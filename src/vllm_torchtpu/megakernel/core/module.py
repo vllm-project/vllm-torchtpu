@@ -47,6 +47,10 @@ class Module:
     name: str = "module"
     reduction: Literal["allreduce", "none", "custom"] = "allreduce"
     input_norm: str | None = None
+    # Optional `KernelContext` layer-schedule fields this module honours in
+    # `emit` (`"layer_hook"`; see `kernel.KernelContext`). The builder engages
+    # a schedule option only when every module it involves declares it.
+    layer_schedule: ClassVar[frozenset[str]] = frozenset()
     Tunables: ClassVar[type | None] = None
     Debug: ClassVar[type | None] = None
     GEOMETRY_FIELDS: ClassVar[dict[str, tuple[str, Any]]] = {}

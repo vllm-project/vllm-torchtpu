@@ -168,6 +168,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
+from vllm_torchtpu.megakernel import adapter as megakernel_adapter
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -1711,6 +1712,11 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
+        self._megakernel: Any = None
+        # Set at load: a megakernel program that serves TP mode resharded the
+        # stock MoE experts from EP to TP in place, so every stock step keeps
+        # its rows replicated over TP (no sequence-parallel slicing).
+        self._megakernel_rows_replicated = False
 
         # Hand-off between stages (pp_buffered); built in capture_model,
         # where every stage reaches the same point.
@@ -8114,6 +8120,14 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
+        self._megakernel = megakernel_adapter.maybe_create(self)
+        # The Qwen3.5 template's `mode=tp` reshards the stock experts at load
+        # (before any bind), and the stock forward's sequence-parallel MoE
+        # would slice rows over TP-sharded experts; this stays set if the
+        # megakernel later declines at bind.
+        self._megakernel_rows_replicated = (
+            getattr(getattr(self._megakernel, "program", None), "mode", None) == "tp"
+        )
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -8609,6 +8623,9 @@ class TPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config,
                 kv_cache_bundle=self._kv_cache_bundle,
             ),
+            # Dummy, precompile and profile forwards always run (and so
+            # compile) the stock model, even where the megakernel would serve.
+            megakernel_adapter.suppressed(self),
         ):
             if self.supports_mm_inputs and self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
@@ -10003,6 +10020,8 @@ class TPUModelRunner(GPUModelRunner):
                 depth=envs.TPU_PP_HANDOFF_DEPTH,
             )
             self._pp_handoff.warmup()
+        if self._megakernel is not None:
+            self._megakernel.bind_and_warmup(self)
         if self.enforce_eager:
             return
         if self.lora_config is not None:
@@ -11607,7 +11626,9 @@ class TPUModelRunner(GPUModelRunner):
                 valid_tokens = num_tokens_padded
         tp_size = self.parallel_config.tensor_parallel_size
         if rows_sliced is None:
-            rows_sliced = sequence_parallel.step_rows_are_sliced(num_tokens_padded)
+            rows_sliced = not getattr(
+                self, "_megakernel_rows_replicated", False
+            ) and sequence_parallel.step_rows_are_sliced(num_tokens_padded)
         if rows_sliced and tp_size > 1:
             from vllm.distributed import get_tensor_model_parallel_rank
 
@@ -11619,22 +11640,48 @@ class TPUModelRunner(GPUModelRunner):
             padding_state.update(valid_tokens, num_tokens_padded)
 
     def forward_model(
-        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        intermediate_tensors=None,
     ):
-        # @support_torch_compile annotations will be put on the vLLM model if it
-        # supports torch.compile
-        kwargs = {}
-        sequence_parallel.set_active(
-            sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
-        )
-        if intermediate_tensors is not None:
-            kwargs["intermediate_tensors"] = intermediate_tensors
-        out = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
+        hit, out = False, None
+        if self._megakernel is not None:
+            # A megakernel step returns what the stock model would; both go
+            # through the normalization below.
+            hit, out = self._megakernel.try_forward(
+                self,
+                megakernel_adapter.StepContext(
+                    input_ids=input_ids,
+                    positions=positions,
+                    inputs_embeds=inputs_embeds,
+                    intermediate_tensors=intermediate_tensors,
+                ),
+            )
+
+        if hit:
+            # The megakernel ran the step whole: no layer of it slices rows.
+            sequence_parallel.set_active(False)
+        else:
+            # @support_torch_compile annotations will be put on the vLLM model
+            # if it supports torch.compile
+            kwargs = {}
+            # Rows stay replicated on every step once a megakernel resharded
+            # the stock MoE experts to TP (`_megakernel_rows_replicated`).
+            sequence_parallel.set_active(
+                not getattr(self, "_megakernel_rows_replicated", False)
+                and sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
+            )
+            if intermediate_tensors is not None:
+                kwargs["intermediate_tensors"] = intermediate_tensors
+            out = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
+        assert out is not None
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
         if isinstance(out, IntermediateTensors):

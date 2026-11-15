@@ -274,6 +274,18 @@ class MiniCtx:
     sc: Any = lambda *_: contextlib.nullcontext()
     norm_x: Any = None
     raw_refs: Any = None
+    # The optional layer-schedule fields of `KernelContext`, off by default;
+    # the modules read them on every path.
+    deferred_fill: Any = None
+    layer_hook: Any = None
+    arp: bool = False
+    ar0: Any = None
+
+    def arp_scale(self, x: Any, rows: Any = None) -> Any:
+        if not self.arp:
+            return x
+        r = self.scr["arp"][:, 0:1] if rows is None else self.scr["arp"][rows, 0:1]
+        return x * r
 
     def module_params(self, name: str) -> Any:
         return self.core_plan.module(name)

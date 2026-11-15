@@ -79,6 +79,12 @@ class CacheExec:
     # force_under_jit=True (jax.debug.callback device-to-host sync + Python
     # validation). In-kernel routing to shared null page 0 always applies.
     check_ckpt_bounds: bool = False
+    # Decode context parallel size: the `dcp` ranks of a KV-head group each
+    # hold one shard of the paged pool. Global kernel page `p` of a sequence
+    # sits on DCP rank `p % dcp` at page-table column `p // dcp`, and the page
+    # table is the rank-local one (`pool.dcp`). 1: the pool is replicated over
+    # the group.
+    dcp: int = 1
 
     def __post_init__(self) -> None:
         if not any(
@@ -95,6 +101,10 @@ class CacheExec:
                 f"CacheExec.act_mode must be one of {ACT_MODE_VALUES}, "
                 f"got {self.act_mode!r}"
             )
+        if not isinstance(self.dcp, int) or isinstance(self.dcp, bool) or self.dcp < 1:
+            raise ValueError(f"CacheExec.dcp must be an int >= 1, got {self.dcp!r}")
+        if self.dcp > 1 and not self.paged_kv:
+            raise ValueError("CacheExec.dcp > 1 shards the paged pool: needs paged_kv")
 
     @property
     def FUSED(self) -> bool:

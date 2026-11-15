@@ -26,7 +26,7 @@ from ..ops import FP8, I32
 from .backend import kernel_debug_check
 from .checks import safe_kv_page
 from .config import cache_exec
-from .scatter_ctx import ScatterKernel, batch_to_i32_cols, is_active
+from .scatter_ctx import ScatterKernel, batch_to_i32_cols, is_active, kv_token_col
 
 
 def kv_cols(kc: ScatterKernel) -> None:
@@ -43,7 +43,17 @@ def kv_cols(kc: ScatterKernel) -> None:
 def scatter_single_token_across_att(
     kc: ScatterKernel, s_idx: Any, b_idx: Any, t_idx: Any
 ) -> None:
-    """Write row `b_idx`'s K / V into its page of every attention pool."""
+    """Write row `b_idx`'s K / V into its page of every attention pool (under
+    DCP, only on the rank holding that page)."""
+    if kc.sg.dcp > 1:
+        p_pos = jnp.maximum(kc.pos_ref[b_idx], jnp.int32(0))
+        own, _ = kv_token_col(kc, p_pos)
+        pl.when(own)(lambda: _scatter_token(kc, s_idx, b_idx, t_idx))
+    else:
+        _scatter_token(kc, s_idx, b_idx, t_idx)
+
+
+def _scatter_token(kc: ScatterKernel, s_idx: Any, b_idx: Any, t_idx: Any) -> None:
     sg, pos_ref, kv_pages_ref = kc.sg, kc.pos_ref, kc.kv_pages_ref
     raw_out_refs, kv_page, knew_buf = kc.raw_out_refs, kc.kv_page, kc.knew_buf
     vnew_buf, sem_kv_rd, sem_kv_wr = kc.vnew_buf, kc.sem_kv_rd, kc.sem_kv_wr
@@ -52,7 +62,9 @@ def scatter_single_token_across_att(
     page_size, h4 = sg.page_size, sg.h4
     p = pos_ref[b_idx]
     p_pos = jnp.maximum(p, jnp.int32(0))
-    p_ok = jnp.logical_and(p >= 0, lax.div(p_pos, page_size) < sg.pt_cols)
+    p_nonneg = p >= 0  # traced before the column: the DCP 1 program is unchanged
+    _, col = kv_token_col(kc, p_pos)
+    p_ok = jnp.logical_and(p_nonneg, col < sg.pt_cols)
     kernel_debug_check(
         p_ok,
         "KV scatter pos outside [0, page_table.shape[1] * page_size)",
@@ -173,23 +185,41 @@ def scatter_kv(kc: ScatterKernel) -> None:
                         safe_kv_page(raw_kpt, num_pages) == kp0,
                     )
 
-                @pl.when(same_page)
+                # Under DCP two tokens of one sequence can share a physical
+                # page id yet sit on different ranks (pages p and p + 1 have
+                # the same column `p // dcp`): each token's write is masked by
+                # its own page's owner, and a rank holding none skips the RMW.
+                run_same = same_page
+                owns: list[Any] = []
+                if sg.dcp > 1:
+                    owns = [
+                        kv_token_col(kc, jnp.maximum(pos_ref[b0 + t], jnp.int32(0)))[0]
+                        for t in range(T)
+                    ]
+                    any_own = owns[0]
+                    for t in range(1, T):
+                        any_own = jnp.logical_or(any_own, owns[t])
+                    run_same = jnp.logical_and(same_page, any_own)
+
+                @pl.when(run_same)
                 def _():
                     kp = kp0
                     p_ok_list = []
                     for t in range(T):
                         p_t = pos_ref[b0 + t]
                         p_t_pos = jnp.maximum(p_t, jnp.int32(0))
-                        p_ok_t = jnp.logical_and(
-                            p_t >= 0, lax.div(p_t_pos, page_size) < sg.pt_cols
-                        )
-                        p_ok_list.append(p_ok_t)
+                        p_t_nonneg = p_t >= 0
+                        _, col_t = kv_token_col(kc, p_t_pos)
+                        p_ok_t = jnp.logical_and(p_t_nonneg, col_t < sg.pt_cols)
                         kernel_debug_check(
                             p_ok_t,
                             "KV scatter pos outside "
                             "[0, page_table.shape[1] * page_size)",
                             interpret=bool(interpret),
                         )
+                        if sg.dcp > 1:
+                            p_ok_t = jnp.logical_and(p_ok_t, owns[t])
+                        p_ok_list.append(p_ok_t)
                     ln_list = [
                         lax.rem(jnp.maximum(pos_ref[b0 + t], jnp.int32(0)), page_size)
                         for t in range(T)

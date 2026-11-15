@@ -67,12 +67,29 @@ class TileContext:
     moe_tp: bool = False
     ctx: int = 2048
     g: Any = None
+    # The bucket runs with 1-launch fused pool I/O (resolved by the caller,
+    # `runtime.exec_policy.bucket_exec_spec`); rules may tune fused buckets.
+    fused_pool_io: bool = False
 
     @property
     def NS(self) -> int:
         assert self.B % self.T == 0, (self.B, self.T)
         return self.B // self.T
 
+
+@dataclass(frozen=True)
+class _ReadTrackingTileContext(TileContext):
+    """`TileContext` that records whether a tile rule reads `fused_pool_io`
+    (`approx_features` evaluates the fused half of its grid only for rules
+    that do)."""
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "fused_pool_io":
+            _FUSED_FLAG_READ[0] = True
+        return object.__getattribute__(self, name)
+
+
+_FUSED_FLAG_READ = [False]
 
 # Tile rule: `(tc: TileContext) -> Tiles`.
 TileRule = Callable[[TileContext], Tiles]
@@ -217,7 +234,15 @@ class Profile:
             _check_exact_bucket(self, tc, t)
         return t
 
-    def exec_for(self, base: ExecSpec, *, B: int, T: int, g: Any = None) -> ExecSpec:
+    def exec_for(
+        self,
+        base: ExecSpec,
+        *,
+        B: int,
+        T: int,
+        g: Any = None,
+        fused_pool_io: bool = False,
+    ) -> ExecSpec:
         """Specialize `base` for bucket `(T, B)` under this profile.
 
         Explicit settings on `base` win (expert / test overrides), the profile
@@ -231,13 +256,22 @@ class Profile:
           backend can, e.g. never on a `T=1` bucket). Pass `pool_gather="split"`
           to force split under a GPR profile.
         Fused pool I/O is resolved by the caller because it also depends on the
-        pool backend.
+        pool backend; the caller passes its decision as `fused_pool_io` so the
+        tile rule sees it (`TileContext.fused_pool_io`).
         """
         moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
         tiles = base.tiles
         if tiles is None and self.tile_rule() is not None:
             tiles = self.tiles_for(
-                TileContext(B=B, T=T, R=base.R, moe_tp=moe_tp, ctx=base.ctx, g=g)
+                TileContext(
+                    B=B,
+                    T=T,
+                    R=base.R,
+                    moe_tp=moe_tp,
+                    ctx=base.ctx,
+                    g=g,
+                    fused_pool_io=bool(fused_pool_io),
+                )
             )
         base_gather = cache_exec(base).pool_gather
         if base_gather is not False:
@@ -316,7 +350,8 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     two tile rules give it different values on any bucket of the grid (`B` in
     `1..MAX_BATCH_ROWS`, `T` in `{1, 2, 3, 4, 5, 6, 8}` with `B % T == 0`, `R`
     in `{1, 2, 4, 8, 16}`, `moe_tp` in `{False, True}`, `ctx` in
-    `{2048, 8192, 32768, 131072, 262144}`) and the knob is `approx` in
+    `{2048, 8192, 32768, 131072, 262144}`, and `fused_pool_io` in
+    `{False, True}` when either rule reads it) and the knob is `approx` in
     `exec_spec.tile_numerics()` (module knobs as `tiles.<module>.<field>`); a
     pool-I/O mode the profile turns on and the reference does not counts per
     `POOL_IO_NUMERICS`. In addition, `Profile.tiles_for` (and `exec_for`)
@@ -340,23 +375,44 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     rule = profile.tile_rule()
     if rule is not ref_rule:
         approx_knobs = [k for k, v in numerics.items() if v == "approx"]
-        for R in _NUMERICS_GRID_R:
-            for moe_tp in (False, True):
-                for ctx in _NUMERICS_GRID_CTX:
-                    for T in _NUMERICS_GRID_T:
-                        for B in _NUMERICS_GRID_B:
-                            if B % T != 0:
-                                continue
-                            tc = TileContext(B=B, T=T, R=R, moe_tp=moe_tp, ctx=ctx)
-                            t = default_tiles(tc) if rule is None else rule(tc)
-                            d = default_tiles(tc) if ref_rule is None else ref_rule(tc)
-                            if t == d:
-                                continue
-                            feats.update(
-                                f"tiles.{k}"
-                                for k in approx_knobs
-                                if _knob(t, k) != _knob(d, k)
-                            )
+
+        def grid(fused: bool) -> None:
+            ctx_cls = TileContext if fused else _ReadTrackingTileContext
+            for R in _NUMERICS_GRID_R:
+                for moe_tp in (False, True):
+                    for ctx in _NUMERICS_GRID_CTX:
+                        for T in _NUMERICS_GRID_T:
+                            for B in _NUMERICS_GRID_B:
+                                if B % T != 0:
+                                    continue
+                                tc = ctx_cls(
+                                    B=B,
+                                    T=T,
+                                    R=R,
+                                    moe_tp=moe_tp,
+                                    ctx=ctx,
+                                    fused_pool_io=fused,
+                                )
+                                t = default_tiles(tc) if rule is None else rule(tc)
+                                d = (
+                                    default_tiles(tc)
+                                    if ref_rule is None
+                                    else ref_rule(tc)
+                                )
+                                if t == d:
+                                    continue
+                                feats.update(
+                                    f"tiles.{k}"
+                                    for k in approx_knobs
+                                    if _knob(t, k) != _knob(d, k)
+                                )
+
+        # The fused half of the grid only for rules that read the flag: a rule
+        # that never reads `fused_pool_io` on the split half cannot depend on it.
+        _FUSED_FLAG_READ[0] = False
+        grid(False)
+        if _FUSED_FLAG_READ[0]:
+            grid(True)
     if (
         profile.fused_pool_io != ref_fused
         and POOL_IO_NUMERICS["fused_pool_io"] == "approx"

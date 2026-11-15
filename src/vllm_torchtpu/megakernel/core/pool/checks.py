@@ -24,6 +24,7 @@ from jax.experimental import pallas as pl
 
 from ..ops import I32
 from .config import cache_exec
+from .dcp import host_page_owner_col
 
 if TYPE_CHECKING:
     from ..exec_spec import ExecSpec
@@ -66,6 +67,10 @@ def _validate_pool_metadata_host(
     num_pages = int(cache_exec(ex).num_pages)
     page_size = int(layout.page_size)
     pps = int(layout.pages_per_slot)
+    # Under DCP the page table is rank-local: global page `lp` of a sequence is
+    # at column `lp // dcp` (on DCP rank `lp % dcp`), the same physical page id
+    # on every rank.
+    dcp = int(cache_exec(ex).dcp)
 
     has_ckpt = (
         layout.has_recurrent and ckpt_arr is not None and np.asarray(ckpt_arr).size > 0
@@ -82,7 +87,7 @@ def _validate_pool_metadata_host(
 
     active_kv_pages: set[int] = set()
     kv_write_owner: dict[int, int] = {}
-    seen_kv_targets: set[tuple[int, int]] = set()
+    seen_kv_targets: set[tuple[int, ...]] = set()
 
     for s in range(NS):
         if not bool(act_s[s]):
@@ -90,7 +95,7 @@ def _validate_pool_metadata_host(
         seq_pos = pos[s * T : (s + 1) * T]
         for t in range(T):
             p_tok = int(seq_pos[t])
-            lp_tok = p_tok // page_size
+            owner, lp_tok = host_page_owner_col(p_tok // page_size, dcp)
             if p_tok < 0 or lp_tok >= pt.shape[1]:
                 if check_bounds:
                     raise ValueError(
@@ -113,7 +118,7 @@ def _validate_pool_metadata_host(
                     f"across active sequences {prev_s} and {s}"
                 )
             kv_write_owner[kp] = s
-            target = (kp, p_tok % page_size)
+            target = (kp, p_tok % page_size) + ((owner,) if dcp > 1 else ())
             if target in seen_kv_targets:
                 raise ValueError(
                     f"Step pool metadata: duplicate KV write (page={kp}, "
@@ -122,6 +127,9 @@ def _validate_pool_metadata_host(
             seen_kv_targets.add(target)
 
         max_lp = min(pt.shape[1], max(0, int(np.max(seq_pos)) // page_size + 1))
+        if dcp > 1:  # the columns this sequence's pages occupy
+            max_pg = max(0, int(np.max(seq_pos)) // page_size)
+            max_lp = min(pt.shape[1], max_pg // dcp + 1)
         for lp in range(max_lp):
             p_id = int(pt[s, lp])
             if p_id <= 0 or p_id >= num_pages:

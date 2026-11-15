@@ -41,6 +41,12 @@ FEATURE_MROPE = "mrope"
 FEATURE_PREFIX_CACHING = "prefix_caching"
 FEATURE_KV_OFFLOAD = "kv_offload"
 FEATURE_KV_TRANSFER = "kv_transfer"
+# Consumer-only KV transfer: a transfer connector that only loads KV into this
+# engine before the scheduler runs a request (`kv_role == "kv_consumer"`) and
+# declares no layer-wise load or save, so a program that bypasses the
+# per-layer attention modules skips none of the connector's work. Narrower
+# than `kv_transfer` (any transfer connector, the program honors its hooks).
+FEATURE_KV_TRANSFER_CONSUMER = "kv_transfer_consumer"
 FEATURE_EPLB_DYNAMIC = "eplb_dynamic"
 FEATURE_SLEEP_MODE = "sleep_mode"
 FEATURES: frozenset[str] = frozenset(
@@ -53,6 +59,7 @@ FEATURES: frozenset[str] = frozenset(
         FEATURE_PREFIX_CACHING,
         FEATURE_KV_OFFLOAD,
         FEATURE_KV_TRANSFER,
+        FEATURE_KV_TRANSFER_CONSUMER,
         FEATURE_EPLB_DYNAMIC,
         FEATURE_SLEEP_MODE,
     }
@@ -186,7 +193,7 @@ class Bucket:
 
     @property
     def key(self) -> tuple[int, int]:
-        return (int(self.T), int(self.B))
+        return (self.T, self.B)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -219,6 +226,12 @@ class MonoProgram(Protocol):
     `check_compiled_ir(debug, bucket)`, `attach_draft(drafter)` /
     `detach_draft()`, `on_warmup_done()` (called once per bind, after the
     worker finishes its whole warmup).
+    `attach_draft(drafter)` runs after `bind`, before the bind agreement,
+    with the runner's drafter (`None` without one); it returns `None` when
+    the program serves no draft, `True` when it attached one, or a `Decline`
+    (code `draft_declined`) when it was asked for a draft it can't serve on
+    this rank: that is the rank's bind vote, so every rank declines, and
+    `detach_draft()` runs on every rank whose megakernel declines at bind.
     `decide` may return `None` for a step it doesn't see (no metadata): stock,
     not counted in the step mix.
     """
@@ -273,6 +286,13 @@ class TpuMonoSpec:
     `collective_domain` names the ranks the kernel's collectives span (see
     `COLLECTIVE_DOMAINS`); the runtime's agreements run over that group.
 
+    `architectures` / `model_types` are the checkpoints the folder serves:
+    the runtime picks a folder under `vllm_torchtpu.models` whose `SPEC`
+    lists a checkpoint's HF `architectures` entry or `model_type` (also of
+    its `text_config`), and `hf_fields` (`(field, value)` pairs, read from the
+    HF config or its `text_config`) narrows that to configs with those
+    values; a folder with `hf_fields` is preferred when both match.
+
     `top_level_options` names the `options` keys a user may also set at the
     top level of the megakernel config (e.g. `VLLM_TPU_MEGAKERNEL=
     "mode=ep,buckets=8"`); the runtime forwards those into `options`. It reads
@@ -294,6 +314,9 @@ class TpuMonoSpec:
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
     api_version: int = API_VERSION
+    architectures: tuple[str, ...] = ()
+    model_types: tuple[str, ...] = ()
+    hf_fields: tuple[tuple[str, Any], ...] = ()
     top_level_options: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
@@ -326,7 +349,7 @@ class TpuMonoSpec:
             )
         if PAR_TP not in self.parallelism:
             raise MegakernelConfigError(f"{where}: parallelism must include 'tp'")
-        if unknown := sorted(set(self.requires) - set(REQUIRES_KEYS)):
+        if unknown := sorted(self.requires.keys() - REQUIRES_KEYS.keys()):
             raise MegakernelConfigError(
                 f"{where}: unknown requires key {unknown[0]!r}; "
                 f"known: {sorted(REQUIRES_KEYS)}"
@@ -341,6 +364,16 @@ class TpuMonoSpec:
                 f"{where}: collective_domain={self.collective_domain!r}; "
                 f"expected one of {sorted(COLLECTIVE_DOMAINS)}"
             )
+        for field in ("architectures", "model_types"):
+            values = _items(where, field, getattr(self, field))
+            fix(field, tuple(str(v) for v in values))
+        fields = self.hf_fields
+        pairs = (
+            fields.items()
+            if isinstance(fields, Mapping)
+            else _items(where, "hf_fields", fields)
+        )
+        fix("hf_fields", tuple((str(k), v) for k, v in pairs))
         values = _items(where, "top_level_options", self.top_level_options)
         fix("top_level_options", frozenset(str(v) for v in values))
 

@@ -626,7 +626,7 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         warmup_threads.append(torch.get_num_threads())
 
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(capture_model=capture_model),
+        model_runner=SimpleNamespace(capture_model=capture_model, _megakernel=None),
         compilation_config=SimpleNamespace(compilation_time=0.0),
         speculative_config=object() if speculative else None,
     )

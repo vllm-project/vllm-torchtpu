@@ -1,0 +1,291 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The runner and worker call sites: the dummy-run suppression scope, the
+megakernel step inside `forward_model`, the weight-update guard in
+`sync_weights` and the post-warmup hook in `compile_or_warm_up_model`."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+
+def test_runner_dummy_run_forward_is_suppressed() -> None:
+    """`TPUModelRunner._dummy_run` calls `forward_model` inside `suppressed(self)`."""
+    import ast
+    from pathlib import Path
+
+    import vllm_torchtpu
+
+    src = (Path(vllm_torchtpu.__file__).parent / "runner" / "tpu_runner.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(src)
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_dummy_run"
+    )
+
+    def _is_suppress(item: ast.withitem) -> bool:
+        call = item.context_expr
+        return (
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) == "megakernel_adapter.suppressed"
+            and [ast.unparse(a) for a in call.args] == ["self"]
+        )
+
+    def _calls_forward(node: ast.AST) -> bool:
+        return any(
+            isinstance(c, ast.Call) and ast.unparse(c.func) == "self.forward_model"
+            for c in ast.walk(node)
+        )
+
+    fwd_calls = [
+        c
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call) and ast.unparse(c.func) == "self.forward_model"
+    ]
+    assert fwd_calls, "_dummy_run no longer calls self.forward_model"
+    guarded = [
+        w
+        for w in ast.walk(fn)
+        if isinstance(w, ast.With)
+        and any(_is_suppress(i) for i in w.items)
+        and _calls_forward(w)
+    ]
+    n_guarded = sum(
+        1
+        for w in guarded
+        for c in ast.walk(w)
+        if isinstance(c, ast.Call) and ast.unparse(c.func) == "self.forward_model"
+    )
+    assert n_guarded == len(fwd_calls)
+
+
+class _FakeIntermediateTensors(list):
+    """Stands in for vLLM's `IntermediateTensors` in `forward_model`'s module
+    namespace. A one-element list, so only the `IntermediateTensors` branch
+    returns it whole: the list unwrapping after it would return its element."""
+
+
+def _runner_forward_model() -> Any:
+    """`TPUModelRunner.forward_model`; compiled from source without torch_tpu."""
+    try:
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    except ImportError:
+        pass
+    else:
+        return TPUModelRunner.forward_model
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    import vllm_torchtpu
+    from vllm_torchtpu.megakernel import adapter as megakernel_adapter
+
+    path = Path(vllm_torchtpu.__file__).parent / "runner" / "tpu_runner.py"
+    src = path.read_text(encoding="utf-8")
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.FunctionDef) and n.name == "forward_model"
+    )
+    fn_src = textwrap.dedent(ast.get_source_segment(src, fn) or "")
+    ns: dict[str, Any] = {
+        "megakernel_adapter": megakernel_adapter,
+        "IntermediateTensors": _FakeIntermediateTensors,
+    }
+    exec(compile(fn_src, str(path), "exec"), ns)
+    return ns["forward_model"]
+
+
+def _raw_outputs() -> list[Any]:
+    import torch
+
+    h = torch.arange(6.0).reshape(3, 2)
+    aux = [torch.ones(3, 2)]
+    return [h, [h], (h,), (h, aux), [h, aux], _FakeIntermediateTensors([h])]
+
+
+@pytest.mark.parametrize("raw_idx", range(6))
+def test_runner_normalizes_megakernel_output_like_stock(
+    raw_idx: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A megakernel step's output goes through the stock normalization."""
+    from types import SimpleNamespace
+
+    import torch
+
+    forward_model = _runner_forward_model()
+    # The name `forward_model` checks against, whether it's the real runner
+    # (vLLM's class) or compiled from source.
+    monkeypatch.setitem(
+        forward_model.__globals__, "IntermediateTensors", _FakeIntermediateTensors
+    )
+    raw = _raw_outputs()[raw_idx]
+    stock_calls: list[dict[str, Any]] = []
+
+    def model(**kw: Any) -> Any:
+        stock_calls.append(kw)
+        return raw
+
+    class _Driver:
+        def __init__(self, hit: bool) -> None:
+            self.hit, self.ctx = hit, None
+
+        def try_forward(self, runner: Any, ctx: Any) -> tuple[bool, Any]:
+            self.ctx = ctx
+            return (True, raw) if self.hit else (False, None)
+
+    ids = torch.zeros((3,), dtype=torch.int32)
+    pos = torch.zeros((3,), dtype=torch.int32)
+    stock = forward_model(SimpleNamespace(_megakernel=None, model=model), ids, pos)
+    assert len(stock_calls) == 1
+    drv = _Driver(hit=True)
+    mk = forward_model(SimpleNamespace(_megakernel=drv, model=model), ids, pos)
+    assert len(stock_calls) == 1, "a megakernel hit must not run the stock model"
+    assert drv.ctx.input_ids is ids and drv.ctx.positions is pos
+    assert drv.ctx.inputs_embeds is None
+    emb = torch.zeros(3, 2)
+    forward_model(
+        SimpleNamespace(_megakernel=drv, model=model),
+        None,
+        pos,
+        inputs_embeds=emb,
+    )
+    assert drv.ctx.input_ids is None and drv.ctx.inputs_embeds is emb
+    assert type(mk) is type(stock) and len(mk) == len(stock) == 2
+    assert mk[0] is stock[0]
+    assert mk[1] is stock[1]
+    if isinstance(raw, _FakeIntermediateTensors):
+        # A stage before the last: the intermediate tensors, whole.
+        assert stock[0] is raw and stock[1] is None
+
+
+def test_runner_declined_step_runs_the_stock_forward_unchanged() -> None:
+    """A declined step calls the stock model exactly as without a megakernel:
+    the runner passes no extra model kwargs (`StepContext.model_kwargs` stays
+    `None`), only the intermediate tensors."""
+    import inspect
+    from types import SimpleNamespace
+
+    import torch
+
+    forward_model = _runner_forward_model()
+    assert "model_kwargs" not in inspect.signature(forward_model).parameters
+    stock_calls: list[dict[str, Any]] = []
+    h = torch.zeros(2, 2)
+
+    def model(**kw: Any) -> Any:
+        stock_calls.append(kw)
+        return h
+
+    class _Decline:
+        ctx: Any = None
+
+        def try_forward(self, runner: Any, ctx: Any) -> tuple[bool, Any]:
+            self.ctx = ctx
+            return False, None
+
+    drv = _Decline()
+    runner = SimpleNamespace(_megakernel=drv, model=model)
+    ids = torch.zeros((2,), dtype=torch.int32)
+    pos = torch.zeros((2,), dtype=torch.int32)
+    it = object()
+    out = forward_model(runner, ids, pos, intermediate_tensors=it)
+    assert out[0] is h and out[1] is None
+    assert drv.ctx.model_kwargs is None
+    assert drv.ctx.intermediate_tensors is it
+    assert stock_calls == [
+        dict(input_ids=ids, positions=pos, inputs_embeds=None, intermediate_tensors=it)
+    ]
+
+
+def test_worker_sync_weights_runs_the_weight_update_guard() -> None:
+    """`TPUWorker.sync_weights` runs the guard before syncing."""
+    import ast
+    from pathlib import Path
+
+    import vllm_torchtpu
+
+    src = (Path(vllm_torchtpu.__file__).parent / "worker" / "tpu_worker.py").read_text(
+        "utf-8"
+    )
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.FunctionDef) and n.name == "sync_weights"
+    )
+    first = ast.unparse(fn.body[0])
+    assert first == "megakernel_adapter.guard_weight_update(self.model_runner)"
+
+
+def _worker_compile_or_warm_up_model() -> Any:
+    """`TPUWorker.compile_or_warm_up_model`; compiled from source with stand-ins
+    for the thread, cache and GC helpers it calls."""
+    import ast
+    import textwrap
+    import time
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import vllm_torchtpu
+
+    path = Path(vllm_torchtpu.__file__).parent / "worker" / "tpu_worker.py"
+    src = path.read_text(encoding="utf-8")
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.FunctionDef) and n.name == "compile_or_warm_up_model"
+    )
+    fn_src = textwrap.dedent(ast.get_source_segment(src, fn) or "")
+    ns: dict[str, Any] = {
+        "time": time,
+        "CompilationTimes": lambda **kw: SimpleNamespace(**kw),
+        "CacheArtifactManager": SimpleNamespace(clear=lambda: None),
+        "set_torch_threads_for_runtime": lambda: None,
+        "freeze_gc_heap": lambda: None,
+        "maybe_attach_gc_debug_callback": lambda: None,
+        "_release_free_host_heap": lambda: None,
+    }
+    exec(compile(fn_src, str(path), "exec"), ns)
+    return ns["compile_or_warm_up_model"]
+
+
+@pytest.mark.parametrize("with_megakernel", [False, True])
+def test_worker_warmup_calls_on_warmup_done_after_capture_model(
+    with_megakernel: bool,
+) -> None:
+    """`TPUWorker.compile_or_warm_up_model` calls the megakernel's
+    `on_warmup_done(runner)` once, after `capture_model()`."""
+    from types import SimpleNamespace
+
+    events: list[Any] = []
+    runner = SimpleNamespace(capture_model=lambda: events.append("capture"))
+    runner._megakernel = (
+        SimpleNamespace(on_warmup_done=lambda r: events.append(("done", r)))
+        if with_megakernel
+        else None
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+        speculative_config=None,
+    )
+
+    _worker_compile_or_warm_up_model()(worker)
+
+    assert events == (["capture", ("done", runner)] if with_megakernel else ["capture"])

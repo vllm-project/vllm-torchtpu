@@ -1,0 +1,88 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Qwen3.5 megakernel template (the `qwen35` shorthand).
+
+Serve it with `VLLM_TPU_MEGAKERNEL=1` (by the checkpoint's arch), `qwen35`, or
+`--additional-config '{"megakernel": {"plugin": "<this package>"}}'`;
+template settings (`profile`, `mode`, `buckets`, ...) go in `options`.
+Importing this module loads no torch / jax / vLLM: `create` is imported lazily.
+"""
+
+from __future__ import annotations
+
+from vllm_torchtpu.megakernel.core.runtime.contract import TpuMonoSpec
+
+SPEC = TpuMonoSpec(
+    name="qwen35",
+    version="1",
+    create=".adapter:create",
+    chips=("TPU7x",),
+    tp_sizes=(8,),
+    # "dcp": decode context parallelism, with the DCP size dividing the ranks
+    # per KV head (`adapter.dcp_size_decline`); KV pages per `pool.dcp`.
+    parallelism=frozenset({"tp", "ep_in_tp", "dcp"}),
+    # "kv_transfer_consumer": a PD decode leg's transfer connector, loading KV
+    # before the scheduler runs a request, with no layer-wise hooks.
+    features=frozenset(
+        {
+            "spec_decode",
+            "mrope",
+            "prefix_caching",
+            "kv_offload",
+            "kv_transfer_consumer",
+        }
+    ),
+    requires={"mamba_ssm_cache_dtype": "bfloat16"},
+    # The checkpoints this folder serves (the adapter picks it by these).
+    architectures=(
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
+    ),
+    model_types=("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text"),
+    # The options also accepted at the top level of the megakernel config
+    # (`VLLM_TPU_MEGAKERNEL="mode=ep,buckets=8"`); `adapter.OPTION_KEYS`.
+    top_level_options=frozenset(
+        {
+            "profile",
+            "mode",
+            "buckets",
+            "verify_buckets",
+            "fused_pool_io",
+            "fused_pool_io_max_b",
+            "fused_pool_io_min_b_hi",
+            "pool_gather",
+            "compile_hlo_check",
+            "mtp_draft",
+            "mtp_draft_buckets",
+            "mtp_draft_verify_buckets",
+        }
+    ),
+    # Of the default profile (qwen35-candidate30-fused); qwen35-baseline is
+    # exact. The program logs the resolved profile's numerics at bind.
+    numerics="approx",
+    # Every decline `create` / `bind` can return beyond the adapter's own codes,
+    # so peers log `peer_declined:<code>` rather than `other`.
+    decline_codes=(
+        "non_moe_checkpoint",
+        "invalid_geometry",
+        "geometry_mismatch",
+        "backbone_not_found",
+        "layer_count_mismatch",
+        "unaligned_cache_layout",
+        "empty_buckets",
+        "dcp_geometry_unsupported",
+    ),
+)
