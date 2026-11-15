@@ -729,8 +729,9 @@ _LTX2_V2A_LOCAL_KV_PATCHED = "_tpu_ltx2_v2a_local_kv_patched"
 
 def _patch_ltx2_v2a_local_kv_attn() -> None:
     # -------------------------------------------------------------------------
-    # TODO: Remove once vLLM-Omni's LTX2VideoToAudioParallelAttention computes
-    # local shard attention + LSE reduction instead of all-to-all gathering
+    # TODO: Remove this _LTX2ParallelAttention._forward_impl patch once
+    # vLLM-Omni's LTX2VideoToAudioParallelAttention strategy computes local
+    # shard attention + LSE reduction instead of all-to-all gathering
     # full-sequence video K/V across Ulysses ranks.
     #
     # In LTX-2 video_to_audio_attn, audio queries (128 tokens) are replicated

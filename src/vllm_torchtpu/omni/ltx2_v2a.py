@@ -33,6 +33,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+# Cap each materialized float32 score chunk (B * H * S_q * kv_chunk) at
+# 16M elements (64 MiB).
 DEFAULT_MAX_SCORE_ELEMENTS = 16_777_216
 
 
@@ -119,11 +121,17 @@ def _local_unnormalized_attention(
     s_kv = k.shape[2]
     rows_per_kv = max(1, bsz * heads * s_q)
     kv_chunk = max(1, max_score_elements // rows_per_kv)
+    # torch.matmul has no out_dtype, so bf16/f16 operands would round both
+    # scores (before scale/exp) and o_local (before cross-chunk/cross-rank
+    # LSE rescaling and packing into the float32 send_buf) back to low
+    # precision. Upcasting the operands keeps scores and unnormalized outputs
+    # in float32 in plain torch (compiled by XLA) over the short audio queries.
     if s_kv <= kv_chunk:
         scores = torch.matmul(q, k.float().transpose(-2, -1)) * scale
         m_local = scores.amax(dim=-1, keepdim=True)
         probs = torch.exp(scores - m_local)
         l_local = probs.sum(dim=-1, keepdim=True)
+        # Reproduce flash attention's low-precision P rounding before P @ V.
         p_cast = probs.to(prob_dtype).float() if prob_dtype != torch.float32 else probs
         o_local = torch.matmul(p_cast, v.float())
         return o_local, m_local, l_local
@@ -141,6 +149,7 @@ def _local_unnormalized_attention(
         probs = torch.exp(scores - m_next)
         l_curr = probs.sum(dim=-1, keepdim=True)
         alpha = torch.exp(m_run - m_next)
+        # Reproduce flash attention's low-precision P rounding before P @ V.
         p_cast = probs.to(prob_dtype).float() if prob_dtype != torch.float32 else probs
         o_curr = torch.matmul(p_cast, v[:, :, start:end].float())
         o_run = o_run * alpha + o_curr
@@ -162,6 +171,8 @@ def ltx2_v2a_local_kv_attention(
     """Compute ``video_to_audio`` cross-attention from replicated Q and sharded K/V."""
     bsz, s_q, q_heads, dim = query.shape
     kv_heads = key.shape[2]
+    # Upcast Q once to float32 for _local_unnormalized_attention's float32
+    # score matmuls; K and V are upcast per shard or chunk there.
     q = query.transpose(1, 2).float()
     k = key.transpose(1, 2)
     v = value.transpose(1, 2)

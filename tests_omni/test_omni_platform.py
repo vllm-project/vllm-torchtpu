@@ -1221,8 +1221,6 @@ def test_ltx2_v2a_local_kv_matches_global_attention(
         probs = probs.to(dtype).float()
     ref = torch.matmul(probs, vf).transpose(1, 2).to(dtype)
 
-    sent_minor_dims: list[int] = []
-
     def rank_fn(rank: int, pg):
         k_shard = k_full[:, rank * s_kv_local : (rank + 1) * s_kv_local].contiguous()
         v_shard = v_full[:, rank * s_kv_local : (rank + 1) * s_kv_local].contiguous()
@@ -1234,7 +1232,6 @@ def test_ltx2_v2a_local_kv_matches_global_attention(
             ulysses_pg=pg,
             max_score_elements=max_elems,
         )
-        sent_minor_dims.append(out.shape[-1])
         return out
 
     outs, stats = _run_simulated_ulysses(world_size, rank_fn)
