@@ -61,11 +61,47 @@ def test_get_tile_sizes_48v_and_bf16_budget():
     )
     assert (dec, mix) == (1, 128)
 
-    # bf16 1-token decode bumps step budget for non-power-of-two head counts,
-    # whereas window_size > 1 keeps uninflated pipeline step counts.
+    # bf16 1-token decode halves per-head transfer bytes for all head counts
+    # (power-of-two and 48-head TP splits alike), whereas window_size > 1 keeps
+    # uninflated pipeline step counts.
     assert tiling.decode_tile_target(
         4, 12, window_size=1, rec_state_bytes=2
     ) > tiling.decode_tile_target(4, 12, window_size=4, rec_state_bytes=2)
+    assert tiling.decode_tile_target(
+        32, 32, window_size=1, rec_state_bytes=2
+    ) > tiling.decode_tile_target(32, 32, window_size=1, rec_state_bytes=4)
+    # get_vmem_estimate_bytes keeps (1 + window_size) state slots for all n_v.
+    est_w1 = tiling.get_vmem_estimate_bytes(
+        tile_b=1,
+        chunk_sz=128,
+        n_kq=16,
+        n_v=48,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+        act_out_bytes=2,
+        rec_state_bytes=2,
+        num_lanes=128,
+        conv_state_dim_size=2 * 16 * 128 + 48 * 128,
+        is_decode=False,
+        window_size=1,
+    )
+    est_w4 = tiling.get_vmem_estimate_bytes(
+        tile_b=1,
+        chunk_sz=128,
+        n_kq=16,
+        n_v=48,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+        act_out_bytes=2,
+        rec_state_bytes=2,
+        num_lanes=128,
+        conv_state_dim_size=2 * 16 * 128 + 48 * 128,
+        is_decode=False,
+        window_size=4,
+    )
+    assert est_w4 > est_w1
     dec_w4, _ = tiling.get_tile_sizes(
         batch_size=32,
         num_seqs=8,

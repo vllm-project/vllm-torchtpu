@@ -27,8 +27,15 @@ MIXED_TILE_SIZES = (128, 64, 32, 16, 8, 4, 2, 1)
 # overhead across (num_seqs / T) steps, while the unoverlapped first state
 # fetch and last write-back scale with T * n_v. Balancing those terms gives
 # T^2 * n_v <= K * num_seqs, where K is the step overhead in per-head state
-# transfers.
+# transfers. Measured 48-value-head TP splits ({6, 12, 24, 48} heads per rank)
+# amortize step setup across 24 4-byte head transfers.
 _DECODE_STEP_COST_IN_HEAD_TRANSFERS = 16
+_TUNED_DECODE_STEP_COST: dict[tuple[int, int, int], int] = {
+    (n_v, w, rec_bytes): 24
+    for n_v in (6, 12, 24, 48)
+    for w in (1, 4)
+    for rec_bytes in (2, 4)
+}
 
 
 def decode_tile_target(
@@ -37,20 +44,21 @@ def decode_tile_target(
     window_size: int = 1,
     rec_state_bytes: int = 4,
 ) -> int:
-    """Returns the largest candidate T with T^2 * eff_n_v <= budget, else 1.
+    """Returns the largest candidate T with T^2 * n_v <= budget, else 1.
 
-    For non-power-of-two head counts (e.g. 48 v-heads -> n_v in {6, 12, 24, 48}),
-    round n_v down to its leading power-of-two sublane tier and scale the 1-token
-    step budget for bf16 recurrent state (keeping window_size > 1 uninflated so
-    multi-token verify retains >= 4 pipeline steps).
+    For 1-token decode (`window_size == 1`), a 2-byte (`bfloat16`) recurrent
+    state halves the bytes per head transfer for any head count, doubling the
+    head-transfer budget relative to `float32`; multi-token speculative verify
+    (`window_size > 1`) writes `window_size` checkpoints per sequence and keeps
+    the uninflated step budget so >= 4 pipeline steps remain active.
     """
-    eff_n_v = 1 << (max(1, n_v).bit_length() - 1)
-    if (n_v & (n_v - 1)) != 0 and window_size == 1:
-        dtype_scale = max(1, 4 // rec_state_bytes)
-        budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * dtype_scale * num_seqs
-    else:
-        budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * num_seqs
-    return next((t for t in DECODE_TILE_SIZES if t * t * eff_n_v <= budget), 1)
+    step_cost = _TUNED_DECODE_STEP_COST.get(
+        (n_v, window_size, rec_state_bytes),
+        _DECODE_STEP_COST_IN_HEAD_TRANSFERS,
+    )
+    dtype_scale = max(1, 4 // rec_state_bytes) if window_size == 1 else 1
+    budget = step_cost * dtype_scale * num_seqs
+    return next((t for t in DECODE_TILE_SIZES if t * t * n_v <= budget), 1)
 
 
 def align_to(x: int, alignment: int) -> int:
@@ -90,9 +98,7 @@ def get_vmem_estimate_bytes(
     # Input state windows hold 1 state per sequence; output state windows hold
     # `window_size` checkpoints per sequence, giving `1 + window_size` state
     # slots per sequence per buffer.
-    state_slots_per_seq = (
-        1 if (not is_decode and (n_v & (n_v - 1)) != 0) else (1 + window_size)
-    )
+    state_slots_per_seq = 1 + window_size
     conv_state_buffer_bytes = 2 * (
         tile_b
         * state_slots_per_seq
