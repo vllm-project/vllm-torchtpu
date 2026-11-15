@@ -263,6 +263,7 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("TORCH_TPU_MP_RENDEZVOUS_PORT", None),
         ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
         ("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", None),
+        ("VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", True),
     ],
 )
 def test_migrated_knob_defaults(monkeypatch, name, expected):

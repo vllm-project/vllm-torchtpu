@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES: bool = True
 
 
 def env_with_choices(
@@ -1281,6 +1282,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # vLLM-Omni Wan VAE decode on several chips: all-gather halo exchange,
+    # host (gloo) integer metadata and MAX collectives, and untiled rank-local
+    # encode on TPU. 0 keeps the upstream code paths.
+    "VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES": env_bool(
+        "VLLM_TPU_OMNI_WAN_VAE_MULTICHIP_PATCHES", True
     ),
 }
 
