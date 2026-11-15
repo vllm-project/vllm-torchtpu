@@ -146,21 +146,15 @@ class TpuFlashAttentionBackend(SDPABackend):
         return TpuFlashAttentionImpl
 
 
-_NON_RING_FLASH_PREFS = frozenset(
-    {
-        "sdpa",
-        "torch",
-        "torch_sdpa",
-        "tpu_sdpa",
-        "cudnn_attn",
-        "flashinfer_attn",
-        "trtllm_attn",
-        "sage_attn",
-        "sage_attn_3",
-        "flash_attn_hub",
-        "flash_attn_3_hub",
-    }
-)
+_NON_TPU_FLASH_BACKEND_PREFS = frozenset({"sdpa", "tpu_sdpa", "torch_sdpa"})
+
+
+def uses_tpu_flash_diffusion_backend(backend_name: str | None) -> bool:
+    """Whether ``backend_name`` selects the TPU Pallas flash attention path."""
+    return (
+        backend_name is None
+        or str(backend_name).lower() not in _NON_TPU_FLASH_BACKEND_PREFS
+    )
 
 
 @functools.cache
@@ -254,8 +248,7 @@ def can_run_tpu_ring_attention(
     causal: bool = False,
 ) -> bool:
     """Whether a RingParallelAttention call fits the TPU Pallas ring kernel."""
-    pref = getattr(ring_runner, "attn_backend_pref", None)
-    if pref is not None and str(pref).lower() in _NON_RING_FLASH_PREFS:
+    if not uses_tpu_flash_diffusion_backend(ring_runner.attn_backend_pref):
         return False
     if (
         causal
@@ -277,21 +270,20 @@ def can_run_tpu_ring_attention(
         return False
     if attn_metadata is not None:
         if (
-            getattr(attn_metadata, "attn_mask", None) is not None
-            or getattr(attn_metadata, "joint_query", None) is not None
-            or getattr(attn_metadata, "joint_key", None) is not None
-            or getattr(attn_metadata, "joint_value", None) is not None
+            attn_metadata.attn_mask is not None
+            or attn_metadata.joint_query is not None
+            or attn_metadata.joint_key is not None
+            or attn_metadata.joint_value is not None
         ):
             return False
-        extra = getattr(attn_metadata, "extra", None) or {}
+        extra = attn_metadata.extra
         if (
             extra.get("valid_kv_length") is not None
             or extra.get("gate_compress") is not None
             or extra.get("kv_cache_dtype") not in (None, "float")
         ):
             return False
-    sp_group = getattr(ring_runner, "_sp_group", None)
-    return int(getattr(sp_group, "ring_world_size", 0)) >= 1
+    return int(ring_runner._sp_group.ring_world_size) >= 1
 
 
 _checked_ring_layouts: set[tuple[int, int, int]] = set()
@@ -304,7 +296,7 @@ def check_ring_rank_layout(sp_group: Any, ring_size: int, uly_size: int) -> None
     tensor and pipeline parallel sizes are 1 (it orders tp innermost).
     """
     dist = torch.distributed
-    ring_group = getattr(sp_group, "ring_group", None)
+    ring_group = sp_group.ring_group
     if not dist.is_initialized() or not isinstance(ring_group, dist.ProcessGroup):
         return
     key = (id(ring_group), ring_size, uly_size)

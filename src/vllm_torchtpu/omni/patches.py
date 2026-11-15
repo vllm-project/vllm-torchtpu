@@ -648,18 +648,113 @@ def _patch_ltx2_split_rope() -> None:
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
 
 
+_DIFFUSION_INIT_DEVICE_WRAPPED = "_tpu_diffusion_init_device_wrapped"
+
+
+def _patch_diffusion_worker_init_device() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni passes OmniDiffusionConfig (or parallel_config)
+    # to OmniPlatform.set_device() or calls init_diffusion_worker_vllm_config()
+    # before set_device() in DiffusionWorker.init_device().
+    #
+    # Problem: DiffusionWorker.init_device()
+    # (vllm_omni/diffusion/worker/diffusion_worker.py) calls
+    # current_omni_platform.set_device(self.device) before
+    # init_diffusion_worker_vllm_config(vllm_config), and set_device() creates
+    # the PjRt client (reading LIBTPU_INIT_ARGS on first allocation).
+    # OmniTpuPlatform needs self.od_config.parallel_config.ring_degree before
+    # set_device() runs. WorkerProc._create_worker calls
+    # get_diffusion_worker_cls() inside each worker process after
+    # DiffusionWorker is defined and before DiffusionWorker.__init__ calls
+    # init_device().
+    # -------------------------------------------------------------------------
+    import functools
+
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    from vllm_torchtpu.omni.platform import OmniTpuPlatform
+
+    if getattr(DiffusionWorker.init_device, _DIFFUSION_INIT_DEVICE_WRAPPED, False):
+        return
+
+    orig_init_device = DiffusionWorker.init_device
+
+    @functools.wraps(orig_init_device)
+    def _tpu_init_device(self: Any) -> None:
+        parallel_config = getattr(
+            getattr(self, "od_config", None), "parallel_config", None
+        )
+        raw_ring_degree = getattr(parallel_config, "ring_degree", 1)
+        OmniTpuPlatform._diffusion_ring_degree = max(1, int(raw_ring_degree or 1))
+        orig_init_device(self)
+
+    setattr(_tpu_init_device, _DIFFUSION_INIT_DEVICE_WRAPPED, True)
+    DiffusionWorker.init_device = _tpu_init_device
+    logger.info(
+        "Applied TPU patch: record ring_degree before DiffusionWorker.init_device."
+    )
+
+
 _RING_ATTENTION_PATCHED = "_tpu_ring_attention_patched"
 
 
 def _patch_ring_attention() -> None:
-    """Route RingParallelAttention.run_attention to the TPU Pallas ring kernel."""
+    """Route RingParallelAttention to the TPU Pallas ring attention kernel."""
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni dispatches RingParallelAttention
+    # through OmniPlatform (or an out-of-tree ring attention backend hook)
+    # instead of hardcoding CUDA/ROCm FlashAttention and torch.distributed P2P
+    # ring collectives.
+    #
+    # Problem: RingParallelAttention.run_attention
+    # (vllm_omni/diffusion/attention/parallel/ring.py) only implements CUDA/ROCm
+    # ring_flash_attn_func and ring_pytorch_attn_func, both of which exchange
+    # K/V shards with torch.distributed P2P sends/recvs that hang on TPU.
+    # -------------------------------------------------------------------------
+    import functools
+
     from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 
     from vllm_torchtpu.omni.attention import (
         can_run_tpu_ring_attention,
         check_ring_rank_layout,
         tpu_ring_flash_attention,
+        uses_tpu_flash_diffusion_backend,
     )
+
+    if not getattr(RingParallelAttention.__init__, _RING_ATTENTION_PATCHED, False):
+        orig_init = RingParallelAttention.__init__
+
+        @functools.wraps(orig_init)
+        def _tpu_ring_init(
+            self: Any,
+            sp_group: Any,
+            attn_backend_pref: str | None = None,
+            attn_backend_explicit: bool = False,
+        ) -> None:
+            orig_init(
+                self,
+                sp_group,
+                attn_backend_pref=attn_backend_pref,
+                attn_backend_explicit=attn_backend_explicit,
+            )
+            ring_size = int(self._sp_group.ring_world_size)
+            if ring_size > 1:
+                if not uses_tpu_flash_diffusion_backend(self.attn_backend_pref):
+                    raise NotImplementedError(
+                        "Ring attention layer does not fit the TPU Pallas ring "
+                        f"kernel (attn_backend_pref={self.attn_backend_pref}), "
+                        "and vLLM-Omni's RingParallelAttention "
+                        "(torch.distributed P2P sends) is not supported on TPU."
+                    )
+                check_ring_rank_layout(
+                    self._sp_group,
+                    ring_size,
+                    int(self._sp_group.ulysses_world_size),
+                )
+
+        setattr(_tpu_ring_init, _RING_ATTENTION_PATCHED, True)
+        RingParallelAttention.__init__ = _tpu_ring_init
 
     if not getattr(RingParallelAttention.run_attention, _RING_ATTENTION_PATCHED, False):
         orig_run = RingParallelAttention.run_attention
@@ -678,10 +773,10 @@ def _patch_ring_attention() -> None:
             ):
                 details = (
                     f"dtype={query.dtype}, causal={causal}, "
-                    f"attn_backend_pref={getattr(self, 'attn_backend_pref', None)}, "
+                    f"attn_backend_pref={self.attn_backend_pref}, "
                     f"metadata={type(attn_metadata).__name__}"
                 )
-                if int(getattr(self._sp_group, "ring_world_size", 1)) > 1:
+                if int(self._sp_group.ring_world_size) > 1:
                     # The upstream ring exchanges K/V with torch.distributed
                     # P2P sends, which hang on TPU, so fail loudly instead.
                     raise NotImplementedError(
@@ -706,7 +801,7 @@ def _patch_ring_attention() -> None:
                 )
             sp_group = self._sp_group
             ring_size = int(sp_group.ring_world_size)
-            uly_size = int(getattr(sp_group, "ulysses_world_size", 1))
+            uly_size = int(sp_group.ulysses_world_size)
             check_ring_rank_layout(sp_group, ring_size, uly_size)
             return tpu_ring_flash_attention(
                 query,

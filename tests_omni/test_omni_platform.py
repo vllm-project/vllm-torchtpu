@@ -22,6 +22,7 @@ import pytest
 import torch
 from diffusers.pipelines.ltx2.vocoder import UpSample1d
 from vllm_omni.diffusion import ipc
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -113,6 +114,10 @@ def test_platform_attributes():
     assert platform.supports_diffusion_dense_flash_attention() is False
     assert (
         platform.get_diffusion_attn_backend_cls(None, 64)
+        == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
+    )
+    assert (
+        platform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", 64)
         == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
     )
     for name in ("SDPA", "TPU_SDPA", "torch_sdpa"):
@@ -965,10 +970,13 @@ def _non_ring_reference_bshd(q, k, v, scale):
 
 
 def _residual_reference_bhsd(query, key, value, *, scale=None):
-    """Reference (o_unnorm, m, l) attention residuals in log2 space.
+    """CPU JAX reference returning f32 log2 attention residuals ``(o_unnorm, m, l)``.
 
-    Same contract as ``residual_flash_attention_bhsd``, in plain JAX so it
-    runs on CPU.
+    For ``query`` ``(B, H_q, S_q, D)`` and ``key``/``value`` ``(B, H_kv, S_kv, D_v)``,
+    computes ``scores_log2 = (q @ k^T) * (scale * log2(e))`` in ``float32`` and
+    returns ``float32`` arrays ``o_unnorm`` ``(B, H_q, S_q, D_v)``, row-wise max
+    ``m`` ``(B, H_q, S_q, 1)``, and ``exp2(scores_log2 - m)`` sum ``l``
+    ``(B, H_q, S_q, 1)``.
     """
     import jax
     import jax.numpy as jnp
@@ -1394,7 +1402,7 @@ def test_ring_attention_patch_and_dispatch(monkeypatch):
 
     monkeypatch.setattr("vllm_torchtpu.omni.attention._ring_attention_op", _fake_op)
 
-    sp_group = SimpleNamespace(ring_world_size=2, ulysses_world_size=2)
+    sp_group = SimpleNamespace(ring_world_size=2, ulysses_world_size=2, ring_group=None)
     runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_FLASH_ATTN")
     q = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
     k = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
@@ -1406,11 +1414,10 @@ def test_ring_attention_patch_and_dispatch(monkeypatch):
     assert calls == [(1, 2, 2, 0.25)]
 
     # 2. Calls the kernel cannot run (causal, float32, attn_mask, joint
-    # tensors, SDPA preference) raise when ring_world_size > 1.
+    # tensors) raise when ring_world_size > 1; SDPA preference raises at init.
     calls.clear()
-    masked_meta = SimpleNamespace(attn_mask=torch.ones(1, 16, dtype=torch.bool))
-    joint_meta = SimpleNamespace(joint_query=q, extra={})
-    sdpa_runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_SDPA")
+    masked_meta = AttentionMetadata(attn_mask=torch.ones(1, 16, dtype=torch.bool))
+    joint_meta = AttentionMetadata(joint_query=q)
     unsupported = [
         lambda r: r.run_attention(q, k, v, causal=True),
         lambda r: r.run_attention(q.float(), k.float(), v.float()),
@@ -1421,11 +1428,13 @@ def test_ring_attention_patch_and_dispatch(monkeypatch):
         with pytest.raises(NotImplementedError, match="not supported on TPU"):
             call(runner)
     with pytest.raises(NotImplementedError, match="attn_backend_pref=TPU_SDPA"):
-        sdpa_runner.run_attention(q, k, v)
+        RingParallelAttention(sp_group, attn_backend_pref="TPU_SDPA")
     assert calls == []
 
     # 3. With ring_world_size == 1 they warn once and run vLLM-Omni's ring.
-    single_group = SimpleNamespace(ring_world_size=1, ulysses_world_size=2)
+    single_group = SimpleNamespace(
+        ring_world_size=1, ulysses_world_size=2, ring_group=None
+    )
     single_runner = RingParallelAttention(
         single_group, attn_backend_pref="TPU_FLASH_ATTN"
     )
@@ -1443,9 +1452,51 @@ def test_ring_attention_patch_and_dispatch(monkeypatch):
         )
 
     # 5. Re-applying _patch_ring_attention is idempotent.
+    init_fn = RingParallelAttention.__init__
     run_fn = RingParallelAttention.run_attention
     _patch_ring_attention()
+    assert RingParallelAttention.__init__ is init_fn
     assert RingParallelAttention.run_attention is run_fn
+
+
+def test_ring_attention_init_rejects_invalid_backend_pref(monkeypatch):
+    from vllm_torchtpu.omni import attention as omni_attention
+    from vllm_torchtpu.omni.patches import _patch_ring_attention
+
+    _patch_ring_attention()
+
+    class _FakeGroup:
+        def __init__(self, ranks):
+            self.ranks = ranks
+
+    monkeypatch.setattr(torch.distributed, "ProcessGroup", _FakeGroup)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda g: g.ranks)
+    monkeypatch.setattr(omni_attention, "_checked_ring_layouts", set())
+
+    valid_group = SimpleNamespace(
+        ring_world_size=2, ulysses_world_size=2, ring_group=_FakeGroup([0, 2])
+    )
+    for valid_pref in (None, "TPU_FLASH_ATTN", "FLASH_ATTN"):
+        runner = RingParallelAttention(valid_group, attn_backend_pref=valid_pref)
+        assert runner.attn_backend_pref == valid_pref
+
+    for bad_pref in ("SDPA", "TPU_SDPA", "TORCH_SDPA", "torch_sdpa"):
+        with pytest.raises(NotImplementedError, match=f"attn_backend_pref={bad_pref}"):
+            RingParallelAttention(valid_group, attn_backend_pref=bad_pref)
+
+    bad_layout_group = SimpleNamespace(
+        ring_world_size=2, ulysses_world_size=2, ring_group=_FakeGroup([0, 4])
+    )
+    with pytest.raises(NotImplementedError, match="tensor/pipeline parallel"):
+        RingParallelAttention(bad_layout_group, attn_backend_pref="TPU_FLASH_ATTN")
+
+    single_group = SimpleNamespace(
+        ring_world_size=1, ulysses_world_size=2, ring_group=_FakeGroup([0])
+    )
+    single_sdpa = RingParallelAttention(single_group, attn_backend_pref="TPU_SDPA")
+    assert single_sdpa.attn_backend_pref == "TPU_SDPA"
 
 
 def test_ring_rank_layout_check(monkeypatch):
