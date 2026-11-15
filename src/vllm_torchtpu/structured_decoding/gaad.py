@@ -106,6 +106,16 @@ class FSMBridge:
         if matcher is None:
             return [], []
 
+        def _is_matcher_terminated() -> bool:
+            is_terminated = getattr(matcher, "is_terminated", None)
+            if callable(is_terminated) and is_terminated():
+                return True
+            is_stop_accepted = getattr(matcher, "is_stop_token_accepted", None)
+            return bool(callable(is_stop_accepted) and is_stop_accepted())
+
+        if _is_matcher_terminated():
+            return [], []
+
         if self.stats is not None:
             self.stats.calls += 1
 
@@ -115,6 +125,9 @@ class FSMBridge:
                 if not matcher.accept_token(token):
                     return [], []
                 advanced += 1
+
+            if _is_matcher_terminated():
+                return [], []
 
             jump_str = matcher.find_jump_forward_string()
             if not jump_str:
