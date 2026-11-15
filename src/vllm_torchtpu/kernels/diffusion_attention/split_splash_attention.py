@@ -144,8 +144,8 @@ def split_splash_attention(
     kh = jnp.swapaxes(key, 1, 2)
     vh = jnp.swapaxes(value, 1, 2)
 
-    q_img_f32 = qh[:, :, s_txt:, :].astype(jnp.float32) * scale
-    q_img = q_img_f32.astype(query.dtype)
+    q_img = (qh[:, :, s_txt:, :].astype(jnp.float32) * scale).astype(query.dtype)
+    q_img_f32 = q_img.astype(jnp.float32)
     k_img, v_img = kh[:, :, s_txt:, :], vh[:, :, s_txt:, :]
     k_txt, v_txt = kh[:, :, :s_txt, :], vh[:, :, :s_txt, :]
 

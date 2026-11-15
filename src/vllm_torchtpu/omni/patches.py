@@ -23,6 +23,7 @@ patch_registry.py.
 """
 
 import functools
+import inspect
 from functools import cache as run_once
 from typing import Any
 
@@ -427,7 +428,6 @@ def _patch_sdpa_fallback_dispatch() -> None:
 
     from vllm_torchtpu.omni.attention import (
         TpuSDPAImpl,
-        _flash_attention_op,
         _get_split_splash_op,
     )
 
@@ -435,7 +435,6 @@ def _patch_sdpa_fallback_dispatch() -> None:
         return
     if envs.VLLM_TPU_OMNI_SPLIT_SPLASH and not torch.compiler.is_compiling():
         _get_split_splash_op()
-        _flash_attention_op()
     # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
     setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
     SDPAImpl.forward = TpuSDPAImpl.forward
@@ -658,6 +657,16 @@ def _patch_ltx2_split_rope() -> None:
 
 
 _QWEN_IMAGE_PREFIX_MASK_PATCHED = "_tpu_qwen_image_prefix_mask_patched"
+_EXPECTED_QWEN_CROSS_ATTN_PARAMS = (
+    "self",
+    "hidden_states",
+    "encoder_hidden_states",
+    "vid_freqs",
+    "txt_freqs",
+    "hidden_states_mask",
+    "encoder_hidden_states_mask",
+    "qk_norm_rope_table",
+)
 
 
 def _patch_qwen_image_prefix_mask() -> None:
@@ -689,6 +698,18 @@ def _patch_qwen_image_prefix_mask() -> None:
         return
 
     orig_forward = attn_cls.forward
+    actual_params = tuple(inspect.signature(orig_forward).parameters)
+    if actual_params != _EXPECTED_QWEN_CROSS_ATTN_PARAMS or not (
+        hasattr(qwen_image_transformer, "_qwen_image_qk_norm_rope")
+        and hasattr(qwen_image_transformer, "AttentionMetadata")
+    ):
+        logger.warning(
+            "Skipping QwenImageCrossAttention prefix-mask patch due to "
+            "upstream signature/helper drift: params=%s.",
+            actual_params,
+        )
+        return
+
     attn_cls._tpu_orig_forward = orig_forward
 
     @functools.wraps(orig_forward)
