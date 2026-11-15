@@ -673,15 +673,39 @@ _EXPECTED_QWEN_CROSS_ATTN_PARAMS = (
 )
 
 
+class _PrefixLenAttnProxy:
+    """Stands in for a QwenImageCrossAttention to tag its attention metadata.
+
+    Every attribute resolves to the wrapped module except ``attn``, which
+    records the text prefix length on the metadata the upstream forward built.
+    """
+
+    def __init__(self, module: Any, prefix_len: int) -> None:
+        self._module = module
+        self._prefix_len = prefix_len
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+    def attn(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: Any | None = None,
+    ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            attn_metadata.attn_mask = attn_metadata.attn_mask.to(dtype=torch.bool)
+            attn_metadata.extra["prefix_mask_len"] = self._prefix_len
+        return self._module.attn(query, key, value, attn_metadata)
+
+
 def _patch_qwen_image_prefix_mask() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove once vLLM-Omni's QwenImageCrossAttention passes the known
     # text prefix length in AttentionMetadata.extra (or avoids constructing a
     # joint key mask when hidden_states_mask is None).
     #
-    # Source: adapted from QwenImageCrossAttention.forward in
-    #   vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py
-    #   (lines 849-947 at vllm-omni v0.33.0rc1).
     # Problem: QwenImagePipeline always passes encoder_hidden_states_mask, so
     #   QwenImageCrossAttention concatenates [encoder_hidden_states_mask, 1s]
     #   into AttentionMetadata(attn_mask=joint_mask) without recording where
@@ -689,8 +713,9 @@ def _patch_qwen_image_prefix_mask() -> None:
     #   SDPA on the full (S_txt + S_img) sequence.
     # Fix: When VLLM_TPU_OMNI_SPLIT_SPLASH=1, non-SP calls with
     #   hidden_states_mask is None and encoder_hidden_states_mask is not None
-    #   record extra={"prefix_mask_len": seq_len_txt} on AttentionMetadata so
-    #   TpuSDPAImpl can safely split at seq_len_txt without host mask checks.
+    #   run the upstream forward on a proxy whose attn() records
+    #   extra={"prefix_mask_len": seq_len_txt} on the AttentionMetadata, so
+    #   TpuSDPAImpl can split at seq_len_txt without host mask checks.
     # -------------------------------------------------------------------------
     if not envs.VLLM_TPU_OMNI_SPLIT_SPLASH:
         return
@@ -703,13 +728,10 @@ def _patch_qwen_image_prefix_mask() -> None:
 
     orig_forward = attn_cls.forward
     actual_params = tuple(inspect.signature(orig_forward).parameters)
-    if actual_params != _EXPECTED_QWEN_CROSS_ATTN_PARAMS or not (
-        hasattr(qwen_image_transformer, "_qwen_image_qk_norm_rope")
-        and hasattr(qwen_image_transformer, "AttentionMetadata")
-    ):
+    if actual_params != _EXPECTED_QWEN_CROSS_ATTN_PARAMS:
         logger.warning(
-            "Skipping QwenImageCrossAttention prefix-mask patch due to "
-            "upstream signature/helper drift: params=%s.",
+            "Skipping QwenImageCrossAttention prefix-mask patch: upstream "
+            "forward signature changed to %s.",
             actual_params,
         )
         return
@@ -731,89 +753,24 @@ def _patch_qwen_image_prefix_mask() -> None:
             self.parallel_config is not None
             and self.parallel_config.sequence_parallel_size > 1
         )
-        if (
+        target = self
+        if not (
             sp_active
             or self.reference_precision
             or hidden_states_mask is not None
             or encoder_hidden_states_mask is None
-            or qk_norm_rope_table is not None
         ):
-            return orig_forward(
-                self,
-                hidden_states,
-                encoder_hidden_states,
-                vid_freqs,
-                txt_freqs,
-                hidden_states_mask=hidden_states_mask,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
-                qk_norm_rope_table=qk_norm_rope_table,
-            )
-
-        img_qkv, _ = self.to_qkv(hidden_states)
-        q_size = self.query_num_heads * self.head_dim
-        kv_size = self.kv_num_heads * self.head_dim
-        img_query, img_key, img_value = img_qkv.split(
-            [q_size, kv_size, kv_size], dim=-1
-        )
-
-        txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
-        add_q_size = self.add_query_num_heads * self.head_dim
-        add_kv_size = self.add_kv_num_heads * self.head_dim
-        txt_query, txt_key, txt_value = txt_qkv.split(
-            [add_q_size, add_kv_size, add_kv_size], dim=-1
-        )
-
-        img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
-        img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
-        img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
-
-        txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
-        txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
-        txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
-
-        seq_len_txt = encoder_hidden_states.shape[1]
-        img_query, img_key = qwen_image_transformer._qwen_image_qk_norm_rope(
-            img_query,
-            img_key,
-            self.norm_q,
-            self.norm_k,
+            target = _PrefixLenAttnProxy(self, encoder_hidden_states.shape[1])
+        return orig_forward(
+            target,
+            hidden_states,
+            encoder_hidden_states,
             vid_freqs,
-            self.rope,
-            self.eps,
-            use_fused=self.qk_norm,
-        )
-        txt_query, txt_key = qwen_image_transformer._qwen_image_qk_norm_rope(
-            txt_query,
-            txt_key,
-            self.norm_added_q,
-            self.norm_added_k,
             txt_freqs,
-            self.rope,
-            self.eps,
+            hidden_states_mask=hidden_states_mask,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            qk_norm_rope_table=qk_norm_rope_table,
         )
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
-
-        img_mask = torch.ones(
-            hidden_states.shape[:2],
-            dtype=torch.bool,
-            device=hidden_states.device,
-        )
-        joint_mask = torch.cat(
-            [encoder_hidden_states_mask.to(dtype=torch.bool), img_mask], dim=1
-        )
-        attn_metadata = qwen_image_transformer.AttentionMetadata(
-            attn_mask=joint_mask,
-            extra={"prefix_mask_len": seq_len_txt},
-        )
-        joint_hidden_states = self.attn(
-            joint_query, joint_key, joint_value, attn_metadata
-        )
-        joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
-        img_attn_output = self.to_out(joint_hidden_states[:, seq_len_txt:, :])
-        txt_attn_output = self.to_add_out(joint_hidden_states[:, :seq_len_txt, :])
-        return img_attn_output, txt_attn_output
 
     setattr(_prefix_masked_forward, _QWEN_IMAGE_PREFIX_MASK_PATCHED, True)
     attn_cls.forward = _prefix_masked_forward
