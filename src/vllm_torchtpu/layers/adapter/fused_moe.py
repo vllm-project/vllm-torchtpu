@@ -25,6 +25,7 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import SharedExpert
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    TpSlicedExperts,
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
@@ -33,7 +34,9 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[
+    tuple[int, str, bool, Any, bool, bool, bool], Callable
+] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -160,6 +163,7 @@ def _build_fused_moe_custom_op(
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
     with_shared: bool = False,
+    with_dual: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -187,8 +191,15 @@ def _build_fused_moe_custom_op(
     )
 
     # torch_tpu takes only arrays and POD types as op arguments, so the op
-    # passes fused_moe_func's SharedExpert as its four tensors.
-    def routed(
+    # passes fused_moe_func's SharedExpert and TpSlicedExperts as four tensors
+    # each, after the routed operands (shared first).
+    def routed(*operands: jax.Array | None) -> jax.Array:
+        extra = list(operands[10:])
+        shared = SharedExpert(*extra[:4]) if with_shared else None
+        tp_experts = TpSlicedExperts(*extra[-4:]) if with_dual else None
+        return routed_fn(*operands[:10], shared=shared, tp_experts=tp_experts)
+
+    def routed_only(
         hidden_states: jax.Array,
         w1: jax.Array,
         w2: jax.Array,
@@ -200,7 +211,7 @@ def _build_fused_moe_custom_op(
         topk_ids: jax.Array,
         experts_start: jax.Array | None,
     ) -> jax.Array:
-        return routed_fn(
+        return routed(
             hidden_states,
             w1,
             w2,
@@ -213,7 +224,7 @@ def _build_fused_moe_custom_op(
             experts_start,
         )
 
-    def routed_and_shared(
+    def routed_and_4(
         hidden_states: jax.Array,
         w1: jax.Array,
         w2: jax.Array,
@@ -224,12 +235,12 @@ def _build_fused_moe_custom_op(
         topk_weights: jax.Array,
         topk_ids: jax.Array,
         experts_start: jax.Array | None,
-        shared_w1: jax.Array,
-        shared_s1: jax.Array,
-        shared_w2: jax.Array,
-        shared_s2: jax.Array,
+        extra0: jax.Array,
+        extra1: jax.Array,
+        extra2: jax.Array,
+        extra3: jax.Array,
     ) -> jax.Array:
-        return routed_fn(
+        return routed(
             hidden_states,
             w1,
             w2,
@@ -240,11 +251,56 @@ def _build_fused_moe_custom_op(
             topk_weights,
             topk_ids,
             experts_start,
-            shared=SharedExpert(shared_w1, shared_s1, shared_w2, shared_s2),
+            extra0,
+            extra1,
+            extra2,
+            extra3,
         )
 
+    def routed_and_8(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+        extra0: jax.Array,
+        extra1: jax.Array,
+        extra2: jax.Array,
+        extra3: jax.Array,
+        extra4: jax.Array,
+        extra5: jax.Array,
+        extra6: jax.Array,
+        extra7: jax.Array,
+    ) -> jax.Array:
+        return routed(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            extra0,
+            extra1,
+            extra2,
+            extra3,
+            extra4,
+            extra5,
+            extra6,
+            extra7,
+        )
+
+    num_extra_groups = int(with_shared) + int(with_dual)
     fused_moe_kernel_impl = pallas.jax_op(
-        op_name, routed_and_shared if with_shared else routed
+        op_name, (routed_only, routed_and_4, routed_and_8)[num_extra_groups]
     )
 
     # We must overwrite the default fake implementation as vLLM uses dynamic
@@ -261,6 +317,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         with_shared,
+        with_dual,
     )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
@@ -274,6 +331,7 @@ def _get_fused_moe_custom_op(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     with_shared: bool = False,
+    with_dual: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
@@ -284,6 +342,7 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         with_shared,
+        with_dual,
     )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
@@ -295,6 +354,7 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         with_shared=with_shared,
+        with_dual=with_dual,
     )
 
 
@@ -306,6 +366,7 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     with_shared: bool = False,
+    with_dual: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -315,6 +376,7 @@ def prebuild_fused_moe_kernel(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         with_shared=with_shared,
+        with_dual=with_dual,
     )
 
 
@@ -334,11 +396,14 @@ def fused_moe_gmm(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     shared: tuple[torch.Tensor, ...] | None = None,
+    tp_experts: tuple[torch.Tensor, ...] | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
     ``shared`` holds a shared expert's tensors in SharedExpert's order; its
     output is then added to the routed output (fused_moe_func).
+    ``tp_experts`` holds the dual layout's TP-sliced experts in
+    TpSlicedExperts' order (fused_moe_func).
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -358,6 +423,7 @@ def fused_moe_gmm(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         with_shared=shared is not None,
+        with_dual=tp_experts is not None,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
@@ -376,4 +442,5 @@ def fused_moe_gmm(
         topk_ids,
         experts_start,
         *(shared or ()),
+        *(tp_experts or ()),
     )

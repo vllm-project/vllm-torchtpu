@@ -5793,6 +5793,10 @@ class TPUModelRunner(GPUModelRunner):
             )
 
             arm_dense_fp4_shared(self.model, "target model")
+        if envs.TPU_MOE_DUAL_LAYOUT_MAX_TOKENS:
+            from vllm_torchtpu.layers.adapter.dense_fp4_dual import arm_dense_fp4_dual
+
+            arm_dense_fp4_dual(self.model, "target model")
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache

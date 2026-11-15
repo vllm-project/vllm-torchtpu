@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import NamedTuple
 
 import jax
 from jax import numpy as jnp
@@ -89,6 +90,7 @@ _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 _DENSE_FP4_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_MAX_TOKENS
+_DUAL_LAYOUT_MAX_TOKENS = envs.TPU_MOE_DUAL_LAYOUT_MAX_TOKENS
 # Fixed at import: one-hot permute/combine over the valid prefix only.
 _BOUNDED_ONEHOT = envs.TPU_MOE_BOUNDED_ONEHOT
 # Fixed at import: build the MoE permutation from one packed sort.
@@ -145,6 +147,76 @@ def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
     fp4 = jax.lax.bitcast_convert_type(w_packed, jnp.float4_e2m1fn)
     fp4 = fp4.reshape(*w_packed.shape[:-1], -1)  # [..., N, K]
     return jnp.swapaxes(fp4, -1, -2)  # [..., K, N]
+
+
+class TpSlicedExperts(NamedTuple):
+    """Rank r's TP slice of every routed expert: intermediate columns
+    [r * i / R, (r + 1) * i / R) of each expert's gate, up and down, in the
+    K-major fp4 layout and per-128-row f32 block scales of the EP weights
+    (`fused_moe_func`'s dual layout)."""
+
+    w1: jax.Array  # [E, h, 2 * i / R] fp4: [gate | up]
+    w2: jax.Array  # [E, i / R, h] fp4
+    s1: jax.Array  # [E, h / 128, 1, 2 * i / R] f32
+    s2: jax.Array  # [E, i / 128 / R, 1, h] f32
+
+
+def _fp4_to_words(w: jax.Array) -> jax.Array:
+    """fp4 [..., n] -> int32 [..., n / 8]: collectives take no 4-bit type."""
+    pairs = w.reshape(*w.shape[:-1], -1, 2)
+    octets = jax.lax.bitcast_convert_type(pairs, jnp.uint8)
+    quads = octets.reshape(*w.shape[:-1], -1, 4)
+    return jax.lax.bitcast_convert_type(quads, jnp.int32)
+
+
+def _words_to_fp4(words: jax.Array) -> jax.Array:
+    """Inverse of `_fp4_to_words`."""
+    octets = jax.lax.bitcast_convert_type(words, jnp.uint8)
+    fp4 = jax.lax.bitcast_convert_type(
+        octets.reshape(*words.shape[:-1], -1), jnp.float4_e2m1fn
+    )
+    return fp4.reshape(*words.shape[:-1], -1)
+
+
+def tp_slice_sends(
+    w1: jax.Array, w2: jax.Array, s1: jax.Array, s2: jax.Array, num_ranks: int
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """An EP rank's routed experts ([E_local, h, 2i] fp4 [gate | up], [E_local,
+    i, h] fp4 and their [.., K/128, 1, N] f32 scales) cut into `num_ranks`
+    TP slices of the intermediate dim, destination-major: rows [q * E_local,
+    (q + 1) * E_local) of each result are rank q's slice of this rank's
+    experts, ready for an all-to-all; fp4 travels as int32 words."""
+    e, h, two_i = w1.shape
+    i_r = two_i // 2 // num_ranks
+    blocks = i_r // 128
+
+    def by_rank(v, axis, width):
+        # [.., i, ..] -> [R, .., i / R, ..] with the rank axis leading.
+        v = v.reshape(*v.shape[:axis], num_ranks, width, *v.shape[axis + 1 :])
+        return jnp.moveaxis(v, axis, 0)
+
+    def gate_up(v):  # [E, .., 2i] -> [R, E, .., 2i / R], [gate | up] per rank
+        v = v.reshape(*v.shape[:-1], 2, num_ranks, i_r)
+        v = jnp.moveaxis(v, -2, 0)
+        return v.reshape(*v.shape[:-2], 2 * i_r)
+
+    def flat(v):
+        return v.reshape(num_ranks * e, *v.shape[2:])
+
+    return (
+        flat(_fp4_to_words(gate_up(w1))),
+        flat(_fp4_to_words(by_rank(w2, 1, i_r))),
+        flat(gate_up(s1)),
+        flat(by_rank(s2, 1, blocks)),
+    )
+
+
+def tp_slices_from_received(
+    w1: jax.Array, w2: jax.Array, s1: jax.Array, s2: jax.Array
+) -> TpSlicedExperts:
+    """The all-to-all of `tp_slice_sends`' results (source-major, i.e. global
+    expert order under linear EP placement) as this rank's TpSlicedExperts."""
+    return TpSlicedExperts(_words_to_fp4(w1), _words_to_fp4(w2), s1, s2)
 
 
 def requant_unpack_kmajor(
@@ -810,8 +882,15 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     shared: SharedExpert | None = None,
+    tp_experts: TpSlicedExperts | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
+
+    ``tp_experts`` is the dual layout of EP weights: this rank's TP slice of
+    every routed expert. Steps of up to TPU_MOE_DUAL_LAYOUT_MAX_TOKENS tokens
+    run the dense fp4 kernel on it with the global ids (every rank streams
+    the same share of the touched experts, where EP leaves the busiest rank
+    to set the step time); the result is a per-rank partial like the EP one.
 
     With ``shared``, an always-on expert's output (rounded to bf16) is added to
     the routed output, as vLLM's MoERunner adds a separately computed shared
@@ -845,8 +924,20 @@ def fused_moe_func(
 
     num_tokens, hidden_size = hidden_states.shape
 
+    dual = (
+        tp_experts is not None
+        and use_ep
+        and 0 < num_tokens <= _DUAL_LAYOUT_MAX_TOKENS
+        and rhs_quant_dtype is None
+        and w1_bias is None
+        and w2_bias is None
+        and can_use_dense_expert_fp4(
+            hidden_states, *tp_experts, activation=activation, shared=shared
+        )
+    )
     dense_fp4 = (
-        0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
+        not dual
+        and 0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
         and rhs_quant_dtype is None
         and w1_bias is None
         and w2_bias is None
@@ -862,7 +953,7 @@ def fused_moe_func(
     )
     if shared is not None and activation != "swigluoai":
         raise NotImplementedError(f"shared experts take swigluoai, not {activation}")
-    if shared is not None and not dense_fp4:
+    if shared is not None and not (dense_fp4 or dual):
         routed = fused_moe_func(
             hidden_states,
             w1,
@@ -898,6 +989,17 @@ def fused_moe_func(
     # TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled) so the EP mask, GMM reduce,
     # and `where` propagate appropriately.
     topk_weights = topk_weights.astype(_get_topk_weights_dtype(hidden_states.dtype))
+
+    if dual:
+        logger.info_once("Selected dense fp4 decode MoE on TP-sliced experts")
+        return dense_expert_moe_fp4(
+            hidden_states,
+            *tp_experts,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            shared=shared,
+        )
 
     onehot_permute = (
         use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold

@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SHARED: bool = False
+    TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
     TPU_GMM_FP8_W8A8: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -753,6 +754,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in the same call, other steps add it with XLA inside the op. Armed once
     # after load.
     "TPU_MOE_DENSE_FP4_SHARED": env_bool("TPU_MOE_DENSE_FP4_SHARED", default=False),
+    # EP MoE layers with fp4 experts also keep a TP-sliced copy of every
+    # routed expert (layers/adapter/dense_fp4_dual.py), built at load by an
+    # all-to-all; steps of up to this many tokens run the dense fp4 kernel on
+    # it (fused_moe_gmm.fused_moe_func). 0 disables it.
+    "TPU_MOE_DUAL_LAYOUT_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_DUAL_LAYOUT_MAX_TOKENS", 0
+    ),
     # Prefill-sized gmm_v2 calls with fp4 experts (per-128-K-block scales) run
     # fp8 x fp8: the rhs tile requantized to e4m3 with per-column scales, the
     # lhs rows to e4m3 with per-row scales (kernels/megablox/gmm_v2.py

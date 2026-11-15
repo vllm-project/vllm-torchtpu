@@ -1427,3 +1427,48 @@ def test_prepare_routed_counting_sort_env_gate_restores_sorts(
     assert num_sorts == expected_sorts, (
         f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
     )
+
+
+def _all_to_all(per_rank_sends, num_ranks):
+    """Emulated all-to-all: rank q receives block q of every rank's sends."""
+    rows = per_rank_sends[0][0].shape[0] // num_ranks
+    return [
+        [
+            jnp.concatenate([s[k][q * rows : (q + 1) * rows] for s in per_rank_sends])
+            for k in range(4)
+        ]
+        for q in range(num_ranks)
+    ]
+
+
+def test_tp_slices_of_ep_weights_round_trip():
+    num_ranks, e, h, i = 4, 2, 256, 512
+    i_r = i // num_ranks
+    rng = np.random.default_rng(0)
+    g = num_ranks * e
+    w1 = jnp.asarray(rng.normal(size=(g, h, 2 * i)), jnp.float4_e2m1fn)
+    w2 = jnp.asarray(rng.normal(size=(g, i, h)), jnp.float4_e2m1fn)
+    s1 = jnp.asarray(rng.normal(size=(g, h // 128, 1, 2 * i)), jnp.float32)
+    s2 = jnp.asarray(rng.normal(size=(g, i // 128, 1, h)), jnp.float32)
+    sends = [
+        fused_moe_gmm.tp_slice_sends(
+            *(w[r * e : (r + 1) * e] for w in (w1, w2, s1, s2)), num_ranks
+        )
+        for r in range(num_ranks)
+    ]
+    assert sends[0][0].dtype == jnp.int32 and sends[0][1].dtype == jnp.int32
+    for q, received in enumerate(_all_to_all(sends, num_ranks)):
+        got = fused_moe_gmm.tp_slices_from_received(*received)
+        cols = slice(q * i_r, (q + 1) * i_r)
+        up_cols = slice(i + q * i_r, i + (q + 1) * i_r)
+        want = (
+            jnp.concatenate([w1[..., cols], w1[..., up_cols]], -1),
+            w2[:, cols],
+            jnp.concatenate([s1[..., cols], s1[..., up_cols]], -1),
+            s2[:, q * i_r // 128 : (q + 1) * i_r // 128],
+        )
+        for a, b in zip(got, want, strict=True):
+            assert a.dtype == b.dtype and a.shape == b.shape
+            np.testing.assert_array_equal(
+                np.asarray(a.astype(jnp.float32)), np.asarray(b.astype(jnp.float32))
+            )

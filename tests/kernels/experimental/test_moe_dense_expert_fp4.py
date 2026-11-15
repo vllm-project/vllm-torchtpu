@@ -49,7 +49,9 @@ def _shared(h, i_s, seed):
     )
 
 
-def _moe(x, w1, w2, s1, s2, weights, ids, e, topk, shared=None, use_ep=True):
+def _moe(
+    x, w1, w2, s1, s2, weights, ids, e, topk, shared=None, use_ep=True, tp_experts=None
+):
     return wrapper.fused_moe_func(
         x,
         w1,
@@ -68,6 +70,7 @@ def _moe(x, w1, w2, s1, s2, weights, ids, e, topk, shared=None, use_ep=True):
         onehot_moe_permute_threshold=wrapper.resolve_onehot_permute_threshold(),
         skip_padded_tokens=True,
         shared=shared,
+        tp_experts=tp_experts,
     )
 
 
@@ -148,4 +151,64 @@ def test_dense_fp4_shared_without_local_route_is_the_shared_expert():
     zeros = jnp.zeros_like(x)
     ref = np.asarray(wrapper.shared_expert_mlp(x, shared, zeros), np.float32)
     out = np.asarray(out, np.float32)
+    np.testing.assert_allclose(out, ref, rtol=0, atol=1e-2 * np.abs(ref).max())
+
+
+@pytest.mark.parametrize("m,with_shared", [(8, False), (13, True), (32, True)])
+def test_dual_layout_matches_ep(monkeypatch, m, with_shared):
+    """Ranks emulated on one chip: the sum of the ranks' partials over the
+    TP-sliced copy equals the EP ranks' sum, up to summation order."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    num_ranks, e, h, i, topk = 4, 2, 512, 512, 4
+    x, w1, w2, s1, s2, weights, _ = _inputs(m, h, i, num_ranks * e, topk, seed=m)
+    rng = np.random.default_rng(m)
+    ids = jnp.asarray(
+        np.stack([rng.choice(num_ranks * e, topk, replace=False) for _ in range(m)]),
+        jnp.int32,
+    )
+    ep = [[w[r * e : (r + 1) * e] for w in (w1, w2, s1, s2)] for r in range(num_ranks)]
+    sends = [wrapper.tp_slice_sends(*w, num_ranks) for w in ep]
+    copies = [
+        wrapper.tp_slices_from_received(
+            *(
+                jnp.concatenate([s[k][q * e : (q + 1) * e] for s in sends])
+                for k in range(4)
+            )
+        )
+        for q in range(num_ranks)
+    ]
+    # Each rank's slice of a TP-sliced shared expert, the same in both layouts.
+    shared = [
+        _shared(h, 128, seed=m + r) if with_shared else None for r in range(num_ranks)
+    ]
+    monkeypatch.setattr(wrapper, "_DENSE_FP4_MAX_TOKENS", 32)
+    jax.clear_caches()
+
+    def total(tp):
+        out = 0
+        for r in range(num_ranks):
+            out = out + np.asarray(
+                _moe(
+                    x,
+                    *ep[r],
+                    weights,
+                    ids,
+                    r * e,
+                    topk,
+                    shared[r],
+                    tp_experts=copies[r] if tp else None,
+                ),
+                np.float32,
+            )
+        return out
+
+    monkeypatch.setattr(wrapper, "_DUAL_LAYOUT_MAX_TOKENS", 0)
+    ref = total(tp=True)  # the cap keeps the EP path
+    monkeypatch.setattr(wrapper, "_DUAL_LAYOUT_MAX_TOKENS", 32)
+    jax.clear_caches()
+    assert kernel.can_use_dense_expert_fp4(
+        x, *copies[0], activation="swigluoai", shared=shared[0]
+    )
+    out = total(tp=True)
     np.testing.assert_allclose(out, ref, rtol=0, atol=1e-2 * np.abs(ref).max())
