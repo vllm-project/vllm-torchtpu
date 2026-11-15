@@ -24,6 +24,11 @@ from the grammar state after the previous step's tokens and from the drafter's
 proposal for this step. Both are on the host only with async scheduling off, so
 GaaD turns async scheduling off (``check_config``).
 
+Forcing a token pins the canonical tokenization of the jump string, which can
+differ from the tokens decoding without drafts picks, and so change the text
+generated after it. With ``VLLM_TPU_JUMP_DECODING_VERIFY=1`` the forced tokens
+are verified like model drafts instead, so greedy output is unchanged.
+
 A row has at most ``num_speculative_tokens`` slots. Without a drafter, the
 speculative config names ``GAAD_PROPOSER`` as a ``custom_class`` method and
 GaaD fills every row.
@@ -76,6 +81,12 @@ def is_enabled() -> bool:
     from vllm_torchtpu import envs
 
     return bool(envs.VLLM_TPU_JUMP_DECODING)
+
+
+def verifies_forced_tokens() -> bool:
+    from vllm_torchtpu import envs
+
+    return bool(envs.VLLM_TPU_JUMP_DECODING_VERIFY)
 
 
 def check_config(vllm_config: VllmConfig) -> None:
@@ -230,6 +241,8 @@ def plan_request(
     finally:
         cursor.rollback()
     request.spec_token_ids = tokens
+    if verifies_forced_tokens():
+        return [DRAFT_FLAG_MODEL] * len(flags)
     return flags
 
 

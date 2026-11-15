@@ -308,3 +308,10 @@ def test_draft_flags_are_laid_out_like_the_drafts(monkeypatch, enabled):
         return
     # a: its flags; b: no drafts; c: G then MODEL by default; then padding.
     assert flags.tolist() == [G, G, M, G, M, 0, 0, 0]
+
+
+def test_verify_mode_marks_forced_tokens_model(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_JUMP_DECODING_VERIFY", "1")
+    request = _request()
+    assert plan_request(request, _manager(), 7) == [M, M, M]
+    assert request.spec_token_ids == [1, 2, 3]
