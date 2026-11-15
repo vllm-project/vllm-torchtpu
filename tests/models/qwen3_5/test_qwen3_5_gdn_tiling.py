@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tile selection, metadata bounds and the fused 1-dot recurrence of the
-Qwen3.5 GDN v3 copy."""
+Qwen3.5 GDN v3 copy. The tiler, the per-step trims and the fused 1-dot run only
+at the Qwen3.5-397B shapes they were measured at; every other shape takes
+main's tiles and main's per-step code."""
 
+import dataclasses
 import re
 
 import jax
@@ -23,9 +26,13 @@ import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.gdn.v3 import compute_conv1d as main_compute_conv1d
+from vllm_torchtpu.kernels.gdn.v3 import compute_gdn as main_compute_gdn
 from vllm_torchtpu.kernels.gdn.v3 import config as main_config
 from vllm_torchtpu.kernels.gdn.v3 import metadata as main_metadata
+from vllm_torchtpu.kernels.gdn.v3 import wrapper as main_wrapper
 from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
+    compute_conv1d,
     compute_gdn,
     config,
     metadata,
@@ -183,9 +190,11 @@ def test_select_decode_tile_size(kwargs, expected):
     assert tiling.select_decode_tile_size(**args) == expected
 
 
-def _call_kernels(n_kq, n_v, window, num_seqs, num_tokens, state_dtype, **kwargs):
+def _call_kernels(
+    n_kq, n_v, window, num_seqs, num_tokens, state_dtype, module=wrapper, **kwargs
+):
     """Kernel names of one fused_conv1d_gdn call (decode and prefill/mixed),
-    traced from shapes only."""
+    traced from shapes only. `module` is the copy's wrapper or main's."""
     dim = 2 * n_kq * D_K + n_v * D_V
     num_slots = num_seqs * window + 1
 
@@ -211,7 +220,7 @@ def _call_kernels(n_kq, n_v, window, num_seqs, num_tokens, state_dtype, **kwargs
     if window > 1:
         inputs["read_offsets"] = sds((num_seqs,), jnp.int32)
     jaxpr = jax.make_jaxpr(
-        lambda x: wrapper.fused_conv1d_gdn.__wrapped__(
+        lambda x: module.fused_conv1d_gdn.__wrapped__(
             **x,
             conv_bias=None,
             n_kq=n_kq,
@@ -272,18 +281,27 @@ def test_decode_tile_per_call(
     ) == (f"batched_{batched}", f"per_seq_b1_{mixed}")
 
 
-def _cfg(mode, tile_size, window_size=1, batch_size=256, **kwargs):
-    return config.GDNConfig(
+def _cfg(
+    mode,
+    tile_size,
+    window_size=1,
+    batch_size=256,
+    n_kq=2,
+    n_v=8,
+    cfg_module=config,
+    **kwargs,
+):
+    return cfg_module.GDNConfig(
         mode=mode,
-        dtypes=config.Dtypes(
+        dtypes=cfg_module.Dtypes(
             act_in=F32, act_out=BF16, compute=F32, recurrent_state=F32, conv_state=F32
         ),
         batch_size=batch_size,
-        dim_size=2 * 2 * D_K + 8 * D_V,
+        dim_size=2 * n_kq * D_K + n_v * D_V,
         kernel_size=KERNEL_SIZE,
         tile_size=tile_size,
-        num_kq_heads=2,
-        num_v_heads=8,
+        num_kq_heads=n_kq,
+        num_v_heads=n_v,
         kq_head_dim=D_K,
         v_head_dim=D_V,
         window_size=window_size,
@@ -467,11 +485,186 @@ def test_the_decode_tile_override_reaches_the_kernel():
         (16, 64, 2, True),
         (2, 8, 4, False),
         (8, 32, 1, False),
-        # TP4 (16 value heads per rank) stays below the threshold.
+        # TP4 (16 value heads per rank) is not a fused shape.
         (4, 16, 4, False),
+        # Qwen3.5-35B-A3B at TP1 (32 value heads per rank, as the 397B at TP2,
+        # but 16 kq heads), TP2 and TP4 keeps main's two-dot form.
+        (16, 32, 4, False),
+        (8, 16, 4, False),
+        (4, 8, 4, False),
     ],
 )
 def test_the_fused_1dot_rule(n_kq, n_v, window, fused):
-    assert wrapper.use_fused_1dot(window, n_v) is fused
+    assert wrapper.use_fused_1dot(window, n_kq, n_v, D_K, D_V) is fused
     params = _decode_call_params(n_kq=n_kq, n_v=n_v, window=window)
     assert f"'fused_1dot': {fused}" in params
+
+
+def test_off_the_fused_shapes_a_verify_window_computes_mains_recurrence():
+    """Qwen3.5-35B-A3B at TP1 with MTP: its verify windows give main's
+    recurrence bit for bit."""
+    n_kq, n_v, seq_tile, window = 16, 32, 2, 4
+    aligned_v = 128
+    rngs = iter(jax.random.split(jax.random.key(7), 9))
+    args = (
+        jnp.array([window, 2], jnp.int32),
+        jax.random.normal(next(rngs), (seq_tile, n_kq, window, 1, D_K), F32),
+        jax.random.normal(next(rngs), (seq_tile, n_kq, window, 1, D_K), F32),
+        jax.random.normal(next(rngs), (seq_tile, n_v, window, 1, D_V), F32),
+        jax.random.normal(next(rngs), (seq_tile, 1, window, 1, aligned_v), F32),
+        jax.random.normal(next(rngs), (seq_tile, 1, window, 1, aligned_v), F32),
+        0.1 * jax.random.normal(next(rngs), (seq_tile, n_v, D_K, D_V), F32),
+        jax.random.normal(next(rngs), (aligned_v,), F32),
+        jax.random.normal(next(rngs), (aligned_v,), F32),
+    )
+    shape = dict(tile_size=seq_tile, window_size=window, n_kq=n_kq, n_v=n_v)
+    cfg = _cfg(
+        config.GDNMode.BATCHED,
+        fused_1dot=wrapper.use_fused_1dot(window, n_kq, n_v, D_K, D_V),
+        **shape,
+    )
+    ref_cfg = _cfg(main_config.GDNMode.BATCHED, cfg_module=main_config, **shape)
+    got = jax.jit(lambda *a: compute_gdn.recurrent_gdn(*a, cfg=cfg))(*args)
+    want = jax.jit(lambda *a: main_compute_gdn.recurrent_gdn(*a, cfg=ref_cfg))(*args)
+    for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(g, w)
+
+
+def _per_seq_chunk(kernels):
+    (chunk,) = [int(k.rsplit("_c", 1)[1]) for k in kernels if k.startswith("per_seq")]
+    return chunk
+
+
+# Per-rank GDN shapes outside config.TILER_SHAPES, with token counts at
+# which the tiler's chunk would differ from main's: Qwen3.5-35B-A3B (16 kq and
+# 32 value heads) at TP4, as main's CI serves it, at TP2 and at TP1, and the
+# Qwen3.5-397B at TP4. A 24-token batch keeps a 24-token chunk, which the
+# tiler would round down to 16; it is used only where the chunked solve's
+# triangular block (8 or fewer rows above 8 value heads) divides 24.
+_MAIN_CHUNK_CASES = [
+    (4, 8, 96),
+    (4, 8, 8192),
+    (8, 16, 24),
+    (8, 16, 8192),
+    (16, 32, 24),
+    (16, 32, 8192),
+    (4, 16, 24),
+    (4, 16, 8192),
+]
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize(("n_kq", "n_v", "num_tokens"), _MAIN_CHUNK_CASES)
+def test_off_the_tiler_shapes_the_prefill_chunk_is_mains(
+    monkeypatch, n_kq, n_v, num_tokens, dynamic
+):
+    """Outside config.TILER_SHAPES the prefill/mixed kernel takes the
+    chunk main's kernel takes: 64 tokens by default (the batch, if smaller),
+    or the VMEM fit under dynamic tiling."""
+    monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", dynamic)
+    got = _per_seq_chunk(_call_kernels(n_kq, n_v, 1, 1, num_tokens, F32))
+    want = _per_seq_chunk(
+        _call_kernels(n_kq, n_v, 1, 1, num_tokens, F32, module=main_wrapper)
+    )
+    assert got == want
+    if not dynamic:
+        assert got == min(num_tokens, wrapper.MAIN_MIXED_TILE_SIZE)
+
+
+@pytest.mark.parametrize(
+    ("n_kq", "n_v", "num_tokens", "chunk"),
+    [
+        # The PP8 x TP1 prefill legs: the VMEM fit, and a 40-token batch
+        # rounded down to a multiple of 16 (main's chunk would be 40).
+        (16, 64, 8192, 64),
+        (16, 64, 40, 32),
+        # The DP4 x TP2 and TP8 decode legs: 128 fits.
+        (8, 32, 8192, 128),
+        (2, 8, 8192, 128),
+        (8, 32, 40, 32),
+        (2, 8, 40, 32),
+    ],
+)
+def test_at_the_tiler_shapes_the_tiler_sizes_the_prefill_chunk(
+    monkeypatch, n_kq, n_v, num_tokens, chunk
+):
+    assert (n_kq, n_v, D_K, D_V) in config.TILER_SHAPES
+    for dynamic in (False, True):
+        monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", dynamic)
+        assert _per_seq_chunk(_call_kernels(n_kq, n_v, 1, 1, num_tokens, F32)) == (
+            chunk
+        )
+
+
+def _batched_tile(kernels):
+    (tile,) = [
+        int(re.search(r"_b(\d+)_", k).group(1))
+        for k in kernels
+        if k.startswith("batched")
+    ]
+    return tile
+
+
+# (window, sequences, tokens): a one-sequence decode (main's CI serves
+# max-num-seqs 1), a 32-sequence decode and 16 verify windows of 4.
+_MAIN_DECODE_CALLS = [(1, 1, 16), (1, 32, 256), (4, 16, 64)]
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize(("window", "num_seqs", "num_tokens"), _MAIN_DECODE_CALLS)
+@pytest.mark.parametrize(("n_kq", "n_v"), [(4, 8), (8, 16), (16, 32)])
+def test_off_the_tiler_shapes_the_decode_tile_is_mains(
+    monkeypatch, n_kq, n_v, window, num_seqs, num_tokens, dynamic
+):
+    """Qwen3.5-35B-A3B at TP4, TP2 and TP1: the decode kernel takes the tile
+    main's kernel takes, the caller's 4 under the window cap, or main's
+    dynamic pick."""
+    monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", dynamic)
+    args = (n_kq, n_v, window, num_seqs, num_tokens, F32)
+    got = _batched_tile(_call_kernels(*args))
+    want = _batched_tile(_call_kernels(*args, module=main_wrapper))
+    assert got == want
+
+
+@pytest.mark.parametrize(
+    ("n_kq", "n_v", "trims"),
+    [
+        (16, 64, True),
+        (8, 32, True),
+        (2, 8, True),
+        (4, 8, False),
+        (8, 16, False),
+        (16, 32, False),
+        (4, 16, False),
+    ],
+)
+def test_the_step_trims_rule(n_kq, n_v, trims):
+    assert ((n_kq, n_v, D_K, D_V) in config.TILER_SHAPES) is trims
+    params = _decode_call_params(n_kq=n_kq, n_v=n_v, window=1)
+    assert f"'step_trims': {trims}" in params
+
+
+def test_without_the_step_trims_the_conv_taps_are_mains():
+    """The conv program off the tiler shapes is main's, op for op; the trims'
+    first-product start is a different program."""
+    n_kq, n_v, seq_tile, chunk = 4, 8, 4, 1
+    dim = 2 * n_kq * D_K + n_v * D_V
+    rngs = iter(jax.random.split(jax.random.key(11), 2))
+    args = (
+        jnp.array([1, 1, 0, 1], jnp.int32),
+        jax.random.normal(next(rngs), (seq_tile, chunk + KERNEL_SIZE - 1, 1, dim), F32),
+        jax.random.normal(next(rngs), (KERNEL_SIZE, 1, dim), F32),
+        None,
+    )
+    shape = dict(tile_size=seq_tile, n_kq=n_kq, n_v=n_v)
+    cfg = _cfg(config.GDNMode.BATCHED, **shape)
+    ref_cfg = _cfg(main_config.GDNMode.BATCHED, cfg_module=main_config, **shape)
+
+    def program(fn, c):
+        return str(jax.make_jaxpr(lambda *a: fn(*a, cfg=c))(*args))
+
+    want = program(main_compute_conv1d.causal_conv1d, ref_cfg)
+    assert not cfg.step_trims
+    assert program(compute_conv1d.causal_conv1d, cfg) == want
+    trims = dataclasses.replace(cfg, step_trims=True)
+    assert program(compute_conv1d.causal_conv1d, trims) != want
