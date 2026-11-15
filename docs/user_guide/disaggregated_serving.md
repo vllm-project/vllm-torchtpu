@@ -112,7 +112,45 @@ python examples/disagg/toy_proxy_server.py \
 
 ---
 
-## 4. Reference Launch Scripts & GKE Manifests
+## 4. Decode Capacity Preemption & Error Contract
+
+When a Decode instance (`kv_role="kv_consumer"`) runs with `kv_load_failure_policy="fail"` (the upstream vLLM default), `vllm-torchtpu` aborts `RUNNING` requests that are evicted due to KV cache capacity pressure instead of returning them to `waiting` to recompute prompts locally on the decode pool. Administrative prefix cache resets (`reset_prefix_cache`) continue to requeue requests without aborting them.
+
+### Proxy & Router Error Contract
+
+Aborted victims emit a single terminal `EngineCoreOutput` once the preemption step's `finished_req_ids` drains:
+
+* `finish_reason`: `"error"` (`FinishReason.ERROR`)
+* `stop_reason`: `"kv_cache_preempted"`
+* `kv_transfer_params`:
+
+```json
+{
+  "kv_transfer_error": {
+    "status_code": 500,
+    "status_name": "model.KVCachePreempt",
+    "status_message": "D-side request was preempted due to KV cache capacity."
+  }
+}
+```
+
+Preemption metrics (`vllm:num_preemptions`, `vllm:request_num_preemptions`, and `EngineCoreEventType.PREEMPTED`) are still recorded alongside `vllm:request_success{finished_reason="error"}` so capacity evictions remain observable in engine logs and dashboards.
+
+### Configuration & Override
+
+Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` enables abort; `"recompute"` keeps local recomputation). To override this behavior independently of `kv_load_failure_policy`, set `additional_config.abort_on_preemption` (`bool`) on the `kv_consumer` instance:
+
+```bash
+# Keep preempt-and-recompute on capacity eviction while keeping kv_load_failure_policy="fail"
+--additional-config '{"abort_on_preemption": false}'
+
+# Enable capacity-preemption abort even when kv_load_failure_policy="recompute"
+--additional-config '{"abort_on_preemption": true}'
+```
+
+---
+
+## 5. Reference Launch Scripts & GKE Manifests
 
 | Script / Manifest | Description |
 | :--- | :--- |
@@ -124,7 +162,7 @@ python examples/disagg/toy_proxy_server.py \
 
 ---
 
-## 5. Key Raiden Environment Variables
+## 6. Key Raiden Environment Variables
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |

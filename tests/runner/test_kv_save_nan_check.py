@@ -21,6 +21,9 @@ import numpy as np
 import pytest
 import torch
 from runner_input_test_utils import _host_copy_state
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.sequence import IntermediateTensors
 
@@ -184,8 +187,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         def wait_for_save(self, nan_check=None):
             self.snapshot = nan_check
 
-        def get_finished(self, _finished_req_ids):
-            return {"r0"}, None
+        def get_transfer_results(self, _finished_req_ids):
+            return KVConnectorTransferResults(finished_sending={"r0"})
 
         def get_block_ids_with_load_errors(self):
             return set()
@@ -200,9 +203,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             pass
 
     connector = OptInConnector()
-    wave = MagicMock()
-    wave.step.return_value = contextlib.nullcontext()
-    wave.start_forward.return_value = IntermediateTensors(
+    handoff = MagicMock()
+    handoff.start_forward.return_value = IntermediateTensors(
         {"hidden_states": torch.zeros(2, 2), "residual": torch.zeros(2, 2)}
     )
 
@@ -231,7 +233,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     valid_tokens_per_chunk = [2, 1]
 
     runner = SimpleNamespace(
-        _pp_wave=None if pp_is_last else wave,
+        _pp_handoff=None if pp_is_last else handoff,
+        _dp_step_other_decode=False,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
         _pp_pending_scheduler_output=None,
@@ -248,6 +251,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         phase_based_profiler=None,
         _is_async_drafter=False,
         _greedy_top_tokens_this_step=lambda: False,
+        _min_tokens_batch_state=lambda: {},
         vllm_config=SimpleNamespace(),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
         input_batch=SimpleNamespace(
@@ -267,6 +271,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
                 num_computed_tokens=0, num_tokens=1, output_token_ids=[]
             ),
         },
+        num_prompt_logprobs={},
         _run_dp_dummy_chunk=MagicMock(),
         query_start_loc_np=np.zeros(4, dtype=np.int32),
         _last_sequence_layout_plan=None,
@@ -284,17 +289,19 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _kv_cache_bundle=None,
         _stage_timing=MagicMock(),
         is_pooling_model=False,
+        pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
             maybe_select_logits_hidden_states=lambda hs, _plan, _idx: hs[:1]
         ),
         compute_logits_from_hidden_states=lambda _hs: torch.zeros(1, 8),
         _attn_metadata_builder_ctx=SimpleNamespace(
-            mamba_state_indices=None, unified_mamba_state_indices=None
+            mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None
         ),
         mamba_slot_read_offsets=None,
         speculative_config=None,
         _fence_spec_kv_under_token_copy=False,
         _is_dspark_pd_producer=False,
+        _adaptive_verification=None,
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda _logits: torch.tensor([7]),
         _update_mamba_slot_read_offsets=lambda *_args: None,
@@ -324,11 +331,15 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner._prepare_inputs = prepare_inputs
     runner.forward_model = MagicMock(side_effect=[(out, None) for out in chunk_outputs])
     for name in (
+        "_any_decode",
+        "_readmit_trimmed_drafts",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
+        "_build_kv_connector_output",
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",
+        "_maybe_select_logits_hidden_states",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 

@@ -73,9 +73,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TORCHTPU_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-# Provides get_vllm_commit_hash (the vLLM pin in pyproject.toml).
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/configs/pipeline_config.sh"
 
 VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 OUTPUT_DIR="${OUTPUT_DIR:-${TORCHTPU_ROOT}/dist}"
@@ -131,15 +128,6 @@ CORE_VERSION=$1
 WHEEL_VERSION="${CORE_VERSION}"
 [[ -n "${CORE_VERSION}" ]] || die "CORE_VERSION must not be empty."
 
-# The vLLM ref CI tested: the pin in pyproject.toml, unless overridden.
-PINNED_VLLM_REF="$(get_vllm_commit_hash)" \
-    || die "could not read the vLLM pin from ${TORCHTPU_ROOT}/pyproject.toml."
-VLLM_REF="${VLLM_REF_OVERRIDE:-${PINNED_VLLM_REF}}"
-if [[ "${VLLM_REF}" != "${PINNED_VLLM_REF}" ]]; then
-    echo "WARNING: building vLLM ${VLLM_REF} (VLLM_REF_OVERRIDE), not the" \
-         "pyproject.toml pin ${PINNED_VLLM_REF}. Do not publish this wheel." >&2
-fi
-
 # Make it absolute; the build runs from inside the temp clone.
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
@@ -161,6 +149,15 @@ for tool in cargo rustc; do
             "${WHEEL_PLATFORM_TAG}. Run without Rust on PATH."
     fi
 done
+
+# The vLLM ref CI tested: the pin in pyproject.toml, unless overridden.
+PINNED_VLLM_REF="$("${PYTHON}" "${SCRIPT_DIR}/bootstrap.py" vllm-pin)" \
+    || die "could not read the vLLM pin from ${TORCHTPU_ROOT}/pyproject.toml."
+VLLM_REF="${VLLM_REF_OVERRIDE:-${PINNED_VLLM_REF}}"
+if [[ "${VLLM_REF}" != "${PINNED_VLLM_REF}" ]]; then
+    echo "WARNING: building vLLM ${VLLM_REF} (VLLM_REF_OVERRIDE), not the" \
+         "pyproject.toml pin ${PINNED_VLLM_REF}. Do not publish this wheel." >&2
+fi
 
 # --- Temp workspace and cleanup ----------------------------------------------
 # Set up before cloning so the clone is always removed, even on failure.

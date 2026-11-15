@@ -40,6 +40,23 @@ class ShapeDtypeStruct:
 
 
 @dataclasses.dataclass(frozen=True)
+class KvCacheGroup:
+    """Attention layers that share one page table and one retention rule.
+
+    Attributes:
+        name: The group's name; its page table is the `{name}_block_tables` input.
+        layer_names: The group's layers; layer `j` keeps its KV in state tensor `j`.
+        window: For a sliding-window group, the positions a query reads, itself
+            included (a query at position `p` reads keys from `p - window + 1`);
+            None for a group that keeps every block.
+    """
+
+    name: str
+    layer_names: tuple[str, ...]
+    window: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class ModelExportConfig:
     """General model export configuration."""
 
@@ -84,6 +101,9 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
             headers.
         speculative_config: Speculative decoding the runtime runs, recorded as
             `serving_config.speculative_config` (vLLM's field names); None for none.
+        max_verify_tokens: The draft tokens a step can verify beyond the drafter's,
+            such as tokens a grammar forces: a recurrent model keeps a checkpoint per
+            verify token, as it does per draft token. 0 for only the drafter's.
     """
 
     vocab_size: int = 151936
@@ -104,8 +124,20 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     hf_checkpoint_dir: str | None = None
     uses_mrope: bool = False
     speculative_config: dict[str, Any] | None = None
+    max_verify_tokens: int = 0
 
     def __post_init__(self) -> None:
+        if self.max_verify_tokens < 0:
+            raise ValueError(
+                f"max_verify_tokens must be >= 0, got {self.max_verify_tokens}"
+            )
+        if self.max_verify_tokens and self.speculative_config:
+            k = int(self.speculative_config["num_speculative_tokens"])
+            if self.max_verify_tokens <= k:
+                raise ValueError(
+                    f"max_verify_tokens ({self.max_verify_tokens}) must exceed "
+                    f"num_speculative_tokens ({k}), which the window already covers"
+                )
         if self.emit_byte_tokenizer and self.vocab_size > 256:
             raise ValueError(
                 f"emit_byte_tokenizer requires vocab_size <= 256, got {self.vocab_size}"
@@ -125,13 +157,26 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         return self.max_num_seqs + 1
 
     @property
+    def recurrent_window(self) -> int:
+        """Consecutive recurrent state slots a sequence holds: its state slot,
+        then one checkpoint per draft token a step can verify (the speculative
+        draft tokens, or `max_verify_tokens` when larger), so a verify step that
+        rejects drafts resumes from the accepted token's state.
+        """
+        drafted = 0
+        if self.speculative_config:
+            drafted = int(self.speculative_config["num_speculative_tokens"])
+        return max(drafted, self.max_verify_tokens) + 1
+
+    @property
     def num_state_slots(self) -> int:
-        """Slots of each recurrent state pool: one per sequence plus null slot 0.
+        """Slots of each recurrent state pool: `recurrent_window` per sequence
+        plus null slot 0.
 
         A recurrent layer's state is fixed-size per sequence, so its pool is sized
         by `max_num_seqs`, not by the paged KV `num_blocks`.
         """
-        return self.max_num_seqs + 1
+        return self.max_num_seqs * self.recurrent_window + 1
 
 
 @runtime_checkable

@@ -16,6 +16,7 @@ import contextlib
 import copy
 import inspect
 import weakref
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +35,9 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.kv_transfer import kv_transfer_state
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
@@ -52,7 +56,11 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    apply_top_k_top_p,
+    random_sampler_variants,
+    topk_candidate_blocks,
+)
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -64,11 +72,19 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
+from vllm_torchtpu.runner.speculative_decoding_manager import (
+    SpeculativeDecodingManager,
+)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
 )
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+
+def _warmup_requests():
+    return defaultdict(lambda: SimpleNamespace(output_token_ids=[]))
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
@@ -121,6 +137,7 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
@@ -131,6 +148,51 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     # 40960 tokens in 40 entries of 1024, and the ids must fit that row.
     assert block_ids == list(range(1, 1 + expected_blocks))
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
+
+
+def test_spec_warmup_request_verifies_k_drafts_under_dynamic_schedule():
+    """Each warmup decode step verifies the K drafts the step before proposed,
+    also when a dynamic speculative decoding schedule cuts host drafts."""
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.propose.return_value = [[7, 8, 9]]
+    captured = []
+    runner = SimpleNamespace(
+        max_model_len=4096,
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            num_speculative_tokens=3,
+            uses_dynamic_speculative_decoding=lambda: True,
+        ),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=64, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["__spec_warmup_0__"]),
+        _is_async_drafter=True,
+        _async_drafter=drafter,
+        execute_model=lambda so: captured.append(so),
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
+    )
+    manager = SpeculativeDecodingManager(runner)
+    runner.sample_tokens = lambda _: manager.propose_draft_token_ids(
+        sampled_token_ids=None,
+        scheduler_output=captured[-1],
+        next_tokens_per_chunk=[None],
+    )
+    runner.take_draft_token_ids = manager.take_draft_token_ids
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 128, idx=0)
+
+    decode_steps = captured[1:]
+    assert decode_steps
+    for so in decode_steps:
+        assert so.scheduled_spec_decode_tokens == {"__spec_warmup_0__": [7, 8, 9]}
 
 
 class _BlockTables(list):
@@ -159,6 +221,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     runner = SimpleNamespace(
         max_model_len=1048576,
         max_num_reqs=64,
+        max_num_local_reqs=64,
         max_num_tokens=256,
         block_size=384,
         max_num_blocks_per_req=pages,
@@ -279,6 +342,7 @@ def test_smem_caps_refresh_after_backend_block_size_update():
     runner = SimpleNamespace(
         max_model_len=32768,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=16,
         max_num_blocks_per_req=2048,
@@ -312,6 +376,7 @@ def test_smem_caps_refresh_keeps_block_table_width_when_block_size_unchanged():
     runner = SimpleNamespace(
         max_model_len=1000,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=16,
         max_num_blocks_per_req=64,  # placeholder table width, > cdiv(1000, 16)
@@ -338,6 +403,7 @@ def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
     runner = SimpleNamespace(
         max_model_len=32768,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=384,
         max_num_blocks_per_req=86,
@@ -426,10 +492,8 @@ def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
 @pytest.mark.parametrize("succeeds", [True, False])
 def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
     # Every stage runs the synthetic prefill through the hand-off in step,
-    # so a stage never retries on its own, and settles the burst after its
-    # forward so the launches that carry the prefill on are issued.
+    # so a stage never retries on its own.
     attempts = MagicMock(return_value=succeeds)
-    wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -437,7 +501,6 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
             pipeline_parallel_size=4, prefill_context_parallel_size=1
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
-        _pp_wave=wave,
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[4096],
         max_model_len=262144,
@@ -461,14 +524,12 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
         TPUModelRunner._warmup_mtp_prefill(runner)
 
     assert attempts.call_args_list == [((4096,), {})]
-    assert wave.settle.call_count == 1
 
 
 def test_mtp_prefill_warmup_fills_every_bucket():
     # Buckets are per rank: a PCP8 prompt of 8 x 512 tokens pads to 512 per
     # rank. Prompts above one scheduler step collapse onto its size.
     attempts = MagicMock(return_value=True)
-    wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -476,7 +537,6 @@ def test_mtp_prefill_warmup_fills_every_bucket():
             pipeline_parallel_size=4, prefill_context_parallel_size=8
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
-        _pp_wave=wave,
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[512, 1024, 1536, 2048, 4096, 8192],
         max_model_len=262144,
@@ -496,7 +556,6 @@ def test_mtp_prefill_warmup_fills_every_bucket():
         ((16384,), {}),
         ((32768,), {}),
     ]
-    assert wave.settle.call_count == 5
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -659,6 +718,7 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
@@ -666,6 +726,36 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
     # Each mixed variant that fits ran: the peak is R decoders plus two
     # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
     assert max(sizes) == min(R + 2, 4)
+
+
+def test_spec_warmup_keeps_optimistic_output_placeholders():
+    captured = []
+    requests = _warmup_requests()
+    spec = SimpleNamespace(max_num_blocks_per_req=lambda _config, _max_pos: 1)
+
+    def execute_model(so):
+        if so.scheduled_cached_reqs.req_ids:
+            captured.append(list(so.scheduled_cached_reqs.num_output_tokens))
+        rid = "__spec_warmup_0__"
+        requests[rid].output_token_ids.extend([0] * 8)
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=requests,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 1, idx=0)
+
+    assert captured == [[8 * (t + 1)] for t in range(9)]
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
@@ -801,6 +891,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
             None if spec_k is None else SimpleNamespace(num_speculative_tokens=spec_k)
         ),
         _last_sequence_layout_plan=None,
+        pcp_manager=None,
         input_batch=SimpleNamespace(req_ids=req_ids),
     )
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
@@ -915,7 +1006,11 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     cpu_samples = [("0", "main_forward", 0.1)] if has_samples else []
     device_samples = [("0", "main_forward", 0.2)] if has_samples else []
     connector = MagicMock()
-    connector.get_finished.return_value = ({"sent"}, {"loaded"})
+    connector.get_transfer_results.return_value = KVConnectorTransferResults(
+        finished_sending={"sent"},
+        finished_recving={"loaded", "failed"},
+        failed_recving={"failed"},
+    )
     connector.get_block_ids_with_load_errors.return_value = {41, 43}
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
@@ -935,7 +1030,15 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     ):
         result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
 
-    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, stats)
+    assert result == (
+        {"sent"},
+        {"loaded", "failed"},
+        {"failed"},
+        {"jobs": []},
+        {41, 43},
+        2,
+        stats,
+    )
     assert result[-1] is stats
     if isinstance(leaf_stats, TpuKVConnectorStats):
         assert leaf_stats.data["runner_cpu_issue_seconds"] == cpu_samples
@@ -944,7 +1047,8 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
         assert stats == original_stats
     assert unrelated_stats.data == original_unrelated_data
     runner._stage_timing.take_samples.assert_called_once_with()
-    connector.get_finished.assert_called_once_with({"finished"})
+    connector.get_transfer_results.assert_called_once_with({"finished"})
+    connector.get_finished.assert_not_called()
     connector.get_block_ids_with_load_errors.assert_called_once_with()
     connector.get_block_ids_with_load_errors_group_index.assert_called_once_with()
     connector.clear_connector_metadata.assert_called_once_with()
@@ -954,8 +1058,19 @@ def test_no_forward_output_preserves_invalid_block_ids():
     runner = SimpleNamespace(
         maybe_setup_kv_connector=MagicMock(),
         get_finished_kv_transfers=MagicMock(
-            return_value=(set(), {"failed-load"}, None, {41, 43}, 2, None)
+            return_value=(
+                set(),
+                {"failed-load"},
+                {"failed-load"},
+                None,
+                {41, 43},
+                2,
+                None,
+            )
         ),
+    )
+    runner._build_kv_connector_output = (
+        TPUModelRunner._build_kv_connector_output.__get__(runner)
     )
     scheduler_output = SimpleNamespace()
     vllm_config = SimpleNamespace()
@@ -969,12 +1084,36 @@ def test_no_forward_output_preserves_invalid_block_ids():
         )
 
     assert output.kv_connector_output.finished_recving == {"failed-load"}
+    assert output.kv_connector_output.failed_recving == {"failed-load"}
     assert output.kv_connector_output.invalid_block_ids == {41, 43}
     if tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         assert output.kv_connector_output.invalid_block_group_index == 2
 
 
-def test_build_kv_connector_output_supports_vllm_023():
+def test_no_forward_output_is_empty_without_transfers():
+    # What get_finished_kv_transfers returns when nothing finished.
+    runner = SimpleNamespace(
+        maybe_setup_kv_connector=MagicMock(),
+        get_finished_kv_transfers=MagicMock(
+            return_value=(None, None, set(), None, set(), None, None)
+        ),
+    )
+    runner._build_kv_connector_output = (
+        TPUModelRunner._build_kv_connector_output.__get__(runner)
+    )
+
+    with patch(
+        "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+        return_value=False,
+    ):
+        output = TPUModelRunner.kv_connector_no_forward(
+            runner, SimpleNamespace(), SimpleNamespace()
+        )
+
+    assert output is tpu_runner.EMPTY_MODEL_RUNNER_OUTPUT
+
+
+def test_make_kv_connector_output_omits_unsupported_group_index():
     with (
         patch.object(
             tpu_runner,
@@ -983,9 +1122,10 @@ def test_build_kv_connector_output_supports_vllm_023():
         ),
         patch.object(tpu_runner, "KVConnectorOutput") as output_cls,
     ):
-        tpu_runner._build_kv_connector_output(
+        tpu_runner._make_kv_connector_output(
             finished_sending={"sent"},
             finished_recving=None,
+            failed_recving=set(),
             kv_connector_worker_meta=None,
             invalid_block_ids=set(),
             invalid_block_group_index=None,
@@ -994,21 +1134,23 @@ def test_build_kv_connector_output_supports_vllm_023():
     output_cls.assert_called_once_with(
         finished_sending={"sent"},
         finished_recving=None,
+        failed_recving=set(),
         kv_connector_worker_meta=None,
         invalid_block_ids=set(),
         kv_connector_stats=None,
     )
 
 
-def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
+def test_make_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
     with patch.object(
         tpu_runner,
         "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
         False,
     ):
-        out = tpu_runner._build_kv_connector_output(
+        out = tpu_runner._make_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
+            failed_recving=set(),
             kv_connector_worker_meta=None,
             invalid_block_ids={41, 43},
             invalid_block_group_index=2,
@@ -1403,6 +1545,7 @@ class TestAttentionMetadataBuilder:
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
+        runner.pcp_manager = None
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
@@ -2329,7 +2472,12 @@ class TestUnifiedReadOffsetMigration:
         runner._mamba_ckpt_window = ckpt_window
         runner._bucket_len = TPUModelRunner._bucket_len
         runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
-        for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
+        for name in (
+            "_pad_dev_to_bucket",
+            "_expand_pool_split",
+            "_spec_seed_sources",
+            "_mamba_column_stride",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         # The collector strides the mamba block tables by the mamba groups'
         # spec block size (times the cp world), not by the attention block
@@ -2648,6 +2796,97 @@ class _FakeTpuEvent:
         self.synchronized += 1
 
 
+def _dummy_run_stand_in(monkeypatch, forward_model):
+    """A runner stand-in that `TPUModelRunner._dummy_run` can drive on CPU:
+    attention metadata and input staging run for real, the forward is
+    `forward_model`, and `compute_selected_logits` returns its input."""
+    _FakeTpuEvent.instances.clear()
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
+    for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
+        monkeypatch.setattr(tpu_runner, name, lambda *a, **kw: contextlib.nullcontext())
+    from vllm_torchtpu.layers.core.sequence_layout import (
+        DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    )
+
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        max_model_len=64,
+        max_num_tokens=64,
+        max_num_reqs=4,
+        max_num_blocks_per_req=4,
+        most_model_len=None,
+        block_size=16,
+        uses_mrope=False,
+        supports_mm_inputs=False,
+        _pp_is_first=True,
+        _pp_handoff=None,
+        _pp_topk_buffer=None,
+        _kv_cache_bundle=None,
+        lora_config=None,
+        vllm_config=MagicMock(),
+        mesh=MagicMock(),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+        _has_mamba_state=False,
+        mamba_slot_read_offsets=None,
+        _mamba_ckpt_window=1,
+        _prefill_ckpt_units=None,
+        _unified_kv_layout=False,
+        empty_slot_mappings={},
+        position_ids=torch.zeros(64, dtype=torch.int32),
+        _input_staging_fence=None,
+        _unfenced_h2d_sources=[],
+        _fenced_h2d_sources=[],
+        _free_h2d_sources={},
+        _registered_h2d_sources=set(),
+        _token_padding_state=None,
+        pcp_manager=None,
+        sequence_layout_planner=SimpleNamespace(
+            prepare_dummy=lambda **kw: SimpleNamespace(
+                descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            )
+        ),
+        maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
+        _dp_num_tokens_across_dp=lambda n: None,
+        forward_model=forward_model,
+        compute_selected_logits=lambda out, idx: out,
+        _dp_vocab_logits=False,
+    )
+    for name in (
+        "_build_attention_metadata",
+        "_record_input_staging_fence",
+        "_wait_input_staging_fence",
+        "_pp_take_topk_indices",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    bt = MagicMock()
+    bt.max_num_blocks_per_req = 4
+    bt.get_cpu_tensor.return_value = torch.zeros((4, 4), dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(block_table=[bt])
+    builder = AttentionMetadataBuilder(
+        kv_cache_spec=FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.bfloat16,
+            page_size_padded=16384,
+        ),
+        layer_names=["attn.0"],
+        vllm_config=MagicMock(),
+        device=runner.device,
+        runner=runner,
+        kv_cache_group_id=0,
+    )
+    group = MagicMock()
+    group.metadata_builders = [builder]
+    group.layer_names = ["attn.0"]
+    runner.attn_groups = [[group]]
+
+    return runner
+
+
 class TestInputStagingFence:
     """A chunk records a fence after uploading from the reusable host staging
     tensors; the next chunk synchronizes on it before rewriting them, once."""
@@ -2824,18 +3063,6 @@ class TestInputStagingFence:
         release the previous run's host sources and fence its own before the
         forward, so repeated runs neither accumulate buffers nor make the next
         wait block on a dummy forward."""
-        _FakeTpuEvent.instances.clear()
-        monkeypatch.setattr(
-            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
-        )
-        monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
-        for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
-            monkeypatch.setattr(
-                tpu_runner, name, lambda *a, **kw: contextlib.nullcontext()
-            )
-        from vllm_torchtpu.layers.core.sequence_layout import (
-            DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-        )
 
         def forward_model(**kw):
             # The fence must already cover this run's uploads.
@@ -2843,75 +3070,7 @@ class TestInputStagingFence:
             assert runner._unfenced_h2d_sources == []
             return torch.zeros((4, 8), dtype=torch.float32), None
 
-        runner = SimpleNamespace(
-            device=torch.device("cpu"),
-            max_model_len=64,
-            max_num_tokens=64,
-            max_num_reqs=4,
-            max_num_blocks_per_req=4,
-            most_model_len=None,
-            block_size=16,
-            uses_mrope=False,
-            supports_mm_inputs=False,
-            _pp_is_first=True,
-            _pp_wave=None,
-            _pp_topk_buffer=None,
-            _kv_cache_bundle=None,
-            lora_config=None,
-            vllm_config=MagicMock(),
-            mesh=MagicMock(),
-            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
-            _has_mamba_state=False,
-            mamba_slot_read_offsets=None,
-            _mamba_ckpt_window=1,
-            _unified_kv_layout=False,
-            empty_slot_mappings={},
-            position_ids=torch.zeros(64, dtype=torch.int32),
-            _input_staging_fence=None,
-            _unfenced_h2d_sources=[],
-            _fenced_h2d_sources=[],
-            _free_h2d_sources={},
-            _registered_h2d_sources=set(),
-            _token_padding_state=None,
-            sequence_layout_planner=SimpleNamespace(
-                prepare_dummy=lambda **kw: SimpleNamespace(
-                    descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
-                )
-            ),
-            maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
-            _dp_num_tokens_across_dp=lambda n: None,
-            forward_model=forward_model,
-            compute_selected_logits=lambda out, idx: out,
-        )
-        for name in (
-            "_build_attention_metadata",
-            "_record_input_staging_fence",
-            "_wait_input_staging_fence",
-            "_pp_take_topk_indices",
-        ):
-            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
-        bt = MagicMock()
-        bt.max_num_blocks_per_req = 4
-        bt.get_cpu_tensor.return_value = torch.zeros((4, 4), dtype=torch.int32)
-        runner.input_batch = SimpleNamespace(block_table=[bt])
-        builder = AttentionMetadataBuilder(
-            kv_cache_spec=FullAttentionSpec(
-                block_size=16,
-                num_kv_heads=2,
-                head_size=128,
-                dtype=torch.bfloat16,
-                page_size_padded=16384,
-            ),
-            layer_names=["attn.0"],
-            vllm_config=MagicMock(),
-            device=runner.device,
-            runner=runner,
-            kv_cache_group_id=0,
-        )
-        group = MagicMock()
-        group.metadata_builders = [builder]
-        group.layer_names = ["attn.0"]
-        runner.attn_groups = [[group]]
+        runner = _dummy_run_stand_in(monkeypatch, forward_model)
 
         for dp_lockstep in (False, True, False):
             TPUModelRunner._dummy_run(
@@ -2925,7 +3084,7 @@ class TestInputStagingFence:
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
 
         # With through_handoff=True, the fence must be recorded before
-        # _pp_wave.start_forward so the next wait never blocks on the receive.
+        # _pp_handoff.start_forward so the next wait never blocks on the receive.
         handoff_checked = []
 
         def start_forward(n):
@@ -2934,8 +3093,7 @@ class TestInputStagingFence:
             handoff_checked.append(n)
             return None
 
-        runner._pp_wave = SimpleNamespace(
-            step=contextlib.nullcontext,
+        runner._pp_handoff = SimpleNamespace(
             start_forward=start_forward,
             end_forward=lambda *a: None,
         )
@@ -3288,6 +3446,7 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     """
     from vllm_torchtpu import envs
 
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
     seen = []
@@ -3302,14 +3461,22 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
         lambda model: seen.append(("hash", model)),
     )
     runner = MagicMock(spec=TPUModelRunner)
+    runner._truncate_rope_caches.side_effect = lambda model: seen.append(
+        ("truncate", model)
+    )
     draft_model = object()
 
     TPUModelRunner._relayout_tables(runner, draft_model)
-    assert seen == [("rope", draft_model), ("hash", draft_model)]
+    assert seen == [
+        ("truncate", draft_model),
+        ("rope", draft_model),
+        ("hash", draft_model),
+    ]
 
     # No draft (ngram) or flags off: nothing to relayout.
     seen.clear()
     TPUModelRunner._relayout_tables(runner, None)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", False)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
     TPUModelRunner._relayout_tables(runner, draft_model)
@@ -3467,6 +3634,49 @@ def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
     assert int(out_bf16.item()) == 0
 
 
+def _recording_sampler(record):
+    """A `sample_from_logits_func` stand-in that calls
+    `record(u, (all_greedy, topk_candidates, apply_topk_topp))`, an omitted
+    argument taking `TPUModelRunner.sample_from_logits`'s default."""
+    signature = inspect.signature(TPUModelRunner.sample_from_logits)
+
+    def sample_from_logits(*args, **kwargs):
+        call = signature.bind(None, *args, **kwargs)
+        call.apply_defaults()
+        arg = call.arguments
+        record(
+            arg["u"],
+            (arg["all_greedy"], arg["topk_candidates"], arg["apply_topk_topp"]),
+        )
+        return torch.zeros((arg["logits"].shape[0], 1), dtype=torch.int32)
+
+    return sample_from_logits
+
+
+# A real vocabulary size: 1,940 whole CANDIDATE_BLOCKs.
+_VOCAB_SIZE = 248320
+
+
+def _precompile_runner(
+    record, speculative_config=None, candidate_blocks=0, num_reqs_paddings=(2,)
+):
+    """A runner stand-in for `_precompile_sample_from_logits` that samples
+    through `_recording_sampler(record)`. `candidate_blocks` stands for
+    TPU_SAMPLER_TOPK_CANDIDATES, gated on `_VOCAB_SIZE`."""
+    return SimpleNamespace(
+        num_reqs_paddings=list(num_reqs_paddings),
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+        _topk_candidate_blocks=lambda: topk_candidate_blocks(
+            candidate_blocks, _VOCAB_SIZE
+        ),
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        sample_from_logits_func=_recording_sampler(record),
+        speculative_config=speculative_config,
+    )
+
+
 @pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
 def test_sampler_applies_topk_topp_only_when_a_request_sets_them(
     speculative_config,
@@ -3486,89 +3696,47 @@ def test_sampler_applies_topk_topp_only_when_a_request_sets_them(
         assert TPUModelRunner._sampler_applies_topk_topp(runner) is expected
 
 
-def test_precompile_warms_the_no_topk_topp_graph_without_spec_decode():
-    """Without speculative decoding the precompile also warms the graph that
-    skips top-k/top-p, so the first decode step that uses it compiles
-    nothing."""
-    seen = []
-
-    def fake_sample_from_logits(
-        logits,
-        temperatures,
-        u,
-        top_k,
-        top_p,
-        all_greedy=False,
-        topk_candidates=0,
-        apply_topk_topp=True,
-    ):
-        seen.append((all_greedy, topk_candidates, apply_topk_topp))
-        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
-
-    runner = SimpleNamespace(
-        num_reqs_paddings=[2, 4],
-        _hidden_states_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-        _topk_candidate_blocks=lambda: 0,
-        _precompile_timed=lambda _name: contextlib.nullcontext(),
-        sample_from_logits_func=fake_sample_from_logits,
-        speculative_config=None,
-    )
-    TPUModelRunner._precompile_sample_from_logits(runner)
-    variants = [(False, 0, True), (False, 0, False), (True, 0, True)]
-    assert seen == variants * 2
-
-
 @pytest.mark.parametrize("candidate_blocks", [0, 8])
 @pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
 def test_every_runtime_sampler_variant_is_precompiled(
     speculative_config, candidate_blocks
 ):
-    """Every (all_greedy, topk_candidates, apply_topk_topp) graph that the
-    random sampling path picks at runtime is one the precompile warms, so
-    serving compiles no sampler graph after warmup."""
+    """Every (all_greedy, topk_candidates, apply_topk_topp) graph that
+    sampling picks at runtime, random or all-greedy, is one the precompile
+    warms in every num_reqs bucket, so serving compiles no sampler graph after
+    warmup. The random path picks from random_sampler_variants, which both
+    precompiles warm."""
+    num_blocks = topk_candidate_blocks(candidate_blocks, _VOCAB_SIZE)
+    num_reqs_paddings = (2, 4)
+    # (num_reqs, (all_greedy, topk_candidates, apply_topk_topp))
     warmed = set()
-
-    def fake_sample_from_logits(
-        logits,
-        temperatures,
-        u,
-        top_k,
-        top_p,
-        all_greedy=False,
-        topk_candidates=0,
-        apply_topk_topp=True,
-    ):
-        warmed.add((all_greedy, topk_candidates, apply_topk_topp))
-        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
-
     TPUModelRunner._precompile_sample_from_logits(
-        SimpleNamespace(
-            num_reqs_paddings=[2],
-            _hidden_states_dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-            _topk_candidate_blocks=lambda: candidate_blocks,
-            _precompile_timed=lambda _name: contextlib.nullcontext(),
-            sample_from_logits_func=fake_sample_from_logits,
-            speculative_config=speculative_config,
+        _precompile_runner(
+            lambda u, variant: warmed.add((u.shape[0], variant)),
+            speculative_config,
+            candidate_blocks,
+            num_reqs_paddings,
         )
     )
+    variants = {(False, *variant) for variant in random_sampler_variants(num_blocks)}
+    assert {(n, v) for n in num_reqs_paddings for v in variants} <= warmed
 
+    # vLLM's InputBatch stores vocab_size as the top_k of a request that does
+    # not set it.
+    unset = _VOCAB_SIZE
     for top_k, top_p in (
-        ([0, 0], [1.0, 1.0]),
-        ([0, 0], [0.9, 1.0]),
+        ([unset, unset], [1.0, 1.0]),
+        ([unset, unset], [0.9, 1.0]),
         ([2, 2], [1.0, 1.0]),
-        ([2, 0], [1.0, 1.0]),
+        ([2, unset], [1.0, 1.0]),
         ([100, 2], [0.9, 0.9]),
     ):
         runner = SimpleNamespace(
             speculative_config=speculative_config,
-            _topk_candidate_blocks=lambda: candidate_blocks,
+            _topk_candidate_blocks=lambda: num_blocks,
             input_batch=SimpleNamespace(
                 top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
-                no_top_k=not any(top_k),
+                no_top_k=all(k == unset for k in top_k),
                 no_top_p=all(p == 1.0 for p in top_p),
             ),
         )
@@ -3578,7 +3746,20 @@ def test_every_runtime_sampler_variant_is_precompiled(
                 TPUModelRunner._sampler_topk_candidates(runner, 0, 2, grammar_output),
                 TPUModelRunner._sampler_applies_topk_topp(runner),
             )
-            assert variant in warmed, (top_k, top_p, grammar_output, variant)
+            assert variant in variants, (top_k, top_p, grammar_output, variant)
+
+    # All-greedy batches sample through _greedy_sample.
+    greedy = []
+    TPUModelRunner._greedy_sample(
+        SimpleNamespace(
+            sample_from_logits_func=_recording_sampler(
+                lambda _u, variant: greedy.append(variant)
+            )
+        ),
+        torch.zeros((2, 16), dtype=torch.bfloat16),
+    )
+    assert len(greedy) == 1, greedy
+    assert {(n, greedy[0]) for n in num_reqs_paddings} <= warmed, greedy
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -3586,30 +3767,33 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     """At top_k == 0 and top_p == 1.0 (RL rollouts sample with top_k=-1 and
     top_p=1) the no-top-k/top-p path samples exactly the tokens of the full
     path; with top-k set, skipping would change them (negative control)."""
-    torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(0)
     runner = SimpleNamespace()
     runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
     num_reqs, vocab = 16, 4096
-    logits = (torch.randn(num_reqs, vocab) * 4).to(dtype)
-    temperatures = torch.ones((num_reqs, 1), dtype=dtype)
-    temperatures[:2] = 0.0  # Greedy rows keep their argmax either way.
+    logits = (torch.randn(num_reqs, vocab, generator=gen) * 4).to(dtype)
+    # Greedy rows (0.0) keep their argmax either way; the others sample at
+    # unit and non-unit temperatures.
+    temperatures = torch.tensor(
+        [[0.0], [0.7], [1.0], [1.3]] * (num_reqs // 4), dtype=dtype
+    )
     top_k = torch.zeros((num_reqs, 1), dtype=torch.int32)
     top_p = torch.ones((num_reqs, 1), dtype=torch.float32)
 
     scaled = runner._apply_temperature(logits, temperatures)
     assert torch.equal(apply_top_k_top_p(scaled, top_k, top_p, 0), scaled)
     for _ in range(4):
-        u = torch.rand((num_reqs, vocab), dtype=torch.float32)
+        u = torch.rand((num_reqs, vocab), dtype=torch.float32, generator=gen)
         full = sample_fn(runner, logits, temperatures, u, top_k, top_p)
         skip = sample_fn(
             runner, logits, temperatures, u, top_k, top_p, apply_topk_topp=False
         )
         assert torch.equal(full, skip)
 
-    flat_logits = (torch.randn(num_reqs, vocab) * 0.1).to(dtype)
+    flat_logits = (torch.randn(num_reqs, vocab, generator=gen) * 0.1).to(dtype)
     top_5 = torch.full((num_reqs, 1), 5, dtype=torch.int32)
-    u = torch.rand((num_reqs, vocab), dtype=torch.float32)
+    u = torch.rand((num_reqs, vocab), dtype=torch.float32, generator=gen)
     ones = torch.ones((num_reqs, 1), dtype=dtype)
     # Ties at the 5th value are allowed too.
     fifth = flat_logits.float().topk(5, dim=-1).values[:, -1:]
@@ -3667,7 +3851,9 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
         }
         requests["r1"].num_tokens = 2  # A partial prefill: its token is discarded.
         runner = SimpleNamespace(
-            _pp_wave=None,
+            _pp_handoff=None,
+            _dp_step_other_decode=False,
+            num_prompt_logprobs={},
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
                 draft_chunks=[],
@@ -3675,9 +3861,11 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
                 num_reqs_list=list(num_reqs_list),
                 spec_decode_metadata_list=[None, None],
                 mamba_state_indices_list=None,
+                mamba_boundary_plans=None,
                 pooler_output_list=[],
                 top_tokens=False,
                 kv_save_nan_check=None,
+                prompt_logprobs_chunks=[],
             ),
             input_batch=SimpleNamespace(
                 max_num_logprobs=max_logprobs,
@@ -3696,6 +3884,8 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
             _is_async_drafter=False,
             _is_dspark_pd_producer=False,
             _fence_spec_kv_under_token_copy=False,
+            _min_tokens_batch_state=lambda: {},
+            _adaptive_verification=None,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
@@ -3726,7 +3916,11 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
 
         runner.gather_logprobs = recording_gather_logprobs
         runner._stage_timing.take_samples.return_value = ([], [])
-        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+        for name in (
+            "maybe_wait_for_kv_save",
+            "get_finished_kv_transfers",
+            "_build_kv_connector_output",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         return TPUModelRunner.sample_tokens(runner, None)
 
@@ -3768,18 +3962,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
 
     seen_u_dtypes: list[torch.dtype] = []
 
-    def fake_sample_from_logits(
-        logits,
-        temperatures,
-        u,
-        top_k,
-        top_p,
-        all_greedy=False,
-        topk_candidates=0,
-        apply_topk_topp=True,
-    ):
+    def record_u_dtype(u, _variant):
         seen_u_dtypes.append(u.dtype)
-        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    fake_sample_from_logits = _recording_sampler(record_u_dtype)
 
     bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
     sampling_params = (
@@ -3789,21 +3975,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     )
 
     # 1. _precompile_sample_from_logits: the full graph, the no-top-k/top-p
-    # graph and the greedy graph, with or without speculative decoding.
-    for speculative_config, num_graphs in ((None, 3), (SimpleNamespace(), 3)):
-        precompile_runner = SimpleNamespace(
-            num_reqs_paddings=[2],
-            _hidden_states_dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-            _topk_candidate_blocks=lambda: 0,
-            _precompile_timed=lambda _name: contextlib.nullcontext(),
-            sample_from_logits_func=fake_sample_from_logits,
-            speculative_config=speculative_config,
-        )
-        TPUModelRunner._precompile_sample_from_logits(precompile_runner)
-        assert seen_u_dtypes == [torch.float32] * num_graphs
-        seen_u_dtypes.clear()
+    # graph and the greedy graph.
+    TPUModelRunner._precompile_sample_from_logits(_precompile_runner(record_u_dtype))
+    assert seen_u_dtypes == [torch.float32] * 3
+    seen_u_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
@@ -3856,7 +4031,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             has_structured_output_requests=False,
         )
         runner = SimpleNamespace(
-            _pp_wave=None,
+            _pp_handoff=None,
+            _dp_step_other_decode=False,
+            num_prompt_logprobs={},
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
                 draft_chunks=[],
@@ -3864,9 +4041,11 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 num_reqs_list=[2],
                 spec_decode_metadata_list=[None],
                 mamba_state_indices_list=None,
+                mamba_boundary_plans=None,
                 pooler_output_list=[],
                 top_tokens=False,
                 kv_save_nan_check=None,
+                prompt_logprobs_chunks=[],
             ),
             input_batch=SimpleNamespace(
                 max_num_logprobs=None,
@@ -3894,6 +4073,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _is_async_drafter=False,
             _is_dspark_pd_producer=False,
             _fence_spec_kv_under_token_copy=False,
+            _min_tokens_batch_state=lambda: {},
+            _adaptive_verification=None,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
@@ -3909,9 +4090,312 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _stage_timing=MagicMock(),
         )
         runner._stage_timing.take_samples.return_value = ([], [])
-        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+        for name in (
+            "maybe_wait_for_kv_save",
+            "get_finished_kv_transfers",
+            "_build_kv_connector_output",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_decode_metadata_cache_hit_updates_request_distribution_cpu():
+    from runner_input_test_utils import (
+        _make_runner,
+        _scheduler_output,
+    )
+
+    runner = _make_runner(
+        num_computed_tokens=[10, 10, 10, 10],
+        prompt_tokens=[10, 10, 10, 10],
+        scheduled_tokens=[1, 1, 1, 1],
+        token_paddings=[4, 8, 16],
+        max_num_reqs=4,
+        pcp_size=1,
+    )
+    scheduler_output = _scheduler_output([1, 1, 1, 1])
+
+    # First call: cache miss, initializes cache and sets distribution.
+    TPUModelRunner._prepare_inputs(
+        runner, scheduler_output, start_index=0, num_decode_reqs=4
+    )
+    assert torch.equal(
+        runner._request_distribution_cpu,
+        torch.tensor([4, 4, 4], dtype=torch.int32),
+    )
+
+    # Simulate stale CPU request distribution from intervening prefill/mixed step.
+    runner._request_distribution_cpu.copy_(torch.tensor([0, 0, 4], dtype=torch.int32))
+
+    # Second call: cache hit. Must refresh _request_distribution_cpu to [4, 4, 4].
+    TPUModelRunner._prepare_inputs(
+        runner, scheduler_output, start_index=0, num_decode_reqs=4
+    )
+    assert torch.equal(
+        runner._request_distribution_cpu,
+        torch.tensor([4, 4, 4], dtype=torch.int32),
+    )
+
+
+def _bare_rope(cls, rows: int) -> torch.nn.Module:
+    """A `cls` instance holding only a `[rows, 8]` cos_sin_cache buffer;
+    `_truncate_rope_caches` dispatches on the type and reads only the buffer."""
+    module = cls.__new__(cls)
+    torch.nn.Module.__init__(module)
+    module.register_buffer("cos_sin_cache", torch.zeros(rows, 8), persistent=False)
+    return module
+
+
+def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
+    """TPU_ROPE_CACHE_TRUNCATE also truncates DeepSeek-scaling caches (MLA
+    YaRN and DeepSeek-V4), preserves shared buffers across both truncation and
+    row-major relayout, and reaches the draft model via `_relayout_tables`."""
+    from vllm.model_executor.layers.rotary_embedding import (
+        DeepseekScalingRotaryEmbedding,
+        RotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
+    )
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmDeepseekScalingRotaryEmbedding,
+    )
+
+    max_len = 32
+    shared_buf = torch.arange(128 * 8, dtype=torch.float32).reshape(128, 8)
+    shared_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    shared_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    shared_a.cos_sin_cache = shared_buf
+    shared_b.cos_sin_cache = shared_buf
+    # Distinct sole-owner buffers stay distinct after truncation + relayout.
+    sole_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    sole_a.cos_sin_cache.fill_(1.0)
+    sole_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    sole_b.cos_sin_cache.fill_(2.0)
+    model = torch.nn.ModuleDict(
+        {
+            "rope": _bare_rope(RotaryEmbedding, 128),
+            "deepseek": _bare_rope(DeepseekScalingRotaryEmbedding, 128),
+            "tpu_deepseek": _bare_rope(VllmDeepseekScalingRotaryEmbedding, 128),
+            "deepseek_v4": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
+            "sole_a": sole_a,
+            "sole_b": sole_b,
+            "shared_a": shared_a,
+            "shared_b": shared_b,
+            "short": _bare_rope(DeepseekScalingRotaryEmbedding, 16),
+        }
+    )
+    other = torch.nn.Module()
+    other.register_buffer("cos_sin_cache", torch.zeros(128, 8), persistent=False)
+    model["other"] = other
+
+    draft_shared_buf = torch.ones(128, 8)
+    draft_shared_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_shared_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_shared_a.cos_sin_cache = draft_shared_buf
+    draft_shared_b.cos_sin_cache = draft_shared_buf
+    draft_model = torch.nn.ModuleDict(
+        {
+            "draft_rope": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
+            "shared_a": draft_shared_a,
+            "shared_b": draft_shared_b,
+        }
+    )
+
+    relayout_calls = 0
+
+    def fake_to_row_major(t: torch.Tensor) -> torch.Tensor:
+        nonlocal relayout_calls
+        relayout_calls += 1
+        return t.clone()
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+    monkeypatch.setattr(runner_utils_module, "_to_row_major", fake_to_row_major)
+    monkeypatch.setattr(runner_utils_module, "_install_entry_layout_pin", lambda: None)
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
+    )
+
+    runner._truncate_rope_caches(model)
+    runner_utils_module.relayout_rope_caches(model)
+    runner._relayout_tables(draft_model)
+
+    for name in (
+        "rope",
+        "deepseek",
+        "tpu_deepseek",
+        "deepseek_v4",
+        "sole_a",
+        "sole_b",
+        "shared_a",
+        "shared_b",
+    ):
+        assert model[name].cos_sin_cache.shape == (max_len, 8), name
+    assert model["sole_a"].cos_sin_cache is not model["sole_b"].cos_sin_cache
+    assert torch.all(model["sole_a"].cos_sin_cache == 1.0)
+    assert torch.all(model["sole_b"].cos_sin_cache == 2.0)
+    assert model["shared_a"].cos_sin_cache is model["shared_b"].cos_sin_cache
+    assert model["short"].cos_sin_cache.shape == (16, 8)
+    assert model["other"].cos_sin_cache.shape == (128, 8)
+    assert draft_model["draft_rope"].cos_sin_cache.shape == (max_len, 8)
+    assert draft_model["shared_a"].cos_sin_cache.shape == (max_len, 8)
+    assert (
+        draft_model["shared_a"].cos_sin_cache is draft_model["shared_b"].cos_sin_cache
+    )
+    # 8 unique RoPE buffers in `model` (shared_a/shared_b share 1, plus short)
+    # + 2 unique RoPE buffers in `draft_model` (draft_rope + shared_a/shared_b).
+    assert relayout_calls == 10
+
+
+def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
+    """Under MTP K > 1, un-clamped draft positions at the end of context reach
+    `max_model_len - 2 + (K - 1) >= max_model_len`; both target and draft RoPE
+    caches keep 8-row-aligned speculative slack so those rows stay in bounds."""
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
+    )
+
+    from vllm_torchtpu import envs
+
+    max_len = 32
+    spec_k = 3
+    # cdiv(32 + 3, 8) * 8 == 40 rows.
+    expected_rows = 40
+    untruncated = torch.arange(128 * 8, dtype=torch.float32).reshape(128, 8)
+
+    target_rope = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    target_rope.cos_sin_cache = untruncated.clone()
+    model = torch.nn.ModuleDict({"rope": target_rope})
+
+    draft_rope = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_rope.cos_sin_cache = untruncated.clone()
+    draft_model = torch.nn.ModuleDict({"draft_rope": draft_rope})
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=spec_k)
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
+    )
+
+    runner._truncate_rope_caches(model)
+    runner._relayout_tables(draft_model)
+
+    assert model["rope"].cos_sin_cache.shape == (expected_rows, 8)
+    assert draft_model["draft_rope"].cos_sin_cache.shape == (expected_rows, 8)
+
+    # End-of-context request whose last accepted token is at max_model_len - 2:
+    # K = 3 draft steps advance positions [30, 31, 32] (reaching max_model_len).
+    draft_positions = torch.tensor(
+        [max_len - 2 + step for step in range(spec_k)], dtype=torch.long
+    )
+    assert int(draft_positions.max().item()) == max_len
+    torch.testing.assert_close(
+        draft_model["draft_rope"].cos_sin_cache[draft_positions],
+        untruncated[draft_positions],
+    )
+
+
+class TestLogitsAtDpVocabRows:
+    """TPU_DP_VOCAB_PARALLEL: every logits batch reaches the compiled logits
+    program at the step's DP-wide request bucket, padded and sliced outside
+    it."""
+
+    @staticmethod
+    def _runner(on, step_max_reqs=3, max_num_reqs=32):
+        """A runner whose compute_selected_logits records the indices it gets
+        and returns their rows of `hidden * 10`."""
+        runner = SimpleNamespace(
+            _dp_vocab_logits=on,
+            _dp_step_max_reqs=step_max_reqs,
+            max_num_reqs=max_num_reqs,
+            seen=[],
+        )
+        runner._dp_vocab_logits_rows = TPUModelRunner._dp_vocab_logits_rows.__get__(
+            runner
+        )
+
+        def compute_selected_logits(hidden, indices):
+            runner.seen.append(indices)
+            return hidden[indices] * 10
+
+        runner.compute_selected_logits = compute_selected_logits
+        return runner
+
+    def test_off_passes_straight_through(self):
+        runner = self._runner(False)
+        hidden, indices = torch.arange(16.0).reshape(16, 1), torch.tensor([3, 7, 9])
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, hidden, indices)
+        assert runner.seen == [indices]
+        assert got.flatten().tolist() == [30.0, 70.0, 90.0]
+
+    @pytest.mark.parametrize(
+        "step_max_reqs, rows", [(0, 8), (3, 8), (9, 16), (17, 32), (40, 32)]
+    )
+    def test_rows_are_the_bucket_of_the_dp_wide_largest_chunk(
+        self, step_max_reqs, rows
+    ):
+        """Busy and idle ranks read the same all-reduced request count, so
+        they pad to the same bucket; a light step pays only for its bucket."""
+        runner = self._runner(True, step_max_reqs=step_max_reqs)
+        assert TPUModelRunner._dp_vocab_logits_rows(runner) == rows
+
+    @pytest.mark.parametrize("step_max_reqs, rows", [(3, 8), (9, 16)])
+    def test_pads_indices_and_slices_the_rows_back(self, step_max_reqs, rows):
+        """This rank samples 3 rows; it enters the logits program at the step's
+        bucket, which another rank's larger chunk (9 requests) can raise."""
+        runner = self._runner(True, step_max_reqs=step_max_reqs)
+        hidden = torch.arange(16.0).reshape(16, 1)
+        indices = torch.tensor([3, 7, 9], dtype=torch.int32)
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, hidden, indices)
+        assert runner.seen[0].tolist() == [3, 7, 9] + [0] * (rows - 3)
+        assert got.flatten().tolist() == [30.0, 70.0, 90.0]
+
+    def test_full_bucket_needs_no_pad(self):
+        runner = self._runner(True, step_max_reqs=8)
+        hidden, indices = torch.arange(16.0).reshape(16, 1), torch.arange(8)
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, hidden, indices)
+        assert runner.seen[0] is indices
+        assert got.shape == (8, 1)
+
+    @pytest.mark.parametrize("dp_vocab, rows", [(True, 16), (False, 4)])
+    def test_idle_dummy_chunk_enters_logits_at_the_dp_vocab_rows(
+        self, monkeypatch, dp_vocab, rows
+    ):
+        """An idle DP engine's dummy chunk must enter the logits program at the
+        row count busy engines pad to (`_dp_vocab_logits_rows`, the bucket
+        checked above), or the lm_head's cross-engine collectives see different
+        shapes and hang. Without the flag it keeps its own request count."""
+        seen = []
+        runner = _dummy_run_stand_in(
+            monkeypatch, lambda **kw: (torch.zeros((16, 8)), None)
+        )
+        runner.compute_selected_logits = lambda out, idx: seen.append(idx.shape[0])
+        runner._dp_vocab_logits = dp_vocab
+        runner._dp_vocab_logits_rows = lambda: 16
+        TPUModelRunner._dummy_run(
+            runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=True
+        )
+        assert seen == [rows]
+
+    def test_rejects_a_batch_above_the_row_count(self):
+        runner = self._runner(True, step_max_reqs=4)
+        with pytest.raises(ValueError, match="exceeds"):
+            TPUModelRunner._logits_at_dp_vocab_rows(
+                runner, torch.zeros(9, 2), torch.arange(9)
+            )

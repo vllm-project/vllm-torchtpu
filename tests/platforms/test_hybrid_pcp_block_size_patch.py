@@ -35,6 +35,8 @@ def _config(
             block_size=512,
             enable_prefix_caching=enable_prefix_caching,
             prefix_match_unit=None,
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=0,
             # PallasAttentionBackend's default layout.
             get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
         ),
@@ -328,7 +330,7 @@ def test_full_attention_capacity_counts_rank_local_pages(
 
 def test_pcp_1m_hybrid_capacity_admission_and_autofit():
     _patch_vllm_hybrid_pcp_block_sizes()
-    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.core import kv_cache_planning
 
     config = _config(pcp=16)
     config.model_config = SimpleNamespace(max_model_len=1048576)
@@ -349,19 +351,24 @@ def test_pcp_1m_hybrid_capacity_admission_and_autofit():
         KVCacheGroupSpec([f"gdn.{j}.{i}" for i in range(23)], gdn) for j in range(3)
     ]
     # FA uses 128 local pages; each of three GDN groups retains two states.
-    needed = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+    builder = kv_cache_planning.DefaultKVCacheConfigBuilder()
+    needed = kv_cache_planning._max_memory_usage_bytes_from_groups(
+        builder, config, groups
+    )
     assert needed == (128 + 3 * 2) * 23 * page_bytes
     usable = (1024 - 1) * 23 * page_bytes
-    kv_cache_utils._check_enough_kv_cache_memory(
+    kv_cache_planning._check_enough_kv_cache_memory(
         usable,
         lambda: needed,
         config.model_config.max_model_len,
-        lambda available: kv_cache_utils._estimate_max_model_len_from_groups(
-            config, groups, available
+        lambda available: kv_cache_planning._estimate_max_model_len_from_groups(
+            builder, config, groups, available
         ),
     )
     assert (
-        kv_cache_utils._estimate_max_model_len_from_groups(config, groups, usable)
+        kv_cache_planning._estimate_max_model_len_from_groups(
+            builder, config, groups, usable
+        )
         == 1048576
     )
     assert config.model_config.max_model_len == 1048576
@@ -430,3 +437,27 @@ def test_no_prefix_cache_admits_950k_with_rank_local_capacity(pcp):
     assert manager.block_pool.get_num_free_blocks() == 1023
     # Normalization is local to the coordinator; physical storage is untouched.
     assert config.kv_cache_groups[-1].kv_cache_spec.block_size == 512
+
+
+def test_unpromotable_specs_are_planned_unchanged():
+    """Upstream raises when local specs cannot be promoted to one type (full
+    attention next to Mamba). The patch keeps the specs as they are, so hybrid
+    planning neither drops them nor logs a promotion it did not make."""
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core import kv_cache_planning
+
+    specs = {
+        "attn": FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+        ),
+        "ssm": MambaSpec(
+            block_size=16,
+            shapes=((2, 8),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="align",
+        ),
+    }
+    assert kv_cache_planning._promote_local_kv_cache_specs(dict(specs)) == specs
+    planned = dict(specs)
+    kv_cache_planning.unify_hybrid_kv_cache_specs(planned)
+    assert planned == specs

@@ -38,6 +38,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     ragged_gather_reduce as ragged_gather_reduce_v3,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_scatter import ragged_scatter
+from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 
 pytestmark = pytest.mark.tpu_test
 
@@ -206,7 +207,7 @@ class ScatterTest(jtu.JaxTestCase):
         the kernel the input dtype.
         """
         info = pltpu.get_tpu_info()
-        if info.sparse_core is None:
+        if get_sparse_core_info(info) is None:
             self.skipTest("no SparseCore on this TPU")
         fixed = dataclasses.replace(info, vmem_capacity_bytes=64 * 1024 * 1024)
 
@@ -267,10 +268,10 @@ class ScatterTest(jtu.JaxTestCase):
         suite observes any of them.
         """
         live = pltpu.get_tpu_info()
-        if live.sparse_core is None:
+        if get_sparse_core_info(live) is None:
             self.skipTest("no SparseCore on this TPU")
 
-        def tiling(input_size, hidden_size, generation, num_simd_lanes):
+        def tiling(input_size, hidden_size, sc_vmem_bytes, num_simd_lanes):
             return rgr_v2_config.Config(
                 input_size=input_size,
                 hidden_size=hidden_size,
@@ -281,13 +282,13 @@ class ScatterTest(jtu.JaxTestCase):
                 subcore_axis_name="subcore",
                 tpu_info=dataclasses.replace(
                     live,
-                    generation=generation,
                     num_lanes=128,
                     sparse_core=dataclasses.replace(
                         live.sparse_core,
                         num_cores=2,
                         num_subcores=16,
                         num_lanes=num_simd_lanes,
+                        vmem_capacity_bytes=sc_vmem_bytes,
                     ),
                 ),
             )
@@ -295,7 +296,7 @@ class ScatterTest(jtu.JaxTestCase):
         # The limits are spelled out rather than read from _CostModelConstants,
         # so a derivation that stops consulting them still fails here.
         for input_size, hidden_size in ((20480, 4096), (32768, 4096)):
-            cfg = tiling(input_size, hidden_size, 7, 16)
+            cfg = tiling(input_size, hidden_size, 512 * 1024, 16)
             self.assertLessEqual(
                 input_size // (cfg.row_chunk_size * cfg.num_row_partitions), 40
             )
@@ -303,7 +304,7 @@ class ScatterTest(jtu.JaxTestCase):
 
         # This device makes the rounding observable: rounding the chunk's VMEM
         # bound up instead of down picks 1024, over the budget it enforces.
-        self.assertEqual(tiling(32768, 4096, 6, 32).col_chunk_size, 512)
+        self.assertEqual(tiling(32768, 4096, 256 * 1024, 32).col_chunk_size, 512)
 
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.
     # The second case approximates the Qwen3-Coder-480B, 2k-batch-size, EP=8.

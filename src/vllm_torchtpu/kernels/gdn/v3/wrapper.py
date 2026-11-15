@@ -120,7 +120,7 @@ def inner_kernel(
         cfg=cfg,
     )
 
-    conv_state_out_slot_ref[...] = new_conv_state
+    conv_state_out_slot_ref[...] = new_conv_state.astype(conv_state_out_slot_ref.dtype)
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -261,6 +261,12 @@ def outer_kernel(
     )
     num_tiles = metadata_ref.num_tiles[...]
     body = functools.partial(inner_kernel, cfg=cfg)
+    scratches = (
+        metadata_ref,
+        weights_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+    )
     state_allocs = (conv_in_alloc, recurrent_in_alloc)
     out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
     state_out_args = (conv_state_out_ref, recurrent_state_out_ref)
@@ -295,12 +301,7 @@ def outer_kernel(
             recurrent_state_ref,
             out_ref,
             *state_out_args,
-            scratches=(
-                metadata_ref,
-                weights_ref,
-                carry_conv_scratch_ref,
-                carry_recurrent_scratch_ref,
-            ),
+            scratches=scratches,
             allocations=allocations,
         )
 
@@ -326,6 +327,8 @@ def outer_kernel(
         "conv_dtype",
         "attention_mode",
         "gate_lower_bound",
+        "kernel_act_dtype",
+        "kernel_conv_weight_dtype",
     ),
 )
 def fused_conv1d_gdn(
@@ -343,6 +346,8 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
     ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
+    prefill_ckpt_offsets: jax.Array | None = None,  # [num_seqs]
+    prefill_ckpt_indices: jax.Array | None = None,  # [num_seqs]
     *,
     n_kq: int,
     n_v: int,
@@ -358,6 +363,8 @@ def fused_conv1d_gdn(
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
+    kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
+    kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
@@ -401,6 +408,14 @@ def fused_conv1d_gdn(
             `state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
             `num_spec_tokens > 0`.
+        prefill_ckpt_offsets: Optional [num_seqs] int32. Query token offset
+            of each sequence's internal prefill checkpoint (0 for none). When
+            0 < offset < query_len and prefill_ckpt_indices is non-negative,
+            the state after the first offset query tokens is also written,
+            encoded like the final state, to block prefill_ckpt_indices[s].
+            Must be passed together with prefill_ckpt_indices.
+        prefill_ckpt_indices: Optional [num_seqs] int32. Destination state
+            block of each sequence's prefill checkpoint (-1 for none).
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Key/query dimension.
@@ -422,6 +437,9 @@ def fused_conv1d_gdn(
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
+        kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
+        kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to
+            before the kernel.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
@@ -433,6 +451,11 @@ def fused_conv1d_gdn(
         out: Fused output tensor.
     """
     # TODO(kyuyeunk): Support bf16
+    if jnp.dtype(kernel_act_dtype) != jnp.float32:
+        raise ValueError(
+            f"kernel_act_dtype must be float32; got {jnp.dtype(kernel_act_dtype).name}."
+        )
+
     act_out_dtype = qkv.dtype
 
     is_shared = isinstance(states, jax.Array)
@@ -457,9 +480,9 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    qkv = qkv.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
+    qkv = qkv.astype(kernel_act_dtype)
+    b = b.astype(kernel_act_dtype)
+    a = a.astype(kernel_act_dtype)
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
@@ -504,6 +527,15 @@ def fused_conv1d_gdn(
         # Iniitalize the ckpt_indices to default value.
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
+    assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None), (
+        "prefill_ckpt_offsets and prefill_ckpt_indices go together"
+    )
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        assert prefill_ckpt_offsets.shape == (num_seqs,), prefill_ckpt_offsets.shape
+        assert prefill_ckpt_indices.shape == (num_seqs,), prefill_ckpt_indices.shape
+        prefill_ckpt_offsets = prefill_ckpt_offsets.astype(jnp.int32)
+        prefill_ckpt_indices = prefill_ckpt_indices.astype(jnp.int32)
 
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
@@ -601,8 +633,9 @@ def fused_conv1d_gdn(
     # Step 3: Weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
-    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
-    conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
+    conv_weight = conv_weight.swapaxes(0, 2).astype(kernel_conv_weight_dtype)
+    if conv_bias is not None:
+        conv_bias = conv_bias.astype(kernel_conv_weight_dtype)
 
     # Step 4: Wrap inputs for the kernel.
     conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
@@ -673,10 +706,13 @@ def fused_conv1d_gdn(
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
                 ckpt_indices=ckpt_indices,
+                prefill_ckpt_offsets=prefill_ckpt_offsets,
+                prefill_ckpt_indices=prefill_ckpt_indices,
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
         state_spec = jax.tree.map(lambda _: hbm_spec, in_states)
+        scratch_shapes = cfg.get_scratch_shape_dict()
 
         # Step 7: Handle case where write needs to be done in existing out.
         input_output_aliases = {}
@@ -711,7 +747,7 @@ def fused_conv1d_gdn(
                 weights_spec,
             ),
             out_specs=(hbm_spec, state_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
+            scratch_shapes=scratch_shapes,
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,

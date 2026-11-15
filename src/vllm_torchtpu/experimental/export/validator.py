@@ -401,3 +401,72 @@ def validate_exported_model_dir(output_dir: str) -> None:
                         f"{actual_out['shape']}"
                     )
                 _check_dtype(m_out, actual_out["dtype"], where)
+
+    _check_draft(meta, functions)
+
+
+# `speculative_config.method` values that declare the exported drafter (`draft`).
+DRAFTER_METHODS = ("mtp", "dspark")
+
+
+def _check_draft(meta: dict[str, Any], functions: dict[str, Any]) -> None:
+    """The drafting contract across functions (`draft`).
+
+    An artifact declaring a drafter method (`speculative_config.method` in
+    `DRAFTER_METHODS`) exports `draft` for exactly the `forward` buckets;
+    each variant takes the forward's `hidden_states` and returns
+    `draft_tokens` `[max_num_seqs, k]`.
+    """
+    serving = meta.get("serving_config") or {}
+    speculative = serving.get("speculative_config") or {}
+    draft = functions.get("draft")
+    method = speculative.get("method")
+    if method in DRAFTER_METHODS and not draft:
+        raise ValueError(
+            f"speculative_config declares method {method!r} but the artifact "
+            "exports no draft"
+        )
+    if not draft:
+        return
+    forward = functions.get("forward") or {}
+    if set(draft) != set(forward):
+        raise ValueError(
+            f"draft buckets {sorted(draft, key=int)} differ from forward buckets "
+            f"{sorted(forward, key=int)}"
+        )
+    k = int(speculative.get("num_speculative_tokens", 1))
+    want_draft = [int(serving.get("max_num_seqs", 0)), k]
+    for bucket, spec in draft.items():
+        where = f"draft_bucket{bucket}"
+        hidden_in = [
+            i
+            for i in spec.get("inputs", [])
+            if i.get("argument_type") == "intermediate"
+            and i.get("name") == "hidden_states"
+        ]
+        hidden_out = [
+            o
+            for o in forward[bucket].get("outputs", [])
+            if o.get("argument_type") == "intermediate"
+            and o.get("name") == "hidden_states"
+        ]
+        if len(hidden_in) != 1 or not hidden_out:
+            raise ValueError(f"{where} must take forward's hidden_states intermediate")
+        if (hidden_in[0].get("shape"), hidden_in[0].get("dtype")) != (
+            hidden_out[0].get("shape"),
+            hidden_out[0].get("dtype"),
+        ):
+            raise ValueError(
+                f"{where} takes hidden_states {hidden_in[0].get('dtype')}"
+                f"{hidden_in[0].get('shape')}, forward returns "
+                f"{hidden_out[0].get('dtype')}{hidden_out[0].get('shape')}"
+            )
+        draft_out = [
+            o for o in spec.get("outputs", []) if o.get("name") == "draft_tokens"
+        ]
+        if (
+            len(draft_out) != 1
+            or draft_out[0].get("shape") != want_draft
+            or (canonical_dtype(draft_out[0].get("dtype", "")) != "i32")
+        ):
+            raise ValueError(f"{where} must return draft_tokens i32{want_draft}")

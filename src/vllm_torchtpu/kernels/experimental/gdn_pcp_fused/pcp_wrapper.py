@@ -229,6 +229,64 @@ def _compute_gdn_tile(
     )
 
 
+def _copy_prefill_ckpt_carry(
+    dst_conv_ref: jax.Ref,
+    dst_recurrent_ref: jax.Ref,
+    src_conv_ref: jax.Ref,
+    src_recurrent_ref: jax.Ref,
+    sem: jax.Ref,
+) -> None:
+    """Copies the fp32 inter-tile carry between VMEM and its HBM backup."""
+    copies = (
+        pltpu.make_async_copy(src_conv_ref, dst_conv_ref, sem),
+        pltpu.make_async_copy(src_recurrent_ref, dst_recurrent_ref, sem),
+    )
+    for copy in copies:
+        copy.start()
+    for copy in copies:
+        copy.wait()
+
+
+def _export_prefill_ckpt(
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    conv_state_out_slot_ref: jax.Ref,
+    recurrent_out_slot_ref: jax.Ref,
+    ckpt_updates_ref: jax.Ref,
+    sem: jax.Ref,
+    *,
+    cfg: config.GDNConfig,
+) -> None:
+    """Copies the state after tile p_id into its compact checkpoint update.
+
+    The tile's output slots hold its final state in the encoding that
+    `StateOutBufferedRef` writes into ``state_updates_ref`` on a sequence's
+    last tile, so ``ckpt_updates_ref[s]`` gets the same granules at the same
+    offsets. The DMAs are waited inline. Reading the output slots inside the
+    pipeline body is race-free: any prior step's copy-out completed before the
+    body, and the current step's pipeline copy-out runs after the body and
+    only fires on a sequence's last tile, which a checkpoint tile never is.
+    """
+    s_idx = metadata_ref.p_id_to_s_idx[p_id, 0]
+    dst = memory_ref.granule_view(ckpt_updates_ref, ckpt_updates_ref.shape[:1])
+    copies = []
+    for slot_ref, offset in (
+        (conv_state_out_slot_ref, cfg.conv_hbm_offset),
+        (recurrent_out_slot_ref, cfg.recurrent_hbm_offset),
+    ):
+        src = memory_ref.granule_view(slot_ref, slot_ref.shape[:2])
+        num_granules = src.shape[2]
+        copy = pltpu.make_async_copy(
+            src.at[pl.ds(0, 1), 0],
+            dst.at[pl.ds(s_idx, 1), pl.ds(offset, num_granules)],
+            sem,
+        )
+        copy.start()
+        copies.append(copy)
+    for copy in copies:
+        copy.wait()
+
+
 def _pcp_qkvz_projection_gdn_outer_kernel(
     # Inputs.
     metadata_ref: memory_ref.MetadataRef,
@@ -240,6 +298,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     a_ref: jax.Array,
     state_source_ref: jax.Array,
     state_pad_src_ref: jax.Array,
+    ckpt_pad_src_ref: jax.Array | None,
     zero_gdn_ref: jax.Array,
     packed_out_hbm_ref: jax.Array,
     weights_ref: memory_ref.WeightRefs,
@@ -250,6 +309,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projected_qkv_ref: jax.Array,
     z_ref: jax.Array,
     active_rows_out_ref: jax.Array,
+    ckpt_updates_ref: jax.Ref | None,
+    conv_carry_backup_ref: jax.Ref | None,
+    recurrent_carry_backup_ref: jax.Ref | None,
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
@@ -276,6 +338,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     active_rows_smem_ref: jax.Array,
     active_rows_dma_sem: jax.Array,
     state_pad_sem: jax.Array,
+    ckpt_sem: jax.Ref | None,
     *,
     cfg: config.GDNConfig,
     pcp_size: int,
@@ -293,6 +356,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     Granules from ``state_pad_start`` to the end of each compact block are not
     state, so they are copied from the pool unchanged (``state_pad_src_ref[s]``
     is the source block, or -1 for sequences that are not written back).
+
+    With internal prefill checkpoints, ``ckpt_updates_ref[s]`` holds the state
+    at sequence ``s``'s checkpoint row in the same compact layout, padded from
+    pool block ``ckpt_pad_src_ref[s]``, and the carry backups are HBM scratch
+    for the shadow tiles (see ``pcp_metadata.PREFILL_CKPT_SHADOW``).
     """
     del packed_out_hbm_ref
     is_fp8_projection = projection_weight_ref.dtype == jnp.float8_e4m3fn
@@ -851,23 +919,30 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         state_updates_ref, state_updates_ref.shape[:1]
     )
     num_pad_granules = update_granules.shape[1] - state_pad_start
+    pad_targets = [(state_pad_src_ref, update_granules)]
+    if ckpt_updates_ref is not None:
+        assert ckpt_pad_src_ref is not None
+        pad_targets.append(
+            (
+                ckpt_pad_src_ref,
+                memory_ref.granule_view(ckpt_updates_ref, ckpt_updates_ref.shape[:1]),
+            )
+        )
 
-    def _state_pad_copy(seq):
+    def _state_pad_copy(seq, src_ref, dst_granules):
         """HBM-to-HBM copy of one sequence's non-state granules.
 
         It touches only granules past ``state_pad_start``, disjoint from the
         state granules the pipeline writes, so it needs no ordering with them.
         """
-        src_block = state_pad_src_ref[seq]
+        src_block = src_ref[seq]
         size = jnp.where(src_block >= 0, 1, 0)
         return pltpu.make_async_copy(
             pool_granules.at[
                 pl.ds(jnp.maximum(src_block, 0), size),
                 pl.ds(state_pad_start, num_pad_granules),
             ],
-            update_granules.at[
-                pl.ds(seq, size), pl.ds(state_pad_start, num_pad_granules)
-            ],
+            dst_granules.at[pl.ds(seq, size), pl.ds(state_pad_start, num_pad_granules)],
             state_pad_sem,
         )
 
@@ -876,7 +951,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             return
 
         def _start(seq, _) -> None:
-            _state_pad_copy(seq).start()
+            for src_ref, dst_granules in pad_targets:
+                _state_pad_copy(seq, src_ref, dst_granules).start()
 
         lax.fori_loop(0, num_state_seqs, _start, None, unroll=False)
 
@@ -885,7 +961,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             return
 
         def _wait(seq, _) -> None:
-            _state_pad_copy(seq).wait()
+            for src_ref, dst_granules in pad_targets:
+                _state_pad_copy(seq, src_ref, dst_granules).wait()
 
         lax.fori_loop(0, num_state_seqs, _wait, None, unroll=False)
 
@@ -1027,7 +1104,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 output_recv_sems,
             )
 
-        _compute_gdn_tile(
+        compute_tile = functools.partial(
+            _compute_gdn_tile,
             b_slot_ref,
             a_slot_ref,
             conv_state_in_slot_ref,
@@ -1045,6 +1123,56 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             cfg=cfg,
             comm_chunk_size=comm_chunk_size,
         )
+        tile_ckpt_mode = stage_metadata_ref.tile_ckpt_mode
+        if tile_ckpt_mode is None:
+            compute_tile()
+        else:
+            assert carry_conv_scratch_ref is not None
+            assert carry_recurrent_scratch_ref is not None
+            assert conv_carry_backup_ref is not None
+            assert recurrent_carry_backup_ref is not None
+            assert ckpt_updates_ref is not None
+            assert ckpt_sem is not None
+            ckpt_mode = tile_ckpt_mode[p_id]
+            is_shadow_tile = ckpt_mode == pcp_metadata.PREFILL_CKPT_SHADOW
+
+            # Back up the carry to HBM before the shadow tile to avoid adding
+            # VMEM pressure.
+            pl.when(is_shadow_tile)(
+                functools.partial(
+                    _copy_prefill_ckpt_carry,
+                    conv_carry_backup_ref,
+                    recurrent_carry_backup_ref,
+                    carry_conv_scratch_ref,
+                    carry_recurrent_scratch_ref,
+                    ckpt_sem,
+                )
+            )
+            compute_tile()
+            pl.when(ckpt_mode != pcp_metadata.PREFILL_CKPT_NONE)(
+                functools.partial(
+                    _export_prefill_ckpt,
+                    metadata_ref,
+                    p_id,
+                    conv_state_out_slot_ref,
+                    recurrent_out_slot_ref,
+                    ckpt_updates_ref,
+                    ckpt_sem,
+                    cfg=cfg,
+                )
+            )
+            # Restore the pre-shadow carry; the real tile that follows
+            # overwrites the shadow's output rows.
+            pl.when(is_shadow_tile)(
+                functools.partial(
+                    _copy_prefill_ckpt_carry,
+                    carry_conv_scratch_ref,
+                    carry_recurrent_scratch_ref,
+                    conv_carry_backup_ref,
+                    recurrent_carry_backup_ref,
+                    ckpt_sem,
+                )
+            )
 
         @pl.when(projection_is_active)
         def _compute_projection_tile() -> None:
@@ -1353,6 +1481,8 @@ def fused_qkvz_projection_pcp_gdn(
     recurrent_state_dtype: jnp.dtype = jnp.float32.dtype,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
+    prefill_ckpt_offsets: jax.Array | None = None,
+    prefill_ckpt_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run ragged PCP prefill with fused QKVZ projection and communication.
 
@@ -1367,6 +1497,12 @@ def fused_qkvz_projection_pcp_gdn(
     donated pool. Runtime stage metadata
     handles mixed request lengths and arbitrary absolute query offsets without
     expanding active work to the compile bucket.
+
+    prefill_ckpt_offsets and prefill_ckpt_indices ([max_num_seqs] int32, passed
+    together or both None) request internal prefill checkpoints: for each
+    sequence with 0 < offset < query_len and index >= 0, the state after its
+    first offset global logical query tokens is written, encoded like the
+    final state, to block index of this rank's pool shard.
     """
     if pcp_size <= 1:
         raise ValueError("The PCP fused GDN kernel requires pcp_size > 1.")
@@ -1397,6 +1533,24 @@ def fused_qkvz_projection_pcp_gdn(
         raise NotImplementedError(
             "GDN v3 needs an fp32 or bf16 recurrent state; got "
             f"{recurrent_state_dtype}."
+        )
+    has_prefill_ckpt = prefill_ckpt_offsets is not None
+    if has_prefill_ckpt != (prefill_ckpt_indices is not None):
+        raise ValueError(
+            "prefill_ckpt_offsets and prefill_ckpt_indices must be passed together."
+        )
+    if (
+        prefill_ckpt_offsets is not None
+        and prefill_ckpt_indices is not None
+        and (
+            prefill_ckpt_offsets.shape != state_indices.shape
+            or prefill_ckpt_indices.shape != state_indices.shape
+        )
+    ):
+        raise ValueError(
+            "Prefill checkpoint offsets and indices must match state_indices: "
+            f"{prefill_ckpt_offsets.shape=} {prefill_ckpt_indices.shape=} "
+            f"{state_indices.shape=}."
         )
 
     global_batch_size = b.shape[0]
@@ -1596,6 +1750,24 @@ def fused_qkvz_projection_pcp_gdn(
         & (state_indices < state_source.shape[0])
     )
     state_dst = jnp.where(write_back, state_indices, -1).astype(jnp.int32)
+    ckpt_dst = None
+    if prefill_ckpt_offsets is not None and prefill_ckpt_indices is not None:
+        # Normalize invalid, unreserved or out-of-range entries to (0, -1) so
+        # no tile exports them and _scatter_state_updates skips them.
+        prefill_ckpt_offsets, prefill_ckpt_indices = (
+            pcp_metadata.mask_prefill_ckpt_requests(
+                prefill_ckpt_offsets.astype(jnp.int32),
+                prefill_ckpt_indices.astype(jnp.int32),
+                seq_ends - seq_starts,
+            )
+        )
+        ckpt_write_back = (
+            (seq_ids < distribution[-1])
+            & (prefill_ckpt_indices >= 0)
+            & (prefill_ckpt_indices < state_source.shape[0])
+        )
+        ckpt_dst = jnp.where(ckpt_write_back, prefill_ckpt_indices, -1)
+        prefill_ckpt_offsets = jnp.where(ckpt_write_back, prefill_ckpt_offsets, 0)
 
     metadata_obj, stage_metadata_obj = pcp_metadata.compute_pcp_stage_metadata(
         cfg=cfg,
@@ -1614,6 +1786,7 @@ def fused_qkvz_projection_pcp_gdn(
         projection_token_block_size=projection_cfg.token_block_size,
         num_qkv_out_blocks=num_qkv_out_blocks,
         num_projection_out_blocks=num_projection_out_blocks,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
     )
     metadata_spec = jax.tree.map(
         lambda _: pl.BlockSpec(memory_space=pltpu.SMEM),
@@ -1722,6 +1895,23 @@ def fused_qkvz_projection_pcp_gdn(
         ),
         pltpu.SMEM((1,), jnp.int32),
     )
+    carry_shapes = cfg.get_scratch_shape_dict()
+    if has_prefill_ckpt:
+        # Append checkpoint outputs and HBM carry backups at the end to preserve
+        # existing input_output_aliases indices.
+        ckpt_out_shapes = (
+            state_updates_shape,
+            *(
+                jax.ShapeDtypeStruct(carry_shapes[name].shape, jnp.float32)
+                for name in ("carry_conv_scratch_ref", "carry_recurrent_scratch_ref")
+            ),
+        )
+        ckpt_out_specs = (hbm_spec,) * 3
+        ckpt_pad_src_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+        ckpt_sem_shape = pltpu.SemaphoreType.DMA
+    else:
+        ckpt_out_shapes = ckpt_out_specs = (None,) * 3
+        ckpt_pad_src_spec = ckpt_sem_shape = None
     # Pallas aliases index flattened array leaves; a missing BF16 scale has
     # no leaf. Derive the output-buffer positions from the actual prefix.
     output_input_offset = len(
@@ -1736,6 +1926,7 @@ def fused_qkvz_projection_pcp_gdn(
                 a,
                 state_source,
                 state_dst,
+                ckpt_dst,
             )
         )
     )
@@ -1747,7 +1938,6 @@ def fused_qkvz_projection_pcp_gdn(
         output_input_offset: 0,
         output_input_offset + 1: 1,
     }
-    carry_shapes = cfg.get_scratch_shape_dict()
     kernel_name = (
         "fused_pcp_qkvz_projection_gdn_per_seq_compact_qkv"
         f"_c{comm_chunk_size}_p{pcp_size}_pooled"
@@ -1763,6 +1953,9 @@ def fused_qkvz_projection_pcp_gdn(
         _projected_qkv,
         z,
         active_rows,
+        ckpt_updates,
+        _conv_carry_backup,
+        _recurrent_carry_backup,
     ) = pl.pallas_call(
         functools.partial(
             _pcp_qkvz_projection_gdn_outer_kernel,
@@ -1781,6 +1974,7 @@ def fused_qkvz_projection_pcp_gdn(
             projected_qkv_shape,
             z_shape,
             jax.ShapeDtypeStruct((1,), jnp.int32),
+            *ckpt_out_shapes,
         ),
         in_specs=(
             metadata_spec,
@@ -1792,6 +1986,7 @@ def fused_qkvz_projection_pcp_gdn(
             hbm_spec,
             hbm_spec,
             pl.BlockSpec(memory_space=pltpu.SMEM),
+            ckpt_pad_src_spec,
             hbm_spec,
             hbm_spec,
             weights_spec,
@@ -1803,6 +1998,7 @@ def fused_qkvz_projection_pcp_gdn(
             hbm_spec,
             hbm_spec,
             hbm_spec,
+            *ckpt_out_specs,
         ),
         scratch_shapes=(
             carry_shapes["carry_conv_scratch_ref"],
@@ -1834,6 +2030,7 @@ def fused_qkvz_projection_pcp_gdn(
             pltpu.SMEM((1,), jnp.int32),
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
+            ckpt_sem_shape,
         ),
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
@@ -1852,16 +2049,24 @@ def fused_qkvz_projection_pcp_gdn(
         a,
         state_source,
         state_dst,
+        ckpt_dst,
         zero_gdn_out,
         zero_packed_out,
         weights,
     )
 
+    num_written_seqs = jnp.minimum(distribution[-1], num_state_seqs)
+    if ckpt_dst is not None:
+        # Scatter checkpoints before final states so final states win if both
+        # map to the same block ID.
+        state_source = _scatter_state_updates(
+            state_source, ckpt_updates, ckpt_dst, num_written_seqs
+        )
     state_source = _scatter_state_updates(
         state_source,
         state_updates,
         state_dst,
-        jnp.minimum(distribution[-1], num_state_seqs),
+        num_written_seqs,
     )
 
     packed_out = packed_out.reshape(local_num_tokens, n_v, d_v)

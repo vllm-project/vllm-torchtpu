@@ -51,7 +51,7 @@ echo "Release version: ${VERSION}"
 # Stop before building if this version is already on PyPI (versions can't be
 # reused). PUBLISH_PYPI comes from the step's env in .buildkite/release/pipeline.yml.
 [[ -n "${PUBLISH_PYPI:-}" ]] || die "PyPI project (PUBLISH_PYPI) is not set."
-check_not_published "${PUBLISH_PYPI}" "${VERSION}" "${PYPI_BASE_URL:-https://pypi.org}"
+check_not_published "${PUBLISH_PYPI}" "${VERSION}"
 
 # --- Private build venv ------------------------------------------------------
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/core-build.XXXXXX")"

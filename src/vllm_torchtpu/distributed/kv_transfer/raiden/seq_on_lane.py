@@ -67,6 +67,7 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.tags import (
     TAG_GDN_CONV,
     TAG_GDN_SSM,
     class_tag,
+    libtpu_key,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 
@@ -959,7 +960,7 @@ def measured_sol_layout_fingerprint(
     payload: dict[str, Any] = {
         "schema": SOL_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         "minor_to_major": list(minor_to_major),
         "tiles": [list(tile) for tile in tiles],
         "element_size_in_bits": element_bits,

@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 # Architectures whose recurrent layers read and write their state through the
 # attention-shaped pool. The Qwen3 and Qwen4Exp families build on
@@ -178,3 +190,84 @@ def derive_pooled_gdn_state_layout(
         ssm_tokens=ssm_tokens,
         conv_tokens=conv_tokens,
     )
+
+
+def prefill_checkpoint_enabled(vllm_config: VllmConfig) -> bool:
+    """Enables checkpoints for pooled GDN with block-aligned prefix hits."""
+    from vllm_torchtpu import envs as tpu_envs
+
+    if not tpu_envs.TPU_GDN_PREFILL_CHECKPOINT:
+        return False
+    cache = vllm_config.cache_config
+    parallel = vllm_config.parallel_config
+    if (
+        cache.mamba_cache_mode != "align"
+        or parallel.decode_context_parallel_size != 1
+        or not unified_kv_layout_enabled_for_architecture(
+            vllm_config.model_config.architecture
+        )
+    ):
+        return False
+    assert cache.mamba_block_size is not None
+    # vLLM 0.32.0 can hash a partial-hit state copy at the next block boundary
+    # without writing it when an internal checkpoint skips that boundary.
+    # TODO(https://github.com/vllm-project/vllm/issues/65264): remove this
+    # check once the pin has the fix.
+    logical_block = cache.mamba_block_size * parallel.prefill_context_parallel_size
+    unit = cache.prefix_match_unit
+    if unit is None or unit >= logical_block:
+        return True
+    logger.info_once(
+        "GDN internal prefill checkpoints are off: prefix_match_unit=%d is finer "
+        "than the logical Mamba block size %d.",
+        unit,
+        logical_block,
+    )
+    return False
+
+
+@dataclass(frozen=True)
+class PrefillCheckpointUnits:
+    """Units of the prefill checkpoint rule, as the engine core applies it.
+
+    All token sizes are global across PCP ranks: mamba_block_size is
+    MambaSpec.block_size * pcp_world_size, the column stride of the Mamba
+    block table. cache_hit_alignment_tokens is the prefix-cache hit
+    granularity, which places the checkpoint below a chunk's end.
+    """
+
+    hash_block_size: int
+    cache_hit_alignment_tokens: int
+    mamba_block_size: int
+    alignment: int
+    drop_eagle_block: bool
+    num_hash_lookahead_tokens: int = 0
+
+    def fill_offsets(
+        self, out: np.ndarray, seq_lens: np.ndarray, query_lens: np.ndarray
+    ) -> None:
+        """Populates per-request logical query checkpoint offsets into out (0 if none).
+
+        seq_lens (chunk ends) and query_lens (scheduled tokens) cover active
+        requests; any padded tail in out is zeroed.
+        """
+        # Lazy import to avoid a circular import while vllm.platforms initializes.
+        from vllm.model_executor.layers.mamba.checkpoint import (
+            compute_mamba_prefill_checkpoints,
+        )
+
+        out[:] = 0
+        # A checkpoint lies at least one hash block past the query start.
+        rows = np.flatnonzero(query_lens > self.hash_block_size)
+        if rows.size:
+            offsets, _ = compute_mamba_prefill_checkpoints(
+                [int(n) for n in seq_lens[rows]],
+                [int(n) for n in query_lens[rows]],
+                hash_block_size=self.hash_block_size,
+                mamba_block_size=self.mamba_block_size,
+                checkpoint_alignment=self.alignment,
+                drop_eagle_block=self.drop_eagle_block,
+                cache_hit_alignment_tokens=self.cache_hit_alignment_tokens,
+                num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+            )
+            out[rows] = np.asarray(offsets, dtype=np.int32)
