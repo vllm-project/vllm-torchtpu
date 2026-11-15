@@ -435,11 +435,11 @@ def _patch_sdpa_fallback_dispatch() -> None:
         _get_split_splash_op,
     )
 
+    if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
+        return
     if envs.VLLM_TPU_OMNI_SPLIT_SPLASH and not torch.compiler.is_compiling():
         _get_split_splash_op()
         _flash_attention_op()
-    if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
-        return
     # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
     setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
     SDPAImpl.forward = TpuSDPAImpl.forward

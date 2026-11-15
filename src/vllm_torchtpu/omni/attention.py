@@ -134,6 +134,10 @@ def _can_use_unmasked_flash_in_sdpa(
         or query.ndim != 4
         or key.ndim != 4
         or value.ndim != 4
+        or query.shape[0] != key.shape[0]
+        or query.shape[0] != value.shape[0]
+        or key.shape[1] != value.shape[1]
+        or key.shape[2] != value.shape[2]
         or query.dtype != torch.bfloat16
         or key.dtype != torch.bfloat16
         or value.dtype != torch.bfloat16
@@ -171,27 +175,22 @@ class TpuSDPAImpl(SDPAImpl):
         value: torch.Tensor,
         attn_metadata: Any | None = None,
     ) -> torch.Tensor:
+        scale = (
+            query.shape[-1] ** -0.5
+            if self.softmax_scale is None
+            else float(self.softmax_scale)
+        )
         prefix_len = _prefix_mask_len_for_split_splash(
             query, key, value, attn_metadata, self.causal
         )
         if prefix_len is not None:
             assert attn_metadata is not None and attn_metadata.attn_mask is not None
-            scale = (
-                query.shape[-1] ** -0.5
-                if self.softmax_scale is None
-                else float(self.softmax_scale)
-            )
             return _get_split_splash_op()(
                 query, key, value, attn_metadata.attn_mask, prefix_len, scale
             )
         if _can_use_unmasked_flash_in_sdpa(
             query, key, value, attn_metadata, self.causal
         ):
-            scale = (
-                query.shape[-1] ** -0.5
-                if self.softmax_scale is None
-                else float(self.softmax_scale)
-            )
             return _flash_attention_op()(query, key, value, scale)
         # ---------------------------------------------------------------------
         # TODO: Remove the math-backend pin, and its canary

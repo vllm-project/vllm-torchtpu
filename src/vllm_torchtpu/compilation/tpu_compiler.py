@@ -265,6 +265,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # with the venv prefix or mount path. get_libtpu_cache_key() already
     # identifies the loaded build without its path.
     "TPU_LIBRARY_PATH",
+    # vLLM-Omni diffusion only (never compiled via TpuCompilerAdaptor).
+    "VLLM_TPU_OMNI_SPLIT_SPLASH",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
