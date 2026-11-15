@@ -37,6 +37,10 @@ def _typed_view(block_ref, view_dtype, lane_split: int):
     return block_ref.reshape(-1, block_ref.shape[-1] // lane_split)
 
 
+# Public name for consumers that index into the view (GDN v3 window_tile).
+typed_view = _typed_view
+
+
 def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:
     """Reads a raw block ref as ``(rows, lanes // lane_split)`` view_dtype."""
     return _typed_view(block_ref, view_dtype, lane_split)[...]

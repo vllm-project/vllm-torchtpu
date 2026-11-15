@@ -77,6 +77,17 @@ class Tiles:
     dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
     dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
+    # VMEM cuts (large buckets): the hidden input / output stay in HBM (DMA'd through
+    # `scr['xb']`) instead of two [M, H] bf16 VMEM windows.
+    hbm_io: bool = False
+    # > 0: the whole-[MB, H] prologue / epilogue ops (residual load, final norm) run in
+    # row chunks of this many rows (smaller register-allocator spill area).
+    io_chunk: int = 0
+    # The shared dense accumulator `acc` sized to the blocks' declared widths only (no
+    # `[MB, H]` floor; a block reading past its declared width fails at trace time).
+    acc_fit: bool = False
+    # Skip scratch a build never touches (GDN `pg_raw*` staging under the chunk gather).
+    lean_scratch: bool = False
     # Per-block tunables (registered `Tunables` instances keyed by block name).
     blocks: Mapping[str, Any] = TunablesMap()
 
@@ -140,6 +151,10 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
     "dense_acc_pair": "approx",  # paired dense accumulation
     "dmm_unroll": "approx",  # unrolled dense matmul accumulation
     "rel_fetch": "exact",  # trace-time-decoded dense refills (scheduling)
+    "hbm_io": "exact",  # hidden input / output memory space (same values)
+    "io_chunk": "exact",  # row chunking of row-independent ops
+    "acc_fit": "exact",  # `acc` buffer width (same values)
+    "lean_scratch": "exact",  # unused scratch not allocated
 }
 
 

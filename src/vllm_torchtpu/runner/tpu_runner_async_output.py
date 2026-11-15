@@ -129,7 +129,11 @@ class AsyncTPUCopyState:
         spec_logprobs: list[SpecLogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
-        pinned = envs.VLLM_TPU_PINNED_TOKEN_COPY
+        # Pinned ring reads race the device-to-host copy once TOKEN_PADDING_REUSE drops
+        # the per-step host-to-device barrier (c32 GSM8K 0.14 with both on, 0.968 with
+        # pinned off), so the pinned ring is only used without padding reuse.
+        pinned = (envs.VLLM_TPU_PINNED_TOKEN_COPY
+                  and not envs.VLLM_TPU_TOKEN_PADDING_REUSE)
         if pinned:
             chunks_cpu = [
                 _pinned_buffer(t).copy_(t, non_blocking=True) for t in chunks_tpu

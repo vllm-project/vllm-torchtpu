@@ -98,6 +98,10 @@ PATCHES = (
     Patch("vllm_torchtpu.core.decode_priority:patch_decode_priority", _ENGINE),
     Patch("vllm_torchtpu.compilation.aot_guard_skip:patch_aot_guard_skip", _ACTIVE),
     Patch("vllm_torchtpu.core.zero_schedule_diag:patch_zero_schedule_diag", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.prefix_aware_scheduler:patch_prompt_ids_ndarray_early",
+        _ENGINE,
+    ),
     # API server: reasoning-token count at stream end without tool re-parsing.
     Patch("vllm_torchtpu.core.reasoning_count_patch:patch_reasoning_count_skip_tools", _ACTIVE),
     Patch(

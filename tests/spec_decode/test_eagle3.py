@@ -2947,3 +2947,165 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+# VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL: a mixed async step (decode rows plus a
+# partial and a final prefill chunk) seeds through the fused program with the
+# partial-prefill tokens as an override vector; it must equal the eager path.
+# Rows: (kind, tokens, num_draft, sampler row). The partial prefill's sampler
+# row holds a token that must be thrown away (555); its seed is the prompt's
+# next token 777. Width 8 > 4 real requests: padding rows repeat the last.
+_MIXED_REQS = {
+    "dec_a": ("decode", 4, 3, [91, 92, 201, -1]),
+    "partial": ("partial", 6, 0, [555, -1, -1, -1]),
+    "final": ("final", 5, 0, [303, -1, -1, -1]),
+    "dec_b": ("decode", 4, 3, [202, -1, -1, -1]),
+}
+
+
+def _mixed_seed_case(order, device):
+    width = 8
+    lens = [_MIXED_REQS[r][1] for r in order]
+    qsl = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    total = int(qsl[-1])
+    T = 32
+    qsl_dev = np.full(width + 1, total, dtype=np.int32)
+    qsl_dev[: len(qsl)] = qsl
+    draft_lengths = np.full(width, _MIXED_REQS[order[-1]][2], dtype=np.int32)
+    draft_lengths[: len(order)] = [_MIXED_REQS[r][2] for r in order]
+    nt = np.full((width, 4), -1, dtype=np.int32)
+    nt[: len(order)] = [_MIXED_REQS[r][3] for r in order]
+    requests = {
+        "partial": SimpleNamespace(
+            num_computed_tokens=10, get_token_id=lambda i: 777 if i == 16 else -5
+        ),
+        "final": SimpleNamespace(num_computed_tokens=0, get_token_id=lambda i: -5),
+    }
+    sched = SimpleNamespace(num_scheduled_tokens={r: _MIXED_REQS[r][1] for r in order})
+    discard = [i for i, r in enumerate(order) if _MIXED_REQS[r][0] == "partial"]
+
+    def make_chunk():
+        return _make_chunk(
+            input_ids=(torch.arange(T, dtype=torch.int32) + 1000).to(device),
+            position_ids=(torch.arange(T, dtype=torch.int32) + 50).to(device),
+            query_start_loc_np=qsl,
+            start_index=0,
+            num_reqs=len(order),
+            device=device,
+            draft_lengths=torch.from_numpy(draft_lengths).to(device),
+            attn_ctx=SimpleNamespace(
+                query_start_loc=torch.from_numpy(qsl_dev).to(device),
+                use_max_model_len=False,
+            ),
+        )
+
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=list(order)),
+        device=device,
+        requests=requests,
+        num_tokens_paddings=[4, 8, 16, 32],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=8,
+        max_num_reqs=8,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    return make_chunk, runner, sched, discard, torch.from_numpy(nt).to(device)
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ("dec_a", "partial", "final", "dec_b"),
+        ("final", "dec_a", "dec_b", "partial"),  # padding repeats the override
+        ("partial", "dec_b", "final", "dec_a"),
+        ("dec_a", "final", "dec_b"),  # no partial: all -1 override
+    ],
+)
+@pytest.mark.parametrize("seed_fused", [True, False])
+@pytest.mark.parametrize("check", [0, 1])
+def test_fused_draft_seed_partial_matches_eager(monkeypatch, order, seed_fused, check):
+    """Flag on vs off on mixed steps: identical draft input ids, positions,
+    gather indices (the step-0 draft rows / carry rows), rejected counts and
+    the fused path's draft-rows extras; the fused check finds no mismatch."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    device = torch.device("cpu")
+    monkeypatch.setattr(e3, "_fused_seed_device", lambda _t: True)
+    # The eager path's seed scatter is a tpu-backend compiled region; run its
+    # undecorated body on CPU.
+    raw_seed_ids = e3.Eagle3Proposer._draft_seed_input_ids.__wrapped__
+    raw_seed_ids = getattr(raw_seed_ids, "_torchdynamo_orig_callable", raw_seed_ids)
+    monkeypatch.setattr(e3.Eagle3Proposer, "_draft_seed_input_ids", raw_seed_ids)
+    monkeypatch.setenv("VLLM_TPU_FUSED_ASYNC_DRAFT_SEED", "1")
+    monkeypatch.setenv("VLLM_TPU_DRAFT_SEED_FUSED", "1" if seed_fused else "0")
+    monkeypatch.setenv("VLLM_TPU_DRAFT_SEED_EXTRAS", "1")
+    monkeypatch.setenv("VLLM_TPU_VERIFY_FUSED_CHECK", str(check))
+    make_chunk, runner, sched, discard, nt = _mixed_seed_case(order, device)
+
+    def run(flag):
+        monkeypatch.setenv("VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL", "1" if flag else "0")
+        proposer = _make_proposer(draft_tp=1, method="mtp")
+        proposer.runner = runner
+        proposer._draft_rows = True
+        chunk = make_chunk()
+        calls = {"eager_put": 0}
+        orig = torch.Tensor.__setitem__
+
+        def counting_setitem(t, idx, val):
+            calls["eager_put"] += 1
+            return orig(t, idx, val)
+
+        with mock.patch.object(torch.Tensor, "__setitem__", counting_setitem):
+            out = proposer._prepare_draft_inputs(
+                chunk,
+                sampled_token_ids=None,
+                discard_sampled_tokens_req_indices=discard,
+                num_rejected_tokens_np=None,
+                scheduler_output=sched,
+                next_tokens_device=nt,
+            )
+        extras = proposer._seed_extras.get(id(chunk))
+        return proposer, chunk, out, extras, calls["eager_put"]
+
+    _, _, off, off_extras, off_puts = run(False)
+    on_p, on_chunk, on, on_extras, on_puts = run(True)
+    ids_off, pos_off, g_off, rej_off = off
+    ids_on, pos_on, g_on, rej_on = on
+    n = len(order)
+    num_rows = 8
+    p = 4
+    assert torch.equal(ids_on, ids_off)
+    assert torch.equal(pos_on, pos_off)
+    assert g_on.shape == g_off.shape == (p,)
+    assert torch.equal(g_on, g_off)
+    assert torch.equal(rej_on, rej_off)
+    # Seed tokens at the seed rows: the partial prefill seeds 777, never 555.
+    seeds = ids_on[g_on[:n]].tolist()
+    for i, r in enumerate(order):
+        kind = _MIXED_REQS[r][0]
+        if kind == "partial":
+            assert seeds[i] == 777
+        elif kind == "final":
+            assert seeds[i] == 303
+    assert 555 not in ids_on.tolist()
+    # Step-0 draft rows and the carry rows read from the same seed rows.
+    ref_rows = on_p._padded_draft_rows(g_off, num_rows)
+    ref_rej = _maybe_pad_dim0(rej_off[:num_rows], num_rows)
+    if seed_fused:
+        assert on_extras is not None
+        assert torch.equal(on_extras[0], ref_rows)
+        assert torch.equal(on_extras[1], ref_rej)
+        if off_extras is not None:  # no partial: the flag-off path fused too
+            assert torch.equal(on_extras[0], off_extras[0])
+            assert torch.equal(on_extras[1], off_extras[1])
+    assert torch.equal(pos_on[g_on[:n]], pos_off[g_off[:n]])
+    # With a partial prefill the flag-off path is the eager one (index_put
+    # through __setitem__); the flag-on path has none.
+    if discard:
+        assert off_puts > 0
+        assert off_extras is None
+    assert on_puts == 0
+    if check and seed_fused:
+        clean, caught = on_p._seed_mismatches.tolist()
+        assert on_p._seed_checks_done == 1
+        assert clean == 0 and caught == 0

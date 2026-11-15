@@ -1202,11 +1202,28 @@ def prefill_indexer_chunk(tokens: int) -> int | None:
 
     Default: 512 when it divides the step. VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK
     overrides it with any multiple of 8 that divides the step.
+    VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK applies its chunk only to steps of
+    at most ``SMALL_INDEXER_STEP_TOKENS`` rows, whose top-k the default leaves
+    exposed (one call, or two 512-row chunks).
     """
     override = envs.VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK
     if override and override % 8 == 0 and tokens % override == 0:
         return override
+    small = envs.VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK
+    if (
+        small
+        and small % 8 == 0
+        and tokens <= SMALL_INDEXER_STEP_TOKENS
+        and small < tokens
+        and tokens % small == 0
+    ):
+        return small
     return 512 if tokens % 512 == 0 else None
+
+
+# Largest per-rank prefill indexer step VLLM_TPU_QSA_PREFILL_INDEXER_SMALL_CHUNK
+# re-chunks (replicated 256/512/1024 buckets; SP 2K/4K/8K chunks per rank).
+SMALL_INDEXER_STEP_TOKENS = 1024
 
 
 # Largest expanded kernel-page table the ragged prefill indexer prefetches
@@ -1852,27 +1869,27 @@ def _pooled_qsa(
         return pool, q, gate, lengths, req, starts, vals, pos
     if token_shard is not None:
         assert rows is None, "the token shard covers the all-token prefill path"
-        index, size = token_shard
-        width = len(iq) // size
-        base, sub_starts, sub_context = token_shard_step(starts, context, index, width)
-
-        def own(x):
-            return jax.lax.dynamic_slice_in_dim(x, base, width)
-
-        blocks = select_blocks(
-            own(iq),
-            pool,
-            own(lengths),
-            compressed_table,
-            own(req),
-            sub_starts,
-            sub_context,
-            ratio=compress_ratio,
-            block_topk=token_topk // compress_ratio,
-            slot=compressed_slot,
-            # The whole step takes the ragged prefill indexer; keep the
-            # shard on it too (it serves verify-sized requests as well).
-            max_query_len=1,
+        # Shards with more rows than request slots take the ragged prefill
+        # indexer (it serves verify-sized requests as well). Narrower shards
+        # (the decode buckets of VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD) take
+        # the decode indexer when every request lies in one shard, else the
+        # whole step is indexed and the shard's rows kept.
+        blocks = token_shard_selection(
+            functools.partial(
+                select_blocks,
+                pool=pool,
+                table=compressed_table,
+                ratio=compress_ratio,
+                block_topk=token_topk // compress_ratio,
+                slot=compressed_slot,
+            ),
+            iq,
+            lengths,
+            req,
+            starts,
+            context,
+            max_query_len,
+            token_shard,
         )
         return pool, q, gate, lengths, req, starts, blocks
     if shard is not None:

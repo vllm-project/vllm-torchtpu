@@ -138,3 +138,190 @@ def test_mode_is_decided_once_for_the_smallest_sp_bucket(
     assert Qwen4ExpQSA._token_shard_mode(8, False, max_num_seqs) is False
     monkeypatch.setattr(envs, "QWEN4_EXP_PREFILL_SP", False, raising=False)
     assert Qwen4ExpQSA._token_shard_mode(8, True, max_num_seqs) is False
+
+
+@pytest.mark.parametrize(
+    "tokens,max_num_seqs,compressed_dcp,expected",
+    [
+        (256, 16, False, True),
+        (512, 24, False, True),
+        (3072, 32, False, True),
+        (256, 32, False, False),  # 32 rows per rank, not more than 32 slots
+        (128, 8, False, False),  # below the 256-row minimum
+        (264, 16, False, True),
+        (260, 16, False, False),  # does not divide by TP
+        (512, 16, True, False),  # compressed DCP: DECODE_TOKEN_SHARD's job
+    ],
+)
+def test_replicated_token_shard_eligibility(
+    monkeypatch, tokens, max_num_seqs, compressed_dcp, expected
+):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", True, raising=False
+    )
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_COMPRESSED_DCP", compressed_dcp, raising=False
+    )
+    assert sp.replicated_token_shard_eligible(tokens, 8, max_num_seqs) is expected
+    assert sp.replicated_token_shard_eligible(tokens, 1, max_num_seqs) is False
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", False, raising=False
+    )
+    assert sp.replicated_token_shard_eligible(tokens, 8, max_num_seqs) is False
+
+
+_SC_AG = "--xla_tpu_enable_sparse_core_collective_offload_all_gather"
+
+
+@pytest.mark.parametrize(
+    "libtpu_args,expected",
+    [
+        ("", True),
+        (f"{_SC_AG}=false", True),
+        (f"{_SC_AG}=true", False),
+        # The last setting wins, as in libtpu (the recipe appends overrides).
+        (f"{_SC_AG}=true {_SC_AG}=false", True),
+        (f"{_SC_AG}=false {_SC_AG}=true", False),
+        # The c32 recipe's offload flags around it.
+        (
+            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=8388608 "
+            f"{_SC_AG}=true "
+            "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true",
+            False,
+        ),
+    ],
+)
+def test_replicated_token_shard_off_under_sparse_core_all_gather_offload(
+    monkeypatch, libtpu_args, expected
+):
+    """The selection all-gather of Qwen4ExpBackboneRP halts a SparseCore with
+    the all-gather offload on (c32): the router and the QSA layers both drop
+    the graph there."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", libtpu_args)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", True, raising=False
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_COMPRESSED_DCP", False, raising=False)
+    assert sp.replicated_token_shard_enabled() is expected
+    assert sp.replicated_token_shard_eligible(512, 8, 24) is expected
+    assert Qwen4ExpQSA._replicated_token_shard_mode(8, True, "model.layers.3") is expected
+    assert Qwen4ExpQSA._replicated_token_shard_mode(8, True, "mtp.layers.0") is False
+
+
+@pytest.mark.parametrize(
+    "tokens,tp,rows_per_request,expected",
+    [
+        (64, 8, 4, True),  # 8 rows per rank: two whole verify requests
+        (96, 8, 4, True),
+        (128, 8, 4, True),
+        (48, 8, 4, False),  # 6 rows per rank split a request
+        (32, 8, 4, False),  # below the 64-row minimum
+        (64, 1, 4, False),  # no TP
+        (72, 8, 4, False),  # 9 rows per rank
+        (72, 8, 1, True),  # plain decode: any per-rank share holds whole requests
+    ],
+)
+def test_decode_req_shard_eligibility(monkeypatch, tokens, tp, rows_per_request, expected):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_COMPRESSED_DCP", False, raising=False)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", False, raising=False
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD", True, raising=False)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD_MIN_ROWS", 64, raising=False
+    )
+    assert sp.decode_req_shard_eligible(tokens, tp, rows_per_request) is expected
+    # The prefill rule stays off: the flags are independent.
+    assert sp.replicated_token_shard_enabled() is False
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD", False, raising=False)
+    assert sp.decode_req_shard_eligible(tokens, tp, rows_per_request) is False
+
+
+@pytest.mark.parametrize(
+    "libtpu_args,compressed_dcp,expected",
+    [
+        ("", False, True),
+        (f"{_SC_AG}=true", False, False),  # the selection all-gather halts a SparseCore
+        ("", True, False),  # compressed DCP: DECODE_TOKEN_SHARD's job
+    ],
+)
+def test_decode_req_shard_guards_and_layer_ops(monkeypatch, libtpu_args, compressed_dcp, expected):
+    """The decode flag alone builds the token-sharded ops of the target's QSA
+    layers (the RP graph serves its buckets); never the MTP draft's."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", libtpu_args)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_COMPRESSED_DCP", compressed_dcp, raising=False)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", False, raising=False
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD", True, raising=False)
+    assert sp.decode_req_shard_enabled() is expected
+    assert sp.decode_req_shard_eligible(64, 8, 4) is expected
+    assert Qwen4ExpQSA._replicated_token_shard_mode(8, True, "model.layers.3") is expected
+    assert Qwen4ExpQSA._replicated_token_shard_mode(8, True, "mtp.layers.0") is False
+
+
+@pytest.mark.parametrize(
+    "starts,context,size",
+    [
+        # One-token decodes in narrow shards (width <= request slots): every
+        # request lies in one shard, so the shards take the decode indexer.
+        ([0, 1, 2, 2], [1661, 1663, 0], 4),
+        ([0, 2, 4, 4], [1661, 1663, 0], 4),
+        ([0, 1, 2, 2], [1661, 1663, 0], 8),
+        # A request crossing a narrow shard: the whole step is indexed.
+        ([0, 3, 4, 4], [1661, 1663, 0], 4),
+    ],
+)
+def test_narrow_token_shards_compose_to_the_pooled_step(
+    rowwise_attention,  # noqa: F811
+    monkeypatch,
+    starts,
+    context,
+    size,
+):
+    """VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD: decode-sized shards (no more
+    rows than request slots) through select -> gather -> attend equal the
+    replicated step, on the shard path and the whole-step fallback."""
+    head, pool, tail = mtp_rows._inputs(False, starts, context)
+    options = dict(mtp_rows.OPTIONS, token_topk=256, max_query_len=4)
+    want_pool, want_out, want_selected = jax.jit(
+        lambda *args: pooled_qsa.pooled_qsa_step(*args, **options)
+    )(*head, pool, *tail)
+    width = len(head[0]) // size
+    assert width <= len(context)
+    results = [
+        jax.jit(
+            lambda *args: pooled_qsa.pooled_qsa_token_select_step(
+                *args, shard_size=size, **options
+            )
+        )(*head, pool, *tail, jnp.asarray([s], jnp.int32))
+        for s in range(size)
+    ]
+    new_pool, q, gate, lengths, req, st, _ = results[0]
+    np.testing.assert_array_equal(
+        np.asarray(new_pool).view(np.uint8), np.asarray(want_pool).view(np.uint8)
+    )
+    gathered = jnp.concatenate([result[-1] for result in results])
+    _, out, selected = jax.jit(
+        lambda *args: pooled_qsa.pooled_qsa_shard_attend_step(
+            *args, kv_heads=2, compress_ratio=4, token_topk=256, merged=True, max_query_len=4
+        )
+    )(q, gate, lengths, req, st, tail[3], tail[1], new_pool, gathered)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(want_out))
+    np.testing.assert_array_equal(np.asarray(selected), np.asarray(want_selected))

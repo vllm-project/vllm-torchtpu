@@ -68,7 +68,15 @@ def _hc_mix_operands(
     """`(hdn [W, n_down], [hup_b [k_up, H]])` of one mixing hyper-connection."""
     W, lr = g.NHC * g.H, g.LOWRANK
     down = hc.input_mix_weight_down.weight.data  # [LR, W]
-    inj = hc.block_inject_weight.weight.data  # [NHC, W]
+    # A mixer built without the combine (`GatedResidual(use_combine=False)`: the final
+    # mixer before lm_head, the MTP draft's included) has no injection; its columns are
+    # zero (the greedy tail never reads them).
+    inj_w = getattr(hc, "block_inject_weight", None)
+    inj = (
+        inj_w.weight.data
+        if inj_w is not None
+        else torch.zeros((g.NHC, W), dtype=down.dtype, device=down.device)
+    )  # [NHC, W]
     up = hc.input_mix_weight_up.weight.data  # [W, LR]
     assert tuple(down.shape) == (lr, W) and tuple(up.shape) == (W, lr), (
         down.shape,

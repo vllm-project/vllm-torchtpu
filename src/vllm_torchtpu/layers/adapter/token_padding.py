@@ -20,6 +20,11 @@ from vllm_torchtpu import envs
 
 _padding_state: "TokenPaddingState | None" = None
 
+# VLLM_TPU_PREFLAT_FWD_ARGS: per-key masks are kept for steps of at most this
+# many padded rows (the decode and verify buckets), at most this many keys.
+PREFLAT_MAX_PADDED_TOKENS = 64
+PREFLAT_MAX_MASKS = 128
+
 
 @dataclass
 class TokenPaddingState:
@@ -37,6 +42,10 @@ class TokenPaddingState:
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
         key = (local_valid_tokens, local_padded_tokens)
+        if envs.VLLM_TPU_PREFLAT_FWD_ARGS and self._preflat_swap(key):
+            return
+        if "_preflat_base" in self.__dict__:
+            self._preflat_restore()
         if envs.VLLM_TPU_TOKEN_PADDING_REUSE:
             # The mask only ever changes here, so the same rows as the last
             # write leave it exact: skip the synchronous H2D.
@@ -47,6 +56,54 @@ class TokenPaddingState:
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        if "_preflat_base" in self.__dict__:
+            self._preflat_base_key = key
+
+    def _preflat_swap(self, key: tuple[int, int]) -> bool:
+        """VLLM_TPU_PREFLAT_FWD_ARGS: point the mask at an owned device buffer
+        built once for `key` (same shape, dtype and values as a write of
+        `key` into the original buffer) instead of rebuilding a host mask and
+        copying it synchronously. No device op runs, and a forward still in
+        flight keeps reading the buffer it was given (nothing is written in
+        place). False for keys past the cache bound (e.g. prefill row
+        counts): the caller then writes the original buffer as before."""
+        valid, padded = key
+        if padded > PREFLAT_MAX_PADDED_TOKENS:
+            return False
+        d = self.__dict__
+        if "_preflat_base" not in d:
+            self._preflat_base = self.local_padding_mask
+            # Unknown contents: the first fallback write must not be skipped.
+            self._preflat_base_key = None
+            self._preflat_masks: dict = {}
+        if d.get("_preflat_key") == key and self.local_padding_mask is not (
+            self._preflat_base
+        ):
+            return True
+        masks = self._preflat_masks
+        entry = masks.get(key)
+        if entry is None:
+            base = self._preflat_base
+            host = torch.zeros(base.shape[0], dtype=torch.bool)
+            host[valid:padded] = True
+            # The cache keeps `host` alive, so the non-blocking upload never
+            # reads freed memory, and nothing ever writes either tensor.
+            entry = (host.to(base.device, non_blocking=True), host)
+            if len(masks) >= PREFLAT_MAX_MASKS:
+                masks.pop(next(iter(masks)))
+            masks[key] = entry
+        self.local_padding_mask = entry[0]
+        self._preflat_key = key
+        return True
+
+    def _preflat_restore(self) -> None:
+        """Back to the original buffer for a write past the cache bound (or
+        the flag turned off). The REUSE skip may only trust the key that
+        buffer itself last held."""
+        if self.local_padding_mask is not self._preflat_base:
+            self.local_padding_mask = self._preflat_base
+            self._preflat_key = None
+            self._last_key = self._preflat_base_key
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]

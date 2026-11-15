@@ -107,3 +107,14 @@ def test_subst_extract_fused_matches_prefix_then_extract():
     assert ids.dtype == ids_ref.dtype and torch.equal(ids, ids_ref)
     assert drafts.dtype == drafts_ref.dtype and torch.equal(drafts, drafts_ref)
     assert ids.data_ptr() != src.data_ptr()
+
+
+def test_subst_static_args_strips_without_a_view():
+    """VLLM_TPU_SUBST_STATIC_ARGS wraps the substitution with the owned-alias
+    strip (runner/owned_args.py), not eagle3's `a[:]` view, so the forward
+    gets back the caller's own input-ids tensor."""
+    from vllm_torchtpu.runner import tpu_runner
+
+    static = tpu_runner._substitute_placeholder_token_static
+    assert static.__wrapped__ is tpu_runner._substitute_placeholder_token
+    assert static.__code__.co_filename.endswith("owned_args.py")
