@@ -33,7 +33,8 @@ import torch
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.bridge import hbm
 from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
-from vllm_torchtpu.megakernel.kimi_k3.config import active
+from vllm_torchtpu.megakernel.kimi_k3 import config as _config_mod
+from vllm_torchtpu.megakernel.kimi_k3 import expert_banks
 from vllm_torchtpu.megakernel.program import (
     KVGroup,
     RequestInput,
@@ -42,6 +43,10 @@ from vllm_torchtpu.megakernel.program import (
 )
 
 logger = init_logger(__name__)
+
+
+def active() -> _config_mod.KernelConfig:
+    return _config_mod.active()
 
 
 def role_config(config: MegakernelEngineConfig, role: str) -> MegakernelEngineConfig:
@@ -100,6 +105,9 @@ def split_rows(
 class KimiAggregate:
     """See the module docstring."""
 
+    _prefill_ep: int = 8
+    _decode_ep: int = 8
+
     def __init__(
         self,
         config: MegakernelEngineConfig,
@@ -115,6 +123,11 @@ class KimiAggregate:
         if kernel.prefill_expert_parallel not in (8, 16):
             raise NotImplementedError(
                 "the K3 aggregate engine requires prefill_expert_parallel 8 or 16"
+            )
+        if kernel.decode_expert_parallel == 16 and kernel.prefill_expert_parallel != 16:
+            raise NotImplementedError(
+                "the K3 aggregate engine requires prefill_expert_parallel 16 "
+                "when decode_expert_parallel is 16"
             )
         if kernel.prefill_expert_parallel == 8 and kernel.kd_hot_plan:
             raise NotImplementedError(
@@ -142,6 +155,7 @@ class KimiAggregate:
         )
         self.rank = self.decoder.rank
         self._prefill_ep = kernel.prefill_expert_parallel
+        self._decode_ep = kernel.decode_expert_parallel
         self._loaded = False
 
     def load_weights(self) -> None:
@@ -157,11 +171,17 @@ class KimiAggregate:
         weights = self.decoder.ops.weights
         kernel = active()
         shared_names = list(PREFILL_SHARED)
-        if self._prefill_ep != 8:
+        if self._prefill_ep != self._decode_ep:
             excluded = set(EXPERT_FAMILIES)
             if kernel.prefill_expert_plan:
                 excluded.update(("router", "router_bias"))
             shared_names = [n for n in shared_names if n not in excluded]
+        elif expert_banks.bank_name(EXPERT_FAMILIES[0], 0) in weights:
+            shared_names = [n for n in shared_names if n not in EXPERT_FAMILIES] + [
+                expert_banks.bank_name(family, bank)
+                for family in EXPERT_FAMILIES
+                for bank in range(len(expert_banks.SHARED_BANK_SIZES))
+            ]
         missing = [n for n in shared_names if n not in weights]
         if missing:
             raise RuntimeError(f"K3 aggregate: the decoder holds no {missing}")
@@ -186,8 +206,10 @@ class KimiAggregate:
         self.decoder.warmup()
 
     def step(self, step_input: StepInput) -> StepOutput:
-        prefill, decode = split_rows(step_input.requests, self.decoder.tracked)
         finished = set(step_input.finished or ())
+        if finished:
+            self.decoder.forget(finished)
+        prefill, decode = split_rows(step_input.requests, self.decoder.tracked)
         # A request computing again (preempted) restarts in the decoder.
         restarted = [
             r.req_id
@@ -201,4 +223,4 @@ class KimiAggregate:
         else:
             for req_id in finished:
                 self.prefiller._requests.pop(req_id, None)
-        return self.decoder.step(StepInput(decode, finished, (), step_input.mask))
+        return self.decoder.step(StepInput(decode, (), (), step_input.mask))

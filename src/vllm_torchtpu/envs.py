@@ -140,17 +140,32 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     K3_AGGREGATE_EP16: bool = False
+    K3_DCP_COMBINE_CHUNKS: bool = True
+    K3_DECODE_EXPERT_BANKS: bool = True
     K3_FP8_WIRES: str = ""
     K3_HOT_PLAN: str = ""
-    K3_MAX_PREFILL_STEP_TOKENS: int = 16384
+    K3_MAX_PREFILL_STEP_TOKENS: int = 8192
+    K3_PREFILL_A2A_CHIP_SHARD: bool = False
     K3_PREFILL_EXPERT_PLAN: str = ""
-    K3_PREFILL_PREFIX_FP8: bool = True
+    K3_PREFILL_KDA_A2A: bool = False
+    K3_PREFILL_KDA_DUAL_GATHER: bool = False
+    K3_PREFILL_KDA_RING_SET: bool = False
+    K3_PREFILL_KDA_A2A_FP8: bool = False
+    K3_PREFILL_KDA_FP8_GATHER: bool = False
+    K3_PREFILL_MLA_A2A: bool = False
+    K3_PREFILL_MLA_A2A_FP8: bool = False
+    K3_PREFILL_MOE_16K_MONOLITHIC: bool = False
+    K3_PREFILL_MOE_DENSE_FP8: bool = False
+    K3_PREFILL_MOE_W4A8: bool = False
+    K3_PREFILL_PREFIX_FP8: bool = False
+    K3_PREFILL_REPLICA_PLAN: str = ""
     K3_PREFILL_ROUTE_COUNTS: bool = False
     K3_PREFILL_ROUTE_COUNTS_DIR: str = ""
-    K3_PREFILL_SJF: bool = True
+    K3_PREFILL_SJF: bool = False
     K3_PREFILL_SJF_AGING: float = 16384.0
-    K3_REPLICA_PLAN: str = "none"
-    K3_SERIAL_PREFILL: bool = True
+    K3_REPLICA_PLAN: str = ""
+    K3_SERIAL_PREFILL: bool = False
+    K3_UNIFIED_EP16: bool = False
 
 
 def env_with_choices(
@@ -868,17 +883,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kimi K3 megakernel and prefill scheduler knobs.
     "K3_AGGREGATE_EP16": env_bool("K3_AGGREGATE_EP16", default=False),
+    "K3_DCP_COMBINE_CHUNKS": env_bool("K3_DCP_COMBINE_CHUNKS", default=True),
+    "K3_DECODE_EXPERT_BANKS": env_bool("K3_DECODE_EXPERT_BANKS", default=True),
     "K3_FP8_WIRES": env_str("K3_FP8_WIRES", ""),
     "K3_HOT_PLAN": env_str("K3_HOT_PLAN", ""),
-    "K3_MAX_PREFILL_STEP_TOKENS": env_int("K3_MAX_PREFILL_STEP_TOKENS", 16384),
+    "K3_MAX_PREFILL_STEP_TOKENS": env_int("K3_MAX_PREFILL_STEP_TOKENS", 8192),
+    "K3_PREFILL_A2A_CHIP_SHARD": env_bool("K3_PREFILL_A2A_CHIP_SHARD", default=False),
     "K3_PREFILL_EXPERT_PLAN": env_str("K3_PREFILL_EXPERT_PLAN", ""),
-    "K3_PREFILL_PREFIX_FP8": env_bool("K3_PREFILL_PREFIX_FP8", default=True),
+    "K3_PREFILL_KDA_A2A": env_bool("K3_PREFILL_KDA_A2A", default=False),
+    "K3_PREFILL_KDA_DUAL_GATHER": env_bool("K3_PREFILL_KDA_DUAL_GATHER", default=False),
+    "K3_PREFILL_KDA_RING_SET": env_bool("K3_PREFILL_KDA_RING_SET", default=False),
+    "K3_PREFILL_KDA_A2A_FP8": env_bool("K3_PREFILL_KDA_A2A_FP8", default=False),
+    "K3_PREFILL_KDA_FP8_GATHER": env_bool("K3_PREFILL_KDA_FP8_GATHER", default=False),
+    "K3_PREFILL_MLA_A2A": env_bool("K3_PREFILL_MLA_A2A", default=False),
+    "K3_PREFILL_MLA_A2A_FP8": env_bool("K3_PREFILL_MLA_A2A_FP8", default=False),
+    "K3_PREFILL_MOE_16K_MONOLITHIC": env_bool(
+        "K3_PREFILL_MOE_16K_MONOLITHIC", default=False
+    ),
+    "K3_PREFILL_MOE_DENSE_FP8": env_bool("K3_PREFILL_MOE_DENSE_FP8", default=False),
+    "K3_PREFILL_MOE_W4A8": env_bool("K3_PREFILL_MOE_W4A8", default=False),
+    "K3_PREFILL_PREFIX_FP8": env_bool("K3_PREFILL_PREFIX_FP8", default=False),
+    "K3_PREFILL_REPLICA_PLAN": env_str("K3_PREFILL_REPLICA_PLAN", ""),
     "K3_PREFILL_ROUTE_COUNTS": env_bool("K3_PREFILL_ROUTE_COUNTS", default=False),
     "K3_PREFILL_ROUTE_COUNTS_DIR": env_str("K3_PREFILL_ROUTE_COUNTS_DIR", ""),
-    "K3_PREFILL_SJF": env_bool("K3_PREFILL_SJF", default=True),
+    "K3_PREFILL_SJF": env_bool("K3_PREFILL_SJF", default=False),
     "K3_PREFILL_SJF_AGING": env_float("K3_PREFILL_SJF_AGING", 16384.0),
-    "K3_REPLICA_PLAN": env_str("K3_REPLICA_PLAN", "none"),
-    "K3_SERIAL_PREFILL": env_bool("K3_SERIAL_PREFILL", default=True),
+    "K3_REPLICA_PLAN": env_str("K3_REPLICA_PLAN", ""),
+    "K3_SERIAL_PREFILL": env_bool("K3_SERIAL_PREFILL", default=False),
+    "K3_UNIFIED_EP16": env_bool("K3_UNIFIED_EP16", default=False),
 }
 
 

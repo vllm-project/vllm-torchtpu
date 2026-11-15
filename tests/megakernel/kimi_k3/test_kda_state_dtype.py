@@ -13,6 +13,7 @@ from jax.experimental import pallas as pl
 from vllm_torchtpu.megakernel import backend
 from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
 from vllm_torchtpu.megakernel.kimi_k3 import program
+from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel
 
 pytestmark = pytest.mark.cpu_test
 
@@ -162,3 +163,127 @@ def test_prefill_rejects_bf16_instead_of_ignoring_the_flag():
     )
     with pytest.raises(NotImplementedError, match="decode-only"):
         program.check(config)
+
+
+def _kda_token_step_oracle_f32(
+    hidden_f32,
+    gate_w_f32,
+    fb_w_f32,
+    proj_w_f32,
+    conv_w_f32,
+    alog_f32,
+    dt_f32,
+    norm_f32,
+    rec0_f32,
+    hist0_f32,
+    live_len: int,
+):
+    seq_len = hidden_f32.shape[0]
+    heads, ch = 3, 128
+    width = heads * ch
+    gate_feat = np.asarray(
+        jnp.asarray(hidden_f32 @ gate_w_f32, jnp.bfloat16), np.float32
+    )
+    raw_gate = np.asarray(
+        jnp.asarray(gate_feat @ fb_w_f32, jnp.bfloat16), np.float32
+    ).reshape(seq_len, heads, ch)
+    proj = np.asarray(jnp.asarray(hidden_f32 @ proj_w_f32, jnp.bfloat16), np.float32)
+    qkv = proj[:, : 3 * width].reshape(seq_len, 3, heads, ch)
+    out_gate_sig = 1.0 / (1.0 + np.exp(-proj[:, 3 * width : 4 * width]))
+    beta_logits = proj[:, 4 * width : 4 * width + heads]
+
+    window = np.concatenate([hist0_f32, qkv], axis=0)
+    conv = sum(window[tap : tap + seq_len] * conv_w_f32[tap] for tap in range(4))
+    filtered = conv / (1.0 + np.exp(-conv))
+    a_log = np.exp(alog_f32)[None, :, :]
+    decay = -5.0 / (1.0 + np.exp(-a_log * (raw_gate + dt_f32[None])))
+    beta = 1.0 / (1.0 + np.exp(-beta_logits))
+
+    q_raw, k_raw, v_raw = filtered[:, 0], filtered[:, 1], filtered[:, 2]
+    q_norm = (
+        q_raw
+        / np.sqrt(np.sum(q_raw * q_raw, axis=-1, keepdims=True) + 1e-6)
+        / np.sqrt(ch)
+    )
+    k_norm = k_raw / np.sqrt(np.sum(k_raw * k_raw, axis=-1, keepdims=True) + 1e-6)
+
+    state = rec0_f32.copy()
+    out = np.zeros((seq_len, width), dtype=np.float32)
+    for tok in range(live_len):
+        state = state * np.exp(decay[tok])[:, :, None]
+        pred = np.einsum("hkv,hk->hv", state, k_norm[tok])
+        delta = (v_raw[tok] - pred) * beta[tok][:, None]
+        state = state + k_norm[tok][:, :, None] * delta[:, None, :]
+        y_tok = np.einsum("hkv,hk->hv", state, q_norm[tok])
+        rms = 1.0 / np.sqrt(np.mean(y_tok * y_tok, axis=-1, keepdims=True) + 1e-5)
+        out[tok] = (y_tok * rms * norm_f32[0][None, :]).reshape(width) * out_gate_sig[
+            tok
+        ]
+    return out, state, window[live_len : live_len + 3]
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "tile", "live_len"),
+    [
+        (512, 128, 350),
+        (256, 128, 0),
+        (192, 64, 150),
+    ],
+)
+def test_should_match_token_recurrence_when_kda_tiled_uses_grouped_supertiles(
+    seq_len: int, tile: int, live_len: int
+):
+    rng = np.random.default_rng(20261112 + seq_len + live_len)
+    hidden_dim = 256
+    hidden_np = rng.standard_normal((seq_len, hidden_dim)).astype(np.float32) * 0.1
+    if live_len < seq_len:
+        hidden_np[live_len:] = 7.5
+    hidden = jnp.asarray(hidden_np, jnp.bfloat16)
+    gate_w = jnp.asarray(
+        rng.standard_normal((hidden_dim, 128)) * 0.1, dtype=jnp.bfloat16
+    )
+    fb_w = jnp.asarray(rng.standard_normal((128, 384)) * 0.1, dtype=jnp.bfloat16)
+    proj_w = jnp.asarray(
+        rng.standard_normal((hidden_dim, 1664)) * 0.1, dtype=jnp.bfloat16
+    )
+    conv_w = jnp.asarray(rng.standard_normal((4, 3, 3, 128)) * 0.2, dtype=jnp.bfloat16)
+    alog = jnp.asarray(rng.uniform(-1.5, -0.5, size=(3, 1)), dtype=jnp.float32)
+    dt = jnp.asarray(rng.uniform(-2.0, -0.5, size=(3, 128)), dtype=jnp.float32)
+    norm = jnp.asarray(rng.uniform(0.8, 1.2, size=(8, 128)), dtype=jnp.bfloat16)
+    rec0 = jnp.asarray(rng.standard_normal((3, 128, 128)) * 0.05, dtype=jnp.float32)
+    hist0 = jnp.asarray(rng.standard_normal((3, 3, 3, 128)) * 0.1, dtype=jnp.bfloat16)
+    length = jnp.array([live_len], dtype=jnp.int32)
+
+    fn = prefill_megakernel.make_kda_tiled(seq_len=seq_len, tile=tile, interpret=True)
+    att, rec_out, hist_out = fn(
+        hidden, gate_w, fb_w, proj_w, conv_w, alog, dt, norm, rec0, hist0, length
+    )
+
+    ref_att, ref_rec, ref_hist = _kda_token_step_oracle_f32(
+        np.asarray(hidden, np.float32),
+        np.asarray(gate_w, np.float32),
+        np.asarray(fb_w, np.float32),
+        np.asarray(proj_w, np.float32),
+        np.asarray(conv_w, np.float32),
+        np.asarray(alog, np.float32),
+        np.asarray(dt, np.float32),
+        np.asarray(norm, np.float32),
+        np.asarray(rec0, np.float32),
+        np.asarray(hist0, np.float32),
+        live_len,
+    )
+    att_np = np.asarray(att, np.float32)
+    rec_np = np.asarray(rec_out, np.float32)
+    hist_np = np.asarray(hist_out, np.float32)
+
+    if live_len < seq_len:
+        assert np.max(np.abs(att_np[live_len:])) == 0.0
+    if live_len == 0:
+        np.testing.assert_array_equal(rec_np, np.asarray(rec0, np.float32))
+        np.testing.assert_array_equal(hist_np, np.asarray(hist0, np.float32))
+    else:
+        rel_att = np.linalg.norm(att_np - ref_att) / (np.linalg.norm(ref_att) + 1e-8)
+        rel_rec = np.linalg.norm(rec_np - ref_rec) / (np.linalg.norm(ref_rec) + 1e-8)
+        assert rel_att < 0.02
+        assert rel_rec < 0.02
+        assert np.max(np.abs(hist_np - ref_hist)) < 1e-2

@@ -20,6 +20,8 @@ KDA state in per-request slots. Two pieces serve it:
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -155,8 +157,34 @@ def commit_latent_rows(pools, rows, block_tables, positions, pool_map, *, group=
     return tuple(pools)
 
 
-def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, source_rows=None,
-                       null_period=None):
+_KDA_COMMIT_PING_PONG_VMEM_LIMIT_BYTES = 40 * 1024 * 1024
+
+
+def kda_commit_buffer_count(
+    batch_size: int,
+    conv_row_shape: tuple[int, ...],
+    conv_dtype: jnp.dtype,
+    recurrent_row_shape: tuple[int, ...],
+    recurrent_dtype: jnp.dtype,
+) -> int:
+    row_bytes = (
+        math.prod(conv_row_shape) * jnp.dtype(conv_dtype).itemsize
+        + math.prod(recurrent_row_shape) * jnp.dtype(recurrent_dtype).itemsize
+    )
+    if batch_size > 1 and 2 * row_bytes <= _KDA_COMMIT_PING_PONG_VMEM_LIMIT_BYTES:
+        return 2
+    return 1
+
+
+def commit_kda_states(
+    conv_slots,
+    recurrent_slots,
+    conv,
+    recurrent,
+    slots,
+    source_rows=None,
+    null_period=None,
+):
     """Copy complete KDA rows back without XLA's per-row scatter loop.
 
     Row writes finish in input order. With ``null_period``, rows whose
@@ -168,16 +196,33 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
     batch = slots.shape[0]
     selected = source_rows is not None
     prefetch = 2 if selected else 1
+    buffers = kda_commit_buffer_count(
+        batch, conv.shape[1:], conv.dtype, recurrent.shape[1:], recurrent.dtype
+    )
 
-    def body(indices, *args):
+    def body_single(indices, *args):
         sources, args = (args[0], args[1:]) if selected else (None, args)
-        (old_conv, old_state, new_conv, new_state, out_conv, out_state,
-         conv_buffer, state_buffer, semaphores) = args
+        (
+            old_conv,
+            old_state,
+            new_conv,
+            new_state,
+            out_conv,
+            out_state,
+            conv_buffer,
+            state_buffer,
+            semaphores,
+        ) = args
+
         def copy_row(i):
             source = sources[i] if sources is not None else i
             reads = (
-                tpu.make_async_copy(new_conv.at[pl.ds(source, 1)], conv_buffer, semaphores.at[0]),
-                tpu.make_async_copy(new_state.at[pl.ds(source, 1)], state_buffer, semaphores.at[1]),
+                tpu.make_async_copy(
+                    new_conv.at[pl.ds(source, 1)], conv_buffer, semaphores.at[0]
+                ),
+                tpu.make_async_copy(
+                    new_state.at[pl.ds(source, 1)], state_buffer, semaphores.at[1]
+                ),
             )
             for item in reads:
                 item.start()
@@ -185,8 +230,12 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
                 item.wait()
             target = indices[i]
             writes = (
-                tpu.make_async_copy(conv_buffer, out_conv.at[pl.ds(target, 1)], semaphores.at[0]),
-                tpu.make_async_copy(state_buffer, out_state.at[pl.ds(target, 1)], semaphores.at[1]),
+                tpu.make_async_copy(
+                    conv_buffer, out_conv.at[pl.ds(target, 1)], semaphores.at[0]
+                ),
+                tpu.make_async_copy(
+                    state_buffer, out_state.at[pl.ds(target, 1)], semaphores.at[1]
+                ),
             )
             for item in writes:
                 item.start()
@@ -200,23 +249,135 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
             else:
                 pl.when(indices[i] % null_period != 0)(lambda: copy_row(i))
 
+    def body_ping_pong(indices, *args):
+        sources, args = (args[0], args[1:]) if selected else (None, args)
+        (
+            old_conv,
+            old_state,
+            new_conv,
+            new_state,
+            out_conv,
+            out_state,
+            conv_buffers,
+            state_buffers,
+            semaphores,
+            state_smem,
+        ) = args
+        for idx in range(5):
+            state_smem[idx] = jnp.int32(0)
+
+        def drain(buf_idx):
+            @pl.when(state_smem[buf_idx] != 0)
+            def wait_write():
+                target = state_smem[2 + buf_idx]
+                writes = (
+                    tpu.make_async_copy(
+                        conv_buffers.at[pl.ds(buf_idx, 1)],
+                        out_conv.at[pl.ds(target, 1)],
+                        semaphores.at[buf_idx, 0],
+                    ),
+                    tpu.make_async_copy(
+                        state_buffers.at[pl.ds(buf_idx, 1)],
+                        out_state.at[pl.ds(target, 1)],
+                        semaphores.at[buf_idx, 1],
+                    ),
+                )
+                for item in writes:
+                    item.wait()
+                state_smem[buf_idx] = jnp.int32(0)
+
+        def copy_row(i):
+            buf = state_smem[4]
+            other = jnp.int32(1) - buf
+            drain(buf)
+            source = sources[i] if sources is not None else i
+            reads = (
+                tpu.make_async_copy(
+                    new_conv.at[pl.ds(source, 1)],
+                    conv_buffers.at[pl.ds(buf, 1)],
+                    semaphores.at[buf, 0],
+                ),
+                tpu.make_async_copy(
+                    new_state.at[pl.ds(source, 1)],
+                    state_buffers.at[pl.ds(buf, 1)],
+                    semaphores.at[buf, 1],
+                ),
+            )
+            for item in reads:
+                item.start()
+            for item in reads:
+                item.wait()
+            drain(other)
+            target = indices[i]
+            writes = (
+                tpu.make_async_copy(
+                    conv_buffers.at[pl.ds(buf, 1)],
+                    out_conv.at[pl.ds(target, 1)],
+                    semaphores.at[buf, 0],
+                ),
+                tpu.make_async_copy(
+                    state_buffers.at[pl.ds(buf, 1)],
+                    out_state.at[pl.ds(target, 1)],
+                    semaphores.at[buf, 1],
+                ),
+            )
+            for item in writes:
+                item.start()
+            state_smem[buf] = jnp.int32(1)
+            state_smem[2 + buf] = target
+            state_smem[4] = other
+
+        @pl.loop(0, batch)
+        def row(i):
+            if null_period is None:
+                copy_row(i)
+            else:
+                pl.when(indices[i] % null_period != 0)(lambda: copy_row(i))
+
+        drain(jnp.int32(0))
+        drain(jnp.int32(1))
+
+    if buffers == 2:
+        body = body_ping_pong
+        scratch_shapes = (
+            tpu.VMEM((2, *conv.shape[1:]), conv.dtype),
+            tpu.VMEM((2, *recurrent.shape[1:]), recurrent.dtype),
+            tpu.SemaphoreType.DMA((2, 2)),
+            tpu.SMEM((5,), jnp.int32),
+        )
+    else:
+        body = body_single
+        scratch_shapes = (
+            tpu.VMEM((1, *conv.shape[1:]), conv.dtype),
+            tpu.VMEM((1, *recurrent.shape[1:]), recurrent.dtype),
+            tpu.SemaphoreType.DMA((2,)),
+        )
+
     return pl.pallas_call(
         body,
         name="kda_selected_state_commit" if selected else "kda_state_commit",
-        out_shape=(jax.ShapeDtypeStruct(conv_slots.shape, conv_slots.dtype),
-                   jax.ShapeDtypeStruct(recurrent_slots.shape, recurrent_slots.dtype)),
+        out_shape=(
+            jax.ShapeDtypeStruct(conv_slots.shape, conv_slots.dtype),
+            jax.ShapeDtypeStruct(recurrent_slots.shape, recurrent_slots.dtype),
+        ),
         input_output_aliases={prefetch: 0, prefetch + 1: 1},
         grid_spec=tpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=prefetch,
             in_specs=[pl.BlockSpec(memory_space=tpu.HBM)] * 4,
             out_specs=[pl.BlockSpec(memory_space=tpu.HBM)] * 2,
-            scratch_shapes=(
-                tpu.VMEM((1, *conv.shape[1:]), conv.dtype),
-                tpu.VMEM((1, *recurrent.shape[1:]), recurrent.dtype),
-                tpu.SemaphoreType.DMA((2,)),
-            ),
+            scratch_shapes=scratch_shapes,
         ),
-    )(slots, *((source_rows,) if selected else ()), conv_slots, recurrent_slots, conv, recurrent)
+    )(
+        slots,
+        *((source_rows,) if selected else ()),
+        conv_slots,
+        recurrent_slots,
+        conv,
+        recurrent,
+    )
+
+
+_commit_kda_states = commit_kda_states
 
 def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, block_tables,
                  slots, *, batch_size, dcp_pool_map, dcp_owner_table=None, state_row=None,
@@ -258,10 +419,7 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         local = slots[group_rows]
         local = jnp.where(local == 0, 0, local - data_group * (group_slots - 1))
         state_index = jnp.concatenate([local + k * group_slots for k in range(dp)])
-    # The stack reads the input KDA states from their slots itself where it
-    # can (DP1 above four rows or a selected verify row; DP2 at B2..B128).
-    # DP2 indices already include each held head shard's bank offset.
-    in_place = ((state_row is not None or batch_size > 4) and dp == 1
+    in_place = (dp == 1
                 or dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128))
     if in_place:
         conv, recurrent = conv_slots, recurrent_slots
@@ -291,8 +449,8 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         # Keep the input banks alive until acceptance. Return the native
         # post-states without touching persistent slots or gathering rows.
         conv_slots, recurrent_slots = conv, recurrent
-    elif batch_size > 16 and dp in (1, 2):
-        conv_slots, recurrent_slots = _commit_kda_states(
+    elif dp in (1, 2):
+        conv_slots, recurrent_slots = commit_kda_states(
             conv_slots, recurrent_slots, conv, recurrent, state_index,
             null_period=conv_slots.shape[0] // dp)
     else:

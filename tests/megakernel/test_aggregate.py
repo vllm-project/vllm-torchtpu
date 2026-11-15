@@ -89,9 +89,10 @@ def test_aggregate_capabilities_and_role_configs():
     caps = k3.capabilities(config)
     assert caps.roles == frozenset({"prefill", "decode"})
     assert caps.speculation == "dspark" and caps.num_speculative_tokens == 7
-    assert caps.page_aligned_chunks and caps.block_copies
+    assert caps.page_aligned_chunks and not caps.block_copies
     assert caps.max_step_tokens == 8256
     prefill = role_config(config, "prefill")
+    assert k3.capabilities(prefill).block_copies
     # The prefill window cap (16K) is above this engine's 8256-token budget.
     assert prefill.role == "prefill" and prefill.max_num_batched_tokens == 8256
     assert prefill.num_speculative_tokens == 0

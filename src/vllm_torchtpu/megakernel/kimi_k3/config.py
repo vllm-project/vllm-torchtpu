@@ -11,15 +11,62 @@ the standalone tools install overrides before building the program.
 import dataclasses
 import hashlib
 import json
-from typing import Any
+from typing import Any, Final
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
 
+_DISABLED_PLAN_VALUES: Final[frozenset[str]] = frozenset({"0", "none", "off", "false"})
+EP8_DEFAULT_EXPERT_PLAN: Final[str] = "plan_ep8_real_hotfirst.npz"
+EP16_DEFAULT_EXPERT_PLAN: Final[str] = "plan_ep16_real_hotfirst.npz"
+EP8_DEFAULT_REPLICA_PLAN: Final[str] = "replica_plan_ep8_real_plain4.npz"
+EP16_DEFAULT_REPLICA_PLAN: Final[str] = "replica_plan_ep16_real_plain4.npz"
 
-def plan_name(value: str) -> str:
-    """A plan env value as a file name: ``none`` is no plan."""
-    return "" if value.lower() == "none" else value
+
+def resolve_expert_parallel_settings(
+    *,
+    aggregate: bool,
+    unified_ep16: bool,
+    aggregate_ep16: bool,
+    raw_expert_plan: str,
+    raw_replica_plan: str,
+    raw_hot_plan: str,
+) -> tuple[int, int, str, str]:
+    if not aggregate:
+        return 16, 8, raw_expert_plan, raw_replica_plan
+    if unified_ep16:
+        if raw_expert_plan.lower() in _DISABLED_PLAN_VALUES:
+            expert_plan = ""
+        elif not raw_expert_plan or raw_expert_plan == EP8_DEFAULT_EXPERT_PLAN:
+            expert_plan = EP16_DEFAULT_EXPERT_PLAN
+        else:
+            expert_plan = raw_expert_plan
+        if raw_replica_plan.lower() in _DISABLED_PLAN_VALUES:
+            replica_plan = ""
+        elif not raw_replica_plan or raw_replica_plan == EP8_DEFAULT_REPLICA_PLAN:
+            replica_plan = "" if raw_hot_plan else EP16_DEFAULT_REPLICA_PLAN
+        else:
+            replica_plan = raw_replica_plan
+        return 16, 16, expert_plan, replica_plan
+    prefill_ep = 16 if aggregate_ep16 else 8
+    expert_plan = raw_expert_plan
+    replica_plan = raw_replica_plan
+    if prefill_ep == 8:
+        if expert_plan.lower() in _DISABLED_PLAN_VALUES:
+            expert_plan = ""
+        elif not expert_plan:
+            expert_plan = EP8_DEFAULT_EXPERT_PLAN
+        if replica_plan.lower() in _DISABLED_PLAN_VALUES:
+            replica_plan = ""
+        elif not replica_plan and not raw_hot_plan:
+            replica_plan = EP8_DEFAULT_REPLICA_PLAN
+    return prefill_ep, 8, expert_plan, replica_plan
+
+
+def resolve_decode_expert_banks(
+    *, prefill_ep: int, decode_ep: int, enabled: bool
+) -> bool:
+    return enabled and prefill_ep == decode_ep == 16
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32,12 +79,17 @@ class KernelConfig:
     # Block tables: "local" (vLLM's rank-local DCP tables) or "global" (global
     # page ids).
     dcp_tables: str = "local"
+    dcp_combine_chunks: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_DCP_COMBINE_CHUNKS
+    )
     # MLA decode key tile (tokens per page fold). 2048 is opt-in and applies
     # only to FP8 plain decode at attention_dp=2, dcp_group=16 with 32 rows per
     # DP group (B64); everything else uses 1024.
     mla_decode_ktile: int = 1024
     # Routed experts and weight layout (the pre-shard format).
     expert_gate_up: str = "mxfp4"  # "mxfp4" or "fp8" (reblocked)
+    decode_expert_parallel: int = 8
+    decode_expert_banks: bool = False
     mxfp4_block: int = 2048
     mxfp4_pair_tile: int = 512
     mxfp4_static_tile: int = 0
@@ -73,7 +125,6 @@ class KernelConfig:
     mla_flash_prefix_tiles: bool = True
     # Cached-prefix attention in FP8 (E4M3FN keys/values from the expansion, FP8
     # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
-    # keys stay BF16. K3_PREFILL_PREFIX_FP8=0 turns it off.
     prefill_prefix_fp8: bool = dataclasses.field(
         default_factory=lambda: envs.K3_PREFILL_PREFIX_FP8
     )
@@ -90,6 +141,9 @@ class KernelConfig:
     prefill_expert_plan: str = dataclasses.field(
         default_factory=lambda: envs.K3_PREFILL_EXPERT_PLAN
     )
+    prefill_replica_plan: str = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_REPLICA_PLAN
+    )
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
@@ -98,6 +152,39 @@ class KernelConfig:
     # EP16: all serving windows (FP32 reduce-scatter).
     # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
+    prefill_moe_16k_monolithic: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_MOE_16K_MONOLITHIC
+    )
+    prefill_moe_dense_fp8: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_MOE_DENSE_FP8
+    )
+    prefill_moe_w4a8: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_MOE_W4A8
+    )
+    prefill_kda_fp8_gather: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_KDA_FP8_GATHER
+    )
+    prefill_kda_a2a: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_KDA_A2A
+    )
+    prefill_kda_dual_gather: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_KDA_DUAL_GATHER
+    )
+    prefill_kda_ring_set: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_KDA_RING_SET
+    )
+    prefill_kda_a2a_fp8: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_KDA_A2A_FP8
+    )
+    prefill_mla_a2a: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_MLA_A2A
+    )
+    prefill_mla_a2a_fp8: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_MLA_A2A_FP8
+    )
+    prefill_a2a_chip_shard: bool = dataclasses.field(
+        default_factory=lambda: envs.K3_PREFILL_A2A_CHIP_SHARD
+    )
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
@@ -119,9 +206,8 @@ class KernelConfig:
     # [92, 8 S] (the dispatch order of the slots). Per step, each replicated
     # expert's routes stay home, split by row parity, or move to the replica,
     # whichever gives the lowest modeled slowest-group expert time. A bare
-    # name loads from kimi_k3/data. K3_REPLICA_PLAN=none (its default) is empty.
     kd_replica_plan: str = dataclasses.field(
-        default_factory=lambda: plan_name(envs.K3_REPLICA_PLAN)
+        default_factory=lambda: envs.K3_REPLICA_PLAN
     )
     # FP8 wires for attention DP's hidden-row gathers (off when empty): "t0"
     # the attention input, "t10" the MoE input. Rows travel as e4m3 with one
@@ -134,12 +220,72 @@ class KernelConfig:
     vmem_pad_kb: int = 0
 
     def __post_init__(self) -> None:
+        if self.kd_replica_plan.lower() in _DISABLED_PLAN_VALUES:
+            object.__setattr__(self, "kd_replica_plan", "")
+        if self.prefill_replica_plan.lower() in _DISABLED_PLAN_VALUES:
+            object.__setattr__(self, "prefill_replica_plan", "")
         if self.kd_hot_plan and self.kd_replica_plan:
             raise ValueError("kd_hot_plan and kd_replica_plan are exclusive")
+        if self.kd_hot_plan and self.prefill_replica_plan:
+            raise ValueError("kd_hot_plan and prefill_replica_plan are exclusive")
+        if self.prefill_replica_plan and self.prefill_expert_parallel != 16:
+            raise ValueError("prefill_replica_plan requires prefill_expert_parallel=16")
+        if self.prefill_replica_plan and not self.prefill_fused_moe:
+            raise ValueError("prefill_replica_plan requires prefill_fused_moe=True")
+        if (
+            self.kd_replica_plan
+            and self.prefill_replica_plan
+            and self.kd_replica_plan != self.prefill_replica_plan
+        ):
+            raise ValueError(
+                "kd_replica_plan and prefill_replica_plan must match when both are set"
+            )
         if not set(self.fp8_wires) <= {"t0", "t10"}:
             raise ValueError("fp8_wires holds t0 and/or t10")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
+        if self.decode_expert_parallel not in (8, 16):
+            raise ValueError("decode_expert_parallel is 8 or 16")
+        if self.decode_expert_parallel == 16 and self.kd_hot_plan:
+            raise ValueError("kd_hot_plan needs decode_expert_parallel 8")
+        if self.decode_expert_banks and self.decode_expert_parallel != 16:
+            raise ValueError("decode_expert_banks needs decode_expert_parallel 16")
+        if self.prefill_kda_a2a_fp8 and not self.prefill_kda_a2a:
+            raise ValueError("prefill_kda_a2a_fp8 requires prefill_kda_a2a=True")
+        if self.prefill_mla_a2a_fp8 and not self.prefill_mla_a2a:
+            raise ValueError("prefill_mla_a2a_fp8 requires prefill_mla_a2a=True")
+        if self.prefill_a2a_chip_shard and not (
+            self.prefill_kda_a2a or self.prefill_mla_a2a
+        ):
+            raise ValueError(
+                "prefill_a2a_chip_shard requires prefill_kda_a2a=True "
+                "or prefill_mla_a2a=True"
+            )
+        if self.prefill_a2a_chip_shard and (
+            self.prefill_kda_a2a_fp8 or self.prefill_mla_a2a_fp8
+        ):
+            raise ValueError(
+                "prefill_a2a_chip_shard is mutually exclusive with "
+                "prefill_kda_a2a_fp8 and prefill_mla_a2a_fp8"
+            )
+        if self.prefill_moe_dense_fp8 and not self.prefill_fused_moe:
+            raise ValueError("prefill_moe_dense_fp8 requires prefill_fused_moe=True")
+        if self.prefill_moe_dense_fp8 and self.prefill_expert_parallel not in (8, 16):
+            raise ValueError(
+                "prefill_moe_dense_fp8 requires prefill_expert_parallel in (8, 16)"
+            )
+        if self.prefill_moe_w4a8 and not self.prefill_fused_moe:
+            raise ValueError("prefill_moe_w4a8 requires prefill_fused_moe=True")
+        if self.prefill_moe_w4a8 and not self.prefill_moe_16k_monolithic:
+            raise ValueError(
+                "prefill_moe_w4a8 requires prefill_moe_16k_monolithic=True"
+            )
+        if self.prefill_moe_w4a8 and self.prefill_expert_parallel != 16:
+            raise ValueError("prefill_moe_w4a8 requires prefill_expert_parallel=16")
+        if self.prefill_moe_w4a8 and self.prefill_moe_dense_fp8:
+            raise ValueError(
+                "prefill_moe_w4a8 is mutually exclusive with prefill_moe_dense_fp8"
+            )
         if self.mla_decode_ktile not in (1024, 2048):
             raise ValueError("mla_decode_ktile supports 1024 or experimental 2048")
         if self.mla_decode_ktile == 2048 and (

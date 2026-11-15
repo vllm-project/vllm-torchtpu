@@ -35,6 +35,7 @@ from vllm_torchtpu.megakernel.bridge import (
     stream_to_device,
 )
 from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
+from vllm_torchtpu.megakernel.kimi_k3 import expert_banks
 from vllm_torchtpu.megakernel.kimi_k3.layout import CONV_HEAD_ROWS, NUM_LAYERS
 from vllm_torchtpu.megakernel.kimi_k3.pools import (
     KDA_LAYERS,
@@ -92,6 +93,13 @@ def dp_group_rows(batch_size: int, attention_dp: int) -> np.ndarray:
     ).astype(np.int32)
 
 
+def decode_compiler_options(rows: int) -> dict[str, str]:
+    config = kernel_config.active()
+    if rows in (1, 2, 4, 8, 16, 32, 64, 96, 128) and config.decode_no_hlo_calls:
+        return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
+    return {}
+
+
 def decode_options(batch_size: int) -> dict:
     """The kernel's tuned decode recipe for ``batch_size`` rows: from B8,
     rows are token-scattered over sequence-parallel owners with the routed
@@ -133,6 +141,65 @@ def decode_options(batch_size: int) -> dict:
     }
 
 
+def decode_weight_parts(
+    rank_loader: Any, presharded: Any, rank: int, *, attention_dp: int, banked: bool
+) -> Any:
+    iterator = rank_loader.iter_decode_rank(
+        presharded, rank, split_experts=True, attention_dp=attention_dp
+    )
+    if banked:
+        iterator = expert_banks.bank_expert_parts(
+            iterator, expert_banks.SHARED_BANK_SIZES
+        )
+    return iterator
+
+
+PACKED_FAMILIES = (
+    "attn_res",
+    "mlp_res",
+    "attn_norm",
+    "ffn_norm",
+    "router_bias",
+    "latent_norm",
+    "output_res",
+    "final_norm",
+    "m_qnorm",
+    "m_knorm",
+    "k_norm",
+    "k_dt",
+    "k_a_log",
+)
+
+
+def pack_small_operands(
+    weights: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, tuple[str, int, tuple[int, ...]]]]:
+    groups: dict[str, list[str]] = {}
+    for name in PACKED_FAMILIES:
+        if name in weights:
+            groups.setdefault(str(weights[name].dtype), []).append(name)
+    operands = {n: t for n, t in weights.items() if n not in PACKED_FAMILIES}
+    layout: dict[str, tuple[str, int, tuple[int, ...]]] = {}
+    for dtype, names in groups.items():
+        operand, offset = f"packed#{dtype}", 0
+        for name in names:
+            shape = tuple(weights[name].shape[1:])
+            layout[name] = (operand, offset, shape)
+            offset += math.prod(shape)
+        operands[operand] = torch.cat([weights[n].reshape(1, -1) for n in names], dim=1)
+    return operands, layout
+
+
+def unpack_small_operands(
+    local: dict[str, Any], layout: dict[str, tuple[str, int, tuple[int, ...]]]
+) -> dict[str, Any]:
+    out = {n: v for n, v in local.items() if not n.startswith("packed#")}
+    for name, (operand, offset, shape) in layout.items():
+        size = math.prod(shape)
+        out[name] = local[operand][offset : offset + size].reshape(shape)
+    return out
+
+
 class DecodeOps:
     """Decoder weights, KDA slots and the step ops over vLLM's unified pools.
 
@@ -167,6 +234,8 @@ class DecodeOps:
         self.batch_sizes = tuple(sorted(batch_sizes))
         self.num_slots = num_slots
         self.weights: dict[str, torch.Tensor] = {}
+        self._operand_weights: dict[str, torch.Tensor] = {}
+        self._packed_layout: dict[str, tuple[str, int, tuple[int, ...]]] = {}
         self.names: tuple[str, ...] = ()
         self.slots: list[torch.Tensor] = []
         self.unified_pools: list[torch.Tensor] = []  # bound by use_unified_pools
@@ -199,18 +268,23 @@ class DecodeOps:
         KDA slots (once: decoders sharing these ops load them once)."""
         if self.weights:
             return 0.0
-        presharded = self.presharded
         stats = stream_to_device(
-            self.rank_loader.iter_decode_rank(
-                presharded,
+            decode_weight_parts(
+                self.rank_loader,
+                self.presharded,
                 self.rank,
-                split_experts=True,
                 attention_dp=self.attention_dp,
+                banked=kernel_config.active().decode_expert_banks,
             ),
             lambda _group, name, tensor: self.weights.__setitem__(name, tensor),
         )
-        self.names = tuple(sorted(self.weights))
-        materialize(self.weights[self.names[-1]])
+        self._operand_weights, self._packed_layout = dict(self.weights), {}
+        if kernel_config.active().decode_expert_banks:
+            self._operand_weights, self._packed_layout = pack_small_operands(
+                self.weights
+            )
+        self.names = tuple(sorted(self._operand_weights))
+        materialize(self._operand_weights[self.names[-1]])
         # Attention DP: bank entry s + k * n holds held shard k's heads of its
         # group's slot s (pools.group_slots).
         state_slots = group_slots(self.num_slots, self.attention_dp) * self.attention_dp
@@ -230,7 +304,7 @@ class DecodeOps:
                 stats["gib"],
                 len(self.names),
                 stats["wall"],
-                presharded,
+                self.presharded,
                 hbm(self.rank),
             )
         report_load_stats("decode", self.rank, stats)
@@ -267,7 +341,7 @@ class DecodeOps:
 
     def _operands(self) -> tuple[torch.Tensor, ...]:
         return (
-            *(self.weights[n] for n in self.names),
+            *(self._operand_weights[n] for n in self.names),
             *self.slots,
             *self.unified_pools,
         )
@@ -302,6 +376,7 @@ class DecodeOps:
         from vllm_torchtpu.megakernel.kimi_k3 import sampling
 
         paged, names = self.paged, self.names
+        packed_layout = self._packed_layout
         count = len(names)
         options = decode_options(batch)
         pool_map, owner_table = self.pool_map, self.owner_table
@@ -309,7 +384,9 @@ class DecodeOps:
         width = self.VERIFY_ROWS
 
         def body(*args):
-            weights = {name: args[i][0] for i, name in enumerate(names)}
+            weights = unpack_small_operands(
+                {name: args[i][0] for i, name in enumerate(names)}, packed_layout
+            )
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
             state = args[count + 2 + pools]
@@ -481,13 +558,7 @@ class DecodeOps:
             add_verify(requests, spec_rows)
         return calls
 
-    @staticmethod
-    def _compiler_options(rows: int) -> dict[str, str]:
-        config = kernel_config.active()
-        dp_rows = rows in (2, 4) and config.attention_dp > 1
-        if (rows in (8, 16, 32, 64, 96, 128) or dp_rows) and config.decode_no_hlo_calls:
-            return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
-        return {}
+    _compiler_options = staticmethod(decode_compiler_options)
 
     def _build_mask_pack(self, control: Any, batch: int) -> Any:
         """Keep the masked plain step within Torch's 64-operand limit: pack
@@ -532,9 +603,6 @@ class DecodeOps:
 
     @staticmethod
     def _run(op: Any, rows: int, *args: Any) -> Any:
-        """``op(*args)`` for a ``rows``-row step: at 8, 16, 32, 64, 96 and 128 rows
-        (and attention DP's 2 and 4) with XLA's deduplicated calls off
-        (``KernelConfig.decode_no_hlo_calls``)."""
         options = DecodeOps._compiler_options(rows)
         if options:
             from torch_tpu._internal.compiler_options import custom_compiler_options
@@ -566,6 +634,7 @@ class DecodeOps:
         if key in self._ops:
             return self._ops[key]
         rows, paged, names = self.VERIFY_ROWS, self.paged, self.names
+        packed_layout = self._packed_layout
         count = len(names)
         options = decode_options(rows)
         options["defer_kda_commit"] = self.attention_dp == 1
@@ -581,7 +650,9 @@ class DecodeOps:
         pools = len(self.unified_pools)
 
         def body(*args):
-            weights = {name: args[i][0] for i, name in enumerate(names)}
+            weights = unpack_small_operands(
+                {name: args[i][0] for i, name in enumerate(names)}, packed_layout
+            )
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
             (packet,) = args[count + 2 + pools :]
@@ -686,6 +757,7 @@ class DecodeOps:
         if key in self._ops:
             return self._ops[key]
         rows, paged, names = requests * rows_per, self.paged, self.names
+        packed_layout = self._packed_layout
         count = len(names)
         options = decode_options(rows)
         options["defer_kda_commit"] = True
@@ -703,7 +775,9 @@ class DecodeOps:
             order = np.argsort(placed)
 
         def body(*args):
-            weights = {name: args[i][0] for i, name in enumerate(names)}
+            weights = unpack_small_operands(
+                {name: args[i][0] for i, name in enumerate(names)}, packed_layout
+            )
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
             (packet,) = args[count + 2 + pools :]

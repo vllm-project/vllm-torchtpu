@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shortest-uncached-prompt-first waiting queue for a P/D prefill engine.
 
-Unless ``K3_PREFILL_SJF=0``, a KV producer's scheduler admits waiting requests
+With ``K3_PREFILL_SJF=1`` a KV producer's scheduler admits waiting requests
 in order of their uncached prompt tokens (estimated from the local prefix
 cache when the request is queued), minus an aging credit of
 ``K3_PREFILL_SJF_AGING`` tokens per second waited, so long prompts are not
