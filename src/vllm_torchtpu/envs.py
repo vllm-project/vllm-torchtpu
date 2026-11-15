@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_MOE_TC_COMBINE: bool = False
+    TPU_MOE_PAIR_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -832,6 +833,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.
     "TPU_MOE_TC_COMBINE": env_bool("TPU_MOE_TC_COMBINE"),
+    # Non-EP (TP-sliced experts) MoE combine of prefill-sized top-4 batches by
+    # routed-row pairs on the TensorCore (kernels/megablox/pair_combine.py)
+    # instead of the SparseCore gather-reduce, where its shape admits it.
+    "TPU_MOE_PAIR_COMBINE": env_bool("TPU_MOE_PAIR_COMBINE"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

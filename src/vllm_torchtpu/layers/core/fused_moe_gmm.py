@@ -30,7 +30,7 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
     dense_expert_moe_fp4,
     shared_activation,
 )
-from vllm_torchtpu.kernels.megablox import tc_combine
+from vllm_torchtpu.kernels.megablox import pair_combine, tc_combine
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
     gmm_v2,
@@ -91,6 +91,10 @@ _ONEHOT_AUTO_CAP = 512
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 _DENSE_FP4_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_MAX_TOKENS
 _DUAL_LAYOUT_MAX_TOKENS = envs.TPU_MOE_DUAL_LAYOUT_MAX_TOKENS
+# The pair combine's measured envelope (TPU_MOE_PAIR_COMBINE): MiniMax-M3's
+# top-4 routing at prefill chunks.
+_PAIR_COMBINE_TOPK = 4
+_PAIR_COMBINE_MIN_TOKENS = 1024
 # Fixed at import: one-hot permute/combine over the valid prefix only.
 _BOUNDED_ONEHOT = envs.TPU_MOE_BOUNDED_ONEHOT
 # Fixed at import: build the MoE permutation from one packed sort.
@@ -696,6 +700,40 @@ def moe_gmm(
             preferred_element_type=x.dtype,
             rhs_quant_dtype=rhs_quant_dtype,
         )
+    if (
+        envs.TPU_MOE_PAIR_COMBINE
+        and not use_ep
+        and topk == _PAIR_COMBINE_TOPK
+        and num_tokens >= _PAIR_COMBINE_MIN_TOKENS
+        and pair_combine.supported(
+            num_tokens,
+            gmm2_res.shape[0],
+            gmm2_res.shape[1],
+            topk,
+            gmm2_res.dtype,
+            topk_weights_flat.dtype,
+        )
+    ):
+        # TP-sliced experts: every expert is local, so a token's rows lie in
+        # every expert's range; the pair kernel DMAs each route's own row pair.
+        # Invalid routes read pair 0, and a valid row's pair can hold the first
+        # row past the GMM's valid prefix: zero the rows the GMM did not write
+        # among those so a zero weight cannot carry stale NaN.
+        rows = gmm2_res.shape[0]
+        computed = group_sizes.sum(dtype=jnp.int32)
+        for edge in (computed, jnp.maximum(computed, 1)):
+            row = jnp.minimum(edge, rows - 1)
+            unwritten = (edge >= computed) & (edge < rows)
+            gmm2_res = gmm2_res.at[row].set(
+                jnp.where(unwritten, 0, gmm2_res[row]).astype(gmm2_res.dtype)
+            )
+        return pair_combine.pair_combine(
+            gmm2_res,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask_flat,
+            topk=topk,
+        ).astype(x.dtype)
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (

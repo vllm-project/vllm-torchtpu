@@ -237,6 +237,9 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
 
     monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", get_tpu_info)
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
+    # The SparseCore and EP selection; test_moe_gmm_non_ep_pair_combine covers
+    # the pair combine that precedes it for TP-sliced experts.
+    monkeypatch.setattr(fused_moe_gmm.pair_combine, "supported", lambda *a: False)
     calls = []
 
     def fake_combine(path, *args, **kwargs):
@@ -392,6 +395,9 @@ def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
 
     monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", checked_combine)
     monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce", unexpected_ep_combine)
+    # NaN rows inside the computed range: the pair combine's pairs would carry
+    # them to their neighbours (test_moe_gmm_non_ep_pair_combine covers it).
+    monkeypatch.setattr(fused_moe_gmm.pair_combine, "supported", lambda *a: False)
     actual = moe_gmm(
         x=jnp.zeros((num_routes, 1), jnp.bfloat16),
         w1=jnp.zeros((1, 1, 1), jnp.bfloat16),
@@ -416,6 +422,84 @@ def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
     assert actual.dtype == jnp.bfloat16
     assert np.isfinite(np.asarray(actual)).all()
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("all_padding", [False, True])
+def test_moe_gmm_non_ep_pair_combine(monkeypatch, all_padding):
+    """TP-sliced experts at a prefill chunk: the pair combine serves, and rows
+    the GMM did not write (the last valid row's pair sibling; pair 0, which
+    invalid routes read, in an all-padding step) cannot reach a token."""
+    monkeypatch.setenv("TPU_MOE_PAIR_COMBINE", "1")
+    monkeypatch.setattr(fused_moe_gmm, "_PAIR_COMBINE_MIN_TOKENS", 0)
+    num_tokens, topk, hidden, experts = 128, 4, 256, 16
+    rng = np.random.default_rng(0)
+    ids = np.stack(
+        [rng.choice(experts, topk, replace=False) for _ in range(num_tokens)]
+    )
+    w = rng.uniform(0.1, 1.0, (num_tokens, topk)).astype(np.float32)
+    if all_padding:
+        w[:] = 0
+    else:
+        w[-3:] = 0  # padded tokens: skipped, their routes sorted last
+        w[0, 0] = 0  # a zero routing weight: skipped too
+    valid = (w != 0).ravel()
+    order = np.argsort(np.where(valid, ids.ravel(), experts), kind="stable")
+    revert = np.empty_like(order)
+    revert[order] = np.arange(order.size)
+    computed = int(valid.sum())
+    assert computed % 2 or all_padding  # the last valid row's sibling is unwritten
+    rows = rng.standard_normal((num_tokens * topk, hidden)).astype(np.float32)
+    rows[computed:] = np.nan
+    source = jnp.asarray(rows, jnp.bfloat16)
+    weights = jnp.asarray(w.ravel(), jnp.bfloat16)
+    gmm_outputs = iter([jnp.zeros((num_tokens * topk, 1), jnp.bfloat16), source])
+    monkeypatch.setattr(
+        fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
+    )
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
+    pair = fused_moe_gmm.pair_combine.pair_combine
+    monkeypatch.setattr(
+        fused_moe_gmm.pair_combine,
+        "pair_combine",
+        lambda *a, **k: pair(*a, **k, interpret=True),
+    )
+    actual = moe_gmm(
+        x=jnp.zeros((num_tokens * topk, 1), jnp.bfloat16),
+        w1=jnp.zeros((1, 1, 1), jnp.bfloat16),
+        w1_scale=None,
+        w1_bias=None,
+        w2=jnp.zeros((1, 1, hidden), jnp.bfloat16),
+        w2_scale=None,
+        w2_bias=None,
+        group_sizes=jnp.asarray(
+            np.bincount(ids.ravel()[valid], minlength=experts), jnp.int32
+        ),
+        argsort_revert_indices=jnp.asarray(revert, jnp.int32),
+        topk_weights_flat=weights,
+        valid_mask_flat=jnp.asarray(valid),
+        token_indices_sorted=jnp.asarray(order // topk, jnp.int32),
+        activation="silu",
+        num_tokens=num_tokens,
+        topk=topk,
+        use_ep=False,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=512,
+    )
+    clean = np.where(np.isnan(rows), 0, rows)
+    expected = (
+        (
+            np.asarray(jnp.asarray(clean, jnp.bfloat16).astype(jnp.float32))[revert]
+            * np.asarray(weights.astype(jnp.float32))[:, None]
+            * valid[:, None]
+        )
+        .reshape(num_tokens, topk, hidden)
+        .sum(axis=1)
+    )
+    out = np.asarray(actual.astype(jnp.float32))
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(
+        out, expected, rtol=1e-2, atol=1e-2 * np.abs(expected).max()
+    )
 
 
 def _reference_fused_moe(
