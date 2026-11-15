@@ -108,9 +108,24 @@ PATCHES = (
         "vllm_torchtpu.core.divergent_hybrid_hits:patch_divergent_hybrid_hits",
         _ENGINE,
     ),
+    # Admission-path host timeline (inert unless VLLM_TPU_HOSTADMIT_PROBE).
+    Patch("vllm_torchtpu.runner.host_admit_probe:patch_engine_core", ("engine_core",)),
     # Victim host-tier policy hooks (inert unless the policy is on), after the
     # LIFO free patch and retention so they wrap the final free paths.
     Patch("vllm_torchtpu.offload.victim:patch_block_pool_victims", _ENGINE),
+    # Per-request prefix lookup line (inert unless VLLM_TPU_PREFIX_LOOKUP_LOG).
+    Patch("vllm_torchtpu.offload.lookup_log:patch_prefix_lookup_log", _ENGINE),
+    # After every patch of the KV cache manager, its groups and the block
+    # pool: it checks the functions it encodes as they are installed.
+    Patch("vllm_torchtpu.core.kv_decode_fast_path:patch_kv_decode_fast_path", _ENGINE),
+    Patch("vllm_torchtpu.core.kv_load_pacing:patch_kv_load_pacing", _ENGINE),
+    # Host admission costs (inert unless their flags are on).
+    Patch(
+        "vllm_torchtpu.core.prompt_token_array:patch_prompt_token_array",
+        ("engine_core",),
+    ),
+    Patch("vllm_torchtpu.runner.gc_at_waits:patch_gc_at_waits", _ENGINE),
+    Patch("vllm_torchtpu.runner.gc_at_waits:patch_engine_core_gc", ("engine_core",)),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
@@ -131,6 +146,7 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
+    Patch("vllm_torchtpu.model_loader_patches:patch_expert_mapping_cache", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(
         "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
@@ -149,6 +165,8 @@ PATCHES = (
     ),
     # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
+    # API-server reasoning-token count (VLLM_TPU_REASONING_COUNT_FAST).
+    Patch("vllm_torchtpu.reasoning_count:patch_reasoning_count_fast", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

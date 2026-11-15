@@ -28,6 +28,21 @@ same one and stays in lockstep through the collectives inside the specialized
 region. The decision has to come from a tensor shape: that is what leaves a
 guard behind. A branch on some other python value is guarded outside the
 ShapeEnv, vLLM drops that guard, and nothing here can see it.
+
+Token-count decisions are half-open: ``tokens < B`` or ``tokens >= B`` with B a
+compile size, so a trace's upper bounds sit one below a compile size and only
+its lower bounds sit on one. An inclusive upper bound at a compile size
+(``tokens <= B``) next to another decision's ``tokens >= B`` pins the trace at
+B to that single value: torch replaces the token count with the constant, the
+trace's graph drops the token-count SymInt inputs, and the other traces'
+buckets can no longer be handed to it (j-037e02fd).
+
+Slicing a persistent buffer by the token count (``buf[:tokens]``) leaves the
+inclusive bound ``tokens <= len(buf)``. A buffer sized to the token budget puts
+that bound on the largest compile size, and pins the trace at the largest
+bucket whenever a ``tokens >= B`` gate sits at the budget (j-b03d84bd: budget
+512 against the fused HC mix's ``tokens < 512`` gate). Buffers sliced by the
+token count therefore hold one row past the largest bucket.
 """
 
 from __future__ import annotations

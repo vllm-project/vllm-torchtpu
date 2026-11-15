@@ -874,6 +874,85 @@ class ExpertParamStager:
         return len(self._staged)
 
 
+# Layer mappings built by the expert mapping cache, and how many of them
+# were compared with a fresh build on their first cache hit.
+_expert_mapping_cache_stats = {"built": 0, "verified": 0}
+
+
+def expert_mapping_cache_stats() -> dict[str, int]:
+    return dict(_expert_mapping_cache_stats)
+
+
+def patch_expert_mapping_cache() -> None:
+    """Build each expert layer's checkpoint mapping once, not once per call.
+
+    ``RoutedExperts.load_weights`` rebuilds ``get_expert_mapping`` (three
+    entries per expert plus the fused-checkpoint entries) and indexes it by
+    expert on every call. A model that hands it one checkpoint tensor per call
+    (qwen4_exp) pays that per expert tensor, for other ranks' experts too:
+    1.7 ms at 512 experts, ~150k expert tensors per EP rank. The mapping is a
+    function of the call's arguments and of the layer's checkpoint names and
+    expert counts, which make up the cache key. The first cache hit of each key
+    is compared with a fresh build.
+    """
+    from vllm.model_executor.layers.fused_moe import routed_experts
+
+    cls = routed_experts.RoutedExperts
+    if getattr(cls, "_tpu_expert_mapping_cache_patch", False):
+        return
+    orig_get_expert_mapping = cls.get_expert_mapping
+    orig_index = routed_experts._index_expert_mapping
+    # id() of each cached mapping list -> (the list, its index).
+    indexes: dict[int, tuple[list, dict]] = {}
+
+    @functools.wraps(orig_get_expert_mapping)
+    def get_expert_mapping(self, *args, **kwargs):
+        moe_config = self.moe_config
+        key = (
+            args,
+            tuple(sorted(kwargs.items())),
+            self.ckpt_gate_proj_name,
+            self.ckpt_down_proj_name,
+            self.ckpt_up_proj_name,
+            self.lora_base_layer_prefix,
+            moe_config.num_experts,
+            moe_config.num_logical_experts,
+            self.expert_map_manager.num_fused_shared_experts,
+        )
+        cache = self.__dict__.setdefault("_tpu_expert_mapping_cache", {})
+        entry = cache.get(key)
+        if entry is None:
+            mapping = orig_get_expert_mapping(self, *args, **kwargs)
+            indexes[id(mapping)] = (mapping, orig_index(mapping))
+            cache[key] = [mapping, False]
+            _expert_mapping_cache_stats["built"] += 1
+            return mapping
+        mapping, checked = entry
+        if not checked:
+            if orig_get_expert_mapping(self, *args, **kwargs) != mapping:
+                raise RuntimeError(
+                    f"Expert mapping of {self.layer_name} changed between calls "
+                    "with the same layer configuration"
+                )
+            entry[1] = True
+            _expert_mapping_cache_stats["verified"] += 1
+        return mapping
+
+    def _index_expert_mapping(mapping):
+        entry = indexes.get(id(mapping))
+        if entry is None or entry[0] is not mapping:
+            return orig_index(mapping)
+        return entry[1]
+
+    cls.get_expert_mapping = get_expert_mapping
+    routed_experts._index_expert_mapping = _index_expert_mapping
+    cls._tpu_expert_mapping_cache_patch = True
+    logger.info(
+        "Applied TPU patch: RoutedExperts builds its checkpoint expert mapping "
+        "once per layer."
+    )
+
+
 def patch_moe_expert_write_staging() -> None:
     """Load expert parameters through host stand-ins written to the device
     once each.
