@@ -455,8 +455,8 @@ def _ring_ulysses_attention_op(
     return op
 
 
-# Below 4096 rows per rank, pure-ring per-head ICI hops cost more than
-# intra-chip D2D all_to_all + bulk ppermute.
+# Per-rank sequence shard threshold up to which uly_size=1 even-ring calls
+# dispatch to _short_2d_ring_attention_op.
 _SHORT_SHARD_2D_RING_MAX = 4096
 
 # The ICI-DMA ring kernel asks for 64 MiB of scoped VMEM and its tile tables
@@ -470,7 +470,10 @@ def _ici_ring_kernel_hw_supported() -> bool:
     global _ici_ring_kernel_hw_ok
     supported = _ici_ring_kernel_hw_ok
     if supported is None:
-        # PCI scan only; it does not start a TPU runtime.
+        # PCI scan only; it does not start a TPU runtime. Unlike
+        # tpu_info.get_chip_version(), which defaults unknown accelerator
+        # strings to TPU_7X, this returns UNKNOWN so the check stays False on
+        # unknown hosts.
         version = hardware.get_tpu_version()
         supported = version is _ICI_RING_KERNEL_TPU_VERSION
         _ici_ring_kernel_hw_ok = supported

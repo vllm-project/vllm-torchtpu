@@ -22,7 +22,12 @@ import math
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 LOG2_E = 1.44269504
 FIXED_M_RECENTER = 88.0
@@ -303,8 +308,6 @@ def select_untuned_blocks(
 
 
 def _pad_seq(tensor: Any, multiple: int, axis: int) -> Any:
-    import jax.numpy as jnp
-
     pad = -tensor.shape[axis] % multiple
     if not pad:
         return tensor
@@ -315,15 +318,11 @@ def _pad_seq(tensor: Any, multiple: int, axis: int) -> Any:
 
 def max_row_norm_per_head(x: Any, *, seq_axis: int = 2) -> Any:
     """Max L2 row norm per head over batch and sequence."""
-    import jax.numpy as jnp
-
     return jnp.sqrt((x.astype(jnp.float32) ** 2).sum(axis=-1)).max(axis=(0, seq_axis))
 
 
 def ring_fixed_m_operands(qn_max: Any, mk_h: Any) -> Any:
     """Build the (2, heads) scalar-prefetch array for hybrid fixed-m ring attention."""
-    import jax.numpy as jnp
-
     bound = qn_max * mk_h
     # Keep row 0 constant so scalar prefetch stays off Mosaic's critical path.
     m = jnp.full_like(bound, float(math.floor(FIXED_M_RING_SAFE_BOUND)))
@@ -332,9 +331,6 @@ def ring_fixed_m_operands(qn_max: Any, mk_h: Any) -> Any:
 
 def fixed_m_update(qk: Any, v: Any, m: Any) -> tuple[Any, Any]:
     """Compute one KV sub-block's softmax sum and output at a pinned m."""
-    import jax.numpy as jnp
-    from jax import lax
-
     s_curr = jnp.exp2(qk - m)
     s_cast = s_curr.astype(jnp.bfloat16)
     l_curr = s_curr.sum(axis=0, keepdims=True).astype(jnp.float32)
@@ -346,9 +342,6 @@ def fixed_m_update(qk: Any, v: Any, m: Any) -> tuple[Any, Any]:
 
 def online_update(qk: Any, v: Any, m_prev: Any) -> tuple[Any, Any, Any, Any]:
     """Compute one KV sub-block's online-softmax terms."""
-    import jax.numpy as jnp
-    from jax import lax
-
     m_curr = qk.max(axis=0)[None, :]
     m_next = jnp.maximum(m_prev, m_curr)
     s_curr = jnp.exp2(qk - m_next[0:1])
@@ -472,8 +465,6 @@ class Blocks(NamedTuple):
 def _neighbor(
     axis_names: tuple[str, ...], ring_axis: str, offset: int
 ) -> tuple[Any, ...]:
-    from jax import lax
-
     ring_size = lax.axis_size(ring_axis)
     idx = lax.axis_index(ring_axis)
     nxt = lax.rem(idx + offset + ring_size, ring_size)
@@ -511,11 +502,6 @@ def _ring_attention_kernel(
     axis_names: tuple[str, ...],
     ring_axis: str,
 ) -> None:
-    import jax.numpy as jnp
-    from jax import lax
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
-
     float32 = jnp.float32
     head_dim_v_repeats, rem = divmod(head_dim_v, NUM_SUBLANES)
     if rem != 0:
@@ -838,11 +824,6 @@ def ring_attention_forward(
     interpret: Any = False,
 ) -> Any:
     """Launch single-call Pallas ring attention over [B, H, S, D] shards."""
-    import jax
-    import jax.numpy as jnp
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
-
     batch, num_q_heads, _, head_dim_qk = q.shape
     num_kv_heads = k.shape[1]
     kv_pad = k.shape[2]
@@ -963,9 +944,6 @@ def ring_attention_sharded(
     interpret: Any = False,
 ) -> Any:
     """Run shard_map body on [1, ..., B, S_shard, H, D] local shards."""
-    import jax
-    import jax.numpy as jnp
-
     lead = len(axis_names)
     lead_axes = tuple(range(lead))
     q_s = jnp.squeeze(q, axis=lead_axes)
