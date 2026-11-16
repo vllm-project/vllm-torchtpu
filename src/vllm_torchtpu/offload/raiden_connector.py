@@ -629,7 +629,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # with it, from a second view of the region; RaidenStoreOffloadingWorker
         # registers these byte views as given (merged_key_geometry there too).
         merged_keys = None
-        if is_qwen4_exp(getattr(self, "_vllm_config", None)):
+        from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import merge_compressed_k_enabled
+
+        if is_qwen4_exp(getattr(self, "_vllm_config", None)) and merge_compressed_k_enabled():
             from vllm_torchtpu.models.vllm.qwen4_exp.offload import merged_key_geometry
 
             merged_keys = merged_key_geometry(

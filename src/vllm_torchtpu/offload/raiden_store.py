@@ -1631,8 +1631,15 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
             is_qwen4_exp,
             merged_key_geometry,
         )
+        from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+            merge_compressed_k_enabled,
+        )
 
-        if is_qwen4_exp(vllm_config) and merged_key_geometry(vllm_config, kv_cache_config):
+        if (
+            is_qwen4_exp(vllm_config)
+            and merge_compressed_k_enabled()
+            and merged_key_geometry(vllm_config, kv_cache_config)
+        ):
             # QWEN4_EXP_MERGE_COMPRESSED_K: the connector registers each pool
             # region's pages as one [num_blocks, page] byte view and its key
             # region as a second [num_blocks, key_stride] view at an offset
@@ -2405,8 +2412,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             is_qwen4_exp,
             merged_key_geometry,
         )
+        from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+            merge_compressed_k_enabled,
+        )
 
-        if is_qwen4_exp(vllm_config):
+        if is_qwen4_exp(vllm_config) and merge_compressed_k_enabled():
             merged_keys = merged_key_geometry(vllm_config, kv_cache_config)
             if merged_keys is not None:
                 # QWEN4_EXP_MERGE_COMPRESSED_K: the scheduler's config counts

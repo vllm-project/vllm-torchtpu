@@ -475,7 +475,7 @@ def test_merged_keys_move_with_their_page(monkeypatch):
     assert torch.equal(pages_view[dst], original[0])
     assert torch.equal(keys_view[dst], original[1])
     key_bytes = storage[NUM_BLOCKS * page + dst * key_stride : NUM_BLOCKS * page + (dst + 1) * key_stride]
-    assert torch.equal(key_bytes, original[1])
+    assert torch.equal(key_bytes.view(torch.int8), original[1])
 
 
 # -- scheduler: store and load plan against an in-memory Raiden store -----------
