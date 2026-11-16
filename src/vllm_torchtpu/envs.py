@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_SP_FP8_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
+    TPU_MINIMAX_M3_SP_FUSED_NORM: bool = False
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SHARED: bool = False
@@ -752,6 +753,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER": env_bool(
         "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER", default=False
+    ),
+    # "full" SP: the residual add, norm and e4m3 quantization before each
+    # e4m3 all-gather run as one Pallas pass over the shard
+    # (models/minimax_m3/kernels/sp_norm.py) instead of three XLA fusions.
+    "TPU_MINIMAX_M3_SP_FUSED_NORM": env_bool(
+        "TPU_MINIMAX_M3_SP_FUSED_NORM", default=False
     ),
     # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
     # experts run the permutation-free dense-expert kernel (kernels/experimental/

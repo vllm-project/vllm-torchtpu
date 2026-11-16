@@ -43,7 +43,9 @@ from vllm.model_executor.models.utils import (
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
+from vllm_torchtpu.models.minimax_m3.kernels import sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
+from vllm_torchtpu.models.minimax_m3.ops.sp_norm import get_add_norm_quant_op
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
 
 
@@ -76,6 +78,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
         self.tp_size = get_tensor_model_parallel_world_size()
+        if self.tp_size > 1 and envs.TPU_MINIMAX_M3_SP_FUSED_NORM:
+            self._add_norm_quant = get_add_norm_quant_op(config.rms_norm_eps)
 
     @contextlib.contextmanager
     def _layer_owned_reductions(self) -> Iterator[None]:
@@ -148,39 +152,76 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         shard: torch.Tensor | None,
-    ) -> torch.Tensor:
+        update: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
         """Sequence-parallel layer: the residual stream stays a token shard.
 
         ``shard`` is this rank's rows of the residual stream (None for the
-        first layer, whose ``hidden_states`` is the full embedding). Norms run
-        on the shard, all-gathers feed attention and the FFN, and their
-        partial outputs are reduce-scattered back onto the shard.
+        first layer, whose ``hidden_states`` is the full embedding) and
+        ``update`` the previous layer's not yet added reduce-scattered FFN
+        output (None when already in ``shard``). Norms run on the shard,
+        all-gathers feed attention and the FFN, and their partial outputs are
+        reduce-scattered back onto the shard. Returns the residual shard
+        entering this layer (None for the first), the shard after attention
+        and this layer's FFN update.
         """
         with self._layer_owned_reductions():
-            return self._forward_sp(positions, hidden_states, shard)
+            return self._forward_sp(positions, hidden_states, shard, update)
+
+    def _norm_gather(
+        self,
+        norm: GemmaRMSNorm,
+        shard: torch.Tensor,
+        update: torch.Tensor | None,
+        fp8: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(shard + update, all-gathered norm(shard + update)): one fused pass
+        over the shard when it feeds an e4m3 gather and an update is pending."""
+        fused = envs.TPU_MINIMAX_M3_SP_FUSED_NORM and _fits_sp_norm(shard)
+        if update is not None and fp8 and fused:
+            weight = norm.weight.float() + 1.0
+            shard, q, scale = self._add_norm_quant(shard, update, weight)
+        else:
+            if update is not None:
+                shard = shard + update
+            normed = norm(shard)
+            if not fp8:
+                return shard, tensor_model_parallel_all_gather(normed, 0)
+            q, scale = _quantize_rows(normed)
+        q, scale = _gather_rows_e4m3(q, scale)
+        return shard, (q.float() * scale).to(shard.dtype)
 
     def _forward_sp(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         shard: torch.Tensor | None,
-    ) -> torch.Tensor:
+        update: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        layer_input = None
         if shard is None:
             attn = self.self_attn(positions, self.input_layernorm(hidden_states))
             shard = tensor_model_parallel_reduce_scatter(
                 attn + hidden_states / self.tp_size, 0
             )
         else:
-            normed = _all_gather_rows(
-                self.input_layernorm(shard), envs.TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER
+            shard, normed = self._norm_gather(
+                self.input_layernorm,
+                shard,
+                update,
+                envs.TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER,
             )
+            layer_input = shard
             attn = self.self_attn(positions, normed)
-            shard = shard + tensor_model_parallel_reduce_scatter(attn, 0)
+            update = tensor_model_parallel_reduce_scatter(attn, 0)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        normed = _all_gather_rows(
-            self.post_attention_layernorm(shard), envs.TPU_MINIMAX_M3_SP_FP8_GATHER
+        shard, normed = self._norm_gather(
+            self.post_attention_layernorm,
+            shard,
+            update,
+            envs.TPU_MINIMAX_M3_SP_FP8_GATHER,
         )
-        return shard + tensor_model_parallel_reduce_scatter(ffn(normed), 0)
+        return layer_input, shard, tensor_model_parallel_reduce_scatter(ffn(normed), 0)
 
 
 def _sp_mode() -> str:
@@ -211,10 +252,29 @@ def _all_gather_rows(x: torch.Tensor, fp8: bool) -> torch.Tensor:
     an 8-bit relayout per call)."""
     if not fp8:
         return tensor_model_parallel_all_gather(x, 0)
-    scale = x.abs().amax(dim=-1, keepdim=True).float().clamp(min=1e-12) / _FP8_MAX
-    q = tensor_model_parallel_all_gather((x.float() / scale).to(torch.float8_e4m3fn), 0)
-    scale = tensor_model_parallel_all_gather(scale, 0)
+    q, scale = _gather_rows_e4m3(*_quantize_rows(x))
     return (q.float() * scale).to(x.dtype)
+
+
+def _fits_sp_norm(shard: torch.Tensor) -> bool:
+    """Whether `sp_norm.add_norm_quant` tiles this shard's rows."""
+    rows = shard.shape[0]
+    return rows <= sp_norm.BLOCK_ROWS or rows % sp_norm.BLOCK_ROWS == 0
+
+
+def _quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """e4m3 rows of ``x`` and their per-row f32 scales ``amax / 448``."""
+    scale = x.abs().amax(dim=-1, keepdim=True).float().clamp(min=1e-12) / _FP8_MAX
+    return (x.float() / scale).to(torch.float8_e4m3fn), scale
+
+
+def _gather_rows_e4m3(
+    q: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        tensor_model_parallel_all_gather(q, 0),
+        tensor_model_parallel_all_gather(scale, 0),
+    )
 
 
 @support_torch_compile(
@@ -261,11 +321,19 @@ class MiniMaxM3Model(nn.Module):
             inputs_embeds.shape[0], self.tp_size
         )
         if sp_step and self.sp_mode == "full":
-            shard = None
+            shard, update = None, None
             for idx, layer in enumerate(self.layers):
-                shard = layer.forward_sp(positions, inputs_embeds, shard)
-                if idx + 1 in self.aux_hidden_state_layers:
-                    aux_hidden_states.append(tensor_model_parallel_all_gather(shard, 0))
+                # Layer idx materializes its input residual (entry idx).
+                layer_input, shard, update = layer.forward_sp(
+                    positions, inputs_embeds, shard, update
+                )
+                if idx > 0 and idx in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(
+                        tensor_model_parallel_all_gather(layer_input, 0)
+                    )
+            shard = shard + update
+            if len(self.layers) in self.aux_hidden_state_layers:
+                aux_hidden_states.append(tensor_model_parallel_all_gather(shard, 0))
             hidden_states = tensor_model_parallel_all_gather(self.norm(shard), 0)
         else:
             hidden_states, residual = inputs_embeds, None
