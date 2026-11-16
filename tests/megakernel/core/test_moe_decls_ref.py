@@ -236,6 +236,47 @@ def test_moe_topk_packed_and_route_vec_compile_time_bounds():
             e_slots=72,
             module_name="fake_moe",
         )
+    # Divisibility, alignment, TOPK bounds, and ecopy_opt validation
+    for bad_g, tp_flag, match in (
+        (dataclasses.replace(g_ok, E=500, e_slots=0), False, "E=500.*multiple of R=8"),
+        (dataclasses.replace(g_ok, TOPK=0, e_slots=0), False, "TOPK=0"),
+        (dataclasses.replace(g_ok, TOPK=129, e_slots=0), False, "TOPK=129"),
+        (
+            dataclasses.replace(g_ok, IS=1020, e_slots=0),
+            False,
+            "IS=1020.*multiple of R=8",
+        ),
+        (
+            dataclasses.replace(g_ok, IS=512, e_slots=0),
+            False,
+            "ISR=64.*multiple of 128",
+        ),
+        (dataclasses.replace(g_ok, I=250, e_slots=0), True, "I=250.*divisible by R=8"),
+        (dataclasses.replace(g_ok, I=256, e_slots=0), True, "IR=32.*multiple of 128"),
+        (dataclasses.replace(g_ok, I=192, e_slots=0), False, "IR=192.*multiple of 128"),
+    ):
+        with pytest.raises(MegakernelConfigError, match=match):
+            derive_moe_params(
+                bad_g,
+                ex_ok,
+                p_ok,
+                tt_ok,
+                dbg,
+                moe_tp=tp_flag,
+                e_slots=0,
+                module_name="fake_moe",
+            )
+    with pytest.raises(MegakernelConfigError, match="ecopy_opt must be 0 or 1"):
+        derive_moe_params(
+            g_ok,
+            ex_ok,
+            p_ok,
+            MoETunables(ecopy_opt=2),
+            dbg,
+            moe_tp=False,
+            e_slots=0,
+            module_name="fake_moe",
+        )
 
 
 def test_moe_decls_options_binding_and_hf_params():
@@ -752,3 +793,49 @@ def test_moe_reference_rename_and_missing_scales_error():
             g=base_g,
             ex=ex,
         )
+
+    # MoEDebug (`forced_routing` / `row_mask`) is rejected by `moe_reference`.
+    for dbg_case in (MoEDebug(forced_routing=True), MoEDebug(row_mask=True)):
+        ex_dbg = dataclasses.replace(ex, debug=DebugOptions(modules={"moe": dbg_case}))
+        with pytest.raises(MegakernelConfigError, match="does not support MoEDebug"):
+            moe_reference(canon_params, x, g=base_g, ex=ex_dbg)
+
+    # EP / EPLB expert-slot shape and primary-slot identity checks in `moe_reference`.
+    ER = E // R
+    EW = ER + 2
+    ep_g0 = dataclasses.replace(base_g, I=IR, moe_tp=False, e_slots=0)
+    ep_eplb_g = dataclasses.replace(base_g, I=IR, moe_tp=False, e_slots=EW)
+    ep_params0 = {
+        **canon_params,
+        "e13": canon_params["e13"][:, :ER],
+        "e2": canon_params["e2"][:, :ER],
+    }
+    out_ep0, _ = moe_reference(ep_params0, x, g=ep_g0, ex=ex)
+    with pytest.raises(MegakernelConfigError, match=f"EW={EW}"):
+        moe_reference(ep_params0, x, g=ep_eplb_g, ex=ex)
+
+    ep_params_eplb = {
+        **canon_params,
+        "e13": jnp.concatenate(
+            [ep_params0["e13"], ep_params0["e13"][::-1, :2]], axis=1
+        ),
+        "e2": jnp.concatenate([ep_params0["e2"], ep_params0["e2"][::-1, :2]], axis=1),
+        "e_cores": [
+            [
+                [
+                    *range(r * ER, (r + 1) * ER),
+                    ((r + 1) % R) * ER,
+                    ((r + 1) % R) * ER + 1,
+                ]
+                for r in range(R)
+            ]
+        ],
+    }
+    with pytest.raises(MegakernelConfigError, match=f"EW={ER}"):
+        moe_reference(ep_params_eplb, x, g=ep_g0, ex=ex)
+    out_eplb, _ = moe_reference(ep_params_eplb, x, g=ep_eplb_g, ex=ex)
+    np.testing.assert_array_equal(out_eplb, out_ep0)
+
+    bad_cores = [[[*reversed(range(r * ER, (r + 1) * ER)), 0, 1] for r in range(R)]]
+    with pytest.raises(MegakernelConfigError, match="identity primary expert slots"):
+        moe_reference({**ep_params_eplb, "e_cores": bad_cores}, x, g=ep_eplb_g, ex=ex)

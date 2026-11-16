@@ -22,9 +22,33 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from ...decls import ResolvedModuleGeometry
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, FP8, round_bf16
+from .params import MoEDebug
+
+
+def _expected_expert_slots(g: Any, *, R: int, E: int, is_tp: bool) -> int:
+    raw_slots = (
+        g.options.get("e_slots", g.values.get("e_slots", 0))
+        if isinstance(g, ResolvedModuleGeometry)
+        else getattr(g, "e_slots", 0)
+    )
+    e_slots = int(raw_slots or 0)
+    er = E // R
+    if e_slots < 0:
+        raise MegakernelConfigError(f"e_slots={e_slots} must be >= 0")
+    if is_tp and e_slots not in (0, E):
+        raise MegakernelConfigError(
+            "moe_tp=True does not support redundant expert slots "
+            f"(got e_slots={e_slots} for E={E})"
+        )
+    if not is_tp and 0 < e_slots < er:
+        raise MegakernelConfigError(
+            f"e_slots={e_slots} must be 0 or >= ER={er} when moe_tp=False"
+        )
+    return e_slots if e_slots > 0 else (E if is_tp else er)
 
 
 def moe_reference(
@@ -36,18 +60,49 @@ def moe_reference(
     ex: ExecSpec,
     layer_idx: int = 0,
     moe_tp: bool | None = None,
+    module_name: str = "moe",
 ) -> tuple[jax.Array, Any]:
-    """Pure-JAX multi-rank MoE forward for one layer."""
+    """Pure-JAX multi-rank MoE forward for one layer.
+
+    Under EPLB (`moe_tp=False` with `e_slots > E // R`), slots `0..ER-1` on
+    rank `r` hold primary experts `r * ER .. (r + 1) * ER - 1` and slots
+    `ER..EW-1` hold redundant replicas; this exact reference evaluates the
+    primary slots after validating the `EW` slot shape (and identity primary
+    slots in `params["e_cores"]` when present). `MoEDebug` (`forced_routing`
+    and `row_mask`) is rejected with `MegakernelConfigError`.
+    """
+    dbg = ex.debug.modules.get(module_name)
+    if isinstance(dbg, MoEDebug) and (dbg.forced_routing or dbg.row_mask):
+        raise MegakernelConfigError(
+            "moe_reference does not support MoEDebug forced_routing or row_mask "
+            f"(got {dbg})"
+        )
     R, B = ex.R, ex.B
+    if R <= 0:
+        raise MegakernelConfigError(f"MoE R={R} must be >= 1")
     H = int(g.H)
     E = int(g.E)
     TOPK = int(g.TOPK)
     IS = int(g.IS)
     I = int(g.I)  # noqa: E741
     is_tp = bool(g.moe_tp) if moe_tp is None else bool(moe_tp)
+    if E <= 0 or E % R != 0:
+        raise MegakernelConfigError(f"MoE E={E} must be a positive multiple of R={R}")
+    if TOPK <= 0 or min(E, 128) < TOPK:
+        raise MegakernelConfigError(
+            f"MoE TOPK={TOPK} must satisfy 1 <= TOPK <= min(E={E}, 128)"
+        )
+    if IS <= 0 or IS % R != 0:
+        raise MegakernelConfigError(f"MoE IS={IS} must be a positive multiple of R={R}")
+    if I <= 0 or (is_tp and I % R != 0):
+        raise MegakernelConfigError(
+            f"MoE I={I} must be > 0"
+            + (f" and divisible by R={R} when moe_tp=True" if is_tp else "")
+        )
     ISR = IS // R
     IR = I // R if is_tp else I
     ER = E // R
+    EW = _expected_expert_slots(g, R=R, E=E, is_tp=is_tp)
     rename = getattr(g, "rename", None) or {}
 
     def _get(canon: str) -> Any:
@@ -148,6 +203,33 @@ def moe_reference(
         if e2_s_all is None
         else (e2_s_all[:, layer_idx] if e2_s_all.ndim == 4 else e2_s_all)
     )
+    for w_label, arr_l in (
+        ("e13", e13_l_all),
+        ("e2", e2_l_all),
+        *([] if e13_s_l_all is None else [("e13_s", e13_s_l_all)]),
+        *([] if e2_s_l_all is None else [("e2_s", e2_s_l_all)]),
+    ):
+        if arr_l.shape[0] != R or arr_l.shape[1] != EW:
+            raise MegakernelConfigError(
+                f"moe_reference expected {w_label} per-layer shape "
+                f"(R={R}, EW={EW}, ...), got {arr_l.shape}"
+            )
+    if not is_tp and "e_cores" in params:
+        e_cores = params["e_cores"]
+        cores_l = e_cores[layer_idx] if len(e_cores) > layer_idx else None
+        if cores_l is None or len(cores_l) != R:
+            raise MegakernelConfigError(
+                f"moe_reference got invalid e_cores for layer_idx={layer_idx}, R={R}"
+            )
+        for r in range(R):
+            want_primary = list(range(r * ER, (r + 1) * ER))
+            got_primary = [int(c) for c in cores_l[r][:ER]]
+            if got_primary != want_primary:
+                raise MegakernelConfigError(
+                    f"moe_reference requires identity primary expert slots "
+                    f"0..{ER - 1} on rank {r} (expected {want_primary[:4]}.., "
+                    f"got {got_primary[:4]}..)"
+                )
 
     multi_layer = sh13_all.ndim == 4 or e13_all.ndim == 5 or router_all.ndim == 4
     sh_gate_all = _get("sh_gate")

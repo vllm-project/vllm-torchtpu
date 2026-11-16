@@ -144,6 +144,34 @@ def derive_moe_params(
             f"MoEModule requires execution on every layer (got {moe_layers} "
             f"of L={g.L} layers)"
         )
+    if ex.R <= 0:
+        raise MegakernelConfigError(f"MoE R={ex.R} must be >= 1")
+    if tt.topk and not (g.E > 0 and (g.E - 1).bit_length() <= 9):
+        raise MegakernelConfigError(
+            "topk_packed requires 1 <= E <= 512 ((E - 1).bit_length() <= 9 "
+            f"for 9-bit float32 mantissa packing), got E={g.E}"
+        )
+    if g.E <= 0 or g.E % ex.R != 0:
+        raise MegakernelConfigError(
+            f"MoE E={g.E} must be a positive multiple of R={ex.R}"
+        )
+    if g.TOPK <= 0 or min(g.E, 128) < g.TOPK:
+        raise MegakernelConfigError(
+            f"MoE TOPK={g.TOPK} must satisfy 1 <= TOPK <= min(E={g.E}, 128)"
+        )
+    if g.IS <= 0 or g.IS % ex.R != 0:
+        raise MegakernelConfigError(
+            f"MoE IS={g.IS} must be a positive multiple of R={ex.R}"
+        )
+    if g.I <= 0 or (moe_tp and g.I % ex.R != 0):
+        raise MegakernelConfigError(
+            f"MoE I={g.I} must be > 0"
+            + (f" and divisible by R={ex.R} when moe_tp=True" if moe_tp else "")
+        )
+    if tt.ecopy_opt not in (0, 1):
+        raise MegakernelConfigError(
+            f"MoETunables.ecopy_opt must be 0 or 1, got {tt.ecopy_opt!r}"
+        )
     er = g.E // ex.R
     isr = g.IS // ex.R
     ir = g.I // ex.R if moe_tp else g.I
@@ -162,6 +190,15 @@ def derive_moe_params(
     extra = ew - er
     if g.H <= 0 or g.H % 128 != 0:
         raise MegakernelConfigError(f"Dimension H={g.H} must be a multiple of 128")
+    if isr % 128 != 0:
+        raise MegakernelConfigError(
+            f"Dimension ISR={isr} (IS={g.IS}, R={ex.R}) must be a multiple of 128"
+        )
+    if ir % 128 != 0:
+        raise MegakernelConfigError(
+            f"Dimension IR={ir} (I={g.I}, R={ex.R}, moe_tp={moe_tp}) "
+            "must be a multiple of 128"
+        )
     ch = col_chunk(g.H)
     assert g.H % ch == 0, (g.H, ch)
     t13, t2 = plan.nt["e13"], plan.nt["e2"]
@@ -177,11 +214,6 @@ def derive_moe_params(
         raise MegakernelConfigError(
             "MoEDebug.row_mask requires identity expert placement "
             f"(got ecopy=True with moe_tp=False, e_slots={e_slots} > ER={er})"
-        )
-    if tt.topk and not (g.E > 0 and (g.E - 1).bit_length() <= 9):
-        raise MegakernelConfigError(
-            "topk_packed requires 1 <= E <= 512 ((E - 1).bit_length() <= 9 "
-            f"for 9-bit float32 mantissa packing), got E={g.E}"
         )
     nb_picks = round_up(ex.B * g.TOPK, 128)
     route_vec = bool(
