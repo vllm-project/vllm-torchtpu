@@ -95,12 +95,20 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
         apply_omni_model_specific_patches()
-        if selected_backend is not None and selected_backend.upper() in (
+        upper = selected_backend.upper() if selected_backend is not None else None
+        if upper in (
             "SDPA",
             "TPU_SDPA",
             "TORCH_SDPA",
         ):
             backend = "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        elif upper in (
+            "RAINFUSION_ATTN",
+            "FASTVIDEO_VSA",
+            "TPU_BLOCK_SPARSE",
+            "BLOCK_SPARSE",
+        ):
+            backend = "vllm_torchtpu.omni.attention.TpuBlockSparseAttentionBackend"
         else:
             backend = "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
         logger.info_once(

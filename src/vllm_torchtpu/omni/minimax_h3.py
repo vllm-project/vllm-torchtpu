@@ -30,6 +30,7 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.omni.attention import refresh_block_sparse_step_gates
 
 logger = init_logger(__name__)
 
@@ -766,6 +767,7 @@ def install_minimax_h3_tpu_execution_patches() -> None:
                     if reference_kv_state is not None:
                         reference_kv_state.begin_step(step, sigma=s_v)
                     dl.minimax_h3_publish_denoise_progress(step, s_v, num_steps)
+                    refresh_block_sparse_step_gates(step, num_steps)
                     t_v, t_a = 1.0 - s_v, 1.0 - s_a
                     imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
                     audio_ref_cond_t = max(
@@ -858,6 +860,7 @@ def install_minimax_h3_tpu_execution_patches() -> None:
             raw_model._tpu_cond_proj_cache = None
             raw_model._tpu_refiner_cache = None
             dl.minimax_h3_publish_denoise_progress(None, None, None)
+            refresh_block_sparse_step_gates(None, None)
             if reference_kv_state is not None:
                 positive.static_kwargs.pop("reference_kv_state", None)
                 reference_kv_state.close()
