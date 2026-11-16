@@ -108,6 +108,11 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         return acc
 
     acc_gate, acc_up = deinterleave_lane(acc)
+    return gate_up_act(acc_gate, acc_up, fuse_act)
+
+
+def gate_up_act(acc_gate: jax.Array, acc_up: jax.Array, fuse_act: str) -> jax.Array:
+    """The fused activation of apply_act_fn on separate gate and up values."""
     match fuse_act:
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
@@ -1941,7 +1946,40 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
     )
 
 
-@jax.jit(static_argnames=["fuse_act", "preferred_element_type", "maybe_quantize_lhs"])
+_stream_logged: set[int] = set()
+
+
+def _decode_stream_spec() -> tuple[int, int, int] | None:
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.megablox import gmm_decode_stream
+
+    return gmm_decode_stream.parse_spec(envs.TPU_GMM_V2_DECODE_STREAM)
+
+
+def _log_stream_once(size_m: int, chunk: int, slots: int, max_m: int) -> None:
+    if size_m in _stream_logged:
+        return
+    _stream_logged.add(size_m)
+    args = (
+        "TPU_GMM_V2_DECODE_STREAM=%s on: gmm_v2_mlp size_m=%d runs the streamed "
+        "decode MLP kernel (chunk rows %d, slots %d, max size_m %d)",
+        os.environ.get("TPU_GMM_V2_DECODE_STREAM"), size_m, chunk, slots, max_m,
+    )
+    try:
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(*args)
+    except ImportError:  # kernel-only use without vllm
+        import logging
+
+        logging.getLogger(__name__).info(*args)
+
+
+@jax.jit(
+    static_argnames=[
+        "fuse_act", "preferred_element_type", "maybe_quantize_lhs", "max_group_size"
+    ]
+)
 def gmm_v2_mlp(
     lhs: jax.Array,  # [size_m, size_k]
     rhs1: jax.Array,  # [size_group, size_k, size_n1]
@@ -1954,12 +1992,16 @@ def gmm_v2_mlp(
     fuse_act: str | None = None,
     preferred_element_type: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
+    max_group_size: int | None = None,
 ) -> jax.Array:
     """gmm_v2(gmm_v2(lhs, rhs1, fuse_act), rhs2) for an MoE expert MLP.
 
     For decode-sized tiles the two run in one kernel (kernel_mlp), which loads
     the second gmm's first weight block under the first gmm's compute: as two
     calls, each exposes its first block's DMA. Otherwise it is two gmm_v2 calls.
+    With TPU_GMM_V2_DECODE_STREAM, decode-sized fp4 calls run
+    gmm_decode_stream instead. max_group_size bounds the rows of one group
+    (the token count of a top-k routing); None means size_m.
     """
 
     def two_calls():
@@ -1992,6 +2034,32 @@ def gmm_v2_mlp(
         group_offset = jnp.array([0], dtype=jnp.int32)
     elif jnp.isscalar(group_offset):
         group_offset = group_offset[None]
+    stream = _decode_stream_spec()
+    if stream is not None:
+        from vllm_torchtpu.kernels.megablox import gmm_decode_stream
+
+        chunk, slots, max_m = stream
+        if (
+            gmm_decode_stream.eligible(
+                lhs, rhs1, rhs2, rhs1_scale, rhs2_scale, fuse_act, chunk, max_m
+            )
+            is None
+        ):
+            _log_stream_once(padded_size_m, chunk, slots, max_m)
+            return gmm_decode_stream.gmm_decode_stream_mlp(
+                lhs,
+                rhs1,
+                rhs2,
+                group_sizes,
+                rhs1_scale,
+                rhs2_scale,
+                group_offset,
+                fuse_act=fuse_act,
+                out_dtype=preferred_element_type,
+                chunk_rows=chunk,
+                slots=slots,
+                max_group_size=max_group_size,
+            )[:size_m]
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     common = dict(
