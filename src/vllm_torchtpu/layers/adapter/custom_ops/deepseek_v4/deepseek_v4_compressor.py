@@ -366,7 +366,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
     # head_dim == 128:              lightning indexer, one array for both.
     @property
     def _has_rope_cache(self) -> bool:
-        return self.head_dim == 512 and self.overlap
+        return False  # CSA now stores RoPE inside its 512-byte E4M3 record.
 
     @property
     def _separate_state(self) -> bool:
@@ -396,7 +396,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         elif self._separate_state:
             variant, jax_fn = "hca", _compressor_jax_hca
         else:
-            variant, jax_fn = "indexer", _compressor_jax_indexer
+            # Both use one cache operand; head_dim still selects the kernel mode.
+            variant = "csa_fp8" if self.head_dim == 512 else "indexer"
+            jax_fn = _compressor_jax_indexer
 
         wrapped_fn = functools.partial(
             jax_fn,
@@ -432,7 +434,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             P(),  # cache
         )
         donate_argnums = (len(input_partition_specs) - 1, )  # cache
-        if variant != "indexer":
+        if variant not in ("indexer", "csa_fp8"):
             input_partition_specs += (P(), )  # rope_cache / state_cache
             donate_argnums += (len(input_partition_specs) - 1, )
 
@@ -444,7 +446,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             input_partition_specs=input_partition_specs,
         )
 
-        if variant == "indexer":
+        if variant in ("indexer", "csa_fp8"):
 
             def _fake_compressor(hidden_states, wkv_wgate, ape, norm_weight,
                                  cos_sin_cache, positions, state_block_tables,

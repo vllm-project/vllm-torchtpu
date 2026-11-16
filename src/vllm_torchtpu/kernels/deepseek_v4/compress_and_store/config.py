@@ -71,7 +71,7 @@ _MODE_DEFAULTS = {
         compress_ratio=4,
         quant_block=64,
         overlap=True,
-        has_rope_cache=True,
+        has_rope_cache=False,
     ),
     Mode.CSA_INDEXER:
     dict(

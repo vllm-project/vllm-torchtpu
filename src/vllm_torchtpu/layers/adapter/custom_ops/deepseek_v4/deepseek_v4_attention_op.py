@@ -26,8 +26,6 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import \
     mla_ragged_paged_attention
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import \
     mla_sliding_window_ragged_paged_attention
-from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import \
-    sparse_ragged_paged_attention
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import align_to
 
@@ -175,7 +173,7 @@ def _attention_csa(
     main_cu_q_lens: jax.Array,
     main_distribution: jax.Array,
     attention_sinks: jax.Array,
-    main_cache_rope: jax.Array,
+    q8: jax.Array,
     *,
     sm_scale: float,
     sliding_window: int,
@@ -184,8 +182,8 @@ def _attention_csa(
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays."""
-    if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
+    """CSA FP8: a single C512 cache; SWA consumes the BF16 Q output."""
+    if main_cache_kv.shape[0] == 0:
         return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
 
     swa_page_indices = swa_page_indices.flatten()
@@ -210,20 +208,11 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
-    output = sparse_ragged_paged_attention(
-        q=q,
-        cache_kv_nope=main_cache_kv,
-        cache_kv_rope=main_cache_rope,
-        topk_indices=extra,
-        page_indices=main_page_indices,
-        cu_q_lens=main_cu_q_lens,
-        distribution=main_distribution,
-        attention_sinks=attention_sinks,
-        swa_accumution=swa_output,
-        swa_l=swa_l,
-        swa_m=swa_m,
-        sm_scale=sm_scale,
-    )
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention.csa_fp8 import sparse_csa_fp8
+    output = sparse_csa_fp8(
+        q8, main_cache_kv, extra, main_page_indices, main_cu_q_lens,
+        main_distribution, attention_sinks, swa_output, swa_l, swa_m,
+        sm_scale=sm_scale)
     return output, updated_sw_cache
 
 

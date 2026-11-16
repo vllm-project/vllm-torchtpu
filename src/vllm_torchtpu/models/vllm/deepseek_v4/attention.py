@@ -40,8 +40,7 @@ from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import \
     fused_reverse_rope_wo_a_projection
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
-    BATCH_AXIS, VllmDeepseekV4SWACache, _attention_csa, _attention_hca,
-    get_packed_mla_head_size)
+    BATCH_AXIS, VllmDeepseekV4SWACache, _attention_csa, _attention_hca)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import \
     VllmDeepseekCompressor
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import \
@@ -72,6 +71,17 @@ def _qnorm_rope_jax(
 ) -> jax.Array:
     """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
     return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+
+
+def _qnorm_rope_dual_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention.csa_qnorm_dual import qnorm_rope_dual
+    return qnorm_rope_dual(x, positions, cos_sin_cache, eps=eps)
 
 
 def _rope_jax(
@@ -234,12 +244,9 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
 
         block_size = vllm_config.cache_config.block_size
         comp_ratio = max(1, self.compress_ratio)
-        hf_config = vllm_config.model_config.hf_config
         if comp_ratio == 4:
-            # CSA (`sparse_mla`) reads the NoPE record from this array and the
-            # RoPE channels from the companion `{prefix}_rope` array; the
-            # packed width here budgets for both.
-            head_size = get_packed_mla_head_size(hf_config)
+            # Full CSA latent: 512 E4M3 channels in one physical record.
+            head_size = 512  # Scale-one E4M3 for all channels, including RoPE.
         else:
             # HCA (`mla`) stores raw bf16 latents rather than pay for DSv4 FP8
             # quantization and dequantization on every access. Its cache is a
@@ -345,7 +352,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             non_causal_block=non_causal,
         )
 
-        op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
+        op_type = "swa" if swa_only else ("csa_fp8" if is_csa else "hca")
         # Build unique cache key encoding geometry, overlay status, block
         # causality, and profiling stage.
         op_name = (f"pallas::deepseek_v4_attention_{op_type}"
@@ -385,7 +392,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             P(attn_head_axis),  # attention_sinks
         )
         if is_csa:
-            input_partition_specs += (P(), )  # main_cache_rope
+            input_partition_specs += (P(None, "model", None), )  # q8
 
         # Donate sw_cache to permit in-place updates by the Pallas sliding-window kernel.
         attn_jax_op = pallas.jax_op(
@@ -429,12 +436,14 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             return op
 
         eps = float(self.mla_attn.eps)
-        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
+        is_csa = self.compress_ratio == 4
+        qnorm_fn = _qnorm_rope_dual_jax if is_csa else _qnorm_rope_jax
+        op_name = f"pallas::deepseek_v4_qnorm_rope{'_dual' if is_csa else ''}_e{_name_float(eps)}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
                 op_name,
-                functools.partial(_qnorm_rope_jax, eps=eps),
+                functools.partial(qnorm_fn, eps=eps),
                 mesh=get_vllm_model_wrapper_context().mesh,
                 input_partition_specs=(
                     P(None, "model", None),  # q
@@ -442,7 +451,12 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                     P(),  # cos_sin_cache
                 ),
             )
-            op.register_fake(_fake_rope)
+            def fake_qnorm(q, positions, cos_sin_cache):
+                if is_csa:
+                    return (torch.empty_like(q),
+                            torch.empty_like(q, dtype=torch.float8_e4m3fn))
+                return _fake_rope(q, positions, cos_sin_cache)
+            op.register_fake(fake_qnorm)
             _pallas_op_cache[op_name] = op
         object.__setattr__(self, "_qnorm_rope_op_instance", op)
         return op
@@ -503,6 +517,9 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         q = self.wq_b(qr).view(qr.shape[0], self.mla_attn.n_local_heads,
                                self.mla_attn.head_dim)
         q = self.qnorm_rope(q, positions)
+        q8 = None
+        if self.compress_ratio == 4:
+            q, q8 = q
         kv = self.kv_rope(kv, positions)
 
         topk_indices = None
@@ -521,6 +538,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             positions,
             None,
             topk_indices=topk_indices,
+            q8=q8,
         )
         return res
 
@@ -551,6 +569,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         output: torch.Tensor | None,
         *,
         topk_indices: torch.Tensor | None,
+        q8: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Prepare metadata operands and dispatch the Pallas attention op."""
         attn_ctx = get_forward_context().attn_metadata
@@ -651,25 +670,9 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             self.attn_sink,
         )
         if is_csa:
-            main_cache_rope = self._as_kernel_cache_view(
-                _live_cache(rope_entry))
-            if main_cache_rope is None:
-                if _live_cache(nope_entry) is not None:
-                    # Not the profiling pass -- the compressed-KV array is
-                    # live, so the companion must be too. Falling through
-                    # would hand the kernel the NoPE array as its RoPE
-                    # operand and silently attend to the wrong channels.
-                    raise RuntimeError(
-                        f"{self.custom_prefix}: CSA layer has a live "
-                        "compressed-KV array but no companion RoPE array. "
-                        "The runner binds them as a (nope, rope) pair on this "
-                        "layer's `kv_cache`; got "
-                        f"{type(kv_entry).__name__}.")
-                # Profiling pass: shapes are placeholders and the kernel is
-                # skipped. Clone rather than alias -- XLA dedupes identical
-                # inputs into one operand and desyncs the declared signature.
-                main_cache_rope = main_cache_kv.clone()
-            operands += (main_cache_rope, )
+            if q8 is None:
+                raise RuntimeError("CSA FP8 requires the dual Q producer output")
+            operands += (q8, )
 
         output, new_sw_cache = self.attn_op(*operands)
 

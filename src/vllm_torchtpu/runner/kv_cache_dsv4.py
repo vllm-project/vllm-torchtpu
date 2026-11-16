@@ -127,9 +127,7 @@ class DsV4KVCacheAllocator:
         than by the generic `head_size` formula. With `T =
         spec.num_states` compressed tokens per page:
 
-            CSA `*.attn`      NoPE `(N, T, 4, 128)`     512B/token
-                              RoPE `(N, T/4, 4, 128)`   128B/token, in a
-                                                        companion array
+            CSA `*.attn`      E4M3 `(N, T, 4, 128)`      512B/token
             indexer k_cache   `(N, T/4, 4, 256)`        256B/token
             HCA `*.attn`      `(N, T*2, 4, 128)`       1024B/token (raw bf16)
 
@@ -176,13 +174,10 @@ class DsV4KVCacheAllocator:
                 shape = (num_blocks, page_size // packing, packing, 256)
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
             elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
-                # CSA is split across two arrays, for NoPE and RoPE.
+                # Full 512-dimensional CSA latent in one E4M3 record.
                 nope = _create_cache((num_blocks, page_size, packing, 128),
                                      layer_name)
-                rope = _create_cache(
-                    (num_blocks, page_size // packing, packing, 128),
-                    f"{layer_name}{self._DS_V4_ROPE_CACHE_SUFFIX}")
-                kv_caches[layer_name] = (nope, rope)
+                kv_caches[layer_name] = nope
                 csa_nope_hosts.append(nope)
             else:
                 # HCA keeps raw bf16 latents: 512 values = 1024B per token,
