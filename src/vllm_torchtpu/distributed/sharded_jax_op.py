@@ -21,14 +21,14 @@ genuinely sharded therefore gets tensors sized for the global array instead of
 this rank's shard -- for an EP MoE at 2048 tokens a rank, an output claiming
 16384 rows.
 
-``pcp_streaming_rpa``'s adapter solved that by reimplementing ``__call__``, and
-that copy has since fallen behind -- stock has gained an eager wrapper-tensor
-branch and MLIR-fingerprint-based kernel caching that it does not have. So
-instead of forking the method, this derives it from the installed one and
-changes the single line that builds the output placeholders. If upstream
-reworks that line the derivation no-ops and the caller falls back to stock,
-which is wrong only in the way described above and fails loudly on a shape
-mismatch rather than silently.
+``torch_tpu==0.2.0``'s ``JaxCallable`` takes ``output_partition_specs`` and
+sizes each output with ``torch_placeholder(..., partition_spec=spec)``, but it
+expects one spec per output leaf: given a bare ``PartitionSpec`` it zips the
+spec's own entries against the outputs and fails. So this resolves the caller's
+``output_partition_specs`` against ``len(lowered.out_avals)`` (broadcasting a
+bare ``PartitionSpec`` across all output leaves, matching ``jax.jit``'s
+``out_shardings`` semantics) and hands the per-leaf list to both the stock
+``JaxCallable`` and ``fake_fn``.
 """
 
 import inspect
@@ -40,96 +40,32 @@ import torch
 from jax.sharding import NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
-from vllm_torchtpu.logger import init_logger
 
-logger = init_logger(__name__)
-
-_STOCK_PLACEHOLDER_LINE = """      output_shapes = [
-          torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
-      ]"""
-_SHARDED_PLACEHOLDER_LINE = (
-    """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
-)
+def _is_spec_leaf(spec: Any) -> bool:
+    return spec is None or isinstance(spec, PartitionSpec)
 
 
-def _sharded_output_placeholders(lowered, mesh):
-    """Torch placeholders sized for this rank's shard of each output.
+def _flat_output_partition_specs(
+    output_partition_specs: Any,
+    num_outputs: int | None = None,
+) -> list[PartitionSpec | None]:
+    """One spec per output leaf, in ``lowered.out_avals`` order.
 
-    ``jax.export`` keeps the real output shardings on ``_out_named_shardings``
-    even though it reports ``out_avals`` as replicated; where it does not, fall
-    back to the aval, which is what stock would have used anyway.
+    Matches ``jax.jit``'s ``out_shardings`` tree-prefix rule for a bare
+    ``PartitionSpec`` or ``None``: when ``num_outputs`` is known, a single leaf
+    spec broadcasts across all ``num_outputs`` outputs; structured PyTrees must
+    have exactly ``num_outputs`` leaves.
     """
-    shardings = getattr(lowered, "_out_named_shardings", None)
-    if shardings is None or len(shardings) != len(lowered.out_avals):
-        shardings = (None,) * len(lowered.out_avals)
-    return [
-        _placeholder(aval, getattr(sharding, "spec", None), mesh)
-        for aval, sharding in zip(lowered.out_avals, shardings)
-    ]
-
-
-def _placeholder(aval, spec, mesh):
-    """One output tensor, shaped by ``spec`` rather than by the aval.
-
-    The aval carries a replicated spec that cannot be overridden in place --
-    ``ShapedArray.update(sharding=...)`` drops a concrete mesh's spec on the
-    floor -- so this reproduces what ``torch_placeholder`` would do, reading the
-    partitioning from ``spec``. Outputs ``jax.export`` did not label, and
-    non-array outputs, go through the installed path unchanged.
-    """
-    if spec is None or not isinstance(aval, jax.core.ShapedArray):
-        return pallas_impl.torch_placeholder(aval, mesh=mesh)
-    torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
-    if torch_dtype is None:
-        raise NotImplementedError(f"Unsupported dtype for pallas kernels: {aval.dtype}")
-    shape = tuple(pallas_impl.get_local_shape(aval.shape, mesh, spec))
-    if torch_dtype == torch.float4_e2m1fn_x2 and shape:
-        if shape[-1] % 2:
-            raise ValueError(
-                "expected the last dimension of the JAX local shape to be even "
-                f"to pack into {torch_dtype}, got {shape[-1]} (local={shape}, "
-                f"global={aval.shape}, spec={spec})"
-            )
-        shape = shape[:-1] + (shape[-1] // 2,)
-    return torch.empty(shape, dtype=torch_dtype, device="tpu")
-
-
-def _build_sharded_callable_cls():
-    """A ``JaxCallable`` whose ``__call__`` is the installed one, minus the
-    assumption that a sharded output is replicated.
-
-    The method source is recompiled inside a throwaway class so its original
-    indentation -- and therefore the needle below -- survives verbatim.
-    """
-    src = inspect.getsource(pallas_impl.JaxCallable.__call__)
-    if _STOCK_PLACEHOLDER_LINE not in src:
-        logger.warning(
-            "torch_tpu's JaxCallable.__call__ no longer builds its output "
-            "placeholders the way this adapter expects; sharded outputs will "
-            "be sized globally. Sharded multi-device ops will fail on a shape "
-            "mismatch until this is re-derived."
+    if _is_spec_leaf(output_partition_specs):
+        count = 1 if num_outputs is None else num_outputs
+        return [output_partition_specs] * count
+    flat = jax.tree.leaves(output_partition_specs, is_leaf=_is_spec_leaf)
+    if num_outputs is not None and len(flat) != num_outputs:
+        raise ValueError(
+            f"output_partition_specs has {len(flat)} leaves, "
+            f"but fn returned {num_outputs} outputs."
         )
-        return pallas_impl.JaxCallable
-    patched = "class _Holder:\n" + src.replace(
-        _STOCK_PLACEHOLDER_LINE, _SHARDED_PLACEHOLDER_LINE, 1
-    )
-    namespace: dict = {}
-    exec(  # noqa: S102 - deriving from the installed source is the point
-        compile(patched, pallas_impl.__file__, "exec"),
-        {
-            **pallas_impl.__dict__,
-            "_sharded_output_placeholders": _sharded_output_placeholders,
-        },
-        namespace,
-    )
-    return type(
-        "_ShardedJaxCallable",
-        (pallas_impl.JaxCallable,),
-        {"__call__": namespace["_Holder"].__call__},
-    )
-
-
-_SHARDED_CALLABLE_CLS = None
+    return flat
 
 
 def sharded_jax_op(
@@ -148,16 +84,14 @@ def sharded_jax_op(
     ``pallas.jax_op`` reconstitutes the global shapes from the mesh.
     ``output_partition_specs`` is required, not optional -- getting it wrong is
     how a sharded output silently becomes a replicated one -- and mirrors the
-    shape of ``fn``'s result: one spec for one array.
+    shape of ``fn``'s result (or passes a single ``PartitionSpec`` to broadcast
+    across all outputs).
 
     Prefer returning a single array from ``fn`` over a one-tuple. Both work
     here, but a one-tuple gives the op the schema ``-> ((Tensor))``, and torch
     ``guard_int``s every symbolic input dimension of an op with that schema, so
     a caller under ``torch.compile`` loses its dynamic batch dimension.
     """
-    global _SHARDED_CALLABLE_CLS
-    if _SHARDED_CALLABLE_CLS is None:
-        _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
     if "::" not in name or len(name.split("::")) != 2:
         raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
 
@@ -171,10 +105,6 @@ def sharded_jax_op(
         is_leaf=lambda s: isinstance(s, PartitionSpec),
     )
 
-    # `out_shardings` is what puts the real shardings on the export's
-    # `_out_named_shardings`, which is the only place they survive; the rest of
-    # the jit config mirrors `pallas.custom_jax_kernel`, `keep_unused` included
-    # so the jitted arity keeps matching the torch operands.
     jit_fn = jax.jit(
         fn,
         static_argnums=static_argnums,
@@ -191,25 +121,48 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
-    wrapped_fn = _SHARDED_CALLABLE_CLS(
+    wrapped_fn = pallas_impl.JaxCallable(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
         mesh=mesh,
         input_partition_specs=input_partition_specs,
+        # Annotated as tuple[tuple[str, ...], ...], but each entry is handed to
+        # torch_placeholder(partition_spec=...), which takes a PartitionSpec.
+        # pyrefly: ignore[bad-argument-type]
+        output_partition_specs=_flat_output_partition_specs(output_partition_specs),
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
     )
 
+    orig_exported = wrapped_fn.exported
+    resolved_specs: list[PartitionSpec | None] | None = None
+
+    def _exported_with_resolved_specs(*jax_args: Any, **jax_kwargs: Any) -> Any:
+        nonlocal resolved_specs
+        lowered = orig_exported(*jax_args, **jax_kwargs)
+        n_out = len(lowered.out_avals)
+        if resolved_specs is None or len(resolved_specs) != n_out:
+            resolved_specs = _flat_output_partition_specs(output_partition_specs, n_out)
+            # pyrefly: ignore[bad-assignment]
+            wrapped_fn.output_partition_specs = resolved_specs
+        return lowered
+
+    wrapped_fn.exported = _exported_with_resolved_specs
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
 
-    def fake_fn(*args, **kwargs):
-        jax_args = pallas_impl.jax_placeholders(
-            args, mesh=mesh, partition_specs=input_partition_specs
-        )
+    def fake_fn(*args: Any, **kwargs: Any) -> Any:
+        norm_args, norm_kwargs = wrapped_fn._normalize_invocation_args(args, kwargs)
+        jax_args, jax_kwargs = wrapped_fn._get_jax_placeholders(norm_args, norm_kwargs)
         with jax._src.config.export_ignore_forward_compatibility(True):
-            lowered = wrapped_fn.exported(*jax_args, **kwargs)
-        return lowered.out_tree.unflatten(_sharded_output_placeholders(lowered, mesh))
+            lowered = wrapped_fn.exported(*jax_args, **jax_kwargs)
+        assert resolved_specs is not None
+        placeholders = [
+            # pyrefly: ignore[bad-argument-type]
+            pallas_impl.torch_placeholder(aval, mesh=mesh, partition_spec=spec)
+            for aval, spec in zip(lowered.out_avals, resolved_specs)
+        ]
+        return lowered.out_tree.unflatten(placeholders)
 
     op.register_fake(fake_fn)
     return op
