@@ -1,0 +1,44 @@
+{
+ "cases": [
+  {
+   "prompt_tokens": 64,
+   "equal_to_fork": true,
+   "first_divergence": null,
+   "drafts": 15.0,
+   "accepted": 48.0
+  },
+  {
+   "prompt_tokens": 700,
+   "equal_to_fork": true,
+   "first_divergence": null,
+   "drafts": 21.0,
+   "accepted": 42.0
+  },
+  {
+   "prompt_tokens": 1500,
+   "equal_to_fork": true,
+   "first_divergence": null,
+   "drafts": 20.0,
+   "accepted": 43.0
+  },
+  {
+   "prompt_tokens": 5000,
+   "equal_to_fork": true,
+   "first_divergence": null,
+   "drafts": 18.0,
+   "accepted": 45.0
+  },
+  {
+   "prompt_tokens": 20000,
+   "equal_to_fork": true,
+   "first_divergence": null,
+   "drafts": 21.0,
+   "accepted": 45.0
+  }
+ ],
+ "usa_equal_to_fork": true,
+ "usa_tau_port": 4.3553,
+ "usa_tau_fork": 4.2987,
+ "usa_port": "The **United States of America (USA)**, commonly known as the **United States** or simply **America**, is a federal republic made up of 50 states, a federal district, and several territories. It is located mainly in North America, between Canada and Mexico.\n\nIt has **50 states**.\n\nHere are all 50 states by name:\n\n1. Alabama\n2. Alaska\n3. Arizona\n4. Arkansas\n5. California\n6. Colorado\n7. Connecticut\n8. Delaware\n9. Florida\n10. Georgia\n11. Hawaii\n12. Idaho\n13. Illinois\n14. Indiana\n15. Iowa\n16. Kansas\n17. Kentucky\n18. Louisiana\n19. Maine\n20. Maryland\n21. Massachusetts\n22. Michigan\n23. Minnesota\n24. Mississippi\n25. Missouri\n26. Montana\n27. Nebraska\n28. Nevada\n29. New Hampshire\n30. New Jersey\n31. New Mexico\n32. New York\n33. North Carolina\n34. North Dakota\n35. Ohio\n36. Oklahoma\n37. Oregon\n38. Pennsylvania\n39. Rhode Island\n40. South Carolina\n41. South Dakota\n42. Tennessee\n43. Texas\n44. Utah\n45. Vermont\n46. Virginia\n47. Washington\n48. West Virginia\n49. Wisconsin\n50. Wyoming\n\nNote: The official names are **United States of America**, **New Hampshire**, **New Jersey**, **New Mexico**, **North Carolina**, **North Dakota**, **Rhode Island**, **South Carolina**, **South Dakota**, and **West Virginia**.",
+ "all_equal": true
+}

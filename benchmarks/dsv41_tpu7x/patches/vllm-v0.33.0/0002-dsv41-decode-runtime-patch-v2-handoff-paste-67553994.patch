@@ -1,0 +1,193 @@
+From 7b9099b9eae949611031be3a013bcb1006b4e948 Mon Sep 17 00:00:00 2001
+From: Chaitanya Kulkarni <chaitanyapk@google.com>
+Date: Tue, 20 Oct 2026 07:03:47 +0000
+Subject: [PATCH 2/4] dsv41: decode runtime patch v2 (handoff paste
+ 6755399435850973)
+
+---
+ vllm/benchmarks/lib/endpoint_request_func.py  |  2 +-
+ .../kv_connector/v1/decode_bench_connector.py |  4 +--
+ vllm/v1/core/block_pool.py                    |  2 --
+ vllm/v1/core/kv_cache_coordinator.py          | 29 +++++++++++++------
+ vllm/v1/core/kv_cache_planning.py             | 10 ++++++-
+ vllm/v1/core/single_type_kv_cache_manager.py  |  8 ++++-
+ 6 files changed, 39 insertions(+), 16 deletions(-)
+
+diff --git a/vllm/benchmarks/lib/endpoint_request_func.py b/vllm/benchmarks/lib/endpoint_request_func.py
+index d65e4cf888..bb4fe72bd8 100644
+--- a/vllm/benchmarks/lib/endpoint_request_func.py
++++ b/vllm/benchmarks/lib/endpoint_request_func.py
+@@ -168,7 +168,7 @@ def _update_headers_common(
+         headers |= request_func_input.extra_headers
+     if request_func_input.request_id:
+         headers["x-request-id"] = request_func_input.request_id
+-    dp_size = int(os.environ.get("VLLM_BENCH_DP_SIZE", "1"))
++    dp_size = int(os.environ.get("VLLM_BENCH_DP_SIZE", "8"))
+     if dp_size > 1 and "X-data-parallel-rank" not in headers:
+         headers["X-data-parallel-rank"] = str(_dp_rr_counter % dp_size)
+         _dp_rr_counter += 1
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
+index 515fbf6de0..d6dbf70d6b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
+@@ -292,7 +292,7 @@ class DecodeBenchConnectorScheduler:
+         req_id = request.request_id
+ 
+         # Only fill once per request on first scheduling
+-        if req_id in self._filled_requests:
++        if request.num_tokens < 4096 or __import__("os").path.exists("/tmp/disable_decode_bench_fill") or req_id in self._filled_requests:
+             return 0, False
+ 
+         # Calculate how many tokens we need to fill
+@@ -527,7 +527,7 @@ class DecodeBenchConnectorWorker:
+ 
+         Supports both single- and multi-group KV cache configurations.
+         """
+-        if not metadata.reqs_to_fill:
++        if not metadata.reqs_to_fill or __import__('os').path.exists('/tmp/disable_decode_bench_fill'):
+             return
+ 
+         assert self.kv_caches is not None, "KV caches must be registered before filling"
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index d632a52fe3..c09aaaed2b 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -762,8 +762,6 @@ class BlockPool:
+             rem = num_blocks - take_aux
+             if rem > 0:
+                 borrowed = self.free_block_queue.popright_n(rem)
+-                for b in borrowed:
+-                    b.pool_partition = partition
+                 ret.extend(borrowed)
+         else:
+             ret = self.free_block_queue.popleft_n(num_blocks)
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 892bbfdc7f..12e0460ff8 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     FullAttentionSpec,
+     KVCacheConfig,
++    KVCacheGroupSpec,
+     KVCacheSpec,
+     MambaSpec,
+     MLAAttentionSpec,
+@@ -88,6 +89,15 @@ def replay_boundaries(
+     return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+ 
+ 
++def _first_spec(group: KVCacheGroupSpec) -> KVCacheSpec:
++    """The representative spec of a group (first member for uniform-type groups)."""
++    spec = group.kv_cache_spec
++    specs = getattr(spec, "kv_cache_specs", None)
++    if specs:
++        return next(iter(specs.values()))
++    return spec
++
++
+ class KVCacheCoordinator(ABC):
+     """Coordinate the KV cache of different KV cache groups."""
+ 
+@@ -186,26 +196,27 @@ class KVCacheCoordinator(ABC):
+         )
+ 
+         has_mla = any(
+-            isinstance(g.kv_cache_spec, MLAAttentionSpec)
++            isinstance(_first_spec(g), MLAAttentionSpec)
+             for g in self.kv_cache_config.kv_cache_groups
+         )
+         has_swa_mla = any(
+-            isinstance(g.kv_cache_spec, SlidingWindowMLASpec)
++            isinstance(_first_spec(g), SlidingWindowMLASpec)
+             for g in self.kv_cache_config.kv_cache_groups
+         )
+         if has_mla and has_swa_mla and kv_cache_config.num_blocks >= 256:
+             num_blocks = kv_cache_config.num_blocks
+-            num_state = min(
+-                1152 if num_blocks >= 16384 else 160, max(16, num_blocks // 40)
+-            )
+-            num_swa = min(
+-                2816 if num_blocks >= 16384 else 640, max(32, num_blocks // 11)
+-            )
++            if num_blocks >= 16384:
++                num_state, num_swa = 1152, 2816
++            elif num_blocks >= 4096:
++                num_state, num_swa = 1056, 800
++            else:
++                num_state = max(16, num_blocks // 40)
++                num_swa = max(32, num_blocks // 11)
+             self.block_pool.configure_aux_partitions(num_swa, num_state)
+             for manager, group in zip(
+                 self.single_type_managers, self.kv_cache_config.kv_cache_groups
+             ):
+-                if isinstance(group.kv_cache_spec, SlidingWindowMLASpec):
++                if isinstance(_first_spec(group), SlidingWindowMLASpec):
+                     if any(
+                         name.endswith(".compressor.state_cache")
+                         for name in group.layer_names
+diff --git a/vllm/v1/core/kv_cache_planning.py b/vllm/v1/core/kv_cache_planning.py
+index ae15c0f4d2..24a258a360 100644
+--- a/vllm/v1/core/kv_cache_planning.py
++++ b/vllm/v1/core/kv_cache_planning.py
+@@ -239,6 +239,12 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
+     return True
+ 
+ 
++# Upper bound on the auto-sized KV cache block count. Block tables, prefix-cache
++# metadata and the aux partitions are sized from it; `num_gpu_blocks_override`
++# still wins when set.
++MAX_AUTO_NUM_BLOCKS = 16384
++
++
+ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
+     """Override the number of kv cache blocks if `num_gpu_blocks_override` is set.
+     The override is logged once, at the call site in `get_kv_cache_configs`.
+@@ -678,7 +684,7 @@ def get_kv_cache_config_from_groups(
+     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
+     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
+ 
+-    num_blocks = available_memory // bytes_per_block
++    num_blocks = min(available_memory // bytes_per_block, MAX_AUTO_NUM_BLOCKS)
+     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+     size = bytes_per_block * num_blocks
+ 
+@@ -1571,6 +1577,8 @@ def get_kv_cache_configs(
+         num_blocks = (
+             available_memory_one_worker // bytes_per_block if projected_groups else 1
+         )
++        if override is None:
++            num_blocks = min(num_blocks, MAX_AUTO_NUM_BLOCKS)
+         kv_cache_configs.append(
+             builder.get_kv_cache_config_from_groups(
+                 vllm_config, projected_groups, num_blocks
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 33d772fd1f..2df679124e 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -359,7 +359,10 @@ class SingleTypeKVCacheManager(ABC):
+         if num_external_computed_tokens <= 0:
+             return
+ 
++        num_skipped_blocks = num_skipped_tokens // self.block_size
+         req_blocks = self.req_to_blocks[request_id]
++        if num_skipped_blocks > len(req_blocks):
++            req_blocks.extend([self._null_block] * (num_skipped_blocks - len(req_blocks)))
+         num_new_blocks = max(
+             0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+         )
+@@ -1057,7 +1060,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+                     computed.pop()
+         if drop_eagle_block and computed_blocks[0]:
+             for computed in computed_blocks:
+-                computed.pop()
++                popped = computed.pop()
++                if not popped.is_null and popped.ref_cnt == 0:
++                    block_pool.touch((popped,))
++                    block_pool.free_blocks((popped,))
+             # Re-align after eagle pop: the pop may break the alignment
+             # when block_size != alignment_tokens (hybrid models with
+             # different page sizes, e.g. Gemma4).
+-- 
+2.56.0.611.g1030f0b940-goog
+

@@ -162,6 +162,10 @@ def main() -> None:
     ap.add_argument("--proxy-dp-size", type=int, default=8,
                     help="proxy pins decode requests over this many DP ranks (0 = server LB)")
     ap.add_argument("--no-extra-whls", action="store_true", help="skip scripts/pd/whls/*.whl")
+    ap.add_argument("--libtpu", default="",
+                    help="override the libtpu version in_pod_setup.sh installs (default: 0.0.48 legacy / 0.0.50 main)")
+    ap.add_argument("--runtime", choices=["legacy", "main"], default="legacy",
+                    help="main: upstream-main TPU runtime pins (torch_tpu 0.2.0, libtpu 0.0.50, jax 0.11.2, vLLM 0.33) and no legacy wheel downgrades")
     ap.add_argument("--reuse-pods", action="store_true")
     ap.add_argument("--gates-only", action="store_true")
     ap.add_argument("--resume", action="store_true",
@@ -188,7 +192,7 @@ def main() -> None:
     # Extra wheels override the handoff set (e.g. the tpu-sync-torch the vtt tree pins:
     # 1d02e4a's pyproject wants 0.0.1.dev20260923040928, the handoff ships ...0917).
     extra = {f"workspace/whls_pd/{w.name}": w for w in sorted((HERE / "whls").glob("*.whl"))
-             if not a.no_extra_whls}
+             if not (a.no_extra_whls or a.runtime == "main")}
     stack, prov = L.build_stack(Path(a.vtt), Path(a.vllm), HERE / "sitecustomize_pd.py", extra_files=extra)
     prov["extra_whls"] = sorted(extra)
     out = L.run_dir(THREAD, f"{a.tag}_{a.suffix}")
@@ -246,7 +250,7 @@ def main() -> None:
             # The token stays inside the pods (never in logs or the run dir).
             dl += (f"cat > /tmp/dsv41_env.sh <<'EOF'\nexport GCS_TOKEN='{tok}' "
                    f"DSV41_GCS_BUCKET='{L.GCS_BUCKET}' DSV41_GCS_PREFIX='{L.GCS_PREFIX}' "
-                   f"DSV41_SHARDS=all DSV41_HF_REPO='{a.hf_repo}'\nEOF\n")
+                   f"DSV41_SHARDS=all DSV41_HF_REPO='{a.hf_repo}' DSV41_RUNTIME='{a.runtime}' DSV41_LIBTPU='{a.libtpu}'\nEOF\n")
             L.upload_stack(stack)  # once, before the two pods fetch it in parallel
 
             def recreate_role(r: str) -> None:

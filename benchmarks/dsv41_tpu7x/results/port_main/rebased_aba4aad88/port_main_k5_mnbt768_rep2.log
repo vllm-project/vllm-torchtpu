@@ -1,0 +1,3 @@
+[X1] conc= 256 seqs/rank= 32 tok/step/rank= 192 | step=48.01 ms tau=3.1011 | interior=16534.05 tok/s (4134/chip, 64.6/user) | @3.5=18660.85 | tpot=17.081 ms ttft_p50=2.952 s
+[X1] conc= 512 seqs/rank= 64 tok/step/rank= 384 | step=72.53 ms tau=3.1095 | interior=21951.27 tok/s (5488/chip, 42.9/user) | @3.5=24707.97 | tpot=25.804 ms ttft_p50=5.5777 s
+[X1] fit: step_ms = 23.5 + 0.128 * tokens_per_rank  (ctx=4000)

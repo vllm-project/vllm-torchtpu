@@ -1,0 +1,59 @@
+{
+  "ctx": "gke_cloud-tpu-multipod-dev_us-central1_bodaborg-tpu7x-spot-sps",
+  "pods": {
+    "prefill": "chaitanyapk-dsv41-pd-pf-pm",
+    "decode": "chaitanyapk-dsv41-pd-dc-pm"
+  },
+  "run_id": "20261116-122630-046c77",
+  "args": {
+    "ctx": "gke_cloud-tpu-multipod-dev_us-central1_bodaborg-tpu7x-spot-sps",
+    "suffix": "pm",
+    "tag": "dsv41_port_main_validate",
+    "vtt": "/usr/local/google/home/chaitanyapk/.gemini/jetski/brain/386b2d65-9703-489e-bab9-9f2f69e34bbc/scratch/port/vtt-main",
+    "vllm": "/usr/local/google/home/chaitanyapk/.gemini/jetski/brain/386b2d65-9703-489e-bab9-9f2f69e34bbc/scratch/port/vllm-main",
+    "prefill_ced": 1,
+    "prefill_mnbt": 8192,
+    "decode_mnbt": 768,
+    "enable_dspark": 1,
+    "gpu_mem": "0.85",
+    "gates_args": "",
+    "keep_pods": true,
+    "env": [
+      "PREFILL_MODE=4x_tp2",
+      "PREFILL_4X_TP2_GPU_MEM=0.92",
+      "VLLM_DSV41_STREAMIDX_SCHED_GROUPS=0",
+      "PREFILL_4X_TP2_MNBT=8192"
+    ],
+    "decode_env": [
+      "MAX_NUM_SEQS=128",
+      "COMPILE_SIZES=[16, 40, 48, 64, 96, 192, 384, 512, 768]",
+      "VLLM_DSV41_CSA_FUSED_MAX_TOKENS=768",
+      "ENABLE_PREFIX_CACHING=1",
+      "PREFIX_CACHE_RETENTION_INTERVAL=1024"
+    ],
+    "prefill_env": [],
+    "proxy_dp_size": 8,
+    "no_extra_whls": false,
+    "libtpu": "",
+    "runtime": "main",
+    "reuse_pods": false,
+    "gates_only": false,
+    "resume": true,
+    "allow_foreign": true,
+    "boot_timeout": 5400,
+    "pending_timeout": 3600,
+    "hf_repo": ""
+  },
+  "vllm_torchtpu": {
+    "path": "/usr/local/google/home/chaitanyapk/.gemini/jetski/brain/386b2d65-9703-489e-bab9-9f2f69e34bbc/scratch/port/vtt-main",
+    "head": "7bc0c2b1fde5aa35d0e988092ce19d73de92c8be",
+    "dirty": ""
+  },
+  "vllm": {
+    "path": "/usr/local/google/home/chaitanyapk/.gemini/jetski/brain/386b2d65-9703-489e-bab9-9f2f69e34bbc/scratch/port/vllm-main",
+    "head": "c93bfc822db4bca98e242c79d1d1daf0f83d1bd6",
+    "dirty": ""
+  },
+  "stack_key": "97ab5664b91637e7",
+  "extra_whls": []
+}

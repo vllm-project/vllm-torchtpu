@@ -21,6 +21,24 @@ export TMPDIR=/dev/shm/tmp
 
 (
   pip uninstall -y tpu-inference torchax >/dev/null 2>&1 || true
+  if [ "${DSV41_RUNTIME:-legacy}" = "main" ]; then
+    # Runtime matching upstream vllm-torchtpu main (pyproject pins): keep the nightly image's torch, install the
+    # pinned TPU runtime from PyPI, no legacy wheel downgrades. vLLM is our v0.33.0-based branch.
+    LIBTPU_VER="${DSV41_LIBTPU:-0.0.50}"
+    # The nightly image may carry an older torch (seen: 2.10.0+cpu); torch_tpu 0.2.0 needs 2.11-2.15 and upstream pins
+    # 2.13.0, whose CPU wheels (+torchvision 0.28.0) are in the staged /workspace/whls.
+    pip install --no-cache-dir --no-deps --no-index --find-links=/workspace/whls --force-reinstall \
+      torch==2.13.0 torchvision==0.28.0 >/dev/null
+    pip install --no-cache-dir --no-deps "libtpu==${LIBTPU_VER}" "torch_tpu==${DSV41_TORCH_TPU:-0.2.0}" \
+      "tpu-sync-torch==${DSV41_TPU_SYNC:-0.0.1.dev20261029081917}" "jax==${DSV41_JAX:-0.11.2}" "jaxlib==${DSV41_JAX:-0.11.2}" \
+      portpicker==1.6.0 sympy >/dev/null
+    # torch_tpu 0.2.0's pallas layer imports frozendict (we install with --no-deps); the wheel is staged.
+    pip install --no-cache-dir --no-deps --no-index --find-links=/workspace/whls frozendict immutabledict >/dev/null
+    python3 -c "import torch_tpu, frozendict" || { echo "[PIP] torch_tpu import FAILED"; exit 1; }
+    echo "[PIP] runtime=main libtpu=${LIBTPU_VER} torch_tpu=${DSV41_TORCH_TPU:-0.2.0} jax=${DSV41_JAX:-0.11.2}"
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.33.0 SETUPTOOLS_SCM_PRETEND_VERSION=0.33.0 VLLM_TARGET_DEVICE=empty pip install --no-cache-dir --no-index --no-deps --no-build-isolation -e /workspace/vllm >/dev/null
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 pip install --no-cache-dir --no-index --no-deps --no-build-isolation -e /workspace/vllm-torchtpu >/dev/null
+  else
   pip install --no-cache-dir --no-deps "libtpu==${LIBTPU_VER}" portpicker==1.6.0 compressed-tensors==0.15.0 sympy >/dev/null
   pip install --no-cache-dir --no-index --find-links=/workspace/whls --no-deps --force-reinstall /workspace/whls/*.whl >/dev/null
   if ls /workspace/whls_pd/*.whl >/dev/null 2>&1; then
@@ -29,6 +47,7 @@ export TMPDIR=/dev/shm/tmp
   fi
   SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.29.0 SETUPTOOLS_SCM_PRETEND_VERSION=0.29.0 VLLM_TARGET_DEVICE=empty pip install --no-cache-dir --no-index --no-deps --no-build-isolation -e /workspace/vllm >/dev/null
   SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 pip install --no-cache-dir --no-index --no-deps --no-build-isolation -e /workspace/vllm-torchtpu >/dev/null
+  fi
   for d in /usr/local/lib/python3.12/*-packages/vllm_torchtpu; do
     [ -d "$d" ] && [ "$(realpath "$d")" != "$(realpath /workspace/vllm-torchtpu/src/vllm_torchtpu)" ] && cp -rf /workspace/vllm-torchtpu/src/vllm_torchtpu/* "$d/" || true
   done
