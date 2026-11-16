@@ -151,7 +151,7 @@ def _init_shared_weights_on_tpu(
         lin_in = (
             jax.random.normal(
                 key_for(101, me),
-                (1, ngdn, nt["lin_in"], tk["lin_in"], nli),
+                (1, ngdn, nt.get("lin_in", 1), tk.get("lin_in", 128), nli),
                 dtype=BF16,
             )
             * jnp.bfloat16(0.125)
@@ -159,7 +159,7 @@ def _init_shared_weights_on_tpu(
         lin_out = (
             jax.random.normal(
                 key_for(102, me),
-                (1, ngdn, nt["lin_out"], tk["lin_out"], H),
+                (1, ngdn, nt.get("lin_out", 1), tk.get("lin_out", 128), H),
                 dtype=BF16,
             )
             * jnp.bfloat16(0.125)
@@ -358,6 +358,9 @@ def _init_shared_weights_on_tpu(
         "smalls": raw["smalls_f"],
         "final_norm": raw["final_norm"],
     }
+    if ngdn == 0:  # attention-only geometry: no GDN weights to stream
+        for w in (w_lib, w_f):
+            del w["lin_in"], w["lin_out"]
     return w_lib, w_f
 
 
