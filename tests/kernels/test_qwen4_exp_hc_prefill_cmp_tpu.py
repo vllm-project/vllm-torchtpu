@@ -19,9 +19,15 @@ output (mixed, injection):
   double rounding alone puts it 0.96% of max from the reference at 512 rows in
   interpret mode, so a fixed 1%-of-max line would gate on served's error).
 
-The combined streams equal the served kernel's bit for bit, the combine
-prologue equals gated_residual followed by the mix without prologue bit for
-bit (the fold's premise), and a second call returns the same bits.
+The combined streams equal the served kernel's bit for bit, and a second call
+returns the same bits. The fold's premise: the combine prologue gives the
+combined streams of gated_residual bit for bit, and its mixed rows and
+injection equal those of gated_residual followed by the mix without prologue
+within max 2^-7 of max and l2 1e-3. They are not bit for bit on the TPU: the
+compiled prologue kernel forms the sum of squares of its freshly rounded rows
+with bf16 multiply-accumulates into f32 accumulators (vmac.bf16.f32), the mix
+kernel with f32 multiplies and adds, so the variance can differ in its last
+bits and move a norm rounding (CPU interpret mode gives equal bits).
 
 Run it on a TPU host, e.g. through the bench recipe:
 ``BENCH=script "BENCH_CMD=python -m pytest -q -s
@@ -153,13 +159,15 @@ def test_tpu_cmp_matches_served(tokens, prologue):
         # The fold's premise: prologue = gated_residual, then the mix.
         sep = gated_residual_fn(BRANCHES, HIDDEN, TILE, partial)(residual, block, injection)
         mixed2, inj2 = hc_prefill_mix_cmp(sep, *weights, **static)
-        same = [
-            bool(np.array_equal(np.asarray(a), np.asarray(b)))
-            for a, b in ((cmp[2], sep), (cmp[0], mixed2), (cmp[1], inj2))
-        ]
-        record["prologue_equals_separate"] = same
-        if not all(same):
-            failures.append(("fold", "prologue differs from gated_residual + mix", same))
+        if not np.array_equal(np.asarray(cmp[2]), np.asarray(sep)):
+            failures.append(("fold", "combined streams differ from gated_residual"))
+        fold = {}
+        for name, a, b in (("mixed", cmp[0], mixed2), ("injection", cmp[1], inj2)):
+            fold[name] = _metrics(_np(a), _np(b))
+            fold[name]["sep_vs_ref"] = _metrics(_np(b), ref[0 if name == "mixed" else 1])
+            if fold[name]["max_rel"] > 2.0**-7 or fold[name]["l2"] > 1e-3:
+                failures.append(("fold", name, fold[name]))
+        record["prologue_vs_separate"] = fold
     record["failures"] = [str(f) for f in failures]
     print("P5HC_NUM " + json.dumps(record, sort_keys=True))
     out = os.environ.get("P5HC_OUT")
