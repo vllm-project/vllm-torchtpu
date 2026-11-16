@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.models.minimax_m3.experimental import plan
 from vllm_torchtpu.models.minimax_m3.experimental.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.experimental.ops.msa import (
     get_msa_dcp_op,
@@ -342,7 +343,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         # heads, and each rank stores all of their rows for its blocks.
         self.kv_head_replicas = max(1, tp_size // config.num_key_value_heads)
         self.dcp_kv_heads = max(1, self.dcp_size // self.kv_head_replicas)
-        dtype = cache_dtype(cache_config)
+        # The model plan's msa_cache slot: 4-bit (`kernels.msa_fp4`) or
+        # --kv-cache-dtype's.
+        dtype = cache_dtype(cache_config, int4=plan.selected(vllm_config, "msa_cache"))
         self.kv_cache = MiniMaxM3Cache(
             2 * self.head_dim * self.dcp_kv_heads, dtype, prefix=f"{prefix}.attn"
         )

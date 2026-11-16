@@ -35,10 +35,14 @@ from vllm.model_executor.models.utils import (
 )
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3.experimental import plan
 from vllm_torchtpu.models.minimax_m3.experimental.attention import (
     MiniMaxM3SparseAttention,
 )
 from vllm_torchtpu.models.minimax_m3.experimental.moe import MiniMaxM3MLP, MiniMaxM3MoE
+from vllm_torchtpu.models.minimax_m3.experimental.ops.tp_all_reduce import (
+    PallasTpAllReduce,
+)
 from vllm_torchtpu.models.minimax_m3.experimental.quant import (
     CT_TO_MODELOPT_EXPERT_SUFFIX,
 )
@@ -222,6 +226,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        # Shared-core hooks the model plan turns on (read by the runner after
+        # load_model): the model's TP all-reduce (tpu_communicator
+        # .ModelAllReduce; a cap of 0 = XLA's) and the spec-verify sampler
+        # (runner.spec_verify_sampler; None = the runner's unfused verify).
+        logger.info("MiniMax M3 model plan: %s", plan.resolve_plan(vllm_config))
+        max_bytes = plan.selected(vllm_config, "tp_all_reduce")
+        self.model_all_reduce = PallasTpAllReduce(max_bytes) if max_bytes else None
+        spec_verify_sampler = plan.selected(vllm_config, "spec_verify")
+        self.spec_verify_sampler = (
+            spec_verify_sampler() if spec_verify_sampler is not None else None
+        )
         config = vllm_config.model_config.hf_text_config
         self.model = MiniMaxM3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

@@ -24,6 +24,7 @@ _ARCHITECTURES = (
     # with the text-only model.
     "MiniMaxM3SparseForConditionalGeneration",
 )
+# Keep in sync with variants.VARIANTS["model"] / ["draft"] (test_plan checks).
 _MODEL = "vllm_torchtpu.models.minimax_m3.experimental.model:MiniMaxM3SparseForCausalLM"
 # The checkpoint's dspark/ draft; keep in sync with dspark.ARCHITECTURE.
 _DSPARK_ARCHITECTURE = "DSparkMiniMaxDraftModel"
