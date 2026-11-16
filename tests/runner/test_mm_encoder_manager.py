@@ -12,15 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounter
 from vllm.distributed import parallel_state
 from vllm.v1.worker import encoder_cudagraph
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
 
 from vllm_torchtpu.runner import mm_encoder_manager as mm
+
+
+def _make_manager(
+    capture_values,
+    *,
+    paths=None,
+    budgets=(8, 4),
+    forward=None,
+):
+    model = Mock()
+    model.use_data_parallel = False
+    if forward is not None:
+        model.encoder_cudagraph_forward = forward
+    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        capture_axes=(),
+        padding_logics={},
+        paths=paths
+        or {"default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False)},
+    )
+    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
+        lambda budget, *args, path: SimpleNamespace(values=capture_values(budget))
+    )
+    model.get_encoder_cudagraph_item_specs.return_value = [Mock(), Mock()]
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda _: 0,
+                mm_encoder_tp_mode="weights",
+                video_pruning_rate=None,
+            ),
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=list(budgets),
+            encoder_cudagraph_max_vision_items_per_batch=2,
+            encoder_cudagraph_max_frames_per_batch=0,
+        ),
+    )
+    return mm.MMEncoderManager(config, torch.device("cpu"), model)
 
 
 @pytest.fixture
@@ -32,40 +73,18 @@ def compile_mock(monkeypatch):
 
 @pytest.fixture
 def manager(compile_mock):
-    model = Mock()
-    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
-        capture_axes=(),
-        padding_logics={},
+    return _make_manager(
+        lambda budget: {
+            "pixels": torch.zeros(budget, 2),
+            "scalar": torch.tensor(0),
+            "positions": torch.arange(budget),
+        },
         paths={
             "global": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
             "local": SimpleNamespace(min_token_budget=8, allow_zero_tokens=True),
         },
+        budgets=(8, 4),
     )
-    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
-        lambda budget, *args, path: SimpleNamespace(
-            values={
-                "pixels": torch.zeros(budget, 2),
-                "scalar": torch.tensor(0),
-                "positions": torch.arange(budget),
-            }
-        )
-    )
-    model.get_encoder_cudagraph_item_specs.return_value = [Mock(), Mock()]
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            dtype=torch.float32,
-            multimodal_config=SimpleNamespace(
-                get_limit_per_prompt=lambda _: 0, mm_encoder_tp_mode="weights"
-            ),
-        ),
-        compilation_config=SimpleNamespace(
-            cudagraph_mm_encoder=True,
-            encoder_cudagraph_token_budgets=[8, 4],
-            encoder_cudagraph_max_vision_items_per_batch=2,
-            encoder_cudagraph_max_frames_per_batch=0,
-        ),
-    )
-    return mm.MMEncoderManager(config, torch.device("cpu"), model)
 
 
 def test_initialization_compiles_encoder_forward(manager, compile_mock):
@@ -128,44 +147,68 @@ def test_exact_shape_input_is_detached_to_match_template_guards(manager):
 
 
 def test_templates_are_built_without_autograd(compile_mock):
-    # Templates derived from parameters (e.g. interpolated position
-    # embeddings) must not require grad, or replays built under no_grad miss
-    # every precompiled budget graph on Dynamo's requires_grad guard.
-    weight = torch.nn.Parameter(torch.ones(2))
-    model = Mock()
-    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
-        capture_axes=(),
-        padding_logics={},
-        paths={
-            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False)
+    # Both parameter-derived tensors and pre-existing parameters / no-op .to()
+    # tensors must be detached so replays built under no_grad match template
+    # Dynamo guards.
+    weight = torch.nn.Parameter(torch.ones(4, 2))
+    mgr = _make_manager(
+        lambda budget: {
+            "pos_embeds": weight[:1].repeat(budget, 1),
+            "raw_param": weight.to(torch.float32),
         },
+        budgets=(4,),
     )
-    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
-        lambda budget, *args, path: SimpleNamespace(
-            values={"pos_embeds": weight.repeat(budget, 1)}
+    assert torch.is_grad_enabled()
+    template = mgr.budget_templates["default"][4]
+    assert not template["pos_embeds"].requires_grad
+    assert not template["raw_param"].requires_grad
+
+
+def test_exact_shape_replay_reuses_precompiled_dynamo_graph(monkeypatch):
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    real_compile = torch.compile
+    monkeypatch.setattr(
+        mm.torch,
+        "compile",
+        lambda fn, **kwargs: real_compile(fn, **{**kwargs, "backend": counter}),
+    )
+    monkeypatch.setattr(mm, "synchronize_tensors", lambda *args, **kwargs: None)
+    weight = torch.nn.Parameter(torch.ones(4, 2))
+
+    def forward(values, *, path):
+        return values["pixels"] + values["pos_embeds"] + values["raw_param"]
+
+    mgr = _make_manager(
+        lambda budget: {
+            "pixels": torch.zeros(budget, 2),
+            "pos_embeds": weight[:1].repeat(budget, 1),
+            "raw_param": weight.to(torch.float32),
+        },
+        budgets=(4,),
+        forward=forward,
+    )
+    mgr.precompile_vision_encoder()
+    assert counter.frame_count == 1
+
+    mgr.model.prepare_encoder_cudagraph_replay_buffers.side_effect = (
+        lambda *args, **kwargs: SimpleNamespace(
+            values={
+                "pixels": torch.ones(4, 2),
+                "pos_embeds": weight[:1].repeat(4, 1),
+                "raw_param": weight.to(torch.float32),
+            }
         )
     )
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            dtype=torch.float32,
-            multimodal_config=SimpleNamespace(
-                get_limit_per_prompt=lambda _: 0, mm_encoder_tp_mode="weights"
-            ),
-        ),
-        compilation_config=SimpleNamespace(
-            cudagraph_mm_encoder=True,
-            encoder_cudagraph_token_budgets=[4],
-            encoder_cudagraph_max_vision_items_per_batch=2,
-            encoder_cudagraph_max_frames_per_batch=0,
-        ),
-    )
-    manager = mm.MMEncoderManager(config, torch.device("cpu"), model)
-    assert torch.is_grad_enabled()
-    assert not manager.budget_templates["default"][4]["pos_embeds"].requires_grad
+    out = mgr._run_budget_graph({}, 4, allow_eager_fallback=False)
+    assert out is not None
+    assert counter.frame_count == 1
+    torch._dynamo.reset()
 
 
 @pytest.mark.parametrize(
-    ("tokens", "slot"), [(1, 4), (4, 4), (5, 8), (8, 8), (9, 16), (17, 24)]
+    ("tokens", "slot"),
+    [(0, 4), (1, 4), (4, 4), (5, 8), (8, 8), (9, 16), (16, 16), (17, 24)],
 )
 def test_gather_slot_is_padded_to_a_token_budget(manager, tokens, slot):
     # budgets are [4, 8]; beyond the largest, the next multiple of it.
@@ -478,18 +521,51 @@ def test_data_parallel_execute_gathers_between_synchronizations(
     tp.all_gather.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("max_step_tokens", "expected"),
+    [(0, [4, 8]), (8, [4, 8]), (9, [4, 8, 16]), (20, [4, 8, 16, 24])],
+)
 @pytest.mark.parametrize("use_dp", [True, False])
 def test_precompile_gathers_every_budget_under_data_parallelism(
-    coordinated_manager, monkeypatch, use_dp
+    coordinated_manager, monkeypatch, use_dp, max_step_tokens, expected
 ):
-    """A new all-gather size compiles on first use, so startup gathers each budget."""
+    """A new all-gather size compiles on first use, so startup warms reachable slots."""
     manager = coordinated_manager
     manager.use_dp = use_dp
     tp = SimpleNamespace(all_gather=Mock(side_effect=lambda t, *, dim: t.repeat(2, 1)))
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp)
-    manager.precompile_vision_encoder()
+    manager.precompile_vision_encoder(max_step_tokens=max_step_tokens)
     sizes = [c.args[0].shape[0] for c in tp.all_gather.call_args_list]
-    assert sizes == (list(manager.token_budgets) if use_dp else [])
+    assert sizes == (expected if use_dp else [])
+
+
+@pytest.mark.parametrize(("mm_budget_tokens", "expected"), [(24, 24), (None, 16)])
+def test_capture_model_passes_encoder_step_budget_to_precompile(
+    monkeypatch, mm_budget_tokens, expected
+):
+    from vllm_torchtpu.runner import tpu_runner
+
+    encoder_mgr = Mock()
+    monkeypatch.setattr(
+        tpu_runner, "maybe_create_mm_encoder_manager", lambda *_args: encoder_mgr
+    )
+    runner = MagicMock(spec=tpu_runner.TPUModelRunner)
+    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    runner.enforce_eager = False
+    runner.lora_config = None
+    runner.vllm_config = runner.device = runner.model = None
+    runner.mm_budget = (
+        SimpleNamespace(get_encoder_budget=lambda: mm_budget_tokens)
+        if mm_budget_tokens is not None
+        else None
+    )
+    runner.scheduler_config = SimpleNamespace(max_num_encoder_input_tokens=16)
+    runner._mtp_prefill_only = False
+    runner._is_async_drafter = False
+    tpu_runner.TPUModelRunner.capture_model(runner)
+    encoder_mgr.precompile_vision_encoder.assert_called_once_with(
+        max_step_tokens=expected
+    )
 
 
 @pytest.mark.parametrize("capture_axes", [(), ((1, 2),)])
@@ -522,20 +598,12 @@ def test_factory_requires_enabled_and_supported(
 
 def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock):
     """Chunk an oversized video so each chunk hits a compiled budget graph."""
-    model = Mock()
-    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
-        capture_axes=(),
-        padding_logics={},
-        paths={
-            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
-        },
-    )
     # 4 patches per output token (e.g. spatial_merge_size = 2)
-    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
-        lambda budget, *args, path: SimpleNamespace(
-            values={"pixel_values": torch.zeros(budget * 4, 2)}
-        )
+    mgr = _make_manager(
+        lambda budget: {"pixel_values": torch.zeros(budget * 4, 2)},
+        budgets=(4, 8),
     )
+    model = mgr.model
 
     def get_item_specs(mm_kwargs):
         grid = mm_kwargs["video_grid_thw"]
@@ -580,24 +648,6 @@ def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock
     model.select_encoder_cudagraph_items.side_effect = select_items
     model.prepare_encoder_cudagraph_replay_buffers.side_effect = prepare_replay
     model.postprocess_encoder_output.side_effect = postprocess
-
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            dtype=torch.float32,
-            multimodal_config=SimpleNamespace(
-                get_limit_per_prompt=lambda _: 0,
-                mm_encoder_tp_mode="weights",
-                video_pruning_rate=None,
-            ),
-        ),
-        compilation_config=SimpleNamespace(
-            cudagraph_mm_encoder=True,
-            encoder_cudagraph_token_budgets=[4, 8],
-            encoder_cudagraph_max_vision_items_per_batch=2,
-            encoder_cudagraph_max_frames_per_batch=0,
-        ),
-    )
-    mgr = mm.MMEncoderManager(config, torch.device("cpu"), model)
 
     # Forward projects every group of 4 patch rows to 1 output token by summing
     def compiled_forward(values, *, path):
