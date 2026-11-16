@@ -18,6 +18,11 @@ CODE_DIR="${CODE_DIR:-/zzlfs/temu/src/vllm-torchtpu-cszhz}"
 source "${VENV:-/zzlfs/temu/.venv-epic}/bin/activate"
 cd "${CODE_DIR}"
 export PYTHONPATH="${CODE_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
+# Rocky/RHEL 宿主（glibc 2.34）：venv 里自编的 tpu_sync _tpu_raiden_torch_2_13_0.so 是 Ubuntu 24.04 编的（要 glibc 2.38），
+# 换用 overlay-el9 里在 Rocky 上重编的版本（src/build-tpusync-1031-el9.sh）。PYTHONPATH 排在 site-packages 前面。
+if [[ -f /etc/redhat-release && -d /zzlfs/temu/overlay-el9/tpu_sync ]]; then
+  export PYTHONPATH="${PYTHONPATH}:/zzlfs/temu/overlay-el9"
+fi
 ulimit -c 0
 
 export MODEL_URI="gs://zzl-bucket/models/DeepSeek-V4.1-Flash"
@@ -45,6 +50,11 @@ export VLLM_XLA_CHECK_RECOMPILATION=0
 # 开着会在编译时报错，只能关。关掉后 8 个 worker 编译完不归还堆内存，单机 DP8 启动时可能逼近主机内存上限
 # 被 OOM kill；venv 换成 PIE python 后建议设 TPU_RECLAIM_COMPILE_MEMORY=1。见 REPRODUCE.zh.md §2.4。
 export TPU_RECLAIM_COMPILE_MEMORY="${TPU_RECLAIM_COMPILE_MEMORY:-0}"
+# 有的宿主在 /etc/environment 里设了 LD_PRELOAD=libtcmalloc（ssh 登录时由 PAM 带进来）。
+# reclaim 靠 glibc malloc_trim，碰到 tcmalloc 会直接报 "requires Linux with glibc malloc"，这里改回 glibc。
+if [[ "${TPU_RECLAIM_COMPILE_MEMORY}" == "1" && "${LD_PRELOAD:-}" == *tcmalloc* ]]; then
+  echo "unset LD_PRELOAD=${LD_PRELOAD} (TPU_RECLAIM_COMPILE_MEMORY=1 needs glibc malloc)"; unset LD_PRELOAD
+fi
 export OMP_NUM_THREADS=1 NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm VLLM_TARGET_DEVICE=tpu
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0
 export RUNAI_STREAMER_MEMORY_LIMIT=34359738368 TPU_SHARDED_LOAD_SYNC_EVERY=512
@@ -58,6 +68,7 @@ export VLLM_SERVER_DEV_MODE=1
 # P 默认 40 ms：并发长请求经多个 API server 解析后到达各 rank 仍相差几十 ms。
 if [[ "${ROLE}" == "prefill" ]]; then _WAVE_DEFAULT=40; else _WAVE_DEFAULT=20; fi
 export VLLM_DP_WAVE_START_DELAY_MS="${VLLM_DP_WAVE_START_DELAY_MS:-${_WAVE_DEFAULT}}"
+export PYTHONFAULTHANDLER=1  # 诊断：worker 段错误或 abort 时打印 Python 栈
 export PYTHONUNBUFFERED=1
 # --- Stage-3 Raiden DSv4 KV 传输 ---
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
