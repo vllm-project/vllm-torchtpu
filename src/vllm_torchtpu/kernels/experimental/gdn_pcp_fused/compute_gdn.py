@@ -203,8 +203,8 @@ def chunked_gdn_per_seq(
         * beta_large
     )
 
-    # Absorb gating_backward into u_ws so the unscaled K (transposed once per KQ
-    # head) is shared by all of its V heads.
+    # Absorb gating_backward into u_ws so sibling V heads share the same
+    # unscaled K, letting the compiler reuse K and its transpose per KQ head.
     # [num_v_heads, chunk, v_head_dim]
     u_ws_gated = u_ws * gating_backward
     k_rep = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
