@@ -3825,7 +3825,7 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
     from_device_chunks = tpu_runner.AsyncTPUCopyState.from_device_chunks
 
     def capture_from_device_chunks(*args, **kwargs):
-        captured.append(kwargs.get("spec_logprobs"))
+        captured.append(kwargs.get("logprobs"))
         return from_device_chunks(*args, **kwargs)
 
     monkeypatch.setattr(

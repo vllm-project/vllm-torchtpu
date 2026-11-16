@@ -28,7 +28,7 @@ INVALID_TOKEN_ID = -1
 
 
 @dataclass
-class SpecLogprobsChunk:
+class LogprobsChunk:
     """One chunk's logprobs, one row per logits row.
 
     A verify chunk's logits hold, per request, one row per draft token and
@@ -46,8 +46,8 @@ class SpecLogprobsChunk:
     row_starts: np.ndarray
 
 
-def spec_logprobs_lists(
-    chunks: list[SpecLogprobsChunk], gen_lens: list[int] | None
+def logprobs_lists(
+    chunks: list[LogprobsChunk], gen_lens: list[int] | None
 ) -> LogprobsLists:
     """Keep each request's generated rows, in request order.
 
@@ -105,8 +105,8 @@ class AsyncTPUCopyState:
     # Step with logprobs requested: per-chunk logprobs, copied with the
     # tokens and cut to each request's rows in `get_output` (the accepted
     # rows in a spec-decode step).
-    spec_logprobs: list[SpecLogprobsChunk] | None = None
-    # Device sources of `spec_logprobs`, kept alive until the copy lands.
+    logprobs: list[LogprobsChunk] | None = None
+    # Device sources of `logprobs`, kept alive until the copy lands.
     _logprobs_tpu: list[LogprobsTensors] | None = None
 
     @classmethod
@@ -114,21 +114,21 @@ class AsyncTPUCopyState:
         cls,
         chunks_tpu: list[torch.Tensor],
         chunk_real_lens: list[int],
-        spec_logprobs: list[SpecLogprobsChunk] | None = None,
+        logprobs: list[LogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
         logprobs_tpu = None
-        if spec_logprobs:
+        if logprobs:
             # get_output takes request i's logprobs rows from the chunk that
             # sampled it: one logprobs chunk per token chunk, with one row
             # start per real request.
-            num_rows = [len(c.row_starts) for c in spec_logprobs]
+            num_rows = [len(c.row_starts) for c in logprobs]
             assert num_rows == chunk_real_lens, (num_rows, chunk_real_lens)
-            logprobs_tpu = [c.tensors for c in spec_logprobs]
-            spec_logprobs = [
-                SpecLogprobsChunk(c.tensors.to_cpu_nonblocking(), c.row_starts)
-                for c in spec_logprobs
+            logprobs_tpu = [c.tensors for c in logprobs]
+            logprobs = [
+                LogprobsChunk(c.tensors.to_cpu_nonblocking(), c.row_starts)
+                for c in logprobs
             ]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
@@ -137,7 +137,7 @@ class AsyncTPUCopyState:
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
             chunks_tpu=chunks_tpu,
-            spec_logprobs=spec_logprobs or None,
+            logprobs=logprobs or None,
             _logprobs_tpu=logprobs_tpu,
         )
 
@@ -235,9 +235,9 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             valid_sampled_token_ids = [
                 seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
             ]
-        if self.copy_state.spec_logprobs:
-            self._model_runner_output.logprobs = spec_logprobs_lists(
-                self.copy_state.spec_logprobs, gen_lens
+        if self.copy_state.logprobs:
+            self._model_runner_output.logprobs = logprobs_lists(
+                self.copy_state.logprobs, gen_lens
             )
         for i in self.discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()

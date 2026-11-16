@@ -29,11 +29,11 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
-    SpecLogprobsChunk,
+    LogprobsChunk,
     assemble_spec_next_tokens,
     compute_num_rejected,
     extract_draft_token_ids,
-    spec_logprobs_lists,
+    logprobs_lists,
     subtract_num_rejected_tokens,
 )
 
@@ -205,10 +205,10 @@ def _row_logprobs(num_rows, base=0):
     )
 
 
-def test_spec_logprobs_lists_keeps_accepted_rows_in_request_order():
-    verify = SpecLogprobsChunk(_row_logprobs(8), row_starts=np.array([0, 4, 6]))
-    no_drafts = SpecLogprobsChunk(_row_logprobs(4, base=100), np.arange(2))
-    out = spec_logprobs_lists([verify, no_drafts], gen_lens=[2, 2, 1, 1, 1])
+def test_logprobs_lists_keeps_accepted_rows_in_request_order():
+    verify = LogprobsChunk(_row_logprobs(8), row_starts=np.array([0, 4, 6]))
+    no_drafts = LogprobsChunk(_row_logprobs(4, base=100), np.arange(2))
+    out = logprobs_lists([verify, no_drafts], gen_lens=[2, 2, 1, 1, 1])
     assert out.cu_num_generated_tokens == [0, 2, 4, 5, 6, 7]
     assert out.logprob_token_ids[:, 0].tolist() == [0, 1, 4, 5, 6, 100, 101]
     assert out.sampled_token_ranks.tolist() == [0, 1, 4, 5, 6, 100, 101]
@@ -223,9 +223,7 @@ def test_get_output_attaches_spec_logprobs():
         chunk_real_lens=[3],
         copy_ready_event=None,
         completed=True,
-        spec_logprobs=[
-            SpecLogprobsChunk(_row_logprobs(8), row_starts=np.array([0, 4, 6]))
-        ],
+        logprobs=[LogprobsChunk(_row_logprobs(8), row_starts=np.array([0, 4, 6]))],
     )
     out = AsyncTPUModelRunnerOutput(
         model_runner_output=ModelRunnerOutput(
@@ -265,16 +263,16 @@ def _bucketed_logprobs(num_rows, num_logprobs, seed):
 
 @pytest.mark.parametrize("num_logprobs", [0, 20])
 @pytest.mark.parametrize("real_rows", [[5], [16, 3], [16, 16, 7]])
-def test_spec_logprobs_lists_without_gen_lens_matches_the_blocking_path(
+def test_logprobs_lists_without_gen_lens_matches_the_blocking_path(
     num_logprobs, real_rows
 ):
     """gen_lens=None, one generated token per request: each chunk's first `n`
     bucketed rows, in chunk order."""
     chunks = [
-        SpecLogprobsChunk(_bucketed_logprobs(16, num_logprobs, seed), np.arange(n))
+        LogprobsChunk(_bucketed_logprobs(16, num_logprobs, seed), np.arange(n))
         for seed, n in enumerate(real_rows)
     ]
-    out = spec_logprobs_lists(chunks, gen_lens=None)
+    out = logprobs_lists(chunks, gen_lens=None)
     _assert_same_logprobs_lists(
         out,
         _blocking_logprobs_lists([(c.tensors, len(c.row_starts)) for c in chunks]),
@@ -288,7 +286,7 @@ def test_get_output_attaches_plain_logprobs():
         chunk_real_lens=[3],
         copy_ready_event=None,
         completed=True,
-        spec_logprobs=[SpecLogprobsChunk(logprobs, np.arange(3))],
+        logprobs=[LogprobsChunk(logprobs, np.arange(3))],
     )
     out = AsyncTPUModelRunnerOutput(
         model_runner_output=ModelRunnerOutput(
@@ -305,22 +303,22 @@ def test_get_output_attaches_plain_logprobs():
 
 
 @pytest.mark.parametrize(
-    "num_rows, spec_logprobs",
+    "num_rows, logprobs",
     [
         (2, None),
         # No real rows: get_output returns before it assembles logprobs.
-        (0, [SpecLogprobsChunk(_bucketed_logprobs(4, 0, 1), np.arange(0))]),
+        (0, [LogprobsChunk(_bucketed_logprobs(4, 0, 1), np.arange(0))]),
     ],
     ids=["no-logprobs-requested", "empty-output"],
 )
-def test_get_output_leaves_logprobs_none(num_rows, spec_logprobs):
+def test_get_output_leaves_logprobs_none(num_rows, logprobs):
     req_ids = ["a", "b"][:num_rows]
     copy_state = AsyncTPUCopyState(
         chunks_cpu=[torch.tensor([[1], [2], [0], [0]])],
         chunk_real_lens=[num_rows],
         copy_ready_event=None,
         completed=True,
-        spec_logprobs=spec_logprobs,
+        logprobs=logprobs,
     )
     out = AsyncTPUModelRunnerOutput(
         model_runner_output=ModelRunnerOutput(
@@ -341,11 +339,11 @@ def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
     tokens = [torch.zeros((8, 1), dtype=torch.int32)]
     device_logprobs = _bucketed_logprobs(8, 2, 3)
     state = AsyncTPUCopyState.from_device_chunks(
-        tokens, [5], spec_logprobs=[SpecLogprobsChunk(device_logprobs, np.arange(5))]
+        tokens, [5], logprobs=[LogprobsChunk(device_logprobs, np.arange(5))]
     )
     # The host copies ride the same async D2H as the sampled tokens; the
     # device sources stay alive until the copy event is waited on.
-    (host,) = state.spec_logprobs
+    (host,) = state.logprobs
     assert np.array_equal(host.row_starts, np.arange(5))
     assert torch.equal(host.tensors.logprobs, device_logprobs.logprobs)
     assert state._logprobs_tpu is not None
@@ -355,8 +353,8 @@ def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
     state.copy_ready_event.synchronize.assert_called_once_with()
     assert state._logprobs_tpu is None
     empty = AsyncTPUCopyState.from_device_chunks(tokens, [5])
-    assert empty.spec_logprobs is None and empty._logprobs_tpu is None
+    assert empty.logprobs is None and empty._logprobs_tpu is None
     # get_output needs one row start per real request in each chunk.
-    short = SpecLogprobsChunk(device_logprobs, np.arange(4))
+    short = LogprobsChunk(device_logprobs, np.arange(4))
     with pytest.raises(AssertionError):
-        AsyncTPUCopyState.from_device_chunks(tokens, [5], spec_logprobs=[short])
+        AsyncTPUCopyState.from_device_chunks(tokens, [5], logprobs=[short])

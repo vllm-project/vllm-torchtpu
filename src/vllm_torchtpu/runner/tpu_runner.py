@@ -204,7 +204,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
-    SpecLogprobsChunk,
+    LogprobsChunk,
 )
 from vllm_torchtpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
@@ -5403,7 +5403,7 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_offset = 0
         # Per-chunk logprobs, cut to each request's generated tokens once they
         # reach the host (AsyncTPUModelRunnerOutput.get_output).
-        spec_logprobs_chunks: list[SpecLogprobsChunk] = []
+        logprobs_chunks: list[LogprobsChunk] = []
 
         # True if the step has drafts to verify (a request carried drafts in
         # from the previous step). Not the same as self.speculative_config, the
@@ -5467,8 +5467,8 @@ class TPUModelRunner(GPUModelRunner):
                             md.draft_lengths,
                             md.final_logits_indices,
                         )
-                        spec_logprobs_chunks.append(
-                            SpecLogprobsChunk(
+                        logprobs_chunks.append(
+                            LogprobsChunk(
                                 tensors=self.gather_logprobs(logits, row_tokens),
                                 row_starts=np.concatenate(
                                     ([0], np.cumsum(md.draft_lengths_cpu + 1)[:-1])
@@ -5541,8 +5541,8 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(padded)
                     if needs_logprobs:
-                        spec_logprobs_chunks.append(
-                            SpecLogprobsChunk(
+                        logprobs_chunks.append(
+                            LogprobsChunk(
                                 tensors=self.gather_logprobs(logprob_logits, selected),
                                 row_starts=np.arange(num_reqs),
                             )
@@ -5612,8 +5612,8 @@ class TPUModelRunner(GPUModelRunner):
                 # due to recompilations outside torch.compiled code, so just make
                 # sure `sample_from_logits` does not modify the logits in-place.
                 if needs_logprobs:
-                    spec_logprobs_chunks.append(
-                        SpecLogprobsChunk(
+                    logprobs_chunks.append(
+                        LogprobsChunk(
                             tensors=self.gather_logprobs(
                                 logprob_logits, selected_token_ids
                             ),
@@ -5673,7 +5673,7 @@ class TPUModelRunner(GPUModelRunner):
                 copy_state = AsyncTPUCopyState.from_device_chunks(
                     combined_selected_tokens,
                     combined_selected_tokens_real_lens,
-                    spec_logprobs=spec_logprobs_chunks,
+                    logprobs=logprobs_chunks,
                 )
 
         if self.scheduler_config.async_scheduling:
