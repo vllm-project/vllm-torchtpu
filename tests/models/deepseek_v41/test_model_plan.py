@@ -43,6 +43,7 @@ CUSTOMER_CONFIGS = {
 # Profile -> the config it is written for.
 PROFILE_CONFIGS = {
     "dsv41-dp16-c768": CUSTOMER_CONFIGS["dp16_ep16_fused_ep"],
+    "dsv41-dp16-c768-forge": CUSTOMER_CONFIGS["dp16_ep16_fused_ep"],
 }
 
 

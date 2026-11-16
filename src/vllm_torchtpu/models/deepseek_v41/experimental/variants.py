@@ -16,6 +16,20 @@ def _fused_ep_with_ep(context: PlanContext) -> bool:
 
 
 EXPERIMENTAL_VARIANTS: dict[str, dict[str, Variant]] = {
+    "csa2_attention": {
+        # `tuned` with the two-slot SparseCore gather. The three-slot gather
+        # reads one zero row for every negative id, and those reads serialize:
+        # 65,536 padding ids take 2.7 ms against 0.06 ms here, and a DP rank
+        # padded to the 2048 bucket gathers 1M of them per KV-source layer.
+        "tuned_two_slot_gather": Variant(
+            params={
+                "deep_gather": False,
+                "blocked_rope_gather": True,
+                "qb_rope_exact_rows": True,
+            },
+            description="padded 2048-bucket gather 42.8 -> 1.0 ms per source layer",
+        ),
+    },
     "moe_kernel": {
         # Push-dispatch fused EP MoE (kernels/experimental/push_fused_moe),
         # tuned at DP16/EP16 C768 decode (#2839, #2876, LAND9). Each key is a
