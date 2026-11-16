@@ -105,14 +105,20 @@ def _kernel(
     srow_lead: int,
     mode: str,
     pair: bool,
+    deep: bool,
 ):
     D, HD = depth, head_dim
     E = srow_lead                    # tiles a slot-row copy starts ahead of its tile's refill
     reads, compute = mode in ("full", "reads"), mode in ("full", "compute")
     kv_bufs = scratch[:D]            # VMEM [TILE, 1, 4, hd] e4m3 each: one ring slot a buffer
     code_bufs = scratch[D:2 * D]     # VMEM int32[1, GPT] each
-    (kv_sem, srow_ref, srow_sem, qbuf, q_sem, obuf, o_sem, m_ref, l_ref, acc_ref, ctr_ref) = scratch[2 * D:]
-    lead = D - 1                     # tiles in flight ahead of the one being read
+    (kv_sem, srow_ref, srow_sem, qbuf, q_sem, obuf, o_sem, m_ref, l_ref, acc_ref, ctr_ref) = scratch[2 * D:2 * D + 11]
+    if deep:
+        # Tile t's scores, tile t - 1's softmax and tile t - 2's values a body: scores and probabilities by tile
+        # parity, each tile's state parity (2: a filler tile's, never read) in a ring of four.
+        s_buf, p_buf, a_buf, tpar_ref = scratch[2 * D + 11:]
+    # Tiles in flight ahead of the one being read (deep: tile t's slab is read until body t + 2).
+    lead = D - 3 if deep else D - 1
     ct_shift = _ilog2(ct)
     total = meta_ref[0]
 
@@ -294,6 +300,118 @@ def _kernel(
         def _():
             finish(q, p)
 
+    def flags(i):
+        """(real, union group, first, last) of tile i; tiles outside the step are fillers."""
+        real = (i >= 0) & (i < total)
+        rec = rec_of(i)
+        row = rec & ((1 << LAST_BIT) - 1)
+        last = (lax.shift_right_logical(rec, LAST_BIT) & 1) == 1
+        return real, row >> ct_shift, real & ((row & (ct - 1)) == 0), real & last
+
+    def deep_step(i, slot):
+        """Body i: tile i's scores, tile i - 1's online softmax, tile i - 2's values (each tile's work in one
+        body, the three chains independent), then tile i - 2's union group out if that was its last tile."""
+        real, q, first, _ = flags(i)
+
+        @pl.when(first)
+        def _():
+            ctr_ref[0] = ctr_ref[0] + 1
+            group_start(i, ctr_ref[0] & 1)
+
+        par = jnp.where(real, ctr_ref[0] & 1, 2)
+        tpar_ref[i & 3] = par
+        kv_wait(slot)
+        k = i + lead
+        ks = (slot + lead) % D
+        srow_copy(k, ks).wait()
+        kv_issue(k, ks)
+        srow_copy(k + E, (ks + E) % D).start()
+        bias = bias_of(slot)
+        for h in range(kv_heads):
+            kk, _ = head_kv(slot, h, True, False)
+            sc = lax.dot_general(queries(par & 1, h), kk, (((1,), (1,)), ((), ())),
+                                 preferred_element_type=jnp.float32)
+            if s_scale != 1.0:
+                sc = sc * s_scale
+            s_buf[(i & 1) * kv_heads + h] = sc + bias
+        j = i - 1
+        _, _, first_j, _ = flags(j)
+        par_j = tpar_ref[j & 3]
+        for h in range(kv_heads):
+            idx, sl = par_j * kv_heads + h, (j & 1) * kv_heads + h
+            sc = s_buf[sl]
+            m0 = jnp.where(first_j, MASKED, m_ref[idx])
+            m1 = jnp.maximum(m0, jnp.max(sc, axis=1, keepdims=True))
+            alpha = jnp.where(first_j, 0.0, jnp.exp(m0 - m1))
+            prob = jnp.exp(sc - m1)
+            l_ref[idx] = jnp.where(first_j, 0.0, l_ref[idx]) * alpha + jnp.sum(prob, axis=1, keepdims=True)
+            m_ref[idx] = m1
+            p_buf[sl] = prob.astype(jnp.bfloat16)
+            a_buf[sl] = alpha
+        k2 = i - 2
+        _, q2, _, last2 = flags(k2)
+        par_k = tpar_ref[k2 & 3]
+        for h in range(kv_heads):
+            _, v = head_kv((slot - 2) % D, h, False, True)
+            idx, sl = par_k * kv_heads + h, (k2 & 1) * kv_heads + h
+            acc_ref[idx] = acc_ref[idx] * a_buf[sl] + lax.dot_general(
+                p_buf[sl], v, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+
+        @pl.when(last2)
+        def _():
+            finish(q2, par_k)
+
+    def run_deep():
+        ctr_ref[0] = -1
+        ctr_ref[1] = 0
+        ctr_ref[2] = 0
+        for t in range(4):
+            tpar_ref[t] = 2
+        for p in range(3):
+            reset(p)
+        q_copy(row_of(0) >> ct_shift, 0).start()
+        for k in range(lead):
+            srow_copy(k, k % D).start()
+        for k in range(lead):
+            srow_copy(k, k).wait()
+            kv_issue(k, k)
+        for k in range(lead, lead + E):
+            srow_copy(k, k % D).start()
+        bodies = total + 2
+
+        def outer(o, carry):
+            for u in range(D):
+                i = o * D + u
+
+                @pl.when(i < bodies)
+                def _(i=i, u=u):
+                    deep_step(i, u)
+
+            return carry
+
+        lax.fori_loop(0, (bodies + D - 1) // D, outer, None)
+
+        def drain(k, carry):
+            kv_wait(k & (D - 1))
+            return carry
+
+        lax.fori_loop(bodies, bodies + lead, drain, None)
+
+        def drain_srow(k, carry):
+            pltpu.make_async_copy(rows_hbm.at[pl.ds(0, GPT)], srow_ref.at[pl.ds(0, GPT)],
+                                  srow_sem.at[k & (D - 1)]).wait()
+            return carry
+
+        lax.fori_loop(bodies + lead, bodies + lead + E, drain_srow, None)
+        for p in range(2):
+            @pl.when(ctr_ref[1 + p] == 1)
+            def _(p=p):
+                o_copy(0, p).wait()
+
+    if deep:
+        pl.when(total > 0)(run_deep)
+        return
+
     @pl.when(total > 0)
     def _():
         ctr_ref[0] = -1
@@ -342,7 +460,7 @@ def _kernel(
 
 def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=2, k_scale=1.0, v_scale=1.0,
                         depth=8, guard=True, f8dot=False, sm_scale=None, vmem_mib=56, srow_lead=None, mode="full",
-                        pair=False):
+                        pair=False, deep=False):
     """Ungated bf16 attention [R, heads, hd] of the aligned query rows over each union group's tables.
 
     ``query`` [R, heads, hd] (R a multiple of 16; union group q = rows [16 q, 16 q + 16)); ``rows``
@@ -352,6 +470,8 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
     ``srow_lead``: tiles a tile's slot-row copy (HBM to SMEM) starts ahead of its refill (default depth - 2).
     ``mode`` (timing diagnosis): "full"; "compute" (no KV copies: the units on whatever the ring holds); "reads"
     (the copies alone, no tile compute). ``pair``: two slots whose groups are pool-contiguous take one copy.
+    ``deep``: tile t's scores, tile t - 1's softmax and tile t - 2's values in one body (Compare's deep body), so
+    neither MXU dot of a body waits on the body's own softmax; same arithmetic as the plain body.
     """
     tokens, heads, hd = query.shape
     pages, page_size, head_axis, packing, dim = pool.shape
@@ -386,13 +506,15 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
 
     if mode not in ("full", "compute", "reads"):
         raise ValueError("mode: 'full', 'compute' or 'reads'")
-    srow_lead = depth - 2 if srow_lead is None else srow_lead
+    if deep and (mode != "full" or depth < 8):
+        raise ValueError("the deep body runs in full mode with a ring of at least 8")
+    srow_lead = (depth - 4 if deep else depth - 2) if srow_lead is None else srow_lead
     if not 1 <= srow_lead < depth:
         raise ValueError("srow_lead: from 1 to depth - 1")
     kernel = functools.partial(
         _kernel, depth=depth, ct=ct, kv_heads=kv_heads, hpk=hpk, head_dim=hd, q_scale=float(q_scale),
         s_scale=float(s_scale), v_scale=float(v_scale), guard=guard, f8dot=f8dot, srow_lead=srow_lead, mode=mode,
-        pair=pair)
+        pair=pair, deep=deep)
     scratch = [pltpu.VMEM((TILE, 1, 4, hd), pool.dtype) for _ in range(depth)]
     scratch += [pltpu.VMEM((1, GPT), jnp.int32) for _ in range(depth)]
     scratch += [
@@ -408,6 +530,13 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
         pltpu.VMEM((2 * kv_heads, M, hd), jnp.float32),
         pltpu.SMEM((4,), jnp.int32),
     ]
+    if deep:
+        # Three state parities (2: fillers'), the scores, probabilities and rescale factors of two tiles, and the
+        # state parity of the last four tiles.
+        scratch[-4:-1] = [pltpu.VMEM((3 * kv_heads, M, 1), jnp.float32), pltpu.VMEM((3 * kv_heads, M, 1), jnp.float32),
+                          pltpu.VMEM((3 * kv_heads, M, hd), jnp.float32)]
+        scratch += [pltpu.VMEM((2 * kv_heads, M, TILE), jnp.float32), pltpu.VMEM((2 * kv_heads, M, TILE), jnp.bfloat16),
+                    pltpu.VMEM((2 * kv_heads, M, 1), jnp.float32), pltpu.SMEM((4,), jnp.int32)]
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out = pl.pallas_call(
         kernel,
@@ -422,7 +551,7 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
             dimension_semantics=("arbitrary",), vmem_limit_bytes=vmem_mib * 1024**2, disable_bounds_checks=True),
         out_shape=jax.ShapeDtypeStruct((tokens, heads * hd), jnp.bfloat16),
         name=f"qsa_union_walk_cmp_t{T}_d{depth}" + ("_f8" if f8dot else "") + ("" if guard else "_ng")
-        + ("" if mode == "full" else f"_{mode}") + ("_pair" if pair else ""),
+        + ("" if mode == "full" else f"_{mode}") + ("_pair" if pair else "") + ("_deep" if deep else ""),
     )(
         rec,
         ntiles,
