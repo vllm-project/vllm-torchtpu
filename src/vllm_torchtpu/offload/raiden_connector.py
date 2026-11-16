@@ -110,6 +110,10 @@ logger = init_logger(__name__)
 # How long poll_and_complete_transfers waits for a pending host-tier load when
 # a request is blocked on one (at least 5 ms when nothing else is running).
 _LOAD_WAIT_MS = 1.5
+# How long estimate_external_hit_tokens reuses a request's answer while the
+# request's block hashes and local hit stay the same. The prefix-aware waiting
+# sort asks for every request in its window on every step.
+_EXTERNAL_HIT_ESTIMATE_TTL_S = 0.25
 
 
 def _connector_option(extra_config: Mapping[str, Any], key: str, default: Any) -> Any:
@@ -247,6 +251,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     # Option host_tier_recency (see _connector_option); off unless configured.
     _host_tier_recency: bool = False
+    # request id -> (number of block hashes, chunk-aligned local hit, time,
+    # host-tier tokens) of the last estimate_external_hit_tokens answer.
+    _external_hit_estimates: dict[str, tuple[int, int, float, int]] | None = None
 
     def __init__(
         self,
@@ -789,6 +796,74 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if orig_partial is not None:
                     tracker.record_partial_lookup = orig_partial
 
+    def estimate_external_hit_tokens(
+        self, request: Request, num_local_tokens: int
+    ) -> int:
+        """Host-tier tokens past ``num_local_tokens`` that a lookup would load.
+
+        ``PrefixAwareScheduler._external_warmth`` asks this for the waiting
+        sort, the warmest-first promotion and the pipeline scheduler's
+        pending-work estimate. Without an answer, a request whose prefix is in
+        the host tier but no longer in HBM is ranked as a cold prompt and waits
+        behind cheaper work while its host-tier entries age towards eviction.
+
+        The probe changes nothing: lookups take no pin and refresh no recency,
+        no lookup event is emitted, and the lookup state the probe moves is
+        restored. It answers 0 for a request the connector does not track, one
+        with a transfer in flight, one that skips the prefix cache, or one with
+        less than a hash block past its local hit. An answer is reused for
+        ``_EXTERNAL_HIT_ESTIMATE_TTL_S`` while the request's block hashes and
+        chunk-aligned local hit are unchanged.
+        """
+        if getattr(request, "skip_reading_prefix_cache", False):
+            return 0
+        if not self.config.kv_group_configs:
+            return 0
+        tokens_per_chunk = self.config.kv_group_configs[0].tokens_per_chunk
+        if tokens_per_chunk <= 0:
+            return 0
+        aligned_local = round_down(max(0, int(num_local_tokens)), tokens_per_chunk)
+        if request.num_tokens - aligned_local < self.config.tokens_per_hash:
+            return 0
+        estimates = self._external_hit_estimates
+        if estimates is None:
+            estimates = self._external_hit_estimates = {}
+        req_id = request.request_id
+        num_hashes = len(request.block_hashes)
+        now = time.monotonic()
+        cached = estimates.get(req_id)
+        if (
+            cached is not None
+            and cached[0] == num_hashes
+            and cached[1] == aligned_local
+            and now - cached[2] < _EXTERNAL_HIT_ESTIMATE_TTL_S
+        ):
+            return max(0, aligned_local + cached[3] - num_local_tokens)
+        req_status = self._req_status.get(req_id)
+        if req_status is None or req_status.transfer_jobs:
+            return 0
+        req_status.update_offload_keys()
+        orig_local = req_status.num_locally_computed_tokens
+        orig_partial = req_status.partial_tail_boundary
+        try:
+            # Callers outside schedule()'s step region hold the manager for the
+            # probe; inside it the region already holds it.
+            if self._step_region is None:
+                with self._manager_locked():
+                    ext = self._quiet_lookup(req_status, aligned_local)
+            else:
+                ext = self._quiet_lookup(req_status, aligned_local)
+        finally:
+            req_status.num_locally_computed_tokens = orig_local
+            req_status.partial_tail_boundary = orig_partial
+        ext_tokens = ext if ext is not None and ext > 0 else 0
+        if len(estimates) > 2 * len(self._req_status) + 64:
+            # Drop the answers of requests the connector no longer tracks.
+            for stale in [r for r in estimates if r not in self._req_status]:
+                del estimates[stale]
+        estimates[req_id] = (num_hashes, aligned_local, now, ext_tokens)
+        return max(0, aligned_local + ext_tokens - num_local_tokens)
+
     def resolve_divergent_local_hit_tokens(
         self,
         request: Request,
@@ -871,6 +946,15 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         return self.connector_scheduler.resolve_divergent_local_hit_tokens(
             request, num_local, num_reconciled, block_size
         )
+
+    def estimate_external_hit_tokens(
+        self, request: Request, num_local_tokens: int
+    ) -> int:
+        """The scheduler side's host-tier hit estimate; 0 on a worker."""
+        scheduler = self.connector_scheduler
+        if not isinstance(scheduler, TPURaidenOffloadingScheduler):
+            return 0
+        return scheduler.estimate_external_hit_tokens(request, num_local_tokens)
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
