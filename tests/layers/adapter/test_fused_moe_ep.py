@@ -19,6 +19,7 @@ it still refuses. None of this needs a TPU: the refusals are decided before any
 op is built, and the one path that does build stops at `_build_op`.
 """
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -220,6 +221,8 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
 ):
     from unittest.mock import Mock
 
+    import jax
+
     from vllm_torchtpu.kernels.fused_moe import v2
 
     monkeypatch.setattr(bridge, "_OPS", {})
@@ -258,9 +261,11 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
     assert len(closures) == 8
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
+    # The call reads the expert count off w1 to size the step's tile.
+    w1 = jax.ShapeDtypeStruct((4, 8, 32), jnp.float8_e4m3fn)
     operands = (
         x,
-        None,
+        w1,
         None,
         None,
         None,
@@ -377,12 +382,37 @@ def test_qwen_4096_bucket_is_not_refused_by_smem():
     assert _prebuild(layer, topk=10, node_tokens=32768) == "op"
 
 
-def test_fixed_smem_working_set_is_still_checked():
-    gather_bytes = token_gather_smem_bytes(bridge._TILE_M)
-    assert gather_bytes == 2048
+@pytest.mark.parametrize(
+    "taller,gather_bytes",
+    [
+        (None, 2048),  # the real gate, on a CPU host: no chip, so _TILE_M's
+        (False, 2048),
+        (True, 3072),  # a layer whose prefill steps take 256-row tiles
+    ],
+)
+def test_fixed_smem_working_set_is_still_checked(taller, gather_bytes):
+    """The token-gather windows are sized for the tile this layer's prefill
+    steps take, as taller_tile_applies decides it for the layer's expert."""
+    asked = []
+
+    def applies(*args, **kwargs):
+        asked.append(args)
+        return taller
+
+    tile = bridge._PREFILL_TILE_M if taller else bridge._TILE_M
+    assert token_gather_smem_bytes(tile) == gather_bytes
     needed = bridge._SMEM_OVERHEAD_BYTES + gather_bytes
-    assert _prebuild(_layer(), smem_bytes=needed) == "op"
-    assert _prebuild(_layer(), smem_bytes=needed - 1) is None
+    gate = (
+        patch.object(bridge, "taller_tile_applies", side_effect=applies)
+        if taller is not None
+        else contextlib.nullcontext()
+    )
+    with gate:
+        assert _prebuild(_layer(), smem_bytes=needed) == "op"
+        assert _prebuild(_layer(), smem_bytes=needed - 1) is None
+    if taller is not None:
+        # The layer's own expert: 4 local experts of 8 x 16, fp8 weights.
+        assert asked[0] == (4, 8, 16, "fp8", None)
 
 
 @pytest.mark.parametrize(
@@ -1286,3 +1316,117 @@ def test_fused_scale_buffers_are_fresh_bases_aliased_by_the_parameters():
         assert buf in dict(layer.named_buffers())
         assert isinstance(weight, torch.nn.Parameter) and not weight.requires_grad
         assert weight.shape == ref.shape and weight.data_ptr() == table.data_ptr()
+
+
+_TP_PAIRS = tuple((2 * i, 2 * i + 1) for i in range(16))
+
+
+@pytest.mark.parametrize(
+    "x_rows,groups,topk,e_total,want",
+    [
+        # Qwen3.8 (topk 10 of 512 experts) on DP16 x TP2 + EP32: every TP pair
+        # holds its engine's tokens twice, so the layer's step is half the
+        # input rows, and 8192 tokens fill each expert to 160 rows.
+        (32 * 1024, _TP_PAIRS, 10, 512, 256),  # 16384 tokens, 320 per expert
+        (32 * 512, _TP_PAIRS, 10, 512, 256),  # 8192 tokens, 160 per expert
+        (32 * 256, _TP_PAIRS, 10, 512, 128),  # 4096 tokens, 80 per expert
+        (32 * 93, _TP_PAIRS, 10, 512, 128),  # decode
+        # No replica groups: the input rows are the step.
+        (8192, None, 10, 512, 256),
+        (8184, None, 10, 512, 128),
+        # What counts is how full the experts are, not the token count: fewer,
+        # fuller experts get there sooner, and many small ones not at 16384.
+        (2560, None, 8, 128, 256),  # 160 per expert
+        (16384, None, 4, 1024, 128),  # 64 per expert
+    ],
+)
+def test_prefill_steps_take_the_taller_tile(x_rows, groups, topk, e_total, want):
+    """The tile height follows how many rows the step routes to each expert,
+    with the tokens counted after the replica split."""
+    rule = bridge.tile_rows_for_step
+    assert rule(x_rows, groups, topk, e_total, lambda: True) == want
+    assert rule(x_rows, groups, topk, e_total, lambda: False) == bridge._TILE_M
+
+
+@pytest.mark.parametrize(
+    "chip,expert,weight_format,taller",
+    [
+        # 192 MiB of VMEM: Qwen3.8's FP8 expert keeps its three weight slots
+        # (prefetch distance 2) at 256 rows.
+        ("TPU_8I", (16, 8192, 2048), "fp8", True),
+        # A wider expert drops to two slots at 256 rows.
+        ("TPU_8I", (16, 8192, 2304), "fp8", False),
+        # Fits at the same schedule, but the 256-row tile is not validated
+        # on FP4 weights.
+        ("TPU_8I", (48, 4096, 2048), "fp4", False),
+        # 64 MiB: Qwen3.8's 256-row build does not fit at all.
+        ("TPU_7X", (16, 8192, 2048), "fp8", False),
+        # Fits at the same schedule, but the chip is not one it is measured on.
+        ("TPU_7X", (16, 4096, 1024), "fp8", False),
+    ],
+)
+def test_taller_tile_only_where_validated_and_the_weight_schedule_holds(
+    chip, expert, weight_format, taller
+):
+    """A prefill step takes 256-row tiles only on a validated chip and weight
+    format, and only where they keep the weight slots."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
+    got = bridge.taller_tile_applies(*expert, weight_format, info=info)
+    assert got is taller
+    want = bridge._PREFILL_TILE_M if taller else bridge._TILE_M
+    assert bridge.tile_rows_for_step(16384, None, 10, 512, lambda: got) == want
+
+
+def test_decode_steps_never_ask_whether_the_taller_tile_fits():
+    def unexpected():
+        raise AssertionError("asked for a decode-sized step")
+
+    assert bridge.tile_rows_for_step(1488, None, 10, 512, unexpected) == bridge._TILE_M
+
+
+@pytest.mark.parametrize(
+    "x_rows,taller,want",
+    [
+        (32 * 512, True, 256),  # 160 rows per expert, and the gate agrees
+        (32 * 512, False, 128),  # the gate refuses this expert
+        (32 * 256, True, 128),  # 80 rows per expert: the gate is not asked
+    ],
+)
+def test_the_built_op_hands_the_kernel_the_step_tile(monkeypatch, x_rows, taller, want):
+    """The traced call checks the expert fused_ep_moe_v2 will see -- local
+    experts, hidden, inter from w1 [experts, hidden, 2 * inter] -- and passes
+    the kernel the tile height the step takes."""
+    from unittest.mock import Mock
+
+    import jax
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build(name, fn, **kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    asked = []
+
+    def applies(*args, **kwargs):
+        asked.append(args)
+        return taller
+
+    monkeypatch.setattr(bridge, "taller_tile_applies", applies)
+    # Qwen3.8 on DP16 x TP2 + EP32: 512 experts of 8192 x 2048, topk 10.
+    mesh = SimpleNamespace(shape={bridge.EP_AXIS_NAME: 32})
+    bridge._build_op(mesh, 10, True, "silu", None, True, token_replica_groups=_TP_PAIRS)
+    x = jax.ShapeDtypeStruct((x_rows, 8192), jnp.bfloat16)
+    w1 = jax.ShapeDtypeStruct((512, 8192, 2 * 2048), jnp.float8_e4m3fn)
+    rank = jnp.zeros((1, 1), dtype=jnp.int32)
+    closures[0](x, w1, None, None, None, jnp.zeros((1, 1)), rank)
+    assert kernel.call_args.kwargs["capacity"] == want
+    assert asked == ([(16, 8192, 2048, "fp8", None)] if x_rows == 32 * 512 else [])

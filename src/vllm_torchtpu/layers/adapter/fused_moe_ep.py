@@ -47,6 +47,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
 
@@ -71,10 +72,31 @@ from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
-# The tile height the kernel slabs rows into, and the unit its ragged stride
-# rounds to. The kernel's routing tables are built against this value, so it
-# is not free to change here alone.
+# The tile height the kernel slabs a step's rows into (and the unit its ragged
+# stride rounds to), unless the step is prefill-sized and takes
+# _PREFILL_TILE_M below.
 _TILE_M = 128
+# Prefill-sized steps slab their rows in taller tiles. A tile pays fixed costs
+# (the token-row wait, the commits and pushes, the epilogue, its scales) and
+# loads each weight block into the matrix unit once; at prefill an expert
+# holds hundreds of rows (the busiest shard's hot experts ~800 at 16k tokens),
+# so a taller tile pays those half as often, on the shard every other waits
+# for. What decides it is how full the experts are: a step takes the taller
+# tile from _PREFILL_TILE_MIN_ROWS_PER_EXPERT routed rows per expert on
+# average (tokens * topk / experts, the tokens counted after the replica
+# split). That is Qwen3.8's 8192-token step (topk 10 of 512 experts), the
+# smallest step the taller tile is measured at. Decode stays at _TILE_M: an
+# expert holds a few dozen rows there and the step is bound by streaming the
+# weights. A prefill step stays at _TILE_M too off the chips and weight
+# formats below, or where its taller build would lose weight slots or not
+# fit VMEM (taller_tile_applies).
+_PREFILL_TILE_M = 256
+_PREFILL_TILE_MIN_ROWS_PER_EXPERT = 160
+# Where the taller tile is validated: its speed is measured on TPU8i (Qwen3.8's
+# FP8 expert), and the kernel's 256-row tests use FP8 weights. Other chips and
+# formats keep _TILE_M until it is measured there; enabling one is an entry here.
+_PREFILL_TILE_CHIPS = frozenset({pltpu.ChipVersion.TPU_8I})
+_PREFILL_TILE_FORMATS = frozenset({"fp8"})
 
 # SMEM used by the resident routing tables and Mosaic's scalar working set,
 # excluding the two fixed token-gather windows. Measured by subtracting the
@@ -165,6 +187,62 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
+def tile_rows_for_step(x_rows, token_replica_groups, topk, e_total, taller_applies):
+    """The kernel's tile height for a step whose MoE input has `x_rows` rows.
+
+    The step is counted as the layer counts it, after the token replica split:
+    a group of TP ranks holds the same tokens, each its share once. A step
+    whose `topk` routes fill the `e_total` experts to
+    _PREFILL_TILE_MIN_ROWS_PER_EXPERT rows each on average is prefill-sized,
+    and takes the taller tile where `taller_applies()` says so (see
+    taller_tile_applies); it is asked only for prefill-sized steps.
+    """
+    width = len(token_replica_groups[0]) if token_replica_groups else 1
+    pairs = x_rows // width * topk
+    if pairs < _PREFILL_TILE_MIN_ROWS_PER_EXPERT * e_total or not taller_applies():
+        return _TILE_M
+    return _PREFILL_TILE_M
+
+
+def _tpu_info():
+    """This chip's record, or None outside a device process (a CPU host)."""
+    try:
+        return pltpu.get_tpu_info()
+    except Exception:  # noqa: BLE001 - CPU host, or an unknown device kind
+        return None
+
+
+def taller_tile_applies(
+    g_local, hidden, inter, weight_format, rhs_qb=None, *, info=None
+):
+    """Whether a prefill-sized step takes the _PREFILL_TILE_M build.
+
+    Only on a chip and weight format it is validated on, and only where the
+    taller build fits VMEM at the _TILE_M build's weight schedule: its
+    per-tile buffers grow with its height, and where they push the build past
+    VMEM, or force fewer weight slots (a shallower prefetch, or none), the
+    taller tile costs the weight streaming more than it saves in per-tile
+    overhead. On TPU8i (192 MiB) Qwen3.8's FP8 expert fits at both heights
+    with the same three slots.
+    """
+    from vllm_torchtpu.kernels.fused_moe.v2.host import WeightFormat, fit_weight_slots
+
+    weight_format = WeightFormat(weight_format)
+    info = info if info is not None else _tpu_info()
+    if (
+        weight_format.value not in _PREFILL_TILE_FORMATS
+        or info is None
+        or info.chip_version not in _PREFILL_TILE_CHIPS
+    ):
+        return False
+    kw = dict(weight_format=weight_format, info=info)
+    if rhs_qb is not None:
+        kw["rhs_qb"] = rhs_qb
+    short = fit_weight_slots(g_local, _TILE_M, hidden, inter, **kw)
+    tall = fit_weight_slots(g_local, _PREFILL_TILE_M, hidden, inter, **kw)
+    return tall.fits and (tall.distance, tall.nbuf) == (short.distance, short.nbuf)
+
+
 def _build_op(
     mesh,
     topk: int,
@@ -241,7 +319,21 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=_TILE_M,
+            capacity=tile_rows_for_step(
+                x.shape[0],
+                token_replica_groups,
+                topk,
+                w1.shape[0],
+                # The expert shape as fused_ep_moe_v2 reads it: x [T, hidden],
+                # w1 [experts, hidden, 2 * inter] (logical width).
+                lambda: taller_tile_applies(
+                    w1.shape[0] // mesh.shape[EP_AXIS_NAME],
+                    x.shape[1],
+                    w1.shape[2] // 2,
+                    weight_format,
+                    rhs_qb,
+                ),
+            ),
             block=None,
             ragged_stride=None,
             weight_format=WeightFormat(weight_format),
@@ -901,7 +993,37 @@ def prebuild_fused_moe_ep(
         ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
     )
 
-    gather_bytes = token_gather_smem_bytes(_TILE_M)
+    if weights is None:
+        if weight_format == "fp4":
+            weights = (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+            )
+        else:
+            weights = (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+            )
+    w1, w2, w1_scale, w2_scale = weights
+    local_experts, hidden = w1.shape[0], w1.shape[1]
+    # Torch stores two FP4 output elements per byte; JAX sees the logical
+    # width after the bridge converts the native FP4 tensor.
+    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
+
+    # A prefill-sized step of this layer takes the tile taller_tile_applies
+    # picks for this expert, the check the traced call makes; the token-gather
+    # windows are sized for it, so a layer that stays at _TILE_M keeps that
+    # footprint.
+    prefill_tile = (
+        _PREFILL_TILE_M
+        if taller_tile_applies(local_experts, hidden, inter, weight_format, rhs_qb)
+        else _TILE_M
+    )
+    gather_bytes = token_gather_smem_bytes(prefill_tile)
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
     smem = _smem_capacity_bytes()
     if needed_smem > smem:
@@ -924,27 +1046,6 @@ def prebuild_fused_moe_ep(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
     mesh_expert_order = _mesh_expert_order(ep)
-
-    if weights is None:
-        if weight_format == "fp4":
-            weights = (
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
-            )
-        else:
-            weights = (
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-            )
-    w1, w2, w1_scale, w2_scale = weights
-    local_experts, hidden = w1.shape[0], w1.shape[1]
-    # Torch stores two FP4 output elements per byte; JAX sees the logical
-    # width after the bridge converts the native FP4 tensor.
-    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
 
     # The threshold is applied here rather than per step: the op is shape
     # agnostic, so the only place a token count is known outside the traced
@@ -1023,9 +1124,9 @@ def prebuild_fused_moe_ep(
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
-        "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s",
+        "pcp=%d topk=%d capacity=%d prefill_capacity=%d sharded_plan=%s "
+        "format=%s rhs_qb=%s act=%s scoring=%s score_bias=%s hash_routing=%s "
+        "routed_scale=%s token_replica_groups=%s",
         hidden,
         inter,
         local_experts,
@@ -1033,6 +1134,7 @@ def prebuild_fused_moe_ep(
         pcp,
         topk,
         _TILE_M,
+        prefill_tile,
         sharded_plan,
         weight_format,
         rhs_qb,
@@ -1246,12 +1348,8 @@ def _max_node_tokens(ep: int, pcp: int = 1) -> int:
 
 def _smem_capacity_bytes() -> int:
     """This chip's scalar memory, or tpu7x's outside a device process."""
-    try:
-        from jax.experimental.pallas import tpu as pltpu
-
-        return int(pltpu.get_tpu_info().smem_capacity_bytes)
-    except Exception:  # noqa: BLE001 - CPU host, or an unknown device kind
-        return 1024 * 1024
+    info = _tpu_info()
+    return 1024 * 1024 if info is None else int(info.smem_capacity_bytes)
 
 
 def _pcp_size(layer) -> int:
