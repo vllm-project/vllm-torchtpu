@@ -26,7 +26,8 @@ PROFILES: dict[str, dict[str, str]] = {
         "expert_layout": "dp16_c768",
     },
     # dsv41-dp16-c768 with experimental variants under test; it differs only
-    # in the slots that name one (csa2_attention: two-slot SparseCore gather).
+    # in the slots that name one (csa2_attention: two-slot SparseCore gather;
+    # moe_kernel: a shard's repeated tail rows route once).
     # Same config and additional_config.
     "dsv41-dp16-c768-forge": {
         "csa2_attention": "tuned_two_slot_gather",
@@ -37,7 +38,7 @@ PROFILES: dict[str, dict[str, str]] = {
         "dspark_draft": "tuned",
         "decode_step": "tuned",
         "host_gc": "tuned",
-        "moe_kernel": "push_fused_ep",
+        "moe_kernel": "push_fused_ep_repeated_tail",
         "expert_layout": "dp16_c768",
     },
 }

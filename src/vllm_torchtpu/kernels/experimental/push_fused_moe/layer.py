@@ -232,6 +232,25 @@ def _repeat_bits(bits, repeats):
     return word.reshape(n * repeats)[: n_in * repeats]
 
 
+def _repeated_tail_start(rows):
+    """Index of the first of the trailing rows that equal the last row.
+
+    `rows` are [t, ...] arrays read together: a row repeats the last one when
+    it matches it bit for bit in every array. 0 when every row matches.
+    """
+    t = rows[0].shape[0]
+    same = jnp.ones((t,), jnp.bool_)
+    for a in rows:
+        if jnp.issubdtype(a.dtype, jnp.floating):
+            a = lax.bitcast_convert_type(
+                a, jnp.dtype(f"int{jnp.dtype(a.dtype).itemsize * 8}")
+            )
+        a = a.reshape(t, -1)
+        same &= jnp.all(a == a[-1:], axis=1)
+    idx = lax.broadcasted_iota(jnp.int32, (t,), 0)
+    return jnp.max(jnp.where(same, -1, idx)) + 1
+
+
 _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
@@ -283,6 +302,7 @@ def fused_ep_moe_push(
     light_prepush=0,
     single_barrier=False,
     early_scale_scatter=0,
+    drop_repeated_tail=False,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -325,7 +345,12 @@ def fused_ep_moe_push(
     (plan_kernel._tables); `single_barrier` opens the expert kernel and the
     routing exchange with one barrier phase, not two; `early_scale_scatter`
     lets the scale-slab scatter run under the in-op shared expert (1: not
-    held behind it; 2: nor behind the SparseCore pre-push). The
+    held behind it; 2: nor behind the SparseCore pre-push);
+    `drop_repeated_tail` routes only the first of the trailing rows that
+    repeat this shard's last row bit for bit (x, gating, hash ids and a
+    per-row score bias) and copies its result onto the others, so a
+    bucket's padding rows, which are all alike, cost one row instead of
+    loading the experts they all select. The
     caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
@@ -598,8 +623,11 @@ def fused_ep_moe_push(
         q_l = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
         return gate_l, hash_l, q_l, row_scale_l
 
-    def select_local(gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l):
-        """v2's: top-k, router weights, and this shard's routing payload."""
+    def select_local(
+        gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l, keep=None
+    ):
+        """v2's: top-k, router weights, and this shard's routing payload;
+        rows where `keep` [rows, 1] is False route nowhere."""
         me = rank_l[0, 0]
         if row_bias:
             score_bias_l = token_layout.split(score_bias_l, me)
@@ -634,6 +662,8 @@ def fused_ep_moe_push(
         )
         # A row carrying no real score routes nowhere (see v2).
         row_routes = _row_routes(scores, gate_l)
+        if keep is not None:
+            row_routes &= keep
         if renormalize:
             denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
@@ -678,6 +708,7 @@ def fused_ep_moe_push(
         pre_tables=None,
         x_l=None,
         shared_l=None,
+        tail_start=None,
     ):
         """Dispatch tables, SparseCore pre-push, plan, kernel and combine.
 
@@ -964,6 +995,11 @@ def fused_ep_moe_push(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if tail_start is not None:
+            # The dropped repeats of the tail's first row take its result.
+            first = lax.dynamic_slice_in_dim(combined, tail_start, 1, axis=0)
+            rows = lax.broadcasted_iota(jnp.int32, (t_local, 1), 0)
+            combined = jnp.where(rows > tail_start, first, combined)
         out = token_layout.restore(combined, ax)
         outs = (out,) + (() if updated_load is None else (updated_load,))
         outs += tuple(shared_out)
@@ -983,8 +1019,18 @@ def fused_ep_moe_push(
             bias_it,
         ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
+        tail_start = keep = None
+        if drop_repeated_tail:
+            me = rank_l[0, 0]
+            row_inputs = [token_layout.split(x_l, me), gate_l]
+            if hash_l is not None:
+                row_inputs.append(hash_l)
+            if row_bias:
+                row_inputs.append(token_layout.split(score_bias_l, me))
+            tail_start = _repeated_tail_start(row_inputs)
+            keep = lax.broadcasted_iota(jnp.int32, (t_local, 1), 0) <= tail_start
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
-            gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
+            gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l, keep
         )
         pre_tables = None
         my_counts = block_hist.sum(axis=0)
@@ -1056,6 +1102,7 @@ def fused_ep_moe_push(
             pre_tables,
             x_l,
             shared_l,
+            tail_start,
         )
 
     bias_args = tuple(b for b in (w1_bias, w2_bias) if b is not None)
@@ -1144,6 +1191,7 @@ def fused_ep_moe_push(
         int(light_prepush),
         bool(single_barrier),
         int(early_scale_scatter),
+        bool(drop_repeated_tail),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
