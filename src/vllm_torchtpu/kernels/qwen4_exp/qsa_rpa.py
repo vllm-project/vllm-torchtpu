@@ -804,9 +804,43 @@ def _prefill_attention(
     kv_head_offset=0,
     dcp=None,
     return_lse=False,
+    compare=True,
 ):
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
-    ``block_sparse_gqa_attention``)."""
+    ``block_sparse_gqa_attention``). ``compare=False`` skips the compare core
+    (its own fallback: the flag-off call)."""
+    if (
+        compare
+        and envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE
+        and dcp is None
+        and not return_lse
+        and kv_head_offset == 0
+        and ratio == 4
+        and cache.dtype == jnp.float8_e4m3fn
+        and cache.shape[1] % 128 == 0
+        and tuple(cache.shape[2:]) == (1, 4, 256)
+        and query.shape[1:] == (24, 256)
+        and kv_heads == 2
+        and query.shape[0] % 16 == 0
+        and query.shape[0] >= 1024
+    ):
+        from vllm_torchtpu.kernels.qwen4_exp.qsa_compare_core import compare_core_prefill
+
+        def fallback():
+            output, _ = _prefill_attention(
+                query, gate, blocks, lengths, table, cache, starts, kv_heads=kv_heads, ratio=ratio,
+                k_scale=k_scale, v_scale=v_scale, compare=False,
+            )
+            return output
+
+        return compare_core_prefill(
+            query, gate, blocks, lengths, table, cache, starts, kv_heads=kv_heads, ratio=ratio,
+            k_scale=k_scale, v_scale=v_scale, union_cap=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP,
+            min_context=envs.VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT, fallback=fallback,
+            depth=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH,
+            bitset="sparsecore" if envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET else "tensorcore",
+            lister=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES,
+        )
     union_group = envs.VLLM_TPU_QSA_PREFILL_UNION_WALK
     if union_group and (128 % union_group or union_group < 8):
         raise ValueError("VLLM_TPU_QSA_PREFILL_UNION_WALK must be a divisor of 128, at least 8")

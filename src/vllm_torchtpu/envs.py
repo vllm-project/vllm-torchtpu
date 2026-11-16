@@ -187,6 +187,10 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE: bool = False
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP: int = 2048
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH: int = 8
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES: str = "sparsecore"
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
@@ -1053,6 +1057,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # COMPACT_COPY: how the compact pool is copied ("vmem": whole pages staged through VMEM by DMA; "pipe": a Pallas
     # pipeline copying 32-bit words; "dma": HBM-to-HBM DMAs, slow on TPU per i2b j-950efc5d). All byte-exact.
     "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY": env_str("VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY", "vmem"),
+    # COMPARE_CORE: the QSA prefill attention of the union walk's eligible steps through
+    # qsa_compare_core (16-row union groups, one flat tile list over all of them, 512-token tiles of
+    # 4-token copies from the served pool; default off). It takes the union walk's static guard
+    # (Q24/KV2/D256, FP8 pool of 128-aligned pages, no DCP, offset or LSE, at least 1024 rows) with
+    # rows a multiple of 16, and falls back to the call the flag-off path makes when the longest row is
+    # below VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT or a union group's union passes CAP 4-token groups
+    # (a multiple of 128 whose 128-slot tiles are a power of two). DEPTH: tiles in flight (a power of
+    # two). TABLES: the union list and row codes on the "sparsecore" (with the bitset there under
+    # VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET) or by the XLA "reference". Not bitwise against the served
+    # kernels (bf16 probabilities, union-order accumulation).
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE": env_bool("VLLM_TPU_QSA_PREFILL_COMPARE_CORE"),
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", 2048),
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH", 8),
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES": env_str("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES", "sparsecore"),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.
