@@ -11,7 +11,8 @@ BENCH=script; the block exports the served prefill QSA env).
   max |out - ref| / mean |ref| at most 0.08 (Compare's max_rel), every value finite. The port against the served
   output is printed: both are bf16, so one output ulp at the largest values already gives ~0.09 there.
 - Timing (printed, not gated): each path's call, the tables, and the kernel in full, without its KV copies
-  (compute), with its copies alone (reads), and with the slot rows staged one tile ahead (lead1).
+  (compute), with its copies alone (reads), with the slot rows staged one tile ahead (lead1), and with
+  pool-contiguous slot pairs as one copy (pair, pair_reads).
 
 Selections follow the recorded ones (s10623 L39: 513 groups a row in ~335 runs; two rows 16 apart share ~105):
 each row keeps its 32 most recent complete groups and its predecessor's other groups but ~49, which it replaces by
@@ -244,7 +245,7 @@ def test_numerics_and_time_against_served(monkeypatch, name, reqs, tokens, page)
     tiles = int(np.sum(np.where(u > 0, -(-np.minimum(u, cap) // cc.GPT), 0)))
     modes = {}
     for label, kw in (("full", {}), ("compute", dict(mode="compute")), ("reads", dict(mode="reads")),
-                      ("lead1", dict(srow_lead=1))):
+                      ("lead1", dict(srow_lead=1)), ("pair", dict(pair=True)), ("pair_reads", dict(pair=True, mode="reads"))):
         fn = jax.jit(lambda q, r, c, us, p, kw=kw: cc.compare_core_kernel(q, r, c, us, p, union_cap=cap,
                                                                           depth=depth, **kw))
         modes[label] = _median_ms(fn, kargs)

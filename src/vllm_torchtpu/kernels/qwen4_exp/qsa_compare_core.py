@@ -104,6 +104,7 @@ def _kernel(
     f8dot: bool,
     srow_lead: int,
     mode: str,
+    pair: bool,
 ):
     D, HD = depth, head_dim
     E = srow_lead                    # tiles a slot-row copy starts ahead of its tile's refill
@@ -140,12 +141,28 @@ def _kernel(
         if not reads:
             return
         buf = kv_bufs[slot]
-        for j in range(GPT):
-            pltpu.make_async_copy(
-                cache_hbm.at[pl.ds(srow_ref[slot * GPT + j], RATIO)],
-                buf.at[pl.ds(j * RATIO, RATIO)],
-                kv_sem.at[slot],
-            ).start()
+
+        def copy(src, j, n):
+            pltpu.make_async_copy(cache_hbm.at[pl.ds(src, n * RATIO)], buf.at[pl.ds(j * RATIO, n * RATIO)],
+                                  kv_sem.at[slot]).start()
+
+        if pair:
+            # Two slots whose groups are pool-contiguous move as one 8-token copy; the tile's byte count is the same.
+            for j in range(0, GPT, 2):
+                a, b = srow_ref[slot * GPT + j], srow_ref[slot * GPT + j + 1]
+                joined = b == a + RATIO
+
+                @pl.when(joined)
+                def _(a=a, j=j):
+                    copy(a, j, 2)
+
+                @pl.when(~joined)
+                def _(a=a, b=b, j=j):
+                    copy(a, j, 1)
+                    copy(b, j + 1, 1)
+        else:
+            for j in range(GPT):
+                copy(srow_ref[slot * GPT + j], j, 1)
         pltpu.make_async_copy(codes_hbm.at[pl.ds(row_of(k), 1)], code_bufs[slot], kv_sem.at[slot]).start()
 
     def q_copy(q, qs):
@@ -324,7 +341,8 @@ def _kernel(
 
 
 def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=2, k_scale=1.0, v_scale=1.0,
-                        depth=8, guard=True, f8dot=False, sm_scale=None, vmem_mib=56, srow_lead=None, mode="full"):
+                        depth=8, guard=True, f8dot=False, sm_scale=None, vmem_mib=56, srow_lead=None, mode="full",
+                        pair=False):
     """Ungated bf16 attention [R, heads, hd] of the aligned query rows over each union group's tables.
 
     ``query`` [R, heads, hd] (R a multiple of 16; union group q = rows [16 q, 16 q + 16)); ``rows``
@@ -333,7 +351,7 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
     ``union_cap``, the caller's fallback holds the rest). Rows of union groups with no slot are not written.
     ``srow_lead``: tiles a tile's slot-row copy (HBM to SMEM) starts ahead of its refill (default depth - 2).
     ``mode`` (timing diagnosis): "full"; "compute" (no KV copies: the units on whatever the ring holds); "reads"
-    (the copies alone, no tile compute).
+    (the copies alone, no tile compute). ``pair``: two slots whose groups are pool-contiguous take one copy.
     """
     tokens, heads, hd = query.shape
     pages, page_size, head_axis, packing, dim = pool.shape
@@ -373,7 +391,8 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
         raise ValueError("srow_lead: from 1 to depth - 1")
     kernel = functools.partial(
         _kernel, depth=depth, ct=ct, kv_heads=kv_heads, hpk=hpk, head_dim=hd, q_scale=float(q_scale),
-        s_scale=float(s_scale), v_scale=float(v_scale), guard=guard, f8dot=f8dot, srow_lead=srow_lead, mode=mode)
+        s_scale=float(s_scale), v_scale=float(v_scale), guard=guard, f8dot=f8dot, srow_lead=srow_lead, mode=mode,
+        pair=pair)
     scratch = [pltpu.VMEM((TILE, 1, 4, hd), pool.dtype) for _ in range(depth)]
     scratch += [pltpu.VMEM((1, GPT), jnp.int32) for _ in range(depth)]
     scratch += [
@@ -403,7 +422,7 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
             dimension_semantics=("arbitrary",), vmem_limit_bytes=vmem_mib * 1024**2, disable_bounds_checks=True),
         out_shape=jax.ShapeDtypeStruct((tokens, heads * hd), jnp.bfloat16),
         name=f"qsa_union_walk_cmp_t{T}_d{depth}" + ("_f8" if f8dot else "") + ("" if guard else "_ng")
-        + ("" if mode == "full" else f"_{mode}"),
+        + ("" if mode == "full" else f"_{mode}") + ("_pair" if pair else ""),
     )(
         rec,
         ntiles,
