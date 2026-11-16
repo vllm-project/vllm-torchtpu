@@ -31,6 +31,7 @@ from ...decls import (
 )
 from ...errors import MegakernelConfigError
 from ...ops import BF16, F32, FP8
+from ..swiglu import SwiGLU
 from .params import validate_moe_geometry
 
 MOE_WEIGHT_NAMES: tuple[str, ...] = ("sh13", "sh2", "e13", "e2")
@@ -188,55 +189,11 @@ def moe_hf_params(
     sh2_fp8 = w_dt["sh2"] == "fp8"
     e13_fp8 = w_dt["e13"] == "fp8"
     e2_fp8 = w_dt["e2"] == "fp8"
-    sh13_dt = FP8 if sh13_fp8 else BF16
-    sh2_dt = FP8 if sh2_fp8 else BF16
     e13_dt = FP8 if e13_fp8 else BF16
     e2_dt = FP8 if e2_fp8 else BF16
 
     def _n(canon: str) -> str:
         return rename.get(canon, canon)
-
-    def _sh_gu_pair(
-        canon: str, hf_stem: str, order: int, aliases: tuple[VLLMAlias, ...] = ()
-    ) -> list[HFParamDecl]:
-        w_n, s_n = _n(canon), _n(f"{canon}_s")
-        out = [
-            HFParamDecl(
-                name=w_n,
-                hf_name=f"{p}shared_expert.{hf_stem}.weight",
-                shape=(H, IS),
-                hf_shape=(IS, H),
-                dtype=sh13_dt,
-                transform=ParamTransform(
-                    fuse_into="sh13",
-                    fuse_order=order,
-                    fuse_axis=-1,
-                    transpose=(1, 0),
-                    quantize="fp8" if sh13_fp8 else None,
-                    shard_axis=-1,
-                ),
-                vllm_aliases=aliases,
-            ),
-        ]
-        if sh13_fp8:
-            out.append(
-                HFParamDecl(
-                    name=s_n,
-                    hf_name=f"{p}shared_expert.{hf_stem}.weight_scale_inv",
-                    shape=(IS,),
-                    hf_shape=(IS,),
-                    dtype=F32,
-                    transform=ParamTransform(
-                        fuse_into="sh13_s",
-                        fuse_order=order,
-                        fuse_axis=-1,
-                        scale_for=w_n,
-                        shard_axis=-1,
-                        small_field="sh13_s",
-                    ),
-                )
-            )
-        return out
 
     def _exp_gu_pair(
         canon: str, hf_stem: str, order: int, aliases: tuple[VLLMAlias, ...] = ()
@@ -340,20 +297,6 @@ def moe_hf_params(
             init=ParamInit(mean=0.0, std=0.1),
         ),
     ]
-    sh_gu_alias = (
-        VLLMAlias(
-            source=f"{p}shared_expert.gate_up_proj",
-            targets=(_n("sh_gate_proj"), _n("sh_up_proj")),
-            scale_targets=(
-                (_n("sh_gate_proj_s"), _n("sh_up_proj_s")) if sh13_fp8 else ()
-            ),
-            scale_source=f"{p}shared_expert.gate_up_proj.weight_scale",
-            shard_axis=-1,
-            already_sharded=True,
-            already_fp8=True,
-            flipped=True,
-        ),
-    )
     e13_alias = (
         VLLMAlias(
             source=f"{p}experts.w13_weight",
@@ -367,61 +310,26 @@ def moe_hf_params(
         ),
     )
     decls.extend(
-        [
-            *_sh_gu_pair("sh_gate_proj", "gate_proj", 0, sh_gu_alias),
-            *_sh_gu_pair("sh_up_proj", "up_proj", 1),
-            HFParamDecl(
-                name=_n("sh2"),
-                hf_name=f"{p}shared_expert.down_proj.weight",
-                shape=(IS, H),
-                hf_shape=(H, IS),
-                dtype=sh2_dt,
-                transform=ParamTransform(
-                    transpose=(1, 0),
-                    quantize="fp8" if sh2_fp8 else None,
+        SwiGLU("sh13", "sh2", sh13_fp8, sh2_fp8).hf_params(
+            _n,
+            f"{p}shared_expert.",
+            H,
+            IS,
+            canon="sh_",
+            down_aliases=(
+                VLLMAlias(
+                    source=f"{p}_fused_se_down_fp8_weight",
+                    targets=(_n("sh2"),),
+                    scale_targets=(_n("sh2_s"),) if sh2_fp8 else (),
+                    scale_source=f"{p}_fused_se_down_fp8_scale",
                     shard_axis=0,
-                ),
-                vllm_aliases=(
-                    VLLMAlias(
-                        source=f"{p}_fused_se_down_fp8_weight",
-                        targets=(_n("sh2"),),
-                        scale_targets=(_n("sh2_s"),) if sh2_fp8 else (),
-                        scale_source=f"{p}_fused_se_down_fp8_scale",
-                        shard_axis=0,
-                        already_sharded=False,
-                        already_fp8=True,
-                        flipped=True,
-                    ),
-                    VLLMAlias(
-                        source=f"{p}shared_expert.down_proj",
-                        targets=(_n("sh2"),),
-                        scale_targets=(_n("sh2_s"),) if sh2_fp8 else (),
-                        scale_source=f"{p}shared_expert.down_proj.weight_scale",
-                        shard_axis=0,
-                        already_sharded=True,
-                        already_fp8=True,
-                        flipped=True,
-                    ),
+                    already_sharded=False,
+                    already_fp8=True,
+                    flipped=True,
                 ),
             ),
-        ]
-    )
-    if sh2_fp8:
-        decls.append(
-            HFParamDecl(
-                name=_n("sh2_s"),
-                hf_name=f"{p}shared_expert.down_proj.weight_scale_inv",
-                shape=(H,),
-                hf_shape=(H,),
-                dtype=F32,
-                transform=ParamTransform(
-                    scale_for=_n("sh2"),
-                    shard_axis=None,
-                    replicate_ranks=True,
-                    small_field="sh2_s",
-                ),
-            )
         )
+    )
     decls.extend(
         [
             *_exp_gu_pair("e_gate_proj", "gate_proj", 0, e13_alias),

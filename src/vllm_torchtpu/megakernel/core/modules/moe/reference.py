@@ -26,6 +26,7 @@ from ...decls import ResolvedModuleGeometry
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, FP8, round_bf16
+from ..swiglu import swiglu_reference
 from .params import MoEDebug, validate_moe_geometry
 
 
@@ -218,22 +219,14 @@ def moe_reference(
     for r in range(R):
         sh_gate = sh_gate_l[r]
         sg = jax.nn.sigmoid(jnp.sum(x_moe * sh_gate[None, :], axis=-1, keepdims=True))
-        w_sh13 = sh13_l[r].astype(F32)
-        g13 = (
-            (xb_moe @ w_sh13) * sh13_s_l[r]
-            if sh13_s_l is not None
-            else (xb_moe @ w_sh13)
+        ysh = swiglu_reference(
+            xb_moe,
+            sh13_l[r],
+            sh2_l[r],
+            ISR,
+            None if sh13_s_l is None else sh13_s_l[r],
+            None if sh2_s_l is None else sh2_s_l[r],
         )
-        mid_sh = (
-            round_bf16(
-                round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
-                * round_bf16(g13[:, ISR:])
-            )
-            .astype(BF16)
-            .astype(F32)
-        )
-        w_sh2 = sh2_l[r].astype(F32)
-        ysh = (mid_sh @ w_sh2) * sh2_s_l[r] if sh2_s_l is not None else (mid_sh @ w_sh2)
         part_r = ysh * sg
 
         e13_l = e13_l_all[r]

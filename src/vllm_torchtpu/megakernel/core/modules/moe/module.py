@@ -35,8 +35,9 @@ from ...decls import (
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...module import Module
-from ...ops import BF16, F32, FP8, I32, round_bf16, round_up
+from ...ops import BF16, F32, FP8, I32, round_up
 from ...spec import ExtraInput, SmallField, WeightDecl
+from ..swiglu import SwiGLU
 from .context import MoEEmit
 from .decls import (
     MOE_FIELD_ALIASES,
@@ -111,6 +112,11 @@ class MoEModule(Module):
             opts["weight_dtypes"] = self.weight_dtypes
         self.options = FrozenDict(opts)
 
+    @property
+    def _shared(self) -> SwiGLU:
+        w_dt = self.weight_dtypes
+        return SwiGLU("sh13", "sh2", w_dt["sh13"] == "fp8", w_dt["sh2"] == "fp8")
+
     def _check_option_consistency(self, g: Any) -> tuple[bool, int]:
         g_tp = getattr(g, "moe_tp", None)
         if (
@@ -174,14 +180,11 @@ class MoEModule(Module):
         ir = g.I // ex.R if moe_tp else g.I
         ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
         layout_e = "stacked" if ex.stack_e else "per_layer"
-        sh13_dt = FP8 if self.weight_dtypes["sh13"] == "fp8" else BF16
-        sh2_dt = FP8 if self.weight_dtypes["sh2"] == "fp8" else BF16
         e13_dt = FP8 if self.weight_dtypes["e13"] == "fp8" else BF16
         e2_dt = FP8 if self.weight_dtypes["e2"] == "fp8" else BF16
         w_list = [
             WeightDecl("router", K=g.H, N=g.E, dtype=BF16, stream_ring="static"),
-            WeightDecl("sh13", K=g.H, N=2 * isr, dtype=sh13_dt, stream_ring="static"),
-            WeightDecl("sh2", K=isr, N=g.H, dtype=sh2_dt, stream_ring="static"),
+            *self._shared.weights(g.H, isr),
             WeightDecl(
                 "e13",
                 K=g.H,
@@ -219,12 +222,11 @@ class MoEModule(Module):
         moe_tp, e_slots = self._check_option_consistency(g)
         er = g.E // ex.R
         isr = g.IS // ex.R
-        fields = [SmallField("post_norm", g.H)]
-        if self.weight_dtypes["sh13"] == "fp8":
-            fields.append(SmallField("sh13_s", 2 * isr))
-        if self.weight_dtypes["sh2"] == "fp8":
-            fields.append(SmallField("sh2_s", g.H))
-        fields.append(SmallField("sh_gate", g.H))
+        fields = [
+            SmallField("post_norm", g.H),
+            *self._shared.smalls(g.H, isr),
+            SmallField("sh_gate", g.H),
+        ]
         if not moe_tp and e_slots > er:
             fields.append(SmallField("ecopy", g.E))
         return fields
@@ -357,17 +359,8 @@ class MoEModule(Module):
             with sc("moe_route"):
                 n_hit = route(m, l, pexp)
             with sc("moe_shared"):
-                g13 = stream.dmatmul("sh13", scr["xb"], 2 * ISR)
-                if mp.sh13_scaled:
-                    g13 = g13 * ctx.sm(slot, "sh13_s")
-                mid = round_bf16(
-                    round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
-                    * round_bf16(g13[:, ISR:])
-                )
-                scr["xb2"][:, :ISR] = mid.astype(BF16)
-                ysh = stream.dmatmul("sh2", scr["xb2"], H)
-                if mp.sh2_scaled:
-                    ysh = ysh * ctx.sm(slot, "sh2_s")
+                shared = SwiGLU("sh13", "sh2", mp.sh13_scaled, mp.sh2_scaled)
+                ysh = shared.emit(ctx, slot, ISR, H)
                 scr["part"][...] = ysh * scr["sg"][:, 0:1]
             with sc("moe_experts"):
                 if PIPE:
