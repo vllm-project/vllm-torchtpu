@@ -278,6 +278,13 @@ class TestTPUMultiConnectorHybridHitForwarding:
             self._multi(SimpleNamespace()).estimate_external_hit_tokens("req", 256) == 0
         )
 
+    def test_external_hit_estimate_takes_the_largest_wherever_it_is(self):
+        small = SimpleNamespace(estimate_external_hit_tokens=lambda req, n: 64)
+        large = SimpleNamespace(estimate_external_hit_tokens=lambda req, n: 512)
+
+        assert self._multi(small, large).estimate_external_hit_tokens("req", 0) == 512
+        assert self._multi(large, small).estimate_external_hit_tokens("req", 0) == 512
+
     def test_transfer_polls_are_summed_across_children(self):
         scheduler = object()
         first = SimpleNamespace(
