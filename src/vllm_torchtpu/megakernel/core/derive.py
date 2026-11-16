@@ -24,6 +24,7 @@ from .errors import MegakernelConfigError
 from .geometry import ModelGeometry
 from .modules.gdn import GDNModule
 from .modules.gqa import GQAModule
+from .modules.mlp import DenseMLPModule
 from .modules.moe import MoEModule
 from .pool import PoolLayout
 from .schedule import (
@@ -75,7 +76,7 @@ def derive_model_geometry(
     moe_tp: bool | None = None,
     e_slots: int | None = None,
 ) -> ModelGeometry:
-    """Derive hybrid GQA/GDN + MoE `ModelGeometry` from `cls` and `hf_config`."""
+    """Derive GQA/GDN + MoE or dense-FFN `ModelGeometry` from `cls` and `hf_config`."""
     if isinstance(hf_config, ModelGeometry):
         rep: dict[str, Any] = {
             k: fn(v)
@@ -142,12 +143,11 @@ def derive_model_geometry(
         gdn_gate = str(top.get("gdn_gate", "silu"))
 
     moe_b = cls._find_binding(MoEModule, sched)
-    if moe_b is None:
-        raise MegakernelConfigError(f"ModelDef {mname!r} has no MoEModule in schedule")
-    exp_spec = moe_b.fields.get("experts", "num_experts")
-    exp_key = exp_spec[0] if isinstance(exp_spec, tuple) else exp_spec
-    if isinstance(exp_key, str):
-        raw_e = _lookup_raw_key(merged, exp_key)
+    moe_kw: dict[str, Any] = {"E": 0, "TOPK": 0, "I": 0, "IS": 0}
+    if moe_b is not None:
+        exp_spec = moe_b.fields.get("experts", "num_experts")
+        exp_key = exp_spec[0] if isinstance(exp_spec, tuple) else exp_spec
+        raw_e = _lookup_raw_key(merged, exp_key) if isinstance(exp_key, str) else 1
         if (
             raw_e is REQUIRED
             or raw_e is None
@@ -157,9 +157,15 @@ def derive_model_geometry(
                 f"{cls.__name__} supports MoE checkpoints only "
                 f"(missing or non-positive {exp_key!r})"
             )
-    moe_g = moe_b.resolve(merged)
-    eff_tp = bool(moe_g.moe_tp) if moe_tp is None else bool(moe_tp)
-    eff_slots = int(moe_g.e_slots) if e_slots is None else int(e_slots)
+        moe_g = moe_b.resolve(merged)
+        moe_kw = {k: int(getattr(moe_g, k)) for k in moe_kw}
+        moe_kw.update(moe_tp=bool(moe_g.moe_tp), e_slots=int(moe_g.e_slots))
+    if moe_tp is not None:
+        moe_kw["moe_tp"] = bool(moe_tp)
+    if e_slots is not None:
+        moe_kw["e_slots"] = int(e_slots)
+    mlp_b = cls._find_binding(DenseMLPModule, sched)
+    ff = int(mlp_b.resolve(merged).FF) if mlp_b is not None else 0
     zc = validate_norms(cls, sched, merged, eps, model_name=mname)
     g = cls.geometry_cls(
         L=L,
@@ -173,12 +179,8 @@ def derive_model_geometry(
         VH=VH,
         KD=KD,
         VD=VD,
-        E=int(moe_g.E),
-        TOPK=int(moe_g.TOPK),
-        I=int(moe_g.I),
-        IS=int(moe_g.IS),
-        moe_tp=eff_tp,
-        e_slots=eff_slots,
+        FF=ff,
+        **moe_kw,
         eps=eps,
         gdn_l2_eps=gdn_l2_eps,
         theta=theta,
@@ -245,14 +247,7 @@ def derive_model_spec(
                 f"cannot be represented in ModelSpec (expected {exp_desc})"
             )
     canon_ffn = next(
-        (
-            b
-            for i, b in enumerate(sched.ffn)
-            if "ffn" not in ovs.get(i, {})
-            and issubclass(_module_cls_of(b), MoEModule)
-            and getattr(_module_cls_of(b), "routed_experts", True)
-        ),
-        None,
+        (b for i, b in enumerate(sched.ffn) if "ffn" not in ovs.get(i, {})), None
     )
     for lyr, b in enumerate(sched.ffn):
         if canon_ffn is None or b != canon_ffn:
@@ -365,6 +360,7 @@ def hf_config_for_geometry(
         (cls._find_binding(GQAModule, sched), gqa_m),
         (gdn_b, gdn_m),
         (cls._find_binding(MoEModule, sched), {k: int(v) for k, v in moe_m.items()}),
+        (cls._find_binding(DenseMLPModule, sched), {"inter": int(g.FF)}),
     ):
         if b is not None:
             for canon, val in mapping.items():

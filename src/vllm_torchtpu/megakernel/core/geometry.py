@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Model-level `FromHF`, `LMHead`, and `ModelGeometry` for hybrid GQA/GDN + MoE."""
+"""Model-level `FromHF`, `LMHead`, and `ModelGeometry` (GQA/GDN + MoE or dense FFN)."""
 
 from __future__ import annotations
 
@@ -90,7 +90,11 @@ class FromHF:
 
 @dataclass(frozen=True)
 class ModelGeometry:
-    """Resolved hybrid attention / linear-attention (`GQA` + `GDN`) + `MoE` geometry."""
+    """Resolved attention / linear-attention (`GQA` + `GDN`) + FFN geometry.
+
+    `E == 0` means no `MoE` (`TOPK`, `I`, `IS` unused); `FF` is the dense FFN
+    intermediate size (0: no `DenseMLP`).
+    """
 
     L: int
     att_every: int
@@ -107,6 +111,7 @@ class ModelGeometry:
     TOPK: int
     I: int  # noqa: E741
     IS: int
+    FF: int = 0
     moe_tp: bool = True
     e_slots: int = 0
     eps: float = 1e-6
@@ -151,6 +156,9 @@ class ModelGeometry:
     def IR(self, R: int) -> int:
         return self.I // R if self.moe_tp else self.I
 
+    def FFR(self, R: int) -> int:
+        return self.FF // R
+
     def EW(self, R: int) -> int:
         return (
             self.e_slots
@@ -183,12 +191,12 @@ class ModelGeometry:
                 # Routing tables are sized from B and MR; the hard walls are the
                 # 128-lane rows-on-lanes top-k and hits table (TOPK <= 128) and
                 # the paged scatter's `page_size >= MR` (asserted there).
-                self.E % R == 0 and self.TOPK <= 128 and 1 <= B <= M <= MAX_BATCH_ROWS,
+                (self.E == 0 or (self.E % R == 0 and self.TOPK <= 128))
+                and 1 <= B <= M <= MAX_BATCH_ROWS,
                 f"Invalid E={self.E}, R={R}, B={B}, M={M}, TOPK={self.TOPK}",
             ),
             (
-                self.E % 128 == 0
-                and self.E <= 1024
+                (self.E == 0 or (self.E % 128 == 0 and self.E <= 1024))
                 and self.H % pc == 0
                 and self.nh(R) <= 8,
                 f"Invalid E={self.E}, H={self.H}, nh={self.nh(R)}",
@@ -216,7 +224,7 @@ class ModelGeometry:
                 f"Invalid paged_kv config: page_size={cx.page_size}, ctx={ex.ctx}, "
                 f"num_pages={cx.num_pages}, max_pages={resolved_max_pages_per_seq(ex)}"
             )
-        for n in (self.H, self.HD, self.IR(R), self.ISR(R)):
+        for n in (self.H, self.HD, self.IR(R), self.ISR(R), self.FFR(R)):
             if n % 128 != 0:
                 raise MegakernelConfigError(f"Dimension {n} must be a multiple of 128")
         if self.NGDN > 0:
@@ -286,8 +294,9 @@ class ModelGeometry:
             VH=vh,
             E=e_tiny,
             TOPK=min(self.TOPK, 4),
-            I=max(i_min, min(self.I, 512)),
-            IS=max(128 * R, min(self.IS, 512)),
+            I=max(i_min, min(self.I, 512)) if self.E else 0,
+            IS=max(128 * R, min(self.IS, 512)) if self.E else 0,
+            FF=max(128 * R, min(self.FF, 512)) if self.FF else 0,
             e_slots=e_slots,
         )
         for k, v in vars(self).items():

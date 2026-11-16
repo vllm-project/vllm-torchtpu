@@ -151,7 +151,7 @@ def composed_reference_step(
     paged_kv: bool | None = None,
     pool_io: bool = False,
 ) -> tuple[jax.Array, dict[str, Any]]:
-    """Execute hybrid GQA/GDN + MoE module `reference()` along `sched`."""
+    """Execute GQA/GDN + FFN module `reference()` along `sched`."""
     B, L = ex.B, g.L
     use_paged_kv = cache_exec(ex).paged_kv if paged_kv is None else bool(paged_kv)
     step_state, conv_in, rec_in, ngdn, vh, KD, VD = prepare_reference_step_state(

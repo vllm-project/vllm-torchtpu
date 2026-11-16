@@ -73,7 +73,7 @@ class _BoundFromHF:
 
 
 class ModelDef:
-    """Declarative model definition base class for the hybrid GQA/GDN + MoE family."""
+    """Declarative model definition base class for GQA/GDN + MoE or dense-FFN models."""
 
     name: ClassVar[str] = ""
     display_name: ClassVar[str] = ""

@@ -190,7 +190,7 @@ settings from `SPEC` before `create` runs; the checkpoint checks are
 
 1. Copy the folder with the scaffold (above) and keep its imports relative.
 2. `model.py`: describe the new architecture with the library's modules
-   (`GQA`, `GDN`, `MoE`, `Norm`, ...) and its geometry from the HF config.
+   (`GQA`, `GDN`, `MoE`, `DenseMLP`, `Norm`, ...) and its geometry from the HF config.
    Keep `register()`; register nothing at import time.
 3. `profiles/`: start from `baseline.py` (exact numerics), name the
    profiles after the model, and set `DEFAULT_PROFILE`.

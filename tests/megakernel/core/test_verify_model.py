@@ -113,6 +113,55 @@ class _SynthHybridModel(mk.ModelDef):
     lm_head = mk.LMHead("out_head")
 
 
+class _SynthDenseModel(mk.ModelDef):
+    """Dense (no MoE) `ModelDef`: GQA attention + `DenseMLP` SwiGLU FFN."""
+
+    name = "synth_dense"
+    hf_architectures = ("SynthDenseForCausalLM",)
+    hf_model_type = ("synth_dense",)
+    supported_tp_sizes = (2, 8)
+    default_hf_config = {
+        "architectures": ["SynthDenseForCausalLM"],
+        "model_type": "synth_dense",
+        "vocab_size": 256,
+        "hidden_size": 1024,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "rope_theta": 10000.0,
+        "rms_norm_eps": 1e-6,
+        "intermediate_size": 3072,
+    }
+    geometry = mk.FromHF(
+        hidden="hidden_size",
+        layers="num_hidden_layers",
+        vocab="vocab_size",
+        eps="rms_norm_eps",
+        rope_theta="rope_theta",
+    )
+    attn = mk.GQA.bind(
+        prefix="self_attn",
+        heads="num_attention_heads",
+        kv_heads="num_key_value_heads",
+        head_dim="head_dim",
+    )
+    mlp = mk.DenseMLP.bind(
+        prefix="mlp",
+        inter="intermediate_size",
+        weight_dtypes={"gate_up": "bf16", "down": "bf16"},
+    )
+    schedule = mk.Schedule(
+        mixer=attn,
+        ffn=mlp,
+        pre_norm=mk.Norm.bind("input_layernorm"),
+        post_norm=mk.Norm.bind("post_attention_layernorm"),
+    )
+    embed = mk.Embedding("model.embed_tokens")
+    final_norm = mk.Norm.bind("model.norm")
+    lm_head = mk.LMHead("lm_head")
+
+
 _SYNTH_BASELINE_TILES = mk.Tiles(vmem_mib=62).with_modules(
     {"gqa": {"kv_blk": 256, "nkv": 3}}
 )
@@ -387,6 +436,17 @@ def test_verify_model_synthetic_second_model_def():
         "rec_final_max_abs",
     ):
         assert k in kvr["PallasWriter_T2"], k
+
+
+@pytest.mark.slow
+def test_verify_model_dense_mlp_model_def():
+    """A dense `ModelDef` (no MoE binding) derives an `E == 0` geometry whose
+    shrunk HF config round-trips, and passes `verify_model`."""
+    g = _SynthDenseModel.shrink(R=2)
+    assert g.E == 0 and g.FF > 0
+    assert _SynthDenseModel.derive_geometry(_SynthDenseModel.shrink_hf_config(R=2)) == g
+    rep = mk.verify_model(_SynthDenseModel, approx_profiles=False, T_values=(1, 2))
+    rep.assert_passed(allow_skipped=False)
 
 
 @pytest.mark.slow

@@ -18,6 +18,7 @@ output roles and comparison modes, `ModelDef`-free verification input builders,
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import jax
@@ -523,6 +524,20 @@ def test_verify_module_builtin_gqa_and_gdn_pass():
     )
     assert res_gdn.passed is True, res_gdn
     assert {c.name: c.status for c in res_gdn.checks}["kernel_vs_reference"] == "passed"
+
+
+@pytest.mark.parametrize("w_dtype", ["bf16", "fp8"])
+def test_verify_module_builtin_dense_mlp_bit_exact(w_dtype: str):
+    """`DenseMLPModule` on a dense (E=0) geometry matches its reference bit for
+    bit; FF=256 keeps each weight one K tile, so both sum in the same order."""
+    g = dataclasses.replace(_tiny_geom(L=1), E=0, TOPK=0, I=0, IS=0, FF=256)
+    mod = mk.DenseMLPModule(
+        geometry=g, weight_dtypes={"gate_up": w_dtype, "down": w_dtype}
+    )
+    res = mk.verify_module(mod, g, R=2, B_per_T=2, T_values=(1, 2))
+    assert res.passed is True, res
+    kvr = {c.name: c for c in res.checks}["kernel_vs_reference"]
+    assert kvr.status == "passed" and kvr.max_ulp_diff == 0, kvr
 
 
 def test_verify_module_custom_fails_closed_without_oracle():

@@ -22,10 +22,13 @@ from .gdn import (
     GDNParams,
 )
 from .gqa import GQA, GQAModule, GQAParams
+from .mlp import DenseMLP, DenseMLPModule
 from .moe import MoE, MoEDebug, MoEModule, MoEParams
 from .norm import Embedding, EmbeddingModule, Norm, NormModule
 
 __all__ = [
+    "DenseMLP",
+    "DenseMLPModule",
     "Embedding",
     "EmbeddingModule",
     "GDN",
