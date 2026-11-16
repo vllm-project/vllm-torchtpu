@@ -4257,9 +4257,11 @@ class TPUModelRunner(GPUModelRunner):
         # Phase 1: all TARGET dummy forwards.
         for _ in range(num_chunks):
             self._run_dp_dummy_chunk(bucket)
-        self._dp_prompt_logprob_dummies(
-            self._dp_prompt_logprob_calls(bucket, num_chunks), bucket
-        )
+        if self._pp_is_last:
+            # Only the last pipeline stage scores prompt rows.
+            self._dp_prompt_logprob_dummies(
+                self._dp_prompt_logprob_calls(bucket, num_chunks), bucket
+            )
         # Phase 2: pair the context updates or draft forwards on drafter workers.
         if num_chunks > 0 and self._is_async_drafter:
             if self._is_dspark_pd_producer:
@@ -4826,7 +4828,7 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         """Score the step's planned prompt rows, each chunk's from its hidden
         states, through compute_selected_logits and gather_logprobs in calls of
-        the request bucket both precompile for the chunk's token bucket.
+        at most _prompt_logprob_rows_per_call rows.
 
         Under DP lockstep (DP with expert parallelism) every DP engine must
         issue the same logits collectives each step (see _dummy_run), at the
@@ -4835,15 +4837,23 @@ class TPUModelRunner(GPUModelRunner):
         dummy calls up to the DP-wide bound, and idle engines run the bound in
         _run_dp_idle_pairing.
         """
+        lockstep = self._dp_lockstep_enabled()
         num_calls = 0
         for chunk, hidden_states in chunks:
             rows, targets = prompt_logprobs.rows_and_targets(chunk.spans, self.requests)
             rows_per_call = self._prompt_logprob_rows_per_call(hidden_states.shape[0])
             for lo in range(0, rows.shape[0], rows_per_call):
                 n = min(rows_per_call, rows.shape[0] - lo)
-                indices = np.zeros(rows_per_call, dtype=np.int32)
+                # Lockstep engines must match shapes; otherwise a partial call
+                # pads only to its own request bucket.
+                padded = (
+                    rows_per_call
+                    if lockstep
+                    else _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)
+                )
+                indices = np.zeros(padded, dtype=np.int32)
                 indices[:n] = rows[lo : lo + n]
-                target_ids = np.zeros((rows_per_call, 1), dtype=np.int64)
+                target_ids = np.zeros((padded, 1), dtype=np.int64)
                 target_ids[:n, 0] = targets[lo : lo + n]
                 logits = self.compute_selected_logits(
                     hidden_states, torch.from_numpy(indices).to(self.device)
@@ -4853,7 +4863,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 chunk.slices.append((tensors, n))
                 num_calls += 1
-        if self._dp_lockstep_enabled():
+        if lockstep:
             bucket = self._dp_target_bucket
             assert bucket is not None
             # Every chunk is raised to the DP-wide bucket, so every engine's
@@ -4873,14 +4883,18 @@ class TPUModelRunner(GPUModelRunner):
 
     def _dp_local_prompt_logprob_rows(self, scheduler_output: "SchedulerOutput") -> int:
         """The prompt rows this engine scores this step, for the DP-wide bound
-        under DP lockstep; 0 without it."""
+        under DP lockstep; 0 without it and on stages before the last, which
+        score none."""
         if not (
             self._dp_lockstep_enabled()
+            and self._pp_is_last
             and self.num_prompt_logprobs
             and self._prompt_logprobs_unsupported is None
         ):
             return 0
         num_reqs = self.input_batch.num_reqs
+        # Only the row count matters here, and it does not depend on where the
+        # rows sit in the chunk, so all-zero offsets (query_start_loc) will do.
         spans = prompt_logprobs.plan_chunk(
             cast(list[str], self.input_batch.req_ids[:num_reqs]),
             np.zeros(num_reqs + 1, dtype=np.int32),
@@ -4909,10 +4923,13 @@ class TPUModelRunner(GPUModelRunner):
         hidden_states = torch.empty(
             (bucket, self.model_config.get_hidden_size()),
             dtype=self._hidden_states_dtype,
-        ).to(self.device)
+            device=self.device,
+        )
         indices = torch.zeros(
-            self._prompt_logprob_rows_per_call(bucket), dtype=torch.int32
-        ).to(self.device)
+            self._prompt_logprob_rows_per_call(bucket),
+            dtype=torch.int32,
+            device=self.device,
+        )
         for _ in range(num_calls):
             self.compute_selected_logits(hidden_states, indices)
 

@@ -71,6 +71,7 @@ def _runner(max_logprobs=3, **overrides):
         _dp_step_num_chunks=0,
         _dp_step_prompt_logprob_rows=0,
         _hidden_states_dtype=torch.float32,
+        _pp_is_last=True,
     )
     for name in (
         "compute_selected_logits",
@@ -309,3 +310,38 @@ def test_every_dp_rank_learns_the_largest_prompt_row_count(monkeypatch):
         for rank, rows in enumerate([9, 0])
     ]
     assert [r._dp_step_prompt_logprob_rows for r in runners] == [9, 9]
+
+
+@pytest.mark.parametrize(
+    "lockstep, pp_is_last, rows",
+    [(True, True, 18 + 3), (False, True, 0), (True, False, 0)],
+)
+def test_dp_local_prompt_logprob_rows(lockstep, pp_is_last, rows):
+    """d scores 18 rows, a finishes its prompt (rows 3-5) and b asks for none;
+    only the last pipeline stage of a lockstep engine counts them."""
+    runner = _runner(
+        _dp_lockstep_enabled=lambda: lockstep,
+        _pp_is_last=pp_is_last,
+        num_prompt_logprobs={"d": 1, "a": 2},
+        input_batch=SimpleNamespace(
+            num_reqs=3,
+            req_ids=["d", "b", "a"],
+            num_computed_tokens_cpu=np.array([0, 0, 3]),
+        ),
+    )
+    step = SimpleNamespace(num_scheduled_tokens={"d": 19, "b": 5, "a": 4})
+    assert TPUModelRunner._dp_local_prompt_logprob_rows(runner, step) == rows
+
+
+def test_last_logits_call_pads_to_its_own_bucket_outside_lockstep():
+    """Outside DP lockstep, 24 rows in calls of 16 end with an 8-row call."""
+    sizes = []
+    runner = _runner(max_num_reqs=16, num_prompt_logprobs={"d": 1, "a": 2})
+
+    def compute_selected_logits(hidden, indices):
+        sizes.append(indices.shape[0])
+        return TPUModelRunner.compute_selected_logits(runner, hidden, indices)
+
+    runner.compute_selected_logits = compute_selected_logits
+    _run_steps(runner, [[{"d": 19, "a": 7}]], 32)
+    assert sizes == [16, 8]
