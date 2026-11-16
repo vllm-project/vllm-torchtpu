@@ -221,6 +221,25 @@ def arrival_mirror_rows(recv_rows, e_total, tile_m):
     return recv_rows // tile_m + 2 * e_total + 2
 
 
+def mirror_rows_per_tile(tile_m):
+    """Rows of a scale mirror that one tile's sublane of tile_m f32 occupies.
+
+    One up to a lane block. Above it, the sublane is stored as tile_m / 128
+    rows of 128 lanes -- the same bytes in the same order. A [rows, 256] f32
+    array in HBM is laid out in (8, 128) tiles, and Mosaic cannot slice such
+    an array a row at a time, which is how every mirror transport addresses
+    it; a 128-lane array it can.
+    """
+    if tile_m <= HIDDEN_LANE_BLOCK:
+        return 1
+    if tile_m % HIDDEN_LANE_BLOCK:
+        raise ValueError(
+            f"a tile of {tile_m} rows above one lane block must be a whole "
+            f"number of {HIDDEN_LANE_BLOCK}-lane rows in the scale mirror"
+        )
+    return tile_m // HIDDEN_LANE_BLOCK
+
+
 def row_lane_blocks(hidden):
     """Lane blocks one token row is staged as: a row is (this many, 128)."""
     return hidden // HIDDEN_LANE_BLOCK
@@ -1672,7 +1691,15 @@ def vmem_scratch_arrays(
             (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
             form.wire_dtype,
         ),
-        ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        (
+            "oscl_vm",
+            (
+                OUT_PARITIES,
+                mirror_rows_per_tile(capacity),
+                capacity // mirror_rows_per_tile(capacity),
+            ),
+            jnp.float32,
+        ),
     ]
 
 
