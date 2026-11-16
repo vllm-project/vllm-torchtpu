@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention

@@ -64,7 +64,7 @@ import jax
 import torch
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 

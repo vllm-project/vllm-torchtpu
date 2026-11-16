@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import torch
 from einops import rearrange
 from jax.sharding import PartitionSpec
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear

@@ -19,7 +19,7 @@ elsewhere as the identical plain-torch algorithm in
 """
 
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 
 from vllm_torchtpu.kernels.router_topk import router_topk
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk

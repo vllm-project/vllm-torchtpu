@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import jax
 import torch
 from jax.sharding import PartitionSpec as P
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,

@@ -84,8 +84,7 @@ def _load_module(monkeypatch):
             "vllm_torchtpu.kernels.deepseek_v4.q_send",
             "vllm_torchtpu.kernels.deepseek_v4.rope",
             "vllm_torchtpu.models.vllm.vllm_model_wrapper_context",
-            "torch_tpu",
-            "torch_tpu._internal",
+            "torch.tpu",
         )
     }
     stubs["vllm_torchtpu.kernels.deepseek_v4.collective_ids"].Q_SEND_COLLECTIVE_ID = 4
@@ -96,7 +95,7 @@ def _load_module(monkeypatch):
     o_projection = stubs["vllm_torchtpu.kernels.deepseek_v4.o_projection"]
     o_projection.O_FETCH_MAX_TOKENS = 512
     o_projection.fused_reverse_rope_wo_a_projection_o_fetch = None
-    stubs["torch_tpu._internal"].pallas = types.SimpleNamespace(jax_op=_FakeJaxOp)
+    stubs["torch.tpu"].pallas = types.SimpleNamespace(jax_op=_FakeJaxOp)
     stubs["vllm_torchtpu.models.vllm.vllm_model_wrapper_context"].get_pallas_op_mesh = (
         lambda: None
     )

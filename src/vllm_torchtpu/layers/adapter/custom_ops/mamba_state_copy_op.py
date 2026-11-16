@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.experimental.pallas import tpu as pltpu
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 
 from vllm_torchtpu.kernels import pool_adapters
 
