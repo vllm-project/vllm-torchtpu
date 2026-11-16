@@ -72,6 +72,8 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_EXPERT_PLACEMENT` | `""` | Static expert placement for `EP`: a JSON table (a local path or a `gs://` URI) that sets, per MoE layer, which experts each EP rank holds, as a permutation. Applied at weight load to the experts and the router, so every MoE kernel serves it unchanged. With Ray DP engines, also list it in `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`: vLLM copies only `VLLM_` variables and the names listed there to the engine actors. |
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
+| `TPU_SP_MIN_ROWS` | `0` | With `TPU_MOE_SEQUENCE_PARALLEL`, backbone steps with fewer tokens keep every token on every TP rank (all-reduce after attention and in the MoE combine). `0` keeps every step sequence parallel. |
+| `TPU_SP_FP8_GATHER` | `False` | With `TPU_MOE_SEQUENCE_PARALLEL`, all-gathers the normed rows before attention in fp8 with per-row scales instead of bf16. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
