@@ -17,21 +17,23 @@ and its programs compile nothing after warmup.
 
 A one-layer GLM-5.2-shaped DSA model with one MTP layer (small dims, dummy
 weights, no tokenizer) serves the same token prompts with the switch off and
-on, one engine after the other in this process. Six short prompts and two
-long ones in one batch give a step whose prefill chunk carries many requests,
-and later steps that verify the short ones' drafts while the long ones keep
-prefilling.
+on, one engine after the other, each in a spawned child process. Six short
+prompts and two long ones in one batch give a step whose prefill chunk
+carries many requests, and later steps that verify the short ones' drafts
+while the long ones keep prefilling.
 
 Under EP-DP lockstep (data parallel 2 with expert parallel, served: vLLM
 runs data parallelism out of process), idle ranks replay the two passes;
-the served outputs must match the switch-off run, and no rank may hang. That
-test needs two chips no process holds yet, so it comes first here: run it
-before any test that touches the TPU from the pytest process itself.
+the served outputs must match the switch-off run, and no rank may hang.
+
+Neither test touches the TPU from the pytest process itself. The one-chip
+test waits until its child has released the chips before it goes on.
 
 Run with: pytest tests/entrypoints/llm/test_mtp_kv_only_step0.py -v
 """
 
 import json
+import multiprocessing
 import os
 import signal
 import socket
@@ -39,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pytest
 import torch
+from tpu_release import wait_for_tpu_release
 
 pytestmark = pytest.mark.tpu_test
 
@@ -55,6 +59,8 @@ MAX_NUM_BATCHED_TOKENS = 1024
 MAX_MODEL_LEN = 2048
 VOCAB = 8192
 MAX_TOKENS = 24
+# One engine's build, warmup and generate; two of them fit the test's timeout.
+CHILD_TIMEOUT_S = 480
 SPEC_DRAFT_METRIC = "vllm:spec_decode_num_draft_tokens"
 SPEC_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens"
 
@@ -145,66 +151,92 @@ def _graphs(worker) -> int:
     return _xla_cache_entries()
 
 
-def _run(monkeypatch, model_dir: str, switch: bool) -> dict:
-    """One engine, in this process: a process that has touched the TPU keeps
-    its chips, so an engine in a child process could not open them after
-    another in-process TPU test. Shut down before the next engine."""
-    from tpu_release import wait_for_tpu_release
+def _run_in_child(model_dir: str, switch: bool) -> dict:
+    """`_run` in a spawned child process. A process that has touched the TPU
+    keeps its chips until it exits, so the child, not pytest, holds them, and
+    they are free again for the tests after this one that start engines of
+    their own."""
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(target=_run_case, args=(model_dir, switch, child))
+    process.start()
+    child.close()
+    try:
+        result = parent.recv() if parent.poll(CHILD_TIMEOUT_S) else "timed out"
+    except EOFError:
+        result = "exited without a result"
+    finally:
+        process.join(timeout=30)
+        if process.is_alive():
+            process.kill()
+            process.join()
+    assert isinstance(result, dict), f"child exit code {process.exitcode}: {result}"
+    wait_for_tpu_release()
+    return result
+
+
+def _run_case(model_dir: str, switch: bool, conn) -> None:
+    """Runs one engine in this (child) process and sends back its result or
+    a failure."""
+    try:
+        conn.send(_run(model_dir, switch))
+    except BaseException:
+        conn.send(traceback.format_exc())
+
+
+def _run(model_dir: str, switch: bool) -> dict:
+    """One engine, with the engine core in this process so `collective_rpc`
+    can instrument the drafter; call it through `_run_in_child`."""
     from vllm import LLM, SamplingParams
-    from vllm import envs as vllm_envs
     from vllm.distributed import cleanup_dist_env_and_memory
     from vllm.inputs import TokensPrompt
     from vllm.v1.metrics.reader import Counter
 
-    with monkeypatch.context() as m:
-        m.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        m.setenv("VLLM_XLA_CHECK_RECOMPILATION", "1")
-        m.setenv("TPU_MTP_KV_ONLY_STEP0", "1" if switch else "0")
-        llm = LLM(
-            model=model_dir,
-            skip_tokenizer_init=True,
-            load_format="dummy",
-            tensor_parallel_size=1,
-            max_model_len=MAX_MODEL_LEN,
-            max_num_seqs=MAX_NUM_SEQS,
-            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-            kv_cache_memory_bytes=1 << 30,
-            # The sparse MLA kernels take an fp8 latent cache only.
-            kv_cache_dtype="fp8",
-            enable_prefix_caching=False,
-            disable_log_stats=False,
-            speculative_config={"method": "mtp", "num_speculative_tokens": NUM_SPEC},
-            seed=0,
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ["VLLM_XLA_CHECK_RECOMPILATION"] = "1"
+    os.environ["TPU_MTP_KV_ONLY_STEP0"] = "1" if switch else "0"
+    llm = LLM(
+        model=model_dir,
+        skip_tokenizer_init=True,
+        load_format="dummy",
+        tensor_parallel_size=1,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=MAX_NUM_SEQS,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        kv_cache_memory_bytes=1 << 30,
+        # The sparse MLA kernels take an fp8 latent cache only.
+        kv_cache_dtype="fp8",
+        enable_prefix_caching=False,
+        disable_log_stats=False,
+        speculative_config={"method": "mtp", "num_speculative_tokens": NUM_SPEC},
+        seed=0,
+    )
+    try:
+        (built,) = llm.collective_rpc(_instrument)
+        (graphs_before,) = llm.collective_rpc(_graphs)
+        params = SamplingParams(
+            temperature=0.0,
+            max_tokens=MAX_TOKENS,
+            ignore_eos=True,
+            detokenize=False,
         )
-        try:
-            (built,) = llm.collective_rpc(_instrument)
-            (graphs_before,) = llm.collective_rpc(_graphs)
-            params = SamplingParams(
-                temperature=0.0,
-                max_tokens=MAX_TOKENS,
-                ignore_eos=True,
-                detokenize=False,
-            )
-            outputs = llm.generate(
-                [TokensPrompt(prompt_token_ids=ids) for ids in _prompts()], params
-            )
-            (graphs_after,) = llm.collective_rpc(_graphs)
-            ((two_pass_graphs, proposals),) = llm.collective_rpc(_recorded)
-            drafts = accepted = 0.0
-            for metric in llm.get_metrics():
-                if metric.name == SPEC_DRAFT_METRIC:
-                    assert isinstance(metric, Counter)
-                    drafts += metric.value
-                elif metric.name == SPEC_ACCEPTED_METRIC:
-                    assert isinstance(metric, Counter)
-                    accepted += metric.value
-        finally:
-            llm.llm_engine.engine_core.shutdown()
-            del llm
-            cleanup_dist_env_and_memory()
-            # The engine froze vLLM's env reads; the next engine sets its own.
-            vllm_envs.disable_envs_cache()
-            wait_for_tpu_release()
+        outputs = llm.generate(
+            [TokensPrompt(prompt_token_ids=ids) for ids in _prompts()], params
+        )
+        (graphs_after,) = llm.collective_rpc(_graphs)
+        ((two_pass_graphs, proposals),) = llm.collective_rpc(_recorded)
+        drafts = accepted = 0.0
+        for metric in llm.get_metrics():
+            if metric.name == SPEC_DRAFT_METRIC:
+                assert isinstance(metric, Counter)
+                drafts += metric.value
+            elif metric.name == SPEC_ACCEPTED_METRIC:
+                assert isinstance(metric, Counter)
+                accepted += metric.value
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+        del llm
+        cleanup_dist_env_and_memory()
     return {
         "built": built,
         "tokens": [list(out.outputs[0].token_ids) for out in outputs],
@@ -422,16 +454,16 @@ def test_two_pass_step0_matches_the_single_pass_under_ep_dp_lockstep(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# One chip, in process (after the served test: see the module docstring)
+# One chip, each engine in a spawned child
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.timeout(1200)
-def test_two_pass_step0_matches_the_single_pass_end_to_end(monkeypatch, tmp_path):
+def test_two_pass_step0_matches_the_single_pass_end_to_end(tmp_path):
     model_dir = str(tmp_path / "glm-dsa-mtp-tiny")
     _write_config(model_dir)
-    off = _run(monkeypatch, model_dir, switch=False)
-    on = _run(monkeypatch, model_dir, switch=True)
+    off = _run_in_child(model_dir, switch=False)
+    on = _run_in_child(model_dir, switch=True)
 
     def summary(result):
         return {k: v for k, v in result.items() if k not in ("tokens", "proposals")}
