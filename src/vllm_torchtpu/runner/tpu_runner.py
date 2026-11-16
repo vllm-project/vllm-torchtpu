@@ -3829,6 +3829,13 @@ class TPUModelRunner(GPUModelRunner):
                             scheduler_output, "scheduled_spec_decode_flags", None
                         ),
                         start_index=start_index,
+                        # Logprobs and min_tokens read every verify row by
+                        # position, so only skip GRAMMAR rows without them.
+                        skip_grammar_rows=(
+                            gaad.is_enabled()
+                            and self.input_batch.max_num_logprobs is None
+                            and not self._min_tokens
+                        ),
                     )
                 )
 
@@ -7293,6 +7300,18 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+                if gaad.is_enabled() and self.speculative_config is not None:
+                    # A verify step's logits rows are a token bucket; GaaD drops
+                    # GRAMMAR rows, so any bucket up to the step's tokens occurs.
+                    for num_rows in self.num_tokens_paddings:
+                        if num_rows > num_tokens:
+                            break
+                        indices = torch.zeros(num_rows, dtype=torch.int32).to(
+                            self.device
+                        )
+                        synchronize_tensors(
+                            self.compute_selected_logits(dummy_hidden, indices)
+                        )
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -7692,6 +7711,25 @@ class TPUModelRunner(GPUModelRunner):
                 _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
                     dummy_logits, bonus_logits_indices, target_logits_indices
                 )
+                if gaad.is_enabled():
+                    # GaaD computes logits only for MODEL and bonus rows, so the
+                    # gather also reads from fewer rows: every smaller bucket that
+                    # still holds one row per request.
+                    for num_rows in self.num_tokens_paddings:
+                        if num_rows >= num_tokens:
+                            break
+                        if num_rows < num_reqs:
+                            continue
+                        synchronize_tensors(
+                            self.spec_gather_bonus_and_target_logits(
+                                torch.zeros(
+                                    (num_rows, self.vocab_size),
+                                    dtype=self._hidden_states_dtype,
+                                ).to(self.device),
+                                bonus_logits_indices,
+                                target_logits_indices,
+                            )
+                        )
                 warm_temps = torch.zeros(
                     (num_tokens, 1),
                     dtype=self._hidden_states_dtype,

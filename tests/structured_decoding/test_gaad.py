@@ -282,36 +282,81 @@ def test_check_config_leaves_other_configs_alone(monkeypatch):
     assert config.scheduler_config.async_scheduling is True
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_draft_flags_are_laid_out_like_the_drafts(monkeypatch, enabled):
+def _manager_for(req_ids):
     from vllm_torchtpu.runner.speculative_decoding_manager import (
         SpeculativeDecodingManager,
     )
 
+    manager = SpeculativeDecodingManager.__new__(SpeculativeDecodingManager)
+    manager.runner = SimpleNamespace(
+        device=torch.device("cpu"), input_batch=SimpleNamespace(req_ids=req_ids)
+    )
+    return manager
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_draft_flags_are_laid_out_like_the_drafts(monkeypatch, enabled):
     if enabled:
         monkeypatch.setenv("VLLM_TPU_JUMP_DECODING", "1")
     else:
         monkeypatch.delenv("VLLM_TPU_JUMP_DECODING", raising=False)
-    manager = SpeculativeDecodingManager.__new__(SpeculativeDecodingManager)
-    manager.runner = SimpleNamespace(
-        device=torch.device("cpu"),
-        input_batch=SimpleNamespace(req_ids=["x", "a", "b", "c"]),
+    manager = _manager_for(["x", "a", "b", "c"])
+    flat = manager._flat_draft_flags(
+        np.array([3, 0, 2], dtype=np.int32), {"a": [G, G, M], "c": [G]}, start_index=1
     )
-    flags = manager._build_draft_flags_tensor(
-        np.array([3, 0, 2], dtype=np.int32),
-        8,
-        {"a": [G, G, M], "c": [G]},
-        start_index=1,
-    )
+    # a: its flags; b: no drafts; c: G then MODEL by default.
+    assert flat.tolist() == [G, G, M, G, M]
+    flags = manager._build_draft_flags_tensor(flat, 8)
     if not enabled:
         assert flags is None
         return
-    # a: its flags; b: no drafts; c: G then MODEL by default; then padding.
     assert flags.tolist() == [G, G, M, G, M, 0, 0, 0]
 
 
-def test_verify_mode_marks_forced_tokens_model(monkeypatch):
-    monkeypatch.setenv("VLLM_TPU_JUMP_DECODING_VERIFY", "1")
-    request = _request()
-    assert plan_request(request, _manager(), 7) == [M, M, M]
+def test_grammar_rows_skip_the_lm_head():
+    from vllm_torchtpu.runner.speculative_decoding_manager import (
+        SpeculativeDecodingManager,
+    )
+
+    # Request 0 drafts [G, M, G] (logits rows 0-2, bonus row 3); request 1
+    # drafts [G, G] (rows 4-5, bonus row 6).
+    logits, bonus, target = SpeculativeDecodingManager._skip_grammar_rows(
+        np.array([3, 2]),
+        np.array([G, M, G, G, G]),
+        np.array([10, 11, 12, 13, 20, 21, 22]),
+        np.array([3, 6]),
+        np.array([0, 1, 2, 4, 5]),
+    )
+    # Only the MODEL draft's row and the bonus rows keep the LM head.
+    assert logits.tolist() == [11, 13, 22]
+    assert bonus.tolist() == [1, 2]
+    # GRAMMAR drafts point at their request's bonus row.
+    assert target.tolist() == [1, 0, 1, 2, 2]
+
+
+def test_the_drafter_fills_only_its_share_of_the_row(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_JUMP_DECODING", "1")
+    monkeypatch.setenv("VLLM_TPU_GAAD_DRAFT_TOKENS", "1")
+    assert gaad.draft_limit(7) == 1
+    # The drafter's x after the forced run is past its share; the grammar
+    # still fills the row.
+    request = _request(spec_token_ids=[1, 2, 3, 7])
+    assert plan_request(request, _manager(), 7) == [G, G, G]
     assert request.spec_token_ids == [1, 2, 3]
+
+
+def test_a_skipped_request_keeps_the_drafters_share(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_JUMP_DECODING", "1")
+    monkeypatch.setenv("VLLM_TPU_GAAD_DRAFT_TOKENS", "2")
+    skipped = _request(request_id="s", spec_token_ids=[7, 8, 9], is_prefill_chunk=True)
+    scheduler = SimpleNamespace(
+        structured_output_manager=_manager(), num_spec_tokens=7, running=[skipped]
+    )
+    assert gaad.plan_running_requests(scheduler) == {}
+    assert skipped.spec_token_ids == [7, 8]
+
+
+def test_draft_limit_without_gaad(monkeypatch):
+    monkeypatch.delenv("VLLM_TPU_JUMP_DECODING", raising=False)
+    monkeypatch.setenv("VLLM_TPU_GAAD_DRAFT_TOKENS", "2")
+    assert gaad.draft_limit(7) == 7

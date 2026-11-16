@@ -24,14 +24,12 @@ from the grammar state after the previous step's tokens and from the drafter's
 proposal for this step. Both are on the host only with async scheduling off, so
 GaaD turns async scheduling off (``check_config``).
 
-Forcing a token pins the canonical tokenization of the jump string, which can
-differ from the tokens decoding without drafts picks, and so change the text
-generated after it. With ``VLLM_TPU_JUMP_DECODING_VERIFY=1`` the forced tokens
-are verified like model drafts instead, so greedy output is unchanged.
-
-A row has at most ``num_speculative_tokens`` slots. Without a drafter, the
-speculative config names ``GAAD_PROPOSER`` as a ``custom_class`` method and
-GaaD fills every row.
+A row has ``num_speculative_tokens`` slots. The model drafter fills at most
+``VLLM_TPU_GAAD_DRAFT_TOKENS`` of them (all of them when unset) and the grammar
+may force tokens into the rest, so a wide row costs the drafter nothing. The
+runner computes target logits only for ``MODEL`` slots and the bonus slot.
+Without a drafter, the speculative config names ``GAAD_PROPOSER`` as a
+``custom_class`` method and GaaD fills every row.
 """
 
 from __future__ import annotations
@@ -83,10 +81,14 @@ def is_enabled() -> bool:
     return bool(envs.VLLM_TPU_JUMP_DECODING)
 
 
-def verifies_forced_tokens() -> bool:
+def draft_limit(num_speculative_tokens: int) -> int:
+    """How many slots of a row the model drafter fills."""
     from vllm_torchtpu import envs
 
-    return bool(envs.VLLM_TPU_JUMP_DECODING_VERIFY)
+    limit = envs.VLLM_TPU_GAAD_DRAFT_TOKENS
+    if not is_enabled() or limit is None:
+        return num_speculative_tokens
+    return min(limit, num_speculative_tokens)
 
 
 def check_config(vllm_config: VllmConfig) -> None:
@@ -235,14 +237,13 @@ def plan_request(
     budget = min(k, request.max_tokens - request.num_output_tokens - 1)
     if budget <= 0:
         return None
+    model_draft = request.spec_token_ids[: draft_limit(k)]
     cursor = GrammarCursor(matcher, structured_output_manager.tokenizer)
     try:
-        tokens, flags = plan_draft_row(request.spec_token_ids, cursor, budget)
+        tokens, flags = plan_draft_row(model_draft, cursor, budget)
     finally:
         cursor.rollback()
     request.spec_token_ids = tokens
-    if verifies_forced_tokens():
-        return [DRAFT_FLAG_MODEL] * len(flags)
     return flags
 
 
@@ -251,10 +252,14 @@ def plan_running_requests(scheduler: Any) -> dict[str, list[int]]:
     manager = scheduler.structured_output_manager
     k = scheduler.num_spec_tokens
     flags_by_req: dict[str, list[int]] = {}
+    limit = draft_limit(k)
     for request in scheduler.running:
         flags = plan_request(request, manager, k)
         if flags is not None:
             flags_by_req[request.request_id] = flags
+        elif len(request.spec_token_ids) > limit:
+            # A request GaaD skips keeps only the drafter's share of the row.
+            request.spec_token_ids = request.spec_token_ids[:limit]
     return flags_by_req
 
 

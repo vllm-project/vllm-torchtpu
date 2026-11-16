@@ -280,12 +280,29 @@ class SpeculativeDecodingManager:
                 f"'{self.runner.speculative_config.method}' is not supported."
             )
 
-    def _build_draft_flags_tensor(
+    def _flat_draft_flags(
         self,
         num_draft_tokens: np.ndarray,
-        padded_logits_length: int,
         scheduled_spec_decode_flags: Mapping[str, Sequence[int]] | None,
         start_index: int,
+    ) -> np.ndarray:
+        """Each draft's GaaD flag, in draft order; MODEL where none is given."""
+        flags_by_req = scheduled_spec_decode_flags or {}
+        flat = np.full(int(num_draft_tokens.sum()), gaad.DRAFT_FLAG_MODEL, np.int32)
+        num_reqs = num_draft_tokens.shape[0]
+        req_ids = self.runner.input_batch.req_ids[start_index : start_index + num_reqs]
+        offset = 0
+        for req_id, n in zip(req_ids, num_draft_tokens):
+            n = int(n)
+            flags = flags_by_req.get(req_id) if req_id is not None else None
+            if flags is not None:
+                row = flags[:n]
+                flat[offset : offset + len(row)] = row
+            offset += n
+        return flat
+
+    def _build_draft_flags_tensor(
+        self, flat_flags: np.ndarray, padded_logits_length: int
     ) -> torch.Tensor | None:
         """Lays out each draft's flag like the drafts; None without GaaD.
 
@@ -294,22 +311,40 @@ class SpeculativeDecodingManager:
         """
         if not gaad.is_enabled():
             return None
-        flags_by_req = scheduled_spec_decode_flags or {}
         padded_draft_flags = np.zeros(padded_logits_length, dtype=np.int32)
-        num_reqs = num_draft_tokens.shape[0]
-        req_ids = self.runner.input_batch.req_ids[start_index : start_index + num_reqs]
-        offset = 0
-        for req_id, n in zip(req_ids, num_draft_tokens):
-            n = int(n)
-            flags = flags_by_req.get(req_id) if req_id is not None else None
-            row = padded_draft_flags[offset : offset + n]
-            row[:] = gaad.DRAFT_FLAG_MODEL
-            if flags is not None:
-                row[: len(flags)] = flags[:n]
-            offset += n
+        padded_draft_flags[: flat_flags.shape[0]] = flat_flags
         return torch.from_numpy(padded_draft_flags).to(
             self.runner.device, non_blocking=True
         )
+
+    @staticmethod
+    def _skip_grammar_rows(
+        num_draft_tokens: np.ndarray,
+        flat_flags: np.ndarray,
+        logits_indices: np.ndarray,
+        bonus_logits_indices: np.ndarray,
+        target_logits_indices: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Drops the target logits rows of GRAMMAR drafts (as rvllm does).
+
+        A GRAMMAR draft is accepted without its target row, and a rejection,
+        which samples from the target row, only happens at a MODEL draft, so
+        the LM head need not run for GRAMMAR rows. Their target index points
+        at the request's bonus row instead, a row the sampler reads but never
+        uses. Returns the kept logits indices and the remapped bonus and
+        target indices.
+        """
+        keep = np.ones(logits_indices.shape[0], dtype=bool)
+        keep[target_logits_indices[flat_flags == gaad.DRAFT_FLAG_GRAMMAR]] = False
+        new_row = np.cumsum(keep) - 1
+        bonus = new_row[bonus_logits_indices]
+        req_of_draft = np.repeat(np.arange(num_draft_tokens.shape[0]), num_draft_tokens)
+        target = np.where(
+            keep[target_logits_indices],
+            new_row[target_logits_indices],
+            bonus[req_of_draft],
+        )
+        return logits_indices[keep], bonus, target
 
     def get_spec_decode_metadata(
         self,
@@ -319,6 +354,7 @@ class SpeculativeDecodingManager:
         defer_draft_token_ids: bool = False,
         scheduled_spec_decode_flags: Mapping[str, Sequence[int]] | None = None,
         start_index: int = 0,
+        skip_grammar_rows: bool = False,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and
         rejection sampling.
@@ -335,12 +371,20 @@ class SpeculativeDecodingManager:
           A SpecDecodeMetadata object containing the necessary indices for
           speculative decoding.
         """
+        flat_flags = self._flat_draft_flags(
+            num_draft_tokens, scheduled_spec_decode_flags, start_index
+        )
+        # The kept logits rows depend on the flags, so such a step bypasses
+        # the cache.
+        skip_rows = skip_grammar_rows and bool(
+            (flat_flags == gaad.DRAFT_FLAG_GRAMMAR).any()
+        )
         cache_key = (
             num_draft_tokens.tobytes(),
             cu_num_scheduled_tokens.tobytes(),
             padded_num_reqs,
         )
-        if cache_key == self._meta_cache_key:
+        if not skip_rows and cache_key == self._meta_cache_key:
             assert self._meta_cache is not None
             assert self._meta_cache_np is not None
             logits_indices, target_logits_indices, padded_logits_length = (
@@ -353,10 +397,7 @@ class SpeculativeDecodingManager:
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
             draft_flags_tensor = self._build_draft_flags_tensor(
-                num_draft_tokens,
-                padded_logits_length,
-                scheduled_spec_decode_flags,
-                start_index,
+                flat_flags, padded_logits_length
             )
             return SpecDecodeMetadata(
                 draft_token_ids=(
@@ -430,7 +471,22 @@ class SpeculativeDecodingManager:
             self.runner.num_tokens_paddings, logits_indices.shape[0]
         )
 
-        padded_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
+        if skip_rows:
+            logits_indices, bonus_logits_indices, target_logits_indices = (
+                self._skip_grammar_rows(
+                    num_draft_tokens,
+                    flat_flags,
+                    logits_indices,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                )
+            )
+        # The LM head runs over padded_logits_rows rows; the per-draft arrays
+        # keep padded_logits_length, so the samplers' shapes do not change.
+        padded_logits_rows = _get_padded_token_len(
+            self.runner.num_tokens_paddings, logits_indices.shape[0]
+        )
+        padded_logits_indices = np.zeros(padded_logits_rows, dtype=np.int32)
         padded_logits_indices[: logits_indices.shape[0]] = logits_indices
 
         padded_bonus_logits_indices = np.zeros(padded_num_reqs, dtype=np.int32)
@@ -470,10 +526,7 @@ class SpeculativeDecodingManager:
         device = self.runner.device
 
         draft_flags_tensor = self._build_draft_flags_tensor(
-            num_draft_tokens,
-            padded_logits_length,
-            scheduled_spec_decode_flags,
-            start_index,
+            flat_flags, padded_logits_length
         )
         metadata = SpecDecodeMetadata(
             draft_token_ids=(
@@ -510,6 +563,8 @@ class SpeculativeDecodingManager:
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.
         metadata.draft_lengths_cpu = num_draft_tokens.copy()
+        if skip_rows:
+            return metadata
         self._meta_cache_key = cache_key
         self._meta_cache = metadata
         self._meta_cache_np = (
