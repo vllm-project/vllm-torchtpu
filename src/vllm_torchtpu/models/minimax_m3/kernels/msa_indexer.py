@@ -216,10 +216,12 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
 # Pages per dot in `_kernel_v3`: 2 x 16 pages, paired along the contraction.
 _PAGES_PER_CHUNK = 32
 # `_kernel_v3` issues the ahead group's descriptors during its first chunks:
-# all four of a decode group's 32-page chunks (2: standalone decode calls
-# c48-like int4 folded 101 -> 92 us, b36 117 -> 111, fp8 c16 b5 25.5 -> 24.1,
-# kernel bench j-0a884760).
-_DMA_ISSUE_CHUNKS = 4
+# all of a 128- or 256-page group's 32-page chunks (2 chunks of 128-page
+# groups: standalone decode calls, int4 folded 23 x 450 pages 101 -> 92 us,
+# fp8 5 x 450 pages 25.5 -> 24.1, j-0a884760; of 256-page ones 4 -> 8: 87.7
+# -> 77.9 and 22.7 -> 21.5, j-83e37332). An earlier sweep found all chunks
+# slower (j-2e0b290e), before the copies took one scalar address each.
+_DMA_ISSUE_CHUNKS = 8
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed

@@ -41,6 +41,7 @@ NUM_PAGES = 40
         ([1, 130, 3], [300, 200, 0], 64, 48, 4),
         ([1, 1], [1000, 5], 128, 512, 2),  # small class only, page groups
         ([1, 3], [1000, 5], 128, 512, 128),  # small class only, token-major (v3)
+        ([1, 3], [1000, 5], 128, 512, 256),  # 256-page groups: copies over 8 chunks
     ],
 )
 def test_matches_reference(
@@ -193,6 +194,7 @@ def test_lowers_for_tpu(dtype, kernel):
     [
         ([1, 3], [1000, 5], 128),  # token-major (decode)
         ([8, 8], [700, 90], 128),  # token-major (spec-decode verify)
+        ([8, 8], [700, 90], 256),  # 256-page groups (`msa._wide_decode_scores`)
         ([8, 8], [700, 90], 4),  # page groups
         ([1, 130, 3], [300, 200, 0], 4),  # small and large classes
     ],

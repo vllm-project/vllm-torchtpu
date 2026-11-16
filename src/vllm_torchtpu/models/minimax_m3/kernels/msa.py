@@ -293,18 +293,39 @@ def _select_and_attend(
 _DECODE_ROWS = 8
 
 
-def block_score_options(index_heads: int = 1) -> dict[str, int]:
+def block_score_options(index_heads: int = 1, wide: bool = False) -> dict[str, int]:
     """The tile sizes the MSA forward scores blocks with, for query rows that
     fold `index_heads` heads per token. A transposed (folded 4-bit or fp8)
     decode tile holds one request's rows: its scoring costs per tile row, and 32-row
     tiles for one head's 8 rows ran the c48 / c64 DCP 2 decode indexer 7%
-    slower, bit-identical results (bench j-74f8b992)."""
+    slower, bit-identical results (bench j-74f8b992).
+
+    `wide` (`_wide_decode_scores`) scores 256 pages per small-class step:
+    half the grid steps, ~0.4 us each."""
     return dict(
         block_q=msa_indexer.DEFAULT_BLOCK_Q,
         large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
         pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
-        small_pages_per_step=msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
+        small_pages_per_step=2 * msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP
+        if wide
+        else msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
         transposed_tile_q=min(_DECODE_ROWS * index_heads, msa_indexer.DEFAULT_BLOCK_Q),
+    )
+
+
+def _wide_decode_scores(index_q, index_cache, seq_lens, index_heads) -> bool:
+    """Whether a step's block scores take 256-page groups: a decode step
+    (`msa_indexer.is_prefill_step`) of more than one request's rows, over
+    8-bit or 4-bit index pages (a 256-page ring of bf16 pages is twice the
+    VMEM). Standalone decode calls (j-83e37332): int4 folded 23 x 450 pages
+    94.7 -> 77.9 us, 36 x 366 pages 110.6 -> 105.7, fp8 5 x 450 pages 24.0 ->
+    21.5; one request of 313 pages 8.7 -> 9.1 (so a single request keeps
+    128)."""
+    rows = index_q.shape[0]
+    return (
+        rows > _DECODE_ROWS * index_heads
+        and not msa_indexer.is_prefill_step(rows, seq_lens.shape[0])
+        and jnp.dtype(index_cache.dtype).itemsize == 1
     )
 
 
@@ -330,7 +351,10 @@ def _block_scores(
         block_tables,
         cu_q_lens,
         num_seqs,
-        **block_score_options(index_heads),
+        **block_score_options(
+            index_heads,
+            _wide_decode_scores(index_q, index_cache, seq_lens, index_heads),
+        ),
         scale_cache=scale_cache,
         scale_row=scale_row,
         row_index=row_index,
