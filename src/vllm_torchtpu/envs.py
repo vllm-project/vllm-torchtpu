@@ -124,7 +124,7 @@ if TYPE_CHECKING:
     TPU_PP_EQUAL_COST_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_HANDOFF_DEPTH: int = 2
-    TPU_ROPE_IN_GRAPH: bool = False
+    TPU_ROPE_IN_GRAPH: bool = True
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -928,12 +928,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
     "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
     # Compute rotary cos/sin in-graph from positions instead of indexing a
-    # precomputed [max_position, rotary_dim] HBM table. Set to 1 to enable
-    # (default 0). Graduation: defaults to 1 once full CI passes in #3352;
-    # TPU_ROPE_CACHE_TRUNCATE and TPU_ROPE_CACHE_ROW_MAJOR are removed in
-    # #3357 once DeepSeek-V4 Pallas kernels migrate in #3355, and this flag
-    # is removed in #2747 after default-on soak.
-    "TPU_ROPE_IN_GRAPH": env_bool("TPU_ROPE_IN_GRAPH", default=False),
+    # precomputed [max_position, rotary_dim] HBM table. Set to 0 to restore
+    # the precomputed table (default 1). Graduation: TPU_ROPE_CACHE_TRUNCATE
+    # and TPU_ROPE_CACHE_ROW_MAJOR are removed in #3357 once DeepSeek-V4
+    # Pallas kernels migrate in #3355, and this flag is removed in #2747
+    # after default-on soak.
+    "TPU_ROPE_IN_GRAPH": env_bool("TPU_ROPE_IN_GRAPH", default=True),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
