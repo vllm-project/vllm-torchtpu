@@ -301,7 +301,7 @@ def _profile_attention(
     if not configured:
         return kv_cache, None, []
 
-    from torch_tpu._internal.profiler import TpuProfilerConfig
+    from torch.tpu.profiler import TpuProfilerConfig
 
     from vllm_torchtpu import profiler_trace
 
