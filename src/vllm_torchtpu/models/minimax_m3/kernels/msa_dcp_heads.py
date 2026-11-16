@@ -60,6 +60,14 @@ HEAD_PARALLEL_MIN_TOKENS = 2048
 # 1.90 ms at lower (16-token tiles of 16 pages before; j-f7057d29).
 _BLOCK_Q = 8
 _PAGES_PER_STEP = 64
+# A KV head's two replicas split a long step's rows instead of its query
+# heads: each attends half the tokens with all 16 heads, so a tile's page
+# union and its 4-bit unpacking serve twice the rows (kernel bench
+# j-b3925dba, c64 shape: 8 heads x 8192 tokens 1.961 ms -> 16 heads x 4096
+# tokens 1.248 ms at 32-page groups), for two permutes of half a step's
+# queries and outputs between the replicas (one chip's cores at c64).
+SPLIT_REPLICA_ROWS = True
+_SPLIT_PAGES_PER_STEP = 32
 
 
 def merge_partials(
@@ -421,12 +429,16 @@ def _exchange_pages(
     return recv, recv_sc
 
 
-def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
+def _own_selection(
+    candidates, *, dcp, replicas, topk, axis, interpret, share_only=False
+):
     """The selection ``[T, topk]`` of this rank's KV head, from every rank's
     packed ``candidates [T, G * 2 * topk]``. Each replica of the head merges
     the candidates of a ``1 / replicas`` share of the tokens (an all-to-all
     of that share) and the replicas all-gather the merged selections, which
-    are 1/8 the candidates' bytes."""
+    are 1/8 the candidates' bytes. With `share_only` (the tokens split
+    evenly), the replica's own share ``[T / replicas, topk]`` comes back
+    instead, with no all-gather."""
     num_tokens = candidates.shape[0]
     heads = dcp // replicas
     split = replicas if num_tokens % replicas == 0 else 1
@@ -438,6 +450,9 @@ def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
     send = jnp.repeat(send, replicas // split, axis=1).reshape(dcp, part, 2 * topk)
     own = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)  # [dcp, T / split, 2K]
     selected = msa_dcp.merge_head_candidates(own, topk, interpret)[:, 0]
+    if share_only:
+        assert split == replicas, (num_tokens, replicas)
+        return selected
     if split > 1:
         groups = [list(range(h * replicas, (h + 1) * replicas)) for h in range(heads)]
         selected = jax.lax.all_gather(
@@ -480,6 +495,11 @@ def _head_parallel_attend(
     capacity = block_tables_2d.shape[1]  # logical blocks per round
     replicas = kv_head_replicas
     part = -(-capacity // replicas)  # each replica's share of the buffer
+    # The two replicas of a KV head split the rows (`_replica_rows`): each
+    # attends half the tokens with all the head's query heads.
+    split = SPLIT_REPLICA_ROWS and replicas == 2 and num_tokens % (2 * _BLOCK_Q) == 0
+    rows = num_tokens // replicas if split else num_tokens
+    offset = rank % replicas * rows if split else 0
 
     selected = _own_selection(
         candidates,
@@ -488,14 +508,20 @@ def _head_parallel_attend(
         topk=topk,
         axis=axis,
         interpret=interpret,
+        share_only=split,
     )
 
     seq_id, pos, valid = tokens
+    if split:
+        seq_id, pos, valid = (
+            jax.lax.dynamic_slice_in_dim(x, offset, rows) for x in tokens
+        )
+        q = _replica_rows(q, rank, axis=axis, dcp=dcp)
     seq_blocks = -(-seq_lens // (block_size * dcp))
     blocks = jnp.where(hp_req, seq_blocks, 0)
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
     # Rows per kernel call (the caller pads tokens to a block_q multiple).
-    window = min(num_tokens, msa_attention.MAX_TOKENS_PER_CALL)
+    window = min(rows, msa_attention.MAX_TOKENS_PER_CALL)
     sel_block = jnp.maximum(selected, 0)
     own_block = pos // block_size
     limit = pos % block_size + 1
@@ -552,13 +578,14 @@ def _head_parallel_attend(
         local = jnp.where(mine, slot(tok_base, own_block), -1)
         lo = cu[jnp.min(jnp.where(in_round, seq_idx, max_num_seqs - 1))]
         hi = cu[jnp.max(jnp.where(in_round, seq_idx + 1, 0))]
+        lo, hi = (jnp.clip(x - offset, 0, rows) for x in (lo, hi))
         page_table = jnp.arange(dcp * num_pages, dtype=jnp.int32)
 
         attend = functools.partial(
             msa_attention_lse.msa_sparse_attention_lse,
             sm_scale=sm_scale,
             block_q=_BLOCK_Q,
-            pages_per_step=_PAGES_PER_STEP,
+            pages_per_step=_SPLIT_PAGES_PER_STEP if split else _PAGES_PER_STEP,
             head=0,
             scale_cache=sc,
             k_scale_row=0,
@@ -574,7 +601,7 @@ def _head_parallel_attend(
             return out
 
         def window_body(i, acc):
-            start = jnp.minimum(lo + i * window, num_tokens - window)
+            start = jnp.minimum(lo + i * window, rows - window)
 
             def sl(x):
                 return jax.lax.dynamic_slice_in_dim(x, start, window, 0)
@@ -601,7 +628,42 @@ def _head_parallel_attend(
         return jax.lax.while_loop(lambda s: s[0] < max_num_seqs, body, state)
 
     _, acc = jax.lax.cond(first < max_num_seqs, more_rounds, lambda s: s, (first, acc))
+    if split:
+        acc = _replica_heads(acc, rank, axis=axis, dcp=dcp)
     return acc
+
+
+def _replica_rows(q, rank, *, axis, dcp):
+    """This replica's half of the rows of ``q [T, Hl, D]`` with both
+    replicas' query heads, ``[T / 2, 2 Hl, D]`` (replica 0's heads first):
+    the half of its own heads it keeps and the partner's (rank ``rank ^ 1``)
+    heads for that half, by one permute of a half."""
+    rows = q.shape[0] // 2
+    j = rank % 2
+    mine = jax.lax.dynamic_slice_in_dim(q, j * rows, rows)
+    theirs = jax.lax.ppermute(
+        jax.lax.dynamic_slice_in_dim(q, (1 - j) * rows, rows),
+        axis,
+        [(r, r ^ 1) for r in range(dcp)],
+    )
+    first, second = jnp.where(j == 0, mine, theirs), jnp.where(j == 0, theirs, mine)
+    return jnp.concatenate([first, second], axis=1)
+
+
+def _replica_heads(out, rank, *, axis, dcp):
+    """Inverse of `_replica_rows` for the head-major output ``[2 Hl, T / 2,
+    D]`` of this replica's rows: its own heads ``[Hl, T, D]`` over every row,
+    the partner's half from the partner."""
+    heads = out.shape[0] // 2
+    j = rank % 2
+    mine = jax.lax.dynamic_slice_in_dim(out, j * heads, heads)
+    theirs = jax.lax.ppermute(
+        jax.lax.dynamic_slice_in_dim(out, (1 - j) * heads, heads),
+        axis,
+        [(r, r ^ 1) for r in range(dcp)],
+    )
+    first, second = jnp.where(j == 0, mine, theirs), jnp.where(j == 0, theirs, mine)
+    return jnp.concatenate([first, second], axis=1)
 
 
 def attend_and_merge(
