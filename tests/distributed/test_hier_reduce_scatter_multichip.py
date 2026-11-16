@@ -16,17 +16,14 @@
 `test_hier_reduce_scatter.py` pins arming and dispatch against stand-ins; this
 arms the real op through `prebuild_hier_reduce_scatter()` and checks that
 `moe_combine_reduce_scatter(group, x)` gives every rank the block
-`group.reduce_scatter(x, dim=0)` gives it, eager and under `torch.compile`.
+`group.reduce_scatter(x, dim=0)` gives it, eager and under `torch.compile`,
+through a group whose own reduce-scatter raises, so the kernel must serve it.
 That is the rank-to-mesh-index mapping, which only real ranks exercise.
 
 Run on one host (4 chips x 2 cores = 8 ranks).
 """
 
 import argparse
-import json
-import os
-import signal
-import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -35,64 +32,19 @@ import pytest
 
 pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 WORLD_SIZE = 8
 # (rows per rank, hidden): the padded micro-batched path (64, 160), the
 # micro-batched kernel (1024), the row-streaming kernel at the default
-# threshold (2048 x 4096 = 16 MiB), and a hidden too wide for its VMEM, which
-# must fall back to the micro-batched kernel (2048 x 7168).
-SHAPES = ((64, 4096), (160, 4096), (1024, 4096), (2048, 4096), (2048, 7168))
+# threshold (3072 x 4096 = 24 MiB), and a hidden too wide for its VMEM, which
+# must fall back to the micro-batched kernel (2048 x 7168 = 28 MiB).
+SHAPES = ((64, 4096), (160, 4096), (1024, 4096), (3072, 4096), (2048, 7168))
 CALLS_PER_SHAPE = 2  # serving calls the op once per MoE layer on new data
 # Both sides round a sum of 8 bf16 values to bf16, in different orders.
 MAX_REL_ERR = 1e-2
-# Under the per-PR multichip lane's pytest --timeout=600, so this limit, not
-# pytest's, ends a hung launch and the finally below can reap the workers.
+# Under the per-PR multichip lane's pytest --timeout=600.
 LAUNCH_TIMEOUT_SECONDS = 480
-
-
-def _worker_command(result_dir: Path) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nnodes=1",
-        f"--nproc-per-node={WORLD_SIZE}",
-        str(Path(__file__).resolve()),
-        "--worker",
-        "--result-dir",
-        str(result_dir),
-    ]
-
-
-def _prepare_worker_env() -> dict[str, str]:
-    try:
-        from tests.distributed.tpu_test_utils import prepare_tpu_environment
-    except ImportError as exc:
-        pytest.skip(f"TorchTPU is unavailable: {exc}")
-    keys = (
-        "TORCH_TPU_XPROF_SESSION_ID",
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
-        "TORCH_TPU_TOPOLOGY",
-    )
-    saved = {k: os.environ.get(k) for k in keys}
-    try:
-        for k in keys:
-            os.environ.pop(k, None)
-        prepare_tpu_environment(world_size=WORLD_SIZE)
-        env = os.environ.copy()
-    except ValueError as exc:
-        pytest.skip(f"Eight TPU devices are unavailable: {exc}")
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    env["TPU_MOE_EP_HIER_RS"] = "bf16"
-    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
-    env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
-    env.setdefault("VLLM_USE_AOT_COMPILE", "0")
-    return env
 
 
 def _rel_err(got, want) -> float:
@@ -127,8 +79,20 @@ def _check(rank: int) -> dict:
 
     hrs._ARMED = hrs._Armed(op=counted, ranks=armed.ranks)
 
+    class _NoFallback:
+        """The EP group's ranks, with no reduce-scatter to fall back to: a
+        call, eager or compiled, that does not take the kernel raises."""
+
+        ranks = ep.ranks
+        world_size = ep.world_size
+
+        def reduce_scatter(self, x, dim):
+            raise AssertionError("fell back to the group's reduce-scatter")
+
+    no_fallback = _NoFallback()
+
     def combine(x):
-        return hrs.moe_combine_reduce_scatter(ep, x)
+        return hrs.moe_combine_reduce_scatter(no_fallback, x)
 
     for how in ("eager", "compiled"):
         for rows, hidden in SHAPES:
@@ -174,84 +138,26 @@ def _check(rank: int) -> dict:
     return out
 
 
-def _run_worker(result_dir: Path) -> None:
-    import torch
-    import torch_tpu  # noqa: F401
-    from torch import distributed as dist
-
-    rank = int(os.environ["RANK"])
-    world = int(os.environ["WORLD_SIZE"])
-    result: dict[str, object] = {"rank": rank, "world": world}
-    initialized = False
-    try:
-        dist.init_process_group(backend="tpu_dist")
-        initialized = True
-        torch.empty((1,), device="tpu").cpu()
-        from vllm.distributed.parallel_state import init_distributed_environment
-
-        init_distributed_environment(
-            world_size=world,
-            rank=rank,
-            local_rank=int(os.environ["LOCAL_RANK"]),
-            distributed_init_method="env://",
-            backend="tpu_dist",
-        )
-        result["check"] = _check(rank)
-    except BaseException as exc:  # noqa: BLE001 - reported to the parent
-        traceback.print_exc()
-        result["error"] = repr(exc)
-    finally:
-        (result_dir / f"rank_{rank}.json").write_text(json.dumps(result, indent=2))
-        if rank == 0:
-            print("RESULT rank0", json.dumps(result), flush=True)
-        if initialized:
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                traceback.print_exc()
-    if "error" in result:
-        raise SystemExit(1)
-
-
-def _launch(result_dir: Path) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        _worker_command(result_dir),
-        cwd=Path(__file__).resolve().parents[2],
-        env=_prepare_worker_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        start_new_session=True,
-    )
-    output = ""
-    try:
-        output, _ = process.communicate(timeout=LAUNCH_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as exc:
-        output = exc.output or ""
-    finally:
-        # Also on pytest's own timeout, which raises out of communicate(): the
-        # workers run in their own session and would keep holding the chips.
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=60)
-    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
-
-
 def test_hier_reduce_scatter_on_real_collectives(tmp_path):
     result_dir = tmp_path / "hier_rs"
     result_dir.mkdir()
-    completed = _launch(result_dir)
-    results = []
-    for rank in range(WORLD_SIZE):
-        path = result_dir / f"rank_{rank}.json"
-        results.append(
-            json.loads(path.read_text())
-            if path.exists()
-            else {"rank": rank, "error": "missing worker result"}
-        )
-    errors = [r for r in results if "error" in r]
-    assert not errors, (errors, (completed.stdout or "")[-4000:])
+    from tests.distributed.tpu_test_utils import (
+        launch_torchrun_workers,
+        read_worker_results,
+        torchrun_worker_env,
+    )
+
+    env = torchrun_worker_env(WORLD_SIZE)
+    env["TPU_MOE_EP_HIER_RS"] = "bf16"
+    completed = launch_torchrun_workers(
+        Path(__file__).resolve(),
+        result_dir,
+        world_size=WORLD_SIZE,
+        env=env,
+        cwd=REPO_ROOT,
+        timeout=LAUNCH_TIMEOUT_SECONDS,
+    )
+    results = read_worker_results(result_dir, WORLD_SIZE, completed)
     for r in results:
         check = r["check"]
         assert check["armed"], (r["rank"], check)
@@ -273,4 +179,8 @@ if __name__ == "__main__":
     parser.add_argument("--result-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.worker:
-        _run_worker(args.result_dir)
+        # Run as a script: the repo root is not on sys.path.
+        sys.path.insert(0, str(REPO_ROOT))
+        from tests.distributed.tpu_test_utils import run_torchrun_worker
+
+        run_torchrun_worker(args.result_dir, _check)

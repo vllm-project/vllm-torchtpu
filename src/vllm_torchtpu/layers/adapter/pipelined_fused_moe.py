@@ -384,8 +384,10 @@ def pipelined_fused_moe_gmm(
             skip_padded_tokens=skip_padded_tokens,
         )
 
-        # Reduce-scatter partial output for current chunk
-        rs_i = moe_combine_reduce_scatter(collective_group, out_i)
+        # Reduce-scatter partial output for current chunk. The group's
+        # collective overlaps the next chunk's MoE compute; a TensorCore
+        # kernel (TPU_MOE_EP_HIER_RS) would not.
+        rs_i = collective_group.reduce_scatter(out_i, dim=0)
         rs_outputs.append(rs_i)
 
         if i + 1 < num_chunks:

@@ -117,7 +117,7 @@ _SUPPORTED = dict(
     world_size=8,
     dp_ranks=list(RANKS),
     topology=SimpleNamespace(num_chips=4, cores_per_chip=2),
-    sorted_gather=False,
+    chip="7x",
 )
 
 
@@ -136,14 +136,20 @@ def _set_world(monkeypatch, **overrides):
         lambda: SimpleNamespace(ranks=world["dp_ranks"]),
     )
     monkeypatch.setattr(chip_topology, "get_chip_topology", lambda: world["topology"])
-    monkeypatch.setattr(
-        hrs.envs, "MOE_FUSED_EP_SORTED_GATHER", world["sorted_gather"], raising=False
-    )
+    from jax.experimental.pallas import tpu as pltpu
+
+    monkeypatch.setattr(hrs, "_chip_version", lambda: pltpu.ChipVersion(world["chip"]))
 
 
 def test_world_reason_accepts_supported_world(monkeypatch):
     _set_world(monkeypatch)
-    assert hrs._unsupported_world_reason() is None
+    assert hrs._unsupported_world_reason(draft_model=False) is None
+
+
+def test_world_reason_refuses_a_draft_model(monkeypatch):
+    _set_world(monkeypatch)
+    got = hrs._unsupported_world_reason(draft_model=True)
+    assert got is not None and "draft model" in got
 
 
 @pytest.mark.parametrize(
@@ -174,16 +180,12 @@ def test_world_reason_accepts_supported_world(monkeypatch):
             "not 2 of 2",
             id="two_chips",
         ),
-        pytest.param(
-            dict(sorted_gather=True),
-            "MOE_FUSED_EP_SORTED_GATHER",
-            id="rank_ordered_mesh",
-        ),
+        pytest.param(dict(chip="v6e"), "tuned for tpu7x", id="not_tpu7x"),
     ],
 )
 def test_world_reason_refuses(monkeypatch, overrides, reason):
     _set_world(monkeypatch, **overrides)
-    got = hrs._unsupported_world_reason()
+    got = hrs._unsupported_world_reason(draft_model=False)
     assert got is not None and reason in got
 
 
@@ -201,9 +203,16 @@ def arming(monkeypatch):
     from vllm_torchtpu.distributed import ep_mesh
 
     monkeypatch.setattr(hrs, "_ARMED", None)
+    monkeypatch.setattr(hrs, "_REFUSED", None)
     monkeypatch.setattr(hrs.envs, "TPU_MOE_EP_HIER_RS", "bf16", raising=False)
-    monkeypatch.setattr(hrs, "_unsupported_world_reason", lambda: None)
-    state = SimpleNamespace(builds=[], mesh=_mesh(range(8)))
+    monkeypatch.setattr(hrs, "_unsupported_world_reason", lambda draft_model: None)
+    state = SimpleNamespace(builds=[], mesh=_mesh(range(8)), gathers=0, peers=[])
+
+    def gather(reason):
+        state.gathers += 1
+        return [reason, *state.peers]
+
+    monkeypatch.setattr(hrs, "_gather_reasons", gather)
     monkeypatch.setattr(ep_mesh, "build_ep_mesh", lambda axis_name: state.mesh)
     monkeypatch.setattr(ep_mesh, "ep_rank_order", lambda: (0, 1, 6, 7, 2, 3, 4, 5))
     monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: _Group())
@@ -218,11 +227,12 @@ def arming(monkeypatch):
 
 def test_prebuild_is_a_noop_when_off(monkeypatch):
     monkeypatch.setattr(hrs, "_ARMED", None)
+    monkeypatch.setattr(hrs, "_REFUSED", None)
     monkeypatch.setattr(hrs.envs, "TPU_MOE_EP_HIER_RS", "off", raising=False)
     monkeypatch.setattr(
         hrs,
         "_unsupported_world_reason",
-        lambda: pytest.fail("must not inspect the world when off"),
+        lambda draft_model: pytest.fail("must not inspect the world when off"),
     )
     assert hrs.prebuild_hier_reduce_scatter() is False
 
@@ -236,16 +246,96 @@ def test_prebuild_arms_once(arming):
     assert hrs._ARMED is not None and hrs._ARMED.ranks == RANKS
 
 
-def test_prebuild_refuses_unsupported_world(arming, monkeypatch):
-    monkeypatch.setattr(hrs, "_unsupported_world_reason", lambda: "no reason")
+def test_prebuild_refuses_unsupported_world_once(arming, monkeypatch):
+    monkeypatch.setattr(hrs, "_unsupported_world_reason", lambda draft_model: "why")
+    assert hrs.prebuild_hier_reduce_scatter() is False
     assert hrs.prebuild_hier_reduce_scatter() is False
     assert hrs._ARMED is None and not arming.builds
+    assert hrs._REFUSED == "why" and arming.gathers == 1
+
+
+def test_prebuild_passes_draft_model(arming, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        hrs, "_unsupported_world_reason", lambda draft_model: seen.append(draft_model)
+    )
+    hrs.prebuild_hier_reduce_scatter(draft_model=True)
+    assert seen == [True]
 
 
 def test_prebuild_refuses_mesh_not_in_device_id_order(arming):
     arming.mesh = _mesh((0, 1, 4, 5, 6, 7, 2, 3))
     assert hrs.prebuild_hier_reduce_scatter() is False
     assert hrs._ARMED is None and not arming.builds
+    assert "ascending device id" in hrs._REFUSED
+
+
+def test_prebuild_refuses_on_every_rank_when_one_refuses(arming):
+    """A rank that would arm must not wait on one that refused."""
+    arming.peers = [None] * 6 + ["the chip topology is unknown"]
+    assert hrs.prebuild_hier_reduce_scatter() is False
+    assert not arming.builds and "ranks disagree" in hrs._REFUSED
+
+
+def test_agreed_reason_when_every_rank_refuses_alike(monkeypatch):
+    monkeypatch.setattr(hrs, "_gather_reasons", lambda reason: [reason] * 8)
+    assert hrs._agreed_reason("why") == "why"
+    assert hrs._agreed_reason(None) is None
+
+
+@pytest.mark.parametrize(
+    "x, reason",
+    [
+        pytest.param(torch.zeros(64, HIDDEN), "float32", id="not_bf16"),
+        pytest.param(torch.zeros(64, 4, 4, dtype=torch.bfloat16), "3 dims", id="3d"),
+        pytest.param(
+            torch.zeros(64, 2816, dtype=torch.bfloat16), "hidden size 2816", id="hidden"
+        ),
+        pytest.param(
+            torch.zeros(56, HIDDEN, dtype=torch.bfloat16), "row count", id="rows"
+        ),
+    ],
+)
+def test_fallback_logs_its_reason(armed, monkeypatch, x, reason):
+    logged = []
+    monkeypatch.setattr(hrs, "_log_fallback", logged.append)
+    hrs.moe_combine_reduce_scatter(_Group(), x)
+    assert len(logged) == 1 and reason in logged[0]
+
+
+def test_fallback_log_compiles_without_a_graph_break(armed):
+    group = _Group()
+    fn = torch.compile(
+        lambda x: hrs.moe_combine_reduce_scatter(group, x),
+        backend="eager",
+        fullgraph=True,
+    )
+    assert fn(torch.zeros(64, 2816, dtype=torch.bfloat16)).shape == (8, 2816)
+    assert armed.calls == 0
+
+
+def test_load_model_arms_through_the_runner(monkeypatch):
+    import inspect
+
+    from vllm_torchtpu.runner import tpu_runner
+
+    runner_cls = tpu_runner.TPUModelRunner
+    assert "self._arm_hier_reduce_scatter()" in inspect.getsource(runner_cls.load_model)
+    seen = []
+    monkeypatch.setattr(
+        hrs,
+        "prebuild_hier_reduce_scatter",
+        lambda draft_model=False: seen.append(draft_model),
+    )
+    runner = object.__new__(runner_cls)
+    for spec, draft in (
+        (None, False),
+        (SimpleNamespace(method="ngram"), False),
+        (SimpleNamespace(method="mtp"), True),
+    ):
+        runner.speculative_config = spec
+        runner._arm_hier_reduce_scatter()
+        assert seen.pop() is draft
 
 
 def test_communicator_combine_routes_through_dispatcher(monkeypatch):
@@ -266,7 +356,9 @@ def test_communicator_combine_routes_through_dispatcher(monkeypatch):
 
 
 @pytest.mark.parametrize("num_chunks", [1, 2])
-def test_pipelined_moe_routes_through_dispatcher(monkeypatch, num_chunks):
+def test_pipelined_moe_routes_single_chunk_through_dispatcher(monkeypatch, num_chunks):
+    """One chunk goes through the dispatcher; the chunk pipeline keeps the
+    group's collective, which overlaps the next chunk's compute."""
     from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
 
     group = _Group()
@@ -296,4 +388,7 @@ def test_pipelined_moe_routes_through_dispatcher(monkeypatch, num_chunks):
         topk=2,
         activation="silu",
     )
-    assert calls == [group] * num_chunks and group.calls == 0
+    if num_chunks == 1:
+        assert calls == [group] and group.calls == 0
+    else:
+        assert not calls and group.calls == num_chunks

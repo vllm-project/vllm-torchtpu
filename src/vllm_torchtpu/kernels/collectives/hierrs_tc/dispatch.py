@@ -25,12 +25,12 @@ from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
 )
 
 # Input bytes per device from which the row-streaming kernel serves a call.
-# Wall-clock per call on tpu7x 2x2x1 at hidden 2048 (us, micro-batched vs
-# row-streaming): 104.5 / 103.9 at 8 MiB, 198.6 / 198.4 at 16 MiB, 245.3 /
-# 240.9 at 24 MiB, 298.0 / 292.7 at 32 MiB. They tie at 16 MiB, and from there
-# the row-streaming kernel is also ahead on memory: it streams through VMEM,
-# where the micro-batched one needs 3 bytes per element of work buffers.
-STREAM_MIN_BYTES = 16 << 20
+# Wall-clock per call on tpu7x 2x2x1, row-streaming over micro-batched, at
+# every shape both take (hidden 2048 to 6144): 1.04 to 1.11 up to 20 MiB, so
+# the micro-batched kernel serves those; 0.97 to 1.035 from 24 MiB, a tie.
+# There the row-streaming kernel wins on memory: it streams through VMEM,
+# where the micro-batched one needs HBM work buffers of 1.5x the input.
+STREAM_MIN_BYTES = 24 << 20
 
 
 def uses_stream(rows: int, hidden: int, itemsize: int) -> bool:

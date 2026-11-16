@@ -324,7 +324,8 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
         self.assertGreater(snr, _MIN_BF16_SNR_DB, msg=f"SNR {snr:.1f} dB")
 
     @parameterized.product(
-        num_micro_batches=[1, 2, 4],
+        # No caller selects one micro-batch (config.py _MIN_SAFE_MICRO_BATCHES).
+        num_micro_batches=[2, 4],
         order=[(7, 6, 5, 4, 3, 2, 1, 0), _TPU7X_RANK_AT_MESH_INDEX],
     )
     def test_micro_batched_order_matches_reference(self, num_micro_batches, order):
@@ -356,14 +357,16 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
 
     @parameterized.product(
         # Rows per rank x hidden at the default threshold: the micro-batched
-        # kernel padded (64, 160) and not (1024, 16000), the row-streaming one
-        # (2048, 16384), and a hidden too wide for its VMEM (2048 x 7168).
+        # kernel padded (64, 160) and not (1024, 2048, 16000), the
+        # row-streaming one (3072, 16384), and a hidden too wide for its VMEM
+        # (2048 x 7168).
         shape=[
             (64, 4096),
             (160, 4096),
             (1024, 4096),
             (16000, 4096),
             (2048, 4096),
+            (3072, 4096),
             (16384, 4096),
             (2048, 7168),
         ],
@@ -449,7 +452,8 @@ class HierarchicalReduceScatterPlanningTest(jtu.JaxTestCase):
             (64, 4096, False),
             (1024, 4096, False),
             (16000, 4096, False),
-            (2048, 4096, True),
+            (2048, 4096, False),
+            (3072, 4096, True),
             (16384, 4096, True),
             (2048, 7168, False),
         ):

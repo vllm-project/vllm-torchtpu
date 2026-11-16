@@ -60,12 +60,16 @@ def supports_chip_topology(num_chips: int, cores_per_chip: int) -> bool:
     )
 
 
+def supports_hidden(num_devices: int, hidden: int) -> bool:
+    return splits_hidden_evenly(hidden, _MIN_SAFE_MICRO_BATCHES, num_devices)
+
+
 def is_supported_by_hierrs_tc(num_devices: int, rows: int, hidden: int) -> bool:
     return (
         supports_num_devices(num_devices)
         and rows % num_devices == 0
         and rows // num_devices >= _MIN_OUTPUT_ROWS
-        and splits_hidden_evenly(hidden, _MIN_SAFE_MICRO_BATCHES, num_devices)
+        and supports_hidden(num_devices, hidden)
     )
 
 

@@ -13,12 +13,13 @@
 # limitations under the License.
 """Arms the EP MoE combine's reduce-scatter on the hierrs_tc kernels.
 
-The op runs on the EP mesh, which must be in ascending device id: arming
-refuses the rank-ordered mesh (`MOE_FUSED_EP_SORTED_GATHER`), because the
-kernel takes its neighbour chips from the mesh order. `group.reduce_scatter`
-hands rank r the r-th row block, so mesh index i receives the block of the
-rank there (`ep_rank_order`). Kernel selection lives in
-`kernels/collectives/hierrs_tc/dispatch.py`.
+`TPUModelRunner.load_model` arms it once per process; every rank must make
+the same decision. The op runs on the EP mesh, which must be in ascending
+device id (so not `MOE_FUSED_EP_SORTED_GATHER`'s rank order on tpu7x), because
+the kernel takes its neighbour chips from the mesh order.
+`group.reduce_scatter` hands rank r the r-th row block, so mesh index i
+receives the block of the rank there (`ep_rank_order`). Kernel selection lives
+in `kernels/collectives/hierrs_tc/dispatch.py`.
 """
 
 from typing import Any, NamedTuple
@@ -39,9 +40,18 @@ class _Armed(NamedTuple):
 
 
 _ARMED: _Armed | None = None
+# Why arming refused, once it has; arming runs at most once per process.
+_REFUSED: str | None = None
 
 
-def _unsupported_world_reason() -> str | None:
+def _chip_version() -> Any:
+    from jax.experimental.pallas import tpu as pltpu
+
+    # The worker owns the TPU by the time the model loads.
+    return pltpu.get_tpu_info().chip_version
+
+
+def _unsupported_world_reason(draft_model: bool) -> str | None:
     import torch.distributed as dist
     from vllm.distributed.parallel_state import get_dp_group
 
@@ -52,6 +62,10 @@ def _unsupported_world_reason() -> str | None:
         supports_num_devices,
     )
 
+    if draft_model:
+        # The draft graph is traced once for every bucket, and whether a call
+        # is eligible depends on its row count.
+        return "a draft model (MTP) is configured"
     ep = get_ep_group()
     if ep is None:
         return "expert parallelism is off"
@@ -69,8 +83,12 @@ def _unsupported_world_reason() -> str | None:
             f"the kernel needs 4 chips of 2 TensorCores, not {topology.num_chips} "
             f"of {topology.cores_per_chip}"
         )
-    if envs.MOE_FUSED_EP_SORTED_GATHER:
-        return "MOE_FUSED_EP_SORTED_GATHER keeps the EP mesh in EP-rank order"
+    from jax.experimental.pallas import tpu as pltpu
+
+    chip = _chip_version()
+    if chip != pltpu.ChipVersion.TPU_7X:
+        # The VMEM limits and the kernel selection are measured on tpu7x.
+        return f"the kernel is tuned for tpu7x, not {chip}"
     return None
 
 
@@ -105,7 +123,7 @@ def _build_op(mesh: Any, order: tuple[int, ...], axis_name: str) -> Any:
         fn,
         mesh=mesh,
         input_partition_specs=(spec,),
-        output_partition_specs=spec,
+        output_partition_specs=(spec,),
     )
     num_devices = len(order)
     # vLLM traces with a dynamic token dimension.
@@ -113,10 +131,36 @@ def _build_op(mesh: Any, order: tuple[int, ...], axis_name: str) -> Any:
     return op
 
 
-def prebuild_hier_reduce_scatter() -> bool:
-    """Returns whether the op is armed. Call outside Dynamo: it runs a collective."""
-    global _ARMED
-    if _ARMED is not None or envs.TPU_MOE_EP_HIER_RS == "off":
+def _gather_reasons(reason: str | None) -> list[str | None]:
+    """Every rank's refusal reason, over the world's CPU group."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return [reason]
+    from vllm.distributed.parallel_state import get_world_group
+
+    seen: list[str | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(seen, reason, group=get_world_group().cpu_group)
+    return seen
+
+
+def _agreed_reason(reason: str | None) -> str | None:
+    """Refuse on every rank if one refuses, so no rank waits on the others in
+    build_ep_mesh or in the kernel."""
+    seen = _gather_reasons(reason)
+    refused = {r: why for r, why in enumerate(seen) if why is not None}
+    if not refused:
+        return None
+    if len(refused) == len(seen) and len(set(refused.values())) == 1:
+        return seen[0]
+    return f"ranks disagree: {refused}"
+
+
+def prebuild_hier_reduce_scatter(draft_model: bool = False) -> bool:
+    """Returns whether the op is armed. Call once on every rank, outside Dynamo:
+    it runs collectives."""
+    global _ARMED, _REFUSED
+    if _ARMED is not None or _REFUSED is not None or envs.TPU_MOE_EP_HIER_RS == "off":
         return _ARMED is not None
 
     from vllm_torchtpu.distributed.ep_mesh import (
@@ -126,15 +170,17 @@ def prebuild_hier_reduce_scatter() -> bool:
         get_ep_group,
     )
 
-    reason = _unsupported_world_reason()
+    reason = _agreed_reason(_unsupported_world_reason(draft_model))
     mesh = order = ep = None
     if reason is None:
         mesh = build_ep_mesh(axis_name=EP_AXIS_NAME)
         order = ep_rank_order()
         ep = get_ep_group()
         assert mesh is not None and order is not None and ep is not None
+        # build_ep_mesh gives every rank the same mesh, so they decide alike.
         reason = _unordered_mesh_reason(mesh)
     if reason is not None:
+        _REFUSED = reason
         logger.warning_once(
             "TPU_MOE_EP_HIER_RS=%s is set, but the MoE combine keeps the group's "
             "reduce-scatter: %s.",
@@ -148,26 +194,49 @@ def prebuild_hier_reduce_scatter() -> bool:
     _ARMED = _Armed(op=op, ranks=tuple(int(r) for r in ep.ranks))
     logger.info_once(
         "MoE combine reduce-scatter runs on hierrs_tc: %d devices, ici_dtype=bf16, "
-        "rank at each mesh index=%s.",
+        "rank at each mesh index=%s.%s",
         len(order),
         order,
+        " Layers the fused EP kernel serves combine inside it instead."
+        if envs.USE_MOE_FUSED_EP_KERNEL
+        else "",
     )
     return True
 
 
-def moe_combine_reduce_scatter(group: Any, x: torch.Tensor) -> torch.Tensor:
-    """`group.reduce_scatter(x, dim=0)`, on hierrs_tc when armed and eligible."""
-    from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
-        is_supported_by_hierrs_tc,
+@torch.compiler.assume_constant_result
+def _log_fallback(reason: str) -> None:
+    """Trace-time log; takes no symbolic values."""
+    logger.warning_once(
+        "TPU_MOE_EP_HIER_RS: a MoE combine keeps the group's reduce-scatter: %s.",
+        reason,
     )
 
+
+def _ineligible_reason(num_devices: int, x: torch.Tensor) -> str | None:
+    from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
+        is_supported_by_hierrs_tc,
+        supports_hidden,
+    )
+
+    if x.dim() != 2:
+        return f"the input has {x.dim()} dims, not 2"
+    if x.dtype != torch.bfloat16:
+        return f"the input is {x.dtype}, not bfloat16"
+    hidden = int(x.shape[1])
+    if not supports_hidden(num_devices, hidden):
+        return f"hidden size {hidden} does not split over {num_devices} devices"
+    if not is_supported_by_hierrs_tc(num_devices, x.shape[0], hidden):
+        return f"the row count does not give {num_devices} devices 8 rows or more each"
+    return None
+
+
+def moe_combine_reduce_scatter(group: Any, x: torch.Tensor) -> torch.Tensor:
+    """`group.reduce_scatter(x, dim=0)`, on hierrs_tc when armed and eligible."""
     armed = _ARMED
-    if (
-        armed is not None
-        and tuple(int(r) for r in group.ranks) == armed.ranks
-        and x.dim() == 2
-        and x.dtype == torch.bfloat16
-        and is_supported_by_hierrs_tc(len(armed.ranks), x.shape[0], x.shape[1])
-    ):
-        return armed.op(x)
+    if armed is not None and tuple(int(r) for r in group.ranks) == armed.ranks:
+        reason = _ineligible_reason(len(armed.ranks), x)
+        if reason is None:
+            return armed.op(x)
+        _log_fallback(reason)
     return group.reduce_scatter(x, dim=0)
