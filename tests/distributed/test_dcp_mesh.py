@@ -58,10 +58,8 @@ def _dcp_mesh_environment(monkeypatch, group, world_size, rank):
         "devices",
         Mock(side_effect=AssertionError("the DCP mesh must not read jax.devices()")),
     )
-    from torch_tpu._internal import pallas as pallas_module
-
     get_pallas_mesh = Mock(side_effect=lambda **kwargs: object())
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", get_pallas_mesh)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", get_pallas_mesh)
     return get_pallas_mesh
 
 

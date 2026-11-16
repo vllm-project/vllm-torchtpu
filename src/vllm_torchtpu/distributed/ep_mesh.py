@@ -304,7 +304,6 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
 
     import numpy as np
     from jax.sharding import Mesh
-    from torch_tpu._internal.pallas import get_pallas_mesh
 
     if stages > 1:
         # The EP group is one pipeline stage.
@@ -312,7 +311,7 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
             (axis_name,), (len(device_ids),), get_ep_group(), unordered
         )
     else:
-        ranked = get_pallas_mesh(axis_names=(axis_name,))
+        ranked = torch.tpu.pallas.get_pallas_mesh(axis_names=(axis_name,))
     by_id = {int(d.id): d for d in ranked.devices.flat}
     if sorted(by_id) != sorted(device_ids):
         # The ids become the DeviceAssignment, and ep_rank_order/ep_mesh_index

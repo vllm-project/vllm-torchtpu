@@ -18,6 +18,7 @@ from unittest.mock import Mock
 import jax
 import numpy as np
 import pytest
+import torch
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu.distributed import ep_mesh as ep
@@ -137,7 +138,6 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
     order: that order is the kernel's DeviceAssignment, and the fused MoE's
     all-gathers are slower over the rank-ordered one."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(
         jax,
@@ -151,7 +151,7 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
             _pallas_devices(rank_device_ids), axis_names
         )
     )
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", made)
     monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: rank_device_ids)
 
@@ -179,13 +179,12 @@ def test_mesh_keeps_pallas_rank_order_under_cp(monkeypatch, cp_size_fn, cp_size)
     [0, 1, 4, 5, 6, 7, 2, 3]. Sorting them here is what failed to compile with
     "Disjoint or conflicting device assignments" on PCP + fused EP."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(ep, cp_size_fn, lambda: cp_size)
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
     rank_device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     monkeypatch.setattr(
-        pallas_module,
+        torch.tpu.pallas,
         "get_pallas_mesh",
         lambda axis_names: _fake_mesh(_pallas_devices(rank_device_ids), axis_names),
     )
@@ -202,11 +201,10 @@ def test_mesh_rejects_pallas_ids_that_are_not_the_groups(monkeypatch):
     """The mesh's ids become the DeviceAssignment and ep_rank_order indexes
     them as the gathered device ids, so any other set must fail at startup."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 4)
     monkeypatch.setattr(
-        pallas_module,
+        torch.tpu.pallas,
         "get_pallas_mesh",
         lambda axis_names: _fake_mesh(_pallas_devices((0, 1, 2, 3)), axis_names),
     )
@@ -222,7 +220,6 @@ def test_mesh_covers_the_stage_under_pipeline_parallelism(monkeypatch):
     """An EP group that is one pipeline stage gets a mesh of its own devices,
     built from its process group."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
     monkeypatch.setattr(
@@ -237,7 +234,7 @@ def test_mesh_covers_the_stage_under_pipeline_parallelism(monkeypatch):
         devices=SimpleNamespace(flat=[SimpleNamespace(id=2), SimpleNamespace(id=3)])
     )
     made = Mock(return_value=mesh)
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", made)
     monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
 
     assert [d.id for d in ep.build_ep_mesh().devices.flat] == [2, 3]
@@ -252,11 +249,10 @@ def test_mesh_rejects_a_group_smaller_than_the_world(monkeypatch):
     describe a sub-group, so a smaller EP group has to fail rather than build
     a mesh of the wrong size."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
     made = Mock()
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", made)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (10, 20))
     with pytest.raises(NotImplementedError, match="spans 2 devices"):
         ep.build_ep_mesh()
