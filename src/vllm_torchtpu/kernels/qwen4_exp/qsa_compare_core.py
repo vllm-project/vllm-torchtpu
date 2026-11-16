@@ -148,8 +148,12 @@ def _kernel(
             return
         buf = kv_bufs[slot]
 
+        # 0 for every tile in a step, but traced: the 128 destination addresses are then formed in the body rather
+        # than hoisted out of the loop, where they stay live and spill to SMEM (~70 bundles a tile).
+        zero = lax.shift_right_logical(k, 30)
+
         def copy(src, j, n):
-            pltpu.make_async_copy(cache_hbm.at[pl.ds(src, n * RATIO)], buf.at[pl.ds(j * RATIO, n * RATIO)],
+            pltpu.make_async_copy(cache_hbm.at[pl.ds(src, n * RATIO)], buf.at[pl.ds(j * RATIO + zero, n * RATIO)],
                                   kv_sem.at[slot]).start()
 
         if pair:
