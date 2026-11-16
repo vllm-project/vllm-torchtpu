@@ -40,7 +40,10 @@ _HBM = pl.BlockSpec(memory_space=pltpu.HBM)
 _SEM = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
 # The start and wait only issue and wait on DMAs.
 _VMEM_LIMIT_BYTES = 1 << 20
-# The transfer time the scheduler should hide, in ns.
+# Roughly how long the 8 MiB block (T=128 tokens x 64 heads x 512 x bf16) takes to
+# arrive, in ns: the scheduler puts about that much independent work between the
+# start and the wait. With 20 us the wait is ~0 us in every layer on DSv4-Pro c160;
+# larger values (100-120 us) hid nothing more.
 _LATENCY_NS = "20000"
 
 
