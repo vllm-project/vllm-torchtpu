@@ -431,9 +431,16 @@ def _resolve_moe_dimensions(
 
     top_k = _as_int(
         tc.get("num_experts_per_tok")
+        or tc.get("num_experts_per_token")
+        or tc.get("experts_per_token")
         or tc.get("num_selected_experts")
-        or tc.get("top_k")
     )
+    if num_experts > 0 and top_k <= 0:
+        msg = (
+            "MoE config names no routed experts per token (num_experts_per_tok, "
+            "num_experts_per_token, experts_per_token, num_selected_experts)"
+        )
+        raise ValueError(msg)
     return num_experts, top_k, moe_inter, num_shared, shared_inter
 
 

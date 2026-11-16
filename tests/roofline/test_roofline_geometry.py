@@ -742,3 +742,37 @@ def test_chips_sources_contain_no_legacy_tpu_v5_or_v4_references() -> None:
             assert not pattern.search(desc), (
                 f"legacy reference in {key}.description: {desc}"
             )
+
+
+def test_config_with_experts_per_token_and_sampling_top_k_reads_routed_count() -> None:
+    """Read the routed experts per token, not a sampling top_k in the same config."""
+    expected_routed_experts_per_token = 16
+    routed_and_sampling_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "num_experts": 896,
+        "num_experts_per_token": 16,
+        "top_k": 50,
+        "moe_intermediate_size": 1024,
+        "vocab_size": 163840,
+    }
+    geom = from_hf_config(routed_and_sampling_cfg)
+    assert geom.top_k == expected_routed_experts_per_token
+
+
+def test_moe_config_without_routed_experts_key_is_rejected() -> None:
+    """Reject a MoE config that names no routed experts per token."""
+    sampling_only_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "num_experts": 896,
+        "top_k": 50,
+        "moe_intermediate_size": 1024,
+        "vocab_size": 163840,
+    }
+    with pytest.raises(ValueError, match="routed experts per token"):
+        from_hf_config(sampling_only_cfg)
