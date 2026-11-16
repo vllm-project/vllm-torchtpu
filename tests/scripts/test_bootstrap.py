@@ -29,6 +29,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import unittest
 from collections.abc import Mapping
@@ -2851,50 +2852,173 @@ class TestBootstrapUnits(unittest.TestCase):
             ],
         )
 
-    def test_run_eval_flow_stops_when_it_cannot_read_the_chip(self) -> None:
+    def test_run_eval_flow_terminates_with_unknown_chip(self) -> None:
         # run_eval_flow.sh picks the perf baselines by the chip vllm_torchtpu
-        # reads. When that fails, a run that gates on perf stops before it
-        # benchmarks anything and says what to set, where it used to go on
-        # with v7x's baselines.
+        # reads. A run that gates on perf stops before it benchmarks anything,
+        # and says what to set, when it cannot tell the chip: the lookup does
+        # not run, no accelerator type is set, the type names no chip
+        # vllm_torchtpu knows, or tpu_info reads it as another chip. Each of
+        # those used to go on with v7x's baselines. A type that names a chip
+        # goes on to the benchmark with that chip's baselines.
         flow = _REPO_ROOT / "scripts/vllm/benchmarking/run_eval_flow.sh"
+        # tpu_info as far as the script uses it. Like the real one,
+        # get_chip_version takes a type it does not know for TPU7x; with
+        # STUB_FALLS_BACK set it knows none.
+        fake_tpu_info = textwrap.dedent(
+            """\
+            import enum
+            import os
+
+
+            class ChipVersion(enum.Enum):
+                TPU_V5E = "v5e"
+                TPU_V6E = "v6e"
+                TPU_7X = "7x"
+
+
+            def get_tpu_type():
+                return os.environ.get("TPU_ACCELERATOR_TYPE", "")
+
+
+            def get_chip_version(accelerator_type=None):
+                name = (accelerator_type or get_tpu_type() or "").strip().lower()
+                name = name.split("-")[0].removeprefix("tpu")
+                name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+                known = not os.environ.get("STUB_FALLS_BACK")
+                if known and name in {chip.value for chip in ChipVersion}:
+                    return ChipVersion(name)
+                return ChipVersion.TPU_7X
+            """
+        )
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
-            bin_dir = tmp_path / "bin"
-            bin_dir.mkdir()
+            package = tmp_path / "stub" / "vllm_torchtpu"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "tpu_info.py").write_text(fake_tpu_info, encoding="utf-8")
             calls = tmp_path / "python3.calls"
-            fake_python = bin_dir / "python3"
-            fake_python.write_text(
-                f'#!/usr/bin/env bash\necho called >> "{calls}"\nexit 1\n',
-                encoding="utf-8",
-            )
-            fake_python.chmod(fake_python.stat().st_mode | stat.S_IEXEC)
+
+            def python3_dir(name: str, last_line: str) -> pathlib.Path:
+                bin_dir = tmp_path / name
+                bin_dir.mkdir()
+                fake_python = bin_dir / "python3"
+                fake_python.write_text(
+                    f'#!/usr/bin/env bash\necho called >> "{calls}"\n{last_line}\n',
+                    encoding="utf-8",
+                )
+                fake_python.chmod(fake_python.stat().st_mode | stat.S_IEXEC)
+                return bin_dir
+
+            # A python3 that cannot run the lookup, and one that runs it.
+            broken = python3_dir("broken", "exit 1")
+            working = python3_dir("working", f'exec "{sys.executable}" "$@"')
+            # The script reaches the benchmark by a path relative to where it
+            # is run, so a run that gets that far starts this stand-in.
+            work = tmp_path / "work"
+            benchmark = work / "scripts/vllm/benchmarking/run_benchmarks.sh"
+            benchmark.parent.mkdir(parents=True)
+            benchmark.write_text("#!/usr/bin/env bash\nexit 3\n", encoding="utf-8")
+            benchmark.chmod(benchmark.stat().st_mode | stat.S_IEXEC)
             results = tmp_path / "results"
-            # --host: a server that is already up, so the script neither
-            # starts one nor registers its cleanup.
-            stopped = subprocess.run(
-                [
-                    "bash",
-                    str(flow),
-                    "--config",
-                    "qwen3-0.6b-tp1",
-                    "--host",
-                    "127.0.0.1",
-                    "--results-dir",
-                    str(results),
-                ],
-                cwd=_REPO_ROOT,
-                env={"PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}"},
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(stopped.returncode, 1, stopped.stderr)
-            self.assertIn("ERROR: could not read the TPU chip", stopped.stderr)
-            self.assertIn("TPU_ACCELERATOR_TYPE", stopped.stderr)
-            self.assertNotIn("using v7x's perf baselines", stopped.stdout)
-            # The chip lookup was the only thing run: no benchmark, no check.
-            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 1)
-            self.assertEqual(list(results.iterdir()), [])
+
+            def run(
+                bin_dir: pathlib.Path, **env: str
+            ) -> subprocess.CompletedProcess[str]:
+                calls.write_text("", encoding="utf-8")
+                shutil.rmtree(results, ignore_errors=True)
+                # --host: a server that is already up, so the script neither
+                # starts one nor registers its cleanup.
+                return subprocess.run(
+                    [
+                        "bash",
+                        str(flow),
+                        "--config",
+                        "qwen3-0.6b-tp1",
+                        "--host",
+                        "127.0.0.1",
+                        "--results-dir",
+                        str(results),
+                    ],
+                    cwd=work,
+                    env={
+                        "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                        "PYTHONPATH": str(package.parent),
+                        **env,
+                    },
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+            unknown = "names no chip vllm_torchtpu knows"
+            for case, bin_dir, env, reason in (
+                (
+                    "the lookup does not run",
+                    broken,
+                    {"TPU_ACCELERATOR_TYPE": "v6e"},
+                    "",
+                ),
+                ("no type is set", working, {}, "TPU_ACCELERATOR_TYPE is unset"),
+                (
+                    "a chip newer than this vllm_torchtpu",
+                    working,
+                    {"TPU_ACCELERATOR_TYPE": "v8x-8"},
+                    unknown,
+                ),
+                ("a typo", working, {"TPU_ACCELERATOR_TYPE": "v6ee"}, unknown),
+                (
+                    "a typo that still says 7x",
+                    working,
+                    {"TPU_ACCELERATOR_TYPE": "tpu7xx"},
+                    unknown,
+                ),
+                (
+                    "TPU_VERSION's name for v6e, which tpu_info does not know",
+                    working,
+                    {"TPU_ACCELERATOR_TYPE": "tpu6e"},
+                    unknown,
+                ),
+                (
+                    "tpu_info falls back to TPU7x for a type that names another chip",
+                    working,
+                    {"TPU_ACCELERATOR_TYPE": "v6e", "STUB_FALLS_BACK": "1"},
+                    "tpu_info reads TPU accelerator type 'v6e' as 7x, not v6e",
+                ),
+            ):
+                with self.subTest(case=case):
+                    stopped = run(bin_dir, **env)
+                    self.assertEqual(stopped.returncode, 1, stopped.stderr)
+                    self.assertIn("ERROR: could not read the TPU chip", stopped.stderr)
+                    self.assertIn("TPU_ACCELERATOR_TYPE", stopped.stderr)
+                    self.assertIn(reason, stopped.stderr)
+                    self.assertNotIn("Perf baseline for", stopped.stdout)
+                    # The chip lookup was the only thing run: no benchmark, no
+                    # check.
+                    self.assertEqual(
+                        len(calls.read_text(encoding="utf-8").splitlines()), 1
+                    )
+                    self.assertEqual(list(results.iterdir()), [])
+
+            # A type that names a chip goes on, as far as the benchmark, with
+            # that chip's baselines: the types the perf steps and GKE set. A
+            # tpu_info that reads every type as TPU7x does not stop the type
+            # that names it.
+            for env, chip in (
+                ({"TPU_ACCELERATOR_TYPE": "v6e"}, "v6e"),
+                ({"TPU_ACCELERATOR_TYPE": "v6e-8"}, "v6e"),
+                ({"TPU_ACCELERATOR_TYPE": "tpu7x"}, "v7x"),
+                ({"TPU_ACCELERATOR_TYPE": "tpu7x-8"}, "v7x"),
+                ({"TPU_ACCELERATOR_TYPE": "tpu7x", "STUB_FALLS_BACK": "1"}, "v7x"),
+            ):
+                with self.subTest(env=env):
+                    went_on = run(working, **env)
+                    self.assertEqual(went_on.returncode, 3, went_on.stderr)
+                    self.assertNotIn("ERROR", went_on.stderr)
+                    self.assertIn(
+                        f"Perf baseline for {chip}: scripts/vllm/benchmarking/"
+                        f"baselines/perf/{chip}/qwen3-0.6b-tp1.baseline.json",
+                        went_on.stdout,
+                    )
 
     def test_expand_env_interpolates_as_buildkite_does(self) -> None:
         # The fake agent and _render_doc both use it: $$ is a literal $ and
@@ -3045,35 +3169,34 @@ class TestBootstrapUnits(unittest.TestCase):
             gen: [s for s in steps if not _left_out(bp, s)] for gen, steps in on.items()
         }
 
-        # The General suite: each generation runs one step of it. v6e's is a
-        # step of its own, with v7x's configs, in order, less the two a v6e
-        # 2x4 slice cannot run - DeepSeek-V2 in bf16 outgrows its 256 GB, and
-        # nvfp4 needs native fp4. Each step is two configs to a slice.
+        # The General suite is two steps. Every generation runs the first, of
+        # the configs all of them can run. v7x alone runs the second, of the
+        # two a v6e 2x4 slice cannot - DeepSeek-V2 in bf16 outgrows its 256 GB,
+        # and nvfp4 needs native fp4. Each step is two configs to a slice.
         def configs(step: dict[str, Any]) -> list[str]:
             command = " ".join(step["commands"])
             return command.split("run_eval_configs.sh", 1)[1].replace("\\", " ").split()
 
-        def general(gen: str) -> dict[str, Any]:
-            (step,) = [
+        def general(gen: str) -> list[dict[str, Any]]:
+            return [
                 s
                 for s in runs[gen]
                 if "General suite" in s["label"] and "Nightly" not in s["label"]
             ]
-            return step
 
-        v6e_general, v7x_general = general("v6e"), general("v7x")
+        (v6e_general,) = general("v6e")
+        v7x_general, v7x_only = general("v7x")
         self.assertNotEqual(v6e_general["label"], v7x_general["label"])
+        self.assertEqual(configs(v6e_general), configs(v7x_general))
         v6e_cannot_run = {"deepseek-v2-tp8-ep", "qwen3-30b-a3b-nvfp4-tp8-ep"}
-        self.assertLessEqual(v6e_cannot_run, set(configs(v7x_general)))
-        self.assertEqual(
-            configs(v6e_general),
-            [c for c in configs(v7x_general) if c not in v6e_cannot_run],
-        )
-        for step in (v6e_general, v7x_general):
-            self.assertEqual(len(configs(step)), 2 * step["parallelism"], step["label"])
-        # The full step is kept from v6e alone, not given to v7x alone, so a
-        # generation added later runs it.
-        self.assertIn('!= "v6e"', v7x_general["if"])
+        self.assertEqual(set(configs(v7x_only)), v6e_cannot_run)
+        self.assertFalse(v6e_cannot_run & set(configs(v6e_general)))
+        for step in (v6e_general, v7x_general, v7x_only):
+            self.assertEqual(
+                len(configs(step)), 2 * step.get("parallelism", 1), step["label"]
+            )
+        # The first step names no generation, so one added later runs it.
+        self.assertIsNone(_generation_check_re(bp).search(v7x_general.get("if", "")))
 
         # The server reads the chip from TPU_ACCELERATOR_TYPE, the results
         # upload names the device after it, and run_eval_flow.sh picks the

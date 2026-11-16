@@ -74,20 +74,10 @@ lane, because its LKG promotion waits on two of its steps.
 
 Like the other lanes, the perf lane goes up once for each chip the build runs.
 A v6e 2x4 slice holds 256 GB of HBM to a v7x-8's 768 GB, so v6e runs only
-what fits and needs neither fp4 nor `run_multihost.sh`: a General suite step
-of its own, qwen3-0.6b, and the nightly general suite. v6e's General suite
-step is the General suite less the two configs that need more (deepseek-v2,
-~470 GB in bf16, and the native-fp4 qwen3-30b-a3b-nvfp4); an `if` on
-`TPU_GENERATION` gives v6e that step and every other generation the full one.
-Every other step v6e cannot run carries an `if` comparing `TPU_GENERATION`
-with `v7x`. The
-steps set `TPU_ACCELERATOR_TYPE` from the generation: the server reads the chip
-from it, the results upload names the device after it, and `run_eval_flow.sh`
-gates on that chip's perf baselines in
-`scripts/vllm/benchmarking/baselines/perf/<chip>/`. All of those are v7x's for
-now, so v6e reports its numbers without the perf gate until a v6e baseline
-lands for a config; the accuracy gate, whose baselines are shared, still
-applies.
+what fits and needs neither fp4 nor `run_multihost.sh`: the General suite,
+qwen3-0.6b, the nightly general suite, and the nightly
+qwen3-32b-tp8-offload-prefix. The General suite is two steps. Every generation
+runs the first. The second runs on every generation but v6e.
 
 A PR labeled `skip-tpu-ci` (it still needs `ready`) uploads only the `cpu` lane
 and the image build (skipping the `-omni` image and every TPU lane), so what

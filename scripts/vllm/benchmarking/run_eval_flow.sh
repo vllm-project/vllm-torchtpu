@@ -155,15 +155,32 @@ BASELINE_CONFIG="${BASELINE_CONFIG:-$CONFIG_NAME}"
 #
 # A run that gates on perf stops here, before the server starts, when the chip
 # cannot be read: another chip's baselines would gate it on the wrong numbers,
-# or on none. --skip-perf-check needs no chip.
+# or on none. That includes an accelerator type that names no chip tpu_info
+# knows (a typo, or a chip newer than the installed vllm_torchtpu), which
+# tpu_info.get_chip_version takes for TPU7x: the name is looked up below
+# without that fallback, and has to be the chip get_chip_version reads.
+# --skip-perf-check needs no chip.
 PERF_BASELINE=""
 if [ "$SKIP_PERF_CHECK" = "0" ]; then
     TPU_CHIP=$(python3 -c '
 import sys
 from vllm_torchtpu.tpu_info import get_chip_version, get_tpu_type
-if not get_tpu_type():
+
+tpu_type = get_tpu_type()
+if not tpu_type:
     sys.exit("TPU_ACCELERATOR_TYPE is unset and the GCE metadata names no accelerator type")
-v = get_chip_version().value
+read = get_chip_version(tpu_type)
+# The name as get_chip_version normalizes it, looked up without its fallback
+# to TPU7x
+name = tpu_type.strip().lower().split("-")[0].removeprefix("tpu")
+name = {"v7x": "7x"}.get(name, name)
+try:
+    chip = type(read)(name)
+except ValueError:
+    sys.exit(f"TPU accelerator type {tpu_type!r} names no chip vllm_torchtpu knows")
+if read is not chip:
+    sys.exit(f"tpu_info reads TPU accelerator type {tpu_type!r} as {read.value}, not {chip.value}")
+v = chip.value
 print("TPU_CHIP=" + (v if v.startswith("v") else "v" + v))
 ' | sed -n 's/^TPU_CHIP=//p' | tail -n 1) || TPU_CHIP=""
     if [ -z "$TPU_CHIP" ]; then

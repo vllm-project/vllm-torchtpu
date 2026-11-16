@@ -69,8 +69,7 @@ x-general-suite-env: &general_suite_env
 steps:
   - group: "Perf and Eval on TPU"
     steps:
-      # The General suite, two configs to a slice. Every generation runs it
-      # but v6e, which has the step below.
+      # The General suite, two configs to a slice.
       - label: "Perf/Eval: General suite (TPU ${TPU_GENERATION:-v7x}-8)"
         <<: *perf_step
         parallelism: 2
@@ -86,9 +85,9 @@ steps:
               gemma-4-26b-fp8-dp4-tp2-multimodal
 
       # General suite cases that does not fit on v6e
-      - label: "Perf/Eval: General suite, v7x only"
+      - label: "Perf/Eval: General suite, v7x subset (TPU v7x-8)"
         <<: *perf_step
-        if: '"${TPU_GENERATION:-v7x}" == "v7x"'
+        if: '"${TPU_GENERATION:-v7x}" != "v6e"'
         env: *general_suite_env
         plugins:
           - *kube_plugin
