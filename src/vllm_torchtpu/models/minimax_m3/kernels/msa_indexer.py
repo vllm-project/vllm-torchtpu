@@ -463,7 +463,10 @@ def _kernel_v3(
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
     # Prefill-chunk tiles only (`FP8_MXU_QUERIES`); decode-sized tiles keep bf16.
     fp8_queries = FP8_MXU_QUERIES and block_q > DEFAULT_BLOCK_Q
-    q_pair_fp8 = q_pair.astype(jnp.float8_e4m3fn) if fp8_queries else None
+    # Saturate: e4m3 has no inf, and a cast past its 448 range reads NaN.
+    q_pair_fp8 = (
+        jnp.clip(q_pair, -448, 448).astype(jnp.float8_e4m3fn) if fp8_queries else None
+    )
     num_chunks = pages_per_step // chunk
     # The ahead group's descriptors, spread over the first chunks' page pairs
     # (in one chunk they crowd its scalar slots: slower, bench j-9956cd34;
