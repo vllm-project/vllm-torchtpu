@@ -35,6 +35,7 @@ from vllm_torchtpu.offload.metrics import (
     RaidenOffloadPromMetrics,
     RaidenOffloadStatsCollector,
     build_raiden_offload_metric_definitions,
+    compute_load_tokens_by_source,
     external_sources_with_tokens,
     split_external_hit,
 )
@@ -102,12 +103,10 @@ def test_collector_unknown_sources_handling() -> None:
 
 
 def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
-    collector = RaidenOffloadStatsCollector(storage_backend="posix")
-
     # 1. Single attention key (64 tokens, 4 x 16-token sub-blocks):
     # 3 HOST + 1 DISK sub-blocks form 2 runs -> 48 HOST + 16 DISK.
     k_dense = make_offload_key(b"dense0", 0)
-    assert collector.compute_load_tokens_by_source(
+    assert compute_load_tokens_by_source(
         start_token=0,
         end_token=64,
         load_key_ranges=[(0, 64, k_dense)],
@@ -120,7 +119,7 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
 
     # 2. Partial-tail range [0, 48) on a 64-token chunk excludes t3 ([48, 64)).
     k_tail = make_offload_key(b"tail0", 0)
-    assert collector.compute_load_tokens_by_source(
+    assert compute_load_tokens_by_source(
         start_token=0,
         end_token=48,
         load_key_ranges=[(0, 48, k_tail)],
@@ -141,7 +140,7 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     # key, and a key of 384 HOST + 128 DISK sub-blocks in 2 runs.
     k_big0 = make_offload_key(b"big0", 0)
     k_big_mixed = make_offload_key(b"big_mixed", 0)
-    assert collector.compute_load_tokens_by_source(
+    assert compute_load_tokens_by_source(
         start_token=0,
         end_token=16384,
         load_key_ranges=[(0, 8192, k_big0), (8192, 16384, k_big_mixed)],
@@ -164,7 +163,7 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
         k_a0: ((CacheHitSource.HOST, 4),),
         k_a1: ((CacheHitSource.HOST, 2), (CacheHitSource.P2P, 2)),
     }
-    assert collector.compute_load_tokens_by_source(
+    assert compute_load_tokens_by_source(
         start_token=0,
         end_token=32,
         load_key_ranges=[(0, 16, k_a0), (16, 32, k_a1), (0, 32, k_m1)],
@@ -178,7 +177,7 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
 
     # If Mamba's indivisible checkpoint has one byte slice in DISK, the whole
     # prefix [0, 32) depends on that DISK checkpoint -> {DISK: 32}.
-    assert collector.compute_load_tokens_by_source(
+    assert compute_load_tokens_by_source(
         start_token=0,
         end_token=32,
         load_key_ranges=[(0, 16, k_a0), (16, 32, k_a1), (0, 32, k_m1)],
@@ -212,11 +211,10 @@ def test_compute_load_tokens_by_source_clips_mixed_key_to_hit_range(
     key_range: tuple[int, int],
     expected: dict[CacheHitSource, int],
 ) -> None:
-    collector = RaidenOffloadStatsCollector(storage_backend="posix")
     # A 64-token key with four 16-token sub-blocks: two in host DRAM, two on disk.
     key = make_offload_key(b"mixed", 0)
     assert (
-        collector.compute_load_tokens_by_source(
+        compute_load_tokens_by_source(
             start_token=start_token,
             end_token=end_token,
             load_key_ranges=[(*key_range, key)],
@@ -246,9 +244,8 @@ def test_compute_load_tokens_by_source_unsplit_key_uses_slowest_tier(
         "vllm_torchtpu.offload.metrics.logger.warning_once",
         lambda *args: warnings.append(args),
     )
-    collector = RaidenOffloadStatsCollector(storage_backend="posix")
     key = make_offload_key(b"mixed", 0)
-    assert collector.compute_load_tokens_by_source(
+    assert compute_load_tokens_by_source(
         start_token=0,
         end_token=64,
         load_key_ranges=[(0, 64, key)],

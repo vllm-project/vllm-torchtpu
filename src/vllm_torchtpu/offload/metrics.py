@@ -18,9 +18,11 @@ In vLLM V1, the scheduler (`EngineCore`) and Prometheus `/metrics` endpoint
 Host/Peer/Storage transfers from the scheduler-side `KVCacheStore` controller
 (worker-side `get_finished()` is always empty):
 
-- `RaidenOffloadStatsCollector` runs in `EngineCore`, computing deduplicated
-  token counts per tier and draining per-step deltas as
-  `OffloadingConnectorStats` via `pop_stats()`.
+- `compute_load_tokens_by_source` runs in `EngineCore`, computing deduplicated
+  token counts per tier for one offload hit.
+- `RaidenOffloadStatsCollector` runs in `EngineCore`, counting hit tokens per
+  tier and draining per-step deltas as `OffloadingConnectorStats` via
+  `pop_stats()`.
 - `RaidenOffloadPromMetrics` runs in the API server process, registering
   Raiden's `OffloadingSpec` metric definitions and applying IPC stats deltas to
   Prometheus counters and histograms.
@@ -195,6 +197,105 @@ def split_external_hit(
     return split
 
 
+def compute_load_tokens_by_source(
+    *,
+    start_token: int,
+    end_token: int,
+    load_key_ranges: Iterable[tuple[int, int, OffloadKey]],
+    key_sources: Mapping[OffloadKey, SubBlockSourceCounts],
+    tokens_per_chunk_by_group: Mapping[int, int],
+    mamba_group_ids: Collection[int] = (),
+) -> dict[CacheHitSource, int]:
+    """Compute deduplicated external token counts at sub-block granularity.
+
+    Phase 1 converts each key's clipped `[lo, hi)` span into interval events
+    from its `SubBlockSourceCounts` in `key_sources`:
+    - Uniform keys (`len(source_counts) == 1`) emit a single `[lo, hi)`
+      interval in O(1) regardless of `device_block_size_factor`.
+    - Mixed Attention keys split `[lo, hi)` across `(source, count)` pairs
+      (`count * tokens_per_sub` tokens each), preserving exact `HOST` /
+      `P2P` / `DISK` ratios without iterating individual sub-blocks.
+    - Recurrent (`MambaSpec`) keys slice a single state checkpoint by bytes
+      rather than token positions; all byte slices are needed together to
+      restore that checkpoint, so `[lo, hi)` uses `CacheHitSource.outermost`.
+    - A mixed key that cannot be split evenly by sub-block also uses
+      `CacheHitSource.outermost`, and logs a warning.
+
+    Phase 2 sweeps sorted event boundaries across `[start_token, end_token)`
+    to deduplicate overlapping ranges emitted by multi-group / hybrid models
+    for the same prompt tokens, attributing shared spans via
+    `CacheHitSource.outermost` (the slowest tier required to materialize the
+    span). Tokens no key covers are left out; `split_external_hit`
+    reports them to upstream as `EXTERNAL_UNSPECIFIED`.
+
+    For example, in a hybrid model whose attention keys for tokens
+    `[0, 1536)` are in host DRAM and whose Mamba key for `[768, 1536)` is on
+    disk, `[768, 1536)` needs both tiers and counts as the slower one:
+    `{HOST: 768, DISK: 768}`.
+    """
+    if end_token <= start_token:
+        return {}
+
+    # Phase 1: build `(token_pos, +1/-1, source)` interval events.
+    events: list[tuple[int, int, CacheHitSource]] = []
+    for raw_lo, raw_hi, key in load_key_ranges:
+        # Clip out tokens already resident in device HBM (`< start_token`).
+        lo = max(start_token, raw_lo)
+        hi = min(end_token, raw_hi)
+        if lo >= hi:
+            continue
+        source_counts = key_sources[key]
+        if len(source_counts) == 1:
+            only_source = source_counts[0][0]
+            events.extend(((lo, 1, only_source), (hi, -1, only_source)))
+            continue
+
+        group_idx = get_offload_group_idx(key)
+        is_mamba = group_idx in mamba_group_ids
+        tokens_per_chunk = tokens_per_chunk_by_group.get(group_idx, 0)
+        num_sub = sum(count for _, count in source_counts)
+        if is_mamba or tokens_per_chunk <= 0 or tokens_per_chunk % num_sub != 0:
+            if not is_mamba:
+                logger.warning_once(
+                    "TPURaidenOffloadingConnector: cannot split a mixed-tier "
+                    "key of KV cache group %d by sub-block (%d tokens per "
+                    "chunk, %d sub-blocks); attributing it to its slowest tier.",
+                    group_idx,
+                    tokens_per_chunk,
+                    num_sub,
+                )
+            source = CacheHitSource.outermost(src for src, _ in source_counts)
+            events.extend(((lo, 1, source), (hi, -1, source)))
+            continue
+
+        tokens_per_sub = tokens_per_chunk // num_sub
+        chunk_start = (lo // tokens_per_chunk) * tokens_per_chunk
+        sub_offset = 0
+        for source, count in source_counts:
+            span_lo = max(lo, chunk_start + sub_offset * tokens_per_sub)
+            sub_offset += count
+            span_hi = min(hi, chunk_start + sub_offset * tokens_per_sub)
+            if span_lo < span_hi:
+                events.extend(((span_lo, 1, source), (span_hi, -1, source)))
+
+    if not events:
+        return {}
+
+    # Phase 2: sweep sorted endpoints to deduplicate overlapping KV groups.
+    sources: dict[CacheHitSource, int] = {}
+    active: Counter[CacheHitSource] = Counter()
+    position = start_token
+    for boundary, delta, source in sorted(events):
+        if boundary > position:
+            active_sources = [src for src, cnt in active.items() if cnt > 0]
+            if active_sources:
+                resolved = CacheHitSource.outermost(active_sources)
+                sources[resolved] = sources.get(resolved, 0) + (boundary - position)
+        active[source] += delta
+        position = boundary
+    return external_sources_with_tokens(sources)
+
+
 class RaidenOffloadStatsCollector:
     """Scheduler-side collector producing `OffloadingConnectorStats` deltas."""
 
@@ -231,105 +332,6 @@ class RaidenOffloadStatsCollector:
                 return (CacheHitSource.DISK.value, UNKNOWN_BACKEND_LABEL)
             return (CacheHitSource.DISK.value, self._storage_backend)
         raise ValueError(f"Unsupported offload source for metrics: {source!r}")
-
-    def compute_load_tokens_by_source(
-        self,
-        *,
-        start_token: int,
-        end_token: int,
-        load_key_ranges: Iterable[tuple[int, int, OffloadKey]],
-        key_sources: Mapping[OffloadKey, SubBlockSourceCounts],
-        tokens_per_chunk_by_group: Mapping[int, int],
-        mamba_group_ids: Collection[int] = (),
-    ) -> dict[CacheHitSource, int]:
-        """Compute deduplicated external token counts at sub-block granularity.
-
-        Phase 1 converts each key's clipped `[lo, hi)` span into interval events
-        from its `SubBlockSourceCounts` in `key_sources`:
-        - Uniform keys (`len(source_counts) == 1`) emit a single `[lo, hi)`
-          interval in O(1) regardless of `device_block_size_factor`.
-        - Mixed Attention keys split `[lo, hi)` across `(source, count)` pairs
-          (`count * tokens_per_sub` tokens each), preserving exact `HOST` /
-          `P2P` / `DISK` ratios without iterating individual sub-blocks.
-        - Recurrent (`MambaSpec`) keys slice a single state checkpoint by bytes
-          rather than token positions; all byte slices are needed together to
-          restore that checkpoint, so `[lo, hi)` uses `CacheHitSource.outermost`.
-        - A mixed key that cannot be split evenly by sub-block also uses
-          `CacheHitSource.outermost`, and logs a warning.
-
-        Phase 2 sweeps sorted event boundaries across `[start_token, end_token)`
-        to deduplicate overlapping ranges emitted by multi-group / hybrid models
-        for the same prompt tokens, attributing shared spans via
-        `CacheHitSource.outermost` (the slowest tier required to materialize the
-        span). Tokens no key covers are left out; `split_external_hit`
-        reports them to upstream as `EXTERNAL_UNSPECIFIED`.
-
-        For example, in a hybrid model whose attention keys for tokens
-        `[0, 1536)` are in host DRAM and whose Mamba key for `[768, 1536)` is on
-        disk, `[768, 1536)` needs both tiers and counts as the slower one:
-        `{HOST: 768, DISK: 768}`.
-        """
-        if end_token <= start_token:
-            return {}
-
-        # Phase 1: build `(token_pos, +1/-1, source)` interval events.
-        events: list[tuple[int, int, CacheHitSource]] = []
-        for raw_lo, raw_hi, key in load_key_ranges:
-            # Clip out tokens already resident in device HBM (`< start_token`).
-            lo = max(start_token, raw_lo)
-            hi = min(end_token, raw_hi)
-            if lo >= hi:
-                continue
-            source_counts = key_sources[key]
-            if len(source_counts) == 1:
-                only_source = source_counts[0][0]
-                events.extend(((lo, 1, only_source), (hi, -1, only_source)))
-                continue
-
-            group_idx = get_offload_group_idx(key)
-            is_mamba = group_idx in mamba_group_ids
-            tokens_per_chunk = tokens_per_chunk_by_group.get(group_idx, 0)
-            num_sub = sum(count for _, count in source_counts)
-            if is_mamba or tokens_per_chunk <= 0 or tokens_per_chunk % num_sub != 0:
-                if not is_mamba:
-                    logger.warning_once(
-                        "TPURaidenOffloadingConnector: cannot split a mixed-tier "
-                        "key of KV cache group %d by sub-block (%d tokens per "
-                        "chunk, %d sub-blocks); attributing it to its slowest tier.",
-                        group_idx,
-                        tokens_per_chunk,
-                        num_sub,
-                    )
-                source = CacheHitSource.outermost(src for src, _ in source_counts)
-                events.extend(((lo, 1, source), (hi, -1, source)))
-                continue
-
-            tokens_per_sub = tokens_per_chunk // num_sub
-            chunk_start = (lo // tokens_per_chunk) * tokens_per_chunk
-            sub_offset = 0
-            for source, count in source_counts:
-                span_lo = max(lo, chunk_start + sub_offset * tokens_per_sub)
-                sub_offset += count
-                span_hi = min(hi, chunk_start + sub_offset * tokens_per_sub)
-                if span_lo < span_hi:
-                    events.extend(((span_lo, 1, source), (span_hi, -1, source)))
-
-        if not events:
-            return {}
-
-        # Phase 2: sweep sorted endpoints to deduplicate overlapping KV groups.
-        sources: dict[CacheHitSource, int] = {}
-        active: Counter[CacheHitSource] = Counter()
-        position = start_token
-        for boundary, delta, source in sorted(events):
-            if boundary > position:
-                active_sources = [src for src, cnt in active.items() if cnt > 0]
-                if active_sources:
-                    resolved = CacheHitSource.outermost(active_sources)
-                    sources[resolved] = sources.get(resolved, 0) + (boundary - position)
-            active[source] += delta
-            position = boundary
-        return external_sources_with_tokens(sources)
 
     def record_admission_hits(
         self,

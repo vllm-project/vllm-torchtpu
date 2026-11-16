@@ -131,6 +131,7 @@ from vllm_torchtpu.offload.metrics import (
     RaidenOffloadStatsCollector,
     SubBlockSourceCounts,
     build_raiden_offload_metric_definitions,
+    compute_load_tokens_by_source,
 )
 
 if TYPE_CHECKING:
@@ -550,7 +551,7 @@ class RaidenOffloadingManager(OffloadingManager):
         load_key_ranges: Iterable[tuple[int, int, OffloadKey]],
         key_sources: Mapping[OffloadKey, SubBlockSourceCounts],
     ) -> dict[CacheHitSource, int]:
-        return self._metrics.compute_load_tokens_by_source(
+        return compute_load_tokens_by_source(
             start_token=start_token,
             end_token=end_token,
             load_key_ranges=load_key_ranges,
