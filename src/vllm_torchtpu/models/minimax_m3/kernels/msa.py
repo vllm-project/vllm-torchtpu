@@ -313,18 +313,22 @@ def block_score_options(index_heads: int = 1, wide: bool = False) -> dict[str, i
     )
 
 
-def _wide_decode_scores(index_q, index_cache, seq_lens, index_heads) -> bool:
+def _wide_decode_scores(index_q, index_cache, seq_lens, block_tables, index_heads):
     """Whether a step's block scores take 256-page groups: a decode step
     (`msa_indexer.is_prefill_step`) of more query rows per index head than
-    one request's `_DECODE_ROWS` (a verify step of 2+ requests), over
-    8-bit or 4-bit index pages (a 256-page ring of bf16 pages is twice the
-    VMEM). Standalone decode calls (j-83e37332): int4 folded 23 x 450 pages
-    94.7 -> 77.9 us, 36 x 366 pages 110.6 -> 105.7, fp8 5 x 450 pages 24.0 ->
-    21.5; one request of 313 pages 8.7 -> 9.1 (so a single request keeps
-    128)."""
+    one request's `_DECODE_ROWS` (e.g. a verify step of 2+ requests), whose
+    requests may hold more than 256 pages (a shard of up to 256 pages fits
+    one group either way: c64 DCP 8 decode block scores 62.5 -> 69.4 us per
+    layer at 256, twins j-545009b2, j-1ca3be70), over 8-bit or 4-bit index
+    pages (a 256-page ring of bf16 pages is twice the VMEM). Standalone
+    decode calls (j-83e37332): int4 folded 23 x 450 pages 94.7 -> 77.9 us,
+    36 x 366 pages 110.6 -> 105.7, fp8 5 x 450 pages 24.0 -> 21.5; one
+    request of 313 pages 8.7 -> 9.1 (so a single request keeps 128)."""
     rows = index_q.shape[0]
+    pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
     return (
         rows > _DECODE_ROWS * index_heads
+        and pages_per_seq > 2 * msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP
         and not msa_indexer.is_prefill_step(rows, seq_lens.shape[0])
         and jnp.dtype(index_cache.dtype).itemsize == 1
     )
@@ -354,7 +358,9 @@ def _block_scores(
         num_seqs,
         **block_score_options(
             index_heads,
-            _wide_decode_scores(index_q, index_cache, seq_lens, index_heads),
+            _wide_decode_scores(
+                index_q, index_cache, seq_lens, block_tables, index_heads
+            ),
         ),
         scale_cache=scale_cache,
         scale_row=scale_row,
