@@ -251,7 +251,7 @@ def _paired_query(q: jax.Array) -> jax.Array:
     )
 
 
-def _chunk_maxima(q_pair, page_keys, num_pages) -> jax.Array:
+def _chunk_maxima(q_pair, page_keys, num_pages, col_scales=None) -> jax.Array:
     """``[num_pages, Bq]`` block maxima of `num_pages` pages against a query
     tile given as `_paired_query`.
 
@@ -273,6 +273,12 @@ def _chunk_maxima(q_pair, page_keys, num_pages) -> jax.Array:
         (((1,), (1,)), ((), ())),
         preferred_element_type=jnp.float32,
     )  # [half * S, 2 Bq]
+    if col_scales is not None:  # 4-bit keys' scales: left / right page of a row
+        left, right = (
+            jnp.max((x * c).reshape(half, page_size, block_q), axis=1)
+            for x, c in zip((s[:, :block_q], s[:, block_q:]), col_scales)
+        )
+        return jnp.concatenate([left, right], axis=0)
     m = jnp.max(s.reshape(half, page_size, 2 * block_q), axis=1)
     return jnp.concatenate([m[:, :block_q], m[:, block_q:]], axis=0)
 
@@ -283,6 +289,11 @@ def _chunk_maxima(q_pair, page_keys, num_pages) -> jax.Array:
 # fp8 2,171 -> 819 bundles, 4-bit 1,323 -> 1,008). Products and their f32
 # sums are those of bf16 keys.
 FP8_MXU_KEYS = True
+# The large tiles (prefill chunks) score fp8 queries against fp8 keys (4-bit
+# keys exact, their scales on the scores): the fp8 MXU rate, twice bf16's, on
+# a body the bf16 x fp8 form left MXU-bound (AOT 87 %). The queries round to
+# e4m3 for the block scores only (the top-k selection's input).
+FP8_MXU_QUERIES = True
 
 
 def _transposed_keys(buf, p, live, dtype, folded, masked):
@@ -450,6 +461,9 @@ def _kernel_v3(
     base, live = group(step)
     next_base, next_live = ahead_group(step + ahead)
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
+    # Prefill-chunk tiles only (`FP8_MXU_QUERIES`); decode-sized tiles keep bf16.
+    fp8_queries = FP8_MXU_QUERIES and block_q > DEFAULT_BLOCK_Q
+    q_pair_fp8 = q_pair.astype(jnp.float8_e4m3fn) if fp8_queries else None
     num_chunks = pages_per_step // chunk
     # The ahead group's descriptors, spread over the first chunks' page pairs
     # (in one chunk they crowd its scalar slots: slower, bench j-9956cd34;
@@ -503,18 +517,33 @@ def _kernel_v3(
                 jnp.isfinite(scale_rows) & (page < live), scale_rows, 0.0
             ).T.astype(jnp.bfloat16)  # [S, chunk]
 
+        fp8_mxu = fp8_queries and (folded or cache_ref.dtype == jnp.float8_e4m3fn)
+
         def page_keys(j):
             issue(j)
             if folded:
                 k = pltpu.bitcast(buf[slot, first + j, : rows - 1], jnp.int4)
+                if fp8_mxu:  # exact (|k| <= 8); the scales go on the scores
+                    return k.astype(jnp.float8_e4m3fn)
                 return k.astype(jnp.bfloat16) * scale_cols[:, j : j + 1]
             # A page past the request's end was never copied: its stale words
             # may be NaN or inf, which would reach its pair's score through
             # the zero half of q_pair.
             w = jnp.where(first + j < live, buf[slot, first + j], 0)
-            return pltpu.bitcast(w, cache_ref.dtype).astype(jnp.bfloat16)
+            k = pltpu.bitcast(w, cache_ref.dtype)
+            return k if fp8_mxu else k.astype(jnp.bfloat16)
 
-        m = _chunk_maxima(q_pair, page_keys, chunk)
+        if fp8_mxu:
+            col_scales = None
+            if folded:
+                half = chunk // 2
+                col_scales = (
+                    scale_cols[:, :half].T.reshape(-1, 1).astype(jnp.float32),
+                    scale_cols[:, half:].T.reshape(-1, 1).astype(jnp.float32),
+                )
+            m = _chunk_maxima(q_pair_fp8, page_keys, chunk, col_scales=col_scales)
+        else:
+            m = _chunk_maxima(q_pair, page_keys, chunk)
         if transposed:
             o_ref[:, pl.ds(first, chunk)] = m.T
         else:
