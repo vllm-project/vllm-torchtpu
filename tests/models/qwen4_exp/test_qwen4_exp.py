@@ -68,9 +68,6 @@ def _cpu_model_tests(monkeypatch):
     # device while these CPU-only tests run.
     tpu = getattr(torch, "tpu", None)
     if tpu is not None:
-        monkeypatch.setattr(tpu, "is_available", lambda: False)
-        monkeypatch.setattr(tpu, "current_device", lambda: 0)
-        monkeypatch.setattr(tpu, "device_count", lambda: 0)
         monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
     if hasattr(torch, "accelerator"):
         monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)

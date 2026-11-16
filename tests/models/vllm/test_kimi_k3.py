@@ -82,9 +82,6 @@ def _cpu_model_tests(monkeypatch):
     # nothing for Dynamo to query, so there is nothing to stub either.
     tpu = getattr(torch, "tpu", None)
     if tpu is not None:
-        monkeypatch.setattr(tpu, "is_available", lambda: False)
-        monkeypatch.setattr(tpu, "current_device", lambda: 0)
-        monkeypatch.setattr(tpu, "device_count", lambda: 0)
         monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
 
     if hasattr(torch, "accelerator"):
