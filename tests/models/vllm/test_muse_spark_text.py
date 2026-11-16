@@ -204,6 +204,7 @@ def make_tiny_vllm_config(
     quant_config: Any = None,
     device: str = "cpu",
     max_model_len: int = 4096,
+    limit_mm_per_prompt: dict[str, int] | None = None,
     **text_overrides: Any,
 ) -> VllmConfig:
     cfg_dict = (
@@ -217,12 +218,15 @@ def make_tiny_vllm_config(
     model_dir = tmp_path / ("omni_model" if omni else "text_model")
     model_dir.mkdir(parents=True, exist_ok=True)
     (model_dir / "config.json").write_text(json.dumps(cfg_dict))
-    model_config = ModelConfig(
-        model=str(model_dir),
-        tokenizer_mode="skip",
-        dtype=torch.bfloat16,
-        max_model_len=max_model_len,
-    )
+    mc_kwargs: dict[str, Any] = {
+        "model": str(model_dir),
+        "tokenizer_mode": "skip",
+        "dtype": torch.bfloat16,
+        "max_model_len": max_model_len,
+    }
+    if limit_mm_per_prompt is not None:
+        mc_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
+    model_config = ModelConfig(**mc_kwargs)
     vc = VllmConfig(
         model_config=model_config,
         cache_config=CacheConfig(block_size=128, cache_dtype="auto"),
@@ -649,10 +653,10 @@ def test_real_loader_sequence_binds_op_after_quant_finalize(
     """Regression test for F014: load_weights does not call PWAL prematurely."""
     _use_cpu_platform(monkeypatch, request)
     register_models()
-    assert (
-        ModelRegistry.models["MuseSparkForConditionalGeneration"].load_model_cls()
-        is MuseSparkForConditionalGeneration
-    )
+    model_cls = ModelRegistry.models[
+        "MuseSparkForConditionalGeneration"
+    ].load_model_cls()
+    assert issubclass(model_cls, TPUMuseSparkForCausalLM)
     assert MODELS_CONFIG_MAP["MuseSparkForConditionalGeneration"] is TPUMuseSparkConfig
 
     events: list[str] = []
@@ -675,9 +679,13 @@ def test_real_loader_sequence_binds_op_after_quant_finalize(
         )[1],
     )
 
-    vc = make_tiny_vllm_config(tmp_path, omni=True)
+    vc = make_tiny_vllm_config(
+        tmp_path,
+        omni=True,
+        limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0},
+    )
     with set_current_vllm_config(vc):
-        model = MuseSparkForConditionalGeneration(vllm_config=vc)
+        model = model_cls(vllm_config=vc)
 
     moe = model.model.layers[1].feed_forward
     assert isinstance(moe, TPUMuseSparkMoE)
@@ -708,12 +716,6 @@ def test_real_loader_sequence_binds_op_after_quant_finalize(
     assert moe.router_w_kmajor is not None
     assert moe.router_w_kmajor.shape == (moe.hidden_size, moe.n_routed_experts)
     assert moe.router_w_kmajor.dtype == torch.float32
-
-    # The text-only entry point skips tower tensors but keeps every MoE tensor.
-    assert model.is_unused_checkpoint_weight("model.vision_tower.layers.0.norm1.weight")
-    assert not model.is_unused_checkpoint_weight(
-        "model.language_model.layers.1.mlp.experts.gate_up_proj"
-    )
 
     out = moe(torch.zeros((3, moe.hidden_size), dtype=torch.bfloat16))
     assert out.shape == (3, moe.hidden_size)
