@@ -13,11 +13,11 @@
 # limitations under the License.
 """Row-count padding filter in prepare_routed_gmm_inputs (non-EP).
 
-When every real row carries non-zero routing weights, ``padding_rows="count"``
-builds the same routing layout as zeroing padded weights while leaving padded
-row weights untouched. When a real row carries a zero routing weight, the count
-filter keeps stock dispatch behavior for that real route while excluding padded
-rows by row index.
+When every real row carries non-zero routing weights,
+``PaddedRowFilter.ROW_COUNT`` builds the same routing layout as zeroing padded
+weights while leaving padded row weights untouched. When a real row carries a
+zero routing weight, the row-count filter keeps stock dispatch for that real
+route while excluding padded rows by row index.
 """
 
 import jax.numpy as jnp
@@ -26,7 +26,10 @@ import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter import fused_moe as fused_moe_adapter
-from vllm_torchtpu.layers.core.fused_moe_gmm import prepare_routed_gmm_inputs
+from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    PaddedRowFilter,
+    prepare_routed_gmm_inputs,
+)
 
 E, TOPK, H = 64, 8, 32
 
@@ -81,7 +84,7 @@ def test_count_filter_matches_zeroed_weights_with_nonzero_padded_gates(t, n, see
         ids,
         w,
         skip_padded_tokens=True,
-        padding_rows="count",
+        padded_row_filter=PaddedRowFilter.ROW_COUNT,
         row_info=jnp.asarray([n], jnp.int32),
     )
     for k in ref:
@@ -105,7 +108,7 @@ def test_real_row_zero_gate_keeps_stock_dispatch():
         ids,
         w,
         skip_padded_tokens=True,
-        padding_rows="count",
+        padded_row_filter=PaddedRowFilter.ROW_COUNT,
         row_info=jnp.asarray([n], jnp.int32),
     )
 
@@ -128,54 +131,41 @@ def test_real_row_zero_gate_keeps_stock_dispatch():
     )
 
 
+_INVALID_COMBINATIONS = [
+    # (skip_padded_tokens, padded_row_filter, pass row_info)
+    (False, PaddedRowFilter.ROW_COUNT, True),
+    (True, PaddedRowFilter.ROW_COUNT, False),
+    (False, PaddedRowFilter.ZERO_WEIGHT, True),
+    (True, PaddedRowFilter.ZERO_WEIGHT, True),
+]
+
+
 @pytest.mark.parametrize(
-    "skip, padding_rows, row_info_kind",
-    [
-        (False, "count", "count"),
-        (True, "count", None),
-        (False, None, "count"),
-        (True, "mask", "mask"),
-    ],
+    "skip, padded_row_filter, with_row_info", _INVALID_COMBINATIONS
 )
-def test_prepare_rejects_invalid_padding_rows_combinations(
-    skip, padding_rows, row_info_kind
+def test_prepare_rejects_invalid_padded_row_filter_combinations(
+    skip, padded_row_filter, with_row_info
 ):
     x, ids, w = _inputs(16, seed=0)
-    if row_info_kind == "count":
-        row_info = jnp.asarray([4], jnp.int32)
-    elif row_info_kind == "mask":
-        row_info = jnp.zeros(16, dtype=bool)
-    else:
-        row_info = None
+    row_info = jnp.asarray([4], jnp.int32) if with_row_info else None
     with pytest.raises(ValueError):
         _prep(
             x,
             ids,
             w,
             skip_padded_tokens=skip,
-            padding_rows=padding_rows,
+            padded_row_filter=padded_row_filter,
             row_info=row_info,
         )
 
 
 @pytest.mark.parametrize(
-    "skip, padding_rows, row_info_kind",
-    [
-        (False, "count", "count"),
-        (True, "count", None),
-        (False, None, "count"),
-        (True, "mask", "mask"),
-    ],
+    "skip, padded_row_filter, with_row_info", _INVALID_COMBINATIONS
 )
-def test_adapter_rejects_invalid_padding_rows_combinations(
-    skip, padding_rows, row_info_kind
+def test_adapter_rejects_invalid_padded_row_filter_combinations(
+    skip, padded_row_filter, with_row_info
 ):
-    if row_info_kind == "count":
-        row_info = torch.tensor([4], dtype=torch.int32)
-    elif row_info_kind == "mask":
-        row_info = torch.zeros(16, dtype=torch.bool)
-    else:
-        row_info = None
+    row_info = torch.tensor([4], dtype=torch.int32) if with_row_info else None
     with pytest.raises(ValueError):
         fused_moe_adapter.fused_moe_gmm(
             hidden_states=torch.randn(4, 16, dtype=torch.bfloat16),
@@ -191,6 +181,17 @@ def test_adapter_rejects_invalid_padding_rows_combinations(
             topk=2,
             activation="silu",
             skip_padded_tokens=skip,
-            padding_rows=padding_rows,
+            padded_row_filter=padded_row_filter,
             row_info=row_info,
+        )
+
+
+def test_prebuild_rejects_row_count_filter_without_skipping():
+    with pytest.raises(ValueError):
+        fused_moe_adapter.prebuild_fused_moe_kernel(
+            topk=2,
+            activation="silu",
+            use_ep=False,
+            skip_padded_tokens=False,
+            padded_row_filter=PaddedRowFilter.ROW_COUNT,
         )

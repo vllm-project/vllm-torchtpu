@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import functools
 
 import jax
@@ -334,6 +335,37 @@ def _single_sort_permutation(
     return sorted_indices, revert, sorted_indices // topk
 
 
+class PaddedRowFilter(enum.Enum):
+    """How ``skip_padded_tokens=True`` recognizes padded rows."""
+
+    # The caller zeroed the routing weights of padded rows (FP8 / MXFP4 MoE):
+    # routes whose weight is 0 are dropped.
+    ZERO_WEIGHT = "zero_weight"
+    # Rows at index >= ``row_info[0]`` are padding (BF16 MoE). Routing weights
+    # are not used, so a real route whose gate is exactly 0 still runs.
+    ROW_COUNT = "row_count"
+
+
+def check_padded_row_filter(
+    skip_padded_tokens: bool,
+    padded_row_filter: PaddedRowFilter,
+    has_row_info: bool | None = None,
+) -> None:
+    """Reject inconsistent padded-row arguments.
+
+    ``has_row_info=None`` skips the ``row_info`` check (kernel prebuild, which
+    has no tensor yet).
+    """
+    if padded_row_filter is PaddedRowFilter.ROW_COUNT and not skip_padded_tokens:
+        raise ValueError("PaddedRowFilter.ROW_COUNT requires skip_padded_tokens=True.")
+    if has_row_info is not None and has_row_info != (
+        padded_row_filter is PaddedRowFilter.ROW_COUNT
+    ):
+        raise ValueError(
+            "row_info is required with, and only with, PaddedRowFilter.ROW_COUNT."
+        )
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -345,15 +377,15 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-    padding_rows: str | None = None,
+    padded_row_filter: PaddedRowFilter = PaddedRowFilter.ZERO_WEIGHT,
     row_info: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
-    When ``padding_rows="count"`` (with ``skip_padded_tokens=True``), ``row_info``
-    holds the number of valid prefix rows (1-element int32 array) and padded
-    rows are excluded by row index rather than zeroed routing weights; real rows
-    keep stock dispatch behavior even if a routing weight is zero.
+    With ``skip_padded_tokens=True`` and ``PaddedRowFilter.ROW_COUNT``,
+    ``row_info`` holds the number of valid prefix rows (1-element int32 array)
+    and padded rows are excluded by row index rather than zeroed routing
+    weights; real rows keep stock dispatch even if a routing weight is zero.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -362,24 +394,16 @@ def prepare_routed_gmm_inputs(
     the mask filters out. Always running the masked branch keeps a single
     code path.
     """
-    if padding_rows is not None:
-        if padding_rows != "count":
-            raise ValueError(
-                f"Unsupported padding_rows={padding_rows!r}; expected 'count' or None."
-            )
-        if not skip_padded_tokens:
-            raise ValueError("padding_rows='count' requires skip_padded_tokens=True.")
-        if row_info is None:
-            raise ValueError("padding_rows='count' requires row_info.")
-    elif row_info is not None:
-        raise ValueError("row_info must be None when padding_rows is None.")
+    check_padded_row_filter(
+        skip_padded_tokens, padded_row_filter, has_row_info=row_info is not None
+    )
 
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
     token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
 
-    if skip_padded_tokens and padding_rows == "count":
+    if skip_padded_tokens and padded_row_filter is PaddedRowFilter.ROW_COUNT:
         assert row_info is not None
         valid_mask = (topk_indices_flat >= 0) & (
             token_indices_flat < row_info.reshape(-1)[0]
@@ -697,7 +721,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
-        "padding_rows",
+        "padded_row_filter",
     ),
 )
 def fused_moe_func(
@@ -719,7 +743,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
-    padding_rows: str | None = None,
+    padded_row_filter: PaddedRowFilter = PaddedRowFilter.ZERO_WEIGHT,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -781,8 +805,11 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
+    # The row-count filter is implemented only in the routed path below; BF16
+    # does not reach the dense-expert kernel today (it admits FP8 weights only),
+    # and the first condition keeps it that way if that changes.
     if (
-        padding_rows is None
+        padded_row_filter is not PaddedRowFilter.ROW_COUNT
         and 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD
         and can_use_dense_expert(
             hidden_states,
@@ -819,7 +846,7 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
-        padding_rows=padding_rows,
+        padded_row_filter=padded_row_filter,
         row_info=row_info,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))

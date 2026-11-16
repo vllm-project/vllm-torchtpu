@@ -40,6 +40,7 @@ from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
 )
+from vllm_torchtpu.layers.core.fused_moe_gmm import PaddedRowFilter
 
 
 def _make_mock_moe_config():
@@ -516,14 +517,20 @@ class TestMoEForwardPrecisionBranches:
     @pytest.mark.parametrize(
         "extra_kwargs",
         [
-            {"padding_rows": "count", "row_info": torch.tensor([2], dtype=torch.int32)},
-            {"padding_rows": "count", "row_info": None},
-            {"padding_rows": None, "row_info": torch.tensor([2], dtype=torch.int32)},
+            {
+                "padded_row_filter": PaddedRowFilter.ROW_COUNT,
+                "row_info": torch.tensor([2], dtype=torch.int32),
+            },
+            {"padded_row_filter": PaddedRowFilter.ROW_COUNT, "row_info": None},
+            {
+                "padded_row_filter": PaddedRowFilter.ZERO_WEIGHT,
+                "row_info": torch.tensor([2], dtype=torch.int32),
+            },
         ],
     )
-    def test_pipelined_fused_moe_rejects_padding_rows_and_row_info(self, extra_kwargs):
-        """Non-None padding_rows/row_info must raise, never be silently ignored
-        or reused across chunked DP/PCP calls."""
+    def test_pipelined_fused_moe_rejects_row_count_filter(self, extra_kwargs):
+        """The row-count filter and row_info must raise, never be silently
+        ignored or reused across chunked DP/PCP calls."""
         with pytest.raises(NotImplementedError):
             pipelined_fused_moe_gmm(
                 hidden_states=torch.randn(4, 64, dtype=torch.bfloat16),
@@ -616,6 +623,7 @@ class TestMoEForwardPrecisionBranches:
 
         method = MagicMock()
         method._tpu_activation_str = "silu"
+        method._skip_padded_tokens = False
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5

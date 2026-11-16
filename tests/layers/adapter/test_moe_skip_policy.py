@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for BF16 MoeSkip policy resolution."""
+"""Tests for BF16 MoE padded-token skipping policy resolution."""
 
 from types import SimpleNamespace
 
@@ -46,23 +46,35 @@ def _resolve(**overrides):
     return msp.resolve_bf16_moe_skip_policy(**kwargs)
 
 
-def test_resolve_policy_supported_enables_count_mode():
+def test_resolve_policy_supported_enables_skipping():
     policy = _resolve()
     assert policy.enabled is True
-    assert policy.padding_rows == "count"
     assert policy.fallback_reason is None
-    assert policy.as_dict() == {
-        "enabled": True,
-        "padding_rows": "count",
-        "fallback_reason": None,
-    }
 
 
 def test_resolve_policy_flag_off_is_stock_without_reason():
     policy = _resolve(skip_flag=False)
     assert policy.enabled is False
-    assert policy.padding_rows is None
     assert policy.fallback_reason is None
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "enable_expert_parallel",
+        "data_parallel_size",
+        "pipeline_parallel_size",
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+    ],
+)
+def test_resolve_policy_fails_loudly_on_missing_parallel_field(missing):
+    """A missing ParallelConfig field raises instead of defaulting to a size
+    that would admit skipping."""
+    cfg = _supported_parallel_config()
+    delattr(cfg, missing)
+    with pytest.raises(AttributeError, match=missing):
+        _resolve(parallel_config=cfg)
 
 
 @pytest.mark.parametrize(
@@ -112,7 +124,6 @@ def test_resolve_policy_unsupported_falls_back_to_stock(overrides, expected_frag
     before model load / prebuild."""
     policy = _resolve(**overrides)
     assert policy.enabled is False
-    assert policy.padding_rows is None
     assert policy.fallback_reason is not None
     assert expected_fragment in policy.fallback_reason
 

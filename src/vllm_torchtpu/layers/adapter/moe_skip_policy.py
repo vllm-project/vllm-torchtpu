@@ -11,25 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Effective BF16 MoeSkip policy.
+"""Padded-token skipping policy for BF16 MoE ("MoE skip" in names here).
 
-With ``TPU_MOE_SKIP_PADDED_TOKENS=1`` on a supported BF16 topology,
-``VllmUnquantizedFusedMoEMethod`` drops padded rows inside ``fused_moe_gmm``
-using a 1-element local valid-row count (``padding_rows="count"``) rather than
-zeroing routing weights ahead of the kernel. Real rows keep stock dispatch
-behavior even when a routing weight is zero.
+With ``TPU_MOE_SKIP_PADDED_TOKENS=1``, ``VllmUnquantizedFusedMoEMethod`` drops
+padded rows inside ``fused_moe_gmm`` by row index
+(``PaddedRowFilter.ROW_COUNT``), using the local valid-token count that
+``TokenPaddingState`` tracks. Real rows keep the stock dispatch, including
+routes whose routing weight is exactly 0.
 
-Capability gating runs BEFORE model loading / MoE kernel prebuild / first
-backbone tracing so ``TPUModelRunner``, ``TokenPaddingState`` and
-``VllmUnquantizedFusedMoEMethod`` share one effective mode:
-
-- Supported BF16 topology:
-  ``skip_padded_tokens=True, padding_rows="count", row_info=<local_valid_tokens>``
-- ``flag-off``, EP fallback, or unsupported topologies (DP > 1, PP > 1,
-  PCP > 1, DCP > 1, pipelined MoE collective, fused MoE decode kernels,
-  speculative decoding / drafter, LoRA, non-BF16 / mixed MoE):
-  ``skip_padded_tokens=False, padding_rows=None, row_info=None`` (and no
-  ``local_valid_tokens`` allocation).
+``TPUModelRunner`` resolves the policy once, before it builds the target model
+and the drafter, and publishes it with ``bf16_policy_scope`` so the MoE layers,
+the GMM kernel prebuild and ``TokenPaddingState`` use the same mode. A layer
+built outside that scope runs the stock path. Unsupported configurations
+(expert parallelism, DP / PP / PCP / DCP > 1, the pipelined MoE collective,
+the fused MoE decode kernels, speculative decoding, LoRA, quantized models)
+also run the stock path and allocate no valid-token count.
 """
 
 from __future__ import annotations
@@ -37,38 +33,25 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    enable_pipelined_collective_and_compute,
-)
+if TYPE_CHECKING:
+    from vllm.config import ParallelConfig
 
 _active_bf16_policy: Bf16MoeSkipPolicy | None = None
 
 
 @dataclass(frozen=True)
 class Bf16MoeSkipPolicy:
-    """Effective BF16 MoeSkip mode shared across runner and MoE method."""
+    """Whether BF16 MoE layers skip padded tokens, and why not if disabled."""
 
     enabled: bool
     fallback_reason: str | None = None
 
-    @property
-    def padding_rows(self) -> str | None:
-        return "count" if self.enabled else None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "padding_rows": self.padding_rows,
-            "fallback_reason": self.fallback_reason,
-        }
-
 
 @contextlib.contextmanager
 def bf16_policy_scope(policy: Bf16MoeSkipPolicy) -> Iterator[None]:
-    """Publish the runner-resolved BF16 MoeSkip policy while loading layers."""
+    """Publish the runner's policy to the BF16 MoE layers built in the scope."""
     global _active_bf16_policy
     prev = _active_bf16_policy
     _active_bf16_policy = policy
@@ -79,64 +62,43 @@ def bf16_policy_scope(policy: Bf16MoeSkipPolicy) -> Iterator[None]:
 
 
 def get_active_bf16_policy() -> Bf16MoeSkipPolicy | None:
-    """Return the active runner-resolved BF16 MoeSkip policy, if any."""
+    """Return the policy published by ``bf16_policy_scope``, if any."""
     return _active_bf16_policy
-
-
-def bf16_layer_unsupported_reason(moe: Any) -> str | None:
-    """Per-layer topology check for BF16 row-count MoeSkip (defense-in-depth
-    and standalone unit-test fallback)."""
-    par = getattr(moe, "moe_parallel_config", None)
-    if par is not None:
-        if getattr(par, "use_ep", False):
-            return "expert parallelism"
-        for attr, label in (
-            ("dp_size", "data_parallel_size"),
-            ("pcp_size", "prefill_context_parallel_size"),
-            ("dcp_size", "decode_context_parallel_size"),
-            ("pp_size", "pipeline_parallel_size"),
-        ):
-            if getattr(par, attr, 1) > 1:
-                return f"{label} > 1"
-    if enable_pipelined_collective_and_compute():
-        return "pipelined MoE collective (TPU_MOE_COLLECTION_CHUNK_SIZE)"
-    if envs.USE_MOE_TP_DECODE_KERNEL or envs.FUSED_MOE_DECODE_KERNEL:
-        return "fused MoE decode kernels"
-    return None
 
 
 def resolve_bf16_moe_skip_policy(
     *,
     skip_flag: bool,
-    parallel_config: Any,
+    parallel_config: ParallelConfig,
     pipelined_collective: bool,
     fused_decode_kernel: bool,
     has_speculative: bool,
     has_lora: bool,
     is_unquantized_model: bool,
 ) -> Bf16MoeSkipPolicy:
-    """Resolve the shared BF16 MoeSkip effective mode before model loading.
-
-    Unsupported configurations cleanly fall back to the stock contract
-    ``(skip_padded_tokens=False, padding_rows=None, row_info=None)`` before MoE
-    kernel prebuild and before the first backbone trace.
-    """
+    """Resolve the policy before any MoE layer, kernel prebuild or trace."""
     if not skip_flag:
         return Bf16MoeSkipPolicy(enabled=False)
 
     fallback_reason: str | None = None
     if not is_unquantized_model:
         fallback_reason = "non-unquantized quantization config"
-    elif getattr(parallel_config, "enable_expert_parallel", False):
+    elif parallel_config.enable_expert_parallel:
         fallback_reason = "expert parallelism"
     else:
-        for name in (
-            "data_parallel_size",
-            "pipeline_parallel_size",
-            "prefill_context_parallel_size",
-            "decode_context_parallel_size",
+        for name, size in (
+            ("data_parallel_size", parallel_config.data_parallel_size),
+            ("pipeline_parallel_size", parallel_config.pipeline_parallel_size),
+            (
+                "prefill_context_parallel_size",
+                parallel_config.prefill_context_parallel_size,
+            ),
+            (
+                "decode_context_parallel_size",
+                parallel_config.decode_context_parallel_size,
+            ),
         ):
-            if getattr(parallel_config, name, 1) > 1:
+            if size > 1:
                 fallback_reason = f"{name} > 1"
                 break
     if fallback_reason is None and pipelined_collective:
@@ -150,15 +112,4 @@ def resolve_bf16_moe_skip_policy(
 
     if fallback_reason is not None:
         return Bf16MoeSkipPolicy(enabled=False, fallback_reason=fallback_reason)
-    return Bf16MoeSkipPolicy(enabled=True)
-
-
-def resolve_standalone_bf16_moe_skip_policy(moe: Any) -> Bf16MoeSkipPolicy:
-    """Resolve BF16 MoeSkip policy when VllmUnquantizedFusedMoEMethod is
-    constructed outside TPUModelRunner.load_model()."""
-    if not envs.TPU_MOE_SKIP_PADDED_TOKENS:
-        return Bf16MoeSkipPolicy(enabled=False)
-    reason = bf16_layer_unsupported_reason(moe)
-    if reason is not None:
-        return Bf16MoeSkipPolicy(enabled=False, fallback_reason=reason)
     return Bf16MoeSkipPolicy(enabled=True)

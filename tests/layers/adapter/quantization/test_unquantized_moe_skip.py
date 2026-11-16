@@ -11,15 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the BF16 MoeSkip contract in VllmUnquantizedFusedMoEMethod.
+"""Tests for BF16 MoE padded-token skipping in VllmUnquantizedFusedMoEMethod.
 
-Covers all three execution rows:
-- Supported BF16 topology (row-count MoeSkip):
-    (skip_padded_tokens=True, padding_rows="count", row_info=local_valid_tokens)
-- flag-off:
-    (skip_padded_tokens=False, padding_rows=None, row_info omitted)
-- EP / DP / PP / PCP / DCP / pipelined / unsupported fallback:
-    (skip_padded_tokens=False, padding_rows=None, row_info omitted)
+- Skipping on: skip_padded_tokens=True, PaddedRowFilter.ROW_COUNT and
+  row_info=local_valid_tokens.
+- Skipping off (flag off, an unsupported configuration, or a layer built
+  outside the runner's policy scope): skip_padded_tokens=False, without
+  padded_row_filter or row_info.
 """
 
 from types import SimpleNamespace
@@ -33,35 +31,23 @@ from vllm_torchtpu.layers.adapter.quantization import unquantized as module
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
 )
+from vllm_torchtpu.layers.core.fused_moe_gmm import PaddedRowFilter
 
 _TOPK = 2
 
 
-def _moe_cfg(**parallel_overrides):
-    par = {
-        "use_ep": False,
-        "dp_size": 1,
-        "pcp_size": 1,
-        "dcp_size": 1,
-        "pp_size": 1,
-    }
-    par.update(parallel_overrides)
+def _moe_cfg(use_ep: bool = False):
     return SimpleNamespace(
         experts_per_token=_TOPK,
         has_bias=False,
-        moe_parallel_config=SimpleNamespace(**par),
+        moe_parallel_config=SimpleNamespace(use_ep=use_ep),
     )
 
 
-def _method(
-    *,
-    skip_padded_tokens: bool,
-    padding_rows: str | None = None,
-) -> VllmUnquantizedFusedMoEMethod:
+def _method(*, skip_padded_tokens: bool) -> VllmUnquantizedFusedMoEMethod:
     method = VllmUnquantizedFusedMoEMethod.__new__(VllmUnquantizedFusedMoEMethod)
     method._tpu_activation_str = "silu"
     method._skip_padded_tokens = skip_padded_tokens
-    method._padding_rows = padding_rows
     return method
 
 
@@ -122,14 +108,14 @@ def _run_forward(method: VllmUnquantizedFusedMoEMethod, layer=None):
 
 
 def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
-    """Supported row-count path passes padding_rows='count' and local_valid_tokens
-    without touching routing weights (so padded rows stay non-zero and real
-    zero-gate rows keep stock dispatch)."""
+    """With skipping on, the forward passes the row-count filter and
+    local_valid_tokens without touching routing weights (so padded rows stay
+    non-zero and real zero-gate rows keep stock dispatch)."""
     state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
     state.update(2, 4)
     token_padding.set_padding_state(state)
     try:
-        method = _method(skip_padded_tokens=True, padding_rows="count")
+        method = _method(skip_padded_tokens=True)
         _run_forward(method)
     finally:
         token_padding.set_padding_state(None)
@@ -138,7 +124,7 @@ def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
     assert len(capture_forward.fused_calls) == 1
     call = capture_forward.fused_calls[0]
     assert call["skip_padded_tokens"] is True
-    assert call["padding_rows"] == "count"
+    assert call["padded_row_filter"] is PaddedRowFilter.ROW_COUNT
     assert call["row_info"] is state.local_valid_tokens
     assert int(call["row_info"].item()) == 2
     # Padded rows keep their original non-zero weights (exclusion is by count).
@@ -146,13 +132,13 @@ def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
 
 
 def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
-    """Flag-off / EP / unsupported fallback passes (False, None) and omits
-    row_info, even when pipelined_fused_moe_gmm is active."""
+    """With skipping off, the forward passes skip_padded_tokens=False and omits
+    padded_row_filter and row_info, also when pipelined_fused_moe_gmm runs."""
     state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
     state.update(1, 4)
     token_padding.set_padding_state(state)
     try:
-        method = _method(skip_padded_tokens=False, padding_rows=None)
+        method = _method(skip_padded_tokens=False)
         _run_forward(method)
 
         monkeypatch.setattr(
@@ -167,7 +153,7 @@ def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
     assert len(capture_forward.pipelined_calls) == 1
     for call in (capture_forward.fused_calls[0], capture_forward.pipelined_calls[0]):
         assert call["skip_padded_tokens"] is False
-        assert call["padding_rows"] is None
+        assert "padded_row_filter" not in call
         assert "row_info" not in call
 
 
@@ -175,8 +161,8 @@ def test_count_mode_raises_if_local_valid_tokens_missing(capture_forward):
     state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=False)
     token_padding.set_padding_state(state)
     try:
-        method = _method(skip_padded_tokens=True, padding_rows="count")
-        with pytest.raises(RuntimeError, match="track_valid_tokens=True"):
+        method = _method(skip_padded_tokens=True)
+        with pytest.raises(RuntimeError, match="track_valid_tokens=False"):
             _run_forward(method)
     finally:
         token_padding.set_padding_state(None)
@@ -190,7 +176,6 @@ def test_init_consumes_runner_policy_scope(monkeypatch):
     with moe_skip_policy.bf16_policy_scope(enabled_policy):
         m = VllmUnquantizedFusedMoEMethod(_moe_cfg())
     assert m._skip_padded_tokens is True
-    assert m._padding_rows == "count"
 
     disabled_policy = moe_skip_policy.Bf16MoeSkipPolicy(
         enabled=False, fallback_reason="data_parallel_size > 1"
@@ -198,45 +183,29 @@ def test_init_consumes_runner_policy_scope(monkeypatch):
     with moe_skip_policy.bf16_policy_scope(disabled_policy):
         m_off = VllmUnquantizedFusedMoEMethod(_moe_cfg())
     assert m_off._skip_padded_tokens is False
-    assert m_off._padding_rows is None
-
-    # Layer defense-in-depth still guards EP even if a caller enables policy.
-    with moe_skip_policy.bf16_policy_scope(enabled_policy):
-        m_ep = VllmUnquantizedFusedMoEMethod(_moe_cfg(use_ep=True))
-    assert m_ep._skip_padded_tokens is False
-    assert m_ep._padding_rows is None
 
 
-def test_standalone_init_falls_back_on_ep_and_pipelined(monkeypatch):
+def test_init_outside_runner_scope_runs_stock(monkeypatch):
+    """Only the runner's policy turns skipping on: with the flag set, a layer
+    built outside bf16_policy_scope still runs the stock path."""
     monkeypatch.setattr(
         module.UnquantizedFusedMoEMethod, "__init__", lambda self, moe: None
     )
     monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
-    monkeypatch.delenv("TPU_MOE_COLLECTION_CHUNK_SIZE", raising=False)
-
-    m_ok = VllmUnquantizedFusedMoEMethod(_moe_cfg())
-    assert m_ok._skip_padded_tokens is True
-    assert m_ok._padding_rows == "count"
-
-    m_ep = VllmUnquantizedFusedMoEMethod(_moe_cfg(use_ep=True))
-    assert m_ep._skip_padded_tokens is False
-    assert m_ep._padding_rows is None
-
-    monkeypatch.setenv("TPU_MOE_COLLECTION_CHUNK_SIZE", "16")
-    m_pipe = VllmUnquantizedFusedMoEMethod(_moe_cfg())
-    assert m_pipe._skip_padded_tokens is False
-    assert m_pipe._padding_rows is None
+    assert moe_skip_policy.get_active_bf16_policy() is None
+    m = VllmUnquantizedFusedMoEMethod(_moe_cfg())
+    assert m._skip_padded_tokens is False
 
 
 @pytest.mark.parametrize(
-    "skip, padding_rows, expected_keys",
+    "skip, expected_keys",
     [
-        (False, None, [(_TOPK, "silu", False, None, False)]),
-        (True, "count", [(_TOPK, "silu", False, None, True, "count")]),
+        (False, [(_TOPK, "silu", False, None, False, PaddedRowFilter.ZERO_WEIGHT)]),
+        (True, [(_TOPK, "silu", False, None, True, PaddedRowFilter.ROW_COUNT)]),
     ],
 )
 def test_process_weights_after_loading_prebuilds_expected_kernels(
-    monkeypatch, skip, padding_rows, expected_keys
+    monkeypatch, skip, expected_keys
 ):
     """process_weights_after_loading prebuilds only the kernels needed by the
     resolved policy via the real prebuild_fused_moe_kernel cache key."""
@@ -261,7 +230,7 @@ def test_process_weights_after_loading_prebuilds_expected_kernels(
         module.moe_routing, "register_experts_start_buffer", lambda *a, **k: None
     )
 
-    method = _method(skip_padded_tokens=skip, padding_rows=padding_rows)
+    method = _method(skip_padded_tokens=skip)
     method.moe = SimpleNamespace(has_bias=False)
     method._set_tpu_activation = lambda layer: "silu"
 
@@ -279,16 +248,14 @@ def test_process_weights_after_loading_prebuilds_expected_kernels(
 
 
 def test_disable_moe_skip_disarms_and_prebuilds_stock_kernel(monkeypatch):
-    prebuild_calls: list[tuple[bool, str | None]] = []
+    prebuild_calls: list[dict] = []
     monkeypatch.setattr(
         module,
         "prebuild_fused_moe_kernel",
-        lambda **kwargs: prebuild_calls.append(
-            (kwargs["skip_padded_tokens"], kwargs["padding_rows"])
-        ),
+        lambda **kwargs: prebuild_calls.append(kwargs),
     )
-    method = _method(skip_padded_tokens=True, padding_rows="count")
+    method = _method(skip_padded_tokens=True)
     method.disable_moe_skip(_dummy_layer())
     assert method._skip_padded_tokens is False
-    assert method._padding_rows is None
-    assert prebuild_calls == [(False, None)]
+    assert [call["skip_padded_tokens"] for call in prebuild_calls] == [False]
+    assert "padded_row_filter" not in prebuild_calls[0]

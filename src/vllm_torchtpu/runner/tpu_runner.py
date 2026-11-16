@@ -57,6 +57,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 )
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
@@ -133,8 +134,15 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_rows,
     copy_pool_blocks,
 )
+from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute,
+)
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedConfig,
+    VllmUnquantizedFusedMoEMethod,
+)
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -1236,8 +1244,8 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
-        # Effective BF16 MoeSkip policy, resolved before model loading /
-        # MoE kernel prebuild.
+        # BF16 MoE padded-token skipping policy, resolved before model loading
+        # and MoE kernel prebuild.
         self._bf16_moe_skip_policy = moe_skip_policy.Bf16MoeSkipPolicy(enabled=False)
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
@@ -6004,9 +6012,8 @@ class TPUModelRunner(GPUModelRunner):
             "Setting TPU quantization config for: %s", self.model_config.quantization
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
-        # Resolve BF16 MoeSkip capability before model loading so
-        # VllmUnquantizedFusedMoEMethod, kernel prebuild, and TokenPaddingState
-        # all share one effective mode.
+        # Resolve BF16 MoE padded-token skipping before model loading so the
+        # MoE layers, kernel prebuild and TokenPaddingState share one mode.
         self._bf16_moe_skip_policy = self._resolve_bf16_moe_skip_policy()
 
         # No placed layers or target depth left over from an earlier load.
@@ -6070,7 +6077,7 @@ class TPUModelRunner(GPUModelRunner):
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
-            self._async_drafter.load_model(self.model)
+            self._load_async_drafter()
             # The draft reuses the target's Pallas ops (cached by op name),
             # which were traced against the target's relayouted tables. Its
             # own rope caches and hash tables need the same layout, or the
@@ -7788,18 +7795,11 @@ class TPUModelRunner(GPUModelRunner):
             self._warmup_handoff_forwards()
 
     def _resolve_bf16_moe_skip_policy(self) -> moe_skip_policy.Bf16MoeSkipPolicy:
-        """Resolve the BF16 MoeSkip effective mode before model loading.
+        """Resolve BF16 MoE padded-token skipping before model loading.
 
         Gated here, ahead of ``VllmUnquantizedFusedMoEMethod`` construction,
         GMM kernel prebuild, and the first backbone trace.
         """
-        from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-            enable_pipelined_collective_and_compute,
-        )
-        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-            VllmUnquantizedConfig,
-        )
-
         is_unquantized = isinstance(
             self.vllm_config.quant_config, VllmUnquantizedConfig
         )
@@ -7824,8 +7824,18 @@ class TPUModelRunner(GPUModelRunner):
             )
         return policy
 
+    def _load_async_drafter(self) -> None:
+        """Load the draft model under the target's BF16 MoE skipping policy.
+
+        The draft's BF16 MoE layers must take the runner's policy: it is off
+        under speculative decoding, so TokenPaddingState tracks no valid-token
+        count for them to read.
+        """
+        with moe_skip_policy.bf16_policy_scope(self._bf16_moe_skip_policy):
+            self._async_drafter.load_model(self.model)
+
     def _finalize_bf16_moe_skip_policy_for_model(self) -> None:
-        """Align the BF16 MoeSkip policy with the loaded model's MoE layers.
+        """Align the BF16 MoE skipping policy with the loaded MoE layers.
 
         Runs immediately after model loading and before TokenPaddingState
         allocation or backbone tracing so dense models or models with mixed /
@@ -7834,12 +7844,6 @@ class TPUModelRunner(GPUModelRunner):
         """
         if not self._bf16_moe_skip_policy.enabled:
             return
-        from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
-
-        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-            VllmUnquantizedFusedMoEMethod,
-        )
-
         moe_modules: list[torch.nn.Module] = [
             m
             for m in self.model.modules()
@@ -7852,11 +7856,6 @@ class TPUModelRunner(GPUModelRunner):
         elif method_types != {VllmUnquantizedFusedMoEMethod}:
             names = sorted(t.__name__ for t in method_types)
             reason = f"MoE methods {names}; only the bf16 method is supported"
-        elif any(
-            not getattr(m.quant_method, "_skip_padded_tokens", False)
-            for m in moe_modules
-        ):
-            reason = "layer-level capability fallback"
 
         if reason is None:
             return
