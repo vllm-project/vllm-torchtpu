@@ -286,9 +286,12 @@ def test_paired_main_pad_tile_is_byte_identical(monkeypatch, name):
             .compile()
             .as_text()
         )
-        # The XLA path is a gather and a scatter; the paired-slot writer is
-        # the only Pallas call in this function.
-        assert ("tpu_custom_call" in text) == flag
+        # The paired-slot writer is the only Pallas call in this function. Small
+        # steps take it with the flag off too, padded with invalid rows
+        # (_write_main_cache_paired: an XLA gather of the FP8 carrier would
+        # canonicalize partner bytes that read as FP8 NaN); the flag only pads
+        # to the null page instead. Both run it whenever the page is whole tiles.
+        assert ("tpu_custom_call" in text) == (pool.shape[1] % 128 == 0)
         out = pool
         for slot, rows in enumerate(layers):
             out = write(out, rows, page, logical, valid, slot=slot)
