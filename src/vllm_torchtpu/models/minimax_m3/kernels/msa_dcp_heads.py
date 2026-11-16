@@ -66,7 +66,6 @@ _PAGES_PER_STEP = 64
 # j-b3925dba, c64 shape: 8 heads x 8192 tokens 1.961 ms -> 16 heads x 4096
 # tokens 1.248 ms at 32-page groups), for two permutes of half a step's
 # queries and outputs between the replicas (one chip's cores at c64).
-SPLIT_REPLICA_ROWS = True
 _SPLIT_PAGES_PER_STEP = 32
 
 
@@ -497,7 +496,7 @@ def _head_parallel_attend(
     part = -(-capacity // replicas)  # each replica's share of the buffer
     # The two replicas of a KV head split the rows (`_replica_rows`): each
     # attends half the tokens with all the head's query heads.
-    split = SPLIT_REPLICA_ROWS and replicas == 2 and num_tokens % (2 * _BLOCK_Q) == 0
+    split = replicas == 2 and num_tokens % (2 * _BLOCK_Q) == 0
     rows = num_tokens // replicas if split else num_tokens
     offset = rank % replicas * rows if split else 0
 

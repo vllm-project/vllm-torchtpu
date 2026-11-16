@@ -290,8 +290,6 @@ def _kernel(
             write(acc * (1.0 / jnp.maximum(denom, 1.0)), m * _LN_2 + jnp.log(denom))
 
         def attend_t(width, single):
-            if inline_issue and _INLINE_ISSUE_PAGES < width:
-                issue_next()
             """`attend` for 8/16-bit caches on transposed scores ``s^T [keys,
             rows]``: the max and sum over keys are sublane reductions, the
             output accumulates as ``acc^T [D, rows]`` across the p @ v
@@ -300,6 +298,8 @@ def _kernel(
             keep `attend`, whose per-key scales are lane vectors there, and
             so do 8-token (decode) tiles: c4 b3 decode +0.4 ms per step
             transposed (twin j-fa6121d0 vs glue-only j-2abe5011)."""
+            if inline_issue and width > _INLINE_ISSUE_PAGES:
+                issue_next()
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
                 if packing == 4
@@ -371,10 +371,10 @@ def _kernel(
             lse_ref[...] = (m * _LN_2 + jnp.log(denom)).reshape(lse_ref.shape)
 
         def attend(width, single):
-            if inline_issue and _INLINE_ISSUE_PAGES < width:
-                issue_next()
             """One softmax update over the group's first `width` slots; a
             `single` group (the tile's only one) needs no carried state."""
+            if inline_issue and width > _INLINE_ISSUE_PAGES:
+                issue_next()
             # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
@@ -1085,7 +1085,7 @@ def _chunked_call(
         return q.transpose(1, 0, 2), jnp.zeros((0, num_q_heads), jnp.float32)
     call = functools.partial(
         _attention_call,
-        inline_issue=_INLINE_ISSUE_PAGES > 0 and num_heads == 1,
+        inline_issue=num_heads == 1,
         q_per_head=num_q_heads // num_heads,
         sm_scale=sm_scale,
         block_q=block_q,

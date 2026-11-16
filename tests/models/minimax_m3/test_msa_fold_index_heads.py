@@ -32,9 +32,7 @@ def test_fold_matches_scatter_into_rows(seed):
         q_lens //= 2
     cu = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
     seq_lens = jnp.asarray(q_lens + rng.integers(0, 100, num_seqs), jnp.int32)
-    index_q = jnp.asarray(
-        rng.standard_normal((num_tokens, num_heads, 8)), jnp.bfloat16
-    )
+    index_q = jnp.asarray(rng.standard_normal((num_tokens, num_heads, 8)), jnp.bfloat16)
     folded, rows = msa.fold_index_heads(index_q, seq_lens, cu)
     want = (
         jnp.zeros_like(folded)
