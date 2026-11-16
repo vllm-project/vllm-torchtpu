@@ -203,6 +203,23 @@ def test_config_rejects_unsupported(overrides, error) -> None:
         TPUMiniMaxM3Config.verify_and_update_config(_hook_config(**overrides))
 
 
+def test_config_int4_msa_cache_profile() -> None:
+    """The agentx-int4 profile stores 4-bit index keys with --kv-cache-dtype
+    fp8; indexer_kv_dtype must stay unset, and bf16 KV has no int4 variant."""
+    int4 = {"model_plan": {"profile": "agentx-int4"}}
+    config = _hook_config(cache_dtype="fp8")
+    config.additional_config = int4
+    TPUMiniMaxM3Config.verify_and_update_config(config)
+    config = _hook_config(cache_dtype="fp8", indexer_kv_dtype="fp8")
+    config.additional_config = int4
+    with pytest.raises(NotImplementedError, match="leave indexer_kv_dtype unset"):
+        TPUMiniMaxM3Config.verify_and_update_config(config)
+    config = _hook_config(cache_dtype="auto")
+    config.additional_config = int4
+    with pytest.raises(ValueError, match="msa_cache"):
+        TPUMiniMaxM3Config.verify_and_update_config(config)
+
+
 @pytest.mark.parametrize(
     "name,want",
     [
