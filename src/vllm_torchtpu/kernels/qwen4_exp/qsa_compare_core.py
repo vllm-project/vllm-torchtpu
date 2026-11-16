@@ -709,10 +709,10 @@ def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, 
     original order. ``fallback()`` (the served call, gated output) runs instead when the step's longest row is
     below ``min_context`` or the tables refuse the step (a union past ``union_cap``). The cache passes through.
 
-    ``stats`` (debug, N > 0): every N-th call of a process logs the step's union groups, tiles and tiles a live
-    group (the work order's k is that over the ~4 of interpolated selections) from a host callback, and also runs
-    ``fallback()`` on the same inputs and logs max |core - fallback| / mean |fallback| over live rows; the core's
-    output is returned. Adds the callback and the fallback to the program; for an untimed run only.
+    ``stats`` (debug): also runs ``fallback()`` on the same inputs and appends the step's ``stats_delta`` (union
+    groups, tiles, union max, max |core - fallback| / mean |fallback| over live rows, finiteness, by the step's
+    longest row) to ``STATS_SINK`` while tracing; ``with_compare_stats`` returns it from the traced op. The core's
+    output is returned. Adds the fallback to the program; for an untimed run only.
 
     ``held_tokens`` (> 0): the held read (``qsa_compare_held``), each sequence's cached KV of one KV head held in
     VMEM for its pass; a step with a sequence longer than this takes ``fallback()``.
@@ -803,26 +803,58 @@ def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, 
         scale = jnp.sum(jnp.where(live, jnp.abs(ref), 0.0)) / jnp.maximum(
             jnp.sum(live) * ref.shape[1] * ref.shape[2], 1)
         finite = jnp.all(jnp.isfinite(jnp.where(live, out.astype(jnp.float32), 0.0)))
-        jax.debug.callback(functools.partial(_log_stats, int(stats), int(tokens)), ok, counts, jnp.max(lengths),
-                           err / jnp.maximum(scale, 1e-30), finite)
+        STATS_SINK.append(stats_delta(ok, counts, jnp.max(lengths), err / jnp.maximum(scale, 1e-30), finite, tokens))
     return out, cache
 
 
-_STATS = {"calls": 0}
+# Debug counters of compare_core_prefill(stats=True), one row per range of the step's longest row
+# (STATS_EDGES), one column per STATS_COLUMNS entry. The first STATS_SUMS columns add over calls, the rest take
+# the maximum; union counts and errors count only calls that took the core.
+STATS_EDGES = (19200, 32768, 49152, 65536, 81920, 98304)
+STATS_COLUMNS = ("calls", "core", "live_groups", "tiles", "rows", "union_max", "max_rel", "nonfinite")
+STATS_SUMS = 5
+STATS_SHAPE = (len(STATS_EDGES) + 1, len(STATS_COLUMNS))
+# Filled while a stats op traces (compare_core_prefill appends, with_compare_stats takes); holds tracers of
+# that trace only.
+STATS_SINK = []
 
 
-def _log_stats(every, tokens, ok, counts, longest, max_rel, finite):
-    """Host side of ``compare_core_prefill(stats=N)``."""
-    _STATS["calls"] += 1
-    if _STATS["calls"] % every:
-        return
-    from vllm_torchtpu.logger import init_logger
+def stats_delta(ok, counts, longest, max_rel, finite, tokens):
+    """One call's STATS_SHAPE f32 counters: zero but for the row of ``longest``."""
+    core = ok.astype(jnp.float32)
+    counts = counts.astype(jnp.float32)
+    rel = jnp.where(jnp.isfinite(max_rel), max_rel, 0.0).astype(jnp.float32)
+    row = jnp.stack([jnp.float32(1), core, core * counts[0], core * counts[1], jnp.float32(tokens),
+                     core * counts[2], core * rel, core * (1 - finite.astype(jnp.float32))])
+    which = jnp.sum(longest >= jnp.asarray(STATS_EDGES, jnp.int32))
+    return jnp.zeros(STATS_SHAPE, jnp.float32).at[which].set(row)
 
-    groups, tiles, umax = (int(x) for x in np.asarray(counts))
-    init_logger(__name__).info(
-        "QSA_CMP_STATS call=%d rows=%d longest=%d core=%d live_groups=%d tiles=%d tiles_per_group=%.3f "
-        "union_max=%d max_rel=%.5f finite=%d", _STATS["calls"], tokens, int(longest), int(bool(ok)), groups, tiles,
-        tiles / max(groups, 1), umax, float(max_rel), int(bool(finite)))
+
+def merge_stats(total, delta):
+    """Counters of two sets of calls: sums, then maxima."""
+    return jnp.concatenate([total[:, :STATS_SUMS] + delta[:, :STATS_SUMS],
+                            jnp.maximum(total[:, STATS_SUMS:], delta[:, STATS_SUMS:])], axis=1)
+
+
+def with_compare_stats(step):
+    """``step`` returning one more output, the STATS_SHAPE counters of the compare-core calls it traced.
+
+    No host callback: ``jax_op`` exports the step, and export cannot serialize one. The caller folds the
+    counters into a device buffer (sums, then maxima, as ``merge_stats``) that the runner reads outside the
+    traced forward."""
+
+    @functools.wraps(step)
+    def wrapped(*args, **kwargs):
+        STATS_SINK.clear()
+        outputs = step(*args, **kwargs)
+        deltas = list(STATS_SINK)
+        STATS_SINK.clear()
+        total = jnp.zeros(STATS_SHAPE, jnp.float32)
+        for delta in deltas:
+            total = merge_stats(total, delta)
+        return (*outputs, total)
+
+    return wrapped
 
 
 def tiles_per_group(usize, union_cap):

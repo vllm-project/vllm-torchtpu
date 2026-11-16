@@ -1073,9 +1073,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", 4096),
     "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH", 8),
     "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES": env_str("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES", "sparsecore"),
-    # Debug only (untimed runs): every N-th compare-core call of a process logs its union groups, tiles a live
-    # group and the core's max relative error against the flag-off call on the same inputs (QSA_CMP_STATS lines;
-    # the flag-off call then runs too). 0 (default) adds nothing to the program.
+    # Debug only (untimed runs), N seconds: each pooled QSA layer folds its compare-core calls' union groups,
+    # tiles, largest union and max relative error against the flag-off call on the same inputs (which then runs
+    # too) into a device buffer, by range of the step's longest row; every N seconds the runner logs and zeroes
+    # the buffers (QSA_CMP_STATS lines, compare_core_stats). 0 (default) adds nothing to the program.
     "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS", 0),
     # HELD (tokens, 0 = off): the compare core's held read (qsa_compare_held): each sequence's cached KV of one KV
     # head held in VMEM for that head's pass, union slots gathered from it by vector loads; a step with a sequence

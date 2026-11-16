@@ -8,8 +8,8 @@ wrong union group's codes or a misaligned request changes the output.
 Checks: the device tables against a brute-force construction (padded rows schedule nothing: no row bit, no slot,
 no tile), the SparseCore code math (``compare_code_lanes``) against the XLA reference, the kernel against a
 float64 reference, and the ``_prefill_attention`` dispatch (flag on: the core within the served kernel's error;
-its cap and short-context fallbacks bit for bit the flag-off call; flag off: unchanged). Off TPU the Pallas
-kernels run in interpret mode.
+its cap and short-context fallbacks bit for bit the flag-off call; flag off: unchanged), and the stats counters
+(an extra output of an exported step, no host callback). Off TPU the Pallas kernels run in interpret mode.
 """
 
 import jax
@@ -53,7 +53,7 @@ def kernels(monkeypatch):
     for name in ("VLLM_TPU_QSA_PREFILL_COMPARE_CORE", "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP",
                  "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH", "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES",
                  "VLLM_TPU_QSA_PREFILL_UNION_WALK", "VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT",
-                 "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET"):
+                 "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET", "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS"):
         monkeypatch.delenv(name, raising=False)
     yield
     jax.clear_caches()
@@ -294,6 +294,50 @@ def test_unwritten_nan_bytes_do_not_reach_the_output(kernels):
     want = _f64(q, blocks, lengths, table, pool)[live]
     floor = _max_rel(want.astype(np.float32).astype(jnp.bfloat16).astype(np.float32), want)
     assert _max_rel(got, want) <= 2 * floor, (_max_rel(got, want), floor)
+
+
+def test_stats_counters_leave_the_exported_step_as_an_output(kernels, monkeypatch):
+    """VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS: ``with_compare_stats`` returns the step's counters (union groups,
+    tiles, largest union of the aligned layout's tables, the core's error against the flag-off call) from a
+    function ``jax.export`` takes, and the attention output is the stats-off output bit for bit."""
+    rows, cached, tokens = (40, 200, 120, 72), (900, 1700, 600, 2300), 1024
+    step = _packed_step(2, rows, cached, tokens)
+    for env, value in (("VLLM_TPU_QSA_PREFILL_COMPARE_CORE", "1"), ("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES", "reference"),
+                       ("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH", "4"), ("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", "512"),
+                       ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "1000")):
+        monkeypatch.setenv(env, value)
+    jax.clear_caches()
+    plain = _dispatch(step)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS", "30")
+    jax.clear_caches()
+
+    def attend(q, gate, blocks, lengths, table, pool, starts):
+        out, _ = qsa_rpa._prefill_attention(q, gate, blocks, lengths, table, pool, starts, kv_heads=2, ratio=RATIO)
+        return (out,)
+
+    exported = jax.export.export(jax.jit(cc.with_compare_stats(attend)), platforms=[jax.default_backend()])(*step)
+    out, stats = exported.call(*step)
+    assert cc.STATS_SINK == []
+    np.testing.assert_array_equal(_bits(np.asarray(out)), _bits(plain))
+    (_, blocks, lengths, table), _ = _aligned(step)
+    _, _, usize, ok = cc.compare_tables(jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table),
+                                        groups_cap=table.shape[1] * PAGE // RATIO, union_cap=512, page_size=PAGE)
+    usize = np.asarray(usize)
+    assert bool(ok)
+    stats = np.asarray(stats)
+    which = int(np.sum(int(np.asarray(step[3]).max()) >= np.asarray(cc.STATS_EDGES)))
+    assert not np.delete(stats, which, axis=0).any()
+    calls, core, groups, tiles, rows_, union_max, max_rel, nonfinite = stats[which]
+    assert (calls, core, rows_, nonfinite) == (1, 1, tokens, 0)
+    assert groups == np.sum(usize > 0)
+    assert tiles == np.sum(-(-usize[usize > 0] // cc.GPT))
+    assert union_max == usize.max()
+    assert 0 < max_rel < 0.1  # one bf16 output ulp against the served kernel
+    # A union past the cap: counted as a call, not as the core.
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", "128")
+    jax.clear_caches()
+    _, stats = jax.jit(cc.with_compare_stats(attend))(*step)
+    assert np.asarray(stats)[which, :2].tolist() == [1, 0] and not np.asarray(stats)[which, 2:4].any()
 
 
 def test_dominant_scores_of_another_row_stay_out_of_a_rows_max(kernels):
