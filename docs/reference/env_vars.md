@@ -130,3 +130,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+| `VLLM_TPU_AGENTIC_TELEMETRY` | `False` | Enables host-side OTel span enrichment and multi-turn KV-cache attribution for agentic serving. |
+| `VLLM_TPU_AGENTIC_SPAN_LOG` | `""` | Optional JSONL file path where completed per-request agentic span records are appended. |
+| `VLLM_TPU_REPLICA_ID` | `""` | Optional logical replica identifier attached to `gen_ai.server.replica_id` (defaults to hostname when unset). |
+| `VLLM_TPU_AGENTIC_BLOCK_SIZE` | `0` | Explicit KV block size in tokens per block for session tracking (`0` auto-detects `cache_config.block_size`). |

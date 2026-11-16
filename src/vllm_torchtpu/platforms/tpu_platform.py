@@ -1306,6 +1306,13 @@ class TpuPlatform(Platform):
         backends = cls._find_non_ssm_backends(vllm_config)
         return backends[0] if backends else None
 
+    @staticmethod
+    def _sync_agentic_block_size(vllm_config: VllmConfig) -> None:
+        if envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            from vllm_torchtpu.telemetry.vllm_hooks import sync_block_size_from_config
+
+            sync_block_size_from_config(vllm_config)
+
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
@@ -1314,6 +1321,7 @@ class TpuPlatform(Platform):
         )
 
         if backend_cls is None:
+            cls._sync_agentic_block_size(vllm_config)
             return
 
         # `get_supported_kernel_block_sizes` and
@@ -1364,6 +1372,7 @@ class TpuPlatform(Platform):
                 )
                 cache_config.block_size = min_page_size  # type: ignore[assignment]
             logger.info("Using KV cache block size: %s", cache_config.block_size)
+            cls._sync_agentic_block_size(vllm_config)
 
     @classmethod
     def is_pin_memory_available(cls):
