@@ -45,6 +45,8 @@ TILES_PER_STEP = 4
 _FP4_PREFETCH = 2
 # Page copies a group's start loop issues per iteration (`_kernel`).
 _START_UNROLL = 4
+# Rows of ones `attend_t` appends to v^T for the softmax sums: one sublane tile.
+_SUM_ROWS = 8
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -303,13 +305,20 @@ def _kernel(
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
             p = jnp.exp2(s - m_new)
-            l_cur = jnp.sum(p, axis=0, keepdims=True)
+            # l = 1 . p comes out of the p @ v matmul as its row past the D
+            # value rows (rows of ones streamed with v^T), not from a VPU add
+            # per score vreg: kernel bench j-3e361d8c, ms per 8192-token call,
+            # fp8 32-token tiles, 92.5k prefix: 0.855 -> 0.821 / 1.501 ->
+            # 1.321 / 2.562 -> 2.148 at low / served-like / high dispersion.
+            # The sum is over the bf16 p the matmul weighs v with.
+            ones = jnp.ones((v.shape[0], _SUM_ROWS), v.dtype)
             pv = jax.lax.dot_general(
-                v,
+                jnp.concatenate([v, ones], axis=1),
                 p.astype(v.dtype),
                 (((0,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
-            )  # [D, rows]
+            )  # [D + _SUM_ROWS, rows]
+            l_cur, pv = pv[head_dim : head_dim + 1], pv[:head_dim]
             if single:
                 finish_t(m_new, l_cur, pv)
                 return
