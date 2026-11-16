@@ -84,6 +84,7 @@ def build_indexer(
     topk: int,
     max_model_len: int,
     buffer_tokens: int,
+    # VllmConfig resolves this to 5 for a max_model_len up to 256K.
     prefill_workspace_factor: int = 5,
     prefix: str = "model.layers.0.self_attn.indexer",
 ) -> mla_attention_op.VllmTPUIndexer:

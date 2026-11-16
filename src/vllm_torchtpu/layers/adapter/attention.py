@@ -2659,12 +2659,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def _quantized_kv_latents(
         self, layer: Any, kv_c_normed: torch.Tensor, k_pe: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`(kv_c_normed, k_pe)` as the latent cache writers take them:
-        quantized to the cache dtype when the cache is quantized, flattened
-        to `[num_tokens, kv_lora_rank]` and `[num_tokens, qk_rope_head_dim]`.
+        """`(kv_c_normed, k_pe)` as `forward`'s cache writes take them: quantized
+        to the cache dtype when the cache is quantized (otherwise left in their
+        input dtype), flattened to `[num_tokens, kv_lora_rank]` and
+        `[num_tokens, qk_rope_head_dim]`.
 
-        Every writer of a layer's latent cache goes through this method, so
-        they store the same bytes.
+        A writer that must store the same bytes as `forward` should call this too.
         """
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)

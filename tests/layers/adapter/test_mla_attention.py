@@ -1836,8 +1836,7 @@ def test_sparse_attn_indexer_resolves_the_kv_cache_mode_before_its_ops(monkeypat
         mla_attention_op, "get_current_vllm_config_or_none", lambda: None
     )
     # See `test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence` for
-    # why the module dict
-    # entry goes first.
+    # why the module dict entry goes first.
     if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in vars(envs):
         monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE")
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
