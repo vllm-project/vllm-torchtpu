@@ -6072,6 +6072,20 @@ class TPUModelRunner(GPUModelRunner):
 
             # Logs the resolved values (the payload sort needs the v3 combine).
             fused_moe_gmm.set_row_movement(*moe_row_movement)
+        nvfp4_skip_padded = option(additional, "moe_nvfp4_skip_padded")
+        skip_padded_min_routes = option(additional, "moe_skip_padded_min_routes")
+        if nvfp4_skip_padded or skip_padded_min_routes:
+            from vllm_torchtpu.layers.core import fused_moe_gmm
+
+            # Logs the resolved values.
+            fused_moe_gmm.set_skip_padded(nvfp4_skip_padded, skip_padded_min_routes)
+        redundant_experts = option(additional, "moe_redundant_experts")
+        redundant_placement = option(additional, "moe_redundant_placement")
+        if redundant_experts or redundant_placement:
+            from vllm_torchtpu.layers.adapter import moe_redundant
+
+            # Before the model's expert weights are created; logs the values.
+            moe_redundant.configure(redundant_experts, redundant_placement)
         if option(additional, "tight_vmem"):
             from vllm_torchtpu.kernels import tight_vmem
 

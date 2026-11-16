@@ -94,6 +94,35 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _TC_COMBINE_MIN_TOKENS = 0
 _V3_PAYLOAD_SORT = False
 _FLAT_ROUTING_MIN_TOKENS = 0
+# Padded bucket rows, set from --additional-config before the model's first
+# trace (`set_skip_padded`; off by default):
+#   moe_nvfp4_skip_padded: the NVFP4 GMM path gives padded rows zero routing
+#     weights (token_padding mask), so TPU_MOE_SKIP_PADDED_TOKENS drops them
+#     from the grouped matmul as the FP8 path already does.
+#   moe_skip_padded_min_routes: skip padded rows (skip_padded_tokens) only in
+#     batches of at least this many routes (T * top_k). Below it the rows
+#     still run, so the grouped matmul and the one-hot permute see the same
+#     layout as with the skip off and real rows come out bitwise identical;
+#     their zero routing weights only drop them from the combine. 0 = skip at
+#     every size.
+NVFP4_SKIP_PADDED = False
+_SKIP_PADDED_MIN_ROUTES = 0
+
+
+def set_skip_padded(nvfp4_skip_padded: bool, min_routes: int) -> None:
+    """Keys moe_nvfp4_skip_padded / moe_skip_padded_min_routes."""
+    global NVFP4_SKIP_PADDED, _SKIP_PADDED_MIN_ROUTES
+    if min_routes < 0:
+        raise ValueError("moe_skip_padded_min_routes must be >= 0")
+    NVFP4_SKIP_PADDED = bool(nvfp4_skip_padded)
+    _SKIP_PADDED_MIN_ROUTES = int(min_routes)
+    logger.info(
+        "MoE padded rows: moe_nvfp4_skip_padded=%s moe_skip_padded_min_routes=%d "
+        "(TPU_MOE_SKIP_PADDED_TOKENS=%s)",
+        NVFP4_SKIP_PADDED,
+        _SKIP_PADDED_MIN_ROUTES,
+        envs.TPU_MOE_SKIP_PADDED_TOKENS,
+    )
 
 
 def set_row_movement(
@@ -867,6 +896,9 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if skip_padded_tokens and num_tokens * topk < _SKIP_PADDED_MIN_ROUTES:
+        skip_padded_tokens = False
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.

@@ -134,6 +134,23 @@ DEFAULTS: dict[str, bool | int | str] = {
     "moe_tc_combine_min_tokens": 0,
     "moe_v3_payload_sort": False,
     "moe_flat_routing_min_tokens": 0,
+    # NVFP4 GMM MoE: padded bucket rows get zero routing weights, so
+    # TPU_MOE_SKIP_PADDED_TOKENS (recipe default 1) drops them from the
+    # grouped matmul; and the skip applies only to batches of at least this
+    # many routes (T * top_k; 0 = every size). With 2049 the one-hot-permute
+    # batches keep their layout, so real rows are bitwise as with the skip off
+    # (`fused_moe_gmm.set_skip_padded`).
+    "moe_nvfp4_skip_padded": False,
+    "moe_skip_padded_min_routes": 0,
+    # NVFP4 GMM EP MoE: this many redundant expert slots per EP rank and MoE
+    # layer, each a checkpoint copy of another rank's expert; decode-sized
+    # steps (<= 2048 routes) assign every touched expert whole to one copy
+    # (`layers.adapter.moe_redundant`). Placement: a JSON file path, inline
+    # JSON, or "builtin:<name>" ("" = round-robin fill). Every rank reads all
+    # experts at load; +HBM per slot. Not bitwise (the per-rank grouping of
+    # each token's expert sum changes before the EP all-reduce).
+    "moe_redundant_experts": 0,
+    "moe_redundant_placement": "",
     # MiniMax kernels (MSA attention / select / candidates, gmm_v2, DSpark
     # draft attention): compile each pallas_call once per shape at smaller
     # VMEM limits and keep the first that compiles (`kernels.tight_vmem`);

@@ -1427,3 +1427,47 @@ def test_prepare_routed_counting_sort_env_gate_restores_sorts(
     assert num_sorts == expected_sorts, (
         f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
     )
+
+
+@pytest.mark.parametrize(
+    ("min_routes", "num_tokens", "want_skip"),
+    [(0, 4, True), (2049, 4, False), (2049, 256, False), (2049, 257, True)],
+)
+def test_skip_padded_min_routes_keeps_small_batches_unskipped(
+    monkeypatch, min_routes, num_tokens, want_skip
+):
+    """additional_config moe_skip_padded_min_routes: below the route count
+    (T * top_k) the padded rows still run (skip_padded_tokens off), so small
+    batches keep the layout of the skip-off path."""
+    topk = 8
+    seen = []
+
+    class _Stop(Exception):
+        pass
+
+    def spy(*args, skip_padded_tokens, **kwargs):
+        seen.append(skip_padded_tokens)
+        raise _Stop
+
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
+    monkeypatch.setattr(fused_moe_gmm, "prepare_routed_gmm_inputs", spy)
+    monkeypatch.setattr(fused_moe_gmm, "NVFP4_SKIP_PADDED", False)
+    monkeypatch.setattr(fused_moe_gmm, "_SKIP_PADDED_MIN_ROUTES", 0)
+    fused_moe_gmm.set_skip_padded(True, min_routes)
+    w1 = jnp.zeros((16, 256, 512), jnp.bfloat16)
+    w2 = jnp.zeros((16, 256, 256), jnp.bfloat16)
+    with pytest.raises(_Stop):
+        fused_moe_func(
+            hidden_states=jnp.zeros((num_tokens, 256), jnp.bfloat16),
+            w1=w1,
+            w2=w2,
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=jnp.ones((num_tokens, topk), jnp.float32),
+            topk_ids=jnp.zeros((num_tokens, topk), jnp.int32),
+            topk=topk,
+            skip_padded_tokens=True,
+        )
+    assert seen == [want_skip]

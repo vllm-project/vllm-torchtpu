@@ -64,6 +64,10 @@ REPLACED_ENV = {
     "tight_vmem": "TPU_TIGHT_VMEM",
     "tight_vmem_candidates_mib": "TPU_TIGHT_VMEM_CANDIDATES_MIB",
     "release_jax_caches": "TPU_RELEASE_JAX_CACHES",
+    "moe_nvfp4_skip_padded": "TPU_MOE_NVFP4_SKIP_PADDED",
+    "moe_skip_padded_min_routes": "TPU_MOE_SKIP_PADDED_MIN_ROUTES",
+    "moe_redundant_experts": "VLLM_TPU_MOE_REDUNDANT_EXPERTS",
+    "moe_redundant_placement": "VLLM_TPU_MOE_REDUNDANT_PLACEMENT",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -80,6 +84,9 @@ SAMPLE = {
     "moe_tc_combine_min_tokens": 4096,
     "moe_flat_routing_min_tokens": 1024,
     "tight_vmem_candidates_mib": "32,40,48",
+    "moe_skip_padded_min_routes": 2049,
+    "moe_redundant_experts": 8,
+    "moe_redundant_placement": "builtin:minimax_m31_agentx",
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {
