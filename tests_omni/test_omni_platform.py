@@ -1125,6 +1125,157 @@ def test_tpu_broadcast_patch(monkeypatch):
         patched(t_root, src=0, group_src=0)
 
 
+def test_indexed_modulation_tpu_patch(monkeypatch):
+    import sys
+    import types
+
+    from vllm_omni.diffusion.layers import indexed_modulation as im
+
+    from vllm_torchtpu.omni.patches import (
+        _INDEXED_MODULATION_PATCHED,
+        _patch_indexed_modulation,
+    )
+
+    cpu_calls = []
+
+    def make_orig(tag):
+        def _fn(*args, **kwargs):
+            cpu_calls.append(tag)
+            return f"orig_{tag}"
+
+        return _fn
+
+    orig_ss = make_orig("ss")
+    orig_gate = make_orig("gate")
+    orig_rms = make_orig("rms")
+    orig_gate_rms = make_orig("gate_rms")
+
+    monkeypatch.setattr(im, "indexed_scale_shift_", orig_ss)
+    monkeypatch.setattr(im, "indexed_gate", orig_gate)
+    monkeypatch.setattr(im, "rms_norm_indexed_scale_shift", orig_rms)
+    monkeypatch.setattr(im, "indexed_gate_rms_norm_scale_shift", orig_gate_rms)
+
+    fake_mod = types.ModuleType("vllm_omni._test_fake_caller")
+    fake_mod.rms_norm_indexed_scale_shift = orig_rms
+    monkeypatch.setitem(sys.modules, fake_mod.__name__, fake_mod)
+
+    _patch_indexed_modulation()
+    patched_rms = im.rms_norm_indexed_scale_shift
+    assert getattr(patched_rms, _INDEXED_MODULATION_PATCHED, False)
+    assert fake_mod.rms_norm_indexed_scale_shift is patched_rms
+
+    # Idempotent on repeat install.
+    _patch_indexed_modulation()
+    assert im.rms_norm_indexed_scale_shift is patched_rms
+
+    # Non-TPU tensors delegate straight to upstream.
+    x_cpu = torch.randn(3, 8, dtype=torch.bfloat16)
+    idx = torch.tensor([1, 0, 1], dtype=torch.long)
+    shift = torch.randn(2, 8, dtype=torch.float32)
+    scale = torch.randn(2, 8, dtype=torch.float32)
+    gate = torch.randn(2, 8, dtype=torch.float32)
+    other = torch.randn(3, 8, dtype=torch.bfloat16)
+    weight = torch.randn(8, dtype=torch.bfloat16)
+    assert im.indexed_scale_shift_(x_cpu, shift, scale, idx) == "orig_ss"
+    assert im.indexed_gate(x_cpu, gate, other, idx) == "orig_gate"
+    assert (
+        im.rms_norm_indexed_scale_shift(x_cpu, weight, shift, scale, idx, 1e-6)
+        == "orig_rms"
+    )
+    assert (
+        im.indexed_gate_rms_norm_scale_shift(
+            x_cpu, gate, other, weight, shift, scale, idx, 1e-6
+        )
+        == "orig_gate_rms"
+    )
+    assert cpu_calls == ["ss", "gate", "rms", "gate_rms"]
+
+    class FakeTpuTensor(torch.Tensor):
+        @property
+        def device(self):  # type: ignore[override]
+            return SimpleNamespace(type="tpu")
+
+    # Verify numerical fidelity against FP32 reference on FakeTpuTensor.
+    torch.manual_seed(0)
+    x_raw = torch.randn(4, 16, dtype=torch.bfloat16)
+    idx = torch.tensor([2, 0, 1, 2], dtype=torch.long)
+    shift = torch.randn(3, 16, dtype=torch.float32)
+    scale = torch.randn(3, 16, dtype=torch.float32)
+    gate = torch.randn(3, 16, dtype=torch.float32)
+    branch = torch.randn(4, 16, dtype=torch.bfloat16)
+    weight = torch.randn(16, dtype=torch.bfloat16)
+    eps = 1e-6
+
+    # 1. indexed_scale_shift_ (in-place)
+    x_ss = x_raw.clone().as_subclass(FakeTpuTensor)
+    ret_ss = im.indexed_scale_shift_(x_ss, shift, scale, idx)
+    assert ret_ss is x_ss
+    want_ss = (x_raw.float() * (1.0 + scale[idx]) + shift[idx]).to(torch.bfloat16)
+    torch.testing.assert_close(x_ss.as_subclass(torch.Tensor), want_ss, rtol=0, atol=0)
+
+    # 2. indexed_gate
+    out_gate = im.indexed_gate(
+        x_raw.clone().as_subclass(FakeTpuTensor), gate, branch, idx
+    )
+    want_gate = (x_raw.float() + gate[idx] * branch.float()).to(torch.bfloat16)
+    torch.testing.assert_close(
+        out_gate.as_subclass(torch.Tensor), want_gate, rtol=0, atol=0
+    )
+
+    # 3. rms_norm_indexed_scale_shift
+    out_rms = im.rms_norm_indexed_scale_shift(
+        x_raw.clone().as_subclass(FakeTpuTensor), weight, shift, scale, idx, eps
+    )
+    norm_ref = (
+        x_raw.float()
+        * torch.rsqrt(x_raw.float().pow(2).mean(-1, keepdim=True) + eps)
+        * weight.float()
+    )
+    want_rms = (norm_ref * (1.0 + scale[idx]) + shift[idx]).to(torch.bfloat16)
+    torch.testing.assert_close(
+        out_rms.as_subclass(torch.Tensor), want_rms, rtol=0, atol=0
+    )
+
+    # 4. indexed_gate_rms_norm_scale_shift
+    res_out, mod_out = im.indexed_gate_rms_norm_scale_shift(
+        x_raw.clone().as_subclass(FakeTpuTensor),
+        gate,
+        branch,
+        weight,
+        shift,
+        scale,
+        idx,
+        eps,
+    )
+    torch.testing.assert_close(
+        res_out.as_subclass(torch.Tensor), want_gate, rtol=0, atol=0
+    )
+    upd = want_gate.float()
+    want_mod = (
+        upd
+        * torch.rsqrt(upd.pow(2).mean(-1, keepdim=True) + eps)
+        * weight.float()
+        * (1.0 + scale[idx])
+        + shift[idx]
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(
+        mod_out.as_subclass(torch.Tensor), want_mod, rtol=0, atol=0
+    )
+
+    # 5. Empty 0-row inputs
+    empty = torch.empty(0, 16, dtype=torch.bfloat16).as_subclass(FakeTpuTensor)
+    empty_idx = torch.empty(0, dtype=torch.long)
+    assert im.indexed_scale_shift_(empty, shift, scale, empty_idx).shape == (0, 16)
+    assert im.indexed_gate(empty, gate, empty, empty_idx).shape == (0, 16)
+    assert im.rms_norm_indexed_scale_shift(
+        empty, weight, shift, scale, empty_idx, eps
+    ).shape == (0, 16)
+    r0, m0 = im.indexed_gate_rms_norm_scale_shift(
+        empty, gate, empty, weight, shift, scale, empty_idx, eps
+    )
+    assert r0.shape == (0, 16) and m0.shape == (0, 16)
+
+
 def test_tpu_empty_collectives_patch(monkeypatch):
     import torch.distributed as dist
     import torch.distributed.distributed_c10d as c10d

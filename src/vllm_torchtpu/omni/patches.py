@@ -361,6 +361,10 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_indexed_modulation()
+    _patch_minimax_h3_fused_qk_norm_rope()
+    _patch_diffusion_tpu_compile()
+    _patch_minimax_h3_tpu_execution()
     _patch_ulysses_batched_qkv_a2a()
     _patch_tpu_fp16_sdpa()
 
@@ -924,6 +928,367 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_INDEXED_MODULATION_PATCHED = "_tpu_indexed_modulation_patched"
+
+
+def _patch_indexed_modulation() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's indexed_modulation dispatches out-of-tree
+    # platforms via CustomOp.register_oot instead of checking only `if x.is_cpu:`
+    # before launching Triton kernels.
+    #
+    # Problem: vllm_omni/diffusion/layers/indexed_modulation.py (used by
+    #   MiniMax-H3's DiT blocks and output norm) checks only `if x.is_cpu:`
+    #   before launching Triton kernels (`triton.next_power_of_2(...)`). On TPU,
+    #   `vllm.triton_utils.triton` is a placeholder (`HAS_TRITON = False`), so
+    #   every DiT block fails with
+    #   `AttributeError: module 'triton' has no attribute 'next_power_of_2'`.
+    #   Moreover, naive PyTorch `index_select` + RMSNorm materializes `[S, D]`
+    #   FP32 tables in HBM multiple times per block.
+    # Fix: Route TPU BF16 aligned calls through fused Pallas AdaLN/gated-residual
+    #   kernels (`vllm_torchtpu.omni.adaln`), falling back to FP32-intermediate
+    #   PyTorch ATen ops for non-BF16 or unaligned shapes; non-TPU tensors
+    #   delegate to upstream. Also rebind any direct symbol imports already
+    #   cached in loaded `vllm_omni.*` modules.
+    # -------------------------------------------------------------------------
+    import sys
+
+    from vllm_omni.diffusion.layers import indexed_modulation as im
+
+    from vllm_torchtpu.omni.adaln import (
+        register_adaln_pallas_ops,
+        tpu_indexed_gate,
+        tpu_indexed_gate_rms_norm_scale_shift,
+        tpu_indexed_scale_shift_,
+        tpu_rms_norm_indexed_scale_shift,
+    )
+
+    if getattr(im.rms_norm_indexed_scale_shift, _INDEXED_MODULATION_PATCHED, False):
+        return
+
+    register_adaln_pallas_ops()
+
+    orig_scale_shift_ = im.indexed_scale_shift_
+    orig_gate = im.indexed_gate
+    orig_rms_scale_shift = im.rms_norm_indexed_scale_shift
+    orig_gate_rms_scale_shift = im.indexed_gate_rms_norm_scale_shift
+
+    def _tpu_indexed_scale_shift_(
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.device.type != "tpu":
+            return orig_scale_shift_(x, shift, scale, indices)
+        return tpu_indexed_scale_shift_(x, shift, scale, indices)
+
+    def _tpu_indexed_gate(
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        other: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.device.type != "tpu":
+            return orig_gate(x, gate, other, indices)
+        return tpu_indexed_gate(x, gate, other, indices)
+
+    def _tpu_rms_norm_indexed_scale_shift(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        indices: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        if x.device.type != "tpu":
+            return orig_rms_scale_shift(x, weight, shift, scale, indices, eps)
+        return tpu_rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
+
+    def _tpu_indexed_gate_rms_norm_scale_shift(
+        residual: torch.Tensor,
+        gate: torch.Tensor,
+        branch: torch.Tensor,
+        weight: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        indices: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual.device.type != "tpu":
+            return orig_gate_rms_scale_shift(
+                residual, gate, branch, weight, shift, scale, indices, eps
+            )
+        return tpu_indexed_gate_rms_norm_scale_shift(
+            residual, gate, branch, weight, shift, scale, indices, eps
+        )
+
+    replacements = {
+        "indexed_scale_shift_": (orig_scale_shift_, _tpu_indexed_scale_shift_),
+        "indexed_gate": (orig_gate, _tpu_indexed_gate),
+        "rms_norm_indexed_scale_shift": (
+            orig_rms_scale_shift,
+            _tpu_rms_norm_indexed_scale_shift,
+        ),
+        "indexed_gate_rms_norm_scale_shift": (
+            orig_gate_rms_scale_shift,
+            _tpu_indexed_gate_rms_norm_scale_shift,
+        ),
+    }
+    for name, (_, patched_fn) in replacements.items():
+        setattr(patched_fn, _INDEXED_MODULATION_PATCHED, True)
+        setattr(im, name, patched_fn)
+
+    for mod in list(sys.modules.values()):
+        if not isinstance(mod, types.ModuleType):
+            continue
+        mod_dict = vars(mod)
+        mod_name = mod_dict.get("__name__", "")
+        if not isinstance(mod_name, str) or not mod_name.startswith("vllm_omni."):
+            continue
+        for name, (orig_fn, patched_fn) in replacements.items():
+            if mod_dict.get(name) is orig_fn:
+                setattr(mod, name, patched_fn)
+
+    logger.info("Applied TPU patch: Pallas-fused indexed_modulation for AdaLN.")
+
+
+_MINIMAX_QKNORM_ROPE_PATCHED = "_tpu_minimax_qknorm_rope_patched"
+
+
+def _patch_minimax_h3_fused_qk_norm_rope() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's fused_qk_norm_rope dispatches out-of-tree
+    # platforms via CustomOp.register_oot.
+    #
+    # Problem: MiniMax-H3 Attention calls fused_qk_norm_rope with head_dim=128,
+    #   rotary_dim=96, interleaved=False. On non-CUDA platforms it falls back to
+    #   _eager_qk_norm_rope, which slices q/k into (rotary[:48], rotary[48:96],
+    #   pass[96:128]) and concatenates them per head, forcing non-128-lane-aligned
+    #   strided copies around every attention layer on TPU.
+    # Fix: Route eligible TPU bf16 (T, H, 128) calls through the fused Pallas
+    #   kernel in omni/rope.py (expressing the half-split rotation as an exact
+    #   signed permutation matmul on the MXU).
+    # Effect: Cuts QK RMSNorm + RoPE from ~0.68 ms to ~0.19 ms per block on TPU v7x.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fqkr
+
+    from vllm_torchtpu.omni.rope import (
+        can_fuse_minimax_qk_norm_rope,
+        minimax_fused_qk_norm_rope,
+        register_minimax_qk_norm_rope_op,
+    )
+
+    orig_impl = fqkr._fused_qk_norm_rope_impl
+    if getattr(orig_impl, _MINIMAX_QKNORM_ROPE_PATCHED, False):
+        return
+
+    try:
+        import torch_tpu  # noqa: F401
+
+        register_minimax_qk_norm_rope_op()
+    except ImportError:
+        pass
+
+    def _tpu_fused_qk_norm_rope_impl(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rope_table: torch.Tensor,
+        eps: float,
+        head_dim: int,
+        rotary_dim: int,
+        interleaved: bool,
+        cuda_rms_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if can_fuse_minimax_qk_norm_rope(
+            q, k, q_weight, k_weight, rope_table, head_dim, rotary_dim, interleaved
+        ):
+            return minimax_fused_qk_norm_rope(
+                q, k, q_weight, k_weight, rope_table, eps, rotary_dim
+            )
+        return orig_impl(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            rope_table,
+            eps,
+            head_dim,
+            rotary_dim,
+            interleaved,
+            cuda_rms_norm,
+        )
+
+    setattr(_tpu_fused_qk_norm_rope_impl, _MINIMAX_QKNORM_ROPE_PATCHED, True)
+    fqkr._fused_qk_norm_rope_impl = _tpu_fused_qk_norm_rope_impl
+    logger.info(
+        "Applied TPU patch: Pallas fused_qk_norm_rope for MiniMax-H3 half-split RoPE."
+    )
+
+
+_DIFFUSION_TPU_COMPILE_PATCHED = "_tpu_diffusion_compile_patched"
+_DIFFUSION_TPU_EXEC_SYNC_PATCHED = "_tpu_diffusion_exec_sync_patched"
+
+
+def _patch_diffusion_tpu_compile() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once DiffusionModelRunner._compile_transformer queries the
+    # active OmniPlatform for its torch.compile backend ("tpu") and static-shape
+    # policy (dynamic=False), and DiffusionWorker synchronizes non-primary ranks
+    # at the end of execute_model.
+    #
+    # Problem:
+    # 1. DiffusionModelRunner.load_model skips torch.compile when
+    #    supports_torch_inductor() is False, and _compile_transformer defaults to
+    #    Inductor with dynamic=True (which torch_tpu's Dynamo backend rejects).
+    # 2. On multi-rank SP/TP stages, DiffusionWorker only copies outputs to CPU
+    #    on rank 0 (`should_reply = True`), leaving tail ops pending in
+    #    DEFER_AND_FUSE on ranks 1..N-1 across request boundaries.
+    # Fix: Compile DiT blocks regionally with backend="tpu", dynamic=False when
+    #   enforce_eager is False (initializing static LoRA adapters before compile
+    #   when initialize_lora is provided), and synchronize all TPU ranks at the
+    #   end of execute_model / execute_model_batch.
+    # -------------------------------------------------------------------------
+    try:
+        from vllm_omni.diffusion.compile import regionally_compile
+        from vllm_omni.diffusion.worker.diffusion_model_runner import (
+            DiffusionModelRunner,
+        )
+    except ImportError:
+        return
+
+    from vllm_torchtpu.omni.minimax_h3 import disable_tpu_adaln_cache
+
+    orig_compile_transformer = DiffusionModelRunner._compile_transformer
+    orig_load_model = DiffusionModelRunner.load_model
+    if getattr(
+        orig_compile_transformer, _DIFFUSION_TPU_COMPILE_PATCHED, False
+    ) and getattr(orig_load_model, _DIFFUSION_TPU_COMPILE_PATCHED, False):
+        return
+
+    def _tpu_compile_transformer(self: Any, attr_name: str) -> None:
+        if getattr(self.device, "type", None) != "tpu":
+            return orig_compile_transformer(self, attr_name)
+        model = getattr(self.pipeline, attr_name, None)
+        if model is None or not isinstance(model, torch.nn.Module):
+            return
+        disable_tpu_adaln_cache(model)
+        dynamic = False
+        compile_kwargs: dict[str, Any] = {"backend": "tpu", "dynamic": dynamic}
+        compile_granularity = getattr(
+            self.od_config, "diffusion_compile_granularity", "regional"
+        )
+        try:
+            if compile_granularity == "full":
+                model.compile(**compile_kwargs)
+                compiled_model = model
+            else:
+                compiled_model = regionally_compile(model, **compile_kwargs)
+            setattr(self.pipeline, attr_name, compiled_model)
+        except Exception as exc:
+            logger.warning(
+                "Model runner: TPU %s torch.compile setup for %s failed: %s.",
+                compile_granularity,
+                attr_name,
+                exc,
+            )
+            return
+        logger.info(
+            "Model runner: %s configured for lazy %s "
+            "torch.compile(backend='tpu', dynamic=%s).",
+            attr_name,
+            compile_granularity,
+            dynamic,
+        )
+
+    def _tpu_load_model(self: Any, *args: Any, **kwargs: Any) -> Any:
+        initialize_lora = kwargs.get("initialize_lora")
+        result = orig_load_model(self, *args, **kwargs)
+        if getattr(self.device, "type", None) == "tpu" and self.pipeline is not None:
+            if (
+                callable(initialize_lora)
+                and getattr(self.od_config, "lora_path", None) is not None
+                and not getattr(self.pipeline, "requires_early_lora_init", False)
+            ):
+                initialize_lora()
+            transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
+            if not transformer_attrs:
+                transformer_attrs = ("transformer", "transformer_2")
+            for attr_name in transformer_attrs:
+                dit = getattr(self.pipeline, attr_name, None)
+                if dit is not None:
+                    disable_tpu_adaln_cache(dit)
+            if not self.od_config.enforce_eager:
+                if hasattr(self.pipeline, "setup_compile"):
+                    try:
+                        self.pipeline.setup_compile()
+                    except Exception as exc:
+                        logger.warning(
+                            "Model runner: TPU setup_compile() failed (%s); "
+                            "running without compile.",
+                            exc,
+                        )
+                else:
+                    for attr_name in transformer_attrs:
+                        self._compile_transformer(attr_name)
+        return result
+
+    setattr(_tpu_compile_transformer, _DIFFUSION_TPU_COMPILE_PATCHED, True)
+    DiffusionModelRunner._compile_transformer = _tpu_compile_transformer
+    DiffusionModelRunner.load_model = _tpu_load_model
+
+    for method_name in ("execute_model", "execute_model_batch"):
+        orig_exec = getattr(DiffusionModelRunner, method_name, None)
+        if orig_exec is None or getattr(
+            orig_exec, _DIFFUSION_TPU_EXEC_SYNC_PATCHED, False
+        ):
+            continue
+
+        def _make_synced_exec(fn: Any) -> Any:
+            def _synced_exec(self: Any, *args: Any, **kwargs: Any) -> Any:
+                try:
+                    return fn(self, *args, **kwargs)
+                finally:
+                    if getattr(self.device, "type", None) == "tpu":
+                        torch.accelerator.synchronize()
+
+            setattr(_synced_exec, _DIFFUSION_TPU_EXEC_SYNC_PATCHED, True)
+            return _synced_exec
+
+        setattr(DiffusionModelRunner, method_name, _make_synced_exec(orig_exec))
+
+    logger.info("Applied TPU patch: regional torch.compile(backend='tpu') for DiT.")
+
+
+def _patch_minimax_h3_tpu_execution() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's MiniMax-H3 pipeline avoids per-step TPU host
+    # synchronizations (.item(), torch.unique, dynamic boolean masks) and
+    # @torch.compiler.disable around single-request packed attention.
+    #
+    # Problem:
+    # 1. ExactProjectionCache hashes timesteps on CPU and votes across TP ranks
+    #    via all_reduce().item() on every DiT block.
+    # 2. MiniMaxH3Attention._run_packed_attention is decorated with
+    #    @torch.compiler.disable, splitting every MiniMaxH3DiTBlock into two
+    #    compiled subgraphs plus an eager DEFER_AND_FUSE island.
+    # 3. MiniMaxH3DenoiseBranch.forward_kwargs runs torch.unique(timesteps) on
+    #    device each step (where step 0 has M=3 unique timesteps and steps >= 1
+    #    have M=4, triggering a full 50-block recompile on step 1).
+    # 4. minimax_h3_rf_v_to_x0 and euler_eta0_step execute 16 .item() finiteness
+    #    checks per denoising step, and condition_proj + token_refiner recompute
+    #    timestep-invariant prompt embeddings every step.
+    # Fix: Install the TPU execution helpers in omni/minimax_h3.py.
+    # Effect: MiniMax-H3 768x1344x124f (50 steps) on TPU v7x (Ulysses-8):
+    #   10.49 s/step -> 0.962 s/step (BF16 dense).
+    # -------------------------------------------------------------------------
+    from vllm_torchtpu.omni.minimax_h3 import install_minimax_h3_tpu_execution_patches
+
+    install_minimax_h3_tpu_execution_patches()
 
 
 _ULYSSES_BATCHED_A2A_PATCHED = "_tpu_ulysses_batched_a2a_patched"

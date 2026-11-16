@@ -313,7 +313,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
 # outside these paths imports their kernels, so they cannot change a cached
 # executable; hashing them would only invalidate LLM compile caches.
 _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
+    "vllm_torchtpu/kernels/diffusion_adaln",
     "vllm_torchtpu/kernels/diffusion_attention",
+    "vllm_torchtpu/omni/adaln.py",
     "vllm_torchtpu/omni/attention.py",
     "vllm_torchtpu/omni/rope.py",
 )

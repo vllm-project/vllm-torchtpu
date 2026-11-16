@@ -305,7 +305,8 @@ class TestTpuCompilerCache:
                 or path.relative_to(source_root).as_posix().startswith(excluded_dirs)
             )
             and re.search(
-                r"kernels\.diffusion_attention|kernels import diffusion_attention",
+                r"kernels\.diffusion_(?:attention|adaln)"
+                r"|kernels import diffusion_(?:attention|adaln)",
                 path.read_text(),
             )
         }
@@ -629,9 +630,13 @@ class TestTpuCompilerCache:
         )
 
         assert (
+            "vllm_torchtpu/kernels/diffusion_adaln" in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
+        )
+        assert (
             "vllm_torchtpu/kernels/diffusion_attention"
             in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
         )
+        assert "vllm_torchtpu/omni/adaln.py" in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
         assert "vllm_torchtpu/omni/rope.py" in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
 
     def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
