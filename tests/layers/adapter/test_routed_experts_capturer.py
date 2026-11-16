@@ -14,6 +14,7 @@
 """TPU routed-experts capture: every forward of a step writes the table from
 row 0, and its rows reach the step's snapshot at the step's row offset."""
 
+import threading
 from functools import partial
 from types import SimpleNamespace
 from typing import cast
@@ -24,6 +25,13 @@ import pytest
 import torch
 import torch._dynamo.utils
 from vllm.config import VllmConfig
+from vllm.distributed.aux_output_connector.connector import (
+    AuxOutputConnectorMetadata,
+)
+from vllm.distributed.aux_output_connector.routed_experts import RoutedExpertsBuffer
+from vllm.distributed.aux_output_connector.store import BlockObjectStore
+from vllm.distributed.aux_output_connector.worker import AuxOutputWorkerConnector
+from vllm.forward_context import set_forward_context
 from vllm.platforms import current_platform
 
 from tests.distributed.tpu_test_utils import run_in_isolated_process
@@ -34,10 +42,13 @@ NUM_LAYERS, TOPK = 3, 4
 TOKEN_PADDINGS = [16, 32, 64]
 MAX_NUM_BATCHED_TOKENS = 64
 STAGING_ROWS = MAX_NUM_BATCHED_TOKENS + TOKEN_PADDINGS[-1]
+BLOCK_SIZE = 4
+# Marks padding rows; `_ids(..., num_experts=PADDING)` stays below it.
+PADDING = 511
 TPU = "tpu"
 
 
-def _capturer(num_experts=512, with_staging=True):
+def _vllm_config(num_experts=512):
     model_config = SimpleNamespace(
         get_total_num_hidden_layers=lambda: NUM_LAYERS,
         get_num_experts=lambda: num_experts,
@@ -47,10 +58,23 @@ def _capturer(num_experts=512, with_staging=True):
     vllm_config = SimpleNamespace(
         model_config=model_config,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS),
-        parallel_config=SimpleNamespace(data_parallel_rank=0, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_rank=0,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            use_sequence_parallel_moe=False,
+            is_moe_model=True,
+        ),
+        compilation_config=SimpleNamespace(
+            fast_moe_cold_start=False, static_forward_context={}
+        ),
     )
+    return cast(VllmConfig, vllm_config)
+
+
+def _capturer(num_experts=512, with_staging=True):
     return routed_experts_capturer.TPURoutedExpertsCapturer(
-        cast(VllmConfig, vllm_config), TOKEN_PADDINGS, with_staging=with_staging
+        _vllm_config(num_experts), TOKEN_PADDINGS, with_staging=with_staging
     )
 
 
@@ -62,15 +86,23 @@ def _ids(num_tokens, num_experts=512, seed=0):
     return torch.from_numpy(ids.astype(np.int32))
 
 
+def _forward(capturer, ids, device):
+    """One forward's hook calls, under the forward context vLLM's hook reads."""
+    with set_forward_context(None, _vllm_config(), num_tokens=ids.shape[0]):
+        for layer in range(NUM_LAYERS):
+            capturer.capture(layer, ids[:, layer].to(device))
+
+
 @pytest.fixture
 def cpu_capturer(monkeypatch):
     monkeypatch.setattr(current_platform, "device_type", "cpu")
     return _capturer()
 
 
-def test_capture_traces_once_for_every_bucket(cpu_capturer):
-    """The hook reads nothing but its input, so one trace with a dynamic
-    token dim, as vLLM compiles the backbone, writes every bucket's rows."""
+@pytest.mark.parametrize("is_warmup", [False, True])
+def test_capture_traces_once_for_every_bucket(cpu_capturer, is_warmup):
+    """One trace with a dynamic token dim, as vLLM compiles the backbone,
+    writes every bucket's rows. A warmup forward's context holds 0 tokens."""
     torch._dynamo.reset()
     graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
     compiled = torch.compile(
@@ -81,11 +113,21 @@ def test_capture_traces_once_for_every_bucket(cpu_capturer):
     )
     for num_tokens in (16, 32):
         ids = _ids(num_tokens)[:, 1]
-        compiled(ids)
+        context_num_tokens = 0 if is_warmup else num_tokens
+        with set_forward_context(None, _vllm_config(), num_tokens=context_num_tokens):
+            compiled(ids)
         assert torch.equal(cpu_capturer.device_buffer[:num_tokens, 1], ids)
 
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs + 1
     assert not cpu_capturer.device_buffer[:, [0, 2]].any()
+
+
+def test_capture_rejects_a_layer_past_the_table(cpu_capturer):
+    with (
+        set_forward_context(None, _vllm_config(), num_tokens=16),
+        pytest.raises(IndexError, match="exceeds capture buffer"),
+    ):
+        cpu_capturer.capture(NUM_LAYERS, _ids(16)[:, 0])
 
 
 @pytest.mark.parametrize("row_offset", [0, 7, STAGING_ROWS - 16])
@@ -130,6 +172,94 @@ def test_snapshot_is_a_bucket_sized_copy(cpu_capturer):
     assert not second.any()
 
 
+def _stage_rows_on_host(staging, rows, row_offset):
+    """The staging op's JAX body, for tests without a chip."""
+    staged = routed_experts_capturer._stage_rows_jax(
+        jnp.asarray(staging.numpy()),
+        jnp.asarray(rows.numpy()),
+        jnp.asarray(row_offset.numpy()),
+    )
+    return torch.from_numpy(np.array(staged))
+
+
+def _vllm_connector(capturer):
+    """vLLM's worker connector around `capturer`, built the way vLLM's own
+    connector tests build it."""
+    dtype = np.dtype(capturer.output_dtype_name)
+    shape = capturer.shape_per_token
+    connector = object.__new__(AuxOutputWorkerConnector)
+    connector._capturer = capturer
+    connector._store = BlockObjectStore(
+        max_bytes=1 << 20,
+        object_nbytes=BLOCK_SIZE * int(np.prod(shape)) * dtype.itemsize,
+    )
+    connector._buffer = RoutedExpertsBuffer(
+        dtype, shape, BLOCK_SIZE, 4, MAX_NUM_BATCHED_TOKENS, 2
+    )
+    connector._requests = {}
+    connector._generation = 0
+    connector._step_metadata = None
+    connector._pending_outputs = []
+    connector._lock = threading.Lock()
+    connector._max_concurrent_batches = 2
+    return connector
+
+
+def _run_step(connector, capturer, ids, requests, block_hashes, finished=()):
+    """One single-forward step of `ids` through the capturer and vLLM's
+    connector; `requests` maps a request to (first token, tokens this step)."""
+    connector.begin_step(
+        AuxOutputConnectorMetadata(
+            generation=0,
+            requests=dict.fromkeys(requests, 0),
+            block_hashes=block_hashes,
+            finished_requests=finished,
+        )
+    )
+    _forward(capturer, ids, "cpu")
+    capturer.stage_rows(ids.shape[0], 0)
+    token_starts, num_tokens = zip(*requests.values(), strict=True)
+    pending = connector.prepare_output(
+        SimpleNamespace(
+            req_ids=list(requests),
+            query_start_loc_np=np.cumsum((0, *num_tokens), dtype=np.int32),
+            num_computed_tokens_np=np.array(token_starts, dtype=np.int32),
+        )
+    )
+    pending.enqueue_cpu_copy(
+        num_sampled=np.ones(len(requests), dtype=np.int32),
+        num_rejected=np.zeros(len(requests), dtype=np.int32),
+    )
+    return pending.process_output()
+
+
+def test_vllm_connector_never_reads_the_snapshot_padding(cpu_capturer, monkeypatch):
+    """`snapshot_routing_data` returns a whole bucket where vLLM's returns the
+    real row count, which is safe while vLLM's connector hands out and caches
+    request rows only. A failure here means `snapshot_routing_data` has to
+    change."""
+    monkeypatch.setattr(routed_experts_capturer, "_STAGE_ROWS_OP", _stage_rows_on_host)
+    step = partial(_run_step, _vllm_connector(cpu_capturer), cpu_capturer)
+    hashes = [b"a" * 32, b"b" * 32]
+    # 10 real rows, then padding up to the bucket.
+    ids = _ids(16, num_experts=PADDING)
+    ids[10:] = PADDING
+
+    outputs = step(ids, {"first": (0, 8), "second": (0, 2)}, {"first": hashes})
+
+    assert (cpu_capturer.snapshot_routing_data(10)[10:] == PADDING).all()
+    assert np.array_equal(outputs["first"].rows, ids[:8].numpy())
+    assert np.array_equal(outputs["second"].rows, ids[8:10].numpy())
+
+    # A prefix hit on both of `first`'s blocks reads them back from the cache.
+    next_ids = _ids(16, num_experts=PADDING, seed=1)
+    next_ids[1:] = PADDING
+    outputs = step(next_ids, {"third": (8, 1)}, {"third": hashes}, ("first", "second"))
+
+    expected = torch.cat([ids[:8], next_ids[:1]]).numpy()
+    assert np.array_equal(outputs["third"].rows, expected)
+
+
 # The tests below run on the chip, each in a spawned child, and
 # spawns_tpu_workers runs them before tests that hold the chip in-process.
 
@@ -145,11 +275,6 @@ def _tpu_capturer(num_experts=512):
     return capturer
 
 
-def _forward(capturer, ids):
-    for layer in range(NUM_LAYERS):
-        capturer.capture(layer, ids[:, layer].to(TPU))
-
-
 def _step_rows_reach_the_snapshot_on_tpu(num_experts):
     capturer = _tpu_capturer(num_experts)
     # (real rows, bucket) of three forwards in one step.
@@ -157,7 +282,7 @@ def _step_rows_reach_the_snapshot_on_tpu(num_experts):
     expected, row_offset = [], 0
     for seed, (num_tokens, bucket) in enumerate(forwards):
         ids = _ids(bucket, num_experts, seed)
-        _forward(capturer, ids)
+        _forward(capturer, ids, TPU)
         capturer.stage_rows(bucket, row_offset)
         expected.append(ids[:num_tokens])
         row_offset += num_tokens
@@ -165,7 +290,7 @@ def _step_rows_reach_the_snapshot_on_tpu(num_experts):
     copied = torch.tpu.Event()
     copied.record()
     # The next step rewrites the staging table before that copy is waited on.
-    _forward(capturer, _ids(16, num_experts, seed=9))
+    _forward(capturer, _ids(16, num_experts, seed=9), TPU)
     capturer.stage_rows(16, 0)
     capturer.snapshot_routing_data(16).cpu()
     copied.synchronize()
@@ -188,16 +313,16 @@ def test_step_rows_reach_the_snapshot_on_tpu(num_experts):
 def _staging_compiles_once_per_bucket_on_tpu():
     capturer = _tpu_capturer()
 
-    def stage(bucket, row_offset):
+    def stage(bucket, row_offset, num_tokens):
         capturer.stage_rows(bucket, row_offset)
-        capturer.snapshot_routing_data(bucket).cpu()
+        capturer.snapshot_routing_data(num_tokens).cpu()
 
     for bucket in TOKEN_PADDINGS:
-        stage(bucket, 0)
+        stage(bucket, 0, bucket)
     compiles = torch.tpu._get_cache_stats().num_compilations
     for bucket in TOKEN_PADDINGS:
-        for row_offset in (5, STAGING_ROWS - bucket):
-            stage(bucket, row_offset)
+        stage(bucket, 5, bucket - 1)
+        stage(bucket, STAGING_ROWS - bucket, bucket // 2 + 1)
 
     assert torch.tpu._get_cache_stats().num_compilations == compiles
 
@@ -205,7 +330,8 @@ def _staging_compiles_once_per_bucket_on_tpu():
 @pytest.mark.tpu_test
 @pytest.mark.spawns_tpu_workers
 def test_staging_compiles_once_per_bucket_on_tpu():
-    """The offset is program data, so a new offset compiles nothing.
+    """The offset is program data and the snapshot is a whole bucket, so a new
+    offset or a new row count within a bucket compiles nothing.
 
     Each write is waited on, as the runner's forwards separate them: eager
     writes deferred back to back fuse into programs of their own.

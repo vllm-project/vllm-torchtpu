@@ -13,10 +13,13 @@
 # limitations under the License.
 """Routed-experts capture for TPU steps that run several forwards."""
 
+import bisect
+
 import jax
 import torch
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
+from vllm.forward_context import ForwardContext
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -45,10 +48,12 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
     """Collects a step's routed experts across all of its forwards.
 
     Every forward is padded to a token bucket and writes `device_buffer` from
-    row 0. With `with_staging`, each forward's rows then move into a step-wide
-    staging table at the step's running row count, and the step's snapshot is
-    read from that table. Shapes follow the buckets and the offset is device
-    data, so each program compiles once per bucket.
+    row 0. The compiled forward writes that table but never reads it, so XLA
+    copies it once per forward rather than once per layer. With `with_staging`,
+    each forward's rows then move into a step-wide staging table at the step's
+    running row count, and the step's snapshot is read from that table. Shapes
+    follow the buckets and the offset is device data, so each program compiles
+    once per bucket.
     """
 
     def __init__(
@@ -76,10 +81,17 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
                 device=self.device_buffer.device,
             )
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
-        # The compiled forward writes the table but never reads it, so XLA
-        # copies the table once per forward rather than once per layer.
-        self.device_buffer[: topk_ids.shape[0], layer_id] = topk_ids
+    def _restore_local_topk_ids(
+        self, topk_ids: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        # vLLM picks the row layout by comparing the row count with the forward
+        # context's token count. The backbone is traced once for every bucket,
+        # so that comparison would be fixed at trace time. Layers bound to this
+        # capturer hand over this rank's rows in token order.
+        # TODO(haotianx): Move this to vLLM's `RoutedExpertsRowRestorer` hook on
+        # the MoE runner once the vLLM pin includes
+        # https://github.com/vllm-project/vllm/pull/64689.
+        return topk_ids
 
     def stage_rows(self, num_padded_tokens: int, row_offset: int) -> None:
         """Moves the last forward's rows to `row_offset` of the step; a no-op
@@ -103,13 +115,21 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
         self._staging.copy_(_STAGE_ROWS_OP(self._staging, rows, offset))
 
     def snapshot_routing_data(self, num_tokens: int) -> torch.Tensor:
-        """The step's first `num_tokens` rows, padded to a token bucket."""
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+        """The step's rows padded to a token bucket; only the first
+        `num_tokens` are valid.
 
+        vLLM's capturer returns exactly `num_tokens` rows; here that slice
+        would compile a program per row count. The extra rows are never read:
+        the only caller is `AuxOutputWorkerConnector.prepare_output`, and the
+        only reader of its result, `_commit_output`, slices each request's rows
+        by its real token range. Revisit this if vLLM adds a caller or a reader
+        that uses the row count or the rows past `num_tokens`.
+        """
         assert self._staging is not None, (
             "routed-experts snapshots need with_staging=True"
         )
-        num_rows = _get_padded_token_len(self._token_paddings, num_tokens)
+        bucket_index = bisect.bisect_left(self._token_paddings, num_tokens)
+        num_rows = self._token_paddings[bucket_index]
         # Cloned because the next step's staging writes can run before the copy
         # of this one to the host is done.
         return self._staging[:num_rows].clone()
