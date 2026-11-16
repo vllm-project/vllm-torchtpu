@@ -1,0 +1,437 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Provenance: copied from src/vllm_torchtpu/models/vllm/qwen4_exp/mtp.py at
+# 31f5b61dcb10bc804dd665b2a9e4584bb22e44dc.
+#   Owned by models/qwen4_exp from this copy on.
+"""Qwen4Exp (Qwen3.8 Flash Next) MTP draft on the TPU-native backbone.
+
+Follows upstream ``vllm.models.qwen4_exp.{nvidia,amd}.mtp`` exactly:
+
+* the token embedding (shared with the target) passes ``pre_fc_norm_embedding``
+  and ``fc_embedding`` to [T, H];
+* the target's *pre-final-mixer* multi-stream hidden state [T, hc*H] passes one
+  RMSNorm over all hc*H elements (``pre_fc_norm_hidden``), then the shared
+  ``fc_hidden`` per HC stream; the embedding is added to every stream;
+* one full-attention decoder layer (QSA with its indexer, routed + shared MoE
+  and both hyper-connections; no PLE) runs on that multi-stream state;
+* the MTP's own ``hyper_connection_mixer`` collapses it to [T, H] for the
+  shared LM head, while the multi-stream state feeds the next draft step.
+
+The QSA layer owns ordinary unified-pool pages (``mtp.layers.<L>.self_attn``
+plus its compressed-key and raw-ring groups), planned by ``native_cache_specs``
+and bound by ``Qwen4ExpPooledCache``. Its ragged geometry comes from its own
+forward-context metadata, which the runner's MTP proposer builds for step 0
+(the target's chunk) and for the one-token loop steps.
+"""
+
+import copy
+import itertools
+import re
+from collections.abc import Iterable
+from typing import Any, cast
+
+import torch
+from torch import nn
+from vllm.compilation.decorators import support_torch_compile
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import AutoWeightsLoader
+
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+from . import plan
+from .config import mtp_layer_prefixes
+from .hyperconnection import GatedResidual
+from .model import (
+    Qwen4ExpDecoderLayer,
+    Qwen4ExpForCausalLM,
+    _parameter_storage_key,
+    hc_config,
+    is_remote_expert_block_scale,
+    load_layer_mlp_weights,
+    local_expert_ids,
+    moe_weights_mapper,
+    verify_moe_checkpoint,
+)
+
+_CHECKPOINT_LAYER = re.compile(r"^mtp\.layers\.(\d+)\.")
+
+
+def remap_mtp_ignored_layers(names, first_layer):
+    """Checkpoint ``mtp.layers.<i>`` -> draft module ``mtp.layers.<first+i>``."""
+    return [
+        _CHECKPOINT_LAYER.sub(
+            lambda m: f"mtp.layers.{first_layer + int(m.group(1))}.", name
+        )
+        if name.startswith("mtp.layers.")
+        else name
+        for name in names
+    ]
+
+
+def draft_quant_config(quant_config, first_layer):
+    """The target's FP8 config with the MTP layer's BF16 modules renamed.
+
+    The draft shares the target's quant config object; mutating it would
+    change the target's layer matching, so return a shallow copy with only
+    the skip list replaced.
+    """
+    if quant_config is None:
+        return None
+    ignored = getattr(quant_config, "ignored_layers", None)
+    if not ignored:
+        return quant_config
+    config = copy.copy(quant_config)
+    config.ignored_layers = remap_mtp_ignored_layers(ignored, first_layer)
+    return config
+
+
+def mtp_checkpoint_name(name):
+    """Draft parameter name for a checkpoint tensor; None for target tensors.
+
+    The draft shares the target's embedding and LM head, so only ``mtp.*``
+    tensors belong to it. Checkpoint layer ``i`` is ModuleList entry ``i``.
+    """
+    if not name.startswith("mtp."):
+        return None
+    return "model." + name.removeprefix("mtp.")
+
+
+class Qwen4ExpMultiTokenPredictor(nn.Module):
+    fc_embedding: ReplicatedLinear
+    fc_hidden: ReplicatedLinear
+
+    def __init__(self, cfg, prefixes):
+        super().__init__()
+        t = cfg.model_config.hf_text_config
+        self.hidden_size = t.hidden_size
+        self.hc_count = t.hc_count
+        self.embed_tokens = VocabParallelEmbedding(t.vocab_size, t.hidden_size)
+        self.pre_fc_norm_embedding = GemmaRMSNorm(t.hidden_size, eps=t.rms_norm_eps)
+        self.pre_fc_norm_hidden = GemmaRMSNorm(
+            t.hidden_size * t.hc_count, eps=t.rms_norm_eps
+        )
+        # BF16 in the checkpoint (modules_to_not_convert); replicated so the
+        # [T*hc, H] projection needs no collective.
+        for name in ("fc_embedding", "fc_hidden"):
+            setattr(
+                self,
+                name,
+                ReplicatedLinear(
+                    t.hidden_size,
+                    t.hidden_size,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    quant_config=None,
+                    prefix=f"mtp.{name}",
+                    return_bias=False,
+                ),
+            )
+        self.layers = nn.ModuleList(
+            Qwen4ExpDecoderLayer(
+                cfg,
+                t.num_hidden_layers + i,
+                prefix,
+                layer_type="full_attention",
+            )
+            for i, prefix in enumerate(prefixes)
+        )
+        # The tiled HC kernels are chosen by `tokens >= tile and tokens % tile
+        # == 0` while tracing. The backbone is re-traced per token-bucket
+        # group, but the draft is traced once and its graph serves every
+        # bucket, so a draft traced at fewer than `tile` tokens cannot serve a
+        # larger bucket (ShapeSpecializationError) and vice versa. The draft's
+        # HCs (its layers' too, see `Qwen4ExpDecoderLayer`) therefore keep the
+        # untiled path at every token count.
+        self.hyper_connection_mixer = GatedResidual(hc_config(t), use_combine=False)
+        # Its attention must not choose its structure by the token count
+        # either.
+        for layer in self.layers:
+            cast(Any, layer.self_attn).single_graph = True
+
+    def fuse_inputs(self, input_ids, hidden_states, inputs_embeds=None):
+        """[T, hc*H] decoder input from the token and the previous hidden."""
+        tokens = hidden_states.shape[0]
+        embeds = (
+            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        )
+        embeds = self.fc_embedding(self.pre_fc_norm_embedding(embeds))
+        hidden = self.pre_fc_norm_hidden(hidden_states)
+        hidden = self.fc_hidden(hidden.reshape(tokens * self.hc_count, -1))
+        hidden = hidden.reshape(tokens, self.hc_count, self.hidden_size)
+        return (hidden + embeds.unsqueeze(1)).reshape(tokens, -1)
+
+    def forward(
+        self, input_ids, positions, hidden_states, inputs_embeds, step, rows=None
+    ):
+        hidden = self.fuse_inputs(input_ids, hidden_states, inputs_embeds)
+        layer = cast(Qwen4ExpDecoderLayer, self.layers[step % len(self.layers)])
+        metadata = cast(
+            dict[str, AttentionMetadata], get_forward_context().attn_metadata
+        )[layer.self_attn.prefix]
+        starts = cast(torch.Tensor, metadata.query_start_loc)
+        seq_lens = cast(torch.Tensor, metadata.seq_lens)
+        # The same ragged geometry the target adapter derives: context is the
+        # length before this chunk. Loop steps advance seq_lens in place.
+        context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
+        tables = cast(torch.Tensor, metadata.block_tables)
+        if rows is not None:
+            hidden = layer.forward_rows(
+                hidden,
+                positions.to(torch.int64),
+                rows.to(torch.int64),
+                starts,
+                torch.zeros_like(seq_lens, dtype=torch.int32),
+                context,
+                tables,
+                tables,
+            )
+            return self.hyper_connection_mixer.mix(hidden)[0], hidden
+        hidden = layer(
+            hidden,
+            positions.to(torch.int64),
+            input_ids.to(torch.int64),
+            starts,
+            None,
+            # Pooled QSA reads its ring slot and page tables from the
+            # per-group forward-context metadata; these are placeholders.
+            torch.zeros_like(seq_lens, dtype=torch.int32),
+            context,
+            torch.arange(hidden.shape[0], device=hidden.device) < starts[-1],
+            tables,
+            tables,
+        )
+        return self.hyper_connection_mixer.mix(hidden)[0], hidden
+
+
+# Only the token dimension is dynamic. `draft_rows` (draft step 0's per-request
+# rows) must stay static: vLLM compiles one trace per token bucket by setting
+# every symbol of the trace to the bucket size (create_concrete_args), so a
+# dynamic draft_rows dim was compiled at the bucket size (s64[256] at bucket
+# 256) and failed against the request-sized rows a step passes. The proposer
+# always passes it at the chunk's fixed request capacity instead.
+QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS: dict[str, Any] = {
+    "input_ids": 0,
+    "positions": 0,
+    "hidden_states": 0,
+}
+
+
+@support_torch_compile(dynamic_arg_dims=QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS)
+class Qwen4ExpMTP(nn.Module):
+    """Draft returning (LM-head input [T, H], next-step hidden [T, hc*H])."""
+
+    # Draft step 0 consumes the target's second output, the multi-stream
+    # hidden state, rather than its LM-head input (see Eagle3Proposer).
+    uses_target_aux_hidden_states = True
+    has_own_embed_tokens = False
+    has_own_lm_head = False
+    # Draft step 0 may pass `draft_rows` (each request's last token): the
+    # draft then writes its QSA caches for every token but evaluates the
+    # layer, and returns both outputs, at those rows only.
+    supports_draft_rows = True
+    # Identical to the target's: vLLM writes this onto the shared quant config.
+    packed_modules_mapping = Qwen4ExpForCausalLM.packed_modules_mapping
+
+    def __init__(self, *, vllm_config, prefix=""):
+        super().__init__()
+        prefixes = mtp_layer_prefixes(vllm_config)
+        if len(prefixes) != 1:
+            raise ValueError("Qwen4Exp TPU MTP requires exactly one MTP layer")
+        t = vllm_config.model_config.hf_text_config
+        cfg = copy.copy(vllm_config)
+        cfg.quant_config = draft_quant_config(
+            vllm_config.quant_config, t.num_hidden_layers
+        )
+        self.config = t
+        self.model = Qwen4ExpMultiTokenPredictor(cfg, prefixes)
+        self.lm_head = ParallelLMHead(t.vocab_size, t.hidden_size, prefix="lm_head")
+        self.logits_processor = LogitsProcessor(t.vocab_size)
+        # Hidden width of draft step 0's target input and the loop carry.
+        self.target_hidden_size = t.hidden_size * t.hc_count
+
+    def embed_input_ids(self, input_ids):
+        return self.model.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        hidden_states,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        spec_step_idx: int = 0,
+        draft_rows: torch.Tensor | None = None,
+    ):
+        if intermediate_tensors is not None:
+            raise NotImplementedError("Qwen4Exp MTP runs whole on one stage")
+        return self.model(
+            input_ids,
+            positions,
+            hidden_states,
+            inputs_embeds,
+            spec_step_idx,
+            draft_rows,
+        )
+
+    def bind_shared_selection(self, target_model: nn.Module, max_tokens: int) -> bool:
+        """VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: the draft's QSA layers attend
+        the target's last QSA layer selection instead of their own indexer.
+
+        The target layer writes its ``selected`` rows into a shared buffer;
+        draft step 0 reads each request's last verified row from it and
+        carries those rows to the later steps. Returns whether it bound.
+        """
+        if not plan.value("VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"):
+            return False
+        backbone = getattr(target_model, "model", None)
+        layers = [
+            layer
+            for layer in getattr(backbone, "layers", ())
+            if getattr(layer, "layer_type", None) == "full_attention"
+        ]
+        drafts = [
+            cast(Qwen4ExpDecoderLayer, layer).self_attn for layer in self.model.layers
+        ]
+        # The shared ops are built when the pool is bound, after this load-time
+        # call; the forward takes the shared path only once they exist.
+        if not layers:
+            return False
+        target = layers[-1].self_attn
+        width = target.max_selected_tokens
+        sink = torch.full(
+            (max_tokens, width), -1, dtype=torch.int32, device=target.rope_cache.device
+        )
+        target.register_buffer("_selection_sink", sink, persistent=False)
+        for attention in drafts:
+            assert attention.max_selected_tokens == width
+            attention.register_buffer("_selection_source", sink, persistent=False)
+            attention.register_buffer(
+                "_selection_rows", torch.full_like(sink, -1), persistent=False
+            )
+        return True
+
+    def compute_logits(self, hidden_states, spec_step_idx: int = 0):
+        return self.logits_processor(self.lm_head, hidden_states)
+
+    def is_unused_checkpoint_weight(self, weight_name: str) -> bool:
+        """Checkpoint tensors the draft does not load (the main model's, and
+        other EP ranks' routed-expert FP8 block scales), so the loader can
+        skip them before reading their bytes."""
+        if mtp_checkpoint_name(weight_name) is None:
+            return True
+        if not weight_name.endswith(".weight_scale_inv"):
+            return False
+        # Called once per checkpoint tensor: resolve this rank's experts once.
+        if "_unused_check_local_ids" not in self.__dict__:
+            layers = cast(nn.ModuleList, self.model.layers)
+            self._unused_check_local_ids = (
+                local_expert_ids(layers[0].mlp) if len(layers) else None
+            )
+        return is_remote_expert_block_scale(weight_name, self._unused_check_local_ids)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        parameters = dict(self.named_parameters())
+        moe_mapper = moe_weights_mapper()
+        layers = cast(nn.ModuleList, self.model.layers)
+        moe_loaders = [
+            AutoWeightsLoader(cast(nn.Module, layer.mlp)) for layer in layers
+        ]
+        loaded: set[str] = set()
+        source: set[str] = set()
+
+        def _classified_weights():
+            """(("mlp", layer), item) for MLP tensors, (None, item) otherwise,
+            so consecutive tensors of one layer's MLP load as one batch."""
+            for original, weight in weights:
+                name = mtp_checkpoint_name(original)
+                if name is None:
+                    continue
+                if name in source:
+                    raise ValueError(f"Duplicate checkpoint tensor {original}")
+                source.add(name)
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    if int(idx) >= len(layers):
+                        raise ValueError(f"Unexpected Qwen4Exp MTP layer {original}")
+                    if family == "mlp":
+                        yield ("mlp", int(idx)), (original, name, relative, weight)
+                        continue
+                yield None, (original, name, "", weight)
+
+        for group_key, group in itertools.groupby(
+            _classified_weights(), key=lambda item: item[0]
+        ):
+            if group_key is not None:
+                _, layer_idx = group_key
+                loaded.update(
+                    load_layer_mlp_weights(
+                        moe_loaders[layer_idx],
+                        cast(nn.Module, layers[layer_idx].mlp),
+                        ((relative, weight) for _, (_, _, relative, weight) in group),
+                        moe_mapper,
+                        layer_idx,
+                    )
+                )
+                continue
+            for _, (original, name, _, weight) in group:
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    layer = cast(Qwen4ExpDecoderLayer, layers[int(idx)])
+                    if family == "self_attn":
+                        layer.self_attn.load_weights([(relative, weight)])
+                        continue
+                if name not in parameters:
+                    raise ValueError(
+                        f"Unknown Qwen4Exp MTP checkpoint tensor {original}"
+                    )
+                param = parameters[name]
+                getattr(param, "weight_loader", default_weight_loader)(param, weight)
+                loaded.add(name)
+        for i, layer in enumerate(layers):
+            verify_moe_checkpoint(
+                layer.mlp,
+                f"model.layers.{i}.mlp.",
+                source,
+                moe_mapper,
+                f"MTP layer{i}",
+            )
+            cast(Any, layer.self_attn).finalize_weights()
+        ordinary = {
+            name
+            for name in parameters
+            if not name.startswith(("model.embed_tokens.", "lm_head."))
+            and not any(marker in name for marker in (".mlp.experts.", ".self_attn."))
+        }
+        # Quantization methods may register names for the same storage.
+        loaded_storage = {
+            _parameter_storage_key(parameters[name])
+            for name in loaded & parameters.keys()
+        }
+        missing = {
+            name
+            for name in ordinary - loaded
+            if _parameter_storage_key(parameters[name]) not in loaded_storage
+        }
+        if missing:
+            raise ValueError(f"Incomplete Qwen4Exp MTP checkpoint: {sorted(missing)}")
+        return set(parameters)
