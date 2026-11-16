@@ -55,10 +55,6 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.tracing.engine_spans import (
-    XlaCompileSpans,
-    maybe_create_xla_compile_spans,
-)
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -99,10 +95,6 @@ def _release_free_host_heap() -> None:
 
 
 class TPUWorker(WorkerBase):
-    # Set before the first serving step when traces are exported.
-    _xla_compile_spans: XlaCompileSpans | None = None
-    _xla_compile_spans_checked = False
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -687,31 +679,10 @@ class TPUWorker(WorkerBase):
         )
 
     def execute_model(self, scheduler_output):
-        spans = self._serving_xla_compile_spans()
-        output = self.model_runner.execute_model(scheduler_output)
-        if spans is not None:
-            spans.poll()
-        return output
+        return self.model_runner.execute_model(scheduler_output)
 
     def sample_tokens(self, grammar_output):
-        output = self.model_runner.sample_tokens(grammar_output)
-        if self._xla_compile_spans is not None:
-            self._xla_compile_spans.poll()
-        return output
-
-    def _serving_xla_compile_spans(self) -> XlaCompileSpans | None:
-        """Returns the compile-span emitter, creating it before the first step.
-
-        Creating it at the first serving step baselines everything compiled
-        during start-up and warm-up, so only serving-time compiles are
-        reported.
-        """
-        if not self._xla_compile_spans_checked:
-            self._xla_compile_spans_checked = True
-            self._xla_compile_spans = maybe_create_xla_compile_spans(
-                self.vllm_config, self.rank
-            )
-        return self._xla_compile_spans
+        return self.model_runner.sample_tokens(grammar_output)
 
     def profile_pipeline_chunks(self) -> dict:
         return self.model_runner.profile_pipeline_chunks()
@@ -724,14 +695,6 @@ class TPUWorker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
-        spans = self._serving_xla_compile_spans()
-        try:
-            self._execute_dummy_batch()
-        finally:
-            if spans is not None:
-                spans.poll()
-
-    def _execute_dummy_batch(self) -> None:
         runner = self.model_runner
         bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
         if bucket is None:

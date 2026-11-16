@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""kv_fetch and xla_compile spans emitted from EngineCore and TPU workers."""
+"""kv_fetch spans emitted from EngineCore."""
 
-import datetime
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -66,9 +65,6 @@ class _Clock:
     def __init__(self, start_s: float = 1_000.0) -> None:
         self.now_s = start_s
 
-    def time(self) -> float:
-        return self.now_s
-
     def time_ns(self) -> int:
         return int(round(self.now_s * 1e9))
 
@@ -76,7 +72,6 @@ class _Clock:
 @pytest.fixture
 def clock(monkeypatch):
     clock = _Clock()
-    monkeypatch.setattr(engine_spans.time, "time", clock.time)
     monkeypatch.setattr(engine_spans.time, "time_ns", clock.time_ns)
     return clock
 
@@ -527,274 +522,41 @@ def test_real_scheduler_without_trace_headers_emits_nothing(
     assert tracker.fetches == {}
 
 
-# --- XlaCompileSpans ---------------------------------------------------------
-
-
-class _Entry:
-    def __init__(self, compile_s: float, last_read_s: float, read_count: int = 1):
-        self.compilation_duration = datetime.timedelta(seconds=compile_s)
-        # TorchTPU returns a naive local datetime (pybind11 chrono).
-        self.last_read = datetime.datetime.fromtimestamp(last_read_s)
-        self.read_count = read_count
-
-
-class _FakeTpu:
-    def __init__(self, entries=None, misses=0, with_misses=True):
-        self.entries = list(entries or [])
-        self.misses = misses
-        self.stats_calls = 0
-        if with_misses:
-            self._get_cache_misses = lambda: self.misses
-
-    def _get_cache_stats(self):
-        self.stats_calls += 1
-        return SimpleNamespace(per_entry_stats=list(self.entries))
-
-
-def test_startup_compiles_are_not_reported(clock, spans):
-    tpu = _FakeTpu([_Entry(30.0, clock.now_s - 5)], misses=1)
-    emitter = engine_spans.XlaCompileSpans(tpu, {"vllm.worker.rank": 0})
-
-    clock.now_s += 1
-    emitter.poll()
-
-    assert spans == []
-
-
-def test_unchanged_miss_count_skips_the_cache_scan(clock, spans):
-    tpu = _FakeTpu([_Entry(30.0, clock.now_s - 5)], misses=1)
-    emitter = engine_spans.XlaCompileSpans(tpu, {})
-    calls_after_baseline = tpu.stats_calls
-
-    for _ in range(5):
-        clock.now_s += 0.01
-        emitter.poll()
-
-    assert tpu.stats_calls == calls_after_baseline
-    assert spans == []
-
-
-def test_serving_compile_becomes_a_root_span_ending_at_first_read(clock, spans):
-    tpu = _FakeTpu([_Entry(30.0, clock.now_s - 5)], misses=1)
-    emitter = engine_spans.XlaCompileSpans(tpu, {"vllm.worker.rank": 0})
-    polled_at = clock.now_s
-
-    clock.now_s += 10.0
-    compile_end = clock.now_s - 1.0
-    tpu.entries.append(_Entry(8.718, compile_end))
-    tpu.misses += 1
-    emitter.poll()
-
-    (span,) = spans
-    assert span["name"] == "xla_compile"
-    assert span["end_ns"] == pytest.approx(compile_end * 1e9, abs=1e3)
-    assert span["start_ns"] == pytest.approx((compile_end - 8.718) * 1e9, abs=1e3)
-    assert span["start_ns"] >= polled_at * 1e9
-    attrs = span["attributes"]
-    assert attrs["vllm.xla_compile.compile_s"] == pytest.approx(8.718)
-    assert attrs["vllm.xla_compile.num_graphs"] == 1
-    assert attrs["vllm.worker.rank"] == 0
-    # A root span: no parent in the passed context.
-    assert not trace.get_current_span(span["context"]).get_span_context().is_valid
-
-
-def test_reread_and_parallel_compiles_are_clamped_to_the_poll_interval(clock, spans):
-    tpu = _FakeTpu(misses=0)
-    emitter = engine_spans.XlaCompileSpans(tpu, {})
-    polled_at = clock.now_s
-
-    clock.now_s += 2.0
-    # Already read again (eager graphs reused across layers), so the first
-    # read is unknown; together they took longer than the interval.
-    tpu.entries += [_Entry(1.5, clock.now_s, read_count=4), _Entry(1.5, clock.now_s)]
-    tpu.entries[-1].last_read = datetime.datetime.fromtimestamp(polled_at - 1)
-    tpu.misses = 2
-    emitter.poll()
-
-    (span,) = spans
-    assert span["end_ns"] == pytest.approx(clock.now_s * 1e9, abs=1e3)
-    assert span["start_ns"] == pytest.approx(polled_at * 1e9, abs=1e3)
-    assert span["attributes"]["vllm.xla_compile.compile_s"] == pytest.approx(3.0)
-    assert span["attributes"]["vllm.xla_compile.num_graphs"] == 2
-
-
-def test_cache_hits_from_disk_and_evictions_emit_nothing(clock, spans):
-    tpu = _FakeTpu([_Entry(4.0, clock.now_s - 1)], misses=1)
-    emitter = engine_spans.XlaCompileSpans(tpu, {})
-
-    clock.now_s += 1
-    tpu.entries.append(_Entry(0.0, clock.now_s))  # loaded from a persistent cache
-    tpu.misses += 1
-    emitter.poll()
-    clock.now_s += 1
-    tpu.entries = [tpu.entries[-1]]  # the compiled entry was evicted
-    tpu.misses += 1
-    emitter.poll()
-    clock.now_s += 1
-    tpu.entries.append(_Entry(2.0, clock.now_s))
-    tpu.misses += 1
-    emitter.poll()
-
-    (span,) = spans
-    assert span["attributes"]["vllm.xla_compile.compile_s"] == pytest.approx(2.0)
-
-
-def test_compile_still_running_at_the_poll_is_reported_when_it_finishes(clock, spans):
-    # TorchTPU counts the miss and inserts the entry when the graph is looked
-    # up, but records the duration only when the compile pool finishes, which
-    # the worker thread does not wait for unless it reads a result.
-    tpu = _FakeTpu(misses=0)
-    emitter = engine_spans.XlaCompileSpans(tpu, {})
-    before_miss = clock.now_s
-
-    clock.now_s += 0.01
-    running = _Entry(0.0, clock.now_s)
-    tpu.entries.append(running)
-    tpu.misses = 1
-    emitter.poll()
-    assert spans == []
-    calls = tpu.stats_calls
-
-    clock.now_s += 0.01  # before the first rescan is due
-    emitter.poll()
-    assert tpu.stats_calls == calls
-
-    clock.now_s += 3.0
-    compile_end = clock.now_s - 0.5
-    running.compilation_duration = datetime.timedelta(seconds=2.0)
-    running.last_read = datetime.datetime.fromtimestamp(compile_end)
-    emitter.poll()
-
-    (span,) = spans
-    assert span["end_ns"] == pytest.approx(compile_end * 1e9, abs=1e3)
-    assert span["start_ns"] == pytest.approx((compile_end - 2.0) * 1e9, abs=1e3)
-    assert span["start_ns"] >= before_miss * 1e9
-    assert span["attributes"]["vllm.xla_compile.num_graphs"] == 1
-
-    # Resolved: an unchanged miss count no longer scans.
-    calls = tpu.stats_calls
-    for _ in range(3):
-        clock.now_s += 5.0
-        emitter.poll()
-    assert tpu.stats_calls == calls
-    assert len(spans) == 1
-
-
-def test_carried_compile_window_starts_at_the_poll_before_the_miss(clock, spans):
-    tpu = _FakeTpu(misses=0)
-    emitter = engine_spans.XlaCompileSpans(tpu, {})
-    before_miss = clock.now_s
-
-    clock.now_s += 0.5
-    running = _Entry(0.0, clock.now_s)
-    tpu.entries.append(running)
-    tpu.misses = 1
-    emitter.poll()
-
-    # Several polls while the step waits; then a compile longer than the
-    # last poll interval finishes.
-    for _ in range(3):
-        clock.now_s += 0.5
-        emitter.poll()
-    running.compilation_duration = datetime.timedelta(seconds=10.0)
-    running.last_read = datetime.datetime.fromtimestamp(clock.now_s)
-    clock.now_s += 1.0
-    emitter.poll()
-
-    (span,) = spans
-    assert span["start_ns"] == pytest.approx(before_miss * 1e9, abs=1e3)
-
-
-def test_carried_compile_does_not_end_at_an_earlier_reported_compile(clock, spans):
-    tpu = _FakeTpu(misses=0)
-    emitter = engine_spans.XlaCompileSpans(tpu, {})
-
-    # Two misses: a one-off program that is never read again finishes before
-    # the poll, the other is still compiling.
-    clock.now_s += 1.0
-    one_off_end = clock.now_s - 0.2
-    tpu.entries.append(_Entry(0.5, one_off_end))
-    running = _Entry(0.0, clock.now_s)
-    tpu.entries.append(running)
-    tpu.misses = 2
-    emitter.poll()
-    assert len(spans) == 1
-
-    # The carried compile finishes and is read again before the next scan, so
-    # its first read is lost; it must not reuse the one-off program's.
-    clock.now_s += 5.0
-    running.compilation_duration = datetime.timedelta(seconds=3.0)
-    running.last_read = datetime.datetime.fromtimestamp(clock.now_s - 0.1)
-    running.read_count = 7
-    emitter.poll()
-
-    assert len(spans) == 2
-    span = spans[1]
-    assert span["end_ns"] == pytest.approx(clock.now_s * 1e9, abs=1e3)
-    assert span["start_ns"] == pytest.approx((clock.now_s - 3.0) * 1e9, abs=1e3)
-    assert span["attributes"]["vllm.xla_compile.compile_s"] == pytest.approx(3.0)
-
-
-def test_persistent_cache_loads_stop_rescanning_after_a_timeout(clock, spans):
-    tpu = _FakeTpu(misses=0)
-    emitter = engine_spans.XlaCompileSpans(tpu, {})
-
-    clock.now_s += 1.0
-    tpu.entries.append(_Entry(0.0, clock.now_s))  # never reports a duration
-    tpu.misses = 1
-    emitter.poll()
-    calls = tpu.stats_calls
-
-    # Rescans back off instead of running on every step.
-    for _ in range(200):
-        clock.now_s += 0.01
-        emitter.poll()
-    assert 0 < tpu.stats_calls - calls < 10
-
-    clock.now_s += engine_spans.XlaCompileSpans._PENDING_TIMEOUT_S
-    emitter.poll()
-    calls = tpu.stats_calls
-    for _ in range(10):
-        clock.now_s += 2.0
-        emitter.poll()
-    assert tpu.stats_calls == calls
-    assert spans == []
-
-
-def test_without_a_miss_counter_every_poll_scans(clock, spans):
-    tpu = _FakeTpu(with_misses=False)
-    emitter = engine_spans.XlaCompileSpans(tpu, {})
-
-    clock.now_s += 1
-    tpu.entries.append(_Entry(0.5, clock.now_s))
-    emitter.poll()
-
-    assert len(spans) == 1
-
-
-def test_maybe_create_is_gated_on_the_endpoint(monkeypatch):
-    monkeypatch.setattr(torch, "tpu", _FakeTpu(), raising=False)
-    monkeypatch.setattr(engine_spans, "ensure_tracer_provider", lambda *a: True)
-    config = SimpleNamespace(
-        observability_config=SimpleNamespace(otlp_traces_endpoint=None),
-        parallel_config=SimpleNamespace(data_parallel_rank=1),
+def test_exported_span_is_a_child_of_the_request_parent(
+    shared_model_config, clock, monkeypatch
+):
+    # Goes through vLLM's `instrument_manual` into the OpenTelemetry SDK, as
+    # in a serving process, rather than stubbing `_emit_span`.
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
     )
-    assert engine_spans.maybe_create_xla_compile_spans(config, rank=0) is None
+    from opentelemetry.trace import SpanKind
 
-    config.observability_config.otlp_traces_endpoint = "http://otel:4317"
-    emitter = engine_spans.maybe_create_xla_compile_spans(config, rank=2)
-    assert emitter is not None
-    assert emitter._attributes == {"vllm.worker.rank": 2, "vllm.dp_rank": 1}
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "get_tracer", provider.get_tracer)
+    scheduler, _, hasher = _build_decode_scheduler(shared_model_config, Scheduler)
+    _add_remote_request(scheduler, hasher, "d-req", {"traceparent": TRACEPARENT})
 
-
-def test_maybe_create_skips_non_zero_tp_ranks(monkeypatch):
-    monkeypatch.setattr(torch, "tpu", _FakeTpu(), raising=False)
-    monkeypatch.setattr(engine_spans, "ensure_tracer_provider", lambda *a: True)
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_tensor_model_parallel_rank", lambda: 1
+    start_ns = clock.time_ns()
+    sched_out = scheduler.schedule()
+    clock.now_s += 0.250
+    scheduler.update_from_output(
+        sched_out, _no_forward_output(KVConnectorOutput(finished_recving={"d-req"}))
     )
-    config = SimpleNamespace(
-        observability_config=SimpleNamespace(otlp_traces_endpoint="x"),
-        parallel_config=SimpleNamespace(data_parallel_rank=0),
-    )
-    assert engine_spans.maybe_create_xla_compile_spans(config, rank=1) is None
+    clock.now_s += 0.040
+    scheduler.schedule()
+
+    (span,) = exporter.get_finished_spans()
+    assert span.name == "kv_fetch"
+    assert span.kind is SpanKind.INTERNAL
+    assert span.context.trace_id == TRACE_ID
+    assert span.parent is not None
+    assert span.parent.span_id == PARENT_SPAN_ID
+    assert span.start_time == start_ns
+    assert span.end_time == clock.time_ns()
+    assert span.attributes["vllm.kv_fetch.in_progress_s"] == pytest.approx(0.250)
+    assert span.attributes["vllm.request_id"] == "d-req"
