@@ -7,9 +7,9 @@ BENCH=script; the block exports the served prefill QSA env).
   with slot 0's row).
 - Numerics: ``qsa_rpa._prefill_attention`` with the flag and without it (the served path: the union walk with its
   SparseCore list and gather), each against a float32 reference over every row's exact selection on 512 sampled
-  rows. Gate: the port's max |out - ref| / mean |ref| at most 0.08 (Compare's max_rel) and at most twice the
-  served path's, every value finite. The port against the served output is printed: both are bf16, so one output
-  ulp at the largest values already gives ~0.09 there.
+  rows. Gate (lead ruling 10.264): the port's max and RMS error at most 1.25x the served path's own, its
+  max |out - ref| / mean |ref| at most 0.08 (Compare's max_rel), every value finite. The port against the served
+  output is printed: both are bf16, so one output ulp at the largest values already gives ~0.09 there.
 - Timing (printed, not gated): each path's call, the tables, and the kernel in full, without its KV copies
   (compute), with its copies alone (reads), and with the slot rows staged one tile ahead (lead1).
 
@@ -154,6 +154,12 @@ def _rel(got, ref):
     return float(np.abs(got - ref).max() / np.abs(ref).mean())
 
 
+def _errors(got, ref):
+    """(max |got - ref|, RMS of got - ref)."""
+    d = np.asarray(got, np.float64) - np.asarray(ref, np.float64)
+    return float(np.abs(d).max()), float(np.sqrt(np.mean(d * d)))
+
+
 def _call(step):
     fn = jax.jit(lambda q, g, b, l, t, p, s: qsa_rpa._prefill_attention(q, g, b, l, t, p, s, kv_heads=2,
                                                                         ratio=RATIO)[0])
@@ -222,6 +228,7 @@ def test_numerics_and_time_against_served(monkeypatch, name, reqs, tokens, page)
     rows = live[np.linspace(0, len(live) - 1, 512).astype(int)]
     ref = _reference(step, rows)
     port_rel, served_rel = _rel(port[rows], ref), _rel(served[rows], ref)
+    (port_max, port_rms), (served_max, served_rms) = _errors(port[rows], ref), _errors(served[rows], ref)
     raw_rel = _rel(port[live], served[live])
     finite = bool(np.isfinite(port).all())
     # The core's parts on the same step: tables, then the kernel on them, in each timing mode.
@@ -242,10 +249,14 @@ def test_numerics_and_time_against_served(monkeypatch, name, reqs, tokens, page)
                                                                           depth=depth, **kw))
         modes[label] = _median_ms(fn, kargs)
     per_tile = {k: v * 1e3 / max(tiles, 1) for k, v in modes.items()}
-    _report(f"[cmp-tpu] {name}: max_rel against float32 port {port_rel:.4f} served {served_rel:.4f} (512 rows); port "
+    _report(f"[cmp-tpu] {name}: against float32 (512 rows) port max {port_max:.3e} rms {port_rms:.3e} max_rel "
+            f"{port_rel:.4f}, served max {served_max:.3e} rms {served_rms:.3e} max_rel {served_rel:.4f}, ratios max "
+            f"{port_max / max(served_max, 1e-30):.3f} rms {port_rms / max(served_rms, 1e-30):.3f}; port "
             f"against served {raw_rel:.4f}; finite {finite} ok {bool(ok)}; served call {served_ms:.1f} ms, port call "
             f"{port_ms:.1f} ms, tables {tables_ms:.2f} ms; union max {u.max()} mean live {u[u > 0].mean():.1f}, "
             f"{tiles} tiles, {tiles / max(1, int((u > 0).sum())):.2f} a live group; kernel ms "
             + ", ".join(f"{k} {v:.2f} ({per_tile[k]:.3f} us a tile)" for k, v in modes.items()))
     assert finite and bool(ok)
-    assert port_rel <= MAX_REL and port_rel <= 2 * served_rel, (port_rel, served_rel)
+    assert port_rel <= MAX_REL, port_rel
+    assert port_max <= 1.25 * served_max and port_rms <= 1.25 * served_rms, (port_max, served_max, port_rms,
+                                                                              served_rms)
