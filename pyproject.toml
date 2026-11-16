@@ -28,13 +28,13 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     # vllm: see the `vllm` dependency group below.
-    "torch==2.13.0",
+    "torch==2.14.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
     # are built against a specific torch ABI, so this stays pinned in lockstep with
-    # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
+    # torch==2.14.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
-    "torchvision==0.28.0",
+    "torchvision==0.29.0",
     "torch_tpu==0.2.0",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
@@ -109,8 +109,8 @@ omni = [
     # CUDA build that fails to load libcudart, and transformers imports
     # torchaudio whenever it is installed, so every vLLM import would fail.
     # Take the CPU build instead (see [tool.uv.sources]). 2.11.0 is the newest
-    # torchaudio release; it declares no torch requirement and imports against
-    # torch 2.13.0.
+    # torchaudio release; it declares no torch requirement, and vLLM v0.33.0
+    # pairs it with torch 2.14.0.
     "torchaudio==2.11.0",
 ]
 
