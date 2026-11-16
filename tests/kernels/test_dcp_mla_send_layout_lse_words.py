@@ -68,7 +68,7 @@ def test_send_layout_lse_words_match_packed_reference(
     # The small-chunk grid step, as the adapter derives it (2 at T=2).
     batch = sparse_mla._largest_divisor(query_tokens, 4)
     assert sparse_mla.send_layout_supported(query_tokens, heads, world, 512, batch)
-    p = cpu_interpret.compact_problem(query_tokens, seq_q, heads)
+    p = send_layout_test._problem(query_tokens, seq_q, heads)
     with cpu_interpret.cpu_interpret_context():
         out, lse = prologue._kernel(p, candidate=True)
         send = send_layout_test._kernel_send(p, world)
@@ -95,7 +95,7 @@ def test_send_layout_lse_words_match_packed_reference(
 
 
 def test_send_layout_lse_lo_skip_fault_caught_at_t4() -> None:
-    p = cpu_interpret.compact_problem(4, (3,), 64)
+    p = send_layout_test._problem(4, (3,), 64)
     with cpu_interpret.cpu_interpret_context():
         out, lse = prologue._kernel(p, candidate=True)
         send = send_layout_test._kernel_send(p, 8, fault="send_lse_lo_skip")

@@ -15,14 +15,12 @@
 
 Lets kernel tests run `sparse_ragged_paged_attention` with the SparseCore
 cache layout on CPU (Pallas TPU interpret mode) by replacing the SparseCore
-gather with a CPU stand-in, and builds a compact SparseCore cache problem.
+gather with a CPU stand-in.
 """
 
 from __future__ import annotations
 
 import contextlib
-import os
-import sys
 from unittest import mock
 
 import jax
@@ -30,14 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
-sys.path.insert(0, os.path.dirname(__file__))
-
-import test_mla_decode_prologue as prologue  # noqa: E402
-
-from vllm_torchtpu.kernels.mla.sparse import (  # noqa: E402
-    native_sc_cache_layout,
-    native_sc_gather,
-)
+from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 
 
 def dsa_gather_cpu_interpret(
@@ -139,68 +130,3 @@ def cpu_interpret_context():
         pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
     ):
         yield
-
-
-def compact_problem(query_tokens: int, seq_q: tuple[int, ...], heads: int) -> dict:
-    """Compact 2048-token SparseCore cache problem with empty (-inf LSE),
-    capped-overflow (>512), and mid-range live rows."""
-    rng = np.random.default_rng(2026 + query_tokens * 7 + heads)
-    page_size = 256
-    cache_tokens = 2048
-    pages = cache_tokens // page_size
-    topk = 2048
-
-    def quantized_bytes(dim: int) -> np.ndarray:
-        vals = rng.random((pages, page_size, dim), dtype=np.float32) * 2 - 1
-        fp8 = jnp.asarray(vals / prologue.K_SCALE).astype(jnp.float8_e4m3fn)
-        return np.asarray(jax.lax.bitcast_convert_type(fp8, jnp.uint8))
-
-    nope = quantized_bytes(prologue.NOPE_DIM).reshape(pages, page_size, 4, 128)
-    rope = np.pad(
-        quantized_bytes(prologue.ROPE_DIM),
-        ((0, 0), (0, 0), (0, prologue.ROPE_DIM)),
-    ).reshape(pages, page_size // 4, 4, 128)
-
-    page_table = rng.permutation(pages).astype(np.int32)
-    inv = np.argsort(page_table)
-    physical = np.stack(
-        [
-            rng.choice(cache_tokens, size=topk, replace=False)
-            for _ in range(query_tokens)
-        ]
-    )
-    logical = (inv[physical // page_size] * page_size + physical % page_size).astype(
-        np.int32
-    )
-    counts = np.resize(np.array([0, 640, 129, 257, 512, 65, 384, 700]), query_tokens)
-    counts[0] = 0  # empty row -> lse = -inf (0xFF800000)
-    counts[min(1, query_tokens - 1)] = 640  # > topk_cap=512 -> overflow fix-up
-    live = np.arange(topk)[None, :] < counts[:, None]
-    topk_idx = np.where(live, logical, -1).astype(np.int32)
-
-    num_seqs = len(seq_q)
-    tables = [page_table] + [
-        rng.permutation(pages).astype(np.int32) for _ in range(max(num_seqs - 1, 0))
-    ]
-    num_decode = sum(1 for n in seq_q if n <= 4)
-    q_raw = jnp.asarray(
-        rng.normal(size=(query_tokens, heads, prologue.RAW_HEAD)).astype(np.float32),
-        jnp.bfloat16,
-    )
-    ql_nope = jnp.asarray(
-        rng.normal(size=(query_tokens, heads, prologue.NOPE_DIM)).astype(np.float32),
-        jnp.bfloat16,
-    )
-    return dict(
-        nope=jnp.asarray(native_sc_cache_layout.pack_nope(nope)),
-        rope=jnp.asarray(native_sc_cache_layout.pack_rope_banded(rope)),
-        topk=jnp.asarray(topk_idx),
-        page_table=jnp.asarray(np.concatenate(tables).astype(np.int32)),
-        cu_q_lens=jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32),
-        distribution=jnp.array([num_decode, num_decode, num_seqs], jnp.int32),
-        q_raw=q_raw,
-        ql_nope=ql_nope,
-        positions=jnp.asarray(
-            rng.integers(0, prologue.MAX_POS, size=query_tokens), jnp.int32
-        ),
-    )
