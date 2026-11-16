@@ -33,7 +33,7 @@ from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
 from ...module import Module
-from ...ops import BF16, F32, FP8, I32, round_bf16
+from ...ops import BF16, F32, FP8, I32, kv_page_shape
 from ...pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from ...spec import SmallField, StateDecl, WeightDecl
 from .attention import att_core
@@ -56,7 +56,7 @@ from .merge import split_merge
 from .new_token import att_new
 from .params import GQAParams, GQATunables, derive_params, gqa_scratch
 from .reference import gqa_reference
-from .staging import att_q, kv_new, q_exchange_start, q_gather_finish
+from .staging import att_q, init_rope, kv_new, q_exchange_start, q_gather_finish
 
 
 class GQAModule(Module):
@@ -83,8 +83,8 @@ class GQAModule(Module):
         output_gate: bool = True,
         weight_dtypes: Mapping[str, str] | None = None,
     ) -> None:
-        # `PoolLayout` of the model's paged pools (None: the default page
-        # packing `(2, HD // 4, 4, page_size)`, the only one the paged reads use).
+        # `PoolLayout` of the model's paged pools (None: fp8 pages). Its
+        # `page_dtype` sets the KV page packing `(2, HD // PK, PK, page_size)`.
         self.pool_layout = pool_layout
         self.geometry = geometry
         self.prefix = prefix
@@ -114,13 +114,18 @@ class GQAModule(Module):
             cls, binding, super()._resolve_binding(binding, hf_config)
         )
 
+    @property
+    def kv_dtype(self) -> Any:
+        """KV page dtype: `pool_layout.page_dtype`, fp8 without a layout."""
+        return FP8 if self.pool_layout is None else self.pool_layout.page_dtype
+
     def kv_page_shape(self, g: Any, ex: ExecSpec) -> tuple[int, ...]:
         """Shape of one pool page, from `pool_layout` when the model sets one.
 
         Raises `MegakernelConfigError` if the layout's page packing differs from
-        the `(2, HD // 4, 4, page_size)` packing the paged KV reads assume.
+        the `(2, HD // PK, PK, page_size)` packing the paged KV reads assume.
         """
-        shape = (2, g.HD // 4, 4, cache_exec(ex).page_size)
+        shape = kv_page_shape(1, g.HD, cache_exec(ex).page_size, self.kv_dtype)
         if self.pool_layout is None:
             return shape
         lay_shape = tuple(self.pool_layout.kv_page_shape)
@@ -160,7 +165,7 @@ class GQAModule(Module):
                 StateDecl(
                     POOL_STATE_NAME,
                     (cache_exec(ex).num_pages, *self.kv_page_shape(g, ex)),
-                    FP8,
+                    self.kv_dtype,
                     access="r",
                     per_layer=True,
                     memory_space="hbm",
@@ -186,7 +191,7 @@ class GQAModule(Module):
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         if cache_exec(ex).FUSED:
             return fused_io().gqa_fused_outputs(g, ex)
-        kv_dt = FP8 if cache_exec(ex).paged_kv else F32
+        kv_dt = self.kv_dtype if cache_exec(ex).paged_kv else F32
         return [
             StateDecl("knew", (ex.MR, g.HD), kv_dt, access="w"),
             StateDecl("vnew", (ex.MR, g.HD), kv_dt, access="w"),
@@ -208,6 +213,7 @@ class GQAModule(Module):
             in_scaled=(self.weight_dtypes["att_in"] == "fp8"),
             out_scaled=(self.weight_dtypes["att_out"] == "fp8"),
             output_gate=self.output_gate,
+            kv_dtype=self.kv_dtype,
         )
 
     def _check_pool_layout(self, plan: Any) -> None:
@@ -235,31 +241,19 @@ class GQAModule(Module):
         """Initialize attention-specific VMEM scratch buffers after barrier."""
         ex = ctx.ex
         ap: GQAParams = ctx.module_params(self.name)
-        scr, pos_ref = ctx.scr, ctx.pos_ref
+        scr = ctx.scr
         scr["knew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
         scr["vnew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
         if cache_exec(ex).paged_kv:
-            scr["knew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
-            scr["vnew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
+            scr["knew_o"][...] = jnp.zeros((ex.MR, ap.HD), ap.KV_DT)
+            scr["vnew_o"][...] = jnp.zeros((ex.MR, ap.HD), ap.KV_DT)
         if cache_exec(ex).FUSED:
             fused_io().gqa_fused_init_buffers(ctx)
         if ap.SPLIT and not ap.GQ:
             scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
         if ap.PACK or ap.QV:
             scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
-        if ap.QV:
-            half_ = ap.ROT // 2
-            inv_ = 1.0 / (
-                ap.theta
-                ** (lax.broadcasted_iota(I32, (1, half_), 1).astype(F32) * 2.0 / ap.ROT)
-            )
-            rows_ = lax.broadcasted_iota(I32, (ex.MR, half_), 0)
-            pf = jnp.zeros((ex.MR, half_), F32)
-            for b in range(ex.B):
-                pf = jnp.where(rows_ == b, pos_ref[b].astype(F32), pf)
-            ang_ = pf * inv_
-            scr["rope"][0, :, :half_] = round_bf16(jnp.cos(ang_))
-            scr["rope"][1, :, :half_] = round_bf16(jnp.sin(ang_))
+        init_rope(ctx, ap)
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ap: GQAParams = ctx.module_params(self.name)
@@ -408,5 +402,6 @@ class GQAModule(Module):
             g=self._require_geometry(g),
             module_name=self.name,
             output_gate=self.output_gate,
+            kv_dtype=self.kv_dtype,
             **kw,
         )

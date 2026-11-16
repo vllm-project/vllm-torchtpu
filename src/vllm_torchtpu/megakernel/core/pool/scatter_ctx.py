@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
-from ..ops import BF16, FP8, I32
+from ..ops import BF16, I32
 from .layout import PoolLayout
 
 
@@ -197,11 +197,11 @@ def is_active(kc: ScatterKernel, s: Any) -> Any:
 
 
 def batch_to_i32_cols(kc: ScatterKernel, tok_mr_hd: Any) -> Any:
-    """`[MR, HD]` new K or V rows as `[HD // 4, page_size]` i32 fp8 columns."""
+    """`[MR, HD]` new K or V rows as `[HD // PK, page_size]` i32 page columns."""
     sg = kc.sg
     MR, page_size = sg.MR, sg.page_size
     rows_bf16 = tok_mr_hd.astype(BF16)
     if page_size > MR:
         rows_bf16 = jnp.pad(rows_bf16, ((0, page_size - MR), (0, 0)))
-    cols_fp8 = jnp.swapaxes(rows_bf16, 0, 1).astype(FP8)
-    return pltpu.bitcast(cols_fp8, I32)
+    cols = jnp.swapaxes(rows_bf16, 0, 1).astype(sg.layout.page_dtype)
+    return pltpu.bitcast(cols, I32)

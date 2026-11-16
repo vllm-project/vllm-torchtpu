@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +53,28 @@ def round_bf16(x: jax.Array) -> jax.Array:
     megakernel stays bit-exact with it.
     """
     return x.astype(BF16).astype(F32)
+
+
+def to_kv_dtype(x: jax.Array, dtype: Any) -> jax.Array:
+    """Cast K / V values to the KV page `dtype`; fp8 saturates at +-448."""
+    if x.dtype == jnp.dtype(dtype):
+        return x
+    if jnp.dtype(dtype) == jnp.dtype(FP8):
+        return jnp.clip(x, -448.0, 448.0).astype(FP8)
+    return x.astype(dtype)
+
+
+def kv_page_shape(
+    kvh: int, hd: int, page_size: int, dtype: Any
+) -> tuple[int, int, int, int]:
+    """One KV page `(2 * kvh, hd // PK, PK, page_size)`, `PK = 4 // itemsize`.
+
+    `PK` values of one token's head dim fill one 32-bit sublane word, so the
+    page's `(hd // PK, page_size)` u32 view needs no lane transposes. This is
+    also the stock batched-RPA `SEQ_ALONG_LANE` page.
+    """
+    pk = 4 // jnp.dtype(dtype).itemsize
+    return (2 * kvh, hd // pk, pk, page_size)
 
 
 def bswitch(idx: jax.Array, fns: list):
@@ -102,14 +125,17 @@ def rope_partial(
     products and sums stay in float32.
     """
     half = rot_dim // 2
-    x1, x2, rest = x[:, :half], x[:, half:rot_dim], x[:, rot_dim:]
+    x1, x2 = x[:, :half], x[:, half:rot_dim]
     if round_intermediates:
         y1 = round_bf16(round_bf16(x1 * cos) - round_bf16(x2 * sin))
         y2 = round_bf16(round_bf16(x2 * cos) + round_bf16(x1 * sin))
     else:
         y1 = x1 * cos - x2 * sin
         y2 = x2 * cos + x1 * sin
-    return jnp.concatenate((y1, y2, rest), axis=-1)
+    # Full rotary (`rot_dim == HD`) has no pass-through columns, and Mosaic has
+    # no zero-width vectors.
+    rest = (x[:, rot_dim:],) if rot_dim < x.shape[-1] else ()
+    return jnp.concatenate((y1, y2, *rest), axis=-1)
 
 
 def silu_mul(

@@ -51,6 +51,7 @@ from vllm_torchtpu.megakernel.core.modules.gqa.reference import gqa_reference
 from vllm_torchtpu.megakernel.core.modules.gqa.staging import (
     att_q,
     gqa_rms,
+    init_rope,
     kv_new,
     q_exchange_start,
     q_gather_finish,
@@ -63,7 +64,7 @@ from vllm_torchtpu.megakernel.core.ops import (
     I32,
     rmsnorm,
     rope_partial,
-    round_bf16,
+    to_kv_dtype,
 )
 from vllm_torchtpu.megakernel.core.planner import plan
 from vllm_torchtpu.megakernel.core.pool import CacheExec, PoolLayout
@@ -172,11 +173,15 @@ def _run_gqa_pallas_core_case(
     kv_blk: int = 128,
     kv_sub: int = 0,
     amask: int = 1,
+    hd: int = 256,
+    rot: int = 32,
+    kv_dtype: Any = FP8,
+    output_gate: bool = True,
 ) -> None:
     """Run GQA Pallas core helpers and compare against `gqa_reference`."""
     B = 4
     ctx_len = 256
-    g = FakeGeometry(L=1, att_every=1, H=256, NH=1, NKV=1, HD=256, ROT=32)
+    g = FakeGeometry(L=1, att_every=1, H=256, NH=1, NKV=1, HD=hd, ROT=rot)
     tt = GQATunables(
         kv_blk=kv_blk,
         kv_sub=kv_sub,
@@ -209,7 +214,16 @@ def _run_gqa_pallas_core_case(
         layer_type=LayerType("lt", (FakeMixerModule(), FakeFFNModule())),
     )
     p = plan(ms, ex)
-    ap = derive_params(g, ex, p, tt, in_scaled=False, out_scaled=False)
+    ap = derive_params(
+        g,
+        ex,
+        p,
+        tt,
+        in_scaled=False,
+        out_scaled=False,
+        output_gate=output_gate,
+        kv_dtype=kv_dtype,
+    )
     assert ap.KVE is (paged_kv and kv_ering)
 
     scratch = gqa_scratch(ex, ap)
@@ -231,7 +245,7 @@ def _run_gqa_pallas_core_case(
     s_names = list(scratch.keys())
     sp = _FakeStreamParams(p.smalls_layout)
     cp_stub = _FakeCorePlan(sp)
-    kv_out_dt = FP8 if paged_kv else F32
+    kv_out_dt = kv_dtype if paged_kv else F32
 
     def pallas_body(
         pos_ref,
@@ -278,24 +292,12 @@ def _run_gqa_pallas_core_case(
         scr["knew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
         scr["vnew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
         if paged_kv:
-            scr["knew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
-            scr["vnew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
+            scr["knew_o"][...] = jnp.zeros((ex.MR, ap.HD), kv_dtype)
+            scr["vnew_o"][...] = jnp.zeros((ex.MR, ap.HD), kv_dtype)
         scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
         if ex.VER or ap.QV:
             scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
-        if ap.QV:
-            half_ = ap.ROT // 2
-            inv_ = 1.0 / (
-                ap.theta
-                ** (lax.broadcasted_iota(I32, (1, half_), 1).astype(F32) * 2.0 / ap.ROT)
-            )
-            rows_ = lax.broadcasted_iota(I32, (ex.MR, half_), 0)
-            pf = jnp.zeros((ex.MR, half_), F32)
-            for b in range(ex.B):
-                pf = jnp.where(rows_ == b, pos_ref[b].astype(F32), pf)
-            ang_ = pf * inv_
-            scr["rope"][0, :, :half_] = round_bf16(jnp.cos(ang_))
-            scr["rope"][1, :, :half_] = round_bf16(jnp.sin(ang_))
+        init_rope(ctx, ap)
 
         build_worklist(ctx, ap)
         cx = GQAEmit.build(ctx, ap, jnp.int32(0), "gqa")
@@ -384,36 +386,34 @@ def _run_gqa_pallas_core_case(
             cache=cache,
             interpret=True,
         )
+        ref_kw = dict(g=g, ex=ref_ex, output_gate=output_gate, kv_dtype=kv_dtype)
+        ref_w = {"att_in": w_in, "att_out": w_out, "qn": qn, "kn": kn}
         ref_delta, ref_st = gqa_reference(
-            {"att_in": w_in, "att_out": w_out, "qn": qn, "kn": kn},
-            x_in[:B],
-            {"kc": kc, "vc": vc},
-            g=g,
-            ex=ref_ex,
-            pos=pos,
+            ref_w, x_in[:B], {"kc": kc, "vc": vc}, pos=pos, **ref_kw
         )
         ref_zero_vc, _ = gqa_reference(
-            {"att_in": w_in, "att_out": w_out, "qn": qn, "kn": kn},
-            x_in[:B],
-            {"kc": kc, "vc": jnp.zeros_like(vc)},
-            g=g,
-            ex=ref_ex,
-            pos=pos,
+            ref_w, x_in[:B], {"kc": kc, "vc": jnp.zeros_like(vc)}, pos=pos, **ref_kw
         )
 
         if paged_kv:
-            lay = PoolLayout(num_pools=1, slots_per_pool=0, hd=g.HD, kvh=1)
+            lay = PoolLayout(
+                num_pools=1, slots_per_pool=0, hd=g.HD, kvh=1, page_dtype=kv_dtype
+            )
             pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ref_ex)
-            kc_fp8 = jnp.clip(kc.astype(F32), -448.0, 448.0).astype(FP8)
-            vc_fp8 = jnp.clip(vc.astype(F32), -448.0, 448.0).astype(FP8)
-            nan_fp8 = lax.bitcast_convert_type(jnp.uint8(0x7F), FP8)
+            kc_pg = to_kv_dtype(kc.astype(F32), kv_dtype)
+            vc_pg = to_kv_dtype(vc.astype(F32), kv_dtype)
+            nan_pg = (
+                lax.bitcast_convert_type(jnp.uint8(0x7F), FP8)
+                if kv_dtype == FP8
+                else jnp.asarray(jnp.nan, kv_dtype)
+            )
             for sq in range(ex.NS):
                 p_end = int(pos[sq * T])
-                vc_fp8 = vc_fp8.at[:, sq, p_end:, :].set(nan_fp8)
+                vc_pg = vc_pg.at[:, sq, p_end:, :].set(nan_pg)
             raw_pools = pool.states_to_pool(
                 lay,
                 ref_ex,
-                {"kc": kc_fp8[:, None], "vc": vc_fp8[:, None]},
+                {"kc": kc_pg[:, None], "vc": vc_pg[:, None]},
                 pt,
                 ckpt,
                 roff,
@@ -435,13 +435,11 @@ def _run_gqa_pallas_core_case(
             st1_arg = vc_poisoned
 
     run_dev = cpu_dev if interpret else jax.devices("tpu")[0]
-    pos_d, pt_d, x_d, w_in_d, w_out_d, sm_d, st0_d, st1_d = [
+    args = [
         jax.device_put(arr, run_dev)
         for arr in (pos, pt_arg, x_in, w_in, w_out, sm, st0_arg, st1_arg)
     ]
-    yo_full, knew_out, vnew_out = jax.jit(call)(
-        pos_d, pt_d, x_d, w_in_d, w_out_d, sm_d, st0_d, st1_d
-    )
+    yo_full, knew_out, vnew_out = jax.jit(call)(*args)
     yo_out = np.asarray(yo_full[:B].astype(F32))
     ref_delta_f32 = np.asarray(ref_delta.astype(F32))
     ref_zero_vc_f32 = np.asarray(ref_zero_vc.astype(F32))
@@ -523,6 +521,29 @@ def test_gqa_pallas_core_helpers_match_gqa_reference(
         kv_blk=kv_blk,
         kv_sub=kv_sub,
         amask=amask,
+    )
+
+
+@pytest.mark.parametrize(
+    ("T", "gqa_qv", "amask"),
+    [(1, False, 1), (2, True, 0)],
+    ids=["decode_t1_amask1", "verify_t2_qv_amask0"],
+)
+def test_gqa_pallas_core_dense_qwen3_vs_gqa_reference(T: int, gqa_qv: bool, amask: int):
+    """Dense Qwen3 attention (Cosmos3 reasoner): no output gate, bf16 hd128 KV
+    pages, full rotary."""
+    _run_gqa_pallas_core_case(
+        T=T,
+        paged_kv=True,
+        kv_ering=False,
+        pair_kv=False,
+        gqa_qv=gqa_qv,
+        interpret=True,
+        amask=amask,
+        hd=128,
+        rot=128,
+        kv_dtype=BF16,
+        output_gate=False,
     )
 
 

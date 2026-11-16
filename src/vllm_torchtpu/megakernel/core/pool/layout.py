@@ -14,16 +14,18 @@
 """`PoolLayout`: byte layout of the unified raw pools (KV pages + state slots).
 
 Each of the `num_pools` pools (one per attention layer) has shape
-`[R, num_pages, *kv_page_shape]` fp8 (stored rank-folded as
+`[R, num_pages, *kv_page_shape]` of `page_dtype` (stored rank-folded as
 `[R * num_pages, *kv_page_shape]`), with `kv_page_shape =
-(2 * kvh, hd // 4, 4, page_size)`. A single pool holds:
+(2 * kvh, hd // PK, PK, page_size)` and `PK = 4 // itemsize` (4 fp8, 2 bf16).
+A single pool holds:
 
 1. **KV cache pages** (one page per `page_size` tokens per sequence):
-   `[0]` = K page `(hd // 4, 4, page_size)`, `[1]` = V page. The `(hd // 4, 4)`
-   pair packs `hd` fp8 values into 32-bit words along sublanes, so a `bitcast`
-   to `uint32` yields `(hd // 4, page_size)` u32 rows without lane transposes.
-2. **Recurrent checkpoint slots** (`pages_per_slot` consecutive pages per slot,
-   for each of the `slots_per_pool` recurrent layers that share the pool):
+   `[0]` = K page `(hd // PK, PK, page_size)`, `[1]` = V page. The `(hd // PK,
+   PK)` pair packs `hd` values into 32-bit words along sublanes, so a `bitcast`
+   to `uint32` yields `(hd // PK, page_size)` u32 rows without lane transposes.
+2. **Recurrent checkpoint slots** (fp8 pages only; `pages_per_slot` consecutive
+   pages per slot, for each of the `slots_per_pool` recurrent layers that share
+   the pool):
    - Pages `[0, rec_pages_per_slot)`: recurrent state `(vh, KD, VD)` bf16,
      packed as u32 pairs (`rec_u32_rows` rows of `LANES` lanes).
    - Page `rec_pages_per_slot` (`conv_page`): the causal-conv window
@@ -54,7 +56,7 @@ import jax.numpy as jnp
 
 from ..decls import KVCacheDecl, RecurrentCacheDecl
 from ..errors import MegakernelConfigError
-from ..ops import BF16, F32, FP8, round_up
+from ..ops import BF16, F32, FP8, kv_page_shape, round_up
 from .config import cache_exec
 
 if TYPE_CHECKING:
@@ -65,16 +67,19 @@ LANES = 128
 
 # Geometry the pool I/O paths (split gather / scatter, the in-kernel GPR
 # path, and fused pool I/O) are validated for. They are written in terms of
-# `PoolLayout`, but these combinations are the only ones exercised on TPU;
+# `PoolLayout`, but these combinations are the only ones exercised;
 # `PoolLayout.validate` rejects anything else instead of guessing.
-# - `hd == 256`, `page_size == 128`, `kvh == 1`: KV page `(2, 64, 4, 128)` and
-#   one `(K, V)` head pair per rank and page.
+# - `(hd, page_dtype)` in `VALIDATED_KV_PAGES`: fp8 `hd == 256` (KV page
+#   `(2, 64, 4, 128)`, every pool I/O path) or bf16 `hd == 128` (KV page
+#   `(2, 64, 2, 128)`, KV-only pools on the split scatter path).
+# - `page_size == 128`, `kvh == 1`: one `(K, V)` head pair per rank and page.
 # - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: the only slot
 #   geometry exercised on TPU.
 # - `KD == VD == LANES`, `conv_taps == 3`: recurrent rows are one lane-row wide
 #   and the recurrent conv state shapes (`round_up(3 * B, 8)`, `round_up(3 + T, 8)`)
 #   hard-code the 3-tap window.
 VALIDATED_HD = 256
+VALIDATED_KV_PAGES = ((VALIDATED_HD, jnp.dtype(FP8)), (128, jnp.dtype(BF16)))
 VALIDATED_PAGE_SIZE = 128
 VALIDATED_KVH = 1
 VALIDATED_REC_PAGES_PER_SLOT = 4
@@ -96,7 +101,7 @@ class PoolLayout:
     # Pool topology.
     num_pools: int = 1
     slots_per_pool: int = 0  # recurrent layers per pool; 0 = KV-only pool
-    # KV page packing `(2 * kvh, hd // 4, 4, page_size)` of `page_dtype`.
+    # KV page packing `(2 * kvh, hd // PK, PK, page_size)` of `page_dtype`.
     hd: int = VALIDATED_HD
     kvh: int = VALIDATED_KVH
     page_size: int = VALIDATED_PAGE_SIZE
@@ -167,8 +172,8 @@ class PoolLayout:
     # ------------------------------------------------------------------ pages
     @property
     def kv_page_shape(self) -> tuple[int, int, int, int]:
-        """Shape of one pool page: `(2 * kvh, hd // 4, 4, page_size)`."""
-        return (2 * self.kvh, self.hd // 4, 4, self.page_size)
+        """Shape of one pool page: `(2 * kvh, hd // PK, PK, page_size)`."""
+        return kv_page_shape(self.kvh, self.hd, self.page_size, self.page_dtype)
 
     @property
     def page_bytes(self) -> int:
@@ -177,7 +182,7 @@ class PoolLayout:
 
     @property
     def page_rows(self) -> int:
-        """Rows of one page viewed as `(rows, 4, page_size)` (`2 * kvh * hd // 4`)."""
+        """Rows of one page viewed as `(rows, PK, page_size)` (`2 * kvh * hd // PK`)."""
         return self.kv_page_shape[0] * self.kv_page_shape[1]
 
     @property
@@ -274,16 +279,16 @@ class PoolLayout:
 
         _need(self.num_pools >= 1, "num_pools must be >= 1")
         _need(self.slots_per_pool >= 0, "slots_per_pool must be >= 0")
-        _need(
-            jnp.dtype(self.page_dtype) == jnp.dtype(FP8),
-            "pool pages must be float8_e4m3fn",
-        )
         # Only validated geometry (see the VALIDATED_* constants above).
+        page_dt = jnp.dtype(self.page_dtype)
         _need(
-            self.hd == VALIDATED_HD and self.page_size == VALIDATED_PAGE_SIZE,
-            f"pool kernels are only validated for hd={VALIDATED_HD}, "
+            (self.hd, page_dt) in VALIDATED_KV_PAGES
+            and self.page_size == VALIDATED_PAGE_SIZE,
+            "pool kernels are only validated for (hd, page_dtype) in "
+            f"{[(h, d.name) for h, d in VALIDATED_KV_PAGES]}, "
             f"page_size={VALIDATED_PAGE_SIZE}",
         )
+        fp8_pages = page_dt == jnp.dtype(FP8)
         _need(
             self.kvh == VALIDATED_KVH,
             f"pool pages hold kvh={VALIDATED_KVH} (K, V) head pair per rank",
@@ -293,8 +298,13 @@ class PoolLayout:
                 cache_exec(ex).page_size == self.page_size,
                 f"CacheExec.page_size={cache_exec(ex).page_size} != layout page_size",
             )
+            _need(
+                fp8_pages or not cache_exec(ex).FUSED,
+                "fused pool I/O stages fp8 pages only",
+            )
         if not self.has_recurrent:
             return
+        _need(fp8_pages, "recurrent checkpoint slots are packed into fp8 pages")
         rec_hint = (
             "; per-rank recurrent state exceeds 4 pages, increase tensor-parallel R"
             if self.rec_pages_per_slot > VALIDATED_REC_PAGES_PER_SLOT
@@ -404,6 +414,7 @@ __all__ = [
     "VALIDATED_CONV_TAPS",
     "VALIDATED_HD",
     "VALIDATED_KVH",
+    "VALIDATED_KV_PAGES",
     "VALIDATED_PAGE_SIZE",
     "VALIDATED_REC_PAGES_PER_SLOT",
     "PoolLayout",

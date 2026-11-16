@@ -36,6 +36,14 @@ def _use_cpu_default_device():
         yield
 
 
+# KV-only bf16 hd128 pages (dense Qwen3, Cosmos3 reasoner).
+_BF16_KV = PoolLayout(num_pools=2, hd=128, page_dtype=jnp.bfloat16)
+
+
+def _named_layout(name: str) -> PoolLayout:
+    return _BF16_KV if name == "kv_only_bf16" else _layout(SLOTS[name])
+
+
 def _layout(slots: int, num_pools: int = 2) -> PoolLayout:
     return PoolLayout(
         num_pools=num_pools,
@@ -72,8 +80,8 @@ def _random_states(lay: PoolLayout, ex: ExecSpec, seed: int) -> dict[str, jax.Ar
     k = jax.random.split(jax.random.key(seed), 4)
     kv_shape = (R, lay.num_pools, NS, ex.ctx, lay.hd)
     st = {
-        "kc": (jax.random.normal(k[0], kv_shape) * 0.3).astype(FP8),
-        "vc": (jax.random.normal(k[1], kv_shape) * 0.3).astype(FP8),
+        "kc": (jax.random.normal(k[0], kv_shape) * 0.3).astype(lay.page_dtype),
+        "vc": (jax.random.normal(k[1], kv_shape) * 0.3).astype(lay.page_dtype),
     }
     if lay.has_recurrent:
         ngdn, vh = lay.num_recurrent_layers, lay.vh_per_rank(R)
@@ -132,12 +140,19 @@ def test_page_pack_unpack_roundtrip(name: str):
 
 @pytest.mark.parametrize(
     "name,ckpt_ndim",
-    [("slots3", 3), ("slots3", 2), ("slots1", 3), ("slots1", 2), ("kv_only", 3)],
+    [
+        ("slots3", 3),
+        ("slots3", 2),
+        ("slots1", 3),
+        ("slots1", 2),
+        ("kv_only", 3),
+        ("kv_only_bf16", 3),
+    ],
 )
 def test_states_to_pool_roundtrip(name: str, ckpt_ndim: int):
-    lay = _layout(SLOTS[name])
+    lay = _named_layout(name)
     ex = _exec(R=2, B=2, T=1)
-    st = _random_states(lay, ex, seed=11 + SLOTS[name])
+    st = _random_states(lay, ex, seed=11 + SLOTS.get(name, 0))
     pt, ckpt, roff = _tables(lay, ex, ckpt_ndim)
     raw_pools = pool.states_to_pool(lay, ex, st, pt, ckpt, roff)
     assert len(raw_pools) == lay.num_pools

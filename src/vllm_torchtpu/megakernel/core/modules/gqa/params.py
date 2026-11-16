@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from ...errors import MegakernelConfigError
@@ -43,8 +44,8 @@ NT = (((1,), (1,)), ((), ()))
 
 # Geometry (layout) requirements, not per-bucket tuning:
 # - KVE views each KV ring stage as `(2, HD // 4, BLK)` u32 rows of the untyped
-#   expert pool; that view is validated for HD == 256 only. Other head dims
-#   keep the separate `kvbuf` ring.
+#   expert pool; that view is validated for fp8 pages with HD == 256 only.
+#   Other pages keep the separate `kvbuf` ring.
 # - GQ sends the partial-softmax `(m | l)` pair as two 128-lane halves of one
 #   HD-wide row of the exchange buffer, so it needs HD == 2 * 128.
 KVE_HD = 256
@@ -95,6 +96,13 @@ class GQAParams:
     out_scaled: bool = True
     # Sigmoid output gate: per head `att_in` carries `[q | gate]` columns.
     GATE: bool = True
+    # Paged KV page dtype (`PoolLayout.page_dtype`).
+    KV_DT: Any = FP8
+
+    @property
+    def KV_PK(self) -> int:
+        """Page values per 32-bit sublane word (`4 // itemsize`)."""
+        return 4 // jnp.dtype(self.KV_DT).itemsize
 
     @property
     def QW(self) -> int:
@@ -153,6 +161,7 @@ def derive_params(
     in_scaled: bool = True,
     out_scaled: bool = True,
     output_gate: bool = True,
+    kv_dtype: Any = FP8,
 ) -> GQAParams:
     """`GQAParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
@@ -185,9 +194,12 @@ def derive_params(
         raise MegakernelConfigError(
             f"GQATunables.amask must be in {{0, 1, 2, 3, 4}}, got {tt.amask!r}"
         )
+    kv_pk = 4 // jnp.dtype(kv_dtype).itemsize
     if cache_exec(ex).paged_kv:
-        if g.HD % 4 != 0:
-            raise MegakernelConfigError(f"paged_kv requires HD % 4 == 0, got HD={g.HD}")
+        if g.HD % kv_pk != 0:
+            raise MegakernelConfigError(
+                f"paged_kv requires HD % {kv_pk} == 0, got HD={g.HD}"
+            )
         ps = cache_exec(ex).page_size
         if ps <= 0 or ps % 128 != 0 or BLK % ps != 0:
             raise MegakernelConfigError(
@@ -206,7 +218,7 @@ def derive_params(
             raise MegakernelConfigError(
                 f"paged_kv requires amask in {{0, 1, 2}}, got {tt.amask}"
             )
-    KV_ITEM = 2 * (g.HD // 4) * BLK * 4
+    KV_ITEM = 2 * g.HD * BLK * jnp.dtype(kv_dtype).itemsize
     EBROWS = tiles.ebank // 128
     # KVE stages KV blocks in the (idle) expert ring. On TPU this aliases the
     # untyped byte pool `epool` via `pool_alias.view`; in CPU interpret mode a
@@ -219,6 +231,7 @@ def derive_params(
         and tiles.nbe >= NKV
         and tiles.ebank >= KV_ITEM
         and g.HD == KVE_HD
+        and kv_pk == 4
     )
     if tt.kv_ering and not KVE:
         _warn_gqa_once(
@@ -370,6 +383,7 @@ def derive_params(
         in_scaled=bool(in_scaled),
         out_scaled=bool(out_scaled),
         GATE=bool(output_gate),
+        KV_DT=kv_dtype,
     )
 
 
@@ -404,9 +418,11 @@ def gqa_scratch(ex: ExecSpec, ap: GQAParams) -> dict[str, Any]:
         scr.update(fused_io().gqa_fused_scratch(ex, ap.HD))
     if cache_exec(ex).paged_kv:
         if not ap.KVE:
-            scr["kvbuf"] = pltpu.VMEM((ap.NKV, 2, ap.HD // 4, 4, ap.BLK), FP8)
-        scr["knew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
-        scr["vnew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
+            scr["kvbuf"] = pltpu.VMEM(
+                (ap.NKV, 2, ap.HD // ap.KV_PK, ap.KV_PK, ap.BLK), ap.KV_DT
+            )
+        scr["knew_o"] = pltpu.VMEM((ex.MR, ap.HD), ap.KV_DT)
+        scr["vnew_o"] = pltpu.VMEM((ex.MR, ap.HD), ap.KV_DT)
         scr["wl_kp"] = pltpu.SMEM((ap.NWL * (ap.BLK // cache_exec(ex).page_size),), I32)
     if ap.SPLIT:
         q_rows = ap.NBP if ap.PACK else ex.B

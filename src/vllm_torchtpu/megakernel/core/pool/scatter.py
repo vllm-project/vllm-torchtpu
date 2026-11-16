@@ -25,7 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
-from ..ops import BF16, FP8, I32
+from ..ops import BF16, FP8, I32, to_kv_dtype
 from .backend import check_ckpt_bounds, resolve_active_seqs
 from .checks import check_step_pool_metadata
 from .config import cache_exec
@@ -69,9 +69,10 @@ def scatter_pool_states(
       On TPU (`interpret=False`), sub-slice writes into `page_buf` and `kv_page`
       use zero-copy `Ref.bitcast(U32/BF16/I32).reshape(...)[...] = ...`, which
       packs the 2nd-to-last sublane axis (`4` for `fp8->u32/i32`, `2` for
-      `fp8->bf16`) into 32-bit/16-bit words in VMEM. Because JAX's CPU Pallas
-      `state_discharge` does not invert `Ref.bitcast(...).reshape(...)` on LHS
-      indexed stores, `interpret=True` uses `lax.bitcast_convert_type(..., FP8)`
+      `fp8->bf16` and bf16 KV pages `->i32`) into 32-bit/16-bit words in VMEM.
+      Because JAX's CPU Pallas `state_discharge` does not invert
+      `Ref.bitcast(...).reshape(...)` on LHS indexed stores, `interpret=True`
+      uses `lax.bitcast_convert_type(..., <page dtype>)`
       followed by `swapaxes` to move the unpacked byte axis back to the sublane
       axis, producing the exact same byte layout in `page_buf`/`kv_page`.
     """
@@ -82,8 +83,9 @@ def scatter_pool_states(
     NS, B, T, MR = ex.NS, ex.B, ex.T, ex.MR
     page_size = cache_exec(ex).page_size
     HD = layout.hd
-    h4 = HD // 4
+    page_dt = layout.page_dtype
     page_shape = layout.kv_page_shape
+    h4 = page_shape[1]
     pps = layout.pages_per_slot
     rec_pages = layout.rec_pages_per_slot
     rec_u32_cap = layout.rec_u32_rows
@@ -166,9 +168,9 @@ def scatter_pool_states(
 
     n_pairs = NS // 2
     scratch: dict[str, Any] = {
-        "kv_page": pltpu.VMEM((2, *page_shape), FP8),
-        "knew_buf": pltpu.VMEM((NATT, MR, HD), FP8),
-        "vnew_buf": pltpu.VMEM((NATT, MR, HD), FP8),
+        "kv_page": pltpu.VMEM((2, *page_shape), page_dt),
+        "knew_buf": pltpu.VMEM((NATT, MR, HD), page_dt),
+        "vnew_buf": pltpu.VMEM((NATT, MR, HD), page_dt),
         "sem_kv_rd": pltpu.SemaphoreType.DMA((2,)),
         "sem_kv_wr": pltpu.SemaphoreType.DMA((2,)),
         "sem_kv_in": pltpu.SemaphoreType.DMA((2,)),
@@ -266,10 +268,8 @@ def scatter_pool_states(
         + ((ckpt_indices,) if has_gdn else ())
         + ((active_mask,) if act_mode == "ref" else ())
     )
-    if knew.dtype != FP8:
-        knew = jnp.clip(knew, -448.0, 448.0).astype(FP8)
-    if vnew.dtype != FP8:
-        vnew = jnp.clip(vnew, -448.0, 448.0).astype(FP8)
+    knew = to_kv_dtype(knew, page_dt)
+    vnew = to_kv_dtype(vnew, page_dt)
     if not bool(interpret):
         knew = pltpu.with_memory_space_constraint(knew, pltpu.HBM)
         vnew = pltpu.with_memory_space_constraint(vnew, pltpu.HBM)

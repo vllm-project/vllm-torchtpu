@@ -23,7 +23,7 @@ import jax.numpy as jnp
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, FP8, rmsnorm, rope_partial, round_bf16
+from ...ops import BF16, F32, FP8, rmsnorm, rope_partial, round_bf16, to_kv_dtype
 from ...pool.config import cache_exec
 from .params import GQATunables
 
@@ -41,6 +41,7 @@ def gqa_reference(
     paged_kv: bool | None = None,
     module_name: str = "gqa",
     output_gate: bool = True,
+    kv_dtype: Any = FP8,
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Pure-JAX multi-rank GQA forward for one attention layer (`att_idx`)."""
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
@@ -99,8 +100,8 @@ def gqa_reference(
     kc_a = kc_in[:, a] if multi_layer_kv else kc_in
     vc_a = vc_in[:, a] if multi_layer_kv else vc_in
     if use_paged_kv:
-        kc_a = jnp.clip(kc_a.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
-        vc_a = jnp.clip(vc_a.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
+        kc_a = to_kv_dtype(kc_a.astype(F32), kv_dtype).astype(BF16)
+        vc_a = to_kv_dtype(vc_a.astype(F32), kv_dtype).astype(BF16)
 
     att_partials = []
     knew_ranks = []
@@ -136,8 +137,8 @@ def gqa_reference(
             )
             kb = rope_partial(kb, cos, sin, ROT, round_intermediates=rope_round)
             if use_paged_kv:
-                kb = jnp.clip(kb, -448.0, 448.0).astype(FP8).astype(F32)
-                vb = jnp.clip(vb, -448.0, 448.0).astype(FP8).astype(F32)
+                kb = to_kv_dtype(kb, kv_dtype).astype(F32)
+                vb = to_kv_dtype(vb, kv_dtype).astype(F32)
             q_all.append(qb)
             k_new_r.append(kb[0])
             v_new_r.append(vb[0])

@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..ops import FP8, I32
+from ..ops import I32
 from .backend import kernel_debug_check
 from .checks import safe_kv_page
 from .config import cache_exec
@@ -49,7 +49,7 @@ def scatter_single_token_across_att(
     vnew_buf, sem_kv_rd, sem_kv_wr = kc.vnew_buf, kc.sem_kv_rd, kc.sem_kv_wr
     k_cols_buf, v_cols_buf, lane_iota = kc.k_cols_buf, kc.v_cols_buf, kc.lane_iota
     ex, interpret, NATT, NS = sg.ex, sg.interpret, sg.NATT, sg.NS
-    page_size, h4 = sg.page_size, sg.h4
+    page_size, h4, page_dt = sg.page_size, sg.h4, sg.layout.page_dtype
     p = pos_ref[b_idx]
     p_pos = jnp.maximum(p, jnp.int32(0))
     p_ok = jnp.logical_and(p >= 0, lax.div(p_pos, page_size) < sg.pt_cols)
@@ -104,8 +104,8 @@ def scatter_single_token_across_att(
         k_new = jnp.where(mask_ln, k_col, k_view[...])
         v_new = jnp.where(mask_ln, v_col, v_view[...])
         if bool(interpret):
-            kv_page[k_slot, 0] = lax.bitcast_convert_type(k_new, FP8).swapaxes(1, 2)
-            kv_page[k_slot, 1] = lax.bitcast_convert_type(v_new, FP8).swapaxes(1, 2)
+            kv_page[k_slot, 0] = lax.bitcast_convert_type(k_new, page_dt).swapaxes(1, 2)
+            kv_page[k_slot, 1] = lax.bitcast_convert_type(v_new, page_dt).swapaxes(1, 2)
         else:
             k_view[...] = k_new
             v_view[...] = v_new
@@ -132,7 +132,7 @@ def scatter_kv(kc: ScatterKernel) -> None:
     vnew_buf, sem_kv_rd, sem_kv_wr = kc.vnew_buf, kc.sem_kv_rd, kc.sem_kv_wr
     k_cols_buf, v_cols_buf, lane_iota = kc.k_cols_buf, kc.v_cols_buf, kc.lane_iota
     ex, interpret, NATT, NS, B, T = sg.ex, sg.interpret, sg.NATT, sg.NS, sg.B, sg.T
-    page_size, h4 = sg.page_size, sg.h4
+    page_size, h4, page_dt = sg.page_size, sg.h4, sg.layout.page_dtype
     if T == 1:
 
         def scatter_kv_row(b, _):
@@ -256,10 +256,10 @@ def scatter_kv(kc: ScatterKernel) -> None:
                             v_cur = jnp.where(mask_ln_list[t], v_col, v_cur)
                         if bool(interpret):
                             kv_page[k_slot, 0] = lax.bitcast_convert_type(
-                                k_cur, FP8
+                                k_cur, page_dt
                             ).swapaxes(1, 2)
                             kv_page[k_slot, 1] = lax.bitcast_convert_type(
-                                v_cur, FP8
+                                v_cur, page_dt
                             ).swapaxes(1, 2)
                         else:
                             k_view[...] = k_cur

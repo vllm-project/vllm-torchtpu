@@ -98,6 +98,26 @@ def test_layout_validate_rejects_unvalidated_geometry():
         _layout(3).validate(_exec(R=8, B=8, T=1))
 
 
+def test_layout_bf16_kv_pages_are_the_stock_rpa_pages():
+    """bf16 hd128 KV-only pages validate and equal the stock batched-RPA
+    `SEQ_ALONG_LANE` page, so the stock and megakernel steps share one cache;
+    recurrent slots and fused pool I/O stay fp8-only."""
+    from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
+
+    lay = PoolLayout(num_pools=2, hd=128, page_dtype=jnp.bfloat16)
+    ex = _exec(R=8, B=8, T=1)
+    lay.validate(ex)
+    stock = wrapper.get_kv_cache_shape(
+        NUM_PAGES, 128, 1, 128, jnp.bfloat16, configs.KVLayout.SEQ_ALONG_LANE
+    )
+    assert (NUM_PAGES, *lay.kv_page_shape) == stock == (NUM_PAGES, 2, 64, 2, 128)
+    for bad in (replace(lay, slots_per_pool=1, kh=8, vh=8), replace(lay, hd=256)):
+        with pytest.raises(MegakernelConfigError):
+            bad.validate()
+    with pytest.raises(MegakernelConfigError, match="fused pool I/O"):
+        lay.validate(with_cache(ex, fused_pool_io=True))
+
+
 def test_layout_validate_checks_in_kernel_conv_windows():
     """GPR stages the verify conv window in the K half of the conv page (64
     fp8 rows = 128 bf16 rows), fused pool I/O in the whole conv page (256 rows)."""

@@ -66,6 +66,14 @@ def _use_cpu_default_device(request: pytest.FixtureRequest):
         yield
 
 
+# KV-only bf16 hd128 pages (dense Qwen3, Cosmos3 reasoner).
+_BF16_KV = PoolLayout(num_pools=2, hd=128, page_dtype=jnp.bfloat16)
+
+
+def _named_layout(name: str) -> PoolLayout:
+    return _BF16_KV if name == "kv_only_bf16" else _layout(SLOTS[name])
+
+
 def _layout(slots: int, num_pools: int = 2) -> PoolLayout:
     return PoolLayout(
         num_pools=num_pools,
@@ -102,8 +110,8 @@ def _random_states(lay: PoolLayout, ex: ExecSpec, seed: int) -> dict[str, jax.Ar
     k = jax.random.split(jax.random.key(seed), 4)
     kv_shape = (R, lay.num_pools, NS, ex.ctx, lay.hd)
     st = {
-        "kc": (jax.random.normal(k[0], kv_shape) * 0.3).astype(FP8),
-        "vc": (jax.random.normal(k[1], kv_shape) * 0.3).astype(FP8),
+        "kc": (jax.random.normal(k[0], kv_shape) * 0.3).astype(lay.page_dtype),
+        "vc": (jax.random.normal(k[1], kv_shape) * 0.3).astype(lay.page_dtype),
     }
     if lay.has_recurrent:
         ngdn, vh = lay.num_recurrent_layers, lay.vh_per_rank(R)
@@ -161,8 +169,8 @@ def _check_scatter(
         [10 + 129 * (s % 2) + 3 * (s // 2) + t for s in range(NS) for t in range(T)],
         dtype=jnp.int32,
     )
-    knew = (jax.random.normal(k[0], (NATT, ex.MR, lay.hd)) * 0.3).astype(FP8)
-    vnew = (jax.random.normal(k[1], (NATT, ex.MR, lay.hd)) * 0.3).astype(FP8)
+    knew = (jax.random.normal(k[0], (NATT, ex.MR, lay.hd)) * 0.3).astype(lay.page_dtype)
+    vnew = (jax.random.normal(k[1], (NATT, ex.MR, lay.hd)) * 0.3).astype(lay.page_dtype)
     conv = rec = None
     if lay.has_recurrent:
         ngdn, vh, qkv = (
@@ -293,10 +301,17 @@ def test_scatter_direct_conv_window_lowers_for_24_lane_rows_on_tpu(
 @pytest.mark.parametrize("T", [1, 2])
 @pytest.mark.parametrize(
     "name,ckpt_ndim",
-    [("slots3", 3), ("slots3", 2), ("slots1", 3), ("slots1", 2), ("kv_only", 3)],
+    [
+        ("slots3", 3),
+        ("slots3", 2),
+        ("slots1", 3),
+        ("slots1", 2),
+        ("kv_only", 3),
+        ("kv_only_bf16", 3),
+    ],
 )
 def test_scatter_writes_kv_and_checkpoints(name: str, ckpt_ndim: int, T: int):
-    _check_scatter(_layout(SLOTS[name]), _exec(R=1, B=2 * T, T=T), ckpt_ndim, 31 + T)
+    _check_scatter(_named_layout(name), _exec(R=1, B=2 * T, T=T), ckpt_ndim, 31 + T)
 
 
 @pytest.mark.parametrize("NS", [1, 3, 4])

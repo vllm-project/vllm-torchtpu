@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...ops import BF16, F32, FP8, I32, U32
+from ...ops import BF16, F32, I32, U32
 from ...pool.config import cache_exec
 from .context import GQAEmit
 from .kv import KVRing
@@ -34,7 +34,8 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
     ex, ap, scr, pos_ref, stream = cx.ex, cx.ap, cx.scr, cx.pos_ref, cx.stream
     interpret, KR = cx.interpret, cx.KR
     T, VER = ex.T, ex.VER
-    KVE, BLK, SUB, AMASK, HD = ap.KVE, ap.BLK, ap.SUB, ap.AMASK, ap.HD
+    KVE, BLK, SUB, AMASK = ap.KVE, ap.BLK, ap.SUB, ap.AMASK
+    KV_DT, ROWS = ap.KV_DT, ap.HD // ap.KV_PK
     kv_slot, kvbuf, kbuf, vbuf = kv.slot, kv.kvbuf, kv.kbuf, kv.vbuf
     s = i % KR
     b, t = scr["wl_b"][i], scr["wl_t"][i]
@@ -53,11 +54,11 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
             k_u32 = kst[0]
             v_u32 = kst[1]
         else:
-            k_u32 = kvbuf.at[s, 0].bitcast(U32).reshape(HD // 4, BLK)[...]
-            v_u32 = kvbuf.at[s, 1].bitcast(U32).reshape(HD // 4, BLK)[...]
-        k_full = pltpu.bitcast(k_u32, FP8)
+            k_u32 = kvbuf.at[s, 0].bitcast(U32).reshape(ROWS, BLK)[...]
+            v_u32 = kvbuf.at[s, 1].bitcast(U32).reshape(ROWS, BLK)[...]
+        k_full = pltpu.bitcast(k_u32, KV_DT)
         if AMASK == 0:
-            v_full = pltpu.bitcast(v_u32, FP8)
+            v_full = pltpu.bitcast(v_u32, KV_DT)
     outs = []
     for j in range(BLK // SUB):
         off = t * BLK + j * SUB
@@ -71,7 +72,7 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
             elif AMASK == 1:
                 vu = v_u32 if SUB == BLK else v_u32[:, j * SUB : (j + 1) * SUB]
                 vu = jnp.where(col < rem, vu, jnp.uint32(0))
-                vj = pltpu.bitcast(vu, FP8)
+                vj = pltpu.bitcast(vu, KV_DT)
             else:
                 assert AMASK == 2
                 vu = v_u32 if SUB == BLK else v_u32[:, j * SUB : (j + 1) * SUB]
@@ -82,7 +83,7 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
                         col < r_val, v_val, jnp.uint32(0)
                     ),
                 )
-                vj = pltpu.bitcast(vu, FP8)
+                vj = pltpu.bitcast(vu, KV_DT)
             scores = stream.mm(qrows, kj, NN)
         else:
             kj = kbuf[s] if SUB == BLK else kbuf[s, j * SUB : (j + 1) * SUB]

@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...ops import BF16, F32, FP8, I32, rmsnorm, rope_partial, round_bf16
+from ...ops import BF16, F32, I32, rmsnorm, rope_partial, round_bf16, to_kv_dtype
 from ...pool.config import cache_exec
 from .context import GQAEmit
 from .params import GQAParams
@@ -36,6 +36,24 @@ def rope(ap: GQAParams, x_in: Any, cos_in: Any, sin_in: Any) -> Any:
     return rope_partial(
         x_in, cos_in, sin_in, ap.ROT, round_intermediates=not ap.rope_fp32
     )
+
+
+def init_rope(ctx: Any, ap: GQAParams) -> None:
+    """Step-wide head-batched RoPE table `rope` (`QV`)."""
+    ex, scr = ctx.ex, ctx.scr
+    half = ap.ROT // 2
+    if not ap.QV:
+        return
+    inv = 1.0 / (
+        ap.theta ** (lax.broadcasted_iota(I32, (1, half), 1).astype(F32) * 2.0 / ap.ROT)
+    )
+    rows = lax.broadcasted_iota(I32, (ex.MR, half), 0)
+    pf = jnp.zeros((ex.MR, half), F32)
+    for b in range(ex.B):
+        pf = jnp.where(rows == b, ctx.pos_ref[b].astype(F32), pf)
+    ang = pf * inv
+    scr["rope"][0, :, :half] = round_bf16(jnp.cos(ang))
+    scr["rope"][1, :, :half] = round_bf16(jnp.sin(ang))
 
 
 def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
@@ -85,8 +103,7 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
                     ).astype(BF16)
         else:
             for b in range(B):
-                pb = pos_ref[b]
-                ang = pb.astype(F32) * inv
+                ang = pos_ref[b].astype(F32) * inv
                 cos, sin = round_bf16(jnp.cos(ang)), round_bf16(jnp.sin(ang))
                 rcs[0, b : b + 1, :] = cos
                 rcs[1, b : b + 1, :] = sin
@@ -145,10 +162,8 @@ def kv_new(
             v = ybuf[:B, koff + HD : koff + 2 * HD]
             k = rope(ap, k, cos, sin)
             if cache_exec(ex).paged_kv:
-                k_fp8 = jnp.clip(k, -448.0, 448.0).astype(FP8)
-                v_fp8 = jnp.clip(v, -448.0, 448.0).astype(FP8)
-                scr["knew"][:B, :] = k_fp8.astype(F32)
-                scr["vnew"][:B, :] = v_fp8.astype(F32)
+                scr["knew"][:B, :] = to_kv_dtype(k, ap.KV_DT).astype(F32)
+                scr["vnew"][:B, :] = to_kv_dtype(v, ap.KV_DT).astype(F32)
             else:
                 scr["knew"][:B, :] = k
                 scr["vnew"][:B, :] = v
@@ -162,16 +177,14 @@ def kv_new(
                 v = ybuf[b : b + 1, koff + HD : koff + 2 * HD]
                 k = rope(ap, k, cos, sin)
                 if cache_exec(ex).paged_kv:
-                    k_fp8 = jnp.clip(k, -448.0, 448.0).astype(FP8)
-                    v_fp8 = jnp.clip(v, -448.0, 448.0).astype(FP8)
-                    scr["knew"][b : b + 1, :] = k_fp8.astype(F32)
-                    scr["vnew"][b : b + 1, :] = v_fp8.astype(F32)
+                    scr["knew"][b : b + 1, :] = to_kv_dtype(k, ap.KV_DT).astype(F32)
+                    scr["vnew"][b : b + 1, :] = to_kv_dtype(v, ap.KV_DT).astype(F32)
                 else:
                     scr["knew"][b : b + 1, :] = k
                     scr["vnew"][b : b + 1, :] = v
         if cache_exec(ex).paged_kv:
-            scr["knew_o"][...] = scr["knew"][...].astype(FP8)
-            scr["vnew_o"][...] = scr["vnew"][...].astype(FP8)
+            scr["knew_o"][...] = scr["knew"][...].astype(ap.KV_DT)
+            scr["vnew_o"][...] = scr["vnew"][...].astype(ap.KV_DT)
         if not cache_exec(ex).FUSED:
             k_src = scr["knew_o"] if cache_exec(ex).paged_kv else scr["knew"]
             v_src = scr["vnew_o"] if cache_exec(ex).paged_kv else scr["vnew"]

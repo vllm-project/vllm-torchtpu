@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..exec_spec import ExecSpec
-from ..ops import BF16, F32, FP8
+from ..ops import BF16, F32, FP8, kv_page_shape, to_kv_dtype
 from .backend import check_ckpt_bounds
 from .config import cache_exec, resolved_max_pages_per_seq
 from .layout import LANES, PoolLayout
@@ -42,24 +42,19 @@ def _unfold(x: Any, R: int) -> Any:
 # ---------------------------------------------------------------------------
 # Per-page Host / Test Packing & Unpacking Utilities
 # ---------------------------------------------------------------------------
-def kv_to_raw_page(k_page: Any, v_page: Any) -> jax.Array:
-    """Pack `(page_size, HD)` K and V into `(2, HD // 4, 4, page_size) fp8`."""
+def kv_to_raw_page(k_page: Any, v_page: Any, dtype: Any = FP8) -> jax.Array:
+    """Pack `(page_size, HD)` K and V into one `dtype` page `(2, HD // PK, PK,
+    page_size)` (`PoolLayout.kv_page_shape`)."""
     ps, hd = k_page.shape[0], k_page.shape[-1]
-    assert hd % 4 == 0, hd
-    h4 = hd // 4
-    k_fp8 = (
-        jnp.clip(k_page, -448.0, 448.0).astype(FP8) if k_page.dtype != FP8 else k_page
-    )
-    v_fp8 = (
-        jnp.clip(v_page, -448.0, 448.0).astype(FP8) if v_page.dtype != FP8 else v_page
-    )
-    k_pk = jnp.transpose(k_fp8.reshape(ps, h4, 4), (1, 2, 0))
-    v_pk = jnp.transpose(v_fp8.reshape(ps, h4, 4), (1, 2, 0))
+    _, rows, pk, _ = kv_page_shape(1, hd, ps, dtype)
+    assert rows * pk == hd, (hd, pk)
+    k_pk = jnp.transpose(to_kv_dtype(k_page, dtype).reshape(ps, rows, pk), (1, 2, 0))
+    v_pk = jnp.transpose(to_kv_dtype(v_page, dtype).reshape(ps, rows, pk), (1, 2, 0))
     return jnp.stack([k_pk, v_pk], axis=0)
 
 
 def raw_page_to_kv(raw_page: Any) -> tuple[jax.Array, jax.Array]:
-    """Unpack `(2, HD // 4, 4, page_size) fp8` into `(k_page, v_page)`."""
+    """Unpack one `(2, HD // PK, PK, page_size)` page into `(k_page, v_page)`."""
     ps = raw_page.shape[-1]
     hd = raw_page.shape[1] * raw_page.shape[2]
     k_page = jnp.transpose(raw_page[0], (2, 0, 1)).reshape(ps, hd)
@@ -274,12 +269,11 @@ def states_to_pool(
     taps = layout.conv_taps
     rec_pages = layout.rec_pages_per_slot
     raw_list = []
+    page_dt = jnp.dtype(layout.page_dtype)
     for g_idx in range(layout.num_pools):
-        pool_g = np.zeros(
-            (R, cache_exec(ex).num_pages, *page_shape), dtype=jnp.dtype(FP8)
-        )
-        kc_g = np.asarray(jnp.clip(kc[:, g_idx], -448.0, 448.0).astype(FP8))
-        vc_g = np.asarray(jnp.clip(vc[:, g_idx], -448.0, 448.0).astype(FP8))
+        pool_g = np.zeros((R, cache_exec(ex).num_pages, *page_shape), dtype=page_dt)
+        kc_g = np.asarray(to_kv_dtype(kc[:, g_idx], page_dt))
+        vc_g = np.asarray(to_kv_dtype(vc[:, g_idx], page_dt))
         for r in range(R):
             for s in range(NS):
                 for p in range(pages_per_seq):
@@ -287,7 +281,7 @@ def states_to_pool(
                     t0 = p * cache_exec(ex).page_size
                     k_sl = kc_g[r, s, t0 : t0 + cache_exec(ex).page_size]
                     v_sl = vc_g[r, s, t0 : t0 + cache_exec(ex).page_size]
-                    pool_g[r, kp] = np.asarray(kv_to_raw_page(k_sl, v_sl))
+                    pool_g[r, kp] = np.asarray(kv_to_raw_page(k_sl, v_sl, page_dt))
 
         for sub in range(G_PER_ATT):
             o = g_idx * G_PER_ATT + sub
@@ -334,8 +328,8 @@ def pool_to_states(
     pages_per_seq = _pages_per_seq(ex)
     natt, hd = layout.num_pools, layout.hd
 
-    kc_out = np.zeros((R, natt, NS, ex.ctx, hd), dtype=jnp.dtype(FP8))
-    vc_out = np.zeros((R, natt, NS, ex.ctx, hd), dtype=jnp.dtype(FP8))
+    kc_out = np.zeros((R, natt, NS, ex.ctx, hd), dtype=jnp.dtype(layout.page_dtype))
+    vc_out = np.zeros((R, natt, NS, ex.ctx, hd), dtype=jnp.dtype(layout.page_dtype))
 
     ckpt: Any = None
     rec_out: Any = None

@@ -154,7 +154,7 @@ def test_required_and_frozen_dict_invariants():
 
 def test_cache_and_hf_param_declarations():
     kv = KVCacheDecl(hd=256, kvh=2, page_size=64, page_dtype=BF16)
-    assert kv.kv_page_shape == (4, 64, 4, 64)
+    assert kv.kv_page_shape == (4, 128, 2, 64)  # bf16: 2 values per u32 word
 
     rec = RecurrentCacheDecl(kh=4, vh=8)
     assert (rec.KD, rec.VD, rec.conv_taps) == (128, 128, 3)
