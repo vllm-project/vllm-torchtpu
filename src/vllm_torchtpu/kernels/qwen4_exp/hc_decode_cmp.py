@@ -59,6 +59,16 @@ def cmp_applies(tokens: int) -> bool:
     return PIECE <= tokens <= MAX_TOKENS and tokens % PIECE == 0
 
 
+class _NoCopy:
+    """A copy left out by ``mode="compute"``."""
+
+    def start(self):
+        pass
+
+    def wait(self):
+        pass
+
+
 def _lane_column(values, column: int):
     """``values[:, column:column + 1]`` as a masked lane reduction (exact)."""
     lanes = jax.lax.broadcasted_iota(jnp.int32, values.shape, 1)
@@ -74,7 +84,11 @@ def _kernel(
     eps: float,
     prologue: bool,
     inject: bool,
+    mode: str,
 ):
+    # mode (timing only): "full"; "dma" runs the copies and no compute;
+    # "compute" runs the compute and no copies.
+    compute = mode != "dma"
     refs = list(refs)
     if prologue:
         res_hbm, blk_hbm, pinj_hbm = refs[:3]
@@ -114,6 +128,8 @@ def _kernel(
     s_mixed, s_injo = 4 * branches + 4, 4 * branches + 5
 
     def copy(src, dst, sem):
+        if mode == "compute":
+            return _NoCopy()
         return pltpu.make_async_copy(src, dst, sems.at[sem])
 
     rows_in = [
@@ -157,10 +173,11 @@ def _kernel(
         up_in[b].start()
 
     w_in.wait()
-    # The norm weight plus one, f32, broadcast over a piece's 16 rows.
-    w1_vm[...] = jnp.broadcast_to(
-        1.0 + w_vm[...].astype(jnp.float32)[None, :], (PIECE, width)
-    )
+    if compute:
+        # The norm weight plus one, f32, broadcast over a piece's 16 rows.
+        w1_vm[...] = jnp.broadcast_to(
+            1.0 + w_vm[...].astype(jnp.float32)[None, :], (PIECE, width)
+        )
     if prologue:
         blk_in.wait()
         pinj_in.wait()
@@ -198,7 +215,8 @@ def _kernel(
                 xn_vm[prs, cols] = (v * rb * w1_vm[:, cols]).astype(jnp.bfloat16)
             return carry
 
-        jax.lax.fori_loop(0, pieces, piece, jnp.int32(0))
+        if compute:
+            jax.lax.fori_loop(0, pieces, piece, jnp.int32(0))
         if prologue:
             out = copy(res_vm.at[:, stream(b)], h_hbm.at[:, stream(b)], s_h + b)
             out.start()
@@ -207,6 +225,8 @@ def _kernel(
         if inject and b == 0:
             inj_in.wait()
         dn_in[b].wait()
+        if not compute:
+            continue
         part = jax.lax.dot_general(
             xn_vm[:, stream(b)],
             dn_vm[:, stream(b)],
@@ -220,12 +240,13 @@ def _kernel(
 
     # Gate on the low-rank columns, halved (exact): the up dot then gives
     # u / 2, and 2 sigmoid(bf16(u)) = 1 + tanh(bf16(u / 2)).
-    y = y_vm[:, pl.ds(0, lowrank)]
-    z = (y.astype(jnp.bfloat16).astype(jnp.float32) / branches).astype(jnp.bfloat16)
-    z = z.astype(jnp.float32)
-    gate_half = (z * (0.5 * jax.nn.sigmoid(z))).astype(jnp.bfloat16)
+    if compute:
+        y = y_vm[:, pl.ds(0, lowrank)]
+        z = y.astype(jnp.bfloat16).astype(jnp.float32) / branches
+        z = z.astype(jnp.bfloat16).astype(jnp.float32)
+        gate_half = (z * (0.5 * jax.nn.sigmoid(z))).astype(jnp.bfloat16)
 
-    if inject:
+    if inject and compute:
         # The inject rows' logits sit in lanes lowrank % 128 + j of the
         # 128-lane tile that holds column lowrank.
         tile0 = lowrank // LANES * LANES
@@ -242,11 +263,14 @@ def _kernel(
                 lanes == j, _lane_column(gates, lane0 + j), injection
             )
         injo_vm[...] = injection
+    if inject:
         injo_out = copy(injo_vm, injo_hbm, s_injo)
         injo_out.start()
 
     for b in range(branches):
         up_in[b].wait()
+        if not compute:
+            continue
         u_half = jax.lax.dot_general(
             gate_half,
             up_vm[stream(b), :],
@@ -322,6 +346,7 @@ def hc_decode_mix_cmp(
     block=None,
     prev_injection=None,
     interpret=False,
+    _mode="full",
 ):
     """``hc_decode.hc_decode_mix`` for ``cmp_applies`` row counts.
 
@@ -340,11 +365,12 @@ def hc_decode_mix_cmp(
         hidden=hidden,
         eps=eps,
         interpret=interpret,
+        mode=_mode,
     )
 
 
 @functools.partial(
-    jax.jit, static_argnames=("branches", "hidden", "eps", "interpret")
+    jax.jit, static_argnames=("branches", "hidden", "eps", "interpret", "mode")
 )
 def _hc_decode_mix_cmp(
     x,
@@ -359,6 +385,7 @@ def _hc_decode_mix_cmp(
     hidden,
     eps,
     interpret,
+    mode,
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
@@ -423,6 +450,7 @@ def _hc_decode_mix_cmp(
             eps=eps,
             prologue=prologue,
             inject=inject,
+            mode=mode,
         ),
         in_specs=[any_space] * n_in,
         out_specs=[any_space] * len(out_shape),
