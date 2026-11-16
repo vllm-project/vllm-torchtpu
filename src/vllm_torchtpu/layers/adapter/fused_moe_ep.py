@@ -48,7 +48,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
-from torch_tpu._internal.pallas import jax_op
+from torch.tpu.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (

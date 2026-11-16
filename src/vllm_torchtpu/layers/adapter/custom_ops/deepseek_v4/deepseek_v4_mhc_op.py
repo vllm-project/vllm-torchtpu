@@ -24,7 +24,7 @@ from typing import Any, NamedTuple
 import jax
 import torch
 from jax.sharding import PartitionSpec as P
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,

@@ -88,7 +88,7 @@ plain wheel; this repo injects TPU behavior through vLLM's
 (`vllm.platform_plugins`, `vllm.general_plugins`). Model execution is
 **torch** (`TPUModelRunner` subclasses vLLM's `GPUModelRunner`, running under
 `torch.compile(backend="tpu", fullgraph=True)`); kernels are **JAX/Pallas**,
-bridged into torch as custom ops via `torch_tpu._internal.pallas.jax_op`
+bridged into torch as custom ops via `torch.tpu.pallas.jax_op`
 (plus the sharded variant, `distributed/sharded_jax_op.py`). This is **one
 example** of the bridge pattern — there are many call sites
 (`layers/adapter/custom_ops/*_op.py`, `fused_moe.py`, `linear_common.py`, …),

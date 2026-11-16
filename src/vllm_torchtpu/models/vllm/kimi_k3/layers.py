@@ -41,7 +41,7 @@ from .collective_ops import TokenShardCollectives
 
 @cache
 def _build_attention_residual_op(eps: float):
-    from torch_tpu._internal import pallas
+    from torch.tpu import pallas
 
     from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual
 

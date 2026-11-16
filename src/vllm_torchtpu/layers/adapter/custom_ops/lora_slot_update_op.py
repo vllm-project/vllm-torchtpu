@@ -17,7 +17,7 @@ import math
 
 import jax
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 
 
 # Without this op, vLLM's activate_adapter writes an adapter one stacked tensor

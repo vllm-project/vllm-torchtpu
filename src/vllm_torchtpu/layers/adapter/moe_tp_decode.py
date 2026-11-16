@@ -43,7 +43,8 @@ import torch
 from jax import lax
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
+from torch_tpu._internal.pallas import pallas as pallas_impl
 from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
@@ -114,7 +115,7 @@ def moe_tp_decode_supported(quant_method: Any) -> bool:
 
 def _sds(t: torch.Tensor) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(
-        tuple(t.shape), pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[t.dtype]
+        tuple(t.shape), pallas_impl.TORCH_TO_JAX_DTYPE_MAP[t.dtype]
     )
 
 
