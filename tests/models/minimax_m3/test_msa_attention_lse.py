@@ -400,3 +400,54 @@ def test_fp4_lse_wide_groups(
         0,
     )
     _check(got, want)
+
+
+@pytest.mark.parametrize("pages_per_step", [16, 32])
+def test_decode_tiles_read_unwritten_slots_through_the_write(pages_per_step):
+    """8-bit decode tiles feed pages to the MXU unmasked: a local page's
+    slots past its newest token must have been zeroed by the KV write
+    (`msa_write`), whatever bytes (NaN) they held before; stale ring slots
+    past a group's pages are zeroed by the kernel."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa
+
+    dtype = jnp.float8_e4m3fn
+    rng = np.random.default_rng(21)
+    q, kv_rows, _, table, keys, local_key, local_limit = _inputs(rng, 24, 24, 1, dtype)
+    newest = 63
+    keys[keys == 5] = -1  # a page counts once per token
+    keys[:, 0, -1] = 5  # every token's local page, written up to slot `newest`
+    local_key[:] = 5
+    local_limit[:] = rng.integers(1, newest + 2, 24)
+    poisoned = kv_rows.copy()
+    poisoned[table[5], newest:] = np.nan
+    cache = msa.write_rows(
+        pack(poisoned, dtype),
+        jnp.asarray(kv_rows[table[5], newest : newest + 1]).astype(jnp.bfloat16),
+        jnp.asarray([table[5]], jnp.int32),
+        jnp.asarray([newest], jnp.int32),
+        max_num_seqs=1,
+        interpret=True,
+    )
+    got = msa_sparse_attention_lse(
+        q,
+        cache,
+        jnp.asarray(keys[:, 0]),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        block_q=8,
+        pages_per_step=pages_per_step,
+        interpret=True,
+    )
+    assert np.isfinite(np.asarray(got[0].astype(jnp.float32))).all()
+    want = _reference(
+        np.asarray(q.astype(jnp.float32)),
+        kv_rows,
+        keys[:, 0],
+        local_key,
+        local_limit,
+        table,
+        0,
+    )
+    _check(got, want)

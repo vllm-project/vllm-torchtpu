@@ -143,6 +143,8 @@ def _kernel(
         num_heads, block_q, head_dim = q_ref.shape
         rows_per_page, packing, row_width = buf_ref.shape[3:]
         page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
+        # 8-bit pages of `attend` reach the MXU without an unpack.
+        direct = not fp4 and not transposed and packing == 4
         half = w % ring
         first = (meta & msa_attention._FIRST_BIT) != 0
         last = (meta & msa_attention._LAST_BIT) != 0
@@ -212,6 +214,23 @@ def _kernel(
             n *= 2
 
         kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
+        widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+        if direct:
+            # The step reads the slots up to its width; those past the group's
+            # pages are stale (any bytes at first use): their values are zeroed,
+            # p @ v multiplying them by p = 0.
+            span = jnp.int32(widths[-1])
+            for width in reversed(widths[:-1]):
+                span = jnp.where(count <= width, width, span)
+
+            def zero(g, carry):
+                values = buf_ref.at[half, g].bitcast(jnp.uint32).at[
+                    0, :, 0, pl.ds(row_width // 2, row_width // 2)
+                ]
+                values[...] = jnp.zeros(values.shape, jnp.uint32)
+                return carry
+
+            jax.lax.fori_loop(count, span, zero, 0)
 
         @pl.when(first & jnp.logical_not(last))
         def _init():
@@ -317,7 +336,7 @@ def _kernel(
             # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
-                if fp4 or packing == 4
+                if fp4
                 else msa_attention._bitcast_slots(rows_per_page, packing)
             )  # [S, 1]
             slots = row_slots.T  # [1, S]
@@ -348,12 +367,15 @@ def _kernel(
                     values.append(rows[:, head_dim:])
                     k_scales.append(sk)
                     v_scales.append(sv)
-                elif packing == 4:
-                    # The packed [S / 4, 4, 2D] page read as [S, 2D] rows: slot
-                    # r * 4 + j at row r * 4 + j, and a cheaper relayout than the
-                    # 32-bit words' bitcast (16 vs 30 bundles a page, AOT).
-                    rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
-                    values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
+                elif direct:
+                    # 8-bit keys and values enter the MXU as stored: the loaded
+                    # words' bitcast is free (rows in its slot order,
+                    # `row_slots`). No value slot needs zeroing: the KV write
+                    # zeroes a page's slots past its newest token
+                    # (`msa_write`), and stale ring slots were zeroed above.
+                    words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
+                    rows = pltpu.bitcast(words, kv_ref.dtype)
+                    values.append(rows[:, head_dim:])
                 else:
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
@@ -383,7 +405,7 @@ def _kernel(
             l_cur = jnp.sum(p, axis=1, keepdims=True)
             p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
             pv = jax.lax.dot_general(
-                p_v.astype(v.dtype),
+                p_v.astype(jnp.bfloat16),
                 v,
                 (((1,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
@@ -412,7 +434,6 @@ def _kernel(
         # filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin standalone
         # j-952e8a64), plus ~0.7 us whatever its width (j-aec3278d).
         single = first & last
-        widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
         for i, width in enumerate(widths):
             fits = count > (widths[i - 1] if i else 0)
             if width < pages_per_step:
