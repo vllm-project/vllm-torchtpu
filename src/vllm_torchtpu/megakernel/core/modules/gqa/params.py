@@ -26,6 +26,7 @@ from ...exec_spec import ExecSpec, NumericsClass, register_tunables
 from ...fused_io_hook import fused_io
 from ...ops import BF16, F32, FP8, I32, round_up
 from ...pool.config import cache_exec, resolved_max_pages_per_seq
+from .decls import gqa_nai
 
 logger = logging.getLogger(__name__)
 _WARNED_GQA_KEYS: set[tuple[Any, ...]] = set()
@@ -92,6 +93,13 @@ class GQAParams:
     rope_fp32: bool = False
     in_scaled: bool = True
     out_scaled: bool = True
+    # Sigmoid output gate: per head `att_in` carries `[q | gate]` columns.
+    GATE: bool = True
+
+    @property
+    def QW(self) -> int:
+        """`att_in` column stride of one Q head (`[q]` or `[q | gate]`)."""
+        return (2 if self.GATE else 1) * self.HD
 
     def qrow(self, b: int) -> tuple[int, int]:
         return b // self.PB, (b % self.PB) * self.nh
@@ -144,6 +152,7 @@ def derive_params(
     *,
     in_scaled: bool = True,
     out_scaled: bool = True,
+    output_gate: bool = True,
 ) -> GQAParams:
     """`GQAParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
@@ -157,7 +166,7 @@ def derive_params(
             f"and NH={g.NH} % NKV == 0"
         )
     nh = g.NH // ex.R
-    nai = (2 * nh + 2) * g.HD
+    nai = gqa_nai(nh, g.HD, output_gate)
     G = ex.R // g.NKV
     BLK = tt.kv_blk
     PAIR_KV = tt.pair_kv
@@ -360,6 +369,7 @@ def derive_params(
         rope_fp32=bool(tt.rope_fp32),
         in_scaled=bool(in_scaled),
         out_scaled=bool(out_scaled),
+        GATE=bool(output_gate),
     )
 
 
@@ -383,10 +393,11 @@ def gqa_scratch(ex: ExecSpec, ap: GQAParams) -> dict[str, Any]:
             "aacc": pltpu.VMEM((ex.NS, ap.TQ, ap.HD), F32),
             "knew": pltpu.VMEM((ex.MR, ap.HD), F32),
             "vnew": pltpu.VMEM((ex.MR, ap.HD), F32),
-            "gate": pltpu.VMEM((ex.MR, ap.nh * ap.HD), F32),
             "rcs": pltpu.VMEM((2, ex.MR, ap.ROT // 2), F32),
         }
     )
+    if ap.GATE:
+        scr["gate"] = pltpu.VMEM((ex.MR, ap.nh * ap.HD), F32)
     if not cache_exec(ex).FUSED:
         scr["kv_out_sem"] = pltpu.SemaphoreType.DMA((2,))
     else:

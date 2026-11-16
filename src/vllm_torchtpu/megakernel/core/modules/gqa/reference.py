@@ -40,6 +40,7 @@ def gqa_reference(
     layer_idx: int | None = None,
     paged_kv: bool | None = None,
     module_name: str = "gqa",
+    output_gate: bool = True,
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Pure-JAX multi-rank GQA forward for one attention layer (`att_idx`)."""
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
@@ -104,7 +105,8 @@ def gqa_reference(
     att_partials = []
     knew_ranks = []
     vnew_ranks = []
-    koff = nh * 2 * HD
+    qw = (2 if output_gate else 1) * HD
+    koff = nh * qw
 
     for r in range(R):
         w_in = w_att_in_l[r].astype(F32)
@@ -117,8 +119,8 @@ def gqa_reference(
         qn = qn_l[r]
         kn = kn_l[r]
 
-        qg = y[:, :koff].reshape(B, nh, 2 * HD)
-        gate = qg[:, :, HD:].reshape(B, nh * HD)
+        qg = y[:, :koff].reshape(B, nh, qw)
+        gate = qg[:, :, HD:].reshape(B, nh * HD) if output_gate else None
         q_all = []
         k_new_r = []
         v_new_r = []
@@ -171,8 +173,9 @@ def gqa_reference(
             probs = jax.nn.softmax(scores, axis=-1)
             out_b = probs @ vals
             oh = round_bf16(out_b).reshape(nh * HD)
-            gh = round_bf16(jax.nn.sigmoid(gate[b]))
-            mix_r.append(round_bf16(oh * gh))
+            if output_gate:
+                oh = round_bf16(oh * round_bf16(jax.nn.sigmoid(gate[b])))
+            mix_r.append(oh)
         mix_r_arr = jnp.stack(mix_r, axis=0).astype(BF16).astype(F32)
         w_out = w_att_out_l[r].astype(F32)
         yo = (

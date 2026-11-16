@@ -104,8 +104,9 @@ def split_merge(cx: GQAEmit) -> None:
     if cache_exec(ex).FUSED:
         with sc("att_kvwr"):
             fused_io().gqa_fused_kv_rmw(ctx, ap, a)
-    with sc("att_gate"):
-        scr["gate"][0:B, :] = round_bf16(jax.nn.sigmoid(scr["gate"][0:B, :]))
+    if ap.GATE:
+        with sc("att_gate"):
+            scr["gate"][0:B, :] = round_bf16(jax.nn.sigmoid(scr["gate"][0:B, :]))
     with sc("att_merge"):
         for d in mx:
             d.wait_recv()

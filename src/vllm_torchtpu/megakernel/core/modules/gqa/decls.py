@@ -81,10 +81,18 @@ GQA_OPTIONS: dict[str, Any] = {
     "weight_dtypes": None,
 }
 
+
+def gqa_nai(nh: int, hd: int, output_gate: bool) -> int:
+    """Per-rank `att_in` width: `nh` Q (+ `nh` gate) heads, then one K and one V."""
+    return ((2 if output_gate else 1) * nh + 2) * hd
+
+
 GQA_GEOMETRY_METHODS: dict[str, Any] = {
     "nh": lambda g, R: int(g.NH) // R,
     "G": lambda g, R: R // int(g.NKV),
-    "NAI": lambda g, R: (2 * (int(g.NH) // R) + 2) * int(g.HD),
+    "NAI": lambda g, R: gqa_nai(
+        int(g.NH) // R, int(g.HD), bool(getattr(g, "output_gate", True))
+    ),
 }
 
 
@@ -92,11 +100,6 @@ def validate_gqa_options(options: Mapping[str, Any]) -> None:
     if not bool(options.get("qk_norm", True)):
         raise MegakernelConfigError(
             "GQAModule requires qk_norm=True (the kernel always applies q/k RMSNorm)"
-        )
-    if not bool(options.get("output_gate", True)):
-        raise MegakernelConfigError(
-            "GQAModule requires output_gate=True (the kernel always applies the "
-            "sigmoid output gate)"
         )
     normalize_weight_dtypes(
         options.get("weight_dtypes"),

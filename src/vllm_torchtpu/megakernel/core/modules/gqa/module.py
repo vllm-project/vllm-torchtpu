@@ -47,6 +47,7 @@ from .decls import (
     GQA_WEIGHT_NAMES,
     gqa_cache_decl,
     gqa_hf_params,
+    gqa_nai,
     resolve_gqa_binding,
     validate_gqa_options,
 )
@@ -59,7 +60,8 @@ from .staging import att_q, kv_new, q_exchange_start, q_gather_finish
 
 
 class GQAModule(Module):
-    """Full GQA module with QK RMSNorm, partial RoPE, Q/softmax exchange, and gate."""
+    """Full GQA module with QK RMSNorm, partial RoPE, Q/softmax exchange, and an
+    optional sigmoid output gate (`output_gate`)."""
 
     name: str = "gqa"
     reduction = "allreduce"
@@ -131,7 +133,7 @@ class GQAModule(Module):
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         nh = g.NH // ex.R
-        nai = (2 * nh + 2) * g.HD
+        nai = gqa_nai(nh, g.HD, self.output_gate)
         in_dt = FP8 if self.weight_dtypes["att_in"] == "fp8" else BF16
         out_dt = FP8 if self.weight_dtypes["att_out"] == "fp8" else BF16
         return [
@@ -143,7 +145,7 @@ class GQAModule(Module):
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
         nh = g.NH // ex.R
-        nai = (2 * nh + 2) * g.HD
+        nai = gqa_nai(nh, g.HD, self.output_gate)
         fields = [SmallField("in_norm", g.H)]
         if self.weight_dtypes["att_in"] == "fp8":
             fields.append(SmallField("in_s", nai))
@@ -192,7 +194,7 @@ class GQAModule(Module):
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         nh = g.NH // ex.R
-        nai = (2 * nh + 2) * g.HD
+        nai = gqa_nai(nh, g.HD, self.output_gate)
         return {"acc": max(nai, g.H), "ybuf": nai, "xb2": nh * g.HD, "mix": nh * g.HD}
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GQAParams:
@@ -205,6 +207,7 @@ class GQAModule(Module):
             self.tunables(ex),
             in_scaled=(self.weight_dtypes["att_in"] == "fp8"),
             out_scaled=(self.weight_dtypes["att_out"] == "fp8"),
+            output_gate=self.output_gate,
         )
 
     def _check_pool_layout(self, plan: Any) -> None:
@@ -399,5 +402,11 @@ class GQAModule(Module):
     ) -> tuple[Any, dict[str, Any]]:
         assert state is not None, "GQAModule.reference requires `state` with 'kc'/'vc'"
         return gqa_reference(
-            params, x, state, g=self._require_geometry(g), module_name=self.name, **kw
+            params,
+            x,
+            state,
+            g=self._require_geometry(g),
+            module_name=self.name,
+            output_gate=self.output_gate,
+            **kw,
         )

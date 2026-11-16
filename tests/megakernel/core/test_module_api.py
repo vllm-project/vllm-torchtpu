@@ -472,8 +472,6 @@ def test_module_bind_resolve_validation_and_fail_closed():
     # 1. Fail-closed on unimplemented options, MoE mismatch, and conv_kernel != 4
     with pytest.raises(MegakernelConfigError, match="qk_norm=True"):
         GQAModule.bind("self_attn", qk_norm=False)
-    with pytest.raises(MegakernelConfigError, match="output_gate=True"):
-        GQAModule(output_gate=False)
     with pytest.raises(MegakernelConfigError, match="shared_gate=True"):
         MoEModule.bind("mlp", shared_gate=False)
     with pytest.raises(MegakernelConfigError, match="conv_kernel == 4"):

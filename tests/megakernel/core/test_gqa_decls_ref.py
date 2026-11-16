@@ -183,8 +183,6 @@ def test_gqa_decls_options_binding_and_hf_params():
     )
     with pytest.raises(MegakernelConfigError, match="qk_norm=True"):
         validate_gqa_options({"qk_norm": False})
-    with pytest.raises(MegakernelConfigError, match="output_gate=True"):
-        validate_gqa_options({"output_gate": False})
     with pytest.raises(MegakernelConfigError, match="weight_dtypes"):
         validate_gqa_options({"weight_dtypes": {"bad": "fp8"}})
 
@@ -214,6 +212,10 @@ def test_gqa_decls_options_binding_and_hf_params():
     assert GQA_GEOMETRY_METHODS["nh"](resolved, 2) == 2
     assert GQA_GEOMETRY_METHODS["G"](resolved, 2) == 1
     assert GQA_GEOMETRY_METHODS["NAI"](resolved, 2) == (2 * 2 + 2) * 64
+    ungated = dataclasses.replace(
+        resolved, options={**resolved.options, "output_gate": False}
+    )
+    assert GQA_GEOMETRY_METHODS["NAI"](ungated, 2) == (2 + 2) * 64
 
     # Whole-number partial_rotary_factor=1 (int) resolves to full HD (64),
     # and odd or >HD rotary dimensions raise MegakernelConfigError.

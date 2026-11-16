@@ -58,14 +58,15 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
         ap.theta ** (lax.broadcasted_iota(I32, (1, half), 1).astype(F32) * 2.0 / ROT)
     )
 
-    koff = nh * 2 * HD
+    QW = ap.QW
+    koff = nh * QW
     rcs = scr["rcs"]
     with sc("att_qk"):
         if QV:
             cos = scr["rope"][0, :B, :half]
             sin = scr["rope"][1, :B, :half]
             for h in range(nh):
-                q0_ = h * 2 * HD
+                q0_ = h * QW
                 qh = gqa_rms(ap, ybuf[:B, q0_ : q0_ + HD], qn)
                 qh = round_bf16(rope(ap, qh, cos, sin) * HD**-0.5)
                 for j in range(NHH):
@@ -89,7 +90,7 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
                 cos, sin = round_bf16(jnp.cos(ang)), round_bf16(jnp.sin(ang))
                 rcs[0, b : b + 1, :] = cos
                 rcs[1, b : b + 1, :] = sin
-                qg = ybuf[b, :koff].reshape(nh, 2 * HD)
+                qg = ybuf[b, :koff].reshape(nh, QW)
                 q = gqa_rms(ap, qg[:, :HD], qn)
                 q = round_bf16(rope(ap, q, cos, sin) * HD**-0.5)
                 if PACK:
@@ -131,16 +132,15 @@ def kv_new(
     """Output gate, this step's normed / roped K and V; start their writeback."""
     ex, ap, scr, O, sc, a = cx.ex, cx.ap, cx.scr, cx.O, cx.sc, cx.a  # noqa: E741
     B = ex.B
-    nh, HD, QV = ap.nh, ap.HD, ap.QV
+    nh, HD, QV, QW, GATE = ap.nh, ap.HD, ap.QV, ap.QW, ap.GATE
     with sc("att_kvnew"):
         if QV:
             cos = scr["rope"][0, :B, :half]
             sin = scr["rope"][1, :B, :half]
-            for h in range(nh):
-                q0_ = h * 2 * HD
-                scr["gate"][:B, h * HD : (h + 1) * HD] = ybuf[
-                    :B, q0_ + HD : q0_ + 2 * HD
-                ]
+            if GATE:
+                for h in range(nh):
+                    q0_ = h * QW + HD
+                    scr["gate"][:B, h * HD : (h + 1) * HD] = ybuf[:B, q0_ : q0_ + HD]
             k = gqa_rms(ap, ybuf[:B, koff : koff + HD], kn)
             v = ybuf[:B, koff + HD : koff + 2 * HD]
             k = rope(ap, k, cos, sin)
@@ -155,8 +155,9 @@ def kv_new(
         else:
             for b in range(B):
                 cos, sin = rcs[0, b : b + 1, :], rcs[1, b : b + 1, :]
-                qg = ybuf[b, :koff].reshape(nh, 2 * HD)
-                scr["gate"][b, :] = qg[:, HD:].reshape(nh * HD)
+                if GATE:
+                    qg = ybuf[b, :koff].reshape(nh, QW)
+                    scr["gate"][b, :] = qg[:, HD:].reshape(nh * HD)
                 k = gqa_rms(ap, ybuf[b : b + 1, koff : koff + HD], kn)
                 v = ybuf[b : b + 1, koff + HD : koff + 2 * HD]
                 k = rope(ap, k, cos, sin)

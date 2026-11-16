@@ -26,8 +26,22 @@ from ...ops import F32, I32, round_bf16
 from .context import GQAEmit
 
 
+def gated(cx: GQAEmit, oh: Any, rows: slice, h: int) -> Any:
+    """Head `h`'s output rows `oh` times `round_bf16(sigmoid(gate))` (`GATE`).
+
+    Under `SPLIT`, `split_merge` has already applied the sigmoid in place.
+    """
+    ap = cx.ap
+    if not ap.GATE:
+        return oh
+    gh = cx.scr["gate"][rows, h * ap.HD : (h + 1) * ap.HD]
+    if not ap.SPLIT:
+        gh = round_bf16(jax.nn.sigmoid(gh))
+    return round_bf16(oh * gh)
+
+
 def att_new(cx: GQAEmit) -> None:
-    """Attend to the step's own K/V rows and write the gated output to `mix`."""
+    """Attend to the step's own K/V rows and write the (gated) output to `mix`."""
     ex, ap, scr, sc, gi, am, al = cx.ex, cx.ap, cx.scr, cx.sc, cx.gi, cx.am, cx.al
     aacc = cx.aacc
     B, T, NS, VER = ex.B, ex.T, ex.NS, ex.VER
@@ -80,7 +94,7 @@ def att_new(cx: GQAEmit) -> None:
         else:
             # When `SPLIT` is True, `split_merge` (`merge.py`) has already run:
             # it merged this rank's `nh` heads into `am`/`al`/`aacc` at `q0 : q0 + NR`
-            # and applied `round_bf16(sigmoid)` to `scr["gate"]` in place.
+            # and applied `round_bf16(sigmoid)` to `scr["gate"]` in place (`GATE`).
             NR = nh if PACK else 8
             for b in range(B):
                 sq, tb = divmod(b, T)
@@ -133,10 +147,9 @@ def att_new(cx: GQAEmit) -> None:
                     continue
                 for h in range(nh):
                     oh = round_bf16(outb[h : h + 1, :])
-                    gh = scr["gate"][b : b + 1, h * HD : (h + 1) * HD]
-                    if not SPLIT:
-                        gh = round_bf16(jax.nn.sigmoid(gh))
-                    scr["mix"][b : b + 1, h * HD : (h + 1) * HD] = round_bf16(oh * gh)
+                    scr["mix"][b : b + 1, h * HD : (h + 1) * HD] = gated(
+                        cx, oh, slice(b, b + 1), h
+                    )
         if QV:
             for h in range(nh):
                 oh = jnp.concatenate(
@@ -146,7 +159,4 @@ def att_new(cx: GQAEmit) -> None:
                     ],
                     axis=-1,
                 )
-                gh = scr["gate"][:B, h * HD : (h + 1) * HD]
-                if not SPLIT:
-                    gh = round_bf16(jax.nn.sigmoid(gh))
-                scr["mix"][:B, h * HD : (h + 1) * HD] = round_bf16(oh * gh)
+                scr["mix"][:B, h * HD : (h + 1) * HD] = gated(cx, oh, slice(0, B), h)

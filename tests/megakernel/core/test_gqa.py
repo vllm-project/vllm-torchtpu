@@ -132,7 +132,10 @@ class _FakeGQAStream:
         return self.scr["acc"][:, :n_dim]
 
 
-def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
+@pytest.mark.parametrize("output_gate", [True, False], ids=["gated", "ungated"])
+def test_gqa_module_declarations_and_emit_in_pallas_interpret(
+    fake_ex: ExecSpec, output_gate: bool
+):
     """Verify `GQAModule` declarations drive `planner`/`vmem` and `emit` in Pallas."""
     fake_ex = dataclasses.replace(fake_ex, tiles=_TINY_GQA_TILES)
     g_decl = FakeGeometry(L=2, att_every=1, H=256)
@@ -172,13 +175,17 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         IS=128,
         moe_tp=True,
     )
-    gqa = GQAModule()
+    gqa = GQAModule(output_gate=output_gate)
     ffn = FakeFFNModule()
     ms = ModelSpec(
         "gqa_ffn_exec", config=g, layer_type=LayerType("lt", slots=(gqa, ffn))
     )
     cp, scratch = _build_gqa_test_scratch(ms, ex)
     p = cp.plan
+    q_heads = (2 if output_gate else 1) * g.NH
+    nai = cp.module("gqa").NAI
+    assert nai == (q_heads + 2) * g.HD
+    assert ("gate" in scratch) is output_gate
     wsh = planner.weight_shapes(ms, ex, p)
     ssh = planner.state_shapes(ms, ex, p)
     osh = planner.kernel_out_shapes(ms, ex, p)
