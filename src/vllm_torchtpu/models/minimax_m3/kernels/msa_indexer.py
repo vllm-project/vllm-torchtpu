@@ -215,8 +215,11 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
 
 # Pages per dot in `_kernel_v3`: 2 x 16 pages, paired along the contraction.
 _PAGES_PER_CHUNK = 32
-# `_kernel_v3` issues the ahead group's descriptors during its first chunks.
-_DMA_ISSUE_CHUNKS = 2
+# `_kernel_v3` issues the ahead group's descriptors during its first chunks:
+# all four of a decode group's 32-page chunks (2: standalone decode calls
+# c48-like int4 folded 101 -> 92 us, b36 117 -> 111, fp8 c16 b5 25.5 -> 24.1,
+# kernel bench j-0a884760).
+_DMA_ISSUE_CHUNKS = 4
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
@@ -447,8 +450,8 @@ def _kernel_v3(
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
     num_chunks = pages_per_step // chunk
     # The ahead group's descriptors, spread over the first chunks' page pairs
-    # (in one chunk they crowd its scalar slots, in all chunks they issue
-    # late: both slower, benches j-9956cd34 / j-2e0b290e).
+    # (in one chunk they crowd its scalar slots: slower, bench j-9956cd34;
+    # `_DMA_ISSUE_CHUNKS` says how many).
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
