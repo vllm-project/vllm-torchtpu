@@ -51,6 +51,8 @@ CASES = [
     ),
     (WAN2_1_T2V_14B, {"ulysses_degree": 8}, "u8", ()),
     (WAN2_1_T2V_1_3B, {"ring_degree": 2}, "ring2", ()),
+    (WAN2_1_T2V_1_3B, {"ring_degree": 4}, "ring4", ()),
+    (WAN2_1_T2V_14B, {"cfg_parallel_size": 2, "ring_degree": 4}, "cfg2xr4", ()),
 ]
 
 
