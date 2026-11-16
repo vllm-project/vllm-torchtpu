@@ -488,6 +488,58 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         range_entry.compiled = True
 
+    def prebuild_async(pairs) -> tuple[list, list]:
+        """Submit the buckets in `pairs` for compilation at once, ahead of the
+        serial loop that installs them. Returns `(submitted, rest)`.
+
+        Each bucket is traced here, one after another, then lowered and
+        compiled on torch_tpu's async compile pool, so the buckets' XLA
+        compiles overlap instead of following each other. Tracing stays on
+        this thread: torch.fx tracing is not thread-safe. compile_entry then
+        finds each bucket submitted and waits for it (TpuCompilerAdaptor.
+        prebuild). A bucket vLLM's cache already holds is loaded, not built.
+        """
+        import torch
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilerAdaptor,
+            artifact_key,
+        )
+
+        todo = []
+        for backend, range_entry in pairs:
+            manager = backend.vllm_backend.compiler_manager
+            adaptor = getattr(manager, "compiler", None)
+            r = range_entry.compile_range
+            if (
+                isinstance(adaptor, TpuCompilerAdaptor)
+                and not range_entry.compiled
+                and r.is_single_size()
+                and (r, backend.piecewise_compile_index, adaptor.name)
+                not in manager.cache
+            ):
+                todo.append((adaptor, backend, range_entry))
+        if len(todo) < 2:
+            return [], list(pairs)
+        logger.info("Submitting %d owned buckets for async compile.", len(todo))
+        submitted = []
+        submitted_ids = set()
+        # CompilerManager.compile sets autograd_cache_normalize_inputs=True
+        # around each compile so isomorphic graphs produce the same AOTAutograd
+        # cache key; prebuild sets it too so _compile traces with the same
+        # functorch config as the serial compile path.
+        with torch._functorch.config.patch(autograd_cache_normalize_inputs=True):
+            for adaptor, backend, range_entry in todo:
+                r = range_entry.compile_range
+                key = artifact_key(r, backend.piecewise_compile_index)
+                if adaptor.prebuild(
+                    backend.graph, create_concrete_args(backend.graph, r.start), r, key
+                ):
+                    submitted.append((backend, range_entry))
+                    submitted_ids.add(id(range_entry))
+        rest = [pair for pair in pairs if id(pair[1]) not in submitted_ids]
+        return submitted, rest
+
     def compile_rotated(pairs, local_rank: int) -> None:
         """Compile every range here, each local rank starting on a different
         one: the order without peer replay."""
@@ -569,7 +621,24 @@ def _patch_vllm_compile_all_ranges() -> None:
                     (turn, range_entry.compile_range.end, backend, range_entry)
                 )
 
-        for backend, range_entry in mine:
+        # A rank owning several buckets traces them back to back and compiles
+        # them at once instead of one after another; compile_entry below
+        # finishes every submitted bucket before any serial compile starts, so
+        # a serial fallback never resets scheduling-group ids while an async
+        # bucket is still lowering.
+        submitted, rest = (
+            prebuild_async(mine) if envs.TPU_PRECOMPILE_ASYNC else ([], mine)
+        )
+        try:
+            for backend, range_entry in submitted:
+                compile_entry(backend, range_entry)
+        finally:
+            # Normally a no-op: the loop takes every submitted bucket.
+            for backend, _ in submitted:
+                backend.vllm_backend.compiler_manager.compiler.discard_prebuilt(
+                    backend.graph
+                )
+        for backend, range_entry in rest:
             compile_entry(backend, range_entry)
         with wait_for_peer_artifact(envs.TPU_PRECOMPILE_PEER_WAIT_S):
             for _, _, backend, range_entry in sorted(others, key=lambda o: o[:2]):
