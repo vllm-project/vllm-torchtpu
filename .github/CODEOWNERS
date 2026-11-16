@@ -191,6 +191,10 @@
 /tests/layers/core/post_norm_moe/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @QiliangCui
 /tests/layers/adapter/custom_ops/test_post_norm_moe_op.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @QiliangCui
 
+# Models: Muse Spark
+/src/vllm_torchtpu/models/vllm/muse_spark/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @QiliangCui
+/tests/models/vllm/test_muse_spark*.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @QiliangCui
+
 # Megakernel (root package and shared test setup)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
 /tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
