@@ -6150,6 +6150,18 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+        self._arm_hier_reduce_scatter()
+
+    def _arm_hier_reduce_scatter(self) -> None:
+        """Arms TPU_MOE_EP_HIER_RS once, outside Dynamo: it runs collectives."""
+        from vllm_torchtpu.distributed.hier_reduce_scatter import (
+            prebuild_hier_reduce_scatter,
+        )
+
+        spec = self.speculative_config
+        prebuild_hier_reduce_scatter(
+            draft_model=spec is not None and spec.method != "ngram"
+        )
 
     def load_lora_model(
         self,
