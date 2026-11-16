@@ -38,11 +38,11 @@ SERVED_ENV = {
     "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE": "1", "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET": "1",
     "VLLM_TPU_QSA_PREFILL_QUERY_TILE": "64",
 }
-# (name, [(rows, cached) per request], bucket rows, page tokens)
+# (name, [(rows, cached) per request], bucket rows, page tokens: a TP1 prefill stage's 3200-token kernel pages)
 CASES = [
-    ("ctx64k", [(4096, 64000), (4096, 64000)], 8192, 128),
-    ("ctx96k", [(4096, 96000), (4096, 96000)], 8192, 128),
-    ("s10623", [(3200, 64000), (682, 70400)], 4096, 128),
+    ("ctx64k", [(4096, 64000), (4096, 64000)], 8192, 3200),
+    ("ctx96k", [(4096, 96000), (4096, 96000)], 8192, 3200),
+    ("s10623", [(3200, 64000), (682, 70400)], 4096, 3200),
 ]
 MAX_REL = 0.08
 REPS = int(os.environ.get("CMP_TPU_REPS", "5"))
