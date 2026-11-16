@@ -32,6 +32,7 @@ from typing import Any
 
 import torch
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
 
@@ -46,6 +47,21 @@ def shared_operands(layer: Any) -> tuple[torch.Tensor, ...] | None:
     if getattr(layer, _SHARED_BUFFERS[0], None) is None:
         return None
     return tuple(getattr(layer, name) for name in _SHARED_BUFFERS)
+
+
+def model_side_shared(layer: Any, num_tokens: int) -> bool:
+    """Whether a step of ``num_tokens`` leaves the armed shared expert to the
+    model (TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS) instead of the routed op;
+    the routed op and the model both ask, so exactly one of them runs it.
+    Only while the model owns the MoE reduction (skip_final_all_reduce, set
+    in the same trace for both): the model's partial shared expert is then
+    reduced with the routed partial."""
+    min_tokens = envs.TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS
+    return (
+        0 < min_tokens <= num_tokens
+        and bool(getattr(layer.moe_config, "skip_final_all_reduce", False))
+        and shared_operands(layer) is not None
+    )
 
 
 def _shared_tensors(runner) -> tuple[torch.Tensor, ...] | None:

@@ -225,7 +225,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             shard,
             update,
             envs.TPU_MINIMAX_M3_SP_FP8_GATHER,
-            envs.TPU_MINIMAX_M3_SP_E4M3_QKV and not self.is_moe_layer,
+            envs.TPU_MINIMAX_M3_SP_E4M3_QKV,
         )
         return layer_input, shard, tensor_model_parallel_reduce_scatter(ffn(normed), 0)
 

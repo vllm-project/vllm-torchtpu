@@ -25,6 +25,12 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
+    model_side_shared,
+    shared_operands,
+)
+from vllm_torchtpu.models.minimax_m3.quant import _e4m3_matmul, _materialized_bf16
+
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
 
@@ -141,6 +147,42 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits, _ = self.gate(hidden_states)
-        return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+    def forward(
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        """``hidden_states`` may come as e4m3 rows with per-row f32 scales (an
+        SP step's e4m3 all-gather): the router and routed experts take them
+        dequantized, a model-side shared expert contracts them as e4m3."""
+        e4m3 = isinstance(hidden_states, tuple)
+        x = hidden_states
+        if e4m3:
+            x = (hidden_states[0].float() * hidden_states[1]).to(torch.bfloat16)
+        routed_layer = getattr(self.experts, "routed_experts", None)
+        shared = None
+        if routed_layer is not None and model_side_shared(routed_layer, x.shape[0]):
+            shared = shared_operands(routed_layer)
+        router_logits, _ = self.gate(x)
+        out = self.experts(hidden_states=x, router_logits=router_logits)
+        if shared is None:
+            return out
+        act_fn = self.shared_experts.act_fn
+        return out + _shared_expert(act_fn, hidden_states if e4m3 else x, *shared)
+
+
+def _shared_expert(
+    act_fn: nn.Module,
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    w1: torch.Tensor,
+    s1: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+) -> torch.Tensor:
+    """The armed shared expert (dense_fp4_shared: e4m3 [H, 2I] / [I, H]
+    weights, f32 [1, n] channel scales) as `fused_moe_gmm.shared_expert_mlp`
+    rounds it; e4m3 rows ``x`` contract as e4m3 x e4m3."""
+    if isinstance(x, tuple):
+        gate_up = _e4m3_matmul(x[0], x[1], w1, s1)
+    else:
+        gate_up = (torch.matmul(x, _materialized_bf16(w1)).float() * s1).to(x.dtype)
+    act = act_fn(gate_up)
+    return (torch.matmul(act, _materialized_bf16(w2)).float() * s2).to(act.dtype)

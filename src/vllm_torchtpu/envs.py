@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SHARED: bool = False
+    TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS: int = 0
     TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
     TPU_GMM_FP8_W8A8: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -761,9 +762,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_SP_FUSED_NORM": env_bool(
         "TPU_MINIMAX_M3_SP_FUSED_NORM", default=False
     ),
-    # "full" SP with the e4m3 gathers: qkv_proj (and a dense layer's MLP
-    # gate_up_proj) contract the gathered e4m3 rows against their e4m3 weight
-    # (e4m3 x e4m3, f32 accumulation) instead of dequantizing both to bf16.
+    # "full" SP with the e4m3 gathers: qkv_proj, a dense layer's MLP gate_up
+    # and a model-side shared expert (TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS)
+    # contract the gathered e4m3 rows against their e4m3 weight (e4m3 x e4m3,
+    # f32 accumulation) instead of dequantizing both to bf16.
     "TPU_MINIMAX_M3_SP_E4M3_QKV": env_bool("TPU_MINIMAX_M3_SP_E4M3_QKV", default=False),
     # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
     # experts run the permutation-free dense-expert kernel (kernels/experimental/
@@ -777,6 +779,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in the same call, other steps add it with XLA inside the op. Armed once
     # after load.
     "TPU_MOE_DENSE_FP4_SHARED": env_bool("TPU_MOE_DENSE_FP4_SHARED", default=False),
+    # Steps of at least this many tokens whose MoE reduction the model owns
+    # (MiniMax-M3 SP steps) leave a shared expert armed by
+    # TPU_MOE_DENSE_FP4_SHARED to the model (on the e4m3-gathered rows,
+    # models/minimax_m3/moe.py) instead of the routed op. 0 keeps it in the
+    # routed op at every size.
+    "TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS", 0
+    ),
     # EP MoE layers with fp4 experts also keep a TP-sliced copy of every
     # routed expert (layers/adapter/dense_fp4_dual.py), built at load by an
     # all-to-all; steps of up to this many tokens run the dense fp4 kernel on

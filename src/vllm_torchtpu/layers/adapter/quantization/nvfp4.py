@@ -577,11 +577,15 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             return pipelined_fused_moe_gmm(**kwargs)
 
         from vllm_torchtpu.layers.adapter.dense_fp4_dual import dual_operands
-        from vllm_torchtpu.layers.adapter.dense_fp4_shared import shared_operands
-
-        return fused_moe_gmm(
-            **kwargs, shared=shared_operands(layer), tp_experts=dual_operands(layer)
+        from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
+            model_side_shared,
+            shared_operands,
         )
+
+        shared = shared_operands(layer)
+        if model_side_shared(layer, x.shape[0]):
+            shared = None
+        return fused_moe_gmm(**kwargs, shared=shared, tp_experts=dual_operands(layer))
 
 
 class _NullInputQuantKernel:
