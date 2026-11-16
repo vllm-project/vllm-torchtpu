@@ -294,7 +294,9 @@ def patch_scheduler() -> None:
 
     def schedule(self: Any, *args: Any, **kwargs: Any) -> Any:
         flags_by_req = plan_running_requests(self)
-        output = original_schedule(self, *args, **kwargs)
+        # Any: vLLM's SchedulerOutput does not declare the flags field added
+        # above; the runner reads it with getattr.
+        output: Any = original_schedule(self, *args, **kwargs)
         if flags_by_req:
             output.scheduled_spec_decode_flags = scheduled_flags(
                 flags_by_req, output.scheduled_spec_decode_tokens
