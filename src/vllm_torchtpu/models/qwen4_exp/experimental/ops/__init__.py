@@ -11,4 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Model-owned ops for experimental Qwen3.8-Flash (see ../../README.md)."""
+"""Model-owned ops for experimental Qwen3.8-Flash."""
