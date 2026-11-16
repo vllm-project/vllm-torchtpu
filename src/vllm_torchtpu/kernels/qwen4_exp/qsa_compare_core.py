@@ -407,15 +407,15 @@ def _kth_set_bit(word, k):
 
 
 def group_bits(blocks, lengths, *, groups_cap, words, bitset="tensorcore"):
-    """int32[R / 16, words, 16]: each union group's rows' selection bitsets (row r on lane r), the served bitset's
-    bits (indexer selections plus each row's partial tail group; ids at or past ``groups_cap`` dropped)."""
+    """int32[R / 16 * words * 16], flat: each union group's rows' selection bitsets, word-major with row r on lane
+    r (the served bitset's bits: indexer selections plus each row's partial tail group; ids at or past
+    ``groups_cap`` dropped). Flat because a [G, words, 16] array's 16-wide minor axis pads to 128 lanes on TPU."""
     tokens = blocks.shape[0]
     sel, bit_lengths = plan_selections(blocks, lengths, groups_cap=groups_cap, ratio=RATIO)
     if bitset == "sparsecore":
         from vllm_torchtpu.kernels.qwen4_exp import qsa_union_sc_gather as scg
 
-        flat = scg.union_sc_bits_flat(sel, bit_lengths, ratio=RATIO, groups=groups_cap, words=words)
-        return flat.reshape(tokens // T, words, T)
+        return scg.union_sc_bits_flat(sel, bit_lengths, ratio=RATIO, groups=groups_cap, words=words)
     if bitset != "tensorcore":
         raise ValueError("bitset: 'tensorcore' or 'sparsecore'")
     padded = -(-tokens // 128) * 128
@@ -425,7 +425,7 @@ def group_bits(blocks, lengths, *, groups_cap, words, bitset="tensorcore"):
         ratio=RATIO, groups=groups_cap, words=words, query_block=128, width=128,
     )  # [padded / 128, words, 128], rows on lanes
     split = packed.reshape(padded // 128, words, 128 // T, T).transpose(0, 2, 1, 3)
-    return split.reshape(padded // T, words, T)[: tokens // T]
+    return split.reshape(padded // T, words, T)[: tokens // T].reshape(-1)
 
 
 def union_lists(bits16, *, union_cap):
@@ -485,12 +485,14 @@ def compare_tables(blocks, lengths, table, *, groups_cap, union_cap, page_size, 
     r = jnp.arange(T, dtype=jnp.int32)[None, :]
     consecutive = jnp.all((grouped == 0) | (grouped == grouped[:, :1] + r))
     page_rows = table.reshape(ngroups, T, table.shape[1])[:, 0]
-    bits16 = group_bits(blocks, lengths, groups_cap=groups_cap, words=words, bitset=bitset)
+    bits = group_bits(blocks, lengths, groups_cap=groups_cap, words=words, bitset=bitset)
     if lister == "sparsecore":
         from vllm_torchtpu.kernels.qwen4_exp import qsa_union_sc_gather as scg
 
-        rows, codes, usize = scg.compare_sc_tables(bits16, page_rows, p0, union_cap=union_cap, page_size=page_size)
+        rows, codes, usize = scg.compare_sc_tables(bits, page_rows, p0, words=words, union_cap=union_cap,
+                                                   page_size=page_size)
     elif lister == "reference":
+        bits16 = bits.reshape(ngroups, words, T)
         ids, usize = union_lists(bits16, union_cap=union_cap)
         rows = slot_rows(ids, page_rows, page_size=page_size)
         codes = slot_codes(bits16, ids, p0)
