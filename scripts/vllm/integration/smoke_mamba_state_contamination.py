@@ -16,8 +16,9 @@
 Two long prefixes are interleaved, so the recurrent slot a resumed request
 picks up was last written by the *other* prefix. Attention KV comes back from
 the cache either way; only a real state restore makes the continuation match
-the uncached one. Comparing token ids rather than an expected answer means a
-wrong state shows up even when it does not change the final answer.
+the uncached one. Comparing token ids (optionally allowing a near-tie flip
+within --logprob-atol) rather than an expected answer means a wrong state shows
+up even when it does not change the final answer.
 """
 
 import argparse
@@ -130,7 +131,15 @@ def main() -> int:
     p.add_argument("--rounds", type=int, default=4)
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--timeout", type=int, default=600)
-    p.add_argument("--logprob-atol", type=float, default=0.0)
+    p.add_argument(
+        "--logprob-atol",
+        type=float,
+        default=0.0,
+        help="When > 0, accept a warm-round token divergence as a near-tie if "
+        "all prior token logprobs match within this tolerance and both "
+        "competing tokens at the first divergent step appear in each run's "
+        "top-5 logprobs within this tolerance (0 requires exact token ids).",
+    )
     p.add_argument(
         "--data-parallel-rank",
         type=int,
