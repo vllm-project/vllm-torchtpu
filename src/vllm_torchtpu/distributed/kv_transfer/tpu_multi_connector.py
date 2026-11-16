@@ -159,3 +159,22 @@ class TPUMultiConnector(MultiConnector):
                 if res is not None:
                     return res
         return None
+
+    def estimate_external_hit_tokens(
+        self,
+        request,
+        num_local_tokens: int,
+    ) -> int:
+        """Returns the largest external hit any child expects to load.
+
+        A prefill leg's prefix-aware scheduler reaches the offloading child's
+        host-tier estimate through here; children without one count as 0.
+        """
+        best = 0
+        for c in self._connectors:
+            fn = getattr(c, "estimate_external_hit_tokens", None)
+            if fn is not None:
+                res = fn(request, num_local_tokens)
+                if res and res > best:
+                    best = res
+        return best
