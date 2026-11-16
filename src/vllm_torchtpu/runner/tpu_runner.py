@@ -4535,6 +4535,17 @@ class TPUModelRunner(GPUModelRunner):
         recover_u = torch.rand_like(
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
+        # Sampled DSpark drafts (TPU_DSPARK_SAMPLED_DRAFT=1): verify against
+        # the draft distribution the tokens were drawn from.
+        draft_logits = draft_valid = None
+        if getattr(self.drafter, "sampled_draft", False):
+            draft_rows = self.drafter.sampled_draft_rows(
+                self.input_batch.req_ids[cur_start_idx:cur_end_idx],
+                md.draft_lengths_cpu,
+                md.draft_token_ids,
+            )
+            if draft_rows is not None:
+                draft_logits, draft_valid = draft_rows
         return self.rejection_sampler(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -4549,6 +4560,8 @@ class TPUModelRunner(GPUModelRunner):
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=True,
+            draft_logits=draft_logits,
+            draft_valid=draft_valid,
         )
 
     def sample_tokens(
@@ -6257,6 +6270,34 @@ class TPUModelRunner(GPUModelRunner):
                         do_sampling=True,
                     )
                     synchronize_tensors(out)
+                    if getattr(self.drafter, "sampled_draft", False):
+                        logger.info(
+                            "Rejection warmup: stage=random_sampled_draft rows=%d reqs=%d",
+                            num_tokens,
+                            num_reqs,
+                        )
+                        out = self.rejection_sampler(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_ng,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            temperatures=warm_temps,
+                            top_k=warm_top_k,
+                            top_p=warm_top_p,
+                            accept_u=warm_accept_u,
+                            recover_u=warm_recover_u,
+                            do_sampling=True,
+                            draft_logits=torch.zeros(
+                                (num_tokens, self.vocab_size), dtype=torch.bfloat16
+                            ).to(self.device),
+                            draft_valid=torch.ones(num_tokens, dtype=torch.bool).to(
+                                self.device
+                            ),
+                        )
+                        synchronize_tensors(out)
                     logger.info(
                         "  -- padded_logits_length: %d, num_seqs: %d",
                         num_tokens,
