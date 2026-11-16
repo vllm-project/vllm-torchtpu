@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH: int = 8
     VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES: str = "sparsecore"
     VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS: int = 0
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_HELD: int = 0
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
@@ -1076,6 +1077,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # group and the core's max relative error against the flag-off call on the same inputs (QSA_CMP_STATS lines;
     # the flag-off call then runs too). 0 (default) adds nothing to the program.
     "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS", 0),
+    # HELD (tokens, 0 = off): the compare core's held read (qsa_compare_held): each sequence's cached KV of one KV
+    # head held in VMEM for that head's pass, union slots gathered from it by vector loads; a step with a sequence
+    # longer than this many tokens takes the flag-off call.
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_HELD": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_HELD", 0),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.

@@ -514,6 +514,7 @@ def _compare_tables_kernel(
     waves,
     workers,
     unroll,
+    emit_ids,
 ):
     worker = lax.axis_index(("core", "subcore"))
     lane = lax.iota(jnp.int32, LANES)
@@ -579,7 +580,7 @@ def _compare_tables_kernel(
 
             plsc.parallel_loop(live_vectors, cap_ranks // LANES, unroll=4)(zero)
             out = pl.ds(pl.multiple_of(g * cap_ranks, LANES), cap_ranks)
-            pltpu.sync_copy(rows_v.at[pl.ds(0, cap_ranks)], rows_hbm.at[out])
+            pltpu.sync_copy((ids_v if emit_ids else rows_v).at[pl.ds(0, cap_ranks)], rows_hbm.at[out])
             pltpu.sync_copy(codes_v.at[pl.ds(0, cap_ranks)], codes_hbm.at[out])
             p0_v[...] = jnp.full((LANES,), usize, jnp.int32)
             pltpu.sync_copy(p0_v, usize_hbm.at[pl.ds(pl.multiple_of(g * LANES, LANES), LANES)])
@@ -589,7 +590,7 @@ def _compare_tables_kernel(
     lax.fori_loop(0, waves, group, None)
 
 
-def compare_sc_tables(bits_flat, page_rows, p0, *, words, union_cap, page_size, ratio=4, unroll=4):
+def compare_sc_tables(bits_flat, page_rows, p0, *, words, union_cap, page_size, ratio=4, unroll=4, emit="rows"):
     """SparseCore build of qsa_compare_core's tables: ``(rows, codes, usize)``, int32 [G, union_cap] twice and
     [G], equal to ``qsa_compare_core``'s XLA reference (``union_lists``, ``slot_rows``, ``slot_codes``).
 
@@ -599,8 +600,11 @@ def compare_sc_tables(bits_flat, page_rows, p0, *, words, union_cap, page_size, 
     rows, 16 words at a time by gathers), the list step's word walk (ids and pool rows by ``store_compressed`` at
     the running rank, whose end is the union size), then 16 ranks at a time each rank's 16 row bits gathered from
     the staged bitset (``compare_code_lanes``). The flat bitset is never re-laid as [G, words, 16], whose 16-wide
-    minor axis XLA pads to 128 lanes.
+    minor axis XLA pads to 128 lanes. ``emit="ids"``: the first output holds each rank's group id (-1 past the
+    union) instead of its pool row.
     """
+    if emit not in ("rows", "ids"):
+        raise ValueError("emit: 'rows' or 'ids'")
     ngroups = page_rows.shape[0]
     if bits_flat.shape != (ngroups * words * COMPARE_T,) or union_cap % LANES or words % 8:
         raise ValueError("bits_flat [G * words * 16] (words a multiple of 8) and a union_cap of whole 16-rank vectors")
@@ -622,6 +626,7 @@ def compare_sc_tables(bits_flat, page_rows, p0, *, words, union_cap, page_size, 
             waves=-(-ngroups // workers),
             workers=workers,
             unroll=unroll,
+            emit_ids=emit == "ids",
         ),
         out_type=(flat, flat, jax.ShapeDtypeStruct((ngroups * LANES,), jnp.int32)),
         mesh=_mesh(sc),

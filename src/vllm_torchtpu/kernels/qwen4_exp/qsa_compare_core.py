@@ -472,10 +472,11 @@ def slot_rows(ids, page_rows, *, page_size):
 
 
 def compare_tables(blocks, lengths, table, *, groups_cap, union_cap, page_size, bitset="tensorcore",
-                   lister="reference"):
+                   lister="reference", emit="rows"):
     """(rows, codes, usize, ok) of an aligned step: the kernel's tables and whether the step takes the core
     (every union within ``union_cap``, and each union group's live rows at consecutive positions from its
-    first row, which the codes' edges assume)."""
+    first row, which the codes' edges assume). ``emit="ids"``: each slot's group id (0 past the union) in place
+    of its pool row, for the held read."""
     tokens = blocks.shape[0]
     ngroups = tokens // T
     words = -(-groups_cap // 32)
@@ -490,11 +491,13 @@ def compare_tables(blocks, lengths, table, *, groups_cap, union_cap, page_size, 
         from vllm_torchtpu.kernels.qwen4_exp import qsa_union_sc_gather as scg
 
         rows, codes, usize = scg.compare_sc_tables(bits, page_rows, p0, words=words, union_cap=union_cap,
-                                                   page_size=page_size)
+                                                   page_size=page_size, emit=emit)
+        if emit == "ids":
+            rows = jnp.maximum(rows, 0)
     elif lister == "reference":
         bits16 = bits.reshape(ngroups, words, T)
         ids, usize = union_lists(bits16, union_cap=union_cap)
-        rows = slot_rows(ids, page_rows, page_size=page_size)
+        rows = jnp.maximum(ids, 0) if emit == "ids" else slot_rows(ids, page_rows, page_size=page_size)
         codes = slot_codes(bits16, ids, p0)
     else:
         raise ValueError("lister: 'reference' or 'sparsecore'")
@@ -508,7 +511,7 @@ def compare_tables(blocks, lengths, table, *, groups_cap, union_cap, page_size, 
 
 def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv_heads, ratio, k_scale=1.0,
                          v_scale=1.0, union_cap, min_context, fallback, depth=8, f8dot=False, guard=True, bitset="tensorcore",
-                         lister="reference", stats=0):
+                         lister="reference", stats=0, held_tokens=0):
     """``(gated bf16 output, cache)`` of a packed prefill step through the compare core.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``. Requests are aligned to 16-row
@@ -520,6 +523,9 @@ def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, 
     group (the work order's k is that over the ~4 of interpolated selections) from a host callback, and also runs
     ``fallback()`` on the same inputs and logs max |core - fallback| / mean |fallback| over live rows; the core's
     output is returned. Adds the callback and the fallback to the program; for an untimed run only.
+
+    ``held_tokens`` (> 0): the held read (``qsa_compare_held``), each sequence's cached KV of one KV head held in
+    VMEM for its pass; a step with a sequence longer than this takes ``fallback()``.
     """
     tokens, query_heads, head_dim = query.shape
     pages, page_size = cache.shape[:2]
@@ -555,9 +561,20 @@ def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, 
         a_query, a_blocks, a_lengths, a_table = layout
         rows, codes, usize, ok = compare_tables(a_blocks, a_lengths, a_table, groups_cap=groups_cap,
                                                 union_cap=union_cap, page_size=page_size, bitset=bitset,
-                                                lister=lister)
+                                                lister=lister, emit="ids" if held_tokens else "rows")
+        if held_tokens:
+            ok &= jnp.max(lengths) <= held_tokens
 
         def run():
+            if held_tokens:
+                from vllm_torchtpu.kernels.qwen4_exp.qsa_compare_held import compare_core_kernel_held
+
+                seq_rows = starts if max_tokens is None else offsets
+                page_rows = a_table.reshape(-1, T, a_table.shape[1])[:, 0]
+                return compare_core_kernel_held(
+                    a_query, rows, codes, jnp.where(ok, usize, 0), a_lengths, seq_rows, page_rows, cache,
+                    union_cap=union_cap, held_tokens=held_tokens, nseq=len(starts) - 1, kv_heads=kv_heads,
+                    k_scale=k_scale, v_scale=v_scale)
             return compare_core_kernel(a_query, rows, codes, jnp.where(ok, usize, 0), cache,
                                        union_cap=union_cap, kv_heads=kv_heads, k_scale=k_scale,
                                        v_scale=v_scale, depth=depth, f8dot=f8dot, guard=guard)
