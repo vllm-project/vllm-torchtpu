@@ -88,32 +88,17 @@ def test_external_sources_with_tokens() -> None:
     }
 
 
-def test_collector_unknown_sources_and_missing_key_handling() -> None:
+def test_collector_unknown_sources_handling() -> None:
     collector = RaidenOffloadStatsCollector(
         storage_backend=None,
     )
 
-    # 1. Disk source without configured storage_backend uses ("disk", "unknown"),
+    # Disk source without configured storage_backend uses ("disk", "unknown"),
     # and DEVICE, EXTERNAL_UNSPECIFIED, or non-CacheHitSource values raise.
     assert collector.source_labels(CacheHitSource.DISK) == ("disk", "unknown")
     for invalid in (CacheHitSource.DEVICE, CacheHitSource.EXTERNAL_UNSPECIFIED, "host"):
         with pytest.raises(ValueError, match="Unsupported offload source"):
             collector.source_labels(cast(Any, invalid))
-
-    # 2. Missing key in _step_key_sources returns None from get_load_sub_sources
-    # and is skipped by compute_load_tokens_by_source rather than mislabeled.
-    missing_key = make_offload_key(b"missing", 0)
-    assert collector.get_load_sub_sources(missing_key) is None
-    assert (
-        collector.compute_load_tokens_by_source(
-            start_token=0,
-            end_token=16,
-            load_key_ranges=[(0, 16, missing_key)],
-            tokens_per_chunk_by_group={0: 16},
-        )
-        == {}
-    )
-    assert collector.pop_stats() is None
 
 
 def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
@@ -122,13 +107,11 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     # 1. Single attention key (64 tokens, 4 x 16-token sub-blocks):
     # 3 HOST + 1 DISK sub-blocks form 2 runs -> 48 HOST + 16 DISK.
     k_dense = make_offload_key(b"dense0", 0)
-    collector.record_prepared_load(
-        {k_dense: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))}
-    )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
         end_token=64,
         load_key_ranges=[(0, 64, k_dense)],
+        key_sources={k_dense: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))},
         tokens_per_chunk_by_group={0: 64},
     ) == {
         CacheHitSource.HOST: 48,
@@ -137,19 +120,17 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
 
     # 2. Partial-tail range [0, 48) on a 64-token chunk excludes t3 ([48, 64)).
     k_tail = make_offload_key(b"tail0", 0)
-    collector.record_prepared_load(
-        {
+    assert collector.compute_load_tokens_by_source(
+        start_token=0,
+        end_token=48,
+        load_key_ranges=[(0, 48, k_tail)],
+        key_sources={
             k_tail: (
                 (CacheHitSource.HOST, 2),
                 (CacheHitSource.P2P, 1),
                 (CacheHitSource.DISK, 1),
             )
-        }
-    )
-    assert collector.compute_load_tokens_by_source(
-        start_token=0,
-        end_token=48,
-        load_key_ranges=[(0, 48, k_tail)],
+        },
         tokens_per_chunk_by_group={0: 64},
     ) == {
         CacheHitSource.HOST: 32,
@@ -160,16 +141,14 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     # key, and a key of 384 HOST + 128 DISK sub-blocks in 2 runs.
     k_big0 = make_offload_key(b"big0", 0)
     k_big_mixed = make_offload_key(b"big_mixed", 0)
-    collector.record_prepared_load(
-        {
-            k_big0: ((CacheHitSource.HOST, 512),),
-            k_big_mixed: ((CacheHitSource.HOST, 384), (CacheHitSource.DISK, 128)),
-        }
-    )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
         end_token=16384,
         load_key_ranges=[(0, 8192, k_big0), (8192, 16384, k_big_mixed)],
+        key_sources={
+            k_big0: ((CacheHitSource.HOST, 512),),
+            k_big_mixed: ((CacheHitSource.HOST, 384), (CacheHitSource.DISK, 128)),
+        },
         tokens_per_chunk_by_group={0: 8192},
     ) == {
         CacheHitSource.HOST: 8192 + 6144,
@@ -181,17 +160,15 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     k_a0 = make_offload_key(b"a0", 0)
     k_a1 = make_offload_key(b"a1", 0)
     k_m1 = make_offload_key(b"m1", 1)
-    collector.record_prepared_load(
-        {
-            k_a0: ((CacheHitSource.HOST, 4),),
-            k_a1: ((CacheHitSource.HOST, 2), (CacheHitSource.P2P, 2)),
-            k_m1: ((CacheHitSource.HOST, 4),),
-        }
-    )
+    attention_sources = {
+        k_a0: ((CacheHitSource.HOST, 4),),
+        k_a1: ((CacheHitSource.HOST, 2), (CacheHitSource.P2P, 2)),
+    }
     assert collector.compute_load_tokens_by_source(
         start_token=0,
         end_token=32,
         load_key_ranges=[(0, 16, k_a0), (16, 32, k_a1), (0, 32, k_m1)],
+        key_sources={**attention_sources, k_m1: ((CacheHitSource.HOST, 4),)},
         tokens_per_chunk_by_group={0: 16, 1: 16},
         mamba_group_ids={1},
     ) == {
@@ -201,13 +178,14 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
 
     # If Mamba's indivisible checkpoint has one byte slice in DISK, the whole
     # prefix [0, 32) depends on that DISK checkpoint -> {DISK: 32}.
-    collector.record_prepared_load(
-        {k_m1: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))}
-    )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
         end_token=32,
         load_key_ranges=[(0, 16, k_a0), (16, 32, k_a1), (0, 32, k_m1)],
+        key_sources={
+            **attention_sources,
+            k_m1: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1)),
+        },
         tokens_per_chunk_by_group={0: 16, 1: 16},
         mamba_group_ids={1},
     ) == {
@@ -237,14 +215,12 @@ def test_compute_load_tokens_by_source_clips_mixed_key_to_hit_range(
     collector = RaidenOffloadStatsCollector(storage_backend="posix")
     # A 64-token key with four 16-token sub-blocks: two in host DRAM, two on disk.
     key = make_offload_key(b"mixed", 0)
-    collector.record_prepared_load(
-        {key: ((CacheHitSource.HOST, 2), (CacheHitSource.DISK, 2))}
-    )
     assert (
         collector.compute_load_tokens_by_source(
             start_token=start_token,
             end_token=end_token,
             load_key_ranges=[(*key_range, key)],
+            key_sources={key: ((CacheHitSource.HOST, 2), (CacheHitSource.DISK, 2))},
             tokens_per_chunk_by_group={0: 64},
         )
         == expected
@@ -272,13 +248,11 @@ def test_compute_load_tokens_by_source_unsplit_key_uses_slowest_tier(
     )
     collector = RaidenOffloadStatsCollector(storage_backend="posix")
     key = make_offload_key(b"mixed", 0)
-    collector.record_prepared_load(
-        {key: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))}
-    )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
         end_token=64,
         load_key_ranges=[(0, 64, key)],
+        key_sources={key: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))},
         tokens_per_chunk_by_group=tokens_per_chunk_by_group,
         mamba_group_ids=mamba_group_ids,
     ) == {CacheHitSource.DISK: 64}

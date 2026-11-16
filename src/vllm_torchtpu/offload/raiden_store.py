@@ -251,11 +251,20 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     `pinned` is set to False if `prepare_load` lost the race against eviction
     before acquiring pins. The load job then fails cleanly at submit time,
     allowing vLLM to recompute the blocks.
+
+    `key_sources` has, for each key of a pinned load, the tier that the load
+    reads each of its sub-blocks from.
     """
 
-    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
+    def __init__(
+        self,
+        keys: list[OffloadKey],
+        pinned: bool = True,
+        key_sources: Mapping[OffloadKey, SubBlockSourceCounts] | None = None,
+    ):
         self.keys = keys
         self.pinned = pinned
+        self.key_sources = key_sources or {}
         self.tokens_by_source: dict[CacheHitSource, int] | None = None
 
     def __repr__(self) -> str:
@@ -539,11 +548,13 @@ class RaidenOffloadingManager(OffloadingManager):
         start_token: int,
         end_token: int,
         load_key_ranges: Iterable[tuple[int, int, OffloadKey]],
+        key_sources: Mapping[OffloadKey, SubBlockSourceCounts],
     ) -> dict[CacheHitSource, int]:
         return self._metrics.compute_load_tokens_by_source(
             start_token=start_token,
             end_token=end_token,
             load_key_ranges=load_key_ranges,
+            key_sources=key_sources,
             tokens_per_chunk_by_group=self._tokens_per_chunk_by_group,
             mamba_group_ids=self._mamba_group_ids,
         )
@@ -851,10 +862,9 @@ class RaidenOffloadingManager(OffloadingManager):
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
-        self._metrics.record_prepared_load(
-            self._key_sources(keys, sub_hashes, remote_slices)
+        return RaidenLoadStoreSpec(
+            keys, key_sources=self._key_sources(keys, sub_hashes, remote_slices)
         )
-        return RaidenLoadStoreSpec(keys)
 
     def _key_sources(
         self,
@@ -990,7 +1000,6 @@ class RaidenOffloadingManager(OffloadingManager):
         # read_remote. Drop the leftovers each step; a request retried
         # next step re-runs lookup() and repopulates the stash.
         self._remote_slices.clear()
-        self._metrics.on_schedule_end()
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         return self._metrics.pop_stats()

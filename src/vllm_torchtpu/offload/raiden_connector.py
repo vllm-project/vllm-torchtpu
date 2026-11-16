@@ -246,14 +246,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             # Evicted before prepare_load acquired pins: no confirmed Raiden
             # cache hit and no transfer job will run on the store.
             return
-        # Attribute the hit while prepare_load's per-key tiers are recorded
-        # (they are cleared at the end of the scheduler step).
         req_status = self._req_status[request.request_id]
         start_token = req_status.num_locally_computed_tokens
         src_spec.tokens_by_source = self._raiden_manager.compute_load_tokens_by_source(
             start_token=start_token,
             end_token=start_token + num_external_tokens,
             load_key_ranges=req_status.load_key_ranges,
+            key_sources=src_spec.key_sources,
         )
         self._raiden_manager.record_admission_hits(
             src_spec.tokens_by_source, preempted=request.num_preemptions > 0
@@ -266,9 +265,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
         vLLM's scheduler records the result in
         `vllm:prompt_tokens_cached_by_source`. It calls this right after
-        `update_state_after_alloc`, which computes the split while this step's
-        `prepare_load` tiers are recorded. For example, a 1536-token hit with
-        768 tokens in host DRAM and 768 on disk returns `{HOST: 768, DISK: 768}`.
+        `update_state_after_alloc`, which computes the split from the tiers
+        that `prepare_load` returned. For example, a 1536-token hit with 768
+        tokens in host DRAM and 768 on disk returns `{HOST: 768, DISK: 768}`.
         """
         if num_external_tokens == 0:
             return {}

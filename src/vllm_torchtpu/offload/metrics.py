@@ -18,8 +18,8 @@ In vLLM V1, the scheduler (`EngineCore`) and Prometheus `/metrics` endpoint
 Host/Peer/Storage transfers from the scheduler-side `KVCacheStore` controller
 (worker-side `get_finished()` is always empty):
 
-- `RaidenOffloadStatsCollector` runs in `EngineCore`, tracking per-sub-block
-  tier residency and deduplicated token counts, draining per-step deltas as
+- `RaidenOffloadStatsCollector` runs in `EngineCore`, computing deduplicated
+  token counts per tier and draining per-step deltas as
   `OffloadingConnectorStats` via `pop_stats()`.
 - `RaidenOffloadPromMetrics` runs in the API server process, registering
   Raiden's `OffloadingSpec` metric definitions and applying IPC stats deltas to
@@ -201,9 +201,6 @@ class RaidenOffloadStatsCollector:
     def __init__(self, *, storage_backend: str | None = None):
         self._storage_backend = storage_backend
         self._stats = OffloadingConnectorStats()
-        # Sub-block tiers of each key pinned this step, recorded by
-        # `record_prepared_load` and cleared in `on_schedule_end()`.
-        self._step_key_sources: dict[OffloadKey, SubBlockSourceCounts] = {}
 
     def source_labels(self, source: CacheHitSource) -> tuple[str, str]:
         """Map an external `CacheHitSource` to `(source, backend)` labels.
@@ -235,36 +232,20 @@ class RaidenOffloadStatsCollector:
             return (CacheHitSource.DISK.value, self._storage_backend)
         raise ValueError(f"Unsupported offload source for metrics: {source!r}")
 
-    def record_prepared_load(
-        self, key_sources: Mapping[OffloadKey, SubBlockSourceCounts]
-    ) -> None:
-        """Record the tiers of the keys that one `prepare_load` accepted."""
-        self._step_key_sources.update(key_sources)
-
-    def get_load_sub_sources(self, key: OffloadKey) -> SubBlockSourceCounts | None:
-        """Return the `SubBlockSourceCounts` recorded for `key`, or `None` on miss."""
-        source_counts = self._step_key_sources.get(key)
-        if source_counts:
-            return source_counts
-        logger.warning_once(
-            "TPURaidenOffloadingConnector: offload key missed step source cache; "
-            "skipping offload metric attribution for unrecorded key."
-        )
-        return None
-
     def compute_load_tokens_by_source(
         self,
         *,
         start_token: int,
         end_token: int,
         load_key_ranges: Iterable[tuple[int, int, OffloadKey]],
+        key_sources: Mapping[OffloadKey, SubBlockSourceCounts],
         tokens_per_chunk_by_group: Mapping[int, int],
         mamba_group_ids: Collection[int] = (),
     ) -> dict[CacheHitSource, int]:
         """Compute deduplicated external token counts at sub-block granularity.
 
         Phase 1 converts each key's clipped `[lo, hi)` span into interval events
-        from its `SubBlockSourceCounts`:
+        from its `SubBlockSourceCounts` in `key_sources`:
         - Uniform keys (`len(source_counts) == 1`) emit a single `[lo, hi)`
           interval in O(1) regardless of `device_block_size_factor`.
         - Mixed Attention keys split `[lo, hi)` across `(source, count)` pairs
@@ -275,14 +256,12 @@ class RaidenOffloadStatsCollector:
           restore that checkpoint, so `[lo, hi)` uses `CacheHitSource.outermost`.
         - A mixed key that cannot be split evenly by sub-block also uses
           `CacheHitSource.outermost`, and logs a warning.
-        - Keys missing from `_step_key_sources` are skipped rather than
-          mislabeled as `EXTERNAL_UNSPECIFIED`.
 
         Phase 2 sweeps sorted event boundaries across `[start_token, end_token)`
         to deduplicate overlapping ranges emitted by multi-group / hybrid models
         for the same prompt tokens, attributing shared spans via
         `CacheHitSource.outermost` (the slowest tier required to materialize the
-        span). Tokens no recorded key covers are left out; `split_external_hit`
+        span). Tokens no key covers are left out; `split_external_hit`
         reports them to upstream as `EXTERNAL_UNSPECIFIED`.
 
         For example, in a hybrid model whose attention keys for tokens
@@ -301,9 +280,7 @@ class RaidenOffloadStatsCollector:
             hi = min(end_token, raw_hi)
             if lo >= hi:
                 continue
-            source_counts = self.get_load_sub_sources(key)
-            if source_counts is None:
-                continue
+            source_counts = key_sources[key]
             if len(source_counts) == 1:
                 only_source = source_counts[0][0]
                 events.extend(((lo, 1, only_source), (hi, -1, only_source)))
@@ -353,9 +330,6 @@ class RaidenOffloadStatsCollector:
             active[source] += delta
             position = boundary
         return external_sources_with_tokens(sources)
-
-    def on_schedule_end(self) -> None:
-        self._step_key_sources.clear()
 
     def record_admission_hits(
         self,
