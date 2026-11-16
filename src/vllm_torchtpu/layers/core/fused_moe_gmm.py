@@ -624,6 +624,7 @@ def moe_gmm(
             fuse_act=activation,
             preferred_element_type=x.dtype,
             maybe_quantize_lhs=False,
+            max_group_size=num_tokens,
         )
     else:
         gmm1_res = gmm_wrapper(
