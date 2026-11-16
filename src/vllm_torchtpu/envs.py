@@ -812,6 +812,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # but today they route like real tokens and every expert they touch costs
     # its weight read. Needs TPU_MOE_SKIP_PADDED_TOKENS=1. Default off.
     "TPU_MOE_NVFP4_SKIP_PADDED": env_bool("TPU_MOE_NVFP4_SKIP_PADDED"),
+    # NVFP4 decode MoE: run gmm_v2_mlp calls of at most <max size_m> rows as
+    # one streamed kernel (kernels/megablox/gmm_decode_stream.py) that feeds
+    # every hit expert's gate_up then down weights as <chunk_rows>-row k-slices
+    # through <slots> VMEM slots, so one chunk (not one whole expert block per
+    # gmm) is exposed per call. "<chunk_rows>:<slots>[@<max size_m>]", "on" =
+    # 768:4@512. Same numerics as the fp8 rhs feed. Empty = off.
+    "TPU_GMM_V2_DECODE_STREAM": env_str("TPU_GMM_V2_DECODE_STREAM", ""),
     # TPU_MOE_SKIP_PADDED_TOKENS drops padded rows from the grouped matmul only
     # in batches of at least this many routes (T * top_k); smaller batches run
     # them as with the skip off (bitwise for real rows). 0 = every size.
