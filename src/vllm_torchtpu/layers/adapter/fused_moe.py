@@ -294,6 +294,13 @@ def fused_moe_gmm(
     check_padded_row_filter(
         skip_padded_tokens, padded_row_filter, has_row_info=row_info is not None
     )
+    if row_info is not None and (
+        row_info.numel() != 1 or row_info.dtype != torch.int32
+    ):
+        raise ValueError(
+            "row_info must be a 1-element int32 tensor, got shape "
+            f"{tuple(row_info.shape)} and dtype {row_info.dtype}."
+        )
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,

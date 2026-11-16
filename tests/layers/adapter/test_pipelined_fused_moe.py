@@ -16,6 +16,7 @@
 import inspect
 import os
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -549,6 +550,26 @@ class TestMoEForwardPrecisionBranches:
                 **extra_kwargs,
             )
 
+    def test_pipelined_fused_moe_rejects_a_filter_that_is_not_the_enum(self):
+        not_the_enum: Any = PaddedRowFilter.ZERO_WEIGHT.value
+        with pytest.raises(TypeError, match="PaddedRowFilter"):
+            pipelined_fused_moe_gmm(
+                hidden_states=torch.randn(4, 64, dtype=torch.bfloat16),
+                w1=torch.empty(0),
+                w2=torch.empty(0),
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=None,
+                w2_bias=None,
+                topk_weights=torch.ones(4, 2, dtype=torch.bfloat16) * 0.5,
+                topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+                experts_start=None,
+                topk=2,
+                activation="silu",
+                skip_padded_tokens=True,
+                padded_row_filter=not_the_enum,
+            )
+
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_fp8_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
         """Verify FP8 apply_monolithic passes identical valid
@@ -624,6 +645,7 @@ class TestMoEForwardPrecisionBranches:
         method = MagicMock()
         method._tpu_activation_str = "silu"
         method._skip_padded_tokens = False
+        method._padded_row_filter = PaddedRowFilter.ZERO_WEIGHT
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
@@ -662,6 +684,8 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        assert bound.arguments["padded_row_filter"] is PaddedRowFilter.ZERO_WEIGHT
+        assert "row_info" not in call_kwargs
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_mxfp4_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):

@@ -356,6 +356,10 @@ def check_padded_row_filter(
     ``has_row_info=None`` skips the ``row_info`` check (kernel prebuild, which
     has no tensor yet).
     """
+    if not isinstance(padded_row_filter, PaddedRowFilter):
+        raise TypeError(
+            f"padded_row_filter must be a PaddedRowFilter, got {padded_row_filter!r}."
+        )
     if padded_row_filter is PaddedRowFilter.ROW_COUNT and not skip_padded_tokens:
         raise ValueError("PaddedRowFilter.ROW_COUNT requires skip_padded_tokens=True.")
     if has_row_info is not None and has_row_info != (

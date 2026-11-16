@@ -246,6 +246,10 @@ def pipelined_fused_moe_gmm(
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
+    if not isinstance(padded_row_filter, PaddedRowFilter):
+        raise TypeError(
+            f"padded_row_filter must be a PaddedRowFilter, got {padded_row_filter!r}."
+        )
     if padded_row_filter is PaddedRowFilter.ROW_COUNT or row_info is not None:
         raise NotImplementedError(
             "pipelined_fused_moe_gmm does not support PaddedRowFilter.ROW_COUNT "
