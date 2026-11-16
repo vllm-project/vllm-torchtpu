@@ -75,6 +75,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
 from vllm_torchtpu.layers.adapter import (
+    moe_permute,
     moe_redundant,
     moe_route_trace,
     moe_routing,
@@ -360,6 +361,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # Redundant experts (VLLM_TPU_MOE_REDUNDANT_EXPERTS): extra local slots
         # for copies of other ranks' experts; 0 when off.
         num_experts += moe_redundant.prepare(layer)
+        # Static expert permutation (VLLM_TPU_MOE_EXPERT_PERMUTATION): permuted
+        # global->local expert map before the weights load; off by default.
+        moe_permute.prepare(layer)
         ModelOptNvFp4FusedMoE.create_weights(
             self,
             layer,
@@ -437,6 +441,10 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
         else:
             op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
+        if op is not None and getattr(layer, "_perm_logical_to_physical", None):
+            raise NotImplementedError(
+                "VLLM_TPU_MOE_EXPERT_PERMUTATION with an admitted fused EP MoE layer"
+            )
         if op is not None and getattr(layer, "_rx_plan", None) is not None:
             # USE_MOE_FUSED_EP_KERNEL may be set while this layer stays on the
             # GMM path (op None); an admitted fused EP layer would need the
@@ -506,6 +514,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         moe_redundant.install(layer)
+        moe_permute.install(layer)
         moe_route_trace.register(layer)
         if envs.TPU_MOE_NVFP4_SKIP_PADDED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
             _log_skip_padded_once()
@@ -622,6 +631,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             # Logical -> physical slot ids (identity for layers without
             # replicas); experts_start below is then rank * slots.
             topk_ids = moe_redundant.to_physical(layer, topk_ids, topk_weights)
+        if moe_permute.ENABLED:
+            # Logical -> permuted physical ids; experts_start stays rank * L.
+            topk_ids = moe_permute.to_physical(layer, topk_ids)
         return topk_weights, topk_ids
 
     def shared_in_combine_supported(self) -> bool:
