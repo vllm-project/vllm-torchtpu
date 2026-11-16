@@ -31,6 +31,7 @@ from ...decls import (
 )
 from ...errors import MegakernelConfigError
 from ...ops import BF16, F32, FP8
+from .params import validate_moe_geometry
 
 MOE_WEIGHT_NAMES: tuple[str, ...] = ("sh13", "sh2", "e13", "e2")
 
@@ -85,11 +86,18 @@ MOE_OPTIONS: dict[str, Any] = {
 
 
 def _moe_ew(g: Any, R: int) -> int:
-    e_slots = int(g.options.get("e_slots", g.values.get("e_slots", 0)))
-    if e_slots > 0:
-        return e_slots
+    e_slots = int(g.options.get("e_slots", g.values.get("e_slots", 0)) or 0)
     moe_tp = bool(g.options.get("moe_tp", g.values.get("moe_tp", True)))
-    return int(g.E) if moe_tp else int(g.E) // R
+    _, _, _, ew = validate_moe_geometry(
+        E=int(g.E),
+        R=R,
+        TOPK=int(g.TOPK),
+        IS=int(g.IS),
+        I=int(g.I),
+        moe_tp=moe_tp,
+        e_slots=e_slots,
+    )
+    return ew
 
 
 MOE_GEOMETRY_METHODS: dict[str, Any] = {
@@ -158,7 +166,7 @@ def moe_hf_params(
     p = f"{prefix}." if prefix else ""
     H, E, IS = int(geom.H), int(geom.E), int(geom.IS)
     inter_dim = int(geom.I)
-    moe_tp = bool(getattr(geom, "moe_tp", True)) if moe_tp is None else bool(moe_tp)
+    moe_tp = bool(geom.moe_tp) if moe_tp is None else bool(moe_tp)
     shard_e13 = -1 if moe_tp else 0
     shard_e2 = 1 if moe_tp else 0
     shard_e2_s = None if moe_tp else 0
@@ -172,6 +180,7 @@ def moe_hf_params(
             else None
         )
     )
+    validate_moe_options({"shared_gate": shared_gate, "weight_dtypes": raw_wd})
     w_dt = normalize_weight_dtypes(
         raw_wd, MOE_WEIGHT_NAMES, "MoEModule", MegakernelConfigError
     )
@@ -303,37 +312,34 @@ def moe_hf_params(
             ),
             init=ParamInit(mean=0.0, std=0.1),
         ),
+        HFParamDecl(
+            name=_n("sh_gate"),
+            hf_name=f"{p}shared_expert_gate.weight",
+            shape=(H,),
+            hf_shape=(1, H),
+            dtype=F32,
+            transform=ParamTransform(
+                shard_axis=None, replicate_ranks=True, small_field="sh_gate"
+            ),
+            vllm_aliases=(
+                VLLMAlias(
+                    source=f"{p}_fused_se_gate_weight",
+                    targets=(_n("sh_gate"),),
+                    already_sharded=False,
+                    already_fp8=False,
+                    flipped=False,
+                ),
+                VLLMAlias(
+                    source=f"{p}shared_expert_gate.weight",
+                    targets=(_n("sh_gate"),),
+                    already_sharded=False,
+                    already_fp8=False,
+                    flipped=False,
+                ),
+            ),
+            init=ParamInit(mean=0.0, std=0.1),
+        ),
     ]
-    if shared_gate:
-        decls.append(
-            HFParamDecl(
-                name=_n("sh_gate"),
-                hf_name=f"{p}shared_expert_gate.weight",
-                shape=(H,),
-                hf_shape=(1, H),
-                dtype=F32,
-                transform=ParamTransform(
-                    shard_axis=None, replicate_ranks=True, small_field="sh_gate"
-                ),
-                vllm_aliases=(
-                    VLLMAlias(
-                        source=f"{p}_fused_se_gate_weight",
-                        targets=(_n("sh_gate"),),
-                        already_sharded=False,
-                        already_fp8=False,
-                        flipped=False,
-                    ),
-                    VLLMAlias(
-                        source=f"{p}shared_expert_gate.weight",
-                        targets=(_n("sh_gate"),),
-                        already_sharded=False,
-                        already_fp8=False,
-                        flipped=False,
-                    ),
-                ),
-                init=ParamInit(mean=0.0, std=0.1),
-            )
-        )
     sh_gu_alias = (
         VLLMAlias(
             source=f"{p}shared_expert.gate_up_proj",

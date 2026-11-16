@@ -54,7 +54,7 @@ class MoEParams:
     topk_packed: bool
     topk_lanes: bool
     # Resolved vectorized routing flag (`MoETunables.route_vec` gated by static
-    # preconditions in `MoEModule.plan_params`).
+    # preconditions in `derive_moe_params`).
     route_vec: bool
     r2_direct_store: bool
     unroll: bool
@@ -82,7 +82,7 @@ class MoETunables:
     pipe_ep: bool = False  # Software-pipeline EP experts with T13 == 2 * T2
     r2_direct_store: bool = False  # Direct VMEM store on r2 tile 0
     # Vectorized MXU expert route packing (a distinct routing/Po2C policy that
-    # supersedes `ecopy_opt` whenever its static gate in `MoEModule.plan_params`
+    # supersedes `ecopy_opt` whenever its static gate in `derive_moe_params`
     # holds; resolved into `MoEParams.route_vec`)
     route_vec: bool = False
     topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
@@ -107,7 +107,7 @@ class MoETunables:
 class MoEDebug:
     """`MoEModule` debug flags (`DebugOptions.modules["moe"]`), not tuning knobs.
 
-    Each flag adds a kernel input (`MoEModule.extra_inputs`): `forced_routing`
+    Each flag gates an optional kernel input: `forced_routing`
     routes from an external `rbias` HBM input `[L, M, E]` per rank instead of
     the router's probabilities (the expert weights still come from the
     router); `row_mask` builds the routed-expert list only from the rows whose
@@ -121,6 +121,52 @@ class MoEDebug:
 
 register_tunables("moe", MoETunables)
 register_debug("moe", MoEDebug)
+
+_ROUTE_VEC_FALLBACK_LOGGED: set[tuple[Any, ...]] = set()
+
+
+def validate_moe_geometry(
+    *,
+    E: int,
+    R: int,
+    TOPK: int,
+    IS: int,
+    I: int,  # noqa: E741
+    moe_tp: bool,
+    e_slots: int,
+) -> tuple[int, int, int, int]:
+    """Validate MoE rank/expert/intermediate geometry and return `(er, isr, ir, ew)`."""
+    if R <= 0:
+        raise MegakernelConfigError(f"MoE R={R} must be >= 1")
+    if E <= 0 or E % R != 0:
+        raise MegakernelConfigError(f"MoE E={E} must be a positive multiple of R={R}")
+    if TOPK <= 0 or min(E, 128) < TOPK:
+        raise MegakernelConfigError(
+            f"MoE TOPK={TOPK} must satisfy 1 <= TOPK <= min(E={E}, 128)"
+        )
+    if IS <= 0 or IS % R != 0:
+        raise MegakernelConfigError(f"MoE IS={IS} must be a positive multiple of R={R}")
+    if I <= 0 or (moe_tp and I % R != 0):
+        raise MegakernelConfigError(
+            f"MoE I={I} must be > 0"
+            + (f" and divisible by R={R} when moe_tp=True" if moe_tp else "")
+        )
+    er = E // R
+    isr = IS // R
+    ir = I // R if moe_tp else I
+    if e_slots < 0:
+        raise MegakernelConfigError(f"e_slots={e_slots} must be >= 0")
+    if moe_tp and e_slots not in (0, E):
+        raise MegakernelConfigError(
+            "moe_tp=True does not support redundant expert slots "
+            f"(got e_slots={e_slots} for E={E})"
+        )
+    if not moe_tp and 0 < e_slots < er:
+        raise MegakernelConfigError(
+            f"e_slots={e_slots} must be 0 or >= ER={er} when moe_tp=False"
+        )
+    ew = e_slots if e_slots > 0 else (E if moe_tp else er)
+    return er, isr, ir, ew
 
 
 def derive_moe_params(
@@ -144,49 +190,24 @@ def derive_moe_params(
             f"MoEModule requires execution on every layer (got {moe_layers} "
             f"of L={g.L} layers)"
         )
-    if ex.R <= 0:
-        raise MegakernelConfigError(f"MoE R={ex.R} must be >= 1")
     if tt.topk and not (g.E > 0 and (g.E - 1).bit_length() <= 9):
         raise MegakernelConfigError(
             "topk_packed requires 1 <= E <= 512 ((E - 1).bit_length() <= 9 "
             f"for 9-bit float32 mantissa packing), got E={g.E}"
         )
-    if g.E <= 0 or g.E % ex.R != 0:
-        raise MegakernelConfigError(
-            f"MoE E={g.E} must be a positive multiple of R={ex.R}"
-        )
-    if g.TOPK <= 0 or min(g.E, 128) < g.TOPK:
-        raise MegakernelConfigError(
-            f"MoE TOPK={g.TOPK} must satisfy 1 <= TOPK <= min(E={g.E}, 128)"
-        )
-    if g.IS <= 0 or g.IS % ex.R != 0:
-        raise MegakernelConfigError(
-            f"MoE IS={g.IS} must be a positive multiple of R={ex.R}"
-        )
-    if g.I <= 0 or (moe_tp and g.I % ex.R != 0):
-        raise MegakernelConfigError(
-            f"MoE I={g.I} must be > 0"
-            + (f" and divisible by R={ex.R} when moe_tp=True" if moe_tp else "")
-        )
     if tt.ecopy_opt not in (0, 1):
         raise MegakernelConfigError(
             f"MoETunables.ecopy_opt must be 0 or 1, got {tt.ecopy_opt!r}"
         )
-    er = g.E // ex.R
-    isr = g.IS // ex.R
-    ir = g.I // ex.R if moe_tp else g.I
-    if e_slots < 0:
-        raise MegakernelConfigError(f"e_slots={e_slots} must be >= 0")
-    if moe_tp and e_slots not in (0, g.E):
-        raise MegakernelConfigError(
-            "moe_tp=True does not support redundant expert slots "
-            f"(got e_slots={e_slots} for E={g.E})"
-        )
-    if not moe_tp and 0 < e_slots < er:
-        raise MegakernelConfigError(
-            f"e_slots={e_slots} must be 0 or >= ER={er} when moe_tp=False"
-        )
-    ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
+    er, isr, ir, ew = validate_moe_geometry(
+        E=g.E,
+        R=ex.R,
+        TOPK=g.TOPK,
+        IS=g.IS,
+        I=g.I,
+        moe_tp=moe_tp,
+        e_slots=e_slots,
+    )
     extra = ew - er
     if g.H <= 0 or g.H % 128 != 0:
         raise MegakernelConfigError(f"Dimension H={g.H} must be a multiple of 128")
@@ -216,29 +237,26 @@ def derive_moe_params(
             f"(got ecopy=True with moe_tp=False, e_slots={e_slots} > ER={er})"
         )
     nb_picks = round_up(ex.B * g.TOPK, 128)
-    route_vec = bool(
-        tt.route_vec
-        and ecopy  # redundant-expert placement table active
-        and g.E > 0
-        and g.E % 128 == 0  # 128-lane expert bitmask tiling
-        and (g.E >> 5) <= 256  # packed bitmask rows fit 256-lane scratch
-        and g.E // 128 + 1 <= ex.MR  # MROW + 1 <= MR for route_topk scratch
-        and ex.R * extra + ex.R + 1 <= 128  # NCP + R + 1 <= 128 VREG lanes
-        and nb_picks >= er  # elist/wlist capacity covers ER local slots
+    route_vec_checks = (
+        ("ecopy", ecopy),  # redundant-expert placement table active
+        ("E % 128 == 0", g.E % 128 == 0),  # 128-lane expert bitmask tiling
+        ("(E >> 5) <= 256", (g.E >> 5) <= 256),  # bitmask rows fit 256-lane scratch
+        ("E // 128 + 1 <= MR", g.E // 128 + 1 <= ex.MR),  # MROW + 1 <= MR scratch
+        ("R * extra + R + 1 <= 128", ex.R * extra + ex.R + 1 <= 128),  # <= 128 lanes
+        ("nb_picks >= ER", nb_picks >= er),  # elist/wlist covers ER local slots
     )
-    if tt.route_vec and not route_vec:
-        logger.debug(
-            "MoETunables.route_vec=True disabled for E=%d, R=%d, B=%d, MR=%d, "
-            "ecopy=%s, extra=%d, nb_picks=%d, er=%d",
-            g.E,
-            ex.R,
-            ex.B,
-            ex.MR,
-            ecopy,
-            extra,
-            nb_picks,
-            er,
-        )
+    failed_rvec = [name for name, ok in route_vec_checks if not ok]
+    route_vec = bool(tt.route_vec and not failed_rvec)
+    if tt.route_vec and failed_rvec:
+        log_key = (g.E, ex.R, ex.B, ex.MR, ecopy, extra, nb_picks, er)
+        if log_key not in _ROUTE_VEC_FALLBACK_LOGGED:
+            _ROUTE_VEC_FALLBACK_LOGGED.add(log_key)
+            logger.info(
+                "MoETunables.route_vec=True disabled (failed: %s) for E=%d, R=%d, "
+                "B=%d, MR=%d, ecopy=%s, extra=%d, nb_picks=%d, er=%d",
+                ", ".join(failed_rvec),
+                *log_key,
+            )
     return MoEParams(
         H=g.H,
         E=g.E,
