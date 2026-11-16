@@ -1384,6 +1384,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # read offsets / int32 checkpoint ids, followed by the rolled
             # per-sequence inputs (see gdn_step_metadata). Checkpoint variant:
             # followed by the checkpoint offsets and blocks.
+            plain = not (hoisted or prefill_ckpt or kernel_metadata)
+            if (
+                plain
+                and len(step_metadata) == 2
+                and stacked_state_indices is None
+                and layer_row is None
+            ):
+                # The stacked rows passed positionally after ckpt_indices
+                # (VLLM_TPU_GDN_LEAN_GLUE's operand order): the plain op takes
+                # no step metadata, so the two trailing operands are those.
+                stacked_state_indices, layer_row = step_metadata
+                step_metadata = ()
             assert len(step_metadata) == (
                 5
                 if hoisted
