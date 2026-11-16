@@ -47,6 +47,12 @@ _FP4_PREFETCH = 2
 _START_UNROLL = 4
 # Rows of ones `attend_t` appends to v^T for the softmax sums: one sublane tile.
 _SUM_ROWS = 8
+# Groups of more pages than this issue the next group's page copies from
+# inside their body (`_kernel`'s issue_next), in calls of one KV head: in
+# the every-head kernel (c64 DCP 8 decode rows) the extra body code cost
+# +1.5 % (twin j-d5d8af02 vs j-098b7ff3), while c48's 4-bit calls gained
+# 3-5 % in decode and mixed steps (j-a0b43b89 vs j-b068ae08).
+_INLINE_ISSUE_PAGES = 16
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -75,6 +81,7 @@ def _kernel(
     groups_per_tile: int = 1,
     transposed: bool = False,
     steps_per_call: int | None = None,
+    inline_issue: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -199,14 +206,36 @@ def _kernel(
 
             jax.lax.fori_loop(done, count, start1, 0)
 
+        nxt = w + ring - 1
+
+        def issue_next():
+            """`start_group` of the group `ring - 1` ahead as straight-line,
+            predicated copies of every slot: inside a wide body the scalar
+            address work and descriptor issue share bundles with the vector
+            work instead of running as a loop of their own ahead of it."""
+            valid = nxt < num_groups
+            group = jnp.where(valid, nxt, 0)
+            base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
+            count = jnp.where(valid, work_count_ref[group], 0)
+            for g in range(pages_per_step):
+                page = page_table_ref[jnp.maximum(work_page_ref[base + g], 0)]
+
+                @pl.when(g < count)
+                def _start(g=g, page=page):
+                    for copy in page_copies(nxt % ring, g, page):
+                        copy.start(priority=g % 2)
+
+        # Groups this wide issue the next group's copies inside their body.
+        inline = inline_issue and count > _INLINE_ISSUE_PAGES
+
         @pl.when(w == 0)
         def _first():
             for d in range(ring - 1):
                 pl.when(d < num_groups)(functools.partial(start_group, d, d))
 
-        @pl.when(w + ring - 1 < num_groups)
+        @pl.when((nxt < num_groups) & jnp.logical_not(inline))
         def _next():
-            start_group(w + ring - 1, (w + ring - 1) % ring)
+            start_group(nxt, nxt % ring)
 
         # One wait per set bit of `count` (the source only sizes the wait).
         n = 1
@@ -261,6 +290,8 @@ def _kernel(
             write(acc * (1.0 / jnp.maximum(denom, 1.0)), m * _LN_2 + jnp.log(denom))
 
         def attend_t(width, single):
+            if inline_issue and _INLINE_ISSUE_PAGES < width:
+                issue_next()
             """`attend` for 8/16-bit caches on transposed scores ``s^T [keys,
             rows]``: the max and sum over keys are sublane reductions, the
             output accumulates as ``acc^T [D, rows]`` across the p @ v
@@ -342,6 +373,8 @@ def _kernel(
             lse_ref[...] = (m * _LN_2 + jnp.log(denom)).reshape(lse_ref.shape)
 
         def attend(width, single):
+            if inline_issue and _INLINE_ISSUE_PAGES < width:
+                issue_next()
             """One softmax update over the group's first `width` slots; a
             `single` group (the tile's only one) needs no carried state."""
             # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
@@ -518,6 +551,7 @@ def _attention_call(
     scale_cache=None,
     scale_rows=None,
     calls=1,
+    inline_issue=False,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -625,6 +659,7 @@ def _attention_call(
             tiles_per_step=tiles_per_step,
             groups_per_tile=groups_per_tile,
             transposed=transposed,
+            inline_issue=inline_issue,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1052,6 +1087,7 @@ def _chunked_call(
         return q.transpose(1, 0, 2), jnp.zeros((0, num_q_heads), jnp.float32)
     call = functools.partial(
         _attention_call,
+        inline_issue=_INLINE_ISSUE_PAGES > 0 and num_heads == 1,
         q_per_head=num_q_heads // num_heads,
         sm_scale=sm_scale,
         block_q=block_q,
