@@ -20,6 +20,11 @@ import pytest
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.runner.owned_args import (
+    is_owned,
+    is_stamped,
+    static_shape_args_owned,
+)
 from vllm_torchtpu.runner.tpu_runner import (
     TPUModelRunner,
     _substitute_placeholder_token,
@@ -109,3 +114,44 @@ def test_substitute_placeholder_token_rejects_mismatched_lengths():
             torch.zeros(4, dtype=torch.int32),
             torch.zeros(2, dtype=torch.int32),
         )
+
+
+def test_substitute_placeholder_token_strips_dynamic_dim_marks():
+    x = torch.tensor([-1, 10, -1, 20], dtype=torch.int32)
+    torch._dynamo.mark_dynamic(x, 0)
+    assert hasattr(x, "_dynamo_dynamic_indices")
+
+    cur_idx = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
+    pre_idx = torch.tensor([0, 1, -1, -1], dtype=torch.int64)
+    next_tok = torch.tensor([101, 202], dtype=torch.int64)
+    with torch.compiler.set_stance("force_eager"):
+        out = _substitute_placeholder_token(x, cur_idx, pre_idx, next_tok)
+    # The caller gets its own tensor back, updated in place.
+    assert out is x
+    assert out.tolist() == [101, 10, 202, 20]
+    assert _substitute_placeholder_token.__code__.co_filename.endswith("owned_args.py")
+
+
+def test_static_shape_args_owned_passes_stamp_free_owned_args():
+    seen = []
+
+    def probe(a, b):
+        seen.append(a)
+        a.add_(1)
+        return a, b
+
+    wrapped = static_shape_args_owned(probe)
+    x = torch.zeros(4, dtype=torch.int32)
+    torch._dynamo.mark_dynamic(x, 0)
+    big = torch.zeros(8, dtype=torch.int32)
+    view = big[2:6]
+    torch._dynamo.mark_dynamic(view, 0)
+
+    out_a, out_b = wrapped(x, view)
+    alias = seen[0]
+    assert alias is not x and not is_stamped(alias)
+    assert alias.data_ptr() == x.data_ptr()
+    assert out_a is x and x.tolist() == [1, 1, 1, 1]
+    # A stamped view becomes an owned, stamp-free copy.
+    assert out_b is not view and is_owned(out_b) and not is_stamped(out_b)
+    assert torch.equal(out_b, view)
