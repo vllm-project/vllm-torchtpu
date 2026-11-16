@@ -70,8 +70,19 @@ class MiniMaxM3MLP(nn.Module):
         limit, alpha, beta = swiglu_params(config)
         self.act_fn = SiluAndMulWithClamp(swiglu_limit=limit, alpha=alpha, beta=beta)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
+    def forward(
+        self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        """``x`` may come as e4m3 rows with per-row f32 scales (an SP step's
+        e4m3 all-gather), which gate_up_proj contracts as e4m3."""
+        e4m3_apply = getattr(self.gate_up_proj.quant_method, "apply_e4m3_rows", None)
+        if isinstance(x, tuple) and e4m3_apply is None:
+            x = (x[0].float() * x[1]).to(torch.bfloat16)
+        if isinstance(x, tuple):
+            # gate_up_proj is bias-free and keeps the linear's forward = apply.
+            gate_up = e4m3_apply(self.gate_up_proj, *x)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         x, _ = self.down_proj(self.act_fn(gate_up))
         return x
 

@@ -761,9 +761,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_SP_FUSED_NORM": env_bool(
         "TPU_MINIMAX_M3_SP_FUSED_NORM", default=False
     ),
-    # "full" SP with TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: qkv_proj contracts the
-    # gathered e4m3 rows against its e4m3 weight (e4m3 x e4m3, f32
-    # accumulation) instead of dequantizing both to bf16.
+    # "full" SP with the e4m3 gathers: qkv_proj (and a dense layer's MLP
+    # gate_up_proj) contract the gathered e4m3 rows against their e4m3 weight
+    # (e4m3 x e4m3, f32 accumulation) instead of dequantizing both to bf16.
     "TPU_MINIMAX_M3_SP_E4M3_QKV": env_bool("TPU_MINIMAX_M3_SP_E4M3_QKV", default=False),
     # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
     # experts run the permutation-free dense-expert kernel (kernels/experimental/
