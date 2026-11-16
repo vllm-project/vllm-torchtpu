@@ -269,7 +269,7 @@ def test_spec_logprobs_lists_without_gen_lens_matches_the_blocking_path(
     num_logprobs, real_rows
 ):
     """gen_lens=None, one generated token per request: each chunk's first `n`
-    bucketed rows, in chunk order. A single chunk is sliced, not copied."""
+    bucketed rows, in chunk order."""
     chunks = [
         SpecLogprobsChunk(_bucketed_logprobs(16, num_logprobs, seed), np.arange(n))
         for seed, n in enumerate(real_rows)
@@ -279,8 +279,6 @@ def test_spec_logprobs_lists_without_gen_lens_matches_the_blocking_path(
         out,
         _blocking_logprobs_lists([(c.tensors, len(c.row_starts)) for c in chunks]),
     )
-    shared = np.shares_memory(out.logprobs, chunks[0].tensors.logprobs.numpy())
-    assert shared == (len(chunks) == 1)
 
 
 def test_get_output_attaches_plain_logprobs():

@@ -58,7 +58,7 @@ def spec_logprobs_lists(
     the first `n` of its bucketed rows (`n` = its number of requests), in
     chunk order, and `cu_num_generated_tokens` stays None.
     """
-    ids, lps, ranks = [], [], []
+    parts = []
     offset = 0
     for chunk in chunks:
         n = len(chunk.row_starts)
@@ -70,34 +70,20 @@ def spec_logprobs_lists(
                 for start, g in zip(chunk.row_starts, gen_lens[offset : offset + n])
             ]
             rows = np.concatenate(take) if take else np.zeros(0, dtype=np.int64)
-        index = _row_index(rows)
-        ids.append(chunk.tensors.logprob_token_ids[index])
-        lps.append(chunk.tensors.logprobs[index])
-        ranks.append(chunk.tensors.selected_token_ranks[index])
+        index = torch.as_tensor(rows, dtype=torch.int64)
+        parts.append(
+            LogprobsTensors(
+                logprob_token_ids=chunk.tensors.logprob_token_ids[index],
+                logprobs=chunk.tensors.logprobs[index],
+                selected_token_ranks=chunk.tensors.selected_token_ranks[index],
+            )
+        )
         offset += n
     cu_num_generated_tokens = None
     if gen_lens is not None:
         assert offset == len(gen_lens), (offset, len(gen_lens))
         cu_num_generated_tokens = np.concatenate(([0], np.cumsum(gen_lens))).tolist()
-    return LogprobsTensors(
-        logprob_token_ids=_cat_rows(ids),
-        logprobs=_cat_rows(lps),
-        selected_token_ranks=_cat_rows(ranks),
-        cu_num_generated_tokens=cu_num_generated_tokens,
-    ).tolists()
-
-
-def _row_index(rows: np.ndarray) -> slice | torch.Tensor:
-    """An index for `rows`: a slice, which takes a view instead of a copy,
-    when they are the leading rows 0, 1, ..., n - 1."""
-    if np.array_equal(rows, np.arange(len(rows))):
-        return slice(len(rows))
-    return torch.from_numpy(np.asarray(rows, dtype=np.int64))
-
-
-def _cat_rows(parts: list[torch.Tensor]) -> torch.Tensor:
-    """Concatenates the chunks' rows; a single chunk is returned uncopied."""
-    return parts[0] if len(parts) == 1 else torch.cat(parts)
+    return LogprobsTensors.cat(parts).tolists(cu_num_generated_tokens)
 
 
 @dataclass
@@ -240,26 +226,21 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             selected_token_ids = selected_token_ids.unsqueeze(-1)
 
         max_gen_len = selected_token_ids.shape[-1]
+        gen_lens = None
         if max_gen_len == 1:
             valid_sampled_token_ids = selected_token_ids.tolist()
-            if self.copy_state.spec_logprobs:
-                self._model_runner_output.logprobs = spec_logprobs_lists(
-                    self.copy_state.spec_logprobs, gen_lens=None
-                )
-            for i in self.discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
         else:
             valid_mask = selected_token_ids != INVALID_TOKEN_ID
             gen_lens = valid_mask.sum(dim=1).tolist()
             valid_sampled_token_ids = [
                 seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
             ]
-            if self.copy_state.spec_logprobs:
-                self._model_runner_output.logprobs = spec_logprobs_lists(
-                    self.copy_state.spec_logprobs, gen_lens
-                )
-            for i in self.discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
+        if self.copy_state.spec_logprobs:
+            self._model_runner_output.logprobs = spec_logprobs_lists(
+                self.copy_state.spec_logprobs, gen_lens
+            )
+        for i in self.discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids[i].clear()
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
         return self._model_runner_output

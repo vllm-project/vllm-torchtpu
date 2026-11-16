@@ -5611,11 +5611,15 @@ class TPUModelRunner(GPUModelRunner):
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
                 # sure `sample_from_logits` does not modify the logits in-place.
-                chunk_logprobs = (
-                    self.gather_logprobs(logprob_logits, selected_token_ids)
-                    if needs_logprobs
-                    else None
-                )
+                if needs_logprobs:
+                    spec_logprobs_chunks.append(
+                        SpecLogprobsChunk(
+                            tensors=self.gather_logprobs(
+                                logprob_logits, selected_token_ids
+                            ),
+                            row_starts=np.arange(num_reqs),
+                        )
+                    )
 
                 # Keep the bucketed (padded) tensor; trim happens on the host
                 # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
@@ -5628,13 +5632,6 @@ class TPUModelRunner(GPUModelRunner):
                             next_tokens_tpu_offset + req_idx - cur_start_idx
                         )
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
-                if needs_logprobs:
-                    assert chunk_logprobs is not None
-                    spec_logprobs_chunks.append(
-                        SpecLogprobsChunk(
-                            tensors=chunk_logprobs, row_starts=np.arange(num_reqs)
-                        )
-                    )
 
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
