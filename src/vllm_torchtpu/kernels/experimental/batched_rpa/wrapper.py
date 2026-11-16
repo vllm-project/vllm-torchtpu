@@ -734,6 +734,39 @@ def ragged_paged_attention(
             page_size=page_size,
         )
     else:
+        # Same shapes and dtypes as prepare_inputs would return for this call;
+        # the kernel runs without bounds checks, so a short buffer would read
+        # out of range silently.
+        scale = None
+        if use_per_token_scale:
+            scale = jax.ShapeDtypeStruct(
+                (queries.shape[0], keys.shape[1]), per_token_scale_dtype
+            )
+        expected = jax.eval_shape(
+            lambda q, k, v, ks, vs: prepare_inputs(
+                q,
+                k,
+                v,
+                queries.dtype,
+                kv_cache.dtype,
+                ks,
+                vs,
+                kv_layout=kv_layout,
+                page_size=page_size,
+            ),
+            queries,
+            keys,
+            values,
+            scale,
+            scale,
+        )
+        got = [(tuple(x.shape), jnp.dtype(x.dtype)) for x in prepared_inputs]
+        want = [(tuple(x.shape), jnp.dtype(x.dtype)) for x in expected]
+        if got != want:
+            raise ValueError(
+                f"prepared_inputs (shape, dtype) {got} do not match what"
+                f" prepare_inputs returns for these arguments: {want}"
+            )
         q_hbm, new_kv_hbm = prepared_inputs
 
     default_decode, default_prefill = calculate_block_sizes(
