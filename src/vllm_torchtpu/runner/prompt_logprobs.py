@@ -83,11 +83,14 @@ def unsupported_reason(
 
 
 def max_logits_calls(num_rows: int, rows_per_call: int, num_chunks: int) -> int:
-    """At most how many logits calls score `num_rows` prompt rows spread over
-    `num_chunks` forward chunks, each chunk's rows in calls of `rows_per_call`.
+    """Upper bound on the logits calls needed to score `num_rows` prompt rows.
 
-    The sum of the chunks' ceil(rows / rows_per_call) is at most
-    ceil(num_rows / rows_per_call) + num_chunks - 1.
+    A call scores up to `rows_per_call` rows, all from the same forward chunk,
+    so each chunk's rows are scored separately and each chunk can leave one
+    call partly filled. However the rows split across the `num_chunks`
+    chunks, the count is at most ceil(num_rows / rows_per_call) +
+    num_chunks - 1. For example, 16 rows at 8 per call take 2 calls in one
+    chunk, but 3 if split 9 + 7 across two chunks.
     """
     if num_rows == 0:
         return 0
