@@ -541,7 +541,9 @@ def _prefill_attention(
         kv_tile=kv_tile,
         k_scale=k_scale,
         v_scale=v_scale,
+        # pyrefly: ignore[bad-argument-type]
         **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
+        # pyrefly: ignore[bad-argument-type]
         **({"query_tile": query_tile} if query_tile else {}),
         **({"dcp": dcp} if dcp is not None else {}),
         **({"return_lse": True} if return_lse else {}),
@@ -741,6 +743,7 @@ def qsa_attention(
             return _shift_rows_up(x, prefix, capacity)
 
         prefill_lengths = jnp.where(rows < starts[-1] - prefix, shift(lengths), 0)
+        # pyrefly: ignore[bad-unpacking]
         prefilled, cache = prefill_fn(
             shift(query),
             shift(gate),
@@ -761,6 +764,7 @@ def qsa_attention(
         return jnp.where((lengths > 0)[:, None, None], output, 0), cache
     ids = jnp.minimum(rows + prefix, len(query) - 1)
     prefill_lengths = jnp.where(rows < starts[-1] - prefix, lengths[ids], 0)
+    # pyrefly: ignore[bad-unpacking]
     prefilled, cache = prefill_fn(
         query[ids],
         gate[ids],
