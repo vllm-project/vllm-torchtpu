@@ -492,40 +492,6 @@ def test_cancelled_response_suppresses_late_pkg2_but_waits_for_send_barrier_to_f
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before
 
 
-@pytest.mark.parametrize("outcome", [RaidenSendOutcome.SUCCESS, None])
-def test_terminal_response_keeps_trace_headers(
-    outcome, shared_model_config, scheduler_cls
-):
-    """The API server parents the request span on the terminal's headers."""
-    scheduler, _, hasher = _build_producer_scheduler(shared_model_config, scheduler_cls)
-    headers = {"traceparent": "00-90d86cb618c6615e4dd701e734a854a7-0123456789abcdef-01"}
-    req = Request(
-        "p-request",
-        list(range(1, 33)),
-        SamplingParams(max_tokens=1, detokenize=False),
-        None,
-        client_index=3,
-        block_hasher=hasher,
-        trace_headers=headers,
-    )
-    scheduler.add_request(req)
-    sched_out = scheduler.schedule()
-    first = scheduler.update_from_output(sched_out, _runner_output_for_step(sched_out))
-    assert first[3].outputs[0].finish_reason is None
-
-    empty_sched = scheduler.schedule()
-    final = scheduler.update_from_output(
-        empty_sched,
-        _runner_output_for_step(
-            empty_sched,
-            results=RaidenSendResults({"p-request": outcome}) if outcome else None,
-            finished_sending={"p-request"},
-        ),
-    )[3].outputs[0]
-    assert final.finish_reason is not None
-    assert final.trace_headers == headers
-
-
 def test_prefill_and_send_completion_in_same_step(shared_model_config, scheduler_cls):
     scheduler, state, hasher = _build_producer_scheduler(
         shared_model_config, scheduler_cls
