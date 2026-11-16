@@ -338,9 +338,7 @@ def _kernel(
             p = jnp.exp2(s - m_new)
             # l = 1 . p comes out of the p @ v matmul as its row past the D
             # value rows (rows of ones streamed with v^T), not from a VPU add
-            # per score vreg: kernel bench j-3e361d8c, ms per 8192-token call,
-            # fp8 32-token tiles, 92.5k prefix: 0.855 -> 0.821 / 1.501 ->
-            # 1.321 / 2.562 -> 2.148 at low / served-like / high dispersion.
+            # per score vreg (the body is VALU-bound; kernel bench j-3e361d8c).
             # The sum is over the bf16 p the matmul weighs v with.
             ones = jnp.ones((v.shape[0], _SUM_ROWS), v.dtype)
             pv = jax.lax.dot_general(
