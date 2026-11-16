@@ -744,35 +744,54 @@ def test_chips_sources_contain_no_legacy_tpu_v5_or_v4_references() -> None:
             )
 
 
-def test_config_with_experts_per_token_and_sampling_top_k_reads_routed_count() -> None:
-    """Read the routed experts per token, not a sampling top_k in the same config."""
+SAMPLING_TOP_K_MOE_CFG: dict[str, object] = {
+    "hidden_size": 4096,
+    "num_hidden_layers": 8,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "num_experts": 896,
+    "top_k": 50,
+    "moe_intermediate_size": 1024,
+    "vocab_size": 163840,
+}
+
+
+@pytest.mark.parametrize(
+    "routed_experts_key",
+    [
+        "num_experts_per_tok",
+        "num_experts_per_token",
+        "experts_per_token",
+        "num_selected_experts",
+    ],
+)
+def test_config_with_experts_per_token_and_sampling_top_k_reads_routed_count(
+    routed_experts_key: str,
+) -> None:
+    """Read each routed-experts key, not a sampling top_k in the same config."""
     expected_routed_experts_per_token = 16
     routed_and_sampling_cfg = {
-        "hidden_size": 4096,
-        "num_hidden_layers": 8,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "num_experts": 896,
-        "num_experts_per_token": 16,
-        "top_k": 50,
-        "moe_intermediate_size": 1024,
-        "vocab_size": 163840,
+        **SAMPLING_TOP_K_MOE_CFG,
+        routed_experts_key: expected_routed_experts_per_token,
     }
     geom = from_hf_config(routed_and_sampling_cfg)
     assert geom.top_k == expected_routed_experts_per_token
 
 
+def test_nested_text_config_with_sampling_top_k_reads_routed_count() -> None:
+    """Read the routed experts per token from a nested text_config."""
+    expected_routed_experts_per_token = 16
+    nested_cfg = {
+        "text_config": {
+            **SAMPLING_TOP_K_MOE_CFG,
+            "num_experts_per_token": expected_routed_experts_per_token,
+        }
+    }
+    geom = from_hf_config(nested_cfg)
+    assert geom.top_k == expected_routed_experts_per_token
+
+
 def test_moe_config_without_routed_experts_key_is_rejected() -> None:
     """Reject a MoE config that names no routed experts per token."""
-    sampling_only_cfg = {
-        "hidden_size": 4096,
-        "num_hidden_layers": 8,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "num_experts": 896,
-        "top_k": 50,
-        "moe_intermediate_size": 1024,
-        "vocab_size": 163840,
-    }
     with pytest.raises(ValueError, match="routed experts per token"):
-        from_hf_config(sampling_only_cfg)
+        from_hf_config(SAMPLING_TOP_K_MOE_CFG)

@@ -408,6 +408,16 @@ def _resolve_layer_types(
     return _infer_pattern_layer_types(tc, cfg, num_layers, specs)
 
 
+# Config keys that name the routed experts per token, in lookup order. A sampling
+# `top_k` in the same config is not one of them.
+_ROUTED_EXPERTS_PER_TOKEN_KEYS: tuple[str, ...] = (
+    "num_experts_per_tok",
+    "num_experts_per_token",
+    "experts_per_token",
+    "num_selected_experts",
+)
+
+
 def _resolve_moe_dimensions(
     tc: Mapping[str, object],
 ) -> tuple[int, int, int, int, int]:
@@ -430,16 +440,11 @@ def _resolve_moe_dimensions(
         shared_inter = num_shared * moe_inter
 
     top_k = _as_int(
-        tc.get("num_experts_per_tok")
-        or tc.get("num_experts_per_token")
-        or tc.get("experts_per_token")
-        or tc.get("num_selected_experts")
+        next((tc[key] for key in _ROUTED_EXPERTS_PER_TOKEN_KEYS if tc.get(key)), None)
     )
     if num_experts > 0 and top_k <= 0:
-        msg = (
-            "MoE config names no routed experts per token (num_experts_per_tok, "
-            "num_experts_per_token, experts_per_token, num_selected_experts)"
-        )
+        accepted_keys = ", ".join(_ROUTED_EXPERTS_PER_TOKEN_KEYS)
+        msg = f"MoE config names no routed experts per token ({accepted_keys})"
         raise ValueError(msg)
     return num_experts, top_k, moe_inter, num_shared, shared_inter
 
