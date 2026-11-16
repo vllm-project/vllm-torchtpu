@@ -950,8 +950,11 @@ class TpuPlatform(Platform):
         else:
             compilation_config.mode = CompilationMode.VLLM_COMPILE
 
-        # No graph splitting — TPU handles the full graph including
-        compilation_config.splitting_ops = []
+        # Compile whole graphs by default (TPU handles the full graph), but
+        # keep explicit boundaries a model config hook or the caller declared:
+        # model hooks run before this, in VllmConfig.try_verify_and_update_config.
+        if compilation_config.splitting_ops is None:
+            compilation_config.splitting_ops = []
 
         # Kernel-iteration mode splits the compiled graph at the Pallas RPA
         # custom ops so they execute eagerly outside the compiled pieces.
@@ -961,11 +964,30 @@ class TpuPlatform(Platform):
         # are allocated at model build, so list every id the registry could
         # plausibly allocate (should_split does exact name matching).
         if envs.TPU_KERNEL_ITER_MODE:
-            compilation_config.splitting_ops = [
+            rpa_ops = [
                 f"pallas::{prefix}_{i}"
                 for prefix in ("rpa_kernel", "rpa_kernel_batched")
                 for i in range(64)
             ]
+            declared = set(compilation_config.splitting_ops)
+            compilation_config.splitting_ops.extend(
+                rpa_op for rpa_op in rpa_ops if rpa_op not in declared
+            )
+        else:
+            # The RPA ops donate kv_cache unless TPU_KERNEL_ITER_MODE is set
+            # (layers/adapter/attention.py); run eagerly at a graph boundary,
+            # the donation would kill the buffer the next piece still reads.
+            rpa_boundaries = [
+                op
+                for op in compilation_config.splitting_ops
+                if op.startswith("pallas::rpa_kernel")
+            ]
+            if rpa_boundaries:
+                raise ValueError(
+                    f"compilation_config.splitting_ops splits at RPA kernels "
+                    f"({rpa_boundaries[:2]}...) without TPU_KERNEL_ITER_MODE; "
+                    "set TPU_KERNEL_ITER_MODE=1 or drop those boundaries."
+                )
 
         # Disable inductor-specific fusion passes (only available on CUDA).
         compilation_config.pass_config.fuse_norm_quant = False
