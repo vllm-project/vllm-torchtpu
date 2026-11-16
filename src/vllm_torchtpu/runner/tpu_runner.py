@@ -3233,6 +3233,19 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
+    def _fit_draft_row(self, drafts: torch.Tensor) -> torch.Tensor:
+        """``[rows, k]`` drafts padded to the ``K`` columns of a source span.
+
+        With GaaD the drafter fills only its share of the row
+        (``gaad.draft_limit``), and an async step then schedules only that
+        share, so the padding is never substituted.
+        """
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        if drafts.shape[1] >= k:
+            return drafts
+        return torch.nn.functional.pad(drafts, (0, k - drafts.shape[1]))
+
     def _scheduled_draft_counts(
         self,
         req_offset: int,
@@ -3363,7 +3376,9 @@ class TPUModelRunner(GPUModelRunner):
             drafts_per_chunk,
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
-            drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            drafts_chunk = self._fit_draft_row(
+                fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            )
             src = assemble_spec_next_tokens(
                 nt_chunk, drafts_chunk, None if bucketed else num_reqs
             )
@@ -3435,7 +3450,9 @@ class TPUModelRunner(GPUModelRunner):
             flat = sel.view(-1)
             chunk_padded_num_reqs = flat.shape[0] if bucketed else n
             bonus = (flat if bucketed else flat[:n]).unsqueeze(1)  # [rows, 1]
-            drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            drafts_chunk = self._fit_draft_row(
+                fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            )
             src = torch.cat(
                 [bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1
             )  # [chunk_padded_num_reqs, 1+K] = [bonus, draft_1..K]
@@ -4431,6 +4448,15 @@ class TPUModelRunner(GPUModelRunner):
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
+        if self.scheduler_config.async_scheduling and gaad.follows_commit(
+            scheduler_output
+        ):
+            # The engine committed the step in flight before scheduling this
+            # one (gaad.patch_engine_core). Commit it here too, before the
+            # cached state reads the scheduler's exact counts, so the step
+            # takes its tokens and drafts from the host, nothing substituted.
+            self._modify_prev_results()
+            self._pre_async_results = None
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
