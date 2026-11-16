@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from ...ops import BF16, F32, I32, rmsnorm, rope_partial, round_bf16, to_kv_dtype
 from ...pool.config import cache_exec
 from .context import GQAEmit
+from .decls import ROPE_TABLE_INPUT
 from .params import GQAParams
 
 
@@ -39,9 +40,15 @@ def rope(ap: GQAParams, x_in: Any, cos_in: Any, sin_in: Any) -> Any:
 
 
 def init_rope(ctx: Any, ap: GQAParams) -> None:
-    """Step-wide head-batched RoPE table `rope` (`QV`)."""
+    """Step-wide RoPE tables: `rcs` from the `ROPE_TABLE_INPUT` extra input
+    (`ROPE_TABLE`), and the head-batched `rope` table (`QV`)."""
     ex, scr = ctx.ex, ctx.scr
     half = ap.ROT // 2
+    if ap.ROPE_TABLE:
+        pltpu.sync_copy(ctx.extra[ROPE_TABLE_INPUT], scr["rcs"])
+        if ap.QV:
+            scr["rope"][:, :, :half] = scr["rcs"][...]
+        return
     if not ap.QV:
         return
     inv = 1.0 / (
@@ -103,10 +110,13 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
                     ).astype(BF16)
         else:
             for b in range(B):
-                ang = pos_ref[b].astype(F32) * inv
-                cos, sin = round_bf16(jnp.cos(ang)), round_bf16(jnp.sin(ang))
-                rcs[0, b : b + 1, :] = cos
-                rcs[1, b : b + 1, :] = sin
+                if ap.ROPE_TABLE:
+                    cos, sin = rcs[0, b : b + 1, :], rcs[1, b : b + 1, :]
+                else:
+                    ang = pos_ref[b].astype(F32) * inv
+                    cos, sin = round_bf16(jnp.cos(ang)), round_bf16(jnp.sin(ang))
+                    rcs[0, b : b + 1, :] = cos
+                    rcs[1, b : b + 1, :] = sin
                 qg = ybuf[b, :koff].reshape(nh, QW)
                 q = gqa_rms(ap, qg[:, :HD], qn)
                 q = round_bf16(rope(ap, q, cos, sin) * HD**-0.5)

@@ -78,8 +78,13 @@ GQA_FIELD_ALIASES: dict[str, str] = {
 GQA_OPTIONS: dict[str, Any] = {
     "qk_norm": True,
     "output_gate": True,
+    "rope_table": False,
     "weight_dtypes": None,
 }
+
+# `GQAModule(rope_table=True)` extra input: per-rank `(2, MR, ROT // 2)` f32, the
+# cos (`[0]`) and sin (`[1]`) of every step row, used as given.
+ROPE_TABLE_INPUT = "rope_cs"
 
 
 def gqa_nai(nh: int, hd: int, output_gate: bool) -> int:

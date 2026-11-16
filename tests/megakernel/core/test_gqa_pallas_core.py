@@ -36,6 +36,7 @@ from vllm_torchtpu.megakernel.core import pool
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.modules.gqa.attention import att_core
 from vllm_torchtpu.megakernel.core.modules.gqa.context import GQAEmit
+from vllm_torchtpu.megakernel.core.modules.gqa.decls import ROPE_TABLE_INPUT
 from vllm_torchtpu.megakernel.core.modules.gqa.kv import (
     KVRing,
     build_worklist,
@@ -64,6 +65,8 @@ from vllm_torchtpu.megakernel.core.ops import (
     I32,
     rmsnorm,
     rope_partial,
+    round_bf16,
+    round_up,
     to_kv_dtype,
 )
 from vllm_torchtpu.megakernel.core.planner import plan
@@ -177,10 +180,16 @@ def _run_gqa_pallas_core_case(
     rot: int = 32,
     kv_dtype: Any = FP8,
     output_gate: bool = True,
+    rope_delta: int | None = None,
 ) -> None:
-    """Run GQA Pallas core helpers and compare against `gqa_reference`."""
+    """Run GQA Pallas core helpers and compare against `gqa_reference`.
+
+    With `rope_delta`, RoPE comes from a per-row table at position
+    `pos + rope_delta` while `pos` stays the KV index (`rope_table`).
+    """
     B = 4
-    ctx_len = 256
+    kv_off = -rope_delta if rope_delta else 0
+    ctx_len = 256 + round_up(kv_off, 256)
     g = FakeGeometry(L=1, att_every=1, H=256, NH=1, NKV=1, HD=hd, ROT=rot)
     tt = GQATunables(
         kv_blk=kv_blk,
@@ -194,7 +203,8 @@ def _run_gqa_pallas_core_case(
     )
     tiles = TINY_TILES.with_modules({"gqa": tt})
     cache = (
-        CacheExec(paged_kv=True, page_size=128, num_pages=32)
+        # Up to 4 sequences of `ctx_len // 128` pages, plus null page 0.
+        CacheExec(paged_kv=True, page_size=128, num_pages=max(32, ctx_len // 32 + 1))
         if paged_kv
         else CacheExec()
     )
@@ -223,6 +233,7 @@ def _run_gqa_pallas_core_case(
         out_scaled=False,
         output_gate=output_gate,
         kv_dtype=kv_dtype,
+        rope_table=rope_delta is not None,
     )
     assert ap.KVE is (paged_kv and kv_ering)
 
@@ -256,6 +267,7 @@ def _run_gqa_pallas_core_case(
         sm_ref,
         st0_ref,
         st1_ref,
+        rope_ref,
         out_mix_ref,
         out_knew_ref,
         out_vnew_ref,
@@ -283,6 +295,7 @@ def _run_gqa_pallas_core_case(
             me=jnp.int32(0),
             stream=f_stream,
             comm=None,
+            extra={ROPE_TABLE_INPUT: rope_ref},
             raw_refs=raw_refs,
         )
         scr["sm"][0] = sm_ref[0]
@@ -335,6 +348,7 @@ def _run_gqa_pallas_core_case(
             pl.BlockSpec(memory_space=pltpu.VMEM),
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
         ],
         out_specs=[
             pl.BlockSpec(memory_space=pltpu.VMEM),
@@ -356,7 +370,7 @@ def _run_gqa_pallas_core_case(
         # Sequence 0 has plen=140 (2 blocks of 128), sequence 1 has plen=60 (1 block),
         # so when T=2 (NS=2) total worklist items = 2 + 1 = 3 (odd!), exercising
         # both `item_pair` and the odd-item tail in `att_core` when `pair_kv=True`.
-        seq_plens = [140, 60, 140, 60]
+        seq_plens = [140 + kv_off, 60 + kv_off, 140 + kv_off, 60 + kv_off]
         pos = jnp.array(
             [seq_plens[b // T] + (b % T) for b in range(B)],
             dtype=I32,
@@ -386,13 +400,35 @@ def _run_gqa_pallas_core_case(
             cache=cache,
             interpret=True,
         )
+        half = g.ROT // 2
+        rope_rows = jnp.zeros((2, ex.MR, half), F32)
+        if rope_delta is not None:
+            inv = 1.0 / (g.theta ** (jnp.arange(half, dtype=F32) * 2.0 / g.ROT))
+            ang = (pos + rope_delta).astype(F32)[:, None] * inv[None, :]
+            rope_rows = rope_rows.at[:, :B].set(
+                round_bf16(jnp.stack([jnp.cos(ang), jnp.sin(ang)]))
+            )
         ref_kw = dict(g=g, ex=ref_ex, output_gate=output_gate, kv_dtype=kv_dtype)
         ref_w = {"att_in": w_in, "att_out": w_out, "qn": qn, "kn": kn}
+        ref_rope = None if rope_delta is None else rope_rows[:, :B]
         ref_delta, ref_st = gqa_reference(
-            ref_w, x_in[:B], {"kc": kc, "vc": vc}, pos=pos, **ref_kw
+            ref_w, x_in[:B], {"kc": kc, "vc": vc}, pos=pos, rope_cs=ref_rope, **ref_kw
         )
         ref_zero_vc, _ = gqa_reference(
-            ref_w, x_in[:B], {"kc": kc, "vc": jnp.zeros_like(vc)}, pos=pos, **ref_kw
+            ref_w,
+            x_in[:B],
+            {"kc": kc, "vc": jnp.zeros_like(vc)},
+            pos=pos,
+            rope_cs=ref_rope,
+            **ref_kw,
+        )
+        # Today's semantics: one index drives both RoPE and the KV cache.
+        ref_kv_rope = (
+            None
+            if rope_delta is None
+            else gqa_reference(
+                ref_w, x_in[:B], {"kc": kc, "vc": vc}, pos=pos, **ref_kw
+            )[0]
         )
 
         if paged_kv:
@@ -437,7 +473,7 @@ def _run_gqa_pallas_core_case(
     run_dev = cpu_dev if interpret else jax.devices("tpu")[0]
     args = [
         jax.device_put(arr, run_dev)
-        for arr in (pos, pt_arg, x_in, w_in, w_out, sm, st0_arg, st1_arg)
+        for arr in (pos, pt_arg, x_in, w_in, w_out, sm, st0_arg, st1_arg, rope_rows)
     ]
     yo_full, knew_out, vnew_out = jax.jit(call)(*args)
     yo_out = np.asarray(yo_full[:B].astype(F32))
@@ -455,6 +491,11 @@ def _run_gqa_pallas_core_case(
         )
     with pytest.raises(AssertionError):
         np.testing.assert_allclose(yo_out, ref_zero_vc_f32, rtol=2e-2, atol=atol)
+    if ref_kv_rope is not None:
+        with pytest.raises(AssertionError):
+            np.testing.assert_allclose(
+                yo_out, np.asarray(ref_kv_rope.astype(F32)), rtol=2e-2, atol=atol
+            )
 
     # Check every sequence's new K/V rows (`knew` / `vnew`).
     for sq in range(ex.NS):
@@ -525,25 +566,42 @@ def test_gqa_pallas_core_helpers_match_gqa_reference(
 
 
 @pytest.mark.parametrize(
-    ("T", "gqa_qv", "amask"),
-    [(1, False, 1), (2, True, 0)],
-    ids=["decode_t1_amask1", "verify_t2_qv_amask0"],
+    "interpret",
+    [True, pytest.param(False, marks=pytest.mark.tpu_test)],
+    ids=["cpu", "tpu"],
 )
-def test_gqa_pallas_core_dense_qwen3_vs_gqa_reference(T: int, gqa_qv: bool, amask: int):
+@pytest.mark.parametrize(
+    ("T", "gqa_qv", "amask", "rope_delta"),
+    [(1, False, 1, None), (2, True, 0, None), (1, False, 1, -700), (2, True, 1, -700)],
+    ids=[
+        "decode_t1_amask1",
+        "verify_t2_qv_amask0",
+        "decode_t1_rope_table_delta_m700",
+        "verify_t2_qv_rope_table_delta_m700",
+    ],
+)
+def test_gqa_pallas_core_dense_qwen3_vs_gqa_reference(
+    T: int, gqa_qv: bool, amask: int, rope_delta: int | None, interpret: bool
+):
     """Dense Qwen3 attention (Cosmos3 reasoner): no output gate, bf16 hd128 KV
-    pages, full rotary."""
+    pages, full rotary; with `rope_delta`, RoPE comes from a per-row table 700
+    positions behind the KV index (M-RoPE after an image) and must match the
+    reference with separate RoPE and KV indices, not one index for both."""
+    if not interpret and jax.devices()[0].platform != "tpu":
+        pytest.skip("TPU device required for interpret=False")
     _run_gqa_pallas_core_case(
         T=T,
         paged_kv=True,
         kv_ering=False,
         pair_kv=False,
         gqa_qv=gqa_qv,
-        interpret=True,
+        interpret=interpret,
         amask=amask,
         hd=128,
         rot=128,
         kv_dtype=BF16,
         output_gate=False,
+        rope_delta=rope_delta,
     )
 
 

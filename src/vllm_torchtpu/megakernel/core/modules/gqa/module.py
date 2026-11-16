@@ -35,7 +35,7 @@ from ...fused_io_hook import fused_io
 from ...module import Module
 from ...ops import BF16, F32, FP8, I32, kv_page_shape
 from ...pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
-from ...spec import SmallField, StateDecl, WeightDecl
+from ...spec import ExtraInput, SmallField, StateDecl, WeightDecl
 from .attention import att_core
 from .context import GQAEmit
 from .decls import (
@@ -45,6 +45,7 @@ from .decls import (
     GQA_OPTIONS,
     GQA_PARAM_NAMES,
     GQA_WEIGHT_NAMES,
+    ROPE_TABLE_INPUT,
     gqa_cache_decl,
     gqa_hf_params,
     gqa_nai,
@@ -81,6 +82,7 @@ class GQAModule(Module):
         prefix: str = "self_attn",
         qk_norm: bool = True,
         output_gate: bool = True,
+        rope_table: bool = False,
         weight_dtypes: Mapping[str, str] | None = None,
     ) -> None:
         # `PoolLayout` of the model's paged pools (None: fp8 pages). Its
@@ -90,12 +92,16 @@ class GQAModule(Module):
         self.prefix = prefix
         self.qk_norm = bool(qk_norm)
         self.output_gate = bool(output_gate)
+        # The step takes each row's RoPE cos / sin (`ROPE_TABLE_INPUT`) and `pos`
+        # is the KV index only, so RoPE positions (M-RoPE) may differ from it.
+        self.rope_table = bool(rope_table)
         self.weight_dtypes = normalize_weight_dtypes(
             weight_dtypes, GQA_WEIGHT_NAMES, "GQAModule", MegakernelConfigError
         )
         opts: dict[str, Any] = {
             "qk_norm": self.qk_norm,
             "output_gate": self.output_gate,
+            "rope_table": self.rope_table,
         }
         if weight_dtypes is not None:
             opts["weight_dtypes"] = self.weight_dtypes
@@ -135,6 +141,11 @@ class GQAModule(Module):
                 f"layout has {lay_shape}"
             )
         return lay_shape
+
+    def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
+        if not self.rope_table:
+            return []
+        return [ExtraInput(ROPE_TABLE_INPUT, "hbm", (2, ex.MR, g.ROT // 2), F32)]
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         nh = g.NH // ex.R
@@ -214,6 +225,7 @@ class GQAModule(Module):
             out_scaled=(self.weight_dtypes["att_out"] == "fp8"),
             output_gate=self.output_gate,
             kv_dtype=self.kv_dtype,
+            rope_table=self.rope_table,
         )
 
     def _check_pool_layout(self, plan: Any) -> None:

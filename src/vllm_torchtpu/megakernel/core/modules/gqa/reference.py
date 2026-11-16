@@ -42,8 +42,13 @@ def gqa_reference(
     module_name: str = "gqa",
     output_gate: bool = True,
     kv_dtype: Any = FP8,
+    rope_cs: Any = None,
 ) -> tuple[jax.Array, dict[str, Any]]:
-    """Pure-JAX multi-rank GQA forward for one attention layer (`att_idx`)."""
+    """Pure-JAX multi-rank GQA forward for one attention layer (`att_idx`).
+
+    `pos` is each row's KV index. RoPE uses each row's `(2, B, ROT // 2)` cos /
+    sin in `rope_cs` when given (`GQAModule(rope_table=True)`), else `pos`.
+    """
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
     a = int(att_idx)
     lyr = a if layer_idx is None else int(layer_idx)
@@ -126,8 +131,11 @@ def gqa_reference(
         k_new_r = []
         v_new_r = []
         for b in range(B):
-            ang = pos[b].astype(F32) * inv
-            cos, sin = round_bf16(jnp.cos(ang)), round_bf16(jnp.sin(ang))
+            if rope_cs is None:
+                ang = pos[b].astype(F32) * inv
+                cos, sin = round_bf16(jnp.cos(ang)), round_bf16(jnp.sin(ang))
+            else:
+                cos, sin = rope_cs[0, b : b + 1], rope_cs[1, b : b + 1]
             qb = rmsnorm(qg[b, :, :HD], qn, eps, zero_centered=zc)
             kb = rmsnorm(y[b : b + 1, koff : koff + HD], kn, eps, zero_centered=zc)
             vb = y[b : b + 1, koff + HD : koff + 2 * HD]

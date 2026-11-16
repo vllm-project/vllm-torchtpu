@@ -98,6 +98,9 @@ class GQAParams:
     GATE: bool = True
     # Paged KV page dtype (`PoolLayout.page_dtype`).
     KV_DT: Any = FP8
+    # RoPE cos / sin come per row from the `ROPE_TABLE_INPUT` extra input
+    # instead of `pos_ref`, which then only indexes the KV cache.
+    ROPE_TABLE: bool = False
 
     @property
     def KV_PK(self) -> int:
@@ -162,6 +165,7 @@ def derive_params(
     out_scaled: bool = True,
     output_gate: bool = True,
     kv_dtype: Any = FP8,
+    rope_table: bool = False,
 ) -> GQAParams:
     """`GQAParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
@@ -384,6 +388,7 @@ def derive_params(
         out_scaled=bool(out_scaled),
         GATE=bool(output_gate),
         KV_DT=kv_dtype,
+        ROPE_TABLE=bool(rope_table),
     )
 
 
