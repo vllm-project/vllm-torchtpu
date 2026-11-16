@@ -40,7 +40,7 @@ A TPU step in `pipeline_tests.yml`, `pipeline_integration.yml` or
 `pipeline_perf.yml` is written once, with no generation in its `label` or
 `key`. For each generation, `bootstrap.py` reads the file through
 `buildkite-agent pipeline upload --dry-run`, puts the generation's label
-prefix (`v6e `, `v7x `) before every label and group name and its key prefix
+prefix (`v6e`, `v7x`) before every label and group name and its key prefix
 (`tpu6e_`, `tpu7x_`) before every key the file defines (and before a
 `depends_on` that names one), then uploads the result. If that fails, the
 upload fails; a file never goes up unstamped. A step outside these files that
