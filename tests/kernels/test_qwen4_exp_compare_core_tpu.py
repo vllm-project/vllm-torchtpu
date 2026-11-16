@@ -24,7 +24,6 @@ import pytest
 from vllm_torchtpu.kernels.qwen4_exp import qsa_compare_core as cc
 from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
-pytestmark = pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU only")
 
 RATIO, TOPK = 4, 512
 # The served prefill flags the numerics compare against, used where the pod's env has none.
@@ -48,8 +47,21 @@ MAX_REL = 0.08
 REPS = int(os.environ.get("CMP_TPU_REPS", "5"))
 
 
+def _report(line):
+    """A result line on stdout and, with CMP_TPU_OUT set, appended to its summary.txt."""
+    print(line, flush=True)
+    out = os.environ.get("CMP_TPU_OUT")
+    if out:
+        os.makedirs(out, exist_ok=True)
+        with open(os.path.join(out, "summary.txt"), "a") as f:
+            f.write(line + "\n")
+
+
 @pytest.fixture(autouse=True)
 def served_env(monkeypatch):
+    # The backend is touched here, not at import: a backend initialized during collection claims the TPU.
+    if jax.default_backend() != "tpu":
+        pytest.skip("TPU only")
     for k, v in SERVED_ENV.items():
         if k not in os.environ:
             print(f"[cmp-tpu] {k} unset in the pod env; using {v}", flush=True)
@@ -138,8 +150,8 @@ def test_sparsecore_tables_equal_the_reference():
     want_fn, _, _ = _aligned_tables(step, "reference", "tensorcore", cap)
     got, want = jax.block_until_ready(got_fn(*args)), jax.block_until_ready(want_fn(*args))
     usize = np.asarray(want[2])
-    print(f"[cmp-tpu] tables s10623: usize max {usize.max()} mean live {usize[usize > 0].mean():.1f}; "
-          f"tiles a live group {float(cc.tiles_per_group(want[2], cap)):.2f}", flush=True)
+    _report(f"[cmp-tpu] tables s10623: usize max {usize.max()} mean live {usize[usize > 0].mean():.1f}; "
+            f"tiles a live group {float(cc.tiles_per_group(want[2], cap)):.2f}")
     for name, g, w in zip(("rows", "codes", "usize", "ok"), got, want):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w), err_msg=name)
 
@@ -173,10 +185,10 @@ def test_numerics_and_time_against_served(monkeypatch, name, reqs, tokens, page)
     kernel_ms = _median_ms(kernel_fn, kargs)
     u = np.asarray(usize)
     tiles = int(np.sum(np.where(u > 0, -(-np.minimum(u, cap) // cc.GPT), 0)))
-    print(f"[cmp-tpu] {name}: max_rel {max_rel:.4f} (max abs {d.max():.3e}, mean |served| {scale:.3e}) finite "
-          f"{finite} ok {bool(ok)}; served call {served_ms:.1f} ms, port call {port_ms:.1f} ms, tables "
-          f"{tables_ms:.2f} ms, kernel {kernel_ms:.2f} ms; union max {u.max()} mean live {u[u > 0].mean():.1f}, "
-          f"{tiles} tiles, {tiles / max(1, int((u > 0).sum())):.2f} a live group, kernel "
-          f"{kernel_ms * 1e3 / max(tiles, 1):.3f} us a tile", flush=True)
+    _report(f"[cmp-tpu] {name}: max_rel {max_rel:.4f} (max abs {d.max():.3e}, mean |served| {scale:.3e}) finite "
+            f"{finite} ok {bool(ok)}; served call {served_ms:.1f} ms, port call {port_ms:.1f} ms, tables "
+            f"{tables_ms:.2f} ms, kernel {kernel_ms:.2f} ms; union max {u.max()} mean live {u[u > 0].mean():.1f}, "
+            f"{tiles} tiles, {tiles / max(1, int((u > 0).sum())):.2f} a live group, kernel "
+            f"{kernel_ms * 1e3 / max(tiles, 1):.3f} us a tile")
     assert finite and bool(ok)
     assert max_rel <= MAX_REL, max_rel
