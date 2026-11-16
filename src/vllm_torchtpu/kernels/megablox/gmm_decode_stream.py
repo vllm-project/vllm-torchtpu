@@ -174,7 +174,7 @@ def _kernel(
     end_rows = lax.fori_loop(0, group_offset + num_groups, scan, jnp.int32(0))
     num_hit = cnt_ref[0]
     num_chunks = num_hit * ce
-    lhs_rows = pl.cdiv(end_rows, _SUB) * _SUB
+    lhs_rows = pl.multiple_of(pl.cdiv(end_rows, _SUB) * _SUB, _SUB)
 
     def lhs_copy():
         return pltpu.make_async_copy(
@@ -192,7 +192,9 @@ def _kernel(
             w_hbm, s_hbm, r = w2_hbm, s2_hbm, jnp.where(c < c1, 0, c - c1)
         return (
             pltpu.make_async_copy(
-                w_hbm.at[e, pl.ds(r * chunk, chunk)], w_ref.at[slot], wsem.at[slot, 0]
+                w_hbm.at[e, pl.ds(pl.multiple_of(r * chunk, chunk), chunk)],
+                w_ref.at[slot],
+                wsem.at[slot, 0],
             ),
             pltpu.make_async_copy(
                 s_hbm.at[e, pl.ds(r * kbc, kbc)], s_ref.at[slot], wsem.at[slot, 1]
@@ -223,7 +225,7 @@ def _kernel(
         c = t % ce
         m_off = hit_ref[1, j]
         rows = hit_ref[2, j]
-        a = m_off - m_off % _SUB
+        a = pl.multiple_of(m_off - m_off % _SUB, _SUB)
         is_w2 = c >= c1
         cc = jnp.where(is_w2, c - c1, c)
         row0 = pl.multiple_of(jnp.where(is_w2, hrow, a), _SUB)
@@ -284,11 +286,11 @@ def _kernel(
         m_end = hit_ref[1, j] + hit_ref[2, j]
         is_last = j == num_hit - 1
         final = jnp.where(is_last, pl.cdiv(m_end, _SUB), m_end // _SUB) * _SUB
-        w0 = cnt_ref[1]
+        w0 = pl.multiple_of(cnt_ref[1], _SUB)
 
         @pl.when(final > w0)
         def _():
-            size = final - w0
+            size = pl.multiple_of(final - w0, _SUB)
             pltpu.make_async_copy(
                 o_ref.at[pl.ds(w0, size)], out_hbm.at[pl.ds(w0, size)], iosem.at[1]
             ).start()
@@ -329,7 +331,7 @@ def _kernel(
             return carry
 
         lax.fori_loop(0, num_chunks, body, 0)
-        written = cnt_ref[1]
+        written = pl.multiple_of(cnt_ref[1], _SUB)
         pltpu.make_async_copy(
             o_ref.at[pl.ds(0, written)], out_hbm.at[pl.ds(0, written)], iosem.at[1]
         ).wait()
