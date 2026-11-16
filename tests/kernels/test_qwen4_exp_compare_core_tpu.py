@@ -261,3 +261,115 @@ def test_numerics_and_time_against_served(monkeypatch, name, reqs, tokens, page)
     assert port_rel <= MAX_REL, port_rel
     assert port_max <= 1.25 * served_max and port_rms <= 1.25 * served_rms, (port_max, served_max, port_rms,
                                                                               served_rms)
+
+
+# Float64 stress cases (work-order-prefill-qsa.md, last section): one 2,048-row request at 24,000 cached tokens,
+# 3200-token pages, the port and the served path each against a float64 reference on 256 sampled rows.
+STRESS = ("peaked", "long_unions", "near_duplicate_keys", "fp8_range_ends", "nan_tail", "recorded_selections")
+_RECORDED = ("/home/benliangw_google_com/workspace/tmp/compare-runs/prepared/objects/served/"
+             "served-8f219aec5cbc3d30ba2e/served-prefill-38258702ef-stage6.json")
+
+
+def _stress_step(name, seed=11, rows=2048, ctx=24000, page=3200):
+    """(step, query scale) of a stress case; the pool holds one sequence's pages in a permuted order."""
+    rng = np.random.default_rng(seed)
+    pps = -(-(ctx + rows) // page)
+    lengths = (ctx + np.arange(rows) + 1).astype(np.int32)
+    table = np.broadcast_to((rng.permutation(pps) + 1).astype(np.int32), (rows, pps)).copy()
+    if name == "long_unions":
+        # Each 16-row group: 272 shared groups and 227 of each row's own, ~3,900 a union (cap 4,096); a row's
+        # 13 most recent groups ride along so each selection stays causal.
+        blocks = np.full((rows, TOPK), -1, np.int32)
+        for g in range(rows // 16):
+            complete = (ctx + 16 * g + 1) // RATIO
+            pool = rng.permutation(complete - 16)[: 272 + 16 * 227]
+            for r in range(16):
+                own = pool[272 + 227 * r: 272 + 227 * (r + 1)]
+                recent = np.arange(complete - 13, complete)
+                sel = np.unique(np.concatenate([pool[:272], own, recent]))[:TOPK]
+                blocks[16 * g + r, :len(sel)] = sel
+    elif name == "recorded_selections" and os.path.exists(_RECORDED):
+        # s10623 L39's recorded selections (rows 16 apart), each row taking the nearest earlier recorded row's
+        # groups below its own tail (Compare's interpolated plant), shifted onto this context.
+        import json
+
+        rec = json.load(open(_RECORDED))["plant"]["selections"][0]["tables"][0]
+        blocks = np.full((rows, TOPK), -1, np.int32)
+        for t in range(rows):
+            sel = np.asarray(rec[min(t // 16, len(rec) - 1)], np.int64)
+            sel = sel[sel < lengths[t] // RATIO][:TOPK]
+            blocks[t, :len(sel)] = sel
+    else:
+        blocks = _selections(rng, rows, ctx)
+    scale = 8.0 if name == "peaked" else 1.0
+    q = jnp.asarray(rng.normal(0, 0.5 * scale, (rows, 24, 256)), jnp.bfloat16)
+    gate = jnp.asarray(rng.uniform(-3, 3, (rows, 24, 256)), jnp.bfloat16)
+    shape = (pps + 1, page, 1, 4, 256)
+    if name == "near_duplicate_keys":
+        # Every token's K and V one of 4 base records, a few bytes flipped: many exact and near ties.
+        base = rng.integers(0, 0x40, size=(4, 1, 4, 256), dtype=np.uint8) | (rng.integers(0, 2, (4, 1, 4, 256)).astype(np.uint8) << 7)
+        raw = base[rng.integers(0, 4, size=shape[:2])].copy()
+        flip = rng.random(raw.shape) < 0.01
+        raw[flip] ^= 1
+    elif name == "fp8_range_ends":
+        # Magnitudes at e4m3's ends: 448 (0x7E), the smallest subnormal (0x01) and zero, random signs.
+        mag = rng.choice(np.array([0x7E, 0x01, 0x00], np.uint8), size=shape, p=[0.3, 0.4, 0.3])
+        raw = mag | (rng.integers(0, 2, size=shape).astype(np.uint8) << 7)
+    else:
+        raw = rng.integers(0, 0x40, size=shape, dtype=np.uint8) | (rng.integers(0, 2, size=shape).astype(np.uint8) << 7)
+    if name == "nan_tail":
+        # Unwritten bytes past the last row in its tail group (and the rest of its page) are NaN (0x7F).
+        last = ctx + rows
+        page_i, off = last // page, last % page
+        raw[table[0, page_i], off:] = 0x7F
+    pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+    starts = jnp.asarray([0] + [rows] * 16, jnp.int32)
+    return (q, gate, jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table), pool, starts)
+
+
+def _f64_rows(step, rows):
+    """float64 gated attention of the sampled rows over their exact selections (numpy, on the host)."""
+    q, gate, blocks, lengths, table, pool, _ = step
+    page = pool.shape[1]
+    flat = np.asarray(pool.reshape(-1, 4, 256).astype(jnp.float32)).astype(np.float64)
+    qn, gn = np.asarray(q.astype(jnp.float32), np.float64), np.asarray(gate.astype(jnp.float32), np.float64)
+    b, ln, tb = np.asarray(blocks), np.asarray(lengths), np.asarray(table)
+    out = np.zeros((len(rows), 24, 256))
+    for n, t in enumerate(rows):
+        length = int(ln[t])
+        groups = {int(x) for x in b[t] if x >= 0}
+        if length % RATIO:
+            groups.add(length // RATIO)
+        toks = np.asarray(sorted(x for g in groups for x in range(g * RATIO, g * RATIO + RATIO) if x < length))
+        kv = flat[tb[t][toks // page] * page + toks % page]
+        for h in range(24):
+            k, v = kv[:, 2 * (h // 12)], kv[:, 2 * (h // 12) + 1]
+            s = k @ qn[t, h] / 16.0
+            p = np.exp(s - s.max())
+            out[n, h] = (p / p.sum()) @ v
+    return out / (1.0 + np.exp(-gn[rows]))
+
+
+@pytest.mark.parametrize("name", STRESS)
+def test_stress_against_float64(monkeypatch, name):
+    if name == "recorded_selections" and not os.path.exists(_RECORDED):
+        pytest.skip("recorded selections not on this host")
+    step = _stress_step(name)
+    _, served = _call(step)
+    served = np.asarray(jax.block_until_ready(served).astype(jnp.float32))
+    jax.clear_caches()
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_COMPARE_CORE", "1")
+    _, port = _call(step)
+    port = np.asarray(jax.block_until_ready(port).astype(jnp.float32))
+    rows = np.linspace(0, len(port) - 1, 256).astype(int)
+    ref = _f64_rows(step, rows)
+    (pm, pr), (sm, sr) = _errors(port[rows], ref), _errors(served[rows], ref)
+    port_rel, served_rel = _rel(port[rows], ref), _rel(served[rows], ref)
+    finite = bool(np.isfinite(port).all())
+    _report(f"[cmp-tpu] stress {name}: against float64 (256 rows) port max {pm:.3e} rms {pr:.3e} max_rel "
+            f"{port_rel:.4f}, served max {sm:.3e} rms {sr:.3e} max_rel {served_rel:.4f}, ratios max "
+            f"{pm / max(sm, 1e-30):.3f} rms {pr / max(sr, 1e-30):.3f}; finite port {finite} served "
+            f"{bool(np.isfinite(served).all())}")
+    assert finite
+    assert port_rel <= MAX_REL, port_rel
+    assert pm <= 1.25 * sm and pr <= 1.25 * sr, (pm, sm, pr, sr)

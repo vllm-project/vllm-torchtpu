@@ -267,3 +267,30 @@ def test_dispatch_flag_on_off_and_fallbacks(kernels, monkeypatch):
         monkeypatch.setenv(env, value)
         jax.clear_caches()
         np.testing.assert_array_equal(_bits(_dispatch(step)), _bits(served), err_msg=env)
+
+
+def test_unwritten_nan_bytes_do_not_reach_the_output(kernels):
+    """Bytes past each request's last row in its pages are NaN (0x7F); rows never see them (causal edge, masked
+    scores by select, values guarded), so the output stays finite and within the bf16 floor."""
+    # Every request's last length leaves its tail group partial (941, 1770, 619), so the NaN bytes sit in a group
+    # the last rows' unions load.
+    step = _packed_step(4, rows=(41, 70, 19))
+    (q, blocks, lengths, table), _ = _aligned(step)
+    raw = np.asarray(jax.lax.bitcast_convert_type(step[5], jnp.uint8)).copy()
+    starts = np.asarray(step[6])
+    tab = np.asarray(step[4])
+    for r in range(len(starts) - 1):
+        last = int(np.asarray(step[3])[starts[r + 1] - 1])            # tokens written for request r
+        page = tab[starts[r]][last // PAGE]
+        raw[page, last % PAGE:] = 0x7F
+    pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+    groups_cap = table.shape[1] * PAGE // RATIO
+    rows, codes, usize, ok = cc.compare_tables(jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table),
+                                               groups_cap=groups_cap, union_cap=512, page_size=PAGE)
+    got = cc.compare_core_kernel(jnp.asarray(q, jnp.bfloat16), rows, codes, usize, pool, union_cap=512, depth=4)
+    live = lengths > 0
+    got = np.asarray(got.astype(jnp.float32))[live]
+    assert np.isfinite(got).all()
+    want = _f64(q, blocks, lengths, table, pool)[live]
+    floor = _max_rel(want.astype(np.float32).astype(jnp.bfloat16).astype(np.float32), want)
+    assert _max_rel(got, want) <= 2 * floor, (_max_rel(got, want), floor)

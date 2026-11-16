@@ -204,16 +204,16 @@ def _kernel(
                 v = jnp.where(v == v, v, jnp.zeros_like(v))
         return k, v
 
-    def bias_of(slot):
-        """[M, TILE] f32: 0 where a row sees a token, MASKED elsewhere (every query head's 16 rows alike)."""
+    def keep_of(slot):
+        """[M, TILE] bool: whether a row sees a token (every query head's 16 rows alike). Scores take MASKED by a
+        select, not an added bias: a key a row does not see may be unwritten bytes (NaN), and NaN + bias stays NaN."""
         cw = code_bufs[slot][...]                                    # [1, GPT]
         code = cw & 0xFFFF
         edge = lax.shift_right_logical(cw, 16) - EDGE_BIAS
         r = lax.broadcasted_iota(jnp.int32, (T, GPT), 0)
         bit = ((code >> r) & 1) != 0
-        parts = [jnp.where(bit & (r - j >= edge), 0.0, MASKED).astype(jnp.float32) for j in range(RATIO)]
-        bias = jnp.concatenate(parts, axis=1)                        # [T, TILE]
-        return jnp.concatenate([bias] * hpk, axis=0)
+        keep = jnp.concatenate([bit & (r - j >= edge) for j in range(RATIO)], axis=1)  # [T, TILE]
+        return jnp.concatenate([keep] * hpk, axis=0)
 
     def queries(qs, h):
         cols = [qbuf[qs, :, (h * hpk + jj) * HD:(h * hpk + jj + 1) * HD] for jj in range(hpk)]
@@ -224,13 +224,13 @@ def _kernel(
 
     def tile_step(slot, qs, p):
         """One tile on state parity p: per KV head the masked scores, the online softmax and the values."""
-        bias = bias_of(slot)
+        keep = keep_of(slot)
         for h in range(kv_heads):
             k, v = head_kv(slot, h, True, True)
             s = lax.dot_general(queries(qs, h), k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
             if s_scale != 1.0:
                 s = s * s_scale
-            s = s + bias
+            s = jnp.where(keep, s, MASKED)
             idx = p * kv_heads + h
             m0 = m_ref[idx]
             m1 = jnp.maximum(m0, jnp.max(s, axis=1, keepdims=True))
@@ -330,14 +330,14 @@ def _kernel(
         srow_copy(k, ks).wait()
         kv_issue(k, ks)
         srow_copy(k + E, (ks + E) % D).start()
-        bias = bias_of(slot)
+        keep = keep_of(slot)
         for h in range(kv_heads):
             kk, _ = head_kv(slot, h, True, False)
             sc = lax.dot_general(queries(par & 1, h), kk, (((1,), (1,)), ((), ())),
                                  preferred_element_type=jnp.float32)
             if s_scale != 1.0:
                 sc = sc * s_scale
-            s_buf[(i & 1) * kv_heads + h] = sc + bias
+            s_buf[(i & 1) * kv_heads + h] = jnp.where(keep, sc, MASKED)
         j = i - 1
         _, _, first_j, _ = flags(j)
         par_j = tpar_ref[j & 3]

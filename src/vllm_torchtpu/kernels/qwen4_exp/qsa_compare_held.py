@@ -172,8 +172,8 @@ def _held_kernel(
         code = cw & 0xFFFF
         edge = lax.shift_right_logical(cw, 16) - 1
         r = lax.broadcasted_iota(jnp.int32, (T, TILE), 0)
-        bias = jnp.where((((code >> r) & 1) != 0) & (r >= edge), 0.0, MASKED).astype(jnp.float32)
-        return jnp.concatenate([bias] * hpk, axis=0)
+        keep = (((code >> r) & 1) != 0) & (r >= edge)
+        return jnp.concatenate([keep] * hpk, axis=0)
 
     def tile_step(slot, qs, p):
         k = pltpu.bitcast(jnp.concatenate([planes[0], planes[1]], axis=1), jnp.float8_e4m3fn)
@@ -184,7 +184,7 @@ def _held_kernel(
         s = lax.dot_general(q, k.astype(jnp.bfloat16), (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
         if s_scale != 1.0:
             s = s * s_scale
-        s = s + bias_of(slot)
+        s = jnp.where(bias_of(slot), s, MASKED)   # a select: an unseen key may be NaN bytes
         m0 = m_ref[p]
         m1 = jnp.maximum(m0, jnp.max(s, axis=1, keepdims=True))
         alpha = jnp.exp(m0 - m1)
