@@ -74,6 +74,10 @@ def apply_omni_tpu_patches() -> None:
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
     _patch_tpu_broadcast()
     _patch_tpu_empty_collectives()
+    from vllm_torchtpu.omni.quantization import register_omni_tpu_quantization
+
+    register_omni_tpu_quantization()
+    _patch_block_sparse_attention_registry()
 
 
 _TPU_BROADCAST_PATCHED = "_tpu_allreduce_bcast_patched"
@@ -1218,10 +1222,50 @@ def _patch_diffusion_tpu_compile() -> None:
             transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
             if not transformer_attrs:
                 transformer_attrs = ("transformer", "transformer_2")
+            from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+                VllmFp8LinearMethodTPU,
+            )
+
+            fp8_a2a_count = 0
+            fp8_a2a_modes: set[str] = set()
             for attr_name in transformer_attrs:
                 dit = getattr(self.pipeline, attr_name, None)
                 if dit is not None:
                     disable_tpu_adaln_cache(dit)
+                    modules_fn = getattr(dit, "modules", None)
+                    if callable(modules_fn):
+                        for submod in modules_fn():
+                            attn_mod = getattr(submod, "attention", None)
+                            ps = getattr(attn_mod, "parallel_strategy", None)
+                            if ps is None:
+                                continue
+                            block_has_fp8 = False
+                            block_a2a_mode = "all"
+                            for child in submod.modules():
+                                qm = getattr(child, "quant_method", None)
+                                if isinstance(qm, VllmFp8LinearMethodTPU):
+                                    qcfg = getattr(qm, "quant_config", None)
+                                    block_a2a_mode = str(
+                                        getattr(qcfg, "fp8_ulysses_a2a_mode", "all")
+                                    ).lower()
+                                    if (
+                                        getattr(qcfg, "fp8_ulysses_a2a", True)
+                                        and block_a2a_mode != "off"
+                                    ):
+                                        block_has_fp8 = True
+                                    break
+                            ps._tpu_fp8_a2a = block_has_fp8
+                            ps._tpu_fp8_a2a_mode = block_a2a_mode
+                            if block_has_fp8:
+                                fp8_a2a_count += 1
+                                fp8_a2a_modes.add(block_a2a_mode)
+            if fp8_a2a_count > 0:
+                logger.info(
+                    "Model runner: enabled FP8 Ulysses all-to-all (modes=%s) "
+                    "on %d quantized attention blocks.",
+                    sorted(fp8_a2a_modes),
+                    fp8_a2a_count,
+                )
             if not self.od_config.enforce_eager:
                 if hasattr(self.pipeline, "setup_compile"):
                     try:
@@ -1292,22 +1336,37 @@ def _patch_minimax_h3_tpu_execution() -> None:
 
 
 _ULYSSES_BATCHED_A2A_PATCHED = "_tpu_ulysses_batched_a2a_patched"
+_TPU_ULYSSES_FP8_A2A_ENABLED: bool = False
+_TPU_ULYSSES_FP8_A2A_MODE: str = "all"
+_FP8_E4M3_MAX: float = 448.0
+
+
+def set_tpu_ulysses_fp8_a2a(enabled: bool, mode: str = "all") -> None:
+    """Enable or disable global FP8 (``float8_e4m3fn``) Ulysses all-to-all transport."""
+    global _TPU_ULYSSES_FP8_A2A_ENABLED, _TPU_ULYSSES_FP8_A2A_MODE
+    _TPU_ULYSSES_FP8_A2A_ENABLED = bool(enabled)
+    _TPU_ULYSSES_FP8_A2A_MODE = str(mode).lower()
 
 
 def _patch_ulysses_batched_qkv_a2a() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove once vLLM-Omni's UlyssesParallelAttention.pre_attention
     # batches matching Q, K, V tensors into a single SeqAllToAll4D collective
-    # without mutating self._sp_ctx during TorchDynamo tracing.
+    # (with optional FP8 transport) without mutating self._sp_ctx during
+    # TorchDynamo tracing.
     #
     # Problem: UlyssesParallelAttention.pre_attention issues three separate
     #   SeqAllToAll4D.apply calls for Q, K, V in every transformer block (150
-    #   forward all-to-alls per step on 50-block DiTs).
+    #   forward all-to-alls per step on 50-block DiTs) in 16-bit precision.
     # Fix: When Q, K, V share shape and dtype on TPU under standard strict
     #   Ulysses SP (scatter_idx=2, gather_idx=1), concatenate (Q, K, V) along
-    #   batch dim 0, issue one SeqAllToAll4D.apply, and chunk(3, dim=0),
-    #   returning a fresh _UlyssesCtx in the 5-tuple without mutating self.
-    # Effect: Reduces forward Ulysses all-to-all launches by 3x (150 -> 50/step).
+    #   batch dim 0, optionally cast to float8_e4m3fn when TPU FP8 DiT
+    #   quantization is active, issue one SeqAllToAll4D.apply, and chunk(3,
+    #   dim=0), returning a fresh _UlyssesCtx in the 5-tuple without mutating
+    #   self. Likewise, transport post_attention's reverse SeqAllToAll4D in
+    #   float8_e4m3fn when FP8 Ulysses all-to-all is active.
+    # Effect: Reduces forward Ulysses all-to-all launches by 3x (150 -> 50/step)
+    #   and halves collective byte volume in FP8 mode (1.64x-1.81x faster A2A).
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.attention.parallel import ulysses as uly_mod
     from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
@@ -1316,6 +1375,7 @@ def _patch_ulysses_batched_qkv_a2a() -> None:
     orig_pre = cls.pre_attention
     if getattr(orig_pre, _ULYSSES_BATCHED_A2A_PATCHED, False):
         return
+    orig_post = cls.post_attention
 
     def _tpu_pre_attention(
         self: Any,
@@ -1376,13 +1436,29 @@ def _patch_ulysses_batched_qkv_a2a() -> None:
                 self, query, key, value, attn_metadata, *extra_args, **extra_kwargs
             )
 
-        qkv_batched = SeqAllToAll4D.apply(
-            self._ulysses_pg,
-            torch.cat((query, key, value), dim=0),
-            self._scatter_idx,
-            self._gather_idx,
-            self._use_sync,
+        qkv_in = torch.cat((query, key, value), dim=0)
+        use_fp8 = bool(
+            _TPU_ULYSSES_FP8_A2A_ENABLED or getattr(self, "_tpu_fp8_a2a", False)
         )
+        fp8_mode = str(
+            getattr(self, "_tpu_fp8_a2a_mode", _TPU_ULYSSES_FP8_A2A_MODE)
+        ).lower()
+        if use_fp8 and fp8_mode in ("all", "qkv") and query.dtype == torch.bfloat16:
+            qkv_batched = SeqAllToAll4D.apply(
+                self._ulysses_pg,
+                qkv_in.clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn),
+                self._scatter_idx,
+                self._gather_idx,
+                self._use_sync,
+            ).to(query.dtype)
+        else:
+            qkv_batched = SeqAllToAll4D.apply(
+                self._ulysses_pg,
+                qkv_in,
+                self._scatter_idx,
+                self._gather_idx,
+                self._use_sync,
+            )
         q_ex, k_ex, v_ex = qkv_batched.chunk(3, dim=0)
         ctx = uly_mod._UlyssesCtx(
             name=self.name,
@@ -1393,9 +1469,143 @@ def _patch_ulysses_batched_qkv_a2a() -> None:
         )
         return q_ex, k_ex, v_ex, attn_metadata, ctx
 
+    def _tpu_post_attention(
+        self: Any,
+        attn_output: torch.Tensor,
+        ctx: Any,
+    ) -> torch.Tensor:
+        use_fp8 = bool(
+            _TPU_ULYSSES_FP8_A2A_ENABLED or getattr(self, "_tpu_fp8_a2a", False)
+        )
+        fp8_mode = str(
+            getattr(self, "_tpu_fp8_a2a_mode", _TPU_ULYSSES_FP8_A2A_MODE)
+        ).lower()
+        if (
+            use_fp8
+            and fp8_mode in ("all", "out")
+            and isinstance(ctx, uly_mod._UlyssesCtx)
+            and ctx.joint_len == 0
+            and not ctx.use_uaa
+            and not self._ulysses_a2a_permute
+            and isinstance(attn_output, torch.Tensor)
+            and attn_output.device.type == "tpu"
+            and attn_output.dtype == torch.bfloat16
+        ):
+            return SeqAllToAll4D.apply(
+                ctx.ulysses_pg,
+                attn_output.clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(
+                    torch.float8_e4m3fn
+                ),
+                ctx.gather_idx,
+                ctx.scatter_idx,
+                ctx.use_sync,
+            ).to(attn_output.dtype)
+        return orig_post(self, attn_output, ctx)
+
     setattr(_tpu_pre_attention, _ULYSSES_BATCHED_A2A_PATCHED, True)
     cls.pre_attention = _tpu_pre_attention
-    logger.info("Applied TPU patch: batched QKV forward all_to_all for Ulysses SP.")
+    cls.post_attention = _tpu_post_attention
+    logger.info(
+        "Applied TPU patch: batched QKV + optional FP8 all_to_all for Ulysses SP."
+    )
+
+
+_BLOCK_SPARSE_REGISTRY_PATCHED = "_tpu_block_sparse_registry_patched"
+
+
+def _patch_block_sparse_attention_registry() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's DiffusionAttentionBackendEnum and
+    # BLOCK_SPARSE_BACKENDS natively include TpuBlockSparseAttentionBackend and
+    # ForwardContext step hooks notify registered attention backends directly.
+    #
+    # Problem:
+    # 1. vLLM-Omni's AttentionSpec only forwards block_sparse kwargs when the
+    #    backend name is in diff_data.BLOCK_SPARSE_BACKENDS.
+    # 2. MiniMaxH3Pipeline calls set_forward_context_denoise_step_idx outside
+    #    an active ForwardContext, so reading get_forward_context() inside a
+    #    compiled block either misses the step index or triggers a TorchDynamo
+    #    recompilation on every integer step 0..N-1.
+    # Fix: Register TpuBlockSparseAttentionBackend for RAINFUSION_ATTN and
+    #   FASTVIDEO_VSA, add TPU_BLOCK_SPARSE / BLOCK_SPARSE / FASTVIDEO_VSA to
+    #   BLOCK_SPARSE_BACKENDS, and update each TpuBlockSparseAttentionImpl's
+    #   boolean _sparse_step_active gate on host whenever the step index changes.
+    # -------------------------------------------------------------------------
+    try:
+        from vllm_omni.diffusion import data as diff_data
+        from vllm_omni.diffusion import forward_context as fc
+        from vllm_omni.diffusion.attention.backends.registry import (
+            DiffusionAttentionBackendEnum,
+            register_diffusion_backend,
+        )
+    except ImportError:
+        return
+
+    backend_path = "vllm_torchtpu.omni.attention.TpuBlockSparseAttentionBackend"
+    for member_name in ("RAINFUSION_ATTN", "FASTVIDEO_VSA"):
+        member = DiffusionAttentionBackendEnum.__members__.get(member_name)
+        if member is not None:
+            register_diffusion_backend(member, backend_path)
+
+    diff_data.BLOCK_SPARSE_BACKENDS = frozenset(
+        set(diff_data.BLOCK_SPARSE_BACKENDS)
+        | {"FASTVIDEO_VSA", "TPU_BLOCK_SPARSE", "BLOCK_SPARSE"}
+    )
+
+    orig_set_step = fc.set_forward_context_denoise_step_idx
+    if getattr(orig_set_step, _BLOCK_SPARSE_REGISTRY_PATCHED, False):
+        return
+    orig_set_total = fc.set_forward_context_denoise_total_steps
+
+    _step_state: dict[str, int | None] = {"step": None, "total": None}
+
+    def _sync_gates() -> None:
+        from vllm_torchtpu.omni.attention import refresh_block_sparse_step_gates
+
+        ctx = fc.get_forward_context() if fc.is_forward_context_available() else None
+        step_idx = (
+            getattr(ctx, "denoise_step_idx", None)
+            if ctx is not None
+            else _step_state["step"]
+        )
+        total = (
+            getattr(ctx, "total_denoise_steps", None)
+            if ctx is not None
+            else _step_state["total"]
+        )
+        refresh_block_sparse_step_gates(step_idx, total)
+
+    def _tpu_set_step(step_idx: int | None) -> None:
+        _step_state["step"] = step_idx
+        if step_idx is None:
+            _step_state["total"] = None
+        orig_set_step(step_idx)
+        _sync_gates()
+
+    def _tpu_set_total(total_steps: int | None) -> None:
+        _step_state["total"] = total_steps
+        orig_set_total(total_steps)
+        _sync_gates()
+
+    setattr(_tpu_set_step, _BLOCK_SPARSE_REGISTRY_PATCHED, True)
+    setattr(_tpu_set_total, _BLOCK_SPARSE_REGISTRY_PATCHED, True)
+    fc.set_forward_context_denoise_step_idx = _tpu_set_step
+    fc.set_forward_context_denoise_total_steps = _tpu_set_total
+
+    step_replacements = (
+        ("set_forward_context_denoise_step_idx", orig_set_step, _tpu_set_step),
+        ("set_forward_context_denoise_total_steps", orig_set_total, _tpu_set_total),
+    )
+    for mod in list(sys.modules.values()):
+        if not isinstance(mod, types.ModuleType):
+            continue
+        mod_dict = vars(mod)
+        mod_name = mod_dict.get("__name__", "")
+        if not isinstance(mod_name, str) or not mod_name.startswith("vllm_omni."):
+            continue
+        for attr_name, orig_fn, patched_fn in step_replacements:
+            if mod_dict.get(attr_name) is orig_fn:
+                setattr(mod, attr_name, patched_fn)
 
 
 _TPU_FP16_SDPA_PATCHED = "_tpu_fp16_sdpa_patched"

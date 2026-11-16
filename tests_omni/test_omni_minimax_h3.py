@@ -367,6 +367,327 @@ def test_ulysses_batched_qkv_a2a_returns_5_tuple(monkeypatch):
     assert q_ex.shape == k_ex.shape == v_ex.shape == (1, 10, 2, 8)
     assert ctx.scatter_idx == 2 and ctx.gather_idx == 1
 
+    # Also verify FP8 Ulysses all-to-all clamping on outlier values (> 448.0).
+    a2a_dtypes: list[torch.dtype] = []
+
+    def fake_apply_fp8(pg, inp, scatter_idx, gather_idx, use_sync):
+        a2a_dtypes.append(inp.dtype)
+        b, s, h, d = inp.shape
+        if scatter_idx == 2 and gather_idx == 1:
+            return (
+                inp.reshape(b, s, 2, h // 2, d)
+                .permute(0, 2, 1, 3, 4)
+                .reshape(b, s * 2, h // 2, d)
+            )
+        return (
+            inp.reshape(b, 2, s // 2, h, d)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(b, s // 2, h * 2, d)
+        )
+
+    monkeypatch.setattr(comm_mod.SeqAllToAll4D, "apply", staticmethod(fake_apply_fp8))
+    inst._tpu_fp8_a2a = True
+    q_bf16 = torch.full((1, 4, 4, 8), 1000.0, dtype=torch.bfloat16).as_subclass(
+        FakeTPUTensor
+    )
+    k_bf16 = torch.full((1, 4, 4, 8), -1000.0, dtype=torch.bfloat16).as_subclass(
+        FakeTPUTensor
+    )
+    v_bf16 = torch.full((1, 4, 4, 8), 500.0, dtype=torch.bfloat16).as_subclass(
+        FakeTPUTensor
+    )
+    q_f, k_f, v_f, _, ctx_f = inst.pre_attention(q_bf16, k_bf16, v_bf16, meta)
+    assert a2a_dtypes[-1] == torch.float8_e4m3fn
+    assert q_f.dtype == torch.bfloat16
+    assert (
+        torch.isfinite(q_f).all()
+        and torch.isfinite(k_f).all()
+        and torch.isfinite(v_f).all()
+    )
+    assert float(q_f.max()) == 448.0 and float(k_f.min()) == -448.0
+
+    o_bf16 = torch.full((1, 8, 2, 8), 900.0, dtype=torch.bfloat16).as_subclass(
+        FakeTPUTensor
+    )
+    o_f = inst.post_attention(o_bf16, ctx_f)
+    assert a2a_dtypes[-1] == torch.float8_e4m3fn
+    assert o_f.dtype == torch.bfloat16
+    assert torch.isfinite(o_f).all()
+    assert float(o_f.max()) == 448.0
+
+
+def test_block_sparse_attention_pallas_interpret_parity():
+    pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from vllm_torchtpu.kernels.diffusion_attention.block_sparse import (
+        block_sparse_attention_bshd,
+        sol_routing_stats,
+    )
+
+    rng = np.random.default_rng(7)
+    bsz, seq_len, heads, dim = 1, 512, 2, 128
+    valid_len = 480
+    prefix_tokens = 140
+    block = 128
+    scale = dim**-0.5
+
+    q_t = torch.from_numpy(
+        rng.standard_normal((bsz, seq_len, heads, dim)).astype(np.float32) * 0.5
+    ).to(torch.bfloat16)
+    k_t = torch.from_numpy(
+        rng.standard_normal((bsz, seq_len, heads, dim)).astype(np.float32) * 0.5
+    ).to(torch.bfloat16)
+    v_t = torch.from_numpy(
+        rng.standard_normal((bsz, seq_len, heads, dim)).astype(np.float32) * 0.5
+    ).to(torch.bfloat16)
+
+    # PyTorch exact masked reference over valid_len tokens
+    qf = q_t.float().permute(0, 2, 1, 3)  # [B, H, S, D]
+    kf = k_t.float().permute(0, 2, 1, 3)
+    vf = v_t.float().permute(0, 2, 1, 3)
+    scores = torch.matmul(qf, kf.transpose(-2, -1)) * scale
+    valid_k = torch.arange(seq_len) < valid_len
+    scores = scores.masked_fill(~valid_k[None, None, None, :], -1e30)
+    probs = torch.softmax(scores, dim=-1)
+    ref_out = torch.matmul(probs, vf).permute(0, 2, 1, 3).to(torch.bfloat16)
+
+    q_j = jnp.asarray(q_t.float().numpy(), dtype=jnp.bfloat16)
+    k_j = jnp.asarray(k_t.float().numpy(), dtype=jnp.bfloat16)
+    v_j = jnp.asarray(v_t.float().numpy(), dtype=jnp.bfloat16)
+
+    # 1. Dense parity (max_density=1.0) against exact masked softmax over valid_len
+    got_dense_j = block_sparse_attention_bshd(
+        q_j,
+        k_j,
+        v_j,
+        scale=scale,
+        valid_len=valid_len,
+        prefix_tokens=prefix_tokens,
+        block=block,
+        max_density=1.0,
+        sink_stride=4,
+        interpret=True,
+    )
+    got_dense = torch.from_numpy(np.asarray(got_dense_j, dtype=np.float32)).to(
+        torch.bfloat16
+    )
+    assert_parity(
+        got_dense[:, :valid_len],
+        ref_out[:, :valid_len],
+        name="block_sparse_dense_parity",
+        max_rel_l2=1e-2,
+        max_abs=2e-2,
+    )
+
+    # 2. Sparse routing (max_density=0.5, prefix=140 -> 2 prefix blocks = 256 rows):
+    #    Prefix query blocks [0:256] MUST match exact dense attention!
+    got_sparse_j = block_sparse_attention_bshd(
+        q_j,
+        k_j,
+        v_j,
+        scale=scale,
+        valid_len=valid_len,
+        prefix_tokens=prefix_tokens,
+        block=block,
+        max_density=0.5,
+        sink_stride=4,
+        interpret=True,
+    )
+    got_sparse = torch.from_numpy(np.asarray(got_sparse_j, dtype=np.float32)).to(
+        torch.bfloat16
+    )
+    assert torch.isfinite(got_sparse.float()).all()
+    assert_parity(
+        got_sparse[:, :256],
+        ref_out[:, :256],
+        name="block_sparse_prefix_parity",
+        max_rel_l2=1e-2,
+        max_abs=2e-2,
+    )
+
+    # 3. Verify Customer C1 routing density at S=37,760 with block=1024, sink_stride=8
+    seg_c1 = (jnp.arange(37760, dtype=jnp.int32) >= 37719).astype(jnp.int32)
+    q_c1 = jnp.ones((1, 37760, 128), dtype=jnp.bfloat16) * 0.1
+    stats = sol_routing_stats(
+        q_c1,
+        q_c1,
+        seg_c1,
+        block=1024,
+        prefix_tokens=412,
+        max_density=0.25,
+        sink_stride=8,
+    )
+    assert stats["n_b"] == 37
+    assert stats["k_cap"] == 10
+    assert 0.20 <= float(stats["density"]) <= 0.30
+
+
+def test_tpu_omni_fp8_config_layer_policy():
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm_omni.quantization.factory import build_quant_config
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        VllmUnquantizedLinearMethod,
+    )
+    from vllm_torchtpu.omni import patches
+    from vllm_torchtpu.omni.quantization import (
+        TpuOmniFp8Config,
+        register_omni_tpu_quantization,
+    )
+
+    register_omni_tpu_quantization()
+    assert not patches._TPU_ULYSSES_FP8_A2A_ENABLED
+    cfg = build_quant_config(
+        {
+            "method": "fp8",
+            "ignored_layers": ["blocks.0.*", "blocks.1.*", "blocks.49.*"],
+        }
+    )
+    assert isinstance(cfg, TpuOmniFp8Config)
+    assert not cfg.is_checkpoint_fp8_serialized
+    assert cfg.fp8_ulysses_a2a is True
+    assert cfg.fp8_ulysses_a2a_mode == "all"
+    # Instantiating TpuOmniFp8Config must NOT flip the global FP8 A2A switch
+    # (unquantized boundary blocks must stay BF16 unless tagged per-block).
+    assert not patches._TPU_ULYSSES_FP8_A2A_ENABLED
+
+    cfg_out = build_quant_config({"method": "fp8", "fp8_ulysses_a2a_mode": "out"})
+    assert isinstance(cfg_out, TpuOmniFp8Config)
+    assert cfg_out.fp8_ulysses_a2a is True
+    assert cfg_out.fp8_ulysses_a2a_mode == "out"
+
+    cfg_off = build_quant_config({"method": "fp8", "fp8_ulysses_a2a_mode": "off"})
+    assert isinstance(cfg_off, TpuOmniFp8Config)
+    assert cfg_off.fp8_ulysses_a2a is False
+
+    with pytest.raises(ValueError, match="fp8_ulysses_a2a_mode"):
+        build_quant_config({"method": "fp8", "fp8_ulysses_a2a_mode": "invalid"})
+
+    dummy = LinearBase(128, 128, params_dtype=torch.bfloat16, tp_rank=0, tp_size=1)
+    for skipped_prefix in (
+        "blocks.0.attn.qkv_proj",
+        "blocks.1.mlp.fc1",
+        "blocks.49.attn.out_proj",
+        "blocks.5.adaln_proj.linear",
+        "condition_proj",
+        "token_refiner.blocks.0.attn.qkv_proj",
+        "final_layer.adaln_proj.linear",
+        "text_encoder.model.layers.0.self_attn.qkv_proj",
+    ):
+        m = cfg.get_quant_method(dummy, skipped_prefix)
+        assert isinstance(m, VllmUnquantizedLinearMethod), skipped_prefix
+
+    for quant_prefix in (
+        "blocks.2.attn.qkv_proj",
+        "blocks.2.attn.out_proj",
+        "blocks.25.mlp.fc1",
+        "blocks.46.mlp.fc2",
+    ):
+        m = cfg.get_quant_method(dummy, quant_prefix)
+        assert isinstance(m, VllmFp8LinearMethodTPU), quant_prefix
+
+
+def test_tpu_block_sparse_step_gate_and_skip_layers(monkeypatch):
+    from vllm_omni.diffusion import forward_context as fc
+    from vllm_omni.diffusion.data import AttentionSpec
+    from vllm_omni.diffusion.forward_context import (
+        ForwardContext,
+        override_forward_context,
+    )
+
+    from vllm_torchtpu.omni import patches
+    from vllm_torchtpu.omni.attention import (
+        TpuBlockSparseAttentionBackend,
+        TpuBlockSparseAttentionImpl,
+    )
+    from vllm_torchtpu.omni.platform import OmniTpuPlatform
+
+    monkeypatch.setattr(patches, "apply_omni_model_specific_patches", lambda: None)
+    patches._patch_block_sparse_attention_registry()
+    for name in ("RAINFUSION_ATTN", "FASTVIDEO_VSA", "TPU_BLOCK_SPARSE"):
+        assert (
+            OmniTpuPlatform.get_diffusion_attn_backend_cls(name, 128)
+            == "vllm_torchtpu.omni.attention.TpuBlockSparseAttentionBackend"
+        )
+    assert TpuBlockSparseAttentionBackend.get_name() == "TPU_BLOCK_SPARSE"
+
+    spec = AttentionSpec(
+        backend="FASTVIDEO_VSA",
+        block_sparse={"sparsity": 0.75, "start_step": 10, "skip_layers": "0-1"},
+    )
+    bkw = spec.backend_kwargs()
+    assert bkw is not None
+
+    imp_skip = TpuBlockSparseAttentionImpl(
+        7, 128, 128**-0.5, prefix="blocks.0.attn", backend_kwargs=bkw, role="self"
+    )
+    imp_refiner = TpuBlockSparseAttentionImpl(
+        7,
+        128,
+        128**-0.5,
+        prefix="token_refiner.blocks.0.attn",
+        backend_kwargs=bkw,
+        role="minimax_h3.token_refiner",
+    )
+    imp_active = TpuBlockSparseAttentionImpl(
+        7, 128, 128**-0.5, prefix="blocks.2.attn", backend_kwargs=bkw, role="self"
+    )
+    assert not imp_skip._sparse_step_active
+    assert not imp_refiner._sparse_step_active
+    assert not imp_active._sparse_step_active  # start_step=10 -> starts False
+
+    with override_forward_context(ForwardContext()):
+        fc.set_forward_context_denoise_total_steps(50)
+        fc.set_forward_context_denoise_step_idx(9)
+        assert not imp_active._sparse_step_active
+        fc.set_forward_context_denoise_step_idx(10)
+        assert imp_active._sparse_step_active
+        assert not imp_skip._sparse_step_active
+        assert not imp_refiner._sparse_step_active
+        fc.set_forward_context_denoise_step_idx(None)
+        assert not imp_active._sparse_step_active
+
+    # Also verify step-gate updates work when ForwardContext is NOT active
+    # (matching MiniMaxH3Pipeline's minimax_h3_publish_denoise_progress) AND
+    # that TorchDynamo guards on _sparse_step_active across dense->sparse transition.
+    fc.set_forward_context_denoise_total_steps(50)
+    fc.set_forward_context_denoise_step_idx(9)
+    assert not imp_active._sparse_step_active
+    fc.set_forward_context_denoise_step_idx(10)
+    assert imp_active._sparse_step_active
+
+    calls: list[str] = []
+    imp_dyn = TpuBlockSparseAttentionImpl(
+        2,
+        128,
+        128**-0.5,
+        prefix="blocks.5.attn",
+        backend_kwargs={**bkw, "block_size": 128},
+        role="self",
+    )
+    imp_dyn._op = lambda q, k, v, sc: (calls.append("dense"), q)[1]
+    imp_dyn._sparse_op = lambda q, k, v, *a: (calls.append("sparse"), q * 2)[1]
+
+    class Wrap(nn.Module):
+        def __init__(self, impl):
+            super().__init__()
+            self.impl = impl
+
+        def forward(self, q):
+            return self.impl.forward(q, q, q, None)
+
+    c_wrap = torch.compile(Wrap(imp_dyn), backend="eager", dynamic=False)
+    q_in = torch.ones(1, 512, 2, 128, dtype=torch.bfloat16)
+    fc.set_forward_context_denoise_step_idx(2)
+    out_d = c_wrap(q_in)
+    fc.set_forward_context_denoise_step_idx(12)
+    out_s = c_wrap(q_in)
+    fc.set_forward_context_denoise_step_idx(None)
+    assert calls == ["dense", "sparse"]
+    assert float(out_d[0, 0, 0, 0]) == 1.0
+    assert float(out_s[0, 0, 0, 0]) == 2.0
+
 
 def test_tpu_fp16_sdpa_upcast_patch(monkeypatch):
     import torch.nn.functional as F
@@ -605,6 +926,54 @@ def test_extract_prefix_tokens_ref2va_text_cap_and_sdpa_chunking(monkeypatch):
     assert tuple(out_vit.shape) == (1, 2, 2500, 72)
 
 
+def test_tpu_load_model_tags_fp8_ulysses_a2a_per_block(monkeypatch):
+    from vllm_omni.diffusion.worker import diffusion_model_runner as dmr
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+    from vllm_torchtpu.omni import patches
+    from vllm_torchtpu.omni.quantization import TpuOmniFp8Config
+
+    monkeypatch.setattr(
+        dmr.DiffusionModelRunner, "load_model", lambda self, *a, **kw: None
+    )
+    patches._patch_diffusion_tpu_compile()
+
+    cfg = TpuOmniFp8Config(fp8_ulysses_a2a=True, fp8_ulysses_a2a_mode="out")
+    fp8_method = object.__new__(VllmFp8LinearMethodTPU)
+    fp8_method.quant_config = cfg
+
+    class FakeLinear(nn.Module):
+        def __init__(self, qm=None):
+            super().__init__()
+            self.quant_method = qm
+
+    class FakeBlock(nn.Module):
+        def __init__(self, quantized: bool):
+            super().__init__()
+            self.attention = SimpleNamespace(parallel_strategy=SimpleNamespace())
+            self.proj = FakeLinear(fp8_method if quantized else None)
+
+    class FakeDiT(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList(
+                [FakeBlock(False), FakeBlock(True), FakeBlock(False)]
+            )
+
+    dit = FakeDiT()
+    runner = SimpleNamespace(
+        device=SimpleNamespace(type="tpu"),
+        pipeline=SimpleNamespace(_dit_modules=("transformer",), transformer=dit),
+        od_config=SimpleNamespace(enforce_eager=True),
+    )
+    dmr.DiffusionModelRunner.load_model(runner)
+
+    assert dit.blocks[0].attention.parallel_strategy._tpu_fp8_a2a is False
+    assert dit.blocks[1].attention.parallel_strategy._tpu_fp8_a2a is True
+    assert dit.blocks[1].attention.parallel_strategy._tpu_fp8_a2a_mode == "out"
+    assert dit.blocks[2].attention.parallel_strategy._tpu_fp8_a2a is False
+
+
 @pytest.mark.tpu_test
 def test_diffusion_adaln_pallas_tpu_hardware_parity():
     from vllm_torchtpu.omni.adaln import (
@@ -730,4 +1099,78 @@ def test_minimax_qk_norm_rope_pallas_tpu_hardware_parity():
     )
     assert_parity(
         got_k, want_k, name="tpu_qknorm_rope_k", max_rel_l2=5e-3, max_abs=6.5e-2
+    )
+
+
+@pytest.mark.tpu_test
+def test_block_sparse_attention_pallas_tpu_hardware_parity():
+    from vllm_torchtpu.omni.attention import (
+        TpuBlockSparseAttentionImpl,
+        _block_sparse_attention_op,
+    )
+
+    dev = torch.device("tpu")
+    bsz, seq_len, heads, dim = 1, 512, 2, 128
+    valid_len = 480
+    prefix_tokens = 140
+    block = 128
+    scale = dim**-0.5
+
+    torch.manual_seed(7)
+    q_cpu = (torch.randn(bsz, seq_len, heads, dim) * 0.5).to(torch.bfloat16)
+    k_cpu = (torch.randn(bsz, seq_len, heads, dim) * 0.5).to(torch.bfloat16)
+    v_cpu = (torch.randn(bsz, seq_len, heads, dim) * 0.5).to(torch.bfloat16)
+
+    qf = q_cpu.float().permute(0, 2, 1, 3)
+    kf = k_cpu.float().permute(0, 2, 1, 3)
+    vf = v_cpu.float().permute(0, 2, 1, 3)
+    scores = torch.matmul(qf, kf.transpose(-2, -1)) * scale
+    valid_k = torch.arange(seq_len) < valid_len
+    scores = scores.masked_fill(~valid_k[None, None, None, :], -1e30)
+    ref_out = (
+        torch.matmul(torch.softmax(scores, dim=-1), vf)
+        .permute(0, 2, 1, 3)
+        .to(torch.bfloat16)
+    )
+
+    q_tpu, k_tpu, v_tpu = q_cpu.to(dev), k_cpu.to(dev), v_cpu.to(dev)
+    op = _block_sparse_attention_op()
+    got_dense = op(
+        q_tpu, k_tpu, v_tpu, scale, valid_len, prefix_tokens, block, 1.0, 1.0, 4
+    )
+
+    impl = TpuBlockSparseAttentionImpl(
+        num_heads=heads,
+        head_size=dim,
+        softmax_scale=scale,
+        prefix="blocks.2.attn",
+        backend_kwargs={
+            "sparsity": 0.5,
+            "start_step": 0,
+            "block_size": block,
+            "sink_stride": 4,
+        },
+        role="self",
+    )
+    meta = SimpleNamespace(
+        attn_mask=None,
+        extra={"valid_kv_length": valid_len, "prefix_tokens": prefix_tokens},
+    )
+    got_sparse = impl.forward(q_tpu, k_tpu, v_tpu, attn_metadata=meta)
+    torch.accelerator.synchronize()
+
+    assert_parity(
+        got_dense[:, :valid_len],
+        ref_out[:, :valid_len],
+        name="tpu_block_sparse_dense_parity",
+        max_rel_l2=1e-2,
+        max_abs=2e-2,
+    )
+    assert torch.isfinite(got_sparse.cpu().float()).all()
+    assert_parity(
+        got_sparse[:, :256],
+        ref_out[:, :256],
+        name="tpu_block_sparse_prefix_parity",
+        max_rel_l2=1e-2,
+        max_abs=2e-2,
     )
