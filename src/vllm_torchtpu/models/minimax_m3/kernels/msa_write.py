@@ -202,6 +202,10 @@ def _kernel(
                     new = jnp.pad(new, ((0, rows - spec.data_rows), (0, 0)))
                 merged = (words & keep) | (new << jnp.uint32(spec.bits * j))
                 words = jnp.where(take, merged, words)
+                # Slots past the run are zeroed: an unwritten slot may hold
+                # any bytes (NaN), which readers then need not mask.
+                past = (slot_j >= hi) & (row < spec.data_rows)
+                words = jnp.where(past, words & keep, words)
             if spec.scale_lane is not None:  # last word row: one scale per slot (lane)
                 bits = by_slot[spec.scale_lane : spec.scale_lane + 1]
                 if width > _LANES:
@@ -291,6 +295,11 @@ def write_runs(
 ) -> list[jax.Array]:
     """Write token ``t``'s rows / values of every target at ``(pages[t],
     slots[t])`` of its cache; returns the caches in `targets` order.
+
+    A `Rows` target's data slots past each run's last token are zeroed: the
+    8-bit decode attention (`msa_attention_lse._kernel`) multiplies a page's
+    unseen values by p = 0 unmasked, so no slot it reads may hold NaN bytes.
+    Any other writer of these caches must keep that invariant.
 
     The caches share the page geometry (same pages, slots per page). Tokens
     with a page outside the caches are dropped. Consecutive tokens of a run

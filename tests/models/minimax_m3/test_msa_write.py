@@ -46,6 +46,16 @@ def _batch(q_lens, ctx_lens, rng, pad_tokens):
     return jnp.asarray(pages), jnp.asarray(pos)
 
 
+def _zero_past_runs(rows, pages, pos):
+    """``rows [pages, S, ...]`` with each written page's slots past its last
+    written one zeroed, as the kernel writes them."""
+    rows = np.array(rows)
+    page_size, pages, pos = rows.shape[1], np.asarray(pages), np.asarray(pos)
+    for p in np.unique(pages[pages < rows.shape[0]]):
+        rows[p, pos[pages == p].max() % page_size + 1 :] = 0
+    return rows
+
+
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize(
@@ -61,15 +71,16 @@ def _batch(q_lens, ctx_lens, rng, pad_tokens):
 def test_matches_xla_scatter(q_lens, ctx_lens, pad_tokens, width, dtype):
     rng = np.random.default_rng(sum(q_lens) + width)
     num_tokens = sum(q_lens) + pad_tokens
-    cache = pack(
-        rng.standard_normal((NUM_PAGES, PAGE, width)).astype(np.float32), dtype
-    )
+    init = rng.standard_normal((NUM_PAGES, PAGE, width)).astype(np.float32)
+    cache = pack(init, dtype)
     rows = jnp.asarray(rng.standard_normal((num_tokens, width)) * 300).astype(
         jnp.bfloat16
     )
     pages, pos = _batch(q_lens, ctx_lens, rng, pad_tokens)
 
-    expected = msa.write_rows_xla(cache, rows, pages, pos)
+    expected = msa.write_rows_xla(
+        pack(_zero_past_runs(init, pages, pos), dtype), rows, pages, pos
+    )
     got = msa.write_rows(
         cache, rows, pages, pos, max_num_seqs=max(len(q_lens), 1), interpret=True
     )
@@ -134,7 +145,7 @@ def test_fp4_matches_scatter(q_lens, ctx_lens, pad_tokens, folded):
         )
 
     got = write()
-    want = np.asarray(nib).copy()
+    want = _zero_past_runs(nib, pages, pos)
     keep = np.asarray(pages) < NUM_PAGES
     p, s = np.asarray(pages)[keep], np.asarray(pos)[keep] % PAGE
     want[p, s] = np.asarray(rows)[keep]
@@ -286,9 +297,12 @@ def test_small_pages_match_xla_scatter():
     pages = jnp.asarray(np.concatenate(pages + [[DROPPED] * 2]), jnp.int32)
     pos = jnp.asarray(np.concatenate(pos + [[0, 0]]), jnp.int32)
     dtype = jnp.float8_e4m3fn
-    cache = pack(rng.standard_normal((num_pages, page, 128)).astype(np.float32), dtype)
+    init = rng.standard_normal((num_pages, page, 128)).astype(np.float32)
+    cache = pack(init, dtype)
     rows = jnp.asarray(rng.standard_normal((pages.shape[0], 128))).astype(jnp.bfloat16)
-    expected = msa.write_rows_xla(cache, rows, pages, pos)
+    expected = msa.write_rows_xla(
+        pack(_zero_past_runs(init, pages, pos), dtype), rows, pages, pos
+    )
     got = msa.write_rows(cache, rows, pages, pos, max_num_seqs=3, interpret=True)
     np.testing.assert_array_equal(
         np.asarray(got.astype(jnp.float32)), np.asarray(expected.astype(jnp.float32))
