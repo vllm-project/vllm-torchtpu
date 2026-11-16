@@ -506,6 +506,93 @@ def test_served_dims_front_switches_are_bit_exact(shape, switch):
     assert _rel(wrong, want) > CONTROL_BOUND
 
 
+# The DP16 landing's MoE-front switches (models/deepseek_v41/experimental).
+LANDING_SWITCHES = dict(
+    onehot_slots=True,
+    hbm_staging=True,
+    matmul_scale_repeat=True,
+    exchange_row_gather=True,
+    bf16_sort_counts=True,
+    slim_prepush_barrier=True,
+    fused_dispatch_meta=True,
+    table_kernel=True,
+    exchange_tables=True,
+    kernel_plan_tables=True,
+    single_barrier=True,
+    early_scale_scatter=2,
+    light_prepush=2,
+    dispatch_ahead=25,
+    tail_barrier=False,
+)
+
+
+@pytest.mark.parametrize("hash_routed", [False, True], ids=["scored", "hashed"])
+@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
+def test_served_dims_drop_repeated_tail_is_bit_exact(shape, hash_routed):
+    """Rows repeating their shard's last row take the first repeat's result:
+    the layer's output is the one without the switch bit for bit, on shards
+    whose tails repeat (shard 0 entirely, shard 1 not at all, the others
+    from different rows on), scored and hash-routed; the load accumulator
+    shows that only the first of each tail's repeats was routed."""
+    g_local, rows, topk = SERVED_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 81, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 82, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    x, gating = np.array(x), np.array(gating)
+    routed_rows = 0
+    for shard in range(EP):
+        lo, hi = shard * rows, (shard + 1) * rows
+        start = hi if shard == 1 else lo if shard == 0 else lo + rows // EP * shard
+        x[start:hi] = x[hi - 1]
+        gating[start:hi] = gating[hi - 1]
+        routed_rows += min(start, hi - 1) - lo + 1
+    shard = NamedSharding(mesh, P(AXIS))
+    replicated = NamedSharding(mesh, P())
+    x, gating = jax.device_put(x, shard), jax.device_put(gating, shard)
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+        **LANDING_SWITCHES,
+    )
+    if hash_routed:
+        ids = np.asarray(gating).argsort(axis=1)[:, :topk].astype(np.int32)
+        common["hash_topk_ids"] = jax.device_put(ids, shard)
+    # One slot per expert, so the accumulator counts each expert's rows.
+    identity = jnp.arange(e_total, dtype=jnp.int32)[:, None]
+    common["expert_slot"] = jax.device_put(identity, replicated)
+    zeros = jnp.zeros((e_total,), jnp.int32)
+    want, load_all = fused_ep_moe_push(
+        x, *weights, gating, expert_load=jax.device_put(zeros, replicated), **common
+    )
+    want = np.asarray(want)
+    assert np.isfinite(want.astype(np.float32)).all()
+    got, load_kept = fused_ep_moe_push(
+        x,
+        *weights,
+        gating,
+        expert_load=jax.device_put(zeros, replicated),
+        drop_repeated_tail=True,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(got), want)
+    assert int(np.asarray(load_all).sum()) == EP * rows * topk
+    assert int(np.asarray(load_kept).sum()) == routed_rows * topk
+
+
 def _shared_expert_weights(mesh, seed):
     """A per-channel FP8 shared expert at the served dims, replicated."""
     from vllm_torchtpu.kernels.quantized_matmul.shared_expert import _FP8_MAX

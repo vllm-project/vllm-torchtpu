@@ -350,7 +350,10 @@ def fused_ep_moe_push(
     repeat this shard's last row bit for bit (x, gating, hash ids and a
     per-row score bias) and copies its result onto the others, so a
     bucket's padding rows, which are all alike, cost one row instead of
-    loading the experts they all select. The
+    loading the experts they all select. Each row's FFN, wire quantization
+    and combine are per row, and an expert's replicas hold the same weights,
+    so the copied result is the one the row would have computed; the
+    dropped rows are left out of `expert_load`. The
     caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
