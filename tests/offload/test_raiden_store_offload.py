@@ -4639,17 +4639,14 @@ class TestHitSourcesBySource(unittest.TestCase):
         self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, stats2.data["data"])
         self.assertIsNone(manager.get_stats())
 
-    def test_unknown_source_and_missing_key_cache_semantics(self):
+    def test_missing_key_cache_semantics(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
         from vllm.v1.core.sched.output import SchedulerOutput
         from vllm.v1.metrics.cache_hit_source import CacheHitSource
         from vllm.v1.metrics.stats import PrefixCacheStats
 
-        from vllm_torchtpu.offload.metrics import (
-            UNSPECIFIED_OFFLOAD_LABELS,
-            RaidenOffloadMetricName,
-        )
+        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
 
         store = FakeKVCacheStore()
         manager = make_manager(store, storage_backend="posix")
@@ -4662,7 +4659,7 @@ class TestHitSourcesBySource(unittest.TestCase):
         ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
         self.assertEqual(ext_tokens, self.BLOCK)
 
-        # 1. Simulate a key missing _step_key_sources during update_state_after_alloc:
+        # Simulate a key missing _step_key_sources during update_state_after_alloc:
         # Raiden's HIT_TOKENS skips unrecorded keys rather than
         # mislabeling them, while get_external_cache_hit_sources still sums to the
         # hit count (as external_unspecified), so upstream keeps the split.
@@ -4692,53 +4689,6 @@ class TestHitSourcesBySource(unittest.TestCase):
         assert miss_stats is not None
         miss_values = miss_stats.data["data"]
         self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, miss_values)
-
-        # 2. A genuinely unrecognized BlockStatus (e.g. a new C++ tier not yet
-        # mapped by Python's _block_status) records under
-        # UNSPECIFIED_OFFLOAD_LABELS == ("external_unspecified", "unknown") in
-        # hit_tokens.
-        self.assertEqual(
-            UNSPECIFIED_OFFLOAD_LABELS, ("external_unspecified", "unknown")
-        )
-        unmapped_status_enum = SimpleNamespace(
-            HOST=FakeBlockStatus.HOST,
-            HOST_AND_HBM=FakeBlockStatus.HOST_AND_HBM,
-            REMOTE=FakeBlockStatus.REMOTE,
-            SHARED_STORAGE=object(),
-            HBM=FakeBlockStatus.HBM,
-            INIT=FakeBlockStatus.INIT,
-        )
-        unknown_block = FakeRaidenBlockId(
-            raiden_id=store.raiden_id,
-            host_block_id=-1,
-            status=FakeBlockStatus.SHARED_STORAGE,
-        )
-        k_cxl_ok = make_offload_key(req.block_hashes[1], 0)
-        with patch.object(manager, "_block_status", unmapped_status_enum):
-            manager._metrics.record_prepared_load(
-                [k_cxl_ok],
-                4,
-                {sh: unknown_block for sh in sub_hashes(k_cxl_ok)},
-                sub_hashes(k_cxl_ok),
-                manager._block_status,
-            )
-            cxl_tokens = manager.compute_load_tokens_by_source(
-                start_token=0,
-                end_token=self.BLOCK,
-                load_key_ranges=[(0, self.BLOCK, k_cxl_ok)],
-            )
-            self.assertEqual(
-                cxl_tokens, {CacheHitSource.EXTERNAL_UNSPECIFIED: self.BLOCK}
-            )
-            manager.record_admission_hits(cxl_tokens)
-
-        unk_stats = sched.get_stats()
-        assert unk_stats is not None
-        unk_values = unk_stats.data["data"]
-        self.assertEqual(
-            unk_values[RaidenOffloadMetricName.HIT_TOKENS],
-            {UNSPECIFIED_OFFLOAD_LABELS: self.BLOCK},
-        )
 
     def test_unpinned_load_reports_unspecified_and_no_hit_tokens(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks

@@ -31,7 +31,7 @@ from __future__ import annotations
 import copy
 import enum
 from collections import Counter
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -66,12 +66,6 @@ OFFLOAD_LOAD_LABELNAMES: tuple[str, str] = ("source", "backend")
 UNKNOWN_BACKEND_LABEL = "unknown"
 HOST_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.HOST.value, "dram")
 P2P_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.P2P.value, "rdma")
-# Reserved strictly for unrecognized C++ `BlockStatus` values (never used for
-# keys missing from `_step_key_sources`).
-UNSPECIFIED_OFFLOAD_LABELS: tuple[str, str] = (
-    CacheHitSource.EXTERNAL_UNSPECIFIED.value,
-    UNKNOWN_BACKEND_LABEL,
-)
 
 # Tier of each sub-block of one `OffloadKey`, as `(source, count)` runs of
 # consecutive sub-blocks in the same tier; the counts sum to
@@ -159,17 +153,6 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
             self.observe(zero_hits.data, engine_idx)
 
 
-def status_to_hit_source(status: Any, block_status_cls: Any) -> CacheHitSource:
-    """Map a Raiden C++ `BlockStatus` value to upstream `CacheHitSource`."""
-    if status in (block_status_cls.HOST, block_status_cls.HOST_AND_HBM):
-        return CacheHitSource.HOST
-    if status == block_status_cls.REMOTE:
-        return CacheHitSource.P2P
-    if status == block_status_cls.SHARED_STORAGE:
-        return CacheHitSource.DISK
-    return CacheHitSource.EXTERNAL_UNSPECIFIED
-
-
 def external_sources_with_tokens(
     tokens_by_source: Mapping[CacheHitSource, int],
 ) -> dict[CacheHitSource, int]:
@@ -250,84 +233,13 @@ class RaidenOffloadStatsCollector:
                 )
                 return (CacheHitSource.DISK.value, UNKNOWN_BACKEND_LABEL)
             return (CacheHitSource.DISK.value, self._storage_backend)
-        if source == CacheHitSource.EXTERNAL_UNSPECIFIED:
-            return UNSPECIFIED_OFFLOAD_LABELS
         raise ValueError(f"Unsupported offload source for metrics: {source!r}")
 
-    def _resolve_block_source(
-        self, status: Any, block_status_cls: Any
-    ) -> CacheHitSource:
-        source = status_to_hit_source(status, block_status_cls)
-        if source == CacheHitSource.EXTERNAL_UNSPECIFIED:
-            logger.warning_once(
-                "TPURaidenOffloadingConnector: unrecognized Raiden BlockStatus %s; "
-                "attributing offload metrics to (%r, %r).",
-                repr(status),
-                *UNSPECIFIED_OFFLOAD_LABELS,
-            )
-        return source
-
     def record_prepared_load(
-        self,
-        keys: Sequence[OffloadKey],
-        device_block_size_factor: int,
-        remote_slices: Mapping[bytes, Any],
-        sub_hashes: Sequence[bytes],
-        block_status_cls: Any,
+        self, key_sources: Mapping[OffloadKey, SubBlockSourceCounts]
     ) -> None:
-        """Record each key's `SubBlockSourceCounts` from `prepare_load`.
-
-        `remote_slices` contains only the sub-hashes that remain non-local after
-        pinning (any sub-hash promoted to local `HOST` DRAM before `prepare_load`
-        is absent from `remote_slices`); all other sub-blocks are in host DRAM.
-        For example, with `device_block_size_factor=4` and only the last of a
-        key's 4 sub-hashes in `remote_slices` (status `SHARED_STORAGE`), the
-        key is recorded as `((HOST, 3), (DISK, 1))`.
-        """
-        if not keys or device_block_size_factor <= 0:
-            return
-        if not remote_slices:
-            # Fast path when every pinned sub-block is resident in local HOST
-            # DRAM: share one 1-element tuple across all keys without scanning
-            # `sub_hashes`.
-            uniform_host: SubBlockSourceCounts = (
-                (CacheHitSource.HOST, device_block_size_factor),
-            )
-            for key in keys:
-                self._step_key_sources[key] = uniform_host
-            return
-
-        num_hashes = len(sub_hashes)
-        resolved: dict[Any, CacheHitSource] = {}
-        for idx, key in enumerate(keys):
-            start = idx * device_block_size_factor
-            end = min(start + device_block_size_factor, num_hashes)
-            source_counts: list[tuple[CacheHitSource, int]] = []
-            cur_source: CacheHitSource | None = None
-            cur_count = 0
-            for pos in range(start, end):
-                remote_block = remote_slices.get(sub_hashes[pos])
-                if remote_block is None:
-                    source = CacheHitSource.HOST
-                else:
-                    source = resolved.get(remote_block.status)
-                    if source is None:
-                        source = resolved[remote_block.status] = (
-                            self._resolve_block_source(
-                                remote_block.status, block_status_cls
-                            )
-                        )
-                if source == cur_source:
-                    cur_count += 1
-                else:
-                    if cur_source is not None:
-                        source_counts.append((cur_source, cur_count))
-                    cur_source = source
-                    cur_count = 1
-            if cur_source is not None:
-                source_counts.append((cur_source, cur_count))
-            if source_counts:
-                self._step_key_sources[key] = tuple(source_counts)
+        """Record the tiers of the keys that one `prepare_load` accepted."""
+        self._step_key_sources.update(key_sources)
 
     def get_load_sub_sources(self, key: OffloadKey) -> SubBlockSourceCounts | None:
         """Return the `SubBlockSourceCounts` recorded for `key`, or `None` on miss."""

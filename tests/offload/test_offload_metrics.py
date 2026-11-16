@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import enum
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -31,28 +30,15 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiConnector
 from vllm_torchtpu.offload.metrics import (
-    HOST_OFFLOAD_LABELS,
     OFFLOAD_LOAD_LABELNAMES,
-    UNSPECIFIED_OFFLOAD_LABELS,
     RaidenOffloadMetricName,
     RaidenOffloadPromMetrics,
     RaidenOffloadStatsCollector,
     build_raiden_offload_metric_definitions,
     external_sources_with_tokens,
     split_external_hit,
-    status_to_hit_source,
 )
 from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
-
-
-class _FakeBlockStatus(enum.Enum):
-    INIT = 0
-    REMOTE = 1
-    HOST = 2
-    HBM = 3
-    HOST_AND_HBM = 4
-    SHARED_STORAGE = 5
-    CXL = 6
 
 
 def _make_prom_metric_types(
@@ -78,7 +64,6 @@ def _make_prom_metric_types(
 
 
 def test_metric_definitions_have_directional_labels() -> None:
-    assert UNSPECIFIED_OFFLOAD_LABELS == ("external_unspecified", "unknown")
     defs = build_raiden_offload_metric_definitions({})
     assert set(defs.keys()) == {m.value for m in RaidenOffloadMetricName}
     load_metrics = {
@@ -86,25 +71,6 @@ def test_metric_definitions_have_directional_labels() -> None:
     }
     for metric in load_metrics:
         assert defs[metric].labelnames == OFFLOAD_LOAD_LABELNAMES
-
-
-@pytest.mark.parametrize(
-    ("status", "expected_hit"),
-    [
-        (_FakeBlockStatus.HOST, CacheHitSource.HOST),
-        (_FakeBlockStatus.HOST_AND_HBM, CacheHitSource.HOST),
-        (_FakeBlockStatus.REMOTE, CacheHitSource.P2P),
-        (_FakeBlockStatus.SHARED_STORAGE, CacheHitSource.DISK),
-        (_FakeBlockStatus.HBM, CacheHitSource.EXTERNAL_UNSPECIFIED),
-        (_FakeBlockStatus.INIT, CacheHitSource.EXTERNAL_UNSPECIFIED),
-        (_FakeBlockStatus.CXL, CacheHitSource.EXTERNAL_UNSPECIFIED),
-    ],
-)
-def test_status_to_hit_source(
-    status: _FakeBlockStatus,
-    expected_hit: CacheHitSource,
-) -> None:
-    assert status_to_hit_source(status, _FakeBlockStatus) == expected_hit
 
 
 def test_external_sources_with_tokens() -> None:
@@ -128,14 +94,9 @@ def test_collector_unknown_sources_and_missing_key_handling() -> None:
     )
 
     # 1. Disk source without configured storage_backend uses ("disk", "unknown"),
-    # EXTERNAL_UNSPECIFIED uses ("external_unspecified", "unknown"), and DEVICE
-    # or non-CacheHitSource values raise.
+    # and DEVICE, EXTERNAL_UNSPECIFIED, or non-CacheHitSource values raise.
     assert collector.source_labels(CacheHitSource.DISK) == ("disk", "unknown")
-    assert (
-        collector.source_labels(CacheHitSource.EXTERNAL_UNSPECIFIED)
-        == UNSPECIFIED_OFFLOAD_LABELS
-    )
-    for invalid in (CacheHitSource.DEVICE, "host"):
+    for invalid in (CacheHitSource.DEVICE, CacheHitSource.EXTERNAL_UNSPECIFIED, "host"):
         with pytest.raises(ValueError, match="Unsupported offload source"):
             collector.source_labels(cast(Any, invalid))
 
@@ -154,72 +115,15 @@ def test_collector_unknown_sources_and_missing_key_handling() -> None:
     )
     assert collector.pop_stats() is None
 
-    # 3. Unrecognized BlockStatus (CXL) in prepare_load records under
-    # ("external_unspecified", "unknown") instead of ("p2p", "rdma").
-    k0 = make_offload_key(b"k0", 0)
-    cxl_block = SimpleNamespace(status=_FakeBlockStatus.CXL)
-    collector.record_prepared_load(
-        [k0],
-        1,
-        {b"s0": cxl_block},
-        [b"s0"],
-        _FakeBlockStatus,
-    )
-    assert collector.get_load_sub_sources(k0) == (
-        (CacheHitSource.EXTERNAL_UNSPECIFIED, 1),
-    )
-
-    collector.record_prepared_load(
-        [k0],
-        2,
-        {b"s1": cxl_block},
-        [b"s0", b"s1"],
-        _FakeBlockStatus,
-    )
-    assert collector.get_load_sub_sources(k0) == (
-        (CacheHitSource.HOST, 1),
-        (CacheHitSource.EXTERNAL_UNSPECIFIED, 1),
-    )
-
-    tokens_by_source = collector.compute_load_tokens_by_source(
-        start_token=0,
-        end_token=16,
-        load_key_ranges=[(0, 16, k0)],
-        tokens_per_chunk_by_group={0: 16},
-    )
-    assert tokens_by_source == {
-        CacheHitSource.HOST: 8,
-        CacheHitSource.EXTERNAL_UNSPECIFIED: 8,
-    }
-    collector.record_admission_hits(tokens_by_source)
-
-    stats = collector.pop_stats()
-    assert stats is not None
-    values = stats.data["data"]
-    assert values[RaidenOffloadMetricName.HIT_TOKENS] == {
-        HOST_OFFLOAD_LABELS: 8,
-        UNSPECIFIED_OFFLOAD_LABELS: 8,
-    }
-
 
 def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     collector = RaidenOffloadStatsCollector(storage_backend="posix")
-    peer_blk = SimpleNamespace(status=_FakeBlockStatus.REMOTE)
-    disk_blk = SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE)
 
     # 1. Single attention key (64 tokens, 4 x 16-token sub-blocks):
     # 3 HOST + 1 DISK sub-blocks form 2 runs -> 48 HOST + 16 DISK.
     k_dense = make_offload_key(b"dense0", 0)
     collector.record_prepared_load(
-        [k_dense],
-        4,
-        {b"s3": disk_blk},
-        [b"s0", b"s1", b"s2", b"s3"],
-        _FakeBlockStatus,
-    )
-    assert collector.get_load_sub_sources(k_dense) == (
-        (CacheHitSource.HOST, 3),
-        (CacheHitSource.DISK, 1),
+        {k_dense: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))}
     )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
@@ -234,16 +138,13 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     # 2. Partial-tail range [0, 48) on a 64-token chunk excludes t3 ([48, 64)).
     k_tail = make_offload_key(b"tail0", 0)
     collector.record_prepared_load(
-        [k_tail],
-        4,
-        {b"t2": peer_blk, b"t3": disk_blk},
-        [b"t0", b"t1", b"t2", b"t3"],
-        _FakeBlockStatus,
-    )
-    assert collector.get_load_sub_sources(k_tail) == (
-        (CacheHitSource.HOST, 2),
-        (CacheHitSource.P2P, 1),
-        (CacheHitSource.DISK, 1),
+        {
+            k_tail: (
+                (CacheHitSource.HOST, 2),
+                (CacheHitSource.P2P, 1),
+                (CacheHitSource.DISK, 1),
+            )
+        }
     )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
@@ -255,29 +156,15 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
         CacheHitSource.P2P: 16,
     }
 
-    # 3. Large sub-block factor (factor=512, 8192-token chunks):
-    # - Uniform HOST batch shares a single 1-element tuple across keys.
-    # - Contiguous 384 HOST + 128 DISK collapses to 2 runs instead of 512.
+    # 3. Large sub-block factor (factor=512, 8192-token chunks): a uniform HOST
+    # key, and a key of 384 HOST + 128 DISK sub-blocks in 2 runs.
     k_big0 = make_offload_key(b"big0", 0)
-    k_big1 = make_offload_key(b"big1", 0)
-    collector.record_prepared_load([k_big0, k_big1], 512, {}, [], _FakeBlockStatus)
-    runs_big0 = collector.get_load_sub_sources(k_big0)
-    runs_big1 = collector.get_load_sub_sources(k_big1)
-    assert runs_big0 == ((CacheHitSource.HOST, 512),)
-    assert runs_big0 is runs_big1
-
     k_big_mixed = make_offload_key(b"big_mixed", 0)
-    big_hashes = [f"bh_{i}".encode() for i in range(512)]
     collector.record_prepared_load(
-        [k_big_mixed],
-        512,
-        {h: disk_blk for h in big_hashes[384:]},
-        big_hashes,
-        _FakeBlockStatus,
-    )
-    assert collector.get_load_sub_sources(k_big_mixed) == (
-        (CacheHitSource.HOST, 384),
-        (CacheHitSource.DISK, 128),
+        {
+            k_big0: ((CacheHitSource.HOST, 512),),
+            k_big_mixed: ((CacheHitSource.HOST, 384), (CacheHitSource.DISK, 128)),
+        }
     )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
@@ -294,13 +181,12 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     k_a0 = make_offload_key(b"a0", 0)
     k_a1 = make_offload_key(b"a1", 0)
     k_m1 = make_offload_key(b"m1", 1)
-    collector.record_prepared_load([k_a0, k_m1], 4, {}, [], _FakeBlockStatus)
     collector.record_prepared_load(
-        [k_a1],
-        4,
-        {b"a1_2": peer_blk, b"a1_3": peer_blk},
-        [b"a1_0", b"a1_1", b"a1_2", b"a1_3"],
-        _FakeBlockStatus,
+        {
+            k_a0: ((CacheHitSource.HOST, 4),),
+            k_a1: ((CacheHitSource.HOST, 2), (CacheHitSource.P2P, 2)),
+            k_m1: ((CacheHitSource.HOST, 4),),
+        }
     )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
@@ -316,11 +202,7 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     # If Mamba's indivisible checkpoint has one byte slice in DISK, the whole
     # prefix [0, 32) depends on that DISK checkpoint -> {DISK: 32}.
     collector.record_prepared_load(
-        [k_m1],
-        4,
-        {b"m1_3": disk_blk},
-        [b"m1_0", b"m1_1", b"m1_2", b"m1_3"],
-        _FakeBlockStatus,
+        {k_m1: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))}
     )
     assert collector.compute_load_tokens_by_source(
         start_token=0,
@@ -353,15 +235,10 @@ def test_compute_load_tokens_by_source_clips_mixed_key_to_hit_range(
     expected: dict[CacheHitSource, int],
 ) -> None:
     collector = RaidenOffloadStatsCollector(storage_backend="posix")
-    disk_blk = SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE)
     # A 64-token key with four 16-token sub-blocks: two in host DRAM, two on disk.
     key = make_offload_key(b"mixed", 0)
     collector.record_prepared_load(
-        [key],
-        4,
-        {b"s2": disk_blk, b"s3": disk_blk},
-        [b"s0", b"s1", b"s2", b"s3"],
-        _FakeBlockStatus,
+        {key: ((CacheHitSource.HOST, 2), (CacheHitSource.DISK, 2))}
     )
     assert (
         collector.compute_load_tokens_by_source(
@@ -394,14 +271,9 @@ def test_compute_load_tokens_by_source_unsplit_key_uses_slowest_tier(
         lambda *args: warnings.append(args),
     )
     collector = RaidenOffloadStatsCollector(storage_backend="posix")
-    disk_blk = SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE)
     key = make_offload_key(b"mixed", 0)
     collector.record_prepared_load(
-        [key],
-        4,
-        {b"s3": disk_blk},
-        [b"s0", b"s1", b"s2", b"s3"],
-        _FakeBlockStatus,
+        {key: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))}
     )
     assert collector.compute_load_tokens_by_source(
         start_token=0,

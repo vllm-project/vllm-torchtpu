@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import itertools
 import math
 import os
 import socket
@@ -128,6 +129,7 @@ from vllm_torchtpu.offload.metrics import (
     HOST_OFFLOAD_LABELS,
     P2P_OFFLOAD_LABELS,
     RaidenOffloadStatsCollector,
+    SubBlockSourceCounts,
     build_raiden_offload_metric_definitions,
 )
 
@@ -850,13 +852,41 @@ class RaidenOffloadingManager(OffloadingManager):
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
         self._metrics.record_prepared_load(
-            keys,
-            self._device_block_size_factor,
-            remote_slices,
-            sub_hashes,
-            self._block_status,
+            self._key_sources(keys, sub_hashes, remote_slices)
         )
         return RaidenLoadStoreSpec(keys)
+
+    def _key_sources(
+        self,
+        keys: list[OffloadKey],
+        sub_hashes: list[bytes],
+        remote_slices: Mapping[bytes, Any],
+    ) -> dict[OffloadKey, SubBlockSourceCounts]:
+        """The tier that `submit_load_job` reads each sub-block of each key from.
+
+        `remote_slices` has Raiden's location record of each sub-block that is not
+        read from the host pool: a peer's block (`REMOTE`) or a storage block.
+        """
+        factor = self._device_block_size_factor
+        if not remote_slices:
+            # The common load, all in the host pool: one tuple for every key.
+            all_host: SubBlockSourceCounts = ((CacheHitSource.HOST, factor),)
+            return dict.fromkeys(keys, all_host)
+        key_sources: dict[OffloadKey, SubBlockSourceCounts] = {}
+        for key_idx, key in enumerate(keys):
+            sources = []
+            for sub_hash in sub_hashes[key_idx * factor : (key_idx + 1) * factor]:
+                block = remote_slices.get(sub_hash)
+                if block is None:
+                    sources.append(CacheHitSource.HOST)
+                elif block.status == self._block_status.REMOTE:
+                    sources.append(CacheHitSource.P2P)
+                else:  # SHARED_STORAGE
+                    sources.append(CacheHitSource.DISK)
+            key_sources[key] = tuple(
+                (source, len(list(run))) for source, run in itertools.groupby(sources)
+            )
+        return key_sources
 
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
