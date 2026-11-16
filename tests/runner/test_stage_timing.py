@@ -35,7 +35,7 @@ def events(monkeypatch):
 
     factory = MagicMock(side_effect=make_event)
     factory.events = created
-    monkeypatch.setattr(stage_timing, "TpuEvent", factory)
+    monkeypatch.setattr(stage_timing, "Event", factory)
     return factory
 
 

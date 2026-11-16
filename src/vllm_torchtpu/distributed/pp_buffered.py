@@ -87,7 +87,7 @@ import math
 import threading
 from collections import deque
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from vllm.sequence import IntermediateTensors
@@ -95,9 +95,6 @@ from vllm.sequence import IntermediateTensors
 from vllm_torchtpu.distributed.pp_engine import buffered_extra_steps
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
-
-if TYPE_CHECKING:
-    from torch_tpu._internal.stream.streams import TpuEvent
 
 logger = init_logger(__name__)
 
@@ -138,11 +135,11 @@ def _flush(tensors: tuple[torch.Tensor, ...]) -> None:
     sync.synchronize(list(tensors), wait=False)
 
 
-def _fence() -> "TpuEvent":
+def _fence() -> torch.Event:
     """Records a device event for all work submitted so far."""
-    from torch_tpu._internal.stream.streams import TpuEvent
+    from torch.tpu import Event
 
-    event = TpuEvent()
+    event = Event()
     event.record()
     return event
 
@@ -281,7 +278,7 @@ class PPBuffered:
         # Sends queued for the helper thread, the one in progress first:
         # (transfer, tensors, fence); the last stage queues no tensors.
         self._cv = threading.Condition()
-        self._sends: deque[tuple[int, tuple[torch.Tensor, ...], TpuEvent]] = deque()
+        self._sends: deque[tuple[int, tuple[torch.Tensor, ...], torch.Event]] = deque()
         self._closing = False
         self._error: BaseException | None = None
         self._thread: threading.Thread | None = None
@@ -595,7 +592,7 @@ class PPBuffered:
         self._queue_send(self._current, outgoing, _fence())
 
     def _queue_send(
-        self, transfer: int, outgoing: tuple[torch.Tensor, ...], fence: "TpuEvent"
+        self, transfer: int, outgoing: tuple[torch.Tensor, ...], fence: torch.Event
     ) -> None:
         if self._thread is None:
             self._thread = threading.Thread(
@@ -614,7 +611,7 @@ class PPBuffered:
             self._cv.notify_all()
 
     def _send(
-        self, transfer: int, outgoing: tuple[torch.Tensor, ...], fence: "TpuEvent"
+        self, transfer: int, outgoing: tuple[torch.Tensor, ...], fence: torch.Event
     ) -> None:
         """Sends one transfer once its tensors are computed and returns when
         the copies are done; runs on the send thread. Once the fence shows
