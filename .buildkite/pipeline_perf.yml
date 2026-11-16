@@ -73,29 +73,6 @@ steps:
       # but v6e, which has the step below.
       - label: "Perf/Eval: General suite (TPU ${TPU_GENERATION:-v7x}-8)"
         <<: *perf_step
-        if: '"${TPU_GENERATION:-v7x}" != "v6e"'
-        parallelism: 3
-        env: *general_suite_env
-        plugins:
-          - *kube_plugin
-        commands:
-          - |
-            .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
-              qwen3-coder-30b-fp8-tp8-ep \
-              qwen3-30b-a3b-nvfp4-tp8-ep \
-              qwen3.5-35b-fp8-tp4-ep \
-              deepseek-v2-tp8-ep \
-              gemma-4-31b-fp8-dp4-tp2-multimodal \
-              gemma-4-26b-fp8-dp4-tp2-multimodal
-
-      # v6e's General suite: the one above less the two configs a v6e 2x4 slice
-      # cannot run, deepseek-v2-tp8-ep (DeepSeek-V2 in bf16, ~470 GB of its
-      # 256 GB of HBM) and qwen3-30b-a3b-nvfp4-tp8-ep (native fp4, which this
-      # repo covers on v7x and later only). A config added above is added here
-      # too if it fits.
-      - label: "Perf/Eval: General suite, v6e subset (TPU v6e-8)"
-        <<: *perf_step
-        if: '"${TPU_GENERATION:-v7x}" == "v6e"'
         parallelism: 2
         env: *general_suite_env
         plugins:
@@ -107,6 +84,19 @@ steps:
               qwen3.5-35b-fp8-tp4-ep \
               gemma-4-31b-fp8-dp4-tp2-multimodal \
               gemma-4-26b-fp8-dp4-tp2-multimodal
+
+      # General suite cases that does not fit on v6e
+      - label: "Perf/Eval: General suite, v7x only"
+        <<: *perf_step
+        if: '"${TPU_GENERATION:-v7x}" == "v7x"'
+        env: *general_suite_env
+        plugins:
+          - *kube_plugin
+        commands:
+          - |
+            .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
+              qwen3-30b-a3b-nvfp4-tp8-ep \
+              deepseek-v2-tp8-ep
 
       - label: "Perf/Eval: qwen3-0.6b-tp1"
         <<: *perf_step

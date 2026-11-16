@@ -2195,13 +2195,9 @@ class TestBootstrapUnits(unittest.TestCase):
         # upload names them (test_tests_lane_tpu_generations checks that it
         # does). The script defines no prefix of its own either.
         report_sh = _SCRIPTS_DIR / "nightly_report.sh"
-        self.assertNotIn(
-            bp.TPU_V7X.key_prefix, report_sh.read_text(encoding="utf-8")
-        )
+        self.assertNotIn(bp.TPU_V7X.key_prefix, report_sh.read_text(encoding="utf-8"))
         report_env = {"PATH": os.environ["PATH"], **report_step["env"]}
-        self.assertEqual(
-            report_env["TPU_VERIFIED_KEY_PREFIX"], bp.TPU_V7X.key_prefix
-        )
+        self.assertEqual(report_env["TPU_VERIFIED_KEY_PREFIX"], bp.TPU_V7X.key_prefix)
         scanned = subprocess.run(
             ["bash", "-c", 'source "$1" && nightly_tests_lane_keys', "_", report_sh],
             cwd=_REPO_ROOT,
@@ -2555,9 +2551,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertNotEqual(verify(runs["v6e"]), default)
         self.assertIn(bp.TPU_V7X.key_prefix, default)
         self.assertEqual(
-            verify(runs["v6e"]).replace(
-                bp.TPU_V6E.key_prefix, bp.TPU_V7X.key_prefix
-            ),
+            verify(runs["v6e"]).replace(bp.TPU_V6E.key_prefix, bp.TPU_V7X.key_prefix),
             default,
         )
 
