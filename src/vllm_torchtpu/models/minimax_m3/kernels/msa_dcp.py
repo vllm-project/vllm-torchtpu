@@ -61,9 +61,18 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 _NEG_INF = float("-inf")
 _LANES = 128
 # The narrowest column count `local_candidates` scans (a vreg's lanes), and
-# the fewest tokens for which it picks a width per row block.
+# the fewest rows for which it picks a width per row block: below it a pick
+# is latency-bound whatever its width (c4 b1 3.4 us at 1,024 columns), above
+# it per-column work (c48 b36 decode: 288 rows x 1,024 columns, 12 us per
+# layer, of which ~370 columns are visible).
 _MIN_CANDIDATE_WIDTH = 128
-_MIN_CANDIDATE_TOKENS = 1024
+_MIN_CANDIDATE_TOKENS = 128
+# Decode-sized batches (up to this many rows) pick in row blocks of a vreg's
+# lanes, transposed, where that pads less than `msa_select.DEFAULT_BLOCK_ROWS`
+# (c48 b36: 288 rows in 3 x 128, not 2 x 256: candidates 12.0 -> 3.4 us per
+# layer, twins j-1b4fb146, j-ec9e7ff6; c48 b23's 184 rows in 2 x 128 were
+# slower than in one block of 184, 4.6 -> 6.3 us at 136K context).
+_DECODE_CANDIDATE_TOKENS = 1024
 
 # Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
 # limit; every decode bucket) an 8-token verify group fills an attention tile
@@ -347,6 +356,16 @@ def local_candidates(
     # `block_rows` rows mostly of padding: the kernel's topk passes scan every
     # row of the block.
     block_rows = min(block_rows, max(8, -(-num_tokens // 8) * 8))
+    # Only where 128-row blocks pad less (not one block's worth of rows, nor a
+    # multiple of 256), and not for a class with `live_rows`: its unpadded
+    # scores must hold whole blocks of the size it was planned for (below).
+    rows_128 = -(-num_tokens // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
+    if (
+        live_rows is None
+        and block_rows < num_tokens <= _DECODE_CANDIDATE_TOKENS
+        and rows_128 < -(-num_tokens // block_rows) * block_rows
+    ):
+        block_rows = _TRANSPOSED_ROWS
     if pretransposed:
         block_rows = -(-block_rows // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
     pad = -num_tokens % block_rows
@@ -363,12 +382,14 @@ def local_candidates(
     p = jnp.pad(pos, (0, pad))[:, None]
     # Static scan widths (`_scan_widths`, one kernel body each); each row
     # block takes the narrowest one holding every block its rows see (a
-    # rank's blocks below n are among its first ceil(n / dcp) columns). A
-    # decode batch scans the full width: its scan is a few us, and picking a
-    # width would cost more.
+    # rank's blocks below n are among its first ceil(n / dcp) columns). Only
+    # transposed blocks: row-major ones scan the full width (c48 b23's one
+    # block of 184 rows took 4.6 us per layer at 1,024 columns, 18 us with
+    # widths, twins j-9662bca6, j-7cf6dd33).
+    transposed = block_rows % _TRANSPOSED_ROWS == 0
     widths = (
         _scan_widths(num_cols, pretransposed)
-        if num_tokens > _MIN_CANDIDATE_TOKENS
+        if transposed and num_tokens >= _MIN_CANDIDATE_TOKENS
         else [num_cols]
     )
     num_blocks = (num_tokens + pad) // block_rows
@@ -379,7 +400,6 @@ def local_candidates(
         needed = -(-(last_pos // block_size + 1) // dcp)
         w = jnp.asarray(widths, jnp.int32)
         row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
-    transposed = block_rows % _TRANSPOSED_ROWS == 0
     if transposed:
         kernel = functools.partial(_candidates_kernel_t, pretransposed=pretransposed)
         pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))

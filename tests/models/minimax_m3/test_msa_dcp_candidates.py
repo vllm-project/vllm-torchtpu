@@ -55,11 +55,14 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
 @pytest.mark.parametrize(
     "num_tokens,num_cols,dcp,rank,max_pos,init_blocks,local_blocks",
     [
-        (300, 512, 2, 1, 40_000, 0, 1),  # several row blocks, few chunks visible
+        (300, 512, 2, 1, 40_000, 0, 1),  # 128-row blocks, few chunks visible
         (300, 512, 2, 0, 130_000, 1, 1),  # every chunk visible in some block
         (5, 256, 8, 3, 9_000, 0, 1),  # decode-sized: one 8-row block
         (40, 96, 4, 2, 20_000, 1, 2),  # a width below one 128-column step
         (300, 384, 2, 0, 60_000, 0, 1),  # widths 128, 256 and the full 384
+        (128, 512, 2, 1, 50_000, 0, 1),  # the fewest rows that pick widths
+        (129, 512, 2, 0, 50_000, 0, 1),  # one block of all its rows
+        (1032, 256, 2, 1, 30_000, 0, 1),  # past decode-sized: 256-row blocks
     ],
 )
 def test_candidates_match_reference(
@@ -97,7 +100,7 @@ def test_candidates_match_reference(
     np.testing.assert_array_equal(np.asarray(got_s), want_s)
 
 
-@pytest.mark.parametrize("num_tokens", [256, 384, 300])
+@pytest.mark.parametrize("num_tokens", [256, 384, 300, 129])
 def test_row_blocks_stay_inside_the_scores(num_tokens):
     """Without `live_rows` every row block runs: the scores the kernel reads
     must hold whole row blocks (a block past them halted the c48 decode twin
