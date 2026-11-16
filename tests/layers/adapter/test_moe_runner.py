@@ -264,9 +264,9 @@ def test_the_count_tap_sees_every_layer_the_runner_applies(monkeypatch):
     torch.nn.Module.__init__(runner)
     runner.routed_experts = SimpleNamespace()
     monkeypatch.setattr(runner, "_rows_gathered", lambda: (True, False))
-    logits, ids = torch.zeros(2, 4), torch.tensor([3, 1])
+    hidden, logits, ids = torch.zeros(2, 8), torch.zeros(2, 4), torch.tensor([3, 1])
     runner._apply_quant_method(
-        hidden_states=torch.zeros(2, 8),
+        hidden_states=hidden,
         router_logits=logits,
         shared_experts_input=None,
         input_ids=ids,
@@ -274,6 +274,7 @@ def test_the_count_tap_sees_every_layer_the_runner_applies(monkeypatch):
     ((layer, got_logits, got_ids, gathered),) = recorded
     assert layer is runner.routed_experts
     assert got_logits is logits and got_ids is ids
+    assert gathered.pop("hidden_states") is hidden
     assert gathered == {"over_dp": True, "over_pcp": False}
     assert applied[0]["router_logits"] is logits
     assert applied[0]["input_ids"] is ids

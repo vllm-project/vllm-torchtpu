@@ -208,6 +208,7 @@ class VllmMoERunner(MoERunner):
                 self.routed_experts,
                 router_logits,
                 input_ids,
+                hidden_states=hidden_states,
                 over_dp=over_dp,
                 over_pcp=over_pcp,
             )

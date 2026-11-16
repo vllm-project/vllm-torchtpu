@@ -16,8 +16,10 @@
 An expert placement is only as good as the routing statistics it is built
 from, and a fused kernel selects inside its own program, so its choices never
 reach the host. With the tap on, every MoE layer, whatever its kernel, re-runs
-the same selection in the traced forward (`moe_routing.select_experts`: hash
-table or scored top-k) and accumulates, on the device, per global expert:
+the same selection in the traced forward, through the routing entry point the
+TPU MoE methods use (`moe_routing.route`: a model's custom routing function,
+else hash table or scored top-k), and accumulates, on the device, per global
+expert:
 
     row 0: routed pairs           sum over steps of c
     row 1: squared per-step count sum over steps of c * c
@@ -35,7 +37,7 @@ hot expert's count wraps within the hour at 1024-token steps). The snapshot is
 the running total, never overwritten:
 
     <dir>/counts_ep<rank>_<seq>.npz   counts [layers, 3, experts] i64,
-                                      layer_names, step, wall
+                                      layer_names, layer_indices, step, wall
 
 <rank> is the layer's EP rank. Each token is counted once over the ranks'
 snapshots: where the MoE input is replicated over a TP group (the fused
@@ -43,6 +45,9 @@ kernel's token replica groups), only TP rank 0 records, and where the MoE
 runner has gathered the rows over DP or PCP, each rank counts only its own.
 Experts are numbered as in the checkpoint, also in a layer an expert placement
 has renumbered, so a placement built from the counts names the same experts.
+`layer_indices` holds each layer's number in a TPU_EXPERT_PLACEMENT table, as
+the loader numbers it (`expert_placement.layer_index`: a drafter's MoE layer i
+of an n-layer target is n + i, whatever its module is named), or -1.
 A restarted process numbers its snapshots after the ones already in <dir>;
 its `step` starts over, which is how a reader tells the runs apart.
 
@@ -70,11 +75,11 @@ COUNTS_ATTR = "_tpu_expert_counts"
 # rows its runner gathered.
 RANKS_ATTR = "_tpu_expert_count_ranks"
 
-# (layer name, layer, slot order or None) for every tapped layer of this
-# process, in registration order. The layers own the buffers; this only lists
-# them for the dump, with the order that maps a placed layer's slots back to
-# the checkpoint's experts.
-_TAPPED: list[tuple[str, torch.nn.Module, tuple[int, ...] | None]] = []
+# (layer name, layer, slot order or None, table layer or -1) for every tapped
+# layer of this process, in registration order. The layers own the buffers;
+# this only lists them for the dump, with the order that maps a placed layer's
+# slots back to the checkpoint's experts.
+_TAPPED: list[tuple[str, torch.nn.Module, tuple[int, ...] | None, int]] = []
 
 
 def _fresh_state() -> dict:
@@ -149,7 +154,15 @@ def register(layer) -> None:
         torch.tensor([dp_rank, pcp_rank], dtype=torch.int32, device=device),
         persistent=False,
     )
-    _TAPPED.append((layer.layer_name, layer, expert_placement.expert_order(layer)))
+    index = expert_placement.layer_index(layer.layer_name)
+    _TAPPED.append(
+        (
+            layer.layer_name,
+            layer,
+            expert_placement.expert_order(layer),
+            -1 if index is None else index,
+        )
+    )
 
 
 def is_tapped(layer) -> bool:
@@ -214,25 +227,27 @@ def record(
     router_logits: torch.Tensor,
     input_ids,
     *,
+    hidden_states: torch.Tensor | None = None,
     over_dp: bool = False,
     over_pcp: bool = False,
 ) -> None:
     """Accumulate this step's selections into the layer's buffer (traced).
 
-    `over_dp` / `over_pcp`: the runner gathered the rows over that group
-    before the experts got them, so this rank holds every rank's rows.
+    `hidden_states`: the rows the experts get, for a routing function that
+    reads them (the logits stand in when not given). `over_dp` / `over_pcp`:
+    the runner gathered the rows over that group before the experts got them,
+    so this rank holds every rank's rows.
     """
     counts = getattr(layer, COUNTS_ATTR, None)
     if counts is None:
         return
-    _, topk_ids = moe_routing.select_experts(
-        hidden_states=router_logits,
-        router_logits=router_logits,
-        topk=layer.moe_config.experts_per_token,
-        renormalize=layer.renormalize,
-        scoring_fn=layer.scoring_func,
-        layer=layer,
-        input_ids=input_ids,
+    # The selection the TPU MoE methods make, a custom routing function's
+    # included, so the counts are the experts the kernel runs.
+    _, topk_ids = moe_routing.route(
+        layer,
+        router_logits if hidden_states is None else hidden_states,
+        router_logits,
+        input_ids,
     )
     experts = counts.shape[1]
     device = router_logits.device
@@ -280,11 +295,11 @@ def maybe_dump() -> None:
         return
     import numpy as np
 
-    buffers = [getattr(layer, COUNTS_ATTR) for _, layer, _ in _TAPPED]
+    buffers = [getattr(layer, COUNTS_ATTR) for _, layer, _, _ in _TAPPED]
     interval = torch.stack(buffers).cpu().double().numpy()
     for buffer in buffers:
         buffer.zero_()
-    for counts, (_, _, order) in zip(interval, _TAPPED, strict=True):
+    for counts, (_, _, order, _) in zip(interval, _TAPPED, strict=True):
         if order is not None:
             # A placed layer counts by slot; slot s holds expert order[s].
             # Row 2 is not per expert.
@@ -302,7 +317,8 @@ def maybe_dump() -> None:
         np.savez(
             f,
             counts=np.rint(_STATE["total"]).astype(np.int64),
-            layer_names=np.array([name for name, _, _ in _TAPPED]),
+            layer_names=np.array([name for name, _, _, _ in _TAPPED]),
+            layer_indices=np.array([i for _, _, _, i in _TAPPED], dtype=np.int64),
             step=_STATE["steps"],
             wall=time.time(),
         )

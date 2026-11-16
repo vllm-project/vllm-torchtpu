@@ -236,3 +236,55 @@ def test_sequence_parallel_rows_gathered_by_the_runner_are_refused(
     _tapped(layer)
     with pytest.raises(NotImplementedError, match="sequence-parallel"):
         expert_count_tap.record(layer, _selecting(1, 2), None, over_dp=True)
+
+
+def test_a_custom_routing_function_decides_what_is_counted(tap_env):
+    """The tap selects as the TPU MoE methods do (`moe_routing.route`), so a
+    model's own routing function, not plain top-k, decides the counts."""
+    layer = _Layer()
+    seen = {}
+
+    def routing(hidden_states, gating_output, topk, renormalize):
+        seen["hidden_states"] = hidden_states
+        ids = torch.tensor([[6, 7]] * gating_output.shape[0], dtype=torch.int32)
+        return torch.ones(ids.shape), ids
+
+    layer.custom_routing_function = routing
+    counts = _tapped(layer)
+    hidden = torch.zeros((3, 4))
+    expert_count_tap.record(layer, _selecting(1, 2, 3), None, hidden_states=hidden)
+    assert counts[0].tolist() == [0, 0, 0, 0, 0, 0, 3, 3]
+    assert seen["hidden_states"] is hidden
+
+
+def test_snapshots_number_layers_as_the_placement_table_does(tap_env, monkeypatch):
+    """A Qwen3.5 / Qwen3-Next drafter's `mtp.layers.<i>` MoE layer is table
+    layer n + i (`expert_placement.layer_index`), not target layer i."""
+    import vllm.config
+
+    text_config = SimpleNamespace(num_hidden_layers=6)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=text_config),
+            hf_text_config=text_config,
+        )
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    expert_placement._target_layers.cache_clear()
+    try:
+        target, drafter, other = _Layer(), _Layer(), _Layer()
+        drafter.layer_name = "mtp.layers.0.mlp.experts"
+        other.layer_name = "model.shared_moe.experts"
+        for layer in (target, drafter, other):
+            _tapped(layer)
+        for _ in range(2):
+            expert_count_tap.maybe_dump()
+    finally:
+        expert_placement._target_layers.cache_clear()
+    snap = np.load(tap_env / "counts_ep3_0000.npz")
+    assert snap["layer_names"].tolist() == [
+        "model.layers.5.ffn.experts",
+        "mtp.layers.0.mlp.experts",
+        "model.shared_moe.experts",
+    ]
+    assert snap["layer_indices"].tolist() == [5, 6, -1]

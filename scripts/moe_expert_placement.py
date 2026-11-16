@@ -33,7 +33,16 @@ contiguous. A placement only permutes a layer's experts over the ranks,
 experts / shards to a rank; it never replicates one. The cost defaults are
 fitted to the fused EP kernel on DeepSeek-V4-Pro; for another kernel or model,
 pass its own --floor-us, --visit-us, --tile-us, --short-tile-us, --row-us,
---rung and --tile-rows.
+--rung and --tile-rows. Without such a fit, `--floor-us 0 --visit-us 0
+--tile-us 0 --short-tile-us 0 --row-us 1` makes a slot's cost its row count,
+so each layer is placed to even out the expected rows per rank (and
+--min-gain-us is then in rows per step).
+
+Layers are numbered as TPU_EXPERT_PLACEMENT numbers them: the tap records each
+layer's table number, so a drafter's MoE layer i of an n-layer target is n + i
+whatever its module is named. Snapshots written before the tap recorded the
+numbers are read by name, `layers.<n>.`, and their `mtp.*` drafter layers are
+skipped.
 """
 
 import argparse
@@ -46,10 +55,22 @@ import re
 import numpy as np
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+_DRAFTER_RE = re.compile(r"(?:^|\.)mtp\.")
+
+
+def _index_from_name(name):
+    """A layer's table number from its name, for snapshots without
+    `layer_indices`. A `mtp.*` drafter layer is n + i of an n-layer target,
+    which its name alone does not give, so it has none."""
+    if _DRAFTER_RE.search(name):
+        return None
+    m = _LAYER_RE.search(name)
+    return int(m.group(1)) if m else None
 
 
 def load_counts(dirs, skip):
-    """{layer name: (mean [E] per step, variance [E] per step)} summed over ranks."""
+    """{layer name: (table layer or None, mean [E] per step, variance [E] per
+    step)}, summed over ranks."""
     by_rank = collections.defaultdict(list)
     for d in dirs:
         pattern = os.path.join(d, "**", "counts_ep*_*.npz")
@@ -59,7 +80,7 @@ def load_counts(dirs, skip):
                 by_rank[(d, int(m.group(1)))].append((int(m.group(2)), path))
     if not by_rank:
         raise SystemExit(f"no counts_ep*_*.npz under {dirs}")
-    mean, var, names = None, None, None
+    mean, var, names, indices = None, None, None, None
     for key, snaps in sorted(by_rank.items()):
         snaps.sort()
         # The latest run: everything from the last restart of `step` on.
@@ -78,10 +99,14 @@ def load_counts(dirs, skip):
         layer_names = [str(n) for n in last["layer_names"]]
         if names is None:
             names, mean, var = layer_names, mu, v
+            if "layer_indices" in last.files:
+                indices = [int(i) if i >= 0 else None for i in last["layer_indices"]]
+            else:
+                indices = [_index_from_name(n) for n in names]
         else:
             assert names == layer_names, key
             mean, var = mean + mu, var + v
-    return {n: (mean[i], var[i]) for i, n in enumerate(names)}
+    return {n: (indices[i], mean[i], var[i]) for i, n in enumerate(names)}
 
 
 class VisitModel:
@@ -210,11 +235,16 @@ def main():
     )
     counts = load_counts(a.dirs, a.skip)
     lo, hi = (int(x) for x in a.layers.split(":"))
-    layers = {}
-    for name, (mu, var) in counts.items():
-        m = _LAYER_RE.search(name)
-        if m and lo <= int(m.group(1)) <= hi:
-            layers[int(m.group(1))] = (mu, var)
+    layers, names = {}, {}
+    for name, (index, mu, var) in counts.items():
+        if index is None or not lo <= index <= hi:
+            continue
+        if index in names:
+            raise SystemExit(f"{names[index]} and {name} are both table layer {index}")
+        names[index] = name
+        layers[index] = (mu, var)
+    if not layers:
+        raise SystemExit(f"no tapped MoE layer in --layers {a.layers}")
     built = {n: place(mu, var, a.shards, model) for n, (mu, var) in layers.items()}
     table, before, after = {}, [], []
     for n, (mu, var) in sorted(layers.items()):
