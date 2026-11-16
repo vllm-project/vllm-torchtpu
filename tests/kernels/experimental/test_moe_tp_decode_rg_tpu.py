@@ -27,7 +27,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 ROUTED_SCALE = 2.5
-ROWS = (96, 128, 160, 192)
+SERVED_RANKS = 16
+ROWS = (96, 128, 160, 192, 224)
 
 
 @pytest.mark.parametrize(
@@ -39,6 +40,8 @@ ROWS = (96, 128, 160, 192)
         ("ep", 96, 77, False),
         ("ep", 160, 160, False),
         ("ep", 192, 192, True),
+        # 224 rows fit VMEM only with TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM=1.15.
+        ("ep", 224, 211, False),
     ],
 )
 def test_row_gathered_is_bitwise(monkeypatch, layout, rows, n_valid, hot):
@@ -52,15 +55,20 @@ def test_row_gathered_is_bitwise(monkeypatch, layout, rows, n_valid, hot):
         pytest.skip("needs a TPU host (8 or 16 cores)")
     monkeypatch.setenv("TPU_MOE_TP_DECODE_EXTRA_ROWS", ",".join(map(str, ROWS)))
     monkeypatch.setenv("TPU_MOE_TP_DECODE_VMEM_FRACTION", "1.0")
+    if rows > 192:
+        monkeypatch.setenv("TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM", "1.15")
     devices = jax.devices()
     n = len(devices)
     experts = 256
     ep = layout == "ep"
+    # Per-rank weight shapes of the served 16-rank deployment on any host:
+    # VMEM admission (224 rows) depends on them. The all-reduce sums the n
+    # local ranks, which under EP cover the first n x 16 experts.
     c = dict(
         h=6144,
-        e=experts // n if ep else experts,
-        i=2048 if ep else 2048 // n,
-        fs=2048 // n,
+        e=experts // SERVED_RANKS if ep else experts,
+        i=2048 if ep else 2048 // SERVED_RANKS,
+        fs=2048 // SERVED_RANKS,
         topk=8,
     )
     mesh = Mesh(np.asarray(devices), ("d",))
@@ -104,19 +112,21 @@ def test_row_gathered_is_bitwise(monkeypatch, layout, rows, n_valid, hot):
             )
         )
 
-    ops = (
-        jnp.tile(x, (n, 1)),
-        jnp.tile(scores, (n, 1)),
-        bias,
-        jnp.asarray([n_valid], jnp.int32),
-        jnp.arange(n, dtype=jnp.int32).reshape(n, 1),
-        *stacked,
-        starts,
-    )
+    def operands(x, scores, n_valid):
+        return (
+            jnp.tile(x, (n, 1)),
+            jnp.tile(scores, (n, 1)),
+            bias,
+            jnp.asarray([n_valid], jnp.int32),
+            jnp.arange(n, dtype=jnp.int32).reshape(n, 1),
+            *stacked,
+            starts,
+        )
 
     def put(ops):
         return [jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(ops, specs)]
 
+    ops = operands(x, scores, n_valid)
     args = put(ops)
     want = np.asarray(make(kernel.moe_tp_decode, fast=True)(*args)).view(np.uint16)
     got = np.asarray(make(kernel_rg.moe_tp_decode_rg)(*args)).view(np.uint16)

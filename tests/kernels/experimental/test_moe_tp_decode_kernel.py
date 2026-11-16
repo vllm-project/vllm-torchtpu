@@ -176,6 +176,17 @@ def test_row_gathered_admits_at_glm52_ep16_shapes(monkeypatch, rows, admitted):
     assert got is admitted
 
 
+def test_row_gathered_vmem_headroom_admits_224_rows(monkeypatch):
+    from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel_rg
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_EXTRA_ROWS", "224")
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_VMEM_FRACTION", "1.0")
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM", "1.15")
+    shapes = _shapes(224, 6144, 16, 2048, 128, score_experts=256)
+    assert kernel_rg.can_use_moe_tp_decode_rg(*shapes, topk=8, n_ranks=N_RANKS)
+
+
 @pytest.mark.parametrize(
     "info, shapes, n_ranks",
     [

@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_VMEM_FRACTION: float = 0.75
     TPU_MOE_TP_DECODE_RG_MIN_ROWS: int = 0
     TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS: int = 0
+    TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM: float = 1.25
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1214,6 +1215,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (default) = no cap.
     "TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS": env_nonnegative_int(
         "TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS", 0
+    ),
+    # moe_tp_decode row-gathered kernel: the factor on its estimated VMEM need
+    # for admission and the compile limit (kernel.VMEM_HEADROOM by default).
+    # 1.15 admits 224 rows at GLM-5.2 EP16.
+    "TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM": env_float(
+        "TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM", 1.25
     ),
     # moe_tp_decode: pass n_valid, rank and the expert offset as three [1]
     # scalar operands instead of one stacked int32[3] (one XLA fusion per MoE

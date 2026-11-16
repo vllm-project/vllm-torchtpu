@@ -90,10 +90,18 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
     )
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
     need = fixed + kernel._NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
-    limit = int(need * kernel.VMEM_HEADROOM)
+    limit = int(need * _vmem_headroom())
     if limit > int(info.vmem_capacity_bytes * kernel._vmem_fraction()):
         return None
     return need, min(limit, info.vmem_capacity_bytes)
+
+
+def _vmem_headroom():
+    """TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM: the factor on the estimated VMEM need
+    that admission and the compile limit use."""
+    from vllm_torchtpu import envs
+
+    return float(envs.TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM)
 
 
 def can_use_moe_tp_decode_rg(
