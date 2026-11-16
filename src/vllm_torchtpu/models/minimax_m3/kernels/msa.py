@@ -542,11 +542,22 @@ def fold_index_heads(
         # Padding tokens after the last request, one unique row each.
         num_heads * num_real + head * (num_tokens - num_real) + (tok - num_real)[None],
     )
-    folded = (
-        jnp.zeros((num_heads * num_tokens, head_dim), index_q.dtype)
-        .at[rows.reshape(-1)]
-        .set(index_q.transpose(1, 0, 2).reshape(-1, head_dim))
+    # The folded rows by a gather from each row's (token, head): the inverse
+    # of `rows`. As a scatter of `index_q` into `rows` this cost ~75 us per
+    # layer at c64's 8K-token steps (twin j-40c5ed08).
+    r = jnp.arange(num_heads * num_tokens, dtype=jnp.int32)
+    starts = num_heads * cu_q_lens
+    seq = jnp.searchsorted(starts[1:], r, side="right", method="compare_all")
+    seq = jnp.minimum(seq, seq_lens.shape[0] - 1).astype(jnp.int32)
+    real = r < num_heads * num_real
+    first = jnp.where(real, msa_indexer.lookup(cu_q_lens, seq), num_real)
+    length = jnp.where(
+        real, msa_indexer.lookup(cu_q_lens, seq + 1) - first, num_tokens - num_real
     )
+    off = r - num_heads * first
+    length = jnp.maximum(length, 1)
+    src = (first + off % length) * num_heads + off // length
+    folded = index_q.reshape(num_tokens * num_heads, head_dim)[src]
     return folded, rows
 
 
