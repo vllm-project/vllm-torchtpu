@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -47,9 +48,11 @@ from vllm_torchtpu.megakernel.core.modules.moe.decls import (
     validate_moe_options,
 )
 from vllm_torchtpu.megakernel.core.modules.moe.params import (
+    _ROUTE_VEC_FALLBACK_LOGGED,
     MoEDebug,
     MoETunables,
     derive_moe_params,
+    validate_moe_geometry,
 )
 from vllm_torchtpu.megakernel.core.modules.moe.reference import moe_reference
 from vllm_torchtpu.megakernel.core.modules.transforms import apply_hf_transforms
@@ -58,8 +61,13 @@ from vllm_torchtpu.megakernel.core.planner import plan
 from vllm_torchtpu.megakernel.core.spec import LayerType, ModelSpec
 
 
-def test_moe_topk_packed_and_route_vec_compile_time_bounds():
+def test_moe_topk_packed_and_route_vec_compile_time_bounds(
+    caplog: pytest.LogCaptureFixture,
+):
     """Verify `MoETunables`, `MoEDebug`, and `derive_moe_params` compile-time checks."""
+    assert validate_moe_geometry(
+        E=512, R=8, TOPK=8, IS=1024, I=256, moe_tp=False, e_slots=72
+    ) == (64, 128, 256, 72)
     field_names = {f.name for f in dataclasses.fields(MoETunables)}
     assert set(MoETunables.NUMERICS.keys()) == field_names
     dbg = MoEDebug()
@@ -140,29 +148,47 @@ def test_moe_topk_packed_and_route_vec_compile_time_bounds():
                 module_name="fake_moe",
             )
 
-    # `route_vec` resolves to False (quiet fallback) when preconditions are not met:
-    # - `e_slots=80` (R*EXTRA+R+1 = 137 > 128)
-    # - `e_slots=96` (R*EXTRA+R+1 = 265 > 128)
-    # - `E=2048, B=4` (E // 128 + 1 = 17 > MR=8)
-    # - `e_slots=0` (ecopy=False)
+    # `route_vec` resolves to False (and logs once at INFO naming the failed
+    # precondition) when preconditions are not met:
+    # - `e_slots=80` (only `R * extra + R + 1 <= 128` fails: 137 > 128)
+    # - `e_slots=96` (only `R * extra + R + 1 <= 128` fails: 265 > 128)
+    # - `E=1024, e_slots=132, B=4` (only `E // 128 + 1 <= MR` fails: 9 > MR=8,
+    #   with ER=128 == nb_picks=128 and R*EXTRA+R+1 = 41 <= 128)
+    # - `e_slots=0` (only `ecopy` fails)
     tt_rvec = MoETunables(topk=False, route_vec=True)
-    for fallback_g in (
-        dataclasses.replace(g_ok, E=512, e_slots=80),
-        dataclasses.replace(g_ok, E=512, e_slots=96),
-        dataclasses.replace(g_ok, E=2048, e_slots=260),
-        dataclasses.replace(g_ok, E=512, e_slots=0),
+    _ROUTE_VEC_FALLBACK_LOGGED.clear()
+    for fallback_g, exp_failed in (
+        (dataclasses.replace(g_ok, E=512, e_slots=80), "R * extra + R + 1 <= 128"),
+        (dataclasses.replace(g_ok, E=512, e_slots=96), "R * extra + R + 1 <= 128"),
+        (dataclasses.replace(g_ok, E=1024, e_slots=132), "E // 128 + 1 <= MR"),
+        (dataclasses.replace(g_ok, E=512, e_slots=0), "ecopy"),
     ):
-        mp_fb = derive_moe_params(
-            fallback_g,
-            ex_ok,
-            p_ok,
-            tt_rvec,
-            dbg,
-            moe_tp=False,
-            e_slots=fallback_g.e_slots,
-            module_name="fake_moe",
-        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            mp_fb = derive_moe_params(
+                fallback_g,
+                ex_ok,
+                p_ok,
+                tt_rvec,
+                dbg,
+                moe_tp=False,
+                e_slots=fallback_g.e_slots,
+                module_name="fake_moe",
+            )
+            derive_moe_params(
+                fallback_g,
+                ex_ok,
+                p_ok,
+                tt_rvec,
+                dbg,
+                moe_tp=False,
+                e_slots=fallback_g.e_slots,
+                module_name="fake_moe",
+            )
         assert mp_fb.route_vec is False
+        msgs = [r.getMessage() for r in caplog.records if "route_vec=True" in r.message]
+        assert len(msgs) == 1
+        assert f"(failed: {exp_failed})" in msgs[0]
 
     # Partial layer count or non-128-aligned H raises MegakernelConfigError
     p_partial = dataclasses.replace(p_ok, module_layer_counts={"fake_moe": 0})
@@ -341,6 +367,8 @@ def test_moe_decls_options_binding_and_hf_params():
     )
     names_bf16 = {d.name for d in decls_bf16}
     assert "e_gate_proj_s" not in names_bf16 and "sh2_s" not in names_bf16
+    with pytest.raises(MegakernelConfigError, match="shared_gate=True"):
+        moe_hf_params("mlp", res, shared_gate=False)
 
     # End-to-end check on `moe_hf_params` -> `apply_hf_transforms` -> `moe_reference`
     # against the dense unsharded oracle for `moe_tp` and `fp8`/`bf16`.

@@ -26,29 +26,7 @@ from ...decls import ResolvedModuleGeometry
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, FP8, round_bf16
-from .params import MoEDebug
-
-
-def _expected_expert_slots(g: Any, *, R: int, E: int, is_tp: bool) -> int:
-    raw_slots = (
-        g.options.get("e_slots", g.values.get("e_slots", 0))
-        if isinstance(g, ResolvedModuleGeometry)
-        else getattr(g, "e_slots", 0)
-    )
-    e_slots = int(raw_slots or 0)
-    er = E // R
-    if e_slots < 0:
-        raise MegakernelConfigError(f"e_slots={e_slots} must be >= 0")
-    if is_tp and e_slots not in (0, E):
-        raise MegakernelConfigError(
-            "moe_tp=True does not support redundant expert slots "
-            f"(got e_slots={e_slots} for E={E})"
-        )
-    if not is_tp and 0 < e_slots < er:
-        raise MegakernelConfigError(
-            f"e_slots={e_slots} must be 0 or >= ER={er} when moe_tp=False"
-        )
-    return e_slots if e_slots > 0 else (E if is_tp else er)
+from .params import MoEDebug, validate_moe_geometry
 
 
 def moe_reference(
@@ -78,31 +56,26 @@ def moe_reference(
             f"(got {dbg})"
         )
     R, B = ex.R, ex.B
-    if R <= 0:
-        raise MegakernelConfigError(f"MoE R={R} must be >= 1")
     H = int(g.H)
     E = int(g.E)
     TOPK = int(g.TOPK)
     IS = int(g.IS)
     I = int(g.I)  # noqa: E741
     is_tp = bool(g.moe_tp) if moe_tp is None else bool(moe_tp)
-    if E <= 0 or E % R != 0:
-        raise MegakernelConfigError(f"MoE E={E} must be a positive multiple of R={R}")
-    if TOPK <= 0 or min(E, 128) < TOPK:
-        raise MegakernelConfigError(
-            f"MoE TOPK={TOPK} must satisfy 1 <= TOPK <= min(E={E}, 128)"
-        )
-    if IS <= 0 or IS % R != 0:
-        raise MegakernelConfigError(f"MoE IS={IS} must be a positive multiple of R={R}")
-    if I <= 0 or (is_tp and I % R != 0):
-        raise MegakernelConfigError(
-            f"MoE I={I} must be > 0"
-            + (f" and divisible by R={R} when moe_tp=True" if is_tp else "")
-        )
-    ISR = IS // R
-    IR = I // R if is_tp else I
-    ER = E // R
-    EW = _expected_expert_slots(g, R=R, E=E, is_tp=is_tp)
+    raw_slots = (
+        g.options.get("e_slots", g.values.get("e_slots", 0))
+        if isinstance(g, ResolvedModuleGeometry)
+        else getattr(g, "e_slots", 0)
+    )
+    ER, ISR, IR, EW = validate_moe_geometry(
+        E=E,
+        R=R,
+        TOPK=TOPK,
+        IS=IS,
+        I=I,
+        moe_tp=is_tp,
+        e_slots=int(raw_slots or 0),
+    )
     rename = getattr(g, "rename", None) or {}
 
     def _get(canon: str) -> Any:
@@ -120,11 +93,8 @@ def moe_reference(
     if router_all.ndim == 4:
         w_router = router_all[0, layer_idx].astype(F32)
     elif router_all.ndim == 3:
-        w_router = (
-            router_all[layer_idx]
-            if router_all.shape[0] != R or layer_idx > 0
-            else router_all[0]
-        ).astype(F32)
+        # `(L, H, E)` layer-stacked or `(R, H, E)` rank-replicated (`layer_idx == 0`).
+        w_router = router_all[layer_idx].astype(F32)
     else:
         w_router = router_all.astype(F32)
     logits = xb_moe @ w_router
