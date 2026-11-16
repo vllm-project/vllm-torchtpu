@@ -24,6 +24,7 @@ import pytest
 import torch
 from vllm.config import (
     CacheConfig,
+    CompilationConfig,
     KVTransferConfig,
     LoRAConfig,
     ModelConfig,
@@ -1200,6 +1201,34 @@ def test_check_and_update_config_accepts_a_config_without_a_model(
     assert vllm_config.parallel_config.is_moe_model is None
     # The hook reached its end rather than short-circuiting.
     assert vllm_config.compilation_config.splitting_ops == []
+
+
+@pytest.mark.parametrize("splitting_ops", [None, [], ["test::host_boundary"]])
+@pytest.mark.parametrize("kernel_iteration", [False, True])
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_check_and_update_config_keeps_declared_splitting_ops(
+    mock_prepare_env, mock_apply_patches, monkeypatch, splitting_ops, kernel_iteration
+):
+    """Boundaries a model config hook (or the caller) declared survive the
+    platform hook; kernel-iteration mode adds its RPA boundaries once."""
+    monkeypatch.setenv("TPU_KERNEL_ITER_MODE", str(int(kernel_iteration)))
+    expected = list(splitting_ops or [])
+    if kernel_iteration:
+        expected.extend(
+            f"pallas::{prefix}_{i}"
+            for prefix in ("rpa_kernel", "rpa_kernel_batched")
+            for i in range(64)
+        )
+    with _device_left_unset():
+        vllm_config = VllmConfig(
+            compilation_config=CompilationConfig(splitting_ops=splitting_ops)
+        )
+
+    assert vllm_config.compilation_config.splitting_ops == expected
+    # Running the hook again neither drops nor duplicates a boundary.
+    TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.compilation_config.splitting_ops == expected
 
 
 @patch("vllm_torchtpu.patch_registry.apply")
