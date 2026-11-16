@@ -16,9 +16,12 @@
 import contextlib
 import contextvars
 import functools
+import glob
 import json
+import os
 import socket
 import sys
+import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -82,6 +85,46 @@ _ACTIVE_TRACE_HEADERS: contextvars.ContextVar[dict[str, str] | None] = (
     contextvars.ContextVar("_ACTIVE_TRACE_HEADERS", default=None)
 )
 
+
+def _ipc_base_dir() -> str:
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm"
+    return tempfile.gettempdir()
+
+
+def _sanitize_replica_id(replica_id: str) -> str:
+    return "".join(
+        c if c.isalnum() or c in ("-", "_", ".") else "_" for c in str(replica_id)
+    )
+
+
+def _atomic_write_text(path: str, content: str) -> None:
+    """Atomically write `content` to `path`, cleaning up temp file on error."""
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+
+
+def _resolve_default_dp_rank() -> int:
+    try:
+        from vllm.config.vllm import get_current_vllm_config
+
+        cfg = get_current_vllm_config()
+        pc = getattr(cfg, "parallel_config", None)
+        return max(0, int(getattr(pc, "data_parallel_rank", 0) or 0))
+    except Exception:
+        return 0
+
+
+_IPC_UID_PREFIX = f"{_ipc_base_dir()}/.vllm_tpu_agentic_{os.getuid()}"
+_EVICTION_SYNC_PATH = f"{_IPC_UID_PREFIX}_eviction_state"
+_MAX_EVICTION_SYNC_BYTES = 524_288
+_COMPACT_RECENT_SESSIONS = 1024
 _INFLIGHT_REQUESTS_MAXSIZE = 16384
 _DETECTED_VLLM_BLOCK_SIZE: int | None = None
 _PATCHES_LOGGED: bool = False
@@ -179,12 +222,14 @@ class AgenticTelemetryService:
         *,
         block_size: int | None = None,
         replica_id: str | None = None,
+        dp_rank: int | None = None,
         span_log_path: str | None = None,
         session_tracker: SessionTurnTracker | None = None,
         eviction_tracker: BlockEvictionTracker | None = None,
         inflight_maxsize: int = _INFLIGHT_REQUESTS_MAXSIZE,
     ) -> None:
         self.replica_id = replica_id or envs.VLLM_TPU_REPLICA_ID or socket.gethostname()
+        self.dp_rank = dp_rank
         self.span_log_path = (
             span_log_path
             if span_log_path is not None
@@ -208,6 +253,130 @@ class AgenticTelemetryService:
         self._inflight: BoundedLRU[str, _InFlightRequestState] = BoundedLRU(
             inflight_maxsize
         )
+        self._eviction_sync_dirty: bool = False
+        self._eviction_writer_initialized: bool = False
+        self._eviction_sync_cursors: dict[str, tuple[int, int]] = {}
+
+    def _safe_replica_id(self) -> str:
+        return _sanitize_replica_id(self.replica_id)
+
+    def _resolved_dp_rank(self) -> int:
+        if self.dp_rank is None:
+            self.dp_rank = _resolve_default_dp_rank()
+        return self.dp_rank
+
+    def _eviction_sync_prefix(self) -> str:
+        return f"{_EVICTION_SYNC_PATH}_{self._safe_replica_id()}"
+
+    def _eviction_sync_path(self, dp_rank: int | None = None) -> str:
+        rank = self._resolved_dp_rank() if dp_rank is None else int(dp_rank)
+        return f"{self._eviction_sync_prefix()}_dp{rank}"
+
+    def flush_eviction_sync(self) -> None:
+        """Flush changed per-session eviction deltas after each eviction batch."""
+        if not self._eviction_sync_dirty or not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            return
+        self._eviction_sync_dirty = False
+        changed_sessions = self.eviction_tracker.pop_dirty_session_state()
+        last_pair = self.eviction_tracker.last_evicted_pair()
+        sync_path = self._eviction_sync_path()
+        try:
+            needs_replace = not self._eviction_writer_initialized
+            if not needs_replace and os.path.exists(sync_path):
+                needs_replace = os.path.getsize(sync_path) >= _MAX_EVICTION_SYNC_BYTES
+            if needs_replace:
+                sessions_payload = (
+                    changed_sessions
+                    if not self._eviction_writer_initialized
+                    else self.eviction_tracker.export_recent_session_state(
+                        _COMPACT_RECENT_SESSIONS
+                    )
+                )
+                payload = {
+                    "sessions": sessions_payload,
+                    "last": last_pair,
+                }
+                _atomic_write_text(
+                    sync_path,
+                    json.dumps(payload, separators=(",", ":")) + "\n",
+                )
+                self._eviction_writer_initialized = True
+            else:
+                payload = {
+                    "sessions": changed_sessions,
+                    "last": last_pair,
+                }
+                line = json.dumps(payload, separators=(",", ":")) + "\n"
+                with open(sync_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except OSError:
+            pass
+
+    def _apply_eviction_sync_record(self, raw_line: str) -> bool:
+        """Parse and merge one eviction sync JSONL line."""
+        if not raw_line or not raw_line.startswith("{"):
+            return False
+        try:
+            data = json.loads(raw_line)
+            sessions = data.get("sessions")
+            if isinstance(sessions, Mapping) and sessions:
+                self.eviction_tracker.import_session_state(sessions)
+            last = data.get("last")
+            if (
+                isinstance(last, list)
+                and len(last) >= 2
+                and last[0] is not None
+                and last[1] is not None
+            ):
+                self.eviction_tracker.merge_last_evicted(float(last[0]), int(last[1]))
+            return True
+        except ValueError:
+            return False
+
+    def _sync_single_eviction_file(self, sync_path: str) -> None:
+        try:
+            st = os.stat(sync_path)
+        except OSError:
+            return
+        prev_ino, offset = self._eviction_sync_cursors.get(sync_path, (-1, 0))
+        if prev_ino == st.st_ino and offset == st.st_size:
+            return
+        if prev_ino != st.st_ino or st.st_size < offset:
+            offset = 0
+        try:
+            with open(sync_path, "rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+            if not chunk:
+                self._eviction_sync_cursors[sync_path] = (st.st_ino, offset)
+                return
+            last_nl = chunk.rfind(b"\n")
+            if last_nl == -1:
+                if offset == 0:
+                    raw_text = chunk.decode("utf-8", errors="replace").strip()
+                    if self._apply_eviction_sync_record(raw_text):
+                        offset = len(chunk)
+                self._eviction_sync_cursors[sync_path] = (st.st_ino, offset)
+                return
+            complete = chunk[: last_nl + 1]
+            offset += len(complete)
+            self._eviction_sync_cursors[sync_path] = (st.st_ino, offset)
+            for raw_line in complete.decode("utf-8", errors="replace").splitlines():
+                line = raw_line.strip()
+                if line:
+                    self._apply_eviction_sync_record(line)
+        except OSError:
+            pass
+
+    def _maybe_sync_eviction_state(self) -> None:
+        """Incrementally merge session eviction deltas across all DP engines."""
+        if not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            return
+        prefix = f"{self._eviction_sync_prefix()}_dp"
+        for sync_path in sorted(glob.glob(f"{prefix}*")):
+            if ".tmp." in sync_path:
+                continue
+            self._sync_single_eviction_file(sync_path)
 
     def discard_request(self, request_id: str | None) -> None:
         """Drop in-flight bookkeeping for an aborted or rejected request."""
@@ -244,11 +413,15 @@ class AgenticTelemetryService:
         now: float | None = None,
         *,
         session_id: str | None = None,
+        defer_sync: bool = False,
     ) -> None:
-        """Record an HBM block eviction event."""
+        """Record an HBM block eviction event (with optional deferred IPC flush)."""
         self.eviction_tracker.record_eviction(
             block_hash, now=now, session_id=session_id
         )
+        self._eviction_sync_dirty = True
+        if not defer_sync:
+            self.flush_eviction_sync()
 
     def on_prefill_output(
         self, req_state: Any, engine_core_output: Any
@@ -269,6 +442,7 @@ class AgenticTelemetryService:
             return inflight.breakdown
 
         self._maybe_sync_vllm_block_size()
+        self._maybe_sync_eviction_state()
         prefill_now = time.monotonic()
 
         session_id, parent_session_id, turn_id = extract_agent_headers(
@@ -425,6 +599,7 @@ class AgenticTelemetryService:
         if snap_evict is not None and now is None:
             eviction_age_ms, session_evicted_wall = snap_evict
         else:
+            self._maybe_sync_eviction_state()
             if prefill_evict_ts is None:
                 prefill_evict_ts = self.eviction_tracker.session_evicted_ts(session_id)
             eviction_age_ms, session_evicted_wall = self._compute_eviction_snapshot(
@@ -621,6 +796,262 @@ def patch_trace_headers(
                 mod.contains_trace_headers = contains_fn
             if extract_fn is not None and hasattr(mod, "extract_trace_headers"):
                 mod.extract_trace_headers = extract_fn
+
+
+def _tag_computed_blocks_for_session(
+    block_pool: Any, new_computed_blocks: Any, session_id: str | None
+) -> None:
+    """Tag matched prefix-hit blocks once at `allocate_slots` (`O(hit_blocks)`)."""
+    if block_pool is None or new_computed_blocks is None or not session_id:
+        return
+    groups = getattr(new_computed_blocks, "blocks", None)
+    if not groups:
+        return
+    blk_sessions = getattr(block_pool, "_agentic_block_session", None)
+    if blk_sessions is None:
+        blk_sessions = {}
+        block_pool._agentic_block_session = blk_sessions
+    for group_blocks in groups:
+        for blk in group_blocks or ():
+            if getattr(blk, "is_null", False):
+                continue
+            blk_id = getattr(blk, "block_id", None)
+            if blk_id is not None:
+                blk_sessions[blk_id] = session_id
+            with contextlib.suppress(AttributeError):
+                blk._agentic_session_id = session_id
+
+
+def patch_block_pool(
+    block_pool_cls: Any = None,
+    service: AgenticTelemetryService | None = None,
+    *,
+    kv_cache_manager_cls: Any = None,
+) -> None:
+    """Wrap `BlockPool` to track session block ownership and batch eviction sync."""
+    is_default_cls = block_pool_cls is None
+    if block_pool_cls is None:
+        from vllm.v1.core.block_pool import BlockPool as block_pool_cls
+
+    if not block_pool_cls.__dict__.get("_tpu_agentic_eviction_patch", False):
+        orig_evict = block_pool_cls._maybe_evict_cached_block
+        orig_cache_full = getattr(block_pool_cls, "cache_full_blocks", None)
+        orig_get_new_blocks = getattr(block_pool_cls, "get_new_blocks", None)
+        orig_evict_blocks = getattr(block_pool_cls, "evict_blocks", None)
+
+        if orig_cache_full is not None:
+
+            @functools.wraps(orig_cache_full)
+            def _wrapped_cache_full_blocks(
+                self: Any,
+                request: Any,
+                blocks: list[Any],
+                num_cached_blocks: int,
+                num_full_blocks: int,
+                block_size: int,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                res = orig_cache_full(
+                    self,
+                    request,
+                    blocks,
+                    num_cached_blocks,
+                    num_full_blocks,
+                    block_size,
+                    *args,
+                    **kwargs,
+                )
+                try:
+                    if num_cached_blocks >= num_full_blocks:
+                        return res
+                    sid = _extract_request_session_id(request)
+                    all_tokens = (
+                        getattr(request, "all_token_ids", None)
+                        or getattr(request, "prompt_token_ids", None)
+                        or ()
+                    )
+                    block_mask = kwargs.get("block_mask")
+                    if block_mask is None and len(args) > 1:
+                        block_mask = args[1]
+                    blk_sessions = getattr(self, "_agentic_block_session", None)
+                    if blk_sessions is None:
+                        blk_sessions = {}
+                        self._agentic_block_session = blk_sessions
+                    blk_hashes = getattr(self, "_agentic_block_rolling_hash", None)
+                    if blk_hashes is None:
+                        blk_hashes = {}
+                        self._agentic_block_rolling_hash = blk_hashes
+
+                    prev_hash = 0
+                    if num_cached_blocks > 0 and num_cached_blocks - 1 < len(blocks):
+                        prev_blk = blocks[num_cached_blocks - 1]
+                        prev_id = getattr(prev_blk, "block_id", None)
+                        prev_hash = (
+                            blk_hashes.get(prev_id)
+                            if prev_id is not None and prev_id in blk_hashes
+                            else getattr(prev_blk, "_agentic_rolling_hash", 0)
+                        ) or 0
+                    for i in range(
+                        num_cached_blocks, min(num_full_blocks, len(blocks))
+                    ):
+                        blk = blocks[i]
+                        rel_idx = i - num_cached_blocks
+                        masked_out = (
+                            block_mask is not None
+                            and rel_idx < len(block_mask)
+                            and not block_mask[rel_idx]
+                        )
+                        if getattr(blk, "is_null", False) or masked_out:
+                            if all_tokens and (i + 1) * block_size <= len(all_tokens):
+                                chunk = tuple(
+                                    all_tokens[i * block_size : (i + 1) * block_size]
+                                )
+                                prev_hash = hash((prev_hash, chunk))
+                            continue
+                        blk_id = getattr(blk, "block_id", None)
+                        if all_tokens and (i + 1) * block_size <= len(all_tokens):
+                            chunk = tuple(
+                                all_tokens[i * block_size : (i + 1) * block_size]
+                            )
+                            prev_hash = hash((prev_hash, chunk))
+                            if blk_id is not None:
+                                blk_hashes[blk_id] = prev_hash
+                            with contextlib.suppress(AttributeError):
+                                blk._agentic_rolling_hash = prev_hash
+                        if sid:
+                            if blk_id is not None:
+                                blk_sessions[blk_id] = sid
+                            with contextlib.suppress(AttributeError):
+                                blk._agentic_session_id = sid
+                except Exception as exc:
+                    logger.warning_once(
+                        "Agentic telemetry cache_full_blocks hook failed: %s", exc
+                    )
+                return res
+
+            block_pool_cls.cache_full_blocks = _wrapped_cache_full_blocks
+
+        @functools.wraps(orig_evict)
+        def _wrapped_maybe_evict_cached_block(self: Any, block: Any) -> bool:
+            raw_hash = getattr(block, "block_hash", None)
+            blk_id = getattr(block, "block_id", None)
+            blk_sessions = getattr(self, "_agentic_block_session", None)
+            blk_hashes = getattr(self, "_agentic_block_rolling_hash", None)
+            rolling_hash = (
+                blk_hashes.get(blk_id)
+                if blk_hashes is not None
+                and blk_id is not None
+                and blk_id in blk_hashes
+                else getattr(block, "_agentic_rolling_hash", None)
+            )
+            evicted_sid = (
+                blk_sessions.get(blk_id)
+                if blk_sessions is not None
+                and blk_id is not None
+                and blk_id in blk_sessions
+                else getattr(block, "_agentic_session_id", None)
+            )
+            evicted = orig_evict(self, block)
+            if evicted and raw_hash is not None:
+                try:
+                    if blk_sessions is not None and blk_id is not None:
+                        blk_sessions.pop(blk_id, None)
+                    if blk_hashes is not None and blk_id is not None:
+                        blk_hashes.pop(blk_id, None)
+                    for attr in ("_agentic_rolling_hash", "_agentic_session_id"):
+                        if hasattr(block, attr):
+                            with contextlib.suppress(AttributeError):
+                                setattr(block, attr, None)
+                    alloc_sid = getattr(self, "_agentic_allocating_session_id", None)
+                    record_sid = (
+                        None
+                        if (evicted_sid is not None and evicted_sid == alloc_sid)
+                        else evicted_sid
+                    )
+                    in_batch = bool(getattr(self, "_agentic_in_batch_evict", False))
+                    svc = service or get_telemetry_service()
+                    svc.on_block_evicted(
+                        rolling_hash if rolling_hash is not None else raw_hash,
+                        session_id=record_sid,
+                        defer_sync=in_batch,
+                    )
+                except Exception as exc:
+                    logger.warning_once(
+                        "Agentic telemetry block eviction hook failed: %s", exc
+                    )
+            return evicted
+
+        block_pool_cls._maybe_evict_cached_block = _wrapped_maybe_evict_cached_block
+
+        def _wrap_batch_evict_fn(orig_fn: Any) -> Any:
+            @functools.wraps(orig_fn)
+            def _wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+                self._agentic_in_batch_evict = True
+                try:
+                    return orig_fn(self, *args, **kwargs)
+                finally:
+                    self._agentic_in_batch_evict = False
+                    try:
+                        svc = service or get_telemetry_service()
+                        svc.flush_eviction_sync()
+                    except Exception as exc:
+                        logger.warning_once(
+                            "Agentic telemetry batch eviction flush failed: %s", exc
+                        )
+
+            return _wrapped
+
+        if orig_get_new_blocks is not None:
+            block_pool_cls.get_new_blocks = _wrap_batch_evict_fn(orig_get_new_blocks)
+
+        if orig_evict_blocks is not None:
+            block_pool_cls.evict_blocks = _wrap_batch_evict_fn(orig_evict_blocks)
+
+        block_pool_cls._tpu_agentic_eviction_patch = True
+
+    if kv_cache_manager_cls is None and is_default_cls:
+        try:
+            from vllm.v1.core.kv_cache_manager import (
+                KVCacheManager as kv_cache_manager_cls,
+            )
+        except ImportError as exc:
+            logger.warning_once(
+                "Skipping KVCacheManager allocate_slots telemetry patch: %s", exc
+            )
+
+    if kv_cache_manager_cls is not None and not kv_cache_manager_cls.__dict__.get(
+        "_tpu_agentic_alloc_patch", False
+    ):
+        orig_allocate_slots = kv_cache_manager_cls.allocate_slots
+
+        @functools.wraps(orig_allocate_slots)
+        def _wrapped_allocate_slots(
+            self: Any, request: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+            bp = getattr(self, "block_pool", None)
+            sid = _extract_request_session_id(request)
+            if bp is not None:
+                bp._agentic_allocating_session_id = sid
+            try:
+                res = orig_allocate_slots(self, request, *args, **kwargs)
+            finally:
+                if bp is not None:
+                    bp._agentic_allocating_session_id = None
+            if res is not None:
+                try:
+                    computed = (
+                        args[2] if len(args) > 2 else kwargs.get("new_computed_blocks")
+                    )
+                    _tag_computed_blocks_for_session(bp, computed, sid)
+                except Exception as exc:
+                    logger.warning_once(
+                        "Agentic telemetry allocate_slots tag failed: %s", exc
+                    )
+            return res
+
+        kv_cache_manager_cls.allocate_slots = _wrapped_allocate_slots
+        kv_cache_manager_cls._tpu_agentic_alloc_patch = True
 
 
 def patch_output_processor(
@@ -852,6 +1283,12 @@ def install_agentic_telemetry_patches() -> None:
         return
 
     patch_trace_headers()
+    try:
+        patch_block_pool()
+    except ImportError as exc:
+        logger.warning_once(
+            "Skipping BlockPool telemetry patch; BlockPool unavailable: %s", exc
+        )
     try:
         patch_output_processor()
     except ImportError as exc:
