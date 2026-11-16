@@ -13,6 +13,7 @@
 # limitations under the License.
 import abc
 import dataclasses
+import functools
 from typing import Any, cast
 
 import jax
@@ -359,15 +360,31 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 p0 = schedule_ref.dma_kv_cache[block_idx, b, 0, 0]
                 tokens = schedule_ref.dma_kv_cache[block_idx, b, 0, 2]
                 tokens = jnp.where(is_no_op, 0, tokens)
-                for i in range(self.cfgs.bkv_p_cache):
-                    sz = jnp.clip(tokens - i * page_size, 0, page_size)
-                    p_idx = jnp.minimum(p0 + i, last_index) if i else p0
-                    src_off = page_indices_ref[p_idx] * page_size
-                    pltpu.make_async_copy(
-                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
-                        vmem_dst.at[b, pl.ds(i * page_size, sz)],
-                        sem,
-                    ).start()
+
+                def compact_pages(lo, hi, b=b, p0=p0, tokens=tokens):
+                    for i in range(lo, hi):
+                        sz = jnp.clip(tokens - i * page_size, 0, page_size)
+                        p_idx = jnp.minimum(p0 + i, last_index) if i else p0
+                        src_off = page_indices_ref[p_idx] * page_size
+                        pltpu.make_async_copy(
+                            kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
+                            vmem_dst.at[b, pl.ds(i * page_size, sz)],
+                            sem,
+                        ).start()
+
+                group = self.cfgs.serve.kv_skip_group
+                pages = self.cfgs.bkv_p_cache
+                if not group:
+                    compact_pages(0, pages)
+                else:
+                    # A group past the tile's last token would only issue
+                    # zero-size DMAs; the wait counts bytes, so skipping them
+                    # changes nothing it waits for.
+                    for lo in range(0, pages, group):
+                        hi = min(lo + group, pages)
+                        pl.when(tokens > lo * page_size)(
+                            functools.partial(compact_pages, lo, hi)
+                        )
             else:
                 # Lean per-page fetch: a tile's cache pages are consecutive
                 # page-table entries landing at i * page_size, so only the
@@ -433,6 +450,8 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         slot: int | jax.Array,
         total_steps: int | jax.Array,
     ):
+        if self.cfgs.serve.read_only_cache:
+            return
         is_no_op, block_idx = _step_guard(step, total_steps)
         kv_out_ref, _, schedule_ref, page_indices_ref = self.dst_ref
         assert self.sem_sends is not None
@@ -493,6 +512,8 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         slot: int | jax.Array,
         total_steps: int | jax.Array,
     ):
+        if self.cfgs.serve.read_only_cache:
+            return
         is_no_op, block_idx = _step_guard(step, total_steps)
         _, _, schedule_ref, _ = self.dst_ref
         assert self.sem_sends is not None
@@ -508,6 +529,53 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
             flat_src.at[pl.ds(0, wait_lanes), :],
             flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
+        ).wait()
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectionFetch:
+    """Fetches each lane-tile's selection words into a slot of VMEM.
+
+    ``selection_hbm`` is [sequences * tiles_per_seq, bkv // 128, 128]: tile
+    ``k`` of sequence ``s`` is row ``s * tiles_per_seq + k``. ``window`` is
+    [NUM_INPUT_SLOTS, batch, bkv // 128, 128] and ``sems`` one DMA semaphore a
+    slot. A lane with no task (s_idx -1) fetches nothing.
+    """
+
+    selection_hbm: jax.Ref
+    schedule_ref: Any
+    window: jax.Ref
+    sems: jax.Ref
+    tiles_per_seq: int
+    cfgs: configs.RpaConfigs
+
+    def _lane_rows(self, block_idx, b, is_no_op):
+        s_idx = self.schedule_ref.s_idx[block_idx, b]
+        rows = jnp.where(jnp.logical_or(is_no_op, s_idx < 0), 0, 1)
+        tile = jnp.maximum(s_idx, 0) * self.tiles_per_seq
+        return tile + self.schedule_ref.k_idx[block_idx, b], rows
+
+    def copy_in(self, step, slot, total_steps):
+        is_no_op, block_idx = _step_guard(step, total_steps)
+        for b in range(self.cfgs.batch_size):
+            tile, rows = self._lane_rows(block_idx, b, is_no_op)
+            pltpu.make_async_copy(
+                self.selection_hbm.at[pl.ds(tile, rows)],
+                self.window.at[slot, pl.ds(b, rows)],
+                self.sems.at[slot],
+            ).start()
+
+    def wait_in(self, step, slot, total_steps):
+        # Every copy moves one [bkv // 128, 128] row, so one wait over the
+        # lanes that issued covers them all.
+        is_no_op, block_idx = _step_guard(step, total_steps)
+        rows = 0
+        for b in range(self.cfgs.batch_size):
+            rows += self._lane_rows(block_idx, b, is_no_op)[1]
+        pltpu.make_async_copy(
+            self.window.at[slot, pl.ds(0, rows)],
+            self.window.at[slot, pl.ds(0, rows)],
+            self.sems.at[slot],
         ).wait()
 
 

@@ -89,6 +89,26 @@ def _get_tpu_global_device_id() -> int:
         return 0
 
 
+def device_chip_coords(devices: Any) -> list[tuple[int, Any, Any]]:
+    """Lists (device id, chip coords, core on chip) for each device.
+
+    A device that does not expose an attribute shows "coords unavailable" or
+    "core unavailable" in its place, so the listing never stops startup.
+    """
+    listed = []
+    for device in devices:
+        coords = getattr(device, "coords", None)
+        core = getattr(device, "core_on_chip", None)
+        listed.append(
+            (
+                int(device.id),
+                tuple(coords) if coords is not None else "coords unavailable",
+                core if core is not None else "core unavailable",
+            )
+        )
+    return listed
+
+
 def _collect_rank_to_device_id(
     group: Any, global_rank: int, device_id: int
 ) -> dict[int, int]:

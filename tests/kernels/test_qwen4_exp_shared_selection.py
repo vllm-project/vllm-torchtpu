@@ -71,3 +71,32 @@ def test_shared_blocks_take_the_selection_or_every_visible_block():
     )
     np.testing.assert_array_equal(got[1], [9, 3, 12, 5])
     np.testing.assert_array_equal(got[2], [7, 0, 2, 0])  # an uncovered slot: group 0
+
+
+@pytest.mark.parametrize("rows", [None, [2, 6, -1]])
+def test_shared_step_without_indexer_writes(rowwise_attention, rows):
+    """``indexer_writes=False`` (VLLM_TPU_MTP_DRAFT_SKIP_INDEXER_WRITES): the
+    same output, selection and main-KV bytes; the stand-in compressed-key and
+    ring writes (pool[11, 0] and pool[11, 1]) are left out."""
+    head, pool, tail = _inputs(False, STARTS, CONTEXT)
+    selected = pooled_qsa.pooled_qsa_step(*head, pool, *tail, **SHARED_OPTIONS)[2]
+    if rows is None:
+        step, extra = pooled_qsa.pooled_qsa_shared_step, (selected,)
+    else:
+        rows = jnp.asarray(rows, jnp.int32)
+        step = pooled_qsa.pooled_qsa_shared_rows_step
+        extra = (rows, selected[jnp.maximum(rows, 0)])
+
+    def run(**kw):
+        return jax.jit(lambda *a: step(*a, **SHARED_OPTIONS, **kw))(
+            *head, pool, *tail, *extra
+        )
+
+    want_pool, want_out, want_selected = run()
+    got_pool, got_out, got_selected = run(indexer_writes=False)
+    np.testing.assert_array_equal(np.asarray(got_out), np.asarray(want_out))
+    np.testing.assert_array_equal(np.asarray(got_selected), np.asarray(want_selected))
+    expected = np.array(want_pool)
+    expected[11, :2] = np.asarray(pool)[11, :2]
+    np.testing.assert_array_equal(_bytes(got_pool), _bytes(expected))
+    assert not np.array_equal(_bytes(want_pool[11, :2]), _bytes(pool[11, :2]))

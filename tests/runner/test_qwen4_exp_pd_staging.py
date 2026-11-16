@@ -9,6 +9,7 @@ slice in its own geometry.
 """
 
 import importlib.util
+import math
 import pathlib
 
 import numpy as np
@@ -686,3 +687,553 @@ def test_draft_kv_refuses_a_pcp_or_merged_key_producer(monkeypatch, env):
     with pytest.raises(Exception) as other:
         pkg.StagedConsumer(_decode_cfg(3), None, None, None, None, 1 << 20)
     assert "plain TP1 pipeline producer" not in str(other.value)
+
+
+# --- VLLM_TPU_QSA_COMPRESSED_DCP on a staged decode ----------------------------
+# Every rank still receives every compressed pair; each lands only the pairs of
+# its own B-token blocks, at row (t % B) // (2 ratio) of its page for the
+# block's D x B table entry (pooled_qsa.compressed_pairs with dcp). The
+# reference lands the load unsplit (today's planner, into per-block virtual
+# pages) and then copies each owned block's rows to its split page.
+
+_SPLIT_TP, _SPLIT_D, _SPLIT_B, _SPLIT_SRC, _SPLIT_R = 8, 4, 128, 384, 4
+_MEMBERS = ("model.layers.3.self_attn.compressed_k", "model.layers.7.self_attn.compressed_k")
+# Slot 2 of the packed group is the MTP draft's (no producer pages: never landed).
+_MEMBER_ROWS = _SPLIT_B // (2 * _SPLIT_R)
+
+
+def _split_consumer(tp_rank, split=True):
+    c = object.__new__(st.StagedConsumer)
+    c.rank = st.RankSlice(tp_size=_SPLIT_TP, tp_rank=tp_rank, num_kv_heads=2, main_dcp=_SPLIT_D)
+    c.ratio, c.dst_block, c.src_block, c._state_entry = _SPLIT_R, _SPLIT_B, _SPLIT_SRC, 0
+    c._dst_owner = {}
+    c._dst_compressed = {name: (0, slot * _MEMBER_ROWS) for slot, name in enumerate(_MEMBERS)}
+    c._src_owner = {name: i for i, name in enumerate(_MEMBERS)}
+    c.src_groups = [None] * len(_MEMBERS)
+    c._gdn_names, c._zero_draft = [], {}
+    c._dcp_owners = frozenset(_MEMBERS) if split else frozenset()
+    return c
+
+
+def _copy_fn():
+    # Compressed keys only: a repack whose main and GDN parts are empty.
+    return st.make_repack(src_block=_SPLIT_SRC, dst_block=_SPLIT_B, src_gdn=None, dst_gdn=None,
+                          kv_head=0, v_head_start=0, channels=[0], write=scatter)
+
+
+def _run_copies(pool, staging, copy_s, copy_d):
+    size = st.bucket(max(len(copy_s), 1), 16)
+    out = jnp.asarray(pool)
+    for plan in st.repack_chunks([], [], copy_s, copy_d, [], [], size, 1):
+        out = _copy_fn()(out, jnp.asarray(staging), *(jnp.asarray(v, jnp.int32) for v in plan))
+    return np.asarray(out)
+
+
+def _split_load(num_tokens, skip, seed):
+    """Staging with every producer compressed page (random keys), the staged
+    suffix's page lists, split tables (one page per D x B entry, the same for
+    every rank's page) and per-block virtual tables for the unsplit landing."""
+    rng = np.random.default_rng(seed)
+    n_src = -(-num_tokens // _SPLIT_SRC)
+    first = skip // _SPLIT_SRC
+    staging = carrier(1 + len(_MEMBERS) * n_src, _SPLIT_SRC)
+    staging[1:] = rng.integers(0, 256, staging[1:].shape, dtype=np.uint8)
+    full = {
+        name: list(range(1 + i * n_src, 1 + (i + 1) * n_src)) for i, name in enumerate(_MEMBERS)
+    }
+    staged = {name: pages[first:] for name, pages in full.items()}
+    entries = -(-num_tokens // (_SPLIT_D * _SPLIT_B))
+    blocks = -(-num_tokens // _SPLIT_B)
+    ids = rng.permutation(np.arange(1, 200))
+    split_table = [int(x) for x in ids[:entries]]
+    virtual = {name: [int(x) for x in ids[100 + 40 * i : 100 + 40 * i + blocks]]
+               for i, name in enumerate(_MEMBERS)}
+    stale = rng.integers(0, 256, (200, _SPLIT_B, 1, ROWS, LANES), dtype=np.uint8)
+    return staging, staged, [first] * len(_MEMBERS), split_table, virtual, stale
+
+
+def _reference_split_pool(
+    num_tokens, skip, tp_rank, staging, staged, first, split_table, virtual, stale
+):
+    span = 2 * _SPLIT_R
+    pairs = math.ceil(math.ceil(num_tokens / _SPLIT_R) / 2)
+    copy_s, copy_d = [], []
+    for name, (gi, offset) in _split_consumer(tp_rank)._dst_compressed.items():
+        s, d = st.compressed_rows_np(num_tokens, _SPLIT_R, staged[name], _SPLIT_SRC, virtual[name],
+                                     _SPLIT_B, start=skip, src_first=first[0], dst_offset=offset)
+        copy_s.append(s)
+        copy_d.append(d)
+    unsplit = flat_rows(_run_copies(np.zeros_like(stale), staging,
+                                    np.concatenate(copy_s), np.concatenate(copy_d)))
+    ref = flat_rows(stale.copy())
+    for name, (gi, offset) in _split_consumer(tp_rank)._dst_compressed.items():
+        for k in range(skip // _SPLIT_B, -(-num_tokens // _SPLIT_B)):
+            if k % _SPLIT_D != tp_rank % _SPLIT_D:
+                continue
+            rows = min(_MEMBER_ROWS, pairs - k * _SPLIT_B // span)  # pairs of the block
+            src = virtual[name][k] * _SPLIT_B + offset
+            dst = split_table[k // _SPLIT_D] * _SPLIT_B + offset
+            ref[dst : dst + rows] = unsplit[src : src + rows]
+    return ref
+
+
+@pytest.mark.parametrize(
+    "num_tokens,skip",
+    [
+        pytest.param(1500, 0, id="no_prefix"),
+        pytest.param(2600, 1024, id="local_prefix"),  # skip on a D x B entry, mid source page
+        pytest.param(300, 0, id="shorter_than_an_entry"),
+        pytest.param(100, 0, id="shorter_than_a_block"),
+    ],
+)
+def test_split_compressed_landing_is_the_owned_part_of_the_unsplit_landing(num_tokens, skip):
+    staging, staged, first, split_table, virtual, stale = _split_load(num_tokens, skip, num_tokens)
+    tables = [split_table]
+    owned_any = False
+    for r in range(_SPLIT_TP):
+        c = _split_consumer(r)
+        ms, md, cs, cd, gs, gd = c.indices(staged, tables, num_tokens, skip, first)
+        assert len(ms) == len(gs) == 0
+        got = flat_rows(_run_copies(stale, staging, cs, cd))
+        want = _reference_split_pool(num_tokens, skip, r, staging, staged, first, split_table,
+                                     virtual, stale)
+        # Page 0 is the null page: an empty plan rewrites its row 0.
+        np.testing.assert_array_equal(got[_SPLIT_B:], want[_SPLIT_B:], err_msg=f"rank {r}")
+        changed = got[_SPLIT_B:] != flat_rows(stale)[_SPLIT_B:]
+        written = int(changed.any(axis=(1, 2)).sum())
+        owned_any |= written > 0
+        if num_tokens <= _SPLIT_B and r % _SPLIT_D:
+            assert written == 0  # a block of rank 0's only
+        # The draft's slot (rows from 2 x member rows) is never written.
+        pages = np.asarray(split_table)
+        draft_rows = pages[:, None] * _SPLIT_B + 2 * _MEMBER_ROWS + np.arange(_MEMBER_ROWS)
+        draft_rows = draft_rows.reshape(-1)
+        np.testing.assert_array_equal(got[draft_rows], flat_rows(stale)[draft_rows])
+    assert owned_any
+
+
+@pytest.mark.parametrize("dcp,tp_rank", [(4, 0), (4, 3), (4, 6), (2, 5)])
+@pytest.mark.parametrize("num_tokens,start", [(1, 0), (300, 0), (7521, 0), (20000, 4096)])
+def test_split_compressed_planners_agree(dcp, tp_rank, num_tokens, start):
+    """compressed_rows_np, compressed_rows_split_np (one producer rank) and
+    compressed_dst_np list the same pairs, those pair_tokens_np names, with the
+    kernel's split rows."""
+    rank = st.RankSlice(tp_size=8, tp_rank=tp_rank, num_kv_heads=2, main_dcp=dcp)
+    src, dst = np.arange(1, 9), list(range(100, 140))
+    first = start // 3200
+    t = st.pair_tokens_np(num_tokens, 4, start, 512, rank)
+    every = st.pair_tokens_np(num_tokens, 4, start)
+    assert np.array_equal(t, every[(every // 512) % dcp == tp_rank % dcp])
+    want_d = np.asarray(dst)[t // (dcp * 512)] * 512 + 64 + (t % 512) // 8
+    s, d = st.compressed_rows_np(num_tokens, 4, src, 3200, dst, 512, start=start,
+                                 src_first=first, dst_offset=64, rank=rank)
+    assert np.array_equal(d, want_d)
+    assert np.array_equal(s, src[t // 3200 - first] * 3200 + (t % 3200) // 8)
+    s1, d1 = st.compressed_rows_split_np(num_tokens, 4, [src], 3200, dst, 512, start=start,
+                                         src_first=first, dst_offset=64, rank=rank)
+    assert np.array_equal(s1, s) and np.array_equal(d1, d)
+    assert np.array_equal(
+        st.compressed_dst_np(num_tokens, 4, dst, 512, start, 64, rank=rank), want_d)
+    # Without a rank (or at DCP 1) nothing changes.
+    plain = st.RankSlice(tp_size=8, tp_rank=tp_rank, num_kv_heads=2, main_dcp=1)
+    assert np.array_equal(st.compressed_dst_np(num_tokens, 4, dst, 512, start, 64, rank=plain),
+                          st.compressed_dst_np(num_tokens, 4, dst, 512, start, 64))
+
+
+def test_zero_draft_rows_follow_the_split():
+    """QWEN4_EXP_PD_ZERO_DRAFT_KV: the draft's rows of the landed tokens, split
+    like its pages (main KV under VLLM_TPU_QSA_MTP_KV_DCP, compressed keys
+    under VLLM_TPU_QSA_COMPRESSED_DCP), else every row."""
+    draft = "mtp.layers.48.self_attn"
+    n, skip = 5000, 2048
+    for split in (True, False):
+        c = _split_consumer(5, split=split)
+        c.dst_block, c.ratio = 512, 4
+        c._dst_compressed = {}
+        c._zero_draft = {draft: (1, 0), draft + ".compressed_k": (2, 128)}
+        c._dcp_owners = frozenset(c._zero_draft) if split else frozenset()
+        main_table = list(range(10, 13)) if split else list(range(10, 20))
+        comp_table = list(range(30, 33)) if split else list(range(30, 40))
+        _, _, cs, cd, _, _ = c.indices({}, [[], main_table, comp_table], n, skip, [0, 0, 0])
+        assert not cs.any()  # from the null staging row
+        d = 4 if split else 1
+        rank = st.RankSlice(tp_size=8, tp_rank=5, num_kv_heads=2, main_dcp=d)
+        t = np.arange(skip, n)
+        t = t[(t // 512) % d == rank.dcp_rank] if split else t
+        main = np.asarray(main_table)[t // (d * 512)] * 512 + t % 512
+        p = np.arange(skip // 8, math.ceil(math.ceil(n / 4) / 2)) * 8
+        p = p[(p // 512) % d == rank.dcp_rank] if split else p
+        comp = np.asarray(comp_table)[p // (d * 512)] * 512 + 128 + (p % 512) // 8
+        assert set(cd.tolist()) == set(main.tolist()) | set(comp.tolist())
+
+
+def test_verify_split_keys_reads_zero_mismatches_and_catches_a_wrong_row():
+    """QWEN4_EXP_PD_VERIFY_SPLIT_KEYS on the landing above, with a host reader
+    in place of the device read-back: no mismatch after the split landing, one
+    after a corrupted pool row, many after an unsplit (wrong) landing."""
+    n, skip, r = 2600, 1024, 6
+    staging, staged, first, split_table, virtual, stale = _split_load(n, skip, 7)
+    c = _split_consumer(r)
+    c.route, c.src_merged = None, False
+    c.reservations, c.skips = {9: staged}, {9: (skip, first)}
+    _, _, cs, cd, _, _ = c.indices(staged, [split_table], n, skip, first)
+    pool = flat_rows(_run_copies(stale, staging, cs, cd))
+    stage = flat_rows(staging)
+
+    def reader(p):
+        return lambda s, d: (stage[s], p[d])
+
+    out = c.verify_split_keys(9, [split_table], n, read_rows=reader(pool))
+    owned = sum(len(x[1]) for x in c.split_key_check_rows(9, [split_table], n))
+    assert out["mismatched"] == 0 and out["pairs"] == owned > 0
+    assert out["pool_digest"] == out["staging_digest"]
+    assert out["nonzero"] == owned and out["control_equal"] == 0
+    bad = pool.copy()
+    row = c.split_key_check_rows(9, [split_table], n)[1][2][3]
+    bad[row] ^= 1
+    out = c.verify_split_keys(9, [split_table], n, read_rows=reader(bad))
+    assert out["mismatched"] == 1 and out["by_owner"] == {_MEMBERS[0]: 0, _MEMBERS[1]: 1}
+    # Rank 6's rows landed by rank 5's plan: nearly every pair differs.
+    other = _split_consumer(5)
+    _, _, cs, cd, _, _ = other.indices(staged, [split_table], n, skip, first)
+    wrong = flat_rows(_run_copies(stale, staging, cs, cd))
+    out = c.verify_split_keys(9, [split_table], n, read_rows=reader(wrong))
+    assert out["mismatched"] == owned
+
+
+# --- QWEN4_EXP_PACK_MAIN_KV on a staged decode ----------------------------------
+# Consecutive target layers share one main-KV owner: member s keeps K and V in
+# head slots 2s and 2s + 1 of the owner's rows (pool_layout.pooled_cache_specs);
+# an odd last layer keeps whole rows. The repack writes both members' pairs in
+# one row. The reference lands the load the slow way, unpacked (every layer on
+# pages of its own, today's planner), then merges each member's landed pair into
+# the owner's row by the rule of the decode's own paired writer
+# (pooled_qsa._write_main_cache_paired: a lane's four FP8 head slots are one
+# 32-bit word, low byte first; main_slot_rows and the keep mask).
+
+_PACK_LAYERS = tuple(f"model.layers.{i}.self_attn" for i in (3, 7, 11, 15, 19))
+
+
+def _main_owners(layers):
+    """``layout.main_owners`` as pooled_cache_specs pairs ``layers``."""
+    owners = []
+    for start in range(0, len(layers) - 1, 2):
+        chunk = layers[start : start + 2]
+        owners += [(name, chunk[0], slot) for slot, name in enumerate(chunk)]
+    return tuple(owners)
+
+
+def _pack_pairs(layers):
+    from types import SimpleNamespace
+
+    return st.main_pairs(SimpleNamespace(main_owners=_main_owners(layers)))
+
+
+def _pack_consumer(tp_rank, layers, pairs, compressed=(), d=_SPLIT_D):
+    """A staged TP8 rank landing ``layers``' main KV (paired by ``pairs``) and,
+    for F1's split, the split compressed keys of ``compressed`` (group "comp")."""
+    c = object.__new__(st.StagedConsumer)
+    c.rank = st.RankSlice(tp_size=_SPLIT_TP, tp_rank=tp_rank, num_kv_heads=2, main_dcp=d)
+    c.ratio, c.dst_block, c.src_block, c._state_entry = _SPLIT_R, _SPLIT_B, _SPLIT_SRC, 0
+    away = {m for members in pairs.values() for m in members[1:]}
+    c._dst_owner = {n: n for n in layers if n not in away}
+    c._main_pairs = pairs
+    c._dst_compressed = {n: ("comp", slot * _MEMBER_ROWS) for slot, n in enumerate(compressed)}
+    names = list(layers) + list(compressed)
+    c._src_owner = {n: i for i, n in enumerate(names)}
+    c.src_groups = [None] * len(names)
+    c._gdn_names, c._zero_draft = [], {}
+    c._dcp_owners = frozenset(compressed) | frozenset(c._dst_owner)
+    return c
+
+
+def _main_fn(rank):
+    return st.make_repack(src_block=_SPLIT_SRC, dst_block=_SPLIT_B, src_gdn=None, dst_gdn=None,
+                          kv_head=rank.kv_head, v_head_start=0, channels=[0], write=scatter)
+
+
+def _land(c, pool, staging, idx, size=None, null_rows=None):
+    size = size or st.bucket(max(len(idx[0]), len(idx[2]), 1), 16)
+    out = jnp.asarray(pool)
+    fn = _main_fn(c.rank)
+    for plan in st.repack_chunks(*idx, size, 1, null_rows=null_rows):
+        out = fn(out, jnp.asarray(staging), *(jnp.asarray(v, jnp.int32) for v in plan))
+    return np.asarray(out)
+
+
+def _main_load(num_tokens, skip, layers, rng, page_base=200, pages=200):
+    """Staging with every layer's producer main-KV pages (random rows), the
+    staged suffix's page lists and one destination table per layer (a paired
+    member's own table is the unpacked reference's virtual pages)."""
+    n_src = -(-num_tokens // _SPLIT_SRC)
+    first = skip // _SPLIT_SRC
+    staging = carrier(1 + len(layers) * n_src, _SPLIT_SRC)
+    staging[1:] = rng.integers(0, 256, staging[1:].shape, dtype=np.uint8)
+    staged = {name: list(range(1 + i * n_src, 1 + (i + 1) * n_src))[first:]
+              for i, name in enumerate(layers)}
+    entries = -(-num_tokens // (_SPLIT_D * _SPLIT_B))
+    ids = [int(x) for x in rng.permutation(np.arange(page_base, page_base + pages))]
+    tables = {name: ids[i * entries : (i + 1) * entries] for i, name in enumerate(layers)}
+    return staging, staged, first, tables
+
+
+def _merge_slot(old, new, slot):
+    """``pooled_qsa._write_main_cache_paired`` on rows ``[n, 4, 256]``: ``new``
+    holds the layer's pair at slots 0-1 (``pack_rows``), moved to ``slot``."""
+    pq = pytest.importorskip("vllm_torchtpu.kernels.qwen4_exp.pooled_qsa")
+    moved = np.asarray(pq.main_slot_rows(jnp.asarray(new), slot))
+
+    def words(rows):  # [n, 256] uint32: sublane 0 is the low byte
+        return np.ascontiguousarray(rows.transpose(0, 2, 1)).view(np.uint32)[..., 0]
+
+    merged = (words(old) & np.uint32(pq._main_slot_keep_mask(slot))) | words(moved)
+    return merged[..., None].view(np.uint8).transpose(0, 2, 1)
+
+
+def _reference_packed_main(num_tokens, skip, tp_rank, layers, pairs, staging, staged, first,
+                           tables, stale):
+    plain = _pack_consumer(tp_rank, layers, {})
+    idx = plain.indices(staged, tables, num_tokens, skip, [first] * len(layers))
+    assert idx[0].ndim == 1
+    unpacked = flat_rows(_land(plain, np.zeros_like(stale), staging, idx))
+    ref = flat_rows(stale.copy())
+    b, d = _SPLIT_B, _SPLIT_D
+    t = np.arange(skip, num_tokens)
+    t = t[(t // b) % d == tp_rank % d]
+
+    def rows(name):
+        return np.asarray(tables[name], dtype=np.int64)[t // (d * b)] * b + t % b
+
+    paired = {m for members in pairs.values() for m in members}
+    for owner, members in pairs.items():
+        for slot, member in enumerate(members):
+            ref[rows(owner)] = _merge_slot(ref[rows(owner)], unpacked[rows(member)], slot)
+    for name in layers:
+        if name not in paired:  # whole rows (K, V, 0, 0), as today
+            ref[rows(name)] = unpacked[rows(name)]
+    return ref
+
+
+_PACK_CASES = [
+    pytest.param(1500, 0, 5, None, id="no_prefix_odd"),
+    pytest.param(2600, 1024, 5, None, id="local_prefix_odd"),
+    pytest.param(2600, 1024, 4, 96, id="local_prefix_even_chunked"),
+    pytest.param(300, 0, 3, None, id="shorter_than_an_entry_odd"),
+    pytest.param(100, 0, 2, 64, id="shorter_than_a_block_chunked"),
+]
+
+
+@pytest.mark.parametrize("spread", [False, True], ids=["last_row_pad", "spread_pad"])
+@pytest.mark.parametrize("num_tokens,skip,n_layers,chunk", _PACK_CASES)
+def test_packed_main_landing_is_the_slot_merge_of_the_unpacked_landing(
+    num_tokens, skip, n_layers, chunk, spread
+):
+    layers = _PACK_LAYERS[:n_layers]
+    pairs = _pack_pairs(layers)
+    assert len(pairs) == n_layers // 2
+    rng = np.random.default_rng(num_tokens + n_layers)
+    staging, staged, first, tables = _main_load(num_tokens, skip, layers, rng)
+    stale = rng.integers(0, 256, (400, _SPLIT_B, 1, ROWS, LANES), dtype=np.uint8)
+    written_any = False
+    for r in range(_SPLIT_TP):
+        c = _pack_consumer(r, layers, pairs)
+        idx = c.indices(staged, tables, num_tokens, skip, [first] * len(layers))
+        assert idx[0].ndim == 2 and idx[0].shape == (len(idx[1]), 2)
+        # Spread padding (repack_chunks null_rows) pads both source columns
+        # with distinct zero staging rows onto the pool's page 0.
+        null_rows = (_SPLIT_SRC, _SPLIT_B) if spread else None
+        got = flat_rows(_land(c, stale, staging, idx, chunk, null_rows))
+        want = _reference_packed_main(num_tokens, skip, r, layers, pairs, staging, staged, first,
+                                      tables, stale)
+        # Page 0 is the null page: an empty plan rewrites its row 0.
+        np.testing.assert_array_equal(got[_SPLIT_B:], want[_SPLIT_B:], err_msg=f"rank {r}")
+        written = (got[_SPLIT_B:] != flat_rows(stale)[_SPLIT_B:]).any(axis=(1, 2))
+        written_any |= bool(written.any())
+        if num_tokens <= _SPLIT_B and r % _SPLIT_D:
+            assert not written.any()  # a block of rank 0's only
+        # The paired-away members' own pages are never written.
+        for owner, (_, member) in pairs.items():
+            pages = np.asarray(tables[member])
+            np.testing.assert_array_equal(np.asarray(got).reshape(400, -1)[pages],
+                                          stale.reshape(400, -1)[pages])
+    assert written_any
+
+
+def test_packed_main_pairs_differ_and_an_odd_layer_keeps_zero_slots():
+    """Controls on one rank: the two head-slot pairs of an owner's row carry
+    different layers (a repack writing member 0 twice would pass a check of
+    member 0 alone), and the odd last layer's slots 2-3 are zero."""
+    layers = _PACK_LAYERS[:3]
+    pairs = _pack_pairs(layers)
+    n, skip, r = 1500, 0, 5
+    staging, staged, first, tables = _main_load(n, skip, layers, np.random.default_rng(3))
+    c = _pack_consumer(r, layers, pairs)
+    got = flat_rows(_land(c, carrier(400, _SPLIT_B), staging,
+                          c.indices(staged, tables, n, skip, [first] * 3)))
+    t = np.arange(n)
+    t = t[(t // _SPLIT_B) % _SPLIT_D == r % _SPLIT_D]
+
+    def rows(name):
+        return np.asarray(tables[name])[t // (_SPLIT_D * _SPLIT_B)] * _SPLIT_B + t % _SPLIT_B
+
+    owner = got[rows(layers[0])]
+    assert (owner[:, :2] != owner[:, 2:]).any(axis=(1, 2)).all()
+    h = c.rank.kv_head
+
+    def src(name):
+        pages = np.asarray(staged[name])
+        return flat_rows(staging)[pages[t // _SPLIT_SRC] * _SPLIT_SRC + t % _SPLIT_SRC]
+
+    np.testing.assert_array_equal(owner[:, :2], src(layers[0])[:, 2 * h : 2 * h + 2])
+    np.testing.assert_array_equal(owner[:, 2:], src(layers[1])[:, 2 * h : 2 * h + 2])
+    odd = got[rows(layers[2])]
+    np.testing.assert_array_equal(odd[:, :2], src(layers[2])[:, 2 * h : 2 * h + 2])
+    assert not odd[:, 2:].any()
+
+
+@pytest.mark.parametrize(
+    "num_tokens,skip",
+    [pytest.param(1500, 0, id="no_prefix"), pytest.param(2600, 1024, id="local_prefix"),
+     pytest.param(300, 0, id="shorter_than_an_entry")],
+)
+def test_packed_main_with_split_compressed_keys(num_tokens, skip):
+    """F1 (VLLM_TPU_QSA_MTP_KV_DCP + VLLM_TPU_QSA_COMPRESSED_DCP) with packing:
+    one repack lands paired main KV (an odd layer included) and split
+    compressed keys, in chunks of mixed kinds; each part equals its slow
+    reference and nothing else changes."""
+    layers = _PACK_LAYERS[:3]
+    pairs = _pack_pairs(layers)
+    rng = np.random.default_rng(num_tokens * 3 + skip)
+    m_stage, m_staged, first, tables = _main_load(num_tokens, skip, layers, rng)
+    c_stage, c_staged, _, split_table, virtual, _ = _split_load(num_tokens, skip, num_tokens)
+    # One carrier: main pages first, then the compressed pages shifted after them.
+    shift = len(m_stage) - 1
+    staging = np.concatenate([m_stage, c_stage[1:]])
+    c_staged_s = {n: [p + shift for p in pages] for n, pages in c_staged.items()}
+    stale = rng.integers(0, 256, (400, _SPLIT_B, 1, ROWS, LANES), dtype=np.uint8)
+    for r in range(_SPLIT_TP):
+        c = _pack_consumer(r, layers, pairs, compressed=_MEMBERS)
+        src_pages = {**m_staged, **c_staged_s}
+        dst = {**tables, "comp": split_table}
+        idx = c.indices(src_pages, dst, num_tokens, skip, [first] * (len(layers) + len(_MEMBERS)))
+        assert idx[0].ndim == 2
+        got = flat_rows(_land(c, stale, staging, idx, 96, (_SPLIT_SRC, _SPLIT_B)))
+        want = _reference_packed_main(num_tokens, skip, r, layers, pairs, m_stage, m_staged, first,
+                                      tables, stale)
+        comp = _reference_split_pool(num_tokens, skip, r, c_stage, c_staged, [first] * 2,
+                                     split_table, virtual, stale)
+        # Compressed pages (ids < 200) from the split reference, main pages
+        # (ids >= 200) from the packed reference.
+        want[: 200 * _SPLIT_B] = comp[: 200 * _SPLIT_B]
+        np.testing.assert_array_equal(got[_SPLIT_B:], want[_SPLIT_B:], err_msg=f"rank {r}")
+
+
+@pytest.mark.parametrize("num_tokens,skip", [(2600, 0), (2600, 1024), (100, 0)])
+def test_paired_main_sources_and_tile_alignment(num_tokens, skip):
+    """``main_sources`` lists member 0's and member 1's staging rows for the
+    owner's destination rows, in the same order; an unpaired owner pads
+    column 1 with the null row; ``align_rows`` pads both columns alike."""
+    layers = _PACK_LAYERS[:3]
+    pairs = _pack_pairs(layers)
+    staging, staged, first, tables = _main_load(num_tokens, skip, layers, np.random.default_rng(9))
+    for r in (0, 3, 6):
+        c = _pack_consumer(r, layers, pairs)
+        ms, md, *_ = c.indices(staged, tables, num_tokens, skip, [first] * 3)
+        rank = c.rank
+        segs = []
+        for name in (layers[0], layers[2]):
+            s0, d = st.main_rows_np(num_tokens, staged[name], _SPLIT_SRC, tables[name], _SPLIT_B,
+                                    rank, start=skip, src_first=first)
+            if name == layers[0]:
+                s1, _ = st.main_rows_np(num_tokens, staged[layers[1]], _SPLIT_SRC, tables[name],
+                                        _SPLIT_B, rank, start=skip, src_first=first)
+            else:
+                s1 = np.zeros_like(s0)
+            if len(d):
+                segs.append((st.align_rows(np.stack([s0, s1], axis=1)), st.align_rows(d)))
+        want_s = np.concatenate([s for s, _ in segs]) if segs else np.zeros((0, 2), np.int64)
+        want_d = np.concatenate([d for _, d in segs]) if segs else np.zeros(0, np.int64)
+        np.testing.assert_array_equal(ms, want_s)
+        np.testing.assert_array_equal(md, want_d)
+        assert ms.shape == (len(md), 2) and len(md) % st.REPACK_TILE == 0
+        # Every program keeps the [rows, 2] shape, an empty rank's included.
+        for plan in st.repack_chunks(ms, md, [], [], [], [], 64, 1):
+            assert plan[0].shape == (64, 2)
+
+
+def test_verify_main_pairs_reads_zero_mismatches_and_catches_a_wrong_slot():
+    """QWEN4_EXP_PD_VERIFY_SPLIT_KEYS's packed main-KV check on the landing
+    above, with a host reader in place of the device read-back: no mismatch
+    after the packed landing, one after a corrupted byte, every row after a
+    landing that swaps the two members' slots."""
+    layers = _PACK_LAYERS[:5]
+    pairs = _pack_pairs(layers)
+    n, skip, r = 2600, 1024, 6
+    staging, staged, first, tables = _main_load(n, skip, layers, np.random.default_rng(11))
+    c = _pack_consumer(r, layers, pairs)
+    c.route, c._src_split = None, frozenset()
+    uuid = 9
+    c.reservations, c.skips = {uuid: staged}, {uuid: (skip, [first] * 5)}
+    pool = flat_rows(_land(c, carrier(400, _SPLIT_B), staging,
+                           c.indices(staged, tables, n, skip, [first] * 5)))
+    stage = flat_rows(staging)
+
+    def reader(p):
+        return lambda s, d: (stage[s], p[d])
+
+    checked = c.main_pair_check_rows(uuid, tables, n)
+    owner = list(pairs)[0]
+    assert [m for m, *_ in checked] == list(pairs[owner])
+    out = c.verify_main_pairs(uuid, tables, n, read_rows=reader(pool))
+    assert out["owner"] == owner
+    # Each completed check moves to the next owner.
+    assert [m for m, *_ in c.main_pair_check_rows(uuid, tables, n)] == list(pairs[list(pairs)[1]])
+    assert out["mismatched"] == 0 and out["rows"] == sum(len(x[2]) for x in checked) > 0
+    assert out["pool_digest"] == out["staging_digest"] and out["partner_equal"] == 0
+    assert out["nonzero"] > 0.9 * out["rows"]
+    c._verify_main_total["checks"] = 0  # back to the first owner
+    bad = pool.copy()
+    bad[checked[1][3][5], 3, 17] ^= 1  # member 1's V byte of one row
+    out = c.verify_main_pairs(uuid, tables, n, read_rows=reader(bad))
+    assert out["mismatched"] == 1 and out["by_member"] == {pairs[owner][0]: 0, pairs[owner][1]: 1}
+    c._verify_main_total["checks"] = 0
+    swapped = pool.copy()
+    rows = checked[0][3]
+    swapped[rows] = np.concatenate([pool[rows][:, 2:], pool[rows][:, :2]], axis=1)
+    out = c.verify_main_pairs(uuid, tables, n, read_rows=reader(swapped))
+    assert out["mismatched"] == out["rows"] and out["partner_equal"] == out["rows"]
+
+
+def test_verify_main_pairs_reports_a_rank_without_rows():
+    """A DCP rank that stores no token of a load's suffix (here, a load
+    shorter than one block, on rank 1) logs an empty check instead of
+    raising."""
+    layers = _PACK_LAYERS[:2]
+    pairs = _pack_pairs(layers)
+    n, skip, r = 100, 0, 1
+    staging, staged, first, tables = _main_load(n, skip, layers, np.random.default_rng(12))
+    c = _pack_consumer(r, layers, pairs)
+    c.route, c._src_split = None, frozenset()
+    c.reservations, c.skips = {4: staged}, {4: (skip, [first] * 2)}
+    assert all(len(x[2]) == 0 for x in c.main_pair_check_rows(4, tables, n))
+
+    def never(s, d):
+        raise AssertionError("no rows to read")
+
+    out = c.verify_main_pairs(4, tables, n, read_rows=never)
+    assert out["rows"] == 0 and out["mismatched"] == 0 and out["nonzero"] == 0
+
+
+def test_verify_split_keys_of_a_rank_without_pairs_reports_zero():
+    """A load whose suffix holds no block of this rank: nothing to read back."""
+    n, skip, r = 100, 0, 3
+    staging, staged, first, split_table, virtual, stale = _split_load(n, skip, 11)
+    c = _split_consumer(r)
+    c.route, c.src_merged = None, False
+    c.reservations, c.skips = {9: staged}, {9: (skip, first)}
+
+    def reader(s, d):
+        raise AssertionError("no rows to read")
+
+    out = c.verify_split_keys(9, [split_table], n, read_rows=reader)
+    assert out["pairs"] == out["mismatched"] == out["nonzero"] == 0

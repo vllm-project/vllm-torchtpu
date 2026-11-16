@@ -36,7 +36,13 @@ def _sc_topk(bits, k):
     return sparsecore_topk(bits, k, write_empty_rows=True)
 
 
-def merge_threshold(vals_pair, pos_pair, k, *, topk=None):
+def _sc_topk_scores(bits, k):
+    from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
+
+    return sparsecore_topk(bits, k, write_empty_rows=True, return_scores=True)
+
+
+def merge_threshold(vals_pair, pos_pair, k, *, topk=None, from_scores=False):
     """Boundary of the global top-``k`` over the pair's local lists.
 
     ``vals_pair`` f32 ``[D, T, k]`` and ``pos_pair`` int32 ``[D, T, k]`` (global
@@ -45,21 +51,33 @@ def merge_threshold(vals_pair, pos_pair, k, *, topk=None):
     slots of ``k`` largest raw-bit scores per row (``-1`` padded); it defaults
     to the SparseCore top-k and only fixes the threshold value, so its own tie
     order does not matter.
+
+    ``from_scores`` (VLLM_TPU_QSA_DCP_MERGE_SCORES): ``topk`` returns
+    ``(slots, picked)`` with ``picked`` the raw bits at each kept slot, and the
+    boundary key is the minimum of their monotone keys: the same integers the
+    default reads by gathering ``key`` at the slots.
     """
-    topk = topk or _sc_topk
+    topk = topk or (_sc_topk_scores if from_scores else _sc_topk)
     d, t, width = vals_pair.shape
     vals = jnp.moveaxis(vals_pair, 0, 1).reshape(t, d * width)
     pos = jnp.moveaxis(pos_pair, 0, 1).reshape(t, d * width)
     filled = pos != EMPTY
     bits = jnp.where(filled, jax.lax.bitcast_convert_type(vals, jnp.int32), BITS_NEG_INF)
     key = monotone_key(bits)
-    slots = topk(bits, k)
-    taken = slots >= 0
     big = jnp.iinfo(jnp.int32).max
-    thr_key = jnp.min(
-        jnp.where(taken, jnp.take_along_axis(key, jnp.maximum(slots, 0), axis=1), big),
-        axis=1,
-    )
+    if from_scores:
+        slots, picked = topk(bits, k)
+        taken = slots >= 0
+        thr_key = jnp.min(jnp.where(taken, monotone_key(picked), big), axis=1)
+    else:
+        slots = topk(bits, k)
+        taken = slots >= 0
+        thr_key = jnp.min(
+            jnp.where(
+                taken, jnp.take_along_axis(key, jnp.maximum(slots, 0), axis=1), big
+            ),
+            axis=1,
+        )
     full = jnp.sum(taken, axis=1) >= k
     strict = filled & (key > thr_key[:, None])
     tied = filled & (key == thr_key[:, None])

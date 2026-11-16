@@ -228,3 +228,52 @@ def test_victims_are_stamped_when_the_lifo_patch_lands_after_the_hook():
 
     got = json.loads(line[len("Q38_SERVED "):])
     assert len(got) == 3 and all(step == 4 for _, step in got), got
+
+
+def test_store_victims_counts_stored_keys_by_group():
+    """The telemetry line splits victim_store_keys by KV cache group, so checkpoint stores count apart from
+    attention blocks."""
+    from vllm.v1.kv_offload.base import get_offload_group_idx
+
+    from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+    req = _request("r", 4 * BS)
+    resident = set()
+
+    class _Manager:
+        def prepare_victim_store(self, keys):
+            return [k for k in keys if k not in resident]
+
+        def submit_store_job(self, job_id, keys, block_ids):
+            self.job = (job_id, list(keys), list(block_ids))
+
+        def drain_jobs(self, job_ids):
+            return [NS(job_id=j, success=True) for j in job_ids]
+
+    sched = object.__new__(TPURaidenOffloadingScheduler)
+    sched._raiden_manager = _Manager()
+    sched._generate_job_id = lambda: 11
+    sched._fence_pending = {}
+    sched._victim_tap = tap = victim.VictimTap()
+    sched._victim_min_age, sched._victim_groups = 2, {0, 1, 3}
+    tap.step = 10
+    groups = [0, 0, 1, 3, 3, 3]
+    tap.pending = [victim.Victim(i + 1, _hash(req, i % 4, group=g), freed_step=0) for i, g in enumerate(groups)]
+    sched._store_victims()
+    _, keys, _ = sched._raiden_manager.job
+    stored = [get_offload_group_idx(k) for k in keys]
+    tel = sched.telemetry
+    assert tel["victim_store_keys"] == len(keys) == len(groups)
+    assert {k: v for k, v in tel.items() if k.startswith("victim_store_keys_g")} == {
+        f"victim_store_keys_g{g}": stored.count(g) for g in set(stored)
+    } == {"victim_store_keys_g0": 2, "victim_store_keys_g1": 1, "victim_store_keys_g3": 3}
+    assert "victim_store_keys_g3=3" in sched.telemetry_line()
+
+    # A second step adds to the per-group counters; keys already on the host are not counted.
+    resident.update(keys)
+    tap.pending = [victim.Victim(9, _hash(req, 0, group=0), freed_step=0),
+                   victim.Victim(10, _hash(req, 3, group=1), freed_step=0)]
+    tap.step = 12
+    sched._store_victims()
+    assert tel["victim_store_keys_g1"] == 2 and tel["victim_store_keys_g0"] == 2
+    assert tel["victim_store_keys"] == len(groups) + 1

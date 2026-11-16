@@ -6035,12 +6035,14 @@ class TPURaidenConnectorWorker:
                 first_attempt_s=now,
             )
             if tp_group is not None:
+                from vllm_torchtpu.distributed.kv_transfer import stage3_admission as adm
+
                 pending.task = self._stage_stage3_submit_task(pending, synchronous)
-                ready: list[bool | None] = [None] * int(tp_group.world_size)
-                torch.distributed.all_gather_object(
-                    ready, pending.task is not None, group=tp_group.cpu_group
-                )
-                if not all(ready):
+                if not adm.all_staged(
+                    pending.task is not None,
+                    tp_group,
+                    bool(tpu_envs.QWEN4_EXP_PD_FAST_ADMIT),
+                ):
                     self._record_stage3_load_failure(destination_req_id, local_blocks)
                     continue
             with TraceAnnotation(
@@ -6666,7 +6668,7 @@ class TPURaidenConnectorWorker:
             logger.info(
                 "Stage-3 admission A/B stats rank%d mode=%s passes=%d pass_ms mean=%.3f "
                 "p50=%.3f p90=%.3f candidates/pass=%.2f batched_collectives/pass=%.2f "
-                "parked/pass=%.2f passes_with_parked=%d pass_ms_with_parked=%.3f",
+                "parked/pass=%.2f passes_with_parked=%d pass_ms_with_parked=%.3f%s",
                 self.tp_rank,
                 "ON" if on else "OFF",
                 st["passes"],
@@ -6678,6 +6680,7 @@ class TPURaidenConnectorWorker:
                 st["parked"] / n,
                 len(mp),
                 sum(mp) / len(mp) if mp else 0.0,
+                self._stage3_admission_stats_extra(),
             )
             st["ms"], st["cand"], st["coll"], st["parked"], st["ms_parked"] = [], 0, 0, 0, []
         if admission is not None:
@@ -6731,6 +6734,10 @@ class TPURaidenConnectorWorker:
                 self.tp_rank,
             )
         self._stage3_admission_last_mode = on
+
+    def _stage3_admission_stats_extra(self) -> str:
+        """Destination counters a model-owned admission appends to the stats line."""
+        return ""
 
     def _stage3_admission_free_map(self) -> Any:
         """The local free map of model-owned destination storage, or None."""

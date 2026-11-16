@@ -380,3 +380,55 @@ def test_checkpoint_head_packing_and_kv_replication(tp, rank, monkeypatch):
         assert module.get_auxiliary_cache_specs()["compressed_k"].tokens_per_state == 4
         with pytest.raises(ValueError, match="Missing"):
             module.finalize_weights()
+
+
+@pytest.mark.parametrize("rank", [0, 3, 4, 6])
+def test_dcp_local_qgate_group_weight_holds_the_group_rows(rank, monkeypatch):
+    # VLLM_TPU_QSA_DCP_LOCAL_QGATE: the group's q_proj rows, in the order the
+    # all-gather of the group's q_proj outputs would concatenate them.
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_DCP_LOCAL_QGATE", "1")
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: rank
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 8
+    )
+    with torch.device("cpu"):
+        module = Qwen4ExpQSA(
+            config=attention_config(), tp_size=8, tp_rank=rank, max_model_len=8192,
+            pooled=True,
+        )
+        assert module.main_kv_dcp == 4 and module._group_qgate
+        q = torch.randn(12288, 2560, dtype=torch.float32).to(torch.bfloat16)
+        module.load_weights([("q_proj.weight", q)])
+        width = 12288 // 8
+        group = module.q_proj_group_weight
+        assert group.shape == (4 * width, 2560)
+        first = rank // 4 * 4 * width
+        torch.testing.assert_close(group, q[first : first + 4 * width], rtol=0, atol=0)
+        own = rank % 4
+        torch.testing.assert_close(
+            group[own * width : (own + 1) * width], module.q_proj.weight, rtol=0, atol=0
+        )
+        hidden = torch.randn(5, 2560, dtype=torch.float32).to(torch.bfloat16)
+        local = torch.nn.functional.linear(hidden, group)
+        torch.testing.assert_close(
+            local[:, own * width : (own + 1) * width], module.q_proj(hidden), rtol=0, atol=0
+        )
+
+
+def test_dcp_local_qgate_off_registers_nothing(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "4")
+    monkeypatch.delenv("VLLM_TPU_QSA_DCP_LOCAL_QGATE", raising=False)
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 8
+    )
+    with torch.device("cpu"):
+        module = Qwen4ExpQSA(
+            config=attention_config(), tp_size=8, tp_rank=1, max_model_len=8192, pooled=True
+        )
+    assert not module._group_qgate and not hasattr(module, "q_proj_group_weight")

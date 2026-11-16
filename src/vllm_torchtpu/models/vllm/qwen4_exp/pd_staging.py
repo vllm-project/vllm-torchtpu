@@ -14,8 +14,9 @@ proven whole-page copy and the reshape happens on the decode:
    (the producer broadcasts each span to every decode unit);
 2. when a load lands, the runner thread repacks the staged pages into the
    rank's own pool pages in one donated program: main KV takes the rank's head
-   slot, compressed keys, rings and PLE state are re-blocked or copied, and GDN
-   state takes the rank's SSM heads and conv channels;
+   pair (into head slots 0-1, or a paired layer's slots under
+   QWEN4_EXP_PACK_MAIN_KV), compressed keys, rings and PLE state are re-blocked
+   or copied, and GDN state takes the rank's SSM heads and conv channels;
 3. the staging pages are freed.
 
 Pool geometry (``pool_layout.pooled_cache_specs``): every owner shares one raw
@@ -144,6 +145,28 @@ def quarantine_steps() -> int:
     return int(envs.QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS)
 
 
+def verify_split_keys_enabled() -> bool:
+    """QWEN4_EXP_PD_VERIFY_SPLIT_KEYS (envs; read directly when this module is
+    loaded by path, without the package)."""
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:
+        import os
+
+        value = os.environ.get("QWEN4_EXP_PD_VERIFY_SPLIT_KEYS", "").strip().lower()
+        return value in ("1", "true", "yes", "on")
+    return bool(envs.QWEN4_EXP_PD_VERIFY_SPLIT_KEYS)
+
+
+# QWEN4_EXP_PD_VERIFY_SPLIT_KEYS: loads checked first, of each kind (without
+# and with a local prefix), then one load in VERIFY_EVERY; split compressed
+# owners per check; rows per read program (one compiled shape).
+VERIFY_FIRST_LOADS = 8
+VERIFY_EVERY = 64
+VERIFY_OWNERS = 3
+VERIFY_CHUNK_ROWS = 4096
+
+
 def draft_kv_enabled() -> bool:
     """QWEN4_EXP_PD_DRAFT_KV (q38 F2; envs; read directly when this module is
     loaded by path, without the package)."""
@@ -155,6 +178,19 @@ def draft_kv_enabled() -> bool:
         value = os.environ.get("QWEN4_EXP_PD_DRAFT_KV", "").strip().lower()
         return value in ("1", "true", "yes", "on")
     return bool(envs.QWEN4_EXP_PD_DRAFT_KV)
+
+
+def fast_admit() -> bool:
+    """QWEN4_EXP_PD_FAST_ADMIT (envs; read directly when this module is loaded
+    by path, without the package)."""
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:
+        import os
+
+        value = os.environ.get("QWEN4_EXP_PD_FAST_ADMIT", "").strip().lower()
+        return value in ("1", "true", "yes", "on")
+    return bool(envs.QWEN4_EXP_PD_FAST_ADMIT)
 
 
 def force_gap_fraction() -> float:
@@ -256,9 +292,12 @@ def check_draft_kv(missing, dst_owners, main_dcp: int, main_dcp_owners) -> None:
             "QWEN4_EXP_PD_DRAFT_KV=1 lands; unset one of them"
         )
     if any(name.endswith(".compressed_k") for name in main_dcp_owners):
+        # The staged landing splits compressed keys for a decode-only draft
+        # (whose owners have no producer pages); F2's landed draft keys and
+        # their draft-gap zero-fill are not validated split.
         raise ValueError(
-            "QWEN4_EXP_PD_DRAFT_KV=1 refuses VLLM_TPU_QSA_COMPRESSED_DCP=1: the "
-            "staging repack lands compressed keys unsplit"
+            "QWEN4_EXP_PD_DRAFT_KV=1 refuses VLLM_TPU_QSA_COMPRESSED_DCP=1: split "
+            "compressed keys land for a decode-only draft only"
         )
     if main_dcp > 1:
         split = set(main_dcp_owners)
@@ -319,12 +358,38 @@ def main_tokens_np(num_tokens, dst_block, rank, start=0) -> np.ndarray:
     return t
 
 
-def pair_tokens_np(num_tokens, ratio, start=0) -> np.ndarray:
+def pair_tokens_np(num_tokens, ratio, start=0, dst_block=0, rank=None) -> np.ndarray:
     """The first token of each compressed pair ``compressed_rows_np`` /
-    ``compressed_dst_np`` / ``pd_route.compressed_src_rows`` list, in order."""
+    ``compressed_dst_np`` / ``pd_route.compressed_src_rows`` list, in order
+    (with ``rank``: the pairs that rank owns, ``owned_pairs``)."""
     span = 2 * ratio
     pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
-    return np.arange(start // span, pairs, dtype=np.int64) * span
+    return owned_pairs(np.arange(start // span, pairs, dtype=np.int64) * span, dst_block, rank)
+
+
+def owned_pairs(t, dst_block, rank) -> np.ndarray:
+    """The pairs (first tokens ``t``) a decode rank stores.
+
+    Compressed keys split under VLLM_TPU_QSA_COMPRESSED_DCP (``rank`` given,
+    ``rank.main_dcp`` > 1) follow the main-KV rule: pair rank ``(t // B) % D``
+    writes the groups of its own ``B``-token blocks (``B = dst_block``;
+    ``pooled_qsa.compressed_pairs`` with ``dcp``). ``B`` is a multiple of the
+    pair span, so one rank holds a whole pair. ``rank`` None: every pair."""
+    if rank is None or rank.main_dcp <= 1:
+        return t
+    return t[(t // dst_block) % rank.main_dcp == rank.dcp_rank]
+
+
+def pair_dst_np(t, dst_pages, dst_block, span, dst_offset=0, rank=None) -> np.ndarray:
+    """Destination rows of pairs ``t``: row ``(t % B) // span`` after the
+    member's ``dst_offset`` in the page of ``t``'s table entry, which covers
+    ``D * B`` tokens when split (``rank``, ``owned_pairs``), else ``B``
+    (``pooled_qsa.compressed_pairs``)."""
+    d = 1 if rank is None else max(1, rank.main_dcp)
+    if d > 1 and dst_block % span:
+        raise ValueError(f"split compressed keys need whole pairs in a {dst_block}-token block")
+    dp = np.asarray(dst_pages, dtype=np.int64)
+    return dp[t // (d * dst_block)] * dst_block + dst_offset + (t % dst_block) // span
 
 
 def split_pool(name: str) -> tuple[str, int | None]:
@@ -361,12 +426,42 @@ def owner_kind(name: str) -> str:
 # chunks bound the footprint and compile one shape. The DMA writer keeps a few
 # int32 scalars per row in SMEM (1 MiB; ~11.5 B/row measured), so a program
 # stays near 40k rows: 16k main, 16k copied, 4 GDN pages (~1.6k rows each).
+# QWEN4_EXP_PD_REPACK_SHAPE replaces the three sizes (parse_repack_shape).
+# Sizes count written rows. A paired main-KV row (QWEN4_EXP_PACK_MAIN_KV)
+# gathers two staging rows, so a program's main gather reads 32k rows; the
+# gather's scalar prefetch is its own kernel's (4 B per gathered row).
 REPACK_CHUNK_ROWS = 1 << 14
 # Rows per scatter tile. Every run of contiguous destination rows starts on a
 # tile (each layer's segment is padded to a multiple), so a tile is one DMA:
 # main KV runs a page (512 rows), compressed keys 64 rows per decode page.
 REPACK_TILE = 64
 REPACK_GDN_PAGES = 4
+# Distinct (tokens, prefix) owner counts a QWEN4_EXP_PD_FAST_ADMIT consumer
+# keeps; the memo starts over when full.
+_COUNTS_MEMO_ENTRIES = 4096
+
+
+def parse_repack_shape(value: str | None) -> tuple[int, int, int]:
+    """Main-KV rows, copied rows and GDN pages per repack program
+    (QWEN4_EXP_PD_REPACK_SHAPE: ``"main,copy,gdn"``; empty is 16384,16384,4).
+
+    ``":"`` separates too: the recipes' comma-separated ``*_EXTRA_SERVER_ENV``
+    lists cannot carry a comma inside a value. Row counts are whole scatter
+    tiles, so every segment of a later chunk still starts on a tile.
+    """
+    value = (value or "").strip()
+    if not value:
+        return REPACK_CHUNK_ROWS, REPACK_CHUNK_ROWS, REPACK_GDN_PAGES
+    try:
+        main, copied, gdn = (int(x) for x in value.replace(":", ",").split(","))
+    except ValueError:
+        main = copied = gdn = 0
+    if min(main, copied, gdn) <= 0 or main % REPACK_TILE or copied % REPACK_TILE:
+        raise ValueError(
+            "QWEN4_EXP_PD_REPACK_SHAPE must be 'main,copy,gdn' with main and copy "
+            f"positive multiples of {REPACK_TILE} and gdn positive, got {value!r}"
+        )
+    return main, copied, gdn
 
 
 def bucket(n: int, floor: int = 1024) -> int:
@@ -376,31 +471,170 @@ def bucket(n: int, floor: int = 1024) -> int:
 
 def repack_chunks(
     main_s, main_d, copy_s, copy_d, gdn_s, gdn_d,
-    size=REPACK_CHUNK_ROWS, gdn_pages=REPACK_GDN_PAGES, inrow=None,
+    size=REPACK_CHUNK_ROWS, gdn_pages=REPACK_GDN_PAGES, copy_size=None, split_gdn=False,
+    null_rows=None, inrow=None,
 ):
     """Padded index lists per repack program, each of one fixed shape.
 
     A chunk with nothing left of a kind rewrites the null page (row 0, page 0
-    on both sides) in its place. ``inrow = (main, key, dst)``
-    (QWEN4_EXP_INROW_COMPRESSED_K): a fourth kind, appended to every chunk.
+    on both sides) in its place. A chunk holds ``size`` main-KV rows and
+    ``copy_size`` (default ``size``) copied rows. With ``split_gdn`` the first
+    chunk carries every GDN page and later chunks carry ``None`` for both GDN
+    lists: they run the repack built without GDN state. ``null_rows = (staging
+    page rows, pool page rows)`` pads main-KV and copied rows with distinct
+    null-page rows (``_spread``) in place of the last pair repeated.
+    ``inrow = (main, key, dst)`` (QWEN4_EXP_INROW_COMPRESSED_K): a fourth
+    kind of ``size`` rows, appended to every chunk (after the GDN lists).
     """
+    copy_size = size if copy_size is None else copy_size
+    if split_gdn and len(gdn_s) > gdn_pages:
+        raise ValueError(
+            f"split_gdn needs every GDN page in one chunk: {len(gdn_s)} > {gdn_pages}"
+        )
     n_inrow = len(inrow[2]) if inrow is not None else 0
     chunks = max(
-        1, -(-len(main_s) // size), -(-len(copy_s) // size), -(-len(gdn_s) // gdn_pages),
+        1,
+        -(-len(main_s) // size),
+        -(-len(copy_s) // copy_size),
+        -(-len(gdn_s) // gdn_pages),
         -(-n_inrow // size),
     )
     for i in range(chunks):
         part = slice(i * size, (i + 1) * size)
+        copied = slice(i * copy_size, (i + 1) * copy_size)
         pages = slice(i * gdn_pages, (i + 1) * gdn_pages)
-        chunk = (
-            _pad(main_s[part], size), _pad(main_d[part], size),
-            _pad(copy_s[part], size), _pad(copy_d[part], size),
-            _pad(gdn_s[pages], gdn_pages), _pad(gdn_d[pages], gdn_pages),
-        )
+        if split_gdn and i:
+            gdn = (None, None)
+        else:
+            gdn = (_pad(gdn_s[pages], gdn_pages), _pad(gdn_d[pages], gdn_pages))
+        if null_rows is None:
+            rows = (
+                _pad(main_s[part], size), _pad(main_d[part], size),
+                _pad(copy_s[copied], copy_size), _pad(copy_d[copied], copy_size),
+            )
+        else:
+            src_rows, dst_rows = null_rows
+            rows = (
+                _spread(main_s[part], size, src_rows),
+                _spread(main_d[part], size, dst_rows),
+                _spread(copy_s[copied], copy_size, src_rows),
+                _spread(copy_d[copied], copy_size, dst_rows),
+            )
+        chunk = (*rows, *gdn)
         if inrow is not None:
             # An empty part rewrites the null page's row 0 with zeros.
             chunk += tuple(_pad(v[part], size) for v in inrow)
         yield chunk
+
+
+def _spread(values, size: int, rows: int):
+    """Pads a row list to ``size`` with null-page rows 0, 1, ..., ``rows`` - 1 in turn.
+
+    Flat rows below ``rows`` are page 0 on either side: the staging carrier's
+    page 0 is never reserved and stays zero, and nothing reads the pool's
+    page 0, so the padding copies zeros onto rows no one reads. DMAs that all
+    hit one row run one after another while distinct rows overlap (a
+    padding-only program at 16384,16384,4: 3.4 ms with one row, 1.5 ms with
+    distinct rows, W1b probe j-78bcecf2); padded destinations also form
+    whole contiguous tiles (segments start on a tile and ``rows`` is a
+    multiple of it), which the writer stores in one DMA each. Paired main-KV
+    sources (``[n, 2]``, ``main_sources``) pad every column with the same
+    rows: each column's gather then reads distinct rows too.
+    """
+    values = np.asarray(values, dtype=np.int64)
+    pad = np.arange(size - len(values), dtype=np.int64) % rows
+    if values.ndim == 2:
+        pad = np.repeat(pad[:, None], values.shape[1], axis=1)
+    return np.concatenate((values, pad))
+
+
+def repack_chunks_packed(
+    main_s, main_d, copy_s, copy_d, gdn_s, gdn_d,
+    size=REPACK_CHUNK_ROWS, gdn_pages=REPACK_GDN_PAGES, copy_size=None, split_gdn=False,
+    null_rows=None,
+):
+    """``repack_chunks``' chunks as ``pack_index`` vectors and their shapes
+    (QWEN4_EXP_PD_FAST_ADMIT), each list written once into its chunk's int32
+    vector and padded in place: main-KV and copied rows as ``_spread`` pads them
+    when ``null_rows`` is given (else as ``_pad``), GDN lists as ``_pad``.
+    Paired main-KV sources (``[n, 2]``) keep their shape."""
+    copy_size = size if copy_size is None else copy_size
+    if split_gdn and len(gdn_s) > gdn_pages:
+        raise ValueError(
+            f"split_gdn needs every GDN page in one chunk: {len(gdn_s)} > {gdn_pages}"
+        )
+    chunks = max(
+        1,
+        -(-len(main_s) // size),
+        -(-len(copy_s) // copy_size),
+        -(-len(gdn_s) // gdn_pages),
+    )
+    src_rows, dst_rows = null_rows if null_rows is not None else (None, None)
+    for i in range(chunks):
+        parts = [
+            (main_s, i * size, size, src_rows), (main_d, i * size, size, dst_rows),
+            (copy_s, i * copy_size, copy_size, src_rows),
+            (copy_d, i * copy_size, copy_size, dst_rows),
+        ]
+        if not (split_gdn and i):
+            parts += [
+                (gdn_s, i * gdn_pages, gdn_pages, None), (gdn_d, i * gdn_pages, gdn_pages, None),
+            ]
+        shapes = tuple((n, *np.shape(values)[1:]) for values, _, n, _ in parts)
+        host = np.empty(sum(math.prod(shape) for shape in shapes), dtype=np.int32)
+        pos = 0
+        for (values, start, n, spread), shape in zip(parts, shapes):
+            seg = host[pos : pos + math.prod(shape)].reshape(shape)
+            piece = values[start : start + n]
+            k = len(piece)
+            seg[:k] = piece
+            if spread is not None:
+                pad = np.arange(n - k, dtype=np.int64) % spread  # _spread's null-page rows
+                seg[k:] = pad.reshape((-1,) + (1,) * (len(shape) - 1))
+            elif k:
+                seg[k:] = piece[-1]  # _pad: the last row repeated
+            else:
+                seg[:] = 0  # _pad's null page / null row
+            pos += math.prod(shape)
+        yield host, shapes
+
+
+def pack_index(lists) -> tuple[np.ndarray, tuple]:
+    """One repack chunk's index lists as one int32 vector, and their shapes
+    (``_run_chunks_packed``; ``unpack_index`` inverts it)."""
+    shapes = tuple(tuple(np.shape(v)) for v in lists)
+    host = np.empty(sum(math.prod(shape) for shape in shapes), dtype=np.int32)
+    pos = 0
+    for values, shape in zip(lists, shapes):
+        n = math.prod(shape)
+        host[pos : pos + n] = np.asarray(values).reshape(-1)
+        pos += n
+    return host, shapes
+
+
+def unpack_index(index, shapes) -> list:
+    """The repack's six index arguments from a ``pack_index`` vector: its
+    lists in order, then (four lists: a chunk without GDN state) a
+    one-element slice for each GDN argument, which that repack never reads."""
+    args, pos = [], 0
+    for shape in shapes:
+        n = math.prod(shape)
+        args.append(index[pos : pos + n].reshape(shape))
+        pos += n
+    if len(args) == 4:
+        args += [index[:1], index[:1]]
+    return args
+
+
+def unpacked_chunk(chunk) -> tuple:
+    """A ``repack_chunks`` tuple from a ``repack_chunks_packed`` chunk (other
+    chunks unchanged): the lists as numpy views, ``None`` for a chunk's
+    missing GDN lists."""
+    if len(chunk) != 2:
+        return chunk
+    host, shapes = chunk
+    lists = tuple(unpack_index(host, shapes))
+    return lists if len(shapes) == 6 else lists[:4] + (None, None)
 
 
 def _pad(values, size: int):
@@ -409,8 +643,9 @@ def _pad(values, size: int):
     # row 0 is the null page's on both sides, which nothing reads.
     if isinstance(values, np.ndarray):
         if values.ndim == 2:
-            # Routed GDN entries, [owners, staging pages]: repeat the last row
-            # (an empty list rewrites the null page's rows).
+            # Routed GDN entries, [owners, staging pages], or paired main-KV
+            # sources, [rows, members]: repeat the last row (an empty list
+            # rewrites the null page's rows).
             if len(values) == 0:
                 values = np.zeros((1, values.shape[1]), dtype=np.int64)
             return np.concatenate(
@@ -512,45 +747,42 @@ def compressed_rows(
 
 def compressed_rows_np(
     num_tokens, ratio, src_pages, src_block, dst_pages, dst_block,
-    start=0, src_first=0, dst_offset=0, src_page_rows=None,
+    start=0, src_first=0, dst_offset=0, src_page_rows=None, rank=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``compressed_rows`` as int64 arrays, vectorized. ``src_page_rows``
     (default ``src_block``): rows of a source page, when one source page holds
-    the keys of ``src_block`` tokens in fewer rows (merged producer keys)."""
+    the keys of ``src_block`` tokens in fewer rows (merged producer keys).
+    ``rank``: a DCP-split destination owner (VLLM_TPU_QSA_COMPRESSED_DCP); only
+    the rank's own pairs land, at their split rows (``owned_pairs``,
+    ``pair_dst_np``)."""
     span = 2 * ratio
     if start % span:
         raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
-    pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
-    t = np.arange(start // span, pairs, dtype=np.int64) * span
+    t = pair_tokens_np(num_tokens, ratio, start, dst_block, rank)
     sp = np.asarray(src_pages, dtype=np.int64)
-    dp = np.asarray(dst_pages, dtype=np.int64)
     page_rows = src_block if src_page_rows is None else src_page_rows
     src = sp[t // src_block - src_first] * page_rows + (t % src_block) // span
-    dst = dp[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
-    return src, dst
+    return src, pair_dst_np(t, dst_pages, dst_block, span, dst_offset, rank)
 
 
 def compressed_rows_split_np(
     num_tokens, ratio, src_pages_by_rank, src_block, dst_pages, dst_block,
-    start=0, src_first=0, dst_offset=0,
+    start=0, src_first=0, dst_offset=0, rank=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``compressed_rows_np`` for keys split over ``P`` producer ranks by page
     owner: a main-KV ID spans ``P`` pages of ``src_block`` tokens and rank
     ``(t // src_block) % P`` holds page ``t // src_block``'s keys, at the start
-    of that rank's staged page for the ID."""
+    of that rank's staged page for the ID. ``rank`` as in ``compressed_rows_np``."""
     span = 2 * ratio
     if start % span:
         raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
     p = len(src_pages_by_rank)
-    pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
-    t = np.arange(start // span, pairs, dtype=np.int64) * span
+    t = pair_tokens_np(num_tokens, ratio, start, dst_block, rank)
     owner = (t // src_block) % p
     entry = t // (p * src_block) - src_first
     sp = np.stack([np.asarray(pages, dtype=np.int64) for pages in src_pages_by_rank])
     src = sp[owner, entry] * src_block + (t % src_block) // span
-    dp = np.asarray(dst_pages, dtype=np.int64)
-    dst = dp[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
-    return src, dst
+    return src, pair_dst_np(t, dst_pages, dst_block, span, dst_offset, rank)
 
 
 def main_dst_np(num_tokens, dst_pages, dst_block, rank, start=0) -> np.ndarray:
@@ -563,17 +795,37 @@ def main_dst_np(num_tokens, dst_pages, dst_block, rank, start=0) -> np.ndarray:
     return dp[t // (d * dst_block)] * dst_block + t % dst_block
 
 
+def main_sources(srcs, columns: int) -> np.ndarray:
+    """One main-KV owner's staging rows as a segment of the repack's ``main_src``.
+
+    ``srcs``: one array per member, in head-slot order, listing the same
+    tokens in the same order (the owner's destination rows). ``columns`` 1
+    (unpaired layout): the owner's rows, ``[n]``. ``columns`` 2
+    (QWEN4_EXP_PACK_MAIN_KV): ``[n, 2]``, member ``s`` in column ``s``; an
+    owner without a partner (an odd last layer, the MTP draft) takes staging
+    row 0, the never-reserved null page, so its head slots 2-3 stay zero.
+    """
+    if len(srcs) > columns:
+        raise ValueError(f"{len(srcs)} main-KV members for {columns} source columns")
+    if columns == 1:
+        return np.asarray(srcs[0], dtype=np.int64)
+    first = np.asarray(srcs[0], dtype=np.int64)
+    cols = [np.asarray(x, dtype=np.int64) for x in srcs]
+    if any(len(c) != len(first) for c in cols):
+        raise ValueError("paired main-KV members must list the same tokens")
+    cols += [np.zeros(len(first), dtype=np.int64)] * (columns - len(cols))
+    return np.stack(cols, axis=1)
+
+
 def compressed_dst_np(
-    num_tokens, ratio, dst_pages, dst_block, start=0, dst_offset=0
+    num_tokens, ratio, dst_pages, dst_block, start=0, dst_offset=0, rank=None
 ) -> np.ndarray:
     """``compressed_rows_np``'s destination rows alone (routed staging)."""
     span = 2 * ratio
     if start % span:
         raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
-    pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
-    t = np.arange(start // span, pairs, dtype=np.int64) * span
-    dp = np.asarray(dst_pages, dtype=np.int64)
-    return dp[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
+    t = pair_tokens_np(num_tokens, ratio, start, dst_block, rank)
+    return pair_dst_np(t, dst_pages, dst_block, span, dst_offset, rank)
 
 
 def route_geometry_for(cfg, src_layout, decode_layout, rank) -> "pd_route.RouteGeometry | None":
@@ -642,7 +894,34 @@ def align_rows(rows: np.ndarray, tile: int = REPACK_TILE) -> np.ndarray:
     pad = -len(rows) % tile
     if not pad:
         return rows
-    return np.concatenate((rows, np.full(pad, rows[-1], dtype=rows.dtype)))
+    return np.concatenate((rows, np.repeat(rows[-1:], pad, axis=0)))
+
+
+def _cat(parts, columns: int = 1) -> np.ndarray:
+    """A planner's segments, each tile-aligned (``align_rows``), as one list;
+    ``columns`` > 1: paired main-KV sources (``main_sources``), ``[0, columns]``
+    when empty so every program keeps its shape."""
+    parts = [align_rows(p) for p in parts if len(p)]
+    if parts:
+        return np.concatenate(parts)
+    return np.zeros((0, columns) if columns > 1 else 0, dtype=np.int64)
+
+
+def cat_aligned(parts, columns: int = 1, tile: int = REPACK_TILE) -> np.ndarray:
+    """``_cat(parts, columns)`` in one allocation: each segment tile-aligned by
+    repeating its last row (``align_rows``), ``[0, columns]`` (or ``[0]``) when
+    every part is empty."""
+    parts = [p for p in parts if len(p)]
+    if not parts:
+        return np.zeros((0, columns) if columns > 1 else 0, dtype=np.int64)
+    sizes = [len(p) + (-len(p) % tile) for p in parts]
+    out = np.empty((sum(sizes), *parts[0].shape[1:]), dtype=np.result_type(*parts))
+    pos = 0
+    for p, size in zip(parts, sizes):
+        out[pos : pos + len(p)] = p
+        out[pos + len(p) : pos + size] = p[-1]
+        pos += size
+    return out
 
 
 def compressed_destinations(
@@ -709,6 +988,26 @@ def inrow_union_np(main_s, main_d, key_codes, key_d):
     m[np.searchsorted(d, main_d)] = main_s
     k[np.searchsorted(d, key_d)] = key_codes
     return m, k, d
+
+
+def main_pairs(layout) -> dict[str, tuple[str, ...]]:
+    """Each paired main-KV owner's members in head-slot order
+    (QWEN4_EXP_PACK_MAIN_KV, ``layout.main_owners``); empty when unpaired.
+
+    The owner is member 0 and names the scheduler group; member ``s`` keeps K
+    and V in head slots ``2s`` and ``2s + 1`` of the owner's rows
+    (``pool_layout.pooled_cache_specs``). Owners missing here (an odd last
+    target layer, the MTP draft) hold one layer in whole rows.
+    """
+    slots: dict[str, dict[int, str]] = {}
+    for prefix, owner, slot in getattr(layout, "main_owners", ()) or ():
+        slots.setdefault(owner, {})[int(slot)] = prefix
+    out = {}
+    for owner, members in slots.items():
+        if sorted(members) != list(range(len(members))) or len(members) > 2 or members[0] != owner:
+            raise ValueError(f"paired main KV owner {owner} has members {members}")
+        out[owner] = tuple(members[s] for s in range(len(members)))
+    return out
 
 
 def page_prefix_rows(
@@ -867,6 +1166,13 @@ def make_repack(
 ):
     """``fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)``.
 
+    ``main_src`` ``[n]``: one layer per written row, the rank's head pair to
+    head slots 0-1 and zeros in 2-3. ``[n, 2]`` (QWEN4_EXP_PACK_MAIN_KV,
+    ``main_sources``): two layers per written row, member ``s``'s pair (from
+    staging row ``main_src[:, s]``) to head slots ``2s`` and ``2s + 1``, the
+    slot rule of the decode's own paired writer
+    (``pooled_qsa._write_main_cache_paired``).
+
     ``compact_gdn = (stage_rows, pages)`` (QWEN4_EXP_PD_ROUTED_DST): a GDN
     owner's staged state is this rank's SSM rows (its value heads, already in
     its own order) followed by the producer's whole conv rows, over ``pages``
@@ -988,9 +1294,16 @@ def make_repack(
             rows = gather(stage, flat)
             return rows if rows.dtype == jnp.uint8 else jax.lax.bitcast_convert_type(rows, jnp.uint8)
 
-        # Main KV: the rank's head pair to slot 0, the other slots zero.
-        pair = gather_u8(main_src)[:, 2 * kv_head : 2 * kv_head + 2]
-        main = jnp.concatenate([pair, jnp.zeros_like(pair)], axis=1)
+        if main_src.ndim == 2:
+            # Paired main KV: both members' pairs in one written row. The
+            # gather reads member 0's rows, then member 1's.
+            n = main_src.shape[0]
+            pairs = gather_u8(main_src.T.reshape(-1))[:, 2 * kv_head : 2 * kv_head + 2]
+            main = jnp.concatenate([pairs[:n], pairs[n:]], axis=1)
+        else:
+            # Main KV: the rank's head pair to slot 0, the other slots zero.
+            pair = gather_u8(main_src)[:, 2 * kv_head : 2 * kv_head + 2]
+            main = jnp.concatenate([pair, jnp.zeros_like(pair)], axis=1)
         # Compressed keys, rings + tags, PLE state: bytes unchanged.
         copies = gather_u8(copy_src)
         if has_gdn and compact_gdn is not None:
@@ -1093,7 +1406,8 @@ def make_shared_scatter(write=None):
 class RepackPlan:
     """One load's landing, planned before any device work: the shared
     compressed-key gather passes (``pd_shared_compressed.GatherPass``), then
-    the repack chunks (``repack_chunks``)."""
+    the repack chunks (``repack_chunks``; with QWEN4_EXP_PD_FAST_ADMIT,
+    ``repack_chunks_packed``'s vectors and shapes)."""
 
     passes: list
     chunks: list
@@ -1337,6 +1651,23 @@ class StagedConsumer:
     src_split_keys = False
     _key_pools: "dict[str, int]" = types.MappingProxyType({})
     _src_split: "frozenset[str]" = frozenset()
+    # The repack program shape (QWEN4_EXP_PD_REPACK_SHAPE) and the GDN split
+    # (repack_chunks split_gdn), set by __init__; the default fixed chunks for
+    # a consumer assembled without it.
+    _repack_shape = (REPACK_CHUNK_ROWS, REPACK_CHUNK_ROWS, REPACK_GDN_PAGES)
+    _split_gdn = False
+    # (staging, pool) rows per page, whose page-0 rows pad repack chunks
+    # (repack_chunks null_rows); set by __init__, the last pair repeated for a
+    # consumer assembled without it.
+    _null_rows = None
+    _fn_rest = None
+    _op_rest = None
+    # The decode layout's DCP-split owners (main_dcp_owners), set by
+    # __init__; none for a consumer assembled without it.
+    _dcp_owners: "frozenset[str]" = frozenset()
+    # QWEN4_EXP_PACK_MAIN_KV: main-KV owner -> its members in head-slot order
+    # (layout.main_owners), set by __init__; unpaired without it.
+    _main_pairs: "dict[str, tuple[str, ...]]" = types.MappingProxyType({})
 
     def __init__(self, cfg, decode_layout, decode_groups, pool, rank: RankSlice, staging_bytes: int):
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
@@ -1349,16 +1680,14 @@ class StagedConsumer:
         )
 
         from .pd import TransferExtent, build_transfer_groups
-        from .pool_layout import pack_main_kv_enabled, pooled_cache_specs
+        from .pool_layout import pooled_cache_specs
 
-        if pack_main_kv_enabled():
-            raise ValueError(
-                "A staged Qwen PD decode needs QWEN4_EXP_PACK_MAIN_KV=0 (the "
-                "pipeline producer's layout)"
-            )
         # Packed compressed keys (QWEN4_EXP_PACK_COMPRESSED_K=1) are this
         # decode's own layout: the repack writes each layer's pairs at its
-        # slot of the owner group's page. The producer never packs.
+        # slot of the owner group's page. Paired main KV
+        # (QWEN4_EXP_PACK_MAIN_KV=1) likewise: one written row carries both
+        # members' head pairs (_main_pairs). The producer packs neither (a
+        # TP1 stage holds two KV heads a row, which pairing refuses).
         self.cfg, self.rank, self.pool = cfg, rank, pool
         self.dst_layout = decode_layout
         self.dst_groups = decode_groups
@@ -1399,6 +1728,7 @@ class StagedConsumer:
             tp=src_tp,
             main_dcp=self.src_pcp if self.src_pcp > 1 else src_dcp,
             pack_compressed=src_pack,
+            pack_main=False,
             merge_compressed=self.src_merged,
             split_compressed=self.src_split_keys,
             main_interleave=pcp_interleave() if self.src_pcp > 1 else None,
@@ -1551,11 +1881,23 @@ class StagedConsumer:
             for r in range(self.src_pcp)
         }
         self._dst_owner = {n: g.group_index for g in self.dst_groups for n in g.layer_names}
+        self._main_pairs = main_pairs(decode_layout)
         # Compressed-key owner -> (destination group, row offset in its page):
         # a packed member sits in its owner's group at slot * member rows.
         self._dst_compressed = compressed_destinations(
             decode_layout, self._dst_owner, self.dst_block, self.ratio
         )
+        # Main KV under VLLM_TPU_QSA_MAIN_KV_DCP (the draft's with
+        # VLLM_TPU_QSA_MTP_KV_DCP) and compressed keys under
+        # VLLM_TPU_QSA_COMPRESSED_DCP: each rank lands only the rows it owns.
+        self._dcp_owners = frozenset(decode_layout.main_dcp_owners)
+        if self.shared is not None and self._dcp_owners.intersection(self._dst_compressed):
+            # The landing gather writes every pair at its unsplit row on
+            # every rank (pd_shared_compressed.gather_passes).
+            raise ValueError(
+                "QWEN4_EXP_PD_SHARED_COMPRESSED refuses VLLM_TPU_QSA_COMPRESSED_DCP=1: "
+                "its landing gather writes compressed keys unsplit"
+            )
         # Decode-only MTP: the draft layer's owners (and its packed compressed
         # slot) have no producer pages; its prompt KV starts empty (synthetic
         # acceptance does not read it). QWEN4_EXP_PD_DRAFT_KV: the producer
@@ -1564,7 +1906,8 @@ class StagedConsumer:
         # Split keys are staged per producer rank ("<owner>.pcp<r>"), as split
         # main KV is; either way the logical owner is covered.
         staged = set(self._src_owner) | {n.rsplit(".pcp", 1)[0] for n in self._key_pools}
-        missing = (set(self._dst_owner) | set(self._dst_compressed)) - staged
+        members = {m for pair in self._main_pairs.values() for m in pair}
+        missing = (set(self._dst_owner) | set(self._dst_compressed) | members) - staged
         if draft_kv:
             check_draft_kv(
                 missing, self._dst_owner, rank.main_dcp,
@@ -1608,6 +1951,20 @@ class StagedConsumer:
                 name = prefix + ".compressed_k"
                 if name in self._dst_compressed and owner in self._dst_owner:
                     self._inrow_keys[name] = (owner, inrow_span(slot))
+            # The in-row planner lands every key on every rank, unpacked and
+            # one index list per kind (repack_chunks' inrow stream).
+            split = sorted(self._dcp_owners.intersection(self._inrow_keys))
+            if split:
+                raise ValueError(
+                    "QWEN4_EXP_INROW_COMPRESSED_K is not combined with "
+                    f"VLLM_TPU_QSA_COMPRESSED_DCP split keys ({split[0]}, ...)"
+                )
+            if self._inrow_keys and fast_admit():
+                raise ValueError(
+                    "QWEN4_EXP_INROW_COMPRESSED_K is not combined with "
+                    "QWEN4_EXP_PD_FAST_ADMIT (its packed repack chunks carry no "
+                    "in-row stream)"
+                )
         # A speculative state table holds the committed state, then K
         # speculative checkpoints; the connector hands the repack only the
         # committed entry (_Stage3TransferGroup.transfer_pages).
@@ -1617,11 +1974,17 @@ class StagedConsumer:
         tp = rank.tp_size
         src_gdn = gdn_geometry(cfg, 1, self.src_layout.token_bytes) if self._gdn_names else None
         dst_gdn = gdn_geometry(cfg, tp, decode_layout.token_bytes) if self._gdn_names else None
-        self._fn = make_repack(
+        from vllm_torchtpu import envs
+
+        self._repack_shape = parse_repack_shape(envs.QWEN4_EXP_PD_REPACK_SHAPE)
+        # A first program that holds every GDN owner lands all GDN state; the
+        # load's later programs run a repack built without GDN state, which
+        # gathers no padded GDN pages.
+        self._split_gdn = 0 < len(self._gdn_names) <= self._repack_shape[2]
+        self._null_rows = (stage_rows, self.dst_block)
+        repack_kwargs = dict(
             src_block=self.src_block,
             dst_block=self.dst_block,
-            src_gdn=src_gdn,
-            dst_gdn=dst_gdn,
             kv_head=rank.kv_head,
             v_head_start=rank.tp_rank * (dst_gdn.v_heads if dst_gdn else 0),
             channels=conv_channels(src_gdn, dst_gdn, rank) if src_gdn else [0],
@@ -1631,7 +1994,12 @@ class StagedConsumer:
                 else None
             ),
         )
+        self._fn = make_repack(src_gdn=src_gdn, dst_gdn=dst_gdn, **repack_kwargs)
+        self._fn_rest = None
+        if self._split_gdn:
+            self._fn_rest = make_repack(src_gdn=None, dst_gdn=None, **repack_kwargs)
         self._op = None
+        self._op_rest = None
 
     # --- allocation (identical on every rank of the engine) ---
 
@@ -1642,7 +2010,69 @@ class StagedConsumer:
         pool_group = getattr(self, "_pool_group", None)
         return self._src_owner if pool_group is None else pool_group
 
+    def _fast(self) -> bool:
+        """QWEN4_EXP_PD_FAST_ADMIT, read once per consumer (instance dict, so a
+        consumer assembled without ``__init__`` reads it on first use)."""
+        fast = self.__dict__.get("_fast_admit")
+        if fast is None:
+            fast = self.__dict__["_fast_admit"] = fast_admit()
+        return fast
+
     def _owner_counts(self, num_tokens: int, skip_tokens: int):
+        """(first staged source page per group, owners, staging pages per owner)
+        of a load, in manifest order. With QWEN4_EXP_PD_FAST_ADMIT they come
+        from a per-(tokens, prefix) memo, as fresh lists."""
+        if not self._fast():
+            return self._owner_counts_once(num_tokens, skip_tokens)
+        key = (int(num_tokens), int(skip_tokens))
+        memo = self.__dict__.setdefault("_counts_memo", {})
+        hit = memo.get(key)
+        if hit is None:
+            if len(memo) >= _COUNTS_MEMO_ENTRIES:
+                memo.clear()
+            hit = memo[key] = self._owner_counts_by_kind(*key)
+        first, owners, counts = hit
+        return list(first), list(owners), list(counts)
+
+    def _owner_counts_by_kind(self, num_tokens: int, skip_tokens: int):
+        """``_owner_counts_once`` with one page count per distinct (cache kind,
+        source group pages) instead of one per owner: owners of a kind with
+        the same source pages take the same count. Raises where it does, on
+        the same owner (the first of its kind and pages, evaluated in order)."""
+        if self.route is None:
+            first, owners, counts = self._owner_counts_once(num_tokens, skip_tokens)
+            return tuple(first), tuple(owners), tuple(counts)
+        meta = self.__dict__.get("_owner_meta")
+        if meta is None:
+            names = tuple(pool.layer_name for pool in self.manifest.pools)
+            pool_group = self._pool_group_map()
+            # A PCP producer's split pools ("<owner>.pcp<r>") count per rank.
+            meta = self.__dict__["_owner_meta"] = (
+                names,
+                tuple(pool_kind(n) for n in names),
+                tuple(pool_group[n] for n in names),
+                tuple(split_pool(n)[1] for n in names),
+            )
+        owners, kinds, groups, pcp_ranks = meta
+        src_pages = [g.page_count(num_tokens) for g in self.src_groups]
+        shared = self._shared_load(num_tokens)
+        by_kind: dict = {}
+        counts = []
+        for kind, gi, pcp_rank in zip(kinds, groups, pcp_ranks):
+            key = (kind, src_pages[gi], pcp_rank)
+            count = by_kind.get(key)
+            if count is None:
+                count = by_kind[key] = (
+                    self.shared.staged_pages(num_tokens, skip_tokens)
+                    if shared and kind == "compressed"
+                    else pd_route.staging_pages(
+                        kind, num_tokens, key[1], skip_tokens, self.route, pcp_rank
+                    )
+                )
+            counts.append(count)
+        return (0,) * len(self.src_groups), owners, tuple(counts)
+
+    def _owner_counts_once(self, num_tokens: int, skip_tokens: int):
         if self.route is not None:
             # Compact pages per owner, identical on every rank (one destination
             # page list per tag serves the whole engine).
@@ -1716,17 +2146,22 @@ class StagedConsumer:
                 # Ranks free pages at their own receive terminals; allocate only
                 # pages free on all of them, in the same order everywhere.
                 dist.all_reduce(free, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
-        available = torch.nonzero(free, as_tuple=False).flatten().tolist()
-        if len(available) < sum(counts):
-            return False
-        pages, cursor = {}, 0
-        for name, count in zip(owners, counts):
-            pages[name] = available[cursor : cursor + count]
-            cursor += count
-        for owner_pages in pages.values():
-            self.free[owner_pages] = 0
-            if reduced_free is not None:
-                reduced_free[owner_pages] = 0
+        if self._fast():
+            pages = self._take_pages(free, owners, counts, reduced_free)
+            if pages is None:
+                return False
+        else:
+            available = torch.nonzero(free, as_tuple=False).flatten().tolist()
+            if len(available) < sum(counts):
+                return False
+            pages, cursor = {}, 0
+            for name, count in zip(owners, counts):
+                pages[name] = available[cursor : cursor + count]
+                cursor += count
+            for owner_pages in pages.values():
+                self.free[owner_pages] = 0
+                if reduced_free is not None:
+                    reduced_free[owner_pages] = 0
         self.reservations[uuid] = pages
         self.skips[uuid] = (skip_tokens, first)
         # Per-load token counts (shared loads' clips); created on first use so
@@ -1735,6 +2170,32 @@ class StagedConsumer:
         if draft_zero_until > 0:
             self.__dict__.setdefault("draft_zero", {})[uuid] = int(draft_zero_until)
         return True
+
+    def _take_pages(self, free, owners, counts, reduced_free):
+        """``reserve``'s allocation under QWEN4_EXP_PD_FAST_ADMIT: the first
+        ``sum(counts)`` free pages in page order, cut per owner in manifest
+        order, zeroed in one write per map (CPU maps, written through numpy
+        views). None when they do not fit. The same pages as the per-owner
+        path."""
+        need = sum(counts)
+        available = np.flatnonzero(free.numpy())
+        if len(available) < need:
+            return None
+        take = available[:need]
+        flat = take.tolist()
+        pages, cursor = {}, 0
+        for name, count in zip(owners, counts):
+            pages[name] = flat[cursor : cursor + count]
+            cursor += count
+        if len(pages) != len(owners):
+            # A repeated owner name keeps its last slice only, as there.
+            take = np.asarray(
+                [p for owner_pages in pages.values() for p in owner_pages], dtype=np.int64
+            )
+        self.free.numpy()[take] = 0
+        if reduced_free is not None:
+            reduced_free.numpy()[take] = 0
+        return pages
 
     def destination(self, uuid: int) -> tuple[list[str], list[int], list[int]]:
         skip, _ = self.skips.get(uuid, (0, None))
@@ -1800,7 +2261,7 @@ class StagedConsumer:
                 # Created on first use (consumers assembled without __init__).
                 self.__dict__.setdefault("quarantine", []).append([steps, held])
             elif held:
-                self.free[held] = 1
+                self._mark_free(held)
         return pages
 
     def advance_quarantine(self) -> int:
@@ -1818,9 +2279,17 @@ class StagedConsumer:
             if entry[0] <= 0:
                 freed.extend(entry[1])
         if freed:
-            self.free[freed] = 1
+            self._mark_free(freed)
             held[:] = [entry for entry in held if entry[0] > 0]
         return len(freed)
+
+    def _mark_free(self, pages: list[int]) -> None:
+        """Returns ``pages`` to the free map (QWEN4_EXP_PD_FAST_ADMIT: one
+        numpy write through the CPU map's view instead of a list index)."""
+        if self._fast():
+            self.free.numpy()[np.asarray(pages, dtype=np.int64)] = 1
+        else:
+            self.free[pages] = 1
 
     def quarantined_pages(self) -> int:
         return sum(len(entry[1]) for entry in self.__dict__.get("quarantine", ()))
@@ -1877,6 +2346,21 @@ class StagedConsumer:
 
     # --- the repack ---
 
+    def _split_rank(self, name: str) -> "RankSlice | None":
+        """This rank for a DCP-split destination owner (``_dcp_owners``), else None."""
+        return self.rank if name in self._dcp_owners else None
+
+    def _main_members(self, name: str) -> tuple[str, ...]:
+        """The producer main-KV owners a destination main owner lands, in
+        head-slot order: both paired members (``_main_pairs``), else itself."""
+        return self._main_pairs.get(name, (name,))
+
+    def _main_columns(self) -> int:
+        """Source columns of the repack's ``main_src`` (``main_sources``): 2
+        when the layout pairs main KV, so every program of every load has one
+        shape; else 1."""
+        return 2 if self._main_pairs else 1
+
     def indices(
         self, src_pages, dst_tables, num_tokens, skip_tokens=0, first=None, draft_zero_until=0
     ):
@@ -1902,6 +2386,7 @@ class StagedConsumer:
         for name, (gi, offset) in self._dst_compressed.items():
             if name in inrow_keys and self.src_split_keys:
                 raise ValueError("in-row decode keys need unsplit producer keys")
+            split = self._split_rank(name)
             if self.src_split_keys:
                 # Keys of token t come from producer rank (t // B) % P, in that
                 # rank's page for t's main-KV ID (B-token pages, P per ID).
@@ -1910,6 +2395,7 @@ class StagedConsumer:
                     [src_pages[f"{name}.pcp{r}"] for r in range(self.src_pcp)],
                     self.src_block, dst_tables[gi], self.dst_block, start=skip_tokens,
                     src_first=first[self._src_owner[f"{name}.pcp0"]], dst_offset=offset,
+                    rank=split,
                 )
                 copy_s.append(s)
                 copy_d.append(d)
@@ -1922,12 +2408,18 @@ class StagedConsumer:
                 self.src_block * (self.src_layout.merged_key_span if merged else 1),
                 dst_tables[gi], self.dst_block, start=skip_tokens,
                 src_first=first[self._src_owner[name]], dst_offset=offset,
-                src_page_rows=self.src_block if merged else None,
+                src_page_rows=self.src_block if merged else None, rank=split,
             )
             if name in inrow_keys:
+                # Landed with its main-KV owner (_inrow_append).
                 key_src[name] = s
                 continue
-            s, d = gap.split(name, s, d, lambda: pair_tokens_np(num_tokens, self.ratio, skip_tokens))
+            s, d = gap.split(
+                name, s, d,
+                lambda split=split: pair_tokens_np(
+                    num_tokens, self.ratio, skip_tokens, self.dst_block, split
+                ),
+            )
             copy_s.append(s)
             copy_d.append(d)
         for name, gi in self._dst_owner.items():
@@ -1936,19 +2428,25 @@ class StagedConsumer:
                 continue
             # A PCP producer's split main KV is staged per rank (below).
             src = src_pages.get(name)
-            src_first = first[self._src_owner[name]]
             dst = dst_tables[gi]
             if kind == "main":
-                pcp = None
-                if name in self._src_split:
-                    from .pool_layout import pcp_interleave
+                # One destination row list for the owner; one source list per
+                # member, from that member's own staging pages, in its order.
+                srcs = []
+                for member in self._main_members(name):
+                    member_src, pcp = src_pages.get(member), None
+                    if member in self._src_split:
+                        from .pool_layout import pcp_interleave
 
-                    # One staged page list per producer rank (same length).
-                    src = [src_pages[f"{name}.pcp{r}"] for r in range(self.src_pcp)]
-                    pcp = (self.src_pcp, pcp_interleave())
-                s, d = main_rows_np(num_tokens, src, self.src_block, dst, self.dst_block,
-                                    self.rank, start=skip_tokens, src_first=src_first,
-                                    src_pcp=pcp)
+                        # One staged page list per producer rank (same length).
+                        member_src = [src_pages[f"{member}.pcp{r}"] for r in range(self.src_pcp)]
+                        pcp = (self.src_pcp, pcp_interleave())
+                    s, d = main_rows_np(
+                        num_tokens, member_src, self.src_block, dst, self.dst_block, self.rank,
+                        start=skip_tokens, src_first=first[self._src_owner[member]], src_pcp=pcp,
+                    )
+                    srcs.append(s)
+                s = main_sources(srcs, self._main_columns())
                 if self._inrow_append(name, s, d, key_src, dst, num_tokens, skip_tokens, inrow_rows):
                     continue
                 s, d = gap.split(
@@ -1972,27 +2470,22 @@ class StagedConsumer:
         for name, (gi, offset) in self._zero_draft.items():
             dst = dst_tables[gi]
             kind = owner_kind(name)
+            split = self._split_rank(name)
             if kind == "compressed":
-                pairs = np.arange(skip_tokens // (2 * self.ratio),
-                                  math.ceil(math.ceil(num_tokens / self.ratio) / 2))
-                t = pairs * 2 * self.ratio
-                d = (np.asarray(dst, dtype=np.int64)[t // self.dst_block] * self.dst_block
-                     + offset + (t % self.dst_block) // (2 * self.ratio))
-            elif kind == "main":  # the draft's main KV is not DCP-split
-                t = np.arange(skip_tokens, num_tokens, dtype=np.int64)
-                d = (np.asarray(dst, dtype=np.int64)[t // self.dst_block] * self.dst_block
-                     + t % self.dst_block)
+                span = 2 * self.ratio
+                d = compressed_dst_np(num_tokens, self.ratio, dst, self.dst_block,
+                                      skip_tokens // span * span, offset, rank=split)
+            elif kind == "main":
+                # Split under VLLM_TPU_QSA_MTP_KV_DCP, else every row.
+                rank = self.rank if split else dataclasses.replace(self.rank, main_dcp=1)
+                d = main_dst_np(num_tokens, dst, self.dst_block, rank, skip_tokens)
             else:  # ring: its one page's rows
                 d = np.arange(self.dst_block, dtype=np.int64) + dst[0] * self.dst_block
             copy_s.append(np.zeros(len(d), dtype=np.int64))
             copy_d.append(d)
 
-        def cat(parts):
-            parts = [align_rows(p) for p in parts if len(p)]
-            return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
-
         return (
-            cat(main_s), cat(main_d), cat(copy_s), cat(copy_d),
+            _cat(main_s, self._main_columns()), _cat(main_d), _cat(copy_s), _cat(copy_d),
             np.asarray(gdn_s, dtype=np.int64), np.asarray(gdn_d, dtype=np.int64),
         ) + self._inrow_streams(inrow_rows)
 
@@ -2037,13 +2530,16 @@ class StagedConsumer:
     def _routed_indices(self, src_pages, dst_tables, num_tokens, skip_tokens, draft_zero_until=0):
         """``indices`` over routed compact staging: same destination rows in
         the same order as the broadcast layout, read from compact rows."""
+        if self._fast() and self.route.pcp == 1 and not self.route.key_span:
+            # The shared-row planner models a plain TP1 producer; a PCP or
+            # merged-key producer (pd_route pcp / key_span) takes the planner below.
+            return self._routed_indices_shared_rows(
+                src_pages, dst_tables, num_tokens, skip_tokens, draft_zero_until
+            )
         g, rank = self.route, self.rank
         main_s, main_d, copy_s, copy_d = [], [], [], []
         gdn_s, gdn_d = [], []
         gap = _DraftGap(draft_zero_until if draft_zero_until > skip_tokens else 0)
-
-        def pairs():
-            return pair_tokens_np(num_tokens, self.ratio, skip_tokens)
 
         # A shared load's compressed keys are written by the landing gather
         # (shared_passes), not by the repack. The gather runs first, so a
@@ -2060,13 +2556,24 @@ class StagedConsumer:
                     num_tokens, skip_tokens, src_pages[name], g
                 )
                 continue
+            # Split keys (VLLM_TPU_QSA_COMPRESSED_DCP): every rank receives every
+            # pair and lands the ones it owns.
+            split = self._split_rank(name)
+
+            def pairs(split=split):
+                return pair_tokens_np(num_tokens, self.ratio, skip_tokens, self.dst_block, split)
+
             d = compressed_dst_np(
-                num_tokens, self.ratio, dst_tables[gi], self.dst_block, skip_tokens, offset
+                num_tokens, self.ratio, dst_tables[gi], self.dst_block, skip_tokens, offset,
+                rank=split,
             )
             if shared:
                 gap.split(name, d, d, pairs)
                 continue
-            s = pd_route.compressed_src_rows(num_tokens, skip_tokens, src_pages[name], g)
+            s = pd_route.compressed_src_rows(
+                num_tokens, skip_tokens, src_pages[name], g,
+                rank=None if split is None else rank.tp_rank,
+            )
             s, d = gap.split(name, s, d, pairs)
             copy_s.append(s)
             copy_d.append(d)
@@ -2076,13 +2583,19 @@ class StagedConsumer:
                 continue
             dst = dst_tables[gi]
             if kind == "main":
-                # A PCP producer's split main KV: one staged space per rank.
-                src = (
-                    [src_pages[f"{name}.pcp{r}"] for r in range(g.pcp)]
-                    if g.pcp > 1 and name in getattr(self, "_src_split", ())
-                    else src_pages[name]
-                )
-                s = pd_route.main_src_rows(num_tokens, skip_tokens, rank.tp_rank, src, g)
+                # One source list per member (_main_members); a PCP producer's
+                # split main KV has one staged space per rank.
+                srcs = [
+                    pd_route.main_src_rows(
+                        num_tokens, skip_tokens, rank.tp_rank,
+                        [src_pages[f"{m}.pcp{r}"] for r in range(g.pcp)]
+                        if g.pcp > 1 and m in getattr(self, "_src_split", ())
+                        else src_pages[m],
+                        g,
+                    )
+                    for m in self._main_members(name)
+                ]
+                s = main_sources(srcs, self._main_columns())
                 d = main_dst_np(num_tokens, dst, self.dst_block, rank, skip_tokens)
                 if self._inrow_append(name, s, d, key_src, dst, num_tokens, skip_tokens, inrow_rows):
                     continue
@@ -2104,15 +2617,132 @@ class StagedConsumer:
         gap.emit(copy_s, copy_d)
         self.last_draft_rows = (gap.landed, gap.zeroed)
 
-        def cat(parts):
-            parts = [align_rows(p) for p in parts if len(p)]
-            return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
-
         return (
-            cat(main_s), cat(main_d), cat(copy_s), cat(copy_d),
+            _cat(main_s, self._main_columns()), _cat(main_d), _cat(copy_s), _cat(copy_d),
             np.asarray(gdn_s, dtype=np.int64).reshape(-1, n_gdn),
             np.asarray(gdn_d, dtype=np.int64),
         ) + self._inrow_streams(inrow_rows)
+
+    def _routed_indices_shared_rows(
+        self, src_pages, dst_tables, num_tokens, skip_tokens, draft_zero_until=0
+    ):
+        """``_routed_indices`` under QWEN4_EXP_PD_FAST_ADMIT, with the same
+        arrays. A kind's rows depend on the load and the rank, not the layer:
+        each layer only indexes its own page lists with them
+        (``pd_route._flat``: ``pages[row // S] * S + row % S``). So the token
+        enumerations and their quotients are computed once per load (per split
+        flag for compressed keys, ``_split_rank``), lazily and in the
+        reference's order (its first raise is the same); paired main-KV members
+        share the owner's rows (``main_sources``), and the segments are
+        tile-aligned in one allocation (``cat_aligned``)."""
+        g, rank, block = self.route, self.rank, self.dst_block
+        stage, span = g.stage_rows, 2 * self.ratio
+        main_s, main_d, copy_s, copy_d = [], [], [], []
+        gdn_s, gdn_d = [], []
+        gap = _DraftGap(draft_zero_until if draft_zero_until > skip_tokens else 0)
+        rows: dict = {}
+
+        def pairs(split):
+            # compressed_dst_np's tokens, checks and destination quotients
+            # (pair_tokens_np / pair_dst_np with ``split``).
+            key = ("pairs", split is None)
+            if key not in rows:
+                if skip_tokens % span:
+                    raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
+                t = pair_tokens_np(num_tokens, self.ratio, skip_tokens, block, split)
+                d = 1 if split is None else max(1, split.main_dcp)
+                if d > 1 and block % span:
+                    raise ValueError(
+                        f"split compressed keys need whole pairs in a {block}-token block"
+                    )
+                rows[key] = (t, t // (d * block), (t % block) // span)
+            return rows[key]
+
+        def pair_src(split):
+            # pd_route.compressed_src_rows' compact rows (rank = split's TP rank).
+            key = ("pair_src", split is None)
+            if key not in rows:
+                index = np.arange(
+                    skip_tokens // span, math.ceil(math.ceil(num_tokens / self.ratio) / 2),
+                    dtype=np.int64,
+                )
+                if split is not None and g.dcp > 1:
+                    index = index[(index * span // g.dst_block) % g.dcp == split.tp_rank % g.dcp]
+                r = index - pd_route.skip_rows("compressed", skip_tokens, g)
+                rows[key] = (r // stage, r % stage)
+            return rows[key]
+
+        def main():
+            # main_dst_np's tokens and pd_route.main_src_rows' compact rows.
+            if "main" not in rows:
+                t_dst = main_tokens_np(num_tokens, block, rank, skip_tokens)
+                if g.dst_block == block and g.dcp == rank.main_dcp:
+                    t_src = t_dst
+                else:
+                    t = np.arange(skip_tokens, num_tokens, dtype=np.int64)
+                    t_src = t[(t // g.dst_block) % g.dcp == rank.tp_rank % g.dcp]
+                r = (
+                    (t_src // g.entry) * g.dst_block
+                    + t_src % g.dst_block
+                    - pd_route.skip_rows("main", skip_tokens, g)
+                )
+                rows["main"] = (
+                    t_dst, r // stage, r % stage,
+                    t_dst // (rank.main_dcp * block), t_dst % block,
+                )
+            return rows["main"]
+
+        def pages(values):
+            return np.asarray(values, dtype=np.int64)
+
+        shared = self._shared_load(num_tokens)
+        for name, (gi, offset) in self._dst_compressed.items():
+            split = self._split_rank(name)
+            t, q, r = pairs(split)
+            d = pages(dst_tables[gi])[q] * block + offset + r
+            if shared:
+                gap.split(name, d, d, lambda t=t: t)
+                continue
+            sq, sr = pair_src(split)
+            s, d = gap.split(name, pages(src_pages[name])[sq] * stage + sr, d, lambda t=t: t)
+            copy_s.append(s)
+            copy_d.append(d)
+        columns = self._main_columns()
+        prefix = None
+        for name, gi in self._dst_owner.items():
+            kind = owner_kind(name)
+            if kind == "compressed":
+                continue
+            dst = dst_tables[gi]
+            if kind == "main":
+                t, sq, sr, dq, dr = main()
+                srcs = [pages(src_pages[m])[sq] * stage + sr for m in self._main_members(name)]
+                s, d = gap.split(
+                    name, main_sources(srcs, columns), pages(dst)[dq] * block + dr, lambda: t
+                )
+                main_s.append(s)
+                main_d.append(d)
+            elif kind in ("ring", "ple"):
+                if prefix is None:
+                    ar = np.arange(g.prefix_rows, dtype=np.int64)
+                    prefix = (ar, ar // stage, ar % stage)
+                ar, pq, pr = prefix
+                entry = dst[self._state_entry] if kind == "ple" else dst[0]
+                copy_s.append(pages(src_pages[name])[pq] * stage + pr)
+                copy_d.append(entry * block + ar)
+                gap.count(name, g.prefix_rows)
+        n_gdn = g.gdn_rows // g.stage_rows
+        for name in self._gdn_names:
+            gdn_s.append(list(src_pages[name][:n_gdn]))
+            gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
+        gap.emit(copy_s, copy_d)
+        self.last_draft_rows = (gap.landed, gap.zeroed)
+        return (
+            cat_aligned(main_s, columns), cat_aligned(main_d),
+            cat_aligned(copy_s), cat_aligned(copy_d),
+            np.asarray(gdn_s, dtype=np.int64).reshape(-1, n_gdn),
+            np.asarray(gdn_d, dtype=np.int64),
+        )
 
     def _shared_load(self, num_tokens: int) -> bool:
         """Whether this load's compressed keys go once per host."""
@@ -2157,6 +2787,40 @@ class StagedConsumer:
             return None
         return self.landing.warm()
 
+    def warm_repack(self) -> float:
+        """Compiles the repack programs for this consumer's chunk shape; returns
+        the seconds taken.
+
+        Runs one null chunk through each op (the GDN-free one too when loads
+        split): every index is a page-0 row or page, so it reads the carrier's
+        null page and rewrites the pool's null page, which nothing reads, as
+        chunk padding does. Without it the first served load compiles both
+        programs on every rank. No collective: the repack has none."""
+        main, copied, gdn = self._repack_shape
+        empty = np.zeros(0, dtype=np.int64)
+        # The served main-KV source shape: [rows, 2] when main KV is paired.
+        main_src = _cat([], self._main_columns())
+        gdn_src = empty
+        if self.route is not None:
+            pages = self.route.gdn_rows // self.route.stage_rows
+            gdn_src = np.zeros((0, pages), dtype=np.int64)
+        null = repack_chunks(
+            main_src, empty, empty, empty, gdn_src, empty, main, gdn, copy_size=copied,
+            null_rows=self._null_rows,
+            inrow=(empty, empty, empty) if getattr(self, "_inrow_keys", {}) else None,
+        )
+        chunk = next(null)
+        chunks = [chunk] + ([chunk[:4] + (None, None) + chunk[6:]] if self._split_gdn else [])
+        t0 = time.monotonic()
+        self._run_chunks(chunks)
+        seconds = time.monotonic() - t0
+        logger.info(
+            "Qwen PD staged repack rank%d: %d program(s) warmed for chunk shape "
+            "%d,%d,%d in %.1f s",
+            self.rank.tp_rank, len(chunks), main, copied, gdn, seconds,
+        )
+        return seconds
+
     def plan_repack(self, uuid: int, dst_tables, num_tokens: int) -> RepackPlan:
         """Every index of one load's landing, in numpy, before any device work
         (and before any collective)."""
@@ -2170,8 +2834,16 @@ class StagedConsumer:
             if getattr(self, "route", None) is not None
             else []
         )
-        inrow = idx[6:] if len(idx) > 6 else None
-        return RepackPlan(passes=passes, chunks=list(repack_chunks(*idx[:6], inrow=inrow)))
+        main, copied, gdn = self._repack_shape
+        shape = dict(copy_size=copied, split_gdn=self._split_gdn, null_rows=self._null_rows)
+        if len(idx) > 6:
+            # QWEN4_EXP_INROW_COMPRESSED_K: the in-row stream rides every chunk
+            # (never packed: __init__ refuses QWEN4_EXP_PD_FAST_ADMIT with it).
+            chunks = repack_chunks(*idx[:6], main, gdn, inrow=idx[6:], **shape)
+        else:
+            chunker = repack_chunks_packed if self._fast() else repack_chunks
+            chunks = chunker(*idx, main, gdn, **shape)
+        return RepackPlan(passes=passes, chunks=list(chunks))
 
     def run_repack(self, plan: RepackPlan) -> None:
         if plan.passes:
@@ -2182,20 +2854,336 @@ class StagedConsumer:
 
     def repack(self, uuid: int, dst_tables, num_tokens: int) -> None:
         self.run_repack(self.plan_repack(uuid, dst_tables, num_tokens))
+        skip, _ = self.skips.get(uuid, (0, None))
+        if self._verify_due(skip):
+            for check in (self.verify_split_keys, self.verify_main_pairs):
+                try:
+                    check(uuid, dst_tables, num_tokens)
+                except Exception:  # a diagnostic never fails the load
+                    logger.exception(
+                        "Qwen PD landing verify rank%d: %s failed to run",
+                        self.rank.tp_rank, check.__name__,
+                    )
+
+    # --- QWEN4_EXP_PD_VERIFY_SPLIT_KEYS: read-back of split compressed keys
+    # and of paired main KV (QWEN4_EXP_PACK_MAIN_KV) ---
+
+    def _verify_due(self, skip: int) -> bool:
+        """Whether this load is checked (every rank lands the same loads in
+        the same order, so all ranks check the same ones)."""
+        if not verify_split_keys_enabled():
+            return False
+        if not (self._dcp_owners.intersection(self._dst_compressed) or self._main_pairs):
+            return False
+        seen = self.__dict__.setdefault("_verify_seen", {"loads": 0, "plain": 0, "prefix": 0})
+        kind = "prefix" if skip else "plain"
+        seen["loads"] += 1
+        seen[kind] += 1
+        return seen[kind] <= VERIFY_FIRST_LOADS or seen["loads"] % VERIFY_EVERY == 0
+
+    def split_key_check_rows(self, uuid: int, dst_tables, num_tokens: int):
+        """``[(owner, staging rows, pool rows)]`` of one load's check, for up to
+        ``VERIFY_OWNERS`` split compressed-key owners.
+
+        Written out apart from the repack's planners: every pair of the load
+        from the local prefix on, at its staging row as it lands unsplit, then
+        the pairs this rank owns by the kernel's rule, owner ``(t // B) % D``,
+        row ``table[t // (D * B)] * B + slot offset + (t % B) // (2 * ratio)``
+        (``pooled_qsa.compressed_pairs``). Merged or split producer keys are
+        not covered (no rows)."""
+        if self.src_merged:
+            return []
+        pages = self.reservations[uuid]
+        skip, first = self.skips.get(uuid, (0, None))
+        names = [
+            n for n in self._dst_compressed if n in self._dcp_owners and not n.startswith("mtp.")
+        ]
+        if len(names) > VERIFY_OWNERS:
+            names = [names[0], names[len(names) // 2], names[-1]]
+        span, b, d = 2 * self.ratio, self.dst_block, self.rank.main_dcp
+        pairs = math.ceil(math.ceil(num_tokens / self.ratio) / 2)
+        t = np.arange(skip // span, pairs, dtype=np.int64) * span
+        own = (t // b) % d == self.rank.tp_rank % d
+        out = []
+        for name in names:
+            gi, offset = self._dst_compressed[name]
+            if self.route is not None:
+                src = pd_route.compressed_src_rows(num_tokens, skip, pages[name], self.route)
+            else:
+                sp = np.asarray(pages[name], dtype=np.int64)
+                f = first[self._src_owner[name]] if first else 0
+                src = sp[t // self.src_block - f] * self.src_block + (t % self.src_block) // span
+            table = np.asarray(dst_tables[gi], dtype=np.int64)
+            dst = table[t[own] // (d * b)] * b + offset + (t[own] % b) // span
+            out.append((name, src[own], dst))
+        return out
+
+    def verify_split_keys(self, uuid: int, dst_tables, num_tokens: int, read_rows=None) -> dict:
+        """Compare this rank's owned compressed pairs in the pool with the same
+        pairs' staging bytes after a load landed (QWEN4_EXP_PD_VERIFY_SPLIT_KEYS);
+        logs digests of both sides and the mismatched pairs, returns the counts.
+
+        ``read_rows(src, dst)`` returns uint8 ``[n, 4, 256]`` staging rows
+        ``src`` and pool rows ``dst``; by default the DMA row gather on the
+        device (an XLA gather or FP8 bitcast canonicalises NaN bytes). The
+        control compares each pool row with the next pair's staging row: equal
+        counts near zero show the rows hold distinct keys, not zeros."""
+        import hashlib
+
+        rows = self.split_key_check_rows(uuid, dst_tables, num_tokens)
+        if not rows:
+            return {}
+        src = np.concatenate([r[1] for r in rows])
+        dst = np.concatenate([r[2] for r in rows])
+        n = len(src)
+        if n == 0:
+            stage = pool = np.zeros((0, ROW_SUBLANES, ROW_LANES), np.uint8)
+        else:
+            stage, pool = (read_rows or self._read_rows_device)(src, dst)
+        row = ROW_SUBLANES * ROW_LANES
+        flat_p, flat_s = pool.reshape(n, row), stage.reshape(n, row)
+        bad = (flat_p != flat_s).any(axis=1)
+        bounds = np.cumsum([0] + [len(r[1]) for r in rows])
+        by_owner = {
+            name: int(bad[lo:hi].sum()) for (name, _, _), lo, hi in zip(rows, bounds, bounds[1:])
+        }
+        result = dict(
+            pairs=n,
+            mismatched=int(bad.sum()),
+            by_owner=by_owner,
+            nonzero=int(flat_s.any(axis=1).sum()),
+            control_equal=int((flat_p[:-1] == flat_s[1:]).all(axis=1).sum()) if n > 1 else 0,
+            pool_digest=hashlib.sha256(pool.tobytes()).hexdigest()[:16],
+            staging_digest=hashlib.sha256(stage.tobytes()).hexdigest()[:16],
+        )
+        total = self.__dict__.setdefault(
+            "_verify_total", dict(checks=0, pairs=0, mismatched=0)
+        )
+        total["checks"] += 1
+        total["pairs"] += n
+        total["mismatched"] += result["mismatched"]
+        skip, _ = self.skips.get(uuid, (0, None))
+        (logger.warning if result["mismatched"] else logger.info)(
+            "Qwen PD split-key verify rank%d uuid %d tokens %d skip %d: pairs %d mismatched %d "
+            "%s nonzero %d control_equal %d digest pool %s staging %s | cumulative %s",
+            self.rank.tp_rank, uuid, num_tokens, skip, n, result["mismatched"], by_owner,
+            result["nonzero"], result["control_equal"], result["pool_digest"],
+            result["staging_digest"], total,
+        )
+        return result
+
+    def main_pair_check_rows(self, uuid: int, dst_tables, num_tokens: int):
+        """``[(member, head slot, staging rows, pool rows)]`` of one load's
+        paired main-KV check: both members of one paired owner (the next owner
+        in turn after each completed check, the same on every rank), every
+        token this rank stores from the local prefix on.
+
+        Written out apart from the repack's planners: pair rank ``(t // B) %
+        D`` stores token ``t`` at row ``table[t // (D * B)] * B + t % B``
+        (``qsa_rpa.virtual_page_metadata``), member ``s`` at head slots ``2s``
+        and ``2s + 1`` of that row (``pooled_qsa._write_main_cache_paired``);
+        the staging row is the producer's whole row, whose head ``h`` pair is
+        at slots ``2h`` and ``2h + 1``. A PCP producer's split main KV is not
+        covered (no rows)."""
+        owners = [o for o, m in self._main_pairs.items() if len(m) == 2 and o in self._dst_owner]
+        if not owners or self._src_split:
+            return []
+        done = self.__dict__.get("_verify_main_total", {}).get("checks", 0)
+        owner = owners[done % len(owners)]
+        pages = self.reservations[uuid]
+        skip, first = self.skips.get(uuid, (0, None))
+        b, d = self.dst_block, self.rank.main_dcp
+        t = np.arange(skip, num_tokens, dtype=np.int64)
+        t = t[(t // b) % d == self.rank.tp_rank % d]
+        table = np.asarray(dst_tables[self._dst_owner[owner]], dtype=np.int64)
+        dst = table[t // (d * b)] * b + t % b
+        out = []
+        for slot, member in enumerate(self._main_pairs[owner]):
+            if self.route is not None:
+                src = pd_route.main_src_rows(
+                    num_tokens, skip, self.rank.tp_rank, pages[member], self.route
+                )
+            else:
+                sp = np.asarray(pages[member], dtype=np.int64)
+                f = first[self._src_owner[member]] if first else 0
+                src = sp[t // self.src_block - f] * self.src_block + t % self.src_block
+            out.append((member, slot, src, dst))
+        return out
+
+    def verify_main_pairs(self, uuid: int, dst_tables, num_tokens: int, read_rows=None) -> dict:
+        """Compare both members' head-slot pairs of one paired main-KV owner in
+        the pool with this rank's head pair in the members' staging rows
+        after a load landed (QWEN4_EXP_PD_VERIFY_SPLIT_KEYS with
+        QWEN4_EXP_PACK_MAIN_KV); logs digests of both sides and the
+        mismatched rows per member, returns the counts.
+
+        ``read_rows`` as in ``verify_split_keys``. The control compares each
+        member's pool slot with the other member's staging pair: equal counts
+        near zero show the two slots hold different layers' bytes."""
+        import hashlib
+
+        rows = self.main_pair_check_rows(uuid, dst_tables, num_tokens)
+        if not rows:
+            return {}
+        src = np.concatenate([r[2] for r in rows])
+        dst = np.concatenate([r[3] for r in rows])
+        if len(src) == 0:
+            stage = pool = np.zeros((0, ROW_SUBLANES, ROW_LANES), np.uint8)
+        else:
+            stage, pool = (read_rows or self._read_rows_device)(src, dst)
+        h = self.rank.kv_head
+        bounds = np.cumsum([0] + [len(r[2]) for r in rows])
+        want = [stage[lo:hi, 2 * h : 2 * h + 2] for lo, hi in zip(bounds, bounds[1:])]
+        got = [
+            pool[lo:hi, 2 * slot : 2 * slot + 2]
+            for (_, slot, _, _), lo, hi in zip(rows, bounds, bounds[1:])
+        ]
+        bad = [(g != w).any(axis=(1, 2)) for g, w in zip(got, want)]
+        partner = [(got[i] == want[1 - i]).all(axis=(1, 2)) for i in range(len(rows))]
+        g_all, w_all = np.concatenate(got), np.concatenate(want)
+        result = dict(
+            owner=rows[0][0],
+            rows=int(len(src)),
+            mismatched=int(sum(x.sum() for x in bad)),
+            by_member={name: int(x.sum()) for (name, _, _, _), x in zip(rows, bad)},
+            nonzero=int(w_all.reshape(len(w_all), 2 * ROW_LANES).any(axis=1).sum()),
+            partner_equal=int(sum(x.sum() for x in partner)),
+            pool_digest=hashlib.sha256(g_all.tobytes()).hexdigest()[:16],
+            staging_digest=hashlib.sha256(w_all.tobytes()).hexdigest()[:16],
+        )
+        total = self.__dict__.setdefault(
+            "_verify_main_total", dict(checks=0, rows=0, mismatched=0)
+        )
+        total["checks"] += 1
+        total["rows"] += result["rows"]
+        total["mismatched"] += result["mismatched"]
+        skip, _ = self.skips.get(uuid, (0, None))
+        (logger.warning if result["mismatched"] else logger.info)(
+            "Qwen PD packed-main verify rank%d uuid %d tokens %d skip %d owner %s: rows %d "
+            "mismatched %d %s nonzero %d partner_equal %d digest pool %s staging %s "
+            "| cumulative %s",
+            self.rank.tp_rank, uuid, num_tokens, skip, result["owner"], result["rows"],
+            result["mismatched"], result["by_member"], result["nonzero"],
+            result["partner_equal"], result["pool_digest"], result["staging_digest"], total,
+        )
+        return result
+
+    def _read_rows_device(self, src, dst):
+        """Staging rows ``src`` and pool rows ``dst``, read back to the host
+        byte for byte, in ``VERIFY_CHUNK_ROWS`` programs of one shape."""
+        if getattr(self, "_verify_op", None) is None:
+            self._verify_op = self._build_verify_op()
+        device = self.pool.device
+        stage_parts, pool_parts = [], []
+        for i in range(0, len(src), VERIFY_CHUNK_ROWS):
+            k = min(VERIFY_CHUNK_ROWS, len(src) - i)
+            s, d = (
+                torch.from_numpy(
+                    np.ascontiguousarray(_pad(v[i : i + k], VERIFY_CHUNK_ROWS), dtype=np.int32)
+                ).to(device)
+                for v in (src, dst)
+            )
+            stage_rows, pool_rows = self._verify_op(self.pool, self.staging, s, d)
+            stage_parts.append(stage_rows.cpu().numpy()[:k])
+            pool_parts.append(pool_rows.cpu().numpy()[:k])
+        return np.concatenate(stage_parts), np.concatenate(pool_parts)
+
+    def _build_verify_op(self):
+        """The read-back as one compiled read-only program (``_build_op``'s pattern)."""
+        import functools
+
+        import jax
+        import jax.numpy as jnp
+        from torch_tpu._internal import pallas
+
+        gather = functools.partial(dma_row_gather, out_dtype=jnp.uint8)
+
+        def verify_fn(
+            pool: jax.Array, staging: jax.Array, src: jax.Array, dst: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            stage_rows = gather(staging.reshape(-1, ROW_SUBLANES, ROW_LANES), src)
+            pool_rows = gather(pool.reshape(-1, ROW_SUBLANES, ROW_LANES), dst)
+            return stage_rows, pool_rows
+
+        op = pallas.jax_op("pallas::qwen4_pd_verify_split_keys", verify_fn)
+        op.register_fake(
+            lambda pool, staging, src, dst: tuple(
+                torch.empty(
+                    (src.shape[0], ROW_SUBLANES, ROW_LANES), dtype=torch.uint8, device=src.device
+                )
+                for _ in range(2)
+            )
+        )
+
+        @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+        def run(pool, staging, src, dst):
+            return op(pool, staging, src, dst)
+
+        return run
 
     def _run_chunks(self, chunks) -> None:
+        if self._fast() and self.__dict__.get("_packed_ok", True):
+            self._run_chunks_packed(chunks)
+            return
         device = self.pool.device
 
-        if self._op is None:
-            self._op = self._build_op()
-        for chunk in chunks:
-            args = [
-                torch.from_numpy(np.ascontiguousarray(v, dtype=np.int32)).to(device)
-                for v in chunk
-            ]
-            self._op(self.pool, self.staging, *args)
+        def dev(v):
+            return torch.from_numpy(np.ascontiguousarray(v, dtype=np.int32)).to(device)
 
-    def _build_op(self):
+        if self._op is None:
+            self._op = self._build_op(self._fn, "pallas::qwen4_pd_staged_repack")
+        for chunk in chunks:
+            if chunk[4] is not None:
+                self._op(self.pool, self.staging, *(dev(v) for v in chunk))
+                continue
+            # A later chunk of a split-GDN load (repack_chunks): the repack
+            # built without GDN state never reads the two GDN arguments.
+            if self._op_rest is None:
+                self._op_rest = self._build_op(
+                    self._fn_rest, "pallas::qwen4_pd_staged_repack_no_gdn"
+                )
+                self._no_gdn = dev(np.zeros(1))
+            index = [dev(v) for v in chunk[:4]]
+            # The in-row stream (chunk[6:], QWEN4_EXP_INROW_COMPRESSED_K) follows.
+            inrow = [dev(v) for v in chunk[6:]]
+            self._op_rest(self.pool, self.staging, *index, self._no_gdn, self._no_gdn, *inrow)
+
+    def _run_chunks_packed(self, chunks) -> None:
+        """``_run_chunks`` with one host-to-device copy per program instead of
+        one per index list (QWEN4_EXP_PD_FAST_ADMIT): a chunk's lists go out
+        as one int32 vector (``pack_index``), which the compiled program
+        slices back into the same arguments (``unpack_index``). If a packed
+        program fails to build or run, this consumer goes back to
+        ``_run_chunks``' per-list uploads from that chunk on (rewriting a
+        chunk's rows is a no-op: its staging pages are still held)."""
+        device = self.pool.device
+        ops = self.__dict__.setdefault("_packed_ops", {})
+        for i, chunk in enumerate(chunks):
+            if len(chunk) == 2:  # repack_chunks_packed
+                host, shapes = chunk
+            else:
+                host, shapes = pack_index(chunk if chunk[4] is not None else chunk[:4])
+            try:
+                op = ops.get(shapes)
+                if op is None:
+                    fn, name = (
+                        (self._fn, "pallas::qwen4_pd_staged_repack_packed")
+                        if len(shapes) == 6
+                        else (self._fn_rest, "pallas::qwen4_pd_staged_repack_no_gdn_packed")
+                    )
+                    op = ops[shapes] = self._build_op(fn, name, packed=shapes)
+                op(self.pool, self.staging, torch.from_numpy(host).to(device))
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(
+                    "Qwen PD staged repack rank%d: packed index upload failed (%s); "
+                    "per-list uploads from here on",
+                    self.rank.tp_rank, exc,
+                )
+                self._packed_ok = False
+                self._run_chunks([unpacked_chunk(c) for c in chunks[i:]])
+                return
+
+    def _build_op(self, fn, name: str, packed=None):
         """The repack as the runner's pool row copies run it (mamba_state_copy_op).
 
         A donating op and its ``copy_`` writeback fuse into one aliased
@@ -2203,11 +3191,12 @@ class StagedConsumer:
         donated, and XLA copies it to give the in-place writer a buffer (a
         second 48 GiB pool: compile HBM OOM). The op is built outside the
         compiled function, which dynamo cannot trace its construction from.
+
+        ``packed``: the shapes of the index lists, which the compiled program
+        then takes as one int32 vector (``_run_chunks_packed``).
         """
         import jax
         from torch_tpu._internal import pallas
-
-        fn = self._fn
 
         if getattr(self, "_inrow_keys", {}):
             # QWEN4_EXP_INROW_COMPRESSED_K: every chunk carries the in-row stream.
@@ -2226,11 +3215,9 @@ class StagedConsumer:
             ) -> tuple[jax.Array, jax.Array]:
                 out = fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src,
                          gdn_dst, inrow_main, inrow_key, inrow_dst)
-                return out, main_src[0]
+                return out, main_src.reshape(-1)[0]
 
-            op = pallas.jax_op(
-                "pallas::qwen4_pd_staged_repack_inrow", repack_fn, donate_argnums=(0,)
-            )
+            name += "_inrow"
         else:
             def repack_fn(
                 pool: jax.Array,
@@ -2243,15 +3230,25 @@ class StagedConsumer:
                 gdn_dst: jax.Array,
             ) -> tuple[jax.Array, jax.Array]:
                 out = fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)
-                return out, main_src[0]
+                return out, main_src.reshape(-1)[0]
 
-            op = pallas.jax_op("pallas::qwen4_pd_staged_repack", repack_fn, donate_argnums=(0,))
+        op = pallas.jax_op(name, repack_fn, donate_argnums=(0,))
         op.register_fake(
             lambda pool, staging, main_src, *rest: (
                 torch.empty_like(pool),
                 torch.empty((), dtype=main_src.dtype, device=main_src.device),
             )
         )
+
+        if packed is not None:
+
+            @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+            def run_packed(pool, staging, index):
+                new_pool, marker = op(pool, staging, *unpack_index(index, packed))
+                pool.copy_(new_pool)
+                return marker
+
+            return run_packed
 
         @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
         def run(pool, staging, *indices):

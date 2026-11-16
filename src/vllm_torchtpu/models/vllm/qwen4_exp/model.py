@@ -15,7 +15,9 @@
 
 import itertools
 import math
-from collections.abc import Iterable, Sequence
+import time
+from collections import Counter
+from collections.abc import Iterable, Iterator, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -62,8 +64,10 @@ from vllm_torchtpu.core.mamba_tail_fold import prefill_checkpoint_targets
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     GdnStepMetadataCache,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.rows_update_op import update_rows_
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.model_loader_patches import expert_mapping_cache_stats
 
 from . import sequence_parallel as sp
 from .config import (
@@ -74,6 +78,7 @@ from .config import (
 )
 from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .layer_digest import digest as layer_digest
 from .parallel import PLEParallel
 from .pd_identity import LoadedWeightIdentity
 from .ple import PLEInputs, merged_embed_all_reduce
@@ -95,6 +100,54 @@ def _parameter_storage_key(parameter):
         parameter.shape,
         parameter.stride(),
     )
+
+
+class _LoadTimes:
+    """Wall time of one load_weights pass by tensor family, logged per rank."""
+
+    def __init__(self) -> None:
+        self.start = time.perf_counter()
+        self.seconds: Counter[str] = Counter()
+        self.tensors: Counter[str] = Counter()
+        self.read_bytes = 0
+
+    def read(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yields ``weights``, adding the time spent producing them."""
+        source = iter(weights)
+        while True:
+            start = time.perf_counter()
+            item = next(source, None)
+            self.seconds["read"] += time.perf_counter() - start
+            if item is None:
+                return
+            self.read_bytes += item[1].numel() * item[1].element_size()
+            yield item
+
+    def add(self, family: str, start: float, excluded: float = 0.0) -> None:
+        """One load of ``family`` since ``start``, less ``excluded`` seconds
+        (reads it waited for, counted under ``read``)."""
+        self.seconds[family] += time.perf_counter() - start - excluded
+        self.tensors[family] += 1
+
+    def log(self, identity: LoadedWeightIdentity | None) -> None:
+        families = ", ".join(
+            f"{family} {self.seconds[family]:.1f} s ({count})"
+            for family, count in sorted(self.tensors.items())
+        )
+        logger.info(
+            "Qwen4Exp load_weights took %.1f s: reading %.1f s (%.1f GiB, "
+            "waiting for digests %.1f s), %s, finalize %.1f s; expert "
+            "mappings %s",
+            time.perf_counter() - self.start,
+            self.seconds["read"],
+            self.read_bytes / 2**30,
+            0.0 if identity is None else identity.wait_seconds,
+            families,
+            self.seconds["finalize"],
+            expert_mapping_cache_stats(),
+        )
 
 
 def moe_weights_mapper():
@@ -305,6 +358,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             if raw_layer_type == "linear_attention"
             else "full_attention"
         )
+        self.layer_index = index
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
                 t,
@@ -401,6 +455,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         gdn_step_metadata_cache=None,
         replicated_token_shard=False,
         sp_microbatch=None,
+        combine_from=None,
+        defer_combine=False,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
         token shard; the token-indexed inputs still cover the whole step.
@@ -411,28 +467,50 @@ class Qwen4ExpDecoderLayer(nn.Module):
         rows; only the real rows enter collectives, attention and the MoE.
         ``replicated_token_shard``: the replicated prefill graph of
         VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD; QSA runs the
-        token-sharded indexer."""
+        token-sharded indexer.
+
+        ``combine_from``: the previous layer's deferred mlp combine,
+        ``(hc, block_output, residuals)``, in place of ``hidden``; it runs as
+        ``hc.combine_mix`` into this layer's attn mix (a layer without PLE).
+        ``defer_combine``: return this layer's mlp combine inputs,
+        ``(block_output, residuals)``, instead of its output."""
         num_tokens = input_ids.shape[0] if sequence_parallel else None
         rows = (
             num_tokens // sp.tp_world_size()
             if sp_pad and num_tokens is not None
             else None
         )
-        hidden = self.apply_ple(
-            hidden,
-            input_ids,
-            query_start_loc,
-            ngram_context,
-            state_slots,
-            context_lens,
-            ple_raw_embeddings,
-            sequence_parallel=sequence_parallel,
-            sp_pad=sp_pad,
-        )
-        block, residual = self.attn_hyper_connection.mix(hidden)
+        if combine_from is not None:
+            assert self.ple is None and not sequence_parallel
+            prev_hc, prev_output, prev_residual = combine_from
+            block, residual = prev_hc.combine_mix(
+                prev_output,
+                prev_residual,
+                self.attn_hyper_connection,
+                prefill_fused=False,
+            )
+        else:
+            hidden = self.apply_ple(
+                hidden,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                state_slots,
+                context_lens,
+                ple_raw_embeddings,
+                sequence_parallel=sequence_parallel,
+                sp_pad=sp_pad,
+            )
+            block, residual = self.attn_hyper_connection.mix(hidden)
         if sp_pad:
             block = sp.unpad(block, rows)
+        # VLLM_TPU_LAYER_DIGEST (debug, layer_digest.py): one digest per point.
+        digest_buf = getattr(self, "_layer_digest", None)
+        digests = None
         if sequence_parallel and sp_microbatch is not None:
+            if digest_buf is not None:
+                # The halves gather their own rows; the digest gathers the step.
+                digests = [layer_digest(sp.gather(block, num_tokens))]
             block = self._attention_in_halves(
                 block,
                 positions,
@@ -449,6 +527,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             if sequence_parallel:
                 block = sp.gather(block, num_tokens)
+            if digest_buf is not None:
+                digests = [layer_digest(block)]
             if self.layer_type == "linear_attention":
                 block = sp.reduce(
                     self.linear_attn(block, gdn_step_metadata_cache), sequence_parallel
@@ -480,6 +560,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     ),
                 )[0]
                 block = sp.reduce(block, sequence_parallel)
+        if digests is not None:
+            digests.append(layer_digest(block))
         block, residual = self.attn_hyper_connection.combine_mix(
             sp.pad_shard(block, sp_pad), residual, self.mlp_hyper_connection
         )
@@ -488,7 +570,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             valid_tokens = sp.shard(valid_tokens[:, None])[:, 0]
         if sp_pad:
             block = sp.unpad(block, rows)
-        block = torch.where(valid_tokens[:, None], block, 0)
+        from vllm_torchtpu.layers.adapter.fused_moe_decode import kernel_masks_padding
+
+        # FUSED_MOE_DECODE_KERNEL_PADDING_MASK: the armed MoE op zeroes the
+        # rows past the padding mask's real-row count itself.
+        if sequence_parallel or not kernel_masks_padding(self.mlp):
+            block = torch.where(valid_tokens[:, None], block, 0)
         if sequence_parallel:
             moe = self._sequence_parallel_moe(block, num_tokens)
         elif sp.pcp_world_size() > 1 and not self._moe_owns_pcp:
@@ -499,7 +586,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
             moe = sp.pcp_gather(self.mlp(sp.pcp_shard(block)), block.shape[0])
         else:
             moe = self.mlp(block)
-        return self.mlp_hyper_connection.combine(sp.pad_shard(moe, sp_pad), residual)
+        if defer_combine:
+            if digests is not None:
+                digests += [layer_digest(moe), layer_digest(residual)]
+                update_rows_(digest_buf, torch.stack(digests))
+            return sp.pad_shard(moe, sp_pad), residual
+        out = self.mlp_hyper_connection.combine(sp.pad_shard(moe, sp_pad), residual)
+        if digests is not None:
+            digests += [layer_digest(moe), layer_digest(out)]
+            update_rows_(digest_buf, torch.stack(digests))
+        return out
 
     def apply_ple(
         self,
@@ -620,7 +716,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 )
                 selections.append(selected)
             outputs.append(sp.reduce_scatter_rows(partial_out))
-        if selections and getattr(self.self_attn, "_selection_sink", None) is not None:
+        if selections and any(
+            getattr(self.self_attn, buf, None) is not None
+            for buf in ("_selection_sink", "_selection_dump")
+        ):
             self.self_attn.write_selection_sink(torch.cat(selections))
         return torch.cat(outputs)
 
@@ -920,11 +1019,22 @@ class Qwen4ExpBackbone(nn.Module):
             or envs.VLLM_TPU_GDN_STEP_KERNEL_METADATA
             else None
         )
-        for index in self.stage:
+        # TPU_QWEN4_HC_DECODE_FOLD: a layer hands its mlp combine to the next
+        # attn mix (or the final mixer) unless the next layer adds its PLE
+        # embedding to the combined streams first.
+        fold = envs.TPU_QWEN4_HC_DECODE_FOLD and not sequence_parallel
+        stage = list(self.stage)
+        pending = None
+        for position, index in enumerate(stage):
             layer = self.layers[index]
             if ple_token is not None and index == self.host_ple_index:
                 ple_raw_embeddings = ple.lookup_finish(ple_token, ple_inputs, hidden)
-            hidden = layer(
+            if position + 1 < len(stage):
+                following = cast(Qwen4ExpDecoderLayer, self.layers[stage[position + 1]])
+                defer = fold and following.ple is None
+            else:
+                defer = fold and self.last_stage
+            output = layer(
                 hidden,
                 positions.to(torch.int64),
                 input_ids.to(torch.int64),
@@ -941,12 +1051,27 @@ class Qwen4ExpBackbone(nn.Module):
                 gdn_step_metadata_cache=gdn_step_metadata_cache,
                 replicated_token_shard=replicated_token_shard,
                 sp_microbatch=sp_microbatch,
+                combine_from=pending,
+                defer_combine=defer,
             )
+            if defer:
+                pending, hidden = (layer.mlp_hyper_connection, *output), None
+            else:
+                pending, hidden = None, output
         if not self.last_stage:
             return IntermediateTensors(
                 {"hidden_states": hidden, "residual": torch.zeros_like(hidden)}
             )
-        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        if pending is not None:
+            last_hc, last_output, last_residual = pending
+            mixed, (hidden, _) = last_hc.combine_mix(
+                last_output,
+                last_residual,
+                self.hyper_connection_mixer,
+                prefill_fused=False,
+            )
+        else:
+            mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if sp_pad:
             mixed, hidden = sp.unpad(mixed, rows), sp.unpad(hidden, rows)
         if sequence_parallel:
@@ -1849,6 +1974,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         self.pd_loaded_weight_identity = None
         self.pd_loaded_ple_identity = None
         self.pd_loaded_weight_records = None
+        times = _LoadTimes()
         identity = LoadedWeightIdentity() if self._pd_weight_identity_enabled else None
         parameters = dict(self.named_parameters())
         loaded, source = set(), set()
@@ -1879,8 +2005,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         }
 
         def _classified_weights():
-            for original, weight in weights:
+            for original, weight in times.read(weights):
                 if original.startswith(("model.visual.", "mtp.")):
+                    times.tensors["skipped"] += 1
                     continue
                 mapped = self.hf_to_vllm_mapper._map_name(original)
                 name = original if mapped is None else mapped
@@ -1892,6 +2019,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
                 if is_pp_missing_parameter(name, self):
                     if identity is not None:
                         identity.observe_tensor(original, weight)
+                    times.tensors["skipped"] += 1
                     continue
                 if name.startswith("model.layers."):
                     _, _, idx, family, relative = name.split(".", 4)
@@ -1905,6 +2033,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
                                 and int(expert_str) not in local_expert_ids
                             ):
                                 source.add(name)
+                                times.tensors["skipped"] += 1
                                 continue
                         if identity is not None:
                             identity.observe_tensor(original, weight)
@@ -1916,11 +2045,42 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
                 source.add(name)
                 yield None, (original, name, "", weight)
 
+        def load_one(original: str, name: str, weight: torch.Tensor) -> str:
+            """Loads one non-MLP checkpoint tensor; returns its family for
+            load timing."""
+            if name.startswith("model.layers."):
+                _, _, idx, family, relative = name.split(".", 4)
+                layer = layers[int(idx)]
+                if family == "ple":
+                    assert layer.ple is not None
+                    layer.ple.load_checkpoint([(relative, weight)])
+                    return "ple"
+                if family == "self_attn":
+                    layer.self_attn.load_weights([(relative, weight)])
+                    return "attention"
+                if family == "linear_attn" and relative in gdn_map:
+                    mapped, shard = gdn_map[relative]
+                    target = f"model.layers.{idx}.linear_attn.{mapped}"
+                    param = parameters[target]
+                    cast(BasevLLMParameter, param).weight_loader(param, weight, shard)
+                    loaded.add(target)
+                    return "gdn"
+            if name not in parameters:
+                raise ValueError(f"Unknown Qwen4Exp checkpoint tensor {original}")
+            param = parameters[name]
+            loader = getattr(param, "weight_loader", default_weight_loader)
+            loader(param, weight)
+            loaded.add(name)
+            return "other"
+
         for group_key, group in itertools.groupby(
             _classified_weights(), key=lambda item: item[0]
         ):
             if group_key is not None:
                 _, layer_idx = group_key
+                # The batch reads its tensors as it loads them: their read
+                # time is counted under "read", not "mlp".
+                start, read_before = time.perf_counter(), times.seconds["read"]
                 loaded.update(
                     load_layer_mlp_weights(
                         moe_loaders[layer_idx],
@@ -1930,34 +2090,13 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
                         layer_idx,
                     )
                 )
+                times.add("mlp", start, excluded=times.seconds["read"] - read_before)
                 continue
 
             for _, (original, name, _, weight) in group:
-                if name.startswith("model.layers."):
-                    _, _, idx, family, relative = name.split(".", 4)
-                    layer = layers[int(idx)]
-                    if family == "ple":
-                        assert layer.ple is not None
-                        layer.ple.load_checkpoint([(relative, weight)])
-                        continue
-                    if family == "self_attn":
-                        layer.self_attn.load_weights([(relative, weight)])
-                        continue
-                    if family == "linear_attn" and relative in gdn_map:
-                        mapped, shard = gdn_map[relative]
-                        target = f"model.layers.{idx}.linear_attn.{mapped}"
-                        param = parameters[target]
-                        cast(BasevLLMParameter, param).weight_loader(
-                            param, weight, shard
-                        )
-                        loaded.add(target)
-                        continue
-                if name not in parameters:
-                    raise ValueError(f"Unknown Qwen4Exp checkpoint tensor {original}")
-                param = parameters[name]
-                loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, weight)
-                loaded.add(name)
+                start = time.perf_counter()
+                times.add(load_one(original, name, weight), start)
+        finalize_start = time.perf_counter()
         for i in self.model.stage:
             layer = layers[i]
             verify_moe_checkpoint(
@@ -1996,4 +2135,6 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
             self.pd_loaded_weight_identity = identity.finish()
             self.pd_loaded_ple_identity = identity.finish(name_fragment=".ple.")
             self.pd_loaded_weight_records = identity.records()
+        times.seconds["finalize"] += time.perf_counter() - finalize_start
+        times.log(identity)
         return set(dict(self.named_parameters()))

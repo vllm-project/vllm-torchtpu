@@ -514,6 +514,9 @@ def calculate_block_sizes(
         "fast_kv_fetch",
         "kv_slot",
         "compact_kv_schedule",
+        "kv_skip_group",
+        "read_only_cache",
+        "schedule_in_hbm",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -561,6 +564,10 @@ def ragged_paged_attention(
     fast_kv_fetch: bool = False,
     kv_slot: int | None = None,
     compact_kv_schedule: bool = False,
+    kv_skip_group: int = 0,
+    selection_bits: jax.Array | None = None,
+    read_only_cache: bool = False,
+    schedule_in_hbm: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -634,6 +641,29 @@ def ragged_paged_attention(
         compact_kv_schedule: Keep one KV-cache schedule entry per lane-tile
             (read-only HEAD_ALONG_SUBLANE only); admits larger decode KV
             blocks within the SMEM schedule budget. Defaults to False.
+        kv_skip_group: With compact_kv_schedule, issue each lane-tile's page
+            DMAs in groups of this many pages and skip the groups past the
+            tile's tokens (no zero-size DMAs). Same DMAs with data and the same
+            results. 0 (default) issues every page slot.
+        selection_bits: [max_num_seqs, pages_per_seq * page_size] int32. Query
+            j of a sequence attends key t of its pages when bit j of
+            ``selection_bits[seq, t]`` is set; no causal, window or scope mask
+            applies. Words at or past the sequence's kv_lens must be 0, and
+            every token below kv_lens must hold finite K and V (a masked key
+            still enters P @ V with weight 0). A query with no set bit in a KV
+            tile gets that tile's finite masked weights, which a later tile
+            with a key scales by 0; one with no key at all returns finite
+            garbage the caller must overwrite. Decode-only, read-only
+            HEAD_ALONG_SUBLANE, decode KV blocks a multiple of 128 dividing
+            pages_per_seq * page_size. None (default) keeps the causal mask.
+        read_only_cache: With skip_kv_update, the kernels neither write nor
+            return the cache, and the returned cache is kv_cache itself; a
+            caller inside a conditional can then leave the cache out of the
+            branch outputs. Defaults to False.
+        schedule_in_hbm: The schedule kernel's array outputs are typed HBM,
+            so XLA keeps them where the attention kernel reads them instead of
+            placing them in VMEM and copying each one to HBM. Same schedule.
+            Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -723,7 +753,29 @@ def ragged_paged_attention(
         fast_kv_fetch=fast_kv_fetch,
         kv_slot=kv_slot,
         compact_kv_schedule=compact_kv_schedule,
+        kv_skip_group=kv_skip_group,
+        selection_mask=selection_bits is not None,
+        read_only_cache=read_only_cache,
     )
+    if read_only_cache and not skip_kv_update:
+        raise ValueError("read_only_cache needs skip_kv_update")
+    if selection_bits is not None and not (
+        decode_only
+        and skip_kv_update
+        and kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+        and cp_group_size is None
+        and attention_scope == configs.AttentionScope.FULL
+        and sliding_window is None
+        and selection_bits.dtype == jnp.int32
+        and selection_bits.shape == (max_num_seqs, serve_cfgs.pages_per_seq * page_size)
+    ):
+        raise ValueError(
+            "selection_bits needs decode_only, read-only HEAD_ALONG_SUBLANE, FULL "
+            "scope without CP or window, and int32 [max_num_seqs, pages_per_seq * "
+            f"page_size], got {selection_bits.shape=} {selection_bits.dtype=}"
+        )
+    if kv_skip_group and not compact_kv_schedule:
+        raise ValueError("kv_skip_group needs compact_kv_schedule")
     if compact_kv_schedule and not (
         kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE and skip_kv_update
     ):
@@ -802,6 +854,12 @@ def ragged_paged_attention(
         kv_cache_lens = global_kv_cache_lens
         kv_new_lens = q_lens
         q_offsets = global_kv_cache_lens
+    elif selection_bits is not None:
+        # Every query of a sequence sees all of its kv_lens tokens, all read
+        # from the cache; the selection words do the masking.
+        kv_cache_lens = kv_lens
+        kv_new_lens = jnp.zeros_like(q_lens)
+        q_offsets = kv_lens
     else:  # FULL
         kv_cache_lens = global_kv_cache_lens
         kv_new_lens = q_lens
@@ -849,14 +907,36 @@ def ragged_paged_attention(
             kv_cache_lens,
             kv_new_lens,
             distribution,
-            # The slot only changes which pair the kernel unpacks; one schedule
-            # serves both layers of a paired page.
+            # The slot only changes which pair the kernel unpacks, the skip
+            # group only how the fetch issues and the selection only the mask;
+            # one schedule serves them all.
             cfgs=dataclasses.replace(
-                cfgs, serve=dataclasses.replace(cfgs.serve, kv_slot=None)
+                cfgs,
+                serve=dataclasses.replace(
+                    cfgs.serve,
+                    kv_slot=None,
+                    kv_skip_group=0,
+                    selection_mask=False,
+                    read_only_cache=False,
+                ),
             ),
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
+            hbm_outputs=schedule_in_hbm,
         )
+        selection_hbm = None
+        if selection_bits is not None:
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            bkv = cfgs.bkv_sz
+            tokens = selection_bits.shape[1]
+            if bkv % num_lanes or tokens % bkv:
+                raise ValueError(
+                    f"selection_bits needs decode KV blocks ({bkv}) that are a "
+                    f"multiple of {num_lanes} and divide {tokens} tokens"
+                )
+            selection_hbm = selection_bits.reshape(
+                max_num_seqs * (tokens // bkv), bkv // num_lanes, num_lanes
+            )
         result = kernel.rpa_kernel(
             cu_q_lens,
             q_offsets,
@@ -868,6 +948,7 @@ def ragged_paged_attention(
             new_kv_hbm,
             kv_cache,
             lse_hbm_in,
+            selection_hbm,
             cfgs=cfgs,
             computer_cls=computer_cls,
         )
@@ -876,6 +957,8 @@ def ragged_paged_attention(
         else:
             o_out, kv_out, _ = result
             lse_out = None
+        if read_only_cache:
+            kv_out = kv_cache
         return o_out, kv_out, lse_out
 
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(

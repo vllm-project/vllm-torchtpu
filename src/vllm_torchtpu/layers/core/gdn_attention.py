@@ -41,6 +41,7 @@ from vllm_torchtpu.kernels.gdn.v3 import metadata as gdn_v3_metadata
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput, QKVColumns
+from vllm_torchtpu.kernels.gdn.v3.metadata import GdnSlotRows
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 _GDN_TP_AXIS_NAME = "tp"
@@ -801,8 +802,14 @@ def _build_v3_pool_state_plan(
     qk_pair_layout: bool,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    log_positions: int = 0,
+    n_kq: int = 0,
 ):
-    """Describe this rank's GDN state regions in the unified pool."""
+    """Describe this rank's GDN state regions in the unified pool.
+
+    ``log_positions`` > 0 adds the GDN window log regions
+    (``pool_adapters.window_log_regions``).
+    """
     block_size, payload, lanes = pool_adapters._pool_geometry(pool)
     if pool_block_tokens % block_size != 0:
         raise ValueError(
@@ -849,6 +856,8 @@ def _build_v3_pool_state_plan(
         qk_pair_layout=qk_pair_layout,
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
+        log_positions=log_positions,
+        n_kq=n_kq,
     )
 
 
@@ -885,6 +894,7 @@ def run_jax_gdn_attention_pooled_local(
     read_offsets: jnp.ndarray | None = None,
     ckpt_indices: jnp.ndarray | None = None,
     per_seq_inputs: tuple[jnp.ndarray, ...] | None = None,
+    slot_rows: GdnSlotRows | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -900,6 +910,8 @@ def run_jax_gdn_attention_pooled_local(
     packed_metadata: jnp.ndarray | None = None,
     metadata_only: bool = False,
     packed_size: int = 0,
+    window_log: bool = False,
+    window_factored: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray] | jnp.ndarray:
     """GDN attention over the unified block pool.
 
@@ -912,6 +924,10 @@ def run_jax_gdn_attention_pooled_local(
     region in the following tokens. All pool knowledge lives here: this
     function builds the copy-plan that maps those two regions onto the V3
     kernel's state operands, so the kernel itself never sees the pool layout.
+    With ``window_log`` (VLLM_TPU_GDN_WINDOW_LOG) the plan also maps the draft
+    log of the ``num_spec_tokens`` draft positions, which selects the kernel's
+    window-log mode; ``window_factored`` (VLLM_TPU_GDN_WINDOW_FACTORED) runs
+    its BATCHED window in factored form.
     """
 
     conv_dim = conv_weight.shape[-1 if conv_weight_kmajor else 0]
@@ -932,6 +948,8 @@ def run_jax_gdn_attention_pooled_local(
         qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
+        log_positions=num_spec_tokens if window_log else 0,
+        n_kq=n_kq,
     )
     num_rows = (
         mixed_qkv.values.shape[0]
@@ -982,6 +1000,8 @@ def run_jax_gdn_attention_pooled_local(
         packed_metadata=packed_metadata,
         metadata_only=metadata_only,
         packed_size=packed_size,
+        factored_window=window_factored,
+        slot_rows=slot_rows,
     )
     if metadata_only:
         return result
@@ -1037,6 +1057,8 @@ def run_jax_gdn_attention_pooled(
     seq_lens: jnp.ndarray,
     slot_read_offsets: jnp.ndarray | None = None,
     ckpt_indices: jnp.ndarray | None = None,
+    stacked_state_indices: jnp.ndarray | None = None,
+    layer_row: jnp.ndarray | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -1054,6 +1076,8 @@ def run_jax_gdn_attention_pooled(
     packed_metadata: jnp.ndarray | None = None,
     metadata_only: bool = False,
     packed_size: int = 0,
+    window_log: bool = False,
+    window_factored: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray] | jnp.ndarray:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -1094,6 +1118,11 @@ def run_jax_gdn_attention_pooled(
           internal prefill checkpoints (VLLM_TPU_MAMBA_TAIL_FOLD). Sequence
           `s` also writes its state after `offsets[s]` query tokens to pool
           block `blocks[s]`; 0 means none.
+        stacked_state_indices: With `layer_row`: every GDN layer's
+          `state_indices` of the step, [layers, max_reqs], the same stack in
+          every layer's call; the read-offset gather and the kernels' state
+          addressing then use row `layer_row[0]` of it, one computation a
+          step for all layers instead of one a layer.
 
     Returns:
         A tuple containing:
@@ -1135,10 +1164,23 @@ def run_jax_gdn_attention_pooled(
             P(None, None),
             (P(None), P(None), P(None), P(None), P(None, None)),
         )
-    if slot_read_offsets is not None:
+    stacked = stacked_state_indices is not None
+    if stacked:
+        assert layer_row is not None and slot_read_offsets is not None
+        # VLLM_TPU_GDN_LEAN_GLUE stacks come from the plain pooled op only.
+        assert (
+            step_metadata is None
+            and prefill_ckpt is None
+            and packed_metadata is None
+            and not metadata_only
+        ), "stacked GDN slot rows exclude the step / checkpoint metadata variants"
+    if slot_read_offsets is not None and not stacked:
         # Per-sequence read offsets (see below), replicated like the other
         # per-sequence inputs.
         in_specs = in_specs + (P(None),)
+    elif stacked:
+        # Read offsets come from the stacks; the per-layer slot is unused.
+        in_specs = in_specs + (None,)
     if ckpt_indices is not None:
         # `(num_seqs, num_spec_tokens + 1)` block id per checkpoint,
         # replicated like the other per-sequence inputs.
@@ -1147,6 +1189,11 @@ def run_jax_gdn_attention_pooled(
             "slot_read_offsets to say which one"
         )
         in_specs = in_specs + (P(None, None),)
+    elif stacked:
+        in_specs = in_specs + (None,)
+    if stacked:
+        # Stacked state indices, stacked read offsets, the layer's row.
+        in_specs = in_specs + (P(None, None), P(None, None), P(None))
 
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
@@ -1167,6 +1214,8 @@ def run_jax_gdn_attention_pooled(
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
         conv_weight_kmajor=conv_weight_kmajor,
+        window_log=window_log,
+        window_factored=window_factored,
     )
     if packed_metadata is not None or metadata_only:
         # VLLM_TPU_GDN_STEP_KERNEL_METADATA: one replicated packed vector,
@@ -1199,6 +1248,13 @@ def run_jax_gdn_attention_pooled(
                 *rest, prefill_ckpt=(ckpt_offsets, ckpt_blocks)
             )
 
+    if stacked:
+        stacked_inner = local_fn
+
+        def local_fn(*args):
+            *head, si, ro, row = args
+            return stacked_inner(*head, slot_rows=GdnSlotRows(si, ro, row))
+
     mapped_fn = jax.shard_map(
         local_fn,
         mesh=mesh,
@@ -1218,6 +1274,8 @@ def run_jax_gdn_attention_pooled(
     if step_metadata is not None:
         read_offsets, step_ckpt_indices, *per_seq_inputs = step_metadata
         extra_args = (read_offsets, step_ckpt_indices, tuple(per_seq_inputs))
+    elif stacked:
+        extra_args = (None,)
     elif slot_read_offsets is not None:
         extra_args = (slot_read_offsets[state_indices],)
     else:
@@ -1226,10 +1284,20 @@ def run_jax_gdn_attention_pooled(
         # Already per-sequence (row s names sequence s's checkpoint blocks),
         # so it needs no gather by state_indices.
         extra_args = extra_args + (ckpt_indices,)
+    elif stacked:
+        extra_args = extra_args + (None,)
     if prefill_ckpt is not None:
         extra_args = extra_args + tuple(prefill_ckpt)
     if packed_metadata is not None:
         extra_args = extra_args + (packed_metadata,)
+    if stacked:
+        # One gather for every layer: each layer's call builds the same
+        # stacks, which XLA merges into one computation.
+        extra_args = extra_args + (
+            stacked_state_indices,
+            slot_read_offsets[stacked_state_indices],
+            layer_row,
+        )
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,

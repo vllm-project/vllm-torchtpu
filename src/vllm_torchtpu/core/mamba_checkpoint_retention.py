@@ -41,6 +41,14 @@ This patch:
   column's last token, so no exact decode-boundary state exists and decode
   checkpoints stay off.
 
+``VLLM_TPU_MAMBA_PIN_HIT_CHECKPOINT=1`` extends the pin to every hashed state
+block leaving a request's table, the checkpoint it resumed from included, and
+frees the pinned blocks older boundary first. Without it the resumed checkpoint
+goes to the free queue as soon as the state column passes it (on a producer at
+the latest when the request finishes, ``Scheduler._connector_finished``), ahead
+of the KV it serves; a turn that ends in the previous turn's block publishes no
+checkpoint of its own, so that early one is the chain's only checkpoint.
+
 ``VLLM_TPU_MAMBA_CHECKPOINT_RETENTION=0`` disables the whole patch;
 ``VLLM_TPU_MAMBA_DECODE_CHECKPOINT=0`` disables only the decode checkpoints.
 """
@@ -55,6 +63,8 @@ from vllm_torchtpu import envs
 logger = init_logger(__name__)
 
 _PATCH_FLAG = "_tpu_mamba_checkpoint_retention_patch"
+# VLLM_TPU_MAMBA_PIN_HIT_CHECKPOINT, read when the patch is installed.
+_pin_hit_checkpoint = False
 
 
 def _own(manager) -> dict[str, dict[int, tuple[object, bool]]]:
@@ -63,17 +73,21 @@ def _own(manager) -> dict[str, dict[int, tuple[object, bool]]]:
 
 
 def _pinned(manager) -> dict[str, list]:
-    """Published checkpoints already dropped from the block table."""
+    """Checkpoints dropped from the block table and still held: the request's
+    own, or with VLLM_TPU_MAMBA_PIN_HIT_CHECKPOINT every hashed state block."""
     return manager.__dict__.setdefault("_tpu_pinned_checkpoints", {})
 
 
 def _release(manager, request_id: str, blocks: list) -> None:
-    """Free blocks leaving a request's table, keeping its own checkpoints."""
+    """Free blocks leaving a request's table, keeping its own checkpoints
+    (with VLLM_TPU_MAMBA_PIN_HIT_CHECKPOINT, every hashed block)."""
     own = _own(manager).get(request_id)
     freed = []
     for block in blocks:
         entry = own.get(block.block_id) if own else None
-        if entry is not None and entry[0] is block and block.block_hash is not None:
+        if block.block_hash is not None and (
+            _pin_hit_checkpoint or (entry is not None and entry[0] is block)
+        ):
             _pinned(manager).setdefault(request_id, []).append(block)
         else:
             freed.append(block)
@@ -126,7 +140,12 @@ def _eviction_order(coordinator, request_id: str) -> list:
     attention, state, pinned = [], [], []
     for manager in coordinator.single_type_managers:
         if isinstance(manager, MambaManager):
-            pinned.append(_take_pinned(manager, request_id))
+            taken = _take_pinned(manager, request_id)
+            if _pin_hit_checkpoint:
+                # Resumed and published checkpoints together, older boundary
+                # first; a block that lost its hash sorts first.
+                taken.sort(key=lambda b: b.block_hash_num_tokens or 0)
+            pinned.append(taken)
             state.append(manager.pop_blocks_for_free(request_id))
         else:
             attention.append(manager.pop_blocks_for_free(request_id))
@@ -155,6 +174,8 @@ def patch_mamba_checkpoint_retention() -> None:
 
     if getattr(MambaManager.cache_blocks, _PATCH_FLAG, False):
         return
+    global _pin_hit_checkpoint
+    _pin_hit_checkpoint = envs.VLLM_TPU_MAMBA_PIN_HIT_CHECKPOINT
 
     original_cache_blocks = MambaManager.cache_blocks
     original_remove_range = MambaManager._remove_blocks_in_range
@@ -312,6 +333,7 @@ def patch_mamba_checkpoint_retention() -> None:
     KVCacheCoordinator.pop_blocks_for_free = coordinator_pop_blocks_for_free
     logger.info(
         "Applied TPU patch: Mamba align checkpoints pinned until request free, "
-        "freed after their KV (decode checkpoints: %s).",
+        "freed after their KV (decode checkpoints: %s; resumed checkpoints: %s).",
         "on (no spec decode)" if decode_checkpoints else "off",
+        "pinned" if _pin_hit_checkpoint else "freed when passed",
     )

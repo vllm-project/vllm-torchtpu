@@ -188,6 +188,18 @@ class ServingConfigs:
     # the fetch derives each page's size. Shrinks the SMEM schedule by the
     # pages per KV block, which admits larger KV blocks.
     compact_kv_schedule: bool = False
+    # With compact_kv_schedule: issue a lane-tile's page DMAs in groups of this
+    # many pages, each group only when the tile has a token in it, so the pages
+    # past the tile's last one cost no zero-size DMAs. 0 issues every slot.
+    kv_skip_group: int = 0
+    # Read-only decode: a per-token word of query bits replaces the causal,
+    # window and scope masks. Query j of a sequence attends key t when bit j of
+    # the word for t is set. Each lane-tile fetches its words beside its KV.
+    selection_mask: bool = False
+    # Read-only decode (skip_kv_update): the kernel neither writes nor returns
+    # the KV cache, so a caller can run it inside a conditional that must not
+    # return the cache (XLA would copy the whole pool).
+    read_only_cache: bool = False
 
     @property
     def max_decode_bkv_p_new(self) -> int:
@@ -487,6 +499,12 @@ class RpaConfigs:
             self.serve.packing_kv,
             self.aligned_kv_head_dim,
         )
+
+    @property
+    def selection_vmem_shape(self) -> tuple[int, int, int]:
+        """One lane-tile's selection words per batch lane, 128 tokens a row."""
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (self.block.batch_size, self.block.bkv_sz // num_lanes, num_lanes)
 
     @property
     def dma_kv_new_size(self) -> int:

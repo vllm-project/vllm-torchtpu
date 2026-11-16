@@ -7,6 +7,7 @@ Prefill reuses KV tiles through block-sparse attention; decode uses batched RPA,
 or the fused sparse GQA decode kernel under VLLM_TPU_QSA_FUSED_SPARSE_DECODE.
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -14,6 +15,7 @@ import jax.numpy as jnp
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp import shape_tuned
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_decode_blocks
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _token_metadata,
@@ -155,8 +157,15 @@ def _dcp_page_metadata(
     blocks, lengths, table, *, ratio, page_size, dcp, ascending=False
 ):
     """:func:`virtual_page_metadata` for this DCP rank's owned groups; rows
-    with no owned token get ``kv_lens`` 0 and no query (see ``cu_q_lens``)."""
+    with no owned token get ``kv_lens`` 0 and no query (see ``cu_q_lens``).
+
+    A true ``dcp[3]`` (``pooled_qsa.compressed_dcp_own_blocks``): ``blocks``
+    hold only selected groups of this rank, -1 elsewhere, at any column, and
+    a row's selection is its entries below its completed groups (rows the RPA
+    batch pads carry zeros and length 0); otherwise it is its first
+    ``min(complete, budget)`` columns."""
     rank, world = dcp[0], dcp[1]
+    own_list = len(dcp) > 3 and dcp[3]
     unit_groups = dcp_interleave(dcp, page_size) // ratio
     rank = jnp.asarray(rank, jnp.int32).reshape(-1)[0]
     batch, budget = blocks.shape
@@ -165,7 +174,11 @@ def _dcp_page_metadata(
     complete = lengths // ratio
     count = jnp.minimum(complete, budget)
     columns = jnp.arange(budget)[None, :]
-    owned = (columns < count[:, None]) & ((blocks // unit_groups) % world == rank)
+    if own_list:
+        selected = (blocks >= 0) & (blocks < complete[:, None])
+    else:
+        selected = columns < count[:, None]
+    owned = selected & ((blocks // unit_groups) % world == rank)
     # Owned groups ascending at the front, the rest after them.
     if ascending and envs.VLLM_TPU_QSA_DCP_META_PARTITION:
         # VLLM_TPU_QSA_DCP_META_PARTITION: the selection is already ascending,
@@ -226,13 +239,17 @@ def _rpa_attention_batch(
     slot_read=False,
     compact=False,
     fast_fetch=False,
+    skip_empty=0,
     dcp=None,
     return_lse=False,
     ascending=False,
+    read_only=False,
 ):
     """With ``return_lse`` returns ``(out, lse, cache)``: ``out`` f32 normalized
     over the attended keys and not gated, ``lse`` [rows, heads] (natural log);
-    rows with no key get 0 and -inf. ``dcp``: see ``virtual_page_metadata``."""
+    rows with no key get 0 and -inf. ``dcp``: see ``virtual_page_metadata``.
+    ``read_only``: RPA neither writes nor returns the cache (the returned
+    cache is the argument), for callers inside a conditional."""
     from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
     kv_slot = None
@@ -297,7 +314,10 @@ def _rpa_attention_batch(
         fast_kv_fetch=fast_fetch,
         kv_slot=kv_slot,
         compact_kv_schedule=compact,
+        **({"kv_skip_group": skip_empty} if compact and skip_empty else {}),
         **({"return_lse": True} if return_lse else {}),
+        **({"read_only_cache": True} if read_only else {}),
+        schedule_in_hbm=envs.VLLM_TPU_RPA_SCHEDULE_HBM,
     )
     out, next_cache = result[0], result[1]
     rows = jnp.minimum(cu_q_lens[:-1], len(q) - 1)
@@ -359,10 +379,13 @@ def rpa_attention(
     dcp=None,
     return_lse=False,
     ascending=False,
+    read_only=False,
 ):
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
     ``_rpa_attention_batch``); ``dcp`` attends this DCP rank's owned keys.
-    ``ascending``: see ``virtual_page_metadata``."""
+    ``ascending``: see ``virtual_page_metadata``.
+    ``read_only``: see ``_rpa_attention_batch``; the chunk loop then takes the
+    cache as a loop constant instead of carrying it."""
     batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
     if compact and envs.VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES:
         # The compact schedule holds one entry per lane-tile instead of one
@@ -392,6 +415,11 @@ def rpa_attention(
                 compact=True,
                 bkv_size=bkv_size,
                 batch_size=lanes,
+                **(
+                    {"skip_empty": envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY}
+                    if envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY
+                    else {}
+                ),
             )
             if compact
             else {}
@@ -400,6 +428,7 @@ def rpa_attention(
         **({"dcp": dcp} if dcp is not None else {}),
         **({"return_lse": True} if return_lse else {}),
         **({"ascending": True} if ascending else {}),
+        **({"read_only": True} if read_only else {}),
     )
     if len(q) <= batch_size:
         return attend(q, gate, blocks, lengths, table, cache)
@@ -414,6 +443,16 @@ def rpa_attention(
         *output, cache = attend(query, gate, blocks, lengths, table, cache)
         return cache, tuple(output)
 
+    if read_only:
+        base = cache
+
+        def step(carry, inputs):  # noqa: F811
+            query, gate, blocks, lengths, table = inputs
+            *output, _ = attend(query, gate, blocks, lengths, table, base)
+            return carry, tuple(output)
+
+        cache = jnp.zeros((), jnp.int32)
+
     # Keep the small-step path fully unrolled, but bound the unroll for large
     # prefill steps. Fully expanding a 4K step repeats the RPA body 128 times
     # in each QSA layer and makes whole-model compilation impractical.
@@ -424,10 +463,209 @@ def rpa_attention(
         tuple(map(split, (q, gate, blocks, lengths, table))),
         unroll=min(num_chunks, 4),
     )
+    if read_only:
+        cache = base
     out = output[0].reshape(-1, *q.shape[1:])[: len(q)]
     if return_lse:
         return out, output[1].reshape(-1, q.shape[1])[: len(q)], cache
     return out, cache
+
+
+logger = init_logger(__name__)
+
+UNION_REQUESTS = 32  # requests per union RPA call; its [32, P] page table at
+# P = 2080 is 266 KB of scalar memory, as the 128-row per-row call's is.
+
+
+def union_page_slots(budget, ratio, tile, rows=4):
+    """Union page slots a request: ``rows`` rows' ``budget`` groups and their
+    tail groups, in whole ``tile``-token KV tiles."""
+    per_tile = tile // ratio
+    return -(-(rows * (budget + 1)) // per_tile) * per_tile
+
+
+# Diagnostics for the bench (scripts/bench_qsa_rpa_decode.py f15c): build the
+# union metadata before the route instead of inside its union branch, or skip
+# the route (wrong for requests of more than max_query_len rows).
+_UNION_META_FIRST = False
+_UNION_ROUTE = True
+
+
+def union_request_slots(rows, requests, max_query_len):
+    """Request slots the union path covers: whole calls of ``UNION_REQUESTS``,
+    as many as a step of ``rows`` rows holding ``max_query_len`` rows a request
+    fills (a verify step's request slots past them are empty), at most the
+    program's ``requests``."""
+    calls = -(-rows // (UNION_REQUESTS * max_query_len))
+    return min(calls * UNION_REQUESTS, -(-requests // UNION_REQUESTS) * UNION_REQUESTS)
+
+
+def union_decode_applies(cache, *, kv_heads, ratio, kv_head_offset, max_query_len, dcp):
+    """VLLM_TPU_QSA_DECODE_RPA_UNION covers a verify step's decode branch:
+    main-KV DCP in the decode layout, the compact schedule and slot reads,
+    1 < max_query_len <= 4, 512-token pages of 4-token groups."""
+    tile = envs.VLLM_TPU_QSA_DECODE_RPA_UNION
+    if not tile:
+        return False
+    if tile % 128:
+        raise ValueError(f"VLLM_TPU_QSA_DECODE_RPA_UNION={tile} must be a multiple of 128")
+    return bool(
+        1 < max_query_len <= 4
+        and dcp is not None
+        and dcp_interleave(dcp, cache.shape[1]) == cache.shape[1]
+        and ratio == 4
+        and cache.shape[1] == 512
+        and envs.VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE
+        and envs.VLLM_TPU_QSA_DECODE_SLOT_READ
+        and slot_readable(cache, kv_heads, kv_head_offset)
+    )
+
+
+def union_metadata(blocks, lengths, table, starts, *, rows, ratio, max_query_len, dcp):
+    """``(starts, pages, sel, meta, live)`` for ``union_decode_attention``: the
+    covered requests' starts, and their union pages, per-token row words and
+    meta from the SparseCore kernel (qsa_union_meta), with each row's
+    liveness."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_union_meta import (
+        union_row_live,
+        union_sc_metadata,
+    )
+
+    slots = union_page_slots(blocks.shape[1], ratio, envs.VLLM_TPU_QSA_DECODE_RPA_UNION)
+    starts = starts.astype(jnp.int32)
+    covered = union_request_slots(rows, len(starts) - 1, max_query_len)
+    if covered < len(starts) - 1:
+        starts = starts[: covered + 1]
+    # write="tile": page and word slots past the tile holding a request's last
+    # page are left unwritten; RPA reads no tile past kv_lens.
+    pages, sel, meta = union_sc_metadata(
+        blocks,
+        lengths,
+        starts,
+        table,
+        dcp[0],
+        world=dcp[1],
+        pages_per_seq=slots,
+        # A true dcp[3]: rank-only lists, as _dcp_page_metadata reads them.
+        own_list=len(dcp) > 3 and bool(dcp[3]),
+        emit_sel=True,
+        write="tile",
+    )
+    return starts, pages, sel, meta, union_row_live(meta, starts, rows)
+
+
+def union_decode_attention(
+    q,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    ratio,
+    k_scale,
+    v_scale,
+    kv_head_offset,
+    max_query_len,
+    dcp,
+    read_only=False,
+    metadata=None,
+):
+    """Verify-step attention on this DCP rank's owned keys, one RPA sequence
+    per request over the union of its rows' owned pages.
+
+    Same contract as ``decode_attention(..., dcp=dcp, return_lse=True)``:
+    ``(out, lse, cache)``, ``out`` f32 normalized over the row's owned keys
+    and not gated, ``lse`` natural log; a row with no owned key gives 0 and
+    -inf. Each row attends exactly the keys it attends there; the sums run in
+    another order. Requests go to RPA in calls of ``UNION_REQUESTS``, each
+    over its contiguous rows. A verify step holds at most ``max_query_len``
+    rows a request; rows past a request's fourth get 0 and -inf, and a call
+    attends no row past its ``UNION_REQUESTS * max_query_len``-row slice
+    (``qsa_attention`` routes steps with longer requests to the per-row
+    path). Only the first ``union_request_slots`` requests are attended; the
+    caller routes a step with live requests past them to the per-row path.
+    ``read_only``: see ``_rpa_attention_batch``. ``metadata``:
+    ``union_metadata``'s result, when the caller built it.
+    """
+    from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
+
+    tile = envs.VLLM_TPU_QSA_DECODE_RPA_UNION
+    if metadata is None:
+        metadata = union_metadata(
+            blocks, lengths, table, starts, rows=len(q), ratio=ratio,
+            max_query_len=max_query_len, dcp=dcp,
+        )
+    starts, pages, sel, meta, live = metadata
+    requests = len(starts) - 1
+    chunks = -(-requests // UNION_REQUESTS)
+    pad = chunks * UNION_REQUESTS - requests
+    if pad > 0:
+        starts = jnp.concatenate([starts, jnp.broadcast_to(starts[-1:], (pad,))])
+        pages, sel, meta = (jnp.pad(x, ((0, pad), (0, 0))) for x in (pages, sel, meta))
+    call_rows = UNION_REQUESTS * max_query_len
+    # Rows past the last call's slice are padding, so a slice never clamps.
+    query = jnp.pad(
+        q.astype(jnp.float32),
+        ((0, call_rows), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
+    )
+    dummy_k = jnp.zeros((call_rows, 1, query.shape[-1]), cache.dtype)
+    virtual_cache = cache.reshape(-1, ratio, *cache.shape[2:])
+    blocks_cfg = configs.BlockSizes(
+        bq_sz=max_query_len,
+        bq_c_sz=max_query_len,
+        bkv_sz=tile,
+        batch_size=envs.VLLM_TPU_QSA_DECODE_RPA_LANES,
+    )
+    skip = envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY
+    out = jnp.zeros(query.shape, jnp.float32)
+    lse = jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
+    for c in range(chunks):
+        first = c * UNION_REQUESTS
+        part = slice(first, first + UNION_REQUESTS)
+        row0 = starts[first]
+        out_c, virtual_cache, lse_c = wrapper.ragged_paged_attention(
+            jax.lax.dynamic_slice_in_dim(query, row0, call_rows),
+            dummy_k,
+            dummy_k,
+            virtual_cache,
+            meta[part, 1],
+            pages[part].reshape(-1),
+            # A request of more than max_query_len rows (the precompile's
+            # dummy steps) could carry a call past its query slice; rows
+            # past the slice are not attended.
+            jnp.clip(starts[first : first + UNION_REQUESTS + 1] - row0, 0, call_rows),
+            jnp.full((3,), UNION_REQUESTS, jnp.int32),
+            sm_scale=q.shape[-1] ** -0.5,
+            q_scale=None,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out_dtype=jnp.dtype(jnp.float32),
+            skip_kv_update=True,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            decode_block_sizes=blocks_cfg,
+            prefill_block_sizes=dataclasses.replace(blocks_cfg, batch_size=1),
+            decode_only=True,
+            lean_kv_fetch=bool(
+                envs.VLLM_TPU_QSA_DECODE_LEAN_FETCH or envs.VLLM_TPU_QSA_DECODE_FAST_FETCH
+            ),
+            fast_kv_fetch=bool(envs.VLLM_TPU_QSA_DECODE_FAST_FETCH),
+            kv_slot=kv_head_offset,
+            compact_kv_schedule=True,
+            **({"kv_skip_group": skip} if skip else {}),
+            return_lse=True,
+            decode_query_size=max_query_len,
+            selection_bits=sel[part],
+            **({"read_only_cache": True} if read_only else {}),
+            schedule_in_hbm=envs.VLLM_TPU_RPA_SCHEDULE_HBM,
+        )
+        # Later calls start at their own first row, so each row keeps the
+        # value its own call wrote.
+        out = jax.lax.dynamic_update_slice_in_dim(out, out_c, row0, 0)
+        lse = jax.lax.dynamic_update_slice_in_dim(lse, lse_c.astype(jnp.float32), row0, 0)
+    out = jnp.where(live[:, None, None], out[: len(q), :, : q.shape[-1]], 0)
+    lse = jnp.where(live[:, None], lse[: len(q)], -jnp.inf)
+    return out, lse, virtual_cache.reshape(cache.shape)
 
 
 def fused_sparse_decode(
@@ -509,6 +747,7 @@ def decode_attention(
     dcp=None,
     return_lse=False,
     ascending=False,
+    read_only=False,
 ):
     """Per-row decode attention: fused sparse decode when enabled, else RPA.
 
@@ -566,6 +805,7 @@ def decode_attention(
         **({"dcp": dcp} if dcp is not None else {}),
         **({"return_lse": True} if return_lse else {}),
         **({"ascending": True} if ascending else {}),
+        **({"read_only": True} if read_only else {}),
     )
     *outs, cache = result
     outs = [x[:, : q.shape[1]] if trailing else x for x in outs]
@@ -590,6 +830,7 @@ def _decode_attention(
     dcp=None,
     return_lse=False,
     ascending=False,
+    read_only=False,
 ):
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     if kv_head_offset:
@@ -616,6 +857,8 @@ def _decode_attention(
         options["return_lse"] = True
     if ascending and dcp is not None:
         options["ascending"] = True
+    if read_only:
+        options["read_only"] = True
 
     return rpa_attention(q, gate, blocks, lengths, table, cache, **options)
 
@@ -930,6 +1173,171 @@ def dcp_combine_own_step(
     return dcp_combine_own(out_pair, lse_pair, gate)
 
 
+def _rank_weight(out, lse, lse_all):
+    """This rank's partial scaled by ``exp(lse - max_r lse_r)`` over every head,
+    the max, and whether any rank owns a key of each (token, head)."""
+    top = jnp.max(lse_all, axis=0)
+    finite = jnp.isfinite(top)
+    weight = jnp.where(finite, jnp.exp(lse - jnp.where(finite, top, 0)), 0)
+    # where, not *: a rank that owns no key of a row may hold garbage there.
+    return jnp.where(weight[..., None] > 0, weight[..., None] * out, 0), top, finite
+
+
+def dcp_merge_scale(out, lse, lse_all, *, out_dtype=jnp.float32):
+    """This rank's addend of a reduce-scatter DCP merge (VLLM_TPU_QSA_DCP_MERGE=rs).
+
+    ``out`` [T, S * H, D] f32 and ``lse`` [T, S * H] are this rank's
+    ``qsa_attention(dcp=...)`` results over the group's concatenated heads;
+    ``lse_all`` [S, T, S * H] is every group rank's ``lse``. Returns
+    [S, T, H, D]: block ``d`` holds group rank ``d``'s heads scaled by
+    ``exp(lse - max_r lse_r)``, the product ``dcp_combine`` sums, so a
+    reduce-scatter of the blocks over the group gives each rank the numerator of
+    its heads' merge (``dcp_merge_finish`` divides and gates it).
+    """
+    size = lse_all.shape[0]
+    tokens, heads_all, dim = out.shape
+    scaled = _rank_weight(out, lse, lse_all)[0]
+    scaled = scaled.reshape(tokens, size, heads_all // size, dim).transpose(1, 0, 2, 3)
+    return scaled.astype(out_dtype)
+
+
+def dcp_merge_scale_step(out: jax.Array, lse: jax.Array, lse_all: jax.Array) -> jax.Array:
+    """``dcp_merge_scale`` (f32 addends) with a fully annotated signature for ``jax_op``."""
+    return dcp_merge_scale(out, lse, lse_all)
+
+
+def dcp_merge_scale_bf16_step(
+    out: jax.Array, lse: jax.Array, lse_all: jax.Array
+) -> jax.Array:
+    """``dcp_merge_scale`` with bf16 addends (VLLM_TPU_QSA_DCP_MERGE=rs_bf16)."""
+    return dcp_merge_scale(out, lse, lse_all, out_dtype=jnp.bfloat16)
+
+
+def dcp_merge_finish(summed, lse_all, gate, rank, *, out_dtype=jnp.bfloat16):
+    """This rank's heads of the merge from the reduce-scattered numerator.
+
+    ``summed`` [T, H, D] is the group's sum of ``dcp_merge_scale`` block
+    ``rank``; ``lse_all`` [S, T, S * H]; ``gate`` [T, H, D] and ``rank`` int32
+    ``[1]`` as in ``dcp_combine``, whose weights, normalization and gate
+    rounding this repeats (only the order of the sum over ranks differs).
+    """
+    size, tokens, heads_all = lse_all.shape
+    heads = heads_all // size
+    start = rank.reshape(()).astype(jnp.int32) * heads
+    lse_own = jax.lax.dynamic_slice_in_dim(lse_all, start, heads, axis=2)
+    top = jnp.max(lse_own, axis=0)
+    finite = jnp.isfinite(top)
+    weight = jnp.where(finite[None], jnp.exp(lse_own - jnp.where(finite, top, 0)[None]), 0)
+    total = jnp.sum(weight, axis=0)
+    out = summed.astype(jnp.float32) / jnp.where(total > 0, total, 1)[..., None]
+    gated = bf16(
+        bf16(out).astype(jnp.float32)
+        * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
+    )
+    return jnp.where(finite[..., None], gated, 0).astype(out_dtype)
+
+
+def dcp_merge_finish_step(
+    summed: jax.Array, lse_all: jax.Array, gate: jax.Array, rank: jax.Array
+) -> jax.Array:
+    """``dcp_merge_finish`` with a fully annotated signature for ``jax_op``."""
+    return dcp_merge_finish(summed, lse_all, gate, rank)
+
+
+def dcp_merge_proj_share(out, lse, lse_all, gate_all, *, out_dtype=jnp.bfloat16):
+    """This rank's share of the gated merge of every head of its DCP group
+    (VLLM_TPU_QSA_DCP_MERGE=proj).
+
+    Normalized weight times partial times the rounded gate, [T, S * H, D]. The
+    merge and the gate are linear in the partials, so the group's shares summed
+    give the gated merge; projecting each share by the output projection's
+    columns of all S * H heads lets the projection's TP all-reduce do that sum.
+    ``gate_all`` [T, S * H, D] is the group's gate.
+    """
+    scaled, top, finite = _rank_weight(out, lse, lse_all)
+    weight = jnp.where(finite[None], jnp.exp(lse_all - jnp.where(finite, top, 0)[None]), 0)
+    total = jnp.sum(weight, axis=0)
+    share = scaled / jnp.where(total > 0, total, 1)[..., None]
+    gated = share * bf16(jax.nn.sigmoid(gate_all.astype(jnp.float32))).astype(jnp.float32)
+    return jnp.where(finite[..., None], gated, 0).astype(out_dtype)
+
+
+def dcp_merge_proj_share_step(
+    out: jax.Array, lse: jax.Array, lse_all: jax.Array, gate_all: jax.Array
+) -> jax.Array:
+    """``dcp_merge_proj_share`` with a fully annotated signature for ``jax_op``."""
+    return dcp_merge_proj_share(out, lse, lse_all, gate_all)
+
+
+def dcp_merge_check_stats(new, old, lse_all):
+    """Agreement of a merge's [T, H, D] result with ``dcp_combine``'s ``old``
+    (VLLM_TPU_QSA_DCP_MERGE_CHECK), f32 [8]: max abs error, max |old|, max
+    error relative to its head vector's largest |old|, fraction of elements
+    that differ, NaN count of ``new``, max abs difference between the merged
+    LSE ``top + log(total)`` and ``logsumexp``, 1 (a call count), 0."""
+    new32, old32 = new.astype(jnp.float32), old.astype(jnp.float32)
+    nan = jnp.isnan(new32)
+    err = jnp.where(nan, 0, jnp.abs(new32 - old32))
+    head = jnp.max(jnp.abs(old32), axis=-1)
+    rel = jnp.where(head > 0, jnp.max(err, axis=-1) / jnp.where(head > 0, head, 1), 0)
+    top = jnp.max(lse_all, axis=0)
+    finite = jnp.isfinite(top)
+    shift = jnp.where(finite, top, 0)
+    merged = shift + jnp.log(jnp.sum(jnp.exp(lse_all - shift[None]), axis=0))
+    lse_err = jnp.where(finite, jnp.abs(merged - jax.nn.logsumexp(lse_all, axis=0)), 0)
+    return jnp.stack(
+        [
+            jnp.max(err),
+            jnp.max(jnp.abs(old32)),
+            jnp.max(rel),
+            jnp.mean((new32 != old32).astype(jnp.float32)),
+            jnp.sum(nan.astype(jnp.float32)),
+            jnp.max(lse_err),
+            jnp.float32(1),
+            jnp.float32(0),
+        ]
+    ).astype(jnp.float32)
+
+
+def dcp_merge_check_stats_step(
+    new: jax.Array, old: jax.Array, lse_all: jax.Array
+) -> jax.Array:
+    """``dcp_merge_check_stats`` with a fully annotated signature for ``jax_op``."""
+    return dcp_merge_check_stats(new, old, lse_all)
+
+
+def dcp_qgate_check_stats(new, old, head_dim):
+    """Agreement of the locally projected group query/gate ``new`` with the
+    all-gathered ``old`` (VLLM_TPU_QSA_DCP_LOCAL_QGATE under
+    VLLM_TPU_QSA_DCP_MERGE_CHECK), both [T, heads * 2 * head_dim]: the f32 [8]
+    of ``dcp_merge_check_stats`` over [T, heads, 2 * head_dim] vectors, LSE
+    entry 0."""
+    tokens = new.shape[0]
+    new32 = new.astype(jnp.float32).reshape(tokens, -1, 2 * head_dim)
+    old32 = old.astype(jnp.float32).reshape(tokens, -1, 2 * head_dim)
+    nan = jnp.isnan(new32)
+    err = jnp.where(nan, 0, jnp.abs(new32 - old32))
+    head = jnp.max(jnp.abs(old32), axis=-1)
+    rel = jnp.where(head > 0, jnp.max(err, axis=-1) / jnp.where(head > 0, head, 1), 0)
+    return jnp.stack(
+        [
+            jnp.max(err),
+            jnp.max(jnp.abs(old32)),
+            jnp.max(rel),
+            jnp.mean((new32 != old32).astype(jnp.float32)),
+            jnp.sum(nan.astype(jnp.float32)),
+            jnp.float32(0),
+            jnp.float32(1),
+            jnp.float32(0),
+        ]
+    ).astype(jnp.float32)
+
+
+def dcp_qgate_check_stats_step(new: jax.Array, old: jax.Array, *, head_dim: int) -> jax.Array:
+    """``dcp_qgate_check_stats`` with a fully annotated signature for ``jax_op``."""
+    return dcp_qgate_check_stats(new, old, head_dim)
+
+
 def pcp_combine(out_pair, lse_pair, gate, *, out_dtype=jnp.bfloat16):
     """Merge a PCP pair's partial attention over every head, then gate.
 
@@ -966,6 +1374,7 @@ def qsa_attention(
     max_query_len=1,
     dcp=None,
     ascending=False,
+    union=False,
 ):
     """Route a decode prefix to per-row decode and the remaining rows to prefill.
 
@@ -986,6 +1395,13 @@ def qsa_attention(
     normalized over the owned keys and NOT gated, ``lse`` [T, heads] f32
     (natural log, ``-inf`` when the row owns no key). ``dcp_combine`` merges
     the pair.
+
+    ``union`` (target verify steps): when VLLM_TPU_QSA_DECODE_RPA_UNION
+    covers the decode branch (``union_decode_applies``), a step whose requests
+    all hold at most ``max_query_len`` rows takes ``union_decode_attention``
+    and any other step the per-row path, chosen on device. Both read the cache
+    only, so the conditional returns out and LSE and not the cache (XLA would
+    copy the pool for a returned cache).
     """
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     if kv_head_offset:
@@ -1011,6 +1427,79 @@ def qsa_attention(
         output, cache = prefill_fn(query, gate, blocks, lengths, table, cache, starts, **options)
         return split(output, lengths, cache)
     if len(query) <= (len(starts) - 1) * max_query_len:
+        if union and union_decode_applies(
+            cache,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_head_offset=kv_head_offset,
+            max_query_len=max_query_len,
+            dcp=dcp,
+        ):
+            first = None
+            if _UNION_META_FIRST:
+                first = union_metadata(
+                    blocks, lengths, table, starts, rows=len(query), ratio=ratio,
+                    max_query_len=max_query_len, dcp=dcp,
+                )
+
+            def by_union(operands):
+                query, gate, blocks, lengths, table, starts, cache, meta = operands
+                out, lse, _ = union_decode_attention(
+                    query,
+                    blocks,
+                    lengths,
+                    table,
+                    cache,
+                    starts,
+                    ratio=ratio,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    kv_head_offset=kv_head_offset,
+                    max_query_len=max_query_len,
+                    dcp=dcp,
+                    read_only=True,
+                    metadata=meta,
+                )
+                return out, lse
+
+            def by_rows(operands):
+                query, gate, blocks, lengths, table, starts, cache, _ = operands
+                out, lse, _ = decode_attention(
+                    query,
+                    gate,
+                    blocks,
+                    lengths,
+                    table,
+                    cache,
+                    read_only=True,
+                    **({"ascending": True} if ascending else {}),
+                    **options,
+                )
+                live = (lengths > 0)[:, None]
+                return (
+                    jnp.where(live[..., None], out.astype(jnp.float32), 0),
+                    jnp.where(live, lse.astype(jnp.float32), -jnp.inf),
+                )
+
+            # Every request at most max_query_len rows, and none past the
+            # request slots the union path covers.
+            covered = union_request_slots(len(query), len(starts) - 1, max_query_len)
+            # Traced once per program: shows which decode programs hold the route.
+            logger.info_once(
+                "QSA decode RPA union: %d-token tile, %d rows, %d request slots, "
+                "%d covered, own lists %s",
+                envs.VLLM_TPU_QSA_DECODE_RPA_UNION, len(query), len(starts) - 1,
+                covered, len(dcp) > 3 and bool(dcp[3]),
+            )
+            fits = jnp.all(starts[1:] - starts[:-1] <= max_query_len)
+            if covered < len(starts) - 1:
+                fits = fits & (starts[covered] == starts[-1])
+            operands = (query, gate, blocks, lengths, table, starts, cache, first)
+            if not _UNION_ROUTE:
+                out, lse = by_union(operands)
+                return out, lse, cache
+            out, lse = jax.lax.cond(fits, by_union, by_rows, operands)
+            return out, lse, cache
         output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
         return split(output, lengths, cache) if dcp is not None else (output, cache)
 

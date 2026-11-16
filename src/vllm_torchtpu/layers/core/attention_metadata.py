@@ -876,6 +876,8 @@ def stage_block_table_uploads(
         ctx.num_reqs,
         tuple(table_geom),
     )
+    if envs.VLLM_TPU_BLOCK_TABLE_STAGE_CHECK:
+        _check_last_staged_upload(runner)
     prev = runner.__dict__.get("_block_table_stage_prev")
     reused_key = None
     if (
@@ -903,8 +905,49 @@ def stage_block_table_uploads(
     )
 
 
+def _check_last_staged_upload(runner) -> None:
+    """VLLM_TPU_BLOCK_TABLE_STAGE_CHECK: compares the previous staged upload,
+    read back from the device, with the host copy it was made from."""
+    stats = runner.__dict__.setdefault(
+        "_block_table_stage_check_stats",
+        {"checks": 0, "bad_uploads": 0, "bad_entries": 0, "unfenced_packs": 0},
+    )
+    last = runner.__dict__.get("_block_table_stage_check_last")
+    if last is None:
+        return
+    runner._block_table_stage_check_last = None
+    host, dev = last
+    bad = int((dev.cpu() != host).sum())
+    stats["checks"] += 1
+    stats["bad_uploads"] += bad > 0
+    stats["bad_entries"] += bad
+    if stats["checks"] % envs.VLLM_TPU_BLOCK_TABLE_STAGE_CHECK == 0 or (
+        bad and stats["bad_uploads"] <= 20
+    ):
+        logger.info(
+            "BLOCK_TABLE_STAGE_CHECK checks=%d bad_uploads=%d bad_entries=%d "
+            "unfenced_packs=%d last_bad=%d entries=%d",
+            stats["checks"],
+            stats["bad_uploads"],
+            stats["bad_entries"],
+            stats["unfenced_packs"],
+            bad,
+            host.numel(),
+        )
+
+
 def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_key):
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
+    # The runner records its input staging fence just before dispatching the
+    # forward and waits on it at the start of the next input preparation, so
+    # a walk that packs while it is pending (the drafter's) runs while this
+    # step's upload from the shared scratch may still be reading it.
+    unfenced = runner.__dict__.get("_input_staging_fence") is not None
+    if envs.VLLM_TPU_BLOCK_TABLE_STAGE_CHECK and unfenced:
+        runner.__dict__.setdefault(
+            "_block_table_stage_check_stats",
+            {"checks": 0, "bad_uploads": 0, "bad_entries": 0, "unfenced_packs": 0},
+        )["unfenced_packs"] += 1
     if (
         envs.VLLM_TPU_BLOCK_TABLE_PACK_DELTA
         and ctx.position_ids_override is None
@@ -924,10 +967,15 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
         runner._block_table_stage_prev = (table_geom, None, staged_dev, stage_key)
         return staged_dev
     runner.__dict__.pop("_block_table_pack_delta", None)
-    # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
-    # drains, so a later chunk or draft walk must not refill a shared scratch
-    # (see `stage_h2d_upload`).
-    flat = zeros_h2d_source(runner, total)
+    if unfenced and envs.VLLM_TPU_UNFENCED_UPLOAD_PRIVATE:
+        # One-off unpooled buffer; `stage_h2d_upload` keeps it alive until the
+        # fence and then drops it.
+        flat = torch.zeros((total,), dtype=torch.int32, device="cpu")
+    else:
+        # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
+        # drains, so a later chunk or draft walk must not refill a shared
+        # scratch (see `stage_h2d_upload`).
+        flat = zeros_h2d_source(runner, total)
 
     if ctx.position_ids_override is None:
         offset = 0
@@ -960,6 +1008,8 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
     else:
         reused = False
         staged_dev = stage_h2d_upload(runner, flat)
+    if envs.VLLM_TPU_BLOCK_TABLE_STAGE_CHECK and ctx.position_ids_override is None:
+        runner._block_table_stage_check_last = (flat.clone(), staged_dev)
     if envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
         # Dummy runs (zero-filled) never key a reuse.
         key = stage_key if ctx.position_ids_override is None else None

@@ -57,3 +57,10 @@ class StreamIndexComponents:
     # With table_expansion and a KV block of whole entries: one DMA per entry
     # (its `expansion` kernel pages are consecutive) instead of one per page.
     coalesce_entries: bool = False
+    # With per_token_scores: the same per-token scores from a head-major q
+    # block, whole-vreg head sums and a key block read by `keys.read_block`.
+    dense_step: bool = False
+    # Fetch only the groups of this many kernel pages of a KV block that hold
+    # keys of its sequence (one sequence per tile; 0 fetches whole blocks).
+    # The skipped keys are masked.
+    tail_skip: int = 0

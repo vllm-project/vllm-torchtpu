@@ -19,7 +19,7 @@ which ``support_torch_compile`` cannot read.
 """
 
 import inspect
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import torch
 from torch import nn
@@ -29,6 +29,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.spec_decode.shard_argmax import greedy_draft_token
+from vllm_torchtpu.runner import greedy_top_tokens
 
 
 class MtpDraftModel(Protocol):
@@ -49,6 +50,7 @@ class _MtpFusedLoop(nn.Module):
         mtp: MtpDraftModel,
         num_steps: int,
         use_mk: bool = False,
+        top_tokens: bool = False,
     ) -> None:
         super().__init__()
         # Own compile-cache folder, as in MtpLoopStepModel.
@@ -56,6 +58,9 @@ class _MtpFusedLoop(nn.Module):
         self.mtp = mtp
         self.num_steps = num_steps
         self.use_mk = use_mk
+        # VLLM_TPU_DRAFT_TOP_TOKENS: each step's token is the vocabulary-parallel
+        # argmax of the MTP module's own LM head.
+        self.top_tokens = top_tokens
 
     def forward(
         self,
@@ -101,7 +106,12 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = greedy_draft_token(self.mtp, last_hidden)
+            if self.top_tokens:
+                input_ids = greedy_top_tokens.top_token_ids(
+                    cast(nn.Module, self.mtp), last_hidden
+                )
+            else:
+                input_ids = greedy_draft_token(self.mtp, last_hidden)
             tokens.append(input_ids)
         return tuple(tokens)
 
@@ -141,6 +151,27 @@ def mk_draft_compile_config(vllm_config: VllmConfig, inner: Any, rows_per_reques
     }
     object.__setattr__(cfg, "compilation_config", cc)
     return cfg, sizes
+class _MtpCheckFusedLoop(_MtpFusedLoop):
+    """The VLLM_TPU_MTP_DRAFT_CHECK reference copy. Its own ``forward``
+    gives it its own AOT artifact key (the forward's qualified name)."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        seq_lens: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        return super().forward(
+            input_ids,
+            positions,
+            hidden_states,
+            seq_lens,
+            intermediate_tensors,
+            inputs_embeds,
+        )
 
 
 def build_mtp_fused_loop(
@@ -151,6 +182,8 @@ def build_mtp_fused_loop(
     num_steps: int,
     dynamic_arg_dims: dict,
     use_mk: bool = False,
+    top_tokens: bool = False,
+    reference: bool = False,
 ) -> nn.Module:
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
@@ -160,12 +193,19 @@ def build_mtp_fused_loop(
     # reject the loop, which then silently falls back to per-step dispatch.
     loop_args = inspect.signature(_MtpFusedLoop.forward).parameters
     dims = {k: v for k, v in dict(dynamic_arg_dims).items() if k in loop_args}
+    base = _MtpCheckFusedLoop if reference else _MtpFusedLoop
     cls = support_torch_compile(dynamic_arg_dims=dims)(
-        type("MtpFusedLoop", (_MtpFusedLoop,), {})
+        type("MtpFusedLoop", (base,), {})
     )
     with set_current_vllm_config(vllm_config):
-        return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps,
-                   use_mk=use_mk)
+        return cls(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            mtp=mtp,
+            num_steps=num_steps,
+            use_mk=use_mk,
+            top_tokens=top_tokens,
+        )
 
 
 class _MkDraftStep0(nn.Module):

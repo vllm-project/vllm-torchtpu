@@ -7,6 +7,10 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.qwen4_exp.history_rows import (
+    gather_history_rows,
+    history_row_kernel_enabled,
+)
 
 
 def compact_rows(table, ids, *, head_dim: int):
@@ -143,6 +147,14 @@ def short_conv(
     # VLLM_TPU_PLE_CONV_HISTORY_FAST: request-owned history starts at packed
     # position zero, so taps read history only for each request's first rows.
     fast_history = request_owned_history and envs.VLLM_TPU_PLE_CONV_HISTORY_FAST
+    row_kernel = history_row_kernel_enabled()
+
+    def history_at(slot, pos):
+        # history[slot, pos] for in-range slot and pos, broadcast together.
+        if row_kernel:
+            return gather_history_rows(history, slot * state_len + pos)
+        return history[slot, pos]
+
     accum = jnp.zeros((token_count, channels), jnp.float32)
     for tap in range(weight.shape[-1]):
         distance = state_len - tap * dilation
@@ -161,7 +173,7 @@ def short_conv(
             # O(R*distance*C) elements instead of one history row per token.
             # Inactive scatter destinations are out of bounds and dropped.
             offsets = jnp.arange(distance, dtype=jnp.int32)
-            past = history[safe_slots[:, None], state_len - distance + offsets]
+            past = history_at(safe_slots[:, None], state_len - distance + offsets)
             past = jnp.where(has_initial_states[:, None, None], past, 0)
             destinations = starts[:-1, None] + offsets
             lengths = starts[1:] - starts[:-1]
@@ -174,9 +186,9 @@ def short_conv(
         else:
             # A one-tap convolution has no historical state and only distance 0.
             past = (
-                history[
+                history_at(
                     safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1)
-                ]
+                )
                 if state_len
                 else jnp.zeros_like(x)
             )
@@ -192,9 +204,9 @@ def short_conv(
 
     lengths = starts[1:] - starts[:-1]
     positions = lengths[:, None] - state_len + jnp.arange(state_len)[None, :]
-    past = history[
+    past = history_at(
         safe_slots[:, None], jnp.clip(positions + state_len, 0, state_len - 1)
-    ]
+    )
     past = jnp.where(has_initial_states[:, None, None], past, 0)
     current = x[jnp.clip(starts[:-1, None] + positions, 0, token_count - 1)]
     updated = jnp.where((positions >= 0)[..., None], current, past)

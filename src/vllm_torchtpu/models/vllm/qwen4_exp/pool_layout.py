@@ -252,6 +252,7 @@ def pooled_cache_specs(
     split_compressed: bool | None = None,
     draft_prefix_cacheable: bool | None = None,
     inrow_compressed: bool | None = None,
+    pack_main: bool | None = None,
 ):
     """Derive uniform physical pages without widening compressed-key coverage.
 
@@ -283,10 +284,12 @@ def pooled_cache_specs(
     KV keep ``B``, so prefix hashing and the draft are unchanged.
     ``VLLM_TPU_QSA_MTP_KV_DCP`` gives the draft's main KV groups ``2 * B`` too.
     """
-    # ``tp`` / ``main_dcp`` / ``pack_compressed`` / ``draft_prefix_cacheable``
-    # describe another engine (a PD peer's geometry, pd_staging); by default
-    # this engine's (config.native_cache_specs).
+    # ``tp`` / ``main_dcp`` / ``pack_compressed`` / ``pack_main`` /
+    # ``draft_prefix_cacheable`` describe another engine (a PD peer's
+    # geometry, pd_staging); by default this engine's (config.native_cache_specs).
     tp = cfg.parallel_config.tensor_parallel_size if tp is None else tp
+    if pack_main is None:
+        pack_main = pack_main_kv_enabled()
     specs = native_cache_specs(cfg, tp, draft_prefix_cacheable=draft_prefix_cacheable)
     text = cfg.model_config.hf_text_config
     main: Any = specs[
@@ -336,7 +339,7 @@ def pooled_cache_specs(
             for env, on in (
                 (MERGE_COMPRESSED_K_ENV, merged),
                 (PACK_COMPRESSED_K_ENV, pack_compressed),
-                (PACK_MAIN_KV_ENV, pack_main_kv_enabled()),
+                (PACK_MAIN_KV_ENV, pack_main),
             )
             if on
         ]
@@ -354,7 +357,7 @@ def pooled_cache_specs(
             raise ValueError("a compressed key must fit half a main-KV row")
         packed_slots = 1
     if merged:
-        if pack_compressed or pack_main_kv_enabled():
+        if pack_compressed or pack_main:
             raise ValueError(
                 f"{MERGE_COMPRESSED_K_ENV}=1 replaces {PACK_COMPRESSED_K_ENV} and "
                 f"is not combined with {PACK_MAIN_KV_ENV}"
@@ -383,7 +386,7 @@ def pooled_cache_specs(
     else:
         packed_slots = 1
     main_owners: list[tuple[str, str, int]] = []
-    if pack_main_kv_enabled():
+    if pack_main:
         packing = 4 if main.dtype == torch.float8_e4m3fn else 2
         if main.num_kv_heads != 1 or packing * main.num_head_slots != 4:
             raise ValueError(

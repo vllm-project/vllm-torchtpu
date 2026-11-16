@@ -277,3 +277,28 @@ def test_decode_rpa_reads_second_layer_through_head_offset(interpret, monkeypatc
     # The second layer presents two KV heads and three leading zero queries.
     assert calls[-1] == ((batch, 6, WIDTH), (batch, 2, WIDTH))
     assert calls[0] == ((batch, 3, WIDTH), (batch, 1, WIDTH))
+
+
+def test_pad_rows_to_tile_schedules_nothing_for_padded_rows():
+    """VLLM_TPU_QSA_PAIRED_MAIN_PAD_TILE: the rows added to reach a whole
+    128-row tile are invalid and address the null page, so the paired
+    writer's per-row DMAs (each gated on its valid bit) skip them and the
+    padded tile never takes the bulk path."""
+    rng = np.random.default_rng(3)
+    tokens, tile = 96, 128
+    rows = rows_for(rng, tokens)
+    valid = jnp.asarray(rng.random(tokens) < 0.75)
+    page = jnp.where(valid, jnp.asarray(rng.integers(0, PAGES, tokens)), PAGES)
+    offsets = jnp.asarray(rng.integers(0, PAGE_TOKENS, tokens), jnp.int32)
+    out = pooled_qsa.pad_rows_to_tile(rows, page, offsets, valid, tile, PAGES)
+    p_rows, p_page, p_offsets, p_valid = (np.asarray(x) for x in out)
+    assert len(p_rows) == len(p_page) == len(p_offsets) == len(p_valid) == tile
+    np.testing.assert_array_equal(raw(out[0][:tokens]), raw(rows))
+    np.testing.assert_array_equal(p_page[:tokens], np.asarray(page))
+    np.testing.assert_array_equal(p_valid[:tokens], np.asarray(valid))
+    assert not p_valid[tokens:].any()
+    assert (p_page[tokens:] == PAGES).all()
+    assert p_valid.sum() == np.asarray(valid).sum()
+    # A step already a whole number of tiles passes through unchanged.
+    same = pooled_qsa.pad_rows_to_tile(out[0], out[1], out[2], out[3], tile, PAGES)
+    assert all(a is b for a, b in zip(same, out))

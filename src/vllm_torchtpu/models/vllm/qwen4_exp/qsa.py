@@ -381,6 +381,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         # rank pairs sharing a KV head; the MTP draft keeps whole pages unless
         # VLLM_TPU_QSA_MTP_KV_DCP splits it the same way.
         self.main_kv_dcp = 1
+        # VLLM_TPU_QSA_DCP_MERGE: the proj merge (with VLLM_TPU_QSA_DCP_MERGE_CHECK
+        # a `_merge_check` buffer instead), and whether the MTP draft's ops are
+        # the DCP ones.
+        self._proj_merge = False
+        # VLLM_TPU_QSA_DCP_LOCAL_QGATE: the group's q/gate projected locally
+        # (``q_proj_group_weight``) on the DCP merge paths.
+        self._group_qgate = False
+        self._draft_dcp = False
         # Prefill context parallelism: every rank of a PCP group runs the
         # step's tokens and heads, and the group splits main KV by token like
         # main-KV DCP, in units of pcp_interleave() tokens (pool_layout).
@@ -408,6 +416,36 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 torch.full((1,), tp_rank % dcp, dtype=torch.int32, device=device),
                 persistent=False,
             )
+            if envs.VLLM_TPU_QSA_DCP_LOCAL_QGATE:
+                # The q_proj rows of the DCP group's TP ranks (dcp * (tp_rank //
+                # dcp) onward, heads in group-rank order), filled by load_weights.
+                self._group_qgate = True
+                self.register_buffer(
+                    "q_proj_group_weight",
+                    torch.empty(
+                        (dcp * 2 * self.num_heads * self.head_dim, self.hidden_size),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                    persistent=False,
+                )
+            if envs.VLLM_TPU_QSA_DCP_MERGE_CHECK:
+                from .dcp_merge_check import register
+
+                register(self, device)
+            elif envs.VLLM_TPU_QSA_DCP_MERGE == "proj":
+                # The o_proj columns of the DCP group's heads (TP ranks
+                # dcp * (tp_rank // dcp) onward), filled by load_weights.
+                self._proj_merge = True
+                self.register_buffer(
+                    "o_proj_group_weight",
+                    torch.empty(
+                        (self.hidden_size, dcp * self.num_heads * self.head_dim),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                    persistent=False,
+                )
         # VLLM_TPU_QSA_DECODE_TOKEN_SHARD: the replicated backbone's indexer
         # token-sharded over the DCP pairs (the target's compressed-DCP layers).
         self.decode_token_shard = bool(
@@ -568,6 +606,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 partial(build_pooled_qsa_shared_op(False), **keywords),
                 partial(build_pooled_qsa_shared_op(True), **keywords),
             )
+        # VLLM_TPU_MTP_DRAFT_SKIP_INDEXER_WRITES: the shared ops without this
+        # layer's compressed-key, ring and tag writes (only its own indexer
+        # reads them). Built for the DCP draft ops below.
+        self._shared_skip_ops = None
         # The select op (`select_for_kernel`) is built here, outside the traced
         # forward (jax_op inspects the step signature, which Dynamo cannot trace),
         # and only when the megakernel is enabled: default serving never
@@ -613,6 +655,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._dcp_op = None
         self._token_shard_dcp_op = None
         self._decode_token_shard_dcp_op = None
+        # The pair-merge ops (not the PCP one) take `global_selection`.
+        self._compressed_dcp = False
         if self.pcp > 1:
             from vllm_torchtpu.distributed.pcp import get_pcp_group
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -692,6 +736,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 self._rows_op = draft(False, True)
                 if self._shared_ops is not None:
                     self._shared_ops = (draft(True, False), draft(True, True))
+                    if envs.VLLM_TPU_MTP_DRAFT_SKIP_INDEXER_WRITES:
+                        self._shared_skip_ops = tuple(
+                            partial(op, indexer_writes=False)
+                            for op in self._shared_ops
+                        )
+                self._draft_dcp = True
             if getattr(self, "token_shard", False) or getattr(
                 self, "replicated_token_shard", False
             ):
@@ -871,12 +921,20 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             with torch.no_grad():
                 if name in ("q_proj.weight", "k_proj.weight", "v_proj.weight"):
                     cast(BasevLLMParameter, parameter).weight_loader(parameter, weight)
+                    if name == "q_proj.weight" and self._group_qgate:
+                        span = self.main_kv_dcp * 2 * self.num_heads * self.head_dim
+                        first = self.tp_rank // self.main_kv_dcp * span
+                        self.q_proj_group_weight.copy_(weight[first : first + span])
                 elif name == "o_proj.weight":
                     width = self.num_heads * self.head_dim
                     self.o_proj.weight_loader(
                         parameter,
                         weight[:, self.tp_rank * width : (self.tp_rank + 1) * width],
                     )
+                    if self._proj_merge:
+                        span = self.main_kv_dcp * width
+                        first = self.tp_rank // self.main_kv_dcp * span
+                        self.o_proj_group_weight.copy_(weight[:, first : first + span])
                 else:
                     parameter.copy_(weight)
             loaded.add(name)
@@ -927,8 +985,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             shared,
             decode_token_shard,
             write_sink,
+            project_shares=getattr(self, "_proj_merge", False),
         )
-        output = self.o_proj(output)
+        if getattr(self, "_proj_merge", False):
+            # This rank's share of every group head; the TP sum below (or the
+            # caller's) adds the group's shares.
+            output = torch.nn.functional.linear(output, self.o_proj_group_weight)
+        else:
+            output = self.o_proj(output)
         if reduce and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output, selected
@@ -948,13 +1012,25 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         shared=None,
         decode_token_shard=False,
         write_sink=True,
+        project_shares=False,
     ):
         """``forward_with_indices`` without the output projection and all-reduce.
 
         ``shared`` (pooled, VLLM_TPU_QSA_DRAFT_SHARED_SELECTION): another QSA
         layer's ``selected`` for the attended rows (one per ``rows`` entry);
         it replaces this layer's indexer selection.
+
+        ``project_shares`` (VLLM_TPU_QSA_DCP_MERGE=proj, from
+        ``forward_with_indices`` only): the output is this rank's share of all
+        the DCP group's heads, for ``o_proj_group_weight``.
         """
+        proj_merge = getattr(self, "_proj_merge", False)
+        draft_dcp = getattr(self, "_draft_dcp", False)
+        if proj_merge and not project_shares:
+            raise NotImplementedError(
+                "VLLM_TPU_QSA_DCP_MERGE=proj returns per-rank shares of the group's "
+                "heads; only forward_with_indices projects them"
+            )
         assert len(self.cache_owners) == (1 if self.pooled else 4), (
             "Task4 must bind real or profiling scratch QSA owners"
         )
@@ -976,6 +1052,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
         pick_rows = rows is not None and not self.pooled
         op = self._op if rows is None or pick_rows else self._rows_op
+        # Whether `op` merges over the DCP group (_dcp_finish).
+        dcp_merge = not (rows is None or pick_rows) and draft_dcp
         if (
             self.pooled
             and getattr(self, "_shard_op", None) is not None
@@ -983,10 +1061,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         ):
             # The TP-sharded indexer; it also takes an optional rows operand.
             op = self._shard_op
+            dcp_merge = False
         token_shard_op = getattr(self, "_token_shard_op", None)
         if token_shard and rows is None and token_shard_op is not None:
             # Takes precedence over the key-sharded indexer in this graph.
             op = partial(token_shard_op, shard_index=self.token_shard_index)
+            dcp_merge = False
         if getattr(self, "_dcp_op", None) is not None and rows is None:
             # VLLM_TPU_QSA_MAIN_KV_DCP: this rank's main-KV rows, pair-combined.
             if token_shard and self._token_shard_dcp_op is not None:
@@ -1004,6 +1084,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 )
             else:
                 op = partial(self._dcp_op, dcp_rank=self.dcp_rank)
+            if getattr(self, "_compressed_dcp", False) and (
+                getattr(self, "_selection_sink", None) is not None
+            ):
+                # The MTP draft attends this layer's selection
+                # (bind_shared_selection): keep it whole under
+                # VLLM_TPU_QSA_COMPRESSED_DCP_LOCAL_MERGE.
+                op = partial(op, global_selection=True)
+            dcp_merge = True
         shared_ops = getattr(self, "_shared_ops", None)
         source = getattr(self, "_selection_source", None)
         if shared is None and source is not None and shared_ops is not None:
@@ -1020,9 +1108,27 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         use_shared = shared is not None and shared_ops is not None and not pick_rows
         if use_shared:
             op = shared_ops[rows is not None]
+            dcp_merge = draft_dcp
+            skip_ops = getattr(self, "_shared_skip_ops", None)
+            # Read while tracing: the MTP proposer's reference programs
+            # (VLLM_TPU_MTP_DRAFT_CHECK) are traced with it False.
+            if skip_ops is not None and getattr(self, "skip_indexer_writes", True):
+                op = skip_ops[rows is not None]
+        merge_check = getattr(self, "_merge_check", None)
+        group_qgate = dcp_merge and getattr(self, "_group_qgate", False)
+        # Under VLLM_TPU_QSA_DCP_MERGE_CHECK the op all-gathers as usual and
+        # compares the locally projected group q/gate with it.
+        qgate_check = group_qgate and merge_check is not None
+        group_qgate = group_qgate and not qgate_check
+        if project_shares and not dcp_merge:
+            raise NotImplementedError("VLLM_TPU_QSA_DCP_MERGE=proj on a path without the DCP merge")
         assert op is not None
         output, selected = op(
-            self.q_proj(hidden),
+            (
+                torch.nn.functional.linear(hidden, self.q_proj_group_weight)
+                if group_qgate
+                else self.q_proj(hidden)
+            ),
             self.k_proj(hidden),
             self.v_proj(hidden),
             self.indexer.index_qk_proj(hidden),
@@ -1045,6 +1151,17 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 if self.fp8_kv
                 else {}
             ),
+            **(
+                {"merge_check": merge_check}
+                if dcp_merge and merge_check is not None
+                else {}
+            ),
+            **({"group_qgate": True} if group_qgate else {}),
+            **(
+                {"qgate_check": torch.nn.functional.linear(hidden, self.q_proj_group_weight)}
+                if qgate_check
+                else {}
+            ),
         )
         if rows is None and getattr(self, "_union_probe_selected", None) is not None:
             # VLLM_TPU_QSA_PREFILL_UNION_PROBE (debug, log-only): copies only.
@@ -1061,13 +1178,19 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         return output, selected
 
     def write_selection_sink(self, selected):
-        """The target's selection of a whole step for the MTP draft
-        (bind_shared_selection); nothing without a draft bound."""
+        """The selection of a whole step: the target's for the MTP draft
+        (bind_shared_selection) and VLLM_TPU_QSA_SEL_DUMP's debug copy;
+        nothing when neither is bound."""
         sink = getattr(self, "_selection_sink", None)
         if sink is not None:
             # Both writes go through the donating row update: a slice copy_
             # into the buffer copied all of it every step (~42 us at 8192 rows).
             update_rows_(sink, selected)
+        dump = getattr(self, "_selection_dump", None)
+        if dump is not None:
+            # VLLM_TPU_QSA_SEL_DUMP (debug): this layer's selection for the
+            # runner to save on sampled steps (selection_dump.py).
+            update_rows_(dump, selected[: dump.shape[0]])
 
     def select_for_kernel(self, hidden, positions, metadata: QSAMetadata):
         """Cache writes and the indexer only; the attention runs in the Qwen3.8

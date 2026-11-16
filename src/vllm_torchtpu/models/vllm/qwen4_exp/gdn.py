@@ -87,6 +87,8 @@ class Qwen4ExpGatedDeltaNetAttention(VllmGatedDeltaNetAttention):
     # The pooled op may receive the whole in_proj_qkvz output
     # (VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ); _prepare_pooled_gdn_input narrows it.
     pooled_qkvz_input = True
+    # config.validate_gdn_window_log admits it on a staged MTP decode.
+    window_log_supported = True
 
     def _prepare_pooled_gdn_input(
         self,

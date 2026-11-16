@@ -39,10 +39,16 @@ class SparseCoreTopK:
 
     ``bounded_copy`` copies only each row's live prefix of the score buffer
     (see ``sparsecore_topk``); same winners.
+
+    ``inline`` traces ``sparsecore_topk`` into the caller's computation instead
+    of a nested jit. XLA legalizes scheduling groups before it inlines nested
+    calls and drops a group whose members sit in different computations, so a
+    group pairing the top-k with the caller's ops needs it.
     """
 
     overlaps_scoring: ClassVar[bool] = True
     bounded_copy: bool = False
+    inline: bool = False
 
     def select(
         self,
@@ -53,7 +59,8 @@ class SparseCoreTopK:
         scheduling_group_id: int | None,
         return_scores: bool,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
-        return sparsecore_topk(
+        select = sparsecore_topk.__wrapped__ if self.inline else sparsecore_topk
+        return select(
             score_bits,
             k,
             row_lengths=row_lengths,

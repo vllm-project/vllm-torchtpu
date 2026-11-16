@@ -310,6 +310,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "USE_PHASED_PROFILER",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.
+    # TPU_RAIDEN_ADVERTISE_HOST is the pod IP in the P/D recipes, so hashing it
+    # gives every pod its own cache directory and no archive ever loads.
+    "TPU_RAIDEN_ADVERTISE_HOST",
     "TPU_RAIDEN_CONTROLLER_ADDRESS",
     "TPU_RAIDEN_ENGINE_ID",
     "TPU_RAIDEN_JOB_NAME",
@@ -344,6 +347,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_POOL_STAGING_LEASES",
     # Host staging arena size on a Qwen PD producer (host memory only).
     "QWEN4_EXP_PD_STAGING_LEASES",
+    # Which host buffer an unfenced upload copies from, and the staged
+    # block-table readback check: host-side only.
+    "VLLM_TPU_UNFENCED_UPLOAD_PRIVATE",
+    "VLLM_TPU_BLOCK_TABLE_STAGE_CHECK",
+    "VLLM_TPU_TOKEN_STORE_UPLOAD_COPY",
+    "VLLM_TPU_TOKEN_STORE_CHECK",
     # When a staged Qwen PD decode runs its (unchanged) repack program.
     "QWEN4_EXP_PD_SYNC_REPACK",
     "QWEN4_EXP_PD_SYNC_REPACK_AB_S",
@@ -359,12 +368,44 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Where a staged decode's compressed keys land (once per host, then a
     # landing all-gather): adds shape-keyed landing programs, changes none.
     "QWEN4_EXP_PD_SHARED_COMPRESSED",
+    # A staged decode's read-back check of split compressed keys: adds one
+    # shape-keyed read program, changes none.
+    "QWEN4_EXP_PD_VERIFY_SPLIT_KEYS",
     # Host-side Stage-3 admission collectives (same decisions; q38 D-MK).
     "QWEN4_EXP_PD_BATCHED_ADMISSION",
     "QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES",
     "QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK",
+    # Host-side staged admission and repack indices (same pages and rows);
+    # its one-upload repack programs are keyed by their own graphs.
+    "QWEN4_EXP_PD_FAST_ADMIT",
+    # Stage-3 load submit after the forward dispatch (same submits).
+    "QWEN4_EXP_PD_DEFER_LOAD_SUBMIT",
     # Per-step host phase logging (runner/host_phases.py).
     "VLLM_TPU_HOST_PHASES",
+    # Last pipeline stage replies from the output thread (host only;
+    # runner/pp_last_async_output.py).
+    "VLLM_TPU_PP_LAST_ASYNC_OUTPUT",
+    # Engine-core KV cache bookkeeping shortcut (core/kv_decode_fast_path.py).
+    "VLLM_TPU_KV_DECODE_FAST_PATH",
+    # Engine-core cap on remote KV loads started a pass (core/kv_load_pacing.py).
+    "VLLM_TPU_KV_LOAD_STARTS_PER_STEP",
+    # New-request prompt arrays (core/prompt_token_array.py).
+    "VLLM_TPU_PROMPT_TOKEN_ARRAY",
+    # Garbage collections at waits (runner/gc_at_waits.py).
+    "VLLM_TPU_GC_AT_WAITS",
+    # API-server reasoning-token count (reasoning_count.py).
+    "VLLM_TPU_REASONING_COUNT_FAST",
+    # Engine-core gen2 collection policy (runner/gc_at_waits.py).
+    "VLLM_TPU_GC_FREEZE",
+    "VLLM_TPU_GC_UNTRACK_TOKEN_LISTS",
+    "VLLM_TPU_GC_GEN2_THRESHOLD",
+    "VLLM_TPU_GC_GEN2_PERIOD_S",
+    "VLLM_TPU_GC_CENSUS",
+    # Host timeline and py-spy windows (runner/host_admit_probe.py).
+    "VLLM_TPU_HOSTADMIT_PROBE",
+    "VLLM_TPU_HOSTADMIT_PYSPY",
+    "VLLM_TPU_HOSTADMIT_PYSPY_RANKS",
+    "VLLM_TPU_HOSTADMIT_EVENTS",
     # Per-step token-bucket counts (runner/step_buckets.py).
     "VLLM_TPU_LOG_STEP_BUCKETS",
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
@@ -395,6 +436,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # The chunk scheduler's spread (engine side): it changes which buckets
     # steps use, not the compiled programs.
     "TPU_PP_SPREAD_MAX_PREFIX",
+    # The chunk scheduler's waiting order (engine side): it changes which
+    # requests a step carries, not the compiled programs.
+    "TPU_PP_WARM_FIRST",
+    "TPU_PP_WARM_FIRST_AGING",
+    "TPU_PP_WARM_FIRST_TIER",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -418,11 +464,18 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+    "VLLM_TPU_OFFLOAD_TIER_CLASSES",
+    "VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO",
+    "VLLM_TPU_OFFLOAD_TIER_CHECK",
+    "VLLM_TPU_OFFLOAD_TIER_KEY_ROWS",
     # Scheduler prefix-cache hit length only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     # Scheduler prefix-cache block lifetime only.
     "VLLM_TPU_MAMBA_CHECKPOINT_RETENTION",
     "VLLM_TPU_MAMBA_DECODE_CHECKPOINT",
+    "VLLM_TPU_MAMBA_PIN_HIT_CHECKPOINT",
+    # Scheduler-side lookup log only.
+    "VLLM_TPU_PREFIX_LOOKUP_LOG",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",

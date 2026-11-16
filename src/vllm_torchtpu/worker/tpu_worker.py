@@ -86,6 +86,15 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu.distributed.pp_push import widen_message_rings
 
         widen_message_rings(vllm_config)
+        if (
+            envs.VLLM_TPU_PP_LAST_ASYNC_OUTPUT
+            and vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            from vllm_torchtpu.runner.pp_last_async_output import (
+                install_worker_output_thread,
+            )
+
+            install_worker_output_thread()
 
         super().__init__(
             vllm_config=vllm_config,

@@ -122,7 +122,7 @@ def rowwise_attention(monkeypatch):
             jnp.zeros((len(ids), tag_elements), jnp.int32),
         )
 
-    def write_compressed(pool, completed, complete, req, logical, *args):
+    def write_compressed(pool, completed, complete, req, logical, *args, **_):
         value = jnp.sum(jnp.where(complete[:, None], completed, 0))
         return pool.at[11, 0].set(value.astype(pool.dtype))
 

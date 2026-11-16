@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -27,6 +29,7 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    slot_rows: "GdnSlotRows | None" = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing multiple sequences per tile.
 
@@ -57,8 +60,12 @@ def compute_batched_seq_metadata(
         p_id_is_first_tile=is_valid_seqs,
         p_id_is_last_tile=is_valid_seqs,
         s_idx_has_initial_state=has_initial_state,
-        s_idx_to_state_indices=state_indices,
-        s_idx_to_read_offset=read_offsets,
+        s_idx_to_state_indices=(
+            state_indices if slot_rows is None else slot_rows.rows(slot_rows.state_indices)
+        ),
+        s_idx_to_read_offset=(
+            read_offsets if slot_rows is None else slot_rows.rows(slot_rows.read_offsets)
+        ),
         s_idx_to_ckpt_indices=ckpt_indices,
     )
 
@@ -101,6 +108,31 @@ def per_seq_tile_slots(cfg: config.GDNConfig, max_seqs: int, tile_sized: bool) -
     return min(cfg.batch_size, pl.cdiv(cfg.batch_size, cfg.chunk_size) + max_seqs + 2)
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class GdnSlotRows:
+    """Per-sequence state indices and read offsets of every GDN layer of the
+    step, [layers, num_seqs] each, and this layer's row (int32 [1]). Every
+    layer passes the same stacks, so their glue (the read-offset gather, the
+    PER_SEQ roll, the SMEM operand copies) is one computation a step."""
+
+    state_indices: jax.Array
+    read_offsets: jax.Array
+    row: jax.Array
+
+    def rows(self, stacked: jax.Array) -> memory_ref.SlotRows:
+        return memory_ref.SlotRows(
+            stacked.reshape(-1).astype(jnp.int32), self.row, stacked.shape[-1]
+        )
+
+    def rolled(self, shift) -> "GdnSlotRows":
+        return GdnSlotRows(
+            jnp.roll(self.state_indices, shift=shift, axis=1),
+            jnp.roll(self.read_offsets, shift=shift, axis=1),
+            self.row,
+        )
+
+
 def compute_per_seq_metadata(
     cfg: config.GDNConfig,
     seq_lens: jax.Array,
@@ -113,6 +145,7 @@ def compute_per_seq_metadata(
     prerolled: bool = False,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
     tile_sized: bool = False,
+    slot_rows: GdnSlotRows | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -150,6 +183,10 @@ def compute_per_seq_metadata(
                 ckpt_indices,
             )
         )
+    # `slot_rows` is never prerolled: `prerolled` covers
+    # only the per-sequence inputs above.
+    if slot_rows is not None:
+        slot_rows = slot_rows.rolled(-start_seq)
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -223,8 +260,12 @@ def compute_per_seq_metadata(
         p_id_is_first_tile=p_id_is_first_tile,
         p_id_is_last_tile=p_id_is_last_tile,
         s_idx_has_initial_state=has_initial_state,
-        s_idx_to_state_indices=state_indices,
-        s_idx_to_read_offset=read_offsets,
+        s_idx_to_state_indices=(
+            state_indices if slot_rows is None else slot_rows.rows(slot_rows.state_indices)
+        ),
+        s_idx_to_read_offset=(
+            read_offsets if slot_rows is None else slot_rows.rows(slot_rows.read_offsets)
+        ),
         s_idx_to_ckpt_indices=ckpt_indices,
         p_id_to_state_override=p_id_to_state_override,
     )

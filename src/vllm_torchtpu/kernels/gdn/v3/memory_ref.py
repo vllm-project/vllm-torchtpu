@@ -68,6 +68,23 @@ class SmemWrapper:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class SlotRows:
+    """One layer's row of a per-sequence array stacked for every layer.
+
+    `data` is the [layers * width] stack, `row` an int32 [1] naming the row,
+    so every layer's call passes the same stack and indexes its own row.
+    """
+
+    data: Any
+    row: Any
+    width: int = dataclasses.field(metadata=dict(static=True))
+
+    def __getitem__(self, idx):
+        return self.data[self.row[0] * self.width + idx]
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class MetadataRef:
     num_tiles: Any
     p_id_to_s_idx: SmemWrapper
@@ -212,6 +229,12 @@ def qkv_2d_rows(
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class InBufferedRef(BaseBufferedRef):
+    # (first lane, lanes) of a [tokens, 1, cols] source this ref streams, for
+    # two inputs packed into one array (GDNConfig.ba_packed); None: all.
+    lanes: tuple[int, int] | None = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
+
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -237,11 +260,12 @@ class InBufferedRef(BaseBufferedRef):
                 ).start()
             return
 
+        lanes = () if self.lanes is None else (slice(None), pl.ds(*self.lanes))
         for idx in range(self.cfg.seq_tile_size):
             r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
             dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             pltpu.make_async_copy(
-                src_ref.at[pl.ds(r_base, dma_size)],
+                src_ref.at[(pl.ds(r_base, dma_size),) + lanes],
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
             ).start()
@@ -545,8 +569,12 @@ class ExternalStateInBufferedRef(StateInBufferedRef):
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             nblocks = jnp.where(should_read, self.region.nblocks, 0)
 
-            # Resume from the checkpoint of the last accepted token.
-            read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
+            # Resume from the checkpoint of the last accepted token. In LOG
+            # mode that is checkpoint 0 plus logged updates applied on load.
+            if self.cfg.is_window_log:
+                read_ckpt = 0
+            else:
+                read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
             state_idx = self._ckpt_state_idx(s_idx, read_ckpt)
 
             pltpu.make_async_copy(
@@ -688,9 +716,9 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
             # windowed sequences; the clamp is for PER_SEQ tiles, which
             # hold many tokens but keep only the final state.
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+            num_ckpts = jnp.minimum(r_size, self.cfg.state_out_positions)
 
-            for t in range(self.cfg.window_size):
+            for t in range(self.cfg.state_out_positions):
                 should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                 nblocks = jnp.where(should_write, self.region.nblocks, 0)
                 state_idx = self.metadata_ref.state_override(
@@ -714,7 +742,7 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+            num_ckpts = jnp.minimum(r_size, self.cfg.state_out_positions)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
         # Each checkpoint's copy covers one full region tile; wait for that
@@ -825,6 +853,15 @@ def create_allocs(
             )
             for ref in (b_ref, a_ref)
         )
+    elif cfg.ba_packed:
+        # One [tokens, 1, b lanes + a lanes] array carries both.
+        assert a_ref is None and b_ref.shape[-1] == b_shape[-1] + a_shape[-1]
+        b_alloc = in_buffered_partial(
+            spec=b_spec, dtype_or_type=b_ref, lanes=(0, b_shape[-1])
+        )
+        a_alloc = in_buffered_partial(
+            spec=a_spec, dtype_or_type=b_ref, lanes=(b_shape[-1], a_shape[-1])
+        )
     else:
         b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
         a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
@@ -923,13 +960,13 @@ def create_allocs(
             )
             conv_out_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_out_positions,
                 plan.conv.nblocks,
                 *conv_state_ref.shape[1:],
             )
             recurrent_out_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_out_positions,
                 plan.recurrent.nblocks,
                 *recurrent_state_ref.shape[1:],
             )
@@ -951,14 +988,14 @@ def create_allocs(
             )
             conv_out_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_out_positions,
                 plan.conv.nblocks,
                 plan.conv.nrows,
                 *payload,
             )
             recurrent_out_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_out_positions,
                 plan.recurrent.nblocks,
                 plan.recurrent.nrows,
                 *payload,
@@ -1012,3 +1049,54 @@ def create_allocs(
         conv_out_alloc,
         recurrent_out_alloc,
     )
+
+
+def create_log_allocs(
+    metadata_ref: MetadataRef,
+    state_source_ref: jax.Array,
+    cfg: config.GDNConfig,
+    *,
+    with_outputs: bool,
+) -> tuple[tuple[pltpu.BufferedRef, ...], tuple[pltpu.BufferedRef, ...]]:
+    """Buffered refs streaming the draft log of checkpoint block 0 (LOG mode).
+
+    Both log regions (`StateSourcePlan.log` and `.log_conv`) are read the
+    way the state regions are: one tile per sequence from checkpoint block
+    0, gated by first-tile and has_initial_state. With `with_outputs` (the
+    BATCHED kernel, which writes the log) each is also written back to
+    checkpoint block 0 once per valid sequence.
+
+    Returns:
+        (input allocs, output allocs), each ordered (log, log_conv).
+    """
+    plan = cfg.state_plan
+    assert cfg.is_window_log and plan is not None
+    assert plan.log is not None and plan.log_conv is not None
+    assert not plan.whole_block_dma
+    payload = state_source_ref.shape[2:]
+    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers, use_lookahead=False)
+    partial = dict(
+        buffer_count=pipeline_mode.buffer_count,
+        use_lookahead=pipeline_mode.use_lookahead,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+        stride=plan.stride,
+        dtype_or_type=state_source_ref,
+    )
+    in_allocs, out_allocs = [], []
+    for region in (plan.log, plan.log_conv):
+        shape = (cfg.seq_tile_size, 1, region.nblocks, region.nrows, *payload)
+        spec = pl.BlockSpec(
+            block_shape=shape,
+            memory_space=pltpu.VMEM,
+            index_map=lambda i: (i,),
+            pipeline_mode=pipeline_mode,
+        )
+        in_allocs.append(
+            ExternalStateInBufferedRef.input(spec=spec, region=region, **partial)
+        )
+        if with_outputs:
+            out_allocs.append(
+                ExternalStateOutBufferedRef.output(spec=spec, region=region, **partial)
+            )
+    return tuple(in_allocs), tuple(out_allocs)

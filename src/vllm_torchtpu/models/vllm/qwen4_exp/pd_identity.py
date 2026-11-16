@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -42,6 +43,9 @@ class LoadedWeightIdentity:
         self._budget = max(budget, 1) << 20
         self._inflight = 0
         self._cv = threading.Condition()
+        # Loader time spent on digests (hashing inline, or waiting for the
+        # pool), for the load timing log (model._LoadTimes).
+        self.wait_seconds = 0.0
 
     def _release(self, nbytes: int) -> None:
         with self._cv:
@@ -61,14 +65,18 @@ class LoadedWeightIdentity:
         self._names.add(name)
         meta = (str(tensor.dtype), tuple(tensor.shape))
         if self._pool is None:
+            start = time.perf_counter()
             self._records[name] = (*meta, _sha256(tensor))
+            self.wait_seconds += time.perf_counter() - start
             return
         nbytes = tensor.numel() * tensor.element_size()
+        start = time.perf_counter()
         with self._cv:
             # A tensor larger than the budget still goes once nothing else waits.
             while self._inflight and self._inflight + nbytes > self._budget:
                 self._cv.wait()
             self._inflight += nbytes
+        self.wait_seconds += time.perf_counter() - start
 
         def work(t=tensor, n=nbytes):
             try:
@@ -79,12 +87,14 @@ class LoadedWeightIdentity:
         self._pending[name] = (*meta, self._pool.submit(work))
 
     def _drain(self) -> None:
+        start = time.perf_counter()
         for name, (dtype, shape, fut) in self._pending.items():
             self._records[name] = (dtype, shape, fut.result())
         self._pending.clear()
         if self._pool is not None:
             self._pool.shutdown(wait=True)
             self._pool = None
+        self.wait_seconds += time.perf_counter() - start
 
     def observe(
         self, weights: Iterable[tuple[str, torch.Tensor]]

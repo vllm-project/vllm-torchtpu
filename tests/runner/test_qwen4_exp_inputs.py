@@ -453,3 +453,81 @@ def test_fused_prepare_inputs_matches_eager(
         # check: the live comparison agrees; fault (context - 1): it catches it.
         bad = int(a_fused._fused_check_bad)
         assert (bad == 0) if check == "check" else (bad > 0), bad
+
+
+def _store_adapter(host):
+    runner = NS(device="cpu", input_batch=NS(token_ids_cpu_tensor=host))
+    runner.model_config = NS(hf_text_config=q4exp_text_config())
+    runner.cache_config = NS(block_size=128)
+    runner.vllm_config = NS(
+        model_config=runner.model_config,
+        parallel_config=NS(pipeline_parallel_size=1),
+        speculative_config=None,
+    )
+    return Qwen4ExpAdapter(runner)
+
+
+def test_store_copy_gives_the_same_ngram_ids_and_survives_the_batch_rewrite(
+    monkeypatch,
+):
+    """VLLM_TPU_TOKEN_STORE_UPLOAD_COPY: over a multi-chunk prompt the n-gram
+    lookup gets the same ids from the copied store as from the batch tensor,
+    and a rewrite of the batch tensor after the upload leaves them alone."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", "", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_TOKEN_STORE_UPLOAD_COPY", True, raising=False)
+    gen = torch.Generator().manual_seed(0)
+    host = torch.randint(1000, 9000, (3, 9000), dtype=torch.int32, generator=gen)
+    adapter = _store_adapter(host)
+    rows = torch.arange(3)
+    for chunk in range(4):  # 2048-token chunks of an 8192-token prompt
+        context = torch.tensor([chunk * 2048, chunk * 2048 + 1, max(chunk * 2048 - 5, 0)])
+        store = adapter.begin_step()
+        assert store is not host
+        expected = ngram_context_from_store(host, rows, context, 248044, 3)
+        got = ngram_context_from_store(store, rows, context, 248044, 3)
+        assert torch.equal(got, expected)
+        before = got.clone()
+        host[:, : chunk * 2048 + 2048] = -1  # the next step's _update_states
+        assert torch.equal(ngram_context_from_store(store, rows, context, 248044, 3), before)
+        host.copy_(torch.randint(1000, 9000, host.shape, dtype=torch.int32, generator=gen))
+    # Two host copies, used in turn.
+    copies = adapter._token_store_copies
+    assert copies[0] is not copies[1]
+    assert adapter.begin_step() is copies[0]
+    assert adapter.begin_step() is copies[1]
+
+
+def test_without_the_flag_the_store_is_the_batch_tensor(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", "", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_TOKEN_STORE_UPLOAD_COPY", False, raising=False)
+    host = torch.zeros((2, 8), dtype=torch.int32)
+    assert _store_adapter(host).begin_step() is host  # CPU: .to() aliases
+
+
+def test_store_check_counts_a_torn_upload(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", "", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_TOKEN_STORE_UPLOAD_COPY", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_TOKEN_STORE_CHECK", 3, raising=False)
+    host = torch.arange(16, dtype=torch.int32).reshape(2, 8)
+    adapter = _store_adapter(host)
+    adapter.begin_step()
+    adapter.begin_step()
+    stats = adapter._token_store_check
+    assert stats["checks"] == 1 and stats["bad_steps"] == 0
+    kept, dev = adapter._token_store_last
+    torn = dev.clone()
+    torn[1, 2:5] = -1
+    adapter._token_store_last = (kept, torn)
+    adapter.begin_step()
+    assert stats["checks"] == 2 and stats["bad_steps"] == 1 and stats["bad_entries"] == 3
+    assert stats["taken"] == 3
+    adapter.begin_step()
+    assert stats["checks"] == 3 and stats["taken"] == 3  # no snapshot past N
+    adapter.begin_step()
+    assert stats["checks"] == 3

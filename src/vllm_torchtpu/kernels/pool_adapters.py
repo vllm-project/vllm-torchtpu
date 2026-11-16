@@ -527,6 +527,8 @@ def v3_state_source(
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     qk_pair_layout: bool = False,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    log_positions: int = 0,
+    n_kq: int = 0,
 ) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
@@ -548,6 +550,11 @@ def v3_state_source(
     GDN kernel indexes ``ssm_state_indices[seq, ckpt]``; every checkpoint
     reuses this same intra-block geometry, so the block size stays
     independent of ``num_speculative_tokens``.
+
+    ``log_positions`` > 0 selects the GDN window log
+    (VLLM_TPU_GDN_WINDOW_LOG): checkpoint block 0 also carries the operands
+    of that many draft positions in the rows after the conv region
+    (``window_log_regions``), and ``n_kq`` is the rank's key head count.
     """
     block_size, payload, lanes = _pool_geometry(pool)
     if is_seq_along_lane_pool():
@@ -644,9 +651,111 @@ def v3_state_source(
         rows_used=conv_rows,
         rows_perm=conv_rows_perm,
     )
+    if not log_positions:
+        return gdn_v3_config.StateSourcePlan(
+            stride=split,
+            conv=conv,
+            recurrent=ssm,
+            whole_block_dma=is_seq_along_lane_pool(),
+        )
+    if is_seq_along_lane_pool():
+        raise ValueError(
+            "VLLM_TPU_GDN_WINDOW_LOG needs a token-major pool: whole-block "
+            "DMA plans carry no draft log"
+        )
+    log, log_conv = window_log_regions(
+        conv,
+        block_size=block_size,
+        lanes=lanes,
+        tok_bytes=tok_bytes,
+        log_positions=log_positions,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        conv_dim=conv_dim,
+    )
     return gdn_v3_config.StateSourcePlan(
         stride=split,
         conv=conv,
         recurrent=ssm,
-        whole_block_dma=is_seq_along_lane_pool(),
+        log=log,
+        log_conv=log_conv,
     )
+
+
+def window_log_regions(
+    conv: gdn_v3_config.StateRegion,
+    *,
+    block_size: int,
+    lanes: int,
+    tok_bytes: int,
+    log_positions: int,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    conv_dim: int,
+) -> tuple[gdn_v3_config.StateRegion, gdn_v3_config.StateRegion]:
+    """The GDN window log's ``(log, log_conv)`` regions, or why they do not fit.
+
+    Both sit in checkpoint block 0, in the conv region's kernel block right
+    after it: ``log`` holds the gate, key and update rows of
+    ``log_positions`` draft positions as ``d_v``-lane FP32 rows
+    (``gdn_v3_config.log_layout_rows``), ``log_conv`` their conv inputs in
+    the conv region's view. Raises ``ValueError`` with the numbers when the
+    geometry, dtypes or window leave no room or no supported layout; the
+    kernel's ``validate_log_plan`` repeats the layout checks at trace time.
+    """
+    reasons = []
+    if log_positions < 1:
+        reasons.append(f"{log_positions} draft positions")
+    if d_k != d_v or n_v > d_v or lanes % d_v:
+        reasons.append(
+            f"log rows need d_k == d_v, n_v <= d_v and d_v | lanes "
+            f"(d_k={d_k}, d_v={d_v}, n_v={n_v}, lanes={lanes})"
+        )
+    if conv.rows_perm is not None:
+        reasons.append("the QK pair conv layout (TPU_GDN_CONV_QK_PAIR_LAYOUT=1)")
+    conv_lanes = lanes // conv.lane_split
+    if conv_dim % conv_lanes:
+        reasons.append(f"conv_dim {conv_dim} is not whole {conv_lanes}-lane rows")
+    if reasons:
+        raise ValueError(
+            "VLLM_TPU_GDN_WINDOW_LOG unsupported for this GDN geometry: "
+            + "; ".join(reasons)
+        )
+    *_, log_rows_used = gdn_v3_config.log_layout_rows(log_positions, n_kq, n_v)
+    log_nrows = math.ceil(log_rows_used * d_v * 4 / tok_bytes)
+    conv_rows_used = log_positions * conv_dim // conv_lanes
+    conv_nrows = math.ceil(
+        conv_rows_used * conv_lanes * jnp.dtype(conv.view_dtype).itemsize / tok_bytes
+    )
+    row0 = conv.row0 + conv.nrows
+    end = row0 + log_nrows + conv_nrows
+    if end > block_size:
+        raise ValueError(
+            f"VLLM_TPU_GDN_WINDOW_LOG: the draft log of {log_positions} positions "
+            f"needs rows [{row0}, {end}) of checkpoint block 0's {block_size}-row "
+            f"kernel block ({log_nrows} log rows, {conv_nrows} conv-input rows after "
+            f"the state's {row0}); it does not fit"
+        )
+    log = gdn_v3_config.StateRegion(
+        kb0=conv.kb0,
+        nblocks=1,
+        row0=row0,
+        nrows=log_nrows,
+        view_dtype=jnp.dtype(jnp.float32),
+        lane_split=lanes // d_v,
+        rows_used=log_rows_used,
+    )
+    log_conv = gdn_v3_config.StateRegion(
+        kb0=conv.kb0,
+        nblocks=1,
+        row0=row0 + log_nrows,
+        nrows=conv_nrows,
+        view_dtype=conv.view_dtype,
+        lane_split=conv.lane_split,
+        rows_used=conv_rows_used,
+    )
+    return log, log_conv

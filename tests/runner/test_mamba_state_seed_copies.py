@@ -66,6 +66,7 @@ def _make_self(
     ckpt_window=1,
     read_offsets=None,
     bm_layout=None,
+    window_log_gids=frozenset(),
 ):
     """Build a minimal fake runner ``self`` for the collector.
 
@@ -106,6 +107,8 @@ def _make_self(
         # 1 = no speculative checkpoint group; > 1 takes the sliding-group
         # path exercised at the bottom of this file.
         _mamba_ckpt_window=ckpt_window,
+        # Mamba gids in the GDN window-log layout (VLLM_TPU_GDN_WINDOW_LOG).
+        _mamba_window_log_gids=frozenset(window_log_gids),
         # The collector reads the manager block size from cache_config, not
         # the runner's init-time snapshot (the executor finalizes it after
         # the runner is constructed).
@@ -837,6 +840,7 @@ def test_async_rejections_seed_only_at_actual_state_crossing(
     fake._pre_async_results = SimpleNamespace(
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
+        num_chunks=1,
         spec_decode_num_rejected_tokens=torch.tensor([rejected]),
         wait_for_copy=lambda: sampled,
     )
@@ -868,6 +872,7 @@ def test_async_state_seed_away_from_boundary_does_not_wait():
     fake._pre_async_results = SimpleNamespace(
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
+        num_chunks=1,
         spec_decode_num_rejected_tokens=torch.tensor([3]),
         wait_for_copy=unexpected_wait,
     )
@@ -890,6 +895,7 @@ def test_async_state_seed_uses_previous_request_order():
     fake._pre_async_results = SimpleNamespace(
         req_id_to_index_copy={"a": 0, "b": 1},
         num_draft_per_req={0: 3, 1: 3},
+        num_chunks=1,
         wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1], [77, 88, 99, 11]]),
     )
     before = fake.input_batch.num_computed_tokens_cpu.copy()
@@ -914,6 +920,7 @@ def test_async_state_seed_can_return_to_previous_column_after_rejection():
     fake._pre_async_results = SimpleNamespace(
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
+        num_chunks=1,
         wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1]]),
     )
     _collect(fake, _sched({"a": 1}))
@@ -941,8 +948,34 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     fake._pre_async_results = SimpleNamespace(
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
+        num_chunks=1,
         wait_for_copy=lambda: torch.tensor([[77, 88, 99, 11]]),
     )
     _collect(fake, _sched({"a": 4}))
     assert fake._mamba_state_pos["a"] == 1
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]
+
+
+def test_async_correction_refuses_a_multi_chunk_previous_step():
+    """The rejection correction indexes the previous step's draft map and
+    sampled copy by a position that counts padded rows of earlier chunks;
+    they agree only for a single-chunk step."""
+    fake, _ = _make_self(
+        ["a"],
+        [383],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        num_chunks=2,
+        wait_for_copy=lambda: torch.tensor([[77, 88, 99, 11]]),
+    )
+    with pytest.raises(AssertionError, match="single-chunk"):
+        _collect(fake, _sched({"a": 4}))

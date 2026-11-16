@@ -85,6 +85,12 @@ def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Ten
     return tokens.to(torch.int64).view(-1, 1)
 
 
+def top_token_ids(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    """The greedy token of each row, ``[rows]`` int32 like
+    ``torch.argmax(logits, dim=-1).to(torch.int32)``."""
+    return top_tokens(owner, hidden_states).view(-1).to(torch.int32)
+
+
 def log_step_path(is_spec_step: bool, req_ids: Sequence[str | None]) -> None:
     """Logs, once per path, that a step's tokens came from the top tokens.
 

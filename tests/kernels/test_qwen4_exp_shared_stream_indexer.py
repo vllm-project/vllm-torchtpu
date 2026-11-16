@@ -9,6 +9,7 @@ the SparseCore selector, so both paths are compared on identical score bits.
 
 import functools
 import importlib
+import re
 import types
 
 import jax
@@ -645,3 +646,115 @@ def test_prefill_pool_page_table_keeps_the_selection(
     expected = run()
     monkeypatch.setattr(pooled_qsa, "PREFILL_PAGE_TABLE_SMEM_BYTES", 0)
     np.testing.assert_array_equal(run(), expected)
+
+
+@pytest.mark.parametrize("chunk", [1 << 20, 4])
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_sc_overlap_keeps_the_selection_and_applies_the_write(
+    monkeypatch, interpret, case, chunk
+):
+    """VLLM_TPU_QSA_DECODE_SC_OVERLAP's schedule (no early-exit cond, unrolled
+    windows, the deferred write after scoring) selects the default blocks and
+    returns the pool with the write applied."""
+    q_lens, context, tokens = CASES[case]
+    args = inputs(len(case), q_lens, context, tokens, "integer")
+
+    def reference(*operands, topk_backend=None, **kwargs):
+        # The overlap path names its (SparseCore) backend; select on CPU.
+        return streamindex.streamindex_topk(
+            *operands, topk_backend=ReferenceTopK(), **kwargs
+        )
+
+    monkeypatch.setattr(pooled_qsa, "streamindex_topk", reference)
+    monkeypatch.setattr(pooled_qsa, "decode_query_chunk_size", lambda pages: chunk)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", "256")
+    monkeypatch.setenv("VLLM_TPU_QSA_INDEXER_MIXED_ONLY", "1")
+    expected = select(args)
+
+    def write(pool):
+        return pool.at[3, 5].set(7)
+
+    blocks, pool = pooled_qsa.select_blocks(
+        **args, ratio=RATIO, block_topk=BLOCK_TOPK, after_scoring=write
+    )
+    np.testing.assert_array_equal(np.asarray(blocks), expected)
+    np.testing.assert_array_equal(np.asarray(pool), np.asarray(write(args["pool"])))
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("tokens,windows", [(16, 1), (32, 2)])
+def test_sc_overlap_lowers_paired_scheduling_groups(monkeypatch, tokens, windows, mode):
+    """Mode 1: window g's SparseCore top-k shares a scheduling group with window
+    g+1's scoring and the last top-k one with the deferred write; mode 2 has no
+    groups. In both, neither a lax.cond nor a loop holds the top-k."""
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_SC_OVERLAP", str(mode))
+    monkeypatch.setattr(pooled_qsa, "decode_query_chunk_size", lambda pages: 16)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", "1024")
+    monkeypatch.setenv("VLLM_TPU_QSA_INDEXER_MIXED_ONLY", "1")
+    monkeypatch.setenv("VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY", "1")
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((tokens, 4, 128), jnp.bfloat16),
+        shape((64, 512, 1, 2, 256), jnp.bfloat16),
+        shape((tokens,), jnp.int32),
+        shape((64, 16), jnp.int32),
+        shape((tokens,), jnp.int32),
+        shape((65,), jnp.int32),
+        shape((64,), jnp.int32),
+    )
+
+    def run(*operands):
+        def write(pool):
+            return pool.at[operands[3][:, 0]].set(0)
+
+        blocks, pool = pooled_qsa.select_blocks(
+            *operands, ratio=RATIO, block_topk=512, after_scoring=write
+        )
+        return blocks, pool
+
+    streamindex.config.reset_scheduling_group_ids()
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = jax.jit(run).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+
+    def groups(marker):
+        found = []
+        for line in text.splitlines():
+            if marker in line and "_scheduling_group_id" in line:
+                value = line.split('_scheduling_group_id = "')[1]
+                found.append(int(value.split('"')[0]))
+        return found
+
+    topk = groups("sc_topk_direct")
+    scoring = groups("StreamIdxTC-m-bq_4")
+    # The scatter's attributes close its multi-line op, on the pool-typed line.
+    write = groups("-> tensor<64x512x1x2x256xbf16>")
+    if mode == 1:
+        assert topk == list(range(1, windows + 1))
+        assert scoring == list(range(1, windows))
+        assert write == [windows]
+    else:
+        assert "_scheduling_group_id" not in text
+    # No early-exit cond and no window loop: the only case per window is the
+    # pass metadata's, ahead of the scoring.
+    assert text.count('"stablehlo.case"') == windows
+    assert "stablehlo.while" not in text
+    assert text.count("stablehlo.optimization_barrier") == windows
+    # The scores cross the barrier flat (the SparseCore's view); in the
+    # [rows, positions] shape they cost two SparseCore relayouts per top-k.
+    for line in text.splitlines():
+        if "stablehlo.optimization_barrier" in line:
+            first = line.split(" : ")[1].split(",")[0]
+            assert re.fullmatch(r"tensor<\d+xi32>", first), line
+    # Members of a group share one computation: XLA drops a group that spans
+    # nested calls, so neither jit stays a call of its own.
+    assert "func.func private @streamindex_topk" not in text
+    assert "func.func private @sparsecore_topk" not in text

@@ -71,3 +71,110 @@ class MtpLoopStepModel(nn.Module):
             inputs_embeds,
             spec_step_idx,
         )
+
+
+def decode_rows_count(tokens, tokens_per_request):
+    """Rows MTP draft step 0 evaluates for a ``tokens``-token bucket
+    (VLLM_TPU_MTP_DRAFT_DECODE_ROWS): the bucket's request bound in a pure
+    decode step, ``tokens / tokens_per_request`` (K + 1), rounded up to a
+    multiple of 16. Takes an int or the traced token count."""
+    step = 16 * tokens_per_request
+    return (tokens + step - 1) // step * 16
+
+
+class MtpStep0RowsModel(nn.Module):
+    """An MTP draft's step 0 at selected rows as a separately compiled
+    program (VLLM_TPU_MTP_DRAFT_DECODE_ROWS, VLLM_TPU_MTP_DRAFT_CHECK).
+
+    Each kind has its own ``forward``: vLLM keys a module's AOT artifact by the
+    forward's qualified name and line, not by the instance.
+    """
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        mtp: nn.Module,
+        tokens_per_request: int = 0,
+    ) -> None:
+        super().__init__()
+        # Own compile-cache folder, as in MtpLoopStepModel.
+        self.prefix = prefix
+        self.mtp = mtp
+        self.tokens_per_request = tokens_per_request
+
+    def _step0(self, input_ids, positions, hidden_states, draft_rows):
+        return type(self.mtp).forward(
+            self.mtp,
+            input_ids,
+            positions,
+            hidden_states,
+            None,
+            None,
+            0,
+            draft_rows,
+        )
+
+
+class MtpStep0DecodeRows(MtpStep0RowsModel):
+    """``draft_rows`` is token-length (dynamic, one entry per token of the
+    bucket, -1 past the requests); the layer evaluates its first
+    ``decode_rows_count(T, tokens_per_request)`` entries."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        draft_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        rows = draft_rows[
+            : decode_rows_count(draft_rows.shape[0], self.tokens_per_request)
+        ]
+        return self._step0(input_ids, positions, hidden_states, rows)
+
+
+class MtpStep0CapacityRows(MtpStep0RowsModel):
+    """``draft_rows`` at one static length, as the draft's own program takes
+    it (the VLLM_TPU_MTP_DRAFT_CHECK reference)."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        draft_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._step0(input_ids, positions, hidden_states, draft_rows)
+
+
+def build_mtp_step0_rows_model(
+    *,
+    vllm_config: VllmConfig,
+    prefix: str,
+    mtp: nn.Module,
+    dynamic_arg_dims: dict,
+    tokens_per_request: int,
+) -> nn.Module:
+    """Compile ``MtpStep0DecodeRows`` (``tokens_per_request`` > 0) or
+    ``MtpStep0CapacityRows`` with the draft's own dynamic dims, plus
+    ``draft_rows`` dim 0 when it is token-length."""
+    base: type[MtpStep0RowsModel] = MtpStep0CapacityRows
+    dims = {
+        k: v
+        for k, v in dict(dynamic_arg_dims).items()
+        if k in ("input_ids", "positions", "hidden_states")
+    }
+    if tokens_per_request:
+        base = MtpStep0DecodeRows
+        dims["draft_rows"] = 0
+    cls = support_torch_compile(dynamic_arg_dims=dims)(
+        type(base.__name__, (base,), {})
+    )
+    return cls(
+        vllm_config=vllm_config,
+        prefix=prefix,
+        mtp=mtp,
+        tokens_per_request=tokens_per_request,
+    )
