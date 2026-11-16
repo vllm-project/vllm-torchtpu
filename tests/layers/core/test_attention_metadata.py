@@ -779,6 +779,7 @@ class TestBlockTableUploadReuse:
             _free_h2d_sources={},
             _registered_h2d_sources=set(),
             _block_table_upload_reuse=None,
+            pcp_manager=None,
         )
         tables, groups_out = [], []
         for gid, (is_mamba, num_blocks, block_size) in enumerate(groups):
