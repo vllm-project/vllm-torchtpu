@@ -50,6 +50,7 @@ _QB = 128  # quant block rows (NVFP4 requantized to block 128)
 _NCOL = 256  # output columns per matmul (MXU width)
 _SUB = 16  # bf16 sublane tiling of lhs / out rows
 _ACT_COLS = 512  # columns per activation / output-merge step
+_VMEM_MARGIN = 2 << 20  # Mosaic internal scratch over vmem_bytes()
 
 
 def plan(size_m: int, max_group_size: int | None) -> tuple[tuple[int, ...], int | None]:
@@ -144,7 +145,7 @@ def _kernel(
     o_ref,  # VMEM [2, MCAP + 16, N] out dtype: output rows of 2 entries
     cs_ref,  # VMEM [16, N] out dtype: the open 16-row output slab
     w_ref,  # VMEM [slots, chunk, N] fp4
-    s_ref,  # VMEM [slots, chunk / 128, 1, N] f32
+    s_ref,  # VMEM [slots, chunk / 128, N] f32
     ent_ref,  # SMEM [3, max entries] int32: group, first row, rows
     cnt_ref,  # SMEM [3] int32: entries, out DMA rows of entry slot 0 / 1
     wsem,  # DMA [slots, 2]
@@ -240,7 +241,7 @@ def _kernel(
                 wsem.at[slot, 0],
             ),
             pltpu.make_async_copy(
-                s_hbm.at[e, pl.ds(r * kbc, kbc)], s_ref.at[slot], wsem.at[slot, 1]
+                s_hbm.at[e, pl.ds(r * kbc, kbc), 0], s_ref.at[slot], wsem.at[slot, 1]
             ),
         )
 
@@ -300,8 +301,8 @@ def _kernel(
                 # gmm_v2's dequantize-before-matmul: bf16(w) * bf16(scale)
                 # in bf16, one matmul over the slice (f32 sums per slice).
                 w = w_slot[:, pl.ds(c0, _NCOL)].astype(x.dtype)
-                sc = s_slot[:, :, pl.ds(c0, _NCOL)].astype(x.dtype)
-                w = (w.reshape(kbc, _QB, _NCOL) * sc).reshape(chunk, _NCOL)
+                sc = s_slot[:, pl.ds(c0, _NCOL)].astype(x.dtype)
+                w = (w.reshape(kbc, _QB, _NCOL) * sc[:, None, :]).reshape(chunk, _NCOL)
                 acc = acc + jnp.matmul(x, w, preferred_element_type=jnp.float32)
             else:
                 for kb in range(kbc):
@@ -315,7 +316,7 @@ def _kernel(
                         preferred_element_type=jnp.float32,
                     )
                     # [1, 256] row, broadcast over the rows (same products).
-                    acc = acc + blk * s_slot[kb, 0:1, pl.ds(c0, _NCOL)]
+                    acc = acc + blk * s_slot[kb : kb + 1, pl.ds(c0, _NCOL)]
             a_ref[ai, 0:mb, c0 : c0 + _NCOL] = acc
 
         @pl.when(c == c1 - 1)
@@ -409,8 +410,8 @@ def vmem_bytes(k1, f, n, chunk, slots, mcap, out_itemsize=2) -> int:
     x = 3 * mcap * k1 * 2
     acc = 2 * mcap * n * 4
     o = (2 * (mcap + _SUB) + _SUB) * n * out_itemsize
-    w = slots * chunk * n // 2
-    s = slots * _gmm.align_to(chunk // _QB, 8) * 8 * n * 4  # [kb, 1, N] f32 pads
+    w = slots * chunk * n  # fp4 takes a byte per element in VMEM
+    s = slots * _gmm.align_to(chunk // _QB, 8) * n * 4
     return x + acc + o + w + s
 
 
@@ -442,7 +443,7 @@ def gmm_decode_stream_mlp(
     capacity = 64 << 20 if interpret else pltpu.get_tpu_info().vmem_capacity_bytes
     vmem_limit = min(
         int(capacity * 0.9),
-        _gmm.align_to(need + (8 << 20), 1 << 20),
+        _gmm.align_to(need + _VMEM_MARGIN, 1 << 20),
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     kernel = functools.partial(
@@ -472,7 +473,7 @@ def gmm_decode_stream_mlp(
                 pltpu.VMEM((2, mcap + _SUB, n), out_dtype),
                 pltpu.VMEM((_SUB, n), out_dtype),
                 pltpu.VMEM((slots, chunk_rows, n), rhs1.dtype),
-                pltpu.VMEM((slots, chunk_rows // _QB, 1, n), jnp.float32),
+                pltpu.VMEM((slots, chunk_rows // _QB, n), jnp.float32),
                 pltpu.SMEM((3, max_ent), jnp.int32),
                 pltpu.SMEM((3,), jnp.int32),
                 pltpu.SemaphoreType.DMA((slots, 2)),
