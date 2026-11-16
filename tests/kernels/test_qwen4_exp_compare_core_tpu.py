@@ -266,9 +266,11 @@ def test_numerics_and_time_against_served(monkeypatch, name, reqs, tokens, page)
 
 # Float64 stress cases (work-order-prefill-qsa.md, last section): one 2,048-row request at 24,000 cached tokens,
 # 3200-token pages, the port and the served path each against a float64 reference on 256 sampled rows.
-STRESS = ("peaked", "long_unions", "near_duplicate_keys", "fp8_range_ends", "nan_tail", "recorded_selections")
-_RECORDED = ("/home/benliangw_google_com/workspace/tmp/compare-runs/prepared/objects/served/"
-             "served-8f219aec5cbc3d30ba2e/served-prefill-38258702ef-stage6.json")
+STRESS = ("peaked", "long_unions", "near_duplicate_keys", "fp8_range_ends", "nan_tail", "recorded_selections",
+          "dominant_cross_row")
+# s10623 stage-6 L39's recorded selections, rows 0-127 (Compare's served-prefill-38258702ef-stage6.json,
+# plant.selections[0].tables[0]), each row's 513 groups sorted and stored as uint16 differences.
+_RECORDED = os.path.join(os.path.dirname(__file__), "data", "qsa_s10623_l39_selections.npz")
 
 
 def _stress_step(name, seed=11, rows=2048, ctx=24000, page=3200):
@@ -289,12 +291,10 @@ def _stress_step(name, seed=11, rows=2048, ctx=24000, page=3200):
                 recent = np.arange(complete - 13, complete)
                 sel = np.unique(np.concatenate([pool[:272], own, recent]))[:TOPK]
                 blocks[16 * g + r, :len(sel)] = sel
-    elif name == "recorded_selections" and os.path.exists(_RECORDED):
+    elif name == "recorded_selections":
         # s10623 L39's recorded selections (rows 16 apart), each row taking the nearest earlier recorded row's
-        # groups below its own tail (Compare's interpolated plant), shifted onto this context.
-        import json
-
-        rec = json.load(open(_RECORDED))["plant"]["selections"][0]["tables"][0]
+        # groups below its own tail (Compare's interpolated plant).
+        rec = np.cumsum(np.load(_RECORDED)["deltas"].astype(np.int64), axis=1)
         blocks = np.full((rows, TOPK), -1, np.int32)
         for t in range(rows):
             sel = np.asarray(rec[min(t // 16, len(rec) - 1)], np.int64)
@@ -302,8 +302,22 @@ def _stress_step(name, seed=11, rows=2048, ctx=24000, page=3200):
             blocks[t, :len(sel)] = sel
     else:
         blocks = _selections(rng, rows, ctx)
+    dominant = None
+    if name == "dominant_cross_row":
+        # The first row of every 16-row union group also selects 64 old groups no other row selects, whose keys
+        # (K bytes 48.0, queries offset by +0.25) every row scores ~190 above its own keys: each row's softmax max
+        # must be over the keys it sees, or the other 15 rows' probabilities underflow (Compare's deep-body fault,
+        # v2-cmp-t-pqsa2 f95d10a4).
+        dominant = rng.choice(ctx // RATIO - 64, 64, replace=False)
+        for t in range(rows):
+            keep = blocks[t][(blocks[t] >= 0) & ~np.isin(blocks[t], dominant)]
+            if t % 16 == 0:
+                keep = np.concatenate([dominant, keep[: TOPK - len(dominant)]])
+            blocks[t] = -1
+            blocks[t, :len(keep)] = keep
     scale = 8.0 if name == "peaked" else 1.0
-    q = jnp.asarray(rng.normal(0, 0.5 * scale, (rows, 24, 256)), jnp.bfloat16)
+    offset = 0.25 if name == "dominant_cross_row" else 0.0
+    q = jnp.asarray(rng.normal(offset, 0.5 * scale, (rows, 24, 256)), jnp.bfloat16)
     gate = jnp.asarray(rng.uniform(-3, 3, (rows, 24, 256)), jnp.bfloat16)
     shape = (pps + 1, page, 1, 4, 256)
     if name == "near_duplicate_keys":
@@ -323,6 +337,10 @@ def _stress_step(name, seed=11, rows=2048, ctx=24000, page=3200):
         last = ctx + rows
         page_i, off = last // page, last % page
         raw[table[0, page_i], off:] = 0x7F
+    if dominant is not None:
+        toks = (dominant[:, None] * RATIO + np.arange(RATIO)).ravel()
+        for k in (0, 2):                                     # K of both KV heads; V stays random
+            raw[table[0, toks // page], toks % page, 0, k] = 0x64
     pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
     starts = jnp.asarray([0] + [rows] * 16, jnp.int32)
     return (q, gate, jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table), pool, starts)
@@ -353,8 +371,9 @@ def _f64_rows(step, rows):
 
 @pytest.mark.parametrize("name", STRESS)
 def test_stress_against_float64(monkeypatch, name):
-    if name == "recorded_selections" and not os.path.exists(_RECORDED):
-        pytest.skip("recorded selections not on this host")
+    """Gate (coordinator ruling on checks6): the port's max and RMS error at most 1.25x the served path's, every
+    value finite; max_rel at most 0.08 only where the served path itself is within 0.08 (a peaked case reads
+    0.20 on both)."""
     step = _stress_step(name)
     _, served = _call(step)
     served = np.asarray(jax.block_until_ready(served).astype(jnp.float32))
@@ -372,5 +391,6 @@ def test_stress_against_float64(monkeypatch, name):
             f"{pm / max(sm, 1e-30):.3f} rms {pr / max(sr, 1e-30):.3f}; finite port {finite} served "
             f"{bool(np.isfinite(served).all())}")
     assert finite
-    assert port_rel <= MAX_REL, port_rel
     assert pm <= 1.25 * sm and pr <= 1.25 * sr, (pm, sm, pr, sr)
+    if served_rel <= MAX_REL:
+        assert port_rel <= MAX_REL, (port_rel, served_rel)

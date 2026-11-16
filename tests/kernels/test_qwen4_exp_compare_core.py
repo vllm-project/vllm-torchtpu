@@ -294,3 +294,63 @@ def test_unwritten_nan_bytes_do_not_reach_the_output(kernels):
     want = _f64(q, blocks, lengths, table, pool)[live]
     floor = _max_rel(want.astype(np.float32).astype(jnp.bfloat16).astype(np.float32), want)
     assert _max_rel(got, want) <= 2 * floor, (_max_rel(got, want), floor)
+
+
+def test_dominant_scores_of_another_row_stay_out_of_a_rows_max(kernels):
+    """One row of every union group (its first live row) also selects 16 old groups of its request that no other
+    row selects, whose keys every row's query scores ~190 above its own keys. Each row's softmax max is over the
+    keys it sees: a max over the union group's raw scores (masked slots included) would underflow every other
+    row's visible probabilities (exp(-190) is below f32's smallest normal) and collapse those rows."""
+    step = _packed_step(5)
+    (q, blocks, lengths, table), _ = _aligned(step)
+    rng = np.random.default_rng(5)
+    q = np.asarray(jnp.asarray(q + 0.25, jnp.bfloat16).astype(jnp.float32))
+    raw = np.asarray(jax.lax.bitcast_convert_type(step[5], jnp.uint8)).copy()
+    owners, dominant, picks = [], {}, {}
+    for g in range(len(lengths) // cc.T):
+        rows = [r for r in range(g * cc.T, (g + 1) * cc.T) if lengths[r] > 0]
+        if len(rows) < 2:
+            continue
+        # One set a request (its pages), from groups every row of the request sees; no other row selects it.
+        req = int(table[rows[0], 0])
+        if req not in picks:
+            picks[req] = rng.choice(int(lengths[rows].min()) // RATIO - 8, 16, replace=False)
+        pick = picks[req]
+        owner = rows[0]
+        own = [x for x in blocks[owner] if x >= 0 and x not in pick][: TOPK - 16]
+        blocks[owner] = -1
+        blocks[owner, : 16 + len(own)] = np.concatenate([pick, own])
+        for r in rows[1:]:
+            keep = [x for x in blocks[r] if x >= 0 and x not in pick]
+            blocks[r] = -1
+            blocks[r, : len(keep)] = keep
+        for x in pick:
+            for tok in range(x * RATIO, x * RATIO + RATIO):
+                raw[table[owner][tok // PAGE], tok % PAGE, 0, (0, 2)] = 0x64      # K of both heads: 48.0
+        owners.append(owner)
+        dominant[g] = pick
+    pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+    # The case is sharp: the other rows' raw scores on the owner's dominant keys sit far above their own.
+    flat = np.asarray(pool.astype(jnp.float32)).reshape(-1, 4, 256)
+    gaps = []
+    for g, pick in dominant.items():
+        for r in range(g * cc.T + 1, (g + 1) * cc.T):
+            if lengths[r] <= 0:
+                continue
+            seen = np.asarray(_visible(blocks[r], int(lengths[r])))
+            hidden = np.asarray([tok for x in pick for tok in range(x * RATIO, x * RATIO + RATIO)])
+            k_seen = flat[table[r][seen // PAGE] * PAGE + seen % PAGE][:, 0]
+            k_hidden = flat[table[r][hidden // PAGE] * PAGE + hidden % PAGE][:, 0]
+            gaps.append((k_hidden @ q[r, 0]).max() / 16 - (k_seen @ q[r, 0]).max() / 16)
+    assert len(owners) >= 8 and min(gaps) > 120, (len(owners), min(gaps))
+    groups_cap = table.shape[1] * PAGE // RATIO
+    rows, codes, usize, ok = cc.compare_tables(jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table),
+                                               groups_cap=groups_cap, union_cap=512, page_size=PAGE)
+    assert bool(ok)
+    got = cc.compare_core_kernel(jnp.asarray(q, jnp.bfloat16), rows, codes, usize, pool, union_cap=512, depth=4)
+    live = lengths > 0
+    got = np.asarray(got.astype(jnp.float32))[live]
+    assert np.isfinite(got).all()
+    want = _f64(q, blocks, lengths, table, pool)[live]
+    floor = _max_rel(want.astype(np.float32).astype(jnp.bfloat16).astype(np.float32), want)
+    assert _max_rel(got, want) <= 2 * floor, (_max_rel(got, want), floor)
