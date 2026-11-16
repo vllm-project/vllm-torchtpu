@@ -148,6 +148,56 @@ def test_rejection_sampler_greedy_with_mismatches(device):
     assert torch.equal(output, expected)
 
 
+def _grammar_case(device):
+    # Request 0 drafts [G 10, M 20, G 30]; request 1 drafts [G 100, G 200].
+    # The target's argmax disagrees with every GRAMMAR draft and with 20.
+    draft_token_ids = torch.tensor(
+        [10, 20, 30, 100, 200], dtype=torch.int32, device=device
+    )
+    draft_flags = torch.tensor([2, 1, 2, 2, 2], dtype=torch.int32, device=device)
+    target_logits = torch.zeros((5, 1000), dtype=torch.float32, device=device)
+    for row, token in enumerate([11, 99, 31, 101, 201]):
+        target_logits[row, token] = 10.0
+    return dict(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+        target_logits=target_logits,
+        bonus_token_ids=torch.tensor([40, 300], dtype=torch.int32, device=device),
+        segment_ids=torch.tensor([0, 0, 0, 1, 1], dtype=torch.int64, device=device),
+        group_indices=torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64, device=device),
+        max_draft_tokens=3,
+        draft_flags=draft_flags,
+    )
+
+
+def test_rejection_sampler_greedy_accepts_grammar_drafts(device):
+    output = RejectionSampler()(**_grammar_case(device))
+    # Request 0: G 10 accepted, M 20 rejected for the target's 99, and the G 30
+    # after it rejected with it. Request 1: both G accepted, then the bonus.
+    expected = torch.tensor(
+        [[10, 99, -1, -1], [100, 200, 300, -1]], dtype=torch.int32, device=device
+    )
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_random_accepts_grammar_drafts(device):
+    case = _grammar_case(device)
+    num_tokens = case["draft_token_ids"].shape[0]
+    output = RejectionSampler()(
+        **case,
+        temperatures=torch.ones((num_tokens, 1), device=device),
+        top_k=torch.zeros((num_tokens, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((num_tokens, 1), device=device),
+        # u = 1 rejects every MODEL draft the target does not pick.
+        accept_u=torch.ones(num_tokens, device=device),
+        recover_u=torch.full((num_tokens, 1000), 0.5, device=device),
+        do_sampling=True,
+    )
+    assert output[0, 0].item() == 10
+    assert output[0, 2:].tolist() == [-1, -1]
+    assert output[1].tolist() == [100, 200, 300, -1]
+
+
 def test_rejection_sampler_greedy_zero_draft_tokens(device):
     sampler = RejectionSampler()
 

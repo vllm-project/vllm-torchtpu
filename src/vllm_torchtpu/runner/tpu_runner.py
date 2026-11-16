@@ -220,7 +220,7 @@ from vllm_torchtpu.spec_decode.utils import (
     handoff_seed_tokens,
     normalize_draft_config,
 )
-from vllm_torchtpu.structured_decoding import StructuredDecodingManager
+from vllm_torchtpu.structured_decoding import StructuredDecodingManager, gaad
 from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
@@ -1474,7 +1474,10 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler = RejectionSampler(
                 self.speculative_config, self.device
             )
-            if self.speculative_config.method == "ngram":
+            if gaad.is_standalone(self.speculative_config):
+                # GaaD alone: the scheduler plans every draft from the grammar.
+                self.drafter = None
+            elif self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
@@ -3705,6 +3708,17 @@ class TPUModelRunner(GPUModelRunner):
                         defer_draft_token_ids=bool(
                             self.scheduler_config.async_scheduling
                         ),
+                        scheduled_spec_decode_flags=getattr(
+                            scheduler_output, "scheduled_spec_decode_flags", None
+                        ),
+                        start_index=start_index,
+                        # Logprobs and min_tokens read every verify row by
+                        # position, so only skip GRAMMAR rows without them.
+                        skip_grammar_rows=(
+                            gaad.is_enabled()
+                            and self.input_batch.max_num_logprobs is None
+                            and not self._min_tokens
+                        ),
                     )
                 )
 
@@ -5332,6 +5346,7 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices=md.group_indices,
                 max_draft_tokens=self.speculative_config.num_speculative_tokens,
                 accept_u=accept_u,
+                draft_flags=md.draft_flags,
             )
         assert accept_u is not None
         assert req_temperatures is not None
@@ -5356,6 +5371,7 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
             topk_candidates=topk_candidates,
             apply_topk_topp=self._sampler_applies_topk_topp(),
+            draft_flags=md.draft_flags,
         )
 
     def sample_tokens(
@@ -6954,6 +6970,18 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+                if gaad.is_enabled() and self.speculative_config is not None:
+                    # A verify step's logits rows are a token bucket; GaaD drops
+                    # GRAMMAR rows, so any bucket up to the step's tokens occurs.
+                    for num_rows in self.num_tokens_paddings:
+                        if num_rows > num_tokens:
+                            break
+                        indices = torch.zeros(num_rows, dtype=torch.int32).to(
+                            self.device
+                        )
+                        synchronize_tensors(
+                            self.compute_selected_logits(dummy_hidden, indices)
+                        )
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -7273,6 +7301,12 @@ class TPUModelRunner(GPUModelRunner):
                 warm_accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(
                     self.device
                 )
+                # With GaaD every verify passes flags (a separate graph).
+                warm_draft_flags = (
+                    torch.ones(num_tokens, dtype=torch.int32).to(self.device)
+                    if gaad.is_enabled()
+                    else None
+                )
                 # --- greedy verify path (do_sampling=False) ---
                 bonus_token_ids, target_logits_warm = self.spec_bonus_and_target_logits(
                     dummy_logits, bonus_logits_indices, target_logits_indices
@@ -7288,6 +7322,7 @@ class TPUModelRunner(GPUModelRunner):
                     accept_u=(
                         warm_accept_u if self.rejection_sampler.synthetic_mode else None
                     ),
+                    draft_flags=warm_draft_flags,
                 )
                 synchronize_tensors(out)
                 if self._greedy_head_owner is not None:
@@ -7305,6 +7340,25 @@ class TPUModelRunner(GPUModelRunner):
                 _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
                     dummy_logits, bonus_logits_indices, target_logits_indices
                 )
+                if gaad.is_enabled():
+                    # GaaD computes logits only for MODEL and bonus rows, so the
+                    # gather also reads from fewer rows: every smaller bucket that
+                    # still holds one row per request.
+                    for num_rows in self.num_tokens_paddings:
+                        if num_rows >= num_tokens:
+                            break
+                        if num_rows < num_reqs:
+                            continue
+                        synchronize_tensors(
+                            self.spec_gather_bonus_and_target_logits(
+                                torch.zeros(
+                                    (num_rows, self.vocab_size),
+                                    dtype=self._hidden_states_dtype,
+                                ).to(self.device),
+                                bonus_logits_indices,
+                                target_logits_indices,
+                            )
+                        )
                 warm_temps = torch.zeros(
                     (num_tokens, 1),
                     dtype=self._hidden_states_dtype,
@@ -7340,6 +7394,7 @@ class TPUModelRunner(GPUModelRunner):
                         do_sampling=True,
                         topk_candidates=topk_candidates,
                         apply_topk_topp=apply_topk_topp,
+                        draft_flags=warm_draft_flags,
                     )
                     synchronize_tensors(out)
                 logger.info(

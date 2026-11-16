@@ -584,7 +584,7 @@ class Eagle3Proposer:
         draft_dims = getattr(draft_model, "_dynamic_arg_dims", None)
         if draft_dims is None:
             return
-        K = self.speculative_config.num_speculative_tokens
+        K = self.num_draft_steps
         if K < 2:
             return
         try:
@@ -1195,6 +1195,14 @@ class Eagle3Proposer:
             (last_token_indices,), next_token_ids.to(input_ids.dtype)
         )
 
+    @property
+    def num_draft_steps(self) -> int:
+        """Tokens the drafter proposes per request: num_speculative_tokens, or
+        GaaD's drafter share of the row (the grammar may fill the rest)."""
+        from vllm_torchtpu.structured_decoding import gaad
+
+        return gaad.draft_limit(self.speculative_config.num_speculative_tokens)
+
     def propose(
         self,
         sampled_token_ids: list[list[int]] | None,
@@ -1236,7 +1244,7 @@ class Eagle3Proposer:
         if num_reqs == 0:
             return []
 
-        K = self.speculative_config.num_speculative_tokens
+        K = self.num_draft_steps
 
         chunks = self.draft_chunks
         if not chunks:
@@ -2337,7 +2345,7 @@ class Eagle3Proposer:
         collectives, so there is nothing for an idle rank to pair with and the
         forwards would be pure wasted device time.
         """
-        K = self.speculative_config.num_speculative_tokens
+        K = self.num_draft_steps
         if not self._dp_lockstep_sharded() or num_chunks * K == 0:
             return
         self._draft_md_cache.clear()

@@ -1,0 +1,308 @@
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Grammar-as-a-Draft (GaaD): grammar-forced tokens in speculative draft rows.
+
+Where a structured-output request's grammar admits exactly one continuation
+string, the tokens of that string are known before the model runs. GaaD plans
+them into the request's draft row with flag ``GRAMMAR``; the rejection sampler
+accepts a ``GRAMMAR`` slot without comparing it with the target, and a rejected
+``MODEL`` slot ahead of it still rejects it, as it rejects every later slot.
+
+Each row is planned in ``Scheduler.schedule()``, before the step is dispatched,
+from the grammar state after the previous step's tokens and from the drafter's
+proposal for this step. Both are on the host only with async scheduling off, so
+GaaD turns async scheduling off (``check_config``).
+
+A row has ``num_speculative_tokens`` slots. The model drafter fills at most
+``VLLM_TPU_GAAD_DRAFT_TOKENS`` of them (all of them when unset) and the grammar
+may force tokens into the rest, so a wide row costs the drafter nothing. The
+runner computes target logits only for ``MODEL`` slots and the bonus slot.
+Without a drafter, the speculative config names ``GAAD_PROPOSER`` as a
+``custom_class`` method and GaaD fills every row.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.config import SpeculativeConfig, VllmConfig
+
+logger = logging.getLogger("vllm." + __name__)
+
+DRAFT_FLAG_EMPTY = 0
+DRAFT_FLAG_MODEL = 1
+DRAFT_FLAG_GRAMMAR = 2
+
+# The `custom_class` speculative model that selects GaaD without a drafter.
+GAAD_PROPOSER = "vllm_torchtpu.structured_decoding.gaad.GrammarOnlyProposer"
+
+
+class GrammarOnlyProposer:
+    """Names GaaD without a drafter; it proposes nothing.
+
+    vLLM's runner base class builds one from the `custom_class` config; the
+    TPU runner then replaces it with no drafter.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    def propose(self, *args: Any, **kwargs: Any) -> list[list[int]]:
+        del args, kwargs
+        return []
+
+
+def is_standalone(speculative_config: SpeculativeConfig | None) -> bool:
+    """Whether the speculative config selects GaaD without a drafter."""
+    return (
+        speculative_config is not None
+        and speculative_config.method == "custom_class"
+        and speculative_config.model == GAAD_PROPOSER
+    )
+
+
+def is_enabled() -> bool:
+    from vllm_torchtpu import envs
+
+    return bool(envs.VLLM_TPU_JUMP_DECODING)
+
+
+def draft_limit(num_speculative_tokens: int) -> int:
+    """How many slots of a row the model drafter fills."""
+    from vllm_torchtpu import envs
+
+    limit = envs.VLLM_TPU_GAAD_DRAFT_TOKENS
+    if not is_enabled() or limit is None:
+        return num_speculative_tokens
+    return min(limit, num_speculative_tokens)
+
+
+def check_config(vllm_config: VllmConfig) -> None:
+    """Validates a GaaD configuration and turns async scheduling off for it."""
+    speculative_config = vllm_config.speculative_config
+    if is_standalone(speculative_config) and not is_enabled():
+        raise ValueError(
+            f"Speculative model {GAAD_PROPOSER} needs VLLM_TPU_JUMP_DECODING=1."
+        )
+    if not is_enabled():
+        return
+    if speculative_config is None:
+        raise ValueError(
+            "VLLM_TPU_JUMP_DECODING=1 needs a speculative config: a drafter, or "
+            f'{{"model": "{GAAD_PROPOSER}", "num_speculative_tokens": K}}.'
+        )
+    scheduler_config = vllm_config.scheduler_config
+    if scheduler_config.async_scheduling:
+        logger.warning(
+            "GaaD plans each draft row from the previous step's tokens on the "
+            "host; turning async scheduling off."
+        )
+        scheduler_config.async_scheduling = False
+
+
+class GrammarCursor:
+    """Walks a grammar matcher along a draft row; ``rollback`` restores it.
+
+    The forced token is the next token of the canonical encoding of the
+    matcher's jump-forward string. The encoding is used whole or not at all: a
+    jump whose encoding the grammar rejects anywhere forces nothing. It is
+    encoded once per jump run and looked up again after a token off the run.
+    """
+
+    def __init__(self, matcher: Any, tokenizer: Any):
+        self._matcher = matcher
+        self._tokenizer = tokenizer
+        self._advanced = 0
+        # The rest of the current jump run, or None before it is looked up.
+        self._run: list[int] | None = None
+
+    def forced_next(self) -> int | None:
+        """The only token the grammar lets the row continue with, or None."""
+        if self._run is None:
+            self._run = self._jump_tokens()
+        return self._run[0] if self._run else None
+
+    def advance(self, token: int) -> bool:
+        """Advances past ``token`` if the grammar allows it."""
+        if not self._matcher.accept_token(token):
+            return False
+        self._advanced += 1
+        if self._run and self._run[0] == token:
+            # An exhausted run is looked up again: the grammar may force more.
+            self._run = self._run[1:] or None
+        else:
+            self._run = None
+        return True
+
+    def rollback(self) -> None:
+        if self._advanced:
+            self._matcher.rollback(self._advanced)
+        self._advanced = 0
+        self._run = None
+
+    def _jump_tokens(self) -> list[int]:
+        if self._matcher.is_terminated():
+            return []
+        jump = self._matcher.find_jump_forward_string()
+        if not jump:
+            return []
+        tokens = list(self._tokenizer.encode(jump, add_special_tokens=False))
+        probe = self._matcher.fork()
+        if not all(probe.accept_token(token) for token in tokens):
+            return []
+        return tokens
+
+
+def plan_draft_row(
+    model_draft: Sequence[int], cursor: GrammarCursor, k: int
+) -> tuple[list[int], list[int]]:
+    """Merges ``model_draft`` with the tokens the grammar forces, ``k`` at most.
+
+    1. A model token that is the forced token becomes a ``GRAMMAR`` slot; one
+       the grammar allows where it forces nothing stays a ``MODEL`` slot.
+    2. The model draft is cut at its first token the grammar rejects or that
+       differs from the forced token: its later tokens continue from a
+       tokenization the forced path does not take.
+    3. Forced tokens fill the remaining slots while the grammar forces one.
+
+    Advances ``cursor`` past every planned token. The row has no ``EMPTY``
+    padding: the scheduler schedules exactly the planned tokens.
+    """
+    tokens: list[int] = []
+    flags: list[int] = []
+    for token in model_draft[:k]:
+        forced = cursor.forced_next()
+        if (forced is not None and forced != token) or not cursor.advance(token):
+            break
+        tokens.append(token)
+        flags.append(DRAFT_FLAG_GRAMMAR if forced == token else DRAFT_FLAG_MODEL)
+    while len(tokens) < k:
+        forced = cursor.forced_next()
+        if forced is None or not cursor.advance(forced):
+            break
+        tokens.append(forced)
+        flags.append(DRAFT_FLAG_GRAMMAR)
+    return tokens, flags
+
+
+def _has_penalties(sampling_params: Any) -> bool:
+    return (
+        sampling_params.presence_penalty != 0.0
+        or sampling_params.frequency_penalty != 0.0
+        or sampling_params.repetition_penalty != 1.0
+    )
+
+
+def plan_request(
+    request: Any, structured_output_manager: Any, k: int
+) -> list[int] | None:
+    """Replaces ``request.spec_token_ids`` with its GaaD row; returns its flags.
+
+    Returns None, leaving the drafts as they are, for a request GaaD skips: one
+    still prefilling, whose grammar does not constrain its next token (it has
+    none, it is not xgrammar, or reasoning has not ended), or that reports
+    logprobs or applies penalties (a ``GRAMMAR`` slot has no target logits row
+    to report or penalize).
+    """
+    if request.is_prefill_chunk or request.num_output_placeholders:
+        return None
+    structured = request.structured_output_request
+    if structured is None:
+        return None
+    # Reasoning tokens before the grammar starts are unconstrained.
+    bounds = structured_output_manager._get_constraint_bounds(request, ())
+    if bounds.constraint_start != 0:
+        return None
+    grammar = structured.grammar
+    matcher = getattr(grammar, "matcher", None)
+    if matcher is None or grammar.is_terminated():
+        return None
+    params = request.sampling_params
+    if params is None or params.logprobs is not None or _has_penalties(params):
+        return None
+    budget = min(k, request.max_tokens - request.num_output_tokens - 1)
+    if budget <= 0:
+        return None
+    model_draft = request.spec_token_ids[: draft_limit(k)]
+    cursor = GrammarCursor(matcher, structured_output_manager.tokenizer)
+    try:
+        tokens, flags = plan_draft_row(model_draft, cursor, budget)
+    finally:
+        cursor.rollback()
+    request.spec_token_ids = tokens
+    return flags
+
+
+def plan_running_requests(scheduler: Any) -> dict[str, list[int]]:
+    """Plans every running request's draft row; returns flags by request id."""
+    manager = scheduler.structured_output_manager
+    k = scheduler.num_spec_tokens
+    flags_by_req: dict[str, list[int]] = {}
+    limit = draft_limit(k)
+    for request in scheduler.running:
+        flags = plan_request(request, manager, k)
+        if flags is not None:
+            flags_by_req[request.request_id] = flags
+        elif len(request.spec_token_ids) > limit:
+            # A request GaaD skips keeps only the drafter's share of the row.
+            request.spec_token_ids = request.spec_token_ids[:limit]
+    return flags_by_req
+
+
+def scheduled_flags(
+    flags_by_req: dict[str, list[int]],
+    scheduled_spec_decode_tokens: dict[str, list[int]],
+) -> dict[str, list[int]]:
+    """Trims each planned row's flags to the drafts the scheduler scheduled."""
+    return {
+        req_id: flags_by_req[req_id][: len(tokens)]
+        for req_id, tokens in scheduled_spec_decode_tokens.items()
+        if req_id in flags_by_req
+    }
+
+
+def patch_scheduler() -> None:
+    """Plans GaaD rows in ``Scheduler.schedule`` in the engine-core process.
+
+    The scheduler sends the flags of each scheduled row to the runner as
+    ``SchedulerOutput.scheduled_spec_decode_flags``; a request without flags
+    has only ``MODEL`` drafts.
+    """
+    if not is_enabled():
+        return
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler, "_tpu_gaad_patched", False):
+        return
+    SchedulerOutput.scheduled_spec_decode_flags = None
+    original_schedule = Scheduler.schedule
+
+    def schedule(self: Any, *args: Any, **kwargs: Any) -> Any:
+        flags_by_req = plan_running_requests(self)
+        # Any: vLLM's SchedulerOutput does not declare the flags field added
+        # above; the runner reads it with getattr.
+        output: Any = original_schedule(self, *args, **kwargs)
+        if flags_by_req:
+            output.scheduled_spec_decode_flags = scheduled_flags(
+                flags_by_req, output.scheduled_spec_decode_tokens
+            )
+        return output
+
+    Scheduler.schedule = schedule
+    Scheduler._tpu_gaad_patched = True
+    logger.info("Applied TPU patch: GaaD draft rows in Scheduler.schedule.")
