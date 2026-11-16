@@ -35,6 +35,7 @@ the same way.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -125,7 +126,7 @@ def _kernel(
     # Out (HBM)
     out_hbm,  # [Mp, N] out dtype
     # Scratch
-    z_ref,  # VMEM [Mp + MCAP, K1] bf16: lhs rows, then h at row HROW
+    z_ref,  # VMEM [K1 / chunk, Mp + MCAP, chunk] bf16: lhs k-slices, h at row HROW
     a_ref,  # VMEM [2 * MCAP, N] f32: gate_up acc rows [0, MCAP), down acc after
     o_ref,  # VMEM [Mp + MCAP, N] out dtype
     w_ref,  # VMEM [slots, chunk, N] fp4
@@ -140,7 +141,7 @@ def _kernel(
     slots: int,
     buckets: tuple[int, ...],
     fuse_act: str,
-    stride0: bool = True,
+    w_load: str = "tile",
 ):
     k1 = lhs_hbm.shape[1]
     n = w1_hbm.shape[2]
@@ -151,6 +152,7 @@ def _kernel(
     c1 = k1 // chunk
     ce = c1 + f // chunk
     kbc = chunk // _QB
+    act_cols = math.gcd(chunk, _ACT_COLS)
 
     # Hit groups in row order, as fill_metadata lays them out.
     group_offset = go_ref[0]
@@ -176,10 +178,17 @@ def _kernel(
     num_chunks = num_hit * ce
     lhs_rows = pl.multiple_of(pl.cdiv(end_rows, _SUB) * _SUB, _SUB)
 
-    def lhs_copy():
-        return pltpu.make_async_copy(
-            lhs_hbm.at[pl.ds(0, lhs_rows)], z_ref.at[pl.ds(0, lhs_rows)], iosem.at[0]
-        )
+    def lhs_copies():
+        # k-slice i of the lhs rows to z_ref[i]: compute indexes slices on a
+        # leading dim, never at a dynamic lane offset.
+        return [
+            pltpu.make_async_copy(
+                lhs_hbm.at[pl.ds(0, lhs_rows), pl.ds(i * chunk, chunk)],
+                z_ref.at[i, pl.ds(0, lhs_rows)],
+                iosem.at[0],
+            )
+            for i in range(c1)
+        ]
 
     def chunk_copies(t, w1_side: bool):
         """The weight and scale copies of chunk t from rhs1 or rhs2."""
@@ -229,43 +238,45 @@ def _kernel(
         is_w2 = c >= c1
         cc = jnp.where(is_w2, c - c1, c)
         row0 = pl.multiple_of(jnp.where(is_w2, hrow, a), _SUB)
-        koff = pl.multiple_of(cc * chunk, _QB)
         arow0 = pl.multiple_of(jnp.where(is_w2, mcap, 0), _SUB)
 
         @pl.when(cc == 0)
         def _():
             a_ref[pl.ds(arow0, mb), :] = jnp.zeros((mb, n), jnp.float32)
 
-        x = z_ref[pl.ds(row0, mb), pl.ds(koff, chunk)]
+        x = z_ref[cc, pl.ds(row0, mb), :]
         w_slot = w_ref.at[slot]
         s_slot = s_ref.at[slot]
         fp8 = jnp.float8_e4m3fn
+        w_all = w_slot[...] if w_load == "full" else None
         for c0 in range(0, n, _NCOL):
             acc = a_ref[pl.ds(arow0, mb), pl.ds(c0, _NCOL)]
             for kb in range(kbc):
-                w = w_slot[pl.ds(kb * _QB, _QB), pl.ds(c0, _NCOL)].astype(fp8)
+                if w_all is None:
+                    w = w_slot[pl.ds(kb * _QB, _QB), pl.ds(c0, _NCOL)]
+                else:
+                    w = w_all[kb * _QB : (kb + 1) * _QB, c0 : c0 + _NCOL]
+                w = w.astype(fp8)
                 blk = jnp.matmul(
                     x[:, kb * _QB : (kb + 1) * _QB],
                     w,
                     preferred_element_type=jnp.float32,
                 )
-                if stride0:  # zero-stride sublane broadcast load
-                    scale = s_slot[kb, pl.ds(0, mb, 0), pl.ds(c0, _NCOL)]
-                else:  # interpret mode
-                    scale = s_slot[kb, 0:1, pl.ds(c0, _NCOL)]
-                blk = blk * scale
+                # [1, 256] row, broadcast over the rows (same products).
+                blk = blk * s_slot[kb, 0:1, pl.ds(c0, _NCOL)]
                 acc = acc + blk
             a_ref[pl.ds(arow0, mb), pl.ds(c0, _NCOL)] = acc
 
         @pl.when(c == c1 - 1)
         def _():
             # h = act(gate, up), rounded to the lhs dtype (gmm_v2's h).
-            for c0 in range(0, f, _ACT_COLS):
-                gate = a_ref[0:mb, c0 : c0 + _ACT_COLS]
-                up = a_ref[0:mb, f + c0 : f + c0 + _ACT_COLS]
-                z_ref[hrow : hrow + mb, c0 : c0 + _ACT_COLS] = _gmm.gate_up_act(
-                    gate, up, fuse_act
-                ).astype(z_ref.dtype)
+            for c0 in range(0, f, act_cols):
+                gate = a_ref[0:mb, c0 : c0 + act_cols]
+                up = a_ref[0:mb, f + c0 : f + c0 + act_cols]
+                lo = c0 % chunk
+                z_ref[c0 // chunk, hrow : hrow + mb, lo : lo + act_cols] = (
+                    _gmm.gate_up_act(gate, up, fuse_act).astype(z_ref.dtype)
+                )
 
         @pl.when(c == ce - 1)
         def _():
@@ -298,14 +309,16 @@ def _kernel(
 
     @pl.when(num_chunks > 0)
     def _():
-        lhs_copy().start()
+        for cp in lhs_copies():
+            cp.start()
         for i in range(slots - 1):
 
             @pl.when(i < num_chunks)
             def _():
                 start_chunk(i)
 
-        lhs_copy().wait()
+        for cp in lhs_copies():
+            cp.wait()
 
         def body(t, carry):
             nxt = t + slots - 1
@@ -361,6 +374,7 @@ def gmm_decode_stream_mlp(
     slots: int,
     max_group_size: int | None = None,
     interpret: bool = False,
+    w_load: str = "tile",
 ) -> jax.Array:
     size_m, k1 = lhs.shape
     g, _, n = rhs1.shape
@@ -373,7 +387,7 @@ def gmm_decode_stream_mlp(
     capacity = 64 << 20 if interpret else pltpu.get_tpu_info().vmem_capacity_bytes
     vmem_limit = min(
         int(capacity * 0.9),
-        _gmm.align_to(need + (6 << 20), 1 << 20),
+        _gmm.align_to(need + (8 << 20), 1 << 20),
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     kernel = functools.partial(
@@ -383,7 +397,7 @@ def gmm_decode_stream_mlp(
         slots=slots,
         buckets=buckets,
         fuse_act=fuse_act,
-        stride0=not interpret,
+        w_load=w_load,
     )
     w_bytes = g * (k1 * n + f * n) // 2 + g * (k1 + f) // _QB * n * 4
     call = pl.pallas_call if interpret else tight_vmem.pallas_call
@@ -397,7 +411,7 @@ def gmm_decode_stream_mlp(
             in_specs=[hbm, hbm, hbm, hbm, hbm],
             out_specs=hbm,
             scratch_shapes=[
-                pltpu.VMEM((size_m + mcap, k1), lhs.dtype),
+                pltpu.VMEM((k1 // chunk_rows, size_m + mcap, chunk_rows), lhs.dtype),
                 pltpu.VMEM((2 * mcap, n), jnp.float32),
                 pltpu.VMEM((size_m + mcap, n), out_dtype),
                 pltpu.VMEM((slots, chunk_rows, n), rhs1.dtype),
@@ -412,7 +426,7 @@ def gmm_decode_stream_mlp(
             vmem_limit_bytes=vmem_limit,
             disable_bounds_checks=True,
         ),
-        name=f"gmm_decode_stream-g_{g}-m_{size_m}-k_{k1}-f_{f}-c_{chunk_rows}x{slots}"
+        name=f"gmm_decode_stream-g_{g}-m_{size_m}-k_{k1}-f_{f}-c_{chunk_rows}x{slots}-{w_load}"
         f"-b_{'_'.join(map(str, buckets))}",
         cost_estimate=pl.CostEstimate(
             flops=2 * size_m * (k1 * n + f * n),
