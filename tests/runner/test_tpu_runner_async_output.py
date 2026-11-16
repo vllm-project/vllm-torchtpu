@@ -346,7 +346,10 @@ def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
 
     def spy_to_cpu_nonblocking(tensors):
         calls.append("logprobs.to_cpu_nonblocking")
-        host_copies.append(to_cpu_nonblocking(tensors))
+        # On CPU the real method returns its input. Return a new tuple, as a
+        # copy from the device does, so the checks below can tell the host
+        # copy from the device tensors.
+        host_copies.append(to_cpu_nonblocking(tensors)._replace())
         return host_copies[-1]
 
     monkeypatch.setattr(LogprobsTensors, "to_cpu_nonblocking", spy_to_cpu_nonblocking)
@@ -361,6 +364,7 @@ def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
     assert calls == ["logprobs.to_cpu_nonblocking", "event.record"]
     (host,) = state.logprobs
     assert host.tensors is host_copies[0]
+    assert host.tensors is not device_logprobs
     assert np.array_equal(host.row_starts, np.arange(5))
     assert state._logprobs_tpu is not None
     assert state._logprobs_tpu[0] is device_logprobs
