@@ -108,8 +108,9 @@ served = functools.partial(
 )
 def test_cmp_matches_reference_and_served(tokens, swap, prologue):
     """Within bf16 rounding of a float64 reference at the kernel's rounding
-    points, no less accurate than the served kernel, and within 1% of max of
-    the served kernel (the served one rounds the norm twice). The combined
+    points, no less accurate than the served kernel, and as close to the
+    served kernel as the served kernel's own error allows (it rounds the norm
+    twice); the gates of test_qwen4_exp_hc_prefill_cmp_tpu.py. The combined
     streams are the served kernel's bit for bit."""
     residual, block, injection, weights = _inputs(5 * tokens + int(prologue), tokens)
     partial = bool(tokens % TILE)
@@ -125,9 +126,10 @@ def test_cmp_matches_reference_and_served(tokens, swap, prologue):
             np.testing.assert_array_equal(g, s)
             continue
         vs, cr, sr = _metrics(g, s), _metrics(g, r), _metrics(s, r)
-        assert vs["max_rel"] <= 1e-2 and vs["l2"] <= 1e-2, (name, vs)
         assert cr["max_rel"] <= 2.0**-7 and cr["l2"] <= 1e-3, (name, cr)
         assert cr["l2"] <= 2.0 * sr["l2"] + 1e-5, (name, cr, sr)
+        assert cr["max_rel"] <= max(sr["max_rel"], 2.0**-7), (name, cr, sr)
+        assert vs["l2"] <= 1e-2 and vs["max_rel"] <= sr["max_rel"] + 2.0**-7, (name, vs, sr)
 
 
 @pytest.mark.parametrize("tokens", [2 * TILE, 2 * TILE + 48])

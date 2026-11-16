@@ -4,16 +4,24 @@ against the served prefill HC kernels (hc_prefill_fused at
 TPU_QWEN4_HC_PREFILL_NORM=bf16ep64, gated_residual) on the same inputs, at
 Flash's shapes and the prefill chunk sizes.
 
-The kernels differ in the norm's rounding (the cmp kernel rounds once, the
-served one twice), the summation orders and the sigmoid's implementation, so
-the gate is a tolerance, not equality. Per output (mixed, injection):
-max |cmp - served| <= 1% of max |served| and ||cmp - served||_2 <= 1% of
-||served||_2; against a float64 host reference with the cmp kernel's rounding
-points, max <= 2^-7 of max |ref| and l2 <= 1e-3, and the cmp kernel's l2 error
-at most twice the served kernel's (plus 1e-5). The combined streams equal the
-served kernel's bit for bit, the combine prologue equals gated_residual
-followed by the mix without prologue bit for bit (the fold's premise), and a
-second call returns the same bits.
+The kernels differ in the norm's rounding (the cmp kernel rounds once, as the
+torch path does; the served one twice), the summation orders and the
+sigmoid's implementation, so the gate is a tolerance, not equality. The
+reference is float64 host math with the cmp kernel's rounding points. Per
+output (mixed, injection):
+
+* accuracy: cmp against the reference, max <= 2^-7 of max |ref| and
+  l2 <= 1e-3 of ||ref||;
+* no less accurate than served: cmp's l2 error at most twice served's (plus
+  1e-5), cmp's max error at most max(served's, 2^-7 of max |ref|);
+* against served: l2 <= 1e-2 of ||served||, and max at most served's own max
+  error against the reference plus 2^-7 of max |served| (the served kernel's
+  double rounding alone puts it 0.96% of max from the reference at 512 rows in
+  interpret mode, so a fixed 1%-of-max line would gate on served's error).
+
+The combined streams equal the served kernel's bit for bit, the combine
+prologue equals gated_residual followed by the mix without prologue bit for
+bit (the fold's premise), and a second call returns the same bits.
 
 Run it on a TPU host, e.g. through the bench recipe:
 ``BENCH=script "BENCH_CMD=python -m pytest -q -s
@@ -135,12 +143,12 @@ def test_tpu_cmp_matches_served(tokens, prologue):
             continue
         vs, cr, sr = _metrics(c, s), _metrics(c, ref[i]), _metrics(s, ref[i])
         record[name] = dict(vs_served=vs, cmp_vs_ref=cr, served_vs_ref=sr)
-        if vs["max_rel"] > 1e-2 or vs["l2"] > 1e-2:
-            failures.append((name, "tolerance against served", vs))
         if cr["max_rel"] > 2.0**-7 or cr["l2"] > 1e-3:
             failures.append((name, "tolerance against the float64 reference", cr))
-        if cr["l2"] > 2.0 * sr["l2"] + 1e-5:
-            failures.append((name, "less accurate than served", cr["l2"], sr["l2"]))
+        if cr["l2"] > 2.0 * sr["l2"] + 1e-5 or cr["max_rel"] > max(sr["max_rel"], 2.0**-7):
+            failures.append((name, "less accurate than served", cr, sr))
+        if vs["l2"] > 1e-2 or vs["max_rel"] > sr["max_rel"] + 2.0**-7:
+            failures.append((name, "tolerance against served", vs, sr))
     if prologue:
         # The fold's premise: prologue = gated_residual, then the mix.
         sep = gated_residual_fn(BRANCHES, HIDDEN, TILE, partial)(residual, block, injection)
