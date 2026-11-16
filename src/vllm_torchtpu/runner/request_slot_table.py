@@ -11,18 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reusable request-ID-keyed device-slot table for stateful sampling adapters.
+"""Request-ID-keyed slots and a device table of small int32 rows.
 
-``TPUModelRunner`` reorders batch rows mid-step in ``_reorder_batch_for_rpa``
-and under ``--async-scheduling`` leaves unsettled output placeholders in flight
-when ``sample_tokens()`` begins. Stateful sampling adapters (such as
-``thinking_token_budget``, token penalties, or ``bad_words``) can own a
-``RequestSlotTable`` to maintain fixed-shape ``[max_num_reqs + 1, num_cols]``
-per-request state on device (with slot ``0`` reserved as an untracked sentinel),
-release slots across unscheduled waves, and reuse cached per-chunk
-``slot_ids`` H2D uploads across steady-state decode steps.
+``RequestSlotAllocator`` maps request IDs to slots ``1..max_num_reqs`` on the
+host. Slot ``0`` is a null slot: chunk slot-ID arrays point padding, untracked
+and discarded rows at it.
+
+``RequestSlotTable`` keeps one fixed-width int32 row per leased slot in a
+``[max_num_reqs + 1, num_cols]`` tensor on the device. It is meant for a few
+int32 values of per-request sampling state that must stay on the device across
+steps while requests change batch rows: ``TPUModelRunner`` reorders the batch
+in ``_reorder_batch_for_rpa``, drops a request from the batch in a step that
+does not schedule it, and under ``--async-scheduling`` still has output
+placeholders in flight when ``sample_tokens()`` begins. Keying slots on request
+IDs keeps each row with its request through all three.
 """
 
+import operator
 from collections.abc import Callable, Container, Iterable, Sequence
 from collections.abc import Set as AbstractSet
 
@@ -30,15 +35,132 @@ import numpy as np
 import torch
 
 from vllm_torchtpu.layers.adapter.sample.scatter_ops import seed_slot_rows
+from vllm_torchtpu.utils import synchronize_tensors
+
+_INT32 = np.iinfo(np.int32)
+
+
+class RequestSlotAllocator:
+    """Host-side map from request IDs to slots ``1..max_num_reqs``.
+
+    Slot ``0`` is never leased. The owner decides when a request leases and
+    releases its slot; the allocator keeps no device state.
+    """
+
+    def __init__(self, max_num_reqs: int) -> None:
+        if max_num_reqs <= 0:
+            raise ValueError(f"max_num_reqs must be positive, got {max_num_reqs}")
+        self._max_num_reqs = max_num_reqs
+        self._slot_by_req_id: dict[str, int] = {}
+        # Popped from the end, so the first lease gets slot 1.
+        self._free_slots = list(range(max_num_reqs, 0, -1))
+
+    @property
+    def max_num_reqs(self) -> int:
+        return self._max_num_reqs
+
+    def slot_for(self, req_id: str) -> int | None:
+        """Return the slot leased to ``req_id``, or None."""
+        return self._slot_by_req_id.get(req_id)
+
+    def allocated_req_ids(self) -> AbstractSet[str]:
+        """Return a live view of the request IDs that hold a slot."""
+        return self._slot_by_req_id.keys()
+
+    def lease(self, req_id: str) -> int:
+        """Return the slot of ``req_id``, leasing a free one if it holds none.
+
+        Raises:
+            RuntimeError: all ``max_num_reqs`` slots are leased.
+        """
+        slot = self._slot_by_req_id.get(req_id)
+        if slot is None:
+            if not self._free_slots:
+                raise RuntimeError(
+                    f"RequestSlotAllocator is full: all {self._max_num_reqs} "
+                    "slots are leased"
+                )
+            slot = self._free_slots.pop()
+            self._slot_by_req_id[req_id] = slot
+        return slot
+
+    def release(self, req_ids: Iterable[str]) -> None:
+        """Free the slots of the requests in ``req_ids`` that hold one."""
+        for req_id in req_ids:
+            slot = self._slot_by_req_id.pop(req_id, None)
+            if slot is not None:
+                self._free_slots.append(slot)
+
+    def build_chunk_slot_ids(
+        self,
+        batch_req_ids: Sequence[str | None],
+        start_idx: int,
+        end_idx: int,
+        discard_req_ids: AbstractSet[str] = frozenset(),
+    ) -> np.ndarray | None:
+        """Return the slot IDs of batch rows ``[start_idx, end_idx)``.
+
+        The result is a ``[max_num_reqs]`` int32 array: entry ``i`` is the
+        slot of ``batch_req_ids[start_idx + i]``, and 0 for rows past the end
+        of the batch, empty rows, requests without a slot, requests in
+        ``discard_req_ids`` and the padding. Returns None when no row has a
+        slot. The caller uploads the array.
+
+        Raises:
+            ValueError: the range is invalid, the chunk has more than
+                ``max_num_reqs`` rows, or two rows hold the same slot.
+        """
+        if start_idx < 0 or end_idx < start_idx:
+            raise ValueError(f"invalid chunk range [{start_idx}, {end_idx})")
+        upper = min(end_idx, len(batch_req_ids))
+        if upper - start_idx > self._max_num_reqs:
+            raise ValueError(
+                f"chunk [{start_idx}, {upper}) has {upper - start_idx} rows, "
+                f"more than max_num_reqs={self._max_num_reqs}"
+            )
+        slots = np.zeros(self._max_num_reqs, dtype=np.int32)
+        for row, req_id in enumerate(batch_req_ids[start_idx:upper]):
+            if req_id is None or req_id in discard_req_ids:
+                continue
+            slot = self._slot_by_req_id.get(req_id)
+            if slot is not None:
+                slots[row] = slot
+        active = slots[slots > 0]
+        if active.size == 0:
+            return None
+        if np.unique(active).size != active.size:
+            raise ValueError(
+                f"chunk [{start_idx}, {upper}) lists a request twice: "
+                f"slots {slots[: upper - start_idx].tolist()}"
+            )
+        return slots
 
 
 class RequestSlotTable[RowT: Sequence[int]]:
-    """Request-ID-keyed ``[max_num_reqs + 1, num_cols]`` int32 device-slot pool.
+    """``[max_num_reqs + 1, num_cols]`` int32 device table with one row per
+    slot of its ``allocator``.
 
-    Slot ``0`` is a permanent untracked sentinel row; slots ``1..max_num_reqs``
-    are leased to active requests in ``input_batch`` and released when requests
-    finish, are preempted, or rotate out in unscheduled waves. The table lives
-    on ``device`` and is allocated on first use.
+    Row 0 holds ``sentinel_row``, and the slot scatters in ``scatter_ops``
+    leave it unchanged, so kernels can read it for padding and untracked rows.
+    One step goes in this order:
+
+    1. The owner calls ``release`` for requests that finished or were
+       preempted, and ``mark_dirty`` for rows it has rebuilt (for example a
+       resumed request's state).
+    2. ``sync_step`` releases the slots of tracked requests that are not in
+       the batch, leases a slot for each tracked request that is, and writes
+       their new rows to the table in one ``seed_slot_rows`` call.
+    3. Kernels read and update the rows through slot IDs from
+       ``allocator.build_chunk_slot_ids``, and the owner stores their output
+       with ``commit_table``.
+
+    In ``sync_step``, a request's row comes from ``mark_dirty`` when one is
+    staged. Otherwise, a request without a slot (new, or back after leaving
+    the batch) gets ``compute_cold_row(req_id)``, and a request that keeps its
+    slot keeps its row.
+
+    If ``sync_step`` raises, the leases and staged rows no longer match the
+    table. The runner stops on such errors, so the table is not reused.
     """
 
     def __init__(
@@ -48,119 +170,118 @@ class RequestSlotTable[RowT: Sequence[int]]:
         device: torch.device,
         sentinel_row: Sequence[int] | None = None,
     ) -> None:
-        self._max_num_reqs = int(max_num_reqs)
-        if self._max_num_reqs <= 0:
-            raise ValueError(f"max_num_reqs must be positive, got {max_num_reqs}")
-        self._num_cols = int(num_cols)
-        if self._num_cols <= 0:
+        self._allocator = RequestSlotAllocator(max_num_reqs)
+        if num_cols <= 0:
             raise ValueError(f"num_cols must be positive, got {num_cols}")
+        self._num_cols = num_cols
         self._device = device
-        default_row = (
-            tuple(int(v) for v in sentinel_row)
-            if sentinel_row is not None
-            else (0,) * self._num_cols
+        self._sentinel_row: tuple[int, ...] = self._check_row(
+            (0,) * num_cols if sentinel_row is None else sentinel_row
         )
-        if len(default_row) != self._num_cols:
-            raise ValueError(
-                f"sentinel_row length {len(default_row)} != num_cols {self._num_cols}"
-            )
-        self._sentinel_row: tuple[int, ...] = default_row
-        self._capacity = self._max_num_reqs + 1
-        self._slot_by_req_id: dict[str, int] = {}
-        self._free_slots: list[int] = list(range(self._capacity - 1, 0, -1))
         self._dirty_rows: dict[str, RowT] = {}
         self._table: torch.Tensor | None = None
-        # Last slot-ID upload per chunk (start_idx, width) with the host bytes
-        # it came from, so every chunk of a multi-chunk step reuses its own.
-        self._slot_ids_cache: dict[tuple[int, int], tuple[bytes, torch.Tensor]] = {}
+
+    @property
+    def allocator(self) -> RequestSlotAllocator:
+        return self._allocator
 
     @property
     def max_num_reqs(self) -> int:
-        return self._max_num_reqs
+        return self._allocator.max_num_reqs
 
     @property
     def device(self) -> torch.device:
         return self._device
 
-    # Read-only slot/table introspection for unit tests and stateful adapters.
-    @property
-    def table(self) -> torch.Tensor | None:
+    def _check_row(self, row: Sequence[int]) -> tuple[int, ...]:
+        if len(row) != self._num_cols:
+            raise ValueError(f"row {row!r} has {len(row)} values, not {self._num_cols}")
+        values = tuple(operator.index(v) for v in row)  # TypeError if not integers
+        if not all(_INT32.min <= v <= _INT32.max for v in values):
+            raise ValueError(f"row {values} does not fit in int32")
+        return values
+
+    def _ensure_table(self) -> torch.Tensor:
+        if self._table is None:
+            rows = np.tile(
+                np.asarray(self._sentinel_row, dtype=np.int32),
+                (self.max_num_reqs + 1, 1),
+            )
+            self._table = torch.from_numpy(rows).to(self._device)
         return self._table
-
-    def slot_for(self, req_id: str) -> int | None:
-        return self._slot_by_req_id.get(req_id)
-
-    def has_dirty(self, req_id: str) -> bool:
-        return req_id in self._dirty_rows
-
-    def allocated_req_ids(self) -> AbstractSet[str]:
-        return self._slot_by_req_id.keys()
 
     def commit_table(self, table: torch.Tensor) -> None:
+        """Store ``table``, for example a kernel's output, as the device state.
+
+        The leases do not change.
+
+        Raises:
+            ValueError: ``table`` does not have this table's shape, int32 dtype
+                or device type.
+        """
+        shape = (self.max_num_reqs + 1, self._num_cols)
+        if (
+            tuple(table.shape) != shape
+            or table.dtype != torch.int32
+            or table.device.type != self._device.type
+        ):
+            raise ValueError(
+                f"expected a {shape} int32 table on {self._device.type}, got "
+                f"{tuple(table.shape)} {table.dtype} on {table.device.type}"
+            )
         self._table = table
 
-    def ensure_table(self) -> torch.Tensor:
-        if self._table is None:
-            sentinel_np = np.tile(
-                np.asarray(self._sentinel_row, dtype=np.int32), (self._capacity, 1)
-            )
-            self._table = torch.from_numpy(sentinel_np).to(self._device)
-            self._slot_ids_cache.clear()
-        return self._table
-
     def mark_dirty(self, req_id: str, row: RowT) -> None:
+        """Stage ``row`` as the state of ``req_id``.
+
+        The next ``sync_step`` that finds ``req_id`` in the batch writes it,
+        whether or not the request holds a slot. ``release`` and
+        ``release_unscheduled`` drop it.
+
+        Raises:
+            ValueError: ``row`` does not have ``num_cols`` int32 values.
+            TypeError: a value is not an integer.
+        """
+        self._check_row(row)
         self._dirty_rows[req_id] = row
 
-    def _release_slot(self, req_id: str) -> None:
-        slot = self._slot_by_req_id.pop(req_id, None)
-        if slot is not None:
-            self._free_slots.append(slot)
+    def release(self, req_ids: Iterable[str]) -> None:
+        """Free the slots and staged rows of ``req_ids``.
 
-    def release(self, req_ids: Iterable[str] | None) -> None:
-        """Free slots and pending dirty rows for ``req_ids``."""
-        if not req_ids:
-            return
-        for req_id in req_ids:
+        Call it before ``sync_step`` for requests that finished or were
+        preempted in this step. ``sync_step`` only releases requests that are
+        not in the batch, so a request preempted and resumed in the same step
+        would otherwise keep its old row.
+        """
+        released = list(req_ids)
+        for req_id in released:
             self._dirty_rows.pop(req_id, None)
-            self._release_slot(req_id)
+        self._allocator.release(released)
 
     def release_unscheduled(self, active_req_ids: Container[str]) -> None:
-        """Free slots and dirty rows for requests absent from ``active_req_ids``."""
-        if not self._slot_by_req_id and not self._dirty_rows:
-            return
-        for req_id in list(self._slot_by_req_id):
-            if req_id not in active_req_ids:
-                self._dirty_rows.pop(req_id, None)
-                self._release_slot(req_id)
-        for req_id in list(self._dirty_rows):
-            if req_id not in active_req_ids:
-                self._dirty_rows.pop(req_id, None)
+        """Free the slots and staged rows of requests not in ``active_req_ids``."""
+        self.release(
+            [
+                req_id
+                for req_id in (*self._allocator.allocated_req_ids(), *self._dirty_rows)
+                if req_id not in active_req_ids
+            ]
+        )
 
     def needs_cold_reseed(
         self,
         batch_req_ids: Iterable[str | None],
         tracked_req_ids: Container[str],
     ) -> bool:
-        """Return True if ``sync_step`` will invoke ``compute_cold_row``."""
+        """Return True if ``sync_step`` will call ``compute_cold_row``: a tracked
+        request in the batch holds no slot and has no staged row."""
         return any(
             req_id is not None
             and req_id in tracked_req_ids
-            and req_id not in self._slot_by_req_id
+            and self._allocator.slot_for(req_id) is None
             and req_id not in self._dirty_rows
             for req_id in batch_req_ids
         )
-
-    def _allocate_slot(self, req_id: str) -> int:
-        existing = self._slot_by_req_id.get(req_id)
-        if existing is not None:
-            return existing
-        assert self._free_slots, (
-            f"RequestSlotTable pool exhausted "
-            f"(max_num_reqs={self._max_num_reqs}, capacity={self._capacity})"
-        )
-        slot = self._free_slots.pop()
-        self._slot_by_req_id[req_id] = slot
-        return slot
 
     def sync_step(
         self,
@@ -168,113 +289,65 @@ class RequestSlotTable[RowT: Sequence[int]]:
         tracked_req_ids: Container[str],
         compute_cold_row: Callable[[str], RowT],
     ) -> torch.Tensor | None:
-        """Lease slots and seed dirty/cold rows for the tracked requests in
-        ``batch_req_ids``, after releasing those no longer in it.
+        """Lease slots and write rows for the tracked requests in
+        ``batch_req_ids``, after releasing the tracked requests not in it.
 
-        Returns the device table, or None when no tracked request is in the
-        batch.
+        A request listed twice in ``batch_req_ids`` is handled once. Returns
+        the device table, or None when no tracked request is in the batch.
+
+        Raises:
+            RuntimeError: more tracked requests than ``max_num_reqs``.
+            ValueError, TypeError: ``compute_cold_row`` returned an invalid row.
         """
-        batch_tracked = list(
-            dict.fromkeys(
-                req_id
-                for req_id in batch_req_ids
-                if req_id is not None and req_id in tracked_req_ids
-            )
-        )
+        batch_tracked = [
+            req_id
+            for req_id in batch_req_ids
+            if req_id is not None and req_id in tracked_req_ids
+        ]
         # Release first, also when no tracked request is left in the batch,
-        # so a request that returns later is cold-seeded.
+        # so a request that returns later gets a cold row.
         self.release_unscheduled(set(batch_tracked))
         if not batch_tracked:
             return None
 
-        table = self.ensure_table()
-        to_seed: list[tuple[int, RowT]] = []
+        table = self._ensure_table()
+        to_seed: list[tuple[int, Sequence[int]]] = []
         for req_id in batch_tracked:
-            had_slot = req_id in self._slot_by_req_id
-            slot = self._allocate_slot(req_id)
-            dirty = self._dirty_rows.pop(req_id, None)
-            if dirty is None and not had_slot:
-                dirty = compute_cold_row(req_id)
-            if dirty is not None:
-                to_seed.append((slot, dirty))
+            had_slot = self._allocator.slot_for(req_id) is not None
+            slot = self._allocator.lease(req_id)
+            row = self._dirty_rows.pop(req_id, None)
+            if row is None and not had_slot:
+                row = self._check_row(compute_cold_row(req_id))
+            if row is not None:
+                to_seed.append((slot, row))
 
         if to_seed:
-            # Each row is for a distinct leased slot, so one [max_num_reqs]
-            # scatter seeds them all.
-            assert len(to_seed) <= self._max_num_reqs
-            slots_np = np.zeros(self._max_num_reqs, dtype=np.int32)
-            vals_np = np.tile(
-                np.asarray(self._sentinel_row, dtype=np.int32),
-                (self._max_num_reqs, 1),
-            )
-            for idx, (slot, row_vals) in enumerate(to_seed):
+            # Each row has its own slot, so one [max_num_reqs] scatter writes
+            # all of them; unused entries point at slot 0, which it leaves
+            # unchanged.
+            slots_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+            rows_np = np.zeros((self.max_num_reqs, self._num_cols), dtype=np.int32)
+            for idx, (slot, row) in enumerate(to_seed):
                 slots_np[idx] = slot
-                vals_np[idx] = row_vals
+                rows_np[idx] = row
             # Synchronous .to(device): sample_tokens() runs after the runner's
-            # input-staging fence, so async H2D from temporary CPU buffers
-            # would risk reading freed host memory in TorchTPU.
+            # input-staging fence, so an async H2D copy from these temporary
+            # arrays could read freed host memory in TorchTPU.
             table = seed_slot_rows(
                 table,
                 torch.from_numpy(slots_np).to(self._device),
-                torch.from_numpy(vals_np).to(self._device),
+                torch.from_numpy(rows_np).to(self._device),
             )
             self._table = table
         return table
 
-    def build_chunk_slot_ids(
-        self,
-        batch_req_ids: Sequence[str | None],
-        start_idx: int,
-        end_idx: int,
-        padded_num_reqs: int | None = None,
-        discard_req_ids: AbstractSet[str] | None = None,
-    ) -> torch.Tensor | None:
-        """Build ``[padded_num_reqs]`` int32 slot IDs for ``[start_idx, end_idx)``."""
-        width = self._max_num_reqs if padded_num_reqs is None else int(padded_num_reqs)
-        upper = min(end_idx, len(batch_req_ids))
-        assert upper - start_idx <= width, (
-            f"Chunk [{start_idx}, {upper}) has {upper - start_idx} rows, more "
-            f"than its {width} slot IDs"
-        )
-        slots_np = np.zeros(width, dtype=np.int32)
-        seen_slots: set[int] = set()
-        any_active = False
-        for batch_i in range(start_idx, upper):
-            req_id = batch_req_ids[batch_i]
-            if req_id is None:
-                continue
-            slot = self._slot_by_req_id.get(req_id)
-            if slot is None or (
-                discard_req_ids is not None and req_id in discard_req_ids
-            ):
-                continue
-            assert slot not in seen_slots, (
-                f"Duplicate slot {slot} for req_id={req_id!r} in chunk"
-            )
-            seen_slots.add(slot)
-            slots_np[batch_i - start_idx] = slot
-            any_active = True
-        if not any_active:
-            return None
-        key = (start_idx, width)
-        slots_bytes = slots_np.tobytes()
-        cached = self._slot_ids_cache.get(key)
-        if cached is not None and cached[0] == slots_bytes:
-            return cached[1]
-        dev = torch.from_numpy(slots_np).to(self._device)
-        self._slot_ids_cache[key] = (slots_bytes, dev)
-        return dev
-
-    def precompile(self, sync_fn: Callable[..., None]) -> torch.Tensor:
-        """Warm ``seed_slot_rows`` at ``[max_num_reqs]`` width."""
-        table = self.ensure_table()
-        seed_slots = torch.zeros(self._max_num_reqs, dtype=torch.int32).to(self._device)
-        seed_vals = np.tile(
-            np.asarray(self._sentinel_row, dtype=np.int32), (self._max_num_reqs, 1)
-        )
-        table = seed_slot_rows(
-            table, seed_slots, torch.from_numpy(seed_vals).to(self._device)
-        )
-        sync_fn(table)
+    def precompile(self) -> torch.Tensor:
+        """Compile ``seed_slot_rows`` at the shapes ``sync_step`` uses, and
+        return the table."""
+        table = self._ensure_table()
+        slots = torch.zeros(self.max_num_reqs, dtype=torch.int32).to(self._device)
+        rows = torch.zeros((self.max_num_reqs, self._num_cols), dtype=torch.int32)
+        table = seed_slot_rows(table, slots, rows.to(self._device))
+        synchronize_tensors(table)
         self._table = table
         return table

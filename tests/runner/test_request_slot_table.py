@@ -11,97 +11,158 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for ``RequestSlotTable``, the request-ID-keyed device-slot pool."""
+"""Tests for ``RequestSlotAllocator`` and ``RequestSlotTable``."""
 
+from typing import Any
+
+import numpy as np
 import pytest
 import torch
 
 from vllm_torchtpu.runner import request_slot_table
-from vllm_torchtpu.runner.request_slot_table import RequestSlotTable
+from vllm_torchtpu.runner.request_slot_table import (
+    RequestSlotAllocator,
+    RequestSlotTable,
+)
 
 CPU = torch.device("cpu")
 
 
 @pytest.fixture(autouse=True)
-def _eager_seed_kernel():
-    """Run the ``@torch.compile(backend="tpu")`` seed kernel eagerly on CPU."""
+def _eager_seed_kernel(request: pytest.FixtureRequest):
+    """Run the ``@torch.compile(backend="tpu")`` seed kernel eagerly on CPU,
+    except in TPU tests, which run it compiled."""
+    if request.node.get_closest_marker("tpu_test"):
+        yield
+        return
     with torch.compiler.set_stance("force_eager"):
         yield
 
 
-def test_constructor_validates_row_shape() -> None:
+def _cold_rows(rows: dict[str, tuple[int, ...]], calls: list[str]):
+    def compute_cold_row(req_id: str) -> tuple[int, ...]:
+        calls.append(req_id)
+        return rows[req_id]
+
+    return compute_cold_row
+
+
+def _row(pool: RequestSlotTable, table: torch.Tensor, req_id: str) -> list[int]:
+    slot = pool.allocator.slot_for(req_id)
+    assert slot is not None
+    return table[slot].tolist()
+
+
+def test_allocator_leases_from_slot_one_and_reuses_freed_slots() -> None:
+    alloc = RequestSlotAllocator(max_num_reqs=2)
+    assert alloc.max_num_reqs == 2
+    assert alloc.lease("a") == 1 and alloc.lease("a") == 1
+    assert alloc.lease("b") == 2
+    assert set(alloc.allocated_req_ids()) == {"a", "b"}
+    with pytest.raises(RuntimeError, match="all 2 slots are leased"):
+        alloc.lease("c")
+    alloc.release(["a", "never-leased"])
+    assert alloc.slot_for("a") is None
+    assert alloc.lease("c") == 1
+
+
+def test_constructors_validate_their_arguments() -> None:
+    with pytest.raises(ValueError, match="max_num_reqs must be positive, got 0"):
+        RequestSlotAllocator(max_num_reqs=0)
     with pytest.raises(ValueError, match="max_num_reqs must be positive, got 0"):
         RequestSlotTable(max_num_reqs=0, num_cols=1, device=CPU)
     with pytest.raises(ValueError, match="num_cols must be positive"):
         RequestSlotTable(max_num_reqs=2, num_cols=0, device=CPU)
-    with pytest.raises(ValueError, match="sentinel_row length 1 != num_cols 2"):
+    with pytest.raises(ValueError, match=r"row \(1,\) has 1 values, not 2"):
         RequestSlotTable(max_num_reqs=2, num_cols=2, device=CPU, sentinel_row=(1,))
+    not_ints: Any = (0.5,)
+    with pytest.raises(TypeError):
+        RequestSlotTable(max_num_reqs=2, num_cols=1, device=CPU, sentinel_row=not_ints)
 
 
-def test_sync_step_leases_slots_and_seeds_dirty_and_cold_rows() -> None:
+def test_sync_step_leases_slots_and_seeds_staged_and_cold_rows() -> None:
     pool: RequestSlotTable[tuple[int, int]] = RequestSlotTable(
         max_num_reqs=2, num_cols=2, device=CPU, sentinel_row=(-99, 0)
     )
-    assert pool.max_num_reqs == 2 and pool.device == CPU and pool.table is None
-    tracked = {"a": (10, 1), "b": (20, 2), "c": (30, 3)}
-    pool.mark_dirty("a", tracked["a"])
-    assert not pool.needs_cold_reseed(["a"], tracked)
-    assert pool.needs_cold_reseed(["b"], tracked)
-    assert not pool.needs_cold_reseed(["untracked", None], tracked)
+    assert pool.max_num_reqs == 2 and pool.device == CPU
+    rows = {"a": (10, 1), "b": (20, 2), "c": (30, 3)}
+    pool.mark_dirty("a", rows["a"])
+    assert not pool.needs_cold_reseed(["a"], rows)
+    assert pool.needs_cold_reseed(["b"], rows)
+    assert not pool.needs_cold_reseed(["untracked", None], rows)
 
     cold_calls: list[str] = []
+    cold = _cold_rows(rows, cold_calls)
+    # Untracked and empty rows lease nothing and seed nothing.
+    tbl = pool.sync_step(["a", None, "untracked", "b"], rows, cold)
+    assert tbl is not None and tbl.shape == (3, 2)
+    assert cold_calls == ["b"]
+    assert tbl[0].tolist() == [-99, 0]
+    assert _row(pool, tbl, "a") == [10, 1] and _row(pool, tbl, "b") == [20, 2]
+    assert pool.allocator.slot_for("untracked") is None
+    slots = (pool.allocator.slot_for("a"), pool.allocator.slot_for("b"))
 
-    def cold_row(rid: str) -> tuple[int, int]:
-        cold_calls.append(rid)
-        return tracked[rid]
+    # Requests that keep their slot keep their row, without a cold row.
+    assert pool.sync_step(["b", "a"], rows, cold) is tbl
+    assert (pool.allocator.slot_for("a"), pool.allocator.slot_for("b")) == slots
 
-    # Untracked and missing rows lease nothing and seed nothing.
-    tbl = pool.sync_step(["a", None, "untracked", "b"], tracked, cold_row)
-    assert tbl is not None and pool.table is tbl and tbl.shape == (3, 2)
-    assert cold_calls == ["b"] and not pool.has_dirty("a")
-    assert tuple(tbl[0].tolist()) == (-99, 0)
-    sa, sb = pool.slot_for("a"), pool.slot_for("b")
-    assert sa is not None and sb is not None and sa != sb
-    assert tuple(tbl[sa].tolist()) == (10, 1)
-    assert tuple(tbl[sb].tolist()) == (20, 2)
-    assert pool.slot_for("untracked") is None
-
-    # Leased rows keep their slot and state across steps without reseeding.
-    assert pool.sync_step(["b", "a"], tracked, cold_row) is tbl
-    assert (pool.slot_for("a"), pool.slot_for("b")) == (sa, sb)
-
-    # A wave swap frees "a" and cold-seeds "c"; "a" cold-seeds again on return.
-    tbl = pool.sync_step(["b", "c"], tracked, cold_row)
-    assert tbl is not None and "a" not in pool.allocated_req_ids()
+    # "a" leaves the batch and loses its slot; "c" and later "a" get cold rows.
+    tbl = pool.sync_step(["b", "c"], rows, cold)
+    assert tbl is not None and "a" not in pool.allocator.allocated_req_ids()
     assert cold_calls == ["b", "c"]
-    tbl = pool.sync_step(["a", "c"], tracked, cold_row)
+    tbl = pool.sync_step(["a", "c"], rows, cold)
     assert tbl is not None and cold_calls == ["b", "c", "a"]
-    assert pool.sync_step(["untracked"], tracked, cold_row) is None
+    assert pool.sync_step(["untracked"], rows, cold) is None
+
+
+def test_mark_dirty_rewrites_the_row_of_a_request_that_keeps_its_slot() -> None:
+    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+        max_num_reqs=2, num_cols=1, device=CPU
+    )
+    rows = {"a": (7,)}
+    cold_calls: list[str] = []
+    cold = _cold_rows(rows, cold_calls)
+    tbl = pool.sync_step(["a"], rows, cold)
+    assert tbl is not None and cold_calls == ["a"]
+    slot = pool.allocator.slot_for("a")
+
+    pool.mark_dirty("a", (8,))
+    tbl = pool.sync_step(["a"], rows, cold)
+    assert tbl is not None and pool.allocator.slot_for("a") == slot
+    assert tbl[slot].tolist() == [8]
+    assert cold_calls == ["a"]
+
+
+def test_a_request_listed_twice_is_handled_once() -> None:
+    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+        max_num_reqs=2, num_cols=1, device=CPU
+    )
+    rows = {"a": (5,)}
+    cold_calls: list[str] = []
+    tbl = pool.sync_step(["a", "a"], rows, _cold_rows(rows, cold_calls))
+    assert tbl is not None and cold_calls == ["a"]
+    assert set(pool.allocator.allocated_req_ids()) == {"a"}
+    assert _row(pool, tbl, "a") == [5]
 
 
 def test_untracked_only_step_releases_slots() -> None:
     """A batch without tracked requests still releases the slots of the ones
-    that left, so a returning request is cold-seeded instead of keeping its
-    old row."""
+    that left, so a returning request gets a cold row instead of keeping its
+    old one."""
     pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
         max_num_reqs=2, num_cols=1, device=CPU
     )
-    tracked = {"a": (1,)}
+    rows = {"a": (1,)}
     cold_calls: list[str] = []
-
-    def cold_row(rid: str) -> tuple[int]:
-        cold_calls.append(rid)
-        return tracked[rid]
-
-    assert pool.sync_step(["a"], tracked, cold_row) is not None
-    assert pool.sync_step(["x", None], tracked, cold_row) is None
-    assert not pool.allocated_req_ids()
+    cold = _cold_rows(rows, cold_calls)
+    assert pool.sync_step(["a"], rows, cold) is not None
+    assert pool.sync_step(["x", None], rows, cold) is None
+    assert not pool.allocator.allocated_req_ids()
     # "a" returns with a state that moved on while it was away.
-    tracked["a"] = (5,)
-    tbl = pool.sync_step(["a"], tracked, cold_row)
-    slot = pool.slot_for("a")
-    assert tbl is not None and slot is not None and cold_calls == ["a", "a"]
-    assert tbl[slot].tolist() == [5]
+    rows["a"] = (5,)
+    tbl = pool.sync_step(["a"], rows, cold)
+    assert tbl is not None and cold_calls == ["a", "a"]
+    assert _row(pool, tbl, "a") == [5]
 
 
 def test_sync_step_seeds_new_rows_in_one_scatter(
@@ -121,147 +182,188 @@ def test_sync_step_seeds_new_rows_in_one_scatter(
     pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
         max_num_reqs=3, num_cols=1, device=CPU
     )
-    tracked = {"a": (1,), "b": (2,), "c": (3,)}
-    tbl = pool.sync_step(["a", "b", "c"], tracked, tracked.__getitem__)
+    rows = {"a": (1,), "b": (2,), "c": (3,)}
+    tbl = pool.sync_step(["a", "b", "c"], rows, rows.__getitem__)
     assert tbl is not None and seeded == [3]
     assert sorted(tbl[1:, 0].tolist()) == [1, 2, 3]
 
 
-def test_release_frees_slots_and_dirty_rows() -> None:
+def test_release_frees_slots_and_staged_rows() -> None:
     pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
         max_num_reqs=3, num_cols=1, device=CPU
     )
-    tracked = {rid: (7,) for rid in ("a", "b", "c")}
-    pool.sync_step(["a", "b", "c"], tracked, tracked.__getitem__)
-    slot_a, slot_c = pool.slot_for("a"), pool.slot_for("c")
+    rows = {rid: (7,) for rid in ("a", "b", "c", "d")}
+    cold_calls: list[str] = []
+    cold = _cold_rows(rows, cold_calls)
+    pool.sync_step(["a", "b", "c"], rows, cold)
+    slot_a, slot_c = pool.allocator.slot_for("a"), pool.allocator.slot_for("c")
 
+    # release drops the staged row too: "a" comes back with a cold row.
     pool.mark_dirty("a", (8,))
     pool.release(["a"])
-    assert pool.slot_for("a") is None and not pool.has_dirty("a")
-    pool.release(None)
+    assert pool.allocator.slot_for("a") is None
+    assert pool.needs_cold_reseed(["a"], rows)
 
     # Requests outside the active set lose their slot and staged rows.
     pool.mark_dirty("d", (9,))
     pool.release_unscheduled({"b"})
-    assert set(pool.allocated_req_ids()) == {"b"} and not pool.has_dirty("d")
+    assert set(pool.allocator.allocated_req_ids()) == {"b"}
+    assert pool.needs_cold_reseed(["d"], rows)
 
     # Freed slots are leased again.
-    pool.sync_step(["b", "d"], {**tracked, "d": (9,)}, lambda rid: (9,))
-    assert pool.slot_for("d") in {slot_a, slot_c}
-    assert set(pool.allocated_req_ids()) == {"b", "d"}
+    cold_calls.clear()
+    pool.sync_step(["b", "d"], rows, cold)
+    assert cold_calls == ["d"]
+    assert pool.allocator.slot_for("d") in {slot_a, slot_c}
 
 
-def test_pool_exhaustion_asserts() -> None:
+def test_full_pool_raises() -> None:
     pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
         max_num_reqs=2, num_cols=1, device=CPU
     )
-    tracked = {rid: (0,) for rid in ("r0", "r1", "r2")}
-    with pytest.raises(AssertionError, match="RequestSlotTable pool exhausted"):
-        pool.sync_step(["r0", "r1", "r2"], tracked, tracked.__getitem__)
+    rows = {rid: (0,) for rid in ("r0", "r1", "r2")}
+    with pytest.raises(RuntimeError, match="RequestSlotAllocator is full"):
+        pool.sync_step(["r0", "r1", "r2"], rows, rows.__getitem__)
+
+
+def test_rows_are_validated() -> None:
+    pool: RequestSlotTable[tuple[int, ...]] = RequestSlotTable(
+        max_num_reqs=2, num_cols=2, device=CPU
+    )
+    with pytest.raises(ValueError, match=r"has 1 values, not 2"):
+        pool.mark_dirty("a", (1,))
+    not_ints: Any = (1, 2.5)
+    with pytest.raises(TypeError):
+        pool.mark_dirty("a", not_ints)
+    with pytest.raises(ValueError, match="does not fit in int32"):
+        pool.mark_dirty("a", (1, 2**31))
+    with pytest.raises(ValueError, match=r"has 3 values, not 2"):
+        pool.sync_step(["a"], {"a"}, lambda rid: (1, 2, 3))
 
 
 def test_chunk_slot_ids_layout() -> None:
     pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
         max_num_reqs=4, num_cols=1, device=CPU
     )
-    tracked = {"a": (1,), "b": (2,)}
+    rows = {"a": (1,), "b": (2,)}
     batch = ["a", "x", "b", None]
-    pool.sync_step(batch, tracked, tracked.__getitem__)
-    sa, sb = pool.slot_for("a"), pool.slot_for("b")
+    pool.sync_step(batch, rows, rows.__getitem__)
+    sa, sb = pool.allocator.slot_for("a"), pool.allocator.slot_for("b")
+    build = pool.allocator.build_chunk_slot_ids
 
-    # Width defaults to max_num_reqs; untracked and missing rows map to slot 0.
-    ids = pool.build_chunk_slot_ids(batch, 0, 4)
-    assert ids is not None and ids.dtype == torch.int32
+    # A [max_num_reqs] int32 host array; untracked and empty rows map to 0.
+    ids = build(batch, 0, 4)
+    assert isinstance(ids, np.ndarray) and ids.dtype == np.int32
     assert ids.tolist() == [sa, 0, sb, 0]
-    # Rows are chunk-relative, padded to padded_num_reqs.
-    ids = pool.build_chunk_slot_ids(batch, 2, 4, padded_num_reqs=2)
-    assert ids is not None and ids.tolist() == [sb, 0]
-    ids = pool.build_chunk_slot_ids(batch, 0, 3, padded_num_reqs=8)
-    assert ids is not None and ids.tolist() == [sa, 0, sb, 0, 0, 0, 0, 0]
+    # Rows are chunk-relative, and end_idx may pass the end of the batch.
+    ids = build(batch, 2, 8)
+    assert ids is not None and ids.tolist() == [sb, 0, 0, 0]
     # Discarded requests map to slot 0; a chunk without active rows is None.
-    ids = pool.build_chunk_slot_ids(batch, 0, 3, discard_req_ids={"a"})
+    ids = build(batch, 0, 3, discard_req_ids={"a"})
     assert ids is not None and ids.tolist() == [0, 0, sb, 0]
-    assert pool.build_chunk_slot_ids(batch, 0, 2, discard_req_ids={"a"}) is None
-    assert pool.build_chunk_slot_ids(["x", None], 0, 2) is None
+    assert build(batch, 0, 2, discard_req_ids={"a"}) is None
+    assert build(["x", None], 0, 2) is None
 
 
-def test_chunk_with_more_rows_than_slot_ids_asserts() -> None:
-    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
-        max_num_reqs=4, num_cols=1, device=CPU
-    )
-    batch = ["a", "b", "c"]
-    tracked = {rid: (0,) for rid in batch}
-    pool.sync_step(batch, tracked, tracked.__getitem__)
-    with pytest.raises(AssertionError, match=r"Chunk \[0, 3\) has 3 rows"):
-        pool.build_chunk_slot_ids(batch, 0, 3, padded_num_reqs=2)
-    # Only rows inside the batch count, so an end_idx past it still fits.
-    ids = pool.build_chunk_slot_ids(batch, 1, 8, padded_num_reqs=2)
-    assert ids is not None
-    assert ids.tolist() == [pool.slot_for("b"), pool.slot_for("c")]
-
-
-def test_slot_id_cache_reuses_uploads_until_the_layout_changes() -> None:
+def test_chunk_slot_ids_reject_invalid_chunks() -> None:
     pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
         max_num_reqs=2, num_cols=1, device=CPU
     )
-    tracked = {"r0": (0,), "r1": (0,)}
-    pool.sync_step(["r0", "r1"], tracked, tracked.__getitem__)
-    s1 = pool.build_chunk_slot_ids(["r0", "r1"], 0, 2, 4)
-    s2 = pool.build_chunk_slot_ids(["r0", "r1"], 0, 2, 4)
-    s_pad8 = pool.build_chunk_slot_ids(["r0", "r1"], 0, 2, 8)
-    s_reordered = pool.build_chunk_slot_ids(["r1", "r0"], 0, 2, 4)
-    assert s1 is not None and s2 is s1
-    assert s_pad8 is not None and s_pad8 is not s1 and s_pad8.shape == (8,)
-    assert s_reordered is not None and s_reordered is not s1
-    assert s_reordered.tolist()[:2] == s1.tolist()[:2][::-1]
+    rows = {"a": (0,), "b": (0,)}
+    pool.sync_step(["a", "b"], rows, rows.__getitem__)
+    build = pool.allocator.build_chunk_slot_ids
+    with pytest.raises(ValueError, match=r"invalid chunk range \[-1, 1\)"):
+        build(["a", "b"], -1, 1)
+    with pytest.raises(ValueError, match=r"invalid chunk range \[2, 1\)"):
+        build(["a", "b"], 2, 1)
+    with pytest.raises(ValueError, match=r"has 3 rows, more than max_num_reqs=2"):
+        build(["a", "b", "c"], 0, 3)
+    with pytest.raises(ValueError, match="lists a request twice"):
+        build(["a", "a"], 0, 2)
 
 
-def test_slot_id_uploads_cached_per_chunk_across_steps() -> None:
-    """A step with two chunks keeps one cached slot-ID upload per chunk."""
-    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
-        max_num_reqs=4, num_cols=1, device=CPU
-    )
-    tracked = {rid: (7,) for rid in ("a", "b", "c", "d")}
-    batch = ["a", "b", "c", "d"]
-    assert pool.sync_step(batch, tracked, tracked.__getitem__) is not None
-
-    def chunk_uploads(req_ids: list[str]) -> list[torch.Tensor | None]:
-        return [
-            pool.build_chunk_slot_ids(req_ids, 0, 2, 2),
-            pool.build_chunk_slot_ids(req_ids, 2, 4, 2),
-        ]
-
-    step1 = chunk_uploads(batch)
-    step2 = chunk_uploads(batch)
-    assert step1[0] is not None and step1[1] is not None
-    assert step2[0] is step1[0] and step2[1] is step1[1]
-    # Swapping two rows of the second chunk re-uploads only that chunk.
-    step3 = chunk_uploads(["a", "b", "d", "c"])
-    assert step3[0] is step1[0] and step3[1] is not step1[1]
-    assert step3[1] is not None
-    assert step3[1].tolist() == step1[1].tolist()[::-1]
-
-
-def test_duplicate_slot_in_chunk_asserts() -> None:
-    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
-        max_num_reqs=2, num_cols=1, device=CPU
-    )
-    tracked = {"a": (0,)}
-    pool.sync_step(["a"], tracked, tracked.__getitem__)
-    with pytest.raises(AssertionError, match="Duplicate slot"):
-        pool.build_chunk_slot_ids(["a", "a"], 0, 2)
-
-
-def test_precompile_seeds_sentinel_rows_on_the_bound_device() -> None:
+def test_precompile_seeds_sentinel_rows_and_syncs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    synced: list[torch.Tensor] = []
+    monkeypatch.setattr(request_slot_table, "synchronize_tensors", synced.append)
     pool: RequestSlotTable[tuple[int, int]] = RequestSlotTable(
         max_num_reqs=3, num_cols=2, device=CPU, sentinel_row=(-1, 0)
     )
-    synced: list[torch.Tensor] = []
-    table = pool.precompile(synced.append)
-    assert synced == [table] and pool.table is table
+    table = pool.precompile()
+    assert len(synced) == 1 and synced[0] is table
     assert table.device.type == "cpu" and table.dtype == torch.int32
     assert table.tolist() == [[-1, 0]] * 4
-    # commit_table replaces the device state without touching the leases.
-    updated = table + 1
+
+
+def test_commit_table_stores_the_state_the_next_step_starts_from() -> None:
+    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+        max_num_reqs=2, num_cols=1, device=CPU
+    )
+    rows = {"a": (3,), "b": (4,)}
+    tbl = pool.sync_step(["a"], rows, rows.__getitem__)
+    slot_a = pool.allocator.slot_for("a")
+    assert tbl is not None and slot_a is not None
+    updated = tbl.clone()
+    updated[slot_a] = 30
     pool.commit_table(updated)
-    assert pool.table is updated and pool.ensure_table() is updated
+    out = pool.sync_step(["a", "b"], rows, rows.__getitem__)
+    assert out is not None
+    assert _row(pool, out, "a") == [30] and _row(pool, out, "b") == [4]
+    for bad in (
+        torch.zeros((2, 1), dtype=torch.int32),
+        torch.zeros((3, 1), dtype=torch.int64),
+        torch.zeros((3, 2), dtype=torch.int32),
+    ):
+        with pytest.raises(ValueError, match=r"expected a \(3, 1\) int32 table"):
+            pool.commit_table(bad)
+
+
+def test_precompile_covers_the_seed_call_sync_step_makes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``precompile`` calls ``seed_slot_rows`` with the shapes, dtypes and
+    devices of a seeding ``sync_step``, so serving compiles nothing new."""
+    calls: list[tuple] = []
+    seed = request_slot_table.seed_slot_rows
+
+    def spy(table: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor):
+        calls.append(
+            tuple((t.shape, t.dtype, t.device.type) for t in (table, slots, rows))
+        )
+        return seed(table, slots, rows)
+
+    monkeypatch.setattr(request_slot_table, "seed_slot_rows", spy)
+    monkeypatch.setattr(request_slot_table, "synchronize_tensors", lambda t: None)
+    pool: RequestSlotTable[tuple[int, int]] = RequestSlotTable(
+        max_num_reqs=4, num_cols=2, device=CPU, sentinel_row=(-1, 0)
+    )
+    pool.precompile()
+    rows = {"a": (1, 2), "b": (3, 4)}
+    pool.sync_step(["a", "b"], rows, rows.__getitem__)
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
+@pytest.mark.tpu_test
+def test_precompile_then_sync_step_on_tpu_matches_cpu() -> None:
+    """The compiled ``seed_slot_rows`` that ``precompile`` warms gives
+    ``sync_step`` the same table on TPU as the eager kernel on CPU."""
+    import torch_tpu  # noqa: F401
+
+    rows = {"a": (1, 2), "b": (3, 4), "c": (5, 6)}
+
+    def run(device: torch.device) -> tuple[list[list[int]], list[int | None]]:
+        pool: RequestSlotTable[tuple[int, int]] = RequestSlotTable(
+            max_num_reqs=4, num_cols=2, device=device, sentinel_row=(-1, 0)
+        )
+        pool.precompile()
+        pool.sync_step(["a", None, "b"], rows, rows.__getitem__)
+        pool.mark_dirty("a", (7, 8))
+        tbl = pool.sync_step(["a", "c"], rows, rows.__getitem__)
+        assert tbl is not None and tbl.device.type == device.type
+        slots = [pool.allocator.slot_for(rid) for rid in ("a", "b", "c")]
+        return tbl.cpu().tolist(), slots
+
+    with torch.compiler.set_stance("force_eager"):
+        expected = run(CPU)
+    assert run(torch.device("tpu")) == expected

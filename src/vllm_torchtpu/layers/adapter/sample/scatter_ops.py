@@ -11,70 +11,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""XLA-friendly unique-index scatter helpers for TPU sampling adapters."""
+"""Row writes into slot tables for TPU sampling kernels.
+
+Row 0 of a slot table is a null row. ``RequestSlotTable`` writes new rows with
+``seed_slot_rows``, and sampling kernels that keep per-request rows in such a
+table write them back with ``scatter_slot_rows``.
+"""
 
 import torch
-
-
-def _amax_fill(dtype: torch.dtype) -> float | int:
-    """Fill for non-matching ``amax`` candidates: the lowest value of ``dtype``
-    (-inf for floating dtypes), so no scattered value loses to it.
-
-    It depends only on ``dtype``, so a trace sees a constant.
-    """
-    if dtype.is_floating_point:
-        return float("-inf")
-    if dtype == torch.bool or dtype.is_complex:
-        raise TypeError(
-            f"broadcast_amax_scatter needs a floating or integer dtype, got {dtype}"
-        )
-    return torch.iinfo(dtype).min
-
-
-def broadcast_amax_scatter(
-    base: torch.Tensor,
-    indices: torch.Tensor,
-    values: torch.Tensor,
-    valid_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Scatter ``values`` into ``base`` at unique valid ``indices`` via ``amax``.
-
-    Uses a masked broadcast + ``amax`` reduction rather than
-    ``Tensor.scatter(0, ...)``, whose XLA lowering for dynamic colliding
-    indices is slow on TPU. Non-matching candidates take the lowest value of
-    ``base.dtype`` (-inf for floating dtypes), so every scattered value
-    survives the ``amax``. Active ``indices[valid_mask]`` must be pairwise
-    distinct and within ``[0, base.shape[0])``.
-    """
-    num_indices = indices.shape[0]
-    fill = _amax_fill(base.dtype)
-    if num_indices == 0:
-        return base
-    if base.device.type == "cpu" and not torch.compiler.is_compiling():
-        active_idx = indices[valid_mask]
-        assert active_idx.numel() == torch.unique(active_idx).numel(), (
-            "Duplicate active indices passed to broadcast_amax_scatter"
-        )
-    target_idx = torch.arange(
-        base.shape[0], dtype=indices.dtype, device=base.device
-    ).unsqueeze(1)
-    match = valid_mask.unsqueeze(0) & (target_idx == indices.unsqueeze(0))
-    trailing_ones = (1,) * (base.ndim - 1)
-    match_view = match.reshape(*match.shape, *trailing_ones)
-    cand = torch.where(
-        match_view,
-        values.to(base.dtype).unsqueeze(0),
-        fill,
-    ).amax(dim=1)
-    any_match = match.any(dim=1).reshape(base.shape[0], *trailing_ones)
-    return torch.where(any_match, cand, base)
 
 
 def scatter_slot_rows(
     table: torch.Tensor, slot_ids: torch.Tensor, rows: torch.Tensor
 ) -> torch.Tensor:
-    """Return ``table`` with ``out[slot_ids[i]] = rows[i]`` for ``slot_ids > 0``."""
-    return broadcast_amax_scatter(table, slot_ids, rows, slot_ids > 0)
+    """Return ``table`` with ``out[slot_ids[i]] = rows[i]`` where ``slot_ids[i] > 0``.
+
+    The other entries write row 0 back to itself, the null-row pattern of
+    ``TPUModelRunner._update_mamba_slot_read_offsets``, so one ``index_put``
+    covers the whole fixed-size ``slot_ids``. ``slot_ids`` is 1-D and ``rows``
+    is ``[len(slot_ids), *table.shape[1:]]`` with ``table``'s dtype. Active
+    slots must be distinct and below ``table.shape[0]``.
+    """
+    torch._assert(slot_ids.dim() == 1, "slot_ids must be 1-D")
+    torch._assert(
+        rows.shape == (slot_ids.shape[0], *table.shape[1:]),
+        "rows must have shape [len(slot_ids), *table.shape[1:]]",
+    )
+    torch._assert(rows.dtype == table.dtype, "rows must have the table's dtype")
+    active = slot_ids > 0
+    if table.device.type == "cpu" and not torch.compiler.is_compiling():
+        active_slots = slot_ids[active]
+        if active_slots.numel() and int(active_slots.max()) >= table.shape[0]:
+            raise ValueError(
+                f"slot IDs {slot_ids.tolist()} reach past the {table.shape[0]} rows"
+            )
+        if active_slots.numel() != torch.unique(active_slots).numel():
+            raise ValueError(f"slot IDs {slot_ids.tolist()} repeat an active slot")
+    targets = torch.where(active, slot_ids, 0).long()
+    keep = active.reshape(-1, *(1,) * (rows.dim() - 1))
+    return table.index_put((targets,), torch.where(keep, rows, table[0]))
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -83,5 +58,5 @@ def seed_slot_rows(
     seed_slots: torch.Tensor,
     seed_values: torch.Tensor,
 ) -> torch.Tensor:
-    """Scatter ``seed_values`` into ``table`` at active ``seed_slots > 0``."""
+    """Write ``seed_values`` into ``table`` at the active ``seed_slots > 0``."""
     return scatter_slot_rows(table, seed_slots, seed_values)
