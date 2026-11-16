@@ -42,6 +42,15 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_decode_cmp import (  # noqa: E402
 
 BRANCHES, HIDDEN, LOWRANK, EPS = 4, 2560, 320, 1e-6
 WIDTH = BRANCHES * HIDDEN
+# cmp kernel variants by name: --opts "name:lookahead,overlap,up_whole;..."
+OPTS = {"cmp": None}
+
+
+def _parse_opts(text):
+    for item in [x for x in text.split(";") if x]:
+        name, vals = item.split(":")
+        la, ov, uw = vals.split(",")
+        OPTS[name] = (("lookahead", int(la)), ("overlap", ov == "1"), ("up_whole", uw == "1"))
 
 
 def _chain(kernel, variant, iters, interpret=False):
@@ -49,8 +58,11 @@ def _chain(kernel, variant, iters, interpret=False):
     if kernel == "served":
         fn = lambda *a, **k: hc_decode_mix(*a, max_tile=512, **k)  # noqa: E731
     else:
-        mode = kernel.split("-")[1] if "-" in kernel else "full"
-        fn = lambda *a, **k: hc_decode_mix_cmp(*a, _mode=mode, **k)  # noqa: E731
+        name, _, mode = kernel.partition("-")
+        opts = OPTS[name]
+        fn = lambda *a, **k: hc_decode_mix_cmp(  # noqa: E731
+            *a, _mode=mode or "full", _opts=opts, **k
+        )
 
     def chain(weights, *carry):
         w = weights if variant != "final" else weights[:3]
@@ -102,9 +114,14 @@ def main():
     parser.add_argument("--side-tokens", default="16,64,128,256")
     parser.add_argument("--iters", type=int, default=32)
     parser.add_argument("--chains", type=int, default=3)
+    parser.add_argument("--opts", default="")
+    # Variant names timed with mode=compute as well (combine only).
+    parser.add_argument("--compute-of", default="cmp")
+    parser.add_argument("--dma-of", default="cmp")
     # CPU dry run of the script (no device times).
     parser.add_argument("--interpret", action="store_true")
     opts = parser.parse_args()
+    _parse_opts(opts.opts)
     keys = jax.random.split(jax.random.key(0), 8)
     bf16 = jnp.bfloat16
     weights = [
@@ -124,9 +141,10 @@ def main():
             if variant != "combine" and str(tokens) not in opts.side_tokens.split(","):
                 continue
             result = dict(tokens=tokens, variant=variant)
-            kernels = ["served", "cmp"]
+            kernels = ["served"] + list(OPTS)
             if variant == "combine":
-                kernels += ["cmp-dma", "cmp-compute"]
+                kernels += [f"{n}-compute" for n in opts.compute_of.split(",") if n]
+                kernels += [f"{n}-dma" for n in opts.dma_of.split(",") if n]
             for kernel in kernels:
                 if kernel != "served" and not cmp_applies(tokens):
                     continue
@@ -137,7 +155,8 @@ def main():
                 for _ in range(opts.chains):
                     jax.block_until_ready(fn(weights, *args))
                 jax.profiler.stop_trace()
-                durs = _kernel_durations(trace_dir).get(kernel.split("-")[0], [])
+                key = "served" if kernel == "served" else "cmp"
+                durs = _kernel_durations(trace_dir).get(key, [])
                 shutil.rmtree(trace_dir, ignore_errors=True)
                 if durs:
                     result[kernel] = dict(
@@ -154,8 +173,12 @@ def main():
                 if k in result
             ]
             ratio = ""
-            if "served" in result and "cmp" in result:
-                ratio = f" cmp/served {result['cmp']['median'] / result['served']['median']:.3f}"
+            if "served" in result:
+                ratio = " " + " ".join(
+                    f"{k}/served {result[k]['median'] / result['served']['median']:.3f}"
+                    for k in OPTS
+                    if k in result
+                )
             print(f"HCCMP_TIME tokens {tokens:3d} {variant:7s} " + " | ".join(parts) + ratio, flush=True)
     out = os.environ.get("CDK_OUTPUT_DIR")
     if out:

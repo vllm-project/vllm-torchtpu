@@ -54,6 +54,12 @@ CHUNK = 256
 LANES = 128
 
 
+# (lookahead, overlap, up_whole): MiB of copies kept in flight ahead of the
+# one being waited (a large number issues all at entry), the next stream's norm in
+# one block with the previous down dot, one up dot for all streams.
+DEFAULT_OPTS = (("lookahead", 1024), ("overlap", False), ("up_whole", False))
+
+
 def cmp_applies(tokens: int) -> bool:
     """Whether ``tokens`` rows run this kernel (a concrete count)."""
     return PIECE <= tokens <= MAX_TOKENS and tokens % PIECE == 0
@@ -85,6 +91,9 @@ def _kernel(
     prologue: bool,
     inject: bool,
     mode: str,
+    lookahead: int,
+    overlap: bool,
+    up_whole: bool,
 ):
     # mode (timing only): "full"; "dma" runs the copies and no compute;
     # "compute" runs the compute and no copies.
@@ -157,86 +166,119 @@ def _kernel(
         else None
     )
 
-    # Issue order is consumption order: the DMA engine serves them in turn.
-    rows_in[0].start()
+    # Copies in consumption order. All in flight at once share the HBM port,
+    # so the first stream's rows would land late: a copy starts once the
+    # copies started ahead of it and not yet waited hold less than
+    # ``lookahead`` MiB.
+    T, H, W, R = rows, hidden, width, lowrank
+    queue = [(rows_in[0], T * H * 2)]
     if prologue:
-        blk_in.start()
-        pinj_in.start()
-    w_in.start()
+        queue += [(blk_in, T * H * 2), (pinj_in, T * LANES * 4)]
+    queue += [(w_in, W * 2)]
     if inject:
-        inj_in.start()
-    dn_in[0].start()
+        queue += [(inj_in, branches * W * 2)]
+    queue += [(dn_in[0], R * H * 2)]
     for b in range(1, branches):
-        rows_in[b].start()
-        dn_in[b].start()
-    for b in range(branches):
-        up_in[b].start()
+        queue += [(rows_in[b], T * H * 2), (dn_in[b], R * H * 2)]
+    queue += [(c, H * LANES * 3 * 2) for c in up_in]
+    budget = lookahead << 20
+    state = dict(started=0, waited=-1)
 
-    w_in.wait()
+    def pump():
+        while state["started"] < len(queue):
+            i = state["started"]
+            held = sum(n for _, n in queue[state["waited"] + 1 : i])
+            if i > state["waited"] + 1 and held + queue[i][1] > budget:
+                break
+            queue[i][0].start()
+            state["started"] += 1
+
+    def need(c):
+        i = next(j for j, (q, _) in enumerate(queue) if q is c)
+        while state["started"] <= i:
+            queue[state["started"]][0].start()
+            state["started"] += 1
+        c.wait()
+        state["waited"] = max(state["waited"], i)
+        pump()
+
+    pump()
+
+    need(w_in)
     if compute:
         # The norm weight plus one, f32, broadcast over a piece's 16 rows.
         w1_vm[...] = jnp.broadcast_to(
             1.0 + w_vm[...].astype(jnp.float32)[None, :], (PIECE, width)
         )
     if prologue:
-        blk_in.wait()
-        pinj_in.wait()
+        need(blk_in)
+        need(pinj_in)
+
+    def piece(p, b):
+        r0 = p if isinstance(p, int) else pl.multiple_of(p * PIECE, PIECE)
+        prs = pl.ds(r0, PIECE)
+        if prologue:
+            ib = jnp.broadcast_to(_lane_column(pinj_vm[prs, :], b), (PIECE, CHUNK))
+        ss = None
+        for k in range(chunks):
+            cols = pl.ds(b * hidden + k * CHUNK, CHUNK)
+            if prologue:
+                blk = blk_vm[prs, pl.ds(k * CHUNK, CHUNK)].astype(jnp.float32)
+                hb = (res_vm[prs, cols].astype(jnp.float32) + blk * ib).astype(
+                    jnp.bfloat16
+                )
+                res_vm[prs, cols] = hb
+            else:
+                hb = res_vm[prs, cols]
+            for q in range(CHUNK // LANES):
+                vq = hb[:, q * LANES : (q + 1) * LANES].astype(jnp.float32)
+                ss = vq * vq if ss is None else ss + vq * vq
+        rs = jax.lax.rsqrt(jnp.sum(ss, axis=1, keepdims=True) / hidden + eps)
+        rb = jnp.broadcast_to(rs, (PIECE, CHUNK))
+        for k in range(chunks):
+            cols = pl.ds(b * hidden + k * CHUNK, CHUNK)
+            v = res_vm[prs, cols].astype(jnp.float32)
+            xn_vm[prs, cols] = (v * rb * w1_vm[:, cols]).astype(jnp.bfloat16)
+
+    def down_dot(c):
+        if inject and c == 0:
+            need(inj_in)
+        need(dn_in[c])
+        if not compute:
+            return
+        part = jax.lax.dot_general(
+            xn_vm[:, stream(c)],
+            dn_vm[:, stream(c)],
+            dimension_numbers=(((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        if c == 0:
+            y_vm[...] = part
+        else:
+            y_vm[...] += part
 
     h_out = []
     for b in range(branches):
-        rows_in[b].wait()
-
-        def piece(p, carry, b=b):
-            r0 = pl.multiple_of(p * PIECE, PIECE)
-            prs = pl.ds(r0, PIECE)
-            if prologue:
-                ib = jnp.broadcast_to(
-                    _lane_column(pinj_vm[prs, :], b), (PIECE, CHUNK)
-                )
-            ss = None
-            for k in range(chunks):
-                cols = pl.ds(b * hidden + k * CHUNK, CHUNK)
-                if prologue:
-                    blk = blk_vm[prs, pl.ds(k * CHUNK, CHUNK)].astype(jnp.float32)
-                    hb = (
-                        res_vm[prs, cols].astype(jnp.float32) + blk * ib
-                    ).astype(jnp.bfloat16)
-                    res_vm[prs, cols] = hb
-                else:
-                    hb = res_vm[prs, cols]
-                for q in range(CHUNK // LANES):
-                    vq = hb[:, q * LANES : (q + 1) * LANES].astype(jnp.float32)
-                    ss = vq * vq if ss is None else ss + vq * vq
-            rs = jax.lax.rsqrt(jnp.sum(ss, axis=1, keepdims=True) / hidden + eps)
-            rb = jnp.broadcast_to(rs, (PIECE, CHUNK))
-            for k in range(chunks):
-                cols = pl.ds(b * hidden + k * CHUNK, CHUNK)
-                v = res_vm[prs, cols].astype(jnp.float32)
-                xn_vm[prs, cols] = (v * rb * w1_vm[:, cols]).astype(jnp.bfloat16)
-            return carry
-
-        if compute:
-            jax.lax.fori_loop(0, pieces, piece, jnp.int32(0))
+        need(rows_in[b])
+        if overlap and b >= 1:
+            # Stream b's norm, unrolled, in one block with stream b - 1's down
+            # dot: the scheduler packs the VPU work beside the MXU work.
+            down_dot(b - 1)
+            if compute:
+                for p in range(pieces):
+                    piece(p * PIECE, b)
+        elif compute:
+            jax.lax.fori_loop(
+                0, pieces, lambda p, c, b=b: (piece(p, b), c)[1], jnp.int32(0)
+            )
         if prologue:
             out = copy(res_vm.at[:, stream(b)], h_hbm.at[:, stream(b)], s_h + b)
             out.start()
             h_out.append(out)
-
-        if inject and b == 0:
-            inj_in.wait()
-        dn_in[b].wait()
-        if not compute:
-            continue
-        part = jax.lax.dot_general(
-            xn_vm[:, stream(b)],
-            dn_vm[:, stream(b)],
-            dimension_numbers=(((1,), (1,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
-        if b == 0:
-            y_vm[...] = part
-        else:
-            y_vm[...] += part
+        if not overlap:
+            down_dot(b)
+    if overlap:
+        down_dot(branches - 1)
 
     # Gate on the low-rank columns, halved (exact): the up dot then gives
     # u / 2, and 2 sigmoid(bf16(u)) = 1 + tanh(bf16(u / 2)).
@@ -267,19 +309,35 @@ def _kernel(
         injo_out = copy(injo_vm, injo_hbm, s_injo)
         injo_out.start()
 
+    def mix_term(u_half, b):
+        u = u_half.astype(jnp.bfloat16).astype(jnp.float32)
+        return (1.0 + jnp.tanh(u)) * xn_vm[:, stream(b)].astype(jnp.float32)
+
+    if up_whole:
+        for b in range(branches):
+            need(up_in[b])
     for b in range(branches):
-        up_in[b].wait()
+        if not up_whole:
+            need(up_in[b])
         if not compute:
             continue
-        u_half = jax.lax.dot_general(
-            gate_half,
-            up_vm[stream(b), :],
-            dimension_numbers=(((1,), (1,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
-        term = (1.0 + jnp.tanh(u_half.astype(jnp.bfloat16).astype(jnp.float32))) * (
-            xn_vm[:, stream(b)].astype(jnp.float32)
-        )
+        if up_whole:
+            if b == 0:
+                u_all = jax.lax.dot_general(
+                    gate_half,
+                    up_vm[...],
+                    dimension_numbers=(((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+            term = mix_term(u_all[:, b * hidden : (b + 1) * hidden], b)
+        else:
+            u_half = jax.lax.dot_general(
+                gate_half,
+                up_vm[stream(b), :],
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            term = mix_term(u_half, b)
         if b == 0:
             acc_vm[...] = term
         elif b < branches - 1:
@@ -347,6 +405,7 @@ def hc_decode_mix_cmp(
     prev_injection=None,
     interpret=False,
     _mode="full",
+    _opts=None,
 ):
     """``hc_decode.hc_decode_mix`` for ``cmp_applies`` row counts.
 
@@ -366,11 +425,12 @@ def hc_decode_mix_cmp(
         eps=eps,
         interpret=interpret,
         mode=_mode,
+        opts=_opts or DEFAULT_OPTS,
     )
 
 
 @functools.partial(
-    jax.jit, static_argnames=("branches", "hidden", "eps", "interpret", "mode")
+    jax.jit, static_argnames=("branches", "hidden", "eps", "interpret", "mode", "opts")
 )
 def _hc_decode_mix_cmp(
     x,
@@ -386,6 +446,7 @@ def _hc_decode_mix_cmp(
     eps,
     interpret,
     mode,
+    opts,
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
@@ -451,6 +512,7 @@ def _hc_decode_mix_cmp(
             prologue=prologue,
             inject=inject,
             mode=mode,
+            **dict(opts),
         ),
         in_specs=[any_space] * n_in,
         out_specs=[any_space] * len(out_shape),

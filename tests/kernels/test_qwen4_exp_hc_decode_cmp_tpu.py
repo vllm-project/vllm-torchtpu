@@ -116,12 +116,28 @@ def _fmt(m):
 @pytest.mark.parametrize("prologue", [True, False])
 @pytest.mark.parametrize("tokens", BUCKETS)
 def test_tpu_cmp_matches_served(tokens, prologue, inject):
+    _check(tokens, prologue, inject, None)
+
+
+# The kernel's schedule options (copy lookahead MiB, overlap, one up dot):
+# every form must give the default's numerics.
+VARIANTS = [(4, True, False), (2, True, False), (8, True, True)]
+
+
+@pytest.mark.parametrize("variant", VARIANTS, ids=lambda v: "v%d%d%d" % v)
+@pytest.mark.parametrize("tokens", [16, 64, 192, 256])
+def test_tpu_cmp_variants_match_served(tokens, variant):
+    la, ov, uw = variant
+    _check(tokens, True, True, (("lookahead", la), ("overlap", ov), ("up_whole", uw)))
+
+
+def _check(tokens, prologue, inject, opts):
     residual, block, injection, weights = _inputs(7 * tokens + 1, tokens, inject)
     static = dict(branches=BRANCHES, hidden=HIDDEN, eps=EPS)
     extra = dict(block=block, prev_injection=injection) if prologue else {}
     served = hc_decode_mix(residual, *weights, **extra, max_tile=512, **static)
-    cmp = hc_decode_mix_cmp(residual, *weights, **extra, **static)
-    again = hc_decode_mix_cmp(residual, *weights, **extra, **static)
+    cmp = hc_decode_mix_cmp(residual, *weights, **extra, **static, _opts=opts)
+    again = hc_decode_mix_cmp(residual, *weights, **extra, **static, _opts=opts)
     ref = _reference(residual, block, injection, weights, prologue)
 
     names = ["mixed", "injection", "combined"]
@@ -144,7 +160,8 @@ def test_tpu_cmp_matches_served(tokens, prologue, inject):
         if cr["l2"] > 2.0 * sr["l2"] + 1e-5:
             failures.append((name, "less accurate than served", cr["l2"], sr["l2"]))
     print(
-        f"HCCMP_NUM tokens {tokens} prologue {int(prologue)} inject {int(inject)}: "
+        f"HCCMP_NUM tokens {tokens} prologue {int(prologue)} inject {int(inject)} "
+        f"opts {dict(opts) if opts else 'default'}: "
         + " || ".join(lines)
     )
     assert not failures, failures
