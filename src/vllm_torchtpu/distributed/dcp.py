@@ -149,11 +149,11 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     if cached is not None:
         return cached
 
-    import torch
+    from torch.tpu.pallas import get_pallas_mesh
 
     # No device array: get_pallas_mesh numbers mesh positions by PyTorch rank,
     # which is the binding torch_tpu#3522 guarantees.
-    mesh = torch.tpu.pallas.get_pallas_mesh(axis_names=axis_names, mesh_shape=shape)
+    mesh = get_pallas_mesh(axis_names=axis_names, mesh_shape=shape)
     logger.info(
         "DCP device mesh | axes=%s shape=%s rank_in_group=%d ranks=%s",
         axis_names,

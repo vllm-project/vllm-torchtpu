@@ -102,6 +102,7 @@ def get_or_create_pcp_mesh(
     ranks follow those of the stages before it.
     """
     import torch.distributed as dist
+    from torch.tpu.pallas import get_pallas_mesh
 
     layout = get_pcp_group_layout()
     group = get_pcp_group()
@@ -176,11 +177,9 @@ def get_or_create_pcp_mesh(
             mesh = get_stage_mesh(axis_names, shape, group, layout.device_ids)
         else:
             mesh = (
-                torch.tpu.pallas.get_pallas_mesh(axis_names=axis_names)
+                get_pallas_mesh(axis_names=axis_names)
                 if tp_axis_name is None
-                else torch.tpu.pallas.get_pallas_mesh(
-                    axis_names=axis_names, mesh_shape=shape
-                )
+                else get_pallas_mesh(axis_names=axis_names, mesh_shape=shape)
             )
     logger.info(
         "PCP device mesh | axes=%s shape=%s PCP ranks=%s device_ids=%s",
