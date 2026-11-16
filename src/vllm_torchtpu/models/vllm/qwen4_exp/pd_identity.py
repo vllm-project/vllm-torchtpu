@@ -134,6 +134,54 @@ class LoadedWeightIdentity:
         payload = json.dumps(records, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode()).hexdigest()
 
+    def records(self) -> dict[str, tuple[str, tuple[int, ...], str]]:
+        """Per-tensor ``(dtype, shape, sha256)`` records of what this rank loaded."""
+        if not self._records or None in self._records.values():
+            raise ValueError(
+                "PD identity requires successfully loaded checkpoint tensors"
+            )
+        return dict(self._records)  # type: ignore[arg-type]
+
+
+def merged_identity(
+    per_rank_records: Iterable[dict], *, name_fragment: str | None = None
+) -> str:
+    """Digest of the union of the tensors a group of ranks loaded.
+
+    With load-time filtering (``--enable-ep-weight-filter``, Exos
+    ``EXOS_WEIGHT_LOAD_FILTER=pd``, or a pipeline stage that streams only its
+    own layers) each rank reads only its share, so per-rank digests differ even
+    though the ranks together consumed the whole checkpoint. Merging the
+    per-tensor records first gives the digest one rank that loaded every tensor
+    would report (the same as ``LoadedWeightIdentity.finish``), and a tensor
+    two ranks loaded with different bytes is still rejected.
+    """
+    merged = merged_records(per_rank_records, name_fragment=name_fragment)
+    payload = json.dumps(merged, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def merged_records(
+    per_rank_records: Iterable[dict], *, name_fragment: str | None = None
+) -> dict[str, tuple[str, tuple[int, ...], str]]:
+    """Union of per-rank ``(dtype, shape, sha256)`` records (see merged_identity)."""
+    merged: dict = {}
+    loaded = False
+    for records in per_rank_records:
+        for name, value in records.items():
+            loaded = True
+            if name_fragment is not None and name_fragment not in name:
+                continue
+            value = (value[0], tuple(value[1]), value[2])
+            previous = merged.setdefault(name, value)
+            if previous != value:
+                raise ValueError(f"Qwen PD ranks loaded different bytes for {name}")
+    # Something must have been loaded; a fragment that matches none of it
+    # still digests the empty set, as finish() always did.
+    if not loaded:
+        raise ValueError("PD identity requires successfully loaded checkpoint tensors")
+    return merged
+
 
 def canonical_rank_identity(records: list[dict], *, world_size: int) -> dict:
     """Compare rank ownership using engine-relative coordinates, not host paths."""

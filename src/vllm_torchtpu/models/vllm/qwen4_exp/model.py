@@ -1225,6 +1225,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         self._pd_weight_identity_enabled = pd_transfer_enabled(vllm_config)
         self.pd_loaded_weight_identity: str | None = None
         self.pd_loaded_ple_identity: str | None = None
+        self.pd_loaded_weight_records: dict | None = None
         self.pd_gdn_qk_pair_layout = envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
@@ -1355,6 +1356,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         self.pd_loaded_weight_identity = None
         self.pd_loaded_ple_identity = None
+        self.pd_loaded_weight_records = None
         times = _LoadTimes()
         identity = LoadedWeightIdentity() if self._pd_weight_identity_enabled else None
         if identity is not None:
@@ -1475,6 +1477,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         if identity is not None:
             self.pd_loaded_weight_identity = identity.finish()
             self.pd_loaded_ple_identity = identity.finish(name_fragment=".ple.")
+            self.pd_loaded_weight_records = identity.records()
         times.seconds["finalize"] += time.perf_counter() - finalize_start
         times.log(identity)
         return set(dict(self.named_parameters()))
