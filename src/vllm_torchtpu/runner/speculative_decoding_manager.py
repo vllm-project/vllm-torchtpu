@@ -63,6 +63,9 @@ class SpecDecodeMetadata:
     # request (accepted count, rejected draft token or -1), decided before the
     # LM head; the step's logits then hold one row per request.
     synthetic_verify: tuple[torch.Tensor, torch.Tensor] | None = None
+    # This rank's TP rank (int32 [1]) when the synthetic verify's logits hold
+    # only this rank's block of the request rows (`_synthetic_verify_logits`).
+    synthetic_row_rank: torch.Tensor | None = None
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None

@@ -15,6 +15,7 @@
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
 import functools
+import itertools
 
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
@@ -131,6 +132,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     synthetic_sample_and_assemble,
+    synthetic_sample_rows_and_assemble,
     synthetic_verify_rows,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
@@ -655,6 +657,16 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     return next(iter(found.values()))
 
 
+# Fewest request rows per rank for which the synthetic verify splits them.
+# The split saves 1 - 1/tp of the sampler's passes over [rows, vocab] and
+# costs an all-to-all plus a token all-gather (~10 us each). Each of the
+# top-p bisection's 31 passes is launch-bound up to ~16 rows (tpu7x, TP8
+# MiniMax-M3 twins: 1.7 us per pass at 8 and 16 rows, 2.0 us on a single
+# row), so splitting 8 or 16 rows lost (+24 / +19 us) and 48 or 64 won
+# (-450 / -630 us); 4 rows per rank sits between.
+_SYNTHETIC_ROW_SPLIT_MIN_ROWS = 4
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -1174,6 +1186,9 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
+        # This rank's TP rank (int32 [1]) when the synthetic one-row verify
+        # splits its requests' rows over the TP ranks; set at load.
+        self._synthetic_row_rank: torch.Tensor | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -4304,9 +4319,8 @@ class TPUModelRunner(GPUModelRunner):
                             hidden_states, logits_indices
                         )
                     elif synthetic_verify and spec_decode_metadata is not None:
-                        logits = self.compute_selected_logits(
-                            hidden_states,
-                            self._plan_synthetic_verify(spec_decode_metadata),
+                        logits = self._synthetic_verify_logits(
+                            hidden_states, spec_decode_metadata
                         )
                     else:
                         logits = self.compute_selected_logits(
@@ -4772,6 +4786,61 @@ class TPUModelRunner(GPUModelRunner):
         md.synthetic_verify = (accepted_count, recover_draft)
         return rows
 
+    def _synthetic_row_split_rank(self) -> torch.Tensor | None:
+        """This rank's TP rank as a device tensor when the synthetic verify's
+        rows can be split over the TP ranks (the model computes its LM head
+        shard, the TP group spans the step), else None."""
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        if not (
+            envs.TPU_SPEC_SYNTHETIC_ROW_SPLIT
+            and self.speculative_config is not None
+            and self._pp_is_last
+            and not self.is_pooling_model
+            and hasattr(self.model, "compute_logits_shard")
+            and get_tensor_model_parallel_world_size() > 1
+            # An idle lockstep engine replays the busy ranks' collectives;
+            # its dummy steps issue the gathered path's.
+            and not self._dp_lockstep_enabled()
+        ):
+            return None
+        logger.info(
+            "Synthetic verify: request rows split over %d TP ranks.",
+            get_tensor_model_parallel_world_size(),
+        )
+        return torch.tensor(
+            [get_tensor_model_parallel_rank()], dtype=torch.int32, device=self.device
+        )
+
+    def _synthetic_verify_logits(
+        self, hidden_states: torch.Tensor, md: SpecDecodeMetadata
+    ) -> torch.Tensor:
+        """Plan the synthetic verify and compute its logits: one row per
+        padded request (`compute_selected_logits`), or this rank's block of
+        those rows when they split over the TP ranks
+        (`compute_selected_logit_rows`, marked on ``md``)."""
+        rows = self._plan_synthetic_verify(md)
+        if not self._synthetic_rows_split(rows.shape[0]):
+            md.synthetic_row_rank = None
+            return self.compute_selected_logits(hidden_states, rows)
+        md.synthetic_row_rank = self._synthetic_row_rank
+        return self.compute_selected_logit_rows(hidden_states, rows)
+
+    def _synthetic_rows_split(self, padded_num_reqs: int) -> bool:
+        """Whether a synthetic verify of ``padded_num_reqs`` rows splits them
+        over the TP ranks (`_synthetic_verify_logits`)."""
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        tp = get_tensor_model_parallel_world_size()
+        return (
+            self._synthetic_row_rank is not None
+            and padded_num_reqs % tp == 0
+            and padded_num_reqs // tp >= _SYNTHETIC_ROW_SPLIT_MIN_ROWS
+        )
+
     def _sample_synthetic_verify(
         self,
         logits: torch.Tensor,
@@ -4785,14 +4854,25 @@ class TPUModelRunner(GPUModelRunner):
         assert md.synthetic_verify is not None and md.draft_token_ids is not None
         assert self.speculative_config is not None
         accepted_count, recover_draft = md.synthetic_verify
-        temperatures, top_k, top_p = self._build_padded_sampling_params(
-            cur_start_idx, cur_end_idx, logits
+        padded_num_reqs = md.draft_lengths.shape[0]
+        temperatures, top_k, top_p = self._padded_sampling_params(
+            cur_start_idx, cur_end_idx, padded_num_reqs, logits.dtype, logits.device
         )
-        recover_u = torch.rand_like(
-            logits, dtype=torch.float32, generator=sampling_generator
+        # Every request's uniforms, drawn alike on every rank.
+        recover_u = torch.rand(
+            (padded_num_reqs, logits.shape[-1]),
+            dtype=torch.float32,
+            device=logits.device,
+            generator=sampling_generator,
         )
-        return synthetic_sample_and_assemble(
+        if md.synthetic_row_rank is None:
+            sample, rows_args = synthetic_sample_and_assemble, ()
+        else:
+            sample = synthetic_sample_rows_and_assemble
+            rows_args = (md.synthetic_row_rank,)
+        return sample(
             logits,
+            *rows_args,
             recover_draft,
             accepted_count,
             temperatures,
@@ -5689,6 +5769,7 @@ class TPUModelRunner(GPUModelRunner):
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
                 self.model, self._dp_lockstep_enabled()
             )
+        self._synthetic_row_rank = self._synthetic_row_split_rank()
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -6496,6 +6577,9 @@ class TPUModelRunner(GPUModelRunner):
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
+                    if self._synthetic_rows_split(num_reqs):
+                        out = self.compute_selected_logit_rows(dummy_hidden, indices)
+                        synchronize_tensors(out)
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
                     )
@@ -7005,9 +7089,20 @@ class TPUModelRunner(GPUModelRunner):
         ]
         if blocks := self._topk_candidate_blocks():
             variants.append({"topk_candidates": blocks})
-        for variant in variants:
-            out = synthetic_sample_and_assemble(
-                logits,
+        samplers: list[tuple] = [(synthetic_sample_and_assemble, logits, ())]
+        if self._synthetic_rows_split(num_reqs):
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            rows = logits[: num_reqs // get_tensor_model_parallel_world_size()]
+            samplers.append(
+                (synthetic_sample_rows_and_assemble, rows, (self._synthetic_row_rank,))
+            )
+        for (sample, sample_logits, rows_args), variant in itertools.product(
+            samplers, variants
+        ):
+            out = sample(
+                sample_logits,
+                *rows_args,
                 recover_draft,
                 accepted_count,
                 temps,
@@ -8545,11 +8640,22 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._padded_sampling_params(
+            cur_start_idx, cur_end_idx, logits.shape[0], logits.dtype, logits.device
+        )
+
+    def _padded_sampling_params(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        padded_num_reqs: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
+        temps_cpu = torch.ones(padded_num_reqs, dtype=dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
@@ -8569,9 +8675,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            temps_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_k_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_p_cpu.unsqueeze(1).to(device, non_blocking=True),
         )
 
     def _topk_candidate_blocks(self) -> int:
@@ -8650,6 +8756,34 @@ class TPUModelRunner(GPUModelRunner):
             return torch.empty((0,), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_logit_rows(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        """``compute_selected_logits`` split by rows over the TP ranks: this
+        rank's block of the selected rows (block ``rank`` of ``tp``), full
+        vocabulary. Each rank's LM head shard of every row goes out in one
+        all-to-all, 1/tp of the all-gather's bytes."""
+        from torch.distributed import _functional_collectives as funcol
+        from vllm.distributed import get_tp_group
+
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        shard = self.model.compute_logits_shard(selected)  # [rows, vocab / tp]
+        tp_group = get_tp_group()
+        tp = tp_group.world_size
+        num_rows, shard_vocab = shard.shape
+        # Row block d goes to rank d; block r of the result is rank r's shard.
+        recv = funcol.all_to_all_single(
+            shard.reshape(tp, num_rows // tp, shard_vocab).contiguous(),
+            None,
+            None,
+            tp_group.device_group,
+        )
+        if isinstance(recv, funcol.AsyncCollectiveTensor):
+            recv = funcol.wait_tensor(recv)
+        logits = recv.permute(1, 0, 2).reshape(num_rows // tp, tp * shard_vocab)
+        return logits[:, : self.model.logits_processor.org_vocab_size]
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(

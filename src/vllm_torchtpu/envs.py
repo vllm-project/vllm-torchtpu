@@ -73,12 +73,16 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_MINIMAX_M3_FP8_LINEARS: bool = True
+    TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
+    TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -127,6 +131,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = True
+    TPU_DRAFT_BUCKET_STEP: int = 32
+    TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -189,6 +195,8 @@ if TYPE_CHECKING:
     EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB: int = 128
+    VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB: int = 64
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -208,6 +216,10 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_PREFILL_SPACING_FRAC: float = 0.5
+    VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
+    VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
+    VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
 
 
 def env_with_choices(
@@ -696,6 +708,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # MiniMax-M3 target-model MXFP8 linears run on e4m3 weights with a
+    # per-channel power-of-two scale (models/minimax_m3/quant.py); 0 restores
+    # the exact bf16 dequantization.
+    "TPU_MINIMAX_M3_FP8_LINEARS": env_bool("TPU_MINIMAX_M3_FP8_LINEARS", default=True),
+    # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
+    # permutation-free dense-expert kernel (kernels/experimental/
+    # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
+    # 0 disables it.
+    "TPU_MOE_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_DENSE_FP4_MAX_TOKENS", 16
+    ),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
@@ -720,6 +743,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counting sort either way. A stand-down knob in case a libtpu release
     # miscompiles the rank contraction again.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
+    # Run the EP one-hot MoE permute and combine as Pallas kernels that visit
+    # only the 128-slot blocks of the valid local prefix (about 1/EP of the
+    # routed slots) instead of dense one-hot matmuls over every slot, where
+    # the shapes allow (kernels/megablox/moe_onehot_bounded.py). A stand-down
+    # knob; the owner-output combine (TPU_MOE_OWNER_OUTPUT_MODE) takes
+    # precedence over this combine.
+    "TPU_MOE_BOUNDED_ONEHOT": env_bool("TPU_MOE_BOUNDED_ONEHOT", True),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
@@ -742,6 +772,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
     ),
+    # Expert-parallel MoE combine of large batches on the TensorCore
+    # (kernels/megablox/tc_combine.py) instead of the SparseCore
+    # gather-reduce, where its shape admits it.
+    "TPU_MOE_TC_COMBINE": env_bool("TPU_MOE_TC_COMBINE"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -946,6 +980,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rejected slot or its bonus slot) instead of every verify row.
     "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY": env_bool(
         "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY", default=True
+    ),
+    # Extra DFlash/DSpark draft-forward buckets above 64 tokens, this many
+    # apart (`DFlashProposer._fine_draft_buckets`; 0: the target's token
+    # buckets only). A draft is num_reqs * block tokens, which the target's
+    # coarse buckets pad by up to ~45 %.
+    "TPU_DRAFT_BUCKET_STEP": env_nonnegative_int("TPU_DRAFT_BUCKET_STEP", 32),
+    # Under the synthetic one-row verify, split the requests' rows over the TP
+    # ranks: an all-to-all of the LM head shards instead of an all-gather of
+    # the full logits, each rank samples its block, the tokens are gathered.
+    # Needs the model's compute_logits_shard; same tokens.
+    "TPU_SPEC_SYNTHETIC_ROW_SPLIT": env_bool(
+        "TPU_SPEC_SYNTHETIC_ROW_SPLIT", default=True
     ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
@@ -1181,6 +1227,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How many times an offload save whose transfer failed is retried.
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES": env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # MiB of one worker's KV that offload loads may have in flight at once
+    # (0: no bound); the step's input uploads queue behind them.
+    "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB": env_int(
+        "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB", 128
+    ),
+    # MiB of one worker's KV that offload saves may have in flight at once
+    # (0: no bound); the next forward's KV write waits for them.
+    "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB": env_int(
+        "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB", 64
+    ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
@@ -1270,6 +1326,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # PrefillSpacingScheduler: decode-only time owed after a step that runs a
+    # chunk of a long prompt, as a fraction of that step's time (0 disables
+    # spacing; prefill chunks are still ordered shortest first).
+    "VLLM_TPU_PREFILL_SPACING_FRAC": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_SPACING_FRAC", 0.5
+    ),
+    # PrefillSpacingScheduler: a prompt is long, and its chunks are spaced,
+    # while at least this many of its prompt tokens are left to compute.
+    "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS", 8192
+    ),
+    # PrefillSpacingScheduler: TPOT target in ms. Prefill is deferred while a
+    # long-chunk step would push a decoding request that can still meet it past
+    # it (TPOT projected from max_tokens: only acts when clients set max_tokens
+    # with ignore_eos; 0 disables).
+    "VLLM_TPU_PREFILL_TPOT_TARGET_MS": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_TARGET_MS", 0.0
+    ),
+    # PrefillSpacingScheduler: longest run of steps, in seconds, that the TPOT
+    # target alone may defer prefill for; the next step then runs prefill.
+    "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
     ),
 }
 

@@ -390,7 +390,8 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             rows = rows.to(head_dtype)
         self.markov_w2_shard = F.pad(rows, (0, 0, 0, width - (end - start)))
         device = markov_w2.device
-        self.vocab_shard_start = torch.tensor(start, dtype=torch.int64, device=device)
+        # float32, as the (max, id) pairs carry ids (`shard_argmax_pair`).
+        self.vocab_shard_start = torch.tensor(start, dtype=torch.float32, device=device)
         if self.lm_head.org_vocab_size_padded == self.lm_head.org_vocab_size:
             self.vocab_shard_pad_mask = None
         else:

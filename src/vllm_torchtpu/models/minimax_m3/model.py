@@ -249,6 +249,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab shard of ``compute_logits`` (pad columns
+        included), without the all-gather."""
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(
             weights, mapper=self.hf_to_vllm_mapper

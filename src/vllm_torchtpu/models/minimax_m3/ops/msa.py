@@ -401,9 +401,12 @@ def merge_head_partials(
     this rank's heads along the leading axis, and only that ``1 / DCP``
     share is transposed back to ``[T, H / DCP, D]`` (and, with a 4-bit
     cache's `hadamard`, unrotated: the rotation is linear, so the merged sum
-    unrotates as its terms would, up to bf16 rounding order). The MSA merge
-    always reduce-scatters: `TPU_DCP_LSE_MERGE_A2A` (the MLA merge's
-    all-to-all for small steps) does not apply here."""
+    unrotates as its terms would, up to bf16 rounding order). It merges DCP
+    groups over several KV heads, always by reduce-scatter
+    (`TPU_DCP_LSE_MERGE_A2A`, the MLA merge's all-to-all for small steps,
+    does not apply); over one KV head the attention op merges, in f32
+    (`msa_dcp.attend_and_merge`; `TPU_DCP_RS_OUT_PRECISION` does not apply
+    there)."""
     # The LSEs cross the all-gather token-major ([T, H], as the MLA merge
     # sends them): gathered head-major they took 2x as long (c48 / c64
     # twins, j-fe812c28, j-c5c4bdfc).
@@ -430,6 +433,7 @@ def gather_group_heads(
     group: Any,
     dcp: int,
     kv_head_replicas: int,
+    dcp_rank: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The DCP group's query heads ``[T, dcp * q_heads, D]``
     (`gather_query_heads`) and its KV heads' ``k``/``v``/``index_q``
@@ -440,7 +444,7 @@ def gather_group_heads(
     rank's 11 heads at DCP 8) can run while the scoring op computes instead
     of before it, and needs no strided split of a combined gather."""
     return gather_query_heads(q, group), *gather_group_kv(
-        k, v, index_q, group, dcp, kv_head_replicas
+        k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
     )
 
 
@@ -451,13 +455,29 @@ def gather_group_kv(
     group: Any,
     dcp: int,
     kv_head_replicas: int,
+    dcp_rank: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The ``k``/``v``/``index_q [T, dcp // kv_head_replicas, D]`` of the DCP
-    group's KV heads (rank ``i`` holds KV head ``i // kv_head_replicas``, so
-    every ``kv_head_replicas``-th rank supplies the next head)."""
+    group's KV heads. Rank ``i = h * kv_head_replicas + j`` holds KV head
+    ``h``, as its other replicas do, so it sends only part ``j`` of the
+    tokens: a replica-split all-gather moves ``1 / kv_head_replicas`` of the
+    bytes of gathering every rank's rows and keeping one replica's (c64
+    decode twin j-c4bfc418: 17.3 us per layer for ``bf16[4096, 3, 128]``)."""
     num_tokens, _, head_dim = k.shape
-    per_rank = group.all_gather(torch.cat([k, v, index_q], dim=1).contiguous(), dim=1)
-    per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::kv_head_replicas]
+    rows = torch.cat([k, v, index_q], dim=1)  # [T, 3, D]
+    reps = kv_head_replicas
+    if num_tokens % reps:
+        per_rank = group.all_gather(rows.contiguous(), dim=1)
+        per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::reps]
+        return tuple(per_head[:, :, i].contiguous() for i in range(3))
+    part = num_tokens // reps
+    mine = torch.index_select(rows.view(reps, part, 3, head_dim), 0, dcp_rank % reps)
+    parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, 3, D]
+    per_head = (
+        parts.view(dcp // reps, reps, part, 3, head_dim)
+        .permute(1, 2, 0, 3, 4)
+        .reshape(num_tokens, dcp // reps, 3, head_dim)
+    )
     return tuple(per_head[:, :, i].contiguous() for i in range(3))
 
 
@@ -581,9 +601,6 @@ def get_msa_dcp_op(
         _score_jax,
         donate_argnums=(_SHARD_KV_CACHE_ARG, _SHARD_INDEX_CACHE_ARG),
     )
-    attend_op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
-    )
 
     def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, *args):
         return (
@@ -597,7 +614,16 @@ def get_msa_dcp_op(
         )
 
     score_op.register_fake(_score_fake)
-    attend_op.register_fake(_head_major_attend_fake)
+    if kv_heads == 1:
+        attend_merge_op = _get_msa_dcp_attend_merge_op(
+            sm_scale, topk, dcp, False, suffix
+        )
+    else:
+        attend_merge_op = None
+        attend_op = pallas.jax_op(
+            f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
+        )
+        attend_op.register_fake(_head_major_attend_fake)
 
     def op(
         q: torch.Tensor,
@@ -613,11 +639,9 @@ def get_msa_dcp_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        if kv_heads == 1:
-            q_all = gather_query_heads(q, group)
-        else:
+        if kv_heads > 1:
             q_all, k, v, index_q = gather_group_heads(
-                q, k, v, index_q, group, dcp, kv_head_replicas
+                q, k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )
         new_kv_cache, new_index_cache, candidates = score_op(
             k,
@@ -634,6 +658,16 @@ def get_msa_dcp_op(
         )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
+        if attend_merge_op is not None:
+            return attend_merge_op(
+                dcp_rank,
+                q,
+                kv_cache,
+                candidates,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+            )
         candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
@@ -700,30 +734,6 @@ def _get_msa_dcp_fp4_op(
             scale_cache=scale_cache,
         ), msa_fp4.rotate_queries(q)
 
-    def _attend_jax(
-        q: jax.Array,
-        kv_cache: jax.Array,
-        scale_cache: jax.Array,
-        candidates: jax.Array,
-        seq_lens: jax.Array,
-        block_tables: jax.Array,
-        query_start_loc: jax.Array,
-        dcp_rank: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        return msa_dcp.msa_attend_dcp(
-            q,
-            kv_cache,
-            candidates,
-            seq_lens,
-            block_tables,
-            query_start_loc,
-            sm_scale=sm_scale,
-            topk=topk,
-            rank=dcp_rank,
-            dcp=dcp,
-            scale_cache=scale_cache,
-        )
-
     suffix = (
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
@@ -735,9 +745,6 @@ def _get_msa_dcp_fp4_op(
             _SHARD_INDEX_CACHE_ARG,
             _DCP_SCALE_CACHE_ARG,
         ),
-    )
-    attend_op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_fp4_attend_{suffix}", _attend_jax
     )
 
     def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *args):
@@ -754,7 +761,11 @@ def _get_msa_dcp_fp4_op(
         )
 
     score_op.register_fake(_score_fake)
-    attend_op.register_fake(_head_major_attend_fake)
+    attend_merge_op = (
+        _get_msa_dcp_attend_merge_op(sm_scale, topk, dcp, True, suffix)
+        if kv_heads == 1
+        else None
+    )
     heads_op = (
         _get_msa_dcp_heads_op(
             sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
@@ -780,7 +791,9 @@ def _get_msa_dcp_fp4_op(
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
         if kv_heads > 1:
-            k, v, index_q = gather_group_kv(k, v, index_q, group, dcp, kv_head_replicas)
+            k, v, index_q = gather_group_kv(
+                k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
+            )
         new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score_op(
             k,
             v,
@@ -811,20 +824,109 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 metadata.request_distribution,
             )
-        q_all = gather_query_heads(q, group)
-        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
-        out, lse = attend_op(
-            q_all,
+        assert attend_merge_op is not None
+        return attend_merge_op(
+            dcp_rank,
+            q,
             kv_cache,
-            scale_cache,
             candidates,
             metadata.seq_lens,
             metadata.block_tables,
             metadata.query_start_loc,
-            dcp_rank,
+            scale_cache,
+            hadamard,
         )
-        return merge_head_partials(out, lse, group, hadamard)
 
+    return op
+
+
+def _get_msa_dcp_attend_merge_op(
+    sm_scale: float, topk: int, dcp: int, fp4: bool, suffix: str
+) -> Callable[..., torch.Tensor]:
+    """The attention half of the DCP op over one KV head, as one SPMD op over
+    the DCP mesh (`msa_dcp.attend_and_merge`): this rank's head-major
+    queries and its candidates in, its heads' merged output ``[T, Hl * D]``
+    out. With `fp4` it also takes the scale cache and the hadamard."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+
+    mesh = get_or_create_dcp_mesh()
+    sharded, replicated = PartitionSpec(DCP_AXIS_NAME), PartitionSpec()
+    # rank, q, kv_cache, candidates | seq_lens, block_tables, query_start_loc
+    # | (scale_cache, hadamard)
+    specs = (sharded,) * 4 + (replicated,) * 3 + ((sharded, replicated) if fp4 else ())
+    body = jax.shard_map(
+        functools.partial(
+            msa_dcp.attend_and_merge,
+            axis=DCP_AXIS_NAME,
+            dcp=dcp,
+            sm_scale=sm_scale,
+            topk=topk,
+        ),
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=sharded,
+        check_vma=False,
+    )
+
+    def run(*args):
+        return body(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    # torch_tpu reads the operand types from these annotations.
+    def _attend_jax(
+        dcp_rank: jax.Array,
+        q: jax.Array,
+        kv_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+    ) -> jax.Array:
+        return run(
+            dcp_rank, q, kv_cache, candidates, seq_lens, block_tables, query_start_loc
+        )
+
+    def _attend_fp4_jax(
+        dcp_rank: jax.Array,
+        q: jax.Array,
+        kv_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        scale_cache: jax.Array,
+        hadamard: jax.Array,
+    ) -> jax.Array:
+        return run(
+            dcp_rank,
+            q,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            scale_cache,
+            hadamard,
+        )
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_attend_merge_{suffix}_fp4{int(fp4)}",
+        _attend_fp4_jax if fp4 else _attend_jax,
+        mesh=mesh,
+        input_partition_specs=specs,
+        # A sequence, one spec per output (a bare spec reads as its axes).
+        output_partition_specs=(sharded,),
+    )
+
+    def _fake(dcp_rank, q, *args):
+        num_heads, num_tokens, head_dim = q.shape
+        return q.new_empty((num_tokens, num_heads * head_dim))
+
+    op.register_fake(_fake)
     return op
 
 

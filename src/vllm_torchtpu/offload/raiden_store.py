@@ -83,7 +83,7 @@ import os
 import socket
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -442,6 +442,24 @@ class FinishedJob:
     failed_device_block_ids: list[int] = field(default_factory=list)
 
 
+@dataclass
+class _PacedStore:
+    """A store job split into pieces of whole keys."""
+
+    queued: deque[tuple[list[OffloadKey], list[int]]]
+    live: set[int] = field(default_factory=set)
+    failed: bool = False
+
+
+@dataclass
+class _QueuedLoad:
+    """The not yet launched part of an admitted local load."""
+
+    admission: Admission
+    hashes: list[bytes]
+    device_ids: list[int]
+
+
 def _dma_order(
     sub_hashes: list[bytes], device_ids: list[int], host_ids: list[int]
 ) -> tuple[list[bytes], list[int]]:
@@ -502,6 +520,12 @@ class RaidenOffloadingManager(OffloadingManager):
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
         dp_rank: int = 0,
+        # Most local load sub-blocks in flight at once (0: no bound); see
+        # `_launch_queued_loads`.
+        max_inflight_load_sub_blocks: int = 0,
+        # Most save sub-blocks in flight at once (0: no bound); see
+        # `_launch_queued_stores`.
+        max_inflight_store_sub_blocks: int = 0,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -654,6 +678,21 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
+
+        # Load pacing: launched-but-unresolved local load sub-hashes, and the
+        # local loads still waiting for room.
+        self._max_inflight_loads = max_inflight_load_sub_blocks
+        self._inflight_loads: set[bytes] = set()
+        self._queued_loads: deque[_QueuedLoad] = deque()
+
+        # Store pacing: a store job runs as pieces, each its own admission
+        # (insert + save) under a negative piece id, launched while fewer than
+        # `_max_inflight_stores` sub-blocks are saving.
+        self._max_inflight_stores = max_inflight_store_sub_blocks
+        self._store_jobs: dict[int, _PacedStore] = {}
+        self._piece_parent: dict[int, int] = {}
+        self._piece_sub_blocks: dict[int, int] = {}
+        self._next_piece_id = -1
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -1098,19 +1137,110 @@ class RaidenOffloadingManager(OffloadingManager):
         )
 
     def has_pending_work(self) -> bool:
-        return bool(self._admissions)
+        return bool(self._admissions) or bool(self._store_jobs)
 
     def shutdown(self) -> None:
         # Unregister first: the callback runs on a Raiden-owned thread and
         # must not fire into a half-torn-down manager while jobs drain.
         if self._supports_eviction_callback:
             self._store.set_eviction_callback(None)
-        if self._admissions:
-            self.drain_jobs(set(self._admissions.keys()))
+        if self._admissions or self._store_jobs:
+            self.drain_jobs(set(self._admissions) | set(self._store_jobs))
 
     # -- job submission bridge (called by the connector scheduler) --------
 
     def submit_store_job(
+        self, job_id: int, keys: list[OffloadKey], device_block_ids: list[int]
+    ) -> None:
+        """Admit and launch a store job, as pieces when saves are paced."""
+        if self._max_inflight_stores <= 0 or not keys:
+            self._submit_store_batch(job_id, keys, device_block_ids)
+            return
+        keys_per_piece = max(
+            self._max_inflight_stores // self._device_block_size_factor, 1
+        )
+        # Device-block order, so each piece keeps runs of consecutive blocks.
+        device_block_ids, keys = map(
+            list, zip(*sorted(zip(device_block_ids, keys), key=lambda p: p[0]))
+        )
+        self._store_jobs[job_id] = _PacedStore(
+            deque(
+                (keys[i : i + keys_per_piece], device_block_ids[i : i + keys_per_piece])
+                for i in range(0, len(keys), keys_per_piece)
+            )
+        )
+        self._launch_queued_stores()
+
+    def _launch_queued_stores(self) -> None:
+        """Launch store pieces while fewer than `_max_inflight_stores`
+        sub-blocks are saving.
+
+        A save reads the KV pool from HBM while the next forward writes it, and
+        the forward waits for every read already issued, so one large save
+        stalls every running request for its whole duration. Each piece is
+        its own insert + save, so the store's host-capacity check covers
+        exactly what the piece saves.
+        """
+        self._fold_store_pieces()
+        for job_id, job in list(self._store_jobs.items()):
+            while job.queued:
+                if sum(self._piece_sub_blocks.values()) >= self._max_inflight_stores:
+                    return
+                keys, device_block_ids = job.queued.popleft()
+                piece_id = self._next_piece_id
+                self._next_piece_id -= 1
+                self._piece_parent[piece_id] = job_id
+                self._piece_sub_blocks[piece_id] = (
+                    len(keys) * self._device_block_size_factor
+                )
+                job.live.add(piece_id)
+                self._submit_store_batch(piece_id, keys, device_block_ids)
+                # A piece can finish inside the submit (insert rejected,
+                # nothing new to save): give its room back at once.
+                self._fold_store_pieces()
+
+    def _fold_store_pieces(self) -> None:
+        """Replace finished pieces by their job's finish, once its last piece
+        is done."""
+        kept: list[FinishedJob] = []
+        for finished in self._finished:
+            job_id = self._piece_parent.pop(finished.job_id, None)
+            if job_id is None:
+                kept.append(finished)
+                continue
+            self._piece_sub_blocks.pop(finished.job_id, None)
+            job = self._store_jobs[job_id]
+            job.live.discard(finished.job_id)
+            job.failed |= not finished.success
+            if not job.live and not job.queued:
+                del self._store_jobs[job_id]
+                kept.append(
+                    FinishedJob(
+                        job_id=job_id, op=AdmissionOp.STORE, success=not job.failed
+                    )
+                )
+        self._finished = kept
+
+    def _cancel_queued_store_pieces(self, job_ids: set[int]) -> set[int]:
+        """Drop the unlaunched pieces of `job_ids` (their source blocks are
+        about to be reused); return the ids of their launched pieces."""
+        pieces: set[int] = set()
+        for job_id in job_ids & self._store_jobs.keys():
+            job = self._store_jobs[job_id]
+            if job.queued:
+                job.failed = True
+                for keys, _ in job.queued:
+                    self._inflight_store_keys.difference_update(keys)
+                job.queued.clear()
+            if not job.live:
+                del self._store_jobs[job_id]
+                self._finished.append(
+                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=False)
+                )
+            pieces |= job.live
+        return pieces
+
+    def _submit_store_batch(
         self, job_id: int, keys: list[OffloadKey], device_block_ids: list[int]
     ) -> None:
         """Admit and launch a store job after all worker ranks acknowledge
@@ -1345,6 +1475,25 @@ class RaidenOffloadingManager(OffloadingManager):
             local_hashes, dst_device_ids_for_local = _dma_order(
                 local_hashes, dst_device_ids_for_local, local_host_ids
             )
+        if not remote_batches and self._max_inflight_loads > 0:
+            # Local only: paced (`_launch_queued_loads`).
+            admission = Admission(
+                job_id=job_id,
+                op=AdmissionOp.LOAD,
+                keys=keys,
+                sub_hashes=sub_hashes,
+                pending=set(sub_hashes),
+                req_id=req_id,
+                dst_device_block_ids=list(device_block_ids),
+            )
+            self._admissions[job_id] = admission
+            for sub_hash in sub_hashes:
+                self._hash_to_admission[sub_hash] = admission
+            self._queued_loads.append(
+                _QueuedLoad(admission, local_hashes, dst_device_ids_for_local)
+            )
+            self._launch_queued_loads()
+            return
         if local_hashes and not self._store.load(
             local_hashes, dst_device_ids_for_local
         ):
@@ -1383,7 +1532,7 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def is_job_launched(self, job_id: int) -> bool:
         """Whether a job has been admitted+launched and is not yet terminal."""
-        return job_id in self._admissions
+        return job_id in self._admissions or job_id in self._store_jobs
 
     # -- finalizer --------------------------------------------------------
 
@@ -1522,6 +1671,8 @@ class RaidenOffloadingManager(OffloadingManager):
             results.append((done, failed))
         if has_loads:
             done, failed, _pending = self._store.poll_load_status()
+            self._inflight_loads.difference_update(done)
+            self._inflight_loads.difference_update(failed)
             results.append((done, failed))
         if has_remote:
             done, failed, _pending = self._store.poll_remote_read_status()
@@ -1554,6 +1705,53 @@ class RaidenOffloadingManager(OffloadingManager):
             if self._maybe_retry_save(admission):
                 continue
             self._finalize(admission)
+
+    def _launch_queued_loads(self) -> None:
+        """Launch queued local loads while fewer than `_max_inflight_loads`
+        sub-blocks are in flight, splitting a load at the bound.
+
+        A host->HBM copy shares the device's host-transfer path with the
+        step's own input uploads, which wait behind everything issued before
+        them, so one large load stalls every running request for its whole
+        duration. Bounding what is in flight bounds that wait; a load larger
+        than the bound lands over several scheduler steps.
+        """
+        while self._queued_loads:
+            room = self._max_inflight_loads - len(self._inflight_loads)
+            if room <= 0:
+                return
+            head = self._queued_loads[0]
+            hashes, device_ids = head.hashes[:room], head.device_ids[:room]
+            head.hashes, head.device_ids = head.hashes[room:], head.device_ids[room:]
+            if not head.hashes:
+                self._queued_loads.popleft()
+            if self._store.load(hashes, device_ids):
+                self._inflight_loads.update(hashes)
+                continue
+            unlaunched = hashes + head.hashes
+            logger.error(
+                "TPURaidenOffloadingConnector: load job %d: load() launch failed "
+                "for %d sub-blocks",
+                head.admission.job_id,
+                len(unlaunched),
+            )
+            if head.hashes:
+                self._queued_loads.popleft()
+            self._fail_unlaunched_load(head.admission, unlaunched)
+
+    def _fail_unlaunched_load(self, admission: Admission, hashes: list[bytes]) -> None:
+        admission.failed = True
+        admission.failed_sub_hashes.extend(hashes)
+        admission.pending.difference_update(hashes)
+        if not admission.pending:
+            self._finalize(admission)
+
+    def _cancel_queued_loads(self, job_ids: set[int]) -> None:
+        """Fail the unlaunched pieces of the loads among `job_ids`: their
+        destination blocks are being reclaimed."""
+        for item in [q for q in self._queued_loads if q.admission.job_id in job_ids]:
+            self._queued_loads.remove(item)
+            self._fail_unlaunched_load(item.admission, item.hashes)
 
     def _maybe_retry_save(self, admission: Admission) -> bool:
         """Re-issue the failed subset of a store job's save, at most
@@ -1601,6 +1799,8 @@ class RaidenOffloadingManager(OffloadingManager):
     def poll_finished_jobs(self) -> list[FinishedJob]:
         """Poll raiden completion and return newly terminal jobs."""
         self._poll_once()
+        self._launch_queued_loads()
+        self._launch_queued_stores()
         finished = self._finished
         self._finished = []
         return finished
@@ -1620,7 +1820,9 @@ class RaidenOffloadingManager(OffloadingManager):
         """
         # Suppress retries for draining jobs: source blocks are being reclaimed,
         # so subsequent reads would transfer invalid/overwritten data.
-        for job_id in job_ids:
+        self._cancel_queued_loads(set(job_ids))
+        waits = set(job_ids) | self._cancel_queued_store_pieces(set(job_ids))
+        for job_id in waits:
             admission = self._admissions.get(job_id)
             if admission is not None:
                 admission.retries_left = 0
@@ -1628,11 +1830,13 @@ class RaidenOffloadingManager(OffloadingManager):
         drained: list[FinishedJob] = []
         while True:
             self._poll_once()
+            self._launch_queued_loads()
+            self._launch_queued_stores()
             drained.extend(f for f in self._finished if f.job_id in job_ids)
             self._finished = [f for f in self._finished if f.job_id not in job_ids]
             live = [
                 job_id
-                for job_id in job_ids
+                for job_id in waits
                 if job_id in self._admissions and not self._admissions[job_id].poisoned
             ]
             if not live:
@@ -1640,6 +1844,7 @@ class RaidenOffloadingManager(OffloadingManager):
             if time.perf_counter() >= deadline:
                 for job_id in live:
                     self._admissions[job_id].poisoned = True
+                self._cancel_queued_loads(set(live))
                 logger.error(
                     "TPURaidenOffloadingConnector: drain timed out after %.1fs; "
                     "poisoned jobs %s (%d keys): their transfers are still in flight "
@@ -2802,6 +3007,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 )
             bytes_per_block_all_ranks -= draft_bytes
         assert bytes_per_block_all_ranks > 0
+        # What one worker moves per sub-block of a load.
+        self._sub_block_bytes = bytes_per_block_all_ranks // (
+            self.world_size * self.device_block_size_factor
+        )
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
         )
@@ -2965,8 +3174,20 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
                 dp_rank=self.dp_rank,
+                max_inflight_load_sub_blocks=self._sub_blocks(
+                    envs.VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB
+                ),
+                max_inflight_store_sub_blocks=self._sub_blocks(
+                    envs.VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB
+                ),
             )
         return self._manager
+
+    def _sub_blocks(self, mib: int) -> int:
+        """`mib` MiB of one worker's offloaded KV in sub-blocks (0 stays 0)."""
+        if mib <= 0:
+            return 0
+        return max(1, (mib << 20) // max(self._sub_block_bytes, 1))
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         if self._worker is None:

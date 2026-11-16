@@ -39,8 +39,9 @@ _UINT_BY_BITS = {16: jnp.uint16, 8: jnp.uint8}
 # Runs whose page copies are in flight at once: a run's merge is a few
 # hundred bundles, so its copies' latency, not their bytes, bounds a
 # one-run-at-a-time pipeline (~0.5 us per run and cache in the c48 twins,
-# j-efdac848).
-_DEPTH = 4
+# j-efdac848). At 4 a 4-bit decode run still took ~0.37 us for a ~360-bundle
+# body (c48 decode twin j-c22c589e: 37 runs, 13.9 us per layer).
+_DEPTH = 8
 # Rows of an 8-bit sublane tile: row windows start at a multiple.
 _ROW_ALIGN = 32
 _LANES = 128

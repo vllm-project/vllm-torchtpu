@@ -31,7 +31,8 @@ lives on rank ``b % dcp``, whole, and every block-level step stays local:
 2. `msa_attend_dcp`: each rank merges the candidates into that selection,
    attends every query head of the KV head over the selected blocks it
    holds and returns the partial output with its log-sum-exp; the caller
-   merges the ranks' partials (`ops.msa.merge_head_partials`).
+   merges the ranks' partials (`attend_and_merge` runs both, or
+   `ops.msa.merge_head_partials` merges over several KV heads).
 
 A DCP group wider than a KV head's TP replicas (e.g. DCP 8 at TP 8 with 4
 KV heads) spans ``G = dcp / replicas`` KV heads: every rank then stores all
@@ -64,13 +65,26 @@ _MIN_CANDIDATE_WIDTH = 128
 _MIN_CANDIDATE_TOKENS = 1024
 
 # Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
-# limit) an 8-token verify group fills an attention tile alone
-# (no padding rows, half the page union of a 16-token tile). Larger decode
-# batches keep 16-token tiles: at 48-64 tiles of 8 the per-tile work list and
-# kernel steps cost more than the smaller unions save (c48 b39 decode twin
-# 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
-# j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
-DCP_SMALL_BATCH_TOKENS = 128
+# limit; every decode bucket) an 8-token verify group fills an attention tile
+# alone: a 16-token tile holds two requests' disjoint page unions, so its
+# groups score twice the rows over the same pages (AOT, 4-bit 16-page step:
+# ~1,450 bundles at 8 tokens vs ~2,240 at 16). With the twins' selections
+# dispersed as served (int4 index-scale fill), c48 b37 decode attention was
+# 223 us per layer in 16-token tiles (j-52ca6e4b). Before that fill, the
+# twins' tiles were nearly empty and 8-token ones lost on per-tile cost
+# (c48 b39 108.4 -> 116.7 ms per step, j-82660a13 vs j-8a29ceb0).
+DCP_SMALL_BATCH_TOKENS = 1024
+# Pages per kernel step of those 8-token tiles in batches of more than
+# `_WIDE_GROUP_MIN_TOKENS` tokens: a tile's 128 query rows keep a 32-page
+# score tile the size of a 16-token tile's 16-page one (AOT: 32 pages ~3,000
+# bundles vs 2 x ~1,700 for two 16-page steps). Batches of up to 128 tokens
+# (c4 / c16 decode) keep 16-page groups: there the 32-page ones saved at most
+# 1.4 us per layer (c16 b6, j-5eda23f9 vs j-c93c225d), and their other
+# accumulation order re-rolled the twin's dummy-weight expert routing into a
+# reproducibly worse MoE balance at c4 b1 p90-100 (+0.58 ms per step, every
+# core's MSA ops flat, j-eb9a7c1a vs j-fbcd168a).
+_SMALL_BATCH_PAGES_PER_STEP = 32
+_WIDE_GROUP_MIN_TOKENS = 129
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -330,10 +344,16 @@ def local_candidates(
     if pretransposed:
         block_rows = -(-block_rows // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
     pad = -num_tokens % block_rows
-    if pretransposed:
-        s = jnp.pad(scores, ((0, 0), (0, pad)))
-    else:
-        s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
+    s = scores if pretransposed else scores[:, 0]
+    if pad and (live_rows is None or num_tokens < block_rows):
+        s = jnp.pad(s, ((0, 0), (0, pad)) if pretransposed else ((0, pad), (0, 0)))
+    # Without `live_rows` every row block runs, so a last block past the
+    # scores always reads past them: in the c48 decode twin (384 tokens, DCP 2,
+    # 4-bit) that halted every chip at warmup (j-433e936a). A class's grid
+    # stops at its live rows, so its scores keep no padded copy (~17 us per
+    # layer for the c48 mixed step's small tiles, j-c22c589e); its last block
+    # reads past them only when the live rows reach it. Padding rows pick from
+    # garbage and are dropped, as the kernels reduce within a row only.
     p = jnp.pad(pos, (0, pad))[:, None]
     # Static scan widths (`_scan_widths`, one kernel body each); each row
     # block takes the narrowest one holding every block its rows see (a
@@ -776,6 +796,7 @@ def msa_attend_dcp(
     rank: int | jax.Array,
     dcp: int,
     scale_cache: jax.Array | None = None,
+    q_head_major: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Second half of the DCP forward: attend over the selected blocks this
@@ -787,13 +808,15 @@ def msa_attend_dcp(
     their own merged heads, a 1 / DCP share of the group's each).
 
     ``q [T, G * Hg, D]`` holds every query head of the group's ``G`` KV heads
-    (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``);
-    ``candidates [dcp, T, G * 2 * topk]`` every rank's candidates. Returns
+    (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``), or ``[G * Hg,
+    T, D]`` with `q_head_major`; ``candidates [dcp, T, G * 2 * topk]`` every
+    rank's candidates. Returns
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
-    leading axis (`ops.msa.merge_head_partials`).
+    leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
+    sends each rank its block (`attend_and_merge`).
     """
-    num_tokens = q.shape[0]
+    num_tokens = q.shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
@@ -812,14 +835,25 @@ def msa_attend_dcp(
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    small = num_tokens <= DCP_SMALL_BATCH_TOKENS
+    if small:
+        block_q = msa_attention.SMALL_BATCH_BLOCK_Q
+        pages_per_step = (
+            _SMALL_BATCH_PAGES_PER_STEP
+            if num_tokens >= _WIDE_GROUP_MIN_TOKENS
+            else msa_attention.DEFAULT_PAGES_PER_STEP
+        )
+    elif scale_cache is not None:
+        block_q = msa_attention.PREFILL_BLOCK_Q_4BIT
+        pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP_4BIT
+    else:
+        block_q = msa_attention.PREFILL_BLOCK_Q
+        pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP
     common = dict(
         sm_scale=sm_scale,
-        block_q=(
-            msa_attention.SMALL_BATCH_BLOCK_Q
-            if num_tokens <= DCP_SMALL_BATCH_TOKENS
-            else msa_attention.DEFAULT_BLOCK_Q
-        ),
-        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        block_q=block_q,
+        pages_per_step=pages_per_step,
+        q_head_major=q_head_major,
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
@@ -847,3 +881,230 @@ def msa_attend_dcp(
     return msa_attention_lse.msa_sparse_attention_lse_heads(
         q, kv_cache, keys, *args, head_major=True, **common
     )
+
+
+_PARTIALS_BLOCK_TOKENS = 256
+
+
+def _merge_partials_kernel(lse_ref, parts_ref, *rest, rotated):
+    """One token block of `merge_partials`: ``lse_ref [dcp, Bt, Hl]``,
+    ``parts_ref [dcp, Hl, Bt, D]``, (``hadamard [D, D]``), ``o_ref [Bt,
+    Hl * D]``."""
+    o_ref = rest[-1]
+    dcp, num_heads, _, head_dim = parts_ref.shape
+    lse = lse_ref[...]
+    # torch.logsumexp over the ranks; a token no rank attended (every lse
+    # -inf) gets NaN weights, which the where below turns into zeros.
+    peak = jnp.max(lse, axis=0)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    total = peak + jnp.log(jnp.sum(jnp.exp(lse - peak[None]), axis=0))
+    weight = jnp.exp(lse - total[None])
+    weight = jnp.where(weight > 0, weight, 0.0)  # NaN (no rank attended) -> 0
+    for h in range(num_heads):
+        merged = None
+        for r in range(dcp):
+            w = jnp.broadcast_to(weight[r, :, h : h + 1], parts_ref.shape[2:])
+            # A plain product: a rank that attended nothing for a token has
+            # a zero partial (`msa_sparse_attention_lse`), never NaN, so no
+            # select guards it (a compare and a select per element, ~20% of
+            # the kernel's bundles).
+            term = parts_ref[r, h].astype(jnp.float32) * w
+            merged = term if merged is None else merged + term
+        merged = merged.astype(o_ref.dtype)
+        if rotated:
+            merged = jnp.dot(merged, rest[0][...], preferred_element_type=jnp.float32)
+            merged = (merged * (1.0 / head_dim)).astype(o_ref.dtype)
+        o_ref[:, h * head_dim : (h + 1) * head_dim] = merged
+
+
+@functools.partial(jax.jit, static_argnames=("block_tokens", "interpret"))
+def merge_partials(
+    parts: jax.Array,
+    lse: jax.Array,
+    hadamard: jax.Array | None = None,
+    *,
+    block_tokens: int = _PARTIALS_BLOCK_TOKENS,
+    interpret: bool = False,
+) -> jax.Array:
+    """The log-sum-exp merge of every DCP rank's partial attention output of
+    this rank's heads, token-major: ``parts [dcp, Hl, T, D]`` (rank ``r``'s
+    head-major partial), ``lse [dcp, T, Hl]`` f32 -> ``[T, Hl * D]``.
+
+    Weights and sum in f32, rounded once; a rank's partial of a token it
+    attended nothing for must be zero (as `msa_sparse_attention_lse` writes
+    it), not NaN. A 4-bit cache's partials (in the rotated basis) are
+    unrotated by its bf16 `hadamard` (``x @ H / D``, as
+    `ops.msa._rotate_heads`). One pass that writes the layout the output
+    projection reads: the reduce-scatter merge weighted the whole ``[dcp *
+    Hl, T, D]`` partial and XLA relaid it out for the token-major output
+    (~43 + 24 us per layer at 8K tokens, c4 twin j-db4e365d)."""
+    dcp, num_heads, num_tokens, head_dim = parts.shape
+    block_t = max(1, min(num_tokens, block_tokens))
+    rotated = hadamard is not None
+    return pl.pallas_call(
+        functools.partial(_merge_partials_kernel, rotated=rotated),
+        grid=(pl.cdiv(num_tokens, block_t),),
+        in_specs=[
+            pl.BlockSpec((dcp, block_t, num_heads), lambda i: (0, i, 0)),
+            pl.BlockSpec((dcp, num_heads, block_t, head_dim), lambda i: (0, 0, i, 0)),
+            *(
+                [pl.BlockSpec((head_dim, head_dim), lambda i: (0, 0))]
+                if rotated
+                else []
+            ),
+        ],
+        out_specs=pl.BlockSpec((block_t, num_heads * head_dim), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), parts.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge_partials",
+    )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
+
+
+def gather_by_permute(x: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
+    """Every rank's `x` in rank order, ``[dcp, *x.shape]``, by ``dcp - 1``
+    collective permutes (rank ``r`` gets rank ``r + s``'s `x` from shift
+    ``s``). For decode-sized operands of a DCP pair (two cores of one
+    chip): each XLA all-gather there blocks the TensorCore for its latency
+    (3.2 us per layer at c4 b3, j-c71e5160). Across chips (DCP 8) the
+    permutes' starts cost more than the all-gather (c64 twin j-f92f5540)."""
+    out = jnp.zeros((dcp, *x.shape), x.dtype)
+    out = jax.lax.dynamic_update_index_in_dim(out, x, rank, 0)
+    for shift in range(1, dcp):
+        perm = [(src, (src - shift) % dcp) for src in range(dcp)]
+        received = jax.lax.ppermute(x, axis, perm)
+        out = jax.lax.dynamic_update_index_in_dim(
+            out, received, (rank + shift) % dcp, 0
+        )
+    return out
+
+
+def all_to_all_by_permute(
+    x: jax.Array, rank: jax.Array, axis: str, dcp: int
+) -> jax.Array:
+    """`jax.lax.all_to_all` of ``x [dcp, ...]`` along its leading axis (block
+    ``d`` goes to rank ``d``; block ``s`` of the result came from rank
+    ``s``), by `gather_by_permute`'s permutes. For decode-sized blocks: each
+    XLA all-to-all costs its latency on the TensorCore (~1.3 us per layer at
+    c4 decode, j-c71e5160)."""
+    out = jnp.zeros_like(x)
+    own = jax.lax.dynamic_index_in_dim(x, rank, 0, False)
+    out = jax.lax.dynamic_update_index_in_dim(out, own, rank, 0)
+    for shift in range(1, dcp):
+        perm = [(src, (src - shift) % dcp) for src in range(dcp)]
+        send = jax.lax.dynamic_index_in_dim(x, (rank - shift) % dcp, 0, False)
+        received = jax.lax.ppermute(send, axis, perm)
+        out = jax.lax.dynamic_update_index_in_dim(
+            out, received, (rank + shift) % dcp, 0
+        )
+    return out
+
+
+def _exchange_partials(
+    parts: jax.Array, lses: jax.Array, rank: jax.Array, axis: str, dcp: int
+) -> tuple[jax.Array, jax.Array]:
+    """`all_to_all_by_permute` of ``parts [dcp, Hl, T, D]`` and ``lses [dcp,
+    T, Hl]`` f32 in one set of permutes: the LSEs' bits ride as one more uint16
+    head row (a permute copies bytes; every permute start costs ~1 us on the
+    TensorCore at decode, c4 twin j-6bbe97e2)."""
+    num_ranks, num_heads, num_tokens, head_dim = parts.shape
+    if parts.dtype.itemsize != 2 or 2 * num_heads > head_dim:
+        raise ValueError(
+            f"16-bit partials with 2 * heads <= head_dim, got {parts.dtype} "
+            f"{parts.shape}"
+        )
+    # As 16-bit integers: float copies may canonicalize NaN or flush
+    # subnormal bit patterns (the LSE halves are arbitrary bits).
+    words = jax.lax.bitcast_convert_type(parts, jnp.uint16)
+    bits = jax.lax.bitcast_convert_type(lses, jnp.uint16)  # [dcp, T, Hl, 2]
+    bits = bits.reshape(num_ranks, 1, num_tokens, 2 * num_heads)
+    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - 2 * num_heads)))
+    both = all_to_all_by_permute(
+        jnp.concatenate([words, bits], axis=1), rank, axis, dcp
+    )
+    bits = both[:, num_heads, :, : 2 * num_heads].reshape(
+        num_ranks, num_tokens, num_heads, 2
+    )
+    return (
+        jax.lax.bitcast_convert_type(both[:, :num_heads], parts.dtype),
+        jax.lax.bitcast_convert_type(bits, lses.dtype),
+    )
+
+
+def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
+    """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
+    rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
+    permute: XLA's all-gather of the 16 MB c4 / c16 queries took 158 us per
+    layer in the twin (j-094494a7), a permute plus the concatenation ~51 us
+    on the same core pair in a standalone bench (j-a7bf7869; all-gather ~90)."""
+    if dcp != 2:
+        return jax.lax.all_gather(q, axis, axis=0, tiled=True)
+    other = jax.lax.ppermute(q, axis, [(0, 1), (1, 0)])
+    # [q, other, q] from row `rank * Hl` is the pair's heads in rank order.
+    both = jnp.concatenate([q, other, q])
+    return jax.lax.dynamic_slice_in_dim(both, rank * q.shape[0], 2 * q.shape[0])
+
+
+def attend_and_merge(
+    rank: jax.Array,
+    q: jax.Array,
+    kv_cache: jax.Array,
+    candidates: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    scale_cache: jax.Array | None = None,
+    hadamard: jax.Array | None = None,
+    *,
+    axis: str,
+    dcp: int,
+    sm_scale: float,
+    topk: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """The attention half of the DCP forward over one KV head, inside a
+    ``shard_map`` over `axis` (the DCP group): this rank's head-major query
+    heads ``q [Hl, T, D]`` (rotated for a 4-bit cache, then pass its
+    `scale_cache` and `hadamard`) and packed ``candidates [T, 2 * topk]`` ->
+    its heads' merged output ``[T, Hl * D]``.
+
+    The query heads and candidates are all-gathered, `msa_attend_dcp` runs
+    over the group's heads, and each rank's head block of the partial and
+    its LSEs go to their owner by all-to-all for `merge_partials`. As XLA
+    collectives in one program they move the head-major buffers as laid out;
+    torch's all-to-all of them cost ~890 us per layer at 8K tokens (c4 twin,
+    j-c60806bf)."""
+    num_heads, num_tokens, head_dim = q.shape
+    rank = rank_array(rank)[0]
+    q_all = _gather_heads(q, rank, axis, dcp)
+    # Decode-sized operands of a pair move by permutes (latency); a prefill
+    # step's partials by XLA's all-to-all, which writes them in place.
+    small = dcp == 2 and num_tokens <= DCP_SMALL_BATCH_TOKENS
+    if small:
+        cand_all = gather_by_permute(candidates, rank, axis, dcp)
+    else:
+        cand_all = jax.lax.all_gather(candidates, axis, axis=0)
+    out, lse = msa_attend_dcp(
+        q_all,
+        kv_cache,
+        cand_all,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        sm_scale=sm_scale,
+        topk=topk,
+        rank=rank,
+        dcp=dcp,
+        scale_cache=scale_cache,
+        q_head_major=True,
+        interpret=interpret,
+    )
+    # Block r of each result came from rank r: its partial of this rank's heads.
+    parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
+    lses = lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1)
+    if small:
+        parts, lses = _exchange_partials(parts, lses, rank, axis, dcp)
+    else:
+        parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
+        lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
+    return merge_partials(parts, lses, hadamard, interpret=interpret)

@@ -395,8 +395,9 @@ class KVCacheManager:
                     sharded_draft = getattr(attn_module.impl, "sharded_draft_dcp", None)
                     if sharded_draft is not None:
                         # A drafter's sliding-window KV sharded over DCP like
-                        # the target's (`cp_draft_attention`): block_size-token
-                        # pages holding every KV head of the DCP group. Exact
+                        # the target's (`cp_draft_attention`): pages the size
+                        # of block_size tokens of the DCP group's KV heads,
+                        # holding as many blocks of this rank's head. Exact
                         # spec; full attention as vLLM's sliding-window
                         # manager rejects DCP (the window is applied on read).
                         kv_heads = max(
