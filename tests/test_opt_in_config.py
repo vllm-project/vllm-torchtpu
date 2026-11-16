@@ -63,6 +63,7 @@ REPLACED_ENV = {
     "moe_flat_routing_min_tokens": "TPU_MOE_FLAT_ROUTING_MIN_TOKENS",
     "tight_vmem": "TPU_TIGHT_VMEM",
     "tight_vmem_candidates_mib": "TPU_TIGHT_VMEM_CANDIDATES_MIB",
+    "release_jax_caches": "TPU_RELEASE_JAX_CACHES",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {

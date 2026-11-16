@@ -51,6 +51,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.opt_in_config import option
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
@@ -90,6 +91,23 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+
+
+def _release_jax_caches() -> None:
+    """Drop JAX's trace and lowering caches after warm-up (additional_config
+    release_jax_caches).
+
+    Every bucket is compiled by now and the Pallas kernels live inside those
+    programs, so the cached jaxprs are only needed if a kernel is traced again,
+    which then re-traces it once.
+    """
+    import jax
+
+    jax.clear_caches()
+    logger.info(
+        "additional_config.release_jax_caches: dropped JAX trace/lowering "
+        "caches after warm-up."
+    )
 
 
 class TPUWorker(WorkerBase):
@@ -803,6 +821,8 @@ class TPUWorker(WorkerBase):
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
+        if option(self.vllm_config.additional_config, "release_jax_caches"):
+            _release_jax_caches()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.

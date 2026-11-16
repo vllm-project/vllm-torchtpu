@@ -140,6 +140,12 @@ DEFAULTS: dict[str, bool | int | str] = {
     # only the limit changes. Candidates "<MiB>,..." ("" = "32,40,48,52").
     "tight_vmem": False,
     "tight_vmem_candidates_mib": "",
+    # Worker: drop JAX's trace / lowering caches once warm-up has compiled
+    # every bucket (`jax.clear_caches`). The Pallas kernels already sit in the
+    # compiled programs; the cached jaxprs only serve a re-trace. Frees
+    # ~0.9 GiB host heap per worker (~7 GiB per MiniMax-M3.1 host), which
+    # lowers the Raiden host-pool start-up guard reading. Host-only.
+    "release_jax_caches": False,
 }
 
 
