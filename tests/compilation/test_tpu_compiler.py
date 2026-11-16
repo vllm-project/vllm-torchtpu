@@ -39,6 +39,7 @@ class TestTpuCompilerCache:
         *,
         max_num_seqs=16,
         num_gpu_blocks=1024,
+        kv_cache_layout="LBNHC",
         mamba_cache_mode="none",
         prefix_match_unit=None,
     ):
@@ -47,6 +48,7 @@ class TestTpuCompilerCache:
                 gpu_memory_utilization=0.9,
                 num_gpu_blocks=num_gpu_blocks,
                 num_gpu_blocks_override=None,
+                kv_cache_layout=kv_cache_layout,
                 mamba_cache_mode=mamba_cache_mode,
                 mamba_block_size=3072,
                 prefix_match_unit=prefix_match_unit,
@@ -80,9 +82,13 @@ class TestTpuCompilerCache:
             different_kv = compute_tpu_compilation_hash(
                 self._config(num_gpu_blocks=2048)
             )
+            different_layout = compute_tpu_compilation_hash(
+                self._config(kv_cache_layout="LBHNC")
+            )
 
         assert base != different_batch
         assert base != different_kv
+        assert base != different_layout
 
     def test_tpu_hash_covers_gdn_prefill_checkpoint_gate_only(self):
         """The hash follows prefill_checkpoint_enabled, not its raw inputs."""

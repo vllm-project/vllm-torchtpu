@@ -435,6 +435,8 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "kv_cache": {
             "gpu_memory_utilization": cache_config.gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
+            # Resolved upfront in TpuPlatform.check_and_update_config.
+            "kv_cache_layout": cache_config.kv_cache_layout,
         },
         # The GDN op traces with prefill checkpoint operands or with constant
         # None inputs depending on this gate. Its inputs (prefix_match_unit,
