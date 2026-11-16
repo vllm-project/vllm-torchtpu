@@ -1521,11 +1521,6 @@
       "concise_description": "No attribute `XSpace` in module `vllm_torchtpu.tools.xplane_pb2`"
     },
     {
-      "path": "src/vllm_torchtpu/tpu_info.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `None` is not assignable to declared return type `str`"
-    },
-    {
       "path": "src/vllm_torchtpu/worker/tpu_worker.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `TPUModelRunner` has no attribute `_sync_weights`"

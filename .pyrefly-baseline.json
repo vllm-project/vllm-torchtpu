@@ -384,11 +384,6 @@
       "path": "src/vllm_torchtpu/tools/merge_xplane.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `XSpace` in module `vllm_torchtpu.tools.xplane_pb2`"
-    },
-    {
-      "path": "src/vllm_torchtpu/tpu_info.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `None` is not assignable to declared return type `str`"
     }
   ]
 }

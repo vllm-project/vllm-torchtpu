@@ -945,3 +945,270 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def test_tpu_flash_attention_prefix_kv_slicing(monkeypatch):
+    assert TpuFlashAttentionBackend.supports_prefix_kv_slicing is True
+    assert TpuSDPABackend.supports_prefix_kv_slicing is False
+
+    seen = []
+
+    def fake_op(q, k, v, scale):
+        seen.append((k.shape[1], v.shape[1], scale))
+        scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) * scale
+        return torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v.float()).to(
+            q.dtype
+        )
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.attention._flash_attention_op", lambda: fake_op
+    )
+    mock_warn = MagicMock()
+    monkeypatch.setattr("vllm_torchtpu.omni.attention.logger.warning_once", mock_warn)
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 12, 4, 16, dtype=torch.bfloat16)
+    k = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    v = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+
+    impl = TpuFlashAttentionImpl(num_heads=4, head_size=16, softmax_scale=0.25)
+    meta = SimpleNamespace(
+        attn_mask=None,
+        extra={"valid_kv_length": 11},
+    )
+    out = impl.forward(q, k, v, attn_metadata=meta)
+    assert seen == [(11, 11, 0.25)]
+    mock_warn.assert_not_called()
+
+    # Matches explicit broadcast key-padding mask on the valid prefix.
+    mask_meta = SimpleNamespace(
+        attn_mask=torch.arange(16)[None, :] < 11,
+        extra={},
+    )
+    ref = TpuSDPAImpl(num_heads=4, head_size=16, softmax_scale=0.25).forward(
+        q.float(), k.float(), v.float(), attn_metadata=mask_meta
+    )
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+    # Non-bf16 SDPA fallback also honors valid_kv_length when attn_mask is None.
+    out_f32 = impl.forward(q.float(), k.float(), v.float(), attn_metadata=meta)
+    torch.testing.assert_close(out_f32, ref, rtol=1e-5, atol=1e-5)
+
+    for bad in (0, -1, 17, True, "11"):
+        bad_meta = SimpleNamespace(attn_mask=None, extra={"valid_kv_length": bad})
+        with pytest.raises(ValueError, match="valid_kv_length"):
+            impl.forward(q, k, v, attn_metadata=bad_meta)
+
+
+@pytest.mark.parametrize(
+    "chips,dev_count,expected_env",
+    [
+        ("0,1,2,3", 8, None),  # GKE 4-chip dual-core pod -> cleared
+        ("2,3,0,1", 8, None),  # GKE unordered Go-map permutation -> cleared
+        ("0,1", 4, None),  # GKE 2-chip dual-core pod -> cleared
+        ("0,1", 8, "0,1"),  # 2-chip subset on 4-chip host -> preserved
+        ("1,2", 4, "1,2"),  # non-zero-based subset -> preserved
+        ("0,0,1,2", 8, "0,0,1,2"),  # duplicate IDs -> preserved
+        ("0,1,2,3", 4, "0,1,2,3"),  # single-core-per-chip -> preserved
+    ],
+)
+def test_normalize_gke_visible_chips(monkeypatch, chips, dev_count, expected_env):
+    monkeypatch.setenv("TPU_VISIBLE_CHIPS", chips)
+    monkeypatch.setattr(
+        OmniTpuPlatform, "get_device_count", classmethod(lambda cls: dev_count)
+    )
+    OmniTpuPlatform._normalize_gke_visible_chips()
+    assert os.environ.get("TPU_VISIBLE_CHIPS") == expected_env
+
+
+def test_tpu_broadcast_patch(monkeypatch):
+    import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
+
+    from vllm_torchtpu.omni.patches import (
+        _TPU_BROADCAST_PATCHED,
+        _patch_tpu_broadcast,
+    )
+
+    events = []
+    orig_calls = []
+
+    def fake_orig_broadcast(
+        tensor, src=None, group=None, async_op=False, group_src=None
+    ):
+        orig_calls.append((tensor, src, group, async_op, group_src))
+        return "orig_work"
+
+    monkeypatch.setattr(c10d, "broadcast", fake_orig_broadcast)
+    monkeypatch.setattr(dist, "broadcast", fake_orig_broadcast)
+    _patch_tpu_broadcast()
+    patched = c10d.broadcast
+    assert dist.broadcast is patched
+    assert getattr(patched, _TPU_BROADCAST_PATCHED, False)
+
+    # Idempotent on repeat installation.
+    _patch_tpu_broadcast()
+    assert c10d.broadcast is patched
+
+    # CPU tensors bypass straight to original broadcast.
+    cpu_t = torch.tensor([1, 2, 3])
+    assert patched(cpu_t, src=0) == "orig_work"
+    assert len(orig_calls) == 1
+
+    class FakeTpuTensor(torch.Tensor):
+        @property
+        def device(self):  # type: ignore[override]
+            return SimpleNamespace(type="tpu")
+
+    monkeypatch.setattr(c10d, "_rank_not_in_group", lambda group: False)
+    monkeypatch.setattr(c10d, "get_backend", lambda group: "tpu_dist")
+    monkeypatch.setattr(c10d, "get_world_size", lambda group: 4)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda device=None: events.append("sync"),
+    )
+
+    def fake_all_reduce(tensor, op=None, group=None, async_op=False):
+        events.append(("all_reduce", tensor.dtype, tensor.clone()))
+        tensor.add_(10)
+        return None
+
+    monkeypatch.setattr(c10d, "all_reduce", fake_all_reduce)
+
+    # Non-root rank zeroes its buffer and syncs before all_reduce, then syncs after.
+    monkeypatch.setattr(c10d, "get_rank", lambda group: 2)
+    t_nonroot = torch.tensor([5, 6], dtype=torch.int64).as_subclass(FakeTpuTensor)
+    patched(t_nonroot, src=0)
+    assert [e if isinstance(e, str) else e[0] for e in events] == [
+        "sync",
+        "sync",
+        "all_reduce",
+        "sync",
+    ]
+    assert torch.equal(events[2][2].as_subclass(torch.Tensor), torch.tensor([0, 0]))
+    assert torch.equal(t_nonroot.as_subclass(torch.Tensor), torch.tensor([10, 10]))
+
+    # Root rank preserves its buffer without an extra zero_() sync.
+    events.clear()
+    monkeypatch.setattr(c10d, "get_rank", lambda group: 0)
+    t_root = torch.tensor([7, 8], dtype=torch.int64).as_subclass(FakeTpuTensor)
+    patched(t_root, src=0)
+    assert [e if isinstance(e, str) else e[0] for e in events] == [
+        "sync",
+        "all_reduce",
+        "sync",
+    ]
+    assert torch.equal(events[1][2].as_subclass(torch.Tensor), torch.tensor([7, 8]))
+
+    # Bool tensor promotes to int32 for SUM all_reduce and copies back as bool.
+    events.clear()
+    monkeypatch.setattr(c10d, "get_rank", lambda group: 1)
+
+    def fake_bool_all_reduce(tensor, op=None, group=None, async_op=False):
+        events.append(("all_reduce", tensor.dtype, tensor.clone()))
+        tensor.copy_(torch.tensor([1, 0, 1], dtype=torch.int32))
+        return None
+
+    monkeypatch.setattr(c10d, "all_reduce", fake_bool_all_reduce)
+    t_bool = torch.tensor([True, True, False], dtype=torch.bool).as_subclass(
+        FakeTpuTensor
+    )
+    patched(t_bool, src=0)
+    assert events[2][1] == torch.int32
+    assert t_bool.dtype == torch.bool
+    assert t_bool.as_subclass(torch.Tensor).tolist() == [True, False, True]
+
+    with pytest.raises(ValueError, match="Either src or group_src"):
+        patched(t_root)
+    with pytest.raises(ValueError, match="Cannot specify both"):
+        patched(t_root, src=0, group_src=0)
+
+
+def test_tpu_empty_collectives_patch(monkeypatch):
+    import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
+
+    from vllm_torchtpu.omni.patches import (
+        _TPU_EMPTY_COLLECTIVES_PATCHED,
+        _patch_tpu_empty_collectives,
+    )
+
+    calls = []
+
+    def make_orig(tag):
+        def _fn(*args, **kwargs):
+            calls.append(tag)
+            return f"orig_{tag}"
+
+        return _fn
+
+    for name, tag in (
+        ("all_gather_single", "ag"),
+        ("reduce_scatter_tensor", "rs"),
+        ("all_reduce", "ar"),
+    ):
+        fn = make_orig(tag)
+        monkeypatch.setattr(c10d, name, fn)
+        monkeypatch.setattr(dist, name, fn)
+
+    _patch_tpu_empty_collectives()
+    patched_ag = c10d.all_gather_single
+    assert getattr(patched_ag, _TPU_EMPTY_COLLECTIVES_PATCHED, False)
+    assert dist.all_gather_single is patched_ag
+
+    # Idempotent on repeat install.
+    _patch_tpu_empty_collectives()
+    assert c10d.all_gather_single is patched_ag
+
+    class FakeTpuTensor(torch.Tensor):
+        @property
+        def device(self):  # type: ignore[override]
+            return SimpleNamespace(type="tpu")
+
+    empty_tpu = torch.empty(0, 8, dtype=torch.bfloat16).as_subclass(FakeTpuTensor)
+    nonempty_tpu = torch.ones(2, 8, dtype=torch.bfloat16).as_subclass(FakeTpuTensor)
+    empty_cpu = torch.empty(0, 8, dtype=torch.bfloat16)
+
+    # 0-element TPU collectives short-circuit without calling c10d backend.
+    assert dist.all_gather_into_tensor(empty_tpu, empty_tpu) is None
+    assert dist.reduce_scatter_tensor(empty_tpu, empty_tpu) is None
+    assert dist.all_reduce(empty_tpu) is None
+    work = dist.all_gather_single(empty_tpu, empty_tpu, async_op=True)
+    assert work.is_completed() and work.is_success() and work.wait()
+    assert calls == []
+
+    # Non-empty TPU or CPU tensors delegate to the original collectives.
+    assert dist.all_gather_single(nonempty_tpu, nonempty_tpu) == "orig_ag"
+    assert dist.reduce_scatter_tensor(nonempty_tpu, nonempty_tpu) == "orig_rs"
+    assert dist.all_reduce(nonempty_tpu) == "orig_ar"
+    assert dist.all_gather_single(empty_cpu, empty_cpu) == "orig_ag"
+    assert calls == ["ag", "rs", "ar", "ag"]
+
+
+def test_tpu_fp16_sdpa_patch_skips_lazy_module_getattr(monkeypatch):
+    import sys
+    import types
+
+    import torch.nn.functional as F
+
+    from vllm_torchtpu.omni.patches import _patch_tpu_fp16_sdpa
+
+    def fake_sdpa(*args, **kwargs):
+        return args[0]
+
+    class _LazyModule(types.ModuleType):
+        def __getattr__(self, name: str):
+            raise ImportError(f"unexpected lazy import of {name}")
+
+    lazy_mod = _LazyModule("_test_lazy_module")
+    eager_mod = types.ModuleType("_test_eager_sdpa_caller")
+    eager_mod.scaled_dot_product_attention = fake_sdpa  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(F, "scaled_dot_product_attention", fake_sdpa)
+    monkeypatch.setitem(sys.modules, lazy_mod.__name__, lazy_mod)
+    monkeypatch.setitem(sys.modules, eager_mod.__name__, eager_mod)
+
+    _patch_tpu_fp16_sdpa()
+    assert eager_mod.scaled_dot_product_attention is F.scaled_dot_product_attention
+    assert F.scaled_dot_product_attention is not fake_sdpa
