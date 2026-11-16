@@ -451,6 +451,28 @@ python3 transfer_stats.py ...                                                   
   子 agent 的 key 和父会话不同、负载触发的迁移。前缀路由跟着缓存走、不迁移后到 93.3%，c512 吞吐 8.82 req/s、TTFT P50 2.83s。
   迁移阈值 3 时 P 一饱和就频繁迁移（483 次），每次整段重算又加重 P，反而更差（8.08）；按加性代价（排队 + 2 × 重算）选 rank 时迁移 1895 次，只有 6.67 req/s。
 
+### 5.7 AgentX c256（2026-11-15，Rocky 主机 1hnv / 304m）
+
+`results/agentx-c256-{base-el9,chunked,chunked-droute2,chunked-droute-eplbperm,best-3600}-1115-*`，汇总用 `agentx_summary.py`。
+代码 e6f1f1e17；P 生产配置 + `--enable-prompt-tokens-details`，D `MAX_NUM_SEQS=64` + `[16,48,96,144,192,288,384,2048]`，两边 `TPU_RECLAIM_COMPILE_MEMORY=1`；proxy 前缀路由 + 命中诊断。
+aiperf 的统计不含 warmup 阶段的请求。
+
+| 运行 | 时长 | req/s | 输出 tok/s | TTFT P50 / P90 | ITL P50 | D 最忙 / 最闲 rank（运行中请求） |
+|---|---|---|---|---|---|---|
+| 基线 | 900s | 5.51 | 4,906 | 2.56 / 8.85 s | 11.8 ms | 6.4 / 1.8 |
+| + P 分块分词（6.1 第 15 条） | 900s | 5.84 | 5,168 | 0.83 / 2.36 s | 12.3 ms | 10.0 / 2.3 |
+| + D 路由（6.1 第 16 条） | 900s | **5.99** | **5,348** | 0.87 / 2.25 s | **11.2 ms** | 6.6 / 4.2 |
+| + D 静态 EPLB `dsv41_flash_dp8_c384_perm` | 900s | 5.91 | 5,252 | 0.87 / 2.38 s | 11.7 ms | 7.0 / 4.5 |
+| 分块分词 + D 路由 | **3600s** | 4.55 | 4,600 | 0.90 / 2.58 s | 10.4 ms | — |
+| 参考（客户提供，c256） | 3600s | 5.22 | 5,218 | 0.22 / 0.48 s | 4.83 ms | — |
+
+- 基线的 TTFT 卡在 P 的 API server：proxy 只对 `/v1/completions` 本地分词，AgentX 的 chat 请求每个都在 P 上整段分词（py-spy：API server 91% 的 CPU 在 `_encode_plus`，25 万 token 约 0.5s）。
+  4 个 API server 一忙就排队，P 段 P50 随时间从 1.2s 涨到 7.8s，而 P 引擎内部只要约 0.74s。分块分词后稳态 P 段 P50 约 0.55s（排队 0.45s + prefill 0.51s，均值），D 段约 0.27s。
+- D 路由前 D 的请求跟着 P 的 rank（前缀路由），c256 时最忙 rank 平均 10 个、最闲 2.3 个；DP lockstep 下每步等最忙的。均衡后 ITL -9%，换 rank 多拉 KV 的代价看不出来（D 段不变）。
+- 静态 EPLB 没有收益：c256 下 D 每个 rank 只有约 40 行，MoE 受权重读取限制，专家负载均衡影响不大。换 layout 后 D 重新编译约 1 小时。
+- 3600s 的吞吐低于 900s：会话是闭环的（上一轮结束才发下一轮），吞吐由单请求延迟决定；后段会话更长、长输出也能跑完（平均输出 1011 vs 892）。
+  单请求约 0.9s + 1011 × 10.4ms ≈ 11.4s，参考约 5s。剩下的主要差距是 ITL：每步耗时约 34ms（和 greedy bench 相当），但 temperature 1.0 下 DSpark 每步只接受约 3.0 个 token（greedy 约 5.9）。
+
 ---
 
 ## 6. 改动与效果（按收益排序）
@@ -482,6 +504,13 @@ python3 transfer_stats.py ...                                                   
     原来 96→192→384 之间最多补齐 2 倍，AgentX c512 的 ITL 34→17 ms、输出吞吐 5,538→7,947 tok/s。D 编译缓存多约 10 GB（42 GB）。
 14. **proxy 前缀路由**（2026-11-13）：按文本前缀哈希把请求发到已缓存最长前缀的 P rank、不迁移，AgentX c512 稳态命中 92.4→93.3%、吞吐 8.38→8.82 req/s、TTFT P50 3.86→2.83s（5.6）。
 13. **proxy 复用 P 的 prompt token ids**（159e4efe4）：chat 请求让 P 返回 `prompt_token_ids`，放进 `kv_transfer_params` 交给 D，D 不再渲染模板、重新分词（`PROXY_REUSE_PROMPT_IDS=0` 关）。100k token 命中缓存的 chat TTFT 873→678–774ms，输出一致。
+15. **P 的 API server 分块分词**（`apply_venv_patches.py` 第 8 节，2026-11-15）：vLLM `_tokenize_prompt` 对长 prompt（≥128K 字符）按 proxy 同样的规则切块
+   （只在两个 ASCII 字母之间的空格处切），用 `tokenizers.encode_batch` 并行编码再拼接。只用于不要 offset、参数只含 `add_special_tokens` / 截断的情况，
+   截断方向按 tokenizer 的 `truncation_side`（vLLM 默认 left）；用一份关掉截断 / padding 的 backend 副本（HF 的 `__call__` 会把 `enable_truncation` 留在共享 backend 上）。
+   离线随机测试和 AgentX 真实流量 1414 条长请求（`VLLM_CHUNKED_TOKENIZE_VERIFY=1` 逐条和整段分词比对）全部一致；单条约快 9 倍。`VLLM_CHUNKED_TOKENIZE=0` 关。
+   AgentX c256 TTFT P50 2.56→0.83s、P90 8.85→2.36s（5.7）。
+16. **proxy 给 D 单独选 rank**（`PROXY_DECODE_ROUTING=1`，`PROXY_DECODE_SLACK` 默认 2）：D 也按前缀块哈希选缓存了最长前缀的 rank（保留 D 的前缀缓存），
+   但该 rank 在跑的 decode 流比最少的 rank 多出 slack 以上时改发最闲的 rank。日志 `PERF PROXY decode_route`。AgentX c256 ITL 12.3→11.2 ms（5.7）。
 
 ### 6.2 D 这一跳的控制路径优化（2026-10-29，已部署）
 
@@ -509,6 +538,7 @@ python3 transfer_stats.py ...                                                   
 
 ### 6.3 试过但没用 / 不可行
 
+- **D 静态 EPLB**（`TPU_EXPERT_PLACEMENT=dsv41_flash_dp8_c384_perm`，2026-11-15）：AgentX c256 无收益（ITL 11.2→11.7 ms，在误差内），换 layout 后 D 重新编译约 1 小时（5.7）。
 - async scheduling 用在 P 上：TTFT 无改善。
 - **DSpark 的 K 不能改**：`num_speculative_tokens` 必须等于 checkpoint 的 block size 5（`block/Markov-head machinery is trained for exactly that block length`），K=3/4 启动即报错。
 - dummy 前向不放 token（让空闲 rank 的 selection 全为 -1）：没用，热点在 deep gather 的共享零行（6.1 第 11 条）。
@@ -520,6 +550,16 @@ python3 transfer_stats.py ...                                                   
 ---
 
 ## 7. 已知问题与踩坑
+
+**Rocky 9 主机（2026-11-14，sunnyfang-tpu7x-dws-3-1hnv / -4-304m）**
+
+venv 和自编 tpu-sync 都是在 Ubuntu 24.04 上建的，换到 Rocky Linux 9 要额外处理：
+- 自编的 `_tpu_raiden_torch_2_13_0.so` 要 glibc 2.38（Rocky 9 是 2.34）：在 Rocky 上用 clang 19 重编（`/zzlfs/temu/src/build-tpusync-1031-el9.sh`，
+  libzmq 要强制 `CMAKE_INSTALL_LIBDIR=lib`），产物放 `/zzlfs/temu/overlay-el9/tpu_sync`，`start_1p1d_epic.sh` 在 RHEL 上自动加进 PYTHONPATH。
+- 要装 `python3.12`（venv 的 python 指向 `/usr/bin/python3.12`）、`libibverbs`；runai streamer 找 Ubuntu 的 CA 路径，建软链接 `/etc/ssl/certs/ca-certificates.crt -> /etc/pki/tls/certs/ca-bundle.crt`，否则读 GCS 报 `File access error`。
+- Rocky 的 python3.12 是 PIE，**必须开 `TPU_RECLAIM_COMPILE_MEMORY=1`**：不开时 P、D 编译期都把 944 GB 吃光，整机卡死（OOM 后 worker 报 `RuntimeUnexpectedCoreHalt`）。
+- `/etc/environment` 设了 `LD_PRELOAD=libtcmalloc`（ssh 登录时由 PAM 带进来），和 reclaim 冲突（`requires Linux with glibc malloc`）；`start_1p1d_epic.sh` 开 reclaim 时会 unset。
+- `stop_vllm_local.sh` 原来只匹配 `.venv/bin/vllm serve`，停不掉 `.venv-epic` 的主进程（已修）。
 
 **主机内存（新主机 944 GB）**
 

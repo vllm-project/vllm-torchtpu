@@ -966,6 +966,82 @@ _PREFIX_ROUTER = (
     else None
 )
 
+class _DecodeRouter:
+    """Picks the DECODE DP rank (PROXY_DECODE_ROUTING=1; default off = the
+    decode hop reuses the prefill rank header).
+
+    D keeps a prefix cache and pulls only the uncached part of the KV, so a
+    request prefers the D rank holding its longest prefix (same block hashes
+    as _PrefixRouter). D's ranks step in lockstep, so the busiest rank sets
+    the step time for all of them; a request leaves its prefix rank for the
+    rank with the fewest in-flight decode streams when its prefix rank has
+    more than PROXY_DECODE_SLACK (default 2) streams above that minimum.
+    """
+
+    def __init__(self, dp: int, rank_tokens: int, slack: int):
+        self.dp = dp
+        self.slack = slack
+        self.capacity = int(
+            rank_tokens * _PrefixRouter.CHARS_PER_TOKEN / _PrefixRouter.BLOCK_CHARS
+        )
+        self.active = [0] * dp
+        self.caches = [collections.OrderedDict() for _ in range(dp)]
+        self.moves = 0  # requests sent away from their longest-prefix rank
+
+    @staticmethod
+    def hashes(req_data: dict) -> list[bytes] | None:
+        text = _PrefixRouter._text(req_data)
+        if text is None:
+            return None
+        raw = text.encode("utf-8", "surrogatepass")
+        step, prev, out = _PrefixRouter.BLOCK_CHARS, b"", []
+        for i in range(0, len(raw) - step + 1, step):
+            prev = hashlib.blake2b(prev + raw[i : i + step], digest_size=8).digest()
+            out.append(prev)
+        return out
+
+    def assign(self, hashes: list[bytes]) -> tuple[int, int, bool]:
+        matches = []
+        for r in range(self.dp):
+            cache, n = self.caches[r], 0
+            for h in hashes:
+                if h not in cache:
+                    break
+                n += 1
+            matches.append(n)
+        least = min(range(self.dp), key=lambda r: (self.active[r], -matches[r]))
+        home = max(range(self.dp), key=lambda r: (matches[r], -self.active[r]))
+        moved = False
+        if matches[home] == 0:
+            best = least
+        elif self.active[home] - self.active[least] > self.slack:
+            best, moved = least, True
+            self.moves += 1
+        else:
+            best = home
+        cache = self.caches[best]
+        for h in hashes:
+            cache[h] = None
+            cache.move_to_end(h)
+        while len(cache) > self.capacity:
+            cache.popitem(last=False)
+        self.active[best] += 1
+        return best, matches[best], moved
+
+    def release(self, rank: int) -> None:
+        self.active[rank] = max(0, self.active[rank] - 1)
+
+
+_DECODE_ROUTER = (
+    _DecodeRouter(
+        _SESSION_AFFINITY_DP,
+        int(os.environ.get("PROXY_DECODE_RANK_TOKENS", "8874043")),
+        int(os.environ.get("PROXY_DECODE_SLACK", "2")),
+    )
+    if _SESSION_AFFINITY_DP > 1 and os.environ.get("PROXY_DECODE_ROUTING", "0") == "1"
+    else None
+)
+
 _SESSION_ROUTER = (
     _SessionRouter(
         _SESSION_AFFINITY_DP,
@@ -991,6 +1067,12 @@ async def _handle_completions(api: str, request: Request):
             forwarded["X-data-parallel-rank"] = dp_rank
         routed: tuple[int, int] | None = None
         session_key = None
+        client_rank = "X-data-parallel-rank" in forwarded
+        d_hashes = (
+            _DecodeRouter.hashes(req_data)
+            if _DECODE_ROUTER is not None and not client_rank
+            else None
+        )
         router = _PREFIX_ROUTER or _SESSION_ROUTER
         if "X-data-parallel-rank" not in forwarded and _PREFIX_ROUTER is not None:
             routed = _PREFIX_ROUTER.assign(req_data)
@@ -1132,25 +1214,40 @@ async def _handle_completions(api: str, request: Request):
                 flush=True,
             )
             first = True
-            async for chunk in stream_from_decode(
-                decode_client_info, api, req_data, request_id, forwarded
-            ):
-                if first:
-                    t_first = time.time()
-                    t_first_perf = time.perf_counter()
-                    decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
-                    ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
-                    _PROXY_LATENCY.record("decode_first", decode_first_ms)
-                    _PROXY_LATENCY.record("ttft", ttft_ms)
-                    print(
-                        f"PERF PROXY first_chunk req_id={request_id} "
-                        f"ts={t_first:.6f} "
-                        f"dur_from_decode_send_ms={decode_first_ms:.2f} "
-                        f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
-                        flush=True,
-                    )
-                    first = False
-                yield chunk
+            d_forwarded, d_rank = forwarded, None
+            if d_hashes is not None:
+                d_rank, d_match, d_moved = _DECODE_ROUTER.assign(d_hashes)
+                d_forwarded = {**forwarded, "X-data-parallel-rank": str(d_rank)}
+                print(
+                    f"PERF PROXY decode_route req_id={request_id} rank={d_rank} "
+                    f"p_rank={forwarded.get('X-data-parallel-rank')} "
+                    f"match_blocks={d_match} moved={int(d_moved)} "
+                    f"active={_DECODE_ROUTER.active} moves={_DECODE_ROUTER.moves}",
+                    flush=True,
+                )
+            try:
+              async for chunk in stream_from_decode(
+                decode_client_info, api, req_data, request_id, d_forwarded
+              ):
+                  if first:
+                      t_first = time.time()
+                      t_first_perf = time.perf_counter()
+                      decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
+                      ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                      _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                      _PROXY_LATENCY.record("ttft", ttft_ms)
+                      print(
+                          f"PERF PROXY first_chunk req_id={request_id} "
+                          f"ts={t_first:.6f} "
+                          f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                          f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                          flush=True,
+                      )
+                      first = False
+                  yield chunk
+            finally:
+                if d_rank is not None:
+                    _DECODE_ROUTER.release(d_rank)
 
         # Streaming responses are SSE: clients such as aiperf pick the parser
         # from the Content-Type and reject `data:` lines served as JSON.
@@ -1198,4 +1295,12 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    uvicorn.run(app, host=global_args.host, port=global_args.port)
+    # aiperf reuses pooled connections after a session's idle gap; uvicorn's
+    # 5 s default keep-alive closed some of them mid-reuse (AgentX c256 3600s:
+    # 4 "Connection reset" / "Server disconnected" errors).
+    uvicorn.run(
+        app,
+        host=global_args.host,
+        port=global_args.port,
+        timeout_keep_alive=int(os.environ.get("PROXY_KEEP_ALIVE_S", "300")),
+    )
