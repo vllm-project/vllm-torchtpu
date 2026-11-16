@@ -214,7 +214,9 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB: int = 64
     TPU_RAIDEN_LRU_REFRESH: int = 0
     TPU_HOST_HEAP_REPORT: int = 0
+    TPU_HOST_HEAP_USAGE_AFTER_S: int = 900
     TPU_RELEASE_JAX_CACHES: bool = False
+    TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY: bool = False
     TPU_RAIDEN_OFFLOAD_STATS: bool = False
     TPU_RAIDEN_FLUSH_REAL_REUSE: bool = False
     TPU_RAIDEN_LOSS_TRACE: bool = False
@@ -1367,7 +1369,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Host-heap diagnostics at worker start-up (worker/host_heap_report.py):
     # 1 = RSS / tcmalloc / anon mappings, 2 = + Python heap census,
     # 3 = + measure dropping start-up-only references. Host-only.
+    # 4 = + per-precompile-pass heap and executable counts, and which of the
+    # compiled executables serving calls (logged TPU_HOST_HEAP_USAGE_AFTER_S
+    # seconds after warm-up, then every 10 min). Host-only.
     "TPU_HOST_HEAP_REPORT": env_int("TPU_HOST_HEAP_REPORT", 0),
+    "TPU_HOST_HEAP_USAGE_AFTER_S": env_int("TPU_HOST_HEAP_USAGE_AFTER_S", 900),
+    # Spec decode with synthetic acceptance (SYNTHETIC_ACCEPTANCE_LENGTH, perf
+    # runs): warm only the synthetic one-row verify at each rejection-sampler
+    # bucket, not the full greedy / non-greedy rejection-sampler graphs that
+    # such steps never run. Saves their compile time and host memory; a step
+    # that needs the full path (logprobs, grammar, min_tokens) compiles it on
+    # first use. No effect on real-acceptance runs.
+    "TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY": env_bool(
+        "TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY", default=False
+    ),
     # Drop JAX's tracing / lowering caches once warm-up has compiled every
     # bucket. The Pallas kernels are already lowered into the compiled
     # programs; the cached jaxprs only serve a re-trace. Frees ~0.9 GiB host

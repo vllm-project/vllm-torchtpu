@@ -216,3 +216,125 @@ def experiments(rank: int, release) -> None:
         after_jax,
         after_jax - after_ser,
     )
+
+
+# ---------------------------------------------------------------------------
+# Level 4: where the compiled-executable heap comes from, and what serving uses.
+#
+# Every TorchTpuCompiledExecutable created while a precompile pass runs is
+# stamped with that pass's name; its calls are counted. At each pass end the
+# tcmalloc in-use bytes are logged, so the heap a pass adds and the number of
+# executables it made sit on one line. After warm-up the counts are marked, and
+# a timer later logs, per pass, how many of its executables serving called.
+
+_phase = "startup"
+_records: list[list] = []  # [phase, calls, calls_at_warm]
+_last_alloc: float | None = None
+_rank = -1
+
+
+def set_phase(name: str) -> None:
+    global _phase
+    _phase = name
+
+
+def install_exec_tracker(rank: int) -> bool:
+    """Wrap TorchTpuCompiledExecutable.__init__/__call__ (diagnostic only)."""
+    global _rank
+    _rank = rank
+    try:
+        from torch_tpu._internal.compile import torch_tpu_compiled_executable as m
+    except Exception as e:  # noqa: BLE001
+        logger.warning("HOSTHEAP-EXEC tracker not installed: %r", e)
+        return False
+    cls = m.TorchTpuCompiledExecutable
+    if getattr(cls, "_hh_wrapped", False):
+        return True
+    orig_init, orig_call = cls.__init__, cls.__call__
+
+    def __init__(self, *a, **k):
+        orig_init(self, *a, **k)
+        rec = [_phase, 0, 0]
+        # A dict entry (not an attribute of the class) so that an
+        # AsyncCompiledArtifact proxy copying this __dict__ shares the record.
+        self.__dict__["_hh_rec"] = rec
+        _records.append(rec)
+
+    def __call__(self, *a, **k):
+        rec = self.__dict__.get("_hh_rec")
+        if rec is not None:
+            rec[1] += 1
+        return orig_call(self, *a, **k)
+
+    cls.__init__ = __init__
+    cls.__call__ = __call__
+    cls._hh_wrapped = True
+    return True
+
+
+def phase_end(name: str, rank: int) -> None:
+    global _last_alloc
+    tc = _tcmalloc()
+    alloc = tc.get("current_allocated_bytes", -1.0)
+    n = sum(1 for r in _records if r[0] == name)
+    delta = alloc - _last_alloc if _last_alloc is not None else 0.0
+    _last_alloc = alloc
+    logger.info(
+        "HOSTHEAP-PHASE rank=%d phase=%r alloc=%.2f GiB delta=%+.2f GiB "
+        "rss_anon=%.2f GiB new_executables=%d total_executables=%d",
+        rank,
+        name,
+        alloc,
+        delta,
+        rss_anon_gib(),
+        n,
+        len(_records),
+    )
+
+
+def mark_warm() -> None:
+    for r in _records:
+        r[2] = r[1]
+    set_phase("serving")
+
+
+def usage_report(tag: str, rank: int) -> None:
+    by: dict[str, list[int]] = collections.OrderedDict()
+    for ph, calls, warm in _records:
+        row = by.setdefault(ph, [0, 0, 0, 0])
+        row[0] += 1
+        row[1] += 1 if warm > 0 else 0
+        row[2] += 1 if calls > warm else 0
+        row[3] += calls - warm
+    parts = [
+        f"{ph}: n={r[0]} warm_called={r[1]} served_called={r[2]} served_calls={r[3]}"
+        for ph, r in by.items()
+    ]
+    logger.info(
+        "HOSTHEAP-USAGE %s rank=%d executables=%d served_called=%d | %s",
+        tag,
+        rank,
+        len(_records),
+        sum(r[2] for r in by.values()),
+        " | ".join(parts),
+    )
+
+
+def start_usage_timer(rank: int, after_s: float, repeat_s: float) -> None:
+    import threading
+    import time
+
+    def run():
+        t = after_s
+        time.sleep(t)
+        while True:
+            try:
+                usage_report(f"+{t:.0f}s", rank)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("HOSTHEAP-USAGE failed: %r", e)
+            if repeat_s <= 0:
+                return
+            time.sleep(repeat_s)
+            t += repeat_s
+
+    threading.Thread(target=run, name="hostheap-usage", daemon=True).start()

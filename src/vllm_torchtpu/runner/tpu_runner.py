@@ -6840,10 +6840,23 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_timed(self, name: str):
         """Common boilerplate for each AOT bucket precompile pass."""
         logger.info("Compiling %s with different input shapes.", name)
+        heap_phases = envs.TPU_HOST_HEAP_REPORT >= 4
+        if heap_phases:
+            from vllm_torchtpu.worker import host_heap_report
+
+            host_heap_report.set_phase(name)
         start = time.perf_counter()
         yield
         logger.info("Compilation finished in %.2f [secs].", time.perf_counter() - start)
         self._update_num_xla_graphs(name)
+        if heap_phases:
+            from torch.compiler._cache import CacheArtifactManager
+
+            # The per-compile artifact record is dropped after warm-up anyway;
+            # drop it per pass so each pass's heap delta is what it keeps.
+            CacheArtifactManager.clear()
+            host_heap_report.phase_end(name, host_heap_report._rank)
+            host_heap_report.set_phase(f"after {name}")
 
     def _dummy_logits(self, num_reqs: int) -> torch.Tensor:
         return torch.zeros(
@@ -7161,6 +7174,23 @@ class TPUModelRunner(GPUModelRunner):
                     break
         head_pairs = list(pairs)
         pairs = _rotate_precompile_sweep(pairs, "rejection_sampler")
+        # Steps that can take the synthetic one-row verify never reach the
+        # full rejection sampler, so with TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY
+        # only the synthetic verify programs are warmed. A step that falls
+        # back to the full path (logprobs, grammar, min_tokens) compiles its
+        # verify graphs on first use instead.
+        synthetic_only = (
+            envs.TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY
+            and envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+            and self.rejection_sampler.synthetic_mode
+            and self._greedy_head_owner is None
+        )
+        if synthetic_only:
+            logger.info(
+                "TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY=1: warming only the "
+                "synthetic one-row verify at %d rejection-sampler buckets",
+                len(pairs),
+            )
         with self._precompile_timed("rejection_sampler"):
             # padded_logits_length-shaped inputs, rebuilt when the length
             # changes; dtypes mirror get_spec_decode_metadata so the graph is
@@ -7193,6 +7223,22 @@ class TPUModelRunner(GPUModelRunner):
                 warm_accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(
                     self.device
                 )
+                if synthetic_only:
+                    self._precompile_synthetic_verify(
+                        draft_token_ids,
+                        target_logits_indices,
+                        segment_ids,
+                        group_indices,
+                        draft_lengths,
+                        bonus_logits_indices,
+                        warm_accept_u,
+                    )
+                    logger.info(
+                        "  -- padded_logits_length: %d, num_seqs: %d",
+                        num_tokens,
+                        num_reqs,
+                    )
+                    continue
                 # --- greedy verify path (do_sampling=False) ---
                 bonus_token_ids, target_logits_warm = self.spec_bonus_and_target_logits(
                     dummy_logits, bonus_logits_indices, target_logits_indices

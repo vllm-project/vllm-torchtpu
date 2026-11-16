@@ -812,9 +812,18 @@ class TPUWorker(WorkerBase):
                 envs.TPU_HOST_HEAP_REPORT,
             )
             host_heap_report.report("loaded", self.rank)
+            if envs.TPU_HOST_HEAP_REPORT >= 4:
+                host_heap_report.install_exec_tracker(self.rank)
+                host_heap_report.phase_end("loaded", self.rank)
+                host_heap_report.set_phase("profile_run")
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
+        if envs.TPU_HOST_HEAP_REPORT >= 4:
+            from vllm_torchtpu.worker import host_heap_report
+
+            host_heap_report.phase_end("profile_run", self.rank)
+            host_heap_report.set_phase("capture")
         if getattr(self, "speculative_config", None) is not None:
             # Record the warm-up traces under the serving thread count. Other
             # models keep upstream's warm-up at the startup count.
@@ -851,6 +860,13 @@ class TPUWorker(WorkerBase):
         _release_free_host_heap()
         if heap_report:
             host_heap_report.report("released", self.rank)
+            if heap_report >= 4:
+                host_heap_report.phase_end("released", self.rank)
+                host_heap_report.usage_report("warm", self.rank)
+                host_heap_report.mark_warm()
+                host_heap_report.start_usage_timer(
+                    self.rank, float(envs.TPU_HOST_HEAP_USAGE_AFTER_S), 600.0
+                )
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
