@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FP8_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FUSED_NORM: bool = False
+    TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SHARED: bool = False
@@ -760,6 +761,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_SP_FUSED_NORM": env_bool(
         "TPU_MINIMAX_M3_SP_FUSED_NORM", default=False
     ),
+    # "full" SP with TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: qkv_proj contracts the
+    # gathered e4m3 rows against its e4m3 weight (e4m3 x e4m3, f32
+    # accumulation) instead of dequantizing both to bf16.
+    "TPU_MINIMAX_M3_SP_E4M3_QKV": env_bool("TPU_MINIMAX_M3_SP_E4M3_QKV", default=False),
     # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
     # experts run the permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.

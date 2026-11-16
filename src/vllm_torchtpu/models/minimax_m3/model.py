@@ -174,9 +174,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         shard: torch.Tensor,
         update: torch.Tensor | None,
         fp8: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        e4m3_out: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
         """(shard + update, all-gathered norm(shard + update)): one fused pass
-        over the shard when it feeds an e4m3 gather and an update is pending."""
+        over the shard when it feeds an e4m3 gather and an update is pending.
+        ``e4m3_out`` returns the gathered e4m3 rows and their scales."""
         fused = envs.TPU_MINIMAX_M3_SP_FUSED_NORM and _fits_sp_norm(shard)
         if update is not None and fp8 and fused:
             weight = norm.weight.float() + 1.0
@@ -189,6 +191,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 return shard, tensor_model_parallel_all_gather(normed, 0)
             q, scale = _quantize_rows(normed)
         q, scale = _gather_rows_e4m3(q, scale)
+        if e4m3_out:
+            return shard, (q, scale)
         return shard, (q.float() * scale).to(shard.dtype)
 
     def _forward_sp(
@@ -210,6 +214,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 shard,
                 update,
                 envs.TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER,
+                envs.TPU_MINIMAX_M3_SP_E4M3_QKV,
             )
             layer_input = shard
             attn = self.self_attn(positions, normed)

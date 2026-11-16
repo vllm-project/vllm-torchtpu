@@ -74,6 +74,21 @@ _materialized_bf16 = pallas.jax_op("pallas::minimax_m3_upcast_e4m3", _upcast_e4m
 _materialized_bf16.register_fake(lambda w: torch.empty_like(w, dtype=torch.bfloat16))
 
 
+def _e4m3_rows_matmul(
+    q: jax.Array, row_scale: jax.Array, w: jax.Array, w_scale: jax.Array
+) -> jax.Array:
+    acc = jax.lax.dot(q, w, preferred_element_type=jnp.float32)
+    return (acc * row_scale * w_scale.astype(jnp.float32)).astype(jnp.bfloat16)
+
+
+_e4m3_matmul = pallas.jax_op("pallas::minimax_m3_e4m3_rows_matmul", _e4m3_rows_matmul)
+_e4m3_matmul.register_fake(
+    lambda q, row_scale, w, w_scale: q.new_empty(
+        (q.shape[0], w.shape[1]), dtype=torch.bfloat16
+    )
+)
+
+
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
 _E8M0_BIAS = 127
@@ -237,6 +252,15 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             weight = layer.weight.to(x.dtype)
         # The scale is a power of two, so this rounds once, like x @ bf16(W).
         return torch.matmul(x, weight) * layer.weight_scale
+
+    def apply_e4m3_rows(
+        self, layer: torch.nn.Module, q: torch.Tensor, row_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """``apply`` of the rows ``q * row_scale`` (e4m3 [T, K], f32 [T, 1]),
+        as an e4m3 x e4m3 matmul when the weight is e4m3."""
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            return self.apply(layer, (q.float() * row_scale).to(torch.bfloat16))
+        return _e4m3_matmul(q, row_scale, layer.weight, layer.weight_scale)
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):

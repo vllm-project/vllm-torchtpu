@@ -402,9 +402,21 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        """``hidden_states`` may come as e4m3 rows with per-row f32 scales
+        (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3."""
+        e4m3_apply = getattr(self.qkv_proj.quant_method, "apply_e4m3_rows", None)
+        if isinstance(hidden_states, tuple) and e4m3_apply is None:
+            q8, row_scale = hidden_states
+            hidden_states = (q8.float() * row_scale).to(torch.bfloat16)
+        if isinstance(hidden_states, tuple):
+            # qkv_proj is bias-free and keeps the linear's forward = apply.
+            qkv = e4m3_apply(self.qkv_proj, *hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
@@ -415,7 +427,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.rotary_emb,
             self.norm_rope_op,
         )
-        num_tokens = hidden_states.shape[0]
+        num_tokens = qkv.shape[0]
         if not self.q_head_major:
             q = q.view(num_tokens, self.num_heads, self.head_dim)
         metadata = get_forward_context().attn_metadata
