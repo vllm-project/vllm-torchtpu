@@ -1357,6 +1357,19 @@ def calculate_tiling(
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
     max_num_buckets = 4
+    if (
+        envs.TPU_GMM_FP8_W8A8
+        and dims.size_m > FP8_DECODE_MAX_M
+        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
+    ):
+        # Prefill chunks give each expert ~256 +- 16 rows (8192 tokens x top-4
+        # over 128 experts, local or TP-sliced); 4 x 64-row buckets cap the
+        # tile at 256, so half the groups spill into a second tile that
+        # re-streams and re-quantizes the expert for a few rows. A fifth
+        # bucket: tpu7x gate_up / down 332 / 159 -> 250 / 114 us (EP),
+        # 482 / 382 -> 352 / 280 us (TP-sliced); 384 rows fall off a cliff
+        # on EP's gate_up (1082 us).
+        max_num_buckets = 5
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
