@@ -265,6 +265,19 @@ class TestTPUMultiConnectorHybridHitForwarding:
             is None
         )
 
+    def test_external_hit_estimate_is_the_largest_child_estimate(self):
+        children = [
+            SimpleNamespace(),
+            SimpleNamespace(estimate_external_hit_tokens=lambda req, n: 0),
+            SimpleNamespace(estimate_external_hit_tokens=lambda req, n: n + 128),
+            SimpleNamespace(estimate_external_hit_tokens=lambda req, n: 64),
+        ]
+
+        assert self._multi(*children).estimate_external_hit_tokens("req", 256) == 384
+        assert (
+            self._multi(SimpleNamespace()).estimate_external_hit_tokens("req", 256) == 0
+        )
+
     def test_transfer_polls_are_summed_across_children(self):
         scheduler = object()
         first = SimpleNamespace(
