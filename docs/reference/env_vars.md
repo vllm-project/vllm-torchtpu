@@ -73,10 +73,11 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
-| `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
+| `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or `"sort"`). |
+| `TPU_MOE_TOPK_WEIGHTS_FLOAT32` | `False` | Keeps `FusedMoE` top-k routing weights in `float32` instead of casting to the activation dtype in `fused_moe_gmm`, improving numerical parity with training frameworks in RL and distillation workloads. |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
-| `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
+| `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp,experts"`), including `VocabParallelEmbedding`, `ParallelLMHead`, and unquantized `RoutedExperts` without expert bias (quantized to the `MOE_REQUANTIZE_*` format; skips `kv_b_proj`). |
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization. |
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 dense-linear steps whose padded token bucket has at most this many rows keep bf16 activations (W8A16) instead of quantizing them to FP8. Per-channel path with FP8 weights only; measured on v7x. |
@@ -93,9 +94,11 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | :--- | :--- | :--- |
 | `VLLM_TPU_BLOCK_MAJOR_KV` | `False` | Selects the block-major KV cache memory layout for Ragged Paged Attention. |
 | `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL` | `None` | Enables the unified KV cache block pool across hybrid attention layers (e.g., GDN + Full Attention or MLA). Unset: on for the pooled GDN / KDA architectures, off otherwise. Off on a hybrid model selects the per-layer layout: attention KV blocks plus `max_num_reqs + 1` compact mamba slots (or the uniform layout, which pads every block to the mamba page, when a KV connector other than DecodeBench is configured). On the compact layout `--num-gpu-blocks-override` sets the attention block count and the mamba slots stay compact. |
+| `TPU_GDN_PREFILL_CHECKPOINT` | `True` | Pooled GDN layers declare an internal prefill checkpoint block so a prefill chunk runs to the prompt end and writes block-boundary state mid-chunk. Set `0` (uniformly across all ranks and PP stages) to end each prefill chunk at its last cacheable block boundary. |
 | `TPU_SKIP_MAMBA_SCHEDULER_BLOCKS` | `True` | On the compact-mamba layout (`TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0`) with prefix caching off, GDN layers take no blocks from the attention pool: the runner keeps their state in its own per-request slots. Applies only to GDN layers without speculative decoding or a KV connector; elsewhere it has no effect. Set `0` to restore vLLM's stock accounting (one block per GDN group per request) for debugging. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `False` | Shards MLA latent projections across the 2 TensorCores of a single TPU v7x chip when `TP=1`. |
 | `TPU_MLA_MASKED_DENSE_ENABLED` | `False` | Enables the masked-dense MLA attention path for short KV lengths. |
+| `TPU_MLA_SPARSE_SPLIT_Q` | `False` | Passes `q_nope` and `q_pe` as separate operands to Sparse MLA attention so they join in VMEM (avoiding a caller concat padded to `640` wide) and exports `DCP` log-sum-exp lane-dense. |
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
@@ -112,6 +115,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_RAIDEN_JOB_NAME` | `""` | Role name (`"prefill"` or `"decode"`) registered with the Raiden controller. |
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Engine replica identifier for Raiden KV transfer. |
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of parallel DMA transfer streams in `TpuRaidenConnector`. |
+| `TPU_RAIDEN_TRANSFER_STREAMS` | `0` | TCP streams each producer rank opens per `(pool, peer)` push (export on the producer role). `0` keeps one stream per source rank (`TPU_RAIDEN_TRANSFER_PARALLELISM`); a positive value is clamped to `TPU_RAIDEN_TRANSFER_PARALLELISM`. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | Selects `"controller"` or `"host"` KV cache resharding when Prefill and Decode topologies differ. |
 | `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol (`"zmq"` or `"tcp"`) for host-side KV resharding. |
 | `TPU_KV_TRANSFER_PORT` | `"9100"` | Port used by `TPUConnector` for KV cache transfer. |
