@@ -13,10 +13,9 @@
 # limitations under the License.
 """Per-request ``SamplingParams.thinking_token_budget`` tracker and step adapters.
 
-Builds on ``RequestSlotTable`` for request-ID-keyed ``[max_num_reqs + 1, 7]``
-device-slot pooling, wave-swap slot release, and cached ``slot_ids`` H2D
-uploads, while delegating KMP transitions and forcing kernels to
-``vllm_torchtpu.layers.adapter.sample.thinking_budget``.
+Keeps each budgeted request's KMP state in a ``RequestSlotTable`` row
+(``[max_num_reqs + 1, 7]`` int32 on the device) and delegates the transitions
+and forcing kernels to ``vllm_torchtpu.layers.adapter.sample.thinking_budget``.
 """
 
 from __future__ import annotations
@@ -42,6 +41,7 @@ from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.request_slot_table import RequestSlotTable
+from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm import SamplingParams
@@ -95,8 +95,13 @@ class ThinkingBudgetTracker:
         reasoning_config: ReasoningConfig | None,
         max_num_reqs: int,
         device: torch.device,
+        upload: Callable[[str, torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
+        """``upload(key, host)`` copies a chunk's slot IDs to the device. The
+        runner passes ``_upload_unless_unchanged``, so steady decode reuses the
+        previous copy; the default copies every time."""
         self._markers = ThinkingBudgetMarkers.from_reasoning_config(reasoning_config)
+        self._upload = upload
         self._slots: RequestSlotTable[StateTuple] = RequestSlotTable(
             max_num_reqs=max_num_reqs,
             num_cols=NUM_STATE_COLS,
@@ -127,6 +132,13 @@ class ThinkingBudgetTracker:
 
     def __bool__(self) -> bool:
         return self._markers is not None and bool(self._budgets)
+
+    def upload_slot_ids(self, start_idx: int, slot_ids: np.ndarray) -> torch.Tensor:
+        """Copy the host slot IDs of the chunk at ``start_idx`` to the device."""
+        host = torch.from_numpy(slot_ids)
+        if self._upload is None:
+            return host.to(self._slots.device)
+        return self._upload(f"thinking_budget_slot_ids_{start_idx}", host)
 
     def update_states(
         self,
@@ -253,7 +265,6 @@ class ThinkingBudgetTracker:
         verify_logits_paddings: Sequence[int],
         max_draft_tokens: int,
         dummy_logits_fn: Callable[[int], torch.Tensor],
-        sync_fn: Callable[..., None],
         precompile_top_tokens: bool = False,
     ) -> None:
         """Pre-warm all thinking-budget subgraphs across compiled bucket shapes."""
@@ -263,13 +274,13 @@ class ThinkingBudgetTracker:
         kernel_args = markers.kernel_args()
         max_reqs = self.max_num_reqs
         device = self._slots.device
-        state_table = self._slots.precompile(sync_fn)
+        state_table = self._slots.precompile()
 
         slot_ids_full = torch.zeros(max_reqs, dtype=torch.int32).to(device)
         forced_full = tb_kernels.query_forced_tokens(
             state_table, slot_ids_full, markers.natural_end_ids, markers.end_ids
         )
-        sync_fn(forced_full)
+        synchronize_tensors(forced_full)
 
         has_spec_verify = max_draft_tokens > 0 and bool(verify_logits_paddings)
         # (rows, forced_ids length) of the warmed force_logits_rows and
@@ -316,7 +327,7 @@ class ThinkingBudgetTracker:
                     *kernel_args,
                 )
             to_sync.append(state_table)
-            sync_fn(to_sync)
+            synchronize_tensors(to_sync)
             logger.info("  -- plain num_seqs: %d", num_reqs)
 
         if has_spec_verify:
@@ -353,7 +364,7 @@ class ThinkingBudgetTracker:
                             forced_tgt,
                         )
                         verify_sync.append(out_toks)
-                sync_fn(verify_sync)
+                synchronize_tensors(verify_sync)
 
         self._slots.commit_table(state_table)
 
@@ -375,15 +386,13 @@ class ThinkingBudgetStepState:
         batch_req_ids: Sequence[str | None],
         start_idx: int,
         end_idx: int,
-        padded_num_reqs: int | None = None,
     ) -> torch.Tensor | None:
-        return self.tracker.slots.build_chunk_slot_ids(
-            batch_req_ids=batch_req_ids,
-            start_idx=start_idx,
-            end_idx=end_idx,
-            padded_num_reqs=padded_num_reqs,
-            discard_req_ids=self.discard_req_ids,
+        slot_ids = self.tracker.slots.allocator.build_chunk_slot_ids(
+            batch_req_ids, start_idx, end_idx, self.discard_req_ids
         )
+        if slot_ids is None:
+            return None
+        return self.tracker.upload_slot_ids(start_idx, slot_ids)
 
     def mask_plain_logits(
         self, logits: torch.Tensor, slot_ids: torch.Tensor

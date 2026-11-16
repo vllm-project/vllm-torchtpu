@@ -3452,6 +3452,21 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
     assert z22 is not zf and tuple(z22.shape) == (2, 2)
 
 
+def test_upload_unless_unchanged_can_copy_synchronously():
+    """Code after the input-staging fence (``sample_tokens()``) asks for a
+    synchronous copy; repeated values still reuse the previous upload."""
+    runner = SimpleNamespace(device=torch.device("cpu"), _h2d_reuse={})
+    host = MagicMock()
+    host.dtype, host.shape = torch.int32, (2,)
+    host.numpy.return_value.tobytes.return_value = b"\x01"
+    dev = TPUModelRunner._upload_unless_unchanged(runner, "k", host, non_blocking=False)
+    host.to.assert_called_once_with(runner.device, non_blocking=False)
+    again = TPUModelRunner._upload_unless_unchanged(
+        runner, "k", host, non_blocking=False
+    )
+    assert again is dev and host.to.call_count == 1
+
+
 def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     """The draft shares the target's cached Pallas ops, which are traced
     against the target's relayouted tables; the draft's own tables must get

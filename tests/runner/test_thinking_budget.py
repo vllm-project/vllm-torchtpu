@@ -127,6 +127,19 @@ def _override_and_advance(
     return out, advance_plain_states(state_table, slot_ids, out, *markers.kernel_args())
 
 
+def _chunk_slot_ids(
+    tracker: ThinkingBudgetTracker,
+    batch_req_ids: list[str] | list[str | None],
+    start_idx: int,
+    end_idx: int,
+) -> torch.Tensor | None:
+    """The chunk's ``[max_num_reqs]`` slot IDs on the tracker's device."""
+    ids = tracker.slots.allocator.build_chunk_slot_ids(
+        batch_req_ids, start_idx, end_idx
+    )
+    return None if ids is None else tracker.upload_slot_ids(start_idx, ids)
+
+
 def _request_state(
     req_id: str,
     prompt_token_ids: list[int],
@@ -345,9 +358,7 @@ class TestUpstreamParityAndBoundaries:
             tpu_tok = base_tok
             if state_table is not None:
                 assert tracker.markers is not None
-                slot_ids = tracker.slots.build_chunk_slot_ids(
-                    ["req0"], 0, 1, padded_num_reqs=4
-                )
+                slot_ids = _chunk_slot_ids(tracker, ["req0"], 0, 1)
                 assert slot_ids is not None
                 row_logits = torch.zeros((4, vocab_size), dtype=torch.float32)
                 row_logits[0, base_tok] = 5.0
@@ -745,7 +756,7 @@ class TestKMPKernelsFuzz:
             reqs[rid] = _request_state(rid, [1, *GEMMA4_START], sp)
             tracker.add(rid, sp, [1, *GEMMA4_START])
         table = tracker.prepare_step(batch_ids, reqs)
-        slots = tracker.slots.build_chunk_slot_ids(batch_ids, 0, 300, 512)
+        slots = _chunk_slot_ids(tracker, batch_ids, 0, 300)
         assert table is not None and slots is not None and slots[300].item() == 0
         seg = torch.full((1024,), 300, dtype=torch.int64)
         seg[0] = 1
@@ -774,7 +785,7 @@ class TestKMPKernelsFuzz:
             assert torch.equal(out_l[1], snap[1]) and eff_d[1].item() == 77
             assert (eff_d[2:] == 77).all()
 
-        with pytest.raises(AssertionError, match="Duplicate active indices"):
+        with pytest.raises(ValueError, match="repeat an active slot"):
             seed_slot_rows(
                 table,
                 torch.tensor([1, 1], dtype=torch.int32),
@@ -783,14 +794,14 @@ class TestKMPKernelsFuzz:
 
 
 class TestLifecyclePreemptionAndChunkedPrefill:
-    """Lifecycle hooks, wave slot recycling, H2D reuse, and real ``_update_states``."""
+    """Lifecycle hooks, slot recycling, slot-ID uploads and real ``_update_states``."""
 
     def test_update_states_lifecycle_slot_reuse_and_batch_reorder(self) -> None:
         cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
         tracker = ThinkingBudgetTracker(cfg, max_num_reqs=2, device=torch.device("cpu"))
         tracker.add("plain", SamplingParams(), [1, QWEN3_START[0]])
         tracker.add("pool", None, [1])
-        assert tracker.enabled and not tracker and tracker.slots.table is None
+        assert tracker.enabled and not tracker
 
         sp2 = SamplingParams(thinking_token_budget=2)
         reqs = {
@@ -803,22 +814,19 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             tracker.prepare_step(["r0", "r1"], {"r0": reqs["r0"], "r1": reqs["r1"]})
             is not None
         )
-        # Steady-state build_chunk_slot_ids reuses the cached tensor without H2D copy.
-        s1 = tracker.slots.build_chunk_slot_ids(["r0", "r1"], 0, 2, 4)
-        s2 = tracker.slots.build_chunk_slot_ids(["r0", "r1"], 0, 2, 4)
-        s_pad8 = tracker.slots.build_chunk_slot_ids(["r0", "r1"], 0, 2, 8)
-        s_reord = tracker.slots.build_chunk_slot_ids(["r1", "r0"], 0, 2, 4)
-        assert s1 is not None and s2 is s1
-        assert s_pad8 is not None and s_pad8 is not s1 and s_pad8.shape == (8,)
-        assert s_reord is not None and s_reord.tolist()[:2] == s1.tolist()[:2][::-1]
+        # A batch reorder moves the slots with their requests.
+        s1 = _chunk_slot_ids(tracker, ["r0", "r1"], 0, 2)
+        s_reord = _chunk_slot_ids(tracker, ["r1", "r0"], 0, 2)
+        assert s1 is not None and s1.shape == (2,)
+        assert s_reord is not None and s_reord.tolist() == s1.tolist()[::-1]
 
-        with pytest.raises(AssertionError, match="RequestSlotTable pool exhausted"):
+        with pytest.raises(RuntimeError, match="RequestSlotAllocator is full"):
             tracker.prepare_step(["r0", "r1", "r2"], reqs)
         assert (
             tracker.prepare_step(["r1", "r2"], {"r1": reqs["r1"], "r2": reqs["r2"]})
             is not None
         )
-        allocated = tracker.slots.allocated_req_ids()
+        allocated = tracker.slots.allocator.allocated_req_ids()
         assert "r0" not in allocated and "r2" in allocated
 
         # InputBatch swap_states + upstream thinking_budget_state_holder cleanup.
@@ -857,7 +865,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         tb_swap.add("a", pa, ra.prompt_token_ids)
         tb_swap.add("b", rb.sampling_params, rb.prompt_token_ids)
         st = tb_swap.prepare_step(batch.req_ids[:2], {"a": ra, "b": rb})
-        slots = tb_swap.slots.build_chunk_slot_ids(batch.req_ids, 0, 2, 4)
+        slots = _chunk_slot_ids(tb_swap, batch.req_ids, 0, 2)
         assert st is not None and slots is not None and tb_swap.markers is not None
         out, _ = _override_and_advance(
             st,
@@ -866,6 +874,31 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             tb_swap.markers,
         )
         assert out[:2, 0].tolist() == [55, QWEN3_END[0]]
+
+    def test_chunk_slot_ids_go_through_the_upload_hook(self) -> None:
+        """Each chunk's host slot IDs reach the device through ``upload``,
+        keyed by the chunk's first row; a chunk without slots uploads nothing."""
+        cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
+        uploads: list[tuple[str, list[int]]] = []
+
+        def upload(key: str, host: torch.Tensor) -> torch.Tensor:
+            uploads.append((key, host.tolist()))
+            return host
+
+        tracker = ThinkingBudgetTracker(
+            cfg, max_num_reqs=4, device=torch.device("cpu"), upload=upload
+        )
+        sp = SamplingParams(thinking_token_budget=2)
+        reqs = {rid: _request_state(rid, [1, QWEN3_START[0]], sp) for rid in "ab"}
+        for rid in reqs:
+            tracker.add(rid, sp, [1, QWEN3_START[0]])
+        batch: list[str | None] = ["a", "x", "b"]
+        step = tracker.step_state(batch, reqs, frozenset({"b"}))
+        assert step is not None
+        assert step.chunk_slot_ids(batch, 0, 2) is not None
+        assert step.chunk_slot_ids(batch, 2, 3) is None  # "b" is discarded
+        slot_a = tracker.slots.allocator.slot_for("a")
+        assert uploads == [("thinking_budget_slot_ids_0", [slot_a, 0, 0, 0])]
 
     def test_more_concurrent_requests_than_max_num_reqs_across_waves(
         self, monkeypatch: pytest.MonkeyPatch
@@ -934,7 +967,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
 
         def decode_wave(wave_ids: list[str], raw_toks: list[int]) -> list[int]:
             tbl = tracker.prepare_step(wave_ids, runner.requests)
-            sl = tracker.slots.build_chunk_slot_ids(wave_ids, 0, len(wave_ids), 2)
+            sl = _chunk_slot_ids(tracker, wave_ids, 0, len(wave_ids))
             assert tbl is not None and sl is not None and tracker.markers is not None
             sel = torch.tensor([[t] for t in raw_toks], dtype=torch.int64)
             out, tbl = _override_and_advance(tbl, sl, sel, tracker.markers)
@@ -950,13 +983,12 @@ class TestLifecyclePreemptionAndChunkedPrefill:
 
         # Wave 2: evict r0, r1 implicitly (preempted_req_ids=None) & admit r2, r3.
         schedule_wave(["r2", "r3"], ["r2", "r3"])
-        assert set(tracker.slots.allocated_req_ids()).isdisjoint({"r0", "r1"})
+        assert set(tracker.slots.allocator.allocated_req_ids()).isdisjoint({"r0", "r1"})
         assert decode_wave(["r2", "r3"], [40, 50]) == [GEMMA4_END[0], 50]
 
         # Wave 3: admit r4 (5th live request!) alongside cold-reentering r0.
         schedule_wave(["r4", "r0"], ["r4"])
         assert len(runner.requests) == 5 and len(tracker.requests) == 5
-        assert not tracker.slots.has_dirty("r0")
         assert tracker.needs_output_reseed(["r4", "r0"])
         # r0 already has [20] (1/2 budget used): next token [21] hits 2/2, then forces!
         assert decode_wave(["r4", "r0"], [60, 21]) == [60, 21]
@@ -1006,7 +1038,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         runner._update_states(so_new)
 
         table = tracker.prepare_step(["p"], runner.requests)
-        slots = tracker.slots.build_chunk_slot_ids(["p"], 0, 1, 4)
+        slots = _chunk_slot_ids(tracker, ["p"], 0, 1)
         assert table is not None and slots is not None and tracker.markers is not None
         for tok in (20, 21, 22):
             _, table = _override_and_advance(
@@ -1022,7 +1054,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         so_preempt.preempted_req_ids = {"p"} if explicit_preempt else None
         runner._update_states(so_preempt)
         assert "p" not in runner.input_batch.req_id_to_index
-        assert "p" not in tracker.slots.allocated_req_ids()
+        assert "p" not in tracker.slots.allocator.allocated_req_ids()
 
         all_toks = [*prompt, *settled_outputs]
         so_resume = SchedulerOutput.make_empty()
@@ -1041,7 +1073,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         assert runner.requests["p"].output_token_ids == settled_outputs
 
         table = tracker.prepare_step(["p"], runner.requests)
-        slots = tracker.slots.build_chunk_slot_ids(["p"], 0, 1, 4)
+        slots = _chunk_slot_ids(tracker, ["p"], 0, 1)
         assert table is not None and slots is not None
         emitted: list[int] = []
         for tok in (30, 31, 32, 33, 34):
@@ -1396,7 +1428,7 @@ class TestSampleTokens:
         # forcing nor an in-place write.
         assert int(selected[0, 0].item()) == GEMMA4_END[0]
         assert torch.equal(logprob_logits, raw)
-        slot_r0 = runner._thinking_budget.slots.slot_for("r0")
+        slot_r0 = runner._thinking_budget.slots.allocator.slot_for("r0")
         assert slot_r0 is not None
         assert int(tb_step.state_table[slot_r0, COL_THINK_COUNT].item()) == 1
         assert int(tb_step.state_table[slot_r0, COL_END_MATCH].item()) == 1
@@ -1470,9 +1502,10 @@ class TestSampleTokens:
                 [50, 51, 52, GEMMA4_END[0]],
                 [69],
             ]
-            st_tbl = runner._thinking_budget.slots.ensure_table()
-            slot_r2 = runner._thinking_budget.slots.slot_for("r2")
-            assert slot_r2 is not None
+            # r2 keeps its slot, so this returns the committed table unchanged.
+            st_tbl = runner._thinking_budget.prepare_step(["r2"], runner.requests)
+            slot_r2 = runner._thinking_budget.slots.allocator.slot_for("r2")
+            assert st_tbl is not None and slot_r2 is not None
             assert int(st_tbl[slot_r2, COL_THINK_COUNT].item()) == 1
         elif mode == "async_eagle3":
             req = _request_state(
@@ -1744,9 +1777,9 @@ class TestPrecompileAndTPU:
 
         with torch.compiler.set_stance("force_eager"):
             cpu_tbl = cpu_tb.prepare_step(batch_ids, reqs)
-            cpu_sl = cpu_tb.slots.build_chunk_slot_ids(batch_ids, 0, 4, 4)
+            cpu_sl = _chunk_slot_ids(cpu_tb, batch_ids, 0, 4)
         tpu_tbl = tpu_tb.prepare_step(batch_ids, reqs)
-        tpu_sl = tpu_tb.slots.build_chunk_slot_ids(batch_ids, 0, 4, 4)
+        tpu_sl = _chunk_slot_ids(tpu_tb, batch_ids, 0, 4)
         assert cpu_tbl is not None and tpu_tbl is not None
         assert cpu_sl is not None and tpu_sl is not None
         synchronize_tensors(tpu_tbl)

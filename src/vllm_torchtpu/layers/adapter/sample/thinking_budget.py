@@ -28,10 +28,7 @@ from typing import TYPE_CHECKING, Final, cast
 import numpy as np
 import torch
 
-from vllm_torchtpu.layers.adapter.sample.scatter_ops import (
-    broadcast_amax_scatter,
-    scatter_slot_rows,
-)
+from vllm_torchtpu.layers.adapter.sample.scatter_ops import scatter_slot_rows
 
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
@@ -678,15 +675,18 @@ def prepare_spec_verify_drafts(
         )
         safe_grp = torch.where(in_bounds, group_indices, 0).to(torch.int64)
         flat_idx = safe_seg * max_draft_tokens + safe_grp
-        empty_cells = torch.full(
-            (num_cells,),
+        # Each in-bounds (request, position) cell is written once; the other
+        # drafts go to one extra sink cell, as in the rejection sampler.
+        cells = torch.full(
+            (num_cells + 1,),
             NO_FORCED_TOKEN,
             dtype=torch.int32,
             device=state_table.device,
         )
-        draft_grid = broadcast_amax_scatter(
-            empty_cells, flat_idx, draft_i32, in_bounds
-        ).reshape(num_reqs, max_draft_tokens)
+        targets = torch.where(in_bounds, flat_idx, num_cells)
+        draft_grid = cells.index_put((targets,), draft_i32)[:num_cells].reshape(
+            num_reqs, max_draft_tokens
+        )
 
         forced_cols: list[torch.Tensor] = []
         for step_idx in range(max_draft_tokens):

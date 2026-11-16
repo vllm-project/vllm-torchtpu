@@ -1152,6 +1152,10 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config.reasoning_config,
             max_num_reqs=self.max_num_reqs,
             device=self.device,
+            # Synchronous: sample_tokens() runs after the input-staging fence.
+            upload=lambda key, host: self._upload_unless_unchanged(
+                key, host, non_blocking=False
+            ),
         )
         # 1 on TP rank 0, else 0; built lazily on first use by
         # _sync_replicated_drafts_across_tp (needs the TP group initialized).
@@ -3982,7 +3986,9 @@ class TPUModelRunner(GPUModelRunner):
                 release_cb()
             self._fenced_h2d_sources.clear()
 
-    def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
+    def _upload_unless_unchanged(
+        self, slot: str, host: torch.Tensor, non_blocking: bool = True
+    ) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
         values have not changed.
 
@@ -3990,13 +3996,15 @@ class TPUModelRunner(GPUModelRunner):
         in steady decode most of their small index tensors repeat step after
         step. One entry per slot keeps memory bounded however the values vary.
         The entry also holds `host`, so a temporary array stays alive while its
-        non-blocking upload may still be reading it.
+        non-blocking upload may still be reading it. Code that runs after the
+        input-staging fence, such as `sample_tokens()`, passes
+        `non_blocking=False`.
         """
         key = (host.dtype, tuple(host.shape), host.numpy().tobytes())
         prev = self._h2d_reuse.get(slot)
         if prev is not None and prev[0] == key:
             return prev[1]
-        dev = host.to(self.device, non_blocking=True)
+        dev = host.to(self.device, non_blocking=non_blocking)
         self._h2d_reuse[slot] = (key, dev, host)
         return dev
 
@@ -7244,7 +7252,6 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 max_draft_tokens=max_draft_tokens,
                 dummy_logits_fn=self._dummy_logits,
-                sync_fn=synchronize_tensors,
                 precompile_top_tokens=self._greedy_head_owner is not None,
             )
 
