@@ -934,13 +934,12 @@ class TpuPlatform(Platform):
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
             # get the hand-off's engine side here; engine-core processes
             # install it again on their side.
-            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
+            from vllm_torchtpu.distributed.pp_engine import (
+                patch_executor_for_pp_buffered,
+            )
 
-            patch_executor_for_pp_handoff(vllm_config)
+            patch_executor_for_pp_buffered(vllm_config)
             _configure_pipeline_chunks(vllm_config)
-            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
-
-            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 
@@ -1499,17 +1498,18 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
-    """Install the time-budget scheduler for a pipeline and the engine-core
-    hook that times the stages. Off when the env disables it, when the DP
-    scheduler or another scheduler is configured, or when chunked prefill is
-    disabled."""
+    """Install the pipeline chunk scheduler and the engine-core hook that
+    collects its chunk limits from the stages. Off when both
+    TPU_PP_LONE_PROMPT_CHUNKS and TPU_PP_EQUAL_COST_CHUNKS are off, when the
+    DP scheduler or another scheduler is configured, or when chunked prefill
+    is disabled."""
     from vllm_torchtpu.core.pp_chunk_scheduler import (
         SCHEDULER_CLS,
         patch_engine_core_for_pp_chunks,
     )
 
     scheduler_config = vllm_config.scheduler_config
-    if not envs.TPU_PP_DYNAMIC_CHUNKS:
+    if not (envs.TPU_PP_LONE_PROMPT_CHUNKS or envs.TPU_PP_EQUAL_COST_CHUNKS):
         return
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         logger.warning(
@@ -1523,7 +1523,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     if not scheduler_config.enable_chunked_prefill:
         logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")
         return
-    if envs.TPU_PP_CHUNK_SLACK < 0:
+    if envs.TPU_PP_EQUAL_COST_CHUNKS and envs.TPU_PP_CHUNK_SLACK < 0:
         raise ValueError(
             f"TPU_PP_CHUNK_SLACK must not be negative: {envs.TPU_PP_CHUNK_SLACK}"
         )

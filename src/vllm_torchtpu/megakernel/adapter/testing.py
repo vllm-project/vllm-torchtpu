@@ -55,6 +55,7 @@ def fake_runner(
     mamba_cache_mode: str = "none",
     supports_mm_inputs: bool = False,
     multimodal_config: Any = None,
+    lora_config: Any = None,
     mesh: Any = None,
     kv_cache_initialized: bool = True,
     **extra: Any,
@@ -107,6 +108,7 @@ def fake_runner(
         cache_config=cache_cfg,
         speculative_config=spec_cfg,
         kv_transfer_config=kv_transfer_config,
+        lora_config=lora_config,
         additional_config=add_cfg,
     )
     runner = SimpleNamespace(
@@ -135,7 +137,7 @@ def fake_runner(
         enforce_eager=bool(enforce_eager),
         _unified_kv_layout=bool(unified_kv_layout),
         supports_mm_inputs=bool(supports_mm_inputs),
-        lora_config=None,
+        lora_config=lora_config,
         _pp_is_first=True,
         _pp_is_last=True,
         _pcp_enabled=False,

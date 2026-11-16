@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The lazy (PEP 562) `megakernel.core` and `megakernel.core.dma` package namespaces."""
+"""The lazy (PEP 562) `megakernel.core` and `megakernel.core.runtime` namespaces."""
 
 from __future__ import annotations
 
@@ -23,11 +23,14 @@ import pytest
 
 import vllm_torchtpu.megakernel.core as mk
 import vllm_torchtpu.megakernel.core.dma as mk_dma
+import vllm_torchtpu.megakernel.core.runtime as mk_rt
 
 _SRC = Path(mk.__file__).resolve().parents[3]
 
 
-@pytest.mark.parametrize("pkg", [mk, mk_dma], ids=["megakernel", "dma"])
+@pytest.mark.parametrize(
+    "pkg", [mk, mk_dma, mk_rt], ids=["megakernel", "dma", "runtime"]
+)
 def test_every_public_name_is_in_the_lazy_tables_and_resolves(pkg) -> None:
     lazy, subs = set(pkg._LAZY), set(pkg._SUBMODULES)
     assert not lazy & subs
@@ -59,6 +62,8 @@ _HEAVY = (
     "vllm_torchtpu.megakernel.core.ops",
     "vllm_torchtpu.megakernel.core.planner",
     "vllm_torchtpu.megakernel.core.pool",
+    "vllm_torchtpu.megakernel.core.runtime.eligibility",
+    "vllm_torchtpu.megakernel.core.runtime.policy",
 )
 
 _BLOCKED = """
@@ -67,8 +72,9 @@ for name in ("jax", "jaxlib", "torch", "vllm"):
     sys.modules[name] = None
 import vllm_torchtpu.megakernel.core as mk
 import vllm_torchtpu.megakernel.core.dma as dma
+import vllm_torchtpu.megakernel.core.runtime as rt
 assert mk.MegakernelLayoutError and mk.MegakernelConfigError
-assert dma.__all__
+assert dma.__all__ and rt.__all__
 assert sys.modules["jax"] is None
 heavy = [m for m in {heavy!r} if m in sys.modules]
 assert not heavy, heavy
@@ -89,6 +95,7 @@ pkg.__path__ = [str(pathlib.Path({src!r}) / "vllm_torchtpu")]
 sys.modules["vllm_torchtpu"] = pkg
 import vllm_torchtpu.megakernel.core as mk
 import vllm_torchtpu.megakernel.core.dma
+import vllm_torchtpu.megakernel.core.runtime
 assert mk.MegakernelLayoutError and mk.MegakernelConfigError
 assert "jax" not in sys.modules
 heavy = [m for m in {heavy!r} if m in sys.modules]
@@ -101,3 +108,45 @@ def test_package_import_loads_no_megakernel_submodule() -> None:
     """With jax importable, importing the packages imports neither jax nor any
     heavy megakernel submodule."""
     assert _run(_LAZY_ONLY.format(src=str(_SRC), heavy=_HEAVY)) == "OK"
+
+
+_FIRST_LOOKUP = """
+import importlib
+from vllm_torchtpu.megakernel import core as mk
+from vllm_torchtpu.megakernel.core import _builtins
+
+calls = []
+real_import = importlib.import_module
+
+def fake_import(name, package=None):
+    if name == "vllm_torchtpu.megakernel.core._reentrant_builtin":
+        calls.append(name)
+        assert len(calls) == 1, f"re-entered builtin import: {calls}"
+        # Re-entrant lookup while `profile` is mid-import (building
+        # DEFAULT_PROFILE) and `_reentrant_builtin` is mid-import: fails with
+        # RecursionError unless `_LOADED.add(name)` runs before import.
+        p = mk.Profile(
+            name="reentrant-exact",
+            numerics="exact",
+            tiles=lambda tc: mk.default_tiles(tc),
+        )
+        assert p.numerics == "exact"
+        return None
+    return real_import(name, package)
+
+importlib.import_module = fake_import
+_builtins.TUNABLES = ("_reentrant_builtin", *_builtins.TUNABLES)
+_builtins._LOADED.discard("_reentrant_builtin")
+
+assert mk.get_profile("default").numerics == "exact"
+mk.register_profile(
+    mk.Profile(name="test-approx-profile", numerics="approx", fused_pool_io=True)
+)
+assert mk.get_profile("test-approx-profile").numerics == "approx"
+assert calls == ["vllm_torchtpu.megakernel.core._reentrant_builtin"], calls
+print("OK")
+"""
+
+
+def test_first_lookup_is_a_profile_lookup() -> None:
+    assert _run(_FIRST_LOOKUP) == "OK"

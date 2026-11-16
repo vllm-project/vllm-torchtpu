@@ -44,6 +44,7 @@ def derive_pool_layout(
     num_pools: int | None = None,
     slots_per_pool: int | None = None,
     R: int | None = None,
+    conv_dtype: Any = None,
 ) -> PoolLayout:
     """Derive a `PoolLayout` from per-layer module cache declarations.
 
@@ -59,7 +60,9 @@ def derive_pool_layout(
 
     Whenever an active `RecurrentCacheDecl` leaves `rec_pages_per_slot=None`,
     `R` (the tensor-parallel rank count) must be passed explicitly to size
-    per-rank recurrent state pages. This function computes layout geometry only;
+    per-rank recurrent state pages. `conv_dtype`, when given, overrides the
+    declared conv window storage dtype (e.g. to match the dtype the serving
+    framework stores in its pool). This function computes layout geometry only;
     call `PoolLayout.validate` to enforce TPU pool-kernel support constraints.
     """
     explicit_rec = _unwrap_cache_decl(rec_decl) if rec_decl is not None else None
@@ -172,7 +175,8 @@ def derive_pool_layout(
             page_dtype=page_dtype,
         )
     rec_dtype = BF16 if rec_d.rec_dtype is None else rec_d.rec_dtype
-    conv_dtype = BF16 if rec_d.conv_dtype is None else rec_d.conv_dtype
+    if conv_dtype is None:
+        conv_dtype = BF16 if rec_d.conv_dtype is None else rec_d.conv_dtype
     conv_pages = (
         rec_d.conv_pages_per_slot
         if rec_d.conv_pages_per_slot is not None

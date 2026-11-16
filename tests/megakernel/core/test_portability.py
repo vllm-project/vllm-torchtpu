@@ -61,7 +61,9 @@ def _derive_required_modules(
     return required
 
 
-_LAZY_IMPORTERS = frozenset({"__init__.py", "dma/__init__.py", "runtime/__init__.py"})
+_LAZY_IMPORTERS = frozenset(
+    {"__init__.py", "dma/__init__.py", "runtime/__init__.py", "_builtins.py"}
+)
 
 
 def test_megakernel_portability_ast_guard():

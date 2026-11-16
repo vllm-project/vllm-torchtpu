@@ -53,6 +53,11 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    apply_top_k_top_p,
+    random_sampler_variants,
+    topk_candidate_blocks,
+)
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -213,6 +218,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     runner = SimpleNamespace(
         max_model_len=1048576,
         max_num_reqs=64,
+        max_num_local_reqs=64,
         max_num_tokens=256,
         block_size=384,
         max_num_blocks_per_req=pages,
@@ -333,6 +339,7 @@ def test_smem_caps_refresh_after_backend_block_size_update():
     runner = SimpleNamespace(
         max_model_len=32768,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=16,
         max_num_blocks_per_req=2048,
@@ -366,6 +373,7 @@ def test_smem_caps_refresh_keeps_block_table_width_when_block_size_unchanged():
     runner = SimpleNamespace(
         max_model_len=1000,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=16,
         max_num_blocks_per_req=64,  # placeholder table width, > cdiv(1000, 16)
@@ -392,6 +400,7 @@ def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
     runner = SimpleNamespace(
         max_model_len=32768,
         max_num_reqs=256,
+        max_num_local_reqs=256,
         max_num_tokens=8192,
         block_size=384,
         max_num_blocks_per_req=86,
@@ -480,10 +489,8 @@ def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
 @pytest.mark.parametrize("succeeds", [True, False])
 def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
     # Every stage runs the synthetic prefill through the hand-off in step,
-    # so a stage never retries on its own, and settles the burst after its
-    # forward so the launches that carry the prefill on are issued.
+    # so a stage never retries on its own.
     attempts = MagicMock(return_value=succeeds)
-    wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -491,7 +498,6 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
             pipeline_parallel_size=4, prefill_context_parallel_size=1
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
-        _pp_wave=wave,
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[4096],
         max_model_len=262144,
@@ -515,14 +521,12 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
         TPUModelRunner._warmup_mtp_prefill(runner)
 
     assert attempts.call_args_list == [((4096,), {})]
-    assert wave.settle.call_count == 1
 
 
 def test_mtp_prefill_warmup_fills_every_bucket():
     # Buckets are per rank: a PCP8 prompt of 8 x 512 tokens pads to 512 per
     # rank. Prompts above one scheduler step collapse onto its size.
     attempts = MagicMock(return_value=True)
-    wave = MagicMock()
     runner = SimpleNamespace(
         enforce_eager=False,
         speculative_config=object(),
@@ -530,7 +534,6 @@ def test_mtp_prefill_warmup_fills_every_bucket():
             pipeline_parallel_size=4, prefill_context_parallel_size=8
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
-        _pp_wave=wave,
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[512, 1024, 1536, 2048, 4096, 8192],
         max_model_len=262144,
@@ -550,7 +553,6 @@ def test_mtp_prefill_warmup_fills_every_bucket():
         ((16384,), {}),
         ((32768,), {}),
     ]
-    assert wave.settle.call_count == 5
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -886,6 +888,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
             None if spec_k is None else SimpleNamespace(num_speculative_tokens=spec_k)
         ),
         _last_sequence_layout_plan=None,
+        pcp_manager=None,
         input_batch=SimpleNamespace(req_ids=req_ids),
     )
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
@@ -1539,6 +1542,7 @@ class TestAttentionMetadataBuilder:
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
+        runner.pcp_manager = None
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
@@ -2465,7 +2469,12 @@ class TestUnifiedReadOffsetMigration:
         runner._mamba_ckpt_window = ckpt_window
         runner._bucket_len = TPUModelRunner._bucket_len
         runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
-        for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
+        for name in (
+            "_pad_dev_to_bucket",
+            "_expand_pool_split",
+            "_spec_seed_sources",
+            "_mamba_column_stride",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         # The collector strides the mamba block tables by the mamba groups'
         # spec block size (times the cp world), not by the attention block
@@ -2810,7 +2819,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         uses_mrope=False,
         supports_mm_inputs=False,
         _pp_is_first=True,
-        _pp_wave=None,
+        _pp_handoff=None,
         _pp_topk_buffer=None,
         _kv_cache_bundle=None,
         lora_config=None,
@@ -2831,6 +2840,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _registered_h2d_sources=set(),
         _block_table_upload_reuse=None,
         _token_padding_state=None,
+        pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
             prepare_dummy=lambda **kw: SimpleNamespace(
                 descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
@@ -3074,7 +3084,7 @@ class TestInputStagingFence:
         assert runner._block_table_upload_reuse is None
 
         # With through_handoff=True, the fence must be recorded before
-        # _pp_wave.start_forward so the next wait never blocks on the receive.
+        # _pp_handoff.start_forward so the next wait never blocks on the receive.
         handoff_checked = []
 
         def start_forward(n):
@@ -3083,8 +3093,7 @@ class TestInputStagingFence:
             handoff_checked.append(n)
             return None
 
-        runner._pp_wave = SimpleNamespace(
-            step=contextlib.nullcontext,
+        runner._pp_handoff = SimpleNamespace(
             start_forward=start_forward,
             end_forward=lambda *a: None,
         )
@@ -3784,6 +3793,175 @@ def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
     assert int(out_bf16.item()) == 0
 
 
+def _recording_sampler(record):
+    """A `sample_from_logits_func` stand-in that calls
+    `record(u, (all_greedy, topk_candidates, apply_topk_topp))`, an omitted
+    argument taking `TPUModelRunner.sample_from_logits`'s default."""
+    signature = inspect.signature(TPUModelRunner.sample_from_logits)
+
+    def sample_from_logits(*args, **kwargs):
+        call = signature.bind(None, *args, **kwargs)
+        call.apply_defaults()
+        arg = call.arguments
+        record(
+            arg["u"],
+            (arg["all_greedy"], arg["topk_candidates"], arg["apply_topk_topp"]),
+        )
+        return torch.zeros((arg["logits"].shape[0], 1), dtype=torch.int32)
+
+    return sample_from_logits
+
+
+# A real vocabulary size: 1,940 whole CANDIDATE_BLOCKs.
+_VOCAB_SIZE = 248320
+
+
+def _precompile_runner(
+    record, speculative_config=None, candidate_blocks=0, num_reqs_paddings=(2,)
+):
+    """A runner stand-in for `_precompile_sample_from_logits` that samples
+    through `_recording_sampler(record)`. `candidate_blocks` stands for
+    TPU_SAMPLER_TOPK_CANDIDATES, gated on `_VOCAB_SIZE`."""
+    return SimpleNamespace(
+        num_reqs_paddings=list(num_reqs_paddings),
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+        _topk_candidate_blocks=lambda: topk_candidate_blocks(
+            candidate_blocks, _VOCAB_SIZE
+        ),
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        sample_from_logits_func=_recording_sampler(record),
+        speculative_config=speculative_config,
+    )
+
+
+@pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
+def test_sampler_applies_topk_topp_only_when_a_request_sets_them(
+    speculative_config,
+):
+    """The no-top-k/top-p graph is used whenever no running request sets top-k
+    or top-p, with or without speculative decoding."""
+    for no_top_k, no_top_p, expected in (
+        (True, True, False),
+        (False, True, True),
+        (True, False, True),
+        (False, False, True),
+    ):
+        runner = SimpleNamespace(
+            speculative_config=speculative_config,
+            input_batch=SimpleNamespace(no_top_k=no_top_k, no_top_p=no_top_p),
+        )
+        assert TPUModelRunner._sampler_applies_topk_topp(runner) is expected
+
+
+@pytest.mark.parametrize("candidate_blocks", [0, 8])
+@pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
+def test_every_runtime_sampler_variant_is_precompiled(
+    speculative_config, candidate_blocks
+):
+    """Every (all_greedy, topk_candidates, apply_topk_topp) graph that
+    sampling picks at runtime, random or all-greedy, is one the precompile
+    warms in every num_reqs bucket, so serving compiles no sampler graph after
+    warmup. The random path picks from random_sampler_variants, which both
+    precompiles warm."""
+    num_blocks = topk_candidate_blocks(candidate_blocks, _VOCAB_SIZE)
+    num_reqs_paddings = (2, 4)
+    # (num_reqs, (all_greedy, topk_candidates, apply_topk_topp))
+    warmed = set()
+    TPUModelRunner._precompile_sample_from_logits(
+        _precompile_runner(
+            lambda u, variant: warmed.add((u.shape[0], variant)),
+            speculative_config,
+            candidate_blocks,
+            num_reqs_paddings,
+        )
+    )
+    variants = {(False, *variant) for variant in random_sampler_variants(num_blocks)}
+    assert {(n, v) for n in num_reqs_paddings for v in variants} <= warmed
+
+    # vLLM's InputBatch stores vocab_size as the top_k of a request that does
+    # not set it.
+    unset = _VOCAB_SIZE
+    for top_k, top_p in (
+        ([unset, unset], [1.0, 1.0]),
+        ([unset, unset], [0.9, 1.0]),
+        ([2, 2], [1.0, 1.0]),
+        ([2, unset], [1.0, 1.0]),
+        ([100, 2], [0.9, 0.9]),
+    ):
+        runner = SimpleNamespace(
+            speculative_config=speculative_config,
+            _topk_candidate_blocks=lambda: num_blocks,
+            input_batch=SimpleNamespace(
+                top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
+                no_top_k=all(k == unset for k in top_k),
+                no_top_p=all(p == 1.0 for p in top_p),
+            ),
+        )
+        for grammar_output in (None, object()):
+            variant = (
+                False,
+                TPUModelRunner._sampler_topk_candidates(runner, 0, 2, grammar_output),
+                TPUModelRunner._sampler_applies_topk_topp(runner),
+            )
+            assert variant in variants, (top_k, top_p, grammar_output, variant)
+
+    # All-greedy batches sample through _greedy_sample.
+    greedy = []
+    TPUModelRunner._greedy_sample(
+        SimpleNamespace(
+            sample_from_logits_func=_recording_sampler(
+                lambda _u, variant: greedy.append(variant)
+            )
+        ),
+        torch.zeros((2, 16), dtype=torch.bfloat16),
+    )
+    assert len(greedy) == 1, greedy
+    assert {(n, greedy[0]) for n in num_reqs_paddings} <= warmed, greedy
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
+    """At top_k == 0 and top_p == 1.0 (RL rollouts sample with top_k=-1 and
+    top_p=1) the no-top-k/top-p path samples exactly the tokens of the full
+    path; with top-k set, skipping would change them (negative control)."""
+    gen = torch.Generator().manual_seed(0)
+    runner = SimpleNamespace()
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
+    num_reqs, vocab = 16, 4096
+    logits = (torch.randn(num_reqs, vocab, generator=gen) * 4).to(dtype)
+    # Greedy rows (0.0) keep their argmax either way; the others sample at
+    # unit and non-unit temperatures.
+    temperatures = torch.tensor(
+        [[0.0], [0.7], [1.0], [1.3]] * (num_reqs // 4), dtype=dtype
+    )
+    top_k = torch.zeros((num_reqs, 1), dtype=torch.int32)
+    top_p = torch.ones((num_reqs, 1), dtype=torch.float32)
+
+    scaled = runner._apply_temperature(logits, temperatures)
+    assert torch.equal(apply_top_k_top_p(scaled, top_k, top_p, 0), scaled)
+    for _ in range(4):
+        u = torch.rand((num_reqs, vocab), dtype=torch.float32, generator=gen)
+        full = sample_fn(runner, logits, temperatures, u, top_k, top_p)
+        skip = sample_fn(
+            runner, logits, temperatures, u, top_k, top_p, apply_topk_topp=False
+        )
+        assert torch.equal(full, skip)
+
+    flat_logits = (torch.randn(num_reqs, vocab, generator=gen) * 0.1).to(dtype)
+    top_5 = torch.full((num_reqs, 1), 5, dtype=torch.int32)
+    u = torch.rand((num_reqs, vocab), dtype=torch.float32, generator=gen)
+    ones = torch.ones((num_reqs, 1), dtype=dtype)
+    # Ties at the 5th value are allowed too.
+    fifth = flat_logits.float().topk(5, dim=-1).values[:, -1:]
+    full = sample_fn(runner, flat_logits, ones, u, top_5, top_p)
+    skip = sample_fn(runner, flat_logits, ones, u, top_5, top_p, apply_topk_topp=False)
+    assert (flat_logits.float().gather(-1, full.long()) >= fifth).all()
+    assert not (flat_logits.float().gather(-1, skip.long()) >= fifth).all()
+
+
 def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     """All TPUModelRunner call sites into sample_from_logits_func must draw
     uniform random noise `u` in float32 even when logits are bfloat16."""
@@ -3797,18 +3975,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
 
     seen_u_dtypes: list[torch.dtype] = []
 
-    def fake_sample_from_logits(
-        logits,
-        temperatures,
-        u,
-        top_k,
-        top_p,
-        all_greedy=False,
-        topk_candidates=0,
-        apply_topk_topp=True,
-    ):
+    def record_u_dtype(u, _variant):
         seen_u_dtypes.append(u.dtype)
-        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    fake_sample_from_logits = _recording_sampler(record_u_dtype)
 
     bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
     sampling_params = (
@@ -3817,22 +3987,11 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         torch.ones((2, 1), dtype=torch.float32),
     )
 
-    # 1. _precompile_sample_from_logits: two graphs without speculative
-    # decoding, plus the no-top-k/top-p graph with it.
-    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 3)):
-        precompile_runner = SimpleNamespace(
-            num_reqs_paddings=[2],
-            _hidden_states_dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-            _topk_candidate_blocks=lambda: 0,
-            _precompile_timed=lambda _name: contextlib.nullcontext(),
-            sample_from_logits_func=fake_sample_from_logits,
-            speculative_config=speculative_config,
-        )
-        TPUModelRunner._precompile_sample_from_logits(precompile_runner)
-        assert seen_u_dtypes == [torch.float32] * num_graphs
-        seen_u_dtypes.clear()
+    # 1. _precompile_sample_from_logits: the full graph, the no-top-k/top-p
+    # graph and the greedy graph.
+    TPUModelRunner._precompile_sample_from_logits(_precompile_runner(record_u_dtype))
+    assert seen_u_dtypes == [torch.float32] * 3
+    seen_u_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
@@ -3885,8 +4044,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             has_structured_output_requests=False,
         )
         runner = SimpleNamespace(
-            _pp_wave=None,
+            _pp_handoff=None,
             _dp_step_other_decode=False,
+            num_prompt_logprobs={},
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
                 draft_chunks=[],
@@ -3894,9 +4054,11 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 num_reqs_list=[2],
                 spec_decode_metadata_list=[None],
                 mamba_state_indices_list=None,
+                mamba_boundary_plans=None,
                 pooler_output_list=[],
                 top_tokens=False,
                 kv_save_nan_check=None,
+                prompt_logprobs_chunks=[],
             ),
             input_batch=SimpleNamespace(
                 max_num_logprobs=None,
