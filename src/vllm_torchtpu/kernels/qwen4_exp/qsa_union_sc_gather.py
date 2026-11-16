@@ -1321,9 +1321,19 @@ def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group):
     contiguous run of items per vector subcore; the slab-major output is regrouped by XLA as the TensorCore plan
     regroups its own.
     """
-    tokens, k = sel.shape
+    tokens = sel.shape[0]
     if group % LANES or 128 % group or tokens % group:
         raise ValueError(f"the SparseCore bitset needs groups of whole 16-row slabs that split the {tokens} rows")
+    flat = union_sc_bits_flat(sel, bit_lengths, ratio=ratio, groups=groups, words=words)
+    return bits_slabs_to_plan(flat, tokens=tokens, group=group, words=words)
+
+
+def union_sc_bits_flat(sel, bit_lengths, *, ratio, groups, words):
+    """``union_sc_bits``' slab-major output, int32[T // 16 * words * 16]: each 16-row slab's bitset words, a row a
+    lane (the compare core's union groups are these slabs)."""
+    tokens, k = sel.shape
+    if tokens % LANES:
+        raise ValueError(f"the SparseCore bitset needs whole 16-row slabs, not {tokens} rows")
     if words % 8 or groups > words * WORD_BITS:
         raise ValueError("words must be a multiple of 8 covering every group")
     _log2(ratio)
@@ -1341,4 +1351,4 @@ def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group):
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, needs_layout_passes=False),
         name=f"qsa_union_sc_bits_k{k}_w{words}",
     )(sel.astype(jnp.int32).reshape(-1), bit_lengths.astype(jnp.int32))
-    return bits_slabs_to_plan(flat, tokens=tokens, group=group, words=words)
+    return flat
