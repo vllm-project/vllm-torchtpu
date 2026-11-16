@@ -81,6 +81,11 @@ def _log_packed_collectives() -> None:
             merge,
             merge,
         )
+    if envs.TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT:
+        logger.info_once(
+            "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT=1 on: MSA DCP candidate merge "
+            "selects each slot with a lane-axis max."
+        )
     if gather:
         logger.info_once(
             "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS=%d: MSA DCP query heads "

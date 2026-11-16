@@ -235,6 +235,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
@@ -1481,6 +1482,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
     "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 DCP candidate merge (`msa_dcp.merge_candidates`, the dense
+    # ranking used below 64 candidates per token, i.e. DCP 2) picks each
+    # output slot with a max over the candidate (lane) axis instead of over
+    # a middle axis. Same values; avoids a slow XLA layout at some row counts.
+    "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT": env_bool(
+        "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT", default=False
     ),
     # MiniMax M3 head-parallel DCP prefill attention (`msa_dcp_heads`, steps of
     # at least 2,048 tokens at DCP 8) kernel config, "<block_q>:<pages per

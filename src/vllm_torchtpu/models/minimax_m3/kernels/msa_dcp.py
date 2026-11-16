@@ -47,6 +47,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
@@ -440,6 +441,13 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     s_j, b_j = s[:, None, :], b[:, None, :]
     ahead = real[:, None, :] & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
     place = jnp.where(real, jnp.sum(ahead, axis=2, dtype=jnp.int32), topk)
+    if envs.TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT:
+        # Same selection with the candidates on the reduced (minor) axis:
+        # [rows, topk, dcp * topk] -> max over lanes. XLA lays the
+        # [rows, dcp * topk, topk] form out badly at some row counts (32
+        # rows: 3.5 us vs 0.4 us at 24); the values are identical.
+        slot = jnp.arange(topk, dtype=jnp.int32)[None, :, None]
+        return jnp.max(jnp.where(place[:, None, :] == slot, b[:, None, :], -1), axis=2)
     slot = jnp.arange(topk, dtype=jnp.int32)[None, None, :]
     return jnp.max(jnp.where(place[:, :, None] == slot, b_i, -1), axis=1)
 
