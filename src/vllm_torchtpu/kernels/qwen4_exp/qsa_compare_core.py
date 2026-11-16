@@ -24,9 +24,10 @@ call of ``qsa_rpa._prefill_attention``:
   heads form one [192, 256] block, row ``jj * 16 + r`` for query head ``jj`` and row ``r``. QK and
   PV are single bf16 MXU passes with f32 accumulation (FP8 K and V are exact in bf16); the softmax
   is online per union group; the output is normalized at the union group's last tile and copied out.
-- ``skew``: tile t - 1's softmax and values in the same body as tile t's unpack and scores, so the
-  two chains interleave (the scores of a tile wait in VMEM one body; V is unpacked again from the
-  tile's slab).
+- Ring slots are separate buffers and the tile loop's body takes ``depth`` tiles, so each tile's slot
+  is static: the refill copies (into another buffer than the one the tile reads) carry no memory
+  dependency on the tile's loads and the scheduler interleaves them.
+- ``f8dot``: K (and with ``guard`` off, V) enter the MXU as e4m3, without the bf16 conversion.
 
 The new rows' KV is the served write's (``qsa_writes`` runs before attention), so the kernel only
 reads the pool. Output: ungated bf16 rows in the aligned layout; ``compare_core_prefill`` gates them
@@ -70,6 +71,17 @@ def _byte(words, c):
     return pltpu.bitcast(x.astype(jnp.uint16).astype(jnp.uint8), jnp.float8_e4m3fn)
 
 
+def _head_bytes(words, h):
+    """(K, V) e4m3 [n, hd] of KV head h from u32 words [n, hd] of the served record (bytes 2h, 2h + 1)."""
+    half = words if h == 0 else lax.shift_right_logical(words, jnp.uint32(16))
+    half = half.astype(jnp.uint16)
+    k = half.astype(jnp.uint8)
+    # u16 shifts go through u32 (as batched_rpa ``convert_to_target_bitwidth``).
+    v = pltpu.bitcast(lax.shift_right_logical(pltpu.bitcast(half, jnp.uint32), jnp.uint32(8)), jnp.uint16)
+    v = v.astype(jnp.uint8)
+    return pltpu.bitcast(k, jnp.float8_e4m3fn), pltpu.bitcast(v, jnp.float8_e4m3fn)
+
+
 def _kernel(
     rec_ref,      # SMEM int32[tiles_cap]: (q * ct + t) | last << LAST_BIT
     nt_ref,       # SMEM int32[ngroups]: tiles of each union group
@@ -79,19 +91,7 @@ def _kernel(
     codes_hbm,    # int32[ngroups * ct, GPT]: each union slot's code
     cache_hbm,    # [pool tokens, 1, 4, hd] e4m3
     out_hbm,      # [rows, heads * hd] bf16
-    kv_ref,       # VMEM [depth * TILE, 1, 4, hd] e4m3: the KV ring
-    code_ref,     # VMEM int32[depth, 1, GPT]
-    kv_sem,       # DMA[depth]
-    srow_ref,     # SMEM int32[2 * depth * GPT]: slot rows ring
-    srow_sem,     # DMA[2 * depth]
-    qbuf,         # VMEM bf16[2, T, heads * hd]
-    q_sem,        # DMA[2]
-    obuf,         # VMEM bf16[2, T, heads * hd]
-    o_sem,        # DMA[2]
-    m_ref,        # VMEM f32[2 * kv, M, 1]
-    l_ref,        # VMEM f32[2 * kv, M, 1]
-    acc_ref,      # VMEM f32[2 * kv, M, hd]
-    *rest,        # skew: VMEM f32[2 * kv, M, TILE] scores of the previous tile
+    *scratch,
     depth: int,
     ct: int,
     kv_heads: int,
@@ -101,15 +101,15 @@ def _kernel(
     s_scale: float,
     v_scale: float,
     guard: bool,
-    skew: bool,
+    f8dot: bool,
 ):
-    sbuf = rest[0] if skew else None
-    D, HD, M = depth, head_dim, hpk * T
-    lead = D - 2 if skew else D - 1          # tiles in flight ahead of the one being read
-    S = 2 * D
+    D, HD = depth, head_dim
+    kv_bufs = scratch[:D]            # VMEM [TILE, 1, 4, hd] e4m3 each: one ring slot a buffer
+    code_bufs = scratch[D:2 * D]     # VMEM int32[1, GPT] each
+    (kv_sem, srow_ref, srow_sem, qbuf, q_sem, obuf, o_sem, m_ref, l_ref, acc_ref, ctr_ref) = scratch[2 * D:]
+    lead = D - 1                     # tiles in flight ahead of the one being read
     ct_shift = _ilog2(ct)
     total = meta_ref[0]
-    words = kv_ref.bitcast(jnp.uint32).reshape(D * TILE * 2, 128)   # a token's 256 words as two lane rows
 
     def rec_of(i):
         return rec_ref[jnp.clip(i, 0, total - 1)]
@@ -117,28 +117,28 @@ def _kernel(
     def row_of(i):
         return rec_of(i) & ((1 << LAST_BIT) - 1)
 
-    def srow_copy(k):
-        s = k & (S - 1)
+    def srow_copy(k, s):
+        """Tile k's slot rows into slot-row buffer s (static where the caller knows k mod depth)."""
         src = rows_hbm.at[pl.ds(pl.multiple_of(row_of(k) * GPT, GPT), GPT)]
-        return pltpu.make_async_copy(src, srow_ref.at[pl.ds(pl.multiple_of(s * GPT, GPT), GPT)], srow_sem.at[s])
+        dst = srow_ref.at[pl.ds(pl.multiple_of(s * GPT, GPT), GPT)]
+        return pltpu.make_async_copy(src, dst, srow_sem.at[s])
 
     def kv_wait(slot):
-        # DMA semaphores count bytes: one descriptor of the whole tile covers its 128 copies.
-        pltpu.make_async_copy(cache_hbm.at[pl.ds(0, TILE)], kv_ref.at[pl.ds(0, TILE)], kv_sem.at[slot]).wait()
-        pltpu.make_async_copy(codes_hbm.at[pl.ds(0, 1)], code_ref.at[slot], kv_sem.at[slot]).wait()
+        # DMA semaphores count bytes: one descriptor of the whole tile covers its 128 copies; the descriptor's
+        # buffers only give the size.
+        pltpu.make_async_copy(cache_hbm.at[pl.ds(0, TILE)], kv_bufs[0], kv_sem.at[slot]).wait()
+        pltpu.make_async_copy(codes_hbm.at[pl.ds(0, 1)], code_bufs[0], kv_sem.at[slot]).wait()
 
-    def kv_issue(k):
-        """Tile k's 128 group copies and its codes into ring slot k mod depth (k clamped into the step)."""
-        slot = k & (D - 1)
-        s = k & (S - 1)
-        base = slot * TILE
+    def kv_issue(k, slot):
+        """Tile k's 128 group copies and its codes into ring slot ``slot`` (static: k mod depth)."""
+        buf = kv_bufs[slot]
         for j in range(GPT):
             pltpu.make_async_copy(
-                cache_hbm.at[pl.ds(srow_ref[s * GPT + j], RATIO)],
-                kv_ref.at[pl.ds(base + j * RATIO, RATIO)],
+                cache_hbm.at[pl.ds(srow_ref[slot * GPT + j], RATIO)],
+                buf.at[pl.ds(j * RATIO, RATIO)],
                 kv_sem.at[slot],
             ).start()
-        pltpu.make_async_copy(codes_hbm.at[pl.ds(row_of(k), 1)], code_ref.at[slot], kv_sem.at[slot]).start()
+        pltpu.make_async_copy(codes_hbm.at[pl.ds(row_of(k), 1)], code_bufs[slot], kv_sem.at[slot]).start()
 
     def q_copy(q, qs):
         return pltpu.make_async_copy(q_hbm.at[pl.ds(pl.multiple_of(q * T, T), T)], qbuf.at[qs], q_sem.at[qs])
@@ -146,40 +146,36 @@ def _kernel(
     def o_copy(q, os_):
         return pltpu.make_async_copy(obuf.at[os_], out_hbm.at[pl.ds(pl.multiple_of(q * T, T), T)], o_sem.at[os_])
 
-    def token_words(slot, j):
-        """u32 words [GPT, hd] of token j of each group of a ring slot (copies land group-major)."""
-        start = 2 * (slot * TILE + j)
-        lo = words[pl.ds(start, GPT, stride=2 * RATIO), :]
-        hi = words[pl.ds(start + 1, GPT, stride=2 * RATIO), :]
-        return jnp.concatenate([lo, hi], axis=1)
-
-    def unpack(slot, want_k, want_v):
-        """Per KV head (K, V) [TILE, hd] bf16 in (token in group, group) order."""
-        ks = [[] for _ in range(kv_heads)]
-        vs = [[] for _ in range(kv_heads)]
+    def head_kv(slot, h, want_k, want_v):
+        """KV head h's K and V [TILE, hd] of ring slot ``slot`` in (token in group, group) order."""
+        words = kv_bufs[slot].bitcast(jnp.uint32).reshape(TILE, HD).reshape(TILE * HD // 128, 128)
+        per = HD // 128
+        ks, vs = [], []
         for j in range(RATIO):
-            w = token_words(slot, j)
-            for h in range(kv_heads):
-                if want_k:
-                    ks[h].append(_byte(w, 2 * h).astype(jnp.bfloat16))
-                if want_v:
-                    vs[h].append(_byte(w, 2 * h + 1).astype(jnp.bfloat16))
-        k = [jnp.concatenate(x, axis=0) for x in ks] if want_k else None
-        v = None
-        if want_v:
-            v = [jnp.concatenate(x, axis=0) for x in vs]
+            # Copies land group-major (token 4 g + j at row 4 g + j): a stride of 4 tokens reads token j of each.
+            parts = [words[pl.ds(per * j + c, GPT, stride=per * RATIO), :] for c in range(per)]
+            k8, v8 = _head_bytes(jnp.concatenate(parts, axis=1), h)
+            ks.append(k8)
+            vs.append(v8)
+        k = v = None
+        if want_k:
+            k = jnp.concatenate(ks if f8dot else [x.astype(jnp.bfloat16) for x in ks], axis=0)
+        if want_v and f8dot and not guard:
+            v = jnp.concatenate(vs, axis=0)
+        elif want_v:
+            v = jnp.concatenate([x.astype(jnp.bfloat16) for x in vs], axis=0)
             if guard:
                 # A masked probability is 0, and 0 x NaN is NaN: unwritten pool bytes must not reach the sum.
-                v = [jnp.where(x == x, x, jnp.zeros_like(x)) for x in v]
+                v = jnp.where(v == v, v, jnp.zeros_like(v))
         return k, v
 
     def bias_of(slot):
         """[M, TILE] f32: 0 where a row sees a token, MASKED elsewhere (every query head's 16 rows alike)."""
-        cw = code_ref[slot]                                          # [1, GPT]
+        cw = code_bufs[slot][...]                                    # [1, GPT]
         code = cw & 0xFFFF
         edge = lax.shift_right_logical(cw, 16) - EDGE_BIAS
         r = lax.broadcasted_iota(jnp.int32, (T, GPT), 0)
-        bit = (lax.shift_right_logical(code, r) & 1) != 0
+        bit = ((code >> r) & 1) != 0
         parts = [jnp.where(bit & (r - j >= edge), 0.0, MASKED).astype(jnp.float32) for j in range(RATIO)]
         bias = jnp.concatenate(parts, axis=1)                        # [T, TILE]
         return jnp.concatenate([bias] * hpk, axis=0)
@@ -191,32 +187,23 @@ def _kernel(
             q = (q.astype(jnp.float32) * q_scale).astype(jnp.bfloat16)
         return q
 
-    def scores(slot, qs):
-        """Tile ``slot``'s masked scores per KV head, [M, TILE] f32."""
-        k, _ = unpack(slot, True, False)
+    def tile_step(slot, qs, p):
+        """One tile on state parity p: per KV head the masked scores, the online softmax and the values."""
         bias = bias_of(slot)
-        out = []
         for h in range(kv_heads):
-            s = lax.dot_general(queries(qs, h), k[h], (((1,), (1,)), ((), ())),
-                                preferred_element_type=jnp.float32)
+            k, v = head_kv(slot, h, True, True)
+            s = lax.dot_general(queries(qs, h), k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
             if s_scale != 1.0:
                 s = s * s_scale
-            out.append(s + bias)
-        return out
-
-    def online(slot, p, s_list):
-        """The online-softmax step of one tile on state parity ``p``."""
-        _, v = unpack(slot, False, True)
-        for h in range(kv_heads):
+            s = s + bias
             idx = p * kv_heads + h
-            s = s_list[h]
             m0 = m_ref[idx]
             m1 = jnp.maximum(m0, jnp.max(s, axis=1, keepdims=True))
             alpha = jnp.exp(m0 - m1)
             prob = jnp.exp(s - m1)
             l_ref[idx] = l_ref[idx] * alpha + jnp.sum(prob, axis=1, keepdims=True)
             acc_ref[idx] = acc_ref[idx] * alpha + lax.dot_general(
-                prob.astype(jnp.bfloat16), v[h], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+                prob.astype(jnp.bfloat16), v, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
             m_ref[idx] = m1
 
     def reset(p):
@@ -226,11 +213,10 @@ def _kernel(
             l_ref[idx] = jnp.zeros(l_ref.shape[1:], jnp.float32)
             acc_ref[idx] = jnp.zeros(acc_ref.shape[1:], jnp.float32)
 
-    def finish(q, g):
-        """Union group q (ordinal g)'s rows out: normalized state into its output buffer, then copied."""
-        p = g & 1
-
-        @pl.when(g >= 2)
+    def finish(q, p):
+        """Union group q's rows out from state parity p: its output buffer's previous copy waited, the
+        normalized state written, the copy started."""
+        @pl.when(ctr_ref[1 + p] == 1)
         def _():
             o_copy(0, p).wait()
 
@@ -241,124 +227,87 @@ def _kernel(
             for jj in range(hpk):
                 obuf[p, :, (h * hpk + jj) * HD:(h * hpk + jj + 1) * HD] = out[jj * T:(jj + 1) * T]
         o_copy(q, p).start()
+        ctr_ref[1 + p] = 1
 
-    def group_start(i, g):
-        """Tile i opens union group ordinal g: its query rows (prefetched), the next group's prefetch, a fresh
-        state."""
+    def group_start(i, p):
+        """Tile i opens a union group on parity p: its query rows (prefetched), the next group's prefetch, a
+        fresh state."""
         q = row_of(i) >> ct_shift
-        qs = g & 1
-        q_copy(0, qs).wait()
+        q_copy(0, p).wait()
         nxt = i + nt_ref[q]
 
         @pl.when(nxt < total)
         def _():
-            q_copy(row_of(nxt) >> ct_shift, 1 - qs).start()
+            q_copy(row_of(nxt) >> ct_shift, 1 - p).start()
 
-        reset(qs)
+        reset(p)
 
-    def refill(i):
-        """Tile i + lead's copies (its slot rows already staged), then the slot rows of the tile after it."""
-        k = i + lead
-        srow_copy(k).wait()
-        kv_issue(k)
-        srow_copy(k + 1).start()
-
-    def flags(i):
+    def step(i, slot):
+        """Tile i, read from ring slot ``slot`` (static), refilling slot ``slot - 1`` with tile i + depth - 1."""
         rec = rec_of(i)
         row = rec & ((1 << LAST_BIT) - 1)
-        return row >> ct_shift, (row & (ct - 1)) == 0, lax.shift_right_logical(rec, LAST_BIT) & 1
+        q = row >> ct_shift
+        first = (row & (ct - 1)) == 0
+        last = lax.shift_right_logical(rec, LAST_BIT) & 1
+
+        @pl.when(first)
+        def _():
+            ctr_ref[0] = ctr_ref[0] + 1
+            group_start(i, ctr_ref[0] & 1)
+
+        p = ctr_ref[0] & 1
+        kv_wait(slot)
+        k = i + lead
+        ks = (slot + lead) % D
+        srow_copy(k, ks).wait()
+        kv_issue(k, ks)
+        srow_copy(k + 1, (ks + 1) % D).start()
+        tile_step(slot, p, p)
+
+        @pl.when(last == 1)
+        def _():
+            finish(q, p)
 
     @pl.when(total > 0)
     def _():
+        ctr_ref[0] = -1
+        ctr_ref[1] = 0
+        ctr_ref[2] = 0
         q_copy(row_of(0) >> ct_shift, 0).start()
         for k in range(lead + 1):
-            srow_copy(k).start()
+            srow_copy(k, k % D).start()
+        for k in range(lead):
+            srow_copy(k, k).wait()
+            kv_issue(k, k)
 
-        def prologue(k, carry):
-            srow_copy(k).wait()
-            kv_issue(k)
+        def outer(o, carry):
+            # Ring slots are static: each body takes depth tiles.
+            for u in range(D):
+                i = o * D + u
+
+                @pl.when(i < total)
+                def _(i=i, u=u):
+                    step(i, u)
+
             return carry
 
-        lax.fori_loop(0, lead, prologue, None)
-
-        if not skew:
-            def body(i, g):
-                q, first, last = flags(i)
-                g = g + first.astype(jnp.int32)
-
-                @pl.when(first)
-                def _():
-                    group_start(i, g)
-
-                slot = i & (D - 1)
-                kv_wait(slot)
-                refill(i)
-                online(slot, g & 1, scores(slot, g & 1))
-
-                @pl.when(last == 1)
-                def _():
-                    finish(q, g)
-
-                return g
-
-            g_end = lax.fori_loop(0, total, body, jnp.int32(-1))
-        else:
-            def a_step(i, g):
-                slot = i & (D - 1)
-                for h, s in enumerate(scores(slot, g & 1)):
-                    sbuf[(i & 1) * kv_heads + h] = s
-
-            def b_step(i, g):
-                online(i & (D - 1), g & 1, [sbuf[(i & 1) * kv_heads + h] for h in range(kv_heads)])
-
-            # Tile 0 alone, then each body: tile i - 1's softmax and values beside tile i's scores.
-            q0, first0, last0 = flags(0)
-            group_start(0, jnp.int32(0))
-            kv_wait(0)
-            refill(0)
-            a_step(0, jnp.int32(0))
-
-            def body(i, carry):
-                g_prev, q_prev, last_prev = carry
-                q, first, last = flags(i)
-                g = g_prev + first.astype(jnp.int32)
-
-                @pl.when(first)
-                def _():
-                    group_start(i, g)
-
-                slot = i & (D - 1)
-                kv_wait(slot)
-                b_step(i - 1, g_prev)
-                refill(i)
-                a_step(i, g)
-
-                @pl.when(last_prev == 1)
-                def _():
-                    finish(q_prev, g_prev)
-
-                return g, q, last
-
-            g_end, q_end, _ = lax.fori_loop(1, total, body, (jnp.int32(0), q0, last0))
-            b_step(total - 1, g_end)
-            finish(q_end, g_end)
+        lax.fori_loop(0, (total + D - 1) // D, outer, None)
 
         def drain(k, carry):
             kv_wait(k & (D - 1))
             return carry
 
         lax.fori_loop(total, total + lead, drain, None)
-        srow_copy(total + lead).wait()
-
-        @pl.when(g_end >= 1)
-        def _():
-            o_copy(0, (g_end - 1) & 1).wait()
-
-        o_copy(0, g_end & 1).wait()
+        last_srow = (total + lead) & (D - 1)
+        pltpu.make_async_copy(rows_hbm.at[pl.ds(0, GPT)], srow_ref.at[pl.ds(0, GPT)], srow_sem.at[last_srow]).wait()
+        for p in range(2):
+            @pl.when(ctr_ref[1 + p] == 1)
+            def _(p=p):
+                o_copy(0, p).wait()
 
 
 def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=2, k_scale=1.0, v_scale=1.0,
-                        depth=8, skew=False, guard=True, sm_scale=None, vmem_mib=56):
+                        depth=8, guard=True, f8dot=False, sm_scale=None, vmem_mib=56):
     """Ungated bf16 attention [R, heads, hd] of the aligned query rows over each union group's tables.
 
     ``query`` [R, heads, hd] (R a multiple of 16; union group q = rows [16 q, 16 q + 16)); ``rows``
@@ -399,13 +348,13 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
 
     kernel = functools.partial(
         _kernel, depth=depth, ct=ct, kv_heads=kv_heads, hpk=hpk, head_dim=hd, q_scale=float(q_scale),
-        s_scale=float(s_scale), v_scale=float(v_scale), guard=guard, skew=skew)
-    scratch = [
-        pltpu.VMEM((depth * TILE, 1, 4, hd), pool.dtype),
-        pltpu.VMEM((depth, 1, GPT), jnp.int32),
+        s_scale=float(s_scale), v_scale=float(v_scale), guard=guard, f8dot=f8dot)
+    scratch = [pltpu.VMEM((TILE, 1, 4, hd), pool.dtype) for _ in range(depth)]
+    scratch += [pltpu.VMEM((1, GPT), jnp.int32) for _ in range(depth)]
+    scratch += [
         pltpu.SemaphoreType.DMA((depth,)),
-        pltpu.SMEM((2 * depth * GPT,), jnp.int32),
-        pltpu.SemaphoreType.DMA((2 * depth,)),
+        pltpu.SMEM((depth * GPT,), jnp.int32),
+        pltpu.SemaphoreType.DMA((depth,)),
         pltpu.VMEM((2, T, heads * hd), jnp.bfloat16),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.VMEM((2, T, heads * hd), jnp.bfloat16),
@@ -413,9 +362,8 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
         pltpu.VMEM((2 * kv_heads, M, 1), jnp.float32),
         pltpu.VMEM((2 * kv_heads, M, 1), jnp.float32),
         pltpu.VMEM((2 * kv_heads, M, hd), jnp.float32),
+        pltpu.SMEM((4,), jnp.int32),
     ]
-    if skew:
-        scratch.append(pltpu.VMEM((2 * kv_heads, M, TILE), jnp.float32))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out = pl.pallas_call(
         kernel,
@@ -429,7 +377,7 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",), vmem_limit_bytes=vmem_mib * 1024**2, disable_bounds_checks=True),
         out_shape=jax.ShapeDtypeStruct((tokens, heads * hd), jnp.bfloat16),
-        name=f"qsa_union_walk_cmp_t{T}_d{depth}" + ("_skew" if skew else ""),
+        name=f"qsa_union_walk_cmp_t{T}_d{depth}" + ("_f8" if f8dot else "") + ("" if guard else "_ng"),
     )(
         rec,
         ntiles,
@@ -557,7 +505,7 @@ def compare_tables(blocks, lengths, table, *, groups_cap, union_cap, page_size, 
 
 
 def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv_heads, ratio, k_scale=1.0,
-                         v_scale=1.0, union_cap, min_context, fallback, depth=8, skew=False, bitset="tensorcore",
+                         v_scale=1.0, union_cap, min_context, fallback, depth=8, f8dot=False, guard=True, bitset="tensorcore",
                          lister="reference"):
     """``(gated bf16 output, cache)`` of a packed prefill step through the compare core.
 
@@ -605,7 +553,7 @@ def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, 
         def run():
             return compare_core_kernel(a_query, rows, codes, jnp.where(ok, usize, 0), cache,
                                        union_cap=union_cap, kv_heads=kv_heads, k_scale=k_scale,
-                                       v_scale=v_scale, depth=depth, skew=skew)
+                                       v_scale=v_scale, depth=depth, f8dot=f8dot, guard=guard)
 
         raw = lax.cond(ok, run, lambda: jnp.zeros(a_query.shape, jnp.bfloat16))
         return (raw if back is None else raw[back]), ok
