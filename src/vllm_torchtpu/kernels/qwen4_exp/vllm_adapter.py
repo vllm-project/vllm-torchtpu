@@ -11,6 +11,7 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
+from vllm_torchtpu.kernels.qwen4_exp.hc_decode_cmp import hc_decode_mix_auto
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_cmp import hc_prefill_mix_cmp
@@ -135,6 +136,8 @@ def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
     max_tile = envs.TPU_QWEN4_HC_DECODE_TILE_ROWS
     static = dict(branches=branches, hidden=hidden, eps=eps, max_tile=max_tile)
+    mix = hc_decode_mix_auto if envs.TPU_QWEN4_HC_DECODE_COMPARE else hc_decode_mix
+    cmp_tag = "_cmp" if envs.TPU_QWEN4_HC_DECODE_COMPARE else ""
     if inject:
 
         def core(
@@ -144,18 +147,19 @@ def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
             up: jax.Array,
             inject_weight: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            return hc_decode_mix(x, weight, down, up, inject_weight, **static)
+            return mix(x, weight, down, up, inject_weight, **static)
 
     else:
 
         def core(
             x: jax.Array, weight: jax.Array, down: jax.Array, up: jax.Array
         ) -> jax.Array:
-            return hc_decode_mix(x, weight, down, up, **static)[0]
+            return mix(x, weight, down, up, **static)[0]
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_decode_c{branches}_h{hidden}_e{eps_tag}"
-        f"{'_inj' if inject else ''}{f'_t{max_tile}' if max_tile else ''}_v1",
+        f"{'_inj' if inject else ''}{f'_t{max_tile}' if max_tile else ''}"
+        f"{cmp_tag}_v1",
         core,
     )
 
@@ -192,6 +196,9 @@ def build_decode_combine_mix_op(
     max_tile = envs.TPU_QWEN4_HC_DECODE_TILE_ROWS
     static = dict(branches=branches, hidden=hidden, eps=eps, max_tile=max_tile)
     tile_tag = f"_t{max_tile}" if max_tile else ""
+    if envs.TPU_QWEN4_HC_DECODE_COMPARE:
+        tile_tag += "_cmp"
+    mix = hc_decode_mix_auto if envs.TPU_QWEN4_HC_DECODE_COMPARE else hc_decode_mix
     if inject:
 
         def core(
@@ -203,7 +210,7 @@ def build_decode_combine_mix_op(
             up: jax.Array,
             inject_weight: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            return hc_decode_mix(
+            return mix(
                 residual,
                 weight,
                 down,
@@ -228,7 +235,7 @@ def build_decode_combine_mix_op(
             down: jax.Array,
             up: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            mixed, _, combined = hc_decode_mix(
+            mixed, _, combined = mix(
                 residual,
                 weight,
                 down,

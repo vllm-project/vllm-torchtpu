@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
     TPU_QWEN4_HC_DECODE_FOLD: bool = False
     TPU_QWEN4_HC_DECODE_TILE_ROWS: int = 0
+    TPU_QWEN4_HC_DECODE_COMPARE: bool = False
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
@@ -1411,6 +1412,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (192 rows: one tile instead of three of 64). Each tile streams the
     # layer's HC weights through the MXU again. 0 keeps the 128-row tiling.
     "TPU_QWEN4_HC_DECODE_TILE_ROWS": env_int("TPU_QWEN4_HC_DECODE_TILE_ROWS", 0),
+    # qwen4_exp, with TPU_QWEN4_HC_DECODE_FUSED: steps of 16 to 256 rows (a
+    # multiple of 16) run the fused decode HC mix as hc_decode_cmp.py, which
+    # issues every row and weight copy at entry, takes the injection logits
+    # from the down projection's MXU pass and writes the combined rows back
+    # stream by stream. Other row counts keep hc_decode.py.
+    "TPU_QWEN4_HC_DECODE_COMPARE": env_bool("TPU_QWEN4_HC_DECODE_COMPARE"),
     # qwen4_exp prefill: let the fused HC mix (hc_full) and the gated_residual
     # combine take any whole number (>= 2) of hc_prefill_full_tile tiles, not
     # only even counts, so 6,400- and 3,200-token steps leave the unfused
