@@ -29,15 +29,18 @@ def test_parse_spec():
     assert S.parse_spec("1536:3") == (1536, 3, 512)
     assert S.parse_spec("768:4@256") == (768, 4, 256)
     with pytest.raises(ValueError):
+        S.parse_spec("768:4@4096")
+    with pytest.raises(ValueError):
         S.parse_spec("700:4")
     with pytest.raises(ValueError):
         S.parse_spec("768:1")
 
 
-def test_buckets():
-    assert S._buckets(8) == (16, 32)
-    assert S._buckets(48) == (16, 32, 64)
-    assert S._buckets(128) == (16, 32, 64, 128, 144)
+def test_plan():
+    assert S.plan(32, 8) == ((16, 32), None)
+    assert S.plan(192, 48) == ((16, 32, 64), None)
+    assert S.plan(512, 128) == ((16, 32, 64, 128), None)
+    assert S.plan(1024, 256) == ((16, 32, 48, 128), 128)
 
 
 def test_eligible_rejects():
@@ -73,16 +76,19 @@ def _reference(lhs, w1, s1, w2, s2, gs, act):
 
 
 @pytest.mark.parametrize(
-    "group_sizes,chunk,slots",
+    "group_sizes,chunk,slots,m,max_group",
     [
-        ([3, 0, 5, 9, 0, 1], 256, 3),  # unaligned group starts, 3 slots
-        ([0, 0, 20, 0, 4, 0], 128, 2),  # leading empty groups, 2 slots
-        ([0, 0, 0, 0, 0, 0], 256, 3),  # no work
-        ([17, 0, 0, 0, 0, 30], 256, 4),  # groups past one 16-row slab
+        ([3, 0, 5, 9, 0, 1], 256, 3, 64, 32),  # unaligned group starts, 3 slots
+        ([0, 0, 20, 0, 4, 0], 128, 2, 64, 32),  # leading empty groups, 2 slots
+        ([0, 0, 0, 0, 0, 0], 256, 3, 64, 32),  # no work
+        ([17, 0, 0, 0, 0, 30], 256, 4, 64, 32),  # groups past one 16-row slab
+        ([1, 1, 1, 1, 1, 1], 256, 3, 64, 32),  # many entries in one slab
+        ([5, 140, 0, 2, 60, 40], 256, 3, 640, 160),  # > 512 rows: split, bf16 tiles
+        ([30, 0, 100, 0, 0, 3], 128, 2, 512, 128),  # <= 512 rows, group split at 128
     ],
 )
-def test_stream_matches_dequantized_reference(group_sizes, chunk, slots):
-    k, f, g, m = 512, 512, 6, 64
+def test_stream_matches_dequantized_reference(group_sizes, chunk, slots, m, max_group):
+    k, f, g = 512, 512, 6
     keys = jax.random.split(jax.random.key(0), 5)
     w1 = (jax.random.normal(keys[0], (g, k, 2 * f)) * 2).astype(jnp.float4_e2m1fn)
     w2 = (jax.random.normal(keys[1], (g, f, 2 * f)) * 2).astype(jnp.float4_e2m1fn)
@@ -93,7 +99,7 @@ def test_stream_matches_dequantized_reference(group_sizes, chunk, slots):
     out = S.gmm_decode_stream_mlp(
         lhs, w1, w2, gs, s1, s2, jnp.zeros((1,), jnp.int32),
         fuse_act="swigluoai", out_dtype=jnp.bfloat16, chunk_rows=chunk,
-        slots=slots, max_group_size=32, interpret=True,
+        slots=slots, max_group_size=max_group, interpret=True,
     )
     ref, valid = _reference(lhs, w1, s1, w2, s2, gs, "swigluoai")
     out = np.asarray(out.astype(jnp.float32))
