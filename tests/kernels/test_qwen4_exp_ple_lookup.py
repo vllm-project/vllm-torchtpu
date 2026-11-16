@@ -84,3 +84,54 @@ def test_larger_chunks_match_eight_token_chunks(chunk_tokens, token_count):
     )
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, LOCAL_ROWS))
+
+
+@pytest.mark.parametrize("owned_pct", [13, 25, 50, 100])
+@pytest.mark.parametrize("chunk_tokens", [8, 64, 256])
+@pytest.mark.parametrize("token_count", [1, 13, 64, 300])
+def test_owned_gather_matches_masked_gather(owned_pct, chunk_tokens, token_count):
+    """VLLM_TPU_PLE_OWNED_GATHER_PCT gathers only this shard's ids and is
+    bit-identical, including chunks that own more than the buffer (they take
+    the masked gather) and -1 padding ids."""
+    rng = np.random.default_rng(owned_pct * 1000 + chunk_tokens + token_count)
+    rows, table = _shard(rng)
+    start = jnp.asarray([2 * LOCAL_ROWS], jnp.int32)
+    # 8 shards' worth of vocab: about 1/8 of the ids are this shard's.
+    ids = rng.integers(0, 8 * LOCAL_ROWS, (token_count, 3))
+    ids[0, 0] = -1
+    want = resident_lookup_raw(
+        table,
+        jnp.asarray(ids),
+        start,
+        local_rows=LOCAL_ROWS,
+        head_dim=HEAD_DIM,
+        chunk_tokens=chunk_tokens,
+    )
+    got = resident_lookup_raw(
+        table,
+        jnp.asarray(ids),
+        start,
+        local_rows=LOCAL_ROWS,
+        head_dim=HEAD_DIM,
+        chunk_tokens=chunk_tokens,
+        owned_pct=owned_pct,
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, 2 * LOCAL_ROWS))
+
+
+def test_owned_gather_overflow_takes_masked_path():
+    """A chunk whose ids are all this shard's overflows a 13% buffer."""
+    rng = np.random.default_rng(7)
+    rows, table = _shard(rng)
+    ids = rng.integers(0, LOCAL_ROWS, (64, 3))  # every id owned by shard 0
+    got = resident_lookup_raw(
+        table,
+        jnp.asarray(ids),
+        jnp.asarray([0], jnp.int32),
+        local_rows=LOCAL_ROWS,
+        head_dim=HEAD_DIM,
+        chunk_tokens=64,
+        owned_pct=13,
+    )
+    np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, 0))
