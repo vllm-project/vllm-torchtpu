@@ -255,9 +255,14 @@ def _vllm_config(speculative_config=None, async_scheduling=True, gaad=None):
 
 
 _STANDALONE = SimpleNamespace(
-    method="custom_class", model=gaad.GAAD_PROPOSER, num_speculative_tokens=7
+    method="custom_class",
+    model=gaad.GAAD_PROPOSER,
+    num_speculative_tokens=7,
+    use_eagle=lambda: False,
 )
-_DRAFTER = SimpleNamespace(method="mtp", model=None, num_speculative_tokens=7)
+_DRAFTER = SimpleNamespace(
+    method="mtp", model=None, num_speculative_tokens=7, use_eagle=lambda: True
+)
 
 
 def test_check_config_needs_gaad_for_standalone():
@@ -286,10 +291,16 @@ def test_check_config_rejects_bad_options(options, match):
         gaad.check_config(_vllm_config(_DRAFTER, gaad=options))
 
 
-def test_check_config_turns_async_scheduling_off():
-    config = _vllm_config(_DRAFTER, async_scheduling=True, gaad={"draft_tokens": 3})
+def test_check_config_turns_async_scheduling_off_without_a_device_drafter():
+    config = _vllm_config(_STANDALONE, async_scheduling=True, gaad={})
     gaad.check_config(config)
     assert config.scheduler_config.async_scheduling is False
+
+
+def test_check_config_keeps_async_scheduling_with_a_device_drafter():
+    config = _vllm_config(_DRAFTER, async_scheduling=True, gaad={"draft_tokens": 3})
+    gaad.check_config(config)
+    assert config.scheduler_config.async_scheduling is True
 
 
 def test_check_config_leaves_other_configs_alone():
@@ -304,6 +315,7 @@ def _manager_for(req_ids, enabled):
     )
 
     manager = SpeculativeDecodingManager.__new__(SpeculativeDecodingManager)
+    manager._model_flags = {}
     manager.runner = SimpleNamespace(
         device=torch.device("cpu"),
         input_batch=SimpleNamespace(req_ids=req_ids),
@@ -325,6 +337,10 @@ def test_draft_flags_are_laid_out_like_the_drafts(enabled):
         assert flags is None
         return
     assert flags.tolist() == [G, G, M, G, M, 0, 0, 0]
+    # A step without GRAMMAR drafts reuses one tensor of MODEL flags.
+    model = manager._build_draft_flags_tensor(np.array([M, M], np.int32), 8)
+    assert model.tolist() == [M] * 8
+    assert manager._build_draft_flags_tensor(np.array([M], np.int32), 8) is model
 
 
 def test_grammar_rows_skip_the_lm_head():
@@ -372,3 +388,250 @@ def test_a_skipped_request_keeps_the_drafters_share():
 def test_draft_limit_is_the_row_without_draft_tokens():
     assert gaad.draft_limit(_vllm_config(_DRAFTER)) == 7
     assert gaad.draft_limit(_vllm_config(_DRAFTER, gaad={})) == 7
+
+
+def _scheduler(*requests, constraint_start=0):
+    return SimpleNamespace(
+        structured_output_manager=_manager(constraint_start),
+        num_spec_tokens=7,
+        running=list(requests),
+        vllm_config=_vllm_config(_DRAFTER, gaad={}),
+    )
+
+
+def _free_slot_matcher():
+    matcher = _Matcher()
+    for token in (1, 2, 3):
+        assert matcher.accept_token(token)
+    return matcher
+
+
+def _at_free_slot(**overrides):
+    grammar = SimpleNamespace(matcher=_free_slot_matcher(), is_terminated=lambda: False)
+    return _request(
+        structured_output_request=SimpleNamespace(grammar=grammar), **overrides
+    )
+
+
+def test_a_plain_text_batch_stays_async():
+    plain = _request(structured_output_request=None, num_output_placeholders=4)
+    assert not gaad.needs_sync_step(_scheduler(plain))
+
+
+@pytest.mark.parametrize("make", [_request, _at_free_slot])
+def test_a_planned_request_makes_the_step_sync(make):
+    # Forced or not at its committed state: the grammar may force a token
+    # right after its tokens in flight.
+    request = make(num_output_placeholders=4, spec_token_ids=[-1] * 7)
+    assert gaad.is_planned(request, _manager(), 7)
+    assert gaad.needs_sync_step(_scheduler(request))
+    # Planning still leaves it to the synchronous step.
+    assert plan_request(request, _manager(), 7) is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"structured_output_request": None},
+        {"sampling_params": SimpleNamespace(logprobs=1)},
+        {"max_tokens": 1},
+        {"is_prefill_chunk": True},
+    ],
+)
+def test_a_request_gaad_skips_stays_async(overrides):
+    request = _request(num_output_placeholders=4, **overrides)
+    assert not gaad.needs_sync_step(_scheduler(request))
+
+
+def test_reasoning_stays_async():
+    request = _request(num_output_placeholders=4)
+    assert not gaad.needs_sync_step(_scheduler(request, constraint_start=1))
+
+
+def test_a_terminated_grammar_stays_async():
+    grammar = SimpleNamespace(matcher=_Matcher(), is_terminated=lambda: True)
+    request = _request(
+        num_output_placeholders=4,
+        structured_output_request=SimpleNamespace(grammar=grammar),
+    )
+    assert not gaad.needs_sync_step(_scheduler(request))
+
+
+def test_one_planned_request_makes_the_whole_batch_sync():
+    plain = _request(structured_output_request=None, num_output_placeholders=4)
+    planned = _at_free_slot(num_output_placeholders=4)
+    assert gaad.needs_sync_step(_scheduler(plain, planned))
+
+
+def test_grammar_drafts_are_found():
+    assert gaad.has_grammar_drafts(
+        SimpleNamespace(scheduled_spec_decode_flags={"r": [M, G], "s": [M]})
+    )
+    assert not gaad.has_grammar_drafts(
+        SimpleNamespace(scheduled_spec_decode_flags={"r": [M, M]})
+    )
+
+
+class _Scheduler:
+    def __init__(self, *requests):
+        self.structured_output_manager = _manager()
+        self.num_spec_tokens = 7
+        self.running = list(requests)
+        self.drafts = None
+
+    def has_requests(self) -> bool:
+        return True
+
+    def update_draft_token_ids(self, draft_token_ids) -> None:
+        self.drafts = draft_token_ids
+
+
+def _engine(scheduler, in_flight=None):
+    from collections import deque
+
+    queue = deque()
+    if in_flight is not None:
+        queue.append((None, in_flight, None))
+    return SimpleNamespace(
+        vllm_config=_vllm_config(_DRAFTER, gaad={}),
+        batch_queue=queue,
+        scheduler=scheduler,
+        check_for_draft_tokens=True,
+        model_executor=SimpleNamespace(take_draft_token_ids=lambda: "drafts"),
+    )
+
+
+@pytest.fixture
+def patched_step(monkeypatch):
+    """EngineCore.step_with_batch_queue patched over a stub of the original."""
+    from vllm.v1.engine.core import EngineCore
+
+    calls = []
+
+    def original(self):
+        calls.append(self.scheduler.has_requests())
+        return "outputs", False
+
+    monkeypatch.setattr(EngineCore, "step_with_batch_queue", original)
+    monkeypatch.setattr(EngineCore, "_tpu_gaad_patched", False, raising=False)
+    gaad.patch_engine_core()
+    return EngineCore.step_with_batch_queue, calls
+
+
+def _step_output(structured=True, flags=None, follows_commit=False):
+    return SimpleNamespace(
+        scheduled_spec_decode_flags=flags,
+        gaad_follows_commit=follows_commit,
+        has_structured_output_requests=structured,
+        total_num_scheduled_tokens=8,
+    )
+
+
+def test_the_engine_commits_the_step_in_flight_before_a_sync_step(patched_step):
+    step, calls = patched_step
+    scheduler = _Scheduler(_request(num_output_placeholders=4))
+    engine = _engine(scheduler, _step_output())
+    assert step(engine) == ("outputs", True)
+    # The original only committed the step in flight; the drafts it made
+    # reach the scheduler for the synchronous step.
+    assert calls == [False]
+    assert scheduler.drafts == "drafts"
+    assert scheduler.has_requests()
+    # The next step the scheduler makes is marked for the runner.
+    assert scheduler._tpu_gaad_committed
+
+
+def test_the_engine_schedules_an_async_step_otherwise(patched_step):
+    step, calls = patched_step
+    scheduler = _Scheduler(
+        _request(structured_output_request=None, num_output_placeholders=4)
+    )
+    assert step(_engine(scheduler, _step_output())) == ("outputs", False)
+    assert calls == [True]
+    assert scheduler.drafts is None
+
+
+def test_the_engine_schedules_with_nothing_in_flight(patched_step):
+    step, calls = patched_step
+    scheduler = _Scheduler(_request())
+    assert step(_engine(scheduler)) == ("outputs", False)
+    assert calls == [True]
+
+
+def test_a_draft_row_is_padded_to_the_source_span():
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=4)
+    )
+    drafts = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
+    padded = TPUModelRunner._fit_draft_row(runner, drafts)
+    assert padded.tolist() == [[5, 6, 0, 0], [7, 8, 0, 0]]
+    full = torch.zeros((2, 4), dtype=torch.int32)
+    assert TPUModelRunner._fit_draft_row(runner, full) is full
+
+
+class _Stop(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("flags", "follows_commit", "commits"),
+    [
+        ({"r": [M, G]}, False, True),
+        ({"r": [M, M]}, True, True),
+        ({"r": [M, M]}, False, False),
+        (None, False, False),
+    ],
+)
+def test_the_runner_commits_the_previous_step_after_the_engines_commit(
+    flags, follows_commit, commits
+):
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    calls = []
+
+    def update_states(output):
+        calls.append("update_states")
+        raise _Stop
+
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        _adaptive_verification=None,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        _pre_async_results="previous",
+        _modify_prev_results=lambda: calls.append("commit"),
+        _update_states=update_states,
+    )
+    with pytest.raises(_Stop):
+        TPUModelRunner.execute_model(
+            runner, _step_output(flags=flags, follows_commit=follows_commit)
+        )
+    if commits:
+        assert calls == ["commit", "update_states"]
+        assert runner._pre_async_results is None
+    else:
+        assert calls == ["update_states"]
+        assert runner._pre_async_results == "previous"
+
+
+def test_the_step_after_a_commit_is_marked(monkeypatch):
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    outputs = [
+        SimpleNamespace(total_num_scheduled_tokens=n, scheduled_spec_decode_tokens={})
+        for n in (0, 4, 4)
+    ]
+    monkeypatch.setattr(Scheduler, "schedule", lambda self: outputs.pop(0))
+    monkeypatch.setattr(Scheduler, "_tpu_gaad_patched", False, raising=False)
+    monkeypatch.setattr(
+        SchedulerOutput, "scheduled_spec_decode_flags", None, raising=False
+    )
+    monkeypatch.setattr(SchedulerOutput, "gaad_follows_commit", False, raising=False)
+    gaad.patch_scheduler()
+    scheduler = _scheduler()
+    scheduler._tpu_gaad_committed = True
+    marks = [gaad.follows_commit(Scheduler.schedule(scheduler)) for _ in range(3)]
+    # An empty step leaves the mark for the next step that runs the model.
+    assert marks == [False, True, False]

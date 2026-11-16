@@ -97,6 +97,8 @@ class SpeculativeDecodingManager:
         # (logits_indices, target_logits_indices, padded_logits_length) from
         # the cached build — needed to re-extract draft_token_ids on a hit.
         self._meta_cache_np: tuple[np.ndarray, np.ndarray, int] | None = None
+        # GaaD flags of a step without GRAMMAR drafts, by padded length.
+        self._model_flags: dict[int, torch.Tensor] = {}
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._staged_draft_copy is not None:
@@ -307,10 +309,20 @@ class SpeculativeDecodingManager:
         """Lays out each draft's flag like the drafts; None without GaaD.
 
         With GaaD every verify step passes flags, a request without them
-        having only MODEL drafts, so the rejection samplers keep one graph.
+        having only MODEL drafts, so the rejection samplers keep one graph. A
+        step without GRAMMAR drafts reuses one device tensor per length; the
+        samplers read only which drafts are GRAMMAR.
         """
         if not gaad.is_enabled(self.runner.vllm_config):
             return None
+        if not (flat_flags == gaad.DRAFT_FLAG_GRAMMAR).any():
+            flags = self._model_flags.get(padded_logits_length)
+            if flags is None:
+                flags = torch.full(
+                    (padded_logits_length,), gaad.DRAFT_FLAG_MODEL, dtype=torch.int32
+                ).to(self.runner.device)
+                self._model_flags[padded_logits_length] = flags
+            return flags
         padded_draft_flags = np.zeros(padded_logits_length, dtype=np.int32)
         padded_draft_flags[: flat_flags.shape[0]] = flat_flags
         return torch.from_numpy(padded_draft_flags).to(

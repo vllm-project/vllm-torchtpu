@@ -20,9 +20,13 @@ accepts a ``GRAMMAR`` slot without comparing it with the target, and a rejected
 ``MODEL`` slot ahead of it still rejects it, as it rejects every later slot.
 
 Each row is planned in ``Scheduler.schedule()``, before the step is dispatched,
-from the grammar state after the previous step's tokens and from the drafter's
-proposal for this step. Both are on the host only with async scheduling off, so
-GaaD turns async scheduling off (``check_config``).
+from the grammar state after the request's last token and from the drafter's
+proposal for this step. With async scheduling both are on the host only once
+the step in flight is committed, so while a running request is one GaaD plans
+rows for, each step runs synchronously: the engine first commits the step in
+flight (``patch_engine_core``), and the runner reads the scheduler's tokens and
+drafts instead of the device's. Every other step stays async; a batch without
+structured output never waits.
 
 GaaD is on when ``--additional-config`` has a ``gaad`` entry, for example
 ``{"gaad": {"draft_tokens": 3}}``. A row has ``num_speculative_tokens`` slots.
@@ -101,7 +105,13 @@ def draft_limit(vllm_config: VllmConfig) -> int:
 
 
 def check_config(vllm_config: VllmConfig) -> None:
-    """Validates a GaaD configuration and turns async scheduling off for it."""
+    """Validates a GaaD configuration.
+
+    Async scheduling stays on with a drafter that drafts on the device; GaaD
+    makes only its own steps synchronous (``patch_engine_core``). Without one
+    (GaaD alone, or a host drafter such as ngram) the runner has no device
+    drafts to feed async steps, so async scheduling is turned off.
+    """
     speculative_config = vllm_config.speculative_config
     options = _options(vllm_config)
     if options is None:
@@ -136,10 +146,10 @@ def check_config(vllm_config: VllmConfig) -> None:
             f"1 to num_speculative_tokens ({k}), got {draft_tokens!r}."
         )
     scheduler_config = vllm_config.scheduler_config
-    if scheduler_config.async_scheduling:
+    if scheduler_config.async_scheduling and not speculative_config.use_eagle():
         logger.warning(
-            "GaaD plans each draft row from the previous step's tokens on the "
-            "host; turning async scheduling off."
+            "GaaD without a drafter that drafts on the device runs every step "
+            "synchronously; turning async scheduling off."
         )
         scheduler_config.async_scheduling = False
 
@@ -237,20 +247,18 @@ def _has_penalties(sampling_params: Any) -> bool:
     )
 
 
-def plan_request(
-    request: Any, structured_output_manager: Any, k: int, limit: int | None = None
-) -> list[int] | None:
-    """Replaces ``request.spec_token_ids`` with its GaaD row; returns its flags.
+def _grammar_cursor(
+    request: Any, structured_output_manager: Any, k: int
+) -> tuple[GrammarCursor, int] | None:
+    """The cursor at ``request``'s committed grammar state and its row budget.
 
-    The row keeps at most ``limit`` of the drafter's tokens (all when None).
-
-    Returns None, leaving the drafts as they are, for a request GaaD skips: one
-    still prefilling, whose grammar does not constrain its next token (it has
-    none, it is not xgrammar, or reasoning has not ended), or that reports
-    logprobs or applies penalties (a ``GRAMMAR`` slot has no target logits row
-    to report or penalize).
+    None for a request GaaD skips: one still prefilling, whose grammar does
+    not constrain its next token (it has none, it is not xgrammar, or
+    reasoning has not ended), that reports logprobs or applies penalties (a
+    ``GRAMMAR`` slot has no target logits row to report or penalize), or that
+    has no room left for a draft.
     """
-    if request.is_prefill_chunk or request.num_output_placeholders:
+    if request.is_prefill_chunk:
         return None
     structured = request.structured_output_request
     if structured is None:
@@ -269,14 +277,72 @@ def plan_request(
     budget = min(k, request.max_tokens - request.num_output_tokens - 1)
     if budget <= 0:
         return None
+    return GrammarCursor(matcher, structured_output_manager.tokenizer), budget
+
+
+def plan_request(
+    request: Any, structured_output_manager: Any, k: int, limit: int | None = None
+) -> list[int] | None:
+    """Replaces ``request.spec_token_ids`` with its GaaD row; returns its flags.
+
+    The row keeps at most ``limit`` of the drafter's tokens (all when None).
+
+    Returns None, leaving the drafts as they are, for a request GaaD skips
+    (``_grammar_cursor``) and for one with tokens in flight, whose grammar
+    state lags its tokens.
+    """
+    if request.num_output_placeholders:
+        return None
+    start = _grammar_cursor(request, structured_output_manager, k)
+    if start is None:
+        return None
+    cursor, budget = start
     model_draft = request.spec_token_ids[:limit]
-    cursor = GrammarCursor(matcher, structured_output_manager.tokenizer)
     try:
         tokens, flags = plan_draft_row(model_draft, cursor, budget)
     finally:
         cursor.rollback()
     request.spec_token_ids = tokens
     return flags
+
+
+def is_planned(request: Any, structured_output_manager: Any, k: int) -> bool:
+    """Whether GaaD plans ``request``'s rows, its tokens in flight aside."""
+    return _grammar_cursor(request, structured_output_manager, k) is not None
+
+
+def has_grammar_drafts(scheduler_output: Any) -> bool:
+    """Whether a scheduled step carries a ``GRAMMAR`` draft."""
+    flags = getattr(scheduler_output, "scheduled_spec_decode_flags", None) or {}
+    return any(DRAFT_FLAG_GRAMMAR in row for row in flags.values())
+
+
+def follows_commit(scheduler_output: Any) -> bool:
+    """Whether a step was scheduled with no step in flight to substitute from.
+
+    So is a step the engine scheduled right after committing the step in
+    flight (``patch_engine_core``): the scheduler's counts are exact, not
+    ahead by the drafts of a step in flight, and its drafts are on the host.
+    A step with grammar drafts always is one.
+    """
+    return bool(
+        getattr(scheduler_output, "gaad_follows_commit", False)
+    ) or has_grammar_drafts(scheduler_output)
+
+
+def needs_sync_step(scheduler: Any) -> bool:
+    """Whether the step in flight is committed before the next is scheduled.
+
+    As in rvllm, per batch: it is while a running request is one GaaD plans
+    rows for. Its next row may carry grammar drafts as soon as the grammar
+    forces a token, which can start within the step in flight; judging it on
+    the state before those tokens would leave the first step of each forced
+    run without grammar drafts, and a JSON-like grammar starts one after
+    nearly every value. A batch without such a request stays async.
+    """
+    manager = scheduler.structured_output_manager
+    k = scheduler.num_spec_tokens
+    return any(is_planned(request, manager, k) for request in scheduler.running)
 
 
 def plan_running_requests(scheduler: Any) -> dict[str, list[int]]:
@@ -312,8 +378,10 @@ def patch_scheduler() -> None:
 
     The scheduler sends the flags of each scheduled row to the runner as
     ``SchedulerOutput.scheduled_spec_decode_flags``; a request without flags
-    has only ``MODEL`` drafts. Whether GaaD is on comes from each scheduler's
-    config, so the patch is installed always and does nothing when it is off.
+    has only ``MODEL`` drafts. ``SchedulerOutput.gaad_follows_commit`` marks
+    the first step after the engine committed the step in flight. Whether GaaD
+    is on comes from each scheduler's config, so the patch is installed always
+    and does nothing when it is off.
     """
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -321,21 +389,76 @@ def patch_scheduler() -> None:
     if getattr(Scheduler, "_tpu_gaad_patched", False):
         return
     SchedulerOutput.scheduled_spec_decode_flags = None
+    SchedulerOutput.gaad_follows_commit = False
     original_schedule = Scheduler.schedule
 
     def schedule(self: Any, *args: Any, **kwargs: Any) -> Any:
         if not is_enabled(self.vllm_config):
             return original_schedule(self, *args, **kwargs)
         flags_by_req = plan_running_requests(self)
-        # Any: vLLM's SchedulerOutput does not declare the flags field added
-        # above; the runner reads it with getattr.
+        # Any: vLLM's SchedulerOutput does not declare the fields added
+        # above; the runner reads them with getattr.
         output: Any = original_schedule(self, *args, **kwargs)
         if flags_by_req:
             output.scheduled_spec_decode_flags = scheduled_flags(
                 flags_by_req, output.scheduled_spec_decode_tokens
             )
+        # The first step the runner executes after a commit of the engine's.
+        if output.total_num_scheduled_tokens and getattr(
+            self, "_tpu_gaad_committed", False
+        ):
+            output.gaad_follows_commit = True
+            self._tpu_gaad_committed = False
         return output
 
     Scheduler.schedule = schedule
     Scheduler._tpu_gaad_patched = True
     logger.info("Applied TPU patch: GaaD draft rows in Scheduler.schedule.")
+
+
+def patch_engine_core() -> None:
+    """Commits the step in flight before a step GaaD may plan grammar drafts for.
+
+    The engine then schedules the next step with nothing in flight, so GaaD
+    plans it from the committed grammar state and the drafter's host drafts,
+    as with async scheduling off. Async scheduling only: without it every step
+    is committed before the next anyway. Whether GaaD is on comes from each
+    engine's config, so the patch is installed always and does nothing when it
+    is off.
+    """
+    from vllm.v1.engine.core import EngineCore
+
+    if getattr(EngineCore, "_tpu_gaad_patched", False):
+        return
+    original_step = EngineCore.step_with_batch_queue
+
+    def step_with_batch_queue(self: Any) -> Any:
+        queue = self.batch_queue
+        # The queue holds at most the one step in flight here.
+        if (
+            not queue
+            or not is_enabled(self.vllm_config)
+            or not needs_sync_step(self.scheduler)
+        ):
+            return original_step(self)
+        in_flight = queue[-1][1]
+        scheduler = self.scheduler
+        # With nothing to schedule, the original only waits for the step in
+        # flight and commits it.
+        scheduler.has_requests = lambda: False
+        try:
+            outputs, _ = original_step(self)
+        finally:
+            del scheduler.has_requests
+        scheduler._tpu_gaad_committed = True
+        # The runner keeps a host copy of a structured step's drafts.
+        if self.check_for_draft_tokens and in_flight.has_structured_output_requests:
+            draft_token_ids = self.model_executor.take_draft_token_ids()
+            if draft_token_ids is not None:
+                scheduler.update_draft_token_ids(draft_token_ids)
+        # The step ran a model; False would make the engine loop sleep.
+        return outputs, in_flight.total_num_scheduled_tokens > 0
+
+    EngineCore.step_with_batch_queue = step_with_batch_queue
+    EngineCore._tpu_gaad_patched = True
+    logger.info("Applied TPU patch: GaaD synchronous steps in EngineCore.")
