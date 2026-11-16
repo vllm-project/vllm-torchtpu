@@ -42,8 +42,8 @@ warmest-first admission, each step this scheduler:
   decode-step time, so the rule only acts when clients set ``max_tokens`` and
   ``ignore_eos`` (as AgentX does). Any pending prefill, short prompts too, is
   priced as a long-chunk step: the next step may admit a long one. Unlike the
-  fixed debt, prefill then runs as soon as every such request can afford the
-  step. At most ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are
+  fixed debt, prefill then runs as soon as every such request's slack covers
+  ``VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON`` times that step's extra time. At most ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are
   deferred this way. With ``VLLM_TPU_PREFILL_TPOT_PRICED`` such a step is not
   decode-only when a shorter step fits: it runs, in the scheduler's order
   (running chunks, then the waiting window, each shortest first), the whole
@@ -96,6 +96,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.tpot_target_s = envs.VLLM_TPU_PREFILL_TPOT_TARGET_MS / 1e3
         self.max_hold_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S
         self.priced = envs.VLLM_TPU_PREFILL_TPOT_PRICED
+        self.hold_horizon = envs.VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON
         # Decoding request id -> when it was first scheduled to decode, and
         # its output tokens at the previous step (TPOT projection).
         self._decode_t0: dict[str, float] = {}
@@ -268,7 +269,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             # prefill for it cannot bring it back under.
             if slack_s > 0:
                 self._slack_s = min(self._slack_s, slack_s)
-        return self._slack_s < long_s - decode_s
+        return self._slack_s < self.hold_horizon * (long_s - decode_s)
 
     def _fit_tokens(self) -> int:
         """Largest prefill-token bin whose measured step fits the slack."""

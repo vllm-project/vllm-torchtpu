@@ -194,6 +194,19 @@ def test_tpot_target_defers_prefill_only_for_a_decoder_short_of_slack(
     assert scheduled == ({"dec"} if held else {"dec", "long"})
 
 
+@pytest.mark.parametrize(("horizon", "held"), [(1.0, False), (1.5, True)])
+def test_hold_horizon_scales_the_long_step_price(
+    model_config, monkeypatch, horizon, held
+):
+    # 2.5 s of slack against a 1.96 s longer long-chunk step.
+    scheduler, _, _ = _tpot_scheduler(
+        model_config, monkeypatch, target_ms=50.0, long_s=2.0
+    )
+    scheduler.hold_horizon = horizon
+    scheduled = set(scheduler.schedule().num_scheduled_tokens)
+    assert scheduled == ({"dec"} if held else {"dec", "long"})
+
+
 def test_tpot_target_defers_prefill_at_most_max_hold(model_config, monkeypatch):
     # 3 s of slack, a 4.96 s longer long-chunk step: held until max_hold_s.
     scheduler, clock, _ = _tpot_scheduler(

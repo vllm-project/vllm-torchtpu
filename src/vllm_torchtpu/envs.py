@@ -232,6 +232,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
+    VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON: float = 1.0
 
 
 def env_with_choices(
@@ -1424,6 +1425,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whole remaining prefills up to the largest prefill-token bin (512-4096)
     # whose measured step time fits every decoding request's slack.
     "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED"),
+    # PrefillSpacingScheduler: the TPOT target defers prefill while a decoding
+    # request's slack is below this many long-chunk step prices (long minus
+    # decode step time). Above 1 it also covers the step async scheduling has
+    # already queued when the decision is made.
+    "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON", 1.0
+    ),
 }
 
 
