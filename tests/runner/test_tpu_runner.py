@@ -80,6 +80,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
+    AsyncTPUModelRunnerOutput,
 )
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
@@ -3804,16 +3805,19 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     assert not (flat_logits.float().gather(-1, skip.long()) >= fifth).all()
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("max_logprobs", [None, 0, 3])
 def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
-    monkeypatch, max_logprobs
+    monkeypatch, max_logprobs, async_scheduling
 ):
     """Each decode chunk's gathered logprobs ride the async output copy as one
     chunk with a row per real request, in chunk order, and the step's
     logprobs equal what the former blocking per-step copy built from the same
     device tensors, for two decode chunks with padded rows and a discarded
     request. Without logprobs requested, nothing is gathered and the output's
-    logprobs stay None."""
+    logprobs stay None. With async scheduling, sample_tokens returns before
+    anything waits on the copy, and get_output() then returns the tokens and
+    logprobs of the synchronous step."""
     monkeypatch.setattr(
         torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
     )
@@ -3839,10 +3843,13 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
 
     gathered = []
 
-    def run():
+    def run(async_scheduling):
+        captured.clear()
+        gathered.clear()
         runner = _sample_tokens_runner(
             logits_list,
             num_reqs_list,
+            scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
             model_config=SimpleNamespace(max_logprobs=max_logprobs),
             # Temperature 0: every row samples its argmax, whatever the noise.
             _build_padded_sampling_params=lambda start, end, logits: (
@@ -3870,7 +3877,16 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
         runner.gather_logprobs = recording_gather_logprobs
         return TPUModelRunner.sample_tokens(runner, None)
 
-    deferred = run()
+    deferred = run(async_scheduling)
+    if async_scheduling:
+        # Nothing has waited on the copy yet; get_output() does.
+        assert isinstance(deferred, AsyncTPUModelRunnerOutput)
+        copy_state = deferred.copy_state
+        assert not copy_state.completed
+        assert copy_state.copy_ready_event.synchronized == 0
+        deferred = deferred.get_output()
+        assert copy_state.completed
+        assert copy_state.copy_ready_event.synchronized == 1
     argmax = [
         [int(t)]
         for logits, n in zip(logits_list, num_reqs_list)
@@ -3882,17 +3898,24 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
     if max_logprobs is None:
         assert chunks == [] and gathered == []
         assert deferred.logprobs is None
-        return
-    # The copied chunks are the gathered device tensors, with one row start
-    # per real request, in chunk order.
-    assert len(chunks) == len(gathered) == len(num_reqs_list)
-    for chunk, tensors, n in zip(chunks, gathered, num_reqs_list):
-        assert chunk.tensors is tensors
-        assert np.array_equal(chunk.row_starts, np.arange(n))
-    assert deferred.logprobs.logprob_token_ids.shape == (6, max_logprobs + 1)
-    _assert_same_logprobs_lists(
-        deferred.logprobs, _blocking_logprobs_lists(zip(gathered, num_reqs_list))
-    )
+    else:
+        # The copied chunks are the gathered device tensors, with one row
+        # start per real request, in chunk order.
+        assert len(chunks) == len(gathered) == len(num_reqs_list)
+        for chunk, tensors, n in zip(chunks, gathered, num_reqs_list):
+            assert chunk.tensors is tensors
+            assert np.array_equal(chunk.row_starts, np.arange(n))
+        assert deferred.logprobs.logprob_token_ids.shape == (6, max_logprobs + 1)
+        _assert_same_logprobs_lists(
+            deferred.logprobs, _blocking_logprobs_lists(zip(gathered, num_reqs_list))
+        )
+    if async_scheduling:
+        synchronous = run(async_scheduling=False)
+        assert deferred.sampled_token_ids == synchronous.sampled_token_ids
+        if max_logprobs is None:
+            assert synchronous.logprobs is None
+        else:
+            _assert_same_logprobs_lists(deferred.logprobs, synchronous.logprobs)
 
 
 def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):

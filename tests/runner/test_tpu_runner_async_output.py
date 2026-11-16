@@ -335,22 +335,37 @@ def test_get_output_leaves_logprobs_none(num_rows, logprobs):
 
 
 def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
-    monkeypatch.setattr(torch, "tpu", SimpleNamespace(Event=MagicMock), raising=False)
+    calls = []
+    event = MagicMock()
+    event.record.side_effect = lambda: calls.append("event.record")
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
+    )
+    to_cpu_nonblocking = LogprobsTensors.to_cpu_nonblocking
+    host_copies = []
+
+    def spy_to_cpu_nonblocking(tensors):
+        calls.append("logprobs.to_cpu_nonblocking")
+        host_copies.append(to_cpu_nonblocking(tensors))
+        return host_copies[-1]
+
+    monkeypatch.setattr(LogprobsTensors, "to_cpu_nonblocking", spy_to_cpu_nonblocking)
     tokens = [torch.zeros((8, 1), dtype=torch.int32)]
     device_logprobs = _bucketed_logprobs(8, 2, 3)
     state = AsyncTPUCopyState.from_device_chunks(
         tokens, [5], logprobs=[LogprobsChunk(device_logprobs, np.arange(5))]
     )
-    # The host copies ride the same async D2H as the sampled tokens; the
-    # device sources stay alive until the copy event is waited on.
+    # The logprobs copy is issued before the copy event is recorded, so the
+    # wait on that event covers it, and the state keeps the host copy. The
+    # device sources stay alive until the event is waited on.
+    assert calls == ["logprobs.to_cpu_nonblocking", "event.record"]
     (host,) = state.logprobs
+    assert host.tensors is host_copies[0]
     assert np.array_equal(host.row_starts, np.arange(5))
-    assert torch.equal(host.tensors.logprobs, device_logprobs.logprobs)
     assert state._logprobs_tpu is not None
     assert state._logprobs_tpu[0] is device_logprobs
-    state.copy_ready_event.record.assert_called_once_with()
     state.wait()
-    state.copy_ready_event.synchronize.assert_called_once_with()
+    event.synchronize.assert_called_once_with()
     assert state._logprobs_tpu is None
     empty = AsyncTPUCopyState.from_device_chunks(tokens, [5])
     assert empty.logprobs is None and empty._logprobs_tpu is None
@@ -358,3 +373,52 @@ def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
     short = LogprobsChunk(device_logprobs, np.arange(4))
     with pytest.raises(AssertionError):
         AsyncTPUCopyState.from_device_chunks(tokens, [5], logprobs=[short])
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_logprobs", [0, 2])
+@pytest.mark.parametrize("real_rows", [[5], [8, 3]])
+def test_deferred_logprobs_from_device_match_a_blocking_cpu_copy(
+    device, real_rows, num_logprobs
+):
+    """Bucketed logprobs on the device, copied by from_device_chunks next to
+    the sampled tokens: get_output() returns the same rows, values and dtypes
+    as a blocking .cpu() copy of the same device tensors, cut to the real
+    rows and concatenated the way sample_tokens did before the copy was
+    deferred."""
+    tokens = [
+        (torch.arange(8, dtype=torch.int32).view(8, 1) + 100 * i).to(device)
+        for i in range(len(real_rows))
+    ]
+    on_device = [
+        LogprobsTensors(
+            *(t.to(device) for t in _bucketed_logprobs(8, num_logprobs, seed)[:3])
+        )
+        for seed in range(len(real_rows))
+    ]
+    state = AsyncTPUCopyState.from_device_chunks(
+        tokens,
+        real_rows,
+        logprobs=[LogprobsChunk(t, np.arange(n)) for t, n in zip(on_device, real_rows)],
+    )
+    # Host tensors from the start; get_output() reads them after it waits.
+    assert all(c.tensors.logprobs.device.type == "cpu" for c in state.logprobs)
+    req_ids = [f"r{i}" for i in range(sum(real_rows))]
+    out = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={r: i for i, r in enumerate(req_ids)},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=state,
+        discard_sampled_tokens_req_indices=[],
+    ).get_output()
+    blocking = [
+        (LogprobsTensors(*(x.cpu() for x in t[:3])), n)
+        for t, n in zip(on_device, real_rows)
+    ]
+    _assert_same_logprobs_lists(out.logprobs, _blocking_logprobs_lists(blocking))
+    assert out.sampled_token_ids == [
+        [100 * i + j] for i, n in enumerate(real_rows) for j in range(n)
+    ]

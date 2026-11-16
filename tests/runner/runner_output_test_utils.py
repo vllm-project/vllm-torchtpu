@@ -34,7 +34,9 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
     one scheduled token and no output yet, and they sample greedily (the
     argmax). Keyword arguments replace runner attributes; tests change the
     nested state (`execute_model_state`, `input_batch`, `requests`) on the
-    returned runner."""
+    returned runner. With `scheduler_config` overridden to async scheduling,
+    the step parks its tokens through the runner's own `_update_placeholder`
+    and returns before the copy is waited on."""
     req_ids = [f"r{i}" for i in range(sum(num_reqs_list))]
     runner = SimpleNamespace(
         execute_model_state=SimpleNamespace(
@@ -67,7 +69,9 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
             generators={},
         ),
         requests={
-            r: SimpleNamespace(num_computed_tokens=0, num_tokens=1, output_token_ids=[])
+            r: SimpleNamespace(
+                req_id=r, num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+            )
             for r in req_ids
         },
         num_prompt_logprobs={},
@@ -99,6 +103,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",
+        "_update_placeholder",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     for name, value in overrides.items():
