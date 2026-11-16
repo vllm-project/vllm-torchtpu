@@ -24,10 +24,12 @@ import pytest
 if TYPE_CHECKING:
     from vllm_torchtpu.roofline.modules import ModuleCost
 
+import vllm_torchtpu.roofline as rf
 from vllm_torchtpu.roofline import (
     CHIPS,
     Dtypes,
     Parallel,
+    SeqKvLayout,
     StepShape,
     dtypes_from_hf_config,
     from_hf_config,
@@ -595,6 +597,126 @@ def test_pcp_moe_global_rows_and_flops_conservation() -> None:
     exp_ed = ep_busiest_experts(64, 8, (4 + 8 * 2) * 2, 8)
     exp_w_bytes = exp_ed * float(4 * 3 * 2048 * 1024) * 1.0 + router_elems * 1.0
     assert moe_mix.hbm_bytes == pytest.approx(exp_w_bytes, rel=1e-06)
+
+
+def test_nope_mla_zero_rope_dim_and_compress_ratios() -> None:
+    """Verify NoPE-MLA costing with zero rope dim and compression ratio."""
+    nope_mla_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 4,
+        "layer_types": ["mla"] * 4,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "q_lora_rank": 1024,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 0,
+        "v_head_dim": 128,
+        "intermediate_size": 8192,
+        "vocab_size": 64000,
+    }
+    geom_uncomp = rf.from_hf_config(nope_mla_cfg)
+    assert geom_uncomp.qk_rope_head_dim == 0
+    geom_comp = rf.from_hf_config(
+        {**nope_mla_cfg, "compress_ratios": [4.0, 0.5, 1.0, 1.0]}
+    )
+    assert geom_comp.compress_ratios == (4.0, 0.5, 1.0, 1.0)
+    par = Parallel(tp=4)
+    dt = Dtypes(kv=1.0)
+    shape = StepShape(batch=4, rows_per_seq=1, context=4096)
+    mods_u = {m.name: m for m in pass_costs(geom_uncomp, par, shape, dt)}
+    mods_c = {m.name: m for m in pass_costs(geom_comp, par, shape, dt)}
+    mods_ctx0 = {
+        m.name: m
+        for m in pass_costs(
+            geom_uncomp, par, StepShape(batch=4, rows_per_seq=1, context=0), dt
+        )
+    }
+    kv_traffic_u = mods_u["mla"].hbm_bytes - mods_ctx0["mla"].hbm_bytes
+    kv_traffic_c = mods_c["mla"].hbm_bytes - mods_ctx0["mla"].hbm_bytes
+    assert kv_traffic_c == pytest.approx(kv_traffic_u * (2.75 / 4.0), rel=1e-09)
+    bd_u = rf.hbm_breakdown_per_core_bytes(geom_uncomp, dt, par, SeqKvLayout(4, 4096))
+    bd_c = rf.hbm_breakdown_per_core_bytes(geom_comp, dt, par, SeqKvLayout(4, 4096))
+    assert bd_c.kv == pytest.approx(bd_u.kv * (2.75 / 4.0), rel=1e-09)
+    with pytest.raises(ValueError, match="compress_ratios"):
+        rf.from_hf_config({**nope_mla_cfg, "compress_ratios": [2.0, 2.0]})
+    with pytest.raises(ValueError, match="compress_ratios"):
+        rf.from_hf_config({**nope_mla_cfg, "compress_ratios": [2.0, 0.0, 1.0, 1.0]})
+    with pytest.raises(ValueError, match="qk_rope_head_dim"):
+        pass_costs(
+            rf.from_hf_config({**nope_mla_cfg, "qk_rope_head_dim": -1}), par, shape, dt
+        )
+    with pytest.raises(ValueError, match="qk_rope_head_dim"):
+        rf.hbm_breakdown_per_core_bytes(
+            rf.from_hf_config({**nope_mla_cfg, "qk_rope_head_dim": -1}),
+            dt,
+            par,
+            SeqKvLayout(1, 1024),
+        )
+
+
+def test_mxu_m_tile_systolic_duty_cycle_on_sparse_moe() -> None:
+    """Verify MXU M-tile systolic duty cycle scaling on sparse MoE."""
+    geom = from_hf_config(QWEN35_CFG)
+    par = Parallel(tp=8)
+    dt = Dtypes(w_expert=1.0, act="a8")
+    shape = StepShape(batch=1, rows_per_seq=1, context=0)
+    mods_unpad = {m.name: m for m in pass_costs(geom, par, shape, dt, mxu_m_tile=1)}
+    mods_pad = {m.name: m for m in pass_costs(geom, par, shape, dt, mxu_m_tile=256)}
+    assert mods_pad["moe"].hbm_bytes == pytest.approx(
+        mods_unpad["moe"].hbm_bytes, rel=1e-12
+    )
+    shared_fp8 = 2.0 * 1.0 * float(60 * 3 * 4096 * (1024 // 8))
+    routed_unpad = mods_unpad["moe"].fp8_flops - shared_fp8
+    routed_pad = mods_pad["moe"].fp8_flops - shared_fp8
+    assert routed_pad == pytest.approx(routed_unpad * 256.0, rel=1e-09)
+    assert routed_pad < routed_unpad * 256.0 * (20.0 / 10.0)
+    par_ep = Parallel(tp=8, ep=8, moe="ep")
+    ep_unpad = {m.name: m for m in pass_costs(geom, par_ep, shape, dt, mxu_m_tile=1)}
+    ep_pad = {m.name: m for m in pass_costs(geom, par_ep, shape, dt, mxu_m_tile=256)}
+    ep_routed_unpad = ep_unpad["moe"].fp8_flops - shared_fp8
+    ep_routed_pad = ep_pad["moe"].fp8_flops - shared_fp8
+    assert ep_routed_pad == pytest.approx(ep_routed_unpad * 256.0, rel=1e-09)
+
+
+def test_block_parallel_sp_collectives_per_moe_dispatch() -> None:
+    """Verify SP residual collectives per dispatch mode under block parallelism."""
+    cfg = {
+        "architectures": ["Qwen2MoeForCausalLM"],
+        "hidden_size": 2048,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "num_hidden_layers": 2,
+        "num_experts": 16,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 1024,
+        "intermediate_size": 4096,
+        "vocab_size": 32000,
+        "block_parallel": 2,
+    }
+    geom = from_hf_config(cfg)
+    shape = StepShape(batch=1, rows_per_seq=4)
+    dt = Dtypes()
+    par_ar = Parallel(tp=8, residual="sp", moe="ep", moe_dispatch="allreduce")
+    costs_ar = pass_costs(geom, par_ar, shape, dt)
+    attn_ar = next(m for m in costs_ar if m.name == "gqa")
+    moe_ar = next(m for m in costs_ar if m.name == "moe")
+    assert "out_rs" not in {c.name for c in attn_ar.collectives}
+    assert "dispatch_ag" not in {c.name for c in moe_ar.collectives}
+    assert "combine_rs" in {c.name for c in moe_ar.collectives}
+    par_push = Parallel(tp=8, residual="sp", moe="ep", moe_dispatch="a2a_push")
+    costs_push = pass_costs(geom, par_push, shape, dt)
+    attn_push = next(m for m in costs_push if m.name == "gqa")
+    moe_push = next(m for m in costs_push if m.name == "moe")
+    assert "out_rs" in {c.name for c in attn_push.collectives}
+    assert "dispatch_push" in {c.name for c in moe_push.collectives}
+    par_ag = Parallel(tp=8, residual="sp", moe="ep", moe_dispatch="ag_ep")
+    costs_ag = pass_costs(geom, par_ag, shape, dt)
+    attn_ag = next(m for m in costs_ag if m.name == "gqa")
+    moe_ag = next(m for m in costs_ag if m.name == "moe")
+    assert "out_rs" in {c.name for c in attn_ag.collectives}
+    assert "dispatch_ag" in {c.name for c in moe_ag.collectives}
 
 
 def test_dense_four_bit_weights_charge_unpack() -> None:
