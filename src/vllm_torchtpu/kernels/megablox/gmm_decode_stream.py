@@ -52,11 +52,21 @@ _SUB = 16  # bf16 sublane tiling of lhs / out rows
 _ACT_COLS = 512  # columns per activation / output-merge step
 
 
-def _buckets(max_rows: int) -> tuple[int, ...]:
-    """Row buckets one expert's rows (plus <= _SUB - 1 alignment rows) use."""
-    cap = _gmm.align_to(max_rows + _SUB - 1, _SUB)
-    out = [b for b in (16, 32, 64, 128, 256, 512) if b < cap]
-    return (*out, cap)
+def plan(size_m: int, max_group_size: int | None) -> tuple[tuple[int, ...], int | None]:
+    """(row buckets of one entry, first bucket fed bf16-dequantized or None).
+
+    An entry is a group's rows, split as gmm_v2 splits groups into tiles of
+    at most buckets[-1] rows counted from the 16-row slab start. Up to
+    FP8_SMALL_DECODE_MAX_M rows gmm_v2 feeds every tile fp8 (rows are
+    independent, so any bucket gives its results). Above it, gmm_v2's tiles
+    are 128 rows with buckets 16/32/48 on the fp8 feed and 128 dequantized to
+    bf16 before the matmul; the same split and feeds are used here.
+    """
+    max_rows = min(max_group_size or size_m, size_m)
+    if size_m <= _gmm.FP8_SMALL_DECODE_MAX_M:
+        cap = min(_gmm.align_to(max_rows + _SUB - 1, _SUB), 128)
+        return (*[b for b in (16, 32, 64) if b < cap], cap), None
+    return tuple(_gmm.FP8_DECODE_BUCKETS), _gmm.FP8_DECODE_TILE_M
 
 
 def parse_spec(raw: str) -> tuple[int, int, int] | None:
@@ -75,7 +85,10 @@ def parse_spec(raw: str) -> tuple[int, int, int] | None:
     slots = parts[1] if len(parts) > 1 else 4
     if chunk % _QB or slots < 2:
         raise ValueError(f"TPU_GMM_V2_DECODE_STREAM={raw!r}: chunk % 128, slots >= 2")
-    return chunk, slots, int(max_m) if max_m else 512
+    max_m = int(max_m) if max_m else 512
+    if max_m > _gmm.FP8_DECODE_MAX_M:
+        raise ValueError(f"TPU_GMM_V2_DECODE_STREAM={raw!r}: max size_m <= 2048")
+    return chunk, slots, max_m
 
 
 def eligible(
@@ -126,38 +139,42 @@ def _kernel(
     # Out (HBM)
     out_hbm,  # [Mp, N] out dtype
     # Scratch
-    z_ref,  # VMEM [K1 / chunk, Mp + MCAP, chunk] bf16: lhs k-slices, h at row HROW
-    a_ref,  # VMEM [2 * MCAP, N] f32: gate_up acc rows [0, MCAP), down acc after
-    o_ref,  # VMEM [Mp + MCAP, N] out dtype
+    x_ref,  # VMEM [3, K1 / chunk, MCAP, chunk] bf16: lhs rows of 2 entries, h
+    a_ref,  # VMEM [2, MCAP, N] f32: gate_up acc, down acc
+    o_ref,  # VMEM [2, MCAP + 16, N] out dtype: output rows of 2 entries
+    cs_ref,  # VMEM [16, N] out dtype: the open 16-row output slab
     w_ref,  # VMEM [slots, chunk, N] fp4
     s_ref,  # VMEM [slots, chunk / 128, 1, N] f32
-    hit_ref,  # SMEM [3, G] int32: group, row offset, rows of each hit group
-    cnt_ref,  # SMEM [2] int32: hits, out rows written
+    ent_ref,  # SMEM [3, max entries] int32: group, first row, rows
+    cnt_ref,  # SMEM [3] int32: entries, out DMA rows of entry slot 0 / 1
     wsem,  # DMA [slots, 2]
-    iosem,  # DMA [2]
+    xsem,  # DMA [2]
+    osem,  # DMA [2]
     *,
     num_groups: int,
     chunk: int,
     slots: int,
     buckets: tuple[int, ...],
+    bf16_from: int | None,
     fuse_act: str,
     w_load: str = "tile",
 ):
     k1 = lhs_hbm.shape[1]
     n = w1_hbm.shape[2]
     f = w2_hbm.shape[1]
-    mp = lhs_hbm.shape[0]
     mcap = buckets[-1]
-    hrow = mp
     c1 = k1 // chunk
     ce = c1 + f // chunk
     kbc = chunk // _QB
     act_cols = math.gcd(chunk, _ACT_COLS)
+    h_slot = 2
 
-    # Hit groups in row order, as fill_metadata lays them out.
+    # Entries in row order: each hit group split as gmm_v2's fill_metadata
+    # splits it into tiles of at most mcap rows from the slab start.
     group_offset = go_ref[0]
     cnt_ref[0] = 0
     cnt_ref[1] = 0
+    cnt_ref[2] = 0
 
     def scan(lg, m_off):
         g = lg - group_offset
@@ -165,27 +182,44 @@ def _kernel(
 
         @pl.when(jnp.logical_and(size > 0, g >= 0))
         def _():
-            h = cnt_ref[0]
-            hit_ref[0, h] = g
-            hit_ref[1, h] = m_off
-            hit_ref[2, h] = size
-            cnt_ref[0] = h + 1
+            lo = m_off % _SUB
+            first = jnp.minimum(mcap - lo, size)
+            pieces = 1 + pl.cdiv(size - first, mcap)
+
+            def piece(p, cur):
+                rows = jnp.minimum(mcap - cur % _SUB, m_off + size - cur)
+                k = cnt_ref[0]
+                ent_ref[0, k] = g
+                ent_ref[1, k] = cur
+                ent_ref[2, k] = rows
+                cnt_ref[0] = k + 1
+                return cur + rows
+
+            lax.fori_loop(0, pieces, piece, m_off)
 
         return m_off + size
 
-    end_rows = lax.fori_loop(0, group_offset + num_groups, scan, jnp.int32(0))
-    num_hit = cnt_ref[0]
-    num_chunks = num_hit * ce
-    lhs_rows = pl.multiple_of(pl.cdiv(end_rows, _SUB) * _SUB, _SUB)
+    lax.fori_loop(0, group_offset + num_groups, scan, jnp.int32(0))
+    num_ent = cnt_ref[0]
+    num_chunks = num_ent * ce
 
-    def lhs_copies():
-        # k-slice i of the lhs rows to z_ref[i]: compute indexes slices on a
-        # leading dim, never at a dynamic lane offset.
+    def ent(j):
+        m_off = ent_ref[1, j]
+        rows = ent_ref[2, j]
+        a = pl.multiple_of(m_off - m_off % _SUB, _SUB)
+        return ent_ref[0, j], m_off, rows, a
+
+    def x_copies(j):
+        # Entry j's lhs rows from the slab start, one k-slice per copy, so
+        # compute indexes k-slices on a leading dim.
+        _, m_off, rows, a = ent(j)
+        lr = pl.multiple_of(pl.cdiv(m_off - a + rows, _SUB) * _SUB, _SUB)
+        slot = j % 2
         return [
             pltpu.make_async_copy(
-                lhs_hbm.at[pl.ds(0, lhs_rows), pl.ds(i * chunk, chunk)],
-                z_ref.at[i, pl.ds(0, lhs_rows)],
-                iosem.at[0],
+                lhs_hbm.at[pl.ds(a, lr), pl.ds(i * chunk, chunk)],
+                x_ref.at[slot, i, pl.ds(0, lr)],
+                xsem.at[slot],
             )
             for i in range(c1)
         ]
@@ -194,7 +228,7 @@ def _kernel(
         """The weight and scale copies of chunk t from rhs1 or rhs2."""
         slot = t % slots
         c = t % ce
-        e = hit_ref[0, t // ce]
+        e = ent_ref[0, t // ce]
         if w1_side:
             w_hbm, s_hbm, r = w1_hbm, s1_hbm, jnp.where(c < c1, c, 0)
         else:
@@ -228,97 +262,114 @@ def _kernel(
         for cp in chunk_copies(t, True):
             cp.wait()
 
+    def out_copy(slot, a, size):
+        return pltpu.make_async_copy(
+            o_ref.at[slot, pl.ds(0, size)], out_hbm.at[pl.ds(a, size)], osem.at[slot]
+        )
+
+    def wait_out(slot):
+        size = pl.multiple_of(cnt_ref[1 + slot], _SUB)
+
+        @pl.when(size > 0)
+        def _():
+            out_copy(slot, 0, size).wait()
+            cnt_ref[1 + slot] = 0
+
     def compute(t, mb):
         slot = t % slots
         j = t // ce
         c = t % ce
-        m_off = hit_ref[1, j]
-        rows = hit_ref[2, j]
-        a = pl.multiple_of(m_off - m_off % _SUB, _SUB)
+        _, m_off, rows, a = ent(j)
         is_w2 = c >= c1
         cc = jnp.where(is_w2, c - c1, c)
-        row0 = pl.multiple_of(jnp.where(is_w2, hrow, a), _SUB)
-        arow0 = pl.multiple_of(jnp.where(is_w2, mcap, 0), _SUB)
+        xs = jnp.where(is_w2, h_slot, j % 2)
+        ai = is_w2.astype(jnp.int32)
+        bf16 = bf16_from is not None and mb >= bf16_from
 
         @pl.when(cc == 0)
         def _():
-            a_ref[pl.ds(arow0, mb), :] = jnp.zeros((mb, n), jnp.float32)
+            a_ref[ai, 0:mb, :] = jnp.zeros((mb, n), jnp.float32)
 
-        x = z_ref[cc, pl.ds(row0, mb), :]
+        x = x_ref[xs, cc, 0:mb, :]
         w_slot = w_ref.at[slot]
         s_slot = s_ref.at[slot]
-        fp8 = jnp.float8_e4m3fn
         w_all = w_slot[...] if w_load == "full" else None
         for c0 in range(0, n, _NCOL):
-            acc = a_ref[pl.ds(arow0, mb), pl.ds(c0, _NCOL)]
-            for kb in range(kbc):
-                if w_all is None:
-                    w = w_slot[pl.ds(kb * _QB, _QB), pl.ds(c0, _NCOL)]
-                else:
-                    w = w_all[kb * _QB : (kb + 1) * _QB, c0 : c0 + _NCOL]
-                w = w.astype(fp8)
-                blk = jnp.matmul(
-                    x[:, kb * _QB : (kb + 1) * _QB],
-                    w,
-                    preferred_element_type=jnp.float32,
-                )
-                # [1, 256] row, broadcast over the rows (same products).
-                blk = blk * s_slot[kb, 0:1, pl.ds(c0, _NCOL)]
-                acc = acc + blk
-            a_ref[pl.ds(arow0, mb), pl.ds(c0, _NCOL)] = acc
+            acc = a_ref[ai, 0:mb, c0 : c0 + _NCOL]
+            if bf16:
+                # gmm_v2's dequantize-before-matmul: bf16(w) * bf16(scale)
+                # in bf16, one matmul over the slice (f32 sums per slice).
+                w = w_slot[:, pl.ds(c0, _NCOL)].astype(x.dtype)
+                sc = s_slot[:, :, pl.ds(c0, _NCOL)].astype(x.dtype)
+                w = (w.reshape(kbc, _QB, _NCOL) * sc).reshape(chunk, _NCOL)
+                acc = acc + jnp.matmul(x, w, preferred_element_type=jnp.float32)
+            else:
+                for kb in range(kbc):
+                    if w_all is None:
+                        w = w_slot[pl.ds(kb * _QB, _QB), pl.ds(c0, _NCOL)]
+                    else:
+                        w = w_all[kb * _QB : (kb + 1) * _QB, c0 : c0 + _NCOL]
+                    blk = jnp.matmul(
+                        x[:, kb * _QB : (kb + 1) * _QB],
+                        w.astype(jnp.float8_e4m3fn),
+                        preferred_element_type=jnp.float32,
+                    )
+                    # [1, 256] row, broadcast over the rows (same products).
+                    acc = acc + blk * s_slot[kb, 0:1, pl.ds(c0, _NCOL)]
+            a_ref[ai, 0:mb, c0 : c0 + _NCOL] = acc
 
         @pl.when(c == c1 - 1)
         def _():
             # h = act(gate, up), rounded to the lhs dtype (gmm_v2's h).
             for c0 in range(0, f, act_cols):
-                gate = a_ref[0:mb, c0 : c0 + act_cols]
-                up = a_ref[0:mb, f + c0 : f + c0 + act_cols]
+                gate = a_ref[0, 0:mb, c0 : c0 + act_cols]
+                up = a_ref[0, 0:mb, f + c0 : f + c0 + act_cols]
                 lo = c0 % chunk
-                z_ref[c0 // chunk, hrow : hrow + mb, lo : lo + act_cols] = (
-                    _gmm.gate_up_act(gate, up, fuse_act).astype(z_ref.dtype)
+                x_ref[h_slot, c0 // chunk, 0:mb, lo : lo + act_cols] = (
+                    _gmm.gate_up_act(gate, up, fuse_act).astype(x_ref.dtype)
                 )
 
         @pl.when(c == ce - 1)
         def _():
-            r = a + lax.broadcasted_iota(jnp.int32, (mb, _ACT_COLS), 0)
-            keep = r < m_off
-            mine = jnp.logical_and(m_off <= r, r < m_off + rows)
+            os = j % 2
+            wait_out(os)  # entry j - 2's rows have left this slot
+            i = lax.broadcasted_iota(jnp.int32, (mb, _ACT_COLS), 0)
+            lo = m_off - a
+            hi = lo + rows
             for c0 in range(0, n, _ACT_COLS):
-                y = a_ref[mcap : mcap + mb, c0 : c0 + _ACT_COLS].astype(o_ref.dtype)
-                old = o_ref[pl.ds(a, mb), pl.ds(c0, _ACT_COLS)]
-                o_ref[pl.ds(a, mb), pl.ds(c0, _ACT_COLS)] = jnp.where(
-                    keep, old, jnp.where(mine, y, jnp.zeros_like(y))
+                y = a_ref[1, 0:mb, c0 : c0 + _ACT_COLS].astype(o_ref.dtype)
+                y = jnp.where(i < hi, y, jnp.zeros_like(y))
+                # Rows before the entry in its first slab: earlier entries'.
+                carry = cs_ref[:, c0 : c0 + _ACT_COLS]
+                o_ref[os, 0:_SUB, c0 : c0 + _ACT_COLS] = jnp.where(
+                    i[:_SUB] < lo, carry, y[:_SUB]
                 )
+                if mb > _SUB:
+                    o_ref[os, _SUB:mb, c0 : c0 + _ACT_COLS] = y[_SUB:]
+            # Write the slabs no later entry touches; keep the open one.
+            end = m_off + rows
+            is_last = j == num_ent - 1
+            final = jnp.where(is_last, pl.cdiv(end, _SUB), end // _SUB) * _SUB
+            size = pl.multiple_of(final - a, _SUB)
+
+            @pl.when(size > 0)
+            def _():
+                out_copy(os, a, size).start()
+                cnt_ref[1 + os] = size
+
+            cs_ref[...] = o_ref[os, pl.ds(size, _SUB), :]
 
     branches = [functools.partial(lambda t, mb: compute(t, mb), mb=mb) for mb in buckets]
 
-    def flush_out(j):
-        # Rows below the next group's first slab are final: write them.
-        m_end = hit_ref[1, j] + hit_ref[2, j]
-        is_last = j == num_hit - 1
-        final = jnp.where(is_last, pl.cdiv(m_end, _SUB), m_end // _SUB) * _SUB
-        w0 = pl.multiple_of(cnt_ref[1], _SUB)
-
-        @pl.when(final > w0)
-        def _():
-            size = pl.multiple_of(final - w0, _SUB)
-            pltpu.make_async_copy(
-                o_ref.at[pl.ds(w0, size)], out_hbm.at[pl.ds(w0, size)], iosem.at[1]
-            ).start()
-            cnt_ref[1] = final
-
     @pl.when(num_chunks > 0)
     def _():
-        for cp in lhs_copies():
+        for cp in x_copies(0):
             cp.start()
         for i in range(slots - 1):
 
             @pl.when(i < num_chunks)
             def _():
                 start_chunk(i)
-
-        for cp in lhs_copies():
-            cp.wait()
 
         def body(t, carry):
             nxt = t + slots - 1
@@ -327,36 +378,40 @@ def _kernel(
             def _():
                 start_chunk(nxt)
 
-            wait_chunk(t)
             j = t // ce
-            m_off = hit_ref[1, j]
-            need = m_off % _SUB + hit_ref[2, j]
+
+            @pl.when(t % ce == 0)
+            def _():
+                for cp in x_copies(j):
+                    cp.wait()
+
+                @pl.when(j + 1 < num_ent)
+                def _():
+                    for cp in x_copies(j + 1):
+                        cp.start()
+
+            wait_chunk(t)
+            _, m_off, rows, a = ent(j)
+            need = m_off - a + rows
             bidx = sum((need > b).astype(jnp.int32) for b in buckets[:-1])
             if len(buckets) == 1:
                 branches[0](t)
             else:
                 lax.switch(bidx, branches, t)
-
-            @pl.when(t % ce == ce - 1)
-            def _():
-                flush_out(j)
-
             return carry
 
         lax.fori_loop(0, num_chunks, body, 0)
-        written = pl.multiple_of(cnt_ref[1], _SUB)
-        pltpu.make_async_copy(
-            o_ref.at[pl.ds(0, written)], out_hbm.at[pl.ds(0, written)], iosem.at[1]
-        ).wait()
+        wait_out(0)
+        wait_out(1)
 
 
-def vmem_bytes(size_m, k1, f, n, chunk, slots, mcap, out_itemsize=2) -> int:
-    z = (size_m + mcap) * k1 * 2
+def vmem_bytes(k1, f, n, chunk, slots, mcap, out_itemsize=2) -> int:
+    x = 3 * mcap * k1 * 2
     acc = 2 * mcap * n * 4
-    o = (size_m + mcap) * n * out_itemsize
+    o = (2 * (mcap + _SUB) + _SUB) * n * out_itemsize
     w = slots * chunk * n // 2
-    s = slots * (chunk // _QB) * 8 * n * 4  # [kb, 1, N] f32 pads to 8 sublanes
-    return z + acc + o + w + s
+    s = slots * _gmm.align_to(chunk // _QB, 8) * 8 * n * 4  # [kb, 1, N] f32 pads
+    return x + acc + o + w + s
 
 
 def gmm_decode_stream_mlp(
@@ -379,11 +434,11 @@ def gmm_decode_stream_mlp(
     size_m, k1 = lhs.shape
     g, _, n = rhs1.shape
     f = rhs2.shape[1]
-    max_rows = min(max_group_size or size_m, size_m)
-    buckets = _buckets(max_rows)
+    buckets, bf16_from = plan(size_m, max_group_size)
     mcap = buckets[-1]
+    max_ent = g + pl.cdiv(size_m, _SUB)
     out_dtype = jnp.dtype(out_dtype or lhs.dtype)
-    need = vmem_bytes(size_m, k1, f, n, chunk_rows, slots, mcap, out_dtype.itemsize)
+    need = vmem_bytes(k1, f, n, chunk_rows, slots, mcap, out_dtype.itemsize)
     capacity = 64 << 20 if interpret else pltpu.get_tpu_info().vmem_capacity_bytes
     vmem_limit = min(
         int(capacity * 0.9),
@@ -396,6 +451,7 @@ def gmm_decode_stream_mlp(
         chunk=chunk_rows,
         slots=slots,
         buckets=buckets,
+        bf16_from=bf16_from,
         fuse_act=fuse_act,
         w_load=w_load,
     )
@@ -411,14 +467,16 @@ def gmm_decode_stream_mlp(
             in_specs=[hbm, hbm, hbm, hbm, hbm],
             out_specs=hbm,
             scratch_shapes=[
-                pltpu.VMEM((k1 // chunk_rows, size_m + mcap, chunk_rows), lhs.dtype),
-                pltpu.VMEM((2 * mcap, n), jnp.float32),
-                pltpu.VMEM((size_m + mcap, n), out_dtype),
+                pltpu.VMEM((3, k1 // chunk_rows, mcap, chunk_rows), lhs.dtype),
+                pltpu.VMEM((2, mcap, n), jnp.float32),
+                pltpu.VMEM((2, mcap + _SUB, n), out_dtype),
+                pltpu.VMEM((_SUB, n), out_dtype),
                 pltpu.VMEM((slots, chunk_rows, n), rhs1.dtype),
                 pltpu.VMEM((slots, chunk_rows // _QB, 1, n), jnp.float32),
-                pltpu.SMEM((3, g), jnp.int32),
-                pltpu.SMEM((2,), jnp.int32),
+                pltpu.SMEM((3, max_ent), jnp.int32),
+                pltpu.SMEM((3,), jnp.int32),
                 pltpu.SemaphoreType.DMA((slots, 2)),
+                pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
             ],
         ),
