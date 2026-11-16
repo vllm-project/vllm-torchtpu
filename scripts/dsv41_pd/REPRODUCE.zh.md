@@ -463,6 +463,8 @@ aiperf 的统计不含 warmup 阶段的请求。
 | + P 分块分词（6.1 第 15 条） | 900s | 5.84 | 5,168 | 0.83 / 2.36 s | 12.3 ms | 10.0 / 2.3 |
 | + D 路由（6.1 第 16 条） | 900s | **5.99** | **5,348** | 0.87 / 2.25 s | **11.2 ms** | 6.6 / 4.2 |
 | + D 静态 EPLB `dsv41_flash_dp8_c384_perm` | 900s | 5.91 | 5,252 | 0.87 / 2.38 s | 11.7 ms | 7.0 / 4.5 |
+| + DSpark 采样 draft（6.1 第 17 条，τ=1） | 900s | **6.07** | **5,441** | 0.95 / 2.82 s | **9.5 ms** | 6.3 / 3.7 |
+| 采样 draft，τ=1.5 | 900s | 5.89 | 5,235 | 0.93 / 2.82 s | 11.5 ms | 6.7 / 3.9 |
 | 分块分词 + D 路由 | **3600s** | 4.55 | 4,600 | 0.90 / 2.58 s | 10.4 ms | — |
 | 参考（客户提供，c256） | 3600s | 5.22 | 5,218 | 0.22 / 0.48 s | 4.83 ms | — |
 | c512 分块分词 + D 路由（`agentx-c512-best-3600-1116-0106`） | 3600s | 8.03 | 8,407 | 1.66 / 14.65 s | 14.3 ms | 14.8 / 11.3 |
@@ -475,6 +477,8 @@ aiperf 的统计不含 warmup 阶段的请求。
 - 静态 EPLB 没有收益：c256 下 D 每个 rank 只有约 40 行，MoE 受权重读取限制，专家负载均衡影响不大。换 layout 后 D 重新编译约 1 小时。
 - c512（3600s，0 错误）：比 5.6 的 3600s 吞吐 +6%、TTFT P50 -54%、ITL -9%，仍比参考低 22%。c512 下 TTFT 长尾在 P：P 段 P50 1.08s、P90 12s、P99 45s（排队），D 段 P50 0.35s；
   稳态 P 命中 94.0%（全局理论 96.5%，差的是前缀在别的 rank）。
+- 采样 draft：每步接受 token 3.02→3.42（τ=1），ITL -15%，每步耗时不变（约 33 ms，未走融合 kernel 的开销可忽略）；greedy 请求输出逐字不变。
+  缓存命中约 97%（没命中的是还没 propose 过的新请求），命中的行 100% 有效。τ=1.5（draft 更平）回到 3.03，说明 drafter 并不比 target 尖，上限在 drafter 本身。
 - 3600s 的吞吐低于 900s：会话是闭环的（上一轮结束才发下一轮），吞吐由单请求延迟决定；后段会话更长、长输出也能跑完（平均输出 1011 vs 892）。
   单请求约 0.9s + 1011 × 10.4ms ≈ 11.4s，参考约 5s。剩下的主要差距是 ITL：每步耗时约 34ms（和 greedy bench 相当），但 temperature 1.0 下 DSpark 每步只接受约 3.0 个 token（greedy 约 5.9）。
 
@@ -516,6 +520,12 @@ aiperf 的统计不含 warmup 阶段的请求。
    AgentX c256 TTFT P50 2.56→0.83s、P90 8.85→2.36s（5.7）。
 16. **proxy 给 D 单独选 rank**（`PROXY_DECODE_ROUTING=1`，`PROXY_DECODE_SLACK` 默认 2）：D 也按前缀块哈希选缓存了最长前缀的 rank（保留 D 的前缀缓存），
    但该 rank 在跑的 decode 流比最少的 rank 多出 slack 以上时改发最闲的 rank。日志 `PERF PROXY decode_route`。AgentX c256 ITL 12.3→11.2 ms（5.7）。
+17. **DSpark 采样 draft**（`TPU_DSPARK_SAMPLED_DRAFT=1`，2026-11-16）：原来 draft 一律取 argmax，temperature 1.0 下每个位置的接受率只有 p(argmax q)。
+   现在按请求温度从 q = softmax((base + markov(prev)) / T) 采样（Gumbel-max：argmax(q + T·G)，T=0 的请求即原来的 greedy），
+   并按请求 id 缓存 q；验证时 rejection sampler 用 u·q(x) ≤ p(x) 接受、拒绝时从 max(0, p − q) 重采样（无损，接受率 Σmin(p, q)）。
+   缓存的 draft token 与被验证的不一致时该行退回 q = δ(x) 的检验（对任意 x 仍无损）。`TPU_DSPARK_DRAFT_TEMP_SCALE`（τ，默认 1）缩放 draft 温度，
+   `TPU_DSPARK_SAMPLED_DRAFT_LOG=N` 每 N 次验证记一次缓存命中。CPU 统计测试：输出分布等于 p，接受率等于理论值。AgentX c256 ITL 11.2→9.5 ms（5.7）。
+   采样模式不走 drafter 的融合 greedy kernel。
 
 ### 6.2 D 这一跳的控制路径优化（2026-10-29，已部署）
 

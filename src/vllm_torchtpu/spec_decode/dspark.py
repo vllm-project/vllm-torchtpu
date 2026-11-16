@@ -15,12 +15,20 @@ FIRST prediction position and every slot predicts the NEXT token — versus
 DFlash's 1 + K (anchor is bonus only). Speculators-format checkpoints set
 ``sample_from_anchor=False`` and keep the DFlash layout.
 
-PoC scope: greedy draft sampling only (argmax + d2t remap); probabilistic
-Gumbel-coupled sampling is not implemented.
+Greedy draft sampling (argmax + d2t remap) by default. With
+TPU_DSPARK_SAMPLED_DRAFT=1 each draft token is SAMPLED from the draft
+distribution q = softmax((base + markov(prev)) / T) at the request's
+temperature (Gumbel-max: argmax(logits + T * G)), and the pre-temperature
+draft logits are kept per request so the rejection sampler can run the
+lossless test u * q(x) <= p(x) with residual max(0, p - q). At T > 0 this
+accepts sum(min(p, q)) per position instead of p(argmax q).
 """
 
 from __future__ import annotations
 
+import os
+
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 
@@ -39,6 +47,23 @@ class DSparkProposer(DFlashProposer):
 
         super().__init__(runner, vllm_config)
         self._decode_samples = None
+        # Sampled drafting (see module docstring). The instance attribute
+        # shadows the greedy compiled method that DFlashProposer.propose and
+        # the precompile path call.
+        self.sampled_draft = os.environ.get("TPU_DSPARK_SAMPLED_DRAFT", "0") == "1"
+        self._cur_chunk = None
+        self._q_entries: list = []
+        self._q_all: torch.Tensor | None = None
+        self._q_tok_all: torch.Tensor | None = None
+        self._q_rows: dict[str, int] = {}
+        # Draft temperature scale tau: drafts come from softmax(q / (tau * T)).
+        # Any q keeps the output distribution exact; tau > 1 flattens an
+        # over-confident drafter towards the target's distribution.
+        self.draft_temp_scale = float(os.environ.get("TPU_DSPARK_DRAFT_TEMP_SCALE", "1.0"))
+        self._q_log_every = int(os.environ.get("TPU_DSPARK_SAMPLED_DRAFT_LOG", "0"))
+        self._q_calls = 0
+        if self.sampled_draft:
+            self._dflash_forward_and_sample = self._sampled_forward_and_sample
 
         if not self.dflash_config.get("target_layer_ids"):
             raise ValueError(
@@ -72,7 +97,14 @@ class DSparkProposer(DFlashProposer):
                 f"{spec.dspark_draft_topk}; only greedy drafting of a fixed "
                 "block is implemented."
             )
-        logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
+        if self.sampled_draft and not self.sample_from_anchor:
+            raise ValueError("TPU_DSPARK_SAMPLED_DRAFT=1 needs sample_from_anchor.")
+        logger.info(
+            "DSpark: sample_from_anchor=%s, K=%d, sampled_draft=%s.",
+            self.sample_from_anchor,
+            K,
+            self.sampled_draft,
+        )
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
     # ([draft_vocab, hidden] plus a d2t remap) and possibly its own
@@ -176,3 +208,174 @@ class DSparkProposer(DFlashProposer):
         draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
 
         return draft_tokens_chunk, hidden
+
+    # ------------------------------------------------------------------ #
+    # Sampled drafting (TPU_DSPARK_SAMPLED_DRAFT=1)
+    # ------------------------------------------------------------------ #
+    def _prepare_dflash_inputs(self, chunk, *args, **kwargs):
+        self._cur_chunk = chunk
+        return super()._prepare_dflash_inputs(chunk, *args, **kwargs)
+
+    def propose(self, *args, **kwargs):
+        if not self.sampled_draft:
+            return super().propose(*args, **kwargs)
+        self._q_entries = []
+        result = super().propose(*args, **kwargs)
+        self._finish_q_cache()
+        return result
+
+    def _sampled_forward_and_sample(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        chunk, self._cur_chunk = self._cur_chunk, None
+        padded_num_reqs = input_ids.shape[0] // block_size
+        temps_cpu = torch.zeros(padded_num_reqs, dtype=torch.float32)
+        if chunk is not None and chunk.num_reqs > 0:
+            start = chunk.start_index
+            temps_cpu[: chunk.num_reqs].copy_(
+                self.runner.input_batch.temperature_cpu_tensor[
+                    start : start + chunk.num_reqs
+                ].to(torch.float32)
+            )
+        temps = temps_cpu.to(input_ids.device)
+        gumbel_u = torch.rand(
+            (padded_num_reqs, block_size, self._draft_vocab_size()),
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        inv_tau = torch.full(
+            (1,), 1.0 / self.draft_temp_scale, dtype=torch.float32
+        ).to(input_ids.device)
+        tokens, hidden, q_logits = self._sampled_forward_compiled(
+            input_ids, positions, block_size, temps, gumbel_u, inv_tau
+        )
+        if chunk is not None:
+            self._q_entries.append((chunk.start_index, chunk.num_reqs, q_logits, tokens))
+        return tokens, hidden
+
+    def _draft_vocab_size(self) -> int:
+        if not hasattr(self, "_vocab_cache"):
+            w = self.draft_model.model.markov_head.markov_w2.weight
+            self._vocab_cache = int(w.shape[0])
+        return self._vocab_cache
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _sampled_forward_compiled(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+        temps: torch.Tensor,
+        gumbel_u: torch.Tensor,
+        inv_tau: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Backbone forward + sequential Markov sampling from q, in-graph.
+
+        x_k = argmax(q_k + T * G_k), q_k = base_k + markov(x_{k-1}), which is
+        a draw from softmax(q_k / T) (T = 0 rows: argmax, the greedy draft).
+        Returns the drafts, the hidden states and the pre-temperature draft
+        logits q [padded_num_reqs, block_size, vocab] (bf16).
+        """
+        assert self.draft_model is not None
+        hidden = self.draft_model.model(input_ids=input_ids, positions=positions)
+        padded_num_reqs = hidden.shape[0] // block_size
+        valid_hidden = hidden[: padded_num_reqs * block_size]
+        logits = self.draft_model.compute_draft_logits(valid_hidden).to(torch.float32)
+        vocab = logits.shape[-1]
+        logits_3d = logits.view(padded_num_reqs, block_size, vocab)
+        u = gumbel_u[:, :, :vocab].clamp(min=1e-20, max=1.0 - 1e-7)
+        noise = -torch.log(-torch.log(u)) * temps.view(padded_num_reqs, 1, 1)
+        ids_3d = input_ids[: padded_num_reqs * block_size].view(
+            padded_num_reqs, block_size
+        )
+        prev = ids_3d[:, 0]
+        draft_tokens = []
+        q_list = []
+        for i in range(block_size):
+            bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
+            # Cached q is already divided by tau, so the rejection sampler's
+            # softmax(q / T) is exactly the distribution sampled here.
+            q_i = (logits_3d[:, i] + bias.to(torch.float32)) * inv_tau
+            step = self.draft_model.map_draft_to_target(
+                (q_i + noise[:, i]).argmax(dim=-1)
+            )
+            draft_tokens.append(step)
+            q_list.append(q_i.to(torch.bfloat16))
+            prev = step
+        return (
+            torch.stack(draft_tokens, dim=1),
+            hidden,
+            torch.stack(q_list, dim=1),
+        )
+
+    def _finish_q_cache(self) -> None:
+        """Index this step's draft logits by request id for the next verify."""
+        rows: dict[str, int] = {}
+        qs, toks = [], []
+        offset = 0
+        req_ids = self.runner.input_batch.req_ids
+        for start, num_reqs, q, tok in self._q_entries:
+            padded, k, vocab = q.shape
+            for r in range(num_reqs):
+                rid = req_ids[start + r]
+                if rid is not None:
+                    rows[rid] = offset + r * k
+            qs.append(q.reshape(padded * k, vocab))
+            toks.append(tok.reshape(padded * k).to(torch.int32))
+            offset += padded * k
+        self._q_entries = []
+        self._q_rows = rows
+        if not qs:
+            self._q_all = self._q_tok_all = None
+            return
+        self._q_all = qs[0] if len(qs) == 1 else torch.cat(qs, dim=0)
+        self._q_tok_all = toks[0] if len(toks) == 1 else torch.cat(toks, dim=0)
+
+    def sampled_draft_rows(
+        self,
+        req_ids: list,
+        draft_lengths_cpu: np.ndarray,
+        draft_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Draft logits for the verify rows of ``req_ids`` (in batch order,
+        ``draft_lengths_cpu`` drafts each), aligned with ``draft_token_ids``.
+
+        A row is valid only if its request was drafted by the last propose
+        and the cached draft token equals the token being verified; invalid
+        rows fall back to the greedy-draft test in the rejection sampler.
+        """
+        if not self.sampled_draft or self._q_all is None:
+            return None
+        padded_len = draft_token_ids.shape[0]
+        idx = np.zeros(padded_len, dtype=np.int64)
+        has = np.zeros(padded_len, dtype=np.bool_)
+        pos = 0
+        for rid, n in zip(req_ids, draft_lengths_cpu):
+            n = int(n)
+            base = self._q_rows.get(rid)
+            if base is not None and n > 0:
+                idx[pos : pos + n] = base + np.arange(n)
+                has[pos : pos + n] = True
+            pos += n
+        device = draft_token_ids.device
+        idx_t = torch.from_numpy(idx).to(device)
+        has_t = torch.from_numpy(has).to(device)
+        rows = self._q_all.index_select(0, idx_t)
+        cached = self._q_tok_all.index_select(0, idx_t)
+        valid = has_t & (cached == draft_token_ids.to(torch.int32))
+        if self._q_log_every > 0:
+            self._q_calls += 1
+            if self._q_calls % self._q_log_every == 0:
+                n_has = int(has.sum())
+                n_valid = int(valid.sum().item())
+                logger.info(
+                    "DSpark sampled-draft rows: drafted=%d cached=%d valid=%d (%.1f%%)",
+                    int(sum(int(n) for n in draft_lengths_cpu[: len(req_ids)])),
+                    n_has,
+                    n_valid,
+                    100.0 * n_valid / max(n_has, 1),
+                )
+        return rows, valid
