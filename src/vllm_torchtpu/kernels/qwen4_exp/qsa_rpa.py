@@ -840,6 +840,7 @@ def _prefill_attention(
             depth=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH,
             bitset="sparsecore" if envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET else "tensorcore",
             lister=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES,
+            stats=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS,
         )
     union_group = envs.VLLM_TPU_QSA_PREFILL_UNION_WALK
     if union_group and (128 % union_group or union_group < 8):

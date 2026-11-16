@@ -508,13 +508,18 @@ def compare_tables(blocks, lengths, table, *, groups_cap, union_cap, page_size, 
 
 def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv_heads, ratio, k_scale=1.0,
                          v_scale=1.0, union_cap, min_context, fallback, depth=8, f8dot=False, guard=True, bitset="tensorcore",
-                         lister="reference"):
+                         lister="reference", stats=0):
     """``(gated bf16 output, cache)`` of a packed prefill step through the compare core.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``. Requests are aligned to 16-row
     boundaries as ``union_walk_prefill`` aligns them (padding rows of length 0) and their rows return to the
     original order. ``fallback()`` (the served call, gated output) runs instead when the step's longest row is
     below ``min_context`` or the tables refuse the step (a union past ``union_cap``). The cache passes through.
+
+    ``stats`` (debug, N > 0): every N-th call of a process logs the step's union groups, tiles and tiles a live
+    group (the work order's k is that over the ~4 of interpolated selections) from a host callback, and also runs
+    ``fallback()`` on the same inputs and logs max |core - fallback| / mean |fallback| over live rows; the core's
+    output is returned. Adds the callback and the fallback to the program; for an untimed run only.
     """
     tokens, query_heads, head_dim = query.shape
     pages, page_size = cache.shape[:2]
@@ -558,10 +563,13 @@ def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, 
                                        v_scale=v_scale, depth=depth, f8dot=f8dot, guard=guard)
 
         raw = lax.cond(ok, run, lambda: jnp.zeros(a_query.shape, jnp.bfloat16))
-        return (raw if back is None else raw[back]), ok
+        live = usize > 0
+        tiles = jnp.sum(jnp.where(live, (jnp.minimum(usize, union_cap) + GPT - 1) // GPT, 0)).astype(jnp.int32)
+        counts = jnp.stack([jnp.sum(live).astype(jnp.int32), tiles, jnp.max(usize).astype(jnp.int32)])
+        return (raw if back is None else raw[back]), ok, counts
 
     def skip():
-        return jnp.zeros(query.shape, jnp.bfloat16), jnp.zeros((), bool)
+        return jnp.zeros(query.shape, jnp.bfloat16), jnp.zeros((), bool), jnp.zeros((3,), jnp.int32)
 
     branches = [functools.partial(core, n) for n in sizes]
     route = jnp.sum(offsets[-1] > jnp.asarray(sizes[:-1], jnp.int32))
@@ -570,7 +578,7 @@ def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, 
         route = jnp.where(jnp.all(real % align == 0), 0, route + 1)
     branches.append(skip)
     route = jnp.where(jnp.max(lengths) >= min_context, route, len(branches) - 1)
-    raw, ok = lax.switch(route, branches)
+    raw, ok, counts = lax.switch(route, branches)
 
     def gated():
         out = bf16(bf16(raw).astype(jnp.float32)
@@ -580,7 +588,34 @@ def compare_core_prefill(query, gate, blocks, lengths, table, cache, starts, *, 
     def served():
         return fallback().astype(jnp.bfloat16)
 
-    return lax.cond(ok, gated, served), cache
+    out = lax.cond(ok, gated, served)
+    if stats:
+        ref = served().astype(jnp.float32)
+        live = (lengths > 0)[:, None, None]
+        err = jnp.max(jnp.where(live, jnp.abs(out.astype(jnp.float32) - ref), 0.0))
+        scale = jnp.sum(jnp.where(live, jnp.abs(ref), 0.0)) / jnp.maximum(
+            jnp.sum(live) * ref.shape[1] * ref.shape[2], 1)
+        finite = jnp.all(jnp.isfinite(jnp.where(live, out.astype(jnp.float32), 0.0)))
+        jax.debug.callback(functools.partial(_log_stats, int(stats), int(tokens)), ok, counts, jnp.max(lengths),
+                           err / jnp.maximum(scale, 1e-30), finite)
+    return out, cache
+
+
+_STATS = {"calls": 0}
+
+
+def _log_stats(every, tokens, ok, counts, longest, max_rel, finite):
+    """Host side of ``compare_core_prefill(stats=N)``."""
+    _STATS["calls"] += 1
+    if _STATS["calls"] % every:
+        return
+    from vllm_torchtpu.logger import init_logger
+
+    groups, tiles, umax = (int(x) for x in np.asarray(counts))
+    init_logger(__name__).info(
+        "QSA_CMP_STATS call=%d rows=%d longest=%d core=%d live_groups=%d tiles=%d tiles_per_group=%.3f "
+        "union_max=%d max_rel=%.5f finite=%d", _STATS["calls"], tokens, int(longest), int(bool(ok)), groups, tiles,
+        tiles / max(groups, 1), umax, float(max_rel), int(bool(finite)))
 
 
 def tiles_per_group(usize, union_cap):
