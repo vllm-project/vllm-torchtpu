@@ -135,3 +135,67 @@ def test_op_names_follow_the_flag(compare, monkeypatch):
 class _FakeOp:
     def register_fake(self, fn):
         return fn
+
+
+def test_layer_plumbing_with_cmp_matches_unfused_layer():
+    """attn mix -> combine_mix -> mlp combine through GatedResidual, as
+    Qwen4ExpDecoderLayer runs, with the decode ops running hc_decode_mix_auto
+    at a cmp row count."""
+    import torch
+
+    from tests.kernels import test_qwen4_exp_hc_decode as served_test
+
+    tokens = 16
+    interpret = pltpu.InterpretParams()
+
+    def to_torch(a):
+        if a.dtype == jnp.bfloat16:
+            return torch.from_numpy(np.asarray(a.astype(jnp.float32))).to(torch.bfloat16)
+        return torch.from_numpy(np.array(a))
+
+    def to_jax(t):
+        t = t.detach()
+        if t.dtype == torch.bfloat16:
+            return served_test._jax(t)
+        return jnp.asarray(t.numpy())
+
+    def ops(module):
+        static = dict(branches=BRANCHES, hidden=HIDDEN, eps=EPS, max_tile=512, interpret=interpret)
+
+        def mix_op(x, *weights):
+            assert cmp_applies(x.shape[0])
+            mixed, inj = hc_decode_mix_auto(*map(to_jax, (x, *weights)), **static)
+            return to_torch(mixed) if inj is None else (to_torch(mixed), to_torch(inj))
+
+        def combine_mix_op(residual, block, gate, *weights):
+            mixed, inj, combined = hc_decode_mix_auto(
+                *map(to_jax, (residual, *weights)),
+                block=to_jax(block),
+                prev_injection=to_jax(gate),
+                **static,
+            )
+            if inj is None:
+                return to_torch(mixed), to_torch(combined)
+            return to_torch(mixed), to_torch(inj), to_torch(combined)
+
+        module._decode_mix_op = mix_op
+        module._decode_combine_mix_op = combine_mix_op
+        return module
+
+    attn, mlp = served_test._module(21), served_test._module(22)
+    fused_attn, fused_mlp = ops(served_test._module(21)), ops(served_test._module(22))
+    torch.manual_seed(23)
+    hyper = torch.randn(tokens, WIDTH).to(torch.bfloat16)
+    attn_out = torch.randn(tokens, HIDDEN).to(torch.bfloat16)
+    mlp_out = torch.randn(tokens, HIDDEN).to(torch.bfloat16)
+    with torch.no_grad():
+        outs = []
+        for a, m in ((attn, mlp), (fused_attn, fused_mlp)):
+            block, residual = a.mix(hyper)
+            block2, residual = a.combine_mix(attn_out, residual, m)
+            outs.append((block, block2, m.combine(mlp_out, residual)))
+    (ref_block, ref_block2, ref_out), (block, block2, out) = outs
+    assert fused_attn._decode_fused(hyper)
+    served_test._check_bf16(served_test._jax(block), ref_block, "attn mixed")
+    served_test._check_bf16(served_test._jax(block2), ref_block2, "mlp mixed")
+    served_test._check_bf16(served_test._jax(out), ref_out, "layer output")
