@@ -57,6 +57,7 @@ from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
+from vllm_torchtpu.yanshu_debug import first_time, stamp
 
 logger = init_logger(__name__)
 
@@ -679,9 +680,32 @@ class TPUWorker(WorkerBase):
         )
 
     def execute_model(self, scheduler_output):
+        # Not the idle steps the engine repeats while a request waits (nothing
+        # scheduled, nothing finished). Ranks above 0 log once.
+        if (
+            scheduler_output.total_num_scheduled_tokens
+            or scheduler_output.finished_req_ids
+        ) and (self.rank == 0 or first_time("S16")):
+            logger.info(
+                "Yanshu debug here, [S16 TPUWorker.execute_model] %s | rank=%d "
+                "next: TPUModelRunner.execute_model() for %d tokens of %d "
+                "request(s)",
+                stamp(),
+                self.rank,
+                scheduler_output.total_num_scheduled_tokens,
+                len(scheduler_output.num_scheduled_tokens),
+            )
         return self.model_runner.execute_model(scheduler_output)
 
     def sample_tokens(self, grammar_output):
+        if self.rank == 0 or first_time("S17"):
+            logger.info(
+                "Yanshu debug here, [S17 TPUWorker.sample_tokens] %s | rank=%d "
+                "next: TPUModelRunner.sample_tokens(), which returns the sampled "
+                "token ids",
+                stamp(),
+                self.rank,
+            )
         return self.model_runner.sample_tokens(grammar_output)
 
     def profile_pipeline_chunks(self) -> dict:
