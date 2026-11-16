@@ -525,6 +525,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         keywords.pop("compressed_slot", None)
         keywords.pop("main_slot", None)
         keywords.pop("max_query_len", None)
+        keywords.pop("cmp_stats", None)
         if self.max_query_len > 1:
             keywords["max_query_len"] = self.max_query_len
         if slot:
@@ -532,6 +533,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if main_slot >= 0:
             keywords["main_slot"] = main_slot
         self._op = partial(build_pooled_qsa_op(), **keywords)
+        from . import compare_core_stats
+
+        if compare_core_stats.enabled() and "mtp" not in self.prefix:
+            # VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS: the op folds its counters into this layer's buffer.
+            self._op = partial(self._op, cmp_stats=compare_core_stats.register(self, pool.device))
         self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)
         self._shared_ops = None
         if vllm_torchtpu_envs.VLLM_TPU_QSA_DRAFT_SHARED_SELECTION:

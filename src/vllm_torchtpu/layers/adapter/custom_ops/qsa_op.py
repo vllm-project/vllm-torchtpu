@@ -133,7 +133,17 @@ def build_qsa_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
 
 @functools.cache
 def build_pooled_qsa_op():
-    op = pallas.jax_op("qwen4_exp::pooled_qsa", pooled_qsa_step, donate_argnums=(10,))
+    """The pooled QSA step. Under VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS the op also returns the compare
+    core's counters and ``run`` takes a ``cmp_stats`` buffer to fold them into (``compare_core_stats``)."""
+    stats = bool(envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE and envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS)
+    if stats:
+        from vllm_torchtpu.kernels.qwen4_exp import qsa_compare_core as cmp
+
+        op = pallas.jax_op(
+            "qwen4_exp::pooled_qsa_cmp_stats", cmp.with_compare_stats(pooled_qsa_step), donate_argnums=(10,)
+        )
+    else:
+        op = pallas.jax_op("qwen4_exp::pooled_qsa", pooled_qsa_step, donate_argnums=(10,))
 
     @op.register_fake
     def fake(
@@ -163,20 +173,36 @@ def build_pooled_qsa_op():
         main_slot=-1,
         max_query_len=1,
     ):
-        return (
+        outputs = (
             torch.empty_like(pool),
             qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
             positions.new_empty(
                 (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
             ),
         )
+        if stats:
+            outputs += (qgate.new_empty(cmp.STATS_SHAPE, dtype=torch.float32),)
+        return outputs
 
-    def run(*args, **kwargs):
+    def run(*args, cmp_stats=None, **kwargs):
         args = list(args)
         for index in (8, 11, 12, 13, 14, 15):
             args[index] = args[index].to(torch.int32)
-        updated, output, blocks = op(*args, **kwargs)
+        if not stats:
+            updated, output, blocks = op(*args, **kwargs)
+            args[10].copy_(updated)
+            return output, blocks
+        updated, output, blocks, delta = op(*args, **kwargs)
         args[10].copy_(updated)
+        if cmp_stats is not None:
+            sums = cmp.STATS_SUMS
+            cmp_stats.copy_(
+                torch.cat(
+                    [cmp_stats[:, :sums] + delta[:, :sums],
+                     torch.maximum(cmp_stats[:, sums:], delta[:, sums:])],
+                    dim=1,
+                )
+            )
         return output, blocks
 
     return run

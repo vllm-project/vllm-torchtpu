@@ -4453,6 +4453,10 @@ class TPUModelRunner(GPUModelRunner):
                 from vllm_torchtpu.models.vllm.qwen4_exp import dcp_merge_check
 
                 dcp_merge_check.after_forward(self)
+            if envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS:
+                from vllm_torchtpu.models.vllm.qwen4_exp import compare_core_stats
+
+                compare_core_stats.after_forward(self)
             if envs.VLLM_TPU_QSA_PREFILL_UNION_COUNT and envs.VLLM_TPU_QSA_PREFILL_UNION_WALK:
                 # D2 engagement (debug, log-only): the step's padded rows and longest sequence, on the host.
                 from vllm_torchtpu.kernels.qwen4_exp.qsa_union_dense import count_union_walk_step

@@ -90,6 +90,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -466,6 +467,182 @@ def union_sc_list_pages(
     return union_sc_list(
         ubits, usize, physw, cap_ranks=cap_ranks, ratio=ratio, unroll=unroll
     )
+
+
+# Compare core tables (qsa_compare_core): the list step at 16-row union groups plus each rank's row code.
+
+COMPARE_T = 16          # rows a compare-core union group (one SparseCore bitset slab)
+COMPARE_EDGE_BIAS = 4   # qsa_compare_core.EDGE_BIAS
+COMPARE_EDGE_MAX = 16   # qsa_compare_core.EDGE_MAX
+
+
+def compare_code_lanes(gid, p0, gather, ratio):
+    """Row codes of 16 ranks (qsa_compare_core's slot code): bit r is row r's bit of the rank's group in its
+    bitset word (``gather(idx)`` reads the union group's flat bitset [words * 16], row r of word w at 16 w + r),
+    bits 16 and up the clamped causal edge ``ratio * gid - p0`` plus the bias; 0 for padding (gid -1)."""
+    live = gid >= 0
+    safe = jnp.maximum(gid, 0)
+    word16 = lax.shift_right_logical(safe, 5) * COMPARE_T
+    bit = safe & (WORD_BITS - 1)
+    code = jnp.zeros_like(gid)
+    for r in range(COMPARE_T):
+        code = code | ((lax.shift_right_logical(gather(word16 + r), bit) & 1) << r)
+    edge = jnp.clip(safe * ratio - p0, -COMPARE_EDGE_BIAS, COMPARE_EDGE_MAX) + COMPARE_EDGE_BIAS
+    return jnp.where(live, code | (edge << 16), 0)
+
+
+def _compare_tables_kernel(
+    bits_hbm,
+    physw_hbm,
+    p0_hbm,
+    rows_hbm,
+    codes_hbm,
+    usize_hbm,
+    bits_v,
+    ubits_v,
+    physw_v,
+    p0_v,
+    rows_v,
+    ids_v,
+    codes_v,
+    *,
+    ngroups,
+    words,
+    words_p,
+    cap_ranks,
+    ratio,
+    waves,
+    workers,
+    unroll,
+    emit_ids,
+):
+    worker = lax.axis_index(("core", "subcore"))
+    lane = lax.iota(jnp.int32, LANES)
+    every = lane >= 0
+    zeros = jnp.zeros((LANES,), jnp.int32)
+
+    def group(wave, carry):
+        g = wave * workers + worker
+
+        @pl.when(g < ngroups)
+        def _():
+            pltpu.sync_copy(bits_hbm.at[pl.ds(pl.multiple_of(g * words * COMPARE_T, LANES), words * COMPARE_T)],
+                            bits_v)
+            pltpu.sync_copy(physw_hbm.at[pl.ds(pl.multiple_of(g * words_p, LANES), words_p)], physw_v)
+            pltpu.sync_copy(p0_hbm.at[pl.ds(pl.multiple_of(g * LANES, LANES), LANES)], p0_v)
+
+            def union_words(v):
+                # Lane l: word 16 v + l, the OR of its 16 rows (row r at 16 w + r).
+                at = (v * LANES + lane) * COMPARE_T
+                u = zeros
+                for r in range(COMPARE_T):
+                    u = u | plsc.load_gather(bits_v, [jnp.minimum(at + r, words * COMPARE_T - 1)])
+                ubits_v[pl.ds(pl.multiple_of(v * LANES, LANES), LANES)] = jnp.where(v * LANES + lane < words, u, 0)
+
+            plsc.parallel_loop(0, words_p // LANES, unroll=2)(union_words)
+
+            def word_step(w, rank):
+                at_word = jnp.full((LANES,), w, jnp.int32)
+                word = plsc.load_gather(ubits_v, [at_word])
+                base = plsc.load_gather(physw_v, [at_word])
+                for pos in half_positions(lane):
+                    mask, gid, prow = expand_half_word(word, base, at_word, pos, ratio)
+                    # Ranks past the cap land in the slack, which the padding fill overwrites.
+                    at = clamp_rank(rank, cap_ranks)
+                    plsc.store_compressed(ids_v.at[pl.ds(at, LANES)], gid, mask=mask)
+                    plsc.store_compressed(rows_v.at[pl.ds(at, LANES)], prow, mask=mask)
+                    rank = rank + plsc.all_reduce_population_count(mask)[0]
+                return rank
+
+            usize = plsc.parallel_loop(0, words, unroll=unroll, carry=jnp.int32(0))(word_step)
+            limit = list_limit(usize, cap_ranks)
+            padding_id = jnp.full((LANES,), -1, jnp.int32)
+            padding_row = padding_rows(physw_v[pl.ds(0, LANES)])
+
+            def fill(i):
+                at = pl.ds(limit + i * LANES, LANES)
+                plsc.store_compressed(ids_v.at[at], padding_id, mask=every)
+                plsc.store_compressed(rows_v.at[at], padding_row, mask=every)
+
+            plsc.parallel_loop(0, pad_vectors(limit, cap_ranks), unroll=4)(fill)
+
+            p0 = p0_v[...][0]
+
+            def code_step(v):
+                at = pl.ds(pl.multiple_of(v * LANES, LANES), LANES)
+                codes_v[at] = compare_code_lanes(ids_v[at], p0, lambda idx: plsc.load_gather(bits_v, [idx]), ratio)
+
+            live_vectors = lax.shift_right_logical(limit + (LANES - 1), _log2(LANES))
+            plsc.parallel_loop(0, live_vectors, unroll=2)(code_step)
+
+            def zero(v):
+                codes_v[pl.ds(pl.multiple_of(v * LANES, LANES), LANES)] = zeros
+
+            plsc.parallel_loop(live_vectors, cap_ranks // LANES, unroll=4)(zero)
+            out = pl.ds(pl.multiple_of(g * cap_ranks, LANES), cap_ranks)
+            pltpu.sync_copy((ids_v if emit_ids else rows_v).at[pl.ds(0, cap_ranks)], rows_hbm.at[out])
+            pltpu.sync_copy(codes_v.at[pl.ds(0, cap_ranks)], codes_hbm.at[out])
+            p0_v[...] = jnp.full((LANES,), usize, jnp.int32)
+            pltpu.sync_copy(p0_v, usize_hbm.at[pl.ds(pl.multiple_of(g * LANES, LANES), LANES)])
+
+        return carry
+
+    lax.fori_loop(0, waves, group, None)
+
+
+def compare_sc_tables(bits_flat, page_rows, p0, *, words, union_cap, page_size, ratio=4, unroll=4, emit="rows"):
+    """SparseCore build of qsa_compare_core's tables: ``(rows, codes, usize)``, int32 [G, union_cap] twice and
+    [G], equal to ``qsa_compare_core``'s XLA reference (``union_lists``, ``slot_rows``, ``slot_codes``).
+
+    ``bits_flat`` int32[G * words * 16]: each 16-row union group's bitset words, a row a lane
+    (``union_sc_bits_flat``); ``page_rows`` int32[G, P]: each union group's page row; ``p0`` int32[G]: the
+    position of its first row. One union group per vector subcore in waves: the union words (the OR of the 16
+    rows, 16 words at a time by gathers), the list step's word walk (ids and pool rows by ``store_compressed`` at
+    the running rank, whose end is the union size), then 16 ranks at a time each rank's 16 row bits gathered from
+    the staged bitset (``compare_code_lanes``). The flat bitset is never re-laid as [G, words, 16], whose 16-wide
+    minor axis XLA pads to 128 lanes. ``emit="ids"``: the first output holds each rank's group id (-1 past the
+    union) instead of its pool row.
+    """
+    if emit not in ("rows", "ids"):
+        raise ValueError("emit: 'rows' or 'ids'")
+    ngroups = page_rows.shape[0]
+    if bits_flat.shape != (ngroups * words * COMPARE_T,) or union_cap % LANES or words % 8:
+        raise ValueError("bits_flat [G * words * 16] (words a multiple of 8) and a union_cap of whole 16-rank vectors")
+    sc = _sc_geometry()
+    workers = sc.num_cores * sc.num_subcores
+    words_p = _round_up(words, LANES)
+    physw = ud._word_bases(page_rows, words=words, page_size=page_size, word_tokens=WORD_BITS * ratio)
+    physw_flat = jnp.pad(physw.astype(jnp.int32), ((0, 0), (0, words_p - words))).reshape(-1)
+    p0_lanes = jnp.broadcast_to(p0.astype(jnp.int32)[:, None], (ngroups, LANES)).reshape(-1)
+    flat = jax.ShapeDtypeStruct((ngroups * union_cap,), jnp.int32)
+    rows, codes, usize = core_map_helper.kernel(
+        functools.partial(
+            _compare_tables_kernel,
+            ngroups=ngroups,
+            words=words,
+            words_p=words_p,
+            cap_ranks=union_cap,
+            ratio=ratio,
+            waves=-(-ngroups // workers),
+            workers=workers,
+            unroll=unroll,
+            emit_ids=emit == "ids",
+        ),
+        out_type=(flat, flat, jax.ShapeDtypeStruct((ngroups * LANES,), jnp.int32)),
+        mesh=_mesh(sc),
+        scratch_types=(
+            pltpu.VMEM((words * COMPARE_T,), jnp.int32),
+            pltpu.VMEM((words_p,), jnp.int32),
+            pltpu.VMEM((words_p,), jnp.int32),
+            pltpu.VMEM((LANES,), jnp.int32),
+            pltpu.VMEM((union_cap + 2 * LANES,), jnp.int32),
+            pltpu.VMEM((union_cap + 2 * LANES,), jnp.int32),
+            pltpu.VMEM((union_cap + 2 * LANES,), jnp.int32),
+        ),
+        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, needs_layout_passes=False),
+        name=f"qsa_union_sc_cmp_tables_c{union_cap}",
+    )(bits_flat.astype(jnp.int32), physw_flat, p0_lanes)
+    return rows.reshape(ngroups, union_cap), codes.reshape(ngroups, union_cap), usize.reshape(ngroups, LANES)[:, 0]
 
 
 # Gather step.
@@ -1321,9 +1498,19 @@ def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group):
     contiguous run of items per vector subcore; the slab-major output is regrouped by XLA as the TensorCore plan
     regroups its own.
     """
-    tokens, k = sel.shape
+    tokens = sel.shape[0]
     if group % LANES or 128 % group or tokens % group:
         raise ValueError(f"the SparseCore bitset needs groups of whole 16-row slabs that split the {tokens} rows")
+    flat = union_sc_bits_flat(sel, bit_lengths, ratio=ratio, groups=groups, words=words)
+    return bits_slabs_to_plan(flat, tokens=tokens, group=group, words=words)
+
+
+def union_sc_bits_flat(sel, bit_lengths, *, ratio, groups, words):
+    """``union_sc_bits``' slab-major output, int32[T // 16 * words * 16]: each 16-row slab's bitset words, a row a
+    lane (the compare core's union groups are these slabs)."""
+    tokens, k = sel.shape
+    if tokens % LANES:
+        raise ValueError(f"the SparseCore bitset needs whole 16-row slabs, not {tokens} rows")
     if words % 8 or groups > words * WORD_BITS:
         raise ValueError("words must be a multiple of 8 covering every group")
     _log2(ratio)
@@ -1341,4 +1528,4 @@ def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group):
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, needs_layout_passes=False),
         name=f"qsa_union_sc_bits_k{k}_w{words}",
     )(sel.astype(jnp.int32).reshape(-1), bit_lengths.astype(jnp.int32))
-    return bits_slabs_to_plan(flat, tokens=tokens, group=group, words=words)
+    return flat
