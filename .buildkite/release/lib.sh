@@ -13,7 +13,11 @@
 # limitations under the License.
 # shellcheck shell=bash
 
-# Shared by the vllm-torchtpu-release steps. Sourced, not run.
+# Shared by the vllm-torchtpu-release steps and the CI wheel build
+# (pipeline_ci_wheels.yml). Sourced, not run.
+
+# Resolved once, here: a caller may source this by a relative path and then cd.
+_RELEASE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Where the staged images go before anyone approves, and where approved images
 # are copied to. GAR is internal; Docker Hub is what users pull.
@@ -60,9 +64,24 @@ resolve_release_version() {
     echo "${version}"
 }
 
+# CI wheel builds (CI_WHEELS=1): a local version, which PyPI rejects, and not a
+# pre-release, so the core's exact pin resolves. "g" keeps the local part from
+# being all digits, which would drop its leading zeros.
+ci_wheel_version() {
+    local commit
+    commit="$(git -C "${_RELEASE_LIB_DIR}" rev-parse HEAD)" \
+        || die "could not read this checkout's commit."
+    echo "0.0.0+g${commit:0:12}"
+}
+
 # The version every step of the build agrees on, set once by preflight.sh
-# (or resolved on the spot when running a step standalone).
+# (or resolved on the spot when running a step standalone). A CI wheel build
+# has no release version; it uses ci_wheel_version.
 release_version() {
+    if [[ "${CI_WHEELS:-}" == "1" ]]; then
+        ci_wheel_version
+        return
+    fi
     local rc=0
     buildkite-agent meta-data exists release-version || rc=$?
     case "${rc}" in
