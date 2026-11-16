@@ -157,6 +157,9 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+        from vllm_torchtpu.omni.patches import _patch_diffusion_tpu_compile
+
+        _patch_diffusion_tpu_compile()
 
     @staticmethod
     def _offload_dense_all_to_all() -> None:
