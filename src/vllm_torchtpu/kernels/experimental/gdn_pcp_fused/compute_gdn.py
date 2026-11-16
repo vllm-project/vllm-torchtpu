@@ -135,8 +135,9 @@ def _dot_kq_with_v_heads(
 ) -> jax.Array:
     """Contracts a per-KQ-head operand with a per-V-head operand.
 
-    An even number of V heads per KQ head is packed in pairs along the lane
-    axis, so that each matmul fills 2 * v_head_dim MXU columns.
+    When the number of V heads per KQ head is even and v_head_dim % 128 == 0,
+    V heads are packed in pairs along the lane axis so each matmul fills
+    2 * v_head_dim MXU columns; otherwise V heads are contracted individually.
     """
     v_per_kq_head = v_operand.shape[0] // kq_operand.shape[0]
     pair_v_heads = v_per_kq_head % 2 == 0 and v_operand.shape[-1] % 128 == 0
