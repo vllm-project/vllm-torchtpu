@@ -188,7 +188,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
     VLLM_TPU_QSA_PREFILL_COMPARE_CORE: bool = False
-    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP: int = 2048
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP: int = 4096
     VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH: int = 8
     VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES: str = "sparsecore"
     VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS: int = 0
@@ -1069,7 +1069,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET) or by the XLA "reference". Not bitwise against the served
     # kernels (bf16 probabilities, union-order accumulation).
     "VLLM_TPU_QSA_PREFILL_COMPARE_CORE": env_bool("VLLM_TPU_QSA_PREFILL_COMPARE_CORE"),
-    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", 2048),
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", 4096),
     "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH", 8),
     "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES": env_str("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES", "sparsecore"),
     # Debug only (untimed runs): every N-th compare-core call of a process logs its union groups, tiles a live

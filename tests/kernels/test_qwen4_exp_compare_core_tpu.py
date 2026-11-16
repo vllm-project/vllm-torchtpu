@@ -133,7 +133,7 @@ def _aligned_tables(step, lister, bitset, cap):
 
 def test_sparsecore_tables_equal_the_reference():
     step = _step(0, CASES[2][1], CASES[2][2], CASES[2][3])
-    cap = int(os.environ.get("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", "2048"))
+    cap = int(os.environ.get("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", "4096"))
     got_fn, args, _ = _aligned_tables(step, "sparsecore", "sparsecore", cap)
     want_fn, _, _ = _aligned_tables(step, "reference", "tensorcore", cap)
     got, want = jax.block_until_ready(got_fn(*args)), jax.block_until_ready(want_fn(*args))
@@ -161,7 +161,7 @@ def test_numerics_and_time_against_served(monkeypatch, name, reqs, tokens, page)
     max_rel = float(d.max() / scale)
     finite = bool(np.isfinite(port).all())
     # The core's parts on the same step: tables, then the kernel on them.
-    cap = int(os.environ.get("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", "2048"))
+    cap = int(os.environ.get("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", "4096"))
     lister = os.environ.get("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES", "sparsecore")
     bitset = "sparsecore" if os.environ.get("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET") == "1" else "tensorcore"
     tables_fn, targs, aq = _aligned_tables(step, lister, bitset, cap)
