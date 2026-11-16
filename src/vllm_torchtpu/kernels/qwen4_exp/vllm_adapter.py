@@ -13,6 +13,7 @@ from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
+from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_cmp import hc_prefill_mix_cmp
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_fused import hc_prefill_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
@@ -277,10 +278,14 @@ def build_prefill_inj_mix_op(
     token_tile: int,
     partial: bool = False,
     norm_impl: str = "vpu",
+    cmp: bool = False,
 ):
     """TPU_QWEN4_HC_PREFILL_FUSED_MIX: prefill HC mix returning ``(mixed,
-    injection)``; ``norm`` stays on chip. Callers gate it to whole tiles."""
+    injection)``; ``norm`` stays on chip. Callers gate it to whole tiles.
+    ``cmp`` (TPU_QWEN4_HC_PREFILL_COMPARE): hc_prefill_cmp's kernel, which
+    ignores ``norm_impl``."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+    mix = hc_prefill_mix_cmp if cmp else hc_prefill_mix
 
     def core(
         x: jax.Array,
@@ -289,7 +294,7 @@ def build_prefill_inj_mix_op(
         up: jax.Array,
         inject_weight: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        return hc_prefill_mix(
+        return mix(
             x,
             weight,
             down,
@@ -305,7 +310,8 @@ def build_prefill_inj_mix_op(
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_inj_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
-        f"{'_p' if partial else ''}{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'_p' if partial else ''}"
+        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
         core,
     )
 
@@ -327,13 +333,16 @@ def build_prefill_combine_mix_op(
     token_tile: int,
     partial: bool = False,
     norm_impl: str = "vpu",
+    cmp: bool = False,
 ):
     """The previous HC's combine fused ahead of this HC's prefill mix.
 
     Returns ``(mixed, injection, combined)``; ``combined`` is the hyper input
-    this HC mixed (the next combine's residual).
+    this HC mixed (the next combine's residual). ``cmp`` as in
+    ``build_prefill_inj_mix_op``.
     """
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+    mix = hc_prefill_mix_cmp if cmp else hc_prefill_mix
 
     def core(
         residual: jax.Array,
@@ -344,7 +353,7 @@ def build_prefill_combine_mix_op(
         up: jax.Array,
         inject_weight: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        return hc_prefill_mix(
+        return mix(
             residual,
             weight,
             down,
@@ -363,7 +372,7 @@ def build_prefill_combine_mix_op(
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_combine_c{branches}_h{hidden}_m{token_tile}"
         f"_e{eps_tag}{'_p' if partial else ''}"
-        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
         core,
     )
 

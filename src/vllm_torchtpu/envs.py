@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
     TPU_QWEN4_HC_PREFILL_NORM: str = "vpu"
+    TPU_QWEN4_HC_PREFILL_COMPARE: bool = False
     VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
@@ -1406,6 +1407,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["vpu", "rows64", "gram", "gram64", "bf16ep", "bf16ep64"],
         case_sensitive=False,
     ),
+    # qwen4_exp prefill, at the fused-mix row counts (whole or partial
+    # hc_prefill_full_tile tiles, at least two): the HC mixes run as
+    # hc_prefill_cmp.py (row tile r's combine, norm and down dot beside row
+    # tile r - 1's up dots and mean; weights copied into VMEM from their
+    # checkpoint layouts), and each layer's mlp combine runs as the prologue of
+    # the next layer's attn mix inside a pipeline stage (as
+    # TPU_QWEN4_HC_DECODE_FOLD at decode sizes). Layers with a per-layer
+    # embedding and a stage's last layer keep the separate combine. Implies the
+    # fused mix's tile counts.
+    "TPU_QWEN4_HC_PREFILL_COMPARE": env_bool("TPU_QWEN4_HC_PREFILL_COMPARE"),
     # Pooled GDN: skip zero-filling the [T, n_v, d_v] output before the
     # decode (BATCHED) and prefill (PER_SEQ) kernels write it. Rows no request
     # owns (bucket padding) are then left unwritten; the decoder layer masks
