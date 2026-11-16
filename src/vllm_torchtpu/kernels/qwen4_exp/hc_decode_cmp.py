@@ -55,9 +55,12 @@ LANES = 128
 
 
 # (lookahead, overlap, up_whole): MiB of copies kept in flight ahead of the
-# one being waited (a large number issues all at entry), the next stream's norm in
-# one block with the previous down dot, one up dot for all streams.
-DEFAULT_OPTS = (("lookahead", 1024), ("overlap", False), ("up_whole", False))
+# one being waited (a large number issues all at entry), the next stream's norm
+# in one block with the previous down dot, one up dot for all streams. The
+# default is the fastest form timed on TPU7x (j-283f92fc, tools/hc_cmp/bench.py):
+# 15.3 us a call at 256 rows against 17.9 with a 4 MiB budget and 21.8 with
+# every copy at entry and no overlap.
+DEFAULT_OPTS = (("lookahead", 8), ("overlap", True), ("up_whole", True))
 
 
 def cmp_applies(tokens: int) -> bool:
