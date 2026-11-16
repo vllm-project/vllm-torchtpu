@@ -62,6 +62,10 @@ def gdn_reference(
       `False` (default), `rec` has separate `NS, vh` axes.
     """
     R, B, T, NS = ex.R, ex.B, ex.T, ex.NS
+    if packed_conv and T != 1:
+        raise MegakernelConfigError(
+            f"gdn_reference: packed_conv=True requires T == 1, got T={T}"
+        )
     o_gdn = int(gdn_idx)
     lyr = o_gdn if layer_idx is None else int(layer_idx)
     L = int(getattr(g, "L", 1))
