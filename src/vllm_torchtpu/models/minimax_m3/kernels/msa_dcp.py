@@ -160,7 +160,10 @@ def _candidates_kernel(
     Row block ``i`` scans only its first ``widths_ref[i]`` columns (one of
     the static `widths`, covering every block its rows see): the scores span
     the whole max-model-len width, mostly past every row's context (c4
-    prefill twin, j-3c651507: ~240 of 1,024 columns visible)."""
+    prefill twin, j-3c651507: ~240 of 1,024 columns visible). `local_candidates`
+    now passes this row-major kernel one full width (its blocks are not
+    transposed); the per-block widths remain for the transposed kernel's
+    callers and the tests."""
     rank = rank_ref[0]
     width_now = widths_ref[pl.program_id(0)]
     rows = scores_ref.shape[0]
@@ -1104,9 +1107,7 @@ def use_decode_plan(num_tokens: int, topk: int) -> bool:
         and num_tokens <= _PLAN_MAX_TOKENS
         and _LANES % topk == 0
         and block_q * topk == _LANES
-        and msa_attention_lse.fits_work_row(
-            block_q, topk, _SMALL_BATCH_PAGES_PER_STEP
-        )
+        and msa_attention_lse.fits_work_row(block_q, topk, _SMALL_BATCH_PAGES_PER_STEP)
     )
 
 

@@ -315,7 +315,8 @@ def block_score_options(index_heads: int = 1, wide: bool = False) -> dict[str, i
 
 def _wide_decode_scores(index_q, index_cache, seq_lens, index_heads) -> bool:
     """Whether a step's block scores take 256-page groups: a decode step
-    (`msa_indexer.is_prefill_step`) of more than one request's rows, over
+    (`msa_indexer.is_prefill_step`) of more query rows per index head than
+    one request's `_DECODE_ROWS` (a verify step of 2+ requests), over
     8-bit or 4-bit index pages (a 256-page ring of bf16 pages is twice the
     VMEM). Standalone decode calls (j-83e37332): int4 folded 23 x 450 pages
     94.7 -> 77.9 us, 36 x 366 pages 110.6 -> 105.7, fp8 5 x 450 pages 24.0 ->

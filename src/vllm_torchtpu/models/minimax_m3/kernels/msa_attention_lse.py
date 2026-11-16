@@ -224,9 +224,11 @@ def _kernel(
                 span = jnp.where(count <= width, width, span)
 
             def zero(g, carry):
-                values = buf_ref.at[half, g].bitcast(jnp.uint32).at[
-                    0, :, 0, pl.ds(row_width // 2, row_width // 2)
-                ]
+                values = (
+                    buf_ref.at[half, g]
+                    .bitcast(jnp.uint32)
+                    .at[0, :, 0, pl.ds(row_width // 2, row_width // 2)]
+                )
                 values[...] = jnp.zeros(values.shape, jnp.uint32)
                 return carry
 
