@@ -25,10 +25,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    Dimensions,
+    InputConfigs,
     TileSizes,
     apply_act_fn,
+    calculate_tiling,
     gmm_v2,
     interleave_lane,
     situ_and_mul,
@@ -503,3 +507,33 @@ def test_gmm_fp4_fp8_w8a8_matches_reference(monkeypatch):
     # e4m3 keeps 3 mantissa bits: ~4% relative error per operand.
     assert np.abs(actual - expected).mean() < 0.1 * np.abs(expected).mean()
     np.testing.assert_allclose(actual, expected, atol=0.15 * np.abs(expected).max())
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("w8a8, tile_m", [("0", 256), ("1", 320)])
+@pytest.mark.parametrize("size_n, size_group", [(6144, 16), (768, 128)])
+def test_calculate_tiling_w8a8_prefill_fifth_bucket(
+    monkeypatch, w8a8, tile_m, size_n, size_group
+):
+    """8k-token prefill chunks (MiniMax-M3.1, EP8 local or TP-sliced experts:
+    ~256 rows per group): the fp8 x fp8 path takes a fifth 64-row bucket."""
+    _require_tpu()
+    monkeypatch.setenv("TPU_GMM_FP8_W8A8", w8a8)
+    dims = Dimensions(
+        size_m=32768,
+        size_k=6144,
+        size_n=size_n,
+        size_group=size_group,
+        size_lhs_group=size_group,
+        size_lhs_sublane=16,
+    )
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
+    rhs_cfgs = InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=128,
+        dtype=jnp.float4_e2m1fn,
+        has_scale=True,
+    )
+    vmem_limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit, "swigluoai")
+    assert (tiles.tile_m, tiles.bucket_base) == (tile_m, 64)
