@@ -23,9 +23,10 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from runner_input_test_utils import (
+from runner_output_test_utils import (
     _assert_same_logprobs_lists,
     _blocking_logprobs_lists,
+    _sample_tokens_runner,
 )
 from vllm.config import (
     CacheConfig,
@@ -3835,63 +3836,14 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
     g = torch.Generator().manual_seed(0)
     logits_list = [torch.randn(4, 64, generator=g), torch.randn(4, 64, generator=g)]
     num_reqs_list = [4, 2]
-    req_ids = [f"r{i}" for i in range(6)]
 
     gathered = []
 
     def run():
-        scheduler_output = SimpleNamespace(
-            num_scheduled_tokens={r: 1 for r in req_ids},
-            finished_req_ids=set(),
-            has_structured_output_requests=False,
-        )
-        requests = {
-            r: SimpleNamespace(num_computed_tokens=0, num_tokens=1, output_token_ids=[])
-            for r in req_ids
-        }
-        requests["r1"].num_tokens = 2  # A partial prefill: its token is discarded.
-        runner = SimpleNamespace(
-            _pp_handoff=None,
-            _dp_step_other_decode=False,
-            num_prompt_logprobs={},
-            execute_model_state=SimpleNamespace(
-                scheduler_output=scheduler_output,
-                draft_chunks=[],
-                logits_list=list(logits_list),
-                num_reqs_list=list(num_reqs_list),
-                spec_decode_metadata_list=[None, None],
-                mamba_state_indices_list=None,
-                mamba_boundary_plans=None,
-                pooler_output_list=[],
-                top_tokens=False,
-                kv_save_nan_check=None,
-                prompt_logprobs_chunks=[],
-            ),
-            input_batch=SimpleNamespace(
-                max_num_logprobs=max_logprobs,
-                num_reqs=6,
-                req_ids=list(req_ids),
-                req_id_to_index={r: i for i, r in enumerate(req_ids)},
-                all_greedy=False,
-                num_tokens_no_spec=[1] * 6,
-                token_ids_cpu=np.zeros((6, 8), dtype=np.int32),
-                generators={},
-            ),
-            requests=requests,
-            speculative_config=None,
-            scheduler_config=SimpleNamespace(async_scheduling=False),
+        runner = _sample_tokens_runner(
+            logits_list,
+            num_reqs_list,
             model_config=SimpleNamespace(max_logprobs=max_logprobs),
-            _is_async_drafter=False,
-            _is_dspark_pd_producer=False,
-            _fence_spec_kv_under_token_copy=False,
-            _min_tokens_batch_state=lambda: {},
-            _adaptive_verification=None,
-            is_pooling_model=False,
-            drafter=SimpleNamespace(),
-            spec_decode_manager=SimpleNamespace(
-                propose_draft_token_ids=lambda **kw: None
-            ),
-            _get_sampling_generator=lambda: None,
             # Temperature 0: every row samples its argmax, whatever the noise.
             _build_padded_sampling_params=lambda start, end, logits: (
                 torch.zeros((logits.shape[0], 1)),
@@ -3900,10 +3852,11 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
             ),
             _sampler_topk_candidates=lambda start, end, grammar: 0,
             _sampler_applies_topk_topp=lambda: False,
-            _update_mamba_slot_read_offsets=lambda *_args: None,
-            _update_num_xla_graphs=lambda *_args: None,
-            _stage_timing=MagicMock(),
         )
+        runner.input_batch.max_num_logprobs = max_logprobs
+        runner.input_batch.all_greedy = False
+        # A partial prefill: its token is discarded.
+        runner.requests["r1"].num_tokens = 2
         runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
         runner.sample_from_logits_func = (
             TPUModelRunner.sample_from_logits.__wrapped__.__get__(runner)
@@ -3915,13 +3868,6 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
             return gathered[-1]
 
         runner.gather_logprobs = recording_gather_logprobs
-        runner._stage_timing.take_samples.return_value = ([], [])
-        for name in (
-            "maybe_wait_for_kv_save",
-            "get_finished_kv_transfers",
-            "_build_kv_connector_output",
-        ):
-            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         return TPUModelRunner.sample_tokens(runner, None)
 
     deferred = run()
@@ -4025,77 +3971,20 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
 
     # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
     for spec_method in (None, "ngram"):
-        scheduler_output = SimpleNamespace(
-            num_scheduled_tokens={"r0": 1, "r1": 1},
-            finished_req_ids=set(),
-            has_structured_output_requests=False,
-        )
-        runner = SimpleNamespace(
-            _pp_handoff=None,
-            _dp_step_other_decode=False,
-            num_prompt_logprobs={},
-            execute_model_state=SimpleNamespace(
-                scheduler_output=scheduler_output,
-                draft_chunks=[],
-                logits_list=[bf16_logits],
-                num_reqs_list=[2],
-                spec_decode_metadata_list=[None],
-                mamba_state_indices_list=None,
-                mamba_boundary_plans=None,
-                pooler_output_list=[],
-                top_tokens=False,
-                kv_save_nan_check=None,
-                prompt_logprobs_chunks=[],
-            ),
-            input_batch=SimpleNamespace(
-                max_num_logprobs=None,
-                num_reqs=2,
-                req_ids=["r0", "r1"],
-                req_id_to_index={"r0": 0, "r1": 1},
-                all_greedy=False,
-                num_tokens_no_spec=[1, 1],
-                token_ids_cpu=np.zeros((2, 8), dtype=np.int32),
-            ),
-            requests={
-                "r0": SimpleNamespace(
-                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
-                ),
-                "r1": SimpleNamespace(
-                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
-                ),
-            },
+        runner = _sample_tokens_runner(
+            [bf16_logits],
+            [2],
             speculative_config=(
                 None
                 if spec_method is None
                 else SimpleNamespace(method=spec_method, num_speculative_tokens=1)
             ),
-            scheduler_config=SimpleNamespace(async_scheduling=False),
-            _is_async_drafter=False,
-            _is_dspark_pd_producer=False,
-            _fence_spec_kv_under_token_copy=False,
-            _min_tokens_batch_state=lambda: {},
-            _adaptive_verification=None,
-            is_pooling_model=False,
-            drafter=SimpleNamespace(),
-            spec_decode_manager=SimpleNamespace(
-                propose_draft_token_ids=lambda **kw: None
-            ),
-            _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
             _sampler_applies_topk_topp=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
-            _update_mamba_slot_read_offsets=lambda *_args: None,
-            _update_num_xla_graphs=lambda *_args: None,
-            _stage_timing=MagicMock(),
         )
-        runner._stage_timing.take_samples.return_value = ([], [])
-        for name in (
-            "maybe_wait_for_kv_save",
-            "get_finished_kv_transfers",
-            "_build_kv_connector_output",
-        ):
-            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        runner.input_batch.all_greedy = False
 
         TPUModelRunner.sample_tokens(runner, None)
 

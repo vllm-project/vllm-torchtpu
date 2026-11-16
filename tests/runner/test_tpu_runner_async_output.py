@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-from runner_input_test_utils import (
+from runner_output_test_utils import (
     _assert_same_logprobs_lists,
     _blocking_logprobs_lists,
 )
