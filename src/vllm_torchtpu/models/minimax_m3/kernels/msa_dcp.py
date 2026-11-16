@@ -80,17 +80,10 @@ DCP_SMALL_BATCH_TOKENS = 1024
 # pages ~3,000 bundles vs 2 x ~1,700 for two 16-page steps), and a tile pays
 # a group step's fixed cost (~0.7 us) once per 32 pages, not 16 (c4 b3: -4.6
 # us per call, c16 b6: -3.7, twins j-315ea1ce, j-c2aafd46). A step of one
-# tile keeps 16-page groups: its second group's pages arrive while the first
-# computes, where a 32-page group waits for all of them (c4 b1: +2.9 us per
-# call at 32 pages, j-315ea1ce).
+# tile too, now that 8-bit pages enter the MXU as stored: c4 b1 decode
+# attention 5.9 -> 5.3 us per call (twins j-e5b22c98, j-52a1417f; while
+# pages were unpacked to bf16 it was +2.9 us, j-315ea1ce).
 _SMALL_BATCH_PAGES_PER_STEP = 32
-
-
-def _small_batch_pages_per_step(num_tokens: int) -> int:
-    """Pages per kernel step of a small batch's 8-token tiles."""
-    if num_tokens <= msa_attention.SMALL_BATCH_BLOCK_Q:
-        return msa_attention.DEFAULT_PAGES_PER_STEP
-    return _SMALL_BATCH_PAGES_PER_STEP
 
 
 # Decode steps of up to this many tokens run `_decode_plan_kernel`: its dense
@@ -852,7 +845,7 @@ def msa_attend_dcp(
     small = num_tokens <= DCP_SMALL_BATCH_TOKENS
     if small:
         block_q = msa_attention.SMALL_BATCH_BLOCK_Q
-        pages_per_step = _small_batch_pages_per_step(num_tokens)
+        pages_per_step = _SMALL_BATCH_PAGES_PER_STEP
     elif scale_cache is not None:
         block_q = msa_attention.PREFILL_BLOCK_Q_4BIT
         pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP_4BIT
@@ -1092,7 +1085,7 @@ def use_decode_plan(num_tokens: int, topk: int) -> bool:
         and _LANES % topk == 0
         and block_q * topk == _LANES
         and msa_attention_lse.fits_work_row(
-            block_q, topk, _small_batch_pages_per_step(num_tokens)
+            block_q, topk, _SMALL_BATCH_PAGES_PER_STEP
         )
     )
 
@@ -1117,7 +1110,7 @@ def _attend_pair_decode(
     (`msa_attention_lse.planned_attention`)."""
     num_q_heads, num_tokens, _ = q_all.shape
     block_q = msa_attention.SMALL_BATCH_BLOCK_Q
-    pages_per_step = _small_batch_pages_per_step(num_tokens)
+    pages_per_step = _SMALL_BATCH_PAGES_PER_STEP
     sections, _, tiles_per_step, groups_per_tile = msa_attention_lse.call_work_spec(
         num_tokens, num_q_heads, q_all.dtype, topk, block_q, pages_per_step
     )
