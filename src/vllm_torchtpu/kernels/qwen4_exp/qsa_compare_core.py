@@ -376,9 +376,15 @@ def _kernel(
         q_copy(row_of(0) >> ct_shift, 0).start()
         for k in range(lead):
             srow_copy(k, k % D).start()
-        for k in range(lead):
-            srow_copy(k, k).wait()
-            kv_issue(k, k)
+        @pl.when(total < (1 << 30))
+        def _():
+            # Its own region (a condition the parent's does not imply, so it is not folded away): the slot-row copies
+            # below write buffers these copies read their addresses from, and nothing orders an asynchronous SMEM
+            # write after scalar loads in the same basic block. (In the loop a body writes only a buffer last read in
+            # an earlier body.)
+            for k in range(lead):
+                srow_copy(k, k).wait()
+                kv_issue(k, k)
         for k in range(lead, lead + E):
             srow_copy(k, k % D).start()
         bodies = total + 2
@@ -424,9 +430,15 @@ def _kernel(
         q_copy(row_of(0) >> ct_shift, 0).start()
         for k in range(lead):
             srow_copy(k, k % D).start()
-        for k in range(lead):
-            srow_copy(k, k).wait()
-            kv_issue(k, k)
+        @pl.when(total < (1 << 30))
+        def _():
+            # Its own region (a condition the parent's does not imply, so it is not folded away): the slot-row copies
+            # below write buffers these copies read their addresses from, and nothing orders an asynchronous SMEM
+            # write after scalar loads in the same basic block. (In the loop a body writes only a buffer last read in
+            # an earlier body.)
+            for k in range(lead):
+                srow_copy(k, k).wait()
+                kv_issue(k, k)
         # Each slot-row copy runs E tiles ahead of its use: an HBM-to-SMEM copy outlasts a tile.
         for k in range(lead, lead + E):
             srow_copy(k, k % D).start()
