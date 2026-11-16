@@ -80,7 +80,7 @@ def test_resolve_policy_fails_loudly_on_missing_parallel_field(missing):
 @pytest.mark.parametrize(
     "overrides, expected_fragment",
     [
-        ({"is_unquantized_model": False}, "non-unquantized"),
+        ({"is_unquantized_model": False}, "quantized model"),
         (
             {
                 "parallel_config": _supported_parallel_config(

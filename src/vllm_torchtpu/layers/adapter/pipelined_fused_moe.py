@@ -249,7 +249,8 @@ def pipelined_fused_moe_gmm(
     if padded_row_filter is PaddedRowFilter.ROW_COUNT or row_info is not None:
         raise NotImplementedError(
             "pipelined_fused_moe_gmm does not support PaddedRowFilter.ROW_COUNT "
-            "(chunked DP/PCP layouts cannot reuse a single local valid-row count)."
+            "or row_info (chunked DP/PCP layouts cannot reuse a single local "
+            "valid-row count)."
         )
     collective_group, _ = _get_moe_collective_group()
 

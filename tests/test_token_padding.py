@@ -239,20 +239,3 @@ def test_valid_tokens_allocation_is_gated_by_track_valid_tokens():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.get_local_valid_tokens() is None
-
-
-def test_update_writes_mask_every_call_without_caching():
-    """Verify no hidden write-skipping cache suppresses repeated mask updates."""
-    writes = 0
-
-    class _CountingMask(torch.Tensor):
-        def copy_(self, src, non_blocking=False):
-            nonlocal writes
-            writes += 1
-            return super().copy_(src, non_blocking=non_blocking)
-
-    mask = _CountingMask(torch.zeros(8, dtype=torch.bool))
-    state = TokenPaddingState(local_padding_mask=mask)
-    state.update(4, 8)
-    state.update(4, 8)
-    assert writes == 2

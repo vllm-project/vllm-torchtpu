@@ -16,8 +16,8 @@
 - Skipping on: skip_padded_tokens=True, PaddedRowFilter.ROW_COUNT and
   row_info=local_valid_tokens.
 - Skipping off (flag off, an unsupported configuration, or a layer built
-  outside the runner's policy scope): skip_padded_tokens=False, without
-  padded_row_filter or row_info.
+  outside the runner's policy scope): skip_padded_tokens=False and
+  PaddedRowFilter.ZERO_WEIGHT (the stock kernel), without row_info.
 """
 
 from types import SimpleNamespace
@@ -132,8 +132,9 @@ def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
 
 
 def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
-    """With skipping off, the forward passes skip_padded_tokens=False and omits
-    padded_row_filter and row_info, also when pipelined_fused_moe_gmm runs."""
+    """With skipping off, the forward passes skip_padded_tokens=False and
+    PaddedRowFilter.ZERO_WEIGHT without row_info, also when
+    pipelined_fused_moe_gmm runs."""
     state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
     state.update(1, 4)
     token_padding.set_padding_state(state)
@@ -153,7 +154,7 @@ def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
     assert len(capture_forward.pipelined_calls) == 1
     for call in (capture_forward.fused_calls[0], capture_forward.pipelined_calls[0]):
         assert call["skip_padded_tokens"] is False
-        assert "padded_row_filter" not in call
+        assert call["padded_row_filter"] is PaddedRowFilter.ZERO_WEIGHT
         assert "row_info" not in call
 
 
@@ -258,4 +259,4 @@ def test_disable_moe_skip_disarms_and_prebuilds_stock_kernel(monkeypatch):
     method.disable_moe_skip(_dummy_layer())
     assert method._skip_padded_tokens is False
     assert [call["skip_padded_tokens"] for call in prebuild_calls] == [False]
-    assert "padded_row_filter" not in prebuild_calls[0]
+    assert prebuild_calls[0]["padded_row_filter"] is PaddedRowFilter.ZERO_WEIGHT

@@ -279,8 +279,16 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
                 topk=tpu_layer.moe_config.experts_per_token,
                 activation=self._tpu_activation_str,
                 use_ep=tpu_layer.moe_config.moe_parallel_config.use_ep,
-                skip_padded_tokens=False,
+                skip_padded_tokens=self._skip_padded_tokens,
+                padded_row_filter=self._padded_row_filter,
             )
+
+    @property
+    def _padded_row_filter(self) -> PaddedRowFilter:
+        """Row filter of the prebuilt kernel and the forward call."""
+        if self._skip_padded_tokens:
+            return PaddedRowFilter.ROW_COUNT
+        return PaddedRowFilter.ZERO_WEIGHT
 
     @property
     def is_monolithic(self) -> bool:
@@ -379,11 +387,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             skip_padded_tokens=self._skip_padded_tokens,
-            padded_row_filter=(
-                PaddedRowFilter.ROW_COUNT
-                if self._skip_padded_tokens
-                else PaddedRowFilter.ZERO_WEIGHT
-            ),
+            padded_row_filter=self._padded_row_filter,
         )
 
     def _forward_monolithic_tpu(
@@ -419,6 +423,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
             "skip_padded_tokens": self._skip_padded_tokens,
+            "padded_row_filter": self._padded_row_filter,
         }
         if self._skip_padded_tokens:
             # Rows at index >= the local valid-token count are padding.
@@ -428,7 +433,6 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
                     "bf16 MoE padded-token skipping is on, but TokenPaddingState "
                     "does not track valid tokens (track_valid_tokens=False)."
                 )
-            kwargs["padded_row_filter"] = PaddedRowFilter.ROW_COUNT
             kwargs["row_info"] = row_info
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)

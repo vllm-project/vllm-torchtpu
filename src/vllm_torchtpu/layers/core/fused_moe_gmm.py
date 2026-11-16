@@ -387,9 +387,12 @@ def prepare_routed_gmm_inputs(
     and padded rows are excluded by row index rather than zeroed routing
     weights; real rows keep stock dispatch even if a routing weight is zero.
 
-    For non-EP runs `topk_indices_local` is always non-negative, so the
-    valid-mask path computed below is a no-op (jnp.where on an all-True
-    mask). For EP, the caller applies the expert-map remap upstream
+    For non-EP runs `topk_indices_local` is always non-negative, so without
+    ``skip_padded_tokens`` the valid-mask path computed below is a no-op
+    (jnp.where on an all-True mask). With ``skip_padded_tokens=True`` the
+    mask also drops the padded rows' routes, identified by a zero routing
+    weight (``ZERO_WEIGHT``) or by a row index at or past ``row_info[0]``
+    (``ROW_COUNT``). For EP, the caller applies the expert-map remap upstream
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
     code path.
@@ -566,8 +569,10 @@ def moe_gmm(
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
-    The valid-mask gating below is a no-op for non-EP runs (mask is all
-    True) and keeps the single code path uniform for both EP and non-EP.
+    The valid-mask gating below is a no-op for non-EP runs without
+    padded-token skipping (mask is all True); with skipping it also zeroes
+    the contributions of the dropped padded routes. It keeps the single code
+    path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)

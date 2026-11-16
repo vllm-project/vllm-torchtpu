@@ -31,14 +31,6 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
-class _Mask:
-    def __init__(self):
-        self.updates: list[tuple[int, int]] = []
-
-    def update(self, valid: int, padded: int) -> None:
-        self.updates.append((valid, padded))
-
-
 class _OtherMoEMethod(FusedMoEMethodBase):
     def create_weights(self, *args, **kwargs):
         raise AssertionError("not called")
@@ -49,7 +41,7 @@ class _OtherMoEMethod(FusedMoEMethodBase):
 
 def _runner():
     runner = object.__new__(TPUModelRunner)
-    runner._token_padding_state = _Mask()
+    runner._token_padding_state = None
     runner._bf16_moe_skip_policy = msp.Bf16MoeSkipPolicy(enabled=False)
     runner._last_sequence_layout_plan = None
     return runner
@@ -85,12 +77,17 @@ def _supported_runner(monkeypatch):
 
 def test_every_step_updates_padding_state_including_full_buckets():
     """Single graph: every step, full buckets included, writes the padding
-    state (mask and, with skipping on, local_valid_tokens) before forward."""
+    mask and local_valid_tokens before forward."""
     runner = _runner()
-    steps = [(15, 16), (16, 16), (255, 256), (256, 256), (32, 32)]
-    for valid, padded in steps:
+    state = token_padding.TokenPaddingState.create(256, "cpu", track_valid_tokens=True)
+    runner._token_padding_state = state
+    assert state.local_valid_tokens is not None
+    for valid, padded in [(15, 16), (16, 16), (255, 256), (256, 256), (3, 32)]:
         _step(runner, valid, padded)
-    assert runner._token_padding_state.updates == steps
+        assert state.local_valid_tokens.tolist() == [valid]
+        expected_mask = [False] * 256
+        expected_mask[valid:padded] = [True] * (padded - valid)
+        assert state.local_padding_mask.tolist() == expected_mask
 
 
 def test_resolve_bf16_policy_supported_enables_skipping(monkeypatch):
@@ -106,7 +103,7 @@ def test_resolve_bf16_policy_supported_enables_skipping(monkeypatch):
         (lambda r, mp: mp.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0"), None),
         (
             lambda r, mp: setattr(r.vllm_config, "quant_config", object()),
-            "non-unquantized",
+            "quantized model",
         ),
         (
             lambda r, mp: setattr(r.parallel_config, "enable_expert_parallel", True),
@@ -194,6 +191,39 @@ def test_finalize_policy_keeps_pure_bf16_moe_model(monkeypatch):
     assert runner._bf16_moe_skip_policy is policy
 
 
+def test_fallback_warning_only_for_models_with_bf16_moe_layers(monkeypatch):
+    """With the flag set, a fallback is logged once the model is known to have
+    BF16 MoE layers: not with the flag off, and not for a dense model."""
+    logged: list[tuple] = []
+    monkeypatch.setattr(
+        runner_module.logger, "warning_once", lambda msg, *args: logged.append(args)
+    )
+    runner = _runner()
+    bf16_method = object.__new__(VllmUnquantizedFusedMoEMethod)
+    bf16_method._skip_padded_tokens = False
+    bf16_method._tpu_activation_str = None
+    bf16_mod = SimpleNamespace(quant_method=bf16_method)
+    other_mod = SimpleNamespace(quant_method=object.__new__(_OtherMoEMethod))
+    off = msp.Bf16MoeSkipPolicy(enabled=False)
+    dp = msp.Bf16MoeSkipPolicy(enabled=False, fallback_reason="data_parallel_size > 1")
+    on = msp.Bf16MoeSkipPolicy(enabled=True)
+
+    def _finalize(policy, modules):
+        runner._bf16_moe_skip_policy = policy
+        runner.model = SimpleNamespace(modules=lambda: modules)
+        runner._finalize_bf16_moe_skip_policy_for_model()
+
+    _finalize(off, [bf16_mod])
+    _finalize(dp, [SimpleNamespace()])
+    _finalize(on, [SimpleNamespace()])
+    assert logged == []
+
+    _finalize(dp, [bf16_mod])
+    assert logged == [("data_parallel_size > 1",)]
+    _finalize(on, [bf16_mod, other_mod])
+    assert len(logged) == 2 and logged[1][0].startswith("MoE methods")
+
+
 def test_draft_moe_layers_follow_the_runner_policy(monkeypatch):
     """Flag on with an MTP / EAGLE drafter, in load_model order.
 
@@ -206,7 +236,6 @@ def test_draft_moe_layers_follow_the_runner_policy(monkeypatch):
     drafter = object.__new__(Eagle3Proposer)
     runner.drafter = drafter
     runner.speculative_config = SimpleNamespace()
-    runner.model = object()
     monkeypatch.setattr(
         unquantized.UnquantizedFusedMoEMethod, "__init__", lambda self, moe: None
     )
@@ -224,6 +253,9 @@ def test_draft_moe_layers_follow_the_runner_policy(monkeypatch):
     with msp.bf16_policy_scope(policy):
         target_method = VllmUnquantizedFusedMoEMethod(moe_cfg)
     assert target_method._skip_padded_tokens is False
+    runner.model = SimpleNamespace(
+        modules=lambda: [SimpleNamespace(quant_method=target_method)]
+    )
     runner._finalize_bf16_moe_skip_policy_for_model()
     assert runner._bf16_moe_skip_policy is policy
 

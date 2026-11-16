@@ -82,7 +82,7 @@ def resolve_bf16_moe_skip_policy(
 
     fallback_reason: str | None = None
     if not is_unquantized_model:
-        fallback_reason = "non-unquantized quantization config"
+        fallback_reason = "quantized model"
     elif parallel_config.enable_expert_parallel:
         fallback_reason = "expert parallelism"
     else:

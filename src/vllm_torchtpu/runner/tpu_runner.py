@@ -7798,12 +7798,10 @@ class TPUModelRunner(GPUModelRunner):
         """Resolve BF16 MoE padded-token skipping before model loading.
 
         Gated here, ahead of ``VllmUnquantizedFusedMoEMethod`` construction,
-        GMM kernel prebuild, and the first backbone trace.
+        GMM kernel prebuild, and the first backbone trace. A fallback is
+        logged after loading, once the model is known to have BF16 MoE layers.
         """
-        is_unquantized = isinstance(
-            self.vllm_config.quant_config, VllmUnquantizedConfig
-        )
-        policy = moe_skip_policy.resolve_bf16_moe_skip_policy(
+        return moe_skip_policy.resolve_bf16_moe_skip_policy(
             skip_flag=bool(envs.TPU_MOE_SKIP_PADDED_TOKENS),
             parallel_config=self.parallel_config,
             pipelined_collective=enable_pipelined_collective_and_compute(),
@@ -7814,15 +7812,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.speculative_config is not None or self.drafter is not None
             ),
             has_lora=self.lora_config is not None,
-            is_unquantized_model=is_unquantized,
+            is_unquantized_model=isinstance(
+                self.vllm_config.quant_config, VllmUnquantizedConfig
+            ),
         )
-        if policy.fallback_reason is not None and is_unquantized:
-            logger.warning_once(
-                "TPU_MOE_SKIP_PADDED_TOKENS is not applied to the bf16 MoE "
-                "(%s); falling back to the stock path.",
-                policy.fallback_reason,
-            )
-        return policy
 
     def _load_async_drafter(self) -> None:
         """Load the draft model under the target's BF16 MoE skipping policy.
@@ -7840,39 +7833,42 @@ class TPUModelRunner(GPUModelRunner):
         Runs immediately after model loading and before TokenPaddingState
         allocation or backbone tracing so dense models or models with mixed /
         non-BF16 MoE layers cleanly fall back to the stock contract without
-        allocating ``local_valid_tokens``.
+        allocating ``local_valid_tokens``. With the flag set, a fallback is
+        logged once, and only for a model with BF16 MoE layers.
         """
-        if not self._bf16_moe_skip_policy.enabled:
-            return
-        moe_modules: list[torch.nn.Module] = [
-            m
-            for m in self.model.modules()
-            if isinstance(getattr(m, "quant_method", None), FusedMoEMethodBase)
-        ]
-        method_types = {type(m.quant_method) for m in moe_modules}
-        reason: str | None = None
-        if not method_types:
-            reason = "model has no MoE layers"
-        elif method_types != {VllmUnquantizedFusedMoEMethod}:
-            names = sorted(t.__name__ for t in method_types)
-            reason = f"MoE methods {names}; only the bf16 method is supported"
-
-        if reason is None:
-            return
-
-        for m in moe_modules:
+        policy = self._bf16_moe_skip_policy
+        if not policy.enabled and policy.fallback_reason is None:
+            return  # TPU_MOE_SKIP_PADDED_TOKENS is off.
+        moe_methods: list[tuple[torch.nn.Module, FusedMoEMethodBase]] = []
+        for m in self.model.modules():
             qm = getattr(m, "quant_method", None)
-            if isinstance(qm, VllmUnquantizedFusedMoEMethod):
+            if isinstance(qm, FusedMoEMethodBase):
+                moe_methods.append((m, qm))
+        bf16_methods = [
+            (m, qm)
+            for m, qm in moe_methods
+            if isinstance(qm, VllmUnquantizedFusedMoEMethod)
+        ]
+        if policy.enabled:
+            method_types = {type(qm) for _, qm in moe_methods}
+            if not method_types:
+                reason = "model has no MoE layers"
+            elif method_types != {VllmUnquantizedFusedMoEMethod}:
+                names = sorted(t.__name__ for t in method_types)
+                reason = f"MoE methods {names}; only the bf16 method is supported"
+            else:
+                return
+            for m, qm in bf16_methods:
                 qm.disable_moe_skip(m)
-
-        self._bf16_moe_skip_policy = moe_skip_policy.Bf16MoeSkipPolicy(
-            enabled=False, fallback_reason=reason
-        )
-        if method_types:
+            policy = moe_skip_policy.Bf16MoeSkipPolicy(
+                enabled=False, fallback_reason=reason
+            )
+            self._bf16_moe_skip_policy = policy
+        if bf16_methods:
             logger.warning_once(
                 "TPU_MOE_SKIP_PADDED_TOKENS is not applied to the bf16 MoE "
                 "(%s); falling back to the stock path.",
-                reason,
+                policy.fallback_reason,
             )
 
     def _backbone_dummy_runs(self, num_tokens: int) -> None:
