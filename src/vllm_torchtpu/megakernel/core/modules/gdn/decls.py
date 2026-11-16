@@ -135,17 +135,13 @@ def bind_gdn_module(
 ) -> ModuleBinding:
     """Bind a GDN module class, routing literal `gate=` to `options['gate']`."""
     kw = dict(hf_fields_or_options)
-    for k in ("gate", "gdn_gate"):
+    for k in ("gate", "gdn_gate", "linear_gate_act", "linear_attn_gate_act"):
         if k in kw and not (
             isinstance(kw[k], tuple) and len(kw[k]) == 2 and isinstance(kw[k][0], str)
         ):
             gate_lit = validate_gdn_gate(kw.pop(k))
             b = Module.bind.__func__(cls, prefix, **kw)
-            return dataclasses.replace(
-                b,
-                fields={**b.fields, "gate": ("gdn_gate", gate_lit)},
-                options={**b.options, "gate": gate_lit},
-            )
+            return dataclasses.replace(b, options={**b.options, "gate": gate_lit})
     return Module.bind.__func__(cls, prefix, **kw)
 
 
@@ -160,7 +156,6 @@ def resolve_gdn_binding(
         opt_gate is not None
         and "gate" not in binding.explicit_fields
         and "gdn_gate" not in binding.explicit_fields
-        and binding.fields.get("gate") != ("gdn_gate", opt_gate)
     ):
         raw_gate = opt_gate
     else:

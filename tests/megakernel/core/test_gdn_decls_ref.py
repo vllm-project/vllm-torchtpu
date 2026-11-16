@@ -289,6 +289,7 @@ def test_gdn_decls_options_binding_and_hf_params():
             "hidden_size": 256,
             "linear_num_key_heads": 4,
             "linear_num_value_heads": 8,
+            "gdn_gate": "silu",
         }
     )
     assert res_from_bind.gate == "sigmoid" and res_from_bind.gdn_gate == "sigmoid"
@@ -497,6 +498,20 @@ def test_gdn_reference_matches_direct_computation(
             gate=gate,
         )
         np.testing.assert_allclose(ref_out_p, ref_out, rtol=0, atol=0)
+    elif T > 1 and R == 1 and not multi_layer:
+        with pytest.raises(
+            MegakernelConfigError, match="packed_conv=True requires T == 1"
+        ):
+            gdn_reference(
+                params,
+                x,
+                state_in,
+                g=g,
+                ex=ex,
+                multi_layer=False,
+                packed_conv=True,
+                gate=gate,
+            )
 
     # Independent unsharded NumPy HF GatedDeltaNet oracle across all KH/VH heads
     NS = ex.NS
