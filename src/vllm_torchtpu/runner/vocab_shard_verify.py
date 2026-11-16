@@ -28,7 +28,7 @@ from vllm.distributed import tensor_model_parallel_all_gather
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     TEMPERATURE_EPS,
     _random_rejection_sample_impl,
-    assemble_rejection_output,
+    assemble_rejection_output_and_mask,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     MASKED_LOGIT_VALUE,
@@ -241,7 +241,7 @@ def verify_candidates_impl(
         is_greedy | ~has_recovery_mass, target_argmax.long(), recovered
     ).to(torch.int32)
 
-    selected, valid_slot_mask = assemble_rejection_output(
+    selected, valid_slot_mask = assemble_rejection_output_and_mask(
         draft_token_ids,
         accepted,
         recovered_token_ids,

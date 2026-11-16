@@ -53,6 +53,8 @@ PREFLAT_MAX_PADDED_TOKENS = token_padding.PREFLAT_MAX_PADDED_TOKENS
 
 # Served geometry: 8192-token max bucket; the c4 crash buffer was 8192 + 48.
 MAX_TOKENS = 8192
+# TokenPaddingState.create keeps one row past the largest bucket.
+MASK_ROWS = MAX_TOKENS + 1
 BUCKETS = [4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 384, 512, 1024, 2048, 8192]
 K = 3
 
@@ -67,7 +69,7 @@ def _flags(monkeypatch, preflat: bool, reuse: bool) -> None:
 
 
 def _reference(key: tuple[int, int]) -> torch.Tensor:
-    ref = torch.zeros(MAX_TOKENS, dtype=torch.bool)
+    ref = torch.zeros(MASK_ROWS, dtype=torch.bool)
     ref[key[0] : key[1]] = True
     return ref
 
@@ -110,7 +112,7 @@ def test_padding_mask_preflat_matches_rebuild(monkeypatch, seed, reuse):
         _flags(monkeypatch, preflat=True, reuse=reuse)
         new.update(*key)
         got = new.local_padding_mask
-        assert got.shape == old.local_padding_mask.shape == (MAX_TOKENS,)
+        assert got.shape == old.local_padding_mask.shape == (MASK_ROWS,)
         assert got.dtype == torch.bool
         assert torch.equal(got, old.local_padding_mask)
         assert torch.equal(got, _reference(key))

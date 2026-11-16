@@ -267,3 +267,27 @@ def test_padding_mask_keeps_the_largest_bucket_dynamic(budget):
     torch._dynamo.reset()
     assert symints
     assert out[: budget - 3].eq(2.0).all() and out[budget - 3 :].eq(0.0).all()
+
+
+@pytest.mark.parametrize("preflat", [False, True])
+def test_overwrite_makes_the_next_update_rewrite_the_mask(monkeypatch, preflat):
+    """A mask written from outside `update` (the MTP draft's padding) must not
+    let the REUSE skip keep it for the next target step with the same key, nor
+    land in a cached PREFLAT mask."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
+
+    monkeypatch.setattr(envs, "VLLM_TPU_TOKEN_PADDING_REUSE", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_PREFLAT_FWD_ARGS", preflat, raising=False)
+    state = TokenPaddingState.create(64, "cpu")
+    state.update(24, 32)
+    cached = state.local_padding_mask
+    draft = torch.zeros(65, dtype=torch.bool)
+    draft[3:8] = True
+    state.overwrite(draft)
+    if preflat:
+        assert not cached[3:8].any(), "a cached PREFLAT mask was written"
+    state.update(24, 32)
+    want = torch.zeros(65, dtype=torch.bool)
+    want[24:32] = True
+    assert torch.equal(state.local_padding_mask, want)

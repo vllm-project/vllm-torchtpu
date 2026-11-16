@@ -78,6 +78,14 @@ def test_logs_steps_of_the_configured_size_up_to_the_count():
     assert layer_digest.after_forward(model, 16, 0) is None  # count reached
 
 
+class _IdentityGDN(nn.Module):
+    """The GDN mixer as identity; the decoder also passes it the step's GDN
+    metadata cache."""
+
+    def forward(self, x, *args, **kwargs):
+        return x
+
+
 class _FakeHC(nn.Module):
     def mix(self, hidden):
         return hidden * 2, hidden
@@ -105,7 +113,7 @@ def test_decoder_layer_writes_the_four_points(monkeypatch):
         model, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
     )
     monkeypatch.setattr(
-        model, "Qwen4ExpGatedDeltaNetAttention", Mock(return_value=nn.Identity())
+        model, "Qwen4ExpGatedDeltaNetAttention", Mock(return_value=_IdentityGDN())
     )
     monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity())
     monkeypatch.setattr(model, "GatedResidual", lambda *a, **kw: _FakeHC())

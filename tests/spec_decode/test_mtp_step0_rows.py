@@ -95,6 +95,7 @@ def _proposer(capacity=128, decode=True):
     proposer._check_warm = [False, False]
     proposer._check_decode_calls = 0
     proposer._draft_rows_len = lambda chunk: capacity
+    proposer._seed_extras = {}  # no async seed program (VLLM_TPU_DRAFT_SEED_EXTRAS off)
     calls = []
 
     def fake_forward_draft(**kw):

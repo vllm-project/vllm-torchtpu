@@ -494,7 +494,7 @@ def _random_rejection_sample_impl(
         recovered_token_ids,
     )
 
-    return assemble_rejection_output(
+    return assemble_rejection_output_and_mask(
         draft_token_ids,
         accepted,
         recovered_token_ids,
@@ -506,7 +506,7 @@ def _random_rejection_sample_impl(
     )[0]
 
 
-def assemble_rejection_output(
+def assemble_rejection_output_and_mask(
     draft_token_ids: torch.Tensor,
     accepted: torch.Tensor,
     recovered_token_ids: torch.Tensor,
@@ -522,7 +522,11 @@ def assemble_rejection_output(
     `draft_token_ids` is int64, `accepted` the per-slot accept decisions and
     `recovered_token_ids` the int32 token to emit at a rejected slot. Returns
     the [batch_size, max_draft_tokens + 1] selected tokens, padded with
-    PLACEHOLDER_TOKEN_ID, and the mask of declared draft slots."""
+    PLACEHOLDER_TOKEN_ID, and the mask of declared draft slots.
+
+    (Named apart from ``assemble_rejection_output`` below, which takes the
+    decisions first and returns the tokens only: the candidate-sampling
+    verify's helper of the same name.)"""
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device

@@ -1720,7 +1720,7 @@ class Eagle3Proposer:
             host[num_valid:num_rows] = True
             return host
 
-        state.local_padding_mask.copy_(
+        state.overwrite(
             self._device_constant(("draft_padding", num_valid, num_rows, length), build)
         )
 

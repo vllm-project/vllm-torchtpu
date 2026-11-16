@@ -271,6 +271,11 @@ class Engine:
             },
         )
         r = SimpleNamespace(
+            # The runner's staged H2D sources (stage_h2d_upload).
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
             requests={},
             _mamba_copy_plan=[(gid, [self.pool]) for gid in MAMBA_GIDS],
             scheduler_config=SimpleNamespace(async_scheduling=False),
@@ -805,6 +810,11 @@ def _crossing_runner(offsets, rows_by_gid, *, log_gids, seeded=True, computed=8)
         tables[gid] = SimpleNamespace(get_cpu_tensor=lambda t=t: t)
     pool = torch.zeros((32, 4))
     r = SimpleNamespace(
+        # The runner's staged H2D sources (stage_h2d_upload).
+        _unfenced_h2d_sources=[],
+        _fenced_h2d_sources=[],
+        _free_h2d_sources={},
+        _registered_h2d_sources=set(),
         requests={"a": object()},
         _mamba_copy_plan=[(gid, [pool]) for gid in rows_by_gid],
         scheduler_config=SimpleNamespace(async_scheduling=False),
@@ -895,6 +905,11 @@ def test_cow_copy_keeps_log_rows_and_offset(monkeypatch):
     offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
     offsets[9] = 3
     r = SimpleNamespace(
+        # The runner's staged H2D sources (stage_h2d_upload).
+        _unfenced_h2d_sources=[],
+        _fenced_h2d_sources=[],
+        _free_h2d_sources={},
+        _registered_h2d_sources=set(),
         mamba_slot_read_offsets=offsets,
         kv_cache_raw_tensors=[pool],
         _pool_block_split=1,

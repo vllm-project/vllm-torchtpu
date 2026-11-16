@@ -63,6 +63,18 @@ class TokenPaddingState:
         if "_preflat_base" in self.__dict__:
             self._preflat_base_key = key
 
+    def overwrite(self, mask: torch.Tensor) -> None:
+        """Write `mask` into the original mask buffer from outside `update`
+        (the MTP draft's padding, VLLM_TPU_MTP_DRAFT_PADDING_MASK). Neither the
+        REUSE skip nor a PREFLAT swap may then trust a key: the next `update`
+        rewrites the mask whatever its key, and the cached PREFLAT masks are
+        never written."""
+        if "_preflat_base" in self.__dict__:
+            self._preflat_restore()
+            self._preflat_base_key = None
+        self.local_padding_mask.copy_(mask)
+        self.__dict__.pop("_last_key", None)
+
     def _preflat_swap(self, key: tuple[int, int]) -> bool:
         """VLLM_TPU_PREFLAT_FWD_ARGS: point the mask at an owned device buffer
         built once for `key` (same shape, dtype and values as a write of

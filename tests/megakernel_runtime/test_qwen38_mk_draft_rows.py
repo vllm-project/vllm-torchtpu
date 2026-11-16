@@ -85,6 +85,7 @@ def _loop(use_mk):
     loop = fl._MtpFusedLoop.__new__(fl._MtpFusedLoop)
     torch.nn.Module.__init__(loop)
     loop.mtp, loop.num_steps, loop.prefix, loop.use_mk = _StubMtp(), 2, "", use_mk
+    loop.top_tokens = False  # VLLM_TPU_DRAFT_TOP_TOKENS off (the merged loop reads it)
     return loop
 
 
