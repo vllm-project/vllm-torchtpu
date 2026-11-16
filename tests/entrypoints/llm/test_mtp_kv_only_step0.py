@@ -26,12 +26,15 @@ Under EP-DP lockstep (data parallel 2 with expert parallel, served: vLLM
 runs data parallelism out of process), idle ranks replay the two passes;
 the served outputs must match the switch-off run, and no rank may hang.
 
-Neither test touches the TPU from the pytest process itself. The one-chip
-test waits until its child has released the chips before it goes on.
+Neither test touches the TPU from the pytest process itself. Each starts its
+engines without the TPU bootstrap variables an earlier test's engine may have
+left in the pytest process's environment, and waits for the chips to be free
+before and after every engine it starts.
 
 Run with: pytest tests/entrypoints/llm/test_mtp_kv_only_step0.py -v
 """
 
+import contextlib
 import json
 import multiprocessing
 import os
@@ -59,8 +62,23 @@ MAX_NUM_BATCHED_TOKENS = 1024
 MAX_MODEL_LEN = 2048
 VOCAB = 8192
 MAX_TOKENS = 24
-# One engine's build, warmup and generate; two of them fit the test's timeout.
+# Generous for one engine's build, warmup and generate.
 CHILD_TIMEOUT_S = 480
+# The TPU platform writes these into the environment of the process that
+# builds an engine, for that engine's workers, and leaves them there. An
+# earlier test that built an engine in the pytest process (on every chip,
+# say) leaves its values behind; an engine started from here must work out
+# its own.
+TPU_BOOTSTRAP_ENV = (
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TORCH_TPU_DP_MASTER_ADDR",
+    "TORCH_TPU_DP_MASTER_PORT",
+    "TORCH_TPU_DP_SIZE",
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_TOPOLOGY",
+    "TORCH_TPU_XPROF_SESSION_ID",
+)
 SPEC_DRAFT_METRIC = "vllm:spec_decode_num_draft_tokens"
 SPEC_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens"
 
@@ -156,6 +174,9 @@ def _run_in_child(model_dir: str, switch: bool) -> dict:
     keeps its chips until it exits, so the child, not pytest, holds them, and
     they are free again for the tests after this one that start engines of
     their own."""
+    # The previous engine (another test's, or the switch-off child) may still
+    # hold the chips while it exits.
+    wait_for_tpu_release()
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
     process = context.Process(target=_run_case, args=(model_dir, switch, child))
@@ -170,8 +191,10 @@ def _run_in_child(model_dir: str, switch: bool) -> dict:
         if process.is_alive():
             process.kill()
             process.join()
-    assert isinstance(result, dict), f"child exit code {process.exitcode}: {result}"
-    wait_for_tpu_release()
+    try:
+        assert isinstance(result, dict), f"child exit code {process.exitcode}: {result}"
+    finally:
+        wait_for_tpu_release()
     return result
 
 
@@ -192,6 +215,8 @@ def _run(model_dir: str, switch: bool) -> dict:
     from vllm.inputs import TokensPrompt
     from vllm.v1.metrics.reader import Counter
 
+    for key in TPU_BOOTSTRAP_ENV:
+        os.environ.pop(key, None)
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["VLLM_XLA_CHECK_RECOMPILATION"] = "1"
     os.environ["TPU_MTP_KV_ONLY_STEP0"] = "1" if switch else "0"
@@ -314,6 +339,9 @@ def _serve_and_generate(model_dir: str, switch: bool) -> dict:
     Returns the generated token ids, how many ranks logged that they built
     pass 1, and how many padding-chunk replays of the two passes were
     logged."""
+    # The previous engine (another test's, or this test's switch-off server)
+    # may still hold the chips while it exits.
+    wait_for_tpu_release()
     port = _free_port()
     base = f"http://localhost:{port}"
     cmd = [
@@ -348,8 +376,8 @@ def _serve_and_generate(model_dir: str, switch: bool) -> dict:
         "--speculative-config",
         json.dumps({"method": "mtp", "num_speculative_tokens": NUM_SPEC}),
     ]
-    env = dict(
-        os.environ,
+    env = {k: v for k, v in os.environ.items() if k not in TPU_BOOTSTRAP_ENV}
+    env.update(
         TPU_MTP_KV_ONLY_STEP0="1" if switch else "0",
         VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(SERVE_TIMEOUT_S),
         VLLM_ENGINE_READY_TIMEOUT_S=str(SERVE_TIMEOUT_S),
@@ -371,8 +399,16 @@ def _serve_and_generate(model_dir: str, switch: bool) -> dict:
         )
 
     def tail() -> str:
+        """The log from its first traceback or crash, then its last lines: a
+        worker's root cause is logged well before the API server's traceback."""
         with open(log.name, errors="replace") as fh:
-            return "".join(fh.readlines()[-60:])
+            lines = fh.readlines()
+        marks = ("Traceback", "failed to start", "Fatal Python error", "Check failed")
+        first = next(
+            (i for i, line in enumerate(lines) if any(m in line for m in marks)),
+            len(lines),
+        )
+        return "".join([*lines[first : first + 120], "...\n", *lines[-60:]])
 
     try:
         deadline = time.time() + SERVE_TIMEOUT_S
@@ -421,11 +457,13 @@ def _serve_and_generate(model_dir: str, switch: bool) -> dict:
         }
     finally:
         server.terminate()
-        try:
+        with contextlib.suppress(subprocess.TimeoutExpired):
             server.wait(timeout=180)
-        except subprocess.TimeoutExpired:
+        # The engine processes it started may outlive it.
+        with contextlib.suppress(ProcessLookupError):
             os.killpg(server.pid, signal.SIGKILL)
-            server.wait(timeout=60)
+        server.wait(timeout=60)
+        wait_for_tpu_release()
 
 
 def _lone_prompt() -> list[int]:
