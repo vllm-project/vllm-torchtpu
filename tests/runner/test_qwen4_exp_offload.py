@@ -393,6 +393,91 @@ def test_every_group_kind_round_trips_bit_exactly(monkeypatch, packed):
         assert torch.equal(restored, originals[kind]), kind
 
 
+def test_merged_keys_move_with_their_page(monkeypatch):
+    """QWEN4_EXP_MERGE_COMPRESSED_K with the host tier.
+
+    The runner allocates each region as ``num_blocks`` pages and then a key
+    region with one ``key_stride`` block of keys per block ID. Registration
+    must expose both as [num_blocks, bytes] views of the same storage (the key
+    view at its offset), main-KV groups must move both, other groups only the
+    page, and the worker must hand Raiden those views as they are, so a block's
+    page and keys come back together in a different block.
+    """
+    from unittest.mock import patch
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.offload import merged_key_geometry
+    from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+    from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+    monkeypatch.setenv("QWEN4_EXP_MERGE_COMPRESSED_K", "1")
+    cfg, layout, native, _ = qwen_pool(monkeypatch)
+    cfg.model_config.architecture = ARCH
+    assert layout.merged_compressed
+    page, key_stride = merged_key_geometry(cfg, native)
+    assert page == layout.page_bytes and 0 < key_stride < page
+    region_pages = layout.compressed_region_pages(NUM_BLOCKS)
+    assert region_pages * page >= NUM_BLOCKS * key_stride
+
+    # One region's backing storage: the pages, then the key region.
+    storage = torch.zeros((NUM_BLOCKS + region_pages) * page, dtype=torch.uint8)
+    shape = (NUM_BLOCKS, layout.block_size, 1, 4, 256)
+    pool = storage[: NUM_BLOCKS * page].view(torch.float8_e4m3fn).view(shape)
+    kv_caches = {}
+    for group in native.kv_cache_groups:
+        for name in group.layer_names:
+            kv_caches[name] = [pool] if isinstance(group.kv_cache_spec, MambaSpec) else pool
+    captured = []
+    connector = NS(
+        _vllm_config=cfg,
+        connector_worker=NS(kv_cache_config=native, _init_worker=captured.append),
+    )
+    TPURaidenOffloadingConnector.register_kv_caches(connector, kv_caches)
+    (canonical,) = captured
+    pages_view, keys_view = (t.tensor for t in canonical.tensors)
+    assert [t.page_size_bytes for t in canonical.tensors] == [page, key_stride]
+    assert pages_view.shape == (NUM_BLOCKS, page) and pages_view.storage_offset() == 0
+    assert keys_view.shape == (NUM_BLOCKS, key_stride)
+    assert keys_view.storage_offset() == NUM_BLOCKS * page
+    assert keys_view.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+    for group, refs in zip(native.kv_cache_groups, canonical.group_data_refs):
+        main = any(n.endswith(".self_attn") for n in group.layer_names)
+        assert [r.tensor_idx for r in refs] == ([0, 1] if main else [0]), group.layer_names
+
+    registered = []
+    modules, sys = _fake_tpu_sync(registered)
+    with (
+        patch.dict(sys.modules, modules),
+        patch.object(RaidenStoreOffloadingWorker, "_controller_reachable") as up,
+    ):
+        up.return_value = True
+        worker = RaidenStoreOffloadingWorker(
+            canonical,
+            vllm_config=cfg,
+            kv_cache_config=native,
+            host_blocks_to_allocate=8,
+            controller_address="127.0.0.1:1",
+            rank=0,
+        )
+        worker._register_thread.join(timeout=10)
+    assert registered, "worker never registered"
+    rows = [entry[0] for entry in registered[0][0]]
+    assert rows[0] is pages_view and rows[1] is keys_view
+
+    # Save block 3's page and keys from the row views, clobber, load into block 20.
+    generator = torch.Generator().manual_seed(0)
+    storage.copy_(torch.randint(0, 256, storage.shape, generator=generator, dtype=torch.uint8))
+    src, dst = 3, 20
+    original = (pages_view[src].clone(), keys_view[src].clone())
+    host = [r[src].clone() for r in rows]
+    storage.copy_(torch.randint(0, 256, storage.shape, generator=generator, dtype=torch.uint8))
+    for r, slot in zip(rows, host):
+        r[dst].copy_(slot)
+    assert torch.equal(pages_view[dst], original[0])
+    assert torch.equal(keys_view[dst], original[1])
+    key_bytes = storage[NUM_BLOCKS * page + dst * key_stride : NUM_BLOCKS * page + (dst + 1) * key_stride]
+    assert torch.equal(key_bytes, original[1])
+
+
 # -- scheduler: store and load plan against an in-memory Raiden store -----------
 
 

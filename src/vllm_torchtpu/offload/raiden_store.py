@@ -1627,6 +1627,51 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         assert device_block_size % kernel_block_size == 0
         device_block_size_factor = device_block_size // kernel_block_size
 
+        from vllm_torchtpu.models.vllm.qwen4_exp.offload import (
+            is_qwen4_exp,
+            merged_key_geometry,
+        )
+
+        if is_qwen4_exp(vllm_config) and merged_key_geometry(vllm_config, kv_cache_config):
+            # QWEN4_EXP_MERGE_COMPRESSED_K: the connector registers each pool
+            # region's pages as one [num_blocks, page] byte view and its key
+            # region as a second [num_blocks, key_stride] view at an offset
+            # (TPURaidenOffloadingConnector.register_kv_caches). Rebuilding a
+            # typed array from each storage's base (the path below) would drop
+            # the key view's offset and row size, so register the byte views as
+            # given, as the multi-shape path does: one kernel row per pool page
+            # (offload_pool_geometry), so block IDs index both views alike.
+            assert block_major_contract is None, (
+                "block-major bundling does not take merged compressed keys"
+            )
+            assert device_block_size_factor == 1, (
+                "Qwen4Exp merged-key offload expects one kernel row per pool page, "
+                f"got factor {device_block_size_factor}"
+            )
+            rows = {t.tensor.shape[0] for t in kv_caches.tensors}
+            assert len(rows) == 1, f"merged-key views disagree on block count: {rows}"
+            merged_views: list[torch.Tensor] = []
+            for kv_cache_tensor in kv_caches.tensors:
+                view = kv_cache_tensor.tensor
+                assert view.dim() == 2 and view.is_contiguous(), (
+                    "merged-key canonical views must be contiguous [blocks, bytes]"
+                )
+                assert view.shape[1] == kv_cache_tensor.page_size_bytes, (
+                    f"view row {view.shape[1]} != page {kv_cache_tensor.page_size_bytes}"
+                )
+                merged_views.append(view)
+            logger.info(
+                "TPURaidenOffloadingConnector: merged compressed keys: registering "
+                "%d byte views (rows %s bytes) over %d blocks",
+                len(merged_views),
+                sorted({int(t.shape[1]) for t in merged_views}),
+                next(iter(rows)),
+            )
+            self._init_registration(
+                merged_views, host_blocks_to_allocate, controller_address, rank
+            )
+            return
+
         if is_multi_shapes_geometry(per_block_shape):
             # Branch for models whose kv cache consists of multiple tensors
             # with different shapes. The resolved shapes describe those
@@ -2356,6 +2401,23 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 config.worker_kv_bytes_per_block * self.world_size
             )
         assert bytes_per_block_all_ranks > 0
+        from vllm_torchtpu.models.vllm.qwen4_exp.offload import (
+            is_qwen4_exp,
+            merged_key_geometry,
+        )
+
+        if is_qwen4_exp(vllm_config):
+            merged_keys = merged_key_geometry(vllm_config, kv_cache_config)
+            if merged_keys is not None:
+                # QWEN4_EXP_MERGE_COMPRESSED_K: the scheduler's config counts
+                # each region's pages only; the workers also register a key
+                # block of key_stride bytes per page (the key region is
+                # allocated after the pages). Size the host pool for both so
+                # cpu_bytes_to_use still bounds the host allocation.
+                page_bytes, key_stride = merged_keys
+                bytes_per_block_all_ranks = (
+                    bytes_per_block_all_ranks * (page_bytes + key_stride) + page_bytes - 1
+                ) // page_bytes
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
         )
