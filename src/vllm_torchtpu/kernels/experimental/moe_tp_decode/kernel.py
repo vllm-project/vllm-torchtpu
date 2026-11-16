@@ -99,6 +99,15 @@ def exact_in_bf16(value: float) -> bool:
     return float(rounded) == float(value)
 
 
+def row_buckets():
+    """ROW_BUCKETS plus TPU_MOE_TP_DECODE_EXTRA_ROWS (multiples of 16). Each
+    is still subject to can_use_moe_tp_decode's shape and VMEM checks."""
+    from vllm_torchtpu import envs
+
+    extra = {r for r in envs.TPU_MOE_TP_DECODE_EXTRA_ROWS if r > 0 and r % 16 == 0}
+    return tuple(sorted(set(ROW_BUCKETS) | extra))
+
+
 def _split_meta():
     """TPU_MOE_TP_DECODE_SPLIT_META: n_valid / rank / e0 as [1] operands."""
     from vllm_torchtpu import envs
@@ -149,9 +158,18 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
     need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
     limit = int(need * VMEM_HEADROOM)
-    if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
+    if limit > int(info.vmem_capacity_bytes * _vmem_fraction()):
         return None
     return need, min(limit, info.vmem_capacity_bytes)
+
+
+def _vmem_fraction():
+    """TPU_MOE_TP_DECODE_VMEM_FRACTION: the share of VMEM the plan's limit may
+    take (default VMEM_FRACTION). Only admission moves with it; the limit of a
+    plan it admits is need x VMEM_HEADROOM either way."""
+    from vllm_torchtpu import envs
+
+    return float(envs.TPU_MOE_TP_DECODE_VMEM_FRACTION)
 
 
 def kernel_name(
@@ -204,7 +222,7 @@ def can_use_moe_tp_decode(
     m, h = x.shape
     experts, i, out = w2.shape
     num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
-    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
+    if m not in row_buckets() or scores.shape != (m, num_experts):
         return False
     # This rank's experts are a linear block of the router's num_experts
     # (experts == num_experts under plain TP).

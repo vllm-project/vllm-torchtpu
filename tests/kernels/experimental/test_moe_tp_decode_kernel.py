@@ -157,6 +157,25 @@ def test_admits_the_decode_buckets_at_glm52_shapes(monkeypatch, rows, admitted):
     assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS) is admitted
 
 
+def test_extra_rows_add_decode_buckets(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_EXTRA_ROWS", "96,100,128")
+    assert kernel.row_buckets() == (16, 32, 64, 96, 128)
+
+
+@pytest.mark.parametrize(
+    "rows, admitted", [(96, True), (128, True), (192, True), (224, False)]
+)
+def test_row_gathered_admits_at_glm52_ep16_shapes(monkeypatch, rows, admitted):
+    from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel_rg
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_EXTRA_ROWS", "96,128,192,224")
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_VMEM_FRACTION", "1.0")
+    shapes = _shapes(rows, 6144, 16, 2048, 128, score_experts=256)
+    got = kernel_rg.can_use_moe_tp_decode_rg(*shapes, topk=8, n_ranks=N_RANKS)
+    assert got is admitted
+
+
 @pytest.mark.parametrize(
     "info, shapes, n_ranks",
     [
