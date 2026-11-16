@@ -43,9 +43,11 @@ warmest-first admission, each step this scheduler:
   ``ignore_eos`` (as AgentX does). Any pending prefill, short prompts too, is
   priced as a long-chunk step: the next step may admit a long one. Unlike the
   fixed debt, prefill then runs as soon as every such request's slack covers
-  ``VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON`` times that step's extra time. At most ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are
-  deferred this way. With ``VLLM_TPU_PREFILL_TPOT_PRICED`` such a step is not
-  decode-only when a shorter step fits: it runs, in the scheduler's order
+  ``VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON`` times that step's extra time (the
+  horizon gates only whether to hold, not the priced bins below). At most
+  ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are deferred this way.
+  With ``VLLM_TPU_PREFILL_TPOT_PRICED`` such a step is not decode-only when a
+  shorter step fits: it runs, in the scheduler's order
   (running chunks, then the waiting window, each shortest first), the whole
   remaining prefills that fit the largest prefill-token bin whose measured
   step time stays within every decoding request's slack (no chunk is cut).

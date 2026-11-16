@@ -199,10 +199,11 @@ def test_hold_horizon_scales_the_long_step_price(
     model_config, monkeypatch, horizon, held
 ):
     # 2.5 s of slack against a 1.96 s longer long-chunk step.
+    monkeypatch.setenv("VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON", str(horizon))
     scheduler, _, _ = _tpot_scheduler(
         model_config, monkeypatch, target_ms=50.0, long_s=2.0
     )
-    scheduler.hold_horizon = horizon
+    assert scheduler.hold_horizon == horizon
     scheduled = set(scheduler.schedule().num_scheduled_tokens)
     assert scheduled == ({"dec"} if held else {"dec", "long"})
 
