@@ -1,4 +1,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """HBM block eviction age tracking and hardware wastage attribute helpers."""
 
 import time
@@ -51,18 +63,14 @@ class TpuPaddingCounterTracker:
         }
 
     def update_from_dict(self, data: Mapping[str, Any]) -> None:
-        self.prompt_rounds = max(
-            self.prompt_rounds, int(data.get("prompt_rounds", 0))
-        )
+        self.prompt_rounds = max(self.prompt_rounds, int(data.get("prompt_rounds", 0)))
         self.prompt_real_tokens = max(
             self.prompt_real_tokens, int(data.get("prompt_real_tokens", 0))
         )
         self.prompt_filler_tokens = max(
             self.prompt_filler_tokens, int(data.get("prompt_filler_tokens", 0))
         )
-        self.reply_rounds = max(
-            self.reply_rounds, int(data.get("reply_rounds", 0))
-        )
+        self.reply_rounds = max(self.reply_rounds, int(data.get("reply_rounds", 0)))
         self.reply_real_tokens = max(
             self.reply_real_tokens, int(data.get("reply_real_tokens", 0))
         )
@@ -80,20 +88,16 @@ class TpuPaddingCounterTracker:
 
 
 class BlockEvictionTracker:
-    """Tracks HBM block evictions, replica LRU horizon, and per-session eviction timestamps."""
+    """Tracks HBM block evictions, LRU horizon, and session eviction timestamps."""
 
     def __init__(self, maxsize: int = 131072, session_maxsize: int = 65536) -> None:
         self._evicted_at: BoundedLRU[Any, float] = BoundedLRU(maxsize)
         self._block_owner: BoundedLRU[Any, str] = BoundedLRU(maxsize)
-        self._session_evicted_ts: BoundedLRU[str, float] = BoundedLRU(
-            session_maxsize
-        )
+        self._session_evicted_ts: BoundedLRU[str, float] = BoundedLRU(session_maxsize)
         self._session_evicted_wall_ms: BoundedLRU[str, int] = BoundedLRU(
             session_maxsize
         )
-        self._session_cleared_ts: BoundedLRU[str, float] = BoundedLRU(
-            session_maxsize
-        )
+        self._session_cleared_ts: BoundedLRU[str, float] = BoundedLRU(session_maxsize)
         self._dirty_sessions: set[str] = set()
         self._last_evicted_ts: float | None = None
         self._last_evicted_wall_ms: int | None = None
@@ -101,7 +105,7 @@ class BlockEvictionTracker:
     def register_session_blocks(
         self, session_id: str | None, block_hashes: Iterable[Any]
     ) -> None:
-        """Associate `block_hashes` with `session_id` for deduplicated eviction tracking."""
+        """Associate `block_hashes` with `session_id` for eviction tracking."""
         if not session_id:
             return
         for blk_hash in block_hashes:
@@ -170,7 +174,7 @@ class BlockEvictionTracker:
         return self._session_evicted_ts.peek(session_id)
 
     def session_evicted_at_ms(self, session_id: str | None) -> int | None:
-        """Return epoch-ms timestamp when `session_id` blocks were evicted on this replica."""
+        """Return epoch-ms timestamp when `session_id` blocks were evicted."""
         if not session_id:
             return None
         return self._session_evicted_wall_ms.peek(session_id)
@@ -203,7 +207,7 @@ class BlockEvictionTracker:
         *,
         session_id: str | None = None,
     ) -> float | None:
-        """Return milliseconds since the most recent eviction among `missed_block_hashes` or `session_id`."""
+        """Return ms since latest eviction in `missed_block_hashes` or session."""
         ts_now = time.monotonic() if now is None else now
         latest_evict: float | None = None
         for blk_hash in missed_block_hashes:
@@ -219,7 +223,7 @@ class BlockEvictionTracker:
         return max(0.0, (ts_now - latest_evict) * 1000.0)
 
     def pop_dirty_session_state(self) -> dict[str, list[float | int]]:
-        """Pop and return only sessions whose eviction timestamp changed since the last flush."""
+        """Pop and return sessions whose eviction timestamp changed since flush."""
         if not self._dirty_sessions:
             return {}
         dirty = tuple(self._dirty_sessions)
@@ -235,7 +239,7 @@ class BlockEvictionTracker:
     def export_recent_session_state(
         self, limit: int = 1024
     ) -> dict[str, list[float | int]]:
-        """Export up to `limit` most recently evicted sessions for sync log compaction."""
+        """Export up to `limit` most recent evicted sessions for log compaction."""
         items = list(self._session_evicted_ts._data.items())
         if limit > 0 and len(items) > limit:
             items = items[-limit:]
@@ -288,7 +292,7 @@ class BlockEvictionTracker:
 
 
 def compute_tpu_bucket_padding_tokens(scheduled_tokens: int) -> int:
-    """Return static TPU power-of-2 bucket padding tokens (min bucket 16) for `scheduled_tokens`."""
+    """Return TPU power-of-2 bucket padding tokens (min 16) for `scheduled_tokens`."""
     if scheduled_tokens <= 0:
         return 0
     padded = max(16, 1 << (scheduled_tokens - 1).bit_length())
@@ -337,9 +341,7 @@ def extract_hardware_span_attributes(
         attrs["vllm.kv_cache.external_computed_tokens"] = int(
             num_external_computed_tokens
         )
-        attrs.setdefault(
-            "vllm.kv_cache.dram_tokens", int(num_external_computed_tokens)
-        )
+        attrs.setdefault("vllm.kv_cache.dram_tokens", int(num_external_computed_tokens))
     if kv_transfer_params:
         for src_key, attr_key in (
             ("dram_tokens", "vllm.kv_cache.dram_tokens"),

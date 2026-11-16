@@ -1,4 +1,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Stage 4 end-to-end 5-turn agent session verification for CUJ-2 telemetry."""
 
 from types import SimpleNamespace
@@ -56,7 +68,7 @@ def _run_turn(
 
 
 def test_five_turn_agent_session_and_subagent_fork() -> None:
-    """Verify 5-turn agent workflow: cold start, cache hit, mutation, eviction, and sub-agent fork."""
+    """Verify 5-turn workflow: cold start, hit, mutation, eviction, and fork."""
     svc = AgenticTelemetryService(block_size=4, replica_id="tpu-v6e-node-1")
 
     # Turn 1 (Cold start): 8 prompt tokens, 0 cached -> 8 new_input; generates 4 tokens.
@@ -93,14 +105,21 @@ def test_five_turn_agent_session_and_subagent_fork() -> None:
 
     # Turn 3 (Dynamic system prompt mutation at token index 4):
     # First 4 tokens hit cache; token 4 mutates (999 instead of 5);
-    # prior sequence length was 20, so tokens 4..20 (16 tokens) are prefix_mutation_loss,
+    # prior sequence length was 20, so tokens 4..20 (16 tokens) are
+    # prefix_mutation_loss,
     # plus 4 new tokens at the tail.
-    t3_prompt = [1, 2, 3, 4, 999, 6, 7, 8] + t1_out + [13, 14, 15, 16] + t2_out + [
-        21,
-        22,
-        23,
-        24,
-    ]
+    t3_prompt = (
+        [1, 2, 3, 4, 999, 6, 7, 8]
+        + t1_out
+        + [13, 14, 15, 16]
+        + t2_out
+        + [
+            21,
+            22,
+            23,
+            24,
+        ]
+    )
     t3_out = [25, 26, 27, 28]
     attrs3 = _run_turn(
         svc,
@@ -118,7 +137,8 @@ def test_five_turn_agent_session_and_subagent_fork() -> None:
     assert attrs3["gen_ai.usage.input_tokens.new_input"] == 4
 
     # Turn 4 (HBM capacity eviction on same replica):
-    # Prefix matches Turn 3's 28 tokens, but only 8 tokens remain in HBM (20 evicted at t=38.5s).
+    # Prefix matches Turn 3's 28 tokens, but only 8 tokens remain in HBM (20 evicted at
+    # t=38.5s).
     t3_full = t3_prompt + t3_out
     hashes = compute_rolling_block_hashes(t3_full, block_size=4)
     for blk_hash in hashes[2:]:
@@ -142,7 +162,8 @@ def test_five_turn_agent_session_and_subagent_fork() -> None:
     assert attrs4["vllm.kv_cache.time_since_eviction_ms"] == 1500.0
 
     # Turn 5 (Sub-agent fork inheriting from `agent-main`):
-    # Sub-agent shares the 36-token history of `agent-main` (16 cached in HBM, 20 evicted) + 4 new tokens.
+    # Sub-agent shares the 36-token history of `agent-main` (16 cached in HBM, 20
+    # evicted) + 4 new tokens.
     t4_full = t4_prompt + t4_out
     t5_prompt = t4_full + [37, 38, 39, 40]
     attrs5 = _run_turn(

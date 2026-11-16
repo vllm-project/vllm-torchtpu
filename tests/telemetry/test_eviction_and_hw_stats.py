@@ -1,4 +1,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for Stage 2: BlockEvictionTracker and hardware span attributes."""
 
 import pytest
@@ -17,7 +29,8 @@ def test_block_eviction_tracker_age_and_bounds():
     tracker.record_eviction("hash-1", now=100.0)
     tracker.record_eviction("hash-2", now=101.5)
 
-    # Missed hashes include both hash-1 and hash-2; most recent eviction is hash-2 (101.5s)
+    # Missed hashes include both hash-1 and hash-2; most recent eviction is hash-2
+    # (101.5s)
     age_ms = tracker.time_since_eviction_ms(["hash-1", "hash-2"], now=102.0)
     assert age_ms == pytest.approx(500.0)
 
@@ -142,4 +155,3 @@ def test_tpu_padding_counter_tracker():
 )
 def test_compute_tpu_bucket_padding_tokens(scheduled_tokens, expected_padding):
     assert compute_tpu_bucket_padding_tokens(scheduled_tokens) == expected_padding
-

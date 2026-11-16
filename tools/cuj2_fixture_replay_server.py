@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """CUJ-2 Golden Trace Replay Server for offline CUJ-1 joiner and UI integration.
 
 Serves an OpenAI-compatible `/v1/chat/completions` endpoint on CPU and emits
@@ -8,10 +20,11 @@ pre-captured golden CUJ-2 `llm_request` OTel spans (linked to the caller's W3C
 """
 
 import argparse
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
-from pathlib import Path
+import sys
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 DEFAULT_FIXTURE = (
@@ -24,7 +37,7 @@ _OTEL_CONFIGURED_ENDPOINT: str | None = None
 def _ensure_otel_exporter(otlp_endpoint: str) -> None:
     """Configure a global TracerProvider + OTLPSpanExporter on first use."""
     global _OTEL_CONFIGURED_ENDPOINT
-    if _OTEL_CONFIGURED_ENDPOINT == otlp_endpoint:
+    if otlp_endpoint == _OTEL_CONFIGURED_ENDPOINT:
         return
     from opentelemetry import trace
     from opentelemetry.sdk.resources import Resource
@@ -63,7 +76,7 @@ def load_fixtures(path: Path) -> list[dict[str, Any]]:
 def maybe_emit_otel_span(
     attrs: dict[str, Any], headers: dict[str, str], otlp_endpoint: str | None
 ) -> None:
-    """Emit an OTel `llm_request` SERVER span parented to `traceparent` if OTel is available."""
+    """Emit an OTel `llm_request` SERVER span parented to `traceparent`."""
     if not otlp_endpoint:
         return
     try:
@@ -80,8 +93,8 @@ def maybe_emit_otel_span(
             for k, v in attrs.items():
                 if v is not None:
                     span.set_attribute(k, v)
-    except Exception:
-        pass
+    except Exception as exc:
+        sys.stderr.write(f"OTel replay span skipped: {exc}\n")
 
 
 class ReplayHandler(BaseHTTPRequestHandler):
@@ -127,9 +140,7 @@ class ReplayHandler(BaseHTTPRequestHandler):
                 matched = dict(item)
                 break
         if matched is None:
-            matched = dict(
-                self.fixtures[ReplayHandler.cursor % len(self.fixtures)]
-            )
+            matched = dict(self.fixtures[ReplayHandler.cursor % len(self.fixtures)])
             ReplayHandler.cursor += 1
             if session_id:
                 matched["gen_ai.session.id"] = session_id
@@ -164,7 +175,8 @@ class ReplayHandler(BaseHTTPRequestHandler):
                     "message": {
                         "role": "assistant",
                         "content": (
-                            f"[CUJ-2 Replay] session={matched.get('gen_ai.session.id')} "
+                            f"[CUJ-2 Replay] "
+                            f"session={matched.get('gen_ai.session.id')} "
                             f"turn={matched.get('gen_ai.session.turn_id')} "
                             f"cache_hit={cached_toks}/{prompt_toks}"
                         ),
@@ -202,9 +214,9 @@ def main() -> None:
     ReplayHandler.otlp_endpoint = args.otlp_endpoint
 
     server = HTTPServer((args.host, args.port), ReplayHandler)
-    print(
-        f"CUJ-2 Golden Trace Replay Server listening on http://{args.host}:{args.port} "
-        f"({len(ReplayHandler.fixtures)} golden spans loaded)"
+    sys.stdout.write(
+        f"CUJ-2 Replay Server listening on http://{args.host}:{args.port} "
+        f"({len(ReplayHandler.fixtures)} golden spans loaded)\n"
     )
     server.serve_forever()
 

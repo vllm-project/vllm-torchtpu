@@ -278,6 +278,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Host-only OTel span and Prometheus telemetry; never alters compiled graphs.
     "VLLM_TPU_AGENTIC_TELEMETRY",
     "VLLM_TPU_AGENTIC_SPAN_LOG",
+    "VLLM_REPLICA_ID",
+    "VLLM_TPU_AGENTIC_BLOCK_SIZE",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

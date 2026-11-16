@@ -1,4 +1,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for Stage 3: flag-gated vLLM lifecycle hooks."""
 
 from types import SimpleNamespace
@@ -17,7 +29,7 @@ from vllm_torchtpu.telemetry.vllm_hooks import (
 
 
 def test_flag_off_is_strict_noop(monkeypatch) -> None:
-    """When `VLLM_TPU_AGENTIC_TELEMETRY=False`, `install_agentic_telemetry_patches` does nothing."""
+    """When telemetry flag is False, `install_agentic_telemetry_patches` is a no-op."""
     monkeypatch.setattr(envs, "VLLM_TPU_AGENTIC_TELEMETRY", False)
     called = []
     monkeypatch.setattr(
@@ -81,7 +93,7 @@ def test_block_pool_eviction_hook_records_timestamps() -> None:
 
 
 def test_output_processor_hooks_enrich_spans_and_counters() -> None:
-    """Wrapped `OutputProcessor` classifies prefill tokens and enriches `llm_request` spans."""
+    """Wrapped `OutputProcessor` classifies prefill and enriches `llm_request`."""
     captured_spans: list[dict[str, Any]] = []
 
     class FakeOutputProcessor:
@@ -172,7 +184,7 @@ def test_output_processor_hooks_enrich_spans_and_counters() -> None:
 
 
 def test_vllm_v1_prefill_stats_weight_version_and_contextvar_headers(tmp_path) -> None:
-    """Handles vLLM V1 `prefill_stats`, `weight_version`, state pop, and ContextVar headers."""
+    """Handles vLLM V1 `prefill_stats`, `weight_version`, and ContextVar headers."""
     import json
 
     fake_tracing_mod = SimpleNamespace(
@@ -240,7 +252,7 @@ def test_vllm_v1_prefill_stats_weight_version_and_contextvar_headers(tmp_path) -
     req = SimpleNamespace(
         request_id="req-v1",
         prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
-        trace_headers=None,  # Simulates AsyncLLM clearing trace_headers when OTel disabled
+        trace_headers=None,  # AsyncLLM clears trace_headers when OTel is off
     )
     proc.add_request(req)
     assert req.trace_headers == extracted
@@ -363,13 +375,15 @@ def test_batch_eviction_sync_and_server_padding_hook(monkeypatch) -> None:
     assert counts["reply_real_tokens"] == 1
     assert counts["reply_filler_tokens"] == 15
     import os
+
     assert os.path.exists(svc._padding_sync_path())
     assert not os.path.exists(f"{svc._padding_sync_path()}.tmp.{os.getpid()}")
 
 
 def test_installer_fails_loudly_on_missing_anchor(tmp_path) -> None:
-    """`install_into_tree` raises `RuntimeError` if target files or anchors are missing."""
+    """`install_into_tree` raises `RuntimeError` if files or anchors are missing."""
     import pytest
+
     from vllm_torchtpu.telemetry.install import install_into_tree
 
     pkg_dir = tmp_path / "vllm_torchtpu"
@@ -397,10 +411,13 @@ def test_installer_wires_compile_env_ignored_idempotently(tmp_path) -> None:
         "}\n",
         encoding="utf-8",
     )
+    reload_target = (
+        "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint"
+    )
     (pkg_dir / "patch_registry.py").write_text(
         "PATCHES = (\n"
         "    Patch(\n"
-        '        "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",\n'
+        f'        "{reload_target}",\n'
         "        _ACTIVE,\n"
         "    ),\n"
         ")\n",
@@ -412,9 +429,7 @@ def test_installer_wires_compile_env_ignored_idempotently(tmp_path) -> None:
         install_into_tree(pkg_dir)
 
     # Missing _TPU_COMPILE_ENV_IGNORED anchor raises loudly.
-    (comp_dir / "tpu_compiler.py").write_text(
-        "OTHER_SET = set()\n", encoding="utf-8"
-    )
+    (comp_dir / "tpu_compiler.py").write_text("OTHER_SET = set()\n", encoding="utf-8")
     with pytest.raises(
         RuntimeError, match="Failed to locate _TPU_COMPILE_ENV_IGNORED anchor"
     ):
@@ -422,9 +437,7 @@ def test_installer_wires_compile_env_ignored_idempotently(tmp_path) -> None:
 
     # Stock v0.32.0-shaped tpu_compiler.py gets both telemetry env vars wired once.
     (comp_dir / "tpu_compiler.py").write_text(
-        "_TPU_COMPILE_ENV_IGNORED = {\n"
-        '    "TPU_NAME",\n'
-        "}\n",
+        '_TPU_COMPILE_ENV_IGNORED = {\n    "TPU_NAME",\n}\n',
         encoding="utf-8",
     )
     install_into_tree(pkg_dir)
@@ -436,6 +449,8 @@ def test_installer_wires_compile_env_ignored_idempotently(tmp_path) -> None:
     exec(first_compiler, ns)
     assert "VLLM_TPU_AGENTIC_TELEMETRY" in ns["_TPU_COMPILE_ENV_IGNORED"]
     assert "VLLM_TPU_AGENTIC_SPAN_LOG" in ns["_TPU_COMPILE_ENV_IGNORED"]
+    assert "VLLM_REPLICA_ID" in ns["_TPU_COMPILE_ENV_IGNORED"]
+    assert "VLLM_TPU_AGENTIC_BLOCK_SIZE" in ns["_TPU_COMPILE_ENV_IGNORED"]
     assert first_compiler.count('"VLLM_TPU_AGENTIC_TELEMETRY"') == 1
     assert first_compiler.count('"VLLM_TPU_AGENTIC_SPAN_LOG"') == 1
 
@@ -478,7 +493,7 @@ def test_golden_fixtures_match_schema_contract() -> None:
 def test_delta_eviction_sync_compaction_and_lru_horizon_omitted(
     monkeypatch, tmp_path
 ) -> None:
-    """Delta sync writes only changed sessions per step, reads incrementally, compacts, and omits lru_horizon_ms."""
+    """Delta sync writes changed sessions, compacts, and omits lru_horizon_ms."""
     import json
 
     import vllm_torchtpu.telemetry.vllm_hooks as hooks_mod
@@ -531,7 +546,8 @@ def test_delta_eviction_sync_compaction_and_lru_horizon_omitted(
     api_svc._maybe_sync_eviction_state()
     assert api_svc.eviction_tracker.session_evicted_at_ms("sess-C") is not None
 
-    # Verify per-turn span attributes omit lru_horizon_ms while keeping time_since_eviction_ms & session_evicted_at_ms.
+    # Verify per-turn span attributes omit lru_horizon_ms while keeping
+    # time_since_eviction_ms & session_evicted_at_ms.
     req_t1 = SimpleNamespace(
         request_id="req-a-1",
         prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],

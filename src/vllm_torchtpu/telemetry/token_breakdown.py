@@ -1,13 +1,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Seven-category input token attribution and bounded two-tier session tracking."""
 
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
-
-K = TypeVar("K")
-V = TypeVar("V")
+from typing import Any
 
 CATEGORIES: tuple[str, ...] = (
     "cache_hit",
@@ -20,7 +29,7 @@ CATEGORIES: tuple[str, ...] = (
 )
 
 
-class BoundedLRU(Generic[K, V]):
+class BoundedLRU[K, V]:
     """Fixed-capacity LRU mapping backed by OrderedDict."""
 
     def __init__(self, maxsize: int) -> None:
@@ -141,7 +150,7 @@ _ASSISTANT_ROLE_TOKEN_ID = 77091
 
 
 def _find_last_assistant_reply_end(prompt_token_ids: Sequence[int]) -> int | None:
-    """Return the token index right after the last completed ChatML assistant message."""
+    """Return the token index after the last completed ChatML assistant message."""
     total = len(prompt_token_ids)
     last_asst_end: int | None = None
     idx = 0
@@ -163,7 +172,7 @@ def _find_last_assistant_reply_end(prompt_token_ids: Sequence[int]) -> int | Non
 
 
 def _find_server_hop_reply_end(prompt_token_ids: Sequence[int]) -> int | None:
-    """Return the token index right after the last completed assistant message on a server hop.
+    """Return the token index after the last completed assistant message on a hop.
 
     Searches for the last `<|im_start|>assistant` (`151644, 77091`) that has a
     closing `<|im_end|>` (`151645`) so turns with multiple trailing tool/user
@@ -228,9 +237,9 @@ def _find_reply_end_idx(
         if asst_end is not None and asst_end > start:
             return asst_end
     if matched_prefix_end > 0 and start >= matched_prefix_end:
-        seen_im_ends = prior_im_ends + prompt_token_ids[
-            matched_prefix_end:start
-        ].count(_IM_END_TOKEN_ID)
+        seen_im_ends = prior_im_ends + prompt_token_ids[matched_prefix_end:start].count(
+            _IM_END_TOKEN_ID
+        )
     else:
         seen_im_ends = prompt_token_ids[:start].count(_IM_END_TOKEN_ID)
     for idx in range(start, total):
@@ -248,7 +257,7 @@ def compute_rolling_block_hashes(
     prefix_hashes: tuple[int, ...] = (),
     start_block: int = 0,
 ) -> tuple[int, ...]:
-    """Compute chained block hashes over full blocks of `tokens`, reusing `prefix_hashes[:start_block]`."""
+    """Compute chained block hashes over full blocks, reusing `prefix_hashes`."""
     num_blocks = len(tokens) // block_size
     if num_blocks <= 0:
         return ()
@@ -330,9 +339,7 @@ class SessionTurnTracker:
 
         t1, t2, used_parent = self._lookup_prior(session_id, parent_session_id)
         prior_turn_id = (
-            t1.turn_id
-            if t1 is not None
-            else (t2.turn_id if t2 is not None else None)
+            t1.turn_id if t1 is not None else (t2.turn_id if t2 is not None else None)
         )
         is_revisit_hop = (
             not used_parent
@@ -356,7 +363,7 @@ class SessionTurnTracker:
                 prompt_token_ids, hit, t2, used_parent or parent_session_id
             )
 
-        # No prior state on this replica (or revisit hop after intermediate turns elsewhere).
+        # No prior state on this replica (or revisit hop after intermediate turns).
         if session_id and turn_id is not None and turn_id > 1:
             last_reply_end = _find_server_hop_reply_end(prompt_token_ids)
             if last_reply_end is not None and 0 < last_reply_end <= total:
@@ -375,9 +382,7 @@ class SessionTurnTracker:
             )
 
         # Turn 1 (or stateless request): check cross-session shared prefix blocks.
-        cross_opp = self._count_cross_session_tokens(
-            prompt_token_ids, hit, session_id
-        )
+        cross_opp = self._count_cross_session_tokens(prompt_token_ids, hit, session_id)
         return TokenBreakdown(
             cache_hit=hit,
             cross_session_opportunity=cross_opp,
@@ -438,9 +443,7 @@ class SessionTurnTracker:
         )
         prior_im_ends = prior.prior_im_ends
         matched_prefix_end = (
-            prior.reply_start_idx
-            if diverge_idx >= prior.reply_start_idx > 0
-            else 0
+            prior.reply_start_idx if diverge_idx >= prior.reply_start_idx > 0 else 0
         )
         reply_end = max(
             block_base,
@@ -632,11 +635,7 @@ class SessionTurnTracker:
             return full_hashes, reused_blocks
 
         reply_start_idx = _detect_reply_start_idx(prompt_token_ids)
-        verified_prefix = (
-            matched_len
-            if matched_len is not None
-            else reused_blocks * bs
-        )
+        verified_prefix = matched_len if matched_len is not None else reused_blocks * bs
         if (
             prior_t1 is not None
             and reply_start_idx >= prior_t1.reply_start_idx
@@ -664,9 +663,7 @@ class SessionTurnTracker:
             evicted_hashes = (
                 evicted_state.block_hashes
                 if evicted_state.block_hashes
-                else compute_rolling_block_hashes(
-                    evicted_state.tokens, self.block_size
-                )
+                else compute_rolling_block_hashes(evicted_state.tokens, self.block_size)
             )
             self.tier2.put(
                 evicted_sid,
@@ -675,9 +672,7 @@ class SessionTurnTracker:
                     seq_len=len(evicted_state.tokens),
                     block_hashes=evicted_hashes,
                     reply_start_idx=evicted_state.reply_start_idx,
-                    tail_hash=_compute_tail_hash(
-                        evicted_state.tokens, self.block_size
-                    ),
+                    tail_hash=_compute_tail_hash(evicted_state.tokens, self.block_size),
                     prior_im_ends=evicted_state.prior_im_ends,
                 ),
             )
