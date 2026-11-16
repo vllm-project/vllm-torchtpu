@@ -950,8 +950,11 @@ class TpuPlatform(Platform):
         else:
             compilation_config.mode = CompilationMode.VLLM_COMPILE
 
-        # No graph splitting — TPU handles the full graph including
-        compilation_config.splitting_ops = []
+        # Compile whole graphs by default (TPU handles the full graph), but
+        # keep explicit boundaries a model config hook or the caller declared:
+        # model hooks run before this, in VllmConfig.try_verify_and_update_config.
+        if compilation_config.splitting_ops is None:
+            compilation_config.splitting_ops = []
 
         # Kernel-iteration mode splits the compiled graph at the Pallas RPA
         # custom ops so they execute eagerly outside the compiled pieces.
@@ -961,11 +964,13 @@ class TpuPlatform(Platform):
         # are allocated at model build, so list every id the registry could
         # plausibly allocate (should_split does exact name matching).
         if envs.TPU_KERNEL_ITER_MODE:
-            compilation_config.splitting_ops = [
-                f"pallas::{prefix}_{i}"
+            compilation_config.splitting_ops.extend(
+                op
                 for prefix in ("rpa_kernel", "rpa_kernel_batched")
                 for i in range(64)
-            ]
+                if (op := f"pallas::{prefix}_{i}")
+                not in compilation_config.splitting_ops
+            )
 
         # Disable inductor-specific fusion passes (only available on CUDA).
         compilation_config.pass_config.fuse_norm_quant = False
