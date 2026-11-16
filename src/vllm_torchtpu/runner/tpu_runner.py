@@ -489,6 +489,49 @@ def _rotate_precompile_sweep(items: Collection[Any], sweep: str) -> list[Any]:
     return items[start:] + items[:start]
 
 
+# The sampler variants of the synthetic one-row verify, in warm-up order: a
+# step picks one from its requests' sampling params
+# (`_sampler_topk_candidates`, `_sampler_applies_topk_topp`,
+# `_sampler_applies_top_k`), and each is its own compiled program.
+SAMPLER_VARIANTS = ("full", "no_topk_topp", "top_p", "topk_candidates")
+
+
+def sampler_variant_name(
+    topk_candidates: int, apply_topk_topp: bool, apply_top_k: bool
+) -> str:
+    """The SAMPLER_VARIANTS name of a sampler call's static arguments."""
+    if topk_candidates:
+        return "topk_candidates"
+    if not apply_topk_topp:
+        return "no_topk_topp"
+    if not apply_top_k:
+        return "top_p"
+    return "full"
+
+
+def default_sampler_variant(
+    defaults: dict[str, Any], vocab_size: int, candidate_blocks: int
+) -> str:
+    """The sampler variant a batch of requests that all keep the default
+    sampling params ``defaults`` (ModelConfig.get_diff_sampling_param) picks,
+    with speculative decoding on. Mirrors SamplingParams (greedy drops top-k
+    and top-p), InputBatch.add_request (top-k is set only for
+    0 < top_k < vocab_size, top-p for top_p < 1) and the runner's three
+    variant choices."""
+    temperature = defaults.get("temperature", 1.0)
+    top_k = defaults.get("top_k") or 0
+    top_p = defaults.get("top_p", 1.0)
+    if temperature is not None and temperature < 1e-5:
+        return "no_topk_topp"
+    has_top_k = 0 < top_k < vocab_size
+    has_top_p = top_p is not None and top_p < 1
+    if not has_top_k:
+        return "top_p" if has_top_p else "no_topk_topp"
+    if candidate_blocks and 1 <= top_k <= candidate_blocks // 2:
+        return "topk_candidates"
+    return "full"
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -5074,6 +5117,12 @@ class TPUModelRunner(GPUModelRunner):
             torch.float32,
             hidden_states.device,
         )
+        topk_candidates = self._sampler_topk_candidates(
+            cur_start_idx, cur_end_idx, None
+        )
+        apply_topk_topp = self._sampler_applies_topk_topp()
+        apply_top_k = self._sampler_applies_top_k()
+        self._note_sampler_variant(topk_candidates, apply_topk_topp, apply_top_k)
         out, self._synthetic_rng_counter = self.synthetic_verify_head(
             hidden_states,
             md.draft_token_ids,
@@ -5089,9 +5138,9 @@ class TPUModelRunner(GPUModelRunner):
             top_k,
             top_p,
             self.speculative_config.num_speculative_tokens,
-            self._sampler_topk_candidates(cur_start_idx, cur_end_idx, None),
-            self._sampler_applies_topk_topp(),
-            self._sampler_applies_top_k(),
+            topk_candidates,
+            apply_topk_topp,
+            apply_top_k,
         )
         md.synthetic_output = out
         return out
@@ -5113,6 +5162,12 @@ class TPUModelRunner(GPUModelRunner):
         temperatures, top_k, top_p = self._padded_sampling_params(
             cur_start_idx, cur_end_idx, padded_num_reqs, logits.dtype, logits.device
         )
+        topk_candidates = self._sampler_topk_candidates(
+            cur_start_idx, cur_end_idx, None
+        )
+        apply_topk_topp = self._sampler_applies_topk_topp()
+        apply_top_k = self._sampler_applies_top_k()
+        self._note_sampler_variant(topk_candidates, apply_topk_topp, apply_top_k)
         # The in-graph draw covers the gathered (unsplit) rows; a TP row
         # split keeps the generator's uniforms (synthetic_sample_rows_and_assemble).
         if envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG and md.synthetic_row_rank is None:
@@ -5129,11 +5184,9 @@ class TPUModelRunner(GPUModelRunner):
                 md.segment_ids,
                 md.group_indices,
                 self.speculative_config.num_speculative_tokens,
-                topk_candidates=self._sampler_topk_candidates(
-                    cur_start_idx, cur_end_idx, None
-                ),
-                apply_topk_topp=self._sampler_applies_topk_topp(),
-                apply_top_k=self._sampler_applies_top_k(),
+                topk_candidates=topk_candidates,
+                apply_topk_topp=apply_topk_topp,
+                apply_top_k=apply_top_k,
             )
             return out
         # Every request's uniforms, drawn alike on every rank.
@@ -5162,11 +5215,9 @@ class TPUModelRunner(GPUModelRunner):
             md.segment_ids,
             md.group_indices,
             self.speculative_config.num_speculative_tokens,
-            topk_candidates=self._sampler_topk_candidates(
-                cur_start_idx, cur_end_idx, None
-            ),
-            apply_topk_topp=self._sampler_applies_topk_topp(),
-            apply_top_k=self._sampler_applies_top_k(),
+            topk_candidates=topk_candidates,
+            apply_topk_topp=apply_topk_topp,
+            apply_top_k=apply_top_k,
         )
 
     def _sample_spec_verify_chunk(
@@ -7191,6 +7242,18 @@ class TPUModelRunner(GPUModelRunner):
                 "synthetic one-row verify at %d rejection-sampler buckets",
                 len(pairs),
             )
+        if (
+            envs.TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS
+            and envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+            and self.rejection_sampler.synthetic_mode
+        ):
+            logger.info(
+                "TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS=%s: warming synthetic "
+                "verify sampler variants %s and the row selection on serving's "
+                "inputs",
+                envs.TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS,
+                ",".join(self._warm_sampler_variant_names()),
+            )
         with self._precompile_timed("rejection_sampler"):
             # padded_logits_length-shaped inputs, rebuilt when the length
             # changes; dtypes mirror get_spec_decode_metadata so the graph is
@@ -7394,17 +7457,29 @@ class TPUModelRunner(GPUModelRunner):
         assert self.rejection_sampler.synthetic_conditional_rates is not None
         assert self.speculative_config is not None
         num_reqs = draft_lengths.shape[0]
-        accepted_count, _, recover_draft = synthetic_verify_rows(
-            draft_token_ids,
-            draft_lengths,
-            segment_ids,
-            group_indices,
-            target_logits_indices,
-            bonus_logits_indices,
-            target_logits_indices,
-            warm_accept_u,
-            self.rejection_sampler.synthetic_conditional_rates,
+        # Serving passes final_logits_indices as its own int32 tensor. Passed
+        # as target_logits_indices again, Dynamo dedups the aliased input and
+        # guards on it, so serving never runs the warmed row selection. With
+        # TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS set, warm it on serving's
+        # inputs instead, and only the in-graph RNG one when that is on.
+        runtime_rows = bool(envs.TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS)
+        final_logits_indices = (
+            torch.zeros_like(target_logits_indices)
+            if runtime_rows
+            else target_logits_indices
         )
+        if not (runtime_rows and envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG):
+            accepted_count, _, recover_draft = synthetic_verify_rows(
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                target_logits_indices,
+                bonus_logits_indices,
+                final_logits_indices,
+                warm_accept_u,
+                self.rejection_sampler.synthetic_conditional_rates,
+            )
         logits = torch.zeros(
             (num_reqs, self.vocab_size), dtype=self._hidden_states_dtype
         ).to(self.device)
@@ -7416,13 +7491,7 @@ class TPUModelRunner(GPUModelRunner):
         recover_u = torch.zeros((num_reqs, self.vocab_size), dtype=torch.float32).to(
             self.device
         )
-        variants: list[dict] = [
-            {},
-            {"apply_topk_topp": False},
-            {"apply_top_k": False},
-        ]
-        if blocks := self._topk_candidate_blocks():
-            variants.append({"topk_candidates": blocks})
+        variants = self._warm_sampler_variants()
         if envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG:
             # A dummy counter: warming must not advance the serving one.
             counter = torch.zeros((), dtype=torch.int32).to(self.device)
@@ -7433,7 +7502,7 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices,
                 target_logits_indices,
                 bonus_logits_indices,
-                target_logits_indices,
+                final_logits_indices,
                 counter,
                 self.rejection_sampler.synthetic_conditional_rates,
             )
@@ -7504,13 +7573,7 @@ class TPUModelRunner(GPUModelRunner):
             return
         assert self.rejection_sampler.synthetic_conditional_rates is not None
         assert self.speculative_config is not None
-        variants: list[dict] = [
-            {},
-            {"apply_topk_topp": False},
-            {"apply_top_k": False},
-        ]
-        if blocks := self._topk_candidate_blocks():
-            variants.append({"topk_candidates": blocks})
+        variants = self._warm_sampler_variants()
         hsize = self.model_config.get_hidden_size()
         counter = torch.zeros((), dtype=torch.int32).to(self.device)
         with self._precompile_timed("synthetic_verify_head"):
@@ -7543,6 +7606,13 @@ class TPUModelRunner(GPUModelRunner):
         temps = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
         top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+        # Serving's final_logits_indices is its own tensor (see
+        # `_precompile_synthetic_verify`).
+        final_logits_indices = (
+            torch.zeros_like(target_logits_indices)
+            if envs.TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS
+            else target_logits_indices
+        )
         for variant in variants:
             out, _ = self.synthetic_verify_head(
                 hidden,
@@ -7552,7 +7622,7 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices,
                 target_logits_indices,
                 bonus_logits_indices,
-                target_logits_indices,
+                final_logits_indices,
                 counter,
                 self.rejection_sampler.synthetic_conditional_rates,
                 temps,
@@ -9206,6 +9276,76 @@ class TPUModelRunner(GPUModelRunner):
         ):
             return 0
         return num_blocks
+
+    def _warm_sampler_variant_names(self) -> tuple[str, ...]:
+        """The synthetic-verify sampler variants warm-up compiles, by
+        TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS (empty: all of them)."""
+        cached = getattr(self, "_warm_sampler_variant_names_cache", None)
+        if cached is not None:
+            return cached
+        setting = envs.TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS
+        if not setting:
+            names: tuple[str, ...] = SAMPLER_VARIANTS
+        elif setting == "auto":
+            names = (
+                default_sampler_variant(
+                    self.model_config.get_diff_sampling_param(),
+                    self.vocab_size,
+                    self._topk_candidate_blocks(),
+                ),
+            )
+        else:
+            names = tuple(n.strip() for n in setting.split(",") if n.strip())
+            unknown = [n for n in names if n not in SAMPLER_VARIANTS]
+            if unknown:
+                raise ValueError(
+                    f"TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS: unknown {unknown}; "
+                    f"expected 'auto' or a comma list of {SAMPLER_VARIANTS}"
+                )
+        self._warm_sampler_variant_names_cache = names
+        return names
+
+    def _warm_sampler_variants(self) -> list[dict]:
+        """Keyword arguments of the synthetic-verify sampler variants to warm,
+        in SAMPLER_VARIANTS order."""
+        names = self._warm_sampler_variant_names()
+        variants: dict[str, dict] = {
+            "full": {},
+            "no_topk_topp": {"apply_topk_topp": False},
+            "top_p": {"apply_top_k": False},
+        }
+        if blocks := self._topk_candidate_blocks():
+            variants["topk_candidates"] = {"topk_candidates": blocks}
+        return [variants[n] for n in SAMPLER_VARIANTS if n in variants and n in names]
+
+    def _note_sampler_variant(
+        self, topk_candidates: int, apply_topk_topp: bool, apply_top_k: bool
+    ) -> None:
+        """Logs, once per variant, the synthetic-verify sampler variants
+        serving runs and whether warm-up compiled them."""
+        if not envs.TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS:
+            return
+        name = sampler_variant_name(topk_candidates, apply_topk_topp, apply_top_k)
+        seen = getattr(self, "_sampler_variants_seen", None)
+        if seen is None:
+            seen = self._sampler_variants_seen = set()
+        if name in seen:
+            return
+        seen.add(name)
+        warmed = self._warm_sampler_variant_names()
+        if name in warmed:
+            logger.info(
+                "TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS: serving runs sampler "
+                "variant %s (warmed)",
+                name,
+            )
+        else:
+            logger.warning(
+                "TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS: serving runs sampler "
+                "variant %s, not warmed (warmed: %s); compiling it on first use",
+                name,
+                ",".join(warmed),
+            )
 
     def _sampler_applies_topk_topp(self) -> bool:
         """False when speculative decoding is on and no running request sets

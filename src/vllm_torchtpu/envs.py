@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     TPU_HOST_HEAP_USAGE_AFTER_S: int = 900
     TPU_RELEASE_JAX_CACHES: bool = False
     TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY: bool = False
+    TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS: str = ""
     TPU_RAIDEN_OFFLOAD_STATS: bool = False
     TPU_RAIDEN_FLUSH_REAL_REUSE: bool = False
     TPU_RAIDEN_LOSS_TRACE: bool = False
@@ -1389,6 +1390,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # first use. No effect on real-acceptance runs.
     "TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY": env_bool(
         "TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY", default=False
+    ),
+    # Which sampler variants of the synthetic one-row verify
+    # (synthetic_sample_and_assemble[_rng], synthetic_verify_head) warm-up
+    # compiles at each rejection-sampler bucket. Each step picks one of
+    # `full` (top-k and top-p), `no_topk_topp` (no request sets either),
+    # `top_p` (top-p set, no top-k) and `topk_candidates` from its requests'
+    # sampling params. Empty (default): all of them. `auto`: the one a batch
+    # of requests on the model's default sampling params (generation config)
+    # picks. Otherwise a comma list of names. A step that picks a variant not
+    # warmed compiles it on first use (logged once). Also warms the verify
+    # row selection on its runtime inputs. Host memory only; outputs
+    # unchanged.
+    "TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS": env_str(
+        "TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS", ""
     ),
     # Drop JAX's tracing / lowering caches once warm-up has compiled every
     # bucket. The Pallas kernels are already lowered into the compiled
