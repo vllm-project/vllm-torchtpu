@@ -325,7 +325,7 @@ class SpeculativeDecodingManager:
         bonus_logits_indices: np.ndarray,
         target_logits_indices: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Drops the target logits rows of GRAMMAR drafts (as rvllm does).
+        """Drops the target logits rows of GRAMMAR drafts.
 
         A GRAMMAR draft is accepted without its target row, and a rejection,
         which samples from the target row, only happens at a MODEL draft, so
