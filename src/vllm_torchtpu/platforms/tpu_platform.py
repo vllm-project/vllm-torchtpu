@@ -217,9 +217,7 @@ _tpu_kv_connectors_registered = False
 
 
 def _configure_torchtpu_eager_mode() -> None:
-    from torch_tpu._internal import execution_mode
-
-    previous_mode = execution_mode.eager_mode
+    previous_mode = torch.tpu.eager_mode
     # Kernel-iteration mode keeps DEFER_NEVER: DEFER_AND_FUSE fuses the eager
     # region around the split-out Pallas ops into per-context device programs,
     # each of which recompiles after a kernel hot-swap. With DEFER_NEVER the
@@ -229,10 +227,10 @@ def _configure_torchtpu_eager_mode() -> None:
             "TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).", previous_mode.name
         )
         return
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    torch.tpu.eager_mode = torch.tpu.EagerMode.DEFER_AND_FUSE
     logger.info(
         "TorchTPU eager mode configured: %s (previous=%s)",
-        execution_mode.eager_mode.name,
+        torch.tpu.eager_mode.name,
         previous_mode.name,
     )
 
