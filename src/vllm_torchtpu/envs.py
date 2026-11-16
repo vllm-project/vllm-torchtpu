@@ -216,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD: bool = False
     VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD_MIN_ROWS: int = 64
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
+    VLLM_TPU_PLE_OWNED_GATHER_PCT: int = 0
     VLLM_TPU_PLE_FUSED_GATE: bool = False
     VLLM_TPU_PLE_CONV_HISTORY_FAST: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
@@ -1409,6 +1410,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PLE_CONV_HISTORY_FAST": env_bool("VLLM_TPU_PLE_CONV_HISTORY_FAST"),
     "VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS": env_nonnegative_int(
         "VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS", 8
+    ),
+    # Qwen4-exp resident PLE table: gather only the ids this vocab shard owns,
+    # compacted into a buffer of this percent of each chunk's ids (0 = off;
+    # chunks owning more fall back to the full masked gather). Bit-identical.
+    "VLLM_TPU_PLE_OWNED_GATHER_PCT": env_nonnegative_int(
+        "VLLM_TPU_PLE_OWNED_GATHER_PCT", 0
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4

@@ -161,6 +161,7 @@ class ResidentPLETable(Qwen4ExpPLETable):
             self.shard_indices.num_org_elements,
             self.embedding_dim,
             envs.VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS,
+            envs.VLLM_TPU_PLE_OWNED_GATHER_PCT,
         )
 
     def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
