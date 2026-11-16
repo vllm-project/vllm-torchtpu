@@ -102,8 +102,12 @@ def _kernel(
     v_scale: float,
     guard: bool,
     f8dot: bool,
+    srow_lead: int,
+    mode: str,
 ):
     D, HD = depth, head_dim
+    E = srow_lead                    # tiles a slot-row copy starts ahead of its tile's refill
+    reads, compute = mode in ("full", "reads"), mode in ("full", "compute")
     kv_bufs = scratch[:D]            # VMEM [TILE, 1, 4, hd] e4m3 each: one ring slot a buffer
     code_bufs = scratch[D:2 * D]     # VMEM int32[1, GPT] each
     (kv_sem, srow_ref, srow_sem, qbuf, q_sem, obuf, o_sem, m_ref, l_ref, acc_ref, ctr_ref) = scratch[2 * D:]
@@ -126,11 +130,15 @@ def _kernel(
     def kv_wait(slot):
         # DMA semaphores count bytes: one descriptor of the whole tile covers its 128 copies; the descriptor's
         # buffers only give the size.
+        if not reads:
+            return
         pltpu.make_async_copy(cache_hbm.at[pl.ds(0, TILE)], kv_bufs[0], kv_sem.at[slot]).wait()
         pltpu.make_async_copy(codes_hbm.at[pl.ds(0, 1)], code_bufs[0], kv_sem.at[slot]).wait()
 
     def kv_issue(k, slot):
         """Tile k's 128 group copies and its codes into ring slot ``slot`` (static: k mod depth)."""
+        if not reads:
+            return
         buf = kv_bufs[slot]
         for j in range(GPT):
             pltpu.make_async_copy(
@@ -261,8 +269,9 @@ def _kernel(
         ks = (slot + lead) % D
         srow_copy(k, ks).wait()
         kv_issue(k, ks)
-        srow_copy(k + 1, (ks + 1) % D).start()
-        tile_step(slot, p, p)
+        srow_copy(k + E, (ks + E) % D).start()
+        if compute:
+            tile_step(slot, p, p)
 
         @pl.when(last == 1)
         def _():
@@ -274,11 +283,14 @@ def _kernel(
         ctr_ref[1] = 0
         ctr_ref[2] = 0
         q_copy(row_of(0) >> ct_shift, 0).start()
-        for k in range(lead + 1):
+        for k in range(lead):
             srow_copy(k, k % D).start()
         for k in range(lead):
             srow_copy(k, k).wait()
             kv_issue(k, k)
+        # Each slot-row copy runs E tiles ahead of its use: an HBM-to-SMEM copy outlasts a tile.
+        for k in range(lead, lead + E):
+            srow_copy(k, k % D).start()
 
         def outer(o, carry):
             # Ring slots are static: each body takes depth tiles.
@@ -298,8 +310,13 @@ def _kernel(
             return carry
 
         lax.fori_loop(total, total + lead, drain, None)
-        last_srow = (total + lead) & (D - 1)
-        pltpu.make_async_copy(rows_hbm.at[pl.ds(0, GPT)], srow_ref.at[pl.ds(0, GPT)], srow_sem.at[last_srow]).wait()
+
+        def drain_srow(k, carry):
+            pltpu.make_async_copy(rows_hbm.at[pl.ds(0, GPT)], srow_ref.at[pl.ds(0, GPT)],
+                                  srow_sem.at[k & (D - 1)]).wait()
+            return carry
+
+        lax.fori_loop(total + lead, total + lead + E, drain_srow, None)
         for p in range(2):
             @pl.when(ctr_ref[1 + p] == 1)
             def _(p=p):
@@ -307,13 +324,16 @@ def _kernel(
 
 
 def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=2, k_scale=1.0, v_scale=1.0,
-                        depth=8, guard=True, f8dot=False, sm_scale=None, vmem_mib=56):
+                        depth=8, guard=True, f8dot=False, sm_scale=None, vmem_mib=56, srow_lead=None, mode="full"):
     """Ungated bf16 attention [R, heads, hd] of the aligned query rows over each union group's tables.
 
     ``query`` [R, heads, hd] (R a multiple of 16; union group q = rows [16 q, 16 q + 16)); ``rows``
     int32[R / 16, union_cap] the pool token row of each union slot's group, ``codes`` the same shape (module
     docstring), ``usize`` int32[R / 16] each union's size (slots past it are not read; at most
     ``union_cap``, the caller's fallback holds the rest). Rows of union groups with no slot are not written.
+    ``srow_lead``: tiles a tile's slot-row copy (HBM to SMEM) starts ahead of its refill (default depth - 2).
+    ``mode`` (timing diagnosis): "full"; "compute" (no KV copies: the units on whatever the ring holds); "reads"
+    (the copies alone, no tile compute).
     """
     tokens, heads, hd = query.shape
     pages, page_size, head_axis, packing, dim = pool.shape
@@ -346,9 +366,14 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
     last = (t_of == ntiles[q_of] - 1).astype(jnp.int32)
     rec = jnp.where(idx < total, (q_of * ct + t_of) | (last << LAST_BIT), 0).astype(jnp.int32)
 
+    if mode not in ("full", "compute", "reads"):
+        raise ValueError("mode: 'full', 'compute' or 'reads'")
+    srow_lead = depth - 2 if srow_lead is None else srow_lead
+    if not 1 <= srow_lead < depth:
+        raise ValueError("srow_lead: from 1 to depth - 1")
     kernel = functools.partial(
         _kernel, depth=depth, ct=ct, kv_heads=kv_heads, hpk=hpk, head_dim=hd, q_scale=float(q_scale),
-        s_scale=float(s_scale), v_scale=float(v_scale), guard=guard, f8dot=f8dot)
+        s_scale=float(s_scale), v_scale=float(v_scale), guard=guard, f8dot=f8dot, srow_lead=srow_lead, mode=mode)
     scratch = [pltpu.VMEM((TILE, 1, 4, hd), pool.dtype) for _ in range(depth)]
     scratch += [pltpu.VMEM((1, GPT), jnp.int32) for _ in range(depth)]
     scratch += [
@@ -377,7 +402,8 @@ def compare_core_kernel(query, rows, codes, usize, pool, *, union_cap, kv_heads=
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",), vmem_limit_bytes=vmem_mib * 1024**2, disable_bounds_checks=True),
         out_shape=jax.ShapeDtypeStruct((tokens, heads * hd), jnp.bfloat16),
-        name=f"qsa_union_walk_cmp_t{T}_d{depth}" + ("_f8" if f8dot else "") + ("" if guard else "_ng"),
+        name=f"qsa_union_walk_cmp_t{T}_d{depth}" + ("_f8" if f8dot else "") + ("" if guard else "_ng")
+        + ("" if mode == "full" else f"_{mode}"),
     )(
         rec,
         ntiles,

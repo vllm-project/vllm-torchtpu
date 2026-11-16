@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU checks of VLLM_TPU_QSA_PREFILL_COMPARE_CORE at the served prefill shape (run through the bench's
-BENCH=script, which carries the served prefill env).
+BENCH=script; the block exports the served prefill QSA env).
 
-- Tables: the SparseCore build (``compare_sc_tables`` on ``union_sc_bits_flat``) equals the XLA reference.
-- Numerics: ``qsa_rpa._prefill_attention`` with the flag against the same call without it (the served path under
-  the pod's env: the union walk with its SparseCore list and gather) on the same inputs: an 8192-row step of two
-  4096-row requests at 64k and 96k context, and s10623's shape (3200 rows at 64000 plus 682 at 70400). Gate:
-  max |port - served| / mean |served| over live rows at most 0.08 (Compare's max_rel), every value finite.
-- Timing (printed, not gated): each path's call and the core's parts, median wall time of a few jitted calls.
+- Tables: the SparseCore build (``compare_sc_tables`` on ``union_sc_bits_flat``) equals the XLA reference on every
+  live slot (padding slots only need a valid address: the SparseCore pads with word 0's pool base, the reference
+  with slot 0's row).
+- Numerics: ``qsa_rpa._prefill_attention`` with the flag and without it (the served path: the union walk with its
+  SparseCore list and gather), each against a float32 reference over every row's exact selection on 512 sampled
+  rows. Gate: the port's max |out - ref| / mean |ref| at most 0.08 (Compare's max_rel) and at most twice the
+  served path's, every value finite. The port against the served output is printed: both are bf16, so one output
+  ulp at the largest values already gives ~0.09 there.
+- Timing (printed, not gated): each path's call, the tables, and the kernel in full, without its KV copies
+  (compute), with its copies alone (reads), and with the slot rows staged one tile ahead (lead1).
 
-Selections: each row takes its 32 most recent groups plus 480 drawn from a request-level set of popular groups
-(Zipf weights, so neighbouring rows overlap as real selections do), its own tail group by the served contract.
+Selections follow the recorded ones (s10623 L39: 513 groups a row in ~335 runs; two rows 16 apart share ~105):
+each row keeps its 32 most recent complete groups and its predecessor's other groups but ~49, which it replaces by
+new groups in runs of 1-3 drawn over the context, so 16 consecutive rows' union is ~1,250 groups and 64 rows'
+~3,400 (the served walk's ~3,300 estimate at 92.8k, prefill-bound/result.md).
 """
 
 import os
@@ -71,6 +77,26 @@ def served_env(monkeypatch):
     jax.clear_caches()
 
 
+def _selections(rng, n, ctx, topk=TOPK, local=32, change=49):
+    """int32 [n, topk] selections of a request's n rows after ctx cached tokens (module docstring)."""
+    out = np.full((n, topk), -1, np.int32)
+    keep = None
+    for i in range(n):
+        complete = (ctx + i + 1) // RATIO
+        recent = np.arange(max(0, complete - local), complete)
+        if keep is None:
+            keep = rng.choice(max(complete - local, 1), size=topk - local, replace=False)
+        else:
+            keep = keep[rng.permutation(len(keep))[change:]]
+            starts = rng.integers(0, max(complete - local - 3, 1), size=change)
+            runs = np.concatenate([s0 + np.arange(rng.integers(1, 4)) for s0 in starts])
+            keep = np.unique(np.concatenate([keep, runs]))
+            keep = keep[keep < complete - local][: topk - local] if len(keep) > topk - local else keep
+        sel = np.unique(np.concatenate([recent, keep]))[:topk]
+        out[i, :len(sel)] = sel
+    return out
+
+
 def _step(seed, reqs, tokens, page):
     rng = np.random.default_rng(seed)
     pps = max(-(-(c + n) // page) for n, c in reqs)
@@ -81,22 +107,10 @@ def _step(seed, reqs, tokens, page):
     blocks = np.full((tokens, TOPK), -1, np.int32)
     table = np.zeros((tokens, pps), np.int32)
     for r, (n, ctx) in enumerate(reqs):
-        pages = owner[r * pps:(r + 1) * pps]
-        hot_n = 1600
-        hot = rng.choice((ctx + n) // RATIO, size=hot_n, replace=False)
-        weight = 1.0 / np.arange(1, hot_n + 1) ** 0.8
-        for i in range(n):
-            t = starts[r] + i
-            length = ctx + i + 1
-            lengths[t] = length
-            table[t] = pages
-            complete = length // RATIO
-            local = np.arange(max(0, complete - 32), complete)
-            ok = hot < complete
-            w = weight[ok] / weight[ok].sum()
-            pick = rng.choice(hot[ok], size=min(TOPK - len(local), int(ok.sum())), replace=False, p=w)
-            sel = np.unique(np.concatenate([local, pick]))[:TOPK]
-            blocks[t, :len(sel)] = sel
+        rows = slice(starts[r], starts[r] + n)
+        lengths[rows] = ctx + np.arange(n) + 1
+        table[rows] = owner[r * pps:(r + 1) * pps]
+        blocks[rows] = _selections(rng, n, ctx)
     q = jnp.asarray(rng.normal(0, 0.5, (tokens, 24, 256)), jnp.bfloat16)
     gate = jnp.asarray(rng.uniform(-3, 3, (tokens, 24, 256)), jnp.bfloat16)
     key = jax.random.key(seed)
@@ -104,6 +118,40 @@ def _step(seed, reqs, tokens, page):
     raw = raw | (jax.random.randint(jax.random.fold_in(key, 1), raw.shape, 0, 2, jnp.int32).astype(jnp.uint8) << 7)
     pool = jax.lax.bitcast_convert_type(raw, jnp.float8_e4m3fn)
     return q, gate, jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table), pool, jnp.asarray(starts)
+
+
+def _reference(step, rows):
+    """float32 gated attention [len(rows), 24, 256] of the sampled rows over their exact selections (the indexer's
+    groups plus the partial tail group, tokens below the row's length), 32 rows a chunk."""
+    q, gate, blocks, lengths, table, pool, _ = step
+    pages, page = pool.shape[:2]
+    flat = pool.reshape(pages * page, 4, 256)
+
+    @jax.jit
+    def chunk(r):
+        length = lengths[r]
+        tail = jnp.where(length % RATIO != 0, length // RATIO, -1)
+        groups = jnp.concatenate([blocks[r], tail[:, None]], axis=1)                    # [c, K + 1]
+        tok = groups[..., None] * RATIO + jnp.arange(RATIO)                              # [c, K + 1, 4]
+        tok = tok.reshape(len(r), -1)
+        live = (tok >= 0) & (tok < length[:, None]) & (groups.repeat(RATIO, axis=1) >= 0)
+        safe = jnp.where(live, tok, 0)
+        phys = jnp.take_along_axis(table[r], safe // page, axis=1) * page + safe % page
+        kv = flat[phys].astype(jnp.float32)                                              # [c, n, 4, 256]
+        qq = q[r].astype(jnp.float32).reshape(len(r), 2, 12, 256)
+        k, v = kv[:, :, 0::2], kv[:, :, 1::2]                                           # [c, n, 2, 256]
+        s = jnp.einsum("cgjd,cngd->cgjn", qq, k, precision="highest") / 16.0
+        s = jnp.where(live[:, None, None, :], s, -jnp.inf)
+        p = jax.nn.softmax(s, axis=-1)
+        o = jnp.einsum("cgjn,cngd->cgjd", p, v, precision="highest").reshape(len(r), 24, 256)
+        return o * jax.nn.sigmoid(gate[r].astype(jnp.float32))
+
+    out = [np.asarray(chunk(jnp.asarray(rows[i:i + 32]))) for i in range(0, len(rows), 32)]
+    return np.concatenate(out)
+
+
+def _rel(got, ref):
+    return float(np.abs(got - ref).max() / np.abs(ref).mean())
 
 
 def _call(step):
@@ -152,7 +200,10 @@ def test_sparsecore_tables_equal_the_reference():
     usize = np.asarray(want[2])
     _report(f"[cmp-tpu] tables s10623: usize max {usize.max()} mean live {usize[usize > 0].mean():.1f}; "
             f"tiles a live group {float(cc.tiles_per_group(want[2], cap)):.2f}")
-    for name, g, w in zip(("rows", "codes", "usize", "ok"), got, want):
+    live = np.arange(cap)[None, :] < usize[:, None]
+    np.testing.assert_array_equal(np.where(live, np.asarray(got[0]), 0), np.where(live, np.asarray(want[0]), 0),
+                                  err_msg="rows (live slots)")
+    for name, g, w in zip(("codes", "usize", "ok"), got[1:], want[1:]):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w), err_msg=name)
 
 
@@ -167,28 +218,34 @@ def test_numerics_and_time_against_served(monkeypatch, name, reqs, tokens, page)
     port_fn, port = _call(step)
     port = np.asarray(jax.block_until_ready(port).astype(jnp.float32))
     port_ms = _median_ms(port_fn, step)
-    live = np.asarray(step[3]) > 0
-    d = np.abs(port[live] - served[live])
-    scale = float(np.abs(served[live]).mean())
-    max_rel = float(d.max() / scale)
+    live = np.nonzero(np.asarray(step[3]) > 0)[0]
+    rows = live[np.linspace(0, len(live) - 1, 512).astype(int)]
+    ref = _reference(step, rows)
+    port_rel, served_rel = _rel(port[rows], ref), _rel(served[rows], ref)
+    raw_rel = _rel(port[live], served[live])
     finite = bool(np.isfinite(port).all())
-    # The core's parts on the same step: tables, then the kernel on them.
+    # The core's parts on the same step: tables, then the kernel on them, in each timing mode.
     cap = int(os.environ.get("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", "4096"))
     lister = os.environ.get("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES", "sparsecore")
     bitset = "sparsecore" if os.environ.get("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET") == "1" else "tensorcore"
     tables_fn, targs, aq = _aligned_tables(step, lister, bitset, cap)
-    rows, codes, usize, ok = jax.block_until_ready(tables_fn(*targs))
+    rows_t, codes, usize, ok = jax.block_until_ready(tables_fn(*targs))
     tables_ms = _median_ms(tables_fn, targs)
     depth = int(os.environ.get("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH", "8"))
-    kernel_fn = jax.jit(lambda q, r, c, u, p: cc.compare_core_kernel(q, r, c, u, p, union_cap=cap, depth=depth))
-    kargs = (aq, rows, codes, usize, step[5])
-    kernel_ms = _median_ms(kernel_fn, kargs)
+    kargs = (aq, rows_t, codes, usize, step[5])
     u = np.asarray(usize)
     tiles = int(np.sum(np.where(u > 0, -(-np.minimum(u, cap) // cc.GPT), 0)))
-    _report(f"[cmp-tpu] {name}: max_rel {max_rel:.4f} (max abs {d.max():.3e}, mean |served| {scale:.3e}) finite "
-            f"{finite} ok {bool(ok)}; served call {served_ms:.1f} ms, port call {port_ms:.1f} ms, tables "
-            f"{tables_ms:.2f} ms, kernel {kernel_ms:.2f} ms; union max {u.max()} mean live {u[u > 0].mean():.1f}, "
-            f"{tiles} tiles, {tiles / max(1, int((u > 0).sum())):.2f} a live group, kernel "
-            f"{kernel_ms * 1e3 / max(tiles, 1):.3f} us a tile")
+    modes = {}
+    for label, kw in (("full", {}), ("compute", dict(mode="compute")), ("reads", dict(mode="reads")),
+                      ("lead1", dict(srow_lead=1))):
+        fn = jax.jit(lambda q, r, c, us, p, kw=kw: cc.compare_core_kernel(q, r, c, us, p, union_cap=cap,
+                                                                          depth=depth, **kw))
+        modes[label] = _median_ms(fn, kargs)
+    per_tile = {k: v * 1e3 / max(tiles, 1) for k, v in modes.items()}
+    _report(f"[cmp-tpu] {name}: max_rel against float32 port {port_rel:.4f} served {served_rel:.4f} (512 rows); port "
+            f"against served {raw_rel:.4f}; finite {finite} ok {bool(ok)}; served call {served_ms:.1f} ms, port call "
+            f"{port_ms:.1f} ms, tables {tables_ms:.2f} ms; union max {u.max()} mean live {u[u > 0].mean():.1f}, "
+            f"{tiles} tiles, {tiles / max(1, int((u > 0).sum())):.2f} a live group; kernel ms "
+            + ", ".join(f"{k} {v:.2f} ({per_tile[k]:.3f} us a tile)" for k, v in modes.items()))
     assert finite and bool(ok)
-    assert max_rel <= MAX_REL, max_rel
+    assert port_rel <= MAX_REL and port_rel <= 2 * served_rel, (port_rel, served_rel)
