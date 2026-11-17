@@ -7548,8 +7548,15 @@ class TPUModelRunner(GPUModelRunner):
                 self.vllm_config, self.device, self.model
             )
             if self.encoder_cudagraph_manager is not None:
+                max_step_tokens = (
+                    self.mm_budget.get_encoder_budget()
+                    if self.mm_budget is not None
+                    else self.scheduler_config.max_num_encoder_input_tokens
+                )
                 with self._precompile_timed("multimodal vision encoder"):
-                    self.encoder_cudagraph_manager.precompile_vision_encoder()
+                    self.encoder_cudagraph_manager.precompile_vision_encoder(
+                        max_step_tokens=max_step_tokens
+                    )
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
