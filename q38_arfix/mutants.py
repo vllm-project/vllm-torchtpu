@@ -29,13 +29,23 @@ MUTANTS = [
     ("m4_factor_when_unset", FN, "    if not m:\n        return {}\n", "    if not m:\n        return {ENV: ''}\n", WIRE),
     ("m5_compile_key_dropped", TC, "    factors.update(tp8_ar_decode_fn.compile_factors())", "    tp8_ar_decode_fn.compile_factors()", WIRE),
     ("m6_dtype_ignored", AR, "and x.dtype == torch.bfloat16 and", "and", WIRE),
-    ("m7_wire_forced_bf16", FN, 'ag="fwd", wire=wire, interpret=interpret)', 'ag="fwd", wire="bf16", interpret=interpret)', MATH),
-    ("m8_cap_ignored", FN, "    if h8.supports(rows, hidden, x.dtype, max_rows_):", "    if h8.supports(rows, hidden, x.dtype):", MATH),
+    # BLSTACK-H8 (port onto Benliang Wang's d523c2ce0): m7 / m8 / m10 re-anchored after D68 (fa3486a8a), which moved
+    # the H8-takes-it check into padded_rows() and added a second (padded) kernel call; the old anchors matched 2 / 0 / 0
+    # times (j-4915a150 BAD ANCHOR).
+    ("m7_wire_forced_bf16", FN, '        return h8.tp8_hier_all_reduce_local(x, axis=axis, pairs=pairs, ag="fwd", wire=wire, interpret=interpret)',
+     '        return h8.tp8_hier_all_reduce_local(x, axis=axis, pairs=pairs, ag="fwd", wire="bf16", interpret=interpret)', MATH),
+    ("m8_cap_ignored", FN, "    if h8.supports(rows, hidden, dtype, max_rows_):\n        return rows\n",
+     "    if h8.supports(rows, hidden, dtype):\n        return rows\n", MATH),
     ("m9_pairs_id_order", FN, "    return tuple((chips[c][0], chips[c][1]) for c in sorted(chips))",
      "    return tuple((2 * c, 2 * c + 1) for c in range(len(chips)))", MATH),
-    ("m10_psum_everywhere", FN, "    if h8.supports(rows, hidden, x.dtype, max_rows_):", "    if False and h8.supports(rows, hidden, x.dtype, max_rows_):", MATH),
+    ("m10_psum_everywhere", FN, "    if h8.supports(rows, hidden, dtype, max_rows_):\n        return rows\n",
+     "    if False and h8.supports(rows, hidden, dtype, max_rows_):\n        return rows\n", MATH),
     ("m11_arm_skips_rank_check", AR, "    _check_same_on_every_rank(signature, tp)\n", "", WIRE),
     ("m12_arm_accepts_tp4", AR, "    if int(tp.world_size) != N_MEMBERS:", "    if int(tp.world_size) not in (4, N_MEMBERS):", WIRE),
+    # BLSTACK-H8: his served decode runs VLLM_TPU_QSA_DCP_MERGE=proj; a site that skipped H8 on the proj-merge path
+    # must be caught by the proj-merge wiring case.
+    ("m13_qsa_proj_merge_not_routed", QSA, "            if tp_ar_decode.use_kernel(output):",
+     "            if not getattr(self, \"_proj_merge\", False) and tp_ar_decode.use_kernel(output):", WIRE),
 ]
 
 
