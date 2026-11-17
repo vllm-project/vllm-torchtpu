@@ -576,6 +576,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
     With `num_output`, request `req_id` has that many outputs, min_tokens 4
     and stop token 3."""
     runner = SimpleNamespace(
+        num_prompt_logprobs={},
         execute_model_state=SimpleNamespace(
             scheduler_output=SimpleNamespace(
                 num_scheduled_tokens={"r0": 1},
@@ -591,6 +592,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             pooler_output_list=[],
             top_tokens=False,
             kv_save_nan_check=None,
+            prompt_logprobs_chunks=[],
         ),
         input_batch=SimpleNamespace(
             max_num_logprobs=None,
@@ -598,6 +600,8 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             req_ids=["r0"],
             req_id_to_index={"r0": 0},
             all_greedy=True,
+            no_top_k=True,
+            no_top_p=True,
             num_tokens_no_spec=[1],
             token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
         ),
@@ -631,6 +635,8 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             num_computed_tokens=0, num_tokens=1, output_token_ids=[0] * num_output
         )
     for name in (
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
         "_mask_min_tokens",
         "_min_tokens_batch_state",
         "_settle_draft_placeholders_for_min_tokens",

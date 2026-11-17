@@ -270,6 +270,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
                 num_computed_tokens=0, num_tokens=1, output_token_ids=[]
             ),
         },
+        num_prompt_logprobs={},
         _run_dp_dummy_chunk=MagicMock(),
         query_start_loc_np=np.zeros(4, dtype=np.int32),
         _last_sequence_layout_plan=None,
@@ -331,6 +332,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     for name in (
         "_any_decode",
         "_readmit_trimmed_drafts",
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",

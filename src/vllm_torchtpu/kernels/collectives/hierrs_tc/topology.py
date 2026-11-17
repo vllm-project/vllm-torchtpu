@@ -14,6 +14,7 @@
 """Device and chunk indexing; devices 2k and 2k+1 are the cores of chip k."""
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from vllm_torchtpu.kernels.collectives.hierrs_tc.config import Config
@@ -39,9 +40,28 @@ class Topology:
 
 
 class ChunkLocator:
-    def __init__(self, config: Config, topo: Topology):
+    def __init__(
+        self, config: Config, topo: Topology, order: tuple[int, ...] | None = None
+    ):
         self.config = config
         self.topo = topo
+        # Input row block order[c] holds chunk c; None is the identity.
+        identity = tuple(range(config.num_devices))
+        self.order = None if order is None or tuple(order) == identity else order
+
+    def input_chunk(self, chunk_idx):
+        """The input row block that holds `chunk_idx`.
+
+        Only the input is permuted: every working buffer is indexed by chunk.
+        """
+        if self.order is None:
+            return chunk_idx
+        if isinstance(chunk_idx, int):
+            return self.order[chunk_idx]
+        block = jnp.int32(self.order[0])
+        for c, b in enumerate(self.order[1:], start=1):
+            block = jnp.where(chunk_idx == c, jnp.int32(b), block)
+        return block
 
     def get_slice(self, chunk_idx, start, size):
         return (
@@ -109,7 +129,7 @@ class ChunkLocator:
     def make_phase1_index_fn(self, mb_idx):
         def phase1_index_fn(chip_idx):
             c_me = self.get_phase1_chunk_idx(self.topo.cur_id, chip_idx)
-            return (c_me, mb_idx)
+            return (self.input_chunk(c_me), mb_idx)
 
         return phase1_index_fn
 

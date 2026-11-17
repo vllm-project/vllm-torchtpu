@@ -74,6 +74,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     runner = SimpleNamespace(
         _pp_handoff=None,
         _dp_step_other_decode=False,
+        num_prompt_logprobs={},
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -85,6 +86,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
             pooler_output_list=[],
             top_tokens=False,
             kv_save_nan_check=None,
+            prompt_logprobs_chunks=[],
         ),
         input_batch=SimpleNamespace(
             max_num_logprobs=None,
@@ -130,6 +132,8 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     runner._stage_timing.take_samples.return_value = ([], [])
     runner._async_drafter = runner.drafter
     for name in (
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",

@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
+    TPU_MOE_EP_HIER_RS: str = "off"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -172,6 +173,8 @@ if TYPE_CHECKING:
     TPU_USE_RAIDEN_CONNECTOR: bool = False
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
+    TPU_RAIDEN_POOL_STAGING_BUDGET_MB: int = 0
+    TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS: int = 0
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -850,6 +853,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_TOPK_WEIGHTS_FLOAT32": env_bool(
         "TPU_MOE_TOPK_WEIGHTS_FLOAT32", default=False
     ),
+    # Runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore
+    # kernels instead of the group's, with this wire dtype between chips.
+    # Remove once that is the default or the kernels are retired.
+    "TPU_MOE_EP_HIER_RS": env_with_choices(
+        "TPU_MOE_EP_HIER_RS", "off", ["off", "bf16"]
+    ),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
@@ -1139,6 +1148,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Concurrent pool-reshard transfers to provision bounded host staging for.
     "TPU_RAIDEN_POOL_STAGING_LEASES": env_nonnegative_int(
         "TPU_RAIDEN_POOL_STAGING_LEASES", 8
+    ),
+    # Consumer-side host staging budget (MiB per rank) for the pool-reshard
+    # arena: a request larger than the budget allows is pulled as a chain of
+    # sub-transfers. 0 = size the arena for whole max-length requests. Both
+    # peers need a tpu-sync with sub-transfer chains (tpu-sync-torch from the
+    # 2026-10-26 nightlies on): the source controller slices the request, and
+    # a producer without them plans it whole, which the window-sized arena
+    # refuses. Not honoured under TPU_RAIDEN_POOL_TAGS_PER_LAYER=1.
+    "TPU_RAIDEN_POOL_STAGING_BUDGET_MB": env_nonnegative_int(
+        "TPU_RAIDEN_POOL_STAGING_BUDGET_MB", 0
+    ),
+    # Explicit consumer-side sub-transfer window (full-attention destination
+    # pages per sub-transfer); overrides the budget-derived window. 0 = none.
+    "TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS": env_nonnegative_int(
+        "TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS", 0
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
