@@ -263,6 +263,7 @@ def _draft_bucket_runner(draft_sizes):
     drafter.set_draft_compile_sizes.side_effect = lambda sizes: setattr(
         drafter.draft_vllm_config.compilation_config, "compile_sizes", list(sizes)
     )
+    drafter.kv_only_missing_buckets.return_value = []
     runner.drafter = drafter
     runner._check_draft_buckets = TPUModelRunner._check_draft_buckets.__get__(runner)
     return runner
@@ -279,6 +280,16 @@ def test_draft_bucket_check_refuses_a_bucket_the_draft_never_compiles():
     runner.num_tokens_paddings = [512, 1024, 1536, 2048, 2560, 3072, 3584, 4096]
     with pytest.raises(RuntimeError, match=r"\[1536, 2560, 3072, 3584\]"):
         runner._check_draft_buckets()
+
+
+def test_draft_bucket_check_refuses_a_bucket_the_kv_only_pass_never_compiles():
+    runner = _draft_bucket_runner([512, 1024, 2048, 4096])
+    runner.drafter.kv_only_missing_buckets.return_value = [2048]
+    with pytest.raises(RuntimeError, match=r"KV-only pass .* token buckets \[2048\]"):
+        runner._check_draft_buckets()
+    runner.drafter.kv_only_missing_buckets.assert_called_once_with(
+        runner.num_tokens_paddings
+    )
 
 
 def test_draft_bucket_check_skips_a_stage_without_a_drafter():

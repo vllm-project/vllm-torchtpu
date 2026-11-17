@@ -363,6 +363,31 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+def _validate_mtp_kv_only_step0(vllm_config: "VllmConfig", pcp_enabled: bool) -> None:
+    """Refuse TPU_MTP_KV_ONLY_STEP0 on a configuration that cannot take the
+    two-pass draft step 0, before any weights load.
+
+    The draft's own structure (one DSA MTP layer, one MLA layer and one
+    indexer cache) is checked when it loads (spec_decode/mtp_kv_only.py).
+    """
+    if not envs.TPU_MTP_KV_ONLY_STEP0:
+        return
+    spec = vllm_config.speculative_config
+    method = spec.method if spec is not None else None
+    if method != "mtp":
+        raise NotImplementedError(
+            f"TPU_MTP_KV_ONLY_STEP0 is set, but the draft method is {method!r}. "
+            "Unset it to keep the single full draft step 0."
+        )
+    # TODO: support PCP: it localizes the gather indices per rank, which
+    #   pass 2's row selection does not model yet.
+    if pcp_enabled:
+        raise NotImplementedError(
+            "TPU_MTP_KV_ONLY_STEP0 is set, but prefill context parallelism is "
+            "on. Unset it to keep the single full draft step 0."
+        )
+
+
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     """Rejects LoRA settings that the TPU LoRA path does not support yet.
 
@@ -930,6 +955,7 @@ class TpuPlatform(Platform):
                 "Using vLLM native multiprocess PCP world; PCP is not "
                 "represented as a JAX mesh axis."
             )
+        _validate_mtp_kv_only_step0(vllm_config, pcp_config.enabled)
         validate_pipeline_parallel_config(vllm_config)
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)

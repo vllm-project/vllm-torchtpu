@@ -7702,6 +7702,14 @@ class TPUModelRunner(GPUModelRunner):
                 f"target buckets {self.num_tokens_paddings}, draft compile "
                 f"sizes {draft_sizes}"
             )
+        # The two-pass step 0's KV-only pass keeps its own copy of the sizes.
+        kv_only_missing = self.drafter.kv_only_missing_buckets(self.num_tokens_paddings)
+        if kv_only_missing:
+            raise RuntimeError(
+                "the MTP draft's KV-only pass (TPU_MTP_KV_ONLY_STEP0) has no "
+                f"compiled graph for token buckets {kv_only_missing}: target "
+                f"buckets {self.num_tokens_paddings}"
+            )
 
     def _warmup_mtp_prefill(self) -> None:
         """Warm the real prefill-only MTP K1 proposal and nothing else.

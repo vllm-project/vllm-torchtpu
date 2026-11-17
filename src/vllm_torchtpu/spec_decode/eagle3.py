@@ -750,6 +750,13 @@ class Eagle3Proposer:
         if self._mtp_kv_only is not None:
             self._mtp_kv_only.set_compile_sizes(sizes)
 
+    def kv_only_missing_buckets(self, target_buckets: Iterable[int]) -> list[int]:
+        """Target token buckets the two-pass step 0 can run at but its
+        KV-only pass has no compiled graph for; empty while it is off."""
+        if self._mtp_kv_only is None:
+            return []
+        return self._mtp_kv_only.missing_buckets(target_buckets)
+
     def schedules_kv_only_prefill(self, num_scheduled_tokens: Iterable[int]) -> bool:
         """Whether a step scheduling these per-request token counts carries
         the prefill span the two-pass step 0 needs; False while it is off.

@@ -496,14 +496,32 @@ def test_set_draft_compile_sizes_keeps_the_kv_only_copy_at_its_gate(monkeypatch)
     ]
     kv_only_config = proposer._mtp_kv_only.vllm_config
     assert kv_only_config.compilation_config.compile_sizes == [512, 1024, 4096]
+    # Every target bucket at or above the gate has a KV-only graph.
+    assert proposer.kv_only_missing_buckets([16, 32, 512, 1024, 4096]) == []
+
+
+def test_kv_only_missing_buckets_names_a_bucket_its_copy_lacks(monkeypatch):
+    """A target bucket at or above the gate that only the draft's own copy
+    of the sizes got is reported; buckets below the gate never take the two
+    passes and are not."""
+    proposer = _build_proposer()
+    _patch_builder(monkeypatch)
+    proposer._mtp_kv_only = MtpKvOnlyStep0.build(proposer, _attn_layers())
+    proposer.set_draft_compile_sizes([16, 512, 4096])
+    proposer.draft_vllm_config.compilation_config.compile_sizes = [16, 512, 2048, 4096]
+    assert proposer.kv_only_missing_buckets([16, 512, 2048, 4096]) == [2048]
+
+
+def test_kv_only_missing_buckets_is_empty_while_the_switch_is_off():
+    proposer = _build_proposer()
+    proposer._mtp_kv_only = None
+    assert proposer.kv_only_missing_buckets([16, 512, 4096]) == []
 
 
 @pytest.mark.parametrize(
     "setup, message",
     [
-        ("eagle3", "draft method is 'eagle3'"),
         ("kv_shared", "reads the target's KV cache"),
-        ("pcp", "prefill context parallelism"),
         ("unsupported", "not DSA"),
         ("two_mla_layers", "not one of each"),
         ("no_indexer_cache", "not one of each"),
@@ -512,8 +530,9 @@ def test_set_draft_compile_sizes_keeps_the_kv_only_copy_at_its_gate(monkeypatch)
 )
 def test_build_refusals_raise(monkeypatch, setup, message):
     """The switch is explicit: a draft or layout that cannot take the
-    two-pass step 0 raises at load instead of keeping the single pass."""
-    proposer = _build_proposer(method="eagle3" if setup == "eagle3" else "mtp")
+    two-pass step 0 raises at load instead of keeping the single pass. (The
+    draft method and PCP are refused before load, by the platform.)"""
+    proposer = _build_proposer()
     built = _patch_builder(
         monkeypatch, reason="not DSA" if setup == "unsupported" else None
     )
@@ -524,8 +543,6 @@ def test_build_refusals_raise(monkeypatch, setup, message):
     proposer._draft_attn_layer_names = set(layers)
     if setup == "kv_shared":
         proposer._draft_kv_shared = True
-    if setup == "pcp":
-        proposer.runner._pcp_enabled = True
     if setup == "loop_bucket_is_the_largest":
         # max_num_reqs pads to the largest bucket, so no chunk could ever
         # reach the gate one past it.

@@ -259,15 +259,11 @@ def _sizes_at_or_above(sizes: Iterable[int | str], min_tokens: int) -> list[int 
 def _layout_unsupported_reason(
     proposer: "Eagle3Proposer", all_attn_layers: dict[str, AttentionLayerBase]
 ) -> str | None:
-    """Why `proposer`'s draft or layout cannot take the two-pass step 0."""
-    if proposer.speculative_config.method != "mtp":
-        return f"the draft method is {proposer.speculative_config.method!r}"
+    """Why `proposer`'s loaded draft cannot take the two-pass step 0. The
+    configuration (draft method, PCP) is checked before any weights load, in
+    `TpuPlatform.check_and_update_config`."""
     if proposer._draft_kv_shared:
         return "the draft reads the target's KV cache"
-    # TODO: support PCP: it localizes the gather indices per rank, which
-    #   pass 2's row selection does not model yet.
-    if proposer.runner._pcp_enabled:
-        return "prefill context parallelism is on"
     assert proposer.draft_model is not None
     reason = kv_only_unsupported_reason(proposer.draft_model)
     if reason is not None:
@@ -372,6 +368,19 @@ class MtpKvOnlyStep0:
         buckets after load), keeping those at or above the gate."""
         self.vllm_config.compilation_config.compile_sizes = _sizes_at_or_above(
             draft_sizes, self.min_tokens
+        )
+
+    def missing_buckets(self, target_buckets: Iterable[int]) -> list[int]:
+        """Target token buckets a step 0 can take the two passes at that the
+        KV-only pass has no compiled graph for."""
+        compiled = {
+            int(size)
+            for size in self.vllm_config.compilation_config.compile_sizes or ()
+        }
+        return sorted(
+            int(t)
+            for t in target_buckets
+            if int(t) >= self.min_tokens and int(t) not in compiled
         )
 
     def precompile_gather_rows(self, proposer: "Eagle3Proposer") -> None:

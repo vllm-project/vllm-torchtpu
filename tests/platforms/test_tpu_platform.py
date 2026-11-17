@@ -46,6 +46,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
     _validate_lora_config,
+    _validate_mtp_kv_only_step0,
     _validate_peer_replay_config,
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
@@ -1040,6 +1041,40 @@ class TestTpuPlatform:
         from vllm_torchtpu.utils import get_device_name
 
         assert get_device_name() == expected_name
+
+
+class TestMtpKvOnlyStep0ConfigValidation:
+    """TPU_MTP_KV_ONLY_STEP0 on a configuration that cannot take the two-pass
+    draft step 0 is refused before any weights load."""
+
+    @staticmethod
+    def _config(method="mtp"):
+        vllm_config = MagicMock()
+        vllm_config.speculative_config = (
+            None if method is None else SimpleNamespace(method=method)
+        )
+        return vllm_config
+
+    def test_off_accepts_any_configuration(self, monkeypatch):
+        monkeypatch.delenv("TPU_MTP_KV_ONLY_STEP0", raising=False)
+        _validate_mtp_kv_only_step0(self._config("eagle3"), pcp_enabled=True)
+
+    def test_mtp_without_pcp_passes(self, monkeypatch):
+        monkeypatch.setenv("TPU_MTP_KV_ONLY_STEP0", "1")
+        _validate_mtp_kv_only_step0(self._config(), pcp_enabled=False)
+
+    @pytest.mark.parametrize(
+        "method, message", [("eagle3", "'eagle3'"), (None, "None")]
+    )
+    def test_a_draft_other_than_mtp_is_refused(self, monkeypatch, method, message):
+        monkeypatch.setenv("TPU_MTP_KV_ONLY_STEP0", "1")
+        with pytest.raises(NotImplementedError, match=f"draft method is {message}"):
+            _validate_mtp_kv_only_step0(self._config(method), pcp_enabled=False)
+
+    def test_prefill_context_parallelism_is_refused(self, monkeypatch):
+        monkeypatch.setenv("TPU_MTP_KV_ONLY_STEP0", "1")
+        with pytest.raises(NotImplementedError, match="prefill context parallelism"):
+            _validate_mtp_kv_only_step0(self._config(), pcp_enabled=True)
 
 
 class TestPhasedProfilingConfigValidation:
