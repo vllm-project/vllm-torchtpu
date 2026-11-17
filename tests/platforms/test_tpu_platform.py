@@ -645,6 +645,15 @@ class TestTpuPlatform:
         expected_cls,
     ):
         monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", True)
+        # DP > 1 on one host writes these into os.environ; start without them
+        # and let monkeypatch remove them again afterwards.
+        for name in (
+            "TORCH_TPU_DP_SIZE",
+            "TORCH_TPU_DP_MASTER_ADDR",
+            "TORCH_TPU_DP_MASTER_PORT",
+        ):
+            monkeypatch.setenv(name, "")
+            monkeypatch.delenv(name)
         vllm_config.cache_config.block_size = 16
         vllm_config.parallel_config.data_parallel_size = 2
         vllm_config.parallel_config.data_parallel_size_local = 2
