@@ -950,7 +950,13 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
     @parameterized.product(
         dist=[(1, 1, 1), (0, 0, 1)],
+        skip_empty_mixed=[False, True],
     )
+    def test_ragged_paged_attention_static_skip_mixed(self, dist, skip_empty_mixed):
+        """A 4-token call (at most decode_query_size and the decode bq) whose
+        sequence the distribution labels DECODE or MIXED. With
+        skip_empty_mixed it runs DECODE alone over every sequence; without it,
+        DECODE and then MIXED."""
         if not jtu.is_device_tpu_at_least(version=4):
             self.skipTest("Expect TPUv4+")
         rng = np.random.default_rng(1234)
@@ -1006,6 +1012,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             distribution,
             kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
             decode_query_size=4,
+            skip_empty_mixed=skip_empty_mixed,
         )
         self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
         self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
