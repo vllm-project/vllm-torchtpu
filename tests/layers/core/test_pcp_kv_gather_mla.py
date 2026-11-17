@@ -89,10 +89,20 @@ def _mesh():
     return jax.sharding.Mesh(np.array(devices[:DCP]), (streamindex_topk.DCP_AXIS_NAME,))
 
 
-def _specs(layout):
+def _specs(layout, packed_rope=False):
+    """(nope, rope) specs; `packed_rope` (TPU_SPARSE_MLA_PACKED_ROPE) stores
+    the rope cache as 64 bytes per token, eight tokens per row."""
     packing = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
     return tuple(
-        SparseMLAKVCacheSpec.create(kind, layout, NUM_PAGES, PAGE_SIZE, dim, packing)
+        SparseMLAKVCacheSpec.create(
+            kind,
+            layout,
+            NUM_PAGES,
+            PAGE_SIZE,
+            dim,
+            packing,
+            packed_rope=packed_rope and kind is KVCacheType.ROPE,
+        )
         for kind, dim in ((KVCacheType.NOPE, LKV_DIM), (KVCacheType.ROPE, ROPE_DIM))
     )
 
@@ -303,9 +313,41 @@ def _fp8(rng, shape, scale=1.0):
 @pytest.mark.parametrize("pcp", [2, 4, 8])
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
+    _pcp_prefill_outputs(monkeypatch, scenario, pcp, layout)
+
+
+@pytest.mark.parametrize("pcp", [2, 4, 8])
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_pcp_prefill_packed_rope_matches_unpacked(monkeypatch, scenario, pcp):
+    """TPU_PCP_PACKED_ROPE: the PCP write + workspace gather + attention over a
+    packed rope cache (8 tokens per row) matches the numpy reference and the
+    padded rope cache (4 tokens per row) on every split prefill row."""
+    padded = _pcp_prefill_outputs(monkeypatch, scenario, pcp, "sparsecore")
+    packed = _pcp_prefill_outputs(
+        monkeypatch, scenario, pcp, "sparsecore", packed_rope=True
+    )
+    assert len(packed) == len(padded)
+    for step, ((out_p, mask_p), (out_u, mask_u)) in enumerate(zip(packed, padded)):
+        np.testing.assert_array_equal(mask_p, mask_u)
+        assert mask_p.any()
+        np.testing.assert_allclose(
+            out_p[mask_p],
+            out_u[mask_u],
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg=f"step {step}: packed rope differs from padded rope",
+        )
+
+
+def _pcp_prefill_outputs(monkeypatch, scenario, pcp, layout, packed_rope=False):
+    """Runs every step of `scenario` through the PCP write + prefill attention,
+    checks each split prefill row against numpy, and returns per step
+    `(output [DCP, local_padded, H, LKV_DIM], checked-row mask [DCP, local_padded])`.
+    The random inputs depend on (scenario, pcp, layout) only."""
     mesh = _mesh()
     monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
-    nope_spec, rope_spec = _specs(KVCacheLayout(layout))
+    nope_spec, rope_spec = _specs(KVCacheLayout(layout), packed_rope)
+    assert rope_spec.packed_rope == packed_rope
     chunk_pages = pcp_chunk_pages(CHUNK_TOKENS, PAGE_SIZE, DCP)
     rng = np.random.default_rng(zlib.crc32(f"{scenario}-{pcp}-{layout}".encode()))
     tp = DCP // pcp
@@ -323,6 +365,7 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
         for s in (nope_spec, rope_spec)
     )
     checked = 0
+    results = []
     for st in _plan_steps(pcp, steps, _block_table(rng)):
         plan0, local_padded = st.plan0, st.local_padded
         kv_rows, pe_rows, q_rows, topk_rows, owners = [], [], [], [], []
@@ -408,6 +451,7 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
         out = np.asarray(out.astype(jnp.float32)).reshape(
             DCP, local_padded, HEADS_PER_RANK, LKV_DIM
         )
+        mask = np.zeros((DCP, local_padded), bool)
 
         for d in range(DCP):
             p, t = divmod(d, tp)
@@ -426,8 +470,11 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
                     err_msg=f"step {st.index} dcp rank {d} row {i} "
                     f"(request {r}, position {pos})",
                 )
+                mask[d, i] = True
                 checked += 1
+        results.append((out, mask))
     assert checked > 0
+    return results
 
 
 # --- Indexer top-k ---------------------------------------------------------

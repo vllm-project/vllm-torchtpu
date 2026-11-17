@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MIXED_KERNEL_V2: bool = True
     USE_TPU_PCP_MANAGER: bool = False
     TPU_PCP_INDEXER_SAL: bool = False
+    TPU_PCP_PACKED_ROPE: bool = False
     TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
     TPU_PCP_KV_CHUNK_TOKENS: int = 65536
     JAX_PLATFORMS: str = ""
@@ -960,6 +961,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # writes with the SAL writer and gathers a SAL workspace. Off: 'sal' falls
     # back to (or, if explicit, is rejected in favour of) HEAD_ALONG_SUBLANE.
     "TPU_PCP_INDEXER_SAL": env_bool("TPU_PCP_INDEXER_SAL", default=False),
+    # PCP manager: allow TPU_SPARSE_MLA_PACKED_ROPE (64 B rope per token, eight
+    # tokens per cache row, instead of one padded 128-byte row). The split
+    # prefill gathers whole pages into its workspace, so the packed rows carry
+    # over and the attention kernel expands them (`packed_rope=True`).
+    "TPU_PCP_PACKED_ROPE": env_bool("TPU_PCP_PACKED_ROPE", default=False),
     # PCP manager: max context tokens one forward's prefills may gather.
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
     # PCP manager: context tokens gathered per all-gather chunk.
