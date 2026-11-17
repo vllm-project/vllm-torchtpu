@@ -15,7 +15,7 @@
 # and one decode replica. See README.md in this directory.
 name: gate-tp8-dcp4-1p1d
 purpose: >-
-  Accuracy of the main-based stack at the TP8 + DCP4 decode layout, and the
+  Accuracy of this tree at the TP8 + DCP4 decode layout, and the
   cost of the Qwen3.5 FP8 trade-off settings, measured as an on/off pair.
   The submission tree has no gate of its own at this layout.
 base_point: 8
@@ -48,6 +48,6 @@ suite:
 noise:
   gsm8k_1319_samples: "+-0.42%"
 references:
-  - {job: j-0cdcabb5, tree: 7b45f3df2, layout: "TP8 + DCP4 1P1D", gsm8k: "98.10%"}
-  - {job: j-017298cb, tree: 8fd4dd025, layout: "TP8 1P1D", gsm8k: "97.73%"}
-  - {job: j-9818f652, tree: infx-qwen35-agentx-disagg-candidate2, layout: "TP8 MK ep, thinking on", gsm8k: "97.88%"}
+  - {tree: "an earlier tree", layout: "TP8 + DCP4 1P1D", gsm8k: "98.10%"}
+  - {tree: "an earlier tree", layout: "TP8 1P1D", gsm8k: "97.73%"}
+  - {tree: "an earlier submission candidate", layout: "TP8, decode megakernel in EP mode, thinking on", gsm8k: "97.88%"}
