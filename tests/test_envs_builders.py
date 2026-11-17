@@ -28,6 +28,7 @@ from vllm_torchtpu.envs import (
     env_bool,
     env_float,
     env_int,
+    env_nonnegative_float,
     env_nonnegative_int,
     env_nonnegative_int_or_auto,
     env_str,
@@ -158,6 +159,19 @@ def test_float_rejects_non_numbers(monkeypatch):
     monkeypatch.setenv(VAR, "soon")
     with pytest.raises(ValueError, match=VAR):
         env_float(VAR, 1.0)()
+
+
+@pytest.mark.parametrize("value,expected", [("0", 0.0), ("2.5", 2.5)])
+def test_nonnegative_float_accepts_zero_and_up(monkeypatch, value, expected):
+    monkeypatch.setenv(VAR, value)
+    assert env_nonnegative_float(VAR, 1.0)() == expected
+
+
+@pytest.mark.parametrize("value", ["-0.5", "nan", "inf"])
+def test_nonnegative_float_rejects_negative_and_non_finite(monkeypatch, value):
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match=VAR):
+        env_nonnegative_float(VAR, 1.0)()
 
 
 @pytest.mark.parametrize("value", [None, "", "  ", "auto", "AUTO", " Auto "])

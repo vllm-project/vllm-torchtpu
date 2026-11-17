@@ -1360,13 +1360,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # falls back to full tokenization for ineligible tokenizers/requests.
     "VLLM_TPU_SEGMENT_TOKENIZE": env_bool("VLLM_TPU_SEGMENT_TOKENIZE"),
     # Token budget of that cache (~12 B/token: id pointers plus piece text).
-    "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
+    "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
     ),
     # Recent prompts whose ids a new prompt reuses up to the last added token
     # they share (segment_tokenize.py). 0 keeps no prompts: every prompt is
     # split and looked up piece by piece.
-    "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_int(
+    "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_nonnegative_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
     ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
