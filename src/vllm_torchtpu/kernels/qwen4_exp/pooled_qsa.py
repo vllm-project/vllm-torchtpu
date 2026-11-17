@@ -1585,6 +1585,28 @@ def _select_blocks(
     return selected.reshape(-1, *selected.shape[2:])[: len(query)]
 
 
+# q38 BLSTACK-W2: (tokens, request slots, main slot, decision) already logged by _log_fused_kv_write in this process.
+_Q38_FUSED_KV_WRITE_LOGGED: set = set()
+
+
+def _log_fused_kv_write(tokens: int, slots: int, main_slot: int, decode_rows: int, fused: bool) -> None:
+    """q38 BLSTACK-W2: one INFO line per distinct traced shape / decision and process when
+    VLLM_TPU_QSA_FUSED_KV_WRITE is set: 'ENGAGED' (fused_layer_write stores this layer's caches) or 'NOT ENGAGED'
+    (the separate writers: a prefill-sized step, or a geometry fused_write_supported refuses). Traced shapes only:
+    a compile-cache hit re-traces nothing and prints nothing."""
+    key = (tokens, slots, main_slot, fused)
+    if key in _Q38_FUSED_KV_WRITE_LOGGED:
+        return
+    _Q38_FUSED_KV_WRITE_LOGGED.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 BLSTACK fused KV write %s: tokens %d, request slots %d, main slot %d (decode-sized up to %d tokens; "
+        "VLLM_TPU_QSA_FUSED_KV_WRITE)",
+        "ENGAGED" if fused else "NOT ENGAGED", tokens, slots, main_slot, decode_rows,
+    )
+
+
 def qsa_cache_writes(
     pool: jax.Array,
     k: jax.Array,
@@ -1670,6 +1692,10 @@ def qsa_cache_writes(
             pool, len(k), len(ring_ids), main_slot if main_slot >= 0 else None
         )
     )
+    if envs.VLLM_TPU_QSA_FUSED_KV_WRITE and indexer_writes:
+        # q38 BLSTACK-W2 trace-time engagement line of the fused writer (log only: Python at trace time, nothing
+        # enters the traced program; once per distinct shape / decision and process).
+        _log_fused_kv_write(len(k), len(ring_ids), main_slot, len(context) * max_query_len, bool(fused))
     if fused and not main_write:
         raise ValueError("main_write=False needs the separate cache writers")
 
