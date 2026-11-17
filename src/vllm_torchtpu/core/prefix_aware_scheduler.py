@@ -20,9 +20,10 @@ follow-up requests whose prefixes are already cached, and under high HBM
 utilization can evict those cached prefixes before they are reused.
 
 PrefixAwareScheduler inspects the ready queue within a lookahead window and
-prioritizes requests with the fewest uncached prompt tokens. It modifies only
-the admission ordering; memory management, eviction, and preemption policies
-remain untouched.
+prioritizes requests with the fewest uncached prompt tokens. By default it
+modifies only the admission ordering; eviction and preemption policies
+remain untouched. The two decode options below also change how many remote
+loads a step admits and the blocks reserved for them.
 
 On a prefill/decode-disaggregated decode leg (``kv_role`` ``kv_consumer``)
 it also runs decoding requests ahead of partial prefills, promotes the
@@ -30,11 +31,14 @@ warmest request of both waiting queues (``kv_holding_waiting`` and
 ``waiting``), memoises ``find_longest_cache_hit`` across steps, ships long
 prompts to the workers as packed int32, trims re-sent token ids and logs
 per-minute admission telemetry. Every other engine (no KV transfer, a KV
-producer, or ``kv_both``) keeps the warmest-first admission alone. A KV
-consumer also prefetches remote KV for waiting requests past a full running
-set and, with decode context parallelism, throttles how many remote loads it
-admits; a KV producer sorts the head of the waiting queue. Options:
-``tpu_scheduler`` (core/scheduler_options.py).
+producer, or ``kv_both``) keeps the warmest-first admission alone. With the
+``tpu_scheduler`` options (core/scheduler_options.py) a KV consumer also
+prefetches remote KV for waiting requests past a full running set
+(``kv_prefetch``, which lifts ``max_num_active_reqs`` for vLLM's waiting loop
+and enforces the cap itself) and, with decode context parallelism, throttles
+how many remote loads it admits (``decode_inflight_throttle``, through the
+async-load block reservation); a KV producer sorts the head of the waiting
+queue.
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -176,9 +180,25 @@ class PrefixAwareScheduler(AsyncScheduler):
             and kv_transfer_config.is_kv_consumer
             and not kv_transfer_config.is_kv_producer
         )
-        self._promote_warmest_switch = scheduler_options.get(
-            self.vllm_config
-        ).promote_warmest
+        options = scheduler_options.get(self.vllm_config)
+        self._promote_warmest_switch = options.promote_warmest
+        if options.kv_prefetch and not (
+            self._is_kv_consumer and self.connector is not None
+        ):
+            raise ValueError(
+                f"additional_config.{scheduler_options.SECTION}.kv_prefetch "
+                "starts remote KV loads; it needs a KV consumer with a KV connector"
+            )
+        if options.decode_inflight_throttle and not (
+            self._is_kv_consumer and self.dcp_world_size > 1
+        ):
+            raise ValueError(
+                f"additional_config.{scheduler_options.SECTION}."
+                "decode_inflight_throttle needs a KV consumer with "
+                "decode_context_parallel_size > 1"
+            )
+        self._kv_prefetch_switch = options.kv_prefetch
+        self._decode_throttle_switch = options.decode_inflight_throttle
         self._memo_xstep = False
         if self._is_kv_consumer:
             self._enable_memo_xstep()
@@ -198,8 +218,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
 
     # ------------------------------------------------------------------
-    # Decode KV prefetch past a full running set (on for a KV consumer with
-    # a connector; N = _KV_PREFETCH_MAX_HELD).
+    # Decode KV prefetch past a full running set (option
+    # tpu_scheduler.kv_prefetch, on a KV consumer with a connector;
+    # N = _KV_PREFETCH_MAX_HELD).
     #
     # vLLM v0.31.0's waiting loop stops at ``len(running) >=
     # max_num_active_reqs`` before it asks the connector about the next
@@ -235,10 +256,11 @@ class PrefixAwareScheduler(AsyncScheduler):
     _KV_PREFETCH_RESERVE_BLOCKS = 512
 
     def _init_kv_prefetch(self) -> None:
-        consumer = bool(getattr(self, "_is_kv_consumer", False)) and (
-            getattr(self, "connector", None) is not None
+        # __init__ refuses the option on any other leg than a KV consumer
+        # with a connector.
+        self._kv_prefetch_n = (
+            self._KV_PREFETCH_MAX_HELD if self._kv_prefetch_switch else 0
         )
-        self._kv_prefetch_n = self._KV_PREFETCH_MAX_HELD if consumer else 0
         self._kv_prefetch_reserve = self._KV_PREFETCH_RESERVE_BLOCKS
         # Real admission cap while schedule() runs with prefetch on, else None.
         self._kv_prefetch_cap: int | None = None
@@ -613,29 +635,27 @@ class PrefixAwareScheduler(AsyncScheduler):
             return reserved + self._kv_prefetch_reserve
         return reserved
 
-    # Decode admission throttle (a KV consumer with DCP > 1): refuse a new
-    # remote load while this many loads are in flight, or while running plus
-    # in-flight requests reach max_num_seqs plus the overprovision; otherwise
-    # reserve max(the reserved blocks, the per-sequence blocks x (running +
-    # in flight)). Every IX decode leg with DCP 4 ran these values.
+    # Decode admission throttle (option tpu_scheduler.decode_inflight_throttle,
+    # on a KV consumer with DCP > 1): refuse a new remote load while this many
+    # loads are in flight, or while running plus in-flight requests reach
+    # max_num_seqs plus the overprovision; otherwise reserve max(the reserved
+    # blocks, the per-sequence blocks x (running + in flight)). Every IX
+    # decode leg with DCP 4 ran these values.
     _DECODE_MAX_STAGE3_INFLIGHT = 16
     _DECODE_STAGE3_OVERPROVISION = 32
     _DECODE_RESERVED_BLOCKS = 128
     _DECODE_RESERVED_BLOCKS_PER_SEQ = 8
 
     def _decode_inflight_reserved_blocks(self) -> int:
-        """The stock async-load reservation, or, on a KV consumer with
-        DCP > 1, the decode admission throttle (constants above)."""
+        """The stock async-load reservation, or, with the
+        decode_inflight_throttle option, the decode admission throttle
+        (constants above)."""
         base = int(super()._inflight_prefill_reserved_blocks() or 0)
-        on = getattr(self, "_decode_throttle_switch", None)
-        if on is None:
-            on = int(getattr(self, "dcp_world_size", 1) or 1) > 1
-            self._decode_throttle_switch = on
-        if not on or not getattr(self, "_is_kv_consumer", False):
+        if not self._decode_throttle_switch:
             return base
-        num_inflight = len(getattr(self, "_inflight_prefills", ()))
-        num_running = len(getattr(self, "running", ()))
-        max_running = int(getattr(self, "max_num_running_reqs", 32) or 32)
+        num_inflight = len(self._inflight_prefills)
+        num_running = len(self.running)
+        max_running = self.max_num_running_reqs
         max_stage3_inflight = self._DECODE_MAX_STAGE3_INFLIGHT
         stage3_overprovision = self._DECODE_STAGE3_OVERPROVISION
         if (max_stage3_inflight > 0 and num_inflight >= max_stage3_inflight) or (

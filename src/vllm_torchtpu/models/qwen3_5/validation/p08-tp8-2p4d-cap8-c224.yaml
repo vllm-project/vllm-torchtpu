@@ -235,3 +235,5 @@ legs:
     additional_config:
       tpu_scheduler:
         promote_warmest: false
+        kv_prefetch: true
+        decode_inflight_throttle: true

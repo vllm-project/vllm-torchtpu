@@ -11,26 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The decode admission throttle (_decode_inflight_reserved_blocks): on for a
-KV consumer with DCP > 1."""
+"""The decode admission throttle (_decode_inflight_reserved_blocks): option
+``tpu_scheduler.decode_inflight_throttle``, on a KV consumer with DCP > 1."""
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 
+from vllm_torchtpu.core import prefix_change_log
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 # ---------------- decode admission throttle ----------------
 
 
-def _pas(consumer=True, inflight=0, running=0, max_running=16, dcp=4):
+def _pas(on=True, inflight=0, running=0, max_running=16):
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    s._is_kv_consumer = consumer
+    s._decode_throttle_switch = on
     s._inflight_prefills = [object()] * inflight
     s.running = [object()] * running
     s.max_num_running_reqs = max_running
-    s.dcp_world_size = dcp
     return s
 
 
@@ -42,9 +44,9 @@ def base7():
         yield
 
 
-def test_throttle_off_at_dcp1_is_the_stock_reservation(base7):
+def test_throttle_off_is_the_stock_reservation(base7):
     for inflight in (0, 16, 40):
-        s = _pas(inflight=inflight, running=16, dcp=1)
+        s = _pas(on=False, inflight=inflight, running=16)
         s._kv_prefetch_in_waiting = False
         assert s._decode_inflight_reserved_blocks() == 7
         assert s._inflight_prefill_reserved_blocks() == 7
@@ -62,7 +64,7 @@ def test_throttle_on_dcp4_defaults(base7):
         _pas(inflight=15, running=40, max_running=16)._decode_inflight_reserved_blocks()
         == 1 << 30
     )
-    assert _pas(consumer=False, inflight=16)._decode_inflight_reserved_blocks() == 7
+    assert _pas(on=False, inflight=16)._decode_inflight_reserved_blocks() == 7
 
 
 def test_throttle_reaches_the_vllm_hook(base7):
@@ -74,3 +76,37 @@ def test_throttle_reaches_the_vllm_hook(base7):
     s = _pas(inflight=2, running=3)
     s._kv_prefetch_in_waiting = False
     assert s._inflight_prefill_reserved_blocks() == 128
+
+
+def _built(monkeypatch, options, kv_role="kv_consumer", dcp=4):
+    """Runs PrefixAwareScheduler.__init__ over a stub base __init__."""
+
+    def fake_init(self, *args, **kwargs):
+        self.vllm_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_role=kv_role,
+                is_kv_consumer=kv_role == "kv_consumer",
+                is_kv_producer=kv_role == "kv_producer",
+            ),
+            additional_config={"tpu_scheduler": options},
+        )
+        self.connector = object()
+        self.kv_cache_manager = MagicMock()
+        self.dcp_world_size = dcp
+
+    monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
+    monkeypatch.setattr(prefix_change_log, "install_epoch", lambda: None)
+    monkeypatch.setattr(PrefixAwareScheduler, "_enable_memo_xstep", lambda self: None)
+    return PrefixAwareScheduler()
+
+
+def test_the_throttle_is_the_option(monkeypatch):
+    assert _built(monkeypatch, {})._decode_throttle_switch is False
+    s = _built(monkeypatch, {"decode_inflight_throttle": True})
+    assert s._decode_throttle_switch is True
+
+
+@pytest.mark.parametrize("kv_role, dcp", [("kv_consumer", 1), ("kv_producer", 4)])
+def test_the_throttle_is_refused_off_a_dcp_consumer(monkeypatch, kv_role, dcp):
+    with pytest.raises(ValueError, match="decode_inflight_throttle"):
+        _built(monkeypatch, {"decode_inflight_throttle": True}, kv_role, dcp)
