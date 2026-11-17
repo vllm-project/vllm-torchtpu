@@ -14,21 +14,13 @@
 """Register a torch custom op backed by a multi-device JAX/Pallas function.
 
 ``torch_tpu``'s ``pallas.jax_op`` accepts ``mesh`` and
-``input_partition_specs`` and exports a real multi-device SPMD module, but it
-sizes the torch output tensors from ``lowered.out_avals``, where ``jax.export``
-records ``shard_map`` results as *replicated*. A caller whose outputs are
-genuinely sharded therefore gets tensors sized for the global array instead of
-this rank's shard -- for an EP MoE at 2048 tokens a rank, an output claiming
-16384 rows.
-
-``pcp_streaming_rpa``'s adapter solved that by reimplementing ``__call__``, and
-that copy has since fallen behind -- stock has gained an eager wrapper-tensor
-branch and MLIR-fingerprint-based kernel caching that it does not have. So
-instead of forking the method, this derives it from the installed one and
-changes the single line that builds the output placeholders. If upstream
-reworks that line the derivation no-ops and the caller falls back to stock,
-which is wrong only in the way described above and fails loudly on a shape
-mismatch rather than silently.
+``input_partition_specs`` and exports a real multi-device SPMD module, but
+``jax.export`` records ``shard_map`` results as *replicated*, so an output
+sized from ``lowered.out_avals`` is sized for the global array instead of this
+rank's shard -- for an EP MoE at 2048 tokens a rank, an output claiming 16384
+rows. ``JaxCallable`` therefore takes the outputs' ``output_partition_specs``
+and sizes each output from them, and the fake this module registers sizes its
+outputs from the export's real output shardings the same way.
 """
 
 import inspect
@@ -39,17 +31,6 @@ import jax
 import torch
 from jax.sharding import NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
-
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
-
-_STOCK_PLACEHOLDER_LINE = """      output_shapes = [
-          torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
-      ]"""
-_SHARDED_PLACEHOLDER_LINE = (
-    """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
-)
 
 
 def _sharded_output_placeholders(lowered, mesh):
@@ -92,67 +73,6 @@ def _placeholder(aval, spec, mesh):
             )
         shape = shape[:-1] + (shape[-1] // 2,)
     return torch.empty(shape, dtype=torch_dtype, device="tpu")
-
-
-def _build_sharded_callable_cls():
-    """A ``JaxCallable`` whose ``__call__`` is the installed one, minus the
-    assumption that a sharded output is replicated.
-
-    The method source is recompiled inside a throwaway class so its original
-    indentation -- and therefore the needle below -- survives verbatim.
-    """
-    src = inspect.getsource(pallas_impl.JaxCallable.__call__)
-    if _STOCK_PLACEHOLDER_LINE not in src:
-        logger.warning(
-            "torch_tpu's JaxCallable.__call__ no longer builds its output "
-            "placeholders the way this adapter expects; sharded outputs will "
-            "be sized globally. Sharded multi-device ops will fail on a shape "
-            "mismatch until this is re-derived."
-        )
-        return pallas_impl.JaxCallable
-    patched = "class _Holder:\n" + src.replace(
-        _STOCK_PLACEHOLDER_LINE, _SHARDED_PLACEHOLDER_LINE, 1
-    )
-    namespace: dict = {}
-    exec(  # noqa: S102 - deriving from the installed source is the point
-        compile(patched, pallas_impl.__file__, "exec"),
-        {
-            **pallas_impl.__dict__,
-            "_sharded_output_placeholders": _sharded_output_placeholders,
-        },
-        namespace,
-    )
-    return type(
-        "_ShardedJaxCallable",
-        (pallas_impl.JaxCallable,),
-        {"__call__": namespace["_Holder"].__call__},
-    )
-
-
-_SHARDED_CALLABLE_CLS = None
-
-
-def _stock_takes_output_specs() -> bool:
-    """Whether the installed ``JaxCallable`` no longer builds placeholders the
-    way the derivation patches, but sizes them from its own
-    ``output_partition_specs`` instead."""
-    src = inspect.getsource(pallas_impl.JaxCallable.__call__)
-    params = inspect.signature(pallas_impl.JaxCallable.__init__).parameters
-    return _STOCK_PLACEHOLDER_LINE not in src and "output_partition_specs" in params
-
-
-def _callable_cls_and_kwargs(output_partition_specs) -> tuple[type, dict]:
-    """The ``JaxCallable`` class to build and its extra constructor kwargs."""
-    global _SHARDED_CALLABLE_CLS
-    if _stock_takes_output_specs():
-        # One spec per output leaf: stock zips them with the out avals.
-        specs = jax.tree.leaves(
-            output_partition_specs, is_leaf=lambda s: isinstance(s, PartitionSpec)
-        )
-        return pallas_impl.JaxCallable, {"output_partition_specs": specs}
-    if _SHARDED_CALLABLE_CLS is None:
-        _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
-    return _SHARDED_CALLABLE_CLS, {}
 
 
 def sharded_jax_op(
@@ -217,8 +137,7 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
-    callable_cls, callable_kwargs = _callable_cls_and_kwargs(output_partition_specs)
-    wrapped_fn = callable_cls(
+    wrapped_fn = pallas_impl.JaxCallable(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
@@ -226,7 +145,10 @@ def sharded_jax_op(
         input_partition_specs=input_partition_specs,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
-        **callable_kwargs,
+        # One spec per output leaf: JaxCallable zips them with the out avals.
+        output_partition_specs=jax.tree.leaves(
+            output_partition_specs, is_leaf=lambda s: isinstance(s, PartitionSpec)
+        ),
     )
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
