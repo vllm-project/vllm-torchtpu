@@ -6119,6 +6119,13 @@ class TPUModelRunner(GPUModelRunner):
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
+        if envs.TPU_SAMPLER_TOPP_CANDIDATES:
+            from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+                arm_topp_kernel,
+            )
+
+            arm_topp_kernel()
+
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
