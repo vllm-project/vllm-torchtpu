@@ -21,6 +21,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, FP8, rmsnorm, rope_partial, round_bf16
 from ...pool.config import cache_exec
@@ -70,16 +71,22 @@ def gqa_reference(
 
     in_scaled = jnp.dtype(w_att_in_all.dtype) == jnp.dtype(FP8)
     out_scaled = jnp.dtype(w_att_out_all.dtype) == jnp.dtype(FP8)
-    has_in_s = in_scaled and ("att_in_s" in params or "in_s" in params)
-    has_out_s = out_scaled and ("att_out_s" in params or "out_s" in params)
+    if in_scaled and "att_in_s" not in params and "in_s" not in params:
+        raise MegakernelConfigError(
+            "gqa_reference: FP8 'att_in' requires 'att_in_s' or 'in_s' scale"
+        )
+    if out_scaled and "att_out_s" not in params and "out_s" not in params:
+        raise MegakernelConfigError(
+            "gqa_reference: FP8 'att_out' requires 'att_out_s' or 'out_s' scale"
+        )
     att_in_s_l = (
         _slice_sm(params["att_in_s"] if "att_in_s" in params else params["in_s"])
-        if has_in_s
+        if in_scaled
         else None
     )
     att_out_s_l = (
         _slice_sm(params["att_out_s"] if "att_out_s" in params else params["out_s"])
-        if has_out_s
+        if out_scaled
         else None
     )
     qn_l = _slice_sm(params["qn"])

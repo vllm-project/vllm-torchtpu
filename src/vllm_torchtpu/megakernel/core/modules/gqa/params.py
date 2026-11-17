@@ -147,9 +147,18 @@ def derive_params(
 ) -> GQAParams:
     """`GQAParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
+    if ex.R <= 0 or g.NH <= 0 or g.NH % ex.R != 0:
+        raise MegakernelConfigError(
+            f"GQA NH={g.NH} must be a positive multiple of R={ex.R}"
+        )
+    if g.NKV <= 0 or g.NKV > ex.R or ex.R % g.NKV != 0 or g.NH % g.NKV != 0:
+        raise MegakernelConfigError(
+            f"GQA requires 1 <= NKV={g.NKV} <= R={ex.R} with R % NKV == 0 "
+            f"and NH={g.NH} % NKV == 0"
+        )
     nh = g.NH // ex.R
     nai = (2 * nh + 2) * g.HD
-    G = max(1, ex.R // g.NKV)
+    G = ex.R // g.NKV
     BLK = tt.kv_blk
     PAIR_KV = tt.pair_kv
     NKV = max(tt.nkv, 4) if PAIR_KV else tt.nkv

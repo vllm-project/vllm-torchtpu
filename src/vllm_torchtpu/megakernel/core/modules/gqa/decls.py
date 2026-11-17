@@ -114,9 +114,13 @@ def resolve_gqa_binding(
     hd_raw = vals.get("head_dim")
     hd = H // NH if hd_raw is None else int(hd_raw)
     rot_raw = vals.get("rot", 1.0)
-    if isinstance(rot_raw, bool) or not isinstance(rot_raw, (int, float)):
+    if (
+        isinstance(rot_raw, bool)
+        or not isinstance(rot_raw, (int, float))
+        or (isinstance(rot_raw, float) and rot_raw > 1.0 and not rot_raw.is_integer())
+    ):
         raise MegakernelConfigError(
-            f"GQAModule rot must be an int or float, got {rot_raw!r}"
+            f"GQAModule rot must be a fraction in (0, 1] or an integer, got {rot_raw!r}"
         )
     rot_val = (
         int(round(float(rot_raw) * hd)) if 0.0 < float(rot_raw) <= 1.0 else int(rot_raw)
