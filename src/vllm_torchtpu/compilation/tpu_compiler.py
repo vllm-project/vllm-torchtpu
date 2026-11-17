@@ -693,9 +693,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         elif payload.signature != shape_variants.graph_signature(graph):
             # Not what makes the bundled entry safe -- that comes from wrapper
             # and executable being one object, with no lookup left to drift.
-            # This is the same check BucketExecutables.get already applies to
-            # the in-memory hand-over, extended across processes, and it earns
-            # its place because nothing else validates the entry against the
+            # This is the positional dtype-and-shape check that
+            # BucketExecutables.get falls back to for renamed placeholders in
+            # the in-memory hand-over, extended across processes; the artifact
+            # was saved for this same subgraph and bucket, so nothing here is
+            # matched by name or reordered. It earns its place because
+            # nothing else validates the entry against the
             # graph: torch_tpu injects a synthetic cache_info and stubs out
             # generate_guards_expression, and replaying a pickle we wrote
             # ourselves never goes through AOTAutogradCache.try_load.
