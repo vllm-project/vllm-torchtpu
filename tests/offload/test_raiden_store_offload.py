@@ -4902,5 +4902,184 @@ class TestDenseDpIndex(unittest.TestCase):
         self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
+class TestResolveDivergentLocalHit(unittest.TestCase):
+    """resolve_divergent_local_hit_tokens: the block-aligned full-attention
+    prefix a producer keeps in HBM when its local hybrid hit diverged, found
+    through the real _quiet_lookup over a recorded _lookup."""
+
+    BS = 4
+
+    def _sched(self, hits, transfer_jobs=()):
+        """``hits`` maps the lookup's start (num_locally_computed_tokens) to
+        the host-tier tokens _lookup answers past it (None while pending)."""
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched._events_tracker = MagicMock()
+        req_status = SimpleNamespace(
+            transfer_jobs=set(transfer_jobs),
+            update_offload_keys=MagicMock(),
+            num_locally_computed_tokens=0,
+        )
+        sched._req_status = {"r": req_status}
+        starts: list[int] = []
+
+        def lookup(status, max_num_new_tokens=None):
+            # A real lookup records an event; the quiet probe must swallow it.
+            sched._events_tracker.record_lookup(status)
+            starts.append(status.num_locally_computed_tokens)
+            return hits.get(status.num_locally_computed_tokens, 0)
+
+        sched._lookup = lookup
+        return sched, starts
+
+    def _resolve(self, sched, num_local, num_reconciled, skip=False):
+        request = SimpleNamespace(request_id="r", skip_reading_prefix_cache=skip)
+        return sched.resolve_divergent_local_hit_tokens(
+            request, num_local, num_reconciled, self.BS
+        )
+
+    def test_cases(self):
+        cases = [
+            # (name, num_local, num_reconciled, hits, expected, lookup starts)
+            # Host tier holds tokens past the aligned FA hit: keep all of it.
+            ("hit_above_fa_aligned", 10, 4, {8: 4}, 8, [8]),
+            ("pending_at_fa_aligned", 10, 4, {8: None}, 8, [8]),
+            # The final block's state is in the host tier: keep one block less
+            # and load the final block.
+            ("one_block_back", 12, 4, {8: 4}, 8, [12, 8]),
+            ("one_block_back_pending", 12, 4, {8: None}, 8, [12, 8]),
+            # A deeper chunk holds the state: the scan stops at the highest.
+            ("chunk_scan", 20, 4, {8: 6}, 12, [20, 16, 12, 8]),
+            ("chunk_scan_pending", 20, 4, {12: None}, 12, [20, 16, 12]),
+            # A host-tier hit that ends at or below the reconciled hit loads
+            # nothing new.
+            ("hit_not_past_reconciled", 16, 9, {8: 1}, None, [16, 12, 8]),
+            # Nothing in the host tier: the reconciled hit stands.
+            ("none", 12, 4, {}, None, [12, 8, 4]),
+        ]
+        for name, num_local, num_reconciled, hits, expected, starts in cases:
+            with self.subTest(name):
+                sched, seen = self._sched(hits)
+                self.assertEqual(
+                    self._resolve(sched, num_local, num_reconciled), expected
+                )
+                self.assertEqual(seen, starts)
+                sched._events_tracker.record_lookup.assert_not_called()
+                sched._req_status["r"].update_offload_keys.assert_called_once()
+
+    def test_a_request_with_a_transfer_in_flight_keeps_its_aligned_hit(self):
+        sched, seen = self._sched({8: 4}, transfer_jobs=[3])
+        self.assertEqual(self._resolve(sched, 10, 4), 8)
+        self.assertEqual(seen, [])
+
+    def test_a_request_that_skips_the_prefix_cache_resolves_nothing(self):
+        sched, seen = self._sched({8: 4})
+        self.assertIsNone(self._resolve(sched, 10, 4, skip=True))
+        self.assertEqual(seen, [])
+
+
+class TestPartialTailLookupWithRecency(unittest.TestCase):
+    """_lookup under host_tier_recency: partial-tail boundaries are probed from
+    the top down, only above the local HBM hit, and a pending boundary makes a
+    lookup with no complete hit wait."""
+
+    def _sched(self, results, complete_hit=0, local_hit=0):
+        """``results`` maps a boundary to the store's answer per group."""
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched._host_tier_recency = True
+        sched.config = SimpleNamespace(
+            supports_partial_tail=True,
+            tokens_per_hash=2,
+            kv_group_configs=(
+                SimpleNamespace(group_idx=0),
+                SimpleNamespace(group_idx=1),
+            ),
+        )
+        sched._partial_tail_block_size = 8
+        sched._events_tracker = MagicMock()
+        sched._lookup_complete_chunks = MagicMock(return_value=complete_hit)
+        sched._make_boundary_key = lambda req, group_idx, boundary, ctx: (
+            group_idx,
+            boundary,
+        )
+        probed: list[tuple[int, int]] = []
+
+        def lookup(key, ctx):
+            probed.append(key)
+            group_idx, boundary = key
+            return results.get(boundary, (LookupResult.MISS,) * 2)[group_idx]
+
+        sched.manager = SimpleNamespace(lookup=lookup)
+        req_status = SimpleNamespace(
+            num_locally_computed_tokens=0,
+            partial_tail_boundary=123,
+            max_load_tokens=None,
+            req=SimpleNamespace(num_prompt_tokens=20, _tpu_local_hit_tokens=local_hit),
+            req_context=None,
+        )
+        return sched, req_status, probed
+
+    def test_the_highest_hit_boundary_is_taken(self):
+        hit = (LookupResult.HIT, LookupResult.HIT)
+        sched, status, probed = self._sched({4: hit, 2: hit})
+        self.assertEqual(sched._lookup(status), 4)
+        self.assertEqual(status.partial_tail_boundary, 4)
+        # Boundaries 6 (both groups probed, group 0 missed) then 4.
+        self.assertEqual(probed, [(0, 6), (0, 4), (1, 4)])
+        self.assertEqual(sched._events_tracker.record_partial_lookup.call_count, 2)
+
+    def test_a_group_that_misses_skips_the_boundary(self):
+        sched, status, probed = self._sched(
+            {6: (LookupResult.HIT, LookupResult.MISS), 4: (LookupResult.HIT,) * 2}
+        )
+        self.assertEqual(sched._lookup(status), 4)
+        self.assertEqual(probed, [(0, 6), (1, 6), (0, 4), (1, 4)])
+
+    def test_boundaries_at_or_below_the_local_hit_are_not_probed(self):
+        hit = (LookupResult.HIT, LookupResult.HIT)
+        # HBM already holds 4 tokens: only boundary 6 can load anything.
+        sched, status, probed = self._sched({4: hit}, local_hit=4)
+        self.assertEqual(sched._lookup(status), 0)
+        self.assertIsNone(status.partial_tail_boundary)
+        self.assertEqual(probed, [(0, 6)])
+
+    def test_a_pending_boundary_without_a_complete_hit_waits(self):
+        for pending in (LookupResult.HIT_PENDING, LookupResult.RETRY):
+            with self.subTest(pending.name):
+                sched, status, probed = self._sched({6: (LookupResult.HIT, pending)})
+                self.assertIsNone(sched._lookup(status))
+                self.assertIsNone(status.partial_tail_boundary)
+                self.assertEqual([b for _, b in probed], [6, 6, 4, 2])
+
+    def test_a_pending_boundary_above_a_complete_hit_keeps_the_complete_hit(self):
+        sched, status, probed = self._sched(
+            {14: (LookupResult.RETRY, LookupResult.HIT)}, complete_hit=8
+        )
+        self.assertEqual(sched._lookup(status), 8)
+        self.assertEqual(sorted({b for _, b in probed}), [10, 12, 14])
+
+    def test_a_mid_chunk_local_hit_touches_and_loads_nothing(self):
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched._host_tier_recency = True
+        sched.config = SimpleNamespace(
+            kv_group_configs=(SimpleNamespace(tokens_per_chunk=4),)
+        )
+        req_status = MagicMock(transfer_jobs=set())
+        sched._req_status = {"r1": req_status}
+        sched._touch = MagicMock()
+        req = SimpleNamespace(request_id="r1")
+        # A local hit of 6 ends inside the second 4-token chunk.
+        self.assertEqual(sched.get_num_new_matched_tokens(req, 6), (0, False))
+        self.assertEqual(req_status.num_locally_computed_tokens, 6)
+        req_status.update_offload_keys.assert_called_once_with()
+        req_status.update_num_hit_chunks.assert_called_once_with(6)
+        sched._touch.assert_called_once_with(req_status)
+
+
 if __name__ == "__main__":
     unittest.main()
