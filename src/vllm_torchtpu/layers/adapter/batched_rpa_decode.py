@@ -19,6 +19,9 @@ one KV head per device, head_dim 256 and an fp8 KV cache, 8 lanes cap the KV
 block at 2,816 tokens and 4 lanes allow 4,096, so a ~98K-token sequence takes
 25 blocks instead of 36 and pays the fixed per-block cost (masks, stitch,
 lane-chained softmax) less often: the attention call ran 15.1% faster at 64
+rows and 14.6% at 112 rows (tpu7x, standalone kernel benchmark), and the
+decode step 4.3% / 3.8% faster in the engine than with 8 lanes. The result is
+not bit-exact against 8 lanes (max abs 4.3e-4, bf16 rounding scale).
 
 Only that measured shape is in the table, and only for long-context
 deployments (``max_model_len`` of at least the measured ~98K tokens); every
