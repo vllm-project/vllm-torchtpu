@@ -37,6 +37,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.opt_in_config import option
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
@@ -53,6 +54,10 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+# Draft buckets of additional_config spec_draft_bucket_step start above this
+# many tokens.
+_FINE_DRAFT_BUCKETS_FROM = 64
 
 # --additional-config key: keep an opted-in drafter's KV DCP-sharded or whole
 # per rank (`_shards_draft_kv_over_dcp`). Part of the compile-cache key.
@@ -110,6 +115,9 @@ class DFlashProposer:
     Implements a parallel block-level speculative decoding framework.
     """
 
+    # additional_config spec_draft_bucket_step (set in __init__).
+    _draft_bucket_step: int = 0
+
     def __init__(
         self,
         runner: TPUModelRunner,
@@ -134,6 +142,23 @@ class DFlashProposer:
                 "DFlash/DSpark requires target layer ids in the draft config "
                 "(one of eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
                 "target_layer_ids, or dflash_config.target_layer_ids)."
+            )
+
+        # Extra draft-forward buckets above 64 tokens this many apart (0: the
+        # target's token buckets only; `_fine_draft_buckets`).
+        self._draft_bucket_step = option(
+            getattr(vllm_config, "additional_config", None), "spec_draft_bucket_step"
+        )
+        if self._draft_bucket_step < 0:
+            raise ValueError(
+                "additional_config.spec_draft_bucket_step must not be negative"
+            )
+        if self._draft_bucket_step:
+            logger.info(
+                "Draft-forward buckets every %d tokens above %d "
+                "(additional_config spec_draft_bucket_step).",
+                self._draft_bucket_step,
+                _FINE_DRAFT_BUCKETS_FROM,
             )
 
         draft_tp = self.speculative_config.draft_tensor_parallel_size
@@ -412,7 +437,27 @@ class DFlashProposer:
         max_draft_tokens = self._max_chunk_reqs() * self.block_size
         while paddings[-1] < max_draft_tokens:
             paddings.append(min(paddings[-1] * 2, max_draft_tokens))
+        if self._draft_bucket_step:
+            # Every row of a padded draft costs: its matmuls, TP all-reduces,
+            # LM head and window attention all scale with the bucket.
+            paddings = sorted(set(paddings).union(self._fine_draft_buckets()))
         return paddings
+
+    def _fine_draft_buckets(self) -> list[int]:
+        """Draft-only buckets from `_FINE_DRAFT_BUCKETS_FROM` up to a full
+        chunk: spec_draft_bucket_step apart, and an eighth of the bucket's
+        power of two apart above 8 x the step, so a bucket pads at most
+        ~12.5 % and their count grows with log2 of the chunk. A draft is
+        num_reqs * block tokens, which the target's coarse buckets pad by up
+        to ~45 %."""
+        step = self._draft_bucket_step
+        max_draft_tokens = self._max_chunk_reqs() * self.block_size
+        buckets = []
+        bucket = _FINE_DRAFT_BUCKETS_FROM
+        while bucket < max_draft_tokens:
+            bucket += max(step, (1 << (bucket.bit_length() - 1)) // 8)
+            buckets.append(min(bucket, max_draft_tokens))
+        return buckets
 
     def _get_padded_len(self, target_len: int) -> int:
         paddings = self._draft_token_paddings()

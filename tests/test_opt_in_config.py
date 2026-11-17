@@ -94,6 +94,8 @@ REPLACED_ENV = {
     "prefill_tpot_target_ms": "VLLM_TPU_PREFILL_TPOT_TARGET_MS",
     "prefill_tpot_max_hold_s": "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S",
     "prefill_tpot_priced": "VLLM_TPU_PREFILL_TPOT_PRICED",
+    # --- v7 runner/spec ---
+    "spec_draft_bucket_step": "TPU_DRAFT_BUCKET_STEP",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -135,6 +137,8 @@ SAMPLE = {
     "prefill_spacing_min_tokens": 8192,
     "prefill_tpot_target_ms": 6.5,
     "prefill_tpot_max_hold_s": 10.0,
+    # --- v7 runner/spec ---
+    "spec_draft_bucket_step": 32,
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {

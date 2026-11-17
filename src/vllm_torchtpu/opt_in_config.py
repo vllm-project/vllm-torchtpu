@@ -315,6 +315,13 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # whole remaining prefills up to the largest prefill-token bin
     # (512-4096) whose measured step time fits every decoding request's slack.
     "prefill_tpot_priced": False,
+    # --- v7 runner/spec ---
+    # DFlash/DSpark draft forward: extra buckets above 64 tokens this many
+    # apart (an eighth of the power of two apart past 8 x the step), so a
+    # draft of num_reqs * block tokens pads <= ~12.5 % instead of up to ~45 %
+    # (`DFlashProposer._fine_draft_buckets`). More precompiled draft programs.
+    # 0 = the target's token buckets only. Bitwise per row (padding only).
+    "spec_draft_bucket_step": 0,
 }
 
 

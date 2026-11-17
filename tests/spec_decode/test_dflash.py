@@ -238,6 +238,44 @@ def test_draft_buckets_cover_a_full_chunk(
         proposer._get_padded_len(draft_paddings[-1] + 1)
 
 
+@pytest.mark.parametrize(
+    ("step", "num_tokens_paddings", "num_reqs_max_model_len", "draft_paddings"),
+    [
+        (32, [16, 32, 64], 16, [16, 32, 64, 96, 128]),
+        # Past 8 x the step, an eighth of the power of two apart.
+        (
+            8,
+            [16, 32, 64],
+            64,
+            [16, 32, 64, 72, 80, 88, 96, 104, 112, 120, 128]
+            + list(range(144, 257, 16))
+            + list(range(288, 513, 32)),
+        ),
+        # The target's buckets stay; the last bucket is the full chunk.
+        (32, [16, 32, 64, 128], 13, [16, 32, 64, 96, 104, 128]),
+    ],
+)
+def test_draft_bucket_step_adds_fine_buckets(
+    step, num_tokens_paddings, num_reqs_max_model_len, draft_paddings
+):
+    proposer = _make_precompile_proposer(num_tokens_paddings, num_reqs_max_model_len)
+    assert proposer._draft_bucket_step == 0
+    proposer._draft_bucket_step = step
+
+    assert proposer._draft_token_paddings() == draft_paddings
+    # Every draft length pads to a bucket of at most 12.5 % (+ the step).
+    for tokens in range(65, draft_paddings[-1] + 1):
+        assert proposer._get_padded_len(tokens) - tokens < max(step, tokens // 8)
+
+
+def test_draft_bucket_step_key_is_read_at_init():
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    assert proposer._draft_bucket_step == 0
+    proposer.vllm_config.additional_config = {"spec_draft_bucket_step": 32}
+    DFlashProposer.__init__(proposer, proposer.runner, proposer.vllm_config)
+    assert proposer._draft_bucket_step == 32
+
+
 def test_precompile_warms_draft_only_buckets():
     proposer = _make_precompile_proposer([16, 32, 64], num_reqs_max_model_len=16)
 
