@@ -558,6 +558,7 @@ def _pallas_rpa_kernel_batched(
     decode_query_size: int = 1,
     decode_lanes: int | None = None,
     tuned_tiles: bool = False,
+    skip_empty_mixed: bool = False,
     block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
@@ -567,6 +568,8 @@ def _pallas_rpa_kernel_batched(
         kernel_kwargs["decode_query_size"] = decode_query_size
     if tuned_tiles:
         kernel_kwargs["tuned_tiles"] = True
+    if skip_empty_mixed:
+        kernel_kwargs["skip_empty_mixed"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -867,6 +870,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # The tuned batched RPA tiles and decode lanes (wrapper.calculate_block_sizes,
     # batched_rpa_decode); off unless a model rule turns them on.
     tuned_tiles: bool = False
+    # Skip an empty MIXED call (the batched RPA wrapper's skip_empty_mixed);
+    # off unless a model rule turns it on.
+    skip_empty_mixed: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1013,6 +1019,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             self.decode_lanes,
             self.tuned_tiles,
+            self.skip_empty_mixed,
             block_major,
         )
         existing = self._kernel_config_cache.get(config_key)
@@ -1057,6 +1064,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             self.decode_lanes,
             self.tuned_tiles,
+            self.skip_empty_mixed,
             block_major,
         )
         existing = self._kernel_registry.get(registry_key)
@@ -1102,6 +1110,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["decode_lanes"] = self.decode_lanes
             if "tuned_tiles" in entry_params:
                 entry_kwargs["tuned_tiles"] = self.tuned_tiles
+            if "skip_empty_mixed" in entry_params:
+                entry_kwargs["skip_empty_mixed"] = self.skip_empty_mixed
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1235,6 +1245,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
             tuned_tiles=self.tuned_tiles,
+            skip_empty_mixed=self.skip_empty_mixed,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1458,6 +1469,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
                     tuned_tiles=self.tuned_tiles,
+                    skip_empty_mixed=self.skip_empty_mixed,
                 )
             return
 

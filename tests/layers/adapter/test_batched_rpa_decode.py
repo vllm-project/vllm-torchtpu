@@ -57,6 +57,13 @@ def test_decode_lanes_table(num_kv_heads, head_dim, dtype, max_model_len, lanes)
 
 
 def _entry_rpa_func(
+    monkeypatch,
+    *,
+    rows,
+    decode_query_size,
+    decode_lanes,
+    tuned_tiles=False,
+    skip_empty_mixed=False,
 ):
     seen = {}
 
@@ -75,6 +82,7 @@ def _entry_rpa_func(
         decode_query_size=decode_query_size,
         decode_lanes=decode_lanes,
         tuned_tiles=tuned_tiles,
+        skip_empty_mixed=skip_empty_mixed,
     )
     return seen["rpa_func"]
 
@@ -109,6 +117,17 @@ def test_tuned_tiles_reach_the_kernel(monkeypatch):
         "decode_query_size": 4,
         "tuned_tiles": True,
     }
+
+
+def test_skip_empty_mixed_reaches_the_kernel_on_its_own(monkeypatch):
+    rpa_func = _entry_rpa_func(
+        monkeypatch,
+        rows=64,
+        decode_query_size=4,
+        decode_lanes=None,
+        skip_empty_mixed=True,
+    )
+    assert rpa_func.keywords == {"decode_query_size": 4, "skip_empty_mixed": True}
 
 
 def _lanes_after_init(monkeypatch, *, tuned_tiles, max_model_len=262144):
@@ -171,3 +190,27 @@ def test_dcp_kernels_take_the_tuned_tiles(monkeypatch):
     )
     tuned[0](*([None] * 11))
     assert seen["tuned_tiles"] is True
+    assert seen["skip_empty_mixed"] is False
+
+
+def test_dcp_kernels_take_the_skip_on_its_own(monkeypatch):
+    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
+    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", lambda name, fn: fn)
+    kw = dict(
+        sliding_window=None,
+        sm_scale=1.0,
+        logits_soft_cap=None,
+        q_scale=None,
+        k_scale=None,
+        v_scale=None,
+        cp_group_size=4,
+        cp_rank=0,
+        decode_query_size=4,
+    )
+    default = cp_attention.build_dcp_kernels(**kw)
+    skip = cp_attention.build_dcp_kernels(skip_empty_mixed=True, **kw)
+    for off, on in zip(default, skip, strict=True):
+        assert off is not on
+        assert off.keywords["skip_empty_mixed"] is False
+        assert on.keywords["skip_empty_mixed"] is True
+        assert on.keywords["tuned_tiles"] is False
