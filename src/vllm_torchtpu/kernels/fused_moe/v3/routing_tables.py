@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Host/device routing table interfaces and expert-to-rank mapping for Fused EP
-MoE v3."""
+MoE v3.
+
+The table builders below (build_routing_tables and the per-shard slices) are
+the dense-jnp reference the shard-tables kernel is tested against
+(tests/kernels/fused_moe/test_fused_ep_moe_v3_tables.py)."""
 
 from typing import NamedTuple
 
@@ -211,24 +215,6 @@ def local_routed_rows(routing, shard, *, routed_rows_per_shard):
         jnp.int32(routed_rows_per_shard),
         routing.routed_row - base,
     )
-
-
-def shard_token_table(routing, shard, *, routed_rows_per_shard):
-    """The token each of this shard's routed rows computes,
-    [routed_rows_per_shard],
-    clamped into the token range: the kernel fetches rows by this value
-    with bounds checks off."""
-    T, K = routing.arrival_row.shape
-    token_of_pair = jnp.broadcast_to(
-        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
-    ).reshape(-1)
-    row = local_routed_rows(routing, shard, routed_rows_per_shard=routed_rows_per_shard)
-    table = (
-        jnp.zeros((routed_rows_per_shard,), jnp.int32)
-        .at[row]
-        .add(token_of_pair, mode="drop")
-    )
-    return jnp.clip(table, jnp.int32(0), jnp.int32(max(T - 1, 0)))
 
 
 def shard_expert_rows(routing, shard, *, num_experts, num_shards):

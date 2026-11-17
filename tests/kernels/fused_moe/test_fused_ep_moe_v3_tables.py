@@ -22,6 +22,9 @@ leave it. These tests check the bound's arithmetic at the Qwen3.5 decode
 shapes and at a wide mesh, and, with the lookup's window moved down so its
 edge is reachable at a small shape, that the kernel really drops pairs past
 the edge and that the check refuses those calls and admits exact ones.
+
+Every table the kernel emits is also checked against ``routing_tables``'
+reference passes (dense jnp ops over the same pairs).
 """
 
 import jax
@@ -179,3 +182,60 @@ def test_the_check_refuses_the_call_the_lookup_would_corrupt(
     routed_row = _shard_tables(messages, 1, routed_rows)[2]
     owned = int(np.sum((pairs < EXPERTS) & (pairs >= EXPERTS // SHARDS)))
     assert _own_pairs_dropped(routed_row, pairs, 1, routed_rows) == owned > 0
+
+
+@pytest.mark.parametrize("unrouted", [0, 17], ids=["all_routed", "unrouted_tokens"])
+def test_shard_tables_match_the_reference(interpret, unrouted):
+    """Every table the kernel emits for each shard, against routing_tables'
+    reference passes over the same pairs: routed and arrival rows (a pair
+    that routes nowhere takes the drop row and arrival row zero), the FFN
+    kernel's transport and push tables, the expert rows and bases, the
+    counts, the visit order and the run rows."""
+    messages, pairs = _messages(unrouted=unrouted)
+    pairs_per_shard = TOKENS * TOP_K
+    routed_rows = tables.routed_rows_bound(SHARDS * TOKENS, TOP_K, EXPERTS, TILE)
+    ref = tables.build_routing_tables(
+        jnp.asarray(pairs.reshape(-1, TOP_K)),
+        num_experts=EXPERTS,
+        num_shards=SHARDS,
+        tokens_per_shard=TOKENS,
+        block=kernel.shard_tables_block(pairs_per_shard),
+        tile_rows=TILE,
+        routed_rows_per_shard=routed_rows,
+    )
+    live = pairs < EXPERTS
+    for shard in range(SHARDS):
+        (run_rows, arrival, routed_row, ffn_tables, rows, base, counts, visit) = (
+            _shard_tables(messages, shard, routed_rows)[:8]
+        )
+        own = slice(shard * pairs_per_shard, (shard + 1) * pairs_per_shard)
+        want_routed = tables.local_routed_rows(
+            ref, shard, routed_rows_per_shard=routed_rows
+        )
+        np.testing.assert_array_equal(
+            np.asarray(routed_row), np.where(live, want_routed, routed_rows)
+        )
+        want_arrival = np.asarray(ref.arrival_row).reshape(-1)[own]
+        np.testing.assert_array_equal(
+            np.asarray(arrival).reshape(-1), np.where(live[own], want_arrival, 0)
+        )
+        want_rows, want_base = tables.shard_expert_rows(
+            ref, shard, num_experts=EXPERTS, num_shards=SHARDS
+        )
+        want_ffn = tables.shard_transport_tables(
+            ref, shard, num_experts=EXPERTS, num_shards=SHARDS
+        ) + tables.shard_push_tables(ref, shard, num_experts=EXPERTS, num_shards=SHARDS)
+        assert len(ffn_tables) == len(want_ffn)
+        for got, want in zip(ffn_tables, want_ffn):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        np.testing.assert_array_equal(np.asarray(rows), np.asarray(want_rows))
+        np.testing.assert_array_equal(np.asarray(base), np.asarray(want_base))
+        want_counts = tables.shard_counts(
+            ref, want_rows, shard, num_experts=EXPERTS, num_shards=SHARDS
+        )
+        np.testing.assert_array_equal(np.asarray(counts), np.asarray(want_counts))
+        np.testing.assert_array_equal(
+            np.asarray(visit),
+            np.asarray(tables.visit_order(want_rows, EXPERTS // SHARDS)),
+        )
+        np.testing.assert_array_equal(np.asarray(run_rows), np.asarray(ref.run_rows))
