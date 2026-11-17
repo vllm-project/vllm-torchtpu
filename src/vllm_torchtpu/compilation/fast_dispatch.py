@@ -168,7 +168,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
             logger.info("fast_compiled_call: fast=%d slow=%d", _STATS[0], _STATS[1])
 
     @functools.wraps(fn)
-    def qx_fast_compiled(*args: Any, **kwargs: Any) -> Any:
+    def fast_dispatch_call(*args: Any, **kwargs: Any) -> Any:
         if not _CONFIG["fast"]:
             return compiled(*args, **kwargs)
         if not state["disabled"]:
@@ -207,14 +207,14 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
             return out
         return compiled(*args, **kwargs)
 
-    qx_fast_compiled._qx_fast_state = state  # type: ignore[attr-defined]
-    qx_fast_compiled._torchdynamo_orig_callable = getattr(  # type: ignore[attr-defined]
+    fast_dispatch_call._fast_dispatch_state = state  # type: ignore[attr-defined]
+    fast_dispatch_call._torchdynamo_orig_callable = getattr(  # type: ignore[attr-defined]
         compiled, "_torchdynamo_orig_callable", fn
     )
     # torch._dynamo.eval_frame.innermost_fn (used by torch._dynamo.disable)
     # follows _torchdynamo_orig_callable only from the wrapper it names.
-    qx_fast_compiled._torchdynamo_wrapper_id = id(qx_fast_compiled)  # type: ignore[attr-defined]
-    return qx_fast_compiled
+    fast_dispatch_call._torchdynamo_wrapper_id = id(fast_dispatch_call)  # type: ignore[attr-defined]
+    return fast_dispatch_call
 
 
 def _drop_global_state(entries: Any) -> list[bool]:
@@ -254,13 +254,13 @@ def install() -> None:
         )
 
     @functools.wraps(orig_compile)
-    def qx_compile(model: Any = None, *args: Any, **kwargs: Any) -> Any:
+    def compile_hook(model: Any = None, *args: Any, **kwargs: Any) -> Any:
         if args:
             return orig_compile(model, *args, **kwargs)
         if model is None:
 
             def deco(m: Any) -> Any:
-                return qx_compile(m, **kwargs)
+                return compile_hook(m, **kwargs)
 
             return deco
         if not _eligible(model, kwargs):
@@ -275,5 +275,5 @@ def install() -> None:
             return _wrap(out, model)
         return out
 
-    torch.compile = qx_compile
+    torch.compile = compile_hook
     logger.debug("torch.compile hook installed; inert until tpu_compile arms it")
