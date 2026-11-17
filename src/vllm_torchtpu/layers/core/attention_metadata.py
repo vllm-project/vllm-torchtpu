@@ -322,8 +322,10 @@ def _staged_walk_products_compiled(
       for declaring groups if prefill_ckpt_offsets is given) + (the states
       stacked as one `[G, num_reqs]` tensor when G > 1).
 
-    Issued for every staged walk, dummy runs included, so warmup and lockstep
-    ranks dispatch the same program sequence.
+    Issued for every staged walk that misses the runner's caches, dummy runs
+    included, so warmup and lockstep ranks dispatch the same program sequence;
+    `stage_block_table_uploads` skips it when an unchanged upload hits the
+    table-view or staged-products cache.
     """
     return _staged_walk_products(
         staged_dev,
@@ -350,6 +352,15 @@ def _staged_walk_products_compiled(
 # future refactor instead of spreading the state across `TPUModelRunner` and
 # `attention_metadata`.
 _DEFAULT_MAX_H2D_BUFFERS = 64
+
+# Entries of the runner's staged-products cache (`stage_block_table_uploads`)
+# before it is cleared. The key holds the identity of the walk's staged
+# upload, and a changed block table gives a new upload, so only entries for
+# the current upload can hit (one per walk layout and state-block column
+# set); older ones are dead. The cap only stops dead entries, each a few small
+# device index tensors plus the upload they keep alive, from piling up; it is
+# not a tuned value.
+STAGED_PRODUCTS_CACHE_SIZE = 8
 
 
 def _noop_release() -> None:
@@ -450,6 +461,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.has_prefill_ckpt_blocks = self.prefill_ckpt_spec_blocks is not None
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
+        # `_block_table_geometry`'s cache: the key it last computed the width
+        # for, and that width.
+        self._cached_geom_key: tuple[int, int, int] | None = None
+        self._cached_target_num_blocks = 0
 
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
@@ -514,7 +529,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         # Only a mamba group's width depends on the checkpoint window.
         window = ctx.mamba_ckpt_window if self.is_mamba_group else 1
         geom_key = (most_model_len, max_blocks, window)
-        if getattr(self, "_cached_geom_key", None) == geom_key:
+        if self._cached_geom_key == geom_key:
             return block_table_obj, self._cached_target_num_blocks
 
         spec = self.kv_cache_spec
@@ -920,18 +935,16 @@ def stage_block_table_uploads(
             tuple(table_geom),
             tuple(gid for gid, _, _ in entries),
         )
-        if getattr(runner, "_cached_staged_block_tables_key", None) == bt_views_key:
+        if runner._cached_staged_block_tables_key == bt_views_key:
             ctx.staged_block_tables = runner._cached_staged_block_tables
             return
 
     products_key = _stage_products_key(
         ctx, staged_dev, num_reqs_padded, table_geom, entries, mamba_geom
     )
-    cache_dict = getattr(runner, "_stage_products_cache", None)
-    if not isinstance(cache_dict, dict):
-        cache_dict = None
+    cache_dict = runner._stage_products_cache
     cached = None
-    if products_key is not None and cache_dict is not None:
+    if products_key is not None:
         hit = cache_dict.get(products_key)
         if hit is not None:
             cached = hit[1]
@@ -953,10 +966,7 @@ def stage_block_table_uploads(
             ctx.mamba_prefill_ckpt_offsets,
         )
         if products_key is not None and staged_dev.device.type == "tpu":
-            if cache_dict is None:
-                cache_dict = {}
-                runner._stage_products_cache = cache_dict
-            elif len(cache_dict) >= 8:
+            if len(cache_dict) >= STAGED_PRODUCTS_CACHE_SIZE:
                 cache_dict.clear()
             cache_dict[products_key] = (staged_dev, products)
 

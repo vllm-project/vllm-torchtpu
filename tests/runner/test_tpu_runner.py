@@ -906,6 +906,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
         _last_sequence_layout_plan=None,
         pcp_manager=None,
         input_batch=SimpleNamespace(req_ids=req_ids),
+        _async_subst_prep_cache={},
     )
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
         fake,
@@ -4485,6 +4486,7 @@ def test_stage_timing_disabled_skips_thread_and_events():
 
 def test_dp_num_tokens_across_dp_caches_cpu_tensors():
     runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner._dp_tokens_cpu_cache = {}
     runner._dp_lockstep_enabled = lambda: False
     runner.parallel_config = SimpleNamespace(
         data_parallel_size=1,

@@ -1430,6 +1430,44 @@ class TPUModelRunner(GPUModelRunner):
         # Last upload per `_upload_unless_unchanged` slot:
         # (key, device tensor, host source).
         self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
+        # Host-path caches of per-step values that repeat across steady decode
+        # steps, each keyed on everything its value depends on (see each
+        # reader).
+        # `_prepare_async_token_substitution_indices`: identity-layout
+        # (cur, pre) index arrays per (stride, sub_pairs).
+        self._async_subst_prep_cache: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+        # `_apply_async_token_substitution`: uploaded [2, N] index tensors per
+        # (num_tokens, cur, pre) (at most 256), and the last one used.
+        self._async_subst_dev_cache: dict[tuple, torch.Tensor] = {}
+        self._cached_subst_key: tuple | None = None
+        self._cached_substitution_indices: torch.Tensor | None = None
+        # `_prepare_inputs`: uniform-schedule count arrays, token index
+        # arrays, rejected-count subtraction indices, and the request
+        # distribution views (at most 32) with the last one used.
+        self._uniform_sched_arr_cache: dict[tuple[int, int], np.ndarray] = {}
+        self._prepare_inputs_idx_cache: dict[tuple, Any] = {}
+        self._async_subtract_idx_cache: dict[tuple, tuple] = {}
+        self._comb_views_cache: dict[
+            tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._cached_comb_key: tuple[int, int, int] | None = None
+        self._cached_comb_views: tuple[torch.Tensor, torch.Tensor] | None = None
+        # `_dp_num_tokens_across_dp`: host count tensors per (dp_size, tokens).
+        self._dp_tokens_cpu_cache: dict[tuple[int, int], torch.Tensor] = {}
+        # Output assembly: the req_id_to_index snapshot handed to the
+        # scheduler, reused while the batch's request order is unchanged.
+        self._cached_output_req_ids_key: tuple | None = None
+        self._cached_req_id_to_index_snap: dict[str, int] = {}
+        # Sampling-param uploads per batch layout.
+        self._sampling_params_dev_cache: dict[tuple, Any] = {}
+        # `attention_metadata.stage_block_table_uploads`: the staged Mamba
+        # products per walk key (at most `STAGED_PRODUCTS_CACHE_SIZE`), and
+        # the last table views of a walk without Mamba groups, with the upload
+        # they view (its id is part of the key, so it must stay alive).
+        self._stage_products_cache: dict[tuple, tuple[torch.Tensor, tuple]] = {}
+        self._cached_staged_block_tables_key: tuple | None = None
+        self._cached_staged_block_tables: dict[int, torch.Tensor] | None = None
+        self._cached_staged_block_tables_dev: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
@@ -3182,10 +3220,7 @@ class TPUModelRunner(GPUModelRunner):
                 for i in range(num_reqs)
             )
         if is_identity_layout:
-            cache = getattr(self, "_async_subst_prep_cache", None)
-            if cache is None:
-                cache = {}
-                self._async_subst_prep_cache = cache
+            cache = self._async_subst_prep_cache
             cache_key = (stride, sub_pairs)
             cached = cache.get(cache_key)
             if cached is not None:
@@ -3263,7 +3298,7 @@ class TPUModelRunner(GPUModelRunner):
         ):
             return input_ids
 
-        use_fast_slice = getattr(self, "_fast_token_substitution", False)
+        use_fast_slice = self._fast_token_substitution
         use_subst_cache = use_fast_slice or self.device.type == "tpu"
         if use_fast_slice:
             # Fast path 1: Direct device token slicing for 1:1 steady-state decode
@@ -3294,12 +3329,10 @@ class TPUModelRunner(GPUModelRunner):
                 token_in_tpu_cur_input_indices.tobytes(),
                 token_in_tpu_pre_next_tokens_indices.tobytes(),
             )
-            subst_cache = getattr(self, "_async_subst_dev_cache", None)
-            if subst_cache is None:
-                subst_cache = {}
-                self._async_subst_dev_cache = subst_cache
-            if getattr(self, "_cached_subst_key", None) == subst_key and hasattr(
-                self, "_cached_substitution_indices"
+            subst_cache = self._async_subst_dev_cache
+            if (
+                self._cached_subst_key == subst_key
+                and self._cached_substitution_indices is not None
             ):
                 substitution_indices = self._cached_substitution_indices
             elif subst_key in subst_cache:
@@ -4095,10 +4128,7 @@ class TPUModelRunner(GPUModelRunner):
             min_num_scheduled_tokens_all_reqs == max_num_scheduled_tokens_all_reqs
         )
         if is_uniform_scheduled:
-            uni_arr_cache = getattr(self, "_uniform_sched_arr_cache", None)
-            if uni_arr_cache is None:
-                uni_arr_cache = {}
-                self._uniform_sched_arr_cache = uni_arr_cache
+            uni_arr_cache = self._uniform_sched_arr_cache
             uni_arr_key = (num_reqs, max_num_scheduled_tokens_all_reqs)
             num_scheduled_tokens_per_req = uni_arr_cache.get(uni_arr_key)
             if num_scheduled_tokens_per_req is None:
@@ -4153,10 +4183,7 @@ class TPUModelRunner(GPUModelRunner):
         else:
             # General path: mixed prefill + decode / spec-decode.
             token_ids_stride = int(self.input_batch.token_ids_cpu.shape[1])
-            idx_cache = getattr(self, "_prepare_inputs_idx_cache", None)
-            if idx_cache is None:
-                idx_cache = {}
-                self._prepare_inputs_idx_cache = idx_cache
+            idx_cache = self._prepare_inputs_idx_cache
             idx_cache_key = (
                 (
                     start_index,
@@ -4395,10 +4422,7 @@ class TPUModelRunner(GPUModelRunner):
                 padded_total_num_scheduled_tokens,
                 sub_pairs,
             )
-            sub_cache = getattr(self, "_async_subtract_idx_cache", None)
-            if sub_cache is None:
-                sub_cache = {}
-                self._async_subtract_idx_cache = sub_cache
+            sub_cache = self._async_subtract_idx_cache
             cached_sub = sub_cache.get(sub_key)
             if cached_sub is not None and len(cached_sub) == 3:
                 seq_idx_dev, pos_idx_dev, qx_sub_mask = cached_sub
@@ -4642,18 +4666,11 @@ class TPUModelRunner(GPUModelRunner):
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
             combined[5] = num_reqs
-            if self.device.type == "tpu" or getattr(
-                self, "_fast_token_substitution", False
-            ):
+            if self.device.type == "tpu" or self._fast_token_substitution:
                 chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
-                comb_cache = getattr(self, "_comb_views_cache", None)
-                if comb_cache is None:
-                    comb_cache = {}
-                    self._comb_views_cache = comb_cache
-                if (
-                    not hasattr(self, "_cached_comb_views")
-                    or getattr(self, "_cached_comb_key", None) != chunk_comb_key
-                ):
+                comb_cache = self._comb_views_cache
+                cached_views = self._cached_comb_views
+                if cached_views is None or self._cached_comb_key != chunk_comb_key:
                     cached_views = comb_cache.get(chunk_comb_key)
                     if cached_views is None:
                         comb_dev = combined.to(self.device, non_blocking=True)
@@ -4663,9 +4680,7 @@ class TPUModelRunner(GPUModelRunner):
                         comb_cache[chunk_comb_key] = cached_views
                     self._cached_comb_views = cached_views
                     self._cached_comb_key = chunk_comb_key
-                request_distribution, mamba_request_distribution = (
-                    self._cached_comb_views
-                )
+                request_distribution, mamba_request_distribution = cached_views
             else:
                 combined_device = combined.to(self.device, non_blocking=True)
                 request_distribution = combined_device[0:3]
@@ -5126,10 +5141,7 @@ class TPUModelRunner(GPUModelRunner):
             dp_size = 1
         else:
             dp_size = utils.get_dp_size(self.parallel_config)
-        cache = self.__dict__.get("_dp_tokens_cpu_cache")
-        if cache is None:
-            cache = {}
-            self._dp_tokens_cpu_cache = cache
+        cache = self._dp_tokens_cpu_cache
         key = (dp_size, int(num_tokens))
         t = cache.get(key)
         if t is None:
@@ -7035,7 +7047,7 @@ class TPUModelRunner(GPUModelRunner):
                 tuple(req_ids),
                 len(self.input_batch.req_id_to_index),
             )
-            if getattr(self, "_cached_output_req_ids_key", None) == req_ids_key:
+            if self._cached_output_req_ids_key == req_ids_key:
                 req_id_to_index_snap = self._cached_req_id_to_index_snap
             else:
                 req_id_to_index_snap = dict(self.input_batch.req_id_to_index)
@@ -10346,11 +10358,10 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 is_uniform = True
 
+        cache: dict[tuple, Any] | None = None
+        cache_key: tuple = ()
         if logits.device.type == "tpu":
-            cache = getattr(self, "_sampling_params_dev_cache", None)
-            if cache is None:
-                cache = {}
-                self._sampling_params_dev_cache = cache
+            cache = self._sampling_params_dev_cache
             if is_uniform:
                 cache_key = (
                     "uniform",
@@ -10373,9 +10384,6 @@ class TPUModelRunner(GPUModelRunner):
             cached = cache.get(cache_key)
             if cached is not None:
                 return cached
-        else:
-            cache = None
-            cache_key = None
 
         if is_uniform:
             temps_cpu = torch.full((padded_num_reqs,), temp0, dtype=logits.dtype)
