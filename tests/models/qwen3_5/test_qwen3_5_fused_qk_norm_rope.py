@@ -38,6 +38,7 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_torchtpu.models.qwen3_5 import hooks
 from vllm_torchtpu.models.qwen3_5.kernels import fused_qk_norm_rope as fused
+from vllm_torchtpu.models.qwen3_5.kernels import measured
 
 pytestmark = pytest.mark.cpu_test
 
@@ -248,7 +249,15 @@ def test_buckets_up_to_16384_rows_take_the_kernel(rows, uses_kernel):
 
 @pytest.fixture
 def restore_attention(monkeypatch):
-    """Undo whatever a test installs on Qwen3NextAttention."""
+    """Undo whatever a test installs on Qwen3NextAttention, and the GDN
+    routing the Qwen3.5 rule wraps around vLLM's loader post-processing."""
+    from vllm.model_executor.model_loader import base_loader
+
+    monkeypatch.setattr(
+        base_loader,
+        "process_weights_after_loading",
+        base_loader.process_weights_after_loading,
+    )
     monkeypatch.setattr(Qwen3NextAttention, "__init__", Qwen3NextAttention.__init__)
     monkeypatch.setattr(
         Qwen3NextAttention,
@@ -303,7 +312,7 @@ def test_the_rule_installs_the_patch_where_it_was_measured_only(
         "397b": _model_config(QWEN35, SHAPE_397B),
         "397b-hidden-2048": _model_config(QWEN35, {**SHAPE_397B, "hidden_size": 2048}),
     }[case]
-    result = fused.maybe_install_qk_norm_rope_patch(model_config)
+    result = measured.maybe_install_fused_norm_kernels(model_config)
     # False keeps the patch eligible for the next lifecycle stage.
     assert result is (None if installs else False)
     assert (Qwen3NextAttention._project_qkv_gate is not original_project) is installs
@@ -318,7 +327,7 @@ def test_main_ci_model_computes_mains_projection_bit_for_bit(
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
     original_project = Qwen3NextAttention._project_qkv_gate
     assert (
-        fused.maybe_install_qk_norm_rope_patch(_model_config(QWEN35, SHAPE_35B))
+        measured.maybe_install_fused_norm_kernels(_model_config(QWEN35, SHAPE_35B))
         is False
     )
     layer = _layer(fused_qk_norm_rope=False)
