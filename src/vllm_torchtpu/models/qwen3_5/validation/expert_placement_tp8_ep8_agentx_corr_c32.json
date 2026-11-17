@@ -668,8 +668,7 @@
  },
  "model": "Qwen/Qwen3.5-397B-A17B-FP8",
  "parallelism": "TP8 + expert parallel (EP8), 8 ranks",
- "recording": "Decode-step routing of the InferenceX AgentX replay (agentx MVP scenario, conc 4 and 8, MTP 3) recorded with eplb/profiler on cdk job j-2ddd39cf-6a13-443c-8cca; 50,435 decode steps, logical expert ids",
- "algorithm": "swap local search of the primaries on replayed mean max-core distinct experts over sampled decode steps (train half), then greedy copies by replayed gain",
- "solver": "eplb/solve_placement.py --copies 32",
+ "recording": "Decode-step routing of an InferenceX AgentX replay (concurrency 4 and 8, MTP with 3 speculative tokens): 50,435 decode steps, in logical expert ids",
+ "algorithm": "swap local search of the primaries on replayed mean max-core distinct experts over sampled decode steps (train half), then 32 copies per layer (4 per rank) chosen greedily by replayed gain",
  "serving": "copies are served only by the few-token MoE kernel; about 2.8 GiB more HBM per device than a table without copies"
 }
