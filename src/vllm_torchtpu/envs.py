@@ -261,6 +261,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
+    VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS: int = 0
+    VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
@@ -1679,6 +1681,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S": env_nonnegative_float(
         "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
     ),
+    # PrefillSpacingScheduler: while the decode-only debt defers prefill, still
+    # schedule prompts with at most this many uncached tokens left, whole, up
+    # to this many prefill tokens per step (shortest first). 0 defers all
+    # prefill during the debt.
+    "VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS", 0
+    ),
+    # PrefillSpacingScheduler: with the TPOT target set, price the next step's
+    # prefill by its tokens instead of as a long chunk. The step's prefill is
+    # cut to the tokens that fit in the smallest slack of the decoding requests
+    # it protects (per-token cost measured on long-chunk steps), so short
+    # prompts still run; prefill is deferred only when less than one KV block
+    # fits.
+    "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED", False),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
     # output reduce-scatter (`models.minimax_m3.dcp_pack`). 0 keeps the
