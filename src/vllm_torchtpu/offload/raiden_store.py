@@ -2500,7 +2500,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
     def build_metric_definitions(
         cls, extra_config: dict[str, Any]
     ) -> dict[str, OffloadingMetricMetadata]:
-        return build_raiden_offload_metric_definitions(extra_config)
+        return build_raiden_offload_metric_definitions()
 
     def __init__(
         self,

@@ -34,7 +34,6 @@ import copy
 import enum
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping
-from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -59,12 +58,12 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-# Load/hit metrics label where data is read from (`source`), aligned with
+# `source` labels where data is read from, aligned with
 # upstream `vllm:prompt_tokens_cached_by_source` for PromQL rollups. `backend`
 # names what serves the tier: `dram` for host, `rdma` for p2p, and the
 # configured storage type for disk, so a new storage backend adds label values
 # rather than metrics.
-OFFLOAD_LOAD_LABELNAMES: tuple[str, str] = ("source", "backend")
+SOURCE_LABELNAMES: tuple[str, str] = ("source", "backend")
 UNKNOWN_BACKEND_LABEL = "unknown"
 HOST_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.HOST.value, "dram")
 P2P_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.P2P.value, "rdma")
@@ -78,16 +77,13 @@ SubBlockSourceCounts = tuple[tuple[CacheHitSource, int], ...]
 
 
 class RaidenOffloadMetricName(enum.StrEnum):
-    """Directional Prometheus metrics emitted by Raiden KV offload."""
+    """Prometheus metrics emitted by Raiden KV offload."""
 
     HIT_TOKENS = "vllm:kv_offload_raiden_hit_tokens"
 
 
-def build_raiden_offload_metric_definitions(
-    extra_config: Mapping[str, Any],
-) -> dict[str, OffloadingMetricMetadata]:
+def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
     """Return Prometheus metric definitions for TPURaidenStoreOffloadingSpec."""
-    del extra_config
     return {
         RaidenOffloadMetricName.HIT_TOKENS: OffloadingCounterMetadata(
             documentation=(
@@ -96,7 +92,7 @@ def build_raiden_offload_metric_definitions(
                 "backend. Unlike vllm:prompt_tokens_cached_by_source, splits "
                 "disk hits by storage backend and counts only pinned tokens."
             ),
-            labelnames=OFFLOAD_LOAD_LABELNAMES,
+            labelnames=SOURCE_LABELNAMES,
         ),
     }
 

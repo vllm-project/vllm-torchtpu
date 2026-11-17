@@ -30,7 +30,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiConnector
 from vllm_torchtpu.offload.metrics import (
-    OFFLOAD_LOAD_LABELNAMES,
+    SOURCE_LABELNAMES,
     RaidenOffloadMetricName,
     RaidenOffloadPromMetrics,
     RaidenOffloadStatsCollector,
@@ -64,14 +64,10 @@ def _make_prom_metric_types(
     }
 
 
-def test_metric_definitions_have_directional_labels() -> None:
-    defs = build_raiden_offload_metric_definitions({})
+def test_metric_definitions_have_source_labels() -> None:
+    defs = build_raiden_offload_metric_definitions()
     assert set(defs.keys()) == {m.value for m in RaidenOffloadMetricName}
-    load_metrics = {
-        RaidenOffloadMetricName.HIT_TOKENS,
-    }
-    for metric in load_metrics:
-        assert defs[metric].labelnames == OFFLOAD_LOAD_LABELNAMES
+    assert defs[RaidenOffloadMetricName.HIT_TOKENS].labelnames == SOURCE_LABELNAMES
 
 
 def test_external_sources_with_tokens() -> None:
