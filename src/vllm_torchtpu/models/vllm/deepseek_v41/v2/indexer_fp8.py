@@ -782,17 +782,27 @@ def select_fp8_indexer_jax(
     ):
         return _select_fp8_indexer_jax(*arguments, score_width)
 
-    # Preserve score-buffer row boundaries for both widths. Only contexts
-    # covered by one K tile can narrow the scores and retain their keys.
+    # Score only the batch's live keys, in power-of-two widths from one K tile
+    # (whose keys stay resident) up to the full score width. Preserve score-
+    # buffer row boundaries for every width. Scoring all 524,288 columns for
+    # a 147K-token context (73,728 keys) took 8.9 ms per 2,048-row chunk,
+    # against 1.8 ms for 57,344 keys in one K tile.
+    widths = [width]
+    while widths[-1] < score_width:
+        widths.append(min(2 * widths[-1], score_width))
     live = (requests >= 0) & (requests < page_table.shape[0])
     longest = jnp.where(live, lengths, 0).max()
     grouped = jnp.all(requests[1:] >= requests[:-1])
-    return jax.lax.cond(
-        grouped & (longest <= width),
-        lambda: _select_fp8_indexer_jax(*arguments, width, prefill_chunk_rows=chunk),
-        lambda: _select_fp8_indexer_jax(
-            *arguments, score_width, prefill_chunk_rows=chunk
-        ),
+    fitting = jnp.searchsorted(jnp.asarray(widths, jnp.int32), longest)
+    branch = jnp.where(grouped, jnp.minimum(fitting, len(widths) - 1), len(widths) - 1)
+    return jax.lax.switch(
+        branch,
+        [
+            functools.partial(
+                _select_fp8_indexer_jax, *arguments, w, prefill_chunk_rows=chunk
+            )
+            for w in widths
+        ],
     )
 
 
