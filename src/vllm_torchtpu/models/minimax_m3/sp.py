@@ -205,14 +205,20 @@ def reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     return _OPS.reduce_scatter(x)
 
 
-def all_gather(x: torch.Tensor, fp8: bool) -> torch.Tensor:
+def all_gather(x: torch.Tensor, fp8: bool, num_tokens: int) -> torch.Tensor:
     """Every rank's slice, in mesh order: [T / tp, H] -> [T, H] in x.dtype.
 
     fp8: each row goes over the wire as e4m3 with one f32 scale (amax / 448)
     and is expanded back after the gather.
+
+    num_tokens: T, the step's token count (`positions.shape[0]`). The gather's
+    output is viewed with it so the traced size is the step's own symbol, not
+    tp * (T // tp): DCP code that splits the token dim (`gather_group_kv` at
+    DCP 8) cannot hand a derived size to a torch collective.
     """
     assert _OPS is not None
-    return (_OPS.all_gather_fp8 if fp8 else _OPS.all_gather)(x)
+    out = (_OPS.all_gather_fp8 if fp8 else _OPS.all_gather)(x)
+    return out.view(num_tokens, *x.shape[1:])
 
 
 def embed_partial(embed: torch.nn.Module, input_ids: torch.Tensor) -> torch.Tensor:

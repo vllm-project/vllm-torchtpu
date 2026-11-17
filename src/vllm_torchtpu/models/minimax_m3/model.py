@@ -135,10 +135,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(residual)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = sp.all_gather(hidden_states, self.sp_fp8_attn_gather)
+        hidden_states = sp.all_gather(
+            hidden_states, self.sp_fp8_attn_gather, positions.shape[0]
+        )
         hidden_states = sp.reduce_scatter(self.self_attn(positions, hidden_states))
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = sp.all_gather(hidden_states, self.sp_fp8_gather)
+        hidden_states = sp.all_gather(
+            hidden_states, self.sp_fp8_gather, positions.shape[0]
+        )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         return sp.reduce_scatter(ffn(hidden_states)), residual
 
@@ -218,17 +222,19 @@ class MiniMaxM3Model(nn.Module):
         hidden_states = None
         aux_hidden_states = []
         if 0 in self.aux_hidden_state_layers:
-            aux_hidden_states.append(sp.all_gather(residual, fp8=False))
+            aux_hidden_states.append(sp.all_gather(residual, False, positions.shape[0]))
         for idx, layer in enumerate(self.layers):
             hidden_states, residual = layer.forward_sp(
                 positions, hidden_states, residual
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(
-                    sp.all_gather(hidden_states + residual, fp8=False)
+                    sp.all_gather(
+                        hidden_states + residual, False, positions.shape[0]
+                    )
                 )
         hidden_states, _ = self.norm(hidden_states, residual)
-        hidden_states = sp.all_gather(hidden_states, fp8=False)
+        hidden_states = sp.all_gather(hidden_states, False, positions.shape[0])
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
