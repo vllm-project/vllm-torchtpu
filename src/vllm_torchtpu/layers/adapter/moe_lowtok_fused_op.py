@@ -157,8 +157,6 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
                 topk=topk,
                 dp=dp,
                 tp=tp,
-                dispatch="inkernel",
-                combine="inkernel",
                 dispatch_form=forms[0],
                 combine_form=forms[1],
                 depth=depth,
