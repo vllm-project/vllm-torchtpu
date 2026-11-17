@@ -16,7 +16,10 @@
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
-# Changes from the source: none.
+# Changes from the source:
+# - _QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN and the qkv_2d argument of
+#   get_vmem_estimate_bytes, calculate_mixed_tile_size and get_tile_sizes:
+#   the PER_SEQ VMEM term of 2D bf16 qkv rows.
 # ==============================================================================
 
 """Dynamic tiling heuristics and VMEM memory estimation for Fused Conv1D-GDN."""
