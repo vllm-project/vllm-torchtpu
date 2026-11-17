@@ -270,3 +270,25 @@ def test_switch_installs_on_the_client_class(monkeypatch):
     affinity.install_if_enabled()
     patched = DPLBAsyncMPClient.get_core_engine_for_request
     assert patched is not stock and patched.stock is stock
+
+
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [
+        ("VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS", "0"),
+        ("VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS", "-64"),
+        ("VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE", "0"),
+        ("VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE", "-1"),
+        ("VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN", "-1"),
+    ],
+)
+def test_knob_that_cannot_work_raises_at_install(monkeypatch, knob, value):
+    """A value that would fail every routed request, or silently turn the
+    choice off, raises before the client class is patched."""
+    stock = DPLBAsyncMPClient.get_core_engine_for_request
+    monkeypatch.setattr(DPLBAsyncMPClient, "get_core_engine_for_request", stock)
+    monkeypatch.setenv("VLLM_TPU_DP_PREFIX_AFFINITY", "1")
+    monkeypatch.setenv(knob, value)
+    with pytest.raises(ValueError, match=knob):
+        affinity.install_if_enabled()
+    assert DPLBAsyncMPClient.get_core_engine_for_request is stock
