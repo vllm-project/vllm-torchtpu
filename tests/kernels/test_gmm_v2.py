@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_v2_module
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
@@ -462,3 +463,181 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+# The Qwen3.5 FP8 MoE paths behind gmm_v2.RHS_STREAM (hand-streamed
+# whole-expert rhs slabs) and gmm_v2.TUNED_FP8_MOE (tuned tiles and the
+# rhs-scale hoist). Both are off by default; the Qwen3.5 kernel-numerics rule
+# turns them on for Qwen3.5-397B-A17B on TPU7x. gmm_v2 is jitted and reads
+# both flags at trace time, so every run below clears JAX's caches around it.
+_FP8_MOE_K, _FP8_MOE_N = 1024, 4096  # GMM2: the down projection, one k tile
+# (lhs groups, weight slots, group offset, group sizes). "spread": local groups
+# 4..11 of 16, four of them non-empty with empty groups between and after,
+# and rows of non-local groups on both sides. "single": one non-empty local
+# group, so the stream has one run. "slots": the weights hold two more slots
+# than group_sizes lists (a copy-slot layer); the kernel must not read them.
+_FP8_MOE_LAYOUTS = {
+    "spread": (16, 8, 4, [5, 7, 0, 9, 12, 0, 20, 0, 0, 16, 8, 0, 30, 0, 21, 0]),
+    "single": (16, 8, 4, [10, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 54, 0, 0, 0]),
+    "slots": (8, 10, 0, [12, 0, 20, 0, 16, 8, 0, 72]),
+}
+_WHOLE_EXPERT_TILES = TileSizes(
+    tile_m=128, tile_k=_FP8_MOE_K, tile_n=_FP8_MOE_N, bucket_base=128
+)
+# An 80-row GMM2 over 64 local experts: an entry of the tuned tile table.
+_TUNED_TABLE_SIZES = [3, 0, 2, 0] * 16
+_FP8_MOE_TOLERANCE = 0.05
+
+
+def _fp8_moe_inputs(slots, group_sizes, as_arrays=True):
+    """bf16 rows and a GMM2-shaped FP8 weight with one scale per output channel
+    (a single quant block over k), as main's FP8 MoE checkpoints load."""
+    rows = int(sum(group_sizes))
+    if not as_arrays:
+        return (
+            jax.ShapeDtypeStruct((rows, _FP8_MOE_K), jnp.bfloat16),
+            jax.ShapeDtypeStruct((slots, _FP8_MOE_K, _FP8_MOE_N), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((slots, 1, 1, _FP8_MOE_N), jnp.float32),
+        )
+    lhs_key, rhs_key = jax.random.split(jax.random.key(0))
+    lhs = jax.random.uniform(lhs_key, (rows, _FP8_MOE_K), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        rhs_key, (slots, _FP8_MOE_K, _FP8_MOE_N), jnp.bfloat16, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=_FP8_MOE_K
+    )
+    return lhs, rhs_q, jnp.expand_dims(rhs_scale, axis=2)
+
+
+def _fp8_moe_configs(slots, group_sizes, tile_info):
+    """The configs gmm_v2 builds for these inputs on the current device."""
+    lhs, rhs, rhs_scale = _fp8_moe_inputs(slots, group_sizes, as_arrays=False)
+    vmem = int(gmm_v2_module.pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    return gmm_v2_module.make_gmm_configs(
+        lhs,
+        rhs,
+        rhs_scale,
+        None,
+        jax.ShapeDtypeStruct((len(group_sizes),), jnp.int32),
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        tile_info=tile_info,
+        vmem_limit_bytes=vmem,
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=True,
+        zero_initialize=True,
+    )
+
+
+def _relative_l2(actual, expected) -> float:
+    actual = np.asarray(actual, dtype=np.float32)
+    expected = np.asarray(expected, dtype=np.float32)
+    return float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
+
+
+@pytest.mark.parametrize("layout", sorted(_FP8_MOE_LAYOUTS))
+@pytest.mark.parametrize("tuned", [False, True], ids=["main_order", "tuned"])
+@pytest.mark.parametrize("rhs_stream", [False, True], ids=["pipeline", "stream"])
+def test_fp8_moe_cases_take_the_paths_they_test(monkeypatch, rhs_stream, tuned, layout):
+    """On TPU7x (chip description only), the device cases below stream the rhs
+    slabs exactly when RHS_STREAM is set and hoist the rhs scale exactly when
+    TUNED_FP8_MOE is set, and the tuned case takes the tuned table's tiles."""
+    info = gmm_v2_module.pltpu.get_tpu_info_for_chip(
+        gmm_v2_module.pltpu.ChipVersion.TPU_7X, 1
+    )
+    monkeypatch.setattr(gmm_v2_module.pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setattr(gmm_v2_module, "RHS_STREAM", rhs_stream)
+    monkeypatch.setattr(gmm_v2_module, "TUNED_FP8_MOE", tuned)
+    _, slots, _, sizes = _FP8_MOE_LAYOUTS[layout]
+    cfgs = _fp8_moe_configs(slots, sizes, _WHOLE_EXPERT_TILES)
+    assert cfgs.lhs_cfgs.should_quantize
+    assert cfgs.dims.size_group == min(slots, len(sizes))
+    assert bool(gmm_v2_module.use_rhs_stream(cfgs)) is rhs_stream
+    assert gmm_v2_module.hoist_rhs_scale(cfgs) is tuned
+    table = _fp8_moe_configs(64, _TUNED_TABLE_SIZES, gmm_v2_module.calculate_tiling)
+    tiles = (table.tiles.tile_m, table.tiles.bucket_base)
+    assert (tiles == gmm_v2_module._FP8_MOE_GMM2_TILES[80]) is tuned
+
+
+def _run_fp8_moe(
+    monkeypatch, rhs_stream, tuned, lhs, rhs, rhs_scale, sizes, offset, tile_info
+):
+    monkeypatch.setattr(gmm_v2_module, "RHS_STREAM", rhs_stream)
+    monkeypatch.setattr(gmm_v2_module, "TUNED_FP8_MOE", tuned)
+    jax.clear_caches()
+    try:
+        return gmm_v2(
+            lhs,
+            rhs,
+            jnp.asarray(sizes, dtype=jnp.int32),
+            rhs_scale=rhs_scale,
+            group_offset=jnp.array(offset, dtype=jnp.int32),
+            tile_info=tile_info,
+        )
+    finally:
+        jax.clear_caches()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("layout", sorted(_FP8_MOE_LAYOUTS))
+@pytest.mark.parametrize("tuned", [False, True], ids=["main_order", "tuned"])
+@pytest.mark.parametrize("rhs_stream", [False, True], ids=["pipeline", "stream"])
+def test_gmm_fp8_moe_whole_expert_paths_match_reference(
+    monkeypatch, rhs_stream, tuned, layout
+):
+    _require_tpu()
+    _, slots, offset, sizes = _FP8_MOE_LAYOUTS[layout]
+    lhs, rhs, rhs_scale = _fp8_moe_inputs(slots, sizes)
+    expected = reference_gmm(
+        lhs,
+        rhs,
+        jnp.asarray(sizes, dtype=jnp.int32),
+        rhs_scale=rhs_scale,
+        group_offset=jnp.array(offset, dtype=jnp.int32),
+    )
+    actual = _run_fp8_moe(
+        monkeypatch,
+        rhs_stream,
+        tuned,
+        lhs,
+        rhs,
+        rhs_scale,
+        sizes,
+        offset,
+        _WHOLE_EXPERT_TILES,
+    )
+    assert actual.shape == expected.shape
+    # The kernel quantizes the lhs to fp8 per 512-wide block, which alone puts
+    # it about 2.6% (relative L2) from this unquantized reference; a slab from
+    # the wrong expert or group is off by more than 100%.
+    assert _relative_l2(actual, expected) < _FP8_MOE_TOLERANCE
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tuned", [False, True], ids=["main_tiles", "tuned_tiles"])
+@pytest.mark.parametrize("rhs_stream", [False, True], ids=["pipeline", "stream"])
+def test_gmm_fp8_moe_tuned_table_shape_matches_reference(
+    monkeypatch, rhs_stream, tuned
+):
+    _require_tpu()
+    lhs, rhs, rhs_scale = _fp8_moe_inputs(64, _TUNED_TABLE_SIZES)
+    expected = reference_gmm(
+        lhs,
+        rhs,
+        jnp.asarray(_TUNED_TABLE_SIZES, dtype=jnp.int32),
+        rhs_scale=rhs_scale,
+    )
+    actual = _run_fp8_moe(
+        monkeypatch,
+        rhs_stream,
+        tuned,
+        lhs,
+        rhs,
+        rhs_scale,
+        _TUNED_TABLE_SIZES,
+        0,
+        gmm_v2_module.calculate_tiling,
+    )
+    assert actual.shape == expected.shape
+    assert _relative_l2(actual, expected) < _FP8_MOE_TOLERANCE
