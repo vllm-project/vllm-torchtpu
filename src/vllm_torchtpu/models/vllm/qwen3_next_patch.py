@@ -34,7 +34,8 @@ What `maybe_patch_qwen3_next` installs depends on the model (a Qwen3.5 rule):
 
 FP8 fusions, installed for a Qwen3.5 target:
 - Fused attention output sigmoid-gate + per-token FP8 quantization
-  (`pallas_sigmoid_gate_quant`) feeding the FP8 `o_proj`.
+  (`pallas_sigmoid_gate_quant`, `models/qwen3_5/kernels/sigmoid_gate_quant`)
+  feeding the FP8 `o_proj`.
 - Pre-transposed GDN `in_proj_qkvz` FP8 weights
   (`maybe_flip_gdn_in_proj_qkvz_weight`).
 - 256-column-aligned FP8 router gate + shared_expert weights
@@ -86,8 +87,6 @@ import jax
 import jax.numpy as jnp
 import torch
 import torch.nn.functional as F
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 from vllm.distributed import (
     get_pp_group,
@@ -115,6 +114,10 @@ from vllm_torchtpu.layers.adapter.linear_common import (
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 from vllm_torchtpu.models.qwen3_5.kernels import measured
+from vllm_torchtpu.models.qwen3_5.kernels.sigmoid_gate_quant import (
+    pallas_sigmoid_gate_quant,
+    sigmoid_gate_quant_reference,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
@@ -165,107 +168,6 @@ def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
         and qwen3_next.Qwen3NextDecoderLayer.forward is patched_decoder_layer_forward
         and getattr(type(inner), "forward", None) is patched_mtp_forward
     )
-
-
-def _legal_tile(rows: int, cap: int) -> int:
-    for t in range(min(cap, rows), 31, -1):
-        if rows % t == 0 and t % 32 == 0:
-            return t
-    return rows
-
-
-def _select_gate_q_vreg_step(cols: int) -> int:
-    vregs_per_row = max(1, (cols + 1023) // 1024)
-    return max(16, (64 // vregs_per_row // 8) * 8)
-
-
-def _select_gate_q_tile(rows: int, cols: int) -> int:
-    """Select multiple-of-8 VMEM BlockSpec tile cap for [rows, cols] gate + quant.
-
-    For decode/verify batch sizes (rows <= 256), caps tile so grid >= 6 and
-    double-buffered VMEM DMAs overlap with compute. For large prefill shapes
-    (rows > 256), uses a larger VMEM block (up to 512 rows) while the kernel
-    processes VREG-sized sub-tiles internally, avoiding large Pallas grid
-    overhead at T=8192 without spilling VREGs.
-    """
-    vreg_cap = _select_gate_q_vreg_step(cols)
-    # Two bf16 inputs and one fp8 output, double buffered: 10 bytes per
-    # element of the tile. 16 MiB keeps the unsharded width (TP1 under
-    # pipeline parallelism, 8192 columns) inside the scoped VMEM limit;
-    # widths of 2048 columns or less are unaffected.
-    budget_cap = max(32, ((16 << 20) // (10 * cols)) // 32 * 32)
-    if rows <= 256:
-        dma_cap = max(32, (rows // 6 // 32) * 32)
-        return min(vreg_cap, dma_cap, budget_cap)
-    return min(max(vreg_cap, 512), budget_cap)
-
-
-def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref, *, step_m: int):
-    bm = attn_ref.shape[0]
-    step = min(bm, step_m)
-    for r in range(bm // step):
-        sl = slice(r * step, (r + 1) * step)
-        a = attn_ref[sl, :].astype(jnp.float32)
-        g = gate_ref[sl, :].astype(jnp.float32)
-        y = (a * jax.nn.sigmoid(g)).astype(jnp.bfloat16).astype(jnp.float32)
-        amax = jnp.max(jnp.abs(y), axis=1, keepdims=True)
-        scale = amax * jnp.float32(1.0 / 448.0)
-        scale = jnp.where(scale == 0.0, 1.0, scale)
-        scale_inv = jnp.float32(1.0) / scale
-        q_ref[sl, :] = jnp.clip(y * scale_inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
-        s_ref[sl, :] = scale
-
-
-def pallas_sigmoid_gate_quant(
-    attn_out: jax.Array,
-    gate: jax.Array,
-    *,
-    interpret: bool = False,
-) -> tuple[jax.Array, jax.Array]:
-    """Fused attn_output * sigmoid(gate) + per-token FP8 quantization in Pallas."""
-    orig_m, k = attn_out.shape
-    if orig_m < 8:
-        pad = 8 - orig_m
-        attn_out = jnp.pad(attn_out, ((0, pad), (0, 0)))
-        gate = jnp.pad(gate, ((0, pad), (0, 0)))
-    m = attn_out.shape[0]
-    bm = _legal_tile(m, _select_gate_q_tile(m, k))
-    step_m = _legal_tile(bm, _select_gate_q_vreg_step(k))
-    q_spec = pl.BlockSpec((bm, k), lambda i: (i, 0))
-    s_spec = pl.BlockSpec((bm, 1), lambda i: (i, 0))
-    q, s = pl.pallas_call(
-        functools.partial(_sigmoid_gate_quant_kernel, step_m=step_m),
-        out_shape=[
-            jax.ShapeDtypeStruct((m, k), jnp.float8_e4m3fn),
-            jax.ShapeDtypeStruct((m, 1), jnp.float32),
-        ],
-        grid=(m // bm,),
-        in_specs=[q_spec, q_spec],
-        out_specs=[q_spec, s_spec],
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        name="pallas_sigmoid_gate_quant",
-        interpret=pltpu.InterpretParams() if interpret else False,
-    )(attn_out, gate)
-    if orig_m < 8:
-        return q[:orig_m], s[:orig_m]
-    return q, s
-
-
-def sigmoid_gate_quant_reference(
-    attn_out: jax.Array,
-    gate: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """Pure-JAX reference for attn_output * sigmoid(gate) + per-token FP8 quant."""
-    a = attn_out.astype(jnp.float32)
-    g = gate.astype(jnp.float32)
-    y = (a * jax.nn.sigmoid(g)).astype(jnp.bfloat16)
-    y_f32 = y.astype(jnp.float32)
-    amax = jnp.max(jnp.abs(y_f32), axis=-1, keepdims=True)
-    scale = amax * jnp.float32(1.0 / 448.0)
-    scale = jnp.where(scale == 0.0, 1.0, scale)
-    scale_inv = jnp.float32(1.0) / scale
-    q = jnp.clip(y_f32 * scale_inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
-    return q, scale
 
 
 def _get_sigmoid_gate_quant_op() -> Callable:
