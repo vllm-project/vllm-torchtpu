@@ -122,16 +122,16 @@ _CONFIG_OVERRIDES: dict[str, Any] = {}
 
 def layout_overrides(vllm_config: Any) -> dict[str, Any]:
     """The Qwen3.5 layout table's entry for this engine: empty for another
-    model, a layout without an entry, or no engine config."""
+    model, a layout without an entry, or no engine config (None, or a config
+    without a model yet)."""
     from vllm_torchtpu.layers.adapter import sequence_parallel
     from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 
-    model_config = getattr(vllm_config, "model_config", None)
-    if model_config is None or not qwen3_5_settings.is_qwen3_5(model_config):
+    if vllm_config is None or vllm_config.model_config is None:
         return {}
-    layout = sequence_parallel.parallel_layout(
-        getattr(vllm_config, "parallel_config", None)
-    )
+    if not qwen3_5_settings.is_qwen3_5(vllm_config.model_config):
+        return {}
+    layout = sequence_parallel.parallel_layout(vllm_config.parallel_config)
     return dict(QWEN3_5_CONFIG_BY_LAYOUT.get(layout, {})) if layout else {}
 
 
