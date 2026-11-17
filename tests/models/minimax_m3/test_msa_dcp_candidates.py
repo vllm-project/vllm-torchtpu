@@ -63,6 +63,7 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
         (128, 512, 2, 1, 50_000, 0, 1),  # the fewest rows that pick widths
         (129, 512, 2, 0, 50_000, 0, 1),  # one block of all its rows
         (1032, 256, 2, 1, 30_000, 0, 1),  # past decode-sized: 256-row blocks
+        (300, 1040, 2, 1, 270_000, 0, 1),  # running picks, then a looped 1,040
     ],
 )
 def test_candidates_match_reference(

@@ -209,6 +209,119 @@ def _candidates_kernel(
         pl.when(width_now == width)(functools.partial(select, width))
 
 
+def _picks_run(width: int, topk: int) -> bool:
+    """Whether a block `width` columns wide picks by `_picks_running`."""
+    return (
+        width >= _RUNNING_PICK_WIDTH
+        and width % (8 * _RUNNING_PICK_ACCUMULATORS) == 0
+        and topk % 2 == 0
+    )
+
+
+def _picks_reduced(s, cols, width, rank, topk, dcp, score_out_ref, block_out_ref):
+    """`_candidates_kernel_t`'s picks of a narrow block ``s [width, rows]``:
+    per pick a max, the first column holding it, and its removal."""
+    # Column ids as f32 (exact below 2**24): the first of a pick's ties is
+    # one f32 min, where an int32 min takes a compare and a select.
+    col_ids = cols.astype(jnp.float32)
+
+    def pick(k, s):
+        best_score = jnp.max(s, axis=0, keepdims=True)
+        best = jnp.min(
+            jnp.where(s == best_score, col_ids, float(width)),
+            axis=0,
+            keepdims=True,
+        )
+        _store_pick(k, best_score, best, rank, topk, dcp, score_out_ref, block_out_ref)
+        return jnp.where(col_ids == best, _NEG_INF, s)
+
+    if width <= _UNROLLED_WIDTH:
+        for k in range(topk):
+            s = pick(k, s)
+    else:
+        jax.lax.fori_loop(0, topk, pick, s, unroll=_PICK_UNROLL)
+
+
+def _store_pick(k, best_score, best, rank, topk, dcp, score_out_ref, block_out_ref):
+    """Pick `k` (score and f32 column ``[1, rows]``) into slot `k`, or
+    ``topk - 1 - k`` on odd ranks (`local_candidates`)."""
+    slot = jnp.where((rank & 1) == 1, topk - 1 - k, k)
+    score_out_ref[pl.ds(slot, 1), :] = best_score
+    block_out_ref[pl.ds(slot, 1), :] = jnp.where(
+        best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
+    )
+
+
+def _picks_running(
+    s, width, rank, topk, dcp, score_out_ref, block_out_ref, s_ref, t_ref, col_ref
+):
+    """`_picks_reduced` of a wide block in one pass per pick over its vreg
+    rows: each pass removes the previous pick and keeps a running max and
+    the first column holding it per sublane, 5 VALU ops per vreg (a compare
+    and a select for the removal, a compare, a max and a select), where the
+    max, first-column and removal passes take 6. `col_ref [>= width, rows]`
+    holds the column ids; the passes read the block from one of `s_ref` /
+    `t_ref` and write it to the other, which lets loads run ahead of the
+    stores."""
+    rows = s.shape[1]
+    s_ref[:width, :] = s
+    col_ref[:width, :] = jax.lax.broadcasted_iota(jnp.int32, (width, rows), 0).astype(
+        jnp.float32
+    )
+    sub = _RUNNING_PICK_ACCUMULATORS * 8
+
+    def scan(src, dst, prev):
+        def body(v, acc):
+            at = pl.ds(pl.multiple_of(v * sub, sub), sub)
+            cs = col_ref[at, :]
+            xs = jnp.where(
+                cs == jnp.tile(prev, (_RUNNING_PICK_ACCUMULATORS, 1)),
+                _NEG_INF,
+                src[at, :],
+            )
+            dst[at, :] = xs
+            new = []
+            for a, (m, idx) in enumerate(acc):
+                x, c = xs[8 * a : 8 * (a + 1)], cs[8 * a : 8 * (a + 1)]
+                new.append((jnp.maximum(m, x), jnp.where(x > m, c, idx)))
+            return tuple(new)
+
+        init = (
+            (
+                jnp.full((8, rows), _NEG_INF, jnp.float32),
+                jnp.full((8, rows), float(width), jnp.float32),
+            ),
+        ) * _RUNNING_PICK_ACCUMULATORS
+        acc = jax.lax.fori_loop(
+            0, width // sub, body, init, unroll=_RUNNING_PICK_UNROLL
+        )
+        m = jnp.concatenate([a[0] for a in acc], axis=0)  # [sub, rows]
+        idx = jnp.concatenate([a[1] for a in acc], axis=0)
+        best_score = jnp.max(m, axis=0, keepdims=True)
+        best = jnp.min(
+            jnp.where(m == best_score, idx, float(width)), axis=0, keepdims=True
+        )
+        return best_score, best
+
+    def two_picks(i, prev):
+        for k, (src, dst) in enumerate(((s_ref, t_ref), (t_ref, s_ref))):
+            best_score, best = scan(src, dst, prev)
+            _store_pick(
+                2 * i + k,
+                best_score,
+                best,
+                rank,
+                topk,
+                dcp,
+                score_out_ref,
+                block_out_ref,
+            )
+            prev = jnp.broadcast_to(best, (8, rows))
+        return prev
+
+    jax.lax.fori_loop(0, topk // 2, two_picks, jnp.full((8, rows), -1.0, jnp.float32))
+
+
 def _candidates_kernel_t(
     rank_ref,
     widths_ref,
@@ -216,7 +329,7 @@ def _candidates_kernel_t(
     pos_ref,
     score_out_ref,
     block_out_ref,
-    *,
+    *scratch,
     block_size,
     topk,
     init_blocks,
@@ -250,29 +363,14 @@ def _candidates_kernel_t(
         s = jnp.where(
             visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
         )
-        # Column ids as f32 (exact below 2**24): the first of a pick's ties is
-        # one f32 min, where an int32 min takes a compare and a select.
-        col_ids = cols.astype(jnp.float32)
-
-        def pick(k, s):
-            best_score = jnp.max(s, axis=0, keepdims=True)
-            best = jnp.min(
-                jnp.where(s == best_score, col_ids, float(width)),
-                axis=0,
-                keepdims=True,
+        if not _picks_run(width, topk):
+            _picks_reduced(
+                s, cols, width, rank, topk, dcp, score_out_ref, block_out_ref
             )
-            slot = jnp.where((rank & 1) == 1, topk - 1 - k, k)  # `local_candidates`
-            score_out_ref[pl.ds(slot, 1), :] = best_score
-            block_out_ref[pl.ds(slot, 1), :] = jnp.where(
-                best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
-            )
-            return jnp.where(col_ids == best, _NEG_INF, s)
-
-        if width <= _UNROLLED_WIDTH:
-            for k in range(topk):
-                s = pick(k, s)
         else:
-            jax.lax.fori_loop(0, topk, pick, s, unroll=_PICK_UNROLL)
+            _picks_running(
+                s, width, rank, topk, dcp, score_out_ref, block_out_ref, *scratch
+            )
 
     for width in widths:
         pl.when(width_now == width)(functools.partial(select, width))
@@ -288,6 +386,16 @@ _FINE_WIDTH_LIMIT = 256
 # looped, 1,024 columns 12,541 looped vs 10,876 unrolled).
 _UNROLLED_WIDTH = 512
 _PICK_UNROLL = 2
+# Blocks at least this wide pick by `_picks_running` (whose columns must be
+# whole groups of `_RUNNING_PICK_ACCUMULATORS` vregs), over
+# `_RUNNING_PICK_ACCUMULATORS` independent running maxima, its vreg-row loop
+# unrolled `_RUNNING_PICK_UNROLL` times. AOT per 256-row block: 1,024 columns
+# ~7.6k bundles (11.7k looped reduced picks). Each pass adds ~40 bundles of
+# reductions: from 128 columns with 2 accumulators (AOT ~1.2k vs 1.46k) the c4
+# twin's narrow blocks took 45 us per layer against 40 (j-2f091da4).
+_RUNNING_PICK_WIDTH = 256
+_RUNNING_PICK_ACCUMULATORS = 4
+_RUNNING_PICK_UNROLL = 4
 # Past this width the scan widths step by half of it (bounding the
 # kernel's bodies: 20 at 4,096 columns).
 _COARSE_WIDTH_FROM = 1024
@@ -415,12 +523,17 @@ def local_candidates(
         needed = -(-(last_pos // block_size + 1) // dcp)
         w = jnp.asarray(widths, jnp.int32)
         row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
+    scratch = []
     if transposed:
         kernel = functools.partial(_candidates_kernel_t, pretransposed=pretransposed)
         pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))
         p = p.T
         out_spec = pl.BlockSpec((topk, block_rows), lambda i: (0, i))
         out_dims = (topk, num_tokens + pad)
+        # `_picks_running`'s block (twice) and column ids, if any width runs.
+        running = [w for w in widths if _picks_run(w, topk)]
+        if running:
+            scratch = [pltpu.VMEM((max(running), block_rows), jnp.float32)] * 3
     else:
         kernel = _candidates_kernel
         pos_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
@@ -456,6 +569,7 @@ def local_candidates(
             jax.ShapeDtypeStruct(out_dims, jnp.float32),
             jax.ShapeDtypeStruct(out_dims, jnp.int32),
         ],
+        scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",) if live_rows is None else ("arbitrary",),
             vmem_limit_bytes=msa_select._VMEM_LIMIT_BYTES,
@@ -890,8 +1004,14 @@ def msa_attend_dcp(
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     pages_per_seq = block_tables_2d.shape[1]
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
+    small = num_tokens <= DCP_SMALL_BATCH_TOKENS
     if dcp == 2:
         selected = merge_pair_candidates(candidates, topk)  # [T, G, topk]
+        if not small:
+            # One fusion: XLA sank the work list's [tiles, union] reshape into
+            # its inputs as four relayout copies (~11 us per layer at 8K
+            # tokens, c4 twin j-8f751cd8).
+            selected = jax.lax.optimization_barrier(selected)
     else:
         selected = merge_head_candidates(candidates, topk, interpret)
     num_heads = selected.shape[1]
@@ -905,7 +1025,6 @@ def msa_attend_dcp(
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
-    small = num_tokens <= DCP_SMALL_BATCH_TOKENS
     if small:
         block_q = msa_attention.SMALL_BATCH_BLOCK_Q
         pages_per_step = _SMALL_BATCH_PAGES_PER_STEP
