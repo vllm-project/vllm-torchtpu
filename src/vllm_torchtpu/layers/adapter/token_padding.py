@@ -60,6 +60,20 @@ def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
         _padding_state.update(num_valid_tokens, num_padded_tokens)
 
 
+def local_padding_rows(num_rows: int) -> torch.Tensor | None:
+    """This rank's `[num_rows]` padding mask: the stage's own mask where the
+    model supplies one, else the runner's mask; None when neither describes
+    `num_rows` rows."""
+    mask = None
+    if is_forward_context_available():
+        mask = get_forward_context().additional_kwargs.get("token_padding_mask")
+    if mask is None and _padding_state is not None:
+        mask = _padding_state.get_local_padding_mask(num_rows)
+    if mask is None or mask.shape[0] != num_rows:
+        return None
+    return mask
+
+
 def zero_routing_weights_for_padding(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
