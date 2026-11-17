@@ -173,6 +173,13 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # lookahead instead of double-buffered (`gmm_v2._scale_buffering`).
     # Bitwise (pipelining only; the VMEM estimate counts the extra buffer).
     "gmm_scale_lookahead": False,
+    # EP one-hot MoE (<= the one-hot threshold routes): permute and combine as
+    # Pallas kernels over only the 128-slot blocks of the valid local prefix
+    # instead of dense one-hot matmuls over every slot, where the shapes allow
+    # (`kernels/megablox/moe_onehot_bounded.py`). The permute is exact; the
+    # combine sums the same nonzero products (f32 accumulation), possibly in
+    # another MXU order: bitwise in the CPU tests, not guaranteed on TPU.
+    "moe_bounded_onehot": False,
 }
 
 

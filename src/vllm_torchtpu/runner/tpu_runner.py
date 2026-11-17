@@ -6073,6 +6073,10 @@ class TPUModelRunner(GPUModelRunner):
                 gmm_fp8_w8a8,
                 gmm_scale_lookahead,
             )
+        if option(additional, "moe_bounded_onehot"):
+            from vllm_torchtpu.layers.core import fused_moe_gmm
+
+            fused_moe_gmm.set_bounded_onehot(True)  # logs the value
         moe_row_movement = (
             option(additional, "moe_tc_combine_min_tokens"),
             option(additional, "moe_v3_payload_sort"),

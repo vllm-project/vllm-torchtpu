@@ -70,6 +70,7 @@ REPLACED_ENV = {
     "moe_redundant_placement": "VLLM_TPU_MOE_REDUNDANT_PLACEMENT",
     # --- v7 MoE / grouped GEMM ---
     "gmm_fp8_w8a8": "TPU_GMM_FP8_W8A8",
+    "moe_bounded_onehot": "TPU_MOE_BOUNDED_ONEHOT",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {

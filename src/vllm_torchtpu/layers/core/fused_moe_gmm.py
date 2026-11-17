@@ -28,6 +28,11 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     gmm_v2,
     gmm_v2_mlp,
 )
+from vllm_torchtpu.kernels.megablox.moe_onehot_bounded import (
+    bounded_onehot_combine,
+    bounded_onehot_permute,
+    can_use_bounded_onehot,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -150,6 +155,34 @@ def set_row_movement(
             _V3_PAYLOAD_SORT,
             _FLAT_ROUTING_MIN_TOKENS,
         )
+
+
+# r10: EP one-hot MoE permute and combine as Pallas kernels over only the
+# 128-slot blocks of the valid local prefix (about 1/EP of the routed slots)
+# instead of dense one-hot matmuls over every slot, where the shapes allow
+# (kernels/megablox/moe_onehot_bounded.py). Key moe_bounded_onehot, set
+# before the model's first trace (`set_bounded_onehot`; off by default). The
+# owner-output combine (TPU_MOE_OWNER_OUTPUT_MODE) takes precedence.
+_BOUNDED_ONEHOT = False
+
+
+def set_bounded_onehot(enabled: bool) -> None:
+    """Key moe_bounded_onehot."""
+    global _BOUNDED_ONEHOT
+    _BOUNDED_ONEHOT = bool(enabled)
+    logger.info("MoE bounded one-hot permute/combine: %s", _BOUNDED_ONEHOT)
+
+
+def _zero_non_finite(x: jax.Array) -> jax.Array:
+    return jnp.where(jnp.isfinite(x), x, 0)
+
+
+def _use_bounded_onehot(num_tokens: int, num_slots: int, rows: jax.Array) -> bool:
+    return (
+        _BOUNDED_ONEHOT
+        and rows.dtype == jnp.bfloat16
+        and can_use_bounded_onehot(num_tokens, num_slots, rows.shape[1])
+    )
 
 
 def _ep_combine():
@@ -543,6 +576,7 @@ def prepare_routed_gmm_inputs(
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
+    x = None
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster for small
@@ -550,7 +584,20 @@ def prepare_routed_gmm_inputs(
             # sort, build the `[M, T]` permutation directly from it so
             # `fused_moe_gmm` does not depend on `token_indices_sorted` (letting
             # XLA DCE its scatter unless owner-output combine uses it).
-            if bucket_counts is not None:
+            # Under moe_bounded_onehot the non-finite hidden states are zeroed
+            # here (the bounded kernel does it in VMEM) instead of in
+            # fused_moe_func, and the bounded kernel runs only the valid
+            # local prefix of slots.
+            if bucket_counts is not None and _use_bounded_onehot(
+                num_tokens_local, argsort_revert_indices.size, hidden_states_local
+            ):
+                logger.info_once("moe_bounded_onehot: bounded one-hot permute")
+                x = bounded_onehot_permute(
+                    hidden_states_local,
+                    argsort_revert_indices,
+                    group_sizes_local.sum(dtype=jnp.int32)[None],
+                )
+            elif bucket_counts is not None:
                 onehot = (
                     jax.nn.one_hot(
                         argsort_revert_indices.reshape(num_tokens_local, topk),
@@ -566,7 +613,10 @@ def prepare_routed_gmm_inputs(
                     num_tokens_local,
                     dtype=hidden_states_local.dtype,
                 )
-            x = onehot @ hidden_states_local
+            if x is None:
+                if _BOUNDED_ONEHOT:
+                    hidden_states_local = _zero_non_finite(hidden_states_local)
+                x = onehot @ hidden_states_local
         else:
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
@@ -752,6 +802,18 @@ def moe_gmm(
                     valid_count,
                     num_tokens=num_tokens,
                 ).astype(x.dtype)
+            # The dense combine one-hot takes the weights' dtype; the bounded
+            # kernel multiplies in the routed rows' dtype.
+            if topk_weights.dtype == gmm2_res.dtype and _use_bounded_onehot(
+                num_tokens, argsort_revert_indices.size, gmm2_res
+            ):
+                logger.info_once("moe_bounded_onehot: bounded one-hot combine")
+                return bounded_onehot_combine(
+                    gmm2_res,
+                    argsort_revert_indices,
+                    jnp.where(valid_mask, topk_weights, 0),
+                    valid_count,
+                ).astype(x.dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -883,12 +945,17 @@ def fused_moe_func(
     # and `where` propagate appropriately.
     topk_weights = topk_weights.astype(_get_topk_weights_dtype(hidden_states.dtype))
 
-    if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
+    onehot_permute = (
+        use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold
+    )
+    if onehot_permute:
         # The one-hot permute and unpermute are matmuls across all tokens, and
         # 0 * NaN == NaN: one token with a non-finite hidden state or routing
         # weight would turn every token's output into NaN. Zero those values
-        # so the damage stays with that token.
-        hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+        # so the damage stays with that token. Under moe_bounded_onehot the
+        # permute zeroes the hidden states (prepare_routed_gmm_inputs).
+        if not _BOUNDED_ONEHOT:
+            hidden_states = _zero_non_finite(hidden_states)
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
     if use_ep and experts_start is not None:
@@ -915,6 +982,8 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
+        if onehot_permute and _BOUNDED_ONEHOT:
+            hidden_states = _zero_non_finite(hidden_states)
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
