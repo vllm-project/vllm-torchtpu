@@ -3439,6 +3439,7 @@ def prepare_outputs(
         "out_pieces_fault",
         "out_pieces_gather_first",
         "packed_rope",
+        "kv_stack",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3496,6 +3497,7 @@ def sparse_ragged_paged_attention(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    kv_stack: tuple[int, int] | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3614,7 +3616,8 @@ def sparse_ragged_paged_attention(
         (rope_rows u32[T, 16] with `packed_rope`).
         The SparseCore gather writes them into both caches in place before it
         gathers (see `native_sc_gather.dsa_gather_native_sc`), and the updated
-        caches are returned after the other outputs.
+        caches are returned after the other outputs. With `kv_stack` the
+        `dst_rows` are this layer's per-layer rows; the gather offsets them.
       kv_write_fault: test-only (`native_sc_gather.WRITE_FAULTS`).
       mixed_fused_prep: With `mixed_live_gather` taken and
         `mixed_fused_prep_supported`: build kv_lens, the group table and the
@@ -3660,6 +3663,21 @@ def sparse_ragged_paged_attention(
         (`SparseMLAKVCacheSpec.packed_rope`); the gather expands it to the
         padded rows the attention body reads, so the scores are unchanged.
         `kv_write` then writes 16-word rope tokens.
+      kv_stack: GLM5_MKD_STACK_C. `(row, num_blocks)` when the caches are this
+        rank's `[n_layers * num_blocks, ...]` merged stacks
+        (`kv_cache_utils.merge_kv_stack`) and `page_indices` holds this
+        layer's own local pages (each < `num_blocks`, as on a per-layer
+        cache). Every top-k -> row prep (plain window, live-group, mixed
+        fused, fused decode, uncapped) then runs on the per-layer geometry
+        (`total_num_pages = num_blocks`), so it is the same computation in
+        every layer that shares a top-k and XLA CSEs it as on per-layer
+        caches. The row offset `row * num_blocks * page_size` is added after
+        it: by the SparseCore gather in-kernel on the capped paths
+        (`dsa_gather_native_sc(row_offset=)`, which also offsets `kv_write`'s
+        rows -- these must then be per-layer rows), and to the rows on the
+        uncapped one. Every row a gather reads (or writes) is the per-layer
+        row offset into this layer's part of the stack: the bytes of the
+        per-layer cache.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -3840,6 +3858,24 @@ def sparse_ragged_paged_attention(
     )
     window_indices_all: Any = None  # one array, or one per chunk
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
+    gather_row_offset = 0  # GLM5_MKD_STACK_C: added in the SC gather (below)
+    # GLM5_MKD_STACK_C: every top-k -> row prep runs on the per-layer geometry
+    # (`prep_num_pages` = num_blocks, this layer's own page table); the row
+    # offset is added in the SparseCore gather on the capped paths (every
+    # window prep: plain, live-group, mixed fused, fused decode) and to the
+    # rows on the uncapped one. Without a stack: the cache's own pages, no
+    # offset.
+    prep_num_pages = cache_kv_nope.shape[0]
+    stack_row_offset = 0
+    if kv_stack is not None:
+        stack_row, stack_num_blocks = kv_stack
+        if page_indices is None or cache_kv_nope.shape[0] % stack_num_blocks:
+            raise ValueError(
+                f"kv_stack={kv_stack} needs a page table and a merged stack, got "
+                f"{cache_kv_nope.shape[0]} pages"
+            )
+        prep_num_pages = stack_num_blocks
+        stack_row_offset = stack_row * stack_num_blocks * page_size
     group_tab = None
     group_num_live = None
     fused_prep = (
@@ -3879,7 +3915,7 @@ def sparse_ragged_paged_attention(
             cu_q_lens[distribution[2]],
             topk_cap=topk_cap,
             page_size=page_size,
-            total_num_pages=cache_kv_nope.shape[0],
+            total_num_pages=prep_num_pages,
             kernel_batch_size=prep_batch,
             gather_atoms=(
                 small_chunk_gather_atoms
@@ -3887,6 +3923,9 @@ def sparse_ragged_paged_attention(
                 else sparsecore_atoms_per_batch
             ),
         )
+        # Per-layer rows (and, under kv_write, per-layer write rows): the
+        # SparseCore gather adds the stack row offset to both.
+        gather_row_offset = stack_row_offset
     elif (
         window_prep
         and mixed_live_gather
@@ -3932,7 +3971,7 @@ def sparse_ragged_paged_attention(
                     kernel_batch_size=prep_batch,
                     topk_cap=topk_cap,
                     page_size=page_size,
-                    total_num_pages=cache_kv_nope.shape[0],
+                    total_num_pages=prep_num_pages,
                 )
             )
         else:
@@ -3962,8 +4001,10 @@ def sparse_ragged_paged_attention(
                 kernel_batch_size=prep_batch,
                 topk_cap=topk_cap,
                 page_size=page_size,
-                total_num_pages=cache_kv_nope.shape[0],
+                total_num_pages=prep_num_pages,
             )
+        # Per-layer rows; the SparseCore gather adds the stack row offset.
+        gather_row_offset = stack_row_offset
     elif window_prep:
         assert topk_cap is not None and page_indices is not None
         chunk_window_rows = topk // topk_cap * uniform_chunk
@@ -3999,18 +4040,24 @@ def sparse_ragged_paged_attention(
             chunk_size=uniform_chunk,
             topk_cap=topk_cap,
             page_size=page_size,
-            total_num_pages=cache_kv_nope.shape[0],
+            total_num_pages=prep_num_pages,
         )
+        # The row offset is added by the SparseCore gather itself
+        # (`gather_row_offset`), so these rows and their per-chunk slices stay
+        # the per-layer computation.
+        gather_row_offset = stack_row_offset
     else:
         kv_lens, physical_indices = prepare_gather_indices(
             topk_indices,
             page_indices,
             cu_q_lens,
             page_size=page_size,
-            total_num_pages=cache_kv_nope.shape[0],
+            total_num_pages=prep_num_pages,
             is_dcp_mode=is_dcp_mode,
             num_valid_tokens=cu_q_lens[distribution[2]],
         )
+        if stack_row_offset:
+            physical_indices = physical_indices + jnp.int32(stack_row_offset)
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
@@ -4108,6 +4155,7 @@ def sparse_ragged_paged_attention(
                 ]
             ),
             gather_live_in_indices=fused_prep,
+            gather_row_offset=gather_row_offset,
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
             lse_mask_empty=lse_mask_empty,
@@ -4333,8 +4381,15 @@ def sparse_attention_chunk(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    gather_row_offset: int = 0,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
+
+    `gather_row_offset` (GLM5_MKD_STACK_C; the capped path, any window prep):
+    `window_indices` (and `kv_write`'s rows) are per-layer rows and the caches
+    a merged stack; the SparseCore gather adds the offset in-kernel
+    (`dsa_gather_native_sc(row_offset=)`), so the preps and index slices stay
+    common to every layer that shares a top-k.
 
     The output aliases `q`. Returns the updated `q`, or `(q, lse)` when `lse`
     is given. The attention grid is rounded up to its kernel batch size, so
@@ -4885,6 +4940,8 @@ def sparse_attention_chunk(
     live_views = None
     if group_tab is not None and topk_cap is None:
         raise ValueError("group_tab requires topk_cap")
+    if gather_row_offset and topk_cap is None:
+        raise ValueError("gather_row_offset needs the capped gather")
     if pre_gathered is not None:
         # Merge pieces with the gathers issued first (`gather_only` pass).
         gathered_nope_buffer, gathered_rope_buffer, live_views = pre_gathered
@@ -4901,6 +4958,10 @@ def sparse_attention_chunk(
             gather_atoms = sparsecore_atoms_per_batch
             if small_chunk and small_chunk_live_gather:
                 gather_atoms = small_chunk_gather_atoms
+            if gather_row_offset and window_indices is None:
+                raise ValueError(
+                    "gather_row_offset needs prepared window indices (per-layer rows)"
+                )
             if gather_live_in_indices:
                 # `window_indices` is then the fused prep's 128-lane form: hand it
                 # to the gather flat (a bitcast, no relayout); its live vector
@@ -4908,10 +4969,14 @@ def sparse_attention_chunk(
                 live_kwargs = dict(
                     live_vec_offset=chunk_size * topk, linear_indices=True
                 )
+                if gather_row_offset:
+                    live_kwargs["row_offset"] = gather_row_offset
             elif group_tab is not None:
                 # Live-group prep: 128-lane linear rows, bound from the table.
                 assert window_indices is not None and group_num_live is not None
                 live_kwargs = dict(num_live_indices=group_num_live, linear_indices=True)
+                if gather_row_offset:
+                    live_kwargs["row_offset"] = gather_row_offset
             else:
                 live_tokens = batch_end - start_pos
                 token_windows = jnp.where(
@@ -4925,6 +4990,8 @@ def sparse_attention_chunk(
                     live_windows - 1
                 ) * chunk_size * topk_cap + jnp.maximum(0, live_tokens) * topk_cap
                 live_kwargs = dict(num_live_indices=num_live_capped)
+                if gather_row_offset:
+                    live_kwargs["row_offset"] = gather_row_offset
                 if capped_live_rows:
                     # TPU_SPARSE_MLA_LIVE_GATHER (#1948): window w of a gridded
                     # token holds prefix-packed slots [w*cap, (w+1)*cap); gather

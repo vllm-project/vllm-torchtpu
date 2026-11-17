@@ -286,6 +286,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # The GLM-5.2 decode megakernel's engagement log cadence: logging only.
+    "GLM52_DECODE_MK_LOG_EVERY",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

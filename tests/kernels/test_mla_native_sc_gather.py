@@ -120,6 +120,182 @@ class NativeScGatherTest(absltest.TestCase):
                     np.asarray(gathered_rope)[:groups], expected_rope[:groups]
                 )
 
+    def test_row_offset_gathers_the_offset_rows(self):
+        """``row_offset`` (GLM5_MKD_STACK_C): per-layer indices + an in-kernel
+        row offset gather exactly what ``indices + row_offset`` gathers from the
+        merged stack, for every live row; offset 0 equals no offset; a wrong
+        offset (positive control) gathers other rows."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+
+        n_layers, pages, page_size = 3, 32, 256
+        layer_tokens = pages * page_size
+        query_tokens, topk = 32, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20261023)
+        nope_u8 = rng.integers(0, 256, (n_layers * pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(
+            0, 0x7E, (n_layers * pages, page_size // 4, 4, 128), np.uint8
+        )
+        rope_u8[..., 64:] = 0
+        nope_i32 = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        rope_i32 = jnp.asarray(native_sc_cache_layout.pack_rope_banded(rope_u8))
+        indices = jnp.asarray(
+            rng.integers(0, layer_tokens, count, dtype=np.int32).reshape(
+                query_tokens, topk
+            )
+        )
+        num_live = 20 * topk + 3 * 64
+        groups = num_live // native_sc_gather.ROPE_PACKING
+
+        def gather(idx, **kw):
+            return jax.block_until_ready(
+                native_sc_gather.dsa_gather_native_sc(
+                    nope_i32,
+                    rope_i32,
+                    idx,
+                    out_size=count,
+                    atoms_per_batch=16,
+                    num_live_indices=jnp.int32(num_live),
+                    live_multiple=64,
+                    **kw,
+                )
+            )
+
+        for row in range(n_layers):
+            with self.subTest(row=row):
+                off = row * layer_tokens
+                want_nope, want_rope = gather(indices + off)
+                got_nope, got_rope = gather(indices, row_offset=off)
+                np.testing.assert_array_equal(
+                    np.asarray(got_nope)[:num_live], np.asarray(want_nope)[:num_live]
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(got_rope)[:groups], np.asarray(want_rope)[:groups]
+                )
+                wrong_nope, _ = gather(
+                    indices, row_offset=((row + 1) % n_layers) * layer_tokens
+                )
+                self.assertFalse(
+                    np.array_equal(
+                        np.asarray(wrong_nope)[:num_live],
+                        np.asarray(want_nope)[:num_live],
+                    ),
+                    "positive control: a wrong row offset must gather other rows",
+                )
+
+    def test_row_offset_every_live_form_and_kv_write(self):
+        """``row_offset`` on the forms the stacked-cache DCP path uses besides
+        ``num_live_indices``: ``live_vec_offset`` (the fused decode prep's
+        operand, offset in a 16-lane operand of its own) with and without
+        ``kv_write``, and ``num_live_indices`` with ``kv_write``. Per-layer
+        indices and per-layer write rows + an in-kernel offset == ``indices +
+        row_offset`` and ``dst + row_offset`` through the plain kernel: every
+        live gathered row and both whole caches (the write lands in the
+        layer's row of the stack and the gather reads it back). A wrong
+        offset (positive control) moves the writes and the gathered rows."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+
+        n_layers, pages, page_size = 3, 16, 256
+        layer_tokens = pages * page_size
+        query_tokens, topk = 16, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20261024)
+        nope_u8 = rng.integers(0, 256, (n_layers * pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(
+            0, 0x7E, (n_layers * pages, page_size // 4, 4, 128), np.uint8
+        )
+        rope_u8[..., 64:] = 0
+        caches = (
+            jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8)),
+            jnp.asarray(native_sc_cache_layout.pack_rope_banded(rope_u8)),
+        )
+        # Per-layer write rows (some skipped), planted at the start of the
+        # indices so the gather reads them back first.
+        dst = rng.choice(layer_tokens, query_tokens, replace=False).astype(np.int32)
+        dst[[3, 9]] = -1
+        flat = rng.integers(0, layer_tokens, count, dtype=np.int32)
+        flat[: query_tokens * 8 : 8] = np.where(
+            dst >= 0, dst, flat[: query_tokens * 8 : 8]
+        )
+        nope_rows = jnp.asarray(
+            rng.integers(0, 2**32, (query_tokens, 128), np.uint64), jnp.uint32
+        )
+        rope_rows = jnp.asarray(
+            rng.integers(0, 2**32, (query_tokens, 32), np.uint64), jnp.uint32
+        )
+        num_live = 9 * topk
+        groups = num_live // native_sc_gather.ROPE_PACKING
+        _, _, _, occ, nb = native_sc_gather.live_vec_geometry(count, 1)
+        live_b = min(-(-num_live // occ), nb)
+        meta = np.zeros((8, 128), np.int32)
+        meta[0, :16] = live_b
+        meta[0, 16:] = -(-live_b // 32)
+
+        def gather(indices, form, write_rows=None, **kw):
+            if form == "vec_offset":
+                operand = jnp.concatenate(
+                    [indices.reshape(count // 128, 128), jnp.asarray(meta)], 0
+                )
+                live = dict(live_vec_offset=count, linear_indices=True)
+            else:
+                operand = indices.reshape(query_tokens, topk)
+                live = dict(num_live_indices=jnp.int32(num_live))
+            kv = None
+            if write_rows is not None:
+                kv = native_sc_gather.pack_write_rows(
+                    jnp.asarray(write_rows), nope_rows, rope_rows
+                )
+            return jax.block_until_ready(
+                native_sc_gather.dsa_gather_native_sc(
+                    *caches,
+                    operand,
+                    out_size=count,
+                    atoms_per_batch=1,
+                    live_multiple=topk,
+                    kv_write=kv,
+                    **live,
+                    **kw,
+                )
+            )
+
+        def same(a, b):
+            n = [
+                np.array_equal(
+                    np.asarray(a[0])[:num_live], np.asarray(b[0])[:num_live]
+                ),
+                np.array_equal(np.asarray(a[1])[:groups], np.asarray(b[1])[:groups]),
+            ]
+            n += [
+                np.array_equal(np.asarray(x), np.asarray(y))
+                for x, y in zip(a[2:], b[2:])
+            ]
+            return n
+
+        for form, write in (
+            ("vec_offset", False),
+            ("vec_offset", True),
+            ("num_live", True),
+        ):
+            for row in range(n_layers):
+                with self.subTest(form=form, write=write, row=row):
+                    off = row * layer_tokens
+                    ref_dst = np.where(dst >= 0, dst + off, dst) if write else None
+                    want = gather(jnp.asarray(flat + off), form, ref_dst)
+                    got = gather(
+                        jnp.asarray(flat), form, dst if write else None, row_offset=off
+                    )
+                    self.assertEqual(same(got, want), [True] * len(want))
+                    bad = ((row + 1) % n_layers) * layer_tokens
+                    wrong = gather(
+                        jnp.asarray(flat), form, dst if write else None, row_offset=bad
+                    )
+                    res = same(wrong, want)
+                    self.assertFalse(res[0], "positive control: wrong offset gathered")
+                    if write:
+                        self.assertFalse(res[2], "positive control: wrong offset wrote")
+
     def test_live_bounded_gather_is_byte_exact_on_live_rows(self):
         """The decode bucket (16 tokens x topk 2048) with a traced live count.
 

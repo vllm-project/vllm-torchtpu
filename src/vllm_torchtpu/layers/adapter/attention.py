@@ -2495,6 +2495,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # TPU_DCP_MLA_OPROJ_ALL_REDUCE reads the partial whole on every
                 # bucket the pieces would serve (and the drafter never chunks).
                 merge_pieces=getattr(layer, "W_O_dcp_qrep", None) is None,
+                # GLM5_MKD_STACK_C: read at trace time; the runner binds it
+                # with the stacked caches, after this op is built.
+                kv_stack=getattr(layer, "kv_stack", None),
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -3121,6 +3124,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                 query_start_loc=attn_metadata.query_start_loc,
                             )
             else:
+                assert getattr(layer, "kv_stack", None) is None, (
+                    "GLM5_MKD_STACK_C stacked caches are only wired into the "
+                    "DCP sparse MLA op"
+                )
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
 

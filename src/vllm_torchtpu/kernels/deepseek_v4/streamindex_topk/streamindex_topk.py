@@ -2082,6 +2082,7 @@ SMALL_AG_MAX_TOKENS = 8
         "small_all_gather",
         "decode_pack",
         "shared_meta",
+        "kv_stack",
     ),
 )
 def streamindex_topk_dcp(
@@ -2121,6 +2122,7 @@ def streamindex_topk_dcp(
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
     shared_meta: bool = False,
+    kv_stack: tuple[int, int] | None = None,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2245,6 +2247,12 @@ def streamindex_topk_dcp(
         each shard holding its index on the mesh's other (lane) axis
         (`dcp_lane_operand`): the small all-gather's peer addresses under the
         torch bridge, where `lax.axis_index` is refused. Read only by it.
+      kv_stack: GLM5_MKD_STACK_C. `(row, num_blocks)` when `cache_kv` is the
+        `[n_layers, num_blocks, ...]` indexer stack shared by every indexer
+        layer (each rank's shard is its own stack) and this layer is `row`.
+        Each rank reads its stack as one `[n_layers * num_blocks, ...]` page
+        pool (a bitcast, see `kv_cache_utils.merge_kv_stack`) through a page
+        table rewritten into this layer's pages. None: a per-layer cache.
 
     Returns:
       With `overlap_fn`, a pair `(local_topk, overlap_out)`. Otherwise:
@@ -2354,6 +2362,11 @@ def streamindex_topk_dcp(
             # exported call (which then takes one operand fewer than the op
             # hands it). Adds zero.
             dcp_rank = dcp_rank + jnp.int32(0) * lane_ids[0][0]
+        if kv_stack is not None:
+            from vllm_torchtpu.kernels.mla import kv_cache_utils as mla_kv_utils
+
+            cache_kv = mla_kv_utils.merge_kv_stack(cache_kv, kv_stack)
+            page_indices = mla_kv_utils.stack_page_table_dcp(page_indices, kv_stack)
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
 
         local = streamindex_topk(

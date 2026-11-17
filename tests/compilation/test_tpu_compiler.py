@@ -89,6 +89,45 @@ class TestTpuCompilerCache:
 
         assert unprofiled == phased
 
+    def test_tpu_hash_separates_glm52_decode_mk_boots(self):
+        """A GLM-5.2 decode megakernel boot (stacked KV caches, which change the
+        stock graphs) must not share compile-cache entries with a stock boot,
+        and its compile-relevant knobs are keyed too; the engagement log
+        cadence is not."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+        from vllm_torchtpu.kernels.glm52_decode_mk import vllm_adapter
+
+        mk_keys = [k for k in os.environ if k.startswith("GLM52_DECODE_MK")]
+        with (
+            patch(
+                "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+                return_value=[],
+            ),
+            patch.dict(os.environ, {}),
+        ):
+            for k in mk_keys:
+                del os.environ[k]
+
+            def h(**env):
+                with patch.dict(os.environ, env):
+                    return compute_tpu_compilation_hash(self._config())
+
+            stock = h()
+            assert h(GLM52_DECODE_MK="0") == stock
+            mk = h(GLM52_DECODE_MK="1")
+            assert mk != stock
+            mk_b = h(GLM52_DECODE_MK="1", GLM52_DECODE_MK_LEVERS="B")
+            mk_rows = h(GLM52_DECODE_MK="1", GLM52_DECODE_MK_ROWS="16,32")
+            mk_trace = h(GLM52_DECODE_MK="1", GLM52_DECODE_MK_TRACE="1")
+            assert len({stock, mk, mk_b, mk_rows, mk_trace}) == 5
+            assert h(GLM52_DECODE_MK="1", GLM52_DECODE_MK_LOG_EVERY="7") == mk
+            # the registry reads GLM52_DECODE_MK exactly as the adapter does
+            for v in ("1", "0", "", "true", " 1"):
+                with patch.dict(os.environ, {"GLM52_DECODE_MK": v}):
+                    from vllm_torchtpu import envs
+
+                    assert envs.GLM52_DECODE_MK == vllm_adapter.enabled(), v
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 

@@ -98,6 +98,110 @@ def get_kv_cache_shape(
     )
 
 
+# GLM5_MKD_STACK_C: the cache kinds that can be allocated as ONE
+# [n_layers_of_kind, num_blocks, ...] tensor instead of one tensor per layer.
+GLM5_STACKABLE_KV_KINDS = ("nope", "rope", "idx")
+
+
+def glm5_stacked_kv_kinds(value: str | None = None) -> frozenset[str]:
+    """GLM5_MKD_STACK_C -> the stacked GLM-5.2 cache kinds.
+
+    "" or "0": none. "1": all of nope, rope, idx. Otherwise a comma list of
+    kinds. nope and rope go together: the sparse MLA op takes the pair.
+    """
+    if value is None:
+        from vllm_torchtpu import envs
+
+        value = envs.GLM5_MKD_STACK_C
+    v = value.strip()
+    if v in ("", "0"):
+        return frozenset()
+    if v == "1":
+        kinds = frozenset(GLM5_STACKABLE_KV_KINDS)
+    else:
+        kinds = frozenset(x.strip() for x in v.split(",") if x.strip())
+    bad = kinds - set(GLM5_STACKABLE_KV_KINDS)
+    if bad:
+        raise ValueError(f"GLM5_MKD_STACK_C: unknown cache kinds {sorted(bad)}")
+    if ("nope" in kinds) != ("rope" in kinds):
+        raise ValueError(
+            "GLM5_MKD_STACK_C: nope and rope are stacked together or not at all"
+        )
+    return kinds
+
+
+def merge_kv_stack(cache: jax.Array, kv_stack: tuple[int, int]) -> jax.Array:
+    """GLM5_MKD_STACK_C: a stacked cache as one flat page pool, with no copy.
+
+    `cache` is one rank's `[n_layers, num_blocks, *page]` stack and `kv_stack`
+    is `(this layer's row, num_blocks)`. Returns `[n_layers * num_blocks,
+    *page]`: merging two untiled leading dims is a bitcast, so no per-layer
+    slice (which torch_tpu would materialize as a copy) is ever taken. Undo
+    with `split_kv_stack`. Layer `row` owns pages `[row * num_blocks, (row +
+    1) * num_blocks)`: the DCP sparse-MLA op keeps its page math per layer and
+    adds that offset where it addresses the pool
+    (`attention_interface.sparse_mla_attention_dcp(kv_stack=)`); the indexer
+    ops rewrite their page table with `stack_page_table_dcp`.
+    """
+    row, num_blocks = kv_stack
+    if cache.ndim < 3 or cache.shape[1] != num_blocks or not 0 <= row < cache.shape[0]:
+        raise ValueError(
+            f"kv_stack={kv_stack} does not index a [n_layers, {num_blocks}, ...] "
+            f"stack; got cache shape {tuple(cache.shape)}"
+        )
+    return cache.reshape(cache.shape[0] * num_blocks, *cache.shape[2:])
+
+
+def split_kv_stack(merged: jax.Array, stacked_shape: tuple[int, ...]) -> jax.Array:
+    """Inverse of `merge_kv_stack`."""
+    return merged.reshape(stacked_shape)
+
+
+# SparseCore DMA addresses at most this many bytes of one tensor: a cache an SC
+# kernel (the sparse-MLA writer and gather, the indexer append) takes whole must
+# not be larger. A merged GLM5_MKD_STACK_C stack is such a tensor.
+SPARSECORE_MAX_TENSOR_BYTES = 16 * 2**30
+
+
+def glm5_stack_group_sizes(
+    n_layers: int, per_layer_bytes: int, max_group_bytes: int | None = None
+) -> list[int]:
+    """GLM5_MKD_STACK_C: how many layers go in each stacked tensor of one kind.
+
+    The fewest groups whose tensors each fit `max_group_bytes` (default: the
+    SparseCore per-tensor limit, since the DCP ops hand the merged stack to SC
+    kernels), as equal as possible, earlier groups taking the remainder. One
+    group (the whole stack) when it fits.
+    """
+    limit = max_group_bytes or SPARSECORE_MAX_TENSOR_BYTES
+    if per_layer_bytes > limit:
+        raise ValueError(
+            f"GLM5_MKD_STACK_C: one layer's cache ({per_layer_bytes} B) exceeds the "
+            f"{limit} B stacked-tensor limit"
+        )
+    per_group = limit // per_layer_bytes
+    n_groups = -(-n_layers // per_group)
+    base, extra = divmod(n_layers, n_groups)
+    return [base + (g < extra) for g in range(n_groups)]
+
+
+def stack_page_table_dcp(page_table: jax.Array, kv_stack: tuple[int, int]) -> jax.Array:
+    """GLM5_MKD_STACK_C: a DCP page table rewritten into the merged stack's pages.
+
+    Every DCP resolver maps a virtual page id to a rank-local page as
+    `id % num_pages`. For a per-layer cache `num_pages = num_blocks`; on the
+    merged stack it is `n_layers * num_blocks`. Rewriting each entry to
+    `id % num_blocks + row * num_blocks` lands it in `[row * num_blocks,
+    (row + 1) * num_blocks)`, where the resolver's `% (n_layers * num_blocks)`
+    is the identity -- so every entry (padding and negative ids included)
+    resolves to exactly the page the per-layer cache would use, offset to this
+    layer's row.
+    """
+    row, num_blocks = kv_stack
+    nb = jnp.int32(num_blocks)
+    return jnp.mod(page_table, nb) + jnp.int32(row) * nb
+
+
 @dataclasses.dataclass(frozen=True)
 class SparseMLAKVCacheSpec:
     cache_type: KVCacheType
@@ -520,6 +624,7 @@ def update_sparse_mla_kv_cache_dcp(
     rope_spec: SparseMLAKVCacheSpec,
     dcp_size: int,
     interleave_size: int,
+    kv_stack: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's MLA latents into a DCP position-sharded cache.
 
@@ -560,6 +665,11 @@ def update_sparse_mla_kv_cache_dcp(
       dcp_rank: i32 scalar, this shard's DCP index.
       nope_spec, rope_spec: layout descriptors the shards were allocated from.
       dcp_size, interleave_size: the shard layout.
+      kv_stack: GLM5_MKD_STACK_C. `(row, num_blocks)` when the caches are this
+        rank's merged `[n_layers * num_blocks, ...]` stacks (the specs then
+        describe the merged pool) and `block_tables` is this layer's
+        per-layer table: (page, slot) are resolved on `num_blocks` pages and
+        the owned pages offset to the layer's row (`_get_dcp_page_and_slot`).
 
     Returns:
       The updated (nope, rope) shards, same shapes/dtypes as the inputs.
@@ -574,6 +684,7 @@ def update_sparse_mla_kv_cache_dcp(
         nope_spec=nope_spec,
         dcp_size=dcp_size,
         interleave_size=interleave_size,
+        kv_stack=kv_stack,
     )
     return _scatter_caches(
         kv_cache_nope,
@@ -601,6 +712,7 @@ def update_sparse_mla_kv_cache_dcp_jax(
     rope_spec: SparseMLAKVCacheSpec,
     dcp_size: int,
     interleave_size: int,
+    kv_stack: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Pure-XLA `update_sparse_mla_kv_cache_dcp`, for every layout.
 
@@ -618,6 +730,7 @@ def update_sparse_mla_kv_cache_dcp_jax(
         nope_spec=nope_spec,
         dcp_size=dcp_size,
         interleave_size=interleave_size,
+        kv_stack=kv_stack,
     )
     return (
         _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
@@ -635,8 +748,17 @@ def _get_dcp_page_and_slot(
     nope_spec: SparseMLAKVCacheSpec,
     dcp_size: int,
     interleave_size: int,
+    kv_stack: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """This rank's (page, slot) per token; `OOB_PAGE` for rows it does not own."""
+    """This rank's (page, slot) per token; `OOB_PAGE` for rows it does not own.
+
+    `kv_stack` (GLM5_MKD_STACK_C): `(row, num_blocks)` when `nope_spec` is the
+    merged `[n_layers * num_blocks, ...]` pool and `block_tables` this layer's
+    per-layer table. The pages are resolved on `num_blocks` pages, exactly as
+    on a per-layer cache (the same computation in every layer, which XLA
+    CSEs), and the owned ones then offset by `row * num_blocks` into the
+    layer's row of the pool: the page `stack_page_table_dcp` resolves to.
+    """
     # `_check_inputs` asserts it equal to the rope page size, so one
     # (page, slot) addresses both caches.
     page_size = nope_spec.page_size
@@ -666,7 +788,8 @@ def _get_dcp_page_and_slot(
 
     # Virtual ordinal -> physical block in this rank's own shard, exactly as
     # the DCP readers resolve it.
-    local_block_tables = jnp.mod(block_tables, jnp.int32(nope_spec.num_pages)).reshape(
+    num_pages = nope_spec.num_pages if kv_stack is None else kv_stack[1]
+    local_block_tables = jnp.mod(block_tables, jnp.int32(num_pages)).reshape(
         seq_lens.shape[0], -1
     )
     max_pages_per_seq = local_block_tables.shape[1]
@@ -676,4 +799,8 @@ def _get_dcp_page_and_slot(
     page = jnp.where(
         valid, local_block_tables[seq_id, virtual_page], jnp.int32(OOB_PAGE)
     )
+    if kv_stack is not None:
+        row, num_blocks = kv_stack
+        if row:
+            page = jnp.where(page < OOB_PAGE, page + jnp.int32(row * num_blocks), page)
     return page, slot

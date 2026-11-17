@@ -209,6 +209,15 @@ if TYPE_CHECKING:
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
+    GLM5_MKD_STACK_C: str = ""
+    GLM5_MKD_STACK_GROUP_BYTES: int = 0
+    GLM52_DECODE_MK: bool = False
+    GLM52_DECODE_MK_ROWS: str = "16"
+    GLM52_DECODE_MK_LEVERS: str = ""
+    GLM52_DECODE_MK_TRACE: bool = False
+    GLM52_DECODE_MK_OFF: bool = False
+    GLM52_DECODE_MK_PERLAYER_MAX_L: int = 10
+    GLM52_DECODE_MK_LOG_EVERY: int = 2000
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -957,6 +966,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather expands the rows back to the padded format the attention kernel
     # reads. Changes the cache layout: a disagg pair must agree on it.
     "TPU_SPARSE_MLA_PACKED_ROPE": env_bool("TPU_SPARSE_MLA_PACKED_ROPE", default=False),
+    # GLM-5.2 DCP: allocate the target model's sparse-MLA (nope, rope) caches
+    # and indexer K caches as ONE [n_layers_of_kind, num_blocks, ...] tensor
+    # per kind (the operand shape the glm5_mk_dcp decode megakernel takes).
+    # Every layer of a kind is bound to the same tensor with
+    # `module.kv_stack = (row, num_blocks)`; the stock DCP ops address their
+    # row through the page table. "" (default) = per-layer caches; "1" =
+    # stack nope + rope + idx; or a comma list of kinds ("nope,rope", "idx").
+    "GLM5_MKD_STACK_C": lambda: os.getenv("GLM5_MKD_STACK_C", "").strip(),
+    # GLM5_MKD_STACK_C: the largest stacked tensor (bytes). A kind whose stack
+    # is larger is split into the fewest equal groups of layers that fit. 0 =
+    # the SparseCore per-tensor limit (16 GiB), which the DCP ops' SC kernels
+    # cannot exceed.
+    "GLM5_MKD_STACK_GROUP_BYTES": env_int("GLM5_MKD_STACK_GROUP_BYTES", 0),
+    # The GLM-5.2 decode megakernel (kernels/glm52_decode_mk/vllm_adapter.py, which
+    # reads these from os.environ with the same semantics). Registered so the
+    # compile-cache key sees them: a built megakernel switches the runner to
+    # stacked KV caches (GLM5_MKD_STACK_C unset), which changes the stock graphs,
+    # so a stock boot and a megakernel boot must not share cache entries.
+    # GLM52_DECODE_MK: "1" builds the megakernel at load.
+    "GLM52_DECODE_MK": lambda: os.getenv("GLM52_DECODE_MK", "0") == "1",
+    # GLM52_DECODE_MK_ROWS: the row buckets compiled ("16", "32" or "16,32").
+    "GLM52_DECODE_MK_ROWS": lambda: os.getenv("GLM52_DECODE_MK_ROWS", "16"),
+    # GLM52_DECODE_MK_LEVERS: the stage-B levers (presets.py: "" | "A" | "B" | list).
+    "GLM52_DECODE_MK_LEVERS": lambda: os.getenv("GLM52_DECODE_MK_LEVERS", ""),
+    # GLM52_DECODE_MK_TRACE: "1" builds the named-scope trace variant.
+    "GLM52_DECODE_MK_TRACE": lambda: os.getenv("GLM52_DECODE_MK_TRACE", "0") == "1",
+    # GLM52_DECODE_MK_OFF: "1" builds and warms it but starts with it disabled.
+    "GLM52_DECODE_MK_OFF": lambda: os.getenv("GLM52_DECODE_MK_OFF", "0") == "1",
+    # GLM52_DECODE_MK_PERLAYER_MAX_L: the largest model served from per-layer caches.
+    "GLM52_DECODE_MK_PERLAYER_MAX_L": lambda: int(
+        os.getenv("GLM52_DECODE_MK_PERLAYER_MAX_L", "10")
+    ),
+    # GLM52_DECODE_MK_LOG_EVERY: engagement log cadence in decisions (0 = first of
+    # each reason only). Logging only: not in the compile-cache key.
+    "GLM52_DECODE_MK_LOG_EVERY": lambda: int(
+        os.getenv("GLM52_DECODE_MK_LOG_EVERY", "2000") or 0
+    ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")
