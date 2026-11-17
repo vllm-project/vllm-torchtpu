@@ -33,7 +33,9 @@ from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import (
     AttentionScope,
+    Fp8Operand,
     KVLayout,
+    NativeFp8,
 )
 from vllm_torchtpu.layers.adapter import attention, cp_attention, native_fp8_scope
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -224,7 +226,9 @@ def test_dcp_forward_reuses_the_ops_built_with_the_layer_modes_and_tiles(
     monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", build_op)
     monkeypatch.setattr(cp_attention, "synchronize_tensors", lambda *a, **k: None)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
+    pv_static = NativeFp8(pv=Fp8Operand.STATIC)
     modes = native_fp8_scope.AttentionModes(
+        native_fp8=pv_static, native_fp8_prefill=pv_static, decode_exp2=True
     )
     impl = _impl()
     # As the model's settings and tile rule set them before the kernels are built.
