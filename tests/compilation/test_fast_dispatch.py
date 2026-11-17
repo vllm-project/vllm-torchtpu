@@ -201,6 +201,22 @@ def test_fast_compiled_call_dispatches_directly_once_armed():
     assert fast == 3
 
 
+def test_fast_dispatch_binds_keyword_only_defaults():
+    """A positional call of a function with a keyword-only default: the frame
+    Dynamo guards holds the default, so the guards must see it too."""
+
+    def f(x, *, scale=2):
+        return x * scale + 1
+
+    compile_options.apply(_config({"fast_compiled_call": True}))
+    wrapped = _compiled(f)
+    fast, slow = _calls(wrapped, 4)
+    assert (fast, slow) == (3, 1)
+    # An explicit keyword still takes the bound path and its own guards.
+    x = torch.arange(4.0)
+    assert torch.equal(wrapped(x, scale=3), x * 3 + 1)
+
+
 def test_fast_dispatch_keeps_every_compiled_entry():
     """Two shapes alternating both dispatch directly once each is compiled."""
 

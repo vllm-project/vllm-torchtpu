@@ -91,6 +91,8 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
     simple_sig = not (flags & inspect.CO_VARARGS or flags & inspect.CO_VARKEYWORDS)
     nargs = code.co_argcount
     arg_names = code.co_varnames[:nargs]
+    # Keyword-only defaults: a positional call leaves them out of args.
+    kwdefaults = fn.__kwdefaults__
     freevars = code.co_freevars
     closure = fn.__closure__
     sig = inspect.signature(fn)
@@ -112,6 +114,8 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
             f_locals = dict(bound.arguments)
         else:
             f_locals = dict(zip(arg_names, args))
+            if kwdefaults:
+                f_locals.update(kwdefaults)
         if freevars:
             # A function with free variables always has a closure.
             for name, cell in zip(freevars, closure or ()):
