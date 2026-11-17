@@ -43,4 +43,4 @@ def tiny_tiles(kv_blk: int) -> Tiles:
     """The profile's decode tiles with small banks for tiny geometries."""
     return dataclasses.replace(
         profiles.DECODE_TILES, bank=512 << 10, nbd=8, vmem_mib=32
-    ).with_modules({"gqa": {"kv_blk": kv_blk, "nkv": 3}})
+    ).with_modules({"gqa": {"kv_blk": kv_blk}})
