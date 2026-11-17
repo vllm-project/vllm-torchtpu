@@ -75,6 +75,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
 from vllm_torchtpu.layers.adapter import (
+    moe_ep_cap,
     moe_redundant,
     moe_route_trace,
     moe_routing,
@@ -505,6 +506,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         moe_redundant.install(layer)
         moe_route_trace.register(layer)
+        if moe_ep_cap.ENABLED:
+            moe_ep_cap.register(layer)
         if envs.TPU_MOE_NVFP4_SKIP_PADDED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
             _log_skip_padded_once()
         if not self._use_adaptive_fused_moe:
@@ -586,6 +589,11 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             # (skip_padded_tokens) instead of reading their experts' weights.
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights
+            )
+        if moe_ep_cap.ENABLED and moe_ep_cap.applies(layer, x.shape[0]):
+            # Decode steps: cap each EP rank's distinct experts (changes numerics).
+            topk_ids, topk_weights = moe_ep_cap.apply(
+                layer, topk_ids, topk_weights, router_logits
             )
         if moe_redundant.ENABLED:
             # Logical -> physical slot ids (identity for layers without

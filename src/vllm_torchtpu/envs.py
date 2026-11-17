@@ -89,6 +89,8 @@ if TYPE_CHECKING:
     TPU_MOE_FLAT_ROUTING_MIN_TOKENS: int = 0
     TPU_MOE_ROUTE_TRACE: int = 0
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
+    TPU_MOE_EP_CAP: str = ""
+    TPU_MOE_EP_CAP_STATS: int = 0
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
     TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
@@ -841,6 +843,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTE_TRACE_EVERY": env_nonnegative_int(
         "TPU_MOE_ROUTE_TRACE_EVERY", 8192
     ),
+    # Decode-step EP load cap on the grouped-matmul MoE path
+    # (layers/adapter/moe_ep_cap.py). The MoE all-reduce waits for the EP rank
+    # that hits the most distinct experts, and each hit expert costs its weight
+    # read. "<slack>[:drop|:sub<N>][@<max_tokens>]": in steps of at most
+    # <max_tokens> tokens (default 128), a rank keeps at most
+    # ceil(distinct/ep) + <slack> experts (the ones with the most routed weight;
+    # every token's top-1 expert is always kept). Routes to the other experts are
+    # dropped and the token's weights renormalized (drop, the default), or moved
+    # to the token's best-scoring already-kept expert within its top-<N>
+    # (sub<N>). Changes numerics. Empty = off.
+    "TPU_MOE_EP_CAP": env_str("TPU_MOE_EP_CAP", ""),
+    # With TPU_MOE_EP_CAP on: log cumulative cap statistics (routes and routed
+    # weight dropped, busiest-rank experts before/after) from TP rank 0 every
+    # <N> model-runner steps. Adds a small accumulate per MoE layer. 0 = off.
+    "TPU_MOE_EP_CAP_STATS": env_nonnegative_int("TPU_MOE_EP_CAP_STATS", 0),
     # NVFP4 GMM MoE: give padded rows of a token bucket zero routing weights
     # (token_padding mask), so TPU_MOE_SKIP_PADDED_TOKENS drops them from the
     # grouped matmul as the FP8 path already does. Their outputs are discarded,
