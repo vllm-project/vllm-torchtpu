@@ -23,7 +23,10 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    quantize_tensor,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -235,8 +238,6 @@ def _quantize_rows_jax(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Per-row fp8 quantisation of the activation: the rows and scales
     xla_quantized_matmul computes for itself, so a projection fed the
     pre-quantised rows reproduces the plain path's numerics."""
-    from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
-
     x_q, x_s = quantize_tensor(x, jnp.float8_e4m3fn)
     return x_q, x_s.astype(jnp.float32)
 
@@ -281,7 +282,7 @@ def quantized_matmul_prequant(
 ) -> torch.Tensor:
     """`quantized_matmul` for rows already quantized per row to fp8.
 
-    Per-channel weight scales only. Call `_get_prequant_matmul_op` before the
+    Per-channel weight scales only. Call `prebuild_prequant_ops` before the
     trace; building the op inside a traced forward is not allowed.
     """
     if w_s.shape != (w_q.shape[-1],):
