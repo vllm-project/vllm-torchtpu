@@ -349,92 +349,27 @@ def test_get_num_chips_filters_accessible_vfio_tpu_device_ids_without_cap(monkey
     assert tpu_info.get_num_chips() == 0
 
 
-def test_reconcile_tpu_visible_device_paths_narrows_idempotently(monkeypatch):
-    bdf_by_group = {
-        "15": ["0000:89:00.1"],
-        "3": ["0000:08:00.0"],
-        "9": ["0000:89:00.0"],
-        "7": ["0000:08:00.1"],
-    }
-    real_listdir = os.listdir
-    monkeypatch.setattr(
-        tpu_worker.os,
-        "listdir",
-        lambda path=".": (
-            bdf_by_group[str(path).split("/sys/kernel/iommu_groups/")[1].split("/")[0]]
-            if str(path).startswith("/sys/kernel/iommu_groups/")
-            else real_listdir(path)
-        ),
-    )
-    raw_paths = "/dev/vfio/15,/dev/vfio/3,/dev/vfio/9,/dev/vfio/7"
-    expected_pci_order = ["/dev/vfio/3", "/dev/vfio/7", "/dev/vfio/9", "/dev/vfio/15"]
-
-    monkeypatch.delenv("VLLM_TPU_DEVICE_ORDER", raising=False)
-    for rank, expected in enumerate(expected_pci_order):
-        monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", raw_paths)
-        tpu_worker._reconcile_tpu_visible_device_paths(rank, local_world_size=4)
-        assert tpu_worker.os.environ["TPU_VISIBLE_DEVICE_PATHS"] == expected
-        # Calling a second time in the same worker is idempotent and keeps the
-        # narrowed path rather than treating it as < local_world_size.
-        tpu_worker._reconcile_tpu_visible_device_paths(rank, local_world_size=4)
-        assert tpu_worker.os.environ["TPU_VISIBLE_DEVICE_PATHS"] == expected
-
-    monkeypatch.setenv("VLLM_TPU_DEVICE_ORDER", "0,2,1,3")
-    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", raw_paths)
-    tpu_worker._reconcile_tpu_visible_device_paths(1, local_world_size=4)
-    assert tpu_worker.os.environ["TPU_VISIBLE_DEVICE_PATHS"] == "/dev/vfio/9"
-
-    # Exclude bare-metal SR-IOV ICI management VFs (virtfn2) from device paths.
-    monkeypatch.delenv("VLLM_TPU_DEVICE_ORDER", raising=False)
-    sriov_bdfs = {
-        "10": "0000:10:00.1",  # virtfn0 -> compute
-        "11": "0000:10:00.2",  # virtfn1 -> compute
-        "12": "0000:10:00.3",  # virtfn2 -> ICI management (excluded)
-        "20": "0000:20:00.1",  # virtfn0 -> compute
-    }
-    _patch_vfio_fs(
-        monkeypatch,
-        vfio_entries=list(sriov_bdfs),
-        iommu_devices_fn=lambda s: [
-            sriov_bdfs[s.split("/iommu_groups/")[1].split("/")[0]]
-        ],
-        open_sysfs_fn=lambda s: io.StringIO(
-            "0x1ae0\n" if s.endswith("/vendor") else "0x0076\n"
-        ),
-        exists_fn=lambda s: s.endswith("/physfn"),
-        readlink_fn=lambda s: (
-            "../0000:10:00.1"
-            if "0000:10:" in s and s.endswith("/virtfn0")
-            else (
-                "../0000:10:00.2"
-                if "0000:10:" in s and s.endswith("/virtfn1")
-                else "../0000:20:00.1"
-            )
-        ),
-    )
-    monkeypatch.setenv(
-        "TPU_VISIBLE_DEVICE_PATHS",
-        "/dev/vfio/10,/dev/vfio/11,/dev/vfio/12,/dev/vfio/20",
-    )
-    tpu_worker._reconcile_tpu_visible_device_paths(2, local_world_size=3)
-    assert tpu_worker.os.environ["TPU_VISIBLE_DEVICE_PATHS"] == "/dev/vfio/20"
+# A device plugin lists one path per chip (four on a tpu7x host).
+_POD_DEVICE_PATHS = "/dev/vfio/461,/dev/vfio/463,/dev/vfio/460,/dev/vfio/462"
 
 
-def test_reconcile_tpu_visible_device_paths_clears_insufficient_and_keeps_single(
-    monkeypatch,
+@pytest.mark.parametrize("local_world_size", [2, 4, 8])
+def test_reconcile_tpu_visible_device_paths_clears_for_multi_rank(
+    monkeypatch, local_world_size
 ):
-    monkeypatch.delenv("VLLM_TPU_DEVICE_ORDER", raising=False)
-    monkeypatch.setenv(
-        "TPU_VISIBLE_DEVICE_PATHS", "/dev/vfio/0,/dev/vfio/1,/dev/vfio/2,/dev/vfio/3"
-    )
+    # A rank binds one device and a tpu7x chip has two, so the per-chip list is
+    # unusable whether it is shorter than the local world (8) or not (2, 4).
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
     with mock.patch.object(tpu_worker.logger, "warning_once") as warn_mock:
-        tpu_worker._reconcile_tpu_visible_device_paths(0, local_world_size=8)
+        tpu_worker._reconcile_tpu_visible_device_paths(local_world_size)
         warn_mock.assert_called_once()
     assert "TPU_VISIBLE_DEVICE_PATHS" not in tpu_worker.os.environ
 
-    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", "/dev/vfio/5")
-    tpu_worker._reconcile_tpu_visible_device_paths(0, local_world_size=1)
-    assert tpu_worker.os.environ["TPU_VISIBLE_DEVICE_PATHS"] == "/dev/vfio/5"
+
+def test_reconcile_tpu_visible_device_paths_keeps_single_rank(monkeypatch):
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
+    tpu_worker._reconcile_tpu_visible_device_paths(1)
+    assert tpu_worker.os.environ["TPU_VISIBLE_DEVICE_PATHS"] == _POD_DEVICE_PATHS
 
 
 @pytest.mark.parametrize("bad_value", ["not-an-int", "-1"])

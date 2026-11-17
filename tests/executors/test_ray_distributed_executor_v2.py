@@ -72,6 +72,7 @@ class MockVllmConfig:
     return_value="127.0.0.1",
 )
 @patch("vllm_torchtpu.executors.ray_distributed_executor_v2._wait_until_pg_ready")
+@patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_num_chips", lambda: 0)
 class TestTpuRayDistributedExecutorV2:
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -105,6 +106,36 @@ class TestTpuRayDistributedExecutorV2:
         mock_ray.init.assert_called_once()
         assert executor.parallel_config.placement_group == mock_placement_group
         mock_ray.util.placement_group.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("usable_devices", "over_reported"), [(8, True), (12, False), (0, False)]
+    )
+    def test_initialize_ray_cluster_rejects_over_reported_devices(
+        self,
+        mock_wait_until_pg_ready,
+        mock_get_ip,
+        mock_platform,
+        mock_ray,
+        usable_devices,
+        over_reported,
+    ):
+        # A privileged bare-metal tpu7x pod sees 12 VFIO groups per host (8
+        # compute devices and 4 management functions), and Ray counts all 12.
+        mock_platform.ray_device_key = "TPU"
+        mock_ray.is_initialized.return_value = True
+        mock_ray.nodes.return_value = [{"NodeID": "node_1", "Resources": {"TPU": 12.0}}]
+        mock_ray.get_runtime_context.return_value.get_node_id.return_value = "node_1"
+        executor = RayDistributedExecutorV2(self.vllm_config)
+        executor.parallel_config = self.parallel_config
+
+        with patch.object(rde2, "get_num_chips", return_value=usable_devices):
+            if over_reported:
+                with pytest.raises(ValueError, match="Ray reports 12 TPU"):
+                    executor._initialize_ray_cluster()
+                mock_ray.util.placement_group.assert_not_called()
+            else:
+                executor._initialize_ray_cluster()
+                mock_ray.util.placement_group.assert_called_once()
 
     def test_initialize_ray_cluster_pipeline_parallelism(
         self, mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray

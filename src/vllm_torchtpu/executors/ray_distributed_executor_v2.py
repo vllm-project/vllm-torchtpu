@@ -49,6 +49,7 @@ from vllm_torchtpu.executors.kv_block_override import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
+from vllm_torchtpu.tpu_info import get_num_chips
 from vllm_torchtpu.utils import get_dp_size
 from vllm_torchtpu.worker.tpu_rank_binding import slice_binding_env
 
@@ -698,6 +699,27 @@ class RayDistributedExecutorV2(RayExecutorV2):
             len(nodes_with_device),
             len(ray_nodes),
         )
+
+        # Ray counts every numeric /dev/vfio group. A privileged bare-metal pod
+        # also sees SR-IOV management functions there, so Ray over-reports and
+        # the slice layout would be built with too many devices per host.
+        current_node_id = ray.get_runtime_context().get_node_id()
+        ray_devices = next(
+            (
+                int(n["Resources"][device_str])
+                for n in nodes_with_device
+                if n.get("NodeID") == current_node_id
+            ),
+            0,
+        )
+        usable_devices = get_num_chips()
+        if 0 < usable_devices < ray_devices:
+            raise ValueError(
+                f"Ray reports {ray_devices} {device_str} on this node but only "
+                f"{usable_devices} TPU compute devices are usable here. Restart "
+                "Ray on every host with "
+                f"`ray start --resources '{{\"{device_str}\": {usable_devices}}}'`."
+            )
 
         dp_size, dp_rank, _ = self._get_dp_geometry()
         if pp_size == 1 and dp_size > 1:

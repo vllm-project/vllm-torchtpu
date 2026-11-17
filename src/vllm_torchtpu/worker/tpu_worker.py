@@ -49,7 +49,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs, profiler_trace, tpu_info, utils
+from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -83,103 +83,27 @@ def _configure_tpu_process_env(
         os.environ.pop("WORLD_SIZE", None)
 
 
-_LAST_SCOPED_DEVICE_PATH: tuple[int, int, str, str] | None = None
-
-
-def _vfio_path_sort_key(path: str) -> tuple[int, str, int, str]:
-    """Order VFIO device paths by ascending PCI BDF to match libtpu's scanner."""
-    name = os.path.basename(path)
-    if name.isdigit():
-        group = int(name)
-        try:
-            bdfs = sorted(os.listdir(f"/sys/kernel/iommu_groups/{group}/devices"))
-        except OSError:
-            bdfs = []
-        if bdfs:
-            return (0, bdfs[0], group, path)
-        return (1, "", group, path)
-    return (2, path, 0, path)
-
-
-def _is_vfio_application_path(path: str) -> bool:
-    """Exclude bare-metal SR-IOV PFs, ICI management VFs, and non-TPU VFIO paths."""
-    name = os.path.basename(path)
-    if not name.isdigit():
-        return True
-    sysfs_root = f"/sys/kernel/iommu_groups/{int(name)}/devices"
-    try:
-        bdfs = os.listdir(sysfs_root)
-    except OSError:
-        return True
-    if not bdfs:
-        return True
-    for bdf in bdfs:
-        dev_dir = os.path.join(sysfs_root, bdf)
-        try:
-            with open(os.path.join(dev_dir, "vendor"), encoding="ascii") as vf:
-                vendor = vf.read().strip().lower()
-            with open(os.path.join(dev_dir, "device"), encoding="ascii") as df:
-                device_id = df.read().strip().lower()
-        except (OSError, UnicodeDecodeError):
-            return True
-        if (
-            vendor == tpu_info.TPU_PCI_VENDOR_ID
-            and device_id in tpu_info.TPU_VFIO_PCI_DEVICE_IDS
-            and tpu_info._is_application_pci_function(dev_dir, bdf, device_id)
-        ):
-            return True
-    return False
-
-
-def _reconcile_tpu_visible_device_paths(local_rank: int, local_world_size: int) -> None:
-    """Scope or clear inherited ``TPU_VISIBLE_DEVICE_PATHS`` for multi-rank workers.
+def _reconcile_tpu_visible_device_paths(local_world_size: int) -> None:
+    """Clear an inherited ``TPU_VISIBLE_DEVICE_PATHS`` for multi-rank workers.
 
     ``libtpu`` prioritizes ``TPU_VISIBLE_DEVICE_PATHS`` over ``TPU_VISIBLE_CHIPS``
-    and opens every path in the list inside each process. Narrow a pod-wide list
-    to this worker's PCI-ordered device path when ``len(paths) >= local_world_size``,
-    or clear it when fewer paths are listed than ``local_world_size``.
+    and opens every listed path inside each process, so a pod-wide list breaks
+    per-rank device binding. Device plugins list one path per chip while a rank
+    binds one device (tpu7x has two per chip), so the list cannot be narrowed
+    per rank; clear it and let ``TPU_VISIBLE_CHIPS`` select the device.
     """
-    global _LAST_SCOPED_DEVICE_PATH
     raw_paths = envs.TPU_VISIBLE_DEVICE_PATHS
     if not raw_paths or local_world_size <= 1:
         return
-    order = getattr(envs, "VLLM_TPU_DEVICE_ORDER", "") or ""
-    if (local_rank, local_world_size, order, raw_paths) == _LAST_SCOPED_DEVICE_PATH:
-        return
-    unique_paths = [
-        p
-        for p in dict.fromkeys(p.strip() for p in raw_paths.split(",") if p.strip())
-        if _is_vfio_application_path(p)
-    ]
-    if not unique_paths:
-        os.environ.pop("TPU_VISIBLE_DEVICE_PATHS", None)
-        _LAST_SCOPED_DEVICE_PATH = None
-        return
-    sorted_paths = sorted(unique_paths, key=_vfio_path_sort_key)
-    if order:
-        order_list = [int(x) for x in order.split(",") if x.strip()]
-        device_idx = (
-            order_list[local_rank] if 0 <= local_rank < len(order_list) else local_rank
-        )
-    else:
-        device_idx = local_rank
-
-    if len(sorted_paths) >= local_world_size and 0 <= device_idx < len(sorted_paths):
-        scoped = sorted_paths[device_idx]
-        os.environ["TPU_VISIBLE_DEVICE_PATHS"] = scoped
-        _LAST_SCOPED_DEVICE_PATH = (local_rank, local_world_size, order, scoped)
-    else:
-        os.environ.pop("TPU_VISIBLE_DEVICE_PATHS", None)
-        _LAST_SCOPED_DEVICE_PATH = None
-        logger.warning_once(
-            "TPUWorker | Clearing TPU_VISIBLE_DEVICE_PATHS=%r (%d path(s)) "
-            "because local_world_size=%d (device_idx=%d); falling back to "
-            "TPU_VISIBLE_CHIPS.",
-            raw_paths,
-            len(sorted_paths),
-            local_world_size,
-            device_idx,
-        )
+    os.environ.pop("TPU_VISIBLE_DEVICE_PATHS", None)
+    logger.warning_once(
+        "TPUWorker | Clearing TPU_VISIBLE_DEVICE_PATHS=%r because "
+        "local_world_size=%d; each rank binds its device through "
+        "TPU_VISIBLE_CHIPS, which needs every TPU device node of the host to "
+        "be visible to this process.",
+        raw_paths,
+        local_world_size,
+    )
 
 
 def _release_free_host_heap() -> None:
@@ -384,7 +308,6 @@ class TPUWorker(WorkerBase):
                 init_rank = binding.rank - dp_rank * per_engine_world
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
-                tpu_device_local_rank = binding.local_rank
                 tpu_device_local_world = binding.local_world_size
             else:
                 # Dense DP has no cross-rank collective, so each replica
@@ -437,7 +360,6 @@ class TPUWorker(WorkerBase):
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
-                tpu_device_local_rank = binding.native_local_rank
                 tpu_device_local_world = max(
                     binding.local_world_size,
                     (self.parallel_config.data_parallel_size_local or dp_size)
@@ -498,7 +420,6 @@ class TPUWorker(WorkerBase):
                 local_rank_for_init = binding.init_local_rank
                 dist_world_size = binding.world_size
                 os.environ.update(binding.as_env())
-                tpu_device_local_rank = binding.local_rank
                 tpu_device_local_world = binding.local_world_size
             else:
                 local_world = os.environ.get("LOCAL_WORLD_SIZE") or pc.world_size
@@ -526,7 +447,6 @@ class TPUWorker(WorkerBase):
                 _configure_tpu_process_env(
                     self.rank, tpu_local_rank_env, pc.world_size, tpu_local_world
                 )
-                tpu_device_local_rank = tpu_local_rank_env
                 tpu_device_local_world = tpu_local_world
             if envs.TPU_LOCAL_RANK_OFFSET:
                 logger.info(
@@ -539,9 +459,7 @@ class TPUWorker(WorkerBase):
                     binding.local_world_size,
                 )
 
-        _reconcile_tpu_visible_device_paths(
-            tpu_device_local_rank, tpu_device_local_world
-        )
+        _reconcile_tpu_visible_device_paths(tpu_device_local_world)
 
         if not self.devices:
             self.devices = [torch.device("tpu")]
