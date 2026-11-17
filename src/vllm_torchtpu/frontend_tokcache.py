@@ -144,11 +144,6 @@ class PrefixTokenCache:
             keys.append((p + offset).to_bytes(6, "little") + h.copy().digest())
         return keys, h
 
-    @staticmethod
-    def _prefix_keys(b: bytes, bpos: list[int]) -> list[bytes]:
-        keys, _ = PrefixTokenCache._prefix_keys_with_state(b, bpos)
-        return keys
-
     # --------------------------------------------------------------- encode
     def encode(self, text: str) -> list[int]:
         if self.disabled:
@@ -223,7 +218,7 @@ class PrefixTokenCache:
                         break
         ids: list[int]
         if hit is not None:
-            bi, tok_idx, ebi, e = hit
+            bi, tok_idx, _, e = hit
             p = bpos[bi]
             if matched_entry is not None and p == p0:
                 suffix = suf_text
@@ -383,7 +378,6 @@ class PrefixTokenCache:
             logger.debug("%s stats %s", _P, self.stats())
 
 
-_CACHE: PrefixTokenCache | None = None
 _INSTALLED = False
 
 
@@ -471,8 +465,6 @@ def maybe_install_tokenize_prefix_cache() -> bool:
                 if not state["tried"]:
                     state["cache"] = _build_cache_for(renderer.get_tokenizer())
                     state["tried"] = True
-                    global _CACHE
-                    _CACHE = state["cache"]
                     if state["cache"] is not None:
                         logger.info(
                             "%s active: incremental prompt "
