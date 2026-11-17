@@ -181,6 +181,7 @@ def _run_gqa_pallas_core_case(
     kv_dtype: Any = FP8,
     output_gate: bool = True,
     rope_delta: int | None = None,
+    page_size: int = 128,
 ) -> None:
     """Run GQA Pallas core helpers and compare against `gqa_reference`.
 
@@ -189,7 +190,7 @@ def _run_gqa_pallas_core_case(
     """
     B = 4
     kv_off = -rope_delta if rope_delta else 0
-    ctx_len = 256 + round_up(kv_off, 256)
+    ctx_len = round_up(256 + round_up(kv_off, 256), page_size)
     g = FakeGeometry(L=1, att_every=1, H=256, NH=1, NKV=1, HD=hd, ROT=rot)
     tt = GQATunables(
         kv_blk=kv_blk,
@@ -203,8 +204,12 @@ def _run_gqa_pallas_core_case(
     )
     tiles = TINY_TILES.with_modules({"gqa": tt})
     cache = (
-        # Up to 4 sequences of `ctx_len // 128` pages, plus null page 0.
-        CacheExec(paged_kv=True, page_size=128, num_pages=max(32, ctx_len // 32 + 1))
+        # Up to 4 sequences of `ctx_len // page_size` pages, plus null page 0.
+        CacheExec(
+            paged_kv=True,
+            page_size=page_size,
+            num_pages=max(32, 4 * ctx_len // page_size + 1),
+        )
         if paged_kv
         else CacheExec()
     )
@@ -433,7 +438,12 @@ def _run_gqa_pallas_core_case(
 
         if paged_kv:
             lay = PoolLayout(
-                num_pools=1, slots_per_pool=0, hd=g.HD, kvh=1, page_dtype=kv_dtype
+                num_pools=1,
+                slots_per_pool=0,
+                hd=g.HD,
+                kvh=1,
+                page_size=page_size,
+                page_dtype=kv_dtype,
             )
             pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ref_ex)
             kc_pg = to_kv_dtype(kc.astype(F32), kv_dtype)
@@ -571,22 +581,39 @@ def test_gqa_pallas_core_helpers_match_gqa_reference(
     ids=["cpu", "tpu"],
 )
 @pytest.mark.parametrize(
-    ("T", "gqa_qv", "amask", "rope_delta"),
-    [(1, False, 1, None), (2, True, 0, None), (1, False, 1, -700), (2, True, 1, -700)],
+    ("T", "gqa_qv", "amask", "rope_delta", "page_size", "kv_blk"),
+    [
+        (1, False, 1, None, 128, 128),
+        (2, True, 0, None, 128, 128),
+        (1, False, 1, -700, 128, 128),
+        (2, True, 1, -700, 128, 128),
+        (1, False, 1, -700, 512, 128),
+        (2, True, 1, -700, 512, 1024),
+    ],
     ids=[
         "decode_t1_amask1",
         "verify_t2_qv_amask0",
         "decode_t1_rope_table_delta_m700",
         "verify_t2_qv_rope_table_delta_m700",
+        "decode_t1_p512_blk_rounds_up_to_1page_delta_m700",
+        "verify_t2_qv_p512_blk2pages_delta_m700",
     ],
 )
 def test_gqa_pallas_core_dense_qwen3_vs_gqa_reference(
-    T: int, gqa_qv: bool, amask: int, rope_delta: int | None, interpret: bool
+    T: int,
+    gqa_qv: bool,
+    amask: int,
+    rope_delta: int | None,
+    page_size: int,
+    kv_blk: int,
+    interpret: bool,
 ):
     """Dense Qwen3 attention (Cosmos3 reasoner): no output gate, bf16 hd128 KV
     pages, full rotary; with `rope_delta`, RoPE comes from a per-row table 700
     positions behind the KV index (M-RoPE after an image) and must match the
-    reference with separate RoPE and KV indices, not one index for both."""
+    reference with separate RoPE and KV indices, not one index for both. At
+    512-token pages (vLLM's at 256 sequences of 262144 tokens) the 760- and
+    840-token sequences span two pages."""
     if not interpret and jax.devices()[0].platform != "tpu":
         pytest.skip("TPU device required for interpret=False")
     _run_gqa_pallas_core_case(
@@ -602,6 +629,8 @@ def test_gqa_pallas_core_dense_qwen3_vs_gqa_reference(
         kv_dtype=BF16,
         output_gate=False,
         rope_delta=rope_delta,
+        page_size=page_size,
+        kv_blk=kv_blk,
     )
 
 

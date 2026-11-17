@@ -215,7 +215,8 @@ class ModelGeometry:
                 raise MegakernelConfigError(msg)
         cx = cache_exec(ex)
         if cx.paged_kv and not (
-            cx.page_size == 128
+            cx.page_size > 0
+            and cx.page_size % 128 == 0
             and ex.ctx % cx.page_size == 0
             and cx.num_pages >= 1
             and resolved_max_pages_per_seq(ex) >= ex.ctx // cx.page_size

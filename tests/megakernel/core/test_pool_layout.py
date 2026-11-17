@@ -79,9 +79,13 @@ def test_layout_derived_geometry(name: str):
 
 
 def test_layout_validate_rejects_unvalidated_geometry():
+    """Pages hold whole 128-lane tiles; recurrent slots and fused pool I/O,
+    sized in pages, are validated at 128-token pages only."""
     for bad in (
         replace(_layout(3), hd=128),
         replace(_layout(3), page_size=64),
+        replace(_layout(0), page_size=192),
+        replace(_layout(3), page_size=512),
         replace(_layout(3), kvh=2),
         replace(_layout(3), rec_pages_per_slot=2),
         replace(_layout(3), conv_taps=4),
@@ -91,6 +95,12 @@ def test_layout_validate_rejects_unvalidated_geometry():
             bad.validate()
     with pytest.raises(MegakernelConfigError, match="page_size"):
         _layout(3).validate(with_cache(_exec(R=2, B=2, T=1), page_size=64))
+    ex512 = with_cache(_exec(R=2, B=2, T=1, ctx=1024), page_size=512)
+    replace(_layout(0), page_size=512).validate(ex512)
+    with pytest.raises(MegakernelConfigError, match="fused pool I/O is only"):
+        replace(_layout(0), page_size=512).validate(
+            with_cache(ex512, fused_pool_io=True)
+        )
     with pytest.raises(
         MegakernelConfigError,
         match=r"recurrent heads \(kh=2, vh=4\) must be divisible by R=8",
@@ -98,19 +108,22 @@ def test_layout_validate_rejects_unvalidated_geometry():
         _layout(3).validate(_exec(R=8, B=8, T=1))
 
 
-def test_layout_bf16_kv_pages_are_the_stock_rpa_pages():
+@pytest.mark.parametrize("page_size", [128, 512])
+def test_layout_bf16_kv_pages_are_the_stock_rpa_pages(page_size: int):
     """bf16 hd128 KV-only pages validate and equal the stock batched-RPA
-    `SEQ_ALONG_LANE` page, so the stock and megakernel steps share one cache;
-    recurrent slots and fused pool I/O stay fp8-only."""
+    `SEQ_ALONG_LANE` page at the page size vLLM picks (128, or 512 at 256
+    sequences of 262144 tokens), so the stock and megakernel steps share one
+    cache; recurrent slots and fused pool I/O stay fp8-only."""
     from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
-    lay = PoolLayout(num_pools=2, hd=128, page_dtype=jnp.bfloat16)
-    ex = _exec(R=8, B=8, T=1)
+    lay = PoolLayout(num_pools=2, hd=128, page_size=page_size, page_dtype=jnp.bfloat16)
+    ex = _exec(R=8, B=8, T=1, ctx=2 * page_size)
+    ex = with_cache(ex, page_size=page_size)
     lay.validate(ex)
     stock = wrapper.get_kv_cache_shape(
-        NUM_PAGES, 128, 1, 128, jnp.bfloat16, configs.KVLayout.SEQ_ALONG_LANE
+        NUM_PAGES, page_size, 1, 128, jnp.bfloat16, configs.KVLayout.SEQ_ALONG_LANE
     )
-    assert (NUM_PAGES, *lay.kv_page_shape) == stock == (NUM_PAGES, 2, 64, 2, 128)
+    assert (NUM_PAGES, *lay.kv_page_shape) == stock == (NUM_PAGES, 2, 64, 2, page_size)
     for bad in (replace(lay, slots_per_pool=1, kh=8, vh=8), replace(lay, hd=256)):
         with pytest.raises(MegakernelConfigError):
             bad.validate()

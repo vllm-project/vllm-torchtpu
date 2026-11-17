@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
@@ -28,6 +29,7 @@ from ..module import Module
 from ..modules.norm import NormModule
 from ..modules.transforms import _validate_decl_and_array, apply_hf_transforms
 from ..ops import I32
+from ..pool.config import cache_exec
 from ..spec import ModelSpec
 from .eplb import default_eplb_cores, encode_eplb_ecopy
 from .spec_inputs import _coerce_canonical_hf_entry, coerce_canonical_hf_entry
@@ -73,11 +75,17 @@ def _resolve_norm_mod(
 def resolve_spec_and_norms(
     model_def: Any, ex: ExecSpec | None = None, g: Any = None
 ) -> tuple[ModelSpec, Any, Module | None, Module | None, Module | None]:
-    """Resolve `(ModelSpec, geometry, pre_norm, post_norm, final_norm)`."""
+    """Resolve `(ModelSpec, geometry, pre_norm, post_norm, final_norm)`; with
+    `ex`, the spec's pool pages are `ex`'s page size."""
     if not (isinstance(model_def, type) and issubclass(model_def, ModelDef)):
         raise TypeError(f"Expected a ModelDef subclass, got {model_def!r}")
     geom = model_def.geometry() if g is None else g
     ms = model_def.to_model_spec(geom, R=None if ex is None else ex.R)
+    lay = None if ms.cache_backend is None else ms.cache_backend.layout
+    if ex is not None and lay is not None:
+        page_size = cache_exec(ex).page_size
+        if lay.page_size != page_size:
+            ms = ms.with_layout(dataclasses.replace(lay, page_size=page_size))
     sched = model_def.schedule
     pre_n = (
         _resolve_norm_mod(sched.pre_norm, geom, default_small_field="in_norm")

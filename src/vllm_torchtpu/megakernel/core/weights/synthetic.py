@@ -201,7 +201,7 @@ def pack_inputs(
             else:
                 raise ValueError(f"page_table must be 2D or 3D, got {pt_in.shape}")
         elif build_default_pool:
-            lay = m_def.pool_layout(geom, R=R)
+            lay = ms.cache_backend.layout
             pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ex)
             states_mk[POOL_STATE_NAME] = pool.states_to_pool(
                 lay, ex, logical_states, pt, ckpt, roff

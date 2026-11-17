@@ -151,6 +151,11 @@ class GQATunables:
         "rope_fp32": "approx",  # float32 vs bfloat16-rounded RoPE intermediates
     }
 
+    def block(self, page_size: int) -> int:
+        """KV tokens per block over `page_size`-token pages: `kv_blk` rounded up
+        to whole pages, since a block streams whole pages."""
+        return round_up(self.kv_blk, page_size)
+
 
 register_tunables("gqa", GQATunables)
 
@@ -181,7 +186,10 @@ def derive_params(
     nh = g.NH // ex.R
     nai = gqa_nai(nh, g.HD, output_gate)
     G = ex.R // g.NKV
-    BLK = tt.kv_blk
+    paged, ps = cache_exec(ex).paged_kv, cache_exec(ex).page_size
+    if paged and (ps <= 0 or ps % 128 != 0):
+        raise MegakernelConfigError(f"paged_kv requires page_size ({ps}) % 128 == 0")
+    BLK = tt.block(ps) if paged else tt.kv_blk
     PAIR_KV = tt.pair_kv
     NKV = max(tt.nkv, 4) if PAIR_KV else tt.nkv
     if PAIR_KV and tt.nkv < 4:
@@ -199,16 +207,10 @@ def derive_params(
             f"GQATunables.amask must be in {{0, 1, 2, 3, 4}}, got {tt.amask!r}"
         )
     kv_pk = 4 // jnp.dtype(kv_dtype).itemsize
-    if cache_exec(ex).paged_kv:
+    if paged:
         if g.HD % kv_pk != 0:
             raise MegakernelConfigError(
                 f"paged_kv requires HD % {kv_pk} == 0, got HD={g.HD}"
-            )
-        ps = cache_exec(ex).page_size
-        if ps <= 0 or ps % 128 != 0 or BLK % ps != 0:
-            raise MegakernelConfigError(
-                f"paged_kv requires page_size ({ps}) % 128 == 0 and "
-                f"kv_blk ({BLK}) % page_size == 0"
             )
         npages = cache_exec(ex).num_pages
         mpps = resolved_max_pages_per_seq(ex)

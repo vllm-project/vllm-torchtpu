@@ -31,7 +31,7 @@ from ...decls import (
 )
 from ...errors import MegakernelConfigError
 from ...ops import BF16, F32, FP8
-from ...pool.layout import VALIDATED_KVH, VALIDATED_PAGE_SIZE
+from ...pool.layout import VALIDATED_KVH
 
 GQA_WEIGHT_NAMES: tuple[str, ...] = ("att_in", "att_out")
 
@@ -413,7 +413,8 @@ def gqa_cache_decl(
     geom: Any | None, *, pool_layout: Any = None, kv_dtype: str = "fp8"
 ) -> KVCacheDecl:
     """Return the `KVCacheDecl` describing one attention layer's KV page geometry
-    (`pool_layout`'s pages when given, else `geom.HD` pages of `kv_dtype`)."""
+    (`pool_layout`'s pages when given, else `geom.HD` pages of `kv_dtype` at the
+    default page size, which the bound pool's replaces)."""
     if pool_layout is not None:
         return KVCacheDecl(
             hd=int(pool_layout.hd),
@@ -425,6 +426,5 @@ def gqa_cache_decl(
     return KVCacheDecl(
         hd=int(geom.HD),
         kvh=VALIDATED_KVH,
-        page_size=VALIDATED_PAGE_SIZE,
         page_dtype=GQA_KV_DTYPES[kv_dtype],
     )

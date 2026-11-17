@@ -154,6 +154,15 @@ def test_gqa_tunables_and_derive_params_validation():
     )
     with pytest.raises(MegakernelConfigError, match="page_size"):
         derive_params(g, ex_bad_ps, p_paged, GQATunables(kv_blk=128, nkv=2))
+    # A KV block streams whole pages of the bound pool: `kv_blk` rounds up.
+    ex_p512 = dataclasses.replace(
+        ex_paged, ctx=1024, cache=CacheExec(paged_kv=True, page_size=512, num_pages=16)
+    )
+    blks = [
+        derive_params(g, ex_p512, p_paged, GQATunables(kv_blk=b, nkv=2)).BLK
+        for b in (128, 1024)
+    ]
+    assert blks == [512, 1024]
     g_bad_g = FakeGeometry(L=2, att_every=1, H=256, NH=12, NKV=2, HD=256, ROT=64)
     ex_r6 = ExecSpec(B=4, T=1, R=6, ctx=256, stack_e=True, tiles=tiles)
     with pytest.raises(MegakernelConfigError, match="power of two"):

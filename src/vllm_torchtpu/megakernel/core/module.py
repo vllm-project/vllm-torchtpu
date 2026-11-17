@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -272,9 +273,13 @@ class Module:
         return None
 
     def with_cache_layout(self, layout: Any) -> Module:
-        """Return this module bound to `layout` (identity by default)."""
-        del layout
-        return self
+        """Return this module bound to `layout`: a shallow copy with its
+        `pool_layout` replaced (itself when it has none or already has `layout`)."""
+        if getattr(self, "pool_layout", layout) is layout:
+            return self
+        cloned = copy.copy(self)
+        cloned.pool_layout = layout
+        return cloned
 
     def init_logical_states(
         self, key: Any, g: Any, ex: ExecSpec, n_layers: int

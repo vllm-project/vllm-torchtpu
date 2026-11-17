@@ -87,7 +87,7 @@ def _layout(slots: int, num_pools: int = 2) -> PoolLayout:
     )
 
 
-def _exec(R: int, B: int, T: int, ctx: int = 256) -> ExecSpec:
+def _exec(R: int, B: int, T: int, ctx: int = 256, page_size: int = 128) -> ExecSpec:
     return ExecSpec(
         R=R,
         B=B,
@@ -96,7 +96,7 @@ def _exec(R: int, B: int, T: int, ctx: int = 256) -> ExecSpec:
         stack_e=True,
         interpret=True,
         tiles=_TINY_TILES,
-        cache=CacheExec(paged_kv=True, num_pages=NUM_PAGES),
+        cache=CacheExec(paged_kv=True, page_size=page_size, num_pages=NUM_PAGES),
     )
 
 
@@ -165,8 +165,13 @@ def _check_scatter(
         )
         assert not np.any(np.asarray(conv0)) and not np.any(np.asarray(rec0))
     k = jax.random.split(jax.random.key(seed + 10), 4)
+    # Odd sequences write one slot past the start of their second page.
     pos = jnp.asarray(
-        [10 + 129 * (s % 2) + 3 * (s // 2) + t for s in range(NS) for t in range(T)],
+        [
+            10 + (lay.page_size + 1) * (s % 2) + 3 * (s // 2) + t
+            for s in range(NS)
+            for t in range(T)
+        ],
         dtype=jnp.int32,
     )
     knew = (jax.random.normal(k[0], (NATT, ex.MR, lay.hd)) * 0.3).astype(lay.page_dtype)
@@ -300,18 +305,35 @@ def test_scatter_direct_conv_window_lowers_for_24_lane_rows_on_tpu(
 
 @pytest.mark.parametrize("T", [1, 2])
 @pytest.mark.parametrize(
-    "name,ckpt_ndim",
+    "name,ckpt_ndim,page_size,interpret",
     [
-        ("slots3", 3),
-        ("slots3", 2),
-        ("slots1", 3),
-        ("slots1", 2),
-        ("kv_only", 3),
-        ("kv_only_bf16", 3),
+        ("slots3", 3, 128, True),
+        ("slots3", 2, 128, True),
+        ("slots1", 3, 128, True),
+        ("slots1", 2, 128, True),
+        ("kv_only", 3, 128, True),
+        ("kv_only_bf16", 3, 128, True),
+        ("kv_only_bf16", 3, 512, True),
+        pytest.param("kv_only_bf16", 3, 128, False, marks=pytest.mark.tpu_test),
+        pytest.param("kv_only_bf16", 3, 512, False, marks=pytest.mark.tpu_test),
     ],
 )
-def test_scatter_writes_kv_and_checkpoints(name: str, ckpt_ndim: int, T: int):
-    _check_scatter(_named_layout(name), _exec(R=1, B=2 * T, T=T), ckpt_ndim, 31 + T)
+def test_scatter_writes_kv_and_checkpoints(
+    name: str, ckpt_ndim: int, page_size: int, interpret: bool, T: int
+):
+    """Each new K / V row lands in slot `pos % page_size` of page
+    `pos // page_size` and nothing else changes, at the pool's page size (bf16
+    KV-only pools: 128, and 512 as vLLM picks at 256 sequences of 262144
+    tokens), on CPU and on TPU."""
+    if not interpret and jax.devices()[0].platform != "tpu":
+        pytest.skip("TPU device required for interpret=False")
+    lay = replace(_named_layout(name), page_size=page_size)
+    ex = replace(
+        _exec(R=1, B=2 * T, T=T, ctx=2 * page_size, page_size=page_size),
+        interpret=interpret,
+    )
+    with jax.default_device(jax.devices("cpu" if interpret else None)[0]):
+        _check_scatter(lay, ex, ckpt_ndim, 31 + T)
 
 
 @pytest.mark.parametrize("NS", [1, 3, 4])

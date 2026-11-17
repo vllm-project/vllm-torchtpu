@@ -243,10 +243,11 @@ def align_cache_exec(
     page_size: int,
     max_pages_per_seq: int,
 ) -> ExecSpec:
-    """Align `base_exec.ctx` to `kv_blk` and bind paged KV cache geometry."""
+    """Align `base_exec.ctx` to the GQA KV block over `page_size`-token pages
+    and bind paged KV cache geometry."""
     ex0 = profile.exec_for(base_exec, B=base_exec.B, T=1, g=geom)
-    kv_blk = ex0.resolved_tiles.module(GQAModule.name, GQATunables).kv_blk
-    aligned_ctx = ((max_pages_per_seq * page_size) // kv_blk) * kv_blk
+    blk = ex0.resolved_tiles.module(GQAModule.name, GQATunables).block(page_size)
+    aligned_ctx = ((max_pages_per_seq * page_size) // blk) * blk
     return with_cache(
         dataclasses.replace(base_exec, ctx=max(base_exec.ctx, aligned_ctx)),
         num_pages=num_pages,

@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
@@ -136,14 +135,6 @@ class GDNModule(Module):
         if self.pool_layout is not None:
             return self.pool_layout.conv_dtype
         return self.cache_decl(g).conv_dtype
-
-    def with_cache_layout(self, layout: Any) -> GDNModule:
-        """Return a shallow copy bound to `layout` when `pool_layout` differs."""
-        if self.pool_layout is layout:
-            return self
-        cloned = copy.copy(self)
-        cloned.pool_layout = layout
-        return cloned
 
     @classmethod
     def _resolve_binding(

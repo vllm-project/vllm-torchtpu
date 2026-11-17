@@ -72,7 +72,11 @@ LANES = 128
 # - `(hd, page_dtype)` in `VALIDATED_KV_PAGES`: fp8 `hd == 256` (KV page
 #   `(2, 64, 4, 128)`, every pool I/O path) or bf16 `hd == 128` (KV page
 #   `(2, 64, 2, 128)`, KV-only pools on the split scatter path).
-# - `page_size == 128`, `kvh == 1`: one `(K, V)` head pair per rank and page.
+# - `page_size`: any multiple of `LANES` for KV-only pools on the split
+#   scatter path (the bound pool's, e.g. 512 when vLLM's SMEM page-table bound
+#   raises the block size); `VALIDATED_SLOT_PAGE_SIZE` for recurrent
+#   checkpoint slots and fused pool I/O, whose slot geometry is sized in pages.
+# - `kvh == 1`: one `(K, V)` head pair per rank and page.
 # - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: the only slot
 #   geometry exercised on TPU.
 # - `KD == VD == LANES`, `conv_taps == 3`: recurrent rows are one lane-row wide
@@ -80,7 +84,7 @@ LANES = 128
 #   hard-code the 3-tap window.
 VALIDATED_HD = 256
 VALIDATED_KV_PAGES = ((VALIDATED_HD, jnp.dtype(FP8)), (128, jnp.dtype(BF16)))
-VALIDATED_PAGE_SIZE = 128
+VALIDATED_SLOT_PAGE_SIZE = 128
 VALIDATED_KVH = 1
 VALIDATED_REC_PAGES_PER_SLOT = 4
 VALIDATED_CONV_PAGES_PER_SLOT = 1
@@ -93,9 +97,9 @@ VALIDATED_CONV_DTYPES = (BF16, F32)
 class PoolLayout:
     """Unified raw-pool layout: KV page packing plus recurrent checkpoint slots.
 
-    The defaults describe a single KV-only pool with the validated page geometry.
-    Callers build their layout explicitly for their attention and recurrent head
-    counts.
+    The defaults describe a single KV-only pool of 128-token pages. Callers
+    build their layout explicitly for their attention and recurrent head
+    counts, and take `page_size` from the pool they bind.
     """
 
     # Pool topology.
@@ -104,7 +108,7 @@ class PoolLayout:
     # KV page packing `(2 * kvh, hd // PK, PK, page_size)` of `page_dtype`.
     hd: int = VALIDATED_HD
     kvh: int = VALIDATED_KVH
-    page_size: int = VALIDATED_PAGE_SIZE
+    page_size: int = VALIDATED_SLOT_PAGE_SIZE
     page_dtype: Any = FP8
     # Recurrent state `(vh, KD, VD)` of `rec_dtype` (global head counts).
     kh: int = 0
@@ -282,11 +286,14 @@ class PoolLayout:
         # Only validated geometry (see the VALIDATED_* constants above).
         page_dt = jnp.dtype(self.page_dtype)
         _need(
-            (self.hd, page_dt) in VALIDATED_KV_PAGES
-            and self.page_size == VALIDATED_PAGE_SIZE,
+            (self.hd, page_dt) in VALIDATED_KV_PAGES,
             "pool kernels are only validated for (hd, page_dtype) in "
-            f"{[(h, d.name) for h, d in VALIDATED_KV_PAGES]}, "
-            f"page_size={VALIDATED_PAGE_SIZE}",
+            f"{[(h, d.name) for h, d in VALIDATED_KV_PAGES]}",
+        )
+        _need(
+            self.page_size > 0 and self.page_size % LANES == 0,
+            f"page_size={self.page_size} must be a multiple of {LANES} "
+            "(a page's tokens lie along lanes)",
         )
         fp8_pages = page_dt == jnp.dtype(FP8)
         _need(
@@ -302,9 +309,19 @@ class PoolLayout:
                 fp8_pages or not cache_exec(ex).FUSED,
                 "fused pool I/O stages fp8 pages only",
             )
+            _need(
+                self.page_size == VALIDATED_SLOT_PAGE_SIZE or not cache_exec(ex).FUSED,
+                f"fused pool I/O is only validated for page_size="
+                f"{VALIDATED_SLOT_PAGE_SIZE}",
+            )
         if not self.has_recurrent:
             return
         _need(fp8_pages, "recurrent checkpoint slots are packed into fp8 pages")
+        _need(
+            self.page_size == VALIDATED_SLOT_PAGE_SIZE,
+            "recurrent checkpoint slots are only validated for page_size="
+            f"{VALIDATED_SLOT_PAGE_SIZE}",
+        )
         rec_hint = (
             "; per-rank recurrent state exceeds 4 pages, increase tensor-parallel R"
             if self.rec_pages_per_slot > VALIDATED_REC_PAGES_PER_SLOT
@@ -415,7 +432,7 @@ __all__ = [
     "VALIDATED_HD",
     "VALIDATED_KVH",
     "VALIDATED_KV_PAGES",
-    "VALIDATED_PAGE_SIZE",
     "VALIDATED_REC_PAGES_PER_SLOT",
+    "VALIDATED_SLOT_PAGE_SIZE",
     "PoolLayout",
 ]
