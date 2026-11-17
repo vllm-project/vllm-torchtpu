@@ -6062,6 +6062,17 @@ class TPUModelRunner(GPUModelRunner):
                 gmm_prefill_tiles,
                 gmm_decode_w13,
             )
+        gmm_fp8_w8a8 = option(additional, "gmm_fp8_w8a8")
+        gmm_scale_lookahead = option(additional, "gmm_scale_lookahead")
+        if gmm_fp8_w8a8 or gmm_scale_lookahead:
+            from vllm_torchtpu.kernels.megablox import gmm_v2
+
+            gmm_v2.set_r10_options(gmm_fp8_w8a8, gmm_scale_lookahead)
+            logger.info(
+                "MoE gmm_v2: gmm_fp8_w8a8=%s gmm_scale_lookahead=%s",
+                gmm_fp8_w8a8,
+                gmm_scale_lookahead,
+            )
         moe_row_movement = (
             option(additional, "moe_tc_combine_min_tokens"),
             option(additional, "moe_v3_payload_sort"),

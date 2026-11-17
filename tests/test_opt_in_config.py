@@ -68,6 +68,8 @@ REPLACED_ENV = {
     "moe_skip_padded_min_routes": "TPU_MOE_SKIP_PADDED_MIN_ROUTES",
     "moe_redundant_experts": "VLLM_TPU_MOE_REDUNDANT_EXPERTS",
     "moe_redundant_placement": "VLLM_TPU_MOE_REDUNDANT_PLACEMENT",
+    # --- v7 MoE / grouped GEMM ---
+    "gmm_fp8_w8a8": "TPU_GMM_FP8_W8A8",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -93,6 +95,8 @@ NEW_KEYS = {
     "raiden_offload_refresh_lru",
     "minimax_indexer_hoist_metadata",
     "minimax_indexer_row_gather",
+    # --- v7 MoE / grouped GEMM ---
+    "gmm_scale_lookahead",
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.

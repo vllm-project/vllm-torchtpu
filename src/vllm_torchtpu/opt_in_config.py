@@ -163,6 +163,16 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # ~0.9 GiB host heap per worker (~7 GiB per MiniMax-M3.1 host), which
     # lowers the Raiden host-pool start-up guard reading. Host-only.
     "release_jax_caches": False,
+    # --- v7 MoE / grouped GEMM ---
+    # gmm_v2, prefill-sized calls (> 2048 rows) with fp4 experts: buckets
+    # above 48 rows that would dequantize the weights before the matmul run
+    # fp8 x fp8 instead (rhs tile requantized to e4m3 per column, lhs rows to
+    # e4m3 per row; `gmm_v2.uses_fp8_w8a8`). Tile choice unchanged. LOSSY.
+    "gmm_fp8_w8a8": False,
+    # gmm_v2 decode tiles (tile_m <= 128): rhs scale blocks 3-deep with
+    # lookahead instead of double-buffered (`gmm_v2._scale_buffering`).
+    # Bitwise (pipelining only; the VMEM estimate counts the extra buffer).
+    "gmm_scale_lookahead": False,
 }
 
 

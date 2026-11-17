@@ -223,6 +223,25 @@ def tuned_tiles_enabled() -> bool:
     return _tuned_tiles
 
 
+# r10 levers, set from --additional-config before the model's first trace
+# (`set_r10_options`; both off by default):
+#   gmm_fp8_w8a8: prefill-sized calls with fp4 experts (per-128-K-block
+#     scales) run fp8 x fp8 in the buckets that would dequantize the weights
+#     before the matmul: the rhs tile requantized to e4m3 with per-column
+#     scales, the lhs rows to e4m3 with per-row scales (`uses_fp8_w8a8`).
+#     Lossy (~6% vs ~0.4% output error at 8k-token chunks, ~1.6x faster).
+#   gmm_scale_lookahead: decode tiles (tile_m <= FP8_DECODE_TILE_M) queue the
+#     rhs scale blocks three deep with lookahead (`_scale_buffering`). Bitwise.
+_fp8_w8a8 = False
+_scale_lookahead = False
+
+
+def set_r10_options(fp8_w8a8: bool = False, scale_lookahead: bool = False) -> None:
+    global _fp8_w8a8, _scale_lookahead
+    _fp8_w8a8 = bool(fp8_w8a8)
+    _scale_lookahead = bool(scale_lookahead)
+
+
 # Define data classes.
 
 
@@ -415,6 +434,39 @@ def fp8_rhs_feed_dtype(
     return None
 
 
+def requantize_fp8_colscale(
+    w: jax.Array,  # fp4 [tile_k, tile_n]
+    block_scale: jax.Array,  # f32 [tile_k // qbs, 1, tile_n]
+    qbs: int,
+    work_dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    """Re-expresses per-K-block scaled fp4 as e4m3 with one scale per column.
+
+    Returns (w8, col_scale [1, tile_n] f32) with w8 * col_scale ~= w * block_scale,
+    so the tile is a single full-depth fp8 matmul scaled once at the end,
+    without the per-block f32 accumulate of the per-block fp8 feed.
+    """
+    fp8 = jnp.float8_e4m3fn
+    w_max = float(jnp.finfo(w.dtype).max)
+    col_max = jnp.max(block_scale, axis=0)  # [1, tile_n]
+    col_scale = col_max * (w_max / float(jnp.finfo(fp8).max))
+    ratio = (block_scale / jnp.where(col_scale == 0, 1.0, col_scale)).astype(
+        work_dtype
+    )
+    num_blocks, tile_n = block_scale.shape[0], w.shape[1]
+    w_blocks = w.astype(work_dtype).reshape(num_blocks, qbs, tile_n) * ratio
+    return w_blocks.reshape(-1, tile_n).astype(fp8), col_scale
+
+
+def quantize_rows_fp8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Per-row e4m3 quantization: returns (x8, row_scale [m, 1] f32)."""
+    fp8 = jnp.float8_e4m3fn
+    amax = jnp.max(jnp.abs(x), axis=1, keepdims=True).astype(jnp.float32)
+    row_scale = amax / float(jnp.finfo(fp8).max)
+    inv = jnp.where(row_scale == 0, 0.0, 1.0 / row_scale).astype(x.dtype)
+    return (x * inv).astype(fp8), row_scale
+
+
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
     tiles: TileSizes
@@ -435,6 +487,22 @@ class GmmConfigs:
         if bucket_m > FP8_RHS_MAX_BUCKET_M:
             return None
         return fp8_rhs_feed_dtype(self.lhs_cfgs, self.rhs_cfgs)
+
+    def uses_fp8_w8a8(self, bucket_m: int) -> bool:
+        """Whether this prefill bucket runs fp8 x fp8 (gmm_fp8_w8a8): rhs
+        requantized per column, lhs per row. Large-m tiles bind on the MXU's
+        lhs stream, which fp8 halves (fp8 rhs alone does not help). Only
+        buckets that would dequantize before the matmul switch (the caller
+        checks that); tile choice is unchanged."""
+        return (
+            _fp8_w8a8
+            and bucket_m > FP8_RHS_MAX_BUCKET_M
+            and self.dims.size_m > FP8_DECODE_MAX_M
+            and fp8_rhs_feed_dtype(self.lhs_cfgs, self.rhs_cfgs) is not None
+            and pltpu.get_tpu_info().is_matmul_supported(
+                jnp.float8_e4m3fn.dtype, jnp.float8_e4m3fn.dtype
+            )
+        )
 
     @property
     def out_size_n(self) -> int:
@@ -495,6 +563,23 @@ class IndexMaps:
         return (pl.ds(row_start, row_size), 0, n_id)
 
 
+def _scale_buffering(tile_m: int) -> pl.Buffered | None:
+    """gmm_scale_lookahead: decode tiles queue the scale blocks ahead of the
+    weight stream.
+
+    A decode step is DMA-bound, and a scale block refetched only one step ahead
+    left the weight stream idle at every grid step: tpu7x, NVFP4 experts with
+    per-128 scales, 10.4 -> 9.5 us per touched expert (9.0 us of pure weight
+    streaming). Prefill tiles are MXU-bound and stay double-buffered. None
+    (key off) keeps the BlockSpec default.
+    """
+    if not _scale_lookahead:
+        return None
+    if tile_m <= FP8_DECODE_TILE_M:
+        return pl.Buffered(buffer_count=3, use_lookahead=True)
+    return pl.Buffered(buffer_count=2)
+
+
 def generate_block_specs(
     metadata_ref: MetadataRef, cfgs: GmmConfigs
 ) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
@@ -520,9 +605,11 @@ def generate_block_specs(
             index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
+        scale_mode = _scale_buffering(cfgs.tiles.tile_m)
         rhs_scale_block_spec = pl.BlockSpec(
             (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
             index_map.rhs_scale_index_map,
+            **({} if scale_mode is None else {"pipeline_mode": scale_mode}),
         )
 
     rhs_block_spec = WeightsRef(
@@ -605,6 +692,21 @@ def inner_kernel(
             and not (bucket_m <= cfgs.rhs_cfgs.hybrid_after_max_rows)
         )
         dequant_after = cfgs.rhs_cfgs.has_scale and not dequant_before
+        col_scale = row_scale = None
+        if dequant_before and cfgs.uses_fp8_w8a8(bucket_m):
+            # gmm_fp8_w8a8: one full-depth fp8 x fp8 matmul per tile, scaled
+            # per column and per row at the end.
+            dequant_before = dequant_after = False
+            tiled_rhs, col_scale = requantize_fp8_colscale(
+                tiled_rhs, tiled_rhs_ref.get_scale(), rhs_qbs, cfgs.lhs_cfgs.dtype
+            )
+            valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
+            if is_last_k_step and valid_k != 0:
+                # Columns past size_k are stale VMEM; keep them out of the amax.
+                col = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1)
+                tiled_lhs = jnp.where(col < valid_k, tiled_lhs, 0)
+            tiled_lhs, row_scale = quantize_rows_fp8(tiled_lhs)
+            rhs_qbs = cfgs.tiles.tile_k
         if fp8_rhs is not None:
             # Skinny m: the MXU weight push binds, and fp8 halves it.
             tiled_rhs = tiled_rhs.astype(fp8_rhs)
@@ -651,6 +753,8 @@ def inner_kernel(
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc
+                if col_scale is not None:
+                    acc_n *= col_scale[:, start_n:end_n] * row_scale
                 acc_list.append(acc_n)
         else:
             # Quantized matmul path.
@@ -1268,8 +1372,12 @@ def gmm_vmem_estimate(
     rhs_bias_vmem = 0
     if rhs_cfgs.has_bias:
         rhs_bias_vmem = tn * 4
+    scale_mode = _scale_buffering(tm)
+    scale_buffers = 2 if scale_mode is None else scale_mode.buffer_count
     rhs_vmem = fuse_act_factor * (
-        rhs_buffer_count * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+        rhs_buffer_count * rhs_weight_vmem
+        + scale_buffers * rhs_scale_vmem
+        + 2 * rhs_bias_vmem
     )
 
     # 3. Accumulator
