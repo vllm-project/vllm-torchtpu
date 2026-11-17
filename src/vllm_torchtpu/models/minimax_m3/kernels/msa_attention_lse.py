@@ -63,7 +63,7 @@ MAX_FREE = True
 # With `MAX_FREE`, `attend_t` takes each token's mask from the QK matmul: the
 # keys carry a column block that is -_MASK_BIAS where a token does not see the
 # key, the queries a one-hot of their token there.
-MXU_MASK = False
+MXU_MASK = True
 _MASK_BIAS = 1e30
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
