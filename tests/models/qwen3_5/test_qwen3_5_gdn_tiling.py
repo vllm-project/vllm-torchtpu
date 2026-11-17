@@ -596,6 +596,35 @@ def test_at_the_tiler_shapes_the_tiler_sizes_the_prefill_chunk(
         )
 
 
+@pytest.mark.parametrize(
+    ("n_kq", "n_v", "num_tokens", "chunk"),
+    [
+        # Batches under 16 tokens at the tiler shapes keep the batch as the
+        # chunk where the solve's triangular block (2 rows at 64 value heads, 4
+        # at 32, 16 at 8) divides it or is longer than it ...
+        (16, 64, 10, 10),
+        (8, 32, 12, 12),
+        (8, 32, 3, 3),
+        (2, 8, 10, 10),
+        # ... and otherwise round it down to whole blocks, where the chunked
+        # solve used to fail to trace.
+        (16, 64, 9, 8),
+        (16, 64, 15, 14),
+        (8, 32, 10, 8),
+        (8, 32, 6, 4),
+    ],
+)
+def test_at_the_tiler_shapes_a_small_chunk_holds_whole_triangular_blocks(
+    monkeypatch, n_kq, n_v, num_tokens, chunk
+):
+    assert (n_kq, n_v, D_K, D_V) in config.TILER_SHAPES
+    for dynamic in (False, True):
+        monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", dynamic)
+        assert _per_seq_chunk(_call_kernels(n_kq, n_v, 1, 1, num_tokens, F32)) == (
+            chunk
+        )
+
+
 def _batched_tile(kernels):
     (tile,) = [
         int(re.search(r"_b(\d+)_", k).group(1))
