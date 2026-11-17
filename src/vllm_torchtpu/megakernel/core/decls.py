@@ -20,8 +20,6 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .ops import FP8, kv_page_shape
-
 if TYPE_CHECKING:
     from .module import Module
 
@@ -90,11 +88,6 @@ class KVCacheDecl:
     kvh: int = 1
     page_size: int = 128
     page_dtype: Any = None
-
-    @property
-    def kv_page_shape(self) -> tuple[int, int, int, int]:
-        dtype = FP8 if self.page_dtype is None else self.page_dtype
-        return kv_page_shape(self.kvh, self.hd, self.page_size, dtype)
 
 
 @dataclass(frozen=True)
