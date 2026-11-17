@@ -118,6 +118,19 @@ def _inspect_step_detail(
     )
 
 
+def _prompt_left(runner: Any) -> bool | None:
+    """Whether a request of the current chunk still has prompt tokens to
+    compute (host arrays only; `None` when the runner can't tell)."""
+    bctx = getattr(runner, "_attn_metadata_builder_ctx", None)
+    batch = getattr(runner, "input_batch", None)
+    start = getattr(bctx, "start_index", None)
+    if batch is None or start is None:
+        return None
+    lo, hi = int(start), int(start) + int(bctx.num_reqs)
+    done = batch.num_computed_tokens_cpu[lo:hi]
+    return bool((done < batch.num_prompt_tokens[lo:hi]).any())
+
+
 def _default_out_rows(b: int, token_paddings: Sequence[int]) -> int:
     return next((p for p in token_paddings if p >= b), max(16, -(-b // 16) * 16))
 
@@ -192,6 +205,7 @@ class StepRouting:
             self._steps,
             num_tokens,
             self._inspect,
+            _prompt_left(runner),
         )
 
     def can_run(
@@ -318,6 +332,9 @@ class StepRouting:
             and callable(getattr(runner, "model", None))
             and not _aux_hidden_layers(self._backbone)
         ):
+            if inputs_embeds is None and getattr(runner, "supports_mm_inputs", False):
+                # A multimodal runner defers embedding to the stock forward.
+                input_ids, inputs_embeds = runner._get_model_inputs(input_ids, None)
             out = runner.model(
                 input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds
             )

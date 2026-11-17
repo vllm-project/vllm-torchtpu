@@ -312,8 +312,11 @@ class ForwardView:
     the row count the stock model would return. `batch_shape(attn_md, m0)`
     is the adapter's host-only batch inspection; the program passes its
     attention and first recurrent layer metadata, used only when the runner
-    can't describe the batch itself. Built once per step by the adapter;
-    programs treat it as read-only.
+    can't describe the batch itself. `prompt_left` says whether a request of
+    the step still has prompt tokens to compute (a 1-token final prefill chunk
+    looks like decode), from the runner's host arrays; `None` when the runner
+    can't tell. Built once per step by the adapter; programs treat it as
+    read-only.
     """
 
     attn_metadata: Mapping[str, Any] | None
@@ -321,6 +324,7 @@ class ForwardView:
     steps: Mapping[tuple[int, int], StepFn]
     num_tokens: int | None
     inspect: Callable[[Any, Any], Any]
+    prompt_left: bool | None = None
 
     def batch_shape(self, attn_md: Any = None, m0: Any = None) -> Any:
         return self.inspect(attn_md, m0)

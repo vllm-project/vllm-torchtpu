@@ -4594,10 +4594,18 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             self._record_input_staging_fence()
-            if self._pp_is_first:
+            if self._pp_is_first and (
+                chunk_mm_inputs is not None
+                or not getattr(self._megakernel, "serving", False)
+            ):
                 input_ids, inputs_embeds = self._get_model_inputs(
                     input_ids, chunk_mm_inputs
                 )
+            elif self._pp_is_first:
+                # A serving megakernel embeds the ids itself: a chunk without
+                # multimodal embeddings is embedded in `forward_model` only if
+                # the stock model serves it.
+                inputs_embeds = None
             else:
                 # Later stages start from the previous stage's hidden
                 # states; the token ids only size the forward.
@@ -9117,6 +9125,14 @@ class TPUModelRunner(GPUModelRunner):
             )
 
         if not hit:
+            if (
+                self._megakernel is not None
+                and inputs_embeds is None
+                and intermediate_tensors is None
+                and self.supports_mm_inputs
+            ):
+                # The embedding deferred for the megakernel, which declined.
+                input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
             # @support_torch_compile annotations will be put on the vLLM model
             # if it supports torch.compile
             kwargs = {}
