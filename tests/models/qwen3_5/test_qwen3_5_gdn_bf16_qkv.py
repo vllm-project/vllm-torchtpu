@@ -34,7 +34,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.models.qwen3_5.kernels.gdn import tiling, wrapper
+from vllm_torchtpu.models.qwen3_5.kernels.gdn import config, tiling, wrapper
 
 N_KQ, N_V, D_K, D_V, KERNEL_SIZE = 1, 2, 128, 128, 4
 DIM = 2 * N_KQ * D_K + N_V * D_V
@@ -196,6 +196,41 @@ def test_mode_2_matches_mode_0_on_verify_windows():
 def test_unknown_modes_are_refused():
     with pytest.raises(ValueError, match="bf16_qkv_mode"):
         wrapper.fused_conv1d_gdn.__wrapped__(**_verify_window_batch(), **_kwargs(1, 4))
+
+
+@pytest.mark.parametrize("qkv_2d", [False, True])
+def test_only_2d_rows_take_the_f32_unpack_scratch(qkv_2d):
+    """The f32 activation scratch holds the unpacked 2D bf16 rows (one 16-row
+    aligned chunk per sequence), so only a 2D tile allocates it, whatever the
+    activation dtype."""
+    cfg = config.GDNConfig(
+        mode=config.GDNMode.PER_SEQ,
+        dtypes=config.Dtypes(
+            act_in=jnp.dtype(jnp.bfloat16),
+            act_out=jnp.dtype(jnp.bfloat16),
+            compute=jnp.dtype(jnp.float32),
+            recurrent_state=jnp.dtype(jnp.float32),
+            conv_state=jnp.dtype(jnp.float32),
+        ),
+        batch_size=64,
+        dim_size=DIM,
+        kernel_size=KERNEL_SIZE,
+        tile_size=24,
+        num_kq_heads=N_KQ,
+        num_v_heads=N_V,
+        kq_head_dim=D_K,
+        v_head_dim=D_V,
+        qkv_2d=qkv_2d,
+    )
+    with use_abstract_mesh(
+        AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    ):
+        scratch = cfg.get_scratch_shape_dict()["act_scratch_ref"]
+    if not qkv_2d:
+        assert scratch is None
+    else:
+        assert scratch.shape == (cfg.seq_tile_size, 32, 1, DIM)
+        assert scratch.dtype == jnp.float32
 
 
 # Qwen3.5-397B GDN heads per rank: (kq heads, v heads) at TP1, TP2 and TP8.

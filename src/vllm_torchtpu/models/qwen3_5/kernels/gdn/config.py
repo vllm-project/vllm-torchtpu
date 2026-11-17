@@ -284,13 +284,13 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        # The f32 rows a 2D bf16 qkv tile unpacks into (wrapper.inner_kernel):
+        # one 16-row aligned chunk per sequence.
         act_scratch = None
-        if self.dtypes.act_in == jnp.bfloat16.dtype:
-            scratch_chunk = (
-                pl.cdiv(self.chunk_size, 16) * 16 if self.qkv_2d else self.chunk_size
-            )
+        if self.qkv_2d:
+            aligned_chunk = pl.cdiv(self.chunk_size, 16) * 16
             act_scratch = pltpu.VMEM(
-                (self.seq_tile_size, scratch_chunk, 1, self.dim_size), jnp.float32
+                (self.seq_tile_size, aligned_chunk, 1, self.dim_size), jnp.float32
             )
 
         return dict(
