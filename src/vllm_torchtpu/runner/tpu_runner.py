@@ -677,6 +677,14 @@ _TOPK_BUFFER_ATTRIBUTE = "topk_indices_buffer"
 _PP_CARRIED_FILL: dict[str, int] = {_TOPK_INDICES: -1}
 
 
+def _uses_hidden_state_drafter(spec: Any) -> bool:
+    """Whether the speculative method drafts from the target's hidden states
+    (eagle/MTP or dflash), on whichever pipeline stage hosts the draft."""
+    if not spec:
+        return False
+    return spec.use_eagle() or spec.method == "dflash"
+
+
 def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     """The one top-k table this process's layers share, or None."""
     found: dict[int, torch.Tensor] = {}
@@ -742,22 +750,13 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     @property
-    def _uses_hidden_state_drafter(self) -> bool:
-        """Whether the speculative method drafts from the target's hidden
-        states (eagle/MTP or dflash), on whichever pipeline stage hosts it."""
-        spec = self.speculative_config
-        if not spec:
-            return False
-        return spec.use_eagle() or spec.method == "dflash"
-
-    @property
     def _is_async_drafter(self) -> bool:
         """Whether this worker runs a hidden-state drafter.
 
         Under a pipeline only the last stage samples, so only it hosts the
         draft; the other stages hand their hidden states on and never draft.
         """
-        return self._uses_hidden_state_drafter and self._pp_is_last
+        return _uses_hidden_state_drafter(self.speculative_config) and self._pp_is_last
 
     @property
     def _fence_spec_kv_under_token_copy(self) -> bool:
@@ -6178,7 +6177,7 @@ class TPUModelRunner(GPUModelRunner):
         leave that stage waiting for stages that never arrive while they block
         in their next collective.
         """
-        if self._uses_hidden_state_drafter:
+        if _uses_hidden_state_drafter(self.speculative_config):
             self._draft_load_barrier()
 
     def _draft_load_barrier(self) -> None:
