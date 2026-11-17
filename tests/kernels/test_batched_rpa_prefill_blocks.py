@@ -96,6 +96,7 @@ def test_table_tiles_clamp_bq_to_tokens():
 
 
 def test_unsafe_tiles_are_refused():
+    # 128,16,1024,1 scored 78.01% on GSM8K at this shape (gate 97%).
     with (
         patch.object(
             wrapper, "_TUNED_PREFILL_TILES", {(32, 2, 256, True): (128, 16, 1024, 1)}

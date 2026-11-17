@@ -591,10 +591,14 @@ def calculate_block_sizes(
 # bkv together, so with many q heads per KV head (32 q / 2 KV heads on a PP=8
 # stage of Qwen3.5-397B) VMEM stops both at 256 and every 256-key block pays a
 # full accumulator rescale. A 1024-key block with a small q sub-chunk fits:
+# 256,32,1024,1 ran the prefill kernel ~20% faster at 87K context (standalone
+# kernel benchmark, TPU7x), and 256,16,1024,1 cut the PP8 prefill engine step
+# a further 4.8% (137.5 -> 130.9 ms) with GSM8K at 97.80%.
 _TUNED_PREFILL_TILES: dict[tuple[int, int, int, bool], tuple[int, int, int, int]] = {
     (32, 2, 256, True): (256, 16, 1024, 1),
 }
 # Tiles that produced wrong outputs at the tuned shape: 128,16,1024,1 scored
+# 78.01% on GSM8K (gate 97%). No table entry may use them.
 _UNSAFE_PREFILL_TILES = frozenset({(128, 16, 1024, 1)})
 
 
