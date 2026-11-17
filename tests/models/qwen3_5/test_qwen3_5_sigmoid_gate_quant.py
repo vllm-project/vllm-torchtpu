@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The fused attention output sigmoid gate + per-token fp8 quantization
-against the eager gate and quantization in the Pallas interpreter on the
-host, and its tiling."""
+against the eager gate and quantization: in the Pallas interpreter on the
+host, its tiling, and compiled on a TPU at the Qwen3.5-397B ``o_proj`` input
+widths and step sizes."""
 
 import jax
 import jax.numpy as jnp
@@ -89,3 +90,44 @@ def test_sigmoid_gate_quant_tile_selection(rows, cols, expected_bm, expected_ste
     # Two bf16 inputs and one fp8 output, double buffered, within 16 MiB.
     assert bm * cols * 10 <= (16 << 20)
 
+
+def _e4m3_steps(got, want):
+    """|got - want| in units of the float8_e4m3fn spacing at that magnitude
+    (2**(e - 3) for normal values in [2**e, 2**(e + 1)), 2**-9 below 2**-6)."""
+    got = np.asarray(got, np.float32)
+    want = np.asarray(want, np.float32)
+    mag = np.maximum(np.abs(got), np.abs(want))
+    spacing = np.where(
+        mag >= 2.0**-6,
+        2.0 ** (np.floor(np.log2(np.maximum(mag, 2.0**-6))) - 3),
+        2.0**-9,
+    )
+    return np.abs(got - want) / spacing
+
+
+@pytest.mark.tpu_test
+# The 397B o_proj input per device: 32 query heads of 256 at TP1 (pipeline-
+# parallel prefill legs), 16 at TP2 and 4 at TP8 (decode legs). 4 rows take
+# the 8-row pad, 96 is a decode step (32-row blocks), 2176 and 8192 prefill
+# steps (128- to 512-row blocks).
+@pytest.mark.parametrize("cols", [1024, 4096, 8192])
+@pytest.mark.parametrize("rows", [4, 96, 2176, 8192])
+def test_compiled_kernel_matches_the_eager_gate_on_tpu(rows, cols):
+    """The Mosaic-compiled kernel at its default tiles against the reference.
+    The TPU may round one scale a bf16 step away from the reference (an f32
+    reduction order), and the fp8 values then move by at most one
+    float8_e4m3fn step."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    rng = np.random.default_rng(rows + cols)
+    a = jnp.asarray(rng.standard_normal((rows, cols)), dtype=jnp.bfloat16)
+    g = jnp.asarray(rng.standard_normal((rows, cols)), dtype=jnp.bfloat16)
+    q, s = jax.block_until_ready(pallas_sigmoid_gate_quant(a, g))
+    q_ref, s_ref = jax.block_until_ready(sigmoid_gate_quant_reference(a, g))
+    assert q.shape == q_ref.shape == (rows, cols)
+    assert q.dtype == q_ref.dtype == jnp.float8_e4m3fn
+    assert s.shape == s_ref.shape == (rows, 1)
+    np.testing.assert_allclose(
+        np.asarray(s, np.float32), np.asarray(s_ref, np.float32), rtol=2.0**-7, atol=0
+    )
+    assert float(_e4m3_steps(q, q_ref).max()) <= 1.0
