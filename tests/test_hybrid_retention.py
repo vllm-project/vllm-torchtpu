@@ -572,7 +572,7 @@ def test_mamba_manager_cache_partial_tail_hook_with_safe_tail_offset():
     assert mamba_mgr._cache_partial_tail_block(req, 2816) is None
 
 
-# ---------------------------------------------------------------- v20: fork
+# ---------------------------------------------------------------- fork
 # candidate and fork key decisions use cache state only, never the request id.
 
 
@@ -714,7 +714,7 @@ class _GuardPool:
 
 
 class _GuardKVM:
-    """KVCacheManager stand-in with v0.31.0's two allocate_slots refusals."""
+    """KVCacheManager stand-in with vLLM 0.33's two allocate_slots refusals."""
 
     def __init__(self, free: int, need: int):
         self.pool = _GuardPool(free)
