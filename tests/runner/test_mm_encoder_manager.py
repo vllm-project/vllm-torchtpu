@@ -60,6 +60,7 @@ def _make_manager(
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=0,
         ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
     return mm.MMEncoderManager(config, torch.device("cpu"), model)
 
