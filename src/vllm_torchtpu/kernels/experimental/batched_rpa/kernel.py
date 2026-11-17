@@ -621,6 +621,10 @@ def rpa_body(
 
     k, v, k_scale, v_scale = get_scale_factors(k, v, cfgs=cfgs)
 
+    # Masked scores get zero softmax weight, and 0 * NaN = NaN in the PV
+    # matmul. With `mask_invalid_v` the loads above zero the V rows past the
+    # lane's KV end; otherwise rows the step did not fetch hold zeros or an
+    # earlier step's KV, because `rpa_kernel` then zeroes the KV buffers.
 
     # Step 3: Perform compute.
     m_val = m_scratch_ref[...]
@@ -927,15 +931,18 @@ def rpa_kernel(
             # l_scratch and acc_scratch. Once l_scratch / acc_scratch becomes NaN,
             # subsequent iterations cannot recover (0 * NaN = NaN).
 
-            # Initialize KV cache to zeros.
-            # When perfomring p * v, we perform causal masking on lhs (p) by zeroing
+            # Initialize KV cache to zeros unless every step masks V.
+            # When performing p * v, we perform causal masking on lhs (p) by zeroing
             # out columns that should not be processed for a given row. Even if we
             # don't perform masking on rows of rhs (v), the output is still correct
-            # since reuslt of multiplication will be zero thanks zero on lhs. However,
-            # this assumption does not hold if a row of rhs has NaNs. To avoid this,
-            # we initiallize scratch memory with non-zero values. Even if the scratch
-            # memory is storing kv cache from previous step, as long as the data is
-            # not NaNs, there will be no numeric concerns.
+            # since the result of the multiplication will be zero thanks to zeros
+            # on lhs. However, this assumption does not hold if a row of rhs has
+            # NaNs. Without `mask_invalid_v` we therefore zero the KV buffers once
+            # per call: a row a step does not fetch then holds zeros or an earlier
+            # step's KV, which is not NaN. With `mask_invalid_v` every step zeroes
+            # the V rows past each lane's KV end as it loads them, and NaNs in
+            # unattended K only reach masked scores, which `jnp.where` replaces,
+            # so the KV buffers (~27 MB of VMEM for decode, a fixed few us per
             # call) are not zeroed.
 
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
@@ -952,8 +959,16 @@ def rpa_kernel(
                     -1, num_lanes
                 # Explicitly zero out scratches and Q/KV buffers.
                 for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+                # Explicitly zero out scratches and the Q buffer, and the KV
+                # buffer when V is not masked on load.
+                zeroed = [scratches[1], scratches[2], q_ref_flat]
+                if not cfgs.serve.mask_invalid_v:
+                    zeroed.append(
                         kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
                             -1, num_lanes
+                        )
+                    )
+                for ref in zeroed:
                     ref[...] = jnp.zeros_like(ref)
 
                 def execute_schedule_chunk(start_step, num_steps):
