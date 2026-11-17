@@ -33,16 +33,11 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 import pytest
 import torch
 
-# Test files that need no chip, by path from the repo root. A session of
-# nothing but these runs with JAX pinned to the CPU.
-HOST_ONLY_TEST_FILES: tuple[str, ...] = (
-    "tests/distributed/test_sharded_jax_op.py",
-    "tests/layers/adapter/test_small_all_reduce_op.py",
-)
-
 
 def _needs_no_chip(item):
-    return str(item.path).endswith(HOST_ONLY_TEST_FILES)
+    """Whether the test declares it runs on the host (``cpu_test``). A session
+    of nothing but such tests runs with JAX pinned to the CPU."""
+    return item.get_closest_marker("cpu_test") is not None
 
 
 def pytest_collection_modifyitems(items):
