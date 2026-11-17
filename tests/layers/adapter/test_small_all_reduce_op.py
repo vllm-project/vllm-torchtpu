@@ -149,6 +149,26 @@ def test_traces_outside_the_backbone_warmup_keep_the_collective(
     rs.assert_not_called()
 
 
+def test_a_forced_region_takes_the_all_reduce_kernel_outside_the_warmup(
+    armed, monkeypatch
+):
+    """The bounded MTP loop graph forces the kernel: any row count, no warmup
+    fork. The combine is never forced, and leaving the region restores the
+    collective."""
+    ar, rs = armed
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    x = _block(2 * op.MAX_ROWS)
+    fallback = Mock(return_value=object())
+    with op.force_small_all_reduce():
+        assert op.all_reduce_or(x, MESH, fallback) is ar.return_value
+        assert op.dp_combine_or(_block(8 * CORES), fallback) is fallback.return_value
+        with op.force_small_all_reduce(enabled=False):
+            assert op.all_reduce_or(x, MESH, fallback) is fallback.return_value
+        assert op.all_reduce_or(x, MESH, fallback) is ar.return_value
+    assert op.all_reduce_or(x, MESH, fallback) is fallback.return_value
+    rs.assert_not_called()
+
+
 def test_combine_needs_the_dp_group_to_be_the_mesh(armed, monkeypatch):
     _, rs = armed
     monkeypatch.setattr(op, "_DP_COMBINE", False)
