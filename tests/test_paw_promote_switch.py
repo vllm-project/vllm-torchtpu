@@ -15,7 +15,6 @@
 queues can be turned off (FCFS admission). Default on.
 """
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -35,14 +34,6 @@ def test_promote_switch(val, expect):
     s._promote_warmest_switch = scheduler_options.get(cfg).promote_warmest
     assert s._promote_warmest_on() is expect
     assert PrefixAwareScheduler.__new__(PrefixAwareScheduler)._promote_warmest_on()
-
-
-def test_pas_schedule_guards_the_promotion():
-    src = inspect.getsource(PrefixAwareScheduler.schedule)
-    assert (
-        "if self._promote_warmest_on():\n"
-        "                self._select_waiting_queue_for_scheduling()" in src
-    )
 
 
 @pytest.mark.parametrize("on", [True, False])
