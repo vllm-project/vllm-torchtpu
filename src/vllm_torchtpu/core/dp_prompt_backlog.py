@@ -36,9 +36,15 @@ With VLLM_TPU_DP_PROMPT_BACKLOG=1:
   own choice unless that engine's pending prompt
   tokens exceed the least backlogged engine's by more than MARGIN times the
   new prompt's length; then it sends the request to the least backlogged
-  engine (ties broken by vLLM's score). The margin covers the worst case: the
-  request may hold its whole prompt in the first engine's cache and computes
-  all of it on the second, and still starts no later.
+  engine (ties broken by fewer waiting plus running requests, then by the
+  lower engine index). With MARGIN >= 1, a moved request has fewer prompt
+  tokens to wait for and compute on its new engine than on vLLM's choice,
+  even in the worst case where vLLM's choice holds its whole prompt in cache
+  and the new engine computes all of it.
+* Only prompt tokens are compared. The choice does not look at free
+  sequence slots: an engine running max_num_seqs requests with no pending
+  prompt tokens still takes a moved request, which then waits there for a
+  slot.
 
 The choice only decides where a request runs; an engine computes the same
 tokens with or without a prefix-cache hit.
