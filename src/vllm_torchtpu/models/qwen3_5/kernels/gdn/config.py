@@ -16,7 +16,9 @@
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
-# Changes from the source: none.
+# Changes from the source:
+# - SHARED_KKT_SHAPES and GDNConfig.shared_kkt, read by
+#   compute_gdn.chunked_gdn_per_seq.
 
 import dataclasses
 import enum

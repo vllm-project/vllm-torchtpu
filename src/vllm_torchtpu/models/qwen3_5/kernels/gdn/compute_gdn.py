@@ -16,7 +16,9 @@
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
-# Changes from the source: none.
+# Changes from the source:
+# - chunked_gdn_per_seq computes (beta k) k^T as diag(beta) (k k^T), one dot
+#   per kq head, at config.SHARED_KKT_SHAPES only.
 
 import jax
 import jax.numpy as jnp

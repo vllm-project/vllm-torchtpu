@@ -117,7 +117,8 @@ def test_shared_kkt_runs_only_at_the_397b_prefill_shape():
     on, _ = _per_seq_cfgs(64, SHARED_N_KQ, SHARED_N_V)
     assert on.shared_kkt
     # Qwen3.5-35B-A3B at TP4 and TP1 (the CI model), and the 397B decode legs'
-    # TP2 and TP8 shapes, where the IX records ran main's (beta k) k^T.
+    # TP2 and TP8 shapes, where the 397B decode configurations ran main's
+    # (beta k) k^T.
     for n_kq, n_v in ((4, 8), (16, 32), (8, 32), (2, 8)):
         off, _ = _per_seq_cfgs(64, n_kq, n_v)
         assert not off.shared_kkt, (n_kq, n_v)
