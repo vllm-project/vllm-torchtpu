@@ -233,9 +233,45 @@ def resolve_block_major_pool_layout(
     )
 
 
+class DeviceKVCacheAllocator:
+    """Creates zero-filled KV cache arrays directly on the device.
+
+    No array is filled on the host and copied over: a host tensor staged
+    through `.to()` costs about twice the cache size in host RAM per worker,
+    and for a large cache the host fill and copy are nearly all of the
+    allocation time. torch_tpu defers the device zero fill until first use,
+    so call `synchronize` once after the last allocation, before a compiled
+    program receives the arrays: PJRT donates only buffers with no pending
+    write.
+
+    The zero fill is part of the contract. Kernels load cache slots that no
+    token has written yet, and some need them to be finite: paths in the MLA
+    kernels (`kernels/mla/v2`, `kernels/deepseek_v4`) mask only the scores
+    of invalid entries, and 0 * NaN is NaN. Fresh device memory can hold any
+    bits, while zero bits are finite in every cache dtype. FP8 arrays are
+    zero-filled too: the MLA kernels read FP8 caches, and an FP8 byte can
+    encode NaN.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.arrays: list[torch.Tensor] = []
+
+    def allocate(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """Returns a new zero-filled array that `synchronize` covers."""
+        array = torch.zeros(shape, dtype=dtype, device=self.device)
+        self.arrays.append(array)
+        return array
+
+    def synchronize(self) -> None:
+        """Waits for the zero fill of every array allocated so far."""
+        if self.arrays:
+            synchronize_tensors(self.arrays)
+
+
 def allocate_raw_kv_cache_tensors(
     kv_cache_config: KVCacheConfig,
-    device: torch.device,
+    allocator: DeviceKVCacheAllocator,
     pool_geometry: tuple[AttentionSpec, Any, int],
     cache_dtype: str | torch.dtype = "auto",
     block_major: bool = False,
@@ -294,49 +330,11 @@ def allocate_raw_kv_cache_tensors(
         shapes = [(num_blocks, num_pools * split) + page_shape]
     else:
         shapes = [region_shape] * num_pools
-    # Zero-filled in every dtype, FP8 included, like the arrays from
-    # `DeviceKVCacheAllocator`.
     for shape in shapes:
-        raw_tensors.append(torch.zeros(shape, dtype=spec.dtype, device=device))
+        raw_tensors.append(allocator.allocate(shape, spec.dtype))
     for layer_name, pool_index in pool_indices.items():
         layer_to_raw[layer_name] = raw_tensors[0 if block_major else pool_index]
     return layer_to_raw, raw_tensors, layout
-
-
-class DeviceKVCacheAllocator:
-    """Creates zero-filled KV cache arrays directly on the device.
-
-    No array is filled on the host and copied over: a host tensor staged
-    through `.to()` costs about twice the cache size in host RAM per worker,
-    and for a large cache the host fill and copy are nearly all of the
-    allocation time. torch_tpu defers the device zero fill until first use,
-    so call `synchronize` once after the last allocation, before a compiled
-    program receives the arrays: PJRT donates only buffers with no pending
-    write.
-
-    The zero fill is part of the contract. Kernels load cache slots that no
-    token has written yet, and some need them to be finite: paths in the MLA
-    kernels (`kernels/mla/v2`, `kernels/deepseek_v4`) mask only the scores
-    of invalid entries, and 0 * NaN is NaN. Fresh device memory can hold any
-    bits, while zero bits are finite in every cache dtype. FP8 arrays are
-    zero-filled too: the MLA kernels read FP8 caches, and an FP8 byte can
-    encode NaN.
-    """
-
-    def __init__(self, device: torch.device) -> None:
-        self.device = device
-        self.arrays: list[torch.Tensor] = []
-
-    def allocate(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        """Returns a new zero-filled array that `synchronize` covers."""
-        array = torch.zeros(shape, dtype=dtype, device=self.device)
-        self.arrays.append(array)
-        return array
-
-    def synchronize(self) -> None:
-        """Waits for the zero fill of every array allocated so far."""
-        if self.arrays:
-            synchronize_tensors(self.arrays)
 
 
 def make_attention_cache_tensor(
@@ -346,7 +344,7 @@ def make_attention_cache_tensor(
     num_blocks: int,
     kernel_block_size: int,
     cache_dtype: str | torch.dtype,
-    device: torch.device,
+    allocator: DeviceKVCacheAllocator,
 ) -> torch.Tensor:
     num_blocks_per_kv_block = spec.block_size // kernel_block_size
     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
@@ -357,7 +355,7 @@ def make_attention_cache_tensor(
         spec.head_size,
         cache_dtype_str=cache_dtype,
     )
-    return torch.zeros(shape, dtype=spec.dtype, device=device)
+    return allocator.allocate(tuple(shape), spec.dtype)
 
 
 def can_share_attention_cache(
@@ -498,10 +496,13 @@ def materialize_kv_cache_tensors(
     kv_cache_config: KVCacheConfig,
     attn_groups: Sequence[Sequence[AttentionGroup]],
     kernel_block_sizes: Sequence[int],
-    device: torch.device,
+    allocator: DeviceKVCacheAllocator,
     cache_dtype: str | torch.dtype,
     block_major: bool = False,
 ) -> MaterializedKVCache:
+    """Allocates every cache array through `allocator`, direct attention
+    caches and unified pools alike; the caller synchronizes it once all
+    caches exist."""
     kernel_block_size_by_gid = build_kernel_block_size_by_group_id(
         kv_cache_config=kv_cache_config,
         kernel_block_sizes=kernel_block_sizes,
@@ -556,7 +557,7 @@ def materialize_kv_cache_tensors(
                             num_blocks=num_blocks,
                             kernel_block_size=kernel_block_size,
                             cache_dtype=cache_dtype,
-                            device=device,
+                            allocator=allocator,
                         )
                     kv_caches[layer_name] = region_caches[region]
         return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=[])
@@ -568,7 +569,7 @@ def materialize_kv_cache_tensors(
         raise ValueError("unified hybrid KV layout requires an attention pool")
     layer_to_raw, raw_tensors, layout = allocate_raw_kv_cache_tensors(
         kv_cache_config,
-        device,
+        allocator,
         pool_geometry=pool_geometry,
         cache_dtype=cache_dtype,
         block_major=block_major,

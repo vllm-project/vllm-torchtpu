@@ -43,6 +43,7 @@ from vllm_torchtpu.block_major_pool import (
 )
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
+    DeviceKVCacheAllocator,
     layer_to_pool_index,
     materialize_kv_cache_tensors,
     resolve_block_major_pool_layout,
@@ -359,7 +360,7 @@ def test_block_major_materializes_one_merged_pool(make):
         kv_cache_config=cfg,
         attn_groups=_attn_groups(cfg),
         kernel_block_sizes=[kernel_block] * 4,
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="auto",
         block_major=True,
     )
@@ -398,7 +399,7 @@ def test_registration_view_leads_with_the_allocation_dim():
         kv_cache_config=cfg,
         attn_groups=_attn_groups(cfg),
         kernel_block_sizes=[kernel_block] * 4,
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="auto",
         block_major=True,
     )
@@ -421,7 +422,7 @@ def test_layer_major_materialization_unchanged():
         kv_cache_config=cfg,
         attn_groups=_attn_groups(cfg),
         kernel_block_sizes=[BLOCK] * 4,
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="auto",
     )
     assert out.bm_pool_layout is None
@@ -465,7 +466,7 @@ def test_block_major_manifest_keeps_the_layer_major_regions(make):
         kv_cache_config=cfg,
         attn_groups=_attn_groups(cfg),
         kernel_block_sizes=[kernel_block] * 4,
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="auto",
     )
     lm = _manifest(materialize_kv_cache_tensors(**kwargs))
@@ -624,7 +625,7 @@ def test_register_kv_caches_canonicalizes_the_merged_pool():
         kv_cache_config=cfg,
         attn_groups=_attn_groups(cfg),
         kernel_block_sizes=[BLOCK // 2] * 4,
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="auto",
         block_major=True,
     )

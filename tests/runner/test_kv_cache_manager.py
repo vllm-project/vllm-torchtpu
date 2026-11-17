@@ -175,10 +175,11 @@ def _initialize_kv_cache(runner, kv_cache_config, forward_context=None):
 
 
 def _cache_arrays(caches):
-    """The distinct arrays behind `caches`; some layers bind a tuple of them."""
+    """The distinct arrays behind `caches`; some layers bind a tuple or a list
+    of them."""
     arrays = {}
     for cache in caches.values():
-        for array in cache if isinstance(cache, tuple) else (cache,):
+        for array in cache if isinstance(cache, (tuple, list)) else (cache,):
             arrays[id(array)] = array
     return list(arrays.values())
 
@@ -243,6 +244,39 @@ def _mamba_config(vllm_config):
     ]
     return get_kv_cache_config_from_groups(
         vllm_config, groups, 4 * mamba.page_size_bytes
+    )
+
+
+def _unified_hybrid_config(vllm_config):
+    """An attention layer and a Mamba layer in one unified pool."""
+    attention = PallasAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+        )
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((4, 128),),
+        dtypes=(torch.bfloat16,),
+        page_size_padded=attention.page_size_bytes,
+    )
+    num_blocks = 4
+    pool_bytes = num_blocks * attention.page_size_bytes
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=pool_bytes,
+                layers=[name],
+                layer_stride=pool_bytes,
+                block_stride=attention.page_size_bytes,
+            )
+            for name in ["attn.0", "mamba.0"]
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attention),
+            KVCacheGroupSpec(layer_names=["mamba.0"], kv_cache_spec=mamba),
+        ],
     )
 
 
@@ -467,6 +501,26 @@ def test_initialize_kv_cache_synchronizes_deepseek_v4_arrays(
     synchronized = synchronize_mock.call_args.args[0]
     assert sorted(map(id, synchronized)) == sorted(map(id, _cache_arrays(caches)))
     assert len(synchronized) == 2
+
+
+@pytest.mark.parametrize("make_config", [_attention_config, _unified_hybrid_config])
+def test_initialize_unified_kv_cache_synchronizes_new_caches_once_before_binding(
+    meta_runner, synchronize_mock, make_config
+):
+    """The unified layout allocates through the same allocator: every new
+    array, a direct attention cache as well as a pool, is created on the
+    device and synchronized once, before binding."""
+    meta_runner._unified_kv_layout = True
+    meta_runner._resolve_tpu_group_backend.return_value = PallasAttentionBackend
+    meta_runner.kv_cache_dtype = torch.bfloat16
+    synchronize_mock.side_effect = _assert_not_bound_yet
+
+    caches = _initialize_kv_cache(meta_runner, make_config(meta_runner.vllm_config))
+
+    synchronize_mock.assert_called_once()
+    synchronized = synchronize_mock.call_args.args[0]
+    assert sorted(map(id, synchronized)) == sorted(map(id, _cache_arrays(caches)))
+    assert {array.device.type for array in synchronized} == {"meta"}
 
 
 @pytest.mark.tpu_test

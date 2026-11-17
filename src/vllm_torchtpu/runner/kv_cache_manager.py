@@ -1350,11 +1350,13 @@ class KVCacheManager:
         block_major = unified_block_major_enabled(self.runner.vllm_config)
         if block_major:
             self._check_block_major_pool_supported()
+        # Every cache is zero-filled on the device and flushed once, below.
+        allocator = DeviceKVCacheAllocator(self.runner.device)
         materialized = materialize_kv_cache_tensors(
             kv_cache_config=kv_cache_config,
             attn_groups=self.runner.attn_groups,
             kernel_block_sizes=kernel_block_sizes,
-            device=self.runner.device,
+            allocator=allocator,
             cache_dtype=self.runner.kv_cache_dtype,
             block_major=block_major,
         )
@@ -1380,13 +1382,13 @@ class KVCacheManager:
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
         if self.runner._unified_kv_layout:
-            # Flush the pool zero-fill before any compiled execution. PJRT
+            # Flush the zero fill of every cache above, pools and direct
+            # attention caches alike, before any compiled execution. PJRT
             # only donates quiescent buffers: a pending write at enqueue time
             # makes every donated pool parameter fall back to a fresh
             # pool-sized output copy (a 2x-pool transient that OOMs at high
             # gpu_memory_utilization).
-            if self.runner.kv_cache_raw_tensors:
-                synchronize_tensors(self.runner.kv_cache_raw_tensors)
+            allocator.synchronize()
             # Same rule for the seed-copy program: compile it while the pools
             # are quiescent, before any dummy forward leaves writes pending.
             self.runner._precompile_mamba_state_seed_copies()
