@@ -2646,10 +2646,14 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             self.tier_plan = self._build_tier_plan(
                 config, vllm_config, int(cpu_bytes_to_use)
             )
-        elif envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS or envs.VLLM_TPU_OFFLOAD_TIER_CHECK:
+        elif (
+            envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS
+            or envs.VLLM_TPU_OFFLOAD_TIER_CHECK
+            or envs.VLLM_TPU_OFFLOAD_FP4
+        ):
             raise ValueError(
-                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_KEY_ROWS and "
-                "VLLM_TPU_OFFLOAD_TIER_CHECK are modes of the host tier classes and "
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_KEY_ROWS, "
+                "VLLM_TPU_OFFLOAD_TIER_CHECK and VLLM_TPU_OFFLOAD_FP4 are modes of the host tier classes and "
                 "need VLLM_TPU_OFFLOAD_TIER_CLASSES=1"
             )
 
@@ -2686,6 +2690,16 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             refused.append(
                 f"model {vllm_config.model_config.architecture!r} (Qwen4Exp only)"
             )
+        if envs.VLLM_TPU_OFFLOAD_FP4:
+            from vllm_torchtpu.offload import victim as _victim
+
+            if _victim.host_tier_policy() != "victim":
+                refused.append(
+                    "VLLM_TPU_OFFLOAD_FP4 without the victim policy "
+                    "(QWEN4_EXP_HOST_TIER_POLICY=victim)"
+                )
+            if envs.VLLM_TPU_OFFLOAD_TIER_CHECK:
+                refused.append("VLLM_TPU_OFFLOAD_FP4 with VLLM_TPU_OFFLOAD_TIER_CHECK (lossy)")
         if refused:
             raise ValueError(
                 "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_CLASSES serves "
@@ -2701,6 +2715,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         key_row_bytes = None
         if envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS:
             key_row_bytes = self._compressed_key_live_bytes(vllm_config)
+        main_row_bytes = None
+        if envs.VLLM_TPU_OFFLOAD_FP4:
+            from vllm_torchtpu.offload.fp4 import fp4_page_bytes
+
+            page = worker_configs[0].kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            main_row_bytes = fp4_page_bytes(page)
         plan = build_tier_plan(
             worker_configs,
             [group.group_id for group in config.groups],
@@ -2708,6 +2728,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             budget,
             envs.VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO,
             key_row_bytes=key_row_bytes,
+            main_row_bytes=main_row_bytes,
         )
         check_served_plan(plan)
         refuse_ephemeral_ports(
@@ -2790,7 +2811,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             )
         if check is None:
             check = envs.VLLM_TPU_OFFLOAD_TIER_CHECK
-        return TieredOffloadingManager(plan, managers, check=check)
+        return TieredOffloadingManager(
+            plan,
+            managers,
+            check=check,
+            fp4_slots=envs.VLLM_TPU_OFFLOAD_FP4_SLOTS if envs.VLLM_TPU_OFFLOAD_FP4 else None,
+        )
 
     def _tier_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         """A class worker for every class this worker has regions for."""
@@ -2829,17 +2855,39 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 f"which no recorded worker config plans ({tier_class.worker_regions})"
             )
             port = self.tier_controller_port(tier_class)
+            class_caches = class_kv_caches(kv_caches, indices)
+            row_bytes = tier_class.row_bytes if tier_class.rows_per_page > 1 else None
+            if envs.VLLM_TPU_OFFLOAD_FP4 and tier_class.kind == "main":
+                # VLLM_TPU_OFFLOAD_FP4: the main class registers the transcoder's
+                # staging buffers (one a region, rows of one FP4 page), not the pool.
+                import torch
+                from vllm.v1.kv_offload.base import CanonicalKVCacheTensor
+
+                from vllm_torchtpu.offload.fp4 import transcoder
+
+                t = transcoder()
+                assert t is not None, "VLLM_TPU_OFFLOAD_FP4: no transcoder registered"
+                assert sorted(t.staging) == list(indices), (sorted(t.staging), indices)
+                row_bytes = tier_class.row_bytes
+                class_caches = CanonicalKVCaches(
+                    tensors=[
+                        CanonicalKVCacheTensor(
+                            tensor=t.staging[r].view(torch.int8).view(t.slots, row_bytes),
+                            page_size_bytes=row_bytes,
+                        )
+                        for r in indices
+                    ],
+                    group_data_refs=class_caches.group_data_refs,
+                )
             workers[tier_class.name] = RaidenStoreOffloadingWorker(
-                class_kv_caches(kv_caches, indices),
+                class_caches,
                 vllm_config=self.vllm_config,
                 kv_cache_config=self.kv_cache_config,
                 host_blocks_to_allocate=plan.capacity(tier_class)
                 * self.device_block_size_factor,
                 controller_address=f"{self.store_server_ip or '127.0.0.1'}:{port}",
                 rank=rank,
-                row_bytes=(
-                    tier_class.row_bytes if tier_class.rows_per_page > 1 else None
-                ),
+                row_bytes=row_bytes,
                 label=tier_class.name,
             )
         logger.info(

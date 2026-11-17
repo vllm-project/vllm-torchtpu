@@ -321,6 +321,8 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO: float = 4.7
     VLLM_TPU_OFFLOAD_TIER_KEY_ROWS: bool = False
     VLLM_TPU_OFFLOAD_TIER_CHECK: bool = False
+    VLLM_TPU_OFFLOAD_FP4: bool = False
+    VLLM_TPU_OFFLOAD_FP4_SLOTS: int = 256
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
@@ -2203,6 +2205,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_OFFLOAD_TIER_CHECK": env_bool(
         "VLLM_TPU_OFFLOAD_TIER_CHECK", default=False
     ),
+    # With the tier classes and the victim policy: the main-KV class keeps FP4 (MXFP4:
+    # e2m1 values, one power-of-two scale per 32) on the host instead of the FP8 pool
+    # bytes. Each worker quantizes a victim block into an HBM staging slot before
+    # the step's forward and Raiden saves the slot; a load lands in a slot and is
+    # dequantized into the pool block before the request runs (offload/fp4.py).
+    # Lossy. Host-only.
+    "VLLM_TPU_OFFLOAD_FP4": env_bool("VLLM_TPU_OFFLOAD_FP4", default=False),
+    # HBM staging slots per main-KV region for VLLM_TPU_OFFLOAD_FP4 (one FP4 page each).
+    "VLLM_TPU_OFFLOAD_FP4_SLOTS": env_int("VLLM_TPU_OFFLOAD_FP4_SLOTS", 256),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(

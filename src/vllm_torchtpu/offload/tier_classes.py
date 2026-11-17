@@ -76,6 +76,7 @@ from vllm.v1.kv_offload.base import (
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload import raiden_store
+from vllm_torchtpu.offload.fp4 import SlotPool
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     FinishedJob,
@@ -180,6 +181,7 @@ def build_tier_plan(
     budget: int,
     ratio: float,
     key_row_bytes: int | None = None,
+    main_row_bytes: int | None = None,
 ) -> TierPlan:
     """Splits the offloaded groups into classes and sizes them.
 
@@ -188,6 +190,9 @@ def build_tier_plan(
     ``group_kind(spec, layer_names)`` names what a group holds. ``key_row_bytes``, when
     set, is the live bytes of a compressed-key page: the ``keys`` class then keeps that
     many bytes a region instead of the page.
+    ``main_row_bytes``, when set (VLLM_TPU_OFFLOAD_FP4), is the host bytes of one main-KV
+    page in MXFP4: the ``main`` class keeps that many bytes a region (registered as rows
+    of the workers' staging buffers, not of the pool).
     """
     if not worker_configs:
         raise ValueError("host tier classes: no per-worker KV cache configs recorded")
@@ -241,6 +246,13 @@ def build_tier_plan(
                     f"do not tile a {page} B page"
                 )
             row_bytes, rows_per_page = key_row_bytes, page // key_row_bytes
+        if kind == "main" and main_row_bytes is not None:
+            if main_row_bytes <= 0 or main_row_bytes >= page:
+                raise ValueError(
+                    f"host tier classes: FP4 main-KV rows of {main_row_bytes} B for a "
+                    f"{page} B page"
+                )
+            row_bytes, rows_per_page = main_row_bytes, 1
         classes.append(
             TierClass(
                 name=name,
@@ -316,8 +328,26 @@ class TieredOffloadingManager(OffloadingManager):
         plan: TierPlan,
         managers: Sequence[RaidenOffloadingManager],
         check: bool = False,
+        fp4_slots: int | None = None,
     ):
         assert len(managers) == len(plan.classes)
+        # VLLM_TPU_OFFLOAD_FP4 (offload/fp4.py): the main class's device rows are
+        # the workers' staging slots, not pool blocks. A store or load job binds a
+        # slot to each of its main-class keys; store slots are freed when the child
+        # ends, load slots once every worker has dequantized them.
+        self._fp4_class: int | None = None
+        self._fp4: SlotPool | None = None
+        if fp4_slots:
+            mains = [c.index for c in plan.classes if c.kind == "main"]
+            assert len(mains) == 1, [c.name for c in plan.classes]
+            self._fp4_class = mains[0]
+            self._fp4 = SlotPool(fp4_slots)
+        self._fp4_bound: dict[int, dict[OffloadKey, int]] = {}
+        self._fp4_dequant: list[tuple[int, int]] = []
+        self._fp4_release: list[int] = []
+        self.fp4_counts: dict[str, int] = dict.fromkeys(
+            ("store_keys", "load_keys", "store_no_slot", "load_no_slot", "dequant_keys"), 0
+        )
         self._plan = plan
         self._classes = plan.classes
         self._managers = list(managers)
@@ -341,6 +371,45 @@ class TieredOffloadingManager(OffloadingManager):
     @property
     def managers(self) -> list[RaidenOffloadingManager]:
         return self._managers
+
+    # -- FP4 main class (VLLM_TPU_OFFLOAD_FP4) ------------------------------------
+
+    @property
+    def fp4_class(self) -> int | None:
+        return self._fp4_class
+
+    @property
+    def fp4_free_slots(self) -> int:
+        return 0 if self._fp4 is None else self._fp4.free
+
+    def fp4_bind_store(self, job_id: int, keys: Sequence[OffloadKey]) -> list[int] | None:
+        """Slots for a main-class store job's keys (None: not enough free)."""
+        assert self._fp4 is not None
+        slots = self._fp4.take(len(keys))
+        if slots is None:
+            self.fp4_counts["store_no_slot"] += len(keys)
+            return None
+        self._fp4_bound[job_id] = dict(zip(keys, slots))
+        self.fp4_counts["store_keys"] += len(keys)
+        return slots
+
+    def fp4_unbind(self, job_id: int) -> None:
+        """Frees a job's slots (a store that will never be submitted)."""
+        bound = self._fp4_bound.pop(job_id, None)
+        if bound and self._fp4 is not None:
+            self._fp4.give(list(bound.values()))
+
+    def fp4_give(self, slots: Sequence[int]) -> None:
+        if slots and self._fp4 is not None:
+            self._fp4.give(slots)
+
+    def take_fp4_dequant(self) -> tuple[list[tuple[int, int]], list[int]]:
+        """``(slot, pool block)`` pairs of the loads that finished since the last call,
+        and their slots, to free once every worker has dequantized them."""
+        pairs, slots = self._fp4_dequant, self._fp4_release
+        self._fp4_dequant, self._fp4_release = [], []
+        self.fp4_counts["dequant_keys"] += len(pairs)
+        return pairs, slots
 
     # -- routing ------------------------------------------------------------
 
@@ -514,6 +583,10 @@ class TieredOffloadingManager(OffloadingManager):
             ),
         )
         for c, (ks, ids) in parts.items():
+            if c == self._fp4_class:
+                # The main class saves the staging slots its keys were quantized into.
+                bound = self._fp4_bound[job_id]
+                ids = [bound[k] for k in ks]
             self._managers[c].submit_store_job(job_id, ks, ids)
 
     def submit_load_job(
@@ -555,6 +628,27 @@ class TieredOffloadingManager(OffloadingManager):
         # each owns the pins its prepare took and finalizes them itself.
         for c, (ks, ids) in parts.items():
             self._load_keys[c] += len(ks)
+            if c == self._fp4_class and self._fp4 is not None:
+                # The main class lands in staging slots; dequantized into ``ids``
+                # once the whole job has finished (take_fp4_dequant).
+                slots = self._fp4.take(len(ks))
+                if slots is None:
+                    self.fp4_counts["load_no_slot"] += len(ks)
+                    self._managers[c].unwind_prepared_load(RaidenLoadStoreSpec(ks))
+                    self._child_finished(
+                        c,
+                        FinishedJob(
+                            job_id=job_id,
+                            op=AdmissionOp.LOAD,
+                            success=False,
+                            req_id=req_id,
+                            failed_device_block_ids=list(ids),
+                        ),
+                    )
+                    continue
+                self._fp4_bound[job_id] = dict(zip(ks, slots))
+                self.fp4_counts["load_keys"] += len(ks)
+                ids = slots
             self._managers[c].submit_load_job(job_id, ks, ids, req_id, pinned=True)
 
     def on_store_job_cancelled(self, keys: list[OffloadKey]) -> None:
@@ -577,6 +671,12 @@ class TieredOffloadingManager(OffloadingManager):
         parent.waiting.discard(c)
         if not finished.success:
             parent.failed = True
+        if c == self._fp4_class and (
+            parent.op == AdmissionOp.STORE or not finished.success
+        ):
+            # A store child has read its slots (or failed); a failed load child
+            # left nothing to dequantize.
+            self.fp4_unbind(finished.job_id)
         if self._check is not None and finished.stored_keys:
             # Saved by this child, whatever its siblings do: a later load
             # can restore them.
@@ -588,6 +688,14 @@ class TieredOffloadingManager(OffloadingManager):
         if parent.waiting:
             return
         del self._parents[finished.job_id]
+        bound = self._fp4_bound.pop(finished.job_id, None)
+        if bound:
+            if parent.op == AdmissionOp.LOAD and not parent.failed:
+                block_of = dict(zip(parent.keys, parent.device_block_ids))
+                self._fp4_dequant.extend((s, block_of[k]) for k, s in bound.items())
+                self._fp4_release.extend(bound.values())
+            elif self._fp4 is not None:
+                self._fp4.give(list(bound.values()))
         if (
             self._check is not None
             and parent.op == AdmissionOp.LOAD

@@ -459,6 +459,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO",
     "VLLM_TPU_OFFLOAD_TIER_CHECK",
     "VLLM_TPU_OFFLOAD_TIER_KEY_ROWS",
+    "VLLM_TPU_OFFLOAD_FP4",
+    "VLLM_TPU_OFFLOAD_FP4_SLOTS",
     # Scheduler prefix-cache hit length only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     # Scheduler prefix-cache block lifetime only.

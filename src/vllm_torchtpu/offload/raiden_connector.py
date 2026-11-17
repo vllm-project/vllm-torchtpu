@@ -165,6 +165,12 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     # saved and of keys restored, for every worker to hash before the forward.
     tier_check_stores: list[tuple[str, bytes, int]] = field(default_factory=list)
     tier_check_loads: list[tuple[str, bytes, int]] = field(default_factory=list)
+    # VLLM_TPU_OFFLOAD_FP4 (offload/fp4.py): (pool block, staging slot) to quantize and
+    # (staging slot, pool block) to dequantize at start_load_kv, before the forward;
+    # every worker acknowledges fp4_token once both have retired.
+    fp4_quant: list[tuple[int, int]] = field(default_factory=list)
+    fp4_dequant: list[tuple[int, int]] = field(default_factory=list)
+    fp4_token: int = -1
 
 
 @dataclass
@@ -175,6 +181,8 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
     fenced_jobs: dict[int, int] = field(default_factory=dict)
     # Tier check mode: per class, counts in tier_check.CHECK_FIELDS order.
     tier_check: dict[str, list[int]] = field(default_factory=dict)
+    # VLLM_TPU_OFFLOAD_FP4: fp4_token -> ranks whose transcode for it has retired.
+    fp4_done: dict[int, int] = field(default_factory=dict)
 
     def aggregate(self, other):
         assert isinstance(other, RaidenOffloadingWorkerMetadata)
@@ -188,6 +196,9 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         for name, v in other.tier_check.items():
             mine = merged_check.setdefault(name, [0] * len(v))
             merged_check[name] = [a + b for a, b in zip(mine, v)]
+        merged_fp4 = dict(self.fp4_done)
+        for token, v in other.fp4_done.items():
+            merged_fp4[token] = merged_fp4.get(token, 0) + v
         # completed_jobs and transfer_stats are inherited from vLLM base dataclass.
         return RaidenOffloadingWorkerMetadata(
             # pyrefly: ignore[unexpected-keyword]
@@ -196,6 +207,7 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
             fenced_jobs=merged_fenced,
             tier_check=merged_check,
+            fp4_done=merged_fp4,
         )
 
 
@@ -309,6 +321,44 @@ def _planned_region_storages(
     return {r: by_region[r] for r in sorted(by_region)}, group_regions
 
 
+def _build_fp4_transcoder(kv_cache_config, pool_storages, group_regions, num_blocks):
+    """VLLM_TPU_OFFLOAD_FP4: this worker's main-KV regions (the groups the plan calls
+    ``main``) as uint8 views ``[num_blocks, rows, 4, 256]``, the pool's own row
+    shape, with one staging buffer each; registered for raiden_store._tier_worker."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.offload import tier_group_kind
+    from vllm_torchtpu.offload import fp4
+
+    regions: set[int] = set()
+    for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+        if tier_group_kind(group.kv_cache_spec, list(group.layer_names)) == "main":
+            regions.update(group_regions[gid])
+    pools: dict[int, torch.Tensor] = {}
+    page = None
+    for r in sorted(regions):
+        storage, device = pool_storages[r]
+        page = storage.nbytes() // num_blocks
+        rows = fp4.page_rows(page)
+        pools[r] = (
+            torch.empty(0, dtype=torch.uint8, device=device)
+            .set_(storage)
+            .view(num_blocks, rows, fp4.ROW_SLOTS, fp4.ROW_LANES)
+        )
+    if page is None:
+        page = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    t = fp4.Fp4Transcoder(pools, page, tpu_envs.VLLM_TPU_OFFLOAD_FP4_SLOTS)
+    fp4.set_transcoder(t)
+    logger.info(
+        "offload fp4: main-KV regions %s, %d staging slots each (%.2f GB), FP4 page %d B "
+        "of a %d B page",
+        sorted(regions),
+        t.slots,
+        t.staging_bytes / 1e9,
+        fp4.fp4_page_bytes(page),
+        page,
+    )
+    return t
+
+
 def _build_tier_check(connector_worker, kv_caches, group_regions) -> TierCheck:
     """The worker's check: per class, the raw region tensors it registers here (the
     tensors the model allocated, ``[num_blocks, *page]``, not reinterpreted views)."""
@@ -400,6 +450,23 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         if victim.host_tier_policy() == "victim":
             self._enable_victim_policy(spec, vllm_config)
+        # VLLM_TPU_OFFLOAD_FP4 (offload/fp4.py): per step a token; the step's victim
+        # main-class stores (saved once every worker acknowledged their quantize) and
+        # the slots its dequantizes free.
+        self._fp4 = bool(tpu_envs.VLLM_TPU_OFFLOAD_FP4) and isinstance(
+            self.manager, TieredOffloadingManager
+        )
+        self._fp4_token = 0
+        self._fp4_pending: dict[int, dict] = {}
+        self._fp4_victim_jobs: set[int] = set()
+        self._fp4_step_quant: list[tuple[int, int]] = []
+        self._fp4_step_victims: list[tuple[int, list[OffloadKey], list[int]]] = []
+        # Pool blocks with a quantize not yet acknowledged by every worker. A load
+        # into one of them waits (the load's DMA is not ordered with the stream and
+        # would land before the quantize reads the victim's main KV; the classes
+        # share pool regions).
+        self._fp4_busy: Counter[int] = Counter()
+        self._fp4_deferred_loads: list[tuple] = []
 
     def host_resident_tokens(self, request: Request, num_local_tokens: int) -> int:
         """Prompt tokens past ``num_local_tokens`` that every offloaded group
@@ -502,6 +569,24 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             source = dict(keep)
             keys = manager.prepare_victim_store([k for k, _ in keep])
             tel["victim_resident"] = tel.get("victim_resident", 0) + len(keep) - len(keys)
+            if keys and self.__dict__.get("_fp4", False):
+                # The main class goes through staging: quantized by the workers at
+                # this step's start_load_kv (before the new owners' forward), saved
+                # from the slots once acknowledged; no drain for it.
+                fc = manager.fp4_class
+                main = [k for k in keys if manager.class_of(k) == fc]
+                keys = [k for k in keys if manager.class_of(k) != fc]
+                if main:
+                    job4 = self._generate_job_id()
+                    blocks4 = [source[k] for k in main]
+                    slots = manager.fp4_bind_store(job4, main)
+                    if slots is None:
+                        manager.on_store_job_cancelled(main)
+                        tel["fp4_victim_no_slot"] = tel.get("fp4_victim_no_slot", 0) + len(main)
+                    else:
+                        self._fp4_step_quant.extend(zip(blocks4, slots))
+                        self._fp4_step_victims.append((job4, main, blocks4))
+                        tel["fp4_victim_keys"] = tel.get("fp4_victim_keys", 0) + len(main)
             if keys:
                 job_id = self._generate_job_id()
                 t0 = time.perf_counter()
@@ -563,6 +648,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         manager = self.__dict__.get("_raiden_manager")
         if isinstance(manager, TieredOffloadingManager):
             line += " " + manager.telemetry_line()
+            if manager.fp4_class is not None:
+                counts = " ".join(f"{k}={v}" for k, v in manager.fp4_counts.items())
+                line += (
+                    f" fp4[{counts} free_slots={manager.fp4_free_slots} "
+                    f"pending_tokens={len(self.__dict__.get('_fp4_pending', {}))}]"
+                )
         unhashed = self.__dict__.get("_tier_check_unhashed", {})
         for name, counts in sorted(self.__dict__.get("_tier_check_totals", {}).items()):
             fields = " ".join(f"{k}={v}" for k, v in zip(CHECK_FIELDS, counts))
@@ -593,6 +684,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     ) -> KVConnectorMetadata:
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
+        fp4 = self.__dict__.get("_fp4", False)
+        if fp4:
+            self._fp4_step_quant = []
+            self._fp4_step_victims = []
         if self.__dict__.get("_victim", False):
             # Before anything else ships: this step's allocations may reuse
             # the victims' blocks.
@@ -622,6 +717,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         failed_load_block_ids: list[int] = []
         drained: list = []
 
+        step_quant_blocks = {b for b, _ in self._fp4_step_quant} if fp4 else set()
+
         def submit_loads() -> None:
             # Submit load jobs immediately: destination HBM blocks are freshly
             # allocated and safe to write into.
@@ -635,6 +732,16 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     len(device_block_ids),
                     len(src_spec.keys),
                 )
+                if fp4 and any(
+                    b in self._fp4_busy or b in step_quant_blocks for b in device_block_ids
+                ):
+                    self._fp4_deferred_loads.append(
+                        (job_id, src_spec.keys, device_block_ids, job.req_id, src_spec.pinned)
+                    )
+                    self.telemetry["fp4_loads_deferred"] = (
+                        self.telemetry.get("fp4_loads_deferred", 0) + 1
+                    )
+                    continue
                 manager.submit_load_job(
                     job_id,
                     src_spec.keys,
@@ -694,6 +801,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
         # Collect completed/drained jobs for the worker echo channel.
         for finished_job in list(drained) + manager.poll_finished_jobs():
+            if finished_job.op == AdmissionOp.STORE and (
+                finished_job.job_id in self.__dict__.get("_fp4_victim_jobs", ())
+            ):
+                # An FP4 victim save: the scheduler's base knows no such job.
+                self._fp4_victim_jobs.discard(finished_job.job_id)
+                name = "fp4_victim_saved" if finished_job.success else "fp4_victim_save_failed"
+                self.telemetry[name] = self.telemetry.get(name, 0) + 1
+                continue
             if finished_job.op == AdmissionOp.STORE:
                 finished_store_ids.append(finished_job.job_id)
                 self.telemetry["stores_done"] += 1
@@ -712,6 +827,24 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         if check_stores and load_destinations:
             check_stores = self._unhashable_as_forget(check_stores, load_destinations)
+        fp4_quant: list[tuple[int, int]] = []
+        fp4_dequant: list[tuple[int, int]] = []
+        fp4_token = -1
+        if fp4:
+            assert isinstance(manager, TieredOffloadingManager)
+            fp4_dequant, release = manager.take_fp4_dequant()
+            fp4_quant = self._fp4_step_quant
+            if fp4_quant or fp4_dequant:
+                fp4_token = self._fp4_token
+                self._fp4_token += 1
+                self._fp4_pending[fp4_token] = {
+                    "victims": self._fp4_step_victims,
+                    "release": release,
+                    "blocks": [b for b, _ in fp4_quant],
+                    "acks": 0,
+                }
+                self._fp4_busy.update(b for b, _ in fp4_quant)
+            self._fp4_step_quant, self._fp4_step_victims = [], []
         self._maybe_log_telemetry()
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
@@ -726,7 +859,25 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             failed_load_device_block_ids=failed_load_block_ids,
             tier_check_stores=check_stores,
             tier_check_loads=check_loads,
+            fp4_quant=fp4_quant,
+            fp4_dequant=fp4_dequant,
+            fp4_token=fp4_token,
         )
+
+    def _submit_fp4_deferred_loads(self) -> None:
+        """Submits the loads that waited for a quantize of one of their blocks."""
+        deferred = self.__dict__.get("_fp4_deferred_loads")
+        if not deferred:
+            return
+        keep = []
+        for job_id, keys, block_ids, req_id, pinned in deferred:
+            if any(b in self._fp4_busy for b in block_ids):
+                keep.append((job_id, keys, block_ids, req_id, pinned))
+                continue
+            self._raiden_manager.submit_load_job(job_id, keys, block_ids, req_id, pinned=pinned)
+            self.telemetry["loads"] += 1
+            self.telemetry["load_keys"] += len(keys)
+        self._fp4_deferred_loads = keep
 
     def _unhashable_as_forget(
         self, stores: list[tuple[str, bytes, int]], load_destinations: set[int]
@@ -753,6 +904,24 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             for name, counts in meta.tier_check.items():
                 mine = totals.setdefault(name, [0] * len(counts))
                 totals[name] = [a + b for a, b in zip(mine, counts)]
+        if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fp4_done:
+            for token, count in meta.fp4_done.items():
+                pending = self._fp4_pending.get(token)
+                if pending is None:
+                    continue
+                pending["acks"] += count
+                assert pending["acks"] <= self.config.num_workers
+                if pending["acks"] == self.config.num_workers:
+                    del self._fp4_pending[token]
+                    for job4, keys4, blocks4 in pending["victims"]:
+                        self._fp4_victim_jobs.add(job4)
+                        self._raiden_manager.submit_store_job(job4, keys4, blocks4)
+                        self.telemetry["stores"] += 1
+                        self.telemetry["store_keys"] += len(keys4)
+                    self._raiden_manager.fp4_give(pending["release"])
+                    self._fp4_busy.subtract(pending["blocks"])
+                    self._fp4_busy += Counter()  # drops the zero counts
+            self._submit_fp4_deferred_loads()
         if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
             for job_id, count in meta.fenced_jobs.items():
                 parked = self._fence_pending.get(job_id)
@@ -965,9 +1134,19 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             )
         ]
 
+        fp4_t = None
+        if tpu_envs.VLLM_TPU_OFFLOAD_FP4:
+            # Before the class workers register: the main class registers the
+            # transcoder's staging buffers (raiden_store._tier_worker).
+            assert group_regions is not None, "VLLM_TPU_OFFLOAD_FP4 needs the tier classes"
+            fp4_t = _build_fp4_transcoder(
+                self.connector_worker.kv_cache_config, pool_storages, group_regions, num_blocks
+            )
         self.connector_worker._init_worker(
             CanonicalKVCaches(tensors=pool_tensors, group_data_refs=group_data_refs)
         )
+        if fp4_t is not None:
+            fp4_t.warmup_and_selftest()
         if tpu_envs.VLLM_TPU_OFFLOAD_TIER_CHECK:
             assert group_regions is not None
             self._tier_check = _build_tier_check(
@@ -976,7 +1155,26 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
     def start_load_kv(self, forward_context, **kwargs) -> None:
         super().start_load_kv(forward_context, **kwargs)
+        self._run_fp4()
         self._run_tier_check()
+
+    def _run_fp4(self) -> None:
+        """VLLM_TPU_OFFLOAD_FP4: this step's quantizes (victim blocks -> staging slots)
+        then dequantizes (finished loads' slots -> their pool blocks), ahead of the
+        forward on the same stream, then an event for the acknowledgement. Quantizing
+        first keeps a victim's bytes even when a load of this step reuses its block."""
+        meta = self._get_connector_metadata()
+        if not isinstance(meta, RaidenOffloadingConnectorMetadata) or meta.fp4_token < 0:
+            return
+        from vllm_torchtpu.offload.fp4 import transcoder
+
+        t = transcoder()
+        if t is not None:
+            t.quantize(meta.fp4_quant)
+            t.dequantize(meta.fp4_dequant)
+        self.__dict__.setdefault("_fp4_pending", []).append(
+            (meta.fp4_token, _record_fence_event())
+        )
 
     def _run_tier_check(self) -> None:
         """Check mode: hashes this step's saved and restored entries. Runs before
@@ -1016,6 +1214,17 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                     still_pending.append((job_ids, event))
             self._pending_fences = still_pending
 
+        fp4_pending = self.__dict__.get("_fp4_pending")
+        if fp4_pending:
+            keep = []
+            done = self.__dict__.setdefault("_fp4_done", {})
+            for token, event in fp4_pending:
+                if _event_is_retired(event):
+                    done[token] = 1
+                else:
+                    keep.append((token, event))
+            self._fp4_pending = keep
+
         finished_recving: set[str] = set()
         for job_id in meta.finished_store_job_ids:
             self._completed_jobs[job_id] = 1
@@ -1044,14 +1253,17 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         check = self.__dict__.get("_tier_check")
         check_counts = check.take_counts() if check is not None else {}
-        if not (self._fenced_jobs or self._completed_jobs or check_counts):
+        fp4_done = self.__dict__.get("_fp4_done") or {}
+        if not (self._fenced_jobs or self._completed_jobs or check_counts or fp4_done):
             return None
+        self.__dict__["_fp4_done"] = {}
         # completed_jobs is inherited from vLLM base dataclass.
         meta = RaidenOffloadingWorkerMetadata(
             # pyrefly: ignore[unexpected-keyword]
             completed_jobs=self._completed_jobs,
             fenced_jobs=self._fenced_jobs,
             tier_check=check_counts,
+            fp4_done=fp4_done,
         )
         self._completed_jobs = {}
         self._fenced_jobs = {}
