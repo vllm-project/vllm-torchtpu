@@ -2320,6 +2320,8 @@ def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     import vllm_torchtpu.envs as envs
 
+    modules_before = set(sys.modules)
+
     def _put_mod(name: str, **attrs: Any) -> types.ModuleType:
         m = types.ModuleType(name)
         for k, v in attrs.items():
@@ -2603,6 +2605,12 @@ def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
         sys.modules, "vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4", adapter
     )
     spec.loader.exec_module(adapter)
+    # Modules first imported while the stubs above are installed (e.g.
+    # vllm_torchtpu.utils) keep references to the fake torch after monkeypatch
+    # restores sys.modules; re-register them so teardown removes them and later
+    # tests in the same process import them against the real packages.
+    for name in set(sys.modules) - modules_before:
+        monkeypatch.setitem(sys.modules, name, sys.modules.pop(name))
     return SimpleNamespace(
         adapter=adapter,
         torch=fake_torch,
