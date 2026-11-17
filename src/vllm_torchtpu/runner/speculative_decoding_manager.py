@@ -118,6 +118,10 @@ class SpecDecodeMetadata:
     # request (accepted count, rejected draft token or -1), decided before the
     # LM head; the step's logits then hold one row per request.
     synthetic_verify: tuple[torch.Tensor, torch.Tensor] | None = None
+    # This rank's TP rank (int32 [1]) when the synthetic verify's logits hold
+    # only this rank's block of the request rows (spec_synthetic_row_split,
+    # `_synthetic_verify_logits`).
+    synthetic_row_rank: torch.Tensor | None = None
     # spec_verify_coarse_pad: the row count the token buckets pad this
     # chunk's verify rows to (padded_logits_length is the coarse one). Eager
     # uniforms over the verify rows are drawn at this length and zero-padded,

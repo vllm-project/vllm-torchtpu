@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
+from vllm_torchtpu.layers.adapter.sample import top_p_sample
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 
@@ -513,6 +514,22 @@ def _recover_tokens(
     may pass any subset of rows. `target_probs` and `target_logits_argmax`
     are recomputed from `target_logits` when not given.
     """
+    if (
+        draft_probs is None
+        and target_probs is None
+        and target_logits_argmax is None
+        and topk_candidates == 0
+        and not (apply_topk_topp and apply_top_k)
+        and top_p_sample.applies(target_logits)
+    ):
+        # additional_config spec_sampler_top_p_kernel.
+        return top_p_sample.recover(
+            target_logits,
+            draft_token_ids,
+            temperatures,
+            top_p if apply_topk_topp else None,
+            recover_u,
+        )
     if target_logits_argmax is None:
         target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
     if target_probs is None:
@@ -943,8 +960,6 @@ def synthetic_sample_and_assemble(
     removed (`_recover_tokens`, draft one-hot); a bonus row (`recover_draft`
     -1) samples the full target distribution, as the bonus sampler does.
     """
-    batch_size = num_draft_tokens.shape[0]
-    device = draft_token_ids.device
     sampled = _recover_tokens(
         logits,
         recover_draft,
@@ -957,6 +972,92 @@ def synthetic_sample_and_assemble(
         None,
         apply_top_k=apply_top_k,
     )
+    return _assemble_synthetic(
+        sampled,
+        accepted_count,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def synthetic_sample_rows_and_assemble(
+    logit_rows: torch.Tensor,
+    rank: torch.Tensor,
+    recover_draft: torch.Tensor,
+    accepted_count: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    recover_u: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    topk_candidates: int = 0,
+    apply_topk_topp: bool = True,
+    apply_top_k: bool = True,
+) -> torch.Tensor:
+    """`synthetic_sample_and_assemble` with the requests' rows split over the
+    TP ranks (additional_config spec_synthetic_row_split): ``logit_rows``
+    holds this rank's block of them (block ``rank`` of ``tp``, full
+    vocabulary). Each rank samples its block, the ranks all-gather the
+    sampled tokens and every rank lays out the whole batch. Same tokens:
+    sampling is row-wise and every row sees the same inputs."""
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    per_rank = logit_rows.shape[0]
+
+    def rows(x: torch.Tensor) -> torch.Tensor:
+        # One block index, so a slice of the block rather than a row gather
+        # (which read all of `recover_u [rows, vocab]`, ~27 us at 64 rows).
+        blocks = x.reshape(-1, per_rank, *x.shape[1:])
+        return blocks.index_select(0, rank.view(-1)).view(per_rank, *x.shape[1:])
+
+    sampled_rows = _recover_tokens(
+        logit_rows,
+        rows(recover_draft),
+        rows(temperatures),
+        rows(top_k),
+        rows(top_p),
+        rows(recover_u),
+        topk_candidates,
+        apply_topk_topp,
+        None,
+        apply_top_k=apply_top_k,
+    )
+    # Exchanged as float32, which holds every id below 2**24 exactly, as the
+    # vocab-parallel argmax exchanges its ids.
+    sampled = tensor_model_parallel_all_gather(sampled_rows.float(), dim=0)
+    sampled = sampled.to(torch.int32)
+    return _assemble_synthetic(
+        sampled,
+        accepted_count,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+def _assemble_synthetic(
+    sampled: torch.Tensor,
+    accepted_count: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """``[padded_num_reqs, 1 + K]``: each request's accepted drafts, then its
+    sampled token, then placeholders."""
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
     # Gathers from per-request tables and the scatter into the output lower to
     # select chains on TPU (~200 us at 64 requests); masked reductions over
     # [requests, slots] do the same work vectorized. The [R, 1 + K, T] mask is

@@ -322,6 +322,24 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # (`DFlashProposer._fine_draft_buckets`). More precompiled draft programs.
     # 0 = the target's token buckets only. Bitwise per row (padding only).
     "spec_draft_bucket_step": 0,
+    # Synthetic one-row verify (spec_synthetic_one_row_verify) at TP > 1 with
+    # >= 4 request rows per rank: each rank gets its block of the rows over
+    # an all-to-all of the LM head shards (instead of an all-gather of the
+    # full logits), samples it, and the tokens are all-gathered
+    # (`compute_selected_logit_rows`). Needs the model's
+    # compute_logits_shard. Bitwise (same logits rows, same uniforms).
+    "spec_synthetic_row_split": False,
+    # Token recovery without top-k or draft probabilities (the synthetic
+    # verify's sampler) on a Pallas kernel holding each row as a dense
+    # [vocab / 128, 128] slab (`kernels/top_p_sample`). Same steps as the XLA
+    # path, the per-row sums in another order: not bitwise (float rounding of
+    # the softmax / top-p mass; a token can differ on a near-tie).
+    "spec_sampler_top_p_kernel": False,
+    # Runner: stop InputBatch rebuilding its (unused on TPU) device
+    # sampling_metadata on every batch change: no per-num_reqs copy programs
+    # compiled online, no H2D copies behind KV-offload loads. Host-side;
+    # bitwise (the TPU samplers read the CPU sampling tensors).
+    "skip_device_sampling_metadata": False,
 }
 
 

@@ -96,6 +96,8 @@ REPLACED_ENV = {
     "prefill_tpot_priced": "VLLM_TPU_PREFILL_TPOT_PRICED",
     # --- v7 runner/spec ---
     "spec_draft_bucket_step": "TPU_DRAFT_BUCKET_STEP",
+    "spec_synthetic_row_split": "TPU_SPEC_SYNTHETIC_ROW_SPLIT",
+    "spec_sampler_top_p_kernel": "TPU_SAMPLER_TOP_P_KERNEL",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -158,6 +160,9 @@ NEW_KEYS = {
     "gmm_scale_lookahead",
     # --- v7 scheduler ---
     "prefill_spacing_scheduler",
+    # --- v7 runner/spec ---
+    # r10 did this unconditionally (no env var).
+    "skip_device_sampling_metadata",
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.
