@@ -759,14 +759,15 @@ def test_the_first_and_last_stage_post_and_send_only_what_they_must(monkeypatch)
 
 
 def test_tags_differ_per_transfer_and_tensor():
-    handoff = SimpleNamespace(carried=("hidden_states", SIDE))
+    template = _template(side=True)
+    link = pp_buffered.IciLink(
+        1, (template["hidden_states"], template[SIDE]), torch.device("cpu")
+    )
     tags = {
-        pp_buffered.PPBuffered._tag(handoff, transfer, index)
-        for transfer in range(1, 100)
-        for index in range(2)
+        link._tag(transfer, index) for transfer in range(1, 100) for index in range(2)
     }
     assert len(tags) == 198
-    assert pp_buffered.PPBuffered._tag(handoff, pp_buffered._TAG_SPAN, 0) == 0
+    assert link._tag(pp_buffered._TAG_SPAN, 0) == 0
 
 
 def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
