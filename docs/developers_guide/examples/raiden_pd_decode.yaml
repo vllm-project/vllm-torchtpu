@@ -135,8 +135,6 @@ spec:
           value: "1"
         - name: TPU_RAIDEN_QWEN35_ADMISSION
           value: "1"
-        - name: TPU_KV_RESHARD_TRANSPORT
-          value: "raiden"
         - name: TPU_RAIDEN_RESHARD_IMPL
           value: "store"
         - name: TPU_RAIDEN_ADVERTISE_HOST

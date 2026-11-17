@@ -22,7 +22,7 @@ The house rule: a value that does not parse raises, because a misspelled flag
 is a launch-script bug and defaulting hides it.
 """
 
-import types
+import os
 
 import pytest
 
@@ -296,59 +296,46 @@ def test_tpu_kv_reshard_transport_rejects_non_raiden(monkeypatch, raw):
         _ = envs.TPU_KV_RESHARD_TRANSPORT
 
 
-def _premapped_buffer_block():
-    """Compile only env_override.py's TPU_PREMAPPED_BUFFER_SIZE block.
-
-    Reloading the whole module would re-run libtpu flag setup, the GCE
-    metadata probe and the import-time patch registry, so the block is
-    executed on its own against a fake ``os``.
-    """
-    import ast
-    import inspect
-
-    from vllm_torchtpu import env_override
-
-    tree = ast.parse(inspect.getsource(env_override))
-    blocks = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.If) and "TPU_PREMAPPED_BUFFER_SIZE" in ast.unparse(node)
-    ]
-    assert len(blocks) == 1
-    module = ast.Module(body=blocks, type_ignores=[])
-    return compile(module, env_override.__file__, "exec")
-
-
-def _run_premapped_buffer_block(env):
-    fake_os = types.SimpleNamespace(environ=env, getenv=env.get)
-    exec(_premapped_buffer_block(), {"os": fake_os})  # noqa: S102
-    return env
-
-
 @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", " On "])
-def test_env_override_premaps_host_buffer_for_raiden_cache_manager(raw):
+def test_env_override_premaps_host_buffer_for_raiden_cache_manager(monkeypatch, raw):
     """Every env_bool truthy spelling of TPU_USE_RAIDEN_KV_CACHE_MANAGER sizes
     libtpu's premapped host buffer pool to 16 GiB."""
-    env = _run_premapped_buffer_block({"TPU_USE_RAIDEN_KV_CACHE_MANAGER": raw})
-    assert env["TPU_PREMAPPED_BUFFER_SIZE"] == str(16 << 30)
+    from vllm_torchtpu import env_override, envs
+
+    monkeypatch.delitem(vars(envs), "TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", raw)
+    monkeypatch.delenv("TPU_PREMAPPED_BUFFER_SIZE", raising=False)
+    env_override._apply_raiden_premapped_buffer_default()
+    assert os.environ["TPU_PREMAPPED_BUFFER_SIZE"] == str(16 << 30)
 
 
 @pytest.mark.parametrize("raw", [None, "0", "false", ""])
-def test_env_override_skips_premapped_buffer_without_raiden_cache_manager(raw):
+def test_env_override_skips_premapped_buffer_without_raiden_cache_manager(
+    monkeypatch, raw
+):
     """TPU_KV_RESHARD_TRANSPORT=raiden alone (its default) no longer enables the
     premapped pool, so single-host engines keep torch_tpu's default."""
-    env = {"TPU_KV_RESHARD_TRANSPORT": "raiden"}
-    if raw is not None:
-        env["TPU_USE_RAIDEN_KV_CACHE_MANAGER"] = raw
-    env = _run_premapped_buffer_block(env)
-    assert "TPU_PREMAPPED_BUFFER_SIZE" not in env
+    from vllm_torchtpu import env_override, envs
+
+    monkeypatch.delitem(vars(envs), "TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    if raw is None:
+        monkeypatch.delenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
+    else:
+        monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", raw)
+    monkeypatch.delenv("TPU_PREMAPPED_BUFFER_SIZE", raising=False)
+    env_override._apply_raiden_premapped_buffer_default()
+    assert "TPU_PREMAPPED_BUFFER_SIZE" not in os.environ
 
 
-def test_env_override_keeps_a_preset_premapped_buffer_size():
-    env = _run_premapped_buffer_block(
-        {"TPU_USE_RAIDEN_KV_CACHE_MANAGER": "1", "TPU_PREMAPPED_BUFFER_SIZE": "123"}
-    )
-    assert env["TPU_PREMAPPED_BUFFER_SIZE"] == "123"
+def test_env_override_keeps_a_preset_premapped_buffer_size(monkeypatch):
+    from vllm_torchtpu import env_override, envs
+
+    monkeypatch.delitem(vars(envs), "TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
+    monkeypatch.setenv("TPU_PREMAPPED_BUFFER_SIZE", "123")
+    env_override._apply_raiden_premapped_buffer_default()
+    assert os.environ["TPU_PREMAPPED_BUFFER_SIZE"] == "123"
 
 
 def test_spec_warmup_off_spellings(monkeypatch):

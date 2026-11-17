@@ -27,7 +27,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -60,6 +60,7 @@ from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
+    from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
@@ -71,14 +72,15 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     SendMeta,
     TPUConnectorMetadata,
 )
-from vllm_torchtpu.distributed.kv_transfer.connector_names import (
-    RAIDEN_PD_ADMISSION_REQUIRED_MESSAGE,
-    USE_RAIDEN_CONNECTOR_REMOVED_MESSAGE,
-)
 from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
     RaidenSendOutcome,
     RaidenSendResults,
     send_completion_enabled,
+)
+from vllm_torchtpu.distributed.kv_transfer.raiden_pd_validation import (
+    is_kimi_architecture,
+    raiden_qwen35_admission_topology,
+    validate_raiden_pd_config,
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
@@ -627,10 +629,7 @@ def _use_raiden_dsv4_admission() -> bool:
 
 
 def _is_kimi(vllm_config: VllmConfig) -> bool:
-    return getattr(vllm_config.model_config, "architecture", None) in (
-        "KimiK3ForConditionalGeneration",
-        "KimiLinearForCausalLM",
-    )
+    return is_kimi_architecture(vllm_config)
 
 
 def _uses_tp_stage3_source(vllm_config: VllmConfig) -> bool:
@@ -707,12 +706,8 @@ class TPURaidenConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
-        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        if isinstance(extra_config, Mapping) and "use_raiden_connector" in extra_config:
-            raise ValueError(USE_RAIDEN_CONNECTOR_REMOVED_MESSAGE)
-        # Validates the legacy selector (env_with_choices raises on anything
-        # but "raiden"), so a stale TPU_KV_RESHARD_TRANSPORT=zmq fails here.
-        _ = tpu_envs.TPU_KV_RESHARD_TRANSPORT
+        validate_raiden_pd_config(vllm_config)
+        # pyrefly: ignore[bad-override-mutable-attribute]
         self._connector_metadata: TPUConnectorMetadata | None = None
         self._stage3_transfer_groups: tuple[_Stage3TransferGroup, ...] = (
             _stage3_transfer_groups(
@@ -883,13 +878,14 @@ class TPURaidenConnector(KVConnectorBase_V1, SupportsHMA):
 
     def start_load_kv(
         self,
-        _,
-        wait_for_completion: bool = False,
-        report_completion: bool = True,
-        **kwargs,
+        forward_context: "ForwardContext",
+        **kwargs: Any,
     ) -> None:
+        del forward_context
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, TPUConnectorMetadata)
+        wait_for_completion = bool(kwargs.get("wait_for_completion", False))
+        report_completion = bool(kwargs.get("report_completion", True))
         self.connector_worker.process_send_load(
             self._connector_metadata,
             wait_for_completion=wait_for_completion,
@@ -944,8 +940,9 @@ class TPURaidenConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_worker.take_pd_send_results()
 
 
-# Compatibility alias: existing launch configs name the connector
-# "TPUConnector"; both names resolve to the same class.
+# Deprecated compatibility alias for external launch configs that still specify
+# "kv_connector": "TPUConnector". Remove once external callers migrate to
+# "TPURaidenConnector" (no in-repo configs use "TPUConnector").
 TPUConnector = TPURaidenConnector
 
 
@@ -2207,45 +2204,21 @@ class TPURaidenConnectorWorker:
 
     def register_runner(self, runner: TPUModelRunner) -> None:
         self.runner = runner
-        manager_enabled = bool(tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER)
-        qwen_admission = manager_enabled and tpu_envs.TPU_RAIDEN_QWEN35_ADMISSION
-        kimi_admission = manager_enabled and tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION
-        glm_admission = _use_raiden_glm_admission()
-        dsv4_admission = _use_raiden_dsv4_admission()
-        selected = [
-            name
-            for name, enabled in (
-                ("TPU_RAIDEN_QWEN35_ADMISSION", qwen_admission),
-                ("TPU_RAIDEN_KIMIK3_ADMISSION", kimi_admission),
-                ("TPU_RAIDEN_GLM_ADMISSION", glm_admission),
-                ("TPU_RAIDEN_DSV4_ADMISSION", dsv4_admission),
-            )
-            if enabled
-        ]
-        if len(selected) > 1:
-            raise RuntimeError(f"{' and '.join(selected)} are mutually exclusive")
-        if not selected:
-            raise RuntimeError(RAIDEN_PD_ADMISSION_REQUIRED_MESSAGE)
-        if kimi_admission and not self._stage3_kimi:
-            raise ValueError(
-                "TPU_RAIDEN_KIMIK3_ADMISSION requires "
-                "KimiK3ForConditionalGeneration or "
-                "KimiLinearForCausalLM"
-            )
-        if kimi_admission and _use_per_layer_pool_tags():
-            raise ValueError("Kimi K3 does not support TPU_RAIDEN_POOL_TAGS_PER_LAYER")
-        if self._stage3_kimi and (qwen_admission or glm_admission or dsv4_admission):
-            raise ValueError(
-                "Kimi K3 requires TPU_RAIDEN_KIMIK3_ADMISSION=1; "
-                "Qwen, GLM and DSv4 admission cannot admit Kimi"
-            )
-        if qwen_admission or kimi_admission:
+        admission = validate_raiden_pd_config(
+            self.vllm_config,
+            tp_size_fallback=self.tp_size,
+            seq_on_lane=_raiden_seq_on_lane_layout(),
+        )
+        if admission in (
+            "TPU_RAIDEN_QWEN35_ADMISSION",
+            "TPU_RAIDEN_KIMIK3_ADMISSION",
+        ):
             self._admit_raiden_hybrid_kv_cache(runner)
             return
-        if glm_admission:
+        if admission == "TPU_RAIDEN_GLM_ADMISSION":
             self._admit_raiden_glm_kv_cache(runner)
             return
-        assert dsv4_admission
+        assert admission == "TPU_RAIDEN_DSV4_ADMISSION"
         self._admit_raiden_dsv4_kv_cache(runner)
 
     def _require_reshard_controller_address(self) -> str:
@@ -3319,87 +3292,12 @@ class TPURaidenConnectorWorker:
         return f"tp{tp_size}dp{dp_size}_{role}"
 
     def _raiden_qwen35_admission_topology(self) -> str:
-        parallel_config = self.vllm_config.parallel_config
-        pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
-        tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
-        dp_size = int(parallel_config.data_parallel_size or 1)
-        pp_size = _pipeline_parallel_size(self.vllm_config)
-        if _raiden_seq_on_lane_layout() and dp_size == pp_size == 1:
-            dcp_size = int(parallel_config.decode_context_parallel_size)
-            if dcp_size <= 0 or tp_size % dcp_size:
-                raise ValueError("DCP size must divide TP size")
-            if self.is_producer and tp_size > 1 and dcp_size == 1:
-                return f"pcp{pcp_size}tp{tp_size}_prefill"
-            if not self.is_producer and pcp_size == 1 and tp_size > 1:
-                return f"tp{tp_size}dcp{dcp_size}_decode"
-        if self.is_producer and pp_size > 1 and pcp_size > 1:
-            # PP x PCP prefill: every stage-local PCP rank is a source unit
-            # (TPU_RAIDEN_TRANSFER_PARALLELISM = PP * PCP) lowering its own
-            # tokens and GDN heads of its stage's layers.
-            # TODO(yinlin): reachable once pp_validation admits context-parallel
-            # stages, i.e. once the pinned torch_tpu builds a stage group's meshes
-            # (google-pytorch/torch_tpu#4387, for a group made standalone).
-            dcp_size = int(parallel_config.decode_context_parallel_size)
-            if (
-                _raiden_seq_on_lane_layout()
-                and tp_size == 1
-                and dp_size == 1
-                and dcp_size == 1
-                and pp_size in (2, 4, 8)
-            ):
-                return f"pp{pp_size}pcp{pcp_size}_prefill"
-            raise ValueError(
-                "Raiden Qwen3.5 admission topology pp{2,4,8}pcp{N}_prefill "
-                "requires the seq-along-lane FA layout "
-                "(VLLM_KV_CACHE_LAYOUT=HND) and kv_producer with "
-                "tensor_parallel_size=1, data_parallel_size=1, "
-                "decode_context_parallel_size=1, pipeline_parallel_size in "
-                f"(2, 4, 8); got prefill_context_parallel_size={pcp_size}, "
-                f"tensor_parallel_size={tp_size}, "
-                f"data_parallel_size={dp_size}, "
-                f"decode_context_parallel_size={dcp_size}, "
-                f"pipeline_parallel_size={pp_size}"
-            )
-        if self.is_producer:
-            if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
-                return f"pp{pp_size}_prefill"
-            if tp_size == 1 and pcp_size in (4, 8) and dp_size == 1:
-                return f"pcp{pcp_size}_prefill"
-            if tp_size == 1 and pcp_size == 1 and dp_size in (4, 8, 16):
-                return f"dp{dp_size}_prefill"
-            raise ValueError(
-                "Raiden Qwen3.5 admission topology pcp8_prefill, "
-                "pcp4_prefill, dp8_prefill, dp4_prefill, dp16_prefill, or "
-                "pp{2,4,8}_prefill requires kv_producer with "
-                "tensor_parallel_size=1 and either "
-                "prefill_context_parallel_size in (4, 8), "
-                "data_parallel_size=1; or "
-                "prefill_context_parallel_size=1, "
-                "data_parallel_size in (4, 8, 16); or "
-                "pipeline_parallel_size in (2, 4, 8) alone; got "
-                f"prefill_context_parallel_size={pcp_size}, "
-                f"tensor_parallel_size={tp_size}, "
-                f"data_parallel_size={dp_size}, "
-                f"pipeline_parallel_size={pp_size}"
-            )
-        if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
-            return f"pp{pp_size}_decode"
-        if pcp_size != 1 or tp_size not in (1, 2, 4) or dp_size not in (2, 4, 8, 16):
-            raise ValueError(
-                "Raiden Qwen3.5 admission topology dp{N}_decode or "
-                "dp{N}tp{2,4}_decode requires kv_consumer with "
-                "prefill_context_parallel_size=1, tensor_parallel_size in "
-                "(1, 2, 4), data_parallel_size in (2, 4, 8, 16); got "
-                f"prefill_context_parallel_size={pcp_size}, "
-                f"tensor_parallel_size={tp_size}, "
-                f"data_parallel_size={dp_size}"
-            )
-        if tp_size > 1:
-            # Head-sharded decode engine: every TP worker is its own
-            # destination unit (transfer_rank = tp_rank) and the producer
-            # routes each KV head shard to it (TPU_RAIDEN_DST_SHARDS).
-            return f"dp{dp_size}tp{tp_size}_decode"
-        return f"dp{dp_size}_decode"
+        return raiden_qwen35_admission_topology(
+            self.vllm_config,
+            is_producer=self.is_producer,
+            tp_size_fallback=self.tp_size,
+            seq_on_lane=_raiden_seq_on_lane_layout(),
+        )
 
     def _model_config_int(self, name: str, default: int) -> int:
         model_config = self.vllm_config.model_config

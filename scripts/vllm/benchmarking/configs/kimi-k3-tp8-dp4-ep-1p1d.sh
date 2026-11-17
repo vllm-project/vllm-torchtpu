@@ -59,7 +59,6 @@ fi
 EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --mamba-cache-mode align --enable-prompt-tokens-details --reasoning-parser kimi_k3 --distributed-executor-backend mp"
 
 # ---- Raiden Stage 3, both engines --------------------------------------------
-export TPU_KV_RESHARD_TRANSPORT=raiden
 export TPU_RAIDEN_RESHARD_IMPL=store
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
 export TPU_RAIDEN_KIMIK3_ADMISSION=1

@@ -117,16 +117,6 @@
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPURaidenConnector._connector_metadata` overrides parent class `KVConnectorBase_V1` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPURaidenConnector.start_load_kv` overrides parent class `KVConnectorBase_V1` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unbound-name",
       "concise_description": "`payload` may be uninitialized"
     },

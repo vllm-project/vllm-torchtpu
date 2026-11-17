@@ -169,8 +169,6 @@ spec:
                   value: "1"
                 - name: TPU_RAIDEN_QWEN35_ADMISSION
                   value: "1"
-                - name: TPU_KV_RESHARD_TRANSPORT
-                  value: "raiden"
                 # Sidecar-less reshard plane: rank-0 hosts the service at
                 # PORT_BASE + dp_rank, dispatch at DISPATCH_BASE + dp_rank.
                 - name: TPU_RAIDEN_RESHARD_IMPL
@@ -370,8 +368,6 @@ spec:
                   value: "1"
                 - name: TPU_RAIDEN_QWEN35_ADMISSION
                   value: "1"
-                - name: TPU_KV_RESHARD_TRANSPORT
-                  value: "raiden"
                 # Sidecar-less reshard plane; DP8, so ranks 0-7 bind
                 # 28000-28007 (service) and 28100-28107 (dispatch).
                 - name: TPU_RAIDEN_RESHARD_IMPL

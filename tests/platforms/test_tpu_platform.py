@@ -54,31 +54,6 @@ from vllm_torchtpu.platforms.tpu_platform import (
     get_tpu_multihost_topology,
 )
 
-_RAIDEN_PD_ENV = (
-    "TPU_KV_RESHARD_TRANSPORT",
-    "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
-    "TPU_RAIDEN_QWEN35_ADMISSION",
-    "TPU_RAIDEN_KIMIK3_ADMISSION",
-    "TPU_RAIDEN_GLM_ADMISSION",
-    "TPU_RAIDEN_DSV4_ADMISSION",
-)
-
-
-def _clear_raiden_pd_env(monkeypatch):
-    """Drop ambient Raiden P/D settings (and any cached envs values)."""
-    from vllm_torchtpu import envs as tpu_envs
-
-    for name in _RAIDEN_PD_ENV:
-        monkeypatch.delenv(name, raising=False)
-        monkeypatch.delitem(vars(tpu_envs), name, raising=False)
-
-
-def _set_raiden_pd_env(monkeypatch, **overrides):
-    """Set a Raiden P/D environment; the cache manager defaults to on."""
-    env = {"TPU_USE_RAIDEN_KV_CACHE_MANAGER": "1", **overrides}
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-
 
 @pytest.mark.parametrize(
     "hybrid,unified,resumable,blocked",
@@ -689,13 +664,17 @@ class TestTpuPlatform:
         mock_apply_patches,
         vllm_config,
         connector_name,
-        monkeypatch,
+        raiden_pd_env,
     ):
-        _clear_raiden_pd_env(monkeypatch)
         if connector_name in ("TPUConnector", "TPURaidenConnector"):
-            _set_raiden_pd_env(monkeypatch, TPU_RAIDEN_QWEN35_ADMISSION="1")
+            raiden_pd_env(TPU_RAIDEN_QWEN35_ADMISSION="1")
+            vllm_config.parallel_config.prefill_context_parallel_size = 4
+            kv_role = "kv_producer"
+        else:
+            raiden_pd_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER=None)
+            kv_role = "kv_both"
         vllm_config.kv_transfer_config = KVTransferConfig(
-            kv_connector=connector_name, kv_role="kv_both"
+            kv_connector=connector_name, kv_role=kv_role
         )
         if connector_name == "TPUMultiConnector":
             vllm_config.kv_transfer_config.kv_connector_extra_config = {
@@ -711,13 +690,21 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
-        ("connector_name", "extra_config", "env", "error", "match"),
+        (
+            "connector_name",
+            "extra_config",
+            "env",
+            "architecture",
+            "pcp_size",
+            "match",
+        ),
         [
             pytest.param(
                 "TPURaidenConnector",
                 {"use_raiden_connector": True},
                 {"TPU_RAIDEN_QWEN35_ADMISSION": "1"},
-                ValueError,
+                None,
+                4,
                 r"kv_connector_extra_config\['use_raiden_connector'\] has been "
                 r"removed",
                 id="use_raiden_connector",
@@ -726,7 +713,8 @@ class TestTpuPlatform:
                 "TPUConnector",
                 {"use_raiden_connector": False},
                 {"TPU_RAIDEN_QWEN35_ADMISSION": "1"},
-                ValueError,
+                None,
+                4,
                 r"kv_connector_extra_config\['use_raiden_connector'\] has been "
                 r"removed",
                 id="use_raiden_connector_alias",
@@ -735,10 +723,47 @@ class TestTpuPlatform:
                 "TPURaidenConnector",
                 {},
                 {
+                    "TPU_USE_RAIDEN_CONNECTOR": "0",
+                    "TPU_RAIDEN_QWEN35_ADMISSION": "1",
+                },
+                None,
+                4,
+                r"TPU_USE_RAIDEN_CONNECTOR has been removed",
+                id="removed_use_raiden_connector_env",
+            ),
+            pytest.param(
+                "TPURaidenConnector",
+                {},
+                {
+                    "TPU_SIDE_CHANNEL_PORT": "9600",
+                    "TPU_RAIDEN_QWEN35_ADMISSION": "1",
+                },
+                None,
+                4,
+                r"TPU_SIDE_CHANNEL_PORT has been removed",
+                id="removed_side_channel_port_env",
+            ),
+            pytest.param(
+                "TPURaidenConnector",
+                {},
+                {
+                    "TPU_KV_SHM_POOL_GB": "128",
+                    "TPU_RAIDEN_QWEN35_ADMISSION": "1",
+                },
+                None,
+                4,
+                r"TPU_KV_SHM_POOL_GB has been removed",
+                id="removed_shm_pool_gb_env",
+            ),
+            pytest.param(
+                "TPURaidenConnector",
+                {},
+                {
                     "TPU_KV_RESHARD_TRANSPORT": "zmq",
                     "TPU_RAIDEN_QWEN35_ADMISSION": "1",
                 },
-                ValueError,
+                None,
+                4,
                 r"Valid options: \['raiden'\]",
                 id="zmq_transport",
             ),
@@ -749,7 +774,8 @@ class TestTpuPlatform:
                     "TPU_USE_RAIDEN_KV_CACHE_MANAGER": "0",
                     "TPU_RAIDEN_QWEN35_ADMISSION": "1",
                 },
-                ValueError,
+                None,
+                4,
                 r"requires TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and one of",
                 id="cache_manager_disabled",
             ),
@@ -757,7 +783,8 @@ class TestTpuPlatform:
                 "TPUConnector",
                 {},
                 {},
-                ValueError,
+                None,
+                4,
                 r"requires TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and one of",
                 id="no_admission_flag",
             ),
@@ -768,9 +795,38 @@ class TestTpuPlatform:
                     "TPU_RAIDEN_QWEN35_ADMISSION": "1",
                     "TPU_RAIDEN_GLM_ADMISSION": "1",
                 },
-                RuntimeError,
+                None,
+                4,
                 r"mutually exclusive",
                 id="multiple_admission_flags",
+            ),
+            pytest.param(
+                "TPURaidenConnector",
+                {},
+                {"TPU_RAIDEN_QWEN35_ADMISSION": "1"},
+                None,
+                1,
+                r"Raiden Qwen3\.5 admission topology",
+                id="qwen35_invalid_tp1_pcp1_topology",
+            ),
+            pytest.param(
+                "TPURaidenConnector",
+                {},
+                {"TPU_RAIDEN_KIMIK3_ADMISSION": "1"},
+                "Qwen3_5MoeForConditionalGeneration",
+                1,
+                r"TPU_RAIDEN_KIMIK3_ADMISSION requires "
+                r"KimiK3ForConditionalGeneration or KimiLinearForCausalLM",
+                id="kimi_flag_on_non_kimi_model",
+            ),
+            pytest.param(
+                "TPURaidenConnector",
+                {},
+                {"TPU_RAIDEN_QWEN35_ADMISSION": "1"},
+                "KimiK3ForConditionalGeneration",
+                4,
+                r"Kimi K3 requires TPU_RAIDEN_KIMIK3_ADMISSION=1",
+                id="non_kimi_flag_on_kimi_model",
             ),
             pytest.param(
                 "TPUMultiConnector",
@@ -786,7 +842,8 @@ class TestTpuPlatform:
                     ]
                 },
                 {"TPU_RAIDEN_QWEN35_ADMISSION": "1"},
-                ValueError,
+                None,
+                4,
                 r"kv_connector_extra_config\['use_raiden_connector'\] has been "
                 r"removed",
                 id="multi_child_use_raiden_connector",
@@ -802,17 +859,20 @@ class TestTpuPlatform:
         mock_prepare_env,
         mock_apply_patches,
         vllm_config,
-        monkeypatch,
+        raiden_pd_env,
         connector_name,
         extra_config,
         env,
-        error,
+        architecture,
+        pcp_size,
         match,
     ):
         """Stale ZMQ-era or incomplete Raiden P/D settings fail in the platform
         config hook, before the executor spends minutes loading weights."""
-        _clear_raiden_pd_env(monkeypatch)
-        _set_raiden_pd_env(monkeypatch, **env)
+        raiden_pd_env(**env)
+        vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
+        if architecture is not None:
+            vllm_config.model_config.architecture = architecture
         vllm_config.kv_transfer_config = KVTransferConfig(
             kv_connector=connector_name,
             kv_role="kv_producer",
@@ -820,7 +880,7 @@ class TestTpuPlatform:
         )
         vllm_config.cache_config.block_size = 16
 
-        with pytest.raises(error, match=match):
+        with pytest.raises(ValueError, match=match):
             TpuPlatform.check_and_update_config(vllm_config)
 
     @patch("vllm_torchtpu.patch_registry.apply")
@@ -828,11 +888,10 @@ class TestTpuPlatform:
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     def test_check_and_update_config_validates_raiden_child_of_multi_connector(
-        self, mock_prepare_env, mock_apply_patches, vllm_config, monkeypatch
+        self, mock_prepare_env, mock_apply_patches, vllm_config, raiden_pd_env
     ):
         """A Raiden P/D child inside TPUMultiConnector is validated too."""
-        _clear_raiden_pd_env(monkeypatch)
-        _set_raiden_pd_env(monkeypatch, TPU_USE_RAIDEN_KV_CACHE_MANAGER="0")
+        raiden_pd_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER="0")
         vllm_config.kv_transfer_config = KVTransferConfig(
             kv_connector="TPUMultiConnector",
             kv_role="kv_producer",

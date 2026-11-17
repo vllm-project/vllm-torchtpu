@@ -653,8 +653,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indexer, HCA, SWA and the compressor states. Every other model here has
     # exactly one.
     "TPU_RAIDEN_DSV4_ADMISSION": env_bool("TPU_RAIDEN_DSV4_ADMISSION"),
-    # Kept for compatibility while existing Stage-3 launch configs export
-    # TPU_KV_RESHARD_TRANSPORT=raiden; remove once those configs drop the export.
+    # Deprecated: retained only for external launch configs that still export
+    # TPU_KV_RESHARD_TRANSPORT=raiden; new deployments do not need to set it.
+    # Remove once external callers drop the export.
     "TPU_KV_RESHARD_TRANSPORT": env_with_choices(
         "TPU_KV_RESHARD_TRANSPORT", "raiden", ["raiden"], case_sensitive=False
     ),
