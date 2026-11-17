@@ -1399,6 +1399,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TABLE_KERNEL", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_V2_PLAN_KERNEL", True)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1429,6 +1430,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["table_kernel"] is True
         assert forwarded["exchange_tables"] is True
         assert forwarded["kernel_plan_tables"] is True
+        assert "plan_kernel" not in forwarded
     else:
         push_kernel.assert_not_called()
         forwarded = v2_kernel.call_args.kwargs
@@ -1450,6 +1452,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
             "kernel_plan_tables",
         ):
             assert knob not in forwarded
+        assert forwarded["plan_kernel"] is True
 
 
 def test_shared_expert_operands_reach_the_push_layer(monkeypatch):

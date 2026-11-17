@@ -24,7 +24,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -384,6 +383,7 @@ def fused_ep_moe_v2(
     routed=None,
     gather_positions=None,
     preprocess_topology: PreprocessTopology | None = None,
+    plan_kernel: bool = False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -425,6 +425,9 @@ def fused_ep_moe_v2(
     sharded_plan computes the same kernel operands from the two complementary
     1/ep slices their consumers read, plus one small expert-count all-gather.
     It changes routing-plan construction only, never the core kernel.
+    plan_kernel builds that sharded plan in one Pallas kernel (plan_kernel.py)
+    where plan_kernel_fits admits the shape, with the same kernel operands;
+    other shapes, and the SparseCore pair scatter, keep the XLA plan.
 
     token_replica_groups lists ordered groups of device-mesh indices whose
     x and gating rows are identical (for example, a TP group). Each member
@@ -692,7 +695,7 @@ def fused_ep_moe_v2(
     # SparseCore pair scatter, which builds the token gather and scale slab
     # its own way.
     use_plan_kernel = (
-        envs.MOE_FUSED_EP_V2_PLAN_KERNEL
+        plan_kernel
         and bool(sharded_plan)
         and form.quantized_activations
         and not use_split_sc
