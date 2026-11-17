@@ -82,7 +82,7 @@ def test_builtin_choices_are_not_registered(backend):
 def test_platform_resolves_a_registered_name_to_its_class(registered):
     path = TpuPlatform.get_attn_backend_cls(
         selected_backend=registered,
-        attn_selector_config=SimpleNamespace(use_mla=False),
+        attn_selector_config=SimpleNamespace(use_mla=False, kv_cache_dtype=None),
     )
 
     assert path == _TEST_PATH
@@ -92,14 +92,14 @@ def test_platform_rejects_a_registered_name_for_mla(registered):
     with pytest.raises(ValueError, match="does not support MLA"):
         TpuPlatform.get_attn_backend_cls(
             selected_backend=registered,
-            attn_selector_config=SimpleNamespace(use_mla=True),
+            attn_selector_config=SimpleNamespace(use_mla=True, kv_cache_dtype=None),
         )
 
 
 def test_platform_still_overrides_an_unsupported_builtin():
     path = TpuPlatform.get_attn_backend_cls(
         selected_backend=AttentionBackendEnum.TRITON_ATTN,
-        attn_selector_config=SimpleNamespace(use_mla=False),
+        attn_selector_config=SimpleNamespace(use_mla=False, kv_cache_dtype=None),
     )
 
     assert path == AttentionBackendEnum.FLASH_ATTN.get_path()

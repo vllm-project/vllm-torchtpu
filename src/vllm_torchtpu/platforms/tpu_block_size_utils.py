@@ -51,6 +51,24 @@ else:
 logger = init_logger(__name__)
 
 
+# Kept inline: platforms/ loads during vllm.platforms bootstrap, before
+# env_override (no jax / layers.core) and before vllm.distributed finishes
+# initializing (no vllm.model_executor). Synced in test_turboquant_attention.
+TURBOQUANT_KV_CACHE_DTYPES = (
+    "turboquant_k8v4",
+    "turboquant_4bit_nc",
+    "turboquant_k3v4_nc",
+    "turboquant_3bit_nc",
+)
+
+
+def is_turboquant_kv_cache_dtype(cache_dtype: object) -> bool:
+    return (
+        isinstance(cache_dtype, str)
+        and cache_dtype.lower().strip() in TURBOQUANT_KV_CACHE_DTYPES
+    )
+
+
 def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     """Whether the deployment uses the attention-shaped unified KV pool.
 
@@ -60,8 +78,11 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     caches, which is the only layout an attention-only model has and the only
     one the other hybrid families implement.
     """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if is_turboquant_kv_cache_dtype(getattr(cache_config, "cache_dtype", None)):
+        return False
     return unified_kv_layout_enabled_for_architecture(
-        vllm_config.model_config.architecture
+        vllm_config.model_config.architecture,
     )
 
 
@@ -75,6 +96,7 @@ _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    **dict.fromkeys(TURBOQUANT_KV_CACHE_DTYPES, torch.uint8),
 }
 
 _SLOT_ALIGNMENT_BYTES = 16

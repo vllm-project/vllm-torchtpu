@@ -35,6 +35,7 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.mesh_utils import MODEL_AXIS_NAME
 from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
@@ -48,6 +49,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache_dcp,
 )
 from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
+from vllm_torchtpu.layers.core import turboquant as tq
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
@@ -600,6 +602,97 @@ def attention_bundled(
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
+        check_rep=False,
+    )(*args)
+
+
+def sharded_tq_ragged_paged_attention(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    mesh: Mesh,
+    layout: tq.TQLayout,
+    tables: tq.TQTables,
+    layer_idx: jax.Array | None = None,
+    sm_scale: float,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    skip_kv_update: bool = False,
+    shard: bool = True,
+    d_block_sizes: tuple[int, int, int, int] | None = None,
+    m_block_sizes: tuple[int, int, int, int] | None = None,
+    model_axis_name: str = MODEL_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array]:
+    """Run `tq_ragged_paged_attention` directly (1-chip/local) or via `shard_map`."""
+    fn = functools.partial(
+        tq.tq_ragged_paged_attention,
+        layout=layout,
+        tables=tables,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        skip_kv_update=skip_kv_update,
+        d_block_sizes=d_block_sizes,
+        m_block_sizes=m_block_sizes,
+    )
+    if not shard or mesh.size == 1:
+        return fn(
+            queries,
+            keys,
+            values,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            layer_idx=layer_idx,
+        )
+
+    qkv_spec = P(None, model_axis_name, None)
+    cache_spec = (
+        P(None, None, model_axis_name, None, None)
+        if kv_cache.ndim == 5
+        else P(None, model_axis_name, None, None)
+    )
+    in_specs: tuple[P, ...] = (
+        qkv_spec,
+        qkv_spec,
+        qkv_spec,
+        cache_spec,
+        P(None),
+        P(None),
+        P(None),
+        P(None),
+    )
+    args: tuple[jax.Array, ...] = (
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
+    if layer_idx is not None:
+        in_specs = (*in_specs, P())
+        args = (*args, layer_idx)
+
+    def _run(q_s, k_s, v_s, c_s, kl_s, pi_s, cql_s, d_s, *extra):
+        lid = extra[0] if extra else None
+        return fn(q_s, k_s, v_s, c_s, kl_s, pi_s, cql_s, d_s, layer_idx=lid)
+
+    return shard_map.shard_map(
+        _run,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=(cache_spec, qkv_spec),
         check_rep=False,
     )(*args)
 
