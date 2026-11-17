@@ -73,7 +73,8 @@ class ShapeSpecializationError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _placeholder_nodes(graph: fx.GraphModule) -> list[fx.Node]:
+def placeholder_nodes(graph: fx.GraphModule) -> list[fx.Node]:
+    """The graph's placeholders, in call order."""
     nodes = []
     for node in graph.graph.nodes:
         if node.op != "placeholder":
@@ -87,7 +88,7 @@ def _placeholder_value(node: fx.Node) -> Any:
 
 
 def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
-    values = (_placeholder_value(node) for node in _placeholder_nodes(graph))
+    values = (_placeholder_value(node) for node in placeholder_nodes(graph))
     return [value for value in values if value is not None]
 
 
@@ -226,7 +227,7 @@ def _inputs(graph: fx.GraphModule) -> list[_Input]:
             _graph_input_source(node),
             _is_graph_input(node),
         )
-        for node in _placeholder_nodes(graph)
+        for node in placeholder_nodes(graph)
     ]
 
 
