@@ -210,6 +210,25 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # (bitwise only with moe_gmm_fp8_decode_tiles; else <= 2 bf16 ulp,
     # served c48/c64 "1536:3@2048"). Refused with moe_skinny_gmm=bf16_after.
     "gmm_v2_decode_stream": "",
+    # --- v7 minimax attention ---
+    # Same kernel, 4-bit prefill calls with a page cache in
+    # `msa_dcp.msa_attend_dcp`: "<threshold>:<block_q>:<tile_pages>" runs a
+    # call whose selections hold more than <threshold> distinct pages per
+    # query tile on average with <block_q>-token tiles and <tile_pages>
+    # cached union pages, other calls with the configured tiles (both kernels
+    # in one lax.cond). Each call is bitwise equal to its chosen config.
+    "minimax_msa_prefill_adaptive": "",
+    # Same kernel, the page cache table's sorts: "" (stable), "unstable",
+    # "packed" (one int32 operand per sort) or "packed_search"; and
+    # narrower table widths "<w>/<w>/..." below the tile pages (each layer's
+    # calls sort the narrowest that holds their widest union). Same table.
+    "minimax_msa_page_cache_sort": "",
+    "minimax_msa_page_cache_widths": "",
+    # Same kernel, head-parallel DCP prefill attention (`msa_dcp_heads`, with
+    # minimax_dcp_heads_attend): "<block_q>:<pages per step>:<widths
+    # w/w/...>:<page cache slots>", empty fields = the defaults (e.g.
+    # "16:16::1024"). Bitwise when only widths / page cache change.
+    "minimax_dcp_hp_prefill_config": "",
 }
 
 

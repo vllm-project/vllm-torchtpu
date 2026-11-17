@@ -27,6 +27,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention_lse,
     msa_attention_lse_r6,
     msa_dcp,
+    msa_dcp_heads,
     msa_indexer,
 )
 from vllm_torchtpu.opt_in_config import DEFAULTS, option
@@ -71,6 +72,10 @@ R6_ONLY_KEYS = (
     "minimax_msa_prefill_pages_per_step",
     "minimax_msa_decode_work_list_kernel",
     "minimax_msa_decode_one_call",
+    "minimax_msa_prefill_adaptive",
+    "minimax_msa_page_cache_sort",
+    "minimax_msa_page_cache_widths",
+    "minimax_dcp_hp_prefill_config",
 )
 
 
@@ -162,6 +167,38 @@ def _apply_r6(additional_config: Any) -> None:
     for key, attr, default in values:
         value = _non_negative(additional_config, key) or default
         _set_value(additional_config, key, r6, attr, value)
+    _set_value(
+        additional_config,
+        "minimax_msa_prefill_adaptive",
+        r6,
+        "PREFILL_ADAPTIVE",
+        r6.parse_adaptive(option(additional_config, "minimax_msa_prefill_adaptive")),
+    )
+    key = "minimax_msa_page_cache_sort"
+    mode = option(additional_config, key).strip().lower()
+    if mode not in r6.PAGE_CACHE_SORT_MODES:
+        raise ValueError(
+            f"additional_config.{key} must be one of {r6.PAGE_CACHE_SORT_MODES}, "
+            f"got {mode!r}"
+        )
+    _set_value(additional_config, key, r6, "PAGE_CACHE_SORT", mode)
+    key = "minimax_msa_page_cache_widths"
+    raw = option(additional_config, key).replace(",", "/")
+    try:
+        widths = tuple(sorted({int(w) for w in raw.split("/") if w.strip()}))
+    except ValueError:
+        raise ValueError(f"additional_config.{key}: bad widths {raw!r}") from None
+    if widths and widths[0] <= 0:
+        raise ValueError(f"additional_config.{key}: bad widths {raw!r}")
+    _set_value(additional_config, key, r6, "PAGE_CACHE_WIDTHS", widths)
+    key = "minimax_dcp_hp_prefill_config"
+    _set_value(
+        additional_config,
+        key,
+        msa_dcp_heads,
+        "HP_PREFILL_CONFIG",
+        msa_dcp_heads.parse_hp_prefill_config(option(additional_config, key)),
+    )
     if not option(additional_config, "minimax_msa_lse_r6"):
         unused = [
             k for k in R6_ONLY_KEYS if option(additional_config, k) != DEFAULTS[k]

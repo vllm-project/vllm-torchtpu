@@ -75,6 +75,11 @@ REPLACED_ENV = {
     "moe_dense_fp4_max_tokens": "TPU_MOE_DENSE_FP4_MAX_TOKENS",
     "moe_dense_fp4_shared": "TPU_MOE_DENSE_FP4_SHARED",
     "gmm_v2_decode_stream": "TPU_GMM_V2_DECODE_STREAM",
+    # --- v7 minimax attention ---
+    "minimax_msa_prefill_adaptive": "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE",
+    "minimax_msa_page_cache_sort": "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT",
+    "minimax_msa_page_cache_widths": "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS",
+    "minimax_dcp_hp_prefill_config": "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -97,6 +102,11 @@ SAMPLE = {
     # --- v7 MoE / grouped GEMM ---
     "moe_dense_fp4_max_tokens": 32,
     "gmm_v2_decode_stream": "1536:3@512",
+    # --- v7 minimax attention ---
+    "minimax_msa_prefill_adaptive": "30:8:64",
+    "minimax_msa_page_cache_sort": "packed",
+    "minimax_msa_page_cache_widths": "64/128",
+    "minimax_dcp_hp_prefill_config": "16:16::1024",
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {

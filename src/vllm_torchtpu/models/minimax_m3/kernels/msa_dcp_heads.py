@@ -42,6 +42,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
     msa_attention_lse,
+    msa_attention_lse_r6,
     msa_dcp,
     msa_fp4,
 )
@@ -51,6 +52,62 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 # max_model_len 256K), which a step's query gather and merge exceed from
 # about 2K tokens (~0.16 us per token at c64 DCP 8, j-0a66fa2e).
 HEAD_PARALLEL_MIN_TOKENS = 2048
+
+# Key minimax_dcp_hp_prefill_config ("<block_q>:<pages per step>:<widths
+# w/w/...>:<page cache slots>", e.g. "16:16::1024"; r6's lse kernel only,
+# minimax_msa_lse_r6): the MSA kernel config of the head-parallel prefill
+# attention (`_head_parallel_attend`), parsed by `kernel_toggles.apply` into
+# the r6 kernel's kwargs. That path otherwise runs the kernel defaults
+# (block_q 16, 16 pages per step, widths 4/8, no page cache): the
+# minimax_msa_prefill_* keys reach only `msa_dcp.msa_attend_dcp`. The page
+# cache covers `msa_attention_lse_r6.PAGE_CACHE_TILE_PAGES` union pages (key
+# minimax_msa_prefill_page_cache_tile_pages). None = the defaults.
+HP_PREFILL_CONFIG: dict | None = None
+HP_PREFILL_CONFIG_KEY = "minimax_dcp_hp_prefill_config"
+
+
+def parse_hp_prefill_config(spec: str) -> dict | None:
+    """"<block_q>:<pages per step>:<widths w/w/...>:<page cache slots>" (empty
+    fields keep the default) -> r6 kernel kwargs; None when `spec` is empty."""
+    spec = spec.strip()
+    if not spec:
+        return None
+    parts = spec.split(":")
+    if len(parts) != 4:
+        raise ValueError(
+            f"additional_config.{HP_PREFILL_CONFIG_KEY}={spec!r}: want "
+            "<block_q>:<pages per step>:<widths>:<page cache slots>"
+        )
+    block_q, pages_per_step, widths, slots = parts
+    kw = dict(
+        block_q=int(block_q or msa_attention.DEFAULT_BLOCK_Q),
+        pages_per_step=int(pages_per_step or msa_attention.DEFAULT_PAGES_PER_STEP),
+    )
+    if widths:
+        kw["step_widths"] = tuple(sorted(int(w) for w in widths.split("/")))
+    if int(slots or 0):
+        kw["page_cache_slots"] = int(slots)
+    if min(kw["block_q"], kw["pages_per_step"], *kw.get("step_widths", (1,))) <= 0:
+        raise ValueError(f"additional_config.{HP_PREFILL_CONFIG_KEY}={spec!r}")
+    return kw
+
+
+def _hp_prefill_attend():
+    """The head-parallel prefill attention kernel and its config kwargs."""
+    if HP_PREFILL_CONFIG is not None and msa_attention_lse.R6_KERNEL:
+        kw = dict(HP_PREFILL_CONFIG)
+        if "page_cache_slots" in kw:
+            kw["page_cache_bf16"] = msa_attention_lse_r6.PREFILL_PAGE_CACHE_BF16
+        msa_attention_lse_r6._proof(
+            HP_PREFILL_CONFIG_KEY,
+            f"head-parallel MSA prefill attention kernel {kw} (page cache "
+            f"tile pages {msa_attention_lse_r6.PAGE_CACHE_TILE_PAGES})",
+        )
+        return msa_attention_lse_r6.msa_sparse_attention_lse, kw
+    return msa_attention_lse.msa_sparse_attention_lse, dict(
+        block_q=msa_attention.DEFAULT_BLOCK_Q,
+        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+    )
 
 
 def merge_partials(
@@ -300,11 +357,11 @@ def _head_parallel_attend(
         lo = cu[jnp.min(jnp.where(in_round, seq_idx, max_num_seqs - 1))]
         hi = cu[jnp.max(jnp.where(in_round, seq_idx + 1, 0))]
 
+        kernel, kernel_kw = _hp_prefill_attend()
         attend = functools.partial(
-            msa_attention_lse.msa_sparse_attention_lse,
+            kernel,
             sm_scale=sm_scale,
-            block_q=msa_attention.DEFAULT_BLOCK_Q,
-            pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+            **kernel_kw,
             head=0,
             scale_cache=sc,
             k_scale_row=0,
