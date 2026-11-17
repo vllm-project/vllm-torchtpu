@@ -245,6 +245,9 @@ def test_gqa_decls_options_binding_and_hf_params():
 
     cdecl_geom = gqa_cache_decl(resolved)
     assert cdecl_geom == KVCacheDecl(hd=64, kvh=1, page_size=128, page_dtype=FP8)
+    assert gqa_cache_decl(resolved, kv_dtype="bf16").page_dtype == BF16
+    with pytest.raises(MegakernelConfigError, match="kv_dtype"):
+        validate_gqa_options({"kv_dtype": "fp16"})
     play = PoolLayout(num_pools=1, slots_per_pool=0, hd=128, page_size=128)
     assert gqa_cache_decl(None, pool_layout=play).hd == 128
 

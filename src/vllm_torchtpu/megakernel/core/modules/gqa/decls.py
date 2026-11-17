@@ -79,8 +79,12 @@ GQA_OPTIONS: dict[str, Any] = {
     "qk_norm": True,
     "output_gate": True,
     "rope_table": False,
+    "kv_dtype": "fp8",
     "weight_dtypes": None,
 }
+# `GQAModule(kv_dtype=...)` KV page dtypes: the model's KV cache stores
+# `"fp8"` (`float8_e4m3fn`) or `"bf16"` pages.
+GQA_KV_DTYPES: dict[str, Any] = {"fp8": FP8, "bf16": BF16}
 
 # `GQAModule(rope_table=True)` extra input: per-rank `(2, MR, ROT // 2)` f32, the
 # cos (`[0]`) and sin (`[1]`) of every step row, used as given.
@@ -105,6 +109,11 @@ def validate_gqa_options(options: Mapping[str, Any]) -> None:
     if not bool(options.get("qk_norm", True)):
         raise MegakernelConfigError(
             "GQAModule requires qk_norm=True (the kernel always applies q/k RMSNorm)"
+        )
+    if options.get("kv_dtype", "fp8") not in GQA_KV_DTYPES:
+        raise MegakernelConfigError(
+            f"GQAModule kv_dtype must be one of {sorted(GQA_KV_DTYPES)}, "
+            f"got {options.get('kv_dtype')!r}"
         )
     normalize_weight_dtypes(
         options.get("weight_dtypes"),
@@ -400,8 +409,11 @@ def gqa_hf_params(
     return apply_decl_overrides(decls, geom)
 
 
-def gqa_cache_decl(geom: Any | None, *, pool_layout: Any = None) -> KVCacheDecl:
-    """Return the `KVCacheDecl` describing one attention layer's KV page geometry."""
+def gqa_cache_decl(
+    geom: Any | None, *, pool_layout: Any = None, kv_dtype: str = "fp8"
+) -> KVCacheDecl:
+    """Return the `KVCacheDecl` describing one attention layer's KV page geometry
+    (`pool_layout`'s pages when given, else `geom.HD` pages of `kv_dtype`)."""
     if pool_layout is not None:
         return KVCacheDecl(
             hd=int(pool_layout.hd),
@@ -414,5 +426,5 @@ def gqa_cache_decl(geom: Any | None, *, pool_layout: Any = None) -> KVCacheDecl:
         hd=int(geom.HD),
         kvh=VALIDATED_KVH,
         page_size=VALIDATED_PAGE_SIZE,
-        page_dtype=FP8,
+        page_dtype=GQA_KV_DTYPES[kv_dtype],
     )

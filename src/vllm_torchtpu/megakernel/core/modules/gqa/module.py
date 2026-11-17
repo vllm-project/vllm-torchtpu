@@ -42,6 +42,7 @@ from .decls import (
     GQA_FIELD_ALIASES,
     GQA_GEOMETRY_FIELDS,
     GQA_GEOMETRY_METHODS,
+    GQA_KV_DTYPES,
     GQA_OPTIONS,
     GQA_PARAM_NAMES,
     GQA_WEIGHT_NAMES,
@@ -83,9 +84,10 @@ class GQAModule(Module):
         qk_norm: bool = True,
         output_gate: bool = True,
         rope_table: bool = False,
+        kv_dtype: str = "fp8",
         weight_dtypes: Mapping[str, str] | None = None,
     ) -> None:
-        # `PoolLayout` of the model's paged pools (None: fp8 pages). Its
+        # `PoolLayout` of the model's paged pools (None: `kv_dtype` pages). Its
         # `page_dtype` sets the KV page packing `(2, HD // PK, PK, page_size)`.
         self.pool_layout = pool_layout
         self.geometry = geometry
@@ -95,6 +97,8 @@ class GQAModule(Module):
         # The step takes each row's RoPE cos / sin (`ROPE_TABLE_INPUT`) and `pos`
         # is the KV index only, so RoPE positions (M-RoPE) may differ from it.
         self.rope_table = bool(rope_table)
+        # The KV cache's page dtype, from which the model's pool layout derives.
+        self.kv_dtype_name = kv_dtype
         self.weight_dtypes = normalize_weight_dtypes(
             weight_dtypes, GQA_WEIGHT_NAMES, "GQAModule", MegakernelConfigError
         )
@@ -103,6 +107,8 @@ class GQAModule(Module):
             "output_gate": self.output_gate,
             "rope_table": self.rope_table,
         }
+        if kv_dtype != "fp8":
+            opts["kv_dtype"] = kv_dtype
         if weight_dtypes is not None:
             opts["weight_dtypes"] = self.weight_dtypes
         self._validate_options(opts)
@@ -122,8 +128,10 @@ class GQAModule(Module):
 
     @property
     def kv_dtype(self) -> Any:
-        """KV page dtype: `pool_layout.page_dtype`, fp8 without a layout."""
-        return FP8 if self.pool_layout is None else self.pool_layout.page_dtype
+        """KV page dtype: `pool_layout.page_dtype`, `kv_dtype` without a layout."""
+        if self.pool_layout is None:
+            return GQA_KV_DTYPES[self.kv_dtype_name]
+        return self.pool_layout.page_dtype
 
     def kv_page_shape(self, g: Any, ex: ExecSpec) -> tuple[int, ...]:
         """Shape of one pool page, from `pool_layout` when the model sets one.
@@ -351,7 +359,9 @@ class GQAModule(Module):
         geom = g if g is not None else self.geometry
         if geom is None and self.pool_layout is None:
             geom = self._require_geometry(g)
-        return gqa_cache_decl(geom, pool_layout=self.pool_layout)
+        return gqa_cache_decl(
+            geom, pool_layout=self.pool_layout, kv_dtype=self.kv_dtype_name
+        )
 
     def init_logical_states(
         self, key: Any, g: Any, ex: ExecSpec, n_layers: int
