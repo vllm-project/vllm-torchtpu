@@ -226,7 +226,6 @@ def apply(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Traced-code entry from a quant method's ``apply_monolithic``."""
     assert SPEC is not None
-    _log_once(layer)
     ids, weights, stats = cap_routes(
         topk_ids,
         topk_weights,
@@ -244,8 +243,10 @@ def apply(
 
 
 def register(layer: Any) -> None:
-    """Allocate the stats buffer. Call from ``process_weights_after_loading``."""
+    """Proof line and stats buffer. Call from ``process_weights_after_loading``
+    (eager code: the traced ``apply`` must not log)."""
     global _stats
+    _log_once(layer)
     if STATS_EVERY <= 0 or _stats is not None:
         return
     _stats = torch.zeros((_NSTAT,), dtype=torch.float32, device=layer.w13_weight.device)
