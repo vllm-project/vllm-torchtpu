@@ -26,6 +26,7 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
+from vllm_torchtpu.distributed import tpu_multiport_dp
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -49,10 +50,9 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 
-# Launch topology of a single-host multi-port DP server
-# (distributed/tpu_multiport_dp.py): each engine compiles the same programs as
-# under internal-LB DP.
-MULTIPORT_DP_ADDITIONAL_CONFIG_KEY = "tpu_multiport_dp"
+# Launch topology of a single-host multi-port DP server: each engine compiles
+# the same programs as under internal-LB DP.
+MULTIPORT_DP_ADDITIONAL_CONFIG_KEY = tpu_multiport_dp.SECTION
 
 # Knobs that never change the compiled graph (the profiling diagnostics above
 # and the multi-port launch topology), so
