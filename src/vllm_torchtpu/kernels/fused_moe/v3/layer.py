@@ -320,6 +320,48 @@ TABLES_STEP_CANDIDATES = tuple(
 SCALES_RANK_PER_CHANNEL = 2
 SCALES_RANK_PER_BLOCK = 3
 
+# The forms the TPU reference test (tests/kernels/fused_moe/
+# test_fused_ep_moe_v3.py) covers: fp8 weights with one scale per output
+# channel, silu over a gate and an up half, no biases, whole experts in VMEM
+# with one fp8 scale per row, fp8 token rows and intermediate, and fp8 or
+# bf16 result rows. The kernel also carries the weight-streamed build, the
+# blocked row scales, the four-bit, block-scaled and bf16 weight formats,
+# expert biases, the other activations and the single projection, and bf16
+# token rows and intermediate. fused_ep_moe refuses those until a TPU case
+# against the reference covers each; the code stays so that adding the case
+# and the form to these sets is what admits it.
+TESTED_WEIGHT_FORMATS = frozenset({WeightFormat.FP8})
+TESTED_ACTIVATIONS = frozenset({"silu"})
+
+
+def check_tested(form, *, activation, no_gate, has_bias, config):
+    """Raises NotImplementedError for a form no TPU reference test covers
+    (see TESTED_WEIGHT_FORMATS)."""
+    untested = []
+    if form.name not in TESTED_WEIGHT_FORMATS:
+        untested.append(f"weight format {str(form.name)!r}")
+    if no_gate:
+        untested.append("the single projection (no_gate)")
+    elif activation not in TESTED_ACTIVATIONS:
+        untested.append(f"activation {activation!r}")
+    if has_bias:
+        untested.append("expert biases")
+    if config.activation_block or config.token_rows_block or config.stream_block:
+        untested.append(
+            "blocked row scales or a streamed build (Config.activation_block, "
+            "token_block, stream_block)"
+        )
+    if config.token_rows != "fp8":
+        untested.append(f"token_rows {config.token_rows!r}")
+    if config.intermediate != "fp8":
+        untested.append(f"intermediate {config.intermediate!r}")
+    if untested:
+        raise NotImplementedError(
+            f"fused EP MoE v3: {', '.join(untested)} has no TPU test against "
+            "the reference yet. TODO: add the case to test_fused_ep_moe_v3.py "
+            "and the form to the tested sets in layer.py"
+        )
+
 
 def pallas_pair_multiple(
     blocks_per_step=tables_kernel.BLOCKS_PER_STEP,
@@ -762,11 +804,12 @@ def fused_ep_moe(
       routing_block: pairs per routing block. Derived when None.
       routed_rows_per_shard: routed rows per shard. The no-drop bound
         when None.
-      weight_format: "fp8", "fp8_block", "fp4", "int4" or "bf16".
+      weight_format: "fp8", "fp8_block", "fp4", "int4" or "bf16"; only
+        "fp8" is admitted until the others have TPU tests (check_tested).
       weight_block: contraction rows per fp4 scale. WEIGHT_BLOCK_DEFAULT
         when None.
       activation: "silu" or "swigluoai" ("silu", "gelu" or "relu" with
-        no_gate).
+        no_gate); only "silu" with the gate is admitted (check_tested).
       swiglu_limit: the clip of the clamped swiglu ("swigluoai"), the
         model's swiglu_limit (GPT-OSS ships 7.0); ignored by the other
         activations.
@@ -903,6 +946,13 @@ def fused_ep_moe(
         config = Config.for_shape(
             hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=top_k
         )
+    check_tested(
+        form,
+        activation=activation,
+        no_gate=no_gate,
+        has_bias=w1_bias is not None or w2_bias is not None,
+        config=config,
+    )
     partition = jax.sharding.PartitionSpec
     token_dtype = config.token_dtype
     bound = tables.routed_rows_bound(tokens, top_k, num_experts, tile_rows)
