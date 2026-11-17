@@ -1523,12 +1523,25 @@ def test_kv_only_pass_writes_the_full_step0_cache_entries_on_tpu(tpu_mtp):
 
 
 @pytest.mark.tpu_test
-def test_proposer_two_pass_step0_matches_the_single_pass_on_tpu(monkeypatch, tpu_mtp):
+@pytest.mark.parametrize(
+    "rejected, index_share",
+    [
+        pytest.param(0, False, id="all-accepted"),
+        # Request 0's last 2 tokens are rejected drafts: pass 1 still writes
+        # their rows, as the single pass does, and pass 2 narrows request 0's
+        # window back to its accepted prefix.
+        pytest.param(2, True, id="rejected-indexshare"),
+    ],
+)
+def test_proposer_two_pass_step0_matches_the_single_pass_on_tpu(
+    monkeypatch, tpu_mtp, rejected, index_share
+):
     """`Eagle3Proposer._two_pass_step0` on TPU: pass 1 over every row, the
     compiled `_draft_gather_rows`, then step 0 on one row per request with
     the pass-2 metadata it narrows from the chunk's own. Same caches as the
-    single pass, and each request's last row gets the same attention output
-    (within a tolerance: pass 2 runs the decode path of the kernels)."""
+    single pass, and each request's last accepted row gets the same attention
+    output (within a tolerance: pass 2 runs the decode path of the kernels)
+    and the same top-k, which is what IndexShare saves for the loop steps."""
     from vllm.forward_context import ForwardContext, override_forward_context
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -1537,9 +1550,10 @@ def test_proposer_two_pass_step0_matches_the_single_pass_on_tpu(monkeypatch, tpu
 
     built = tpu_mtp
     want_out, want_caches = _tpu_single_pass(built)
-    # Each request's last row: request 0's context (352) is longer than the
-    # top-k (256), so its indexer really selects.
-    want_topk = _selected(built.topk_rows[[31, 55]].cpu())
+    # Each request's last accepted row: request 0's context (352) is longer
+    # than the top-k (256), so its indexer really selects.
+    last = [31 - rejected, 55]
+    want_topk = _selected(built.topk_rows[last].cpu())
     mla.reset_caches(built, built.prefix_caches)
 
     @contextlib.contextmanager
@@ -1570,11 +1584,26 @@ def test_proposer_two_pass_step0_matches_the_single_pass_on_tpu(monkeypatch, tpu
     )
     proposer.draft_vllm_config = object()
     proposer._draft_attn_layer_names = set(TPU_NAMES)
-    proposer.draft_model = (
-        lambda *, input_ids, positions, hidden_states, spec_step_idx: built.step0_c(
-            input_ids, positions, hidden_states
-        )
-    )
+    skips = []
+
+    class _Draft:
+        """The full step 0, with the IndexShare switch a DSA MTP draft has."""
+
+        model = SimpleNamespace(set_skip_topk=skips.append)
+
+        def __call__(self, *, input_ids, positions, hidden_states, spec_step_idx):
+            return built.step0_c(input_ids, positions, hidden_states)
+
+    class _LoopStepModel:
+        """IndexShare's loop-step program (indexer off): step 0 never runs it."""
+
+        def __call__(self, **_kwargs):
+            raise AssertionError("draft step 0 ran the loop-step program")
+
+    proposer.draft_model = _Draft()
+    proposer._share_mtp_indices = index_share
+    proposer._mtp_loop_model = _LoopStepModel() if index_share else None
+    proposer._mtp_topk_buffers = [built.topk_rows] if index_share else []
     proposer._mtp_kv_only = MtpKvOnlyStep0(built.kv_only_c, 9, object())
     ids, positions, hidden = built.step
     md = built.step_md()
@@ -1593,21 +1622,28 @@ def test_proposer_two_pass_step0_matches_the_single_pass_on_tpu(monkeypatch, tpu
         hidden_states=hidden,
         attn_metadata=md,
     )
+    last_rows = torch.tensor(
+        last + [0] * 6, dtype=torch.int64, device=built.last_rows.device
+    )
     with torch.no_grad():
         last_hidden, _, rows_positions, _, owner_mask = proposer._two_pass_step0(
             chunk=chunk,
             input_ids=ids,
             positions=positions,
             target_hidden_states=hidden,
-            last_token_indices=built.last_rows,
-            num_rejected=np.zeros(2, dtype=np.int32),
+            last_token_indices=last_rows,
+            num_rejected=np.array([rejected, 0], dtype=np.int32),
         )
     mla.assert_same_bytes(built.caches, want_caches, "two-pass vs single pass")
-    assert rows_positions.cpu()[:2].tolist() == [built.end - 1, 23]
+    assert rows_positions.cpu()[:2].tolist() == [built.end - 1 - rejected, 23]
     assert owner_mask.cpu().all()
     # Pass 2 runs the decode path of the top-k, which may order the selected
-    # positions differently: compare them as sets.
+    # positions differently: compare them as sets. With IndexShare, these rows
+    # are what `_mtp_save_topk` keeps for the loop steps.
     assert _selected(built.topk_rows[:2].cpu()) == want_topk
+    if index_share:
+        # Pass 2 ran the draft with its indexer on.
+        assert skips == [False]
     torch.testing.assert_close(
-        last_hidden.cpu()[:2], want_out[[31, 55]], rtol=1e-2, atol=1e-2
+        last_hidden.cpu()[:2], want_out[last], rtol=1e-2, atol=1e-2
     )
