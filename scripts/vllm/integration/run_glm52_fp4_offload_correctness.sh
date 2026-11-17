@@ -87,8 +87,7 @@ export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:
 #   NEW_MODEL_DESIGN / MODEL_IMPL_TYPE / VLLM_PLUGINS -- no GLM-5.2 config in
 #     cloud-devkit-recipes sets them (the FP8 v7x-16 recipe has MODEL_IMPL_TYPE
 #     commented out), and the sibling qwen35 rigs run this image without them.
-#   TPU_ROPE_CACHE_ROW_MAJOR / TPU_MOE_HASH_TABLE_ROW_MAJOR -- DSv4 knobs; no
-#     GLM-5.2 recipe sets them.
+#   TPU_MOE_HASH_TABLE_ROW_MAJOR -- DSv4 knob; no GLM-5.2 recipe sets it.
 #   TPU_TOPOLOGY / TPU_HOST_BOUNDS / MEGASCALE_* / TPU_PROCESS_* /
 #     RAY_LOG_TO_STDERR -- the recipe blanks inherited multihost variables for
 #     a 2x2x1 JobSet pod. This rig is one process on one v7x-8 host, and the

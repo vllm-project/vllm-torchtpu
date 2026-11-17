@@ -519,7 +519,7 @@ def test_paired_cos_sin_tables_are_computed_in_graph(theta: float) -> None:
     x = torch.randn(5, 2, 64)
     positions = torch.tensor([0, 1, 777, 2048, 4095])
     expected = rope(x, positions)
-    assert rope_patch.patch_cos_sin_table_pairs(rope) == 1
+    assert rope_patch.patch_cos_sin_buffers(rope) == 1
     assert "cos" not in rope._buffers and "sin" not in rope._buffers
     torch.testing.assert_close(rope(x, positions), expected, rtol=0, atol=1e-5)
 
@@ -528,7 +528,7 @@ def test_a_table_that_is_not_rope_stays_a_buffer() -> None:
     module = nn.Module()
     module.register_buffer("cos", torch.rand(16, 4))
     module.register_buffer("sin", torch.rand(16, 4))
-    assert rope_patch.patch_cos_sin_table_pairs(module) == 0
+    assert rope_patch.patch_cos_sin_buffers(module) == 0
     assert "cos" in module._buffers
 
 
@@ -779,7 +779,7 @@ def test_content_fallback_recovers_mscale_table() -> None:
 
     module = nn.Module()
     module.register_buffer("cos_sin_cache", table, persistent=False)
-    assert rope_patch.patch_cos_sin_cache_buffers(module) == 1
+    assert rope_patch.patch_cos_sin_buffers(module) == 1
     assert isinstance(module.cos_sin_cache, rope_patch.InGraphCosSinCache)
     idx = torch.tensor([0, 1, 37, 511])
     torch.testing.assert_close(
@@ -1048,16 +1048,17 @@ class _TwoSegmentLongRope(nn.Module):
 
 
 def test_segment_verification_samples_rows() -> None:
+    assert not hasattr(rope_patch, "_rope_table_inv_freq")
     # > 4096 rows exercises the sampled prefix + strided + tail index path.
     clean = _SyntheticRotaryEmbedding(max_position=8192, scaling_factor=4.0)
-    assert rope_patch.patch_cos_sin_cache_buffers(clean) == 1
+    assert rope_patch.patch_cos_sin_buffers(clean) == 1
     assert isinstance(clean.cos_sin_cache, rope_patch.InGraphCosSinCache)
 
     # Corrupt row 7 of segment 0 -> analytical and content fallback both reject it.
     corrupt_row7 = _SyntheticRotaryEmbedding(max_position=8192, scaling_factor=4.0)
     buf7 = corrupt_row7.cos_sin_cache
     buf7[7] = -buf7[7] + 2.0
-    assert rope_patch.patch_cos_sin_cache_buffers(corrupt_row7) == 0
+    assert rope_patch.patch_cos_sin_buffers(corrupt_row7) == 0
     assert corrupt_row7.cos_sin_cache is buf7
 
     # ~1.5e-4 OpenMP CPU slice jitter on FP32 tables must NOT split workers,
@@ -1066,7 +1067,7 @@ def test_segment_verification_samples_rows() -> None:
         max_position=8192, scaling_factor=4.0, dtype=torch.float32
     )
     jittered.cos_sin_cache[7, 0] += 1.8e-4
-    assert rope_patch.patch_cos_sin_cache_buffers(jittered) == 1
+    assert rope_patch.patch_cos_sin_buffers(jittered) == 1
     assert isinstance(jittered.cos_sin_cache, rope_patch.InGraphCosSinCache)
 
     wrong_mscale = _SyntheticRotaryEmbedding(
@@ -1080,14 +1081,14 @@ def test_segment_verification_samples_rows() -> None:
 
     # Corrupt row 7 of the second segment (`short_len + 7`) on a multi-segment table.
     clean_long = _TwoSegmentLongRope()
-    assert rope_patch.patch_cos_sin_cache_buffers(clean_long) == 1
+    assert rope_patch.patch_cos_sin_buffers(clean_long) == 1
     assert isinstance(clean_long.cos_sin_cache, rope_patch.InGraphCosSinCache)
 
     corrupt_seg2 = _TwoSegmentLongRope()
     buf_seg2 = corrupt_seg2.cos_sin_cache
     seg2_row7 = corrupt_seg2.original_max_position_embeddings + 7
     buf_seg2[seg2_row7] = -buf_seg2[seg2_row7] + 2.0
-    assert rope_patch.patch_cos_sin_cache_buffers(corrupt_seg2) == 0
+    assert rope_patch.patch_cos_sin_buffers(corrupt_seg2) == 0
     assert corrupt_seg2.cos_sin_cache is buf_seg2
 
 
@@ -1109,7 +1110,7 @@ def test_fope_2d_buffer_skips_content_fallback() -> None:
 
     fope = _FakeFoPE2D()
     orig = fope.cos_sin_cache
-    assert rope_patch.patch_cos_sin_cache_buffers(fope) == 0
+    assert rope_patch.patch_cos_sin_buffers(fope) == 0
     assert fope.cos_sin_cache is orig
 
 
@@ -1134,7 +1135,7 @@ def test_fallback_memo_distinguishes_storage_views() -> None:
     m2.register_buffer("cos_sin_cache", slab[16:], persistent=False)
     root = nn.ModuleDict({"a": m1, "b": m2})
 
-    assert rope_patch.patch_cos_sin_cache_buffers(root) == 2
+    assert rope_patch.patch_cos_sin_buffers(root) == 2
     idx = torch.tensor([1, 5, 11], dtype=torch.int64)
     torch.testing.assert_close(m1.cos_sin_cache[idx], t1[idx], atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(m2.cos_sin_cache[idx], t2[idx], atol=1e-6, rtol=1e-6)
@@ -1190,7 +1191,17 @@ def test_get_rope_cos_sin_and_rotary_dim_across_patched_and_unpatched() -> None:
     pair_mod = nn.Module()
     pair_mod.register_buffer("cos", angles.cos(), persistent=False)
     pair_mod.register_buffer("sin", angles.sin(), persistent=False)
-    assert rope_patch.patch_cos_sin_table_pairs(pair_mod) == 1
+    cache_mod = nn.Module()
+    cache_mod.register_buffer(
+        "cos_sin_cache",
+        torch.cat((angles.cos(), angles.sin()), dim=-1),
+        persistent=False,
+    )
+    combined = nn.Module()
+    combined.pair = pair_mod
+    combined.cache = cache_mod
+    assert rope_patch.patch_cos_sin_buffers(combined) == 2
+    assert isinstance(cache_mod.cos_sin_cache, rope_patch.InGraphCosSinCache)
     assert rope_patch.get_rope_rotary_dim(pair_mod) == 16
     pair_pos = torch.tensor([0, 7, 63], dtype=torch.int32)
     torch.testing.assert_close(

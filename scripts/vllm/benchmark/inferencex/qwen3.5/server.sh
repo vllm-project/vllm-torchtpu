@@ -102,10 +102,6 @@ export RAGGED_GATHER_REDUCE_VERSION="${RAGGED_GATHER_REDUCE_VERSION:-v3}"
 # Set it to empty to opt out of the extra buckets.
 export TPU_TOKEN_BUCKET_EXTRA="${TPU_TOKEN_BUCKET_EXTRA-4,8,48}"
 
-# Shrink the rotary cos_sin caches to max_model_len, text-only, to minimize
-# xla layout data copy overhead.
-export TPU_ROPE_CACHE_TRUNCATE="${TPU_ROPE_CACHE_TRUNCATE:-1}"
-
 # Skip padded tokens in the fused MoE so they activate no experts.
 export TPU_MOE_SKIP_PADDED_TOKENS=1
 

@@ -124,8 +124,6 @@ if TYPE_CHECKING:
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_HANDOFF_DEPTH: int = 2
     TPU_ROPE_IN_GRAPH: bool = True
-    TPU_ROPE_CACHE_TRUNCATE: bool = False
-    TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
@@ -921,12 +919,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # precomputed [max_position, rotary_dim] HBM table. Set to 0 to restore
     # the precomputed table.
     "TPU_ROPE_IN_GRAPH": env_bool("TPU_ROPE_IN_GRAPH", default=True),
-    # Slice the rotary cos_sin caches to max model len at load to
-    # minimize xla layout data copy overhead. Text-only.
-    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
-    # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
-    # layout at load, May cost more HBM due to padding.
-    "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
