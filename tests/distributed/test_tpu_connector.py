@@ -266,6 +266,7 @@ def _make_vllm_config(
     cfg.parallel_config.decode_context_parallel_size = 1
     cfg.parallel_config.cp_kv_cache_interleave_size = interleave_size
     cfg.parallel_config.pipeline_parallel_size = pp_size
+    cfg.parallel_config.world_size = pp_size * pcp_size * tp_size
     return cfg
 
 

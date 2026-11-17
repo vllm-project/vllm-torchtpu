@@ -409,6 +409,7 @@ def _produce(monkeypatch, topo: Topology, num_tokens: int, per_layer_tags: bool)
     )
     config = scheduler.vllm_config
     config.parallel_config.pipeline_parallel_size = topo.pp
+    config.parallel_config.world_size = topo.pp * topo.pcp * topo.ptp
     config.parallel_config.cp_kv_cache_interleave_size = KERNEL_PAGE
     config.kv_transfer_config.kv_connector_extra_config = {
         "destination_decode_context_parallel_size": topo.dcp
@@ -478,6 +479,10 @@ def _produce(monkeypatch, topo: Topology, num_tokens: int, per_layer_tags: bool)
                         return_value=SimpleNamespace(rank_in_group=stage),
                     ),
                     patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=p),
+                    patch(
+                        "vllm_torchtpu.distributed.pipeline_stage._STAGE",
+                        SimpleNamespace(position=p),
+                    ),
                 ):
                     rank = worker._local_raiden_transfer_rank()
                     expected_rank = (
