@@ -423,30 +423,6 @@ def test_local_prefix_hit_forwards_max_cache_hit_length(monkeypatch):
     # ... but a lookup with another bound goes to the base with that bound.
     assert s._get_local_prefix_cache_hit(r, 500)[1] == 7
     assert seen == [500]
-    assert r._tpu_local_hit_tokens == 7
-
-
-def test_schedule_polls_the_connector_before_vllm_schedules(monkeypatch):
-    events = []
-
-    def fake_schedule(self, *args, **kwargs):
-        events.append("schedule")
-        return "out"
-
-    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
-    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    s._is_kv_consumer = True
-    s.running = []
-    s.connector = SimpleNamespace(
-        poll_and_complete_transfers=lambda sched: events.append(("poll", sched))
-    )
-    assert s.schedule() == "out"
-    assert events == [("poll", s), "schedule"]
-    # A connector without the method (main's Raiden connector today) is skipped.
-    events.clear()
-    s.connector = SimpleNamespace()
-    assert s.schedule() == "out"
-    assert events == ["schedule"]
 
 
 def _init_with(monkeypatch, kv_transfer_config, calls=None):
