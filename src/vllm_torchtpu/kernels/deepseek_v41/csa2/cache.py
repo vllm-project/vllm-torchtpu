@@ -13,6 +13,12 @@ import jax
 import jax.numpy as jnp
 
 MIN_KV_AMAX = 1e-4
+# Zero rows that invalid IDs read in the three-slot gather. Gathers whose IDs
+# share one row serialize on v7x: a 160-row prefill tail padded to 2,048 rows
+# spent 2.6 ms per 65,536-ID gather reading row 0, against 0.1 ms for valid
+# IDs. Each invalid ID reads the row of its own position modulo this power
+# of two.
+_ZERO_ROWS = 4096
 
 
 @jax.jit
@@ -220,6 +226,7 @@ def _gather_sc_banked_deep(words, scales, records):
     two gathers are in flight instead of one. Each 16-id stream is filled by
     one masked gather per bank plus a masked gather of a zero row for negative
     ids, so every staged row has exactly one writer and no slot is cleared.
+    Negative ids read distinct zero rows (see ``_ZERO_ROWS``).
     Copies of one slot and stream share a semaphore; with one semaphore per
     source, kind and slot, three- and four-slot versions hung on v7x.
     """
@@ -236,8 +243,8 @@ def _gather_sc_banked_deep(words, scales, records):
     count = records.size
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
-    zero_words = jnp.zeros((8, 128), jnp.int32)
-    zero_scales = jnp.zeros((8,), jnp.float32)
+    zero_words = jnp.zeros((_ZERO_ROWS, 128), jnp.int32)
+    zero_scales = jnp.zeros((_ZERO_ROWS,), jnp.float32)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,
@@ -261,6 +268,7 @@ def _gather_sc_banked_deep(words, scales, records):
         core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         split = word_refs[0].shape[0]
         steps = subchunks // streams
+        lane = jnp.arange(lanes, dtype=jnp.int32)
 
         def outer(ids):
             base = (pl.program_id(0) * cores + core) * subchunks * lanes
@@ -269,6 +277,7 @@ def _gather_sc_banked_deep(words, scales, records):
                 slot = step % slots
                 for stream in range(streams):
                     selected = ids[pl.ds((step * streams + stream) * lanes, lanes)]
+                    position = base + (step * streams + stream) * lanes + lane
                     targets = []
                     for bank in range(len(words)):
                         own = (selected >= 0) & (
@@ -283,7 +292,11 @@ def _gather_sc_banked_deep(words, scales, records):
                             )
                         )
                     targets.append(
-                        (zero_word_ref, zero_scale_ref, jnp.where(selected < 0, 0, -1))
+                        (
+                            zero_word_ref,
+                            zero_scale_ref,
+                            jnp.where(selected < 0, position & (_ZERO_ROWS - 1), -1),
+                        )
                     )
                     for word_src, scale_src, rows in targets:
                         indexed = plsc.Indices(rows, ignored_value=-1)
