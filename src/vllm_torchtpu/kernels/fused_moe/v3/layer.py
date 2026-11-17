@@ -547,6 +547,7 @@ def _pallas_step(
         pairs_per_expert=(
             message_tokens if routing_indices is None else message_tokens * top_k
         ),
+        mesh_axes=mesh_axes,
     )
     (
         _,

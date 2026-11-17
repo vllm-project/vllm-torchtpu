@@ -490,7 +490,6 @@ def one_cpu_shard(monkeypatch):
         (v3_layout, "SHARD_INDEX_OPERAND"),
     ):
         monkeypatch.setattr(module, flag, getattr(module, flag))
-    mesh = Mesh(np.asarray(jax.devices("cpu")[:1]), (MESH_AXIS,))
     tokens, hidden, inter, experts = 32, 256, 128, 8
     shapes = (
         jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
@@ -501,8 +500,10 @@ def one_cpu_shard(monkeypatch):
         jax.ShapeDtypeStruct((tokens, experts), jnp.float32),
     )
 
-    def trace(shard_index=None, **kwargs):
+    def trace(shard_index=None, axes=(MESH_AXIS,), **kwargs):
         kwargs.setdefault("config", Config(result_rows="bf16"))
+        cpu = np.asarray(jax.devices("cpu")[:1]).reshape((1,) * len(axes))
+        mesh = Mesh(cpu, axes)
 
         def run(x, w1, w2, s1, s2, logits):
             return fused_ep_moe(
@@ -562,6 +563,26 @@ def test_both_shard_index_modes_build_in_one_process(one_cpu_shard, bridge_first
     first, second = (bridge, own) if bridge_first else (own, bridge)
     first()
     second()
+
+
+@pytest.mark.cpu_test
+def test_the_tables_program_addresses_every_mesh_axis(one_cpu_shard, monkeypatch):
+    """On a mesh with a replica axis, the transport rounds the shard-tables
+    program hosts address peers by every axis, as the start program's do:
+    an exchange keyed on the expert axis alone gives remote copies a
+    one-coordinate device id on a two-axis mesh."""
+    from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, transport
+
+    seen = []
+    middle = transport.forward_middle_rounds
+
+    def record(exchange):
+        seen.append(exchange.mesh_axes)
+        return middle(exchange)
+
+    monkeypatch.setattr(transport, "forward_middle_rounds", record)
+    one_cpu_shard(axes=(MESH_AXIS, "replica"))
+    assert seen == [(MESH_AXIS, "replica")]
 
 
 @pytest.mark.cpu_test
