@@ -27,10 +27,10 @@ The reasoning-count and detokenizer patches only apply in the API server
 processes; the tokenization cache is only reached through vLLM's renderer.
 """
 
-import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_torchtpu import config_section
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -59,42 +59,13 @@ class FrontendOptions:
 
 
 def parse(raw: Any) -> FrontendOptions:
-    """The ``tpu_frontend`` section as options; None gives the defaults.
-
-    Strict: an unknown key, or a value whose type is not exactly the field's
-    (``1`` for a bool, say), raises ``ValueError``.
-    """
-    if raw is None:
-        return FrontendOptions()
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"additional_config.{SECTION} must be a JSON object, "
-            f"got {type(raw).__name__}"
-        )
-    fields = {f.name: f.type for f in dataclasses.fields(FrontendOptions)}
-    unknown = sorted(set(raw) - set(fields))
-    if unknown:
-        raise ValueError(
-            f"additional_config.{SECTION} has unknown keys {unknown}; "
-            f"valid keys: {sorted(fields)}"
-        )
-    for name, value in raw.items():
-        want = fields[name]
-        assert isinstance(want, type)  # the annotations are classes, not strings
-        if type(value) is not want:
-            raise ValueError(
-                f"additional_config.{SECTION}.{name} must be a "
-                f"{want.__name__}, got {value!r}"
-            )
-    return FrontendOptions(**raw)
+    """The ``tpu_frontend`` section as options (see ``config_section.parse``)."""
+    return config_section.parse(FrontendOptions, SECTION, raw)
 
 
 def get(vllm_config: Any) -> FrontendOptions:
     """The engine's frontend options."""
-    additional = getattr(vllm_config, "additional_config", None)
-    if not isinstance(additional, dict):
-        return FrontendOptions()
-    return parse(additional.get(SECTION))
+    return config_section.get(FrontendOptions, SECTION, vllm_config)
 
 
 def install(vllm_config: Any) -> FrontendOptions:
