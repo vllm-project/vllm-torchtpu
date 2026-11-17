@@ -378,7 +378,7 @@ def _vllm_config(max_num_seqs, num_speculative_tokens):
 
 @pytest.mark.parametrize(
     "max_num_seqs, k, armed",
-    [(16, 3, "fused"), (fused.MAX_ROWS // 2, 3, "eager"), (64, 0, "fused")],
+    [(16, 3, "kernel"), (fused.MAX_ROWS // 2, 3, "JAX reference"), (64, 0, "kernel")],
 )
 def test_prebuild_logs_which_path_decode_takes(monkeypatch, max_num_seqs, k, armed):
     messages = []
@@ -390,7 +390,7 @@ def test_prebuild_logs_which_path_decode_takes(monkeypatch, max_num_seqs, k, arm
         assert fused._prebuild(layer, model_config=None)
     assert len(fused._ops) == 1
     (message,) = messages
-    assert f"runs the {armed} path" in message
+    assert message.endswith(f"runs the {armed}.")
     assert f"<= {fused.MAX_ROWS // (1 + k)} requests" in message
 
 

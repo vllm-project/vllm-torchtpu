@@ -152,13 +152,14 @@ def _log_armed_rows(vllm_config: VllmConfig) -> None:
     max_decode_rows = vllm_config.scheduler_config.max_num_seqs * rows_per_request
     logger.info_once(
         "[Attention] Fused q/k norm + rope: buckets of <= %d rows run the fused "
-        "q/k norm + rope kernel, i.e. decode steps of <= %d requests at %d rows "
-        "each; the largest decode step has %d rows and runs the %s path.",
+        "q/k norm + rope kernel and larger ones its JAX reference in the same "
+        "op, i.e. decode steps of <= %d requests at %d rows each take the "
+        "kernel; the largest decode step has %d rows and runs the %s.",
         MAX_ROWS,
         MAX_ROWS // rows_per_request,
         rows_per_request,
         max_decode_rows,
-        "fused" if max_decode_rows <= MAX_ROWS else "eager",
+        "kernel" if max_decode_rows <= MAX_ROWS else "JAX reference",
     )
 
 
