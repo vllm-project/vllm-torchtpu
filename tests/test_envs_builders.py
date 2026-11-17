@@ -24,6 +24,7 @@ is a launch-script bug and defaulting hides it.
 
 import pytest
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.envs import (
     env_bool,
     env_float,
@@ -263,6 +264,10 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("TORCH_TPU_MP_RENDEZVOUS_PORT", None),
         ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
         ("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", None),
+        ("TPU_VISIBLE_DEVICE_PATHS", ""),
+        ("LWS_WORKER_INDEX", None),
+        ("LWS_GROUP_SIZE", 1),
+        ("LWS_LEADER_ADDRESS", ""),
     ],
 )
 def test_migrated_knob_defaults(monkeypatch, name, expected):
@@ -285,3 +290,10 @@ def test_spec_warmup_off_spellings(monkeypatch):
     monkeypatch.setenv("SPEC_WARMUP", "nope")
     with pytest.raises(ValueError, match="SPEC_WARMUP"):
         _ = envs.SPEC_WARMUP
+
+
+@pytest.mark.parametrize("bad_value", ["not-an-int", "-1"])
+def test_lws_group_size_env_rejects_invalid_and_negative_values(monkeypatch, bad_value):
+    monkeypatch.setenv("LWS_GROUP_SIZE", bad_value)
+    with pytest.raises(ValueError, match="LWS_GROUP_SIZE"):
+        _ = envs.LWS_GROUP_SIZE

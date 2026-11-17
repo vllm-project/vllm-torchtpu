@@ -992,7 +992,7 @@ def test_tpu_worker_specific_env_vars_excluded_from_driver_env():
     }.issubset(_TPU_WORKER_SPECIFIC_ENV_VARS)
 
 
-def test_resolve_slicebuilder_hosts_lws_and_reverse_dns(monkeypatch):
+def test_resolve_slicebuilder_hosts_ipv4_and_ptr_reverse_dns(monkeypatch):
     # IPv4 hosts pass through unchanged without DNS resolution.
     monkeypatch.delenv("LWS_LEADER_ADDRESS", raising=False)
     assert dist_utils.resolve_slicebuilder_hosts(["10.0.0.1", "10.0.0.2"]) == {
@@ -1029,6 +1029,8 @@ def test_resolve_slicebuilder_hosts_lws_and_reverse_dns(monkeypatch):
         == ptr_by_ip
     )
 
+
+def test_resolve_slicebuilder_hosts_lws_dns_and_host_layout(monkeypatch):
     # Bare-metal hostNetwork LWS (replica group 2, not only group 0) where PTR is
     # absent and worker 2's IPv6 address sorts lexicographically before leader 0.
     leader_dns = "vllm-lws-2.vllm-lws.default.svc.cluster.local"
@@ -1061,37 +1063,74 @@ def test_resolve_slicebuilder_hosts_lws_and_reverse_dns(monkeypatch):
         "2001:db8::a": "vllm-lws-2-1.vllm-lws.default.svc.cluster.local",
     }
 
-    # _slice_host_layout recovers true LWS worker order (0, 1, 2) without
-    # ray.io/tpu-worker-id labels.
+    # _resolve_slice_host_layout recovers true LWS worker order (0, 1, 2) without
+    # ray.io/tpu-worker-id labels and reads ray.nodes() only once.
+    nodes_calls = 0
+
+    def _fake_nodes():
+        nonlocal nodes_calls
+        nodes_calls += 1
+        return [
+            {
+                "NodeManagerAddress": ip,
+                "NodeManagerHostname": f"host-{idx}",
+                "Resources": {"TPU": 8},
+            }
+            for idx, ip in enumerate(ip_sorted_hosts)
+        ]
+
+    monkeypatch.setattr(rde2.ray, "nodes", _fake_nodes)
+    executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
+    layout = executor._resolve_slice_host_layout("TPU")
+    assert nodes_calls == 1
+    assert layout.host_order == ["2001:db8::9", "2001:db8::a", "2001:db8::1"]
+    assert layout.chips_per_host == dict.fromkeys(layout.host_order, 8)
+    assert layout.ordered_by_worker_id is True
+    assert layout.hostnames_by_ip == {
+        "2001:db8::1": "host-0",
+        "2001:db8::9": "host-1",
+        "2001:db8::a": "host-2",
+    }
+
+
+def test_slice_host_layout_warns_when_lws_dns_does_not_match_node_ips(monkeypatch):
+    leader_dns = "vllm-lws-0.vllm-lws.default.svc.cluster.local"
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+    monkeypatch.setattr(
+        dist_utils.socket,
+        "getaddrinfo",
+        lambda host, *a, **kw: [
+            (socket.AF_INET6, 0, 0, "", ("2001:db8:1::9", 0, 0, 0))
+        ],
+    )
     monkeypatch.setattr(
         rde2.ray,
         "nodes",
         lambda: [
-            {
-                "Alive": True,
-                "NodeManagerAddress": ip,
-                "Resources": {"TPU": 8},
-            }
-            for ip in ip_sorted_hosts
+            {"NodeManagerAddress": "fd00::2", "Resources": {"TPU": 8}},
+            {"NodeManagerAddress": "fd00::1", "Resources": {"TPU": 8}},
         ],
     )
     executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
-    host_order, chips_per_host = executor._slice_host_layout("TPU")
-    assert host_order == ["2001:db8::9", "2001:db8::a", "2001:db8::1"]
-    assert chips_per_host == dict.fromkeys(host_order, 8)
+    with patch.object(rde2.logger, "warning") as warn_mock:
+        layout = executor._resolve_slice_host_layout("TPU")
+    assert layout.host_order == ["fd00::1", "fd00::2"]
+    assert layout.ordered_by_worker_id is False
+    warn_mock.assert_called_once()
+    assert "LWS_LEADER_ADDRESS" in warn_mock.call_args[0][0]
 
-    with pytest.raises(RuntimeError, match="Failed to resolve IPv6"):
-        dist_utils.resolve_slicebuilder_hosts(["2001:db8::9", "2001:db8::dead"])
 
-    monkeypatch.setenv("LWS_GROUP_SIZE", "0")
-    with pytest.raises(ValueError, match="LWS_GROUP_SIZE"):
-        dist_utils.resolve_lws_hosts_by_ip(leader_dns, 2)
-
-    # Multi-NIC hostNetwork LWS: Ray binds NodeManagerAddress to data-plane ULA
-    # IPv6 (fd00:...) while LWS headless DNS resolves to pod NIC IPv6 (2001:db8:...).
+def test_resolve_slicebuilder_hosts_errors_and_multi_nic_worker_order(monkeypatch):
+    leader_dns = "vllm-lws-2.vllm-lws.default.svc.cluster.local"
     worker1_dns = "vllm-lws-2-1.vllm-lws.default.svc.cluster.local"
-    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
     monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+    monkeypatch.setattr(
+        dist_utils.socket,
+        "getnameinfo",
+        lambda sockaddr, flags: (_ for _ in ()).throw(socket.gaierror("no PTR")),
+    )
     mgmt_dns = {
         leader_dns: "2001:db8:1::3",
         worker1_dns: "2001:db8:1::1",
@@ -1099,8 +1138,23 @@ def test_resolve_slicebuilder_hosts_lws_and_reverse_dns(monkeypatch):
     monkeypatch.setattr(
         dist_utils.socket,
         "getaddrinfo",
-        lambda host, *a, **kw: [(socket.AF_INET6, 0, 0, "", (mgmt_dns[host], 0, 0, 0))],
+        lambda host, *a, **kw: (
+            [(socket.AF_INET6, 0, 0, "", (mgmt_dns[host], 0, 0, 0))]
+            if host in mgmt_dns
+            else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
+        ),
     )
+
+    with pytest.raises(RuntimeError, match="Failed to resolve IPv6"):
+        dist_utils.resolve_slicebuilder_hosts(["2001:db8:1::3", "2001:db8::dead"])
+
+    monkeypatch.setenv("LWS_GROUP_SIZE", "0")
+    with pytest.raises(ValueError, match="LWS_GROUP_SIZE"):
+        dist_utils.resolve_lws_hosts_by_ip(leader_dns, 2)
+
+    # Multi-NIC hostNetwork LWS: Ray binds NodeManagerAddress to data-plane ULA
+    # IPv6 (fd00:...) while LWS headless DNS resolves to pod NIC IPv6 (2001:db8:...).
+    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
     assert dist_utils.resolve_slicebuilder_hosts(
         ["fd00:1::3", "fd00:1::1"],
         ordered_by_worker_id=True,

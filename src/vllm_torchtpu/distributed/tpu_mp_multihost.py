@@ -126,6 +126,22 @@ def _rendezvous_host_ips(
     return host_ips, xprof_session_id
 
 
+def _lws_ordered_by_worker_id(num_hosts: int, peer_index: int, rank_name: str) -> bool:
+    """Validate and return whether ``peer_index`` maps 1:1 to ``LWS_WORKER_INDEX``."""
+    if not envs.LWS_LEADER_ADDRESS:
+        return True
+    lws_group_size = envs.LWS_GROUP_SIZE
+    if lws_group_size != num_hosts:
+        return False
+    lws_worker_index = envs.LWS_WORKER_INDEX
+    if lws_worker_index is not None and lws_worker_index != peer_index:
+        raise ValueError(
+            f"{rank_name} ({peer_index}) must match LWS_WORKER_INDEX "
+            f"({lws_worker_index}) when LWS_GROUP_SIZE == {num_hosts}."
+        )
+    return True
+
+
 def prepare_mp_multihost_env(parallel_config) -> None:
     """Set TORCH_TPU_* env vars for a genuine multi-host `mp` backend run.
 
@@ -142,6 +158,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
         return
 
     node_rank = parallel_config.node_rank
+    ordered_by_worker_id = _lws_ordered_by_worker_id(nnodes, node_rank, "node_rank")
     local_world_size = parallel_config.local_world_size
     total_chips = local_world_size * nnodes
     master_addr = parallel_config.master_addr
@@ -172,7 +189,9 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     # Same construction as ray_distributed_executor_v2.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.
     base_port = envs.TORCH_TPU_BASE_PORT
-    sb_host_by_ip = resolve_slicebuilder_hosts(host_ips, ordered_by_worker_id=True)
+    sb_host_by_ip = resolve_slicebuilder_hosts(
+        host_ips, ordered_by_worker_id=ordered_by_worker_id
+    )
     sb_addresses = [
         f"{sb_host_by_ip[ip]}:{base_port + local_rank}"
         for ip in host_ips
@@ -250,6 +269,9 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     # (0 on the head node, --data-parallel-start-rank on secondary nodes),
     # i.e. the first global DP rank this host owns.
     node_index = parallel_config.data_parallel_rank // dp_size_local
+    ordered_by_worker_id = _lws_ordered_by_worker_id(
+        num_hosts, node_index, "data_parallel node_index"
+    )
     master_addr = parallel_config.data_parallel_master_ip
     rendezvous_port = _rendezvous_port(parallel_config.data_parallel_rpc_port)
 
@@ -279,7 +301,9 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     world_size = parallel_config.world_size
     local_chip_count = world_size * dp_size_local
     base_port = envs.TORCH_TPU_BASE_PORT
-    sb_host_by_ip = resolve_slicebuilder_hosts(host_ips, ordered_by_worker_id=True)
+    sb_host_by_ip = resolve_slicebuilder_hosts(
+        host_ips, ordered_by_worker_id=ordered_by_worker_id
+    )
     sb_addresses = [
         f"{sb_host_by_ip[ip]}:{base_port + local_slot}"
         for ip in host_ips

@@ -250,6 +250,15 @@ class TPUWorker(WorkerBase):
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
+            # Capture before the dense-DP branch below collapses
+            # pc.data_parallel_size_local to 1. When vLLM's run_engine_core
+            # already collapsed pc.data_parallel_size to 1 for non-MoE DP,
+            # TORCH_TPU_DP_SIZE (dp_size) holds the uncollapsed count.
+            dp_size_local = (
+                pc.data_parallel_size_local or dp_size
+                if pc.data_parallel_size > 1
+                else dp_size
+            )
 
             # TorchTPU uses independent per-engine tpu_dist worlds unless EP
             # needs a unified DP*TP world for expert collectives.
@@ -362,8 +371,7 @@ class TPUWorker(WorkerBase):
                 dist_init_method = self.distributed_init_method
                 tpu_device_local_world = max(
                     binding.local_world_size,
-                    (self.parallel_config.data_parallel_size_local or dp_size)
-                    * per_engine_world,
+                    dp_size_local * per_engine_world,
                 )
             local_rank_for_init = binding.init_local_rank
             dist_world_size = binding.world_size

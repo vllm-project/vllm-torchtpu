@@ -465,8 +465,8 @@ def resolve_lws_hosts_by_ip(
     return by_ip
 
 
-def _resolves_to_ip(hostname: str, target_ip: str) -> bool:
-    """Return True iff ``hostname`` is colon-free and resolves to ``target_ip``."""
+def _hostname_resolves(hostname: str, target_ip: str | None = None) -> bool:
+    """Return True iff ``hostname`` is colon-free and resolves (or matches IP)."""
     if not hostname or ":" in hostname:
         return False
     try:
@@ -476,20 +476,9 @@ def _resolves_to_ip(hostname: str, target_ip: str) -> bool:
     return any(
         info[4]
         and isinstance(info[4][0], str)
-        and normalize_ip(info[4][0]) == target_ip
+        and (target_ip is None or normalize_ip(info[4][0]) == target_ip)
         for info in infos
     )
-
-
-def _is_resolvable_hostname(hostname: str) -> bool:
-    """Return True iff ``hostname`` is colon-free and resolves in DNS."""
-    if not hostname or ":" in hostname:
-        return False
-    try:
-        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-    except OSError:
-        return False
-    return any(info[4] and isinstance(info[4][0], str) for info in infos)
 
 
 def resolve_slicebuilder_hosts(
@@ -532,13 +521,13 @@ def resolve_slicebuilder_hosts(
 
         if ordered_by_worker_id and leader_address:
             candidate = lws_pod_hostname(leader_address, worker_idx)
-            if _is_resolvable_hostname(candidate):
+            if _hostname_resolves(candidate):
                 resolved[ip] = candidate
                 continue
 
         if hostnames_by_ip:
             node_host = hostnames_by_ip.get(ip) or hostnames_by_ip.get(norm_ip) or ""
-            if node_host and _is_resolvable_hostname(node_host):
+            if node_host and _hostname_resolves(node_host):
                 resolved[ip] = node_host
                 continue
 
@@ -546,7 +535,7 @@ def resolve_slicebuilder_hosts(
             ptr_host = socket.getnameinfo((norm_ip, 0), socket.NI_NAMEREQD)[0]
         except OSError:
             ptr_host = ""
-        if ptr_host and _resolves_to_ip(ptr_host, norm_ip):
+        if ptr_host and _hostname_resolves(ptr_host, norm_ip):
             resolved[ip] = ptr_host
             continue
 

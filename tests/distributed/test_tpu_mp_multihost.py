@@ -35,6 +35,9 @@ def isolated_environment(monkeypatch):
         "TORCH_TPU_XPROF_SESSION_ID",
         "TPU_NUM_HOSTS",
         "NODE_RANK",
+        "LWS_LEADER_ADDRESS",
+        "LWS_WORKER_INDEX",
+        "LWS_GROUP_SIZE",
         mp._DONE_SENTINEL,
         mp._DP_DONE_SENTINEL,
     ):
@@ -208,3 +211,53 @@ def test_failed_bootstrap_can_retry(bootstrap):
     rendezvous.side_effect = None
     mp.prepare_mp_multihost_env(config)
     assert os.environ[mp._DONE_SENTINEL] == "2"
+
+
+def test_mp_lws_worker_index_mismatch_raises(monkeypatch, bootstrap):
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", "leader.svc.cluster.local")
+    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+    monkeypatch.setenv("LWS_WORKER_INDEX", "1")
+    nnodes_cfg = SimpleNamespace(
+        nnodes=2,
+        node_rank=0,
+        local_world_size=4,
+        master_addr="10.0.0.1",
+        master_port=9000,
+    )
+    with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
+        mp.prepare_mp_multihost_env(nnodes_cfg)
+    bootstrap[0].assert_not_called()
+
+    dp_cfg = SimpleNamespace(
+        data_parallel_size=4,
+        data_parallel_size_local=2,
+        data_parallel_rank=0,
+        data_parallel_rpc_port=9000,
+        data_parallel_master_ip="10.0.0.1",
+        world_size=2,
+    )
+    with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
+        mp.prepare_mp_multihost_dp_env(dp_cfg, 8)
+    bootstrap[0].assert_not_called()
+
+
+def test_mp_lws_subgroup_disables_worker_index_fallback(monkeypatch, bootstrap):
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", "leader.svc.cluster.local")
+    monkeypatch.setenv("LWS_GROUP_SIZE", "4")
+    monkeypatch.setenv("LWS_WORKER_INDEX", "2")
+    seen_flags: list[bool] = []
+
+    def _fake_resolve(host_ips, *, ordered_by_worker_id=False, hostnames_by_ip=None):
+        seen_flags.append(ordered_by_worker_id)
+        return {ip: ip for ip in host_ips}
+
+    monkeypatch.setattr(mp, "resolve_slicebuilder_hosts", _fake_resolve)
+    config = SimpleNamespace(
+        nnodes=2,
+        node_rank=0,
+        local_world_size=4,
+        master_addr="10.0.0.1",
+        master_port=9000,
+    )
+    mp.prepare_mp_multihost_env(config)
+    assert seen_flags == [False]

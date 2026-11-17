@@ -19,13 +19,11 @@ import os
 import stat
 import types
 from importlib import metadata as importlib_metadata
-from unittest import mock
 
 import pytest
 
-from vllm_torchtpu import envs, tpu_info
+from vllm_torchtpu import tpu_info
 from vllm_torchtpu.runner import tpu_runner
-from vllm_torchtpu.worker import tpu_worker
 
 
 def _versions(libtpu):
@@ -347,33 +345,3 @@ def test_get_num_chips_filters_accessible_vfio_tpu_device_ids_without_cap(monkey
         open_sysfs_fn=lambda s: io.StringIO("0x1ae0\n"),
     )
     assert tpu_info.get_num_chips() == 0
-
-
-# A device plugin lists one path per chip (four on a tpu7x host).
-_POD_DEVICE_PATHS = "/dev/vfio/461,/dev/vfio/463,/dev/vfio/460,/dev/vfio/462"
-
-
-@pytest.mark.parametrize("local_world_size", [2, 4, 8])
-def test_reconcile_tpu_visible_device_paths_clears_for_multi_rank(
-    monkeypatch, local_world_size
-):
-    # A rank binds one device and a tpu7x chip has two, so the per-chip list is
-    # unusable whether it is shorter than the local world (8) or not (2, 4).
-    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
-    with mock.patch.object(tpu_worker.logger, "warning_once") as warn_mock:
-        tpu_worker._reconcile_tpu_visible_device_paths(local_world_size)
-        warn_mock.assert_called_once()
-    assert "TPU_VISIBLE_DEVICE_PATHS" not in tpu_worker.os.environ
-
-
-def test_reconcile_tpu_visible_device_paths_keeps_single_rank(monkeypatch):
-    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
-    tpu_worker._reconcile_tpu_visible_device_paths(1)
-    assert tpu_worker.os.environ["TPU_VISIBLE_DEVICE_PATHS"] == _POD_DEVICE_PATHS
-
-
-@pytest.mark.parametrize("bad_value", ["not-an-int", "-1"])
-def test_lws_group_size_env_rejects_invalid_and_negative_values(monkeypatch, bad_value):
-    monkeypatch.setenv("LWS_GROUP_SIZE", bad_value)
-    with pytest.raises(ValueError, match="LWS_GROUP_SIZE"):
-        _ = envs.LWS_GROUP_SIZE

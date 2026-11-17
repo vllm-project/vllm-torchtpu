@@ -849,7 +849,7 @@ class TestTpuCompilerCache:
         monkeypatch.setattr(
             tpu_compiler,
             "_tpu_backend",
-            lambda graph, inputs: lambda *args: backend(graph, inputs)(*args),
+            lambda graph, inputs: (lambda *args: backend(graph, inputs)(*args)),
         )
         compile(a)
         assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket.failed"))
