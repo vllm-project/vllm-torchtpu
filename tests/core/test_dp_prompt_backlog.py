@@ -210,6 +210,131 @@ def test_engine_publishes_pending_prompt_tokens(installed):
     assert kv == pytest.approx(0.25)
 
 
+BLOCK_SIZE = 16
+
+
+def _real_scheduler():
+    """vLLM's async scheduler with a prefix cache, built as the engine core
+    builds it, over a CPU KV cache config."""
+    import torch
+    from vllm.config import (
+        CacheConfig,
+        DeviceConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+    from vllm.v1.structured_output import StructuredOutputManager
+
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=16,
+            max_model_len=2048,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            async_scheduling=True,
+        ),
+        model_config=ModelConfig(
+            model="facebook/opt-125m", dtype="float16", seed=42, max_model_len=2048
+        ),
+        cache_config=CacheConfig(
+            block_size=BLOCK_SIZE,
+            gpu_memory_utilization=0.9,
+            cache_dtype="auto",
+            enable_prefix_caching=True,
+        ),
+        parallel_config=ParallelConfig(),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer0"],
+                FullAttentionSpec(
+                    block_size=BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.float16,
+                ),
+            )
+        ],
+    )
+    vllm_config.cache_config.num_gpu_blocks = 32
+    register_all_kvcache_specs(vllm_config)
+    scheduler = AsyncScheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=BLOCK_SIZE,
+    )
+    init_none_hash(sha256)
+    return scheduler, get_request_block_hasher(BLOCK_SIZE, sha256)
+
+
+def _real_request(request_id, token_ids, hasher):
+    from vllm import SamplingParams
+    from vllm.v1.request import Request as VllmRequest
+
+    params = SamplingParams(max_tokens=8, ignore_eos=True)
+    params.update_from_generation_config({}, 2)
+    return VllmRequest(request_id, token_ids, params, None, block_hasher=hasher)
+
+
+def test_publisher_on_a_real_scheduler(installed):
+    """The publisher reads vLLM's scheduler and KV cache manager as they are
+    at the pinned version: its queues, request counts, KV usage and the
+    prefix-cache lookup of a waiting request."""
+    from vllm.v1.request import RequestStatus
+
+    scheduler, hasher = _real_scheduler()
+    prefix = [900_000 + i for i in range(32)]
+    scheduler.add_request(_real_request("primer", prefix, hasher))
+    scheduler.schedule()
+    scheduler.schedule()
+    scheduler.finish_requests("primer", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+
+    # 48 tokens with the 32-token prefix cached, and 40 uncached tokens.
+    warm = prefix + [800_000 + i for i in range(16)]
+    scheduler.add_request(_real_request("warm", warm, hasher))
+    scheduler.add_request(_real_request("cold", list(range(40)), hasher))
+    core = SimpleNamespace(
+        publish_dp_lb_stats=True,
+        scheduler=scheduler,
+        last_counts=(0, 0),
+        step_counter=3,
+        current_wave=0,
+        output_queue=queue.Queue(),
+    )
+    DPEngineCoreProc._maybe_publish_request_counts(core)
+    _, outputs = core.output_queue.get_nowait()
+    stats = outputs.scheduler_stats
+    pending, kv = backlog.unpack(stats.kv_cache_usage)
+    assert pending == 16 + 40
+    assert (stats.num_running_reqs, stats.num_waiting_reqs) == (0, 2)
+    assert kv == pytest.approx(scheduler.get_kv_cache_usage(), abs=1e-6)
+
+    # One 16-token step admits `warm`, whose 16 uncached tokens fill it.
+    scheduler.schedule()
+    DPEngineCoreProc._maybe_publish_request_counts(core)
+    _, outputs = core.output_queue.get_nowait()
+    assert backlog.unpack(outputs.scheduler_stats.kv_cache_usage)[0] == 40
+    assert outputs.scheduler_stats.num_running_reqs == 1
+
+
 def test_requests_holding_kv_while_waiting_count_as_pending(installed):
     """vLLM admits from kv_holding_waiting before waiting: a request there
     still has its uncomputed prompt ahead of it."""
