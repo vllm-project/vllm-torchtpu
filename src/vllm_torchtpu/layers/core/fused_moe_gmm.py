@@ -52,15 +52,6 @@ def _get_topk_weights_dtype(default_dtype: jnp.dtype) -> jnp.dtype:
     return jnp.float32 if envs.TPU_MOE_TOPK_WEIGHTS_FLOAT32 else default_dtype
 
 
-def _get_gmm_fuse_act(activation: str) -> str:
-    """Returns 'silu_bf16' for 'silu' when TPU_MOE_SILU_BF16 is enabled,
-    else activation.
-    """
-    if activation == "silu" and envs.TPU_MOE_SILU_BF16:
-        return "silu_bf16"
-    return activation
-
-
 logger = init_logger(__name__)
 
 
@@ -541,7 +532,7 @@ def moe_gmm(
         group_sizes,
         group_offset,
         zero_initialize=False,
-        fuse_act=_get_gmm_fuse_act(activation),
+        fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
@@ -761,8 +752,6 @@ def fused_moe_func(
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
-    fuse_act = _get_gmm_fuse_act(activation)
-
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
     if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
@@ -773,7 +762,7 @@ def fused_moe_func(
         w2_scale,
         w1_bias,
         w2_bias,
-        activation=fuse_act,
+        activation=activation,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     ):
@@ -814,7 +803,7 @@ def fused_moe_func(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
-        activation=fuse_act,
+        activation=activation,
         num_tokens=num_tokens,
         topk=topk,
         use_ep=use_ep,

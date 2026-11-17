@@ -108,86 +108,6 @@ def test_fused_moe_gmm_get_topk_weights_dtype(monkeypatch):
     assert fused_moe_gmm._get_topk_weights_dtype(jnp.float16) == jnp.float32
 
 
-def test_silu_bf16_env_defaults_to_false(monkeypatch):
-    monkeypatch.delenv("TPU_MOE_SILU_BF16", raising=False)
-    getter = envs.environment_variables["TPU_MOE_SILU_BF16"]
-    assert getter() is False
-
-
-@pytest.mark.parametrize("value", ["1", "true", "True", "yes", "YES"])
-def test_silu_bf16_env_accepts_truthy(monkeypatch, value):
-    monkeypatch.setenv("TPU_MOE_SILU_BF16", value)
-    getter = envs.environment_variables["TPU_MOE_SILU_BF16"]
-    assert getter() is True
-
-
-@pytest.mark.parametrize("value", ["0", "false", "False", "no", "NO"])
-def test_silu_bf16_env_accepts_falsy(monkeypatch, value):
-    monkeypatch.setenv("TPU_MOE_SILU_BF16", value)
-    getter = envs.environment_variables["TPU_MOE_SILU_BF16"]
-    assert getter() is False
-
-
-def test_fused_moe_gmm_get_gmm_fuse_act(monkeypatch):
-    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_SILU_BF16", False)
-    assert fused_moe_gmm._get_gmm_fuse_act("silu") == "silu"
-    assert fused_moe_gmm._get_gmm_fuse_act("swigluoai") == "swigluoai"
-    assert fused_moe_gmm._get_gmm_fuse_act("gelu") == "gelu"
-
-    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_SILU_BF16", True)
-    assert fused_moe_gmm._get_gmm_fuse_act("silu") == "silu_bf16"
-    assert fused_moe_gmm._get_gmm_fuse_act("swigluoai") == "swigluoai"
-    assert fused_moe_gmm._get_gmm_fuse_act("gelu") == "gelu"
-
-
-@pytest.mark.parametrize(
-    ("silu_bf16_enabled", "expected_fuse_act"),
-    [(False, "silu"), (True, "silu_bf16")],
-)
-def test_moe_gmm_dispatches_silu_bf16_when_enabled(
-    monkeypatch, silu_bf16_enabled, expected_fuse_act
-):
-    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_SILU_BF16", silu_bf16_enabled)
-    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_OWNER_OUTPUT_MODE", "off")
-    recorded_fuse_acts = []
-    gmm_outputs = iter(
-        [
-            jnp.ones((4, 2), dtype=jnp.bfloat16),
-            jnp.ones((4, 2), dtype=jnp.bfloat16),
-        ]
-    )
-
-    def fake_gmm_wrapper(*args, **kwargs):
-        recorded_fuse_acts.append(kwargs.get("fuse_act"))
-        return next(gmm_outputs)
-
-    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", fake_gmm_wrapper)
-
-    actual = fused_moe_gmm.moe_gmm(
-        x=jnp.ones((4, 2), dtype=jnp.bfloat16),
-        w1=jnp.ones((2, 2, 4), dtype=jnp.bfloat16),
-        w1_scale=None,
-        w1_bias=None,
-        w2=jnp.ones((2, 2, 2), dtype=jnp.bfloat16),
-        w2_scale=None,
-        w2_bias=None,
-        group_sizes=jnp.array([2, 2], dtype=jnp.int32),
-        argsort_revert_indices=jnp.array([0, 1, 2, 3], dtype=jnp.int32),
-        topk_weights_flat=jnp.array([0.5, 0.5, 0.5, 0.5], dtype=jnp.bfloat16),
-        valid_mask_flat=jnp.ones((4,), dtype=jnp.bool_),
-        token_indices_sorted=jnp.array([0, 0, 1, 1], dtype=jnp.int32),
-        activation="silu",
-        num_tokens=2,
-        topk=2,
-        use_ep=False,
-        use_sparse_core=False,
-        onehot_moe_permute_threshold=0,
-    )
-
-    assert actual.shape == (2, 2)
-    assert recorded_fuse_acts == [expected_fuse_act, None]
-
-
 @pytest.mark.parametrize("configured_version", ["v1", "v2", "v3"])
 @pytest.mark.parametrize(
     "use_ep,use_sparse_core,threshold,dtype,hidden,topk,num_tokens,source_rows,sc_lanes,expected_path",
@@ -1059,6 +979,72 @@ def test_fused_moe_func_int4_packed_matches_reference():
     np.testing.assert_allclose(
         np.asarray(actual), np.asarray(expected), atol=8.0, rtol=3e-1
     )
+
+
+def _unfused_silu_and_mul_moe(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Unfused bfloat16 MoE: w13 GEMM -> bfloat16 -> SiluAndMul -> w2 GEMM ->
+    bfloat16, then the float32 top-k combine."""
+    num_tokens, topk = topk_ids.shape
+    ids = topk_ids.reshape(-1)
+    x = jnp.repeat(hidden_states, topk, axis=0).astype(jnp.float32)
+    gate_up = jnp.einsum(
+        "rk,rkn->rn",
+        x,
+        w1[ids].astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+    ).astype(jnp.bfloat16)
+    gate, up = jnp.split(gate_up, 2, axis=-1)
+    act = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16) * up
+    down = jnp.einsum(
+        "rk,rkn->rn",
+        act.astype(jnp.float32),
+        w2[ids].astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+    ).astype(jnp.bfloat16)
+    weighted = down.astype(jnp.float32) * topk_weights.reshape(-1, 1)
+    return weighted.reshape(num_tokens, topk, -1).sum(axis=1).astype(jnp.bfloat16)
+
+
+@pytest.mark.tpu_test
+def test_fused_moe_func_silu_bf16_matches_unfused_silu_and_mul(monkeypatch):
+    """With float32 top-k weights, activation="silu_bf16" reproduces the
+    unfused bfloat16 SiluAndMul MoE, and "silu_bf16" reaches gmm_v2."""
+    _require_tpu()
+
+    num_tokens, hidden, inter, num_experts, topk = 64, 512, 256, 8, 2
+    k_h, k_r, k_w1, k_w2 = jax.random.split(jax.random.key(1100), 4)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), jnp.bfloat16)
+    w1 = (
+        jax.random.normal(k_w1, (num_experts, hidden, 2 * inter)) * hidden**-0.5
+    ).astype(jnp.bfloat16)
+    w2 = (jax.random.normal(k_w2, (num_experts, inter, hidden)) * inter**-0.5).astype(
+        jnp.bfloat16
+    )
+    scores = jax.nn.softmax(jax.random.normal(k_r, (num_tokens, num_experts)))
+    topk_weights, topk_ids = jax.lax.top_k(scores, topk)
+    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    topk_ids = topk_ids.astype(jnp.int32)
+    expected = np.asarray(
+        _unfused_silu_and_mul_moe(hidden_states, w1, w2, topk_weights, topk_ids)
+    )
+
+    args = (hidden_states, w1, w2, None, None, None, None, topk_weights, topk_ids)
+    kwargs = dict(topk=topk, use_ep=False, use_sparse_core=False)
+    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_TOPK_WEIGHTS_FLOAT32", True)
+    fused_moe_func.clear_cache()
+    try:
+        hlo = fused_moe_func.lower(*args, activation="silu_bf16", **kwargs).as_text()
+        assert "act_silu_bf16" in hlo
+        silu_bf16 = np.asarray(fused_moe_func(*args, activation="silu_bf16", **kwargs))
+        silu = np.asarray(fused_moe_func(*args, activation="silu", **kwargs))
+    finally:
+        fused_moe_func.clear_cache()
+
+    bf16_equal = np.mean(silu_bf16 == expected)
+    fp32_equal = np.mean(silu == expected)
+    assert bf16_equal > 0.99, (bf16_equal, fp32_equal)
+    # Reverting to float32 intermediates must fail the check above.
+    assert fp32_equal < 0.9, (bf16_equal, fp32_equal)
 
 
 def _fake_tpu_info(sparse_core):

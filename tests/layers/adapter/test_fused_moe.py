@@ -18,7 +18,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_torchtpu.layers.adapter import fused_moe
 from vllm_torchtpu.layers.adapter.fused_moe import get_fused_moe_activation
+from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+    VllmDeepseekV4Mxfp4MoEMethod,
+    VllmMxfp4MoEMethod,
+)
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
 class _Activation(Enum):
@@ -28,6 +34,67 @@ class _Activation(Enum):
 @pytest.mark.parametrize("activation", ["silu", _Activation.SILU])
 def test_get_fused_moe_activation_preserves_standard_activations(activation):
     assert get_fused_moe_activation(activation, object()) == "silu"
+
+
+@pytest.mark.parametrize("silu_bf16", [False, True])
+@pytest.mark.parametrize(
+    "activation", ["silu", _Activation.SILU, "gelu", "swigluoai", "situ"]
+)
+def test_get_fused_moe_activation_resolves_silu_bf16(
+    monkeypatch, silu_bf16, activation
+):
+    monkeypatch.setattr(fused_moe.envs, "TPU_MOE_SILU_BF16", silu_bf16)
+    moe_config = SimpleNamespace(
+        activation_situ_beta=4.0, activation_situ_linear_beta=None
+    )
+    expected = {
+        "silu": "silu_bf16" if silu_bf16 else "silu",
+        _Activation.SILU: "silu_bf16" if silu_bf16 else "silu",
+        "gelu": "gelu",
+        "swigluoai": "swigluoai",
+        "situ": "situ:4.0:none",
+    }[activation]
+    assert get_fused_moe_activation(activation, moe_config) == expected
+
+
+@pytest.mark.parametrize("threshold", [0, 64])
+def test_silu_bf16_warns_when_it_turns_off_dense_expert(monkeypatch, threshold):
+    warnings = []
+    monkeypatch.setattr(fused_moe.envs, "TPU_MOE_SILU_BF16", True)
+    monkeypatch.setattr(fused_moe.envs, "TPU_MOE_DENSE_EXPERT_THRESHOLD", threshold)
+    monkeypatch.setattr(
+        fused_moe.logger,
+        "warning_once",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+
+    assert fused_moe.resolve_silu_bf16("silu") == "silu_bf16"
+    if threshold:
+        assert len(warnings) == 1
+        assert "TPU_MOE_SILU_BF16=1" in warnings[0]
+        assert "TPU_MOE_DENSE_EXPERT_THRESHOLD=64" in warnings[0]
+    else:
+        assert warnings == []
+
+
+@pytest.mark.parametrize("silu_bf16", [False, True])
+def test_mxfp4_resolves_silu_bf16_but_keeps_clamped_kernel(monkeypatch, silu_bf16):
+    monkeypatch.setattr(fused_moe.envs, "TPU_MOE_SILU_BF16", silu_bf16)
+    layer = SimpleNamespace(activation=_Activation.SILU)
+
+    assert VllmMxfp4MoEMethod._resolve_tpu_activation(None, layer) == (
+        "silu_bf16" if silu_bf16 else "silu"
+    )
+    # The clamped kernel keeps float32 intermediates in both settings.
+    assert (
+        VllmDeepseekV4Mxfp4MoEMethod._resolve_tpu_activation(None, layer)
+        == "silu_and_mul_with_clamp"
+    )
+
+
+def test_moe_numerics_env_vars_reach_ray_workers():
+    assert "TPU_MOE_TOPK_WEIGHTS_FLOAT32" in TpuPlatform.additional_env_vars
+    assert "TPU_MOE_SILU_BF16" in TpuPlatform.additional_env_vars
 
 
 @pytest.mark.parametrize(

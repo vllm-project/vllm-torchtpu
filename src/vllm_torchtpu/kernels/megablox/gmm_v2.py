@@ -49,6 +49,21 @@ def silu_and_mul_with_clamp(
     return jax.nn.silu(gate) * up
 
 
+def silu_and_mul_bf16(gate: jax.Array, up: jax.Array) -> jax.Array:
+    """SiLU-and-mul with the bfloat16 roundings of upstream vLLM's SiluAndMul.
+
+    Unfused, the w13 GEMM writes gate and up as bfloat16 and SiluAndMul
+    evaluates silu in float32 and rounds it to bfloat16 before the multiply.
+    This reproduces those three roundings on float32 inputs (such as gmm_v2's
+    accumulator) and returns bfloat16. The dtype is fixed to bfloat16 because
+    the TPU platform runs MoE activations in bfloat16.
+    """
+    gate = gate.astype(jnp.bfloat16)
+    up = up.astype(jnp.bfloat16)
+    silu = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
+    return silu * up
+
+
 def situ_and_mul(
     gate: jax.Array, up: jax.Array, beta: float, linear_beta: float | None
 ) -> jax.Array:
@@ -107,14 +122,7 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
         case "silu_bf16":
-            # Reproduce standalone SiluAndMul (vLLM GPU path / TpuGroupedExperts)
-            # bfloat16 roundings (bfloat16 and targeting only SiLU are
-            # intentional): round gate/up to bfloat16, evaluate silu in float32,
-            # and round silu(gate) back to bfloat16 before multiplying.
-            gate_bf16 = acc_gate.astype(jnp.bfloat16)
-            up_bf16 = acc_up.astype(jnp.bfloat16)
-            silu_bf16 = jax.nn.silu(gate_bf16.astype(jnp.float32)).astype(jnp.bfloat16)
-            return (silu_bf16 * up_bf16).astype(acc.dtype)
+            return silu_and_mul_bf16(acc_gate, acc_up).astype(acc.dtype)
         case "gelu":
             return jax.nn.gelu(acc_gate) * acc_up
         case "gelu_tanh":

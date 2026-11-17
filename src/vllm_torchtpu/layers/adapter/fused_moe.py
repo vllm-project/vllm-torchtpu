@@ -29,6 +29,10 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
@@ -43,11 +47,38 @@ def _resolve_activation_name(activation: Any) -> str:
     return activation.value if hasattr(activation, "value") else str(activation)
 
 
+def resolve_silu_bf16(activation: str) -> str:
+    """Return gmm_v2's "silu_bf16" for "silu" when TPU_MOE_SILU_BF16 is set.
+
+    Resolved once per layer at weight load, outside jit, so the name is a
+    static argument of every compiled MoE program and every kernel cache key.
+    The v2 fused EP, fused decode, TP decode and dense-expert kernels fuse only
+    "silu" and decline "silu_bf16" in their admission checks, so the layer
+    runs on gmm_v2; the adaptive fused EP kernel raises on it at startup.
+    Other activations are returned unchanged.
+    """
+    if activation != "silu" or not envs.TPU_MOE_SILU_BF16:
+        return activation
+    logger.info_once(
+        "TPU_MOE_SILU_BF16=1: SiLU MoE layers run gmm_v2 with activation "
+        "'silu_bf16'; the v2 fused EP, fused decode, TP decode and "
+        "dense-expert MoE kernels, which fuse only 'silu', are not used."
+    )
+    if envs.TPU_MOE_DENSE_EXPERT_THRESHOLD > 0:
+        logger.warning_once(
+            "TPU_MOE_SILU_BF16=1 turns off the dense-expert MoE path that "
+            "TPU_MOE_DENSE_EXPERT_THRESHOLD=%d selects: dense_expert_moe "
+            "fuses only 'silu'.",
+            envs.TPU_MOE_DENSE_EXPERT_THRESHOLD,
+        )
+    return "silu_bf16"
+
+
 def get_fused_moe_activation(activation, moe_config) -> str:
     """Encode vLLM's activation config for the Pallas GMM kernel."""
     activation = _resolve_activation_name(activation)
     if activation != "situ":
-        return activation
+        return resolve_silu_bf16(activation)
 
     beta = moe_config.activation_situ_beta
     linear_beta = moe_config.activation_situ_linear_beta
