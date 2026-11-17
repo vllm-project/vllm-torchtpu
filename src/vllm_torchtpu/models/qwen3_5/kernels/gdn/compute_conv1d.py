@@ -26,14 +26,14 @@ import jax.numpy as jnp
 from vllm_torchtpu.models.qwen3_5.kernels.gdn import config
 
 
-def causal_conv1d_out(
+def _conv_out_rows(
     lhs: jax.Array,  # [seq, prev_kernel_size + chunk, q, dim_size]
     conv_weight: jax.Array,  # [kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     cfg: config.GDNConfig,
-) -> jax.Array:
-    """The conv output rows of `causal_conv1d` without the conv-state select."""
-    assert lhs.ndim == 4
+) -> list[jax.Array]:
+    """The conv output row of each chunk position, the taps starting from the
+    first product."""
     out_list = []
     w_taps = [conv_weight[k : k + 1] for k in range(cfg.kernel_size)]
     bias = conv_bias.reshape(1, 1, -1) if conv_bias is not None else None
@@ -44,7 +44,18 @@ def causal_conv1d_out(
         if bias is not None:
             out = out + bias
         out_list.append(out)
-    return jnp.stack(out_list, axis=1)
+    return out_list
+
+
+def causal_conv1d_out(
+    lhs: jax.Array,  # [seq, prev_kernel_size + chunk, q, dim_size]
+    conv_weight: jax.Array,  # [kernel_size, 1, dim_size]
+    conv_bias: jax.Array | None,  # [dim_size]
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """The conv output rows of `causal_conv1d` without the conv-state select."""
+    assert lhs.ndim == 4
+    return jnp.stack(_conv_out_rows(lhs, conv_weight, conv_bias, cfg), axis=1)
 
 
 def conv_state_rows(
@@ -78,23 +89,11 @@ def causal_conv1d(
 
     assert lhs.ndim == 4
 
-    out_list = []
     if cfg.step_trims:
         # The taps start from the first product instead of a zero.
-        w_taps = [conv_weight[k : k + 1] for k in range(cfg.kernel_size)]
-        bias = conv_bias.reshape(1, 1, -1) if conv_bias is not None else None
-
-        for c_idx in range(cfg.chunk_size):
-            start_idx = 1 + c_idx + cfg.prev_kernel_size - cfg.kernel_size
-            out = lhs[:, start_idx] * w_taps[0]
-            for k in range(1, cfg.kernel_size):
-                out = out + lhs[:, start_idx + k] * w_taps[k]
-
-            if bias is not None:
-                out = out + bias
-
-            out_list.append(out)
+        out_list = _conv_out_rows(lhs, conv_weight, conv_bias, cfg)
     else:
+        out_list = []
         for c_idx in range(cfg.chunk_size):
             out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
 
