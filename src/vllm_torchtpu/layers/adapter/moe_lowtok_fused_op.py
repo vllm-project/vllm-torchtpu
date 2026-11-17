@@ -41,7 +41,12 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives
-from vllm_torchtpu.layers.adapter import moe_options, small_all_reduce_op, token_padding
+from vllm_torchtpu.layers.adapter import (
+    moe_options,
+    sequence_parallel,
+    small_all_reduce_op,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 from vllm_torchtpu.logger import init_logger
 
@@ -220,8 +225,6 @@ def serves(layer, scores_op, is_sequence_parallel: bool) -> bool:
     is served by the plain scores entry (no copy slots), and the step's rows
     are replicated over TP. ``moe_lowtok_scores.prebuild`` sets
     ``_lowtok_has_copies`` on every layer it returns a scores op for."""
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     return (
         _ARMED
         and scores_op is not None

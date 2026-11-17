@@ -19,8 +19,10 @@ from collections.abc import Collection, Sequence
 from typing import Any
 
 import jax
+import numpy as np
 import torch
-from jax.sharding import PartitionSpec
+import torch.distributed as dist
+from jax.sharding import Mesh, PartitionSpec
 
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import collectives_options
@@ -126,9 +128,6 @@ def _build_tp_all_reduce(mesh, tp: int, form: str | None):
     """The all-reduce over the TP pairs of the mesh seen as (dp, tp): mesh
     index i is the TP partner of i ^ (tp - 1) group-wise, which `prebuild`
     checks against the torch TP group before arming."""
-    import numpy as np
-    from jax.sharding import Mesh
-
     n = mesh.shape[EP_AXIS_NAME]
     mesh2 = Mesh(
         np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=("dp_", "tp_")
@@ -192,10 +191,7 @@ def groups_match_mesh(mesh_index: int, tp: int, dp: int = 0) -> bool:
     """Whether every core's TP group is the block of ``tp`` consecutive mesh
     indices it sits in and, when ``dp`` is given, every core's DP group is the
     ``dp`` cores with its TP index; agreed over the EP group (a collective)."""
-    import torch.distributed as dist
     from vllm.distributed.parallel_state import get_dp_group, get_tp_group
-
-    from vllm_torchtpu.distributed.ep_mesh import ep_rank_order
 
     mine = _groups_on_mesh_blocks(
         ep_rank_order(),
