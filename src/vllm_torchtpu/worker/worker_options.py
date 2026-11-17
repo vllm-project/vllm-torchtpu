@@ -15,9 +15,9 @@
 
     --additional-config '{"tpu_worker": {"numa_bind": true}}'
 
-Every option defaults to main's behaviour without it. The options only place
-the worker process on the host and never change a compiled program, so the
-section stays out of the compile-cache key
+Every option defaults to off, which leaves the worker where its launcher put
+it. The options only place the worker process on the host and never change a
+compiled program, so the section stays out of the compile-cache key
 (``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``). Parse once at init with :func:`get`.
 """
 
@@ -33,9 +33,10 @@ SECTION = "tpu_worker"
 class WorkerOptions:
     numa_bind: bool = False
     """Before the TPU runtime starts, narrow each worker's CPU set to the NUMA
-    node its chip is attached to and prefer that node's memory
-    (``worker.numa_bind``). The inherited CPU set is only ever narrowed, and a
-    rank that does not map onto a chip is left alone. Off by default."""
+    node its chip is attached to and prefer that node's memory (see
+    ``vllm_torchtpu.worker.numa_bind``). The inherited CPU set is only ever
+    narrowed, and a rank that does not map onto a chip is left alone. Off by
+    default."""
 
 
 def parse(raw: Any) -> WorkerOptions:
