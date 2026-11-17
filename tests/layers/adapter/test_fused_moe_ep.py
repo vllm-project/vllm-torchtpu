@@ -1566,3 +1566,32 @@ def test_runner_refuses_a_shared_expert_the_op_was_not_built_for():
         VllmMoERunner._apply_quant_method(
             runner, hidden, torch.zeros(2, 3), hidden.clone()
         )
+
+
+def test_op_sees_padded_rows_routed_nowhere_and_real_rows_unchanged():
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    seen = []
+    owner = SimpleNamespace()
+
+    def op(*args):
+        seen.append(args)
+        return args[0]
+
+    setattr(owner, bridge.FUSED_MOE_EP_OP_ATTR, op)
+    hidden = torch.zeros(4, 8)
+    weights = torch.empty(0)
+    scales = torch.ones(1, 1)
+    logits = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    state = token_padding.TokenPaddingState(
+        local_padding_mask=torch.zeros(4, dtype=torch.bool)
+    )
+    token_padding.set_padding_state(state)
+    try:
+        state.update(2, 4)
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+    finally:
+        token_padding.set_padding_state(None)
+    routed = seen[0][5]
+    assert torch.equal(routed[:2], logits[:2])
+    assert torch.isneginf(routed[2:]).all()
