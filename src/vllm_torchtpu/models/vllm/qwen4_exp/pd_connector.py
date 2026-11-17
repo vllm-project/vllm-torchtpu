@@ -443,10 +443,14 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
             # ago are free again, before this step's repacks and admission.
             advance()
         if self._sync_repack and worker is not None and (
-            getattr(self, "_landx", False) or self.__dict__.get("_landx_pending")
+            getattr(self, "_landx", False)
+            or hasattr(self._connector_metadata, "qwen_landx_repack_req_ids")
+            or self.__dict__.get("_landx_pending")
         ):
             # q38 LAND-OVERLAP: keep this step's deferred names for
             # submit_deferred_loads (and flush names an earlier step left behind).
+            # A worker obeys the scheduler's metadata (the field exists only when
+            # the scheduler runs the key), whatever its own copy of the key reads.
             self._landx_take(worker)
         if self._sync_repack and worker is not None:
             # Before this step's forward, so a request admitted in this step

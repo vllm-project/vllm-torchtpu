@@ -284,6 +284,20 @@ def test_worker_key_off_is_todays_calls():
     assert landx_state(c) == [], "no LAND-OVERLAP state with the key off"
 
 
+def test_worker_obeys_the_scheduler_metadata_whatever_its_own_key_reads():
+    w = worker()
+    c = worker_conn(w, landx=False)
+    submit(w, "a", 11)
+    land(w, "a")
+    c._connector_metadata = meta(deferred=["a"])
+    w._staging.step, w._staging.phase = 3, "pre"
+    c.start_load_kv(None)
+    assert w._staging.repacks == []
+    w._staging.phase = "post"
+    c.submit_deferred_loads()
+    assert w._staging.repacks == [(3, "post", 11)]
+
+
 def test_worker_engagement_line_reports_the_share_of_steps(monkeypatch):
     lines = []
     monkeypatch.setattr(pdc.logger, "info", lambda fmt, *a: lines.append(fmt % a))
