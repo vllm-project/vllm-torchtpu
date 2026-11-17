@@ -24,8 +24,8 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
 @pytest.mark.parametrize(
     "hidden,inter,weight_format,rhs_qb,expected,expected_mib",
     [
-        (4096, 1024, host.WeightFormat.FP8, 512, (3, 2), 40.390625),
-        (8192, 2048, host.WeightFormat.FP4, 64, (2, 1), 60.765625),
+        (4096, 1024, host.WeightFormat.FP8, 512, (3, 2), 40.3779296875),
+        (8192, 2048, host.WeightFormat.FP4, 64, (2, 1), 60.7529296875),
     ],
 )
 def test_model_geometry_selects_buffers_that_fit(

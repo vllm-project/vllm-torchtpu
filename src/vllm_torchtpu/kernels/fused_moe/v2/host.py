@@ -17,13 +17,14 @@ enters the kernel, and the VMEM accounting that answers whether a build
 fits. Nothing here runs inside the Pallas body."""
 
 import enum
-import math
 from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.pallas_util import array_vmem_bytes
 
 FP8_MAX = 448.0
 FP8 = jnp.float8_e4m3fn
@@ -1295,24 +1296,6 @@ def chip_generation(info=None):
     if info is None:
         info = pltpu.get_tpu_info()
     return info.generation
-
-
-def array_vmem_bytes(shape, dtype, info):
-    """Bytes one VMEM array of this shape and dtype occupies.
-
-    The minor dimension pads to the chip's lane count and the second-minor
-    to this dtype's sublane tiling; both numbers come off the device record
-    rather than being written down. A one-dimensional array is laid out as
-    a single row of lanes. Padding is most of the difference between an
-    array's element count and the memory it costs: a scale mirror four
-    lanes wide still pays for a full row of lanes.
-    """
-    itemsize = jnp.dtype(dtype).itemsize
-    if len(shape) == 1:
-        return align_up(shape[0], info.num_lanes) * itemsize
-    lanes = align_up(shape[-1], info.num_lanes)
-    sublanes = align_up(shape[-2], info.get_sublane_tiling(dtype))
-    return math.prod(shape[:-2]) * sublanes * lanes * itemsize
 
 
 # A 32-bit array's second-minor dimension tiles to this many sublanes, so a

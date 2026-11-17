@@ -373,7 +373,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_p = bkv_sz // page_size
     del distribution_ref
     span_int_ty = util.get_span_int_dtype(
-        q_dtype, pages_per_seq, page_size, tpu_version=tpu_version
+        q_dtype, pages_per_seq, page_size, bkv_csz, tpu_version=tpu_version
     )
 
     def debug_print(msg, *args):
@@ -392,25 +392,25 @@ def _ragged_paged_attention_kernel_loop(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
         )
         kv_len = kv_lens_ref[seq_idx]
-        kv_len_start = bkv_idx * bkv_sz
         kv_p_start = bkv_idx * bkv_p
         q_start = cu_q_lens_ref[seq_idx]
         q_end = cu_q_lens_ref[seq_idx + 1]
         q_len = q_end - q_start
 
+        (
+            kv_len_start,
+            kv_left_frm_cache,
+            kv_left_frm_new,
+            bkv_sz_frm_cache,
+            bkv_sz_frm_new,
+        ) = staging.compute_bkv_cache_and_new_sizes(
+            kv_len,
+            q_len,
+            bkv_idx,
+            bkv_sz=bkv_sz,
+            skip_kv_update=skip_kv_update,
+        )
         kv_left = kv_len - kv_len_start
-        if skip_kv_update:
-            # KV-sharing layer: the target layer already wrote all kv (including
-            # the current step's tokens) into the shared cache, so fetch every
-            # token from the cache and write nothing back (bkv_sz_frm_new == 0,
-            # so update_sz == 0 and start_update_kv_cache is never triggered).
-            kv_left_frm_cache = kv_left
-        else:
-            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
-        kv_left_frm_new = kv_left - kv_left_frm_cache
-
-        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
-        bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
         page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
         debug_print(
@@ -507,6 +507,7 @@ def _ragged_paged_attention_kernel_loop(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        max_kv_len=pages_per_seq * page_size,
     )
 
     def compute_bkv_attention(ctx: pipeline.BkvStepContext) -> None:
@@ -638,17 +639,15 @@ def merge_kv(
     return kv
 
 
-def prepare_inputs(
+def prepare_q(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
-    k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
-    v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    actual_num_kv_heads: int,
     *,
     fuse_non_tiling_axis_swap: bool | None = None,
 ):
     if fuse_non_tiling_axis_swap is None:
         fuse_non_tiling_axis_swap = envs.USE_RPA_PIPELINED_DMA_STAGING
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
-    actual_num_kv_heads = k.shape[1]
     assert actual_num_q_heads % actual_num_kv_heads == 0
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q_packing = get_dtype_packing(q.dtype)
@@ -678,12 +677,25 @@ def prepare_inputs(
     if not fuse_non_tiling_axis_swap:  # noqa: SIM108 (one comment per path)
         # Legacy path: Separate query axis swap emitting
         # xlu.transpose (Transpose::Execute).
-        q = q_reshaped.swapaxes(0, 1)
-    else:
-        # Fused DMA layout path: Leave query in token-major layout
-        # [max_num_tokens, actual_num_kv_heads, ...] and carry axis permutation
-        # directly in Pallas strided DMA descriptors.
-        q = q_reshaped
+        return q_reshaped.swapaxes(0, 1)
+    # Fused DMA layout path: Leave query in token-major layout
+    # [max_num_tokens, actual_num_kv_heads, ...] and carry axis permutation
+    # directly in Pallas strided DMA descriptors.
+    return q_reshaped
+
+
+def prepare_inputs(
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    *,
+    fuse_non_tiling_axis_swap: bool | None = None,
+):
+    q = prepare_q(
+        q,
+        k.shape[1],
+        fuse_non_tiling_axis_swap=fuse_non_tiling_axis_swap,
+    )
     # TODO(kyuyeunk, chengjiyao): Add kv quantization here.
     kv = merge_kv(k, v)
     return q, kv

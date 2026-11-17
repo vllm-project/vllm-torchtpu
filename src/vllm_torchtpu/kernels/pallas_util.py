@@ -13,7 +13,9 @@
 # limitations under the License.
 """Shared Pallas TPU VMEM, DMA, dtype-packing, and alignment helper functions."""
 
+import math
 import re
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -72,6 +74,62 @@ def get_tpu_version() -> int:
     if match is None:
         return -1
     return int(match.group(1))
+
+
+_CHIP_VERSION_BY_TPU_GEN = {
+    5: pltpu.ChipVersion.TPU_V5P,
+    6: pltpu.ChipVersion.TPU_V6E,
+    7: pltpu.ChipVersion.TPU_7X,
+    8: pltpu.ChipVersion.TPU_8I,
+}
+
+
+def get_tpu_info_for_version(tpu_version: int):
+    """Return a `pltpu.TpuInfo` record for `tpu_version` without requiring a TPU."""
+    chip = _CHIP_VERSION_BY_TPU_GEN.get(tpu_version)
+    if chip is None:
+        raise NotImplementedError(f"Unsupported tpu_version={tpu_version}.")
+    return pltpu.get_tpu_info_for_chip(chip, 1)
+
+
+def align_sublane_rows(rows: int, dtype, info) -> int:
+    """Upper-bound VMEM second-minor row count under Mosaic sublane tiling.
+
+    Reads the full sublane tile height from `info.get_sublane_tiling(dtype)`.
+    When `rows < full_tile`, Mosaic uses a compact power-of-two sub-tile of at
+    least `get_dtype_packing(dtype)` rows. When `rows >= full_tile`, rounding up
+    to `full_tile` is an upper bound (Mosaic uses the large tile only when `rows`
+    is a multiple of it, so shapes like `uint8[24, 128]` or `uint8[136, 128]`
+    incur no extra sublane padding in practice).
+    """
+    assert rows >= 0
+    if rows == 0:
+        return 0
+    full_tile = info.get_sublane_tiling(dtype)
+    if rows < full_tile:
+        return max(get_dtype_packing(dtype), next_power_of_2(rows))
+    return align_to(rows, full_tile)
+
+
+def array_vmem_bytes(shape: Sequence[int], dtype, info) -> int:
+    """Upper-bound VMEM bytes occupied by an array of `shape` and `dtype`.
+
+    Reads lane width and dtype sublane tiling from `info` (`pltpu.TpuInfo`).
+    1D arrays occupy a single lane-padded row; higher-rank arrays pad the minor
+    axis to `info.num_lanes` and bound the second-minor axis via
+    `align_sublane_rows` (an upper bound when `shape[-2] >= full_tile` is not a
+    multiple of `full_tile`).
+    """
+    if math.prod(shape) == 0:
+        return 0
+    bitwidth = get_dtype_bitwidth(dtype)
+    if len(shape) == 1:
+        elems = align_to(shape[0], info.num_lanes)
+    else:
+        lanes = align_to(shape[-1], info.num_lanes)
+        sublanes = align_sublane_rows(shape[-2], dtype, info)
+        elems = math.prod(shape[:-2]) * sublanes * lanes
+    return cdiv(elems * bitwidth, 8)
 
 
 def broadcast_minor(src, shape):

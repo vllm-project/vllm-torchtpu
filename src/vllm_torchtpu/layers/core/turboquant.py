@@ -38,8 +38,9 @@ https://docs.vllm.ai/en/latest/api/vllm/model_executor/layers/quantization/turbo
   multiples for TPU `T(8, 128)` sublane tiling.
 * **Flow:** `_quantize_kv_components` + `_pack_new_tq_tokens_128` quantize and
   pack new tokens on XLA; inside Pallas RPA v3 (`RPAd`/`RPAm`),
-  `_update_tq_page_vreg` merges new tokens into pages in VMEM/VREGs and
-  `_dequant_tq_page_vreg` dequantizes pages in VREGs before MXU attention.
+  `_update_tq_page_vreg` merges new tokens into pages in VMEM/VREGs before
+  compute and `_dequant_tq_page_vreg` dequantizes pages in VREGs for both decode
+  and prefill/spec-decode verify passes.
 """
 
 from __future__ import annotations
@@ -47,12 +48,30 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
+    merge_kv,
+    ref_ragged_paged_attention,
+)
+from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_compressed_kv import (
+    CompressedKvCodec,
+    UpdatePageFn,
+)
+from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_compressed_kv import (
+    ragged_paged_attention as compressed_kv_ragged_paged_attention,
+)
+from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_compressed_kv import (
+    ragged_paged_attention_bundled as compressed_kv_ragged_paged_attention_bundled,
+)
+from vllm_torchtpu.kernels.ragged_paged_attention.v3.tuned_block_sizes_compressed_kv import (  # noqa: E501
+    get_tuned_max_bkv_csz,
+)
 
 _WORD_SIZE = 128  # Bytes (and lanes) per TPU VREG row (`u8[128]`).
 _SUBLANE_WORDS = 8  # VMEM sublane tile height for `T(8, 128)` tiling.
@@ -157,12 +176,35 @@ class TQLayout:
 class TQTables:
     """Constant tables used by quantize/dequantize (host numpy arrays).
 
-    Hashed by identity so it can be a static `jax.jit` argument.
+    Compared and hashed by full array content so equal tables reuse cached static
+    `jax.jit` / Pallas codecs while distinct rotation matrices or centroids
+    compile distinct kernels.
     """
 
     hadamard: np.ndarray  # f32[head_dim, head_dim], orthonormal and symmetric.
     centroids: np.ndarray  # f32[2**bits], sorted.
     midpoints: np.ndarray  # f32[2**bits - 1], sorted.
+    _key: tuple[tuple[int, ...], bytes, bytes, bytes] = dataclasses.field(
+        init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_key",
+            (
+                self.hadamard.shape,
+                np.ascontiguousarray(self.hadamard, dtype=np.float32).tobytes(),
+                np.ascontiguousarray(self.centroids, dtype=np.float32).tobytes(),
+                np.ascontiguousarray(self.midpoints, dtype=np.float32).tobytes(),
+            ),
+        )
+
+    def __hash__(self) -> int:
+        return hash(self._key)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TQTables) and self._key == other._key
 
 
 def hadamard_matrix(head_dim: int) -> np.ndarray:
@@ -175,18 +217,28 @@ def hadamard_matrix(head_dim: int) -> np.ndarray:
     return (hadamard / math.sqrt(head_dim)).astype(np.float32)
 
 
-def make_tables(layout: TQLayout, centroids: np.ndarray) -> TQTables:
-    """Builds the constant tables from the Lloyd-Max centroids."""
-    sorted_c = np.sort(np.asarray(centroids, dtype=np.float32))
-    return TQTables(
-        hadamard=(
-            hadamard_matrix(layout.head_dim)
-            if not layout.is_key_fp8
-            else np.zeros((0, 0), np.float32)
-        ),
-        centroids=sorted_c,
-        midpoints=((sorted_c[:-1] + sorted_c[1:]) / 2).astype(np.float32),
+@functools.cache
+def _make_tables_cached(layout: TQLayout, centroids_bytes: bytes) -> TQTables:
+    sorted_c = np.frombuffer(centroids_bytes, dtype=np.float32).copy()
+    midpoints = ((sorted_c[:-1] + sorted_c[1:]) / 2).astype(np.float32)
+    hadamard = (
+        hadamard_matrix(layout.head_dim)
+        if not layout.is_key_fp8
+        else np.zeros((0, 0), np.float32)
     )
+    for arr in (hadamard, sorted_c, midpoints):
+        arr.flags.writeable = False
+    return TQTables(
+        hadamard=hadamard,
+        centroids=sorted_c,
+        midpoints=midpoints,
+    )
+
+
+def make_tables(layout: TQLayout, centroids: np.ndarray) -> TQTables:
+    """Builds and memoizes the constant tables from the Lloyd-Max centroids."""
+    sorted_c = np.ascontiguousarray(np.sort(np.asarray(centroids, dtype=np.float32)))
+    return _make_tables_cached(layout, sorted_c.tobytes())
 
 
 def rotate(inputs: jax.Array, hadamard: jax.Array) -> jax.Array:
@@ -301,7 +353,7 @@ def _unpack_bits_vreg(
 
 def _dequant_tq_page_vreg(
     pages_h: Any,  # u8[page_words, 128], list of them, or list of Pallas VMEM refs
-    kv_dtype: jnp.dtype,
+    kv_dtype: Any,
     *,
     layout: TQLayout,
     tables: TQTables,
@@ -449,6 +501,24 @@ def _dequant_tq_page_vreg(
     return (dk, dv, k_norm_row) if return_k_norm else (dk, dv)
 
 
+def _dequant_tq_page_for_rpa(
+    page_refs: Sequence[Any],
+    kv_dtype: Any,
+    *,
+    layout: TQLayout,
+    tables: TQTables,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    """`DequantPageFn` adapter returning `(k, v, k_norm_row)`."""
+    res = _dequant_tq_page_vreg(
+        page_refs,
+        kv_dtype,
+        layout=layout,
+        tables=tables,
+        return_k_norm=True,
+    )
+    return cast(tuple[jax.Array, jax.Array, jax.Array | None], res)
+
+
 # ======================================================================================
 # Per-token quantization & Pallas VREG page update
 # ======================================================================================
@@ -580,7 +650,9 @@ def _pack_new_tq_tokens_128(
 def _update_tq_page_vreg(
     old_page: jax.Array,  # u8[page_words, 128]
     new_tok: jax.Array
-    | list[jax.Array],  # list of u8[1 or page_size, 128] or u8[1 or page_size, W, 128]
+    | Sequence[
+        jax.Array
+    ],  # seq of u8[1 or page_size, 128] or u8[1 or page_size, W, 128]
     valid_mask: jax.Array,  # bool[page_size, 1]
     *,
     slot_idx: jax.Array | None = None,
@@ -596,9 +668,9 @@ def _update_tq_page_vreg(
     m_start = k_words + v_words
     m_off = (2 * folds) if layout.is_key_fp8 else folds
     tok_words = (
-        new_tok
-        if isinstance(new_tok, list)
-        else [new_tok[:, w_idx] for w_idx in range(new_tok.shape[1])]
+        [new_tok[:, w_idx] for w_idx in range(new_tok.shape[1])]
+        if isinstance(new_tok, jax.Array)
+        else list(new_tok)
     )
     is_single = tok_words[0].shape[0] == 1
 
@@ -705,11 +777,230 @@ def _update_tq_page_vreg(
 
 
 # ======================================================================================
-# Ragged paged attention entry point
+# Ragged paged attention codec & entry points
 # ======================================================================================
 
 
+def _validate_tq_qkv(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    *,
+    layout: TQLayout,
+) -> None:
+    if not (queries.ndim == keys.ndim == values.ndim == 3):
+        raise ValueError(
+            f"Expected 3D queries, keys, and values, got {queries.shape=},"
+            f" {keys.shape=}, {values.shape=}."
+        )
+    if keys.shape != values.shape:
+        raise ValueError(f"Expected {keys.shape=} to equal {values.shape=}.")
+    if queries.shape[0] != keys.shape[0] or queries.shape[2] != keys.shape[2]:
+        raise ValueError(
+            f"Expected matching token/head_dim axes on {queries.shape=} and"
+            f" {keys.shape=}."
+        )
+    if queries.shape[2] != layout.head_dim:
+        raise ValueError(f"Expected {queries.shape[2]=} to match {layout.head_dim=}.")
+    if keys.shape[1] <= 0 or queries.shape[1] % keys.shape[1] != 0:
+        raise ValueError(
+            f"Expected {queries.shape[1]=} to be divisible by {keys.shape[1]=}."
+        )
+    if not (
+        jnp.issubdtype(queries.dtype, jnp.floating)
+        and jnp.issubdtype(keys.dtype, jnp.floating)
+        and jnp.issubdtype(values.dtype, jnp.floating)
+    ):
+        raise ValueError(
+            "Expected floating-point queries, keys, and values dtypes, got"
+            f" {queries.dtype=}, {keys.dtype=}, {values.dtype=}."
+        )
+    if not (queries.dtype == keys.dtype == values.dtype):
+        raise ValueError(
+            "Expected queries, keys, and values to share one dtype, got"
+            f" {queries.dtype=}, {keys.dtype=}, {values.dtype=}."
+        )
+
+
+@functools.cache
+def _get_tq_update_page_fn(layout: TQLayout) -> UpdatePageFn:
+    return functools.partial(_update_tq_page_vreg, layout=layout)
+
+
+@functools.cache
+def make_tq_codec(
+    layout: TQLayout,
+    tables: TQTables,
+    *,
+    skip_kv_update: bool = False,
+) -> CompressedKvCodec:
+    """Build and memoize the `CompressedKvCodec` for `(layout, tables)`."""
+    return CompressedKvCodec(
+        dequant_page_fn=functools.partial(
+            _dequant_tq_page_for_rpa, layout=layout, tables=tables
+        ),
+        update_page_fn=(None if skip_kv_update else _get_tq_update_page_fn(layout)),
+        page_size_from_words=layout.page_size_from_words_128,
+        max_bkv_csz_fn=get_tuned_max_bkv_csz,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("layout", "tables", "page_size", "skip_kv_update"),
+)
+def _prepare_tq_tensors_jit(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    *,
+    layout: TQLayout,
+    tables: TQTables,
+    page_size: int,
+    skip_kv_update: bool,
+) -> tuple[jax.Array | None, jax.Array | None]:
+    if layout.is_key_fp8:
+        nk_u, nv_i, n_meta = _quantize_kv_components(keys, values, layout, tables)
+        return None, _pack_new_tq_tokens_128(nk_u, nv_i, n_meta, page_size, layout)
+    compute_dtype = queries.dtype
+    hadamard = jnp.asarray(tables.hadamard)
+    if skip_kv_update:
+        return rotate(queries, hadamard).astype(compute_dtype), None
+    hq = queries.shape[1]
+    qk_rot = rotate(jnp.concatenate([queries, keys], axis=1), hadamard)
+    q_in = qk_rot[:, :hq].astype(compute_dtype)
+    nk_u, nv_i, n_meta = _quantize_kv_components(
+        keys, values, layout, tables, rotated_key=qk_rot[:, hq:]
+    )
+    packed_new_kv = _pack_new_tq_tokens_128(nk_u, nv_i, n_meta, page_size, layout)
+    return q_in, packed_new_kv
+
+
+def _prepare_tq_attention_inputs(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    *,
+    layout: TQLayout,
+    tables: TQTables,
+    page_size: int,
+    skip_kv_update: bool,
+) -> tuple[jax.Array, jax.Array | None]:
+    _validate_tq_qkv(queries, keys, values, layout=layout)
+    if layout.is_key_fp8 and skip_kv_update:
+        return queries, None
+    q_rot, packed_new_kv = _prepare_tq_tensors_jit(
+        queries,
+        keys,
+        values,
+        layout=layout,
+        tables=tables,
+        page_size=page_size,
+        skip_kv_update=skip_kv_update,
+    )
+    return (queries if q_rot is None else q_rot), packed_new_kv
+
+
 def tq_ragged_paged_attention(
+    queries: jax.Array,  # [T, Hq, D]
+    keys: jax.Array,  # [T, Hk, D]
+    values: jax.Array,  # [T, Hk, D]
+    kv_cache: jax.Array,  # u8[num_pages, Hk, page_words, 128] or 5D bundled
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    layout: TQLayout,
+    tables: TQTables,
+    layer_idx: jax.Array | None = None,
+    sm_scale: float,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    skip_kv_update: bool = False,
+    d_block_sizes: tuple[int, int, int, int] | None = None,
+    m_block_sizes: tuple[int, int, int, int] | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Ragged paged attention over a compressed TurboQuant `uint8` KV cache.
+
+    Dispatches 4D per-layer caches to `compressed_kv_ragged_paged_attention` (with
+    `layer_idx=None`) and 5D block-major bundled caches to
+    `compressed_kv_ragged_paged_attention_bundled` (requiring `layer_idx`).
+
+    Buffer donation:
+      - `kv_cache` is always passed straight to the underlying Pallas kernel and
+        donated in place (`keys` and `values` are never donated).
+      - When `layout.is_key_fp8` (`turboquant_k8v4`), `queries` is also passed
+        through directly and donated to alias `outputs`. When
+        `not layout.is_key_fp8` (`turboquant_4bit_nc`, `turboquant_k3v4_nc`,
+        `turboquant_3bit_nc`), Hadamard rotation allocates a new rotated `q_in`
+        buffer, leaving the caller's `queries` intact.
+
+    Returns `(new_kv_cache, outputs)`.
+    """
+    if (
+        kv_cache.ndim not in (4, 5)
+        or kv_cache.shape[-1] != _WORD_SIZE
+        or kv_cache.dtype != jnp.uint8
+    ):
+        raise ValueError(
+            f"Expected 4D or 5D uint8 TurboQuant kv_cache ending in {_WORD_SIZE},"
+            f" got {kv_cache.shape=}, {kv_cache.dtype=}."
+        )
+    if kv_cache.ndim == 4 and layer_idx is not None:
+        raise ValueError(
+            "layer_idx must be None when kv_cache is a 4D single-layer cache."
+        )
+    if kv_cache.ndim == 5 and layer_idx is None:
+        raise ValueError(
+            "layer_idx is required when kv_cache is a 5D block-major bundle."
+        )
+
+    cache_kv_heads = kv_cache.shape[-3]
+    if keys.ndim == 3 and cache_kv_heads != keys.shape[1]:
+        raise ValueError(
+            f"Expected kv_cache KV heads {cache_kv_heads} to match {keys.shape[1]=}."
+        )
+
+    page_size = layout.page_size_from_words_128(kv_cache.shape[-2])
+    q_in, packed_new_kv = _prepare_tq_attention_inputs(
+        queries,
+        keys,
+        values,
+        layout=layout,
+        tables=tables,
+        page_size=page_size,
+        skip_kv_update=skip_kv_update,
+    )
+    codec = make_tq_codec(layout, tables, skip_kv_update=skip_kv_update)
+    kernel_fn: Callable[..., Any] = (
+        compressed_kv_ragged_paged_attention_bundled
+        if kv_cache.ndim == 5
+        else compressed_kv_ragged_paged_attention
+    )
+    meta_args = (
+        (layer_idx, kv_lens, page_indices, cu_q_lens, distribution)
+        if layer_idx is not None
+        else (kv_lens, page_indices, cu_q_lens, distribution)
+    )
+    outputs, kv_cache = kernel_fn(
+        q_in,
+        kv_cache,
+        *meta_args,
+        codec=codec,
+        packed_new_kv=packed_new_kv,
+        kv_dtype=keys.dtype,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        skip_kv_update=skip_kv_update,
+        d_block_sizes=d_block_sizes,
+        m_block_sizes=m_block_sizes,
+    )
+    return kv_cache, outputs
+
+
+def ref_tq_ragged_paged_attention(
     queries: jax.Array,  # [T, Hq, D]
     keys: jax.Array,  # [T, Hk, D]
     values: jax.Array,  # [T, Hk, D]
@@ -721,50 +1012,41 @@ def tq_ragged_paged_attention(
     *,
     layout: TQLayout,
     tables: TQTables,
-    rpa_fn: Callable,
+    rpa_fn: Callable[..., Any] | None = None,
     sm_scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Ragged paged attention over a compressed TurboQuant `uint8` KV cache.
-
-    Executes `_pack_new_tq_tokens_128`, `_update_tq_page_vreg`, and
-    `_dequant_tq_page_vreg` via `vmap` and delegates attention to `rpa_fn`
-    (e.g. `ref_ragged_paged_attention`).
-
-    Returns `(new_kv_cache, outputs)`.
-    """
-    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import merge_kv
+    """Reference `vmap` TurboQuant attention for CPU/TPU unit tests."""
+    if rpa_fn is None:
+        rpa_fn = ref_ragged_paged_attention
 
     assert kv_cache.ndim == 4 and kv_cache.shape[3] == _WORD_SIZE, kv_cache.shape
     page_size = layout.page_size_from_words_128(kv_cache.shape[2])
     num_tokens = keys.shape[0]
     compute_dtype = queries.dtype
+    q_in, packed_new_kv = _prepare_tq_attention_inputs(
+        queries,
+        keys,
+        values,
+        layout=layout,
+        tables=tables,
+        page_size=page_size,
+        skip_kv_update=skip_kv_update,
+    )
 
-    if layout.is_key_fp8:
-        q_in, k_in, k_rot = queries, keys, None
-    else:
-        hadamard = jnp.asarray(tables.hadamard)
-        if not skip_kv_update and queries.dtype == keys.dtype:
-            hq = queries.shape[1]
-            qk_rot = rotate(jnp.concatenate([queries, keys], axis=1), hadamard)
-            q_in = qk_rot[:, :hq].astype(compute_dtype)
-            k_rot = qk_rot[:, hq:]
-            k_in = k_rot.astype(compute_dtype)
-        else:
-            q_in = rotate(queries, hadamard).astype(compute_dtype)
-            k_rot = None if skip_kv_update else rotate(keys, hadamard)
-            k_in = (keys if k_rot is None else k_rot).astype(compute_dtype)
-
-    dequant_fn = functools.partial(_dequant_tq_page_vreg, layout=layout, tables=tables)
-    dequant_1 = functools.partial(dequant_fn, kv_dtype=compute_dtype)
-    v_in = values.astype(compute_dtype)
-    if not skip_kv_update:
-        nk_u, nv_i, n_meta = _quantize_kv_components(
-            keys, values, layout, tables, rotated_key=k_rot
+    def dequant_1(page_h: jax.Array) -> tuple[jax.Array, jax.Array]:
+        res = _dequant_tq_page_vreg(
+            page_h,
+            compute_dtype,
+            layout=layout,
+            tables=tables,
+            return_k_norm=False,
         )
-        tq_new_kv = _pack_new_tq_tokens_128(nk_u, nv_i, n_meta, page_size, layout)
+        return cast(tuple[jax.Array, jax.Array], res)
+
+    if not skip_kv_update:
         max_num_seqs = kv_lens.shape[0]
         pages_per_seq = page_indices.shape[0] // max_num_seqs
         num_seqs = distribution[2]
@@ -787,27 +1069,23 @@ def tq_ragged_paged_attention(
         slot_iota = jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
 
         def _apply_tok(tok_i, cache):
+            assert packed_new_kv is not None
             slot_in_p = slot_in_pages[tok_i]
             page_i = page_indices[local_page[tok_i]]
             valid_mask = (slot_in_p >= 0) & (slot_iota == slot_in_p)
-            old_p = cache[page_i]
+            existing_p = cache[page_i]
+            base_p = jnp.where(slot_in_p == 0, jnp.uint8(0), existing_p)
             new_p = jax.vmap(
                 lambda op, nt: _update_tq_page_vreg(
                     op, nt, valid_mask, slot_idx=slot_in_p, layout=layout
                 ),
                 in_axes=(0, 2),
-            )(old_p, tq_new_kv[tok_i][None])
-            return cache.at[page_i].set(jnp.where(slot_in_p >= 0, new_p, old_p))
+            )(base_p, packed_new_kv[tok_i][None])
+            return cache.at[page_i].set(jnp.where(slot_in_p >= 0, new_p, existing_p))
 
         kv_cache = jax.lax.fori_loop(0, num_tokens, _apply_tok, kv_cache)
-        hist_k, hist_v = jax.vmap(jax.vmap(dequant_1))(kv_cache[page_indices])
-        is_decode = (tok_idx < cu_q_lens[distribution[0]])[:, None, None]
-        slot_clamped = jnp.maximum(slot_in_pages, 0)
-        k_in = jnp.where(is_decode, hist_k[local_page, :, slot_clamped, :], k_in)
-        v_in = jnp.where(is_decode, hist_v[local_page, :, slot_clamped, :], v_in)
-    else:
-        hist_k, hist_v = jax.vmap(jax.vmap(dequant_1))(kv_cache[page_indices])
 
+    hist_k, hist_v = jax.vmap(jax.vmap(dequant_1))(kv_cache[page_indices])
     n_pages, n_heads, _, head_dim = hist_k.shape
     merged = merge_kv(
         hist_k.swapaxes(1, 2).reshape(n_pages * page_size, n_heads, head_dim),
@@ -818,8 +1096,8 @@ def tq_ragged_paged_attention(
 
     outputs, _ = rpa_fn(
         q_in,
-        k_in,
-        v_in,
+        keys,
+        values,
         pool,
         kv_lens,
         pool_page_indices,
@@ -828,6 +1106,6 @@ def tq_ragged_paged_attention(
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
-        skip_kv_update=skip_kv_update,
+        skip_kv_update=True,
     )
     return kv_cache, outputs

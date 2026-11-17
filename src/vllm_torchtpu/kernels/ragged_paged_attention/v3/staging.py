@@ -60,6 +60,29 @@ class KvUpdateConfig:
     debug_mode: bool = False
 
 
+def compute_bkv_cache_and_new_sizes(
+    kv_len, q_len, bkv_idx, *, bkv_sz: int, skip_kv_update: bool
+):
+    """Split block `bkv_idx` into cached and newly-generated token counts.
+
+    Returns `(kv_len_start, kv_left_frm_cache, kv_left_frm_new,
+    bkv_sz_frm_cache, bkv_sz_frm_new)`.
+    """
+    kv_len_start = bkv_idx * bkv_sz
+    kv_left = kv_len - kv_len_start
+    kv_left_frm_cache = kv_left if skip_kv_update else jnp.maximum(kv_left - q_len, 0)
+    kv_left_frm_new = kv_left - kv_left_frm_cache
+    bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
+    bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
+    return (
+        kv_len_start,
+        kv_left_frm_cache,
+        kv_left_frm_new,
+        bkv_sz_frm_cache,
+        bkv_sz_frm_new,
+    )
+
+
 class KvUpdateRing(NamedTuple):
     """Double-buffered KV-cache writeback ring tracker."""
 

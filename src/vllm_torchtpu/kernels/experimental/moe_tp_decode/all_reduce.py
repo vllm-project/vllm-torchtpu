@@ -43,7 +43,6 @@ live. Every send is waited before exit, so every semaphore ends at 0.
 
 import dataclasses
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -52,23 +51,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.pallas_util import array_vmem_bytes as tiled_bytes
+
 BF16, F32 = jnp.bfloat16, jnp.float32
 COLLECTIVE_ID = 0
 VMEM_FRACTION = 0.75
 _MESH = pl.DeviceIdType.MESH
 # `standalone` asks for this multiple of its planned bytes.
 _STANDALONE_HEADROOM = 2.0
-
-
-def tiled_bytes(shape, dtype, info) -> int:
-    """VMEM bytes of a buffer padded to Mosaic tiles: the last dim to the lane
-    count, the second-last to the sublane tiling of the dtype."""
-    itemsize = jnp.dtype(dtype).itemsize
-    sublanes = info.num_sublanes * max(1, 4 // itemsize)
-    *lead, rows, cols = (1, *shape) if len(shape) == 1 else shape
-    rows = pl.cdiv(rows, sublanes) * sublanes
-    cols = pl.cdiv(cols, info.num_lanes) * info.num_lanes
-    return math.prod(lead) * rows * cols * itemsize
 
 
 def supported(n: int, m: int, h: int, info) -> bool:
