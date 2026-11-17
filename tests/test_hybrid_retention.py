@@ -17,10 +17,12 @@ cross-turn Mamba boundary + partial-tail LRU retention."""
 from types import SimpleNamespace
 from typing import NamedTuple
 
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu.core import hybrid_retention
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention, _ConvLRUEntry
 
 BS = 256  # attention / mamba block size
@@ -113,6 +115,26 @@ class Pool:
         for b in last:
             self.free_block_queue.append(b)
 
+    def reset_prefix_cache(self):
+        return True
+
+
+def _mamba_manager(**attrs):
+    """Mamba manager stand-in with the two methods the retention hooks wrap."""
+    return SimpleNamespace(
+        _cache_partial_tail_block=lambda request, num_tokens, *args, **kwargs: None,
+        allocate_new_blocks=lambda request_id, num_tokens, num_tokens_main_model: [],
+        **attrs,
+    )
+
+
+def _no_blocks_needed(**kwargs):
+    return 0
+
+
+def _never_allocates(*args, **kwargs):
+    return None
+
 
 POOL = None
 
@@ -151,7 +173,7 @@ class FakeAttnManager:
 def _setup(prompt=1000, osl=600, mamba=True, max_conversations=None, bs=BS):
     pool = Pool()
     attn_mgr = SimpleNamespace(block_size=bs, req_to_blocks={}, dcp_world_size=1)
-    mamba_mgr = SimpleNamespace(block_size=bs, req_to_blocks={}, dcp_world_size=1)
+    mamba_mgr = _mamba_manager(block_size=bs, req_to_blocks={}, dcp_world_size=1)
     groups = [SpecGroup(_attn_spec(), [0], FakeAttnManager, False)]
     managers = [attn_mgr]
     if mamba:
@@ -162,8 +184,11 @@ def _setup(prompt=1000, osl=600, mamba=True, max_conversations=None, bs=BS):
         single_type_managers=managers,
         block_pool=pool,
         _cache_hit_alignment_tokens=HB,
+        get_num_blocks_to_allocate=_no_blocks_needed,
     )
-    kvm = SimpleNamespace(coordinator=coord, enable_caching=True)
+    kvm = SimpleNamespace(
+        coordinator=coord, enable_caching=True, allocate_slots=_never_allocates
+    )
     total = prompt + osl
     req = SimpleNamespace(
         request_id="r",
@@ -510,6 +535,9 @@ def test_mamba_manager_cache_partial_tail_hook_with_safe_tail_offset():
             self._partial_hit_reqs[request.request_id] = (4, partial_blk)
             return ("hash", num_tokens)
 
+        def allocate_new_blocks(self, request_id, num_tokens, num_tokens_main_model):
+            return []
+
     mamba_mgr = HookableMambaMgr()
     groups = [
         SpecGroup(_attn_spec(), [0], FakeAttnManager, False),
@@ -520,9 +548,13 @@ def test_mamba_manager_cache_partial_tail_hook_with_safe_tail_offset():
         single_type_managers=[attn_mgr, mamba_mgr],
         block_pool=pool,
         _cache_hit_alignment_tokens=HB,
+        get_num_blocks_to_allocate=_no_blocks_needed,
     )
-    kvm = SimpleNamespace(coordinator=coord, enable_caching=True)
+    kvm = SimpleNamespace(
+        coordinator=coord, enable_caching=True, allocate_slots=_never_allocates
+    )
     r = HybridStateRetention(kvm)
+    assert r.enabled
 
     # prompt=2817 (2817 % 128 == 1 < 4) -> safe fine boundary is 2688, tainted
     # boundary is 2816.
@@ -672,6 +704,14 @@ class _GuardPool:
             if b.ref_cnt == 0:
                 self.free += 1
 
+    def get_new_blocks(self, num_blocks):
+        assert num_blocks <= self.free
+        self.free -= num_blocks
+        return [SimpleNamespace(ref_cnt=1, is_null=False) for _ in range(num_blocks)]
+
+    def reset_prefix_cache(self) -> bool:
+        return True
+
 
 class _GuardKVM:
     """KVCacheManager stand-in with v0.31.0's two allocate_slots refusals."""
@@ -679,7 +719,7 @@ class _GuardKVM:
     def __init__(self, free: int, need: int):
         self.pool = _GuardPool(free)
         self.need = need
-        self.mamba_mgr = SimpleNamespace(block_size=640, cached_blocks_this_step=set())
+        self.mamba_mgr = _mamba_manager(block_size=640, cached_blocks_this_step=set())
         groups = [
             SimpleNamespace(spec=_attn_spec(640), group_ids=[0]),
             SimpleNamespace(spec=_mamba_spec(640), group_ids=[1]),
@@ -843,6 +883,40 @@ def test_partial_tail_hook_passes_vllm_arguments_through():
     req = SimpleNamespace(request_id="r", num_prompt_tokens=1000)
     kvm.mamba_mgr._cache_partial_tail_block(req, 896, 0)
     assert seen == [(896, 0)]
+
+
+@pytest.mark.parametrize(
+    ("missing", "named"),
+    [
+        ("reset_prefix_cache", "BlockPool.reset_prefix_cache"),
+        ("allocate_slots", "KVCacheManager.allocate_slots"),
+        (
+            "_cache_partial_tail_block",
+            "MambaManager (group 1)._cache_partial_tail_block",
+        ),
+    ],
+)
+def test_missing_vllm_method_turns_retention_off_with_a_warning(
+    monkeypatch, missing, named
+):
+    warnings = []
+    monkeypatch.setattr(
+        hybrid_retention.logger,
+        "warning_once",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+    kvm = _GuardKVM(free=100, need=1)
+    owner = {"reset_prefix_cache": kvm.pool, "allocate_slots": kvm}.get(
+        missing, kvm.mamba_mgr
+    )
+    setattr(owner, missing, None)
+    ret = HybridStateRetention(kvm, max_conversations=256)
+    assert not ret.enabled
+    assert len(warnings) == 1 and named in warnings[0]
+    # Nothing is wrapped: no hook runs while retention is off.
+    for obj in (kvm, kvm.pool, kvm.mamba_mgr):
+        assert not getattr(obj, "_hybrid_retention_guarded", False)
+        assert not getattr(obj, "_hybrid_retention_hooked", False)
 
 
 def test_compacted_prior_turn_is_evicted_before_the_oldest_conversation():
