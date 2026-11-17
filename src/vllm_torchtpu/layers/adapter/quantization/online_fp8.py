@@ -146,9 +146,10 @@ def attach_online_fp8[QuantConfigT: QuantizationConfig | None](
         if not isinstance(config, VllmQuantConfig) or config.get_name() not in (
             "fp8",
             "modelopt_fp4",
+            "modelopt_mixed",
         ):
             raise ValueError(
-                "tpu_online_fp8 supports FP8 and ModelOpt NVFP4 "
+                "tpu_online_fp8 supports FP8 and ModelOpt NVFP4/MIXED_PRECISION "
                 "checkpoint configurations"
             )
         config.online_fp8_policy = policy
