@@ -35,6 +35,9 @@ from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.layers.adapter.attention as attention
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as batched_rpa_configs,
+)
 from vllm_torchtpu.layers.adapter import cp_attention, native_fp8_scope
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl,
@@ -45,8 +48,15 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
+_PV_STATIC = batched_rpa_configs.NativeFp8(pv=batched_rpa_configs.Fp8Operand.STATIC)
 PVS = native_fp8_scope.AttentionModes(
+    native_fp8=_PV_STATIC, native_fp8_prefill=_PV_STATIC, decode_exp2=True
 )
+PVS_KWARGS = {
+    "native_fp8": _PV_STATIC,
+    "native_fp8_prefill": _PV_STATIC,
+    "decode_exp2": True,
+}
 _MESH = object()
 
 
