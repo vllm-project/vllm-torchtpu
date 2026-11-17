@@ -1027,6 +1027,76 @@ def merge_partials(
     )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
 
 
+def _merge_pair_kernel(lse_ref, parts_ref, *rest, rotated):
+    """One token block of `merge_pair_partials`: ``lse_ref [2, Hl, Bt]``,
+    ``parts_ref [2, Hl, Bt, D]``, (``hadamard [D, D]``), ``o_ref [Bt, Hl *
+    D]``."""
+    o_ref = rest[-1]
+    _, num_heads, _, head_dim = parts_ref.shape
+    lse0, lse1 = lse_ref[0], lse_ref[1]
+    # `_merge_partials_kernel`'s weight of rank 0, lane-dense.
+    peak = jnp.maximum(lse0, lse1)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    total = peak + jnp.log(jnp.exp(lse0 - peak) + jnp.exp(lse1 - peak))
+    weight = jnp.exp(lse0 - total)
+    weight = jnp.where(weight > 0, weight, 0.0)  # NaN -> 0
+    for h in range(num_heads):
+        p0 = parts_ref[0, h].astype(jnp.float32)
+        p1 = parts_ref[1, h].astype(jnp.float32)
+        # The head's weights across the lanes as the transpose of their
+        # sublane broadcast: AOT 634 bundles per 256 tokens, against 777 for
+        # lane broadcasts of a [Bt, Hl] transpose and 1,137 for
+        # `merge_partials`' two per head (XLU-bound).
+        w = jnp.broadcast_to(weight[h : h + 1], (head_dim, weight.shape[1])).T
+        # w * p0 + (1 - w) * p1, one weight per head. A rank that attended
+        # nothing has a zero partial, never NaN.
+        merged = (p1 + w * (p0 - p1)).astype(o_ref.dtype)
+        if rotated:
+            merged = jnp.dot(merged, rest[0][...], preferred_element_type=jnp.float32)
+            merged = (merged * (1.0 / head_dim)).astype(o_ref.dtype)
+        o_ref[:, h * head_dim : (h + 1) * head_dim] = merged
+
+
+@functools.partial(jax.jit, static_argnames=("block_tokens", "interpret"))
+def merge_pair_partials(
+    parts: jax.Array,
+    lse: jax.Array,
+    hadamard: jax.Array | None = None,
+    *,
+    block_tokens: int = _PARTIALS_BLOCK_TOKENS,
+    interpret: bool = False,
+) -> jax.Array:
+    """`merge_partials` of a DCP pair with head-major LSEs: ``parts [2, Hl,
+    T, D]``, ``lse [2, Hl, T]`` f32 (as the partial's ``[2 * Hl, T]``
+    reshapes, no transpose) -> ``[T, Hl * D]``.
+
+    The weights as `merge_partials`'; the sum ``p1 + w0 * (p0 - p1)`` rounds
+    differently from ``w0 * p0 + w1 * p1``, at bf16 level. `merge_partials`
+    took 37-39 us per layer at 8K tokens (twins j-2e5da13f, j-d33c9244), and
+    its token-major LSEs a transposing copy."""
+    _, num_heads, num_tokens, head_dim = parts.shape
+    block_t = max(1, min(num_tokens, block_tokens))
+    rotated = hadamard is not None
+    return pl.pallas_call(
+        functools.partial(_merge_pair_kernel, rotated=rotated),
+        grid=(pl.cdiv(num_tokens, block_t),),
+        in_specs=[
+            pl.BlockSpec((2, num_heads, block_t), lambda i: (0, 0, i)),
+            pl.BlockSpec((2, num_heads, block_t, head_dim), lambda i: (0, 0, i, 0)),
+            *(
+                [pl.BlockSpec((head_dim, head_dim), lambda i: (0, 0))]
+                if rotated
+                else []
+            ),
+        ],
+        out_specs=pl.BlockSpec((block_t, num_heads * head_dim), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), parts.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge_pair_partials",
+    )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
+
+
 def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
     """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
     rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
@@ -1335,7 +1405,9 @@ def attend_and_merge(
         return merge_partials(parts, lses, hadamard, interpret=interpret)
     # Block r of each result came from rank r: its partial of this rank's heads.
     parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
-    lses = lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1)
+    lses = lse.reshape(dcp, num_heads, num_tokens)
     parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
     lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
-    return merge_partials(parts, lses, hadamard, interpret=interpret)
+    if dcp == 2:
+        return merge_pair_partials(parts, lses, hadamard, interpret=interpret)
+    return merge_partials(parts, lses.transpose(0, 2, 1), hadamard, interpret=interpret)

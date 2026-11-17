@@ -146,9 +146,19 @@ def _partials_reference(parts, lse, hadamard=None):
     return merged.astype(np.float32).transpose(1, 0, 2).reshape(parts.shape[2], -1)
 
 
+def _merge(pair, parts, lse, hadamard=None, **kwargs):
+    """`merge_partials`, or `merge_pair_partials` on head-major LSEs."""
+    if pair:
+        return msa_dcp.merge_pair_partials(
+            parts, jnp.swapaxes(lse, 1, 2), hadamard, **kwargs
+        )
+    return msa_dcp.merge_partials(parts, lse, hadamard, **kwargs)
+
+
+@pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("rotated", [False, True])
 @pytest.mark.parametrize("num_tokens,block_tokens", [(8, 256), (300, 128)])
-def test_merge_partials_matches_reference(num_tokens, block_tokens, rotated):
+def test_merge_partials_matches_reference(num_tokens, block_tokens, rotated, pair):
     from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 
     dcp, num_heads, head_dim = 2, 8, 128
@@ -164,7 +174,8 @@ def test_merge_partials_matches_reference(num_tokens, block_tokens, rotated):
     hadamard = (
         jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16) if rotated else None
     )
-    got = msa_dcp.merge_partials(
+    got = _merge(
+        pair,
         jnp.asarray(parts, jnp.bfloat16),
         jnp.asarray(lse),
         hadamard,
@@ -180,9 +191,10 @@ def test_merge_partials_matches_reference(num_tokens, block_tokens, rotated):
     np.testing.assert_allclose(got, want, rtol=2**-7, atol=1e-4)
 
 
+@pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("rotated", [False, True])
 @pytest.mark.parametrize("num_tokens", [8, 8192])
-def test_merge_partials_lowers_for_tpu(num_tokens, rotated):
+def test_merge_partials_lowers_for_tpu(num_tokens, rotated, pair):
     args = [
         jax.ShapeDtypeStruct((2, 8, num_tokens, 128), jnp.bfloat16),
         jax.ShapeDtypeStruct((2, num_tokens, 8), jnp.float32),
@@ -192,7 +204,7 @@ def test_merge_partials_lowers_for_tpu(num_tokens, rotated):
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(tpu7x):
         lowered = (
-            jax.jit(msa_dcp.merge_partials)
+            jax.jit(functools.partial(_merge, pair))
             .trace(*args)
             .lower(lowering_platforms=("tpu",))
         )
