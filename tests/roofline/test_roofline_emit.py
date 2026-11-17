@@ -369,6 +369,77 @@ def test_emit_ceiling_rows_and_cli_subcommands(
     assert "p90_interactivity_tok_s" in out_ceil[0]
 
 
+_MIXED_SCENARIO_ARGS: tuple[str, ...] = (
+    "--example-scenario",
+    "chat-8k1k",
+    "--mode",
+    "mixed",
+    "--max-chips",
+    "4",
+    "--concurrency",
+    "8,32",
+)
+
+
+@pytest.mark.parametrize("model_flag", ["--config", "--model"])
+def test_emit_cli_prints_placeholder_when_model_source_is_a_config_file(
+    model_flag: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Print <MODEL>, not the config.json path, and warn on stderr."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(_toy_moe_config_dict()), encoding="utf-8")
+
+    exit_code = cli.main(["emit", model_flag, str(cfg_path), *_MIXED_SCENARIO_ARGS])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "vllm serve <MODEL> --tensor-parallel-size" in captured.out
+    assert str(cfg_path) not in captured.out
+    assert "WARNING: The model to serve is not known" in captured.err
+
+
+def test_emit_cli_prints_model_directory_in_serve_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Print a model directory given to --model as the model to serve."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(_toy_moe_config_dict()), encoding="utf-8"
+    )
+
+    exit_code = cli.main(["emit", "--model", str(tmp_path), *_MIXED_SCENARIO_ARGS])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert f"vllm serve {tmp_path} --tensor-parallel-size" in captured.out
+    assert "The model to serve is not known" not in captured.err
+
+
+def test_ceiling_cli_warns_when_no_layout_fits(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Write the no-feasible-layout warning to stderr when no layout fits in HBM."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(_toy_moe_config_dict()), encoding="utf-8")
+    no_layout_fits_memory_fraction = "0.001"
+
+    exit_code = cli.main(
+        [
+            "ceiling",
+            "--config",
+            str(cfg_path),
+            *_MIXED_SCENARIO_ARGS,
+            "--gpu-memory-utilization",
+            no_layout_fits_memory_fraction,
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out.strip() == "[]"
+    assert "WARNING: No feasible layout met memory" in captured.err
+
+
 def test_resident_batch_cap_emits_max_num_seqs_without_tput_inflation() -> None:
     """Verify resident batch cap adds --max-num-seqs without inflating tput."""
     dense_cfg = {

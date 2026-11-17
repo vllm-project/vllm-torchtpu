@@ -244,6 +244,8 @@ def _dispatch_emit(
     if args.json:
         sys.stdout.write(json.dumps(emitted) + "\n")
         return 0
+    for w in emitted["warnings"]:
+        sys.stderr.write(f"WARNING: {w}\n")
     for cmd_line in emitted["commands"]:
         sys.stdout.write(cmd_line + "\n")
     return 0
@@ -258,9 +260,10 @@ def _dispatch_solve(
     scen = _resolve_scenario(args, parser)
     if args.max_chips is None and args.max_instances is None:
         parser.error("Either --max-chips or --max-instances is required.")
+    dt_auto = dtypes_from_hf_config(cfg)
     splan = solve_serving_plan(
         from_hf_config(cfg),
-        dtypes_from_hf_config(cfg),
+        dt_auto,
         CHIPS[args.chip],
         scen,
         SolveOptions(
@@ -273,7 +276,7 @@ def _dispatch_solve(
     if args.cmd == "ceiling":
         return _dispatch_ceiling(args, splan)
     if args.cmd == "emit":
-        return _dispatch_emit(args, splan, dtypes_from_hf_config(cfg))
+        return _dispatch_emit(args, splan, dt_auto)
     if args.json:
         sys.stdout.write(json.dumps(asdict(splan)) + "\n")
         return 0
