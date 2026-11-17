@@ -20,7 +20,7 @@ so programs built with a key on and off never share a cache entry.
 
 from typing import Any
 
-DEFAULTS: dict[str, bool | int | str] = {
+DEFAULTS: dict[str, bool | int | float | str] = {
     # MiniMax M3: steps of at least this many tokens run every layer on the
     # step's two token halves, so one half's residual all-reduces overlap the
     # other half's attention and FFN. 0 = off.
@@ -166,12 +166,15 @@ DEFAULTS: dict[str, bool | int | str] = {
 }
 
 
-def option(additional_config: Any, key: str) -> bool | int | str:
+def option(additional_config: Any, key: str) -> bool | int | float | str:
     """`additional_config[key]`, or the key's default when unset."""
     default = DEFAULTS[key]
     if not isinstance(additional_config, dict) or key not in additional_config:
         return default
     value = additional_config[key]
+    # JSON has one number type: a float key also takes an int (22 -> 22.0).
+    if type(default) is float and type(value) in (int, float):
+        return float(value)
     # bool is a subclass of int: require the default's exact type.
     if type(value) is not type(default):
         raise ValueError(

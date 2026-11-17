@@ -131,6 +131,16 @@ def test_wrong_type_is_an_error():
         option({"minimax_split_min_tokens": True}, "minimax_split_min_tokens")
 
 
+def test_float_keys_take_json_numbers(monkeypatch):
+    monkeypatch.setitem(DEFAULTS, "_float_key", 0.0)
+    assert option({"_float_key": 22}, "_float_key") == 22.0
+    assert type(option({"_float_key": 22}, "_float_key")) is float
+    assert option({"_float_key": 6.5}, "_float_key") == 6.5
+    for bad in (True, "6.5"):
+        with pytest.raises(ValueError, match="_float_key"):
+            option({"_float_key": bad}, "_float_key")
+
+
 def _toggles():
     from vllm_torchtpu.models.minimax_m3 import kernel_toggles
     from vllm_torchtpu.models.minimax_m3.ops import msa as msa_ops
