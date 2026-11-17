@@ -1219,6 +1219,7 @@ class SparseMlaLayerBranchTest(parameterized.TestCase):
                     sm_scale=self.SM_SCALE,
                     k_scale=self.K_SCALE,
                     cache_layout=NOPE_SPEC.layout.value,
+                    turboquant=False,
                 ),
             )
             # The rope tail is cropped from the sparse output.
