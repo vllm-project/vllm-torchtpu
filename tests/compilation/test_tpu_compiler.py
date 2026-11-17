@@ -14,6 +14,7 @@
 
 import contextlib
 import importlib
+import operator
 import os
 import re
 from pathlib import Path
@@ -21,6 +22,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
+from torch import fx
+from torch._dynamo.backends.common import aot_autograd
+from torch._dynamo.source import ConstantSource
+from torch._functorch.aot_autograd import make_boxed_func
+from torch._functorch.partitioners import min_cut_rematerialization_partition
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv, free_symbols
+from vllm.compilation.piecewise_backend import create_concrete_args
+from vllm.config.utils import Range
 
 from tests.compilation.test_graph_fingerprint import (
     _trace_all_reduce_graph,
@@ -1252,14 +1263,6 @@ def _sp_chunk_graph(size: int, tp: int = 8, hidden: int = 16):
     Nothing ties `s` to a concrete tensor dim, so the buffer size is static
     only if `s` itself is.
     """
-    import operator
-
-    import torch
-    from torch import fx
-    from torch._dynamo.source import ConstantSource
-    from torch._subclasses.fake_tensor import FakeTensorMode
-    from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
     shape_env = ShapeEnv()
     s_val = shape_env.create_symintnode(
         shape_env.create_symbol(size, ConstantSource("s72")), hint=size
@@ -1285,10 +1288,6 @@ def _sp_chunk_graph(size: int, tp: int = 8, hidden: int = 16):
 def _static_tpu_backend(graph, example_inputs):
     """TpuBackend's aot_autograd setup, refusing symbolic sizes as fx_to_mlir
     does ("SymIntArrayRef expected to contain only concrete integers")."""
-    from torch._dynamo.backends.common import aot_autograd
-    from torch._functorch.aot_autograd import make_boxed_func
-    from torch._functorch.partitioners import min_cut_rematerialization_partition
-    from torch.fx.experimental.symbolic_shapes import free_symbols
 
     def fw_compiler(fw_graph, _inputs):
         for node in fw_graph.graph.nodes:
@@ -1311,10 +1310,6 @@ class TestSingleSizeCompile:
         """vLLM hands a single-size compile concrete ints, but aot_autograd
         turns int inputs back into SymInts. `load` recompiles the same way
         when its artifact is missing."""
-        import torch
-        from vllm.compilation.piecewise_backend import create_concrete_args
-        from vllm.config.utils import Range
-
         from vllm_torchtpu.compilation import tpu_compiler
 
         monkeypatch.setattr(tpu_compiler, "_tpu_backend", _static_tpu_backend)
@@ -1331,4 +1326,5 @@ class TestSingleSizeCompile:
         x = torch.randn(size, 16)
         torch.testing.assert_close(fn(size, x), graph(size, x))
         # Only the compiled copy is rewritten; vLLM keeps its own graph.
-        assert len(next(iter(graph.graph.nodes)).users) == 2
+        s72 = next(node for node in graph.graph.nodes if node.name == "s72")
+        assert len(s72.users) == 2
