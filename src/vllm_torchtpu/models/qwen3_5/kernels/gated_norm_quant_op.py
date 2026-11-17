@@ -46,61 +46,44 @@ logger = init_logger(__name__)
 # Steps of fewer rows run the JAX reference inside the same custom op.
 MIN_ROWS = 16
 
-_norm_ops: dict[float, Callable] = {}
 _out_proj_ops: dict[float, Callable] = {}
 
 
 def _build_ops(eps: float) -> None:
-    if eps not in _norm_ops:
+    """Register the fused output projection op for one norm epsilon.
 
-        def norm(
-            o: jax.Array, z: jax.Array, w: jax.Array
-        ) -> tuple[jax.Array, jax.Array]:
-            if MIN_ROWS > 0 and o.shape[0] < MIN_ROWS:
-                return gnq.reference(o, z, w, eps)
-            return gnq.gated_norm_quant(o, z, w, eps)
+    The op computes the gated norm and the out_proj's per-token FP8 rows and
+    scales in one kernel and runs the FP8 matmul on them; registering it
+    inside a traced forward is not allowed, so :func:`install` builds it.
+    """
+    if eps in _out_proj_ops:
+        return
 
-        op = pallas.jax_op(f"pallas::gdn_gated_norm_quant_{len(_norm_ops)}", norm)
-
-        def fake_norm(o, z, w):
-            return (
-                o.new_empty(z.shape, dtype=torch.float8_e4m3fn),
-                o.new_empty((o.shape[0], 1), dtype=torch.float32),
-            )
-
-        op.register_fake(fake_norm)
-        _norm_ops[eps] = op
-
-    if eps not in _out_proj_ops:
-        norm_fn = _norm_ops[eps]
-
-        def fused_out_proj(
-            o: jax.Array,
-            z: jax.Array,
-            w_norm: jax.Array,
-            w_proj: jax.Array,
-            w_scale: jax.Array,
-        ) -> jax.Array:
-            if MIN_ROWS > 0 and o.shape[0] < MIN_ROWS:
-                q, s = gnq.reference(o, z, w_norm, eps)
-            else:
-                q, s = gnq.gated_norm_quant(o, z, w_norm, eps)
-            return linear_common._prequant_matmul_jax(
-                q.reshape(o.shape[0], -1), s, w_proj, w_scale
-            )
-
-        proj_op = pallas.jax_op(
-            f"pallas::gdn_gated_norm_out_proj_{len(_out_proj_ops)}",
-            fused_out_proj,
+    def fused_out_proj(
+        o: jax.Array,
+        z: jax.Array,
+        w_norm: jax.Array,
+        w_proj: jax.Array,
+        w_scale: jax.Array,
+    ) -> jax.Array:
+        if MIN_ROWS > 0 and o.shape[0] < MIN_ROWS:
+            q, s = gnq.reference(o, z, w_norm, eps)
+        else:
+            q, s = gnq.gated_norm_quant(o, z, w_norm, eps)
+        return linear_common._prequant_matmul_jax(
+            q.reshape(o.shape[0], -1), s, w_proj, w_scale
         )
 
-        def fake_out_proj(o, z, w_norm, w_proj, w_scale):
-            return o.new_empty((o.shape[0], w_proj.shape[-1]), dtype=torch.bfloat16)
+    proj_op = pallas.jax_op(
+        f"pallas::gdn_gated_norm_out_proj_{len(_out_proj_ops)}",
+        fused_out_proj,
+    )
 
-        proj_op.register_fake(fake_out_proj)
-        _out_proj_ops[eps] = proj_op
-        _ = norm_fn
-    linear_common._get_prequant_matmul_op()
+    def fake_out_proj(o, z, w_norm, w_proj, w_scale):
+        return o.new_empty((o.shape[0], w_proj.shape[-1]), dtype=torch.bfloat16)
+
+    proj_op.register_fake(fake_out_proj)
+    _out_proj_ops[eps] = proj_op
 
 
 def unsupported_reason(layer: QwenGatedDeltaNetAttention) -> str | None:
