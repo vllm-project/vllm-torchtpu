@@ -410,69 +410,62 @@ def test_glm_same_block_hashes():
 
 
 def test_renderer_patch_routes_and_falls_back(monkeypatch):
-    pytest.importorskip("vllm")
+    """The patched BaseRenderer._tokenize_prompt, on vLLM's own renderer and
+    TokenizeParams: the fast path returns what the original returns, and
+    special tokens, truncation and offsets go to the original."""
+    transformers = pytest.importorskip("transformers")
     from vllm.renderers import base as renderer_base
+    from vllm.renderers.params import TokenizeParams
 
-    from vllm_torchtpu import envs
     from vllm_torchtpu import segment_tokenize as st
 
-    hf = _glm_tokenizer()
     cls = renderer_base.BaseRenderer
-    saved = cls.__dict__["_tokenize_prompt"]
+    original = cls._tokenize_prompt
+    fallbacks = []
+
+    def counted_original(self, prompt, params):
+        fallbacks.append(params)
+        return original(self, prompt, params)
+
+    monkeypatch.setattr(cls, "_tokenize_prompt", counted_original)
+    monkeypatch.setattr(cls, "_tpu_segment_tokenize", False, raising=False)
+    monkeypatch.setattr(st, "_INSTANCES", {})
     monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
-    try:
-        st.patch_renderer_segment_tokenize()
-        assert cls._tpu_segment_tokenize
+    st.patch_renderer_segment_tokenize()
+    assert cls._tokenize_prompt is not counted_original
 
-        class P:  # minimal TokenizeParams stand-in
-            def __init__(self, add_special_tokens=False, max_length=None):
-                self.a, self.m = add_special_tokens, max_length
+    class OffsetsRenderer(cls):
+        def render_messages(self, messages, params):
+            raise NotImplementedError
 
-            def get_encode_kwargs(self):
-                return dict(
-                    truncation=self.m is not None,
-                    max_length=self.m,
-                    add_special_tokens=self.a,
-                )
+        def _can_produce_offsets(self):
+            return True
 
-        class R:
-            _tokenize_prompt = cls._tokenize_prompt
+    # __init__ needs a whole VllmConfig; the tokenize path reads only the
+    # tokenizer.
+    renderer = object.__new__(OffsetsRenderer)
+    renderer.tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=_toy_tokenizer()
+    )
+    prompt = {"prompt": "[gMASK]<sop><|user|>To be, or not<|assistant|>to be"}
 
-            def get_tokenizer(self):
-                return hf
+    plain = TokenizeParams(max_total_tokens=None, add_special_tokens=False)
+    fast = renderer._tokenize_prompt(dict(prompt), plain)
+    assert fallbacks == []
+    assert fast == original(renderer, dict(prompt), plain)
+    assert st._INSTANCES
 
-            def _wants_offsets(self, prompt, params):
-                return False
-
-            def _build_tokens_prompt(self, ids, prompt, offset_mapping=None):
-                return {"prompt_token_ids": ids, "fast": True}
-
-        calls = []
-        monkeypatch.setattr(st, "_INSTANCES", {})
-        r = R()
-        text = "[gMASK]<sop><|user|>hello world<|assistant|>"
-        out = r._tokenize_prompt({"prompt": text}, P())
-        assert (
-            out["fast"]
-            and out["prompt_token_ids"]
-            == hf(text, add_special_tokens=False)["input_ids"]
-        )
-
-        # Over-long prompts and add_special_tokens go to the original path.
-        def orig(self, prompt, params):
-            return calls.append(params) or {"orig": True}
-
-        monkeypatch.setattr(st, "_INSTANCES", {})
-        cls._tpu_segment_tokenize = False
-        cls._tokenize_prompt = orig
-        st.patch_renderer_segment_tokenize()
-        R._tokenize_prompt = cls._tokenize_prompt
-        assert r._tokenize_prompt({"prompt": text}, P(add_special_tokens=True)) == {
-            "orig": True
-        }
-        assert r._tokenize_prompt({"prompt": text}, P(max_length=2)) == {"orig": True}
-        assert len(calls) == 2
-    finally:
-        cls._tokenize_prompt = saved
-        cls._tpu_segment_tokenize = False
-        assert envs.VLLM_TPU_SEGMENT_TOKENIZE is True
+    for params in (
+        TokenizeParams(max_total_tokens=None, add_special_tokens=True),
+        TokenizeParams(
+            max_total_tokens=64, truncate_prompt_tokens=2, add_special_tokens=False
+        ),
+        TokenizeParams(
+            max_total_tokens=None, add_special_tokens=False, return_token_offsets=True
+        ),
+    ):
+        got = renderer._tokenize_prompt(dict(prompt), params)
+        assert fallbacks[-1] is params
+        assert got == original(renderer, dict(prompt), params)
+    assert len(fallbacks) == 3
+    assert len(got["prompt_token_offsets"]) == len(got["prompt_token_ids"])
