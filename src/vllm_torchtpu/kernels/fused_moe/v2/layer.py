@@ -24,6 +24,10 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels.fused_moe.v2.direct_all_gather import (
+    direct_all_gather,
+    supports_direct_all_gather,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -1249,9 +1253,7 @@ def fused_ep_moe_v2(
             topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
                 gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
             )
-            exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-                ep, layout[-1]
-            )
+            exchange = gather_exchange(packed)
         return compute_local(
             q_g,
             exchange,
@@ -1268,6 +1270,20 @@ def fused_ep_moe_v2(
             x_l.dtype,
             expert_load_l,
         )
+
+    def gather_exchange(packed):
+        """The routing exchange [ep, width]: every shard's packed routing row.
+
+        Where the SparseCore can hold every row, each shard writes its row to
+        every peer in one round of remote copies, in place of XLA's SparseCore
+        all-gather, which passes the rows around a ring. Same rows in the same
+        order.
+        """
+        if supports_direct_all_gather(ep, packed.size * packed.dtype.itemsize):
+            gathered = direct_all_gather(packed, ax, ep)
+        else:
+            gathered = lax.all_gather(packed, ax, axis=0, tiled=True)
+        return gathered.reshape(ep, layout[-1])
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """stage="route": the wire rows, router weights and payload."""
@@ -1296,9 +1312,7 @@ def fused_ep_moe_v2(
         )
         topk_weights = topk_weights[:t_local]
         packed = packed[:, : layout[-1]]
-        exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-            ep, layout[-1]
-        )
+        exchange = gather_exchange(packed)
         local_blocks = packed[0, : t_local * topk].reshape(
             t_local * topk // block, block
         )
