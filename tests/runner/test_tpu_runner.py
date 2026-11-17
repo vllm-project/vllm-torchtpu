@@ -4008,6 +4008,107 @@ def test_decode_metadata_cache_hit_updates_request_distribution_cpu():
     )
 
 
+@pytest.mark.parametrize("uses_mrope", [False, True])
+@pytest.mark.parametrize(
+    ("num_reqs", "token_paddings"), [(1, [1, 8]), (3, [4, 8]), (3, [8])]
+)
+def test_steady_decode_inputs_match_the_host_inputs(
+    num_reqs, token_paddings, uses_mrope
+):
+    """A steady step's device-derived inputs equal the ones the host would
+    upload for it, padding included."""
+    from runner_input_test_utils import _make_runner, _scheduler_output
+
+    runner = _make_runner(
+        num_computed_tokens=[10, 12, 20][:num_reqs],
+        prompt_tokens=[10, 8, 20][:num_reqs],
+        scheduled_tokens=[1] * num_reqs,
+        token_paddings=token_paddings,
+        max_num_reqs=4,
+        pcp_size=1,
+        uses_mrope=uses_mrope,
+    )
+    batch = runner.input_batch
+    if uses_mrope:
+
+        def decode_mrope_positions(_scheduler_output):
+            # Decode rows share one position per request, offset per row.
+            pos = torch.from_numpy(batch.num_computed_tokens_cpu.copy())
+            for row, offset in enumerate((0, -3, 5)):
+                runner.mrope_positions.cpu[row, :num_reqs] = pos + offset
+
+        runner._calc_mrope_positions = decode_mrope_positions
+    sched = _scheduler_output([1] * num_reqs)
+
+    md = TPUModelRunner._prepare_inputs(runner, sched, 0, num_reqs)[0]["layer.0"]
+    # CPU "uploads" are views of the staging buffers the next call rewrites.
+    prev = (
+        runner.input_ids.clone(),
+        runner.position_ids.clone(),
+        md.seq_lens.clone(),
+    )
+    batch.num_computed_tokens_cpu += 1
+    md = TPUModelRunner._prepare_inputs(runner, sched, 0, num_reqs)[0]["layer.0"]
+    host = (runner.input_ids, runner.position_ids, md.seq_lens)
+
+    # The previous step sampled the host's next ids, in rows of the request
+    # bucket (fewer than the token bucket for 3 requests at [8]); the padding
+    # rows hold garbage.
+    rows = tpu_runner._get_padded_num_reqs_with_upper_limit(num_reqs, 4)
+    next_tokens = torch.full((rows, 1), -7, dtype=torch.int64)
+    next_tokens[:num_reqs, 0] = host[0][:num_reqs]
+    derived = tpu_runner._advance_decode_inputs(next_tokens, *prev, md.query_start_loc)
+    for got, want in zip(derived, host, strict=True):
+        assert torch.equal(got, want)
+
+
+def _steady_scheduler_output(**overrides):
+    out = SimpleNamespace(
+        total_num_scheduled_tokens=2,
+        scheduled_new_reqs=[],
+        scheduled_spec_decode_tokens={},
+        scheduled_cached_reqs=SimpleNamespace(
+            resumed_req_ids=set(), new_block_ids=[None, None]
+        ),
+    )
+    for key, value in overrides.items():
+        target = out.scheduled_cached_reqs if key in ("resumed", "blocks") else out
+        name = {"resumed": "resumed_req_ids", "blocks": "new_block_ids"}.get(key, key)
+        setattr(target, name, value)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("overrides", "batch_req_ids", "steady"),
+    [
+        ({}, ["a", "b"], True),
+        ({"blocks": [None, ([7],)]}, ["a", "b"], False),
+        ({"resumed": {"b"}}, ["a", "b"], False),
+        ({"scheduled_new_reqs": [object()]}, ["a", "b"], False),
+        ({"scheduled_spec_decode_tokens": {"a": [1]}}, ["a", "b"], False),
+        ({"total_num_scheduled_tokens": 3}, ["a", "b"], False),
+        ({}, ["b", "a"], False),
+        ({}, ["a"], False),
+    ],
+)
+def test_steady_decode_needs_the_same_rows_and_block_table(
+    overrides, batch_req_ids, steady
+):
+    """Only a step of the carried requests in their rows, one token each with
+    no new KV block, derives its inputs from the carry; any step takes it."""
+    carry = SimpleNamespace(req_ids=("a", "b"))
+    runner = SimpleNamespace(
+        _decode_carry=carry,
+        _pre_async_results=object(),
+        input_batch=SimpleNamespace(req_ids=batch_req_ids, num_reqs=len(batch_req_ids)),
+    )
+    got = TPUModelRunner._take_steady_decode_carry(
+        runner, _steady_scheduler_output(**overrides)
+    )
+    assert (got is carry) is steady
+    assert runner._decode_carry is None
+
+
 def _bare_rope(cls, rows: int) -> torch.nn.Module:
     """A `cls` instance holding only a `[rows, 8]` cos_sin_cache buffer;
     `_truncate_rope_caches` dispatches on the type and reads only the buffer."""
