@@ -27,6 +27,7 @@ def vpu_diet_enabled() -> bool:
     """Whether to take the score-tile VPU savings (scale folding, mask skip).
 
     Always on; a function so tests can compare it with the plain path. Both
+    paths give the same bits: the mask skip is exact, and the scale is folded
     """
     return True
 
