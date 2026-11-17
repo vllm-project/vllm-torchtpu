@@ -84,6 +84,7 @@ def _load_module(monkeypatch):
             "vllm_torchtpu.kernels.deepseek_v4.q_send",
             "vllm_torchtpu.kernels.deepseek_v4.rope",
             "vllm_torchtpu.models.vllm.vllm_model_wrapper_context",
+            "vllm_torchtpu.rope_patch",
             "torch_tpu",
             "torch_tpu._internal",
         )
@@ -99,6 +100,9 @@ def _load_module(monkeypatch):
     stubs["torch_tpu._internal"].pallas = types.SimpleNamespace(jax_op=_FakeJaxOp)
     stubs["vllm_torchtpu.models.vllm.vllm_model_wrapper_context"].get_pallas_op_mesh = (
         lambda: None
+    )
+    stubs["vllm_torchtpu.rope_patch"].get_rope_cos_sin = (
+        lambda rotary_emb, positions, *, dtype=None: rotary_emb.cos_sin_cache[positions]
     )
     attention = stubs["vllm_torchtpu.models.vllm.deepseek_v4.attention"]
     attention.VllmDeepseekV4MLAAttention = _FakeBaseAttention
@@ -195,25 +199,25 @@ def test_matches_unsharded_reference(monkeypatch, use_fused):
             rotary_emb=types.SimpleNamespace(cos_sin_cache=None),
         )
         layer.n_local_heads, layer.head_dim = NUM_HEADS, HEAD_DIM
-        layer.rotary_emb = types.SimpleNamespace(cos_sin_cache=None)
-        layer.o_proj_op = lambda o, p, c, w, s: torch.einsum(
+        layer.rotary_emb = types.SimpleNamespace(cos_sin_cache=pos_scale[:, None])
+        layer.o_proj_op = lambda o, cs, w, s: torch.einsum(
             "tgk,gko->tgo",
             o.reshape(-1, NUM_GROUPS // 2, (NUM_HEADS // NUM_GROUPS) * HEAD_DIM)
-            * pos_scale[p][:, None, None],
+            * cs[:, :, None],
             wa[groups],
         ).reshape(-1, NUM_GROUPS // 2 * O_LORA_RANK)
         layer.wo_b = lambda z: z @ wb[rows]
 
-        def fused_o_fetch(o, p, c, w, s):
+        def fused_o_fetch(o, cs, w, s):
             # Stand-in for the kernel: gets this chiplet's unswapped `o` (all
             # heads) and returns wo_a over both chiplets' tokens for its heads.
             o_both = group.all_gather(o, dim=0)[:, heads_half]
-            return layer.o_proj_op(o_both, p, c, w, s)
+            return layer.o_proj_op(o_both, cs, w, s)
 
         heads_half = slice(rank * NUM_HEADS // 2, (rank + 1) * NUM_HEADS // 2)
         object.__setattr__(layer, "_fused_o_fetch", fused_o_fetch)
 
-        def q_send_rope(q_half, p, c):
+        def q_send_rope(q_half, cos_sin):
             # Stand-in for _QSendRope: swap the blocks between the chiplets and
             # assemble all heads for the current chiplet's tokens; the reference
             # has no q-norm + RoPE.
@@ -236,7 +240,8 @@ def test_matches_unsharded_reference(monkeypatch, use_fused):
         try:
             layer = make(rank)
             # The base attention_impl runs attention between these two hooks.
-            o = attn(layer._project_q_rope(qr[rank], pos[rank]), pos[rank])
+            q = layer._project_q_rope(qr[rank], pos[rank], cos_sin=None)
+            o = attn(q, pos[rank])
             out[rank] = layer._o_proj(o, pos[rank])
         except BaseException as error:  # noqa: BLE001 - surfaced below
             errors.append(error)
@@ -449,18 +454,18 @@ def test_q_send_rope_ropes_both_blocks_in_place(monkeypatch):
 
     q._send, q._rope = send, lambda *a: ropes.append(a) or "q"
     q_half = torch.randn(2, NUM_TOKENS, half * HEAD_DIM)
-    pos, cache = torch.arange(NUM_TOKENS), torch.randn(64, HEAD_DIM)
-    assert q(q_half, pos, cache) == "q"
+    cos_sin = torch.randn(NUM_TOKENS, HEAD_DIM)
+    assert q(q_half, cos_sin) == "q"
     ((sent, neighbor_mesh_index, chiplet_index),) = sends
     assert sent.shape == (2, NUM_TOKENS, half * HEAD_DIM)
     assert neighbor_mesh_index is q.neighbor_mesh_index
     assert chiplet_index is q.chiplet_index
-    ((current, neighbor, positions, cos_sin_cache, rope_chiplet_index),) = ropes
+    ((current, neighbor, rope_cos_sin, rope_chiplet_index),) = ropes
     # Both blocks go to q-norm + RoPE as [rows, half the heads, head_dim], in place,
     # with the chiplet index as data (one op for both chiplets).
     assert current.shape == (2 * NUM_TOKENS, half, HEAD_DIM)
     assert neighbor.shape == (NUM_TOKENS, half, HEAD_DIM)
-    assert positions is pos and cos_sin_cache is cache
+    assert rope_cos_sin is cos_sin
     assert rope_chiplet_index is q.chiplet_index
 
 
@@ -480,19 +485,15 @@ def test_project_q_rope_sends_both_chiplets_rows(monkeypatch):
             all_gather=lambda x, dim: torch.cat([x, neighbor_qr], dim),
         ),
     )
-    cache = torch.randn(64, HEAD_DIM)
-    layer.mla_attn = types.SimpleNamespace(
-        head_dim=HEAD_DIM,
-        n_local_heads=NUM_HEADS,
-        rotary_emb=types.SimpleNamespace(cos_sin_cache=cache),
-    )
+    layer.mla_attn = types.SimpleNamespace(head_dim=HEAD_DIM, n_local_heads=NUM_HEADS)
     calls = []
     layer.__dict__["_q_send_rope"] = lambda *a: calls.append(a) or "q"
     qr, pos = torch.randn(NUM_TOKENS, Q_LORA_RANK), torch.arange(NUM_TOKENS)
-    assert layer._project_q_rope(qr, pos) == "q"
-    ((q_half, positions, cos_sin_cache),) = calls
+    cos_sin = torch.randn(NUM_TOKENS, HEAD_DIM)
+    assert layer._project_q_rope(qr, pos, cos_sin) == "q"
+    ((q_half, sent_cos_sin),) = calls
     # [2, T, W]: chiplet 0's tokens, then chiplet 1's; the current chiplet's heads.
     assert q_half.shape == (2, NUM_TOKENS, width)
     torch.testing.assert_close(q_half[0], qr @ w)
     torch.testing.assert_close(q_half[1], neighbor_qr @ w)
-    assert positions is pos and cache is cos_sin_cache
+    assert sent_cos_sin is cos_sin

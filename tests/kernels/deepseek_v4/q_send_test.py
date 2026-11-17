@@ -59,15 +59,14 @@ class ChipPairQSendTest(parameterized.TestCase):
         current = jnp.concatenate(blocks)
         neighbor = q[:, other]
         positions = jnp.asarray(rng.integers(0, MAX_POSITION, num_tokens), jnp.int32)
-        cache = jnp.asarray(make_cos_sin_cache(MAX_POSITION, ROTARY_DIM))
+        cos_sin = jnp.asarray(make_cos_sin_cache(MAX_POSITION, ROTARY_DIM))[positions]
         got = qnorm_rope_pair(
             current,
             neighbor,
-            positions,
-            cache,
+            cos_sin,
             jnp.asarray([chiplet_index], jnp.int32),  # data, not a static
         )
-        want = qnorm_rope(q, positions, cache)
+        want = qnorm_rope(q, cos_sin)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
     @parameterized.parameters(8, 64, 128)

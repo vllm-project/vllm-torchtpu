@@ -428,10 +428,12 @@ def test_vllm_rotary_subclass_exhaustiveness_guard():
     tier1_classes = (
         set(tpu_rope.TIER1_STATIC_ROPE_CLASSES)
         | set(tpu_rope.TIER1_MROPE_CLASSES)
-        | {upstream_rope.DeepseekScalingRotaryEmbedding}
+        | {
+            upstream_rope.DeepseekScalingRotaryEmbedding,
+            upstream_rope.DeepseekV4ScalingRotaryEmbedding,
+        }
     )
     out_of_scope_rotary_base = {
-        upstream_rope.DeepseekV4ScalingRotaryEmbedding,
         upstream_rope.FourierRotaryEmbedding,
         upstream_rope.Llama4VisionRotaryEmbedding,
     }
@@ -442,7 +444,7 @@ def test_vllm_rotary_subclass_exhaustiveness_guard():
         f"{upstream_rotary_base_subclasses ^ expected_all}"
     )
 
-    # Verify OOT registry wiring for all 13 Tier-1 RotaryEmbeddingBase classes.
+    # Verify OOT registry wiring for every Tier-1 RotaryEmbeddingBase class.
     for cls in tier1_classes:
         assert cls.__name__ in op_registry_oot, f"Missing OOT registration for {cls}"
 
@@ -470,6 +472,7 @@ def test_vllm_rotary_subclass_exhaustiveness_guard():
         "dynamic_ntk_alpha",
         "yarn",
         "deepseek_scaling",
+        "deepseek_v4_scaling",
         "mrope_contiguous",
         "mrope_yarn",
         "mrope_interleaved",
@@ -482,7 +485,7 @@ def test_all_in_scope_rotary_classes_match_upstream_cpu_table_and_forward(
     monkeypatch: pytest.MonkeyPatch,
     case: str,
 ):
-    """All 14 in-scope rotary classes match upstream CPU FP32 tables & forwards."""
+    """All in-scope rotary classes match upstream CPU FP32 tables & forwards."""
     import inspect
 
     from vllm.model_executor.layers.rotary_embedding import (
@@ -493,6 +496,9 @@ def test_all_in_scope_rotary_classes_match_upstream_cpu_table_and_forward(
         Llama3RotaryEmbedding,
         MRotaryEmbeddingInterleaved,
         NTKScalingRotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
     )
     from vllm.model_executor.layers.rotary_embedding.ernie45_vl_rope import (
         Ernie4_5_VLRotaryEmbedding,
@@ -592,6 +598,24 @@ def test_all_in_scope_rotary_classes_match_upstream_cpu_table_and_forward(
         if case == "deepseek_scaling":
             return (
                 DeepseekScalingRotaryEmbedding(
+                    64,
+                    64,
+                    128,
+                    10000.0,
+                    False,
+                    8.0,
+                    torch.float32,
+                    beta_fast=32,
+                    beta_slow=1,
+                    mscale=0.707,
+                    mscale_all_dim=0.707,
+                ),
+                pos_1d,
+                None,
+            )
+        if case == "deepseek_v4_scaling":
+            return (
+                DeepseekV4ScalingRotaryEmbedding(
                     64,
                     64,
                     128,
@@ -736,7 +760,7 @@ def test_all_in_scope_rotary_classes_match_upstream_cpu_table_and_forward(
 
     g = torch.Generator().manual_seed(42)
     n_tok = positions.shape[-1]
-    if case == "deepseek_scaling":
+    if case in ("deepseek_scaling", "deepseek_v4_scaling"):
         q = torch.randn(n_tok, 4, 64, generator=g, dtype=torch.float32)
         k = torch.randn(n_tok, 1, 64, generator=g, dtype=torch.float32)
     else:

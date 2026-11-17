@@ -219,7 +219,7 @@ def kernel_fn(
     grid_size_ref,
     rms_weight_ref,
     # HBM inputs (dynamic access)
-    cos_sin_cache_ref,
+    cos_sin_ref,
     cache_ref,
     rope_cache_ref,
     state_cache_ref,
@@ -252,8 +252,7 @@ def kernel_fn(
         cache_ref=cache_ref,
         rope_cache_ref=rope_cache_ref,
         state_cache_ref=state_cache_ref,
-        cos_sin_cache_ref=cos_sin_cache_ref,
-        positions_ref=positions_ref,
+        cos_sin_ref=cos_sin_ref,
         token_pages_ref=token_pages_ref,
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
@@ -385,7 +384,7 @@ def compress_norm_rope_store(
     state_block_size: int,
     state_cache: jax.Array | None = None,
     rope_cache: jax.Array | None = None,
-    cos_sin_cache: jax.Array | None = None,
+    cos_sin: jax.Array | None = None,
     compress_ratio: int,
     overlap: bool,
     quant_block: int = 64,
@@ -408,7 +407,11 @@ def compress_norm_rope_store(
 
     num_tokens = positions.shape[0]
     head_dim = rms_weight.shape[0]
-    rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
+    if cos_sin is not None:
+        assert cos_sin.ndim == 2 and cos_sin.shape[0] == num_tokens
+        rope_head_dim = cos_sin.shape[1]
+    else:
+        rope_head_dim = 0
 
     state_operand = None if state_cache is None or state_cache is cache else state_cache
     state_source = cache if state_operand is None else state_operand
@@ -427,6 +430,11 @@ def compress_norm_rope_store(
         quant_block=quant_block,
         seq_along_lane=seq_along_lane,
     )
+    if cos_sin is not None:
+        tile_n = cfgs.tile_sizes.tile_n
+        pad_len = (tile_n - (cos_sin.shape[0] % tile_n)) % tile_n
+        if pad_len > 0:
+            cos_sin = jnp.pad(cos_sin, ((0, pad_len), (0, 0)))
     if seq_along_lane and cache.shape[-1] != config.SAL_PAGE_SIZE:
         raise ValueError(
             f"SEQ_ALONG_LANE indexer cache {cache.shape} must have "
@@ -486,7 +494,7 @@ def compress_norm_rope_store(
         is_first_mask_rope,
         grid_size,
     )
-    cos_sin_operand = cos_sin_cache if cfgs.dims.has_rope else None
+    cos_sin_operand = cos_sin if cfgs.dims.has_rope else None
     rope_operand = rope_cache if cfgs.dims.has_rope_cache else None
 
     in_specs = (

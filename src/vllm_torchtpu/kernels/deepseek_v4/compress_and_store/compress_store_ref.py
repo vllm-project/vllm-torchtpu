@@ -129,8 +129,7 @@ def compress_norm_rope(
     score_window: jax.Array,  # [N, W, D]
     valid_mask: jax.Array,  # [N, W]
     rms_weight: jax.Array,  # [D]
-    cos_sin_cache: jax.Array,  # [M, R]
-    compressed_pos: jax.Array,  # [N]
+    cos_sin: jax.Array,  # [N, R]
     rms_eps: float,
     rope_head_dim: int,
 ) -> jax.Array:  # [N, D]
@@ -153,9 +152,6 @@ def compress_norm_rope(
         * jax.lax.rsqrt(variance + rms_eps)
         * rms_weight[None, :].astype(compressed_kv.dtype)
     )
-
-    # cos_sin: [N, R]
-    cos_sin = cos_sin_cache[compressed_pos]
 
     res = interleaved_rope(normed, cos_sin, rope_head_dim)
 
@@ -183,7 +179,7 @@ def ref_compress_norm_rope_store(
     token_to_req_indices: jax.Array,  # [num_tokens] int
     kv_slot_mapping: jax.Array,  # [num_tokens] int (compressed-KV slots)
     rms_weight: jax.Array,  # [head_dim] fp32
-    cos_sin_cache: jax.Array,  # [max_pos, rope_head_dim] fp32
+    cos_sin: jax.Array,  # [num_tokens, rope_head_dim] fp32
     block_table_stride: int,
     state_block_size: int,
     head_dim: int,
@@ -286,14 +282,12 @@ def ref_compress_norm_rope_store(
     )
 
     # 4. Compress, norm, RoPE
-    compressed_pos = (positions // compress_ratio) * compress_ratio
     compressed = compress_norm_rope(
         kv_window=kv_window,
         score_window=score_window,
         valid_mask=valid_mask,
         rms_weight=rms_weight,
-        cos_sin_cache=cos_sin_cache,
-        compressed_pos=compressed_pos,
+        cos_sin=cos_sin,
         rms_eps=rms_eps,
         rope_head_dim=rope_head_dim,
     )

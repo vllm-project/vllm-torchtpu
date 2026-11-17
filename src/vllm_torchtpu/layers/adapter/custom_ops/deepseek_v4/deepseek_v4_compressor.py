@@ -37,6 +37,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
 )
+from vllm_torchtpu.rope_patch import get_rope_cos_sin
 from vllm_torchtpu.utils import align_to, synchronize_tensors
 
 if TYPE_CHECKING:
@@ -56,7 +57,7 @@ def _run_compressor(
     wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     positions: jax.Array,
     state_block_tables: jax.Array,
     query_start_loc: jax.Array,
@@ -81,7 +82,7 @@ def _run_compressor(
         wkv_wgate=wkv_wgate,
         ape=ape,
         norm_weight=norm_weight,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         positions=positions,
         block_table=state_block_tables,
         query_start_loc=query_start_loc,
@@ -107,7 +108,7 @@ def _compressor_jax_csa(
     wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     positions: jax.Array,
     state_block_tables: jax.Array,
     query_start_loc: jax.Array,
@@ -131,7 +132,7 @@ def _compressor_jax_csa(
         wkv_wgate=wkv_wgate,
         ape=ape,
         norm_weight=norm_weight,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         positions=positions,
         state_block_tables=state_block_tables,
         query_start_loc=query_start_loc,
@@ -157,7 +158,7 @@ def _compressor_jax_hca(
     wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     positions: jax.Array,
     state_block_tables: jax.Array,
     query_start_loc: jax.Array,
@@ -181,7 +182,7 @@ def _compressor_jax_hca(
         wkv_wgate=wkv_wgate,
         ape=ape,
         norm_weight=norm_weight,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         positions=positions,
         state_block_tables=state_block_tables,
         query_start_loc=query_start_loc,
@@ -207,7 +208,7 @@ def _compressor_jax_indexer(
     wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     positions: jax.Array,
     state_block_tables: jax.Array,
     query_start_loc: jax.Array,
@@ -230,7 +231,7 @@ def _compressor_jax_indexer(
         wkv_wgate=wkv_wgate,
         ape=ape,
         norm_weight=norm_weight,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         positions=positions,
         state_block_tables=state_block_tables,
         query_start_loc=query_start_loc,
@@ -524,7 +525,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             P(),  # wkv_wgate
             P(),  # ape
             P(),  # norm_weight
-            P(),  # cos_sin_cache
+            P(attn_data_axis, None),  # cos_sin
             P(attn_data_axis),  # positions
             P(batch_axis),  # state_block_tables
             P(),  # query_start_loc
@@ -552,7 +553,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 wkv_wgate,
                 ape,
                 norm_weight,
-                cos_sin_cache,
+                cos_sin,
                 positions,
                 state_block_tables,
                 query_start_loc,
@@ -570,7 +571,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 wkv_wgate,
                 ape,
                 norm_weight,
-                cos_sin_cache,
+                cos_sin,
                 positions,
                 state_block_tables,
                 query_start_loc,
@@ -680,12 +681,21 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             "quant_config=None, so it never reaches a TPU linear method and "
             "the canonical (k, n) flip does not apply to it."
         )
+        compressed_positions = (
+            torch.div(positions, self.compress_ratio, rounding_mode="floor")
+            * self.compress_ratio
+            if self.compress_ratio > 1
+            else positions
+        )
+        cos_sin = get_rope_cos_sin(
+            rotary_emb, compressed_positions, dtype=torch.float32
+        )
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,
             self.ape,
             self.norm.weight,
-            rotary_emb.cos_sin_cache,
+            cos_sin,
             positions,
             state_block_tables,
             state_metadata.query_start_loc,

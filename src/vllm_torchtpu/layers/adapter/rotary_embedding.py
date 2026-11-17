@@ -59,6 +59,9 @@ from vllm.model_executor.layers.rotary_embedding.bailing_mrope import (
 )
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+    DeepseekV4ScalingRotaryEmbedding,
+)
 from vllm.model_executor.layers.rotary_embedding.ernie45_vl_rope import (
     Ernie4_5_VLRotaryEmbedding,
 )
@@ -502,16 +505,34 @@ def _make_tpu_mrope_class(base: type[MRotaryEmbedding]) -> type[MRotaryEmbedding
     return CustomOp.register_oot(name=base.__name__)(tpu_cls)
 
 
+def _make_tpu_dsv4_rope_class() -> type[DeepseekV4ScalingRotaryEmbedding]:
+    holder: list[type] = []
+    attrs: dict[str, Any] = {
+        "__module__": __name__,
+        "__doc__": "`DeepseekV4ScalingRotaryEmbedding` Tier-1 in-graph RoPE on TPU.",
+    }
+    _attach_tier1_lifecycle(attrs, DeepseekV4ScalingRotaryEmbedding, holder)
+    tpu_cls = type(
+        "TpuDeepseekV4ScalingRotaryEmbedding",
+        (DeepseekV4ScalingRotaryEmbedding,),
+        attrs,
+    )
+    holder.append(tpu_cls)
+    return CustomOp.register_oot(name="DeepseekV4ScalingRotaryEmbedding")(tpu_cls)
+
+
 TPU_ROPE_CLASSES: dict[str, type[RotaryEmbedding]] = {
     base.__name__: _make_tpu_rope_class(base) for base in _STATIC_ROPE_CLASSES
 }
 TPU_MROPE_CLASSES: dict[str, type[MRotaryEmbedding]] = {
     base.__name__: _make_tpu_mrope_class(base) for base in TIER1_MROPE_CLASSES
 }
+TpuDeepseekV4ScalingRotaryEmbedding = _make_tpu_dsv4_rope_class()
 TpuRotaryEmbedding = TPU_ROPE_CLASSES["RotaryEmbedding"]
 TpuMRotaryEmbedding = TPU_MROPE_CLASSES[MRotaryEmbedding.__name__]
 
 logger.info(
-    "Registered TPU rotary embeddings: ApplyRotaryEmb, %s.",
+    "Registered TPU rotary embeddings: ApplyRotaryEmb, "
+    "DeepseekV4ScalingRotaryEmbedding, %s.",
     ", ".join((*TPU_ROPE_CLASSES, *TPU_MROPE_CLASSES)),
 )

@@ -59,7 +59,6 @@ def test_indexer_refuses_a_cache_of_the_other_layout():
     with pytest.raises(ValueError, match="SEQ_ALONG_LANE layout"):
         _indexer_jax(
             jnp.zeros((1, 1, 128), jnp.bfloat16),
-            zeros,
             jnp.zeros((1, 64), jnp.float32),
             jnp.zeros((1, 1), jnp.float32),
             jnp.zeros((1, 64, 4, 256), jnp.uint8),

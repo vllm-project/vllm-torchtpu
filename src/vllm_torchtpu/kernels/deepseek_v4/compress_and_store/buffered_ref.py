@@ -58,43 +58,6 @@ class _BufferedRef(pltpu.BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class CosSinRef(_BufferedRef):
-    def copy_in(self, src_ref, grid_indices):
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        cos_sin_cache_ref, positions_ref = src_ref
-        slot = self.current_copy_in_slot
-        sem = self.sem_recvs.at[slot]
-        pid = grid_indices[0]
-
-        dest_ref = cast(jax.Ref, self.window_ref.at[slot])  # (tile_n, rope_head_dim)
-
-        tile_n = self.cfgs.tile_sizes.tile_n
-        compress_ratio = self.cfgs.dims.compress_ratio
-
-        @pl.loop(0, tile_n, unroll=True)
-        def loop_body(i):
-            global_idx = pid * tile_n + i
-            position = positions_ref[global_idx]
-            compressed_pos = (position // compress_ratio) * compress_ratio
-
-            src = cos_sin_cache_ref.at[
-                compressed_pos, pl.ds(0, self.window_ref.shape[-1])
-            ]
-            dest = dest_ref.at[i, :]
-            pltpu.make_async_copy(src, dest, sem).start()
-
-    def wait_in(self, src_ref, grid_indices):
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        slot = self.current_wait_in_slot
-        sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, kw_only=True)
 class PageBufferRef(_BufferedRef):
     # VMEM block: cfgs.page_buffer_shape()
     #   (tile_n, pages_to_buffer_per_token, page_size, hbm_pack, LANE) uint8
@@ -440,17 +403,16 @@ def create_allocs_and_specs(
     cache_ref,
     rope_cache_ref,
     state_cache_ref,
-    cos_sin_cache_ref,
-    positions_ref,
+    cos_sin_ref,
     token_pages_ref,
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
 ) -> tuple[
-    tuple[CosSinRef | None, OutputRef, PageBufferRef, RoPEOutputRef | None],
+    tuple[pltpu.BufferedRef | None, OutputRef, PageBufferRef, RoPEOutputRef | None],
     tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
     tuple[
-        tuple[Any, ...] | None,
+        Any,
         tuple[Any, ...],
         tuple[Any, ...],
         tuple[Any, ...] | None,
@@ -466,21 +428,17 @@ def create_allocs_and_specs(
 
     # cos_sin
     if cfgs.dims.has_rope:
-        tile_n = cfgs.tile_sizes.tile_n
         cos_sin_spec = pl.BlockSpec(
             block_shape=cfgs.cos_sin_shape(),
             memory_space=pltpu.VMEM,
-            index_map=lambda i: (i * tile_n, 0),
+            index_map=lambda i: (i, 0),
         )
-        cos_sin_alloc = CosSinRef.create(
-            spec=cos_sin_spec,
-            dtype_or_type=cfgs.dims.cos_sin_dtype,
-            buffer_type=pltpu.BufferType.INPUT,
+        cos_sin_alloc = pltpu.BufferedRef.input(
+            cos_sin_spec,
+            cfgs.dims.cos_sin_dtype,
             buffer_count=2,
-            use_lookahead=False,
-            cfgs=cfgs,
         )
-        cos_sin_args = (cos_sin_cache_ref, positions_ref)
+        cos_sin_args = cos_sin_ref
     else:
         cos_sin_alloc = cos_sin_spec = cos_sin_args = None
 

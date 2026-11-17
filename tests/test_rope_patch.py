@@ -782,8 +782,11 @@ def test_content_fallback_recovers_mscale_table() -> None:
     )
 
 
-def test_deepseek_v4_fope_complex_and_dflash_alias_handling() -> None:
+def test_deepseek_v4_fope_complex_and_dflash_alias_handling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     pytest.importorskip("vllm")
+    _ensure_tpu_rotary_embedding_registered()
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
         DeepseekV4ScalingRotaryEmbedding,
@@ -793,7 +796,27 @@ def test_deepseek_v4_fope_complex_and_dflash_alias_handling() -> None:
         Llama4VisionRotaryEmbedding,
     )
 
+    from vllm_torchtpu import envs
+
     with set_current_vllm_config(_vllm_config(1024)):
+        monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
+        tier1_dsv4 = DeepseekV4ScalingRotaryEmbedding(
+            _HEAD_SIZE,
+            _HEAD_SIZE,
+            256,
+            10000.0,
+            False,
+            4.0,
+            torch.float32,
+            beta_fast=32,
+            beta_slow=1,
+            mscale=1.0,
+            mscale_all_dim=1.0,
+        )
+        _assert_cache_buffers_gone(tier1_dsv4)
+        assert isinstance(tier1_dsv4.cos_sin_cache, rope_patch.InGraphCosSinCache)
+
+        monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", False)
         dsv4_rope = DeepseekV4ScalingRotaryEmbedding(
             _HEAD_SIZE,
             _HEAD_SIZE,
@@ -831,6 +854,8 @@ def test_deepseek_v4_fope_complex_and_dflash_alias_handling() -> None:
 
     assert vision_rope.cos_sin_cache.dtype == torch.complex64
 
+    ref_dsv4_table = dsv4_rope.cos_sin_cache.clone()
+
     draft_wrapper = nn.Module()
     draft_wrapper.dsv4 = dsv4_rope
     draft_wrapper.fope = fope
@@ -838,11 +863,21 @@ def test_deepseek_v4_fope_complex_and_dflash_alias_handling() -> None:
     draft_wrapper.normal = _SyntheticRotaryEmbedding(dtype=torch.float32)
     draft_wrapper._rope_cos_sin_cache = draft_wrapper.normal.cos_sin_cache
 
-    assert rope_patch.patch_in_graph_rotary_embedding(draft_wrapper) == 1
+    assert rope_patch.patch_in_graph_rotary_embedding(draft_wrapper) == 2
     assert "_rope_cos_sin_cache" not in draft_wrapper.__dict__
-    assert isinstance(dsv4_rope.cos_sin_cache, torch.Tensor)
+    assert isinstance(dsv4_rope.cos_sin_cache, rope_patch.InGraphCosSinCache)
     assert isinstance(fope.cos_sin_cache, torch.Tensor)
     assert isinstance(vision_rope.cos_sin_cache, torch.Tensor)
+
+    idx = torch.tensor([0, 3, 17, 255], dtype=torch.int32)
+    for mod in (tier1_dsv4, dsv4_rope):
+        assert rope_patch.get_rope_rotary_dim(mod) == _HEAD_SIZE
+        torch.testing.assert_close(
+            rope_patch.get_rope_cos_sin(mod, idx, dtype=torch.float32),
+            ref_dsv4_table.index_select(0, idx),
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
 
 def _pre_refactor_in_graph_rope_forward(
@@ -1117,42 +1152,48 @@ def test_in_graph_cos_sin_cache_normalizes_indexless_device() -> None:
     assert rank3.device == torch.device("cuda", 3)
 
 
-def test_dsv4_pallas_owner_specs_exist_and_fail_loudly(monkeypatch) -> None:
-    import ast
-    import pathlib
-    import sys
-    import types
+def test_get_rope_cos_sin_and_rotary_dim_across_patched_and_unpatched() -> None:
+    assert not hasattr(rope_patch, "_collect_deepseek_v4_pallas_ropes")
+    assert not hasattr(rope_patch, "_DSV4_PALLAS_OWNER_SPECS")
+    raw_rope = _SyntheticRotaryEmbedding(dtype=torch.bfloat16)
+    patched_rope = copy.deepcopy(raw_rope)
+    assert rope_patch.patch_in_graph_rotary_embedding(patched_rope) == 1
 
-    pkg_root = pathlib.Path(rope_patch.__file__).resolve().parent
-    for mod_name, cls_name in rope_patch._DSV4_PALLAS_OWNER_SPECS:
-        rel = mod_name.removeprefix("vllm_torchtpu.").replace(".", "/") + ".py"
-        path = pkg_root / rel
-        assert path.is_file(), f"Missing DSv4 module file: {path}"
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        defined = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
-        assert cls_name in defined, f"{cls_name} not defined in {mod_name}"
+    positions = torch.tensor([0, 4, 19, 127], dtype=torch.int32)
+    assert rope_patch.get_rope_rotary_dim(raw_rope) == _HEAD_SIZE
+    assert rope_patch.get_rope_rotary_dim(patched_rope) == _HEAD_SIZE
 
-    # R-4.1: if a loaded DSv4 module renames its class, lookup raises AttributeError.
-    mod_name, cls_name = rope_patch._DSV4_PALLAS_OWNER_SPECS[0]
-    monkeypatch.setitem(sys.modules, mod_name, types.ModuleType(mod_name))
-    with pytest.raises(AttributeError):
-        rope_patch._collect_deepseek_v4_pallas_ropes(nn.Module())
+    raw_f32 = rope_patch.get_rope_cos_sin(raw_rope, positions, dtype=torch.float32)
+    patched_f32 = rope_patch.get_rope_cos_sin(
+        patched_rope, positions, dtype=torch.float32
+    )
+    assert raw_f32.shape == (4, _HEAD_SIZE)
+    assert raw_f32.dtype == torch.float32
+    assert patched_f32.dtype == torch.float32
+    torch.testing.assert_close(patched_f32, raw_f32, rtol=0, atol=1.6e-2)
 
-    # Combined skip set across (target, draft) protects a shared rotary_emb.
-    fake_mod = types.ModuleType(mod_name)
-    owner_cls = type(cls_name, (nn.Module,), {})
-    setattr(fake_mod, cls_name, owner_cls)
-    monkeypatch.setitem(sys.modules, mod_name, fake_mod)
+    # 2-D positions shape preservation and paired cos/sin support.
+    pos_2d = positions.view(2, 2)
+    assert rope_patch.get_rope_cos_sin(patched_rope, pos_2d).shape == (
+        2,
+        2,
+        _HEAD_SIZE,
+    )
 
-    shared_rope = _SyntheticRotaryEmbedding()
-    owner = owner_cls()
-    owner.rotary_emb = shared_rope
-    target = nn.ModuleDict({"attn": owner})
-    draft = nn.ModuleDict({"rope": shared_rope})
-    skip_ids = rope_patch._collect_deepseek_v4_pallas_ropes(target, draft)
-    assert id(shared_rope) in skip_ids
-    assert rope_patch.patch_in_graph_rotary_embedding(draft, _skip_ids=skip_ids) == 0
-    assert isinstance(shared_rope.cos_sin_cache, torch.Tensor)
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 16, 2).float() / 16.0))
+    angles = torch.outer(torch.arange(64, dtype=torch.float32), inv_freq)
+    pair_mod = nn.Module()
+    pair_mod.register_buffer("cos", angles.cos(), persistent=False)
+    pair_mod.register_buffer("sin", angles.sin(), persistent=False)
+    assert rope_patch.patch_cos_sin_table_pairs(pair_mod) == 1
+    assert rope_patch.get_rope_rotary_dim(pair_mod) == 16
+    pair_pos = torch.tensor([0, 7, 63], dtype=torch.int32)
+    torch.testing.assert_close(
+        rope_patch.get_rope_cos_sin(pair_mod, pair_pos, dtype=torch.float32),
+        torch.cat((angles.cos()[pair_pos], angles.sin()[pair_pos]), dim=-1),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 def test_rotary_base_never_uses_content_recovery_and_warns_once(
@@ -1190,41 +1231,3 @@ def test_rotary_base_never_uses_content_recovery_and_warns_once(
     assert rope_patch.patch_in_graph_rotary_embedding(unknown) == 0
     assert unknown.cos_sin_cache is orig_buf
     assert any("_UnknownFutureRotaryEmbedding" in w for w in warnings_seen)
-
-
-def test_dsv4_pallas_skip_materializes_tier1_plain_rotary_embedding(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Tier-1 plain `RotaryEmbedding` owned by a DSv4 Pallas op materializes back."""
-    import sys
-    import types
-
-    pytest.importorskip("vllm")
-    _ensure_tpu_rotary_embedding_registered()
-    from vllm.config import set_current_vllm_config
-    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
-
-    from vllm_torchtpu import envs
-
-    mod_name, cls_name = rope_patch._DSV4_PALLAS_OWNER_SPECS[0]
-    fake_mod = types.ModuleType(mod_name)
-    owner_cls = type(cls_name, (nn.Module,), {})
-    setattr(fake_mod, cls_name, owner_cls)
-    monkeypatch.setitem(sys.modules, mod_name, fake_mod)
-    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
-
-    with set_current_vllm_config(_vllm_config(1024)):
-        tier1_rope = RotaryEmbedding(
-            _HEAD_SIZE, _HEAD_SIZE, 128, 10000.0, False, torch.float32
-        )
-    assert isinstance(tier1_rope.cos_sin_cache, rope_patch.InGraphCosSinCache)
-    _assert_cache_buffers_gone(tier1_rope)
-
-    owner = owner_cls()
-    owner.rotary_emb = tier1_rope
-    model = nn.ModuleDict({"attn": owner})
-
-    assert rope_patch.patch_in_graph_rotary_embedding(model) == 0
-    assert isinstance(tier1_rope.cos_sin_cache, torch.Tensor)
-    assert "cos_sin_cache" in tier1_rope._buffers
-    assert tier1_rope.cos_sin_cache.shape == (128, _HEAD_SIZE)

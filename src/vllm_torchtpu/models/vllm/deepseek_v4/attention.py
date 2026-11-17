@@ -62,6 +62,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.rope_patch import get_rope_cos_sin, get_rope_rotary_dim
 from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
@@ -78,28 +79,25 @@ class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
 def _qnorm_rope_jax(
     x: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     *,
     eps: float,
 ) -> jax.Array:
     """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
-    return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+    return rope_kernel.qnorm_rope(x, cos_sin, eps=eps)
 
 
 def _rope_jax(
     x: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
 ) -> jax.Array:
     """RoPE over the trailing `rotary_dim` channels of `x`."""
-    return rope_kernel.rope(x, positions, cos_sin_cache)
+    return rope_kernel.rope(x, cos_sin)
 
 
 def _o_proj_jax(
     x: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     wo_a: jax.Array,
     wo_a_scale: jax.Array,
     *,
@@ -108,8 +106,7 @@ def _o_proj_jax(
     """Inverse RoPE fused into the per-group `wo_a` projection."""
     return fused_reverse_rope_wo_a_projection(
         x,
-        positions,
-        cos_sin_cache,
+        cos_sin,
         wo_a,
         wo_a_scale.reshape(-1),
         head_dim=head_dim,
@@ -118,12 +115,12 @@ def _o_proj_jax(
     )
 
 
-def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
+def _fake_rope(x, cos_sin, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(x)
 
 
-def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
+def _fake_o_proj(x, cos_sin, wo_a, wo_a_scale, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty((x.shape[0], wo_a.shape[-1]), dtype=x.dtype, device=x.device)
 
@@ -484,14 +481,15 @@ class VllmDeepseekV4MLAAttention(
         op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
+            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+            # pyrefly: ignore[no-matching-overload]
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # q
-                    P(),  # positions
-                    P(),  # cos_sin_cache
+                    P(),  # cos_sin
                 ),
             )
             op.register_fake(_fake_rope)
@@ -509,14 +507,15 @@ class VllmDeepseekV4MLAAttention(
         op_name = "pallas::deepseek_v4_kv_rope"
         op = _pallas_op_cache.get(op_name)
         if op is None:
+            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+            # pyrefly: ignore[no-matching-overload]
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(),  # kv
-                    P(),  # positions
-                    P(),  # cos_sin_cache
+                    P(),  # cos_sin
                 ),
             )
             op.register_fake(_fake_rope)
@@ -528,26 +527,38 @@ class VllmDeepseekV4MLAAttention(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        cos_sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply RMSNorm and scaling RoPE to query head states."""
-        return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
+        if cos_sin is None:
+            cos_sin = get_rope_cos_sin(
+                self.mla_attn.rotary_emb, positions, dtype=torch.float32
+            )
+        return self.qnorm_rope_op(q, cos_sin)
 
     def kv_rope(
         self,
         kv: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        cos_sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply scaling RoPE to decoupled key states."""
-        return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
+        if cos_sin is None:
+            cos_sin = get_rope_cos_sin(
+                self.mla_attn.rotary_emb, positions, dtype=torch.float32
+            )
+        return self.kv_rope_op(kv, cos_sin)
 
     def _project_q_rope(
-        self, qr: torch.Tensor, positions: torch.Tensor
+        self, qr: torch.Tensor, positions: torch.Tensor, cos_sin: torch.Tensor
     ) -> torch.Tensor:
         """Query heads with q-RMSNorm and RoPE: [num_tokens, heads, head_dim]."""
         q = self.wq_b(qr).view(
             qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
         )
-        return self.qnorm_rope(q, positions)
+        return self.qnorm_rope(q, positions, cos_sin=cos_sin)
 
     def attention_impl(
         self,
@@ -557,10 +568,16 @@ class VllmDeepseekV4MLAAttention(
         indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         out: torch.Tensor | None,
+        *,
+        cos_sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self._project_q_rope(qr, positions)
-        kv = self.kv_rope(kv, positions)
+        if cos_sin is None:
+            cos_sin = get_rope_cos_sin(
+                self.mla_attn.rotary_emb, positions, dtype=torch.float32
+            )
+        q = self._project_q_rope(qr, positions, cos_sin)
+        kv = self.kv_rope(kv, positions, cos_sin=cos_sin)
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
@@ -763,14 +780,15 @@ class VllmDeepseekV4MLAAttention(
         op_name = f"pallas::deepseek_v4_o_proj_d{head_dim}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
+            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+            # pyrefly: ignore[no-matching-overload]
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # o
-                    P(),  # positions
-                    P(),  # cos_sin_cache
+                    P(),  # cos_sin
                     P(),  # wo_a
                     P(),  # wo_a_scale
                 ),
@@ -848,12 +866,18 @@ class VllmDeepseekV4MLAAttention(
             f"{self.prefix}.wo_a: head_dim {self.head_dim} is not a multiple "
             "of the 128-lane width."
         )
-        rotary_dim = self.rotary_emb.cos_sin_cache.shape[-1]
+        rotary_dim = get_rope_rotary_dim(self.rotary_emb)
         assert rotary_dim % 2 == 0 and rotary_dim <= 128, (
             f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at most 128."
         )
 
-    def _o_proj(self, o: torch.Tensor | Any, positions: torch.Tensor) -> torch.Tensor:
+    def _o_proj(
+        self,
+        o: torch.Tensor | Any,
+        positions: torch.Tensor,
+        *,
+        cos_sin: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
         # The kernel folds the inverse RoPE, the activation quantization and
         # the per-group `wo_a` matmul into one pass.
@@ -866,10 +890,11 @@ class VllmDeepseekV4MLAAttention(
             f"in place and needs [t, {self.n_local_heads}, {self.head_dim}], "
             f"got {list(o.shape)}."
         )
+        if cos_sin is None:
+            cos_sin = get_rope_cos_sin(self.rotary_emb, positions, dtype=torch.float32)
         z = self.o_proj_op(
             o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
+            cos_sin,
             self.wo_a.weight,
             self.wo_a.weight_scale,
         )
@@ -896,6 +921,9 @@ class VllmDeepseekV4MLAAttention(
         qr = self.q_norm(qr)
         kv = self.kv_norm(kv)
 
+        cos_sin = get_rope_cos_sin(
+            self.mla_attn.rotary_emb, positions, dtype=torch.float32
+        )
         attn_output = self.attention_impl(
             hidden_states,
             qr,
@@ -903,7 +931,8 @@ class VllmDeepseekV4MLAAttention(
             indexer_weights,
             positions,
             None,
+            cos_sin=cos_sin,
         )
 
-        out = self._o_proj(attn_output, positions)
+        out = self._o_proj(attn_output, positions, cos_sin=cos_sin)
         return out

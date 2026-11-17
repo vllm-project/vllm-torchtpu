@@ -1086,22 +1086,113 @@ def _clean_compact_rope_attrs(module: nn.Module) -> None:
     module.__dict__.pop("_tpu_compact_rope_angles", None)
 
 
-def patch_in_graph_rotary_embedding(
-    model: nn.Module,
+def get_rope_rotary_dim(rotary_emb: nn.Module) -> int:
+    """Returns the `[cos | sin]` width (`rotary_dim`) of `rotary_emb`."""
+    spec = getattr(rotary_emb, "_in_graph_spec", None)
+    if spec is not None:
+        return int(spec.rotary_dim)
+    inv_freq = getattr(rotary_emb, "_in_graph_rope_inv_freq", None)
+    if inv_freq is not None:
+        return len(inv_freq) * 2
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    if cache is not None:
+        return int(cache.shape[-1])
+    cos = getattr(rotary_emb, "cos", None)
+    if cos is not None:
+        return int(cos.shape[-1]) * 2
+    rotary_dim = rotary_emb.rotary_dim
+    assert isinstance(rotary_dim, int)
+    return rotary_dim
+
+
+def get_rope_cos_sin(
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
     *,
-    _skip_ids: set[int] | None = None,
-) -> int:
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Returns per-position `[cos | sin]` rows of shape
+    `(*positions.shape, rotary_dim)`.
+
+    Computes `cos` and `sin` in-graph when `rotary_emb` has been patched by
+    `patch_in_graph_rotary_embedding`, `install_tier1_in_graph_rope`, or
+    `InGraphCosSinCache`, and falls back to indexing `rotary_emb.cos_sin_cache`
+    when `TPU_ROPE_IN_GRAPH=0`.
+    """
+    spec: RopeInGraphSpec | None = getattr(rotary_emb, "_in_graph_spec", None)
+    if spec is not None:
+        out_dtype = spec.cache_dtype if dtype is None else dtype
+        if (
+            positions.ndim >= 2
+            and spec.dim_modalities is not None
+            and positions.shape[0] == 3
+        ):
+            pos_for_freq = _select_mrope_positions(
+                positions.reshape(3, -1), spec.dim_modalities
+            )
+            out_shape = (*positions.shape[1:], spec.rotary_dim)
+        else:
+            pos_for_freq = positions.reshape(-1)
+            out_shape = (*positions.shape, spec.rotary_dim)
+        rows = _eval_spec_cos_sin(spec, pos_for_freq, out_dtype)
+        return rows.reshape(out_shape)
+
+    inv_freq = getattr(rotary_emb, "_in_graph_rope_inv_freq", None)
+    if inv_freq is not None:
+        cache_dtype = getattr(rotary_emb, "_in_graph_rope_cache_dtype", torch.float32)
+        out_dtype = cache_dtype if dtype is None else dtype
+        dim_modalities = getattr(rotary_emb, "_in_graph_rope_dim_modalities", None)
+        rotary_width = len(inv_freq) * 2
+        if (
+            positions.ndim >= 2
+            and dim_modalities is not None
+            and positions.shape[0] == 3
+        ):
+            pos_for_freq = _select_mrope_positions(
+                positions.reshape(3, -1), dim_modalities
+            )
+            out_shape = (*positions.shape[1:], rotary_width)
+        else:
+            pos_for_freq = positions.reshape(-1)
+            out_shape = (*positions.shape, rotary_width)
+        rows = _in_graph_cos_sin(
+            pos_for_freq,
+            inv_freq,
+            cache_dtype,
+            out_dtype,
+        )
+        return rows.reshape(out_shape)
+
+    cache: Any = getattr(rotary_emb, "cos_sin_cache", None)
+    if isinstance(cache, InGraphCosSinCache):
+        rows = cache[positions]
+        return rows if dtype is None or rows.dtype == dtype else rows.to(dtype)
+    if isinstance(cache, torch.Tensor):
+        rows = cache.index_select(0, positions.reshape(-1).clamp(min=0)).reshape(
+            *positions.shape, cache.shape[-1]
+        )
+        return rows if dtype is None or rows.dtype == dtype else rows.to(dtype)
+
+    cos = getattr(rotary_emb, "cos", None)
+    sin = getattr(rotary_emb, "sin", None)
+    if cos is not None and sin is not None:
+        rows = torch.cat((cos[positions], sin[positions]), dim=-1)
+        return rows if dtype is None or rows.dtype == dtype else rows.to(dtype)
+
+    raise AttributeError(
+        f"{type(rotary_emb).__name__} has neither in-graph RoPE frequencies "
+        "nor cos_sin_cache"
+    )
+
+
+def patch_in_graph_rotary_embedding(model: nn.Module) -> int:
     """Tier-2 post-load & export sweep replacing remaining `cos_sin_cache` buffers.
 
     Modules already converted at `__init__` time by Tier 1 (`_tpu_in_graph_tier1`)
-    are skipped (or materialized back to `torch.Tensor` when listed in `skip_ids`
-    for DeepSeek-V4 Pallas custom-op consumers). Remaining eligible modules
-    (plain-`nn.Module` `Phi3LongRoPE`, CPU-traced `torch.export` models, and
-    model-local paired buffers) are converted in-place.
+    are skipped. Remaining eligible modules (plain-`nn.Module` `Phi3LongRoPE`,
+    CPU-traced `torch.export` models, and model-local paired buffers) are
+    converted in-place.
     """
-    skip_ids = (
-        _collect_deepseek_v4_pallas_ropes(model) if _skip_ids is None else _skip_ids
-    )
     drop_unused_rope_cache_aliases(model)
     mrope_interleaved_cls: type | None = None
     try:
@@ -1115,9 +1206,6 @@ def patch_in_graph_rotary_embedding(
 
     num_patched = 0
     for _, module in model.named_modules():
-        if id(module) in skip_ids:
-            materialize_cos_sin_cache(module)
-            continue
         if getattr(module, "_tpu_in_graph_tier1", False):
             _clean_compact_rope_attrs(module)
             continue
@@ -1174,7 +1262,7 @@ def patch_in_graph_rotary_embedding(
         num_patched += 1
     return (
         num_patched
-        + patch_cos_sin_cache_buffers(model, _skip_ids=skip_ids)
+        + patch_cos_sin_cache_buffers(model)
         + patch_cos_sin_table_pairs(model)
     )
 
@@ -1437,65 +1525,6 @@ def _module_cos_sin_segments(
     return candidate_segments
 
 
-_DSV4_PALLAS_OWNER_SPECS: tuple[tuple[str, str], ...] = (
-    (
-        "vllm_torchtpu.models.vllm.deepseek_v4.attention",
-        "VllmDeepseekV4MLAAttention",
-    ),
-    (
-        "vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer",
-        "VllmDeepseekV4Indexer",
-    ),
-    (
-        "vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor",
-        "VllmDeepseekCompressor",
-    ),
-)
-
-
-def _collect_deepseek_v4_pallas_ropes(*models: nn.Module) -> set[int]:
-    """Object ids of rotary modules consumed as raw tensors by DSv4 Pallas ops."""
-    # TODO(#2747): Remove once DeepSeek-V4 Pallas kernels consume per-token cos_sin.
-    dsv4_rope_cls: type | None = None
-    try:
-        from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
-            DeepseekV4ScalingRotaryEmbedding,
-        )
-
-        dsv4_rope_cls = DeepseekV4ScalingRotaryEmbedding
-    except ImportError:
-        pass
-
-    # Look up via sys.modules rather than importing: importing DSv4 modules
-    # requires torch_tpu/JAX and registers Pallas ops globally. Any model
-    # containing an instance of an owner class has already imported its module;
-    # direct getattr (no default) fails loudly if a class is renamed (R-4.1).
-    pallas_owner_classes: list[type] = []
-    for mod_name, cls_name in _DSV4_PALLAS_OWNER_SPECS:
-        owner_mod = sys.modules.get(mod_name)
-        if owner_mod is not None:
-            pallas_owner_classes.append(getattr(owner_mod, cls_name))
-    pallas_owner_tuple = tuple(pallas_owner_classes)
-
-    skip_ids: set[int] = set()
-    for model in models:
-        for mod in model.modules():
-            if dsv4_rope_cls is not None and isinstance(mod, dsv4_rope_cls):
-                skip_ids.add(id(mod))
-            if pallas_owner_tuple and isinstance(mod, pallas_owner_tuple):
-                for attr in ("rotary_emb", "indexer_rotary_emb"):
-                    sub = getattr(mod, attr, None)
-                    if isinstance(sub, nn.Module):
-                        skip_ids.add(id(sub))
-                mla_attn = getattr(mod, "mla_attn", None)
-                if mla_attn is not None and mla_attn is not mod:
-                    for attr in ("rotary_emb", "indexer_rotary_emb"):
-                        sub = getattr(mla_attn, attr, None)
-                        if isinstance(sub, nn.Module):
-                            skip_ids.add(id(sub))
-    return skip_ids
-
-
 def _recover_rope_segment_from_table(
     cos: torch.Tensor,
     sin: torch.Tensor,
@@ -1559,27 +1588,17 @@ def _recover_rope_segment_from_table(
     )
 
 
-def patch_cos_sin_cache_buffers(
-    model: nn.Module,
-    *,
-    _skip_ids: set[int] | None = None,
-) -> int:
+def patch_cos_sin_cache_buffers(model: nn.Module) -> int:
     """Replaces remaining rotary `cos_sin_cache` buffers with `InGraphCosSinCache`.
 
     Matches `vLLM` rotary modules strictly via exact-class `spec_from_module` +
     sampled CPU verification, and gates content-based `_recover_rope_segment_from_table`
     strictly to `not isinstance(module, RotaryEmbeddingBase)` (model-local buffers).
     """
-    skip_ids = (
-        _collect_deepseek_v4_pallas_ropes(model) if _skip_ids is None else _skip_ids
-    )
     num_patched = 0
     verified_memo: dict[Any, list[CosSinSegment]] = {}
     fallback_memo: dict[tuple[Any, ...], CosSinSegment | None] = {}
     for _, module in model.named_modules():
-        if id(module) in skip_ids:
-            materialize_cos_sin_cache(module)
-            continue
         if (
             getattr(module, "_tpu_in_graph_tier1", False)
             or hasattr(module, "cos_coef")
