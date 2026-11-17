@@ -179,3 +179,122 @@ def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
         match="does not support pipeline parallelism",
     ):
         configure_sp_moe(vllm_config)
+
+
+@pytest.fixture(scope="module")
+def validate_dense_sp(configure_sp_moe):
+    """Yields `_validate_dense_sequence_parallel` with platform stubs active."""
+    del configure_sp_moe
+    from vllm_torchtpu.platforms.tpu_platform import _validate_dense_sequence_parallel
+
+    return _validate_dense_sequence_parallel
+
+
+def _gemma4_vllm_config(**overrides: object) -> SimpleNamespace:
+    parallel = SimpleNamespace(
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+    model = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="gemma4_text"),
+    )
+    cfg = SimpleNamespace(
+        parallel_config=parallel,
+        model_config=model,
+        lora_config=None,
+        speculative_config=None,
+    )
+    for key, val in overrides.items():
+        if hasattr(parallel, key):
+            setattr(parallel, key, val)
+        elif key == "model_type":
+            model.hf_text_config.model_type = val
+        else:
+            setattr(cfg, key, val)
+    return cfg
+
+
+def test_dense_sp_platform_validation_admits_valid_and_ngram(
+    monkeypatch: pytest.MonkeyPatch, validate_dense_sp
+) -> None:
+    import dataclasses
+
+    from vllm.config import LoRAConfig, ModelConfig, VllmConfig
+
+    from vllm_torchtpu import envs
+
+    # Regression guard: LoRAConfig lives on VllmConfig, never on ModelConfig.
+    assert "lora_config" not in {f.name for f in dataclasses.fields(ModelConfig)}
+    assert "lora_config" in {f.name for f in dataclasses.fields(VllmConfig)}
+
+    monkeypatch.setattr(envs, "TPU_DENSE_SEQUENCE_PARALLEL", False)
+    validate_dense_sp(_gemma4_vllm_config(tensor_parallel_size=1))
+
+    monkeypatch.setattr(envs, "TPU_DENSE_SEQUENCE_PARALLEL", True)
+    validate_dense_sp(_gemma4_vllm_config())
+    validate_dense_sp(
+        _gemma4_vllm_config(speculative_config=SimpleNamespace(method="ngram"))
+    )
+
+    with pytest.raises(NotImplementedError, match="LoRA"):
+        validate_dense_sp(_gemma4_vllm_config(lora_config=LoRAConfig(max_loras=1)))
+
+
+def test_dense_sp_platform_warns_once_on_non_gemma4(
+    monkeypatch: pytest.MonkeyPatch, validate_dense_sp
+) -> None:
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.platforms import tpu_platform
+
+    monkeypatch.setattr(envs, "TPU_DENSE_SEQUENCE_PARALLEL", True)
+    warn = MagicMock()
+    monkeypatch.setattr(tpu_platform.logger, "warning_once", warn)
+    validate_dense_sp(_gemma4_vllm_config(model_type="qwen3_5_text"))
+    warn.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "exc_type", "match"),
+    [
+        ({"tensor_parallel_size": 1}, ValueError, "tensor_parallel_size > 1"),
+        (
+            {"pipeline_parallel_size": 2},
+            NotImplementedError,
+            "pipeline_parallel_size=2",
+        ),
+        (
+            {"prefill_context_parallel_size": 2},
+            NotImplementedError,
+            "prefill_context_parallel_size=2",
+        ),
+        (
+            {"decode_context_parallel_size": 2},
+            NotImplementedError,
+            "decode_context_parallel_size=2",
+        ),
+        (
+            {"speculative_config": SimpleNamespace(method="mtp")},
+            NotImplementedError,
+            "'mtp'",
+        ),
+        (
+            {"speculative_config": SimpleNamespace(method="eagle3")},
+            NotImplementedError,
+            "'eagle3'",
+        ),
+    ],
+)
+def test_dense_sp_platform_rejects_unsupported_configs(
+    monkeypatch: pytest.MonkeyPatch,
+    validate_dense_sp,
+    overrides: dict[str, object],
+    exc_type: type[Exception],
+    match: str,
+) -> None:
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_DENSE_SEQUENCE_PARALLEL", True)
+    with pytest.raises(exc_type, match=match):
+        validate_dense_sp(_gemma4_vllm_config(**overrides))
