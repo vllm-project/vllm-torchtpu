@@ -15,23 +15,37 @@
 final prompt token (a serving crash: computed 126208, scheduled 2, prompt
 126209)."""
 
+import dataclasses
 import types
 
 import numpy as np
 import pytest
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner, _strip_prefill_only_padding
 
 
 def _so(num_sched, spec, new=(), cached=None):
-    return types.SimpleNamespace(
+    return dataclasses.replace(
+        SchedulerOutput.make_empty(),
         num_scheduled_tokens=dict(num_sched),
         total_num_scheduled_tokens=sum(num_sched.values()),
         scheduled_spec_decode_tokens=dict(spec),
         scheduled_new_reqs=list(new),
-        scheduled_cached_reqs=cached
-        or types.SimpleNamespace(req_ids=[], num_computed_tokens=[]),
+        scheduled_cached_reqs=cached or CachedRequestData.make_empty(),
+    )
+
+
+def _cached(req_ids, computed):
+    return dataclasses.replace(
+        CachedRequestData.make_empty(),
+        req_ids=list(req_ids),
+        num_computed_tokens=list(computed),
     )
 
 
@@ -43,8 +57,15 @@ def _batch(prompts=()):
 
 
 def _new(rid, computed, prompt_len):
-    return types.SimpleNamespace(
-        req_id=rid, num_computed_tokens=computed, prompt_token_ids=[0] * prompt_len
+    return NewRequestData(
+        req_id=rid,
+        prompt_token_ids=[0] * prompt_len,
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=computed,
+        lora_request=None,
     )
 
 
@@ -54,27 +75,38 @@ def test_strips_padding_on_new_request():
         {"crash": [-1]},
         new=[_new("crash", 126208, 126209), _new("other", 0, 9000)],
     )
-    assert _strip_prefill_only_padding(so, _batch()) == 1
-    assert so.num_scheduled_tokens == {"crash": 1, "other": 4096}
-    assert so.total_num_scheduled_tokens == 4097
-    assert "crash" not in so.scheduled_spec_decode_tokens
+    out = _strip_prefill_only_padding(so, _batch())
+    assert out.num_scheduled_tokens == {"crash": 1, "other": 4096}
+    assert out.total_num_scheduled_tokens == 4097
+    assert "crash" not in out.scheduled_spec_decode_tokens
+    assert out.scheduled_new_reqs is so.scheduled_new_reqs
+
+
+def test_the_scheduler_s_step_is_left_untouched():
+    """Under a uniprocess executor the scheduler holds this object, and it
+    rolls the placeholder back as a rejected draft only if it still sees it."""
+    so = _so({"crash": 2}, {"crash": [-1]}, new=[_new("crash", 126208, 126209)])
+    out = _strip_prefill_only_padding(so, _batch())
+    assert out is not so
+    assert so.num_scheduled_tokens == {"crash": 2}
+    assert so.total_num_scheduled_tokens == 2
+    assert so.scheduled_spec_decode_tokens == {"crash": [-1]}
 
 
 def test_strips_padding_on_resumed_cached_request():
-    cached = types.SimpleNamespace(req_ids=["r"], num_computed_tokens=[126208])
-    so = _so({"r": 2}, {"r": [-1]}, cached=cached)
-    assert _strip_prefill_only_padding(so, _batch([("r", 126209)])) == 1
-    assert so.num_scheduled_tokens["r"] == 1
+    so = _so({"r": 2}, {"r": [-1]}, cached=_cached(["r"], [126208]))
+    out = _strip_prefill_only_padding(so, _batch([("r", 126209)]))
+    assert out.num_scheduled_tokens["r"] == 1
 
 
 def test_leaves_real_drafts_and_in_prompt_steps_alone():
     # Real draft ids (not placeholders): untouched (the runner's guard still
     # refuses them).
     so = _so({"a": 2}, {"a": [17]}, new=[_new("a", 126208, 126209)])
-    assert _strip_prefill_only_padding(so, _batch()) == 0
+    assert _strip_prefill_only_padding(so, _batch()) is so
     # Placeholders but the step stays inside the prompt: untouched.
     so = _so({"b": 2}, {"b": [-1]}, new=[_new("b", 100, 5000)])
-    assert _strip_prefill_only_padding(so, _batch()) == 0
+    assert _strip_prefill_only_padding(so, _batch()) is so
     assert so.num_scheduled_tokens["b"] == 2
 
 
@@ -88,11 +120,13 @@ def _execute_until_update_states(monkeypatch, prefill_only):
     on the runner's input batch."""
     calls = []
     batch = types.SimpleNamespace()
-    monkeypatch.setattr(
-        tpu_runner,
-        "_strip_prefill_only_padding",
-        lambda so, input_batch: calls.append(("strip", so, input_batch)),
-    )
+    stripped = _so({"r": 1}, {})
+
+    def _strip(so, input_batch):
+        calls.append(("strip", so, input_batch))
+        return stripped
+
+    monkeypatch.setattr(tpu_runner, "_strip_prefill_only_padding", _strip)
     runner = types.SimpleNamespace(
         _pp_wave=None,
         execute_model_state=None,
@@ -109,14 +143,17 @@ def _execute_until_update_states(monkeypatch, prefill_only):
     so = _so({"r": 2}, {"r": [-1]})
     with pytest.raises(_Stop):
         TPUModelRunner.execute_model(runner, so)
-    return calls, so, batch
+    return calls, so, batch, stripped
 
 
 def test_execute_model_strips_before_reading_the_step(monkeypatch):
-    calls, so, batch = _execute_until_update_states(monkeypatch, prefill_only=True)
-    assert calls == [("strip", so, batch), ("update", so)]
+    calls, so, batch, stripped = _execute_until_update_states(
+        monkeypatch, prefill_only=True
+    )
+    # The rest of the step runs on the stripped copy.
+    assert calls == [("strip", so, batch), ("update", stripped)]
 
 
 def test_execute_model_does_not_strip_off_the_prefill_only_path(monkeypatch):
-    calls, so, _ = _execute_until_update_states(monkeypatch, prefill_only=False)
+    calls, so, _, _ = _execute_until_update_states(monkeypatch, prefill_only=False)
     assert calls == [("update", so)]
