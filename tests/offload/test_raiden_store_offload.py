@@ -3860,6 +3860,7 @@ class TestStorageSpec(unittest.TestCase):
         self.assertEqual(spec.dp_rank, 0)
         manager_kwargs, worker_kwargs = self._get_manager_and_worker(spec)
         self.assertEqual(manager_kwargs["secondary_backend_configs"], [])
+        self.assertIsNone(manager_kwargs["storage_backend"])
         self.assertEqual(manager_kwargs["dp_rank"], 0)
         self.assertEqual(worker_kwargs["backend_configs"], [])
 
@@ -3908,6 +3909,7 @@ class TestStorageSpec(unittest.TestCase):
         self.assertEqual(store_cfg.parallelism.pp_size, -1)
         self.assertNotIn("tp_size", store_cfg.properties)
         self.assertEqual(store_cfg.properties["direct_io"], "true")
+        self.assertEqual(manager_kwargs["storage_backend"], "posix")
         # The worker registers under its engine-local rank -- its TP rank
         # here, not its world rank -- and writes as its TP rank.
         self.assertEqual(worker_kwargs["rank"], 2)
