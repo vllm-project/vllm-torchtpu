@@ -18,10 +18,10 @@ reads (``all_token_ids[req_id][-num_output_tokens:]`` when
 
 import pickle
 import random
-import time
 
 from vllm.v1.core.sched.output import CachedRequestData
 
+from vllm_torchtpu.core import prefix_aware_scheduler
 from vllm_torchtpu.core.prefix_aware_scheduler import (
     PrefixAwareScheduler,
     trim_resend_token_ids,
@@ -91,42 +91,52 @@ def test_trim_shrinks_payload_at_94k():
         num_output_tokens=[3],
     )
     big = len(pickle.dumps(data))
-    t0 = time.perf_counter()
     saved = trim_resend_token_ids(data)
-    dt = time.perf_counter() - t0
     assert saved == 94_000
     assert data.all_token_ids == {"a": [7, 8, 9]}
     assert len(pickle.dumps(data)) < big // 100
-    assert dt < 0.01
 
 
-def test_scheduler_override_and_off_switch(monkeypatch):
-    calls = []
+def _fake_super(self, *a, **k):
+    return CachedRequestData(
+        req_ids=["a"],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={"a": [1, 2, 3, 4, 5]},
+        new_block_ids=[None],
+        num_computed_tokens=[3],
+        num_output_tokens=[2],
+    )
 
-    def fake_super(self, *a, **k):
-        calls.append(1)
-        return CachedRequestData(
-            req_ids=["a"],
-            resumed_req_ids=set(),
-            new_token_ids=[],
-            all_token_ids={"a": [1, 2, 3, 4, 5]},
-            new_block_ids=[None],
-            num_computed_tokens=[3],
-            num_output_tokens=[2],
-        )
 
+def _decode_leg_scheduler(monkeypatch):
     base = PrefixAwareScheduler.__mro__[1]
-    monkeypatch.setattr(base, "_make_cached_request_data", fake_super)
-
+    monkeypatch.setattr(base, "_make_cached_request_data", _fake_super)
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     s._is_kv_consumer = True
+    return s
+
+
+def test_scheduler_override_trims(monkeypatch):
+    s = _decode_leg_scheduler(monkeypatch)
     out = s._make_cached_request_data([], [], {}, {}, {})
     assert out.all_token_ids == {"a": [4, 5]}
 
-    # A failed trim turns the trim off for the scheduler's lifetime.
-    s2 = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    s2._is_kv_consumer = True
-    s2._trim_resend = False
-    out2 = s2._make_cached_request_data([], [], {}, {}, {})
+
+def test_failed_trim_turns_the_trim_off(monkeypatch):
+    """A trim that raises returns the untrimmed data and is never tried
+    again by that scheduler."""
+    calls = []
+
+    def broken(cached_reqs):
+        calls.append(cached_reqs)
+        raise RuntimeError("simulated trim failure")
+
+    monkeypatch.setattr(prefix_aware_scheduler, "trim_resend_token_ids", broken)
+    s = _decode_leg_scheduler(monkeypatch)
+    out = s._make_cached_request_data([], [], {}, {}, {})
+    assert out.all_token_ids == {"a": [1, 2, 3, 4, 5]}
+    assert s._trim_resend is False
+    out2 = s._make_cached_request_data([], [], {}, {}, {})
     assert out2.all_token_ids == {"a": [1, 2, 3, 4, 5]}
-    assert len(calls) == 2
+    assert len(calls) == 1

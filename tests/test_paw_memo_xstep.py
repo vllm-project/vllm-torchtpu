@@ -150,7 +150,7 @@ def _lookup(s, req):
     return c
 
 
-def _simulate(begin_step, seed, steps, verify=0, num_blocks=160):
+def _simulate(begin_step, seed, steps, verify=0, num_blocks=160, on_check=None):
     rng = random.Random(seed)
     mgr = _manager(num_blocks)
     s = _paw(mgr, verify)
@@ -184,6 +184,8 @@ def _simulate(begin_step, seed, steps, verify=0, num_blocks=160):
                 mgr.coordinator.find_longest_cache_hit(w.block_hashes, w.num_tokens - 1)
             )
             assert memo == fresh, (w.request_id, memo[:2], fresh[:2])
+            if on_check is not None:
+                on_check(s, w)
             checks += 1
             nontrivial += memo[0] > 0
 
@@ -248,6 +250,43 @@ def test_xstep_memo_equals_fresh_lookup(patched_pool):
         f"checks={tot_checks} xstep_hits={tot_hits} computes={tot_computes} "
         f"nontrivial={tot_nontrivial}"
     )
+
+
+def _local_hit_view(mgr, hit):
+    blocks, num_local, boundary, diverged = hit
+    ids = tuple(tuple(b.block_id for b in group) for group in blocks.blocks)
+    return blocks is mgr.empty_kv_cache_blocks, ids, num_local, boundary, diverged
+
+
+def test_memo_local_hit_equals_the_upstream_lookup(patched_pool):
+    """The memo branch of _get_local_prefix_cache_hit returns exactly what
+    vLLM's Scheduler._get_local_prefix_cache_hit returns, across steps."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    counts = {"checks": 0, "from_memo": 0, "hits": 0}
+
+    def compare(s, w):
+        s.connector = None
+        before = s._memo_computes
+        got = s._get_local_prefix_cache_hit(w)
+        counts["from_memo"] += s._memo_computes == before
+        want = Scheduler._get_local_prefix_cache_hit(s, w)
+        mgr = s.kv_cache_manager
+        assert _local_hit_view(mgr, got) == _local_hit_view(mgr, want), w.request_id
+        # The caller may extend the returned lists; the memo must not change.
+        if got[0] is not mgr.empty_kv_cache_blocks:
+            for group in got[0].blocks:
+                group.append(None)
+        again = s._get_local_prefix_cache_hit(w)
+        assert _local_hit_view(mgr, again) == _local_hit_view(mgr, want)
+        counts["checks"] += 1
+        counts["hits"] += want[1] > 0
+
+    for seed in range(4):
+        _simulate(patched_pool, seed, steps=60, on_check=compare)
+    assert counts["from_memo"] == counts["checks"] > 1000
+    assert counts["hits"] > counts["checks"] // 6
+    print(counts)
 
 
 def test_runtime_verifier_agrees(patched_pool):
