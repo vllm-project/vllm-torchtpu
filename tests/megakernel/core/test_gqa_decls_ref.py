@@ -158,6 +158,13 @@ def test_gqa_tunables_and_derive_params_validation():
     ex_r6 = ExecSpec(B=4, T=1, R=6, ctx=256, stack_e=True, tiles=tiles)
     with pytest.raises(MegakernelConfigError, match="power of two"):
         derive_params(g_bad_g, ex_r6, p, GQATunables(kv_blk=128, nkv=2, split=True))
+    for bad_geom, bad_ex, match in (
+        (dataclasses.replace(g, NH=3), ex, "NH=3.*multiple of R=2"),
+        (dataclasses.replace(g, NKV=4), ex, "1 <= NKV=4 <= R=2"),
+        (dataclasses.replace(g_bad_g, NKV=4), ex_r6, "R % NKV == 0"),
+    ):
+        with pytest.raises(MegakernelConfigError, match=match):
+            derive_params(bad_geom, bad_ex, p, GQATunables(kv_blk=128, nkv=2))
 
 
 def test_gqa_decls_options_binding_and_hf_params():
@@ -216,7 +223,7 @@ def test_gqa_decls_options_binding_and_hf_params():
         dataclasses.replace(raw_res, values={**raw_res.values, "rot": 1}),
     )
     assert res_int1.ROT == 64
-    for bad_rot in (0, 33, 128, True):
+    for bad_rot in (0, 32.5, 33, 128, True):
         with pytest.raises(MegakernelConfigError, match="ROT|rot"):
             resolve_gqa_binding(
                 FakeMixerModule,
@@ -316,6 +323,23 @@ def test_gqa_reference_matches_direct_computation(
         vc = vc[:, 0]
 
     state = {"kc": kc, "vc": vc}
+    if use_fp8 and T == 1 and not paged_kv:
+        for drop_k, match in (
+            ("att_in_s", "FP8 'att_in' requires"),
+            ("att_out_s", "FP8 'att_out' requires"),
+        ):
+            with pytest.raises(MegakernelConfigError, match=match):
+                gqa_reference(
+                    {k: v for k, v in params.items() if k != drop_k},
+                    x,
+                    state,
+                    g=g,
+                    ex=ex,
+                    pos=pos,
+                    att_idx=att_idx,
+                    layer_idx=att_idx,
+                    module_name=mod_name,
+                )
     delta, new_state = gqa_reference(
         params,
         x,
