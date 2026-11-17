@@ -102,7 +102,10 @@ To expose each DP rank of the decode instance on its own port (one API server
 per rank, for an external load balancer such as llm-d), add
 `--data-parallel-multi-port-external-lb --data-parallel-size-local 4` and
 `--additional-config '{"tpu_multiport_dp": {"enabled": true}}'`. Rank `r`
-then serves on `--port + r`. All ranks must run on one host.
+then serves on `--port + r`. All ranks must run on one host: the server refuses
+the option with `--nnodes > 1` or `TPU_MULTIHOST_BACKEND=ray`. To spread
+requests over the ranks with the proxy below, list each rank in it:
+`--decoder-hosts` once per rank and `--decoder-ports 9400 9401 9402 9403`.
 
 ### Step 4: Launch the Disaggregated Proxy Server
 

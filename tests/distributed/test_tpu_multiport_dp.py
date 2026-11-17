@@ -22,7 +22,7 @@ import pytest
 from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
-from vllm_torchtpu import patch_registry
+from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.distributed import tpu_multiport_dp as mpdp
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -156,17 +156,28 @@ def test_bootstrap_honours_overrides(monkeypatch):
 
 def test_internal_lb_server_is_rejected(monkeypatch):
     with pytest.raises(ValueError, match="not a rank of"):
-        mpdp.prepare_multiport_dp_env(
-            _vllm_config(_child_config(0, external_lb=False), ON)
-        )
-    assert _bootstrap() == (None, None)
+        mpdp.validate(_vllm_config(_child_config(0, external_lb=False), ON))
 
 
 def test_multi_node_is_rejected(monkeypatch):
     pc = _child_config(0)
     pc.nnodes = 2
     with pytest.raises(NotImplementedError, match="nnodes"):
-        mpdp.prepare_multiport_dp_env(_vllm_config(pc, ON))
+        mpdp.validate(_vllm_config(pc, ON))
+
+
+def test_ray_backend_is_rejected(monkeypatch):
+    monkeypatch.setattr(envs, "TPU_MULTIHOST_BACKEND", "ray")
+    with pytest.raises(NotImplementedError, match="TPU_MULTIHOST_BACKEND=ray"):
+        mpdp.validate(_vllm_config(_child_config(0), ON))
+
+
+def test_validation_is_a_no_op_with_the_option_off(monkeypatch):
+    monkeypatch.setattr(envs, "TPU_MULTIHOST_BACKEND", "ray")
+    pc = _child_config(0, external_lb=False)
+    pc.nnodes = 2
+    mpdp.validate(_vllm_config(pc, {}))
+    mpdp.validate(_vllm_config(_child_config(0), ON | {"tpu_multiport_dp": {}}))
 
 
 # --- duty 2: real local DP rank and local DP size in each engine core ---------
