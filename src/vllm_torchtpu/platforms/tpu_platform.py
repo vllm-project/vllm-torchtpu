@@ -32,6 +32,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, frontend_options, patch_registry
+from vllm_torchtpu.compilation import compile_options
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.distributed import collectives_options
 from vllm_torchtpu.logger import init_logger
@@ -861,6 +862,9 @@ class TpuPlatform(Platform):
         # tpu_frontend patches install from patch_registry below.
         frontend_options.get(vllm_config)
         worker_options.check(vllm_config)
+        # A malformed tpu_compile section fails here, where the config is first
+        # known, not in each worker that arms the options.
+        compile_options.get(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
