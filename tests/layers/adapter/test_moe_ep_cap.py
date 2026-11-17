@@ -122,6 +122,7 @@ def test_parse_spec():
     assert (s.slack, s.mode, s.max_tokens) == (1, "drop", 128)
     s = parse_spec("0:sub6@64")
     assert (s.slack, s.mode, s.sub_topn, s.max_tokens) == (0, "sub", 6, 64)
+    assert parse_spec("0:sub8@g128").in_graph and not parse_spec("0@128").in_graph
     with pytest.raises(ValueError):
         parse_spec("1:foo")
 

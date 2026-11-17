@@ -846,8 +846,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decode-step EP load cap on the grouped-matmul MoE path
     # (layers/adapter/moe_ep_cap.py). The MoE all-reduce waits for the EP rank
     # that hits the most distinct experts, and each hit expert costs its weight
-    # read. "<slack>[:drop|:sub<N>][@<max_tokens>]": in steps of at most
-    # <max_tokens> tokens (default 128), a rank keeps at most
+    # read. "<slack>[:drop|:sub<N>][@[g]<max_tokens>]": in steps of at most
+    # <max_tokens> tokens (default 128; a trace-time branch, or with "g" an
+    # in-graph mask that still computes the cap in larger steps), a rank keeps at most
     # ceil(distinct/ep) + <slack> experts (the ones with the most routed weight;
     # every token's top-1 expert is always kept). Routes to the other experts are
     # dropped and the token's weights renormalized (drop, the default), or moved

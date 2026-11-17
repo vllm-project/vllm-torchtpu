@@ -58,6 +58,7 @@ class CapSpec:
     mode: str  # "drop" | "sub"
     sub_topn: int
     max_tokens: int
+    in_graph: bool = False  # True: mask large steps in-graph (computes everywhere)
 
 
 def parse_spec(spec: str) -> CapSpec | None:
@@ -65,9 +66,11 @@ def parse_spec(spec: str) -> CapSpec | None:
     spec = spec.strip()
     if not spec:
         return None
-    max_tokens = 128
+    max_tokens, in_graph = 128, False
     if "@" in spec:
         spec, _, mt = spec.partition("@")
+        if mt.startswith("g"):
+            in_graph, mt = True, mt[1:]
         max_tokens = int(mt)
     mode, sub_topn = "drop", 0
     if ":" in spec:
@@ -81,7 +84,10 @@ def parse_spec(spec: str) -> CapSpec | None:
     slack = int(spec)
     if slack < 0 or max_tokens <= 0 or (mode == "sub" and sub_topn < 1):
         raise ValueError(f"TPU_MOE_EP_CAP: bad spec {spec!r}")
-    return CapSpec(slack=slack, mode=mode, sub_topn=sub_topn, max_tokens=max_tokens)
+    return CapSpec(
+        slack=slack, mode=mode, sub_topn=sub_topn, max_tokens=max_tokens,
+        in_graph=in_graph,
+    )
 
 
 SPEC: CapSpec | None = parse_spec(envs.TPU_MOE_EP_CAP)
@@ -233,6 +239,13 @@ def apply(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Traced-code entry from a quant method's ``apply_monolithic``."""
     assert SPEC is not None
+    if not SPEC.in_graph and topk_ids.shape[0] > SPEC.max_tokens:
+        # Trace-time branch on the token count (compilation/shape_variants.py
+        # splits the buckets between traces). Both sides touch the stats buffer
+        # so every trace has the same inputs.
+        if _stats is not None:
+            _stats.add_(torch.zeros_like(_stats))
+        return topk_ids, topk_weights
     ids, weights, stats = cap_routes(
         topk_ids,
         topk_weights,
@@ -241,7 +254,7 @@ def apply(
         slack=SPEC.slack,
         mode=SPEC.mode,
         sub_topn=SPEC.sub_topn,
-        max_tokens=SPEC.max_tokens,
+        max_tokens=SPEC.max_tokens if SPEC.in_graph else None,
         router_logits=router_logits,
         score_bias=getattr(layer, "e_score_correction_bias", None),
     )
