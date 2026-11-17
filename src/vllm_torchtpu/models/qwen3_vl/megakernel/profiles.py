@@ -28,10 +28,12 @@ from vllm_torchtpu.megakernel.core.profile import Profile, TileContext
 # `ModelSpec.name` of the Qwen3-VL text decoder.
 MODEL_NAME = "qwen3_vl_text"
 
-# vLLM rotates q / k in float32 (`layers/adapter/rotary_embedding.py`).
+# vLLM rotates q / k in float32 (`layers/adapter/rotary_embedding.py`). The KV
+# ring is the deepest that fits beside the 48 MiB weight ring in the 56 MiB
+# scratch budget: 5 x 1 MiB items, so up to 10k tokens are read a layer ahead.
 DECODE_TILES = Tiles(
     bank=8 << 20, nbd=6, hier=1, mb8=2, lazy=False, dmm_unroll=1
-).with_modules({GQAModule.name: {"rope_fp32": True}})
+).with_modules({GQAModule.name: {"rope_fp32": True, "nkv": 5}})
 
 
 def decode_tiles(tc: TileContext | int) -> Tiles:
