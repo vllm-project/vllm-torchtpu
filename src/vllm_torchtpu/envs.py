@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_STAGING_LEASES: int = 0
     QWEN4_EXP_PD_DRAFT_KV: bool = False
     QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP: float = 0.0
+    QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS: bool = False
     QWEN4_EXP_PD_ROUTED_DST: str = ""
     QWEN4_EXP_PD_REPACK_SHAPE: str = ""
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
@@ -1450,6 +1451,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # zero-fills the rows the producer never computed (above the decode's
     # local hit, below the producer's). In [0, 1); 0 is off. Host-only.
     "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP": env_float("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", 0.0),
+    # With QWEN4_EXP_PD_DRAFT_KV on a staged decode that splits compressed
+    # keys over its main-KV DCP ranks (VLLM_TPU_QSA_COMPRESSED_DCP=1): admit
+    # it (q38 BLSTACK-R). The landing planners split every compressed owner,
+    # the F2 draft's included, and zero-fill its draft gap through the same
+    # split pair tokens. Off keeps the refusal. Decode-side, host-only
+    # (admission of the staging plan): in the compile-key ignore set.
+    "QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS": env_bool("QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS"),
     # "<decode tp>,<decode dcp>,<decode block>" on BOTH legs of a TP1 pipeline
     # producer -> staged TP>1 Qwen4Exp decode: the producer routes each decode
     # rank only its slice (main-KV DCP runs, its GDN heads; compressed keys,

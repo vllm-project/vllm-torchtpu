@@ -275,6 +275,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # How much of each load's draft KV a staged decode zero-fills (q38 F2-3's
     # forced-gap arm): host-side repack indices only.
     "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP",
+    # Whether a staged decode admits F2's draft KV with split compressed keys
+    # (q38 BLSTACK-R): admission only, the staging plan's rows are the same.
+    "QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS",
     # Where a staged decode's compressed keys land (once per host, then a
     # landing all-gather): adds shape-keyed landing programs, changes none.
     "QWEN4_EXP_PD_SHARED_COMPRESSED",
