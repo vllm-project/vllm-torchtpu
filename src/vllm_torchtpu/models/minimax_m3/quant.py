@@ -44,6 +44,8 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    _get_quantized_matmul_op,
+    quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
@@ -214,6 +216,16 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         logger.info_once(
             "MXFP8 linears run on e4m3 weights with per-channel power-of-two scales."
         )
+        if envs.TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS:
+            # Build the op here: its lazy builder takes a lock, which Dynamo
+            # cannot trace inside the forward.
+            _get_quantized_matmul_op()
+            logger.info_once(
+                "MXFP8 linears run W8A8 (per-token e4m3 activations, fp8 MXU) "
+                "for token buckets of <= %d rows "
+                "(TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS).",
+                envs.TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS,
+            )
         logger.debug(
             "MXFP8 linear %s kept e4m3: %d of %d elements below e4m3's normal "
             "range after the block shift.",
@@ -231,6 +243,11 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         if layer.weight.dtype != torch.float8_e4m3fn:
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
         rows = math.prod(x.shape[:-1])
+        if 0 < rows <= envs.TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS and (
+            x.dtype == torch.bfloat16
+        ):
+            # Rows are static at trace time, so each bucket picks one path.
+            return quantized_matmul(x, layer.weight, layer.weight_scale)
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
             weight = _materialized_bf16(layer.weight)
         else:

@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
+    TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS: int = 0
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -743,6 +744,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-channel power-of-two scale (models/minimax_m3/quant.py); 0 restores
     # the exact bf16 dequantization.
     "TPU_MINIMAX_M3_FP8_LINEARS": env_bool("TPU_MINIMAX_M3_FP8_LINEARS", default=True),
+    # MiniMax-M3 e4m3 linears (TPU_MINIMAX_M3_FP8_LINEARS): token buckets of at
+    # most this many rows quantize the activations to e4m3 per token (dynamic
+    # abs-max scale) and run the matmul fp8 x fp8 on the MXU instead of
+    # upcasting the weights to bf16 (decode buckets: faster on v7x); larger
+    # buckets keep bf16 activations, where XLA's fp8 dot plus the quantization
+    # measured slower. Changes numerics. 0 (default) keeps bf16 activations.
+    "TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS", 0
+    ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
