@@ -44,10 +44,11 @@ uses the kernel's `top_k`, `tile_rows`, and `activation` arguments, with
 these export and padding constraints:
 - the rank tensor is handed to the kernel as its shard-index operand,
   because `lax.axis_index` lowers to a partition-id the export path refuses;
-- there is no valid-token operand: a padded row is routed nowhere by handing
-  the kernel a NaN logit row (`drop_nan_rows`), and its input row is zeroed
-  so nothing of it travels; the kernel returns zero for such a row. A rank
-  with no valid rows still takes part in every collective.
+- with padding skipped (`TPU_MOE_SKIP_PADDED_TOKENS`), each rank's valid-row
+  count is the kernel's `valid_tokens` operand: the select kernel routes a
+  row past it nowhere and the transport zeroes its input row, so nothing of
+  it travels, and the kernel returns zero for it. A rank with no valid rows
+  still takes part in every collective.
 
 PyTorch/XLA custom-op adapter bridging vLLM FusedMoE layers to the Pallas Fused
 EP v3 pipeline.
@@ -56,7 +57,6 @@ EP v3 pipeline.
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
 
@@ -85,52 +85,6 @@ logger = init_logger(__name__)
 # slower with the kernel's DMA strategy, so it is not a knob.
 TILE_ROWS = 128
 WEIGHT_FORMAT = "fp8"
-
-
-def mask_local_rows(x: jax.Array, gating: jax.Array, valid_tokens: jax.Array):
-    """One rank's rows: row r is valid when r < valid_tokens[0]. An invalid
-    row gets NaN logits, which the kernel's selector drops (`drop_nan_rows`),
-    and a zero input row."""
-    local = jnp.arange(x.shape[0], dtype=jnp.int32)
-    valid = (local < valid_tokens.astype(jnp.int32)[0])[:, None]
-    gating = jnp.where(valid, gating, jnp.nan)
-    x = jnp.where(valid, x, jnp.zeros_like(x))
-    return x, gating
-
-
-def mask_padded_rows(
-    x: jax.Array, gating: jax.Array, valid_tokens: jax.Array, ep: int, mesh=None
-):
-    """Rows past each rank's valid prefix route nowhere and carry nothing.
-
-    `x` and `gating` are the global arrays, `ep * t_local` rows in rank
-    order; `valid_tokens` is int32 [ep]. Row r of rank r // t_local is valid
-    when r % t_local < valid_tokens[rank]. An invalid row gets NaN logits,
-    which the kernel's selector drops (`drop_nan_rows`), and a zero input row.
-
-    With `mesh`, each rank masks its own rows inside a shard_map. The global
-    form below positions rows with an iota over the whole token axis, which
-    XLA's partitioner rewrites as partition-id * t_local + local row, and the
-    torch bridge compiles the exported program in a mode that refuses the
-    partition-id instruction ("partitionId instruction is not supported for
-    SPMD partitioning"). The local form has no global position to compute.
-    """
-    if mesh is not None:
-        spec = PartitionSpec(MESH_AXIS)
-        return jax.shard_map(
-            mask_local_rows,
-            mesh=mesh,
-            in_specs=(spec, spec, spec),
-            out_specs=(spec, spec),
-        )(x, gating, valid_tokens)
-    tokens = x.shape[0]
-    t_local = tokens // ep
-    local = jnp.arange(tokens, dtype=jnp.int32) % t_local
-    limit = jnp.repeat(valid_tokens.astype(jnp.int32), t_local)
-    valid = (local < limit)[:, None]
-    gating = jnp.where(valid, gating, jnp.nan)
-    x = jnp.where(valid, x, jnp.zeros_like(x))
-    return x, gating
 
 
 def served_config(
@@ -388,7 +342,8 @@ def maybe_fused_moe_ep(
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
     from vllm_torchtpu.kernels.fused_moe.v3 import transport as v3_transport
 
-    ep_size = _EP_SIZE if _EP_SIZE is not None else 8
+    ep_size = _EP_SIZE
+    assert ep_size is not None  # set before the op exists
     row_multiple = v3_layer.ROW_BLOCK * v3_transport.token_multiple(ep_size)
     tokens_per_rank = (
         num_tokens
@@ -666,7 +621,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
 
     reason = (
         _unsupported_layer_reason(layer, local_experts, ep)
-        or _unsupported_routing_reason(layer)
+        or _unsupported_v3_routing_reason(layer)
         or _unsupported_reason(
             w1, w2, w1_scale, w2_scale, local_experts, hidden, inter, activation
         )
@@ -678,7 +633,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     idx = ep_mesh_index()
     if idx is None or not (0 <= idx < ep):
         logger.warning_once(
-            "Fused EP MoE not engaged: ep_mesh_index()=%d out of range [0, %d).",
+            "Fused EP MoE not engaged: ep_mesh_index()=%s out of range [0, %d).",
             idx,
             ep,
         )
@@ -755,6 +710,42 @@ def _unsupported_layer_reason(layer, local_experts: int, ep: int) -> str | None:
         or getattr(layer, "w2_bias", None) is not None
     ):
         return "the bridge passes no expert biases"
+    return None
+
+
+def _unsupported_v3_routing_reason(layer) -> str | None:
+    """Why the v3 kernel's router cannot reproduce this layer's routing, or
+    None.
+
+    The shared check (`fused_moe_ep._unsupported_routing_reason`) refuses a
+    custom routing function, grouped top-k and hash routing. It admits the
+    sigmoid and sqrtsoftplus scores, an expert-score correction bias, a
+    routed scaling factor and uniform_random routing simulation, because
+    the v2 kernel takes them as operands. The v3 select kernel scores with
+    a plain softmax and takes no bias, no scale and no simulated routing,
+    and this bridge passes none, so a layer that uses any of them is refused
+    here rather than routed to different experts with different weights.
+    """
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    reason = _unsupported_routing_reason(layer)
+    if reason is not None:
+        return reason
+    if layer.scoring_func != "softmax":
+        return (
+            f"scoring_func {layer.scoring_func!r}; the v3 router scores with "
+            "a plain softmax"
+        )
+    if layer.e_score_correction_bias is not None:
+        return "an e_score_correction_bias; the v3 router takes no expert bias"
+    scale = float(layer.routed_scaling_factor)
+    if scale != 1.0:
+        return f"routed_scaling_factor {scale}; the v3 kernel does not scale its output"
+    if moe_routing._SIMULATION_STRATEGY is not None:
+        return (
+            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set and the v3 kernel "
+            "routes by itself, so the simulation would not be in effect"
+        )
     return None
 
 
