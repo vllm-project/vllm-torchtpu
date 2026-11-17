@@ -176,6 +176,12 @@ def gather_sharded_weight(
     sharded_module: VocabParallelEmbedding,
 ) -> tuple[torch.Tensor, int, int, torch.device]:
     """Gathers a sharded weight tensor across TP into a full replicated tensor."""
+    if hasattr(sharded_module, "weight_scale"):
+        # e.g. TPU_FP8_LM_HEAD: the weight alone is not the head.
+        raise NotImplementedError(
+            "Cannot replicate a quantized (weight_scale) head for the draft; "
+            "unset TPU_FP8_LM_HEAD or share the head at the target's TP layout."
+        )
     tp_group = get_tp_group().cpu_group
     org_vocab = sharded_module.org_vocab_size
     dim = sharded_module.embedding_dim
