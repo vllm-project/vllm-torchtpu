@@ -282,6 +282,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_install_fused_norm_kernels",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
+    assert "patch_logits_processor_heads" in stages["worker_init"]
 
 
 def test_plugin_import_sets_environment_before_jax():

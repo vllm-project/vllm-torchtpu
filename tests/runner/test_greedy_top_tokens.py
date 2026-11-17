@@ -16,6 +16,8 @@ full-logits argmax, and when a step may take it."""
 
 import logging
 import math
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -38,6 +40,44 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampl
 from vllm_torchtpu.lora.torch_punica_tpu import PunicaWrapperTPU
 from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+@pytest.fixture(autouse=True)
+def _tpu_logits_processor_heads(monkeypatch):
+    """The patch registry installs the TPU heads at platform activation and
+    worker init; these tests apply the same callback and restore vLLM's
+    LogitsProcessor afterwards."""
+    monkeypatch.setattr(
+        LogitsProcessor, "get_top_tokens", LogitsProcessor.get_top_tokens
+    )
+    monkeypatch.setattr(
+        LogitsProcessor,
+        "get_topk_candidates",
+        getattr(LogitsProcessor, "get_topk_candidates", None),
+        raising=False,
+    )
+    greedy_top_tokens.patch_logits_processor_heads()
+
+
+def test_importing_the_module_does_not_patch_logits_processor():
+    """Only the registered patch replaces vLLM's methods; an import alone
+    (tpu_runner imports this module in every process) leaves them alone."""
+    code = (
+        "from vllm.model_executor.layers.logits_processor import LogitsProcessor\n"
+        "upstream = LogitsProcessor.get_top_tokens\n"
+        "from vllm_torchtpu.runner import greedy_top_tokens as g\n"
+        "assert LogitsProcessor.get_top_tokens is upstream\n"
+        "assert not hasattr(LogitsProcessor, 'get_topk_candidates')\n"
+        "g.patch_logits_processor_heads()\n"
+        "assert LogitsProcessor.get_top_tokens is g.tpu_get_top_tokens\n"
+        "assert LogitsProcessor.get_topk_candidates is g.tpu_get_topk_candidates\n"
+        "print('ok')\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().endswith("ok")
 
 
 class _HeadShard(torch.nn.Module):
