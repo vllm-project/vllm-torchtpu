@@ -2412,6 +2412,76 @@ class TestGetFinished:
         assert conn._coord_done_recving == set()
 
 
+def _load_errors(conn) -> set[int]:
+    """Return the blocks the scheduler will recompute for this worker.
+
+    Mirrors `TPUConnector.get_block_ids_with_load_errors`, which calls the
+    worker's method when it exists and otherwise reports no errors.
+    """
+    fn = getattr(conn, "get_block_ids_with_load_errors", None)
+    return fn() if fn is not None else set()
+
+
+class TestFailedLoadsReportLoadErrors:
+    """A request reported as finished receiving must have its KV loaded, or
+    have its blocks reported through `get_block_ids_with_load_errors` so the
+    scheduler recomputes them. Otherwise the request decodes on whatever its
+    blocks held before, i.e. KV left behind by earlier requests.
+    """
+
+    def test_failed_pull_reports_its_blocks_as_load_errors(self):
+        conn = _attach_runner(_make_conn(is_producer=False))
+        conn._coord_channel_executor = _InlineExecutor()
+        entry = _recv_entry(conn, uuid=11, req_id="d1")
+        sock = _FakeSocket(inbound=[[_frame(zsb._MSG_ERR)]])
+        with (
+            patch(f"{_BASE}.make_zmq_socket", return_value=sock),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
+            conn._coord_rank0_pull(entry)
+        assert not entry.pull_ok
+
+        assert conn._coord_get_finished()[1] == {"d1"}
+        assert _load_errors(conn) == set(entry.local_blocks)
+
+    def test_unadmitted_load_reports_its_blocks_as_load_errors(self):
+        conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
+        conn._coord_pool.acquire_slot()
+        conn._coord_rank0_handle_new_load("d1", _load_meta(local_blocks=(3, 4)))
+
+        assert conn._coord_get_finished()[1] == {"d1"}
+        assert _load_errors(conn) == {3, 4}
+
+    def test_load_errors_are_paired_with_get_finished_and_drained_once(self):
+        conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
+        conn._coord_pool.acquire_slot()
+        conn._coord_rank0_handle_new_load("d1", _load_meta(local_blocks=(5, 6)))
+
+        # Not surfaced before _coord_get_finished() emits "d1", preventing
+        # a race where a background failure leaks blocks one step early.
+        assert _load_errors(conn) == set()
+
+        assert conn._coord_get_finished()[1] == {"d1"}
+        assert _load_errors(conn) == {5, 6}
+        # Drained cleanly on subsequent calls.
+        assert _load_errors(conn) == set()
+
+    def test_non_coordinator_rank_reports_no_load_errors(self):
+        conn = _make_conn(is_producer=False, tp_rank=1, tp_size=2)
+        conn._coord_failed_block_ids.update({7, 8})
+        assert _load_errors(conn) == set()
+
+    def test_multiple_failed_loads_aggregate_blocks(self):
+        conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
+        conn._coord_pool.acquire_slot()
+        conn._coord_rank0_handle_new_load("d1", _load_meta(uuid=1, local_blocks=(1, 2)))
+        conn._coord_rank0_handle_new_load("d2", _load_meta(uuid=2, local_blocks=(3, 4)))
+
+        assert conn._coord_get_finished()[1] == {"d1", "d2"}
+        assert _load_errors(conn) == {1, 2, 3, 4}
+        assert _load_errors(conn) == set()
+
+
 class TestConnectorStats:
     def test_producer_records_the_prefill_queue_length(self):
         conn = _attach_runner(_make_conn())

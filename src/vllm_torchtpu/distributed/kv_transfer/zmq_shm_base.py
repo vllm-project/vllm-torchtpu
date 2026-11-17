@@ -420,10 +420,16 @@ class ZmqShmKvConnectorBase:
         # pull timeout). Without surfacing these, the vLLM scheduler
         # keeps waiting for a done_recving that never arrives -- every
         # failure leaks a request and eventually hangs the engine.
-        # We always report them so the scheduler can advance; the KV
-        # contents for the affected req are zero/stale, but that's
-        # strictly better than a hang.
+        # We report them as finished AND record their local block ids
+        # so get_block_ids_with_load_errors() tells the scheduler to
+        # recompute those blocks instead of decoding on stale KV.
         self._coord_done_recving: set[ReqId] = set()
+        # Failed block ids staged alongside _coord_done_recving; promoted
+        # atomically into _coord_failed_block_ids by _coord_get_finished()
+        # so failed blocks are always surfaced in the exact same step as
+        # their request's finished_recving notification.
+        self._coord_pending_failed_block_ids: set[int] = set()
+        self._coord_failed_block_ids: set[int] = set()
         # Consumer side: uuid -> _CoordRecvEntry.
         self._coord_recv: dict[int, _CoordRecvEntry] = {}
 
@@ -1477,13 +1483,15 @@ class ZmqShmKvConnectorBase:
                     for u, e in self._coord_send.items()
                 ]
                 self._coord_done_recving.add(req_id)
+                self._coord_pending_failed_block_ids.update(req_meta.local_block_ids)
             logger.error(
                 "TPUConnectorWorker(%d) rank0 --> shm pool exhausted for "
-                "req_id=%s; surfacing done_recving so scheduler advances "
-                "(expect wrong output for this req). recv_holders=%s "
+                "req_id=%s; surfacing done_recving and reporting %d blocks "
+                "as load errors for recompute. recv_holders=%s "
                 "send_holders=%s",
                 self.node_id,
                 req_id,
+                len(req_meta.local_block_ids),
                 recv_holders,
                 send_holders,
             )
@@ -1751,6 +1759,7 @@ class ZmqShmKvConnectorBase:
                 with self._coord_lock:
                     self._coord_recv.pop(entry.uuid, None)
                     self._coord_done_recving.add(entry.req_id)
+                    self._coord_pending_failed_block_ids.update(entry.local_blocks)
                 assert self._coord_pool is not None
                 self._coord_pool.release_slot(entry.slot_idx)
             entry.load_complete.set()
@@ -2686,12 +2695,16 @@ class ZmqShmKvConnectorBase:
                     entry.reported_done = True
                     newly_done_recving.append((entry.req_id, uuid))
             # Merge in failure-surfacing reqs (pull failed, shm pool
-            # exhausted on admit). The scheduler advances these as if
-            # the KV were ready; the output will be wrong for that req,
-            # but the alternative is an engine-wide hang.
+            # exhausted on admit). Promote their failed block ids
+            # atomically so get_block_ids_with_load_errors() returns them
+            # in the same step for scheduler recomputation instead of
+            # decoding on stale KV.
             if self._coord_done_recving:
                 done_recving |= self._coord_done_recving
                 self._coord_done_recving.clear()
+                if self._coord_pending_failed_block_ids:
+                    self._coord_failed_block_ids |= self._coord_pending_failed_block_ids
+                    self._coord_pending_failed_block_ids.clear()
         # Free slots outside the lock to avoid nesting lock waits.
         for sidx in released_slots:
             assert self._coord_pool is not None
@@ -2716,6 +2729,19 @@ class ZmqShmKvConnectorBase:
                 done_recving,
             )
         return done_sending, done_recving
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Drain failed-load block ids for the scheduler to recompute.
+
+        Paired with reporting the affected reqs in get_finished() in the
+        same pass; only rank 0 reports non-empty (matching _coord_get_finished).
+        """
+        if not self._is_host_coordinator:
+            return set()
+        with self._coord_lock:
+            failed = self._coord_failed_block_ids
+            self._coord_failed_block_ids = set()
+            return failed
 
     # ====================================================================
     # Abstract transport hooks (subclass implements)
