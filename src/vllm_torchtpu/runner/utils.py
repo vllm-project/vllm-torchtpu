@@ -29,6 +29,7 @@ from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.frontend_options import SECTION as FRONTEND_OPTIONS_SECTION
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner import runner_options
+from vllm_torchtpu.worker.worker_options import SECTION as WORKER_OPTIONS_SECTION
 
 logger = init_logger(__name__)
 
@@ -55,13 +56,10 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # owns the name) never change a compiled program.
 RUNNER_OPTIONS_SECTION = runner_options.SECTION
 
-# Host-only section: the worker's process placement (`worker.worker_options`)
-# never changes a compiled program.
-WORKER_OPTIONS_SECTION = "tpu_worker"
-
 # Diagnostics-only knobs, and the host-only sections of the API-server patches
-# (`frontend_options`) and the worker's process placement: they steer
-# profiling or the host and never change the compiled graph, so
+# (`frontend_options`) and the worker's process placement
+# (`worker.worker_options`): they steer profiling or the host and never change
+# the compiled graph, so
 # `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU compile
 # cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(

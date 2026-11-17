@@ -186,10 +186,6 @@ def test_worker_options_are_strict(raw, message):
 
 
 def test_worker_section_is_kept_out_of_the_compile_cache_key():
-    from vllm_torchtpu.runner.utils import (
-        HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
-        WORKER_OPTIONS_SECTION,
-    )
+    from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
-    assert worker_options.SECTION == WORKER_OPTIONS_SECTION
-    assert WORKER_OPTIONS_SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    assert worker_options.SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
