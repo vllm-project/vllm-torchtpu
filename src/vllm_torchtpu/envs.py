@@ -245,6 +245,9 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
+    VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
+    VLLM_TPU_PREFILL_TPOT_US_PER_TOKEN: float = 40.0
+    VLLM_TPU_PREFILL_TPOT_MIN_CHUNK: int = 256
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
@@ -1547,6 +1550,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # target alone may defer prefill for; the next step then runs prefill.
     "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S": env_nonnegative_float(
         "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
+    ),
+    # PrefillSpacingScheduler with a TPOT target: price each step's prefill
+    # instead of holding all of it. The step's prefill tokens are capped so
+    # their modelled cost (a per-token cost learned from measured steps) fits
+    # the smallest slack of the decoding requests that can still meet the
+    # target; prefill is held only when that cap is below
+    # VLLM_TPU_PREFILL_TPOT_MIN_CHUNK tokens.
+    "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED", False),
+    # PrefillSpacingScheduler priced TPOT: per-prefill-token step cost in us
+    # used until a prefill step has been timed.
+    "VLLM_TPU_PREFILL_TPOT_US_PER_TOKEN": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_US_PER_TOKEN", 40.0
+    ),
+    # PrefillSpacingScheduler priced TPOT: smallest prefill cap worth a step;
+    # below it prefill is held as with the unpriced target.
+    "VLLM_TPU_PREFILL_TPOT_MIN_CHUNK": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_TPOT_MIN_CHUNK", 256
     ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
