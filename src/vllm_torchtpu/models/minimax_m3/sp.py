@@ -190,13 +190,17 @@ def _make_ops(mesh, rank: torch.Tensor | None, chip_mesh=None) -> _Ops:
         def ag(x):
             return lax.all_gather(x, axis, axis=0, tiled=True)
 
+    wire = {"u8": jnp.uint8, "s8": jnp.int8, "f8": None}[envs.TPU_MINIMAX_M3_SP_FP8_WIRE]
+
     def ag8(x):
         xf = x.astype(jnp.float32)
         scale = jnp.maximum(jnp.max(jnp.abs(xf), axis=-1, keepdims=True), _SCALE_FLOOR)
         scale = scale / FP8_MAX
         q = (xf / scale).astype(jnp.float8_e4m3fn)
-        q = ag(lax.bitcast_convert_type(q, jnp.uint8))
-        q = lax.bitcast_convert_type(q, jnp.float8_e4m3fn)
+        if wire is None:
+            q = ag(q)
+        else:
+            q = lax.bitcast_convert_type(ag(lax.bitcast_convert_type(q, wire)), q.dtype)
         scale = ag(scale)
         return (q.astype(jnp.float32) * scale).astype(x.dtype)
 

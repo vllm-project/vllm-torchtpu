@@ -258,6 +258,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_GATHER: str = "bf16"
     TPU_MINIMAX_M3_SP_ATTN_GATHER: str = "bf16"
     TPU_MINIMAX_M3_SP_HIERARCHICAL: bool = False
+    TPU_MINIMAX_M3_SP_FP8_WIRE: str = "u8"
 
 
 def env_with_choices(
@@ -1647,6 +1648,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # over the TP group.
     "TPU_MINIMAX_M3_SP_HIERARCHICAL": env_bool(
         "TPU_MINIMAX_M3_SP_HIERARCHICAL", default=False
+    ),
+    # Element type the fp8 sequence-parallel gather sends: u8 / s8 (the e4m3
+    # bits bitcast) or f8 (e4m3 itself).
+    "TPU_MINIMAX_M3_SP_FP8_WIRE": env_with_choices(
+        "TPU_MINIMAX_M3_SP_FP8_WIRE", "u8", ["u8", "s8", "f8"]
     ),
 }
 
