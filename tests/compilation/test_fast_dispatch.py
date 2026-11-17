@@ -20,6 +20,7 @@ the eager backend, which runs on CPU and keeps Dynamo's guards and cache
 entries.
 """
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -91,6 +92,89 @@ def test_hook_is_installed_at_platform_import():
     assert fast_dispatch._INSTALLED
     assert torch.compile.__name__ == "compile"
     assert torch.compile.__code__.co_name == "compile_hook"
+
+
+def _hook_with_stand_in_backend():
+    """The torch.compile hook the platform installs, built over torch's own
+    compile with the "tpu" backend standing in as "eager"; records the
+    keyword arguments each call hands torch.compile."""
+    real_compile = inspect.unwrap(torch.compile)
+    calls = []
+
+    def stand_in(model=None, *args, **kwargs):
+        calls.append(
+            {k: dict(v) if isinstance(v, dict) else v for k, v in kwargs.items()}
+        )
+        if kwargs.get("backend") == "tpu":
+            kwargs = {**kwargs, "backend": "eager"}
+        return real_compile(model, *args, **kwargs)
+
+    return fast_dispatch.make_compile_hook(stand_in), calls
+
+
+ELIGIBLE = {"backend": "tpu", "fullgraph": True, "dynamic": False}
+
+
+@pytest.mark.parametrize("form", ["direct", "decorator"])
+def test_hook_wraps_eligible_functions_and_calls_through(form):
+    hook, calls = _hook_with_stand_in_backend()
+
+    def f(x):
+        return x * 2 + 1
+
+    wrapped = hook(f, **ELIGIBLE) if form == "direct" else hook(**ELIGIBLE)(f)
+    assert calls == [
+        {**ELIGIBLE, "options": {"guard_filter_fn": fast_dispatch._drop_global_state}}
+    ]
+    assert wrapped._fast_dispatch_state["entries"] == []
+    assert wrapped._torchdynamo_orig_callable is f
+    # Disarmed it calls the compiled function; armed, the first call goes
+    # through Dynamo and records the entry, and the next ones dispatch directly.
+    assert _calls(wrapped, 2) == [0, 0]
+    fast_dispatch.configure(fast=True, drop_global_state=False)
+    assert _calls(wrapped, 3) == [2, 1]
+
+
+class _Module(torch.nn.Module):
+    def forward(self, x):
+        return x
+
+
+@pytest.mark.parametrize(
+    "model,args,kwargs",
+    [
+        ("f", (), {**ELIGIBLE, "dynamic": True}),
+        ("f", (), {**ELIGIBLE, "dynamic": None}),
+        ("f", (), {**ELIGIBLE, "fullgraph": False}),
+        ("f", (), {**ELIGIBLE, "backend": "inductor"}),
+        ("f", (), {**ELIGIBLE, "mode": "reduce-overhead"}),
+        ("f", (), {**ELIGIBLE, "options": {"trace.enabled": True}}),
+        ("f", (), {**ELIGIBLE, "disable": True}),
+        ("module", (), ELIGIBLE),
+        ("f", ("tpu",), {}),
+    ],
+)
+def test_hook_passes_other_calls_through_unchanged(model, args, kwargs):
+    seen = []
+    result = object()
+
+    def stand_in(m=None, *a, **kw):
+        seen.append((m, a, kw))
+        return result
+
+    hook = fast_dispatch.make_compile_hook(stand_in)
+
+    def f(x):
+        return x
+
+    target = f if model == "f" else _Module()
+    assert hook(target, *args, **kwargs) is result
+    assert seen == [(target, args, kwargs)]
+    # The decorator form passes them through too.
+    if not args:
+        seen.clear()
+        assert hook(**kwargs)(target) is result
+        assert seen == [(target, (), kwargs)]
 
 
 def test_disarmed_wrapper_only_calls_the_compiled_function():
