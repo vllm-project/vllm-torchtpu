@@ -264,15 +264,15 @@ def build(
             return carry
 
         # ------------------------------ step prologue ------------------------------
+        # Module prologues first: they may add a runtime segment to the stream.
+        for m in modules:
+            with mod_sc(m, "prologue"):
+                m.prologue(ctx)
         for i in range(sp.NBD):
             stream.fetch(jnp.int32(i))
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).start()
-
-        for m in modules:
-            with mod_sc(m, "prologue"):
-                m.prologue(ctx)
 
         if ex.R > 1:
             barrier = pltpu.get_barrier_semaphore()

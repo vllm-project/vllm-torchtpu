@@ -67,6 +67,35 @@ class TwoRing:
         self._active_branches: tuple[int, ...] = tuple(range(len(sp.branch_counts)))
         self._cur_layer: Any = None
         self._ering_busy: bool = False
+        # `(position in the layer, tile count, issue)` of the runtime segment.
+        self._rt: tuple[int, Any, Any] | None = None
+        self._rt_g0: Any = None
+
+    def add_runtime_segment(self, after: str, count: Any, issue: Any) -> None:
+        """Stream `count` (traced, the same every layer) module tiles right after
+        kind `after`'s tiles in every layer, in the one need-ordered dense ring.
+
+        `issue(layer, j, bank)` starts the DMAs of the layer's tile `j` into
+        bank `bank`; the module waits for them, reads the bank and releases it
+        with `dgive(runtime_start() + j)`. Must be called before the first
+        `fetch`; single-branch streams without `rel_fetch` only.
+        """
+        sp = self.sp
+        assert self._rt is None, "one runtime segment per stream"
+        assert len(sp.branch_counts) == 1 and not sp.rel_fetch, (
+            sp.branch_counts,
+            sp.rel_fetch,
+        )
+        # `fetch` then finds a tile's layer without a runtime divide: a refill
+        # lands at most one layer ahead.
+        assert sp.branch_tiles[0] >= sp.NBD, (sp.NBD, sp.branch_tiles[0])
+        (pos,) = [hi for kind, _, hi, _ in sp.branch_segs[0] if kind == after]
+        self._rt = (pos, count, issue)
+
+    def runtime_start(self) -> Any:
+        """Global tile index of the current layer's first runtime-segment tile."""
+        assert self._rt_g0 is not None, "no runtime segment"
+        return self._rt_g0
 
     def begin_layer(self, lyr: Any) -> Any:
         """Reset `self.cursor` and per-branch segment offsets at layer `lyr`."""
@@ -74,7 +103,12 @@ class TwoRing:
             "begin_layer() cannot be called inside stream.segment()"
         )
         self._cur_layer = lyr
-        self.cursor = self.sp.layer_start_tile(lyr)
+        if self._rt is None:
+            self.cursor = self.sp.layer_start_tile(lyr)
+        else:
+            pos, cnt, _ = self._rt
+            self.cursor = lyr * (self.sp.branch_tiles[0] + cnt)
+            self._rt_g0 = self.cursor + pos
         self._cursor_delta = 0
         self._branch_offsets = [0 for _ in self.sp.branch_counts]
         self._active_branches = tuple(range(len(self.sp.branch_counts)))
@@ -309,10 +343,36 @@ class TwoRing:
             def _(kind=kind, lo=lo, ordi=ordi):
                 self.dcopy(kind, self.W[kind].at[ords[ordi], r - lo], bank).start()
 
+    def _fetch_runtime(self, g):
+        """`fetch` when each layer's tiles include the runtime segment."""
+        sp = self.sp
+        pos, cnt, issue = self._rt
+        t_l = sp.branch_tiles[0] + cnt
+
+        lyr = 0 if self._cur_layer is None else self._cur_layer
+        r0 = g - lyr * t_l
+        nxt = r0 >= t_l
+
+        @pl.when(g < sp.L * t_l)
+        def _():
+            bank = g % sp.NBD
+            layer = lyr + nxt.astype(jnp.int32)
+            r = jnp.where(nxt, r0 - t_l, r0)
+            in_rt = jnp.logical_and(r >= pos, r < pos + cnt)
+            pl.when(in_rt)(lambda: issue(layer, r - pos, bank))
+            r_s = jnp.where(r < pos, r, r - cnt)
+
+            @pl.when(jnp.logical_and(jnp.logical_not(in_rt), "dense" not in self.skip))
+            def _():
+                self._seg_issue(sp.branch_segs[0], r_s, (layer, layer), bank)
+
     def fetch(self, g):
         """Issue dense stream tile `g` into bank `g % NBD`."""
         sp = self.sp
         if sp.T_TOTAL == 0:
+            return
+        if self._rt is not None:
+            self._fetch_runtime(g)
             return
 
         @pl.when(jnp.logical_and(g < sp.T_TOTAL, "dense" not in self.skip))
@@ -559,6 +619,8 @@ class TwoRing:
                     self._branch_offsets[b_idx] = cur_off + n_t
             g0 = self.cursor
             self.cursor = g0 + n_t
+            if self._rt is not None and self._branch_offsets[0] == self._rt[0]:
+                self.cursor = self.cursor + self._rt[1]
             self._seg_tiles += n_t
             self._cursor_delta += n_t
         if self._in_segment and lazy is not None and bool(lazy) != bool(self._lazy):
