@@ -417,11 +417,16 @@ class BucketExecutables:
         perm = _input_permutation(stored, current)
         if perm is None:
             raise _handover_error(key, _input_delta(stored_inputs, current_inputs))
+        # Named, so a log shows whether the moved inputs are Dynamo graph
+        # inputs (named after their source) or a split subgraph's intermediates.
+        moved = [name for i, (name, _) in enumerate(stored) if perm[i] != i]
         logger.info(
-            "[shape-variants] %s handed over with %d of %d inputs reordered",
+            "[shape-variants] %s handed over with %d of %d inputs reordered: %s%s",
             key,
-            sum(j != i for j, i in enumerate(perm)),
+            len(moved),
             len(perm),
+            ", ".join(moved[:_NAMED_INPUTS_SHOWN]),
+            " ..." if len(moved) > _NAMED_INPUTS_SHOWN else "",
         )
         # len(perm) >= 2 here, so itemgetter returns a tuple.
         to_stored_order = operator.itemgetter(*perm)
