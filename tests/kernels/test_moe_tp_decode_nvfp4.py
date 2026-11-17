@@ -922,8 +922,9 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
             bias_pad = np.pad(bias, (0, e_pad - _e), constant_values=-np.inf).reshape(
                 1, e_pad
             )
-            w1_scr = np.zeros((nb, h // 8, g * 2 * _i), np.uint32)
-            s1_scr = np.zeros((nb, b13, 1, g * 2 * _i), np.float32)
+            # Ring slots start as garbage: a stale-slot read must not reach out.
+            w1_scr = np.full((nb, h // 8, g * 2 * _i), 0xFFFFFFFF, np.uint32)
+            s1_scr = np.full((nb, b13, 1, g * 2 * _i), np.nan, np.float32)
             out = np.array(jnp.full((m, h), -1.0, dtype=BF16), copy=True)
             ring_sem = _FakeSem((nb, 4 * g))
             shared_sem = _FakeSem((4,))
@@ -944,9 +945,9 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
                 _FakeRef(_ss2),
                 _FakeRef(out),
                 _FakeRef(w1_scr),
-                _FakeRef(np.zeros((nb, g, _i // 8, h), np.uint32)),
+                _FakeRef(np.full((nb, g, _i // 8, h), 0xFFFFFFFF, np.uint32)),
                 _FakeRef(s1_scr),
-                _FakeRef(np.zeros((nb, g, b2, 1, h), np.float32)),
+                _FakeRef(np.full((nb, g, b2, 1, h), np.nan, np.float32)),
                 _FakeRef(np.array(jnp.zeros((h, 2 * fs), FP8), copy=True)),
                 _FakeRef(np.zeros((1, 2 * fs), np.float32)),
                 _FakeRef(np.array(jnp.zeros((fs, h), FP8), copy=True)),
@@ -959,7 +960,7 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
                 _FakeRef(np.zeros((m, e_pad), np.float32)),
                 _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
                 _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
-                _FakeRef(np.zeros((max(1, ((_el + g - 1) // g) * g),), np.int32)),
+                _FakeRef(np.full((max(1, ((_el + g - 1) // g) * g),), 10**6, np.int32)),
                 ring_sem,
                 shared_sem,
                 hit_sem,

@@ -16,8 +16,9 @@ The hashes are recorded for one jax version, _JAX_VERSION, which must equal
 the jax pin in pyproject.toml; with any other installed jax the lowering cases
 skip. When a change to the program is intended, or when the jax pin moves, set
 _JAX_VERSION if needed, run this file, and copy the new hash from each failure
-message into _HASHES. To see what changed, diff the as_text() of the case at
-the old and the new commit.
+message into _HASHES. To see what changed, diff str(f.trace(*shapes).jaxpr) of
+the case at the old and the new commit (the kernel jaxpr, without locations;
+the Mosaic body in as_text() is one opaque blob).
 """
 
 import hashlib
@@ -170,18 +171,23 @@ def _lower(fn, rows, cfg, fmt, kwargs):
             body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
         )
     )
+    # No file:line locations: no traceback frames, and none from the user frame
+    # that jax_include_full_tracebacks_in_locations=False would add back.
     limit = jax.config.jax_traceback_in_locations_limit
+    full = jax.config.jax_include_full_tracebacks_in_locations
     jax.config.update("jax_traceback_in_locations_limit", 0)
+    jax.config.update("jax_include_full_tracebacks_in_locations", True)
     try:
         lowered = f.trace(*_shapes(rows, cfg, fmt)).lower(lowering_platforms=("tpu",))
         return lowered.as_text()
     finally:
         jax.config.update("jax_traceback_in_locations_limit", limit)
+        jax.config.update("jax_include_full_tracebacks_in_locations", full)
 
 
 def _case_id(case):
     fmt, layout, rows, kw = case
-    return "-".join([fmt, layout, f"m{rows}", *(f"{k}={v}" for k, v in kw)])
+    return "-".join([fmt, layout, f"m{rows}", *(f"{k}-{v}" for k, v in kw)])
 
 
 def test_recorded_jax_version_is_the_pin():

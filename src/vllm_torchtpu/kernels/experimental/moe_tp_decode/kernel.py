@@ -161,9 +161,9 @@ def _i_chunk(i):
     return min(i, _I_CHUNK)
 
 
-def _fixed_vmem_bytes(m, h, num_experts, shared_inter, info, *, xs_dtype, hit_rows):
-    """VMEM bytes of everything but the routed-expert ring (tiles padded): the
-    ring's format sets the x block scales' dtype and the hit-table rows."""
+def _fixed_vmem_bytes(m, h, num_experts, shared_inter, info, *, xs_dtype):
+    """VMEM bytes of everything but the routed-expert ring (tiles padded); the
+    ring's format sets the x block scales' dtype."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     f32, bf16 = jnp.float32, jnp.bfloat16
@@ -179,7 +179,7 @@ def _fixed_vmem_bytes(m, h, num_experts, shared_inter, info, *, xs_dtype, hit_ro
         + t((h // _Q_BLOCK, m, info.num_lanes), xs_dtype)  # xs
         + 2 * t((m, h), f32)  # owner, shared
         + t((m, e_pad), f32)  # wtab
-        + t((hit_rows, e_pad), jnp.int32)  # hits_v
+        + t((4, e_pad), jnp.int32)  # hits_v (1 row unless fast; tiled the same)
     )
 
 
@@ -190,7 +190,7 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
     t = functools.partial(all_reduce.tiled_bytes, info=info)
     f32 = jnp.float32
     fixed = _fixed_vmem_bytes(
-        m, h, num_experts, shared_inter, info, xs_dtype=jnp.bfloat16, hit_rows=1
+        m, h, num_experts, shared_inter, info, xs_dtype=jnp.bfloat16
     )
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
     need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
@@ -481,7 +481,7 @@ def _quantize_blocks(x, q_ref, scale_ref):
 
 
 def _quantize_blocks_f32(x, q_ref, scale_ref):
-    """_quantize_blocks in f32 (weight_format="nvfp4"): x [m, h] bf16 to FP8
+    """_quantize_blocks in f32 (Nvfp4Format): x [m, h] bf16 to FP8
     per _Q_BLOCK columns, scales and products in f32."""
     m, h = x.shape
     lanes = scale_ref.shape[-1]
@@ -560,7 +560,7 @@ class _Ring(NamedTuple):
 
 
 def _fp8_ring(r: _RingRefs, count, e0, *, fast: bool, n_chunks: int) -> _Ring:
-    """weight_format="fp8": ring items are (active expert, _I_CHUNK-column chunk
+    """Fp8Format: ring items are (active expert, _I_CHUNK-column chunk
     of I) pairs of per-channel FP8 weights (module docstring, steps 4-6)."""
     m, h = r.xq_ref.shape
     i = r.w2_hbm.shape[1]  # this rank's I
@@ -678,9 +678,13 @@ def _fp8_ring(r: _RingRefs, count, e0, *, fast: bool, n_chunks: int) -> _Ring:
 def _nvfp4_ring(
     r: _RingRefs, count, e0, *, fast: bool, group: int, bk2: int, w2_n_chunk: int
 ) -> _Ring:
-    """weight_format="nvfp4": ring slots of `group` whole active experts of FP4
-    weights with f32 block scales (module docstring, "Weight format"); r's HBM
-    weights are the uint32 views."""
+    """Nvfp4Format: ring slots of `group` whole active experts of FP4
+    weights with f32 block scales (module docstring, "Weight format")."""
+    # _FP4_PACK K-rows per uint32 word: the ring DMAs whole experts in this view
+    # and widens each K-block to FP8 in VMEM.
+    r = r._replace(
+        w1_hbm=r.w1_hbm.bitcast(jnp.uint32), w2_hbm=r.w2_hbm.bitcast(jnp.uint32)
+    )
     m, h = r.xq_ref.shape
     g = group
     nb = _NVFP4_NUM_BUFFERS
@@ -809,13 +813,10 @@ class Fp8Format:
     """Per-channel FP8 routed weights (_fp8_ring): n_chunks ring items of
     _I_CHUNK columns per expert."""
 
-    n_chunks: int = 1
+    n_chunks: int
 
     def ring(self, refs: _RingRefs, count, e0, *, fast: bool) -> _Ring:
         return _fp8_ring(refs, count, e0, fast=fast, n_chunks=self.n_chunks)
-
-
-_FP8_FORMAT = Fp8Format()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -879,16 +880,11 @@ def _kernel(
     routed_scale,
     ar_spec,
     fast=False,
-    weight_format: Fp8Format | Nvfp4Format = _FP8_FORMAT,
+    weight_format: Fp8Format | Nvfp4Format,
 ):
     """The layer on one rank (module docstring); weight_format builds the
     routed-expert ring."""
     all_reduce.prologue(ar_spec)
-    if isinstance(weight_format, Nvfp4Format):
-        # _FP4_PACK K-rows per uint32 word: the ring DMAs whole experts in this
-        # view and widens each K-block to FP8 in VMEM.
-        w1_hbm = w1_hbm.bitcast(jnp.uint32)
-        w2_hbm = w2_hbm.bitcast(jnp.uint32)
     m, h = x_ref.shape
     n_valid = meta_ref[0]
     rank = meta_ref[1]

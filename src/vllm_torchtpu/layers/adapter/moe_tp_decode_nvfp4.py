@@ -1,6 +1,6 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Torch bridge for kernels/experimental/moe_tp_decode, weight_format="nvfp4".
+"""Torch bridge for kernels/experimental/moe_tp_decode with Nvfp4Format.
 
 Mirrors ``layers/adapter/moe_tp_decode.py`` for ``VllmNvfp4MoEMethod`` layers
 behind ``USE_MOE_TP_DECODE_NVFP4_KERNEL`` (default off):

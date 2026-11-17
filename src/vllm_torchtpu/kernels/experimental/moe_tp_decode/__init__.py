@@ -3,7 +3,7 @@
 """Decode MoE layer of one TP rank, shared expert and TP all-reduce included,
 in one Pallas kernel (kernel.py; the all-reduce and its self-test in
 all_reduce.py). Per-channel FP8 routed experts by default; nvfp4.py is the
-entry point for FP4-block512 routed experts (weight_format="nvfp4")."""
+entry point for FP4-block512 routed experts (Nvfp4Format)."""
 
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import (

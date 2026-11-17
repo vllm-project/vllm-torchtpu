@@ -1,6 +1,6 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
-"""moe_tp_decode with weight_format="nvfp4": FP4-block512 W4A8 routed experts.
+"""moe_tp_decode with Nvfp4Format: FP4-block512 W4A8 routed experts.
 
 The kernel is kernel._kernel (routing, compaction, shared expert, combine and
 all-reduce shared with the FP8 format; the FP4 ring is kernel._nvfp4_ring, see
@@ -41,7 +41,6 @@ __all__ = [
     "moe_tp_decode_nvfp4",
 ]
 
-_H_ALIGN = 512
 _W2_N_CHUNK = 2048
 _GROUP_COLS = 1024
 _MAX_GROUP = 4
@@ -70,9 +69,7 @@ def _vmem_plan(
     """(need_bytes, vmem_limit_bytes), or None if limit exceeds budget."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
     f32, u32 = jnp.float32, jnp.uint32
-    fixed = _fixed_vmem_bytes(
-        m, h, num_experts, shared_inter, info, xs_dtype=f32, hit_rows=4
-    )
+    fixed = _fixed_vmem_bytes(m, h, num_experts, shared_inter, info, xs_dtype=f32)
     slot = (
         t((h // _FP4_PACK, group * 2 * i), u32)
         + t((group, i // _FP4_PACK, h), u32)
@@ -158,7 +155,7 @@ def can_use_moe_tp_decode_nvfp4(
         return False
     m, h, experts, i, num_experts, shared_inter = dims
     packed_row_tile = info.num_sublanes * _FP4_PACK
-    if h % _H_ALIGN or h % packed_row_tile or i % packed_row_tile:
+    if h % packed_row_tile or i % packed_row_tile:
         return False
     b13 = h // _Q_BLOCK
     if s13.shape != (experts, b13, 1, 2 * i):
