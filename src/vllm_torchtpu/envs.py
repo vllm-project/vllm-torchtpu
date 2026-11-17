@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
     TPU_DSPARK_MARKOV_KERNEL: bool = True
     TPU_SAMPLER_TOP_P_KERNEL: bool = True
+    TPU_FP8_LM_HEAD: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -1088,6 +1089,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # verify's sampler) runs on a Pallas kernel holding each row as a dense
     # [vocab / 128, 128] slab (kernels/top_p_sample.py). 0 keeps the XLA path.
     "TPU_SAMPLER_TOP_P_KERNEL": env_bool("TPU_SAMPLER_TOP_P_KERNEL", default=True),
+    # MiniMax-M3's LM head (the target's, and the DSpark draft's that shares it)
+    # runs on an e4m3 copy of its weight with one scale per vocabulary row
+    # (kernels/fp8_lm_head.py): half the bytes per decode step. Changes the
+    # logits by the weight's e4m3 rounding, so it is opt-in.
+    "TPU_FP8_LM_HEAD": env_bool("TPU_FP8_LM_HEAD", default=False),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),

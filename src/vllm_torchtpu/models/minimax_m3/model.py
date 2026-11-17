@@ -42,6 +42,7 @@ from vllm.model_executor.models.utils import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.layers.adapter.quantization.fp8_lm_head import Fp8LMHeadMethod
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
@@ -452,6 +453,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        if envs.TPU_FP8_LM_HEAD:
+            # A head_dtype override reads lm_head.weight unscaled.
+            if getattr(self.logits_processor, "head_dtype", None) not in (
+                None,
+                torch.bfloat16,
+            ):
+                raise NotImplementedError(
+                    "TPU_FP8_LM_HEAD does not support a head_dtype override."
+                )
+            self.lm_head.quant_method = Fp8LMHeadMethod()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
