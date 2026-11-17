@@ -962,6 +962,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         dtype: Any,
         test_case: str,
     ):
+        """NaNs in unattended KV page tails and unused batch slots must not
+        poison the attention output via 0.0 * NaN = NaN: V is masked on load
+        (SEQ_ALONG_LANE) or the kernel zeroes its KV buffers per call
+        (HEAD_ALONG_SUBLANE). Covers pure decode (every sequence in the DECODE
+        range, so the DECODE kernel runs) and a partial query block
+        (q_len < bq_sz, MIXED).
         """
         num_heads = (16, 2)
         head_dim = 128
@@ -974,6 +980,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             else [(37, 50)]  # Partial query block where q_len < bq_sz (e.g. 37 < 64)
         )
 
+        distribution = None
+        if test_case == "decode":
+            distribution = jnp.array([len(seq_lens)] * 3, dtype=jnp.int32)
+
         self._test_ragged_paged_attention(
             seq_lens,
             num_heads,
@@ -984,6 +994,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             num_pages,
             kv_layout=kv_layout,
             bkv_sz=128,
+            distribution=distribution,
         )
 
     @parameterized.product(

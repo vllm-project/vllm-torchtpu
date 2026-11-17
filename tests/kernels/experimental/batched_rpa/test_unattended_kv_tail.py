@@ -22,6 +22,7 @@ because 0 * NaN = NaN in the P @ V matmul, so the stitch must zero them.
 The CACHE_ONLY pass used by decode context parallelism fetches no new tokens,
 so every lane past the local cache is such a tail. With a prefill block
 larger than one lane register (bq_sz > 128) the MIXED kernel takes the
+`_stitch_prefill_lane` path, which must zero those lanes as well.
 
 Each case fills every non-cached token slot with NaN and with 0, and checks
 that both runs are finite, identical, and match a float32 reference.
