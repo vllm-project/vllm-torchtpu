@@ -636,7 +636,7 @@ def start_transport(
             if jnp.dtype(token_dtype) == jnp.dtype(jnp.bfloat16):
                 # bf16 token rows: as they are, unit scales.
                 quantized = tile_rows_data.astype(jnp.bfloat16)
-                scale = jnp.ones((rows_of(i), n_scales), jnp.float32)
+                scale = jnp.ones((tile, n_scales), jnp.float32)
             else:
                 quantized, scale = quantize_rows(
                     tile_rows_data,
