@@ -2409,6 +2409,7 @@ def streamindex_topk_dcp(
             dcp_rank = dcp_rank + jnp.int32(0) * lane_ids[0][0]
         if lane_split:
             # This lane's share of the tokens; the KV shard is the same on every lane.
+            assert lane is not None
             size = q.shape[0] // num_lanes
             start = lane[0] * size
             q = lax.dynamic_slice_in_dim(q, start, size, 0)
