@@ -994,3 +994,42 @@ def test_ltx2_per_batch_timestep_patch(monkeypatch):
     assert torch.all(kw_cond["timestep"][:, :4] == 0.0)
     assert torch.all(kw_cond["timestep"][:, 4:] == 900.0)
     assert kw_cond["audio_timestep"].shape == (2,)
+
+
+@pytest.mark.parametrize("batch", [1, 2], ids=["b1_c4u2", "b2_c2u4"])
+def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batch):
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    coords = _ltx2_coords(batch=batch, tokens=8)
+    cos_full, sin_full = rope(coords, out_dtype=torch.bfloat16)
+    assert len(table_syncs) == 1
+
+    # Unsharded full-sequence tables need no extra shard materialization.
+    x_full = torch.randn(batch, 8, 3 * 8, dtype=torch.bfloat16)
+    ltx2.apply_split_rotary_emb(x_full, (cos_full, sin_full), head_dim=8)
+    assert len(table_syncs) == 1
+
+    # Sequence-parallel slices (both rank 0 offset=0 and rank 1 offset>0)
+    # materialize once into zero-offset contiguous buffers and reuse across blocks.
+    upstream_cos, upstream_sin = _UPSTREAM_ROPE_FORWARD(
+        rope, coords, None, torch.bfloat16
+    )
+    for rank, (start, end) in enumerate(((0, 4), (4, 8)), start=1):
+        x_shard = torch.randn(batch, 4, 3 * 8, dtype=torch.bfloat16)
+        freqs_view = (cos_full[:, :, start:end, :], sin_full[:, :, start:end, :])
+        out1 = ltx2.apply_split_rotary_emb(x_shard, freqs_view, head_dim=8)
+        assert len(table_syncs) == 1 + rank
+        # Fresh view object over the same storage hits the shard cache across 48 blocks.
+        out2 = ltx2.apply_split_rotary_emb(
+            x_shard,
+            (cos_full[:, :, start:end, :], sin_full[:, :, start:end, :]),
+            head_dim=8,
+        )
+        assert len(table_syncs) == 1 + rank
+        want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(
+            x_shard,
+            (upstream_cos[:, :, start:end, :], upstream_sin[:, :, start:end, :]),
+            head_dim=8,
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(out1, want, rtol=0, atol=0)
+        torch.testing.assert_close(out2, want, rtol=0, atol=0)

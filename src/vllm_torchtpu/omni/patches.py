@@ -619,6 +619,18 @@ def _patch_ltx2_split_rope() -> None:
         self._tpu_split_rope_cache = (coords, key, tables)
         return tables
 
+    shard_cache: dict[
+        tuple[Any, ...],
+        tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+    ] = {}
+
+    def _is_sharded_view(t: torch.Tensor) -> bool:
+        return (
+            not t.is_contiguous()
+            or t.storage_offset() != 0
+            or t.untyped_storage().nbytes() != t.numel() * t.element_size()
+        )
+
     def _apply_split_rotary_emb(
         x: torch.Tensor,
         freqs: tuple[torch.Tensor, torch.Tensor],
@@ -640,6 +652,45 @@ def _patch_ltx2_split_rope() -> None:
             start = ltx2_transformer.get_tensor_model_parallel_rank() * width
             cos = cos[..., start : start + width]
             sin = sin[..., start : start + width]
+        if not torch.compiler.is_compiling() and (
+            _is_sharded_view(cos) or _is_sharded_view(sin)
+        ):
+            cos_ptr = cos.untyped_storage().data_ptr()
+            sin_ptr = sin.untyped_storage().data_ptr()
+            if cos_ptr != 0 and sin_ptr != 0:
+                shard_key = (
+                    cos_ptr,
+                    cos.storage_offset(),
+                    tuple(cos.shape),
+                    cos.stride(),
+                    sin_ptr,
+                    sin.storage_offset(),
+                    tuple(sin.shape),
+                    sin.stride(),
+                    cos.dtype,
+                    cos.device,
+                )
+                entry = shard_cache.get(shard_key)
+                if (
+                    entry is not None
+                    and entry[0].untyped_storage().data_ptr() == cos_ptr
+                    and entry[1].untyped_storage().data_ptr() == sin_ptr
+                ):
+                    cos, sin = entry[2]
+                else:
+                    cos_local = torch.empty(
+                        cos.shape, dtype=cos.dtype, device=cos.device
+                    )
+                    cos_local.copy_(cos)
+                    sin_local = torch.empty(
+                        sin.shape, dtype=sin.dtype, device=sin.device
+                    )
+                    sin_local.copy_(sin)
+                    synchronize_tensors([cos_local, sin_local], wait=False)
+                    if len(shard_cache) >= 8:
+                        shard_cache.clear()
+                    shard_cache[shard_key] = (cos, sin, (cos_local, sin_local))
+                    cos, sin = cos_local, sin_local
         return apply_split_rotary_half_swap(x, cos, sin, head_dim)
 
     setattr(_cached_rope_forward, _SPLIT_ROPE_PATCHED, True)
