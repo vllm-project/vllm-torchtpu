@@ -682,26 +682,26 @@ class TestBootstrapUnits(unittest.TestCase):
             (
                 "ready",
                 "pr",
-                (("build", "cpu", "ci_wheels"), ("tests", "integration", "verify")),
+                (("build", "cpu", "build_wheels"), ("tests", "integration", "verify")),
                 False,
             ),
             (
                 "ready,oncall-fix",
                 "pr",
-                (("build", "cpu", "ci_wheels"), ("tests", "integration", "verify")),
+                (("build", "cpu", "build_wheels"), ("tests", "integration", "verify")),
                 False,
             ),
             (
                 "ready,oncall-fix,skip-tpu-ci",
                 "pr+cpu-only",
-                (("build", "cpu", "ci_wheels"),),
+                (("build", "cpu", "build_wheels"),),
                 False,
             ),
             (
                 "ready,oncall-fix,run-perf-eval",
                 "pr+perf-eval",
                 (
-                    ("build", "cpu", "ci_wheels"),
+                    ("build", "cpu", "build_wheels"),
                     ("tests", "integration", "perf", "verify"),
                 ),
                 False,
@@ -710,7 +710,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 "ready,oncall-fix,run-full-ci",
                 "pr+nightly-suite",
                 (
-                    ("build", "cpu", "ci_wheels"),
+                    ("build", "cpu", "build_wheels"),
                     ("tests", "integration", "perf", "verify"),
                 ),
                 True,
@@ -1295,7 +1295,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 ("JOB_PRIORITY", "6"),
                 ("WORKLOAD_PRIORITY", "pre-merge"),
                 ("VLLM_COMMIT_HASH", self.pinned),
-                ("upload-stages:upload_stage_0:ci_wheels", "1"),
+                ("upload-stages:upload_stage_0:build_wheels", "1"),
                 ("upload-stages:upload_stage_0:cpu", "1"),
                 ("upload-stages:upload_stage_0:build", "1"),
             ],
@@ -1306,7 +1306,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in pr.uploads],
-            ["upload_stages", "ci_wheels", "cpu", "build"],
+            ["upload_stages", "build_wheels", "cpu", "build"],
         )
         self.assertIn(
             ":pipeline: Upload tests, integration, verify",
@@ -1443,7 +1443,7 @@ class TestBootstrapUnits(unittest.TestCase):
 
     def test_orchestration_single_stage_and_skip_flows(self) -> None:
         # PR skip-tpu-ci & post-merge main webhook upload ONLY the CPU stage:
-        # ["ci_wheels", "cpu", "build"].
+        # ["build_wheels", "cpu", "build"].
         for fx, prio, wprio in (
             (
                 self._run_bootstrap(
@@ -1471,7 +1471,9 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertIn(("JOB_PRIORITY", prio), fx.meta)
             self.assertIn(("WORKLOAD_PRIORITY", wprio), fx.meta)
             self.assertTrue(fx.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
-            self.assertEqual([u[0] for u in fx.uploads], ["ci_wheels", "cpu", "build"])
+            self.assertEqual(
+                [u[0] for u in fx.uploads], ["build_wheels", "cpu", "build"]
+            )
             self.assertTrue(bool(fx.uploads[2][2]["OMNI_IMAGE_SKIP"]))
             self.assertLessEqual(len(fx.uploads[2][2]["OMNI_IMAGE_SKIP"]), 70)
 
@@ -1490,7 +1492,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertTrue(main_pm.annotations[0][2].startswith("CI suite: default: "))
         self.assertEqual(
             [u[0] for u in main_pm.uploads],
-            ["verify", "integration", "tests", "ci_wheels", "cpu", "build"],
+            ["verify", "integration", "tests", "build_wheels", "cpu", "build"],
         )
         self.assertNotIn("NIGHTLY", main_pm.uploads[0][2])
 
@@ -1514,7 +1516,7 @@ class TestBootstrapUnits(unittest.TestCase):
             {"CI_SUITE": "perf", "CI_LANES": "perf", "BUILDKITE_BRANCH": "main"}
         )
         self.assertEqual(
-            [u[0] for u in perf_sched.uploads], ["perf", "ci_wheels", "build"]
+            [u[0] for u in perf_sched.uploads], ["perf", "build_wheels", "build"]
         )
         self.assertTrue(bool(perf_sched.uploads[2][2]["OMNI_IMAGE_SKIP"]))
 
@@ -1543,7 +1545,15 @@ class TestBootstrapUnits(unittest.TestCase):
             )
             self.assertEqual(
                 [u[0] for u in fx.uploads],
-                ["verify", "perf", "integration", "tests", "ci_wheels", "cpu", "build"],
+                [
+                    "verify",
+                    "perf",
+                    "integration",
+                    "tests",
+                    "build_wheels",
+                    "cpu",
+                    "build",
+                ],
             )
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
@@ -1563,7 +1573,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in torchtpu_nightly.uploads],
-            ["verify", "integration", "tests", "ci_wheels", "cpu", "build"],
+            ["verify", "integration", "tests", "build_wheels", "cpu", "build"],
         )
 
         # Integration pipeline resolves upstream vLLM HEAD and uploads promote lane.
@@ -1582,7 +1592,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 "perf",
                 "integration",
                 "tests",
-                "ci_wheels",
+                "build_wheels",
                 "cpu",
                 "build",
             ],
@@ -1629,7 +1639,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertIn(("JOB_PRIORITY", "6"), pre.meta)
         self.assertTrue(pre.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
-        self.assertEqual([u[0] for u in pre.uploads], ["ci_wheels", "cpu", "build"])
+        self.assertEqual([u[0] for u in pre.uploads], ["build_wheels", "cpu", "build"])
         self.assertTrue(bool(pre.uploads[2][2]["OMNI_IMAGE_SKIP"]))
 
         # Merge queue on main: priority 11 (post-merge), ignores PR labels and
@@ -1710,7 +1720,8 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertTrue(mq_pre.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
         self.assertEqual(
-            [u[0] for u in mq_pre.uploads], ["ci_wheels", "cpu", "build", "precommit"]
+            [u[0] for u in mq_pre.uploads],
+            ["build_wheels", "cpu", "build", "precommit"],
         )
 
         # Merge queue fail-open: if base fetch or diff fails even when the queue
@@ -1736,7 +1747,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 )
                 self.assertEqual(
                     [u[0] for u in mq_fail_open.uploads],
-                    ["upload_stages", "ci_wheels", "cpu", "build", "precommit"],
+                    ["upload_stages", "build_wheels", "cpu", "build", "precommit"],
                 )
 
         # An unreadable /ci merge marker (API failure or >5000 comments) is retried,
@@ -1823,7 +1834,7 @@ class TestBootstrapUnits(unittest.TestCase):
         # runs only it.
         self.assertEqual(
             lanes(self._run_bootstrap({**pr, **cutover})),
-            ["ci_wheels", "cpu", "build", "precommit"],
+            ["build_wheels", "cpu", "build", "precommit"],
         )
         docs = self._run_bootstrap({**pr, **cutover}, files=["README.md"])
         self.assertEqual(lanes(docs), ["precommit"])
@@ -1831,7 +1842,8 @@ class TestBootstrapUnits(unittest.TestCase):
         # /ci run puts it in stage 0, so the TPU stage waits for it too.
         ci_run = self._run_bootstrap({**pr, **cutover, "CI_RUN_TPU": "1"})
         self.assertEqual(
-            lanes(ci_run), ["upload_stages", "ci_wheels", "cpu", "build", "precommit"]
+            lanes(ci_run),
+            ["upload_stages", "build_wheels", "cpu", "build", "precommit"],
         )
         self.assertNotIn("precommit", lanes(self._run_next_stage(ci_run)))
 
@@ -2016,9 +2028,9 @@ class TestBootstrapUnits(unittest.TestCase):
             dict(_normalize_lane_uploads(direct_rel, None)),
         )
 
-    def test_tpu_lanes_wait_for_the_ci_wheels_in_every_suite(self) -> None:
-        # Every TPU step waits for ci_check_wheels as well as its image, so a
-        # suite with such a lane must also upload ci_wheels, no later than that
+    def test_tpu_lanes_wait_for_the_build_wheels_in_every_suite(self) -> None:
+        # Every TPU step waits for check_wheels as well as its image, so a
+        # suite with such a lane must also upload build_wheels, no later than that
         # lane's stage: a step that waits for a key the build never has does not
         # run. verify's TPU steps come from upload_models_and_features.sh.
         bp = self.bp
@@ -2039,10 +2051,10 @@ class TestBootstrapUnits(unittest.TestCase):
                 if on_tpu:
                     deps = step.get("depends_on") or []
                     deps = [deps] if isinstance(deps, str) else deps
-                    self.assertIn("ci_check_wheels", deps, (lane, step.get("label")))
+                    self.assertIn("check_wheels", deps, (lane, step.get("label")))
         script = _REPO_ROOT / ".buildkite/scripts/upload_models_and_features.sh"
         self.assertEqual(
-            script.read_text(encoding="utf-8").count('\\"ci_check_wheels\\"'), 2
+            script.read_text(encoding="utf-8").count('\\"check_wheels\\"'), 2
         )
 
         for name, suite in {**bp.SUITES, **bp._PR_SUITES}.items():
@@ -2051,8 +2063,8 @@ class TestBootstrapUnits(unittest.TestCase):
             }
             for lane in {"tests", "integration", "perf", "verify"} & stage_of.keys():
                 with self.subTest(suite=name, lane=lane):
-                    self.assertIn("ci_wheels", stage_of)
-                    self.assertLessEqual(stage_of["ci_wheels"], stage_of[lane])
+                    self.assertIn("build_wheels", stage_of)
+                    self.assertLessEqual(stage_of["build_wheels"], stage_of[lane])
 
     def test_pipeline_yaml_validation_and_nightly_report_keys(self) -> None:
         bp = self.bp

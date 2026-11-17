@@ -12,22 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CI wheels: build the vllm-torchtpu-core and vllm-torchtpu wheels (and the
+# Test wheels: build the vllm-torchtpu-core and vllm-torchtpu wheels (and the
 # vllm-torchtpu sdist) from this commit with the release's own scripts, and
 # check that they resolve together from PyPI. Stage 0, beside the CI image
-# build; the TPU steps of every lane wait for both (ci_check_wheels).
+# build; the TPU steps of every lane wait for both (check_wheels).
 #
 # The files stay artifacts of this build and go nowhere else. Their version,
-# 0.0.0+g<commit> (ci_wheel_version in release/lib.sh), is a local version,
+# 0.0.0+g<commit> (test_wheel_version in release/lib.sh), is a local version,
 # which PyPI rejects. vLLM is built at this commit's pyproject.toml pin.
 
-x-ci-wheel-step: &ci_wheel_step
+x-wheel-step: &wheel_step
   # The agents the CI image is built on; the release builds its wheels on the
   # same kind of host.
   agents:
     queue: cpu_64_core
   env:
-    CI_WHEELS: "1"
+    TEST_WHEELS: "1"
   timeout_in_minutes: 60
   # The builds fetch from GitHub, PyPI and download.pytorch.org, which fail now
   # and then; one retry keeps that from holding up a PR's TPU tests.
@@ -37,21 +37,21 @@ x-ci-wheel-step: &ci_wheel_step
         limit: 1
 
 steps:
-  - group: "CI Wheels"
-    key: "ci_wheels_group"
+  - group: "Build Wheels"
+    key: "build_wheels_group"
     steps:
-      - label: ":package: CI: Build the vllm-torchtpu-core wheel"
-        key: "ci_build_core_wheel"
-        <<: *ci_wheel_step
+      - label: ":package: Build the vllm-torchtpu-core wheel"
+        key: "build_core_wheel"
+        <<: *wheel_step
         commands:
           - bash .buildkite/scripts/build_core_wheel.sh
 
       # After the core, in the same order as the release
       # (release/pipeline.yml); it uses only the core's version, not its wheel.
-      - label: ":package: CI: Build the vllm-torchtpu wheel"
-        key: "ci_build_vllm_torchtpu_wheel"
-        depends_on: "ci_build_core_wheel"
-        <<: *ci_wheel_step
+      - label: ":package: Build the vllm-torchtpu wheel"
+        key: "build_vllm_torchtpu_wheel"
+        depends_on: "build_core_wheel"
+        <<: *wheel_step
         commands:
           - |
             set -euo pipefail
@@ -60,9 +60,9 @@ steps:
             buildkite-agent artifact upload "dist/vllm_torchtpu-*.whl"
             buildkite-agent artifact upload "dist/vllm_torchtpu-*.tar.gz"
 
-      - label: ":mag: CI: Check the wheels resolve from PyPI"
-        key: "ci_check_wheels"
-        depends_on: "ci_build_vllm_torchtpu_wheel"
-        <<: *ci_wheel_step
+      - label: ":mag: Check the wheels resolve from PyPI"
+        key: "check_wheels"
+        depends_on: "build_vllm_torchtpu_wheel"
+        <<: *wheel_step
         commands:
           - bash .buildkite/release/check_wheels.sh

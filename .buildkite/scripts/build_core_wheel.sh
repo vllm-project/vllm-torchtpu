@@ -20,7 +20,7 @@
 #   - Set once by preflight.sh in Buildkite meta-data (release-version), or
 #     resolved on the spot from RELEASE_VERSION / BUILDKITE_BRANCH
 #     (RELEASE_BRANCH_REGEX in .buildkite/release/lib.sh).
-#   - In a CI wheel build (CI_WHEELS=1, .buildkite/pipeline_ci_wheels.yml),
+#   - In a test wheel build (TEST_WHEELS=1, .buildkite/pipeline_build_wheels.yml),
 #     0.0.0+g<commit>, which PyPI rejects; the PyPI check is skipped.
 #   - Forced onto setuptools-scm, so a shallow CI checkout without tags still
 #     gets it.
@@ -29,7 +29,7 @@
 #   dist/<core>-<version>-py3-none-any.whl, uploaded as a Buildkite artifact.
 #   Build meta-data CORE_WHEEL_NAME for later steps.
 #
-# Buildkite only: runs inside a release build, or a CI build's ci_wheels lane.
+# Buildkite only: runs inside a release build, or a CI build's build_wheels lane.
 # ------------------------------------------------------
 
 set -euo pipefail
@@ -52,8 +52,8 @@ echo "Version: ${VERSION}"
 
 # Stop before building if this version is already on PyPI (versions can't be
 # reused). PUBLISH_PYPI comes from the step's env in .buildkite/release/pipeline.yml.
-# A CI wheel build (CI_WHEELS=1) publishes nothing, so it has nothing to check.
-if [[ "${CI_WHEELS:-}" != "1" ]]; then
+# A test wheel build (TEST_WHEELS=1) publishes nothing, so it has nothing to check.
+if [[ "${TEST_WHEELS:-}" != "1" ]]; then
     [[ -n "${PUBLISH_PYPI:-}" ]] || die "PyPI project (PUBLISH_PYPI) is not set."
     check_not_published "${PUBLISH_PYPI}" "${VERSION}"
 fi

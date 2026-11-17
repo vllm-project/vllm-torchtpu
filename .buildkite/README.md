@@ -10,20 +10,20 @@ and every step runs in a pod through `.buildkite/kubernetes/run.sh`.
 slices (1x1x1 and 2x2x1). PR steps exclude `nightly` tests; nightly steps
 include them. Both use the CI image built by `pipeline_build.yml`. On PR builds,
 `bootstrap.py` uploads stage 0 (`pipeline_build.yml`, `pipeline_cpu.yml` and
-`pipeline_ci_wheels.yml`) followed by a `wait` and an `upload-stages` step that
+`pipeline_build_wheels.yml`) followed by a `wait` and an `upload-stages` step that
 uploads the TPU lanes (`tests`, `integration`, `verify`, plus `perf` with
 `run-perf-eval` or `run-full-ci`) only after every stage-0 step (both image
-builds, including `-omni`, the CPU checks and the CI wheels) passes. Retrying a
+builds, including `-omni`, the CPU checks and the test wheels) passes. Retrying a
 failed stage-0 step in Buildkite releases the `wait` once the retry passes and
 runs the uploader step. The `oncall-fix` label raises job and Kueue workload
 priority without changing the suite.
 
-`pipeline_ci_wheels.yml` builds the `vllm-torchtpu-core` and `vllm-torchtpu`
+`pipeline_build_wheels.yml` builds the `vllm-torchtpu-core` and `vllm-torchtpu`
 wheels (and the `vllm-torchtpu` sdist) from the build's commit with the
 release's scripts, on the `cpu_64_core` agents that build the CI image, and
 checks that they resolve together from PyPI (`release/check_wheels.sh`). It
 runs in every suite, beside the image build, and the TPU steps of every lane
-wait for both the image and `ci_check_wheels`: the two come from the same
+wait for both the image and `check_wheels`: the two come from the same
 commit, so the tests run only if both built. The files are artifacts of the
 build and are uploaded nowhere else: their version, `0.0.0+g<commit>`, is a
 local version, which PyPI rejects.
@@ -42,7 +42,7 @@ the hours the nightly's perf steps take. The integration pipeline also runs the
 lane, because its LKG promotion waits on two of its steps.
 
 A PR labeled `skip-tpu-ci` (it still needs `ready`) uploads only the `cpu` lane,
-the image build and the CI wheels (skipping the `-omni` image and every TPU
+the image build and the test wheels (skipping the `-omni` image and every TPU
 lane), so what runs is the image build, the type check, the CPU unit tests and
 the wheel build and check. The post-merge build of such a PR does the same:
 `bootstrap.py` reads the merged PR's labels from GitHub (ignoring
