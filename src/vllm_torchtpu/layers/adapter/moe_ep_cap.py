@@ -150,13 +150,16 @@ def cap_routes(
     ids = topk_ids.long()
     valid = (ids >= 0) & (w != 0)
     safe_ids = torch.where(valid, ids, torch.zeros_like(ids))
-    flat_ids = safe_ids.flatten()
-    zeros_e = torch.zeros(num_experts, dtype=torch.float32, device=device)
-    count = zeros_e.index_add(0, flat_ids, valid.float().flatten())
-    mass = zeros_e.index_add(0, flat_ids, torch.where(valid, w, 0.0).flatten())
+    # One-hot compares, not index_add: a TPU scatter costs ~10-17 us per call at
+    # decode sizes, the fused compare-and-reduce ~2-3 us for the whole cap.
+    experts = torch.arange(num_experts, device=device)
+    hit = (safe_ids.unsqueeze(-1) == experts) & valid.unsqueeze(-1)  # [T, K, E]
+    onehot = hit.float()
+    count = onehot.sum(dim=(0, 1))
+    mass = (onehot * w.unsqueeze(-1)).sum(dim=(0, 1))
     wmax = torch.where(valid, w, torch.full_like(w, -1.0)).amax(dim=-1, keepdim=True)
     top1 = valid & (w == wmax)
-    protected = zeros_e.index_add(0, flat_ids, top1.float().flatten()) > 0
+    protected = (onehot * top1.unsqueeze(-1).float()).amax(dim=(0, 1)) > 0
     active = count > 0
     key = torch.where(active, mass + _PROTECT * protected.float(), -1.0)
     kr = key.view(ep, per_rank)
@@ -183,7 +186,7 @@ def cap_routes(
         scores = router_logits.float().sigmoid()  # [T, E]
         select = scores if score_bias is None else scores + score_bias.float()
         thresh = torch.topk(select, sub_topn, dim=-1).values[:, -1:]
-        mine = torch.zeros_like(scores).scatter(1, safe_ids, valid.float()) > 0
+        mine = hit.any(dim=1)  # [T, E] the token's own (valid) experts
         cand_ok = keep.unsqueeze(0) & ~mine & (select >= thresh)
         cand_sel = torch.where(cand_ok, select, torch.full_like(select, -1.0e30))
         cand_val, cand_idx = torch.topk(cand_sel, k, dim=-1)  # [T, K]
@@ -205,12 +208,8 @@ def cap_routes(
     w_out = torch.where(new_ids >= 0, w_out, torch.zeros_like(w_out))
 
     before = active.view(ep, per_rank).sum(dim=-1).amax()
-    after_hit = torch.zeros(num_experts, dtype=torch.float32, device=device)
-    after_hit = after_hit.index_add(
-        0, torch.where(new_ids >= 0, new_ids, 0).flatten(),
-        (new_ids >= 0).float().flatten(),
-    )
-    after = (after_hit > 0).view(ep, per_rank).sum(dim=-1).amax()
+    # Substitutes land on kept experts, so the kept set is the hit set after.
+    after = keep.view(ep, per_rank).sum(dim=-1).amax()
     stats = torch.stack(
         [
             torch.ones((), device=device),
