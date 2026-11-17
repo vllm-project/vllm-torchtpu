@@ -986,15 +986,12 @@ def _patched_gemma_rmsnorm_forward_native(
 def _speculative_decoding_configured() -> bool:
     """Whether the engine being loaded runs a draft model.
 
-    Unknown counts as yes: keeping an unused BF16 head costs memory, while
-    dropping one a draft needs would run the draft head in FP8.
+    Read from the current vLLM config, which _quantize_target_lm_head has
+    already read for the same head.
     """
-    try:
-        from vllm.config import get_current_vllm_config
+    from vllm.config import get_current_vllm_config
 
-        return get_current_vllm_config().speculative_config is not None
-    except Exception:  # noqa: BLE001
-        return True
+    return get_current_vllm_config().speculative_config is not None
 
 
 def _quantize_target_lm_head() -> bool:

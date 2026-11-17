@@ -1078,7 +1078,7 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
         reason = f"TP shard of {weight.shape[0]} rows not divisible by DP {dp_size}"
     if reason is not None:
         logger.warning(
-            "TPU_DRAFT_VOCAB_PARALLEL: keeping the per-TP-group draft head (%s).",
+            "Vocab-parallel draft head: keeping the per-TP-group draft head (%s).",
             reason,
         )
         return owner
@@ -1086,7 +1086,7 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
         head, int(dp.rank_in_group), dp_size, int(tp.rank_in_group), tp_size
     )
     logger.info(
-        "TPU_DRAFT_VOCAB_PARALLEL: draft lm_head vocab-parallel over DP%d x TP%d "
+        "Vocab-parallel draft head: draft lm_head over DP%d x TP%d "
         "= %d slices; this rank: vocab [%d, %d), weight %s %s (was %s per TP "
         "group). Same BF16 logits; ties to the lowest token id.",
         dp_size,
@@ -1146,8 +1146,7 @@ def keep_bf16_head_for_draft(head: torch.nn.Module) -> torch.nn.Module | None:
     twin = bf16_head_twin(head)
     object.__setattr__(head, _DRAFT_BF16_HEAD_ATTR, twin)
     logger.info(
-        "Kept a BF16 copy of the target lm_head for the draft "
-        "(TPU_DRAFT_LM_HEAD_BF16=1): weight %s %s.",
+        "Kept a BF16 copy of the target lm_head for the draft: weight %s %s.",
         tuple(weight.shape),
         str(weight.dtype).replace("torch.", ""),
     )

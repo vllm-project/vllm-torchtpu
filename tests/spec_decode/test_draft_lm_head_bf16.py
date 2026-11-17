@@ -14,12 +14,12 @@
 """The MTP draft's LM head runs at the checkpoint's BF16 precision.
 
 Qwen3.5-397B-A17B-FP8 ships ``lm_head`` in BF16, and its MTP draft has no head
-of its own: it borrows the target's. ``TPU_QUANTIZE_SHARED_LM_HEAD`` (default
-on) quantizes the target's head to W8A8 FP8 in place, which used to leave the
-draft sharing an FP8 head, and the draft's greedy head defaulted to an FP8
-proxy on top. These tests pin the compliant behaviour: the target's head is
-FP8, the draft gets a BF16 twin holding the checkpoint weight, and the draft's
-greedy head uses that twin; no quantized draft head exists.
+of its own: it borrows the target's. The Qwen3.5 ``quantize_target_lm_head``
+setting quantizes the target's head to W8A8 FP8 in place, which would leave
+the draft sharing an FP8 head. These tests pin the behaviour with the
+setting on: the target's head is FP8, the draft gets a BF16 twin holding the
+checkpoint weight, and the draft's greedy head uses that twin; no quantized
+draft head exists.
 """
 
 from __future__ import annotations
@@ -132,7 +132,7 @@ def test_maybe_share_lm_head_binds_the_bf16_twin_not_the_fp8_head():
 
 
 def test_without_a_twin_the_draft_still_shares_the_target_head():
-    # An unquantized target (TPU_QUANTIZE_SHARED_LM_HEAD=0): nothing changes.
+    # An unquantized target (quantize_target_lm_head off): nothing changes.
     target = _target_with_head()
     draft = _Draft()
     utils.maybe_share_lm_head(
