@@ -20,6 +20,10 @@ every ``tpu_*`` key, ``check`` fails instead: each change that adds a
 section adds its key to ``KNOWN_SECTIONS``. Keys outside those namespaces
 (``abort_on_preemption``, ``raiden_pd_send_completion``, ``megakernel``,
 the ``phased_profiler_*`` keys, or another plugin's) are not checked.
+
+Only the Qwen3.5 config hook (``models/qwen3_5/hooks.py``) calls ``check``
+today, so only Qwen3.5 engines are checked; every other model keeps vLLM's
+pass-through for all keys.
 """
 
 from __future__ import annotations

@@ -24,9 +24,11 @@ it, so every accepted key changes something. ``parse`` derives the accepted
 keys and their types from the dataclass and rejects anything else, so a typo
 fails at engine start instead of being ignored.
 
-The settings apply to Qwen3.5 targets only (``ARCHITECTURES``). ``get``
-returns the defaults for any other model and rejects a ``qwen3_5`` section
-given to one. ``additional_config`` is part of vLLM's config hash, so a
+The settings apply to Qwen3.5 targets only (``ARCHITECTURES``). The Qwen3.5
+config hook (``hooks.py``) parses them at engine start, so only Qwen3.5
+engines check the section; other models do not read it. ``get`` returns the
+defaults for any other model, and raises if such a model's config carries a
+``qwen3_5`` section. ``additional_config`` is part of vLLM's config hash, so a
 setting that changes a compiled program also changes the compile-cache key.
 """
 
@@ -43,8 +45,8 @@ if TYPE_CHECKING:
 
 SECTION = "qwen3_5"
 
-# The architectures the Qwen3.5 settings and config hook apply to: the
-# released Qwen3.5-397B-A17B checkpoints declare the first.
+# The architectures the Qwen3.5 settings and config hook apply to: the one the
+# released Qwen3.5-397B-A17B checkpoints declare.
 ARCHITECTURES = frozenset({"Qwen3_5MoeForConditionalGeneration"})
 
 
@@ -137,8 +139,8 @@ def get(vllm_config: VllmConfig) -> Qwen35Settings:
     """The Qwen3.5 settings of this engine.
 
     For a Qwen3.5 target, the parsed ``additional_config["qwen3_5"]``. For any
-    other model, the defaults; a ``qwen3_5`` section on another model raises
-    ``ValueError``, since it would otherwise be silently ignored.
+    other model, the defaults, and ``ValueError`` if its config carries a
+    ``qwen3_5`` section, which no setting would honour.
     """
     raw = _section(vllm_config)
     if is_qwen3_5(vllm_config.model_config):
@@ -154,15 +156,3 @@ def get(vllm_config: VllmConfig) -> Qwen35Settings:
             f"architectures {archs} are not Qwen3.5 ({sorted(ARCHITECTURES)})"
         )
     return Qwen35Settings()
-
-
-def current() -> Qwen35Settings:
-    """The settings of the engine whose config vLLM is currently building.
-
-    For code that runs under vLLM's config context (model construction,
-    kernel builders). Code on the step path should read the settings once at
-    init and keep them.
-    """
-    from vllm.config import get_current_vllm_config
-
-    return get(get_current_vllm_config())

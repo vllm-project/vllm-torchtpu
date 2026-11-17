@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import pathlib
 
 import pytest
@@ -31,17 +32,39 @@ def test_the_qwen3_5_section_is_known():
     assert settings.SECTION in sections.KNOWN_SECTIONS
 
 
+def _code_strings(path: pathlib.Path) -> set[str]:
+    """The string literals in a module's code, without its docstrings."""
+    tree = ast.parse(path.read_text())
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        )
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    }
+
+
 @pytest.mark.parametrize("section", sorted(sections.KNOWN_SECTIONS))
 def test_every_known_section_has_a_reader(section):
-    """A listed section must be read somewhere in the package, or the list
-    would accept a key that changes nothing."""
-    needle = f'"{section}"'
+    """A listed section must be named in the code of some module of the
+    package (a docstring or comment does not count), or the list would accept
+    a key that changes nothing."""
     readers = [
         p
         for p in PACKAGE.rglob("*.py")
-        if p.name != "additional_config_sections.py" and needle in p.read_text()
+        if p.name != "additional_config_sections.py" and section in _code_strings(p)
     ]
-    assert readers, f"no module of the package reads {needle}"
+    assert readers, f"no module of the package reads {section!r}"
 
 
 @pytest.mark.parametrize(
