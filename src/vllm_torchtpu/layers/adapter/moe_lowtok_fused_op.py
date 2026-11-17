@@ -34,17 +34,14 @@ from jax import lax
 from jax.sharding import Mesh, PartitionSpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
     ep_mesh_index,
-    ep_rank_order,
-    get_ep_group,
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives
-from vllm_torchtpu.layers.adapter import moe_options, token_padding
+from vllm_torchtpu.layers.adapter import moe_options, small_all_reduce_op, token_padding
 from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 from vllm_torchtpu.logger import init_logger
 
@@ -69,31 +66,6 @@ _TP = 0
 _ARMED = False
 _CHECKED = False
 _FP8_DISPATCH = False
-
-
-def _groups_match_mesh(mesh_index: int, dp: int, tp: int) -> bool:
-    """Whether this core's TP group is its block of `tp` consecutive mesh
-    indices and its DP group is the cores with its TP index, agreed over EP."""
-    import torch.distributed as dist
-    from vllm.distributed.parallel_state import get_dp_group, get_tp_group
-
-    order = ep_rank_order()
-    tp_ranks = tuple(int(r) for r in get_tp_group().ranks)
-    dp_ranks = set(int(r) for r in get_dp_group().ranks)
-    block = mesh_index - mesh_index % tp
-    t = mesh_index % tp
-    mine = (
-        order is not None
-        and len(tp_ranks) == tp
-        and all(order[block + j] in tp_ranks for j in range(tp))
-        and len(dp_ranks) == dp
-        and dp_ranks == {order[j * tp + t] for j in range(dp)}
-    )
-    group = get_ep_group()
-    assert group is not None  # the caller found the EP mesh
-    verdicts = [None] * group.world_size
-    dist.all_gather_object(verdicts, bool(mine), group=group.cpu_group)
-    return all(verdicts)
 
 
 def prebuild(vllm_config: Any, topk: int) -> None:
@@ -123,7 +95,7 @@ def prebuild(vllm_config: Any, topk: int) -> None:
         dp * tp != cores
         or dp < 2
         or (tp != 2 and "hier" in forms)
-        or not _groups_match_mesh(index, dp, tp)
+        or not small_all_reduce_op.groups_match_mesh(index, tp, dp)
     ):
         logger.debug(
             "moe_lowtok fused collectives not armed: dp=%d x tp=%d is not the "
@@ -261,13 +233,13 @@ def serves(layer, scores_op, is_sequence_parallel: bool) -> bool:
 
 
 def retain(out: torch.Tensor) -> torch.Tensor:
-    """``out`` plus a zero read from the rank buffer, for a MoE path that does
-    not take the op while another token-count branch of the same model does:
-    a bucket is handed over only between traces that lift the same buffers."""
-    if _RANK is None or not shape_variants.in_warmup():
+    """``out`` plus a zero read from this op's rank buffer
+    (``small_all_reduce_op.retain``), for a MoE path that does not take the op
+    while another token-count branch of the same model does: a bucket is
+    handed over only between traces that lift the same buffers."""
+    if _RANK is None:
         return out
-    value = _RANK[0].to(out.dtype)
-    return out + (value - value)
+    return small_all_reduce_op.retain(out, _RANK)
 
 
 def apply(layer, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:

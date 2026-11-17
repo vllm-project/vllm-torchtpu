@@ -369,7 +369,7 @@ def prebuild_layout(monkeypatch):
         ar=Mock(name="_build_all_reduce"),
         rs=Mock(name="_build_reduce_scatter"),
         tp=Mock(name="_build_tp_all_reduce"),
-        pairs=Mock(name="_tp_pairs_match_mesh", return_value=True),
+        pairs=Mock(name="groups_match_mesh", return_value=True),
     )
     mesh = SimpleNamespace(shape={op.EP_AXIS_NAME: CORES})
     monkeypatch.setattr(op, "build_ep_mesh", lambda: mesh)
@@ -378,7 +378,7 @@ def prebuild_layout(monkeypatch):
     monkeypatch.setattr(op, "_build_all_reduce", builders.ar)
     monkeypatch.setattr(op, "_build_reduce_scatter", builders.rs)
     monkeypatch.setattr(op, "_build_tp_all_reduce", builders.tp)
-    monkeypatch.setattr(op, "_tp_pairs_match_mesh", builders.pairs)
+    monkeypatch.setattr(op, "groups_match_mesh", builders.pairs)
     for name, value in (
         ("_AR_OP", None),
         ("_RS_OP", None),
@@ -458,3 +458,52 @@ def test_prebuild_without_the_setting_builds_no_tp_pair(prebuild_layout):
 
 def test_tp_pair_form_is_oneshot():
     assert (op.TP_PAIR_SIZE, op.TP_PAIR_FORM) == (2, "oneshot")
+
+
+# The layout predicate behind groups_match_mesh, on an 8-core mesh whose mesh
+# index i is rank ORDER[i].
+
+ORDER = (0, 1, 2, 3, 4, 5, 6, 7)
+
+
+@pytest.mark.parametrize(
+    "mesh_index,tp_ranks,dp_ranks,want",
+    [
+        (3, (2, 3), None, True),
+        (3, (2, 3), (1, 3, 5, 7), True),
+        (0, (0, 1), (0, 2, 4, 6), True),
+        (3, (3, 4), None, False),
+        (3, (1, 3), None, False),
+        (3, (2, 3), (0, 2, 4, 6), False),
+        (3, (2, 3), (1, 3, 5), False),
+        (3, (2, 3, 4), None, False),
+    ],
+    ids=[
+        "tp_pair_block",
+        "tp_pair_and_dp_column",
+        "first_core",
+        "pair_straddles_blocks",
+        "pair_not_consecutive",
+        "dp_group_other_tp_index",
+        "dp_group_short",
+        "tp_group_not_tp",
+    ],
+)
+def test_groups_on_mesh_blocks(mesh_index, tp_ranks, dp_ranks, want):
+    got = op._groups_on_mesh_blocks(
+        ORDER, mesh_index, tp_ranks, 2, dp_ranks, 4 if dp_ranks is not None else 0
+    )
+    assert got is want
+
+
+def test_groups_on_mesh_blocks_follows_the_rank_order():
+    """Mesh index, not rank: with ranks 2 and 3 swapped on the mesh, the pair
+    at mesh block 2..3 is still ranks {2, 3}, and DP column 1 holds rank 2."""
+    order = (0, 1, 3, 2, 4, 5, 6, 7)
+    # Mesh index 3 is rank 2: TP index 1 of mesh block 2..3.
+    assert op._groups_on_mesh_blocks(order, 3, (2, 3), 2, (1, 2, 5, 7), 4) is True
+    assert op._groups_on_mesh_blocks(order, 3, (2, 3), 2, (1, 3, 5, 7), 4) is False
+
+
+def test_groups_on_mesh_blocks_without_a_rank_order():
+    assert op._groups_on_mesh_blocks(None, 3, (2, 3), 2) is False
