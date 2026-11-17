@@ -220,36 +220,23 @@ def _drop_global_state(entries: Any) -> list[bool]:
     return [keep_all or e.guard_type != "GLOBAL_STATE" for e in entries]
 
 
-def install() -> None:
-    """Hook ``torch.compile`` for ``backend="tpu", fullgraph=True,
-    dynamic=False`` plain functions. Idempotent. Inert until ``configure``.
+def _eligible(model: Any, kwargs: dict) -> bool:
+    return (
+        isinstance(model, types.FunctionType)
+        and kwargs.get("backend") == "tpu"
+        and kwargs.get("fullgraph") is True
+        and kwargs.get("dynamic") is False
+        and not kwargs.get("disable", False)
+        and kwargs.get("options") is None
+        and kwargs.get("mode") is None
+    )
 
-    fast (``fast_compiled_call``): guard-checked direct dispatch (above).
-    drop_global_state (``drop_global_state_guard``): compile them with a
-    ``guard_filter_fn`` that drops only the GLOBAL_STATE guard (grad mode,
-    num_threads, autocast, default dtype, ...). Warmup entries are then
-    reused by serving even when the serving thread's num_threads/grad mode
-    differ from the warmup thread's; tensor guards (shape, stride, dtype,
-    device, requires_grad) and value guards are kept. These graphs take no
-    requires_grad inputs and run on TPU, so neither grad mode nor the CPU
-    intra-op thread count changes what they compute.
-    """
-    global _INSTALLED
-    if _INSTALLED:
-        return
-    _INSTALLED = True
-    orig_compile = torch.compile
 
-    def _eligible(model: Any, kwargs: dict) -> bool:
-        return (
-            isinstance(model, types.FunctionType)
-            and kwargs.get("backend") == "tpu"
-            and kwargs.get("fullgraph") is True
-            and kwargs.get("dynamic") is False
-            and not kwargs.get("disable", False)
-            and kwargs.get("options") is None
-            and kwargs.get("mode") is None
-        )
+def make_compile_hook(orig_compile: Any) -> Any:
+    """``orig_compile`` (``torch.compile``) with ``backend="tpu",
+    fullgraph=True, dynamic=False`` plain functions compiled with the guard
+    filter and wrapped for fast dispatch, in direct and decorator form. Every
+    other call goes to ``orig_compile`` unchanged."""
 
     @functools.wraps(orig_compile)
     def compile_hook(model: Any = None, *args: Any, **kwargs: Any) -> Any:
@@ -273,5 +260,26 @@ def install() -> None:
             return _wrap(out, model)
         return out
 
-    torch.compile = compile_hook
+    return compile_hook
+
+
+def install() -> None:
+    """Hook ``torch.compile`` for ``backend="tpu", fullgraph=True,
+    dynamic=False`` plain functions. Idempotent. Inert until ``configure``.
+
+    fast (``fast_compiled_call``): guard-checked direct dispatch (above).
+    drop_global_state (``drop_global_state_guard``): compile them with a
+    ``guard_filter_fn`` that drops only the GLOBAL_STATE guard (grad mode,
+    num_threads, autocast, default dtype, ...). Warmup entries are then
+    reused by serving even when the serving thread's num_threads/grad mode
+    differ from the warmup thread's; tensor guards (shape, stride, dtype,
+    device, requires_grad) and value guards are kept. These graphs take no
+    requires_grad inputs and run on TPU, so neither grad mode nor the CPU
+    intra-op thread count changes what they compute.
+    """
+    global _INSTALLED
+    if _INSTALLED:
+        return
+    _INSTALLED = True
+    torch.compile = make_compile_hook(torch.compile)
     logger.debug("torch.compile hook installed; inert until tpu_compile arms it")
