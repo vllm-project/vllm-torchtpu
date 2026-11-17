@@ -25,6 +25,15 @@ scales) through a ring of VMEM slots, slots - 1 chunks ahead. Only one chunk's
 DMA is exposed at the start and one chunk's compute at the end, and the down
 weights of an expert stream in under its gate_up compute.
 
+With ``shared`` the call also computes a TP slice of a dense shared expert
+(e4m3 weights, one scale per output column) on the unpermuted token rows and
+returns it as a second output. Its weights are copied to VMEM in three DMAs
+issued before the routed chunks, and it is computed at the first routed chunk,
+while the next chunks stream, so the shared expert costs its weight bytes in
+the same stream and no separate weight-bound call. Its roundings follow the
+torch shared MLP: bf16 matmul results times the power-of-two column scale, the
+SwiGLU-OAI activation in bf16, bf16 out.
+
 Numerics equal gmm_v2's fp8 rhs feed (decode tiles, at most
 FP8_RHS_MAX_BUCKET_M... per tile there; here any bucket, rows are independent):
 per output column, the f32 sum over 128-deep quant blocks runs in the same
@@ -137,7 +146,93 @@ def _kernel(
     s1_hbm,  # [G, K1 / 128, 1, N] f32
     w2_hbm,  # [G, F, N] fp4
     s2_hbm,  # [G, F / 128, 1, N] f32
-    # Out (HBM)
+    *refs,
+    num_groups: int,
+    chunk: int,
+    slots: int,
+    buckets: tuple[int, ...],
+    bf16_from: int | None,
+    fuse_act: str,
+    w_load: str = "tile",
+    has_shared: bool = False,
+):
+    if has_shared:
+        (xt_hbm, sw1_hbm, ss1_ref, sw2_hbm, ss2_ref, out_hbm, so_hbm,
+         *scratch) = refs
+        *scratch, xt_v, sw1_v, sw2_v, so_v, ssem = scratch
+    else:
+        out_hbm, *scratch = refs
+    _routed_kernel(
+        gs_ref, go_ref, lhs_hbm, w1_hbm, s1_hbm, w2_hbm, s2_hbm, out_hbm, *scratch,
+        num_groups=num_groups, chunk=chunk, slots=slots, buckets=buckets,
+        bf16_from=bf16_from, fuse_act=fuse_act, w_load=w_load,
+        shared=(
+            (xt_hbm, sw1_hbm, ss1_ref, sw2_hbm, ss2_ref, so_hbm, xt_v, sw1_v,
+             sw2_v, so_v, ssem)
+            if has_shared else None
+        ),
+    )
+
+
+def _shared_expert(sh, fuse_act: str):
+    """Copies and compute of the shared expert slice (see module doc)."""
+    (xt_hbm, sw1_hbm, ss1_ref, sw2_hbm, ss2_ref, so_hbm, xt_v, sw1_v, sw2_v,
+     so_v, ssem) = sh
+    copies = [
+        pltpu.make_async_copy(sw1_hbm, sw1_v, ssem.at[0]),
+        pltpu.make_async_copy(sw2_hbm, sw2_v, ssem.at[1]),
+        pltpu.make_async_copy(xt_hbm, xt_v, ssem.at[2]),
+    ]
+    out_copy = pltpu.make_async_copy(so_v, so_hbm, ssem.at[3])
+
+    def start():
+        for cp in copies:
+            cp.start()
+
+    def compute():
+        if fuse_act != "swigluoai":
+            raise NotImplementedError(fuse_act)
+        for cp in copies:
+            cp.wait()
+        x = xt_v[...]
+        k1, n1 = sw1_v.shape
+        fs = n1 // 2
+        n = sw2_v.shape[1]
+        kstep = math.gcd(k1, 512)
+
+        def proj(c0, width):
+            acc = jnp.zeros((x.shape[0], width), jnp.float32)
+            for k in range(0, k1, kstep):
+                acc = acc + jnp.matmul(
+                    x[:, k : k + kstep],
+                    sw1_v[k : k + kstep, c0 : c0 + width],
+                    preferred_element_type=jnp.float32,
+                )
+            # torch: bf16 matmul result, times the power-of-two column scale.
+            return acc.astype(jnp.bfloat16) * ss1_ref[:, c0 : c0 + width].astype(
+                jnp.bfloat16
+            )
+
+        gate = jnp.minimum(proj(0, fs), jnp.bfloat16(7.0))
+        up = jnp.clip(proj(fs, fs), jnp.bfloat16(-7.0), jnp.bfloat16(7.0))
+        glu = gate * jax.nn.sigmoid(jnp.bfloat16(1.702) * gate)
+        h = glu * (up + jnp.bfloat16(1.0))
+        ncol = math.gcd(n, _ACT_COLS)
+        for c0 in range(0, n, ncol):
+            y = jnp.matmul(
+                h, sw2_v[:, c0 : c0 + ncol], preferred_element_type=jnp.float32
+            )
+            so_v[:, c0 : c0 + ncol] = (
+                y.astype(jnp.bfloat16)
+                * ss2_ref[:, c0 : c0 + ncol].astype(jnp.bfloat16)
+            ).astype(so_v.dtype)
+        out_copy.start()
+
+    return start, compute, out_copy.wait
+
+
+def _routed_kernel(
+    gs_ref, go_ref, lhs_hbm, w1_hbm, s1_hbm, w2_hbm, s2_hbm,
     out_hbm,  # [Mp, N] out dtype
     # Scratch
     x_ref,  # VMEM [3, K1 / chunk, MCAP, chunk] bf16: lhs rows of 2 entries, h
@@ -159,6 +254,7 @@ def _kernel(
     bf16_from: int | None,
     fuse_act: str,
     w_load: str = "tile",
+    shared=None,
 ):
     k1 = lhs_hbm.shape[1]
     n = w1_hbm.shape[2]
@@ -362,6 +458,15 @@ def _kernel(
 
     branches = [functools.partial(lambda t, mb: compute(t, mb), mb=mb) for mb in buckets]
 
+    if shared is not None:
+        sh_start, sh_compute, sh_wait = _shared_expert(shared, fuse_act)
+        # Ahead of the routed chunks: computed at the first chunk.
+        sh_start()
+
+        @pl.when(num_chunks == 0)
+        def _():
+            sh_compute()
+
     @pl.when(num_chunks > 0)
     def _():
         for cp in x_copies(0):
@@ -378,6 +483,12 @@ def _kernel(
             @pl.when(nxt < num_chunks)
             def _():
                 start_chunk(nxt)
+
+            if shared is not None:
+                # Chunks t..t+slots-1 stream in under the shared expert.
+                @pl.when(t == 0)
+                def _():
+                    sh_compute()
 
             j = t // ce
 
@@ -405,14 +516,42 @@ def _kernel(
         wait_out(0)
         wait_out(1)
 
+    if shared is not None:
+        sh_wait()
 
-def vmem_bytes(k1, f, n, chunk, slots, mcap, out_itemsize=2) -> int:
+
+def vmem_bytes(k1, f, n, chunk, slots, mcap, out_itemsize=2, shared=None) -> int:
     x = 3 * mcap * k1 * 2
     acc = 2 * mcap * n * 4
     o = (2 * (mcap + _SUB) + _SUB) * n * out_itemsize
     w = slots * chunk * n  # fp4 takes a byte per element in VMEM
     s = slots * _gmm.align_to(chunk // _QB, 8) * n * 4
-    return x + acc + o + w + s
+    sh = 0
+    if shared is not None:
+        tp, n1s, fs = shared  # token rows, 2 * shared width, shared width
+        # e4m3 weights, token rows and out, 8-row padded column scales, and
+        # the f32 / bf16 temporaries of the projections.
+        sh = (k1 * n1s + fs * n) + tp * (k1 + n) * 2 + 8 * (n1s + n) * 4
+        sh += tp * (n1s * 6 + n * 4)
+    return x + acc + o + w + s + sh
+
+
+def shared_eligible(lhs_tok, sw1, ss1, sw2, ss2, k1, n) -> str | None:
+    """None if (token rows, e4m3 [K1, 2Fs], f32 [1, 2Fs], e4m3 [Fs, N],
+    f32 [1, N]) is a shared expert slice this kernel computes, else why not."""
+    e4m3 = jnp.float8_e4m3fn
+    tp, k = lhs_tok.shape
+    if lhs_tok.dtype != jnp.bfloat16 or k != k1 or tp % _SUB:
+        return "token rows"
+    if sw1.dtype != e4m3 or sw2.dtype != e4m3:
+        return "shared not e4m3"
+    k1s, n1s = sw1.shape
+    fs, ns = sw2.shape
+    if k1s != k1 or n1s != 2 * fs or ns != n or fs % 128:
+        return "shared shapes"
+    if ss1.shape != (1, n1s) or ss2.shape != (1, n):
+        return "shared scales"
+    return None
 
 
 def gmm_decode_stream_mlp(
@@ -431,7 +570,11 @@ def gmm_decode_stream_mlp(
     max_group_size: int | None = None,
     interpret: bool = False,
     w_load: str = "tile",
-) -> jax.Array:
+    shared: tuple | None = None,
+):
+    """Routed rows' expert MLP outputs; with ``shared`` = (token rows [Tp, K1]
+    bf16, e4m3 [K1, 2Fs], f32 [1, 2Fs], e4m3 [Fs, N], f32 [1, N]) also the
+    shared expert slice on the token rows, as (routed, shared)."""
     size_m, k1 = lhs.shape
     g, _, n = rhs1.shape
     f = rhs2.shape[1]
@@ -439,7 +582,12 @@ def gmm_decode_stream_mlp(
     mcap = buckets[-1]
     max_ent = g + pl.cdiv(size_m, _SUB)
     out_dtype = jnp.dtype(out_dtype or lhs.dtype)
-    need = vmem_bytes(k1, f, n, chunk_rows, slots, mcap, out_dtype.itemsize)
+    sh_dims = None
+    if shared is not None:
+        sh_dims = (shared[0].shape[0], shared[1].shape[1], shared[3].shape[0])
+    need = vmem_bytes(
+        k1, f, n, chunk_rows, slots, mcap, out_dtype.itemsize, shared=sh_dims
+    )
     capacity = 64 << 20 if interpret else pltpu.get_tpu_info().vmem_capacity_bytes
     vmem_limit = min(
         int(capacity * 0.9),
@@ -455,18 +603,52 @@ def gmm_decode_stream_mlp(
         bf16_from=bf16_from,
         fuse_act=fuse_act,
         w_load=w_load,
+        has_shared=shared is not None,
     )
     w_bytes = g * (k1 * n + f * n) // 2 + g * (k1 + f) // _QB * n * 4
+    in_specs = [hbm, hbm, hbm, hbm, hbm]
+    out_shape = jax.ShapeDtypeStruct((size_m, n), out_dtype)
+    out_specs = hbm
+    sh_scratch = []
+    sh_args = ()
+    flops = 2 * size_m * (k1 * n + f * n)
+    name_sh = ""
+    if shared is not None:
+        xt, sw1, ss1, sw2, ss2 = shared
+        tp = xt.shape[0]
+        n1s = sw1.shape[1]
+        fs = sw2.shape[0]
+        vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+        in_specs += [hbm, hbm, vmem, hbm, vmem]
+        out_shape = (out_shape, jax.ShapeDtypeStruct((tp, n), jnp.bfloat16))
+        out_specs = (hbm, hbm)
+        sh_scratch = [
+            pltpu.VMEM((tp, k1), jnp.bfloat16),
+            pltpu.VMEM((k1, n1s), sw1.dtype),
+            pltpu.VMEM((fs, n), sw2.dtype),
+            pltpu.VMEM((tp, n), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((4,)),
+        ]
+        sh_args = (
+            xt,
+            sw1,
+            ss1.astype(jnp.float32),
+            sw2,
+            ss2.astype(jnp.float32),
+        )
+        w_bytes += k1 * n1s + fs * n
+        flops += 2 * tp * (k1 * n1s + fs * n)
+        name_sh = f"-sh_{fs}"
     call = pl.pallas_call if interpret else tight_vmem.pallas_call
     extra = {"interpret": pltpu.InterpretParams()} if interpret else {}
     return call(
         kernel,
         **extra,
-        out_shape=jax.ShapeDtypeStruct((size_m, n), out_dtype),
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            in_specs=[hbm, hbm, hbm, hbm, hbm],
-            out_specs=hbm,
+            in_specs=in_specs,
+            out_specs=out_specs,
             scratch_shapes=[
                 pltpu.VMEM((3, k1 // chunk_rows, mcap, chunk_rows), lhs.dtype),
                 pltpu.VMEM((2, mcap, n), jnp.float32),
@@ -479,6 +661,7 @@ def gmm_decode_stream_mlp(
                 pltpu.SemaphoreType.DMA((slots, 2)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
+                *sh_scratch,
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -486,9 +669,9 @@ def gmm_decode_stream_mlp(
             disable_bounds_checks=True,
         ),
         name=f"gmm_decode_stream-g_{g}-m_{size_m}-k_{k1}-f_{f}-c_{chunk_rows}x{slots}-{w_load}"
-        f"-b_{'_'.join(map(str, buckets))}",
+        f"-b_{'_'.join(map(str, buckets))}{name_sh}",
         cost_estimate=pl.CostEstimate(
-            flops=2 * size_m * (k1 * n + f * n),
+            flops=flops,
             bytes_accessed=w_bytes + size_m * (k1 + n) * 2,
             transcendentals=0,
         ),
@@ -500,4 +683,5 @@ def gmm_decode_stream_mlp(
         rhs1_scale.astype(jnp.float32),
         rhs2,
         rhs2_scale.astype(jnp.float32),
+        *sh_args,
     )

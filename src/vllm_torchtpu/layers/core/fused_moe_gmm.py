@@ -569,6 +569,79 @@ def prepare_routed_gmm_inputs(
     )
 
 
+_UPCAST_MIN_ROWS = 4096
+
+
+def shared_expert_xla(x, sw1, ss1, sw2, ss2) -> jax.Array:
+    """A dense SwiGLU-OAI shared expert slice (e4m3 [K, 2Fs] / [Fs, N] with
+    f32 [1, n] power-of-two column scales) with the torch MLP's roundings:
+    bf16 matmul results times the scale, the activation in bf16."""
+    bf = jnp.bfloat16
+
+    def weight(w):
+        w = w.astype(bf)
+        # As the MiniMax MXFP8 linear: at MXU-bound sizes a materialized bf16
+        # copy beats the in-fusion convert.
+        if x.shape[0] >= _UPCAST_MIN_ROWS:
+            w = jax.lax.optimization_barrier(w)
+        return w
+
+    fs = sw2.shape[0]
+    gu = jnp.matmul(x, weight(sw1), preferred_element_type=jnp.float32)
+    gu = gu.astype(bf) * ss1.astype(bf)
+    gate = jnp.minimum(gu[:, :fs], bf(7.0))
+    up = jnp.clip(gu[:, fs:], bf(-7.0), bf(7.0))
+    h = gate * jax.nn.sigmoid(bf(1.702) * gate) * (up + bf(1.0))
+    y = jnp.matmul(h, weight(sw2), preferred_element_type=jnp.float32)
+    return y.astype(bf) * ss2.astype(bf)
+
+
+def _stream_with_shared(
+    x, w1, w2, w1_scale, w2_scale, group_sizes, group_offset, *, activation,
+    num_tokens, stream_shared,
+):
+    """gmm_v2_mlp's streamed decode call with the shared expert folded in, or
+    None when the streamed kernel does not serve this call."""
+    from vllm_torchtpu.kernels.megablox import gmm_decode_stream
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import _decode_stream_spec
+
+    spec = _decode_stream_spec()
+    if spec is None or activation != "swigluoai" or x.shape[0] % 16:
+        return None
+    chunk, slots, max_m = spec
+    if gmm_decode_stream.eligible(
+        x, w1, w2, w1_scale, w2_scale, activation, chunk, max_m
+    ) is not None:
+        return None
+    xt, sw1, ss1, sw2, ss2 = stream_shared["args"]
+    if gmm_decode_stream.shared_eligible(
+        xt, sw1, ss1, sw2, ss2, x.shape[1], w2.shape[2]
+    ) is not None:
+        return None
+    logger.info_once(
+        "TPU_MOE_STREAM_SHARED_EXPERT=1: the streamed decode MoE kernel "
+        "computes the shared expert (%d rows)",
+        x.shape[0],
+    )
+    out, sh = gmm_decode_stream.gmm_decode_stream_mlp(
+        x,
+        w1,
+        w2,
+        group_sizes,
+        w1_scale,
+        w2_scale,
+        group_offset,
+        fuse_act=activation,
+        out_dtype=x.dtype,
+        chunk_rows=chunk,
+        slots=slots,
+        max_group_size=num_tokens,
+        shared=(xt, sw1, ss1, sw2, ss2),
+    )
+    stream_shared["out"] = sh
+    return out
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -590,8 +663,13 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    stream_shared: dict | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    ``stream_shared`` (see fused_moe_func) carries a shared expert slice; when
+    the streamed decode kernel serves the call it computes the slice too and
+    leaves it under ``stream_shared["out"]``.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
@@ -613,19 +691,27 @@ def moe_gmm(
         # One kernel for both gmms (gmm_v2_mlp): down's first weight block
         # loads under gate_up's last step instead of after it. Packing
         # factor 1 means rhs_quant_dtype carries nothing gmm_v2_mlp needs.
-        gmm2_res = gmm_v2_mlp(
-            x,
-            w1,
-            w2,
-            group_sizes,
-            rhs1_scale=w1_scale,
-            rhs2_scale=w2_scale,
-            group_offset=group_offset,
-            fuse_act=activation,
-            preferred_element_type=x.dtype,
-            maybe_quantize_lhs=False,
-            max_group_size=num_tokens,
-        )
+        gmm2_res = None
+        if stream_shared is not None:
+            gmm2_res = _stream_with_shared(
+                x, w1, w2, w1_scale, w2_scale, group_sizes, group_offset,
+                activation=activation, num_tokens=num_tokens,
+                stream_shared=stream_shared,
+            )
+        if gmm2_res is None:
+            gmm2_res = gmm_v2_mlp(
+                x,
+                w1,
+                w2,
+                group_sizes,
+                rhs1_scale=w1_scale,
+                rhs2_scale=w2_scale,
+                group_offset=group_offset,
+                fuse_act=activation,
+                preferred_element_type=x.dtype,
+                maybe_quantize_lhs=False,
+                max_group_size=num_tokens,
+            )
     else:
         gmm1_res = gmm_wrapper(
             x,
@@ -841,6 +927,67 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    shared: tuple | None = None,
+) -> jax.Array:
+    """``_fused_moe_routed`` plus, with ``shared`` = (e4m3 [K, 2Fs], f32
+    [1, 2Fs], e4m3 [Fs, N], f32 [1, N]), a dense shared expert slice added to
+    the routed output in bf16, as vLLM's MoE runner adds its shared expert.
+    The streamed decode kernel computes the slice when it serves the call
+    (TPU_MOE_STREAM_SHARED_EXPERT); other paths compute it with XLA dots."""
+    args = (
+        hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias,
+        topk_weights, topk_ids, experts_start,
+    )
+    kwargs = dict(
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    if shared is None:
+        return _fused_moe_routed(*args, **kwargs)
+    num_tokens = hidden_states.shape[0]
+    pad = -num_tokens % 16
+    xt = jnp.pad(hidden_states, ((0, pad), (0, 0))) if pad else hidden_states
+    sw1, ss1, sw2, ss2 = shared
+    shared = (
+        sw1,
+        ss1.reshape(1, -1).astype(jnp.float32),
+        sw2,
+        ss2.reshape(1, -1).astype(jnp.float32),
+    )
+    holder = {"args": (xt, *shared)}
+    out = _fused_moe_routed(*args, stream_shared=holder, **kwargs)
+    sh = holder.get("out")
+    if sh is None:
+        sh = shared_expert_xla(hidden_states, *shared)
+    else:
+        sh = sh[:num_tokens]
+    return sh.astype(out.dtype) + out
+
+
+def _fused_moe_routed(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None = None,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+    stream_shared: dict | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1009,5 +1156,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        stream_shared=stream_shared,
     )
     return x[:num_tokens, :hidden_size]

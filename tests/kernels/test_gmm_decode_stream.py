@@ -108,3 +108,81 @@ def test_stream_matches_dequantized_reference(group_sizes, chunk, slots, m, max_
         assert np.abs(out[:valid] - ref[:valid]).max() <= 1e-2 * scale
     # Rows of the last 16-row slab past the groups are zero, as gmm_v2 masks them.
     assert np.all(out[valid : -(-valid // 16) * 16] == 0)
+
+
+def _shared_reference(xt, sw1, ss1, sw2, ss2):
+    """The torch shared MLP's roundings: bf16 matmul results times the
+    column scale, SwiGLU-OAI in bf16, bf16 down projection times its scale."""
+    bf = jnp.bfloat16
+    fs = sw2.shape[0]
+    gu = jnp.matmul(xt, sw1.astype(bf), preferred_element_type=jnp.float32)
+    gu = gu.astype(bf) * ss1.astype(bf)
+    gate = jnp.minimum(gu[:, :fs], bf(7.0))
+    up = jnp.clip(gu[:, fs:], bf(-7.0), bf(7.0))
+    h = gate * jax.nn.sigmoid(bf(1.702) * gate) * (up + bf(1.0))
+    y = jnp.matmul(h, sw2.astype(bf), preferred_element_type=jnp.float32)
+    return np.asarray((y.astype(bf) * ss2.astype(bf)).astype(jnp.float32))
+
+
+@pytest.mark.parametrize(
+    "group_sizes,tp",
+    [
+        ([3, 0, 5, 9, 0, 1], 16),
+        ([0, 0, 0, 0, 0, 0], 16),  # no routed work: shared still computed
+        ([30, 0, 100, 0, 0, 3], 48),
+    ],
+)
+def test_stream_shared_expert(group_sizes, tp):
+    k, f, g, fs = 512, 512, 6, 256
+    m = 64 if sum(group_sizes) <= 64 else 512
+    keys = jax.random.split(jax.random.key(1), 10)
+    w1 = (jax.random.normal(keys[0], (g, k, 2 * f)) * 2).astype(jnp.float4_e2m1fn)
+    w2 = (jax.random.normal(keys[1], (g, f, 2 * f)) * 2).astype(jnp.float4_e2m1fn)
+    s1 = jax.random.uniform(keys[2], (g, k // 128, 1, 2 * f), jnp.float32, 0.01, 0.03)
+    s2 = jax.random.uniform(keys[3], (g, f // 128, 1, 2 * f), jnp.float32, 0.01, 0.03)
+    lhs = jax.random.uniform(keys[4], (m, k), jnp.float32, -1, 1).astype(jnp.bfloat16)
+    gs = jnp.asarray(group_sizes, jnp.int32)
+    xt = jax.random.uniform(keys[5], (tp, k), jnp.float32, -1, 1).astype(jnp.bfloat16)
+    sw1 = (jax.random.normal(keys[6], (k, 2 * fs)) * 8).astype(jnp.float8_e4m3fn)
+    sw2 = (jax.random.normal(keys[7], (fs, 2 * f)) * 8).astype(jnp.float8_e4m3fn)
+    ss1 = 2.0 ** jnp.round(jax.random.uniform(keys[8], (1, 2 * fs), minval=-9, maxval=-6))
+    ss2 = 2.0 ** jnp.round(jax.random.uniform(keys[9], (1, 2 * f), minval=-9, maxval=-6))
+    common = dict(
+        fuse_act="swigluoai", out_dtype=jnp.bfloat16, chunk_rows=256, slots=3,
+        max_group_size=128, interpret=True,
+    )
+    base = S.gmm_decode_stream_mlp(
+        lhs, w1, w2, gs, s1, s2, jnp.zeros((1,), jnp.int32), **common
+    )
+    assert S.shared_eligible(xt, sw1, ss1, sw2, ss2, k, 2 * f) is None
+    out, sh = S.gmm_decode_stream_mlp(
+        lhs, w1, w2, gs, s1, s2, jnp.zeros((1,), jnp.int32), **common,
+        shared=(xt, sw1, ss1, sw2, ss2),
+    )
+    # The routed rows are untouched by the shared expert.
+    np.testing.assert_array_equal(
+        np.asarray(out.astype(jnp.float32)), np.asarray(base.astype(jnp.float32))
+    )
+    ref = _shared_reference(xt, sw1, ss1, sw2, ss2)
+    sh = np.asarray(sh.astype(jnp.float32))
+    scale = np.abs(ref).max()
+    assert scale > 0
+    # bf16 activation roundings may differ by an ulp (XLA keeps excess
+    # precision in fused elementwise chains); the outputs agree to bf16.
+    assert np.abs(sh - ref).max() <= 1e-2 * scale
+    assert np.abs(sh - ref).mean() <= 1e-3 * scale
+
+
+def test_shared_eligible_rejects():
+    e4m3 = jnp.float8_e4m3fn
+    xt = jax.ShapeDtypeStruct((16, 512), jnp.bfloat16)
+    sw1 = jax.ShapeDtypeStruct((512, 512), e4m3)
+    sw2 = jax.ShapeDtypeStruct((256, 1024), e4m3)
+    ss1 = jax.ShapeDtypeStruct((1, 512), jnp.float32)
+    ss2 = jax.ShapeDtypeStruct((1, 1024), jnp.float32)
+    assert S.shared_eligible(xt, sw1, ss1, sw2, ss2, 512, 1024) is None
+    bad = jax.ShapeDtypeStruct((15, 512), jnp.bfloat16)
+    assert S.shared_eligible(bad, sw1, ss1, sw2, ss2, 512, 1024) == "token rows"
+    bf = jax.ShapeDtypeStruct((512, 512), jnp.bfloat16)
+    assert S.shared_eligible(xt, bf, ss1, sw2, ss2, 512, 1024) == "shared not e4m3"
+    assert S.shared_eligible(xt, sw1, ss1, sw2, ss2, 512, 2048) == "shared shapes"

@@ -246,6 +246,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
+    TPU_MOE_STREAM_SHARED_EXPERT: bool = False
     VLLM_TPU_PREFILL_TPOT_US_PER_TOKEN: float = 40.0
     VLLM_TPU_PREFILL_TPOT_MIN_CHUNK: int = 256
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
@@ -857,6 +858,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gmm) is exposed per call. "<chunk_rows>:<slots>[@<max size_m>]", "on" =
     # 768:4@512. Same numerics as the fp8 rhs feed. Empty = off.
     "TPU_GMM_V2_DECODE_STREAM": env_str("TPU_GMM_V2_DECODE_STREAM", ""),
+    # MoE layers with a dense e4m3 shared expert (MiniMax M3) compute it inside
+    # the routed MoE op instead of vLLM's separate shared MLP; decode calls the
+    # streamed kernel serves (TPU_GMM_V2_DECODE_STREAM) compute it in that
+    # kernel, the rest with XLA dots in the same op (moe_stream_shared).
+    "TPU_MOE_STREAM_SHARED_EXPERT": env_bool("TPU_MOE_STREAM_SHARED_EXPERT", False),
     # TPU_MOE_SKIP_PADDED_TOKENS drops padded rows from the grouped matmul only
     # in batches of at least this many routes (T * top_k); smaller batches run
     # them as with the skip off (bitwise for real rows). 0 = every size.

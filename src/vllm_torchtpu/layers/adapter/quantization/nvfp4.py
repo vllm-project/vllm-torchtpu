@@ -608,6 +608,15 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
+        # A layer armed by moe_stream_shared computes its shared expert here.
+        shared = getattr(layer, "_tpu_stream_shared_w1", None)
+        if shared is not None:
+            kwargs["shared"] = (
+                shared,
+                layer._tpu_stream_shared_s1,
+                layer._tpu_stream_shared_w2,
+                layer._tpu_stream_shared_s2,
+            )
         return fused_moe_gmm(**kwargs)
 
 

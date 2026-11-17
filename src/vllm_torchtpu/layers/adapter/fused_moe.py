@@ -150,6 +150,39 @@ def _allocate_kernel_instance_id() -> int:
     return kernel_instance_id
 
 
+def _fused_moe_func_with_shared(
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    w1_bias,
+    w2_bias,
+    topk_weights,
+    topk_ids,
+    experts_start,
+    shared_w1,
+    shared_s1,
+    shared_w2,
+    shared_s2,
+    **kwargs,
+):
+    return fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        shared=(shared_w1, shared_s1, shared_w2, shared_s2),
+        **kwargs,
+    )
+
+
 def _build_fused_moe_custom_op(
     *,
     topk: int,
@@ -157,9 +190,12 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    with_shared: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
+    if with_shared:
+        op_name += "_shared"
 
     # TODO: once the pod's vLLM includes --moe-backend (added upstream in
     # vLLM PR #33807, 2026-03-01; absent in the 0.19.0 we run), register the
@@ -173,7 +209,7 @@ def _build_fused_moe_custom_op(
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     wrapped_fn = functools.partial(
-        fused_moe_func,
+        _fused_moe_func_with_shared if with_shared else fused_moe_func,
         topk=topk,
         activation=activation,
         use_ep=use_ep,
@@ -193,6 +229,8 @@ def _build_fused_moe_custom_op(
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
     cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    if with_shared:
+        cache_key += ("shared",)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -204,10 +242,13 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    with_shared: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
     cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    if with_shared:
+        cache_key += ("shared",)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -217,6 +258,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=with_shared,
     )
 
 
@@ -227,6 +269,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    with_shared: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -235,6 +278,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=with_shared,
     )
 
 
@@ -253,8 +297,13 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    shared: tuple | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
+
+    ``shared`` = (e4m3 [K, 2Fs], f32 [1, 2Fs], e4m3 [Fs, N], f32 [1, N]) adds
+    a dense shared expert slice to the routed output inside the same op
+    (moe_stream_shared).
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -273,6 +322,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=shared is not None,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
@@ -290,4 +340,5 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        *(shared or ()),
     )
