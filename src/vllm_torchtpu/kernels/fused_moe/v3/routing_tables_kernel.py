@@ -35,9 +35,9 @@ from .routing_tables import COUNT_ROWS, MAX_ROUTING_BLOCK
 # and a sublane-legal block shape.
 BLOCKS_PER_STEP = TABLES_BLOCKS_PER_STEP_MAX  # the most blocks a step takes
 # The lookup phase's table values reach a few million and may be negative.
-# Biased by
-# this they lie in [0, 2**23), where three 8-bit digits represent each one
-# exactly and each digit is exact in bf16.
+# Biased by this they lie in [0, 2**24), where three 8-bit digits represent
+# each one exactly and each digit is exact in bf16. check_lookup_range
+# refuses a call whose values could leave that range.
 LOOKUP_BIAS = 1 << 22
 # The three lookup tables (block offset, packed shift, expert base) travel
 # through the one-hot matmul as three bf16 digit rows each, one byte per
@@ -46,6 +46,57 @@ LOOKUP_TABLES = 3
 LOOKUP_BYTES = 3
 # The row each lookup table occupies in the picked result.
 LOOKUP_BLOCK_OFFSET, LOOKUP_PACKED_SHIFT, LOOKUP_EXPERT_BASE = range(LOOKUP_TABLES)
+
+
+def check_lookup_range(
+    *,
+    num_experts,
+    num_shards,
+    pairs_per_shard,
+    routed_rows_per_shard,
+    row_block,
+    slot_field,
+    pairs_per_expert,
+):
+    """Raises ValueError when a value of the lookup phase's three tables can
+    leave [-LOOKUP_BIAS, 2**(8 * LOOKUP_BYTES) - LOOKUP_BIAS), the range the
+    biased bytes carry exactly. Past it the reassembled value is off by a
+    multiple of 2**(8 * LOOKUP_BYTES), and a pair lands on the drop row or
+    on another expert's rows with nothing raised.
+
+    The bounds are static. A block offset counts a call's earlier pairs, so
+    it is below num_shards * pairs_per_shard. An expert base is below
+    num_shards * routed_rows_per_shard. A packed shift is position_shift *
+    slot_field + slot_shift, where slot_shift is below slot_field and
+    position_shift (an arrival row minus the expert's rows from earlier
+    shards) is at least -(num_shards - 1) * pairs_per_expert and at most a
+    shard's pairs plus every expert run's row-block padding.
+    `pairs_per_expert` is the most pairs one shard can send one expert: its
+    tokens when each token selects distinct experts, its pairs otherwise.
+    """
+    limit = (1 << (BYTE_BITS * LOOKUP_BYTES)) - LOOKUP_BIAS
+    shift_rows = pairs_per_shard + (row_block - 1) * num_experts + 1
+    bounds = (
+        ("block offset", 0, num_shards * pairs_per_shard),
+        ("expert base", 0, num_shards * routed_rows_per_shard),
+        (
+            "packed shift",
+            -(num_shards - 1) * pairs_per_expert * slot_field,
+            shift_rows * slot_field,
+        ),
+    )
+    for name, low, high in bounds:
+        if low < -LOOKUP_BIAS or high > limit:
+            raise ValueError(
+                f"the shard tables' {name} lookup can take values in "
+                f"[{low}, {high}), outside the [{-LOOKUP_BIAS}, {limit}) its "
+                f"{LOOKUP_BYTES} biased bytes carry exactly ({num_shards} "
+                f"shards, {num_experts} experts, {pairs_per_shard} pairs and "
+                f"{routed_rows_per_shard} routed rows per shard). Fewer tokens "
+                "per call or a narrower mesh fit"
+            )
+
+
 # The shard-tables kernel's outputs, in order: the three the layer takes
 # whole, the seven FFN tables, and the four expert tables.
 SHARD_TABLE_OUTPUTS = (
@@ -591,6 +642,7 @@ def shard_tables_kernel(
     blocks_per_step=BLOCKS_PER_STEP,
     zero_words_per_step=TABLES_ZERO_WORDS_DEFAULT,
     shard_index=None,
+    pairs_per_expert=None,
 ):
     """The pallas mode's front end, from the gathered routing messages
     (`routing messages` [num_shards, rows, LANES] int32: shard s's pair indices
@@ -605,7 +657,22 @@ def shard_tables_kernel(
     receive sems) from the start call. The gathered rows come back aliased
     with the middle rounds issued), then one zeroed table per length in
     `zero_tables`. Every output is placed in HBM.
+
+    `pairs_per_expert` is the most pairs one shard sends one expert (its
+    tokens when each token selects distinct experts); None takes
+    pairs_per_shard. It bounds the lookup values (check_lookup_range).
     """
+    check_lookup_range(
+        num_experts=num_experts,
+        num_shards=num_shards,
+        pairs_per_shard=pairs_per_shard,
+        routed_rows_per_shard=routed_rows_per_shard,
+        row_block=row_block,
+        slot_field=slot_field,
+        pairs_per_expert=(
+            pairs_per_shard if pairs_per_expert is None else pairs_per_expert
+        ),
+    )
     n = num_shards * pairs_per_shard
     n_blocks = n // block
     n_groups = n_blocks // blocks_per_step
