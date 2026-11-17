@@ -36,7 +36,8 @@ bitcast, which canonicalised NaN encodings); the FP8 interpretation happens
 only on values about to be quantized or just dequantized.
 """
 
-from __future__ import annotations
+# No `from __future__ import annotations`: pallas.jax_op reads the kernels' argument
+# types from their annotations (offload/tier_check.py does the same).
 
 import functools
 import math

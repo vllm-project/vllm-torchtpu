@@ -330,7 +330,10 @@ def _build_fp4_transcoder(kv_cache_config, pool_storages, group_regions, num_blo
 
     regions: set[int] = set()
     for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-        if tier_group_kind(group.kv_cache_spec, list(group.layer_names)) == "main":
+        names = list(group.layer_names)
+        if not names:
+            continue  # a group with no layers on this pipeline stage
+        if tier_group_kind(group.kv_cache_spec, names) == "main":
             regions.update(group_regions[gid])
     pools: dict[int, torch.Tensor] = {}
     page = None

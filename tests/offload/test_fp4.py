@@ -27,7 +27,9 @@ def fp4(monkeypatch_module=None):
     sys.modules.setdefault("vllm_torchtpu", types.ModuleType("vllm_torchtpu"))
     sys.modules["vllm_torchtpu.logger"] = logger_mod
     if "torch" not in sys.modules:
-        sys.modules["torch"] = types.ModuleType("torch")
+        stub = types.ModuleType("torch")
+        stub.Tensor = object  # annotations are evaluated (no __future__ import in fp4.py)
+        sys.modules["torch"] = stub
     mod = importlib.util.module_from_spec(_SPEC)
     _SPEC.loader.exec_module(mod)
     return mod
