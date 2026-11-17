@@ -15,12 +15,15 @@
 the Config field dense_slots (set by the Qwen3.5 DP4 x TP2 layout table), calls
 of at most dense_slots_max_tokens rows per shard (default 64) take the
 dense-slots layer with the caller's operands, larger calls keep v3; a bad
-threshold raises."""
+threshold raises. The layer hands its program the shard's rows unpadded when
+they are a multiple of 8 (CPU, no kernel is built)."""
 
 from types import SimpleNamespace
 
 import pytest
 
+from vllm_torchtpu.kernels.fused_moe.v3 import Config
+from vllm_torchtpu.kernels.fused_moe.v3.layout import MESH_AXIS
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as A
 from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS
 
@@ -75,22 +78,14 @@ def test_on_takes_dense_up_to_the_threshold(monkeypatch):
     _, a, k = calls[0]
     assert a[1:6] == ("w1", "w2", "s1", "s2", "gating")
     assert k["shard_index"] == "rank" and k["valid_tokens"] == "valid"
-    assert k["drop_nan_rows"] is True and k["fused"] is False and k["top_k"] == 10
-    assert (
-        k["pallas_tables"] is False and k["merged"] is False and k["unpadded"] is False
-    )
+    assert k["drop_nan_rows"] is True and k["top_k"] == 10
+    assert k["config"].dense_slots is True
 
 
-def test_threshold_and_fused(monkeypatch):
-    fields = {
-        "dense_slots": True,
-        "dense_slots_max_tokens": 128,
-        "dense_slots_fused": True,
-        "dense_slots_pallas_tables": True,
-    }
-    got, calls = _run(monkeypatch, 8 * 128, fields)
-    assert got == "dense" and calls[0][2]["fused"] is True
-    assert calls[0][2]["pallas_tables"] is True
+def test_threshold(monkeypatch):
+    fields = {"dense_slots": True, "dense_slots_max_tokens": 128}
+    got, _ = _run(monkeypatch, 8 * 128, fields)
+    assert got == "dense"
     got, _ = _run(monkeypatch, 8 * 136, fields)
     assert got == "v3"
 
@@ -106,13 +101,45 @@ def test_other_fields_leave_it_off(monkeypatch):
     assert got == "v3"
 
 
-def test_merged(monkeypatch):
-    fields = {
-        "dense_slots": True,
-        "dense_slots_fused": True,
-        "dense_slots_merged": True,
-    }
-    got, calls = _run(monkeypatch, 8 * 56, fields)
-    assert got == "dense"
-    k = calls[0][2]
-    assert k["fused"] is True and k["merged"] is True and k["unpadded"] is True
+class _Stop(Exception):
+    pass
+
+
+def _builder_kwargs(monkeypatch, rows_per_shard):
+    got = {}
+
+    def fake_build(**k):
+        got.update(k)
+        raise _Stop
+
+    monkeypatch.setattr(DS, "build_kernel", fake_build)
+    mesh = SimpleNamespace(axis_names=(MESH_AXIS,), shape={MESH_AXIS: EP})
+    x = SimpleNamespace(shape=(EP * rows_per_shard, 4096), dtype="bfloat16")
+    w1 = SimpleNamespace(shape=(EP * 64, 4096, 2048))
+    with pytest.raises(_Stop):
+        DS.dense_slots_moe(
+            x,
+            w1,
+            None,
+            None,
+            None,
+            None,
+            top_k=10,
+            renormalize=True,
+            mesh=mesh,
+            config=Config(),
+        )
+    return got
+
+
+@pytest.mark.parametrize(
+    "rows,real_rows,padded_to",
+    [(48, 48, 64), (64, 64, 64), (8, 8, 32), (20, None, 32), (60, None, 64)],
+)
+def test_the_program_takes_unpadded_rows_in_multiples_of_8(
+    monkeypatch, rows, real_rows, padded_to
+):
+    k = _builder_kwargs(monkeypatch, rows)
+    assert k["real_rows"] == real_rows
+    assert k["tokens_per_shard"] == padded_to
+    assert k["experts_per_shard"] == 64 and k["num_experts"] == EP * 64

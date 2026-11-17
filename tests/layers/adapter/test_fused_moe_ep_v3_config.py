@@ -92,9 +92,6 @@ def test_qwen3_5_dp4_tp2_takes_the_decode_entry():
         "compact_message": True,
         "reorder_chain": True,
         "dense_slots": True,
-        "dense_slots_fused": True,
-        "dense_slots_merged": True,
-        "dense_slots_skip_unrouted": True,
     }
 
 
