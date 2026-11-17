@@ -1833,6 +1833,7 @@ def sparse_mla_attention_pcp_prefill(
         )
     cache_layout = nope_spec.layout.value
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
+    packed_rope_kwargs = {"packed_rope": True} if rope_spec.packed_rope else {}
     sharded = P(dcp_axis_name)
     replicated = P()
     in_specs = (
@@ -1937,6 +1938,9 @@ def sparse_mla_attention_pcp_prefill(
                 sm_scale=sm_scale or 1.0,
                 k_scale=dequant_scale,
                 cache_layout=cache_layout,
+                # TPU_PCP_PACKED_ROPE: the workspace holds whole cache pages,
+                # so packed rope rows (8 tokens each) arrive as allocated.
+                **packed_rope_kwargs,
             )
             # Drop the rope tail: only the nope part is the MLA value.
             return output[..., :lkv_dim].astype(ql_nope.dtype)

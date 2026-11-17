@@ -74,10 +74,10 @@ def validate_pcp_manager_config(vllm_config: Any) -> None:
         raise NotImplementedError("PCP x DCP does not support LoRA.")
     if getattr(model_config, "is_multimodal_model", False):
         raise NotImplementedError("PCP x DCP does not support multimodal inputs.")
-    if envs.TPU_SPARSE_MLA_PACKED_ROPE:
+    if envs.TPU_SPARSE_MLA_PACKED_ROPE and not envs.TPU_PCP_PACKED_ROPE:
         raise NotImplementedError(
-            "PCP x DCP does not support TPU_SPARSE_MLA_PACKED_ROPE: the KV "
-            "gather workspace keeps 4 rope tokens per cache row, not 8."
+            "PCP x DCP does not support TPU_SPARSE_MLA_PACKED_ROPE unless "
+            "TPU_PCP_PACKED_ROPE=1 (packed rope through the KV gather workspace)."
         )
     max_model_len = int(model_config.max_model_len)
     if max_model_len > envs.TPU_PCP_KV_WORKSPACE_TOKENS:

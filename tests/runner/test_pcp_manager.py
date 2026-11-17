@@ -176,7 +176,15 @@ def test_pcp_manager_config_rejects_pcp_size_one():
 
 
 def test_pcp_manager_config_rejects_packed_rope(monkeypatch):
-    """The KV gather workspace has no packed-rope layout."""
+    """Packed rope needs the TPU_PCP_PACKED_ROPE opt-in."""
     monkeypatch.setattr(envs, "TPU_SPARSE_MLA_PACKED_ROPE", True)
+    monkeypatch.setattr(envs, "TPU_PCP_PACKED_ROPE", False)
     with pytest.raises(NotImplementedError, match="TPU_SPARSE_MLA_PACKED_ROPE"):
         validate_pcp_manager_config(_pcp_manager_config())
+
+
+def test_pcp_manager_config_packed_rope_opt_in(monkeypatch):
+    """TPU_PCP_PACKED_ROPE lifts the packed-rope rejection."""
+    monkeypatch.setattr(envs, "TPU_SPARSE_MLA_PACKED_ROPE", True)
+    monkeypatch.setattr(envs, "TPU_PCP_PACKED_ROPE", True)
+    validate_pcp_manager_config(_pcp_manager_config())
