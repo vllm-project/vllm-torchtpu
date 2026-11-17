@@ -39,6 +39,8 @@ class FakeRoutedExperts(RoutedExperts):
         self.e_score_correction_bias = None
         self.routed_scaling_factor = 1.0
         self.renormalize = True
+        # Set by VllmMoERunner; moe_routing.route reads it.
+        self.capture_fn = None
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id):
         return expert_id
