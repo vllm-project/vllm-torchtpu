@@ -13,6 +13,8 @@
 # limitations under the License.
 import unittest
 
+import pytest
+
 from vllm_torchtpu import frontend_tokcache as tokcache_mod
 
 
@@ -103,6 +105,76 @@ def test_installed_cache_uses_the_deployed_sizes():
         8,
         0,
     )
+
+
+@pytest.fixture
+def patched_renderer(monkeypatch):
+    """A real HfRenderer around the toy tokenizer, with the tokenization cache
+    installed on BaseRenderer; returns it and vLLM's unpatched method."""
+    from vllm.renderers import base as rbase
+    from vllm.renderers.hf import HfRenderer
+
+    unpatched = rbase.BaseRenderer._tokenize_prompt
+    # Restored at teardown, after the install below replaces it.
+    monkeypatch.setattr(rbase.BaseRenderer, "_tokenize_prompt", unpatched)
+    monkeypatch.setattr(tokcache_mod, "_INSTALLED", False)
+    assert tokcache_mod.maybe_install_tokenize_prefix_cache()
+    renderer = object.__new__(HfRenderer)
+    renderer.tokenizer = _toy_hf_tokenizer()
+    return renderer, unpatched
+
+
+@pytest.fixture
+def cache_encodes(monkeypatch):
+    """The PrefixTokenCache instances that encoded a prompt."""
+    caches = []
+    encode = tokcache_mod.PrefixTokenCache.encode
+
+    def spy(self, text):
+        caches.append(self)
+        return encode(self, text)
+
+    monkeypatch.setattr(tokcache_mod.PrefixTokenCache, "encode", spy)
+    return caches
+
+
+def _turns(n):
+    """A chat prompt of ``n`` turns, each long enough that the first already
+    passes the cache's 2048-token minimum."""
+    b = tokcache_mod.BOUNDARY
+    body = "hello world user hi " * 600
+    turns = [f"{b}user\n{body}{i}<|im_end|>\n{b}assistant\n" for i in range(n)]
+    return "".join(turns)
+
+
+@pytest.mark.parametrize("add_special_tokens", [True, False])
+def test_patched_renderer_matches_vllms_tokens_on_a_multi_turn_chat(
+    patched_renderer, cache_encodes, add_special_tokens
+):
+    from vllm.renderers.params import TokenizeParams
+
+    renderer, unpatched = patched_renderer
+    params = TokenizeParams(
+        max_total_tokens=None, add_special_tokens=add_special_tokens
+    )
+    for n in (1, 2, 3):
+        prompt = {"prompt": _turns(n)}
+        expected = unpatched(renderer, dict(prompt), params)
+        assert renderer._tokenize_prompt(dict(prompt), params) == expected
+    # The later turns reused the first turns' tokens through the cache.
+    (cache,) = set(cache_encodes)
+    assert cache.hits >= 2 and not cache.disabled
+
+
+def test_patched_renderer_leaves_truncation_to_vllm(patched_renderer, cache_encodes):
+    from vllm.renderers.params import TokenizeParams
+
+    renderer, unpatched = patched_renderer
+    params = TokenizeParams(max_total_tokens=None, truncate_prompt_tokens=10)
+    prompt = {"prompt": _turns(1)}
+    expected = unpatched(renderer, dict(prompt), params)
+    assert len(expected["prompt_token_ids"]) == 10
+    assert renderer._tokenize_prompt(dict(prompt), params) == expected
 
 
 if __name__ == "__main__":
