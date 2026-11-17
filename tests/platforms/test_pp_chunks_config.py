@@ -71,15 +71,20 @@ def test_the_dp_scheduler_with_one_dp_rank_does_not_gate(monkeypatch):
 
 
 def test_custom_scheduler_logs_configured_scheduler_when_dp_sched_env_set(
-    monkeypatch, caplog
+    monkeypatch,
 ):
+    # The platform logger is under vLLM's `vllm` logger, which stops
+    # propagating to caplog's root handler once vLLM configures logging, so
+    # read the warnings off the module's logger itself.
     _env(monkeypatch, dp_sched=True)
     config = _config(dp=2, cls="x.Y")
-    hook = _configure(config)
+    with patch.object(tpu_platform, "logger") as log:
+        hook = _configure(config)
     assert config.scheduler_config.scheduler_cls == "x.Y"
     hook.assert_not_called()
-    assert "scheduler x.Y is configured" in caplog.text
-    assert "the DP scheduler is enabled" not in caplog.text
+    warnings = [c.args[0] % c.args[1:] for c in log.warning.call_args_list]
+    assert any("scheduler x.Y is configured" in w for w in warnings)
+    assert not any("the DP scheduler is enabled" in w for w in warnings)
 
 
 def test_negative_slack_fails_at_config_time(monkeypatch):
