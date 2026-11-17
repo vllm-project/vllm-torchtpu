@@ -21,6 +21,8 @@
 #   sublane broadcast and transpose per kq head) when it gets no precomputed
 #   k^T, and recurrent_gdn passes none; only the one-token decode path
 #   transposes k up front.
+# - chunked_gdn_per_seq computes (beta k) k^T as diag(beta) (k k^T), one dot
+#   per kq head, at config.SHARED_KKT_SHAPES only.
 
 import jax
 import jax.numpy as jnp
