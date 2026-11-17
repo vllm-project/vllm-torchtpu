@@ -257,6 +257,19 @@ def test_a_custom_routing_function_decides_what_is_counted(tap_env):
     assert seen["hidden_states"] is hidden
 
 
+def test_the_tap_leaves_the_routed_experts_capture_hook_to_the_kernel(tap_env):
+    """Router replay records each layer's selection once, from the quant
+    method's own `moe_routing.route`; the tap's recount must not add a second
+    record."""
+    layer = _Layer()
+    captured = []
+    layer.capture_fn = captured.append
+    counts = _tapped(layer)
+    expert_count_tap.record(layer, _selecting(1, 2), None)
+    assert counts[0].sum() == 4
+    assert captured == []
+
+
 def test_snapshots_number_layers_as_the_placement_table_does(tap_env, monkeypatch):
     """A Qwen3.5 / Qwen3-Next drafter's `mtp.layers.<i>` MoE layer is table
     layer n + i (`expert_placement.layer_index`), not target layer i."""

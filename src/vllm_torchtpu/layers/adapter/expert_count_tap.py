@@ -16,10 +16,9 @@
 An expert placement is only as good as the routing statistics it is built
 from, and a fused kernel selects inside its own program, so its choices never
 reach the host. With the tap on, every MoE layer, whatever its kernel, re-runs
-the same selection in the traced forward, through the routing entry point the
-TPU MoE methods use (`moe_routing.route`: a model's custom routing function,
-else hash table or scored top-k), and accumulates, on the device, per global
-expert:
+the same selection in the traced forward, as the TPU MoE methods make it
+(`moe_routing.route`: a model's custom routing function, else hash table or
+scored top-k), and accumulates, on the device, per global expert:
 
     row 0: routed pairs           sum over steps of c
     row 1: squared per-step count sum over steps of c * c
@@ -241,12 +240,15 @@ def record(
     counts = getattr(layer, COUNTS_ATTR, None)
     if counts is None:
         return
-    # The selection the TPU MoE methods make, a custom routing function's
-    # included, so the counts are the experts the kernel runs.
-    _, topk_ids = moe_routing.route(
+    # The selection `moe_routing.route` makes for the TPU MoE methods, a
+    # custom routing function's included, so the counts are the experts the
+    # kernel runs. Not `route` itself: its routed-experts capture hook must
+    # fire once per layer, from the quant method's own routing.
+    _, topk_ids = moe_routing._select_routing(
         layer,
         router_logits if hidden_states is None else hidden_states,
         router_logits,
+        layer.moe_config.experts_per_token,
         input_ids,
     )
     experts = counts.shape[1]
