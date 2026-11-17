@@ -742,18 +742,22 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     @property
+    def _uses_hidden_state_drafter(self) -> bool:
+        """Whether the speculative method drafts from the target's hidden
+        states (eagle/MTP or dflash), on whichever pipeline stage hosts it."""
+        spec = self.speculative_config
+        if not spec:
+            return False
+        return spec.use_eagle() or spec.method == "dflash"
+
+    @property
     def _is_async_drafter(self) -> bool:
         """Whether this worker runs a hidden-state drafter.
 
         Under a pipeline only the last stage samples, so only it hosts the
         draft; the other stages hand their hidden states on and never draft.
         """
-        if not self.speculative_config or not self._pp_is_last:
-            return False
-        return (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.method == "dflash"
-        )
+        return self._uses_hidden_state_drafter and self._pp_is_last
 
     @property
     def _fence_spec_kv_under_token_copy(self) -> bool:
@@ -6165,8 +6169,8 @@ class TPUModelRunner(GPUModelRunner):
         return async_output
 
     def _maybe_draft_load_barrier(self) -> None:
-        """With eagle/MTP or dflash speculative decoding, align every rank of
-        the world group before the draft model load.
+        """With a hidden-state drafter (eagle/MTP or dflash), align every rank
+        of the world group before the draft model load.
 
         The barrier runs on the world group, so every rank must join it, not
         only the ones that load a draft. Under a pipeline only the last stage
@@ -6174,8 +6178,7 @@ class TPUModelRunner(GPUModelRunner):
         leave that stage waiting for stages that never arrive while they block
         in their next collective.
         """
-        spec = self.speculative_config
-        if spec is not None and (spec.use_eagle() or spec.method == "dflash"):
+        if self._uses_hidden_state_drafter:
             self._draft_load_barrier()
 
     def _draft_load_barrier(self) -> None:
