@@ -13,7 +13,7 @@ scenario="${1:?scenario is required: encoder_extend, decode or decode_dp16}"
 model_uri="${2:?model GCS URI is required}"
 results="${3:?results directory is required}"
 case "$scenario" in
-  encoder_extend|decode|decode_dp16) ;;
+  encoder_extend|decode|decode_agentx|decode_dp16) ;;
   *) echo "Unsupported benchmark scenario: $scenario" >&2; exit 2 ;;
 esac
 if [[ "$model_uri" != gs://*/* ]]; then

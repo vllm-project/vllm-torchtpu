@@ -72,7 +72,7 @@ def expected_prefix_hit(prefix_tokens: int, extend_tokens: int, alignment: int) 
 def client_main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--scenario", choices=["decode", "decode_dp16"], default="decode"
+        "--scenario", choices=["decode", "decode_agentx", "decode_dp16"], default="decode"
     )
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -338,14 +338,14 @@ def rank_results(value: list) -> list[dict]:
 
 
 def summarize(results: list, scenario_name: str) -> dict:
-    if scenario_name not in ("decode", "decode_dp16"):
+    if scenario_name not in ("decode", "decode_agentx", "decode_dp16"):
         raise NotImplementedError("Only the decode scenario is supported")
     scenario = SCENARIOS[scenario_name]
     ranks = sorted(rank_results(results), key=lambda r: r["rank"])
     if [r["rank"] for r in ranks] != list(range(scenario.dp_size)):
         raise ValueError("Expected one result for every DP rank; no duplicate ranks")
     hosts = {r["hostname"] for r in ranks}
-    if scenario_name == "decode" and len(hosts) != 1:
+    if scenario_name != "decode_dp16" and len(hosts) != 1:
         raise ValueError("Server monotonic timestamps require a single node")
     if scenario_name == "decode_dp16" and (
         len(hosts) != 2
@@ -607,7 +607,7 @@ def summarize(results: list, scenario_name: str) -> dict:
 def summarize_main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
-    parser.add_argument("--scenario", choices=["decode", "decode_dp16"], required=True)
+    parser.add_argument("--scenario", choices=["decode", "decode_agentx", "decode_dp16"], required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     result = summarize(json.loads(args.input.read_text())["results"], args.scenario)

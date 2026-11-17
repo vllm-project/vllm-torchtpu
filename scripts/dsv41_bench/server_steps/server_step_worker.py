@@ -42,6 +42,10 @@ DECODE_SCENARIO = Scenario(
     "decode", 384, prefix_tokens=98304, output_tokens=512, chunk_tokens=2048
 )
 SCENARIOS = {s.name: s for s in (SCENARIO, DECODE_SCENARIO)}
+# The AgentX decode host: 128 requests at a 144K-token cached context.
+SCENARIOS["decode_agentx"] = Scenario(
+    "decode", 128, prefix_tokens=147456, output_tokens=512, chunk_tokens=2048
+)
 SCENARIOS["decode_dp16"] = Scenario(
     "decode", 768, output_tokens=512, dp_size=16, physical_chips=8
 )
