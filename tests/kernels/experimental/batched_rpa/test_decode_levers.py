@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Which batched RPA kernels take the decode levers: the static fp8 operands
+(`configs.Fp8Operand.STATIC`) and the base-2 decode softmax."""
 
 from types import SimpleNamespace
 
@@ -45,11 +47,18 @@ def _cfgs(mode, soft_cap=None, **serve_kw):
 
 
 DECODE, MIXED = configs.RpaCase.DECODE, configs.RpaCase.MIXED
+PVS = configs.NativeFp8(pv=configs.Fp8Operand.STATIC)
+PV = configs.NativeFp8(pv=configs.Fp8Operand.ROW)
 
 
 @pytest.mark.parametrize(
     "mode, serve_kw, expected",
     [
+        (DECODE, {"native_fp8": PVS}, True),
+        (DECODE, {"native_fp8": PV}, False),
+        (DECODE, {"native_fp8_prefill": PVS}, False),
+        (MIXED, {"native_fp8_prefill": PVS}, True),
+        (MIXED, {"native_fp8": PVS}, False),
     ],
 )
 def test_static_pv_per_kernel(mode, serve_kw, expected):
@@ -71,7 +80,9 @@ def test_decode_exp2_gating(mode, soft_cap, serve_kw, expected):
 
 
 def test_p_prescaled_needs_exp2_and_static_pv():
+    both = _cfgs(DECODE, decode_exp2=True, native_fp8=PVS)
     assert flash_attention.p_prescaled(both)
+    assert not flash_attention.p_prescaled(_cfgs(DECODE, native_fp8=PVS))
     assert not flash_attention.p_prescaled(_cfgs(DECODE, decode_exp2=True))
 
 
@@ -108,10 +119,15 @@ def _wrapper_serving_config(monkeypatch, **kwargs):
 
 def test_wrapper_defaults_are_off(monkeypatch):
     seen = _wrapper_serving_config(monkeypatch)
+    assert seen["native_fp8"] == configs.NATIVE_FP8_OFF
+    assert seen["native_fp8_prefill"] == configs.NATIVE_FP8_OFF
     assert seen["decode_exp2"] is False
 
 
 def test_wrapper_accepts_static_decode_modes(monkeypatch):
     seen = _wrapper_serving_config(
+        monkeypatch, native_fp8=PVS, native_fp8_prefill=PVS, decode_exp2=True
     )
+    assert seen["native_fp8"] == PVS
+    assert seen["native_fp8_prefill"] == PVS
     assert seen["decode_exp2"] is True

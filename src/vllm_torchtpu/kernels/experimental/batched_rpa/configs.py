@@ -151,15 +151,28 @@ class Fp8Operand(enum.StrEnum):
     - ROW: one dynamic scale per row of the operand.
     - SPLIT: ROW, with the rounding residual quantized as a second fp8 half
       stacked under the first along the matmul rows: about bf16 accuracy for
+      twice the LHS rows. DECODE only.
+    - STATIC: a fixed scale: q is cast as is (after q_norm and RoPE it sits
+      well inside the e4m3 range), the softmax weights are cast times
+      `flash_attention.P_SCALE`, which the division by l removes.
     """
 
     OFF = enum.auto()
     ROW = enum.auto()
     SPLIT = enum.auto()
+    STATIC = enum.auto()
+
+
+_FP8_OPERAND_SUFFIX = {
+    Fp8Operand.ROW: "",
+    Fp8Operand.SPLIT: "2",
+    Fp8Operand.STATIC: "s",
+}
 
 
 @dataclasses.dataclass(frozen=True)
 class NativeFp8:
+    """Which matmuls of a kernel run natively in the fp8 KV dtype.
 
     `qk` quantizes q per (token, head) row; `pv` quantizes the softmax weights
     per row. Every operand OFF (the default) is the dequantizing kernel.
@@ -171,8 +184,19 @@ class NativeFp8:
     def any(self) -> bool:
         return self.qk is not Fp8Operand.OFF or self.pv is not Fp8Operand.OFF
 
+    def __str__(self) -> str:
+        """Short form for logs: "qk" / "pv" with "2" for SPLIT and "s" for
+        STATIC (e.g. "pvs", "qk2pv2"), "off" when no operand is on."""
+        parts = [
+            name + _FP8_OPERAND_SUFFIX[op]
+            for name, op in (("qk", self.qk), ("pv", self.pv))
+            if op is not Fp8Operand.OFF
+        ]
+        return "".join(parts) or "off"
+
 
 NATIVE_FP8_OFF = NativeFp8()
+
 
 # Inputs need three slots. The fetch for a tile is issued throughout the
 # preceding tile rather than all at once at its start, so it cannot be waited
@@ -211,7 +235,10 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    # Native fp8 matmuls of the DECODE kernel, and of the PREFILL and MIXED
+    # kernels (no SPLIT operands there).
     native_fp8: NativeFp8 = NATIVE_FP8_OFF
+    native_fp8_prefill: NativeFp8 = NATIVE_FP8_OFF
     # Run the DECODE softmax in base 2: log2(e) is folded into the score
     decode_exp2: bool = False
 
@@ -230,14 +257,35 @@ class ServingConfigs:
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
             )
+        for name in ("native_fp8", "native_fp8_prefill"):
+            self._check_native_fp8(name, getattr(self, name))
 
+    def _check_native_fp8(self, name: str, modes: NativeFp8) -> None:
+        if not modes.any():
+            return
+        if jnp.dtype(self.dtype_kv) not in (
             jnp.dtype(jnp.float8_e4m3fn),
             jnp.dtype(jnp.float8_e5m2),
         ):
             raise ValueError(
+                f"{name}={modes} runs matmuls in the fp8 KV dtype, but the KV "
+                f"cache is {jnp.dtype(self.dtype_kv)}; use an fp8 KV cache or "
+                f"leave {name} off."
             )
+        if modes.qk is not Fp8Operand.OFF and self.scale_q is not None:
             raise ValueError(
+                f"{name}.qk with a static q scale: the q-scale path already "
                 "casts q to the KV dtype; pass one or the other."
+            )
+        if name == "native_fp8_prefill" and Fp8Operand.SPLIT in (modes.qk, modes.pv):
+            raise ValueError(
+                f"{name}={modes}: SPLIT operands are DECODE only; use ROW or STATIC."
+            )
+        if modes.pv is Fp8Operand.STATIC and self.per_token_scale:
+            raise ValueError(
+                f"{name}.pv STATIC with per-token V scales: the scales multiply "
+                "the softmax weights before the cast and can leave the fp8 "
+                "range; use ROW."
             )
 
     @property
