@@ -92,13 +92,9 @@ def test_failed_install_does_not_stop_startup(monkeypatch):
 
 
 def test_section_is_kept_out_of_the_compile_cache_key():
-    from vllm_torchtpu.runner.utils import (
-        FRONTEND_OPTIONS_SECTION,
-        HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
-    )
+    from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
-    assert frontend_options.SECTION == FRONTEND_OPTIONS_SECTION
-    assert FRONTEND_OPTIONS_SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    assert frontend_options.SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 
 def _platform_patches():

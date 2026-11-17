@@ -26,6 +26,7 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
+from vllm_torchtpu.frontend_options import SECTION as FRONTEND_OPTIONS_SECTION
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner import runner_options
 
@@ -54,12 +55,9 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # owns the name) never change a compiled program.
 RUNNER_OPTIONS_SECTION = runner_options.SECTION
 
-# Host-only section: the API-server patches (`frontend_options`) never change
-# a compiled program.
-FRONTEND_OPTIONS_SECTION = "tpu_frontend"
-
-# Diagnostics-only knobs and host-only sections: they steer profiling or the
-# host and never change the compiled graph, so
+# Diagnostics-only knobs, and the host-only section of the API-server patches
+# (`frontend_options`): they steer profiling or the host and never change
+# the compiled graph, so
 # `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU compile
 # cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
