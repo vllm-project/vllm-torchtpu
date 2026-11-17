@@ -291,8 +291,13 @@ def _compile_deferred(
     ranks_per_host=8,
     disable_cache=False,
     num_subgraphs=1,
+    serves=None,
 ):
-    """Run compile_deferred over several traces' accepted buckets."""
+    """Run compile_deferred over several traces' accepted buckets.
+
+    ``serves[i]`` is the bucket predicate trace ``i`` was traced under (the
+    compiled module it belongs to; compilation/bucket_filter).
+    """
     _host(monkeypatch, ranks_per_host)
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
     calls = []
@@ -320,6 +325,7 @@ def _compile_deferred(
                     graph=object(),
                     range_entries=entries,
                     _tpu_trace=trace_idx,
+                    _tpu_serves=None if serves is None else serves[trace_idx],
                     vllm_backend=SimpleNamespace(
                         compiler_manager=SimpleNamespace(
                             compile=compile, disable_cache=disable_cache
@@ -354,6 +360,30 @@ def test_deferred_splits_buckets_across_traces_with_host_slot(
         with pytest.raises(shape_variants.ShapeSpecializationError):
             backends[0].range_entries[Range(4096, 4096)].runnable()
     assert owned == [[4096, 32, 16], [2048, 64], [1024, 128], [512, 256]]
+
+
+def test_deferred_keeps_each_routed_modules_last_trace_live(
+    compile_all_ranges, monkeypatch
+):
+    """With buckets routed to two compiled modules, a partial retrace keeps the
+    other module's older trace live: trace 0 (module A) and trace 2 (module B,
+    which replaced its trace 1) both get their refused buckets handed over."""
+
+    def module_a(n):
+        return n < 1024
+
+    def module_b(n):
+        return n >= 1024
+
+    calls, _, backends = _compile_deferred(
+        monkeypatch, 1, ranks_per_host=None, serves=[module_a, module_b, module_b]
+    )
+    # 9 accepted buckets + 6 hand-overs for each of the two live traces.
+    assert len(calls) == 9 + 6 + 6
+    backends[0].range_entries[Range(4096, 4096)].runnable()
+    backends[2].range_entries[Range(16, 16)].runnable()
+    with pytest.raises(shape_variants.ShapeSpecializationError):
+        backends[1].range_entries[Range(4096, 4096)].runnable()
 
 
 def test_deferred_splits_subgraphs_across_ranks_and_counts_distinct_traces(
