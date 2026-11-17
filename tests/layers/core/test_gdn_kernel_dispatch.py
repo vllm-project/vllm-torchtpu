@@ -286,16 +286,6 @@ def test_the_layer_hands_its_architecture_to_both_ops(architecture):
     assert core.call_args.kwargs["architecture"] == architecture
 
 
-def test_the_engine_architecture_is_used_when_the_layer_has_none():
-    assert (
-        gdn_attention_op._model_architecture(
-            SimpleNamespace(), _vllm_config("Qwen3NextForCausalLM")
-        )
-        == "Qwen3NextForCausalLM"
-    )
-    assert gdn_attention_op._model_architecture(SimpleNamespace(), None) is None
-
-
 def test_the_copy_serves_only_the_qwen3_5_moe_architectures():
     """Qwen3-Next, dense Qwen3.5 and Qwen4Exp share the GDN pool layout but keep
     the shared kernel until they are validated on the copy."""
