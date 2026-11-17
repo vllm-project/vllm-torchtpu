@@ -43,9 +43,26 @@ def _fp8_pages(rng, n, rows, scale=4.0):
 
 def test_geometry(fp4):
     assert fp4.page_rows(3_276_800) == 3200
-    assert fp4.fp4_page_bytes(3_276_800) == 1_740_800
-    assert fp4.staging_shape(3_276_800, 7) == (7, 13_600, 128)
-    assert 13_600 * 128 == fp4.fp4_page_bytes(3_276_800)
+    assert fp4.packed_rows(3200) == 1700  # 3200 * 544 B / 1024 B
+    assert fp4.stage_rows(3200) == 1728  # up to the writer's 64-row tile
+    assert fp4.fp4_page_bytes(3_276_800) == 1728 * 1024
+    assert fp4.staging_shape(3_276_800, 7) == (7, 1728, 4, 256)
+
+
+def test_staging_packing_round_trip(fp4):
+    # The programs' reshape: [n, rows*4 + rows//4, 128] -> [n, packed_rows, 4, 256],
+    # zero-padded to stage_rows, then sliced and reshaped back before dequantizing.
+    rng = np.random.default_rng(2)
+    rows = 64
+    pages, _ = _fp8_pages(rng, 2, rows)
+    q = fp4.quantize_pages(jnp.asarray(pages), jnp, lax)
+    prow, srow = fp4.packed_rows(rows), fp4.stage_rows(rows)
+    staged = jnp.pad(q.reshape(2, prow, 4, 256), ((0, 0), (0, srow - prow), (0, 0), (0, 0)))
+    back = staged[:, :prow].reshape(q.shape)
+    np.testing.assert_array_equal(np.asarray(back), np.asarray(q))
+    a = fp4.dequantize_pages(back, rows, jnp, lax)
+    b = fp4.dequantize_pages(q, rows, jnp, lax)
+    np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
 def test_round_trip_error(fp4):
@@ -69,7 +86,7 @@ def test_round_trip_error(fp4):
 
 def test_codes_match_reference(fp4):
     rng = np.random.default_rng(1)
-    rows = 4
+    rows = 32
     pages, ref = _fp8_pages(rng, 1, rows)
     staged = np.asarray(fp4.quantize_pages(jnp.asarray(pages), jnp, lax))
     packed = staged[0, : rows * 4].reshape(rows, 4, 128)
@@ -81,7 +98,7 @@ def test_codes_match_reference(fp4):
 
 
 def test_extremes_and_zeros(fp4):
-    rows = 4
+    rows = 32
     vals = np.zeros((1, rows, 4, 256), np.float32)
     vals[0, 0, 0, :32] = 448.0  # FP8 max: must not overflow on the way back
     vals[0, 0, 1, :32] = -0.001953125  # FP8 smallest subnormal region

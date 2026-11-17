@@ -26,14 +26,16 @@ small HBM staging buffers that the class registers in place of the pool:
   the request is scheduled again. The slots return to the free list once every
   worker acknowledges that the dequantize retired.
 
-Staging layout per region: ``[slots, rows * 4 + rows // 4, 128]`` uint8, i.e.
-per slot the packed values (``rows * 4`` sublane rows of 128 bytes: one head
-slot of 256 lanes per row) followed by the scales (``rows * 32`` bytes =
-``rows // 4`` rows of 128). A 3,200-token page: 12,800 + 800 rows of 128 B =
-1,740,800 B, no tile padding. Pages are read and written as uint8 views (the
-PD repack's rule: XLA must never handle FP8 KV bytes as FP8 in a gather or a
-bitcast, which canonicalised NaN encodings); the FP8 interpretation happens
-only on values about to be quantized or just dequantized.
+Staging layout per region: ``[slots, stage_rows, 4, 256]`` uint8, the pool's
+own 1,024-byte row shape. Per slot, the packed values (``rows * 4`` runs of
+128 bytes: one head slot of 256 lanes) are followed by the scales (``rows *
+32`` bytes), then zero rows up to a multiple of 64 rows. A 3,200-token page
+packs into 1,700 rows and stages in 1,728 (1,769,472 B, 54% of the FP8 page).
+Pool rows move only by DMA, as in the PD repack: ``dma_row_gather`` reads them
+as uint8 (XLA must never gather or bitcast FP8 KV bytes as FP8 -> integer,
+which canonicalised NaN encodings), and the aliased DMA row writer stores in
+place. The FP8 interpretation happens only on values about to be quantized or
+just dequantized.
 """
 
 # No `from __future__ import annotations`: pallas.jax_op reads the kernels' argument
@@ -68,6 +70,8 @@ SCALE_BIAS = 127
 # Batch sizes compiled for each direction (a batch is padded up to the next one by
 # repeating its last pair, which rewrites the same bytes; bigger batches are split).
 BUCKETS = (1, 4, 16, 64)
+# Rows a grid step of the aliased DMA row writer (pd_staging.REPACK_TILE).
+TILE = 64
 
 
 def page_rows(page_bytes: int) -> int:
@@ -77,20 +81,30 @@ def page_rows(page_bytes: int) -> int:
             f"{ROW_VALUES}-byte token rows"
         )
     rows = page_bytes // ROW_VALUES
-    if rows % 4:
-        raise ValueError(f"VLLM_TPU_OFFLOAD_FP4: {rows} rows a page is not a multiple of 4")
+    if rows % 32:
+        raise ValueError(f"VLLM_TPU_OFFLOAD_FP4: {rows} rows a page is not a multiple of 32")
     return rows
 
 
+def packed_rows(rows: int) -> int:
+    """1,024-byte rows the MXFP4 bytes of a ``rows``-row page fill: 544 B a token row."""
+    return rows * (ROW_VALUES // 2 + SCALES_PER_ROW) // ROW_VALUES
+
+
+def stage_rows(rows: int) -> int:
+    """Rows of one staging slot: ``packed_rows`` rounded up to the writer's tile."""
+    return -(-packed_rows(rows) // TILE) * TILE
+
+
 def fp4_page_bytes(page_bytes: int) -> int:
-    """Host bytes of one main-KV page in MXFP4 (values + scales)."""
-    rows = page_rows(page_bytes)
-    return rows * (ROW_VALUES // 2 + SCALES_PER_ROW)
+    """Host bytes of one main-KV page in MXFP4 (values + scales + tile padding)."""
+    return stage_rows(page_rows(page_bytes)) * ROW_VALUES
 
 
-def staging_shape(page_bytes: int, slots: int) -> tuple[int, int, int]:
-    rows = page_rows(page_bytes)
-    return (slots, rows * ROW_SLOTS + rows * SCALES_PER_ROW // 128, 128)
+def staging_shape(page_bytes: int, slots: int) -> tuple[int, int, int, int]:
+    """``[slots, stage_rows, 4, 256]`` uint8: the pool's own row shape, so the PD
+    repack's aliased DMA row writer stores into it in place."""
+    return (slots, stage_rows(page_rows(page_bytes)), ROW_SLOTS, ROW_LANES)
 
 
 # -- the two transforms (JAX; traced inside pallas.jax_op) ---------------------
@@ -160,20 +174,43 @@ def _bucket(n: int) -> int:
 
 
 class Fp4Transcoder:
-    """One worker's main-class regions, their staging buffers and the two programs."""
+    """One worker's main-class regions, their staging buffers and the two programs.
+
+    ``pools`` are the model's own typed FP8 region tensors (``[pages, kernel rows,
+    *row]``, one 1,024-byte token row per kernel row), never reinterpreted views:
+    the raiden managers (this connector's and the PD connector's) pin each
+    storage's current device buffer, and a program that writes a view of another
+    dtype rebinds the storage to a new buffer, which the PD admission then finds
+    without its TPU layout. Both programs therefore move pool rows only by DMA,
+    as the PD repack does: ``dma_row_gather`` reads pages as uint8 rows, and the
+    aliased DMA row writer (``_write_main_cache_universal``, donated, with the
+    ``copy_`` writeback inside ``torch.compile``) stores into the pool and the
+    staging buffer in place.
+    """
 
     def __init__(self, pools: dict[int, torch.Tensor], page_bytes: int, slots: int):
-        # region -> the pool region as a uint8 view [num_blocks, rows, 4, 256]
         self.pools = dict(pools)
         self.page_bytes = page_bytes
         self.rows = page_rows(page_bytes)
         self.slots = slots
+        for r, p in self.pools.items():
+            kr = int(p.shape[1])
+            if (
+                p.dim() < 3
+                or math.prod(p.shape[2:]) * p.element_size() != ROW_VALUES
+                or self.rows % kr
+                or kr % TILE
+            ):
+                raise ValueError(
+                    f"VLLM_TPU_OFFLOAD_FP4: region {r} tensor {tuple(p.shape)} {p.dtype} is not "
+                    f"[pages, k*{TILE} rows, 1,024-byte row] for a {self.rows}-row page"
+                )
         self.staging: dict[int, torch.Tensor] = {
             r: torch.zeros(staging_shape(page_bytes, slots), dtype=torch.uint8, device=p.device)
             for r, p in self.pools.items()
         }
-        self._quant: dict[int, object] = {}
-        self._dequant: dict[int, object] = {}
+        self._quant: dict[tuple, object] = {}
+        self._dequant: dict[tuple, object] = {}
         self._ops: dict[str, object] = {}
 
     @property
@@ -184,21 +221,41 @@ class Fp4Transcoder:
         op = self._ops.get(kind)
         if op is not None:
             return op
+        import functools
+
         import jax
         import jax.numpy as jnp
         from jax import lax
         from torch_tpu._internal import pallas
 
-        rows = self.rows
+        from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import _write_main_cache_universal
+        from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import dma_row_gather
+
+        write = functools.partial(_write_main_cache_universal, tile=TILE, overlap_edges=True)
+        rows, prow = self.rows, packed_rows(self.rows)
+        srow = stage_rows(self.rows)
+
+        def flat_rows(ids, per):
+            return (ids.astype(jnp.int32)[:, None] * per + jnp.arange(per, dtype=jnp.int32)).reshape(-1)
+
+        def store(target, values, flat):
+            # values [n, *target row]; flat rows into target [pages, page rows, *row].
+            valid = jnp.ones(flat.shape, jnp.bool_)
+            return write(target, values, flat // target.shape[1], flat, valid)
+
         if kind == "quant":
             # pallas.jax_op reads the argument types from the annotations.
             def quant_fn(
                 pool: jax.Array, staging: jax.Array, blocks: jax.Array, slots: jax.Array
             ) -> tuple[jax.Array, jax.Array]:
-                pages = pool[blocks.astype(jnp.int32)]
-                return staging.at[slots.astype(jnp.int32)].set(
-                    quantize_pages(pages, jnp, lax)
-                ), slots[0]
+                n = blocks.shape[0]
+                stage = pool.reshape(-1, ROW_SLOTS, ROW_LANES)
+                pages = dma_row_gather(stage, flat_rows(blocks, rows), out_dtype=jnp.uint8)
+                q = quantize_pages(pages.reshape(n, rows, ROW_SLOTS, ROW_LANES), jnp, lax)
+                q = q.reshape(n, prow, ROW_SLOTS, ROW_LANES)
+                q = jnp.pad(q, ((0, 0), (0, srow - prow), (0, 0), (0, 0)))
+                values = q.reshape(-1, ROW_SLOTS, ROW_LANES)
+                return store(staging, values, flat_rows(slots, srow)), slots[0]
 
             op = pallas.jax_op("pallas::qwen4_offload_fp4_quant", quant_fn, donate_argnums=(1,))
             op.register_fake(
@@ -212,8 +269,12 @@ class Fp4Transcoder:
             def dequant_fn(
                 pool: jax.Array, staging: jax.Array, slots: jax.Array, blocks: jax.Array
             ) -> tuple[jax.Array, jax.Array]:
-                pages = dequantize_pages(staging[slots.astype(jnp.int32)], rows, jnp, lax)
-                return pool.at[blocks.astype(jnp.int32)].set(pages), blocks[0]
+                n = slots.shape[0]
+                staged = staging[slots.astype(jnp.int32)][:, :prow]  # uint8: a plain gather is exact
+                staged = staged.reshape(n, rows * ROW_SLOTS + rows * SCALES_PER_ROW // 128, 128)
+                pages = dequantize_pages(staged, rows, jnp, lax)  # uint8 FP8 bytes
+                values = lax.bitcast_convert_type(pages, pool.dtype).reshape(-1, *pool.shape[2:])
+                return store(pool, values, flat_rows(blocks, rows)), blocks[0]
 
             op = pallas.jax_op("pallas::qwen4_offload_fp4_dequant", dequant_fn, donate_argnums=(0,))
             op.register_fake(
@@ -284,32 +345,39 @@ class Fp4Transcoder:
 
     def warmup_and_selftest(self) -> dict:
         """Compiles every bucket of both programs on block 0 (vLLM's null block, never
-        read) and checks the round trip on a scratch region of random FP8 values."""
+        read) and checks the round trip on scratch tensors of random FP8 values."""
         for b in BUCKETS:
             self.quantize([(0, i) for i in range(b)])
             self.dequantize([(b - 1, 0)] * b)
         return self.selftest()
 
     def selftest(self) -> dict:
-        """Round trip of one page of random FP8 values through both transforms, on
-        the device, on scratch tensors of the same programs' shapes (bucket 1)."""
+        """Round trip of one page of random FP8 values through both programs on the
+        device, on a scratch pool of the region tensor's dtype and row shape."""
         if not self.pools:
             return {}
-        r0 = next(iter(self.pools))
-        dev = self.pools[r0].device
+        pool = next(iter(self.pools.values()))
+        dev = pool.device
+        kr = int(pool.shape[1])
         rng = np.random.default_rng(0)
         vals = (rng.standard_normal((2, self.rows, ROW_SLOTS, ROW_LANES)) * 4).astype(np.float32)
         vals[0, :, :, :32] *= 50.0  # a group near the FP8 range
         f8 = torch.from_numpy(vals).to(torch.float8_e4m3fn)
         ref = f8.to(torch.float32).numpy()
-        scratch_pool = f8.view(torch.uint8).to(dev)
+        scratch_pool = (
+            f8.view(torch.uint8).reshape(2 * self.rows // kr, kr, *pool.shape[2:])
+            .view(pool.dtype).to(dev)
+        )
         scratch_stage = torch.zeros(staging_shape(self.page_bytes, 2), dtype=torch.uint8, device=dev)
         q = self._program("quant", 1)
         d = self._program("dequant", 1)
         one = lambda v: torch.tensor([v], dtype=torch.int32).to(dev)
         q(scratch_pool, scratch_stage, one(0), one(0))
         d(scratch_pool, scratch_stage, one(0), one(1))  # slot 0 -> block 1
-        back = scratch_pool.cpu().view(torch.float8_e4m3fn).to(torch.float32).numpy()[1]
+        back = (
+            scratch_pool.cpu().view(torch.uint8).view(torch.float8_e4m3fn)
+            .to(torch.float32).numpy().reshape(2, self.rows, ROW_SLOTS, ROW_LANES)[1]
+        )
         src = ref[0]
         err = np.abs(back - src)
         rel = float(np.sqrt(np.mean(err**2)) / max(np.sqrt(np.mean(src**2)), 1e-12))
@@ -319,6 +387,7 @@ class Fp4Transcoder:
             "finite": bool(np.isfinite(back).all()),
             "staging_gb": round(self.staging_bytes / 1e9, 2),
             "regions": len(self.pools),
+            "pool": f"{tuple(pool.shape)} {pool.dtype}",
         }
         logger.info("offload fp4: transcode self-test %s", out)
         if not out["finite"] or rel > 0.2:

@@ -321,10 +321,28 @@ def _planned_region_storages(
     return {r: by_region[r] for r in sorted(by_region)}, group_regions
 
 
-def _build_fp4_transcoder(kv_cache_config, pool_storages, group_regions, num_blocks):
+def _region_tensor(kv_caches, storage) -> torch.Tensor:
+    """The model's own typed tensor spanning the whole of ``storage`` (the raw region
+    tensor the cache kernels write in place), not a view of another dtype."""
+    for layer_kv_cache in kv_caches.values():
+        tensors = [layer_kv_cache] if isinstance(layer_kv_cache, torch.Tensor) else layer_kv_cache
+        for t in tensors:
+            if (
+                t.untyped_storage().data_ptr() == storage.data_ptr()
+                and t.storage_offset() == 0
+                and t.numel() * t.element_size() == storage.nbytes()
+                and t.is_contiguous()
+            ):
+                return t
+    raise ValueError(
+        "VLLM_TPU_OFFLOAD_FP4: no layer tensor spans a whole main-KV region storage"
+    )
+
+
+def _build_fp4_transcoder(kv_cache_config, kv_caches, pool_storages, group_regions, num_blocks):
     """VLLM_TPU_OFFLOAD_FP4: this worker's main-KV regions (the groups the plan calls
-    ``main``) as uint8 views ``[num_blocks, rows, 4, 256]``, the pool's own row
-    shape, with one staging buffer each; registered for raiden_store._tier_worker."""
+    ``main``) as the model's typed region tensors, with one staging buffer each;
+    registered for raiden_store._tier_worker."""
     from vllm_torchtpu.models.vllm.qwen4_exp.offload import tier_group_kind
     from vllm_torchtpu.offload import fp4
 
@@ -338,26 +356,23 @@ def _build_fp4_transcoder(kv_cache_config, pool_storages, group_regions, num_blo
     pools: dict[int, torch.Tensor] = {}
     page = None
     for r in sorted(regions):
-        storage, device = pool_storages[r]
+        storage, _ = pool_storages[r]
         page = storage.nbytes() // num_blocks
-        rows = fp4.page_rows(page)
-        pools[r] = (
-            torch.empty(0, dtype=torch.uint8, device=device)
-            .set_(storage)
-            .view(num_blocks, rows, fp4.ROW_SLOTS, fp4.ROW_LANES)
-        )
+        fp4.page_rows(page)  # validates the page geometry
+        pools[r] = _region_tensor(kv_caches, storage)
     if page is None:
         page = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
     t = fp4.Fp4Transcoder(pools, page, tpu_envs.VLLM_TPU_OFFLOAD_FP4_SLOTS)
     fp4.set_transcoder(t)
     logger.info(
         "offload fp4: main-KV regions %s, %d staging slots each (%.2f GB), FP4 page %d B "
-        "of a %d B page",
+        "of a %d B page, pools %s",
         sorted(regions),
         t.slots,
         t.staging_bytes / 1e9,
         fp4.fp4_page_bytes(page),
         page,
+        {r: f"{tuple(p.shape)} {p.dtype}" for r, p in pools.items()},
     )
     return t
 
@@ -1143,7 +1158,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # transcoder's staging buffers (raiden_store._tier_worker).
             assert group_regions is not None, "VLLM_TPU_OFFLOAD_FP4 needs the tier classes"
             fp4_t = _build_fp4_transcoder(
-                self.connector_worker.kv_cache_config, pool_storages, group_regions, num_blocks
+                self.connector_worker.kv_cache_config, kv_caches, pool_storages, group_regions, num_blocks
             )
         self.connector_worker._init_worker(
             CanonicalKVCaches(tensors=pool_tensors, group_data_refs=group_data_refs)
