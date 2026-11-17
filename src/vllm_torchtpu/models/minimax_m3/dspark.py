@@ -57,7 +57,7 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
-from vllm_torchtpu.layers.adapter import cp_draft_attention
+from vllm_torchtpu.layers.adapter import cp_draft_attention, cp_draft_head_split
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
@@ -143,8 +143,11 @@ def _rank_rows_blocker(model: nn.Module, dcp: int, kv_head_replicas: int) -> str
     None."""
     for layer in model.layers:
         attn = layer.self_attn
-        if getattr(attn.attn.impl, "sharded_draft_dcp", None) is None:
+        sharded = getattr(attn.attn.impl, "sharded_draft_dcp", None)
+        if sharded is None:
             return "a draft layer keeps its KV replicated"
+        if sharded.get("head_split"):
+            return "the draft KV is head-split (draft_kv_head_split; no K/V gather)"
         proj = attn.qkv_proj
         if not isinstance(
             proj.quant_method, (MiniMaxM3Mxfp8LinearMethod, VllmUnquantizedLinearMethod)
@@ -346,11 +349,14 @@ def _flipped_weight(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor | Non
     return linear.weight
 
 
-def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+def _column_parallel(
+    linear: nn.Module, x: torch.Tensor, force: bool = False
+) -> torch.Tensor:
     """``linear(x)`` for a TP-replicated linear: with additional_config
-    minimax_dspark_split_fc (r6), each rank computes 1/tp of the output
-    columns, reading 1/tp of the weight, then the ranks all-gather."""
-    if not SPLIT_FC:
+    minimax_dspark_split_fc (r6) or ``force`` (the head-split draft KV, as
+    r10), each rank computes 1/tp of the output columns, reading 1/tp of the
+    weight, then the ranks all-gather."""
+    if not (SPLIT_FC or force):
         return linear(x)
     weight = _flipped_weight(linear, x.dtype)
     tp = get_tensor_model_parallel_world_size()
@@ -362,13 +368,14 @@ def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_all_gather(part, dim=-1)
 
 
-def _context_kv(attn: nn.Module, context: torch.Tensor):
+def _context_kv(attn: nn.Module, context: torch.Tensor, force: bool = False):
     """A draft layer's K and V of the context tokens. Only the qkv_proj's K/V
     columns when its weight is a plain matrix: the Q columns would be
     discarded (1024 of this rank's 1280 for MiniMax-M3's draft at TP8).
     Only with additional_config minimax_dspark_split_fc (r6); else the whole
-    qkv_proj."""
-    weight = _flipped_weight(attn.qkv_proj, context.dtype) if SPLIT_FC else None
+    qkv_proj. ``force``: as with the key (the head-split draft KV)."""
+    split = SPLIT_FC or force
+    weight = _flipped_weight(attn.qkv_proj, context.dtype) if split else None
     if weight is None:
         qkv, _ = attn.qkv_proj(context)
         kv = qkv[:, attn.q_size :]
@@ -421,6 +428,62 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
 
     # Set by `prepare_rank_rows_context_kv` (sharded draft DCP only).
     rank_rows_context_kv: dict | None = None
+    # One write op for every layer's head-split context K/V
+    # (`cp_draft_head_split.write_layers_op`), set by `prepare_draft_kv_write`.
+    _head_split_kv_write_op = None
+    _head_split_context = False
+
+    def prepare_draft_kv_write(self) -> None:
+        """Build the all-layer head-split K/V write (outside any compiled
+        forward) when every layer keeps its KV head-split with the same
+        sharding (additional_config draft_kv_head_split)."""
+        configs = set()
+        for layer in self.layers:
+            cfg = getattr(layer.self_attn.attn.impl, "sharded_draft_dcp", None)
+            if cfg is None or not cfg.get("head_split"):
+                configs.add(None)
+                continue
+            configs.add(
+                (
+                    cfg["dcp"],
+                    min(cfg["dcp"], cfg["kv_head_replicas"]),
+                    cfg["k_scale"],
+                    cfg["v_scale"],
+                )
+            )
+        if len(configs) == 1 and None not in configs:
+            # As r10: fc split by columns over TP and K/V-only projections
+            # (every rank projects all context rows for its own KV head).
+            self._head_split_context = True
+            self._head_split_kv_write_op = cp_draft_head_split.write_layers_op(
+                *configs.pop(), len(self.layers)
+            )
+            logger.info(
+                "MiniMax DSpark: one head-split context K/V write for %d draft "
+                "layers.",
+                len(self.layers),
+            )
+
+    def _write_head_split_context_kv(self, context, positions, metadata) -> None:
+        """Every layer's own-head context K/V through the one all-layer write."""
+        keys, values = [], []
+        for layer in self.layers:
+            attn = layer.self_attn
+            k, v = _context_kv(attn, context, force=True)
+            k = _per_head_norm(k, attn.k_norm, attn.head_dim)
+            k, _ = attn.rotary_emb(positions, k, None)
+            shape = (context.shape[0], attn.num_kv_heads, attn.head_dim)
+            keys.append(k.reshape(shape))
+            values.append(v.reshape(shape))
+        attns = [layer.self_attn.attn for layer in self.layers]
+        cp_draft_head_split.write_layers_with_dcp(
+            keys=torch.stack(keys),
+            values=torch.stack(values),
+            kv_caches=[attn.kv_cache for attn in attns],
+            attn_metadata=metadata,
+            dcp_rank=attns[0].draft_dcp_rank,
+            op=self._head_split_kv_write_op,
+        )
 
     def store_context_kv(
         self,
@@ -444,11 +507,20 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         if self.rank_rows_context_kv is not None:
             return store_context_kv_rank_rows(self, aux, positions, metadata)
         target_hidden_states = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
-        context = self.hidden_norm(_column_parallel(self.fc, target_hidden_states))
+        context = self.hidden_norm(
+            _column_parallel(
+                self.fc, target_hidden_states, force=self._head_split_context
+            )
+        )
         num_tokens = context.shape[0]
+        if self._head_split_kv_write_op is not None and all(
+            m is metadata[0] for m in metadata
+        ):
+            self._write_head_split_context_kv(context, positions, metadata[0])
+            return context
         for layer, layer_metadata in zip(self.layers, metadata, strict=True):
             attn = layer.self_attn
-            k, v = _context_kv(attn, context)
+            k, v = _context_kv(attn, context, force=self._head_split_context)
             k = _per_head_norm(k, attn.k_norm, attn.head_dim)
             k, _ = attn.rotary_emb(positions, k, None)
             impl = attn.attn.impl

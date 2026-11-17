@@ -70,6 +70,15 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # columns over the TP ranks (+ all-gather), and only the K/V columns of
     # each draft qkv_proj, when the weights are plain flipped matrices.
     "minimax_dspark_split_fc": False,
+    # DCP-sharded draft KV (draft_kv_over_dcp sharded/auto), r10's head-split
+    # layout (`layers/adapter/cp_draft_head_split.py`): each rank stores only
+    # its own draft KV head, the head's tensor-parallel replicas split its
+    # tokens, so the context K/V write moves no K/V between ranks and one op
+    # writes every draft layer; draft attention gathers queries and merges
+    # partials over the head's ranks only. Same page bytes (KV cache spec
+    # unchanged). Not bitwise: the window attention kernel and the merge
+    # order differ (ulp-level, draft tokens only).
+    "draft_kv_head_split": False,
     # Raiden KV offload: local loads in host-block order (and the load's fresh
     # device blocks permuted to match), stores in device-block order, so
     # consecutive runs move as one copy per KV array. The block pool's

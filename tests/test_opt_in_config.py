@@ -171,6 +171,8 @@ NEW_KEYS = {
     # r10 did this unconditionally (no env var).
     "skip_device_sampling_metadata",
     "spec_vocab_argmax_masked",
+    # --- r7: head-split DCP draft KV (r10) ---
+    "draft_kv_head_split",
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.

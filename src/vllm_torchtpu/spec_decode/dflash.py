@@ -62,6 +62,9 @@ _FINE_DRAFT_BUCKETS_FROM = 64
 # --additional-config key: keep an opted-in drafter's KV DCP-sharded or whole
 # per rank (`_shards_draft_kv_over_dcp`). Part of the compile-cache key.
 DRAFT_KV_OVER_DCP_KEY = "draft_kv_over_dcp"
+# --additional-config key (opt_in_config): the sharded draft KV's head-split
+# layout (`_draft_kv_head_split`).
+DRAFT_KV_HEAD_SPLIT_KEY = "draft_kv_head_split"
 
 
 @contextlib.contextmanager
@@ -342,11 +345,17 @@ class DFlashProposer:
                             dcp_rank=get_dcp_group().rank_in_group,
                             kv_head_replicas=self._draft_kv_head_replicas(),
                             max_query_len=self.block_size,
+                            head_split=self._draft_kv_head_split(),
                         )
                     attn_impl.initialize_kernel(attn_obj)
             prepare = getattr(self.draft_model, "prepare_sharded_context_kv", None)
             if dcp > 1 and callable(prepare):
                 prepare(get_dcp_group(), dcp, self._draft_kv_head_replicas())
+            prepare_kv_write = getattr(
+                self.draft_model.model, "prepare_draft_kv_write", None
+            )
+            if dcp > 1 and callable(prepare_kv_write):
+                prepare_kv_write()
 
     def _shards_draft_kv_over_dcp(self, attn_impl: PallasAttentionBackendImpl) -> bool:
         """Whether this draft layer keeps its KV DCP-sharded like the target's
@@ -385,6 +394,22 @@ class DFlashProposer:
             attn_impl.use_causal_mask,
         )
         return shard
+
+    def _draft_kv_head_split(self) -> bool:
+        """additional_config draft_kv_head_split: the DCP-sharded draft KV in
+        r10's head-split layout (`cp_draft_head_split`)."""
+        on = bool(option(self.vllm_config.additional_config, DRAFT_KV_HEAD_SPLIT_KEY))
+        if on:
+            logger.info_once(
+                "Draft KV under DCP: head-split layout (additional_config.%s); "
+                "KV head ranks %d",
+                DRAFT_KV_HEAD_SPLIT_KEY,
+                min(
+                    self.vllm_config.parallel_config.decode_context_parallel_size,
+                    self._draft_kv_head_replicas(),
+                ),
+            )
+        return on
 
     def _draft_kv_head_replicas(self) -> int:
         """Tensor-parallel ranks per draft KV head."""

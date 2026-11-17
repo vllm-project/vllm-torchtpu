@@ -52,7 +52,7 @@ from vllm_torchtpu.block_major_pool import (
     unified_block_major_enabled,
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import get_dcp_kv_head_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     indexer_kv_layout,
@@ -79,6 +79,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.adapter import cp_draft_attention as _cp_draft_attention
+from vllm_torchtpu.layers.adapter import cp_draft_head_split as _cp_draft_head_split
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
@@ -1173,9 +1174,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         dcp_rank: int,
         kv_head_replicas: int,
         max_query_len: int,
+        head_split: bool = False,
     ) -> None:
         """Keep this (drafter, sliding-window) layer's KV DCP-sharded like the
         target's (`cp_draft_attention`) instead of whole on every rank.
+
+        ``head_split`` (additional_config draft_kv_head_split): each rank
+        stores only its own KV head, the head's ranks splitting its tokens
+        (`cp_draft_head_split`), so K/V writes cross no rank.
 
         The rank is a buffer of `layer`, so every rank traces one program.
         """
@@ -1190,6 +1196,33 @@ class PallasAttentionBackendImpl(AttentionImpl):
         quantized = bool(self.kv_cache_quantized_dtype)
         k_scale = layer._k_scale_float if quantized else None
         v_scale = layer._v_scale_float if quantized else None
+        if head_split:
+            if self.num_kv_heads != 1:
+                raise NotImplementedError(
+                    "additional_config.draft_kv_head_split needs one draft KV head "
+                    f"per rank, got {self.num_kv_heads}"
+                )
+            head_ranks = min(dcp, kv_head_replicas)
+            self.sharded_draft_dcp = dict(
+                dcp=dcp,
+                kv_head_replicas=kv_head_replicas,
+                head_split=True,
+                head_group=get_dcp_kv_head_group(head_ranks),
+                k_scale=k_scale,
+                v_scale=v_scale,
+                # Built here, outside any compiled forward (see `build_ops`).
+                ops=_cp_draft_head_split.build_ops(
+                    dcp=dcp,
+                    head_ranks=head_ranks,
+                    max_query_len=max_query_len,
+                    sliding_window=self.sliding_window,
+                    sm_scale=self.scale,
+                    causal=self.use_causal_mask,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                ),
+            )
+            return
         self.sharded_draft_dcp = dict(
             dcp=dcp,
             kv_head_replicas=kv_head_replicas,
@@ -1222,6 +1255,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
     ) -> None:
         """Write the drafter's context K/V into its DCP-sharded cache."""
         args = self._sharded_draft_dcp_args(layer)
+        if args.get("head_split"):
+            _cp_draft_head_split.write_with_dcp(
+                key=key.view(key.shape[0], self.num_kv_heads, self.head_size),
+                value=value.view(value.shape[0], self.num_kv_heads, self.head_size),
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                **args,
+            )
+            return
         _cp_draft_attention.write_with_dcp(
             key=key.view(key.shape[0], self.num_kv_heads, self.head_size),
             value=value.view(value.shape[0], self.num_kv_heads, self.head_size),
@@ -1606,7 +1648,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
             key = torch.nn.functional.pad(key, (0, pad_size))
             value = torch.nn.functional.pad(value, (0, pad_size))
         if self.sharded_draft_dcp is not None:
-            outputs = _cp_draft_attention.forward_with_dcp(
+            forward_with_dcp = (
+                _cp_draft_head_split.forward_with_dcp
+                if self.sharded_draft_dcp.get("head_split")
+                else _cp_draft_attention.forward_with_dcp
+            )
+            outputs = forward_with_dcp(
                 query=query,
                 key=key,
                 value=value,

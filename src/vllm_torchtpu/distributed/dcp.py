@@ -91,6 +91,44 @@ def _validate_dcp_rank_alignment(group: Any, dcp_size: int) -> None:
         )
 
 
+_KV_HEAD_GROUPS: dict[int, Any] = {}
+
+
+def get_dcp_kv_head_group(head_ranks: int) -> Any | None:
+    """The ``head_ranks`` consecutive ranks of this rank's DCP group that
+    hold its KV head (the head's tensor-parallel replicas inside the group),
+    or None for one rank; the DCP group itself when it is one head's.
+
+    Built once per size and collectively (creating a process group is a
+    collective): every rank must first call this at the same point, as the
+    draft layers' setup does (`cp_draft_head_split`)."""
+    if head_ranks == 1:
+        return None
+    group = get_dcp_group()
+    assert group is not None and int(group.world_size) % head_ranks == 0
+    if head_ranks == int(group.world_size):
+        return group
+    if head_ranks not in _KV_HEAD_GROUPS:
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import (
+            get_world_group,
+            init_model_parallel_group,
+        )
+
+        # Rank r of the DCP group sits at global rank lane * dcp + r, so the
+        # head's ranks are runs of head_ranks consecutive global ranks.
+        _validate_dcp_rank_alignment(group, int(group.world_size))
+        world = get_world_group()
+        size = int(world.world_size)
+        _KV_HEAD_GROUPS[head_ranks] = init_model_parallel_group(
+            [list(range(i, i + head_ranks)) for i in range(0, size, head_ranks)],
+            world.local_rank,
+            dist.get_backend(world.device_group),
+            group_name=f"dcp_kv_head_{head_ranks}",
+        )
+    return _KV_HEAD_GROUPS[head_ranks]
+
+
 def _single_device_dcp_mesh(axis_names: tuple[str, str]) -> Any:
     """The mesh before distributed init: one device, both axes length 1."""
     import jax
