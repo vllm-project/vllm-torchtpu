@@ -568,12 +568,13 @@ def _select_fp8_indexer_jax(
         unordered=unordered,
     )
     chunk_rows = prefill_chunk_rows or indexer_query_rows(tokens, query_tile)
-    # Decode top-k scans only the blocks that can hold a winner. Publishing
-    # layers rank the same SparseCore block maxima for their candidates.
+    # Top-k scans only the blocks that can hold a winner. Publishing layers
+    # rank the same SparseCore block maxima for their candidates. A prefill
+    # tile of 256 x 65,536 selects in 113 us on SparseCore, against 180 us
+    # for the streaming top-k, so scoring sets the pipeline's pace.
     select_block = block_size if publish_rows else _BLOCK_TOPK_BLOCK
     block_select = (
         stream_select
-        and prefill_chunk_rows is None
         and chunk_rows is not None
         and block_topk.is_supported(chunk_rows, capacity, topk, select_block)
     )
