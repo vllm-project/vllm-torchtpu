@@ -179,6 +179,39 @@ def _fp4_scales(scale_ref, k_row, v_row):
     return jnp.where(jnp.isfinite(sk), sk, 0.0), jnp.where(jnp.isfinite(sv), sv, 0.0)
 
 
+def _fp4_ints(kv_ref) -> jax.Array:
+    """Int4 rows ``[S, 2D]`` of a 4-bit page in slot order (unscaled)."""
+    words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
+    return pltpu.bitcast(words, jnp.int4)
+
+
+# `prefill_precision_levers` "pv8": V enters the MXU as its exact int4 values
+# in fp8, and the probabilities carry the V scale times _PV8_UNIT (lifting
+# p * scale out of fp8's subnormal range), capped so that p * scale * unit
+# stays within fp8's range (V scales above _FP8_MAX / _PV8_UNIT = 7, |v| ~ 50,
+# would saturate); the output divides the unit out.
+_PV8_UNIT = 64.0
+_FP8_MAX = 448.0
+PREFILL_PRECISION_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
+_PRECISION_LEVERS = ("qk8", "pv8")
+
+
+def prefill_precision_levers(spec: str | None = None) -> frozenset:
+    """Levers of ``envs.TPU_MINIMAX_M3_MSA_PREFILL_PRECISION`` (or `spec`) for
+    4-bit prefill calls with the page cache; read when the program is traced."""
+    if spec is None:
+        from vllm_torchtpu import envs
+
+        spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_PRECISION
+    levers = frozenset(x.strip() for x in spec.replace("/", ",").split(",") if x.strip())
+    bad = levers - set(_PRECISION_LEVERS)
+    if bad:
+        raise ValueError(f"{PREFILL_PRECISION_ENV}: unknown levers {sorted(bad)}")
+    if levers:
+        _proof(PREFILL_PRECISION_ENV, f"MSA prefill attention levers {sorted(levers)}")
+    return levers
+
+
 def _packed_sort_fits(n: int, cache_size: int, key_bound: int) -> bool:
     """Whether `_page_cache`'s packed sorts of `n` entries fit 31 bits."""
     pos_bits = max(1, (n - 1).bit_length())
@@ -366,6 +399,7 @@ def _kernel(
     bf16_cache: bool = False,
     row_split: int = 1,
     tiles_per_head: int = 0,
+    precision: frozenset = frozenset(),
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -417,6 +451,10 @@ def _kernel(
         num_cached = cache_ref[cache_size]
         use_cache = cache_ref[cache_size + 1] != 0
     num_groups = block_start_ref[pl.num_programs(0)]
+    # `precision` levers (4-bit pages, `prefill_precision_levers`).
+    qk8 = fp4 and "qk8" in precision
+    pv8 = fp4 and "pv8" in precision
+    out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
         if not tiles_per_head:
@@ -656,7 +694,7 @@ def _kernel(
             its output is 0 and its lse ``m + log(0) = -inf`` with no select (a
             seen row has ``denom >= 1``)."""
             write(
-                acc * (1.0 / jnp.maximum(denom, 1.0)),
+                acc * (out_unit / jnp.maximum(denom, 1.0)),
                 m * _LN_2 + jnp.log(denom),
                 part,
                 parts,
@@ -778,11 +816,21 @@ def _kernel(
                     if from_bf16:
                         rows = bfc_ref[slot]
                         sk, sv = _fp4_scales(scale_ref, k_row, v_row)
+                    elif qk8 or pv8:
+                        rows = _fp4_ints(kv_ref)  # int4 [S, 2D]
+                        sk, sv = _fp4_scales(scale_ref, k_row, v_row)
                     else:
                         rows, sk, sv = msa_attention._fp4_page(
                             kv_ref, scale_ref, k_row, v_row
                         )
-                    values.append(rows[:, head_dim:])
+                    k_int, v_int = rows[:, :head_dim], rows[:, head_dim:]
+                    # int4 values are exact in fp8; scales apply around the dots.
+                    values.append(
+                        v_int.astype(jnp.float8_e4m3fn if pv8 else jnp.bfloat16)
+                    )
+                    keys.append(
+                        k_int.astype(jnp.float8_e4m3fn if qk8 else jnp.bfloat16)
+                    )
                     k_scales.append(sk)
                     v_scales.append(sv)
                 elif packing == 4:
@@ -794,7 +842,8 @@ def _kernel(
                 else:
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
-                keys.append(rows[:, :head_dim])
+                if not fp4:
+                    keys.append(rows[:, :head_dim])
                 masks.append(slots < limit)  # [Bq, S]
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
@@ -803,6 +852,8 @@ def _kernel(
             if fp4:
                 k_scale = jnp.concatenate(k_scales, axis=1) * scale
                 v_scale = jnp.concatenate(v_scales, axis=1)
+                if pv8:
+                    v_scale = jnp.minimum(v_scale * _PV8_UNIT, _FP8_MAX)
             part_heads = num_heads // row_split
             part_rows = part_heads * block_q
 
@@ -813,6 +864,8 @@ def _kernel(
                 q = q_ref[heads].reshape(part_rows, head_dim)
                 if not fp4:
                     q = (q.astype(jnp.float32) * scale).astype(q.dtype)
+                elif qk8:
+                    q = q.astype(jnp.float8_e4m3fn)
                 s = jax.lax.dot_general(
                     q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
                 )
@@ -947,6 +1000,7 @@ def _attention_call(
     cache_bf16=False,
     row_split=1,
     tiles_per_head=0,
+    precision=frozenset(),
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -1106,6 +1160,7 @@ def _attention_call(
             bf16_cache=bf16_cache,
             row_split=row_split,
             tiles_per_head=tiles_per_head,
+            precision=precision if fp4 else frozenset(),
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1488,6 +1543,7 @@ def _chunked_call(
     row_split=1,
     page_cache_tile_pages=0,
     q_head_major=False,
+    prefill_precision=None,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -1527,7 +1583,12 @@ def _chunked_call(
     )
     cache_size = page_cache_slots if scale_cache is not None else 0
     if cache_size:
-        call = functools.partial(call, cache_size=cache_size, cache_bf16=page_cache_bf16)
+        call = functools.partial(
+            call,
+            cache_size=cache_size,
+            cache_bf16=page_cache_bf16,
+            precision=prefill_precision_levers(prefill_precision),
+        )
     limit = msa_attention.MAX_TOKENS_PER_CALL
     step = min(num_tokens, max(block_q, limit - limit % block_q))
     num_chunks = -(-num_tokens // step)
@@ -1728,6 +1789,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "row_split",
         "page_cache_tile_pages",
         "q_head_major",
+        "prefill_precision",
     ),
 )
 def msa_sparse_attention_lse(
@@ -1753,6 +1815,7 @@ def msa_sparse_attention_lse(
     row_split: int = 1,
     page_cache_tile_pages: int = 0,
     q_head_major: bool = False,
+    prefill_precision: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -1792,6 +1855,7 @@ def msa_sparse_attention_lse(
         row_split=row_split,
         page_cache_tile_pages=page_cache_tile_pages,
         q_head_major=q_head_major,
+        prefill_precision=prefill_precision,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
@@ -1812,6 +1876,7 @@ def msa_sparse_attention_lse(
         "row_split",
         "page_cache_tile_pages",
         "q_head_major",
+        "prefill_precision",
     ),
 )
 def msa_sparse_attention_lse_heads(
@@ -1834,6 +1899,7 @@ def msa_sparse_attention_lse_heads(
     row_split: int = 1,
     page_cache_tile_pages: int = 0,
     q_head_major: bool = False,
+    prefill_precision: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
 
@@ -1883,6 +1949,7 @@ def msa_sparse_attention_lse_heads(
         row_split=row_split,
         page_cache_tile_pages=page_cache_tile_pages,
         q_head_major=q_head_major,
+        prefill_precision=prefill_precision,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
