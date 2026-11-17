@@ -343,6 +343,10 @@ def substitution_runner(device, k):
     runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
     runner._fast_token_substitution = False
+    runner._async_subst_prep_cache = {}
+    runner._async_subst_dev_cache = {}
+    runner._cached_subst_key = None
+    runner._cached_substitution_indices = None
     return runner
 
 

@@ -56,7 +56,10 @@ class TestAttentionMetadataBuilderPlumbing:
         runner._free_h2d_sources = {}
         runner._registered_h2d_sources = set()
         runner._h2d_reuse = {}
-        runner._stage_products_cache = None
+        runner._stage_products_cache = {}
+        runner._cached_staged_block_tables_key = None
+        runner._cached_staged_block_tables = None
+        runner._cached_staged_block_tables_dev = None
         runner.attn_groups = []
         runner._unified_kv_layout = False
         runner.pcp_manager = None

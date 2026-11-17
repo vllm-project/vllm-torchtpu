@@ -142,6 +142,7 @@ def _substitution_runner(manager):
         speculative_config=None,
         _last_sequence_layout_plan=None,
         pcp_manager=manager,
+        _async_subst_prep_cache={},
     )
 
 
@@ -153,7 +154,7 @@ def test_async_substitution_goes_through_the_manager_plan():
     assert cur.tolist() == [100, 102]
     assert src.tolist() == [0, 2]
     # A rank-major mapping is never cached as an identity mapping.
-    assert not getattr(runner, "_async_subst_prep_cache", None)
+    assert runner._async_subst_prep_cache == {}
 
 
 def test_async_substitution_without_the_manager_is_the_cached_identity():
