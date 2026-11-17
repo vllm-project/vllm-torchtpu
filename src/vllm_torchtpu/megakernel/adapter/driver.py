@@ -489,13 +489,17 @@ class ProgramDriver(StepRouting):
                     else EligibilityResult(False, "cache_layout_incompatible", str(exc))
                 )
             except BaseException:
+                self._bound = False
                 # This rank is raising: still vote, so the others decline
                 # instead of waiting in the agreement.
-                agree_on_decline(
-                    EligibilityResult(False, "bind_error", "bind failed"),
-                    group=agreement_group(self._domain, runner),
-                    codes=self._codes,
-                )
+                try:
+                    agree_on_decline(
+                        EligibilityResult(False, "bind_error", "bind failed"),
+                        group=agreement_group(self._domain, runner),
+                        codes=self._codes,
+                    )
+                except Exception:  # the original error is the one to report
+                    logger.exception("Megakernel: voting bind_error failed")
                 raise
             token = None
             if decline is None:
@@ -559,7 +563,11 @@ class ProgramDriver(StepRouting):
                     if is_tpu:
                         from vllm_torchtpu.utils import synchronize_tensors
 
-                        synchronize_tensors([out])
+                        leaves = out if isinstance(out, (tuple, list)) else (out,)
+                        if tensors := [
+                            t for t in leaves if isinstance(t, torch.Tensor)
+                        ]:
+                            synchronize_tensors(tensors)
                     if case.check is not None:
                         case.check(out)
         self.reset_stats()
