@@ -32,8 +32,8 @@ takes the normal upload path. Padding slots keep their previous values, which th
 host also left unchanged (checked).
 
 It runs by rule on a Qwen3.5 MTP engine with batch-1 asynchronous decode
-(max_num_seqs == 1), the configuration that ran it (the band H batch-1 decode
-legs); every other engine keeps the uploads.
+(max_num_seqs == 1), the configuration it was measured on; every other engine
+keeps the uploads.
 """
 
 from __future__ import annotations

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""hostov IT2: the steady-state device carry must reproduce the upload path exactly,
+"""The steady-state device carry must reproduce the upload path exactly,
 and the host-side check must refuse every step where it would not.
 """
 
