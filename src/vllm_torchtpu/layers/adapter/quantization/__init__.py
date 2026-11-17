@@ -38,6 +38,9 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
     VllmDeepseekV4Fp8Config,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+from vllm_torchtpu.layers.adapter.quantization.modelopt_mixed import (
+    VllmModelOptMixedConfig,
+)
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import attach_online_fp8
@@ -74,6 +77,7 @@ def get_tpu_quantization_config(
         quant_methods.FP8: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,
         quant_methods.NVFP4: VllmNvfp4Config,
+        quant_methods.MODELOPT_MIXED: VllmModelOptMixedConfig,
         quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,
         quant_methods.DEEPSEEK_V4_FP8: VllmDeepseekV4Fp8Config,
         # TODO: Add more quantization methods as needed
