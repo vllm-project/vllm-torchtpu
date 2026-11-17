@@ -621,8 +621,9 @@ class TpuCompilerAdaptor(CompilerInterface):
     ) -> bool:
         """Write the bundled entry for `graph` to `path`. True if it landed.
 
-        `fingerprint` is `_graph_fingerprint(graph)` taken before the backend
-        ran, as a peer replaying this artifact computes it.
+        With no entry, logs and returns `False`. `fingerprint` is
+        `_graph_fingerprint(graph)` taken before the backend ran, as a peer
+        replaying this artifact computes it.
         """
         if entry is None:
             logger.info(
