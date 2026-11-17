@@ -56,7 +56,12 @@ def _set_rank0(r: jax.Array, o: jax.Array, R: int) -> jax.Array:
 
 
 @pytest.fixture(autouse=True)
-def _use_cpu_default_device():
+def _use_cpu_default_device(request: pytest.FixtureRequest):
+    # The TPU tests pick their own device and skip when the TPU backend is
+    # unavailable; `jax.devices("cpu")` would raise there instead.
+    if request.node.get_closest_marker("tpu_test") is not None:
+        yield
+        return
     with jax.default_device(jax.devices("cpu")[0]):
         yield
 
