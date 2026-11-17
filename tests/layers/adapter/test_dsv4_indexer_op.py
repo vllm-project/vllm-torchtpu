@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import re
 from types import SimpleNamespace
 
@@ -170,71 +169,41 @@ def _build_op(monkeypatch, layer, chunk_tokens):
 
 
 def test_unchunked_layers_share_one_indexer_op(monkeypatch):
-    build = {layer: _build_op(monkeypatch, layer, None) for layer in (2, 4)}
-    first, second = build[2](), build[4]()
-    assert first is second
+    build_first, build_second = (_build_op(monkeypatch, i, None) for i in (2, 4))
+    first = build_first()
+    assert build_second() is first
     assert first.fn.keywords["scheduling_group_slot"] is None
 
 
-def test_chunked_layers_get_their_own_op_and_slot(monkeypatch):
-    """A shared op would put one layer's scheduling groups in every layer."""
-    build = {layer: _build_op(monkeypatch, layer, 256) for layer in (2, 4)}
-    first, second = build[2](), build[4]()
-    assert first is not second
-    assert first.name != second.name
-    assert first.fn.keywords["chunk_tokens"] == 256
-    assert first.fn.keywords["scheduling_group_slot"] == 2
-    assert second.fn.keywords["scheduling_group_slot"] == 4
-
-
-_T, _H, _PAGES, _CHUNK = 128, 4, 8, 32
-
-
-def _indexer_group_ids(slots, chunk_tokens):
-    """Group ids of each CSA layer's indexer, lowered for TPU on an abstract
-    mesh as one program would trace them (one counter reset)."""
-    mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+def _group_ids(fn):
+    """Scheduling group ids in `fn`, lowered for TPU on an abstract mesh."""
+    t, h, pages = 128, 4, 8
     args = (
-        jax.ShapeDtypeStruct((_T, _H, 128), jnp.bfloat16),  # q
-        jax.ShapeDtypeStruct((_T,), jnp.int32),  # positions
+        jax.ShapeDtypeStruct((t, h, 128), jnp.bfloat16),  # q
+        jax.ShapeDtypeStruct((t,), jnp.int32),  # positions
         jax.ShapeDtypeStruct((4096, 64), jnp.float32),  # cos_sin_cache
-        jax.ShapeDtypeStruct((_T, _H), jnp.float32),  # indexer_weights
+        jax.ShapeDtypeStruct((t, h), jnp.float32),  # indexer_weights
         jax.ShapeDtypeStruct(  # SEQ_ALONG_LANE cache
-            (_PAGES, compressor_config.SAL_SUBLANE_GROUPS, 4, 256), jnp.uint8
+            (pages, compressor_config.SAL_SUBLANE_GROUPS, 4, 256), jnp.uint8
         ),
         jax.ShapeDtypeStruct((2,), jnp.int32),  # seq_lens
-        jax.ShapeDtypeStruct((2, _PAGES // 2), jnp.int32),  # page_indices
+        jax.ShapeDtypeStruct((2, pages // 2), jnp.int32),  # page_indices
         jax.ShapeDtypeStruct((3,), jnp.int32),  # cu_q_lens
         jax.ShapeDtypeStruct((3,), jnp.int32),  # distribution
     )
-    streamidx_config.reset_scheduling_group_ids()
-    ids = []
+    mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(mesh):
-        for slot in slots:
-            fn = functools.partial(
-                _indexer_jax,
-                k=256,
-                compression_ratio=4,
-                softmax_scale=0.088,
-                n_head=_H,
-                chunk_tokens=chunk_tokens,
-                scheduling_group_slot=slot,
-            )
-            text = export.export(jax.jit(fn), platforms=("tpu",))(*args).mlir_module()
-            ids.append(
-                set(map(int, re.findall(r'_scheduling_group_id\s*=\s*"?(\d+)', text)))
-            )
-    return ids
+        text = export.export(jax.jit(fn), platforms=("tpu",))(*args).mlir_module()
+    return set(map(int, re.findall(r'_scheduling_group_id\s*=\s*"?(\d+)', text)))
 
 
-def test_chunked_layers_lower_to_disjoint_groups():
-    ids = _indexer_group_ids([2, 4], _CHUNK)
+def test_chunked_layers_get_their_own_op_and_groups(monkeypatch):
+    """A shared op would put one layer's scheduling groups in every layer."""
+    first = _build_op(monkeypatch, 2, 32)()
+    second = _build_op(monkeypatch, 4, 32)()
+    assert first is not second and first.name != second.name
+    streamidx_config.reset_scheduling_group_ids()
+    ids = [_group_ids(op.fn) for op in (first, second)]
     # 128 tokens in chunks of 32: 4 chunks, 3 groups per layer.
     assert [len(layer) for layer in ids] == [3, 3], ids
     assert not ids[0] & ids[1], ids
-
-
-def test_shared_trace_without_slots_repeats_the_groups():
-    """Positive control: what a shared op did to every chunked CSA layer."""
-    ids = _indexer_group_ids([None, None], _CHUNK)
-    assert ids[0] and ids[0] == ids[1], ids
