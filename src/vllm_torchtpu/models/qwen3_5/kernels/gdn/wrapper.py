@@ -778,6 +778,14 @@ def fused_conv1d_gdn(
         )
         if tiler_shape or dynamic_tiling:
             mixed_tile_size = fit_mixed_tile
+        if tiler_shape:
+            # The chunked solve inverts each chunk in triangular blocks, so a
+            # chunk longer than one block must hold whole blocks. Chunks above
+            # 16 tokens are multiples of 16 already; a smaller batch (say 10
+            # tokens at 32 value heads, blocks of 4) is rounded down here.
+            block = config.gdn_triangular_block_size(n_v)
+            if mixed_tile_size > block:
+                mixed_tile_size -= mixed_tile_size % block
         if dynamic_tiling:
             dyn_decode_tile = fit_decode_tile
         # The decode tile's VMEM ceiling in both modes (the dynamic pick is
