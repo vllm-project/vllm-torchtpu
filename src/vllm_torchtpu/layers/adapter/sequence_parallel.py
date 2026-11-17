@@ -11,18 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sequence-parallel linear and normalization adapter helpers for TPU.
+"""Row gating of sequence-parallel MoE.
 
-Provides fused all-gather, reduce-scatter, and row-gated linear wrappers for
-TP-sharded token sequences.
+A step at or above its layout's row threshold (``min_rows``) slices its rows
+over TP; a smaller one keeps them replicated. The runner records the form of
+the step about to run (``set_active``), and the TPU communicator reads it to
+dispatch and combine the MoE rows accordingly.
 """
 
-from collections.abc import Sequence
 from typing import Any
 
 from vllm_torchtpu import envs
 
-_ACTIVE = False
+# The form of the step about to run. Sliced (main's form) until the runner
+# records one, so a forward traced before the first step, or by a caller that
+# records no form, takes main's path.
+_ACTIVE = True
 
 # Smallest step, in rows, that runs sequence-parallel. Below it the step keeps
 # its rows replicated over TP: slicing a few rows saves less in the MoE than the
@@ -30,10 +34,12 @@ _ACTIVE = False
 # different row count gets an entry in _MIN_ROWS_BY_LAYOUT, keyed on
 # (data_parallel_size, tensor_parallel_size).
 #
-# 0 until a model reads each step's form (rows_are_sliced): with it, every
-# sequence-parallel step stays sliced and every compile size follows main's
-# alignment rule, as on main. The change that makes the model follow the
-# step's form raises the threshold.
+# 0: every sequence-parallel step stays sliced and every compile size follows
+# the TP alignment rule of _configure_sequence_parallel_moe. The model slices
+# every step it runs, so the threshold may rise only once the model follows
+# each step's form (is_active).
+# TODO: raise it, per layout, with the change that makes the Qwen3.5 model
+# follow each step's form.
 DEFAULT_MIN_ROWS = 0
 _MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {}
 
@@ -104,23 +110,7 @@ def is_active() -> bool:
     return _ACTIVE
 
 
-def rows_are_sliced(is_sequence_parallel: bool) -> bool:
-    """Whether a MoE layer's rows are this rank's slice of the step."""
-    return is_sequence_parallel and _ACTIVE
-
-
 def rows_are_replicated(is_sequence_parallel: bool) -> bool:
     """Whether a sequence-parallel MoE layer sees the step's rows replicated
     on every rank (a step below min_rows)."""
     return is_sequence_parallel and not _ACTIVE
-
-
-def check_buckets(compile_sizes: Sequence[int], tp_size: int) -> None:
-    """Raise unless every sequence-parallel bucket splits evenly over TP."""
-    threshold = min_rows()
-    uneven = [n for n in compile_sizes if n >= threshold and n % tp_size]
-    if uneven:
-        raise NotImplementedError(
-            f"TPU_MOE_SEQUENCE_PARALLEL splits token buckets >= {threshold} "
-            f"over tensor_parallel_size={tp_size}; buckets {uneven} do not divide."
-        )

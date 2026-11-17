@@ -104,22 +104,20 @@ def test_set_active_decides_sliced_versus_replicated(monkeypatch, active):
     monkeypatch.setattr(sp, "_ACTIVE", not active)
     sp.set_active(active)
     assert sp.is_active() is active
-    assert sp.rows_are_sliced(True) is active
     assert sp.rows_are_replicated(True) is not active
-    # A layer that is not sequence-parallel is neither.
-    assert not sp.rows_are_sliced(False)
+    # A layer that is not sequence-parallel never sees replicated rows.
     assert not sp.rows_are_replicated(False)
+
+
+def test_before_any_step_is_recorded_the_rows_are_sliced():
+    """A forward traced before the runner records a step's form (or by a
+    caller that records none) takes main's sliced path."""
+    import importlib
+
+    fresh = importlib.reload(sp)
+    assert fresh.is_active() is True
+    assert fresh.rows_are_replicated(True) is False
 
 
 def test_fp8_gather_is_always_on():
     assert sp.fp8_gather() is True
-
-
-@pytest.mark.usefixtures("threshold_512")
-def test_check_buckets_refuses_an_uneven_sliced_bucket(groups):
-    groups(1, 8)
-    sp.check_buckets([8, 256, 512, 1024], tp_size=8)
-    with pytest.raises(NotImplementedError, match="do not divide"):
-        sp.check_buckets([516], tp_size=8)
-    # Below the threshold the bucket is replicated, so it need not divide.
-    sp.check_buckets([12], tp_size=8)

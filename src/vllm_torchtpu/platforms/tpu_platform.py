@@ -1632,6 +1632,8 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     cc = vllm_config.compilation_config
     if cc.compile_sizes is None:
         return
+    # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+    # vllm.platforms while it is still loading (a cycle).
     from vllm_torchtpu.layers.adapter import sequence_parallel
 
     # The engine's layout, not this process's groups: none exist yet here.
