@@ -98,6 +98,10 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.connector_names import (
+    STAGE_TIMING_CONNECTORS,
+    kv_connector_names,
+)
 from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     KVSaveNanCheck,
     begin_kv_save_nan_check,
@@ -1514,35 +1518,26 @@ class TPUModelRunner(GPUModelRunner):
 
         Only with ``tpu_runner.stage_timing`` on (the default), and only when the
         KV connector has a `TpuKVConnectorStats` sink, since the timings feed
-        nothing else. Turning it off saves their per-stage TpuEvent records,
-        about 0.4-0.5 ms per served decode step at batch 1-2 under P/D (chunk
-        median 3.99 -> 3.56 ms, j-d4cdaa23 vs j-a0ce6156).
+        nothing else. Turning it off skips their per-stage TpuEvent records,
+        which cost host time on every step.
         """
         return options.stage_timing and kv_uses_stage_timing
 
     @staticmethod
     def _kv_transfer_uses_stage_timing(vllm_config: Any) -> bool:
-        """Whether `vllm_config.kv_transfer_config` has a `TpuKVConnectorStats`
-        sink (`TPUConnector` / `TPURaidenConnector`) that consumes
-        `RunnerStageTiming` samples (`tpu_runner.py:get_finished_kv_transfers`).
-        Single-instance CPU offload (`TPURaidenOffloadingConnector` /
-        `OffloadingConnector`) has no TPU timing sink and discards all samples.
+        """Whether a connector in effect (the configured one, or a child of a
+        multi-connector) has a `TpuKVConnectorStats` sink
+        (`STAGE_TIMING_CONNECTORS`) that consumes `RunnerStageTiming` samples
+        (`get_finished_kv_transfers`). Single-instance CPU offload
+        (`TPURaidenOffloadingConnector` / `OffloadingConnector`) has no TPU
+        timing sink and discards all samples.
         """
-        kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
+        kv_cfg = vllm_config.kv_transfer_config
         if kv_cfg is None:
             return False
-        conn = getattr(kv_cfg, "kv_connector", None)
-        if conn in ("TPUConnector", "TPURaidenConnector"):
-            return True
-        if conn in ("TPUMultiConnector", "MultiConnector"):
-            extra = getattr(kv_cfg, "kv_connector_extra_config", None) or {}
-            for sub in extra.get("connectors", ()):
-                if isinstance(sub, dict) and sub.get("kv_connector") in (
-                    "TPUConnector",
-                    "TPURaidenConnector",
-                ):
-                    return True
-        return False
+        return any(
+            name in STAGE_TIMING_CONNECTORS for name in kv_connector_names(kv_cfg)
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
