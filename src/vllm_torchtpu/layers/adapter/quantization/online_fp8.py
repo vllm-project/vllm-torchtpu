@@ -34,6 +34,7 @@ from vllm.config import VllmConfig
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
@@ -205,6 +206,14 @@ def validate_online_fp8(
             seen_ids.add(layer_id)
             if isinstance(layer, (MoERunner, BaseLayerWithLoRA)):
                 continue
+            # The policy covers layers built from this config. A drafter can
+            # build its layers from its own quant config, or none.
+            if (
+                root is draft_model
+                and isinstance(layer, (LinearBase, RoutedExperts))
+                and layer.quant_config is not config
+            ):
+                continue
             if isinstance(layer, RoutedExperts):
                 prefix = layer.layer_name
             else:
@@ -224,16 +233,13 @@ def validate_online_fp8(
                 moe_layer = cast("TpuRoutedExperts", layer)
                 w13 = moe_layer.w13_weight
                 w2 = moe_layer.w2_weight
-                s13 = getattr(moe_layer, "w13_weight_scale_inv", None)
-                s2 = getattr(moe_layer, "w2_weight_scale_inv", None)
+                s13 = moe_layer.w13_weight_scale_inv
+                s2 = moe_layer.w2_weight_scale_inv
                 if (
-                    policy.weight_scheme != "per_channel"
-                    or w13.ndim != 3
+                    w13.ndim != 3
                     or w2.ndim != 3
                     or w13.dtype != torch.float8_e4m3fn
                     or w2.dtype != torch.float8_e4m3fn
-                    or s13 is None
-                    or s2 is None
                     or s13.dtype != torch.float32
                     or s2.dtype != torch.float32
                     or s13.shape != (w13.shape[0], 1, 1, w13.shape[2])

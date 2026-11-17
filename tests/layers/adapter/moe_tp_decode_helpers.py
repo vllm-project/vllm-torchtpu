@@ -233,6 +233,7 @@ def install_moe_tp_decode_harness(
     monkeypatch.setattr(
         parallel_state, "get_dp_group", lambda: SimpleNamespace(world_size=1)
     )
+    # The unarmed path's grouped matmul (a TPU kernel): a stand-in.
     monkeypatch.setattr(
         fp8_mod, "fused_moe_gmm", lambda hidden_states, **kw: hidden_states * 0.25
     )

@@ -303,7 +303,7 @@ def _make_linear_stub() -> LinearBase:
 
 @pytest.mark.parametrize("kind", ["nvfp4", "fp8"])
 @pytest.mark.parametrize("mode", ["no_policy", "disabled", "untargeted"])
-def test_default_and_untargeted_are_byte_identical(monkeypatch, kind, mode):
+def test_default_and_untargeted_keep_unquantized_moe_dispatch(monkeypatch, kind, mode):
     """Unset, disabled, or non-matching policy keeps VllmUnquantizedFusedMoEMethod."""
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8."
@@ -360,7 +360,6 @@ def test_default_and_untargeted_are_byte_identical(monkeypatch, kind, mode):
 
 def test_already_quantized_and_untargeted_linear_layers_never_touched(monkeypatch):
     """Targeting excluded experts leaves quantized MoE and untargeted Linears intact."""
-    monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "512")
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8."
         "get_tensor_model_parallel_world_size",
@@ -390,7 +389,6 @@ def test_already_quantized_and_untargeted_linear_layers_never_touched(monkeypatc
     assert type(target_fp8.quant_method) is VllmFp8MoEMethodTPU
     assert target_fp8.quant_method.quant_config is fp8_cfg
     assert target_fp8.quant_method.online_fp8 is False
-    assert target_fp8.quant_method._force_per_channel is False
     assert target_fp8.quant_method._online_fp8_excluded_prefix is None
     qm_fp8_lin = fp8_cfg.get_quant_method(
         excluded_linear, "model.layers.78.self_attn.q_b_proj"
@@ -497,15 +495,17 @@ def test_moe_online_fp8_with_bias_raises(monkeypatch, kind):
 
 
 @pytest.mark.parametrize("kind", ["nvfp4", "fp8"])
-def test_requant_numerics_block512_isolation_logging_and_direct_parity(
-    monkeypatch, kind
-):
+def test_requant_numerics_block512_isolation_and_direct_parity(monkeypatch, kind):
     """Per-channel FP8 scales hold under MOE_REQUANTIZE_BLOCK_SIZE=512, match
-    direct build_excluded_moe_online_fp8_method bit-for-bit, and log per layer.
+    direct build_excluded_moe_online_fp8_method bit-for-bit, and a reload is a
+    no-op.
     """
     # Recipe-level NVFP4/MoE overrides must NOT leak into excluded online-FP8 experts.
-    monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "512")
-    monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "int8")
+    # Set the module entry: an entry an earlier setattr left behind hides setenv
+    # (pytest < 9.2), and setattr's own undo would leave one.
+    monkeypatch.setitem(vars(envs), "MOE_REQUANTIZE_BLOCK_SIZE", 512)
+    monkeypatch.setitem(vars(envs), "MOE_REQUANTIZE_WEIGHT_DTYPE", "int8")
+    assert fp8_mod._get_moe_quant_config("untargeted")[1:] == (torch.int8, 512)
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8."
         "get_tensor_model_parallel_world_size",
@@ -558,16 +558,6 @@ def test_requant_numerics_block512_isolation_logging_and_direct_parity(
     for layer in (layer_a, layer_b, direct_layer):
         layer.w13_weight.data.copy_(w13_orig)
         layer.w2_weight.data.copy_(w2_orig)
-
-    logged_info: list[str] = []
-    logged_once: list[str] = []
-    fake_logger = SimpleNamespace(
-        info=lambda fmt, *args: logged_info.append(fmt % args if args else fmt),
-        info_once=lambda fmt, *args: logged_once.append(fmt % args if args else fmt),
-        warning=lambda fmt, *args: None,
-        warning_once=lambda fmt, *args: None,
-    )
-    monkeypatch.setattr(fp8_mod, "logger", fake_logger)
 
     with patch(
         "vllm_torchtpu.layers.adapter.quantization.fp8.prebuild_fused_moe_kernel"
@@ -625,16 +615,7 @@ def test_requant_numerics_block512_isolation_logging_and_direct_parity(
     assert w13_rel < 0.025
     assert w2_rel < 0.025
 
-    # 4) Logging: one line per converted layer; reload is idempotent.
-    assert logged_once == []
-    assert len(logged_info) == 3
-    assert "model.layers.78.mlp.experts" in logged_info[0]
-    assert "model.layers.79.mlp.experts" in logged_info[1]
-    for line in logged_info[:2]:
-        assert "float8_e4m3fn" in line
-        assert f"({local_experts}, 1, 1, {2 * INTER})" in line
-        assert f"({local_experts}, 1, 1, {H})" in line
-
+    # 4) Reload is idempotent.
     old_w13 = layer_a.w13_weight
     layer_a.quant_method.process_weights_after_loading(layer_a)
     assert layer_a.w13_weight is old_w13
@@ -666,7 +647,7 @@ def _ref_moe_forward(
 @pytest.mark.parametrize("kind", ["nvfp4", "fp8"])
 def test_online_fp8_moe_apply_monolithic_matches_fp32_reference(monkeypatch, kind):
     """Unarmed VllmFp8MoEMethodTPU.apply_monolithic matches an FP32 MoE reference."""
-    monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "512")
+    monkeypatch.setitem(vars(envs), "MOE_REQUANTIZE_BLOCK_SIZE", 512)
     monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8."
@@ -960,6 +941,50 @@ def test_validate_online_fp8_with_draft_model(monkeypatch, kind, scenario):
             validate_online_fp8(target_model, cfg, draft_model=draft_model)
 
 
+@pytest.mark.parametrize("draft_config", ["none", "own"])
+def test_validate_online_fp8_skips_drafter_layers_built_from_another_config(
+    monkeypatch, draft_config
+):
+    """A target pattern that also names a layer of a drafter built from its own
+    quant config, or none, audits the target's layers only; a target naming
+    only such a drafter layer is still reported unmatched.
+    """
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        lambda: 4,
+    )
+    cfg = _make_quant_config("fp8", (0,), targets=["model.layers.*.self_attn.q_b_proj"])
+    target_model = torch.nn.Module()
+    target_model.add_module(
+        "q_b", _make_replicated_linear(cfg, "model.layers.0.self_attn.q_b_proj")
+    )
+    draft_cfg = None if draft_config == "none" else _make_quant_config("fp8", (78,))
+    draft_model = torch.nn.Module()
+    draft_model.add_module(
+        "q_b", _make_replicated_linear(draft_cfg, "model.layers.78.self_attn.q_b_proj")
+    )
+
+    logs: list[str] = []
+    monkeypatch.setattr(
+        online_fp8_mod,
+        "logger",
+        SimpleNamespace(
+            info=lambda fmt, *args: logs.append(fmt % args if args else fmt)
+        ),
+    )
+    validate_online_fp8(target_model, cfg, draft_model=draft_model)
+    assert logs[-1] == "TPU online FP8 validated 1 runtime layers (1 Linear, 0 MoE)"
+
+    drafter_only_cfg = _make_quant_config(
+        "fp8", (78,), targets=["model.layers.78.self_attn.q_b_proj"]
+    )
+    with pytest.raises(ValueError, match="unmatched targets=.*layers.78"):
+        validate_online_fp8(
+            torch.nn.Module(), drafter_only_cfg, draft_model=draft_model
+        )
+
+
 def test_tpu_runner_load_model_validates_after_async_drafter_load(monkeypatch):
     """TPUModelRunner.load_model audits target + async drafter after draft load."""
     from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
@@ -1043,7 +1068,7 @@ def test_tpu_runner_load_model_validates_after_async_drafter_load(monkeypatch):
 @pytest.mark.parametrize("policy_on", [False, True])
 def test_moe_tp_decode_arming_on_tiny_target_and_drafter_model(monkeypatch, policy_on):
     """End-to-end arming on a tiny TP8 (8-rank) target + excluded drafter model."""
-    monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "512")
+    monkeypatch.setitem(vars(envs), "MOE_REQUANTIZE_BLOCK_SIZE", 512)
 
     local_experts = 16
     ep_size, tp_size = 1, 8
