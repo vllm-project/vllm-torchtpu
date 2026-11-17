@@ -22,10 +22,15 @@ from vllm_torchtpu.distributed import collectives_options as co
 pytestmark = pytest.mark.cpu_test
 
 
-def _config(additional_config, expert_parallel=True):
+def _config(additional_config, moe=True, dp=1, pcp=1, tp=8):
     return SimpleNamespace(
         additional_config=additional_config,
-        parallel_config=SimpleNamespace(enable_expert_parallel=expert_parallel),
+        model_config=None if moe is None else SimpleNamespace(is_moe=moe),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp,
+            prefill_context_parallel_size=pcp,
+            tensor_parallel_size=tp,
+        ),
     )
 
 
@@ -64,25 +69,44 @@ def test_options_are_frozen():
         co.CollectivesOptions().small_all_reduce = True  # type: ignore[misc]
 
 
+ON = {"tpu_collectives": {"small_all_reduce": True}}
+
+
 @pytest.mark.parametrize(
-    "additional_config,expert_parallel",
+    "additional_config,kwargs",
     [
-        ({}, False),
-        ({"tpu_collectives": {"small_all_reduce": False}}, False),
-        ({"tpu_collectives": {"small_all_reduce": True}}, True),
+        ({}, {"moe": False, "tp": 1}),
+        ({"tpu_collectives": {"small_all_reduce": False}}, {"moe": False}),
+        # vLLM builds the EP group for every MoE model, so the option needs no
+        # --enable-expert-parallel: a MoE model at TP8 without it still serves.
+        (ON, {"moe": True, "tp": 8}),
+        (ON, {"moe": True, "dp": 8, "tp": 1}),
+        (ON, {"moe": True, "pcp": 2, "tp": 1}),
+        (ON, {"moe": None, "tp": 8}),  # no model config: vLLM builds the group
     ],
-    ids=["no_section", "off_without_ep", "on_with_ep"],
+    ids=[
+        "no_section",
+        "off_on_a_dense_model",
+        "moe_tp8",
+        "moe_dp8",
+        "moe_pcp2",
+        "no_model",
+    ],
 )
-def test_validate_accepts_what_the_kernels_can_serve(
-    additional_config, expert_parallel
+def test_validate_accepts_what_the_kernels_can_serve(additional_config, kwargs):
+    co.validate(_config(additional_config, **kwargs))
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [({"moe": False, "tp": 8}, "a dense model"), ({"moe": True, "tp": 1}, "one rank")],
+    ids=["dense_model", "one_rank"],
+)
+def test_validate_refuses_small_all_reduce_without_an_expert_parallel_group(
+    kwargs, match
 ):
-    co.validate(_config(additional_config, expert_parallel))
-
-
-def test_validate_refuses_small_all_reduce_without_expert_parallelism():
-    config = _config({"tpu_collectives": {"small_all_reduce": True}}, False)
-    with pytest.raises(NotImplementedError, match="--enable-expert-parallel"):
-        co.validate(config)
+    with pytest.raises(NotImplementedError, match=match):
+        co.validate(_config(ON, **kwargs))
 
 
 def test_validate_rejects_a_malformed_section():
