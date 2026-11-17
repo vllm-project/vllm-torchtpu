@@ -183,8 +183,9 @@ def get_node_name() -> str:
 
 
 TPU_PCI_VENDOR_ID = "0x1ae0"
-# Supported Google TPU PCI device IDs mapped to canonical accelerator prefixes.
-# Checking vendor, device, and SR-IOV application VF index excludes bare-metal
+# Supported Google TPU PCI device IDs mapped to canonical accelerator prefixes
+# (matching jax/_src/hardware_utils.py and torch_tpu's TpuSpec). Checking
+# vendor, device, and SR-IOV application VF index excludes bare-metal
 # physical/management functions (e.g. 0x0075/0x0077/0x0078 and virtfn2 ICI
 # management VFs on v7x) and non-TPU Google PCI devices (e.g. NVMe/gVNIC).
 TPU_PCI_DEVICE_ID_TO_TYPE: dict[str, str] = {
@@ -198,8 +199,10 @@ TPU_PCI_DEVICE_ID_TO_TYPE: dict[str, str] = {
     "0x0083": "tpu8i",
 }
 TPU_VFIO_PCI_DEVICE_IDS: frozenset[str] = frozenset(TPU_PCI_DEVICE_ID_TO_TYPE)
-# Maximum SR-IOV application VFs per physical function (virtfn0 .. virtfn{k-1})
-# when bare-metal sysfs exposes `physfn` alongside ICI management VFs.
+# Maximum SR-IOV application VFs per physical function (virtfn0 .. virtfn{k-1},
+# matching per-chip TensorCore device counts) when bare-metal sysfs exposes
+# `physfn` alongside ICI management VFs. GCE/GKE guest VMs pass through VFs
+# without `physfn` in guest sysfs, so _is_application_pci_function returns True.
 TPU_VFIO_MAX_APP_VFS_PER_PF: dict[str, int] = {
     "0x0062": 1,
     "0x0063": 1,

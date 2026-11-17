@@ -178,6 +178,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             hosts.append((w_id, node_ip, int(resources[device_str])))
 
         ordered_by = "IP"
+        ordered_by_worker_id = False
         if has_worker_id and len(hosts) > 0:
             hosts.sort(key=lambda x: (x[0], x[1]))
             actual_w_ids = [w_id for w_id, _, _ in hosts]
@@ -193,6 +194,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 hosts.sort(key=lambda x: x[1])
             else:
                 ordered_by = "ray.io/tpu-worker-id"
+                # Under LWS, KubeRay sets ray.io/tpu-worker-id to 0..N-1 across
+                # the full replica group; only treat position as LWS_WORKER_INDEX
+                # when the slice spans the whole LWS group.
+                ordered_by_worker_id = (
+                    not tpu_envs.LWS_LEADER_ADDRESS
+                    or len(hosts) == tpu_envs.LWS_GROUP_SIZE
+                )
         else:
             lws_ordered = False
             if len(hosts) > 1 and tpu_envs.LWS_LEADER_ADDRESS:
@@ -208,6 +216,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
                     if [w_id for w_id, _, _ in lws_hosts] == list(range(len(hosts))):
                         hosts = lws_hosts
                         ordered_by = "LWS_LEADER_ADDRESS DNS"
+                        ordered_by_worker_id = True
                         lws_ordered = True
             if not lws_ordered:
                 if len(hosts) > 1:
@@ -241,8 +250,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
         return _SliceHostLayout(
             host_order=[ip for _, ip, _ in hosts],
             chips_per_host={ip: count for _, ip, count in hosts},
-            ordered_by_worker_id=ordered_by
-            in ("ray.io/tpu-worker-id", "LWS_LEADER_ADDRESS DNS"),
+            ordered_by_worker_id=ordered_by_worker_id,
             hostnames_by_ip=hostnames_by_ip,
         )
 
@@ -250,9 +258,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
         """Return the slice's hosts in rank order and their device counts.
 
         Each DP engine owns a placement group covering only its own chips, so
-        the slice-wide view has to come from the cluster itself. Reading it
-        from `ray.nodes()` and ordering by address gives every engine the same
-        answer without any of them having to agree on anything.
+        the slice-wide view comes from `ray.nodes()` ordered by worker-id label,
+        LWS pod DNS, or node IP address so every engine derives the same layout.
         """
         layout = self._resolve_slice_host_layout(device_str)
         return layout.host_order, layout.chips_per_host

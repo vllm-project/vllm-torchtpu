@@ -91,6 +91,7 @@ def test_reconcile_tpu_visible_device_paths_keeps_single_rank(monkeypatch):
         ("dense_dp_tp1_multi_replica", True),
         ("dense_dp_tp1_collapsed_by_engine_core", True),
         ("dense_dp_tp1_single_local_replica", False),
+        ("dense_dp_tp1_collapsed_single_local_replica", False),
     ],
 )
 def test_init_device_reconciles_tpu_visible_device_paths_per_branch(
@@ -162,6 +163,19 @@ def test_init_device_reconciles_tpu_visible_device_paths_per_branch(
             numa_bind=False,
         )
         pc.data_parallel_index = 0
+        monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
+        monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "host0:8070,host1:8070")
+    elif case == "dense_dp_tp1_collapsed_single_local_replica":
+        pc = ParallelConfig(
+            tensor_parallel_size=1,
+            data_parallel_size=2,
+            data_parallel_size_local=1,
+            enable_expert_parallel=False,
+            numa_bind=False,
+        )
+        pc.data_parallel_index = 0
+        pc.reconfigure_for_independent_dp_rank()
+        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
         monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
         monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "host0:8070,host1:8070")
     else:

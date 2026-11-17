@@ -446,10 +446,7 @@ def resolve_lws_hosts_by_ip(
     leader_address: str, num_hosts: int
 ) -> dict[str, tuple[int, str]]:
     """Resolve LWS pod DNS names to map normalized node IP -> (worker_index, fqdn)."""
-    lws_group_size = envs.LWS_GROUP_SIZE
-    if lws_group_size == 0:
-        raise ValueError("Invalid value '0' for LWS_GROUP_SIZE: must be >= 1.")
-    group_size = max(num_hosts, lws_group_size)
+    group_size = max(num_hosts, envs.LWS_GROUP_SIZE)
     by_ip: dict[str, tuple[int, str]] = {}
     for worker_index in range(group_size):
         hostname = lws_pod_hostname(leader_address, worker_index)
@@ -545,6 +542,6 @@ def resolve_slicebuilder_hosts(
         raise RuntimeError(
             "Failed to resolve IPv6 slicebuilder host address(es) "
             f"{unresolved} to a forward-resolvable DNS hostname via "
-            f"LWS_LEADER_ADDRESS ({leader_address!r}) or reverse DNS."
+            f"LWS_LEADER_ADDRESS ({leader_address!r}), node hostnames, or reverse DNS."
         )
     return resolved

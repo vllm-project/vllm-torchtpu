@@ -21,7 +21,6 @@ from vllm.config import CacheConfig
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.executors import ray_distributed_executor_v2 as rde2
 from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
-    _TPU_WORKER_SPECIFIC_ENV_VARS,
     RayDistributedExecutorV2,
     get_tpu_bundles_for_indices,
 )
@@ -411,6 +410,18 @@ class TestTpuRayDistributedExecutorV2:
 
             # Run initialization
             executor._init_executor()
+
+            excluded_vars = mock_driver_env.call_args.kwargs["worker_specific_vars"]
+            assert {
+                "TPU_VISIBLE_CHIPS",
+                "TPU_VISIBLE_DEVICES",
+                "TPU_VISIBLE_DEVICE_PATHS",
+                "CLOUD_TPU_TASK_ID",
+                "TPU_CHIPS_PER_HOST_BOUNDS",
+                "TPU_HOST_BOUNDS",
+                "TPU_WORKER_ID",
+                "LWS_WORKER_INDEX",
+            }.issubset(excluded_vars)
 
             # An explicit bundle permutation can move the local worker away
             # from rank 0. The queue must use its actual rank or remote
@@ -977,19 +988,6 @@ def test_ray_distributed_executor_bundle_expansion():
     # Too many bundle indices raises ValueError
     with pytest.raises(ValueError, match="less than or equal to world_size"):
         expand_bundles(list(range(17)), 16)
-
-
-def test_tpu_worker_specific_env_vars_excluded_from_driver_env():
-    assert {
-        "TPU_VISIBLE_CHIPS",
-        "TPU_VISIBLE_DEVICES",
-        "TPU_VISIBLE_DEVICE_PATHS",
-        "CLOUD_TPU_TASK_ID",
-        "TPU_CHIPS_PER_HOST_BOUNDS",
-        "TPU_HOST_BOUNDS",
-        "TPU_WORKER_ID",
-        "LWS_WORKER_INDEX",
-    }.issubset(_TPU_WORKER_SPECIFIC_ENV_VARS)
 
 
 def test_resolve_slicebuilder_hosts_ipv4_and_ptr_reverse_dns(monkeypatch):

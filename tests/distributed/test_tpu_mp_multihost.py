@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import socket
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -20,6 +21,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from vllm_torchtpu.distributed import tpu_mp_multihost as mp
+from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.platforms import tpu_platform
 
 
@@ -261,3 +263,58 @@ def test_mp_lws_subgroup_disables_worker_index_fallback(monkeypatch, bootstrap):
     )
     mp.prepare_mp_multihost_env(config)
     assert seen_flags == [False]
+
+
+@pytest.mark.parametrize("mode", ["nnodes", "dp"])
+def test_mp_ipv6_slicebuilder_substitutes_lws_hostnames(monkeypatch, bootstrap, mode):
+    rendezvous, topology = bootstrap
+    rendezvous.return_value = (["2001:db8::9", "2001:db8::a"], "session")
+    leader_dns = "vllm-lws-0.vllm-lws.default.svc.cluster.local"
+    worker1_dns = "vllm-lws-0-1.vllm-lws.default.svc.cluster.local"
+    dns_to_ip = {
+        leader_dns: "2001:db8::9",
+        worker1_dns: "2001:db8::a",
+    }
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+    monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+    monkeypatch.setattr(
+        dist_utils.socket,
+        "getaddrinfo",
+        lambda host, *a, **kw: (
+            [(socket.AF_INET6, 0, 0, "", (dns_to_ip[host], 0, 0, 0))]
+            if host in dns_to_ip
+            else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
+        ),
+    )
+
+    if mode == "nnodes":
+        mp.prepare_mp_multihost_env(
+            SimpleNamespace(
+                nnodes=2,
+                node_rank=0,
+                local_world_size=4,
+                master_addr=leader_dns,
+                master_port=9000,
+            )
+        )
+    else:
+        assert mp.prepare_mp_multihost_dp_env(
+            SimpleNamespace(
+                data_parallel_size=4,
+                data_parallel_size_local=2,
+                data_parallel_rank=0,
+                data_parallel_rpc_port=9000,
+                data_parallel_master_ip=leader_dns,
+                world_size=2,
+            ),
+            8,
+        )
+
+    topology.assert_called_once_with(8)
+    expected = ",".join(
+        f"{host}:{8070 + slot}"
+        for host in (leader_dns, worker1_dns)
+        for slot in range(4)
+    )
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == expected

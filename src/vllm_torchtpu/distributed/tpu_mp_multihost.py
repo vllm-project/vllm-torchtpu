@@ -129,7 +129,7 @@ def _rendezvous_host_ips(
 def _lws_ordered_by_worker_id(num_hosts: int, peer_index: int, rank_name: str) -> bool:
     """Validate and return whether ``peer_index`` maps 1:1 to ``LWS_WORKER_INDEX``."""
     if not envs.LWS_LEADER_ADDRESS:
-        return True
+        return False
     lws_group_size = envs.LWS_GROUP_SIZE
     if lws_group_size != num_hosts:
         return False
