@@ -251,6 +251,24 @@ def test_prefix_every_engine_holds_leaves_the_backlog_choice(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("client_count", [1, 4])
+def test_load_scores_pick_what_the_stock_choice_picks(client_count):
+    """load_scores repeats vLLM's load score; its lowest score is the engine
+    the stock choice takes, so a change upstream fails here."""
+    rng = random.Random(client_count)
+    for i in range(500):
+        client = Client(client_count=client_count)
+        client.lb_engines = [
+            [rng.randrange(6), rng.randrange(12), rng.random()] for _ in range(ENGINES)
+        ]
+        for engine in client.core_engines:
+            client.engine_inflight[engine] = rng.randrange(8)
+        scores = affinity.load_scores(client)
+        want = client.core_engines[scores.index(min(scores))]
+        stock = DPLBAsyncMPClient.get_core_engine_for_request
+        assert stock(client, request(f"s{i}", [1, 2, 3])) == want
+
+
 def test_table_is_bounded():
     table = affinity.PrefixTable(capacity=10)
     for i in range(30):
