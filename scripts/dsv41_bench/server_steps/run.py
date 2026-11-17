@@ -180,7 +180,12 @@ def main() -> None:
     verify_rows = scenario.local_concurrency * (scenario.dspark_tokens + 1)
     # Target and context-KV buckets; draft queries derive their own ladder
     # from request buckets and the draft block size.
-    buckets = [verify_rows, scenario.chunk_tokens] if decode else [128, 2048]
+    prefill = os.environ.get("DSV41_PREFILL_COMPILE_SIZES", "128,2048")
+    buckets = (
+        [verify_rows, scenario.chunk_tokens]
+        if decode
+        else [int(size) for size in prefill.split(",")]
+    )
     env.update(
         TP="1",
         DP=str(scenario.dp_size),
