@@ -84,10 +84,13 @@ def _provably_zero(rp) -> bool:
     try:
         pe = rp._parser_engine
         from vllm.parser.engine.parser_engine import ParserEngine
+        from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 
+        # _config_never_reasons models exactly this engine's state machine, so
+        # a subclass, or a class of the same name, is not taken for it.
         if (
             type(pe).count_reasoning_tokens is not ParserEngine.count_reasoning_tokens
-            or type(pe._engine).__name__ != "StreamingParserEngine"
+            or type(pe._engine) is not StreamingParserEngine
         ):
             return False
         cfg = pe.parser_engine_config
