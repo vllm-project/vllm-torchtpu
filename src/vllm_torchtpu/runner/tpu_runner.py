@@ -2798,7 +2798,6 @@ class TPUModelRunner(GPUModelRunner):
             and not next(iter(per_raw_spec_inputs.values()))[4]
             and dev_type == "tpu"
             and self._pool_block_split == 1
-            and "_spec_seed_sources" not in getattr(self, "__dict__", {})
         )
         for key, (
             raws,
@@ -4512,11 +4511,6 @@ class TPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_per_req,
                 sub_pairs=sub_pairs,
             )
-            if "_prepare_async_token_substitution_indices"
-            not in getattr(self, "__dict__", {})
-            else self._prepare_async_token_substitution_indices(
-                start_index, num_reqs, num_scheduled_tokens_per_req
-            )
         )
 
         # Speculative decoding metadata.
@@ -5309,9 +5303,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
-        if has_kv_transfer_group() or "maybe_setup_kv_connector" in getattr(
-            self, "__dict__", {}
-        ):
+        if has_kv_transfer_group():
             # Raiden overlap: block the worker main thread on the KV load only
             # in inline mode. In the default async mode the load (network pull
             # + DMA H2D into the cache) runs entirely on the Raiden C++
@@ -5364,23 +5356,17 @@ class TPUModelRunner(GPUModelRunner):
                 if spec_decode_metadata is not None
                 else None
             )
-            if (
-                self.scheduler_config.async_scheduling
-                and spec_decode_metadata is not None
-                and len(cur_input_indices) > 0
-                and "_apply_async_token_substitution"
-                not in getattr(self, "__dict__", {})
-            ):
-                input_ids = self._apply_async_token_substitution(
-                    self.input_ids,
-                    cur_input_indices,
-                    pre_next_tokens_indices,
-                    spec_decode_metadata=spec_decode_metadata,
-                )
-            else:
-                input_ids = self._apply_async_token_substitution(
-                    self.input_ids, cur_input_indices, pre_next_tokens_indices
-                )
+            input_ids = self._apply_async_token_substitution(
+                self.input_ids,
+                cur_input_indices,
+                pre_next_tokens_indices,
+                spec_decode_metadata=(
+                    spec_decode_metadata
+                    if self.scheduler_config.async_scheduling
+                    and len(cur_input_indices) > 0
+                    else None
+                ),
+            )
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
             # rejection sampler's draft_token_ids from the device, unless the
