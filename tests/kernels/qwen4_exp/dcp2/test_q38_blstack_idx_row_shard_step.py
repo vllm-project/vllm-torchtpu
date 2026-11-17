@@ -19,6 +19,8 @@
    and without VLLM_TPU_QSA_COMPRESSED_DCP_LOCAL_MERGE.
 """
 
+import importlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -109,7 +111,7 @@ def _rank_pool(layout, full, keep, seq, r):
 
 @pytest.mark.parametrize("shards", [2, 4])
 @pytest.mark.parametrize("case", sorted(CASES))
-def test_shard_select_steps_equal_the_whole_step(monkeypatch, case, shards):
+def test_shard_select_steps_equal_the_whole_step(interpret, monkeypatch, case, shards):
     log = []
     monkeypatch.setattr(pooled_qsa, "select_blocks", fingerprint_select(log))
     layout, full, keep, qgate, s, m, seq, starts = make_step(5, **CASES[case])
@@ -148,7 +150,7 @@ def test_shard_select_steps_equal_the_whole_step(monkeypatch, case, shards):
     print(f"Q38_BLIDX STEP_EQUAL case={case} shards={shards} tokens={tokens} live={live}")
 
 
-def test_flag_off_token_select_keeps_the_prefill_routing(monkeypatch):
+def test_flag_off_token_select_keeps_the_prefill_routing(interpret, monkeypatch):
     """``decode_rows`` off (the prefill sequence-parallel token shard, Benliang's
     path): the shard is scored with max_query_len 1, as before the port."""
     log = []
@@ -161,9 +163,10 @@ def test_flag_off_token_select_keeps_the_prefill_routing(monkeypatch):
     assert [x["max_query_len"] for x in log] == [1], log
 
 
-def test_row_shard_select_logs_each_traced_shape(monkeypatch):
+def test_row_shard_select_logs_each_traced_shape(interpret, monkeypatch):
     """Engagement: the decode-row select step logs once per traced call."""
-    import vllm_torchtpu.logger as logger_mod
+    # The submodule (the package attribute `logger` is a logger object).
+    logger_mod = importlib.import_module("vllm_torchtpu.logger")
 
     lines = []
 
@@ -187,7 +190,7 @@ def test_row_shard_select_logs_each_traced_shape(monkeypatch):
     print("Q38_BLIDX ENGAGE_TRACE_LINE ok")
 
 
-def test_plain_step_is_the_compressed_select_step(monkeypatch):
+def test_plain_step_is_the_compressed_select_step(interpret, monkeypatch):
     """The plain op's step ignores its shard operand: same outputs as the
     compressed-DCP select step for any operand value."""
     monkeypatch.setattr(pooled_qsa, "select_blocks", fingerprint_select([]))

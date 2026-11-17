@@ -38,6 +38,18 @@ from test_qwen4_exp_shared_stream_indexer import (  # noqa: F401 (fixture)
 from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa
 
 
+@pytest.fixture(autouse=True)
+def release_compiled_programs():
+    """Each case compiles its own interpret-mode programs; drop them after
+    the test (XLA:CPU's JIT code mappings otherwise run out: 'LLVM
+    compilation error: Cannot allocate memory', blidx-dev1 j-002d0dbc)."""
+    yield
+    import gc
+
+    jax.clear_caches()
+    gc.collect()
+
+
 @pytest.fixture
 def reference_kernel(monkeypatch, interpret):  # noqa: F811
     def scored(*args, return_scores=False, **kwargs):

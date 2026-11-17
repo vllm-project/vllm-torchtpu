@@ -169,6 +169,15 @@ def test_draft_layer_stays_off(monkeypatch):
     assert not module.compressed_row_shard and not hasattr(module, "row_shard_index")
 
 
+def _identity_projections(module):
+    """The ops are recorders, so the projections only need to run: identity
+    stand-ins (the CPU linear needs loaded weights)."""
+    module.q_proj = torch.nn.Identity()
+    module.k_proj = torch.nn.Identity()
+    module.v_proj = torch.nn.Identity()
+    module.indexer.index_qk_proj = torch.nn.Identity()
+
+
 def _dispatch(monkeypatch, module, tokens, slots=64):
     calls = []
 
@@ -182,6 +191,7 @@ def _dispatch(monkeypatch, module, tokens, slots=64):
     for name in ("_dcp_op", "_row_shard_dcp_op", "_row_plain_dcp_op"):
         if getattr(module, name, None) is not None:
             setattr(module, name, recorder(name))
+    _identity_projections(module)
     table = torch.zeros((slots, 4), dtype=torch.int32)
     per_layer = {
         module.prefix + ".raw_ring": NS(block_tables=torch.zeros((slots, 1), dtype=torch.int32)),
@@ -238,6 +248,7 @@ def test_sink_layer_keeps_the_global_selection(monkeypatch):
         return torch.zeros(1), torch.zeros((96, 2051), dtype=torch.int32)
 
     module._row_shard_dcp_op = op
+    _identity_projections(module)
     monkeypatch.setattr(qsa_mod, "update_rows_", lambda dst, src: None)
     slots, table = 64, torch.zeros((64, 4), dtype=torch.int32)
     per_layer = {
