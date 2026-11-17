@@ -41,6 +41,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
     update_tpu_block_size_and_slot_config,
 )
+from vllm_torchtpu.worker import worker_options
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -855,10 +856,11 @@ class TpuPlatform(Platform):
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
         collectives_options.validate(vllm_config)
-        # Reject a bad tpu_frontend section here, where the config is first
-        # known, rather than at a patch's install. Its patches install from
-        # patch_registry below.
+        # Reject a bad host-only section here, where the config is first
+        # known, rather than in every worker or at a patch's install. The
+        # tpu_frontend patches install from patch_registry below.
         frontend_options.get(vllm_config)
+        worker_options.get(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
