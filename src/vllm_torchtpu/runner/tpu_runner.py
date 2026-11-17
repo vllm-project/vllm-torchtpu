@@ -130,10 +130,13 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    SYNTHETIC_ACCEPT_LANES,
     RejectionSampler,
     synthetic_sample_and_assemble,
     synthetic_sample_rows_and_assemble,
+    synthetic_uniforms_fit,
     synthetic_verify_rows,
+    synthetic_verify_rows_from_uniforms,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -4786,13 +4789,29 @@ class TPUModelRunner(GPUModelRunner):
         assert md.draft_token_ids is not None
         assert self.rejection_sampler is not None
         assert self.rejection_sampler.synthetic_conditional_rates is not None
-        accept_u = torch.rand(
-            md.draft_token_ids.shape,
-            dtype=torch.float32,
-            device=md.draft_token_ids.device,
-            generator=self._get_sampling_generator(),
-        )
-        accepted_count, rows, recover_draft = synthetic_verify_rows(
+        num_reqs = md.draft_lengths.shape[0]
+        device = md.draft_token_ids.device
+        if synthetic_uniforms_fit(md.draft_token_ids.shape[0], num_reqs):
+            # One RNG program for the accepts and the recovery sampler.
+            md.synthetic_uniforms = torch.rand(
+                (num_reqs, self.vocab_size + SYNTHETIC_ACCEPT_LANES),
+                dtype=torch.float32,
+                device=device,
+                generator=self._get_sampling_generator(),
+            )
+            verify, uniforms = (
+                synthetic_verify_rows_from_uniforms,
+                md.synthetic_uniforms,
+            )
+        else:
+            verify = synthetic_verify_rows
+            uniforms = torch.rand(
+                md.draft_token_ids.shape,
+                dtype=torch.float32,
+                device=device,
+                generator=self._get_sampling_generator(),
+            )
+        accepted_count, rows, recover_draft = verify(
             md.draft_token_ids,
             md.draft_lengths,
             md.segment_ids,
@@ -4800,7 +4819,7 @@ class TPUModelRunner(GPUModelRunner):
             md.target_logits_indices,
             md.bonus_logits_indices,
             md.final_logits_indices,
-            accept_u,
+            uniforms,
             self.rejection_sampler.synthetic_conditional_rates,
         )
         md.synthetic_verify = (accepted_count, recover_draft)
@@ -4878,13 +4897,16 @@ class TPUModelRunner(GPUModelRunner):
         temperatures, top_k, top_p = self._padded_sampling_params(
             cur_start_idx, cur_end_idx, padded_num_reqs, logits.dtype, logits.device
         )
-        # Every request's uniforms, drawn alike on every rank.
-        recover_u = torch.rand(
-            (padded_num_reqs, logits.shape[-1]),
-            dtype=torch.float32,
-            device=logits.device,
-            generator=sampling_generator,
-        )
+        # Every request's uniforms, drawn alike on every rank (with the
+        # accepts' when they fit one draw, `_plan_synthetic_verify`).
+        recover_u = md.synthetic_uniforms
+        if recover_u is None:
+            recover_u = torch.rand(
+                (padded_num_reqs, logits.shape[-1]),
+                dtype=torch.float32,
+                device=logits.device,
+                generator=sampling_generator,
+            )
         if md.synthetic_row_rank is None:
             sample, rows_args = synthetic_sample_and_assemble, ()
         else:
@@ -7086,7 +7108,15 @@ class TPUModelRunner(GPUModelRunner):
         assert self.rejection_sampler.synthetic_conditional_rates is not None
         assert self.speculative_config is not None
         num_reqs = draft_lengths.shape[0]
-        accepted_count, _, recover_draft = synthetic_verify_rows(
+        # The uniforms as `_plan_synthetic_verify` draws them at this shape.
+        one_draw = synthetic_uniforms_fit(draft_token_ids.shape[0], num_reqs)
+        u_width = self.vocab_size + (SYNTHETIC_ACCEPT_LANES if one_draw else 0)
+        recover_u = torch.zeros((num_reqs, u_width), dtype=torch.float32).to(
+            self.device
+        )
+        accepted_count, _, recover_draft = (
+            synthetic_verify_rows_from_uniforms if one_draw else synthetic_verify_rows
+        )(
             draft_token_ids,
             draft_lengths,
             segment_ids,
@@ -7094,7 +7124,7 @@ class TPUModelRunner(GPUModelRunner):
             target_logits_indices,
             bonus_logits_indices,
             target_logits_indices,
-            warm_accept_u,
+            recover_u if one_draw else warm_accept_u,
             self.rejection_sampler.synthetic_conditional_rates,
         )
         logits = torch.zeros(
@@ -7105,9 +7135,6 @@ class TPUModelRunner(GPUModelRunner):
         )
         top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
-        recover_u = torch.zeros((num_reqs, self.vocab_size), dtype=torch.float32).to(
-            self.device
-        )
         variants: list[dict] = [
             {},
             {"apply_topk_topp": False},

@@ -827,8 +827,73 @@ def _random_rejection_sample_with_segment(
 # ---------------------------------------------------------------------------
 
 
+# Lanes past the vocabulary in the synthetic verify's one uniform draw
+# (``[padded_num_reqs, vocab + lanes]``): they hold the accept uniforms, so
+# one RNG program serves both the accept decisions and the recovery sampler.
+SYNTHETIC_ACCEPT_LANES = 128
+
+
+def synthetic_uniforms_fit(num_tokens: int, num_reqs: int) -> bool:
+    """Whether ``num_tokens`` accept uniforms fit the lanes of one draw over
+    ``num_reqs`` rows (`synthetic_verify_rows_from_uniforms`)."""
+    return num_tokens <= num_reqs * SYNTHETIC_ACCEPT_LANES
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def synthetic_verify_rows_from_uniforms(
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    final_logits_indices: torch.Tensor,
+    uniforms: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`synthetic_verify_rows` with its accept uniforms taken from the last
+    `SYNTHETIC_ACCEPT_LANES` lanes of ``uniforms`` (row-major)."""
+    accept_u = uniforms[:, -SYNTHETIC_ACCEPT_LANES:].reshape(-1)
+    return _synthetic_verify_rows(
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        target_logits_indices,
+        bonus_logits_indices,
+        final_logits_indices,
+        accept_u[: draft_token_ids.shape[0]],
+        synthetic_conditional_rates,
+    )
+
+
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def synthetic_verify_rows(
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    final_logits_indices: torch.Tensor,
+    accept_u: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compiled `_synthetic_verify_rows`."""
+    return _synthetic_verify_rows(
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        target_logits_indices,
+        bonus_logits_indices,
+        final_logits_indices,
+        accept_u,
+        synthetic_conditional_rates,
+    )
+
+
+def _synthetic_verify_rows(
     draft_token_ids: torch.Tensor,
     num_draft_tokens: torch.Tensor,
     segment_ids: torch.Tensor,
@@ -915,7 +980,10 @@ def synthetic_sample_and_assemble(
     A rejected row samples the target distribution with the rejected draft
     removed (`_recover_tokens`, draft one-hot); a bonus row (`recover_draft`
     -1) samples the full target distribution, as the bonus sampler does.
+    ``recover_u`` may be wider than the vocabulary (the lanes past it are
+    the accept uniforms, `SYNTHETIC_ACCEPT_LANES`).
     """
+    recover_u = recover_u[:, : logits.shape[-1]]
     sampled = _recover_tokens(
         logits,
         recover_draft,
@@ -966,6 +1034,7 @@ def synthetic_sample_rows_and_assemble(
     from vllm.distributed import tensor_model_parallel_all_gather
 
     per_rank = logit_rows.shape[0]
+    recover_u = recover_u[:, : logit_rows.shape[-1]]
 
     def rows(x: torch.Tensor) -> torch.Tensor:
         # One block index, so a slice of the block rather than a row gather
