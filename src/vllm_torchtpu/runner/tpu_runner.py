@@ -125,6 +125,7 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
+    native_fp8_scope,
     sequence_parallel,
     small_all_reduce_op,
     token_padding,
