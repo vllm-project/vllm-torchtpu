@@ -592,6 +592,7 @@ def calculate_block_sizes(
         "decode_query_size",
         "decode_batch_size",
         "tuned_tiles",
+        "skip_empty_mixed",
         "cp_group_size",
         "attention_scope",
         "return_lse",
@@ -637,6 +638,7 @@ def ragged_paged_attention(
     decode_query_size: int = 1,
     decode_batch_size: int = 8,
     tuned_tiles: bool = False,
+    skip_empty_mixed: bool = False,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
@@ -696,6 +698,12 @@ def ragged_paged_attention(
         tuned_tiles: Choose the default block sizes with the tuned tile rules
             (see `calculate_block_sizes`). Defaults to False: the heuristic's
             tiles.
+        skip_empty_mixed: Skip the MIXED call when it has no sequences: a call
+            of at most decode_query_size tokens runs DECODE alone over every
+            sequence, and any other call runs MIXED under a `lax.cond` on its
+            sequence range. Defaults to False: DECODE and MIXED both run on
+            every call. One conditional per attention layer changes how XLA
+            schedules and places the whole compiled step.
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
@@ -998,6 +1006,7 @@ def ragged_paged_attention(
             lse_out = None
         return o_out, kv_out, lse_out
 
+    # With skip_empty_mixed, a call of at most decode_query_size tokens runs
     # DECODE alone over every sequence, and any other call skips MIXED at run
     # time (lax.cond) when its sequence range is empty. Otherwise DECODE and
     # MIXED both run on every call. The conditional, one per attention layer,

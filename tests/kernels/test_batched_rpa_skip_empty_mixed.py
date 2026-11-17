@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Which kernel calls the batched RPA wrapper traces, with and without
+``skip_empty_mixed``.
 
 By default every call runs the DECODE and the MIXED kernel, each after its
 schedule kernel, and nothing is conditional: a conditional around MIXED in
 every attention layer changes how XLA compiles the whole step. With
+``skip_empty_mixed`` a call of at most ``decode_query_size`` tokens runs
+DECODE alone, and any other call puts the MIXED schedule and kernel inside a
+``lax.cond`` whose other branch passes the output and the KV cache through.
+``tuned_tiles`` only picks tiles; it leaves the call structure alone.
 """
 
 import jax
@@ -126,19 +131,34 @@ def _trace(tokens, *, decode_query_size=1, **kwargs):
 
 
 # (tokens, decode_query_size): a 16-token prefill bucket, and a call no larger
+# than decode_query_size (MTP K=3), where skip_empty_mixed runs DECODE alone.
 _CALLS = [(16, 1), (4, 4)]
 
 
+@pytest.mark.parametrize("tuned_tiles", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize(("tokens", "decode_query_size"), _CALLS)
+def test_by_default_decode_and_mixed_always_run(
+    tokens, decode_query_size, return_lse, tuned_tiles
+):
+    jaxpr = _trace(
+        tokens,
+        decode_query_size=decode_query_size,
+        return_lse=return_lse,
+        tuned_tiles=tuned_tiles,
+    )
     # Schedule + DECODE, schedule + MIXED; nothing conditional.
     assert _kernel_calls(jaxpr) == (4, [])
 
 
 @pytest.mark.parametrize("return_lse", [False, True])
+def test_skip_empty_mixed_puts_mixed_under_a_cond(return_lse):
+    jaxpr = _trace(16, skip_empty_mixed=True, return_lse=return_lse)
     # Schedule + DECODE always; schedule + MIXED in the cond's true branch
     # (branches are ordered false, true), and the false branch passes through.
     assert _kernel_calls(jaxpr) == (2, [[0, 2]])
 
 
+def test_skip_empty_mixed_runs_decode_alone_on_a_call_of_decode_size():
+    jaxpr = _trace(4, decode_query_size=4, skip_empty_mixed=True)
     assert _kernel_calls(jaxpr) == (2, [])
