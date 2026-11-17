@@ -21,18 +21,20 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.models.config import (
     MODELS_CONFIG_MAP,
     Qwen3_5ForConditionalGenerationConfig,
 )
 
-from vllm_torchtpu import additional_config_sections
+from vllm_torchtpu import additional_config_sections, tpu_info
 from vllm_torchtpu.models.qwen3_5 import hooks, settings
 from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
 from vllm_torchtpu.models.vllm import register_models
 
 # The real lookup, before the autouse fixture below replaces it.
 _REAL_CHIP_FAMILY = hooks._chip_family
+TPU7X = pltpu.ChipVersion.TPU_7X.value
 
 QWEN35 = "Qwen3_5MoeForConditionalGeneration"
 
@@ -128,8 +130,8 @@ def _vllm_config(
 
 @pytest.fixture(autouse=True)
 def _tpu7x(monkeypatch):
-    """The record jobs ran on TPU7x; tests that need another device override."""
-    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
+    """The defaults were measured on TPU7x; tests of another device override."""
+    monkeypatch.setattr(hooks, "_chip_family", lambda: TPU7X)
 
 
 def _run_hook(cfg) -> SimpleNamespace:
@@ -330,7 +332,7 @@ def test_other_checkpoint_of_the_architecture_keeps_mains_behaviour(field, value
     assert _run_hook(cfg).cache_config.kv_cache_memory_bytes is None
 
 
-@pytest.mark.parametrize("chip", ["v6e", "v5e", "v5p", None])
+@pytest.mark.parametrize("chip", ["v6e", "v5e", "v5p", "7", None])
 def test_smaller_or_unknown_device_keeps_mains_behaviour(monkeypatch, chip):
     monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
     assert _run_hook(_vllm_config()).cache_config.kv_cache_memory_bytes is None
@@ -342,15 +344,43 @@ def test_explicit_budget_is_kept_on_any_device(monkeypatch):
     assert cfg.cache_config.kv_cache_memory_bytes == 12_000_000_000
 
 
-@pytest.mark.parametrize(
-    "accelerator_type, family",
-    [("tpu7x-8", "7x"), ("v7x-16", "7x"), ("v6e-8", "v6e"), ("", None), (None, None)],
-)
-def test_chip_family_reads_the_accelerator_type(monkeypatch, accelerator_type, family):
-    from vllm_torchtpu import tpu_info
+@pytest.fixture
+def accelerator_type(monkeypatch):
+    """Sets the accelerator type tpu_info reads; its chip lookup is cached."""
 
-    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: accelerator_type)
+    def use(value):
+        monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: value)
+        tpu_info.find_chip_version.cache_clear()
+
+    yield use
+    tpu_info.find_chip_version.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "value, family",
+    [
+        ("tpu7x-8", TPU7X),
+        ("v7x-16", TPU7X),
+        ("v6e-8", "v6e"),
+        ("v5litepod-4", "v5e"),
+        ("tpu-unknown-8", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_chip_family_reads_the_accelerator_type(accelerator_type, value, family):
+    """tpu_info resolves the chip, and an unknown one stays unknown (no TPU7x
+    default), so it never gets the calibrated budget."""
+    accelerator_type(value)
     assert _REAL_CHIP_FAMILY() == family
+
+
+def test_the_chip_lookup_is_read_once(accelerator_type, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: calls.append(1) or "tpu7x-8")
+    tpu_info.find_chip_version.cache_clear()
+    assert [_REAL_CHIP_FAMILY() for _ in range(3)] == [TPU7X] * 3
+    assert len(calls) == 1
 
 
 # The 128-token prefix match unit applies only where it was measured: the IX
