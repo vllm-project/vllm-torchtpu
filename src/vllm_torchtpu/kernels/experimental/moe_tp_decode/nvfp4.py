@@ -23,10 +23,12 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import (
     _NVFP4_NUM_BUFFERS,
     _Q_BLOCK,
     FP4,
-    FP8,
-    PAIR,
     ROW_BUCKETS,
+    VMEM_HEADROOM,
+    Nvfp4Format,
+    _admit_shapes,
     _call,
+    _fixed_vmem_bytes,
     exact_in_bf16,
 )
 
@@ -43,8 +45,8 @@ _H_ALIGN = 512
 _W2_N_CHUNK = 2048
 _GROUP_COLS = 1024
 _MAX_GROUP = 4
+# NVFP4 ring depth (kernel._NUM_BUFFERS is the FP8 ring's).
 _NUM_BUFFERS = _NVFP4_NUM_BUFFERS
-VMEM_HEADROOM = 1.25
 VMEM_FRACTION = 0.875
 
 
@@ -67,21 +69,9 @@ def _vmem_plan(
 ):
     """(need_bytes, vmem_limit_bytes), or None if limit exceeds budget."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
-    e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
-    f32, bf16, u32 = jnp.float32, jnp.bfloat16, jnp.uint32
-    fixed = (
-        2 * t((m, h), bf16)  # x in, out
-        + t((m, e_pad), f32)  # scores
-        + t((1, e_pad), f32)  # bias
-        + t((h, 2 * shared_inter), FP8)  # shared gate_up
-        + t((1, 2 * shared_inter), f32)
-        + t((shared_inter, h), FP8)  # shared down
-        + t((1, h), f32)
-        + 2 * t((m, h), FP8)  # sxq (per row), xq (per 512-col block)
-        + t((h // _Q_BLOCK, m, info.num_lanes), f32)  # xs
-        + 2 * t((m, h), f32)  # owner, shared
-        + t((m, e_pad), f32)  # wtab
-        + t((4, e_pad), jnp.int32)  # hits_v
+    f32, u32 = jnp.float32, jnp.uint32
+    fixed = _fixed_vmem_bytes(
+        m, h, num_experts, shared_inter, info, xs_dtype=f32, hit_rows=4
     )
     slot = (
         t((h // _FP4_PACK, group * 2 * i), u32)
@@ -143,31 +133,32 @@ def can_use_moe_tp_decode_nvfp4(
 ) -> bool:
     """Trace-time admission for the NVFP4 W4A8 TP/EPxTP decode kernel."""
     info = pltpu.get_tpu_info()
-    if info.num_cores != 1 or not info.is_matmul_supported(FP8, FP8):
-        return False
     if w2_n_chunk <= 0 or w2_n_chunk % info.num_lanes != 0:
-        return False
-    if x.ndim != 2 or scores.ndim != 2 or bias.ndim != 1:
-        return False
-    if w13.ndim != 3 or w2.ndim != 3 or shared_w13.ndim != 2 or shared_w2.ndim != 2:
         return False
     if s13.ndim != 4 or s2.ndim != 4:
         return False
-    m, h = x.shape
-    experts, i, out = w2.shape
-    num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
-    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
+    dims = _admit_shapes(
+        x,
+        scores,
+        bias,
+        w13,
+        w2,
+        s13,
+        s2,
+        shared_w13,
+        shared_s13,
+        shared_w2,
+        shared_s2,
+        topk=topk,
+        n_ranks=n_ranks,
+        info=info,
+        weight_dtype=FP4,
+    )
+    if dims is None:
         return False
-    if bias.shape != (num_experts,) or experts <= 0 or num_experts % experts:
-        return False
-    if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
-        return False
+    m, h, experts, i, num_experts, shared_inter = dims
     packed_row_tile = info.num_sublanes * _FP4_PACK
-    if h % _H_ALIGN or h % _Q_BLOCK or h % packed_row_tile or i % packed_row_tile:
-        return False
-    if shared_inter <= 0 or shared_inter % PAIR:
-        return False
-    if out != h or w13.shape != (experts, h, 2 * i):
+    if h % _H_ALIGN or h % packed_row_tile or i % packed_row_tile:
         return False
     b13 = h // _Q_BLOCK
     if s13.shape != (experts, b13, 1, 2 * i):
@@ -180,20 +171,6 @@ def can_use_moe_tp_decode_nvfp4(
     if bk2 < min_bk2 or bk2 % info.num_lanes != 0 or bk2 % packed_row_tile != 0:
         return False
     if s2.shape != (experts, b2, 1, h):
-        return False
-    shared = (shared_w13.shape, shared_s13.shape, shared_w2.shape, shared_s2.shape)
-    fs = shared_inter
-    if shared != ((h, 2 * fs), (2 * fs,), (fs, h), (h,)):
-        return False
-    if x.dtype != jnp.bfloat16 or scores.dtype != jnp.float32:
-        return False
-    if w13.dtype != FP4 or w2.dtype != FP4:
-        return False
-    if shared_w13.dtype != FP8 or shared_w2.dtype != FP8:
-        return False
-    if any(s.dtype != jnp.float32 for s in (bias, s13, s2, shared_s13, shared_s2)):
-        return False
-    if not all_reduce.supported(n_ranks, m, h, info):
         return False
     spec = all_reduce.make_spec(n_ranks, m, h)
     g = group_size(i, experts)
@@ -315,21 +292,13 @@ def moe_tp_decode_nvfp4(
     _, limit = plan
     nb = _NUM_BUFFERS
 
-    def routed_weights():
-        s13_4d = s13[:, :, None, :] if s13.ndim == 3 else s13
-        s2_4d = s2[:, :, None, :] if s2.ndim == 3 else s2
-        if s13_4d.shape != (experts, b13, 1, 2 * i) or s2_4d.shape != (
-            experts,
-            b2,
-            1,
-            h,
-        ):
-            raise ValueError(
-                f"Expected 4D scale shapes {(experts, b13, 1, 2 * i)} and "
-                f"{(experts, b2, 1, h)}, got {s13.shape} and {s2.shape}"
-            )
-        return w13, w2, s13_4d, s2_4d
-
+    s13_4d = s13[:, :, None, :] if s13.ndim == 3 else s13
+    s2_4d = s2[:, :, None, :] if s2.ndim == 3 else s2
+    if s13_4d.shape != (experts, b13, 1, 2 * i) or s2_4d.shape != (experts, b2, 1, h):
+        raise ValueError(
+            f"Expected 4D scale shapes {(experts, b13, 1, 2 * i)} and "
+            f"{(experts, b2, 1, h)}, got {s13.shape} and {s2.shape}"
+        )
     return _call(
         x,
         scores,
@@ -337,7 +306,7 @@ def moe_tp_decode_nvfp4(
         n_valid,
         rank,
         experts_start,
-        routed_weights,
+        (w13, w2, s13_4d, s2_4d),
         shared_w13,
         shared_s13,
         shared_w2,
@@ -375,9 +344,6 @@ def moe_tp_decode_nvfp4(
             routed_scale=float(routed_scale),
             ar_spec=ar_spec,
             fast=fast,
-            weight_format="nvfp4",
-            group=g,
-            bk2=bk2,
-            w2_n_chunk=w2_n_chunk,
+            weight_format=Nvfp4Format(group=g, bk2=bk2, w2_n_chunk=w2_n_chunk),
         ),
     )

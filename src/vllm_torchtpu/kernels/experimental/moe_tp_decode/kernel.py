@@ -61,10 +61,11 @@ chunk of I) pair: the gate and up chunks of w13 and the matching w2 rows, so
 VMEM per slot is the TP16 slot whatever I is. The all-reduce still sums every
 rank, so each rank's partial covers its experts x its columns.
 
-Weight format (static weight_format): everything above is "fp8", per-channel
-FP8 routed weights. "nvfp4" (entry point nvfp4.moe_tp_decode_nvfp4) keeps the
-routing, compaction, shared expert, combine and all-reduce and swaps only the
-routed-expert ring (_nvfp4_ring) for one that streams half the bytes:
+Weight format (static weight_format of _kernel): everything above is
+Fp8Format, per-channel FP8 routed weights. Nvfp4Format (entry point
+nvfp4.moe_tp_decode_nvfp4) keeps the routing, compaction, shared expert, both
+ring schedules, combine and all-reduce and swaps only the routed-expert ring
+(_nvfp4_ring) for one that streams half the bytes:
 
   1. w13 [El, H, 2I] and w2 [El, I, H] are float4_e2m1fn, viewed in HBM as
      uint32 [El, H // 8, 2I] / [El, I // 8, H] (8 K-rows per word) and DMAed
@@ -78,6 +79,7 @@ routed-expert ring (_nvfp4_ring) for one that streams half the bytes:
      rows), fp4 -> fp8 per block, into owner_ref in f32.
 """
 
+import dataclasses
 import functools
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -105,25 +107,26 @@ PAIR = 128
 # VMEM limit = need x headroom (Mosaic temporaries), refused above a fraction
 # of the capacity so neighbouring XLA ops keep room.
 VMEM_HEADROOM = 1.25
+# FP8 admission (nvfp4.VMEM_FRACTION for NVFP4).
 VMEM_FRACTION = 0.75
-# Output columns per second-matmul chunk; bounds the live f32 result.
-_N_CHUNK = 512
 # gmm_v2's activation quantization block: one scale per row per this many
-# columns of x (its quant_block_size).
+# columns of x (its quant_block_size). Also the NVFP4 w13 scale block: one f32
+# scale per _Q_BLOCK K-rows.
 _Q_BLOCK = 512
-# Weight ring depth. One slot holds the expert whose first matmul is in
-# flight, so num_buffers - 2 transfers run ahead of compute.
+# FP8 ring: output columns per second-matmul chunk; bounds the live f32 result.
+_N_CHUNK = 512
+# FP8 ring depth. One slot holds the expert whose first matmul is in flight, so
+# num_buffers - 2 transfers run ahead of compute.
 _NUM_BUFFERS = 6
-# Intermediate columns per ring item (one MXU-wide gate and up chunk).
+# FP8 ring: intermediate columns per ring item (one MXU-wide gate and up chunk).
 _I_CHUNK = 128
 
-# weight_format="nvfp4": float4_e2m1fn weights, viewed as uint32 words of
-# _FP4_PACK K-rows each, streamed whole through a shallower ring (an FP4 expert
-# is half the bytes of an FP8 one).
+# NVFP4 ring: float4_e2m1fn weights, viewed as uint32 words of _FP4_PACK K-rows
+# each, streamed whole through a shallower ring (an FP4 expert is half the
+# bytes of an FP8 one).
 FP4 = jnp.float4_e2m1fn
 _FP4_PACK = 8
 _NVFP4_NUM_BUFFERS = 4
-WEIGHT_FORMATS = ("fp8", "nvfp4")
 
 
 def exact_in_bf16(value: float) -> bool:
@@ -158,14 +161,13 @@ def _i_chunk(i):
     return min(i, _I_CHUNK)
 
 
-def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
-    """(need_bytes, vmem_limit_bytes), or None if the limit would exceed
-    VMEM_FRACTION of the capacity. Whole-array blocks (grid=()), tiles padded.
-    `i` is the ring item's column count (_i_chunk of the rank's I)."""
+def _fixed_vmem_bytes(m, h, num_experts, shared_inter, info, *, xs_dtype, hit_rows):
+    """VMEM bytes of everything but the routed-expert ring (tiles padded): the
+    ring's format sets the x block scales' dtype and the hit-table rows."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     f32, bf16 = jnp.float32, jnp.bfloat16
-    fixed = (
+    return (
         2 * t((m, h), bf16)  # x in, out
         + t((m, e_pad), f32)  # scores
         + t((1, e_pad), f32)  # bias
@@ -174,10 +176,21 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
         + t((shared_inter, h), FP8)  # shared down
         + t((1, h), f32)
         + 2 * t((m, h), FP8)  # sxq (per row), xq (per block)
-        + t((h // _Q_BLOCK, m, info.num_lanes), bf16)  # xs
+        + t((h // _Q_BLOCK, m, info.num_lanes), xs_dtype)  # xs
         + 2 * t((m, h), f32)  # owner, shared
         + t((m, e_pad), f32)  # wtab
-        + t((1, e_pad), jnp.int32)  # hits_v
+        + t((hit_rows, e_pad), jnp.int32)  # hits_v
+    )
+
+
+def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
+    """(need_bytes, vmem_limit_bytes), or None if the limit would exceed
+    VMEM_FRACTION of the capacity. Whole-array blocks (grid=()), tiles padded.
+    `i` is the ring item's column count (_i_chunk of the rank's I)."""
+    t = functools.partial(all_reduce.tiled_bytes, info=info)
+    f32 = jnp.float32
+    fixed = _fixed_vmem_bytes(
+        m, h, num_experts, shared_inter, info, xs_dtype=jnp.bfloat16, hit_rows=1
     )
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
     need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
@@ -217,6 +230,75 @@ def kernel_name(
     return name
 
 
+class _Dims(NamedTuple):
+    m: int
+    h: int
+    experts: int
+    i: int
+    num_experts: int
+    shared_inter: int
+
+
+def _admit_shapes(
+    x,
+    scores,
+    bias,
+    w13,
+    w2,
+    s13,
+    s2,
+    shared_w13,
+    shared_s13,
+    shared_w2,
+    shared_s2,
+    *,
+    topk: int,
+    n_ranks: int,
+    info,
+    weight_dtype,
+) -> _Dims | None:
+    """The admission checks every weight format shares: the hardware (one
+    TensorCore per device, an FP8 x FP8 MXU), the shapes of all operands but
+    the routed scales, the dtypes (routed weights `weight_dtype`) and the
+    all-reduce geometry. The dims, or None; the format checks the rest."""
+    if info.num_cores != 1 or not info.is_matmul_supported(FP8, FP8):
+        return None
+    if x.ndim != 2 or scores.ndim != 2 or bias.ndim != 1:
+        return None
+    if w13.ndim != 3 or w2.ndim != 3 or shared_w13.ndim != 2 or shared_w2.ndim != 2:
+        return None
+    m, h = x.shape
+    experts, i, out = w2.shape
+    num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
+    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
+        return None
+    # This rank's experts are a linear block of the router's num_experts
+    # (experts == num_experts under plain TP).
+    if bias.shape != (num_experts,) or experts <= 0 or num_experts % experts:
+        return None
+    if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
+        return None
+    if h % _Q_BLOCK or shared_inter <= 0 or shared_inter % PAIR:
+        return None
+    if out != h or w13.shape != (experts, h, 2 * i):
+        return None
+    shared = (shared_w13.shape, shared_s13.shape, shared_w2.shape, shared_s2.shape)
+    fs = shared_inter
+    if shared != ((h, 2 * fs), (2 * fs,), (fs, h), (h,)):
+        return None
+    if x.dtype != jnp.bfloat16 or scores.dtype != jnp.float32:
+        return None
+    if w13.dtype != weight_dtype or w2.dtype != weight_dtype:
+        return None
+    if shared_w13.dtype != FP8 or shared_w2.dtype != FP8:
+        return None
+    if any(s.dtype != jnp.float32 for s in (bias, s13, s2, shared_s13, shared_s2)):
+        return None
+    if not all_reduce.supported(n_ranks, m, h, info):
+        return None
+    return _Dims(m, h, experts, i, num_experts, shared_inter)
+
+
 def can_use_moe_tp_decode(
     x,
     scores,
@@ -241,40 +323,29 @@ def can_use_moe_tp_decode(
     top-k, SiLU, no scale folded into the weights) are the caller's to check.
     """
     info = pltpu.get_tpu_info()
-    if info.num_cores != 1 or not info.is_matmul_supported(FP8, FP8):
+    dims = _admit_shapes(
+        x,
+        scores,
+        bias,
+        w13,
+        w2,
+        s13,
+        s2,
+        shared_w13,
+        shared_s13,
+        shared_w2,
+        shared_s2,
+        topk=topk,
+        n_ranks=n_ranks,
+        info=info,
+        weight_dtype=FP8,
+    )
+    if dims is None:
         return False
-    if x.ndim != 2 or scores.ndim != 2 or bias.ndim != 1:
-        return False
-    if w13.ndim != 3 or w2.ndim != 3 or shared_w13.ndim != 2 or shared_w2.ndim != 2:
-        return False
-    m, h = x.shape
-    experts, i, out = w2.shape
-    num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
-    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
-        return False
-    # This rank's experts are a linear block of the router's num_experts
-    # (experts == num_experts under plain TP).
-    if bias.shape != (num_experts,) or experts <= 0 or num_experts % experts:
-        return False
-    if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
-        return False
-    if h % _N_CHUNK or h % _Q_BLOCK or shared_inter <= 0 or shared_inter % PAIR:
-        return False
-    if out != h or w13.shape != (experts, h, 2 * i):
+    m, h, experts, i, num_experts, shared_inter = dims
+    if h % _N_CHUNK:
         return False
     if s13.shape != (experts, 1, 1, 2 * i) or s2.shape != (experts, 1, 1, h):
-        return False
-    shared = (shared_w13.shape, shared_s13.shape, shared_w2.shape, shared_s2.shape)
-    fs = shared_inter
-    if shared != ((h, 2 * fs), (2 * fs,), (fs, h), (h,)):
-        return False
-    if x.dtype != jnp.bfloat16 or scores.dtype != jnp.float32:
-        return False
-    if any(w.dtype != FP8 for w in (w13, w2, shared_w13, shared_w2)):
-        return False
-    if any(s.dtype != jnp.float32 for s in (bias, s13, s2, shared_s13, shared_s2)):
-        return False
-    if not all_reduce.supported(n_ranks, m, h, info):
         return False
     spec = all_reduce.make_spec(n_ranks, m, h)
     plan = _vmem_plan(m, h, _i_chunk(i), num_experts, shared_inter, info, spec)
@@ -733,6 +804,41 @@ def _nvfp4_ring(
     return _Ring(items, nb, transfers, quantize_x, gate_up, finish)
 
 
+@dataclasses.dataclass(frozen=True)
+class Fp8Format:
+    """Per-channel FP8 routed weights (_fp8_ring): n_chunks ring items of
+    _I_CHUNK columns per expert."""
+
+    n_chunks: int = 1
+
+    def ring(self, refs: _RingRefs, count, e0, *, fast: bool) -> _Ring:
+        return _fp8_ring(refs, count, e0, fast=fast, n_chunks=self.n_chunks)
+
+
+_FP8_FORMAT = Fp8Format()
+
+
+@dataclasses.dataclass(frozen=True)
+class Nvfp4Format:
+    """FP4-block512 routed weights (_nvfp4_ring): `group` experts per ring slot,
+    w2 K-blocks of bk2 rows, w2 output chunks of w2_n_chunk columns."""
+
+    group: int
+    bk2: int
+    w2_n_chunk: int
+
+    def ring(self, refs: _RingRefs, count, e0, *, fast: bool) -> _Ring:
+        return _nvfp4_ring(
+            refs,
+            count,
+            e0,
+            fast=fast,
+            group=self.group,
+            bk2=self.bk2,
+            w2_n_chunk=self.w2_n_chunk,
+        )
+
+
 def _kernel(
     meta_ref,
     x_ref,
@@ -773,21 +879,12 @@ def _kernel(
     routed_scale,
     ar_spec,
     fast=False,
-    weight_format="fp8",
-    n_chunks=1,
-    group=1,
-    bk2=0,
-    w2_n_chunk=0,
+    weight_format: Fp8Format | Nvfp4Format = _FP8_FORMAT,
 ):
-    """The layer on one rank (module docstring). weight_format picks the
-    routed-expert ring: "fp8" (_fp8_ring, n_chunks ring items per expert) or
-    "nvfp4" (_nvfp4_ring: `group` experts per slot, w2 K-blocks of bk2 rows,
-    w2 output chunks of w2_n_chunk columns)."""
-    if weight_format not in WEIGHT_FORMATS:
-        raise ValueError(f"weight_format {weight_format!r} not in {WEIGHT_FORMATS}")
-    nvfp4 = weight_format == "nvfp4"
+    """The layer on one rank (module docstring); weight_format builds the
+    routed-expert ring."""
     all_reduce.prologue(ar_spec)
-    if nvfp4:
+    if isinstance(weight_format, Nvfp4Format):
         # _FP4_PACK K-rows per uint32 word: the ring DMAs whole experts in this
         # view and widens each K-block to FP8 in VMEM.
         w1_hbm = w1_hbm.bitcast(jnp.uint32)
@@ -879,12 +976,7 @@ def _kernel(
         hits_s_ref,
         active_ids_ref,
     )
-    if nvfp4:
-        ring = _nvfp4_ring(
-            refs, count, e0, fast=fast, group=group, bk2=bk2, w2_n_chunk=w2_n_chunk
-        )
-    else:
-        ring = _fp8_ring(refs, count, e0, fast=fast, n_chunks=n_chunks)
+    ring = weight_format.ring(refs, count, e0, fast=fast)
     items, nb, transfers = ring.items, ring.nb, ring.transfers
 
     if fast:
@@ -1031,9 +1123,8 @@ def _call(
     kernel_kwargs: dict,
 ):
     """The pallas_call of _kernel, for either weight format: the caller passes
-    its ring's scratch (ring_scratch, xs_dtype, active_len, ring_sems), its
-    _kernel statics and routed_weights(), which returns the four routed weight
-    and scale operands (called after the scalar operands are built)."""
+    the four routed weight and scale operands, its ring's scratch (ring_scratch,
+    xs_dtype, active_len, ring_sems) and its _kernel statics."""
     m, h = x.shape
     num_experts = scores.shape[1]
     shared_inter = shared_w2.shape[0]
@@ -1065,7 +1156,7 @@ def _call(
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     weights = (
-        *routed_weights(),
+        *routed_weights,
         shared_w13,
         shared_s13.reshape(1, 2 * shared_inter),
         shared_w2,
@@ -1216,7 +1307,7 @@ def moe_tp_decode(
         n_valid,
         rank,
         experts_start,
-        lambda: (w13, w2, s13, s2),
+        (w13, w2, s13, s2),
         shared_w13,
         shared_s13,
         shared_w2,
@@ -1252,10 +1343,10 @@ def moe_tp_decode(
         ring_sems=(nb, 4 if i == ic else 6),
         kernel_kwargs=dict(
             local_experts=experts,
-            n_chunks=i // ic,
             topk=topk,
             routed_scale=float(routed_scale),
             ar_spec=ar_spec,
             fast=fast,
+            weight_format=Fp8Format(n_chunks=i // ic),
         ),
     )

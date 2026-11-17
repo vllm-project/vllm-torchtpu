@@ -964,14 +964,13 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
                 shared_sem,
                 hit_sem,
                 local_experts=_el,
-                group=g,
-                bk2=_i // b2,
                 topk=topk,
                 routed_scale=ROUTED_SCALE,
                 ar_spec=_spec,
                 fast=fast,
-                weight_format="nvfp4",
-                w2_n_chunk=w2_n_chunk,
+                weight_format=kernel_impl.Nvfp4Format(
+                    group=g, bk2=_i // b2, w2_n_chunk=w2_n_chunk
+                ),
             )
             for sem in (ring_sem, shared_sem, hit_sem):
                 for key, queue in sem.pending.items():
