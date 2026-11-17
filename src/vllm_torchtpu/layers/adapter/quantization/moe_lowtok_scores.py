@@ -259,8 +259,14 @@ def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
         return "apply_router_weight_on_input"
     if moe_routing._SIMULATION_STRATEGY is not None:
         return "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set"
+    # Either option makes the FP8 method claim the DP/PCP exchange
+    # (supports_internal_mk), so vLLM skips its all-gather and the router
+    # input stays rank-local; only the grouped path's pipelined_fused_moe_gmm
+    # gathers it, and the scores entry would serve this rank's rows alone.
     if enable_pipelined_collective_and_compute():
         return "MoE chunk pipelining keeps the router input rank-local"
+    if envs.TPU_MOE_FP8_ALL_GATHER:
+        return "TPU_MOE_FP8_ALL_GATHER keeps the router input rank-local"
     if int(layer.w13_weight.shape[0]) * int(layer.moe_config.ep_size) != int(
         layer.global_num_experts
     ) and not _layer_has_placement_copies(layer):
