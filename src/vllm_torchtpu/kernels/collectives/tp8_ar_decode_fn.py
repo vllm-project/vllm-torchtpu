@@ -9,6 +9,11 @@ from __future__ import annotations
 import functools
 import os
 
+# q38 H8-FIX: module scope, not local to global_fn. `from __future__ import annotations` stores fn's annotations as
+# the strings 'jax.Array'; torch_tpu jax_op evaluates them (inspect.signature(..., eval_str=True)) in this module's
+# globals, so a local import raised NameError at arm() on TPU (j-db896a2a, 5d368f166).
+import jax
+
 N_MEMBERS = 8
 
 
@@ -60,7 +65,6 @@ def local_body(x, *, axis: str, pairs, wire: str, max_rows_: int, interpret=Fals
 def global_fn(mesh, *, axis: str, pairs, wire: str, max_rows_: int, interpret=False):
     """The op's JAX function: x [N * rows, hidden] sharded on axis 0 over ``mesh`` -> same layout, each member's
     block replaced by the sum of all members' blocks."""
-    import jax
     from jax.sharding import PartitionSpec
 
     spec = PartitionSpec(axis)
