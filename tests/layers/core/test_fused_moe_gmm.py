@@ -461,6 +461,88 @@ def _reference_fused_moe(
     return out[:, :hidden_size].astype(hidden_states.dtype)
 
 
+@pytest.mark.parametrize(
+    "num_primary_experts, local_ids, local_count",
+    [
+        # Without a bound every weight slot is local: ids 36 and 37 are slots
+        # 4 and 5.
+        (None, [[0, 4], [5, -1]], 6),
+        # With 4 primaries, slots 4 and 5 hold copies: ids 36 and 37 are the
+        # next shard's primaries, so they are not local here.
+        (4, [[0, -1], [-1, -1]], 4),
+    ],
+)
+def test_copy_slots_stay_outside_the_local_interval(
+    monkeypatch, num_primary_experts, local_ids, local_count
+):
+    """A copy-slot layer's weights hold 6 slots: its 4 primaries (experts 32 to
+    35), then 2 copies. The grouped path takes only ids in [32, 36) as local,
+    zeroes the others' weights, and sizes its groups to the primaries."""
+    seen = {}
+
+    class Routed(Exception):
+        pass
+
+    def prepare(hidden_states, topk_ids, topk_weights, *, local_num_experts, **kw):
+        seen.update(
+            ids=np.asarray(topk_ids),
+            weights=np.asarray(topk_weights, dtype=np.float32),
+            local=local_num_experts,
+        )
+        raise Routed
+
+    monkeypatch.setattr(fused_moe_gmm, "prepare_routed_gmm_inputs", prepare)
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
+    monkeypatch.setattr(fused_moe_gmm, "_MOE_LOWTOK_MAX_TOKENS", 0)
+    slots, hidden, inter = 6, 128, 128
+    with jax.disable_jit(), pytest.raises(Routed):
+        fused_moe_func(
+            jnp.zeros((2, hidden), jnp.bfloat16),
+            jnp.zeros((slots, hidden, 2 * inter), jnp.bfloat16),
+            jnp.zeros((slots, inter, hidden), jnp.bfloat16),
+            None,
+            None,
+            None,
+            None,
+            jnp.full((2, 2), 0.5, jnp.bfloat16),
+            jnp.asarray([[32, 36], [37, 31]], jnp.int32),
+            jnp.int32(32),
+            topk=2,
+            activation="silu",
+            use_ep=True,
+            use_sparse_core=False,
+            num_primary_experts=num_primary_experts,
+        )
+    np.testing.assert_array_equal(seen["ids"], local_ids)
+    np.testing.assert_array_equal(
+        seen["weights"], np.where(np.asarray(local_ids) >= 0, 0.5, 0.0)
+    )
+    assert seen["local"] == local_count
+
+
+@pytest.mark.parametrize("num_primary_experts", [0, 7])
+def test_a_primary_count_outside_the_weight_slots_is_refused(num_primary_experts):
+    with pytest.raises(ValueError, match="num_primary_experts"):
+        jax.eval_shape(
+            lambda: fused_moe_func(
+                jnp.zeros((2, 128), jnp.bfloat16),
+                jnp.zeros((6, 128, 256), jnp.bfloat16),
+                jnp.zeros((6, 128, 128), jnp.bfloat16),
+                None,
+                None,
+                None,
+                None,
+                jnp.zeros((2, 2), jnp.bfloat16),
+                jnp.zeros((2, 2), jnp.int32),
+                jnp.int32(32),
+                topk=2,
+                activation="silu",
+                use_ep=True,
+                num_primary_experts=num_primary_experts,
+            )
+        )
+
+
 def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     hidden_states = jnp.arange(6, dtype=jnp.bfloat16).reshape(3, 2)
     topk_indices = jnp.array([[1, 0], [0, -1], [1, 0]], dtype=jnp.int32)
