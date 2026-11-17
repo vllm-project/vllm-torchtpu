@@ -652,13 +652,18 @@ def test_bfloat16_negative_zero_and_positive_zero_ties(monkeypatch, tp_size):
     assert torch.equal(got, _full_logits_tokens(weight, hidden_states))
 
 
-def _vocab_parallel_topk_candidates_dim0(weight, hidden_states, tp_size, monkeypatch):
+def _vocab_parallel_topk_candidates_dim0(
+    weight, hidden_states, tp_size, monkeypatch, quantize=False
+):
     """Play back tensor_model_parallel_all_gather honoring dim=0 for
-    tpu_get_topk_candidates across all TP shards."""
+    tpu_get_topk_candidates across all TP shards (each shard quantized to
+    W8A8 FP8 first with `quantize`)."""
     vocab = weight.shape[0]
     shards = _shards(weight, tp_size)
     owners = []
     for shard in shards:
+        if quantize:
+            greedy_top_tokens.quantize_lm_head(shard, "fp8")
         owner = _Owner(shard)
         owner.logits_processor.vocab_size = vocab
         owner.logits_processor.padded_vocab_size = shard.weight.shape[0] * tp_size
@@ -1007,6 +1012,99 @@ def test_fused_candidate_blocks_cut_off_at_half_the_block_count(monkeypatch):
     with torch.compiler.set_stance("force_eager"):
         sampler.fused_verify_and_sample_candidates(**packed)
     assert widths == [32]
+
+
+@pytest.mark.parametrize("vocab_size", [301, 2100])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_w8a8_topk_candidates_are_each_shards_top32(monkeypatch, vocab_size, tp_size):
+    """A W8A8 FP8 head takes `_quantized_head_local_topk` (its CPU path here):
+    every rank's 32 candidates must be exactly the top 32 of the logits the
+    quantized head computes for its full-logits path, with those logits."""
+    gen = torch.Generator().manual_seed(300 + vocab_size + tp_size)
+    weight = torch.randn(vocab_size, 16, generator=gen)
+    hidden_states = torch.randn(5, 16, generator=gen)
+
+    packed = _vocab_parallel_topk_candidates_dim0(
+        weight, hidden_states, tp_size, monkeypatch, quantize=True
+    )
+
+    k = greedy_top_tokens.LOCAL_TOPK_CANDIDATES
+    assert packed.shape == (5, 2 * k * tp_size)
+    cand_logits = packed[:, : k * tp_size]
+    cand_ids = packed[:, k * tp_size :].to(torch.int64)
+    for rank, shard in enumerate(_shards(weight, tp_size)):
+        head = greedy_top_tokens.quantize_lm_head(shard, "fp8")
+        assert head._quant_mode == "fp8"
+        # The quantized head's full logits (its in-place quant method's math).
+        logits = greedy_top_tokens._apply_w8a8_lm_head(head, hidden_states)
+        num_pad = shard.shard_indices.num_org_vocab_padding
+        if num_pad:
+            logits[:, -num_pad:] = -float("inf")
+        start = shard.shard_indices.org_vocab_start_index
+        want_vals, want_idx = torch.topk(logits, k, dim=-1)
+        got_ids = cand_ids[:, rank * k : (rank + 1) * k]
+        got_vals = cand_logits[:, rank * k : (rank + 1) * k]
+        for row in range(5):
+            assert sorted(got_ids[row].tolist()) == sorted(
+                (want_idx[row] + start).tolist()
+            )
+            torch.testing.assert_close(
+                got_vals[row].sort().values,
+                want_vals[row].float().sort().values,
+                rtol=0,
+                atol=0,
+            )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_pad", [0, 3])
+def test_w8a8_head_pallas_ops_on_tpu(num_pad):
+    """The registered jax_op bridges of the W8A8 head (fused max and fused
+    top-32, each with and without vocab padding) run on TPU and pick each
+    row's clear winner, as the host path does."""
+    import torch_tpu  # noqa: F401
+
+    gen = torch.Generator().manual_seed(11)
+    vocab_shard, hidden = 256, 128
+    weight = torch.randn(vocab_shard, hidden, generator=gen) * 0.01
+    hidden_states = torch.randn(8, hidden, generator=gen)
+    winners = (5, 17, 40, 63, 100, 128, 200, 250 - num_pad)
+    for row, token in enumerate(winners):
+        weight[token] = hidden_states[row] * 4.0
+    if num_pad:
+        # Padding rows that would win if the mask were missing.
+        weight[-num_pad:] = hidden_states.sum(0) * 100.0
+    tpu = torch.device("tpu")
+    heads = {
+        dev: greedy_top_tokens.quantize_lm_head(
+            _HeadShard(weight.to(dev), 0, 1, num_pad), "fp8"
+        )
+        for dev in ("cpu", tpu)
+    }
+    processor = _Owner(heads["cpu"]).logits_processor
+    processor.vocab_size = vocab_shard - num_pad
+    processor.padded_vocab_size = vocab_shard
+    want = torch.tensor(winners, dtype=torch.int32)
+
+    _, cpu_ids = greedy_top_tokens._quantized_head_local_max(
+        processor, heads["cpu"], hidden_states
+    )
+    _, tpu_ids = greedy_top_tokens._quantized_head_local_max(
+        processor, heads[tpu], hidden_states.to(tpu)
+    )
+    assert torch.equal(cpu_ids, want)
+    assert torch.equal(tpu_ids.cpu().to(torch.int32), want)
+
+    vals, ids = greedy_top_tokens._quantized_head_local_topk(
+        processor, heads[tpu], hidden_states.to(tpu)
+    )
+    vals, ids = vals.cpu(), ids.cpu().to(torch.int64)
+    k = greedy_top_tokens.LOCAL_TOPK_CANDIDATES
+    assert vals.shape == ids.shape == (8, k)
+    top = vals.argmax(dim=-1, keepdim=True)
+    assert torch.equal(ids.gather(1, top).squeeze(1), want.to(torch.int64))
+    assert bool((ids < vocab_shard - num_pad).all())
+    assert all(len(set(r.tolist())) == k for r in ids)
 
 
 def test_quantize_lm_head_is_w8a8_fp8_or_bf16_only():
