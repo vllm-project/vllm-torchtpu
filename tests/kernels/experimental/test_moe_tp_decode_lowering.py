@@ -2,22 +2,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """The TPU lowering of the moe_tp_decode kernels, pinned by hash.
 
-Each case lowers one GLM-5.2 decode MoE layer for TPU7x on the host (no TPU
-needed) and compares a hash of the result with the one recorded in _HASHES:
-the HLO text with each Mosaic kernel body replaced by the hash of its
-assembly without locations, so moving code between lines does not change it
-while any change to an op, operand, constant or op order does. Both weight
-formats are pinned, so an edit made for one cannot silently change the
-other's program.
+Each case lowers one decode MoE layer for TPU7x on the host (no TPU needed)
+and compares the sha256 of the lowered HLO text, Mosaic kernel body included,
+with the hash recorded in _HASHES. Lowering runs with
+jax_traceback_in_locations_limit=0, so the text carries no source locations:
+moving code between lines does not change a hash, while any change to an op,
+operand, constant or op order does. Both weight formats are pinned, so an edit
+made for one cannot silently change the other's program. The pinned program
+includes everything the kernels trace: kernel.py, nvfp4.py, all_reduce.py and
+quantized_matmul.util.quantize_block.
 
-The hashes hold for the jax version they were recorded with (_JAX_VERSION);
-other versions skip. After an intended kernel change, or for a new jax, run
-this file and copy the printed hashes into _HASHES.
+The hashes are recorded for one jax version, _JAX_VERSION, which must equal
+the jax pin in pyproject.toml; with any other installed jax the lowering cases
+skip. When a change to the program is intended, or when the jax pin moves, set
+_JAX_VERSION if needed, run this file, and copy the new hash from each failure
+message into _HASHES. To see what changed, diff the as_text() of the case at
+the old and the new commit.
 """
 
-import base64
 import hashlib
-import re
+import tomllib
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -36,40 +41,74 @@ N_RANKS = 8
 ROUTED_SCALE = 2.5
 _JAX_VERSION = "0.11.2"
 
+# Per-rank shapes: e experts routed, e // ep local, intermediate i per rank.
 TP8 = dict(h=6144, e=256, i=256, fs=256, topk=8, b13=512, b2=256, ep=1)
 EP2TP4 = dict(h=6144, e=256, i=512, fs=256, topk=8, b13=512, b2=512, ep=2)
 EP2TP4_B256 = dict(h=6144, e=256, i=512, fs=256, topk=8, b13=512, b2=256, ep=2)
-CFGS = {"tp8": TP8, "ep2tp4": EP2TP4, "ep2tp4_b256": EP2TP4_B256}
+# I = 128: one FP8 ring item per expert, NVFP4 group 4.
+TP16 = dict(h=6144, e=256, i=128, fs=128, topk=8, b13=512, b2=128, ep=1)
+# 192 routed experts: the routing table is padded to 256 lanes.
+E192 = dict(h=6144, e=192, i=256, fs=256, topk=8, b13=512, b2=256, ep=1)
+CFGS = {
+    "tp8": TP8,
+    "ep2tp4": EP2TP4,
+    "ep2tp4_b256": EP2TP4_B256,
+    "tp16": TP16,
+    "e192": E192,
+}
 
-# (weight format, layout, rows, kernel kwargs) -> sha256 of the normalized HLO.
+# (weight format, layout, rows, kernel kwargs) -> sha256 of the lowered HLO.
 _HASHES = {
     ("fp8", "tp8", 16, (("fast", False),)): (
-        "b1e05590fe2d9a036dc51d5e0c4f616b19f5fb295459779372bf15389d6620e4"
+        "3889ddf81d0a0504f21246825499a9483df9ac1f2449e892e7b74504b417d4f4"
     ),
     ("fp8", "tp8", 16, (("fast", True), ("hbm_operands", True))): (
-        "030f0de08325ec25c0200176427433940d5a3154b7ced443d2e401fb821e7f18"
+        "14859a9ddace044faa741155002361a2671b4898e1f0bf49456cdd74d27a5a33"
     ),
     ("fp8", "ep2tp4", 64, (("fast", True), ("split_meta", True))): (
-        "d62dbf4d950a20615c5fa959870433dd21f28c889a2c7a3f0ec45a9932446631"
+        "baf87219b02d6279499a29ef12a1ae4cf13bce3a9880789b6c7aca653ddc0681"
+    ),
+    ("fp8", "tp16", 16, (("fast", True),)): (
+        "0ec610b3e52036fe06b0b90e0d9ceaff769e363b637067755bc4dcbf88690d3e"
+    ),
+    ("fp8", "tp16", 32, (("fast", False),)): (
+        "b4e516223e824cb462e14f7259a6f8b4bb43533a7d9f262cb54da37143c31a6f"
+    ),
+    ("fp8", "e192", 16, (("fast", True),)): (
+        "a26497afe01d90681c43cbdda56c6ee93c245b232c9499c07109792335ff6744"
     ),
     ("nvfp4", "tp8", 16, (("fast", False),)): (
-        "bdab0e323889b09ddb07b9f93580daff34c5b4213d2511a447555ff3d299df2b"
+        "d3d2231f4e09bedd509a328b36a4c13a2490f7328c354bcc60c8d88c7e4bc009"
     ),
     ("nvfp4", "tp8", 16, (("fast", True),)): (
-        "27bf2c26d9693a989c0e86c5f9ba4c4c3d042138c334b6145184489cb77ef278"
+        "73cf209b3be726cc7277f9e10dab733f7de4405fd752597955001ff16be60356"
     ),
     ("nvfp4", "ep2tp4", 64, (("fast", True),)): (
-        "7d5e0b127218f8ce1a14a1a0f55e2f7465590c132b0ea819fb8835e90900685b"
+        "dfc287b95def0bb0760398782cc8e1a14349e441ef5d3a90208e3bc6550e7184"
     ),
     ("nvfp4", "ep2tp4", 16, (("fast", True), ("split_meta", False))): (
-        "deadd8e460cbceb8f2fec3fa33017ee774fb8678455d0b427c89cc96b63102a4"
+        "d8a11b24ead52db1a8ae8e0f72f6a4ef1ab83eb2e6640dc9062ad1e8532514c6"
     ),
     ("nvfp4", "ep2tp4_b256", 32, (("fast", True), ("w2_n_chunk", 6144))): (
-        "47ffc0fc5f2c83672a8e41c1e22ad693459f154b9e6821e601550e57bf6990d3"
+        "969cdf9f23862d68a9ecbe19c2da516e0ee41d46ced9b390a67782f44e41b56c"
+    ),
+    ("nvfp4", "tp16", 16, (("fast", True),)): (
+        "0f59c2be60e17494b2cef3c00aa407a8b957b7fe0ba942709361cbc15f1b0bfa"
+    ),
+    ("nvfp4", "tp16", 64, (("fast", False),)): (
+        "a964e830017636c8234683ed7b5958835d2b4c35e76da2d5a7307d0f9f8ab418"
+    ),
+    ("nvfp4", "e192", 16, (("fast", True),)): (
+        "5dc8ef662708c946fe17c7b8b4ccea74a6e22b929c358c90356bdda44f89e101"
     ),
 }
 
-_BODY = re.compile(r"(\\22body\\22: \\22)([A-Za-z0-9+/=]+)(\\22)")
+
+def _pinned_jax_version() -> str:
+    pyproject = Path(__file__).resolve().parents[3] / "pyproject.toml"
+    deps = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
+    (pin,) = [d.split("==", 1)[1] for d in deps if d.startswith("jax==")]
+    return pin
 
 
 def _tpu7x():
@@ -107,7 +146,7 @@ def _shapes(rows, cfg, fmt):
 
 
 def _lower(fn, rows, cfg, fmt, kwargs):
-    """HLO text of fn under shard_map, lowered for TPU (abstract arguments)."""
+    """HLO text of fn under shard_map, lowered for TPU without locations."""
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("d",))
     specs = (P("d"), P("d"), P(), P(), P("d"), P("d")) + (P("d"),) * 8
 
@@ -131,33 +170,31 @@ def _lower(fn, rows, cfg, fmt, kwargs):
             body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
         )
     )
-    lowered = f.trace(*_shapes(rows, cfg, fmt)).lower(lowering_platforms=("tpu",))
-    return lowered.as_text()
+    limit = jax.config.jax_traceback_in_locations_limit
+    jax.config.update("jax_traceback_in_locations_limit", 0)
+    try:
+        lowered = f.trace(*_shapes(rows, cfg, fmt)).lower(lowering_platforms=("tpu",))
+        return lowered.as_text()
+    finally:
+        jax.config.update("jax_traceback_in_locations_limit", limit)
 
 
-def _normalized_hash(hlo: str) -> str:
-    from jax._src.lib import tpu as tpu_lib
-    from jax._src.lib.mlir import ir
-
-    def mosaic(m):
-        ctx = ir.Context()
-        ctx.allow_unregistered_dialects = True
-        tpu_lib.register_dialect(ctx)
-        with ctx:
-            module = ir.Module.parse(base64.b64decode(m.group(2)))
-            asm = module.operation.get_asm(enable_debug_info=False)
-        digest = hashlib.sha256(asm.encode()).hexdigest()
-        return f"{m.group(1)}MOSAIC:{digest}{m.group(3)}"
-
-    normalized, n = _BODY.subn(mosaic, hlo)
-    assert n == 1, f"expected one Mosaic kernel, found {n}"
-    return hashlib.sha256(normalized.encode()).hexdigest()
+def _case_id(case):
+    fmt, layout, rows, kw = case
+    return "-".join([fmt, layout, f"m{rows}", *(f"{k}={v}" for k, v in kw)])
 
 
-@pytest.mark.parametrize("case", list(_HASHES), ids=lambda c: "-".join(map(str, c[:3])))
-def test_lowering_matches_recorded_hash(monkeypatch, case):
-    if jax.__version__ != _JAX_VERSION:
-        pytest.skip(f"hashes recorded with jax {_JAX_VERSION}, not {jax.__version__}")
+def test_recorded_jax_version_is_the_pin():
+    assert _pinned_jax_version() == _JAX_VERSION, (
+        "pyproject.toml pins a different jax: re-record _HASHES under it and "
+        "update _JAX_VERSION"
+    )
+
+
+@pytest.mark.parametrize("case", list(_HASHES), ids=_case_id)
+def test_lowering_matches_recorded_hash(monkeypatch, request, case):
+    if jax.__version__ != _pinned_jax_version():
+        pytest.skip(f"installed jax {jax.__version__} is not the pinned one")
     fmt, layout, rows, kw = case
     kwargs = dict(kw)
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
@@ -168,10 +205,13 @@ def test_lowering_matches_recorded_hash(monkeypatch, case):
         fn = fp8_kernel.moe_tp_decode
     else:
         fn = moe_tp_decode_nvfp4
-    # A trace cached by another test would ignore the patched _split_meta.
+    # The jit trace cache ignores the patched _split_meta and TPU info: start
+    # and leave it empty.
     fn.clear_cache()
-    got = _normalized_hash(_lower(fn, rows, CFGS[layout], fmt, kwargs))
-    assert got == _HASHES[case], (
-        f"the TPU lowering of {case} changed: {got} (recorded {_HASHES[case]}). "
-        "If the change is intended, record the new hash in _HASHES."
+    request.addfinalizer(fn.clear_cache)
+    got = hashlib.sha256(_lower(fn, rows, CFGS[layout], fmt, kwargs).encode())
+    assert got.hexdigest() == _HASHES[case], (
+        f"the TPU lowering of {_case_id(case)} changed: {got.hexdigest()} "
+        f"(recorded {_HASHES[case]}). If the change is intended, record the new "
+        "hash in _HASHES."
     )
