@@ -526,7 +526,7 @@ def _inline_int_placeholders(graph: fx.GraphModule, example_inputs: list[Any]) -
     and graph_signature are unchanged; only their uses see the constant.
     """
     inlined = False
-    for node, value in zip(shape_variants._placeholder_nodes(graph), example_inputs):
+    for node, value in zip(shape_variants.placeholder_nodes(graph), example_inputs):
         if type(value) is int and node.users:
             # torch.fx types replace_with as a Node, but substitutes any
             # argument value into the users' args; here it is the int.
