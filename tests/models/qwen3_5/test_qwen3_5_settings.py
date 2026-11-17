@@ -151,11 +151,3 @@ def test_get_defaults_without_a_section(additional):
 def test_get_rejects_a_section_on_another_model(arch):
     with pytest.raises(ValueError, match="are not Qwen3.5"):
         settings.get(_vllm_config(arch, {"qwen3_5": {}}))
-
-
-def test_current_reads_the_config_being_built(monkeypatch, schema):
-    import vllm.config
-
-    cfg = _vllm_config(QWEN35, {"qwen3_5": {"a_int": 5}})
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: cfg)
-    assert settings.current() == _Schema(a_int=5)
