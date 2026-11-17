@@ -74,8 +74,8 @@ def _layout(monkeypatch, *, dp, tp, cores=8, mesh=True, groups_match=True, index
     monkeypatch.setattr(ps, "get_tp_group", lambda: SimpleNamespace(world_size=tp))
     monkeypatch.setattr(ps, "get_dp_group", lambda: SimpleNamespace(world_size=dp))
     monkeypatch.setattr(op, "ep_mesh_index", lambda: index)
-    check = Mock(name="_groups_match_mesh", return_value=groups_match)
-    monkeypatch.setattr(op, "_groups_match_mesh", check)
+    check = Mock(name="groups_match_mesh", return_value=groups_match)
+    monkeypatch.setattr(small_all_reduce_op, "groups_match_mesh", check)
     return check
 
 
@@ -86,7 +86,7 @@ def test_dp4_tp2_arms_the_op(monkeypatch, fresh):
     assert (op._DP, op._TP) == (4, 2)
     # Mesh index 5 is DP rank 2, TP rank 1 of the (dp, tp) view.
     assert op._RANK.tolist() == [2, 1]
-    check.assert_called_once_with(5, 4, 2)
+    check.assert_called_once_with(5, 2, 4)
     fresh.assert_called_once_with(TOPK)
 
 
@@ -104,7 +104,7 @@ def test_dp4_tp2_arms_the_op(monkeypatch, fresh):
 def test_other_layouts_leave_it_unarmed_without_the_groups_collective(
     monkeypatch, fresh, layout
 ):
-    """TP8 (the other IX decode layout), TP other than a chip's pair, a DP x TP
+    """TP8 (the other measured decode layout), TP other than a chip's pair, a DP x TP
     that is not the EP mesh, or one engine on a chip's pair (nothing to
     dispatch over DP): the default MoE path, and no collective."""
     check = _layout(monkeypatch, **layout)
@@ -198,14 +198,22 @@ def test_does_not_serve(monkeypatch, armed, scores_op, copies, sp, active):
 
 
 def test_retain_is_the_identity_when_unarmed(monkeypatch):
+    """Unarmed, even in the warmup and with the small collectives' mesh rank
+    buffer set: that buffer is not this op's."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    monkeypatch.setattr(shape_variants, "in_warmup", lambda: True)
     monkeypatch.setattr(op, "_RANK", None)
+    monkeypatch.setattr(small_all_reduce_op, "_RANK", torch.tensor([float("nan")]))
     out = torch.randn(4, 8)
     assert op.retain(out) is out
 
 
 def test_retain_reads_the_rank_buffer_in_the_warmup(monkeypatch):
     """A live read: a NaN rank buffer poisons the result."""
-    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: True)
+    from vllm_torchtpu.compilation import shape_variants
+
+    monkeypatch.setattr(shape_variants, "in_warmup", lambda: True)
     monkeypatch.setattr(op, "_RANK", torch.tensor([float("nan"), 0.0]))
     assert torch.isnan(op.retain(torch.zeros(4, 8))).all()
     monkeypatch.setattr(op, "_RANK", torch.tensor([3, 1], dtype=torch.int32))

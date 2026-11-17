@@ -15,6 +15,7 @@
 all-reduce of a small block, and the reduce-scatter of the DP MoE combine."""
 
 import contextlib
+from collections.abc import Collection, Sequence
 from typing import Any
 
 import jax
@@ -162,21 +163,47 @@ def _build_tp_all_reduce(mesh, tp: int, form: str | None):
     )
 
 
-def _tp_pairs_match_mesh(mesh_index: int, tp: int) -> bool:
-    """Whether every core's TP group is the block of `tp` consecutive mesh
-    indices it sits in, agreed over the EP group."""
+def _groups_on_mesh_blocks(
+    order: Sequence[int] | None,
+    mesh_index: int,
+    tp_ranks: Collection[int],
+    tp: int,
+    dp_ranks: Collection[int] | None = None,
+    dp: int = 0,
+) -> bool:
+    """Whether this core's TP group (``tp_ranks``) is the block of ``tp``
+    consecutive mesh indices it sits in and, given ``dp_ranks``, its DP group
+    is the ``dp`` cores with its TP index. ``order`` maps mesh index to rank
+    (``ep_rank_order``)."""
+    if order is None or len(tp_ranks) != tp:
+        return False
+    block = mesh_index - mesh_index % tp
+    if not all(order[block + j] in tp_ranks for j in range(tp)):
+        return False
+    if dp_ranks is None:
+        return True
+    t = mesh_index % tp
+    return len(dp_ranks) == dp and set(dp_ranks) == {
+        order[j * tp + t] for j in range(dp)
+    }
+
+
+def groups_match_mesh(mesh_index: int, tp: int, dp: int = 0) -> bool:
+    """Whether every core's TP group is the block of ``tp`` consecutive mesh
+    indices it sits in and, when ``dp`` is given, every core's DP group is the
+    ``dp`` cores with its TP index; agreed over the EP group (a collective)."""
     import torch.distributed as dist
-    from vllm.distributed.parallel_state import get_tp_group
+    from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 
     from vllm_torchtpu.distributed.ep_mesh import ep_rank_order
 
-    order = ep_rank_order()
-    tp_ranks = tuple(int(r) for r in get_tp_group().ranks)
-    block = mesh_index - mesh_index % tp
-    mine = (
-        order is not None
-        and len(tp_ranks) == tp
-        and all(order[block + j] in tp_ranks for j in range(tp))
+    mine = _groups_on_mesh_blocks(
+        ep_rank_order(),
+        mesh_index,
+        tuple(int(r) for r in get_tp_group().ranks),
+        tp,
+        tuple(int(r) for r in get_dp_group().ranks) if dp else None,
+        dp,
     )
     group = get_ep_group()
     assert group is not None  # the caller found the EP mesh
@@ -256,7 +283,7 @@ def prebuild(vllm_config: Any) -> None:
         and tp == TP_PAIR_SIZE
         and tp < _CORES
         and _CORES % tp == 0
-        and _tp_pairs_match_mesh(index, tp)
+        and groups_match_mesh(index, tp)
     ):
         _TP_RANKS = tuple(int(r) for r in get_tp_group().ranks)
         _TP_RANK = torch.tensor([index % tp], dtype=torch.int32, device="tpu")
