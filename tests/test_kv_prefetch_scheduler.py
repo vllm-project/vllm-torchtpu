@@ -156,6 +156,9 @@ def _make_sched(
             kv_connector="DecodeBenchConnector", kv_role=role
         ),
         device_config=DeviceConfig("cpu"),
+        additional_config=(
+            {"tpu_scheduler": {"kv_prefetch": True}} if prefetch else {}
+        ),
     )
     vllm_config.kv_transfer_config.kv_connector = _CONNECTOR
     vllm_config.cache_config.num_gpu_blocks = num_blocks
@@ -178,9 +181,10 @@ def _make_sched(
         block_size=BLOCK,
         log_stats=True,
     )
-    # A KV consumer gets the default (8 held, 512 reserved blocks); the tests
+    # The kv_prefetch option gives 8 held and 512 reserved blocks; the tests
     # drive other depths and reserves through the same attributes.
-    if s._kv_prefetch_n:
+    if prefetch:
+        assert s._kv_prefetch_n == 8
         s._kv_prefetch_n = prefetch
     s._kv_prefetch_reserve = reserve
     return s
@@ -446,9 +450,10 @@ def test_request_without_async_load_stops_prefetch_and_never_passes_cap(
     assert len(eng.s.running) == CAP
 
 
-def test_gate_ignored_on_kv_producer(tmp_path, monkeypatch):
-    s = _make_sched(tmp_path, monkeypatch, prefetch=4, role="kv_producer")
-    assert s._kv_prefetch_n == 0
+def test_the_option_is_refused_on_a_kv_producer(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="kv_prefetch"):
+        _make_sched(tmp_path, monkeypatch, prefetch=4, role="kv_producer")
+    assert _make_sched(tmp_path, monkeypatch, role="kv_producer")._kv_prefetch_n == 0
 
 
 @pytest.mark.parametrize("prefetch", [0, 1, 4])
@@ -514,16 +519,16 @@ def test_randomized_cap_bound_and_no_leaks(tmp_path, monkeypatch, prefetch):
     assert all(b.ref_cnt == 0 for b in pool.blocks)
 
 
-def test_a_kv_consumer_prefetches_by_default(tmp_path, monkeypatch):
+def test_a_kv_consumer_prefetches_only_with_the_option(tmp_path, monkeypatch):
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    s._is_kv_consumer = True
-    s.connector = object()
+    s._kv_prefetch_switch = True
     s._init_kv_prefetch()
     assert (s._kv_prefetch_n, s._kv_prefetch_reserve) == (8, 512)
-    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    s._is_kv_consumer = True
-    s.connector = None
+    s._kv_prefetch_switch = False
     s._init_kv_prefetch()
     assert s._kv_prefetch_n == 0
-    s = _make_sched(tmp_path, monkeypatch, role="kv_producer")
-    assert s._kv_prefetch_n == 0
+    # On the real scheduler: a consumer without the option keeps vLLM's loop.
+    s = _make_sched(tmp_path, monkeypatch)
+    assert s._kv_prefetch_n == 0 and s._is_kv_consumer
+    s = _make_sched(tmp_path, monkeypatch, prefetch=8)
+    assert s._kv_prefetch_n == 8
