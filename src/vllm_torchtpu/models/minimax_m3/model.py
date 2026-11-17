@@ -48,6 +48,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             quant_config,
             vllm_config.cache_config,
             prefix=f"{prefix}.self_attn",
+            layer_id=layer_id,
         )
         # Dense layers name their FFN `mlp`, MoE layers `block_sparse_moe`.
         self.is_moe_layer = bool(config.moe_layer_freq[layer_id])
@@ -72,13 +73,19 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        index_reuse: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`index_reuse` (MSA index reuse on) is the step's shared selection
+        dict (`MiniMaxM3SparseAttention.forward`)."""
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
+        if index_reuse is None:
+            hidden_states = self.self_attn(positions, hidden_states)
+        else:
+            hidden_states = self.self_attn(positions, hidden_states, index_reuse)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         return ffn(hidden_states), residual
@@ -106,6 +113,11 @@ class MiniMaxM3Model(nn.Module):
         # residual added, before the next norm) are also returned; set by
         # the DSpark drafter before the first trace.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        # MSA index reuse (`index_reuse`): the layers share one dict per step;
+        # only when some layer's op runs it (else the calls are unchanged).
+        self.index_reuse = any(
+            layer.self_attn.index_reuse_full is not None for layer in self.layers
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -123,8 +135,9 @@ class MiniMaxM3Model(nn.Module):
         aux_hidden_states = []
         if 0 in self.aux_hidden_state_layers:
             aux_hidden_states.append(inputs_embeds)
+        reuse = {"index_reuse": {}} if getattr(self, "index_reuse", False) else {}
         for idx, layer in enumerate(self.layers):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(positions, hidden_states, residual, **reuse)
             if idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)

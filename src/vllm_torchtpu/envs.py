@@ -255,6 +255,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
+    TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE: str = ""
 
 
 def env_with_choices(
@@ -1628,6 +1629,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Not bit-identical.
     "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION", ""
+    ),
+    # MiniMax M3 MSA cross-layer block-selection reuse (IndexCache) on
+    # decode-sized steps under DCP (`models.minimax_m3.index_reuse`): the
+    # pattern of Full layers, which run the indexer; the other (Shared) layers
+    # attend over the nearest preceding Full layer's selection. "N" or
+    # "stride:N" (Full layers 0, N, 2N, ...), "full:0,a,b,..." (explicit Full
+    # list, must hold 0) or one F/S letter per layer. Empty (or "1") = off.
+    # Lossy. Prefill steps are unchanged.
+    "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE": env_str(
+        "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE", ""
     ),
 }
 

@@ -647,6 +647,97 @@ def _class_candidates(
     )
 
 
+def _write_tokens(
+    k: jax.Array,
+    v: jax.Array,
+    index_k: jax.Array,
+    kv_cache: jax.Array,
+    index_cache: jax.Array,
+    scale_cache: jax.Array | None,
+    pages: jax.Array,
+    pos: jax.Array,
+    *,
+    max_num_seqs: int,
+    interpret: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    """Write a step's K/V rows and index keys at their owner `pages`
+    (4-bit caches with `scale_cache`): ``(kv_cache, index_cache,
+    scale_cache)``."""
+    if scale_cache is not None:
+        return msa.write_fp4(
+            kv_cache,
+            index_cache,
+            scale_cache,
+            k,
+            v,
+            index_k,
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
+    kv_rows = jnp.concatenate([k, v], axis=-1).reshape(k.shape[0], -1)
+    kv_cache, index_cache = msa.write_caches(
+        [msa_write.Rows(kv_cache, kv_rows), msa_write.Rows(index_cache, index_k)],
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
+    return kv_cache, index_cache, None
+
+
+def msa_write_dcp(
+    k: jax.Array,
+    v: jax.Array,
+    index_k: jax.Array,
+    kv_cache: jax.Array,
+    index_cache: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    rank: int | jax.Array,
+    dcp: int,
+    scale_cache: jax.Array | None = None,
+    interpret: bool = False,
+) -> tuple[jax.Array, ...]:
+    """The writes of `msa_write_and_candidates_dcp` alone, the same cache
+    bytes, for a Shared layer of MSA index reuse (`index_reuse`: it attends
+    over a Full layer's selection, so it scores nothing). Returns
+    ``(kv_cache, index_cache[, scale_cache])``."""
+    num_tokens = k.shape[0]
+    rank = rank_array(rank)[0]
+    block_size = msa.page_size(kv_cache)
+    max_num_seqs = seq_lens.shape[0]
+    block_tables_2d = block_tables.reshape(max_num_seqs, -1)
+    seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
+    pages = owner_pages(
+        block_tables_2d,
+        seq_id,
+        pos,
+        valid,
+        block_size=block_size,
+        rank=rank,
+        dcp=dcp,
+    )
+    kv_cache, index_cache, scale_cache = _write_tokens(
+        k,
+        v,
+        index_k,
+        kv_cache,
+        index_cache,
+        scale_cache,
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
+    if scale_cache is None:
+        return kv_cache, index_cache
+    return kv_cache, index_cache, scale_cache
+
+
 def msa_write_and_candidates_dcp(
     k: jax.Array,
     v: jax.Array,
@@ -698,29 +789,20 @@ def msa_write_and_candidates_dcp(
     )
     fp4 = scale_cache is not None
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
+    kv_cache, index_cache, scale_cache = _write_tokens(
+        k,
+        v,
+        index_k,
+        kv_cache,
+        index_cache,
+        scale_cache,
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
     if fp4:
-        kv_cache, index_cache, scale_cache = msa.write_fp4(
-            kv_cache,
-            index_cache,
-            scale_cache,
-            k,
-            v,
-            index_k,
-            pages,
-            pos,
-            max_num_seqs=max_num_seqs,
-            interpret=interpret,
-        )
         index_q = msa_fp4.rotate_queries(index_q)
-    else:
-        kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
-        kv_cache, index_cache = msa.write_caches(
-            [msa_write.Rows(kv_cache, kv_rows), msa_write.Rows(index_cache, index_k)],
-            pages,
-            pos,
-            max_num_seqs=max_num_seqs,
-            interpret=interpret,
-        )
     local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
         local_candidates,
@@ -800,7 +882,8 @@ def msa_attend_dcp(
     scale_cache: jax.Array | None = None,
     q_head_major: bool = False,
     interpret: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+    return_selected: bool = False,
+) -> tuple[jax.Array, ...]:
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
 
@@ -816,7 +899,9 @@ def msa_attend_dcp(
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
     leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
-    sends each rank its block (`attend_and_merge`).
+    sends each rank its block (`attend_and_merge`). With `return_selected`
+    the merged selection ``[T, G, topk]`` int32 follows (MSA index reuse,
+    `index_reuse`).
     """
     num_tokens = q.shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
@@ -826,6 +911,89 @@ def msa_attend_dcp(
     pages_per_seq = block_tables_2d.shape[1]
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
     selected = merge_head_candidates(candidates, topk, interpret)  # [T, G, topk]
+    out = _attend_selected(
+        q,
+        kv_cache,
+        selected,
+        block_tables,
+        (seq_id, pos, valid),
+        num_tokens=num_tokens,
+        rank=rank,
+        block_size=block_size,
+        pages_per_seq=pages_per_seq,
+        dcp=dcp,
+        sm_scale=sm_scale,
+        scale_cache=scale_cache,
+        q_head_major=q_head_major,
+        interpret=interpret,
+    )
+    if return_selected:
+        return (*out, selected)
+    return out
+
+
+def msa_attend_selected_dcp(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    selected: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    sm_scale: float,
+    rank: int | jax.Array,
+    dcp: int,
+    scale_cache: jax.Array | None = None,
+    q_head_major: bool = False,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`msa_attend_dcp` after the candidate merge: attend over the merged
+    ``selected [T, G, topk]`` int32 (the same on every rank of the group; MSA
+    index reuse hands a Full layer's to the Shared layers after it)."""
+    num_tokens = q.shape[1 if q_head_major else 0]
+    rank = rank_array(rank)[0]
+    block_size = msa.page_size(kv_cache)
+    max_num_seqs = seq_lens.shape[0]
+    block_tables_2d = block_tables.reshape(max_num_seqs, -1)
+    pages_per_seq = block_tables_2d.shape[1]
+    seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
+    return _attend_selected(
+        q,
+        kv_cache,
+        selected,
+        block_tables,
+        (seq_id, pos, valid),
+        num_tokens=num_tokens,
+        rank=rank,
+        block_size=block_size,
+        pages_per_seq=pages_per_seq,
+        dcp=dcp,
+        sm_scale=sm_scale,
+        scale_cache=scale_cache,
+        q_head_major=q_head_major,
+        interpret=interpret,
+    )
+
+
+def _attend_selected(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    selected: jax.Array,
+    block_tables: jax.Array,
+    tokens: tuple[jax.Array, jax.Array, jax.Array],
+    *,
+    num_tokens: int,
+    rank: jax.Array,
+    block_size: int,
+    pages_per_seq: int,
+    dcp: int,
+    sm_scale: float,
+    scale_cache: jax.Array | None,
+    q_head_major: bool,
+    interpret: bool,
+) -> tuple[jax.Array, jax.Array]:
+    """The attention of `msa_attend_dcp` over a merged selection."""
+    seq_id, pos, valid = tokens
     num_heads = selected.shape[1]
     own_block = pos // block_size
     local_key = jnp.where(
@@ -1096,6 +1264,13 @@ def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Arr
     return jax.lax.dynamic_slice_in_dim(both, rank * q.shape[0], 2 * q.shape[0])
 
 
+# `attend_and_merge`'s `selection` (MSA index reuse, `index_reuse`):
+# "candidates" takes the local candidates (the default program), "return"
+# also returns the merged selection (a Full layer), "given" takes a merged
+# selection instead of candidates (a Shared layer).
+SELECTIONS = ("candidates", "return", "given")
+
+
 def attend_and_merge(
     rank: jax.Array,
     q: jax.Array,
@@ -1112,7 +1287,8 @@ def attend_and_merge(
     sm_scale: float,
     topk: int,
     interpret: bool = False,
-) -> jax.Array:
+    selection: str = "candidates",
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """The attention half of the DCP forward over one KV head, inside a
     ``shard_map`` over `axis` (the DCP group): this rank's head-major query
     heads ``q [Hl, T, D]`` (rotated for a 4-bit cache, then pass its
@@ -1124,32 +1300,60 @@ def attend_and_merge(
     its LSEs go to their owner by all-to-all for `merge_partials`. As XLA
     collectives in one program they move the head-major buffers as laid out;
     torch's all-to-all of them cost ~890 us per layer at 8K tokens (c4 twin,
-    j-c60806bf)."""
+    j-c60806bf).
+
+    MSA index reuse (`index_reuse`, `SELECTIONS`): with ``selection``
+    "return" this rank's copy of the merged selection ``[T, 1, topk]`` int32
+    follows the output (a Full layer); with "given", ``candidates`` is that
+    merged selection (the same on every rank) and is attended as it is (a
+    Shared layer: no candidate gather, no merge)."""
+    if selection not in SELECTIONS:
+        raise ValueError(f"selection must be one of {SELECTIONS}, got {selection!r}")
     num_heads, num_tokens, head_dim = q.shape
     rank = rank_array(rank)[0]
     q_all = _gather_heads(q, rank, axis, dcp)
     # Decode-sized operands of a pair move by permutes (latency); a prefill
     # step's partials by XLA's all-to-all, which writes them in place.
     small = dcp == 2 and num_tokens <= DCP_SMALL_BATCH_TOKENS
-    if small:
-        cand_all = gather_by_permute(candidates, rank, axis, dcp)
+    selected = None
+    if selection == "given":
+        out, lse = msa_attend_selected_dcp(
+            q_all,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            sm_scale=sm_scale,
+            rank=rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+            q_head_major=True,
+            interpret=interpret,
+        )
     else:
-        cand_all = jax.lax.all_gather(candidates, axis, axis=0)
-    out, lse = msa_attend_dcp(
-        q_all,
-        kv_cache,
-        cand_all,
-        seq_lens,
-        block_tables,
-        cu_q_lens,
-        sm_scale=sm_scale,
-        topk=topk,
-        rank=rank,
-        dcp=dcp,
-        scale_cache=scale_cache,
-        q_head_major=True,
-        interpret=interpret,
-    )
+        if small:
+            cand_all = gather_by_permute(candidates, rank, axis, dcp)
+        else:
+            cand_all = jax.lax.all_gather(candidates, axis, axis=0)
+        out, lse, *rest = msa_attend_dcp(
+            q_all,
+            kv_cache,
+            cand_all,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            sm_scale=sm_scale,
+            topk=topk,
+            rank=rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+            q_head_major=True,
+            interpret=interpret,
+            return_selected=selection == "return",
+        )
+        if rest:
+            (selected,) = rest
     # Block r of each result came from rank r: its partial of this rank's heads.
     parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
     lses = lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1)
@@ -1158,4 +1362,7 @@ def attend_and_merge(
     else:
         parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
         lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
-    return merge_partials(parts, lses, hadamard, interpret=interpret)
+    merged = merge_partials(parts, lses, hadamard, interpret=interpret)
+    if selected is not None:
+        return merged, selected
+    return merged

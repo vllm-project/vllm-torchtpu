@@ -39,6 +39,8 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3 import index_reuse as msa_index_reuse
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
@@ -46,6 +48,8 @@ from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_sharded_op,
 )
 from vllm_torchtpu.models.minimax_m3.ops.qk_norm_rope import get_qk_norm_rope_op
+
+logger = init_logger(__name__)
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -257,6 +261,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         prefix: str,
+        layer_id: int | None = None,
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -356,6 +361,24 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_cfg.get("sparse_init_block", 0),
             sparse_cfg.get("sparse_local_block", 0),
         )
+        # Cross-layer reuse of the block selection on decode steps
+        # (`index_reuse`, TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE; lossy).
+        plan = (
+            msa_index_reuse.plan_from_env(config.num_hidden_layers)
+            if layer_id is not None
+            else None
+        )
+        if plan is not None and self.dcp_size == 1:
+            logger.warning_once(
+                "%s: MSA index reuse needs --decode-context-parallel-size > 1; "
+                "refused, every layer stays Full.",
+                msa_index_reuse.ENV,
+            )
+            plan = None
+        spec = vllm_config.speculative_config
+        # The most query rows of a decode request (`index_reuse.is_decode_step`).
+        self.decode_rows = 1 + (spec.num_speculative_tokens if spec else 0)
+        self.layer_id = layer_id
         if self.dcp_size > 1:
             from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_dcp_world_size
 
@@ -364,14 +387,17 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"DCP group of {get_dcp_world_size()} ranks, expected "
                     f"{self.dcp_size}."
                 )
-            spec = vllm_config.speculative_config
+            reuse_kwargs = {"index_reuse": True} if plan is not None else {}
             self.msa_op = get_msa_dcp_op(
                 *msa_config,
                 self.dcp_size,
                 self.kv_head_replicas,
                 fp4=self.fp4,
-                decode_rows=1 + (spec.num_speculative_tokens if spec else 0),
+                decode_rows=self.decode_rows,
+                **reuse_kwargs,
             )
+            if plan is not None and not self.msa_op.index_reuse:
+                plan = None  # refused by the op's paths (logged there)
             # A buffer, not a Python int, so the rank is a graph input and
             # every DCP rank compiles the same program (see get_msa_dcp_op).
             self.register_buffer(
@@ -391,6 +417,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             )
         else:
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
+        # Set only when reuse runs: whether this layer scores on decode steps.
+        self.index_reuse_full = None if plan is None else plan.is_full(layer_id)
         # A DCP group over one KV head reads q head-major (`get_msa_dcp_op`).
         self.q_head_major = self.dcp_size > 1 and self.dcp_kv_heads == 1
         self.norm_rope_op = get_qk_norm_rope_op(
@@ -402,8 +430,14 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        index_reuse: dict | None = None,
     ) -> torch.Tensor:
+        """``index_reuse`` (MSA index reuse on) is a dict the step's layers
+        share: on a decode step a Full layer leaves its selection in it for
+        the Shared layers after it."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
@@ -437,6 +471,15 @@ class MiniMaxM3SparseAttention(nn.Module):
                 extra["scale_cache"] = self.scale_cache.kv_cache
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
+            if (
+                index_reuse is not None
+                and self.index_reuse_full is not None
+                and msa_index_reuse.is_decode_step(
+                    num_tokens, layer_metadata.seq_lens.shape[0], self.decode_rows
+                )
+            ):
+                extra["index_reuse"] = index_reuse
+                extra["full"] = self.index_reuse_full
             attn_output = self.msa_op(
                 q,
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
