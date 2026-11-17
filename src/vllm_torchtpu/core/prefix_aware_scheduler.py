@@ -350,17 +350,6 @@ class PrefixAwareScheduler(AsyncScheduler):
             # Off a decode leg: the warmest-first admission alone.
             self._promote_warmest(self.kv_holding_waiting or self.waiting)
             return super().schedule(*args, **kwargs)
-        connector = getattr(self, "connector", None)
-        if connector is not None:
-            poll_fn = getattr(connector, "poll_and_complete_transfers", None)
-            if callable(poll_fn):
-                try:
-                    poll_fn(self)
-                except Exception:
-                    logger.exception(
-                        "PrefixAwareScheduler: poll_and_complete_transfers failed."
-                    )
-
         # Decoders first: vLLM schedules ``running`` in list order and a
         # partial prefill takes min(remaining, budget), so a prefill ahead of
         # a decoder can leave it no tokens. Stably move every decoding request
@@ -612,6 +601,18 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple["KVCacheBlocks", int, int, bool]:
+        """Serves the admission lookup from a still-exact memo.
+
+        Without divergent hybrid hits, vLLM 0.33's
+        ``Scheduler._get_local_prefix_cache_hit`` returns
+        ``KVCacheManager.get_computed_blocks`` and ``False``. For a memoised
+        ``find_longest_cache_hit`` result the memo branch returns what that
+        method returns: the same blocks (fresh lists), hit length and
+        shared-prefix boundary. It only skips the lookup. That method records
+        no prefix-cache stats (the scheduler records them at admission), and
+        requests whose ``full`` KV-event report mode makes it emit events go
+        to it.
+        """
         connector = getattr(self, "connector", None)
         if connector is None or not connector.supports_divergent_local_hybrid_hits:
             kvm = self.kv_cache_manager
@@ -632,60 +633,22 @@ class PrefixAwareScheduler(AsyncScheduler):
                 )
                 cached = self._memo_get(request, epoch, max_len)
                 if cached is not None:
-                    hit = cached[2]
-                    if len(hit) == 3:
-                        computed_blocks, num_new_computed_tokens, num_uncached = hit
-                    else:
-                        computed_blocks, num_new_computed_tokens = hit
-                        num_uncached = 0
-                    if isinstance(computed_blocks, tuple):
-                        # Fresh lists, as a fresh lookup would return; the
-                        # memo itself must never be mutated downstream.
-                        computed_blocks = tuple(list(b) for b in computed_blocks)
+                    computed_blocks, num_new_computed_tokens, num_uncached = cached[2]
                     shared_prefix_boundary = (
                         num_new_computed_tokens + num_uncached if num_uncached else 0
                     )
-                    blocks = kvm.create_kv_cache_blocks(computed_blocks)
-                    cast(Any, request)._tpu_local_hit_tokens = num_new_computed_tokens
+                    # Fresh lists, as a fresh lookup returns; the memo itself
+                    # must never be mutated downstream.
+                    blocks = kvm.create_kv_cache_blocks(
+                        tuple(list(b) for b in computed_blocks)
+                    )
                     return (
                         blocks,
                         num_new_computed_tokens,
                         shared_prefix_boundary,
                         False,
                     )
-        blocks, num_local, shared_prefix_boundary, hit_diverged = (
-            super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
-        )
-        if hit_diverged and hasattr(connector, "resolve_divergent_local_hit_tokens"):
-            kvm = self.kv_cache_manager
-            reconciled_blocks, num_reconciled, reconciled_boundary = (
-                kvm.get_computed_blocks(request, max_cache_hit_length)
-            )
-            block_size = self._get_block_size()
-            target_local = connector.resolve_divergent_local_hit_tokens(
-                request, num_local, num_reconciled, block_size
-            )
-            if target_local is None:
-                cast(Any, request)._tpu_local_hit_tokens = num_reconciled
-                return (
-                    reconciled_blocks,
-                    num_reconciled,
-                    reconciled_boundary,
-                    False,
-                )
-            if target_local <= 0:
-                cast(Any, request)._tpu_local_hit_tokens = 0
-                return (
-                    kvm.empty_kv_cache_blocks,
-                    0,
-                    reconciled_boundary,
-                    False,
-                )
-            if target_local < num_local:
-                blocks = kvm.truncate_computed_blocks(blocks, target_local)
-                num_local = target_local
-        cast(Any, request)._tpu_local_hit_tokens = num_local
-        return blocks, num_local, shared_prefix_boundary, hit_diverged
+        return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
 
     def _rank_and_warmth(
         self, request: Request
