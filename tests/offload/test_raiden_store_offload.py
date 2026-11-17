@@ -1647,7 +1647,7 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
             self.assertIs(sched._build_store_jobs(MagicMock()), jobs)
         sched._touch.assert_not_called()
 
-    def test_matched_tokens_forwards_the_load_cap_and_refreshes_recency(self):
+    def test_matched_tokens_forwards_max_num_new_tokens_and_refreshes_recency(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             OffloadingConnectorScheduler,
         )
