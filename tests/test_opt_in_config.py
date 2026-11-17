@@ -82,6 +82,10 @@ REPLACED_ENV = {
     "minimax_dcp_hp_prefill_config": "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG",
     "minimax_dcp_merge_a2a_max_tokens": "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS",
     "minimax_dcp_qcand_gather_max_tokens": "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS",
+    "minimax_sp_mode": "TPU_MINIMAX_M3_SP_MODE",
+    "minimax_sp_min_tokens": "TPU_MINIMAX_M3_SP_MIN_TOKENS",
+    "minimax_sp_fp8_gather": "TPU_MINIMAX_M3_SP_FP8_GATHER",
+    "minimax_sp_fp8_attn_gather": "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -111,6 +115,8 @@ SAMPLE = {
     "minimax_dcp_hp_prefill_config": "16:16::1024",
     "minimax_dcp_merge_a2a_max_tokens": 512,
     "minimax_dcp_qcand_gather_max_tokens": 512,
+    "minimax_sp_mode": "full",
+    "minimax_sp_min_tokens": 1024,
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {

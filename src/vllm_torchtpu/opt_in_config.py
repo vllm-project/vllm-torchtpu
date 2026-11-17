@@ -237,6 +237,20 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # after the scoring op instead of two (bitwise).
     "minimax_dcp_merge_a2a_max_tokens": 0,
     "minimax_dcp_qcand_gather_max_tokens": 0,
+    # MiniMax M3 sequence parallelism (`models/minimax_m3/model.py`) on
+    # steps of at least minimax_sp_min_tokens tokens (0 = 4096) that are a
+    # multiple of TP: "attn" reduce-scatters the attention output with the
+    # residual, normalizes the token shard, all-gathers it as the FFN input
+    # and folds the attention partial into the FFN all-reduce; "full" keeps
+    # the residual stream a token shard through every layer (all-gather
+    # before attention and FFN, reduce-scatter after). "" / "off" = two
+    # all-reduces per layer. Not bitwise (another reduction order).
+    "minimax_sp_mode": "",
+    "minimax_sp_min_tokens": 0,
+    # With minimax_sp_mode: the FFN-input / ("full") attention-input
+    # all-gathers send e4m3 rows with a per-row f32 scale. Lossy.
+    "minimax_sp_fp8_gather": False,
+    "minimax_sp_fp8_attn_gather": False,
 }
 
 

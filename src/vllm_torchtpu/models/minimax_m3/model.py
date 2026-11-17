@@ -13,15 +13,22 @@
 # limitations under the License.
 """MiniMax M3 (text) on TPU."""
 
+import contextlib
 import dataclasses
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import NamedTuple
 
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -38,6 +45,7 @@ from vllm.model_executor.models.utils import (
 )
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
@@ -81,6 +89,96 @@ def _stream_sum(hidden_states: Stream, residual: Stream) -> torch.Tensor:
     if isinstance(hidden_states, tuple):
         return torch.cat([h + r for h, r in zip(hidden_states, residual)])
     return hidden_states + residual
+
+
+# --- Sequence parallelism (additional_config minimax_sp_*) ---
+
+SP_MODES = ("", "off", "attn", "full")
+# minimax_sp_min_tokens = 0 with a mode set: steps of at least this many.
+_SP_DEFAULT_MIN_TOKENS = 4096
+_FP8_MAX = 448.0
+
+
+class SpConfig(NamedTuple):
+    """Sequence parallelism of large steps (see `MiniMaxM3Model.forward`):
+    `mode` "attn" or "full" ("" = off), on steps of at least `min_tokens`
+    tokens that are a multiple of the TP size; `fp8_gather` /
+    `fp8_attn_gather` send the FFN / attention input all-gathers as e4m3
+    rows with a per-row f32 scale."""
+
+    mode: str = ""
+    min_tokens: int = 0
+    fp8_gather: bool = False
+    fp8_attn_gather: bool = False
+
+
+_sp_logged = False
+
+
+def sp_config(additional_config) -> SpConfig:
+    """The minimax_sp_* keys, checked (logs the resolved config once)."""
+    global _sp_logged
+    mode = option(additional_config, "minimax_sp_mode").strip().lower()
+    if mode not in SP_MODES:
+        raise ValueError(
+            f"additional_config.minimax_sp_mode must be one of {SP_MODES[1:]}, "
+            f"got {mode!r}"
+        )
+    min_tokens = option(additional_config, "minimax_sp_min_tokens")
+    if min_tokens < 0:
+        raise ValueError(
+            f"additional_config.minimax_sp_min_tokens must be >= 0, got {min_tokens}"
+        )
+    fp8 = option(additional_config, "minimax_sp_fp8_gather")
+    fp8_attn = option(additional_config, "minimax_sp_fp8_attn_gather")
+    if mode in ("", "off"):
+        if (min_tokens or fp8 or fp8_attn) and not _sp_logged:
+            _sp_logged = True
+            logger.warning(
+                "additional_config minimax_sp_min_tokens / minimax_sp_fp8_* "
+                "act only with minimax_sp_mode attn or full: no effect."
+            )
+        return SpConfig()
+    config = SpConfig(mode, min_tokens or _SP_DEFAULT_MIN_TOKENS, fp8, fp8_attn)
+    if not _sp_logged:
+        _sp_logged = True
+        logger.info(
+            "MiniMax-M3 sequence parallelism on: additional_config minimax_sp_mode=%s "
+            "minimax_sp_min_tokens=%d minimax_sp_fp8_gather=%s "
+            "minimax_sp_fp8_attn_gather=%s",
+            *config,
+        )
+    return config
+
+
+def _sp_step(config: SpConfig, num_tokens: int, tp_size: int) -> bool:
+    """Whether a step of `num_tokens` runs the sequence-parallel path.
+
+    Only inside a warmup trace, which gives each side of this branch its own
+    trace (compilation/shape_variants.py, from the shape guards these
+    comparisons leave); eager forwards and any other trace keep the plain
+    path.
+    """
+    return bool(
+        config.mode
+        and tp_size > 1
+        and torch.compiler.is_compiling()
+        and shape_variants.aot_cache_tag()
+        and num_tokens >= config.min_tokens
+        and num_tokens % tp_size == 0
+    )
+
+
+def _all_gather_rows(x: torch.Tensor, fp8: bool) -> torch.Tensor:
+    """All-gather token rows over TP; `fp8` sends each bf16 row as e4m3 with
+    a per-row f32 scale (amax / 448) and dequantizes on arrival (lossy: the
+    receiver's rows, its own included, carry e4m3 precision)."""
+    if not fp8:
+        return tensor_model_parallel_all_gather(x, 0)
+    scale = x.abs().amax(dim=-1, keepdim=True).float().clamp(min=1e-12) / _FP8_MAX
+    q = tensor_model_parallel_all_gather((x.float() / scale).to(torch.float8_e4m3fn), 0)
+    scale = tensor_model_parallel_all_gather(scale, 0)
+    return (q.float() * scale).to(x.dtype)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -133,6 +231,45 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.sp = sp_config(additional)
+
+    @contextlib.contextmanager
+    def _layer_owned_reductions(self) -> Iterator[None]:
+        """While tracing a sequence-parallel step, o_proj and the FFN return
+        per-rank partial sums and the layer reduces them; every other trace
+        keeps their own all-reduces, so the other programs are unchanged."""
+        o_proj = self.self_attn.o_proj
+        if self.is_moe_layer:
+            experts = self.block_sparse_moe.experts
+            # Layers armed with a MoE op that all-reduces inside it
+            # (fused_moe_decode / moe_tp_decode) ignore skip_final_all_reduce.
+            from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+                moe_tp_decode_supported,
+            )
+
+            if getattr(experts, "_fused_moe_decode_armed", False) or (
+                moe_tp_decode_supported(getattr(experts, "_quant_method", None))
+            ):
+                raise ValueError(
+                    "additional_config.minimax_sp_mode needs a MoE that leaves "
+                    "its all-reduce to the model; this layer's MoE op reduces "
+                    "inside it (fused MoE decode / TP decode kernel)."
+                )
+            cfg = experts.moe_config
+            saved = (o_proj.reduce_results, cfg.skip_final_all_reduce)
+            o_proj.reduce_results, cfg.skip_final_all_reduce = False, True
+        else:
+            down = self.mlp.down_proj
+            saved = (o_proj.reduce_results, down.reduce_results)
+            o_proj.reduce_results = down.reduce_results = False
+        try:
+            yield
+        finally:
+            if self.is_moe_layer:
+                o_proj.reduce_results, cfg.skip_final_all_reduce = saved
+            else:
+                o_proj.reduce_results, down.reduce_results = saved
 
     def forward(
         self,
@@ -140,12 +277,19 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         attn_metadata: dict | None = None,
+        attn_rs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Residual-deferred layer; `attn_rs` (minimax_sp_mode "attn", large
+        steps) reduce-scatters the attention output instead of all-reducing
+        it."""
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if attn_rs:
+            with self._layer_owned_reductions():
+                return self._attn_rs(positions, hidden_states, residual)
         attn = self.self_attn(positions, hidden_states, attn_metadata)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         if not self.split_min_tokens:
@@ -155,6 +299,60 @@ class MiniMaxM3DecoderLayer(nn.Module):
             _all_reduce(attn), residual
         )
         return _all_reduce(ffn(hidden_states)), residual
+
+    def _attn_rs(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each rank gets the new residual stream of its token shard,
+        normalizes it and all-gathers it as the FFN input; the attention
+        partial rides the FFN all-reduce. The returned residual is the
+        pre-attention one, so the next fused add + norm sees
+        ``ffn + attn + residual``."""
+        attn = self.self_attn(positions, hidden_states, None)
+        shard = tensor_model_parallel_reduce_scatter(attn + residual / self.tp_size, 0)
+        normed = _all_gather_rows(
+            self.post_attention_layernorm(shard), self.sp.fp8_gather
+        )
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        out = ffn(normed) + attn
+        return tensor_model_parallel_all_reduce(out), residual
+
+    def forward_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        shard: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sequence-parallel layer (minimax_sp_mode "full"): the residual
+        stream stays a token shard.
+
+        `shard` is this rank's rows of the residual stream (None for the
+        first layer, whose `hidden_states` is the full embedding). Norms run
+        on the shard, all-gathers feed attention and the FFN, and their
+        partial outputs are reduce-scattered back onto the shard.
+        """
+        with self._layer_owned_reductions():
+            if shard is None:
+                attn = self.self_attn(
+                    positions, self.input_layernorm(hidden_states), None
+                )
+                shard = tensor_model_parallel_reduce_scatter(
+                    attn + hidden_states / self.tp_size, 0
+                )
+            else:
+                normed = _all_gather_rows(
+                    self.input_layernorm(shard), self.sp.fp8_attn_gather
+                )
+                attn = self.self_attn(positions, normed, None)
+                shard = shard + tensor_model_parallel_reduce_scatter(attn, 0)
+            ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+            normed = _all_gather_rows(
+                self.post_attention_layernorm(shard), self.sp.fp8_gather
+            )
+            return shard + tensor_model_parallel_reduce_scatter(ffn(normed), 0)
 
     def forward_split(
         self,
@@ -280,6 +478,8 @@ class MiniMaxM3Model(nn.Module):
         # the DSpark drafter before the first trace.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
         check_split_disabled(vllm_config.additional_config)
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.sp = sp_config(vllm_config.additional_config)
         self.split_min_tokens = option(
             vllm_config.additional_config, "minimax_split_min_tokens"
         )
@@ -324,15 +524,28 @@ class MiniMaxM3Model(nn.Module):
             # executable from one trace to another.
             halves = _split_halves(positions, num_tokens // 2, num_tokens)
         split = halves is not None and num_tokens >= self.split_min_tokens
-        if not split:
+        sp_step = halves is None and _sp_step(self.sp, num_tokens, self.tp_size)
+        if sp_step and self.sp.mode == "full":
+            shard = None
+            for idx, layer in enumerate(self.layers):
+                shard = layer.forward_sp(positions, inputs_embeds, shard)
+                if idx + 1 in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(tensor_model_parallel_all_gather(shard, 0))
+            hidden_states = tensor_model_parallel_all_gather(self.norm(shard), 0)
+        elif not split:
             metadata = None
             if halves is not None:
                 metadata = _whole_metadata(halves)
                 positions = torch.cat([halves[0].positions, halves[1].positions])
             for idx, layer in enumerate(self.layers):
-                hidden_states, residual = layer(
-                    positions, hidden_states, residual, metadata
-                )
+                if sp_step:
+                    hidden_states, residual = layer(
+                        positions, hidden_states, residual, attn_rs=True
+                    )
+                else:
+                    hidden_states, residual = layer(
+                        positions, hidden_states, residual, metadata
+                    )
                 if idx + 1 in self.aux_hidden_state_layers:
                     aux_hidden_states.append(hidden_states + residual)
             hidden_states, _ = self.norm(hidden_states, residual)
