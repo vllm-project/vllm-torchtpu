@@ -4175,90 +4175,12 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
     ATTN, MAMBA = 0, 1
 
     def setUp(self):
-        import torch
-        from vllm import SamplingParams
-        from vllm.utils.hashing import sha256
-        from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-        from vllm.v1.kv_cache_interface import (
-            FullAttentionSpec,
-            KVCacheConfig,
-            KVCacheGroupSpec,
-            MambaSpec,
-        )
-        from vllm.v1.kv_offload.base import OffloadingKVEventsConfig
-        from vllm.v1.request import Request
-
-        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
-
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
-        attn = FullAttentionSpec(
-            block_size=self.BLOCK, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+        self.scheduler = _make_real_scheduler(
+            self.manager, block_size=self.BLOCK, hybrid=True
         )
-        mamba = MambaSpec(
-            block_size=self.BLOCK,
-            shapes=((2, 8),),
-            dtypes=(torch.bfloat16,),
-            mamba_cache_mode="align",
-        )
-        kv_cache_config = KVCacheConfig(
-            num_blocks=64,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(["attn"], attn),
-                KVCacheGroupSpec(["gdn"], mamba),
-            ],
-        )
-        # Only the fields the scheduler reads; the store spec's sizing and
-        # control plane play no part in a lookup.
-        spec = SimpleNamespace(
-            config=SimpleNamespace(
-                groups=[
-                    SimpleNamespace(
-                        group_id=self.ATTN,
-                        tokens_per_block=self.BLOCK,
-                        sliding_window_size_in_chunks=None,
-                    ),
-                    SimpleNamespace(
-                        group_id=self.MAMBA,
-                        tokens_per_block=self.BLOCK,
-                        sliding_window_size_in_chunks=1,
-                    ),
-                ]
-            ),
-            blocks_per_chunk=1,
-            tokens_per_block=[self.BLOCK, self.BLOCK],
-            tokens_per_hash=self.BLOCK,
-            offload_prompt_only=False,
-            extra_config={},
-            kv_events_config=OffloadingKVEventsConfig(
-                enable_kv_cache_events=False, self_describing_kv_events=False
-            ),
-            get_manager=lambda: self.manager,
-        )
-        vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(
-                prefix_cache_retention_interval=None, enable_prefix_caching=True
-            ),
-            speculative_config=None,
-            parallel_config=SimpleNamespace(
-                world_size=2, decode_context_parallel_size=1
-            ),
-        )
-        self.scheduler = TPURaidenOffloadingScheduler(
-            spec, vllm_config, kv_cache_config
-        )
-        self._scheduler_args = (spec, vllm_config, kv_cache_config)
-        init_none_hash(sha256)
-        params = SamplingParams(max_tokens=1)
-        params.update_from_generation_config({}, 2)
-        self.request = Request(
-            "req",
-            list(range(self.PROMPT)),
-            params,
-            None,
-            block_hasher=get_request_block_hasher(self.BLOCK, sha256),
-        )
+        self.request = _make_hashed_request("req", self.PROMPT, self.BLOCK)
         self.scheduler.on_new_request(self.request)
 
     def _key(self, group: int, chunk: int):
@@ -4279,7 +4201,9 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
         # synchronous would let the step's forward read blocks still in flight.
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
-        spec, vllm_config, kv_cache_config = self._scheduler_args
+        spec, vllm_config, kv_cache_config = _make_scheduler_args(
+            self.manager, block_size=self.BLOCK, hybrid=True
+        )
         spec = SimpleNamespace(
             **{**vars(spec), "extra_config": {"sync_load_budget_bytes": 1}}
         )
@@ -4374,14 +4298,9 @@ class TestDenseDpIndex(unittest.TestCase):
         self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
-def _make_real_scheduler(
-    manager,
-    *,
-    block_size: int = 16,
-    hybrid: bool = False,
-    mamba_cache_mode: str = "align",
-    num_workers: int = 2,
-):
+def _make_scheduler_args(manager, *, block_size: int = 16, hybrid: bool = False):
+    """Arguments of TPURaidenOffloadingScheduler for a full-attention model,
+    with a Mamba group as well if `hybrid`."""
     import torch
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -4390,8 +4309,6 @@ def _make_real_scheduler(
         MambaSpec,
     )
     from vllm.v1.kv_offload.base import OffloadingKVEventsConfig
-
-    from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
     attn = FullAttentionSpec(
         block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
@@ -4408,7 +4325,7 @@ def _make_real_scheduler(
             block_size=block_size,
             shapes=((2, 8),),
             dtypes=(torch.bfloat16,),
-            mamba_cache_mode=mamba_cache_mode,
+            mamba_cache_mode="align",
         )
         groups.append(KVCacheGroupSpec(["gdn"], mamba))
         tokens_per_block.append(block_size)
@@ -4423,6 +4340,8 @@ def _make_real_scheduler(
         kv_cache_tensors=[],
         kv_cache_groups=groups,
     )
+    # Only the fields the scheduler reads; the store spec's sizing and
+    # control plane play no part in a lookup.
     spec = SimpleNamespace(
         config=SimpleNamespace(groups=spec_groups),
         blocks_per_chunk=1,
@@ -4440,11 +4359,17 @@ def _make_real_scheduler(
             prefix_cache_retention_interval=None, enable_prefix_caching=True
         ),
         speculative_config=None,
-        parallel_config=SimpleNamespace(
-            world_size=num_workers, decode_context_parallel_size=1
-        ),
+        parallel_config=SimpleNamespace(world_size=2, decode_context_parallel_size=1),
     )
-    return TPURaidenOffloadingScheduler(spec, vllm_config, kv_cache_config)
+    return spec, vllm_config, kv_cache_config
+
+
+def _make_real_scheduler(manager, *, block_size: int = 16, hybrid: bool = False):
+    from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+    return TPURaidenOffloadingScheduler(
+        *_make_scheduler_args(manager, block_size=block_size, hybrid=hybrid)
+    )
 
 
 def _make_hashed_request(
@@ -4829,6 +4754,105 @@ class TestHitSourcesBySource(unittest.TestCase):
                 ("disk", "posix"): 4,
             },
         )
+
+    def test_split_uses_group_ids_when_a_group_is_not_offloaded(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store, storage_backend="posix")
+        spec, vllm_config, kv_cache_config = _make_scheduler_args(
+            manager, block_size=self.BLOCK
+        )
+        # vLLM offloads only the prefix-cacheable groups. With a group that is
+        # not offloaded in front, the offloaded group has id 1 and is first in
+        # the scheduler's group configs.
+        groups = kv_cache_config.kv_cache_groups
+        groups.insert(0, groups[0])
+        spec.config.groups[0].group_id = 1
+        sched = TPURaidenOffloadingScheduler(spec, vllm_config, kv_cache_config)
+        req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+
+        # Chunk 0 has three sub-blocks in host DRAM and one on disk.
+        *in_host, on_disk = sub_hashes(make_offload_key(req.block_hashes[0], 1))
+        for sub_hash in in_host:
+            store.entries[sub_hash] = _Entry(status=FakeBlockStatus.HOST)
+        store.storage_entries.add(on_disk)
+
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, self.BLOCK)
+        blocks = (
+            [KVCacheBlock(20), KVCacheBlock(21)],
+            [KVCacheBlock(10), KVCacheBlock(11)],
+        )
+        sched.update_state_after_alloc(req, KVCacheBlocks(blocks=blocks), ext_tokens)
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {CacheHitSource.HOST: 12, CacheHitSource.DISK: 4},
+        )
+
+    def test_connectors_forward_the_hit_split_hooks_to_the_scheduler(self):
+        """vLLM's scheduler calls the hooks on the connector it holds."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+        )
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import (
+            TPUMultiConnector,
+        )
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingConnector,
+            TPURaidenOffloadingScheduler,
+        )
+
+        for through_multi_connector in (False, True):
+            with self.subTest(through_multi_connector=through_multi_connector):
+                store = FakeKVCacheStore()
+                manager = make_manager(store, storage_backend="posix")
+                spec, vllm_config, kv_cache_config = _make_scheduler_args(
+                    manager, block_size=self.BLOCK
+                )
+                # __init__ would create the Raiden store, so set only the two
+                # attributes that the hooks read.
+                offload = object.__new__(TPURaidenOffloadingConnector)
+                offload._kv_cache_config = kv_cache_config
+                offload.connector_scheduler = TPURaidenOffloadingScheduler(
+                    spec, vllm_config, kv_cache_config
+                )
+                connector = offload
+                if through_multi_connector:
+                    # The first child has no hit, so the offload child is chosen.
+                    no_hit = MagicMock(spec=KVConnectorBase_V1)
+                    no_hit.get_num_new_matched_tokens.return_value = (0, False)
+                    connector = object.__new__(TPUMultiConnector)
+                    connector._connectors = [no_hit, offload]
+                    connector._requests_to_connector = {}
+
+                req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
+                connector.on_new_request(req)
+                host_key, disk_key = (
+                    make_offload_key(block_hash, 0) for block_hash in req.block_hashes
+                )
+                seed_host_entries(store, host_key)
+                seed_storage_entries(store, disk_key)
+                ext_tokens, _ = connector.get_num_new_matched_tokens(req, 0)
+                self.assertEqual(ext_tokens, 2 * self.BLOCK)
+
+                blocks = [KVCacheBlock(block_id) for block_id in (10, 11, 12)]
+                connector.update_state_after_alloc(
+                    req, KVCacheBlocks(blocks=(blocks,)), ext_tokens
+                )
+                self.assertEqual(
+                    connector.get_external_cache_hit_sources(req, ext_tokens),
+                    {CacheHitSource.HOST: self.BLOCK, CacheHitSource.DISK: self.BLOCK},
+                )
 
 
 class TestPrepareLoadKeySources(unittest.TestCase):

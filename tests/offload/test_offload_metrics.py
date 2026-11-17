@@ -22,7 +22,7 @@ import prometheus_client
 import pytest
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import PromMetric
-from vllm.v1.kv_offload.base import make_offload_key
+from vllm.v1.kv_offload.base import OffloadKey, make_offload_key
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.stats import SchedulerStats
@@ -34,6 +34,7 @@ from vllm_torchtpu.offload.metrics import (
     RaidenOffloadMetricName,
     RaidenOffloadPromMetrics,
     RaidenOffloadStatsCollector,
+    SubBlockSourceCounts,
     build_raiden_offload_metric_definitions,
     compute_load_tokens_by_source,
     external_sources_with_tokens,
@@ -85,107 +86,133 @@ def test_external_sources_with_tokens() -> None:
     }
 
 
-def test_collector_unknown_sources_handling() -> None:
-    collector = RaidenOffloadStatsCollector(
-        storage_backend=None,
+def test_collector_labels_disk_without_storage_backend_as_unknown() -> None:
+    collector = RaidenOffloadStatsCollector(storage_backend=None)
+    assert collector.source_labels(CacheHitSource.DISK) == ("disk", "unknown")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        CacheHitSource.DEVICE,
+        CacheHitSource.EXTERNAL_UNSPECIFIED,
+        pytest.param("host", id="raw str"),
+    ],
+)
+def test_collector_rejects_unsupported_sources(source: Any) -> None:
+    collector = RaidenOffloadStatsCollector(storage_backend=None)
+    with pytest.raises(ValueError, match="Unsupported offload source"):
+        collector.source_labels(source)
+
+
+_KEY_0 = make_offload_key(b"key0", 0)
+_KEY_1 = make_offload_key(b"key1", 0)
+
+
+@pytest.mark.parametrize(
+    ("end_token", "tokens_per_chunk", "load_key_ranges", "key_sources", "expected"),
+    [
+        # A 64-token key of four 16-token sub-blocks: 3 HOST + 1 DISK sub-blocks
+        # form 2 runs -> 48 HOST + 16 DISK.
+        pytest.param(
+            64,
+            64,
+            [(0, 64, _KEY_0)],
+            {_KEY_0: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))},
+            {CacheHitSource.HOST: 48, CacheHitSource.DISK: 16},
+            id="one key in two tiers",
+        ),
+        # The range [0, 48) of a 64-token chunk excludes its last sub-block,
+        # [48, 64).
+        pytest.param(
+            48,
+            64,
+            [(0, 48, _KEY_0)],
+            {
+                _KEY_0: (
+                    (CacheHitSource.HOST, 2),
+                    (CacheHitSource.P2P, 1),
+                    (CacheHitSource.DISK, 1),
+                )
+            },
+            {CacheHitSource.HOST: 32, CacheHitSource.P2P: 16},
+            id="partial tail",
+        ),
+        # 8192-token chunks of 512 sub-blocks: a uniform HOST key, and a key
+        # of 384 HOST + 128 DISK sub-blocks in 2 runs.
+        pytest.param(
+            16384,
+            8192,
+            [(0, 8192, _KEY_0), (8192, 16384, _KEY_1)],
+            {
+                _KEY_0: ((CacheHitSource.HOST, 512),),
+                _KEY_1: ((CacheHitSource.HOST, 384), (CacheHitSource.DISK, 128)),
+            },
+            {CacheHitSource.HOST: 8192 + 6144, CacheHitSource.DISK: 2048},
+            id="512 sub-blocks per key",
+        ),
+    ],
+)
+def test_compute_load_tokens_by_source_splits_mixed_key_by_sub_block(
+    end_token: int,
+    tokens_per_chunk: int,
+    load_key_ranges: list[tuple[int, int, OffloadKey]],
+    key_sources: dict[OffloadKey, SubBlockSourceCounts],
+    expected: dict[CacheHitSource, int],
+) -> None:
+    assert (
+        compute_load_tokens_by_source(
+            start_token=0,
+            end_token=end_token,
+            load_key_ranges=load_key_ranges,
+            key_sources=key_sources,
+            tokens_per_chunk_by_group={0: tokens_per_chunk},
+        )
+        == expected
     )
 
-    # Disk source without configured storage_backend uses ("disk", "unknown"),
-    # and DEVICE, EXTERNAL_UNSPECIFIED, or non-CacheHitSource values raise.
-    assert collector.source_labels(CacheHitSource.DISK) == ("disk", "unknown")
-    for invalid in (CacheHitSource.DEVICE, CacheHitSource.EXTERNAL_UNSPECIFIED, "host"):
-        with pytest.raises(ValueError, match="Unsupported offload source"):
-            collector.source_labels(cast(Any, invalid))
 
-
-def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
-    # 1. Single attention key (64 tokens, 4 x 16-token sub-blocks):
-    # 3 HOST + 1 DISK sub-blocks form 2 runs -> 48 HOST + 16 DISK.
-    k_dense = make_offload_key(b"dense0", 0)
-    assert compute_load_tokens_by_source(
-        start_token=0,
-        end_token=64,
-        load_key_ranges=[(0, 64, k_dense)],
-        key_sources={k_dense: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1))},
-        tokens_per_chunk_by_group={0: 64},
-    ) == {
-        CacheHitSource.HOST: 48,
-        CacheHitSource.DISK: 16,
-    }
-
-    # 2. Partial-tail range [0, 48) on a 64-token chunk excludes t3 ([48, 64)).
-    k_tail = make_offload_key(b"tail0", 0)
-    assert compute_load_tokens_by_source(
-        start_token=0,
-        end_token=48,
-        load_key_ranges=[(0, 48, k_tail)],
-        key_sources={
-            k_tail: (
-                (CacheHitSource.HOST, 2),
-                (CacheHitSource.P2P, 1),
-                (CacheHitSource.DISK, 1),
-            )
-        },
-        tokens_per_chunk_by_group={0: 64},
-    ) == {
-        CacheHitSource.HOST: 32,
-        CacheHitSource.P2P: 16,
-    }
-
-    # 3. Large sub-block factor (factor=512, 8192-token chunks): a uniform HOST
-    # key, and a key of 384 HOST + 128 DISK sub-blocks in 2 runs.
-    k_big0 = make_offload_key(b"big0", 0)
-    k_big_mixed = make_offload_key(b"big_mixed", 0)
-    assert compute_load_tokens_by_source(
-        start_token=0,
-        end_token=16384,
-        load_key_ranges=[(0, 8192, k_big0), (8192, 16384, k_big_mixed)],
-        key_sources={
-            k_big0: ((CacheHitSource.HOST, 512),),
-            k_big_mixed: ((CacheHitSource.HOST, 384), (CacheHitSource.DISK, 128)),
-        },
-        tokens_per_chunk_by_group={0: 8192},
-    ) == {
-        CacheHitSource.HOST: 8192 + 6144,
-        CacheHitSource.DISK: 2048,
-    }
-
-    # 4. Hybrid Attention (group 0) + Mamba (group 1) over [0, 32):
-    # k_a0=(HOST*4), k_a1=(HOST*2, P2P*2), k_m1=(HOST*4) -> 24 HOST + 8 P2P.
+@pytest.mark.parametrize(
+    ("mamba_sources", "expected"),
+    [
+        pytest.param(
+            ((CacheHitSource.HOST, 4),),
+            {CacheHitSource.HOST: 24, CacheHitSource.P2P: 8},
+            id="recurrent state in host DRAM",
+        ),
+        # Mamba's indivisible checkpoint has one byte slice in DISK, so the
+        # whole prefix [0, 32) depends on that DISK checkpoint.
+        pytest.param(
+            ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1)),
+            {CacheHitSource.DISK: 32},
+            id="recurrent state partly on disk",
+        ),
+    ],
+)
+def test_compute_load_tokens_by_source_hybrid_overlap_uses_slowest_tier(
+    mamba_sources: SubBlockSourceCounts,
+    expected: dict[CacheHitSource, int],
+) -> None:
+    # Hybrid Attention (group 0) + Mamba (group 1) over [0, 32):
+    # k_a0=(HOST*4), k_a1=(HOST*2, P2P*2), and k_m1 covers the whole prefix.
     k_a0 = make_offload_key(b"a0", 0)
     k_a1 = make_offload_key(b"a1", 0)
     k_m1 = make_offload_key(b"m1", 1)
-    attention_sources = {
-        k_a0: ((CacheHitSource.HOST, 4),),
-        k_a1: ((CacheHitSource.HOST, 2), (CacheHitSource.P2P, 2)),
-    }
-    assert compute_load_tokens_by_source(
-        start_token=0,
-        end_token=32,
-        load_key_ranges=[(0, 16, k_a0), (16, 32, k_a1), (0, 32, k_m1)],
-        key_sources={**attention_sources, k_m1: ((CacheHitSource.HOST, 4),)},
-        tokens_per_chunk_by_group={0: 16, 1: 16},
-        mamba_group_ids={1},
-    ) == {
-        CacheHitSource.HOST: 24,
-        CacheHitSource.P2P: 8,
-    }
-
-    # If Mamba's indivisible checkpoint has one byte slice in DISK, the whole
-    # prefix [0, 32) depends on that DISK checkpoint -> {DISK: 32}.
-    assert compute_load_tokens_by_source(
-        start_token=0,
-        end_token=32,
-        load_key_ranges=[(0, 16, k_a0), (16, 32, k_a1), (0, 32, k_m1)],
-        key_sources={
-            **attention_sources,
-            k_m1: ((CacheHitSource.HOST, 3), (CacheHitSource.DISK, 1)),
-        },
-        tokens_per_chunk_by_group={0: 16, 1: 16},
-        mamba_group_ids={1},
-    ) == {
-        CacheHitSource.DISK: 32,
-    }
+    assert (
+        compute_load_tokens_by_source(
+            start_token=0,
+            end_token=32,
+            load_key_ranges=[(0, 16, k_a0), (16, 32, k_a1), (0, 32, k_m1)],
+            key_sources={
+                k_a0: ((CacheHitSource.HOST, 4),),
+                k_a1: ((CacheHitSource.HOST, 2), (CacheHitSource.P2P, 2)),
+                k_m1: mamba_sources,
+            },
+            tokens_per_chunk_by_group={0: 16, 1: 16},
+            mamba_group_ids={1},
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -335,12 +362,18 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
 
 
 @pytest.mark.parametrize(
-    ("tier_config", "configured_tiers"),
+    ("tier_config", "env", "configured_tiers"),
     [
-        ({}, {("host", "dram")}),
-        ({"raiden_storage_path": "/mnt/kv"}, {("host", "dram"), ("disk", "posix")}),
+        ({}, {}, {("host", "dram")}),
+        ({"raiden_storage_path": "/mnt/kv"}, {}, {("host", "dram"), ("disk", "posix")}),
+        (
+            {},
+            {"RAIDEN_STORAGE_PATH": "/mnt/kv", "RAIDEN_STORAGE_TYPE": "POSIX"},
+            {("host", "dram"), ("disk", "posix")},
+        ),
         (
             {"global_registry_address": "registry:2379"},
+            {},
             {("host", "dram"), ("p2p", "rdma")},
         ),
     ],
@@ -348,11 +381,14 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
 def test_prom_metrics_start_each_configured_tier_hit_series_at_zero(
     monkeypatch: pytest.MonkeyPatch,
     tier_config: dict[str, Any],
+    env: dict[str, str],
     configured_tiers: set[tuple[str, str]],
 ) -> None:
     """`rate()` misses the first hit of a series that only appears with it."""
     for name in ("RAIDEN_STORAGE_PATH", "RAIDEN_STORAGE_TYPE"):
         monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     registry = prometheus_client.CollectorRegistry()
     kv_transfer_config = KVTransferConfig(
         kv_connector="TPURaidenOffloadingConnector",
