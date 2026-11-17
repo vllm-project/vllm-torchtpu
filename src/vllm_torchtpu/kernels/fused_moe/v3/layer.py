@@ -160,11 +160,13 @@ def _routing_from_caller(
     return weights, jnp.concatenate(parts, axis=0)
 
 
-def _shard_biases(w1_bias, w2_bias, experts_per_shard, w1_cols, hidden):
-    """The shard's per-expert biases as the kernel's [G, N] tables."""
+def _shard_biases(w1_bias, w2_bias, w1_cols, hidden):
+    """The shard's per-expert biases as the kernel's [slots, N] tables: one
+    row per expert slot of the shard's weights, copy slots included (the
+    kernel reads the first experts_per_shard rows)."""
     return (
-        None if w1_bias is None else w1_bias.reshape(experts_per_shard, w1_cols),
-        None if w2_bias is None else w2_bias.reshape(experts_per_shard, hidden),
+        None if w1_bias is None else w1_bias.reshape(-1, w1_cols),
+        None if w2_bias is None else w2_bias.reshape(-1, hidden),
     )
 
 
@@ -581,9 +583,7 @@ def _pallas_step(
         ring=config.scatter_ring,
     )
     token_scales = token_scales.reshape(n_scales, scale_rows, LANES)
-    w1_bias, w2_bias = _shard_biases(
-        w1_bias, w2_bias, experts_per_shard, w1_cols, hidden
-    )
+    w1_bias, w2_bias = _shard_biases(w1_bias, w2_bias, w1_cols, hidden)
     if sorted_rows:
         # The routed rows sorted into expert order on the sparse cores, so
         # the FFN kernel fetches each tile as one copy. The landing has to
@@ -693,7 +693,7 @@ def _pallas_step(
         .T.reshape(-1)
     )
     pair_index = jnp.pad(pair_index, (0, n_gather - n_pairs))
-    live = weights.reshape(-1) > 0
+    live = weights.reshape(-1) != 0
     live = jnp.pad(live, (0, n_gather - live.shape[0]))
     pair_index = jnp.where(
         live, pair_index, jnp.arange(n_gather, dtype=jnp.int32) % arrival_rows
