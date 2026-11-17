@@ -43,6 +43,9 @@ values, and one such row is more than 1 in 1000 of the output. Both row
 paths run: the SparseCore row gather (``Config.sorted_rows``, the serving
 default) and the Pallas transport, in the serving bridge's shard-index mode,
 and the kernel's own mesh-axis mode once, each with both result-row forms.
+One case gives every shard's weights two copy slots after its primaries, as
+a placement with copies does, filled with NaN: the kernel routes over the
+primaries and must never read a copy slot.
 
 The layer does not run in the TPU interpreter on CPU: its token exchange
 returns DMA semaphores from one Pallas program to the next, which the
@@ -69,16 +72,21 @@ CASES = {
     "spread": (16, 24, "spread", 0),
     "hot": (16, 24, "hot", 0),
     "short_shards": (32, 32, "spread", 5),
+    "copy_slots": (16, 24, "spread", 0),
 }
 # The result rows' two forms: fp8 with one scale per row (Config.result_rows'
 # default, what serving runs) and bf16.
 RESULT_ROWS = ("fp8", "bf16")
+# Copy slots a placement adds after each shard's primary experts: the weights
+# carry them, the kernel routes over the primaries only and never reads them
+# (they hold NaN here, so a read shows in the output).
+COPY_SLOTS = {"copy_slots": 2}
 # The serving bridge passes each shard's index as an operand
 # (layout.SHARD_INDEX_OPERAND, no side effects); the kernel's own mode reads
 # the mesh axis. mode: (shard index operand, sorted rows, cases)
 MODES = {
     "bridge_sorted": (True, True, list(CASES)),
-    "bridge_transport": (True, False, list(CASES)),
+    "bridge_transport": (True, False, [c for c in CASES if c not in COPY_SLOTS]),
     "kernel_sorted": (False, True, ["spread"]),
 }
 
@@ -687,6 +695,21 @@ def eight_tpu7x_cores():
         pytest.skip("fused EP MoE v3 needs eight TPU7x cores")
 
 
+def _with_copy_slots(weights, copies):
+    """Each shard's block of every weight array followed by `copies` slots
+    of NaN, as a placement's copy slots sit after the shard's primaries."""
+    import jax.numpy as jnp
+
+    if not copies:
+        return weights
+    out = []
+    for w in weights:
+        blocks = w.reshape(D, -1, *w.shape[1:])
+        pad = jnp.full((D, copies, *w.shape[1:]), jnp.nan, w.dtype)
+        out.append(jnp.concatenate([blocks, pad], axis=1).reshape(-1, *w.shape[1:]))
+    return tuple(out)
+
+
 def _run_case(name, mode, result_rows):
     """(layer output, reference, valid rows) for one case, both float32."""
     import jax
@@ -702,7 +725,8 @@ def _run_case(name, mode, result_rows):
     x, logits, w1, w2, s1, s2 = _world(experts, real, routing)
     mesh = Mesh(np.asarray(jax.devices()[:D]), (MESH_AXIS,))
     sharded = NamedSharding(mesh, P(MESH_AXIS))
-    args = [jax.device_put(a, sharded) for a in (x, w1, w2, s1, s2, logits)]
+    weights = _with_copy_slots((w1, w2, s1, s2), COPY_SLOTS.get(name, 0))
+    args = [jax.device_put(a, sharded) for a in (x, *weights, logits)]
     valid = [real - (short if d % 2 else 0) for d in range(D)]
     config = Config(result_rows=result_rows, sorted_rows=sorted_rows)
     shard_index = jnp.arange(D, dtype=jnp.int32).reshape(D, 1) if bridge else None
