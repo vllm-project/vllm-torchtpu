@@ -129,7 +129,8 @@ class TPUMultiConnector(MultiConnector):
         return super().supports_divergent_local_hybrid_hits
 
     def poll_and_complete_transfers(self, scheduler) -> tuple[int, int, int, bool]:
-        """Sums every child's schedule-start completion poll."""
+        """Sums every child's schedule-start completion poll (called by the
+        prefix-aware schedulers, #3080 and #3090)."""
         total_ns = 0
         total_early = 0
         total_waited = 0
@@ -151,7 +152,9 @@ class TPUMultiConnector(MultiConnector):
         num_reconciled: int,
         block_size: int,
     ) -> int | None:
-        """Returns the first child's answer; None when no child can serve it."""
+        """Returns the first child's answer; None when no child can serve it
+        (asked by the prefix-aware schedulers' local-hit lookup, #3080 and
+        #3090)."""
         for c in self._connectors:
             fn = getattr(c, "resolve_divergent_local_hit_tokens", None)
             if fn is not None:
