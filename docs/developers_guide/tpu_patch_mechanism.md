@@ -10,6 +10,7 @@ call `apply(stage, model_config=...)` to apply them.
 | Stage | Entry point | Use |
 | --- | --- | --- |
 | `import` | `env_override.py`, after early environment setup | Import-time prerequisites, currently the JAX Pallas lowering patch. |
+| `platform_import` | `vllm_torchtpu/platforms/__init__.py`, which every vLLM process imports to resolve its platform, before the platform module | Patches that must be in place before this package's modules apply module-level decorators, currently the `torch.compile` hook that `additional_config["tpu_compile"]` arms. Its targets may import torch but not vLLM. |
 | `platform_activation` | `TpuPlatform.check_and_update_config` | Shared TPU patches and model-specific patches with `vllm_config.model_config`. |
 | `engine_core` | `_run_engine_core_with_tpu_patches` | Scheduler, KV-cache, offloading, and multimodal patches before the original engine-core entry point. |
 | `worker_init` | `TPUWorker.__init__`, before `WorkerBase.__init__` | Shared patches in each worker, including spawned workers. |
