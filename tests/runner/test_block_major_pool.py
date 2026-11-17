@@ -530,6 +530,16 @@ def _patched_geometry(block_major: bool):
         ),
         patch("vllm.v1.worker.utils.select_common_block_size", return_value=BLOCK // 2),
         patch("vllm.config.set_current_vllm_config"),
+        # Recorded at the engine-core / worker hook before the spec is built.
+        patch.object(
+            raiden_store,
+            "_all_ranks_leaf_kv_cache_specs",
+            tuple(
+                leaf
+                for group in layer_outermost_config().kv_cache_groups
+                for leaf in raiden_store.iter_leaf_kv_cache_specs(group.kv_cache_spec)
+            ),
+        ),
     ]
 
 
