@@ -90,13 +90,16 @@ def _jax_op(name: str, body, mesh, fake, with_rank: bool = False):
     Pallas all-reduce's rank operand ([1, 1] int32, unused by `body`)."""
     axis = tuple(mesh.axis_names)
     axis = axis[0] if len(axis) == 1 else axis
-    specs = (P(axis), P(axis)) if with_rank else (P(axis),)
+    # Every operand is 2-D with the token (or rank) dim leading; name the
+    # minor dim too so a (chip, core) mesh shards only the leading one.
+    spec = P(axis, None)
+    specs = (spec, spec) if with_rank else (spec,)
 
     def per_rank(x, *_rank):
         return body(x)
 
     sharded = jax.shard_map(
-        per_rank, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
+        per_rank, mesh=mesh, in_specs=specs, out_specs=spec, check_vma=False
     )
 
     def put(args):
@@ -119,7 +122,7 @@ def _jax_op(name: str, body, mesh, fake, with_rank: bool = False):
         fn,
         mesh=mesh,
         input_partition_specs=specs,
-        output_partition_specs=P(axis),
+        output_partition_specs=spec,
     )
     op.register_fake(lambda x, *_rank: fake(x))
     return op
