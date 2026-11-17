@@ -68,7 +68,12 @@ def tpu_ar_model_runner(request: pytest.FixtureRequest) -> TPUARModelRunner:
         model_config=model_config,
         speculative_config=None,
     )
-    return TPUARModelRunner(vllm_config, "tpu")
+    return TPUARModelRunner(
+        vllm_config,
+        torch.device("tpu"),
+        profiler_rank=0,
+        profiler_world_size=1,
+    )
 
 
 class _StageModel:
@@ -139,7 +144,12 @@ def test_tpu_ar_model_runner_init_rejects_unsupported_config(
         speculative_config=speculative_config,
     )
     with pytest.raises(NotImplementedError, match=match):
-        TPUARModelRunner(vllm_config, "tpu")
+        TPUARModelRunner(
+            vllm_config,
+            torch.device("tpu"),
+            profiler_rank=0,
+            profiler_world_size=1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -178,8 +188,17 @@ def test_load_model_checks_per_step_hook_capabilities(
 
 
 _HIDDEN = torch.arange(8.0).reshape(2, 4)
+_AUX = torch.ones(2, 4)
 _STAGED = (_HIDDEN, {"layer_0": torch.zeros(2, 4)})
 _INTERMEDIATE = IntermediateTensors({"hidden_states": _HIDDEN})
+
+
+class _PlainVllmModel:
+    def __init__(self, result: Any) -> None:
+        self.result = result
+
+    def __call__(self, **kwargs: Any) -> Any:
+        return self.result
 
 
 @pytest.mark.parametrize(
@@ -220,3 +239,27 @@ def test_forward_model_normalizes_stage_outputs(
         assert "intermediate_tensors" not in model.kwargs
     else:
         assert model.kwargs["intermediate_tensors"] is intermediate_tensors
+
+
+@pytest.mark.parametrize(
+    ("raw_output", "expected_out", "expected_aux"),
+    [
+        (_HIDDEN, _HIDDEN, None),
+        ([_HIDDEN], _HIDDEN, None),
+        ((_HIDDEN, _AUX), _HIDDEN, _AUX),
+        (_INTERMEDIATE, _INTERMEDIATE, None),
+    ],
+    ids=["tensor", "single_elem_list", "draft_aux_tuple", "intermediate_tensors"],
+)
+def test_forward_model_supports_plain_vllm_models(
+    tpu_ar_model_runner: TPUARModelRunner,
+    raw_output: Any,
+    expected_out: Any,
+    expected_aux: Any,
+) -> None:
+    ids, pos = torch.tensor([1, 2]), torch.tensor([0, 1])
+    tpu_ar_model_runner.model = _PlainVllmModel(raw_output)
+
+    out, aux = tpu_ar_model_runner.forward_model(ids, pos)
+    assert out is expected_out
+    assert aux is expected_aux

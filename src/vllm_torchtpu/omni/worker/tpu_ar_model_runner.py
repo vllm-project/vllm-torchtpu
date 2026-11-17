@@ -97,23 +97,23 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> tuple[torch.Tensor | IntermediateTensors, None]:
+    ) -> tuple[torch.Tensor | IntermediateTensors, torch.Tensor | None]:
         """Run the stage model and return ``(hidden_states, aux_hidden_states)``.
 
         vLLM-Omni's runner (``OmniGPUModelRunner._model_forward``) normalises
-        whatever a stage model returns through ``model.make_omni_output`` into
-        an ``OmniOutput``: the text hidden states to sample from plus the
+        whatever an Omni stage model returns through ``model.make_omni_output``
+        into an ``OmniOutput``: the text hidden states to sample from plus the
         multimodal sidecar the next stage consumes. ``TPUModelRunner.forward_model``
         instead unwraps by shape, for vLLM's ``(hidden_states,
         aux_hidden_states)`` draft-model convention, which an ``OmniOutput``
         (a four-field NamedTuple) or a staged thinker's ``(hidden_states,
         captured_layers)`` would match by accident. This override applies the
-        Omni contract: pipeline-parallel ``IntermediateTensors`` pass through,
-        everything else goes through ``make_omni_output`` and only
-        ``text_hidden_states`` continues. The sidecar is dropped: it is the
-        payload for a next stage, and ``__init__`` refuses configs that have
-        one. Aux hidden states are always ``None``; no Omni stage registers
-        draft-model aux layers.
+        Omni contract when ``make_omni_output`` is present (pipeline-parallel
+        ``IntermediateTensors`` pass through, everything else goes through
+        ``make_omni_output`` and only ``text_hidden_states`` continues; the
+        sidecar is dropped because ``__init__`` refuses multi-stage configs),
+        and falls back to ``TPUModelRunner.forward_model``'s unwrapping for
+        plain vLLM models that do not define ``make_omni_output``.
         """
         kwargs: dict[str, Any] = {}
         if intermediate_tensors is not None:
@@ -130,7 +130,12 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         # list or tuple; the same unwrap as TPUModelRunner.forward_model.
         if isinstance(out, (list, tuple)) and len(out) == 1:
             out = out[0]
-        if not isinstance(out, OmniOutput):
-            # pyrefly: ignore[not-callable]
-            out = self.model.make_omni_output(out)
-        return out.text_hidden_states, None
+        if isinstance(out, OmniOutput):
+            return out.text_hidden_states, None
+        make_omni_output = getattr(self.model, "make_omni_output", None)
+        if callable(make_omni_output):
+            omni_out = make_omni_output(out)
+            return omni_out.text_hidden_states, None
+        if isinstance(out, (list, tuple)) and len(out) == 2:
+            return out[0], out[1]
+        return out, None

@@ -19,6 +19,9 @@ from collections.abc import Callable, Iterator
 
 import pytest
 import torch
+
+pytest.importorskip("vllm_omni", reason="vllm_omni is required for omni model tests")
+
 from transformers import Qwen3OmniMoeAudioEncoderConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder as HfQwen3OmniMoeAudioEncoder,
