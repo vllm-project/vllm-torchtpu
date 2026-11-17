@@ -269,3 +269,27 @@ def test_small_batch_wide_groups_match(monkeypatch):
     out, lse = _attend(args)
     np.testing.assert_allclose(lse, want_lse, rtol=0, atol=1e-4)
     np.testing.assert_allclose(out, want_out, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("pretransposed", [False, True])
+def test_unpadded_class_scores_pick_the_same(monkeypatch, pretransposed):
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_select
+
+    rng = np.random.default_rng(9)
+    block_rows = msa_select.DEFAULT_BLOCK_ROWS
+    num_tokens, cols = block_rows + 37, 256
+    scores = rng.standard_normal((num_tokens, 1, cols)).astype(np.float32)
+    if pretransposed:
+        scores = scores[:, 0].T.copy()
+    pos = jnp.asarray(rng.integers(0, 2 * 128 * cols, num_tokens), jnp.int32)
+    live = jnp.asarray(num_tokens - 5, jnp.int32)
+    config = dict(
+        block_size=128, topk=16, init_blocks=0, local_blocks=1, rank=0, dcp=2,
+        live_rows=live, interpret=True,
+    )
+    want = msa_dcp.local_candidates(jnp.asarray(scores), pos, **config)
+    monkeypatch.setattr(msa_dcp, "UNPADDED_CLASS_SCORES", True)
+    got = msa_dcp.local_candidates(jnp.asarray(scores), pos, **config)
+    n = num_tokens - 5
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(np.asarray(g)[:n], np.asarray(w)[:n])

@@ -84,6 +84,8 @@ DCP_SMALL_BATCH_TOKENS = 128
 # call's rows and pages are tiled, so outputs differ by accumulation order.
 SMALL_BATCH_TOKENS = 0
 SMALL_BATCH_WIDE_PAGES = 0
+# Key minimax_dcp_unpadded_class_scores (`local_candidates`).
+UNPADDED_CLASS_SCORES = False
 _WIDE_GROUP_MIN_TOKENS = 129
 PREFILL_TILES: tuple[int, int] | None = None
 PREFILL_TILES_4BIT: tuple[int, int] | None = None
@@ -393,10 +395,7 @@ def local_candidates(
     if pretransposed:
         block_rows = -(-block_rows // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
     pad = -num_tokens % block_rows
-    if pretransposed:
-        s = jnp.pad(scores, ((0, 0), (0, pad)))
-    else:
-        s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
+    s = scores if pretransposed else scores[:, 0]
     p = jnp.pad(pos, (0, pad))[:, None]
     # Static scan widths: 128 x powers of two below the full width, and the
     # full width (one kernel body each); each row block takes the narrowest
@@ -421,7 +420,20 @@ def local_candidates(
         w = jnp.asarray(widths, jnp.int32)
         row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
     transposed = block_rows % _TRANSPOSED_ROWS == 0
-    if live_select and len(widths) == 1 and _live_fits(num_cols, pretransposed):
+    live = live_select and len(widths) == 1 and _live_fits(num_cols, pretransposed)
+    # Key minimax_dcp_unpadded_class_scores: a class's grid stops at its live
+    # rows, so its scores keep no padded copy (~17 us per layer for the c48
+    # mixed step's small tiles in the r10 line); its last block reads past
+    # them only when the live rows reach it. Padding rows pick from garbage
+    # and are dropped (the kernels reduce within a row only). Same picks.
+    if pad and not (
+        UNPADDED_CLASS_SCORES
+        and live_rows is not None
+        and not live
+        and num_tokens >= block_rows
+    ):
+        s = jnp.pad(s, ((0, 0), (0, pad)) if pretransposed else ((0, pad), (0, 0)))
+    if live:
         picked_scores, picked_blocks = _live_candidates(
             s,
             p.T if transposed else p,

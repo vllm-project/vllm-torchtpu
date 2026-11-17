@@ -276,6 +276,10 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # MSA work list: dense-compare unions up to this many pairwise elements
     # (0 = 1 << 20), sorted ones above. Same unions, bitwise.
     "minimax_msa_dense_work_list_elems": 0,
+    # MSA DCP candidate selection: a request class's scores (live-row grid)
+    # are not copied into a padded buffer; the last block reads past them.
+    # Same picks, bitwise.
+    "minimax_dcp_unpadded_class_scores": False,
 }
 
 

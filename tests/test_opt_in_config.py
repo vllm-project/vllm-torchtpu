@@ -134,6 +134,7 @@ NEW_KEYS = {
     "minimax_dcp_prefill_tiles",
     "minimax_dcp_prefill_tiles_4bit",
     "minimax_msa_dense_work_list_elems",
+    "minimax_dcp_unpadded_class_scores",
     "minimax_indexer_hoist_metadata",
     "minimax_indexer_row_gather",
     # --- v7 MoE / grouped GEMM ---

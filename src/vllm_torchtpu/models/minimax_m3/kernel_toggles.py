@@ -58,6 +58,7 @@ TOGGLES = (
         "DECODE_WORK_LIST_KERNEL",
     ),
     ("minimax_msa_decode_one_call", msa_attention_lse_r6, "DECODE_ONE_CALL"),
+    ("minimax_dcp_unpadded_class_scores", msa_dcp, "UNPADDED_CLASS_SCORES"),
 )
 
 # Keys that act only on r6's lse kernel (key minimax_msa_lse_r6).
