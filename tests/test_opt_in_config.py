@@ -98,6 +98,7 @@ REPLACED_ENV = {
     "spec_draft_bucket_step": "TPU_DRAFT_BUCKET_STEP",
     "spec_synthetic_row_split": "TPU_SPEC_SYNTHETIC_ROW_SPLIT",
     "spec_sampler_top_p_kernel": "TPU_SAMPLER_TOP_P_KERNEL",
+    "dspark_markov_kernel": "TPU_DSPARK_MARKOV_KERNEL",
     # --- v7 offload ---
     "offload_max_inflight_load_mib": "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB",
     "offload_max_inflight_store_mib": "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB",
@@ -169,6 +170,7 @@ NEW_KEYS = {
     # --- v7 runner/spec ---
     # r10 did this unconditionally (no env var).
     "skip_device_sampling_metadata",
+    "spec_vocab_argmax_masked",
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.

@@ -340,6 +340,17 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # compiled online, no H2D copies behind KV-offload loads. Host-side;
     # bitwise (the TPU samplers read the CPU sampling tensors).
     "skip_device_sampling_metadata": False,
+    # DSpark greedy Markov chain over a vocab-parallel LM head: its K steps as
+    # one Pallas kernel with remote-DMA exchanges of the (max, id) pairs
+    # (`distributed.pallas_markov_argmax`, self-tested at load; buckets that
+    # do not fit VMEM keep the XLA loop). Scores in f32, so a draft can differ
+    # from the XLA loop's bf16-rounded scores on near-ties (r10: 0-6 % of
+    # drafts); verified tokens are unchanged, only acceptance can move. Not
+    # bitwise in drafts.
+    "dspark_markov_kernel": False,
+    # DSpark vocab-parallel argmax (XLA loop): float32 ids and the cross-rank
+    # argmax as masked reductions, int32 ids along the chain. Bitwise (same ids).
+    "spec_vocab_argmax_masked": False,
     # --- v7 offload ---
     # Raiden KV offload: MiB of one worker's KV that local offload loads may
     # have in flight at once (0 = no bound). A larger load is split and lands

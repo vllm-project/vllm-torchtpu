@@ -17,10 +17,19 @@ gathered scores, ties and NaNs included."""
 import pytest
 import torch
 
+from vllm_torchtpu.spec_decode import vocab_parallel_argmax as vpa
 from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
     reduce_shard_argmax_pairs,
     shard_argmax_pair,
 )
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["gather", "masked"])
+def masked(request):
+    """Every test runs with spec_vocab_argmax_masked off and on."""
+    vpa.set_masked_reduce(request.param)
+    yield request.param
+    vpa.set_masked_reduce(False)
 
 
 def sharded_argmax(full: torch.Tensor, tp_size: int, shard: int) -> torch.Tensor:
@@ -81,3 +90,27 @@ def test_ids_beyond_bf16_precision_are_exact():
     for row, token in enumerate(ids):
         full[row, token] = 1
     assert sharded_argmax(full, tp_size, vocab // tp_size).tolist() == ids
+
+
+def test_masked_reduce_gives_the_same_ids(masked):
+    """spec_vocab_argmax_masked: same ids as the gather (ties, NaN, -inf),
+    int32 on request, float32 or int64 shard starts."""
+    gen = torch.Generator().manual_seed(1)
+    tp_size, shard = 8, 40
+    full = torch.randint(-2, 3, (512, tp_size * shard), generator=gen).float()
+    full[::7, 13] = float("nan")
+    full[::11, 200] = float("nan")
+    full[5::13, :] = float("-inf")
+    pairs = torch.cat(
+        [
+            shard_argmax_pair(
+                full[:, r * shard : (r + 1) * shard],
+                torch.tensor(r * shard, dtype=torch.float32 if masked else torch.int64),
+            )
+            for r in range(tp_size)
+        ],
+        dim=-1,
+    )
+    got = reduce_shard_argmax_pairs(pairs, tp_size, dtype=torch.int32)
+    assert got.dtype == torch.int32
+    assert got.tolist() == full.argmax(dim=-1).tolist()

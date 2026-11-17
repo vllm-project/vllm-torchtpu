@@ -413,3 +413,93 @@ def test_vocab_parallel_markov_argmax_is_opt_in_and_exact(
 def test_drafts_without_the_interface_keep_gathered_logits(monkeypatch):
     p = _draft_with(monkeypatch, _FakeDraft())
     assert p._vocab_parallel_markov is False
+
+
+class _FakeChainKernel:
+    """`pallas_markov_argmax.MarkovChainOp` stand-in: records its inputs."""
+
+    def __init__(self, max_rows):
+        self.max_rows = max_rows
+        self.calls = []
+
+    def fits(self, steps, rows):
+        return rows <= self.max_rows
+
+    def __call__(self, slot_logits, anchors):
+        self.calls.append((slot_logits.clone(), anchors.tolist()))
+        shape = (anchors.shape[0], slot_logits.shape[0])
+        return torch.full(shape, 11, dtype=torch.int32)
+
+
+class _FakeChainDraft(_FakeDraft):
+    def __init__(self, kernel):
+        super().__init__()
+        self.markov_chain_kernel = kernel
+
+    def compute_draft_logits_shard(self, hidden):
+        return self.compute_draft_logits(hidden).to(torch.bfloat16)
+
+    def markov_argmax_shard(self, logits, embed):
+        return logits.float().argmax(-1)
+
+
+def test_markov_chain_kernel_replaces_the_loop():
+    """dspark_markov_kernel: the draft's chain kernel takes slot-major
+    logits ([slot, request, shard]) and the anchors; int64 drafts."""
+    p = _make_proposer(
+        {"dspark_noise_token_id": 7, **_LAYER_IDS}, num_speculative_tokens=3
+    )
+    kernel = _FakeChainKernel(max_rows=2)
+    p.draft_model = _FakeChainDraft(kernel)
+    p._vocab_parallel_markov = True
+    forward = DSparkProposer._dflash_forward_and_sample.__wrapped__
+    input_ids = torch.tensor([5, 7, 7, 9, 7, 7])
+    positions = torch.zeros(6, dtype=torch.int32)
+    drafts, hidden = forward(p, input_ids, positions, 3)
+    assert drafts.dtype == torch.int64
+    assert drafts.tolist() == [[11, 11, 11], [11, 11, 11]]
+    assert hidden.shape == (6, 2)
+    (slot_logits, anchors), = kernel.calls
+    assert anchors == [5, 9]
+    start = 0 if p.sample_from_anchor else 1
+    # Slot s of request r is hidden row 3 r + s, which drafts token 3 r + s + 1.
+    want = torch.tensor([[3 * r + s + 1 for r in range(2)] for s in range(start, 3)])
+    assert slot_logits.shape == (3 - start, 2, 16)
+    assert slot_logits.float().argmax(-1).tolist() == want.tolist()
+    # A bucket the kernel does not fit, or the confidence head: the loop.
+    for max_rows, head in ((1, False), (2, True)):
+        kernel.max_rows = max_rows
+        p.use_confidence_head = head
+        drafts, _ = forward(p, input_ids, positions, 3)
+        assert drafts.tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert len(kernel.calls) == 1
+
+
+def test_markov_kernel_off_never_reaches_the_kernel():
+    """Key off: the draft has no chain kernel, the loop runs as before."""
+    p = _make_proposer(
+        {"dspark_noise_token_id": 7, **_LAYER_IDS}, num_speculative_tokens=3
+    )
+    p.draft_model = _FakeChainDraft(None)
+    p._vocab_parallel_markov = True
+    forward = DSparkProposer._dflash_forward_and_sample.__wrapped__
+    input_ids = torch.tensor([5, 7, 7, 9, 7, 7])
+    drafts, _ = forward(p, input_ids, torch.zeros(6, dtype=torch.int32), 3)
+    assert drafts.tolist() == [[1, 2, 3], [4, 5, 6]]
+
+
+def test_markov_options_from_additional_config():
+    from vllm_torchtpu.distributed import pallas_markov_argmax
+    from vllm_torchtpu.models.minimax_m3.dspark import set_markov_options
+    from vllm_torchtpu.spec_decode import vocab_parallel_argmax as vpa
+
+    try:
+        set_markov_options({})
+        assert not pallas_markov_argmax.enabled() and not vpa.masked_reduce()
+        assert pallas_markov_argmax._refusal() is not None
+        set_markov_options(
+            {"dspark_markov_kernel": True, "spec_vocab_argmax_masked": True}
+        )
+        assert pallas_markov_argmax.enabled() and vpa.masked_reduce()
+    finally:
+        set_markov_options({})

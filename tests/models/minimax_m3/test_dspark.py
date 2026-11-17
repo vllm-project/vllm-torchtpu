@@ -575,11 +575,18 @@ def _simulated_shard_argmax(model, logits, embed, tp_size, width):
     return reduce_shard_argmax_pairs(torch.cat(pairs, dim=-1), tp_size)
 
 
+@pytest.mark.parametrize("masked", [False, True], ids=["gather", "masked"])
 @pytest.mark.parametrize("tp_size,width", [(4, 24), (2, 48), (4, 25), (8, 13)])
-def test_markov_shard_argmax_matches_gathered(tiny_draft, tp_size, width) -> None:
+def test_markov_shard_argmax_matches_gathered(
+    tiny_draft, tp_size, width, masked, monkeypatch
+) -> None:
     """Per-rank (max, id) of logits + Markov bias on the shard, reduced across
     ranks, equals the gathered (logits + markov_bias).argmax: small integers
     make every sum exact, so ties (within and across shards) are frequent."""
+    from vllm_torchtpu.spec_decode import vocab_parallel_argmax as vpa
+
+    # additional_config spec_vocab_argmax_masked: the same ids.
+    monkeypatch.setattr(vpa, "_MASKED_REDUCE", masked)
     model = tiny_draft
     _load(model, _checkpoint())
     gen = torch.Generator().manual_seed(3)

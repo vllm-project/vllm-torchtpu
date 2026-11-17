@@ -72,7 +72,9 @@ from vllm_torchtpu.models.minimax_m3.quant import (
 from vllm_torchtpu.opt_in_config import option
 from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
     MAX_VOCAB_FOR_FLOAT_IDS,
+    masked_reduce,
     reduce_shard_argmax_pairs,
+    set_masked_reduce,
     shard_argmax_pair,
 )
 
@@ -384,6 +386,21 @@ def set_split_fc(additional_config) -> None:
         )
 
 
+def set_markov_options(additional_config) -> None:
+    """additional_config dspark_markov_kernel (`pallas_markov_argmax`) and
+    spec_vocab_argmax_masked (`vocab_parallel_argmax`); both log when set."""
+    from vllm_torchtpu.distributed import pallas_markov_argmax
+
+    pallas_markov_argmax.set_enabled(option(additional_config, "dspark_markov_kernel"))
+    masked = bool(option(additional_config, "spec_vocab_argmax_masked"))
+    set_masked_reduce(masked)
+    if masked:
+        logger.info(
+            "DSpark vocab-parallel argmax: float32 ids, masked cross-rank "
+            "reduction (additional_config spec_vocab_argmax_masked=True)."
+        )
+
+
 class MiniMaxM3DSparkModel(Qwen3DSparkModel):
     decoder_layer_cls = MiniMaxM3DSparkDecoderLayer
 
@@ -495,6 +512,12 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.register_buffer("markov_w2_shard", None, persistent=False)
         self.register_buffer("vocab_shard_start", None, persistent=False)
         self.register_buffer("vocab_shard_pad_mask", None, persistent=False)
+        # `pallas_markov_argmax.MarkovChainOp`: the whole greedy chain in one
+        # kernel (additional_config dspark_markov_kernel), set with the vocab
+        # shard when it builds.
+        self.markov_chain_kernel = None
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        set_markov_options(vllm_config.additional_config)
 
     def _vocab_parallel_markov_blocker(self) -> str | None:
         """Why the shard argmax cannot reproduce the gathered argmax, or None."""
@@ -540,7 +563,10 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             rows = rows.to(head_dtype)
         self.markov_w2_shard = F.pad(rows, (0, 0, 0, width - (end - start)))
         device = markov_w2.device
-        self.vocab_shard_start = torch.tensor(start, dtype=torch.int64, device=device)
+        # float32 under spec_vocab_argmax_masked, as the (max, id) pairs carry
+        # ids (`shard_argmax_pair`).
+        start_dtype = torch.float32 if masked_reduce() else torch.int64
+        self.vocab_shard_start = torch.tensor(start, dtype=start_dtype, device=device)
         if self.lm_head.org_vocab_size_padded == self.lm_head.org_vocab_size:
             self.vocab_shard_pad_mask = None
         else:
@@ -561,11 +587,23 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             )
             return False
         shard = self.lm_head.shard_indices
+        start, end = shard.org_vocab_start_index, shard.org_vocab_end_index
         self._set_markov_vocab_shard(
-            shard.org_vocab_start_index,
-            shard.org_vocab_end_index,
-            self.lm_head.num_embeddings_per_partition,
+            start, end, self.lm_head.num_embeddings_per_partition
         )
+        from vllm_torchtpu.distributed import pallas_markov_argmax
+
+        markov_w1 = self.model.markov_head.markov_w1.weight
+        if (
+            pallas_markov_argmax.enabled()
+            and self.draft_id_to_target_id is None
+            and self._markov_cast_dtype is None
+            and markov_w1.dtype == self.markov_w2_shard.dtype == torch.bfloat16
+        ):
+            # Collective over the TP group (self-tested); None keeps the loop.
+            self.markov_chain_kernel = pallas_markov_argmax.build(
+                markov_w1, self.markov_w2_shard, start, end - start, self._max_num_seqs
+            )
         return True
 
     def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -594,7 +632,10 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         .argmax(-1)``, exchanging one (max, id) pair per rank and row."""
         pair = self.markov_shard_pair(logits_shard, markov_embed)
         gathered = tensor_model_parallel_all_gather(pair, dim=-1)
-        return reduce_shard_argmax_pairs(gathered, self.lm_head.tp_size)
+        # int32 under spec_vocab_argmax_masked: the TPU emulates int64 ops on
+        # the Markov loop's serial chain.
+        dtype = torch.int32 if masked_reduce() else torch.int64
+        return reduce_shard_argmax_pairs(gathered, self.lm_head.tp_size, dtype=dtype)
 
     def tpu_precompute_and_store_context_kv(
         self,

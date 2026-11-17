@@ -35,6 +35,20 @@ import torch
 MAX_VOCAB_FOR_FLOAT_IDS = 1 << 24
 
 
+# additional_config spec_vocab_argmax_masked (`set_masked_reduce`): float32
+# ids and the cross-rank argmax as masked reductions. Same ids.
+_MASKED_REDUCE = False
+
+
+def set_masked_reduce(enabled: bool) -> None:
+    global _MASKED_REDUCE
+    _MASKED_REDUCE = bool(enabled)
+
+
+def masked_reduce() -> bool:
+    return _MASKED_REDUCE
+
+
 def shard_argmax_pair(
     local_scores: torch.Tensor, vocab_start: torch.Tensor | int
 ) -> torch.Tensor:
@@ -44,13 +58,33 @@ def shard_argmax_pair(
     traced program does not bake a rank-specific constant.
     """
     local_max, local_idx = local_scores.max(dim=-1)
+    if _MASKED_REDUCE:
+        # In float32 (exact below MAX_VOCAB_FOR_FLOAT_IDS): an int64 start
+        # costs a 64-bit conversion per call on TPU.
+        if isinstance(vocab_start, torch.Tensor):
+            vocab_start = vocab_start.float()
+        global_idx = local_idx.float() + vocab_start
+        return torch.stack([local_max.float(), global_idx], dim=-1)
     global_idx = local_idx + vocab_start
     return torch.stack([local_max.float(), global_idx.float()], dim=-1)
 
 
-def reduce_shard_argmax_pairs(gathered: torch.Tensor, tp_size: int) -> torch.Tensor:
-    """Global argmax ids (int64 ``[rows]``) from the rank-major all-gather of
-    every rank's ``shard_argmax_pair`` (``[rows, 2 * tp_size]``)."""
+def reduce_shard_argmax_pairs(
+    gathered: torch.Tensor, tp_size: int, dtype: torch.dtype = torch.int64
+) -> torch.Tensor:
+    """Global argmax ids (``dtype`` ``[rows]``) from the rank-major all-gather
+    of every rank's ``shard_argmax_pair`` (``[rows, 2 * tp_size]``)."""
     pairs = gathered.view(gathered.shape[0], tp_size, 2)
-    best_rank = pairs[..., 0].argmax(dim=-1, keepdim=True)
-    return pairs[..., 1].gather(-1, best_rank).squeeze(-1).to(torch.int64)
+    if not _MASKED_REDUCE:
+        best_rank = pairs[..., 0].argmax(dim=-1, keepdim=True)
+        return pairs[..., 1].gather(-1, best_rank).squeeze(-1).to(dtype)
+    scores, ids = pairs[..., 0], pairs[..., 1]
+    # torch.argmax over the ranks, as masked reductions (one fusion, no
+    # gather): the first NaN rank, else the first rank holding the max.
+    rank = torch.arange(tp_size, device=gathered.device)
+    nan = torch.isnan(scores)
+    best = torch.where(nan, float("-inf"), scores).amax(dim=-1, keepdim=True)
+    first_nan = torch.where(nan, rank, tp_size).amin(dim=-1, keepdim=True)
+    first_max = torch.where(scores == best, rank, tp_size).amin(dim=-1, keepdim=True)
+    winner = torch.where(first_nan < tp_size, first_nan, first_max)
+    return torch.where(rank == winner, ids, 0.0).sum(dim=-1).to(dtype)

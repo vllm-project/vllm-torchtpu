@@ -205,6 +205,34 @@ class DSparkProposer(DFlashProposer):
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
 
+        vocab_parallel = self._vocab_parallel_markov
+        sample_start = 0 if self.sample_from_anchor else 1
+        chain_kernel = getattr(self.draft_model, "markov_chain_kernel", None)
+        if (
+            vocab_parallel
+            and chain_kernel is not None
+            and not self.use_confidence_head
+            and chain_kernel.fits(block_size - sample_start, padded_num_reqs)
+        ):
+            # additional_config dspark_markov_kernel: the whole chain in one
+            # kernel (`pallas_markov_argmax`) over slot-major logits
+            # ([slot, request], so each step reads one contiguous block; the
+            # hidden rows are relaid out, not the logits). Drafts are target
+            # ids (the kernel's draft model has no d2t map).
+            slot_hidden = (
+                valid_hidden.view(padded_num_reqs, block_size, -1)[:, sample_start:]
+                .transpose(0, 1)
+                .reshape((block_size - sample_start) * padded_num_reqs, -1)
+            )
+            slot_logits = self.draft_model.compute_draft_logits_shard(slot_hidden)
+            slot_logits = slot_logits.view(
+                block_size - sample_start, padded_num_reqs, -1
+            )
+            anchors = input_ids[: padded_num_reqs * block_size].view(
+                padded_num_reqs, block_size
+            )[:, 0]
+            return chain_kernel(slot_logits, anchors).to(torch.int64), hidden
+
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
         # The vocab-parallel path keeps each rank's vocab shard of them.
@@ -236,6 +264,9 @@ class DSparkProposer(DFlashProposer):
             markov_embeds.append(markov_embed)
             prev = step
         draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
+        if draft_tokens_chunk.dtype != torch.int64:
+            # spec_vocab_argmax_masked's int32 chain: int64 drafts, as before.
+            draft_tokens_chunk = draft_tokens_chunk.to(torch.int64)
 
         if not self.use_confidence_head:
             return draft_tokens_chunk, hidden
