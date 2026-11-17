@@ -87,7 +87,10 @@ def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
 
 
 def zero_routing_weights_for_padding(
-    topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    is_local_tensor: bool = False,
+    is_sequence_parallel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Set routing weights to 0 for padded tokens.
 
@@ -98,7 +101,11 @@ def zero_routing_weights_for_padding(
         topk_ids: Selected expert IDs for each token.
         topk_weights: Routing weights for each token.
         is_local_tensor: Whether topk_ids and topk_weights are local tensors
-            (i.e. not gathered across DP ranks). If True, skips DP all_gather.
+            (i.e. not yet gathered across ranks). If True, skips DP/PCP
+            all_gather, and under sequence-parallel MoE slices this TP rank's
+            shard of ``local_padding_mask``.
+        is_sequence_parallel: Whether the enclosing MoE layer is token-sharded
+            across the TP group (sequence parallel).
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The (topk_ids, topk_weights) tensors
@@ -108,7 +115,37 @@ def zero_routing_weights_for_padding(
         return topk_ids, topk_weights
     num_tokens = topk_ids.shape[0]
     if is_local_tensor:
-        is_padding = _padding_state.get_local_padding_mask(num_tokens)
+        if is_sequence_parallel:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            from vllm_torchtpu.distributed.pcp import get_pcp_group
+
+            pcp_group = get_pcp_group()
+            pcp_size = int(pcp_group.world_size) if pcp_group is not None else 1
+            if pcp_size > 1:
+                raise NotImplementedError(
+                    "Sequence-parallel MoE padding mask slicing does not yet "
+                    f"support PCP ({pcp_size})."
+                )
+            tp_group = get_tp_group()
+            tp_size = int(tp_group.world_size) if tp_group is not None else 1
+            if tp_size > 1:
+                mask_len = _padding_state.local_padding_mask.shape[0]
+                if mask_len < tp_size * num_tokens:
+                    raise ValueError(
+                        f"Sequence-parallel MoE padding mask length ({mask_len}) "
+                        f"cannot cover tp_size ({tp_size}) * num_tokens "
+                        f"({num_tokens})."
+                    )
+                assert tp_group is not None
+                rank = int(tp_group.rank_in_group)
+                is_padding = _padding_state.local_padding_mask[
+                    rank * num_tokens : (rank + 1) * num_tokens
+                ]
+            else:
+                is_padding = _padding_state.get_local_padding_mask(num_tokens)
+        else:
+            is_padding = _padding_state.get_local_padding_mask(num_tokens)
     else:
         from vllm.distributed.parallel_state import get_dp_group
 

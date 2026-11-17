@@ -42,6 +42,7 @@ def _moe_cfg(use_ep: bool = False):
     return SimpleNamespace(
         experts_per_token=_TOPK,
         has_bias=False,
+        is_sequence_parallel=False,
         moe_parallel_config=SimpleNamespace(use_ep=use_ep),
     )
 

@@ -14,7 +14,7 @@
 """Pipelined Fused MoE wrapper with collective communication chunking.
 
 This module provides `pipelined_fused_moe_gmm`, which acts as a wrapper around
-`fused_moe_gmm` (or a custom MoE kernel) to manage and overlap DP or PCP
+`fused_moe_gmm` (or a custom MoE kernel) to manage and overlap DP, PCP, or EP
 collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
@@ -24,7 +24,7 @@ from collections.abc import Sequence
 from typing import cast
 
 import torch
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.collectives import quantized_all_gather
@@ -81,11 +81,21 @@ def fixed_chunk_count(
     return min(count, common)
 
 
-def collection_chunks(seq_len: int, parallel_size: int) -> tuple[int, int]:
+def collection_chunks(
+    seq_len: int, parallel_size: int, *, is_sequence_parallel: bool = False
+) -> tuple[int, int]:
     """Chunk count and local chunk size for this rank's ``seq_len`` tokens."""
     if _fixed_chunk_buckets is not None and parallel_size > 1:
+        buckets: Sequence[int] = _fixed_chunk_buckets
+        if is_sequence_parallel:
+            # `_fixed_chunk_buckets` holds unsharded per-DP-rank step buckets B;
+            # under sequence-parallel MoE each TP rank owns B // tp_size rows.
+            tp_group = get_tp_group()
+            tp_size = int(tp_group.world_size) if tp_group is not None else 1
+            if tp_size > 1:
+                buckets = [b // tp_size for b in _fixed_chunk_buckets if b >= tp_size]
         num_chunks = fixed_chunk_count(
-            _fixed_chunk_buckets, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+            buckets, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
         )
         return num_chunks, seq_len // num_chunks
     return calculate_moe_chunks(
@@ -118,7 +128,7 @@ def calculate_moe_chunks(
 
     Args:
         seq_len: Number of local tokens on this rank (S).
-        parallel_size: World size of the active DP or PCP collective group.
+        parallel_size: World size of the active DP, PCP, or EP collective group.
         chunk_size: Maximum post-gather chunk size threshold in tokens (C).
 
     Returns:
@@ -142,7 +152,7 @@ def calculate_moe_chunks(
     return num_chunks, chunk_size_local
 
 
-def _get_moe_collective_group():
+def _get_moe_collective_group(is_sequence_parallel: bool = False):
     """Select the collective group whose expert shards the kernel combines."""
     pcp_group = get_pcp_group()
     dp_group = get_dp_group()
@@ -154,18 +164,26 @@ def _get_moe_collective_group():
             "MoE collective chunking does not yet support simultaneous "
             f"PCP ({pcp_size}) and DP ({dp_size})."
         )
+    if pcp_size > 1 and is_sequence_parallel:
+        raise NotImplementedError(
+            "MoE collective chunking does not yet support simultaneous "
+            f"PCP ({pcp_size}) and sequence-parallel MoE."
+        )
     if pcp_size > 1:
         return pcp_group, "PCP"
+    if is_sequence_parallel:
+        # Sequence-parallel MoE shards each DP rank's tokens across TP, so
+        # naive dispatch/combine (TpuDeviceCommunicator._moe_group) all-gathers
+        # and reduce-scatters over the EP group (= DP * TP).
+        ep_group = get_ep_group()
+        if ep_group is not None and int(ep_group.world_size) > 1:
+            return ep_group, "EP"
     return dp_group, "DP"
 
 
 @torch.compiler.assume_constant_result
-def _log_active_chunk_pipeline() -> None:
+def _log_active_chunk_pipeline(collective_kind: str, parallel_size: int) -> None:
     """Emit trace-time evidence without passing symbolic values to logging."""
-    collective_group, collective_kind = _get_moe_collective_group()
-    parallel_size = (
-        int(collective_group.world_size) if collective_group is not None else 1
-    )
     logger.info_once(
         "MoE multi-chunk pipeline branch active: group=%s, world_size=%d, threshold=%d",
         collective_kind,
@@ -192,11 +210,12 @@ def pipelined_fused_moe_gmm(
     topk_weights_float32: bool = False,
     row_info: torch.Tensor | None = None,
     return_rows: bool = False,
+    is_sequence_parallel: bool = False,
 ) -> torch.Tensor:
-    """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
+    """Wrapper around fused_moe_gmm to pipeline DP/PCP/EP collectives and compute.
 
-    This function wraps `fused_moe_gmm` by taking control of the active DP or
-    PCP collective communications (AllGather of activations/routing tensors
+    This function wraps `fused_moe_gmm` by taking control of the active DP, PCP,
+    or EP collective communications (AllGather of activations/routing tensors
     and ReduceScatter of outputs) and staging them in chunks to overlap network
     communication with TPU matrix multiplication compute.
 
@@ -228,6 +247,8 @@ def pipelined_fused_moe_gmm(
         row_info: Unsupported in pipelined mode; must be None.
         return_rows: Not supported here: the rows of each expert are reduced
             after this wrapper's reduce-scatter would already have run.
+        is_sequence_parallel: Whether the enclosing MoE layer is token-sharded
+            (sequence parallel), in which case collectives run over the EP group.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
@@ -244,13 +265,17 @@ def pipelined_fused_moe_gmm(
             "pipelined_fused_moe_gmm does not support row_info (chunked DP/PCP "
             "layouts cannot reuse a single local valid-row count)."
         )
-    collective_group, _ = _get_moe_collective_group()
+    collective_group, collective_kind = _get_moe_collective_group(
+        is_sequence_parallel=is_sequence_parallel
+    )
 
     seq_len = hidden_states.shape[0]
     parallel_size = (
         int(collective_group.world_size) if collective_group is not None else 1
     )
-    num_chunks, chunk_size_local = collection_chunks(seq_len, parallel_size)
+    num_chunks, chunk_size_local = collection_chunks(
+        seq_len, parallel_size, is_sequence_parallel=is_sequence_parallel
+    )
 
     # There is no gather to make cheaper on a single rank, so quantizing there
     # would only round the activations for nothing.
@@ -303,7 +328,7 @@ def pipelined_fused_moe_gmm(
             return moe_combine_reduce_scatter(collective_group, out)
         return out
 
-    _log_active_chunk_pipeline()
+    _log_active_chunk_pipeline(collective_kind, parallel_size)
     assert collective_group is not None
 
     # Slice local inputs into num_chunks chunks along dim 0

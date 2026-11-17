@@ -359,7 +359,10 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                **kwargs,
+                is_sequence_parallel=layer.moe_config.is_sequence_parallel,
+            )
 
         return fused_moe_gmm(**kwargs)
 

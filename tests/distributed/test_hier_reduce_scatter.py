@@ -394,9 +394,15 @@ def test_pipelined_moe_routes_single_chunk_through_dispatcher(monkeypatch, num_c
 
     group = _Group()
     calls = []
-    monkeypatch.setattr(pfm, "_get_moe_collective_group", lambda: (group, "DP"))
     monkeypatch.setattr(
-        pfm, "collection_chunks", lambda seq, size: (num_chunks, seq // num_chunks)
+        pfm,
+        "_get_moe_collective_group",
+        lambda is_sequence_parallel=False: (group, "DP"),
+    )
+    monkeypatch.setattr(
+        pfm,
+        "collection_chunks",
+        lambda seq, size, **_: (num_chunks, seq // num_chunks),
     )
     monkeypatch.setattr(pfm, "fused_moe_gmm", lambda **kw: kw["hidden_states"])
     monkeypatch.setattr(

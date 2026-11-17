@@ -45,6 +45,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 def _make_mock_moe_config():
     return SimpleNamespace(
         experts_per_token=8,
+        is_sequence_parallel=False,
         moe_parallel_config=SimpleNamespace(use_ep=False),
         group_size=32,
     )
@@ -497,7 +498,7 @@ class TestMoEForwardPrecisionBranches:
 
     def test_fused_moe_and_pipelined_signature_parity(self):
         """Ensure fused_moe_gmm and pipelined_fused_moe_gmm maintain
-        identical signatures.
+        signature parity (apart from pipelined-only collective flags).
 
         Prevents changes to fused_moe_gmm parameter list that break
         pipelined_fused_moe_gmm.
@@ -505,9 +506,11 @@ class TestMoEForwardPrecisionBranches:
         sig_fused = inspect.signature(fused_moe_gmm)
         sig_pipelined = inspect.signature(pipelined_fused_moe_gmm)
 
-        assert list(sig_fused.parameters.keys()) == list(
-            sig_pipelined.parameters.keys()
-        ), (
+        pipelined_only = {"is_sequence_parallel"}
+        pipelined_shared = [
+            k for k in sig_pipelined.parameters if k not in pipelined_only
+        ]
+        assert list(sig_fused.parameters.keys()) == pipelined_shared, (
             "Signature parameter mismatch between "
             f"fused_moe_gmm ({list(sig_fused.parameters.keys())}) "
             f"and pipelined_fused_moe_gmm ({list(sig_pipelined.parameters.keys())})."
@@ -551,6 +554,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_bias = torch.zeros(4, 1, 128, dtype=torch.float32)
         layer.w2_bias = torch.zeros(4, 1, 64, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
         layer.moe_config.moe_parallel_config.use_ep = False
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
@@ -564,6 +568,7 @@ class TestMoEForwardPrecisionBranches:
 
         mock_fused = MagicMock(return_value=x)
         mock_pipelined = MagicMock(return_value=x)
+        mock_zero_padding = MagicMock(return_value=(topk_ids, topk_weights))
 
         with (
             patch(
@@ -582,13 +587,22 @@ class TestMoEForwardPrecisionBranches:
                 "vllm_torchtpu.layers.adapter.quantization.fp8.pipelined_fused_moe_gmm",
                 mock_pipelined,
             ),
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.fp8.token_padding.zero_routing_weights_for_padding",
+                mock_zero_padding,
+            ),
+            patch.object(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True),
         ):
             out = VllmFp8MoEMethodTPU.apply_monolithic(method, layer, x, router_logits)
 
         assert out is x
+        mock_zero_padding.assert_called_once()
+        assert mock_zero_padding.call_args.kwargs["is_sequence_parallel"] is True
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
+        if pipelined:
+            assert call_kwargs["is_sequence_parallel"] is True
         target_fn = pipelined_fused_moe_gmm if pipelined else fused_moe_gmm
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
@@ -605,6 +619,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_bias = torch.zeros(4, 1, 128, dtype=torch.float32)
         layer.w2_bias = torch.zeros(4, 1, 64, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
 
         method = MagicMock()
         method._tpu_activation_str = "silu"
@@ -643,6 +658,8 @@ class TestMoEForwardPrecisionBranches:
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
+        if pipelined:
+            assert call_kwargs["is_sequence_parallel"] is True
         target_fn = pipelined_fused_moe_gmm if pipelined else fused_moe_gmm
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
@@ -663,6 +680,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_bias = None
         layer.w2_bias = None
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
 
         method = MagicMock()
         method._tpu_activation_str = "silu"
@@ -701,6 +719,8 @@ class TestMoEForwardPrecisionBranches:
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
+        if pipelined:
+            assert call_kwargs["is_sequence_parallel"] is True
         target_fn = pipelined_fused_moe_gmm if pipelined else fused_moe_gmm
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
@@ -717,6 +737,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.w2_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
 
         method = MagicMock(spec=VllmNvfp4MoEMethod)
         # Exercise GMM dispatch; an unset mock attribute would be truthy.
@@ -754,6 +775,8 @@ class TestMoEForwardPrecisionBranches:
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
+        if pipelined:
+            assert call_kwargs["is_sequence_parallel"] is True
         target_fn = pipelined_fused_moe_gmm if pipelined else fused_moe_gmm
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
@@ -766,6 +789,7 @@ class TestMoEForwardPrecisionBranches:
         layer = MagicMock()
         layer.activation = "silu"
         layer.moe_config = _make_mock_moe_config()
+        layer.moe_config.is_sequence_parallel = True
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight_packed = torch.randn(4, 64, 128, dtype=torch.bfloat16)
         layer.w2_weight_packed = torch.randn(4, 128, 64, dtype=torch.bfloat16)
@@ -807,6 +831,8 @@ class TestMoEForwardPrecisionBranches:
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
+        if pipelined:
+            assert call_kwargs["is_sequence_parallel"] is True
         target_fn = pipelined_fused_moe_gmm if pipelined else fused_moe_gmm
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
@@ -823,6 +849,7 @@ class TestMoEForwardPrecisionBranches:
         layer.w13_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.w2_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
+        layer.moe_config.is_sequence_parallel = True
 
         # Exercise the real apply_with_routing helper, not a MagicMock child.
         method = VllmCompressedTensorsW4ANMxfp4MoEMethod.__new__(
@@ -836,6 +863,7 @@ class TestMoEForwardPrecisionBranches:
 
         mock_fused = MagicMock(return_value=x)
         mock_pipelined = MagicMock(return_value=x)
+        mock_zero_padding = MagicMock(return_value=(topk_ids, topk_weights))
 
         with (
             patch(
@@ -854,15 +882,23 @@ class TestMoEForwardPrecisionBranches:
                 "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.pipelined_fused_moe_gmm",
                 mock_pipelined,
             ),
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.token_padding.zero_routing_weights_for_padding",
+                mock_zero_padding,
+            ),
         ):
             out = VllmCompressedTensorsW4ANMxfp4MoEMethod.apply_monolithic(
                 method, layer, x, router_logits
             )
 
         assert out is x
+        mock_zero_padding.assert_called_once()
+        assert mock_zero_padding.call_args.kwargs["is_sequence_parallel"] is True
         called_mock = mock_pipelined if pipelined else mock_fused
         called_mock.assert_called_once()
         call_kwargs = called_mock.call_args.kwargs
+        if pipelined:
+            assert call_kwargs["is_sequence_parallel"] is True
         target_fn = pipelined_fused_moe_gmm if pipelined else fused_moe_gmm
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
@@ -1108,6 +1144,239 @@ def test_pipelined_moe_four_stage_pipeline():
     assert len(rs_calls) == 4
 
 
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_sequence_parallel_moe_pipelines_over_ep_group(dp_size):
+    """Sequence-parallel MoE chunks the EP-group all-gather/reduce-scatter
+    at both DP=1 and DP>1."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    ep_group = _MockCollectiveGroup(world_size=8, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=dp_size, rank=0)
+    seq_len = 1024  # this rank's SP shard of an 8192-token step
+    hidden_dim = 16
+    topk = 2
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    topk_weights = torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk
+    topk_ids = torch.zeros(seq_len, topk, dtype=torch.int32)
+
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 2048),
+        patch.object(pfm, "get_pcp_group", return_value=None),
+        patch.object(pfm, "get_dp_group", return_value=dp_group),
+        patch.object(pfm, "get_ep_group", return_value=ep_group),
+        patch.object(
+            pfm,
+            "fused_moe_gmm",
+            side_effect=lambda hidden_states, **kw: hidden_states * 2.0,
+        ),
+    ):
+        assert pfm._get_moe_collective_group(is_sequence_parallel=True)[1] == "EP"
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+            is_sequence_parallel=True,
+        )
+
+    torch.testing.assert_close(out, hidden_states * 2.0)
+    # 8192 / 2048 = 4 chunks: hidden + weights + ids gathered, 1 RS each.
+    assert len([c for c in ep_group.call_log if c[0] == "all_gather"]) == 12
+    assert len([c for c in ep_group.call_log if c[0] == "reduce_scatter"]) == 4
+    assert dp_group.call_log == []
+
+
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_chunks", [1, 3])
+def test_sequence_parallel_moe_gathers_exact_routing_tensors(weight_dtype, num_chunks):
+    """Non-uniform weights and distinct non-zero int32 expert IDs arrive at
+    fused_moe_gmm bit-for-bit with preserved dtypes across 1 and multiple chunks."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    ep_size = 4
+    seq_len = 6  # divisible by 1 and 3
+    hidden_dim = 8
+    topk = 3
+    chunk_size = (seq_len * ep_size) // num_chunks
+
+    ep_group = _MockCollectiveGroup(world_size=ep_size, rank=1)
+    dp_group = _MockCollectiveGroup(world_size=1, rank=0)
+    hidden_states = torch.arange(seq_len * hidden_dim, dtype=torch.bfloat16).reshape(
+        seq_len, hidden_dim
+    )
+    topk_weights = (
+        torch.arange(1, seq_len * topk + 1, dtype=torch.float32).reshape(seq_len, topk)
+        / 32.0
+    ).to(weight_dtype)
+    topk_ids = torch.arange(10, 10 + seq_len * topk, dtype=torch.int32).reshape(
+        seq_len, topk
+    )
+
+    captured: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def capture_kernel(hidden_states, topk_weights, topk_ids, **_kw):
+        captured.append((topk_weights.clone(), topk_ids.clone()))
+        return hidden_states
+
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", chunk_size),
+        patch.object(pfm, "get_pcp_group", return_value=None),
+        patch.object(pfm, "get_dp_group", return_value=dp_group),
+        patch.object(pfm, "get_ep_group", return_value=ep_group),
+        patch.object(pfm, "fused_moe_gmm", side_effect=capture_kernel),
+    ):
+        pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+            is_sequence_parallel=True,
+        )
+
+    assert len(captured) == num_chunks
+    chunk_local = seq_len // num_chunks
+    for idx, (got_w, got_ids) in enumerate(captured):
+        exp_w = torch.cat(
+            [topk_weights[idx * chunk_local : (idx + 1) * chunk_local]] * ep_size,
+            dim=0,
+        )
+        exp_ids = torch.cat(
+            [topk_ids[idx * chunk_local : (idx + 1) * chunk_local]] * ep_size,
+            dim=0,
+        )
+        assert got_w.dtype == weight_dtype
+        assert got_ids.dtype == torch.int32
+        assert torch.equal(got_w, exp_w)
+        assert torch.equal(got_ids, exp_ids)
+
+
+def test_sequence_parallel_moe_rejects_pcp_and_short_padding_mask():
+    """SP MoE raises loudly on PCP > 1 or an undersized local_padding_mask."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    topk_ids = torch.zeros((4, 2), dtype=torch.int32)
+    topk_weights = torch.ones((4, 2), dtype=torch.float32)
+
+    with (
+        patch.object(pfm, "get_pcp_group", return_value=_MockCollectiveGroup(2, 0)),
+        patch.object(pfm, "get_dp_group", return_value=_MockCollectiveGroup(1, 0)),
+        pytest.raises(NotImplementedError, match="sequence-parallel MoE"),
+    ):
+        pfm._get_moe_collective_group(is_sequence_parallel=True)
+
+    state = token_padding.TokenPaddingState.create(8, device="cpu")
+    state.update(local_valid_tokens=5, local_padded_tokens=8)
+    token_padding.set_padding_state(state)
+    try:
+        with (
+            patch(
+                "vllm_torchtpu.distributed.pcp.get_pcp_group",
+                return_value=_MockCollectiveGroup(2, 0),
+            ),
+            patch(
+                "vllm.distributed.parallel_state.get_tp_group",
+                return_value=_MockCollectiveGroup(4, 1),
+            ),
+            pytest.raises(NotImplementedError, match="PCP"),
+        ):
+            token_padding.zero_routing_weights_for_padding(
+                topk_ids,
+                topk_weights,
+                is_local_tensor=True,
+                is_sequence_parallel=True,
+            )
+
+        # mask_len=8 < tp_size(4) * num_tokens(4) = 16 -> ValueError,
+        # not silent fallback to rank 0's prefix.
+        with (
+            patch(
+                "vllm_torchtpu.distributed.pcp.get_pcp_group",
+                return_value=None,
+            ),
+            patch(
+                "vllm.distributed.parallel_state.get_tp_group",
+                return_value=_MockCollectiveGroup(4, 1),
+            ),
+            pytest.raises(ValueError, match="cannot cover"),
+        ):
+            token_padding.zero_routing_weights_for_padding(
+                topk_ids,
+                topk_weights,
+                is_local_tensor=True,
+                is_sequence_parallel=True,
+            )
+    finally:
+        token_padding.set_padding_state(None)
+
+
+def test_replicated_layer_keeps_dp_group_under_sp_model():
+    """A non-SP layer (speculative drafter) in an SP model must not use the EP group."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    with (
+        patch.object(pfm, "get_pcp_group", return_value=None),
+        patch.object(pfm, "get_dp_group", return_value=_MockCollectiveGroup(1, 0)),
+        patch.object(pfm, "get_ep_group", return_value=_MockCollectiveGroup(8, 0)),
+    ):
+        assert pfm._get_moe_collective_group(is_sequence_parallel=False)[1] == "DP"
+
+
+def test_sequence_parallel_moe_slices_local_token_padding_mask():
+    """Under sequence-parallel MoE, zero_routing_weights_for_padding with
+    is_local_tensor=True slices this TP rank's shard of local_padding_mask."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    tp_group = _MockCollectiveGroup(world_size=4, rank=2)
+    state = token_padding.TokenPaddingState.create(12, device="cpu")
+    # 7 valid tokens out of 12 padded across 4 TP/SP ranks (3 tokens/rank):
+    # rank 0: [F, F, F], rank 1: [F, F, F], rank 2: [F, T, T], rank 3: [T, T, T]
+    state.update(local_valid_tokens=7, local_padded_tokens=12)
+    token_padding.set_padding_state(state)
+
+    topk_ids = torch.arange(6, dtype=torch.int32).reshape(3, 2)
+    topk_weights = torch.ones((3, 2), dtype=torch.float32)
+
+    try:
+        with (
+            patch(
+                "vllm_torchtpu.distributed.pcp.get_pcp_group",
+                return_value=None,
+            ),
+            patch(
+                "vllm.distributed.parallel_state.get_tp_group",
+                return_value=tp_group,
+            ),
+        ):
+            _, masked_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids,
+                topk_weights,
+                is_local_tensor=True,
+                is_sequence_parallel=True,
+            )
+        # Rank 2 owns global rows 6, 7, 8 -> row 0 valid, rows 1..2 padded (zeroed).
+        expected = torch.tensor([[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]])
+        torch.testing.assert_close(masked_weights, expected)
+    finally:
+        token_padding.set_padding_state(None)
+
+
 def test_fixed_chunk_count_honors_the_chunk_size_at_the_largest_bucket():
     from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
 
@@ -1139,3 +1408,17 @@ def test_fixed_chunk_collection_splits_every_bucket_alike(monkeypatch):
         # A single rank gathers nothing and keeps one chunk.
         assert pfm.collection_chunks(512, 1) == (1, 512)
     assert pfm.collection_chunks(2048, 8) == (4, 512)
+
+
+def test_fixed_chunk_buckets_scales_for_sequence_parallel_moe(monkeypatch):
+    """Under sequence-parallel MoE, fixed_moe_collection_chunks holds unsharded
+    per-DP-rank buckets B while each TP rank holds B // tp_size rows."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    monkeypatch.setattr(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 2048)
+    monkeypatch.setattr(pfm, "get_tp_group", lambda: _MockCollectiveGroup(8, 0))
+    # Unsharded step buckets B=[16, 32, ..., 4096] at DP=1, TP=8, EP=8:
+    # local shard lengths are [2, 4, ..., 512], max global = 4096 -> 2 chunks.
+    with pfm.fixed_moe_collection_chunks([16, 32, 64, 512, 4096]):
+        assert pfm.collection_chunks(512, 8, is_sequence_parallel=True) == (2, 256)
+        assert pfm.collection_chunks(2, 8, is_sequence_parallel=True) == (2, 1)
