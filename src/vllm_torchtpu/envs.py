@@ -259,6 +259,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_ATTN_GATHER: str = "bf16"
     TPU_MINIMAX_M3_SP_HIERARCHICAL: bool = False
     TPU_MINIMAX_M3_SP_FP8_WIRE: str = "u8"
+    TPU_MINIMAX_M3_SP_SCATTER: str = "bf16"
 
 
 def env_with_choices(
@@ -1653,6 +1654,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bits bitcast) or f8 (e4m3 itself).
     "TPU_MINIMAX_M3_SP_FP8_WIRE": env_with_choices(
         "TPU_MINIMAX_M3_SP_FP8_WIRE", "u8", ["u8", "s8", "f8"]
+    ),
+    # Wire format of the sequence-parallel reduce-scatter: bf16 (psum_scatter)
+    # or fp8 (each rank's partial sums as e4m3 with one f32 scale per row,
+    # exchanged by an all-to-all and summed in f32 by the receiving rank).
+    "TPU_MINIMAX_M3_SP_SCATTER": env_with_choices(
+        "TPU_MINIMAX_M3_SP_SCATTER", "bf16", ["bf16", "fp8"]
     ),
 }
 

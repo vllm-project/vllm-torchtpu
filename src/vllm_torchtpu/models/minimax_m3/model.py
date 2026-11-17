@@ -224,7 +224,9 @@ class MiniMaxM3Model(nn.Module):
         # traces, so viewing the gathers with it keeps the graph inputs of the
         # all-reduce trace (positions has its own symbol, lifted later).
         num_tokens = input_ids.shape[0]
-        residual = sp.reduce_scatter(sp.embed_partial(self.embed_tokens, input_ids))
+        residual = sp.reduce_scatter(
+            sp.embed_partial(self.embed_tokens, input_ids), exact=True
+        )
         hidden_states = None
         aux_hidden_states = []
         if 0 in self.aux_hidden_state_layers:

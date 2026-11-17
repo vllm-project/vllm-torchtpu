@@ -64,6 +64,8 @@ _SCALE_FLOOR = 1e-12
 class _Ops:
     n: int
     reduce_scatter: Any
+    # The bf16 reduce-scatter (the embedding's, which is exact).
+    reduce_scatter_exact: Any
     # The Pallas all-reduce's rank tensor when that op is armed, else None.
     rank: torch.Tensor | None
     all_gather: Any
@@ -169,6 +171,7 @@ def _chip_mesh(mesh):
 
 def _make_ops(mesh, rank: torch.Tensor | None, chip_mesh=None) -> _Ops:
     n = int(mesh.size)
+    scatter_fp8 = envs.TPU_MINIMAX_M3_SP_SCATTER == "fp8" and chip_mesh is None
     if chip_mesh is not None:
         # Reduce over the cores of a chip first (half the bytes stay on the
         # chip), then over the chips; the gather undoes it in reverse, so the
@@ -190,6 +193,7 @@ def _make_ops(mesh, rank: torch.Tensor | None, chip_mesh=None) -> _Ops:
         def ag(x):
             return lax.all_gather(x, axis, axis=0, tiled=True)
 
+    axis1 = mesh.axis_names[0]
     wire = {"u8": jnp.uint8, "s8": jnp.int8, "f8": None}[envs.TPU_MINIMAX_M3_SP_FP8_WIRE]
 
     def ag8(x):
@@ -204,22 +208,43 @@ def _make_ops(mesh, rank: torch.Tensor | None, chip_mesh=None) -> _Ops:
         scale = ag(scale)
         return (q.astype(jnp.float32) * scale).astype(x.dtype)
 
+    def _fp8_rows(xf):
+        scale = jnp.maximum(jnp.max(jnp.abs(xf), axis=-1, keepdims=True), _SCALE_FLOOR)
+        scale = scale / FP8_MAX
+        return (xf / scale).astype(jnp.float8_e4m3fn), scale
+
+    def rs8(x):
+        # [T, H] partial -> [n, T / n, H]: piece j goes to rank j, which sums
+        # the n pieces it receives (the psum_scatter's slice order).
+        t, h = x.shape
+        q, scale = _fp8_rows(x.astype(jnp.float32).reshape(n, t // n, h))
+        q = lax.bitcast_convert_type(
+            lax.all_to_all(
+                lax.bitcast_convert_type(q, jnp.int8), axis1, 0, 0, tiled=True
+            ),
+            jnp.float8_e4m3fn,
+        )
+        scale = lax.all_to_all(scale, axis1, 0, 0, tiled=True)
+        return jnp.sum(q.astype(jnp.float32) * scale, axis=0).astype(x.dtype)
+
     def fake_rs(x):
         return x.new_empty((x.shape[0] // n, *x.shape[1:]))
 
     def fake_ag(x):
         return x.new_empty((x.shape[0] * n, *x.shape[1:]))
 
+    def rs_op(name, body):
+        return _jax_op(
+            name, body, mesh, fake_rs, with_rank=rank is not None, body_mesh=chip_mesh
+        )
+
+    exact = rs_op("minimax_sp::reduce_scatter", rs)
     return _Ops(
         n=n,
-        reduce_scatter=_jax_op(
-            "minimax_sp::reduce_scatter",
-            rs,
-            mesh,
-            fake_rs,
-            with_rank=rank is not None,
-            body_mesh=chip_mesh,
-        ),
+        reduce_scatter=rs_op("minimax_sp::reduce_scatter_fp8", rs8)
+        if scatter_fp8
+        else exact,
+        reduce_scatter_exact=exact,
         rank=rank,
         all_gather=_jax_op(
             "minimax_sp::all_gather", ag, mesh, fake_ag, body_mesh=chip_mesh
@@ -269,20 +294,25 @@ def arm() -> None:
     _OPS = _make_ops(mesh, rank, chip_mesh)
     logger.info(
         "TPU_MINIMAX_M3_SP_MIN_TOKENS: sequence-parallel collectives armed over "
-        "%d ranks (TPU_MINIMAX_M3_SP_HIERARCHICAL=%d, mesh %s).",
+        "%d ranks (TPU_MINIMAX_M3_SP_HIERARCHICAL=%d, "
+        "TPU_MINIMAX_M3_SP_SCATTER=%s, TPU_MINIMAX_M3_SP_FP8_WIRE=%s, mesh %s).",
         _OPS.n,
         int(chip_mesh is not None),
+        envs.TPU_MINIMAX_M3_SP_SCATTER,
+        envs.TPU_MINIMAX_M3_SP_FP8_WIRE,
         dict((mesh if chip_mesh is None else chip_mesh).shape),
     )
 
 
-def reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+def reduce_scatter(x: torch.Tensor, exact: bool = False) -> torch.Tensor:
     """A 1/TP token slice of the TP sum of `x`: [T, H] -> [T / tp, H]. The
-    slices are in mesh order, the order `all_gather` puts them back in."""
+    slices are in mesh order, the order `all_gather` puts them back in.
+    exact: always the bf16 reduce-scatter (TPU_MINIMAX_M3_SP_SCATTER ignored)."""
     assert _OPS is not None
+    op = _OPS.reduce_scatter_exact if exact else _OPS.reduce_scatter
     if _OPS.rank is not None:
-        return _OPS.reduce_scatter(x, _OPS.rank)
-    return _OPS.reduce_scatter(x)
+        return op(x, _OPS.rank)
+    return op(x)
 
 
 def all_gather(x: torch.Tensor, fp8: bool, num_tokens: int) -> torch.Tensor:
