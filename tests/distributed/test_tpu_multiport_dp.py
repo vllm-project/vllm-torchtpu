@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from vllm.platforms.interface import Platform
 from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
@@ -295,7 +296,11 @@ def test_registration_lets_core_indexed_device_ids_through(
         assert TpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
     else:
         assert _resolve_device_ids([4, 5], ON) == [4, 5]
-        assert TpuPlatform.device_control_env_var == mpdp.DEVICE_CONTROL_PLACEHOLDER
+        assert (
+            TpuPlatform.device_control_env_var
+            == Platform.device_control_env_var
+            == "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+        )
 
 
 def test_device_ids_patch_is_installed_once(monkeypatch):

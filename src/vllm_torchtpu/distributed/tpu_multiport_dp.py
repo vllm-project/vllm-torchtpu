@@ -74,10 +74,6 @@ logger = init_logger(__name__)
 # the compile-cache key.
 SECTION = "tpu_multiport_dp"
 
-# vLLM's base Platform value; TpuPlatform.check_and_update_config switches to
-# it for expert parallelism.
-DEVICE_CONTROL_PLACEHOLDER = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
-
 
 @dataclasses.dataclass(frozen=True)
 class MultiportDpOptions:
@@ -115,7 +111,7 @@ def options(additional_config: Any) -> MultiportDpOptions:
 
 def local_dp_size(vllm_config) -> int:
     """The DP ranks that share this host under the option; 0 means off."""
-    if not options(getattr(vllm_config, "additional_config", None)).enabled:
+    if not options(vllm_config.additional_config).enabled:
         return 0
     return int(vllm_config.parallel_config.data_parallel_size)
 
@@ -237,10 +233,22 @@ def resolve_device_ids(original, engine_args) -> Any:
     option on, the platform stops consulting TPU_VISIBLE_CHIPS (as expert
     parallelism does later in ``check_and_update_config``), so the
     supervisor's core-indexed ``--device-ids`` pass vLLM's range check."""
-    if options(getattr(engine_args, "additional_config", None)).enabled:
+    if options(engine_args.additional_config).enabled:
+        from vllm.platforms.interface import Platform
+
         from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
-        TpuPlatform.device_control_env_var = DEVICE_CONTROL_PLACEHOLDER
+        if TpuPlatform.device_control_env_var != Platform.device_control_env_var:
+            logger.info_once(
+                "TPU multi-port DP: %s is no longer consulted for --device-ids "
+                "(%s), which count TPU cores; the TPU worker binds each "
+                "engine's chips by its local DP rank.",
+                TpuPlatform.device_control_env_var,
+                # info_once keys on its arguments, which must be hashable.
+                str(engine_args.device_ids),
+            )
+            # vLLM's base Platform value, as expert parallelism sets it.
+            TpuPlatform.device_control_env_var = Platform.device_control_env_var
     return original(engine_args)
 
 
