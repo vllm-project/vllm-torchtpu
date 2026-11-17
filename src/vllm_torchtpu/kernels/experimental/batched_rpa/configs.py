@@ -25,9 +25,14 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 
 
 def _get_tpu_info() -> pltpu.TpuInfo:
+    """The local chip's TPU info; TPU7x's when JAX runs without a TPU backend
+    (CPU tests and tracing), so the configs can still be computed. A TPU that
+    JAX does not recognize raises rather than take TPU7x's SMEM and VMEM."""
     try:
         return pltpu.get_tpu_info()
     except ValueError:
+        if jax.default_backend() == "tpu":
+            raise
         return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
 
 

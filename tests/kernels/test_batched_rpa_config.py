@@ -16,6 +16,7 @@
 import functools
 from unittest.mock import MagicMock, patch
 
+import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
@@ -237,3 +238,25 @@ def test_the_jitted_wrapper_passes_the_decode_batch_size_to_its_decode_kernel(
     assert len([n for n in names if n.startswith(decode)]) == 1, names
     assert len([n for n in names if n.startswith(mixed)]) == 1, names
     assert all("-b2-" in n for n in names if n.startswith(mixed)), names
+
+
+@pytest.mark.parametrize(("backend", "falls_back"), [("cpu", True), ("tpu", False)])
+def test_tpu_info_falls_back_to_tpu7x_only_without_a_tpu(
+    monkeypatch, backend, falls_back
+):
+    """An unrecognized chip on a TPU backend raises instead of silently taking
+    TPU7x's SMEM and VMEM sizes; off TPU the configs use TPU7x's."""
+    import jax
+    import jax.experimental.pallas.tpu as pltpu
+
+    def unknown_chip(*args, **kwargs):
+        raise ValueError("Unsupported TPU device kind")
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", unknown_chip)
+    monkeypatch.setattr(jax, "default_backend", lambda: backend)
+    if falls_back:
+        info = configs._get_tpu_info()
+        assert info == pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    else:
+        with pytest.raises(ValueError, match="Unsupported TPU device kind"):
+            configs._get_tpu_info()
