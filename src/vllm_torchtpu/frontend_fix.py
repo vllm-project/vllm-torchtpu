@@ -30,13 +30,14 @@ Both are off by default and installed by ``additional_config["tpu_frontend"]``
 from __future__ import annotations
 
 import contextlib
-import logging
 import multiprocessing
 import os
 import time
 
-logger = logging.getLogger("vllm.qx_fe_fix")
-_P = "[QX_LAZY_REASONING_COUNT]"
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+_P = "tpu_frontend.lazy_reasoning_count:"
 _INSTALLED = False
 _LAZY_REASONING_COUNT_LOG_S = 60.0
 
@@ -131,16 +132,16 @@ def maybe_install_lazy_reasoning_count() -> bool:
             request = kwargs.get("request", args[2] if len(args) > 2 else None)
             so = getattr(request, "stream_options", None)
             cont = bool(so is not None and getattr(so, "continuous_usage_stats", False))
-            self._qx_skip_count = (finished is False) and not cont
+            self._tpu_skip_reasoning_count = (finished is False) and not cont
         except Exception:
-            self._qx_skip_count = False
+            self._tpu_skip_reasoning_count = False
         return res
 
     def _maybe_log():
         now = time.monotonic()
         if now - _Stats.last_log >= log_s:
             _Stats.last_log = now
-            logger.warning(
+            logger.debug(
                 "%s stats zero=%d skipped=%d computed=%d compute_s=%.2f",
                 _P,
                 _Stats.zero,
@@ -152,7 +153,7 @@ def maybe_install_lazy_reasoning_count() -> bool:
     def count_reasoning_tokens(self, token_ids):
         skip = False
         try:
-            skip = self.__dict__.pop("_qx_skip_count", False)
+            skip = self.__dict__.pop("_tpu_skip_reasoning_count", False)
             rp = getattr(self, "_reasoning_parser", None)
             if isinstance(rp, ParserEngineReasoningAdapter) and not getattr(
                 rp, "_streaming_count_valid", True
@@ -167,25 +168,20 @@ def maybe_install_lazy_reasoning_count() -> bool:
             skip = False
         if skip:
             _Stats.skipped += 1
-            return self.__dict__.get("_qx_last_count", 0)
+            return self.__dict__.get("_tpu_last_reasoning_count", 0)
         t0 = time.perf_counter()
         n = orig_count(self, token_ids)
         _Stats.computed += 1
         _Stats.compute_s += time.perf_counter() - t0
         with contextlib.suppress(Exception):
-            self._qx_last_count = n
+            self._tpu_last_reasoning_count = n
             _maybe_log()
         return n
 
-    # Markers that the patch is installed (checked on re-install).
-    # pyrefly: ignore[missing-attribute]
-    parse_delta.__qx_lazy__ = True
-    # pyrefly: ignore[missing-attribute]
-    count_reasoning_tokens.__qx_lazy__ = True
     DelegatingParser.parse_delta = parse_delta
     DelegatingParser.count_reasoning_tokens = count_reasoning_tokens
     _INSTALLED = True
-    logger.warning(
+    logger.info(
         "%s installed DelegatingParser.parse_delta/count_reasoning_tokens "
         "patch (pid %d, %s)",
         _P,
@@ -216,7 +212,7 @@ def maybe_install_lazy_reasoning_count() -> bool:
 # all skipped special tokens) we keep the full prompt, i.e. upstream behaviour.
 # ---------------------------------------------------------------------------
 
-_DT = "[QX_DETOK_PROMPT_TAIL]"
+_DT = "tpu_frontend.detok_prompt_tail:"
 _DETOK_INSTALLED = False
 # Prompt tokens the detokenizer is primed with when the tail is safe.
 DETOK_PROMPT_TAIL_TOKENS = 8
@@ -255,14 +251,14 @@ class _PromptTailView:
     everything except ``prompt_token_ids`` is delegated to the real request.
     """
 
-    __slots__ = ("_qx_req", "prompt_token_ids")
+    __slots__ = ("_request", "prompt_token_ids")
 
     def __init__(self, req, prompt_token_ids):
-        object.__setattr__(self, "_qx_req", req)
+        object.__setattr__(self, "_request", req)
         object.__setattr__(self, "prompt_token_ids", prompt_token_ids)
 
     def __getattr__(self, name):
-        return getattr(object.__getattribute__(self, "_qx_req"), name)
+        return getattr(object.__getattribute__(self, "_request"), name)
 
 
 def maybe_install_detok_prompt_tail() -> bool:
@@ -315,7 +311,7 @@ def maybe_install_detok_prompt_tail() -> bool:
             now = time.monotonic()
             if now - _DetokStats.last_log >= log_s:
                 _DetokStats.last_log = now
-                logger.warning(
+                logger.debug(
                     "%s stats tail=%d full_fallback=%d short=%d",
                     _DT,
                     _DetokStats.tail,
@@ -325,12 +321,10 @@ def maybe_install_detok_prompt_tail() -> bool:
         orig_init(self, tokenizer, request)
 
     # pyrefly: ignore[missing-attribute]
-    __init__.__qx_detok_tail__ = True
-    # pyrefly: ignore[missing-attribute]
     __init__.__wrapped__ = orig_init
     cls.__init__ = __init__
     _DETOK_INSTALLED = True
-    logger.warning(
+    logger.info(
         "%s installed FastIncrementalDetokenizer prompt-tail priming "
         "(tail=%d, pid %d, %s)",
         _DT,

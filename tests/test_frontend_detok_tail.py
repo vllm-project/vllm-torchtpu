@@ -154,10 +154,12 @@ def test_install_patches_vllm_detokenizer(monkeypatch):
     monkeypatch.setattr(ff, "_DETOK_INSTALLED", False)
     try:
         assert ff.maybe_install_detok_prompt_tail()
-        assert getattr(cls.__init__, "__qx_detok_tail__", False)
-        # A second install leaves the first patch in place.
-        assert ff.maybe_install_detok_prompt_tail() is False
+        assert cls.__init__ is not orig
         assert cls.__init__.__wrapped__ is orig
+        # A second install leaves the first patch in place.
+        patched = cls.__init__
+        assert ff.maybe_install_detok_prompt_tail() is False
+        assert cls.__init__ is patched
     finally:
         cls.__init__ = orig
         ff._DETOK_INSTALLED = False

@@ -22,13 +22,15 @@ default; see ``frontend_options``).
 from __future__ import annotations
 
 import hashlib
-import logging
 import os
 import threading
 import time
 from collections import OrderedDict
 
-logger = logging.getLogger("vllm.qx_tokcache")
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+_P = "tpu_frontend.tokenize_prefix_cache:"
 
 BOUNDARY = "<|im_start|>"
 _BOUNDARY_B = BOUNDARY.encode("utf-8")
@@ -250,7 +252,7 @@ class PrefixTokenCache:
             except ValueError:
                 ok = False
             if not ok:
-                logger.warning("[QX_TOKCACHE] boundary/token mismatch; full encode")
+                logger.warning_once("%s boundary/token mismatch; full encode", _P)
                 return self._encode(text)
             ids = e.ids[:tok_idx]
             ids.extend(suf_ids)
@@ -268,8 +270,9 @@ class PrefixTokenCache:
                 if full != ids:
                     self.disabled = True
                     logger.error(
-                        "[QX_TOKCACHE] VERIFY MISMATCH (len %d vs %d); disabling "
+                        "%s verify mismatch (len %d vs %d); disabling "
                         "the tokenize prefix cache permanently",
+                        _P,
                         len(full),
                         len(ids),
                     )
@@ -377,7 +380,7 @@ class PrefixTokenCache:
         now = time.monotonic()
         if now - self._last_log >= self._log_period:
             self._last_log = now
-            logger.warning("[QX_TOKCACHE] stats %s", self.stats())
+            logger.debug("%s stats %s", _P, self.stats())
 
 
 _CACHE: PrefixTokenCache | None = None
@@ -395,13 +398,14 @@ def _build_cache_for(tokenizer) -> PrefixTokenCache | None:
     )
     if backend is None or not isinstance(backend, Tokenizer):
         logger.warning(
-            "[QX_TOKCACHE] tokenizer %s has no Rust backend; not enabled",
+            "%s tokenizer %s has no Rust backend; not enabled",
+            _P,
             type(tokenizer).__name__,
         )
         return None
     boundary_id = tokenizer.convert_tokens_to_ids(BOUNDARY)
     if not isinstance(boundary_id, int) or boundary_id < 0:
-        logger.warning("[QX_TOKCACHE] %s not in vocab; not enabled", BOUNDARY)
+        logger.warning("%s %s not in vocab; not enabled", _P, BOUNDARY)
         return None
     # Per-thread private copies: no truncation/padding state, no RefCell
     # borrow conflicts with the vLLM tokenizer pool.
@@ -432,7 +436,7 @@ def _build_cache_for(tokenizer) -> PrefixTokenCache | None:
         or encode(probe) != tokenizer(probe, add_special_tokens=False)["input_ids"]
         or encode(probe).count(boundary_id) != 1
     ):
-        logger.warning("[QX_TOKCACHE] tokenizer safety probe failed; not enabled")
+        logger.warning("%s tokenizer safety probe failed; not enabled", _P)
         return None
     return PrefixTokenCache(
         encode,
@@ -454,7 +458,7 @@ def maybe_install_tokenize_prefix_cache() -> bool:
         from vllm.renderers import base as rbase
         from vllm.renderers.hf import HfRenderer
     except Exception as e:  # pragma: no cover
-        logger.warning("[QX_TOKCACHE] cannot import vLLM renderer (%r); not enabled", e)
+        logger.warning("%s cannot import vLLM renderer (%r); not enabled", _P, e)
         return False
 
     orig = rbase.BaseRenderer._tokenize_prompt
@@ -470,9 +474,10 @@ def maybe_install_tokenize_prefix_cache() -> bool:
                     global _CACHE
                     _CACHE = state["cache"]
                     if state["cache"] is not None:
-                        logger.warning(
-                            "[QX_TOKCACHE] active: incremental prompt "
+                        logger.info(
+                            "%s active: incremental prompt "
                             "tokenization at %s boundaries (pid %d)",
+                            _P,
                             BOUNDARY,
                             os.getpid(),
                         )
@@ -499,16 +504,20 @@ def maybe_install_tokenize_prefix_cache() -> bool:
                         ):
                             return self._build_tokens_prompt(ids, prompt)
         except Exception as e:  # never break serving
-            logger.warning("[QX_TOKCACHE] error %r; falling back", e)
+            # Once per exception type: a vLLM change that breaks this wrapper
+            # would otherwise log on every request.
+            logger.warning_once(
+                "%s %s in the cached tokenization; using vLLM's tokenization",
+                _P,
+                type(e).__name__,
+            )
         return orig(self, prompt, params)
 
-    # pyrefly: ignore[missing-attribute]
-    _tokenize_prompt.__qx_tokcache__ = True
     rbase.BaseRenderer._tokenize_prompt = _tokenize_prompt
     _INSTALLED = True
-    logger.warning(
-        "[QX_TOKCACHE] installed BaseRenderer._tokenize_prompt patch "
-        "(tpu_frontend.tokenize_prefix_cache, pid %d)",
+    logger.info(
+        "%s installed BaseRenderer._tokenize_prompt patch (pid %d)",
+        _P,
         os.getpid(),
     )
     return True
