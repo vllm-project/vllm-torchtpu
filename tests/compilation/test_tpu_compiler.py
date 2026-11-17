@@ -222,6 +222,10 @@ class TestTpuCompilerCache:
             "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS",
             "VLLM_TPU_DP_PROMPT_BACKLOG",
             "VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN",
+            "VLLM_TPU_DP_PREFIX_AFFINITY",
+            "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS",
+            "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN",
+            "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
