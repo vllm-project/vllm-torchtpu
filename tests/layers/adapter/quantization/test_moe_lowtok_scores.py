@@ -408,6 +408,23 @@ def test_copy_enabled_placement_arms_60_backbone_plus_1_mtp_draft_layer(
     assert line.startswith("moe_lowtok: 61/61 MoE layers armed (scores 61, ids 0)")
 
 
+def test_only_a_512_expert_layer_gets_the_copy_tables(enabled, monkeypatch):
+    """The copy-aware op's slot, holder and hot tables are 512 lanes wide
+    (kernel.slot_table, pack_tables, hot_onehot), so only a placed layer of
+    exactly 512 experts gets it. A copies layer of 768 experts (96 primaries
+    and 4 copies per rank at EP8) keeps the routed-ids entry instead."""
+    monkeypatch.setattr(scores.expert_placement, "has_copies", lambda: True)
+    monkeypatch.setattr(scores.expert_placement, "placed", lambda name: True)
+    monkeypatch.setattr(scores.expert_placement, "slots", lambda: 100)
+    monkeypatch.setattr(scores.expert_placement, "global_count", lambda: 768)
+    monkeypatch.setattr(scores.expert_placement, "shards", lambda: 8)
+    monkeypatch.setattr(scores, "_build_copies_op", Mock(name="copies_op"))
+    layer = make_layer(experts=100)
+    layer.global_num_experts = 768
+    assert scores.prebuild(method(), layer, "silu") is None
+    scores._build_copies_op.assert_not_called()
+
+
 @pytest.mark.parametrize("rows, lowtok", [(64, True), (65, False)])
 def test_in_op_row_cap_dispatches_copy_aware_lowtok_or_fused_moe_func(
     monkeypatch, rows, lowtok
