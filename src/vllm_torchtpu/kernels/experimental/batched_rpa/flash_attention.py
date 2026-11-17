@@ -178,6 +178,7 @@ def flash_attention_qk_softmax(
 
     if folded_scale is None:
         scale = float(cfgs.model.sm_scale)
+        if isinstance(k_scale, (int, float)):
             scale *= float(k_scale)
             k_scale = k_scale * scale
             scale = 1.0
@@ -187,6 +188,7 @@ def flash_attention_qk_softmax(
             qk *= scale
         if k_scale is not None and not isinstance(k_scale, (int, float)):
             qk *= k_scale
+    elif folded_scale is None:
         qk *= cfgs.model.sm_scale
         if cfgs.serve.scale_q is not None:
             qk *= cfgs.serve.scale_q
