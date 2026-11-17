@@ -251,6 +251,13 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # all-gathers send e4m3 rows with a per-row f32 scale. Lossy.
     "minimax_sp_fp8_gather": False,
     "minimax_sp_fp8_attn_gather": False,
+    # MiniMax M3 bias-free MXFP8 linears of the target model / of the DSpark
+    # draft's MLP stay e4m3 with one power-of-two scale per output channel
+    # (`models/minimax_m3/quant.py`) instead of bf16: half the weight bytes.
+    # Lossy only where a block's shift onto its channel scale takes an element
+    # below e4m3's normal range; otherwise the matmul equals the bf16 one.
+    "minimax_fp8_linears": False,
+    "minimax_fp8_draft_linears": False,
 }
 
 

@@ -86,6 +86,8 @@ REPLACED_ENV = {
     "minimax_sp_min_tokens": "TPU_MINIMAX_M3_SP_MIN_TOKENS",
     "minimax_sp_fp8_gather": "TPU_MINIMAX_M3_SP_FP8_GATHER",
     "minimax_sp_fp8_attn_gather": "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER",
+    "minimax_fp8_linears": "TPU_MINIMAX_M3_FP8_LINEARS",
+    "minimax_fp8_draft_linears": "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
