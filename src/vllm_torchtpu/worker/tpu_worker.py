@@ -27,7 +27,7 @@ import torch.profiler
 import torch_tpu  # noqa: F401
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     get_kv_transfer_group,
@@ -83,6 +83,21 @@ def _configure_tpu_process_env(
         os.environ["WORLD_SIZE"] = str(world_size)
     else:
         os.environ.pop("WORLD_SIZE", None)
+
+
+def _world_group_init_kwargs(parallel_config: ParallelConfig) -> dict[str, Any]:
+    """The world group's timeout for init_distributed_environment, when vLLM's
+    --cpu-distributed-timeout-seconds sets one; nothing otherwise.
+
+    Gloo CPU groups wait 30 min by default. Under model-store contention a rank
+    can still be streaming weights after that while its peers sit in a CPU
+    collective (the draft load barrier on prefill, the all_gather_object of
+    build_ep_mesh on decode), and the waiters die with "Timed out waiting
+    1800000ms". The option sets the timeout of every CPU collective: vLLM's own
+    groups read it, and the world group gets it here.
+    """
+    timeout = parallel_config.cpu_distributed_timeout
+    return {} if timeout is None else {"timeout": timeout}
 
 
 def _release_free_host_heap() -> None:
@@ -487,18 +502,6 @@ class TPUWorker(WorkerBase):
         tpu_platform = cast(TpuPlatform, current_platform)
         dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
 
-        # Gloo CPU groups wait 30 min by default. Under model-store contention
-        # a rank can still be streaming weights after that while its peers sit
-        # in a CPU collective (the draft load barrier on prefill, the
-        # all_gather_object of build_ep_mesh on decode), and the waiters die
-        # with "Timed out waiting 1800000ms". vLLM's
-        # --cpu-distributed-timeout-seconds sets the timeout of every CPU
-        # collective: vLLM's own groups read it, and the world group gets it
-        # here.
-        cpu_timeout = self.parallel_config.cpu_distributed_timeout
-        init_kwargs: dict[str, Any] = {}
-        if cpu_timeout is not None:
-            init_kwargs["timeout"] = cpu_timeout
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
                 world_size=init_world,
@@ -506,7 +509,7 @@ class TPUWorker(WorkerBase):
                 local_rank=local_rank_for_init,
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
-                **init_kwargs,
+                **_world_group_init_kwargs(self.parallel_config),
             )
         # The PCP group keeps its natural rank order. Reordering it used to be
         # how the ring was chosen, on the understanding that the ring followed

@@ -28,6 +28,7 @@ from vllm.config import ParallelConfig
 
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import tpu_worker
 
 
 def _run_barrier(world_size, timeout):
@@ -71,6 +72,29 @@ def test_vllm_parallel_config_exposes_the_cpu_timeout(seconds):
     config = ParallelConfig(cpu_distributed_timeout_seconds=seconds)
     expected = None if seconds is None else timedelta(seconds=seconds)
     assert config.cpu_distributed_timeout == expected
+
+
+@pytest.mark.parametrize("seconds", [None, 10800])
+def test_the_world_group_gets_the_cpu_timeout_only_when_set(seconds):
+    config = ParallelConfig(cpu_distributed_timeout_seconds=seconds)
+    expected = {} if seconds is None else {"timeout": timedelta(seconds=seconds)}
+    assert tpu_worker._world_group_init_kwargs(config) == expected
+
+
+def test_init_device_hands_the_timeout_to_the_world_group():
+    """init_device passes the helper's arguments to init_distributed_environment;
+    without them the world group falls back to gloo's 30 min."""
+    source = textwrap.dedent(inspect.getsource(tpu_worker.TPUWorker.init_device))
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "init_distributed_environment"
+    ]
+    assert len(calls) == 1
+    unpacked = [ast.unparse(kw.value) for kw in calls[0].keywords if kw.arg is None]
+    assert unpacked == ["_world_group_init_kwargs(self.parallel_config)"]
 
 
 class _Spec:
