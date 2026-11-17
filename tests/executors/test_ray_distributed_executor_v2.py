@@ -844,6 +844,188 @@ class TestTpuRayDistributedExecutorV2:
 
             executor.ray_worker_handles = []
 
+    @pytest.mark.parametrize(
+        "mode", ["lws_dns", "lws_worker_id_multinic", "node_hostname"]
+    )
+    @patch(
+        "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
+        return_value={},
+    )
+    @patch("vllm_torchtpu.executors.ray_distributed_executor_v2.MessageQueue")
+    def test_init_executor_ipv6_slicebuilder_host_resolution(
+        self,
+        mock_mq,
+        mock_driver_env,
+        mock_wait_until_pg_ready,
+        mock_get_ip,
+        mock_platform,
+        mock_ray,
+        monkeypatch,
+        mode,
+    ):
+        for key in (
+            "TORCH_TPU_DP_SIZE",
+            "TORCH_TPU_DP_MASTER_PORT",
+            "TORCH_TPU_BASE_PORT",
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+            "TORCH_TPU_XPROF_SESSION_ID",
+            "VLLM_RAY_BUNDLE_INDICES",
+            "LWS_LEADER_ADDRESS",
+            "LWS_GROUP_SIZE",
+            "LWS_WORKER_INDEX",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        # Host 0's IPv6 literal ("2001:db8::b") sorts lexicographically after
+        # host 1 ("2001:db8::2"), verifying both host ordering and Step 7
+        # hostname substitution in TORCH_TPU_SLICEBUILDER_ADDRESSES.
+        host0_ip, host1_ip = "2001:db8::b", "2001:db8::2"
+        leader_dns = "vllm-lws-0.vllm-lws.default.svc.cluster.local"
+        worker1_dns = "vllm-lws-0-1.vllm-lws.default.svc.cluster.local"
+
+        if mode == "lws_dns":
+            monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+            monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+            dns_to_ip = {leader_dns: host0_ip, worker1_dns: host1_ip}
+            expected_hosts = (leader_dns, worker1_dns)
+            nodes = [
+                {
+                    "NodeID": "node_2",
+                    "NodeManagerAddress": host1_ip,
+                    "Resources": {"TPU": 4.0},
+                },
+                {
+                    "NodeID": "node_1",
+                    "NodeManagerAddress": host0_ip,
+                    "Resources": {"TPU": 4.0},
+                },
+            ]
+        elif mode == "lws_worker_id_multinic":
+            monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+            monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+            monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+            dns_to_ip = {leader_dns: "fd00::10", worker1_dns: "fd00::11"}
+            expected_hosts = (leader_dns, worker1_dns)
+            nodes = [
+                {
+                    "NodeID": "node_2",
+                    "NodeManagerAddress": host1_ip,
+                    "Resources": {"TPU": 4.0},
+                    "labels": {"ray.io/tpu-worker-id": "1"},
+                },
+                {
+                    "NodeID": "node_1",
+                    "NodeManagerAddress": host0_ip,
+                    "Resources": {"TPU": 4.0},
+                    "labels": {"ray.io/tpu-worker-id": "0"},
+                },
+            ]
+        else:
+            host0_name, host1_name = "tpu-host-0.internal", "tpu-host-1.internal"
+            dns_to_ip = {host0_name: host0_ip, host1_name: host1_ip}
+            expected_hosts = (host0_name, host1_name)
+            nodes = [
+                {
+                    "NodeID": "node_2",
+                    "NodeManagerAddress": host1_ip,
+                    "NodeManagerHostname": host1_name,
+                    "Resources": {"TPU": 4.0},
+                    "labels": {"ray.io/tpu-worker-id": "1"},
+                },
+                {
+                    "NodeID": "node_1",
+                    "NodeManagerAddress": host0_ip,
+                    "NodeManagerHostname": host0_name,
+                    "Resources": {"TPU": 4.0},
+                    "labels": {"ray.io/tpu-worker-id": "0"},
+                },
+            ]
+
+        monkeypatch.setattr(
+            dist_utils.socket,
+            "getnameinfo",
+            lambda sockaddr, flags: (_ for _ in ()).throw(socket.gaierror("no PTR")),
+        )
+        monkeypatch.setattr(
+            dist_utils.socket,
+            "getaddrinfo",
+            lambda host, *a, **kw: (
+                [(socket.AF_INET6, 0, 0, "", (dns_to_ip[host], 0, 0, 0))]
+                if host in dns_to_ip
+                else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
+            ),
+        )
+
+        mock_platform.ray_device_key = "TPU"
+        mock_ray.is_initialized.return_value = True
+        mock_placement_group = MagicMock()
+
+        def create_pg(specs, strategy):
+            mock_placement_group.bundle_specs = specs
+            return mock_placement_group
+
+        mock_ray.util.placement_group.side_effect = create_pg
+        mock_ray.nodes.return_value = nodes
+
+        def get_bundles(pg):
+            return [
+                (i, "node_1", next(k[5:] for k in spec if k.startswith("node:")))
+                for i, spec in enumerate(pg.bundle_specs)
+            ]
+
+        with (
+            patch(
+                "vllm_torchtpu.executors.ray_distributed_executor_v2.get_bundles_sorted_by_node",
+                side_effect=get_bundles,
+            ),
+            patch(
+                "vllm_torchtpu.executors.ray_distributed_executor_v2.get_tpu_multihost_topology",
+                return_value="1,2,2,2",
+            ),
+        ):
+            mock_ray.get_runtime_context().get_node_id.return_value = "node_1"
+
+            self.parallel_config.world_size = 2
+            self.parallel_config.tensor_parallel_size = 2
+            self.parallel_config.pipeline_parallel_size = 1
+            self.parallel_config.local_world_size = 2
+            self.parallel_config.data_parallel_size = 4
+            self.parallel_config.data_parallel_index = 0
+
+            executor = RayDistributedExecutorV2(self.vllm_config)
+            executor.vllm_config = self.vllm_config
+            executor.parallel_config = self.parallel_config
+
+            actors = [MagicMock(), MagicMock()]
+            mock_remote_class = MagicMock()
+            mock_remote_class.options.return_value.remote.side_effect = actors
+            mock_ray.remote.return_value = mock_remote_class
+
+            mock_ray.get.side_effect = [
+                [("node_1", [0]), ("node_1", [1])],
+                f"tcp://[{host0_ip}]:9000",
+                [None, None],
+                [
+                    {"status": "READY", "handle": "handle_1"},
+                    {"status": "READY", "handle": "handle_2"},
+                ],
+            ]
+
+            try:
+                executor._init_executor()
+
+                expected_sb = ",".join(
+                    f"{host}:{8070 + chip}"
+                    for host in expected_hosts
+                    for chip in range(4)
+                )
+                for actor in actors:
+                    env = actor.initialize_worker.remote.call_args[0][1]
+                    assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == expected_sb
+                    assert env["MASTER_ADDR"] == host0_ip
+            finally:
+                executor.ray_worker_handles = []
+
     @patch(
         "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
         return_value={},
@@ -1160,3 +1342,33 @@ def test_resolve_slicebuilder_hosts_errors_and_multi_nic_worker_order(monkeypatc
         "fd00:1::3": leader_dns,
         "fd00:1::1": worker1_dns,
     }
+
+    # If local ray.io/tpu-worker-id contradicts LWS_WORKER_INDEX, position is
+    # not trusted as LWS_WORKER_INDEX.
+    monkeypatch.setenv("LWS_WORKER_INDEX", "1")
+    monkeypatch.setattr(rde2.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        rde2.ray,
+        "get_runtime_context",
+        lambda: MagicMock(get_node_id=lambda: "node_0"),
+    )
+    monkeypatch.setattr(
+        rde2.ray,
+        "nodes",
+        lambda: [
+            {
+                "NodeID": "node_0",
+                "NodeManagerAddress": "fd00:1::3",
+                "Resources": {"TPU": 8},
+                "labels": {"ray.io/tpu-worker-id": "0"},
+            },
+            {
+                "NodeID": "node_1",
+                "NodeManagerAddress": "fd00:1::1",
+                "Resources": {"TPU": 8},
+                "labels": {"ray.io/tpu-worker-id": "1"},
+            },
+        ],
+    )
+    executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
+    assert executor._resolve_slice_host_layout("TPU").ordered_by_worker_id is False

@@ -215,7 +215,8 @@ def test_failed_bootstrap_can_retry(bootstrap):
     assert os.environ[mp._DONE_SENTINEL] == "2"
 
 
-def test_mp_lws_worker_index_mismatch_raises(monkeypatch, bootstrap):
+def test_mp_lws_worker_index_mismatch_raises_only_on_ipv6(monkeypatch, bootstrap):
+    rendezvous, _ = bootstrap
     monkeypatch.setenv("LWS_LEADER_ADDRESS", "leader.svc.cluster.local")
     monkeypatch.setenv("LWS_GROUP_SIZE", "2")
     monkeypatch.setenv("LWS_WORKER_INDEX", "1")
@@ -226,10 +227,6 @@ def test_mp_lws_worker_index_mismatch_raises(monkeypatch, bootstrap):
         master_addr="10.0.0.1",
         master_port=9000,
     )
-    with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
-        mp.prepare_mp_multihost_env(nnodes_cfg)
-    bootstrap[0].assert_not_called()
-
     dp_cfg = SimpleNamespace(
         data_parallel_size=4,
         data_parallel_size_local=2,
@@ -238,12 +235,22 @@ def test_mp_lws_worker_index_mismatch_raises(monkeypatch, bootstrap):
         data_parallel_master_ip="10.0.0.1",
         world_size=2,
     )
+    # IPv4 LWS deployments never use LWS DNS host substitution, so custom
+    # node_rank != LWS_WORKER_INDEX continues to work without raising.
+    mp.prepare_mp_multihost_env(nnodes_cfg)
+    assert mp.prepare_mp_multihost_dp_env(dp_cfg, 8)
+
+    monkeypatch.delenv(mp._DONE_SENTINEL)
+    monkeypatch.delenv(mp._DP_DONE_SENTINEL)
+    rendezvous.return_value = (["2001:db8::9", "2001:db8::a"], "session")
+    with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
+        mp.prepare_mp_multihost_env(nnodes_cfg)
     with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
         mp.prepare_mp_multihost_dp_env(dp_cfg, 8)
-    bootstrap[0].assert_not_called()
 
 
 def test_mp_lws_subgroup_disables_worker_index_fallback(monkeypatch, bootstrap):
+    bootstrap[0].return_value = (["2001:db8::9", "2001:db8::a"], "session")
     monkeypatch.setenv("LWS_LEADER_ADDRESS", "leader.svc.cluster.local")
     monkeypatch.setenv("LWS_GROUP_SIZE", "4")
     monkeypatch.setenv("LWS_WORKER_INDEX", "2")
@@ -251,14 +258,14 @@ def test_mp_lws_subgroup_disables_worker_index_fallback(monkeypatch, bootstrap):
 
     def _fake_resolve(host_ips, *, ordered_by_worker_id=False, hostnames_by_ip=None):
         seen_flags.append(ordered_by_worker_id)
-        return {ip: ip for ip in host_ips}
+        return {ip: f"host-{i}" for i, ip in enumerate(host_ips)}
 
     monkeypatch.setattr(mp, "resolve_slicebuilder_hosts", _fake_resolve)
     config = SimpleNamespace(
         nnodes=2,
         node_rank=0,
         local_world_size=4,
-        master_addr="10.0.0.1",
+        master_addr="leader.svc.cluster.local",
         master_port=9000,
     )
     mp.prepare_mp_multihost_env(config)

@@ -198,7 +198,6 @@ TPU_PCI_DEVICE_ID_TO_TYPE: dict[str, str] = {
     "0x007c": "tpu8t",
     "0x0083": "tpu8i",
 }
-TPU_VFIO_PCI_DEVICE_IDS: frozenset[str] = frozenset(TPU_PCI_DEVICE_ID_TO_TYPE)
 # Maximum SR-IOV application VFs per physical function (virtfn0 .. virtfn{k-1},
 # matching per-chip TensorCore device counts) when bare-metal sysfs exposes
 # `physfn` alongside ICI management VFs. GCE/GKE guest VMs pass through VFs
@@ -276,7 +275,7 @@ def _accessible_vfio_tpu_device_id(group: int) -> str | None:
                 continue
             with open(os.path.join(dev_dir, "device"), encoding="ascii") as df:
                 device_id = df.read().strip().lower()
-            if device_id in TPU_VFIO_PCI_DEVICE_IDS and _is_application_pci_function(
+            if device_id in TPU_PCI_DEVICE_ID_TO_TYPE and _is_application_pci_function(
                 dev_dir, bdf, device_id
             ):
                 return device_id

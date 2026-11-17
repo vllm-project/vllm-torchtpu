@@ -56,6 +56,7 @@ def _clear(monkeypatch):
         (env_bool, True),
         (env_int, 7),
         (env_nonnegative_int, 7),
+        (env_positive_int, 7),
         (env_float, 1.5),
         (env_nonnegative_float, 1.5),
     ],
@@ -70,6 +71,7 @@ def test_unset_reads_as_the_default(builder, default):
         (env_bool, True),
         (env_int, 7),
         (env_nonnegative_int, 7),
+        (env_positive_int, 7),
         (env_float, 1.5),
         (env_nonnegative_float, 1.5),
     ],
@@ -297,7 +299,12 @@ def test_lws_group_size_env_rejects_invalid_and_nonpositive_values(
     monkeypatch.setenv("LWS_GROUP_SIZE", bad_value)
     with pytest.raises(ValueError, match="LWS_GROUP_SIZE"):
         _ = envs.LWS_GROUP_SIZE
-    assert env_positive_int(VAR, 2)() == 2
+
+
+def test_optional_nonnegative_int_unset_and_empty_read_none(monkeypatch):
+    assert env_optional_nonnegative_int(VAR)() is None
+    monkeypatch.setenv(VAR, "  ")
+    assert env_optional_nonnegative_int(VAR)() is None
 
 
 def test_lws_worker_index_env_parses_optional_nonnegative_int(monkeypatch):
@@ -307,7 +314,6 @@ def test_lws_worker_index_env_parses_optional_nonnegative_int(monkeypatch):
     assert envs.LWS_WORKER_INDEX is None
     monkeypatch.setenv("LWS_WORKER_INDEX", "0")
     assert envs.LWS_WORKER_INDEX == 0
-    assert env_optional_nonnegative_int(VAR)() is None
     for bad_value in ("-1", "bad"):
         monkeypatch.setenv("LWS_WORKER_INDEX", bad_value)
         with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):

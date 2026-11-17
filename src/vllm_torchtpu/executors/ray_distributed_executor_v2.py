@@ -143,6 +143,10 @@ class RayDistributedExecutorV2(RayExecutorV2):
         hosts: list[tuple[int, str, int]] = []
         hostnames_by_ip: dict[str, str] = {}
         has_worker_id = True
+        current_node_id = (
+            ray.get_runtime_context().get_node_id() if ray.is_initialized() else None
+        )
+        local_worker_id: int | None = None
         for node in ray.nodes():
             if not node.get("Alive", True):
                 continue
@@ -168,6 +172,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
             if raw_worker_id is not None:
                 try:
                     w_id = int(raw_worker_id)
+                    if (
+                        isinstance(current_node_id, str)
+                        and node.get("NodeID") == current_node_id
+                    ):
+                        local_worker_id = w_id
                 except (ValueError, TypeError):
                     w_id = 0
                     has_worker_id = False
@@ -194,12 +203,17 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 hosts.sort(key=lambda x: x[1])
             else:
                 ordered_by = "ray.io/tpu-worker-id"
-                # Under LWS, KubeRay sets ray.io/tpu-worker-id to 0..N-1 across
-                # the full replica group; only treat position as LWS_WORKER_INDEX
-                # when the slice spans the whole LWS group.
-                ordered_by_worker_id = (
-                    not tpu_envs.LWS_LEADER_ADDRESS
-                    or len(hosts) == tpu_envs.LWS_GROUP_SIZE
+                # Ray populates ray.io/tpu-worker-id from TPU_WORKER_ID at
+                # `ray start`. Only treat position as LWS_WORKER_INDEX when the
+                # slice spans the full LWS group and this node's label agrees.
+                lws_worker_index = tpu_envs.LWS_WORKER_INDEX
+                ordered_by_worker_id = not tpu_envs.LWS_LEADER_ADDRESS or (
+                    len(hosts) == tpu_envs.LWS_GROUP_SIZE
+                    and (
+                        local_worker_id is None
+                        or lws_worker_index is None
+                        or local_worker_id == lws_worker_index
+                    )
                 )
         else:
             lws_ordered = False

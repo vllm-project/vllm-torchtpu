@@ -373,6 +373,8 @@ class TPUWorker(WorkerBase):
                 if uncollapsed_dp_local is not None:
                     local_dp_world = uncollapsed_dp_local * per_engine_world
                 elif my_sb_addresses:
+                    # Each local slice slot shares this host's resolved entry in
+                    # the full slicebuilder list (1 entry per chip on the host).
                     my_sb_host = my_sb_addresses[0].rsplit(":", 1)[0]
                     local_dp_world = sum(
                         1
@@ -380,6 +382,8 @@ class TPUWorker(WorkerBase):
                         if addr.rsplit(":", 1)[0] == my_sb_host
                     )
                 else:
+                    # Single-host fallback when no slicebuilder list is set;
+                    # errs toward clearing on multi-host if unset.
                     local_dp_world = dp_size * per_engine_world
                 tpu_device_local_world = max(binding.local_world_size, local_dp_world)
             local_rank_for_init = binding.init_local_rank

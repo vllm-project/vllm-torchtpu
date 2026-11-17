@@ -170,6 +170,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_RESHARD_PORT_BASE",
     "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE",
     "TPU_WORKER_ID",
+    # Host VFIO device node selection; does not change the compiled XLA program.
     "TPU_VISIBLE_DEVICE_PATHS",
     # Pod/host orchestration identity under Kubernetes LeaderWorkerSet; varies
     # across hosts and deployments without changing the compiled XLA program.
