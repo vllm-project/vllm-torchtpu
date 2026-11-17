@@ -148,3 +148,28 @@ def test_num_tokens_is_part_of_the_key():
             == [8]
         )
     assert len(ffc._CACHE) == 2
+
+
+def test_each_cached_context_starts_its_own_moe_layer_counter():
+    """With fast_moe_cold_start, vLLM's MoE ops name their layer by reading
+    `all_moe_layers[moe_layer_index]` and advancing the index on the current
+    context (`moe_runner.get_layer_from_name`). Every fast call must start at
+    0 and share only the read-only layer list with the cached context."""
+    ffc._CACHE.clear()
+    cfg = _cfg()
+    cfg.compilation_config.fast_moe_cold_start = True
+    cfg.compilation_config.static_all_moe_layers = ["moe.0", "moe.1"]
+    t = torch.tensor([4], dtype=torch.int32)
+    for step in range(3):
+        with ffc.fast_set_forward_context(
+            {"step": step}, cfg, num_tokens=4, num_tokens_across_dp=t.clone()
+        ):
+            ctx = fc.get_forward_context()
+            assert ctx.attn_metadata == {"step": step}
+            assert ctx.moe_layer_index == 0
+            assert ctx.all_moe_layers is cfg.compilation_config.static_all_moe_layers
+            for name in ("moe.0", "moe.1"):
+                assert ctx.all_moe_layers[ctx.moe_layer_index] == name
+                ctx.moe_layer_index += 1
+    assert len(ffc._CACHE) == 1
+    assert cfg.compilation_config.static_all_moe_layers == ["moe.0", "moe.1"]

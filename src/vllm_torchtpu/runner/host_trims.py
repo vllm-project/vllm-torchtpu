@@ -44,9 +44,12 @@ default, and are a documented trade-off:
   :data:`GC_FREEZE_GEN0_THRESHOLD`, so cyclic GC runs rarely in the decode
   loop. Objects created later are collected less often.
 
-The worker applies them from ``execute_model`` and the prefix-aware scheduler
-from ``schedule()``, so they reach the engine-core process too when the
-workers run in their own processes.
+The worker applies them from ``execute_model``. When the workers run in their
+own processes (TP > 1), the engine-core process gets them only through
+:func:`on_scheduler_step`, which nothing calls yet: the prefix-aware
+scheduler's ``schedule()`` calls it in a follow-up to this change and to the
+prefix-aware scheduler PR (#3080), which rewrites that method. Until then
+they apply in the worker processes only.
 """
 
 from __future__ import annotations
@@ -127,7 +130,10 @@ def configure(vllm_config: Any) -> None:
 def on_scheduler_step(vllm_config: Any) -> None:
     """The engine core's per-step hook: configures this process from the
     engine's config on first use (the workers may run in other processes),
-    then applies the process-wide settings."""
+    then applies the process-wide settings.
+
+    No caller yet: the prefix-aware scheduler's ``schedule()`` calls it once
+    this change and #3080 are both in (see the module docstring)."""
     if not _configured:
         configure(vllm_config)
     if STEP_HOOK:
