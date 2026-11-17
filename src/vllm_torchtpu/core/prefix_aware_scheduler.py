@@ -91,11 +91,11 @@ def _hit_signature(result) -> tuple:
 def trim_resend_token_ids(cached_reqs) -> int:
     """Shrink ``CachedRequestData.all_token_ids`` to what the worker reads.
 
-    Upstream (v0.29.0 ``Scheduler._make_cached_request_data``) re-sends the
+    vLLM 0.33's ``Scheduler._make_cached_request_data`` re-sends the
     request's *full* token list for every running request that was not
-    scheduled in the previous step. It is pickled into the SchedulerOutput and
-    unpickled by each of the 8 TP workers (~5 ms at 94k tokens). The only
-    reader on our path is ``GPUModelRunner._update_states`` (reached through
+    scheduled in the previous step; it is pickled into the SchedulerOutput
+    and unpickled by every worker. The only reader on our path is
+    ``GPUModelRunner._update_states`` (reached through
     ``TPUModelRunner._update_states``), and only when the request is not in
     the persistent batch, async scheduling is on and ``num_output_tokens > 0``::
 
@@ -174,10 +174,10 @@ class PrefixAwareScheduler(AsyncScheduler):
     # ------------------------------------------------------------------
     # Cross-step memo of find_longest_cache_hit.
     #
-    # The epoch-keyed memo below was invalidated by *any* prefix-cache
-    # mutation (every hash insert, every eviction, every schedule start with
-    # unwritten blocks), so it was stale on almost every step and
-    # _promote_warmest re-walked up to WINDOW waiting requests per call.
+    # Within one prefix-cache epoch a memoised result is reused as is. Any
+    # prefix-cache mutation (a hash insert, an eviction, a step start with
+    # unwritten blocks) moves the epoch, which happens on almost every step,
+    # so reuse across epochs needs the change log.
     #
     # find_longest_cache_hit(hashes, max_len) is a deterministic function of
     # the answers BlockPool.get_cached_block(h, groups) gives for the hashes it

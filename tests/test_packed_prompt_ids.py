@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.distributed.device_communicators.shm_broadcast import _reduce_tensor
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
@@ -38,7 +39,12 @@ from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 
 def _mq_roundtrip(obj):
-    """Pickle exactly like vLLM v0.29 MessageQueue.enqueue/dequeue."""
+    """Pickle like vLLM 0.33's MessageQueue.enqueue and dequeue.
+
+    Without a tensor arena, which diverts only torch tensors: buffers under
+    1 MiB inline, larger ones out of band, and torch tensors reduced to
+    buffers.
+    """
     oob = []
 
     def oob_callback(buf):
@@ -49,6 +55,7 @@ def _mq_roundtrip(obj):
         return False
 
     dispatch_table = dict(copyreg.dispatch_table)
+    dispatch_table[torch.Tensor] = _reduce_tensor
     with io.BytesIO() as bio:
         p = pickle.Pickler(
             bio, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=oob_callback
