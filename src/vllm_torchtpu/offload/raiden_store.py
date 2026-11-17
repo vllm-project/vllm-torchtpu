@@ -149,6 +149,13 @@ _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 # workers poll before KVCacheStore binds.
 _DEFAULT_CONTROLLER_PORT = 27800
 
+
+def _host_port(host: str, port: int) -> str:
+    """`host:port` for dialing; IPv6 literals get brackets (`[::1]:27800`)."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
 # Seconds between the manager's host-pool stats lines (`_maybe_log_host_stats`).
 _HOST_STATS_LOG_INTERVAL_S = 30.0
 _IP_LOCAL_PORT_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
@@ -3401,8 +3408,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             rank = coords.engine_rank
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
-            controller_address = (
-                f"{self.store_server_ip or '127.0.0.1'}:{self.raiden_controller_port}"
+            controller_address = _host_port(
+                self.store_server_ip or "127.0.0.1", self.raiden_controller_port
             )
             backend_configs: list[object] = []
             if self.storage_config is not None:
