@@ -38,15 +38,17 @@ DP, TP = 4, 2
 E, H, INTER, TOPK = 2, 512, 256, 2
 REL_L2 = 1e-2
 # rows per engine, dispatch form, combine form, FP8 dispatch, routed-row
-# gather, rank as data. The first is the served form at a 32-row step.
+# gather, rank as data, weight ring depth. The first is the served form at a
+# 32-row step.
 CASES = {
-    "served_32": (32, "hier", "hier", True, True, True),
-    "bf16_dispatch_32": (32, "hier", "hier", False, True, True),
-    "no_gather_32": (32, "hier", "hier", True, False, True),
-    "rank_from_axis_32": (32, "hier", "hier", True, True, False),
-    "padded_13": (13, "hier", "hier", False, True, True),
-    "rows_16": (16, "hier", "hier", False, True, True),
-    "flat_forms_16": (16, "flat", "flat", False, True, True),
+    "served_32": (32, "hier", "hier", True, True, True, 1),
+    "bf16_dispatch_32": (32, "hier", "hier", False, True, True, 1),
+    "no_gather_32": (32, "hier", "hier", True, False, True, 1),
+    "rank_from_axis_32": (32, "hier", "hier", True, True, False, 1),
+    "padded_13": (13, "hier", "hier", False, True, True, 1),
+    "rows_16": (16, "hier", "hier", False, True, True, 1),
+    "flat_forms_16": (16, "flat", "flat", False, True, True, 1),
+    "ring_2_32": (32, "hier", "hier", True, True, True, 2),
 }
 
 
@@ -154,7 +156,7 @@ def _worker():
             out = out + w[:, None] * (o * a_s * s2[e].reshape(1, -1))
         return np.asarray(out.astype(jnp.bfloat16)).astype(np.float64)
 
-    def run(rows, dform, cform, fp8, gather, rank_operand):
+    def run(rows, dform, cform, fp8, gather, rank_operand, depth):
         x, logits = inputs(rows)
 
         def body(x, logits, w13, w2, s13, s2, start, rank):
@@ -169,11 +171,9 @@ def _worker():
                 topk=TOPK,
                 dp=DP,
                 tp=TP,
-                dispatch="inkernel",
-                combine="inkernel",
                 dispatch_form=dform,
                 combine_form=cform,
-                depth=1,
+                depth=depth,
                 dispatch_fp8=fp8,
                 rank=rank.reshape(2) if rank_operand else None,
                 gather_rows=gather,
@@ -217,6 +217,9 @@ def _worker():
     )
     result["rank_from_axis_bit_identical"] = bool(
         np.array_equal(bits["served_32"], bits["rank_from_axis_32"])
+    )
+    result["ring_depth_bit_identical"] = bool(
+        np.array_equal(bits["served_32"], bits["ring_2_32"])
     )
     print("RESULT " + json.dumps(result))
 
@@ -265,6 +268,11 @@ def test_rank_as_data_matches_the_axis_index(on_8_devices):
     assert on_8_devices["rank_from_axis_bit_identical"]
 
 
+def test_a_deeper_weight_ring_gives_the_same_bytes(on_8_devices):
+    """The ring depth changes only how far ahead the weights are fetched."""
+    assert on_8_devices["ring_depth_bit_identical"]
+
+
 def _call(rows=32, **kwargs):
     import jax.numpy as jnp
 
@@ -274,8 +282,6 @@ def _call(rows=32, **kwargs):
         topk=TOPK,
         dp=DP,
         tp=TP,
-        dispatch="inkernel",
-        combine="inkernel",
         dispatch_form="hier",
         combine_form="hier",
         depth=1,
@@ -297,11 +303,10 @@ def _call(rows=32, **kwargs):
     [
         (dict(tp=4), "tp == 2"),
         (dict(rows=16, dispatch_fp8=True), "multiple of 32"),
-        (dict(dispatch="xla", dispatch_fp8=True), "dispatch in the kernel"),
         (dict(dispatch_form="ring"), "forms are one of"),
         (dict(depth=0), "depth is at least 1"),
     ],
-    ids=["hier_needs_tp2", "fp8_rows", "fp8_needs_inkernel", "form", "depth"],
+    ids=["hier_needs_tp2", "fp8_rows", "form", "depth"],
 )
 def test_refuses_unsupported_calls(kwargs, match):
     rows = kwargs.pop("rows", 32)

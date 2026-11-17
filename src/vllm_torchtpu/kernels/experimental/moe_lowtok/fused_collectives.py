@@ -39,10 +39,20 @@ Forms, per side:
 Every stage sums in float32 and rounds once; the two cores of a TP pair end with
 the same bytes. The caller runs the entry inside a shard_map over a mesh whose
 axes are ("dp", "tp") in that order, with TP pairs on one chip.
+
+The DP x TP decode op (layers/adapter/moe_lowtok_fused_op.py) runs the "hier"
+forms, a weight ring of one expert, the routed-row gather and the core's index
+as data. The other choices are kept for layouts that op does not arm, and the
+interpret-mode tests check each of them against the same reference: the
+"flat" forms work for any TP size (the "hier" forms need a chip's two cores),
+the dense loop (`gather_rows=False`) applies every hit expert to every row,
+which is cheaper when most rows hit most experts, a deeper ring (`depth`)
+prefetches further ahead at the cost of VMEM, and `rank=None` reads the index
+from the mesh axes for callers that can use `lax.axis_index`.
 """
 
 import functools
-from typing import Any, cast
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -77,7 +87,6 @@ _ROW_TILE = 16
 _VMEM_FRACTION = 0.92
 _VMEM_MARGIN = 1.3
 FORMS = ("flat", "hier")
-SIDES = ("xla", "inkernel")
 
 
 def _push(src, dst, send_sem, recv_sem, dp_idx, tp_idx):
@@ -587,8 +596,6 @@ def _kernel(
     dp,
     tp,
     depth,
-    dispatch,
-    combine,
     dispatch_form,
     combine_form,
     dispatch_fp8,
@@ -611,8 +618,6 @@ def _kernel(
         dp=dp,
         tp=tp,
         depth=depth,
-        dispatch=dispatch,
-        combine=combine,
         dispatch_form=dispatch_form,
         combine_form=combine_form,
         dispatch_fp8=dispatch_fp8,
@@ -639,8 +644,6 @@ def _kernel_body(
     dp,
     tp,
     depth,
-    dispatch,
-    combine,
     dispatch_form,
     combine_form,
     dispatch_fp8,
@@ -654,9 +657,9 @@ def _kernel_body(
 
     hidden = x_ref.shape[1]
     half = hidden // 2
-    rows_l = x_ref.shape[0] if dispatch == "inkernel" else x_ref.shape[0] // dp
-    # Bound below only for the dispatch and combine sides and forms that use
-    # them; Any, so the type checker does not narrow them to None or unbound.
+    rows_l = x_ref.shape[0]
+    # Bound below only for the forms and the FP8 dispatch that use them; Any,
+    # so the type checker does not narrow them to None or unbound.
     xs_all: Any = None
     dsem: Any = None
     xrecv: Any = None
@@ -667,80 +670,70 @@ def _kernel_body(
     c_half: Any = None
     c_recv2: Any = None
     csem: Any = None
-    if dispatch == "inkernel":
-        x_all, lg_all, dsem, xrecv = take(4)
-        if dispatch_fp8:
-            xs_all = take(1)[0]
-    else:
-        x_all, lg_all = x_ref, lg_ref
+    x_all, lg_all, dsem, xrecv = take(4)
+    if dispatch_fp8:
+        xs_all = take(1)[0]
     ids, hits_v, hits_s, hsem, wtab = take(5)
     ring = take(7)
     acc = take(1)[0]
-    if combine == "inkernel":
-        if combine_form == "flat":
-            c_send, c_recv1, c_pair_send, c_pair_recv, csem = take(5)
-        else:
-            c_send, c_recv1, c_half, c_recv2, csem = take(5)
+    if combine_form == "flat":
+        c_send, c_recv1, c_pair_send, c_pair_recv, csem = take(5)
+    else:
+        c_send, c_recv1, c_half, c_recv2, csem = take(5)
     gscratch = tuple(take(14)) if gather_rows else None
     assert not scratch
 
-    if dispatch == "inkernel" or combine == "inkernel":
-        _barrier(dp, tp)
+    _barrier(dp, tp)
 
-    if dispatch == "inkernel":
-        # Logits first: the top-k and the hit collection only need them.
+    # Logits first: the top-k and the hit collection only need them.
+    for j in range(dp):
+
+        @pl.when(j != d)
+        def _(j=j):
+            _push(lg_ref, lg_all.at[_rows_of(d, rows_l)], dsem.at[0], dsem.at[1], j, t)
+
+    lg_all[_rows_of(d, rows_l), :] = lg_ref[...]
+    mine = _rows_of(d, rows_l)
+    if dispatch_fp8:
+        # The rows quantized per row before the push: the same values the
+        # loop would produce from the gathered bf16 rows, in half the bytes.
+        x_q_l, x_s_l = _quantize_rows(x_ref[...].astype(jnp.float32))
+        x_all[mine, :] = x_q_l
+        xs_all[mine, :] = jnp.broadcast_to(x_s_l, (rows_l, _LANE))
         for j in range(dp):
 
             @pl.when(j != d)
             def _(j=j):
-                _push(
-                    lg_ref, lg_all.at[_rows_of(d, rows_l)], dsem.at[0], dsem.at[1], j, t
-                )
+                _push(xs_all.at[mine], xs_all.at[mine], dsem.at[5], dsem.at[6], j, t)
 
-        lg_all[_rows_of(d, rows_l), :] = lg_ref[...]
-        mine = _rows_of(d, rows_l)
-        if dispatch_fp8:
-            # The rows quantized per row before the push: the same values the
-            # loop would produce from the gathered bf16 rows, in half the bytes.
-            x_q_l, x_s_l = _quantize_rows(x_ref[...].astype(jnp.float32))
-            x_all[mine, :] = x_q_l
-            xs_all[mine, :] = jnp.broadcast_to(x_s_l, (rows_l, _LANE))
-            for j in range(dp):
+    else:
+        x_all[mine, :] = x_ref[...]
+    if dispatch_form == "flat":
+        for j in range(dp):
 
-                @pl.when(j != d)
-                def _(j=j):
-                    _push(
-                        xs_all.at[mine], xs_all.at[mine], dsem.at[5], dsem.at[6], j, t
-                    )
+            @pl.when(j != d)
+            def _(j=j):
+                _push(x_all.at[mine], x_all.at[mine], dsem.at[2], xrecv.at[d], j, t)
 
-        else:
-            x_all[mine, :] = x_ref[...]
-        if dispatch_form == "flat":
-            for j in range(dp):
+    else:
+        for u, cols in ((0, pl.ds(0, half)), (1, pl.ds(half, half))):
 
-                @pl.when(j != d)
-                def _(j=j):
-                    _push(x_all.at[mine], x_all.at[mine], dsem.at[2], xrecv.at[d], j, t)
+            @pl.when(t == u)
+            def _(cols=cols):
+                for j in range(dp):
 
-        else:
-            for u, cols in ((0, pl.ds(0, half)), (1, pl.ds(half, half))):
+                    @pl.when(j != d)
+                    def _(j=j):
+                        _push(
+                            x_all.at[mine, cols],
+                            x_all.at[mine, cols],
+                            dsem.at[2],
+                            xrecv.at[d],
+                            j,
+                            t,
+                        )
 
-                @pl.when(t == u)
-                def _(cols=cols):
-                    for j in range(dp):
-
-                        @pl.when(j != d)
-                        def _(j=j):
-                            _push(
-                                x_all.at[mine, cols],
-                                x_all.at[mine, cols],
-                                dsem.at[2],
-                                xrecv.at[d],
-                                j,
-                                t,
-                            )
-
-        _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[1])
+    _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[1])
 
     wtab[...] = _select_topk(lg_all[...], topk, from_logits=True)
     hit = jnp.any(wtab[...] != 0, axis=0, keepdims=True)
@@ -750,8 +743,6 @@ def _kernel_body(
     hcopy.wait()
 
     def rows_ready():
-        if dispatch != "inkernel":
-            return
         if dispatch_fp8:
             _wait_bytes(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[6])
         if dispatch_form == "flat":
@@ -806,9 +797,7 @@ def _kernel_body(
         xs_all=xs_all if dispatch_fp8 else None,
     )
 
-    if combine != "inkernel":
-        out_ref[...] = acc[...].astype(out_ref.dtype)
-    elif combine_form == "flat":
+    if combine_form == "flat":
         c_send[...] = acc[...].astype(c_send.dtype)
         c_recv1[pl.ds(d, 1)] = jnp.zeros((1, rows_l, hidden), c_recv1.dtype)
         for j in range(dp):
@@ -903,19 +892,14 @@ def _kernel_body(
         _wait_bytes(c_recv2.at[pl.ds(0, dp - 1)], csem.at[2])
         _wait_bytes(out_ref.at[:, pl.ds(0, half)], csem.at[4])
 
-    if dispatch == "inkernel":
-        _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[0])
-        if dispatch_fp8:
-            _wait_bytes(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[5])
-        if dispatch_form == "flat":
-            _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[2])
-        else:
-            _wait_bytes(
-                x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[2]
-            )
-            _wait_bytes(
-                x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[3]
-            )
+    _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[0])
+    if dispatch_fp8:
+        _wait_bytes(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[5])
+    if dispatch_form == "flat":
+        _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[2])
+    else:
+        _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[2])
+        _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[3])
 
 
 class _Scratch:
@@ -962,8 +946,6 @@ def vmem_budget(scratch_bytes, operand_bytes):
         "topk",
         "dp",
         "tp",
-        "dispatch",
-        "combine",
         "dispatch_form",
         "combine_form",
         "depth",
@@ -983,8 +965,6 @@ def moe_lowtok_fused(
     topk,
     dp,
     tp,
-    dispatch="inkernel",
-    combine="inkernel",
     dispatch_form="flat",
     combine_form="hier",
     depth=1,
@@ -996,53 +976,34 @@ def moe_lowtok_fused(
 
     Inside a shard_map over a ("dp", "tp") mesh; `rank` ([2] int32: this core's
     index on each axis) when the caller's export path refuses `lax.axis_index`,
-    as the torch bridge does. With `dispatch` "inkernel", `x`
-    [rows, hidden] bf16 and `logits` [rows, experts] bf16 are this engine's own
-    rows and the kernel gathers them over the DP axis; with "xla" they are the
-    gathered rows of every engine. With `combine` "inkernel" the result is this
-    engine's rows [rows, hidden] summed over every rank; with "xla" it is this
-    rank's partial sum over all gathered rows, for the caller's combine. This
-    rank holds experts [experts_start, experts_start + E). `dispatch_fp8` pushes
+    as the torch bridge does. `x` [rows, hidden] bf16 and `logits`
+    [rows, experts] bf16 are this engine's own rows; the kernel gathers them
+    over the DP axis, and the result is this engine's rows [rows, hidden]
+    summed over every rank. This rank holds experts
+    [experts_start, experts_start + E). `dispatch_fp8` pushes
     the rows quantized per row to fp8 with their scale (half the bytes, the
     same values the kernel computes from bf16 rows); it needs row blocks of
     whole fp8 tiles (32 rows per engine). `gather_rows` applies each expert to its
     routed rows only (see `_stream_ring`).
     """
-    if dispatch not in SIDES or combine not in SIDES:
-        raise ValueError(f"dispatch and combine are one of {SIDES}")
     if dispatch_form not in FORMS or combine_form not in FORMS:
         raise ValueError(f"forms are one of {FORMS}")
-    if tp != 2 and (
-        (dispatch == "inkernel" and dispatch_form == "hier")
-        or (combine == "inkernel" and combine_form == "hier")
-    ):
+    if tp != 2 and "hier" in (dispatch_form, combine_form):
         raise ValueError("the hier forms pair the two cores of a chip (tp == 2)")
     if depth < 1:
         raise ValueError("depth is at least 1")
-    if dispatch_fp8 and dispatch != "inkernel":
-        raise ValueError("dispatch_fp8 needs the dispatch in the kernel")
     tokens, hidden = x.shape
     if hidden % (2 * _LANE):
         raise ValueError(f"hidden {hidden} is not a multiple of {2 * _LANE}")
     n_experts, inter, w13_parts, _ = _layout(x, w13)
     lanes = pl.cdiv(logits.shape[1], _LANE) * _LANE
-    if dispatch == "inkernel":
-        rows_l = pl.cdiv(tokens, _ROW_TILE) * _ROW_TILE
-        rows = rows_l * dp
-    else:
-        if tokens % dp:
-            raise ValueError(f"{tokens} gathered rows do not split over dp={dp}")
-        rows_l = tokens // dp
-        if rows_l % _ROW_TILE:
-            raise ValueError(
-                f"{rows_l} rows per engine are not a multiple of {_ROW_TILE}"
-            )
-        rows = tokens
+    rows_l = pl.cdiv(tokens, _ROW_TILE) * _ROW_TILE
+    rows = rows_l * dp
     if dispatch_fp8 and rows_l % 32:
         raise ValueError(
             f"dispatch_fp8 needs {rows_l} rows per engine to be a multiple of 32"
         )
-    pad_rows = (rows_l if dispatch == "inkernel" else rows) - tokens
+    pad_rows = rows_l - tokens
     x_rows = jnp.pad(x, ((0, pad_rows), (0, 0)))
     # The router logits keep their dtype, as moe_lowtok's scores entry does.
     if logits.dtype not in (jnp.bfloat16, jnp.float32):
@@ -1056,32 +1017,30 @@ def moe_lowtok_fused(
     s2 = s2.reshape(n_experts, 1, hidden).astype(jnp.float32)
     gid = (experts_start + jnp.arange(n_experts, dtype=jnp.int32)).reshape(1, n_experts)
     half = hidden // 2
-    out_rows = rows_l if combine == "inkernel" else rows
+    out_rows = rows_l
 
     sc = _Scratch()
-    if dispatch == "inkernel":
-        sc.vmem((rows, hidden), _FP8 if dispatch_fp8 else jnp.bfloat16)
-        sc.vmem((rows, lanes), lg_rows.dtype)
-        sc.add(pltpu.SemaphoreType.DMA((7,)), pltpu.SemaphoreType.DMA((dp,)))
-        if dispatch_fp8:
-            sc.vmem((rows, _LANE), jnp.float32)
+    sc.vmem((rows, hidden), _FP8 if dispatch_fp8 else jnp.bfloat16)
+    sc.vmem((rows, lanes), lg_rows.dtype)
+    sc.add(pltpu.SemaphoreType.DMA((7,)), pltpu.SemaphoreType.DMA((dp,)))
+    if dispatch_fp8:
+        sc.vmem((rows, _LANE), jnp.float32)
     sc.add(pltpu.SMEM((n_experts,), jnp.int32))
     sc.vmem((1, lanes), jnp.int32)
     sc.add(pltpu.SMEM((1, lanes), jnp.int32), pltpu.SemaphoreType.DMA((1,)))
     sc.vmem((rows, lanes), jnp.float32)
     sc.ring(hidden, inter, w13_parts, depth, rows)
     sc.vmem((rows, hidden), jnp.float32)
-    if combine == "inkernel":
-        sc.vmem((rows, hidden), jnp.bfloat16)
-        if combine_form == "flat":
-            sc.vmem((dp, rows_l, hidden), jnp.bfloat16)
-            sc.vmem((rows_l, hidden), jnp.bfloat16)
-            sc.vmem((rows_l, hidden), jnp.bfloat16)
-        else:
-            sc.vmem((rows, half), jnp.bfloat16)
-            sc.vmem((rows, half), jnp.bfloat16)
-            sc.vmem((dp, rows_l, half), jnp.bfloat16)
-        sc.add(pltpu.SemaphoreType.DMA((6,)))
+    sc.vmem((rows, hidden), jnp.bfloat16)
+    if combine_form == "flat":
+        sc.vmem((dp, rows_l, hidden), jnp.bfloat16)
+        sc.vmem((rows_l, hidden), jnp.bfloat16)
+        sc.vmem((rows_l, hidden), jnp.bfloat16)
+    else:
+        sc.vmem((rows, half), jnp.bfloat16)
+        sc.vmem((rows, half), jnp.bfloat16)
+        sc.vmem((dp, rows_l, half), jnp.bfloat16)
+    sc.add(pltpu.SemaphoreType.DMA((6,)))
     if gather_rows:
         _gather_scratch(sc, rows, hidden, inter, dispatch_fp8)
     operand_bytes = (
@@ -1094,12 +1053,9 @@ def moe_lowtok_fused(
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    dispatch_tag = dispatch_form[0] if dispatch == "inkernel" else ""
     name = (
-        f"moe_lowtok_fused_d{dispatch[0]}{dispatch_tag}"
-        f"{'q' if dispatch_fp8 else ''}"
-        f"_c{combine[0]}{combine_form[0] if combine == 'inkernel' else ''}_r{depth}"
-        f"{'_g' if gather_rows else ''}"
+        f"moe_lowtok_fused_di{dispatch_form[0]}{'q' if dispatch_fp8 else ''}"
+        f"_ci{combine_form[0]}_r{depth}{'_g' if gather_rows else ''}"
     )
     prefetch = (
         (gid,) if rank is None else (gid, jnp.asarray(rank, jnp.int32).reshape(2))
@@ -1115,8 +1071,6 @@ def moe_lowtok_fused(
             dp=dp,
             tp=tp,
             depth=depth,
-            dispatch=dispatch,
-            combine=combine,
             dispatch_form=dispatch_form,
             combine_form=combine_form,
             dispatch_fp8=dispatch_fp8,
@@ -1132,17 +1086,8 @@ def moe_lowtok_fused(
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=vmem_budget(sc.vmem_bytes, operand_bytes),
-            **cast(
-                "dict[str, Any]",
-                {"collective_id": COLLECTIVE_ID}
-                if "inkernel" in (dispatch, combine)
-                else {},
-            ),
+            collective_id=COLLECTIVE_ID,
         ),
         name=name,
     )(*prefetch, x_rows, lg_rows, s13, s2, w13, w2)
-    if dispatch == "inkernel" and combine == "inkernel":
-        return out[:tokens]
-    # With the dispatch in the kernel and the combine outside, the partial
-    # sums keep the gathered layout of rows_l padded rows per engine.
-    return out
+    return out[:tokens]
