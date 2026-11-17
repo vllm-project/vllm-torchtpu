@@ -78,6 +78,7 @@ _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
 _UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
+_UPSTREAM_DENOISE_TIMESTEP_KWARGS = ltx2_runtime.LTXRuntime._denoise_timestep_kwargs
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -1012,3 +1013,51 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def test_ltx2_per_batch_timestep_patch(monkeypatch):
+    from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import (
+        LTXI2VConditioningMixin,
+    )
+    from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidanceExecutor
+
+    monkeypatch.setattr(
+        ltx2_runtime.LTXRuntime,
+        "_denoise_timestep_kwargs",
+        _UPSTREAM_DENOISE_TIMESTEP_KWARGS,
+    )
+    patches._patch_ltx2_per_batch_timestep()
+    patched = ltx2_runtime.LTXRuntime._denoise_timestep_kwargs
+    assert getattr(patched, patches._LTX2_PER_BATCH_TIMESTEP_PATCHED, False)
+    patches._patch_ltx2_per_batch_timestep()
+    assert ltx2_runtime.LTXRuntime._denoise_timestep_kwargs is patched
+
+    class _DummyPipeline(LTXI2VConditioningMixin, ltx2_runtime.LTXRuntime):
+        def __init__(self) -> None:
+            self.guidance_executor = LTXGuidanceExecutor()
+            self.unified_text_image_entry = True
+
+    pipe = _DummyPipeline()
+    ts = torch.tensor([900.0, 900.0])
+
+    # Unconditioned T2V keeps 1-D (B,) timesteps instead of (B, T) token expansion.
+    uncond_ctx = SimpleNamespace(
+        conditioning_mask=None, conditioning_mask_for_model=None
+    )
+    kw_uncond = pipe._denoise_timestep_kwargs(
+        ts, None, uncond_ctx, video_token_count=16, audio_token_count=4
+    )
+    assert kw_uncond["timestep"].shape == (2,)
+    assert kw_uncond["audio_timestep"].shape == (2,)
+
+    # Conditioned I2V overrides video timestep with the 2-D (B, T_video) mask.
+    mask = torch.zeros(2, 16)
+    mask[:, :4] = 1.0
+    cond_ctx = SimpleNamespace(conditioning_mask=mask, conditioning_mask_for_model=mask)
+    kw_cond = pipe._denoise_timestep_kwargs(
+        ts, None, cond_ctx, video_token_count=16, audio_token_count=4
+    )
+    assert kw_cond["timestep"].shape == (2, 16)
+    assert torch.all(kw_cond["timestep"][:, :4] == 0.0)
+    assert torch.all(kw_cond["timestep"][:, 4:] == 900.0)
+    assert kw_cond["audio_timestep"].shape == (2,)
