@@ -361,6 +361,7 @@ def _shard_tables_body(
     zero_blocks,
     blocks_per_step,
     shard_operand=False,
+    mesh_axes=(layout.MESH_AXIS,),
 ):
     """The pallas mode's front end: the three phases plus every shard table
     the FFN kernel takes, emitted from the prefix step. The pair indices
@@ -621,6 +622,7 @@ def _shard_tables_body(
                     shard,
                     gathered_rows_out.shape[0] // num_shards,
                     num_shards,
+                    mesh_axes=mesh_axes,
                 )
             )
 
@@ -643,6 +645,7 @@ def shard_tables_kernel(
     zero_words_per_step=TABLES_ZERO_WORDS_DEFAULT,
     shard_index=None,
     pairs_per_expert=None,
+    mesh_axes=(layout.MESH_AXIS,),
 ):
     """The pallas mode's front end, from the gathered routing messages
     (`routing messages` [num_shards, rows, LANES] int32: shard s's pair indices
@@ -661,6 +664,8 @@ def shard_tables_kernel(
     `pairs_per_expert` is the most pairs one shard sends one expert (its
     tokens when each token selects distinct experts); None takes
     pairs_per_shard. It bounds the lookup values (check_lookup_range).
+    `mesh_axes` are the mesh's axis names, which the hosted transport rounds
+    address their peers by (layout.MESH_AXIS is the expert-parallel one).
     """
     check_lookup_range(
         num_experts=num_experts,
@@ -775,6 +780,7 @@ def shard_tables_kernel(
             zero_blocks=zero_blocks,
             blocks_per_step=blocks_per_step,
             shard_operand=shard_index is not None,
+            mesh_axes=mesh_axes,
         ),
         grid=(2 * n_groups + 1,),
         in_specs=(
