@@ -116,16 +116,21 @@ def test_armed_other_tensors_keep_the_stock_call(monkeypatch, shape, dtype):
     assert kern == [] and stock == [x]
 
 
-def _qsa_call(monkeypatch, reduce=True, tp_size=8):
+def _qsa_call(monkeypatch, reduce=True, tp_size=8, proj_merge=False):
     from vllm_torchtpu.models.vllm.qwen4_exp import qsa
 
     stock = _stock(monkeypatch, qsa)
     part = torch.ones(16, 2560, dtype=torch.bfloat16)
+    # BLSTACK-H8 (port onto Benliang Wang's d523c2ce0): his forward_with_indices passes project_shares= to
+    # attend_with_indices and, under VLLM_TPU_QSA_DCP_MERGE=proj (_proj_merge), projects with o_proj_group_weight.
     fake = SimpleNamespace(
-        attend_with_indices=lambda *a: (part, "sel"),
+        attend_with_indices=lambda *a, **k: (part, "sel"),
         o_proj=lambda t: t,
         tp_size=tp_size,
     )
+    if proj_merge:
+        fake._proj_merge = True
+        fake.o_proj_group_weight = torch.eye(2560, dtype=torch.bfloat16)
     out = qsa.Qwen4ExpQSA.forward_with_indices(fake, None, None, None, reduce=reduce)
     return out, stock, part
 
@@ -139,6 +144,18 @@ def test_armed_qsa_reduce_takes_the_kernel(monkeypatch):
     kern = _armed(monkeypatch)
     (out, sel), stock, part = _qsa_call(monkeypatch)
     assert out == ("kernel", part) and stock == [] and kern == [part]
+
+
+def test_flag_off_qsa_proj_merge_reduce_is_the_stock_call(monkeypatch):
+    (out, sel), stock, part = _qsa_call(monkeypatch, proj_merge=True)
+    assert out[0] == "stock" and torch.equal(out[1], part) and len(stock) == 1 and sel == "sel"
+
+
+def test_armed_qsa_proj_merge_reduce_takes_the_kernel(monkeypatch):
+    """His served decode runs VLLM_TPU_QSA_DCP_MERGE=proj: the TP sum of the o_proj_group_weight shares goes to H8."""
+    kern = _armed(monkeypatch)
+    (out, sel), stock, part = _qsa_call(monkeypatch, proj_merge=True)
+    assert out[0] == "kernel" and torch.equal(out[1], part) and stock == [] and len(kern) == 1
 
 
 def test_armed_qsa_partial_path_untouched(monkeypatch):
