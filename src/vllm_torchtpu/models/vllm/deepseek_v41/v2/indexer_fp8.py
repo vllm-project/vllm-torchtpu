@@ -37,6 +37,8 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
+    PACKED_FP8_RESIDENT_KEYS,
+    dense_key_tile,
     indexer_query_rows,
     paged_mqa_key_tile,
     topk_reconstruction_threshold,
@@ -510,9 +512,7 @@ def _select_fp8_indexer_jax(
             ),
             sparse,
         )
-    key_tile = paged_mqa_key_tile(
-        width, layout.page_size, PACKED_FP8_MQA_CONFIG.key_tile
-    )
+    key_tile = dense_key_tile(width, layout.page_size, prefill_chunk_rows is not None)
     query_tile = PACKED_FP8_MQA_CONFIG.query_tile
     capacity = (width + key_tile - 1) // key_tile * key_tile
     pages = page_table[:, : (width + layout.page_size - 1) // layout.page_size]
@@ -806,12 +806,11 @@ def select_fp8_indexer_jax(
     ):
         return _select_fp8_indexer_jax(*arguments, score_width)
 
-    # Score only the batch's live keys, in power-of-two widths from one K tile
-    # (whose keys stay resident) up to the full score width. Preserve score-
-    # buffer row boundaries for every width. Scoring all 524,288 columns for
-    # a 147K-token context (73,728 keys) took 8.9 ms per 2,048-row chunk,
-    # against 1.8 ms for 57,344 keys in one K tile.
-    widths = [width]
+    # Score only the batch's live keys: 16,384-key steps while one resident K
+    # tile covers them, then powers of two up to the full score width.
+    # Scoring all 524,288 columns for a 147K-token context (73,728 keys) took
+    # 8.9 ms per 2,048-row chunk, against 1.8 ms for 57,344 keys in one tile.
+    widths = list(range(width, PACKED_FP8_RESIDENT_KEYS + 1, 16384)) or [width]
     while widths[-1] < score_width:
         widths.append(min(2 * widths[-1], score_width))
     live = (requests >= 0) & (requests < page_table.shape[0])

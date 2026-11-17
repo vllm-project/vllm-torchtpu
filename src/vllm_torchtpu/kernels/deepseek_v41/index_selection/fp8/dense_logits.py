@@ -24,7 +24,7 @@ from .common import (
     _reduce_on_mxu,
     _weighted_selector,
 )
-from .tuned import PACKED_FP8_MQA_CONFIG, paged_mqa_key_tile, paged_mqa_query_tile
+from .tuned import PACKED_FP8_MQA_CONFIG, dense_key_tile, paged_mqa_query_tile
 
 
 def _encode_page_table(page_ids, layout, first_bank_rows):
@@ -462,13 +462,16 @@ def fp8_paged_mqa_logits(
             f"Dense FP8 scoring requires pages of whole {PAGE_RECORDS}-record parts"
         )
     tile, config = paged_mqa_query_tile(query_size, heads), PACKED_FP8_MQA_CONFIG
-    key_tile = paged_mqa_key_tile(max_model_len, layout.page_size, config.key_tile)
+    key_tile = dense_key_tile(max_model_len, layout.page_size, reuse_keys)
+    resident = reuse_keys and key_tile >= max_model_len
     depth = envs.TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH
     config = replace(
         config,
         query_tile=tile,
         key_tile=key_tile,
         issue_depth=depth or config.issue_depth,
+        # A resident tile loads once; two buffers fit 98,304 keys in VMEM.
+        key_buffers=2 if resident else config.key_buffers,
     )
     width = pl.cdiv(max_model_len, key_tile) * key_tile
     if tokens == 0 or width == 0:
