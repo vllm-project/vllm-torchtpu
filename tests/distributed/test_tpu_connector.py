@@ -8826,6 +8826,29 @@ class TestStage3LatePoll:
             assert worker.late_poll_finished_recving() == set()
         worker._raiden_transfer_engine.poll_stats.assert_not_called()
 
+    def test_the_regular_poll_holds_the_receive_lock(self):
+        # _wait_for_recving (inline load) calls _poll_finished without
+        # get_finished's lock; the late poll must never run inside it.
+        worker, engine = self._consumer()
+        held: list[bool] = []
+
+        def try_lock_from_another_thread():
+            got = worker._stage3_poll_lock.acquire(blocking=False)
+            if got:
+                worker._stage3_poll_lock.release()
+            held.append(not got)
+
+        def poll_stats():
+            probe = threading.Thread(target=try_lock_from_another_thread)
+            probe.start()
+            probe.join()
+            return [], [], []
+
+        engine.poll_stats.side_effect = poll_stats
+        with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+            worker._poll_finished(engine)
+        assert held == [True]
+
     def test_an_uncertain_load_it_reports_is_not_failed_at_its_deadline(self):
         # The controller RPC's outcome was uncertain, so the load waits for
         # its native terminal under a deadline. The late poll reports it done.
@@ -8840,6 +8863,16 @@ class TestStage3LatePoll:
         assert worker._stage3_pending_controller_failures == {}
         assert "dst-a" not in worker._failed_recving
         assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_late_poll_is_refused_with_inline_load(monkeypatch):
+    monkeypatch.setattr(f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: True)
+    with pytest.raises(ValueError, match="late_poll"):
+        _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, extra_config={"late_poll": True}
+        )
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=False)
+    assert worker.late_poll_enabled is False
 
 
 class TestStage3AsyncRegister:
