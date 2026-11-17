@@ -548,6 +548,58 @@ class TestTpuPlatform:
             mock_prepare_env.assert_not_called()
             assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ
 
+    @pytest.mark.parametrize(
+        "nnodes,backend,external_lb,error,match",
+        [
+            (2, "", True, NotImplementedError, "nnodes > 1"),
+            (2, "mp", True, NotImplementedError, "nnodes > 1"),
+            (1, "ray", True, NotImplementedError, "TPU_MULTIHOST_BACKEND=ray"),
+            (2, "ray", True, NotImplementedError, "nnodes > 1"),
+            (1, "", False, ValueError, "not a rank of"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch("vllm_torchtpu.distributed.tpu_mp_multihost.prepare_mp_multihost_env")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_multiport_dp_outside_one_host_is_refused_at_startup(
+        self,
+        mock_prepare_env,
+        mock_multihost_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        nnodes,
+        backend,
+        external_lb,
+        error,
+        match,
+    ):
+        """The --nnodes and Ray branches never reach the multi-port bootstrap,
+        so the platform refuses the option before it picks a branch."""
+        monkeypatch.setattr(tpu_platform.envs, "TPU_MULTIHOST_BACKEND", backend)
+        vllm_config.additional_config = {"tpu_multiport_dp": {"enabled": True}}
+        pc = vllm_config.parallel_config
+        pc.nnodes = nnodes
+        pc.data_parallel_size = 4
+        pc.data_parallel_external_lb = external_lb
+        with pytest.raises(error, match=match):
+            TpuPlatform.check_and_update_config(vllm_config)
+        mock_multihost_env.assert_not_called()
+        mock_prepare_env.assert_not_called()
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch("vllm_torchtpu.distributed.tpu_mp_multihost.prepare_mp_multihost_env")
+    def test_multi_node_without_multiport_dp_is_unchanged(
+        self, mock_multihost_env, mock_apply_patches, vllm_config, monkeypatch
+    ):
+        monkeypatch.setattr(tpu_platform.envs, "TPU_MULTIHOST_BACKEND", "")
+        vllm_config.additional_config = {}
+        vllm_config.parallel_config.nnodes = 2
+        TpuPlatform.check_and_update_config(vllm_config)
+        mock_multihost_env.assert_called_once_with(vllm_config.parallel_config)
+
     @pytest.mark.parametrize("layout", ["HND", "NHD"])
     @pytest.mark.parametrize(
         "swa_head_dim,global_head_dim,refused_under_hnd",

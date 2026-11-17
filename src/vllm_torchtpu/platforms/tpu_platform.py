@@ -1219,6 +1219,12 @@ class TpuPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
+        # Before the branches below: the --nnodes and Ray branches would accept
+        # the single-host multi-port DP option without applying it.
+        from vllm_torchtpu.distributed import tpu_multiport_dp
+
+        tpu_multiport_dp.validate(vllm_config)
+
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if multihost_backend != "ray" and parallel_config.nnodes > 1:
             # Genuine multi-host run without Ray: each host runs its own
@@ -1265,11 +1271,7 @@ class TpuPlatform(Platform):
                 # (opt-in, additional_config["tpu_multiport_dp"]): fixes the
                 # shared DP master port and slicebuilder list before the
                 # defaults below.
-                from vllm_torchtpu.distributed.tpu_multiport_dp import (
-                    prepare_multiport_dp_env,
-                )
-
-                multiport_dp = prepare_multiport_dp_env(vllm_config)
+                multiport_dp = tpu_multiport_dp.prepare_multiport_dp_env(vllm_config)
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_ADDR",
                     parallel_config.data_parallel_master_ip or "localhost",

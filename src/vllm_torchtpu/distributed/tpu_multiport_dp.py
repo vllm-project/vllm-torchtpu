@@ -36,6 +36,9 @@ arguments that are identical in every child, once the server opts in with
 supervisor copies its arguments, this option included, into every child. Off
 (the default) changes nothing.
 
+* ``validate`` (from ``TpuPlatform.check_and_update_config``, before any
+  multi-host branch): refuses the option outside a single-host
+  ``--data-parallel-multi-port-external-lb`` server.
 * ``prepare_multiport_dp_env`` (from ``TpuPlatform.check_and_update_config``,
   in each child API server): the vLLM DP group ports, the torch_tpu DP master
   port and the slicebuilder list for the whole N*TP slice; the cross-host
@@ -116,7 +119,18 @@ def local_dp_size(vllm_config) -> int:
     return int(vllm_config.parallel_config.data_parallel_size)
 
 
-def _validate(parallel_config) -> None:
+def validate(vllm_config) -> None:
+    """Refuse the option outside a single-host multi-port DP server.
+
+    ``TpuPlatform.check_and_update_config`` calls this before it picks the
+    multi-host branch, for every ``TPU_MULTIHOST_BACKEND``: the ``--nnodes``
+    and Ray branches never reach ``prepare_multiport_dp_env``, while
+    ``engine_core_kwargs`` and ``resolve_device_ids`` would still apply the
+    option there.
+    """
+    if not options(vllm_config.additional_config).enabled:
+        return
+    parallel_config = vllm_config.parallel_config
     if not parallel_config.data_parallel_external_lb:
         raise ValueError(
             f"additional_config[{SECTION!r}] is enabled, but this server is not "
@@ -126,8 +140,15 @@ def _validate(parallel_config) -> None:
         )
     if parallel_config.nnodes > 1:
         raise NotImplementedError(
-            f"additional_config[{SECTION!r}] does not support --nnodes > 1: "
-            "multi-port DP on TPU supports only all DP ranks on one host."
+            f"additional_config[{SECTION!r}] does not support --nnodes > 1 "
+            f"(got {parallel_config.nnodes}): multi-port DP on TPU supports "
+            "only all DP ranks on one host."
+        )
+    if envs.TPU_MULTIHOST_BACKEND == "ray":
+        raise NotImplementedError(
+            f"additional_config[{SECTION!r}] does not support "
+            "TPU_MULTIHOST_BACKEND=ray: multi-port DP on TPU runs each DP rank "
+            "as its own multiprocess server on one host."
         )
 
 
@@ -135,14 +156,14 @@ def prepare_multiport_dp_env(vllm_config) -> bool:
     """Set the shared slice bootstrap for one multi-port DP rank.
 
     Returns False (and does nothing) unless the option is enabled. Must run
-    before ``check_and_update_config`` defaults TORCH_TPU_DP_MASTER_PORT, and
-    in place of ``prepare_mp_multihost_dp_env``. Idempotent per process.
+    after ``validate``, before ``check_and_update_config`` defaults
+    TORCH_TPU_DP_MASTER_PORT, and in place of ``prepare_mp_multihost_dp_env``.
+    Idempotent per process.
     """
     local_size = local_dp_size(vllm_config)
     if local_size <= 0:
         return False
     parallel_config = vllm_config.parallel_config
-    _validate(parallel_config)
 
     # Every child picks its own random DP-init ports in ParallelConfig; the
     # engines' DP group would never form. Same fix and same ports as
