@@ -366,9 +366,10 @@ SERVED_HIDDEN, SERVED_INTER, SERVED_LOGICAL_INTER = 5120, 2560, 2304
 SERVED_SHAPES = {"g25": (25, 288, 6), "g9": (9, 240, 3)}
 
 
-def _served_fp4_weights(mesh, seed, *, e_total):
+def _served_fp4_weights(mesh, seed, *, e_total, replicas=0):
     """(w1, w2, w1_scale, w2_scale) in the served operand forms, generated on
-    device (the host copy of the f32 masters would be tens of GB)."""
+    device (the host copy of the f32 masters would be tens of GB); the last
+    `replicas` slots hold copies of the first ones."""
     from vllm_torchtpu.kernels.fused_moe.v2.host import fp4_scale_rows
 
     shard = NamedSharding(mesh, P(AXIS))
@@ -376,6 +377,8 @@ def _served_fp4_weights(mesh, seed, *, e_total):
 
     def one(key, k, n):
         raw = jax.random.normal(key, (e_total, k, n), jnp.float32) * 0.1
+        if replicas:
+            raw = raw.at[e_total - replicas :].set(raw[:replicas])
         if k == inter:
             raw = jnp.where(jnp.arange(k)[None, :, None] < logical, raw, 0)
         else:
@@ -590,6 +593,94 @@ def test_served_dims_drop_repeated_tail_is_bit_exact(shape, hash_routed):
     )
     np.testing.assert_array_equal(np.asarray(got), want)
     assert int(np.asarray(load_all).sum()) == EP * rows * topk
+    assert int(np.asarray(load_kept).sum()) == routed_rows * topk
+
+
+@pytest.mark.parametrize("hash_routed", [False, True], ids=["scored", "hashed"])
+@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
+def test_served_dims_drop_repeated_runs_is_bit_exact(shape, hash_routed):
+    """Rows repeating the row before them take their run's first result: the
+    layer's output is the one without the switch bit for bit, on shards with
+    no runs, one run, a run ending before the tail, and runs that break on
+    the gating alone, scored and hash-routed, with replicated experts whose
+    copy a row picks by its own index; the load accumulator counts one
+    routed row per run."""
+    g_local, rows, topk = SERVED_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    # The first EP experts have a second copy in the last EP slots.
+    e_logical = e_total - EP
+    weights = _served_fp4_weights(mesh, 91, e_total=e_total, replicas=EP)
+    x, gating = _inputs(
+        mesh, 92, hidden=SERVED_HIDDEN, e_logical=e_logical, tokens=EP * rows
+    )
+    x, gating = np.array(x), np.array(gating)
+    # Every row picks a replicated expert first, so copies serve real rows.
+    gating[:, :EP] += 10.0
+    third = rows // 3
+    # Per shard, the [start, end) row runs that repeat their first row.
+    runs = {
+        0: [(0, rows)],
+        2: [(third, 2 * third)],
+        3: [(5, 9), (9, third), (third, rows)],
+        4: [(1, third), (2 * third, rows)],
+    }
+    for shard, spans in runs.items():
+        lo = shard * rows
+        for start, end in spans:
+            x[lo + start : lo + end] = x[lo + start]
+            gating[lo + start : lo + end] = gating[lo + start]
+    # Shard 5: one run of x whose gating differs every other row.
+    lo = 5 * rows
+    x[lo : lo + rows] = x[lo]
+    gating[lo : lo + rows : 2] = gating[lo]
+    routed_rows = EP * rows - sum(
+        end - start - 1 for spans in runs.values() for start, end in spans
+    )
+    shard = NamedSharding(mesh, P(AXIS))
+    replicated = NamedSharding(mesh, P())
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+        **LANDING_SWITCHES,
+    )
+    if hash_routed:
+        ids = gating.argsort(axis=1)[:, ::-1][:, :topk].astype(np.int32)
+        common["hash_topk_ids"] = jax.device_put(ids, shard)
+    x, gating = jax.device_put(x, shard), jax.device_put(gating, shard)
+    slots = np.full((e_logical, 2), -1, np.int32)
+    slots[:, 0] = np.arange(e_logical)
+    slots[:EP, 1] = np.arange(e_logical, e_total)
+    common["expert_slot"] = jax.device_put(slots, replicated)
+    zeros = jnp.zeros((e_total,), jnp.int32)
+    want, load_all = fused_ep_moe_push(
+        x, *weights, gating, expert_load=jax.device_put(zeros, replicated), **common
+    )
+    want = np.asarray(want)
+    assert np.isfinite(want.astype(np.float32)).all()
+    got, load_kept = fused_ep_moe_push(
+        x,
+        *weights,
+        gating,
+        expert_load=jax.device_put(zeros, replicated),
+        drop_repeated_runs=True,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(got), want)
+    load_all = np.asarray(load_all)
+    assert int(load_all.sum()) == EP * rows * topk
+    assert (load_all[e_logical:] > 0).all(), "every copy serves some rows"
     assert int(np.asarray(load_kept).sum()) == routed_rows * topk
 
 

@@ -70,5 +70,13 @@ EXPERIMENTAL_VARIANTS: dict[str, dict[str, Variant]] = {
             eligible=_fused_ep_with_ep,
             description="padding rows of a DP-max bucket skip the experts",
         ),
+        # Every run of repeated rows routes once, not only the trailing one:
+        # from the first Engram layer on, a padded bucket's rows stop matching
+        # the last row but still come in runs.
+        "push_fused_ep_repeated_runs": Variant(
+            params={**_PUSH_LANDING, "drop_repeated_runs": True},
+            eligible=_fused_ep_with_ep,
+            description="runs of repeated padding rows skip the experts",
+        ),
     },
 }
