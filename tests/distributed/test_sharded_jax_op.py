@@ -73,14 +73,10 @@ def test_a_specializing_fake_is_caught():
         _export(_op("halve_specialized", fake))
 
 
-@pytest.mark.skipif(
-    not sjo._stock_takes_output_specs(),
-    reason="the installed torch_tpu sizes outputs through the derived class",
-)
-def test_stock_callable_gets_the_output_specs(monkeypatch):
-    """A torch_tpu whose JaxCallable sizes outputs from its own specs must be
-    given them: without, a P("d") output is sized for the global array, eight
-    times this rank's rows on an 8-core mesh."""
+def test_the_callable_gets_the_output_specs(monkeypatch):
+    """JaxCallable sizes outputs from the specs it is given: without them, a
+    P("d") output is sized for the global array, eight times this rank's rows
+    on an 8-core mesh."""
     built = []
     real = torch.library.custom_op
 
