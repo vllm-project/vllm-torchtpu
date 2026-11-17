@@ -1172,7 +1172,7 @@ def _takes_prequant_rows(proj: Any) -> bool:
         and weight.dtype == torch.float8_e4m3fn
         and isinstance(weight_scale, torch.Tensor)
         and weight_scale.ndim == 1
-        and hasattr(getattr(proj, "quant_method", None), "apply_prequant")
+        and isinstance(proj.quant_method, linear_common.PrequantLinearMethod)
     )
 
 

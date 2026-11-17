@@ -56,6 +56,23 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
 
+class PrequantLinearMethod:
+    """A linear method that can also apply its layer to rows already
+    quantized per row to FP8 (`quantize_rows`' values and scales), as the
+    Qwen3.5 model patch's sequence-parallel FP8 all-gather and fused input
+    norm hand them over. Callers dispatch on this class, not on the method's
+    attributes."""
+
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_s: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     """Return the activation quant dtype paired with a given weight dtype.
 
