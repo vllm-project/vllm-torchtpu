@@ -1,6 +1,6 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Torch bridge for kernels/experimental/moe_tp_decode_nvfp4.
+"""Torch bridge for kernels/experimental/moe_tp_decode, weight_format="nvfp4".
 
 Mirrors ``layers/adapter/moe_tp_decode.py`` for ``VllmNvfp4MoEMethod`` layers
 behind ``USE_MOE_TP_DECODE_NVFP4_KERNEL`` (default off):
@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import torch
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.experimental import moe_tp_decode_nvfp4 as kernel
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import nvfp4 as kernel
 from vllm_torchtpu.layers.adapter import moe_tp_decode as fp8_decode
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import align_to

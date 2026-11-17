@@ -28,9 +28,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as fp8_kernel
-from vllm_torchtpu.kernels.experimental.moe_tp_decode_nvfp4 import (
-    moe_tp_decode_nvfp4,
-)
+from vllm_torchtpu.kernels.experimental.moe_tp_decode.nvfp4 import moe_tp_decode_nvfp4
 
 FP8 = jnp.float8_e4m3fn
 FP4 = jnp.float4_e2m1fn

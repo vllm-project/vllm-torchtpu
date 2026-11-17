@@ -16,7 +16,7 @@ in-kernel cross-rank all-reduce for decode batches (`n <= 64`). Opt-in with
 ## API
 
 ```python
-from vllm_torchtpu.kernels.experimental.moe_tp_decode_nvfp4 import (
+from vllm_torchtpu.kernels.experimental.moe_tp_decode.nvfp4 import (
     ROW_BUCKETS,
     can_use_moe_tp_decode_nvfp4,
     exact_in_bf16,
