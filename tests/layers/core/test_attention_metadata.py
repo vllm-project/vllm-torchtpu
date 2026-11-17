@@ -1125,6 +1125,46 @@ class TestBlockTableUploadSkip:
         self._stage(runner, 3)
         assert len(runner._registered_h2d_sources) == 2
 
+    @pytest.mark.parametrize(
+        "bounds_tail,cacheable",
+        [
+            # Only rows 1 and 2 had drafts substituted, so only they can lose
+            # up to 3 rejected tokens; row 0 (length 17) stays in column 1.
+            ((3, np.array([False, True, True])), True),
+            # Row 0 may lose 3 tokens too: column 0 or 1, so recompute.
+            ((3, np.array([True, True, True])), False),
+            ((3,), False),
+            ((0,), True),
+        ],
+    )
+    def test_products_key_bounds_only_substituted_rows(self, bounds_tail, cacheable):
+        """The runner passes `(seq_lens, max_rejected, sub_mask)`; rows outside
+        `sub_mask` cannot lose rejected tokens, so only their own length
+        decides their state-block column."""
+        seq_np = np.array([17, 20, 36], dtype=np.int32)
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=3,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([17, 20, 36, 0], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+            mamba_ckpt_window=3,
+            mamba_seq_lens_bounds=(seq_np, *bounds_tail),
+        )
+        key = attention_metadata._stage_products_key(
+            ctx,
+            torch.zeros(48, dtype=torch.int32),
+            4,
+            [(0, 4, 6), (24, 4, 6)],
+            [(0, None, 6), (1, None, 6)],
+            [(1, 6, 16, None)],
+        )
+        assert (key is not None) is cacheable
+        if cacheable:
+            # Columns 1, 1, 2 of block size 16.
+            assert key[-1] == (np.array([1, 1, 2], dtype=np.int32).tobytes(),)
+
     def test_mamba_staged_products_reused_when_block_cols_invariant(self, monkeypatch):
         plumbing = TestAttentionMetadataBuilderPlumbing()
         runner = plumbing._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
