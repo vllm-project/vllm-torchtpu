@@ -1720,7 +1720,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     ) -> torch.Tensor:
         """apply with the activation already quantised per row: the
         sequence-parallel fp8 all-gather hands the projections fp8 rows
-        and their scales (layers/adapter/sequence_parallel)."""
+        and their scales (layers/adapter/sequence_parallel).
+
+        The pre-quantized matmul takes per-channel weight scales. A weight
+        with block scales (REQUANTIZE_BLOCK_SIZE) runs `apply` on the
+        dequantized rows instead, the path its plain forward takes."""
         from vllm_torchtpu.layers.adapter.linear_common import (
             quantized_matmul_prequant,
         )
@@ -1729,6 +1733,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         weight = layer.weight
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             weight = weight.transpose(0, 1)
+        if layer.weight_scale.shape != (weight.shape[-1],):
+            rows = (x_q.to(torch.float32) * x_s).to(torch.bfloat16)
+            return self.apply(layer, rows, bias)
         out = quantized_matmul_prequant(x_q, x_s, weight, layer.weight_scale)
         if bias is not None:
             out = out + bias
