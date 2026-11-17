@@ -28,6 +28,7 @@ MMLU-with-prefix-caching parity; this file pins the block-selection logic
 directly and cheaply.
 """
 
+import contextlib
 import inspect
 from types import SimpleNamespace
 
@@ -1108,3 +1109,63 @@ def test_prefill_checkpoint_block_is_never_a_seed_copy_operand(layout, window):
         if ckpt is not None:
             assert ckpt != 0
             assert all(ckpt not in pair for pair in pairs)
+
+
+@pytest.mark.parametrize(
+    "window, split, warms_spec_seed",
+    [(3, 1, True), (1, 1, False), (3, 2, False)],
+)
+def test_rollback_warmup_compiles_the_fused_spec_seed_program(
+    monkeypatch, window, split, warms_spec_seed
+):
+    # Synthetic warmup requests never cross a block, so serving would compile
+    # the fused spec-seed gather + rollback reset on the first crossing unless
+    # warmup runs it at every bucket length, with the checkpoint width,
+    # dtypes, distinct state/rollback tensors and grad mode serving uses.
+    calls = []
+
+    def fused(offsets, state_t, ckpt_t, rollback_dst_t):
+        calls.append(
+            (
+                tuple(state_t.shape),
+                state_t.dtype,
+                tuple(ckpt_t.shape),
+                ckpt_t.dtype,
+                tuple(rollback_dst_t.shape),
+                rollback_dst_t.dtype,
+                state_t is rollback_dst_t,
+                torch.is_grad_enabled(),
+            )
+        )
+        return torch.zeros(state_t.shape[0], dtype=torch.int32)
+
+    monkeypatch.setattr(runner_mod, "_spec_seed_and_rollback_compiled", fused)
+    monkeypatch.setattr(
+        runner_mod,
+        "_rollback_offsets_seed_compiled",
+        runner_mod._rollback_offsets_seed_impl,
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "_rollback_offsets_migrate_compiled",
+        runner_mod._rollback_offsets_migrate_impl,
+    )
+    monkeypatch.setattr(runner_mod, "synchronize_tensors", lambda *_a, **_k: None)
+    fake = SimpleNamespace(
+        mamba_slot_read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+        _mamba_ckpt_window=window,
+        _pool_block_split=split,
+        _mamba_copy_plan=[(0, [])],
+        kv_cache_config=None,
+        max_num_reqs=10,
+        _bucket_len=TPUModelRunner._bucket_len,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+    )
+
+    TPUModelRunner._precompile_mamba_rollback_helpers(fake)
+
+    expected = [
+        ((n,), torch.long, (n, window), torch.int32, (n,), torch.long, False, False)
+        for n in (8, 32)
+    ]
+    assert calls == (expected if warms_spec_seed else [])
