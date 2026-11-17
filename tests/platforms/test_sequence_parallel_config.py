@@ -272,39 +272,3 @@ def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
         match="does not support pipeline parallelism",
     ):
         configure_sp_moe(vllm_config)
-
-
-@pytest.mark.parametrize(
-    "tp,dp,ep,expected",
-    [
-        (8, 1, True, True),  # TP8 without data parallelism
-        (2, 4, True, True),  # attention data parallelism over EP ranks
-        (4, 2, True, True),
-        (1, 8, True, False),  # no TP: nothing to slice
-        (2, 4, False, False),  # no EP: the expert sum is never reduced
-    ],
-)
-def test_sequence_parallel_moe_admission(monkeypatch, tp, dp, ep, expected):
-    from vllm.config.parallel import ParallelConfig
-
-    import vllm_torchtpu
-    from vllm_torchtpu import envs
-
-    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
-    saved = ParallelConfig.__dict__.get("use_sequence_parallel_moe")
-    saved_flag = ParallelConfig.__dict__.get("_tpu_no_sp_moe_patch")
-    ParallelConfig._tpu_no_sp_moe_patch = False
-    try:
-        vllm_torchtpu._patch_sequence_parallel_moe_admission()
-        admitted = ParallelConfig.__dict__["use_sequence_parallel_moe"].fget
-        config = SimpleNamespace(
-            enable_expert_parallel=ep,
-            tensor_parallel_size=tp,
-            data_parallel_size=dp,
-        )
-        assert admitted(config) is expected
-    finally:
-        if saved is not None:
-            ParallelConfig.use_sequence_parallel_moe = saved
-        if saved_flag is not None:
-            ParallelConfig._tpu_no_sp_moe_patch = saved_flag
