@@ -218,8 +218,10 @@ def _gather_sc_banked_deep(words, scales, records):
 
     The gather for step i + 2 is issued while step i's rows are written, so
     two gathers are in flight instead of one. Each 16-id stream is filled by
-    one masked gather per bank plus a masked gather of a zero row for negative
+    one masked gather per bank plus a masked gather of zero rows for negative
     ids, so every staged row has exactly one writer and no slot is cleared.
+    Each negative id in flight reads its own zero row (per gather in flight,
+    core, stream and lane): reads that all hit one row queue behind each other.
     Copies of one slot and stream share a semaphore; with one semaphore per
     source, kind and slot, three- and four-slot versions hung on v7x.
     """
@@ -236,11 +238,7 @@ def _gather_sc_banked_deep(words, scales, records):
     count = records.size
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
-    # Invalid ids gather a zero row. Give every subcore lane its own row: when
-    # all ids are invalid (DP-lockstep dummy steps, short selections) a single
-    # shared zero row turns every lane's DMA into a same-address read, which
-    # serializes and made idle-rank gathers ~15x slower than real ones.
-    zero_rows = cores * lanes
+    zero_rows = 2 * cores * streams * lanes
     zero_words = jnp.zeros((zero_rows, 128), jnp.int32)
     zero_scales = jnp.zeros((zero_rows,), jnp.float32)
     mesh = plsc.VectorSubcoreMesh(
@@ -266,7 +264,6 @@ def _gather_sc_banked_deep(words, scales, records):
         core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         split = word_refs[0].shape[0]
         steps = subchunks // streams
-        zero_row = core * lanes + jax.lax.broadcasted_iota(jnp.int32, (lanes,), 0)
 
         def outer(ids):
             base = (pl.program_id(0) * cores + core) * subchunks * lanes
@@ -288,11 +285,15 @@ def _gather_sc_banked_deep(words, scales, records):
                                 jnp.where(own, local, -1),
                             )
                         )
+                    first_zero = ((step % 2 * cores + core) * streams + stream) * lanes
+                    zero_ids = first_zero + jax.lax.broadcasted_iota(
+                        jnp.int32, (lanes,), 0
+                    )
                     targets.append(
                         (
                             zero_word_ref,
                             zero_scale_ref,
-                            jnp.where(selected < 0, zero_row, -1),
+                            jnp.where(selected < 0, zero_ids, -1),
                         )
                     )
                     for word_src, scale_src, rows in targets:
