@@ -497,14 +497,13 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
     )
     # How the two slab tables are built, read off the same device record as
-    # the kernel's VMEM budget: on the TensorCore (a chip whose SparseCore
-    # does not take the scatter-add, see TENSORCORE_TABLES_MAX_SC_SUBCORES)
-    # both scatters are sets; otherwise both stay scatter-adds for the
-    # SparseCore. The mesh in the cache key below already pins the chip; the
-    # choice is in the key as well, so a caller that forces it (a test, an A/B)
-    # never gets the other form's cached body.
-    tables_on_tensorcore = slab_tables_on_tensorcore()
-    slab_by_set = tables_on_tensorcore
+    # the kernel's VMEM budget: on a chip whose small SparseCore does not take
+    # the scatter-add (see TENSORCORE_TABLES_MAX_SC_SUBCORES) both scatters
+    # are sets, built on the TensorCore; otherwise both stay scatter-adds. The
+    # mesh in the cache key below already pins the chip; the choice is in the
+    # key as well, so a caller that forces it (a test, an A/B) never gets the
+    # other form's cached body.
+    slab_by_set = slab_tables_on_tensorcore()
     logger.info_once(
         "fused_ep_moe_v2: slab tables built with a scatter-%s",
         "set" if slab_by_set else "add",

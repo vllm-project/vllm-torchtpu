@@ -1018,23 +1018,24 @@ def local_slab_rows(routing, me, *, shard_stride):
 # offloads neither scatter form, so both run on the TensorCore one element at
 # a time; there the set costs about half the add, which reads each destination
 # back first (1.74x at 16k tokens, 1.76x at 1.5k, measured on TPU8i). A chip
-# without a SparseCore has only the TensorCore, so it takes the TensorCore
-# builds too.
+# without a SparseCore keeps the add too: the set has not been measured there.
 TENSORCORE_TABLES_MAX_SC_SUBCORES = 4
 
 
 def slab_tables_on_tensorcore(info=None):
     """Whether this chip builds the slab tables on the TensorCore.
 
-    True selects the TensorCore builds (today a scatter-set for both slab
-    tables); False keeps both tables scatter-adds for the SparseCore. Read off
-    the same device record the VMEM accounting reads, so the layer answers it
-    once per build.
+    True, for a chip whose SparseCore has at most
+    TENSORCORE_TABLES_MAX_SC_SUBCORES subcores, selects the TensorCore builds
+    (today a scatter-set for both slab tables). False keeps both tables
+    scatter-adds: a full SparseCore runs them, and a chip without one keeps
+    them until the set is measured there. Read off the same device record the
+    VMEM accounting reads, so the layer answers it once per build.
     """
     if info is None:
         info = pltpu.get_tpu_info()
     sc = info.sparse_core
-    return sc is None or sc.num_cores * sc.num_subcores <= (
+    return sc is not None and sc.num_cores * sc.num_subcores <= (
         TENSORCORE_TABLES_MAX_SC_SUBCORES
     )
 

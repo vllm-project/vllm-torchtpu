@@ -43,6 +43,8 @@ import pytest
 jax = pytest.importorskip("jax")
 jnp = jax.numpy
 
+from jax.experimental.pallas import tpu as pltpu  # noqa: E402
+
 from vllm_torchtpu.kernels.fused_moe.v2 import host  # noqa: E402
 
 
@@ -458,13 +460,11 @@ def test_slab_scatter_set_builds_the_add_tables(
         ("TPU_V6E", False),  # 2 x 16
         ("TPU_V5P", False),  # 4 x 16: four SparseCores, all full
         ("TPU_8I", True),  # 1 x 4: the scatters stay on the TensorCore
-        ("TPU_V5E", True),  # no SparseCore at all
+        ("TPU_V5E", False),  # no SparseCore: the set is unmeasured, keep the add
     ],
 )
 def test_slab_tables_follow_the_sparse_core(chip, on_tensorcore):
-    """A chip with at most 4 SparseCore subcores, or none, builds on the TensorCore."""
-    from jax.experimental.pallas import tpu as pltpu
-
+    """Only a chip whose SparseCore has at most 4 subcores builds on the TensorCore."""
     info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
     assert host.slab_tables_on_tensorcore(info) is on_tensorcore
 
