@@ -40,10 +40,10 @@ from vllm_torchtpu.distributed.mesh_utils import (
     _collect_rank_to_device_id,
     _get_current_global_rank,
     _get_tpu_global_device_id,
-    get_pipeline_stage,
     get_stage_mesh,
 )
 from vllm_torchtpu.distributed.pcp import get_pcp_world_size
+from vllm_torchtpu.distributed.pipeline_stage import get_pipeline_stage
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -289,30 +289,19 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
 
     # No jax.devices() lookup: get_pallas_mesh builds abstract devices from the
     # process group, so this worker no longer needs JAX to expose every peer.
-    import torch.distributed as dist
-
-    world_size = int(dist.get_world_size())
-    _, stages = get_pipeline_stage()
-    if len(device_ids) * stages != world_size:
+    stage_size = get_pipeline_stage().size
+    if len(device_ids) != stage_size:
         raise NotImplementedError(
-            f"The EP group spans {len(device_ids)} devices inside a "
-            f"torch.distributed world of {world_size}. get_pallas_mesh builds "
-            "a mesh over the whole world, so EP alongside another parallelism "
-            "axis needs a mesh_shape factorisation that has not been worked "
-            "out."
+            f"The EP group spans {len(device_ids)} devices inside a pipeline "
+            f"stage of {stage_size}. The mesh covers the whole stage, so EP "
+            "alongside another parallelism axis needs a mesh_shape "
+            "factorisation that has not been worked out."
         )
 
     import numpy as np
     from jax.sharding import Mesh
-    from torch.tpu.pallas import get_pallas_mesh
 
-    if stages > 1:
-        # The EP group is one pipeline stage.
-        ranked = get_stage_mesh(
-            (axis_name,), (len(device_ids),), get_ep_group(), unordered
-        )
-    else:
-        ranked = get_pallas_mesh(axis_names=(axis_name,))
+    ranked = get_stage_mesh((axis_name,), (len(device_ids),))
     by_id = {int(d.id): d for d in ranked.devices.flat}
     if sorted(by_id) != sorted(device_ids):
         # The ids become the DeviceAssignment, and ep_rank_order/ep_mesh_index

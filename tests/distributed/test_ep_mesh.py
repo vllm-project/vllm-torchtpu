@@ -22,6 +22,7 @@ import torch
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu.distributed import ep_mesh as ep
+from vllm_torchtpu.distributed import mesh_utils, pipeline_stage
 
 
 @pytest.fixture(autouse=True)
@@ -117,6 +118,11 @@ def test_rank_order_rejects_duplicate_device_ids(monkeypatch, group):
         ep.ep_rank_order()
 
 
+def _world(size):
+    """The stage of a world of `size` ranks without a pipeline."""
+    return pipeline_stage.PipelineStage(0, 1, tuple(range(size)), 0, None)
+
+
 def _pallas_devices(rank_device_ids):
     return [
         SimpleNamespace(id=device_id, process_index=rank)
@@ -137,17 +143,16 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
     mesh orders them by device id rather than keeping get_pallas_mesh's rank
     order: that order is the kernel's DeviceAssignment, and the fused MoE's
     all-gathers are slower over the rank-ordered one."""
-    import torch.distributed as dist
 
     monkeypatch.setattr(
         jax,
         "devices",
         Mock(side_effect=AssertionError("build_ep_mesh must not read jax.devices()")),
     )
-    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 4)
+    monkeypatch.setattr(pipeline_stage, "_STAGE", _world(4))
     rank_device_ids = (40, 20, 10, 30)
     made = Mock(
-        side_effect=lambda axis_names: _fake_mesh(
+        side_effect=lambda axis_names, mesh_shape: _fake_mesh(
             _pallas_devices(rank_device_ids), axis_names
         )
     )
@@ -156,7 +161,7 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: rank_device_ids)
 
     first = ep.build_ep_mesh()
-    assert made.call_args.kwargs == {"axis_names": ("d",)}
+    assert made.call_args.kwargs == {"axis_names": ("d",), "mesh_shape": (4,)}
     assert first.axis_names == ("d",)
     assert [d.id for d in first.devices.flat] == [10, 20, 30, 40]
     # Each device keeps the rank Torchtpu gave it; only the order changes.
@@ -167,7 +172,7 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (10, 20, 30, 40))
     assert ep.build_ep_mesh() is first
     assert ep.build_ep_mesh("experts") is not first
-    assert made.call_args.kwargs == {"axis_names": ("experts",)}
+    assert made.call_args.kwargs == {"axis_names": ("experts",), "mesh_shape": (4,)}
     assert made.call_count == 2
 
 
@@ -178,15 +183,16 @@ def test_mesh_keeps_pallas_rank_order_under_cp(monkeypatch, cp_size_fn, cp_size)
     DeviceAssignment, which is rank order -- on tpu7x, devices
     [0, 1, 4, 5, 6, 7, 2, 3]. Sorting them here is what failed to compile with
     "Disjoint or conflicting device assignments" on PCP + fused EP."""
-    import torch.distributed as dist
 
     monkeypatch.setattr(ep, cp_size_fn, lambda: cp_size)
-    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
+    monkeypatch.setattr(pipeline_stage, "_STAGE", _world(8))
     rank_device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     monkeypatch.setattr(
         torch.tpu.pallas,
         "get_pallas_mesh",
-        lambda axis_names: _fake_mesh(_pallas_devices(rank_device_ids), axis_names),
+        lambda axis_names, mesh_shape: _fake_mesh(
+            _pallas_devices(rank_device_ids), axis_names
+        ),
     )
     monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: rank_device_ids)
@@ -200,13 +206,14 @@ def test_mesh_keeps_pallas_rank_order_under_cp(monkeypatch, cp_size_fn, cp_size)
 def test_mesh_rejects_pallas_ids_that_are_not_the_groups(monkeypatch):
     """The mesh's ids become the DeviceAssignment and ep_rank_order indexes
     them as the gathered device ids, so any other set must fail at startup."""
-    import torch.distributed as dist
 
-    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 4)
+    monkeypatch.setattr(pipeline_stage, "_STAGE", _world(4))
     monkeypatch.setattr(
         torch.tpu.pallas,
         "get_pallas_mesh",
-        lambda axis_names: _fake_mesh(_pallas_devices((0, 1, 2, 3)), axis_names),
+        lambda axis_names, mesh_shape: _fake_mesh(
+            _pallas_devices((0, 1, 2, 3)), axis_names
+        ),
     )
     monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
@@ -219,16 +226,16 @@ def test_mesh_rejects_pallas_ids_that_are_not_the_groups(monkeypatch):
 def test_mesh_covers_the_stage_under_pipeline_parallelism(monkeypatch):
     """An EP group that is one pipeline stage gets a mesh of its own devices,
     built from its process group."""
-    import torch.distributed as dist
 
-    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
-    monkeypatch.setattr(
-        parallel_state,
-        "get_pp_group",
-        lambda: SimpleNamespace(world_size=4, rank_in_group=3),
-    )
     group = SimpleNamespace(world_size=2, ranks=[6, 7], device_group=object())
-    monkeypatch.setattr(ep, "get_ep_group", lambda: group)
+    monkeypatch.setattr(
+        pipeline_stage, "_STAGE", pipeline_stage.PipelineStage(3, 4, (6, 7), 0, group)
+    )
+    monkeypatch.setattr(
+        mesh_utils,
+        "get_cp_group_layout",
+        lambda group: mesh_utils.CpGroupLayout((6, 7), (2, 3), 0, 2),
+    )
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (2, 3))
     mesh = SimpleNamespace(
         devices=SimpleNamespace(flat=[SimpleNamespace(id=2), SimpleNamespace(id=3)])
@@ -248,9 +255,8 @@ def test_mesh_rejects_a_group_smaller_than_the_world(monkeypatch):
     """get_pallas_mesh spans the whole torch.distributed world and cannot
     describe a sub-group, so a smaller EP group has to fail rather than build
     a mesh of the wrong size."""
-    import torch.distributed as dist
 
-    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
+    monkeypatch.setattr(pipeline_stage, "_STAGE", _world(8))
     made = Mock()
     monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", made)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (10, 20))
