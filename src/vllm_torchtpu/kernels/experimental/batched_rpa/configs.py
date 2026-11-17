@@ -137,6 +137,38 @@ class RpaCase(enum.StrEnum):
                 return distribution[1], distribution[2]
 
 
+class Fp8Operand(enum.StrEnum):
+    """How a native fp8 matmul brings one operand into the fp8 KV dtype.
+
+    - OFF: the matmul runs on dequantized K / V, as without native fp8.
+    - ROW: one dynamic scale per row of the operand.
+    - SPLIT: ROW, with the rounding residual quantized as a second fp8 half
+      stacked under the first along the matmul rows: about bf16 accuracy for
+      twice the LHS rows.
+    """
+
+    OFF = enum.auto()
+    ROW = enum.auto()
+    SPLIT = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeFp8:
+    """Which DECODE matmuls run natively in the fp8 KV dtype.
+
+    `qk` quantizes q per (token, head) row; `pv` quantizes the softmax weights
+    per row. Every operand OFF (the default) is the dequantizing kernel.
+    """
+
+    qk: Fp8Operand = Fp8Operand.OFF
+    pv: Fp8Operand = Fp8Operand.OFF
+
+    def any(self) -> bool:
+        return self.qk is not Fp8Operand.OFF or self.pv is not Fp8Operand.OFF
+
+
+NATIVE_FP8_OFF = NativeFp8()
+
 # Inputs need three slots. The fetch for a tile is issued throughout the
 # preceding tile rather than all at once at its start, so it cannot be waited
 # on right away -- it needs one extra tile in flight for the DMA to land.
@@ -174,6 +206,7 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    native_fp8: NativeFp8 = NATIVE_FP8_OFF
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -182,8 +215,19 @@ class ServingConfigs:
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
             )
+        if self.native_fp8.any() and jnp.dtype(self.dtype_kv) not in (
             jnp.dtype(jnp.float8_e4m3fn),
             jnp.dtype(jnp.float8_e5m2),
+        ):
+            raise ValueError(
+                f"native_fp8={self.native_fp8} runs matmuls in the fp8 KV dtype, "
+                f"but the KV cache is {jnp.dtype(self.dtype_kv)}; use an fp8 KV "
+                "cache or leave native_fp8 off."
+            )
+        if self.native_fp8.qk is not Fp8Operand.OFF and self.scale_q is not None:
+            raise ValueError(
+                "native_fp8.qk with a static q scale: the q-scale path already "
+                "casts q to the KV dtype; pass one or the other."
             )
 
     @property
