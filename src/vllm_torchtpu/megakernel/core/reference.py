@@ -27,6 +27,7 @@ from .exec_spec import ExecSpec
 from .geometry import ModelGeometry
 from .modules.gdn import GDNModule
 from .modules.gqa import GQAModule
+from .modules.gqa.decls import ROPE_TABLE_INPUT
 from .modules.norm import NormModule
 from .ops import BF16, F32, rmsnorm, round_bf16, round_up
 from .pool.config import cache_exec
@@ -51,6 +52,30 @@ def _make_ref_module(m: ModuleOrBinding | None, g: ModelGeometry) -> Module | No
         )
     opts = {k: v for k, v in m.options.items() if v is not None}
     return m.module_cls(geometry=g, prefix=m.prefix, **opts)
+
+
+def _gqa_kw(
+    mod: GQAModule,
+    pos: Any,
+    att_idx: int,
+    lyr: int,
+    paged_kv: bool,
+    extra: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """`GQAModule.reference` keyword arguments for layer `lyr`."""
+    kw: dict[str, Any] = {
+        "pos": pos,
+        "att_idx": att_idx,
+        "layer_idx": lyr,
+        "paged_kv": paged_kv,
+    }
+    if mod.rope_table:
+        if extra is None or ROPE_TABLE_INPUT not in extra:
+            raise MegakernelConfigError(
+                f"GQAModule(rope_table=True) needs extra[{ROPE_TABLE_INPUT!r}]"
+            )
+        kw["rope_cs"] = extra[ROPE_TABLE_INPUT]
+    return kw
 
 
 def prepare_reference_step_state(
@@ -150,8 +175,13 @@ def composed_reference_step(
     *,
     paged_kv: bool | None = None,
     pool_io: bool = False,
+    extra: Mapping[str, Any] | None = None,
 ) -> tuple[jax.Array, dict[str, Any]]:
-    """Execute GQA/GDN + FFN module `reference()` along `sched`."""
+    """Execute GQA/GDN + FFN module `reference()` along `sched`.
+
+    `extra` holds the step's module extra inputs by name (`Module.extra_inputs`;
+    one rank's value, e.g. the `rope_table` cos / sin).
+    """
     B, L = ex.B, g.L
     use_paged_kv = cache_exec(ex).paged_kv if paged_kv is None else bool(paged_kv)
     step_state, conv_in, rec_in, ngdn, vh, KD, VD = prepare_reference_step_state(
@@ -177,12 +207,7 @@ def composed_reference_step(
             raise MegakernelConfigError(f"Layer {lyr} has no mixer module")
         b_idx = sched.mixer_branch_indices[lyr]
         if isinstance(mix_mod, GQAModule):
-            mix_kw = {
-                "pos": pos,
-                "att_idx": b_idx,
-                "layer_idx": lyr,
-                "paged_kv": use_paged_kv,
-            }
+            mix_kw = _gqa_kw(mix_mod, pos, b_idx, lyr, use_paged_kv, extra)
         elif isinstance(mix_mod, GDNModule):
             mix_kw = {"gdn_idx": b_idx, "layer_idx": lyr, "multi_layer": True}
         else:
@@ -240,8 +265,10 @@ def spec_reference_step(
     *,
     paged_kv: bool | None = None,
     pool_io: bool = False,
+    extra: Mapping[str, Any] | None = None,
 ) -> tuple[jax.Array, dict[str, Any]]:
-    """Execute module `reference()` along `spec.layer_type.slots`."""
+    """Execute module `reference()` along `spec.layer_type.slots` (`extra` as in
+    `composed_reference_step`)."""
     from .weights.spec_pack import switch_branch_for_layer
 
     B, L = ex.B, int(g.L)
@@ -274,12 +301,7 @@ def spec_reference_step(
             else:
                 x_in = res
             if isinstance(mod, GQAModule):
-                kw: dict[str, Any] = {
-                    "pos": pos,
-                    "att_idx": b_idx,
-                    "layer_idx": lyr,
-                    "paged_kv": use_paged_kv,
-                }
+                kw: dict[str, Any] = _gqa_kw(mod, pos, b_idx, lyr, use_paged_kv, extra)
             elif isinstance(mod, GDNModule):
                 kw = {"gdn_idx": b_idx, "layer_idx": lyr, "multi_layer": True}
             else:

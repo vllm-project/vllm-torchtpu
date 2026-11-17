@@ -227,10 +227,12 @@ class ModelDef:
         *,
         paged_kv: bool | None = None,
         pool_io: bool = False,
+        extra: Mapping[str, Any] | None = None,
     ) -> tuple[jax.Array, dict[str, Any]]:
-        """Composed pure-JAX multi-rank reference along `schedule`."""
+        """Composed pure-JAX multi-rank reference along `schedule` (`extra`: the
+        step's module extra inputs by name, one rank's value)."""
         args = (g, ex, pos, hidden, logical_weights, logical_states)
-        kw = dict(paged_kv=paged_kv, pool_io=pool_io)
+        kw = dict(paged_kv=paged_kv, pool_io=pool_io, extra=extra)
         if not cls.schedule:
             return spec_reference_step(cls.to_model_spec(g, R=ex.R), *args, **kw)
         sched = cls.resolve_schedule(g)
