@@ -86,9 +86,6 @@ class TwoRing:
             sp.branch_counts,
             sp.rel_fetch,
         )
-        # `fetch` then finds a tile's layer without a runtime divide: a refill
-        # lands at most one layer ahead.
-        assert sp.branch_tiles[0] >= sp.NBD, (sp.NBD, sp.branch_tiles[0])
         (pos,) = [hi for kind, _, hi, _ in sp.branch_segs[0] if kind == after]
         self._rt = (pos, count, issue)
 
@@ -349,15 +346,18 @@ class TwoRing:
         pos, cnt, issue = self._rt
         t_l = sp.branch_tiles[0] + cnt
 
-        lyr = 0 if self._cur_layer is None else self._cur_layer
-        r0 = g - lyr * t_l
-        nxt = r0 >= t_l
+        # The layer of `g` without a runtime divide (one per fetch cost 41 us
+        # a step at 8k): a refill lands at most `ceil(NBD / t0)` layers ahead.
+        layer = jnp.int32(0) if self._cur_layer is None else self._cur_layer
+        r = g - layer * t_l
+        for _ in range(-(-sp.NBD // sp.branch_tiles[0])):
+            nxt = r >= t_l
+            layer = layer + nxt.astype(jnp.int32)
+            r = jnp.where(nxt, r - t_l, r)
 
         @pl.when(g < sp.L * t_l)
         def _():
             bank = g % sp.NBD
-            layer = lyr + nxt.astype(jnp.int32)
-            r = jnp.where(nxt, r0 - t_l, r0)
             in_rt = jnp.logical_and(r >= pos, r < pos + cnt)
             pl.when(in_rt)(lambda: issue(layer, r - pos, bank))
             r_s = jnp.where(r < pos, r, r - cnt)
