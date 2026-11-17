@@ -25,7 +25,10 @@ built, before any compiled function runs; the torch.compile hook in
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 SECTION = "tpu_compile"
 
@@ -76,15 +79,17 @@ def parse(raw: Any) -> CompileOptions:
     return CompileOptions(**raw)
 
 
-def get(vllm_config: Any) -> CompileOptions:
-    """The engine's compile options."""
-    additional = getattr(vllm_config, "additional_config", None)
-    if not isinstance(additional, dict):
+def get(vllm_config: "VllmConfig | None") -> CompileOptions:
+    """The engine's compile options. ``TpuPlatform.check_and_update_config``
+    calls this, so a malformed section fails at startup. None (a worker built
+    without a config, as the spawned-process patch test builds one) gives the
+    defaults."""
+    if vllm_config is None:
         return CompileOptions()
-    return parse(additional.get(SECTION))
+    return parse(cast("dict[str, Any]", vllm_config.additional_config).get(SECTION))
 
 
-def apply(vllm_config: Any) -> CompileOptions:
+def apply(vllm_config: "VllmConfig | None") -> CompileOptions:
     """Arm the torch.compile hook of this process with the engine's options."""
     from vllm_torchtpu.compilation import fast_dispatch
 
