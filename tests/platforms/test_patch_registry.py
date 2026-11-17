@@ -220,6 +220,8 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_offload_fine_prefix_alignment",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
+        "patch_scheduler_prefill_srpt",
+        "patch_scheduler_decode_interleave",
         "patch_disable_eagle_block_drop",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
