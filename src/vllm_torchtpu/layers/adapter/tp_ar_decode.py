@@ -43,10 +43,12 @@ from vllm_torchtpu.kernels.collectives.tp8_ar_decode_fn import (  # noqa: F401  
     MAX_ROWS_ENV,
     MODES,
     N_MEMBERS,
+    PAD16_ENV,
     compile_factors,
     global_fn,
     max_rows,
     mode,
+    pad16,
     pairs_from_device_ids,
 )
 from vllm_torchtpu.logger import init_logger
@@ -72,6 +74,7 @@ def arm(model_runner: Any = None) -> bool:
     if not m:
         return False
     rows_cap = max_rows()
+    pad = pad16()
     from jax.experimental.pallas import tpu as pltpu  # noqa: F401  (import check before any op is built)
     from jax.sharding import PartitionSpec
     from torch_tpu._internal.pallas import jax_op
@@ -110,11 +113,11 @@ def arm(model_runner: Any = None) -> bool:
         raise RuntimeError(f"{ENV}: EP mesh device ids {seen} != the EP mesh order {device_ids}")
     pairs = pairs_from_device_ids(device_ids)
     wire = MODES[m]
-    signature = (m, wire, rows_cap, pairs, device_ids)
+    signature = (m, wire, rows_cap, pad, pairs, device_ids)
     _check_same_on_every_rank(signature, tp)
     spec = PartitionSpec(EP_AXIS_NAME)
-    fn = global_fn(mesh, axis=EP_AXIS_NAME, pairs=pairs, wire=wire, max_rows_=rows_cap)
-    name = closure_op_name("pallas::q38_tp_ar_decode", (mesh, pairs, wire, rows_cap))
+    fn = global_fn(mesh, axis=EP_AXIS_NAME, pairs=pairs, wire=wire, max_rows_=rows_cap, pad16_=pad)
+    name = closure_op_name("pallas::q38_tp_ar_decode", (mesh, pairs, wire, rows_cap, pad))
     # pyrefly: ignore[no-matching-overload]
     op = jax_op(name, fn, mesh=mesh, input_partition_specs=(spec,), output_partition_specs=spec)
 
@@ -126,8 +129,9 @@ def arm(model_runner: Any = None) -> bool:
     _ARMED = (op, hidden)
     logger.info(
         "q38 AR-FIX decode TP all-reduce ARMED: %s=%s (H8, wire %s), rows %% 16 == 0 and <= %d take the kernel, "
-        "others XLA psum in the same op; hidden %d; mesh device ids %s; pairs %s; op %s",
-        ENV, m, wire, rows_cap, hidden, device_ids, pairs, name,
+        "others XLA psum in the same op; %s=%d (pad other row counts to 16 for H8); hidden %d; mesh device ids %s; "
+        "pairs %s; op %s",
+        ENV, m, wire, rows_cap, PAD16_ENV, int(pad), hidden, device_ids, pairs, name,
     )
     return True
 

@@ -19,6 +19,10 @@ N_MEMBERS = 8
 
 ENV = "VLLM_TPU_DECODE_TP_AR"
 MAX_ROWS_ENV = "VLLM_TPU_DECODE_TP_AR_MAX_ROWS"
+# q38 L3 D68: pad row counts that are not a multiple of 16 up to the next multiple of 16 so H8 still takes them
+# (the zero rows add nothing to any member's sum; the real rows are sliced back). Unset / empty = off (the old
+# lax.psum fallback at those rows). Only "1" turns it on; anything else raises, so a typo cannot serve stock.
+PAD16_ENV = "VLLM_TPU_DECODE_TP_AR_PAD16"
 MODES = {"h8": "bf16", "h8x": "f32"}  # mode -> H8 wire
 
 
@@ -41,34 +45,69 @@ def max_rows() -> int:
     return value
 
 
+def pad16() -> bool:
+    """D68: True when VLLM_TPU_DECODE_TP_AR_PAD16=1; False when unset or empty. Anything else raises."""
+    value = os.environ.get(PAD16_ENV, "").strip()
+    if value not in ("", "1"):
+        raise ValueError(f"{PAD16_ENV}={value!r}: expected '' (off) or '1'")
+    return value == "1"
+
+
+def padded_rows(rows: int, hidden: int, dtype, max_rows_: int, pad16_: bool) -> int:
+    """The row count H8 runs for a [rows, hidden] partial: ``rows`` itself when H8 takes it; with ``pad16_``, the
+    next multiple of 16 when H8 takes that; else 0 (the lax.psum fallback)."""
+    from vllm_torchtpu.kernels.collectives import tp8_hier_all_reduce as h8
+
+    if h8.supports(rows, hidden, dtype, max_rows_):
+        return rows
+    if pad16_ and rows > 0 and rows % 16:
+        up = -(-rows // 16) * 16
+        if h8.supports(up, hidden, dtype, max_rows_):
+            return up
+    return 0
+
+
 def compile_factors() -> dict[str, str]:
-    """The compile-key factors of this lever: empty when off (so every key is unchanged)."""
+    """The compile-key factors of this lever: empty when off (so every key is unchanged). PAD16 joins the key only
+    when it is set, so keys without it are unchanged."""
     m = mode()
     if not m:
         return {}
-    return {ENV: m, MAX_ROWS_ENV: str(max_rows())}
+    factors = {ENV: m, MAX_ROWS_ENV: str(max_rows())}
+    if pad16():
+        factors[PAD16_ENV] = "1"
+    return factors
 
 
-def local_body(x, *, axis: str, pairs, wire: str, max_rows_: int, interpret=False):
+def local_body(x, *, axis: str, pairs, wire: str, max_rows_: int, interpret=False, pad16_: bool = False):
     """One member's all-reduce of its [rows, hidden] partial (inside shard_map). Rows are static here.
-    ``interpret``: the Pallas TPU interpreter (CPU tests only)."""
+    ``interpret``: the Pallas TPU interpreter (CPU tests only). ``pad16_`` (D68): rows that are not a multiple of 16
+    are zero-padded to the next multiple of 16 for H8 and sliced back, when H8 takes the padded count."""
+    import jax.numpy as jnp
     from jax import lax
 
     from vllm_torchtpu.kernels.collectives import tp8_hier_all_reduce as h8
 
     rows, hidden = x.shape
-    if h8.supports(rows, hidden, x.dtype, max_rows_):
+    run = padded_rows(rows, hidden, x.dtype, max_rows_, pad16_)
+    if run == rows:
         return h8.tp8_hier_all_reduce_local(x, axis=axis, pairs=pairs, ag="fwd", wire=wire, interpret=interpret)
+    if run:
+        xp = jnp.pad(x, ((0, run - rows), (0, 0)))
+        out = h8.tp8_hier_all_reduce_local(xp, axis=axis, pairs=pairs, ag="fwd", wire=wire, interpret=interpret)
+        return out[:rows]
     return lax.psum(x, axis)
 
 
-def global_fn(mesh, *, axis: str, pairs, wire: str, max_rows_: int, interpret=False):
+def global_fn(mesh, *, axis: str, pairs, wire: str, max_rows_: int, interpret=False, pad16_: bool = False):
     """The op's JAX function: x [N * rows, hidden] sharded on axis 0 over ``mesh`` -> same layout, each member's
     block replaced by the sum of all members' blocks."""
     from jax.sharding import PartitionSpec
 
     spec = PartitionSpec(axis)
-    body = functools.partial(local_body, axis=axis, pairs=pairs, wire=wire, max_rows_=max_rows_, interpret=interpret)
+    body = functools.partial(
+        local_body, axis=axis, pairs=pairs, wire=wire, max_rows_=max_rows_, interpret=interpret, pad16_=pad16_
+    )
 
     def fn(x: jax.Array) -> jax.Array:
         return jax.shard_map(body, mesh=mesh, in_specs=(spec,), out_specs=spec, check_vma=False)(x)
