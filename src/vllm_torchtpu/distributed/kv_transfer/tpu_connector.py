@@ -36,7 +36,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -599,15 +599,22 @@ def stage3_fa_raiden_id_fields(
 _env_predicate_cache: dict[str, bool] = {}
 
 
-def _use_raiden_stage3_transport() -> bool:
-    if host_trims.ENABLED:
-        v = _env_predicate_cache.get("stage3")
-        if v is None:
-            v = _env_predicate_cache["stage3"] = (
-                str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
-            )
-        return v
+def _cached_env_predicate(name: str, compute: Callable[[], bool]) -> bool:
+    """`compute()`, answered once per process under the batch-1 rule."""
+    if not host_trims.ENABLED:
+        return compute()
+    v = _env_predicate_cache.get(name)
+    if v is None:
+        v = _env_predicate_cache[name] = compute()
+    return v
+
+
+def _raiden_stage3_transport() -> bool:
     return str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
+
+
+def _use_raiden_stage3_transport() -> bool:
+    return _cached_env_predicate("stage3", _raiden_stage3_transport)
 
 
 def _use_per_layer_pool_tags() -> bool:
@@ -719,12 +726,9 @@ def _resolved_reshard_controller_address(dp_rank: int) -> str:
 
 
 def _use_raiden_glm_admission() -> bool:
-    if host_trims.ENABLED:
-        v = _env_predicate_cache.get("glm")
-        if v is None:
-            v = _env_predicate_cache["glm"] = bool(tpu_envs.use_raiden_glm_admission())
-        return v
-    return tpu_envs.use_raiden_glm_admission()
+    return _cached_env_predicate(
+        "glm", lambda: bool(tpu_envs.use_raiden_glm_admission())
+    )
 
 
 def _use_raiden_dsv4_admission() -> bool:
