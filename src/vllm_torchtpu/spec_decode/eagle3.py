@@ -277,9 +277,8 @@ class Eagle3Proposer:
         self._mtp_fused_loop_max_p: int = 0
         self._prep_step1_inputs: bool = False
         self._last_prep_step1: tuple[torch.Tensor, torch.Tensor] | None = None
-        # Greedy draft head for TPU_GREEDY_TOP_TOKENS: the draft's head owner,
-        # or a _DraftHeadOwnerProxy over a quantized lm-head proxy
-        # (TPU_DRAFT_LM_HEAD_QUANT). None: compute_logits + argmax.
+        # Greedy draft head for greedy top tokens: the head owner that
+        # _init_draft_greedy_head resolves. None: compute_logits + argmax.
         self._draft_greedy_head_owner: torch.nn.Module | None = None
         # Whether the draft's MoE layers were admitted to sequence-parallel
         # MoE (main #1562: the MTP drafter runs under SP like the target).
@@ -1375,9 +1374,8 @@ class Eagle3Proposer:
         if d2t is None:
             owner = self._draft_greedy_head_owner
             if owner is not None:
-                # TPU_GREEDY_TOP_TOKENS: the vocab-parallel argmax, over the
-                # quantized draft head proxy when TPU_DRAFT_LM_HEAD_QUANT
-                # set one.
+                # Greedy top tokens: the vocab-parallel argmax over the
+                # draft's BF16 head.
                 # torch's Module.__getattr__ stub types the owner's
                 # logits_processor submodule as Module | Tensor.
                 # pyrefly: ignore[missing-attribute]

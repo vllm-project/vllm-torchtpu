@@ -22,7 +22,7 @@ One compiled program cannot do both, so steps 1+ run this one: the same draft
 forward over the same weights, KV caches and top-k table, first traced while
 ``skip_topk`` is True.
 
-The MTP step-0 post-attention gather (``TPU_MTP_STEP0_POST_ATTN_GATHER``) has
+The MTP step-0 post-attention gather (installed by the Qwen3.5 model patch) has
 the same shape of problem: step 0 traces with the gather, steps 1+ without.
 ``build_mtp_loop_step_model`` compiles this program with the draft's own
 dynamic dims (Qwen3.5 marks ``positions`` -1 for MRoPE), which the fixed
