@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 Stage = Literal[
     "import",
     "platform_import",
+    "general_plugin",
     "platform_activation",
     "engine_core",
     "worker_init",
@@ -122,6 +123,11 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
+    # Before create_engine_config resolves --device-ids.
+    Patch(
+        "vllm_torchtpu.distributed.tpu_multiport_dp:install_device_ids_patch",
+        ("general_plugin",),
+    ),
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
     Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
@@ -247,6 +253,7 @@ def apply(
     if stage not in (
         "import",
         "platform_import",
+        "general_plugin",
         "platform_activation",
         "engine_core",
         "worker_init",
