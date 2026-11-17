@@ -25,12 +25,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.megablox import common
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
     gmm_v2,
     interleave_lane,
+    lhs_quant_block_size,
+    make_gmm_configs,
     situ_and_mul,
 )
 
@@ -85,6 +89,60 @@ def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
 
     actual = apply_act_fn(interleave_lane(gate, up), f"situ:4.0:{linear_beta}")
     _assert_allclose(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "rhs_block_size, size_k, expected",
+    [
+        (512, 5120, 512),
+        (1024, 5120, 512),
+        (2560, 2560, 512),
+        (640, 640, 512),
+        (256, 2560, 256),
+        (768, 6144, 256),
+        (384, 1536, 128),
+        (320, 1280, None),
+    ],
+)
+def test_lhs_quant_block_size_stays_inside_rhs_blocks(
+    monkeypatch, rhs_block_size, size_k, expected
+):
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: SimpleNamespace(num_lanes=128))
+    assert lhs_quant_block_size(rhs_block_size, size_k) == expected
+
+
+@pytest.mark.parametrize(
+    "rhs_block_size, size_k, expected_dtype, expected_block_size",
+    [
+        (512, 1536, jnp.float8_e4m3fn, 512),
+        (256, 1536, jnp.float8_e4m3fn, 256),
+        (320, 1280, None, 512),
+    ],
+)
+def test_make_gmm_configs_lhs_quant_block_size(
+    monkeypatch, rhs_block_size, size_k, expected_dtype, expected_block_size
+):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    num_groups, size_m, size_n = 4, 16, 256
+    cfgs = make_gmm_configs(
+        jax.ShapeDtypeStruct((size_m, size_k), jnp.bfloat16),
+        jax.ShapeDtypeStruct((num_groups, size_k, size_n), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct(
+            (num_groups, size_k // rhs_block_size, 1, size_n), jnp.float32
+        ),
+        None,
+        jax.ShapeDtypeStruct((num_groups,), jnp.int32),
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        tile_info=TileSizes(16, size_k, size_n, 16),
+        vmem_limit_bytes=info.vmem_capacity_bytes,
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=True,
+        zero_initialize=False,
+    )
+    assert cfgs.lhs_cfgs.quant_dtype == expected_dtype
+    assert cfgs.lhs_cfgs.quant_block_size == expected_block_size
 
 
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
@@ -253,6 +311,60 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
     ).astype(lhs.dtype)
 
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "weight_dtype", [jnp.float8_e4m3fn, jnp.float4_e2m1fn, jnp.int8]
+)
+@pytest.mark.parametrize(
+    "block_size, tile_k",
+    [(256, 1536), (256, 512), (384, 1536), (512, 1536), (768, 1536)],
+)
+def test_gmm_quantized_lhs_applies_each_rhs_block_scale(
+    weight_dtype, block_size, tile_k
+):
+    """Each rhs scale block gets its own scale when gmm_v2 quantizes the lhs.
+
+    Neighboring rhs block scales differ by 8x and K tiles hold several rhs
+    blocks, so an lhs quantization block that straddles rhs blocks applies a
+    wrong scale and shows up as a large error.
+    """
+    _require_tpu()
+    if weight_dtype == jnp.float4_e2m1fn and common.tpu_generation() < 7:
+        pytest.skip("Mosaic unpacks native fp4 only on TPU v7+.")
+
+    batch_size = 128
+    in_size = 1536
+    out_size = 256
+    num_groups = 4
+    lhs_key, rhs_key = jax.random.split(jax.random.key(0))
+
+    lhs = jax.random.uniform(lhs_key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        rhs_key, (num_groups, in_size, out_size), jnp.float32, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(rhs, weight_dtype, axis=1, block_size=block_size)
+    num_blocks = in_size // block_size
+    block_factor = jnp.where(jnp.arange(num_blocks) % 2 == 0, 1.0, 8.0)
+    rhs_scale = rhs_scale * block_factor[None, :, None]
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_gmm(lhs, rhs_q, group_sizes, rhs_scale=rhs_scale)
+    actual = gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        tile_info=TileSizes(tile_m=128, tile_k=tile_k, tile_n=256, bucket_base=128),
+        maybe_quantize_lhs=True,
+    )
+
+    actual = np.asarray(actual, dtype=np.float32)
+    expected = np.asarray(expected, dtype=np.float32)
+    rel_error = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+    assert rel_error < 0.05
 
 
 @pytest.mark.tpu_test
