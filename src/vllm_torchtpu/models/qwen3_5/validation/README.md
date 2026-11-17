@@ -3,35 +3,53 @@
 One YAML file per serving configuration that Qwen3.5 changes are validated
 against:
 
-- `pNN-*.yaml`: the five InferenceX (IX) points of sheet
-  `ix-tpu-pd-cand4-llmd-oct28`, each a prefill/decode disaggregated
-  deployment. `record` names the job behind the published number and the tree
-  it ran; `recipe` names the cloud-devkit-recipes file that launched it.
+- `pNN-*.yaml`: five points of the InferenceX benchmark submission for
+  Qwen3.5-397B-A17B-FP8, each a prefill/decode disaggregated deployment.
+  `pNN` is the point's number on the submitted throughput/interactivity curve
+  and `band-X` its interactivity band, from A (lowest interactivity, highest
+  throughput per dollar) to H. The rest of the name is the decode layout, the
+  prefill and decode replica counts (`4p3d`: four prefill and three decode
+  replicas), the decode leg's `--max-num-seqs` (`capN`) and the benchmark
+  concurrency (`cN`); p12's `t3` marks the batch-1 host trims its
+  `decode_layout` names.
 - `gate-*.yaml`: the 1P1D accuracy gates, one per decode layout. Each runs
   its `arms` back to back and reports the `suite`.
 
 ## Reading a point entry
 
+`record` holds the published result of the point: Mtok/$ and p90
+interactivity (tokens per second per user). The record run used an earlier,
+unreleased tree of this repository (the submission tree), so `record` also
+notes that tree's decode megakernel mode, which this tree does not have: run
+the decode megakernel off here.
+
 Each leg (`prefill`, `decode`) lists:
 
 - `replicas` and `chips_per_replica` (one tpu7x host, 8 devices, per
   replica); `chips` is their total over both legs.
-- `serve_args`: the `vllm serve` arguments the record job's leg ran, from its
-  rendered recipe. `$MODEL` and `$SERVED_MODEL` are the recipe's model path
-  and served name.
+- `serve_args`: the `vllm serve` arguments the record run's leg used.
+  `$MODEL` and `$SERVED_MODEL` are the model path and served name.
 - `env`: the environment the leg set, limited to variables this package
   declares in `envs.py`. Per-pod wiring (ports, hosts, engine ids, cache
-  directories) stays in the recipe.
+  directories) is deployment-specific and not recorded.
 - `additional_config`: the `--additional-config` JSON for the leg. The
   `qwen3_5` section holds Qwen3.5 settings (`settings.py`); other sections
   belong to shared subsystems.
 
-The record jobs ran the submission tree named in `record.tree` (branch
-`infx-qwen35-agentx-disagg-candidate4`), whose environment variables are being
-turned into settings, rules or `additional_config` options change by change.
-Each change that turns one the points use into a setting or section adds it to
-the entries, so the entries describe how to run the points on the tree they
-are in. Run the decode megakernel off on this tree: it is not on `main` yet.
+The decode legs run MTP with synthetic rejection sampling at a fixed
+acceptance length of 3.39 (`--speculative-config`), the acceptance length the
+InferenceX benchmark fixes for this model, so the `record` numbers are at
+that acceptance length. The gates use real rejection sampling and report the
+real acceptance length.
+
+The submission tree's environment variables are being turned into settings,
+rules or `additional_config` options change by change, and each change that
+turns one that the points use into a setting or section updates the entries.
+A value that this tree cannot run yet is kept as the record run used it and
+listed under `not_yet_supported`, per leg, with the capability it needs; the
+change that adds the capability removes it from that list. Everything else
+in an entry runs on the tree it is in, and the entry tests check that this
+tree's `envs.py` accepts every other environment value.
 
 ## Reading a gate entry
 
@@ -39,4 +57,4 @@ are in. Run the decode megakernel off on this tree: it is not on `main` yet.
 the listed `serve_args_override`. `arms` differ only in `additional_config`;
 the changes that add the FP8 trade-off settings add them to `tradeoffs_on`.
 `references` are earlier gates at the same layout (GSM8K strict-match, 1,319
-samples, thinking on).
+samples, thinking on), with the tree each ran described in words.

@@ -15,7 +15,7 @@
 # decode replica. See README.md in this directory.
 name: gate-dp4tp2-1p1d
 purpose: >-
-  Accuracy of the main-based stack at the DP4 x TP2 decode layout, and the
+  Accuracy of this tree at the DP4 x TP2 decode layout, and the
   cost of the Qwen3.5 FP8 trade-off settings, measured as an on/off pair.
   The submission tree's own gate at this layout showed a real acceptance
   length 2.9% below the previous candidate's, cause not isolated.
@@ -49,6 +49,6 @@ suite:
 noise:
   gsm8k_1319_samples: "+-0.42%"
 references:
-  - {job: j-47daeba0, tree: f0e45f677, layout: "DP4 x TP2, submission tree", gsm8k: "97.73%", real_acceptance_length: 3.2528}
-  - {job: j-e4fb560f, tree: infx-qwen35-agentx-disagg-candidate3, layout: "DP4 x TP2", gsm8k: "97.50%", real_acceptance_length: 3.3498}
-  - {job: j-09687ab0, tree: dp4tp2 frozen, layout: "DP4 x TP2", gsm8k: "97.80%", longbench_job: j-180bd829, longbench: "65.41%"}
+  - {tree: "the submission tree", layout: "DP4 x TP2", gsm8k: "97.73%", real_acceptance_length: 3.2528}
+  - {tree: "the previous submission candidate", layout: "DP4 x TP2", gsm8k: "97.50%", real_acceptance_length: 3.3498}
+  - {tree: "an earlier DP4 x TP2 tree", layout: "DP4 x TP2", gsm8k: "97.80%", longbench: "65.41%"}
