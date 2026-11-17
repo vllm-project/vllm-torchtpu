@@ -805,9 +805,14 @@ _BUILD_CACHE_LOCK = threading.Lock()
 
 
 def ffn_kernel(**kwargs):
-    """build_ffn_kernel, memoized on its arguments. The cache is unbounded:
-    one program per (token bucket, format, bias set, activation, config)."""
-    key = tuple(sorted(kwargs.items()))
+    """build_ffn_kernel, memoized on its arguments and on
+    layout.SHARD_INDEX_OPERAND, which the build reads (the operand mode adds
+    one scalar-prefetch table and changes the unpacking), so a build made in
+    one mode is never handed to the other. The cache is unbounded: one
+    program per (token bucket, format, bias set, activation, config, mode)."""
+    key = tuple(sorted(kwargs.items())) + (
+        ("layout.SHARD_INDEX_OPERAND", layout.SHARD_INDEX_OPERAND),
+    )
     run = _BUILD_CACHE.get(key)
     if run is None:
         with _BUILD_CACHE_LOCK:
