@@ -268,6 +268,10 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         # One write op for every layer's DCP-sharded context K/V, set by
         # `prepare_draft_kv_write` once the layers' attention is set up.
         self._sharded_kv_write_op = None
+        # Every layer's K/V columns of qkv_proj side by side ([hidden,
+        # layers * 2 * kv_size]), set by `prepare_draft_kv_write` when each is
+        # a plain matrix: one matmul for all layers' context K/V.
+        self.register_buffer("context_kv_weight", None, persistent=False)
 
     def prepare_draft_kv_write(self) -> None:
         """Build the all-layer DCP-sharded K/V write (outside any compiled
@@ -288,6 +292,16 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
             self._sharded_kv_write_op = write_layers_op(
                 *configs.pop(), len(self.layers)
             )
+        if self._sharded_kv_write_op is None:
+            return  # the concatenated K/V columns serve that write only
+        weights = []
+        for layer in self.layers:
+            attn = layer.self_attn
+            weight = _flipped_weight(attn.qkv_proj, torch.bfloat16)
+            if weight is None:
+                return
+            weights.append(weight[:, attn.q_size :])
+        self.context_kv_weight = torch.cat(weights, dim=1)
 
     @staticmethod
     def _roped_context_kv(attn: nn.Module, context: torch.Tensor, positions):
@@ -296,12 +310,26 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         k, _ = attn.rotary_emb(positions, k, None)
         return k, v
 
+    def _layers_context_kv(self, context: torch.Tensor) -> list:
+        """Each layer's context ``(k, v)``, from one matmul when
+        `context_kv_weight` is set."""
+        weight = self.context_kv_weight
+        if weight is None or weight.dtype != context.dtype:
+            return [_context_kv(layer.self_attn, context) for layer in self.layers]
+        kv = torch.matmul(context, weight)
+        sizes = [layer.self_attn.kv_size for layer in self.layers for _ in "kv"]
+        parts = kv.split(sizes, dim=-1)
+        return list(zip(parts[0::2], parts[1::2], strict=True))
+
     def _write_sharded_context_kv(self, context, positions, metadata) -> None:
         """Every layer's context K/V through the one all-layer write."""
         keys, values = [], []
-        for layer in self.layers:
+        for layer, (k, v) in zip(
+            self.layers, self._layers_context_kv(context), strict=True
+        ):
             attn = layer.self_attn
-            k, v = self._roped_context_kv(attn, context, positions)
+            k = _per_head_norm(k, attn.k_norm, attn.head_dim)
+            k, _ = attn.rotary_emb(positions, k, None)
             shape = (context.shape[0], attn.num_kv_heads, attn.head_dim)
             keys.append(k.reshape(shape))
             values.append(v.reshape(shape))
