@@ -1063,7 +1063,14 @@ def test_moe_tp_decode_arming_on_tiny_target_and_drafter_model(monkeypatch, poli
     monkeypatch.setattr(moe_tp_decode, "_get_op", _get_op)
     monkeypatch.setattr(moe_tp_decode, "_selftest", lambda topo, buckets, device: [])
     monkeypatch.setattr(moe_tp_decode, "_RANK_BUFFER", None)
-    monkeypatch.setattr(moe_tp_decode, "_SELFTEST_DONE", False)
+    # moe_tp_decode records its self-test either as one flag (_SELFTEST_DONE)
+    # or per bucket (_SELFTESTED_BUCKETS, with #2885); reset whichever this
+    # tree defines so arming runs here and teardown restores it.
+    selftest_reset = {"_SELFTEST_DONE": False, "_SELFTESTED_BUCKETS": set()}
+    selftest_names = [n for n in selftest_reset if hasattr(moe_tp_decode, n)]
+    assert selftest_names, "moe_tp_decode has no self-test record to reset"
+    for name in selftest_names:
+        monkeypatch.setattr(moe_tp_decode, name, selftest_reset[name])
 
     nvfp4_cfg = _make_nvfp4_config(
         ["model.layers.1*"],
