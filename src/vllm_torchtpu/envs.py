@@ -243,6 +243,8 @@ if TYPE_CHECKING:
     TPU_PP_EXTRA_STEPS_IN_FLIGHT: int = -1
     TPU_PP_RING_VERIFY: int = 0
     TPU_PP_RING_VERIFY_MUTANT: int = -1
+    TPU_PP_WARMUP_BARRIER: bool = False
+    TPU_PP_MTP_WARMUP_BARRIER: bool = False
     TPU_PP_SPREAD_MAX_PREFIX: int = 0
     TPU_PP_WARM_FIRST: bool = False
     TPU_PP_WARM_FIRST_AGING: float = 10000.0
@@ -1903,6 +1905,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # digests a copy of what it received with one bit flipped, so its link
     # must report mismatches; the forward reads the unchanged tensor. -1: off.
     "TPU_PP_RING_VERIFY_MUTANT": env_int("TPU_PP_RING_VERIFY_MUTANT", -1),
+    # Pipeline stages meet at a host barrier (the world group's CPU group)
+    # after each has compiled its standalone forwards and before the
+    # hand-off warmup runs every bucket through the stages in step. Without
+    # it a stage that finishes compiling more than 300 s after its upstream
+    # neighbour trips the ring's cross-host descriptor wait (c10d store
+    # timeout; q38 b1 lever P j-8b02d3ec, IX l5p1), which uneven layer
+    # partitions (VLLM_PP_LAYER_PARTITION) and cold compiles make likely.
+    # Host-only, startup-only: in the compile-key ignore set.
+    "TPU_PP_WARMUP_BARRIER": env_bool("TPU_PP_WARMUP_BARRIER"),
+    # The same host barrier before each prompt length of the pipeline MTP
+    # prefill warmup (runner _warmup_mtp_prefill). The last stage
+    # cold-compiles its draft inside the first prompt, after posting that
+    # step's receive, so the stages ahead of it send the next prompt's
+    # hand-off and wait on the ring's cross-host descriptor (c10d store,
+    # 300 s) for as long as the compile takes (q38 x1c r j-ab73d6ff: PP3-PP6
+    # timed out while PP7 compiled 12 draft programs). With it, that skew
+    # waits in the barrier, under the CPU group's own timeout (PyTorch's
+    # gloo default, 1800 s). Host-only, startup-only: in the compile-key
+    # ignore set.
+    "TPU_PP_MTP_WARMUP_BARRIER": env_bool("TPU_PP_MTP_WARMUP_BARRIER"),
     # Pipeline chunk scheduler: pending prefill of requests that have at least
     # this many tokens computed is left out of the spread over the stages, so
     # their chunks are cut by the step's time budget alone (full steps at long

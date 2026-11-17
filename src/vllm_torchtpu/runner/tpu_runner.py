@@ -7802,6 +7802,13 @@ class TPUModelRunner(GPUModelRunner):
         one forward alone has none, so each stage settles the burst right
         after each forward; those launches carry the prefill on to the last
         stage, whose forward waits for it.
+
+        With TPU_PP_MTP_WARMUP_BARRIER the stages also meet at the host
+        barrier of ``_pp_warmup_barrier`` before each prompt length. The last
+        stage cold-compiles its draft inside the first one, after it has
+        posted that step's receive; without the barrier the stages ahead of
+        it send the next prompt's hand-off and wait for its receive on the
+        ring's cross-host descriptor, whose store times out after 300 s.
         """
         if not envs.SPEC_WARMUP:
             return
@@ -7827,6 +7834,11 @@ class TPUModelRunner(GPUModelRunner):
             for P in prompt_lens:
                 if pipeline:
                     assert self._pp_wave is not None
+                    if envs.TPU_PP_MTP_WARMUP_BARRIER:
+                        # q38 HIGHC-PPRING: every stage has finished the previous
+                        # prompt, the last stage's draft compile included, before
+                        # any stage sends this one's hand-off (x1c r j-ab73d6ff).
+                        self._pp_warmup_barrier(f"MTP prefill warmup P={P}")
                     try:
                         warmed = self._warmup_one_mtp_prefill(P)
                     finally:
@@ -7959,6 +7971,8 @@ class TPUModelRunner(GPUModelRunner):
         own.
         """
         assert self._pp_wave is not None
+        if envs.TPU_PP_WARMUP_BARRIER:
+            self._pp_warmup_barrier()
         started = time.perf_counter()
         for num_tokens in self.num_tokens_paddings:
             self._dummy_run(
@@ -7983,6 +7997,32 @@ class TPUModelRunner(GPUModelRunner):
         logger.info(
             "Pipeline hand-off warmup: %d buckets in %.1f s",
             len(self.num_tokens_paddings),
+            time.perf_counter() - started,
+        )
+
+    def _pp_warmup_barrier(self, what: str = "hand-off warmup") -> None:
+        """Meet every pipeline stage before the hand-off warmup
+        (TPU_PP_WARMUP_BARRIER), or before one prompt length of the MTP
+        prefill warmup (TPU_PP_MTP_WARMUP_BARRIER); ``what`` names it in
+        the log line.
+
+        Each stage compiles its standalone forwards on its own, so stages
+        reach the hand-off warmup as far apart as their compile times. The
+        warmup's first transfer then waits on the ring's cross-host
+        descriptor, whose store times out after 300 s. A barrier on the
+        world group's CPU (gloo) group, after this stage's device work has
+        drained, absorbs that skew under the process group's own timeout,
+        so the warmup starts with every stage compiled.
+        """
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_world_group
+
+        started = time.perf_counter()
+        synchronize_device()
+        dist.barrier(group=get_world_group().cpu_group)
+        logger.info(
+            "Pipeline %s barrier: waited %.1f s for the other stages",
+            what,
             time.perf_counter() - started,
         )
 

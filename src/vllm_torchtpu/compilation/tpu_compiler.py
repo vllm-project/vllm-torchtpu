@@ -343,6 +343,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PP_EXTRA_STEPS_IN_FLIGHT",
     "TPU_PP_RING_VERIFY",
     "TPU_PP_RING_VERIFY_MUTANT",
+    # Startup-only host barrier before the hand-off warmup: the compiled
+    # forwards are the same either way.
+    "TPU_PP_WARMUP_BARRIER",
+    # The same barrier before each prompt length of the MTP prefill warmup.
+    "TPU_PP_MTP_WARMUP_BARRIER",
     # The chunk scheduler's spread (engine side): it changes which buckets
     # steps use, not the compiled programs.
     "TPU_PP_SPREAD_MAX_PREFIX",
