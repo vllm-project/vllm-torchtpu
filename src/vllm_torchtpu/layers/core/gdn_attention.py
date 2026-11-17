@@ -17,6 +17,8 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 
 import functools
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -73,6 +75,7 @@ def run_jax_gdn_attention(
     kernel_size: int,
     mesh: jax.sharding.Mesh,
     num_spec_tokens: int = 0,
+    conv1d_gdn_kernel: Callable[..., Any] | None = None,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -106,6 +109,8 @@ def run_jax_gdn_attention(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
+        conv1d_gdn_kernel: The attention backend's fused conv1d + GDN kernel
+          (TPUAttentionBackend.conv1d_gdn_kernel); None runs GDN v3.
 
     Returns:
         A tuple containing:
@@ -147,7 +152,7 @@ def run_jax_gdn_attention(
     tp_size = get_mesh_shape_product(mesh, "model")
 
     p_run_jax_gdn_attention_local = functools.partial(
-        gdn_v3_wrapper.fused_conv1d_gdn,
+        conv1d_gdn_kernel or gdn_v3_wrapper.fused_conv1d_gdn,
         n_kq=n_kq // tp_size,
         n_v=n_v // tp_size,
         d_k=d_k,
