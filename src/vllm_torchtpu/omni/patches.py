@@ -22,11 +22,14 @@ apply_omni_model_specific_patches() at attention backend selection
 patch_registry.py.
 """
 
+import functools
+import inspect
 from functools import cache as run_once
 from typing import Any
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -84,6 +87,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_qwen_image_prefix_mask()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -422,10 +426,15 @@ def _patch_sdpa_fallback_dispatch() -> None:
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
-    from vllm_torchtpu.omni.attention import TpuSDPAImpl
+    from vllm_torchtpu.omni.attention import (
+        TpuSDPAImpl,
+        _get_split_splash_op,
+    )
 
     if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
         return
+    if envs.VLLM_TPU_OMNI_SPLIT_SPLASH and not torch.compiler.is_compiling():
+        _get_split_splash_op()
     # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
     setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
     SDPAImpl.forward = TpuSDPAImpl.forward
@@ -645,3 +654,120 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_QWEN_IMAGE_PREFIX_MASK_PATCHED = "_tpu_qwen_image_prefix_mask_patched"
+_EXPECTED_QWEN_CROSS_ATTN_PARAMS = (
+    "self",
+    "hidden_states",
+    "encoder_hidden_states",
+    "vid_freqs",
+    "txt_freqs",
+    "hidden_states_mask",
+    "encoder_hidden_states_mask",
+    "qk_norm_rope_table",
+)
+
+
+class _PrefixLenAttnProxy:
+    """Stands in for a QwenImageCrossAttention to tag its attention metadata.
+
+    Every attribute resolves to the wrapped module except ``attn``, which
+    records the text prefix length on the metadata the upstream forward built.
+    """
+
+    def __init__(self, module: Any, prefix_len: int) -> None:
+        self._module = module
+        self._prefix_len = prefix_len
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+    def attn(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: Any | None = None,
+    ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            attn_metadata.attn_mask = attn_metadata.attn_mask.to(dtype=torch.bool)
+            attn_metadata.extra["prefix_mask_len"] = self._prefix_len
+        return self._module.attn(query, key, value, attn_metadata)
+
+
+def _patch_qwen_image_prefix_mask() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's QwenImageCrossAttention passes the known
+    # text prefix length in AttentionMetadata.extra (or avoids constructing a
+    # joint key mask when hidden_states_mask is None).
+    #
+    # Problem: QwenImagePipeline always passes encoder_hidden_states_mask, so
+    #   QwenImageCrossAttention concatenates [encoder_hidden_states_mask, 1s]
+    #   into AttentionMetadata(attn_mask=joint_mask) without recording where
+    #   the text prefix ends. TpuFlashAttentionImpl then falls back to PyTorch
+    #   SDPA on the full (S_txt + S_img) sequence.
+    # Fix: When VLLM_TPU_OMNI_SPLIT_SPLASH=1, non-SP calls with
+    #   hidden_states_mask is None and encoder_hidden_states_mask is not None
+    #   run the upstream forward on a proxy whose attn() records
+    #   extra={"prefix_mask_len": seq_len_txt} on the AttentionMetadata, so
+    #   TpuSDPAImpl can split at seq_len_txt without host mask checks.
+    # -------------------------------------------------------------------------
+    if not envs.VLLM_TPU_OMNI_SPLIT_SPLASH:
+        return
+
+    from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+
+    attn_cls = qwen_image_transformer.QwenImageCrossAttention
+    if getattr(attn_cls.forward, _QWEN_IMAGE_PREFIX_MASK_PATCHED, False):
+        return
+
+    orig_forward = attn_cls.forward
+    actual_params = tuple(inspect.signature(orig_forward).parameters)
+    if actual_params != _EXPECTED_QWEN_CROSS_ATTN_PARAMS:
+        logger.warning(
+            "Skipping QwenImageCrossAttention prefix-mask patch: upstream "
+            "forward signature changed to %s.",
+            actual_params,
+        )
+        return
+
+    attn_cls._tpu_orig_forward = orig_forward
+
+    @functools.wraps(orig_forward)
+    def _prefix_masked_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        vid_freqs: torch.Tensor,
+        txt_freqs: torch.Tensor,
+        hidden_states_mask: torch.Tensor | None = None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sp_active = (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+        )
+        target = self
+        if not (
+            sp_active
+            or self.reference_precision
+            or hidden_states_mask is not None
+            or encoder_hidden_states_mask is None
+        ):
+            target = _PrefixLenAttnProxy(self, encoder_hidden_states.shape[1])
+        return orig_forward(
+            target,
+            hidden_states,
+            encoder_hidden_states,
+            vid_freqs,
+            txt_freqs,
+            hidden_states_mask=hidden_states_mask,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            qk_norm_rope_table=qk_norm_rope_table,
+        )
+
+    setattr(_prefix_masked_forward, _QWEN_IMAGE_PREFIX_MASK_PATCHED, True)
+    attn_cls.forward = _prefix_masked_forward
+    logger.info("Applied TPU patch: QwenImageCrossAttention prefix_mask_len metadata.")

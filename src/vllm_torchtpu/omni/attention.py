@@ -15,9 +15,13 @@
 
 ``TpuFlashAttentionBackend`` (the default) runs unmasked, non-causal
 bf16 attention through a Pallas flash kernel tuned for diffusion
-sequence lengths. Masked, causal, or non-bf16 calls fall back with a
-one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
+sequence lengths. Masked, causal, or non-bf16 calls delegate to
+``TpuSDPAImpl``, which runs PyTorch SDPA by default and, when
+``VLLM_TPU_OMNI_SPLIT_SPLASH=1``, dispatches eligible prefix-masked
+joint ``[text, image]`` calls to LSE-merged Pallas Split-Splash.
 """
+
+from __future__ import annotations
 
 from functools import cache as run_once
 from typing import Any
@@ -25,16 +29,97 @@ from typing import Any
 import jax
 import torch
 from torch_tpu._internal import pallas
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.diffusion_attention.kernel import flash_attention_bshd
+from vllm_torchtpu.kernels.diffusion_attention.split_splash_attention import (
+    is_split_splash_supported,
+    split_splash_attention,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 
+@run_once
+def _get_split_splash_op():
+    """Builds the torch custom op wrapping prefix-masked Split-Splash."""
+
+    def core(
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        mask: jax.Array,
+        prefix_len: int,
+        scale: float,
+    ) -> jax.Array:
+        return split_splash_attention(
+            q, k, v, mask, prefix_len=prefix_len, softmax_scale=scale
+        )
+
+    op = pallas.jax_op("pallas::omni_split_splash_masked", core)
+    op.register_fake(lambda q, k, v, mask, prefix_len, scale: torch.empty_like(q))
+    return op
+
+
+def _prefix_mask_len_for_split_splash(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: AttentionMetadata | None,
+    causal: bool,
+) -> int | None:
+    if (
+        not envs.VLLM_TPU_OMNI_SPLIT_SPLASH
+        or attn_metadata is None
+        or query.device.type != "tpu"
+        or query.ndim != 4
+        or key.shape != query.shape
+        or value.shape != query.shape
+        or query.dtype != torch.bfloat16
+        or key.dtype != query.dtype
+        or value.dtype != query.dtype
+    ):
+        return None
+    if (
+        attn_metadata.joint_attn_mask is not None
+        or attn_metadata.joint_query is not None
+    ):
+        return None
+    mask = attn_metadata.attn_mask
+    if (
+        mask is None
+        or mask.ndim != 2
+        or mask.shape != (query.shape[0], key.shape[1])
+        or mask.dtype is not torch.bool
+        or mask.device != query.device
+    ):
+        return None
+    prefix_len = attn_metadata.extra.get("prefix_mask_len")
+    if type(prefix_len) is not int:
+        return None
+    if not is_split_splash_supported(
+        q_seq_len=query.shape[1],
+        kv_seq_len=key.shape[1],
+        head_dim=query.shape[3],
+        q_heads=query.shape[2],
+        kv_heads=key.shape[2],
+        causal=causal,
+        prefix_len=prefix_len,
+    ):
+        return None
+    return prefix_len
+
+
 class TpuSDPAImpl(SDPAImpl):
-    """TPU implementation of SDPA attention for diffusion models."""
+    """TPU implementation of SDPA (and opt-in Split-Splash) for diffusion models."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if envs.VLLM_TPU_OMNI_SPLIT_SPLASH and not torch.compiler.is_compiling():
+            _get_split_splash_op()
 
     def forward(
         self,
@@ -43,13 +128,26 @@ class TpuSDPAImpl(SDPAImpl):
         value: torch.Tensor,
         attn_metadata: Any | None = None,
     ) -> torch.Tensor:
+        scale = (
+            query.shape[-1] ** -0.5
+            if self.softmax_scale is None
+            else float(self.softmax_scale)
+        )
+        prefix_len = _prefix_mask_len_for_split_splash(
+            query, key, value, attn_metadata, self.causal
+        )
+        if prefix_len is not None:
+            assert attn_metadata is not None and attn_metadata.attn_mask is not None
+            return _get_split_splash_op()(
+                query, key, value, attn_metadata.attn_mask, prefix_len, scale
+            )
         return self._forward_impl(
             query, key, value, attn_metadata, mask_mode="broadcast_k"
         )
 
 
 class TpuSDPABackend(SDPABackend):
-    """TPU attention backend for diffusion models using PyTorch SDPA."""
+    """TPU diffusion attention backend using PyTorch SDPA (plus opt-in Split-Splash)."""
 
     @staticmethod
     def get_name() -> str:
@@ -91,7 +189,7 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
         attn_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # TODO: Revisit this fallback once torch_tpu SDPA lets callers select its
         # flash kernel and supports masks; until then masked, causal and non-bf16
-        # calls take PyTorch SDPA.
+        # calls take TpuSDPAImpl (PyTorch SDPA, or opt-in Split-Splash).
         if self.causal:
             reason = "causal=True"
         elif attn_mask is not None:
@@ -119,6 +217,13 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
                 f"num_heads ({query.shape[2]}) must be a multiple of "
                 f"num_kv_heads ({key.shape[2]})"
             )
+        if (
+            _prefix_mask_len_for_split_splash(
+                query, key, value, attn_metadata, self.causal
+            )
+            is not None
+        ):
+            return super().forward(query, key, value, attn_metadata)
         if self._needs_sdpa_fallback(query, key, attn_metadata):
             return super().forward(query, key, value, attn_metadata)
         return self._op(query, key, value, self.softmax_scale)
