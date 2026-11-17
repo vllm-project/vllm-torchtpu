@@ -326,6 +326,7 @@ def meta_runner(synchronize_mock):
     runner.use_spmd = False
     runner.enforce_eager = False
     runner.speculative_config = None
+    runner.pcp_manager = None
     runner.shared_kv_cache_layers = {}
     runner._unified_kv_layout = False
     runner._mamba_num_blocks = None
