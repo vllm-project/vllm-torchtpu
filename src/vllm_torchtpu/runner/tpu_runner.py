@@ -335,26 +335,6 @@ def _rollback_offsets_seed_impl(
     )
 
 
-def _reset_and_rollback_read_offsets_impl(
-    read_offsets: torch.Tensor,
-    keep_dev: torch.Tensor,
-    stacked_groups: torch.Tensor,
-    null: torch.Tensor,
-    dst_t: torch.Tensor,
-) -> None:
-    """Fused new-request read-offset reset + mamba seed crossing rollback in a
-    single compiled TPU program."""
-    if stacked_groups.ndim == 1:
-        stacked_groups = stacked_groups.unsqueeze(0)
-    targets = torch.where(keep_dev, stacked_groups, null)
-    all_targets = torch.cat(
-        [targets.reshape(-1).long(), _clamp_offsets_index(read_offsets, dst_t.long())],
-        dim=0,
-    )
-    zero = torch.zeros((), dtype=read_offsets.dtype, device=read_offsets.device)
-    read_offsets.index_put_((all_targets,), zero)
-
-
 def _spec_seed_and_rollback_impl(
     read_offsets: torch.Tensor,
     state_t: torch.Tensor,
@@ -429,9 +409,6 @@ def _update_read_offsets_verify_impl(
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _stack_mamba_groups_compiled = _tpu_compile(_stack_mamba_groups_impl)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
-_reset_and_rollback_read_offsets_compiled = _tpu_compile(
-    _reset_and_rollback_read_offsets_impl
-)
 _spec_seed_and_rollback_compiled = _tpu_compile(_spec_seed_and_rollback_impl)
 _clear_read_offsets_compiled = _tpu_compile(_clear_read_offsets_impl)
 _update_read_offsets_verify_compiled = _tpu_compile(_update_read_offsets_verify_impl)
@@ -451,21 +428,6 @@ def _stack_or_single_mamba_groups(groups: list[torch.Tensor]) -> torch.Tensor:
         else _stack_mamba_groups_impl
     )
     return fn(*groups)
-
-
-def _reset_and_rollback_read_offsets(
-    read_offsets: torch.Tensor,
-    keep_dev: torch.Tensor,
-    stacked_groups: torch.Tensor,
-    null: torch.Tensor,
-    dst_t: torch.Tensor,
-) -> None:
-    fn = (
-        _reset_and_rollback_read_offsets_compiled
-        if read_offsets.device.type == "tpu"
-        else _reset_and_rollback_read_offsets_impl
-    )
-    fn(read_offsets, keep_dev, stacked_groups, null, dst_t)
 
 
 def _spec_seed_and_rollback(
@@ -1307,7 +1269,6 @@ class TPUModelRunner(GPUModelRunner):
         self.input_ids_cpu = torch.zeros(
             self.max_num_tokens, dtype=torch.int32, device="cpu"
         )
-        self.input_ids_np = self.input_ids_cpu.numpy()
         self.positions_cpu = torch.zeros(
             self.max_num_tokens, dtype=torch.int32, device="cpu"
         )
@@ -6807,30 +6768,6 @@ class TPUModelRunner(GPUModelRunner):
             and not self._is_dspark_pd_producer
         ):
             if is_spec_step:
-                # Two chunks that fit one bucket: the drafter returns chunk 0's
-                # slice only and skips the multi-chunk concat (it consumes and
-                # resets the flag in propose()).
-                drafter = getattr(self, "drafter", None)
-                if (
-                    is_async
-                    and drafter is not None
-                    and len(next_tokens_per_chunk) == 2
-                    and not getattr(
-                        scheduler_output, "has_structured_output_requests", False
-                    )
-                    and getattr(self, "max_num_reqs", None) is not None
-                    and next_tokens_per_chunk[0].device.type == "tpu"
-                    and (
-                        next_tokens_per_chunk[0].shape[0]
-                        + next_tokens_per_chunk[1].shape[0]
-                        <= self.max_num_reqs
-                    )
-                    and (
-                        self.speculative_config is None
-                        or self.speculative_config.draft_tensor_parallel_size != 1
-                    )
-                ):
-                    drafter._skip_next_multi_chunk_draft_cat = True
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,
