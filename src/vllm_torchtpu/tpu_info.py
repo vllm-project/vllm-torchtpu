@@ -61,6 +61,30 @@ def get_tpu_type() -> str:
     return tpu_type
 
 
+def _parse_chip_version(accelerator_type: str) -> pltpu.ChipVersion | None:
+    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
+    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    # v5litepod and v7x are the only two that still differ after stripping.
+    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    try:
+        return pltpu.ChipVersion(name)
+    except ValueError:
+        return None
+
+
+@functools.cache
+def find_chip_version() -> pltpu.ChipVersion | None:
+    """This host's TPU chip version, or None if its accelerator type is unset
+    or unrecognized.
+
+    Resolves the chip like `get_chip_version`, without initializing a TPU
+    client, but never substitutes a default: for callers that must not treat
+    an unknown device as TPU7x, such as defaults measured on one chip.
+    """
+    return _parse_chip_version(get_tpu_type() or "")
+
+
 @functools.cache
 def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     """Resolves the TPU chip version without initializing a TPU client.
@@ -71,20 +95,15 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     warning when the accelerator type is unrecognized.
     """
     accelerator_type = accelerator_type or get_tpu_type() or ""
-    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
-    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
-    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
-    # v5litepod and v7x are the only two that still differ after stripping.
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
-    try:
-        return pltpu.ChipVersion(name)
-    except ValueError:
+    chip_version = _parse_chip_version(accelerator_type)
+    if chip_version is None:
         logger.warning(
             "Unrecognized TPU accelerator type %r; defaulting to TPU7x "
             "static geometry.",
             accelerator_type,
         )
         return pltpu.ChipVersion.TPU_7X
+    return chip_version
 
 
 def get_libtpu_version() -> str | None:
