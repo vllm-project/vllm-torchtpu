@@ -2256,6 +2256,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
         # the projection already returned the whole DCP group's heads.
+        q_flat = q
         q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -2315,7 +2316,17 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.dcp_q_replicate:
             if q_rope_table is not None:
                 # The raw q head view (q_pe un-roped) + the rope table.
-                q_dcp_replicated = (q_nope, q, q_rope_table)
+                if (
+                    envs.TPU_MLA_SPARSE_FLAT_Q
+                    and topk_indices is not None
+                    and envs.TPU_MLA_SPARSE_SPLIT_Q
+                ):
+                    q_flat_2d = q_flat.view(
+                        -1, self.num_heads * self.dcp_group_size * self.qk_head_dim
+                    )
+                    q_dcp_replicated = (q_flat_2d, q_flat_2d, q_rope_table)
+                else:
+                    q_dcp_replicated = (q_nope, q, q_rope_table)
             elif self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
             q_proj_layer = cast(DCPGroupColumnParallelLinear, self._q_proj_layer())

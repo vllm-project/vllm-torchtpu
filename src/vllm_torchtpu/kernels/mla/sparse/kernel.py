@@ -1679,12 +1679,18 @@ def _attention_kernel(
         refs = refs[:-1]
     q_pe_hbm_ref = None
     bq_pe_x2_ref = None
+    bq_pe_stage_ref = None
     tab_hbm_ref = None
     bq_tab_x2_ref = None
     if split_q:
-        q_pe_hbm_ref = refs[0]  # [max_num_tokens, num_q_heads, rope_dim]
-        bq_pe_x2_ref = refs[-1]  # [2, bsz, num_q_heads, rope_dim]
-        refs = refs[1:-1]
+        q_pe_hbm_ref = refs[0]  # [max_num_tokens, num_q_heads, rope_dim] or flat 2D
+        if q_pe_hbm_ref.ndim == 2:
+            bq_pe_stage_ref = refs[-1]  # [bsz, num_q_heads, 128]
+            bq_pe_x2_ref = refs[-2]  # [2, bsz, num_q_heads * 256]
+            refs = refs[1:-2]
+        else:
+            bq_pe_x2_ref = refs[-1]  # [2, bsz, num_q_heads, rope_dim]
+            refs = refs[1:-1]
         if q_rope:
             tab_hbm_ref = refs[0]  # f32[max_num_tokens, 2, 128]
             bq_tab_x2_ref = refs[-1]  # f32[2, bsz, 2, 128]
@@ -2234,8 +2240,15 @@ def _attention_kernel(
                 )
             elif split_q:
                 # Same semaphore; the waits below mirror both starts.
+                pe_row = (
+                    pl.multiple_of(
+                        seq_idx_start, 8 * get_dtype_packing(bq_pe_stage_ref.dtype)
+                    )
+                    if bq_pe_stage_ref is not None
+                    else seq_idx_start
+                )
                 _async_copy(
-                    q_pe_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                    q_pe_hbm_ref.at[pl.ds(pe_row, batch_size)],
                     bq_pe_x2_ref.at[bq_sem_idx, :],
                     sem,
                     wait,
@@ -2362,7 +2375,9 @@ def _attention_kernel(
         if q_rope:
             # The caller's rope + concat + zero pad, rebuilt in VMEM: lanes
             # 128:256 of the raw head are one aligned vreg column.
-            if q128:
+            if bq_pe_stage_ref is not None:
+                raw = bq_pe_stage_ref.at[batch_idx][...]
+            elif q128:
                 raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]
             else:
                 raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
@@ -2932,6 +2947,26 @@ def _attention_kernel(
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
+        if bq_pe_stage_ref is not None:
+            pe_head_step = min(
+                num_q_heads, 8 * get_dtype_packing(bq_pe_stage_ref.dtype)
+            )
+            for h0 in range(0, num_q_heads, pe_head_step):
+                raw_htd = jnp.stack(
+                    [
+                        bq_pe_x2_ref[
+                            bi_sem_idx,
+                            :,
+                            h * Q_ROPE_HEAD_DIM + 128 : (h + 1) * Q_ROPE_HEAD_DIM,
+                        ]
+                        for h in range(h0, h0 + pe_head_step)
+                    ]
+                )
+                staged = pltpu.einshape("htd->thd", raw_htd)
+                if pe_head_step == num_q_heads:
+                    bq_pe_stage_ref[...] = staged
+                else:
+                    bq_pe_stage_ref[:, h0 : h0 + pe_head_step, :] = staged
         if not row_widths:
             wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
 
@@ -3737,11 +3772,20 @@ def sparse_ragged_paged_attention(
             "send_exchange = (axis, lane_axis) needs send_world and send_peer "
             "(int32 [2]: rank, lane)"
         )
+    q_pe_flat_ok = (
+        q_rope_table is not None
+        and q_pe is not None
+        and q_pe.ndim == 2
+        and q_pe.shape == (q.shape[0], actual_num_q_heads * Q_ROPE_HEAD_DIM)
+    )
     if q_rope_table is not None:
-        if q_pe is None or q_pe.shape[-1] != Q_ROPE_HEAD_DIM:
+        if q_pe is None or (
+            not q_pe_flat_ok and (q_pe.ndim != 3 or q_pe.shape[-1] != Q_ROPE_HEAD_DIM)
+        ):
             raise ValueError(
                 "q_rope_table needs the raw q head view as q_pe, "
-                f"[tokens, heads, {Q_ROPE_HEAD_DIM}]"
+                f"[tokens, heads, {Q_ROPE_HEAD_DIM}] or "
+                f"[tokens, heads * {Q_ROPE_HEAD_DIM}]"
             )
         if q_rope_table.shape != (q.shape[0], 2, 128) or (
             q_rope_table.dtype != jnp.float32
@@ -3751,7 +3795,9 @@ def sparse_ragged_paged_attention(
                 f"f32[{q.shape[0]}, 2, 128]"
             )
     if q_pe is not None:
-        if q_pe.shape[:2] != q.shape[:2] or q_pe.dtype != q.dtype:
+        if (
+            not q_pe_flat_ok and (q_pe.ndim != 3 or q_pe.shape[:2] != q.shape[:2])
+        ) or q_pe.dtype != q.dtype:
             raise ValueError(
                 f"q_pe {q_pe.shape}/{q_pe.dtype} must match q_nope "
                 f"{q.shape}/{q.dtype} in tokens, heads and dtype"
@@ -4571,13 +4617,42 @@ def sparse_attention_chunk(
         stage_levers = (
             tuple(group_levers) if live_views is not None else tuple(row_levers)
         )
+        q_pe_arg = q_pe
+        q_pe_flat = False
+        if split_q and q_pe_arg.ndim == 2:
+            assert q_rope, "2D flat q_pe requires q_rope_table"
+            pe_sublane_tile = 8 * get_dtype_packing(q_pe_arg.dtype)
+            if (
+                not small_chunk
+                and send_world == 0
+                and send_exchange is None
+                and "q128" not in stage_levers
+                and q.shape[0] % pe_sublane_tile == 0
+                and batch_size % pe_sublane_tile == 0
+                and start_pos % pe_sublane_tile == 0
+                and num_q_heads % 8 == 0
+                and (
+                    num_q_heads <= pe_sublane_tile or num_q_heads % pe_sublane_tile == 0
+                )
+            ):
+                q_pe_flat = True
+            else:
+                q_pe_arg = q_pe_arg.reshape(q.shape[0], num_q_heads, Q_ROPE_HEAD_DIM)
         if split_q:
             # q_pe double buffer; the last scratch ref (but for "pair"'s ring).
             # "q128": only the 128 lanes `load_bq` reads.
-            pe_lanes = 128 if "q128" in stage_levers else q_pe.shape[-1]
-            scratch_shapes.append(
-                pltpu.VMEM((2, batch_size, num_q_heads, pe_lanes), q_pe.dtype)
-            )
+            if q_pe_flat:
+                scratch_shapes.append(
+                    pltpu.VMEM((2, batch_size, q_pe_arg.shape[-1]), q_pe_arg.dtype)
+                )
+                scratch_shapes.append(
+                    pltpu.VMEM((batch_size, num_q_heads, 128), q_pe_arg.dtype)
+                )
+            else:
+                pe_lanes = 128 if "q128" in stage_levers else q_pe_arg.shape[-1]
+                scratch_shapes.append(
+                    pltpu.VMEM((2, batch_size, num_q_heads, pe_lanes), q_pe_arg.dtype)
+                )
         if "pair" in stage_levers or "quad" in stage_levers:
             # Body lever "pair": unpacked KV of a token pair, two pair slots
             # ("quad": one slot of the whole step's tokens).
@@ -4787,7 +4862,7 @@ def sparse_attention_chunk(
         operands = [q, cache_kv_nope, cache_kv_rope]
         roles = ["q", "kv", "kv"]
         if split_q:
-            operands.append(q_pe)
+            operands.append(q_pe_arg)
             roles.append("q_pe")
         if q_rope:
             operands.append(q_rope_table)
