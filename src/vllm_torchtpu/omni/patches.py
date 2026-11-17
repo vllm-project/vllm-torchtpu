@@ -88,6 +88,9 @@ def apply_omni_model_specific_patches() -> None:
     _patch_ltx2_guidance_sigma_scalar()
     _patch_ltx2_async_guidance_step()
     _patch_ltx2_fast_eager_dispatch()
+    from vllm_torchtpu.omni.ltx2_vae import apply_ltx2_video_vae_patches
+
+    apply_ltx2_video_vae_patches()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
