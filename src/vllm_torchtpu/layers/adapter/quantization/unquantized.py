@@ -390,6 +390,9 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "activation": activation_str,
         }
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                **kwargs,
+                is_sequence_parallel=layer.moe_config.is_sequence_parallel,
+            )
 
         return fused_moe_gmm(**kwargs)

@@ -316,7 +316,10 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         topk_weights = topk_weights.to(x.dtype)
 
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-            topk_ids, topk_weights, is_local_tensor=pipelined
+            topk_ids,
+            topk_weights,
+            is_local_tensor=pipelined,
+            is_sequence_parallel=layer.moe_config.is_sequence_parallel,
         )
 
         kwargs = {
@@ -336,7 +339,10 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             "skip_padded_tokens": True,
         }
         if pipelined:
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                **kwargs,
+                is_sequence_parallel=layer.moe_config.is_sequence_parallel,
+            )
 
         # Execute GMM Kernel with native fp4 weights and scales
         return fused_moe_gmm(**kwargs)
