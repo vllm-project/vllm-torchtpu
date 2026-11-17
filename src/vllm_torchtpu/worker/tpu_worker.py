@@ -201,11 +201,23 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
-    def _maybe_bind_numa(self, native_local_rank: int, dp_size: int) -> None:
+    def _maybe_bind_numa(
+        self, native_local_rank: int, dp_size: int, local_rank_offset: int = 0
+    ) -> None:
         """Bind this worker to its chip's NUMA node when
         ``tpu_worker.numa_bind`` is on. The host's workers are this engine's
-        local ranks times its host-local DP engines."""
+        local ranks times its host-local DP engines.
+
+        With a TPU_LOCAL_RANK_OFFSET the engine's ranks start past chip 0 and
+        the host holds workers this count does not see, so the rank-to-chip
+        mapping would pick the wrong node: placement is left unchanged."""
         if not worker_options.get(self.vllm_config).numa_bind:
+            return
+        if local_rank_offset:
+            logger.info(
+                "NUMA bind: TPU_LOCAL_RANK_OFFSET=%d; placement unchanged",
+                local_rank_offset,
+            )
             return
         pc = self.parallel_config
         dp_size_local = (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1
@@ -241,7 +253,9 @@ class TPUWorker(WorkerBase):
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
         # Before the runtime starts, so its threads and buffers follow.
-        self._maybe_bind_numa(binding.native_local_rank, dp_size)
+        self._maybe_bind_numa(
+            binding.native_local_rank, dp_size, binding.local_rank_offset
+        )
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
