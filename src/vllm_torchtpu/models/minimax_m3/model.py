@@ -524,8 +524,10 @@ class MiniMaxM3Model(nn.Module):
             # executable from one trace to another.
             halves = _split_halves(positions, num_tokens // 2, num_tokens)
         split = halves is not None and num_tokens >= self.split_min_tokens
-        sp_step = halves is None and _sp_step(self.sp, num_tokens, self.tp_size)
-        if sp_step and self.sp.mode == "full":
+        # Stand-in models (tests) may carry no SP config: off.
+        sp = getattr(self, "sp", None) or SpConfig()
+        sp_step = halves is None and _sp_step(sp, num_tokens, getattr(self, "tp_size", 1))
+        if sp_step and sp.mode == "full":
             shard = None
             for idx, layer in enumerate(self.layers):
                 shard = layer.forward_sp(positions, inputs_embeds, shard)
