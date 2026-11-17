@@ -4629,6 +4629,47 @@ class TestHitSourcesBySource(unittest.TestCase):
         self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, stats2.data["data"])
         self.assertIsNone(manager.get_stats())
 
+    def test_hybrid_hit_with_mixed_recurrent_state_counts_in_its_slowest_tier(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store, storage_backend="posix")
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK, hybrid=True)
+        req = _make_hashed_request("req", 3 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+
+        # Attention chunks 0 and 1 are in host DRAM. The recurrent state at the
+        # end of chunk 1 has three sub-blocks in host DRAM and one on disk.
+        for chunk in (0, 1):
+            seed_host_entries(store, make_offload_key(req.block_hashes[chunk], 0))
+        *in_host, on_disk = sub_hashes(make_offload_key(req.block_hashes[1], 1))
+        for sub_hash in in_host:
+            store.entries[sub_hash] = _Entry(status=FakeBlockStatus.HOST)
+        store.storage_entries.add(on_disk)
+
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, 2 * self.BLOCK)
+        mamba_null = KVCacheBlock(0)
+        mamba_null.is_null = True
+        sched.update_state_after_alloc(
+            req,
+            KVCacheBlocks(
+                blocks=(
+                    [KVCacheBlock(10), KVCacheBlock(11)],
+                    [mamba_null, KVCacheBlock(21)],
+                )
+            ),
+            ext_tokens,
+        )
+        # Restoring the state needs its disk sub-block, so the whole hit counts
+        # as disk.
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {CacheHitSource.DISK: 2 * self.BLOCK},
+        )
+
     def test_unpinned_load_reports_unspecified_and_no_hit_tokens(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -4739,11 +4780,7 @@ class TestHitSourcesBySource(unittest.TestCase):
         from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
 
         store = FakeKVCacheStore()
-        manager = make_global_manager(
-            store,
-            tokens_per_chunk_by_group={0: self.BLOCK},
-            storage_backend="posix",
-        )
+        manager = make_global_manager(store, storage_backend="posix")
         sched = _make_real_scheduler(manager, block_size=self.BLOCK)
         req = _make_hashed_request("mixed_sub_req", 2 * self.BLOCK + 1, self.BLOCK)
         sched.on_new_request(req)

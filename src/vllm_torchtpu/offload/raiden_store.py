@@ -85,17 +85,12 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    FullAttentionSpec,
-    KVCacheConfig,
-    MambaSpec,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
@@ -131,7 +126,6 @@ from vllm_torchtpu.offload.metrics import (
     RaidenOffloadStatsCollector,
     SubBlockSourceCounts,
     build_raiden_offload_metric_definitions,
-    compute_load_tokens_by_source,
 )
 
 if TYPE_CHECKING:
@@ -380,10 +374,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
         dp_rank: int = 0,
-        # Metrics geometry, derived by `TPURaidenStoreOffloadingSpec`:
-        # `storage_backend` labels the storage tier (None: DRAM-only).
-        tokens_per_chunk_by_group: Mapping[int, int] | None = None,
-        mamba_group_ids: Iterable[int] = (),
+        # Labels the storage tier in metrics (None: DRAM-only).
         storage_backend: str | None = None,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
@@ -537,28 +528,7 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
-        self._tokens_per_chunk_by_group: dict[int, int] = (
-            dict(tokens_per_chunk_by_group) if tokens_per_chunk_by_group else {}
-        )
-        self._mamba_group_ids: frozenset[int] = frozenset(mamba_group_ids)
         self._metrics = RaidenOffloadStatsCollector(storage_backend=storage_backend)
-
-    def compute_load_tokens_by_source(
-        self,
-        *,
-        start_token: int,
-        end_token: int,
-        load_key_ranges: Iterable[tuple[int, int, OffloadKey]],
-        key_sources: Mapping[OffloadKey, SubBlockSourceCounts],
-    ) -> dict[CacheHitSource, int]:
-        return compute_load_tokens_by_source(
-            start_token=start_token,
-            end_token=end_token,
-            load_key_ranges=load_key_ranges,
-            key_sources=key_sources,
-            tokens_per_chunk_by_group=self._tokens_per_chunk_by_group,
-            mamba_group_ids=self._mamba_group_ids,
-        )
 
     def record_admission_hits(
         self,
@@ -2558,6 +2528,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Ensure model-level hybrid flag and KV cache group specs agree before
         # resolving attention kernel geometry.
+        from vllm.v1.kv_cache_interface import MambaSpec
+
         self.is_hybrid_model = vllm_config.model_config.is_hybrid
         has_mamba_group = any(
             isinstance(g.kv_cache_spec, MambaSpec)
@@ -2775,12 +2747,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     ),
                     dict(storage.properties) or "none",
                 )
-            kv_cache_specs = {
-                group.group_id: self.kv_cache_config.kv_cache_groups[
-                    group.group_id
-                ].kv_cache_spec
-                for group in self.config.groups
-            }
             self._manager = RaidenOffloadingManager(
                 kernel_physical_blocks_capacity=self.kernel_physical_blocks_capacity,
                 offload_logical_blocks_capacity=self.offload_logical_blocks_capacity,
@@ -2794,15 +2760,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
                 dp_rank=self.dp_rank,
-                tokens_per_chunk_by_group={
-                    group.group_id: group.tokens_per_block * self.blocks_per_chunk
-                    for group in self.config.groups
-                },
-                mamba_group_ids={
-                    group_id
-                    for group_id, kv_cache_spec in kv_cache_specs.items()
-                    if isinstance(kv_cache_spec, MambaSpec)
-                },
                 storage_backend=storage.storage_type if storage is not None else None,
             )
         return self._manager

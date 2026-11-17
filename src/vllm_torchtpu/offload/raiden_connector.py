@@ -83,7 +83,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
@@ -96,7 +96,11 @@ from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.offload.metrics import RaidenOffloadPromMetrics, split_external_hit
+from vllm_torchtpu.offload.metrics import (
+    RaidenOffloadPromMetrics,
+    compute_load_tokens_by_source,
+    split_external_hit,
+)
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     RaidenLoadStoreSpec,
@@ -248,11 +252,20 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             return
         req_status = self._req_status[request.request_id]
         start_token = req_status.num_locally_computed_tokens
-        src_spec.tokens_by_source = self._raiden_manager.compute_load_tokens_by_source(
+        group_configs = self.config.kv_group_configs
+        src_spec.tokens_by_source = compute_load_tokens_by_source(
             start_token=start_token,
             end_token=start_token + num_external_tokens,
             load_key_ranges=req_status.load_key_ranges,
             key_sources=src_spec.key_sources,
+            tokens_per_chunk_by_group={
+                group.group_idx: group.tokens_per_chunk for group in group_configs
+            },
+            mamba_group_ids={
+                group.group_idx
+                for group in group_configs
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            },
         )
         self._raiden_manager.record_admission_hits(
             src_spec.tokens_by_source, preempted=request.num_preemptions > 0
