@@ -156,7 +156,14 @@ class TestTpuCompilerCache:
         custom_op_boundaries = {
             path.relative_to(source_root).as_posix()
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
-            if "pallas.jax_op" in path.read_text()
+            if any(
+                builder in path.read_text()
+                for builder in (
+                    "pallas.jax_op",
+                    "sharded_jax_op(",
+                    "pcp_streaming_jax_op(",
+                )
+            )
         }
         assert custom_op_boundaries <= hashed
         assert {

@@ -39,6 +39,23 @@ def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
     )
 
 
+def lane_slice_q_metadata(seq_lens, cu_q_lens, start, size):
+    """``(seq_lens, cu_q_lens)`` of query tokens ``[start, start + size)``.
+
+    Each kept token keeps its position: a request cut by the slice end loses
+    the tokens past it from its kv length. A request with no token in the slice
+    gets length 0, so no length goes negative and it scans no kv.
+    """
+    end = start + size
+    kept = jnp.clip(cu_q_lens[1:], start, end) - jnp.clip(cu_q_lens[:-1], start, end)
+    cut = seq_lens - jnp.maximum(cu_q_lens[1:] - end, 0)
+    new_seq_lens = jnp.where(kept > 0, cut, 0)
+    zero = jnp.zeros((1,), cu_q_lens.dtype)
+    return new_seq_lens, jnp.concatenate(
+        [zero, jnp.cumsum(kept).astype(cu_q_lens.dtype)]
+    )
+
+
 def cp_local_length(global_len, cp_rank, cp_size: int, interleave_c: int):
     """Count compressed positions ``< global_len`` owned by `cp_rank`.
 
