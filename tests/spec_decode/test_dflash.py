@@ -832,22 +832,25 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
         nr = torch.tensor(num_reqs, dtype=torch.int32).to(device)
         if builder == "seed":
             seed = torch.ones(rows, dtype=torch.int32).to(device)
-            return proposer._tpu_build_dflash_inputs_seed(
+            result = proposer._tpu_build_dflash_inputs_seed(
                 seed, qsl, pos, nr, block, padded_len, 7777
             )
-        next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
-        draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
-        return proposer._tpu_build_dflash_inputs_next_tokens(
-            next_tokens,
-            qsl,
-            pos,
-            draft_lengths,
-            nr,
-            block,
-            padded_len,
-            7777,
-            INVALID_TOKEN_ID,
-        )
+        else:
+            next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
+            draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
+            result = proposer._tpu_build_dflash_inputs_next_tokens(
+                next_tokens,
+                qsl,
+                pos,
+                draft_lengths,
+                nr,
+                block,
+                padded_len,
+                7777,
+                INVALID_TOKEN_ID,
+            )
+        dflash_module.synchronize_tensors(result, wait=True)
+        return result
 
     def programs() -> int:
         return len(torch.tpu._get_cache_stats().per_entry_stats)
