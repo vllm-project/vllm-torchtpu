@@ -507,7 +507,9 @@ def finish_rows(ctx, expert, acc2, mid_scales):
 # ---- the push and the drains ----
 def push_expert(ctx, expert):
     """Pushes the expert's runs to their shards. The own-shard run is
-    copied locally (it is read only after the drain)."""
+    copied locally (it is read only after the drain). The pl.when bodies
+    run inside the iteration that defines them; they take that iteration's
+    values as defaults all the same, so nothing reads a later one."""
     b, tables, outputs, sems = ctx.b, ctx.tables, ctx.outputs, ctx.sems
     for d in range(b.num_shards):
         blocks = tables.push_blocks[expert, d]
@@ -516,7 +518,7 @@ def push_expert(ctx, expert):
         is_me = jnp.int32(d) == ctx.me
 
         @pl.when(and_nonempty(jnp.logical_not(is_me), blocks))
-        def _():
+        def _(d=d, blocks=blocks, src_block=src_block, dst_block=dst_block):
             rows = tables.push_rows[expert, d]
 
             def push_run():
@@ -545,7 +547,7 @@ def push_expert(ctx, expert):
                 ).start()
 
         @pl.when(and_nonempty(is_me, blocks))
-        def _():
+        def _(blocks=blocks, src_block=src_block, dst_block=dst_block):
             pltpu.make_async_copy(
                 outputs.outgoing.at[pl.ds(src_block * ROW_BLOCK, blocks * ROW_BLOCK)],
                 outputs.arrivals.at[pl.ds(dst_block * ROW_BLOCK, blocks * ROW_BLOCK)],
