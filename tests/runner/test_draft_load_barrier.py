@@ -82,39 +82,43 @@ class _Spec:
 
 
 def _barrier_calls_per_stage(method, num_stages=8):
-    """Run the pre-draft-load step on a fake world of pipeline stages, where
-    only the last stage is an async drafter (it alone hosts the draft)."""
+    """Run the pre-draft-load step on a fake world of pipeline stages, with
+    the runner's own drafter predicates: only the last stage hosts the draft.
+    Returns the barrier calls per stage and which stages host the draft."""
     calls = [0] * num_stages
+    hosts_draft = []
     for pp_rank in range(num_stages):
-        spec = None if method is None else _Spec(method)
-        is_last = pp_rank == num_stages - 1
         stage = SimpleNamespace(
-            speculative_config=spec,
-            _is_async_drafter=bool(
-                is_last
-                and spec is not None
-                and (spec.use_eagle() or spec.method == "dflash")
-            ),
+            speculative_config=None if method is None else _Spec(method),
+            _pp_is_last=pp_rank == num_stages - 1,
         )
+        stage._uses_hidden_state_drafter = (
+            TPUModelRunner._uses_hidden_state_drafter.fget(stage)
+        )
+        hosts_draft.append(TPUModelRunner._is_async_drafter.fget(stage))
 
         def barrier(pp_rank=pp_rank):
             calls[pp_rank] += 1
 
         stage._draft_load_barrier = barrier
         TPUModelRunner._maybe_draft_load_barrier(stage)
-    return calls
+    return calls, hosts_draft
 
 
 @pytest.mark.parametrize("method", ["mtp", "eagle3", "dflash"])
 def test_every_pipeline_stage_joins_the_draft_load_barrier(method):
     # A world-group barrier that only the last stage entered would leave it
     # waiting for the other stages, which never arrive.
-    assert _barrier_calls_per_stage(method) == [1] * 8
+    calls, hosts_draft = _barrier_calls_per_stage(method)
+    assert calls == [1] * 8
+    assert hosts_draft == [False] * 7 + [True]
 
 
 @pytest.mark.parametrize("method", [None, "ngram"])
 def test_no_draft_load_barrier_without_a_hidden_state_drafter(method):
-    assert _barrier_calls_per_stage(method) == [0] * 8
+    calls, hosts_draft = _barrier_calls_per_stage(method)
+    assert calls == [0] * 8
+    assert hosts_draft == [False] * 8
 
 
 def test_load_model_reaches_the_barrier_outside_the_drafter_branch():
