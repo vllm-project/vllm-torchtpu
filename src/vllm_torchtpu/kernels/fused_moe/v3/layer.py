@@ -872,7 +872,15 @@ def fused_ep_moe(
     # the torch bridge's path); None takes an arange, which is fine under a
     # plain jit with a mesh and not under the bridge (a jit-internal
     # constant sharded over the axis compiles to a partition-id there).
-    with_shard = layout.SHARD_INDEX_OPERAND or shard_index is not None
+    # Every program reads the flag when it is built, so an index handed in
+    # with the flag off would reach programs built to read the mesh axis.
+    if shard_index is not None and not layout.SHARD_INDEX_OPERAND:
+        raise ValueError(
+            "shard_index is the index operand of layout.SHARD_INDEX_OPERAND's "
+            "mode; with the flag off the programs read the mesh axis, so "
+            "shard_index must be None"
+        )
+    with_shard = layout.SHARD_INDEX_OPERAND
     if with_shard:
         if replicas != 1:
             raise ValueError(
@@ -1167,6 +1175,11 @@ def fused_ep_moe(
         w2.dtype,
         w1_scales.dtype if form.has_scales else None,
         tuple(r.dtype for r in router),
+        # The module flags the build bakes in: the jit wrapper, and what
+        # every program reads when it is traced.
+        bool(WRAP_IN_JIT),
+        bool(layout.SIDE_EFFECTS),
+        bool(layout.SHARD_INDEX_OPERAND),
     ) + bias_dtypes
 
     # WRAP_IN_JIT: the layer's own callers get one compiled program per shape.
