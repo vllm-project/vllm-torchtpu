@@ -131,3 +131,18 @@ def test_wrapper_accepts_static_decode_modes(monkeypatch):
     assert seen["native_fp8"] == PVS
     assert seen["native_fp8_prefill"] == PVS
     assert seen["decode_exp2"] is True
+
+
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_exp2_dropped_for_an_lse_call_is_logged(monkeypatch, return_lse):
+    from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
+
+    warnings = []
+    monkeypatch.setattr(
+        wrapper,
+        "logger",
+        SimpleNamespace(warning_once=lambda msg, *args: warnings.append(msg)),
+    )
+    _wrapper_serving_config(monkeypatch, decode_exp2=True, return_lse=return_lse)
+    assert len(warnings) == int(return_lse)
+    assert all("decode_exp2" in w for w in warnings)
