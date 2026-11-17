@@ -53,6 +53,49 @@ def test_update_skips_the_copy_only_when_counts_repeat():
     assert len(copies) == 4
 
 
+def test_the_valid_count_is_kept_for_the_step():
+    state = TokenPaddingState.create(8, device="cpu")
+    assert token_padding.get_local_valid_tokens() is None
+    with token_padding.use_padding_state(state):
+        state.update(3, 8)
+        assert token_padding.get_local_valid_tokens() is state.local_valid_tokens
+        assert token_padding.get_local_valid_tokens().tolist() == [3]
+        state.update(5, 8)
+        assert state.get_local_valid_tokens().tolist() == [5]
+
+
+def test_use_padding_state_binds_and_restores():
+    outer = TokenPaddingState.create(4, device="cpu")
+    inner = TokenPaddingState.create(4, device="cpu")
+    token_padding.set_padding_state(outer)
+    try:
+        with token_padding.use_padding_state(inner):
+            assert token_padding._padding_state is inner
+            with token_padding.use_padding_state(None):
+                assert token_padding._padding_state is None
+            assert token_padding._padding_state is inner
+        assert token_padding._padding_state is outer
+        try:
+            with token_padding.use_padding_state(inner):
+                raise RuntimeError("loop graph failed")
+        except RuntimeError:
+            pass
+        assert token_padding._padding_state is outer
+    finally:
+        token_padding.set_padding_state(None)
+
+
+def test_retain_padding_graph_input_reads_the_mask_and_keeps_the_values():
+    out = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    assert token_padding.retain_padding_graph_input(out) is out
+    state = TokenPaddingState.create(4, device="cpu")
+    with token_padding.use_padding_state(state):
+        state.update(1, 4)
+        kept = token_padding.retain_padding_graph_input(out)
+    assert kept is not out
+    assert torch.equal(kept, out)
+
+
 def test_dummy_batch_is_all_padding():
     state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
     state.update(0, 6)

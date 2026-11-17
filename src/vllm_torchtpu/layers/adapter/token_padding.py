@@ -133,20 +133,6 @@ def padding_mask_for(
     return local_padding.ne(0)
 
 
-def zero_scores_for_padding(
-    scores: torch.Tensor, is_local_tensor: bool = False
-) -> torch.Tensor:
-    """Zeroes the router scores of padded tokens.
-
-    A row of zeros selects no expert in the few-token kernel's in-kernel
-    router (its weights renormalise to zero and count no hits).
-    """
-    is_padding = padding_mask_for(scores.shape[0], is_local_tensor)
-    if is_padding is None:
-        return scores
-    return torch.where(is_padding[:, None], torch.zeros_like(scores), scores)
-
-
 @contextlib.contextmanager
 def use_padding_state(state: "TokenPaddingState | None"):
     """Temporarily bind `_padding_state` for a separately compiled loop graph."""
