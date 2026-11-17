@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -27,9 +28,11 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend,
     PallasMLAttentionBackendImpl,
 )
+from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmMLAAttention,
     VllmMultiHeadLatentAttentionWrapper,
+    VllmTPUSparseAttnIndexer,
     _dcp_indexer_a2a_for_bucket,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
@@ -405,6 +408,10 @@ def test_pallas_mla_backend_impl():
     assert out.shape == (4, 16 * 128)
 
 
+class _Layer(SimpleNamespace):
+    """A SimpleNamespace that, like a real layer module, takes weak references."""
+
+
 def _make_impl_and_layer(k_scale=2.0, num_tokens=4):
     """Real-tensor layer for exercising the forward body up to the op call.
 
@@ -412,7 +419,6 @@ def _make_impl_and_layer(k_scale=2.0, num_tokens=4):
     `"W_UV_scale"` are genuinely False; the ops are mocks that capture the
     tensors forward hands them.
     """
-    from types import SimpleNamespace
 
     impl = PallasMLAttentionBackendImpl(
         num_heads=16,
@@ -434,7 +440,8 @@ def _make_impl_and_layer(k_scale=2.0, num_tokens=4):
     )
     torch.manual_seed(0)
     op_out = torch.randn(num_tokens, 16, 512)
-    layer = SimpleNamespace(
+    layer = _Layer(
+        use_sparse=True,
         num_heads=16,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -669,6 +676,207 @@ def test_sparse_mla_op_reads_admission_when_traced(allowed):
             layer.allow_masked_dense = allowed
         captured["core"](*range(11))
     assert core.call_args.kwargs["allow_masked_dense"] is bool(allowed)
+
+
+def _sparse_mla_layer(name, **overrides):
+    _, layer, _, _ = _make_impl_and_layer()
+    layer.layer_name = name
+    layer.scale = 0.125
+    for attr, value in overrides.items():
+        setattr(layer, attr, value)
+    return layer
+
+
+def _build_sparse_mla_ops(impl, layers, meshes=None):
+    """Build each layer's sparse op; returns the jax_op names and kernels."""
+    built = []
+
+    def jax_op(name, fn, **kwargs):
+        built.append((name, fn))
+        return MagicMock()
+
+    meshes = meshes or ["mesh"] * len(layers)
+    with patch.object(attention_adapter.pallas, "jax_op", side_effect=jax_op):
+        for layer, mesh in zip(layers, meshes):
+            with patch.object(
+                attention_adapter,
+                "get_vllm_model_wrapper_context",
+                return_value=SimpleNamespace(mesh=mesh),
+            ):
+                impl._build_sparse_mla_op(layer)
+    return built
+
+
+def test_sparse_mla_op_is_shared_by_layers_with_one_kernel_config():
+    """Every op exports its kernel on its own, so layers must share one."""
+    impl, _, _, _ = _make_impl_and_layer()
+    layers = [_sparse_mla_layer(f"model.layers.{i}.self_attn.attn") for i in range(3)]
+
+    built = _build_sparse_mla_ops(impl, layers)
+
+    assert len(built) == 1
+    assert re.fullmatch(r"pallas::sparse_mla_attention_\d+", built[0][0])
+    # Everything the kernel closes over is in the key or checked when traced.
+    # A new captured value has to be added to the key, and here.
+    assert set(built[0][1].__code__.co_freevars) == {
+        "k_scale",
+        "layers",
+        "mesh",
+        "sm_scale",
+        "sparse_mla_attention",
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides,mesh",
+    [
+        ({"scale": 0.25}, "mesh"),
+        ({"_k_scale_float": 4.0}, "mesh"),
+        ({"kv_cache_quantized_dtype": None}, "mesh"),
+        ({"num_heads": 8}, "mesh"),
+        ({"kv_lora_rank": 256}, "mesh"),
+        ({}, "other_mesh"),
+    ],
+)
+def test_sparse_mla_op_is_not_shared_across_kernel_configs(overrides, mesh):
+    """A layer whose kernel or fake would capture a different value gets its
+    own op."""
+    impl, _, _, _ = _make_impl_and_layer()
+    layers = [
+        _sparse_mla_layer("model.layers.0.self_attn.attn"),
+        _sparse_mla_layer("model.layers.1.self_attn.attn", **overrides),
+    ]
+
+    built = _build_sparse_mla_ops(impl, layers, meshes=["mesh", mesh])
+
+    assert len(built) == 2
+    assert len({name for name, _ in built}) == 2
+
+
+@pytest.mark.parametrize(
+    "attr,value",
+    [("mla_kv_spec", ("other_nope", "rope_spec")), ("allow_masked_dense", False)],
+)
+def test_shared_sparse_mla_op_rejects_layers_traced_differently(attr, value):
+    """KV cache specs and admission are recorded after the op is built, so
+    the shared kernel checks them when traced instead of keying on them."""
+    impl, _, _, _ = _make_impl_and_layer()
+    layers = [_sparse_mla_layer(f"model.layers.{i}.self_attn.attn") for i in range(2)]
+    with patch(
+        "vllm_torchtpu.layers.core.attention_interface.sparse_mla_attention"
+    ) as kernel:
+        ((_, core),) = _build_sparse_mla_ops(impl, layers)
+        for layer in layers:
+            layer.mla_kv_spec = ("nope_spec", "rope_spec")
+            layer.allow_masked_dense = True
+
+        core(*range(11))
+        assert kernel.call_args.args[12:14] == ("nope_spec", "rope_spec")
+        assert kernel.call_args.kwargs["allow_masked_dense"] is True
+
+        setattr(layers[1], attr, value)
+        with pytest.raises(NotImplementedError, match="model.layers.1.self_attn.attn"):
+            core(*range(11))
+
+
+def test_dense_mla_layer_does_not_join_the_sparse_op_check():
+    """Dense MLA layers build the sparse op too but record no sparse KV cache
+    spec, so the shared kernel must not read one from them."""
+    impl, _, _, _ = _make_impl_and_layer()
+    dense = _sparse_mla_layer("model.layers.0.self_attn.attn", use_sparse=False)
+    sparse = _sparse_mla_layer("model.layers.1.self_attn.attn")
+    with patch(
+        "vllm_torchtpu.layers.core.attention_interface.sparse_mla_attention"
+    ) as kernel:
+        ((_, core),) = _build_sparse_mla_ops(impl, [dense, sparse])
+        sparse.mla_kv_spec = ("nope_spec", "rope_spec")
+        sparse.allow_masked_dense = False
+
+        core(*range(11))
+        assert kernel.call_args.args[12:14] == ("nope_spec", "rope_spec")
+
+
+def _build_streamidx_ops(monkeypatch, configs, kernels=None):
+    """Build the streamidx op for each (layer prefix, topk, chunk_tokens,
+    kv cache mode, small-bucket query block); returns the jax_op names."""
+    names = []
+
+    def jax_op(name, fn, **kwargs):
+        names.append(name)
+        if kernels is not None:
+            kernels.append(fn)
+        return MagicMock()
+
+    monkeypatch.setattr(mla_attention_op.pallas, "jax_op", jax_op)
+    for prefix, topk, chunk_tokens, mode, small_bucket_bq in configs:
+        for var, value in (
+            ("TPU_STREAMIDX_CHUNK_TOKENS", chunk_tokens),
+            ("VLLM_TPU_INDEXER_KV_CACHE_MODE", mode),
+            ("TPU_STREAMIDX_SMALL_BUCKET_BQ", small_bucket_bq),
+        ):
+            if value is None:
+                monkeypatch.delenv(var, raising=False)
+            else:
+                monkeypatch.setenv(var, str(value))
+        indexer = SimpleNamespace(
+            topk_tokens=topk, k_cache=SimpleNamespace(prefix=prefix)
+        )
+        VllmTPUSparseAttnIndexer._build_streamidx_op(indexer)
+    return names
+
+
+def test_streamidx_op_is_shared_by_layers_with_one_kernel_config(monkeypatch):
+    """Every op exports its kernel on its own, so indexer layers share one."""
+    kernels = []
+    names = _build_streamidx_ops(
+        monkeypatch,
+        [
+            (f"model.layers.{i}.self_attn.indexer.k_cache", 2048, None, None, None)
+            for i in range(3)
+        ],
+        kernels,
+    )
+
+    assert len(names) == 1
+    assert re.fullmatch(r"pallas::streamidx_topk_\d+", names[0])
+    # Everything the kernel closes over is in the key. A new captured value has
+    # to be added to the key, and here.
+    assert set(kernels[0].__code__.co_freevars) == {
+        "chunk_tokens",
+        "kv_cache_mode",
+        "small_bucket",
+        "topk",
+    }
+
+
+@pytest.mark.parametrize(
+    "topk,chunk_tokens,mode,small_bucket_bq",
+    [
+        (1024, None, None, None),
+        (2048, 512, None, None),
+        (2048, None, "xla", None),
+        (2048, None, None, 4),
+    ],
+)
+def test_streamidx_op_is_not_shared_across_kernel_configs(
+    monkeypatch, topk, chunk_tokens, mode, small_bucket_bq
+):
+    names = _build_streamidx_ops(
+        monkeypatch,
+        [
+            ("model.layers.0.self_attn.indexer.k_cache", 2048, None, None, None),
+            (
+                "model.layers.1.self_attn.indexer.k_cache",
+                topk,
+                chunk_tokens,
+                mode,
+                small_bucket_bq,
+            ),
+        ],
+    )
+
+    assert len(names) == 2
+    assert len(set(names)) == 2
 
 
 @pytest.mark.parametrize(
