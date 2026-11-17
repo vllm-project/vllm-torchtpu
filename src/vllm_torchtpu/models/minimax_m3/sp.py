@@ -85,36 +85,50 @@ def active(num_tokens: int, min_tokens: int, tp_size: int) -> bool:
     return num_tokens >= min_tokens and num_tokens % tp_size == 0
 
 
-def _jax_op(name: str, body, mesh, fake, with_rank: bool = False):
+def _jax_op(name: str, body, mesh, fake, with_rank: bool = False, body_mesh=None):
     """A torch op running `body` per rank. with_rank: the op also takes the
-    Pallas all-reduce's rank operand ([1, 1] int32, unused by `body`)."""
-    axis = tuple(mesh.axis_names)
-    axis = axis[0] if len(axis) == 1 else axis
-    # Every operand is 2-D with the token (or rank) dim leading; name the
-    # minor dim too so a (chip, core) mesh shards only the leading one.
-    spec = P(axis, None)
-    specs = (spec, spec) if with_rank else (spec,)
+    Pallas all-reduce's rank operand ([1, 1] int32, unused by `body`).
+
+    body_mesh: a mesh over the same devices in the same order with more axes
+    (`_chip_mesh`) for `body`'s collectives; torch_tpu still sees `mesh`."""
+    axis = mesh.axis_names[0]
+    specs = (P(axis), P(axis)) if with_rank else (P(axis),)
+    inner = mesh if body_mesh is None else body_mesh
+    inner_spec = P(tuple(inner.axis_names), None)
+    inner_specs = (inner_spec,) * len(specs)
 
     def per_rank(x, *_rank):
         return body(x)
 
     sharded = jax.shard_map(
-        per_rank, mesh=mesh, in_specs=specs, out_specs=spec, check_vma=False
+        per_rank,
+        mesh=inner,
+        in_specs=inner_specs,
+        out_specs=inner_spec,
+        check_vma=False,
     )
 
     def put(args):
-        return (jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        return (
+            jax.device_put(a, NamedSharding(inner, s)) for a, s in zip(args, inner_specs)
+        )
+
+    def call(*args):
+        out = sharded(*put(args))
+        if body_mesh is not None:
+            out = jax.device_put(out, NamedSharding(mesh, P(axis)))
+        return out
 
     # torch_tpu reads the operand types from these annotations.
     if with_rank:
 
         def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
-            return sharded(*put((x, rank)))
+            return call(x, rank)
 
     else:
 
         def fn(x: jax.Array) -> jax.Array:
-            return sharded(*put((x,)))
+            return call(x)
 
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
@@ -122,7 +136,7 @@ def _jax_op(name: str, body, mesh, fake, with_rank: bool = False):
         fn,
         mesh=mesh,
         input_partition_specs=specs,
-        output_partition_specs=spec,
+        output_partition_specs=P(axis),
     )
     op.register_fake(lambda x, *_rank: fake(x))
     return op
@@ -153,9 +167,9 @@ def _chip_mesh(mesh):
     )
 
 
-def _make_ops(mesh, rank: torch.Tensor | None) -> _Ops:
+def _make_ops(mesh, rank: torch.Tensor | None, chip_mesh=None) -> _Ops:
     n = int(mesh.size)
-    if len(mesh.axis_names) == 2:
+    if chip_mesh is not None:
         # Reduce over the cores of a chip first (half the bytes stay on the
         # chip), then over the chips; the gather undoes it in reverse, so the
         # token slices come back in order.
@@ -195,11 +209,20 @@ def _make_ops(mesh, rank: torch.Tensor | None) -> _Ops:
     return _Ops(
         n=n,
         reduce_scatter=_jax_op(
-            "minimax_sp::reduce_scatter", rs, mesh, fake_rs, with_rank=rank is not None
+            "minimax_sp::reduce_scatter",
+            rs,
+            mesh,
+            fake_rs,
+            with_rank=rank is not None,
+            body_mesh=chip_mesh,
         ),
         rank=rank,
-        all_gather=_jax_op("minimax_sp::all_gather", ag, mesh, fake_ag),
-        all_gather_fp8=_jax_op("minimax_sp::all_gather_fp8", ag8, mesh, fake_ag),
+        all_gather=_jax_op(
+            "minimax_sp::all_gather", ag, mesh, fake_ag, body_mesh=chip_mesh
+        ),
+        all_gather_fp8=_jax_op(
+            "minimax_sp::all_gather_fp8", ag8, mesh, fake_ag, body_mesh=chip_mesh
+        ),
     )
 
 
@@ -231,7 +254,7 @@ def arm() -> None:
 
     armed = pallas_all_reduce._ARMED
     rank = armed.rank if armed is not None and armed.ranks == tp_ranks else None
-    hier = False
+    chip_mesh = None
     if envs.TPU_MINIMAX_M3_SP_HIERARCHICAL:
         chip_mesh = _chip_mesh(mesh)
         if chip_mesh is None:
@@ -239,15 +262,13 @@ def arm() -> None:
                 "TPU_MINIMAX_M3_SP_HIERARCHICAL: the TP mesh does not hold each "
                 "chip's cores together; flat collectives."
             )
-        else:
-            mesh, hier = chip_mesh, True
-    _OPS = _make_ops(mesh, rank)
+    _OPS = _make_ops(mesh, rank, chip_mesh)
     logger.info(
         "TPU_MINIMAX_M3_SP_MIN_TOKENS: sequence-parallel collectives armed over "
         "%d ranks (TPU_MINIMAX_M3_SP_HIERARCHICAL=%d, mesh %s).",
         _OPS.n,
-        int(hier),
-        dict(mesh.shape),
+        int(chip_mesh is not None),
+        dict((mesh if chip_mesh is None else chip_mesh).shape),
     )
 
 
