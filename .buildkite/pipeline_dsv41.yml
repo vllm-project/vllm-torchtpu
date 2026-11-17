@@ -217,6 +217,7 @@ steps:
             tests/test_srpt_prefill_scheduler.py
             tests/entrypoints/test_segment_tokenize.py
             tests/core/test_dp_prompt_backlog.py
+            tests/core/test_dp_prefix_affinity.py
             -q --junitxml=perf_eval_results/dsv41-serving-cpu.xml
 
   - group: "DeepSeek-V4.1-Flash on TPU"
