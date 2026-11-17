@@ -360,6 +360,19 @@ def build_ffn_kernel(
             "or bf16 weights: a streamed or block-scaled build "
             "keeps the fp8 intermediate"
         )
+    rows_block = activation_block if token_block is None else token_block
+    if intermediate == "bf16" and not form.has_scales and rows_block:
+        raise ValueError(
+            'intermediate "bf16" with bf16 weights runs the up projection as '
+            "one matmul scaled per row: the token rows take one scale per row, "
+            f"not one per {rows_block}-value block"
+        )
+    if token_rows == "bf16" and stream_block and form.has_scales:
+        raise ValueError(
+            "bf16 token rows with scaled weights take a whole-expert build: "
+            "the up matmul runs on a per-expert bf16 copy of w1, which a "
+            "streamed build does not make"
+        )
     has_result_scales = result_rows == "fp8"
     if sorted_rows and stream_block:
         raise ValueError(
