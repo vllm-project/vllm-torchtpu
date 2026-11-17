@@ -119,7 +119,9 @@ class _Attn:
     def __init__(self, partial, o_proj):
         self.partial, self.o_proj = partial, o_proj
 
-    def __call__(self, positions, x, metadata=None):
+    def __call__(self, positions, x, metadata=None, *index_reuse):
+        # Only given with MSA index reuse on (`_self_attn`).
+        self.index_reuse = index_reuse[0] if index_reuse else None
         return self.partial(x)
 
 
@@ -280,3 +282,31 @@ def test_model_forward_sp_branches(collectives, monkeypatch, mode):
     assert len(aux) == len(want_aux) == 3
     for a, b in zip(aux, want_aux):
         torch.testing.assert_close(a, b, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("mode", ["", "attn", "full"])
+def test_model_forward_shares_the_index_reuse_dict(collectives, monkeypatch, mode):
+    """MSA index reuse on: every layer's attention gets the step's one
+    selection dict on SP steps too (so the decode pattern's Shared layers
+    find their Full layer's selection), and None with it off."""
+    sp = mm.SpConfig(mode, 8)
+    layers, x = _layers(sp), _input()
+    monkeypatch.setattr(mm, "_sp_step", lambda config, n, tp: bool(config.mode))
+    positions = torch.zeros(T, dtype=torch.long)
+    for on in (True, False):
+        fake = types.SimpleNamespace(
+            split_min_tokens=0,
+            aux_hidden_state_layers=(),
+            layers=layers,
+            norm=_Norm(99),
+            sp=sp,
+            tp_size=R,
+            index_reuse=on,
+        )
+        mm.MiniMaxM3Model.forward(fake, None, positions, x)
+        dicts = [layer.self_attn.index_reuse for layer in layers]
+        if on:
+            assert isinstance(dicts[0], dict)
+            assert all(d is dicts[0] for d in dicts)
+        else:
+            assert dicts == [None] * len(layers)

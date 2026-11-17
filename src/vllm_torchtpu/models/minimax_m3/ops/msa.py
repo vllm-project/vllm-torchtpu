@@ -15,7 +15,7 @@
 
 import functools
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import torch
@@ -521,22 +521,58 @@ def gather_group_kv(
     only part ``j`` of its tokens (its replicas hold the same rows, bit for
     bit): ``1 / kv_head_replicas`` of the bytes (r10 line, c64 decode:
     17.3 us per layer for ``bf16[4096, 3, 128]``)."""
-    num_tokens, _, head_dim = k.shape
+    return _gather_group_rows((k, v, index_q), group, dcp, kv_head_replicas, dcp_rank)
+
+
+def gather_group_kv_only(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    group: Any,
+    dcp: int,
+    kv_head_replicas: int,
+    dcp_rank: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`gather_group_kv` without the index queries (a Shared layer of MSA
+    index reuse scores nothing), with the same replica split."""
+    return _gather_group_rows((k, v), group, dcp, kv_head_replicas, dcp_rank)
+
+
+def _gather_group_rows(
+    tensors: tuple[torch.Tensor, ...],
+    group: Any,
+    dcp: int,
+    kv_head_replicas: int,
+    dcp_rank: torch.Tensor | None,
+) -> tuple[torch.Tensor, ...]:
+    """`gather_group_kv` of any tuple of ``[T, 1, D]`` rows."""
+    num_tokens, _, head_dim = tensors[0].shape
+    n = len(tensors)
     reps = kv_head_replicas
     if SPLIT_KV_GATHER and dcp_rank is not None and reps > 1 and not num_tokens % reps:
-        rows = torch.cat([k, v, index_q], dim=1)  # [T, 3, D]
+        rows = torch.cat(tensors, dim=1)  # [T, n, D]
         part = num_tokens // reps
-        mine = torch.index_select(rows.view(reps, part, 3, head_dim), 0, dcp_rank % reps)
-        parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, 3, D]
+        mine = torch.index_select(rows.view(reps, part, n, head_dim), 0, dcp_rank % reps)
+        parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, n, D]
         per_head = (
-            parts.view(dcp // reps, reps, part, 3, head_dim)
+            parts.view(dcp // reps, reps, part, n, head_dim)
             .permute(1, 2, 0, 3, 4)
-            .reshape(num_tokens, dcp // reps, 3, head_dim)
+            .reshape(num_tokens, dcp // reps, n, head_dim)
         )
-        return tuple(per_head[:, :, i].contiguous() for i in range(3))
-    per_rank = group.all_gather(torch.cat([k, v, index_q], dim=1).contiguous(), dim=1)
-    per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::kv_head_replicas]
-    return tuple(per_head[:, :, i].contiguous() for i in range(3))
+        return tuple(per_head[:, :, i].contiguous() for i in range(n))
+    per_rank = group.all_gather(torch.cat(tensors, dim=1).contiguous(), dim=1)
+    per_head = per_rank.view(num_tokens, dcp, n, head_dim)[:, ::kv_head_replicas]
+    return tuple(per_head[:, :, i].contiguous() for i in range(n))
+
+
+def _selected_fake(q, candidates, topk):
+    """Shape of the merged selection ``[T, G, topk]`` int32 of a DCP attend
+    op's ``candidates [dcp, 2 * topk, T * G]``."""
+    num_tokens = q.shape[0]
+    return torch.empty(
+        (num_tokens, candidates.shape[2] // num_tokens, topk),
+        dtype=torch.int32,
+        device=q.device,
+    )
 
 
 @functools.cache
@@ -549,9 +585,17 @@ def get_msa_dcp_op(
     kv_head_replicas: int = 1,
     fp4: bool = False,
     decode_rows: int = 1,
+    index_reuse: bool = False,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_op` for a KV head's context split over ``dcp`` ranks
     (`kernels.msa_dcp`).
+
+    With ``index_reuse`` (`models.minimax_m3.index_reuse`) the op also takes
+    ``index_reuse`` (a dict shared by the step's layers), ``full`` and
+    ``write_index``: a Full layer runs as without it and leaves its merged
+    selection in the dict; a Shared layer writes its K/V (and its index
+    keys if ``write_index``) and attends over the dict's selection, with no
+    scoring, candidates or candidate all-gather.
 
     ``decode_rows`` is the most query rows of a decode request (1 + the
     speculative tokens): with 4-bit caches and a group of several KV heads,
@@ -596,6 +640,7 @@ def get_msa_dcp_op(
             dcp,
             kv_head_replicas,
             decode_rows,
+            index_reuse,
         )
 
     def _score_jax(
@@ -684,6 +729,16 @@ def get_msa_dcp_op(
         if kv_heads == 1 and ATTEND_MERGE
         else None
     )
+    reuse_ops = (
+        _dcp_reuse_ops(sm_scale, topk, dcp, suffix, fp4=False) if index_reuse else None
+    )
+    # Index reuse with attend+merge: the Full layers' program also returns
+    # the merged selection, the Shared layers' takes it.
+    am_select_op, am_given_op = (
+        _attend_merge_reuse_ops(sm_scale, topk, dcp, False, suffix)
+        if index_reuse and attend_merge_op is not None
+        else (None, None)
+    )
 
     def op(
         q: torch.Tensor,
@@ -696,9 +751,34 @@ def get_msa_dcp_op(
         metadata: AttentionMetadata,
         *,
         dcp_rank: torch.Tensor,
+        index_reuse: dict | None = None,
+        full: bool = True,
+        write_index: bool = True,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
+        meta = (metadata.seq_lens, metadata.block_tables, metadata.query_start_loc)
+        if index_reuse is not None and not full:
+            if kv_heads > 1:
+                k, v = gather_group_kv_only(k, v, group, dcp, kv_head_replicas, dcp_rank)
+            if am_given_op is None:
+                q_all = gather_query_heads(q, group)
+            if write_index:
+                new_kv_cache, new_index_cache = reuse_ops.write(
+                    k, v, index_k, kv_cache, index_cache, *meta, dcp_rank
+                )
+                index_cache.copy_(new_index_cache)
+            else:
+                new_kv_cache = reuse_ops.write_kv(k, v, kv_cache, *meta, dcp_rank)
+            kv_cache.copy_(new_kv_cache)
+            if am_given_op is not None:
+                return am_given_op(
+                    dcp_rank, q.contiguous(), kv_cache, index_reuse["selected"], *meta
+                ).view(q.shape)
+            out, lse = reuse_ops.attend_selected(
+                q_all, kv_cache, index_reuse["selected"], *meta, dcp_rank
+            )
+            return merge_head_partials(out, lse, group)
         if attend_merge_op is not None:
             new_kv_cache, new_index_cache, candidates = score_op(
                 k,
@@ -715,6 +795,11 @@ def get_msa_dcp_op(
             )
             kv_cache.copy_(new_kv_cache)
             index_cache.copy_(new_index_cache)
+            if am_select_op is not None and index_reuse is not None:
+                out, index_reuse["selected"] = am_select_op(
+                    dcp_rank, q.contiguous(), kv_cache, candidates, *meta
+                )
+                return out.view(q.shape)
             return attend_merge_op(
                 dcp_rank,
                 q.contiguous(),
@@ -754,6 +839,11 @@ def get_msa_dcp_op(
             )
         else:
             candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        if index_reuse is not None:
+            out, lse, index_reuse["selected"] = reuse_ops.attend_and_select(
+                q_all, kv_cache, candidates, *meta, dcp_rank
+            )
+            return merge_head_partials(out, lse, group)
         out, lse = attend_op(
             q_all,
             kv_cache,
@@ -768,6 +858,273 @@ def get_msa_dcp_op(
     return op
 
 
+class _ReuseOps(NamedTuple):
+    """The JAX ops of MSA index reuse for one DCP op config."""
+
+    write: Callable[..., Any]  # a Shared layer's K/V + index-key writes
+    write_kv: Callable[..., Any]  # its K/V writes only
+    attend_and_select: Callable[..., Any]  # a Full layer's attend + selection
+    attend_selected: Callable[..., Any]  # a Shared layer's attend
+
+
+def _dcp_reuse_ops(
+    sm_scale: float, topk: int, dcp: int, suffix: str, *, fp4: bool
+) -> _ReuseOps:
+    """`_ReuseOps` of the DCP op named by `suffix` (`get_msa_dcp_op`). With
+    `fp4` the ops take and update the scale cache, and the write ops rotate
+    this rank's queries as the 4-bit score op does."""
+    kind = "fp4_" if fp4 else ""
+
+    if fp4:
+
+        def _write_jax(
+            k: jax.Array,
+            v: jax.Array,
+            index_k: jax.Array,
+            kv_cache: jax.Array,
+            index_cache: jax.Array,
+            scale_cache: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            dcp_rank: jax.Array,
+            q: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return *msa_dcp.msa_write_dcp(
+                k,
+                v,
+                index_k,
+                kv_cache,
+                index_cache,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                rank=dcp_rank,
+                dcp=dcp,
+                scale_cache=scale_cache,
+            ), msa_fp4.rotate_queries(q)
+
+        def _write_kv_jax(
+            k: jax.Array,
+            v: jax.Array,
+            kv_cache: jax.Array,
+            scale_cache: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            dcp_rank: jax.Array,
+            q: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return *msa_dcp.msa_write_dcp(
+                k,
+                v,
+                None,
+                kv_cache,
+                None,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                rank=dcp_rank,
+                dcp=dcp,
+                scale_cache=scale_cache,
+            ), msa_fp4.rotate_queries(q)
+
+        def _attend_and_select_jax(
+            q: jax.Array,
+            kv_cache: jax.Array,
+            scale_cache: jax.Array,
+            candidates: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            dcp_rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return msa_dcp.msa_attend_dcp(
+                q,
+                kv_cache,
+                candidates,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                topk=topk,
+                sm_scale=sm_scale,
+                rank=dcp_rank,
+                dcp=dcp,
+                scale_cache=scale_cache,
+                return_selected=True,
+            )
+
+        def _attend_selected_jax(
+            q: jax.Array,
+            kv_cache: jax.Array,
+            scale_cache: jax.Array,
+            selected: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            dcp_rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return msa_dcp.msa_attend_selected_dcp(
+                q,
+                kv_cache,
+                selected,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                sm_scale=sm_scale,
+                rank=dcp_rank,
+                dcp=dcp,
+                scale_cache=scale_cache,
+            )
+
+        write_donate, write_kv_donate = (3, 4, 5), (2, 3)
+
+        def _write_fake(k, v, index_k, kv_cache, index_cache, scale_cache, *args):
+            return (
+                torch.empty_like(kv_cache),
+                torch.empty_like(index_cache),
+                torch.empty_like(scale_cache),
+                torch.empty_like(args[-1]),
+            )
+
+        def _write_kv_fake(k, v, kv_cache, scale_cache, *args):
+            return (
+                torch.empty_like(kv_cache),
+                torch.empty_like(scale_cache),
+                torch.empty_like(args[-1]),
+            )
+
+        def _attend_and_select_fake(q, kv_cache, scale_cache, candidates, *args):
+            return (*_head_major_attend_fake(q), _selected_fake(q, candidates, topk))
+
+    else:
+
+        def _write_jax(
+            k: jax.Array,
+            v: jax.Array,
+            index_k: jax.Array,
+            kv_cache: jax.Array,
+            index_cache: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            dcp_rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return msa_dcp.msa_write_dcp(
+                k,
+                v,
+                index_k,
+                kv_cache,
+                index_cache,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                rank=dcp_rank,
+                dcp=dcp,
+            )
+
+        def _write_kv_jax(
+            k: jax.Array,
+            v: jax.Array,
+            kv_cache: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            dcp_rank: jax.Array,
+        ) -> jax.Array:
+            (kv_cache,) = msa_dcp.msa_write_dcp(
+                k,
+                v,
+                None,
+                kv_cache,
+                None,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                rank=dcp_rank,
+                dcp=dcp,
+            )
+            return kv_cache
+
+        def _attend_and_select_jax(
+            q: jax.Array,
+            kv_cache: jax.Array,
+            candidates: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            dcp_rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return msa_dcp.msa_attend_dcp(
+                q,
+                kv_cache,
+                candidates,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                topk=topk,
+                sm_scale=sm_scale,
+                rank=dcp_rank,
+                dcp=dcp,
+                return_selected=True,
+            )
+
+        def _attend_selected_jax(
+            q: jax.Array,
+            kv_cache: jax.Array,
+            selected: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            dcp_rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return msa_dcp.msa_attend_selected_dcp(
+                q,
+                kv_cache,
+                selected,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                sm_scale=sm_scale,
+                rank=dcp_rank,
+                dcp=dcp,
+            )
+
+        write_donate, write_kv_donate = (3, 4), (2,)
+
+        def _write_fake(k, v, index_k, kv_cache, index_cache, *args):
+            return torch.empty_like(kv_cache), torch.empty_like(index_cache)
+
+        def _write_kv_fake(k, v, kv_cache, *args):
+            return torch.empty_like(kv_cache)
+
+        def _attend_and_select_fake(q, kv_cache, candidates, *args):
+            return (*_head_major_attend_fake(q), _selected_fake(q, candidates, topk))
+
+    name = f"pallas::minimax_m3_msa_dcp_{kind}reuse"
+    ops = _ReuseOps(
+        pallas.jax_op(
+            f"{name}_write_{suffix}", _write_jax, donate_argnums=write_donate
+        ),
+        pallas.jax_op(
+            f"{name}_write_kv_{suffix}", _write_kv_jax, donate_argnums=write_kv_donate
+        ),
+        pallas.jax_op(f"{name}_attend_select_{suffix}", _attend_and_select_jax),
+        pallas.jax_op(f"{name}_attend_selected_{suffix}", _attend_selected_jax),
+    )
+    ops.write.register_fake(_write_fake)
+    ops.write_kv.register_fake(_write_kv_fake)
+    ops.attend_and_select.register_fake(_attend_and_select_fake)
+    ops.attend_selected.register_fake(_head_major_attend_fake)
+    logger.info(
+        "MSA DCP: index reuse ops built (%s, dcp %d): Shared layers attend over "
+        "the preceding Full layer's selection",
+        "4-bit caches" if fp4 else "8/16-bit caches",
+        dcp,
+    )
+    return ops
+
+
 def _get_msa_dcp_fp4_op(
     sm_scale: float,
     topk: int,
@@ -776,6 +1133,7 @@ def _get_msa_dcp_fp4_op(
     dcp: int,
     kv_head_replicas: int,
     decode_rows: int,
+    index_reuse: bool = False,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_dcp_op` for 4-bit caches."""
     kv_heads = max(1, dcp // kv_head_replicas)
@@ -897,6 +1255,83 @@ def _get_msa_dcp_fp4_op(
         if kv_heads == 1 and ATTEND_MERGE
         else None
     )
+    am_select_op, am_given_op = (
+        _attend_merge_reuse_ops(sm_scale, topk, dcp, True, suffix)
+        if index_reuse and attend_merge_op is not None
+        else (None, None)
+    )
+    reuse_ops = (
+        _dcp_reuse_ops(sm_scale, topk, dcp, suffix, fp4=True) if index_reuse else None
+    )
+
+    def shared_op(
+        q,
+        k,
+        v,
+        index_k,
+        kv_cache,
+        index_cache,
+        metadata,
+        dcp_rank,
+        scale_cache,
+        hadamard,
+        index_reuse,
+        write_index,
+    ):
+        """A Shared layer of index reuse: write, then attend over the
+        preceding Full layer's selection (head-parallel path: its local
+        candidates, which `heads_op` merges itself; attend+merge: the
+        selection, in one SPMD op)."""
+        group = get_dcp_group()
+        meta = (metadata.seq_lens, metadata.block_tables, metadata.query_start_loc)
+        if kv_heads > 1:
+            k, v = gather_group_kv_only(k, v, group, dcp, kv_head_replicas, dcp_rank)
+        if write_index:
+            new_kv_cache, new_index_cache, new_scale_cache, q = reuse_ops.write(
+                k,
+                v,
+                index_k,
+                kv_cache,
+                index_cache,
+                scale_cache,
+                *meta,
+                dcp_rank,
+                q.contiguous(),
+            )
+        else:
+            new_kv_cache, new_scale_cache, q = reuse_ops.write_kv(
+                k, v, kv_cache, scale_cache, *meta, dcp_rank, q.contiguous()
+            )
+        if heads_op is None and am_given_op is None:
+            q_all = gather_query_heads(q, group)
+        kv_cache.copy_(new_kv_cache)
+        if write_index:
+            index_cache.copy_(new_index_cache)
+        scale_cache.copy_(new_scale_cache)
+        if am_given_op is not None:
+            return am_given_op(
+                dcp_rank,
+                q.contiguous(),
+                kv_cache,
+                index_reuse["selected"],
+                *meta,
+                scale_cache,
+                hadamard,
+            ).view(q.shape)
+        if heads_op is not None:
+            return heads_op(
+                dcp_rank,
+                q,
+                kv_cache,
+                scale_cache,
+                index_reuse["candidates"],
+                *meta,
+                metadata.request_distribution,
+            )
+        out, lse = reuse_ops.attend_selected(
+            q_all, kv_cache, scale_cache, index_reuse["selected"], *meta, dcp_rank
+        )
+        return merge_head_partials(out, lse, group, hadamard)
 
     def op(
         q: torch.Tensor,
@@ -911,7 +1346,25 @@ def _get_msa_dcp_fp4_op(
         dcp_rank: torch.Tensor,
         scale_cache: torch.Tensor,
         hadamard: torch.Tensor,
+        index_reuse: dict | None = None,
+        full: bool = True,
+        write_index: bool = True,
     ) -> torch.Tensor:
+        if index_reuse is not None and not full:
+            return shared_op(
+                q,
+                k,
+                v,
+                index_k,
+                kv_cache,
+                index_cache,
+                metadata,
+                dcp_rank,
+                scale_cache,
+                hadamard,
+                index_reuse,
+                write_index,
+            )
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
         if kv_heads > 1:
@@ -939,6 +1392,19 @@ def _get_msa_dcp_fp4_op(
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
+        if am_select_op is not None and index_reuse is not None:
+            out, index_reuse["selected"] = am_select_op(
+                dcp_rank,
+                q.contiguous(),
+                kv_cache,
+                candidates,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                scale_cache,
+                hadamard,
+            )
+            return out.view(q.shape)
         if attend_merge_op is not None:
             return attend_merge_op(
                 dcp_rank,
@@ -952,6 +1418,8 @@ def _get_msa_dcp_fp4_op(
                 hadamard,
             ).view(q.shape)
         if heads_op is not None:
+            if index_reuse is not None:
+                index_reuse["candidates"] = candidates
             return heads_op(
                 dcp_rank,
                 q,
@@ -969,6 +1437,18 @@ def _get_msa_dcp_fp4_op(
             )
         else:
             candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        if index_reuse is not None:
+            out, lse, index_reuse["selected"] = reuse_ops.attend_and_select(
+                q_all,
+                kv_cache,
+                scale_cache,
+                candidates,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                dcp_rank,
+            )
+            return merge_head_partials(out, lse, group, hadamard)
         out, lse = attend_op(
             q_all,
             kv_cache,
@@ -984,22 +1464,43 @@ def _get_msa_dcp_fp4_op(
     return op
 
 
-def _get_msa_dcp_attend_merge_op(
+def _attend_merge_reuse_ops(
     sm_scale: float, topk: int, dcp: int, fp4: bool, suffix: str
-) -> Callable[..., torch.Tensor]:
+) -> tuple[Callable[..., Any], Callable[..., torch.Tensor]]:
+    """MSA index reuse's attend+merge ops (`msa_dcp_merge.SELECTIONS`): a
+    Full layer's, which also returns the merged selection ``[T, 1, topk]``,
+    and a Shared layer's, which takes it in place of the candidates."""
+    return (
+        _get_msa_dcp_attend_merge_op(sm_scale, topk, dcp, fp4, suffix, "return"),
+        _get_msa_dcp_attend_merge_op(sm_scale, topk, dcp, fp4, suffix, "given"),
+    )
+
+
+def _get_msa_dcp_attend_merge_op(
+    sm_scale: float,
+    topk: int,
+    dcp: int,
+    fp4: bool,
+    suffix: str,
+    selection: str = "candidates",
+) -> Callable[..., Any]:
     """The attention half of the DCP op over one KV head as one SPMD op over
     the DCP mesh (`msa_dcp_merge.attend_and_merge`): this rank's queries
     ``[T, Hl, D]`` and candidates in, its heads' merged output ``[T, Hl *
-    D]`` out. With `fp4` it also takes the scale cache and the hadamard."""
+    D]`` out. With `fp4` it also takes the scale cache and the hadamard.
+    ``selection`` (MSA index reuse, `msa_dcp_merge.SELECTIONS`): "return"
+    also returns this rank's copy of the merged selection ``[T, 1, topk]``;
+    "given" takes that selection in place of the candidates."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
 
     logger.info(
         "MSA DCP: attention + merge as one SPMD op (minimax_dcp_attend_merge, "
-        "DCP %d, fp4 %s)",
+        "DCP %d, fp4 %s, selection %s)",
         dcp,
         fp4,
+        selection,
     )
     mesh = get_or_create_dcp_mesh()
     sharded, replicated = PartitionSpec(DCP_AXIS_NAME), PartitionSpec()
@@ -1013,10 +1514,11 @@ def _get_msa_dcp_attend_merge_op(
             dcp=dcp,
             sm_scale=sm_scale,
             topk=topk,
+            selection=selection,
         ),
         mesh=mesh,
         in_specs=specs,
-        out_specs=sharded,
+        out_specs=(sharded, sharded) if selection == "return" else sharded,
         check_vma=False,
     )
 
@@ -1063,18 +1565,28 @@ def _get_msa_dcp_attend_merge_op(
         )
 
     # pyrefly: ignore[no-matching-overload]
+    name = f"pallas::minimax_m3_msa_dcp_attend_merge_{suffix}_fp4{int(fp4)}"
+    if selection != "candidates":
+        name += f"_sel_{selection}"
     op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_attend_merge_{suffix}_fp4{int(fp4)}",
+        name,
         _attend_fp4_jax if fp4 else _attend_jax,
         mesh=mesh,
         input_partition_specs=specs,
         # A sequence, one spec per output (a bare spec reads as its axes).
-        output_partition_specs=(sharded,),
+        output_partition_specs=(sharded, sharded)
+        if selection == "return"
+        else (sharded,),
     )
 
     def _fake(dcp_rank, q, *args):
         num_tokens, num_heads, head_dim = q.shape
-        return q.new_empty((num_tokens, num_heads * head_dim))
+        out = q.new_empty((num_tokens, num_heads * head_dim))
+        if selection == "return":
+            return out, torch.empty(
+                (num_tokens, 1, topk), dtype=torch.int32, device=q.device
+            )
+        return out
 
     op.register_fake(_fake)
     return op

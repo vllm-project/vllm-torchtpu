@@ -50,6 +50,7 @@ from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
+from vllm_torchtpu.models.minimax_m3.index_reuse import plan_from_config
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
 from vllm_torchtpu.models.minimax_m3.split import join_seq_lens, split_query_layout
@@ -197,6 +198,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             vllm_config.cache_config,
             prefix=f"{prefix}.self_attn",
             reduce_results=reduce_results,
+            layer_id=layer_id,
         )
         # Dense layers name their FFN `mlp`, MoE layers `block_sparse_moe`.
         self.is_moe_layer = bool(config.moe_layer_freq[layer_id])
@@ -271,6 +273,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
             else:
                 o_proj.reduce_results, down.reduce_results = saved
 
+    def _self_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: dict | None,
+        index_reuse: dict | None,
+    ) -> torch.Tensor:
+        """`self_attn`, given the step's MSA index reuse dict only when on."""
+        if index_reuse is None:
+            return self.self_attn(positions, hidden_states, attn_metadata)
+        return self.self_attn(positions, hidden_states, attn_metadata, index_reuse)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -278,10 +292,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         attn_metadata: dict | None = None,
         attn_rs: bool = False,
+        index_reuse: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Residual-deferred layer; `attn_rs` (minimax_sp_mode "attn", large
         steps) reduce-scatters the attention output instead of all-reducing
-        it."""
+        it. `index_reuse` (MSA index reuse on) is the step's shared selection
+        dict (`MiniMaxM3SparseAttention.forward`)."""
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -289,8 +305,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         if attn_rs:
             with self._layer_owned_reductions():
-                return self._attn_rs(positions, hidden_states, residual)
-        attn = self.self_attn(positions, hidden_states, attn_metadata)
+                return self._attn_rs(positions, hidden_states, residual, index_reuse)
+        attn = self._self_attn(positions, hidden_states, attn_metadata, index_reuse)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         if not self.split_min_tokens:
             hidden_states, residual = self.post_attention_layernorm(attn, residual)
@@ -305,13 +321,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        index_reuse: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Each rank gets the new residual stream of its token shard,
         normalizes it and all-gathers it as the FFN input; the attention
         partial rides the FFN all-reduce. The returned residual is the
         pre-attention one, so the next fused add + norm sees
         ``ffn + attn + residual``."""
-        attn = self.self_attn(positions, hidden_states, None)
+        attn = self._self_attn(positions, hidden_states, None, index_reuse)
         shard = tensor_model_parallel_reduce_scatter(attn + residual / self.tp_size, 0)
         normed = _all_gather_rows(
             self.post_attention_layernorm(shard), self.sp.fp8_gather
@@ -325,6 +342,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         shard: torch.Tensor | None,
+        index_reuse: dict | None = None,
     ) -> torch.Tensor:
         """Sequence-parallel layer (minimax_sp_mode "full"): the residual
         stream stays a token shard.
@@ -336,8 +354,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         """
         with self._layer_owned_reductions():
             if shard is None:
-                attn = self.self_attn(
-                    positions, self.input_layernorm(hidden_states), None
+                attn = self._self_attn(
+                    positions, self.input_layernorm(hidden_states), None, index_reuse
                 )
                 shard = tensor_model_parallel_reduce_scatter(
                     attn + hidden_states / self.tp_size, 0
@@ -346,7 +364,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 normed = _all_gather_rows(
                     self.input_layernorm(shard), self.sp.fp8_attn_gather
                 )
-                attn = self.self_attn(positions, normed, None)
+                attn = self._self_attn(positions, normed, None, index_reuse)
                 shard = shard + tensor_model_parallel_reduce_scatter(attn, 0)
             ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
             normed = _all_gather_rows(
@@ -480,6 +498,10 @@ class MiniMaxM3Model(nn.Module):
         check_split_disabled(vllm_config.additional_config)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.sp = sp_config(vllm_config.additional_config)
+        # MSA index reuse (`index_reuse`): the layers share one dict per step.
+        self.index_reuse = plan_from_config(
+            vllm_config.additional_config, config.num_hidden_layers
+        ).active
         self.split_min_tokens = option(
             vllm_config.additional_config, "minimax_split_min_tokens"
         )
@@ -527,10 +549,15 @@ class MiniMaxM3Model(nn.Module):
         # Stand-in models (tests) may carry no SP config: off.
         sp = getattr(self, "sp", None) or SpConfig()
         sp_step = halves is None and _sp_step(sp, num_tokens, getattr(self, "tp_size", 1))
+        # MSA index reuse: one selection dict per step, shared by the layers
+        # (also on SP steps, whose attention sees all the step's rows). The
+        # token-half split (refused by check_split_disabled) does not reuse.
+        # Passed only when on, so key-off calls are those of the plain model.
+        reuse = {"index_reuse": {}} if getattr(self, "index_reuse", False) else {}
         if sp_step and sp.mode == "full":
             shard = None
             for idx, layer in enumerate(self.layers):
-                shard = layer.forward_sp(positions, inputs_embeds, shard)
+                shard = layer.forward_sp(positions, inputs_embeds, shard, **reuse)
                 if idx + 1 in self.aux_hidden_state_layers:
                     aux_hidden_states.append(tensor_model_parallel_all_gather(shard, 0))
             hidden_states = tensor_model_parallel_all_gather(self.norm(shard), 0)
@@ -542,11 +569,11 @@ class MiniMaxM3Model(nn.Module):
             for idx, layer in enumerate(self.layers):
                 if sp_step:
                     hidden_states, residual = layer(
-                        positions, hidden_states, residual, attn_rs=True
+                        positions, hidden_states, residual, attn_rs=True, **reuse
                     )
                 else:
                     hidden_states, residual = layer(
-                        positions, hidden_states, residual, metadata
+                        positions, hidden_states, residual, metadata, **reuse
                     )
                 if idx + 1 in self.aux_hidden_state_layers:
                     aux_hidden_states.append(hidden_states + residual)

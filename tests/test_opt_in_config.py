@@ -148,6 +148,10 @@ SAMPLE = {
     # --- v7 offload ---
     "offload_max_inflight_load_mib": 128,
     "offload_max_inflight_store_mib": 64,
+    # --- r7: MSA index reuse (IndexCache) ---
+    "minimax_msa_index_reuse": "2",
+    "minimax_msa_index_reuse_prefill": "full:0,4,8",
+    "minimax_msa_index_reuse_decode": "stride:4",
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {
@@ -173,6 +177,11 @@ NEW_KEYS = {
     "spec_vocab_argmax_masked",
     # --- r7: head-split DCP draft KV (r10) ---
     "draft_kv_head_split",
+    # --- r7: MSA index reuse (IndexCache) ---
+    "minimax_msa_index_reuse",
+    "minimax_msa_index_reuse_prefill",
+    "minimax_msa_index_reuse_decode",
+    "minimax_msa_index_reuse_skip_index_write",
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.

@@ -33,7 +33,18 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.minimax_m3.kernels.msa_dcp import msa_attend_dcp, rank_array
+from vllm_torchtpu.models.minimax_m3.kernels.msa_dcp import (
+    msa_attend_dcp,
+    msa_attend_selected_dcp,
+    rank_array,
+)
+
+# `attend_and_merge`'s `selection` (MSA index reuse,
+# `models.minimax_m3.index_reuse`): "candidates" takes the local candidates
+# (the default program), "return" also returns the merged selection (a Full
+# layer), "given" takes a merged selection instead of candidates (a Shared
+# layer: no candidate gather, no merge of candidates).
+SELECTIONS = ("candidates", "return", "given")
 
 # Decode-sized steps of a DCP pair move their candidates and partials by
 # collective permutes (latency-bound), larger ones by XLA collectives.
@@ -218,7 +229,8 @@ def attend_and_merge(
     sm_scale: float,
     topk: int,
     interpret: bool = False,
-) -> jax.Array:
+    selection: str = "candidates",
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """The attention half of the DCP forward over one KV head, inside a
     ``shard_map`` over `axis` (the DCP group): this rank's query heads ``q
     [T, Hl, D]`` (rotated for a 4-bit cache, then pass its `scale_cache` and
@@ -230,31 +242,56 @@ def attend_and_merge(
     go to their owner by all-to-all for `merge_partials`. As XLA collectives
     in one program they move the head-major buffers as laid out; torch's
     all-to-all of them cost ~890 us per layer at 8K tokens in the r10 line's
-    c4 twin."""
+    c4 twin.
+
+    With ``selection`` "return" the merged selection ``[T, 1, topk]`` int32
+    follows the output; with "given", ``candidates`` is that merged
+    selection (the same on every rank) and is attended as it is (`SELECTIONS`)."""
+    if selection not in SELECTIONS:
+        raise ValueError(f"selection must be one of {SELECTIONS}, got {selection!r}")
     num_tokens, num_heads, head_dim = q.shape
     rank = rank_array(rank)[0]
     q_all = _gather_heads(q.transpose(1, 0, 2), rank, axis, dcp)
     # Decode-sized operands of a pair move by permutes (latency); a prefill
     # step's partials by XLA's all-to-all, which writes them in place.
     small = dcp == 2 and num_tokens <= PERMUTE_MAX_TOKENS
-    if small:
-        cand_all = gather_by_permute(candidates, rank, axis, dcp)
+    selected = None
+    if selection == "given":
+        out, lse = msa_attend_selected_dcp(
+            q_all.transpose(1, 0, 2),
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            sm_scale=sm_scale,
+            rank=rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+            interpret=interpret,
+        )
     else:
-        cand_all = jax.lax.all_gather(candidates, axis, axis=0)
-    out, lse = msa_attend_dcp(
-        q_all.transpose(1, 0, 2),
-        kv_cache,
-        cand_all,
-        seq_lens,
-        block_tables,
-        cu_q_lens,
-        sm_scale=sm_scale,
-        topk=topk,
-        rank=rank,
-        dcp=dcp,
-        scale_cache=scale_cache,
-        interpret=interpret,
-    )
+        if small:
+            cand_all = gather_by_permute(candidates, rank, axis, dcp)
+        else:
+            cand_all = jax.lax.all_gather(candidates, axis, axis=0)
+        out, lse, *rest = msa_attend_dcp(
+            q_all.transpose(1, 0, 2),
+            kv_cache,
+            cand_all,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            sm_scale=sm_scale,
+            topk=topk,
+            rank=rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+            interpret=interpret,
+            return_selected=selection == "return",
+        )
+        if rest:
+            (selected,) = rest
     out, lse = out[:, :num_tokens], lse[:, :num_tokens]
     # Block r of each result came from rank r: its partial of this rank's heads.
     parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
@@ -264,4 +301,7 @@ def attend_and_merge(
     else:
         parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
         lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
-    return merge_partials(parts, lses, hadamard, interpret=interpret)
+    merged = merge_partials(parts, lses, hadamard, interpret=interpret)
+    if selected is not None:
+        return merged, selected
+    return merged

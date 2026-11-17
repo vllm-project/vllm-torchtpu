@@ -141,15 +141,38 @@ real = np.concatenate([np.arange(num_real) + r * num_tokens for r in range(dcp)]
 assert np.all(np.isfinite(got)), "non-finite"
 err = np.abs(got[real] - ref[real]).max()
 assert err < 2e-2, err
+if len(sys.argv) > 2:
+    # MSA index reuse: "return" adds the merged selection to the same
+    # output, "given" attends a selection as the candidates would select.
+    args = (jnp.arange(dcp, dtype=jnp.int32),
+            jnp.concatenate([q[:, r * hl:(r + 1) * hl] for r in range(dcp)]),
+            jnp.concatenate(caches))
+    def run(selection, out_specs, *rest):
+        return jax.shard_map(
+            lambda *a: msa_dcp_merge.attend_and_merge(*a, axis="dcp", dcp=dcp,
+                sm_scale=t.SCALE, topk=topk, interpret=True, selection=selection),
+            mesh=mesh, in_specs=(sh,) * 4 + (rep,) * 3, out_specs=out_specs,
+            check_vma=False)(*args, *rest)
+    got_r, sel = run("return", (sh, sh), jnp.concatenate(cands), *meta)
+    assert np.array_equal(np.asarray(got_r.astype(jnp.float32)), got), "return"
+    want_sel = np.asarray(msa_dcp.merge_head_candidates(stacked, topk, 1, True))
+    sel = np.asarray(sel).reshape(dcp, num_tokens, 1, topk)
+    for r in range(dcp):
+        assert np.array_equal(sel[r], want_sel), ("selection", r)
+    got_g = run("given", sh, jnp.concatenate([jnp.asarray(want_sel)] * dcp), *meta)
+    assert np.array_equal(np.asarray(got_g.astype(jnp.float32)), got), "given"
 print("OK", err)
 '''
 
 
+@pytest.mark.parametrize("reuse", [False, True])
 @pytest.mark.parametrize("path", ["small", "large"])
-def test_attend_and_merge_matches_per_rank_attention(path):
+def test_attend_and_merge_matches_per_rank_attention(path, reuse):
     """Permutes (small) and XLA collectives (large) paths: the merged output
     of each rank's heads within bf16 rounding of the f64 merge of per-rank
-    partials (the merge rounds once)."""
+    partials (the merge rounds once). With `reuse` (MSA index reuse) the
+    "return" / "given" selection programs give the same output bit for bit
+    and every rank the merged selection."""
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))))
     env = dict(
@@ -159,7 +182,7 @@ def test_attend_and_merge_matches_per_rank_attention(path):
         PYTHONPATH=f"{root}:{root}/src",
     )
     res = subprocess.run(
-        [sys.executable, "-c", _SCRIPT, path],
+        [sys.executable, "-c", _SCRIPT, path, *(["reuse"] if reuse else [])],
         cwd=root, env=env, capture_output=True, text=True, timeout=1500,
     )
     assert res.returncode == 0 and "OK" in res.stdout, res.stderr[-4000:]

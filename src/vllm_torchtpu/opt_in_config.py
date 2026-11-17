@@ -135,6 +135,18 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # KV head in one kernel call. Bitwise.
     "minimax_msa_decode_work_list_kernel": False,
     "minimax_msa_decode_one_call": False,
+    # MiniMax M3 MSA under DCP, lossy: cross-layer reuse of the block
+    # selection (IndexCache). Layer pattern of the Full layers that score
+    # ("N" = every N-th from 0, "full:0,a,b", or one F/S letter per layer;
+    # "" = off); the others attend over the nearest preceding Full layer's
+    # merged selection and skip the indexer, top-k and candidate exchange.
+    # Per step kind (overrides the first, "" inherits it), and skipping the
+    # index-key writes of layers Shared in both kinds
+    # (`models.minimax_m3.index_reuse`).
+    "minimax_msa_index_reuse": "",
+    "minimax_msa_index_reuse_prefill": "",
+    "minimax_msa_index_reuse_decode": "",
+    "minimax_msa_index_reuse_skip_index_write": False,
     # EP MoE steps of at least this many tokens: combine on the TensorCore
     # (`moe_tc_combine.tc_slab_combine`, bitwise, 0 = off); flat routing
     # arrays read once (same values, 0 = off). And the v3 combine's route

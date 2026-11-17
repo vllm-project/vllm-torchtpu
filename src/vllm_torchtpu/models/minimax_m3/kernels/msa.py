@@ -171,6 +171,36 @@ def write_fp4(
     )
 
 
+def write_fp4_kv(
+    kv_cache: jax.Array,
+    scale_cache: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    pages: jax.Array,
+    pos: jax.Array,
+    *,
+    max_num_seqs: int | None = None,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`write_fp4` of the K/V and their scales only (no index keys): the
+    same K/V bytes and scale rows."""
+    num_tokens = k.shape[0]
+    k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
+    v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
+    scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)
+    block_size = page_size(kv_cache)
+    return msa_write.write_fp4_kv_caches(
+        kv_cache,
+        scale_cache,
+        jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1),
+        scales,
+        pages,
+        pos % block_size,
+        max_runs=_max_runs(num_tokens, max_num_seqs, block_size),
+        interpret=interpret,
+    )
+
+
 def write_kv_and_index(
     kv_cache: jax.Array,
     index_cache: jax.Array,

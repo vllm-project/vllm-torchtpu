@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.models.minimax_m3 import index_reuse as msa_index_reuse
 from vllm_torchtpu.models.minimax_m3 import kernel_toggles
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4
 from vllm_torchtpu.logger import init_logger
@@ -383,6 +384,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         cache_config: CacheConfig | None,
         prefix: str,
         reduce_results: bool = True,
+        layer_id: int | None = None,
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -493,6 +495,20 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_cfg.get("sparse_init_block", 0),
             sparse_cfg.get("sparse_local_block", 0),
         )
+        # Cross-layer reuse of the block selection (`index_reuse`, lossy).
+        plan = msa_index_reuse.plan_from_config(
+            vllm_config.additional_config, config.num_hidden_layers
+        )
+        self.layer_id = layer_id
+        self.index_reuse_plan = plan if plan.active and layer_id is not None else None
+        if self.index_reuse_plan is not None and self.dcp_size == 1:
+            raise NotImplementedError(
+                f"additional_config.{msa_index_reuse.KEY}: MSA index reuse needs "
+                "--decode-context-parallel-size > 1."
+            )
+        spec = vllm_config.speculative_config
+        # The most tokens of a decode-sized step (`index_reuse`).
+        self.decode_rows = 1 + (spec.num_speculative_tokens if spec else 0)
         if self.dcp_size > 1:
             from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_dcp_world_size
 
@@ -501,13 +517,13 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"DCP group of {get_dcp_world_size()} ranks, expected "
                     f"{self.dcp_size}."
                 )
-            spec = vllm_config.speculative_config
             self.msa_op = get_msa_dcp_op(
                 *msa_config,
                 self.dcp_size,
                 self.kv_head_replicas,
                 fp4=self.fp4,
-                decode_rows=1 + (spec.num_speculative_tokens if spec else 0),
+                decode_rows=self.decode_rows,
+                index_reuse=self.index_reuse_plan is not None,
             )
             # A buffer, not a Python int, so the rank is a graph input and
             # every DCP rank compiles the same program (see get_msa_dcp_op).
@@ -546,9 +562,12 @@ class MiniMaxM3SparseAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         attn_metadata: dict | None = None,
+        index_reuse: dict | None = None,
     ) -> torch.Tensor:
         """``attn_metadata`` (per KV-cache prefix) replaces the forward
-        context's, for a call on part of the step's tokens."""
+        context's, for a call on part of the step's tokens. ``index_reuse``
+        (with MSA index reuse on) is a dict the step's layers share: a Full
+        layer leaves its selection in it for the Shared layers after it."""
         qkv, _ = self.qkv_proj(hidden_states)
         norms = (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm)
         if self.norm_rope_op is not None:
@@ -592,6 +611,15 @@ class MiniMaxM3SparseAttention(nn.Module):
                 extra["scale_cache"] = self.scale_cache.kv_cache
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
+            if index_reuse is not None and self.index_reuse_plan is not None:
+                # Static per compiled bucket: the padded token count against
+                # the most decode tokens of the padded request slots.
+                max_seqs = layer_metadata.seq_lens.shape[0]
+                prefill = num_tokens > max_seqs * self.decode_rows
+                plan = self.index_reuse_plan
+                extra["index_reuse"] = index_reuse
+                extra["full"] = plan.is_full(self.layer_id, prefill)
+                extra["write_index"] = plan.writes_index(self.layer_id)
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),

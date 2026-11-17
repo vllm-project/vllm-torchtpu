@@ -549,6 +549,33 @@ def write_fp4_caches(
     return kv_cache, index_cache, scale_cache
 
 
+@functools.partial(jax.jit, static_argnames=("max_runs", "traced_grid", "interpret"))
+def write_fp4_kv_caches(
+    kv_cache: jax.Array,
+    scale_cache: jax.Array,
+    kv_rows: jax.Array,
+    kv_scales: jax.Array,
+    pages: jax.Array,
+    slots: jax.Array,
+    *,
+    max_runs: int,
+    traced_grid: bool = True,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`write_fp4_caches` without the index rows (a layer whose index keys
+    are never read: a Shared layer of MSA index reuse)."""
+    kv_cache, scale_cache = _write(
+        [_Write(kv_cache, kv_rows, 4), _Write(scale_cache, kv_scales)],
+        pages,
+        slots,
+        max_runs=max_runs,
+        traced_grid=traced_grid,
+        interpret=interpret,
+        name="minimax_m3_msa_write_kv_caches",
+    )
+    return kv_cache, scale_cache
+
+
 def max_write_runs(num_tokens: int, max_num_seqs: int, page_size: int) -> int:
     """Runs of a batch: a request's q tokens span at most
     ``(q - 1) // page_size + 2`` pages."""
