@@ -400,9 +400,11 @@ def ragged_gather_reduce(
     )
     destination_blocks = jnp.broadcast_to(destination_template, indices_blocks.shape)
 
-    # Pre-pack `route_metadata` and `route_weights` before sorting and compact
-    # both in a single variadic `jax.lax.sort` with unique integer keys,
-    # eliminating all four dynamic 2D `jnp.take_along_axis` gathers.
+    # Compact each block's valid routes to its front with one variadic sort.
+    # The key is a route's column for a valid route and the column plus the
+    # block size for an invalid one, so the keys are unique and valid routes
+    # keep their order; the packed metadata and the weights (zero for invalid
+    # routes) are sorted along with it.
     raw_meta = jnp.where(
         valid_blocks,
         jnp.bitwise_or(
