@@ -287,19 +287,18 @@ def use_rhs_stream(cfgs: "GmmConfigs") -> bool:
     )
 
 
-def rhs_stream_copies(
-    rhs_ref: "WeightsRef", stream_ref: RhsStreamRef, group_id, slot, *, num_chunks: int
-):
-    """DMA descriptors that bring rhs[group_id] into stream slot `slot`."""
-    size_k = rhs_ref.weight.shape[1]
-    chunk_k = size_k // num_chunks
+def rhs_stream_copies(rhs_ref: "WeightsRef", stream_ref: RhsStreamRef, group_id, slot):
+    """DMA descriptors that bring rhs[group_id] into stream slot `slot`.
+
+    Only non-fused projections stream (use_rhs_stream), so the weight moves as
+    one whole-expert slab, followed by its scale.
+    """
     copies = [
         pltpu.make_async_copy(
-            rhs_ref.weight.at[group_id, pl.ds(c * chunk_k, chunk_k)],
-            stream_ref.weight.at[slot, pl.ds(c * chunk_k, chunk_k)],
+            rhs_ref.weight.at[group_id],
+            stream_ref.weight.at[slot],
             stream_ref.sems.at[slot],
         )
-        for c in range(num_chunks)
     ]
     if stream_ref.scale is not None:
         assert rhs_ref.scale is not None  # the stream has scales iff the rhs has
@@ -970,7 +969,6 @@ def kernel_main(
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
     rhs_hbm_ref = rhs_ref
-    num_chunks = 2 if cfgs.fuse_act is not None else 1
     if stream_ref is not None:
         stream = stream_ref
         max_active_group = min(cfgs.dims.size_group, cfgs.dims.size_lhs_group)
@@ -987,9 +985,7 @@ def kernel_main(
 
             @pl.when(first_group < max_active_group)
             def _():
-                for copy in rhs_stream_copies(
-                    rhs_hbm_ref, stream, first_group, 0, num_chunks=num_chunks
-                ):
+                for copy in rhs_stream_copies(rhs_hbm_ref, stream, first_group, 0):
                     copy.start()
 
     # Fill metadata buffer and return number of group & m interations.
@@ -1045,19 +1041,16 @@ def kernel_main(
         stream.run[1] = num_runs
 
         def slot_rhs_ref(slot) -> RhsRef:
-            def view(lo, hi):
-                return WeightsRef(
-                    weight=stream.weight.at[slot, :, lo:hi],
-                    scale=None
-                    if stream.scale is None
-                    else stream.scale.at[slot, :, :, lo:hi],
-                    bias=None,
-                )
-
+            # use_rhs_stream excludes fused gate/up projections, so a slot holds
+            # one projection's whole-expert slab.
             n = cfgs.out_size_n
-            if cfgs.fuse_act is not None:
-                return FusedWeightsRef(gate=view(0, n), up=view(n, 2 * n))
-            return view(0, n)
+            return WeightsRef(
+                weight=stream.weight.at[slot, :, 0:n],
+                scale=None
+                if stream.scale is None
+                else stream.scale.at[slot, :, :, 0:n],
+                bias=None,
+            )
 
         def streamed_kernel(tiled_lhs_ref, tiled_out_ref, *scratch_refs):
             gm_id = pl.program_id(1)
@@ -1073,11 +1066,7 @@ def kernel_main(
                 @pl.when(jnp.logical_and(gm_id == 0, stream.run[1] > 1))
                 def _():
                     for copy in rhs_stream_copies(
-                        rhs_hbm_ref,
-                        stream,
-                        stream.run_to_group[1],
-                        1,
-                        num_chunks=num_chunks,
+                        rhs_hbm_ref, stream, stream.run_to_group[1], 1
                     ):
                         copy.start()
 
@@ -1090,16 +1079,11 @@ def kernel_main(
                         stream,
                         stream.run_to_group[ahead],
                         ahead % RHS_STREAM_SLOTS,
-                        num_chunks=num_chunks,
                     ):
                         copy.start()
 
                 for copy in rhs_stream_copies(
-                    rhs_hbm_ref,
-                    stream,
-                    group_id,
-                    run % RHS_STREAM_SLOTS,
-                    num_chunks=num_chunks,
+                    rhs_hbm_ref, stream, group_id, run % RHS_STREAM_SLOTS
                 ):
                     copy.wait()
 
