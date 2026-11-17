@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Moved from src/vllm_torchtpu/kernels/fused_moe/v3/dense_slots.py, where it was
-# added by 79400d892 and extended by 3d13f5df7 (candidate4 5a1c82686). Only the
-# Qwen3.5 DP4 x TP2 decode layout runs it (fused_moe_ep_v3.QWEN3_5_CONFIG_BY_LAYOUT
-# turns it on); it builds on the fused EP v3 package (kernels/fused_moe/v3), whose
-# changes it does not pick up automatically.
+# Not a copy of a kernel on main: a layer of its own that only the Qwen3.5
+# DP4 x TP2 decode layout runs (fused_moe_ep_v3.QWEN3_5_CONFIG_BY_LAYOUT turns it
+# on). It builds on the fused EP v3 package (kernels/fused_moe/v3: the select,
+# row quantization, FFN, combine and layout helpers) and does not pick up changes
+# to it automatically.
 """Fused EP MoE with landing rows fixed by the routing alone ("dense slots";
 DP4xTP2 decode, experimental, default off).
 
