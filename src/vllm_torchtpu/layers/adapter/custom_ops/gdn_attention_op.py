@@ -46,7 +46,10 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
-from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
+from vllm_torchtpu.gdn_pool_layout import (
+    gdn_ssm_quant_u32_rows,
+    prefill_checkpoint_enabled,
+)
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import projection_scale
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
@@ -131,6 +134,7 @@ def gdn_attention_core_tpu(
     d_v: int,
     kernel_size: int,
     num_spec_tokens: int = 0,
+    ssm_state_quant: str = "",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # Speculative decoding: vLLM's MambaSpec widens the conv state by
     # `num_spec` columns per slot. The extra columns are unused on TPU
@@ -166,6 +170,7 @@ def gdn_attention_core_tpu(
         kernel_size=kernel_size,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        ssm_state_quant=ssm_state_quant,
     )
     if state_len > kernel_size - 1:
         # Write the kernel result into the first kernel_size - 1 columns of the
@@ -206,6 +211,7 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
+    ssm_state_quant: str = "",
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -233,6 +239,7 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        ssm_state_quant=ssm_state_quant,
     )
 
 
@@ -378,12 +385,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
     _checkpoint_alignment: int | None = None
+    _pcp_streaming_configured: bool = False
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
     conv1d: GdnColumnParallelLinear
 
     def __init__(self, *args, **kwargs):
+        pcp_enabled = self._pcp_streaming_enabled()
+        self._pcp_streaming_configured = pcp_enabled
         super().__init__(*args, **kwargs)
         self._create_conv1d()
         # Bound by the runner during KV-cache initialization; None until then
@@ -400,8 +410,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
-        pcp_enabled = self._pcp_streaming_enabled()
-        self._pcp_streaming_configured = pcp_enabled
         self._keep_qkvz_layout(pcp_enabled)
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
@@ -567,6 +575,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 conv_state_dtype,
             )
         conv_state_dtype = torch.float32
+        if envs.TPU_GDN_SSM_STATE_QUANT and not self._is_pcp_streaming():
+            # Quantized SSM state packs INT8 values + FP32 block-16 scales into
+            # 32-bit words sized by `get_state_shape`.
+            temporal_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -595,7 +607,20 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             conv_dim_axis=0 if is_conv_state_dim_first() else -1,
         )
         conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
+        if envs.TPU_GDN_SSM_STATE_QUANT and not self._is_pcp_streaming():
+            u32_rows = gdn_ssm_quant_u32_rows(
+                self.head_k_dim, envs.TPU_GDN_SSM_STATE_QUANT
+            )
+            if u32_rows is not None:
+                temporal_state_shape = (
+                    temporal_state_shape[0],
+                    u32_rows,
+                    temporal_state_shape[2],
+                )
         return conv_state_shape, temporal_state_shape
+
+    def _is_pcp_streaming(self) -> bool:
+        return self._pcp_streaming_configured or self._pcp_streaming_enabled()
 
     @staticmethod
     def _pcp_streaming_enabled() -> bool:
@@ -706,6 +731,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 d_v=self.head_v_dim,
                 kernel_size=self.conv_kernel_size,
                 num_spec_tokens=num_spec_tokens,
+                ssm_state_quant=envs.TPU_GDN_SSM_STATE_QUANT,
             )
             gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, 4))
 
@@ -764,6 +790,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
         recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
+        ssm_state_quant = (
+            "" if self._is_pcp_streaming() else envs.TPU_GDN_SSM_STATE_QUANT
+        )
         # Speculative decoding: verify windows run in the GDN kernel's SPEC
         # mode with one state checkpoint per window position kept inside
         # the request's state block; rejected drafts are rolled back by
@@ -827,6 +856,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
+                ssm_state_quant=ssm_state_quant,
             )
             if not block_major:
                 return result
@@ -861,6 +891,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size,
                 recurrent_state_dtype,
                 num_spec_tokens,
+                ssm_state_quant,
             ),
             build_op,
         )

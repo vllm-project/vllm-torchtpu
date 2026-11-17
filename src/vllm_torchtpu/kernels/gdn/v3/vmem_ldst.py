@@ -149,9 +149,22 @@ def load_and_select_states(
 
         # Unpack the uint32 words to the state dtype, then upcast because
         # compute runs in fp32.
-        hbm_recurrent_state = pltpu.bitcast(
-            recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
-        ).astype(jnp.float32)
+        if cfg.ssm_state_quant == "int8_block16":
+            q_rows = cfg.recurrent_q_u32_rows
+            q_u32 = recurrent_in_slot_ref[idx, 0, :, :q_rows, :]
+            s_u32 = recurrent_in_slot_ref[idx, 0, :, q_rows:, :]
+            q_vals = pltpu.bitcast(q_u32, jnp.int8).astype(jnp.float32)
+            scales = pltpu.bitcast(s_u32, jnp.float32)
+            scales = jnp.where(jnp.isfinite(scales), scales, 0.0)
+            n_blocks = cfg.recurrent_scale_u32_rows
+            hbm_recurrent_state = (
+                q_vals.reshape(cfg.num_v_heads, n_blocks, 16, cfg.v_head_dim)
+                * scales[:, :, None, :]
+            ).reshape(cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim)
+        else:
+            hbm_recurrent_state = pltpu.bitcast(
+                recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
+            ).astype(jnp.float32)
         prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 
         if carry_recurrent_scratch_ref is not None:
