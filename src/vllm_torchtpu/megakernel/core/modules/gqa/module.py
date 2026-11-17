@@ -53,7 +53,7 @@ from .decls import (
     resolve_gqa_binding,
     validate_gqa_options,
 )
-from .kv import build_worklist, make_kv_ring
+from .kv import add_stream_kv, build_worklist, make_kv_ring
 from .merge import split_merge
 from .new_token import att_new
 from .params import GQAParams, GQATunables, derive_params, gqa_scratch
@@ -254,8 +254,12 @@ class GQAModule(Module):
         return gqa_scratch(ex, plan.module_params[self.name])
 
     def prologue(self, ctx: Any) -> None:
-        """Build this rank's KV worklist (`wl_b`, `wl_t`, `wl_kp`, `wl_cnt[0]`)."""
-        build_worklist(ctx, ctx.module_params(self.name))
+        """Build this rank's KV worklist (`wl_b`, `wl_t`, `wl_kp`, `wl_cnt[0]`)
+        and, under `KVS`, add its KV tiles to the dense stream."""
+        ap: GQAParams = ctx.module_params(self.name)
+        build_worklist(ctx, ap)
+        if ap.KVS_IPT:
+            add_stream_kv(ctx, ap, self.name)
 
     def init_buffers(self, ctx: Any) -> None:
         """Initialize attention-specific VMEM scratch buffers after barrier."""

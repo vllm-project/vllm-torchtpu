@@ -45,6 +45,7 @@ _PACKED_FP8_PAGE_BUFFERS: frozenset[str] = frozenset(
     {
         "epool",
         "kvbuf",
+        "kvs_ring",
         "gpr_rec",
         "gpr_conv",
         "gdn_in_page",

@@ -101,6 +101,10 @@ class GQAParams:
     # RoPE cos / sin come per row from the `ROPE_TABLE_INPUT` extra input
     # instead of `pos_ref`, which then only indexes the KV cache.
     ROPE_TABLE: bool = False
+    # KV items per dense-ring bank when the KV blocks stream through the dense
+    # weight ring in need order (0: a separate KV ring).
+    KVS_IPT: int = 0
+    NBD: int = 0
 
     @property
     def KV_PK(self) -> int:
@@ -349,6 +353,21 @@ def derive_params(
     QVR = ex.B * nh + 8 if GQ else NBP * 8
     nt_att = plan.nt["att_in"] + plan.nt["att_out"]
     LAZY_ATT = tiles.lazy and nt_att <= tiles.nbd
+    # A separate KV ring is read when attention starts, behind the in-flight
+    # weight tiles, and cannot borrow their VMEM at long contexts (64k: 32 MB
+    # of KV per layer vs a 48 MiB ring). Streaming the KV blocks as dense-ring
+    # tiles right after `att_in` keeps one need-ordered HBM stream instead.
+    KVS_IPT = (
+        tiles.bank // KV_ITEM
+        if cache_exec(ex).paged_kv
+        and not KVE
+        and not cache_exec(ex).FUSED
+        and not LAZY_ATT
+        and not tiles.rel_fetch
+        and len(plan.branch_counts) == 1
+        and (g.HD // kv_pk) % 8 == 0
+        else 0
+    )
     return GQAParams(
         H=g.H,
         nh=nh,
@@ -391,6 +410,8 @@ def derive_params(
         GATE=bool(output_gate),
         KV_DT=kv_dtype,
         ROPE_TABLE=bool(rope_table),
+        KVS_IPT=KVS_IPT,
+        NBD=tiles.nbd,
     )
 
 
@@ -402,8 +423,13 @@ def gqa_scratch(ex: ExecSpec, ap: GQAParams) -> dict[str, Any]:
         scr["vbuf"] = pltpu.VMEM((ap.NKV, ap.BLK, ap.HD), BF16)
     scr.update(
         {
+            # `KVS`: one per item of every dense-ring bank, each waited alone.
             "kv_sem": pltpu.SemaphoreType.DMA(
-                (ap.NKVR,) if cache_exec(ex).paged_kv else (2, ap.NKV)
+                (ap.NBD, ap.KVS_IPT)
+                if ap.KVS_IPT
+                else (ap.NKVR,)
+                if cache_exec(ex).paged_kv
+                else (2, ap.NKV)
             ),
             "wl_b": pltpu.SMEM((ap.NWL,), I32),
             "wl_t": pltpu.SMEM((ap.NWL,), I32),
@@ -424,10 +450,11 @@ def gqa_scratch(ex: ExecSpec, ap: GQAParams) -> dict[str, Any]:
     else:
         scr.update(fused_io().gqa_fused_scratch(ex, ap.HD))
     if cache_exec(ex).paged_kv:
-        if not ap.KVE:
-            scr["kvbuf"] = pltpu.VMEM(
-                (ap.NKV, 2, ap.HD // ap.KV_PK, ap.KV_PK, ap.BLK), ap.KV_DT
-            )
+        item = (2, ap.HD // ap.KV_PK, ap.KV_PK, ap.BLK)
+        if ap.KVS_IPT and ex.interpret:  # typed stand-in for the dense pool banks
+            scr["kvs_ring"] = pltpu.VMEM((ap.NBD, ap.KVS_IPT, *item), ap.KV_DT)
+        elif not ap.KVE and not ap.KVS_IPT:
+            scr["kvbuf"] = pltpu.VMEM((ap.NKV, *item), ap.KV_DT)
         scr["knew_o"] = pltpu.VMEM((ex.MR, ap.HD), ap.KV_DT)
         scr["vnew_o"] = pltpu.VMEM((ex.MR, ap.HD), ap.KV_DT)
         scr["wl_kp"] = pltpu.SMEM((ap.NWL * (ap.BLK // cache_exec(ex).page_size),), I32)

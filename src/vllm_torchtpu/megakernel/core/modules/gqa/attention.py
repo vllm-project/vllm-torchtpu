@@ -34,9 +34,9 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
     ex, ap, scr, pos_ref, stream = cx.ex, cx.ap, cx.scr, cx.pos_ref, cx.stream
     interpret, KR = cx.interpret, cx.KR
     T, VER = ex.T, ex.VER
-    KVE, BLK, SUB, AMASK = ap.KVE, ap.BLK, ap.SUB, ap.AMASK
+    BLK, SUB, AMASK = ap.BLK, ap.SUB, ap.AMASK
     KV_DT, ROWS = ap.KV_DT, ap.HD // ap.KV_PK
-    kv_slot, kvbuf, kbuf, vbuf = kv.slot, kv.kvbuf, kv.kbuf, kv.vbuf
+    kbuf, vbuf = kv.kbuf, kv.vbuf
     s = i % KR
     b, t = scr["wl_b"][i], scr["wl_t"][i]
     plen = pos_ref[b * T] if VER else pos_ref[b]
@@ -45,17 +45,16 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
     v_full: Any = None
     v_u32: Any = None
     if cache_exec(ex).paged_kv:
+        kst = kv.stage(i)
         if interpret:
-            kst = kv_slot(s) if KVE else kvbuf.at[s]
             k_u32 = lax.bitcast_convert_type(jnp.swapaxes(kst[0], 1, 2), U32)
             v_u32 = lax.bitcast_convert_type(jnp.swapaxes(kst[1], 1, 2), U32)
-        elif KVE:
-            kst = kv_slot(s)
+        elif kv.u32:
             k_u32 = kst[0]
             v_u32 = kst[1]
         else:
-            k_u32 = kvbuf.at[s, 0].bitcast(U32).reshape(ROWS, BLK)[...]
-            v_u32 = kvbuf.at[s, 1].bitcast(U32).reshape(ROWS, BLK)[...]
+            k_u32 = kst.at[0].bitcast(U32).reshape(ROWS, BLK)[...]
+            v_u32 = kst.at[1].bitcast(U32).reshape(ROWS, BLK)[...]
         k_full = pltpu.bitcast(k_u32, KV_DT)
         if AMASK == 0:
             v_full = pltpu.bitcast(v_u32, KV_DT)
@@ -132,10 +131,10 @@ def item_back(cx: GQAEmit, b: Any, outs: Any) -> None:
 
 def att_core(cx: GQAEmit, kv: KVRing) -> None:
     """Online softmax over this rank's KV worklist (optionally item pairs)."""
-    ex, ap, skip, sc, n_items, KR = cx.ex, cx.ap, cx.skip, cx.sc, cx.n_items, cx.KR
+    ex, ap, skip, sc, n_items = cx.ex, cx.ap, cx.skip, cx.sc, cx.n_items
     am, al, aacc = cx.am, cx.al, cx.aacc
     PAIR_KV, SUB, AMASK, HD, TQ = ap.PAIR_KV, ap.SUB, ap.AMASK, ap.HD, ap.TQ
-    kv_start, kv_wait = kv.start, kv.wait
+    kv_done, kv_wait = kv.done, kv.wait
     with sc("att_core"):
         col = lax.broadcasted_iota(I32, (1 if AMASK else TQ, SUB), 1)
         col_v: Any = (
@@ -155,7 +154,7 @@ def att_core(cx: GQAEmit, kv: KVRing) -> None:
             kv_wait(i)
             if "attn" not in skip:
                 item_back(cx, *item_front(cx, kv, col, col_v, i))
-            kv_start(i + KR)
+            kv_done(i)
             return carry
 
         def item_pair(p, carry):
@@ -168,8 +167,8 @@ def att_core(cx: GQAEmit, kv: KVRing) -> None:
                 f1 = item_front(cx, kv, col, col_v, i1)
                 item_back(cx, *f0)
                 item_back(cx, *f1)
-            kv_start(i0 + KR)
-            kv_start(i1 + KR)
+            kv_done(i0)
+            kv_done(i1)
             return carry
 
         if PAIR_KV:
