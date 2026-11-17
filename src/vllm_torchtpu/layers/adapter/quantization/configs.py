@@ -82,6 +82,19 @@ def should_quantize_on_load(prefix: str) -> bool:
     return any(f".{p.strip('.')}." in padded for p in envs.QUANTIZE_ON_LOAD_PREFIXES)
 
 
+def should_requantize_fp4(prefix: str) -> bool:
+    """Return True if FP4 linear requantization is allowed for `prefix`.
+
+    When `REQUANTIZE_FP4_PREFIXES` is empty, all eligible linear layers may
+    requantize to FP4; otherwise `prefix` must match a dot-bounded pattern.
+    """
+    patterns = envs.REQUANTIZE_FP4_PREFIXES
+    if not patterns:
+        return True
+    padded = f".{prefix}."
+    return any(f".{p.strip('.')}." in padded for p in patterns)
+
+
 class VllmQuantLinearConfig:
     """
     Configuration for quantized linear layers on TPU.
