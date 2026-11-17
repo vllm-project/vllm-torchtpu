@@ -248,13 +248,14 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
 def serves(layer, scores_op, is_sequence_parallel: bool) -> bool:
     """Whether this layer's step takes the fused op: the op is armed, the layer
     is served by the plain scores entry (no copy slots), and the step's rows
-    are replicated over TP."""
+    are replicated over TP. ``moe_lowtok_scores.prebuild`` sets
+    ``_lowtok_has_copies`` on every layer it returns a scores op for."""
     from vllm_torchtpu.layers.adapter import sequence_parallel
 
     return (
         _ARMED
         and scores_op is not None
-        and not getattr(layer, "_lowtok_has_copies", False)
+        and not layer._lowtok_has_copies
         and sequence_parallel.rows_are_replicated(is_sequence_parallel)
     )
 

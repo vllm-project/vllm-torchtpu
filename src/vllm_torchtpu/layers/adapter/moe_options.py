@@ -73,8 +73,11 @@ def parse(raw: Any) -> MoeOptions:
 
 
 def get(vllm_config: Any) -> MoeOptions:
-    """The engine's MoE options."""
-    additional = getattr(vllm_config, "additional_config", None)
+    """The engine's MoE options; the defaults outside an engine (``None``, what
+    ``get_current_vllm_config_or_none`` returns there)."""
+    if vllm_config is None:
+        return MoeOptions()
+    additional = vllm_config.additional_config
     if not isinstance(additional, dict):
         return MoeOptions()
     return parse(additional.get(SECTION))
