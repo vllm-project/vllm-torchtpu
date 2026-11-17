@@ -320,8 +320,10 @@ def forward_with_dcp(
             directly; no gather/combine needed.
 
     `tuned_tiles` and `skip_empty_mixed` must be the layer's, as given to
-    `build_dcp_kernels` when its kernels were prebuilt: the lookup below then
-    finds those ops instead of building new ones while torch.compile traces.
+    `attention_modes`, `tuned_tiles` and `skip_empty_mixed` must be the
+    layer's, as given to `build_dcp_kernels` when its kernels were prebuilt:
+    the lookup below then finds those ops instead of building new ones while
+    torch.compile traces.
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
