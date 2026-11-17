@@ -276,7 +276,17 @@ def test_bind_and_warmup_votes_before_raising(
     drv = _bind_driver(bind)
     with pytest.raises(ValueError, match="internal bug"):
         drv.bind_and_warmup(SimpleNamespace(_megakernel=drv))
-    assert votes == [_vote("bind_error")] and drv.warmed == []
+    assert votes == [_vote("bind_error")] and drv.warmed == [] and not drv._bound
+
+    # If the bind_error vote itself fails, the original bind error still propagates.
+    def vote_boom(t: Any, group: Any) -> None:
+        raise RuntimeError("gloo dead")
+
+    monkeypatch.setattr(agreement_mod, "_all_reduce_max", vote_boom)
+    drv2 = _bind_driver(bind)
+    with pytest.raises(ValueError, match="internal bug"):
+        drv2.bind_and_warmup(SimpleNamespace(_megakernel=drv2))
+    assert not drv2._bound
 
 
 def test_bind_and_warmup_agrees_on_the_bucket_set(fake_tp_group: Any) -> None:
@@ -310,3 +320,41 @@ def test_bind_and_warmup_agreement_error_propagates_after_one_collective(
     with pytest.raises(RuntimeError, match="gloo timeout"):
         drv.bind_and_warmup(SimpleNamespace(_megakernel=drv))
     assert calls == [0] and drv.warmed == []
+
+
+def test_warmup_synchronizes_tensor_and_tuple_outputs_on_tpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import types
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_torchtpu.megakernel.adapter import testing
+    from vllm_torchtpu.megakernel.adapter.plugin import RunnerView
+    from vllm_torchtpu.megakernel.core.runtime.contract import Bucket, WarmupCase
+
+    synced: list[list[torch.Tensor]] = []
+    fake_utils = types.ModuleType("vllm_torchtpu.utils")
+    fake_utils.synchronize_tensors = synced.append  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm_torchtpu.utils", fake_utils)
+
+    t0, t1, t2 = torch.ones(2), torch.zeros(2), torch.full((2,), 3.0)
+    b_single, b_tuple = Bucket(1, 4, 8), Bucket(1, 8, 8)
+    prog = SimpleNamespace(
+        display_name="test",
+        warmup_inputs=lambda b, _s: WarmupCase(args=(b.B,)),
+    )
+    runner = testing.fake_runner()
+    runner.device = SimpleNamespace(type="tpu")
+    drv = driver_mod.ProgramDriver(prog, view=RunnerView(runner))
+    drv._bound = True
+    drv._buckets = [b_single, b_tuple]
+    drv._steps = {
+        b_single.key: lambda _n: t0,
+        b_tuple.key: lambda _n: (t1, t2),
+    }
+    drv.warmup()
+    assert len(synced) == 2
+    assert synced[0] == [t0] and synced[1] == [t1, t2]
