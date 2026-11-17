@@ -8826,6 +8826,18 @@ class TestStage3LatePoll:
             assert worker.late_poll_finished_recving() == set()
         worker._raiden_transfer_engine.poll_stats.assert_not_called()
 
+    def test_a_load_in_the_tp_submit_fan_out_waits_for_the_regular_poll(self):
+        # On a sharded consumer the leader applies the submit outcome, then
+        # fans the decision out; a load it marked terminal in between would
+        # be fanned out as failed to the other ranks.
+        worker, engine = self._consumer()
+        worker._stage3_tp_submits = {"dst-a"}
+        engine.poll_stats.return_value = ([], ["src-a"], [])
+        with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+            assert worker.late_poll_finished_recving() == set()
+        assert "dst-a" not in worker._stage3_terminal_loads
+        assert worker._stage3_late_native == [([], ["src-a"], [])]
+
     def test_the_regular_poll_holds_the_receive_lock(self):
         # _wait_for_recving (inline load) calls _poll_finished without
         # get_finished's lock; the late poll must never run inside it.
