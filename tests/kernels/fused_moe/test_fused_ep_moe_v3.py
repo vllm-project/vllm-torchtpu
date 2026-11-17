@@ -18,9 +18,11 @@ TPU7x host, against a reference that runs the layer's own arithmetic.
 selects each shard's experts with the layer's own top-k selection, runs every
 selected (token, expert) pair through a Pallas program made of the layer's
 own per-expert steps (``rowquant.quantize_rows`` for the FP8 token row,
-``ffn.expert_ffn_fp8``, and ``ffn.result_rows`` with bf16 result rows) on
-tiles of the layer's height, and sums each token's pairs in k order in
-float32, as the combine does.
+``ffn.expert_ffn_fp8``, and ``ffn.result_rows``) on tiles of the layer's
+height, and sums each token's pairs in k order in float32, as the combine
+does. Both result-row forms run: FP8 rows with one scale per row
+(``Config.result_rows`` "fp8", the serving default), whose scale the
+combine folds into the router weight, and bf16 rows.
 
 The reference runs those steps as a Pallas program on the same chip rather
 than as plain XLA, because the two compilers do not round alike. The
@@ -40,7 +42,7 @@ another token's, or combined with the wrong weight moves most of its 1024
 values, and one such row is more than 1 in 1000 of the output. Both row
 paths run: the SparseCore row gather (``Config.sorted_rows``, the serving
 default) and the Pallas transport, in the serving bridge's shard-index mode,
-and the kernel's own mesh-axis mode once.
+and the kernel's own mesh-axis mode once, each with both result-row forms.
 
 The layer does not run in the TPU interpreter on CPU: its token exchange
 returns DMA semaphores from one Pallas program to the next, which the
@@ -56,6 +58,7 @@ import pytest
 
 D, H, INTER, K = 8, 1024, 128, 4
 TILE_ROWS = 32
+LANES = 128
 # One bf16 step: a value is off when it is more than this far from the
 # reference, relative, with an absolute floor for values near zero.
 STEP_REL, STEP_ABS = 2.0**-7, 1e-5
@@ -67,6 +70,9 @@ CASES = {
     "hot": (16, 24, "hot", 0),
     "short_shards": (32, 32, "spread", 5),
 }
+# The result rows' two forms: fp8 with one scale per row (Config.result_rows'
+# default, what serving runs) and bf16.
+RESULT_ROWS = ("fp8", "bf16")
 # The serving bridge passes each shard's index as an operand
 # (layout.SHARD_INDEX_OPERAND, no side effects); the kernel's own mode reads
 # the mesh axis. mode: (shard index operand, sorted rows, cases)
@@ -141,9 +147,10 @@ def _expert_rows(rows, tile_expert, w1, w2, s1, s2, config):
     """The result row of every input row: one Pallas program whose grid step
     i takes TILE_ROWS bf16 token rows and runs them through the layer's own
     steps with expert tile_expert[i]'s weights: the FP8 row quantization,
-    the expert FFN, and the bf16 result rows. Config.elementwise is the
-    scaling products' element type and Config.row_scale_dtype the row
-    scales' rounding, as in the layer."""
+    the expert FFN, and the result rows in Config.result_rows' form.
+    Config.elementwise is the scaling products' element type and
+    Config.row_scale_dtype the row scales' rounding, as in the layer.
+    Returns (result rows, their f32 scales [rows] or None for bf16 rows)."""
     import jax
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
@@ -152,14 +159,15 @@ def _expert_rows(rows, tile_expert, w1, w2, s1, s2, config):
     from vllm_torchtpu.kernels.fused_moe.v3 import ffn, rowquant
 
     # The forms this reference writes out: one scale per row for the token
-    # rows and the intermediate, both FP8, and bf16 result rows.
+    # rows and the intermediate, both FP8.
     assert config.activation_block == 0 and config.token_rows_block == 0, config
     assert config.token_rows == config.intermediate == "fp8", config
-    assert config.result_rows == "bf16", config
+    fp8_rows = config.result_rows == "fp8"
+    result_dtype = rowquant.FP8 if fp8_rows else jnp.bfloat16
     hidden, columns = w1.shape[1], w1.shape[2]
     inter = w2.shape[1]
 
-    def body(tile_expert_ref, rows_ref, w1_ref, w2_ref, s1_ref, s2_ref, out_ref):
+    def body(tile_expert_ref, rows_ref, w1_ref, w2_ref, s1_ref, s2_ref, *out_refs):
         del tile_expert_ref  # read by the index maps
         q, q_scales = rowquant.quantize_rows(
             rows_ref[...], config.row_scale_dtype, block=0, dtype=config.elementwise
@@ -178,21 +186,29 @@ def _expert_rows(rows, tile_expert, w1, w2, s1, s2, config):
             columns_per_pass=config.activation_columns_per_pass,
             token_block=0,
         )
-        result, _ = ffn.result_rows(
+        result, scales = ffn.result_rows(
             acc2,
             mid_scales,
             w2_scales=s2_ref[...],
             w2_bias=None,
-            dtype=jnp.bfloat16,
+            dtype=result_dtype,
             elementwise=config.elementwise,
         )
-        out_ref[...] = result
+        out_refs[0][...] = result
+        if fp8_rows:
+            # One f32 scale per row, spread over a lane row.
+            out_refs[1][...] = jnp.broadcast_to(scales, out_refs[1].shape)
 
     def per_expert(shape):
         return pl.BlockSpec((None, *shape), lambda i, experts: (experts[i], 0, 0))
 
     tile = pl.BlockSpec((TILE_ROWS, hidden), lambda i, experts: (i, 0))
-    return pl.pallas_call(
+    out_shape = [jax.ShapeDtypeStruct(rows.shape, result_dtype)]
+    out_specs = [tile]
+    if fp8_rows:
+        out_shape.append(jax.ShapeDtypeStruct((rows.shape[0], LANES), jnp.float32))
+        out_specs.append(pl.BlockSpec((TILE_ROWS, LANES), lambda i, experts: (i, 0)))
+    outs = pl.pallas_call(
         body,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -204,18 +220,21 @@ def _expert_rows(rows, tile_expert, w1, w2, s1, s2, config):
                 per_expert((1, columns)),
                 per_expert((1, hidden)),
             ],
-            out_specs=tile,
+            out_specs=out_specs,
         ),
-        out_shape=jax.ShapeDtypeStruct(rows.shape, jnp.bfloat16),
+        out_shape=out_shape,
     )(tile_expert, rows, w1, w2, s1[:, None, :], s2[:, None, :])
+    return outs[0], (outs[1][:, 0] if fp8_rows else None)
 
 
 def _reference(x, w1, w2, s1, s2, weights, experts, rows, config):
     """The layer's output on `rows` (global token indices), float32 [tokens,
     hidden], zero elsewhere. Each expert's (token, slot) pairs go through
     _expert_rows in whole tiles; then each token sums its K result rows in
-    k order in float32, a zero weight contributing nothing, and rounds the
-    sum to bf16, as the combine does."""
+    k order in float32, each times its coefficient (the router weight, times
+    the row's scale for FP8 rows, formed in float32 first), a zero
+    coefficient contributing nothing, and rounds the sum to bf16, as the
+    combine does."""
     import jax.numpy as jnp
 
     by_expert = [[] for _ in range(w1.shape[0])]
@@ -235,7 +254,7 @@ def _reference(x, w1, w2, s1, s2, weights, experts, rows, config):
     xs = np.asarray(x.astype(jnp.float32))
     zero = np.zeros(xs.shape[1], np.float32)
     batch = np.stack([zero if t is None else xs[t] for t in order])
-    result = _expert_rows(
+    result, scales = _expert_rows(
         jnp.asarray(batch).astype(jnp.bfloat16),
         jnp.asarray(tile_expert, jnp.int32),
         w1,
@@ -245,12 +264,16 @@ def _reference(x, w1, w2, s1, s2, weights, experts, rows, config):
         config,
     )
     result = np.asarray(result.astype(jnp.float32))
+    scales = None if scales is None else np.asarray(scales, np.float32)
     out = np.zeros(xs.shape, np.float32)
     for t in rows:
         acc = zero
         for k in range(K):
-            c = weights[t, k]
-            term = result[position[(int(t), k)]] * c if c != 0 else zero
+            p = position[(int(t), k)]
+            c = np.float32(weights[t, k])
+            if scales is not None:
+                c = np.float32(c * scales[p])
+            term = result[p] * c if c != 0 else zero
             acc = term if k == 0 else acc + term
         out[t] = acc.astype(jnp.bfloat16).astype(np.float32)
     return out
@@ -312,7 +335,7 @@ def interpret(monkeypatch):
 SMALL = {"shards": 2, "real": 16, "short": 3, "experts": 8, "hidden": 128}
 
 
-def _small_world():
+def _small_world(result_rows):
     from vllm_torchtpu.kernels.fused_moe.v3 import Config
 
     s = SMALL
@@ -326,13 +349,15 @@ def _small_world():
         inter=s["hidden"],
     )
     valid = [s["real"] - (s["short"] if d % 2 else 0) for d in range(s["shards"])]
-    return world, valid, Config(result_rows="bf16")
+    return world, valid, Config(result_rows=result_rows)
 
 
-def _by_hand(x, w1, w2, s1, s2, weights, experts, rows):
+def _by_hand(x, w1, w2, s1, s2, weights, experts, rows, result_rows):
     """The layer's arithmetic written out in numpy, one routed pair at a
     time, with Config's default bfloat16 scaling products: each product of
-    a row and its bf16 inverse scale is rounded to bf16, then cast to FP8."""
+    a row and its bf16 inverse scale is rounded to bf16, then cast to FP8.
+    FP8 result rows are the bf16 down projection quantized the same way,
+    summed with the router weight times the row's scale."""
     import jax.numpy as jnp
 
     bf16, fp8, f32 = jnp.bfloat16, jnp.float8_e4m3fn, np.float32
@@ -361,6 +386,9 @@ def _by_hand(x, w1, w2, s1, s2, weights, experts, rows):
             mid, mid_scale = fp8_row((silu * up).astype(bf16).astype(f32))
             down = (mid @ w2s[e]).astype(f32) * mid_scale * s2s[e]
             result = down.astype(bf16).astype(f32)
+            if result_rows == "fp8":
+                result, result_scale = fp8_row(result)
+                c = f32(c * result_scale)
             term = result * c if c != 0 else 0 * result
             acc = term if acc is None else acc + term
         out[t] = acc.astype(bf16).astype(f32)
@@ -368,15 +396,16 @@ def _by_hand(x, w1, w2, s1, s2, weights, experts, rows):
 
 
 @pytest.mark.cpu_test
-def test_reference_matches_the_layer_arithmetic_by_hand(interpret):
+@pytest.mark.parametrize("result_rows", RESULT_ROWS)
+def test_reference_matches_the_layer_arithmetic_by_hand(interpret, result_rows):
     """The reference's tiles, expert lookup and k-ordered sum, against the
     arithmetic written out in numpy for every routed pair, to the TPU
     test's bound."""
-    (x, logits, w1, w2, s1, s2), valid, config = _small_world()
+    (x, logits, w1, w2, s1, s2), valid, config = _small_world(result_rows)
     rows = _valid_rows(SMALL["real"], valid)
     weights, experts = _routes(logits, SMALL["real"], valid)
     assert len(set(experts[rows].ravel())) == SMALL["experts"]  # every expert
-    want = _by_hand(x, w1, w2, s1, s2, weights, experts, rows)
+    want = _by_hand(x, w1, w2, s1, s2, weights, experts, rows, result_rows)
     got = _reference(x, w1, w2, s1, s2, weights, experts, rows, config)
     report = _compare(got, want, rows)
     assert report["pass"], report
@@ -403,11 +432,12 @@ def _routing_errors(weights, experts, rows):
 
 
 @pytest.mark.cpu_test
-def test_one_bf16_step_flags_every_single_row_error(interpret):
+@pytest.mark.parametrize("result_rows", RESULT_ROWS)
+def test_one_bf16_step_flags_every_single_row_error(interpret, result_rows):
     """The bound sees one wrong row: two tokens' rows swapped, a token's row
     zeroed, and each single-pair routing error in _routing_errors, while
     the reference passes against itself."""
-    (x, logits, w1, w2, s1, s2), valid, config = _small_world()
+    (x, logits, w1, w2, s1, s2), valid, config = _small_world(result_rows)
     rows = _valid_rows(SMALL["real"], valid)
     weights, experts = _routes(logits, SMALL["real"], valid)
     want = _reference(x, w1, w2, s1, s2, weights, experts, rows, config)
@@ -570,7 +600,7 @@ def eight_tpu7x_cores():
         pytest.skip("fused EP MoE v3 needs eight TPU7x cores")
 
 
-def _run_case(name, mode):
+def _run_case(name, mode, result_rows):
     """(layer output, reference, valid rows) for one case, both float32."""
     import jax
     import jax.numpy as jnp
@@ -587,7 +617,7 @@ def _run_case(name, mode):
     sharded = NamedSharding(mesh, P(MESH_AXIS))
     args = [jax.device_put(a, sharded) for a in (x, w1, w2, s1, s2, logits)]
     valid = [real - (short if d % 2 else 0) for d in range(D)]
-    config = Config(result_rows="bf16", sorted_rows=sorted_rows)
+    config = Config(result_rows=result_rows, sorted_rows=sorted_rows)
     shard_index = jnp.arange(D, dtype=jnp.int32).reshape(D, 1) if bridge else None
 
     def run(x, w1, w2, s1, s2, logits):
@@ -623,16 +653,21 @@ def _run_case(name, mode):
     return got.astype(np.float32), want, rows
 
 
-RUNS = [(mode, name) for mode, (_, _, names) in MODES.items() for name in names]
+RUNS = [
+    (mode, name, result_rows)
+    for mode, (_, _, names) in MODES.items()
+    for name in names
+    for result_rows in RESULT_ROWS
+]
 
 
 @pytest.mark.multichip
-@pytest.mark.parametrize("mode,name", RUNS)
-def test_fused_ep_moe_matches_the_reference(eight_tpu7x_cores, mode, name):
+@pytest.mark.parametrize("mode,name,result_rows", RUNS)
+def test_fused_ep_moe_matches_the_reference(eight_tpu7x_cores, mode, name, result_rows):
     """Every value within one bf16 step of the reference, except fewer than
     1 in 1000. The same check must fail on the layer's own output with two
     tokens' rows swapped, and with one row zeroed."""
-    got, want, rows = _run_case(name, mode)
+    got, want, rows = _run_case(name, mode, result_rows)
     report = _compare(got, want, rows)
     assert report["pass"], report
     swapped = got.copy()
