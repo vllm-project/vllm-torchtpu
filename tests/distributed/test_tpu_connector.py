@@ -8826,6 +8826,21 @@ class TestStage3LatePoll:
             assert worker.late_poll_finished_recving() == set()
         worker._raiden_transfer_engine.poll_stats.assert_not_called()
 
+    def test_an_uncertain_load_it_reports_is_not_failed_at_its_deadline(self):
+        # The controller RPC's outcome was uncertain, so the load waits for
+        # its native terminal under a deadline. The late poll reports it done.
+        worker, engine = self._consumer()
+        worker._load_block_ids = {"dst-a": [41, 43]}
+        worker._stage3_pending_controller_failures = {"dst-a": time.time() - 1.0}
+        engine.poll_stats.return_value = ([], ["src-a"], [])
+        with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+            assert worker.late_poll_finished_recving() == {"dst-a"}
+            engine.poll_stats.return_value = ([], [], [])
+            worker._poll_finished(engine)
+        assert worker._stage3_pending_controller_failures == {}
+        assert "dst-a" not in worker._failed_recving
+        assert worker.get_block_ids_with_load_errors() == set()
+
 
 class TestStage3AsyncRegister:
     """_submit_stage3_registration runs the registration off the model-runner
