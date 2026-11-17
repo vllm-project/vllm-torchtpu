@@ -74,6 +74,7 @@ REPLACED_ENV = {
     "moe_tc_combine": "TPU_MOE_TC_COMBINE",
     "moe_dense_fp4_max_tokens": "TPU_MOE_DENSE_FP4_MAX_TOKENS",
     "moe_dense_fp4_shared": "TPU_MOE_DENSE_FP4_SHARED",
+    "gmm_v2_decode_stream": "TPU_GMM_V2_DECODE_STREAM",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -95,6 +96,7 @@ SAMPLE = {
     "moe_redundant_placement": "builtin:minimax_m31_agentx",
     # --- v7 MoE / grouped GEMM ---
     "moe_dense_fp4_max_tokens": 32,
+    "gmm_v2_decode_stream": "1536:3@512",
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {

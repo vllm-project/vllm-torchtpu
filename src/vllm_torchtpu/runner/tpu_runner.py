@@ -6062,6 +6062,17 @@ class TPUModelRunner(GPUModelRunner):
                 gmm_prefill_tiles,
                 gmm_decode_w13,
             )
+        decode_stream = option(additional, "gmm_v2_decode_stream")
+        if decode_stream:
+            from vllm_torchtpu.kernels.megablox import gmm_v2
+
+            # After moe_skinny_gmm: refuses bf16_after.
+            gmm_v2.set_decode_stream(decode_stream)
+            logger.info(
+                "MoE gmm_v2 streamed decode MLP: gmm_v2_decode_stream=%r -> %s",
+                decode_stream,
+                gmm_v2._decode_stream,
+            )
         gmm_fp8_w8a8 = option(additional, "gmm_fp8_w8a8")
         gmm_scale_lookahead = option(additional, "gmm_scale_lookahead")
         if gmm_fp8_w8a8 or gmm_scale_lookahead:

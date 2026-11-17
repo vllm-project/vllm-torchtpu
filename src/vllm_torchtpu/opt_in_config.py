@@ -200,6 +200,16 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # eligible (bf16 linears). LOSSY vs the separate shared-expert linears
     # (another evaluation order/rounding of the fp8 shared MLP).
     "moe_dense_fp4_shared": False,
+    # NVFP4 decode MoE (cg line): gmm_v2_mlp calls of at most <max size_m>
+    # rows run as one streamed kernel that feeds every hit expert's gate_up
+    # then down weights as <chunk_rows>-row k-slices through <slots> VMEM
+    # slots (`kernels/megablox/gmm_decode_stream.py`).
+    # "<chunk_rows>:<slots>[@<max size_m>]", "on" = 768:4@512, "" = off.
+    # Bitwise vs gmm_v2's fp8 rhs feed up to 512 rows (served c4/c16
+    # "1536:3@512"); above 512 rows it follows the r6 fp8 decode tiles
+    # (bitwise only with moe_gmm_fp8_decode_tiles; else <= 2 bf16 ulp,
+    # served c48/c64 "1536:3@2048"). Refused with moe_skinny_gmm=bf16_after.
+    "gmm_v2_decode_stream": "",
 }
 
 

@@ -109,6 +109,11 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         return acc
 
     acc_gate, acc_up = deinterleave_lane(acc)
+    return gate_up_act(acc_gate, acc_up, fuse_act)
+
+
+def gate_up_act(acc_gate: jax.Array, acc_up: jax.Array, fuse_act: str) -> jax.Array:
+    """The fused activation of apply_act_fn on separate gate and up values."""
     match fuse_act:
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
@@ -234,6 +239,37 @@ def tuned_tiles_enabled() -> bool:
 #     rhs scale blocks three deep with lookahead (`_scale_buffering`). Bitwise.
 _fp8_w8a8 = False
 _scale_lookahead = False
+
+
+# gmm_v2_decode_stream="<chunk_rows>:<slots>[@<max size_m>]" ("on" =
+# 768:4@512; "" = off), set from --additional-config before the model's first
+# trace (`set_decode_stream`): NVFP4 decode gmm_v2_mlp calls of at most
+# <max size_m> rows run as one streamed kernel (gmm_decode_stream.py) that
+# feeds every hit expert's gate_up then down weights as <chunk_rows>-row
+# k-slices through <slots> VMEM slots, so one chunk (not one whole expert
+# block per gmm) is exposed per call. Same numerics as the fp8 rhs feed.
+_decode_stream: tuple[int, int, int] | None = None
+_decode_stream_raw = ""
+
+
+def set_decode_stream(raw: str = "") -> None:
+    global _decode_stream, _decode_stream_raw
+    from vllm_torchtpu.kernels.megablox import gmm_decode_stream
+
+    spec = gmm_decode_stream.parse_spec(raw)
+    if spec is not None and _skinny_gmm_path == "bf16_after":
+        # The stream feeds every row fp8; with bf16_after the calls it would
+        # replace run bf16, so it would change their numerics.
+        raise ValueError(
+            "additional_config gmm_v2_decode_stream needs the fp8 rhs feed; "
+            "moe_skinny_gmm='bf16_after' disables it"
+        )
+    _decode_stream = spec
+    _decode_stream_raw = raw if spec is not None else ""
+
+
+def decode_stream_on() -> bool:
+    return _decode_stream is not None
 
 
 def set_r10_options(fp8_w8a8: bool = False, scale_lookahead: bool = False) -> None:
@@ -2309,7 +2345,33 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
     )
 
 
-@jax.jit(static_argnames=["fuse_act", "preferred_element_type", "maybe_quantize_lhs"])
+_stream_logged: set[int] = set()
+
+
+def _log_stream_once(size_m: int, chunk: int, slots: int, max_m: int) -> None:
+    if size_m in _stream_logged:
+        return
+    _stream_logged.add(size_m)
+    args = (
+        "gmm_v2_decode_stream=%s on: gmm_v2_mlp size_m=%d runs the streamed "
+        "decode MLP kernel (chunk rows %d, slots %d, max size_m %d)",
+        _decode_stream_raw, size_m, chunk, slots, max_m,
+    )
+    try:
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(*args)
+    except ImportError:  # kernel-only use without vllm
+        import logging
+
+        logging.getLogger(__name__).info(*args)
+
+
+@jax.jit(
+    static_argnames=[
+        "fuse_act", "preferred_element_type", "maybe_quantize_lhs", "max_group_size"
+    ]
+)
 def gmm_v2_mlp(
     lhs: jax.Array,  # [size_m, size_k]
     rhs1: jax.Array,  # [size_group, size_k, size_n1]
@@ -2322,12 +2384,16 @@ def gmm_v2_mlp(
     fuse_act: str | None = None,
     preferred_element_type: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
+    max_group_size: int | None = None,
 ) -> jax.Array:
     """gmm_v2(gmm_v2(lhs, rhs1, fuse_act), rhs2) for an MoE expert MLP.
 
     For decode-sized tiles the two run in one kernel (kernel_mlp), which loads
     the second gmm's first weight block under the first gmm's compute: as two
     calls, each exposes its first block's DMA. Otherwise it is two gmm_v2 calls.
+    With gmm_v2_decode_stream, decode-sized fp4 calls run gmm_decode_stream
+    instead. max_group_size bounds the rows of one group (the token count of
+    a top-k routing); None means size_m.
     """
 
     def two_calls():
@@ -2360,6 +2426,31 @@ def gmm_v2_mlp(
         group_offset = jnp.array([0], dtype=jnp.int32)
     elif jnp.isscalar(group_offset):
         group_offset = group_offset[None]
+    if _decode_stream is not None:
+        from vllm_torchtpu.kernels.megablox import gmm_decode_stream
+
+        chunk, slots, max_m = _decode_stream
+        if (
+            gmm_decode_stream.eligible(
+                lhs, rhs1, rhs2, rhs1_scale, rhs2_scale, fuse_act, chunk, max_m
+            )
+            is None
+        ):
+            _log_stream_once(padded_size_m, chunk, slots, max_m)
+            return gmm_decode_stream.gmm_decode_stream_mlp(
+                lhs,
+                rhs1,
+                rhs2,
+                group_sizes,
+                rhs1_scale,
+                rhs2_scale,
+                group_offset,
+                fuse_act=fuse_act,
+                out_dtype=preferred_element_type,
+                chunk_rows=chunk,
+                slots=slots,
+                max_group_size=max_group_size,
+            )[:size_m]
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     common = dict(

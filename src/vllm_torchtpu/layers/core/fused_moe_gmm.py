@@ -31,6 +31,9 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
 )
 from vllm_torchtpu.kernels.megablox import tc_combine
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    decode_stream_on as gmm_v2_decode_stream_on,
+)
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
     gmm_v2,
     gmm_v2_mlp,
@@ -753,6 +756,7 @@ def moe_gmm(
             fuse_act=activation,
             preferred_element_type=x.dtype,
             maybe_quantize_lhs=False,
+            **({"max_group_size": num_tokens} if gmm_v2_decode_stream_on() else {}),
         )
     else:
         gmm1_res = gmm_wrapper(
