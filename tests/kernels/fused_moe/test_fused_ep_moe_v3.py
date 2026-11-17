@@ -47,6 +47,15 @@ One case gives every shard's weights two copy slots after its primaries, as
 a placement with copies does, filled with NaN: the kernel routes over the
 primaries and must never read a copy slot.
 
+The same check covers what the Qwen3.5 DP4 x TP2 decode layout runs
+(``fused_moe_ep_v3.QWEN3_5_CONFIG_BY_LAYOUT[(4, 2)]``): the layer with that
+entry's settings (``combine_real_tokens``, ``sort_index_compare``,
+``compact_message``, ``reorder_chain``), which must also give the layer's
+values without them bit for bit, and the dense-slots layer
+(``models/qwen3_5/kernels/dense_slots.py``) the entry selects for calls of at
+most 64 rows per shard, which with float32 scaling products must give the
+values of this layer with bf16 result rows bit for bit.
+
 The layer does not run in the TPU interpreter on CPU: its token exchange
 returns DMA semaphores from one Pallas program to the next, which the
 interpreter cannot do. The CPU tests here check the reference itself, in
@@ -927,8 +936,18 @@ def _with_copy_slots(weights, copies):
     return tuple(out)
 
 
-def _run_case(name, mode, result_rows):
-    """(layer output, reference, valid rows) for one case, both float32."""
+def _dp4tp2_settings():
+    """The Config fields of the Qwen3.5 DP4 x TP2 entry (the v3 settings and the
+    dense-slots selection)."""
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import QWEN3_5_CONFIG_BY_LAYOUT
+
+    return dict(QWEN3_5_CONFIG_BY_LAYOUT[(4, 2)])
+
+
+def _run_case(name, mode, result_rows, settings=None, dense_slots=False):
+    """(layer output, reference, valid rows) for one case, both float32.
+    `settings`: Config fields set on top of the case's; `dense_slots`: run
+    the dense-slots layer, as the fused EP adapter calls it, instead."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding
@@ -944,7 +963,9 @@ def _run_case(name, mode, result_rows):
     expert_weights = _with_copy_slots((w1, w2, s1, s2), COPY_SLOTS.get(name, 0))
     args = [jax.device_put(a, sharded) for a in (x, *expert_weights, logits)]
     valid = [real - (short if d % 2 else 0) for d in range(D)]
-    config = Config(result_rows=result_rows, sorted_rows=sorted_rows)
+    config = Config(
+        result_rows=result_rows, sorted_rows=sorted_rows, **(settings or {})
+    )
     shard_index = jnp.arange(D, dtype=jnp.int32).reshape(D, 1) if bridge else None
     # The rows past each shard's valid count reach the layer as finite rows
     # that are far from zero. NaN rows would not show a layer that ignores
@@ -954,6 +975,26 @@ def _run_case(name, mode, result_rows):
     padding[_valid_rows(real, valid)] = False
 
     def run(x, w1, w2, s1, s2, logits):
+        if dense_slots:
+            from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as ds
+
+            return ds.dense_slots_moe(
+                x,
+                w1,
+                w2,
+                s1,
+                s2,
+                logits,
+                top_k=K,
+                renormalize=True,
+                mesh=mesh,
+                tile_rows=TILE_ROWS,
+                config=config,
+                experts_per_shard=experts // D,
+                shard_index=shard_index,
+                valid_tokens=jnp.asarray(valid, jnp.int32),
+                drop_nan_rows=True,
+            )
         return fused_ep_moe(
             jnp.where(padding, 1.0 + jnp.abs(x), x),
             w1,
@@ -1012,3 +1053,38 @@ def test_fused_ep_moe_matches_the_reference(eight_tpu7x_cores, mode, name, resul
     zeroed[rows[2]] = 0.0
     assert not _compare(swapped, want, rows)["pass"]
     assert not _compare(zeroed, want, rows)["pass"]
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("name", list(CASES))
+def test_dp4tp2_settings_keep_the_layers_values(eight_tpu7x_cores, fresh_builds, name):
+    """The v3 settings of the Qwen3.5 DP4 x TP2 entry change schedules and the
+    routing message's layout, not values: with them the layer is within the
+    reference's bound and gives every value it gives without them."""
+    plain, want, rows = _run_case(name, "bridge_sorted", "bf16")
+    got, _, _ = _run_case(name, "bridge_sorted", "bf16", settings=_dp4tp2_settings())
+    assert _compare(got, want, rows)["pass"], _compare(got, want, rows)
+    np.testing.assert_array_equal(got[rows], plain[rows])
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("name", list(CASES))
+def test_dense_slots_layer_matches_the_reference(eight_tpu7x_cores, fresh_builds, name):
+    """The dense-slots layer as the Qwen3.5 DP4 x TP2 entry runs it: within the
+    reference's bound, and the bound must fail with two tokens' rows swapped;
+    with float32 scaling products, bit-identical to this layer with bf16
+    result rows (the same per-row math)."""
+    settings = _dp4tp2_settings()
+    got, want, rows = _run_case(
+        name, "bridge_sorted", "bf16", settings, dense_slots=True
+    )
+    assert _compare(got, want, rows)["pass"], _compare(got, want, rows)
+    swapped = got.copy()
+    swapped[[rows[0], rows[1]]] = swapped[[rows[1], rows[0]]]
+    assert not _compare(swapped, want, rows)["pass"]
+    f32 = {**settings, "elementwise_dtype": "float32"}
+    dense, _, _ = _run_case(name, "bridge_sorted", "bf16", f32, dense_slots=True)
+    layer, _, _ = _run_case(
+        name, "bridge_sorted", "bf16", {"elementwise_dtype": "float32"}
+    )
+    np.testing.assert_array_equal(dense[rows], layer[rows])
