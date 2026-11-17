@@ -1339,7 +1339,9 @@ def _small_collective_fork_hands_buckets_over(cache_root, model_name, retain):
 @pytest.mark.parametrize("retain", [True, False], ids=["retain", "no_retain"])
 @pytest.mark.parametrize("model_name", ["SmallAllReduceModel", "SmallCombineModel"])
 def test_small_collective_row_fork_hands_buckets_over(tmp_path, model_name, retain):
-    """Both sides of the small-collective row fork lift the rank buffer."""
+    """With retain, both sides of the small-collective row fork lift the rank
+    buffer and the warmup hands the buckets over; without it, the side that
+    skips the kernel lifts no rank buffer and the hand-over is refused."""
     in_child(
         partial(
             _small_collective_fork_hands_buckets_over,
