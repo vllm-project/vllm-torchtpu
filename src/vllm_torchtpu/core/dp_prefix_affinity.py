@@ -85,7 +85,9 @@ class PrefixTable:
 
 def load_scores(client) -> list[float]:
     """The stock balancer's load score of every engine, computed as
-    DPLBAsyncMPClient.get_core_engine_for_request computes it."""
+    DPLBAsyncMPClient.get_core_engine_for_request computes it in vLLM's
+    vllm/v1/engine/core_client.py (v0.31.1rc0, the pinned version); compare
+    it with upstream when the pin moves."""
     scores = []
     for idx, (waiting, running, kv_cache_usage) in enumerate(client.lb_engines):
         inflight = client.engine_inflight[client.core_engines[idx]]
