@@ -33,7 +33,10 @@ prefix-cache hit.
 
 With VLLM_TPU_DP_PROMPT_BACKLOG=1 as well, the stock choice is the backlog one
 (core/dp_prompt_backlog.py): it is installed first and this choice wraps it,
-so the table records the engine a request finally went to.
+so the table records the engine a request finally went to. A request this
+choice routes does not pass through the backlog choice, so its prompt is not
+added to the backlog router's local estimate of that engine's pending prompt
+tokens; the engine's next published count includes it.
 
 Run with one API server process (--api-server-count 1): each API server
 process has its own client and table, and the stock front end spreads a
