@@ -228,7 +228,7 @@ def make_kv_ring(cx: GQAEmit) -> KVRing:
     # A dedicated ring is idle between layers, so each layer starts the next
     # one's first items after its own attention: started at that layer's start
     # they queue behind ~NBD in-flight weight tiles (6 x 8 MiB, 15 us at
-    # 3.2 TB/s on dense Qwen3) and stall it.
+    # 3.2 TB/s) and stall it.
     pl.when(a == 0)(lambda: start_layer(a))
     return KVRing(
         kv_start,
