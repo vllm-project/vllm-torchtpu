@@ -222,7 +222,10 @@ def test_no_forced_embedding_sharing():
 
 
 class _FakeBackbone:
-    def __call__(self, input_ids, positions):
+    def embed_input_ids(self, input_ids):
+        return input_ids.float().unsqueeze(1)
+
+    def __call__(self, input_ids, positions, input_embeds=None):
         rows = torch.arange(input_ids.shape[0], dtype=torch.float32)
         return torch.stack([rows, torch.zeros_like(rows)], dim=1)
 

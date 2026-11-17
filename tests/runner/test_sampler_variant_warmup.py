@@ -87,6 +87,9 @@ def _runner(defaults: dict, num_reqs: int = 4, blocks: int = BLOCKS):
         _topk_candidate_blocks=lambda: blocks,
         _synthetic_rng_counter=None,
         _spec_glue_logged=set(),
+        # One rank: the synthetic verify's rows never split over TP ranks.
+        _synthetic_row_rank=None,
+        _synthetic_rows_split=lambda padded_num_reqs: False,
     )
     _bind(
         runner,
@@ -218,8 +221,9 @@ def _warm_then_serve(monkeypatch, env, defaults, num_tokens=16, num_reqs=4):
                 bonus_logits_indices=torch.arange(num_reqs, dtype=torch.int32),
                 final_logits_indices=torch.arange(num_tokens, dtype=torch.int32),
                 synthetic_verify=None,
+                synthetic_row_rank=None,
             )
-            runner._build_padded_sampling_params = lambda s, e, logits: (
+            runner._padded_sampling_params = lambda s, e, n, dtype, device: (
                 torch.ones((num_reqs, 1), dtype=torch.float32),
                 torch.zeros((num_reqs, 1), dtype=torch.int32),
                 torch.full((num_reqs, 1), 0.95, dtype=torch.float32),
