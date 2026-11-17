@@ -1026,6 +1026,34 @@ def patch_moe_expert_write_staging() -> None:
         return result
 
     def process_weights_after_loading(model, model_config, target_device):
+        from vllm.model_executor.layers.linear import LinearBase
+
+        # Process dense LinearBase modules before flushing staged expert tensors
+        # and running RoutedExperts post-load hooks: shrinking or repacking
+        # dense weights first lowers the HBM high-water mark ahead of MoE
+        # expert requantization.
+        done_modules: set[int] = set()
+        patched_qms: list[tuple[typing.Any, typing.Any]] = []
+        seen_qms: set[int] = set()
+        for module in model.modules():
+            if isinstance(module, LinearBase) and module.quant_method is not None:
+                qm = module.quant_method
+                pwal = qm.process_weights_after_loading
+                pwal(module)
+                done_modules.add(id(module))
+                if id(qm) not in seen_qms:
+                    seen_qms.add(id(qm))
+                    patched_qms.append((qm, pwal))
+
+                    def _guarded_pwal(m, _orig=pwal):
+                        if id(m) not in done_modules:
+                            return _orig(m)
+                        return None
+
+                    typing.cast(
+                        typing.Any, qm
+                    ).process_weights_after_loading = _guarded_pwal
+
         during_load = stager.flushed
         stager.flush_all()
         logger.info(
@@ -1034,7 +1062,11 @@ def patch_moe_expert_write_staging() -> None:
             during_load,
             stager.flushed - during_load,
         )
-        return orig_process(model, model_config, target_device)
+        try:
+            return orig_process(model, model_config, target_device)
+        finally:
+            for qm, orig_pwal in patched_qms:
+                typing.cast(typing.Any, qm).process_weights_after_loading = orig_pwal
 
     RoutedExperts.weight_loader = weight_loader
     RoutedExperts._tpu_expert_staging_patch = True

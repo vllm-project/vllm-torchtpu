@@ -200,3 +200,78 @@ def test_the_patched_loader_keeps_the_upstream_loader_attributes(monkeypatch):
     loader = RoutedExperts.weight_loader
     assert loader.supports_moe_loading is True
     assert loader.__name__ == "weight_loader"
+
+
+def test_linear_weights_processed_before_expert_flush_and_not_rerun(monkeypatch):
+    from typing import Any, cast
+
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.model_loader import base_loader
+
+    from vllm_torchtpu.model_loader_patches import patch_moe_expert_write_staging
+
+    events: list[str] = []
+
+    class _SharedQuantMethod:
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            events.append(f"linear:{cast(Any, layer).tag}")
+
+    shared_qm = _SharedQuantMethod()
+    orig_qm_fn = shared_qm.process_weights_after_loading
+
+    def _make_linear(tag: str) -> LinearBase:
+        lin = LinearBase.__new__(LinearBase)
+        torch.nn.Module.__init__(lin)
+        cast(Any, lin).quant_method = shared_qm
+        cast(Any, lin).tag = tag
+        return lin
+
+    experts = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(experts)
+    experts.w2 = _param(2, 4, 4)
+
+    class _Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.experts = experts
+            self.lin_a = _make_linear("a")
+            self.lin_b = _make_linear("b")
+
+    def _fake_orig_process(model, model_config, target_device):
+        # At the point orig_process runs, staged expert writes must already be
+        # flushed to device, and re-invoking quant_method on LinearBase must be
+        # a no-op so neither linear runs twice.
+        assert torch.equal(experts.w2.data[0], torch.full((4, 4), 9.0))
+        events.append("orig_process_start")
+        for mod in model.modules():
+            qm = getattr(mod, "quant_method", None)
+            if qm is not None:
+                qm.process_weights_after_loading(mod)
+        events.append("orig_process_end")
+
+    monkeypatch.setattr(RoutedExperts, "weight_loader", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        RoutedExperts, "_tpu_expert_staging_patch", False, raising=False
+    )
+    monkeypatch.setattr(
+        base_loader, "process_weights_after_loading", _fake_orig_process
+    )
+    patch_moe_expert_write_staging()
+
+    model = _Model()
+    # Stage only expert 0 of 2 so w2 remains host-staged until flush_all().
+    RoutedExperts.weight_loader(
+        experts, experts.w2, torch.full((4, 4), 9.0), "w2", "w2", 0
+    )
+    assert torch.equal(experts.w2.data[0], torch.zeros((4, 4)))
+
+    base_loader.process_weights_after_loading(model, None, torch.device("cpu"))
+
+    assert events == [
+        "linear:a",
+        "linear:b",
+        "orig_process_start",
+        "orig_process_end",
+    ]
+    assert shared_qm.process_weights_after_loading == orig_qm_fn

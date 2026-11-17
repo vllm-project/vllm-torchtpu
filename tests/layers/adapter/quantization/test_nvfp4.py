@@ -721,3 +721,49 @@ class TestNvfp4MoEMethod:
             out = method.apply_monolithic(layer, x, router_logits)
             assert torch.equal(out, torch.ones(4, 64))
             mock_pipe.assert_called_once()
+
+    def test_prepare_moe_weights_synchronizes_w13_before_w2_on_tpu(self):
+        from vllm_torchtpu.layers.adapter.quantization.nvfp4 import _prepare_moe_weights
+
+        calls: list[str] = []
+
+        class _FakeTpuTensor:
+            def __init__(self, shape: tuple[int, ...], tag: str):
+                self.shape = shape
+                self.tag = tag
+                self.device = MagicMock(type="tpu")
+
+        layer = MagicMock()
+        layer.w13_weight.data = _FakeTpuTensor((2, 512, 256), "w13")
+        layer.w2_weight.data = _FakeTpuTensor((2, 512, 256), "w2")
+
+        def _fake_requant(buf, scale_f, block):
+            calls.append(f"requant:{buf.tag}")
+            out_w = _FakeTpuTensor(buf.shape, f"{buf.tag}_out")
+            out_s = _FakeTpuTensor((2, 1, 1, 512), f"{buf.tag}_scale")
+            return out_w, out_s
+
+        def _fake_sync(tensors):
+            calls.append("sync:" + ",".join(t.tag for t in tensors))
+
+        with (
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4.fresh_buffer",
+                side_effect=lambda t: t,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4.requant_load_kmajor_fp4",
+                side_effect=_fake_requant,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4.synchronize_tensors",
+                side_effect=_fake_sync,
+            ),
+        ):
+            _prepare_moe_weights(layer, MagicMock(), MagicMock(), requant_block=512)
+
+        assert calls == [
+            "requant:w13",
+            "sync:w13_out,w13_scale",
+            "requant:w2",
+        ]
