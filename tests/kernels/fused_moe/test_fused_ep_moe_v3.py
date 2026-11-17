@@ -425,6 +425,134 @@ def test_one_bf16_step_flags_every_single_row_error(interpret):
         assert not report["pass"], (name, report)
 
 
+# ---- the layer's build caches, traced on one CPU device ----
+
+
+@pytest.fixture
+def one_cpu_shard(monkeypatch):
+    """A TPU7x chip record, empty kernel and layer caches, and the module
+    flags restored afterwards. Returns a function that traces the layer on a
+    one-shard mesh of the CPU device."""
+    import jax
+    import jax.numpy as jnp
+    from jax._src.pallas.mosaic import tpu_info
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
+    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
+    from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
+    from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8
+
+    def tpu7x():
+        return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+
+    ffn_kernel = importlib.import_module(
+        "vllm_torchtpu.kernels.fused_moe.v3.ffn_kernel"
+    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", tpu7x)
+    monkeypatch.setattr(tpu_info, "get_tpu_info", tpu7x)
+    monkeypatch.setattr(ffn_kernel, "_BUILD_CACHE", {})
+    monkeypatch.setattr(v3_layer, "_LAYER_CACHE", {})
+    for module, flag in (
+        (v3_layer, "WRAP_IN_JIT"),
+        (v3_layout, "SIDE_EFFECTS"),
+        (v3_layout, "SHARD_INDEX_OPERAND"),
+    ):
+        monkeypatch.setattr(module, flag, getattr(module, flag))
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:1]), (MESH_AXIS,))
+    tokens, hidden, inter, experts = 32, 256, 128, 8
+    shapes = (
+        jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
+        jax.ShapeDtypeStruct((experts, hidden, 2 * inter), FP8),
+        jax.ShapeDtypeStruct((experts, inter, hidden), FP8),
+        jax.ShapeDtypeStruct((experts, 2 * inter), jnp.float32),
+        jax.ShapeDtypeStruct((experts, hidden), jnp.float32),
+        jax.ShapeDtypeStruct((tokens, experts), jnp.float32),
+    )
+
+    def trace(shard_index=None, **kwargs):
+        kwargs.setdefault("config", Config(result_rows="bf16"))
+
+        def run(x, w1, w2, s1, s2, logits):
+            return fused_ep_moe(
+                x,
+                w1,
+                w2,
+                s1,
+                s2,
+                logits,
+                top_k=2,
+                renormalize=True,
+                mesh=mesh,
+                tile_rows=TILE_ROWS,
+                shard_index=shard_index,
+                **kwargs,
+            )
+
+        with jax.default_device(jax.devices("cpu")[0]):
+            return str(jax.make_jaxpr(run)(*shapes))
+
+    return trace
+
+
+@pytest.mark.cpu_test
+def test_a_shard_index_without_the_operand_mode_is_refused(one_cpu_shard):
+    """The programs read layout.SHARD_INDEX_OPERAND when they are built; an
+    index handed in with the flag off is refused before anything is built."""
+    import jax.numpy as jnp
+
+    with pytest.raises(ValueError, match="shard_index must be None"):
+        one_cpu_shard(shard_index=jnp.zeros((1, 1), jnp.int32))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "bridge_first", [True, False], ids=["bridge_first", "own_first"]
+)
+def test_both_shard_index_modes_build_in_one_process(one_cpu_shard, bridge_first):
+    """The bridge's operand mode and the kernel's mesh-axis mode, one after
+    the other with the caches kept: each gets programs built for its own
+    mode (the FFN build reads the flag, so a build cached on its arguments
+    alone would hand one mode's program to the other)."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
+
+    def bridge():
+        v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS = True, False
+        return one_cpu_shard(shard_index=jnp.zeros((1, 1), jnp.int32))
+
+    def own():
+        v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS = False, True
+        return one_cpu_shard()
+
+    # Without the flag in the FFN build's key, the second mode is handed the
+    # first mode's program and the call raises ValueError.
+    first, second = (bridge, own) if bridge_first else (own, bridge)
+    first()
+    second()
+
+
+@pytest.mark.cpu_test
+def test_the_layer_cache_keys_on_the_module_flags(one_cpu_shard):
+    """A build per value of each flag the build bakes in: the jit wrapper
+    (WRAP_IN_JIT) and the programs' side-effect declaration
+    (layout.SIDE_EFFECTS)."""
+    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
+    from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
+
+    v3_layer.WRAP_IN_JIT = True
+    wrapped = one_cpu_shard()
+    v3_layer.WRAP_IN_JIT = False
+    bare = one_cpu_shard()
+    assert len(v3_layer._LAYER_CACHE) == 2 and bare != wrapped
+    v3_layout.SIDE_EFFECTS = not v3_layout.SIDE_EFFECTS
+    one_cpu_shard()
+    one_cpu_shard()
+    assert len(v3_layer._LAYER_CACHE) == 3
+
+
 # ---- the layer on eight TPU7x cores ----
 
 
@@ -440,22 +568,6 @@ def eight_tpu7x_cores():
 
     if jax.device_count() < D or not supported_on(jax.devices()[0]):
         pytest.skip("fused EP MoE v3 needs eight TPU7x cores")
-
-
-@pytest.fixture
-def fresh_builds(monkeypatch):
-    """Empty kernel and layer caches for one case. The FFN kernel's build
-    reads layout.SHARD_INDEX_OPERAND (the bridge's mode takes one more
-    scalar operand) but is cached on its arguments alone, so a build made
-    in one mode would be handed to the other. Serving sets the mode once
-    per process; this test switches it between cases."""
-    ffn_kernel = importlib.import_module(
-        "vllm_torchtpu.kernels.fused_moe.v3.ffn_kernel"
-    )
-    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
-
-    monkeypatch.setattr(ffn_kernel, "_BUILD_CACHE", {})
-    monkeypatch.setattr(v3_layer, "_LAYER_CACHE", {})
 
 
 def _run_case(name, mode):
@@ -516,9 +628,7 @@ RUNS = [(mode, name) for mode, (_, _, names) in MODES.items() for name in names]
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("mode,name", RUNS)
-def test_fused_ep_moe_matches_the_reference(
-    eight_tpu7x_cores, fresh_builds, mode, name
-):
+def test_fused_ep_moe_matches_the_reference(eight_tpu7x_cores, mode, name):
     """Every value within one bf16 step of the reference, except fewer than
     1 in 1000. The same check must fail on the layer's own output with two
     tokens' rows swapped, and with one row zeroed."""
