@@ -162,3 +162,15 @@ def test_positive_control(mesh_pairs):
     a, b = _run(mesh, pairs, x), _run(mesh, pairs, y)
     moved = _bits(a) != _bits(b)
     assert moved[:, 7, 1000].all() and int(moved.sum()) == 8
+
+
+@pytest.mark.parametrize("pad", [False, True])
+def test_op_function_signature_evaluates(mesh_pairs, pad):
+    """torch_tpu's jax_op calls inspect.signature(fn, eval_str=True) on the op function (the engine-init path,
+    tp_ar_decode.arm). String annotations must resolve in the function's globals (J0b j-db896a2a failed here)."""
+    import inspect
+
+    mesh, pairs = mesh_pairs
+    fn = _fn(mesh, pairs, "bf16", pad)
+    sig = inspect.signature(fn, eval_str=True)
+    assert list(sig.parameters) == ["x"]
