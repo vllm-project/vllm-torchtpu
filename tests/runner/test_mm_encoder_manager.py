@@ -150,12 +150,14 @@ def test_exact_shape_input_is_detached_to_match_template_guards(manager):
 def test_templates_are_built_without_autograd(compile_mock):
     # Both parameter-derived tensors and pre-existing parameters / no-op .to()
     # tensors must be detached so replays built under no_grad match template
-    # Dynamo guards.
+    # Dynamo guards; optional None metadata entries (e.g. Qwen2.5-VL
+    # sequence_lengths_*) must pass through untouched.
     weight = torch.nn.Parameter(torch.ones(4, 2))
     mgr = _make_manager(
         lambda budget: {
             "pos_embeds": weight[:1].repeat(budget, 1),
             "raw_param": weight.to(torch.float32),
+            "optional_meta": None,
         },
         budgets=(4,),
     )
@@ -163,6 +165,9 @@ def test_templates_are_built_without_autograd(compile_mock):
     template = mgr.budget_templates["default"][4]
     assert not template["pos_embeds"].requires_grad
     assert not template["raw_param"].requires_grad
+    assert template["optional_meta"] is None
+    padded = mgr._pad_to_template({"optional_meta": None}, 4)
+    assert padded["optional_meta"] is None
 
 
 def test_exact_shape_replay_reuses_precompiled_dynamo_graph(monkeypatch):

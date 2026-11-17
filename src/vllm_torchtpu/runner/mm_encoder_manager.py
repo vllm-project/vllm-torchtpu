@@ -137,7 +137,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
                         path=path,
                     )
                     templates[budget] = {
-                        key: val.detach() if val.requires_grad else val
+                        key: (
+                            val.detach()
+                            if isinstance(val, torch.Tensor) and val.requires_grad
+                            else val
+                        )
                         for key, val in capture.values.items()
                     }
                 self.budget_templates[path] = templates
@@ -175,7 +179,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
         for key, tmpl in template.items():
             src = replay_values.get(key)
-            if src is None:
+            if src is None or tmpl is None:
                 padded[key] = tmpl
                 continue
 
