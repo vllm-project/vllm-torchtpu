@@ -293,6 +293,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "QWEN4_EXP_PD_FAST_ADMIT",
     # Stage-3 load submit after the forward dispatch (same submits).
     "QWEN4_EXP_PD_DEFER_LOAD_SUBMIT",
+    # When a landed load's staged repack is dispatched (after the forward
+    # instead of before) and the step its request joins (q38 LAND-OVERLAP):
+    # the repack programs, the bytes and every model program are the same.
+    "QWEN4_EXP_PD_LANDX_DEFER_REPACK",
     # Per-step host phase logging (runner/host_phases.py).
     "VLLM_TPU_HOST_PHASES",
     # Last pipeline stage replies from the output thread (host only;

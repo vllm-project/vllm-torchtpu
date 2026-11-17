@@ -5886,7 +5886,7 @@ class TPUModelRunner(GPUModelRunner):
             and not has_kv_transfer_group()
         )
         host_phases.mark("token_d2h_bookkeeping")
-        if envs.QWEN4_EXP_PD_DEFER_LOAD_SUBMIT:
+        if envs.QWEN4_EXP_PD_DEFER_LOAD_SUBMIT or envs.QWEN4_EXP_PD_LANDX_DEFER_REPACK:
             # The forward and sampling are dispatched and the wait below holds
             # the host until the forward ends: submit the step's loads now.
             self._submit_deferred_kv_loads()

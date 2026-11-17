@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
     QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
     QWEN4_EXP_PD_DEFER_LOAD_SUBMIT: bool = False
+    QWEN4_EXP_PD_LANDX_DEFER_REPACK: bool = False
     QWEN4_EXP_PD_SHARED_COMPRESSED: bool = False
     QWEN4_EXP_PD_BATCHED_ADMISSION: bool = False
     QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES: int = 0
@@ -1652,6 +1653,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sampling dispatch instead of before the forward; the staged repack stays
     # before it (qwen4_exp pd_connector.submit_deferred_loads). Host-only.
     "QWEN4_EXP_PD_DEFER_LOAD_SUBMIT": env_bool("QWEN4_EXP_PD_DEFER_LOAD_SUBMIT"),
+    # Consumer (q38 HCDEC-LANDX / BLSTACK-LANDX, LAND-OVERLAP): with
+    # QWEN4_EXP_PD_SYNC_REPACK the scheduler holds each load that landed on
+    # every rank out of vLLM's finished_recving for one step and names it in
+    # qwen_landx_repack_req_ids; every rank runs that load's staged repack in
+    # submit_deferred_loads, after the step's forward and sampling dispatch,
+    # instead of in start_load_kv before the forward, and the scheduler
+    # releases it at its next update, so the request joins one step later.
+    # Same repack programs and bytes; host-side scheduling only. Refused at
+    # build without SYNC_REPACK, with SYNC_REPACK_AB_S or SHARED_COMPRESSED.
+    "QWEN4_EXP_PD_LANDX_DEFER_REPACK": env_bool("QWEN4_EXP_PD_LANDX_DEFER_REPACK"),
     # Both legs (q38 XFER S4): a staged decode's compressed-key pairs cross
     # once per decode host instead of once per rank. Page b of a tag's pair
     # space goes to rank b % TP; the ranks all-gather them in the L1-named
