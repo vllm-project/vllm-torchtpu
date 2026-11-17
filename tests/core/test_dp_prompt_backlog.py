@@ -112,7 +112,7 @@ class Coordinator:
         return relay_decoder.decode(relay_encoder.encode(self.rows))
 
 
-def engine(waiting, running, cached_by_id, kv_usage=0.25):
+def engine(waiting, running, cached_by_id, kv_usage=0.25, kv_holding_waiting=()):
     lookups = []
 
     def find_longest_cache_hit(block_hashes, max_length):
@@ -123,11 +123,16 @@ def engine(waiting, running, cached_by_id, kv_usage=0.25):
         prefix_cache_lookup_enabled=lambda request: True,
         coordinator=SimpleNamespace(find_longest_cache_hit=find_longest_cache_hit),
     )
+    kv_holding_waiting = list(kv_holding_waiting)
     scheduler = SimpleNamespace(
         waiting=waiting,
+        kv_holding_waiting=kv_holding_waiting,
         running=running,
         kv_cache_manager=manager,
-        get_request_counts=lambda: (len(running), len(waiting)),
+        get_request_counts=lambda: (
+            len(running),
+            len(waiting) + len(kv_holding_waiting),
+        ),
         get_kv_cache_usage=lambda: kv_usage,
     )
     core = SimpleNamespace(
@@ -203,6 +208,31 @@ def test_engine_publishes_pending_prompt_tokens(installed):
     pending, kv = backlog.unpack(outputs.scheduler_stats.kv_cache_usage)
     assert pending == 83_000 - 1024
     assert kv == pytest.approx(0.25)
+
+
+def test_requests_holding_kv_while_waiting_count_as_pending(installed):
+    """vLLM admits from kv_holding_waiting before waiting: a request there
+    still has its uncomputed prompt ahead of it."""
+    holding = Request(
+        request_id="h0",
+        num_prompt_tokens=6_000,
+        num_computed_tokens=1_000,
+        block_hashes=["h0"],
+    )
+    waiting = [
+        Request(
+            request_id="w0",
+            num_prompt_tokens=2_000,
+            num_computed_tokens=0,
+            block_hashes=["w0"],
+        )
+    ]
+    core, _ = engine(waiting, [], {"h0": 0, "w0": 0}, kv_holding_waiting=[holding])
+    DPEngineCoreProc._maybe_publish_request_counts(core)
+    _, outputs = core.output_queue.get_nowait()
+    pending, _ = backlog.unpack(outputs.scheduler_stats.kv_cache_usage)
+    assert pending == 5_000 + 2_000
+    assert outputs.scheduler_stats.num_waiting_reqs == 2
 
 
 def test_equal_backlogs_keep_vllms_choice(installed):
