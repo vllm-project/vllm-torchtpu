@@ -90,6 +90,10 @@ if [[ "$scenario" == decode_dp16 ]]; then
   done
 fi
 
+# DSV41_PROFILE=1 adds the harness's separate profile wave.
+if [[ "${DSV41_PROFILE:-0}" == 1 ]]; then
+  launch_args+=(--profile)
+fi
 python scripts/dsv41_bench/server_steps/run.py \
   --scenario "$scenario" --input "$results/inputs.json" \
   --out "$results/benchmark" \
