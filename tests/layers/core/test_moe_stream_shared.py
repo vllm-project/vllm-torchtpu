@@ -18,7 +18,11 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
-from vllm_torchtpu.layers.core.fused_moe_gmm import fused_moe_func, shared_expert_xla
+from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    fused_moe_func,
+    fused_moe_func_shared,
+    shared_expert_xla,
+)
 
 
 def _shared_weights(key, hidden, fs):
@@ -81,10 +85,11 @@ def test_fused_moe_func_adds_shared_in_bf16(monkeypatch):
         return routed
 
     monkeypatch.setattr(fused_moe_gmm, "_fused_moe_routed", fake_routed)
-    args = (x, None, None, None, None, None, None, None, None)
-    # The traced function: jit would cache the first patched trace.
+    args = (x, None, None, None, None, None, None, None, None, None)
+    # The traced functions: jit would cache the first patched trace.
     fused = fused_moe_func.__wrapped__
-    got = fused(*args, shared=(sw1, s1, sw2, s2))
+    fused_shared = fused_moe_func_shared.__wrapped__
+    got = fused_shared(*args, sw1, s1, sw2, s2)
     assert seen["shapes"] == [
         (16, hidden), (hidden, 2 * fs), (1, 2 * fs), (fs, hidden), (1, hidden)
     ]
@@ -104,7 +109,7 @@ def test_fused_moe_func_adds_shared_in_bf16(monkeypatch):
         return routed
 
     monkeypatch.setattr(fused_moe_gmm, "_fused_moe_routed", fake_routed_kernel)
-    got = fused(*args, shared=(sw1, s1, sw2, s2))
+    got = fused_shared(*args, sw1, s1, sw2, s2)
     np.testing.assert_array_equal(
         np.asarray(got.astype(jnp.float32)),
         np.asarray((kernel_sh[:num_tokens] + routed).astype(jnp.float32)),
@@ -112,3 +117,30 @@ def test_fused_moe_func_adds_shared_in_bf16(monkeypatch):
     # No shared: the routed output unchanged.
     monkeypatch.setattr(fused_moe_gmm, "_fused_moe_routed", fake_routed)
     assert fused(*args) is routed
+
+
+def test_custom_op_signatures_are_valid():
+    """torch_tpu's jax_op refuses parameters it cannot type (a tuple did)."""
+    import functools
+    import inspect
+
+    from torch_tpu._internal.pallas import pallas
+
+    for fn in (fused_moe_func, fused_moe_func_shared):
+        bound = functools.partial(
+            fn, topk=4, activation="swigluoai", use_ep=True, use_sparse_core=True,
+            onehot_moe_permute_threshold=0, rhs_quant_dtype=None,
+            skip_padded_tokens=False,
+        )
+        sig = inspect.signature(inspect.unwrap(bound), eval_str=True)
+        pallas._verify_signature(sig, bound_names=pallas._get_bound_names(bound))
+
+
+def test_fused_moe_custom_ops_build():
+    from vllm_torchtpu.layers.adapter import fused_moe
+
+    for with_shared in (False, True):
+        fused_moe._build_fused_moe_custom_op(
+            topk=4, activation="swigluoai", use_ep=True, skip_padded_tokens=True,
+            with_shared=with_shared,
+        )

@@ -897,18 +897,18 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "topk",
-        "activation",
-        "use_ep",
-        "use_sparse_core",
-        "onehot_moe_permute_threshold",
-        "rhs_quant_dtype",
-        "skip_padded_tokens",
-    ),
+_STATIC = (
+    "topk",
+    "activation",
+    "use_ep",
+    "use_sparse_core",
+    "onehot_moe_permute_threshold",
+    "rhs_quant_dtype",
+    "skip_padded_tokens",
 )
+
+
+@functools.partial(jax.jit, static_argnames=_STATIC)
 def fused_moe_func(
     hidden_states: jax.Array,
     w1: jax.Array,
@@ -927,18 +927,11 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
-    shared: tuple | None = None,
 ) -> jax.Array:
-    """``_fused_moe_routed`` plus, with ``shared`` = (e4m3 [K, 2Fs], f32
-    [1, 2Fs], e4m3 [Fs, N], f32 [1, N]), a dense shared expert slice added to
-    the routed output in bf16, as vLLM's MoE runner adds its shared expert.
-    The streamed decode kernel computes the slice when it serves the call
-    (TPU_MOE_STREAM_SHARED_EXPERT); other paths compute it with XLA dots."""
-    args = (
+    """Run MoE with precomputed expert ids and weights (_fused_moe_routed)."""
+    return _fused_moe_routed(
         hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias,
         topk_weights, topk_ids, experts_start,
-    )
-    kwargs = dict(
         topk=topk,
         activation=activation,
         use_ep=use_ep,
@@ -947,20 +940,59 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )
-    if shared is None:
-        return _fused_moe_routed(*args, **kwargs)
+
+
+@functools.partial(jax.jit, static_argnames=_STATIC)
+def fused_moe_func_shared(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None,
+    shared_w1: jax.Array,
+    shared_s1: jax.Array,
+    shared_w2: jax.Array,
+    shared_s2: jax.Array,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """fused_moe_func plus a dense shared expert slice (e4m3 [K, 2Fs], scale
+    [2Fs], e4m3 [Fs, N], scale [N], power-of-two column scales) added to the
+    routed output in bf16, as vLLM's MoE runner adds its shared expert. The
+    streamed decode kernel computes the slice when it serves the call
+    (TPU_MOE_STREAM_SHARED_EXPERT); other paths compute it with XLA dots."""
     num_tokens = hidden_states.shape[0]
     pad = -num_tokens % 16
     xt = jnp.pad(hidden_states, ((0, pad), (0, 0))) if pad else hidden_states
-    sw1, ss1, sw2, ss2 = shared
     shared = (
-        sw1,
-        ss1.reshape(1, -1).astype(jnp.float32),
-        sw2,
-        ss2.reshape(1, -1).astype(jnp.float32),
+        shared_w1,
+        shared_s1.reshape(1, -1).astype(jnp.float32),
+        shared_w2,
+        shared_s2.reshape(1, -1).astype(jnp.float32),
     )
     holder = {"args": (xt, *shared)}
-    out = _fused_moe_routed(*args, stream_shared=holder, **kwargs)
+    out = _fused_moe_routed(
+        hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias,
+        topk_weights, topk_ids, experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+        stream_shared=holder,
+    )
     sh = holder.get("out")
     if sh is None:
         sh = shared_expert_xla(hidden_states, *shared)

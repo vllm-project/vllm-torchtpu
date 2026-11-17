@@ -24,6 +24,7 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
+    fused_moe_func_shared,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
@@ -150,39 +151,6 @@ def _allocate_kernel_instance_id() -> int:
     return kernel_instance_id
 
 
-def _fused_moe_func_with_shared(
-    hidden_states,
-    w1,
-    w2,
-    w1_scale,
-    w2_scale,
-    w1_bias,
-    w2_bias,
-    topk_weights,
-    topk_ids,
-    experts_start,
-    shared_w1,
-    shared_s1,
-    shared_w2,
-    shared_s2,
-    **kwargs,
-):
-    return fused_moe_func(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        topk_weights,
-        topk_ids,
-        experts_start,
-        shared=(shared_w1, shared_s1, shared_w2, shared_s2),
-        **kwargs,
-    )
-
-
 def _build_fused_moe_custom_op(
     *,
     topk: int,
@@ -209,7 +177,7 @@ def _build_fused_moe_custom_op(
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     wrapped_fn = functools.partial(
-        _fused_moe_func_with_shared if with_shared else fused_moe_func,
+        fused_moe_func_shared if with_shared else fused_moe_func,
         topk=topk,
         activation=activation,
         use_ep=use_ep,
