@@ -25,10 +25,12 @@ reason, and same shape, as tests/distributed/tpu_test_utils.py.
 """
 
 import dataclasses
+import gc
 import importlib
 import multiprocessing
 import os
 import traceback
+import weakref
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -819,6 +821,21 @@ def test_handover_refuses_a_different_input_set(order):
         shape_variants.ShapeSpecializationError, match="TPU_KERNEL_ITER_MODE"
     ):
         session.get("dir", "key", _stub_graph(order, metas))
+
+
+def test_a_stored_bucket_does_not_keep_its_graph_alive():
+    """put() keeps what a handover compares and a refusal names, not the
+    placeholder nodes, which would hold their GraphModule until the warmup
+    ends: one compiler deep copy per subgraph and bucket."""
+    session = shape_variants.BucketExecutables()
+    graph = _stub_graph(STORED_ORDER)
+    graph_ref = weakref.ref(graph)
+    compiled = lambda *args: args  # noqa: E731
+    session.put("dir", "key", graph, compiled)
+    del graph
+    gc.collect()
+    assert graph_ref() is None
+    assert session.get("dir", "key", _stub_graph(STORED_ORDER)) is compiled
 
 
 def test_signature_delta_names_only_the_inputs_that_differ():
