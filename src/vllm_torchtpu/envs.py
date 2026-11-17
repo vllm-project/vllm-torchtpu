@@ -235,6 +235,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    TPU_SAMPLER_TOPP_CANDIDATES: str = ""
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1491,6 +1492,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
     ),
+    # Top-p sampling finds its probability threshold from candidate blocks
+    # (layers/adapter/sample/topp_candidates.py): comma list of tiers in
+    # 128-logit blocks, e.g. "64,512". Each tier is used only when its blocks
+    # provably hold the whole top-p set of every row, else the next tier, and
+    # finally the full-vocabulary bisection. Same threshold up to the float32
+    # summation order. Empty (default): the full bisection only.
+    "TPU_SAMPLER_TOPP_CANDIDATES": env_str("TPU_SAMPLER_TOPP_CANDIDATES", ""),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
