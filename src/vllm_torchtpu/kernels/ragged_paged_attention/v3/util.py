@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.pallas_util import (
+    align_to,
     cdiv,
     get_dtype_packing,
     get_tpu_version,
@@ -46,14 +47,15 @@ class RpaCase(Enum):
             RpaCase.MIXED: "m",
         }[self]
 
-    def get_range(self, distribution):
+    def get_range(self, distribution, *, has_prefill_pass: bool = True):
         assert distribution.shape == (3,)
         if self == RpaCase.DECODE:
             return 0, distribution[0]
         if self == RpaCase.PREFILL:
             return distribution[0], distribution[1]
         if self == RpaCase.MIXED:
-            return distribution[1], distribution[2]
+            start = distribution[1] if has_prefill_pass else distribution[0]
+            return start, distribution[2]
         raise ValueError(f"Unsupported RPA case: {self}")
 
 
@@ -61,17 +63,18 @@ def get_span_int_dtype(
     q_dtype,
     pages_per_seq: int,
     page_size: int,
+    bkv_csz: int,
     *,
     tpu_version: int | None = None,
 ):
-    """Return `int16` if `pages_per_seq * page_size` fits on TPU v6+, else `int32`."""
+    """Return `int16` if `align_to(pages_per_seq * page_size, bkv_csz)` fits on v6+."""
     if tpu_version is None:
         tpu_version = get_tpu_version()
-    max_kv_len = pages_per_seq * page_size
+    max_span = align_to(pages_per_seq * page_size, bkv_csz)
     if (
         get_dtype_packing(q_dtype) != 1
         and tpu_version >= 6
-        and max_kv_len <= jnp.iinfo(jnp.int16).max
+        and max_span <= jnp.iinfo(jnp.int16).max
     ):
         return jnp.int16
     return jnp.int32
@@ -79,8 +82,8 @@ def get_span_int_dtype(
 
 def validate_common_inputs(
     queries: jax.Array,
-    keys: jax.Array,
-    values: jax.Array,
+    keys: jax.Array | None,
+    values: jax.Array | None,
     kv_lens: jax.Array,
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
@@ -88,6 +91,7 @@ def validate_common_inputs(
     *,
     page_size: int,
     kv_packing: int,
+    actual_num_kv_heads: int | None = None,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     chunk_prefill_size: int | None = None,
@@ -95,33 +99,44 @@ def validate_common_inputs(
     vmem_limit_bytes: int | None = None,
 ) -> None:
     """Validate cache-layout-independent Q/K/V, metadata, and block-size inputs."""
-    q, k, v = queries, keys, values
-    if not (len(q.shape) == len(k.shape) == len(v.shape) == 3):
-        raise ValueError(f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}")
-    if k.shape != v.shape:
-        raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
-    if not (q.shape[0] == k.shape[0] == v.shape[0]):
-        raise ValueError(
-            f"Expected {q.shape[0]=} to be equal to {k.shape[0]=} and {v.shape[0]=}"
-        )
-    if not (q.shape[2] == k.shape[2] == v.shape[2]):
-        raise ValueError(
-            f"Expected {q.shape[2]=} to be equal to {k.shape[2]=} and {v.shape[2]=}"
-        )
-    if not (
-        jnp.issubdtype(q.dtype, jnp.floating)
-        and jnp.issubdtype(k.dtype, jnp.floating)
-        and jnp.issubdtype(v.dtype, jnp.floating)
-    ):
-        raise ValueError(
-            f"Expected floating-point Q/K/V dtypes, got {q.dtype=}, {k.dtype=},"
-            f" {v.dtype=}."
-        )
-    if k.dtype != v.dtype:
-        raise ValueError(f"Expected {k.dtype=} to equal {v.dtype=}.")
+    q = queries
+    if len(q.shape) != 3:
+        raise ValueError(f"Expected 3D array for {q.shape=}")
+    if not jnp.issubdtype(q.dtype, jnp.floating):
+        raise ValueError(f"Expected floating-point Q dtype, got {q.dtype=}.")
 
+    if keys is not None or values is not None:
+        if keys is None or values is None:
+            raise ValueError("keys and values must both be provided or both be None.")
+        k, v = keys, values
+        if not (len(k.shape) == len(v.shape) == 3):
+            raise ValueError(
+                f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}"
+            )
+        if k.shape != v.shape:
+            raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
+        if not (q.shape[0] == k.shape[0] == v.shape[0]):
+            raise ValueError(
+                f"Expected {q.shape[0]=} to be equal to {k.shape[0]=} and {v.shape[0]=}"
+            )
+        if not (q.shape[2] == k.shape[2] == v.shape[2]):
+            raise ValueError(
+                f"Expected {q.shape[2]=} to be equal to {k.shape[2]=} and {v.shape[2]=}"
+            )
+        if not (
+            jnp.issubdtype(k.dtype, jnp.floating)
+            and jnp.issubdtype(v.dtype, jnp.floating)
+        ):
+            raise ValueError(
+                f"Expected floating-point Q/K/V dtypes, got {q.dtype=}, {k.dtype=},"
+                f" {v.dtype=}."
+            )
+        if k.dtype != v.dtype:
+            raise ValueError(f"Expected {k.dtype=} to equal {v.dtype=}.")
+        actual_num_kv_heads = k.shape[1]
+
+    assert actual_num_kv_heads is not None
     actual_num_q_heads = q.shape[1]
-    actual_num_kv_heads = k.shape[1]
     if actual_num_q_heads % actual_num_kv_heads != 0:
         raise ValueError(
             f"Expected {actual_num_q_heads=} to be divisible by {actual_num_kv_heads=}."
@@ -199,11 +214,14 @@ def validate_dynamic_common_inputs(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
+    *,
+    page_size: int | None = None,
 ) -> None:
     """Validate runtime `distribution`, `q_len`, `kv_len`, and `page_indices` ranges."""
     max_num_tokens = queries.shape[0]
     total_num_pages = kv_cache.shape[0]
-    page_size = kv_cache.shape[1]
+    if page_size is None:
+        page_size = kv_cache.shape[1]
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
@@ -240,8 +258,8 @@ def validate_dynamic_common_inputs(
 def run_bundled_rpa(
     rpa_fn: Callable[..., tuple[jax.Array, jax.Array]],
     queries: jax.Array,
-    keys: jax.Array,
-    values: jax.Array,
+    keys: jax.Array | None,
+    values: jax.Array | None,
     kv_cache_bundle: jax.Array,
     layer_idx: jax.Array,
     kv_lens: jax.Array,
@@ -255,15 +273,27 @@ def run_bundled_rpa(
     flat_bundle = kv_cache_bundle.reshape(
         num_blocks * num_layers, *kv_cache_bundle.shape[2:]
     )
-    out, new_flat_bundle = rpa_fn(
-        queries,
-        keys,
-        values,
-        flat_bundle,
-        kv_lens,
-        page_indices * num_layers + layer_idx,
-        cu_q_lens,
-        distribution,
-        **rpa_kwargs,
-    )
+    remapped_pages = page_indices * num_layers + layer_idx
+    if keys is None and values is None:
+        out, new_flat_bundle = rpa_fn(
+            queries,
+            flat_bundle,
+            kv_lens,
+            remapped_pages,
+            cu_q_lens,
+            distribution,
+            **rpa_kwargs,
+        )
+    else:
+        out, new_flat_bundle = rpa_fn(
+            queries,
+            keys,
+            values,
+            flat_bundle,
+            kv_lens,
+            remapped_pages,
+            cu_q_lens,
+            distribution,
+            **rpa_kwargs,
+        )
     return out, new_flat_bundle.reshape(kv_cache_bundle.shape)

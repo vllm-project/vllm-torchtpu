@@ -77,3 +77,49 @@ def test_alignment_and_packing_helpers() -> None:
     assert pallas_util.next_power_of_2(5) == 8
     assert pallas_util.get_dtype_bitwidth(jnp.bfloat16) == 16
     assert pallas_util.get_dtype_packing(jnp.float8_e4m3fn) == 4
+
+
+@pytest.mark.parametrize("tpu_version", [5, 6, 7, 8])
+def test_get_tpu_info_for_version(tpu_version: int) -> None:
+    info = pallas_util.get_tpu_info_for_version(tpu_version)
+    assert info.generation == tpu_version
+    assert info.num_lanes == 128
+    assert info.get_sublane_tiling(jnp.float32) == 8
+    assert info.get_sublane_tiling(jnp.uint8) == 32
+
+
+@pytest.mark.parametrize("bad_version", [-1, 4, 99])
+def test_get_tpu_info_for_version_unsupported(bad_version: int) -> None:
+    with pytest.raises(NotImplementedError, match="Unsupported tpu_version"):
+        pallas_util.get_tpu_info_for_version(bad_version)
+
+
+@pytest.mark.parametrize(
+    ("rows", "dtype_name", "expected"),
+    [
+        (1, "uint8", 4),
+        (12, "uint8", 16),
+        (24, "uint8", 32),
+        (33, "uint8", 64),
+        (136, "uint8", 160),
+        (1, "bfloat16", 2),
+        (3, "bfloat16", 4),
+        (1, "float32", 1),
+        (9, "float32", 16),
+    ],
+)
+def test_align_sublane_rows(rows: int, dtype_name: str, expected: int) -> None:
+    info = pallas_util.get_tpu_info_for_version(7)
+    assert pallas_util.align_sublane_rows(rows, getattr(jnp, dtype_name), info) == (
+        expected
+    )
+
+
+def test_array_vmem_bytes() -> None:
+    info = pallas_util.get_tpu_info_for_version(7)
+    assert pallas_util.array_vmem_bytes((64,), jnp.float32, info) == 128 * 4
+    assert pallas_util.array_vmem_bytes((2, 1, 128), jnp.float32, info) == 2 * 1 * 512
+    assert (
+        pallas_util.array_vmem_bytes((2, 4, 24, 128), jnp.uint8, info)
+        == 2 * 4 * 32 * 128
+    )

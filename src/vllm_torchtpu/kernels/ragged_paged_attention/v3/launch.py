@@ -23,6 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.pallas_util import (
+    array_vmem_bytes,
     cdiv,
     get_dtype_bitwidth,
     has_bank_conflicts,
@@ -111,8 +112,22 @@ def make_base_rpa_scratch_shapes(
     ]
 
 
-def get_scratch_vmem_bytes(scratch_shapes: list[Any]) -> int:
-    """Calculate total VMEM bytes across all `pltpu.VMEM` specs in `scratch_shapes`."""
+def get_scratch_vmem_bytes(
+    scratch_shapes: list[Any],
+    *,
+    tpu_info: Any = None,
+) -> int:
+    """Calculate total VMEM bytes across all `pltpu.VMEM` specs in `scratch_shapes`.
+
+    When `tpu_info` is supplied, applies `array_vmem_bytes` sublane/lane padding
+    to every `pltpu.VMEM` buffer; otherwise sums raw element bitwidths.
+    """
+    if tpu_info is not None:
+        return sum(
+            array_vmem_bytes(spec.shape, spec.dtype, tpu_info)
+            for spec in scratch_shapes
+            if spec.memory_space == pltpu.VMEM
+        )
     total_bits = sum(
         math.prod(spec.shape) * get_dtype_bitwidth(spec.dtype)
         for spec in scratch_shapes

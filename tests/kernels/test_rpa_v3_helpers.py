@@ -38,42 +38,57 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3 import (
 
 
 @pytest.mark.parametrize(
-    ("dtype_name", "pages_per_seq", "page_size", "tpu_version", "want_i16"),
+    (
+        "dtype_name",
+        "pages_per_seq",
+        "page_size",
+        "bkv_csz",
+        "tpu_version",
+        "want_i16",
+    ),
     [
-        ("bfloat16", 2047, 16, 6, True),
+        ("bfloat16", 2047, 16, 16, 6, True),
+        # 2047 * 16 == 32752 <= 32767, but align_to(32752, 64) == 32768 > int16.max.
+        ("bfloat16", 2047, 16, 64, 7, False),
         # 2048 * 16 == 32768 > int16.max (32767) -> must select int32.
-        ("bfloat16", 2048, 16, 6, False),
-        ("bfloat16", 2049, 16, 7, False),
-        ("float32", 64, 16, 7, False),
-        ("bfloat16", 64, 16, 5, False),
-        ("bfloat16", 64, 16, -1, False),
+        ("bfloat16", 2048, 16, 16, 6, False),
+        ("bfloat16", 2049, 16, 16, 7, False),
+        ("float32", 64, 16, 16, 7, False),
+        ("bfloat16", 64, 16, 16, 5, False),
+        ("bfloat16", 64, 16, 16, -1, False),
     ],
 )
 def test_get_span_int_dtype(
     dtype_name: str,
     pages_per_seq: int,
     page_size: int,
+    bkv_csz: int,
     tpu_version: int,
     want_i16: bool,
 ) -> None:
     q_dtype = getattr(jnp, dtype_name)
     got = util.get_span_int_dtype(
-        q_dtype, pages_per_seq, page_size, tpu_version=tpu_version
+        q_dtype, pages_per_seq, page_size, bkv_csz, tpu_version=tpu_version
     )
     assert got == (jnp.int16 if want_i16 else jnp.int32)
 
 
 @pytest.mark.parametrize(
-    ("case_name", "expected"),
+    ("case_name", "has_prefill_pass", "expected"),
     [
-        ("DECODE", (0, 2)),
-        ("PREFILL", (2, 5)),
-        ("MIXED", (5, 7)),
+        ("DECODE", True, (0, 2)),
+        ("PREFILL", True, (2, 5)),
+        ("MIXED", True, (5, 7)),
+        ("MIXED", False, (2, 7)),
     ],
 )
-def test_rpa_case_get_range(case_name: str, expected: tuple[int, int]) -> None:
+def test_rpa_case_get_range(
+    case_name: str, has_prefill_pass: bool, expected: tuple[int, int]
+) -> None:
     dist = jnp.array([2, 5, 7], dtype=jnp.int32)
-    lo, hi = getattr(util.RpaCase, case_name).get_range(dist)
+    lo, hi = getattr(util.RpaCase, case_name).get_range(
+        dist, has_prefill_pass=has_prefill_pass
+    )
     assert (int(lo), int(hi)) == expected
 
 
@@ -307,6 +322,11 @@ def test_get_next_bkv_ids(
     sliding_window: int | None,
     expected: tuple[int, int, int, int],
 ) -> None:
+    next_bq_start = pipeline.start_bkv_idx_for_q_pos(
+        jnp.int32(32) + (bq_idx + 1) * 16,
+        bkv_sz=16,
+        sliding_window=sliding_window,
+    )
     got = pipeline.get_next_bkv_ids(
         jnp.int32(4),
         jnp.int32(bq_idx),
@@ -314,20 +334,46 @@ def test_get_next_bkv_ids(
         jnp.int32(0),
         num_bq=2,
         num_bkv=3,
-        kv_q_gap=jnp.int32(32),
-        actual_bq_sz=16,
-        bkv_sz=16,
-        sliding_window=sliding_window,
+        next_bq_start_bkv_idx=next_bq_start,
         next_seq_start_bkv_idx=jnp.int32(3),
     )
     assert tuple(int(x) for x in got) == expected
 
 
+def test_compute_bkv_cache_and_new_sizes() -> None:
+    ks0, c0, n0, bc0, bn0 = staging.compute_bkv_cache_and_new_sizes(
+        jnp.int32(40),
+        jnp.int32(12),
+        jnp.int32(1),
+        bkv_sz=16,
+        skip_kv_update=False,
+    )
+    assert (int(ks0), int(c0), int(n0), int(bc0), int(bn0)) == (16, 12, 12, 12, 4)
+
+    ks1, c1, n1, bc1, bn1 = staging.compute_bkv_cache_and_new_sizes(
+        jnp.int32(40),
+        jnp.int32(12),
+        jnp.int32(1),
+        bkv_sz=16,
+        skip_kv_update=True,
+    )
+    assert (int(ks1), int(c1), int(n1), int(bc1), int(bn1)) == (16, 24, 0, 16, 0)
+
+
 @pytest.mark.parametrize(
-    ("span_dtype_name", "processed_q", "tile_starts", "effective_kv", "sliding_window"),
+    (
+        "span_dtype_name",
+        "processed_q",
+        "tile_starts",
+        "effective_kv",
+        "sliding_window",
+        "premask_v",
+        "use_k_norm",
+    ),
     [
-        ("int32", 4, (0, 4), 6, None),
-        ("int16", 1024, (894, 898), 902, 128),
+        ("int32", 4, (0, 4), 6, None, False, False),
+        # High int16 span: k_span + sliding_window > 32767 would overflow int16.
+        ("int16", 32000, (31994, 31998), 32002, 2048, True, True),
     ],
 )
 def test_flash_attention_steps_cpu(
@@ -336,6 +382,8 @@ def test_flash_attention_steps_cpu(
     tile_starts: tuple[int, int],
     effective_kv: int,
     sliding_window: int | None,
+    premask_v: bool,
+    use_k_norm: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: SimpleNamespace(num_lanes=128))
@@ -351,6 +399,12 @@ def test_flash_attention_steps_cpu(
         jnp.asarray(rng.standard_normal((bkv_csz, head_dim), dtype=np.float32))
         for _ in tile_starts
     ]
+    knorms = [
+        jnp.asarray(rng.uniform(0.5, 1.5, size=(1, bkv_csz)).astype(np.float32))
+        if use_k_norm
+        else None
+        for _ in tile_starts
+    ]
     l_ref = jax.new_ref(jnp.zeros((q_rows, 128), dtype=jnp.float32))
     m_ref = jax.new_ref(jnp.full((q_rows, 128), -jnp.inf, dtype=jnp.float32))
     o_ref = jax.new_ref(jnp.zeros((q_rows, head_dim), dtype=jnp.float32))
@@ -362,28 +416,47 @@ def test_flash_attention_steps_cpu(
         out_dtype=jnp.float32,
         mask_value=mask_val,
         span_int_ty=span_ty,
+        max_kv_len=32764,
         sliding_window=sliding_window,
     )
 
     with jax.default_matmul_precision("float32"):
-        for t_start, k_tile, v_tile in zip(tile_starts, ks, vs, strict=True):
-            p, v_masked, exp_m_diff = flash_attention.flash_attention_step1_qk_softmax(
+        for t_start, k_tile, v_tile, kn_row in zip(
+            tile_starts, ks, vs, knorms, strict=True
+        ):
+            v_arg = None if premask_v else v_tile
+            p, v_out, exp_m_diff = flash_attention.flash_attention_step1_qk_softmax(
                 q,
                 k_tile,
-                v_tile,
+                v_arg,
                 l_ref,
                 m_ref,
                 processed_q_len=processed_q,
                 processed_kv_len=t_start,
                 effective_kv_len=effective_kv,
                 cfg=cfg,
+                k_norm_row=kn_row,
             )
+            if premask_v:
+                assert v_out is None
+                v_step2 = flash_attention.mask_v_tile(
+                    v_tile,
+                    processed_kv_len=t_start,
+                    effective_kv_len=effective_kv,
+                    span_int_ty=span_ty,
+                )
+            else:
+                v_step2 = v_out
             flash_attention.flash_attention_step2_pv(
-                p, v_masked, exp_m_diff, o_ref, cfg=cfg
+                p, v_step2, exp_m_diff, o_ref, cfg=cfg
             )
 
     got = np.asarray(o_ref[...] / l_ref[:, :1])
-    k_all = np.concatenate([np.asarray(x) for x in ks], axis=0)
+    k_scaled = [
+        np.asarray(k_t) * (1.0 if kn is None else np.asarray(kn).T)
+        for k_t, kn in zip(ks, knorms, strict=True)
+    ]
+    k_all = np.concatenate(k_scaled, axis=0)
     v_all = np.concatenate([np.asarray(x) for x in vs], axis=0)
     k_pos = np.concatenate(
         [np.arange(s, s + bkv_csz) for s in tile_starts], axis=0

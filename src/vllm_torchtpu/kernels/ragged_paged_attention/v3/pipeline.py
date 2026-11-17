@@ -43,12 +43,20 @@ class BkvStepContext(NamedTuple):
 
     bq_sem_idx: Any
     bkv_sem_idx: Any
+    bkv_idx: Any
     processed_q_len: Any
     processed_kv_len: Any
     effective_kv_len: Any
     effective_bkv_sz: Any
     actual_bq_sz: int
     actual_bq_csz: int
+
+
+def start_bkv_idx_for_q_pos(q_pos, *, bkv_sz: int, sliding_window: int | None):
+    """First `bkv_idx` whose keys can fall within `sliding_window` of `q_pos`."""
+    if sliding_window is None:
+        return 0
+    return jnp.maximum(q_pos - sliding_window, 0) // bkv_sz
 
 
 def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx, *, num_bq):
@@ -69,10 +77,7 @@ def get_next_bkv_ids(
     *,
     num_bq,
     num_bkv,
-    kv_q_gap,
-    actual_bq_sz,
-    bkv_sz: int,
-    sliding_window: int | None,
+    next_bq_start_bkv_idx,
     next_seq_start_bkv_idx,
 ):
     next_bkv_idx = bkv_idx + 1
@@ -82,12 +87,6 @@ def get_next_bkv_ids(
     next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
     next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
     next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
-    next_bq_start_bkv_idx = (
-        0
-        if sliding_window is None
-        else jnp.maximum(kv_q_gap + (bq_idx + 1) * actual_bq_sz - sliding_window, 0)
-        // bkv_sz
-    )
     next_bkv_idx = lax.select(is_last_bkv, next_bq_start_bkv_idx, next_bkv_idx)
     next_bkv_idx = lax.select(is_last_bq, next_seq_start_bkv_idx, next_bkv_idx)
     return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
@@ -114,6 +113,9 @@ def run_rpa_sequence_pipeline(
     Before starting each KV fetch (`prologue` and `prefetch_next_bkv`), this
     pipeline calls `kv_update_ring.wait(bkv_sem_idx)` so `fetch_bkv_fn` never
     overwrites a double-buffer slot while an earlier KV writeback is in flight.
+    When `cfg.sliding_window` is set, any updated block with
+    `bkv_idx < next_bq_start_bkv_idx` is flushed immediately on its final visit
+    before the sliding window advances past it.
 
     Args:
       seq_idx: Current sequence index in `[start_seq_idx, end_seq_idx)`.
@@ -156,15 +158,16 @@ def run_rpa_sequence_pipeline(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
     kv_q_gap = kv_len - q_len
-    cur_seq_start_bkv_idx = 0
+    cur_seq_start_bkv_idx = start_bkv_idx_for_q_pos(
+        kv_q_gap, bkv_sz=bkv_sz, sliding_window=sliding_window
+    )
     next_seq_start_bkv_idx = 0
     if sliding_window is not None:
-        cur_seq_start_bkv_idx = jnp.maximum(kv_q_gap - sliding_window, 0) // bkv_sz
         next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
         next_q_len = cu_q_lens_ref[next_seq_idx + 1] - cu_q_lens_ref[next_seq_idx]
         next_kv_q_gap = kv_lens_ref[next_seq_idx] - next_q_len
-        next_seq_start_bkv_idx = (
-            jnp.maximum(next_kv_q_gap - sliding_window, 0) // bkv_sz
+        next_seq_start_bkv_idx = start_bkv_idx_for_q_pos(
+            next_kv_q_gap, bkv_sz=bkv_sz, sliding_window=sliding_window
         )
 
     if debug_mode:
@@ -204,10 +207,13 @@ def run_rpa_sequence_pipeline(
                 seq_idx, bq_idx, bq_sem_idx, num_bq=num_bq
             )
             processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
-            start_bkv_idx = (
-                0
-                if sliding_window is None
-                else jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
+            start_bkv_idx = start_bkv_idx_for_q_pos(
+                processed_q_len, bkv_sz=bkv_sz, sliding_window=sliding_window
+            )
+            next_bq_start_bkv_idx = start_bkv_idx_for_q_pos(
+                processed_q_len + actual_bq_sz,
+                bkv_sz=bkv_sz,
+                sliding_window=sliding_window,
             )
             effective_kv_len = (
                 jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
@@ -239,10 +245,7 @@ def run_rpa_sequence_pipeline(
                     bkv_sem_idx,
                     num_bq=num_bq,
                     num_bkv=end_bkv_idx,
-                    kv_q_gap=kv_q_gap,
-                    actual_bq_sz=actual_bq_sz,
-                    bkv_sz=bkv_sz,
-                    sliding_window=sliding_window,
+                    next_bq_start_bkv_idx=next_bq_start_bkv_idx,
                     next_seq_start_bkv_idx=next_seq_start_bkv_idx,
                 )
                 processed_kv_len = bkv_idx * bkv_sz
@@ -271,9 +274,16 @@ def run_rpa_sequence_pipeline(
                     seq_idx, bkv_idx, bkv_sem_idx, wait=True
                 )
 
-                # Start updating bkv to kv cache if applicable.
-                # Only needed in last bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                # Start updating bkv to kv cache on the final visit to this block.
+                is_last_bkv_visit = (
+                    (bq_idx == num_bq - 1)
+                    if sliding_window is None
+                    else jnp.logical_or(
+                        bq_idx == num_bq - 1, bkv_idx < next_bq_start_bkv_idx
+                    )
+                )
+
+                @pl.when(jnp.logical_and(update_sz > 0, is_last_bkv_visit))
                 def update_cur_bkv_to_cache():
                     kv_update_ring.start(seq_idx, bkv_sem_idx, offset, update_sz)
 
@@ -291,6 +301,7 @@ def run_rpa_sequence_pipeline(
                     BkvStepContext(
                         bq_sem_idx=bq_sem_idx,
                         bkv_sem_idx=bkv_sem_idx,
+                        bkv_idx=bkv_idx,
                         processed_q_len=processed_q_len,
                         processed_kv_len=processed_kv_len,
                         effective_kv_len=effective_kv_len,

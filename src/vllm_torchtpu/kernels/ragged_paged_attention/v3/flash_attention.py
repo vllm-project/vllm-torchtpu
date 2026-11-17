@@ -31,6 +31,7 @@ class FlashAttentionConfig:
     out_dtype: Any
     mask_value: float
     span_int_ty: Any = jnp.int32
+    max_kv_len: int | None = None
     use_causal_mask: bool = True
     sliding_window: int | None = None
     soft_cap: float | None = None
@@ -39,10 +40,12 @@ class FlashAttentionConfig:
     v_scale: float | None = None
 
 
-def _mask_and(mask, new_mask):
-    if mask is None:
-        return new_mask
-    return jnp.logical_and(mask, new_mask)
+def mask_v_tile(v, *, processed_kv_len, effective_kv_len, span_int_ty):
+    """Zero out tail rows `>= effective_kv_len` of a `[bkv_csz, head_dim]` V tile."""
+    v_valid = lax.broadcasted_iota(span_int_ty, v.shape, 0) < jnp.asarray(
+        effective_kv_len - processed_kv_len, dtype=span_int_ty
+    )
+    return jnp.where(v_valid, v, 0.0)
 
 
 def flash_attention_step1_qk_softmax(
@@ -58,13 +61,15 @@ def flash_attention_step1_qk_softmax(
     cfg: FlashAttentionConfig,
     use_causal_mask: bool | None = None,
     skip_kv_mask: bool = False,
+    k_norm_row=None,
 ):
     """Compute FlashAttention-2 `Q @ K^T`, masking, online rowmax/softmax, and `l/m`.
 
     Args:
       q: Query tile of shape `[actual_bq_csz * num_q_heads_per_kv_head, head_dim]`.
       k: Key tile of shape `[bkv_csz, head_dim]`.
-      v: Value tile of shape `[bkv_csz, head_dim]`.
+      v: Value tile of shape `[bkv_csz, head_dim]`, or `None` when the caller
+        masks `v` once outside an inner `bq_start` loop via `mask_v_tile`.
       l_ref: Online softmax row-sum ref of shape
         `[actual_bq_csz * num_q_heads_per_kv_head, 128]`.
       m_ref: Online softmax row-max ref of shape
@@ -75,11 +80,13 @@ def flash_attention_step1_qk_softmax(
       cfg: Frozen `FlashAttentionConfig` holding static kernel options.
       use_causal_mask: Optional per-tile override of `cfg.use_causal_mask`.
       skip_kv_mask: Whether to skip `< effective_kv_len` masking on K and V.
+      k_norm_row: Optional per-token key norm of shape `[1, bkv_csz]` multiplied
+        into `Q @ K^T` in `float32` before casting to `cfg.out_dtype`.
 
     Returns:
       `(p, v, exp_m_diff)` where `p` has shape `[q_rows, bkv_csz]`, `v` is the
-      (optionally tail-zeroed) value tile `[bkv_csz, head_dim]`, and `exp_m_diff`
-      has shape `[q_rows, 128]`.
+      (optionally tail-zeroed) value tile or `None`, and `exp_m_diff` has shape
+      `[q_rows, 128]`.
     """
     causal_mask = cfg.use_causal_mask if use_causal_mask is None else use_causal_mask
     assert q.ndim == 2
@@ -87,8 +94,11 @@ def flash_attention_step1_qk_softmax(
     q_rows, head_dim = q.shape
     assert k.ndim == 2 and k.shape[1] == head_dim
     bkv_csz = k.shape[0]
-    assert v.shape == (bkv_csz, head_dim)
-    assert k.dtype == v.dtype
+    if v is not None:
+        assert v.shape == (bkv_csz, head_dim)
+        assert k.dtype == v.dtype
+    if k_norm_row is not None:
+        assert k_norm_row.shape == (1, bkv_csz)
     assert l_ref.shape == (q_rows, 128)
     assert m_ref.shape == (q_rows, 128)
 
@@ -99,8 +109,13 @@ def flash_attention_step1_qk_softmax(
             q = jnp.clip(q, min=float(info.min), max=float(info.max))
         q = q.astype(k.dtype)
 
-    s = jnp.matmul(q, k.T, preferred_element_type=jnp.float32).astype(cfg.out_dtype)
-    s *= cfg.sm_scale
+    s_f32 = jnp.matmul(q, k.T, preferred_element_type=jnp.float32)
+    if k_norm_row is None:
+        s = s_f32.astype(cfg.out_dtype) * cfg.sm_scale
+    else:
+        s = (s_f32 * (k_norm_row.astype(jnp.float32) * cfg.sm_scale)).astype(
+            cfg.out_dtype
+        )
     if cfg.k_scale is not None:
         s *= cfg.k_scale
     if cfg.q_scale is not None:
@@ -109,24 +124,38 @@ def flash_attention_step1_qk_softmax(
         s = cfg.soft_cap * jnp.tanh(s / cfg.soft_cap)
 
     span_int_ty = cfg.span_int_ty
-    processed_q_int = jnp.asarray(processed_q_len, dtype=span_int_ty)
-    processed_kv_int = jnp.asarray(processed_kv_len, dtype=span_int_ty)
-    effective_kv_int = jnp.asarray(effective_kv_len, dtype=span_int_ty)
-    q_span = processed_q_int + (
-        lax.broadcasted_iota(jnp.int32, s.shape, 0) // cfg.num_q_heads_per_kv_head
-    ).astype(span_int_ty)
-    k_span = processed_kv_int + lax.broadcasted_iota(span_int_ty, s.shape, 1)
-    v_span = processed_kv_int + lax.broadcasted_iota(span_int_ty, v.shape, 0)
-
+    apply_sliding_window = (
+        cfg.sliding_window is not None
+        and (cfg.max_kv_len is None or cfg.sliding_window < cfg.max_kv_len)
+        and cfg.sliding_window <= jnp.iinfo(span_int_ty).max
+    )
     mask = None
-    if causal_mask:
-        assert not skip_kv_mask
-        mask = _mask_and(mask, q_span >= k_span)
-    if not skip_kv_mask:
-        mask = _mask_and(mask, k_span < effective_kv_int)
-        v = jnp.where(v_span < effective_kv_int, v, 0.0)
-    if cfg.sliding_window is not None:
-        mask = _mask_and(mask, q_span < k_span + cfg.sliding_window)
+    if not skip_kv_mask or causal_mask or apply_sliding_window:
+        processed_kv_int = jnp.asarray(processed_kv_len, dtype=span_int_ty)
+        k_span = processed_kv_int + lax.broadcasted_iota(span_int_ty, s.shape, 1)
+        if not skip_kv_mask:
+            effective_kv_int = jnp.asarray(effective_kv_len, dtype=span_int_ty)
+            mask = k_span < effective_kv_int
+            if v is not None:
+                v = mask_v_tile(
+                    v,
+                    processed_kv_len=processed_kv_len,
+                    effective_kv_len=effective_kv_len,
+                    span_int_ty=span_int_ty,
+                )
+        if causal_mask or apply_sliding_window:
+            q_span = jnp.asarray(processed_q_len, dtype=span_int_ty) + (
+                lax.broadcasted_iota(jnp.int32, s.shape, 0)
+                // cfg.num_q_heads_per_kv_head
+            ).astype(span_int_ty)
+            if causal_mask:
+                assert not skip_kv_mask
+                causal = q_span >= k_span
+                mask = causal if mask is None else jnp.logical_and(mask, causal)
+            if apply_sliding_window:
+                assert cfg.sliding_window is not None
+                sw = (q_span - k_span) < cfg.sliding_window
+                mask = sw if mask is None else jnp.logical_and(mask, sw)
     if mask is not None:
         s = jnp.where(mask, s, cast(float, cfg.mask_value))
 
