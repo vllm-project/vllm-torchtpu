@@ -23,8 +23,9 @@ With VLLM_TPU_DP_PROMPT_BACKLOG=1:
 
 * Each engine core publishes its pending prompt tokens with the request
   counts it already sends the DP coordinator: the uncached prompt tokens of
-  its waiting requests plus the prompt tokens its running requests have not
-  computed yet. The coordinator relays [waiting, running, kv_cache_usage] per
+  its waiting requests (kv_holding_waiting and waiting, the two queues the
+  scheduler admits from) plus the prompt tokens its running requests have
+  not computed yet. The coordinator relays [waiting, running, kv_cache_usage] per
   engine without reading the third value, so the engine sends
   ``pending + kv_cache_usage`` there (KV usage capped below 1) and the front
   end splits it again. Only these coordinator messages carry the sum; the
@@ -44,6 +45,7 @@ tokens with or without a prefix-cache hit.
 """
 
 import math
+from itertools import chain
 
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 
@@ -86,7 +88,7 @@ class PendingPrompts:
     def tokens(self, scheduler) -> int:
         pending = 0
         waiting_ids = set()
-        for request in scheduler.waiting:
+        for request in chain(scheduler.kv_holding_waiting, scheduler.waiting):
             waiting_ids.add(request.request_id)
             done = max(
                 request.num_computed_tokens, self.cached_tokens(scheduler, request)
