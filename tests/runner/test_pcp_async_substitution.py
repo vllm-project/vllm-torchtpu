@@ -51,6 +51,7 @@ def _runner_with_async_state(
         speculative_config=None,
         _last_sequence_layout_plan=sequence_layout_plan,
         pcp_manager=None,
+        _async_subst_prep_cache={},
     )
 
 
@@ -373,6 +374,9 @@ def test_async_substitution_uploads_one_index_tensor(fast):
         ),
         _registered_h2d_sources=set(),
         _unfenced_h2d_sources=[],
+        _async_subst_dev_cache={},
+        _cached_subst_key=None,
+        _cached_substitution_indices=None,
     )
     input_ids = torch.zeros(num_tokens, dtype=torch.int32)
     with patch.object(tpu_runner, "_substitute_placeholder_token") as kernel:

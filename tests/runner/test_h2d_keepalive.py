@@ -58,7 +58,7 @@ def test_cached_subtract_indices_upload_synchronously():
     import numpy as np
 
     src = SRC.read_text()
-    i = src.index('            sub_cache = getattr(self, "_async_subtract_idx_cache"')
+    i = src.index("            sub_cache = self._async_subtract_idx_cache")
     end_marker = "sub_cache[sub_key] = (seq_idx_dev, pos_idx_dev, qx_sub_mask)"
     end = src.index(end_marker, i) + len(end_marker)
     block = src[i:end]
@@ -90,7 +90,7 @@ def test_cached_subtract_indices_upload_synchronously():
             return _FakeDevTensor(self.arr)
 
     code = textwrap.dedent(block)
-    runner = SimpleNamespace(device="tpu")
+    runner = SimpleNamespace(device="tpu", _async_subtract_idx_cache={})
     for k in range(260):
         sub_key = (4, 8, ((k, 2), (None, 3), (1, 1)))
         ns = {
@@ -121,7 +121,7 @@ def test_cached_subtract_indices_upload_synchronously():
 
 def test_cached_subst_indices_fifo_256_and_synchronous():
     src = SRC.read_text()
-    i = src.index('subst_cache = getattr(self, "_async_subst_dev_cache"')
+    i = src.index("subst_cache = self._async_subst_dev_cache")
     block = src[i : src.index("subst_cache[subst_key] = substitution_indices", i)]
     assert "non_blocking=" not in block
     assert "_h2d_temp(" not in block
@@ -205,6 +205,7 @@ def test_uniform_and_heterogeneous_sampling_params_cache():
 
     runner = SimpleNamespace(
         vocab_size=151936,
+        _sampling_params_dev_cache={},
         input_batch=SimpleNamespace(
             temperature_cpu_tensor=_FakeTensor(np.full(32, 0.6, dtype=np.float32)),
             top_k_cpu_tensor=_FakeTensor(

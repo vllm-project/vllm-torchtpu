@@ -140,6 +140,17 @@ def _make_runner(
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
     runner._h2d_reuse = {}
+    runner._fast_token_substitution = False
+    runner._uniform_sched_arr_cache = {}
+    runner._prepare_inputs_idx_cache = {}
+    runner._async_subtract_idx_cache = {}
+    runner._comb_views_cache = {}
+    runner._cached_comb_key = None
+    runner._cached_comb_views = None
+    runner._stage_products_cache = {}
+    runner._cached_staged_block_tables_key = None
+    runner._cached_staged_block_tables = None
+    runner._cached_staged_block_tables_dev = None
     runner._upload_unless_unchanged = types.MethodType(
         TPUModelRunner._upload_unless_unchanged, runner
     )
