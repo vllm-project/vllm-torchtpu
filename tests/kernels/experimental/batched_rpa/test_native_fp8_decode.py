@@ -105,10 +105,25 @@ def _reference(inp, kv_lens_list):
     return np.asarray(jnp.concatenate(outs, axis=0))
 
 
+_ROW, _SPLIT = configs.Fp8Operand.ROW, configs.Fp8Operand.SPLIT
+# tpu7x quick bench (ctx 33k): rel L2 ~0.02 with every operand off and with a
+# row-scaled PV, ~2x that with both operands split, ~0.08 with both
+# row-scaled (q at 3 mantissa bits).
+_MODES = {
+    "off": (configs.NativeFp8(), 0.03),
+    "pv": (configs.NativeFp8(pv=_ROW), 0.03),
+    "qk_split_pv_split": (configs.NativeFp8(qk=_SPLIT, pv=_SPLIT), 0.06),
+    "qk_pv": (configs.NativeFp8(qk=_ROW, pv=_ROW), 0.12),
+}
+
+
+@pytest.mark.parametrize("mode", list(_MODES))
 @pytest.mark.parametrize(
     "kv_lens_list",
     [[300], [5000, 9000 + 37, 131], [33000 + 61] + [4096 * 3] * 4],
 )
+def test_decode_fp8_kv(mode, kv_lens_list):
+    native_fp8, tol = _MODES[mode]
     if not jtu.is_device_tpu_at_least(version=7):
         pytest.skip("Expect TPU v7+ (native fp8 MXU)")
     inp = _inputs(kv_lens_list)
