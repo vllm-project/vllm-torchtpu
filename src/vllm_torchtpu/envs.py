@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
     TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS: int = 0
+    TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -758,6 +759,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Smallest token bucket TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS applies to.
     "TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS": env_nonnegative_int(
         "TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS", 0
+    ),
+    # MiniMax-M3 DSpark under DCP: write every draft layer's context K/V into
+    # its sharded (head-split) cache with one op instead of one op per layer,
+    # so the shared token layout, slots and runs are computed once
+    # (`cp_draft_attention.write_layers_op`). Applies only when all draft
+    # layers are DCP-sharded with one sharding and share one attention
+    # metadata; otherwise the per-layer writes run. Default off.
+    "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE": env_bool(
+        "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE", default=False
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/

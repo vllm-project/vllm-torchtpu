@@ -52,6 +52,7 @@ per word.
 """
 
 import functools
+import inspect
 from typing import Any
 
 import jax
@@ -1193,6 +1194,141 @@ def _block_op(
     op = pallas.jax_op(name, _block)
     op.register_fake(lambda q, *args: torch.empty_like(q))
     return op
+
+
+def write_layers(
+    caches,
+    keys: jax.Array,
+    values: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    *,
+    dcp: int,
+    head_ranks: int,
+    rank: jax.Array,
+    k_scale: float | None,
+    v_scale: float | None,
+    interpret: bool = False,
+) -> tuple[jax.Array, ...]:
+    """`write_kv` of every layer (``keys [L, T, 1, D]``) in one trace, so
+    XLA computes the shared token layout, slots and runs once."""
+    return tuple(
+        write_kv(
+            cache,
+            keys[i],
+            values[i],
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp=dcp,
+            head_ranks=head_ranks,
+            rank=rank,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            interpret=interpret,
+        )
+        for i, cache in enumerate(caches)
+    )
+
+
+@functools.cache
+def write_layers_op(
+    dcp: int,
+    head_ranks: int,
+    k_scale: float | None,
+    v_scale: float | None,
+    num_layers: int,
+):
+    """`write_kv` of ``num_layers`` draft layers in one op:
+    ``(kv_cache_0, .., kv_cache_{L-1}, keys [L, T, 1, D], values, seq_lens,
+    block_tables, query_start_loc, dcp_rank) -> new caches``. Build it outside
+    a compiled forward (see `build_ops`)."""
+    from torch_tpu._internal import pallas
+
+    def _write_layers(*args: jax.Array) -> tuple[jax.Array, ...] | jax.Array:
+        caches = args[:num_layers]
+        keys, values, seq_lens, block_tables, query_start_loc, dcp_rank = args[
+            num_layers:
+        ]
+        new_caches = write_layers(
+            caches,
+            keys,
+            values,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp=dcp,
+            head_ranks=head_ranks,
+            rank=dcp_rank[0],
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return new_caches[0] if num_layers == 1 else new_caches
+
+    names = [f"kv_cache_{i}" for i in range(num_layers)] + [
+        "keys",
+        "values",
+        "seq_lens",
+        "block_tables",
+        "query_start_loc",
+        "dcp_rank",
+    ]
+    # jax_op reads the arguments (all arrays) from the signature and the
+    # schema's outputs from the return annotation: a one-tuple reads as one
+    # Tensor (not a tuple of one), so one layer returns its bare cache.
+    _write_layers.__signature__ = inspect.Signature(
+        [
+            inspect.Parameter(
+                n, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array
+            )
+            for n in names
+        ],
+        return_annotation=(
+            jax.Array if num_layers == 1 else tuple[(jax.Array,) * num_layers]
+        ),
+    )
+    name = (
+        f"pallas::dcp_draft_write_l{num_layers}_d{dcp}_h{head_ranks}"
+        f"_k{k_scale}_v{v_scale}"
+    )
+    op = pallas.jax_op(
+        name.replace(".", "p"), _write_layers, donate_argnums=tuple(range(num_layers))
+    )
+
+    def _fake(*args):
+        caches = tuple(torch.empty_like(c) for c in args[:num_layers])
+        return caches[0] if num_layers == 1 else caches
+
+    op.register_fake(_fake)
+    return op
+
+
+def write_layers_with_dcp(
+    *,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    kv_caches: list[torch.Tensor],
+    attn_metadata: Any,
+    dcp_rank: torch.Tensor,
+    op: Any,
+) -> None:
+    """`write_with_dcp` of every draft layer (``keys`` ``[L, T, 1, D]``) at
+    once, for layers sharing one attention metadata (`write_layers_op`)."""
+    assert keys.shape[2] == 1, keys.shape
+    new_caches = op(
+        *kv_caches,
+        keys,
+        values,
+        attn_metadata.seq_lens,
+        attn_metadata.block_tables,
+        attn_metadata.query_start_loc,
+        dcp_rank,
+    )
+    if isinstance(new_caches, torch.Tensor):  # one layer: a bare cache
+        new_caches = (new_caches,)
+    for cache, new_cache in zip(kv_caches, new_caches, strict=True):
+        cache.copy_(new_cache)
 
 
 def write_with_dcp(

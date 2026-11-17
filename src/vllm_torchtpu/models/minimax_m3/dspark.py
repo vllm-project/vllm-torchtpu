@@ -57,6 +57,8 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import cp_draft_attention
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP
@@ -261,6 +263,66 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         hidden_size, eps = self.config.hidden_size, self.config.rms_norm_eps
         self.hidden_norm = GemmaRMSNorm(hidden_size, eps=eps)
         self.norm = GemmaRMSNorm(hidden_size, eps=eps)
+        # One write op for every layer's sharded context K/V
+        # (`cp_draft_attention.write_layers_op`), set by `prepare_draft_kv_write`.
+        self._one_kv_write_op = None
+
+    def prepare_draft_kv_write(self) -> None:
+        """With TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE, build the all-layer sharded
+        context K/V write (outside any compiled forward) when every layer
+        keeps its KV DCP-sharded with the same sharding."""
+        if not envs.TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE:
+            return
+        configs = set()
+        for layer in self.layers:
+            impl = layer.self_attn.attn.impl
+            cfg = getattr(impl, "sharded_draft_dcp", None)
+            if cfg is None or getattr(impl, "num_kv_heads", None) != 1:
+                configs.add(None)
+                continue
+            configs.add(
+                (
+                    cfg["dcp"],
+                    min(cfg["dcp"], cfg["kv_head_replicas"]),
+                    cfg["k_scale"],
+                    cfg["v_scale"],
+                )
+            )
+        if len(configs) != 1 or None in configs:
+            logger.info(
+                "MiniMax DSpark: TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE set but the "
+                "draft layers' KV is not uniformly DCP-sharded; per-layer writes."
+            )
+            return
+        self._one_kv_write_op = cp_draft_attention.write_layers_op(
+            *configs.pop(), len(self.layers)
+        )
+        logger.info(
+            "MiniMax DSpark: one sharded context K/V write for %d draft layers.",
+            len(self.layers),
+        )
+
+    def _write_context_kv_one_op(self, context, positions, metadata) -> None:
+        """Every layer's own-head context K/V through the one all-layer write."""
+        keys, values = [], []
+        for layer in self.layers:
+            attn = layer.self_attn
+            k, v = _context_kv(attn, context)
+            k = _per_head_norm(k, attn.k_norm, attn.head_dim)
+            k, _ = attn.rotary_emb(positions, k, None)
+            impl = attn.attn.impl
+            shape = (context.shape[0], impl.num_kv_heads, impl.head_size)
+            keys.append(k.reshape(shape))
+            values.append(v.reshape(shape))
+        attns = [layer.self_attn.attn for layer in self.layers]
+        cp_draft_attention.write_layers_with_dcp(
+            keys=torch.stack(keys),
+            values=torch.stack(values),
+            kv_caches=[attn.kv_cache for attn in attns],
+            attn_metadata=metadata,
+            dcp_rank=attns[0].draft_dcp_rank,
+            op=self._one_kv_write_op,
+        )
 
     def store_context_kv(
         self,
@@ -281,6 +343,11 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         # columns over the ranks rather than read it whole on each.
         context = self.hidden_norm(_column_parallel(self.fc, target_hidden_states))
         num_tokens = context.shape[0]
+        if self._one_kv_write_op is not None and all(
+            m is metadata[0] for m in metadata
+        ):
+            self._write_context_kv_one_op(context, positions, metadata[0])
+            return context
         for layer, layer_metadata in zip(self.layers, metadata, strict=True):
             attn = layer.self_attn
             k, v = _context_kv(attn, context)
