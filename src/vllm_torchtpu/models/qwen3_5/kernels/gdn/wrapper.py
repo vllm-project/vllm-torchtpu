@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Copied from src/vllm_torchtpu/kernels/gdn/v3/wrapper.py at vllm-torchtpu main
-# c350823af74ba9cdf728daad64df7dd5bcf84e8e. This copy carries the Qwen3.5 GDN v3
-# changes and serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
+# c350823af74ba9cdf728daad64df7dd5bcf84e8e, with its imports pointed at this copy.
+# It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Upstream v3 changes are not picked up automatically.
+# Changes from the source:
+# - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
+#   (main lists the source's errors in .pyrefly-baseline-full.json).
+# No change targets AttentionMode.KDA, which this copy's callers never pass;
+# see compute_kda.py.
 
 import functools
 
