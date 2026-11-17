@@ -6740,7 +6740,8 @@ class TPUModelRunner(GPUModelRunner):
             }
 
         # Every row of a warmup step is padding; a profile step's real
-        # tokens are its requests' query tokens.
+        # tokens are its requests' query tokens. The guard is for runner
+        # stand-ins with neither a padding state nor _token_padding_update.
         if getattr(self, "_token_padding_state", None) is not None:
             self._token_padding_update(
                 num_tokens, sum(profile_query_lens) if profiling else 0
@@ -9132,14 +9133,19 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         """Record which of this step's token rows are padding.
 
-        `rows_sliced` says whether the forward about to run slices its rows
-        over TP (each rank owns `num_tokens_padded // tp` rows), in which case
-        the mask is this rank's slice; otherwise every rank holds all
-        `num_tokens_padded` rows and the mask covers them all. It defaults to
-        the full mask, as on main: no model follows each step's form yet, and
-        the MoE paths read the mask over all of the step's rows. Writing the
-        per-rank slice for a forward that reads every row marks real rows of
-        other ranks as padding, and the MoE then drops their experts.
+        `num_valid_tokens` is the step's real token count; None takes it from
+        the sequence layout plan (the ALL layout only, else no row is
+        padding). `rows_sliced` says whether the forward about to run slices
+        its rows over TP (each rank owns `num_tokens_padded // tp` rows): the
+        mask is then this rank's slice. Otherwise it covers all
+        `num_tokens_padded` rows, which every rank holds. The MoE paths read
+        the mask over all of a step's rows, so the per-rank slice is right
+        only for a forward that reads its own slice: written for one that
+        reads every row, it marks other ranks' real rows as padding and the
+        MoE drops their experts.
+
+        TODO: pass rows_sliced=True from the change that makes the model
+        follow each step's form; until then every caller writes the full mask.
         """
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
