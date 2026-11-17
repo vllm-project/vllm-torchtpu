@@ -12,15 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import re
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import pytest
 import torch
+from jax import export
+from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    config as compressor_config,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+    deepseek_v4_indexer as indexer_mod,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    VllmDeepseekV4Indexer,
     VllmDeepseekV4IndexerCache,
     _indexer_jax,
     static_verify_q_len,
@@ -124,3 +139,102 @@ def test_knob_turns_the_static_pass_off_but_never_on(monkeypatch):
     monkeypatch.setattr(envs, "TPU_SPEC_STATIC_VERIFY", True)
     assert static_verify_q_len(_config("deepseek_v4", 5)) == 6
     assert static_verify_q_len(_config("qwen3_5", 5)) is None
+
+
+class _FakeJaxOp:
+    def __init__(self, name, fn, **kwargs):
+        self.name, self.fn = name, fn
+
+    def register_fake(self, fn):
+        pass
+
+
+def _build_op(monkeypatch, layer, chunk_tokens):
+    """`_build_indexer_op` of the CSA layer `layer`, with `pallas.jax_op` faked."""
+    monkeypatch.setattr(envs, "TPU_STREAMIDX_CHUNK_TOKENS", chunk_tokens)
+    monkeypatch.setattr(indexer_mod, "_indexer_op_cache", {})
+    monkeypatch.setattr(indexer_mod.pallas, "jax_op", _FakeJaxOp)
+    monkeypatch.setattr(indexer_mod, "get_pallas_op_mesh", lambda: None)
+    monkeypatch.setattr(indexer_mod, "get_current_vllm_config", lambda: None)
+    indexer = VllmDeepseekV4Indexer.__new__(VllmDeepseekV4Indexer)
+    object.__setattr__(indexer, "topk_tokens", 512)
+    object.__setattr__(indexer, "compress_ratio", 4)
+    object.__setattr__(indexer, "softmax_scale", 0.088)
+    object.__setattr__(indexer, "n_head", 64)
+    object.__setattr__(
+        indexer,
+        "k_cache",
+        SimpleNamespace(prefix=f"model.layers.{layer}.attn.indexer.k_cache"),
+    )
+    return indexer._build_indexer_op
+
+
+def test_unchunked_layers_share_one_indexer_op(monkeypatch):
+    build = {layer: _build_op(monkeypatch, layer, None) for layer in (2, 4)}
+    first, second = build[2](), build[4]()
+    assert first is second
+    assert first.fn.keywords["scheduling_group_slot"] is None
+
+
+def test_chunked_layers_get_their_own_op_and_slot(monkeypatch):
+    """A shared op would put one layer's scheduling groups in every layer."""
+    build = {layer: _build_op(monkeypatch, layer, 256) for layer in (2, 4)}
+    first, second = build[2](), build[4]()
+    assert first is not second
+    assert first.name != second.name
+    assert first.fn.keywords["chunk_tokens"] == 256
+    assert first.fn.keywords["scheduling_group_slot"] == 2
+    assert second.fn.keywords["scheduling_group_slot"] == 4
+
+
+_T, _H, _PAGES, _CHUNK = 128, 4, 8, 32
+
+
+def _indexer_group_ids(slots, chunk_tokens):
+    """Group ids of each CSA layer's indexer, lowered for TPU on an abstract
+    mesh as one program would trace them (one counter reset)."""
+    mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    args = (
+        jax.ShapeDtypeStruct((_T, _H, 128), jnp.bfloat16),  # q
+        jax.ShapeDtypeStruct((_T,), jnp.int32),  # positions
+        jax.ShapeDtypeStruct((4096, 64), jnp.float32),  # cos_sin_cache
+        jax.ShapeDtypeStruct((_T, _H), jnp.float32),  # indexer_weights
+        jax.ShapeDtypeStruct(  # SEQ_ALONG_LANE cache
+            (_PAGES, compressor_config.SAL_SUBLANE_GROUPS, 4, 256), jnp.uint8
+        ),
+        jax.ShapeDtypeStruct((2,), jnp.int32),  # seq_lens
+        jax.ShapeDtypeStruct((2, _PAGES // 2), jnp.int32),  # page_indices
+        jax.ShapeDtypeStruct((3,), jnp.int32),  # cu_q_lens
+        jax.ShapeDtypeStruct((3,), jnp.int32),  # distribution
+    )
+    streamidx_config.reset_scheduling_group_ids()
+    ids = []
+    with use_abstract_mesh(mesh):
+        for slot in slots:
+            fn = functools.partial(
+                _indexer_jax,
+                k=256,
+                compression_ratio=4,
+                softmax_scale=0.088,
+                n_head=_H,
+                chunk_tokens=chunk_tokens,
+                scheduling_group_slot=slot,
+            )
+            text = export.export(jax.jit(fn), platforms=("tpu",))(*args).mlir_module()
+            ids.append(
+                set(map(int, re.findall(r'_scheduling_group_id\s*=\s*"?(\d+)', text)))
+            )
+    return ids
+
+
+def test_chunked_layers_lower_to_disjoint_groups():
+    ids = _indexer_group_ids([2, 4], _CHUNK)
+    # 128 tokens in chunks of 32: 4 chunks, 3 groups per layer.
+    assert [len(layer) for layer in ids] == [3, 3], ids
+    assert not ids[0] & ids[1], ids
+
+
+def test_shared_trace_without_slots_repeats_the_groups():
+    """Positive control: what a shared op did to every chunked CSA layer."""
+    ids = _indexer_group_ids([None, None], _CHUNK)
+    assert ids[0] and ids[0] == ids[1], ids

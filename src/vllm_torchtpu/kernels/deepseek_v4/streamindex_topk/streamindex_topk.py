@@ -1171,7 +1171,9 @@ def streamindex_topk(
         the first one's trace from `jax.jit`'s cache. Every call that may land
         in the same compiled program must pass a distinct slot. None draws the
         ids from the per-program counter, which is only safe when each call
-        traces anew.
+        traces anew. Only a pipelined call reads it; callers should pass
+        `config.chunked_scheduling_group_slot(...)`, which is None for an
+        unpipelined call, so that call sites keep sharing those traces.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1553,10 +1555,8 @@ def streamindex_topk(
             interleave_c=interleave_c,
         )
 
-        if chunk_tokens is None or max_num_tokens % chunk_tokens:
-            num_chunks, chunk_len = 1, max_num_tokens
-        else:
-            num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+        num_chunks = config.num_chunks(max_num_tokens, chunk_tokens)
+        chunk_len = max_num_tokens // num_chunks
 
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.

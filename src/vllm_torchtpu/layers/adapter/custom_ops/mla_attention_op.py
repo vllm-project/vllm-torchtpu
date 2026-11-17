@@ -56,6 +56,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
@@ -115,17 +118,6 @@ def _streamidx_block_sizes(
 
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
 _INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
-# StreamIndex `scheduling_group_slot`s, one per indexer op in construction order
-# (the same on every rank). Each layer calls the same jitted kernel with the same
-# shapes, so without a slot every layer after the first reuses the first one's
-# cached trace -- and its chunked-pipeline scheduling group ids.
-_STREAMIDX_SCHEDULING_SLOTS: dict[str, int] = {}
-
-
-def _streamidx_scheduling_slot(op_name: str) -> int:
-    return _STREAMIDX_SCHEDULING_SLOTS.setdefault(
-        op_name, len(_STREAMIDX_SCHEDULING_SLOTS)
-    )
 
 
 def _warn_indexer_kv_cache_fallback_once(mode: str, reason: str) -> None:
@@ -438,7 +430,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             else None
         )
         op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
-        scheduling_group_slot = _streamidx_scheduling_slot(op_name)
+        # Each layer calls the same jitted kernel with the same shapes, so
+        # without its own slot every layer after the first would reuse the
+        # first one's cached trace -- and its chunked-pipeline scheduling group
+        # ids. The DCP twin of a layer shares its slot: only one of the two
+        # runs in a forward.
+        scheduling_group_slot = streamidx_config.layer_scheduling_group_slot(
+            self.k_cache.prefix
+        )
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -511,7 +510,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
-                scheduling_group_slot=scheduling_group_slot,
+                scheduling_group_slot=streamidx_config.chunked_scheduling_group_slot(
+                    scheduling_group_slot, q.shape[0], chunk_tokens
+                ),
             )
             return cache_kv, topk_indices
 
@@ -558,7 +559,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             else None
         )
         op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
-        scheduling_group_slot = _streamidx_scheduling_slot(op_name)
+        scheduling_group_slot = streamidx_config.layer_scheduling_group_slot(
+            self.k_cache.prefix
+        )
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -613,7 +616,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
                     q.shape[0], a2a_merge, a2a_min_tokens
                 ),
-                scheduling_group_slot=scheduling_group_slot,
+                scheduling_group_slot=streamidx_config.chunked_scheduling_group_slot(
+                    scheduling_group_slot, q.shape[0], chunk_tokens
+                ),
             )
             return cache_kv, local_topk
 

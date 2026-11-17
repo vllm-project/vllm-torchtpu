@@ -42,7 +42,7 @@ _ARGS = (
 )
 
 
-def _layer_group_ids(slots):
+def _layer_group_ids(slots, chunk=_CHUNK):
     """Group ids of each layer's call, each lowered on its own like a per-layer
     `pallas.jax_op`, within one program (one counter reset)."""
 
@@ -55,7 +55,7 @@ def _layer_group_ids(slots):
                 num_kv_pages_per_block=2,
                 num_queries_per_block=8,
                 enable_early_exit=False,
-                chunk_tokens=_CHUNK,
+                chunk_tokens=chunk,
                 scheduling_group_slot=slot,
             )
 
@@ -98,3 +98,65 @@ def test_slot_ids_stay_clear_of_the_counter_and_each_other():
         config.slot_scheduling_group_ids(-1, 1)
     with pytest.raises(ValueError):
         config.slot_scheduling_group_ids(0, config.MAX_IDS_PER_SLOT + 1)
+    with pytest.raises(ValueError):
+        config.slot_scheduling_group_ids(config.MAX_SCHEDULING_GROUP_SLOT + 1, 1)
+
+
+@pytest.mark.parametrize(
+    "num_tokens, chunk_tokens",
+    # Valid chunks (multiples of 4) that cut a large prefill bucket into more
+    # than 1024 chunks, the old per-slot limit.
+    [(65536, 32), (131072, 64), (262144, 4)],
+)
+def test_a_slot_holds_every_chunk_of_a_large_bucket(num_tokens, chunk_tokens):
+    count = config.num_chunks(num_tokens, chunk_tokens) - 1
+    first = config.slot_scheduling_group_ids(0, count)
+    assert first == config.SLOT_ID_BASE
+
+
+def test_slot_ids_fit_in_int32():
+    last_slot = config.MAX_SCHEDULING_GROUP_SLOT
+    first = config.slot_scheduling_group_ids(last_slot, config.MAX_IDS_PER_SLOT)
+    assert first + config.MAX_IDS_PER_SLOT - 1 < 2**31
+
+
+@pytest.mark.parametrize(
+    "num_tokens, chunk_tokens, expected",
+    [
+        (128, 32, 4),
+        (128, None, 1),  # chunking off
+        (32, 32, 1),  # the bucket is one chunk
+        (16, 32, 1),  # smaller than a chunk
+        (96, 64, 1),  # indivisible: one unpipelined pass
+    ],
+)
+def test_only_a_pipelined_call_keeps_its_slot(num_tokens, chunk_tokens, expected):
+    assert config.num_chunks(num_tokens, chunk_tokens) == expected
+    slot = config.chunked_scheduling_group_slot(5, num_tokens, chunk_tokens)
+    assert slot == (5 if expected > 1 else None)
+    assert config.chunked_scheduling_group_slot(None, num_tokens, chunk_tokens) is None
+
+
+def test_unpipelined_calls_have_no_groups_to_share():
+    """Why an unchunked call can drop its slot: it carries no group ids."""
+    ids = _layer_group_ids([None, None], chunk=_T)
+    assert ids == [set(), set()], ids
+
+
+def test_layer_slot_is_the_layer_index():
+    slot = config.layer_scheduling_group_slot
+    assert slot("model.layers.7.self_attn.indexer.k_cache") == 7
+    # GLM-5.2's MTP layer continues after the target's 78 layers.
+    assert slot("model.layers.78.self_attn.indexer.k_cache") == 78
+    # The prefix alone decides: building other layers first changes nothing.
+    assert slot("model.layers.7.self_attn.indexer.k_cache") == 7
+
+
+def test_prefixes_without_one_layer_index_get_their_own_slots():
+    slot = config.layer_scheduling_group_slot
+    no_index = slot("indexer.k_cache")
+    two_indices = slot("mtp.0.layers.3.indexer.k_cache")
+    assert min(no_index, two_indices) > 1000  # clear of any layer index
+    assert no_index != two_indices
+    assert slot("indexer.k_cache") == no_index
+    assert max(no_index, two_indices) <= config.MAX_SCHEDULING_GROUP_SLOT
