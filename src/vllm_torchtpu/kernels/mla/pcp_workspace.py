@@ -74,6 +74,20 @@ def position_ordered(workspace: jax.Array, interleave: int) -> jax.Array:
     return x.reshape(num_ws_pages, dcp * rows, packing, width)
 
 
+def position_ordered_sal(workspace: jax.Array, interleave: int) -> jax.Array:
+    """`position_ordered` for a SEQ_ALONG_LANE indexer K workspace: reorder the
+    rank-major `[dcp, Pw, G, 4, P]` workspace to `[Pw, G, 4, dcp * P]`.
+
+    The token is the lane (last) dimension, so the same interleave
+    (`(slot // I, rank, slot % I)` -> virtual slot) is applied there."""
+    dcp, num_ws_pages, groups, packing, page_size = workspace.shape
+    x = workspace.reshape(
+        dcp, num_ws_pages, groups, packing, page_size // interleave, interleave
+    )
+    x = jnp.transpose(x, (1, 2, 3, 4, 0, 5))
+    return x.reshape(num_ws_pages, groups, packing, dcp * page_size)
+
+
 def index_pages_per_block(virtual_page: int) -> int:
     """Top-k `num_kv_pages_per_block` for virtual pages of `virtual_page` tokens."""
     return max(1, INDEX_BLOCK_TOKENS // virtual_page)

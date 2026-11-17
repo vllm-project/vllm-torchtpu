@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
     TPU_DCP_MLA_MIXED_KERNEL_V2: bool = True
     USE_TPU_PCP_MANAGER: bool = False
+    TPU_PCP_INDEXER_SAL: bool = False
     TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
     TPU_PCP_KV_CHUNK_TOKENS: int = 65536
     JAX_PLATFORMS: str = ""
@@ -843,6 +844,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=True),
     # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
     "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
+    # PCP manager: allow the SEQ_ALONG_LANE ('sal') indexer K cache (132 B per
+    # token instead of HEAD_ALONG_SUBLANE's 256). The split-prefill top-k then
+    # writes with the SAL writer and gathers a SAL workspace. Off: 'sal' falls
+    # back to (or, if explicit, is rejected in favour of) HEAD_ALONG_SUBLANE.
+    "TPU_PCP_INDEXER_SAL": env_bool("TPU_PCP_INDEXER_SAL", default=False),
     # PCP manager: max context tokens one forward's prefills may gather.
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
     # PCP manager: context tokens gathered per all-gather chunk.

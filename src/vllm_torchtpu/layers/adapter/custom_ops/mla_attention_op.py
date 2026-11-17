@@ -609,6 +609,8 @@ def pcp_prefill_topk(
     interleave_size: int,
     max_model_len: int | None = None,
     chunk_tokens: int | None = None,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    k_write_compact: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """PCP manager split-prefill top-k: write the split rows' K, gather the K
     workspace, top-k the local queries over it (global positions).
@@ -617,6 +619,12 @@ def pcp_prefill_topk(
     workspace, not all of it: the kernel's score buffer is
     `[num_tokens, row width]`, so a full-workspace row costs
     `num_tokens * workspace_tokens * 4` bytes of HBM.
+
+    `kv_layout` is the indexer K cache's layout. `SEQ_ALONG_LANE`
+    (`TPU_PCP_INDEXER_SAL`) writes the split rows with the Pallas SAL writer
+    (`coalesced_kv_append_dcp`, the DCP decode path's writer;
+    `k_write_compact` is its `compact`), gathers a SAL workspace and runs the
+    top-k kernel in SAL: same positions, 132 instead of 256 bytes per token.
 
     Returns the updated cache and `[local_tokens, topk]` global positions.
     """
@@ -642,8 +650,12 @@ def pcp_prefill_topk(
     ):
         num_tokens = q_bytes.shape[0]
         num_ws_pages = ws_req.shape[0]
-        _, rows_per_page, kv_packing, _ = cache_kv.shape
-        page_size = rows_per_page * kv_packing
+        sal = kv_layout == KVLayout.SEQ_ALONG_LANE
+        if sal:
+            page_size = cache_kv.shape[-1]
+        else:
+            _, rows_per_page, kv_packing, _ = cache_kv.shape
+            page_size = rows_per_page * kv_packing
         virtual_page = page_size * dcp_size
         max_seq_pages = (
             None if max_model_len is None else -(-int(max_model_len) // virtual_page)
@@ -666,16 +678,30 @@ def pcp_prefill_topk(
                 dcp_axis_name=DCP_AXIS_NAME,
                 pcp_size=pcp_size,
             )
-            cache_kv = _scatter_indexer_k_rows(
-                cache_kv,
-                k_split,
-                split_seq_lens,
-                split_page_indices,
-                split_cu_q_lens,
-                rank,
-                cp_size=dcp_size,
-                interleave_size=interleave_size,
-            )
+            if sal:
+                cache_kv = coalesced_kv_append_dcp(
+                    cache_kv,
+                    k_split,
+                    split_seq_lens,
+                    split_page_indices,
+                    split_cu_q_lens,
+                    rank,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                    kv_layout=kv_layout,
+                    compact=k_write_compact,
+                )
+            else:
+                cache_kv = _scatter_indexer_k_rows(
+                    cache_kv,
+                    k_split,
+                    split_seq_lens,
+                    split_page_indices,
+                    split_cu_q_lens,
+                    rank,
+                    cp_size=dcp_size,
+                    interleave_size=interleave_size,
+                )
             pages = ws.workspace_pages(
                 split_page_indices,
                 split_seq_lens.shape[0],
@@ -687,7 +713,7 @@ def pcp_prefill_topk(
 
             def at_size(size):
                 def branch(cache_kv):
-                    ws_kv = ws.position_ordered(
+                    ws_kv = (ws.position_ordered_sal if sal else ws.position_ordered)(
                         ws.gather_workspace(
                             cache_kv, pages[:size], axis_name=DCP_AXIS_NAME
                         ),
@@ -708,6 +734,7 @@ def pcp_prefill_topk(
                         num_kv_pages_per_block=(pages_per_block,) * 3,
                         num_queries_per_block=(1, 128, 128),
                         enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                        kv_layout=kv_layout,
                         chunk_tokens=chunk_tokens,
                     ).astype(jnp.int32)
 
@@ -1343,6 +1370,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
         in_specs, out_specs = pcp_prefill_topk_partition_specs()
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        # TPU_PCP_INDEXER_SAL: resolve the layout the cache was allocated in
+        # (the same resolution the DCP decode op makes); off, HAS as before.
+        pcp_indexer_sal = envs.TPU_PCP_INDEXER_SAL
+        kv_cache_mode = (
+            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+            if envs.is_indexer_kv_cache_mode_explicit()
+            else None
+        )
+        k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
 
         def _pcp_prefill_topk_jax(
             cache_kv: jax.Array,
@@ -1362,6 +1398,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             num_split_reqs: jax.Array,
             ws_used_pages: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
+            layout_kwargs = {}
+            if pcp_indexer_sal:
+                _, kv_layout = _resolve_indexer_kv_cache_mode(
+                    cache_kv, k_packed, mode=kv_cache_mode
+                )
+                layout_kwargs = {
+                    "kv_layout": kv_layout,
+                    "k_write_compact": k_write_compact,
+                }
             return pcp_prefill_topk(
                 cache_kv,
                 q_bytes,
@@ -1386,6 +1431,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 interleave_size=interleave_size,
                 max_model_len=max_model_len,
                 chunk_tokens=chunk_tokens,
+                **layout_kwargs,
             )
 
         op_name = f"pallas::pcp_prefill_topk_{self.k_cache.prefix.replace('.', '_')}"

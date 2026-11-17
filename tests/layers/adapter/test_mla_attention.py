@@ -1930,6 +1930,34 @@ def test_indexer_kv_layout_pcp_manager(monkeypatch, caplog):
         assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
 
 
+def test_indexer_kv_layout_pcp_manager_sal_opt_in(monkeypatch):
+    """TPU_PCP_INDEXER_SAL lifts the PCP manager's HAS restriction: default and
+    explicit 'sal' resolve to SEQ_ALONG_LANE, 'has' stays HAS, and a page that
+    SAL cannot hold still falls back."""
+    import importlib
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", False)
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
+    monkeypatch.setattr(envs, "TPU_PCP_INDEXER_SAL", True)
+
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+    assert st_mod.indexer_kv_layout(64) == KVLayout.HEAD_ALONG_SUBLANE
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "has")
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "has")
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+
+
 def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, caplog):
     """Raiden GLM admission downgrades default 'sal' to HAS with a one-time
     warning, rejects explicit 'sal' with ValueError, and leaves 'has'/'xla' and

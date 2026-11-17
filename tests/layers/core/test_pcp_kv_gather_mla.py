@@ -48,6 +48,9 @@ from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk as plain_streamindex_topk,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+    convert_cache_to_seq_along_lane,
+)
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -118,7 +121,7 @@ def _fake_runner(num_computed, num_prompt, q_lens, seq_lens):
     )
 
 
-def _plan_step(pcp, num_computed, num_prompt, q_lens):
+def _plan_step(pcp, num_computed, num_prompt, q_lens, page_size=PAGE_SIZE):
     """Every PCP rank's plan, and its local qsl / seq_lens views."""
     seq_lens = [c + q for c, q in zip(num_computed, q_lens)]
     plans = []
@@ -127,7 +130,7 @@ def _plan_step(pcp, num_computed, num_prompt, q_lens):
             pcp_size=pcp,
             pcp_rank=rank,
             dcp_size=DCP,
-            page_size=PAGE_SIZE,
+            page_size=page_size,
             workspace_tokens=WORKSPACE_TOKENS,
             max_num_batched_tokens=TOKEN_PADDINGS[-1],
             max_num_seqs=MAX_REQS,
@@ -226,7 +229,7 @@ def _final_lens(steps):
     return final_len
 
 
-def _plan_steps(pcp, steps, block_table):
+def _plan_steps(pcp, steps, block_table, page_size=PAGE_SIZE):
     """Per step: every PCP rank's plan and the (request, position) of every
     packed row (None for padding)."""
     final_len = _final_lens(steps)
@@ -240,7 +243,7 @@ def _plan_steps(pcp, steps, block_table):
             c if d else final_len[r]
             for r, (c, d) in enumerate(zip(num_computed, is_decode))
         ]
-        ranks = _plan_step(pcp, num_computed, num_prompt, q_lens)
+        ranks = _plan_step(pcp, num_computed, num_prompt, q_lens, page_size)
         plan0 = ranks[0].plan
         global_qsl = np.concatenate([[0], np.cumsum(q_lens)])
         req_of = np.searchsorted(global_qsl, np.arange(sum(q_lens)), side="right") - 1
@@ -485,13 +488,23 @@ def _check_topk(got, scores, pos, where):
     assert missing.size == 0, f"{where}: missed positions {missing[:8]}"
 
 
-def _plain_topk(record, seq_len, q, weights):
+def _plain_topk(
+    record,
+    seq_len,
+    q,
+    weights,
+    page_size=PAGE_SIZE,
+    kv_layout=streamindex_topk.KVLayout.HEAD_ALONG_SUBLANE,
+):
     """Unsharded `streamindex_topk` of the last `len(q)` positions of a
     `seq_len`-token request whose K is `record`, on one device."""
     num_q = q.shape[0]
-    pages = -(-seq_len // PAGE_SIZE)
-    flat = np.zeros((pages * PAGE_SIZE, IDX_WIDTH), np.uint8)
-    flat[:seq_len] = record[:seq_len]
+    pages = -(-seq_len // page_size)
+    flat = np.zeros((pages * page_size, IDX_WIDTH), np.uint8)
+    flat[:seq_len, : record.shape[-1]] = record[:seq_len]
+    cache = jnp.asarray(flat.reshape(pages, page_size // 4, 4, IDX_WIDTH))
+    if kv_layout == streamindex_topk.KVLayout.SEQ_ALONG_LANE:
+        cache = convert_cache_to_seq_along_lane(cache, IDX_DIM)
     padded = -(-num_q // 128) * 128
     q_pad = np.zeros((padded, *q.shape[1:]), q.dtype)
     q_pad[:num_q] = q
@@ -500,7 +513,7 @@ def _plain_topk(record, seq_len, q, weights):
     out = plain_streamindex_topk(
         jnp.asarray(q_pad),
         jnp.asarray(w_pad),
-        jnp.asarray(flat.reshape(pages, PAGE_SIZE // 4, 4, IDX_WIDTH)),
+        cache,
         jnp.asarray([seq_len], jnp.int32),
         jnp.arange(pages, dtype=jnp.int32),
         jnp.asarray([0, num_q], jnp.int32),
@@ -510,6 +523,7 @@ def _plain_topk(record, seq_len, q, weights):
         num_kv_pages_per_block=(2, 2, 2),
         num_queries_per_block=(1, 128, 128),
         enable_early_exit=False,
+        kv_layout=kv_layout,
     )
     return np.asarray(out)[:num_q]
 
@@ -621,5 +635,162 @@ def test_pcp_indexer_topk_matches_numpy(monkeypatch, scenario, pcp):
                     err_msg=f"{where}: differs from the unsharded kernel",
                 )
                 _check_topk(topk[d, i], scores, pos, where)
+                checked += 1
+    assert checked > 0
+
+
+# --- Indexer top-k, SEQ_ALONG_LANE (TPU_PCP_INDEXER_SAL) --------------------
+
+# SEQ_ALONG_LANE needs a 128-multiple page: 128-token pages, 1024-token
+# virtual pages, buckets of 4 and 8 of them plus the full 16-page workspace.
+SAL_PAGE_SIZE = 128
+SAL_BUCKET_TOKENS = (4096, 8192)
+SAL_MAX_MODEL_LEN = BLOCKS_PER_REQ * SAL_PAGE_SIZE * DCP
+
+
+@pytest.mark.parametrize("compact", [True, False])
+@pytest.mark.parametrize("pcp", [2, 8])
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_pcp_indexer_topk_sal_matches_has(monkeypatch, scenario, pcp, compact):
+    """`pcp_prefill_topk` over a SEQ_ALONG_LANE indexer K cache
+    (TPU_PCP_INDEXER_SAL) writes the same records as the HEAD_ALONG_SUBLANE
+    path (up to the layout) and returns the same top-k positions; both match
+    the unsharded SAL kernel and the numpy scores."""
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    has = streamindex_topk.KVLayout.HEAD_ALONG_SUBLANE
+    sal = streamindex_topk.KVLayout.SEQ_ALONG_LANE
+    mesh = _mesh()
+    monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
+    monkeypatch.setattr(
+        mla_attention_op, "PCP_INDEXER_BUCKET_TOKENS", SAL_BUCKET_TOKENS
+    )
+    rng = np.random.default_rng(zlib.crc32(f"indexer-sal-{scenario}-{pcp}".encode()))
+    steps = SCENARIOS[scenario]
+    final_len = _final_lens(steps)
+    packed = [_quantize_index_k(rng.standard_normal((n, IDX_DIM))) for n in final_len]
+    # The production record: fp8 K + one scale byte, unpadded.
+    rec_width = IDX_DIM + 1
+
+    def topk_fn(kv_layout):
+        return jax.jit(
+            functools.partial(
+                mla_attention_op.pcp_prefill_topk,
+                mesh=mesh,
+                topk=IDX_TOPK,
+                dcp_size=DCP,
+                pcp_size=pcp,
+                interleave_size=INTERLEAVE,
+                max_model_len=SAL_MAX_MODEL_LEN,
+                chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+                kv_layout=kv_layout,
+                k_write_compact=compact,
+            )
+        )
+
+    fns = {has: topk_fn(has), sal: topk_fn(sal)}
+    caches = {
+        layout: jnp.zeros(
+            streamindex_topk.get_kv_cache_shape(
+                DCP * NUM_PAGES, SAL_PAGE_SIZE, IDX_DIM, layout
+            ),
+            jnp.uint8,
+        )
+        for layout in (has, sal)
+    }
+    assert caches[sal].shape[1:] == (IDX_DIM // 4 + 1, 4, SAL_PAGE_SIZE)
+    checked = 0
+    plans = _plan_steps(pcp, steps, _block_table(rng), page_size=SAL_PAGE_SIZE)
+    for st in plans:
+        plan0, local_padded = st.plan0, st.local_padded
+        k_rows, q_rows, w_rows = [], [], []
+        for p in range(pcp):
+            k = np.zeros((local_padded, rec_width), np.uint8)
+            for i in range(local_padded):
+                tok = st.row_tokens[p * local_padded + i]
+                if tok is not None:
+                    k[i] = packed[tok[0]][0][tok[1], :rec_width]
+            k_rows.append(k)
+            q_rows.append(_fp8(rng, (local_padded, IDX_HEADS, IDX_DIM)))
+            w_rows.append(
+                rng.uniform(-1.5, 1.5, (local_padded, IDX_HEADS)).astype(np.float32)
+            )
+        args = (
+            jnp.asarray(_by_dcp_rank(pcp, q_rows)).view(jnp.uint8),
+            jnp.asarray(_by_dcp_rank(pcp, w_rows)),
+            jnp.asarray(_by_dcp_rank(pcp, k_rows)),
+            _rep(plan0.host_metadata["hidden_restore_idx"]),
+            _rep(plan0.host_metadata["split_seq_lens"]),
+            _rep(st.split_tables.reshape(-1)),
+            _rep(plan0.host_metadata["split_query_start_loc"]),
+            _rep(plan0.host_metadata["ws_req"]),
+            _rep(plan0.host_metadata["ws_vpage"]),
+            _shard(pcp, [r.plan.host_metadata["ws_page_offset"] for r in st.ranks]),
+            _shard(pcp, [r.seq_lens for r in st.ranks]),
+            _shard(pcp, [r.qsl for r in st.ranks]),
+            _shard(
+                pcp, [np.array([0, 0, r.plan.local_num_split_reqs]) for r in st.ranks]
+            ),
+            _rep(plan0.host_metadata["num_split_reqs"]),
+            _rep(plan0.host_metadata["ws_used_pages"]),
+        )
+        topk = {}
+        for layout in (has, sal):
+            caches[layout], out = fns[layout](caches[layout], *args)
+            topk[layout] = np.asarray(out).reshape(DCP, local_padded, IDX_TOPK)
+
+        # The SAL writer put every record where the SAL reader expects it.
+        np.testing.assert_array_equal(
+            np.asarray(caches[sal]),
+            np.asarray(convert_cache_to_seq_along_lane(caches[has], IDX_DIM)),
+            err_msg=f"step {st.index}: SAL cache != HAS cache in SAL layout",
+        )
+
+        rows_of = {}
+        for p in range(pcp):
+            for i in range(local_padded):
+                tok = st.row_tokens[p * local_padded + i]
+                if tok is not None and not st.is_decode[tok[0]]:
+                    rows_of.setdefault(tok[0], []).append((tok[1], p, i))
+        plain = {}
+        for r, rows in rows_of.items():
+            rows.sort()
+            pos0, seq_len = rows[0][0], rows[-1][0] + 1
+            assert [x[0] for x in rows] == list(range(pos0, seq_len))
+            out = _plain_topk(
+                packed[r][0][:, :rec_width],
+                seq_len,
+                np.stack([q_rows[p][i] for _, p, i in rows]),
+                np.stack([w_rows[p][i] for _, p, i in rows]),
+                page_size=SAL_PAGE_SIZE,
+                kv_layout=sal,
+            )
+            plain.update({(r, pos): out[j] for j, (pos, _, _) in enumerate(rows)})
+
+        tp = DCP // pcp
+        for d in range(DCP):
+            p = d // tp
+            q = np.asarray(jnp.asarray(q_rows[p]).astype(jnp.float32))
+            for i in range(local_padded):
+                tok = st.row_tokens[p * local_padded + i]
+                if tok is None or st.is_decode[tok[0]]:
+                    continue
+                r, pos = tok
+                where = (
+                    f"step {st.index} dcp rank {d} row {i} (request {r}, "
+                    f"position {pos})"
+                )
+                np.testing.assert_array_equal(
+                    np.sort(topk[sal][d, i]),
+                    np.sort(topk[has][d, i]),
+                    err_msg=f"{where}: SAL top-k differs from HAS",
+                )
+                np.testing.assert_array_equal(
+                    np.sort(topk[sal][d, i]),
+                    np.sort(plain[(r, pos)]),
+                    err_msg=f"{where}: differs from the unsharded SAL kernel",
+                )
+                scores = _index_scores(q[i], w_rows[p][i], packed[r][1])
+                _check_topk(topk[sal][d, i], scores, pos, where)
                 checked += 1
     assert checked > 0

@@ -60,6 +60,35 @@ def test_page_table_reads_every_position_in_order(dcp, interleave):
         assert table[seg].max() == num_ws_pages - 1
 
 
+@pytest.mark.parametrize("dcp,interleave", [(2, 1), (4, 2), (8, 4), (16, 4)])
+def test_position_ordered_sal_matches_has(dcp, interleave):
+    """SEQ_ALONG_LANE workspace (token on the lane dim) reorders to the same
+    token order as the HEAD_ALONG_SUBLANE one, every record byte intact."""
+    num_ws_pages, rows, packing, groups = 3, 32, 4, 3
+    page_size = rows * packing
+    has = np.asarray(
+        _rank_major_workspace(dcp, num_ws_pages, rows, packing, interleave)
+    )
+    # Distinct bytes per (token, record row, packing lane): [dcp, Pw, P, G, 4].
+    tok = has.reshape(dcp, num_ws_pages, page_size, 1, 1)
+    rec = np.arange(groups * packing, dtype=np.int32).reshape(1, 1, 1, groups, packing)
+    records = tok * (groups * packing) + rec
+    has_ws = records.reshape(dcp, num_ws_pages, rows, packing, groups * packing)
+    sal_ws = np.moveaxis(records, 2, -1)  # [dcp, Pw, G, 4, P]
+
+    got = np.asarray(ws.position_ordered_sal(jnp.asarray(sal_ws), interleave))
+    assert got.shape == (num_ws_pages, groups, packing, dcp * page_size)
+    want = np.asarray(ws.position_ordered(jnp.asarray(has_ws), interleave))
+    want = want.reshape(num_ws_pages, dcp * page_size, groups, packing)
+    np.testing.assert_array_equal(got, np.moveaxis(want, 1, -1))
+    # And slot t of virtual page v is position v * dcp * P + t.
+    positions = got[:, 0, 0, :] // (groups * packing)
+    np.testing.assert_array_equal(
+        positions,
+        np.arange(num_ws_pages * dcp * page_size).reshape(num_ws_pages, -1),
+    )
+
+
 def test_page_table_width_capped_at_max_pages_per_seq():
     ws_page_offset = jnp.asarray([0, 5], jnp.int32)
     table = np.asarray(

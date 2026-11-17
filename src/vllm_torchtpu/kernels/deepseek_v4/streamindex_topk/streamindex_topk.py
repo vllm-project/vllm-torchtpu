@@ -1107,6 +1107,8 @@ def indexer_kv_layout(
     requesting `sal` while Raiden GLM admission is enabled raises `ValueError`.
     `TPU_RAIDEN_GLM_DCP_IDENTITY` lifts that restriction: its transfers ship
     whole pages, so they need no packed-row geometry.
+    `USE_TPU_PCP_MANAGER` is restricted the same way unless
+    `TPU_PCP_INDEXER_SAL` is set.
     """
     try:
         from vllm_torchtpu import envs
@@ -1114,7 +1116,9 @@ def indexer_kv_layout(
         raiden_glm_admission = (
             envs.use_raiden_glm_admission() and not envs.TPU_RAIDEN_GLM_DCP_IDENTITY
         )
-        pcp_manager = envs.USE_TPU_PCP_MANAGER
+        # TPU_PCP_INDEXER_SAL: the PCP manager's split-prefill top-k reads
+        # SEQ_ALONG_LANE too, so the PCP restriction below does not apply.
+        pcp_manager = envs.USE_TPU_PCP_MANAGER and not envs.TPU_PCP_INDEXER_SAL
         explicit_env = envs.is_indexer_kv_cache_mode_explicit()
         env_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
     except ImportError:
