@@ -582,7 +582,6 @@ configure_role_environment() {
   export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
   export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
   export TPU_RAIDEN_QWEN35_ADMISSION=1
-  export TPU_KV_RESHARD_TRANSPORT=raiden
   export TPU_RAIDEN_TRANSFER_PARALLELISM=8
   # Destination head shards (dp{N}tp{T}_decode, PR #1183): the producer routes
   # each KV head shard to one decode TP worker, and the handoff's dst_tp_size

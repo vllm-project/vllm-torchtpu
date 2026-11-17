@@ -423,7 +423,6 @@ export TPU_RAIDEN_PLAN_DUMP_DIR=$(shell_quote "${plan_dump_dir}");
 # Raiden configurations:
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1;
 export TPU_RAIDEN_QWEN35_ADMISSION=1;
-export TPU_KV_RESHARD_TRANSPORT=raiden;
 export TPU_RAIDEN_TRANSFER_PARALLELISM=4;
 EOF
 )

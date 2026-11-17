@@ -431,7 +431,6 @@ common_env_exports=(
   # Raiden Stage 3.
   "export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1"
   "export TPU_RAIDEN_DSV4_ADMISSION=1"
-  "export TPU_KV_RESHARD_TRANSPORT=raiden"
   "export TPU_RAIDEN_TRANSFER_PARALLELISM=${TPU_RAIDEN_TRANSFER_PARALLELISM}"
   "export TPU_ENABLE_D2H_TRANSFER=1"
   "export TPU_HMA_D2H_COPY_IMPL=device_put"

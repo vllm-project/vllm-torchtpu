@@ -379,7 +379,6 @@ def _set_env(name: str, value) -> None:
 
 def _environment(monkeypatch, topo: Topology, per_layer_tags: bool) -> None:
     monkeypatch.setattr(tc, "_raiden_seq_on_lane_layout", lambda: True)
-    _set_env("TPU_KV_RESHARD_TRANSPORT", "raiden")
     _set_env("TPU_RAIDEN_TRANSFER_PARALLELISM", topo.units)
     _set_env("TPU_RAIDEN_DST_SHARDS", topo.dtp)
     _set_env("TPU_RAIDEN_CONTROLLER_ADDRESS", CONTROLLER)

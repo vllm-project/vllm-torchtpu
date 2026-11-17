@@ -34,7 +34,6 @@ from .test_tpu_connector import (
 
 def _environment(monkeypatch, pcp=4, tp=2, dtp=8):
     monkeypatch.setattr(tc, "_raiden_seq_on_lane_layout", lambda: True)
-    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     monkeypatch.setenv("TPU_RAIDEN_TRANSFER_PARALLELISM", str(pcp * tp))
     monkeypatch.setenv("TPU_RAIDEN_DST_SHARDS", str(dtp))
     monkeypatch.setenv("TPU_RAIDEN_CONTROLLER_ADDRESS", "localhost:27000")

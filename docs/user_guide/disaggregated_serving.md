@@ -42,12 +42,23 @@ For large models such as `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-35B-A3B-FP8`, `
 
 ### Single-Host Disaggregated Serving
 
-To run Prefill and Decode on a single host, use
-`examples/disagg/launch_qwen35_p4d2_v2_baseline.sh`. It launches a Qwen3.5
+To run Prefill and Decode on a single 8-chip TPU host, use
+`examples/disagg/launch_qwen35_p4d2_v2_baseline.sh` with the TPU-verified
+overrides used in CI (`scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh`):
+
+```bash
+PREFILL_TP=1 PREFILL_PCP=4 DECODE_TP=1 DECODE_DP=4 USE_CURRENT_PY_ENV=1 \
+  bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh
+```
+
+`PREFILL_TP=1 PREFILL_PCP=4` and `DECODE_TP=1 DECODE_DP=4` override the
+launcher's legacy `TP4/PCP1` and `TP2/DP1` defaults to the `PCP=4` / `DP=4`
+topology admitted by Qwen3.5 Stage-3 without requiring `VLLM_KV_CACHE_LAYOUT=HND`,
+and `USE_CURRENT_PY_ENV=1` runs in the active Python environment instead of
+activating a separate conda environment. The script launches a Qwen3.5
 Prefill/Decode pair on one host with `TPU_USE_RAIDEN_KV_CACHE_MANAGER=1` and
 `TPU_RAIDEN_QWEN35_ADMISSION=1`, combining `TPURaidenConnector` with
-`TPURaidenOffloadingConnector` through `TPUMultiConnector`. The multi-host steps
-below show the same configuration split across hosts.
+`TPURaidenOffloadingConnector` through `TPUMultiConnector`.
 
 ### Step 1: Start the Raiden Controller
 
@@ -182,4 +193,4 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Unique engine replica ID within the job role. |
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of source ranks that transfer KV blocks in parallel (source rank transfer parallelism). Distinct from `TPU_RAIDEN_TRANSFER_STREAMS`, which sets the TCP stream count of each push. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | KV resharding implementation (`controller` or `host`) when Prefill and Decode shardings differ. |
-| `TPU_KV_RESHARD_TRANSPORT` | `"raiden"` | Transport selector for KV cache resharding. Defaults to and only accepts `"raiden"` (case-insensitive); kept for launch-config compatibility. Any other value (for example the removed `"zmq"`) is rejected at startup. |
+| `TPU_KV_RESHARD_TRANSPORT` | `"raiden"` | **Deprecated** (new deployments do not need to set it). Transport selector for KV cache resharding, kept only for external launch-config compatibility; defaults to and accepts only `"raiden"` (case-insensitive). Only `TPURaidenConnector` (and its `TPUConnector` alias) reads and validates it, rejecting any other value (for example the removed `"zmq"`) at startup; engines without that connector ignore it. |
