@@ -669,14 +669,9 @@ def _patch_sequence_parallel_moe_admission() -> None:
     else:
         ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
     ParallelConfig._tpu_no_sp_moe_patch = True
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     logger.info(
         "Applied TPU patch: sequence-parallel MoE %s.",
-        "admitted (a step below its layout's row threshold runs replicated; "
-        f"the default threshold is {sequence_parallel.DEFAULT_MIN_ROWS} rows)"
-        if envs.TPU_MOE_SEQUENCE_PARALLEL
-        else "disabled",
+        "admitted" if envs.TPU_MOE_SEQUENCE_PARALLEL else "disabled",
     )
 
 

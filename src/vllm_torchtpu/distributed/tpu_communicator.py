@@ -64,11 +64,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
         return group if group.world_size > 1 else None
 
-    def _replicated_dp_group(self, is_sequence_parallel: bool):
+    def _replicated_dp_group(self):
         """The DP group a replicated sequence-parallel step gathers over, or
-        None when the step is not one or there is a single DP engine."""
-        if not sequence_parallel.rows_are_replicated(is_sequence_parallel):
-            return None
+        None with a single DP engine."""
         group = get_dp_group()
         return group if group.world_size > 1 else None
 
@@ -84,7 +82,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
         if sequence_parallel.rows_are_replicated(is_sequence_parallel):
-            dp_group = self._replicated_dp_group(is_sequence_parallel)
+            dp_group = self._replicated_dp_group()
             if dp_group is None:
                 return hidden_states, router_logits
             hidden_states = dp_group.all_gather(hidden_states, dim=0)
@@ -110,7 +108,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
         if sequence_parallel.rows_are_replicated(is_sequence_parallel):
-            dp_group = self._replicated_dp_group(is_sequence_parallel)
+            dp_group = self._replicated_dp_group()
             if dp_group is None:
                 return hidden_states, topk_weights, topk_ids
             hidden_states = dp_group.all_gather(hidden_states, dim=0)
@@ -132,7 +130,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if group is None:
             return hidden_states
         if sequence_parallel.rows_are_replicated(is_sequence_parallel):
-            dp_group = self._replicated_dp_group(is_sequence_parallel)
+            dp_group = self._replicated_dp_group()
             if dp_group is None:
                 # Every rank holds every row: sum the expert partials in place.
                 return group.all_reduce(hidden_states)
