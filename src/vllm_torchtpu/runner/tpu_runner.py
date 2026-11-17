@@ -8169,9 +8169,19 @@ class TPUModelRunner(GPUModelRunner):
                     if self.scheduler_config.async_scheduling
                     else paddings
                 )
+                # The MTP draft's two-pass step 0 runs on mixed verify +
+                # prefill steps, which under async scheduling carry an
+                # on-device rejected count into it: warm those steps too.
+                drafter = getattr(self, "drafter", None)
+                mixed = (
+                    isinstance(drafter, Eagle3Proposer)
+                    and drafter.kv_only_step0_enabled
+                )
                 for R in counts:
-                    self._warmup_spec_batch(R, prompt_buckets[0], greedy=True)
-                    self._warmup_spec_batch(R, prompt_buckets[0], greedy=False)
+                    for greedy in (True, False):
+                        self._warmup_spec_batch(
+                            R, prompt_buckets[0], greedy=greedy, mixed=mixed
+                        )
                 if prompt_buckets[-1] != prompt_buckets[0]:
                     for R in paddings:
                         self._warmup_spec_batch(R, prompt_buckets[-1], greedy=True)

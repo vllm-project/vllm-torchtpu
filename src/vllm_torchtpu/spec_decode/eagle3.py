@@ -750,6 +750,12 @@ class Eagle3Proposer:
         if self._mtp_kv_only is not None:
             self._mtp_kv_only.set_compile_sizes(sizes)
 
+    @property
+    def kv_only_step0_enabled(self) -> bool:
+        """Whether draft step 0 can take the two passes
+        (TPU_MTP_KV_ONLY_STEP0)."""
+        return self._mtp_kv_only is not None
+
     def kv_only_missing_buckets(self, target_buckets: Iterable[int]) -> list[int]:
         """Target token buckets the two-pass step 0 can run at but its
         KV-only pass has no compiled graph for; empty while it is off."""

@@ -568,13 +568,18 @@ def test_mtp_prefill_warmup_fills_every_bucket():
     ]
 
 
+@pytest.mark.parametrize("two_pass", [False, True])
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
-    async_scheduling,
+    async_scheduling, two_pass
 ):
     one = MagicMock(return_value=True)
     batch = MagicMock()
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.bucketed_drafts = False
+    drafter.kv_only_step0_enabled = two_pass
     runner = SimpleNamespace(
+        drafter=drafter,
         enforce_eager=False,
         _is_async_drafter=True,
         input_batch=SimpleNamespace(num_reqs=0),
@@ -605,9 +610,13 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
     # Every request count (async) or the request paddings (sync) at the
     # shortest prompt bucket, then the paddings at the longest one, nr > 1.
+    # With the two-pass MTP step 0 on, the first sweep also runs the mixed
+    # verify + prefill steps it takes.
     counts = range(2, 33) if async_scheduling else (8, 16, 32)
     assert batch.call_args_list == [
-        ((R, 16), {"greedy": greedy}) for R in counts for greedy in (True, False)
+        ((R, 16), {"greedy": greedy, "mixed": two_pass})
+        for R in counts
+        for greedy in (True, False)
     ] + [
         ((R, 8192), {"greedy": greedy}) for R in (8, 16, 32) for greedy in (True, False)
     ]
