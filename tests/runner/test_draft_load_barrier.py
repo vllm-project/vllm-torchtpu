@@ -116,9 +116,6 @@ def _barrier_calls_per_stage(method, num_stages=8):
             speculative_config=None if method is None else _Spec(method),
             _pp_is_last=pp_rank == num_stages - 1,
         )
-        stage._uses_hidden_state_drafter = (
-            TPUModelRunner._uses_hidden_state_drafter.fget(stage)
-        )
         hosts_draft.append(TPUModelRunner._is_async_drafter.fget(stage))
 
         def barrier(pp_rank=pp_rank):
