@@ -28,6 +28,7 @@ from vllm import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_torchtpu.core import prefix_aware_scheduler
 from vllm_torchtpu.core.packed_ids import (
     PackedPromptIds,
     pack_new_request_prompt_ids,
@@ -167,15 +168,29 @@ def test_exclusions_and_small_prompts():
     assert pack_prompt_ids([1, 2**40]) is None
 
 
-def test_scheduler_hook_and_off_switch():
+def test_scheduler_hook_packs():
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     so = SimpleNamespace(scheduled_new_reqs=[_new_req(list(range(4096)))])
     s._maybe_pack_prompt_ids(so)
     assert isinstance(so.scheduled_new_reqs[0].prompt_token_ids, PackedPromptIds)
 
-    # A failed pack turns packing off for the scheduler's lifetime.
-    s2 = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    s2._pack_ids = False
+
+def test_failed_pack_turns_packing_off(monkeypatch):
+    """A pack that raises leaves the ids as lists and is never tried again by
+    that scheduler."""
+    calls = []
+
+    def broken(scheduler_output, min_len):
+        calls.append(scheduler_output)
+        raise RuntimeError("simulated packing failure")
+
+    monkeypatch.setattr(prefix_aware_scheduler, "pack_new_request_prompt_ids", broken)
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    so = SimpleNamespace(scheduled_new_reqs=[_new_req(list(range(4096)))])
+    s._maybe_pack_prompt_ids(so)
+    assert s._pack_ids is False
+    assert type(so.scheduled_new_reqs[0].prompt_token_ids) is list
     so2 = SimpleNamespace(scheduled_new_reqs=[_new_req(list(range(4096)))])
-    s2._maybe_pack_prompt_ids(so2)
+    s._maybe_pack_prompt_ids(so2)
     assert type(so2.scheduled_new_reqs[0].prompt_token_ids) is list
+    assert len(calls) == 1
