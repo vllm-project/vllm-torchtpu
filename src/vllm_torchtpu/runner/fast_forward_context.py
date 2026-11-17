@@ -21,12 +21,15 @@ times per step (target, draft step 0, draft loop) for ~0.06 ms each, all host
 time on the critical path.
 
 `fast_set_forward_context` builds that context once per
-(vllm_config, num_tokens, num_tokens_across_dp, cudagraph mode) and on later
-calls installs a shallow copy carrying the new `attn_metadata`. Every other
-field of the cached context is a function of the key only. Batch-size tracking
-(VLLM_LOG_BATCHSIZE_INTERVAL) and every non-default argument fall back to the
-stock path. Off by default; ``runner.host_trims`` turns it on under the
-batch-1 rule (:func:`set_enabled`).
+(vllm_config, num_tokens, num_tokens_across_dp) and on later calls installs a
+shallow copy carrying the new `attn_metadata`. Every other field of the cached
+context is a function of the key only; the copy starts its own MoE layer
+counter, and the fields it shares with the cached context are never written
+during a forward at the pinned vLLM. Batch-size tracking
+(VLLM_LOG_BATCHSIZE_INTERVAL) and every non-default argument (the cudagraph
+mode, a batch descriptor, slot mappings, ...) fall back to the stock path, so
+they need no place in the key. Off by default; ``runner.host_trims`` turns it
+on under the batch-1 rule (:func:`set_enabled`).
 """
 
 from __future__ import annotations
