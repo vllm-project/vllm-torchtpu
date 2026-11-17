@@ -226,6 +226,7 @@ class TestTpuCompilerCache:
             "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS",
             "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN",
             "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE",
+            "VLLM_TPU_DETOK_PRIME_SUFFIX",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
