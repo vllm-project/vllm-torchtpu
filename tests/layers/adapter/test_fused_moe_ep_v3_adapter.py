@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Host-side rules of the fused EP v3 bridge (layers/adapter/fused_moe_ep_v3.py):
-the per-layout step gate, the meeting point with the few-token kernel, and the
-copy-slot slice of a placed layer's weights."""
+the per-layout step gate, the meeting point with the few-token kernel, the
+copy-slot slice of a placed layer's weights, and the routing it admits."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -170,3 +170,39 @@ def test_without_the_attribute_every_slot_is_an_expert(armed):
 def test_an_unplaced_layer_is_unchanged(armed):
     assert _prebuild(_layer(slots=4))
     assert armed["local_experts"] == 4
+
+
+@pytest.mark.parametrize(
+    "routing",
+    [
+        dict(scoring_func="sigmoid"),
+        dict(scoring_func="sqrtsoftplus"),
+        dict(e_score_correction_bias=torch.zeros(4 * EP)),
+        dict(routed_scaling_factor=2.5),
+    ],
+    ids=["sigmoid", "sqrtsoftplus", "correction_bias", "routed_scaling"],
+)
+def test_routing_the_v3_router_cannot_compute_is_refused(armed, routing):
+    """The v2 bridge's admission takes these (the v2 kernel has operands for
+    them); the v3 router is a plain softmax with no bias or scale."""
+    layer = _layer(slots=4)
+    for name, value in routing.items():
+        setattr(layer, name, value)
+    assert not _prebuild(layer)
+    assert "local_experts" not in armed
+
+
+def test_simulated_routing_is_refused(armed, monkeypatch):
+    """uniform_random simulation is served by the v2 kernel through routing
+    operands; the v3 kernel routes by itself, so it is refused."""
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", object())
+    monkeypatch.setattr(moe_routing, "_strategy_name", "uniform_random")
+    assert not _prebuild(_layer(slots=4))
+
+
+def test_the_softmax_router_is_admitted(armed):
+    """The control: softmax scoring, no bias, scale 1.0 and no simulation,
+    the Qwen3.5 router."""
+    assert _prebuild(_layer(slots=4))
