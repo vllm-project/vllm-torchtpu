@@ -291,8 +291,16 @@ def _compile_deferred(
     ranks_per_host=8,
     disable_cache=False,
     num_subgraphs=1,
+    routed=None,
 ):
-    """Run compile_deferred over several traces' accepted buckets."""
+    """Run compile_deferred over several traces' accepted buckets.
+
+    ``routed[i]`` is ``(module, buckets)`` for trace ``i``: the stand-in of the
+    compiled module whose routed call traced it (``_tpu_serves``, set by
+    defer()) and the buckets that module serves. The bucket filter removes the
+    other buckets before defer() runs, so the trace holds entries only for its
+    module's buckets.
+    """
     _host(monkeypatch, ranks_per_host)
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
     calls = []
@@ -310,8 +318,9 @@ def _compile_deferred(
     backends = []
     for trace_idx, group in enumerate(groups):
         for subgraph_idx in range(num_subgraphs):
+            sizes = SIZES if routed is None else routed[trace_idx][1]
             entries = {}
-            for s in SIZES:
+            for s in sizes:
                 entry = piecewise_backend.RangeEntry(compile_range=Range(s, s))
                 entry._tpu_deferred = "compile" if s in group else "hand_over"
                 entries[Range(s, s)] = entry
@@ -320,6 +329,7 @@ def _compile_deferred(
                     graph=object(),
                     range_entries=entries,
                     _tpu_trace=trace_idx,
+                    _tpu_serves=None if routed is None else routed[trace_idx][0],
                     vllm_backend=SimpleNamespace(
                         compiler_manager=SimpleNamespace(
                             compile=compile, disable_cache=disable_cache
@@ -354,6 +364,35 @@ def test_deferred_splits_buckets_across_traces_with_host_slot(
         with pytest.raises(shape_variants.ShapeSpecializationError):
             backends[0].range_entries[Range(4096, 4096)].runnable()
     assert owned == [[4096, 32, 16], [2048, 64], [1024, 128], [512, 256]]
+
+
+def test_deferred_keeps_each_routed_modules_last_trace_live(
+    compile_all_ranges, monkeypatch
+):
+    """With buckets routed to two compiled modules, a partial retrace keeps the
+    other module's older trace live: trace 0 (module A) and trace 2 (module B,
+    which replaced its trace 1) both get their refused buckets handed over."""
+    module_a, module_b = object(), object()
+    small = [s for s in SIZES if s < 1024]
+    large = [s for s in SIZES if s >= 1024]
+
+    calls, _, backends = _compile_deferred(
+        monkeypatch,
+        1,
+        groups=(small[:-1], [1024], [2048, 4096]),
+        ranks_per_host=None,
+        routed=[(module_a, small), (module_b, large), (module_b, large)],
+    )
+    # 8 accepted buckets + one hand-over for each of the two live traces.
+    assert len(calls) == 8 + 1 + 1
+    assert all(
+        list(b.range_entries) == [Range(s, s) for s in buckets]
+        for b, buckets in zip(backends, (small, large, large))
+    )
+    backends[0].range_entries[Range(small[-1], small[-1])].runnable()
+    backends[2].range_entries[Range(1024, 1024)].runnable()
+    with pytest.raises(shape_variants.ShapeSpecializationError):
+        backends[1].range_entries[Range(4096, 4096)].runnable()
 
 
 def test_deferred_splits_subgraphs_across_ranks_and_counts_distinct_traces(

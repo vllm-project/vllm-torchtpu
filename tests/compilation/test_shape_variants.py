@@ -334,7 +334,8 @@ def warm(model, config, buckets=BUCKETS) -> int:
     with set_current_vllm_config(config), shape_variants.warmup() as tracked:
         for num_tokens in buckets:
             if tracked.needs_retrace(num_tokens):
-                shape_variants.retrace(model, config)
+                # The runner names the refused bucket (_precompile_backbone).
+                shape_variants.retrace(model, config, num_tokens)
                 retraces += 1
             run(model, config, num_tokens)
     return retraces
