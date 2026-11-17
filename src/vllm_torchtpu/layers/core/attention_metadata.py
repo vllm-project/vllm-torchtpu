@@ -684,16 +684,20 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 "Prefill checkpoints need the unified KV pool."
             )
 
-        pcp_metadata = (
-            None
-            if runner.pcp_manager is None
-            else runner.pcp_manager.build_metadata(
+        pcp_metadata = None
+        if runner.pcp_manager is not None:
+            if block_table_obj is None:
+                # The staged branch above skips the geometry, but the PCP
+                # manager slices its split and replicated tables out of the
+                # group's block table at the group's width (under PCP,
+                # `stage_block_table_uploads` stages a zeroed buffer).
+                block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
+            pcp_metadata = runner.pcp_manager.build_metadata(
                 runner=runner,
                 block_table_obj=block_table_obj,
                 target_num_reqs=target_num_reqs,
                 target_num_blocks=target_num_blocks,
             )
-        )
 
         return AttentionMetadata(
             input_positions=input_positions,
