@@ -34,6 +34,7 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    PrequantLinearMethod,
 )
 from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
 from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
@@ -1300,12 +1301,23 @@ def test_post_attn_norm_moe_fusion_predicate(monkeypatch):
     assert not fuses(layer, _tpu_rows())
 
 
-def _proj(dtype=torch.float8_e4m3fn, scale_shape=(4,)) -> SimpleNamespace:
+def _proj(
+    dtype=torch.float8_e4m3fn, scale_shape=(4,), quant_method=None
+) -> SimpleNamespace:
     return SimpleNamespace(
         weight=torch.zeros(4, 4, dtype=dtype),
         weight_scale=torch.ones(scale_shape),
-        quant_method=SimpleNamespace(apply_prequant=lambda *args: None),
+        quant_method=PrequantLinearMethod() if quant_method is None else quant_method,
     )
+
+
+def test_takes_prequant_rows_dispatches_on_the_method_class():
+    """A method takes pre-quantized rows by being a PrequantLinearMethod, not by
+    having an `apply_prequant` attribute."""
+    assert patch_mod._takes_prequant_rows(_proj())
+    stand_in = SimpleNamespace(apply_prequant=lambda *args: None)
+    assert not patch_mod._takes_prequant_rows(_proj(quant_method=stand_in))
+    assert not patch_mod._takes_prequant_rows(None)
 
 
 def test_mark_pre_attn_norm_quant():
