@@ -1287,6 +1287,13 @@ def test_input_delta_names_the_earlier_trace_for_an_input_only_this_one_takes():
     assert "in this trace" not in named
 
 
+def test_in_warmup_holds_only_inside_the_warmup():
+    assert not shape_variants.in_warmup()
+    with shape_variants.warmup():
+        assert shape_variants.in_warmup()
+    assert not shape_variants.in_warmup()
+
+
 def test_input_delta_names_the_int_input_one_trace_dropped():
     metas = _int_metas()
     sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
