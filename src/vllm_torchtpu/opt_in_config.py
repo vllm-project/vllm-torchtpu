@@ -187,6 +187,19 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # the MXU). Excludes moe_tc_combine_min_tokens (a different, bitwise
     # TensorCore combine): setting both fails at init.
     "moe_tc_combine": False,
+    # MoE steps of 1..this many tokens with NVFP4 experts (EP or TP-MoE) run
+    # the permutation-free dense-expert fp4 kernel instead of sort + grouped
+    # GEMM + combine (`kernels/experimental/moe_dense_expert_fp4.py`); takes
+    # precedence over gmm_v2_decode_stream for those steps. Same roundings as
+    # the GMM path, other f32 sum order: not bitwise. 0 = off.
+    "moe_dense_fp4_max_tokens": 0,
+    # NVFP4 EP MoE layers hand their shared expert (e4m3 per-channel MiniMax
+    # linears) to the routed op: the dense fp4 kernel evaluates it in the
+    # same call, other steps add it with XLA inside the op
+    # (`layers/adapter/dense_fp4_shared.py`). Fails at init when no layer is
+    # eligible (bf16 linears). LOSSY vs the separate shared-expert linears
+    # (another evaluation order/rounding of the fp8 shared MLP).
+    "moe_dense_fp4_shared": False,
 }
 
 

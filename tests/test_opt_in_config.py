@@ -72,6 +72,8 @@ REPLACED_ENV = {
     "gmm_fp8_w8a8": "TPU_GMM_FP8_W8A8",
     "moe_bounded_onehot": "TPU_MOE_BOUNDED_ONEHOT",
     "moe_tc_combine": "TPU_MOE_TC_COMBINE",
+    "moe_dense_fp4_max_tokens": "TPU_MOE_DENSE_FP4_MAX_TOKENS",
+    "moe_dense_fp4_shared": "TPU_MOE_DENSE_FP4_SHARED",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -91,6 +93,8 @@ SAMPLE = {
     "moe_skip_padded_min_routes": 2049,
     "moe_redundant_experts": 8,
     "moe_redundant_placement": "builtin:minimax_m31_agentx",
+    # --- v7 MoE / grouped GEMM ---
+    "moe_dense_fp4_max_tokens": 32,
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {

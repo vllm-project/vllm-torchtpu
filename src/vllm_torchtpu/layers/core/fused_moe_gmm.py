@@ -23,6 +23,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
+    SharedExpert,
+    can_use_dense_expert_fp4,
+    dense_expert_moe_fp4,
+    shared_activation,
+)
 from vllm_torchtpu.kernels.megablox import tc_combine
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
@@ -195,6 +201,34 @@ def set_tc_combine(enabled: bool) -> None:
         )
     _R10_TC_COMBINE = bool(enabled)
     logger.info("MoE r10 TensorCore combine (moe_tc_combine): %s", _R10_TC_COMBINE)
+
+
+# r10's dense fp4 decode MoE, set before the model's first trace
+# (`set_dense_fp4`; off by default):
+#   moe_dense_fp4_max_tokens: MoE steps (EP or TP-MoE) of 1..this many tokens
+#     with fp4 (NVFP4) experts run the permutation-free dense-expert kernel
+#     (kernels/experimental/moe_dense_expert_fp4.py) instead of sort + grouped
+#     GEMM + combine. 0 = never.
+#   moe_dense_fp4_shared: eligible layers hand their shared expert to the
+#     routed op (layers/adapter/dense_fp4_shared.py, armed after load); the
+#     dense fp4 kernel evaluates it in the same call, other steps add it with
+#     XLA inside the op (`shared_expert_mlp`).
+_DENSE_FP4_MAX_TOKENS = 0
+DENSE_FP4_SHARED = False
+
+
+def set_dense_fp4(max_tokens: int, shared: bool) -> None:
+    """Keys moe_dense_fp4_max_tokens / moe_dense_fp4_shared."""
+    global _DENSE_FP4_MAX_TOKENS, DENSE_FP4_SHARED
+    if max_tokens < 0:
+        raise ValueError("moe_dense_fp4_max_tokens must be >= 0")
+    _DENSE_FP4_MAX_TOKENS = int(max_tokens)
+    DENSE_FP4_SHARED = bool(shared)
+    logger.info(
+        "MoE dense fp4 decode: moe_dense_fp4_max_tokens=%d moe_dense_fp4_shared=%s",
+        _DENSE_FP4_MAX_TOKENS,
+        DENSE_FP4_SHARED,
+    )
 
 
 def _zero_non_finite(x: jax.Array) -> jax.Array:
@@ -906,6 +940,28 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+# MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows.
+_SHARED_UPCAST_MIN_ROWS = 4096
+
+
+def shared_expert_mlp(
+    x: jax.Array, shared: SharedExpert, routed: jax.Array
+) -> jax.Array:
+    """``routed`` plus `shared` on the bf16 tokens ``x``, rounded as
+    SharedExpert describes."""
+
+    def projection(v, w, scale):
+        w = w.astype(jnp.bfloat16)
+        if v.shape[0] >= _SHARED_UPCAST_MIN_ROWS:
+            w = jax.lax.optimization_barrier(w)
+        y = jnp.matmul(v, w).astype(jnp.float32) * scale
+        return y.astype(jnp.bfloat16)
+
+    gate, up = jnp.split(projection(x, shared.w1, shared.s1), 2, axis=-1)
+    act = shared_activation(gate.astype(jnp.float32), up.astype(jnp.float32))
+    return projection(act.astype(jnp.bfloat16), shared.w2, shared.s2) + routed
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -936,8 +992,14 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    shared: SharedExpert | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
+
+    With ``shared`` (moe_dense_fp4_shared), an always-on expert's output
+    (rounded to bf16) is added to the routed output, as vLLM's MoERunner adds
+    a separately computed shared expert; the dense fp4 kernel evaluates it in
+    the same call where it serves the step.
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -965,6 +1027,48 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape
+
+    dense_fp4 = (
+        0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
+        and rhs_quant_dtype is None
+        and w1_bias is None
+        and w2_bias is None
+        and can_use_dense_expert_fp4(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            activation=activation,
+            shared=shared,
+        )
+    )
+    if shared is not None and activation != "swigluoai":
+        raise NotImplementedError(f"shared experts take swigluoai, not {activation}")
+    if shared is not None and not dense_fp4:
+        routed = fused_moe_func(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+        )
+        return shared_expert_mlp(hidden_states, shared, routed)
+    # The dense fp4 kernel zeroes non-finite tokens for the routed experts
+    # itself; its shared expert sees them as given.
+    dense_fp4_hidden = hidden_states
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
@@ -1022,6 +1126,31 @@ def fused_moe_func(
             hidden_states = _zero_non_finite(hidden_states)
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+        )
+
+    # Decode: a core holds few routed rows per expert and weight streaming
+    # binds, so the permutation-free kernel skips the routing sort, permute
+    # and combine around the GMM (EP ranks, or TP ranks holding every expert's
+    # slice). Physical ids under moe_redundant_experts are already local here.
+    if dense_fp4:
+        logger.info_once("moe_dense_fp4_max_tokens: dense-expert fp4 decode MoE")
+        dense_ids = topk_ids
+        if NVFP4_SKIP_PADDED:
+            # The kernel streams every expert an id names, even at zero
+            # weight, so padded rows (zero weights under moe_nvfp4_skip_padded)
+            # would pull their experts in. A zero-weight route adds nothing
+            # to the output, so dropping its id keeps the result bitwise.
+            dense_ids = jnp.where(topk_weights != 0, topk_ids, -1)
+        return dense_expert_moe_fp4(
+            dense_fp4_hidden,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            dense_ids,
+            activation=activation,
+            shared=shared,
         )
 
     if (

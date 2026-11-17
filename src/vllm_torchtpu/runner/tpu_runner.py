@@ -6087,6 +6087,13 @@ class TPUModelRunner(GPUModelRunner):
 
             # Logs the resolved values (the payload sort needs the v3 combine).
             fused_moe_gmm.set_row_movement(*moe_row_movement)
+        dense_fp4_max_tokens = option(additional, "moe_dense_fp4_max_tokens")
+        dense_fp4_shared = option(additional, "moe_dense_fp4_shared")
+        if dense_fp4_max_tokens or dense_fp4_shared:
+            from vllm_torchtpu.layers.core import fused_moe_gmm
+
+            # Logs the values; the shared experts are armed after load.
+            fused_moe_gmm.set_dense_fp4(dense_fp4_max_tokens, dense_fp4_shared)
         if option(additional, "moe_tc_combine"):
             from vllm_torchtpu.layers.core import fused_moe_gmm
 
@@ -6198,6 +6205,17 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
 
             arm_runner_models(self)
+        if option(additional, "moe_dense_fp4_shared"):
+            from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
+                arm_dense_fp4_shared,
+            )
+
+            if not arm_dense_fp4_shared(self.model, "target model"):
+                raise ValueError(
+                    "additional_config moe_dense_fp4_shared: no MoE layer is "
+                    "eligible (needs NVFP4 experts on the EP GMM path and a "
+                    "SwiGLU-OAI shared expert on e4m3 per-channel linears)"
+                )
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
