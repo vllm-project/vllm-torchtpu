@@ -69,25 +69,28 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
 # per-config cache: it is asked many times per decode step (DP-lockstep checks
 # in the runner and drafter), and TORCH_TPU_DP_SIZE and data_parallel_size are
 # fixed for the life of the process.
-_DP_SIZE_CACHE = [False]
-_dp_size_cache: list = [None, 0]  # [parallel_config, dp_size]
+_dp_size_cache_on = False
+_dp_size_config: Any = None
+_dp_size_value = 0
 
 
 def cache_dp_size(enabled: bool) -> None:
     """Turn get_dp_size's per-config cache on or off (``runner.host_trims``)."""
-    _DP_SIZE_CACHE[0] = bool(enabled)
-    _dp_size_cache[0], _dp_size_cache[1] = None, 0
+    global _dp_size_cache_on, _dp_size_config, _dp_size_value
+    _dp_size_cache_on = bool(enabled)
+    _dp_size_config, _dp_size_value = None, 0
 
 
 def get_dp_size(parallel_config) -> int:
-    if _DP_SIZE_CACHE[0] and _dp_size_cache[0] is parallel_config:
-        return _dp_size_cache[1]
+    global _dp_size_config, _dp_size_value
+    if _dp_size_cache_on and _dp_size_config is parallel_config:
+        return _dp_size_value
     v = (
         int(os.environ.get("TORCH_TPU_DP_SIZE", "0"))
         or parallel_config.data_parallel_size
     )
-    if _DP_SIZE_CACHE[0]:
-        _dp_size_cache[0], _dp_size_cache[1] = parallel_config, v
+    if _dp_size_cache_on:
+        _dp_size_config, _dp_size_value = parallel_config, v
     return v
 
 

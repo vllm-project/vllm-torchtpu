@@ -381,10 +381,11 @@ def test_dp_size_cache(monkeypatch):
     pc1 = types.SimpleNamespace(data_parallel_size=4)
     pc2 = types.SimpleNamespace(data_parallel_size=2)
     monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
-    monkeypatch.setattr(vu, "_dp_size_cache", [None, 0])
-    monkeypatch.setattr(vu, "_DP_SIZE_CACHE", [False])
+    monkeypatch.setattr(vu, "_dp_size_cache_on", False)
+    monkeypatch.setattr(vu, "_dp_size_config", None)
+    monkeypatch.setattr(vu, "_dp_size_value", 0)
     assert vu.get_dp_size(pc1) == 4
-    vu._DP_SIZE_CACHE[0] = True
+    vu.cache_dp_size(True)
     assert vu.get_dp_size(pc1) == 4
     pc1.data_parallel_size = 8  # cached for the same config object
     assert vu.get_dp_size(pc1) == 4
@@ -438,11 +439,11 @@ def test_configure_turns_every_trim_on_and_off(restore_trims):
     host_trims.configure(_config(1, "kv_consumer"))
     assert host_trims.ENABLED and host_trims.AOT_SKIP_GUARDS
     assert host_trims.CONN_STATS_EVERY == host_trims.CONN_STATS_EVERY_ON == 16
-    assert ffc.enabled() and qx._MEMO["on"] and vu._DP_SIZE_CACHE[0]
+    assert ffc.enabled() and qx._MEMO["on"] and vu._dp_size_cache_on
     host_trims.configure(_config(2, "kv_consumer"))
     assert not host_trims.ENABLED and not host_trims.AOT_SKIP_GUARDS
     assert host_trims.CONN_STATS_EVERY == 1
-    assert not ffc.enabled() and not qx._MEMO["on"] and not vu._DP_SIZE_CACHE[0]
+    assert not ffc.enabled() and not qx._MEMO["on"] and not vu._dp_size_cache_on
 
 
 def test_old_environment_switches_are_ignored(monkeypatch, restore_trims):
@@ -504,11 +505,25 @@ def test_scheduler_step_configures_its_process_once(monkeypatch, restore_trims):
 
 
 def test_the_runner_applies_the_rule_when_it_is_built():
-    # Building a TPUModelRunner needs a TPU, so check the call in its source.
+    # No CPU test can build a TPUModelRunner (its __init__ needs a TPU), so
+    # check the parsed __init__: host_trims.configure(self.vllm_config) must
+    # be an unconditional statement of its body (not in a branch, a nested
+    # function or a comment), so every runner applies the rule.
+    import ast
     import inspect
+    import textwrap
 
     from vllm_torchtpu.runner import tpu_runner as tr
 
-    assert "host_trims.configure(self.vllm_config)" in inspect.getsource(
-        tr.TPUModelRunner.__init__
+    init = ast.parse(textwrap.dedent(inspect.getsource(tr.TPUModelRunner.__init__)))
+    body = init.body[0].body
+    calls = [
+        stmt.value
+        for stmt in body
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+    ]
+    assert any(
+        ast.unparse(call.func) == "host_trims.configure"
+        and [ast.unparse(a) for a in call.args] == ["self.vllm_config"]
+        for call in calls
     )
