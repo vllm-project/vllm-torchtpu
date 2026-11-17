@@ -119,11 +119,13 @@ def test_scheduler_override_and_off_switch(monkeypatch):
     monkeypatch.setattr(base, "_make_cached_request_data", fake_super)
 
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = True
     out = s._make_cached_request_data([], [], {}, {}, {})
     assert out.all_token_ids == {"a": [4, 5]}
 
     # A failed trim turns the trim off for the scheduler's lifetime.
     s2 = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s2._is_kv_consumer = True
     s2._trim_resend = False
     out2 = s2._make_cached_request_data([], [], {}, {}, {})
     assert out2.all_token_ids == {"a": [1, 2, 3, 4, 5]}

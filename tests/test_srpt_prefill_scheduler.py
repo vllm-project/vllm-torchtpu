@@ -350,18 +350,21 @@ def test_failed_hold_backs_off_exponentially_per_target(shared_model_config):
 
 
 @pytest.mark.parametrize(
-    ("scheduler_cls", "expected_running", "expected_preempted"),
+    ("scheduler_cls", "decode_leg", "expected_running", "expected_preempted"),
     [
-        # Decoders first moves `dec` to running[0], which leaves `short`
-        # (behind `long` in admission order) at running[-1] to be preempted.
-        (PrefixAwareScheduler, ["dec", "long"], "short"),
+        # Admission order leaves `dec` at running[-1], so it is preempted.
+        (PrefixAwareScheduler, False, ["long", "short"], "dec"),
+        # On a decode leg, decoders first moves `dec` to running[0], which
+        # leaves `short` (behind `long` in admission order) at running[-1].
+        (PrefixAwareScheduler, True, ["dec", "long"], "short"),
         # SRPT order puts `long` at running[-1], so it is preempted instead.
-        (SrptPrefillScheduler, ["dec", "short"], "long"),
+        (SrptPrefillScheduler, False, ["dec", "short"], "long"),
     ],
 )
-def test_kv_pressure_preempts_longest_prefill(
+def test_kv_pressure_preempts_the_last_running_request(
     shared_model_config,
     scheduler_cls,
+    decode_leg,
     expected_running,
     expected_preempted,
 ):
@@ -372,6 +375,9 @@ def test_kv_pressure_preempts_longest_prefill(
         max_num_batched_tokens=48,
         long_prefill_token_threshold=BLOCK_SIZE,
     )
+    if decode_leg:
+        # A KV consumer of prefill/decode disaggregation, without a connector.
+        scheduler._is_kv_consumer = True
     reqs = {
         "long": _make_real_request("long", 64, hasher, seed=1),
         "short": _make_real_request("short", 32, hasher, seed=2),
