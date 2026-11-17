@@ -16,7 +16,8 @@
 One single-request decode bucket (`B=1`, `T=1`). Every layer streams ~122 MB
 of weights per rank, so the tiles keep HBM streaming: equal ~8 MiB dense
 tiles (slot count = byte count), no unrolled matmul (`dmm_unroll=8` lets one
-matmul pin every ring slot) and no lazy refill.
+matmul pin every ring slot) and no lazy refill. The KV write is in-kernel
+(`fused_pool_io`).
 """
 
 from __future__ import annotations
@@ -50,6 +51,9 @@ PROFILE = Profile(
     numerics="exact",
     model_default=True,
     tiles=decode_tiles,
+    # Each layer writes its token's K/V into the pool in-kernel (one 64 KiB
+    # block per layer) instead of a separate scatter program per step.
+    fused_pool_io=True,
     buckets=(1,),
     verify_buckets=(),
     description="Qwen3-VL text decoder: single-request decode, 8 MiB dense tiles.",

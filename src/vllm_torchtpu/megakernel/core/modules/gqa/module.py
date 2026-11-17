@@ -209,7 +209,9 @@ class GQAModule(Module):
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         if cache_exec(ex).FUSED:
-            return fused_io().gqa_fused_outputs(g, ex)
+            return fused_io().gqa_fused_outputs(
+                self.kv_page_shape(g, ex), self.kv_dtype, ex
+            )
         kv_dt = self.kv_dtype if cache_exec(ex).paged_kv else F32
         return [
             StateDecl("knew", (ex.MR, g.HD), kv_dt, access="w"),

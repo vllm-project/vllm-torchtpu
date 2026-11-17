@@ -305,15 +305,6 @@ class PoolLayout:
                 cache_exec(ex).page_size == self.page_size,
                 f"CacheExec.page_size={cache_exec(ex).page_size} != layout page_size",
             )
-            _need(
-                fp8_pages or not cache_exec(ex).FUSED,
-                "fused pool I/O stages fp8 pages only",
-            )
-            _need(
-                self.page_size == VALIDATED_SLOT_PAGE_SIZE or not cache_exec(ex).FUSED,
-                f"fused pool I/O is only validated for page_size="
-                f"{VALIDATED_SLOT_PAGE_SIZE}",
-            )
         if not self.has_recurrent:
             return
         _need(fp8_pages, "recurrent checkpoint slots are packed into fp8 pages")

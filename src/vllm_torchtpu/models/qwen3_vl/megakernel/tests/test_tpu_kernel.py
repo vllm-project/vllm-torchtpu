@@ -17,7 +17,8 @@ A tiny two-layer geometry (one KV head per rank, as the checkpoint at TP=8)
 runs one paged decode step with RoPE from a per-row table at an M-RoPE
 position 7 below the KV index, and the ungated attention, bf16 KV pages and
 dense FFN through the whole model reference, at the page sizes vLLM picks:
-128 tokens, and 512 when its SMEM page-table bound raises the block size.
+128 tokens, and 512 when its SMEM page-table bound raises the block size. The
+in-kernel KV write (`fused_pool_io`) matches the scatter program bitwise.
 """
 
 from __future__ import annotations
@@ -94,14 +95,36 @@ def test_kernel_matches_model_reference(page_size: int, kv_blk: int) -> None:
         g, ex, pos, hid, w_l, st_l, extra={ROPE_TABLE_INPUT: rope_cs}
     )
 
-    pos_k, hid_k, w_k, st_k = pack_inputs(
-        pos, hid, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True, model_def=mdef
-    )
     lay = dataclasses.replace(mdef.pool_layout(g, R=R), page_size=page_size)
     spec = mdef.to_model_spec(g, R=R).with_layout(lay)
-    step = cache.make_pooled_step(mesh, spec, ex)
     rope_k = jax.device_put(jnp.tile(rope_cs, (R, 1, 1)), NamedSharding(mesh, P("tp")))
-    out, st_out = step(pos_k, hid_k, w_k, st_k, rope_k)
+
+    def run(fused: bool) -> tuple[jax.Array, dict]:
+        pos_k, hid_k, w_k, st_k = pack_inputs(
+            pos,
+            hid,
+            w_l,
+            st_l,
+            g,
+            ex,
+            mesh=mesh,
+            build_default_pool=True,
+            model_def=mdef,
+        )
+        step = cache.make_pooled_step(
+            mesh, spec, ex, donate_pools=fused, fused_pool_io=fused
+        )
+        return step(pos_k, hid_k, w_k, st_k, rope_k)
+
+    out, st_out = run(fused=False)
+    # The in-kernel KV write (one 128-lane block RMW per layer) leaves the same
+    # pools and hidden states as the scatter program.
+    out_f, st_f = run(fused=True)
+    np.testing.assert_array_equal(np.asarray(out_f), np.asarray(out))
+    for a, b in zip(st_f[pool.POOL_STATE_NAME], st_out[pool.POOL_STATE_NAME]):
+        np.testing.assert_array_equal(
+            np.asarray(a).view(np.uint16), np.asarray(b).view(np.uint16)
+        )
 
     out = np.asarray(out, np.float32).reshape(R, ex.M, g.H)[:, : ex.B]
     ref = np.asarray(ref_out, np.float32)

@@ -448,7 +448,7 @@ def gqa_scratch(ex: ExecSpec, ap: GQAParams) -> dict[str, Any]:
     if not cache_exec(ex).FUSED:
         scr["kv_out_sem"] = pltpu.SemaphoreType.DMA((2,))
     else:
-        scr.update(fused_io().gqa_fused_scratch(ex, ap.HD))
+        scr.update(fused_io().gqa_fused_scratch(ex, ap))
     if cache_exec(ex).paged_kv:
         item = (2, ap.HD // ap.KV_PK, ap.KV_PK, ap.BLK)
         if ap.KVS_IPT and ex.interpret:  # typed stand-in for the dense pool banks
