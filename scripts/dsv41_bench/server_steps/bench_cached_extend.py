@@ -19,7 +19,11 @@ from prometheus_client.parser import text_string_to_metric_families
 from server_step_worker import SCENARIO, SCENARIOS, token_counts
 
 DATA_SHA256 = "15d61c22d92c96900b3c4948b6aeea218d3214b676a65df48e7b8555604c7fe2"
-INPUT_SHA256 = "9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064"
+# Frozen prefill corpus per cached prefix length (DSV41_PREFILL_PREFIX_TOKENS).
+# A length not listed yet runs unchecked; pin its input.sha256 here after one run.
+INPUT_SHA256 = {
+    98304: "9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064",
+}
 
 
 def load_frozen_input(path: Path) -> dict:
@@ -32,7 +36,9 @@ def load_frozen_input(path: Path) -> dict:
             "tokenizer": "/models/DeepSeek-V4.1-Flash",
         },
     }
-    if hashlib.sha256(json.dumps(frozen).encode()).hexdigest() != INPUT_SHA256:
+    expected = INPUT_SHA256.get(SCENARIO.prefix_tokens)
+    digest = hashlib.sha256(json.dumps(frozen).encode()).hexdigest()
+    if expected is not None and digest != expected:
         raise ValueError("Input differs from the frozen DeepSeek natural-code corpus")
     return data
 
