@@ -165,7 +165,7 @@ def weighted_sum(
     # with headroom, never over the chip's budget.
     itemsize = jnp.dtype(out_dtype).itemsize
     needed = (
-        2 * top_k * tokens_per_tile * staged
+        2 * top_k * tokens_per_tile * staged * jnp.dtype(rows.dtype).itemsize
         + 2 * tokens_per_tile * hidden * itemsize
         + tokens_per_tile * staged * jnp.dtype(stage_dtype).itemsize
     )

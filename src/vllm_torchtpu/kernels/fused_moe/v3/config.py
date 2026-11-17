@@ -365,10 +365,10 @@ class Config:
             raise ValueError(
                 f"scatter_chunk_pairs {self.scatter_chunk_pairs}: a multiple of {LANES}"
             )
-        if self.scatter_ring < 1:
+        if self.scatter_ring < 2:
             raise ValueError(
-                f"scatter_ring {self.scatter_ring}: at least one "
-                "scatter chunk in flight"
+                f"scatter_ring {self.scatter_ring}: at least two slots (a "
+                "chunk's fetch is issued when an earlier chunk retires)"
             )
         if self.combine_tokens_per_tile <= 0 or self.combine_tokens_per_tile % SUBLANES:
             raise ValueError(

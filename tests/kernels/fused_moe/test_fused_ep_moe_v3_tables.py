@@ -239,3 +239,13 @@ def test_shard_tables_match_the_reference(interpret, unrouted):
             np.asarray(tables.visit_order(want_rows, EXPERTS // SHARDS)),
         )
         np.testing.assert_array_equal(np.asarray(run_rows), np.asarray(ref.run_rows))
+
+
+def test_the_config_takes_the_scatter_ring_the_scatter_takes():
+    """Config refuses a one-slot scatter ring, as scatter_row_tables does (a
+    chunk's fetch is issued when an earlier chunk retires)."""
+    from vllm_torchtpu.kernels.fused_moe.v3.config import Config
+
+    Config(scatter_ring=2)
+    with pytest.raises(ValueError, match="scatter_ring 1"):
+        Config(scatter_ring=1)

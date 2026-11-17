@@ -273,8 +273,6 @@ def _gather_body(*refs, run, block_rows, ring, with_scales):
     subcore = lax.axis_index((CORE_AXIS, SUBCORE_AXIS))
     base = subcore * run
     n_blocks = run // block_rows
-    lanes = pltpu.get_tpu_info().sparse_core.num_lanes
-    lax.broadcasted_iota(jnp.int32, (lanes,), 0)
 
     fetch = pltpu.make_async_copy(
         index_hbm.at[pl.ds(base, run)], index_vmem, scale_store_sems.at[ring]
