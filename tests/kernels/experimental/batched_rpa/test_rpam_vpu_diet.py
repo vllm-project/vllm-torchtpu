@@ -150,7 +150,10 @@ def _run(monkeypatch, inputs, diet, k_scale=None, prefill_blocks=None, **kw):
         kv_layout=_LAYOUT,
         decode_query_size=4,
         prefill_block_sizes=prefill_blocks,
+        # Default tiles and call structure: those of the Qwen3.5 TP8 decode
+        # shape above.
         tuned_tiles=True,
+        skip_empty_mixed=True,
         **kw,
     )
     out = jax.block_until_ready(out)
