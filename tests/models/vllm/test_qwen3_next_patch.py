@@ -1550,3 +1550,23 @@ def test_patched_sparse_moe_forward_v2_owns_combine_no_double_all_reduce(monkeyp
     # Expected: routed_out (2.0) + tp * shared_partial (8 * 0.25 = 2.0) = 4.0
     torch.testing.assert_close(out, routed_out + shared_partial * tp)
 
+
+def test_sp_row_decision_inside_and_outside_shape_variant_warmup(monkeypatch):
+    """A trace outside shape_variants.warmup() takes the caller's
+    sequence-parallel decision; inside it, the trace compares its own token
+    count with the SP row minimum."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    assert not shape_variants.in_warmup()
+    with shape_variants.warmup():
+        assert shape_variants.in_warmup()
+    assert not shape_variants.in_warmup()
+
+    monkeypatch.setattr(patch_mod.sequence_parallel, "is_active", lambda: True)
+    monkeypatch.setattr(patch_mod.sequence_parallel, "min_rows", lambda: 512)
+    assert not patch_mod._rows_are_sequence_parallel(4)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert patch_mod._rows_are_sequence_parallel(4)
+    with shape_variants.warmup():
+        assert not patch_mod._rows_are_sequence_parallel(4)
+        assert patch_mod._rows_are_sequence_parallel(512)
