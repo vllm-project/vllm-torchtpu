@@ -31,8 +31,11 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
 
 def _native_fp8(cfgs: configs.RpaConfigs) -> configs.NativeFp8:
+    """The kernel's native fp8 matmuls: the DECODE modes in DECODE, the
+    prefill modes in PREFILL and MIXED."""
     if cfgs.mode == configs.RpaCase.DECODE:
         return cfgs.serve.native_fp8
+    return cfgs.serve.native_fp8_prefill
 
 
 # The softmax weights are at most 1. The static PV path casts p * P_SCALE
@@ -45,7 +48,10 @@ P_SCALE = 256.0
 def static_pv(cfgs: configs.RpaConfigs) -> bool:
     """Whether PV takes fp8 weights at the static scale P_SCALE.
 
+    `configs.ServingConfigs` rejects a STATIC PV with per-token V scales,
+    which multiply p before the cast and can push it past the fp8 range.
     """
+    return _native_fp8(cfgs).pv is configs.Fp8Operand.STATIC
 
 
 def decode_exp2(cfgs: configs.RpaConfigs) -> bool:
@@ -177,6 +183,7 @@ def flash_attention_qk_softmax(
     row_scale = None
     qk_operand = _native_fp8(cfgs).qk
     native_qk = qk_operand is not configs.Fp8Operand.OFF
+    static_qk = qk_operand is configs.Fp8Operand.STATIC
     split_qk = qk_operand is configs.Fp8Operand.SPLIT
     use_exp2 = decode_exp2(cfgs)
     base_scale = math.log2(math.e) if use_exp2 else 1.0

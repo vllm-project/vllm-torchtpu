@@ -114,10 +114,24 @@ def _reference(inp, reqs):
     return np.asarray(jnp.concatenate(outs, axis=0))
 
 
+_ROW, _STATIC = configs.Fp8Operand.ROW, configs.Fp8Operand.STATIC
+# q at 3 mantissa bits dominates the native QK rows, as in the decode test.
+_MODES = {
+    "off": (configs.NativeFp8(), 0.03),
+    "pv": (configs.NativeFp8(pv=_ROW), 0.03),
+    "pv_static": (configs.NativeFp8(pv=_STATIC), 0.03),
+    "qk_static": (configs.NativeFp8(qk=_STATIC), 0.12),
+    "qk_static_pv_static": (configs.NativeFp8(qk=_STATIC, pv=_STATIC), 0.12),
+}
+
+
+@pytest.mark.parametrize("mode", list(_MODES))
 @pytest.mark.parametrize(
     "reqs",
     [[(4096 + 37, 300)], [(0, 1024), (9000 + 61, 513), (1280, 7)]],
 )
+def test_prefill_fp8_kv(mode, reqs):
+    native_fp8_prefill, tol = _MODES[mode]
     if not jtu.is_device_tpu_at_least(version=7):
         pytest.skip("Expect TPU v7+ (native fp8 MXU)")
     inp = _inputs(reqs)
@@ -136,9 +150,13 @@ def _reference(inp, reqs):
         v_scale=1.0,
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         native_fp8_prefill=native_fp8_prefill,
+        # The tiles and call structure of the Qwen3.5 shapes these modes are
+        # tuned for.
         tuned_tiles=True,
+        skip_empty_mixed=True,
     )
     t = sum(n for _, n in reqs)
     out = np.asarray(out[:t].astype(jnp.float32))
     assert not np.isnan(out).any()
     rel = np.linalg.norm(out - ref) / np.linalg.norm(ref)
+    assert rel < tol, rel
