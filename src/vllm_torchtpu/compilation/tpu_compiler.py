@@ -135,9 +135,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
-    # API-server prompt tokenization and data-parallel request routing: they
-    # act in the front end and in the engine core's stats message, never in
-    # the compiled model.
+    # API-server prompt tokenization and detokenization, and data-parallel
+    # request routing: they act in the front end and in the engine core's
+    # stats message, never in the compiled model.
     "VLLM_TPU_SEGMENT_TOKENIZE",
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS",
     "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS",
@@ -147,6 +147,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS",
     "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN",
     "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE",
+    "VLLM_TPU_DETOK_PRIME_SUFFIX",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, offload retry and drain limits, a weight-load sync cadence, a
     # debug log switch, and the local-rank offsets, which move a worker to a
