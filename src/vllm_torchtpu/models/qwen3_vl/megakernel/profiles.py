@@ -31,10 +31,11 @@ MODEL_NAME = "qwen3_vl_text"
 # vLLM rotates q / k in float32 (`layers/adapter/rotary_embedding.py`). The KV
 # blocks share the dense ring, so its 7 banks (58 MiB of scratch, under the
 # 62 MiB Mosaic limit at B=1) hold the lookahead of both: 3459 us vs 3654 at
-# 6 banks for a 64k-token context, the same at 8k.
+# 6 banks for a 64k-token context, the same at 8k. `pair_kv` overlaps one KV
+# block's softmax with the next one's matmuls: 3449 -> 3063 us at 64k.
 DECODE_TILES = Tiles(
     bank=8 << 20, nbd=7, hier=1, mb8=2, lazy=False, dmm_unroll=1
-).with_modules({GQAModule.name: {"rope_fp32": True}})
+).with_modules({GQAModule.name: {"rope_fp32": True, "pair_kv": True}})
 
 
 def decode_tiles(tc: TileContext | int) -> Tiles:
