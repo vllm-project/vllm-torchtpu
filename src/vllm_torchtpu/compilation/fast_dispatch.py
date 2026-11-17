@@ -27,6 +27,15 @@ both options default to off):
   ``GLOBAL_STATE`` guards (CPU intra-op ``num_threads``, ``grad_mode``) so
   warmup entries are reused across threads while preserving all tensor and
   value guards. Off, the filter keeps every guard.
+
+TODO: Remove this module once PyTorch has a public guarded call path for
+``fullgraph`` compiled functions (an upstream issue is to be filed). Until
+then it relies on Dynamo internals, checked against torch 2.13.0 (git
+cf30153c4c13): ``torch._C._dynamo.eval_frame._get_cache_entries_for_region``
+and ``_get_total_cache_entry_count``, each cache entry's ``code`` and
+``guard_manager.check``, the compiled wrapper's ``_isolate_recompiles_id``,
+``torch._dynamo.eval_frame._stance``, and calling an entry's transformed code
+object directly. A torch upgrade must re-check them.
 """
 
 from __future__ import annotations
@@ -43,7 +52,9 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-_STATS = [0, 0]  # [fast, slow]
+# [fast, slow] calls, counted over every wrapped function of the process;
+# logged at INFO every _LOG_EVERY calls so serving logs show the hit rate.
+_STATS = [0, 0]
 _LOG_EVERY = 20000
 _INSTALLED = False
 # Armed by configure(); both off until the worker applies tpu_compile.
@@ -66,10 +77,7 @@ def configure(fast: bool, drop_global_state: bool) -> None:
 
 
 def _region_entries(code: types.CodeType, region: int) -> list:
-    getter = getattr(_c_eval_frame, "_get_cache_entries_for_region", None)
-    if getter is not None:
-        return list(getter(code, region))
-    return list(_c_eval_frame._debug_get_cache_entry_list(code))
+    return list(_c_eval_frame._get_cache_entries_for_region(code, region))
 
 
 def _entry_count(code: types.CodeType) -> int:
@@ -78,7 +86,7 @@ def _entry_count(code: types.CodeType) -> int:
 
 def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
     code = fn.__code__
-    region = getattr(compiled, "_isolate_recompiles_id", -1)
+    region = compiled._isolate_recompiles_id
     flags = code.co_flags
     simple_sig = not (flags & inspect.CO_VARARGS or flags & inspect.CO_VARKEYWORDS)
     nargs = code.co_argcount
@@ -88,7 +96,6 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
     sig = inspect.signature(fn)
     stance_mod = torch._dynamo.eval_frame
     state: dict[str, Any] = {
-        "entry": None,  # (guard_manager, direct_fn, entry_count)
         "entries": [],  # MRU list of (guard_manager, direct_fn)
         "count": -1,
         "disabled": not simple_sig,
@@ -112,7 +119,6 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
         return f_locals
 
     def _refresh(f_locals: dict | None) -> None:
-        state["entry"] = None
         state["entries"] = []
         state["count"] = -1
         if f_locals is None:
@@ -152,10 +158,8 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 return
             if mru_idx > 0:
                 built.insert(0, built.pop(mru_idx))
-            count = _entry_count(code)
             state["entries"] = built
-            state["count"] = count
-            state["entry"] = (built[0][0], built[0][1], count)
+            state["count"] = _entry_count(code)
         except Exception:  # noqa: BLE001 - fall back to dynamo for good
             state["disabled"] = True
             logger.warning(
@@ -184,13 +188,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                     for idx, (gm, direct) in enumerate(entries):
                         if gm.check(f_locals):
                             if idx > 0:
-                                item = entries.pop(idx)
-                                entries.insert(0, item)
-                                state["entry"] = (
-                                    item[0],
-                                    item[1],
-                                    state["count"],
-                                )
+                                entries.insert(0, entries.pop(idx))
                             if not state["logged"]:
                                 state["logged"] = True
                                 logger.info(
