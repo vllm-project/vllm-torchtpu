@@ -256,6 +256,8 @@ class PrefixAwareScheduler(AsyncScheduler):
                     _hit_signature(fresh[2])[:2],
                 )
                 self._memo_xstep = False
+                # Nothing trims the change log once the memo is off.
+                prefix_change_log.disable(self.kv_cache_manager.block_pool)
                 return fresh
             self._memo_verified += 1
             return fresh

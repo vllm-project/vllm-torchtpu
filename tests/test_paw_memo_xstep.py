@@ -255,6 +255,32 @@ def test_runtime_verifier_agrees(patched_pool):
     assert s._memo_xstep and s._memo_verified > 100 and s._memo_hits == 0
 
 
+def test_memo_mismatch_turns_the_change_log_off(patched_pool):
+    """Once a verified reuse disagrees, the cross-step memo is off and nothing
+    trims the change log, so the pool must stop keeping it."""
+    mgr = _manager(64)
+    d = mgr.block_pool.__dict__
+    s = _paw(mgr, verify=10)
+    req = _req("m1", list(range(13)))
+    max_len = req.num_tokens - 1
+    cached = s._memo_compute(req, s._get_prefix_cache_epoch(), max_len)
+    # Unrelated inserts move the epoch without touching req's probed hashes.
+    other = _req("m2", list(range(500, 513)))
+    assert mgr.allocate_slots(other, other.num_tokens) is not None
+    mgr.new_step_starts()
+    epoch = s._get_prefix_cache_epoch()
+    assert epoch != cached[0] and s._memo_still_exact(cached, epoch)
+    wrong = (cached[2][0], cached[2][1] + 4, cached[2][2])
+    req._paw_hit_cache = cached[:2] + (wrong,) + cached[3:]
+    assert s._memo_get(req, epoch, max_len)[2][1] == cached[2][1]
+    assert not s._memo_xstep
+    assert prefix_change_log.LOG not in d
+    late = _req("m3", list(range(900, 913)))
+    assert mgr.allocate_slots(late, late.num_tokens) is not None
+    mgr.new_step_starts()
+    assert prefix_change_log.LOG not in d
+
+
 def test_change_log_install_is_idempotent_over_the_same_step_patch(patched_pool):
     assert prefix_change_log.install()
     wrapped = BlockPool._insert_block_hash
