@@ -590,7 +590,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights
             )
-        if moe_ep_cap.ENABLED and moe_ep_cap.applies(layer, x.shape[0]):
+        if moe_ep_cap.ENABLED and moe_ep_cap.applies(layer):
             # Decode steps: cap each EP rank's distinct experts (changes numerics).
             topk_ids, topk_weights = moe_ep_cap.apply(
                 layer, topk_ids, topk_weights, router_logits

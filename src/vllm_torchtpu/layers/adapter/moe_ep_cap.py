@@ -19,7 +19,7 @@ to, and the MoE all-reduce waits for the rank with the most distinct experts.
 Served routing is uneven per step (the tokens of one request share experts),
 so the busiest rank holds several more experts than the mean.
 
-On, in steps of at most ``max_tokens`` tokens, every rank keeps at most
+On, in steps of at most ``max_tokens`` tokens (an in-graph mask), every rank keeps at most
 ``ceil(D / ep) + slack`` of its hit experts (``D`` = experts hit by the step),
 ranked by routed weight; an expert that is some token's top-1 is always kept.
 Routes to an expert that is not kept are
@@ -108,9 +108,13 @@ def ep_size_of(layer: Any) -> int:
     return int(moe_config.ep_size)
 
 
-def applies(layer: Any, num_tokens: int) -> bool:
-    """Static (trace-time) gate: on, EP, linear placement, a decode-size step."""
-    if SPEC is None or num_tokens > SPEC.max_tokens:
+def applies(layer: Any) -> bool:
+    """Static (trace-time) gate: on, EP, linear placement, target model.
+
+    Deliberately independent of the token count: a python branch on it would
+    split the traced backbone per bucket (compilation/shape_variants.py). The
+    ``max_tokens`` limit is applied in-graph instead (``cap_routes``)."""
+    if SPEC is None:
         return False
     if getattr(layer, "_rx_plan", None) is not None:  # redundant experts own it
         return False
@@ -129,6 +133,7 @@ def cap_routes(
     slack: int,
     mode: str = "drop",
     sub_topn: int = 0,
+    max_tokens: int | None = None,
     router_logits: torch.Tensor | None = None,
     score_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -145,14 +150,13 @@ def cap_routes(
     ids = topk_ids.long()
     valid = (ids >= 0) & (w != 0)
     safe_ids = torch.where(valid, ids, torch.zeros_like(ids))
-    experts = torch.arange(num_experts, device=device)
-    onehot = (safe_ids.unsqueeze(-1) == experts) & valid.unsqueeze(-1)
-    onehot = onehot.float()  # [T, K, E]
-    count = onehot.sum(dim=(0, 1))
-    mass = (onehot * w.unsqueeze(-1)).sum(dim=(0, 1))
+    flat_ids = safe_ids.flatten()
+    zeros_e = torch.zeros(num_experts, dtype=torch.float32, device=device)
+    count = zeros_e.index_add(0, flat_ids, valid.float().flatten())
+    mass = zeros_e.index_add(0, flat_ids, torch.where(valid, w, 0.0).flatten())
     wmax = torch.where(valid, w, torch.full_like(w, -1.0)).amax(dim=-1, keepdim=True)
     top1 = valid & (w == wmax)
-    protected = (onehot * top1.unsqueeze(-1).float()).amax(dim=(0, 1)) > 0
+    protected = zeros_e.index_add(0, flat_ids, top1.float().flatten()) > 0
     active = count > 0
     key = torch.where(active, mass + _PROTECT * protected.float(), -1.0)
     kr = key.view(ep, per_rank)
@@ -164,6 +168,10 @@ def cap_routes(
     distinct = active.sum()
     cap = torch.div(distinct + (ep - 1), ep, rounding_mode="floor") + slack
     keep = active & ((pos < cap) | protected)
+    if max_tokens is not None:
+        # In-graph (no python branch on the token count): larger steps keep all.
+        tokens = torch.ones_like(ids[:, 0]).sum()
+        keep = keep | (active & (tokens > max_tokens))
     route_keep = valid & keep[safe_ids]
     dropped = valid & ~route_keep
 
@@ -175,7 +183,7 @@ def cap_routes(
         scores = router_logits.float().sigmoid()  # [T, E]
         select = scores if score_bias is None else scores + score_bias.float()
         thresh = torch.topk(select, sub_topn, dim=-1).values[:, -1:]
-        mine = onehot.amax(dim=1) > 0  # [T, E] the token's own (valid) experts
+        mine = torch.zeros_like(scores).scatter(1, safe_ids, valid.float()) > 0
         cand_ok = keep.unsqueeze(0) & ~mine & (select >= thresh)
         cand_sel = torch.where(cand_ok, select, torch.full_like(select, -1.0e30))
         cand_val, cand_idx = torch.topk(cand_sel, k, dim=-1)  # [T, K]
@@ -234,6 +242,7 @@ def apply(
         slack=SPEC.slack,
         mode=SPEC.mode,
         sub_topn=SPEC.sub_topn,
+        max_tokens=SPEC.max_tokens,
         router_logits=router_logits,
         score_bias=getattr(layer, "e_score_correction_bias", None),
     )

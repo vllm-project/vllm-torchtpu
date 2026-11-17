@@ -124,3 +124,11 @@ def test_parse_spec():
     assert (s.slack, s.mode, s.sub_topn, s.max_tokens) == (0, "sub", 6, 64)
     with pytest.raises(ValueError):
         parse_spec("1:foo")
+
+
+def test_max_tokens_mask_keeps_large_steps():
+    ids, w, logits, bias = _route(48, 2)
+    capped, _, _ = cap_routes(ids, w, num_experts=E, ep=EP, slack=0)
+    assert bool((capped < 0).any())
+    kept, kw, _ = cap_routes(ids, w, num_experts=E, ep=EP, slack=0, max_tokens=32)
+    assert torch.equal(kept, ids) and torch.equal(kw, w)
