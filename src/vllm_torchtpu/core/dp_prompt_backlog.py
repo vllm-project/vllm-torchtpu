@@ -107,7 +107,16 @@ class PendingPrompts:
 
 def make_publisher():
     """A DPEngineCoreProc._maybe_publish_request_counts that also publishes
-    pending prompt tokens and republishes when only they change."""
+    pending prompt tokens and republishes when only they change.
+
+    It replaces DPEngineCoreProc._maybe_publish_request_counts in vLLM's
+    vllm/v1/engine/core.py (v0.31.1rc0, the pinned version) instead of
+    wrapping it: the original publishes only when the request counts change
+    and sends the KV usage as is, which are the two things this one changes.
+    The rest, the SchedulerStats it builds and the (-1, EngineCoreOutputs)
+    message it queues, is the original's body; compare it with upstream
+    when the pin moves.
+    """
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.metrics.stats import SchedulerStats
 
