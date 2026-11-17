@@ -432,6 +432,25 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
+        "section,expert_parallel,error",
+        [
+            ({"small_all_reduce": 1}, True, ValueError),
+            ({"small_all_reduce": True}, False, NotImplementedError),
+        ],
+        ids=["malformed", "without_expert_parallel"],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    def test_check_and_update_config_refuses_a_bad_collectives_section(
+        self, mock_apply_patches, vllm_config, section, expert_parallel, error
+    ):
+        """At the config check, before any weight loads."""
+        vllm_config.additional_config = {"tpu_collectives": section}
+        vllm_config.parallel_config.enable_expert_parallel = expert_parallel
+        with pytest.raises(error, match="small_all_reduce"):
+            TpuPlatform.check_and_update_config(vllm_config)
+        mock_apply_patches.assert_not_called()
+
+    @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
         [
             ("all", None, False, "mamba_cache_mode='align'"),
