@@ -157,9 +157,54 @@ def test_routing_the_kernel_does_not_reproduce_keeps_the_ids_entry(
     assert scores.prebuild(method(), layer, "silu") is None
 
 
-def test_chunk_pipelining_keeps_the_ids_entry(enabled, monkeypatch):
-    monkeypatch.setattr(scores, "enable_pipelined_collective_and_compute", lambda: True)
+@pytest.mark.parametrize("option", ["chunk_pipelining", "fp8_all_gather"])
+def test_rank_local_router_input_keeps_the_ids_entry(enabled, monkeypatch, option):
+    """With either option the FP8 method owns the DP exchange, so vLLM leaves
+    the router input rank-local and only the grouped path gathers it: the
+    scores entry is declined and the routed-ids entry (inside the grouped
+    path, after its gather) stays armed."""
+    if option == "chunk_pipelining":
+        monkeypatch.setattr(
+            scores, "enable_pipelined_collective_and_compute", lambda: True
+        )
+    else:
+        monkeypatch.setattr(scores.envs, "TPU_MOE_FP8_ALL_GATHER", True)
+    info = Mock()
+    monkeypatch.setattr(scores.logger, "info", info)
     assert scores.prebuild(method(), make_layer(), "silu") is None
+    scores.log_summary()
+    line = info.call_args.args[0] % info.call_args.args[1:]
+    assert line.startswith("moe_lowtok: 1/1 MoE layers armed (scores 0, ids 1)")
+    assert "keeps the router input rank-local" in line
+
+
+def test_fp8_all_gather_forward_gathers_before_the_grouped_kernel(enabled, monkeypatch):
+    """At DP > 1 with TPU_MOE_FP8_ALL_GATHER, vLLM skips its dispatch and
+    combine. The layer must reach pipelined_fused_moe_gmm, which gathers the
+    rows across DP ranks and reduce-scatters the output, not the scores op,
+    which would compute this rank's rows against its own experts only."""
+    monkeypatch.setattr(scores.envs, "TPU_MOE_FP8_ALL_GATHER", True)
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    monkeypatch.setattr(fp8, "enable_pipelined_collective_and_compute", lambda: False)
+    monkeypatch.setattr(scores, "apply", Mock(return_value="lowtok"))
+    monkeypatch.setattr(fp8.moe_routing, "route", Mock(return_value=(None, None)))
+    monkeypatch.setattr(fp8, "pipelined_fused_moe_gmm", Mock(return_value="gathered"))
+    monkeypatch.setattr(fp8, "fused_moe_gmm", Mock(return_value="local"))
+    layer = make_layer()
+    layer.w13_bias = layer.w2_bias = None
+    op = scores.prebuild(method(), layer, "silu")
+    fp8_method = SimpleNamespace(
+        owner=None,
+        _tpu_activation_str="silu",
+        _use_adaptive_fused_moe=False,
+        _moe_lowtok_scores_op=op,
+    )
+    x = torch.empty(16, 512)
+    out = fp8.VllmFp8MoEMethodTPU.apply_monolithic(
+        fp8_method, layer, x, torch.empty(16, 512)
+    )
+    assert out == "gathered"
+    scores.apply.assert_not_called()
 
 
 def test_a_layer_outside_the_backbone_graph_arms_the_scores_entry(enabled, monkeypatch):
