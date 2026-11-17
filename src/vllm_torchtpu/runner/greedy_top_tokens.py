@@ -21,9 +21,10 @@ lowest token id, the same as ``torch.argmax`` over the full logits: the local
 max keeps the first index of its slice and the cross-rank argmax keeps the
 first rank, which owns the lower ids.
 
-Importing this module replaces ``LogitsProcessor.get_top_tokens`` with
-``tpu_get_top_tokens``, which returns the same tokens as vLLM's for a BF16
-head and adds:
+``patch_logits_processor_heads`` (a ``patch_registry`` patch, applied at
+platform activation and worker init) replaces vLLM's
+``LogitsProcessor.get_top_tokens`` with ``tpu_get_top_tokens``, which returns
+the same tokens as vLLM's for a BF16 head and adds:
 
 - a W8A8 FP8 quantized LM head (``quantize_lm_head``), whose local
   max+argmax runs in fused Pallas ops registered by
@@ -32,7 +33,7 @@ head and adds:
   do not bake rank-specific Python integers;
 - a row-major (``dim=0``) all-gather of the pairs.
 
-It also adds ``LogitsProcessor.get_topk_candidates``: for sampled steps whose
+The patch also adds ``LogitsProcessor.get_topk_candidates``: for sampled steps whose
 requests all have ``1 <= top_k <= 32`` (``topk_candidates_step_eligible``),
 each rank keeps its exact local top-32 and only those ``(logit, id)`` pairs
 are exchanged; ``RejectionSampler.fused_verify_and_sample_candidates`` then
@@ -408,7 +409,14 @@ def tpu_get_top_tokens(
     hidden_states: torch.Tensor,
     embedding_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """TPU-optimized vocabulary-parallel greedy ``lm_head + argmax``."""
+    """TPU-optimized vocabulary-parallel greedy ``lm_head + argmax``.
+
+    A copy of vLLM v0.33.0's ``LogitsProcessor.get_top_tokens``
+    (``vllm/model_executor/layers/logits_processor.py``) with the changes the
+    module docstring lists. It replaces the method rather than wrapping it:
+    the W8A8 head never computes the logits the original starts from, and the
+    tensor shard bounds and the ``dim=0`` all-gather change the BF16 body too.
+    """
     if self.scale <= 0.0 and self.scale != 1.0:
         raise ValueError(
             f"scale must be > 0.0 for greedy argmax reduction, got {self.scale}"
@@ -510,9 +518,6 @@ def tpu_get_top_tokens(
     max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
     top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
     return top_tokens.squeeze(-1).to(torch.int64)
-
-
-LogitsProcessor.get_top_tokens = tpu_get_top_tokens
 
 
 def _extract_local_topk32_torch(
@@ -713,7 +718,17 @@ def tpu_get_topk_candidates(
     return torch.cat([cand_logits, cand_token_ids], dim=-1)
 
 
-LogitsProcessor.get_topk_candidates = tpu_get_topk_candidates
+def patch_logits_processor_heads() -> None:
+    """Install ``tpu_get_top_tokens`` as vLLM's ``LogitsProcessor.get_top_tokens``
+    and add ``LogitsProcessor.get_topk_candidates``.
+
+    Registered in ``patch_registry.PATCHES`` for platform activation and
+    worker init, so every process that runs a model has it before its first
+    step, whatever the greedy top-token and candidate settings. Both are
+    plain assignments, so applying the patch again changes nothing.
+    """
+    LogitsProcessor.get_top_tokens = tpu_get_top_tokens
+    LogitsProcessor.get_topk_candidates = tpu_get_topk_candidates
 
 
 def _ensure_head_shard_buffers(

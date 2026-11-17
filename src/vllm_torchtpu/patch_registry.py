@@ -134,6 +134,11 @@ PATCHES = (
         "vllm_torchtpu.layers.adapter.dp_vocab_parallel:register_logits_processor",
         _ACTIVE,
     ),
+    # Greedy top tokens and top-k candidates on the (possibly W8A8) LM head.
+    Patch(
+        "vllm_torchtpu.runner.greedy_top_tokens:patch_logits_processor_heads",
+        _ACTIVE,
+    ),
     Patch(
         "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
         _ENGINE,
