@@ -126,28 +126,47 @@ def _xla_plan(exchange, me, ids, layout, t_local, topk, e_total, block, stride):
     )
 
 
-@pytest.mark.parametrize("kind", ["uniform", "skewed", "nowhere"])
-@pytest.mark.parametrize(
-    "t_local,topk,e_total",
-    [(8, 6, 384), (16, 6, 384), (32, 6, 384), (40, 6, 384), (16, 3, 128)],
-)
-def test_plan_kernel_matches_the_sharded_xla_plan(kind, t_local, topk, e_total):
-    T = EP * t_local
-    block = routing_block(t_local, topk)
-    stride = ragged_stride_bound(T, topk, e_total, TILE_M)
+def _plan_shape(t_local, topk, e_total):
     layout = layer._exchange_layout(t_local, topk, e_total, True)
-    shape = PlanShape(
+    return PlanShape(
         ep=EP,
         e_total=e_total,
         topk=topk,
         t_local=t_local,
-        block=block,
+        block=routing_block(t_local, topk),
         tile_m=TILE_M,
-        shard_stride=stride,
+        shard_stride=ragged_stride_bound(EP * t_local, topk, e_total, TILE_M),
         scale_at=layout[0],
         count_at=layout[1],
         width=layout[2],
     )
+
+
+def test_plan_kernel_admits_at_most_one_lane_row_of_local_experts():
+    """The visit list ranks a shard's experts within one 128-lane row, so a
+    shard with more local experts takes the XLA plan."""
+    assert plan_kernel_fits(_plan_shape(8, 6, EP * 128))
+    assert not plan_kernel_fits(_plan_shape(8, 6, EP * 136))
+    assert not plan_kernel_fits(_plan_shape(8, 6, EP * 256))
+
+
+@pytest.mark.parametrize("kind", ["uniform", "skewed", "nowhere"])
+@pytest.mark.parametrize(
+    "t_local,topk,e_total",
+    [
+        (8, 6, 384),
+        (16, 6, 384),
+        (32, 6, 384),
+        (40, 6, 384),
+        (16, 3, 128),
+        (8, 6, EP * 128),
+    ],
+)
+def test_plan_kernel_matches_the_sharded_xla_plan(kind, t_local, topk, e_total):
+    T = EP * t_local
+    shape = _plan_shape(t_local, topk, e_total)
+    block, stride = shape.block, shape.shard_stride
+    layout = layer._exchange_layout(t_local, topk, e_total, True)
     assert plan_kernel_fits(shape)
 
     ids = _routing(kind, t_local, topk, e_total, seed=t_local * 31 + topk)

@@ -117,6 +117,7 @@ def plan_kernel_fits(shape: PlanShape) -> bool:
         shape.ep == SUBLANES
         and shape.e_total % shape.ep == 0
         and shape.g_local % SUBLANES == 0
+        and shape.g_local <= LANES
         and PACKED_TABLES * shape.ep <= PACKED_ROWS_LANE
         and shape.pair_lanes <= MAX_PAIR_LANES
         and shape.scale_at == shape.pair_lanes
