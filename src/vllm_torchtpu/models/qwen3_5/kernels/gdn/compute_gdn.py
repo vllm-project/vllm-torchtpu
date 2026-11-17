@@ -17,6 +17,10 @@
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
 # Changes from the source:
+# - recurrent_gdn_per_seq builds each token's k^T broadcast in the chain (one
+#   sublane broadcast and transpose per kq head) when it gets no precomputed
+#   k^T, and recurrent_gdn passes none; only the one-token decode path
+#   transposes k up front.
 # - chunked_gdn_per_seq computes (beta k) k^T as diag(beta) (k k^T), one dot
 #   per kq head, at config.SHARED_KKT_SHAPES only.
 

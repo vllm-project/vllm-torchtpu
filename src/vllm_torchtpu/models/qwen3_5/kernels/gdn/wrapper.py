@@ -17,8 +17,19 @@
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
 # Changes from the source:
+# - fused_conv1d_gdn's bf16_qkv_mode (default 2): a bf16 qkv streams as 2D
+#   rows that inner_kernel unpacks to f32; mode 0 casts it first, as the
+#   source does.
+# - inner_kernel takes a PER_SEQ chunked tile's conv state lazily
+#   (_lazy_conv_state): the static tail on a full tile, the rows ending at
+#   its last real token on a partial one.
+# - A lax.cond skips the PER_SEQ call on decode-only steps of the pooled
+#   (unified block pool) path.
+# - The chunk is clipped to the batch before the 2D qkv check reads it;
+#   main clips it only in its static-tiling branch.
 # - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
 #   (main lists the source's errors in .pyrefly-baseline-full.json).
+# - A comment typo.
 # No change targets AttentionMode.KDA, which this copy's callers never pass;
 # see compute_kda.py.
 
@@ -653,7 +664,7 @@ def fused_conv1d_gdn(
         # the pool block only ever has to hold a single state.
         assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1)
     else:
-        # Iniitalize the ckpt_indices to default value.
+        # Initialize the ckpt_indices to default value.
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
     assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None), (
