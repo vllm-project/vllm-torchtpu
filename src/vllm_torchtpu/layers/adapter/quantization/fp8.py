@@ -88,6 +88,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    PrequantLinearMethod,
     quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -1348,7 +1349,7 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
 
 
 @register_weight_loader_v2_supported_method
-class VllmFp8LinearMethodTPU(Fp8LinearMethod):
+class VllmFp8LinearMethodTPU(Fp8LinearMethod, PrequantLinearMethod):
     """
     TPU FP8 linear method that keeps weights in FP8 at runtime and quantizes
     activations dynamically inside a Pallas matmul bridge, unless
