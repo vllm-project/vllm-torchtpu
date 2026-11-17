@@ -159,7 +159,7 @@ def test_a_malformed_option_fails_at_prebuild(monkeypatch, fresh):
 def test_forms_are_the_dp_tp_decode_values():
     assert (op.DISPATCH_FORM, op.COMBINE_FORM) == ("hier", "hier")
     assert op.RING_DEPTH == 1
-    assert op.GATHER_ROWS is True
+    assert op.ROUTED_ROW_GATHER is True
 
 
 @pytest.fixture
@@ -289,3 +289,34 @@ def test_prebuild_without_an_engine_config_uses_the_default_options(monkeypatch,
     op.prebuild(None, TOPK)
     assert op._ARMED is True
     assert op._FP8_DISPATCH is True
+
+
+def _moe_layer(use_ep=True, topk=TOPK):
+    return SimpleNamespace(
+        moe_config=SimpleNamespace(
+            experts_per_token=topk,
+            moe_parallel_config=SimpleNamespace(use_ep=use_ep),
+        )
+    )
+
+
+def test_maybe_prebuild_arms_for_a_scores_layer_under_ep(monkeypatch):
+    """The FP8 MoE method's weight processing calls it for every MoE layer."""
+    config = _config()
+    prebuild = Mock(name="prebuild")
+    monkeypatch.setattr(op, "prebuild", prebuild)
+    monkeypatch.setattr(op, "get_current_vllm_config_or_none", lambda: config)
+    op.maybe_prebuild(_moe_layer(), object())
+    prebuild.assert_called_once_with(config, TOPK)
+
+
+@pytest.mark.parametrize(
+    "use_ep,scores_op",
+    [(False, object()), (True, None)],
+    ids=["no_expert_parallelism", "no_scores_entry"],
+)
+def test_maybe_prebuild_leaves_other_layers(monkeypatch, use_ep, scores_op):
+    prebuild = Mock(name="prebuild")
+    monkeypatch.setattr(op, "prebuild", prebuild)
+    op.maybe_prebuild(_moe_layer(use_ep=use_ep), scores_op)
+    prebuild.assert_not_called()

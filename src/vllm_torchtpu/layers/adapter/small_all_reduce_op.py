@@ -141,7 +141,7 @@ def _build_tp_all_reduce(mesh, tp: int, form: str | None):
             return jax.lax.psum(block, axis_name="tp_")
         with sc_common.mesh_axes(("dp_", "tp_")):
             return all_reduce.small_all_reduce(
-                block, num_cores=tp, axis="tp_", rank=rank, form=form or None
+                block, num_cores=tp, axis="tp_", rank=rank, form=form
             )
 
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
