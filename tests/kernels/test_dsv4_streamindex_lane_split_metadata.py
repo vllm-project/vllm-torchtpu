@@ -69,3 +69,26 @@ def test_request_cut_by_the_slice_end_loses_only_its_tail():
         jnp.array([100], jnp.int32), jnp.array([0, 10], jnp.int32), jnp.int32(6), 6
     )
     assert s.tolist() == [100] and c.tolist() == [0, 4]
+
+
+def test_request_outside_the_slice_gets_length_zero():
+    # A 24-token request on a 5000-token context behind a 1000-token one.
+    seq_lens = jnp.array([1000, 5024], jnp.int32)
+    cu = jnp.array([0, 1000, 1024], jnp.int32)
+    s, c = metadata.lane_slice_q_metadata(seq_lens, cu, jnp.int32(0), 512)
+    assert s.tolist() == [512, 0] and c.tolist() == [0, 512, 512]
+    s, c = metadata.lane_slice_q_metadata(seq_lens, cu, jnp.int32(512), 512)
+    assert s.tolist() == [1000, 5024] and c.tolist() == [0, 488, 512]
+    # The reviewer case: a new request behind the slice used to go negative.
+    s, _ = metadata.lane_slice_q_metadata(
+        jnp.array([1000, 24], jnp.int32), cu, jnp.int32(0), 512
+    )
+    assert s.tolist() == [512, 0]
+    # A request wholly before the slice scans nothing either.
+    s, _ = metadata.lane_slice_q_metadata(
+        jnp.array([600, 24], jnp.int32),
+        jnp.array([0, 600, 624], jnp.int32),
+        jnp.int32(612),
+        12,
+    )
+    assert s.tolist() == [0, 24]

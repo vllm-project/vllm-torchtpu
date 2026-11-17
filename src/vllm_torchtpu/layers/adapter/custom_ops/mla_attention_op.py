@@ -627,6 +627,7 @@ def _gather_linear_output_channels(
         out = _index_select_bits(gathered, axis, index)
         new._parameters[name] = Parameter(out, requires_grad=False)
     if hasattr(new, "output_size_per_partition"):
+        # pyrefly: ignore[bad-argument-type]
         new.output_size_per_partition = index.numel()
     tensors = [p for p in new._parameters.values() if p is not None]
     if tensors and tensors[0].device.type == "tpu":
@@ -2395,6 +2396,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
             else:
                 self.ts_lanes = lanes
+                # pyrefly: ignore[bad-argument-type]
                 self.mla_attn.token_split_head_order = dcp_token_split.head_order(
                     self.dcp_group_size, lanes, self.num_heads
                 )
@@ -2435,6 +2437,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         """TPU_DCP_MLA_TOKEN_SPLIT: the q projection over every head in
         `dcp_token_split.head_order`, from the processed (rope-permuted) q_b."""
         layer = self._q_proj_layer()
+        assert layer is not None
         if getattr(layer, PREQUANT_ATTR, None) is not None:
             logger.warning_once(
                 "TPU_DCP_MLA_TOKEN_SPLIT: q_b takes a prequantized input; off"
@@ -2609,7 +2612,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 if token_split:
                     # This lane's tokens, every head (the q_b overlap is off here).
                     q_c_lane = dcp_token_split.lane_rows(q_c, self.ts_lane, lanes)
-                    q_b_ts = self.q_b_ts
+                    # A LinearBase kept in __dict__, so typed as a Tensor.
+                    q_b_ts = cast(Any, self.q_b_ts)
                     q = q_b_ts.quant_method.apply(
                         q_b_ts, q_c_lane, getattr(q_b_ts, "bias", None)
                     )
@@ -2682,6 +2686,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 _, k_pe = rope(positions, k_pe, k_pe)
             else:
                 q_pe, k_pe = rope(positions, q_pe, k_pe)
+            assert k_pe is not None
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the
             # cache dtype, and queries should remain in the activation dtype.
