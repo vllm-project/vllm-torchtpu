@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The few-token MoE with its DP dispatch and EP combine in the kernel, on a
-(dp, tp) = (4, 2) mesh of 8 CPU devices.
+(dp, tp) = (4, 2) mesh.
 
-The device checks run this file as a script in a subprocess, because the
-host device count (XLA_FLAGS) must be set before JAX starts. They use TPU
-interpret mode with the race detector, so they check routing, the remote DMA
-and semaphore protocols and the arithmetic (against a float32 reference of
-the kernel's roundings), not Mosaic lowering, VMEM limits or TPU timing.
+The interpret checks run this file as a script in a subprocess on 8 CPU
+devices, because the host device count (XLA_FLAGS) must be set before JAX
+starts. They use TPU interpret mode with the race detector, so they check
+routing, the remote DMA and semaphore protocols and the arithmetic (against a
+float32 reference of the kernel's roundings), not Mosaic lowering, VMEM limits
+or TPU timing. The multichip checks run the compiled kernel on the 8 TPU
+cores of one host against the same reference, at these test shapes and at the
+Qwen3.5-397B decode shapes the torch op serves.
 """
 
 import contextlib
@@ -30,12 +33,13 @@ import sys
 
 import pytest
 
-pytestmark = pytest.mark.cpu_test
-
 DP, TP = 4, 2
 # Experts per core, hidden, intermediate, top-k: small enough for the
 # interpreter, with every core holding experts some rows route to.
 E, H, INTER, TOPK = 2, 512, 256, 2
+# The Qwen3.5-397B MoE layer the torch op serves: 512 experts over the 8 cores,
+# hidden 4096, expert intermediate 1024, top-10.
+Q35_GEOMETRY = (64, 4096, 1024, 10)
 REL_L2 = 1e-2
 # rows per engine, dispatch form, combine form, FP8 dispatch, routed-row
 # gather, rank as data, weight ring depth. The first is the served form at a
@@ -50,6 +54,159 @@ CASES = {
     "flat_forms_16": (16, "flat", "flat", False, True, True, 1),
     "ring_2_32": (32, "hier", "hier", True, True, True, 2),
 }
+# At the 397B shapes, the forms the torch op runs: FP8 rows where a step's
+# rows per engine pad to a multiple of 32, bf16 rows otherwise.
+Q35_CASES = {
+    "q35_served_64": (64, "hier", "hier", True, True, True, 1),
+    "q35_served_48": (48, "hier", "hier", False, True, True, 1),
+    "q35_served_8": (8, "hier", "hier", False, True, True, 1),
+}
+
+
+def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
+    """``run(*case)`` on ``mesh`` (axes ("dp", "tp")): the kernel's output of
+    every core [DP * TP, rows, hidden] bf16 and the float32 reference of this
+    engine's rows (float64)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
+
+    e, h, inter, topk = geometry
+    n_experts = e * DP * TP
+    if geometry == (E, H, INTER, TOPK):
+        rng = np.random.default_rng(0)
+        w13 = jnp.asarray(
+            np.clip(rng.standard_normal((n_experts, h, 2 * inter)) * 40, -448, 448),
+            kernel._FP8,
+        )
+        w2 = jnp.asarray(
+            np.clip(rng.standard_normal((n_experts, inter, h)) * 40, -448, 448),
+            kernel._FP8,
+        )
+        s13 = jnp.asarray(
+            rng.random((n_experts, 1, 1, 2 * inter)) / (40 * np.sqrt(h)), jnp.float32
+        )
+        s2 = jnp.asarray(
+            rng.random((n_experts, 1, 1, h)) / (40 * np.sqrt(inter)), jnp.float32
+        )
+    else:
+        # The same distributions drawn on the devices, already split over the
+        # mesh: the 397B layer's weights are gigabytes.
+        keys = jax.random.split(jax.random.PRNGKey(0), 4)
+
+        def draw():
+            def fp8(key, shape):
+                w = jax.random.normal(key, shape, jnp.float32) * 40
+                return jnp.clip(w, -448, 448).astype(kernel._FP8)
+
+            return (
+                fp8(keys[0], (n_experts, h, 2 * inter)),
+                fp8(keys[1], (n_experts, inter, h)),
+                jax.random.uniform(keys[2], (n_experts, 1, 1, 2 * inter))
+                / (40 * np.sqrt(h)),
+                jax.random.uniform(keys[3], (n_experts, 1, 1, h))
+                / (40 * np.sqrt(inter)),
+            )
+
+        split = NamedSharding(mesh, P(("dp", "tp")))
+        w13, w2, s13, s2 = jax.jit(draw, out_shardings=(split,) * 4)()
+    starts = jnp.asarray(np.arange(DP * TP) * e, jnp.int32)
+    ranks = jnp.asarray([[i // TP, i % TP] for i in range(DP * TP)], jnp.int32)
+    experts = P(("dp", "tp"))
+
+    def inputs(rows):
+        r = np.random.default_rng(rows)
+        x = jnp.asarray(r.standard_normal((DP * rows, h)), jnp.bfloat16)
+        logits = jnp.asarray(
+            r.standard_normal((DP * rows, n_experts)) * 2, jnp.bfloat16
+        )
+        return x, logits
+
+    def reference(x, logits):
+        """Plain JAX with the kernel's roundings: per-row FP8 activations, a
+        softmax top-k renormalized over every expert, float32 sums."""
+        x_q, x_s = kernel._quantize_rows(x.astype(jnp.float32))
+        weights, ids = jax.lax.top_k(jax.nn.softmax(logits.astype(jnp.float32)), topk)
+        weights = weights / weights.sum(axis=1, keepdims=True)
+        out = jnp.zeros((x.shape[0], h), jnp.float32)
+        for expert in range(n_experts):
+            w = jnp.sum(jnp.where(ids == expert, weights, 0), axis=1)
+            hid = jnp.dot(x_q, w13[expert], preferred_element_type=jnp.float32)
+            hid = hid * x_s * s13[expert].reshape(1, -1)
+            a = jax.nn.silu(hid[:, :inter]) * hid[:, inter:]
+            a_q, a_s = kernel._quantize_rows(a)
+            o = jnp.dot(a_q, w2[expert], preferred_element_type=jnp.float32)
+            out = out + w[:, None] * (o * a_s * s2[expert].reshape(1, -1))
+        return np.asarray(out.astype(jnp.bfloat16)).astype(np.float64)
+
+    def run(rows, dform, cform, fp8, gather, rank_operand, depth):
+        x, logits = inputs(rows)
+
+        def body(x, logits, w13, w2, s13, s2, start, rank):
+            return fc.moe_lowtok_fused(
+                x,
+                logits,
+                w13,
+                s13,
+                w2,
+                s2,
+                start[0],
+                topk=topk,
+                dp=DP,
+                tp=TP,
+                dispatch_form=dform,
+                combine_form=cform,
+                depth=depth,
+                dispatch_fp8=fp8,
+                rank=rank.reshape(2) if rank_operand else None,
+                gather_rows=gather,
+            )
+
+        # Each core's output stacked, so both cores of a TP pair are compared.
+        f = jax.jit(
+            jax.shard_map(
+                body,
+                mesh=mesh,
+                in_specs=(P("dp"), P("dp")) + (experts,) * 6,
+                out_specs=experts,
+                check_vma=False,
+            )
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = np.asarray(
+                jax.block_until_ready(f(x, logits, w13, w2, s13, s2, starts, ranks))
+            )
+        return out.reshape(DP * TP, rows, h), reference(x, logits)
+
+    return run
+
+
+def _summary(cores, want):
+    """(bits of every core, the checks on them): both cores of a TP pair hold
+    the same bytes, no NaN, and the engines' rows against the reference."""
+    import numpy as np
+
+    got = np.concatenate([cores[TP * d] for d in range(DP)]).astype(np.float64)
+    bits = cores.view(np.uint16)
+    return bits, dict(
+        pairs_identical=bool(
+            all(np.array_equal(bits[TP * d], bits[TP * d + 1]) for d in range(DP))
+        ),
+        nan=int(np.isnan(got).sum()),
+        rel_l2=float(np.linalg.norm(got - want) / np.linalg.norm(want)),
+    )
+
+
+def _check(case):
+    # Both cores of a chip end with the same bytes.
+    assert case["pairs_identical"], case
+    assert case["nan"] == 0, case
+    assert case["rel_l2"] <= REL_L2, case
 
 
 def _race_control():
@@ -92,16 +249,11 @@ def _race_control():
 
 def _worker():
     import jax
-    import jax.numpy as jnp
     import numpy as np
     from jax._src.pallas.mosaic import tpu_info
     from jax._src.pallas.mosaic.interpret import interpret_pallas_call
     from jax.experimental.pallas import tpu as pltpu
     from jax.sharding import Mesh
-    from jax.sharding import PartitionSpec as P
-
-    from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
-    from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
 
     def tpu7x():
         return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
@@ -111,107 +263,17 @@ def _worker():
 
     devices = sorted(jax.devices("cpu"), key=lambda d: d.id)
     assert len(devices) == DP * TP, devices
-    mesh = Mesh(np.asarray(devices).reshape(DP, TP), ("dp", "tp"))
-    rng = np.random.default_rng(0)
-    n_experts = E * DP * TP
-    w13 = jnp.asarray(
-        np.clip(rng.standard_normal((n_experts, H, 2 * INTER)) * 40, -448, 448),
-        kernel._FP8,
-    )
-    w2 = jnp.asarray(
-        np.clip(rng.standard_normal((n_experts, INTER, H)) * 40, -448, 448), kernel._FP8
-    )
-    s13 = jnp.asarray(
-        rng.random((n_experts, 1, 1, 2 * INTER)) / (40 * np.sqrt(H)), jnp.float32
-    )
-    s2 = jnp.asarray(
-        rng.random((n_experts, 1, 1, H)) / (40 * np.sqrt(INTER)), jnp.float32
-    )
-    starts = jnp.asarray(np.arange(DP * TP) * E, jnp.int32)
-    ranks = jnp.asarray([[i // TP, i % TP] for i in range(DP * TP)], jnp.int32)
-    experts = P(("dp", "tp"))
-
-    def inputs(rows):
-        r = np.random.default_rng(rows)
-        x = jnp.asarray(r.standard_normal((DP * rows, H)), jnp.bfloat16)
-        logits = jnp.asarray(
-            r.standard_normal((DP * rows, n_experts)) * 2, jnp.bfloat16
-        )
-        return x, logits
-
-    def reference(x, logits):
-        """Plain JAX with the kernel's roundings: per-row FP8 activations, a
-        softmax top-k renormalized over every expert, float32 sums."""
-        x_q, x_s = kernel._quantize_rows(x.astype(jnp.float32))
-        weights, ids = jax.lax.top_k(jax.nn.softmax(logits.astype(jnp.float32)), TOPK)
-        weights = weights / weights.sum(axis=1, keepdims=True)
-        out = jnp.zeros((x.shape[0], H), jnp.float32)
-        for e in range(n_experts):
-            w = jnp.sum(jnp.where(ids == e, weights, 0), axis=1)
-            h = jnp.dot(x_q, w13[e], preferred_element_type=jnp.float32)
-            h = h * x_s * s13[e].reshape(1, -1)
-            a = jax.nn.silu(h[:, :INTER]) * h[:, INTER:]
-            a_q, a_s = kernel._quantize_rows(a)
-            o = jnp.dot(a_q, w2[e], preferred_element_type=jnp.float32)
-            out = out + w[:, None] * (o * a_s * s2[e].reshape(1, -1))
-        return np.asarray(out.astype(jnp.bfloat16)).astype(np.float64)
-
-    def run(rows, dform, cform, fp8, gather, rank_operand, depth):
-        x, logits = inputs(rows)
-
-        def body(x, logits, w13, w2, s13, s2, start, rank):
-            return fc.moe_lowtok_fused(
-                x,
-                logits,
-                w13,
-                s13,
-                w2,
-                s2,
-                start[0],
-                topk=TOPK,
-                dp=DP,
-                tp=TP,
-                dispatch_form=dform,
-                combine_form=cform,
-                depth=depth,
-                dispatch_fp8=fp8,
-                rank=rank.reshape(2) if rank_operand else None,
-                gather_rows=gather,
-            )
-
-        # Each core's output stacked, so both cores of a TP pair are compared.
-        f = jax.jit(
-            jax.shard_map(
-                body,
-                mesh=mesh,
-                in_specs=(P("dp"), P("dp")) + (experts,) * 6,
-                out_specs=experts,
-                check_vma=False,
-            )
-        )
-        pltpu.reset_tpu_interpret_mode_state()
-        with contextlib.redirect_stdout(io.StringIO()):
-            out = np.asarray(
-                jax.block_until_ready(f(x, logits, w13, w2, s13, s2, starts, ranks))
-            )
-        races = bool(interpret_pallas_call.races.races_found)
-        cores = out.reshape(DP * TP, rows, H)
-        got = np.concatenate([cores[TP * d] for d in range(DP)]).astype(np.float64)
-        want = reference(x, logits)
-        bits = cores.view(np.uint16)
-        return bits, dict(
-            races_found=races,
-            pairs_identical=bool(
-                all(np.array_equal(bits[TP * d], bits[TP * d + 1]) for d in range(DP))
-            ),
-            nan=int(np.isnan(got).sum()),
-            rel_l2=float(np.linalg.norm(got - want) / np.linalg.norm(want)),
-        )
+    run = _case_runner(Mesh(np.asarray(devices).reshape(DP, TP), ("dp", "tp")))
 
     result = {"race_control": _race_control(), "cases": {}}
     bits = {}
     for name, case in CASES.items():
-        bits[name], result["cases"][name] = run(*case)
+        pltpu.reset_tpu_interpret_mode_state()
+        cores, want = run(*case)
+        bits[name], result["cases"][name] = _summary(cores, want)
+        result["cases"][name]["races_found"] = bool(
+            interpret_pallas_call.races.races_found
+        )
     result["fp8_dispatch_bit_identical"] = bool(
         np.array_equal(bits["served_32"], bits["bf16_dispatch_32"])
     )
@@ -244,30 +306,32 @@ def on_8_devices():
     return json.loads(lines[-1][len("RESULT ") :])
 
 
+@pytest.mark.cpu_test
 def test_race_detector_is_live(on_8_devices):
     assert on_8_devices["race_control"] == {"racy": True, "clean": False}
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_engine_rows_summed_over_every_rank(on_8_devices, name):
     case = on_8_devices["cases"][name]
     assert not case["races_found"], case
-    # Both cores of a chip end with the same bytes.
-    assert case["pairs_identical"], case
-    assert case["nan"] == 0, case
-    assert case["rel_l2"] <= REL_L2, case
+    _check(case)
 
 
+@pytest.mark.cpu_test
 def test_fp8_dispatch_moves_the_same_expert_inputs(on_8_devices):
     """Rows pushed as per-row FP8 give the bytes the bf16 push gives: the
     expert pass quantizes the same rows the same way."""
     assert on_8_devices["fp8_dispatch_bit_identical"]
 
 
+@pytest.mark.cpu_test
 def test_rank_as_data_matches_the_axis_index(on_8_devices):
     assert on_8_devices["rank_from_axis_bit_identical"]
 
 
+@pytest.mark.cpu_test
 def test_a_deeper_weight_ring_gives_the_same_bytes(on_8_devices):
     """The ring depth changes only how far ahead the weights are fetched."""
     assert on_8_devices["ring_depth_bit_identical"]
@@ -298,6 +362,7 @@ def _call(rows=32, **kwargs):
     )
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "kwargs,match",
     [
@@ -312,6 +377,37 @@ def test_refuses_unsupported_calls(kwargs, match):
     rows = kwargs.pop("rows", 32)
     with pytest.raises(ValueError, match=match):
         _call(rows=rows, **kwargs)
+
+
+@pytest.fixture(scope="module")
+def tpu_mesh():
+    """The eight cores of one host as the (dp, tp) mesh. A fixture, not a
+    `skipif`: asking JAX for devices at collection would claim the chips."""
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    if jax.default_backend() != "tpu" or jax.device_count() < DP * TP:
+        pytest.skip("needs the 8 TPU cores of one host")
+    devices = np.asarray(jax.devices()[: DP * TP]).reshape(DP, TP)
+    return Mesh(devices, ("dp", "tp"))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_compiled_kernel_sums_the_engine_rows_on_tpu(tpu_mesh, name):
+    """The Mosaic-compiled kernel (VMEM budget, remote DMAs, barrier) at the
+    interpret checks' cases."""
+    _, case = _summary(*_case_runner(tpu_mesh)(*CASES[name]))
+    _check(case)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("name", sorted(Q35_CASES))
+def test_compiled_kernel_at_the_qwen3_5_decode_shapes_on_tpu(tpu_mesh, name):
+    """The forms the torch op runs, at the Qwen3.5-397B MoE layer's shapes."""
+    _, case = _summary(*_case_runner(tpu_mesh, Q35_GEOMETRY)(*Q35_CASES[name]))
+    _check(case)
 
 
 if __name__ == "__main__":
