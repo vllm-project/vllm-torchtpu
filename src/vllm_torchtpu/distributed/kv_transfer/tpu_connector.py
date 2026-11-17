@@ -105,6 +105,7 @@ from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
     _CoordRecvEntry,
     _CoordSendEntry,
 )
+from vllm_torchtpu.distributed.pipeline_stage import get_pipeline_stage, stage_size
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -621,17 +622,10 @@ def _pipeline_parallel_size(vllm_config: VllmConfig) -> int:
 
 
 def _engine_is_pipeline(vllm_config: VllmConfig) -> bool:
-    """A pipeline-parallel engine: each stage transfers its own layers, so
-    the transfer ranks are the pipeline stages (or their PCP ranks)."""
+    """A pipeline-parallel engine: each stage transfers its own layers, as
+    an engine without a pipeline transfers all of them, so the transfer
+    ranks are the workers of every stage."""
     return _pipeline_parallel_size(vllm_config) > 1
-
-
-def _pipeline_stage_pcp_size(vllm_config: VllmConfig) -> int:
-    """PCP ranks inside each pipeline stage: a PP x PCP stage splits its
-    layers' tokens and GDN heads over them; 1 without PCP or pipeline."""
-    if not _engine_is_pipeline(vllm_config):
-        return 1
-    return int(vllm_config.parallel_config.prefill_context_parallel_size or 1)
 
 
 def _reshard_store_mode() -> bool:
@@ -2493,11 +2487,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 )
         elif _engine_is_pipeline(self.vllm_config):
             pp_size = _pipeline_parallel_size(self.vllm_config)
-            if src_parallelism != pp_size * pcp_size:
+            workers = stage_size(parallel_config)
+            if src_parallelism != pp_size * workers:
                 raise ValueError(
                     "Stage-3 pipeline producer transfer parallelism must "
-                    f"equal PP * PCP size: parallelism={src_parallelism}, "
-                    f"pp_size={pp_size}, pcp_size={pcp_size}"
+                    f"equal PP * stage size: parallelism={src_parallelism}, "
+                    f"pp_size={pp_size}, stage_size={workers}"
                 )
         elif src_parallelism != pcp_size * int(parallel_config.tensor_parallel_size):
             raise ValueError(
@@ -2619,8 +2614,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if _uses_tp_stage3_source(self.vllm_config):
             return int(parallel_config.tensor_parallel_size or 1)
         if _engine_is_pipeline(self.vllm_config):
-            return _pipeline_parallel_size(self.vllm_config) * (
-                _pipeline_stage_pcp_size(self.vllm_config)
+            return _pipeline_parallel_size(self.vllm_config) * stage_size(
+                parallel_config
             )
         return int(parallel_config.prefill_context_parallel_size or 1) * int(
             parallel_config.tensor_parallel_size or 1
@@ -3587,13 +3582,13 @@ class TPURaidenConnectorWorker:
             return
         if _engine_is_pipeline(self.vllm_config):
             pp_size = _pipeline_parallel_size(self.vllm_config)
-            stage_pcp = _pipeline_stage_pcp_size(self.vllm_config)
-            if transfer_parallelism != pp_size * stage_pcp:
+            workers = stage_size(self.vllm_config.parallel_config)
+            if transfer_parallelism != pp_size * workers:
                 raise ValueError(
                     "Pipeline producer transfer parallelism must equal the "
-                    "complete PP stage count times the stage PCP size: "
+                    "complete PP stage count times the workers of a stage: "
                     f"parallelism={transfer_parallelism}, pp_size={pp_size}, "
-                    f"pcp_size={stage_pcp}"
+                    f"stage_size={workers}"
                 )
             if not _use_per_layer_pool_tags():
                 raise ValueError(
@@ -3659,19 +3654,24 @@ class TPURaidenConnectorWorker:
             raise ValueError("TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
         return parallelism
 
+    def _stage3_stage_units(self, parallelism: int) -> int:
+        """The transfer units that share this worker's layers: its pipeline
+        stage's, or all `parallelism` of them without a pipeline."""
+        if _engine_is_pipeline(self.vllm_config):
+            return stage_size(self.vllm_config.parallel_config)
+        return parallelism
+
     def _local_raiden_transfer_rank(self) -> int:
         if _engine_is_pipeline(self.vllm_config):
             from vllm.distributed.parallel_state import get_pp_group
 
             stage = int(get_pp_group().rank_in_group)
-            stage_pcp = _pipeline_stage_pcp_size(self.vllm_config)
-            if not self.is_producer or stage_pcp == 1:
+            workers = stage_size(self.vllm_config.parallel_config)
+            if not self.is_producer or workers == 1:
                 return stage
-            # A PP x PCP producer is one unit per stage-local PCP rank, the
-            # index its kernels own tokens and GDN heads by: stage-major.
-            from vllm_torchtpu.distributed.pcp import get_pcp_rank
-
-            return stage * stage_pcp + int(get_pcp_rank())
+            # A pipeline producer is one unit per worker, stage-major: inside
+            # a stage, the index its kernels own tokens and GDN heads by.
+            return stage * workers + get_pipeline_stage().position
         if not self.is_producer:
             return int(self.tp_rank)
         if _uses_tp_stage3_source(self.vllm_config):
@@ -3785,13 +3785,13 @@ class TPURaidenConnectorWorker:
             raise ValueError("Raiden transfer_parallelism must be positive")
         # A TP1 destination is logically contiguous even if an unrelated PCP
         # option remains present in its shared ParallelConfig, and so is a
-        # pipeline stage without PCP, which holds every token of its layers.
+        # pipeline stage whose workers each hold every token of its layers.
         if (
             not self.is_producer
             or transfer_parallelism == 1
             or (
                 _engine_is_pipeline(self.vllm_config)
-                and _pipeline_stage_pcp_size(self.vllm_config) == 1
+                and stage_size(self.vllm_config.parallel_config) == self.tp_size
             )
         ):
             return page_tokens
@@ -4292,16 +4292,13 @@ class TPURaidenConnectorWorker:
             )
         self._maybe_delay_stage3_registration_for_test(metadata)
         # A pipeline stage holds every token of its own layers: its byte
-        # spans are lowered over the stage's PCP ranks alone (one contiguous
-        # owner without PCP), and the layer subset is expressed through
-        # per-layer pool tags instead.
+        # spans are lowered over the stage's workers alone, as an engine
+        # without a pipeline lowers its own, and the layer subset is expressed
+        # through per-layer pool tags instead.
         pipeline = _engine_is_pipeline(self.vllm_config)
-        if pipeline:
-            lowering_parallelism = _pipeline_stage_pcp_size(self.vllm_config)
-            lowering_rank = transfer_rank % lowering_parallelism
-        else:
-            lowering_parallelism = parallelism // self.tp_size
-            lowering_rank = transfer_rank // self.tp_size
+        stage_units = self._stage3_stage_units(parallelism)
+        lowering_parallelism = stage_units // self.tp_size
+        lowering_rank = transfer_rank % stage_units // self.tp_size
 
         now = time.time()
         expired_terminal_req_ids = [
@@ -4626,11 +4623,10 @@ class TPURaidenConnectorWorker:
 
         tag_geometry = self._stage3_row_geometry
         page_tokens = int(self.vllm_config.cache_config.block_size)
-        # A pipeline stage holds every token of its own layers: it owns every
-        # page, and per-layer pool tags express its layer subset.
-        pipeline = _engine_is_pipeline(self.vllm_config)
-        lowering_parallelism = 1 if pipeline else parallelism
-        lowering_rank = 0 if pipeline else transfer_rank
+        # A pipeline stage holds every token of its own layers: its workers
+        # own every page, and per-layer pool tags express its layer subset.
+        lowering_parallelism = self._stage3_stage_units(parallelism)
+        lowering_rank = transfer_rank % lowering_parallelism
         # A DCP destination (admitted for pipeline and DCP producers) shards
         # each page's tokens over its ranks.
         dst_dcp_size = (

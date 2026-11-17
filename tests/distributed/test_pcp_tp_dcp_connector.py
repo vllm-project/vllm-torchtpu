@@ -400,7 +400,10 @@ def _pp_pcp_coordinates(stage, pcp_rank):
             "vllm.distributed.parallel_state.get_pp_group",
             return_value=SimpleNamespace(rank_in_group=stage),
         ),
-        patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=pcp_rank),
+        patch(
+            "vllm_torchtpu.distributed.pipeline_stage._STAGE",
+            SimpleNamespace(position=pcp_rank),
+        ),
     )
 
 
@@ -497,6 +500,7 @@ def _pp_pcp_scheduler(monkeypatch, parallelism):
     scheduler = _make_raiden_scheduler(is_producer=True, pcp_size=8, block_size=384)
     config = scheduler.vllm_config
     config.parallel_config.pipeline_parallel_size = 4
+    config.parallel_config.world_size = 32
     config.parallel_config.cp_kv_cache_interleave_size = 128
     config.kv_transfer_config.kv_connector_extra_config = {
         "destination_decode_context_parallel_size": 8
@@ -532,7 +536,7 @@ def test_pp_pcp_scheduler_metadata_and_finished_count(monkeypatch, tokens):
 
 def test_pp_pcp_scheduler_rejects_stage_count_parallelism(monkeypatch):
     scheduler = _pp_pcp_scheduler(monkeypatch, 4)
-    with pytest.raises(ValueError, match=r"PP \* PCP"):
+    with pytest.raises(ValueError, match=r"PP \* stage size"):
         scheduler.request_finished(
             _finished_request(1000), [0], mamba_block_ids=[[4, 5]]
         )
