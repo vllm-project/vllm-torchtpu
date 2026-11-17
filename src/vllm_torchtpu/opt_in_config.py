@@ -280,6 +280,16 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # are not copied into a padded buffer; the last block reads past them.
     # Same picks, bitwise.
     "minimax_dcp_unpadded_class_scores": False,
+    # MSA DCP over one KV head (e.g. DCP 2): the attention half (query and
+    # candidate gathers, attention, partial exchange, LSE merge) as one SPMD
+    # op (`kernels/msa_dcp_merge.py`), permutes on a DCP 2 pair up to 1024
+    # tokens, one Pallas merge pass in f32. Supersedes the packed
+    # collectives above for those groups. Not bitwise (f32 merge).
+    "minimax_dcp_attend_merge": False,
+    # MSA DCP groups over several KV heads (e.g. DCP 8): each rank of a KV
+    # head's replicas all-gathers only its 1 / replicas part of the new K / V
+    # / index-query rows (the replicas' rows are equal). Bitwise.
+    "minimax_dcp_split_kv_gather": False,
 }
 
 

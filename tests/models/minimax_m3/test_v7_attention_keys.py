@@ -293,3 +293,51 @@ def test_unpadded_class_scores_pick_the_same(monkeypatch, pretransposed):
     n = num_tokens - 5
     for g, w in zip(got, want):
         np.testing.assert_array_equal(np.asarray(g)[:n], np.asarray(w)[:n])
+
+
+@pytest.mark.parametrize("dcp,replicas,num_tokens", [(8, 2, 6), (8, 2, 5), (4, 4, 8)])
+def test_split_kv_gather_matches_the_full_gather(monkeypatch, dcp, replicas, num_tokens):
+    """Each replica sends its part of the tokens: the gathered K / V /
+    index-query rows equal the full gather's, bit for bit (an odd token
+    count keeps the full gather)."""
+    import torch
+
+    d = 4
+    g = torch.Generator().manual_seed(dcp + num_tokens)
+    heads = [torch.randn(num_tokens, 3, d, generator=g) for _ in range(dcp // replicas)]
+    rows = [heads[i // replicas] for i in range(dcp)]  # replicas hold equal rows
+    sent = []
+
+    class _Group:
+        def __init__(self, bank):
+            self.bank = bank
+
+        def all_gather(self, x, dim):
+            sent.append(x.shape)
+            return torch.cat(self.bank(x), dim=dim)
+
+    def full_bank(x):
+        return list(rows)
+
+    k0, v0, iq0 = (rows[0][:, i : i + 1] for i in range(3))
+    want = msa_ops.gather_group_kv(k0, v0, iq0, _Group(full_bank), dcp, replicas)
+    monkeypatch.setattr(msa_ops, "SPLIT_KV_GATHER", True)
+    for rank in range(dcp):
+        k, v, iq = (rows[rank][:, i : i + 1] for i in range(3))
+        part = num_tokens // replicas
+
+        def split_bank(x):
+            return [
+                rows[r].view(replicas, part, 3, d)[r % replicas].unsqueeze(0)
+                for r in range(dcp)
+            ]
+
+        sent.clear()
+        got = msa_ops.gather_group_kv(
+            k, v, iq, _Group(split_bank if num_tokens % replicas == 0 else full_bank),
+            dcp, replicas, torch.tensor([rank], dtype=torch.int32),
+        )
+        for a, b in zip(got, want):
+            assert torch.equal(a, b)
+        if num_tokens % replicas == 0:
+            assert sent == [(1, part, 3, d)]

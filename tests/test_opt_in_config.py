@@ -135,6 +135,8 @@ NEW_KEYS = {
     "minimax_dcp_prefill_tiles_4bit",
     "minimax_msa_dense_work_list_elems",
     "minimax_dcp_unpadded_class_scores",
+    "minimax_dcp_attend_merge",
+    "minimax_dcp_split_kv_gather",
     "minimax_indexer_hoist_metadata",
     "minimax_indexer_row_gather",
     # --- v7 MoE / grouped GEMM ---
@@ -194,6 +196,8 @@ def _toggles():
     return kernel_toggles, [
         *kernel_toggles.TOGGLES,
         ("minimax_dcp_heads_attend", msa_ops, "DCP_HEADS_ATTEND"),
+        ("minimax_dcp_attend_merge", msa_ops, "ATTEND_MERGE"),
+        ("minimax_dcp_split_kv_gather", msa_ops, "SPLIT_KV_GATHER"),
     ]
 
 
