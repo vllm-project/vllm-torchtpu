@@ -463,9 +463,6 @@ def _init_with(monkeypatch, kv_transfer_config, calls=None):
     calls = [] if calls is None else calls
     monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
     monkeypatch.setattr(
-        prefix_change_log, "install_epoch", lambda: calls.append("epoch")
-    )
-    monkeypatch.setattr(
         PrefixAwareScheduler, "_enable_memo_xstep", lambda self: calls.append("memo")
     )
     return PrefixAwareScheduler()
@@ -480,7 +477,12 @@ def test_kv_role_detection(monkeypatch):
     assert (s._is_disagg, s._is_kv_producer, s._is_kv_consumer) == (True, False, True)
 
 
-def test_init_installs_the_epoch_counters_before_the_memo(monkeypatch):
+def test_init_enables_the_memo_without_patching_vllm(monkeypatch):
+    def fail():
+        raise AssertionError("the scheduler must not install patches")
+
+    monkeypatch.setattr(prefix_change_log, "install_epoch", fail)
+    monkeypatch.setattr(prefix_change_log, "install", fail)
     calls = []
     _init_with(monkeypatch, None, calls)
-    assert calls == ["epoch", "memo"]
+    assert calls == ["memo"]

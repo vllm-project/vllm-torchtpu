@@ -20,12 +20,16 @@ Layered on top of the same-step prefix-hit patch in ``vllm_torchtpu/__init__``
 VocabParallelEmbedding.forward that Dynamo traces, so editing it would change
 vLLM's traced-file code hash and force a full recompile.
 
-``install_epoch`` adds ``pool._tpu_prefix_cache_epoch``, which moves on every
-prefix-cache mutation. The schedulers that memoise lookups install it when
-they are built, so an engine that runs neither keeps the same-step patch as it
-is.
+The patch registry installs both wrapper layers, ``install_epoch`` and then
+``install``, right after the same-step patch. They leave a block pool alone
+until a scheduler that memoises lookups opts the pool in, so an engine that
+runs no such scheduler keeps the same-step patch's behaviour and its block
+pool gains none of these attributes.
 
-Once enabled on a BlockPool, every event that can change the answer of
+``enable_epoch(pool)`` starts ``pool._tpu_prefix_cache_epoch``, which then
+moves on every prefix-cache mutation.
+
+Once ``enable(pool)`` has run, every event that can change the answer of
 ``BlockPool.get_cached_block(h, groups)`` appends ``(epoch, h)`` to
 ``pool._tpu_prefix_change_log`` (``h`` = group-less block hash):
 
@@ -36,6 +40,8 @@ Once enabled on a BlockPool, every event that can change the answer of
   moves by one and the plugin wrapper clears; we log the affected keys with
   that epoch just before);
 * ``reset_prefix_cache`` drops the log and raises the log base epoch.
+
+``disable(pool)`` drops the log and stops it.
 """
 
 import functools
@@ -75,12 +81,19 @@ def log_unwritten_clear(pool) -> None:
         _log_block_keys(d, log, epoch, blocks[block_id])
 
 
+def _bump_epoch(d) -> None:
+    """Moves the epoch of a pool that counts mutations (see ``enable_epoch``)."""
+    if EPOCH in d:
+        d[EPOCH] += 1
+
+
 def install_epoch() -> None:
     """Count prefix-cache mutations in ``pool._tpu_prefix_cache_epoch``.
 
-    The epoch moves on every event that can change a prefix-cache lookup: a
-    hash inserted, hashes evicted, a prefix-cache reset, and the unwritten set
-    cleared at the start of a step. Idempotent.
+    The epoch of a pool that ``enable_epoch`` opted in moves on every event
+    that can change a prefix-cache lookup: a hash inserted, hashes evicted, a
+    prefix-cache reset, and the unwritten set cleared at the start of a step.
+    A registry patch (engine core); idempotent.
     """
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -96,33 +109,28 @@ def install_epoch() -> None:
     @functools.wraps(original_insert_block_hash)
     def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
         original_insert_block_hash(self, block_hash_with_group_id, block, num_tokens)
-        d = self.__dict__
-        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        _bump_epoch(self.__dict__)
 
     @functools.wraps(original_remove_cached_block_hashes)
     def _remove_cached_block_hashes(self, *args, **kwargs):
         evicted_hashes = original_remove_cached_block_hashes(self, *args, **kwargs)
         if evicted_hashes:
-            d = self.__dict__
-            d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+            _bump_epoch(self.__dict__)
         return evicted_hashes
 
     @functools.wraps(original_reset_prefix_cache)
     def reset_prefix_cache(self):
         res = original_reset_prefix_cache(self)
-        d = self.__dict__
-        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        _bump_epoch(self.__dict__)
         return res
 
     # The same-step patch clears the unwritten set in new_step_starts; the
     # epoch moves first, so a lookup made before the clear is not reused.
     @functools.wraps(original_new_step_starts)
     def new_step_starts(self, *args, **kwargs):
-        pool = self.block_pool
-        unwritten = pool.__dict__.get(UNWRITTEN)
-        if unwritten:
-            d = pool.__dict__
-            d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        d = self.block_pool.__dict__
+        if d.get(UNWRITTEN):
+            _bump_epoch(d)
         return original_new_step_starts(self, *args, **kwargs)
 
     for wrapper in (
@@ -145,10 +153,19 @@ def epoch_installed() -> bool:
     return bool(getattr(BlockPool._remove_cached_block_hashes, _EPOCH_MARK, False))
 
 
+def installed() -> bool:
+    """Whether ``install`` has run in this process."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    return bool(getattr(BlockPool._insert_block_hash, _MARK, False))
+
+
 def install() -> bool:
-    """Wrap BlockPool/KVCacheManager (idempotent). Requires the plugin's
-    same-step prefix-hit patch and ``install_epoch``; returns False (memo stays
-    per-step) without them."""
+    """Wrap BlockPool/KVCacheManager to keep the change log of pools that
+    ``enable`` opted in. A registry patch (engine core) after the plugin's
+    same-step prefix-hit patch and ``install_epoch``; idempotent. Returns
+    False, leaving the registry entry eligible for a later stage, while either
+    is missing."""
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 
@@ -222,10 +239,38 @@ def install() -> bool:
     return True
 
 
-def enable(pool) -> None:
+def enable_epoch(pool) -> bool:
+    """Start counting prefix-cache mutations on ``pool``.
+
+    Returns False, leaving the pool alone, when ``install_epoch`` has not run
+    in this process: without the counters a memo would be reused after the
+    cache changed.
+    """
+    if not epoch_installed():
+        return False
+    pool.__dict__.setdefault(EPOCH, 0)
+    return True
+
+
+def enable(pool) -> bool:
+    """Start the change log on ``pool``, whose epoch must be counting.
+
+    Returns False, leaving the pool alone, when ``enable_epoch`` has not run
+    on it or ``install`` has not run in this process.
+    """
     d = pool.__dict__
+    if EPOCH not in d or not installed():
+        return False
     d.setdefault(LOG, [])
-    d.setdefault(BASE, d.get(EPOCH, 0))
+    d.setdefault(BASE, d[EPOCH])
+    return True
+
+
+def disable(pool) -> None:
+    """Drop the change log of ``pool``; the wrappers stop logging there."""
+    d = pool.__dict__
+    d.pop(LOG, None)
+    d.pop(BASE, None)
 
 
 def record_probes(pool, fn, *args):

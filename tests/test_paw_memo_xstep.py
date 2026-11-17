@@ -69,8 +69,10 @@ def patched_pool():
     )
     saved_pool = {k: BlockPool.__dict__[k] for k in names}
     saved_new_step = KVCacheManager.__dict__["new_step_starts"]
+    # The registry's order: the same-step patch, the epoch, the change log.
     vllm_torchtpu._patch_vllm_same_step_prefix_hits()
     prefix_change_log.install_epoch()
+    assert prefix_change_log.install()
     init_none_hash(sha256)
     try:
         yield _begin_step
@@ -253,7 +255,7 @@ def test_runtime_verifier_agrees(patched_pool):
     assert s._memo_xstep and s._memo_verified > 100 and s._memo_hits == 0
 
 
-def test_init_py_untouched_and_install_idempotent(patched_pool):
+def test_change_log_install_is_idempotent_over_the_same_step_patch(patched_pool):
     assert prefix_change_log.install()
     wrapped = BlockPool._insert_block_hash
     assert prefix_change_log.install()
@@ -263,9 +265,55 @@ def test_init_py_untouched_and_install_idempotent(patched_pool):
     assert BlockPool._insert_block_hash is wrapped
 
 
+def _churn(mgr, rid):
+    """Inserts, clears the unwritten set, evicts and resets the prefix cache."""
+    req = _req(rid, list(range(13)))
+    blocks, num_hit, _ = mgr.get_computed_blocks(req)
+    assert mgr.allocate_slots(req, req.num_tokens, num_hit, blocks) is not None
+    mgr.new_step_starts()
+    mgr.free(req)
+    assert mgr.reset_prefix_cache()
+
+
+def test_wrappers_leave_a_pool_alone_until_it_is_opted_in(patched_pool):
+    mgr = _manager(32)
+    d = mgr.block_pool.__dict__
+    _churn(mgr, "a1")
+    for name in (
+        prefix_change_log.EPOCH,
+        prefix_change_log.LOG,
+        prefix_change_log.BASE,
+    ):
+        assert name not in d
+    # The change log needs a counting epoch.
+    assert not prefix_change_log.enable(mgr.block_pool)
+    assert prefix_change_log.LOG not in d
+    assert prefix_change_log.enable_epoch(mgr.block_pool)
+    assert prefix_change_log.enable(mgr.block_pool)
+    _churn(mgr, "a2")
+    assert d[prefix_change_log.EPOCH] > 0
+    assert d[prefix_change_log.BASE] > 0  # the reset raised the log base
+
+
+def test_disable_drops_the_change_log(patched_pool):
+    mgr = _manager(32)
+    d = mgr.block_pool.__dict__
+    assert prefix_change_log.enable_epoch(mgr.block_pool)
+    assert prefix_change_log.enable(mgr.block_pool)
+    req = _req("d1", list(range(13)))
+    assert mgr.allocate_slots(req, req.num_tokens) is not None
+    assert d[prefix_change_log.LOG]
+    prefix_change_log.disable(mgr.block_pool)
+    req2 = _req("d2", list(range(100, 113)))
+    assert mgr.allocate_slots(req2, req2.num_tokens) is not None
+    mgr.new_step_starts()
+    assert prefix_change_log.LOG not in d and prefix_change_log.BASE not in d
+
+
 def test_epoch_moves_on_every_prefix_cache_mutation(patched_pool):
     mgr = _manager(32)
     d = mgr.block_pool.__dict__
+    assert prefix_change_log.enable_epoch(mgr.block_pool)
     req = _req("e1", list(range(13)))
     blocks, num_hit, _ = mgr.get_computed_blocks(req)
     e0 = d.get("_tpu_prefix_cache_epoch", 0)
@@ -283,13 +331,15 @@ def test_epoch_moves_on_every_prefix_cache_mutation(patched_pool):
     assert d["_tpu_prefix_cache_epoch"] > e1 + 1  # hashes removed, then reset
 
 
-def test_without_epoch_counters_there_is_no_memo(monkeypatch):
-    init_none_hash(sha256)
+@pytest.mark.parametrize("case", ["pool_not_opted_in", "no_epoch_counters"])
+def test_without_a_counting_epoch_there_is_no_memo(patched_pool, monkeypatch, case):
     mgr = _manager(32)
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     s.kv_cache_manager = mgr
     s._paw_scoring_broken = False
-    monkeypatch.setattr(prefix_change_log, "epoch_installed", lambda: False)
+    if case == "no_epoch_counters":
+        assert prefix_change_log.enable_epoch(mgr.block_pool)
+        monkeypatch.setattr(prefix_change_log, "epoch_installed", lambda: False)
     assert s._get_prefix_cache_epoch() is None
     req = _req("n1", list(range(13)))
     s._prefix_warmth(req)
