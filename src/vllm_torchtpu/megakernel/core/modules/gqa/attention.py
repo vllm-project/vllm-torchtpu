@@ -180,3 +180,5 @@ def att_core(cx: GQAEmit, kv: KVRing) -> None:
                 item(n_items - 1, 0)
         else:
             lax.fori_loop(0, n_items, item, 0)
+        if kv.start_next_layer is not None:
+            kv.start_next_layer()

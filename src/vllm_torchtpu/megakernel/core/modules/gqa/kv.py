@@ -34,6 +34,8 @@ class KVRing(NamedTuple):
 
     `slot(s)` is ring stage `s` when it lives in the expert pool (`KVE`);
     `kvbuf` (paged) or `kbuf` / `vbuf` (dense) are the dedicated VMEM rings.
+    `start_next_layer()` (dedicated rings only, else None) starts the module's
+    next layer's first items once this layer's are consumed.
     """
 
     start: Any
@@ -42,6 +44,7 @@ class KVRing(NamedTuple):
     kvbuf: Any
     kbuf: Any
     vbuf: Any
+    start_next_layer: Any
 
 
 def build_worklist(ctx: Any, ap: GQAParams) -> None:
@@ -158,7 +161,7 @@ def make_kv_ring(cx: GQAEmit) -> KVRing:
         def kv_stage(s):
             return kv_slot(s) if KVE else kvbuf.at[s]
 
-        def kv_start(i):
+        def kv_start(i, la=a):
             @pl.when(jnp.logical_and(i < n_items, "kv" not in skip))
             def _():
                 s = i % KR
@@ -171,7 +174,7 @@ def make_kv_ring(cx: GQAEmit) -> KVRing:
                         kp = kp_tab[k0 + p]
                         pltpu.make_async_copy(kv_src(r, kp), kv_dst(s, p), sem).start()
 
-                bswitch(a, [lambda r=r: start_for_ref(r) for r in raw_refs])
+                bswitch(la, [lambda r=r: start_for_ref(r) for r in raw_refs])
 
         def kv_wait(i):
             if "kv" not in skip:
@@ -185,27 +188,27 @@ def make_kv_ring(cx: GQAEmit) -> KVRing:
                     st_ = kv_stage(s)
                     pltpu.make_async_copy(st_, st_, ksem.at[s]).wait()
 
-        lax.fori_loop(0, KR, lambda i, _: (kv_start(i), 0)[1], 0)
+        n_layers = len(raw_refs)  # one pool per layer of the module
     else:
         kc, vc = ST["kc"], ST["vc"]
         kbuf, vbuf = scr["kbuf"], scr["vbuf"]
 
-        def kv_item(i, b, t):
+        def kv_item(i, b, t, la=a):
             s = i % NKV
             t0 = pl.multiple_of(t * BLK, BLK)
             return (
                 pltpu.make_async_copy(
-                    kc.at[a, b, pl.ds(t0, BLK)], kbuf.at[s], ksem.at[0, s]
+                    kc.at[la, b, pl.ds(t0, BLK)], kbuf.at[s], ksem.at[0, s]
                 ),
                 pltpu.make_async_copy(
-                    vc.at[a, b, pl.ds(t0, BLK)], vbuf.at[s], ksem.at[1, s]
+                    vc.at[la, b, pl.ds(t0, BLK)], vbuf.at[s], ksem.at[1, s]
                 ),
             )
 
-        def kv_start(i):
+        def kv_start(i, la=a):
             @pl.when(jnp.logical_and(i < n_items, "kv" not in skip))
             def _():
-                for d in kv_item(i, scr["wl_b"][i], scr["wl_t"][i]):
+                for d in kv_item(i, scr["wl_b"][i], scr["wl_t"][i], la):
                     d.start()
 
         def kv_wait(i):
@@ -214,6 +217,25 @@ def make_kv_ring(cx: GQAEmit) -> KVRing:
                 for d in kv_item(i, zero, zero):
                     d.wait()
 
-        for i in range(NKV):
-            kv_start(jnp.int32(i))
-    return KVRing(kv_start, kv_wait, kv_slot, kvbuf, kbuf, vbuf)
+        n_layers = kc.shape[0]
+
+    def start_layer(la):
+        lax.fori_loop(0, KR, lambda i, _: (kv_start(i, la), 0)[1], 0)
+
+    if KVE:  # the expert pool is busy outside attention
+        start_layer(a)
+        return KVRing(kv_start, kv_wait, kv_slot, kvbuf, kbuf, vbuf, None)
+    # A dedicated ring is idle between layers, so each layer starts the next
+    # one's first items after its own attention: started at that layer's start
+    # they queue behind ~NBD in-flight weight tiles (6 x 8 MiB, 15 us at
+    # 3.2 TB/s on dense Qwen3) and stall it.
+    pl.when(a == 0)(lambda: start_layer(a))
+    return KVRing(
+        kv_start,
+        kv_wait,
+        kv_slot,
+        kvbuf,
+        kbuf,
+        vbuf,
+        lambda: pl.when(a + 1 < n_layers)(lambda: start_layer(a + 1)),
+    )
