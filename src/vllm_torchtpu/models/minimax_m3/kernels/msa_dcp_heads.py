@@ -141,6 +141,8 @@ def hp_prefill_kernel_kwargs() -> dict:
 HP_BALANCE_ENV = "TPU_MINIMAX_M3_DCP_HP_BALANCE"
 # Work of a tile beyond its page union (the per-tile fixed cost, in pages).
 _BALANCE_TILE_COST = 12
+# Smallest hand-over worth its fixed cost, as a share of the mean head's work.
+_BALANCE_MIN_SHARE = 0.03
 _balance_logged = False
 
 
@@ -710,7 +712,10 @@ def _head_parallel_attend(
         work = jnp.sum(jnp.where(unions > 0, unions + _BALANCE_TILE_COST, 0))
         work_all = jax.lax.all_gather(work, axis)  # [dcp]
         offload = ring_offload(work_all, replicas)
-        active = single & (jnp.max(offload) > 0)
+        # Skip the hand-over (a second exchange, two permutes and a kernel
+        # call) when the heads are already within ~3% of their mean.
+        mean_work = jnp.mean(work_all.astype(jnp.float32))
+        active = single & (jnp.max(offload) > _BALANCE_MIN_SHARE * mean_work)
         num_tiles = num_tokens // block_q
         split = jnp.where(
             active,
