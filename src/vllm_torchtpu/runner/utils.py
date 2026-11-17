@@ -29,6 +29,7 @@ from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.frontend_options import SECTION as FRONTEND_OPTIONS_SECTION
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner import runner_options
+from vllm_torchtpu.worker.worker_options import SECTION as WORKER_OPTIONS_SECTION
 
 logger = init_logger(__name__)
 
@@ -54,10 +55,6 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # Host-only section: the runner's host-side options (`runner_options`, which
 # owns the name) never change a compiled program.
 RUNNER_OPTIONS_SECTION = runner_options.SECTION
-
-# Host-only section: the worker's process placement (`worker.worker_options`)
-# never changes a compiled program.
-WORKER_OPTIONS_SECTION = "tpu_worker"
 
 # Keys that never change the compiled graph: the diagnostics-only profiler
 # knobs above, which only steer profiling, and the host-only sections, each
