@@ -47,7 +47,11 @@ BF16 = jnp.dtype(jnp.bfloat16)
 
 
 @pytest.fixture(autouse=True)
-def _tpu7x_info():
+def _tpu7x_info(request):
+    # Host tests trace for a TPU7x device; a TPU test runs on its own device.
+    if request.node.get_closest_marker("tpu_test"):
+        yield
+        return
     mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(mesh):
         yield
@@ -426,6 +430,73 @@ def test_fused_1dot_matches_the_two_dot_recurrence():
     jaxpr = jax.make_jaxpr(lambda *a: compute_gdn.recurrent_gdn(*a, cfg=cfg))(*args)
     dots = [e for e in jaxpr.jaxpr.eqns if e.primitive.name == "dot_general"]
     assert len(dots) == seq_tile * window
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("state_dtype", [BF16, F32], ids=["bf16_state", "f32_state"])
+def test_fused_1dot_kernel_matches_mains_two_dot_kernel_on_tpu(state_dtype):
+    """The compiled copy at the Qwen3.5-397B DP4 x TP2 decode shape (8 kq and
+    32 value heads per rank) with verify windows of 4, where the fused 1-dot
+    recurrence runs, against main's v3 kernel (the two-dot recurrence) on the
+    same inputs: the outputs and the conv and recurrent state checkpoints of
+    every real token."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    n_kq, n_v, window = 8, 32, 4
+    assert wrapper.use_fused_1dot(window, n_kq, n_v, D_K, D_V)
+    # 24 verify windows: full, and with fewer drafts accepted (shorter
+    # windows); every sequence continues a context and reads its state from
+    # one of its window's checkpoint slots.
+    lengths = [window, 3, 2, 1] * 6
+    num_seqs = len(lengths)
+    num_tokens = sum(lengths)
+    dim = 2 * n_kq * D_K + n_v * D_V
+    num_blocks = 1 + num_seqs * window
+    rngs = iter(jax.random.split(jax.random.key(11), 8))
+    kwargs = dict(
+        qkv=jax.random.normal(next(rngs), (num_tokens, dim), BF16),
+        b=jax.random.normal(next(rngs), (num_tokens, n_v), BF16),
+        a=jax.random.normal(next(rngs), (num_tokens, n_v), BF16),
+        states=(
+            jax.random.normal(next(rngs), (num_blocks, KERNEL_SIZE - 1, dim), F32),
+            (
+                0.1 * jax.random.normal(next(rngs), (num_blocks, n_v, D_K, D_V), F32)
+            ).astype(state_dtype),
+        ),
+        conv_weight=jax.random.normal(next(rngs), (dim, 1, KERNEL_SIZE), BF16),
+        conv_bias=None,
+        a_log=jax.random.normal(next(rngs), (n_v,), F32),
+        dt_bias=jnp.zeros((n_v,), F32),
+        query_start_loc=jnp.asarray(
+            np.concatenate([[0], np.cumsum(lengths)]), jnp.int32
+        ),
+        state_indices=jnp.arange(num_seqs, dtype=jnp.int32) * window + 1,
+        distribution=jnp.array([num_seqs] * 3, jnp.int32),
+        seq_lens=jnp.asarray([32 + n for n in lengths], jnp.int32),
+        read_offsets=jnp.asarray([s % window for s in range(num_seqs)], jnp.int32),
+    )
+    static = dict(
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=D_K,
+        d_v=D_V,
+        kernel_size=KERNEL_SIZE,
+        num_spec_tokens=window - 1,
+    )
+    got = jax.jit(lambda x: wrapper.fused_conv1d_gdn(**x, **static))(kwargs)
+    want = jax.jit(lambda x: main_wrapper.fused_conv1d_gdn(**x, **static))(kwargs)
+    (got_conv, got_rec), got_out = got
+    (want_conv, want_rec), want_out = want
+    # The checkpoint slots each window writes for its real tokens.
+    slots = np.concatenate(
+        [s * window + 1 + np.arange(n) for s, n in enumerate(lengths)]
+    )
+    # Conv states are input rows, moved, not computed.
+    np.testing.assert_array_equal(got_conv[slots], want_conv[slots])
+    for g, w in ((got_out, want_out), (got_rec[slots], want_rec[slots])):
+        np.testing.assert_allclose(
+            np.asarray(g, np.float32), np.asarray(w, np.float32), rtol=2e-2, atol=2e-2
+        )
 
 
 def _decode_call_params(n_kq=1, n_v=2, window=4, **kwargs):
