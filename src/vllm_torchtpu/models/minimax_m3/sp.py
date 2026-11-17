@@ -37,21 +37,42 @@ buffers in the same order, so a bucket handed between the traces keeps its
 input signature.
 """
 
+import dataclasses
+from typing import Any
+
+import jax
+import jax.numpy as jnp
 import torch
-from vllm.distributed import (
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_reduce_scatter,
-)
+from jax import lax
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+from torch_tpu._internal import pallas
+from vllm.distributed import parallel_state
 
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, get_ep_group
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 FP8_MAX = 448.0
 _SCALE_FLOOR = 1e-12
 
 
+@dataclasses.dataclass(frozen=True)
+class _Ops:
+    n: int
+    reduce_scatter: Any
+    all_gather: Any
+    all_gather_fp8: Any
+
+
+_OPS: _Ops | None = None
+
+
 def active(num_tokens: int, min_tokens: int, tp_size: int) -> bool:
     """Whether a step of `num_tokens` takes the sequence-parallel stream."""
-    if min_tokens <= 0 or tp_size <= 1:
+    if min_tokens <= 0 or tp_size <= 1 or _OPS is None:
         return False
     # Only the backbone warmup gives each side of this branch its own trace
     # (`shape_variants.aot_cache_tag` is set there); any other compile of the
@@ -61,25 +82,105 @@ def active(num_tokens: int, min_tokens: int, tp_size: int) -> bool:
     return num_tokens >= min_tokens and num_tokens % tp_size == 0
 
 
+def _jax_op(name: str, body, mesh, fake):
+    axis = mesh.axis_names[0]
+    sharded = jax.shard_map(
+        body, mesh=mesh, in_specs=(P(axis),), out_specs=P(axis), check_vma=False
+    )
+
+    # torch_tpu reads the operand types from this annotation.
+    def fn(x: jax.Array) -> jax.Array:
+        return sharded(jax.device_put(x, NamedSharding(mesh, P(axis))))
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        name,
+        fn,
+        mesh=mesh,
+        input_partition_specs=(P(axis),),
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(fake)
+    return op
+
+
+def _make_ops(mesh) -> _Ops:
+    axis = mesh.axis_names[0]
+    n = int(mesh.size)
+
+    def rs(x):
+        return lax.psum_scatter(x, axis, scatter_dimension=0, tiled=True)
+
+    def ag(x):
+        return lax.all_gather(x, axis, axis=0, tiled=True)
+
+    def ag8(x):
+        xf = x.astype(jnp.float32)
+        scale = jnp.maximum(jnp.max(jnp.abs(xf), axis=-1, keepdims=True), _SCALE_FLOOR)
+        scale = scale / FP8_MAX
+        q = (xf / scale).astype(jnp.float8_e4m3fn)
+        q = lax.all_gather(lax.bitcast_convert_type(q, jnp.uint8), axis, axis=0, tiled=True)
+        q = lax.bitcast_convert_type(q, jnp.float8_e4m3fn)
+        scale = lax.all_gather(scale, axis, axis=0, tiled=True)
+        return (q.astype(jnp.float32) * scale).astype(x.dtype)
+
+    def fake_rs(x):
+        return x.new_empty((x.shape[0] // n, *x.shape[1:]))
+
+    def fake_ag(x):
+        return x.new_empty((x.shape[0] * n, *x.shape[1:]))
+
+    return _Ops(
+        n=n,
+        reduce_scatter=_jax_op("minimax_sp::reduce_scatter", rs, mesh, fake_rs),
+        all_gather=_jax_op("minimax_sp::all_gather", ag, mesh, fake_ag),
+        all_gather_fp8=_jax_op("minimax_sp::all_gather_fp8", ag8, mesh, fake_ag),
+    )
+
+
+def arm() -> None:
+    """Build the stream's collectives over the TP group. Collective over the
+    TP group; runs once at the end of TPUModelRunner.load_model, outside any
+    trace (the mesh is built from a gather of device ids)."""
+    global _OPS
+    tp = parallel_state.get_tp_group()
+    if tp.world_size == 1:
+        return
+    ep = get_ep_group()
+    tp_ranks = tuple(int(r) for r in tp.ranks)
+    if ep is None or tp_ranks != tuple(int(r) for r in ep.ranks):
+        raise ValueError(
+            "TPU_MINIMAX_M3_SP_MIN_TOKENS needs an EP group over the TP ranks "
+            f"(TP {tp_ranks}, EP {None if ep is None else tuple(ep.ranks)})"
+        )
+    if len(tp_ranks) != torch.distributed.get_world_size():
+        raise ValueError("TPU_MINIMAX_M3_SP_MIN_TOKENS needs TP over the whole world")
+    mesh = build_ep_mesh()
+    if mesh is None:
+        raise ValueError("TPU_MINIMAX_M3_SP_MIN_TOKENS: no EP mesh")
+    _OPS = _make_ops(mesh)
+    logger.info(
+        "TPU_MINIMAX_M3_SP_MIN_TOKENS: sequence-parallel collectives armed over "
+        "%d ranks.",
+        _OPS.n,
+    )
+
+
 def reduce_scatter(x: torch.Tensor) -> torch.Tensor:
-    """This rank's token rows of the TP sum of `x` [T, H] -> [T / tp, H]."""
-    return tensor_model_parallel_reduce_scatter(x, 0)
+    """A 1/TP token slice of the TP sum of `x`: [T, H] -> [T / tp, H]. The
+    slices are in mesh order, the order `all_gather` puts them back in."""
+    assert _OPS is not None
+    return _OPS.reduce_scatter(x)
 
 
 def all_gather(x: torch.Tensor, fp8: bool) -> torch.Tensor:
-    """Every rank's token rows, in rank order: [T / tp, H] -> [T, H] bf16.
+    """Every rank's slice, in mesh order: [T / tp, H] -> [T, H] in x.dtype.
 
-    fp8: each row goes over the wire as e4m3 with one f32 scale (amax / 448),
-    and is expanded back to `x.dtype` after the gather.
+    fp8: each row goes over the wire as e4m3 with one f32 scale (amax / 448)
+    and is expanded back after the gather.
     """
-    if not fp8:
-        return tensor_model_parallel_all_gather(x, 0)
-    xf = x.float()
-    scale = xf.abs().amax(dim=-1, keepdim=True).clamp(min=_SCALE_FLOOR) / FP8_MAX
-    q = (xf / scale).to(torch.float8_e4m3fn)
-    q = tensor_model_parallel_all_gather(q.view(torch.uint8), 0)
-    scale = tensor_model_parallel_all_gather(scale, 0)
-    return (q.view(torch.float8_e4m3fn).float() * scale).to(x.dtype)
+    assert _OPS is not None
+    return (_OPS.all_gather_fp8 if fp8 else _OPS.all_gather)(x)
 
 
 def embed_partial(embed: torch.nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
