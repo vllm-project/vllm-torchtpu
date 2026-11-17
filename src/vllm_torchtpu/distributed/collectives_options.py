@@ -79,21 +79,37 @@ def get(vllm_config: Any) -> CollectivesOptions:
 
 
 def validate(vllm_config: Any) -> None:
-    """Parse the section and refuse options the parallel config cannot serve,
-    while the platform checks the config: before any weight loads.
+    """Parse the section and refuse options the engine cannot serve, while the
+    platform checks the config: before any weight loads.
+
+    The small collectives run over vLLM's expert-parallel group. vLLM builds
+    that group for every MoE model, with or without --enable-expert-parallel,
+    over data x prefill-context x tensor parallel ranks (``_EP`` in
+    ``vllm/distributed/parallel_state.py``, ``initialize_model_parallel``),
+    and ``ep_mesh.get_ep_group`` takes it when it spans more than one rank.
 
     Raises:
       ValueError: the section does not parse.
-      NotImplementedError: ``small_all_reduce`` without expert parallelism,
-        whose mesh the kernels run over.
+      NotImplementedError: ``small_all_reduce`` on a dense model, or on one
+        rank, where that group does not exist.
     """
-    options = get(vllm_config)
-    if (
-        options.small_all_reduce
-        and not vllm_config.parallel_config.enable_expert_parallel
-    ):
-        raise NotImplementedError(
-            f"{SECTION}.small_all_reduce builds its kernels over the "
-            "expert-parallel mesh. Pass --enable-expert-parallel, or turn the "
-            "option off."
-        )
+    if not get(vllm_config).small_all_reduce:
+        return
+    model_config = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    ranks = (
+        parallel.data_parallel_size
+        * parallel.prefill_context_parallel_size
+        * parallel.tensor_parallel_size
+    )
+    if model_config is not None and not model_config.is_moe:
+        reason = "a dense model"
+    elif ranks == 1:
+        reason = "one rank (data x prefill-context x tensor parallel size 1)"
+    else:
+        return
+    raise NotImplementedError(
+        f"{SECTION}.small_all_reduce runs its kernels over vLLM's "
+        "expert-parallel group, which vLLM builds only for a MoE model on more "
+        f"than one rank; this engine is {reason}. Turn the option off."
+    )
