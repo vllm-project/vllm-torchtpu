@@ -13,8 +13,6 @@ stream: maxima come from chunked score reads, and only the chosen blocks are
 fetched from HBM.
 """
 
-import math
-
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -27,6 +25,9 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     RADIX_BUCKETS,
     _ordered_bits,
 )
+
+# Score keys per streamed read; see `_chunk`.
+_STREAM_CHUNK = 8192
 
 
 def default_blocks(k: int, lanes: int, forced: bool = True) -> int:
@@ -41,8 +42,13 @@ def _length_words(rows: int) -> int:
 
 
 def _chunk(width: int) -> int:
-    """Score keys per streamed read when the row is not resident."""
-    return math.gcd(width, 8192)
+    """Score keys per streamed read when the row is not resident.
+
+    The last read ends at the row's end and re-reduces the keys it shares with
+    the previous read, so the chunk need not divide the width. A divisor can be
+    tiny: width 148,224 read 256 keys at a time, 930 us against 51 us resident.
+    """
+    return min(width, _STREAM_CHUNK)
 
 
 def _vmem_words(rows, width, block_width, k, blocks, block_size, buffers, resident):
@@ -87,7 +93,8 @@ def is_supported(rows: int, width: int, k: int, block_size: int) -> bool:
     blocks = default_blocks(k, sc.num_lanes)
     block_width = pl.cdiv(pl.cdiv(width, block_size), alignment) * alignment
     plan = _plan(rows, width, block_width, k, blocks, block_size)
-    streamable = _chunk(width) % (sc.num_lanes * block_size) == 0
+    span = sc.num_lanes * block_size
+    streamable = width % span == 0 and _chunk(width) % span == 0
     return blocks * block_size < width and plan is not None and (plan[0] or streamable)
 
 
@@ -218,9 +225,13 @@ def block_topk(
             """Reduce the visible chunks' block maxima, reading two chunks ahead."""
             reads = pl.cdiv(tokens, chunk)
 
+            def offset(c):
+                # Span-aligned: streamed widths and chunks are span multiples.
+                return jnp.minimum(c * chunk, width - chunk)
+
             def read(c, s):
                 return pltpu.make_async_copy(
-                    score_ref.at[row_id, pl.ds(c * chunk, chunk)],
+                    score_ref.at[row_id, pl.ds(offset(c), chunk)],
                     score_buffers.at[pl.ds(s * chunk, chunk)],
                     score_sems.at[s],
                 )
@@ -236,7 +247,7 @@ def block_topk(
                 @plsc.parallel_loop(0, chunk // span, unroll=8)
                 def reduce(i):
                     window = score_buffers.at[pl.ds(s * chunk + i * span, span)]
-                    start = c * (chunk // block_size) + i * lanes
+                    start = offset(c) // block_size + i * lanes
                     maxima[pl.ds(start, lanes)] = block_max(window)
 
         def fetch_blocks(row_id, count):

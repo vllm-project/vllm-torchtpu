@@ -19,6 +19,8 @@ CASES = [(32, 49408, d) for d in ("random", "relu", "signed_zero", "masked")]
 # 1M-token contexts (ratio 2 and 1): rows stream from HBM; the widest is
 # unsupported and must fall back.
 CASES += [(32, 524288, "random"), (32, 1048576, "masked")]
+# A streamed width that 8,192-key reads do not divide: the last read overlaps.
+CASES += [(96, 148224, "random")]
 
 
 def _scores(distribution, rows, width, rng):
