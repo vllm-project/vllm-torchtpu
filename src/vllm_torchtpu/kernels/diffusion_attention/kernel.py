@@ -17,8 +17,8 @@
 # Changes from the original:
 # - Inlined LOG2_E, FIXED_M_RECENTER, FIXED_M_SAFE_BOUND,
 #   max_row_norm_per_head(), and fixed_m_operands().
-# - Removed the ring-attention residual path (residual_attention,
-#   emit_residuals) and the E4M3 QK path (qk_fp8), which are not used here.
+# - Removed the E4M3 QK path (qk_fp8), which is not used here; kept
+#   emit_residuals for residual_flash_attention_bhsd and 2D Ring-Ulysses.
 # - flash_attention_bshd() replaces attention(): (B, S, H, D) inputs and
 #   outputs, block sizes from autotune_block_sizes(), and fixed-m only
 #   when K/V spans more than one block. Lane-aligned heads are DMA'd as
@@ -49,6 +49,7 @@ collectives around it.
 
 import functools
 import math
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -204,6 +205,7 @@ def _flash_attention_kernel(
     kv_seq_len: int,
     use_fixed_m: bool,
     score_scale: float,
+    emit_residuals: bool = False,
 ) -> None:
     """Hybrid fixed-m / online-softmax flash attention over one (h, i) tile.
 
@@ -368,12 +370,17 @@ def _flash_attention_kernel(
 
     @pl.when(j == grid_width - 1)
     def end():
-        # Normalize by l; the (1, bq) inverse broadcasts up sublanes (every
-        # row of l holds the same sums).
-        (o_ref,) = out_refs
-        l = l_scratch_ref[...]
-        l_inv = 1.0 / l[0:1]
-        o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
+        if emit_residuals:
+            o_out_ref, m_out_ref, l_out_ref = out_refs
+            o_out_ref[...] = o_scratch_ref[...]
+            m_out_ref[...] = m_scratch_ref[...]
+            l_out_ref[...] = l_scratch_ref[...]
+        else:
+            # Normalize by l; the (1, bq) inverse broadcasts up sublanes.
+            (o_ref,) = out_refs
+            l = l_scratch_ref[...]
+            l_inv = 1.0 / l[0:1]
+            o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
 
 
 def _splash_attention_forward(
@@ -388,6 +395,7 @@ def _splash_attention_forward(
     kv_seq_len: int | None = None,
     use_fixed_m: bool = False,
     column_heads: tuple[int, int] | None = None,
+    emit_residuals: bool = False,
 ):
     """Runs the fused splash kernel over ``(heads, seq, dim)`` q/k/v.
 
@@ -406,10 +414,16 @@ def _splash_attention_forward(
         column_heads: ``(num_heads, num_kv_heads)`` when q/k/v are
             ``(seq, heads * dim)`` instead: each head is a lane-aligned
             column block, DMA'd in place with no transposes.
+        emit_residuals: when True, skip final normalization and return the
+            unnormalized output with its log2 softmax residuals in f32.
 
     Returns:
-        The normalized output ``(num_heads, head_dim_v, seq_q)`` in
-        ``q.dtype``.
+        When ``emit_residuals`` is False, the normalized output
+        ``(num_heads, head_dim_v, seq_q)`` in ``q.dtype``. When True, a tuple
+        ``(o_unnorm, m, l)`` of ``float32`` arrays with shapes
+        ``(num_heads, head_dim_v, seq_q)``, ``(num_heads, NUM_SUBLANES, seq_q)``,
+        and ``(num_heads, NUM_SUBLANES, seq_q)``, where ``m`` is the log2-scaled
+        row max and ``l`` is the ``exp2(scores_log2 - m)`` row sum.
     """
     if column_heads is None:
         num_q_heads, padded_q_seq_len, head_dim_qk = q.shape
@@ -472,10 +486,19 @@ def _splash_attention_forward(
     ]
     # Index of the first REAL output, after the scratch block above.
     first_out = len(out_shapes)
+    o_out_dtype = jnp.float32 if emit_residuals else q.dtype
     out_shapes.append(
-        jax.ShapeDtypeStruct((num_q_heads, head_dim_v, actual_q_seq_len), q.dtype)
+        jax.ShapeDtypeStruct((num_q_heads, head_dim_v, actual_q_seq_len), o_out_dtype)
     )
     out_specs.append(pl.BlockSpec((None, head_dim_v, bq), out_index_map))
+    if emit_residuals:
+        for _ in range(2):
+            out_shapes.append(
+                jax.ShapeDtypeStruct(
+                    (num_q_heads, NUM_SUBLANES, actual_q_seq_len), jnp.float32
+                )
+            )
+            out_specs.append(pl.BlockSpec((None, NUM_SUBLANES, bq), out_index_map))
     # Use actual (unpadded) seq lens with ceiling division.
     grid_width = (actual_kv_seq_len + bkv - 1) // bkv
     grid_height = (actual_q_seq_len + bq - 1) // bq
@@ -492,6 +515,7 @@ def _splash_attention_forward(
             kv_seq_len=actual_kv_seq_len,
             use_fixed_m=use_fixed_m,
             score_scale=score_scale,
+            emit_residuals=emit_residuals,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -506,6 +530,8 @@ def _splash_attention_forward(
         ),
         out_shape=out_shapes,
     )(mk, q, k, v)
+    if emit_residuals:
+        return tuple(all_out[first_out:])
     return all_out[first_out]
 
 
@@ -631,5 +657,254 @@ def flash_attention_bshd(
         )
 
     out = jax.vmap(_kernel_3d, in_axes=(0, 0, 0), out_axes=0)(q, k, v)
+    assert isinstance(out, jax.Array)
     # Output is (B, heads, dim, seq) — transpose back to (B, seq, heads, dim).
     return out.transpose(0, 3, 1, 2).astype(query.dtype)
+
+
+RING_LSE_INIT = -1e30
+LSE_EPS = 1e-20
+
+
+def partial_to_lse(
+    o_unnorm: jax.Array,
+    m: jax.Array,
+    l: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Converts splash residuals (o_unnorm, m, l) to (o_norm, lse) in log2 space."""
+    l_safe = jnp.maximum(l, LSE_EPS)
+    o_norm = jnp.where(l > 0.0, o_unnorm / l_safe, 0.0)
+    lse = jnp.where(l > 0.0, m + jnp.log2(l_safe), RING_LSE_INIT)
+    return o_norm, lse
+
+
+def merge_partials(
+    o_a: jax.Array,
+    lse_a: jax.Array,
+    o_b: jax.Array,
+    lse_b: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Merges two partial attention outputs using log2-sum-exp."""
+    lse_max = jnp.maximum(lse_a, lse_b)
+    w_a = jnp.exp2(lse_a - lse_max)
+    w_b = jnp.exp2(lse_b - lse_max)
+    w_sum = jnp.maximum(w_a + w_b, LSE_EPS)
+    lse_new = lse_max + jnp.log2(w_sum)
+    o_new = (w_a * o_a + w_b * o_b) / w_sum
+    return o_new, lse_new
+
+
+# Measured residual block-size overrides for TPU v7x ring attention steps.
+_RING_MEASURED_BLOCK_OVERRIDES: dict[tuple[int, int, int], dict[str, int]] = {
+    (7, 37800, 37800): {"block_q": 6400, "block_kv": 2048, "block_kv_compute": 2048},
+    (7, 18900, 18900): {"block_q": 9472, "block_kv": 1024, "block_kv_compute": 1024},
+    (7, 55800, 55800): {"block_q": 6400, "block_kv": 2048, "block_kv_compute": 2048},
+}
+
+
+def residual_flash_attention_bhsd(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    *,
+    scale: float | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Device-local unnormalized splash attention over ``(B, H, S, D)`` inputs.
+
+    Scores are scaled by ``scale * log2(e)`` and accumulated in base-2
+    exponentials (``p_unnorm = exp2(scores_log2 - m)``).
+
+    Returns:
+        Tuple ``(o_unnorm, m, l)`` of ``float32`` arrays:
+        - ``o_unnorm``: ``(B, H, S_q, D_v)`` unnormalized attention output.
+        - ``m``: ``(B, H, S_q, 1)`` row-wise max of log2-scaled scores.
+        - ``l``: ``(B, H, S_q, 1)`` row-wise sum of ``exp2(scores_log2 - m)``.
+    """
+    _, _, q_orig_len, head_dim = query.shape
+    _, _, kv_orig_len, _ = value.shape
+    spec = detect_spec()
+    override = _RING_MEASURED_BLOCK_OVERRIDES.get(
+        (spec.generation, q_orig_len, kv_orig_len)
+    )
+    block_cfg = (
+        override
+        if override is not None
+        else autotune_block_sizes(
+            q_orig_len,
+            head_dim,
+            2,
+            spec,
+            kv_orig_len,
+            "online",
+        )
+    )
+    bsizes = _local_blocks(
+        q_orig_len,
+        kv_orig_len,
+        **block_cfg,
+    )
+    scale_factor = 1.0 / math.sqrt(head_dim) if scale is None else scale
+    score_scale = scale_factor * LOG2_E
+    q = query.astype(jnp.bfloat16)
+    k = key.astype(jnp.bfloat16)
+    v = value.astype(jnp.bfloat16)
+    mk_arr = jnp.zeros((2, 1), jnp.float32)
+
+    def _kernel_3d(q_3d, k_3d, v_3d):
+        return _splash_attention_forward(
+            q_3d,
+            k_3d,
+            v_3d,
+            mk_arr,
+            bsizes,
+            score_scale=score_scale,
+            q_seq_len=q_orig_len,
+            kv_seq_len=kv_orig_len,
+            use_fixed_m=False,
+            column_heads=None,
+            emit_residuals=True,
+        )
+
+    o_un, m_raw, l_raw = jax.vmap(_kernel_3d, in_axes=(0, 0, 0), out_axes=0)(q, k, v)
+    # Transpose o_un to (B, H, S, D) and take sublane 0 of m and l.
+    o_un = jnp.swapaxes(o_un, -1, -2)
+    m = jnp.swapaxes(m_raw[:, :, 0:1, :], -1, -2)
+    l = jnp.swapaxes(l_raw[:, :, 0:1, :], -1, -2)
+    return o_un, m, l
+
+
+def residual_reference_bhsd(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    *,
+    scale: float | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Device-agnostic reference residual attention in log2 space."""
+    head_dim = query.shape[-1]
+    scale_factor = 1.0 / math.sqrt(head_dim) if scale is None else scale
+    score_scale = scale_factor * LOG2_E
+    q = query.astype(jnp.float32)
+    k = key.astype(jnp.float32)
+    v = value.astype(jnp.float32)
+    q_heads_per_kv = q.shape[1] // k.shape[1]
+    if q_heads_per_kv > 1:
+        k = jnp.repeat(k, q_heads_per_kv, axis=1)
+        v = jnp.repeat(v, q_heads_per_kv, axis=1)
+    scores = (
+        jnp.einsum("bhsd,bhkd->bhsk", q, k, precision=jax.lax.Precision.HIGHEST)
+        * score_scale
+    )
+    m = jnp.max(scores, axis=-1, keepdims=True)
+    p_unnorm = jnp.exp2(scores - m)
+    l = jnp.sum(p_unnorm, axis=-1, keepdims=True)
+    o_un = jnp.einsum(
+        "bhsk,bhkd->bhsd", p_unnorm, v, precision=jax.lax.Precision.HIGHEST
+    )
+    return o_un, m, l
+
+
+def ring_flash_attention_bhsd(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    *,
+    ring_axis: str = "ring",
+    scale: float | None = None,
+    residual_fn: Callable[..., tuple[jax.Array, jax.Array, jax.Array]] = (
+        residual_flash_attention_bhsd
+    ),
+) -> jax.Array:
+    """Ring attention over (B, H, S_local, D) with ppermute K/V rotation.
+
+    Tests inject a CPU reference through ``residual_fn`` in place of the TPU
+    Pallas kernel.
+    """
+    ring_size = lax.axis_size(ring_axis)
+    b, h, s_q, _ = q.shape
+    d_v = v.shape[-1]
+    if ring_size == 1:
+        o_un, m, l = residual_fn(q, k, v, scale=scale)
+        o_norm, _ = partial_to_lse(o_un, m, l)
+        return o_norm.astype(q.dtype)
+
+    perm = [(i, (i + 1) % ring_size) for i in range(ring_size)]
+    o_init = jnp.zeros((b, h, s_q, d_v), dtype=jnp.float32)
+    lse_init = jnp.full((b, h, s_q, 1), RING_LSE_INIT, dtype=jnp.float32)
+
+    def compute_and_merge(o_acc, lse_acc, k_cur, v_cur):
+        o_un, m_part, l_part = residual_fn(q, k_cur, v_cur, scale=scale)
+        o_part, lse_part = partial_to_lse(o_un, m_part, l_part)
+        return merge_partials(o_acc, lse_acc, o_part, lse_part)
+
+    def scan_body(carry, _):
+        o_acc, lse_acc, k_cur, v_cur = carry
+        o_acc, lse_acc = compute_and_merge(o_acc, lse_acc, k_cur, v_cur)
+        k_next = lax.ppermute(k_cur, axis_name=ring_axis, perm=perm)
+        v_next = lax.ppermute(v_cur, axis_name=ring_axis, perm=perm)
+        return (o_acc, lse_acc, k_next, v_next), None
+
+    (o_acc, lse_acc, k_last, v_last), _ = lax.scan(
+        scan_body,
+        (o_init, lse_init, k, v),
+        None,
+        length=ring_size - 1,
+        unroll=True,
+    )
+    o_final, _ = compute_and_merge(o_acc, lse_acc, k_last, v_last)
+    return o_final.astype(q.dtype)
+
+
+def ring_ulysses_flash_attention_bshd(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    *,
+    ring_axis: str = "ring",
+    uly_axis: str | None = "uly",
+    scale: float | None = None,
+    residual_fn: Callable[..., tuple[jax.Array, jax.Array, jax.Array]] = (
+        residual_flash_attention_bhsd
+    ),
+) -> jax.Array:
+    """2D Ring-Ulysses attention over (B, S_local, H, D) inside shard_map.
+
+    Tests inject a CPU reference through ``residual_fn`` in place of the TPU
+    Pallas kernel.
+    """
+    use_uly = uly_axis is not None and lax.axis_size(uly_axis) > 1
+    if use_uly:
+        assert uly_axis is not None
+        q = jnp.swapaxes(
+            lax.all_to_all(query, uly_axis, split_axis=2, concat_axis=1, tiled=True),
+            1,
+            2,
+        )
+        k = jnp.swapaxes(
+            lax.all_to_all(key, uly_axis, split_axis=2, concat_axis=1, tiled=True),
+            1,
+            2,
+        )
+        v = jnp.swapaxes(
+            lax.all_to_all(value, uly_axis, split_axis=2, concat_axis=1, tiled=True),
+            1,
+            2,
+        )
+    else:
+        q = jnp.swapaxes(query, 1, 2)
+        k = jnp.swapaxes(key, 1, 2)
+        v = jnp.swapaxes(value, 1, 2)
+    out = ring_flash_attention_bhsd(
+        q,
+        k,
+        v,
+        ring_axis=ring_axis,
+        scale=scale,
+        residual_fn=residual_fn,
+    )
+    if use_uly:
+        assert uly_axis is not None
+        return lax.all_to_all(
+            jnp.swapaxes(out, 1, 2), uly_axis, split_axis=1, concat_axis=2, tiled=True
+        )
+    return jnp.swapaxes(out, 1, 2)
