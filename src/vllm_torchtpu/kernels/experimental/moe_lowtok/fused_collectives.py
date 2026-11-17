@@ -13,7 +13,7 @@
 # limitations under the License.
 """The moe_lowtok decode layer with its DP dispatch and EP combine inside the kernel.
 
-On a DP x TP expert-parallel decode cell the routed MoE layer is an all-gather of
+On a DP x TP expert-parallel decode layout the routed MoE layer is an all-gather of
 the engine rows and router logits over the DP axis, the moe_lowtok call over the
 rank's experts, a DP reduce-scatter of the partial sums and a TP all-reduce, each
 its own program. This entry runs the collectives as remote DMAs between the cores

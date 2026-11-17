@@ -161,7 +161,7 @@ def test_peer_ids_name_every_mesh_axis_inside_mesh_axes(on_8_devices):
         assert (by_name_dp, by_name_tp) == (dp_index, 1)
         # In mesh order: (dp, tp).
         assert (first, second, n_order) == (dp_index, 1, 2)
-        # Outside mesh_axes, the one-axis id as before.
+        # Outside mesh_axes, the one-axis id.
         assert n_outside == 1
 
 
