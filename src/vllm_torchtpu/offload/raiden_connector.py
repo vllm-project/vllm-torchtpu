@@ -335,7 +335,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     def poll_and_complete_transfers(self, scheduler: Any) -> tuple[int, int, int, bool]:
         """Poll Raiden C++ transfer completions at the start of ``schedule()``
         so completed H2D loads promote ``WAITING_FOR_REMOTE_KVS`` requests in
-        the very next step instead of waiting 2 steps for the worker echo."""
+        the very next step instead of waiting 2 steps for the worker echo.
+
+        The prefix-aware schedulers call it at the start of each step
+        (PrefixAwareScheduler, #3080; the pipeline chunk scheduler's
+        prefix-aware admission, #3090); a scheduler that does not keeps the
+        worker echo."""
         self._scheduler = scheduler
         t0_ns = time.perf_counter_ns()
         manager = self._raiden_manager
@@ -801,9 +806,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
         ``PrefixAwareScheduler._external_warmth`` asks this for the waiting
         sort, the warmest-first promotion and the pipeline scheduler's
-        pending-work estimate. Without an answer, a request whose prefix is in
-        the host tier but no longer in HBM is ranked as a cold prompt and waits
-        behind cheaper work while its host-tier entries age towards eviction.
+        pending-work estimate (#3080, #3090). Without an answer, a request
+        whose prefix is in the host tier but no longer in HBM is ranked as a
+        cold prompt and waits behind cheaper work while its host-tier entries
+        age towards eviction.
 
         The probe changes nothing: lookups take no pin and refresh no recency,
         no lookup event is emitted, and the lookup state the probe moves is
@@ -871,7 +877,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     ) -> int | None:
         """Return the block-aligned local FullAttention prefix length to retain
         in HBM when HBM has a divergent hybrid hit (FullAttention > Mamba), or
-        None if Raiden CPU cannot advance past ``num_reconciled``."""
+        None if Raiden CPU cannot advance past ``num_reconciled``.
+
+        The prefix-aware schedulers' local-hit lookup asks this when the
+        connector reports divergent local hybrid hits (#3080, #3090)."""
         if getattr(request, "skip_reading_prefix_cache", False):
             return None
         req_status = self._req_status.get(request.request_id)
