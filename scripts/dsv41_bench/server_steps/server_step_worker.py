@@ -8,6 +8,7 @@ Host cadence is not a device event clock or isolated encoder/decoder duration.
 import functools
 import hashlib
 import json
+import os
 import logging
 import math
 import socket
@@ -37,7 +38,14 @@ class Scenario:
         return asdict(self)
 
 
-SCENARIO = Scenario("encoder_extend", 8, extend_tokens=16384)
+# DSV41_PREFILL_PREFIX_TOKENS sets the cached prefix, e.g. 131072 for a
+# 147K-token AgentX context.
+SCENARIO = Scenario(
+    "encoder_extend",
+    8,
+    prefix_tokens=int(os.environ.get("DSV41_PREFILL_PREFIX_TOKENS", "98304")),
+    extend_tokens=16384,
+)
 DECODE_SCENARIO = Scenario(
     "decode", 384, prefix_tokens=98304, output_tokens=512, chunk_tokens=2048
 )
