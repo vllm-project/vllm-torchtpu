@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_torchtpu.distributed.kv_transfer.connector_names import MULTI_CONNECTORS
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
@@ -4536,6 +4537,29 @@ def test_kv_transfer_uses_stage_timing():
         )
     )
     assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_multi_with_tpu) is True
+
+
+@pytest.mark.parametrize("multi", MULTI_CONNECTORS)
+@pytest.mark.parametrize(
+    "children,want",
+    [
+        (["TPURaidenOffloadingConnector", "TPURaidenConnector"], True),
+        (["OffloadingConnector"], False),
+        ([], False),
+    ],
+)
+def test_kv_transfer_stage_timing_reads_every_multi_connector(multi, children, want):
+    """Every multi-connector `connector_names` knows is walked the same way,
+    so a name added there cannot silently turn the stage timings off."""
+    cfg = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector=multi,
+            kv_connector_extra_config={
+                "connectors": [{"kv_connector": c} for c in children]
+            },
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg) is want
 
 
 def test_update_states_clears_prev_draft_len_of_scheduled_cached_requests():
