@@ -283,6 +283,55 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
             )
 
 
+class MergePiecesMinTokensTest(parameterized.TestCase):
+    """The V-space merge's c1k chunks come from their own kernel buffers: a
+    chunk sliced out of one buffer is a T(16,128) copy its matmul reads ~2x
+    slower (j-80a3e52c: 48 us copy + 2x47 us per layer vs 2x25)."""
+
+    def _env(self, **values):
+        env = {k: v for k, v in os.environ.items() if k not in values}
+        env.update({k: v for k, v in values.items() if v is not None})
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    SERVED = dict(
+        TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS="2048",
+        TPU_DCP_MLA_UV_BEFORE_MERGE="1",
+        TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS="1024",
+    )
+
+    def _edge(self, **values):
+        with self._env(**{**self.SERVED, **values}):
+            return envs.bucket_gate_edge(attention_interface.merge_pieces_min_tokens())
+
+    def test_vspace_lowers_to_the_uv_gate(self):
+        edge = self._edge(TPU_DCP_MERGE_VSPACE_FUSED="1")
+        self.assertGreater(1024, edge)  # c1k now takes pieces
+        self.assertLessEqual(512, edge)  # c512 (unchunked) does not
+
+    @parameterized.parameters(
+        dict(TPU_DCP_MERGE_VSPACE_FUSED="0"),
+        dict(TPU_DCP_MERGE_VSPACE_FUSED="1", TPU_DCP_MLA_UV_BEFORE_MERGE="0"),
+    )
+    def test_latent_merge_keeps_its_gate(self, **values):
+        edge = self._edge(**values)
+        self.assertLessEqual(1024, edge)
+        self.assertGreater(2048, edge)
+
+    def test_never_raises_the_pieces_gate(self):
+        edge = self._edge(
+            TPU_DCP_MERGE_VSPACE_FUSED="1",
+            TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS="512",
+            TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS="2048",
+        )
+        self.assertEqual(edge, envs.bucket_gate_edge(512))
+
+    def test_uv_gate_zero_is_every_bucket(self):
+        edge = self._edge(
+            TPU_DCP_MERGE_VSPACE_FUSED="1", TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS="0"
+        )
+        self.assertEqual(edge, 0)
+
+
 class DcpMlaTopkCapTest(parameterized.TestCase):
     """The capped sparse-MLA defaults #1510 shipped for GLM-5.2 AgentX: a
     512 cap (from DCP16 there; from DCP8 since the trial-4 E2E served DCP8
