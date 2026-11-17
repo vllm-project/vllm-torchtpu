@@ -42,6 +42,12 @@ def _sched(horizon=0.0, max_wait=0.0, target_ms=6.0):
     s.hold_horizon_s = horizon
     s.max_wait_s = max_wait
     s._wait_releases = 0
+    s.priced = False
+    s.price_reserve = 0.0
+    s._prefill_cap = None
+    s.min_chunk = 256
+    s._s_per_token = 40e-6
+    s.max_num_scheduled_tokens = 8192
     s._decode_t0 = {}
     s._seen_out = {}
     s._tokens_per_step = 4.0
@@ -114,3 +120,39 @@ def test_max_wait_off_holds():
     _in_band(s, r, time.monotonic())
     old = [_req("w", 0, arrival=time.time() - 100.0)]
     assert s._hold_for_tpot([r], old) is True
+
+
+@pytest.mark.parametrize("reserve,slack,expect_hold,expect_cap", [
+    # extra = 0.39 s. Reserve 1: slack 0.3 < extra -> hold (band rule).
+    (1.0, 0.3, True, None),
+    # Reserve 1, slack 0.5: 0.11 s left -> 2750 tokens at 40 us.
+    (1.0, 0.5, False, 2750),
+    # Reserve 0.5: slack 0.3 - 0.195 = 0.105 s -> 2625 tokens.
+    (0.5, 0.3, False, 2625),
+    # Reserve 1, slack 0.395: 0.005 s -> 125 tokens < min chunk -> hold.
+    (1.0, 0.395, True, None),
+])
+def test_price_reserve(reserve, slack, expect_hold, expect_cap):
+    s = _sched()
+    s.priced = True
+    s.price_reserve = reserve
+    r = _req("a", 500)
+    now = time.monotonic()
+    _in_band(s, r, now, slack_s=slack)
+    assert s._price_prefill([r], now) is expect_hold
+    if expect_cap is None:
+        assert s._prefill_cap is None
+    else:
+        assert abs(s._prefill_cap - expect_cap) <= 1
+
+
+def test_max_wait_lifts_price_cap():
+    s = _sched(max_wait=8.0)
+    s.priced = True
+    s.price_reserve = 1.0
+    r = _req("a", 500)
+    _in_band(s, r, time.monotonic(), slack_s=0.5)
+    old = [_req("w", 0, arrival=time.time() - 9.0)]
+    assert s._hold_for_tpot([r], old) is False
+    assert s._prefill_cap is None
+    assert s._wait_releases == 1
