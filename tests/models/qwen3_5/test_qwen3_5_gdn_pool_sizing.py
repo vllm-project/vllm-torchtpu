@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Main's unified-pool block sizing (platforms/tpu_block_size_utils.py) for
-the Qwen3.5-397B GDN geometry at the IX serving layouts.
+the Qwen3.5-397B GDN geometry at the prefill/decode-disaggregated serving
+layouts (TP1 prefill, TP2 and TP8 decode).
 
 The pool keeps the GDN conv state in float32 and the SSM state in the dtype
 the layer declares, which follows vLLM's `--mamba-ssm-cache-dtype` (Qwen3.5
@@ -131,7 +132,8 @@ def test_the_ssm_region_follows_the_declared_ssm_dtype(
 @pytest.mark.parametrize(
     ("tp", "num_spec", "ssm_dtype", "user_block", "final_block"),
     [
-        # The record's --block-size values under main's fp32 conv state.
+        # The --block-size values the measured serving points ran with, under
+        # main's fp32 conv state.
         (1, 1, "bfloat16", 2176, 2304),
         (2, 3, "bfloat16", 640, 1280),
         (8, 3, "bfloat16", 640, 640),
