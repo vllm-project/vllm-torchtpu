@@ -14,7 +14,7 @@
 """Cross-step memo: a find_longest_cache_hit result reused across scheduler
 steps must equal a fresh lookup exactly.
 
-Drives a real vLLM v0.29 hybrid KVCacheManager (full attention + 2 Mamba
+Drives the pinned vLLM's hybrid KVCacheManager (full attention + 2 Mamba
 "align" groups, fine-grained hash block 2 < block 4, eagle drop on) through
 random admissions, chunked prefills, decodes, frees, evictions, unwritten-block
 clears and prefix-cache resets, and compares every memoized lookup with a fresh

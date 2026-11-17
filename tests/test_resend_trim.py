@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SCHED_TRIM_RESEND_TOKEN_IDS: the trimmed CachedRequestData.all_token_ids
-must give the worker exactly the tokens upstream GPUModelRunner._update_states
-reads (``all_token_ids[req_id][-num_output_tokens:]`` when
-``num_output_tokens > 0``)."""
+"""PrefixAwareScheduler's resend trim: the trimmed
+CachedRequestData.all_token_ids must give the worker exactly the tokens
+vLLM's GPUModelRunner._update_states reads (the last ``num_output_tokens``
+ids when ``num_output_tokens > 0``)."""
 
 import pickle
 import random
@@ -29,7 +29,12 @@ from vllm_torchtpu.core.prefix_aware_scheduler import (
 
 
 def _worker_view(data: CachedRequestData, req_id: str):
-    """What upstream v0.29.0 gpu_model_runner.py:1469-1473 consumes."""
+    """What vLLM's GPUModelRunner._update_states reads from ``all_token_ids``.
+
+    It reads only for a request that is not in the persistent batch, under
+    async scheduling, and then only the last ``num_output_tokens`` ids, to
+    restore the request's output tokens.
+    """
     i = data.req_ids.index(req_id)
     n = data.num_output_tokens[i]
     if n > 0 and req_id in data.all_token_ids:
