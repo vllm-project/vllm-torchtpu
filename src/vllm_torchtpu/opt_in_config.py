@@ -258,6 +258,11 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # below e4m3's normal range; otherwise the matmul equals the bf16 one.
     "minimax_fp8_linears": False,
     "minimax_fp8_draft_linears": False,
+    # MiniMax M3 attention: the q / k / index_q / index_k Gemma RMSNorms and
+    # the partial NeoX rope in one Pallas pass (`kernels/qk_norm_rope.py`)
+    # instead of XLA fusions. Same math (f32 norm rounded to bf16, f32
+    # rotation rounded once); not checked bitwise on TPU.
+    "minimax_qk_norm_rope_kernel": False,
 }
 
 

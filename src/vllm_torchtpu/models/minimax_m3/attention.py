@@ -41,11 +41,17 @@ from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.models.minimax_m3 import kernel_toggles
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
     get_msa_op,
     get_msa_sharded_op,
 )
+from vllm_torchtpu.models.minimax_m3.ops.qk_norm_rope import get_qk_norm_rope_op
+from vllm_torchtpu.opt_in_config import option
+
+logger = init_logger(__name__)
+_NORM_ROPE_LOGGED: list[bool] = []
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -326,6 +332,42 @@ def norm_rope_heads(
     )
 
 
+def norm_rope_heads_kernel(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    norms: tuple[GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm],
+    rotary_emb: nn.Module,
+    op,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`norm_rope_heads` in one Pallas pass, `op`
+    (`ops.qk_norm_rope.get_qk_norm_rope_op` for these head counts; key
+    minimax_qk_norm_rope_kernel): every head normed with its row of a per-head
+    ``1 + w`` table (f32, rounded to the activation dtype), then rotated in
+    f32 and rounded once. Same math; the kernel's outputs have fixed layouts,
+    so XLA cannot re-lay out q for its consumers."""
+    if not rotary_emb.is_neox_style or rotary_emb.head_size != head_dim:
+        raise NotImplementedError("MiniMax M3 rotates NeoX-style within each head.")
+    q_norm, k_norm, index_q_norm, index_k_norm = norms
+    weight = (
+        torch.cat(
+            [
+                q_norm.weight.expand(num_heads, head_dim),
+                k_norm.weight.expand(num_kv_heads, head_dim),
+                index_q_norm.weight.expand(num_kv_heads, head_dim),
+                index_k_norm.weight.expand(1, head_dim),
+            ]
+        ).float()
+        + 1.0
+    )
+    assert all(n.variance_epsilon == q_norm.variance_epsilon for n in norms)
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(qkv)
+    cos_sin = cos_sin.index_select(0, positions.flatten())
+    return op(qkv, cos_sin, weight)
+
+
 class MiniMaxM3SparseAttention(nn.Module):
     """GQA attention over the KV blocks the lightning indexer selects.
 
@@ -486,6 +528,18 @@ class MiniMaxM3SparseAttention(nn.Module):
             )
         else:
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
+        # Key minimax_qk_norm_rope_kernel: the norms and rope in one kernel.
+        self.norm_rope_op = None
+        if option(vllm_config.additional_config, "minimax_qk_norm_rope_kernel"):
+            self.norm_rope_op = get_qk_norm_rope_op(
+                self.num_heads, self.num_kv_heads, self.head_dim, eps, False
+            )
+            if not _NORM_ROPE_LOGGED:
+                _NORM_ROPE_LOGGED.append(True)
+                logger.info(
+                    "MiniMax-M3 q/k norm + rope kernel on: "
+                    "additional_config.minimax_qk_norm_rope_kernel"
+                )
 
     def forward(
         self,
@@ -496,16 +550,29 @@ class MiniMaxM3SparseAttention(nn.Module):
         """``attn_metadata`` (per KV-cache prefix) replaces the forward
         context's, for a call on part of the step's tokens."""
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, index_q, index_k = norm_rope_heads(
-            qkv,
-            positions,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
-            self.rotary_emb,
-            self.rope_swap,
-        )
+        norms = (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm)
+        if self.norm_rope_op is not None:
+            q, k, v, index_q, index_k = norm_rope_heads_kernel(
+                qkv,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                norms,
+                self.rotary_emb,
+                self.norm_rope_op,
+            )
+        else:
+            q, k, v, index_q, index_k = norm_rope_heads(
+                qkv,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                norms,
+                self.rotary_emb,
+                self.rope_swap,
+            )
 
         num_tokens = hidden_states.shape[0]
         metadata = attn_metadata or get_forward_context().attn_metadata

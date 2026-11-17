@@ -123,6 +123,7 @@ SAMPLE = {
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {
     "raiden_offload_refresh_lru",
+    "minimax_qk_norm_rope_kernel",
     "minimax_indexer_hoist_metadata",
     "minimax_indexer_row_gather",
     # --- v7 MoE / grouped GEMM ---
