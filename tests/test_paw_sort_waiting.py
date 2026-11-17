@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The waiting-queue sort: the waiting queue is sorted inside schedule().
+"""The waiting-queue sort helpers (``_init_paw_sort``, ``_paw_sort_key``,
+``_sort_waiting_queue``).
 
-These tests check the order the base scheduler sees when it starts admitting,
-i.e. inside ``AsyncScheduler.schedule``. The warmest-first promotion that
-schedule() runs on the same queue is stubbed out so the order is the sort's.
+The pipeline chunk scheduler's prefix-aware admission (#3090) borrows them and
+sorts the waiting queue at the start of its schedule(); these tests check the
+order one sort leaves. PrefixAwareScheduler itself does not sort.
 """
 
 import time
@@ -69,7 +70,6 @@ def _scheduler(monkeypatch, requests, warmth, sort="1", aging="0", window=None):
     s._hit_estimator = None
     s._kv_prefetch_n = 0
     s._kv_prefetch_cap = None
-    s._select_waiting_queue_for_scheduling = lambda: None
     s.block_size = 2176
 
     coordinator = MagicMock()
@@ -90,15 +90,11 @@ def _scheduler(monkeypatch, requests, warmth, sort="1", aging="0", window=None):
 
 
 def _order_seen_by_base_schedule(s):
-    seen = {}
-
-    def base_schedule(*args, **kwargs):
-        seen["order"] = [r.request_id for r in s.waiting]
-        return SimpleNamespace()
-
-    with patch.object(AsyncScheduler, "schedule", side_effect=base_schedule):
-        s.schedule()
-    return seen["order"]
+    """The waiting order the base scheduler admits from: sorted first when
+    the sort is on, as the borrowing scheduler's schedule() does."""
+    if s._paw_sort:
+        s._sort_waiting_queue()
+    return [r.request_id for r in s.waiting]
 
 
 def test_flag_off_leaves_waiting_fcfs(monkeypatch):
@@ -209,17 +205,24 @@ def test_window_bounds_the_sort(monkeypatch):
     assert _order_seen_by_base_schedule(s) == ["b", "a", "c"]
 
 
-def test_sort_failure_disables_the_flag_and_schedule_still_runs(monkeypatch):
+def test_prefix_aware_scheduler_itself_does_not_sort(monkeypatch):
+    # A KV producer naming PrefixAwareScheduler gets the warmest-first
+    # admission alone: the sort runs only where a scheduler borrows it.
     now = time.time()
-    reqs = [_req("a", 50_000, now - 2), _req("b", 3_000, now - 1)]
-    s = _scheduler(monkeypatch, reqs, {})
+    reqs = [_req("big_cold", 90_000, now - 2), _req("small_warm", 92_000, now - 1)]
+    s = _scheduler(monkeypatch, reqs, {"small_warm": 90_000})
+    s._sort_waiting_queue = MagicMock()
+    seen = {}
 
-    def boom(*args, **kwargs):
-        raise RuntimeError("simulated scoring failure")
+    def base_schedule(*args, **kwargs):
+        seen["order"] = [r.request_id for r in s.waiting]
+        return SimpleNamespace()
 
-    s._paw_sort_key = boom
-    assert _order_seen_by_base_schedule(s) == ["a", "b"]
-    assert s._paw_sort is False
+    with patch.object(AsyncScheduler, "schedule", side_effect=base_schedule):
+        s.schedule()
+    # The promotion moved the warmest request to the head; nothing sorted.
+    assert seen["order"] == ["small_warm", "big_cold"]
+    s._sort_waiting_queue.assert_not_called()
 
 
 # ---------------- the connector's host-tier estimate ----------------
