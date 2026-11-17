@@ -372,6 +372,7 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s.deferred_waiting = set()
     s.block_size = 640
     s._inflight_prefills = set()
+    s._decode_throttle_switch = False
     out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
 
     s._step_wait_event = None

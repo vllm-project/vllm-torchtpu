@@ -13,7 +13,7 @@
 # limitations under the License.
 """Options of the TPU schedulers, from ``additional_config["tpu_scheduler"]``.
 
-    --additional-config '{"tpu_scheduler": {"promote_warmest": false}}'
+    --additional-config '{"tpu_scheduler": {"kv_prefetch": true}}'
 
 Every option defaults to main's behaviour without it. The options only change
 which request a scheduler admits next and never change a compiled program,
@@ -34,6 +34,19 @@ class SchedulerOptions:
     """Promote the warmest request of each waiting queue to its head once per
     step (``PrefixAwareScheduler``). False admits in FCFS order. The IX TP8
     points ran false; #1 ran the default."""
+
+    kv_prefetch: bool = False
+    """Start remote KV loads for the head of ``waiting`` while the running set
+    is full (``PrefixAwareScheduler`` on a KV consumer with a connector;
+    refused elsewhere), holding at most 8 requests and keeping 512 blocks for
+    the running set. Every decode leg of the validation entries sets it."""
+
+    decode_inflight_throttle: bool = False
+    """Throttle remote loads (``PrefixAwareScheduler`` on a KV consumer with
+    decode context parallelism > 1; refused elsewhere): refuse a new load
+    while 16 are in flight or while running plus in-flight requests reach
+    ``max_num_seqs`` + 32, and otherwise reserve max(128, 8 x (running + in
+    flight)) blocks. The validation entries' DCP 4 decode legs set it."""
 
 
 def parse(raw: Any) -> SchedulerOptions:

@@ -272,5 +272,7 @@ legs:
         enabled: true
       tpu_runner:
         stage_timing: false
+      tpu_scheduler:
+        kv_prefetch: true
       tpu_worker:
         numa_bind: true

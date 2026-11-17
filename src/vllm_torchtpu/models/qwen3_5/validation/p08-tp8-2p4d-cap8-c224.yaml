@@ -260,6 +260,8 @@ legs:
       tpu_frontend:
         tokenize_prefix_cache: true
       tpu_scheduler:
+        decode_inflight_throttle: true
+        kv_prefetch: true
         promote_warmest: false
       tpu_worker:
         numa_bind: true

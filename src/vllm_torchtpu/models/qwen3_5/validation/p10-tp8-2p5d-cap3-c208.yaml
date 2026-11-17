@@ -264,6 +264,8 @@ legs:
       tpu_runner:
         stage_timing: false
       tpu_scheduler:
+        decode_inflight_throttle: true
+        kv_prefetch: true
         promote_warmest: false
       tpu_worker:
         numa_bind: true
