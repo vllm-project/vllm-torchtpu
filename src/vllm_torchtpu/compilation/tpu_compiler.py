@@ -903,9 +903,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         )
 
         # aot_autograd (inside TpuBackend) requires tuple outputs. Deep-copied
-        # first because _ensure_tuple_output rewrites the output node in place
-        # and vLLM keeps its own reference to `graph`. Only the output node
-        # moves, so the placeholder signature is unaffected.
+        # first because _ensure_tuple_output rewrites the output node in place,
+        # a single-size compile's int placeholders get their concrete values
+        # inlined into their uses, and vLLM keeps its own reference to `graph`.
+        # Neither rewrite adds, drops or reorders a placeholder, so the
+        # placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
         if size is not None:
             _inline_int_placeholders(graph, example_inputs)
