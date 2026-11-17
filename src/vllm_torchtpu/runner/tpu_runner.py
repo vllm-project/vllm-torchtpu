@@ -123,6 +123,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import runai_metadata_cache
+from vllm_torchtpu.models.vllm.deepseek_v41.common import vocab_parallel_head
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -4142,9 +4143,7 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                     else:
-                        logits = self.compute_selected_logits(
-                            hidden_states, logits_indices
-                        )
+                        logits = self._selected_logits(hidden_states, logits_indices)
                 else:
                     if self._can_use_fused_greedy_head(
                         scheduler_output,
@@ -4155,9 +4154,7 @@ class TPUModelRunner(GPUModelRunner):
                             self.compute_greedy_ids(sample_hidden_states)
                         )
                     else:
-                        logits = self.compute_logits_from_hidden_states(
-                            sample_hidden_states
-                        )
+                        logits = self._logits_from_hidden(sample_hidden_states)
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -5745,7 +5742,9 @@ class TPUModelRunner(GPUModelRunner):
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
+                # The vocab-parallel head pairs its collectives by row count.
+                logits_rows = self._vocab_parallel_rows() or num_reqs
+                _idx = torch.zeros(logits_rows, dtype=torch.int32, device=out.device)
                 _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
@@ -7705,6 +7704,66 @@ class TPUModelRunner(GPUModelRunner):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
+
+    def _vocab_parallel_rows(self) -> int | None:
+        """The logits row count every DP rank uses this step when the LM head
+        is vocab-parallel (common/vocab_parallel_head.py), else None.
+
+        The head's collectives pair across ranks, so all ranks score the same
+        number of rows. It is the padded bound for the step's DP-wide largest
+        chunk: each request yields at most 1 + K logits rows, padded as the
+        spec-decode rows are, and at least the padded request count."""
+        if not self._dp_lockstep_enabled():
+            return None
+        model = (
+            self.model.get_language_model()
+            if supports_multimodal(self.model)
+            else self.model
+        )
+        if not vocab_parallel_head.is_vocab_parallel(getattr(model, "lm_head", None)):
+            return None
+        max_reqs = max(1, self._dp_step_max_reqs)
+        spec = self.speculative_config
+        rows_per_req = 1 + (spec.num_speculative_tokens if spec is not None else 0)
+        rows = min(max_reqs * rows_per_req, self.num_tokens_paddings[-1])
+        return max(
+            _get_padded_token_len(self.num_tokens_paddings, rows),
+            _get_padded_num_reqs_with_upper_limit(max_reqs, self.max_num_reqs),
+        )
+
+    def _padded_logits_rows(self, rows: int) -> int:
+        padded = self._vocab_parallel_rows()
+        if padded is None:
+            return rows
+        if rows > padded:
+            raise RuntimeError(
+                f"Vocab-parallel LM head: {rows} logits rows exceed the DP-wide "
+                f"bound {padded}; the ranks' collectives would not pair"
+            )
+        return padded
+
+    def _selected_logits(
+        self, hidden_states: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        rows = indices.shape[0]
+        padded = self._padded_logits_rows(rows)
+        if padded == rows:
+            return self.compute_selected_logits(hidden_states, indices)
+        indices = torch.cat([indices, indices.new_zeros(padded - rows)])
+        return self.compute_selected_logits(hidden_states, indices)[:rows]
+
+    def _logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        rows = hidden_states.shape[0]
+        padded = self._padded_logits_rows(rows)
+        if padded == rows:
+            return self.compute_logits_from_hidden_states(hidden_states)
+        hidden_states = torch.cat(
+            [
+                hidden_states,
+                hidden_states.new_zeros(padded - rows, *hidden_states.shape[1:]),
+            ]
+        )
+        return self.compute_logits_from_hidden_states(hidden_states)[:rows]
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_token_ids(

@@ -26,6 +26,7 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41Mo
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
+from ..common import vocab_parallel_head
 from ..common.mhc import (
     collapse,
     flat_collapse,
@@ -1596,7 +1597,18 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # before the KV cache is sized from what remains.
         for engram in self.model._hbm_engrams():
             engram.upload_hbm_table()
+        # Split the LM head over the vocab where it can be (else it stays
+        # whole): drop the other ranks' vocab rows before the KV cache is
+        # sized, and before the drafter shares this head.
+        vocab_parallel_head.shard_lm_head(
+            self.lm_head, self.logits_processor, self._parallel_config
+        )
         return loaded
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if vocab_parallel_head.is_vocab_parallel(self.lm_head):
+            return vocab_parallel_head.logits(self.lm_head, hidden_states)
+        return super().compute_logits(hidden_states)
 
     def forward(self, *args, **kwargs):
         # Materialize upstream's persistent history outside the compiled model.
@@ -1651,6 +1663,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             # inputs instead of copying device hashes back every step.
             install_host_engram_inputs()
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._parallel_config = parallel
         # TPU's existing FP8 linear adapter registers weight_scale_inv; the
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.
         self.hf_to_vllm_mapper = upstream._make_deepseek_v4_weights_mapper(
