@@ -32,6 +32,7 @@ import numpy as np
 import torch
 from jax import lax
 from jax.sharding import Mesh, PartitionSpec
+from vllm.config import get_current_vllm_config_or_none
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -61,7 +62,7 @@ logger = init_logger(__name__)
 DISPATCH_FORM = "hier"
 COMBINE_FORM = "hier"
 RING_DEPTH = 1
-GATHER_ROWS = True
+ROUTED_ROW_GATHER = True
 
 _OPS: dict[int, torch.library.CustomOpDef] = {}
 # This core's (dp, tp) index on the mesh view, as an int32 [2] device tensor.
@@ -71,6 +72,16 @@ _TP = 0
 _ARMED = False
 _CHECKED = False
 _FP8_DISPATCH = False
+
+
+def maybe_prebuild(layer, scores_op) -> None:
+    """:func:`prebuild` for a MoE layer the few-token kernel's scores entry
+    serves (``scores_op``, from ``moe_lowtok_scores.prebuild``) under expert
+    parallelism; nothing for any other layer. Call it under the loader's
+    config context, which supplies the tpu_moe options."""
+    if scores_op is None or not layer.moe_config.moe_parallel_config.use_ep:
+        return
+    prebuild(get_current_vllm_config_or_none(), int(layer.moe_config.experts_per_token))
 
 
 def prebuild(vllm_config: Any, topk: int) -> None:
@@ -124,7 +135,7 @@ def prebuild(vllm_config: Any, topk: int) -> None:
         forms[1],
         _FP8_DISPATCH,
         RING_DEPTH,
-        GATHER_ROWS,
+        ROUTED_ROW_GATHER,
         moe_lowtok_scores.armed_max_tokens(),
     )
     _build_op(topk)
@@ -144,7 +155,7 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
     forms = (DISPATCH_FORM, COMBINE_FORM)
     fp8_dispatch = _FP8_DISPATCH
     depth = RING_DEPTH
-    gather_rows = GATHER_ROWS
+    gather_rows = ROUTED_ROW_GATHER
 
     def body(x, scores, w13, w2, s13, s2, experts_start, rank):
         start = experts_start[0]
