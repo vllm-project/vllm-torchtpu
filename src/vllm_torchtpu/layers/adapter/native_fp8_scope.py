@@ -16,6 +16,8 @@ speculative draft.
 
 The batched RPA kernel can run its QK and/or PV matmuls in fp8 (``native_fp8``
 for the decode kernel, ``native_fp8_prefill`` for the prefill and mixed
+kernels; ``configs.NativeFp8``) and its decode softmax in base 2
+(``PallasAttentionBackendImpl.attention_modes``).
 A draft model must run at the precision it ships with, so its attention keeps
 the full-precision path whatever the target uses.
 
@@ -24,18 +26,30 @@ The runner marks each draft attention layer's impl
 layer's kernels. The kernel builders pass a layer's modes to the batched and
 DCP kernel entries only when the layer is not a draft. The modes are part of
 every kernel registry key, so a draft layer never shares a target layer's op.
+With every mode off the kernels are built with the wrapper's defaults: the
+entries that take ``attention_modes`` receive ``OFF`` and pass no mode to the
+wrapper.
 """
 
 import dataclasses
 from typing import Any
 
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs
+
 
 @dataclasses.dataclass(frozen=True)
 class AttentionModes:
+    """Reduced-precision modes of a layer's batched RPA kernels (all off by
+    default)."""
 
+    native_fp8: configs.NativeFp8 = configs.NATIVE_FP8_OFF
+    native_fp8_prefill: configs.NativeFp8 = configs.NATIVE_FP8_OFF
     decode_exp2: bool = False
 
     def any(self) -> bool:
+        return (
+            self.native_fp8.any() or self.native_fp8_prefill.any() or self.decode_exp2
+        )
 
 
 OFF = AttentionModes()
@@ -49,7 +63,9 @@ def effective(modes: AttentionModes, is_draft: bool) -> AttentionModes:
 def kernel_kwargs(modes: AttentionModes) -> dict[str, Any]:
     """The batched RPA wrapper's keyword arguments for `modes` (only the on ones)."""
     kwargs: dict[str, Any] = {}
+    if modes.native_fp8.any():
         kwargs["native_fp8"] = modes.native_fp8
+    if modes.native_fp8_prefill.any():
         kwargs["native_fp8_prefill"] = modes.native_fp8_prefill
     if modes.decode_exp2:
         kwargs["decode_exp2"] = True
@@ -59,6 +75,8 @@ def kernel_kwargs(modes: AttentionModes) -> dict[str, Any]:
 def scope_line(modes: AttentionModes, num_target: int, num_draft: int) -> str:
     """The startup line that states the scope, for the compliance log check."""
     return (
+        f"Native FP8 attention: target decode={modes.native_fp8} "
+        f"prefill={modes.native_fp8_prefill} "
         f"exp2={'on' if modes.decode_exp2 else 'off'}, draft=off | "
         f"attention layers: {num_target} target, {num_draft} draft"
     )
