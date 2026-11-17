@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The Qwen3.5 rule that installs the fused GDN gated norm + FP8 quantization
-after loading: the engine it was measured on (Qwen3.5-397B-A17B on TPU7x)
-routes its model through the kernel bridge at the measured value heads per
-device, and any other model, Qwen3.5 checkpoint or device is left as it was.
-Also every IX leg of the validation entries keeps both fused kernels."""
+"""The Qwen3.5 rule that installs the fused kernels: the engine they were
+measured on (Qwen3.5-397B-A17B on TPU7x) installs the fused q/k norm + rope
+and routes every model vLLM's loader finishes through the fused GDN gated norm
++ FP8 quantization bridge at the measured value heads per device; any other
+model, Qwen3.5 checkpoint or device is left as it was. Also every IX leg of
+the validation entries keeps both fused kernels."""
 
+import inspect
 import pathlib
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -24,10 +26,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 import yaml
+from vllm.model_executor.model_loader import base_loader
 
 from vllm_torchtpu.models.qwen3_5 import hooks
-from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op, measured
-from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.models.qwen3_5.kernels import (
+    fused_qk_norm_rope,
+    gated_norm_quant_op,
+    measured,
+)
 
 QWEN35 = ["Qwen3_5MoeForConditionalGeneration"]
 # Qwen3.5-397B-A17B's text config (the measured checkpoint) and
@@ -42,20 +48,20 @@ def _model_config(architectures, shape):
     )
 
 
-@pytest.mark.parametrize(
-    "architectures, shape, chip, routed",
-    [
-        (None, None, "7x", False),
-        (["Qwen3NextForCausalLM"], SHAPE_397B, "7x", False),
-        (["Qwen3_5ForConditionalGeneration"], SHAPE_397B, "7x", False),
-        (QWEN35, SHAPE_35B, "7x", False),
-        (QWEN35, {**SHAPE_397B, "num_experts": 256}, "7x", False),
-        (QWEN35, SHAPE_397B, "v6e", False),
-        (QWEN35, SHAPE_397B, None, False),
-        (QWEN35, SHAPE_397B, "7x", True),
-    ],
-)
-def test_the_runner_routes_the_measured_model_only(
+RULE_CASES = [
+    (None, None, "7x", False),
+    (["Qwen3NextForCausalLM"], SHAPE_397B, "7x", False),
+    (["Qwen3_5ForConditionalGeneration"], SHAPE_397B, "7x", False),
+    (QWEN35, SHAPE_35B, "7x", False),
+    (QWEN35, {**SHAPE_397B, "num_experts": 256}, "7x", False),
+    (QWEN35, SHAPE_397B, "v6e", False),
+    (QWEN35, SHAPE_397B, None, False),
+    (QWEN35, SHAPE_397B, "7x", True),
+]
+
+
+@pytest.mark.parametrize("architectures, shape, chip, routed", RULE_CASES)
+def test_loaded_models_route_where_measured_only(
     monkeypatch, architectures, shape, chip, routed
 ):
     monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
@@ -65,13 +71,68 @@ def test_the_runner_routes_the_measured_model_only(
     model_config = (
         None if architectures is None else _model_config(architectures, shape)
     )
-    got = tpu_runner._install_gdn_fused_norm_quant(model, model_config)
+    got = gated_norm_quant_op.route_measured_model(model, model_config)
     if routed:
         install.assert_called_once_with(model, value_heads=measured.GDN_VALUE_HEADS)
         assert got == 3
     else:
         install.assert_not_called()
         assert got == 0
+
+
+@pytest.mark.parametrize("architectures, shape, chip, installs", RULE_CASES)
+def test_the_rule_installs_both_kernels_where_measured_only(
+    monkeypatch, architectures, shape, chip, installs
+):
+    """The registered patch: the measured engine installs the q/k norm + rope
+    patch and the post-load GDN routing and completes (None); any other config
+    installs neither and stays eligible for the next stage (False)."""
+    monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
+    qk = Mock()
+    after_loading = Mock()
+    monkeypatch.setattr(fused_qk_norm_rope, "install_qk_norm_rope_patch", qk)
+    monkeypatch.setattr(gated_norm_quant_op, "install_after_loading", after_loading)
+    model_config = (
+        None if architectures is None else _model_config(architectures, shape)
+    )
+    got = measured.maybe_install_fused_norm_kernels(model_config)
+    assert got is (None if installs else False)
+    assert qk.called is installs
+    assert after_loading.called is installs
+
+
+def test_the_loader_routes_every_model_after_its_weights_are_processed(monkeypatch):
+    """install_after_loading wraps vLLM's post-processing once: each model the
+    loader finishes is processed first, then routed with the loader's config."""
+    calls = []
+
+    def process(model, model_config, target_device):
+        calls.append(("process", model, model_config, target_device))
+
+    monkeypatch.setattr(base_loader, "process_weights_after_loading", process)
+    monkeypatch.setattr(
+        gated_norm_quant_op,
+        "route_measured_model",
+        lambda model, model_config: calls.append(("route", model, model_config)),
+    )
+    gated_norm_quant_op.install_after_loading()
+    wrapped = base_loader.process_weights_after_loading
+    gated_norm_quant_op.install_after_loading()
+    assert base_loader.process_weights_after_loading is wrapped
+    model, model_config, device = object(), object(), torch.device("cpu")
+    base_loader.process_weights_after_loading(model, model_config, device)
+    assert calls == [
+        ("process", model, model_config, device),
+        ("route", model, model_config),
+    ]
+
+
+def test_vllms_loader_calls_the_post_processing_by_its_module_name():
+    """The routing replaces ``base_loader.process_weights_after_loading``; vLLM's
+    loader looks that name up in its module when it loads a model (under its
+    tracing decorator)."""
+    load_model = inspect.unwrap(base_loader.BaseModelLoader.load_model)
+    assert "process_weights_after_loading" in load_model.__code__.co_names
 
 
 def test_main_ci_model_never_queries_the_device(monkeypatch):
