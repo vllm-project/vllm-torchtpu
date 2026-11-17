@@ -563,9 +563,10 @@ class _Retention:
 
     enabled = True
 
-    def __init__(self, stop=None, fail=False):
+    def __init__(self, stop=None, fail=False, fail_shutdown=False):
         self.stop = stop
         self.fail = fail
+        self.fail_shutdown = fail_shutdown
         self.calls: list[tuple] = []
 
     def pin_running(self, running):
@@ -591,6 +592,11 @@ class _Retention:
 
     def on_request_freed(self, request, attn_blocks):
         self.calls.append(("freed", request.request_id, attn_blocks))
+
+    def shutdown(self):
+        self.calls.append(("shutdown",))
+        if self.fail_shutdown:
+            raise RuntimeError("shutdown")
 
 
 def test_retention_stops_apply_after_the_time_budget_clip():
@@ -619,10 +625,23 @@ def test_retention_runs_after_the_mamba_alignment():
 
 def test_a_failing_retention_hook_disables_retention():
     scheduler = _scheduler(running=[_decode("d")])
-    scheduler._retention = _Retention(fail=True)
+    retention = _Retention(fail=True)
+    scheduler._retention = retention
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert scheduler._retention is None
+    # Retention releases its blocks and its hooks fall through to vLLM's.
+    assert retention.calls == [("pin", ("d",)), ("shutdown",)]
+
+
+def test_a_failing_retention_shutdown_still_leaves_retention_off():
+    scheduler = _scheduler(running=[_decode("d")])
+    retention = _Retention(fail=True, fail_shutdown=True)
+    scheduler._retention = retention
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._retention is None
+    assert retention.calls[-1] == ("shutdown",)
 
 
 def test_schedule_pins_the_running_requests():
