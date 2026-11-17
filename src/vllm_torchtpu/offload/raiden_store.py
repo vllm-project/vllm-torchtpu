@@ -146,11 +146,29 @@ _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 _DEFAULT_CONTROLLER_PORT = 27800
 
 
+def _bracket_ipv6(host: str) -> str:
+    """IPv6 literals get brackets (`::1` -> `[::1]`); others are unchanged."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 def _host_port(host: str, port: int) -> str:
     """`host:port` for dialing; IPv6 literals get brackets (`[::1]:27800`)."""
-    if ":" in host and not host.startswith("["):
-        return f"[{host}]:{port}"
-    return f"{host}:{port}"
+    return f"{_bracket_ipv6(host)}:{port}"
+
+
+def _store_server_ip(store_server_ip: str) -> str:
+    """store_server_ip as KVCacheStore needs it.
+
+    The C++ RaidenController binds its gRPC server on
+    `store_server_ip + ":" + port` without bracketing, so a bare IPv6 literal
+    becomes `::1:27800`, which gRPC resolves as a DNS name. The bind fails
+    with only a log line, and construction then times out waiting for
+    workers. Bracketing (`[::1]`) makes it bind `[::1]:27800`. Local-only runs
+    default to 127.0.0.1 to satisfy the C++ non-empty check.
+    """
+    return _bracket_ipv6(store_server_ip) if store_server_ip else "127.0.0.1"
 
 
 _IP_LOCAL_PORT_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
@@ -606,8 +624,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 shard_size_bytes=1,
                 raiden_controller_port=raiden_controller_port,
                 global_registry_address=global_registry_address,
-                # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
-                store_server_ip=store_server_ip or "127.0.0.1",
+                store_server_ip=_store_server_ip(store_server_ip),
                 # Pool group this store's KV cache flows within (spec
                 # publication and eviction placement).
                 kv_pool_group=kv_pool_group,
