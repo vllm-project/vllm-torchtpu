@@ -142,6 +142,28 @@ def _normalizer_keeps_text(backend: Any) -> bool:
     return keeps(json.loads(backend.to_str()).get("normalizer"))
 
 
+def _prepends_on_first_split_only(backend: Any) -> bool:
+    """Whether the pre-tokenizer marks only the text's first split, as
+    Metaspace with ``prepend_scheme="first"`` does.
+
+    The full encode gives every piece between added tokens its offset in the
+    whole text and prepends the marker only to the piece at offset 0; a piece
+    encoded alone is at offset 0 and gets the marker too.
+    """
+
+    def first_only(pre_tokenizer: dict | None) -> bool:
+        if pre_tokenizer is None:
+            return False
+        if pre_tokenizer.get("type") == "Sequence":
+            return any(first_only(p) for p in pre_tokenizer.get("pretokenizers", []))
+        return (
+            pre_tokenizer.get("type") == "Metaspace"
+            and pre_tokenizer.get("prepend_scheme") == "first"
+        )
+
+    return first_only(json.loads(backend.to_str()).get("pre_tokenizer"))
+
+
 def _overlapping_pair(first: list[str], second: list[str]) -> tuple[str, str] | None:
     """A token of ``first`` and one of ``second`` that can share characters in some
     text, or None.
@@ -303,6 +325,8 @@ class SegmentTokenizer:
         added = list(backend.get_added_tokens_decoder().values())
         if not added:
             return "no added tokens to split at"
+        if _prepends_on_first_split_only(backend):
+            return "the pre-tokenizer prepends its marker to the first split only"
         for tok in added:
             if tok.lstrip or tok.rstrip or tok.single_word:
                 return f"added token {tok.content!r} is not a hard split point"
