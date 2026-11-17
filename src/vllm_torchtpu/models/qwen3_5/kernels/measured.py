@@ -61,3 +61,33 @@ def is_measured_model(model_config) -> bool:
         "RMSNormGated + FP8 linear."
     )
     return False
+
+
+def maybe_install_fused_norm_kernels(model_config) -> bool | None:
+    """Qwen3.5 rule: the engine the kernels were measured on
+    (:func:`is_measured_model`) runs the fused q/k norm + rope
+    (``fused_qk_norm_rope.install_qk_norm_rope_patch``) and routes its loaded
+    GDN layers through the fused gated norm + FP8 quantization
+    (``gated_norm_quant_op.install_after_loading``).
+
+    Registered as a model-specific patch (``patch_registry``). Returns False
+    until such a model config is available, so other models, including
+    Qwen3-Next, which shares ``Qwen3NextAttention`` and the GDN layer class,
+    and every other Qwen3.5 checkpoint or device, never install either and
+    keep vLLM's eager q/k norm and rope and ``RMSNormGated`` + FP8 linear.
+    """
+    if not is_measured_model(model_config):
+        return False
+    # Imported here: both modules import this one for the rule.
+    from vllm_torchtpu.models.qwen3_5.kernels import (
+        fused_qk_norm_rope,
+        gated_norm_quant_op,
+    )
+
+    fused_qk_norm_rope.install_qk_norm_rope_patch()
+    gated_norm_quant_op.install_after_loading()
+    logger.info(
+        "Applied TPU patch: Qwen3.5 fused q/k norm + rope and fused GDN gated "
+        "norm + FP8 quantization."
+    )
+    return None
