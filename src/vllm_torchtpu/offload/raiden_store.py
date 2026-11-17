@@ -206,6 +206,48 @@ def all_ranks_kv_bytes_per_block() -> int | None:
     return _all_ranks_kv_bytes_per_block
 
 
+# Per-layer KV cache specs of every worker, recorded from the per-worker KV
+# cache configs with the bytes per block (see
+# ``_patch_vllm_offload_all_ranks_kv_bytes``). The scheduler's own config keeps
+# one spec per `UniformTypeKVCacheSpecs` group, so this is where it sees every
+# layer. None until recorded.
+_all_ranks_leaf_kv_cache_specs: tuple[Any, ...] | None = None
+
+
+def record_all_ranks_leaf_kv_cache_specs(
+    kv_cache_configs: Sequence[Any],
+) -> tuple[Any, ...]:
+    """Remember the per-layer specs behind every worker's KV cache groups.
+
+    Called where `record_all_ranks_kv_bytes_per_block` is, from the same list,
+    so the engine core and each worker record the same specs.
+    """
+    global _all_ranks_leaf_kv_cache_specs
+    _all_ranks_leaf_kv_cache_specs = tuple(
+        leaf
+        for cfg in kv_cache_configs
+        for group in cfg.kv_cache_groups
+        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec)
+    )
+    return _all_ranks_leaf_kv_cache_specs
+
+
+def _require_all_ranks_leaf_kv_cache_specs() -> tuple[Any, ...]:
+    """The recorded per-layer specs of all workers; RuntimeError if nothing
+    was recorded. The engine core and every worker record before the
+    offloading spec is built, and the scheduler's own config, which keeps
+    one spec per group, cannot stand in for them."""
+    leaves = _all_ranks_leaf_kv_cache_specs
+    if leaves is None:
+        raise RuntimeError(
+            "TPURaidenOffloadingConnector: the per-layer KV cache specs of the "
+            "workers were not recorded before the KV geometry was resolved, so "
+            "the scheduler, whose KV cache config keeps one spec per group, "
+            "cannot see every layer"
+        )
+    return leaves
+
+
 def iter_leaf_kv_cache_specs(kv_cache_spec):
     """Yield the per-layer specs behind a KV cache group spec."""
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -217,14 +259,45 @@ def iter_leaf_kv_cache_specs(kv_cache_spec):
         yield kv_cache_spec
 
 
-def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
-    """Whether this model's KV cache consists of multiple tensors
-    of different shapes.
+def _attention_geometry_key(spec: Any) -> tuple[Any, ...]:
+    """The fields two attention specs must share to tile one common row:
+    `(block_size, num_kv_heads, head_size, dtype, page_size_bytes)`.
+
+    `resolve_attention_geometry` requires every attention group to agree on
+    them; `has_multi_shapes_kv_caches` takes the per-array path when the
+    MLA-family layers do not.
     """
-    return vllm_config.model_config.architecture in (
-        "DeepseekV4ForCausalLM",
-        "GlmMoeDsaForCausalLM",
+    return (
+        spec.block_size,
+        spec.num_kv_heads,
+        spec.head_size,
+        spec.dtype,
+        spec.page_size_bytes,
     )
+
+
+def has_multi_shapes_kv_caches() -> bool:
+    """Whether the KV cache holds MLA-family arrays of different shapes.
+
+    Such a cache (MLA latents next to indexer keys, compressed or
+    sliding-window MLA states) is registered array by array instead of tiling
+    one common row; see `resolve_kernel_geometry`. Decided from the per-layer
+    specs of all workers as recorded by `record_all_ranks_leaf_kv_cache_specs`,
+    so the scheduler, whose KV cache config keeps one spec per group, and the
+    workers decide alike. Two MLA-family layers differ when their
+    `_attention_geometry_key` differs.
+
+    Raises RuntimeError when nothing was recorded.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+    leaves = _require_all_ranks_leaf_kv_cache_specs()
+    geometries = {
+        _attention_geometry_key(leaf)
+        for leaf in leaves
+        if isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec))
+    }
+    return len(geometries) > 1
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):
@@ -1675,14 +1748,7 @@ def resolve_attention_geometry(
         )
         spec0 = attn_specs[0]
         assert all(
-            (s.block_size, s.num_kv_heads, s.head_size, s.dtype, s.page_size_bytes)
-            == (
-                spec0.block_size,
-                spec0.num_kv_heads,
-                spec0.head_size,
-                spec0.dtype,
-                spec0.page_size_bytes,
-            )
+            _attention_geometry_key(s) == _attention_geometry_key(spec0)
             for s in attn_specs
         ), "TPURaidenOffloadingConnector: attention groups disagree on geometry"
         # Ensure all groups share the unified pool's padded page size.
@@ -1743,7 +1809,7 @@ def resolve_kernel_geometry(
     Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
     (device view reconstruction) to guarantee exact geometry parity.
     """
-    if has_multi_shapes_kv_caches(vllm_config):
+    if has_multi_shapes_kv_caches():
         return _resolve_multi_shapes_kv_geometry(kv_cache_config)
     spec0, kernel_block_size, per_block_shape = resolve_attention_geometry(
         vllm_config, kv_cache_config
