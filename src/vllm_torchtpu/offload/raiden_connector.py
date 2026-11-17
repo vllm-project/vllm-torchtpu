@@ -295,8 +295,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 completed_jobs[jid] = num_workers
         for finished_job in finished_jobs:
             if finished_job.failed_device_block_ids:
-                if not hasattr(self, "_pending_failed_jobs"):
-                    self._pending_failed_jobs = []
                 self._pending_failed_jobs.append(finished_job)
                 continue
             if finished_job.job_id in self._jobs:
@@ -452,7 +450,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
         polled = manager.poll_finished_jobs()
 
-        sched_ref = getattr(self, "_scheduler", None)
+        sched_ref = self._scheduler
         if sched_ref is not None:
             self._complete_jobs_directly(
                 sched_ref,
@@ -460,7 +458,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 extra_store_job_ids=finished_store_ids,
             )
             finished_store_ids = []
-            pending_failed = getattr(self, "_pending_failed_jobs", None)
+            pending_failed = self._pending_failed_jobs
             if pending_failed:
                 for failed_job in pending_failed:
                     if failed_job.op == AdmissionOp.STORE:
@@ -587,7 +585,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 req_status.update_num_hit_chunks(num_computed_tokens)
                 self._touch(req_status)
             return 0, False
-        max_loads = getattr(self, "_max_async_load_reqs", 0)
+        max_loads = self._max_async_load_reqs
         if max_loads > 0:
             active_loads = sum(1 for js in self._jobs.values() if not js.is_store)
             if active_loads >= max_loads:
@@ -1168,7 +1166,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
         fence_job_ids = set(meta.fence_job_ids)
-        if getattr(self, "_fence_after_draft", False):
+        if self._fence_after_draft:
             fence_job_ids, self._deferred_fence_ids = (
                 self._deferred_fence_ids,
                 fence_job_ids,

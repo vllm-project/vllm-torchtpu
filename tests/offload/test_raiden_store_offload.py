@@ -1128,6 +1128,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         sched.config = SimpleNamespace(num_workers=num_workers)
         sched._raiden_manager = manager
         sched._fence_pending = {}
+        sched._scheduler = None
+        sched._pending_failed_jobs = []
         return sched
 
     def _stock_meta(self, store_jobs=None, load_jobs=None, jobs_to_flush=None):
@@ -1437,6 +1439,9 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         sched.manager = manager
         sched._raiden_manager = manager
         sched._fence_pending = {}
+        sched._scheduler = None
+        sched._pending_failed_jobs = []
+        sched._max_async_load_reqs = 0
         sched._req_status = {}
         sched._jobs = {}
         sched._job_counter = 0
@@ -2003,6 +2008,8 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn._completed_jobs = {}
         conn._pool_sync_tensors = []
         conn._pending_fences = []
+        conn._fence_after_draft = False
+        conn._deferred_fence_ids = set()
         return conn
 
     def _meta(self, **kwargs):
