@@ -136,6 +136,10 @@ def _make_runner(
         TPUModelRunner._upload_unless_unchanged, runner
     )
     runner._dp_target_bucket = None
+    runner._decode_carry = None
+    runner._take_steady_decode_carry = types.MethodType(
+        TPUModelRunner._take_steady_decode_carry, runner
+    )
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True

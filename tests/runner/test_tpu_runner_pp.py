@@ -351,6 +351,7 @@ class TestBufferedStepPosting:
         runner = SimpleNamespace(
             execute_model_state=None,
             _update_states=lambda _so: None,
+            _take_steady_decode_carry=lambda _so: None,
             scheduler_config=SimpleNamespace(async_scheduling=False),
             _mtp_prefill_only=False,
             _reorder_batch_for_rpa=lambda _so: (0, 0),

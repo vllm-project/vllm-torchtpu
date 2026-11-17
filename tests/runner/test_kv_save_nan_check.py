@@ -240,6 +240,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _pp_pending_scheduler_output=None,
         _pp_pending_kv_save_nan_check=None,
         execute_model_state=None,
+        _decode_carry=None,
         _update_states=lambda _so: None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
         _mtp_prefill_only=False,
@@ -343,6 +344,9 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",
+        "_take_steady_decode_carry",
+        "_plain_decode_carry",
+        "_sampling_logits",
         "_maybe_select_logits_hidden_states",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))

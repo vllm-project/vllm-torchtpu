@@ -156,6 +156,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     SequenceLayoutKind,
+    SequenceLayoutPlan,
     SequenceLayoutPlanner,
     create_sequence_layout_planner,
 )
@@ -273,15 +274,19 @@ class ExecuteModelState:
 
 @dataclass(frozen=True)
 class _DecodeCarry:
-    """A plain decode step's device inputs. The next step derives its own from
-    them on the device when it is steady: the same requests in the same batch
-    rows, one token each, no new KV block (`_take_steady_decode_carry`)."""
+    """A plain decode step's device inputs and attention metadata. The next
+    step derives its own from them on the device when it is steady: the same
+    requests in the same batch rows, one token each, no new KV block
+    (`_take_steady_decode_carry`)."""
 
     req_ids: tuple[str, ...]
     input_ids: torch.Tensor
     positions: torch.Tensor
     seq_lens: torch.Tensor
     query_start_loc: torch.Tensor
+    # Per layer; the groups share positions, seq_lens and query_start_loc.
+    attn_metadata: dict[str, AttentionMetadata]
+    logits_indices: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -2922,7 +2927,12 @@ class TPUModelRunner(GPUModelRunner):
         self._pre_async_results = None
 
     def _plain_decode_carry(
-        self, scheduler_output: "SchedulerOutput", num_chunks: int, input_ids
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_chunks: int,
+        input_ids: torch.Tensor,
+        attn_metadata: dict[str, AttentionMetadata],
+        logits_indices: torch.Tensor,
     ) -> _DecodeCarry | None:
         """This step's inputs, if the next step may derive its own from them.
 
@@ -2930,7 +2940,8 @@ class TPUModelRunner(GPUModelRunner):
         whose sampled token feeds the next step from the device (async
         scheduling, no drafts), on a runner whose decode inputs are only ids,
         positions, seq_lens and a block table: no recurrent state, PCP, PP, DP
-        lockstep, KV transfer or LoRA mapping.
+        lockstep, KV transfer or LoRA mapping. The phased profiler counts the
+        steps `execute_model` prepares, so it keeps every step there.
         """
         batch = self.input_batch
         num_reqs = batch.num_reqs
@@ -2950,6 +2961,7 @@ class TPUModelRunner(GPUModelRunner):
             and not has_kv_transfer_group()
             and self.lora_config is None
             and not self.is_pooling_model
+            and self.phase_based_profiler is None
             and (
                 batch.num_computed_tokens_cpu[:num_reqs]
                 >= batch.num_prompt_tokens[:num_reqs]
@@ -2963,6 +2975,8 @@ class TPUModelRunner(GPUModelRunner):
             positions=self.position_ids,
             seq_lens=ctx.seq_lens,
             query_start_loc=ctx.query_start_loc,
+            attn_metadata=attn_metadata,
+            logits_indices=logits_indices,
         )
 
     def _take_steady_decode_carry(
@@ -2973,11 +2987,12 @@ class TPUModelRunner(GPUModelRunner):
         after `_update_states`), and no request gets a new KV block, so the
         block table on the device still holds."""
         carry, self._decode_carry = self._decode_carry, None
+        if carry is None:
+            return None
         batch = self.input_batch
         cached = scheduler_output.scheduled_cached_reqs
         if (
-            carry is None
-            or self._pre_async_results is None
+            self._pre_async_results is None
             or scheduler_output.total_num_scheduled_tokens != len(carry.req_ids)
             or scheduler_output.scheduled_new_reqs
             or scheduler_output.scheduled_spec_decode_tokens
@@ -3570,7 +3585,6 @@ class TPUModelRunner(GPUModelRunner):
         start_index: int,
         num_decode_reqs: int,
         num_windowed_reqs: int | None = None,
-        steady: _DecodeCarry | None = None,
     ):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
@@ -3789,40 +3803,32 @@ class TPUModelRunner(GPUModelRunner):
             self.input_ids_cpu[
                 total_num_scheduled_tokens:padded_total_num_scheduled_tokens
             ] = 0
-        if steady is not None:
-            assert self._pre_async_results is not None
-            self.input_ids, self.position_ids, seq_lens = _advance_decode_inputs(
-                self._pre_async_results.next_tokens_tpu,
-                steady.input_ids,
-                steady.positions,
-                steady.seq_lens,
-                steady.query_start_loc,
-            )
-        else:
-            self.input_ids = self.input_ids_cpu[local_token_slice].to(
+        self.input_ids = self.input_ids_cpu[local_token_slice].to(
+            self.device, non_blocking=True
+        )
+        if self.uses_mrope:
+            if zero_pad_tail:
+                self.mrope_positions.cpu[
+                    :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                ] = 0
+            self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
                 self.device, non_blocking=True
             )
-            if self.uses_mrope:
-                if zero_pad_tail:
-                    self.mrope_positions.cpu[
-                        :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
-                    ] = 0
-                self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
-                    self.device, non_blocking=True
-                )
-            else:
-                self.position_ids = self.positions_cpu[local_token_slice].to(
-                    self.device, non_blocking=True
-                )
-            if use_max_model_len:
-                seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
-                    self.device, non_blocking=True
-                )
-            else:
-                assert self.num_reqs_most_model_len is not None
-                seq_lens = self.seq_lens_cpu[: self.num_reqs_most_model_len].to(
-                    self.device, non_blocking=True
-                )
+        else:
+            self.position_ids = self.positions_cpu[local_token_slice].to(
+                self.device, non_blocking=True
+            )
+        if use_max_model_len:
+            seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
+                self.device, non_blocking=True
+            )
+            target_num_reqs = self.num_reqs_max_model_len
+        else:
+            assert self.num_reqs_most_model_len is not None
+            seq_lens = self.seq_lens_cpu[: self.num_reqs_most_model_len].to(
+                self.device, non_blocking=True
+            )
+            target_num_reqs = self.num_reqs_most_model_len
 
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
@@ -4495,6 +4501,9 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         steady = self._take_steady_decode_carry(scheduler_output)
+        if steady is not None:
+            self._execute_steady_decode(scheduler_output, steady)
+            return None
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -4667,11 +4676,7 @@ class TPUModelRunner(GPUModelRunner):
                 request_major_input_ids,
                 draft_sequence_layout_plan,
             ) = self._prepare_inputs(
-                scheduler_output,
-                start_index,
-                num_decode_reqs,
-                num_windowed_reqs,
-                steady=steady,
+                scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
             )
 
             # Seed newly-advanced mamba state blocks before the forward reads
@@ -4713,7 +4718,11 @@ class TPUModelRunner(GPUModelRunner):
             draft_input_ids_src = input_ids
             if chunk_index == 0:
                 self._decode_carry = self._plain_decode_carry(
-                    scheduler_output, target_num_chunks, input_ids
+                    scheduler_output,
+                    target_num_chunks,
+                    input_ids,
+                    attn_metadata,
+                    logits_indices,
                 )
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
@@ -4887,29 +4896,9 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
             else:
-                sample_hidden_states = self._maybe_select_logits_hidden_states(
-                    hidden_states, layout_plan, logits_indices
+                logits, hidden_states = self._sampling_logits(
+                    hidden_states, layout_plan, logits_indices, top_tokens
                 )
-                if sample_hidden_states is None:
-                    hidden_states = self._finalize_hidden_states(
-                        hidden_states, layout_plan
-                    )
-                    if top_tokens:
-                        logits = self.compute_selected_top_tokens(
-                            hidden_states, logits_indices
-                        )
-                    else:
-                        logits = self._logits_at_dp_vocab_rows(
-                            hidden_states, logits_indices
-                        )
-                elif top_tokens:
-                    logits = self.compute_top_tokens_from_hidden_states(
-                        sample_hidden_states
-                    )
-                else:
-                    logits = self.compute_logits_from_hidden_states(
-                        sample_hidden_states
-                    )
                 if self.num_prompt_logprobs:
                     assert isinstance(hidden_states, torch.Tensor)
                     prompt_chunk = self._prompt_logprobs_chunk(
@@ -4994,6 +4983,112 @@ class TPUModelRunner(GPUModelRunner):
         if self.is_pooling_model:
             return self.sample_tokens(None)
         return None
+
+    def _sampling_logits(
+        self,
+        hidden_states: torch.Tensor,
+        layout_plan: SequenceLayoutPlan | None,
+        logits_indices: torch.Tensor,
+        top_tokens: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """A chunk's logits at `logits_indices` (its greedy tokens with
+        `top_tokens`), and its hidden states, finalized if that took them."""
+        sample_hidden_states = self._maybe_select_logits_hidden_states(
+            hidden_states, layout_plan, logits_indices
+        )
+        if sample_hidden_states is None:
+            hidden_states = self._finalize_hidden_states(hidden_states, layout_plan)
+            if top_tokens:
+                logits = self.compute_selected_top_tokens(hidden_states, logits_indices)
+            else:
+                logits = self._logits_at_dp_vocab_rows(hidden_states, logits_indices)
+        elif top_tokens:
+            logits = self.compute_top_tokens_from_hidden_states(sample_hidden_states)
+        else:
+            logits = self.compute_logits_from_hidden_states(sample_hidden_states)
+        return logits, hidden_states
+
+    def _execute_steady_decode(
+        self, scheduler_output: "SchedulerOutput", carry: _DecodeCarry
+    ) -> None:
+        """Run a steady decode step on inputs derived on the device from the
+        previous step's: no `_prepare_inputs`, H2D upload, attention metadata
+        build or staging fence (976 us of host time ahead of each launch,
+        profiled on a TP=8 megakernel decode)."""
+        assert self._pre_async_results is not None
+        input_ids, positions, seq_lens = _advance_decode_inputs(
+            self._pre_async_results.next_tokens_tpu,
+            carry.input_ids,
+            carry.positions,
+            carry.seq_lens,
+            carry.query_start_loc,
+        )
+        # The builder puts the same positions and seq_lens in every group.
+        replaced: dict[int, AttentionMetadata] = {}
+        attn_metadata = {}
+        for name, md in carry.attn_metadata.items():
+            new = replaced.get(id(md))
+            if new is None:
+                new = dataclasses.replace(
+                    md, input_positions=positions, seq_lens=seq_lens
+                )
+                replaced[id(md)] = new
+            attn_metadata[name] = new
+        self.input_ids, self.position_ids = input_ids, positions
+        self._decode_carry = dataclasses.replace(
+            carry,
+            input_ids=input_ids,
+            positions=positions,
+            seq_lens=seq_lens,
+            attn_metadata=attn_metadata,
+        )
+
+        inputs_embeds = None
+        if not getattr(self._megakernel, "serving", False):
+            input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
+        sizing_input = input_ids if input_ids is not None else inputs_embeds
+        assert sizing_input is not None
+        num_tokens_padded = sizing_input.shape[0]
+        self._token_padding_update(num_tokens_padded)
+        num_reqs = len(carry.req_ids)
+        with (
+            TraceAnnotation(
+                name=f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks",
+                num_reqs=num_reqs,
+            ),
+            set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens_padded),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.mesh,
+                vllm_config=self.vllm_config,
+                kv_cache_bundle=self._kv_cache_bundle,
+            ),
+            self._stage_timing.stage("main_forward"),
+        ):
+            hidden_states, _ = self.forward_model(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+            )
+        top_tokens = self._greedy_top_tokens_this_step()
+        logits, _ = self._sampling_logits(
+            cast(torch.Tensor, hidden_states),
+            self._last_sequence_layout_plan,
+            carry.logits_indices,
+            top_tokens,
+        )
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output=scheduler_output,
+            logits_list=[logits],
+            pooler_output_list=[],
+            num_reqs_list=[num_reqs],
+            spec_decode_metadata_list=[None],
+            top_tokens=top_tokens,
+        )
 
     def _prompt_logprobs_unsupported_reason(self) -> str | None:
         """Why this runner cannot compute prompt logprobs, with the fix; None if
