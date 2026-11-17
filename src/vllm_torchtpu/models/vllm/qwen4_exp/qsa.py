@@ -898,7 +898,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         else:
             output = self.o_proj(output)
         if reduce and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
+            # q38 AR-FIX (VLLM_TPU_DECODE_TP_AR, default off): the same kernel as sequence_parallel.reduce.
+            from vllm_torchtpu.layers.adapter import tp_ar_decode
+
+            if tp_ar_decode.use_kernel(output):
+                output = tp_ar_decode.kernel_all_reduce(output)
+            else:
+                output = tensor_model_parallel_all_reduce(output)
         return output, selected
 
     def attend(self, hidden, positions, metadata: QSAMetadata):

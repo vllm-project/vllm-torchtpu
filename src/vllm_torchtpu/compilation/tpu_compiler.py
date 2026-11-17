@@ -531,6 +531,14 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
             logger.warning(
                 "Skipping TPU compile environment variable %s: %s", name, exc
             )
+    # q38 AR-FIX decode TP all-reduce kernel (layers/adapter/tp_ar_decode.py; BLSTACK-H8 port onto Benliang Wang's
+    # d523c2ce0): not registered in envs.py, so the loop above never sees it; it keys the cache only when set. Import
+    # only when the flag is set (q38 INT-4, ffd6a8c81): compile_factors() is {} whenever it is empty, so unset leaves
+    # the factors unchanged and imports nothing.
+    if os.environ.get("VLLM_TPU_DECODE_TP_AR", "").strip():
+        from vllm_torchtpu.kernels.collectives import tp8_ar_decode_fn
+
+        factors.update(tp8_ar_decode_fn.compile_factors())
     return factors
 
 

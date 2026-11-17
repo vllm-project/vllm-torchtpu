@@ -156,6 +156,11 @@ def reduce(x: torch.Tensor, sequence_parallel: bool) -> torch.Tensor:
         return x
     if sequence_parallel:
         return tensor_model_parallel_reduce_scatter(x, 0)
+    # q38 AR-FIX (VLLM_TPU_DECODE_TP_AR, default off): the decode TP8 all-reduce as one Pallas call.
+    from vllm_torchtpu.layers.adapter import tp_ar_decode
+
+    if tp_ar_decode.use_kernel(x):
+        return tp_ar_decode.kernel_all_reduce(x)
     return tensor_model_parallel_all_reduce(x)
 
 
