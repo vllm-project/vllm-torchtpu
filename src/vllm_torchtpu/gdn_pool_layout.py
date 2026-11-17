@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vllm_torchtpu.kernels.gdn.ssm_quant import gdn_ssm_quant_u32_rows
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -125,8 +126,12 @@ def pooled_gdn_ssm_state_bytes(
     head_k_dim: int,
     head_v_dim: int,
     dtype: object = DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
+    quant_mode: str = "",
 ) -> int:
     """Live bytes of one slot's head-major, dense SSM region in ``dtype``."""
+    u32_rows = gdn_ssm_quant_u32_rows(head_k_dim, quant_mode)
+    if u32_rows is not None:
+        return num_v_heads * u32_rows * head_v_dim * 4
     return num_v_heads * head_k_dim * head_v_dim * pooled_gdn_state_itemsize(dtype)
 
 

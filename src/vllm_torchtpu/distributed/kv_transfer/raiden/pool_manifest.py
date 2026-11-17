@@ -444,6 +444,11 @@ def _gdn_conv_regions(
 def _gdn_ssm_regions(
     *, ssm_shape: Sequence[int], itemsize: int
 ) -> tuple[RegionSpec, ...]:
+    if tpu_envs.TPU_GDN_SSM_STATE_QUANT:
+        raise NotImplementedError(
+            "Raiden KV transfer does not support quantized GDN recurrent state "
+            "(TPU_GDN_SSM_STATE_QUANT); unset TPU_GDN_SSM_STATE_QUANT."
+        )
     if len(ssm_shape) != 4:
         raise ManifestError(
             f"GDN ssm state must be (blocks, heads, d, d): got {ssm_shape}"
@@ -522,6 +527,11 @@ def _pooled_gdn_state_views(
     layer's region within the merged block-major row; when ``None``, the pool
     is layer-major with one region per manager page.
     """
+    if tpu_envs.TPU_GDN_SSM_STATE_QUANT:
+        raise NotImplementedError(
+            "Raiden KV transfer does not support quantized GDN recurrent state "
+            "(TPU_GDN_SSM_STATE_QUANT); unset TPU_GDN_SSM_STATE_QUANT."
+        )
     raw_index = _raw_index_for(pool, raw_tensors)
     if raw_index is None:
         raise ManifestError(

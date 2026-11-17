@@ -530,12 +530,11 @@ def create_allocs(
     # Initial state needs only 1 slot per sequence; output holds one
     # checkpoint per window position (1 without speculative decoding).
     conv_shape = (cfg.prev_kernel_size, 1, cfg.dim_size)
-    # The window stores the recurrent state as uint32 words; `packing`
-    # state values share one word, so it has kq_head_dim // packing rows.
-    packing = 4 // jnp.dtype(cfg.dtypes.recurrent_state).itemsize
+    # The window stores the recurrent state as uint32 words; packed values
+    # plus optional FP32 block-16 scales span `cfg.recurrent_u32_rows` rows.
     recurrent_shape = (
         cfg.num_v_heads,
-        cfg.kq_head_dim // packing,
+        cfg.recurrent_u32_rows,
         cfg.v_head_dim,
     )
     state_in_partial = functools.partial(

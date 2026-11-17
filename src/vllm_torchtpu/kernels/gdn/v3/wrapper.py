@@ -200,9 +200,34 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     # Round to the state dtype, then pack into the uint32 window.
-    recurrent_out_slot_ref[...] = pltpu.bitcast(
-        new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
-    )
+    if cfg.ssm_state_quant == "int8_block16":
+        q_rows = cfg.recurrent_q_u32_rows
+        n_blocks = cfg.recurrent_scale_u32_rows
+        blocked = new_recurrent_state.reshape(
+            *new_recurrent_state.shape[:-2], n_blocks, 16, cfg.v_head_dim
+        )
+        amax = jnp.max(jnp.abs(blocked), axis=-2)
+        q_max = float(jnp.iinfo(jnp.int8).max)
+        scales = amax * (1.0 / q_max)
+        inv_scales = jnp.where(
+            scales > 0.0, 1.0 / jnp.where(scales > 0.0, scales, 1.0), 0.0
+        )
+        usable = (scales > 0.0) & jnp.isfinite(inv_scales)
+        scales = jnp.where(usable, scales, 0.0)
+        scaled = jnp.where(
+            usable[..., None, :],
+            jnp.clip(blocked * inv_scales[..., None, :], -q_max, q_max),
+            0.0,
+        )
+        q_vals = jnp.rint(scaled).astype(jnp.int8).reshape(*new_recurrent_state.shape)
+        recurrent_out_slot_ref[..., :q_rows, :] = pltpu.bitcast(q_vals, jnp.uint32)
+        recurrent_out_slot_ref[..., q_rows:, :] = pltpu.bitcast(
+            scales.astype(jnp.float32), jnp.uint32
+        )
+    else:
+        recurrent_out_slot_ref[...] = pltpu.bitcast(
+            new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+        )
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
@@ -329,6 +354,7 @@ def outer_kernel(
         "gate_lower_bound",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
+        "ssm_state_quant",
     ),
 )
 def fused_conv1d_gdn(
@@ -368,6 +394,7 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    ssm_state_quant: str = "",
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -548,6 +575,48 @@ def fused_conv1d_gdn(
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
+    effective_ssm_quant = ""
+    effective_u32_rows: int | None = None
+    if ssm_state_quant:
+        from vllm_torchtpu.kernels.gdn.ssm_quant import gdn_ssm_quant_u32_rows
+
+        if is_kda:
+            raise NotImplementedError(
+                "ssm_state_quant is not supported for KDA layers; "
+                "unset TPU_GDN_SSM_STATE_QUANT."
+            )
+        cand_rows = gdn_ssm_quant_u32_rows(d_k, ssm_state_quant)
+        assert cand_rows is not None
+        if d_v != num_lanes:
+            raise ValueError(
+                f"ssm_state_quant={ssm_state_quant!r} requires d_v == "
+                f"num_lanes ({num_lanes}); got d_v={d_v}."
+            )
+        if not is_shared:
+            if jnp.dtype(recurrent_dtype) != jnp.float32:
+                raise ValueError(
+                    f"ssm_state_quant={ssm_state_quant!r} requires float32 "
+                    f"recurrent_state carrier buffer; got {recurrent_dtype}."
+                )
+            if states[1].shape[-2:] != (cand_rows, d_v):
+                raise ValueError(
+                    f"ssm_state_quant={ssm_state_quant!r} expects "
+                    f"recurrent_state.shape[-2:]={(cand_rows, d_v)}, "
+                    f"got {states[1].shape[-2:]}."
+                )
+        else:
+            min_granules = ((n_v * cand_rows * d_v) // num_lanes) + pl.cdiv(
+                (kernel_size - 1) * dim, num_lanes
+            )
+            if states.shape[1] < min_granules:
+                raise ValueError(
+                    f"ssm_state_quant={ssm_state_quant!r} requires at least "
+                    f"{min_granules} shared-pool granules per slot, "
+                    f"got {states.shape[1]}."
+                )
+        effective_ssm_quant = ssm_state_quant
+        effective_u32_rows = cand_rows
+
     # KDA stays on static tiles until the VMEM estimate models its gate.
     if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
         decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
@@ -566,6 +635,7 @@ def fused_conv1d_gdn(
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
             mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
             window_size=window_size,
+            ssm_state_quant=effective_ssm_quant,
         )
         logger.info_once(
             "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
@@ -587,9 +657,14 @@ def fused_conv1d_gdn(
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
         state_positions = 1 + window
-        recurrent_bytes_per_seq = (
-            state_positions * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
-        )
+        if effective_u32_rows is not None:
+            recurrent_bytes_per_seq = (
+                state_positions * n_v * effective_u32_rows * d_v * 4
+            )
+        else:
+            recurrent_bytes_per_seq = (
+                state_positions * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
+            )
         bytes_per_seq = (
             # Recurrent checkpoints — the dominant term.
             recurrent_bytes_per_seq
@@ -685,6 +760,7 @@ def fused_conv1d_gdn(
                 conv_state=conv_dtype,
             ),
             is_shared=is_shared,
+            ssm_state_quant=effective_ssm_quant,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
