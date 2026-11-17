@@ -1421,13 +1421,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DP_PREFIX_AFFINITY": env_bool(
         "VLLM_TPU_DP_PREFIX_AFFINITY", default=False
     ),
-    "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS": env_int(
+    "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS": env_positive_int_or_none(
         "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS", 4096
     ),
-    "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN": env_int(
+    "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN": env_nonnegative_int(
         "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN", 2
     ),
-    "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE": env_int(
+    "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE": env_positive_int_or_none(
         "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE", 65536
     ),
 }
