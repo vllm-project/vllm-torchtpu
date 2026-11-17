@@ -20,8 +20,11 @@ the eager backend.
 
 from __future__ import annotations
 
+import builtins
+import gc
 import sys
 import types
+import weakref
 
 import pytest
 import torch
@@ -60,19 +63,82 @@ def memo_on(monkeypatch):
 
 
 def test_memo_key_covers_metadata_scalars_and_identity():
-    a = torch.zeros(4, 8)
+    a, b = torch.zeros(4, 8), torch.zeros(4, 8)
     obj = object()
-    k1 = qx._memo_key((a, 3, None, "s", obj, [a, 2]))
-    assert k1 == qx._memo_key((torch.ones(4, 8), 3, None, "s", obj, [a, 2]))
+    k1 = qx._memo_key((a, 3, None, "s", obj, [b, 2]))
+    assert k1 == qx._memo_key((torch.ones(4, 8), 3, None, "s", obj, [b, 2]))
     # Tensor values are not part of the key; metadata is.
-    assert k1 != qx._memo_key((torch.zeros(4, 9), 3, None, "s", obj, [a, 2]))
-    assert k1 != qx._memo_key((torch.zeros(8, 4).t(), 3, None, "s", obj, [a, 2]))
-    assert k1 != qx._memo_key((a.to(torch.bfloat16), 3, None, "s", obj, [a, 2]))
-    assert k1 != qx._memo_key((a.requires_grad_(False), 4, None, "s", obj, [a, 2]))
-    assert k1 != qx._memo_key((a, 3, None, "s", object(), [a, 2]))
-    assert k1 != qx._memo_key((a, 3, None, "s", obj, [a, 3]))
-    assert k1 != qx._memo_key((a, True, None, "s", obj, [a, 2]))  # bool vs int
+    assert k1 != qx._memo_key((torch.zeros(4, 9), 3, None, "s", obj, [b, 2]))
+    assert k1 != qx._memo_key((torch.zeros(8, 4).t(), 3, None, "s", obj, [b, 2]))
+    assert k1 != qx._memo_key((a.to(torch.bfloat16), 3, None, "s", obj, [b, 2]))
+    assert k1 != qx._memo_key((a.requires_grad_(False), 4, None, "s", obj, [b, 2]))
+    assert k1 != qx._memo_key((a, 3, None, "s", object(), [b, 2]))
+    assert k1 != qx._memo_key((a, 3, None, "s", obj, [b, 3]))
+    assert k1 != qx._memo_key((a, True, None, "s", obj, [b, 2]))  # bool vs int
     assert qx._memo_key(([0] * (qx._MEMO_MAX_SEQ + 1),)) is None
+
+
+def test_memo_key_tells_aliased_tensor_arguments_apart():
+    # Dynamo guards whether two tensor inputs are the same tensor, so the
+    # same tensor twice and two equal-metadata tensors need different keys.
+    a, b = torch.zeros(4), torch.zeros(4)
+    assert qx._memo_key((a, a)) != qx._memo_key((a, b))
+    assert qx._memo_key((a, [a])) != qx._memo_key((a, [b]))
+    assert qx._memo_key((a, b)) == qx._memo_key((b, a))
+
+
+class _Owner:
+    """An argument object Dynamo guards on through its attributes."""
+
+    def __init__(self, n):
+        self.n = n
+
+
+def _fn_owner(x, owner):
+    return x * owner.n
+
+
+def test_memo_never_hits_for_a_recycled_object_id(memo_on, monkeypatch):
+    # A memo keyed by a freed object's id must not dispatch a later object
+    # that reuses the id to the freed one's cache entry (whose guard on
+    # `owner.n` it never re-checks). Whether CPython hands out the freed
+    # address again is up to its allocator, so the reuse is simulated: the
+    # memo sees the new object under the first one's id.
+    w = _wrapped(_fn_owner)
+    x = torch.arange(4.0)
+    first = _Owner(2)
+    for _ in range(3):
+        torch.testing.assert_close(w(x, first), x * 2)
+    assert qx._MEMO_STATS["store"] == 1
+    (key,) = w._qx_fast_state["memo"]
+    first_id = id(first)
+    del first
+    gc.collect()
+    second = _Owner(5)
+    real_id = builtins.id
+    monkeypatch.setattr(
+        qx, "id", lambda o: first_id if o is second else real_id(o), raising=False
+    )
+    assert qx._memo_key((x, second)) == key
+    hits = qx._MEMO_STATS["hit"]
+    torch.testing.assert_close(w(x, second), x * 5)
+    assert qx._MEMO_STATS["hit"] == hits
+
+
+class _Slotted:
+    __slots__ = ("n",)
+
+
+def test_memo_holds_objects_without_weak_references_alive():
+    # An object that takes no weak reference is held strongly, so its id
+    # cannot be reused while the entry exists.
+    obj = _Slotted()
+    with pytest.raises(TypeError):
+        weakref.ref(obj)
+    (ref,) = qx._memo_refs([obj])
+    assert ref() is obj
+    assert qx._memo_live((ref,), [obj])
+    assert not qx._memo_live((ref,), [_Slotted()])
 
 
 def test_memo_default_off_leaves_dispatch_unchanged(monkeypatch):
