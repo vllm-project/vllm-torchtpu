@@ -145,6 +145,7 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = True
     TPU_DRAFT_BUCKET_STEP: int = 32
     TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
+    TPU_SPEC_SYNTHETIC_ROW_SPLIT_MIN_ROWS: int = 1
     TPU_DSPARK_MARKOV_KERNEL: bool = True
     TPU_SAMPLER_TOP_P_KERNEL: bool = True
     TPU_FP8_LM_HEAD: bool = False
@@ -1079,6 +1080,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Needs the model's compute_logits_shard; same tokens.
     "TPU_SPEC_SYNTHETIC_ROW_SPLIT": env_bool(
         "TPU_SPEC_SYNTHETIC_ROW_SPLIT", default=True
+    ),
+    # Fewest request rows per rank for which the row split applies. It costs
+    # an all-to-all and a token all-gather (~5-10 us); it saves the full-logits
+    # all-gather, its relayout and the sampler's rows past this rank's own. The
+    # dense-row top-p kernel costs per row (kernels/top_p_sample.py), so a
+    # single row per rank already wins (the XLA sampler's passes were
+    # launch-bound up to ~16 rows, which made 4 the floor then).
+    "TPU_SPEC_SYNTHETIC_ROW_SPLIT_MIN_ROWS": env_nonnegative_int(
+        "TPU_SPEC_SYNTHETIC_ROW_SPLIT_MIN_ROWS", 1
     ),
     # The DSpark greedy Markov chain over a vocab-parallel LM head runs its K
     # steps as one kernel with remote-DMA exchanges
