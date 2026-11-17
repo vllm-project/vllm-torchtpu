@@ -20,13 +20,15 @@ result_rows with
 bf16 result rows) and its k-ordered weighted sum.
 
 Small shapes: hidden 1024 (whole 8-sublane staging tiles), intermediate 128, 16, 32 or
-64 experts, top-k 4.
+64 experts, top-k 4; shards of a multiple of 8 rows (the program takes them unpadded)
+and of 20 rows (padded outside it); worlds where experts go unrouted (their weight
+streams skipped).
 
 The checks need 8 CPU devices, and the host device count (XLA_FLAGS) must be set before
 JAX starts, so the tests run this file as a script in a subprocess, once per session,
-for the cases pytest selected, and each test reports its case. Regular CI runs the two
-mutant checks and two reference cases (the fused path, and the unrouted-expert skip on a
-world with cold experts); the rest of the grid is marked nightly.
+for the cases pytest selected, and each test reports its case. Regular CI runs the
+mutant check and two reference cases (unpadded rows on a world with cold experts, and
+padded rows); the rest of the grid is marked nightly.
 """
 
 import json
@@ -44,41 +46,18 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.fused_moe.v3 import Config, ffn
 from vllm_torchtpu.kernels.fused_moe.v3 import device as DEV
+from vllm_torchtpu.kernels.fused_moe.v3 import ffn
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
 from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8, quantize_rows
 from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS
 
 D, H, INTER, K = 8, 1024, 128, 4
 
-VARIANTS = {
-    "plain": {},
-    "fused": dict(fused=True),
-    "pallas_tables": dict(fused=True, pallas_tables=True),
-    "merged": dict(fused=True, merged=True),
-    "merged_unpadded": dict(fused=True, merged=True, unpadded=True),
-    # The unrouted-expert skip (Config.dense_slots_skip_unrouted) and other weight slot
-    # counts.
-    "plain_skip": dict(skip_unrouted=True),
-    "fused_skip": dict(fused=True, skip_unrouted=True),
-    "merged_unpadded_skip": dict(
-        fused=True, merged=True, unpadded=True, skip_unrouted=True
-    ),
-    "merged_unpadded_w4": dict(fused=True, merged=True, unpadded=True, weight_slots=4),
-    "merged_unpadded_skip_w2": dict(
-        fused=True, merged=True, unpadded=True, skip_unrouted=True, weight_slots=2
-    ),
-}
-
 
 def _cpu_budget(monkeypatch):
     # No TPU to ask for its VMEM size: the programs plan for a 64 MiB core.
-    monkeypatch.setattr(DS, "VMEM_LIMIT", 64 << 20)
     monkeypatch.setattr(DEV, "vmem_limit", lambda *a, **k: 64 << 20)
-    monkeypatch.setattr(DS, "TABLE_HOOK", None)
-    monkeypatch.setattr(DS, "MERGED_POS_SHIFT", 0)
-    monkeypatch.setattr(DS, "SKIP_MUTANT", "")
 
 
 def _world(e, real, hot, seed=0):
@@ -162,16 +141,12 @@ def _reference(x, logits, w1, w2, s1, s2, real, valid):
     return out
 
 
-def _run(variant, e, real, hot, short):
+def _run(e, real, hot, short):
     x, logits, w1, w2, s1, s2 = _world(e, real, hot)
     mesh = Mesh(np.asarray(jax.devices()[:D]), ("d",))
     sh = NamedSharding(mesh, P("d"))
     args = [jax.device_put(a, sh) for a in (x, w1, w2, s1, s2, logits)]
     valid = [real - (short if d % 2 else 0) for d in range(D)]
-    kw = dict(VARIANTS[variant])
-    ws = kw.pop("weight_slots", 0)
-    if ws:
-        kw["config"] = Config(dense_slots_weight_slots=ws)
     with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()):
         got = jax.jit(
             lambda *a: DS.dense_slots_moe(
@@ -183,7 +158,6 @@ def _run(variant, e, real, hot, short):
                 shard_index=jnp.arange(D, dtype=jnp.int32).reshape(D, 1),
                 valid_tokens=jnp.asarray(valid, jnp.int32),
                 drop_nan_rows=True,
-                **kw,
             )
         )(*args)
         want = _reference(x, logits, w1, w2, s1, s2, real, valid)
@@ -192,106 +166,44 @@ def _run(variant, e, real, hot, short):
 
 def _close(got, want):
     """The kernel and the reference are the same ops, but CPU matmuls of different
-    shapes (a
-    32-row tile against one row) can round an f32 sum differently, and an fp8
-    requantization
-    can carry that to a few bf16 steps on a handful of values (measured: 15 of
-    196,608). On
-    the device the layer is bit-identical to fused_ep_moe with bf16 result rows
-    (test_fep_dense_slots.py). A wrong row moves most of the output (a mutant: ~90%)."""
+    shapes (a 32-row tile against one row) can round an f32 sum differently, and an
+    fp8 requantization can carry that to a few bf16 steps on a handful of values
+    (measured: 15 of 196,608). On the device the layer is checked against fused_ep_moe
+    with bf16 result rows (tests/kernels/fused_moe/test_fused_ep_moe_v3.py). A wrong
+    row moves most of the output (a mutant: ~90%)."""
     off = np.abs(got - want) > 2.0**-7 * np.abs(want) + 1e-5
     return bool(np.isfinite(got).all() and off.mean() < 1e-3)
 
 
-def _check_matches_reference(variant, e, real, hot, short):
-    if (
-        e == 64
-        and "skip" not in variant
-        and variant not in ("merged_unpadded", "fused")
-    ):
-        pytest.skip("64-expert worlds cover the skip variants and their bases")
-    got, want = _run(variant, e, real, hot, short)
+def _check_matches_reference(e, real, hot, short):
+    got, want = _run(e, real, hot, short)
     assert _close(got, want), float(np.abs(got - want).max())
 
 
-def _run_kernel_only(variant, e, real, hot, short):
-    x, logits, w1, w2, s1, s2 = _world(e, real, hot)
-    mesh = Mesh(np.asarray(jax.devices()[:D]), ("d",))
-    sh = NamedSharding(mesh, P("d"))
-    args = [jax.device_put(a, sh) for a in (x, w1, w2, s1, s2, logits)]
-    valid = [real - (short if d % 2 else 0) for d in range(D)]
-    kw = dict(VARIANTS[variant])
-    ws = kw.pop("weight_slots", 0)
-    if ws:
-        kw["config"] = Config(dense_slots_weight_slots=ws)
-    with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()):
-        got = jax.jit(
-            lambda *a: DS.dense_slots_moe(
-                *a,
-                top_k=K,
-                renormalize=True,
-                mesh=mesh,
-                tile_rows=32,
-                shard_index=jnp.arange(D, dtype=jnp.int32).reshape(D, 1),
-                valid_tokens=jnp.asarray(valid, jnp.int32),
-                drop_nan_rows=True,
-                **kw,
-            )
-        )(*args)
-    return np.asarray(got.astype(jnp.float32))
-
-
-def _check_skip_bit_identical(base, variant, hot, short):
-    """The skip and the slot count change only which weight DMAs run and when: the same
-    program on the same CPU gives every value equal."""
-    a = _run_kernel_only(base, 64, 24, hot, short)
-    b = _run_kernel_only(variant, 64, 24, hot, short)
-    assert np.array_equal(a, b), int((a != b).sum())
-
-
-def _check_skip_slot_mutant_is_caught(monkeypatch):
-    """Computing with the old expert-indexed weight slot on the compacted list reads
-    another
-    expert's (or a not yet landed) weights: the output must move."""
-    a = _run_kernel_only("merged_unpadded", 64, 24, "cold", 0)
-    monkeypatch.setattr(DS, "SKIP_MUTANT", "slot")
-    DS.build_kernel.cache_clear()
-    b = _run_kernel_only("merged_unpadded_skip", 64, 24, "cold", 0)
-    monkeypatch.setattr(DS, "SKIP_MUTANT", "")
-    DS.build_kernel.cache_clear()
-    assert not np.array_equal(a, b)
-
-
 def _check_mutants_are_caught(monkeypatch):
-    """Each mutant breaks the output: the destination reads the neighbouring pair's row
-    (pos),
-    each expert gathers its rows one token off (onehot), the merged program's arrival
-    rows shift
-    by one (merged pos)."""
-    cases = [("plain", "pos"), ("fused", "onehot"), ("merged_unpadded", "merged_pos")]
-    for variant, mutant in cases:
-        if mutant == "pos":
-            monkeypatch.setattr(
-                DS,
-                "TABLE_HOOK",
-                lambda t: dict(
-                    t, pos=jnp.roll(t["pos"].reshape(-1), 1).reshape(t["pos"].shape)
-                ),
-            )
-        elif mutant == "onehot":
-            monkeypatch.setattr(
-                DS, "TABLE_HOOK", lambda t: dict(t, mp=jnp.roll(t["mp"], 1, axis=1))
-            )
-        else:
-            monkeypatch.setattr(DS, "MERGED_POS_SHIFT", 1)
+    """Each mutant of the in-program tables breaks the output: the destination reads
+    the next pair's arrival row (pos), each expert gathers its rows one token off
+    (onehot)."""
+    tables_math = DS._tables_math
+
+    def shifted_pos(*a, **k):
+        mp, tab, pos, misc = tables_math(*a, **k)
+        return mp, tab, jnp.minimum(pos + 1, pos.size - 1), misc
+
+    def rolled_mp(*a, **k):
+        mp, tab, pos, misc = tables_math(*a, **k)
+        return jnp.roll(mp, 1, axis=1), tab, pos, misc
+
+    for mutant in (shifted_pos, rolled_mp):
+        monkeypatch.setattr(DS, "_tables_math", mutant)
         DS.build_kernel.cache_clear()
-        got, want = _run(variant, 16, 24, False, 0)
-        assert not _close(got, want), (variant, mutant)
-        monkeypatch.setattr(DS, "TABLE_HOOK", None)
-        monkeypatch.setattr(DS, "MERGED_POS_SHIFT", 0)
-        DS.build_kernel.cache_clear()
+        got, want = _run(16, 24, False, 0)
+        assert not _close(got, want), mutant.__name__
+    monkeypatch.setattr(DS, "_tables_math", tables_math)
+    DS.build_kernel.cache_clear()
 
 
+# (experts, rows per shard, routing, rows dropped on odd shards)
 WORLDS = [
     (16, 24, False, 0),
     (16, 24, True, 0),
@@ -299,21 +211,13 @@ WORLDS = [
     (64, 24, "cold", 0),
     (64, 32, "cold", 5),
     (64, 24, True, 0),
+    (16, 20, False, 0),
+    (64, 20, "cold", 3),
 ]
-# Regular CI: the two mutant checks (the comparison bites) and two reference cases, the
-# fused path and the unrouted-expert skip where experts go unrouted. Every other case
-# runs nightly.
-REGULAR_WORLD = {
-    "fused": (16, 24, False, 0),
-    "merged_unpadded_skip": (64, 24, "cold", 0),
-}
-SKIP_PAIRS = [
-    ("merged_unpadded", "merged_unpadded_skip"),
-    ("merged_unpadded", "merged_unpadded_w4"),
-    ("merged_unpadded", "merged_unpadded_skip_w2"),
-    ("fused", "fused_skip"),
-]
-SKIP_WORLDS = [("cold", 0), ("cold", 5), (True, 0), (False, 0)]
+# Regular CI: the mutant check (the comparison bites) and two reference cases,
+# unpadded rows where experts go unrouted and padded rows. Every other case runs
+# nightly.
+REGULAR_WORLDS = [(64, 24, "cold", 0), (16, 20, False, 0)]
 
 
 def _case_id(name, *params):
@@ -323,19 +227,10 @@ def _case_id(name, *params):
 def _cases():
     """Every case of the grid: id -> the check it runs with a MonkeyPatch."""
     cases = {}
-    for variant in VARIANTS:
-        for world in WORLDS:
-            cases[_case_id("matches_reference", variant, *world)] = (
-                lambda mp, v=variant, w=world: _check_matches_reference(v, *w)
-            )
-    for base, variant in SKIP_PAIRS:
-        for hot, short in SKIP_WORLDS:
-            cases[_case_id("skip_bit_identical", base, variant, hot, short)] = (
-                lambda mp, b=base, v=variant, h=hot, s=short: _check_skip_bit_identical(
-                    b, v, h, s
-                )
-            )
-    cases["skip_slot_mutant_is_caught"] = _check_skip_slot_mutant_is_caught
+    for world in WORLDS:
+        cases[_case_id("matches_reference", *world)] = (
+            lambda mp, w=world: _check_matches_reference(*w)
+        )
     cases["mutants_are_caught"] = _check_mutants_are_caught
     return cases
 
@@ -363,10 +258,7 @@ def _worker(case_ids):
     print("RESULT " + json.dumps(results))
 
 
-_TESTS = {
-    "test_matches_reference": "matches_reference",
-    "test_skip_bit_identical": "skip_bit_identical",
-}
+_TESTS = {"test_matches_reference": "matches_reference"}
 
 
 def _item_case(item):
@@ -403,46 +295,20 @@ def on_8_devices(request):
     return json.loads(lines[-1][len("RESULT ") :])
 
 
-def _report(results, case, may_skip=False):
+def _report(results, case):
     got = results[case]
-    if got["outcome"] == "skipped" and may_skip:
-        pytest.skip(got["message"])
     assert got["outcome"] == "passed", got["message"]
 
 
 def _matches_params():
-    for variant in VARIANTS:
-        for world in WORLDS:
-            regular = REGULAR_WORLD.get(variant) == world
-            marks = () if regular else (pytest.mark.nightly,)
-            yield pytest.param(variant, *world, marks=marks)
+    for world in WORLDS:
+        marks = () if world in REGULAR_WORLDS else (pytest.mark.nightly,)
+        yield pytest.param(*world, marks=marks)
 
 
-@pytest.mark.parametrize("variant,e,real,hot,short", list(_matches_params()))
-def test_matches_reference(on_8_devices, variant, e, real, hot, short):
-    # The 64-expert worlds run only the skip variants and their bases (the check skips
-    # the rest itself).
-    may_skip = (
-        e == 64
-        and "skip" not in variant
-        and variant not in ("merged_unpadded", "fused")
-    )
-    _report(
-        on_8_devices,
-        _case_id("matches_reference", variant, e, real, hot, short),
-        may_skip,
-    )
-
-
-@pytest.mark.nightly
-@pytest.mark.parametrize("base,variant", SKIP_PAIRS)
-@pytest.mark.parametrize("hot,short", SKIP_WORLDS)
-def test_skip_bit_identical(on_8_devices, base, variant, hot, short):
-    _report(on_8_devices, _case_id("skip_bit_identical", base, variant, hot, short))
-
-
-def test_skip_slot_mutant_is_caught(on_8_devices):
-    _report(on_8_devices, "skip_slot_mutant_is_caught")
+@pytest.mark.parametrize("e,real,hot,short", list(_matches_params()))
+def test_matches_reference(on_8_devices, e, real, hot, short):
+    _report(on_8_devices, _case_id("matches_reference", e, real, hot, short))
 
 
 def test_mutants_are_caught(on_8_devices):

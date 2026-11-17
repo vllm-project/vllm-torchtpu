@@ -17,28 +17,31 @@
 # row quantization, FFN, combine and layout helpers) and does not pick up changes
 # to it automatically.
 """Fused EP MoE with landing rows fixed by the routing alone ("dense slots";
-DP4xTP2 decode, experimental, default off).
+the Qwen3.5 DP4xTP2 decode layout, default off).
 
 The v3 layer moves data the same way (an all-gather of every shard's fp8
 token rows, every local expert streamed once, result rows pushed back to the
 token owners), but it builds packed per-(expert, destination) tables on the
 TensorCore and the sparse cores and sorts the routed rows into expert order
-before the expert kernel. This layer needs none of that:
+before the expert kernel. This layer needs none of that. One Pallas program
+per shard:
 
-  * every shard knows every token's top-k (a small all-gather of the
-    indices), so each shard computes, with a few dense XLA ops, where every
-    one of its result rows lands: the destination's arrival buffer is ordered
-    (source shard, local expert, token), with no padding;
-  * one Pallas program per shard: a barrier, the first weight refills, the
-    shard's rows quantized to fp8 and all-gathered by remote DMA into a
-    VMEM-resident copy of every token row; then each local expert once,
-    its rows picked out of the resident rows by a one-hot matmul (exact),
-    the FFN math of v3 (ffn.expert_ffn_fp8), and each tile's result rows
-    pushed per (expert, destination) run straight into the destination's
-    arrival buffer;
-  * the destination gathers its arrivals into pair order (token-major,
-    pair t * top_k + k) and sums them with v3's weighted_sum, which adds the
-    k terms in order exactly as v3's combine does.
+  * a barrier and the first weight refills; the shard's top-k indices go to
+    every peer by remote DMA, and the shard's rows, quantized to fp8, are
+    all-gathered the same way into a VMEM-resident copy of every token row;
+  * from every token's top-k each shard computes, with vector ops under the
+    weight refills, where every one of its result rows lands: the
+    destination's arrival buffer is ordered (source shard, local expert,
+    token), with no padding;
+  * each local expert with at least one routed row once (the experts no row
+    is routed to are skipped and their weights never streamed, apart from
+    the first WEIGHT_SLOTS - 1, whose refills start before the tables
+    exist), its rows picked out of the resident rows by a one-hot matmul
+    (exact), the FFN math of v3 (ffn.expert_ffn_fp8), and each tile's
+    result rows pushed per (expert, destination) run straight into the
+    destination's arrival buffer in VMEM;
+  * the destination sums each token's top_k arrivals in k order, as v3's
+    weighted_sum does, in the same program.
 
 Result rows travel as bf16 (Config.result_rows "bf16" in v3 terms): no row
 scale has to travel with them. The same per-row math as v3 with bf16 result
@@ -56,7 +59,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.fused_moe.v3 import device, ffn, layout
-from vllm_torchtpu.kernels.fused_moe.v3.combine import weighted_sum
 from vllm_torchtpu.kernels.fused_moe.v3.config import Config
 from vllm_torchtpu.kernels.fused_moe.v3.layout import LANES, MESH_AXIS, device_coords
 from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8, quantize_rows
@@ -69,119 +71,33 @@ ROW_ALIGN = 32
 # Rows per one-hot gather pass (the tile's rows are gathered this many at a
 # time, only as many passes as the tile has live rows).
 GATHER_ROWS = 32
-INTERPRET = None  # tests set a pltpu.InterpretParams()
-VMEM_LIMIT = None  # tests (no TPU to ask) set a byte count
-# The combine inside the program (arrivals and the exchange in VMEM).
-FUSED = False
-# The index exchange and the tables as one Pallas program instead of XLA ops.
-PALLAS_TABLES = False
-COLLECTIVE_ID_TABLES = 6
-# Tests only: a function applied to the tables dict (mutation checks).
-TABLE_HOOK = None
-# The tables inside the fused program (no separate tables program).
-MERGED = False
-# Tests only: the merged program's arrival rows shifted by this much (mutation check).
-MERGED_POS_SHIFT = 0
-# Merged program on the unpadded rows (padding and valid-row masks inside).
-UNPADDED = False
 TAB_LANES = 32
-# Skip the weight stream of local experts no row is routed to: after the
-# tables, the program walks a compacted list of its live experts (the first
-# weight_prefetch experts, whose refills start before the tables exist, stay
-# in the list whatever their rows). Same math on the same rows, so the output
-# is bit-identical; only zero-row experts' weight DMAs disappear.
-# Config.dense_slots_skip_unrouted turns it on; tests may set this instead.
-SKIP_UNROUTED = False
-# Tests only (mutation checks of the skip path): "slot" computes with the
-# weight slot of the old expert-indexed rule instead of the list position's
-# (wrong weights, no hang); "drop" leaves the first live expert after the
-# prefetched ones out of the list (its rows never arrive: a hang or a wrong
-# output, so run it under a timeout).
-SKIP_MUTANT = ""
-# Tests only: the program's weight slots (0: Config.dense_slots_weight_slots, else 3).
-WEIGHT_SLOTS = 0
+# VMEM weight slots (whole experts) of the program: it keeps
+# WEIGHT_SLOTS - 1 expert refills in flight.
+WEIGHT_SLOTS = 3
 
 
 def _align(n, m):
     return -(-n // m) * m
 
 
-def shard_tables(
-    idx_all, me, *, experts_per_shard, num_shards, tokens_per_shard, num_experts
-):
-    """The routing tables of shard `me`, from every token's top-k.
-
-    idx_all: [num_shards * tokens_per_shard, top_k] int32 global expert ids
-    (num_experts or more for none). Returns a dict of int32 arrays:
+def _tables_math(me, allv, own, *, D, Tp, G, K, E):
+    """The routing tables of shard `me`, from every shard's lane-padded top-k
+    (allv [D * Tp, LANES] int32 global expert ids, E or more for none) and
+    this shard's own (own [Tp, LANES]), as vector ops inside the program; the
+    running sums are matmuls of 0/1 matrices (exact: every count is at most
+    Tp * K, every bf16 operand at most Tp). Returns:
       mp [G, N]: row of token t among local expert e's rows (tokens in
         order), -1 where e is not among t's choices;
-      cnt [G]: rows of each local expert;
-      run_start, run_len, dst_row [G * D]: per (expert, destination) run,
-        where it starts among the expert's rows, its length, and the
-        destination's arrival row it lands on;
-      pos [tokens_per_shard * top_k]: arrival row of each of this shard's
-        pairs (pair order), 0 for a pair routed nowhere;
-      misc [4]: (me, rows arriving from other shards, rows sent to self,
-        rows sent to other shards).
-    Packed as the programs read them: tab [G, TAB_LANES] (run_start in
-    lanes [0, D), run_len [D, 2D), dst_row [2D, 3D), cnt at 3D), pos
-    [tokens_per_shard, top_k], misc [8, LANES] (row 0).
+      tab [G, TAB_LANES]: per (expert, destination) run, where it starts
+        among the expert's rows (lanes [0, D)), its length ([D, 2D)) and the
+        destination's arrival row it lands on ([2D, 3D)); the expert's rows
+        at lane 3D;
+      pos [Tp, K]: arrival row of each of this shard's pairs, 0 for a pair
+        routed nowhere;
+      misc [8, LANES]: row 0 holds (me, rows arriving from other shards, rows
+        sent to self, rows sent to other shards).
     """
-    G, D, Tp = experts_per_shard, num_shards, tokens_per_shard
-    N, K = idx_all.shape
-    idx_all = idx_all.astype(jnp.int32)
-    valid_all = (idx_all >= 0) & (idx_all < num_experts)
-    loc = jnp.where(valid_all, idx_all - me * G, -1)
-    e_iota = jnp.arange(G, dtype=jnp.int32)[:, None]
-    m = jnp.zeros((G, N), jnp.bool_)
-    for k in range(K):
-        m = m | (loc[:, k][None, :] == e_iota)
-    mi = m.astype(jnp.int32)
-    incl = jnp.cumsum(mi, axis=1)
-    mp = jnp.where(m, incl - mi, -1)
-    cnt = incl[:, -1]
-    run_len = mi.reshape(G, D, Tp).sum(-1)
-    run_start = jnp.cumsum(run_len, axis=1) - run_len
-    shard_of = jnp.where(valid_all, idx_all // G, D)  # [N, K]
-    by_dest = shard_of.reshape(D, Tp * K)
-    s_iota = jnp.arange(D, dtype=jnp.int32)
-    # c[s, d]: pairs of destination d's tokens whose expert is on shard s
-    c = jnp.sum(
-        (by_dest[None, :, :] == s_iota[:, None, None]).astype(jnp.int32), axis=2
-    )
-    base = jnp.sum(jnp.where((s_iota < me)[:, None], c, 0), axis=0)  # [D]
-    dst_row = base[None, :] + jnp.cumsum(run_len, axis=0) - run_len
-    own = lax.dynamic_slice_in_dim(idx_all, me * Tp, Tp, 0).reshape(-1)
-    valid = (own >= 0) & (own < num_experts)
-    key = jnp.where(valid, own, num_experts)
-    tok = jnp.arange(Tp * K, dtype=jnp.int32) // K
-    less = (key[None, :] < key[:, None]) | (
-        (key[None, :] == key[:, None]) & (tok[None, :] < tok[:, None])
-    )
-    pos = jnp.sum((less & valid[None, :]).astype(jnp.int32), axis=1)
-    pos = jnp.where(valid, pos, 0)
-    n_valid = jnp.sum(valid.astype(jnp.int32))
-    own_local = jnp.sum(jnp.where(s_iota == me, run_len, 0))
-    misc = jnp.stack(
-        [
-            jnp.asarray(me, jnp.int32),
-            n_valid - own_local,
-            own_local,
-            jnp.sum(cnt) - own_local,
-        ]
-    ).astype(jnp.int32)
-    tab = jnp.zeros((G, TAB_LANES), jnp.int32)
-    tab = tab.at[:, 0:D].set(run_start).at[:, D : 2 * D].set(run_len)
-    tab = tab.at[:, 2 * D : 3 * D].set(dst_row).at[:, 3 * D].set(cnt)
-    misc_t = jnp.zeros((8, LANES), jnp.int32).at[0, 0:4].set(misc)
-    return dict(mp=mp, tab=tab, pos=pos.reshape(Tp, K), misc=misc_t)
-
-
-def _tables_math(me, allv, own, *, D, Tp, G, K, E):
-    """shard_tables' tables from every shard's lane-padded top-k (allv
-    [D * Tp, LANES]) and this shard's own (own [Tp, LANES]), as vector ops
-    inside a program; the running sums are matmuls of 0/1 matrices (exact).
-    Returns (mp [G, N], tab [G, TAB_LANES], pos [Tp, K], misc [8, LANES])."""
     N = D * Tp
 
     def dot(a, b):
@@ -281,98 +197,6 @@ def _tables_math(me, allv, own, *, D, Tp, G, K, E):
     return mp, tab, pos, misc
 
 
-@functools.cache
-def build_tables_kernel(
-    *, num_shards, tokens_per_shard, experts_per_shard, top_k, num_experts, mesh_axes
-):
-    """The index exchange and shard_tables as one Pallas program: every
-    shard's top-k (lane-padded [Tp, LANES] int32, num_experts for none) to
-    every peer by remote DMA, then the same tables as shard_tables, with the
-    running sums as matmuls of 0/1 matrices (exact: every count is at most
-    tokens_per_shard * top_k, every bf16 operand at most tokens_per_shard).
-    Returns a callable (me [1] int32, idx [Tp, LANES]) -> (mp, tab, pos, misc).
-    """
-    D, Tp, G, K, E = (
-        num_shards,
-        tokens_per_shard,
-        experts_per_shard,
-        top_k,
-        num_experts,
-    )
-    N = D * Tp
-    if K > LANES or 4 * D > TAB_LANES or Tp % 8:
-        raise ValueError(f"top_k {K}, shards {D}, tokens {Tp}")
-
-    def dot(a, b):
-        return lax.dot_general(
-            a.astype(jnp.bfloat16),
-            b.astype(jnp.bfloat16),
-            (((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
-
-    def kernel(
-        me_ref, idx_ref, mp_ref, tab_ref, pos_ref, misc_ref, idx_all, sem_send, sem_recv
-    ):
-        me = me_ref[0]
-        block = pl.ds(pl.multiple_of(me * Tp, 8), Tp)
-        own = idx_ref[...]
-        idx_all[block, :] = own
-        _barrier(D, mesh_axes)
-        for i in range(1, D):
-            peer = lax.rem(me + i, jnp.int32(D))
-            pltpu.make_async_remote_copy(
-                src_ref=idx_all.at[block],
-                dst_ref=idx_all.at[block],
-                send_sem=sem_send,
-                recv_sem=sem_recv,
-                device_id=device_coords(peer, mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH,
-            ).start()
-        if D > 1:
-            _wait_rows(sem_recv, idx_all, (D - 1) * Tp)
-        mp, tab, pos, misc = _tables_math(
-            me, idx_all[...], own, D=D, Tp=Tp, G=G, K=K, E=E
-        )
-        mp_ref[...] = mp
-        tab_ref[...] = tab
-        pos_ref[...] = pos
-        misc_ref[...] = misc
-        if D > 1:
-            _wait_rows(sem_send, idx_all, (D - 1) * Tp)
-
-    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
-    params = dict(
-        collective_id=COLLECTIVE_ID_TABLES,
-        vmem_limit_bytes=VMEM_LIMIT or device.vmem_limit(),
-    )
-    if layout.SIDE_EFFECTS:
-        params["has_side_effects"] = True
-    return pl.pallas_call(
-        kernel,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            in_specs=[vmem],
-            out_specs=[vmem] * 4,
-            scratch_shapes=(
-                pltpu.VMEM((N, LANES), jnp.int32),
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-            ),
-            grid=(),
-        ),
-        out_shape=[
-            jax.ShapeDtypeStruct((G, N), jnp.int32),
-            jax.ShapeDtypeStruct((G, TAB_LANES), jnp.int32),
-            jax.ShapeDtypeStruct((Tp, K), jnp.int32),
-            jax.ShapeDtypeStruct((8, LANES), jnp.int32),
-        ],
-        compiler_params=pltpu.CompilerParams(**params),
-        interpret=INTERPRET if INTERPRET is not None else False,
-        name=f"fused_ep_dense_slots_tables_g{G}_n{N}",
-    )
-
-
 def _wait_rows(sem, ref, rows):
     """Waits until `rows` rows' worth of copies on `sem` have landed."""
     pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)], sem).wait()
@@ -403,34 +227,26 @@ def build_kernel(
     mesh_axes,
     elementwise,
     columns_per_pass,
-    weight_slots=3,
-    weight_prefetch=2,
     result_slots=3,
-    vmem_limit=None,
-    fused=False,
     out_dtype=jnp.bfloat16,
-    merged=False,
     num_experts=None,
     real_rows=None,
-    skip_unrouted=False,
 ):
-    """The per-shard Pallas program (a callable of the tables and operands).
+    """The per-shard Pallas program: a callable of the shard index, (with
+    real_rows) the valid-row count, the shard's rows, top-k indices and
+    weights, and the local experts' weights and scales.
 
-    merged (fused only): the index exchange and the tables run inside this
-    program, after the first weight refills are issued (so they stream
-    under the table math), and reach the scalar core by a VMEM -> SMEM
-    copy; the program then takes the shard index and its own top-k
-    instead of the tables."""
-    if merged and not fused:
-        raise ValueError("merged tables need the fused program")
-    # real_rows (merged only): the program takes the shard's real rows, top-k
-    # and weights unpadded, plus the valid-row count, and does the padding and
-    # the valid-row masking itself (no XLA pads or masks around it).
+    The index exchange and the tables run inside the program, after the
+    first weight refills are issued (so they stream under the table math),
+    and reach the scalar core by a VMEM -> SMEM copy. The arrivals and the
+    weighted sum stay in VMEM."""
+    # real_rows: the program takes the shard's real rows, top-k and weights
+    # unpadded, plus the valid-row count, and does the padding and the
+    # valid-row masking itself (no XLA pads or masks around it).
     R = tokens_per_shard if real_rows is None else real_rows
-    if real_rows is not None and (not merged or R % 8 or tokens_per_shard < R):
+    if real_rows is not None and (R % 8 or tokens_per_shard < R):
         raise ValueError(
-            f"real_rows {real_rows}: merged only, a multiple of 8, "
-            f"at most {tokens_per_shard}"
+            f"real_rows {real_rows}: a multiple of 8, at most {tokens_per_shard}"
         )
     unpadded = real_rows is not None
     D, Tp, H, INTER, G, K, T = (
@@ -449,67 +265,26 @@ def build_kernel(
             f"tokens_per_shard {Tp} (x{ROW_ALIGN}), tile {T} "
             f"(x{GATHER_ROWS}), hidden {H} (x{LANES})"
         )
-    if not 1 <= weight_prefetch < weight_slots:
-        raise ValueError("weight_prefetch must be in [1, weight_slots)")
+    weight_slots = WEIGHT_SLOTS
+    weight_prefetch = WEIGHT_SLOTS - 1
     n_arrival = Tp * K
     passes = T // GATHER_ROWS
 
     E = num_experts if num_experts is not None else G * D
 
     def kernel(*refs):
-        # Bound below only for the variants that use them (merged, fused,
-        # unpadded, skip_unrouted); Any, so the type checker neither narrows
-        # them to None nor reports them unbound.
-        me_ref: Any = None
-        nv_ref: Any = None
-        tab_ref: Any = None
-        misc_ref: Any = None
-        pos_ref: Any = None
-        mp_ref: Any = None
-        idx_ref: Any = None
-        wts_ref: Any = None
-        out_ref: Any = None
-        landing_ref: Any = None
-        landing_s_ref: Any = None
-        arrivals_ref: Any = None
-        coef_vmem: Any = None
-        sum_vmem: Any = None
-        idx_all: Any = None
-        mp_v: Any = None
-        tab_v: Any = None
-        pos_v: Any = None
-        misc_v: Any = None
-        tab_s: Any = None
-        pos_s: Any = None
-        misc_s: Any = None
-        order_s: Any = None
-        sem_idx_send: Any = None
-        sem_idx_recv: Any = None
-        sem_smem: Any = None
+        # Bound below only with real_rows; Any, so the type checker neither
+        # narrows it to None nor reports it unbound.
         keep: Any = None
-        local_rows: Any = None
-        local_scales: Any = None
         it = iter(refs)
-        if merged:
-            me_ref = next(it)
-            nv_ref = next(it) if unpadded else None
-            tab_ref = misc_ref = pos_ref = mp_ref = None
-            x_ref, idx_ref = next(it), next(it)
-        else:
-            tab_ref, misc_ref = next(it), next(it)
-            pos_ref = next(it) if fused else None
-            mp_ref, x_ref = next(it), next(it)
-        if fused:
-            wts_ref = next(it)
+        me_ref = next(it)
+        nv_ref: Any = next(it) if unpadded else None
+        x_ref, idx_ref, wts_ref = next(it), next(it), next(it)
         w1_ref, w2_ref, w1s_ref, w2s_ref = (next(it) for _ in range(4))
-        if fused:
-            out_ref = next(it)
-            landing_ref = landing_s_ref = arrivals_ref = None
-        else:
-            landing_ref, landing_s_ref, arrivals_ref = (next(it) for _ in range(3))
+        out_ref = next(it)
         (
-            xq_vmem,
-            xs_vmem,
+            _xq_vmem,
+            _xs_vmem,
             rows_all,
             scales_all,
             tile_vmem,
@@ -518,30 +293,24 @@ def build_kernel(
             result_vmem,
             xs_tile,
         ) = (next(it) for _ in range(9))
-        if fused:
-            arrivals_ref, coef_vmem, sum_vmem = (next(it) for _ in range(3))
-        if merged:
-            (idx_all, mp_v, tab_v, pos_v, misc_v, tab_s, pos_s, misc_s) = (
-                next(it) for _ in range(8)
-            )
-        if skip_unrouted:
-            order_s = next(it)
+        arrivals_ref, coef_vmem, sum_vmem = (next(it) for _ in range(3))
+        (idx_all, mp_v, tab_v, pos_v, misc_v, tab_s, pos_s, misc_s) = (
+            next(it) for _ in range(8)
+        )
+        order_s = next(it)
         (
             sem_w1,
             sem_w2,
             sem_ag_send,
             sem_ag_recv,
-            sem_ag_local,
-            sem_load,
+            _sem_ag_local,
+            _sem_load,
             sem_push_send,
             sem_push_local,
             sem_push_recv,
         ) = (next(it) for _ in range(9))
-        if merged:
-            sem_idx_send, sem_idx_recv, sem_smem = (next(it) for _ in range(3))
-            me = me_ref[0]
-        else:
-            me = misc_ref[0, 0]
+        sem_idx_send, sem_idx_recv, sem_smem = (next(it) for _ in range(3))
+        me = me_ref[0]
 
         def w_copy(e, slot):
             return (
@@ -556,8 +325,8 @@ def build_kernel(
                 cp.start()
 
         # The shard's rows quantized as v3's transport does (quantize_rows,
-        # per-row scale), then all-gathered: one remote copy per peer into its
-        # landing block for this shard.
+        # per-row scale), then all-gathered: one remote copy per peer into this
+        # shard's block of the peer's resident rows.
         if unpadded:
             keep = lax.broadcasted_iota(jnp.int32, (R, 1), 0) < nv_ref[0]
             x_in = jnp.where(keep, x_ref[...], jnp.zeros_like(x_ref[...]))
@@ -565,49 +334,37 @@ def build_kernel(
             x_in = x_ref[...]
         xq, xs = quantize_rows(x_in, jnp.float32, block=0, dtype=elementwise)
         block = pl.ds(pl.multiple_of(me * Tp, ROW_ALIGN), Tp)
-        if fused:
-            # Straight into every peer's resident copy (VMEM): no landing
-            # buffer, no reload.
-            if unpadded:
-                real_block = pl.ds(pl.multiple_of(me * Tp, ROW_ALIGN), R)
-                rows_all[block, :] = jnp.zeros((Tp, H), FP8)
-                scales_all[block, :] = jnp.zeros((Tp, LANES), jnp.float32)
-                rows_all[real_block, :] = xq
-                scales_all[real_block, :] = jnp.broadcast_to(xs, (R, LANES))
-                w_in = jnp.where(keep, wts_ref[...], 0.0)
-                idx_in = jnp.where(keep & (w_in != 0), idx_ref[...], E)
-                idx_all[block, :] = jnp.full((Tp, LANES), E, jnp.int32)
-                idx_all[real_block, 0:K] = idx_in
-                coef_vmem[...] = w_in
-            else:
-                rows_all[block, :] = xq
-                scales_all[block, :] = jnp.broadcast_to(xs, (Tp, LANES))
-                if merged:
-                    idx_all[block, :] = idx_ref[...]
-            ag_src = (rows_all.at[block], scales_all.at[block])
-            ag_dst = ag_src
+        # Straight into every peer's resident copy (VMEM): no landing buffer,
+        # no reload.
+        if unpadded:
+            real_block = pl.ds(pl.multiple_of(me * Tp, ROW_ALIGN), R)
+            rows_all[block, :] = jnp.zeros((Tp, H), FP8)
+            scales_all[block, :] = jnp.zeros((Tp, LANES), jnp.float32)
+            rows_all[real_block, :] = xq
+            scales_all[real_block, :] = jnp.broadcast_to(xs, (R, LANES))
+            w_in = jnp.where(keep, wts_ref[...], 0.0)
+            idx_in = jnp.where(keep & (w_in != 0), idx_ref[...], E)
+            idx_all[block, :] = jnp.full((Tp, LANES), E, jnp.int32)
+            idx_all[real_block, 0:K] = idx_in
+            coef_vmem[...] = w_in
         else:
-            xq_vmem[...] = xq
-            xs_vmem[...] = jnp.broadcast_to(xs, (Tp, LANES))
-            ag_src = (xq_vmem, xs_vmem)
-            ag_dst = (landing_ref.at[block], landing_s_ref.at[block])
+            rows_all[block, :] = xq
+            scales_all[block, :] = jnp.broadcast_to(xs, (Tp, LANES))
+            idx_all[block, :] = idx_ref[...]
+        ag_src = (rows_all.at[block], scales_all.at[block])
+        ag_dst = ag_src
         _barrier(D, mesh_axes)
-        if not fused:
-            local_rows = pltpu.make_async_copy(ag_src[0], ag_dst[0], sem_ag_local)
-            local_scales = pltpu.make_async_copy(ag_src[1], ag_dst[1], sem_ag_local)
-            local_rows.start()
-            local_scales.start()
         for i in range(1, D):
             peer = lax.rem(me + i, jnp.int32(D))
-            if merged:  # the indices first: the tables wait on them alone
-                pltpu.make_async_remote_copy(
-                    src_ref=idx_all.at[block],
-                    dst_ref=idx_all.at[block],
-                    send_sem=sem_idx_send,
-                    recv_sem=sem_idx_recv,
-                    device_id=device_coords(peer, mesh_axes),
-                    device_id_type=pl.DeviceIdType.MESH,
-                ).start()
+            # The indices first: the tables wait on them alone.
+            pltpu.make_async_remote_copy(
+                src_ref=idx_all.at[block],
+                dst_ref=idx_all.at[block],
+                send_sem=sem_idx_send,
+                recv_sem=sem_idx_recv,
+                device_id=device_coords(peer, mesh_axes),
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
             for src, dst in zip(ag_src, ag_dst):
                 pltpu.make_async_remote_copy(
                     src_ref=src,
@@ -617,45 +374,30 @@ def build_kernel(
                     device_id=device_coords(peer, mesh_axes),
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
-        if merged:
-            if D > 1:
-                _wait_rows(sem_idx_recv, idx_all, (D - 1) * Tp)
-            own_idx = idx_all[block, :] if unpadded else idx_ref[...]
-            mp, tab, pos, misc = _tables_math(
-                me, idx_all[...], own_idx, D=D, Tp=Tp, G=G, K=K, E=E
-            )
-            if MERGED_POS_SHIFT:
-                pos = jnp.minimum(pos + MERGED_POS_SHIFT, n_arrival - 1)
-            mp_v[...] = mp
-            tab_v[...] = tab
-            pos_v[...] = pos
-            misc_v[...] = misc
-            to_smem = [
-                pltpu.make_async_copy(v, s_, sem_smem)
-                for v, s_ in ((tab_v, tab_s), (pos_v, pos_s), (misc_v, misc_s))
-            ]
-            for cp in to_smem:
-                cp.start()
-            for cp in to_smem:
-                cp.wait()
-            tab_ref, pos_ref, misc_ref, mp_ref = tab_s, pos_s, misc_s, mp_v
+        if D > 1:
+            _wait_rows(sem_idx_recv, idx_all, (D - 1) * Tp)
+        own_idx = idx_all[block, :] if unpadded else idx_ref[...]
+        mp, tab, pos, misc = _tables_math(
+            me, idx_all[...], own_idx, D=D, Tp=Tp, G=G, K=K, E=E
+        )
+        mp_v[...] = mp
+        tab_v[...] = tab
+        pos_v[...] = pos
+        misc_v[...] = misc
+        to_smem = [
+            pltpu.make_async_copy(v, s_, sem_smem)
+            for v, s_ in ((tab_v, tab_s), (pos_v, pos_s), (misc_v, misc_s))
+        ]
+        for cp in to_smem:
+            cp.start()
+        for cp in to_smem:
+            cp.wait()
+        tab_ref, pos_ref, misc_ref, mp_ref = tab_s, pos_s, misc_s, mp_v
         recv_remote = misc_ref[0, 1]
         own_local = misc_ref[0, 2]
-        wait_ref = rows_all if fused else landing_ref
-        wait_s_ref = scales_all if fused else landing_s_ref
-        if not fused:
-            local_rows.wait()
-            local_scales.wait()
         if D > 1:
-            _wait_rows(sem_ag_recv, wait_ref, (D - 1) * Tp)
-            _wait_rows(sem_ag_recv, wait_s_ref, (D - 1) * Tp)
-        if not fused:
-            load_rows = pltpu.make_async_copy(landing_ref, rows_all, sem_load)
-            load_scales = pltpu.make_async_copy(landing_s_ref, scales_all, sem_load)
-            load_rows.start()
-            load_scales.start()
-            load_rows.wait()
-            load_scales.wait()
+            _wait_rows(sem_ag_recv, rows_all, (D - 1) * Tp)
+            _wait_rows(sem_ag_recv, scales_all, (D - 1) * Tp)
         # The scales as one lane-major row: column t is token t's scale.
         scale_row = jnp.transpose(scales_all[...])[0:1, :]  # [1, N]
         tile_vmem[...] = jnp.zeros_like(tile_vmem)
@@ -777,15 +519,35 @@ def build_kernel(
             )
             return tile_count + 1, pend_r, pend_l
 
-        def expert_step(e, carry):
-            wslot = lax.rem(e, jnp.int32(weight_slots))
+        zeros = tuple(jnp.int32(0) for _ in range(result_slots))
+        # The live experts in order. The first P are in the list whatever
+        # their rows: their refills started before the tables existed, and
+        # list position i uses weight slot i % weight_slots, which for
+        # i < P is the slot the prologue filled. A store at every position
+        # and a conditional advance keep the scan branch-free.
+        P = min(weight_prefetch, G)
+        for i in range(P):
+            order_s[i] = jnp.int32(i)
+
+        def collect(e, n):
+            live = tab_ref[e, 3 * D] > 0
+            order_s[n] = e
+            return n + jnp.where(live, 1, 0)
+
+        n_list = lax.fori_loop(P, G, collect, jnp.int32(P))
+
+        def listed_step(i, carry):
+            e = order_s[i]
+            wslot = lax.rem(i, jnp.int32(weight_slots))
             for cp in w_copy(e, wslot):
                 cp.wait()
 
-            @pl.when(e + weight_prefetch < G)
+            @pl.when(i + weight_prefetch < n_list)
             def _():
-                ahead = e + weight_prefetch
-                for cp in w_copy(ahead, lax.rem(ahead, jnp.int32(weight_slots))):
+                ahead = i + weight_prefetch
+                for cp in w_copy(
+                    order_s[ahead], lax.rem(ahead, jnp.int32(weight_slots))
+                ):
                     cp.start()
 
             n_rows = tab_ref[e, 3 * D]
@@ -794,96 +556,48 @@ def build_kernel(
                 0, n_tiles, lambda j, c: tile_step(e, wslot, n_rows, j, c), carry
             )
 
-        zeros = tuple(jnp.int32(0) for _ in range(result_slots))
-        if skip_unrouted:
-            # The live experts in order. The first P are in the list whatever
-            # their rows: their refills started before the tables existed, and
-            # list position i uses weight slot i % weight_slots, which for
-            # i < P is the slot the prologue filled. A store at every position
-            # and a conditional advance keep the scan branch-free.
-            P = min(weight_prefetch, G)
-            for i in range(P):
-                order_s[i] = jnp.int32(i)
-
-            def collect(e, n):
-                live = tab_ref[e, 3 * D] > 0
-                if SKIP_MUTANT == "drop":
-                    live = jnp.logical_and(live, n != P)
-                order_s[n] = e
-                return n + jnp.where(live, 1, 0)
-
-            n_list = lax.fori_loop(P, G, collect, jnp.int32(P))
-
-            def listed_step(i, carry):
-                e = order_s[i]
-                wslot = lax.rem(i, jnp.int32(weight_slots))
-                for cp in w_copy(e, wslot):
-                    cp.wait()
-
-                @pl.when(i + weight_prefetch < n_list)
-                def _():
-                    ahead = i + weight_prefetch
-                    for cp in w_copy(
-                        order_s[ahead], lax.rem(ahead, jnp.int32(weight_slots))
-                    ):
-                        cp.start()
-
-                cslot = (
-                    lax.rem(e, jnp.int32(weight_slots))
-                    if SKIP_MUTANT == "slot"
-                    else wslot
-                )
-                n_rows = tab_ref[e, 3 * D]
-                n_tiles = (n_rows + T - 1) // T
-                return lax.fori_loop(
-                    0, n_tiles, lambda j, c: tile_step(e, cslot, n_rows, j, c), carry
-                )
-
-            _, pend_r, pend_l = lax.fori_loop(
-                0, n_list, listed_step, (jnp.int32(0), zeros, zeros)
-            )
-        else:
-            _, pend_r, pend_l = lax.fori_loop(
-                0, G, expert_step, (jnp.int32(0), zeros, zeros)
-            )
+        _, pend_r, pend_l = lax.fori_loop(
+            0, n_list, listed_step, (jnp.int32(0), zeros, zeros)
+        )
         for i in range(result_slots):
             drain_slot(i, pend_r[i], pend_l[i])
         if D > 1:
-            _wait_rows(sem_ag_send, wait_ref, (D - 1) * Tp)
-            _wait_rows(sem_ag_send, wait_s_ref, (D - 1) * Tp)
-            if merged:
-                _wait_rows(sem_idx_send, idx_all, (D - 1) * Tp)
+            _wait_rows(sem_ag_send, rows_all, (D - 1) * Tp)
+            _wait_rows(sem_ag_send, scales_all, (D - 1) * Tp)
+            _wait_rows(sem_idx_send, idx_all, (D - 1) * Tp)
 
         @pl.when(recv_remote > 0)
         def _():
             _wait_rows(sem_push_recv, arrivals_ref, recv_remote)
 
         del own_local  # local pushes are drained per slot above
-        if fused:
-            # v3's weighted_sum body on the arrivals in place: per token the
-            # top_k rows (looked up by pair), k in order, each times its
-            # coefficient, a zero coefficient's term dropped.
-            if not unpadded:
-                coef_vmem[...] = wts_ref[...]
+        # v3's weighted_sum body on the arrivals in place: per token the top_k
+        # rows (looked up by pair), k in order, each times its coefficient, a
+        # zero coefficient's term dropped.
+        if not unpadded:
+            coef_vmem[...] = wts_ref[...]
 
-            def token(t, carry):
-                c = coef_vmem[pl.ds(t, 1), :]
-                acc = None
-                for k in range(K):
-                    coef = c[:, k : k + 1]
-                    term = arrivals_ref[pos_ref[t, k]].astype(jnp.float32) * coef
-                    term = jnp.where(coef != 0, term, jnp.zeros_like(term))
-                    acc = term if k == 0 else cast("jax.Array", acc) + term
-                row0 = pl.multiple_of(t * LB, 8)
-                sum_vmem[pl.ds(row0, LB), :] = acc
-                return carry
+        def token(t, carry):
+            c = coef_vmem[pl.ds(t, 1), :]
+            acc = None
+            for k in range(K):
+                coef = c[:, k : k + 1]
+                term = arrivals_ref[pos_ref[t, k]].astype(jnp.float32) * coef
+                term = jnp.where(coef != 0, term, jnp.zeros_like(term))
+                acc = term if k == 0 else cast("jax.Array", acc) + term
+            row0 = pl.multiple_of(t * LB, 8)
+            sum_vmem[pl.ds(row0, LB), :] = acc
+            return carry
 
-            lax.fori_loop(0, R, token, 0, unroll=8)
-            out_ref[...] = sum_vmem[...].reshape(R, H).astype(out_ref.dtype)
+        lax.fori_loop(0, R, token, 0, unroll=8)
+        out_ref[...] = sum_vmem[...].reshape(R, H).astype(out_ref.dtype)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     scratch = [
+        # xq_vmem, xs_vmem and the "ag local" and "load" semaphores are not
+        # used by this program; they stay in its plan, the one its performance
+        # was measured with.
         pltpu.VMEM((Tp, H), FP8),  # xq_vmem
         pltpu.VMEM((Tp, LANES), jnp.float32),  # xs_vmem
         pltpu.VMEM((N, H), FP8),  # rows_all
@@ -893,27 +607,18 @@ def build_kernel(
         pltpu.VMEM((weight_slots, INTER, H), FP8),  # w2_vmem
         pltpu.VMEM((result_slots, T, LB, LANES), jnp.bfloat16),  # result
         pltpu.VMEM((T, LANES), jnp.float32),  # xs_tile
-    ]
-    if fused:
-        scratch += [
-            pltpu.VMEM((n_arrival, LB, LANES), jnp.bfloat16),  # arrivals
-            pltpu.VMEM((R, K), jnp.float32),  # coefficients
-            pltpu.VMEM((R * LB, LANES), jnp.float32),  # weighted sums
-        ]
-    if merged:
-        scratch += [
-            pltpu.VMEM((N, LANES), jnp.int32),  # idx_all
-            pltpu.VMEM((G, N), jnp.int32),  # mp
-            pltpu.VMEM((G, TAB_LANES), jnp.int32),  # tab (vector side)
-            pltpu.VMEM((Tp, K), jnp.int32),  # pos
-            pltpu.VMEM((8, LANES), jnp.int32),  # misc
-            pltpu.SMEM((G, TAB_LANES), jnp.int32),  # tab (scalar side)
-            pltpu.SMEM((Tp, K), jnp.int32),  # pos
-            pltpu.SMEM((8, LANES), jnp.int32),  # misc
-        ]
-    if skip_unrouted:
-        scratch += [pltpu.SMEM((G,), jnp.int32)]  # the live-expert list
-    scratch += [
+        pltpu.VMEM((n_arrival, LB, LANES), jnp.bfloat16),  # arrivals
+        pltpu.VMEM((R, K), jnp.float32),  # coefficients
+        pltpu.VMEM((R * LB, LANES), jnp.float32),  # weighted sums
+        pltpu.VMEM((N, LANES), jnp.int32),  # idx_all
+        pltpu.VMEM((G, N), jnp.int32),  # mp
+        pltpu.VMEM((G, TAB_LANES), jnp.int32),  # tab (vector side)
+        pltpu.VMEM((Tp, K), jnp.int32),  # pos
+        pltpu.VMEM((8, LANES), jnp.int32),  # misc
+        pltpu.SMEM((G, TAB_LANES), jnp.int32),  # tab (scalar side)
+        pltpu.SMEM((Tp, K), jnp.int32),  # pos
+        pltpu.SMEM((8, LANES), jnp.int32),  # misc
+        pltpu.SMEM((G,), jnp.int32),  # the live-expert list
         pltpu.SemaphoreType.DMA((weight_slots,)),
         pltpu.SemaphoreType.DMA((weight_slots,)),
         pltpu.SemaphoreType.DMA,  # ag send
@@ -923,35 +628,23 @@ def build_kernel(
         pltpu.SemaphoreType.DMA((result_slots,)),  # push send
         pltpu.SemaphoreType.DMA((result_slots,)),  # push local
         pltpu.SemaphoreType.DMA,  # push recv
+        pltpu.SemaphoreType.DMA,  # idx send
+        pltpu.SemaphoreType.DMA,  # idx recv
+        pltpu.SemaphoreType.DMA,  # smem
     ]
-    if merged:
-        scratch += [pltpu.SemaphoreType.DMA] * 3  # idx send / recv, smem
-    if fused:
-        out_shape = [jax.ShapeDtypeStruct((R, H), out_dtype)]
-        out_specs = [vmem]
-        in_specs = (
-            [vmem, vmem, vmem, hbm, hbm, vmem, vmem]
-            if merged
-            else [vmem, vmem, vmem, hbm, hbm, vmem, vmem]
-        )
-    else:
-        out_shape = [
-            jax.ShapeDtypeStruct((N, H), FP8),
-            jax.ShapeDtypeStruct((N, LANES), jnp.float32),
-            jax.ShapeDtypeStruct((n_arrival, LB, LANES), jnp.bfloat16),
-        ]
-        out_specs = [hbm, hbm, hbm]
-        in_specs = [vmem, vmem, hbm, hbm, vmem, vmem]
-    limit = vmem_limit or VMEM_LIMIT or device.vmem_limit()
-    params = dict(collective_id=COLLECTIVE_ID_DENSE, vmem_limit_bytes=limit)
+    out_shape = [jax.ShapeDtypeStruct((R, H), out_dtype)]
+    out_specs = [vmem]
+    # x, top-k, weights, w1, w2 (streamed from HBM), w1 and w2 scales.
+    in_specs = [vmem, vmem, vmem, hbm, hbm, vmem, vmem]
+    params = dict(
+        collective_id=COLLECTIVE_ID_DENSE, vmem_limit_bytes=device.vmem_limit()
+    )
     if layout.SIDE_EFFECTS:
         params["has_side_effects"] = True
     program = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=(2 if unpadded else 1)
-            if merged
-            else (3 if fused else 2),
+            num_scalar_prefetch=2 if unpadded else 1,
             in_specs=in_specs,
             out_specs=out_specs,
             scratch_shapes=tuple(scratch),
@@ -959,13 +652,7 @@ def build_kernel(
         ),
         out_shape=out_shape,
         compiler_params=pltpu.CompilerParams(**params),
-        interpret=INTERPRET if INTERPRET is not None else False,
-        name=(
-            f"fused_ep_dense_slots{'_f' if fused else ''}"
-            f"{'m' if merged else ''}{'u' if unpadded else ''}"
-            f"{'s' if skip_unrouted else ''}"
-            f"{'' if weight_slots == 3 else f'_w{weight_slots}'}_g{G}_t{T}_n{N}"
-        ),
+        name=f"fused_ep_dense_slots_fm{'u' if unpadded else ''}s_g{G}_t{T}_n{N}",
     )
     return program
 
@@ -987,16 +674,13 @@ def dense_slots_moe(
     shard_index=None,
     valid_tokens=None,
     drop_nan_rows=False,
-    fused=None,
-    pallas_tables=None,
-    merged=None,
-    unpadded=None,
-    skip_unrouted=None,
 ):
     """The dense-slots layer: same operands and result as v3's fused_ep_moe
-    with fp8 weights, per-channel scales and silu (the DP4xTP2 decode
-    binding). x [tokens, hidden] bf16 sharded over the mesh axis; router
-    logits [tokens, num_experts]."""
+    with fp8 weights, per-channel scales, silu and bf16 result rows (the
+    DP4xTP2 decode binding). x [tokens, hidden] bf16 sharded over the mesh
+    axis; router logits [tokens, num_experts]. A shard of a multiple of 8
+    rows hands the program its rows unpadded; any other count is padded to
+    ROW_ALIGN rows outside it."""
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer  # select kernel
 
     if config is None:
@@ -1012,45 +696,11 @@ def dense_slots_moe(
     real = tokens // num_shards
     Tp = _align(real, ROW_ALIGN)
     K = top_k
-    elementwise = config.elementwise
-    if fused is None:
-        fused = FUSED
-    if pallas_tables is None:
-        pallas_tables = PALLAS_TABLES
-    if merged is None:
-        merged = MERGED
-    merged = merged and fused
-    if merged:
-        pallas_tables = False
-    if unpadded is None:
-        unpadded = UNPADDED
-    unpadded = unpadded and merged and real % 8 == 0
-    if skip_unrouted is None:
-        skip_unrouted = SKIP_UNROUTED or getattr(
-            config, "dense_slots_skip_unrouted", False
-        )
-    wslots = WEIGHT_SLOTS or getattr(config, "dense_slots_weight_slots", 0) or 3
-    tables_program: Any = (
-        build_tables_kernel(
-            num_shards=num_shards,
-            tokens_per_shard=Tp,
-            experts_per_shard=G,
-            top_k=K,
-            num_experts=num_experts,
-            mesh_axes=tuple(mesh.axis_names),
-        )
-        if pallas_tables
-        else None
-    )
+    unpadded = real % 8 == 0
     program = build_kernel(
-        fused=fused,
         out_dtype=x.dtype,
-        merged=merged,
         num_experts=num_experts,
         real_rows=real if unpadded else None,
-        skip_unrouted=bool(skip_unrouted),
-        weight_slots=wslots,
-        weight_prefetch=wslots - 1,
         num_shards=num_shards,
         tokens_per_shard=Tp,
         hidden=hidden,
@@ -1059,7 +709,7 @@ def dense_slots_moe(
         top_k=K,
         tile_rows=tile_rows,
         mesh_axes=tuple(mesh.axis_names),
-        elementwise=elementwise,
+        elementwise=config.elementwise,
         columns_per_pass=config.activation_columns_per_pass,
     )
     with_valid = valid_tokens is not None
@@ -1117,72 +767,20 @@ def dense_slots_moe(
             keep = (jnp.arange(Tp, dtype=jnp.int32) < n_valid)[:, None]
             indices = jnp.where(keep, indices, num_experts)
             weights = jnp.where(keep, weights, 0.0)
-        if merged:
-            idx_pad = jnp.pad(
-                indices.astype(jnp.int32),
-                ((0, 0), (0, LANES - K)),
-                constant_values=num_experts,
-            )
-            (out,) = program(
-                me.reshape(1),
-                x_l.astype(jnp.bfloat16),
-                idx_pad,
-                weights.astype(jnp.float32),
-                w1_l[:G],
-                w2_l[:G],
-                s1_l[:G].astype(jnp.float32),
-                s2_l[:G].astype(jnp.float32),
-            )
-            return out[:real]
-        if pallas_tables:
-            idx_pad = jnp.pad(
-                indices.astype(jnp.int32),
-                ((0, 0), (0, LANES - K)),
-                constant_values=num_experts,
-            )
-            mp, tab, pos, misc_t = tables_program(me.reshape(1), idx_pad)
-            t = dict(mp=mp, tab=tab, pos=pos, misc=misc_t)
-        else:
-            idx_all = lax.all_gather(indices.astype(jnp.int32), MESH_AXIS, tiled=True)
-            t = shard_tables(
-                idx_all,
-                me,
-                experts_per_shard=G,
-                num_shards=num_shards,
-                tokens_per_shard=Tp,
-                num_experts=num_experts,
-            )
-        if TABLE_HOOK is not None:
-            t = TABLE_HOOK(t)
-        operands = (
+        idx_pad = jnp.pad(
+            indices.astype(jnp.int32),
+            ((0, 0), (0, LANES - K)),
+            constant_values=num_experts,
+        )
+        (out,) = program(
+            me.reshape(1),
             x_l.astype(jnp.bfloat16),
+            idx_pad,
+            weights.astype(jnp.float32),
             w1_l[:G],
             w2_l[:G],
             s1_l[:G].astype(jnp.float32),
             s2_l[:G].astype(jnp.float32),
-        )
-        if fused:
-            (out,) = program(
-                t["tab"],
-                t["misc"],
-                t["pos"],
-                t["mp"],
-                operands[0],
-                weights.astype(jnp.float32),
-                *operands[1:],
-            )
-            return out[:real]
-        _, _, arrivals = program(t["tab"], t["misc"], t["mp"], *operands)
-        rows = jnp.take(arrivals, t["pos"].reshape(-1), axis=0)
-        out = weighted_sum(
-            rows,
-            None,
-            weights.astype(jnp.float32),
-            tokens_per_shard=Tp,
-            hidden=hidden,
-            out_dtype=x.dtype,
-            tokens_per_tile=min(Tp, 128),
-            dtype=config.combine,
         )
         return out[:real]
 

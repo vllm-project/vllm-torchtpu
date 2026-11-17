@@ -99,10 +99,9 @@ WEIGHT_FORMAT = "fp8"
 # (data_parallel_size, tensor_parallel_size). (4, 2) is what the DP4 x TP2
 # decode legs ran: the combine over real tokens, the sort-index live mask, the
 # compact routing message, the reordered program chain, and the dense-slots
-# layer (fused, merged, skipping unrouted experts) for calls of at most
-# Config.dense_slots_max_tokens rows per shard. Other models, and other
-# layouts, keep for_shape's settings: these paths were validated on Qwen3.5
-# only.
+# layer for calls of at most Config.dense_slots_max_tokens rows per shard.
+# Other models, and other layouts, keep for_shape's settings: these paths were
+# validated on Qwen3.5 only.
 QWEN3_5_CONFIG_BY_LAYOUT: dict[tuple[int, int], dict[str, Any]] = {
     (4, 2): {
         "combine_real_tokens": True,
@@ -110,9 +109,6 @@ QWEN3_5_CONFIG_BY_LAYOUT: dict[tuple[int, int], dict[str, Any]] = {
         "compact_message": True,
         "reorder_chain": True,
         "dense_slots": True,
-        "dense_slots_fused": True,
-        "dense_slots_merged": True,
-        "dense_slots_skip_unrouted": True,
     },
 }
 # The overrides prebuild_fused_moe_ep selected for this process, applied by
@@ -187,26 +183,6 @@ def served_config(
     return config
 
 
-def dense_slots_settings(
-    config: Config | None = None,
-) -> tuple[bool, int, bool, bool, bool]:
-    """(on, max tokens per shard, fused, pallas tables, merged) of the
-    dense-slots layer (models/qwen3_5/kernels/dense_slots.py), from the
-    Config fields dense_slots, dense_slots_max_tokens, dense_slots_fused,
-    dense_slots_pallas_tables and dense_slots_merged. Off by default; the
-    Qwen3.5 layout table turns it on at DP4 x TP2 for calls of at most
-    dense_slots_max_tokens rows per shard (default 64), and larger calls keep
-    the v3 layer."""
-    c = config if config is not None else Config()
-    return (
-        c.dense_slots,
-        c.dense_slots_max_tokens,
-        c.dense_slots_fused,
-        c.dense_slots_pallas_tables,
-        c.dense_slots_merged,
-    )
-
-
 def run_moe_v3(
     mesh,
     topk: int,
@@ -228,21 +204,16 @@ def run_moe_v3(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=topk
     )
 
-    dense_on, dense_max, dense_fused, dense_pt, dense_merged = dense_slots_settings(
-        config
-    )
+    # The dense-slots layer (models/qwen3_5/kernels/dense_slots.py): off by
+    # default; the Qwen3.5 layout table turns it on at DP4 x TP2 for calls of
+    # at most Config.dense_slots_max_tokens rows per shard, and larger calls
+    # keep the v3 layer.
+    dense_on, dense_max = config.dense_slots, config.dense_slots_max_tokens
     if dense_on:
         logger.info_once(
-            "Fused EP MoE: dense-slots layer ON for calls of <= %d rows per shard "
-            "(fused=%s, pallas_tables=%s, merged=%s, skip_unrouted=%s, "
-            "weight_slots=%s); "
-            "larger calls keep the v3 layer",
+            "Fused EP MoE: dense-slots layer ON for calls of <= %d rows per "
+            "shard; larger calls keep the v3 layer",
             dense_max,
-            dense_fused,
-            dense_pt,
-            dense_merged,
-            config.dense_slots_skip_unrouted,
-            config.dense_slots_weight_slots or 3,
         )
 
     def run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens):
@@ -287,10 +258,6 @@ def run_moe_v3(
                 shard_index=rank,
                 valid_tokens=valid_tokens,
                 drop_nan_rows=True,
-                fused=dense_fused,
-                pallas_tables=dense_pt,
-                merged=dense_merged,
-                unpadded=dense_merged,
             )
         return fused_ep_moe(
             x,
