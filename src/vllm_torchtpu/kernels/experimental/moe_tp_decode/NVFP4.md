@@ -77,7 +77,7 @@ layers after model load when `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and
 - **Decode (`n <= 64`):** `n in (16, 32, 64)` calls `moe_tp_decode_nvfp4`
   directly; `n < 16` pads `x` and `scores` to `m = 16`, runs the `m = 16`
   bucket, and slices `[:n]`.
-- **Mixed / prefill (`n > 64`):** calls `moe_tp_decode._tp_chain`
+- **Mixed / prefill (`n > 64`):** calls `_tp_chain` (`layers/adapter/moe_tp_decode.py`)
   (`fused_moe_func` -> `gmm_v2` W4A16 + online-FP8 shared expert + `lax.psum`)
   inside the same custom op on the same K-major FP4 weights and 4D block scales,
   with zero weight duplication.
@@ -132,7 +132,8 @@ layers):
 
 ## Supported layouts (`TP8` and `EP2xTP4`)
 
-When `USE_MOE_TP_DECODE_NVFP4_KERNEL=1`, `nvfp4._prepare_moe_weights` clamps
+When `USE_MOE_TP_DECODE_NVFP4_KERNEL=1`, `_prepare_moe_weights`
+(`layers/adapter/quantization/nvfp4.py`) clamps
 the requantization block size per matrix (`b13 = min(block, H)` and
 `b2 = min(block, I_rank)`) and uses `requant_load_kmajor_fp4` without padding
 `I_rank` up to `512`. For GLM-5.2 (`H = 6144, E = 256, I_tp8 = 256,
@@ -157,7 +158,8 @@ hosts.
   by `max(sum, 1e-20)` and cast to `bf16`; rows `>= n_valid` masked to `0`).
 - **Shared expert:** input `x` and intermediate `silu(gate) * up` are quantized
   per row to `float8_e4m3fn` via `quantize_block` and multiplied by `sw13` /
-  `sw2` with `preferred_element_type=f32`, matching `moe_tp_decode._shared_expert`.
+  `sw2` with `preferred_element_type=f32` (`kernel._shared_expert`, shared with
+  the FP8 format).
 - **Routed experts (W4A8):**
   1. `x` is quantized per row per 512-column K-block in `f32`
      (`xs = max(|x_block|) / 448.0`, `xq = (x_block * (1.0 / xs)).astype(fp8)`).
@@ -165,7 +167,8 @@ hosts.
      VMEM to exact `float8_e4m3fn` immediately before the FP8 MXU matmul.
   3. Gate/up K-block partials are scaled and accumulated in `f32`:
      `acc1 += (matmul(xq_b, w13_b) * xs_b) * s13_b`.
-  4. In `finish_group`, `act = silu(gate) * up` is computed in `f32`, multiplied
+  4. In the ring's `finish` (`kernel._nvfp4_ring`), `act = silu(gate) * up` is
+     computed in `f32`, multiplied
      by the token's `f32` routing weight `coeff`, quantized per row to
      `float8_e4m3fn` (`ms = max(|act|) / 448.0`,
      `mq = (act * (1.0 / ms)).astype(fp8)`), and multiplied by `w2` across
