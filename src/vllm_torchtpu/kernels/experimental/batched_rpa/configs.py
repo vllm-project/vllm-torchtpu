@@ -217,6 +217,22 @@ class ServingConfigs:
         return 0
 
 
+# Most chunks of max_steps_ub steps the HBM schedule holds.
+MAX_SCHEDULE_CHUNKS = 128
+
+
+def worst_case_schedule_chunks(cfgs: "RpaConfigs") -> int:
+    """Chunks of `cfgs.max_steps_ub` steps the shape's worst case fills: every
+    sequence at the block table's full length, pairing each of its q blocks
+    with each of its KV blocks."""
+    q_blocks = cfgs.serve.num_seqs  # DECODE: q_len <= bq per sequence
+    if cfgs.mode != RpaCase.DECODE:
+        q_blocks += cfgs.serve.total_q_tokens // cfgs.bq_sz
+    kv_tokens = cfgs.serve.pages_per_seq * cfgs.serve.page_size
+    steps = pl.cdiv(q_blocks * pl.cdiv(kv_tokens, cfgs.bkv_sz), cfgs.batch_size)
+    return pl.cdiv(steps, cfgs.max_steps_ub)
+
+
 @dataclasses.dataclass(frozen=True, eq=True)
 class RpaConfigs:
     block: BlockSizes
@@ -540,6 +556,10 @@ class RpaConfigs:
     @property
     def max_schedule_size_multiplier(self) -> int:
         """HBM schedule size in chunks of max_steps_ub steps: the serving
+        value, raised (up to MAX_SCHEDULE_CHUNKS) to this shape's worst case
+        (`worst_case_schedule_chunks`). Past it the schedule kernel drops steps
+        rather than write out of bounds (see rpa_metadata_schedule_kernel)."""
+        need = min(worst_case_schedule_chunks(self), MAX_SCHEDULE_CHUNKS)
         return max(self.serve.max_schedule_size_multiplier, need)
 
     def validate_inputs(

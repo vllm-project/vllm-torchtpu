@@ -111,3 +111,45 @@ def test_schedule_overflow_is_dropped_not_written_out_of_bounds(monkeypatch):
     np.testing.assert_array_equal(
         k_idx, np.arange(capacity * batch).reshape(capacity, batch)
     )
+
+
+@pytest.mark.parametrize(("num_seqs", "warns"), [(8, False), (1024, True)])
+def test_a_worst_case_past_the_cap_warns_at_trace_time(monkeypatch, num_seqs, warns):
+    """1M-token block tables: 8 sequences fit the HBM schedule; 1024 do not,
+    and the wrapper says so once while tracing instead of dropping steps
+    silently."""
+    import jax.experimental.pallas.tpu as pltpu
+
+    from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda *args, **kwargs: info)
+    calls = []
+    monkeypatch.setattr(
+        wrapper,
+        "logger",
+        SimpleNamespace(warning_once=lambda msg, *args: calls.append(args)),
+    )
+    pages_per_seq, page, tokens = 8192, 128, 1024
+    kv_shape = wrapper.get_kv_cache_shape(
+        num_seqs * pages_per_seq, page, 1, 256, jnp.float8_e4m3fn
+    )
+
+    def spec(shape, dtype):
+        return jax.ShapeDtypeStruct(shape, dtype)
+
+    jax.make_jaxpr(
+        lambda *a: wrapper.ragged_paged_attention(*a, sm_scale=1 / 16, k_scale=1.0)
+    )(
+        spec((tokens, 4, 256), jnp.bfloat16),
+        spec((tokens, 1, 256), jnp.bfloat16),
+        spec((tokens, 1, 256), jnp.bfloat16),
+        spec(kv_shape, jnp.float8_e4m3fn),
+        spec((num_seqs,), jnp.int32),
+        spec((num_seqs * pages_per_seq,), jnp.int32),
+        spec((num_seqs + 1,), jnp.int32),
+        spec((3,), jnp.int32),
+    )
+    assert bool(calls) == warns, calls
+    for _, need, _, cap in calls:
+        assert need > cap == configs.MAX_SCHEDULE_CHUNKS
