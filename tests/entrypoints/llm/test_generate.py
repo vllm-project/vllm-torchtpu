@@ -61,9 +61,12 @@ GREEDY_SAMPLING_PARAMS = SamplingParams(temperature=0.0, max_tokens=4)
 def llm():
     # pytest caches the fixture so we use weakref.proxy to
     # enable garbage collection
+    # Every call sends at most 4 prompts, so 8 sequences is the only request
+    # bucket a step uses; the default compiles them up to 64.
     llm = LLM(
         model=MODEL_NAME,
         max_num_batched_tokens=64,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=1,
         # TODO: Reduce GPU memory utilization after KV cache optimization.
@@ -173,6 +176,47 @@ def test_logprobs(llm: LLM):
         assert len(output.outputs[0].logprobs) > 0
 
 
+def test_prompt_logprobs(llm: LLM):
+    """Every prompt token gets a logprob, and the rows over a greedy
+    continuation match the logprobs it was sampled with. The four prompts with
+    their continuations exceed max_num_batched_tokens, so prefill is chunked."""
+    greedy = llm.generate(
+        PROMPTS, SamplingParams(temperature=0.0, max_tokens=16, logprobs=0)
+    )
+    scored = llm.generate(
+        [
+            {"prompt_token_ids": [*out.prompt_token_ids, *out.outputs[0].token_ids]}
+            for out in greedy
+        ],
+        SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=2),
+    )
+    for out, scored_out in zip(greedy, scored):
+        prompt_logprobs = scored_out.prompt_logprobs
+        assert prompt_logprobs is not None
+        assert len(prompt_logprobs) == len(scored_out.prompt_token_ids)
+        assert prompt_logprobs[0] is None
+        for token, logprobs in zip(
+            scored_out.prompt_token_ids[1:], prompt_logprobs[1:]
+        ):
+            assert token in logprobs and len(logprobs) in (2, 3)
+        sampled = out.outputs[0]
+        assert sampled.logprobs is not None
+        continuation = prompt_logprobs[len(out.prompt_token_ids) :]
+        for token, sampled_logprobs, logprobs in zip(
+            sampled.token_ids, sampled.logprobs, continuation
+        ):
+            assert logprobs[token].logprob == pytest.approx(
+                sampled_logprobs[token].logprob, abs=0.05
+            )
+
+
 def test_log_stats(llm: LLM):
     outputs = llm.generate(PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS)
     assert all(output.metrics is not None for output in outputs)
+
+
+def test_reset_encoder_cache(llm: LLM):
+    baseline = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
+    llm.llm_engine.reset_encoder_cache()
+    outputs = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
+    assert outputs[0].outputs[0].token_ids == baseline[0].outputs[0].token_ids

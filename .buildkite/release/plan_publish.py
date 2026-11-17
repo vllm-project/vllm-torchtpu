@@ -29,7 +29,6 @@ Optional build env:
 
 import json
 import os
-import re
 import subprocess
 
 
@@ -60,9 +59,7 @@ def command_step(label, key, depends_on, commands, **extra):
 def main():
     version = meta("release-version")
     prod = meta("release-image-prod")
-    prerelease = (
-        re.search(r"(a|b|rc|dev)[0-9]+", version) is not None
-    )  # lib.sh is_prerelease
+    prerelease = meta("release-prerelease") == "yes"
     branch = os.environ["BUILDKITE_BRANCH"]
     dockerhub_repo = os.environ.get("RELEASE_DOCKERHUB_REPO", "vllm/vllm-torchtpu")
     steps = []

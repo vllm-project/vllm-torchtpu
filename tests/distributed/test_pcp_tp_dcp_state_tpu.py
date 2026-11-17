@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Eight-device GDN state seam check. Pallas writes/reads real TPU pools;
-span-directed byte movement between them is emulated on the host.
-This complements, rather than replaces, the native Raiden DMA test.
+"""Eight-device GDN state seam check. Each device holds one worker's unified
+pool, written/read by the host-side pool layout helpers; span-directed byte
+movement between them is emulated on the host. This complements, rather than
+replaces, the native Raiden DMA test.
 """
 
 import os
@@ -30,17 +31,12 @@ def _run_state_seam():
     import jax
     import jax.numpy as jnp
     import numpy as np
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
     from jax.sharding import Mesh, NamedSharding
     from jax.sharding import PartitionSpec as P
+    from kernels.gdn.v3.gdn_pool_state_utils import read_states, write_states
 
+    from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
     from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
-    from vllm_torchtpu.kernels.gdn.v3.vmem_ldst import (
-        load_state_region,
-        store_state_region,
-    )
-    from vllm_torchtpu.layers.core.gdn_attention import _build_v3_pool_state_plan
 
     from .test_pcp_tp_dcp_connector import _manifest
     from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
@@ -48,74 +44,41 @@ def _run_state_seam():
     mesh = Mesh(np.array(jax.devices()), ("rank",))
     if mesh.size != 8:
         pytest.skip("requires eight local TPU devices")
+    sharding = NamedSharding(mesh, P("rank"))
     minor = (4, 3, 2, 1, 0)
     tiles = ((4, 128), (4, 1))
     ssm = np.arange(8 * 512 * 128).reshape(8, 512, 128) % 61 + 1
     conv = np.arange(8 * 18 * 128).reshape(8, 18, 128) % 61 + 1
+    # The pooled conv state is fp32, so its regions are twice the BF16
+    # `_manifest` ones; the BF16 SSM regions and both pool bases still hold.
+    conv_regions = (
+        rpm.RegionSpec("gdn_conv_qk", 0, 3072, 1024, 3),
+        rpm.RegionSpec("gdn_conv_v", 1024, 3072, 512, 3, 4),
+    )
+    idx = jnp.array([0])
     for src_heads in (1, 2):
-        pools = {}
-        plans = {}
-        for heads in set((src_heads, 1)):
-            shape = (3, 2 * heads, 64, 4, 128)
-            plan = _build_v3_pool_state_plan(
-                jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn),
-                conv_dim=768,
-                n_v=4,
-                d_k=128,
-                d_v=128,
-                kernel_size=4,
-                pool_block_tokens=384,
-                qk_pair_layout=True,
-                recurrent_state_dtype=jnp.bfloat16,
-            )
-            plans[heads] = plan
-
-            def write(s, c, o, *, shape=shape, plan=plan):
-                o[...] = jnp.zeros(shape, jnp.float8_e4m3fn)
-                for region, values in ((plan.recurrent, s[...]), (plan.conv, c[...])):
-                    store_state_region(
-                        o.at[pl.ds(region.kb0, region.nblocks)], region, values
-                    )
-
-            call = pl.pallas_call(
-                write,
-                out_shape=jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn),
-                compiler_params=pltpu.CompilerParams(),
-            )
-
-            def local_write(s, c, *, call=call):
-                return call(s[0], c[0])[None]
-
-            fn = jax.jit(
-                jax.shard_map(
-                    local_write,
-                    mesh=mesh,
-                    in_specs=(P("rank"), P("rank")),
-                    out_specs=P("rank"),
-                    check_vma=False,
+        src_pools = [
+            np.asarray(
+                write_states(
+                    jnp.zeros((3, 2 * src_heads, 64, 4, 128), jnp.float8_e4m3fn),
+                    jnp.asarray(ssm[g].reshape(1, 4, 128, 128), jnp.bfloat16),
+                    conv[g].reshape(1, 3, 768),
+                    idx,
+                    split=3,
+                    recurrent_dtype=jnp.bfloat16,
                 )
             )
-            pools[heads] = np.asarray(
-                fn(
-                    jax.device_put(
-                        jnp.asarray(ssm, dtype=jnp.bfloat16),
-                        NamedSharding(mesh, P("rank")),
-                    ),
-                    jax.device_put(
-                        jnp.asarray(conv, dtype=jnp.bfloat16),
-                        NamedSharding(mesh, P("rank")),
-                    ),
-                )
-            )
+            for g in range(8)
+        ]
+        # Worker g's pool lives on device g; the host gathers the raw pools.
+        pools = np.asarray(jax.device_put(np.stack(src_pools), sharding))
         shape = (3, 2, 64, 4, 128)
         # Source worker p*TP+t stores GDN head rank t*PCP+p.
         raw_dst = np.zeros((8, np.prod(shape)), dtype=np.uint8)
         for rank in range(8):
             p, t = divmod(rank, 2)
             g = t * 4 + p
-            raw_src = _apply_xla_tiled_layout(
-                pools[src_heads][g].view(np.uint8), minor, tiles
-            )
+            raw_src = _apply_xla_tiled_layout(pools[g].view(np.uint8), minor, tiles)
             for pool in _manifest(src_heads).pools[1:]:
                 reg = sol.lower_gdn_state_shard_spans_sol(
                     tag=pool.tag,
@@ -125,7 +88,7 @@ def _run_state_seam():
                     producer_tp_rank=t,
                     producer_tp_size=2,
                     dst_shards=8,
-                    regions=pool.regions,
+                    regions=conv_regions if pool.tag == "gdn.conv.g0" else pool.regions,
                     physical_granule_bytes=512,
                 )
                 dst_base = next(
@@ -151,46 +114,27 @@ def _run_state_seam():
         logical = np.empty_like(raw_dst)
         logical[:, index] = raw_dst
         logical = logical.reshape((8,) + shape).view(jnp.float8_e4m3fn)
-        plan = plans[1]
-
-        def read(i, s, c, *, plan=plan):
-            s[...] = load_state_region(
-                i.at[pl.ds(plan.recurrent.kb0, plan.recurrent.nblocks)],
-                plan.recurrent,
-                (512, 128),
+        # Decode shard d's pool lives on device d.
+        logical = np.asarray(jax.device_put(logical, sharding))
+        for d in range(8):
+            actual_s, actual_c = read_states(
+                logical[d],
+                idx,
+                split=3,
+                recurrent_shape=(4, 128, 128),
+                conv_shape=(3, 768),
+                recurrent_dtype=jnp.bfloat16,
             )
-            c[...] = load_state_region(
-                i.at[pl.ds(plan.conv.kb0, plan.conv.nblocks)], plan.conv, (18, 128)
+            np.testing.assert_array_equal(
+                np.asarray(actual_s, np.float32).reshape(512, 128), ssm[d]
             )
-
-        call = pl.pallas_call(
-            read,
-            out_shape=(
-                jax.ShapeDtypeStruct((512, 128), jnp.bfloat16),
-                jax.ShapeDtypeStruct((18, 128), jnp.bfloat16),
-            ),
-        )
-
-        def local_read(x, *, call=call):
-            s, c = call(x[0])
-            return s[None], c[None]
-
-        fn = jax.jit(
-            jax.shard_map(
-                local_read,
-                mesh=mesh,
-                in_specs=P("rank"),
-                out_specs=(P("rank"), P("rank")),
-                check_vma=False,
+            np.testing.assert_array_equal(
+                np.asarray(actual_c).reshape(18, 128), conv[d]
             )
-        )
-        actual_s, actual_c = fn(jax.device_put(logical, NamedSharding(mesh, P("rank"))))
-        np.testing.assert_array_equal(np.asarray(actual_s), ssm)
-        np.testing.assert_array_equal(np.asarray(actual_c), conv)
-        print("PASS GDN BF16 SPMD", src_heads, "-> 1", flush=True)
+        print("PASS GDN SPMD", src_heads, "-> 1", flush=True)
 
 
-def test_pcp_tp_dcp_bf16_state_seam_spmd():
+def test_pcp_tp_dcp_state_seam_spmd():
     run_in_isolated_process(_run_state_seam, timeout=120)
 
 
@@ -207,56 +151,40 @@ def _gdn_heads(keys, values, degree, rank):
 
 def _run_fanout_state_seam():
     os.environ["VLLM_KV_CACHE_LAYOUT"] = "HND"
-    os.environ["TPU_GDN_CONV_QK_PAIR_LAYOUT"] = "1"
-    import jax
     import jax.numpy as jnp
     import numpy as np
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
+    from kernels.gdn.v3.gdn_pool_state_utils import read_states, write_states
 
     from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
     from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
-    from vllm_torchtpu.kernels.gdn.v3.vmem_ldst import (
-        load_state_region,
-        store_state_region,
-    )
-    from vllm_torchtpu.layers.core.gdn_attention import _build_v3_pool_state_plan
 
     from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
 
     minor = (4, 3, 2, 1, 0)
     tiles = ((4, 128), (4, 1))
     d = 128
-    lane_bytes = sol.sol_gdn_conv_lane_bytes(sol.SolFaGeometry(2, 64, 128))
+    taps = 3
+    idx = jnp.array([0])
 
     def side(keys, values, degree, fa_heads):
         key_heads, value_heads = _gdn_heads(keys, values, degree, 0)
         lk, lv = len(key_heads), len(value_heads)
         conv_dim = (2 * lk + lv) * d
+        # One state spans the pool's three blocks (`split=3`).
         shape = (3, 2 * fa_heads, 64, 4, 128)
-        plan = _build_v3_pool_state_plan(
-            jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn),
-            conv_dim=conv_dim,
-            n_v=lv,
-            d_k=d,
-            d_v=d,
-            kernel_size=4,
-            pool_block_tokens=384,
-            qk_pair_layout=True,
-            recurrent_state_dtype=jnp.bfloat16,
-        )
         gdn = rpm.GdnHeadGeometry(
             local_key_heads=lk, local_value_heads=lv, key_head_dim=d, value_head_dim=d
         )
+        # The unified pool keeps the conv state in fp32, segment-major, right
+        # after the BF16 SSM state.
         regions = {
             "gdn.conv.g0": rpm._gdn_conv_regions(
-                conv_shape=(1, 3, conv_dim), itemsize=2, geometry=gdn
+                conv_shape=(1, taps, conv_dim), itemsize=4, geometry=gdn
             ),
             "gdn.ssm.g0": rpm._gdn_ssm_regions(ssm_shape=(1, lv, d, d), itemsize=2),
         }
         bases = {"gdn.conv.g0": lv * d * d * 2, "gdn.ssm.g0": 0}
-        rows = (lv * d, 3 * conv_dim // 128)
-        return shape, plan, regions, bases, rows
+        return shape, regions, bases, lk, lv, conv_dim
 
     # (key heads, value heads, producer degree, decode degree, producer FA
     # heads, decode FA heads, producer rank): a PCP8 stage rank with 16 key /
@@ -268,44 +196,31 @@ def _run_fanout_state_seam():
         (8, 64, 8, 16, 2, 1, 3),
     ):
         fan_out = dst_degree // src_degree
-        src_shape, src_plan, regions, src_bases, src_rows = side(
+        src_shape, regions, src_bases, lk, lv, src_conv_dim = side(
             keys, values, src_degree, src_fa
         )
-        dst_shape, dst_plan, _, dst_bases, dst_rows = side(
+        dst_shape, _, dst_bases, dst_lk, dst_lv, dst_conv_dim = side(
             keys, values, dst_degree, dst_fa
         )
         src_keys, src_values = _gdn_heads(keys, values, src_degree, rank)
-        lk, lv = len(src_keys), len(src_values)
-        assert (src_plan.conv.rows_perm is None) == (lk == 1)
-        assert dst_plan.conv.rows_perm is None
 
-        # Finite random BF16 bit patterns, compared bit-exactly.
+        # Finite random BF16 SSM and fp32 conv bit patterns, compared
+        # bit-exactly.
         rng = np.random.default_rng(rank)
-        ssm = rng.integers(0, 0x7F00, (src_rows[0], 128), dtype=np.uint16).view(
-            jnp.bfloat16
-        )
-        conv = rng.integers(0, 0x7F00, (src_rows[1], 128), dtype=np.uint16).view(
-            jnp.bfloat16
-        )
-
-        def write(s, c, o, *, shape=src_shape, plan=src_plan):
-            o[...] = jnp.zeros(shape, jnp.float8_e4m3fn)
-            # The GDN kernels store their float32 compute states.
-            for region, state in ((plan.recurrent, s[...]), (plan.conv, c[...])):
-                store_state_region(
-                    o.at[pl.ds(region.kb0, region.nblocks)],
-                    region,
-                    state.astype(jnp.float32),
-                )
-
+        ssm = rng.integers(0, 0x7F00, (lv, d, d), dtype=np.uint16).view(jnp.bfloat16)
+        # Normal fp32 values only, so no denormal is flushed on the way.
+        conv = rng.integers(
+            0x00800000, 0x7F000000, (taps, src_conv_dim), dtype=np.uint32
+        ).view(np.float32)
         pool = np.asarray(
-            jax.jit(
-                pl.pallas_call(
-                    write,
-                    out_shape=jax.ShapeDtypeStruct(src_shape, jnp.float8_e4m3fn),
-                    compiler_params=pltpu.CompilerParams(),
-                )
-            )(jnp.asarray(ssm), jnp.asarray(conv))
+            write_states(
+                jnp.zeros(src_shape, jnp.float8_e4m3fn),
+                jnp.asarray(ssm)[None],
+                conv[None],
+                idx,
+                split=3,
+                recurrent_dtype=jnp.bfloat16,
+            )
         )
         raw_src = _apply_xla_tiled_layout(pool.view(np.uint8), minor, tiles)
         raw_dst = np.zeros((fan_out, np.prod(dst_shape)), dtype=np.uint8)
@@ -320,7 +235,6 @@ def _run_fanout_state_seam():
                 physical_granule_bytes=512,
                 num_key_heads=keys,
                 num_value_heads=values,
-                conv_lane_bytes=lane_bytes,
             )
             for span in reg.spans:
                 local = span.dst_unit_ordinal - rank * fan_out
@@ -340,50 +254,38 @@ def _run_fanout_state_seam():
         logical[:, index] = raw_dst
         logical = logical.reshape((fan_out,) + dst_shape).view(jnp.float8_e4m3fn)
 
-        def read(i, s, c, *, plan=dst_plan, rows=dst_rows):
-            s[...] = load_state_region(
-                i.at[pl.ds(plan.recurrent.kb0, plan.recurrent.nblocks)],
-                plan.recurrent,
-                (rows[0], 128),
-            )
-            c[...] = load_state_region(
-                i.at[pl.ds(plan.conv.kb0, plan.conv.nblocks)], plan.conv, (rows[1], 128)
-            )
-
-        reader = jax.jit(
-            pl.pallas_call(
-                read,
-                out_shape=(
-                    jax.ShapeDtypeStruct((dst_rows[0], 128), jnp.bfloat16),
-                    jax.ShapeDtypeStruct((dst_rows[1], 128), jnp.bfloat16),
-                ),
-            )
-        )
         # Logical source rows per tap: [Q heads, K heads, V heads], one
         # 128-lane row per head.
-        tap_rows = src_rows[1] // 3
-        assert tap_rows == 2 * lk + lv
+        conv_rows = conv.reshape(taps, 2 * lk + lv, d)
         for j in range(fan_out):
-            actual_s, actual_c = reader(jnp.asarray(logical[j]))
+            actual_s, actual_c = read_states(
+                jnp.asarray(logical[j]),
+                idx,
+                split=3,
+                recurrent_shape=(dst_lv, d, d),
+                conv_shape=(taps, dst_conv_dim),
+                recurrent_dtype=jnp.bfloat16,
+            )
             dst_keys, dst_values = _gdn_heads(
                 keys, values, dst_degree, rank * fan_out + j
             )
             key_rows = [src_keys.index(h) for h in dst_keys]
             value_rows = [src_values.index(h) for h in dst_values]
-            expected_s = np.concatenate([ssm[v * d : (v + 1) * d] for v in value_rows])
+            assert len(key_rows) == dst_lk and len(value_rows) == dst_lv
+            expected_s = ssm[value_rows]
             rows = (
                 key_rows + [lk + k for k in key_rows] + [2 * lk + v for v in value_rows]
             )
-            expected_c = np.concatenate(
-                [conv[tap * tap_rows + np.array(rows)] for tap in range(3)]
+            expected_c = conv_rows[:, rows].reshape(taps, dst_conv_dim)
+            np.testing.assert_array_equal(
+                np.asarray(actual_s).view(np.uint16).reshape(expected_s.shape),
+                expected_s.view(np.uint16),
             )
             np.testing.assert_array_equal(
-                np.asarray(actual_s).view(np.uint16), expected_s.view(np.uint16)
+                np.asarray(actual_c).view(np.uint32).reshape(expected_c.shape),
+                expected_c.view(np.uint32),
             )
-            np.testing.assert_array_equal(
-                np.asarray(actual_c).view(np.uint16), expected_c.view(np.uint16)
-            )
-        print("PASS GDN BF16 fan-out", src_degree, "->", dst_degree, flush=True)
+        print("PASS GDN fan-out", src_degree, "->", dst_degree, flush=True)
 
 
 def test_pp_pcp_fanout_bf16_state_seam():

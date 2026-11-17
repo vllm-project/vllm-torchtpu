@@ -100,7 +100,7 @@ publish_result() {
     exit 1
   fi
 
-  if [ "${BQ_UPLOAD:-0}" != "1" ]; then
+  if [ "${BQ_UPLOAD:-0}" != "1" ] || { [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; }; then
     echo "BigQuery upload is off for this lane; $name is an artifact only."
     return 0
   fi

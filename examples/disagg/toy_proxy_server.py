@@ -735,4 +735,9 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    uvicorn.run(app, host=global_args.host, port=global_args.port)
+    uvicorn.run(
+        app,
+        host=global_args.host,
+        port=global_args.port,
+        timeout_keep_alive=_env_int("PROXY_TIMEOUT_KEEP_ALIVE_S", 60),
+    )

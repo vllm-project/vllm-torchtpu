@@ -34,8 +34,8 @@
 # Usage:
 #   ./build_vllm_torchtpu.sh <version>
 #
-#   <version>    vllm-torchtpu-core version to pin (must be on PyPI); also
-#                used as the vllm-torchtpu version.
+#   <version>    vllm-torchtpu-core version to pin; also used as the
+#                vllm-torchtpu version.
 #
 # Examples:
 #   ./build_vllm_torchtpu.sh X.Y.Z        # official release
@@ -62,7 +62,6 @@
 #                      vllm_torchtpu-* files are removed; core files are kept.
 #   KEEP_VLLM_SRC      Set to 1 to keep the patched clone for debugging.
 #   PYTHON             Interpreter for the build venv (default: python3).
-#   PIP_INDEX_URL      Standard pip setting; used by the core-version check.
 #
 # Output:
 #   ${OUTPUT_DIR}/vllm_torchtpu-<version>-cpXY-cpXY-manylinux_2_28_x86_64.whl
@@ -74,9 +73,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TORCHTPU_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-# Provides get_vllm_commit_hash (the vLLM pin in pyproject.toml).
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/configs/pipeline_config.sh"
 
 VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 OUTPUT_DIR="${OUTPUT_DIR:-${TORCHTPU_ROOT}/dist}"
@@ -104,7 +100,7 @@ usage() {
     echo ""
     echo "  <version>   Release version for both packages. The vllm-torchtpu wheel"
     echo "              gets this version and pins vllm-torchtpu-core==<version>,"
-    echo "              which must already be published, e.g. X.Y.ZrcN -> both X.Y.ZrcN."
+    echo "              e.g. X.Y.ZrcN -> both X.Y.ZrcN."
     echo ""
     echo "vLLM is built at the ref pinned in pyproject.toml (tag or full commit SHA)"
     echo "(VLLM_REF_OVERRIDE=<ref> for dev builds only)."
@@ -132,15 +128,6 @@ CORE_VERSION=$1
 WHEEL_VERSION="${CORE_VERSION}"
 [[ -n "${CORE_VERSION}" ]] || die "CORE_VERSION must not be empty."
 
-# The vLLM ref CI tested: the pin in pyproject.toml, unless overridden.
-PINNED_VLLM_REF="$(get_vllm_commit_hash)" \
-    || die "could not read the vLLM pin from ${TORCHTPU_ROOT}/pyproject.toml."
-VLLM_REF="${VLLM_REF_OVERRIDE:-${PINNED_VLLM_REF}}"
-if [[ "${VLLM_REF}" != "${PINNED_VLLM_REF}" ]]; then
-    echo "WARNING: building vLLM ${VLLM_REF} (VLLM_REF_OVERRIDE), not the" \
-         "pyproject.toml pin ${PINNED_VLLM_REF}. Do not publish this wheel." >&2
-fi
-
 # Make it absolute; the build runs from inside the temp clone.
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
@@ -162,6 +149,15 @@ for tool in cargo rustc; do
             "${WHEEL_PLATFORM_TAG}. Run without Rust on PATH."
     fi
 done
+
+# The vLLM ref CI tested: the pin in pyproject.toml, unless overridden.
+PINNED_VLLM_REF="$("${PYTHON}" "${SCRIPT_DIR}/bootstrap.py" vllm-pin)" \
+    || die "could not read the vLLM pin from ${TORCHTPU_ROOT}/pyproject.toml."
+VLLM_REF="${VLLM_REF_OVERRIDE:-${PINNED_VLLM_REF}}"
+if [[ "${VLLM_REF}" != "${PINNED_VLLM_REF}" ]]; then
+    echo "WARNING: building vLLM ${VLLM_REF} (VLLM_REF_OVERRIDE), not the" \
+         "pyproject.toml pin ${PINNED_VLLM_REF}. Do not publish this wheel." >&2
+fi
 
 # --- Temp workspace and cleanup ----------------------------------------------
 # Set up before cloning so the clone is always removed, even on failure.
@@ -192,18 +188,6 @@ curl -fsSL --retry 3 -o "${WORK_DIR}/get-pip.py" \
     https://bootstrap.pypa.io/get-pip.py \
     || die "could not download get-pip.py from bootstrap.pypa.io."
 "$PY" "${WORK_DIR}/get-pip.py" --quiet
-
-# The pinned core must already be on PyPI, or the release can't be installed.
-# --ignore-requires-python: we only check the file exists.
-# TODO: TEMP (CI test): the core is not on PyPI yet, so the check is disabled.
-# Restore it before merging.
-# echo "Checking that vllm-torchtpu-core==${CORE_VERSION} is published on PYPI..."
-# "$PY" -m pip download --quiet --no-deps --no-cache-dir \
-#     --ignore-requires-python --only-binary :all: \
-#     --dest "${WORK_DIR}/core-check" \
-#     "vllm-torchtpu-core==${CORE_VERSION}" \
-#     || die "vllm-torchtpu-core==${CORE_VERSION} is not available on the package" \
-#            "index. Upload the core release first, then build the wrapper."
 
 echo "--- Starting vllm-torchtpu wheel build ---"
 echo "vllm-torchtpu-core ver : ${CORE_VERSION}"

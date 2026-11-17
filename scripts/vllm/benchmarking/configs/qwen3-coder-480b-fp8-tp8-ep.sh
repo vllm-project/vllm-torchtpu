@@ -32,7 +32,9 @@ RANDOM_RANGE_RATIO="0.8"
 RANGE_RATIO_STYLE="min"
 MAX_MODEL_LEN=10240
 MAX_NUM_BATCHED_TOKENS=8192
-MAX_NUM_SEQS=512
+# The most this config ever runs at once is lm-eval's 128 concurrent requests
+# (the benchmark runs 64), so the 256 and 512 sequence buckets are never used.
+MAX_NUM_SEQS=128
 SERVER_READY_WAIT_MIN=180
 GPU_MEMORY_UTILIZATION=0.95
 KV_CACHE_DTYPE="fp8"

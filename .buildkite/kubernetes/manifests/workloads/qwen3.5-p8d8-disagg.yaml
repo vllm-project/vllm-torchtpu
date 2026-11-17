@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The PCP8/DP8 disaggregation correctness test as a Kueue workload.
+# The PCP8 -> TP2xDP4 disaggregation correctness test as a Kueue workload.
 #
 # Two single-host slices, not one two-host slice: each engine is eight devices,
 # which is one whole tpu7x-standard-4t host, and they reach each other over the

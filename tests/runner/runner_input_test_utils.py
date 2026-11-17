@@ -59,6 +59,7 @@ def _make_runner(
     runner.num_reqs_most_model_len = None
     runner.num_tokens_paddings = list(token_paddings)
     runner.max_num_reqs = max_num_reqs
+    runner.max_num_local_reqs = max_num_reqs
     runner.max_num_tokens = max_num_tokens
     runner.max_model_len = max_model_len
     runner.block_size = block_size
@@ -72,7 +73,8 @@ def _make_runner(
     runner._mtp_prefill_only = mtp_enabled and pcp_size > 1
     runner._pp_is_first = True
     runner._pp_is_last = True
-    runner._pp_wave = None
+    runner._pp_handoff = None
+    runner._adaptive_verification = None
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
@@ -88,8 +90,10 @@ def _make_runner(
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     runner.sequence_layout_planner = create_sequence_layout_planner(runner.vllm_config)
+    runner.pcp_manager = None
+    runner.get_pcp_planner = types.MethodType(TPUModelRunner.get_pcp_planner, runner)
     runner.cache_config = SimpleNamespace(
-        num_gpu_blocks=8, num_gpu_blocks_override=None
+        block_size=block_size, num_gpu_blocks=8, num_gpu_blocks_override=None
     )
     runner.mesh = SimpleNamespace(
         shape={
@@ -111,9 +115,17 @@ def _make_runner(
     runner._decode_device_cache_key = None
     # The staging-tensor fence is recorded by execute_model; these tests
     # call _prepare_inputs directly, so the wait must find an empty fence.
+    # _dummy_run records one itself (see _fake_tpu_events).
     runner._input_staging_fence = None
+    runner._unfenced_h2d_sources = []
+    runner._fenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
     runner._wait_input_staging_fence = types.MethodType(
         TPUModelRunner._wait_input_staging_fence, runner
+    )
+    runner._record_input_staging_fence = types.MethodType(
+        TPUModelRunner._record_input_staging_fence, runner
     )
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None
@@ -145,6 +157,9 @@ def _make_runner(
     # Affine checkpoint addressing (no per-checkpoint blocks) in these tests.
     runner._mamba_ckpt_window = 1
     runner._unified_kv_layout = False
+    # No GDN internal prefill checkpoints in these layout tests.
+    runner._prefill_ckpt_units = None
+    runner._prefill_ckpt_zero_offsets = {}
     # Default to layer-major KV cache (None bundle) for PCP integration layout tests.
     runner._kv_cache_bundle = None
     # Bind the real seed-copy collector; an empty copy plan makes it a no-op
@@ -242,6 +257,14 @@ def _make_runner(
 
     runner._build_attention_metadata = fake_build_attention_metadata
     return runner
+
+
+def _fake_tpu_events(monkeypatch):
+    """Stand in for `torch.tpu.Event` so a CPU test can record the staging fence."""
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
+    )
 
 
 def _scheduler_output(scheduled_tokens):

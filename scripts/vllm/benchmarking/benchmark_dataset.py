@@ -741,10 +741,11 @@ class MMMUProDataset(BenchmarkDataset):
 
             answer = row.get("answer", "A")
 
-            # Collect images (image_1 through image_7).
+            # The vision subset stores its single image in "image"; the
+            # standard subsets use image_1 through image_7.
             images = []
-            for i in range(1, 8):
-                img = row.get(f"image_{i}")
+            for key in ("image", *(f"image_{i}" for i in range(1, 8))):
+                img = row.get(key)
                 if img is not None:
                     images.append(img)
 

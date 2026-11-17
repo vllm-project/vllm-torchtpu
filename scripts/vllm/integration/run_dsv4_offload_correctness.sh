@@ -90,6 +90,7 @@ CPU_BYTES_TO_USE="${CPU_BYTES_TO_USE:-26843545600}"
 # Base port. Each rank binds RAIDEN_CONTROLLER_PORT + dp_rank_local, so DP 8
 # claims 27801..27808.
 RAIDEN_CONTROLLER_PORT="${RAIDEN_CONTROLLER_PORT:-27801}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
 RUN_ROOT="${RUN_ROOT:-${SCRATCH_ROOT}/dsv4_offload_ci}"
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
 # A full boot is ~27 min of weight load plus compile; leave headroom.
@@ -106,6 +107,8 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
 fi
 
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
+# Decode is one token (max-num-seqs=1); prefill chunks pad up to the budget.
+COMPILE_SIZES="${COMPILE_SIZES:-16,${MAX_NUM_BATCHED_TOKENS}}"
 
 KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${RAIDEN_CONTROLLER_PORT}"',"raiden_job_name":"dsv4-offload-probe"}}'
 
@@ -118,7 +121,7 @@ serve() {
     --quantization deepseek_v4_fp8 \
     --trust-remote-code \
     --max-model-len=9216 \
-    --max-num-batched-tokens=1024 \
+    --max-num-batched-tokens="${MAX_NUM_BATCHED_TOKENS}" \
     --max-num-seqs=1 \
     --kv-cache-dtype=fp8_e4m3 \
     --enable-prefix-caching \
@@ -128,6 +131,7 @@ serve() {
     --tensor-parallel-size="${TP_SIZE}" \
     --no-async-scheduling \
     --enable-expert-parallel \
+    --compilation-config "{\"compile_sizes\":[${COMPILE_SIZES}]}" \
     --port "${PORT}" \
     --kv-transfer-config "$KVT"
 }

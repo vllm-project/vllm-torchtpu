@@ -3,5 +3,4 @@
 # Shrink this file by moving a knob into envs.py; never grow it.
 src/vllm_torchtpu/compilation/tpu_compiler.py:<dynamic>
 src/vllm_torchtpu/distributed/tpu_mp_multihost.py:<dynamic>
-src/vllm_torchtpu/executors/ray_distributed_executor.py:<dynamic>
 src/vllm_torchtpu/platforms/tpu_platform.py:<dynamic>

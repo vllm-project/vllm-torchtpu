@@ -61,6 +61,11 @@ class StructuredDecodingManager:
         self.device_dummy_bitmask = torch.zeros(
             (runner.max_num_reqs, num_words), dtype=torch.int32, device=self.device
         )
+        self.max_num_spec_tokens = (
+            runner.speculative_config.num_speculative_tokens
+            if runner.speculative_config is not None
+            else 0
+        )
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
@@ -89,6 +94,15 @@ class StructuredDecodingManager:
                 pin_memory=PIN_MEMORY,
             )
 
+    def _mask_stride(self, bitmask: np.ndarray, req_ids: Sequence[str]) -> int:
+        """Rows per structured request in the scheduler's grammar bitmask."""
+        mask_stride = 1 + self.max_num_spec_tokens
+        assert bitmask.shape[0] == len(req_ids) * mask_stride, (
+            f"grammar bitmask has {bitmask.shape[0]} rows for {len(req_ids)} "
+            f"requests, expected {mask_stride} per request"
+        )
+        return mask_stride
+
     def prepare_structured_decoding_input(
         self,
         logits: torch.Tensor,
@@ -99,22 +113,25 @@ class StructuredDecodingManager:
         """Builds the device inputs for `structured_decode` for one chunk.
 
         Bitmask rows follow the order of `structured_output_request_ids`
-        (the scheduler order). Each chunk covers requests
-        [cur_start_idx, cur_end_idx) of the input batch, so global batch
-        indices are shifted to chunk-local rows and requests outside the
-        chunk are skipped.
+        (the scheduler order), with `mask_stride = 1 + max_num_spec_tokens`
+        rows allocated per request when speculative decoding is enabled.
+        Each chunk covers requests [cur_start_idx, cur_end_idx) of the input
+        batch, so global batch indices are shifted to chunk-local rows and
+        requests outside the chunk are skipped.
         """
         padded_num_reqs = logits.shape[0]
         req_id_to_index = self.runner.input_batch.req_id_to_index
 
         bitmask = grammar_output.grammar_bitmask
+        req_ids = grammar_output.structured_output_request_ids
+        mask_stride = self._mask_stride(bitmask, req_ids)
         local_indices = []
         mask_rows = []
-        for mask_row, req_id in enumerate(grammar_output.structured_output_request_ids):
+        for grammar_idx, req_id in enumerate(req_ids):
             batch_index = req_id_to_index.get(req_id)
             if batch_index is not None and cur_start_idx <= batch_index < cur_end_idx:
                 local_indices.append(batch_index - cur_start_idx)
-                mask_rows.append(mask_row)
+                mask_rows.append(grammar_idx * mask_stride)
 
         # Fast path 1: No structured requests in this chunk.
         # Bypass both requirement and bitmask host transfers completely by
@@ -167,9 +184,10 @@ class StructuredDecodingManager:
     ]:
         """Builds the `structured_decode` inputs for one spec decoding chunk.
 
-        On spec decoding path, the scheduler emits `1 + s_r` consecutive
-        bitmask rows for one structured request, where `s_r` is the number of drafts
-        scheduled for this step.
+        On spec decoding path, the scheduler allocates a fixed block of
+        `mask_stride = 1 + max_num_spec_tokens` rows per structured request,
+        where the first `s_r` rows cover the `s_r` drafts scheduled for this
+        step and row `s_r` covers the bonus token.
 
         Returns `(require_target, target_bitmask, require_bonus,
         bonus_bitmask, arange)`; the first two are None when `target_logits`
@@ -192,12 +210,13 @@ class StructuredDecodingManager:
 
         req_id_to_index = self.runner.input_batch.req_id_to_index
         bitmask = grammar_output.grammar_bitmask
-        mask_row = 0
-        for req_id in grammar_output.structured_output_request_ids:
+        req_ids = grammar_output.structured_output_request_ids
+        mask_stride = self._mask_stride(bitmask, req_ids)
+        for grammar_idx, req_id in enumerate(req_ids):
+            mask_row = grammar_idx * mask_stride
             num_drafts = len(scheduled_spec_decode_tokens.get(req_id, ()))
             batch_index = req_id_to_index.get(req_id)
             if batch_index is None or not cur_start_idx <= batch_index < cur_end_idx:
-                mask_row += 1 + num_drafts
                 continue
             local_index = batch_index - cur_start_idx
             if num_drafts:
@@ -221,7 +240,6 @@ class StructuredDecodingManager:
                 bitmask[mask_row + num_drafts]
             )
             self.require_structured_out_cpu[local_index] = True
-            mask_row += 1 + num_drafts
 
         if target_logits is not None:
             require_target = self.require_structured_out_target_cpu[
@@ -326,6 +344,68 @@ class StructuredDecodingManager:
             )
             return target_logits, bonus_logits
 
+    def mask_invalid_draft_tokens(
+        self,
+        draft_token_ids: torch.Tensor,
+        grammar_output: GrammarOutput,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        draft_lengths_cpu: np.ndarray,
+    ) -> torch.Tensor:
+        """Pins draft tokens beyond `grammar_output.num_acceptable_drafts` to -1.
+
+        `StructuredOutputManager.grammar_bitmask` fills every row after the first
+        `-1` placeholder with the all-permissive `_full_mask`, so a request's
+        drafts at positions `>= num_acceptable_drafts` must be invalidated (-1)
+        before rejection sampling. `draft_lengths_cpu` holds each chunk-local
+        request's draft count, in the order of `draft_token_ids`.
+        """
+        req_ids = grammar_output.structured_output_request_ids
+        if not req_ids or draft_token_ids.numel() == 0:
+            return draft_token_ids
+
+        chunk_num_reqs = cur_end_idx - cur_start_idx
+        if chunk_num_reqs <= 0:
+            return draft_token_ids
+
+        req_id_to_index = self.runner.input_batch.req_id_to_index
+        num_acceptable = grammar_output.num_acceptable_drafts
+        # Requests without a grammar stay unconstrained (INT32_MAX).
+        limits = np.full(chunk_num_reqs, np.iinfo(np.int32).max, dtype=np.int32)
+        has_structured = False
+        for grammar_idx, req_id in enumerate(req_ids):
+            batch_index = req_id_to_index.get(req_id)
+            if batch_index is not None and cur_start_idx <= batch_index < cur_end_idx:
+                local_idx = batch_index - cur_start_idx
+                limits[local_idx] = (
+                    num_acceptable[grammar_idx] if num_acceptable is not None else 0
+                )
+                has_structured = True
+
+        if not has_structured:
+            return draft_token_ids
+
+        if np.all(limits[: len(draft_lengths_cpu)] >= draft_lengths_cpu):
+            return draft_token_ids
+        invalid_mask_np = np.zeros(draft_token_ids.shape[0], dtype=np.bool_)
+        row = 0
+        for local_idx, num_drafts in enumerate(draft_lengths_cpu):
+            n = int(num_drafts)
+            limit = max(0, int(limits[local_idx]))
+            if limit < n:
+                invalid_mask_np[row + limit : row + n] = True
+            row += n
+        invalid_mask = torch.from_numpy(invalid_mask_np).to(
+            device=draft_token_ids.device
+        )
+        return self.pin_invalid_draft_tokens(invalid_mask, draft_token_ids)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def pin_invalid_draft_tokens(
+        self, invalid_mask: torch.Tensor, draft_token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.where(invalid_mask, -1, draft_token_ids)
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def structured_decode(
         self,
@@ -354,14 +434,22 @@ class StructuredDecodingManager:
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor, arange: torch.Tensor
     ) -> torch.Tensor:
-        assert logits.shape[0] == grammar_bitmask.shape[0]
+        # Both input checks use torch._assert, not assert or raise: it survives
+        # python -O, and under torch.compile(fullgraph=True) the caller still
+        # gets a plain AssertionError with the message.
+        torch._assert(
+            logits.shape[0] == grammar_bitmask.shape[0],
+            "grammar_bitmask must have one row per logits row: "
+            f"logits.shape[0]={logits.shape[0]}, "
+            f"grammar_bitmask.shape[0]={grammar_bitmask.shape[0]}",
+        )
         target_dim = logits.shape[-1]
-        if target_dim < self.vocab_size:
-            raise ValueError(
-                "TPU logits vocab dimension must be at least "
-                f"vocab_size ({self.vocab_size}) (padded to hardware alignment "
-                f"boundary), but got logits.shape[-1]={target_dim}"
-            )
+        torch._assert(
+            target_dim >= self.vocab_size,
+            "TPU logits vocab dimension must be at least "
+            f"vocab_size ({self.vocab_size}) (padded to hardware alignment "
+            f"boundary), but got logits.shape[-1]={target_dim}",
+        )
         # Unpack the bitmask for the entire batch at once.
         # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)
         # arange: (32,)

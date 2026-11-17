@@ -59,6 +59,10 @@ body[data-md-color-scheme="slate"] .md-nav__item--section > label.md-nav__link .
   background-color: #e6f4ea;
   color: #1e8e3e;
 }
+.cg-badge-supported {
+  background-color: #e8f0fe;
+  color: #1967d2;
+}
 .cg-badge-experimental {
   background-color: #fef7e0;
   color: #f9ab00;

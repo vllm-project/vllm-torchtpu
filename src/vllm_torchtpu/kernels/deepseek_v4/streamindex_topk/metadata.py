@@ -201,14 +201,6 @@ def compute_batched_seq_metadata(
 
     is_empty_pass = jnp.greater_equal(start_seq_idx, end_seq_idx)
 
-    def _empty_schedule():
-        return MetadataRef.create(
-            num_steps=jnp.zeros((num_chunks,), dtype=jnp.int32),
-            batch_tile_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-            bq_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-            bkv_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-        )
-
     # Static shape bucketing for JAX XLA tracing on TPU:
     # Compute max_seq_tiles and padded arrays over max_num_seqs to maintain static
     # tensor shapes across kernel invocations. This prevents XLA recompilation per
@@ -291,28 +283,31 @@ def compute_batched_seq_metadata(
         seg_num_steps = num_bq.reshape(-1) * seg_num_bkv
         seg_start_step_id = jnp.cumulative_sum(seg_num_steps, include_initial=True)
 
-        # 2D boolean ownership mask [num_chunks * max_seq_tiles, max_steps] where
-        # entry (j, t) is True if flat pipeline step t belongs to segment j.
-        is_step_in_seg = (all_steps[None, :] >= seg_start_step_id[:-1, None]) & (
-            all_steps[None, :] < seg_start_step_id[1:, None]
-        )
+        # Each step takes the value of the segment it falls in. Segments own
+        # contiguous, increasing step ranges, so scatter each segment's change at
+        # its first step and prefix-sum over the steps: O(segments + steps), not
+        # an O(segments * steps) ownership mask. A TPU scatter costs the same at
+        # any size, so one scatter carries (num_bkv, seq_tile, parity) packed
+        # linearly; parity flips at every non-empty segment, marking its first step.
+        seg_parity = jnp.cumulative_sum((seg_num_steps > 0).astype(jnp.int32)) & 1
+        tile_mult = 2 * max_seq_tiles
+        seg_packed = seg_num_bkv * tile_mult + seg_seq_tiles * 2 + seg_parity
+        change = seg_packed - jnp.pad(seg_packed[:-1], (1, 0))
+        packed = jnp.zeros((max_steps,), jnp.int32)
+        packed = packed.at[seg_start_step_id[:-1]].add(change, mode="drop")
+        live_step = all_steps < seg_start_step_id[-1]
+        packed = jnp.where(live_step, jnp.cumsum(packed), 0)
 
-        # Map each flat pipeline step t to its sequence tile index (0, 1, ...) and
-        # convert it to the starting sequence index in the batch (batch_tile_idx).
-        repeat_seq_tiles = jnp.sum(seg_seq_tiles[:, None] * is_step_in_seg, axis=0)
-        batch_tile_idx = repeat_seq_tiles * seq_batch_size
-        # Holds the starting sequence index per flat pipeline step.
-        start_step_id_repeat = jnp.sum(
-            seg_start_step_id[:-1, None] * is_step_in_seg, axis=0
-        )
-        # Holds the local step index within the sequence tile.
-        tile_step_id = all_steps - start_step_id_repeat
-        # Holds the number of KV blocks processed per pipeline step.
-        # Convert local 1D step index (tile_step_id) into 2D grid coordinates [row,
-        # col] where width is nbkv_per_step_id:
-        # row = tile_step_id // width, col = tile_step_id % width.
-        # jnp.maximum(1, ...) prevents division by zero on inactive steps.
-        nbkv_per_step_id = jnp.sum(seg_num_bkv[:, None] * is_step_in_seg, axis=0)
+        parity = packed & 1
+        is_first = (all_steps == 0) | (parity != jnp.pad(parity[:-1], (1, 0)))
+        first_step = jax.lax.cummax(jnp.where(is_first, all_steps, 0))
+        first_step = jnp.where(live_step, first_step, 0)
+        batch_tile_idx = packed // 2 % max_seq_tiles * seq_batch_size
+        # Local step index within the segment's sequence tile.
+        tile_step_id = all_steps - first_step
+        # KV blocks per step for the step's segment; row = tile_step_id // width,
+        # col = tile_step_id % width. jnp.maximum(1, ...) guards inactive steps.
+        nbkv_per_step_id = packed // tile_mult
 
         bq_idx = jnp.maximum(0, tile_step_id // jnp.maximum(1, nbkv_per_step_id))
         bkv_idx = jnp.maximum(0, tile_step_id % jnp.maximum(1, nbkv_per_step_id))
@@ -328,7 +323,11 @@ def compute_batched_seq_metadata(
             bkv_idx=bkv_idx,
         )
 
-    return jax.lax.cond(is_empty_pass, _empty_schedule, _compute_schedule)
+    # No lax.cond: XLA never CSEs one, and every indexer layer builds this same
+    # schedule from the step metadata. An empty pass is zeroed instead.
+    return jax.tree_util.tree_map(
+        lambda x: jnp.where(is_empty_pass, jnp.zeros_like(x), x), _compute_schedule()
+    )
 
 
 def compute_metadata(

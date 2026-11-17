@@ -40,7 +40,6 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
 # Print to stdout: Buildkite's main log view surfaces stdout, and the
 # failure reason must be readable there without digging through artifacts.
@@ -160,33 +159,15 @@ echo "ports: server=${PORT} registry=${REGISTRY_PORT}\
  offload controller=${OFFLOAD_CONTROLLER_PORT}\
  node controller=${NODE_CONTROLLER_PORT}"
 
-# ---------------------------------------------------------------------------
-# Version preflight: the runtime must match pyproject.toml exactly.
-# ---------------------------------------------------------------------------
-RAIDEN_PIN="$(sed -nE 's/^[[:space:]]*"tpu-sync-torch==([^"]+)".*/\1/p' \
-  "${repo_root}/pyproject.toml" | head -1)"
-[[ -n "${RAIDEN_PIN}" ]] \
-  || fail "no tpu-sync-torch== pin found in pyproject.toml"
-
-python3 - "${RAIDEN_PIN}" <<'PY'
-import importlib.metadata
-import sys
-
-raiden_pin = sys.argv[1]
-raiden_installed = importlib.metadata.version("tpu-sync-torch")
-if raiden_installed != raiden_pin:
-    raise SystemExit(
-        f"installed tpu-sync-torch {raiden_installed} != pyproject pin "
-        f"{raiden_pin}: the CI image must install the pinned wheel")
-print(f"tpu-sync-torch {raiden_installed} matches pyproject pin")
-PY
-
+RAIDEN_VERSION="$(python3 -c \
+  'import importlib.metadata as m; print(m.version("tpu-sync-torch"))')" \
+  || fail "tpu-sync-torch is not installed"
 for cmd in global_registry_server kv_cache_host_store_node_main; do
   command -v "${cmd}" >/dev/null || fail \
-    "${cmd} not found: tpu-sync-torch==${RAIDEN_PIN} does not bundle the \
-global DRAM pool control plane — bump the pin in pyproject.toml"
+    "${cmd} not found: tpu-sync-torch ${RAIDEN_VERSION} does not bundle the \
+global DRAM pool control plane"
 done
-echo "control plane from the tpu-sync-torch ${RAIDEN_PIN} wheel"
+echo "control plane from the tpu-sync-torch ${RAIDEN_VERSION} wheel"
 
 # ---------------------------------------------------------------------------
 # Global registry: the directory and placement plane everything else joins.

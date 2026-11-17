@@ -59,7 +59,8 @@ def check(sha, all_statuses):
     if build is None:
         return None, (
             f"no {CONTEXT} build of {sha}. Run a full build first: "
-            f"vllm-torchtpu-ci on this commit with NIGHTLY=1."
+            f"vllm-torchtpu-ci on this commit with NIGHTLY=1 "
+            f"(or the run-full-ci label on a PR)."
         )
     print(f"{CONTEXT}: {build['state']} ({build['target_url']})")
     if build["state"] != "success":
@@ -82,7 +83,8 @@ def check(sha, all_statuses):
     if not nightly:
         return None, (
             f"{CONTEXT} passed on {sha}, but no nightly step ran in that build. "
-            f"Run it again with NIGHTLY=1 so the release is tested by the full suite."
+            f"Run it again with NIGHTLY=1 (or the run-full-ci label on a PR) "
+            f"so the release is tested by the full suite."
         )
     return build["target_url"], None
 

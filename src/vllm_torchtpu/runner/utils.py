@@ -439,6 +439,8 @@ def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
 
 def relayout_rope_caches(model: torch.nn.Module):
     """Re-materialize every rope cache with a row-major device layout."""
+    # Share one relayouted device tensor across modules that share a buffer.
+    relayouted_by_id: dict[int, torch.Tensor] = {}
     num_changed = 0
     for name, module in model.named_modules():
         if not isinstance(module, RotaryEmbeddingBase):
@@ -454,7 +456,12 @@ def relayout_rope_caches(model: torch.nn.Module):
         if any(b.ndim != 2 for _, b in caches):
             continue
         for buf_name, buf in caches:
-            setattr(module, buf_name, _to_row_major(buf))
+            buf_id = id(buf)
+            relayouted = relayouted_by_id.get(buf_id)
+            if relayouted is None:
+                relayouted = _to_row_major(buf)
+                relayouted_by_id[buf_id] = relayouted
+            setattr(module, buf_name, relayouted)
         num_changed += 1
         logger.info(
             "Relayouted rope cache %s to {1,0} (shape %s)",

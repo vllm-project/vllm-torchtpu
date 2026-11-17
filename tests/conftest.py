@@ -96,6 +96,137 @@ def vllm_config_context():
         yield
 
 
+@pytest.fixture(scope="module")
+def dist_ctx():
+    """Single-rank gloo world and model-parallel groups for one test module.
+
+    Destroys only the groups this fixture created, so later test modules
+    start without a default process group. Groups that already existed when
+    the fixture ran stay in place.
+
+    Defined here rather than in tests/models/vllm/conftest.py: pytest 9.1 drops
+    a subdirectory conftest's fixtures when the file arguments go back into that
+    directory after a file directly under tests/, and sharded CI passes files in
+    any order.
+    """
+    import torch.distributed as dist
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+    owns_world = not dist.is_initialized()
+    owns_model_parallel = False
+    if owns_world:
+        import portpicker
+
+        port = portpicker.pick_unused_port()
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            backend="gloo",
+        )
+    try:
+        owns_model_parallel = not model_parallel_is_initialized()
+        # GroupCoordinator construction consults the current vLLM config.
+        with set_current_vllm_config(VllmConfig()):
+            ensure_model_parallel_initialized(1, 1)
+        yield
+    finally:
+        if owns_model_parallel:
+            destroy_model_parallel()
+        if owns_world:
+            destroy_distributed_environment()
+
+
+@pytest.fixture
+def make_fp8_experts(monkeypatch):
+    """CPU `RoutedExperts` under `quant`, holding TP rank `tp_rank` of the experts."""
+    # Here rather than in tests/layers/adapter/quantization/: see dist_ctx.
+
+    def make(quant, shard_size, *, tp_size=2, tp_rank=1):
+        from types import SimpleNamespace
+
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
+        from vllm.model_executor.layers.fused_moe.config import (
+            FusedMoEConfig,
+            FusedMoEParallelConfig,
+            MoEActivation,
+            RoutingMethodType,
+        )
+        from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+            ExpertMapManager,
+        )
+
+        parallel = FusedMoEParallelConfig(
+            tp_size=tp_size,
+            pcp_size=1,
+            dp_size=1,
+            ep_size=1,
+            tp_rank=tp_rank,
+            pcp_rank=0,
+            dp_rank=0,
+            ep_rank=0,
+            sp_size=1,
+            use_ep=False,
+            all2all_backend="allgather_reducescatter",
+            enable_eplb=False,
+        )
+        config = FusedMoEConfig(
+            num_experts=2,
+            experts_per_token=1,
+            hidden_dim=256,
+            intermediate_size=tp_size * shard_size,
+            num_local_experts=2,
+            num_logical_experts=2,
+            activation=MoEActivation.SILU,
+            device=torch.device("cpu"),
+            routing_method=RoutingMethodType.Renormalize,
+            moe_parallel_config=parallel,
+            in_dtype=torch.bfloat16,
+        )
+        expert_map = ExpertMapManager(
+            max_num_batched_tokens=16,
+            top_k=1,
+            global_num_experts=2,
+            num_redundant_experts=0,
+            num_expert_group=None,
+            moe_parallel_config=parallel,
+            placement_strategy="linear",
+            enable_eplb=False,
+        )
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.quantization.fp8."
+            "get_tensor_model_parallel_world_size",
+            lambda: tp_size,
+        )
+        monkeypatch.setattr(
+            "vllm.distributed.get_tensor_model_parallel_world_size",
+            lambda: tp_size,
+        )
+        quant.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_expert_parallel=False),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+        )
+        with set_current_vllm_config(quant.vllm_config):
+            return RoutedExperts(
+                layer_name="model.layers.0.mlp.experts",
+                params_dtype=torch.bfloat16,
+                moe_config=config,
+                quant_config=quant,
+                expert_map_manager=expert_map,
+            )
+
+    return make
+
+
 @pytest.fixture
 def device(request):
     """Get the device to run tests on (CPU or TPU).

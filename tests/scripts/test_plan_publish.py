@@ -35,8 +35,10 @@ _spec.loader.exec_module(plan_publish)
 
 def plan(version, **env):
     """The steps plan_publish prints for a staged release of `version`."""
+    prerelease = any(tag in version for tag in ("a", "b", "rc", "dev"))
     metadata = {
         "release-version": version,
+        "release-prerelease": "yes" if prerelease else "no",
         "release-image-prod": "us-docker.pkg.dev/x/prod@sha256:abc",
     }
     out = io.StringIO()
