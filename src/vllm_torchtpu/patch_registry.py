@@ -131,6 +131,9 @@ PATCHES = (
     ),
     # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
+    # Data-parallel engine choice (VLLM_TPU_DP_PROMPT_BACKLOG): the engine
+    # core publishes pending prompt tokens, the API server's client routes.
+    Patch("vllm_torchtpu.core.dp_prompt_backlog:install_if_enabled", _ENGINE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
