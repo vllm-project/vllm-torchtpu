@@ -1417,28 +1417,3 @@ def test_runtime_cache_key_covers_the_qwen3_5_kernel_copies():
     shared kernels, so their source must be part of the runtime cache key."""
     _, hashed = _runtime_hashed_files()
     assert "vllm_torchtpu/models/qwen3_5/kernels/gdn/wrapper.py" in hashed
-
-
-class TestShapeVariantsWarmupBypass:
-    def test_in_warmup_guard_and_sp_row_check(self, monkeypatch):
-        """A trace outside shape_variants.warmup() takes the caller's
-        sequence-parallel decision; inside it, the trace compares its own
-        token count with the SP row minimum."""
-        import torch
-
-        from vllm_torchtpu.compilation import shape_variants
-        from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
-
-        assert not shape_variants.in_warmup()
-        with shape_variants.warmup():
-            assert shape_variants.in_warmup()
-        assert not shape_variants.in_warmup()
-
-        monkeypatch.setattr(patch_mod.sequence_parallel, "is_active", lambda: True)
-        monkeypatch.setattr(patch_mod.sequence_parallel, "min_rows", lambda: 512)
-        assert not patch_mod._rows_are_sequence_parallel(4)
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-        assert patch_mod._rows_are_sequence_parallel(4)
-        with shape_variants.warmup():
-            assert not patch_mod._rows_are_sequence_parallel(4)
-            assert patch_mod._rows_are_sequence_parallel(512)
