@@ -68,6 +68,12 @@ UNKNOWN_BACKEND_LABEL = "unknown"
 HOST_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.HOST.value, "dram")
 P2P_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.P2P.value, "rdma")
 
+
+def disk_offload_labels(storage_backend: str) -> tuple[str, str]:
+    """Labels of the storage tier, for example `("disk", "posix")`."""
+    return (CacheHitSource.DISK.value, storage_backend)
+
+
 # Tier of each sub-block of one `OffloadKey`, as `(source, count)` runs of
 # consecutive sub-blocks in the same tier; the counts sum to
 # `device_block_size_factor`. For example, with 4 sub-blocks per key,
@@ -326,8 +332,8 @@ class RaidenOffloadStatsCollector:
                     "configured storage_backend; using backend=%r.",
                     UNKNOWN_BACKEND_LABEL,
                 )
-                return (CacheHitSource.DISK.value, UNKNOWN_BACKEND_LABEL)
-            return (CacheHitSource.DISK.value, self._storage_backend)
+                return disk_offload_labels(UNKNOWN_BACKEND_LABEL)
+            return disk_offload_labels(self._storage_backend)
         raise ValueError(f"Unsupported offload source for metrics: {source!r}")
 
     def record_admission_hits(

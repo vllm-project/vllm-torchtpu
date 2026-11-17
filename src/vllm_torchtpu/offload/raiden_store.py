@@ -126,6 +126,7 @@ from vllm_torchtpu.offload.metrics import (
     RaidenOffloadStatsCollector,
     SubBlockSourceCounts,
     build_raiden_offload_metric_definitions,
+    disk_offload_labels,
 )
 
 if TYPE_CHECKING:
@@ -2344,7 +2345,7 @@ def configured_tier_labels(
     if str(extra_config.get("global_registry_address", "")):
         labels.append(P2P_OFFLOAD_LABELS)
     if _storage_setting(extra_config, _STORAGE_PATH_KEY, envs.RAIDEN_STORAGE_PATH):
-        labels.append((CacheHitSource.DISK.value, _storage_type(extra_config)))
+        labels.append(disk_offload_labels(_storage_type(extra_config)))
     return tuple(labels)
 
 
