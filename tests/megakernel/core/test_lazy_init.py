@@ -58,11 +58,12 @@ def _run(code: str) -> str:
 
 
 _HEAVY = (
-    "vllm_torchtpu.megakernel.core.exec_spec",
-    "vllm_torchtpu.megakernel.core.ops",
+    "vllm_torchtpu.megakernel.core.kernel",
+    "vllm_torchtpu.megakernel.core.cache",
+    "vllm_torchtpu.megakernel.core.modules",
     "vllm_torchtpu.megakernel.core.planner",
-    "vllm_torchtpu.megakernel.core.pool",
-    "vllm_torchtpu.megakernel.core.runtime.eligibility",
+    "vllm_torchtpu.megakernel.core.runtime.checks",
+    "vllm_torchtpu.megakernel.core.runtime.exec_policy",
     "vllm_torchtpu.megakernel.core.runtime.policy",
 )
 
@@ -73,8 +74,11 @@ for name in ("jax", "jaxlib", "torch", "vllm"):
 import vllm_torchtpu.megakernel.core as mk
 import vllm_torchtpu.megakernel.core.dma as dma
 import vllm_torchtpu.megakernel.core.runtime as rt
+import vllm_torchtpu.megakernel.core.runtime.contract as contract
 assert mk.MegakernelLayoutError and mk.MegakernelConfigError
-assert dma.__all__ and rt.__all__
+assert mk.EligibilityResult is contract.EligibilityResult is rt.EligibilityResult
+assert contract.TpuMonoSpec("toy", "1", create="m:create").parallelism == {{"tp"}}
+assert dma.__all__
 assert sys.modules["jax"] is None
 heavy = [m for m in {heavy!r} if m in sys.modules]
 assert not heavy, heavy
@@ -95,7 +99,7 @@ pkg.__path__ = [str(pathlib.Path({src!r}) / "vllm_torchtpu")]
 sys.modules["vllm_torchtpu"] = pkg
 import vllm_torchtpu.megakernel.core as mk
 import vllm_torchtpu.megakernel.core.dma
-import vllm_torchtpu.megakernel.core.runtime
+import vllm_torchtpu.megakernel.core.runtime.contract
 assert mk.MegakernelLayoutError and mk.MegakernelConfigError
 assert "jax" not in sys.modules
 heavy = [m for m in {heavy!r} if m in sys.modules]
@@ -108,6 +112,26 @@ def test_package_import_loads_no_megakernel_submodule() -> None:
     """With jax importable, importing the packages imports neither jax nor any
     heavy megakernel submodule."""
     assert _run(_LAZY_ONLY.format(src=str(_SRC), heavy=_HEAVY)) == "OK"
+
+
+_REGISTRIES = """
+import vllm_torchtpu.megakernel.core as mk
+# Registry lookups before anything touches mk.modules.
+assert mk.Tiles().module("gqa") is not None
+assert mk.Tiles().with_modules({"gqa": {"kv_sub": 2}}).module("gqa").kv_sub == 2
+from vllm_torchtpu.megakernel.core import module_options
+assert {"gqa", "gdn", "moe"} <= set(module_options.registered_tunables())
+# Models and their profiles live in model folders, which register explicitly.
+assert mk.list_models() == () and mk.list_profiles() == ("default",)
+# The fused pool I/O implementation registers on the first lookup.
+from vllm_torchtpu.megakernel.core.fused_io_hook import fused_io, fused_io_available
+assert fused_io_available() and fused_io() is not None
+print("OK")
+"""
+
+
+def test_registry_lookups_load_the_builtins_first() -> None:
+    assert _run(_REGISTRIES) == "OK"
 
 
 _FIRST_LOOKUP = """
@@ -150,3 +174,20 @@ print("OK")
 
 def test_first_lookup_is_a_profile_lookup() -> None:
     assert _run(_FIRST_LOOKUP) == "OK"
+
+
+_FUNCTION_NAMED_SUBMODULE = """
+import sys
+import types
+from vllm_torchtpu.megakernel import core as mk
+import vllm_torchtpu.megakernel.core.verify_module
+assert "vllm_torchtpu.megakernel.core.verify_module" in sys.modules
+assert isinstance(mk.verify_module, types.FunctionType), mk.verify_module
+from vllm_torchtpu.megakernel.core import verify_module
+assert verify_module is mk.verify_module
+print("OK")
+"""
+
+
+def test_verify_module_stays_the_function_after_its_submodule_loads() -> None:
+    assert _run(_FUNCTION_NAMED_SUBMODULE) == "OK"

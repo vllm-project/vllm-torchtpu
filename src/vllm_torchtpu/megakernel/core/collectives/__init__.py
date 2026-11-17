@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""In-kernel inter-rank collectives, remote DMA batching, and SPMD axes."""
+"""In-kernel inter-rank collectives and their build-time parameters, plus the
+collective topology, remote DMA batching and SPMD axis helpers."""
 
 from . import params, remote_copy, ring, spmd, topology
 from .params import CommParams, comm_params, ring_scratch, stage_scratch

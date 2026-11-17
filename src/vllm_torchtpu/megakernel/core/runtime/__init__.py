@@ -19,7 +19,30 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
-    from . import contract, eligibility, policy, stats
+    from . import (
+        checks,
+        contract,
+        eligibility,
+        exec_policy,
+        layout_facts,
+        policy,
+        stats,
+        step_meta,
+    )
+    from .checks import (
+        PoolScheduleInfo,
+        SentinelVariantPlan,
+        WarmupStepPlan,
+        build_global_avals,
+        build_warmup_plan,
+        check_compile_hlo_mesh,
+        ir_required_buckets,
+        pool_schedule_info,
+        verify_compiled_step_ir,
+        verify_ir_coverage,
+        verify_pooled_step_hlo,
+        verify_sentinel_step,
+    )
     from .contract import (
         DOMAIN_TP,
         PARALLELISM_UNSUPPORTED,
@@ -42,6 +65,20 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         check_startup_eligibility,
         check_step_eligibility,
     )
+    from .exec_policy import (
+        DEFAULT_FUSED_POOL_IO_MAX_B,
+        DEFAULT_FUSED_POOL_IO_MIN_B_HI,
+        align_cache_exec,
+        bucket_exec_spec,
+        explicit_profile_settings,
+        parse_runtime_config,
+        resolve_driver_profile,
+    )
+    from .layout_facts import (
+        PoolLayoutFacts,
+        compare_layout_facts,
+        facts_from_pool_layout,
+    )
     from .policy import (
         DEFAULT_BUCKETS,
         DEFAULT_VERIFY_BUCKETS,
@@ -60,17 +97,29 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         check_query_start_loc_uniform,
         inspect_batch_shape,
     )
+    from .step_meta import (
+        JaxStepMetaOps,
+        StepMeta,
+        StepMetaOps,
+        check_ckpt_write_cols_distinct,
+        pack_step_meta,
+        resolve_step_positions,
+    )
 
 # Public names resolve on first access (PEP 562): importing a submodule
 # (e.g. `runtime.contract`) doesn't import jax through this package. The
 # framework-free part is `contract` and `policy` (stdlib) and `stats` (numpy);
-# `eligibility` imports jax through the chip table and loads on first access.
+# the rest is policy- / kernel-bound.
 _SUBMODULES = frozenset(
     {
         "contract",
         "stats",
+        "checks",
         "eligibility",
+        "exec_policy",
+        "layout_facts",
         "policy",
+        "step_meta",
     }
 )
 _LAZY: dict[str, str] = {
@@ -95,17 +144,45 @@ _LAZY: dict[str, str] = {
     "check_mrope_uniform": ".stats",
     "check_query_start_loc_uniform": ".stats",
     "inspect_batch_shape": ".stats",
+    "PoolScheduleInfo": ".checks",
+    "SentinelVariantPlan": ".checks",
+    "WarmupStepPlan": ".checks",
+    "build_global_avals": ".checks",
+    "build_warmup_plan": ".checks",
+    "check_compile_hlo_mesh": ".checks",
+    "ir_required_buckets": ".checks",
+    "pool_schedule_info": ".checks",
+    "verify_compiled_step_ir": ".checks",
+    "verify_ir_coverage": ".checks",
+    "verify_pooled_step_hlo": ".checks",
+    "verify_sentinel_step": ".checks",
     "check_post_mesh_eligibility": ".eligibility",
     "check_startup_eligibility": ".eligibility",
     "check_step_eligibility": ".eligibility",
+    "PoolLayoutFacts": ".layout_facts",
+    "compare_layout_facts": ".layout_facts",
+    "facts_from_pool_layout": ".layout_facts",
     "DEFAULT_BUCKETS": ".policy",
+    "DEFAULT_FUSED_POOL_IO_MAX_B": ".exec_policy",
+    "DEFAULT_FUSED_POOL_IO_MIN_B_HI": ".exec_policy",
     "DEFAULT_VERIFY_BUCKETS": ".policy",
     "MTP_SPECULATIVE_TOKENS": ".policy",
     "MTP_VERIFY_TOKENS": ".policy",
     "BucketPolicy": ".policy",
+    "align_cache_exec": ".exec_policy",
+    "bucket_exec_spec": ".exec_policy",
+    "explicit_profile_settings": ".exec_policy",
     "parse_mk_buckets": ".policy",
     "parse_mk_verify_buckets": ".policy",
+    "parse_runtime_config": ".exec_policy",
+    "resolve_driver_profile": ".exec_policy",
     "select_bucket": ".policy",
+    "JaxStepMetaOps": ".step_meta",
+    "StepMeta": ".step_meta",
+    "StepMetaOps": ".step_meta",
+    "check_ckpt_write_cols_distinct": ".step_meta",
+    "pack_step_meta": ".step_meta",
+    "resolve_step_positions": ".step_meta",
 }
 
 __all__ = [
@@ -116,6 +193,8 @@ __all__ = [
     "UNSUPPORTED_TPU_CHIP",
     "UNSUPPORTED_TP_SIZE",
     "DEFAULT_BUCKETS",
+    "DEFAULT_FUSED_POOL_IO_MAX_B",
+    "DEFAULT_FUSED_POOL_IO_MIN_B_HI",
     "DEFAULT_VERIFY_BUCKETS",
     "MTP_SPECULATIVE_TOKENS",
     "MTP_VERIFY_TOKENS",
@@ -124,27 +203,57 @@ __all__ = [
     "BucketPolicy",
     "Decline",
     "EligibilityResult",
+    "JaxStepMetaOps",
     "LayoutDecline",
     "MKABCalibrator",
     "MonoProgram",
+    "PoolLayoutFacts",
+    "PoolScheduleInfo",
     "RunnerShape",
+    "SentinelVariantPlan",
     "StepDecision",
+    "StepMeta",
+    "StepMetaOps",
     "StepMixTracker",
     "TpuMonoSpec",
     "WarmupCase",
+    "WarmupStepPlan",
+    "align_cache_exec",
+    "bucket_exec_spec",
+    "build_global_avals",
+    "build_warmup_plan",
+    "check_ckpt_write_cols_distinct",
+    "check_compile_hlo_mesh",
     "check_mrope_uniform",
     "check_post_mesh_eligibility",
     "check_query_start_loc_uniform",
     "check_startup_eligibility",
     "check_step_eligibility",
+    "checks",
     "contract",
+    "compare_layout_facts",
     "eligibility",
+    "exec_policy",
+    "explicit_profile_settings",
+    "facts_from_pool_layout",
     "inspect_batch_shape",
+    "ir_required_buckets",
+    "layout_facts",
+    "pack_step_meta",
     "parse_mk_buckets",
     "parse_mk_verify_buckets",
+    "parse_runtime_config",
     "policy",
+    "pool_schedule_info",
+    "resolve_driver_profile",
+    "resolve_step_positions",
     "select_bucket",
     "stats",
+    "step_meta",
+    "verify_compiled_step_ir",
+    "verify_ir_coverage",
+    "verify_pooled_step_hlo",
+    "verify_sentinel_step",
 ]
 
 

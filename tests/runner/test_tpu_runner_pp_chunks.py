@@ -302,6 +302,7 @@ def test_capture_model_checks_draft_buckets_after_the_mtp_warmup(monkeypatch):
     runner.vllm_config = runner.device = runner.model = None
     runner._mtp_prefill_only = True
     runner._is_async_drafter = False
+    runner._megakernel = None
     calls = []
     runner._warmup_mtp_prefill.side_effect = lambda: calls.append("warmup")
     runner._check_draft_buckets.side_effect = lambda: calls.append("check")

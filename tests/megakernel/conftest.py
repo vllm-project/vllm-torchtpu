@@ -70,13 +70,27 @@ def _with_mk_xla_flags(raw_flags: str) -> str:
 
 
 def _mk_roots() -> tuple[Path, ...]:
-    # This directory: both subtrees, `core/` and `adapter/`.
-    return (Path(__file__).resolve().parent,)
+    tests_dir = Path(__file__).resolve().parent.parent
+    return (
+        # This directory: both subtrees, `core/` and `adapter/`.
+        Path(__file__).resolve().parent,
+        # Model folders' megakernel tests (`tests/models/<model>/megakernel`).
+        *(p.resolve() for p in sorted((tests_dir / "models").glob("*/megakernel"))),
+    )
 
 
 def _is_mk_path(path: Path) -> bool:
     resolved = path.resolve()
-    return any(resolved == root or root in resolved.parents for root in _mk_roots())
+    roots = _mk_roots()
+    if any(resolved == root or root in resolved.parents for root in roots):
+        return True
+    # A directory holding only megakernel tests (`tests/models/<model>`).
+    if resolved.is_dir() and any(resolved in root.parents for root in roots):
+        return all(
+            any(root in t.parents for root in roots)
+            for t in resolved.rglob("test_*.py")
+        )
+    return False
 
 
 def _xla_cpu_initialized() -> bool:
@@ -387,6 +401,27 @@ def register_megakernel_cpu_plugin(config: pytest.Config) -> None:
 
 def pytest_configure(config: pytest.Config) -> None:
     register_megakernel_cpu_plugin(config)
+
+
+def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route the lazy vLLM loggers of the megakernel runtime and of any loaded
+    model folder (`vllm_torchtpu.models.*`) to `logging` when vLLM is absent
+    (CPU)."""
+    import importlib
+    import logging
+
+    importlib.import_module("vllm_torchtpu.megakernel.adapter.driver")
+    prefixes = ("vllm_torchtpu.megakernel.adapter.", "vllm_torchtpu.models.")
+    for name in sorted(sys.modules):
+        if not name.startswith(prefixes):
+            continue
+        lazy = getattr(sys.modules[name], "logger", None)
+        if not callable(getattr(lazy, "_resolve", None)):
+            continue
+        try:
+            lazy._resolve()
+        except ModuleNotFoundError:
+            monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))
 
 
 @pytest.fixture
