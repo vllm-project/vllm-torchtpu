@@ -1195,6 +1195,7 @@ def sparse_mla_attention_dcp(
     dcp_lane_ids: jax.Array | None = None,
     fused_merge: bool = False,
     merge_pieces: bool = True,
+    lane_split: bool = False,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1245,6 +1246,11 @@ def sparse_mla_attention_dcp(
       merge_pieces: TPU_DCP_MLA_MERGE_PIECES may split the output into the
         merge's chunks. False for a caller that reads it whole: joining the
         pieces is a copy.
+      lane_split: TPU_DCP_MLA_TOKEN_SPLIT, with `dcp_lane_ids`: `ql_nope` /
+        `q_pe` / the top-k are this lane's block of the bucket's tokens
+        (`kv_c_normed.shape[0] / lanes` rows starting at `lane * rows`); the
+        KV write still takes every token and the global metadata, the kernel
+        the lane-sliced `query_start_loc`.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1276,6 +1282,17 @@ def sparse_mla_attention_dcp(
             f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}."
         )
     num_tokens = ql_nope.shape[0]
+    if lane_split:
+        if send_layout or fused_exchange or dcp_lane_ids is None:
+            raise ValueError(
+                "lane_split needs dcp_lane_ids and excludes send_layout and "
+                "fused_exchange"
+            )
+        if kv_c_normed.shape[0] % num_tokens:
+            raise ValueError(
+                f"lane_split: {kv_c_normed.shape[0]} KV rows are not a whole "
+                f"number of {num_tokens}-token lane blocks"
+            )
     if local_topk_indices.shape[0] != dcp_size * num_tokens:
         raise ValueError(
             "local_topk_indices must carry one row per (rank, token): "
@@ -1374,7 +1391,7 @@ def sparse_mla_attention_dcp(
         # then this shard's DCP rank (TPU_DCP_RANK_OPERAND), then its lane
         # (TPU_MLA_FUSED_SMALL_A2A).
         rope_table_ = extra_[0] if q_rope else None
-        dcp_lane = extra_[-1][0] if fused_exchange else None
+        dcp_lane = extra_[-1][0] if fused_exchange or lane_split else None
         # TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: whether this bucket (static T)
         # runs the exchange inside the kernel or by the separate small a2a.
         fuse_here = bool(
@@ -1534,6 +1551,17 @@ def sparse_mla_attention_dcp(
         # TPU_DCP_MLA_MERGE_PIECES: one output buffer per merge chunk, so the
         # merge's reduce-scatter k waits only for the attention chunks that
         # produce its rows (mixed buckets with the in-kernel lse mask).
+        attn_qsl = query_start_loc_
+        if lane_split:
+            # This lane's tokens keep their positions; the KV write above
+            # used the global metadata.
+            assert dcp_lane is not None
+            _, attn_qsl = streamindex_topk.metadata.lane_slice_q_metadata(
+                seq_lens_,
+                query_start_loc_,
+                dcp_lane.astype(jnp.int32) * num_tokens,
+                num_tokens,
+            )
         out_pieces = 0
         if (
             merge_pieces
@@ -1554,7 +1582,7 @@ def sparse_mla_attention_dcp(
             kv_cache_rope,
             topk_idx,
             local_block_tables,
-            query_start_loc_,
+            attn_qsl,
             request_distribution_,
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
@@ -1661,7 +1689,7 @@ def sparse_mla_attention_dcp(
     rank_args = () if dcp_rank_ids is None else (dcp_rank_ids,)
     if rank_args:
         in_specs = in_specs + (P(dcp_axis_name),)
-    if fused_exchange:
+    if fused_exchange or lane_split:
         rank_args = rank_args + (dcp_lane_ids,)
         in_specs = in_specs + (P(dcp_axis_name),)
     return jax.jit(

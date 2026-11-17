@@ -252,7 +252,7 @@ def harness(monkeypatch):
 
     monkeypatch.setattr(moe_tp_decode, "_selftest", selftest)
     monkeypatch.setattr(moe_tp_decode, "_RANK_BUFFER", None)
-    monkeypatch.setattr(moe_tp_decode, "_SELFTEST_DONE", False)
+    monkeypatch.setattr(moe_tp_decode, "_SELFTESTED_BUCKETS", set())
     monkeypatch.setattr(moe_tp_decode, "logger", _Log(h.logs))
     return h
 

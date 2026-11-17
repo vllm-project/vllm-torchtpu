@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
+    TPU_DCP_MLA_TOKEN_SPLIT: bool = False
+    TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS: int = 1024
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
@@ -117,6 +119,9 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_FAST: bool = True
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
+    USE_MOE_TP_DECODE_NVFP4_KERNEL: bool = False
+    FUSED_MOE_PREFILL_NVFP4_KERNEL: bool = False
+    FUSED_MOE_PREFILL_NVFP4_ACT_MODE: str = "w4a16"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -175,6 +180,9 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = True
     TPU_DCP_INDEXER_HIST_MERGE: bool = True
+    TPU_DCP_INDEXER_LANE_SPLIT: bool = False
+    TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS: int = 512
+    TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
@@ -810,6 +818,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=False
     ),
+    # Prototype. Backbone prefill buckets of at least
+    # TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS split their query tokens over the DCP
+    # lanes (tp // dcp > 1) instead of the heads: each lane attends its half of
+    # the tokens with every head (64-head q_b / W_UK_T / W_UV copies built at
+    # load, in an order that makes the DCP reduce-scatter plus a lane
+    # all-to-all land each rank on its o_proj heads), so the per-token KV
+    # gather is not repeated on every lane. Needs TPU_DCP_INDEXER_LANE_SPLIT,
+    # TPU_DCP_INDEXER_HIST_MERGE and TPU_DCP_RANK_OPERAND (raises otherwise);
+    # without query replication or with one lane (tp == dcp) it is off, with a
+    # warning. Its buckets always apply W_UV before the DCP merge. Exclusive
+    # with TPU_DCP_MLA_OPROJ_ALL_REDUCE.
+    # Costs one 64-head q_b, W_UK_T and W_UV per layer of HBM.
+    "TPU_DCP_MLA_TOKEN_SPLIT": env_bool("TPU_DCP_MLA_TOKEN_SPLIT", default=False),
+    # Smallest padded token bucket that takes TPU_DCP_MLA_TOKEN_SPLIT.
+    "TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS", 1024
+    ),
     # Its o_proj and all-reduce run in chunks of this many tokens (a multiple
     # of 128), pipelined: each chunk's all-reduce under the next chunk's
     # o_proj. 0 = one chunk. A 512-token chunk's all-reduce is 6 MiB, over the
@@ -1195,6 +1220,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     .strip()
     .lower(),
+    # Serve eligible NVFP4 TP or EP x TP (TPU_MOE_EP_TP_SIZE) MoE layers
+    # (sigmoid + correction-bias top-k with renormalization, one FP8 shared
+    # expert, W4A8 block-quantized routed weights) with one op covering
+    # routing, the shared expert, the routed experts and the all-reduce up to
+    # 64 tokens, and the GMM path plus a psum above that
+    # (layers/adapter/moe_tp_decode_nvfp4.py). Also clamps
+    # MOE_REQUANTIZE_BLOCK_SIZE per matrix on non-EP-fused NVFP4 MoE layers
+    # (b13=512, b2=min(512, I_rank): 512/512 at EP2xTP4, 512/256 at TP8) so TP
+    # slices narrower than the block stay unpadded. Needs
+    # TPU_MOE_SKIP_PADDED_TOKENS=1. Remove once the path is the default for
+    # these layers or is folded into moe_tp_decode.
+    "USE_MOE_TP_DECODE_NVFP4_KERNEL": env_bool("USE_MOE_TP_DECODE_NVFP4_KERNEL"),
+    # With USE_MOE_TP_DECODE_NVFP4_KERNEL: serve mixed / prefill buckets at or
+    # above the mode's measured crossover (2048 tokens for w4a16, 512 for w4a8)
+    # on admitted NVFP4 TP or EP x TP MoE layers with fused_moe_prefill_nvfp4
+    # (Stage A) inside the same jax_op instead of the GMM + shared-expert TP
+    # chain plus psum. Default off.
+    "FUSED_MOE_PREFILL_NVFP4_KERNEL": env_bool("FUSED_MOE_PREFILL_NVFP4_KERNEL"),
+    # Activation mode for fused_moe_prefill_nvfp4 when
+    # FUSED_MOE_PREFILL_NVFP4_KERNEL=1: "w4a16" (default, BF16 activations and
+    # BF16 x BF16 MXU dots at >= 2048 tokens) or "w4a8" (per-row FP8
+    # activations and FP8 x FP8 MXU dots at >= 512 tokens).
+    "FUSED_MOE_PREFILL_NVFP4_ACT_MODE": env_with_choices(
+        "FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a16", ["w4a16", "w4a8"]
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -1475,6 +1525,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep the all-gather merge: there the exchange rounds' latency outweighs
     # the merge they save.
     "TPU_DCP_INDEXER_HIST_MERGE": env_bool("TPU_DCP_INDEXER_HIST_MERGE", default=True),
+    # Split each large bucket's query tokens over the DCP lanes (tp // dcp > 1),
+    # which hold replicas of one KV shard; a lane all-gather restores them.
+    "TPU_DCP_INDEXER_LANE_SPLIT": env_bool("TPU_DCP_INDEXER_LANE_SPLIT", default=False),
+    # With the hist merge, all-gather each top-k chunk's rows over the lanes
+    # instead of once at the end; the gathers then fill the wait on the last
+    # chunk's SparseCore top-k. Same result.
+    "TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER": env_bool(
+        "TPU_DCP_INDEXER_LANE_SPLIT_CHUNK_GATHER", default=False
+    ),
+    # Smallest padded token bucket that takes TPU_DCP_INDEXER_LANE_SPLIT.
+    "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_INDEXER_LANE_SPLIT_MIN_TOKENS", 512
+    ),
     # Smallest padded token bucket that takes the all-to-all merge when
     # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
     # variant picks one merge with no runtime cost.
