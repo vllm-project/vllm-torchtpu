@@ -891,6 +891,24 @@ def _int_metas():
     }
 
 
+def test_input_delta_names_the_earlier_trace_for_an_input_only_this_one_takes():
+    metas = _int_metas()
+    sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
+    stored = _int_graph(["s_pos", "hidden", "weight"], metas, sources)
+    current = _int_graph(["s_pos", "s_hid", "hidden", "weight"], metas, sources)
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    named = str(info.value).split("Named, this trace: ")[1]
+    assert named.startswith("s_hid SymInt")
+    # What the earlier trace's ShapeEnv knows of the symbol s_hid reads.
+    assert "in the earlier trace" in named
+    assert "in this trace" not in named
+
+
 def test_input_delta_names_the_int_input_one_trace_dropped():
     metas = _int_metas()
     sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}

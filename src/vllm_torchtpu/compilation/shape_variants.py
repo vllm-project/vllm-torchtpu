@@ -264,9 +264,12 @@ def _describe_input(graph_input: _Input) -> str:
     return " ".join(parts)
 
 
-def _symbol_fate(inputs: Sequence[_Input], source: str | None) -> str | None:
-    """What a trace's ShapeEnv concluded about the symbol read from ``source``:
-    its replacement when it was specialized, else its value range."""
+def _symbol_fate(
+    inputs: Sequence[_Input], source: str | None, trace: str
+) -> str | None:
+    """What the ShapeEnv of the trace ``inputs`` came from concluded about the
+    symbol read from ``source``: its replacement when it was specialized, else
+    its value range. ``trace`` names that trace in the text."""
     if source is None:
         return None
     shape_env = None
@@ -284,10 +287,10 @@ def _symbol_fate(inputs: Sequence[_Input], source: str | None) -> str | None:
         if any(_source_name(s) == source for s in sources):
             replacement = shape_env.replacements.get(symbol)
             if replacement is not None:
-                return f"{symbol} = {replacement} in this trace"
+                return f"{symbol} = {replacement} in {trace}"
             value_range = shape_env.var_to_range.get(symbol)
-            return f"{symbol} in {value_range} in this trace"
-    return f"no symbol of this trace reads {source}"
+            return f"{symbol} in {value_range} in {trace}"
+    return f"no symbol of {trace} reads {source}"
 
 
 def _signature_delta(stored: Sequence[Any], current: Sequence[Any]) -> str:
@@ -327,12 +330,12 @@ def _input_delta(stored: Sequence[_Input], current: Sequence[_Input]) -> str:
                 inputs.append(graph_input)
         return inputs
 
-    def render(inputs: list[_Input], other: Sequence[_Input]) -> str:
+    def render(inputs: list[_Input], other: Sequence[_Input], other_trace: str) -> str:
         shown = []
         for graph_input in inputs[:_NAMED_INPUTS_SHOWN]:
             text = _describe_input(graph_input)
             if _is_int_input(graph_input.value):
-                fate = _symbol_fate(other, _input_source(graph_input))
+                fate = _symbol_fate(other, _input_source(graph_input), other_trace)
                 if fate:
                     text += f" ({fate})"
             shown.append(text)
@@ -343,9 +346,11 @@ def _input_delta(stored: Sequence[_Input], current: Sequence[_Input]) -> str:
     only_stored = unmatched(stored, current)
     only_current = unmatched(current, stored)
     if only_stored:
-        delta += f". Named, earlier trace: {render(only_stored, current)}"
+        named = render(only_stored, current, "this trace")
+        delta += f". Named, earlier trace: {named}"
     if only_current:
-        delta += f". Named, this trace: {render(only_current, stored)}"
+        named = render(only_current, stored, "the earlier trace")
+        delta += f". Named, this trace: {named}"
     return delta
 
 
