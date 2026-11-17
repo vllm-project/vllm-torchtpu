@@ -37,8 +37,9 @@ prefetches remote KV for waiting requests past a full running set
 (``kv_prefetch``, which lifts ``max_num_active_reqs`` for vLLM's waiting loop
 and enforces the cap itself) and, with decode context parallelism, throttles
 how many remote loads it admits (``decode_inflight_throttle``, through the
-async-load block reservation); a KV producer sorts the head of the waiting
-queue.
+async-load block reservation). The waiting-queue sort helpers below are for
+the pipeline-parallel prefill scheduler (#3090); this scheduler does not
+sort.
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -206,7 +207,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._hit_estimator: ExternalHitEstimator | None = (
             self.connector if isinstance(self.connector, ExternalHitEstimator) else None
         )
-        self._init_paw_sort()
         self._init_kv_prefetch()
 
         logger.info(
@@ -377,11 +377,15 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
 
     # ------------------------------------------------------------------
-    # Waiting-queue sort (on for a KV producer).
+    # Waiting-queue sort, for the pipeline chunk scheduler's prefix-aware
+    # admission (#3090), which borrows these helpers and turns the sort on
+    # for a KV producer together with its aging rate. PrefixAwareScheduler
+    # itself does not sort: none of its legs ran the sort, and without an
+    # aging rate a large prompt could be overtaken without bound.
     #
     # ``_promote_warmest`` moves one request per queue to the head. With the
-    # sort on, ``schedule()`` also stable-sorts the first
-    # _PAW_SORT_WINDOW requests of ``waiting`` before the base
+    # sort on, the borrowing scheduler's ``schedule()`` also stable-sorts the
+    # first _PAW_SORT_WINDOW requests of ``waiting`` before the base
     # scheduler admits from it, so every admission of the step follows the
     # order. The key is the request's estimated uncached prompt tokens
     # (prompt minus local HBM hit minus a loadable external hit) minus
@@ -749,15 +753,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         prefilling = [r for r in self.running if not _is_decoding(r)]
         if prefilling and decoding:
             self.running[:] = decoding + prefilling
-        if getattr(self, "_paw_sort", False):
-            try:
-                self._sort_waiting_queue()
-            except Exception:
-                logger.exception(
-                    "PrefixAwareScheduler: waiting-queue sort failed; turning "
-                    "the sort off."
-                )
-                self._paw_sort = False
         self._step_wait_event = None
         waiting_at_start = len(self.waiting)
         if getattr(self, "_memo_xstep", False):
