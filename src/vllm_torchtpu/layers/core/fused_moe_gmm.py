@@ -575,7 +575,7 @@ _UPCAST_MIN_ROWS = 4096
 def shared_expert_xla(x, sw1, ss1, sw2, ss2) -> jax.Array:
     """A dense SwiGLU-OAI shared expert slice (e4m3 [K, 2Fs] / [Fs, N] with
     f32 [1, n] power-of-two column scales) with the torch MLP's roundings:
-    bf16 matmul results times the scale, the activation in bf16."""
+    bf16 matmul results times the scale, the activation rounded once to bf16."""
     bf = jnp.bfloat16
 
     def weight(w):
@@ -589,9 +589,9 @@ def shared_expert_xla(x, sw1, ss1, sw2, ss2) -> jax.Array:
     fs = sw2.shape[0]
     gu = jnp.matmul(x, weight(sw1), preferred_element_type=jnp.float32)
     gu = gu.astype(bf) * ss1.astype(bf)
-    gate = jnp.minimum(gu[:, :fs], bf(7.0))
-    up = jnp.clip(gu[:, fs:], bf(-7.0), bf(7.0))
-    h = gate * jax.nn.sigmoid(bf(1.702) * gate) * (up + bf(1.0))
+    gate = jnp.minimum(gu[:, :fs].astype(jnp.float32), 7.0)
+    up = jnp.clip(gu[:, fs:].astype(jnp.float32), -7.0, 7.0)
+    h = (gate * jax.nn.sigmoid(1.702 * gate) * (up + 1.0)).astype(bf)
     y = jnp.matmul(h, weight(sw2), preferred_element_type=jnp.float32)
     return y.astype(bf) * ss2.astype(bf)
 

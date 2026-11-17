@@ -32,7 +32,7 @@ issued before the routed chunks, and it is computed at the first routed chunk,
 while the next chunks stream, so the shared expert costs its weight bytes in
 the same stream and no separate weight-bound call. Its roundings follow the
 torch shared MLP: bf16 matmul results times the power-of-two column scale, the
-SwiGLU-OAI activation in bf16, bf16 out.
+SwiGLU-OAI activation from those bf16 values rounded once to bf16, bf16 out.
 
 Numerics equal gmm_v2's fp8 rhs feed (decode tiles, at most
 FP8_RHS_MAX_BUCKET_M... per tile there; here any bucket, rows are independent):
@@ -213,10 +213,11 @@ def _shared_expert(sh, fuse_act: str):
                 jnp.bfloat16
             )
 
-        gate = jnp.minimum(proj(0, fs), jnp.bfloat16(7.0))
-        up = jnp.clip(proj(fs, fs), jnp.bfloat16(-7.0), jnp.bfloat16(7.0))
-        glu = gate * jax.nn.sigmoid(jnp.bfloat16(1.702) * gate)
-        h = glu * (up + jnp.bfloat16(1.0))
+        # The activation runs in f32 and rounds once, as XLA's fusion of the
+        # bf16 elementwise chain does.
+        gate = jnp.minimum(proj(0, fs).astype(jnp.float32), 7.0)
+        up = jnp.clip(proj(fs, fs).astype(jnp.float32), -7.0, 7.0)
+        h = (gate * jax.nn.sigmoid(1.702 * gate) * (up + 1.0)).astype(jnp.bfloat16)
         ncol = math.gcd(n, _ACT_COLS)
         for c0 in range(0, n, ncol):
             y = jnp.matmul(

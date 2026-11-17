@@ -117,9 +117,9 @@ def _shared_reference(xt, sw1, ss1, sw2, ss2):
     fs = sw2.shape[0]
     gu = jnp.matmul(xt, sw1.astype(bf), preferred_element_type=jnp.float32)
     gu = gu.astype(bf) * ss1.astype(bf)
-    gate = jnp.minimum(gu[:, :fs], bf(7.0))
-    up = jnp.clip(gu[:, fs:], bf(-7.0), bf(7.0))
-    h = gate * jax.nn.sigmoid(bf(1.702) * gate) * (up + bf(1.0))
+    gate = jnp.minimum(gu[:, :fs].astype(jnp.float32), 7.0)
+    up = jnp.clip(gu[:, fs:].astype(jnp.float32), -7.0, 7.0)
+    h = (gate * jax.nn.sigmoid(1.702 * gate) * (up + 1.0)).astype(bf)
     y = jnp.matmul(h, sw2.astype(bf), preferred_element_type=jnp.float32)
     return np.asarray((y.astype(bf) * ss2.astype(bf)).astype(jnp.float32))
 
@@ -167,10 +167,10 @@ def test_stream_shared_expert(group_sizes, tp):
     sh = np.asarray(sh.astype(jnp.float32))
     scale = np.abs(ref).max()
     assert scale > 0
-    # bf16 activation roundings may differ by an ulp (XLA keeps excess
-    # precision in fused elementwise chains); the outputs agree to bf16.
+    # f32 sums over different k splits may round to neighbouring bf16 values.
     assert np.abs(sh - ref).max() <= 1e-2 * scale
     assert np.abs(sh - ref).mean() <= 1e-3 * scale
+    assert np.mean(sh == ref) > 0.9
 
 
 def test_shared_eligible_rejects():
