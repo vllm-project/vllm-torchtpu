@@ -98,6 +98,9 @@ REPLACED_ENV = {
     "spec_draft_bucket_step": "TPU_DRAFT_BUCKET_STEP",
     "spec_synthetic_row_split": "TPU_SPEC_SYNTHETIC_ROW_SPLIT",
     "spec_sampler_top_p_kernel": "TPU_SAMPLER_TOP_P_KERNEL",
+    # --- v7 offload ---
+    "offload_max_inflight_load_mib": "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB",
+    "offload_max_inflight_store_mib": "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -141,6 +144,9 @@ SAMPLE = {
     "prefill_tpot_max_hold_s": 10.0,
     # --- v7 runner/spec ---
     "spec_draft_bucket_step": 32,
+    # --- v7 offload ---
+    "offload_max_inflight_load_mib": 128,
+    "offload_max_inflight_store_mib": 64,
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {

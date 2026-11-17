@@ -340,6 +340,17 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # compiled online, no H2D copies behind KV-offload loads. Host-side;
     # bitwise (the TPU samplers read the CPU sampling tensors).
     "skip_device_sampling_metadata": False,
+    # --- v7 offload ---
+    # Raiden KV offload: MiB of one worker's KV that local offload loads may
+    # have in flight at once (0 = no bound). A larger load is split and lands
+    # over several scheduler steps, so the step's own input uploads (which
+    # queue behind issued host->HBM copies) wait less. Host-only, bitwise.
+    "offload_max_inflight_load_mib": 0,
+    # Raiden KV offload: MiB of one worker's KV that offload saves may have
+    # in flight at once (0 = no bound). A store job runs as pieces of whole
+    # keys (each its own insert + save), so the next forward's KV write waits
+    # behind fewer issued HBM reads. Host-only, bitwise.
+    "offload_max_inflight_store_mib": 0,
 }
 
 
