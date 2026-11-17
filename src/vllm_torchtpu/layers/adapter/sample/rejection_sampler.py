@@ -810,6 +810,22 @@ def _fused_spec_verify_and_sample_candidates(
     all_top_k = torch.index_select(req_top_k, 0, param_indices)
     all_top_p = torch.index_select(req_top_p, 0, param_indices)
 
+    # Temperature scaling cannot resolve greedy ties, so greedy rows of a mixed
+    # batch decide by the first argmax instead, as in
+    # _random_rejection_sample_with_segment: the tied candidate with the
+    # lowest token id, which is the full vocabulary's first argmax.
+    is_greedy = all_temps.reshape(-1) == 0
+    max_cand_logits = all_cand_logits.max(dim=-1, keepdim=True).values
+    greedy_token_ids = (
+        torch.where(
+            all_cand_logits == max_cand_logits,
+            all_cand_token_ids,
+            torch.iinfo(all_cand_token_ids.dtype).max,
+        )
+        .min(dim=-1)
+        .values
+    )
+
     scaled_cand = all_cand_logits.to(torch.float32) / (
         all_temps.to(torch.float32) + TEMPERATURE_EPS
     )
@@ -837,11 +853,16 @@ def _fused_spec_verify_and_sample_candidates(
     bonus_token_ids = torch.gather(
         all_cand_token_ids[:batch_size], 1, bonus_cand_idx
     ).squeeze(1)
+    bonus_token_ids = torch.where(
+        is_greedy[:batch_size], greedy_token_ids[:batch_size], bonus_token_ids
+    )
 
     target_probs = probs[batch_size:]
     target_cand_logits = all_cand_logits[batch_size:]
     target_cand_token_ids = all_cand_token_ids[batch_size:]
     target_inv_exp_noise = inv_exp_noise[batch_size:]
+    target_is_greedy = is_greedy[batch_size:]
+    target_greedy_token_ids = greedy_token_ids[batch_size:]
 
     valid_draft_token_ids = draft_token_ids >= 0
     draft_token_ids_i32 = draft_token_ids.to(torch.int32)
@@ -857,7 +878,15 @@ def _fused_spec_verify_and_sample_candidates(
         target_token_probs = (target_probs * draft_match.to(target_probs.dtype)).sum(
             dim=-1
         )
-        accepted = (target_token_probs >= accept_u) & valid_draft_token_ids
+        # Accept iff u < p(x): torch.rand can return exactly 0.0, and
+        # u <= p(x) would then accept a draft with p(x) == 0 (outside the
+        # candidates or masked by top-k), as main's sampler notes.
+        accepted = torch.where(
+            target_is_greedy,
+            draft_token_ids_i32 == target_greedy_token_ids,
+            accept_u < target_token_probs,
+        )
+        accepted = accepted & valid_draft_token_ids
 
     recovered_probs = torch.where(
         draft_match, torch.zeros_like(target_probs), target_probs
@@ -869,6 +898,9 @@ def _fused_spec_verify_and_sample_candidates(
     recovered_token_ids = torch.gather(
         target_cand_token_ids, 1, chosen_cand_idx
     ).squeeze(1)
+    recovered_token_ids = torch.where(
+        target_is_greedy, target_greedy_token_ids, recovered_token_ids
+    )
 
     return _assemble_output_tokens(
         draft_token_ids=draft_token_ids,
