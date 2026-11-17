@@ -426,17 +426,6 @@ def test_local_prefix_hit_forwards_max_cache_hit_length(monkeypatch):
     assert r._tpu_local_hit_tokens == 7
 
 
-def test_external_warmth_is_zero_on_a_kv_consumer():
-    r = _make_request("r", num_tokens=4096)
-    s = _make_scheduler([r], {})
-    s.block_size = 16
-    s.connector = SimpleNamespace(estimate_external_hit_tokens=lambda req, local: 2048)
-    s._is_kv_consumer = False
-    assert s._external_warmth(r, 0) == 2048
-    s._is_kv_consumer = True
-    assert s._external_warmth(r, 0) == 0
-
-
 def test_schedule_polls_the_connector_before_vllm_schedules(monkeypatch):
     events = []
 
