@@ -235,6 +235,21 @@ def test_builder_binds_the_tuned_tiles(
     assert _rpa_call_kwargs(monkeypatch, rpa[1], 9) == {"tuned_tiles": True}
 
 
+def test_builder_binds_the_skip_on_its_own(
+    monkeypatch, registered, cpu_vllm_config_context
+):
+    default, skip = _batched_impl(), _batched_impl()
+    skip.skip_empty_mixed = True
+    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
+        d_op = default._build_rpa_kernel(None, None, None)
+        s_op = skip._build_rpa_kernel(None, None, None)
+    assert d_op is not s_op
+    rpa = [fn for n, fn in registered if n.startswith("pallas::rpa_kernel")]
+    assert [fn.keywords["skip_empty_mixed"] for fn in rpa] == [False, True]
+    assert [fn.keywords["tuned_tiles"] for fn in rpa] == [False, False]
+    assert _rpa_call_kwargs(monkeypatch, rpa[1], 9) == {"skip_empty_mixed": True}
+
+
 # --- torch_tpu's own signature check on the built kernel entries -------------
 
 

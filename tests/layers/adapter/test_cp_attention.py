@@ -234,11 +234,13 @@ def test_dcp_forward_reuses_the_ops_built_with_the_layer_modes_and_tiles(
     # As the model's settings and tile rule set them before the kernels are built.
     impl.attention_modes = modes
     impl.tuned_tiles = True
+    impl.skip_empty_mixed = True
     with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
         impl.initialize_kernel(layer)
     assert len(built) == 2
     assert all(fn.keywords["attention_modes"] == modes for fn in built)
     assert all(fn.keywords["tuned_tiles"] is True for fn in built)
+    assert all(fn.keywords["skip_empty_mixed"] is True for fn in built)
 
     metadata = SimpleNamespace(
         seq_lens=torch.tensor([2, 3, 4], dtype=torch.int32),
