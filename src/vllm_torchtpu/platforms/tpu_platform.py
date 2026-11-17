@@ -855,12 +855,12 @@ class TpuPlatform(Platform):
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
         collectives_options.validate(vllm_config)
-        # API-server patches from additional_config["tpu_frontend"] (all off by
-        # default). This runs in every process that builds the engine config,
-        # including each API server, before the renderer exists.
+        # Reject a bad tpu_frontend section here, where the config is first
+        # known, rather than at a patch's install. Its patches install from
+        # patch_registry below.
         from vllm_torchtpu import frontend_options
 
-        frontend_options.install(vllm_config)
+        frontend_options.get(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
@@ -868,7 +868,9 @@ class TpuPlatform(Platform):
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
         patch_registry.apply(
-            "platform_activation", model_config=vllm_config.model_config
+            "platform_activation",
+            model_config=vllm_config.model_config,
+            vllm_config=vllm_config,
         )
         _register_tpu_kv_connectors()
         # Apply before VllmConfig is pickled so EngineCore and all workers see
