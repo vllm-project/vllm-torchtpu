@@ -13,21 +13,37 @@
 # limitations under the License.
 """All-reduce of a small bf16 [rows, hidden] block as one Pallas kernel.
 
-one-shot      Every core pushes its whole block to every other core and
-              sums the arrivals locally (XOR static-slot addressing on 8
-              cores eliminates @pl.when branches and self-copies).
-hier-halves   On 8 cores (4 chips x 2 cores/chip), intra-chip reduce-scatter
-              of (rows, hidden/2) with twin `me ^ 1`, 4-chip all-reduce of
-              (rows, hidden/2) across `me ^ {2, 4, 6}`, then intra-chip
-              all-gather with `me ^ 1` (5 DMAs total, used at rows == 8).
-two-shot      Core j owns columns [j * own, (j + 1) * own). Every core
-              pushes each owner its columns; the owner sums them and pushes
-              the sum back to everyone (used for 8 < rows < 24).
-hier-2stage   On 8 cores (rows >= 24), 4-step hierarchical reduce-scatter +
+``dispatch_form_for`` picks the form from the block's bytes per core and, on
+8 cores, its row count:
+
+one-shot      Blocks of at most ONE_SHOT_MAX_BYTES. Every core pushes its
+              whole block to every other core and sums the arrivals locally
+              (on 8 cores the XOR form, whose static-slot addressing
+              eliminates @pl.when branches and self-copies).
+hier-halves   8 cores, a block of exactly 8 rows above ONE_SHOT_MAX_BYTES.
+              Intra-chip reduce-scatter of (rows, hidden/2) with twin
+              `me ^ 1`, 4-chip all-reduce of (rows, hidden/2) across
+              `me ^ {2, 4, 6}`, then intra-chip all-gather with `me ^ 1`
+              (5 DMAs total).
+two-shot      The other blocks above ONE_SHOT_MAX_BYTES: on 8 cores those
+              of fewer than HIER_2STAGE_MIN_ROWS rows, other than 8; on any
+              other core count, all of them. Core j owns columns
+              [j * own, (j + 1) * own). Every core pushes each owner its
+              columns; the owner sums them and pushes the sum back to
+              everyone.
+hier-2stage   8 cores, blocks of at least HIER_2STAGE_MIN_ROWS rows above
+              ONE_SHOT_MAX_BYTES. 4-step hierarchical reduce-scatter +
               all-gather: intra-chip RS (rows, hidden/2) with `me ^ 1` ->
               4-chip RS (rows, hidden/8) with `me ^ {2, 4, 6}` -> 4-chip AG
               -> intra-chip AG. Cuts inter-chip DMA count and inter-chip
               bytes in half compared to flat two-shot.
+
+The hierarchical forms take mesh indices 2k and 2k + 1 to be the two cores of
+one chip, as on a TPU7x host. That placement only makes them fast: on any
+other, every core's block is still summed exactly once. They round the
+intra-chip partial sums to the input dtype before the inter-chip stage, so a
+result is rounded twice (the bound the kernel tests check); the flat forms sum
+in float32 and round once.
 """
 
 import jax.numpy as jnp
@@ -56,13 +72,10 @@ HIER_2STAGE_MIN_ROWS = 24
 COLLECTIVE_ID = 5
 
 
-def form_for(rows, hidden, itemsize):
-    """The form for a block of rows x hidden elements of itemsize bytes."""
-    return "oneshot" if rows * hidden * itemsize <= ONE_SHOT_MAX_BYTES else "twoshot"
-
-
 def dispatch_form_for(rows, hidden, itemsize, num_cores=8):
-    """Topology-aware form selector for `num_cores == 8` (tpu7x-8)."""
+    """The form for a block of rows x hidden elements of itemsize bytes: the
+    topology-aware forms on 8 cores (4 chips x 2 cores, a TPU7x host), one-shot
+    or two-shot on other core counts."""
     if rows * hidden * itemsize <= ONE_SHOT_MAX_BYTES:
         return "oneshot_xor" if num_cores == 8 else "oneshot"
     if num_cores == 8:
@@ -71,15 +84,6 @@ def dispatch_form_for(rows, hidden, itemsize, num_cores=8):
         if rows >= HIER_2STAGE_MIN_ROWS:
             return "hier_2stage"
     return "twoshot"
-
-
-form_for_8cores = dispatch_form_for
-
-
-def reference(blocks):
-    """The float32 sum over the cores' blocks [cores, rows, hidden], rounded
-    once to the blocks' dtype."""
-    return jnp.sum(blocks.astype(jnp.float32), axis=0).astype(blocks.dtype)
 
 
 def _oneshot(x, n, axis, rank, collective_id):
@@ -533,11 +537,21 @@ def small_all_reduce(
     form = form or dispatch_form_for(
         rows, hidden, jnp.dtype(x.dtype).itemsize, num_cores
     )
-    build = {
+    builds = {
         "oneshot": _oneshot,
         "oneshot_xor": _oneshot_xor,
         "hier_halves": _hier_halves_col_zcopy,
         "twoshot": _twoshot,
         "hier_2stage": _hier_2stage_rs_ag,
-    }[form]
-    return build(x, num_cores, axis, rank, collective_id)
+    }
+    if form not in builds:
+        raise ValueError(f"unknown all-reduce form {form!r}; use one of {list(builds)}")
+    if form in ("hier_halves", "hier_2stage") and num_cores != 8:
+        raise ValueError(f"the {form!r} all-reduce runs on 8 cores, not {num_cores}")
+    if form == "oneshot_xor" and num_cores & (num_cores - 1):
+        # me ^ k for k in 1..n-1 reaches every other core only for a power of 2.
+        raise ValueError(
+            f"the 'oneshot_xor' all-reduce needs a power-of-two core count, "
+            f"not {num_cores}"
+        )
+    return builds[form](x, num_cores, axis, rank, collective_id)

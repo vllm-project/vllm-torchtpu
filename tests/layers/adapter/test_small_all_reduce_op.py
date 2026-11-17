@@ -209,6 +209,61 @@ def test_prebuild_builds_the_ops_when_the_setting_is_on(monkeypatch):
         op.prebuild(ON)
 
 
+@pytest.fixture
+def prebuild_on_a_host(monkeypatch):
+    """prebuild over a stand-in 8-core EP mesh whose DP and TP groups are the
+    mesh; returns the block order the reduce-scatter op was built with."""
+    from vllm.distributed import parallel_state
+
+    group = SimpleNamespace(ranks=list(MESH))
+    built = []
+    monkeypatch.setattr(
+        op, "build_ep_mesh", lambda: SimpleNamespace(shape={op.EP_AXIS_NAME: CORES})
+    )
+    monkeypatch.setattr(op, "get_ep_group", lambda: group)
+    monkeypatch.setattr(op, "ep_mesh_index", lambda: 2)
+    monkeypatch.setattr(op, "_rank_tensor", lambda i: torch.tensor([i]))
+    monkeypatch.setattr(op, "_build_all_reduce", lambda mesh: Mock())
+    monkeypatch.setattr(
+        op, "_build_reduce_scatter", lambda mesh, order: built.append(order) or Mock()
+    )
+    monkeypatch.setattr(parallel_state, "get_dp_group", lambda: group)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    for name, value in [
+        ("_AR_OP", None),
+        ("_RS_OP", None),
+        ("_RANK", None),
+        ("_CORES", 0),
+        ("_MESH_RANKS", ()),
+        ("_DP_COMBINE", False),
+    ]:
+        monkeypatch.setattr(op, name, value)
+    return built
+
+
+@pytest.mark.parametrize(
+    "mesh_order,block_order",
+    [
+        # A TPU7x host's mesh in device-id order (the default): local ranks
+        # 0..7 sit on devices [0, 1, 4, 5, 6, 7, 2, 3].
+        ((0, 1, 6, 7, 2, 3, 4, 5), (0, 1, 6, 7, 2, 3, 4, 5)),
+        # A rank-ordered mesh (PCP, DCP or the sorted gather on).
+        (MESH, None),
+    ],
+)
+def test_the_combine_sends_each_dp_ranks_rows_to_its_mesh_core(
+    prebuild_on_a_host, monkeypatch, mesh_order, block_order
+):
+    """The combine's block r is DP rank r's rows, and the mesh core at index i
+    serves EP (and DP) rank mesh_order[i], so core i must get block
+    mesh_order[i]; block r to core r hands engines each other's rows."""
+    monkeypatch.setattr(op, "ep_rank_order", lambda: mesh_order)
+    op.prebuild(ON)
+    assert prebuild_on_a_host == [block_order]
+    assert op._DP_COMBINE is True
+    assert op._RANK.tolist() == [2]
+
+
 def test_retain_is_the_identity_when_unarmed_or_outside_the_warmup(monkeypatch):
     x = _block(8)
     monkeypatch.setattr(op, "_RANK", None)

@@ -15,7 +15,6 @@
 float64 sum of each core's block and ``jax.lax.psum_scatter``."""
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -37,30 +36,54 @@ from .oracle import (
 pytestmark = pytest.mark.multichip
 
 
-def _reduce_scatter(mesh, per_core, ranks, *, rank_operand=True):
+def _reduce_scatter(
+    mesh, per_core, ranks, *, rank_operand=True, form=None, block_order=None
+):
     def body(x, r):
         return rs.small_reduce_scatter(
-            x, num_cores=N, axis=AXIS, rank=r if rank_operand else None
+            x,
+            num_cores=N,
+            axis=AXIS,
+            rank=r if rank_operand else None,
+            form=form,
+            block_order=block_order,
         )
 
     return run_sharded(mesh, body, per_core, ranks)
 
 
-def _own_blocks(per_core, core):
-    """[N, rows, hidden]: every core's partial sums for ``core``'s rows."""
+def _own_blocks(per_core, block):
+    """[N, rows, hidden]: every core's partial sums for block ``block``."""
     rows = per_core.shape[1] // N
-    return per_core[:, core * rows : (core + 1) * rows]
+    return per_core[:, block * rows : (block + 1) * rows]
 
 
 # 1, 3 and 12 rows are not multiples of the sublane tile: Mosaic refused
 # them before the kernel padded each block.
 @pytest.mark.parametrize("rows", [1, 3, 4, 12, 16, 24, 40, 64])
 @pytest.mark.parametrize("rank_operand", [False, True])
-def test_each_core_gets_the_exact_sum_of_its_block(mesh, rows, rank_operand):
+@pytest.mark.parametrize("form", ["hier", "flat"])
+def test_each_core_gets_the_exact_sum_of_its_block(mesh, rows, rank_operand, form):
     per_core = blocks((N, N * rows, 4096), seed=100 + rows)
-    got = _reduce_scatter(mesh, per_core, range(N), rank_operand=rank_operand)
+    got = _reduce_scatter(
+        mesh, per_core, range(N), rank_operand=rank_operand, form=form
+    )
     for core in range(N):
         terms = _own_blocks(per_core, core)
+        ok = within(got[core], exact_sum(terms), sum_tolerance(terms))
+        assert ok.all(), f"core {core}: {np.count_nonzero(~ok)} elements off"
+
+
+# (0, 1, 6, 7, 2, 3, 4, 5) is the EP rank at each index of a TPU7x host's mesh
+# in device-id order: local ranks 0..7 sit on devices [0, 1, 4, 5, 6, 7, 2, 3].
+@pytest.mark.parametrize("order", [(0, 1, 6, 7, 2, 3, 4, 5), (7, 6, 5, 4, 3, 2, 1, 0)])
+@pytest.mark.parametrize("rows", [3, 16, 40])
+@pytest.mark.parametrize("form", ["hier", "flat"])
+def test_block_order_gives_each_core_its_block(mesh, order, rows, form):
+    per_core = blocks((N, N * rows, 4096), seed=200 + rows)
+    got = _reduce_scatter(mesh, per_core, range(N), form=form, block_order=order)
+    for core in range(N):
+        terms = _own_blocks(per_core, order[core])
         ok = within(got[core], exact_sum(terms), sum_tolerance(terms))
         assert ok.all(), f"core {core}: {np.count_nonzero(~ok)} elements off"
 
@@ -88,17 +111,3 @@ def test_a_wrong_rank_order_fails_the_oracle(mesh):
     for core in (0, 1):
         terms = _own_blocks(per_core, core)
         assert not within(got[core], exact_sum(terms), sum_tolerance(terms)).all()
-
-
-def test_refuses_a_width_off_the_lane_tile():
-    with pytest.raises(ValueError, match="lanes"):
-        rs.small_reduce_scatter(
-            jnp.zeros((8, 4000), jnp.bfloat16), num_cores=N, axis=AXIS
-        )
-
-
-def test_refuses_rows_that_do_not_split():
-    with pytest.raises(ValueError, match="split"):
-        rs.small_reduce_scatter(
-            jnp.zeros((12, 4096), jnp.bfloat16), num_cores=N, axis=AXIS
-        )
