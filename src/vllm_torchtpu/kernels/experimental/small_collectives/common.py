@@ -44,22 +44,6 @@ def barrier(num_cores, axis, dict_ids):
     pl.semaphore_wait(sem, num_cores)
 
 
-def barrier_peers(me, xor_masks, axis, dict_ids):
-    """Every core signals its direct XOR communication peers ``me ^ m`` once
-    and waits for all of them. Sufficient whenever the set of direct DMA peers
-    is symmetric (`b == a ^ m <=> a == b ^ m`).
-    """
-    sem = pltpu.get_barrier_semaphore()
-    for m in xor_masks:
-        pl.semaphore_signal(
-            sem,
-            1,
-            device_id=peer(me ^ jnp.int32(m), axis, dict_ids),
-            device_id_type=MESH,
-        )
-    pl.semaphore_wait(sem, len(xor_masks))
-
-
 def wait_bytes_of(ref_slice, sem):
     """Block until ``sem`` has counted the bytes of ``ref_slice``."""
     pltpu.make_async_copy(ref_slice, ref_slice, sem).wait()
