@@ -809,6 +809,8 @@ def ragged_paged_attention(
         native_fp8_prefill: The same for the PREFILL and MIXED kernels (ROW
             or STATIC operands). Defaults to every operand off.
         decode_exp2: Run the DECODE softmax in base 2; see
+            `configs.ServingConfigs.decode_exp2`. Not applied with
+            return_lse. Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -886,6 +888,12 @@ def ragged_paged_attention(
     k_scale_tensor = dynamic_k_scale
     v_scale_tensor = dynamic_v_scale
 
+    if decode_exp2 and return_lse:
+        logger.warning_once(
+            "Batched RPA: decode_exp2 is not applied to calls that return the "
+            "LSE (such as the DCP passes), whose callers merge LSEs in natural "
+            "log; those calls keep the base-e decode softmax."
+        )
     serve_cfgs = configs.ServingConfigs(
         native_fp8=native_fp8,
         native_fp8_prefill=native_fp8_prefill,
