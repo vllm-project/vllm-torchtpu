@@ -7193,6 +7193,10 @@ class TPURaidenConnectorWorker:
             for req_id in ready:
                 self._stage3_terminal_loads.add(req_id)
                 self._reported_recving.add(req_id)
+                # A load accepted with an uncertain controller outcome is
+                # terminal now, as the regular poll treats a native done
+                # record; its deadline would otherwise fail it later.
+                self._stage3_pending_controller_failures.pop(req_id, None)
                 start_time = self._stage3_load_start_times.get(req_id)
                 latency_ms = (
                     (time.perf_counter() - start_time) * 1000
