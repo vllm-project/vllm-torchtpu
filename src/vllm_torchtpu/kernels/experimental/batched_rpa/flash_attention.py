@@ -29,6 +29,11 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
 
+def _native_fp8(cfgs: configs.RpaConfigs) -> configs.NativeFp8:
+    """The kernel's native fp8 matmuls: the serving modes in DECODE, else none."""
+    if cfgs.mode == configs.RpaCase.DECODE:
+        return cfgs.serve.native_fp8
+    return configs.NATIVE_FP8_OFF
 
 
 # Weight of the low fp8 half in a split (hi + lo / _SPLIT_LO) quantization.
@@ -132,6 +137,9 @@ def flash_attention_qk_softmax(
     diet = vpu_diet_enabled()
     folded_scale = q_folded_scale(cfgs) if diet else None
     row_scale = None
+    qk_operand = _native_fp8(cfgs).qk
+    native_qk = qk_operand is not configs.Fp8Operand.OFF
+    split_qk = qk_operand is configs.Fp8Operand.SPLIT
     folded_scale = q_folded_scale(cfgs) if (diet and not native_qk) else None
     if folded_scale is not None and folded_scale != 1.0:
         q = q * jnp.asarray(folded_scale, dtype=q.dtype)
@@ -262,6 +270,9 @@ def flash_attention_pv(
         p = p.astype(v_sc.dtype) * v_sc
 
     p_row_scale = None
+    pv_operand = _native_fp8(cfgs).pv
+    native_pv = pv_operand is not configs.Fp8Operand.OFF
+    split_pv = pv_operand is configs.Fp8Operand.SPLIT
     if native_pv:
         p, p_row_scale = _quantize_rows(p, v.dtype, split=split_pv)
     p_rows = 2 * tq if split_pv else tq
