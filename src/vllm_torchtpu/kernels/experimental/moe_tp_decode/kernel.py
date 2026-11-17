@@ -477,7 +477,7 @@ class _Ring(NamedTuple):
     descriptors of ring step `step`; quantize_x(x): x into xq_ref and xs_ref as
     gate_up reads it; gate_up(slot): the step's first matmul;
     finish(step, slot, acc1, expert_columns): its activation and second matmul
-    into owner_ref; run_slow(expert_columns): the schedule with fast=False.
+    into owner_ref. _kernel runs both schedules over these.
     """
 
     items: Any
@@ -486,7 +486,6 @@ class _Ring(NamedTuple):
     quantize_x: Callable[[Any], None]
     gate_up: Callable[[Any], Any]
     finish: Callable[[Any, Any, Any, Any], None]
-    run_slow: Callable[[Any], None]
 
 
 def _fp8_ring(r: _RingRefs, count, e0, *, fast: bool, n_chunks: int) -> _Ring:
@@ -602,40 +601,7 @@ def _fp8_ring(r: _RingRefs, count, e0, *, fast: bool, n_chunks: int) -> _Ring:
                 acc2 * r.s2_ref[slot, :, n : n + _N_CHUNK] * ms
             )
 
-    def run_slow(expert_columns):
-        @pl.when(items > 0)
-        def run_experts():
-            # The prime loop after the compaction started the first nb
-            # experts' copies.
-            for copy in transfers(jnp.int32(0)):
-                copy.wait()
-
-            def expert_body(step, acc1):
-                nxt = step + 1
-
-                @pl.when(nxt < items)
-                def wait_next():
-                    for copy in transfers(nxt):
-                        copy.wait()
-
-                # Issued before this expert's elementwise chain so the MXU and
-                # VPU overlap. On the last step it reads a stale slot; the
-                # result is dropped.
-                acc1_next = gate_up(nxt % nb)
-                finish(step, step % nb, acc1, expert_columns)
-
-                # This expert's slot is free once its second matmul has read
-                # it.
-                @pl.when(step + nb < items)
-                def refill():
-                    for copy in transfers(step + nb):
-                        copy.start()
-
-                return acc1_next
-
-            lax.fori_loop(0, items, expert_body, gate_up(0))
-
-    return _Ring(items, nb, transfers, quantize_x, gate_up, finish, run_slow)
+    return _Ring(items, nb, transfers, quantize_x, gate_up, finish)
 
 
 def _nvfp4_ring(
@@ -764,30 +730,7 @@ def _nvfp4_ring(
                 expert_columns,
             )
 
-    def run_slow(expert_columns):
-        @pl.when(items > 0)
-        def run_experts():
-            for copy in transfers(jnp.int32(0)):
-                copy.wait()
-
-            def group_body(step, acc1):
-                nxt = step + 1
-                for copy in transfers(nxt):
-                    copy.wait()
-                acc1_next = gate_up(nxt % nb)
-                finish(step, step % nb, acc1, expert_columns)
-
-                @pl.when(step + nb < items)
-                def refill():
-                    for copy in transfers(step + nb):
-                        copy.start()
-
-                return acc1_next
-
-            acc1 = lax.fori_loop(0, items - 1, group_body, gate_up(0))
-            finish(items - 1, (items - 1) % nb, acc1, expert_columns)
-
-    return _Ring(items, nb, transfers, quantize_x, gate_up, finish, run_slow)
+    return _Ring(items, nb, transfers, quantize_x, gate_up, finish)
 
 
 def _kernel(
@@ -913,21 +856,9 @@ def _kernel(
         active_ids_ref[count] = e
         return count + hit.astype(jnp.int32)
 
-    def compact_clamped(e, count):
-        # compact with the hit-table column clamped into the table.
-        e_pad = hits_s_ref.shape[1]
-        col = jnp.minimum(e0 + e, e_pad - 1)
-        hit = jnp.logical_and(e0 + e < e_pad, hits_s_ref[0, col] != 0)
-        active_ids_ref[count] = e
-        return count + hit.astype(jnp.int32)
-
     if fast:
         # The vector compaction's count, row 3 of the hit table.
         count = hits_s_ref[3, 0]
-    elif nvfp4:
-        # Entry 0 also serves the padded tail of the last expert group.
-        active_ids_ref[0] = jnp.int32(0)
-        count = lax.fori_loop(0, local_experts, compact_clamped, jnp.int32(0))
     else:
         count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
 
@@ -1028,7 +959,37 @@ def _kernel(
             ring.finish(items - 1, (items - 1) % nb, acc1, expert_columns)
 
     else:
-        ring.run_slow(expert_columns)
+
+        @pl.when(items > 0)
+        def run_experts():
+            # The prime loop after the compaction started the first nb items'
+            # copies.
+            for copy in transfers(jnp.int32(0)):
+                copy.wait()
+
+            def item_body(step, acc1):
+                nxt = step + 1
+
+                @pl.when(nxt < items)
+                def wait_next():
+                    for copy in transfers(nxt):
+                        copy.wait()
+
+                # Issued before this item's elementwise chain so the MXU and
+                # VPU overlap. On the last step it reads a stale slot; the
+                # result is dropped.
+                acc1_next = ring.gate_up(nxt % nb)
+                ring.finish(step, step % nb, acc1, expert_columns)
+
+                # This item's slot is free once its second matmul has read it.
+                @pl.when(step + nb < items)
+                def refill():
+                    for copy in transfers(step + nb):
+                        copy.start()
+
+                return acc1_next
+
+            lax.fori_loop(0, items, item_body, ring.gate_up(0))
 
     # Outside pl.when(items > 0): every rank must take part in the exchange
     # (its peers wait for its chunks), consume the barrier signals sent at

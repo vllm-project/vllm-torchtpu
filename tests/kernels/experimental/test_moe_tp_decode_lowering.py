@@ -78,7 +78,7 @@ _HASHES = {
         "a26497afe01d90681c43cbdda56c6ee93c245b232c9499c07109792335ff6744"
     ),
     ("nvfp4", "tp8", 16, (("fast", False),)): (
-        "d3d2231f4e09bedd509a328b36a4c13a2490f7328c354bcc60c8d88c7e4bc009"
+        "427912ec6daddd22f7298033adb3a62845fb7660ec9ec66f882866a12b9ed112"
     ),
     ("nvfp4", "tp8", 16, (("fast", True),)): (
         "73cf209b3be726cc7277f9e10dab733f7de4405fd752597955001ff16be60356"
@@ -96,7 +96,7 @@ _HASHES = {
         "0f59c2be60e17494b2cef3c00aa407a8b957b7fe0ba942709361cbc15f1b0bfa"
     ),
     ("nvfp4", "tp16", 64, (("fast", False),)): (
-        "a964e830017636c8234683ed7b5958835d2b4c35e76da2d5a7307d0f9f8ab418"
+        "8d24a47b33e52a7cabdc0ba16e3d9e0c23a25f8f1d6ce864c777b2bff0c2254c"
     ),
     ("nvfp4", "e192", 16, (("fast", True),)): (
         "5dc8ef662708c946fe17c7b8b4ccea74a6e22b929c358c90356bdda44f89e101"
