@@ -32,8 +32,7 @@ native formula term for term. On a v7x Wan2.2-A14B block at 480p (32760
 tokens) this cuts ~7 ms per transformer layer (80.8 -> 73.9 ms).
 """
 
-import functools
-from functools import cache as run_once
+from typing import Any
 
 import jax
 import torch
@@ -41,16 +40,23 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.diffusion_attention.qk_norm_rope import qk_norm_rope
 
+_PAIR_SWAP_MATRICES: dict[tuple[int, torch.dtype, torch.device], torch.Tensor] = {}
 
-@functools.cache
+
 def _pair_swap_matrix(
     dim: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    p = torch.zeros(dim, dim, dtype=torch.float32)
-    even = torch.arange(0, dim, 2)
-    p[even + 1, even] = -1.0
-    p[even, even + 1] = 1.0
-    return p.to(device=device, dtype=dtype)
+    key = (dim, dtype, device)
+    mat = _PAIR_SWAP_MATRICES.get(key)
+    if mat is None:
+        p = torch.zeros(dim, dim, dtype=torch.float32)
+        even = torch.arange(0, dim, 2)
+        p[even + 1, even] = -1.0
+        p[even, even + 1] = 1.0
+        mat = p.to(device=device, dtype=dtype)
+        if not torch.compiler.is_compiling():
+            _PAIR_SWAP_MATRICES[key] = mat
+    return mat
 
 
 def _repeat_pairs(t: torch.Tensor) -> torch.Tensor:
@@ -86,9 +92,17 @@ def rotary_embedding_wan_forward(
     return apply_rotary_pair_swap(x, cos, sin)
 
 
-@functools.cache
+_FIRST_HALF_LANES: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+
+
 def _first_half_lanes(width: int, head_dim: int, device: torch.device) -> torch.Tensor:
-    return (torch.arange(width) % head_dim < head_dim // 2).to(device)
+    key = (width, head_dim, device)
+    lanes = _FIRST_HALF_LANES.get(key)
+    if lanes is None:
+        lanes = (torch.arange(width) % head_dim < head_dim // 2).to(device)
+        if not torch.compiler.is_compiling():
+            _FIRST_HALF_LANES[key] = lanes
+    return lanes
 
 
 def split_rope_natural_tables(
@@ -139,10 +153,23 @@ def apply_split_rotary_half_swap(
     return out.to(x.dtype)
 
 
-@run_once
-def _qk_norm_rope_op():
-    """Builds the torch custom op wrapping the fused Pallas kernel (once)."""
+_qk_norm_rope: Any = None
 
+
+def _qk_norm_rope_op():
+    """Builds the torch custom op wrapping the fused Pallas kernel (once).
+
+    Not functools.cache: Dynamo ignores that wrapper and re-traces the op
+    builder inside compiled DiT forwards (a graph break). After the first
+    eager call, Dynamo reads the built op from this global.
+    """
+    global _qk_norm_rope
+    if _qk_norm_rope is None:
+        _qk_norm_rope = _build_qk_norm_rope_op()
+    return _qk_norm_rope
+
+
+def _build_qk_norm_rope_op():
     def wan_qk_norm_rope(
         qkv: jax.Array,
         wq: jax.Array,

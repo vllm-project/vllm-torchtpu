@@ -21,6 +21,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
+| `VLLM_TPU_OMNI_COMPILE` | `"0"` | vLLM-Omni diffusion only: opt-in DiT `torch.compile` with the torch_tpu `"tpu"` backend (`dynamic=False`). `"0"` keeps the DiT eager, `"regional"` compiles each repeated transformer block, `"full"` compiles the whole DiT (case-insensitive). Needs Omni `enforce_eager=False`. Pipelines with their own `setup_compile()` stay eager. Not part of the LLM compile cache key; diffusion workers key their executables through `torch.compiler.config.cache_key_tag`. |
+| `VLLM_TPU_OMNI_COMPILE_SPMD_SAFE` | `False` | With `VLLM_TPU_OMNI_COMPILE=regional`, runs each compiled block of an allow-listed DiT (FLUX, FLUX.2, Qwen-Image, Wan) as one torch_tpu SPMD-safe region, so its sequence-parallel collectives stay inside the compiled program. Ignored for `full` and for other models. |
 
 ---
 

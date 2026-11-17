@@ -69,6 +69,11 @@ EXEMPT_PATHS = {
 #                           value, and it is a CPython knob, not one of ours.
 #   omni/platform.py        os.environ["MASTER_PORT"] (exported per worker by
 #                           vLLM-Omni's DiffusionWorker) must raise when unset.
+#   omni/platform.py        hashes TPU_PROCESS_BOUNDS and
+#                           TPU_CHIPS_PER_PROCESS_BOUNDS, the process grid the
+#                           TPU runtime sets up like TPU_VISIBLE_CHIPS, into
+#                           the DiT compile-cache rank tag; unset means the
+#                           runtime default, not a knob default.
 #   model_loader_patches.py RUNAI_STREAMER_PROCESS_GROUP_SIZE is exported by
 #                           the Run:AI streamer's first host-rank discovery in
 #                           the process; unset means that has not run yet.
@@ -94,7 +99,9 @@ BOOTSTRAP_VARS = {
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
     "TORCH_TPU_TOPOLOGY",
     "TORCH_TPU_XPROF_SESSION_ID",
+    "TPU_CHIPS_PER_PROCESS_BOUNDS",
     "TPU_NUM_HOSTS",
+    "TPU_PROCESS_BOUNDS",
     "TPU_VISIBLE_CHIPS",
     "WORLD_SIZE",
 }
