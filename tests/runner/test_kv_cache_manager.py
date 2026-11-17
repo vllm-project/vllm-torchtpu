@@ -453,10 +453,12 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     assert spec.num_head_slots == 1
 
 
-@pytest.mark.parametrize("make_config", [_attention_config, _mamba_config])
+@pytest.mark.parametrize(
+    "make_config", [_attention_config, _shared_attention_config, _mamba_config]
+)
 def test_initialize_kv_cache_allocates_caches_on_device(meta_runner, make_config):
-    """Attention caches and Mamba states are created on the device, not on the
-    host first."""
+    """Attention caches, shared attention regions and Mamba states are created
+    on the device, not on the host first."""
     config = make_config(meta_runner.vllm_config)
 
     with _RecordHostTensors() as host:
@@ -2620,7 +2622,8 @@ def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
     NoPE keeps one 128-word row per token, RoPE packs four tokens' 32 words
     per row, so the sparse gather can fetch a token's own 128 RoPE bytes. The
     bytes are the uint8 pair's; overflow overlay hosts copy the NoPE host.
-    Every array comes from the device allocator.
+    Every array comes from the device allocator and is created on the device
+    (`meta`, where only host tensors hold bytes), with no host staging buffer.
     """
     from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 
@@ -2680,15 +2683,16 @@ def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
     ]
     kv_caches: dict = {}
     num_blocks = 3
-    allocator = DeviceKVCacheAllocator(torch.device("cpu"))
+    allocator = DeviceKVCacheAllocator(torch.device("meta"))
 
-    DsV4KVCacheAllocator(runner)._initialize_ds_v4_kv_cache(
-        SimpleNamespace(kv_cache_groups=groups),
-        specs.__getitem__,
-        kv_caches,
-        num_blocks,
-        allocator,
-    )
+    with _RecordHostTensors() as host:
+        DsV4KVCacheAllocator(runner)._initialize_ds_v4_kv_cache(
+            SimpleNamespace(kv_cache_groups=groups),
+            specs.__getitem__,
+            kv_caches,
+            num_blocks,
+            allocator,
+        )
 
     # Only the compressed-KV group (1,024 pages) bounds the requests per
     # forward; the compressor-state and SWA groups do not.
@@ -2725,10 +2729,13 @@ def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
     assert overflow.dtype == torch.int32
     assert tuple(overflow.shape) == tuple(nope.shape)
     # So the caller's one synchronize covers each array, and none is staged on
-    # the host first.
-    assert sorted(map(id, allocator.arrays)) == sorted(
-        map(id, _cache_arrays(kv_caches))
-    )
+    # the host first: no host tensor is as large as one block of the smallest
+    # array.
+    arrays = _cache_arrays(kv_caches)
+    assert sorted(map(id, allocator.arrays)) == sorted(map(id, arrays))
+    assert {array.device.type for array in arrays} == {"meta"}
+    smallest_block_bytes = min(array.nbytes // array.shape[0] for array in arrays)
+    assert max(host.nbytes, default=0) < smallest_block_bytes
 
 
 @pytest.mark.parametrize(
