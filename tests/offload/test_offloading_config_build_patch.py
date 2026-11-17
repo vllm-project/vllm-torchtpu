@@ -109,8 +109,13 @@ def _kv_cache_config(block_size: int = 4096):
     )
 
 
-def _mixed_mla_kv_cache_config(block_size: int = 256):
-    """One group holding MLA latent and sparse indexer K pages (GLM-5.2)."""
+def _mixed_mla_kv_cache_config(block_size: int = 256, num_blocks: int = 128):
+    """One group holding MLA latent and sparse indexer K pages (GLM-5.2),
+    planned by vLLM's planner in the layer-outermost LBNHC that TPU resolves
+    for it: one tensor per spec, each sized to the whole allocation."""
+    from vllm.config import CacheConfig
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+
     mla = MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
@@ -127,17 +132,14 @@ def _mixed_mla_kv_cache_config(block_size: int = 256):
         block_size=block_size,
         kv_cache_specs={"attn": mla, "indexer": indexer},
     )
-    return KVCacheConfig(
-        num_blocks=128,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=128 * spec.page_size_bytes,
-                layers=["attn", "indexer"],
-                layer_stride=128 * mla.page_size_bytes,
-                block_stride=spec.page_size_bytes,
-            )
-        ],
-        kv_cache_groups=[KVCacheGroupSpec(["attn", "indexer"], spec)],
+    cache_config = CacheConfig(num_gpu_blocks_override=num_blocks)
+    cache_config.kv_cache_layout = "LBNHC"
+    planner_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        cache_config=cache_config,
+    )
+    return get_kv_cache_config_from_groups(
+        planner_config, [KVCacheGroupSpec(["attn", "indexer"], spec)], 1 << 40
     )
 
 
