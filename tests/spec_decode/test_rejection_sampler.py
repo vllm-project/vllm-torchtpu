@@ -29,6 +29,7 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     MASKED_LOGIT_VALUE,
     apply_top_k_top_p,
+    extract_topk_candidates,
 )
 
 pytestmark = pytest.mark.tpu_test
@@ -1277,10 +1278,6 @@ def test_fused_verify_and_sample_candidates(device):
 
     # Pre-extracted packed candidates (topk_candidates=0) must produce the exact
     # same result when passed [rows, 2 * num_cand] float32 [cand_logits, cand_ids].
-    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
-        extract_topk_candidates,
-    )
-
     cand_logits, cand_ids = extract_topk_candidates(logits, num_blocks)
     packed_candidates = torch.cat([cand_logits, cand_ids.to(torch.float32)], dim=-1)
     out_packed = sampler.fused_verify_and_sample_candidates(

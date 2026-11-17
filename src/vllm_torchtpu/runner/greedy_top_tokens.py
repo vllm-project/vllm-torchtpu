@@ -960,7 +960,10 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
         )
     if dp_lockstep and head.tp_size > 1:
         # An idle engine issues the full-logits collective in lockstep with
-        # its busy peers, which would be waiting in the pair exchange.
+        # its busy peers, which would be waiting in the pair exchange. The
+        # runner never gets here: target_head_dp_mode sends this case to the
+        # stock path before resolving an owner. The refusal stays for any
+        # other caller, for which the pair exchange would hang an idle engine.
         raise NotImplementedError(
             "TPU_GREEDY_TOP_TOKENS with expert-parallel data parallelism and a "
             "tensor-parallel LM head is not supported; unset "

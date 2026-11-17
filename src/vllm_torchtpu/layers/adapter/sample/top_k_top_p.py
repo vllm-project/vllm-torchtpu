@@ -191,8 +191,13 @@ def topk_mask(
         than k values might be returned. [batch..., 1]
       replace_val: For the masked values of logits, what to overwrite them with.
       max_k: Optional upper bound on active ``k`` values (``1 <= k <= max_k``).
-        When ``0 < max_k <= vocab_size``, uses a single ``torch.topk`` of size
-        ``max_k`` instead of 32 binary-search reductions.
+        When ``0 < max_k <= vocab_size``, the cutoff is the k-th of the
+        ``max_k`` largest values instead of 32 binary-search reductions. On
+        TPU those come from ``rowmax_select``, the sort-free Pallas row-max
+        select, which takes 2-D logits ``[rows, vocab_size]``; elsewhere from
+        ``torch.topk``. A larger ``k`` is clamped to ``max_k`` and ``k = 0``
+        to 1, so callers pass ``max_k`` only when every row they apply top-k
+        to has ``1 <= k <= max_k``.
 
     Returns:
       masked version of logits. [batch..., vocab_size]
