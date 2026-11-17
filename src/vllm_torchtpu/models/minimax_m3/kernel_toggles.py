@@ -227,3 +227,10 @@ def apply(additional_config: Any) -> None:
     from vllm_torchtpu.models.minimax_m3.ops import msa as msa_ops
 
     _set(additional_config, "minimax_dcp_heads_attend", msa_ops, "DCP_HEADS_ATTEND")
+    for key, attr in (
+        ("minimax_dcp_merge_a2a_max_tokens", "MERGE_A2A_MAX_TOKENS"),
+        ("minimax_dcp_qcand_gather_max_tokens", "QCAND_GATHER_MAX_TOKENS"),
+    ):
+        _set_value(
+            additional_config, key, msa_ops, attr, _non_negative(additional_config, key)
+        )

@@ -229,6 +229,14 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # w/w/...>:<page cache slots>", empty fields = the defaults (e.g.
     # "16:16::1024"). Bitwise when only widths / page cache change.
     "minimax_dcp_hp_prefill_config": "",
+    # MiniMax M3 DCP steps of at most this many tokens (0 = off;
+    # `models/minimax_m3/dcp_pack.py`): merge the attention partials with one
+    # packed all-to-all instead of an LSE all-gather plus a reduce-scatter
+    # (bitwise at DCP 2, another summation order at wider DCP); over one KV
+    # head, gather the query heads and the top-k candidates in one all-gather
+    # after the scoring op instead of two (bitwise).
+    "minimax_dcp_merge_a2a_max_tokens": 0,
+    "minimax_dcp_qcand_gather_max_tokens": 0,
 }
 
 
