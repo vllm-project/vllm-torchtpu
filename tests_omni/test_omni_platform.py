@@ -90,6 +90,7 @@ _UPSTREAM_GUIDE_MODALITY = ltx2_guidance.LTXGuidanceExecutor._guide_modality
 _UPSTREAM_SYNC_GUIDANCE_STEP = (
     ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
 )
+_UPSTREAM_LTX2_ATTN_FORWARD = ltx2_transformer.LTX2Attention.forward
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -1607,3 +1608,114 @@ def test_ltx2_async_guidance_step_avoids_blocking_sync(monkeypatch, table_syncs)
 
     # No path calls upstream's blocking device synchronize.
     assert blocking_syncs == []
+
+
+def test_ltx2_fast_attention_dispatch_and_all_to_all_4d(monkeypatch):
+    import inspect
+
+    from vllm_omni.diffusion.attention.parallel import ulysses as ulysses_mod
+    from vllm_omni.diffusion.distributed import comm
+    from vllm_omni.diffusion.models.ltx2 import ltx2_sequence_parallel
+
+    orig_a2a = comm.all_to_all_4D
+    orig_seq_apply = comm.SeqAllToAll4D.apply
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2Attention, "forward", _UPSTREAM_LTX2_ATTN_FORWARD
+    )
+    monkeypatch.setattr(comm, "all_to_all_4D", orig_a2a)
+    monkeypatch.setattr(comm.SeqAllToAll4D, "apply", orig_seq_apply)
+    monkeypatch.setattr(ulysses_mod.SeqAllToAll4D, "apply", orig_seq_apply)
+    monkeypatch.setattr(ltx2_sequence_parallel.SeqAllToAll4D, "apply", orig_seq_apply)
+
+    patches._patch_ltx2_fast_eager_dispatch()
+    patches._patch_ltx2_fast_eager_dispatch()  # idempotent
+
+    class _DummyProc:
+        def __call__(
+            self,
+            attn,
+            hidden_states,
+            encoder_hidden_states=None,
+            attention_mask=None,
+            query_rotary_emb=None,
+            key_rotary_emb=None,
+            *,
+            perturbation_mask=None,
+            extra_accepted=None,
+        ):
+            del attn, encoder_hidden_states, attention_mask
+            del query_rotary_emb, key_rotary_emb
+            out = hidden_states
+            if perturbation_mask is not None:
+                out = out + perturbation_mask
+            if extra_accepted is not None:
+                out = out + extra_accepted
+            return out
+
+    dummy_attn = object.__new__(ltx2_transformer.LTX2Attention)
+    torch.nn.Module.__init__(dummy_attn)
+    dummy_attn.processor = _DummyProc()
+    x = torch.ones(2, 4, 8)
+    pmask = torch.full((2, 1, 1), 2.0)
+
+    # Standard 6-arg path never invokes inspect.signature.
+    with patch.object(inspect, "signature", wraps=inspect.signature) as spy_sig:
+        out_fast = dummy_attn(x, perturbation_mask=pmask)
+        assert spy_sig.call_count == 0
+        torch.testing.assert_close(out_fast, torch.full_like(x, 3.0))
+
+        # Extra kwargs inspect once per processor class, then hit sig_cache.
+        out_kw1 = dummy_attn(
+            x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=99.0
+        )
+        out_kw2 = dummy_attn(
+            x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=99.0
+        )
+        assert spy_sig.call_count == 1
+        torch.testing.assert_close(out_kw1, torch.full_like(x, 4.0))
+        torch.testing.assert_close(out_kw2, out_kw1)
+
+    # Verify _fast_all_to_all_4d matches upstream comm.all_to_all_4D for both
+    # (scatter=2, gather=1) and (scatter=1, gather=2) across 4 simulated ranks.
+    world_size = 4
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group=None: world_size
+    )
+
+    def _run_simulated_world(fn, rank_inputs, scatter_idx, gather_idx):
+        captured_sends = []
+
+        def collect_send(recv_buf, send_buf, group=None):
+            del group
+            captured_sends.append(send_buf.clone())
+            recv_buf.zero_()
+
+        monkeypatch.setattr(torch.distributed, "all_to_all_single", collect_send)
+        for r in range(world_size):
+            fn(rank_inputs[r], scatter_idx, gather_idx, group="pg")
+        # Transpose rank chunks across the world: recv[dst, src] = send[src, dst]
+        stacked = torch.stack(captured_sends, dim=0)  # (W, W, ...)
+        transposed = stacked.transpose(0, 1).contiguous()
+        outputs = []
+        for r in range(world_size):
+            r_recv = transposed[r]
+            monkeypatch.setattr(
+                torch.distributed,
+                "all_to_all_single",
+                lambda recv_buf, send_buf, group=None, rr=r_recv: recv_buf.copy_(rr),
+            )
+            outputs.append(fn(rank_inputs[r], scatter_idx, gather_idx, group="pg"))
+        return outputs
+
+    torch.manual_seed(0)
+    in_21 = [torch.randn(2, 3, 8, 4) for _ in range(world_size)]
+    got_21 = _run_simulated_world(comm.all_to_all_4D, in_21, 2, 1)
+    want_21 = _run_simulated_world(orig_a2a, in_21, 2, 1)
+    for g, w in zip(got_21, want_21, strict=True):
+        torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+    in_12 = [torch.randn(2, 12, 2, 4) for _ in range(world_size)]
+    got_12 = _run_simulated_world(comm.all_to_all_4D, in_12, 1, 2)
+    want_12 = _run_simulated_world(orig_a2a, in_12, 1, 2)
+    for g, w in zip(got_12, want_12, strict=True):
+        torch.testing.assert_close(g, w, rtol=0, atol=0)
