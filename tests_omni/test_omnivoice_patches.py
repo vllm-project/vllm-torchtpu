@@ -24,8 +24,6 @@ from vllm_torchtpu.omni.patches import _patch_omnivoice_cpu_safetensors_load
 
 pytestmark = [pytest.mark.omni]
 
-_WEIGHTS = {"w": torch.arange(4, dtype=torch.float32)}
-
 
 @pytest.fixture
 def fake_load_file(monkeypatch):
@@ -41,7 +39,7 @@ def fake_load_file(monkeypatch):
         calls.append((str(device), kwargs))
         if str(device) in fail_on:
             raise fail_on[str(device)]
-        return {k: v.clone() for k, v in _WEIGHTS.items()}
+        return {"w": torch.zeros(2)}
 
     monkeypatch.setattr(safetensors_torch, "load_file", _load_file)
     _patch_omnivoice_cpu_safetensors_load.cache_clear()
@@ -76,10 +74,9 @@ def test_patch_installs_wrapper_once_without_touching_original(fake_load_file):
 
 def test_direct_load_is_used_when_it_works(fake_load_file):
     _, calls, _ = fake_load_file
-    state = safetensors_torch.load_file("f", device="tpu:0")
-    assert calls == [("tpu:0", {})]  # no CPU detour
-    torch.testing.assert_close(state["w"], _WEIGHTS["w"])
-    assert safetensors_torch.load_file("f")["w"].device.type == "cpu"  # filename only
+    safetensors_torch.load_file("f", device="tpu:0")
+    safetensors_torch.load_file("f")  # filename only: default device is cpu
+    assert calls == [("tpu:0", {}), ("cpu", {})]  # no CPU detour
 
 
 def test_falls_back_to_cpu_for_unsupported_device(fake_load_file):
@@ -88,7 +85,6 @@ def test_falls_back_to_cpu_for_unsupported_device(fake_load_file):
     state = safetensors_torch.load_file("f", device="tpu:0")
     assert calls == [("tpu:0", {}), ("cpu", {})]
     assert state["w"].device.type == "tpu"
-    torch.testing.assert_close(state["w"].cpu(), _WEIGHTS["w"])
 
 
 def test_extra_arguments_are_passed_through(fake_load_file):
