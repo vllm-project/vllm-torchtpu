@@ -602,28 +602,40 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
 @pytest.mark.parametrize(
-    "shape",
+    "shape,shared_weights",
     [
-        pytest.param(dict(SMALL), id="small"),
-        pytest.param(dict(PROD, tokens=PROD_TOKENS[0]), id="prod_t2048"),
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so this shape runs against the
+        # module's one build of them rather than making its own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
     ],
 )
-def test_slab_scatter_set_and_add_are_bit_exact(monkeypatch, sharded_plan, shape):
+def test_slab_scatter_set_and_add_are_bit_exact(
+    request, monkeypatch, sharded_plan, shape, shared_weights
+):
     """The slab tables' scatter form changes how they are built, not the layer.
 
-    The chip picks the form (host.slab_tables_on_tensorcore); forcing each one here
-    runs both on whatever chip this is, so the form this chip does NOT pick
-    is checked as well.
+    The chip picks the form (host.slab_tables_on_tensorcore); forcing each one
+    here runs both on whatever chip this is, so the form this chip does NOT
+    pick is checked as well. The two forced builds must lower to different
+    programs, so the agreement is not vacuous: were the form ever dropped from
+    the layer's shard_map cache key, the second build would reuse the first
+    one's body and fail here.
     """
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(
-        mesh,
-        40,
-        hidden=shape["hidden"],
-        inter=shape["inter"],
-        e_total=shape["e_total"],
-        weight_format=WeightFormat.FP8,
-    )
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            40,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
     x, gating = _make_inputs(
         mesh,
         41,
@@ -631,19 +643,14 @@ def test_slab_scatter_set_and_add_are_bit_exact(monkeypatch, sharded_plan, shape
         hidden=shape["hidden"],
         e_total=shape["e_total"],
     )
-    outs = []
-    for by_set in (False, True):
-        monkeypatch.setattr(
-            layer, "slab_tables_on_tensorcore", lambda by_set=by_set: by_set
-        )
-        outs.append(
-            fused_ep_moe_v2(
-                x,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                gating,
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the form is read while tracing, so reusing one `run` would lower the
+        # first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
                 topk=shape["topk"],
                 renormalize=True,
                 mesh=mesh,
@@ -651,8 +658,20 @@ def test_slab_scatter_set_and_add_are_bit_exact(monkeypatch, sharded_plan, shape
                 weight_format=WeightFormat.FP8,
                 sharded_plan=sharded_plan,
             )
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, programs = {}, {}
+    for by_set in (False, True):
+        monkeypatch.setattr(
+            layer, "slab_tables_on_tensorcore", lambda by_set=by_set: by_set
         )
-    np.testing.assert_array_equal(np.asarray(outs[1]), np.asarray(outs[0]))
+        run = make_run()
+        programs[by_set] = jax.jit(run).lower(*args).as_text()
+        outs[by_set] = np.asarray(run(*args))
+    assert programs[True] != programs[False]
+    np.testing.assert_array_equal(outs[True], outs[False])
 
 
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])

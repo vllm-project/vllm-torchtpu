@@ -391,11 +391,12 @@ def test_slab_scatter_set_builds_the_add_tables(
 ):
     """Both slab tables come out of a scatter-set as they do of an add.
 
-    That is what lets the chip's SparseCore pick the form. Every live row takes
-    at most one pair and the slab starts at zero; the only rows the two forms
-    can disagree on are dropped or past the slab's last row, where the kernel
-    never reads. Padding rows (expert id e_total) go off-shard in both plans,
-    so they stay out of the live rows too.
+    That is what lets the chip rule (host.slab_tables_on_tensorcore) pick the
+    form by the SparseCore alone. Every live row takes at most one pair and the
+    slab starts at zero; the only rows the two forms can disagree on are
+    dropped or past the slab's last row, where the kernel never reads. Padding
+    rows (expert id e_total) go off-shard in both plans, so they stay out of
+    the live rows too.
     """
     idx, kwargs = _routing_inputs(
         ep, t_local, g_local, topk, skew=routing == "skewed", seed=3
@@ -461,7 +462,7 @@ def test_slab_scatter_set_builds_the_add_tables(
     ],
 )
 def test_slab_tables_follow_the_sparse_core(chip, on_tensorcore):
-    """Only a chip with at most 4 SparseCore subcores builds on the TensorCore."""
+    """A chip with at most 4 SparseCore subcores, or none, builds on the TensorCore."""
     from jax.experimental.pallas import tpu as pltpu
 
     info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)

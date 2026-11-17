@@ -695,7 +695,11 @@ def fused_ep_moe_v2(
         # had; that trade measures +2.80% at 2048 local tokens and negative at
         # every smaller shape, so it is taken only where the routing plan in
         # front of the collective is longer than the scatters behind it. Same
-        # bits either way; only the queue moves.
+        # bits either way; only the queue moves. The barrier is taken on every
+        # chip, including one that builds the tables on the TensorCore: there
+        # the scatters share no queue with the collective, the barrier holds
+        # them until the gathered activations arrive, and that trade has not
+        # been measured.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         token_gather = shard_token_gather(

@@ -1044,10 +1044,12 @@ def slab_scatter(size, rows, values, *, by_set):
 
     Every live row receives at most one routed pair and the destination
     starts at zero, so the add and the set build the same bits, and `by_set`
-    picks whichever the chip builds faster (slab_tables_on_tensorcore). They part
-    only where pairs collide past the slab's last live row -- the rows
-    local_slab_rows sends off-shard pairs to, which nothing reads -- where
-    the add sums and the set keeps either pair.
+    picks whichever the chip builds faster (slab_tables_on_tensorcore). The
+    two differ only at or past row shard_stride, the slab's end, where
+    local_slab_rows sends every off-shard pair: rows past `size` are dropped,
+    and the few the activation-scale view holds past the slab's end are never
+    read. On those rows the add sums the colliding pairs and the set keeps
+    one of them.
     """
     slab = jnp.zeros((size,), values.dtype).at[rows]
     if by_set:
