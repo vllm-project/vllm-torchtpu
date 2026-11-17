@@ -591,22 +591,46 @@ def _select_fp8_indexer_jax(
         # Pipelined tiles inline inside the outer model jit so scheduling
         # metadata reaches the Pallas call instead of the inner jit boundary.
         scorer = fp8_paged_mqa_logits.__wrapped__ if pipelined else fp8_paged_mqa_logits
-        scores = scorer(
-            queries,
-            pool,
-            row_weights.astype(jnp.float32),
-            row_lengths,
-            pages,
-            query_start_loc=(
-                query_offsets if shared else jnp.clip(query_offsets - start, 0, rows)
-            ),
-            max_model_len=capacity if stream_select else width,
-            q_scale=jnp.ones_like(row_weights, dtype=jnp.float32),
-            query_size=query_tile,
-            cache_layout=layout,
-            query_start=start if shared else 0,
-            query_count=rows,
-            reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
+        output_width = capacity if stream_select else width
+        # Prefill scores one K tile at a time, each kept resident while every
+        # query of the chunk reads it. A multi-tile call reloads every tile
+        # for each 6-query group instead.
+        tiles = (
+            output_width // key_tile
+            if prefill_chunk_rows is not None and output_width % key_tile == 0
+            else 1
+        )
+        tile_width = output_width // tiles
+        tile_pages = tile_width // layout.page_size
+        scores = jnp.concatenate(
+            [
+                scorer(
+                    queries,
+                    pool,
+                    row_weights.astype(jnp.float32),
+                    jnp.clip(row_lengths - t * tile_width, 0, tile_width)
+                    if tiles > 1
+                    else row_lengths,
+                    pages[:, t * tile_pages : (t + 1) * tile_pages]
+                    if tiles > 1
+                    else pages,
+                    query_start_loc=(
+                        query_offsets
+                        if shared
+                        else jnp.clip(query_offsets - start, 0, rows)
+                    ),
+                    max_model_len=tile_width,
+                    q_scale=jnp.ones_like(row_weights, dtype=jnp.float32),
+                    query_size=query_tile,
+                    cache_layout=layout,
+                    query_start=start if shared else 0,
+                    query_count=rows,
+                    reuse_keys=prefill_chunk_rows is not None
+                    and tile_width == key_tile,
+                )
+                for t in range(tiles)
+            ],
+            axis=1,
         )
         if group is None:
             return scores
