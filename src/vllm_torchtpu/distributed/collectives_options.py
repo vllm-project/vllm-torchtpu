@@ -15,9 +15,10 @@
 
     --additional-config '{"tpu_collectives": {"small_all_reduce": true}}'
 
-Every option defaults to main's behaviour without it. The options change
-compiled programs, so the section stays in the compile-cache key. Parse once
-at init with :func:`get` and keep the result.
+Without the section every option is off. The options change compiled
+programs, so the section stays in the compile-cache key. :func:`get` parses
+strictly; the platform calls it while it checks the config, so a malformed
+section fails at startup.
 """
 
 import dataclasses
@@ -71,7 +72,28 @@ def parse(raw: Any) -> CollectivesOptions:
 
 def get(vllm_config: Any) -> CollectivesOptions:
     """The engine's collectives options."""
-    additional = getattr(vllm_config, "additional_config", None)
+    additional = vllm_config.additional_config
     if not isinstance(additional, dict):
         return CollectivesOptions()
     return parse(additional.get(SECTION))
+
+
+def validate(vllm_config: Any) -> None:
+    """Parse the section and refuse options the parallel config cannot serve,
+    while the platform checks the config: before any weight loads.
+
+    Raises:
+      ValueError: the section does not parse.
+      NotImplementedError: ``small_all_reduce`` without expert parallelism,
+        whose mesh the kernels run over.
+    """
+    options = get(vllm_config)
+    if (
+        options.small_all_reduce
+        and not vllm_config.parallel_config.enable_expert_parallel
+    ):
+        raise NotImplementedError(
+            f"{SECTION}.small_all_reduce builds its kernels over the "
+            "expert-parallel mesh. Pass --enable-expert-parallel, or turn the "
+            "option off."
+        )

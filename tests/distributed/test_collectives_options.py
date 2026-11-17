@@ -22,8 +22,11 @@ from vllm_torchtpu.distributed import collectives_options as co
 pytestmark = pytest.mark.cpu_test
 
 
-def _config(additional_config):
-    return SimpleNamespace(additional_config=additional_config)
+def _config(additional_config, expert_parallel=True):
+    return SimpleNamespace(
+        additional_config=additional_config,
+        parallel_config=SimpleNamespace(enable_expert_parallel=expert_parallel),
+    )
 
 
 @pytest.mark.parametrize(
@@ -59,3 +62,29 @@ def test_malformed_sections_are_rejected(section, match):
 def test_options_are_frozen():
     with pytest.raises(AttributeError):
         co.CollectivesOptions().small_all_reduce = True  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "additional_config,expert_parallel",
+    [
+        ({}, False),
+        ({"tpu_collectives": {"small_all_reduce": False}}, False),
+        ({"tpu_collectives": {"small_all_reduce": True}}, True),
+    ],
+    ids=["no_section", "off_without_ep", "on_with_ep"],
+)
+def test_validate_accepts_what_the_kernels_can_serve(
+    additional_config, expert_parallel
+):
+    co.validate(_config(additional_config, expert_parallel))
+
+
+def test_validate_refuses_small_all_reduce_without_expert_parallelism():
+    config = _config({"tpu_collectives": {"small_all_reduce": True}}, False)
+    with pytest.raises(NotImplementedError, match="--enable-expert-parallel"):
+        co.validate(config)
+
+
+def test_validate_rejects_a_malformed_section():
+    with pytest.raises(ValueError, match="unknown keys"):
+        co.validate(_config({"tpu_collectives": {"small_all_reduce_max_rows": 64}}))
