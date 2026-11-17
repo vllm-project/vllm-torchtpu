@@ -174,7 +174,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         self._is_kv_producer = self._is_disagg and kv_role == "kv_producer"
         self._is_kv_consumer = self._is_disagg and not self._is_kv_producer
-        prefix_change_log.install_epoch()
         self._enable_memo_xstep()
 
         logger.info(
@@ -209,21 +208,17 @@ class PrefixAwareScheduler(AsyncScheduler):
     _MEMO_VERIFY_REUSES = 64
 
     def _enable_memo_xstep(self) -> None:
-        self._memo_xstep = False
+        """Memoises lookups on this scheduler's block pool: starts its
+        prefix-cache epoch (the same-step memo) and its change log (the
+        cross-step memo), which the patch registry's wrappers keep."""
         self._memo_hits = 0
         self._memo_computes = 0
         self._memo_verified = 0
         self._memo_verify_left = self._MEMO_VERIFY_REUSES
-        try:
-            from vllm.v1.core.block_pool import BlockPool
-
-            pool = getattr(self.kv_cache_manager, "block_pool", None)
-            if not isinstance(pool, BlockPool) or not prefix_change_log.install():
-                return
-            prefix_change_log.enable(pool)
-            self._memo_xstep = True
-        except Exception:
-            logger.exception("PrefixAwareScheduler: memo_xstep init failed.")
+        pool = self.kv_cache_manager.block_pool
+        self._memo_xstep = prefix_change_log.enable_epoch(
+            pool
+        ) and prefix_change_log.enable(pool)
 
     def _memo_trim_log(self) -> None:
         pool = getattr(self.kv_cache_manager, "block_pool", None)
@@ -635,19 +630,20 @@ class PrefixAwareScheduler(AsyncScheduler):
         return None
 
     def _get_prefix_cache_epoch(self) -> int | None:
-        """Return current BlockPool prefix-cache mutation epoch if backed by a
-        real BlockPool, or None if mocked / unavailable."""
+        """Return the prefix-cache mutation epoch of the block pool, or None
+        when the pool does not count mutations (see
+        ``prefix_change_log.enable_epoch``)."""
         block_pool = getattr(self.kv_cache_manager, "block_pool", None)
         if block_pool is None:
             return None
         d = getattr(block_pool, "__dict__", None)
-        if not isinstance(d, dict) or "cached_block_hash_to_block" not in d:
+        if not isinstance(d, dict):
             return None
         # Without the epoch counters the epoch never moves, and a same-epoch
         # memo would be reused after the cache changed.
         if not prefix_change_log.epoch_installed():
             return None
-        return d.get("_tpu_prefix_cache_epoch", 0)
+        return d.get(prefix_change_log.EPOCH)
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""

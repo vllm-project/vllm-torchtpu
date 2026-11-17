@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The prefix-cache epoch and change log install lazily.
+"""The prefix-cache epoch and change log are registry patches.
 
 Importing the scheduler must leave vLLM's block pool, KV cache manager and
-scheduler exactly as main's same-step patch left them, so a configuration
-that does not select PrefixAwareScheduler runs unchanged. The counters
-install when a scheduler that memoises lookups is built.
+scheduler exactly as main's same-step patch left them. The patch registry
+installs the epoch counters and then the change log, both after the same-step
+patch, and each entry is idempotent.
 """
 
 import subprocess
@@ -29,6 +29,7 @@ _SCRIPT = textwrap.dedent(
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm_torchtpu import patch_registry
 
     vllm_torchtpu._patch_vllm_same_step_prefix_hits()
 
@@ -51,21 +52,31 @@ _SCRIPT = textwrap.dedent(
     assert not prefix_change_log.install(), "change log without epoch counters"
     assert methods() == before
 
-    prefix_change_log.install_epoch()
+    targets = [
+        p.target
+        for p in patch_registry.PATCHES
+        if p.target.startswith("vllm_torchtpu.core.prefix_change_log:")
+    ]
+    assert targets == [
+        "vllm_torchtpu.core.prefix_change_log:install_epoch",
+        "vllm_torchtpu.core.prefix_change_log:install",
+    ], targets
+    for target in targets:
+        assert patch_registry._invoke(target) is not False, target
     after = methods()
-    assert prefix_change_log.epoch_installed()
+    assert prefix_change_log.epoch_installed() and prefix_change_log.installed()
     assert after[3] is before[3] and after[5] is before[5]
     assert all(a is not b for a, b in zip(after[:3], before[:3]))
     assert after[4] is not before[4]
-    prefix_change_log.install_epoch()
-    assert methods() == after, "install_epoch is not idempotent"
-    assert prefix_change_log.install()
-    print("LAZY-INSTALL-OK")
+    for target in targets:
+        patch_registry._invoke(target)
+    assert methods() == after, "the registry entries are not idempotent"
+    print("REGISTRY-INSTALL-OK")
     """
 )
 
 
-def test_import_leaves_vllm_unpatched_and_install_is_lazy():
+def test_import_leaves_vllm_unpatched_and_the_registry_installs():
     result = subprocess.run(
         [sys.executable, "-c", _SCRIPT],
         capture_output=True,
@@ -73,4 +84,4 @@ def test_import_leaves_vllm_unpatched_and_install_is_lazy():
         timeout=900,
     )
     assert result.returncode == 0, result.stderr[-4000:]
-    assert "LAZY-INSTALL-OK" in result.stdout
+    assert "REGISTRY-INSTALL-OK" in result.stdout
