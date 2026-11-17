@@ -56,6 +56,13 @@ DIM = 2 * N_KQ * D_K + N_V * D_V
 NUM_TOKENS, NUM_SEQS = 6, 2
 
 
+@pytest.fixture(autouse=True)
+def _empty_shared_gdn_ops(monkeypatch):
+    """Keep an op built from one test's mocks out of every other test: the
+    pooled op is cached in the module-global `_shared_gdn_ops`."""
+    monkeypatch.setattr(gdn_attention_op, "_shared_gdn_ops", {})
+
+
 @pytest.mark.parametrize(
     "architecture", sorted(gdn_attention.QWEN3_5_GDN_COPY_ARCHITECTURES)
 )
