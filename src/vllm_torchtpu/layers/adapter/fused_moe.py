@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM FusedMoE layer adapter for TPU expert-parallel and tensor-parallel execution.
+"""Torch bridge for fused MoE based on fused_moe_func in fused_moe_gmm.
 
-Routes MoE execution across Fused EP v3, low-token decode MoE (`moe_lowtok`),
-and Megablox GMM backends with redundant expert placement support.
+Under an expert placement with copy slots (`expert_placement`), the ops take
+`num_primary_experts`, so the grouped path serves a rank's primaries and never
+its copy slots.
 """
 
 import enum
