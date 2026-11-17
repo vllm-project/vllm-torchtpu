@@ -27,13 +27,17 @@ per-call frame evaluation; every guard Dynamo built is kept.
 * The guard memo (``runner.host_trims`` turns it on under the batch-1 rule;
   it only acts with ``fast_compiled_call``): on top of the direct dispatch,
   remember which cache entry the guard check selected for an argument
-  *signature* (per tensor: shape, stride, dtype, device, requires_grad; per
-  Python scalar / None / str: its type and value; any other object: its id;
-  lists and tuples element-wise) and dispatch later calls with the same
-  signature to that entry without re-running ``guard_manager.check``. The
-  memo is dropped whenever the code object's cache entries change (recompile
-  or eviction). A guard on something the signature does not cover (a global,
-  or an attribute of an argument object) is not re-checked on a memo hit.
+  *signature* (per tensor: shape, stride, dtype, device, requires_grad, and
+  which earlier tensor argument it is, if any; per Python scalar / None /
+  str: its type and value; any other object: its id; lists and tuples
+  element-wise) and dispatch later calls with the same signature to that
+  entry without re-running ``guard_manager.check``. An entry keeps a weak
+  reference to each object it keys by id (a strong one if the object takes
+  no weak reference) and is used only while each is still that object, so a
+  recycled id never matches. The memo is dropped whenever the code object's
+  cache entries change (recompile or eviction). A guard on something the
+  signature does not cover (a global, or an attribute of an argument object)
+  is not re-checked on a memo hit.
 
 TODO: Remove this module once PyTorch has a public guarded call path for
 ``fullgraph`` compiled functions (https://github.com/pytorch/pytorch/issues/206560);
@@ -52,6 +56,7 @@ from __future__ import annotations
 import functools
 import inspect
 import types
+import weakref
 from typing import Any
 
 import torch
@@ -72,29 +77,64 @@ _MEMO_MAX_SEQ = 16
 _SCALARS = (bool, int, float, str)
 
 
-def _memo_key(args: tuple | list) -> tuple | None:
+def _memo_key(args: tuple | list, objs: list | None = None) -> tuple | None:
     """Cheap argument signature for the guard memo, or None (not memoizable).
 
     Covers everything Dynamo's argument guards can see on these call sites for
     a fixed specialization: tensor metadata (not values: tensor values are
-    never guarded), scalar values, and object identity for anything else
-    (``self`` of a compiled method, modules, owners)."""
+    never guarded) and which tensor arguments are the same tensor (Dynamo
+    guards that distinct tensor inputs stay distinct and duplicated ones stay
+    duplicated), scalar values, and object identity for anything else
+    (``self`` of a compiled method, modules, owners). The objects keyed by
+    identity are appended to ``objs``, in key order, so an entry can check
+    later that each is still alive (see ``_memo_refs``)."""
+    return _signature(args, {}, objs)
+
+
+def _signature(args: tuple | list, tensor_ids: dict, objs: list | None) -> tuple | None:
     parts: list[Any] = []
     for a in args:
         if isinstance(a, torch.Tensor):
-            parts.append((a.shape, a.stride(), a.dtype, a.device, a.requires_grad))
+            alias = tensor_ids.setdefault(id(a), len(tensor_ids))
+            parts.append(
+                (a.shape, a.stride(), a.dtype, a.device, a.requires_grad, alias)
+            )
         elif a is None or type(a) in _SCALARS:
             parts.append((type(a), a))
         elif type(a) in (list, tuple):
             if len(a) > _MEMO_MAX_SEQ:
                 return None
-            sub = _memo_key(a)
+            sub = _signature(a, tensor_ids, objs)
             if sub is None:
                 return None
             parts.append((type(a), sub))
         else:
+            if objs is not None:
+                objs.append(a)
             parts.append(("id", id(a)))
     return tuple(parts)
+
+
+def _strong(obj: Any) -> Any:
+    return lambda: obj
+
+
+def _memo_refs(objs: list) -> tuple:
+    """A reference to each object a memo key holds by id: weak where the
+    object allows it, else strong (the entry then keeps it alive, so its id
+    cannot be reused while the entry exists)."""
+    refs = []
+    for obj in objs:
+        try:
+            refs.append(weakref.ref(obj))
+        except TypeError:
+            refs.append(_strong(obj))
+    return tuple(refs)
+
+
+def _memo_live(refs: tuple, objs: list) -> bool:
+    """Whether every object the entry keyed by id is still the one passed."""
+    return all(ref() is obj for ref, obj in zip(refs, objs, strict=True))
 
 
 def memo_stats() -> dict[str, int]:
@@ -151,7 +191,7 @@ def wrap(compiled: Any, fn: types.FunctionType) -> Any:
         "count": -1,
         "disabled": not simple_sig,
         "logged": False,
-        "memo": {},  # signature -> direct fn (guard memo)
+        "memo": {},  # signature -> (direct fn, refs to its id-keyed objects)
         "memo_count": -1,
     }
 
@@ -246,15 +286,23 @@ def wrap(compiled: Any, fn: types.FunctionType) -> Any:
             state["memo"] = {}
             state["memo_count"] = count
             return None
-        key = _memo_key(args)
+        objs: list = []
+        key = _memo_key(args, objs)
         if key is None:
             _MEMO_STATS["nokey"] += 1
             return None
-        hit = state["memo"].get(key)
+        memo = state["memo"]
+        hit = memo.get(key)
         if hit is None:
             return None
+        direct, refs = hit
+        if not _memo_live(refs, objs):
+            # An object the entry was keyed by is gone and its id now names
+            # another one: the guards must run again.
+            del memo[key]
+            return None
         _MEMO_STATS["hit"] += 1
-        return hit
+        return direct
 
     def _memo_store(args: tuple, direct: Any, count: int) -> None:
         if state["memo_count"] != count:
@@ -262,10 +310,17 @@ def wrap(compiled: Any, fn: types.FunctionType) -> Any:
             state["memo_count"] = count
         memo = state["memo"]
         if len(memo) >= _MEMO_MAX_ENTRIES:
-            return
-        key = _memo_key(args)
+            # Drop the entries whose keyed objects are gone before giving up.
+            for dead in [
+                k for k, (_, refs) in memo.items() if any(r() is None for r in refs)
+            ]:
+                del memo[dead]
+            if len(memo) >= _MEMO_MAX_ENTRIES:
+                return
+        objs: list = []
+        key = _memo_key(args, objs)
         if key is not None and key not in memo:
-            memo[key] = direct
+            memo[key] = (direct, _memo_refs(objs))
             _MEMO_STATS["store"] += 1
 
     @functools.wraps(fn)
