@@ -425,7 +425,18 @@ def test_short_tiles_where_only_the_slab_is_over_the_bound(
 ):
     """The slab adds 1 alignment row per expert and 1 tail-read window to the
     routed rows. A build whose routed rows still fit 1 tile per expert gets
-    SHORT_TILE_RUNGS heights, whatever the override asks for."""
-    monkeypatch.setenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "8")
+    SHORT_TILE_RUNGS heights."""
+    monkeypatch.delenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", raising=False)
 
     assert kernel.tile_height_rungs(TILE_M, rows_alloc, 8, 8) == want
+
+
+@pytest.mark.parametrize(
+    "override,want", [("1", (TILE_M,)), ("4", (128, 256, 384, 512))]
+)
+def test_rung_override_wins_on_a_short_tile_build(monkeypatch, override, want):
+    """An explicit MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE sets the count there
+    too: 1 turns the ladder off, as its help says."""
+    monkeypatch.setenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", override)
+
+    assert kernel.tile_height_rungs(TILE_M, 8 * 8 * TILE_M + TILE_M, 8, 8) == want

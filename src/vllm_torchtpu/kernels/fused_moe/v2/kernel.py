@@ -200,15 +200,17 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
 
     The slab adds alignment padding and a tail-read window to the routed
     rows, so a build can be over that bound by its slab and under it by its
-    routed rows. Such a build gets SHORT_TILE_RUNGS heights.
+    routed rows. Such a build gets SHORT_TILE_RUNGS heights, unless
+    MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE sets the count.
 
     """
     one_tile_rows = ep * g_local * tile_m
-    rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
+    override = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE
+    rungs = override or HEIGHT_RUNGS
     if rows_alloc > one_tile_rows:
         if routed_rows_bound(tile_m, rows_alloc, g_local, ep) > one_tile_rows:
             return (tile_m,)
-        rungs = SHORT_TILE_RUNGS
+        rungs = override or SHORT_TILE_RUNGS
     step = tile_m // rungs
     if rungs < 2 or step % ROWBLK or step * rungs != tile_m:
         return (tile_m,)
