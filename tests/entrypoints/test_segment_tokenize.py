@@ -291,6 +291,38 @@ def test_tokenizer_without_added_tokens_is_ineligible(monkeypatch):
     assert st.get_segment_tokenizer(Wrapper(tok), 10_000) is None
 
 
+def _metaspace_tokenizer(prepend_scheme):
+    tok = Tokenizer(models.BPE())
+    tok.pre_tokenizer = pre_tokenizers.Sequence(
+        [pre_tokenizers.Metaspace(prepend_scheme=prepend_scheme)]
+    )
+    tok.decoder = decoders.Metaspace(prepend_scheme=prepend_scheme)
+    tok.train_from_iterator([CORPUS] * 50, trainer=trainers.BpeTrainer(vocab_size=400))
+    tok.add_special_tokens([AddedToken(s, normalized=False) for s in SPECIALS])
+    return tok
+
+
+def test_metaspace_marking_only_the_first_split_is_ineligible():
+    """A piece encoded alone is the first split of its own text, so it would
+    get the marker the full encode gives only to the text's first piece."""
+    tok = _metaspace_tokenizer("first")
+    user, assistant = tok.token_to_id("<|user|>"), tok.token_to_id("<|assistant|>")
+    full = tok.encode("To be<|user|>or not<|assistant|> to be").ids
+    middle = full[full.index(user) + 1 : full.index(assistant)]
+    assert tok.encode("or not", add_special_tokens=False).ids != middle
+    assert SegmentTokenizer.eligible(tok) is not None
+
+
+def test_metaspace_marking_every_split_matches_full_encode():
+    tok = _metaspace_tokenizer("always")
+    assert SegmentTokenizer.eligible(tok) is None
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000)
+    rng = random.Random(5)
+    for _ in range(500):
+        text = _random_text(rng, rng.randrange(1, 20))
+        assert seg.encode(text) == tok.encode(text, add_special_tokens=False).ids
+
+
 def test_encode_special_tokens_ineligible():
     tok = _toy_tokenizer()
     tok.encode_special_tokens = True
