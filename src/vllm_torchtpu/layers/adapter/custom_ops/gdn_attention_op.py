@@ -361,18 +361,6 @@ _shared_gdn_ops: dict[tuple, Any] = {}
 _shared_gdn_op_ids = itertools.count()
 
 
-def _model_architecture(layer: object, vllm_config: object) -> str | None:
-    """The model architecture that selects ``layer``'s GDN kernel
-    (`gdn_attention.gdn_kernel_wrapper`): the layer's model config, else the
-    engine's. None when neither names one."""
-    for owner in (layer, vllm_config):
-        model_config = getattr(owner, "model_config", None)
-        architecture = getattr(model_config, "architecture", None)
-        if isinstance(architecture, str):
-            return architecture
-    return None
-
-
 def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> Any:
     """Return the ``pallas::<kind>_<n>`` op for ``(kind, key)``, building it once.
 
@@ -626,7 +614,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
         vllm_context = get_vllm_model_wrapper_context()
-        architecture = _model_architecture(self, vllm_context.vllm_config)
+        # The layer's model config selects the GDN kernel
+        # (`gdn_attention.gdn_kernel_wrapper`).
+        architecture = self.model_config.architecture
         # The non-PCP op uses num_spec_tokens for verify/rollback. PCP is a
         # prefill-only path admitted at the platform boundary; its widened
         # conv-state tail is preserved by gdn_attention_core_tpu_pcp_prefill.
@@ -776,7 +766,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
-        architecture = _model_architecture(self, vllm_config)
+        architecture = self.model_config.architecture
         mesh = vllm_context.mesh
         n_kq = self.tp_head_geometry.local_num_kq_heads
         d_k = self.head_k_dim
