@@ -163,6 +163,22 @@ def test_plan_kernel_admits_at_most_one_lane_row_of_local_experts():
     ],
 )
 def test_plan_kernel_matches_the_sharded_xla_plan(kind, t_local, topk, e_total):
+    _check_against_the_xla_plan(kind, t_local, topk, e_total, interpret=True)
+
+
+@pytest.mark.parametrize("kind", ["uniform", "nowhere"])
+@pytest.mark.parametrize("t_local,topk,e_total", [(8, 6, 384), (40, 6, 384)])
+def test_plan_kernel_lowered_for_tpu_matches_the_sharded_xla_plan(
+    kind, t_local, topk, e_total
+):
+    """The same tables from the kernel compiled through Mosaic: the dynamic
+    sublane slice, the bitcasts and the exact float32 matmuls."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("lowers the plan kernel for TPU; needs a TPU")
+    _check_against_the_xla_plan(kind, t_local, topk, e_total, interpret=False)
+
+
+def _check_against_the_xla_plan(kind, t_local, topk, e_total, *, interpret):
     T = EP * t_local
     shape = _plan_shape(t_local, topk, e_total)
     block, stride = shape.block, shape.shard_stride
@@ -191,7 +207,7 @@ def test_plan_kernel_matches_the_sharded_xla_plan(kind, t_local, topk, e_total):
             exchange, me, ids, layout, t_local, topk, e_total, block, stride
         )
         got = routing_plan(
-            exchange, jnp.full((1, 1), me, jnp.int32), shape, interpret=True
+            exchange, jnp.full((1, 1), me, jnp.int32), shape, interpret=interpret
         )
         for k, (g, w) in enumerate(zip(got.kernel_tables, want["kernel_tables"])):
             np.testing.assert_array_equal(g, w, err_msg=f"shard {me} table {k}")
