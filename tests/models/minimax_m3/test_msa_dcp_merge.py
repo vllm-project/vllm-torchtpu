@@ -71,6 +71,31 @@ def test_merge_candidates_matches_sequential_topk(dcp, num_tokens, topk):
     np.testing.assert_array_equal(got, _reference(packed, topk))
 
 
+@pytest.mark.parametrize("num_heads,num_tokens", [(1, 64), (3, 37)])
+def test_pair_merge_matches_sequential_topk_as_sets(num_heads, num_tokens):
+    """`merge_pair_candidates` (DCP 2): the reference's blocks, any order,
+    whichever rank comes first."""
+    topk = 16
+    rng = np.random.default_rng(num_heads * 10 + num_tokens)
+    heads = [_candidates(rng, 2, num_tokens, topk, 48) for _ in range(num_heads)]
+    # Rank 1 lists its picks in reverse, as `local_candidates`.
+    odd = [
+        np.concatenate([h[1, :, topk - 1 :: -1], h[1, :, : topk - 1 : -1]], -1)
+        for h in heads
+    ]
+    packed = np.stack(
+        [np.concatenate([h[0] for h in heads], -1), np.concatenate(odd, -1)]
+    )  # [2, T, G * 2 * topk]
+    for order in ([0, 1], [1, 0]):
+        got = np.asarray(
+            msa_dcp.merge_pair_candidates(jnp.asarray(packed[order]), topk)
+        )
+        for g, head in enumerate(heads):
+            np.testing.assert_array_equal(
+                np.sort(got[:, g], axis=1), np.sort(_reference(head, topk), axis=1)
+            )
+
+
 @pytest.mark.parametrize("num_heads,num_tokens", [(1, 37), (4, 300)])
 def test_kernel_merge_matches_sequential_topk(num_heads, num_tokens):
     """The DCP 8 merge kernel (`_merge_kernel`), per head, head-major packing."""

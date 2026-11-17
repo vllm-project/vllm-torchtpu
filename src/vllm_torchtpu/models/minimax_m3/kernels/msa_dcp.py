@@ -194,8 +194,16 @@ def _candidates_kernel(
                 jnp.where(best_score > _NEG_INF, best * dcp + rank, -1)
             )
             s = jnp.where(cols == best, _NEG_INF, s)
-        score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
-        block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
+        odd = (rank & 1) == 1  # picks in reverse (`local_candidates`)
+        for out_ref, picked in (
+            (score_out_ref, picked_scores),
+            (block_out_ref, picked_blocks),
+        ):
+            out_ref[...] = jnp.where(
+                odd,
+                jnp.concatenate(picked[::-1], axis=1),
+                jnp.concatenate(picked, axis=1),
+            )
 
     for width in widths:
         pl.when(width_now == width)(functools.partial(select, width))
@@ -253,8 +261,9 @@ def _candidates_kernel_t(
                 axis=0,
                 keepdims=True,
             )
-            score_out_ref[pl.ds(k, 1), :] = best_score
-            block_out_ref[pl.ds(k, 1), :] = jnp.where(
+            slot = jnp.where((rank & 1) == 1, topk - 1 - k, k)  # `local_candidates`
+            score_out_ref[pl.ds(slot, 1), :] = best_score
+            block_out_ref[pl.ds(slot, 1), :] = jnp.where(
                 best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
             )
             return jnp.where(col_ids == best, _NEG_INF, s)
@@ -336,7 +345,10 @@ def local_candidates(
     live_rows: jax.Array | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """This rank's top-k ``(scores [T, topk] f32, blocks [T, topk] i32)``.
+    """This rank's top-k ``(scores [T, topk] f32, blocks [T, topk] i32)``,
+    in the selection's order (best first), reversed on ranks of odd index:
+    a DCP pair's lists then meet as one bitonic sequence
+    (`merge_pair_candidates`), and wider groups' merges take any order.
 
     With `live_rows` (a traced count), only the row blocks holding rows
     ``[0, live_rows)`` are picked; the other rows' results are unset.
@@ -549,8 +561,9 @@ def _merge_kernel_t(c_ref, o_ref, *, topk: int):
 # Merges of more than this many candidates per token (DCP 8: 128) run
 # `_merge_kernel`: `merge_candidates`' [rows, n, n] ranking and the relayouts
 # of the [dcp, rows, 2 * topk] candidates into rows cost ~3 ms per layer in the
-# c64 mixed step (32768 rows; j-c1444339). Narrower merges (DCP 2, as c4/c16/c48
-# serve) keep the dense ranking, cheap at n = 32.
+# c64 mixed step (32768 rows; j-c1444339). Narrower ones keep the dense
+# ranking, cheap at n = 32 (`msa_attend_dcp` merges a DCP pair by
+# `merge_pair_candidates`).
 _KERNEL_MERGE_MIN_CANDIDATES = 64
 _MERGE_BLOCK_TOKENS = 256
 
@@ -581,6 +594,30 @@ def merge_head_candidates(
         name="minimax_m3_msa_dcp_merge",
     )(c)
     return out[:num_tokens].reshape(num_tokens, num_heads, topk)
+
+
+def merge_pair_candidates(candidates: jax.Array, topk: int) -> jax.Array:
+    """`merge_head_candidates` of a DCP pair as a set: ``[2, T, G * 2 *
+    topk]``, the pair's `pack_candidates` in either order -> ``[T, G,
+    topk]`` holding the same blocks, in no particular order (``-1`` for
+    missing picks).
+
+    One rank's picks are sorted in the selection's order (score descending,
+    ties to the lower block; missing picks ``(-inf, -1)`` last), the other's
+    reversed (`local_candidates`), so the top ``topk`` of their union is the
+    better of slot ``i`` of each (a bitonic merge's first step): one
+    elementwise fusion instead of the dense ranking (~20 us per layer at 8K
+    tokens, c4 twin j-2e5da13f). The attention reads a token's selection as
+    a set (page unions and membership compares)."""
+    picks = []
+    for g in range(candidates.shape[2] // (2 * topk)):
+        c = candidates[:, :, 2 * topk * g : 2 * topk * (g + 1)]
+        s0, s1 = c[0, :, :topk], c[1, :, :topk]
+        b0, b1 = c[0, :, topk:].astype(jnp.int32), c[1, :, topk:].astype(jnp.int32)
+        first = (s0 > s1) | ((s0 == s1) & (b0 < b1))
+        s = jnp.where(first, s0, s1)
+        picks.append(jnp.where(s > _NEG_INF, jnp.where(first, b0, b1), -1))
+    return jnp.stack(picks, axis=1)
 
 
 def _class_candidates(
@@ -853,7 +890,10 @@ def msa_attend_dcp(
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     pages_per_seq = block_tables_2d.shape[1]
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
-    selected = merge_head_candidates(candidates, topk, interpret)  # [T, G, topk]
+    if dcp == 2:
+        selected = merge_pair_candidates(candidates, topk)  # [T, G, topk]
+    else:
+        selected = merge_head_candidates(candidates, topk, interpret)
     num_heads = selected.shape[1]
     own_block = pos // block_size
     local_key = jnp.where(
@@ -1216,7 +1256,8 @@ def attend_and_merge(
     `scale_cache` and `hadamard`) and packed ``candidates [T, 2 * topk]`` ->
     its heads' merged output ``[T, Hl * D]``.
 
-    A prefill-sized step all-gathers the query heads and candidates, runs
+    A prefill-sized step all-gathers the query heads and candidates (a pair
+    swaps them by permutes), runs
     `msa_attend_dcp` over the group's heads, and sends each rank's head block
     of the partial and its LSEs to their owner by all-to-all for
     `merge_partials`. As XLA collectives in one program they move the
@@ -1259,9 +1300,15 @@ def attend_and_merge(
             interpret=interpret,
         )
     else:
+        if dcp == 2 and not small:
+            # `merge_pair_candidates` reads the pair in either order: own
+            # first, by one permute (XLA's all-gather of the [T, 2 * topk]
+            # candidates blocked the TensorCore 15 us per layer at 8K tokens,
+            # j-2e5da13f).
+            peer_candidates = jax.lax.ppermute(candidates, axis, [(0, 1), (1, 0)])
         cand_all = (
             jnp.stack([candidates, peer_candidates])
-            if small
+            if dcp == 2
             else jax.lax.all_gather(candidates, axis, axis=0)
         )
         out, lse = msa_attend_dcp(

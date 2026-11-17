@@ -96,6 +96,8 @@ def test_candidates_match_reference(
         interpret=True,
     )
     want_s, want_b = _reference(scores, pos, rank, dcp, init_blocks, local_blocks)
+    if rank % 2:  # odd ranks list their picks in reverse
+        want_s, want_b = want_s[:, ::-1], want_b[:, ::-1]
     np.testing.assert_array_equal(np.asarray(got_b), want_b)
     np.testing.assert_array_equal(np.asarray(got_s), want_s)
 
