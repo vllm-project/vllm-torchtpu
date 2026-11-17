@@ -864,9 +864,10 @@ def _token_symint(shape_env, source, hint=4):
     return shape_env.create_symintnode(symbol, hint=hint, source=source)
 
 
-def _int_graph(order, metas, sources=()):
+def _int_graph(order, metas, sources=None):
     """A GraphModule with the given placeholders, int ones among them;
     ``sources`` maps a name to the Dynamo source it was read from."""
+    sources = sources or {}
     graph = fx.Graph()
     for name in order:
         node = graph.placeholder(name)
