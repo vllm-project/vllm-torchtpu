@@ -23,7 +23,7 @@ import textwrap
 
 import pytest
 
-ROOT = pathlib.Path(__file__).resolve().parents[2] / "src/vllm_torchtpu"
+ROOT = pathlib.Path(__file__).resolve().parents[3] / "src/vllm_torchtpu"
 COPY_OP = ROOT / "layers/adapter/custom_ops/mamba_state_copy_op.py"
 
 
