@@ -24,7 +24,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_torchtpu.distributed.mesh_utils import CpGroupLayout, get_cp_group_layout
+from vllm_torchtpu.distributed.mesh_utils import (
+    CpGroupLayout,
+    get_cp_group_layout,
+    get_stage_mesh,
+)
+from vllm_torchtpu.distributed.pipeline_stage import PipelineStage, get_pipeline_stage
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -77,26 +82,25 @@ def get_dcp_group_layout() -> CpGroupLayout:
     return get_cp_group_layout(get_dcp_group())
 
 
-def _validate_dcp_rank_alignment(group: Any, dcp_size: int) -> None:
-    """Check DCP is the fastest-varying factor of the global rank.
+def _validate_dcp_rank_alignment(
+    group: Any, dcp_size: int, stage: PipelineStage
+) -> None:
+    """Check DCP is the fastest-varying factor of the rank within the stage.
 
     ``get_pallas_mesh`` numbers mesh positions by PyTorch rank, so a
-    ``(lane, dcp)`` mesh only describes the DCP grouping when
-    ``global_rank == lane * dcp_size + dcp_rank``. If it does not, the mesh
-    still builds and the kernels still run -- they collect over the wrong
+    ``(lane, dcp)`` mesh only describes the DCP grouping when a worker's
+    position in its stage is ``lane * dcp_size + dcp_rank``. If it is not, the
+    mesh still builds and the kernels still run -- they collect over the wrong
     partners, which is a wrong answer rather than an error.
     """
-    import torch.distributed as dist
-
-    rank = int(dist.get_rank())
-    lane, dcp_rank = divmod(rank, dcp_size)
-    expected = tuple(range(lane * dcp_size, (lane + 1) * dcp_size))
+    lane, dcp_rank = divmod(stage.position, dcp_size)
+    expected = stage.ranks[lane * dcp_size : (lane + 1) * dcp_size]
     actual = tuple(int(value) for value in group.ranks)
     if actual != expected or int(group.rank_in_group) != dcp_rank:
         raise RuntimeError(
             "DCP groups must be contiguous runs of ranks so the mesh's last "
-            f"axis is the DCP axis: global rank {rank} with "
-            f"dcp_size={dcp_size} expects ranks {expected} at position "
+            f"axis is the DCP axis: global rank {stage.ranks[stage.position]} "
+            f"with dcp_size={dcp_size} expects ranks {expected} at position "
             f"{dcp_rank}, got {actual} at position {group.rank_in_group}."
         )
 
@@ -134,26 +138,23 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
         return _single_device_dcp_mesh(axis_names)
 
     dcp_size = int(group.world_size)
-    world_size = int(dist.get_world_size())
-    if dcp_size <= 0 or world_size % dcp_size:
+    stage = get_pipeline_stage()
+    if dcp_size <= 0 or stage.size % dcp_size:
         raise NotImplementedError(
-            f"dcp_size={dcp_size} must divide the torch.distributed world of "
-            f"{world_size}."
+            f"dcp_size={dcp_size} must divide the pipeline stage of {stage.size}."
         )
-    _validate_dcp_rank_alignment(group, dcp_size)
+    _validate_dcp_rank_alignment(group, dcp_size, stage)
 
-    shape = (world_size // dcp_size, dcp_size)
+    shape = (stage.size // dcp_size, dcp_size)
     ranks = tuple(int(value) for value in group.ranks)
     cache_key = (axis_names, shape, ranks)
     cached = _MESH_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    from torch_tpu._internal.pallas import get_pallas_mesh
-
     # No device array: get_pallas_mesh numbers mesh positions by PyTorch rank,
     # which is the binding torch_tpu#3522 guarantees.
-    mesh = get_pallas_mesh(axis_names=axis_names, mesh_shape=shape)
+    mesh = get_stage_mesh(axis_names, shape)
     logger.info(
         "DCP device mesh | axes=%s shape=%s rank_in_group=%d ranks=%s",
         axis_names,

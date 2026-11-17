@@ -31,14 +31,17 @@ def _config(
     dp=1,
     ep=False,
     index_topk=None,
+    dcp=1,
 ):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=pp,
             tensor_parallel_size=tp,
             prefill_context_parallel_size=pcp,
+            decode_context_parallel_size=dcp,
             data_parallel_size=dp,
             enable_expert_parallel=ep,
+            world_size=pp * pcp * tp,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         speculative_config=speculative,
@@ -192,9 +195,24 @@ def test_linear_attention_stages_are_fine_without_kv_transfer():
     validate_pipeline_parallel_config(_config(pp=8, layer_types=HYBRID_24))
 
 
-def test_rejects_tensor_parallel_stages():
-    with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
+@pytest.mark.parametrize("inner", [{"tp": 4}, {"tp": 4, "dcp": 4}])
+def test_accepts_tensor_parallel_stages(stage_meshes, inner):
+    validate_pipeline_parallel_config(_config(pp=2, **inner))
+
+
+def test_rejects_tensor_parallel_stages_on_world_size_meshes(monkeypatch):
+    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
+    with pytest.raises(NotImplementedError, match="stages of several devices"):
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [{"tp": 2, "pcp": 4}, {"tp": 4, "dcp": 2}, {"tp": 2, "dp": 2, "ep": True}],
+)
+def test_rejects_stages_that_combine_groups_of_different_sizes(stage_meshes, inner):
+    with pytest.raises(NotImplementedError, match="groups of different sizes"):
+        validate_pipeline_parallel_config(_config(pp=2, **inner))
 
 
 @pytest.fixture
@@ -231,7 +249,7 @@ def test_pipeline_stages_of_one_device_skip_the_torch_tpu_check(monkeypatch):
 
 def test_rejects_other_kv_transfer_with_context_parallel_stages(stage_meshes):
     other = SimpleNamespace(kv_connector="TPUConnectorHMA")
-    with pytest.raises(NotImplementedError, match="context-parallel stages"):
+    with pytest.raises(NotImplementedError, match="TPURaidenConnector"):
         validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=other))
 
 

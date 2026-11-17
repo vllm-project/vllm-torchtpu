@@ -88,7 +88,7 @@ On multi-chip and multi-host slices, `vllm-torchtpu` provides specialized MoE ex
 
 ## 4. Pipeline Parallelism (`--pipeline-parallel-size`)
 
-Pipeline Parallelism partitions model layers across `PP` stages and is composable with `TP`:
+Pipeline Parallelism partitions model layers across `PP` stages; the other axes run inside each stage, over the stage's devices:
 
 ```bash
 vllm serve meta-llama/Llama-3.1-70B-Instruct \
@@ -101,7 +101,7 @@ Two chunking policies, both on by default, keep pipeline bubbles small; each has
 
 The stages hand activations on point to point: each forward's output goes to the next stage as soon as it is done, which keeps the stages busy when prompts of different lengths are in flight. The engine keeps half as many steps again in flight as the pipeline has stages (twelve for eight stages), so stage 0 has a forward queued while the engine core schedules the next step. The hand-off needs libtpu 0.0.50 or later with torch_tpu 0.2.0 or later; the start-up self-test fails fast otherwise. `TPU_PP_HANDOFF_DEPTH` (default `2`) caps the forwards a stage queues for sending: each device holds up to that many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized.
 
-A pipeline stage may also span a prefill context-parallel group (`--prefill-context-parallel-size`), splitting each chunk's attention across the stage's cores (MoE models then require `--enable-expert-parallel`). On dual-core TPU v7x hosts, a two-core stage must not bind the two cores of a single physical chip: set `VLLM_TPU_DEVICE_ORDER` to the device each local rank binds (for example, `0,2,1,3,4,6,5,7` for four two-core stages on one host).
+A stage of several devices runs tensor, prefill context or expert parallelism as an engine without a pipeline does (MoE models with context-parallel stages require `--enable-expert-parallel`). It needs a torch_tpu that compiles a process group's programs for the group's own devices, which the 0.2.0 release does not; start-up fails fast otherwise. Axes that form groups of different sizes inside one stage, such as `TP` next to `PCP`, are refused until torch_tpu compiles their programs for the stage alone. On dual-core TPU v7x hosts, a two-core context-parallel stage must not bind the two cores of a single physical chip: set `VLLM_TPU_DEVICE_ORDER` to the device each local rank binds (for example, `0,2,1,3,4,6,5,7` for four two-core stages on one host).
 
 ---
 

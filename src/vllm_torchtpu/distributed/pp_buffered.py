@@ -13,8 +13,8 @@
 # limitations under the License.
 """Point-to-point hand-off of activations between pipeline stages.
 
-Each device sends the output of a forward to the device that holds the same
-token rows in the next stage, its column, with ``torch.distributed.isend``,
+Each device sends the output of a forward to the device at its own position
+in the next stage, its column, with ``torch.distributed.isend``,
 and that device takes it with ``irecv``. A transfer involves only the two
 devices at its ends and runs no program on either: the receiver posts a
 landing buffer, and once the sender's data is ready the runtime copies it
@@ -227,20 +227,21 @@ class PPBuffered:
     ):
         from vllm.distributed.parallel_state import get_pp_group
 
-        from vllm_torchtpu.distributed.pcp import get_pcp_rank, get_pcp_world_size
+        from vllm_torchtpu.distributed.pipeline_stage import get_pipeline_stage
 
         group = get_pp_group()
         self.rank = int(group.rank_in_group)
         self.size = int(group.world_size)
         self.last = self.size - 1
         # The pipeline group of a device holds its column of every stage:
-        # the devices that hold the same token rows.
+        # the devices at its position in their stages.
         ranks = [int(rank) for rank in group.ranks]
         self.global_rank = ranks[self.rank]
         self.prev = ranks[self.rank - 1] if self.rank > 0 else None
         self.next = ranks[self.rank + 1] if self.rank < self.last else None
-        self.column = get_pcp_rank()
-        self.columns = get_pcp_world_size()
+        stage = get_pipeline_stage()
+        self.column = stage.position
+        self.columns = stage.size
         extras = [key for key in template if key not in (HIDDEN_STATES, RESIDUAL)]
         if (
             set(template) != {HIDDEN_STATES, RESIDUAL, *extras}
