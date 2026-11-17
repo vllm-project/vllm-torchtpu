@@ -302,12 +302,25 @@ def test_qwen_4096_bucket_is_not_refused_by_smem():
     assert _prebuild(layer, topk=10, node_tokens=32768) == "op"
 
 
-def test_fixed_smem_working_set_is_still_checked():
-    gather_bytes = token_gather_smem_bytes(bridge._TILE_M)
-    assert gather_bytes == 2048
+@pytest.mark.parametrize(
+    "chip,gather_bytes",
+    [
+        (None, 2048),  # a CPU host: no chip, so _TILE_M's windows
+        ("TPU_7X", 2048),
+        # FP8 on the chip the taller prefill tile runs on: its windows.
+        ("TPU_8I", 3072),
+    ],
+)
+def test_fixed_smem_working_set_is_still_checked(chip, gather_bytes):
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = chip and pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
+    tallest = bridge._PREFILL_TILE_M if chip == "TPU_8I" else bridge._TILE_M
+    assert token_gather_smem_bytes(tallest) == gather_bytes
     needed = bridge._SMEM_OVERHEAD_BYTES + gather_bytes
-    assert _prebuild(_layer(), smem_bytes=needed) == "op"
-    assert _prebuild(_layer(), smem_bytes=needed - 1) is None
+    with patch.object(bridge, "_tpu_info", return_value=info or None):
+        assert _prebuild(_layer(), smem_bytes=needed) == "op"
+        assert _prebuild(_layer(), smem_bytes=needed - 1) is None
 
 
 @pytest.mark.parametrize(
@@ -1208,3 +1221,61 @@ def test_fused_scale_buffers_are_fresh_bases_aliased_by_the_parameters():
         assert buf in dict(layer.named_buffers())
         assert isinstance(weight, torch.nn.Parameter) and not weight.requires_grad
         assert weight.shape == ref.shape and weight.data_ptr() == table.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "x_rows,groups,want",
+    [
+        # Qwen3.8 DP16 x TP2 + EP32: every TP pair holds its engine's tokens
+        # twice, so the layer's step is half the input rows.
+        (32 * 1024, tuple((2 * i, 2 * i + 1) for i in range(16)), 256),  # 16384
+        (32 * 512, tuple((2 * i, 2 * i + 1) for i in range(16)), 256),  # 8192
+        (32 * 256, tuple((2 * i, 2 * i + 1) for i in range(16)), 128),  # 4096
+        (32 * 93, tuple((2 * i, 2 * i + 1) for i in range(16)), 128),  # decode
+        # No replica groups: the input rows are the step.
+        (8192, None, 256),
+        (8184, None, 128),
+    ],
+)
+def test_prefill_steps_take_the_taller_tile(x_rows, groups, want):
+    """The tile height follows the layer's step size, counted after the split."""
+    assert bridge.tile_rows_for_step(x_rows, groups, lambda: True) == want
+    assert bridge.tile_rows_for_step(x_rows, groups, lambda: False) == bridge._TILE_M
+
+
+@pytest.mark.parametrize(
+    "chip,expert,weight_format,taller",
+    [
+        # 192 MiB of VMEM: Qwen3.8's FP8 expert keeps its three weight slots
+        # (prefetch distance 2) at 256 rows.
+        ("TPU_8I", (16, 8192, 2048), "fp8", True),
+        # A wider expert drops to two slots at 256 rows.
+        ("TPU_8I", (16, 8192, 2304), "fp8", False),
+        # Fits at the same schedule, but the 256-row tile is not validated
+        # on FP4 weights.
+        ("TPU_8I", (48, 4096, 2048), "fp4", False),
+        # 64 MiB: Qwen3.8's 256-row build does not fit at all.
+        ("TPU_7X", (16, 8192, 2048), "fp8", False),
+        # Fits at the same schedule, but the chip is not one it is measured on.
+        ("TPU_7X", (16, 4096, 1024), "fp8", False),
+    ],
+)
+def test_taller_tile_only_where_validated_and_the_weight_schedule_holds(
+    chip, expert, weight_format, taller
+):
+    """A prefill step takes 256-row tiles only on a validated chip and weight
+    format, and only where they keep the weight slots."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
+    got = bridge.taller_tile_applies(*expert, weight_format, info=info)
+    assert got is taller
+    want = bridge._PREFILL_TILE_M if taller else bridge._TILE_M
+    assert bridge.tile_rows_for_step(16384, None, lambda: got) == want
+
+
+def test_decode_steps_never_ask_whether_the_taller_tile_fits():
+    def unexpected():
+        raise AssertionError("asked for a decode-sized step")
+
+    assert bridge.tile_rows_for_step(1488, None, unexpected) == bridge._TILE_M
