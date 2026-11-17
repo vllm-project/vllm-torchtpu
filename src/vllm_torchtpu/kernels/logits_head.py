@@ -6,15 +6,20 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# Measured on v7x for the DSpark drafter's [240, 5120] x [129280, 5120]^T:
-# 435 us against 530 us for the XLA dot (the HBM floor is 448 us).
-TUNED_TILES = {(240, 5120, 129280): 1280}
+# Vocab tile per [vocab, K] weight. Measured on v7x for the DSpark drafter's
+# [240, 5120] x [129280, 5120]^T: 435 us against 530 us for the XLA dot (the
+# HBM floor is 448 us). The tile sets how the weight streams, so every row
+# count up to MAX_ROWS that fills whole BF16 sublane tiles (16 rows) shares it.
+TUNED_TILES = {(5120, 129280): 1280}
+MAX_ROWS = 288
 
 
 def is_supported_shape(rows: int, weight_shape: tuple[int, ...]) -> bool:
     return (
         len(weight_shape) == 2
-        and (rows, weight_shape[1], weight_shape[0]) in TUNED_TILES
+        and 0 < rows <= MAX_ROWS
+        and rows % 16 == 0
+        and (weight_shape[1], weight_shape[0]) in TUNED_TILES
     )
 
 
@@ -24,7 +29,7 @@ def logits_head(hidden: jax.Array, weight: jax.Array) -> jax.Array:
     vocab, weight_width = weight.shape
     assert hidden.dtype == weight.dtype == jnp.bfloat16
     assert width == weight_width
-    tile = TUNED_TILES[(rows, width, vocab)]
+    tile = TUNED_TILES[(width, vocab)]
 
     def kernel(hidden_ref, weight_ref, logits_ref):
         logits_ref[...] = jnp.dot(

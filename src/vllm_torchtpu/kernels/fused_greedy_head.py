@@ -9,8 +9,12 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.utils import get_device_name
 
-# Qualified on v7 with full-K reuse and compact partials; other shapes fall back.
-TUNED_TILES = {(288, 5120, 129280): 1280}
+# Vocab tile per [vocab, K] weight, qualified on v7 with full-K reuse and
+# compact partials. The tile sets how the weight streams; the hidden rows only
+# sit beside it in VMEM, so every row count up to MAX_ROWS that fills whole
+# BF16 sublane tiles (16 rows) shares it. Other shapes fall back.
+TUNED_TILES = {(5120, 129280): 1280}
+MAX_ROWS = 288
 
 # Packed-key layout: the high 16 bits hold an order-preserving key of the BF16
 # value, the low 16 bits hold _COL_MASK - column, so one int32 max returns the
@@ -22,7 +26,9 @@ _NAN_KEY = 0x7FFF0000  # above the key of +inf (0x7F800000): NaN wins
 def is_supported_shape(rows: int, weight_shape: tuple[int, ...]) -> bool:
     return (
         len(weight_shape) == 2
-        and (rows, weight_shape[1], weight_shape[0]) in TUNED_TILES
+        and 0 < rows <= MAX_ROWS
+        and rows % 16 == 0
+        and (weight_shape[1], weight_shape[0]) in TUNED_TILES
         and get_device_name() == "TPU v7"
     )
 
@@ -81,7 +87,7 @@ def fused_greedy_head(hidden: jax.Array, weight: jax.Array) -> jax.Array:
     vocab, weight_width = weight.shape
     assert hidden.dtype == weight.dtype == jnp.bfloat16
     assert width == weight_width
-    tile = TUNED_TILES[(rows, width, vocab)]
+    tile = TUNED_TILES[(width, vocab)]
     assert tile <= _COL_MASK + 1
     tiles = vocab // tile
 

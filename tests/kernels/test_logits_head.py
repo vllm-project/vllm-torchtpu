@@ -8,8 +8,10 @@ from vllm_torchtpu.kernels import logits_head as kernel
 
 
 def test_supported_shapes():
-    assert kernel.is_supported_shape(240, (129280, 5120))
-    assert not kernel.is_supported_shape(288, (129280, 5120))
+    for rows in (80, 96, 240, 288):
+        assert kernel.is_supported_shape(rows, (129280, 5120))
+    for rows in (0, 72, 304):
+        assert not kernel.is_supported_shape(rows, (129280, 5120))
     assert not kernel.is_supported_shape(240, (129280, 4096))
 
 
