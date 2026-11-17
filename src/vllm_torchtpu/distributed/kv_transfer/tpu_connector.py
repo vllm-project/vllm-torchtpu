@@ -2744,7 +2744,17 @@ class TPURaidenConnectorWorker:
         # Opt-in connector options; off keeps the synchronous behaviour.
         self._async_complete = _connector_option(vllm_config, "async_complete")
         self._async_register = _connector_option(vllm_config, "async_register")
+        # Public: TPUWorker reads it to find the connectors it late-polls.
         self.late_poll_enabled = _connector_option(vllm_config, "late_poll")
+        if self.late_poll_enabled and dist_utils.get_raiden_inline_load():
+            # The inline-load wait polls for its own loads before the first
+            # forward; a late poll on the async output thread could take
+            # their native done records and leave the wait spinning until
+            # the pull timeout.
+            raise ValueError(
+                "kv_connector_extra_config['late_poll'] cannot be combined "
+                "with TPU_RAIDEN_INLINE_LOAD"
+            )
         # async_complete: complete_request_blocks RPCs in flight on a
         # background thread, keyed by req_id -> (future, uuid, attempts).
         self._stage3_complete_futures: dict[str, tuple[Any, int, int]] = {}
@@ -6831,6 +6841,12 @@ class TPURaidenConnectorWorker:
         )
 
     def _poll_finished(self, engine: "KVCacheManager") -> None:
+        # get_finished already holds the lock (reentrant); the inline-load
+        # wait (_wait_for_recving) polls without it.
+        with self._stage3_poll_lock:
+            self._poll_finished_locked(engine)
+
+    def _poll_finished_locked(self, engine: "KVCacheManager") -> None:
         if (
             not self.is_producer
             and self._raiden_stage3_enabled()
