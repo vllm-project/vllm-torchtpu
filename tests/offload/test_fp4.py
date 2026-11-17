@@ -153,3 +153,17 @@ def test_page_scatter_interpret(fp4):
     np.testing.assert_array_equal(out[3], np.asarray(values[0]))
     np.testing.assert_array_equal(out[1], np.asarray(values[1]))
     assert (out[[0, 2, 4]] == 0).all()
+
+
+def test_page_gather_interpret(fp4):
+    pl = pytest.importorskip("jax.experimental.pallas")
+    src = jnp.arange(4 * 8 * 4 * 256, dtype=jnp.int32).astype(jnp.uint8).reshape(4, 8, 4, 256)
+    orig = pl.pallas_call
+    try:
+        pl.pallas_call = lambda *a, **k: orig(*a, **{**k, "interpret": True})
+        out = fp4.page_gather(src, jnp.asarray([2, 0, 2], jnp.int32))
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"interpret mode unavailable: {exc}")
+    finally:
+        pl.pallas_call = orig
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(src)[[2, 0, 2]])

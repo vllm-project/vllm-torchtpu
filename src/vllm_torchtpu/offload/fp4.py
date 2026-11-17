@@ -135,6 +135,33 @@ def page_scatter(target, values, dst):
     )(dst.astype(jnp.int32), values, target)
 
 
+def page_gather(source, ids):
+    """``source[ids]`` as one HBM-to-HBM DMA per page, bytes untouched. An XLA gather
+    of the FP8 region widened the whole operand first (j-7fec99d7-f70c-4a0d-a96a
+    reserved 60 GiB, the 30 GiB FP8 region as bf16)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    def kernel(ids_ref, src_ref, out_ref, sem):
+        i = pl.program_id(0)
+        pltpu.async_copy(src_ref.at[ids_ref[i]], out_ref.at[i], sem).wait()
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(ids.shape[0],),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        out_shape=jax.ShapeDtypeStruct((ids.shape[0], *source.shape[1:]), source.dtype),
+        name="qwen4_offload_fp4_page_gather",
+    )(ids.astype(jnp.int32), source)
+
+
 # -- the two transforms (JAX; traced inside pallas.jax_op) ---------------------
 
 
@@ -218,8 +245,9 @@ class Fp4Transcoder:
     without its TPU layout (j-fdf67c82-4a51-4f6f-a226). Writes into the pool and
     into staging go through ``page_scatter`` (whole-page DMAs, aliased, donated,
     with the ``copy_`` writeback inside ``torch.compile``). Pool pages are read
-    with a plain gather as FP8 values and converted to float, never bitcast to an
-    integer type (main-KV pages hold FP8 KV values, not reinterpreted bytes).
+    as FP8 values and converted to float, never bitcast to an
+    integer type (main-KV pages hold FP8 KV values, not reinterpreted bytes);
+    pages are read with ``page_gather`` (whole-page DMAs), never an XLA gather.
     """
 
     def __init__(self, pools: dict[int, torch.Tensor], page_bytes: int, slots: int):
@@ -275,7 +303,7 @@ class Fp4Transcoder:
                 pool: jax.Array, staging: jax.Array, blocks: jax.Array, slots: jax.Array
             ) -> tuple[jax.Array, jax.Array]:
                 n = blocks.shape[0]
-                pages = pool[kernel_pages(pool, blocks)].reshape(n, rows, ROW_SLOTS, ROW_LANES)
+                pages = page_gather(pool, kernel_pages(pool, blocks)).reshape(n, rows, ROW_SLOTS, ROW_LANES)
                 q = quantize_pages(pages, jnp, lax).reshape(n, srow, ROW_SLOTS, ROW_LANES)
                 return page_scatter(staging, q, slots), slots[0]
 
@@ -371,6 +399,12 @@ class Fp4Transcoder:
         for b in BUCKETS:
             self.quantize([(0, i) for i in range(b)])
             self.dequantize([(b - 1, 0)] * b)
+            # Run them now (execution is lazy): a program that cannot load fails
+            # here, attributed to its bucket, not in a later reader of the pool.
+            for r, pool in self.pools.items():
+                pool[:1, :1].cpu()
+                self.staging[r][:1, :1].cpu()
+            logger.info("offload fp4: bucket %d programs ran", b)
         return self.selftest()
 
     def selftest(self) -> dict:
