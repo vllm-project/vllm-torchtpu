@@ -425,6 +425,9 @@ def generate_mask(
     # test admits is below the sequence's KV length, and the KV-length test
     # (`kv_iota < n_valid`) adds nothing. Rows past a lane's query length admit
     # keys past its KV length, but rows are independent and those rows are
+    # never stored; V rows past the KV length cannot hold NaN either way
+    # (`mask_invalid_v` zeroes them on load; without it the kernel zeroes its
+    # KV buffers once per call).
     causal_only = (
         cfgs.mode == configs.RpaCase.DECODE
         and cfgs.serve.attention_scope == configs.AttentionScope.FULL
