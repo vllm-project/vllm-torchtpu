@@ -60,9 +60,11 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_token_replica_groups,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    FP4_COMBINE_HIDDEN_ALIGN,
     HIDDEN_LANE_BLOCK,
     PACK4,
     U32_SUBLANE_TILE,
+    can_use_fp4_combine,
     token_gather_smem_bytes,
 )
 from vllm_torchtpu.layers.adapter import token_padding
@@ -181,6 +183,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    combine_fp4: bool = False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -203,6 +206,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        combine_fp4,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -244,6 +248,7 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            combine_fp4=combine_fp4,
             **bias_kw,
             **routing_kw,
         )
@@ -926,6 +931,19 @@ def prebuild_fused_moe_ep(
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    combine_fp4 = False
+    if envs.MOE_FUSED_EP_COMBINE_DTYPE == "fp4":
+        if can_use_fp4_combine(hidden, weight_format):
+            combine_fp4 = True
+        else:
+            logger.warning_once(
+                "MOE_FUSED_EP_COMBINE_DTYPE='fp4' ignored for hidden=%d, "
+                "weight_format=%s (requires weight_format='fp4' and hidden "
+                "divisible by %d); falling back to FP8 combine collective.",
+                hidden,
+                weight_format,
+                FP4_COMBINE_HIDDEN_ALIGN,
+            )
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )
@@ -946,12 +964,13 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
+        combine_fp4=combine_fp4,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
-        "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s",
+        "combine_fp4=%s act=%s scoring=%s score_bias=%s hash_routing=%s "
+        "routed_scale=%s token_replica_groups=%s",
         hidden,
         inter,
         local_experts,
@@ -962,6 +981,7 @@ def prebuild_fused_moe_ep(
         sharded_plan,
         weight_format,
         rhs_qb,
+        combine_fp4,
         activation,
         scoring_fn,
         has_score_bias,

@@ -238,6 +238,28 @@ def _quant_apply(x, sinv_native, usable):
     return jnp.where(usable, x * sinv_native, jnp.zeros_like(x)).astype(FP8)
 
 
+def rowquant_fp4_hadamard(x):
+    """Per-row dynamic e2m1 quant after block-128 Walsh-Hadamard rotation."""
+    h128 = host.hadamard_128_bf16()
+    x_rot = (
+        jnp.matmul(
+            x.reshape(-1, HIDDEN_LANE_BLOCK),
+            h128,
+            preferred_element_type=jnp.float32,
+        )
+        .astype(jnp.bfloat16)
+        .reshape(x.shape)
+    )
+    amax = jnp.max(jnp.abs(x_rot), axis=-1, keepdims=True)
+    scale = amax.astype(jnp.float32) * (1.0 / host.FP4_MAX)
+    usable = jnp.isfinite(scale) & (scale > 0)
+    scale = jnp.where(usable, scale, 0.0)
+    sinv = jnp.where(usable, 1.0 / jnp.where(usable, scale, 1.0), 0.0)
+    scaled = jnp.clip(x_rot * sinv.astype(x_rot.dtype), -host.FP4_MAX, host.FP4_MAX)
+    q = jnp.where(usable, scaled, jnp.zeros_like(x_rot)).astype(FP4)
+    return q, scale
+
+
 def wire_row_and_scale(
     acc2, mid_scale, *, w2s=None, w2b=None, wire_dtype=FP8, tile_m=None
 ):
@@ -275,7 +297,9 @@ def wire_row_and_scale(
     if w2b is not None:
         down = down + w2b
     down_bf16 = down.astype(jnp.bfloat16)
-    if wire_dtype is FP8:
+    if jnp.dtype(wire_dtype) == jnp.dtype(FP4):
+        return rowquant_fp4_hadamard(down_bf16)
+    if jnp.dtype(wire_dtype) == jnp.dtype(FP8):
         return rowquant_fp8(down_bf16)
     rows = tile_m if tile_m is not None else down_bf16.shape[0]
     return down_bf16, jnp.ones((rows, 1), jnp.float32)
@@ -568,6 +592,7 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    combine_fp4=False,
 ):
     """Build the pallas_call and the function that invokes it."""
     if act_fn not in ACT_FNS:
@@ -581,6 +606,11 @@ def _build_fused_ep_moe_kernel(
     # of the wire is the weight format's, not a literal here.
     form = host.weight_form(weight_format)
     rhs_packed4 = weight_format == host.WeightFormat.FP4
+    if combine_fp4 and not host.can_use_fp4_combine(hidden, weight_format):
+        raise ValueError(
+            f"combine_fp4 requires FP4 weights and hidden ({hidden}) divisible "
+            f"by {host.FP4_COMBINE_HIDDEN_ALIGN}"
+        )
     # The weight prefetch distance and the slot count it needs are chosen
     # below, once the shapes they are sized against have been checked: they
     # are a property of THIS build and not of the process, so everything
@@ -677,6 +707,7 @@ def _build_fused_ep_moe_kernel(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        combine_fp4=combine_fp4,
     )
     prefetch_distance = slots.distance
     nbuf = slots.nbuf
@@ -926,6 +957,9 @@ def _build_fused_ep_moe_kernel(
         # for their row geometry, which the send waits count bytes against.
         contrib_hbm = next(it)
         cscl_hbm = next(it)
+        if combine_fp4:
+            recv_hbm = recv_hbm.bitcast(jnp.uint32)
+            contrib_hbm = contrib_hbm.bitcast(jnp.uint32)
         # Two independent refs (rather than a leading slot dimension) let the
         # scalar core branch once per activation tile and then use static SMEM
         # indexing for all of that tile's token rows.
@@ -1843,11 +1877,16 @@ def _build_fused_ep_moe_kernel(
                             if has_w2_bias
                             else None
                         ),
-                        wire_dtype=form.wire_dtype,
+                        wire_dtype=FP4 if combine_fp4 else form.wire_dtype,
                         tile_m=height,
                     )
-                    wire_rows_staged = wire_rows.reshape(
+                    wire_rows_3d = wire_rows.reshape(
                         height, lane_blocks, HIDDEN_LANE_BLOCK
+                    )
+                    wire_rows_staged = (
+                        pltpu.bitcast(wire_rows_3d, jnp.uint32)
+                        if combine_fp4
+                        else wire_rows_3d
                     )
                     wire_scales_staged = wire_scales.reshape(1, height)
 
@@ -2090,6 +2129,7 @@ def _build_fused_ep_moe_kernel(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 scale_slots=scale_slots,
+                combine_fp4=combine_fp4,
             )
         ]
         + [
@@ -2168,7 +2208,7 @@ def _build_fused_ep_moe_kernel(
             )
         # contrib and cscl are sized for the no-drop worst case.
         contrib_rows = ragged_rows_alloc
-        wire = form.wire_dtype
+        wire = FP4 if combine_fp4 else form.wire_dtype
         out_shape = [
             jax.ShapeDtypeStruct((recv_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
@@ -2194,9 +2234,11 @@ def _build_fused_ep_moe_kernel(
         bias_tag = ("_w13bias" if has_w1_bias else "") + (
             "_w2bias" if has_w2_bias else ""
         )
+        combine_tag = "_fp4combine" if combine_fp4 else ""
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"
+            f"{combine_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
@@ -2435,10 +2477,14 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     gt = COMBINE_GROUP
     groups = tb // gt
     lanes = HIDDEN_LANE_BLOCK
+    packed4_wire = jnp.dtype(wire_dtype) == jnp.dtype(FP4)
 
     def kernel(
         pos_sm, coef_sm, arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems
     ):
+        if packed4_wire:
+            arr_hbm = arr_hbm.bitcast(jnp.uint32)
+
         def start_row(base, parity, i, k):
             # Alternate queues by slot: this kernel is one 4 KiB descriptor per
             # arrival row and an in-order queue retires descriptors at a fixed
@@ -2455,10 +2501,9 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             """One token's weighted sum, in the arrival rows' own layout."""
             acc = None
             for k in range(topk):
-                term = (
-                    rows_vm[parity, k * tb + i].astype(jnp.float32)
-                    * coef_sm[(base + i) * topk + k]
-                )
+                raw = rows_vm[parity, k * tb + i]
+                vals = pltpu.bitcast(raw, FP4) if packed4_wire else raw
+                term = vals.astype(jnp.float32) * coef_sm[(base + i) * topk + k]
                 acc = term if acc is None else acc + term
             tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
 
@@ -2516,6 +2561,9 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    rows_vm_blocks = lane_blocks // PACK4 if packed4_wire else lane_blocks
+    rows_vm_dtype = jnp.uint32 if packed4_wire else wire_dtype
+    combine_suffix = "_fp4combine" if packed4_wire else ""
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2524,7 +2572,8 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             out_specs=hbm,
             scratch_shapes=(
                 pltpu.VMEM(
-                    (COMBINE_PARITIES, topk * tb, lane_blocks, lanes), wire_dtype
+                    (COMBINE_PARITIES, topk * tb, rows_vm_blocks, lanes),
+                    rows_vm_dtype,
                 ),
                 pltpu.VMEM((tb, lane_blocks, lanes), out_dtype),
                 pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
@@ -2537,7 +2586,7 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
         ),
-        name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}",
+        name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}{combine_suffix}",
     )
 
     def fn(arrivals, coef, pos):
