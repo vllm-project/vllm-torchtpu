@@ -85,6 +85,19 @@ class GDNMode(enum.StrEnum):
     PER_SEQ = enum.auto()
 
 
+def gdn_triangular_block_size(num_v_heads: int) -> int:
+    """Sub-block size of the chunked GDN intra-chunk solve
+    (`GDNConfig.triangular_block_size`): between-block updates scale as 1 / B,
+    so B scales inversely with the head groups of 8 value heads
+    (head_groups * B <= 16), as the largest power of two within that budget so
+    that it divides every chunk."""
+    head_groups = pl.cdiv(num_v_heads, 8)
+    for b in (16, 8, 4):
+        if head_groups * b <= 16:
+            return b
+    return 2
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Dtypes:
@@ -210,17 +223,13 @@ class GDNConfig:
         # B = 16 // 3 = 5, which does not divide a 128-row chunk).
         # Chunk sizes are powers of two, so pick the largest power of two
         # that satisfies the budget instead of the exact quotient.
-        head_groups = pl.cdiv(self.num_v_heads, 8)
         if self.is_kda:
+            head_groups = pl.cdiv(self.num_v_heads, 8)
             for b in (16, 8, 4):
                 if head_groups * b * b <= 256:
                     return b
             return 2
-        # GDN: between-block updates scale as 1 / B.
-        for b in (16, 8, 4):
-            if head_groups * b <= 16:
-                return b
-        return 2
+        return gdn_triangular_block_size(self.num_v_heads)
 
     @property
     def shared_kkt(self) -> bool:
