@@ -893,18 +893,31 @@ class TestDeferredNoForwardOutput:
         assert result.kv_connector_output.finished_recving == {"r1"}
 
     def test_timeout_bounds_the_wait(self):
-        import time
-
         from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
 
         worker = self._worker()
+        waits: list[float] = []
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            return False  # The timeout passed with no dummy batch.
+
+        worker._dummy_batch_cv.wait = wait
+        seen_count: list[int] = []
+
+        def poll():
+            seen_count.append(worker._dummy_batch_count)
+            return set()
+
         out = _DeferredNoForwardOutput(
-            SimpleNamespace(kv_connector_output=None), worker, [lambda: set()], 0
+            SimpleNamespace(kv_connector_output=None), worker, [poll], 0
         )
-        out.timeout_s = 0.02
-        t = time.monotonic()
+        out.timeout_s = 5.0
         result = out.get_output()
-        assert 0.015 <= time.monotonic() - t < 1.0
+        # One wait, bounded by timeout_s; then the poll runs without a dummy
+        # batch and the output comes back unchanged.
+        assert len(waits) == 1 and 0 < waits[0] <= 5.0
+        assert seen_count == [0]
         assert result.kv_connector_output is None
 
 
