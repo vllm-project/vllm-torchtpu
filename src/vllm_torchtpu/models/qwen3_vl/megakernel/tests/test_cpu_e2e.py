@@ -16,9 +16,10 @@
 The adapter loads `SPEC` by this folder's package name, runs its startup
 checks on a fake multimodal M-RoPE runner, and `create` builds a program for
 a tiny geometry; the program packs the fake vLLM backbone's bf16 weights,
-binds its per-layer bf16 KV caches, warms up and serves a decode step through
-the CPU-interpret kernel, and leaves a step with prompt tokens to the stock
-model.
+binds its per-layer bf16 KV caches at their page size (128 tokens, or 512 as
+vLLM picks at 256 sequences of 262144 tokens), warms up and serves a decode
+step through the CPU-interpret kernel, and leaves a step with prompt tokens to
+the stock model.
 """
 
 from __future__ import annotations
@@ -48,10 +49,11 @@ def _w(*shape: int) -> SimpleNamespace:
     return SimpleNamespace(weight=torch.randn(shape, dtype=torch.bfloat16) * 0.05)
 
 
-def _backbone(g: Any) -> SimpleNamespace:
+def _backbone(g: Any, page_size: int) -> SimpleNamespace:
     """A vLLM-like Qwen3-VL text backbone: fused qkv / gate_up projections in
     `(out, in)` layout and one bf16 KV cache of HND pages per layer."""
-    page = model.Qwen3VLText.pool_layout(g, R=1).kv_page_shape
+    lay = model.Qwen3VLText.pool_layout(g, R=1)
+    page = dataclasses.replace(lay, page_size=page_size).kv_page_shape
     half = g.ROT // 2
     inv = g.theta ** (-torch.arange(half, dtype=torch.float32) / half)
     ang = torch.arange(4096, dtype=torch.float32)[:, None] * inv
@@ -84,10 +86,13 @@ def _backbone(g: Any) -> SimpleNamespace:
     return SimpleNamespace(embed_tokens=embed, layers=layers, norm=_w(g.H))
 
 
-@pytest.fixture
-def tiny_runner(mk_fake_runner: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
-    """A fake TP=1 multimodal runner over a tiny backbone, with this folder as
-    the megakernel plugin (one `(1, 1)` bucket)."""
+@pytest.fixture(params=[128, 512], ids=["p128", "p512"])
+def tiny_runner(
+    request: pytest.FixtureRequest, mk_fake_runner: Any, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """A fake TP=1 multimodal runner over a tiny backbone of `request.param`-token
+    KV pages, with this folder as the megakernel plugin (one `(1, 1)` bucket)."""
+    page_size = request.param
     g = tiny_geom(R=1)
     ex = ExecSpec(
         R=1,
@@ -114,7 +119,7 @@ def tiny_runner(mk_fake_runner: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     qsl = np.zeros(16, dtype=np.int32)
     qsl[:2] = [0, 1]
     return mk_fake_runner(
-        model=SimpleNamespace(model=_backbone(g)),
+        model=SimpleNamespace(model=_backbone(g, page_size)),
         hf_config=SimpleNamespace(
             architectures=list(model.Qwen3VLText.hf_architectures)
         ),
@@ -124,7 +129,7 @@ def tiny_runner(mk_fake_runner: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
             "stats_period_s": 3600,
         },
         mesh=Mesh(np.array(jax.devices("cpu")[:1]), ("tp",)),
-        block_size=128,
+        block_size=page_size,
         supports_mm_inputs=True,
         uses_mrope=True,
         token_paddings=(1, 2, 4),
@@ -170,8 +175,14 @@ def test_serves_decode_and_leaves_prompt_steps_to_stock(tiny_runner: Any) -> Non
     assert res.step_mix == {"mk_t1_b1": 1, "stock_prompt": 1}
     out = res.outputs[0]
     assert out.shape == (1, 256) and bool(torch.isfinite(out.float()).all())
-    # The new token's K/V went to KV index 129 (page 4, slot 1) of every layer.
-    for layer in tiny_runner.model.model.layers:
-        page = layer.self_attn.attn.kv_cache[0][4].float()
-        assert page[..., 1].abs().sum() > 0
-        assert page[..., 0].abs().sum() == 0 and page[..., 2:].abs().sum() == 0
+    # The kernel took the pool's pages, and the new token's K/V went to KV
+    # index 129 of every layer: page 4 slot 1 at 128 tokens, page 3 slot 129 at 512.
+    layers = tiny_runner.model.model.layers
+    ps = layers[0].self_attn.attn.kv_cache[0].shape[-1]
+    assert res.program.spec.cache_backend.layout.page_size == ps
+    page_id, slot = (3, 4)[129 // ps], 129 % ps
+    for layer in layers:
+        page = layer.self_attn.attn.kv_cache[0][page_id].float()
+        assert page[..., slot].abs().sum() > 0
+        assert page[..., :slot].abs().sum() == 0
+        assert page[..., slot + 1 :].abs().sum() == 0

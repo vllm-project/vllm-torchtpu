@@ -17,8 +17,8 @@ The megakernel serves the decoder's single-request decode steps; prefill,
 vision and every step with prompt tokens left stay on the stock model. Serve
 it with `VLLM_TPU_MEGAKERNEL=1` (by the checkpoint's arch) or `qwen3_vl`, and
 the stock paths this kernel's KV pages match: `VLLM_KV_CACHE_LAYOUT=HND`,
-`--attention-backend CUSTOM`, `--block-size 128`. Importing this module loads
-no torch / jax / vLLM: `create` is imported lazily.
+`--attention-backend CUSTOM`, at any page size of 128-token multiples.
+Importing this module loads no torch / jax / vLLM: `create` is imported lazily.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ SPEC = TpuMonoSpec(
     chips=("TPU7x",),
     tp_sizes=(8,),
     features=frozenset({"mrope", "multimodal", "prefix_caching"}),
-    requires={"kv_cache_dtype": "auto", "block_size": "128"},
+    requires={"kv_cache_dtype": "auto"},
     # Cosmos3 is a Qwen3-VL whose decoder is the Qwen3-VL text model.
     architectures=("Cosmos3ForConditionalGeneration",),
     model_types=("cosmos3_omni",),

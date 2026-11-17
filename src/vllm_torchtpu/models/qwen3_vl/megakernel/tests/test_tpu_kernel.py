@@ -16,10 +16,13 @@
 A tiny two-layer geometry (one KV head per rank, as the checkpoint at TP=8)
 runs one paged decode step with RoPE from a per-row table at an M-RoPE
 position 7 below the KV index, and the ungated attention, bf16 KV pages and
-dense FFN through the whole model reference.
+dense FFN through the whole model reference, at the page sizes vLLM picks:
+128 tokens, and 512 when its SMEM page-table bound raises the block size.
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -61,21 +64,31 @@ def _check_close(got: np.ndarray, ref: np.ndarray, atol: float, rtol: float) -> 
     np.testing.assert_allclose(got, ref, atol=atol, rtol=rtol)
 
 
-def test_kernel_matches_model_reference() -> None:
+@pytest.mark.parametrize(
+    ("page_size", "kv_blk"),
+    [(128, 256), (512, 1024), (512, 256)],
+    ids=["p128_blk2pages", "p512_blk2pages", "p512_blk_rounds_up_to_1page"],
+)
+def test_kernel_matches_model_reference(page_size: int, kv_blk: int) -> None:
     mdef = model.register()
     g = tiny_geom(R=R)
     ex = ExecSpec(
         R=R,
         B=2,
         T=1,
-        ctx=512,
-        tiles=tiny_tiles(kv_blk=256),
-        cache=CacheExec(paged_kv=True, num_pages=16, max_pages_per_seq=4),
+        ctx=4 * page_size,
+        tiles=tiny_tiles(kv_blk=kv_blk),
+        cache=CacheExec(
+            paged_kv=True, page_size=page_size, num_pages=16, max_pages_per_seq=4
+        ),
     )
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos, hid, w_l, st_l = random_logical_inputs(
+    _, hid, w_l, st_l = random_logical_inputs(
         jax.random.PRNGKey(0), g, ex, model_def=mdef
     )
+    # The new tokens land past the first page: slot 7 of page 1, and the last
+    # page's slot `page_size - 5`.
+    pos = jnp.array([page_size + 7, 4 * page_size - 5], jnp.int32)
     rope_cs = _rope_table(g, pos - 7, ex.MR)
     ref_out, ref_st = mdef.reference_step(
         g, ex, pos, hid, w_l, st_l, extra={ROPE_TABLE_INPUT: rope_cs}
@@ -84,7 +97,9 @@ def test_kernel_matches_model_reference() -> None:
     pos_k, hid_k, w_k, st_k = pack_inputs(
         pos, hid, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True, model_def=mdef
     )
-    step = cache.make_pooled_step(mesh, mdef.to_model_spec(g, R=R), ex)
+    lay = dataclasses.replace(mdef.pool_layout(g, R=R), page_size=page_size)
+    spec = mdef.to_model_spec(g, R=R).with_layout(lay)
+    step = cache.make_pooled_step(mesh, spec, ex)
     rope_k = jax.device_put(jnp.tile(rope_cs, (R, 1, 1)), NamedSharding(mesh, P("tp")))
     out, st_out = step(pos_k, hid_k, w_k, st_k, rope_k)
 
@@ -95,7 +110,6 @@ def test_kernel_matches_model_reference() -> None:
     cos = (out[0] * ref).sum() / np.linalg.norm(out[0]) / np.linalg.norm(ref)
     assert cos >= 0.9999, cos
 
-    lay = mdef.pool_layout(g, R=R)
     pt, _, _, _ = pool.allocate_test_layout(lay, ex)
     kv = pool.pool_to_states(lay, ex, st_out[pool.POOL_STATE_NAME], pt)
     for k in ("kc", "vc"):

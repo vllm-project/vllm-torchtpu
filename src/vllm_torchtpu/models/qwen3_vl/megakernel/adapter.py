@@ -15,9 +15,10 @@
 
 `create` checks the checkpoint without loading anything; `load` packs the
 bf16 weights of the loaded vLLM model; `bind` aliases its 64 per-layer bf16
-KV caches; `build` returns one bridge step per decode bucket, which embeds the
-ids, gathers each row's M-RoPE cos / sin from vLLM's rotary cache and runs
-the backbone through the final norm (the runner computes the logits);
+KV caches at their page size; `build` returns one bridge step per decode
+bucket, which embeds the ids, gathers each row's M-RoPE cos / sin from
+vLLM's rotary cache and runs the backbone through the final norm (the runner
+computes the logits);
 `decide` / `forward` route decode (`T=1`) steps whose requests are all past
 their prompt.
 """
@@ -25,6 +26,7 @@ their prompt.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
@@ -42,6 +44,7 @@ from vllm_torchtpu.megakernel.adapter import (
 from vllm_torchtpu.megakernel.adapter.plugin import ForwardView, RunnerView
 from vllm_torchtpu.megakernel.core import CacheExec, ExecSpec, Profile
 from vllm_torchtpu.megakernel.core import runtime as mk_rt
+from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.runtime.contract import (
     Bucket,
     Decline,
@@ -59,8 +62,7 @@ logger = init_logger(__name__)
 OPTION_KEYS = frozenset({"profile", "buckets"})
 KV_LAYOUT_DECLINE = "kv_cache_layout"
 KV_LAYOUT_HINT = (
-    "serve with VLLM_KV_CACHE_LAYOUT=HND --attention-backend CUSTOM "
-    "--block-size 128 and a bf16 KV cache"
+    "serve with VLLM_KV_CACHE_LAYOUT=HND --attention-backend CUSTOM and a bf16 KV cache"
 )
 
 
@@ -182,14 +184,25 @@ class Qwen3VLProgram:
 
     def bind(self, view: RunnerView) -> None:
         """Alias every layer's KV cache as one bf16 pool of the kernel's pages,
-        and read vLLM's rotary cos / sin cache."""
-        lay = self.spec.cache_backend.layout
-        page = tuple(lay.kv_page_shape)
-        pools = []
-        for i, layer in enumerate(self.backbone.layers):
+        at the pool's page size, and read vLLM's rotary cos / sin cache."""
+        raws = []
+        for layer in self.backbone.layers:
             raw = _unwrap(layer.self_attn.attn.kv_cache)
             if isinstance(raw, torch.Tensor) and raw.ndim == 6 and raw.shape[0] == 1:
                 raw = raw[0]
+            raws.append(raw)
+        lay = self.spec.cache_backend.layout
+        if isinstance(raws[0], torch.Tensor) and raws[0].ndim > 0:
+            # vLLM sizes the pages (512 tokens at max_model_len 262144 and
+            # max_num_seqs 256, its SMEM page-table bound); the kernel takes them.
+            lay = dataclasses.replace(lay, page_size=int(raws[0].shape[-1]))
+            try:
+                lay.validate()
+            except MegakernelConfigError as exc:
+                raise _kv_decline(f"layer 0 KV cache pages: {exc}") from exc
+        page = tuple(lay.kv_page_shape)
+        pools = []
+        for i, raw in enumerate(raws):
             if not (
                 isinstance(raw, torch.Tensor)
                 and raw.dtype == torch.bfloat16
@@ -223,6 +236,7 @@ class Qwen3VLProgram:
                 )
             )
         self.view = view
+        self.spec = self.spec.with_layout(lay)
         self.raw_pools = pools
         self.num_pages = num_pages
         self.max_pages_per_seq = view.max_pages_per_seq
@@ -233,7 +247,7 @@ class Qwen3VLProgram:
             self.profile,
             self.geom,
             num_pages=num_pages,
-            page_size=page[-1],
+            page_size=lay.page_size,
             max_pages_per_seq=self.max_pages_per_seq,
         )
 
