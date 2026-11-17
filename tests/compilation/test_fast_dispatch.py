@@ -26,18 +26,17 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm_torchtpu import _qx_fastcall
-from vllm_torchtpu.compilation import compile_options
+from vllm_torchtpu.compilation import compile_options, fast_dispatch
 from vllm_torchtpu.compilation.compile_options import CompileOptions
 
 
 @pytest.fixture(autouse=True)
 def _disarmed():
     """Every test starts and ends with the hook disarmed (main's default)."""
-    _qx_fastcall.configure(fast=False, drop_global_state=False)
+    fast_dispatch.configure(fast=False, drop_global_state=False)
     torch._dynamo.reset()
     yield
-    _qx_fastcall.configure(fast=False, drop_global_state=False)
+    fast_dispatch.configure(fast=False, drop_global_state=False)
     torch._dynamo.reset()
 
 
@@ -53,17 +52,17 @@ def _compiled(fn, **options):
         backend="eager",
         fullgraph=True,
         dynamic=False,
-        options={"guard_filter_fn": _qx_fastcall._drop_global_state},
+        options={"guard_filter_fn": fast_dispatch._drop_global_state},
     )
-    return _qx_fastcall._wrap(compiled, fn)
+    return fast_dispatch._wrap(compiled, fn)
 
 
 def _calls(wrapped, n):
     x = torch.arange(4.0)
-    before = list(_qx_fastcall._STATS)
+    before = list(fast_dispatch._STATS)
     for _ in range(n):
         assert torch.equal(wrapped(x), x * 2 + 1)
-    return [a - b for a, b in zip(_qx_fastcall._STATS, before)]
+    return [a - b for a, b in zip(fast_dispatch._STATS, before)]
 
 
 def test_options_default_off():
@@ -87,9 +86,9 @@ def test_options_are_strict(raw, message):
 def test_hook_is_installed_at_platform_import():
     import vllm_torchtpu.platforms  # noqa: F401
 
-    assert _qx_fastcall._INSTALLED
+    assert fast_dispatch._INSTALLED
     assert torch.compile.__name__ == "compile"
-    assert torch.compile.__code__.co_name == "qx_compile"
+    assert torch.compile.__code__.co_name == "compile_hook"
 
 
 def test_disarmed_wrapper_only_calls_the_compiled_function():
@@ -99,7 +98,7 @@ def test_disarmed_wrapper_only_calls_the_compiled_function():
     wrapped = _compiled(f)
     assert _calls(wrapped, 4) == [0, 0]
     # Nothing was cached for direct dispatch.
-    assert wrapped._qx_fast_state["entries"] == []
+    assert wrapped._fast_dispatch_state["entries"] == []
     # torch._dynamo.disable() unwraps it to the plain function.
     assert wrapped._torchdynamo_orig_callable is f
     assert torch._dynamo.eval_frame.innermost_fn(wrapped) is f
@@ -125,10 +124,10 @@ def test_fast_dispatch_keeps_every_compiled_entry():
     compile_options.apply(_config({"fast_compiled_call": True}))
     wrapped = _compiled(f)
     small, large = torch.arange(4.0), torch.arange(8.0)
-    before = list(_qx_fastcall._STATS)
+    before = list(fast_dispatch._STATS)
     for x in (small, large, small, large, small, large):
         assert torch.equal(wrapped(x), x * 2 + 1)
-    fast, slow = (a - b for a, b in zip(_qx_fastcall._STATS, before))
+    fast, slow = (a - b for a, b in zip(fast_dispatch._STATS, before))
     assert (fast, slow) == (4, 2)
 
 
@@ -146,7 +145,7 @@ def _num_threads_recompiles():
         compiled(x)
     finally:
         torch.set_num_threads(threads)
-    return _qx_fastcall._entry_count(g.__code__)
+    return fast_dispatch._entry_count(g.__code__)
 
 
 def test_disarmed_filter_keeps_the_global_state_guard():
@@ -155,7 +154,7 @@ def test_disarmed_filter_keeps_the_global_state_guard():
         SimpleNamespace(guard_type="GLOBAL_STATE"),
         SimpleNamespace(guard_type="TENSOR_MATCH"),
     ]
-    assert _qx_fastcall._drop_global_state(entries) == [True, True]
+    assert fast_dispatch._drop_global_state(entries) == [True, True]
     assert _num_threads_recompiles() == 2
 
 
@@ -165,7 +164,7 @@ def test_drop_global_state_guard_reuses_the_entry_across_threads():
         SimpleNamespace(guard_type="GLOBAL_STATE"),
         SimpleNamespace(guard_type="TENSOR_MATCH"),
     ]
-    assert _qx_fastcall._drop_global_state(entries) == [False, True]
+    assert fast_dispatch._drop_global_state(entries) == [False, True]
     assert _num_threads_recompiles() == 1
 
 
@@ -186,7 +185,7 @@ def test_worker_arms_the_hook_before_anything_else():
             rank=0,
             distributed_init_method="tcp://127.0.0.1:29500",
         )
-    assert _qx_fastcall._CONFIG == {"fast": True, "drop_global_state": False}
+    assert fast_dispatch._CONFIG == {"fast": True, "drop_global_state": False}
 
 
 class _HashStub:

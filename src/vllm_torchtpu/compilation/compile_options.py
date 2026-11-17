@@ -20,7 +20,7 @@ Every option defaults to off, which is main's behaviour. The options change
 how compiled programs are guarded and called, so the section stays in the
 compile-cache key. The worker applies them with :func:`apply` when it is
 built, before any compiled function runs; the torch.compile hook in
-``_qx_fastcall`` is installed at import but does nothing until then.
+``fast_dispatch`` is installed at import but does nothing until then.
 """
 
 import dataclasses
@@ -42,7 +42,7 @@ class CompileOptions:
     fast_compiled_call: bool = False
     """Call those functions' compiled code directly when one of their cached
     entries' guards accepts the arguments, instead of going through Dynamo's
-    frame evaluation on every call (``_qx_fastcall``)."""
+    frame evaluation on every call (``fast_dispatch``)."""
 
 
 def parse(raw: Any) -> CompileOptions:
@@ -86,10 +86,10 @@ def get(vllm_config: Any) -> CompileOptions:
 
 def apply(vllm_config: Any) -> CompileOptions:
     """Arm the torch.compile hook of this process with the engine's options."""
-    from vllm_torchtpu import _qx_fastcall
+    from vllm_torchtpu.compilation import fast_dispatch
 
     options = get(vllm_config)
-    _qx_fastcall.configure(
+    fast_dispatch.configure(
         fast=options.fast_compiled_call,
         drop_global_state=options.drop_global_state_guard,
     )
