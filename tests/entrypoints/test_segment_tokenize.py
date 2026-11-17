@@ -267,6 +267,30 @@ def test_normalized_token_under_a_changing_normalizer_is_ineligible():
     assert SegmentTokenizer.eligible(tok) is None
 
 
+def test_tokenizer_without_added_tokens_is_ineligible(monkeypatch):
+    """With nothing to split at, the split pattern would be empty and match
+    at every position; the original path runs instead."""
+    import vllm_torchtpu.segment_tokenize as st
+
+    tok = Tokenizer(models.BPE())
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.train_from_iterator(
+        [CORPUS] * 5,
+        trainer=trainers.BpeTrainer(
+            vocab_size=300, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()
+        ),
+    )
+    assert tok.get_added_tokens_decoder() == {}
+    assert SegmentTokenizer.eligible(tok) is not None
+
+    class Wrapper:
+        def __init__(self, backend):
+            self._tokenizer = backend
+
+    monkeypatch.setattr(st, "_INSTANCES", {})
+    assert st.get_segment_tokenizer(Wrapper(tok), 10_000) is None
+
+
 def test_encode_special_tokens_ineligible():
     tok = _toy_tokenizer()
     tok.encode_special_tokens = True

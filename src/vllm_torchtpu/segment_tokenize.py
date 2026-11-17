@@ -301,6 +301,8 @@ class SegmentTokenizer:
         if getattr(backend, "encode_special_tokens", False):
             return "encode_special_tokens is set"
         added = list(backend.get_added_tokens_decoder().values())
+        if not added:
+            return "no added tokens to split at"
         for tok in added:
             if tok.lstrip or tok.rstrip or tok.single_word:
                 return f"added token {tok.content!r} is not a hard split point"
