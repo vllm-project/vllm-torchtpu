@@ -350,6 +350,26 @@ def test_gmm_quantized_lhs_applies_each_rhs_block_scale(
     rhs_scale = rhs_scale * block_factor[None, :, None]
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     group_sizes = get_group_sizes(batch_size, num_groups)
+    tile_info = TileSizes(tile_m=128, tile_k=tile_k, tile_n=256, bucket_base=128)
+
+    cfgs = make_gmm_configs(
+        lhs,
+        rhs_q,
+        rhs_scale,
+        None,
+        group_sizes,
+        jnp.zeros((1,), jnp.int32),
+        tile_info=tile_info,
+        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=True,
+        zero_initialize=True,
+    )
+    if not cfgs.lhs_cfgs.should_quantize:
+        pytest.skip(
+            f"gmm_v2 does not quantize the lhs for {jnp.dtype(weight_dtype)} here."
+        )
 
     expected = reference_gmm(lhs, rhs_q, group_sizes, rhs_scale=rhs_scale)
     actual = gmm_v2(
@@ -357,7 +377,7 @@ def test_gmm_quantized_lhs_applies_each_rhs_block_scale(
         rhs_q,
         group_sizes,
         rhs_scale=rhs_scale,
-        tile_info=TileSizes(tile_m=128, tile_k=tile_k, tile_n=256, bucket_base=128),
+        tile_info=tile_info,
         maybe_quantize_lhs=True,
     )
 

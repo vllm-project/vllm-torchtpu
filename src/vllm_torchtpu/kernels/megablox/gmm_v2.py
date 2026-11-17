@@ -1250,19 +1250,24 @@ def make_gmm_configs(
         if tpu_info.int8_ops_per_second > 0 and not is_rhs_float:
             lhs_q_dtype = jnp.int8.dtype
 
-    lhs_qbs = lhs_quant_block_size(block_size, dims.size_k)
-    if lhs_q_dtype is not None and lhs_qbs is None:
-        logger.warning_once(
-            "[GMM kernel] rhs quant block size %d (K=%d) has no lane-aligned lhs "
-            "quantization block that divides it; lhs stays unquantized (bf16).",
-            block_size,
-            dims.size_k,
-        )
-        lhs_q_dtype = None
+    lhs_qbs = _LHS_QUANT_BLOCK_SIZE
+    if lhs_q_dtype is not None:
+        aligned_qbs = lhs_quant_block_size(block_size, dims.size_k)
+        if aligned_qbs is None:
+            logger.warning_once(
+                "[GMM kernel] rhs quant block size %d (K=%d) has no lane-aligned "
+                "lhs quantization block that divides it; lhs stays unquantized "
+                "(bf16).",
+                block_size,
+                dims.size_k,
+            )
+            lhs_q_dtype = None
+        else:
+            lhs_qbs = aligned_qbs
 
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
-        quant_block_size=_LHS_QUANT_BLOCK_SIZE if lhs_qbs is None else lhs_qbs,
+        quant_block_size=lhs_qbs,
         dtype=lhs.dtype,
     )
     assert (
