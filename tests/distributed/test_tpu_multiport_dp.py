@@ -253,11 +253,22 @@ def _resolve_device_ids(device_ids, additional):
     )
 
 
+@pytest.fixture
+def isolated_registry(monkeypatch):
+    """A registry with nothing applied yet, as in a freshly spawned process."""
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    monkeypatch.setattr(patch_registry, "_applying", set())
+    monkeypatch.setattr(patch_registry, "_active_stages", set())
+
+
 @pytest.mark.parametrize("flag,raises", [(True, False), (False, True)])
-def test_registration_lets_core_indexed_device_ids_through(monkeypatch, flag, raises):
+def test_registration_lets_core_indexed_device_ids_through(
+    monkeypatch, isolated_registry, flag, raises
+):
     """DPSupervisor hands rank 2 of DP4 x TP2 --device-ids [4, 5]; with four
     chips in TPU_VISIBLE_CHIPS, vLLM rejects that unless the platform stops
-    consulting the variable."""
+    consulting the variable. The general plugin installs the patch through the
+    registry's general_plugin stage."""
     import vllm.engine.arg_utils as arg_utils
 
     from vllm_torchtpu.layers import register_layers
@@ -273,6 +284,11 @@ def test_registration_lets_core_indexed_device_ids_through(monkeypatch, flag, ra
 
     register_layers()
 
+    assert arg_utils.EngineArgs._resolve_device_ids._tpu_multiport_dp_patch
+    assert (
+        "vllm_torchtpu.distributed.tpu_multiport_dp:install_device_ids_patch"
+        in patch_registry._applied
+    )
     if raises:
         with pytest.raises(ValueError, match="out of range"):
             _resolve_device_ids([4, 5], {})

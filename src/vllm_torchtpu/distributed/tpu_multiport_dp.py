@@ -44,7 +44,8 @@ supervisor copies its arguments, this option included, into every child. Off
   port and the slicebuilder list for the whole N*TP slice; the cross-host
   rendezvous is not run.
 * ``resolve_device_ids`` (wraps vLLM's ``EngineArgs._resolve_device_ids``,
-  installed by the package's general plugin, which vLLM loads in
+  installed at the patch registry's ``general_plugin`` stage, which the
+  package's general plugin applies and vLLM loads in
   ``EngineArgs.__post_init__``): the supervisor's ``--device-ids``
   count TPU cores, not the chips ``TPU_VISIBLE_CHIPS`` lists. Chip binding on
   this path is owned by the TPU worker binding, so vLLM's device-control
