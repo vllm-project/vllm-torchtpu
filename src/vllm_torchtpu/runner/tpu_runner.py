@@ -698,50 +698,44 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 
 def _strip_prefill_only_padding(
     scheduler_output: "SchedulerOutput", input_batch: "InputBatch"
-) -> int:
-    """Drop draft-placeholder rows vLLM padded onto a final prompt token
-    (prefill-only MTP).
+) -> "SchedulerOutput":
+    """The step without the draft-placeholder rows vLLM padded onto a final
+    prompt token (prefill-only MTP).
 
-    Applies only to a request whose placeholders are all -1 and whose step
-    would cross the prompt by exactly those rows. Returns how many requests
-    were trimmed. A module function rather than a runner method: it reads only
-    the step and the input batch, so runner stand-ins need nothing extra.
+    Drops them only for a request whose drafts are all -1 placeholders and
+    whose step crosses the end of the prompt only because of them. Returns a
+    copy when it drops any, as ``trim_scheduled_drafts`` does: under a
+    uniprocess executor the scheduler holds the same object, and it rolls the
+    placeholders back as rejected drafts only if it still sees them.
     """
-    spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+    spec = scheduler_output.scheduled_spec_decode_tokens
     if not spec:
-        return 0
+        return scheduler_output
     info: dict[str, tuple[int, int | None]] = {}
-    for nrd in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
-        prompt_ids = getattr(nrd, "prompt_token_ids", None)
+    for nrd in scheduler_output.scheduled_new_reqs:
+        prompt_ids = nrd.prompt_token_ids
         info[nrd.req_id] = (
-            int(nrd.num_computed_tokens),
+            nrd.num_computed_tokens,
             len(prompt_ids) if prompt_ids is not None else None,
         )
-    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-    if cached is not None:
-        for req_id, computed in zip(
-            getattr(cached, "req_ids", ()) or (),
-            getattr(cached, "num_computed_tokens", ()) or (),
-        ):
-            idx = input_batch.req_id_to_index.get(req_id)
-            prompt = (
-                int(input_batch.num_prompt_tokens[idx]) if idx is not None else None
-            )
-            info[req_id] = (int(computed), prompt)
-    trimmed = 0
-    for req_id, drafts in list(spec.items()):
+    cached = scheduler_output.scheduled_cached_reqs
+    for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
+        idx = input_batch.req_id_to_index.get(req_id)
+        prompt = int(input_batch.num_prompt_tokens[idx]) if idx is not None else None
+        info[req_id] = (computed, prompt)
+    num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+    total = scheduler_output.total_num_scheduled_tokens
+    stripped: dict[str, int] = {}
+    for req_id, drafts in spec.items():
         if not drafts or any(int(t) != -1 for t in drafts):
             continue
-        n = scheduler_output.num_scheduled_tokens.get(req_id)
+        n = num_scheduled_tokens.get(req_id)
         computed, prompt = info.get(req_id, (None, None))
         if n is None or computed is None or prompt is None:
             continue
         if computed + n > prompt and computed + n - len(drafts) <= prompt:
-            scheduler_output.num_scheduled_tokens[req_id] = n - len(drafts)
-            scheduler_output.total_num_scheduled_tokens -= len(drafts)
-            del spec[req_id]
-            trimmed += 1
-            logger.warning_once(
+            stripped[req_id] = len(drafts)
+            logger.debug(
                 "Prefill-only MTP: dropped %d draft-placeholder row(s) padded "
                 "onto the final prompt token of request %s "
                 "(num_computed_tokens=%d, num_prompt_tokens=%d).",
@@ -750,7 +744,25 @@ def _strip_prefill_only_padding(
                 computed,
                 prompt,
             )
-    return trimmed
+    if not stripped:
+        return scheduler_output
+    logger.warning_once(
+        "Prefill-only MTP: dropping the draft-placeholder rows vLLM pads onto a "
+        "request's final prompt token; the scheduler counts them as rejected "
+        "drafts. Per-request details are logged at DEBUG."
+    )
+    num_scheduled_tokens = dict(num_scheduled_tokens)
+    for req_id, num_drafts in stripped.items():
+        num_scheduled_tokens[req_id] -= num_drafts
+        total -= num_drafts
+    return dataclasses.replace(
+        scheduler_output,
+        num_scheduled_tokens=num_scheduled_tokens,
+        scheduled_spec_decode_tokens={
+            req_id: drafts for req_id, drafts in spec.items() if req_id not in stripped
+        },
+        total_num_scheduled_tokens=total,
+    )
 
 
 # Recompilation-avoidance contract:
@@ -4391,7 +4403,9 @@ class TPUModelRunner(GPUModelRunner):
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         if self._mtp_prefill_only:
-            _strip_prefill_only_padding(scheduler_output, self.input_batch)
+            scheduler_output = _strip_prefill_only_padding(
+                scheduler_output, self.input_batch
+            )
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
