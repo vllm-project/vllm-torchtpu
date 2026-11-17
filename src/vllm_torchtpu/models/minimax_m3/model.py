@@ -42,11 +42,14 @@ from vllm.model_executor.models.utils import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
-from vllm_torchtpu.models.minimax_m3.kernels import sp_norm
+from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.ops.sp_norm import get_add_norm_quant_op
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
+
+logger = init_logger(__name__)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -415,6 +418,9 @@ class MiniMaxM3Model(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        bound = max(layer.self_attn.score_bound() for layer in self.layers)
+        on = msa_attention_lse.configure_max_free(bound)
+        logger.info("MiniMax-M3 MSA score bound %.1f: max-free softmax %s", bound, on)
         return loaded_params
 
 

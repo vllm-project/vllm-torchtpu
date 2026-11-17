@@ -60,6 +60,9 @@ _INLINE_ISSUE_PAGES = 16
 # x1.476), inside exp's f32 range (88.7) both ways: p = exp2(s) never
 # overflows, and a row's largest p stays a normal float.
 MAX_FREE = True
+# `configure_max_free` keeps MAX_FREE only under this score bound: exp(75)
+# leaves e^13 of f32 range for a tile's softmax sum and p @ v.
+_MAX_FREE_SCORE_BOUND = 75.0
 # With `MAX_FREE`, `attend_t` takes each token's mask from the QK matmul: the
 # keys carry a column block that is -_MASK_BIAS where a token does not see the
 # key, the queries a one-hot of their token there.
@@ -297,9 +300,10 @@ def _kernel(
 
         def finish(m, denom, acc):
             """Output and lse from a tile's softmax state (log2 units, ``m``
-            finite). A row that saw no slot has ``denom = 0`` and ``acc = 0``:
-            its output is 0 and its lse ``m + log(0) = -inf`` with no select (a
-            seen row has ``denom >= 1``)."""
+            finite: the running max, or 0 with `MAX_FREE`). A row that saw no
+            slot has ``denom = 0`` and ``acc = 0``: its output is 0 and its lse
+            ``m + log(0) = -inf`` with no select (a seen row's ``denom`` is at
+            least `_denom_floor`)."""
             write(
                 acc * (1.0 / jnp.maximum(denom, _denom_floor())),
                 m * _LN_2 + jnp.log(denom),
@@ -538,6 +542,15 @@ def _kernel(
     if steps_per_call is not None:
         b = b % steps_per_call
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+
+
+def configure_max_free(score_bound: float) -> bool:
+    """Sets `MAX_FREE` for a loaded model whose largest score bound (natural
+    log units, every layer, after its keys' cache rounding) is
+    `score_bound`, and returns it: off past `_MAX_FREE_SCORE_BOUND`."""
+    global MAX_FREE
+    MAX_FREE = score_bound <= _MAX_FREE_SCORE_BOUND
+    return MAX_FREE
 
 
 def _denom_floor() -> float:

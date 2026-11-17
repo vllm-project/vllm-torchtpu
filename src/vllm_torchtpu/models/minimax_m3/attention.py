@@ -340,6 +340,10 @@ class MiniMaxM3SparseAttention(nn.Module):
             scales_in_page=True,
         )
         self.fp4 = dtype == torch.uint8
+        # Cached keys' norm over the exact ones', at most (`score_bound`): int4
+        # rows of a Hadamard-rotated vector carry ~12 % rounding (1.25 here;
+        # 1.476 only if every other element sat half a step off), e4m3 1/16.
+        self.key_rounding = 1.25 if self.fp4 else 1.0625 if dtype.itemsize == 1 else 1.0
         self.scale_cache = None
         if self.fp4:
             if self.index_shards > 1:
@@ -400,6 +404,15 @@ class MiniMaxM3SparseAttention(nn.Module):
             eps,
             self.q_head_major,
         )
+
+    def score_bound(self) -> float:
+        """Largest ``|q . k| * head_dim**-0.5`` the loaded norms allow:
+        per-head RMS norms (weight ``1 + w``; RoPE and the int4 rotation keep
+        norms) give ``sqrt(D) * max|1 + w_q| * max|1 + w_k|``, times the
+        cache's key rounding."""
+        q_gain = (1.0 + self.q_norm.weight.float()).abs().max().item()
+        k_gain = (1.0 + self.k_norm.weight.float()).abs().max().item()
+        return self.head_dim**0.5 * q_gain * k_gain * self.key_rounding
 
     def forward(
         self,
