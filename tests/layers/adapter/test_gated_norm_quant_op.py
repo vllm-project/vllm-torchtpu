@@ -70,8 +70,7 @@ class _HostOp:
 @pytest.fixture
 def host_ops(monkeypatch):
     """Call after constructing the layer, whose own ops stay mocked."""
-    monkeypatch.setattr(gated_norm_quant_op, "_norm_ops", {})
-    monkeypatch.setattr(linear_common, "_prequant_matmul_op", None)
+    monkeypatch.setattr(gated_norm_quant_op, "_out_proj_ops", {})
     monkeypatch.setattr(linear_common, "_quantized_matmul_kernel_op", None)
     monkeypatch.setattr(
         gnq,
@@ -279,10 +278,9 @@ def test_steps_below_16_rows_run_the_reference(
     host_ops, monkeypatch, rows, uses_kernel
 ):
     """A step of fewer than 16 rows (MIN_ROWS; small decode steps) runs the JAX
-    reference inside both ops, and a 16-row step runs the kernel. The ops are
-    traced for their shapes only."""
+    reference inside the fused output projection op, and a 16-row step runs
+    the kernel. The op is traced for its shapes only."""
     host_ops()
-    monkeypatch.setattr(gated_norm_quant_op, "_out_proj_ops", {})
     paths: list[str] = []
     kernel, reference = gnq.gated_norm_quant, gnq.reference
 
@@ -302,7 +300,6 @@ def test_steps_below_16_rows_run_the_reference(
     o = jax.ShapeDtypeStruct((rows, heads, dim), jnp.bfloat16)
     z = jax.ShapeDtypeStruct((rows, heads * dim), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((dim,), jnp.float32)
-    jax.eval_shape(gated_norm_quant_op._norm_ops[1e-6].fn, o, z, w)
     jax.eval_shape(
         gated_norm_quant_op._out_proj_ops[1e-6].fn,
         o,
@@ -311,8 +308,7 @@ def test_steps_below_16_rows_run_the_reference(
         jax.ShapeDtypeStruct((heads * dim, n), jnp.float8_e4m3fn),
         jax.ShapeDtypeStruct((n,), jnp.float32),
     )
-    path = "kernel" if uses_kernel else "reference"
-    assert paths == [path, path]
+    assert paths == ["kernel" if uses_kernel else "reference"]
 
 
 def test_prequant_matmul_equals_the_quantizing_matmul():
@@ -332,7 +328,6 @@ def test_prequant_matmul_equals_the_quantizing_matmul():
 def test_build_ops_registers_with_the_real_op_bridge(monkeypatch):
     """`pallas.jax_op` validates the JAX function's signature, including its
     return annotation, at registration; the host stand-in above does not."""
-    monkeypatch.setattr(gated_norm_quant_op, "_norm_ops", {})
-    monkeypatch.setattr(linear_common, "_prequant_matmul_op", None)
+    monkeypatch.setattr(gated_norm_quant_op, "_out_proj_ops", {})
     gated_norm_quant_op._build_ops(1e-6)
-    assert list(gated_norm_quant_op._norm_ops) == [1e-6]
+    assert list(gated_norm_quant_op._out_proj_ops) == [1e-6]
