@@ -652,6 +652,23 @@ def test_checks_hlo_ir_warmup_and_sentinel():
     )
     assert not ok_bad and "expected >= 2 donated pool arguments" in msg_bad
 
+    # bf16 hd128 pages `(2, 64, 2, 128)`: the page shape follows the dtype.
+    bf16_ir = good_ir.replace("64x2x64x4x128xf8E4M3FN", "64x2x64x2x128xbf16")
+    ok_bf16, msg_bf16 = verify_compiled_step_ir(
+        bf16_ir,
+        num_pages=64,
+        page_size=128,
+        kvh=1,
+        hd=128,
+        num_pools=2,
+        page_dtype=jnp.bfloat16,
+    )
+    assert ok_bf16, msg_bf16
+    ok_fp8, _ = verify_compiled_step_ir(
+        bf16_ir, num_pages=64, page_size=128, kvh=1, hd=128, num_pools=2
+    )
+    assert not ok_fp8
+
     assert ir_required_buckets(
         [(1, 8), (1, 16), (4, 16)],
         {(1, 8): True, (1, 16): False, (4, 16): True},

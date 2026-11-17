@@ -710,7 +710,7 @@ class Qwen35Program:
             if bucket_t < m_rows:
                 hid = F.pad(hid, (0, 0, 0, m_rows - bucket_t))
             hid_out = execute_pooled_step_inplace(
-                op, pos_b, hid, pt_b, ckpt_b, roff_b, weights, pools
+                op, pos_b, hid, pt_b, [ckpt_b, roff_b], weights, pools
             )
             if hid_out.shape[0] > out_rows:
                 hid_out = hid_out[:out_rows].clone()

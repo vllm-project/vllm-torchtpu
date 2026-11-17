@@ -15,7 +15,23 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+import jax.numpy as jnp
+
+from .ops import kv_page_shape
 from .pool import POOL_KERNEL_NAMES, PoolLayout
+
+# KV page dtype -> its name in StableHLO / MLIR and in HLO text.
+IR_DTYPE_NAMES: dict[str, tuple[str, str]] = {
+    "float8_e4m3fn": ("f8E4M3FN", "f8e4m3fn"),
+    "bfloat16": ("bf16", "bf16"),
+}
+
+
+def ir_dtype_names(dtype: Any) -> tuple[str, str]:
+    """`(mlir, hlo)` element type names of a KV page `dtype`."""
+    return IR_DTYPE_NAMES[jnp.dtype(dtype).name]
 
 
 def check_fused_pooled_step_hlo(
@@ -51,8 +67,9 @@ def check_pooled_step_hlo(
 ) -> tuple[bool, str]:
     """Verify that a compiled pooled step HLO has no full-pool HBM or VMEM copies.
 
-    The pool page shape (`page_size`, `kvh`, `hd`) defaults to `layout` (or the
-    validated `PoolLayout()` page geometry); explicit arguments override it.
+    The pool page shape (`page_size`, `kvh`, `hd`) and dtype default to `layout`
+    (or the validated `PoolLayout()` page geometry); explicit arguments
+    override it.
     `kernel_names` defaults to the generic pool kernel names.
 
     `min_pool_pages` (default 16) filters out small per-token KV (1-page) or
@@ -97,10 +114,12 @@ def check_pooled_step_hlo(
             f"(found {n_tpu_cc} tpu_custom_call, need >={min_cc})"
         )
         return False, msg
-    pool_suffix = f",{2 * kvh},{hd // 4},4,{page_size}]"
+    page = kv_page_shape(kvh, hd, page_size, lay.page_dtype)
+    pool_suffix = f",{','.join(map(str, page))}]"
+    hlo_dt = ir_dtype_names(lay.page_dtype)[1]
     for line in hlo_text.splitlines():
         if pool_suffix in line and (
-            "copy-start(" in line or ("= f8e4m3fn[" in line and "copy(" in line)
+            "copy-start(" in line or (f"= {hlo_dt}[" in line and "copy(" in line)
         ):
             prefix = line.split(pool_suffix, 1)[0]
             dim_str = prefix.rsplit("[", 1)[-1].rsplit(",", 1)[-1].strip()

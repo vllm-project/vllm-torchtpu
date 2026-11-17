@@ -166,7 +166,7 @@ def test_exported_bridge_raiden_pointer_identity_and_bit_exact(T: int, B: int) -
     assert len(out_specs) == 1 + len(pools_t)
 
     hid_out_t = execute_pooled_step_inplace(
-        op, pos_t, hid_t, pt_t, ckpt_t, roff_t, w_flat_t, pools_t
+        op, pos_t, hid_t, pt_t, [ckpt_t, roff_t], w_flat_t, pools_t
     )
 
     # 4. Assert Raiden pointer identity: neither data_ptr() nor storage ptr changed

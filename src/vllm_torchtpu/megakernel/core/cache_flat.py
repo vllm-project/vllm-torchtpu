@@ -30,6 +30,7 @@ from .cache_common import (
     validate_page_table_shape,
 )
 from .exec_spec import ExecSpec
+from .planner import extra_inputs
 from .pool import check_ckpt_bounds
 from .pool.config import (
     POOL_STATE_NAME,
@@ -52,7 +53,10 @@ def make_flat_pooled_step(
     """Build a flat-signature `shard_map` step for `torch_xla` bridge integration.
 
     Flat input signature:
-      `(pos, hidden, *w_flat, *raw_pools, page_table, ckpt_indices, read_offsets)`
+      `(pos, hidden, *w_flat, *raw_pools, page_table, *step_meta)`, where
+      `step_meta` is `(ckpt_indices, read_offsets)` for a recurrent pool backend
+      (none for attention-only pools), then the module extra inputs
+      (`Module.extra_inputs`, sharded like `make_pooled_step`'s).
     Flat output signature:
       `(out_hidden, *raw_pools_out)`
     """
@@ -110,12 +114,15 @@ def make_flat_pooled_step(
     pool_start = 2 + n_w_flat
     pool_end = pool_start + num_pools
     donate_argnums = tuple(range(pool_start, pool_end)) if donate_pools else ()
+    extras = extra_inputs(ms, ex_paged)
+    n_rec = 2 if has_rec else 0
 
     in_specs = (
         (P(), P("tp"))
         + (P("tp"),) * n_w_flat
         + (P("tp"),) * num_pools
-        + (P(), P(), P())
+        + (P(),) * (1 + n_rec)
+        + tuple(P("tp") if x.memory_space == "hbm" else P() for x in extras)
     )
     out_specs = (P("tp"),) + (P("tp"),) * num_pools
     max_pt = resolved_max_pages_per_seq(ex_paged)
@@ -126,9 +133,10 @@ def make_flat_pooled_step(
             r.squeeze(0) if r.ndim == 6 else r
             for r in rest[n_w_flat : n_w_flat + num_pools]
         )
-        page_table, ckpt_indices, read_offsets = rest[
-            n_w_flat + num_pools : n_w_flat + num_pools + 3
-        ]
+        meta = rest[n_w_flat + num_pools :]
+        page_table = meta[0]
+        ckpt_indices, read_offsets = meta[1 : 1 + n_rec] if has_rec else (None, None)
+        extra = meta[1 + n_rec :]
 
         w_args: list[Any] = []
         w_idx = 0
@@ -192,7 +200,7 @@ def make_flat_pooled_step(
                 st_map_f["ckpt_indices"] = ckpt_indices
                 st_map_f["read_offsets"] = read_offsets
             s_args_f = [st_map_f[k] for k in p_l.s_names]
-            out_vals_f = call_l(pos, hidden, *w_args, *s_args_f)
+            out_vals_f = call_l(pos, hidden, *w_args, *s_args_f, *extra)
             if not isinstance(out_vals_f, (tuple, list)):
                 out_vals_f = (out_vals_f,)
             out_map_f = dict(zip(p_l.o_names, out_vals_f))
@@ -238,7 +246,7 @@ def make_flat_pooled_step(
             pb.page_table_state_name: page_table,
         }
         s_args = [st_map[k] for k in s_names]
-        out_vals = call(pos, hidden, *w_args, *s_args)
+        out_vals = call(pos, hidden, *w_args, *s_args, *extra)
         if not isinstance(out_vals, (tuple, list)):
             out_vals = (out_vals,)
         out_map = dict(zip(o_names, out_vals))

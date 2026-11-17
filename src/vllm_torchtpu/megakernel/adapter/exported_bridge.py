@@ -152,7 +152,9 @@ def build_pooled_step_op(
     """Build a PyTorch custom op wrapping `cache.make_flat_pooled_step`.
 
     Returns `(op, in_specs, out_specs, donate_argnums)` where `op` takes
-    `(pos, hidden, page_table, ckpt_indices, read_offsets, weights, pools)`.
+    `(pos, hidden, page_table, step_meta, weights, pools)`: `step_meta` is the
+    flat step's arguments after the page table (`ckpt_indices`, `read_offsets`
+    for recurrent pools, then the module extra inputs).
     """
     global _OP_COUNTER
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
@@ -199,8 +201,7 @@ def build_pooled_step_op(
         pos: torch.Tensor,
         hidden: torch.Tensor,
         page_table: torch.Tensor,
-        ckpt_indices: torch.Tensor,
-        read_offsets: torch.Tensor,
+        step_meta: list[torch.Tensor],
         weights: list[torch.Tensor],
         pools: list[torch.Tensor],
     ) -> list[torch.Tensor]:
@@ -210,8 +211,7 @@ def build_pooled_step_op(
             *weights,
             *pools,
             page_table,
-            ckpt_indices,
-            read_offsets,
+            *step_meta,
         ]
         if pos.device.type == "cpu":
             # CPU interpret execution path for unit tests without a TPU host.
@@ -236,8 +236,7 @@ def build_pooled_step_op(
         pos: torch.Tensor,
         hidden: torch.Tensor,
         page_table: torch.Tensor,
-        ckpt_indices: torch.Tensor,
-        read_offsets: torch.Tensor,
+        step_meta: list[torch.Tensor],
         weights: list[torch.Tensor],
         pools: list[torch.Tensor],
     ) -> list[torch.Tensor]:
@@ -251,8 +250,7 @@ def execute_pooled_step_inplace(
     pos: torch.Tensor,
     hidden: torch.Tensor,
     page_table: torch.Tensor,
-    ckpt_indices: torch.Tensor,
-    read_offsets: torch.Tensor,
+    step_meta: Sequence[torch.Tensor],
     weights: Sequence[torch.Tensor],
     pools: Sequence[torch.Tensor],
 ) -> torch.Tensor:
@@ -265,8 +263,7 @@ def execute_pooled_step_inplace(
         pos,
         hidden,
         page_table,
-        ckpt_indices,
-        read_offsets,
+        list(step_meta),
         list(weights),
         list(pools),
     )

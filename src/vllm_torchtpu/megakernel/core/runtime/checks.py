@@ -26,8 +26,11 @@ import numpy as np
 from jax.sharding import NamedSharding
 
 from .. import cache
+from ..cache_hlo import ir_dtype_names
 from ..errors import MegakernelConfigError, MegakernelLayoutError
 from ..exec_spec import ExecSpec
+from ..ops import FP8, kv_page_shape
+from ..planner import extra_inputs
 from ..pool.config import cache_exec
 from ..spec import ModelSpec
 from .policy import MTP_VERIFY_TOKENS
@@ -111,22 +114,22 @@ def build_global_avals(
     max_pages_per_seq: int,
     ckpt_cols: int | None = None,
 ) -> list[_Sds]:
-    """Construct global `jax.ShapeDtypeStruct` descriptors for HLO lowering/export."""
+    """Global `jax.ShapeDtypeStruct`s of the `make_flat_pooled_step` arguments."""
     r_cnt, g = mesh.devices.size, spec.config
     k_ckpt = ckpt_cols if ckpt_cols is not None else ex.T
     g_per_att = max(1, pool_schedule_info(spec).recurrent_slots_per_pool)
-    sds = [
-        _Sds((r_cnt * int(t.shape[0]), *t.shape[1:]), _any_dtype_to_jax(t.dtype))
-        for t in (*w_flat, *raw_pools)
-    ]
-    return [
-        _Sds((ex.B,), jnp.int32),
-        _Sds((r_cnt * ex.M, g.H), jnp.bfloat16),
-        *sds,
-        _Sds((ex.NS, max_pages_per_seq), jnp.int32),
-        _Sds((g_per_att, ex.NS, k_ckpt), jnp.int32),
-        _Sds((g_per_att, ex.NS), jnp.int32),
-    ]
+    i32 = jnp.int32
+    avals = [((ex.B,), i32), ((r_cnt * ex.M, g.H), jnp.bfloat16)]
+    for t in (*w_flat, *raw_pools):
+        sh = (r_cnt * int(t.shape[0]), *t.shape[1:])
+        avals.append((sh, _any_dtype_to_jax(t.dtype)))
+    avals.append(((ex.NS, max_pages_per_seq), i32))
+    if spec.cache_backend.has_recurrent_pool:
+        avals += [((g_per_att, ex.NS, k_ckpt), i32), ((g_per_att, ex.NS), i32)]
+    for x in extra_inputs(spec, ex):
+        lead = r_cnt if x.memory_space == "hbm" else 1
+        avals.append(((lead * x.shape[0], *x.shape[1:]), x.dtype))
+    return [_Sds(sh, dt) for sh, dt in avals]
 
 
 def verify_pooled_step_hlo(
@@ -163,11 +166,10 @@ def verify_pooled_step_hlo(
     lowered = jax.jit(step_fn, **j_kw, keep_unused=True).lower(*avals)
     hlo_text = lowered.compile().as_text() if do_comp else lowered.as_text("hlo")
     num_pages, page_size = int(raw_pools[0].shape[0]), int(raw_pools[0].shape[-1])
-    g, pb = spec.config, spec.cache_backend
-    kvh = int(g.nkv(ex.R)) if hasattr(g, "nkv") else 1
+    pb = spec.cache_backend
     def_k = ("gather_gdn_states", "scatter_pool_states")
     k_names = pb.kernel_names if pb is not None else def_k
-    hlo_kw = dict(kvh=kvh, hd=int(g.HD), min_pool_pages=max(16, num_pages))
+    hlo_kw = dict(layout=pb.layout, min_pool_pages=max(16, num_pages))
     fio = cache_exec(ex).FUSED
     return cache.check_pooled_step_hlo(
         hlo_text, page_size, fused_pool_io=fio, kernel_names=k_names, **hlo_kw
@@ -188,11 +190,15 @@ def verify_compiled_step_ir(
     kvh: int,
     hd: int,
     num_pools: int,
+    page_dtype: Any = FP8,
     hlo_text: str | None = None,
 ) -> tuple[bool, str]:
     """Verify that a compiled outer forward step donates and aliases all pools."""
     if not ir_text or not ir_text.strip():
         return False, "empty compiled IR"
+    page = kv_page_shape(kvh, hd, page_size, page_dtype)
+    page_x = "x".join(map(str, page))
+    mlir_dt, hlo_dt = ir_dtype_names(page_dtype)
     calls = ("stablehlo.custom_call", "mhlo.custom_call", "custom-call(")
     if not any(tok in ir_text for tok in calls):
         return False, "missing custom kernel call in compiled IR"
@@ -203,7 +209,7 @@ def verify_compiled_step_ir(
         main_m = re.search(r"func\.func\b[^{]*@main\s*\((.*?)\)\s*->", ir_text, re.S)
         if main_m is None:
             return False, "missing func.func @main signature in compiled MLIR"
-        pool_sh = f"{num_pages}x{2 * kvh}x{hd // 4}x4x{page_size}xf8E4M3FN"
+        pool_sh = f"{num_pages}x{page_x}x{mlir_dt}"
         pool_pat = re.compile(rf"%arg\d+\s*:\s*tensor<{pool_sh}>(?:\s*(\{{[^}}]*\}}))?")
         don_pat = re.compile(r"jax\.buffer_donor = true|tf\.aliasing_output\s*=\s*\d+")
         matches = pool_pat.finditer(main_m.group(1))
@@ -222,13 +228,13 @@ def verify_compiled_step_ir(
             msg = f"entries in HloModule input_output_alias, found {len(aliases)}"
             return False, f"expected >= {num_pools} {msg}"
 
-    mlir_pat = re.compile(rf"\b(\d+)x{2 * kvh}x{hd // 4}x4x{page_size}xf8E4M3FN\b")
-    hlo_suf = f",{2 * kvh},{hd // 4},4,{page_size}]"
+    mlir_pat = re.compile(rf"\b(\d+)x{page_x}x{mlir_dt}\b")
+    hlo_suf = f",{','.join(map(str, page))}]"
     for txt in [ir_text] + extra_hlo:
         for line in txt.splitlines():
             if "func.func" in line or "ENTRY" in line or "custom_call" in line:
                 continue
-            is_hlo_cp = "= f8e4m3fn[" in line and "copy(" in line
+            is_hlo_cp = f"= {hlo_dt}[" in line and "copy(" in line
             if not (any(op in line for op in _COPY_OPS) or is_hlo_cp):
                 continue
             s_ln = line.strip()
