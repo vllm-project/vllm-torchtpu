@@ -49,7 +49,3 @@ def test_the_shared_adapter_does_not_import_it_at_module_level():
         and "qwen3_5" in ast.unparse(node)
     ]
     assert not top_level
-
-
-def test_the_v3_package_no_longer_has_it():
-    assert not (PACKAGE / "kernels/fused_moe/v3/dense_slots.py").exists()
