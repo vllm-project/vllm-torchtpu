@@ -196,12 +196,6 @@ def derive_params(
     BLK = tt.block(ps) if paged else tt.kv_blk
     PAIR_KV = tt.pair_kv
     NKV = max(tt.nkv, 4) if PAIR_KV else tt.nkv
-    if PAIR_KV and tt.nkv < 4:
-        _warn_gqa_once(
-            ("pair_kv_nkv", tt.nkv),
-            "GQATunables.pair_kv=True raised nkv from %d to 4",
-            tt.nkv,
-        )
     if ex.ctx <= 0 or BLK <= 0 or ex.ctx % BLK != 0 or BLK % 128 != 0:
         raise MegakernelConfigError(
             f"GQA requires ctx ({ex.ctx}) % kv_blk ({BLK}) == 0 and kv_blk % 128 == 0"
@@ -368,6 +362,12 @@ def derive_params(
         and (g.HD // kv_pk) % 8 == 0
         else 0
     )
+    if PAIR_KV and tt.nkv < 4 and not KVS_IPT:  # `KVS` has no KV ring depth
+        _warn_gqa_once(
+            ("pair_kv_nkv", tt.nkv),
+            "GQATunables.pair_kv=True raised nkv from %d to 4",
+            tt.nkv,
+        )
     return GQAParams(
         H=g.H,
         nh=nh,
