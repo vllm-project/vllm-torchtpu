@@ -40,7 +40,9 @@ multi-turn think-time within a strictly bounded HBM pin budget:
    ``prepare_prefill_split`` and ``adjust_prefill_split`` align the checkpoint
    to ``num_prompt_tokens - 4`` and also checkpoint the pre-final full block
    (``f640 - 640``) of fork candidates so later requests that share all but
-   the last block hit immediately without a 2-request Marconi delay. A fork
+   the last block hit immediately. Without this checkpoint, vLLM's
+   shared-prefix boundary snapshots the junction only when a second request
+   reaches it, so that second request still recomputes the prefix. A fork
    candidate is decided once, at the request's first prefill chunk, from
    ``start <= 0`` (cold prefill), never from the request id.
 2. Pin running (full boundary + partial tail + fork junction). Once a decoding
@@ -95,9 +97,13 @@ _PIN_MAX_DECODE_BLOCKS = 4
 _PIN_MAX_MISSED_PROBES = 3
 # Maximum fork/root junction entries retained in _fork_lru (3 blocks each).
 _MAX_FORK_LRU_ENTRIES = 16
+# Over the pinned-block cap, fork anchors beyond this many are evicted before
+# any latest-turn conversation entry: conversations hold the next turn's
+# boundary, and this many anchors still cover the shared roots in use.
+_MIN_FORK_ANCHORS_KEPT = 8
 # Safety bound on per-request fork decisions (normally popped on finish).
 _MAX_FORK_DECISIONS = 8192
-# Why KVCacheManager.allocate_slots returned None (vLLM v0.31.0):
+# Why KVCacheManager.allocate_slots returned None (vLLM 0.33):
 #   inflight_reserve: required <= free but required > free - reserved_blocks, the
 #     async-load admission gate that keeps the remaining-prompt blocks of every
 #     in-flight prefill free (Scheduler._inflight_prefill_reserved_blocks).
@@ -107,8 +113,9 @@ _MAX_FORK_DECISIONS = 8192
 #   unknown: none of the above could be established.
 # "required" is the coordinator's block count plus the waiting-request watermark.
 ALLOC_NONE_REASONS = ("inflight_reserve", "no_blocks", "same_step", "unknown")
-# Retention bounds and policy; every IX point ran these values (C: none set
-# them). The constructor arguments override them.
+# Retention bounds and policy: the values the Qwen3.5 prefill legs were
+# measured with (none of them set another value). The constructor arguments
+# override them.
 _MAX_CONVERSATIONS = 96
 _MAX_PINNED_BLOCKS = 360
 _KEEP_PRIOR_TURNS = 1
@@ -156,7 +163,7 @@ class _ForkLRUEntry(NamedTuple):
 
 def retention_wanted(vllm_config: Any) -> bool:
     """Whether a scheduler should keep hybrid-state snapshots: on a KV producer
-    (the IX prefill legs). ``HybridStateRetention.enabled`` then also requires
+    (a prefill leg). ``HybridStateRetention.enabled`` then also requires
     a Mamba group, a full-attention group and prefix caching."""
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     return getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
@@ -518,7 +525,7 @@ class HybridStateRetention:
         self, request: Any, kwargs: dict[str, Any]
     ) -> tuple[str, int, int]:
         """Returns (reason, required blocks, free blocks) for a None from
-        allocate_slots; mirrors the two refusal checks in vLLM v0.31.0
+        allocate_slots; mirrors the two refusal checks in vLLM 0.33's
         KVCacheManager.allocate_slots."""
         free = self._get_num_free_blocks()
         if self._same_step_hit(kwargs.get("new_computed_blocks")):
@@ -702,9 +709,9 @@ class HybridStateRetention:
         return [s for s in stops if s > start]
 
     def adjust_prefill_split(self, request: Any, start: int, aligned: int) -> int:
-        """Clip ``aligned`` prefill chunk tokens so the chunk stops at mandatory
-        v16 Mamba state checkpoints (``pre_full = f640 - 640``, untainted
-        ``full_boundary``, and untainted ``fine_boundary``)."""
+        """Clip ``aligned`` prefill chunk tokens so the chunk stops at the
+        Mamba state checkpoints this module needs (``pre_full = f640 - 640``,
+        untainted ``full_boundary``, and untainted ``fine_boundary``)."""
         if not self.enabled or aligned <= 0:
             return aligned
         end = start + aligned
@@ -1138,7 +1145,7 @@ class HybridStateRetention:
             if prior_key is not None:
                 if not self.evict_conversation(prior_key):
                     break
-            elif len(self._fork_lru) > 8:
+            elif len(self._fork_lru) > _MIN_FORK_ANCHORS_KEPT:
                 if not self.evict_oldest_fork_anchor():
                     break
             elif self._conv_lru:
