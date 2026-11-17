@@ -13,9 +13,11 @@
 # limitations under the License.
 """GDN output projection with the gated norm and fp8 quantization fused.
 
-Where the kernel was measured the runner calls :func:`install_if_supported`
-after loading (a Qwen3.5 rule, ``measured``). :func:`install` checks every
-gated-delta-net layer and marks it, and the layer's output
+Where the kernel was measured (the Qwen3.5 rule,
+``measured.maybe_install_fused_norm_kernels``), :func:`install_after_loading`
+has vLLM's loader call :func:`route_measured_model` on every model it
+finishes, which calls :func:`install_if_supported`. :func:`install` checks
+every gated-delta-net layer and marks it, and the layer's output
 projection runs :func:`output_projection`: one kernel produces the out-proj's
 fp8 rows and scales from the GDN output and the gate, and the fp8 matmul runs
 on them, instead of ``RMSNormGated`` followed by the fp8 linear.
@@ -24,6 +26,7 @@ Custom-op registration and shape guards for fused post-GDN RMSNormGated +
 FP8 quantization.
 """
 
+import functools
 from collections.abc import Callable, Collection
 from typing import cast
 
@@ -45,6 +48,9 @@ logger = init_logger(__name__)
 
 # Steps of fewer rows run the JAX reference inside the same custom op.
 MIN_ROWS = 16
+
+# Marks the wrapper install_after_loading puts on the loader's post-processing.
+_INSTALLED_ATTR = "_tpu_gdn_fused_norm_quant"
 
 _out_proj_ops: dict[float, Callable] = {}
 
@@ -186,6 +192,47 @@ def install_if_supported(
             )
             return 0
     return install(model)
+
+
+def route_measured_model(model: torch.nn.Module, model_config) -> int:
+    """Qwen3.5 rule: route the GDN output projections of a loaded model
+    through the fused kernel where it was measured
+    (``measured.is_measured_model``: Qwen3.5-397B-A17B on TPU7x, at the GDN
+    value heads per device of its legs) and every GDN layer allows it.
+    Other models, other Qwen3.5 checkpoints (the MTP draft among them) and
+    other devices are untouched. Returns the number of layers routed."""
+    # Imported here so that importing the GDN layer, which imports this
+    # module, does not load the Qwen3.5 config hook the rule reads.
+    from vllm_torchtpu.models.qwen3_5.kernels import measured
+
+    if not measured.is_measured_model(model_config):
+        return 0
+    return install_if_supported(model, value_heads=measured.GDN_VALUE_HEADS)
+
+
+def install_after_loading() -> None:
+    """Call :func:`route_measured_model` on every model vLLM's loader builds,
+    right after its weights are processed into their runtime layout (the
+    out_proj's FP8 weight, scales and (k, n) layout the fused path checks).
+
+    Idempotent. Every model a loader builds, pipeline stages and the draft
+    included, passes through ``process_weights_after_loading``, so the
+    routing needs no call of its own in the runner.
+    """
+    from vllm.model_executor.model_loader import base_loader
+
+    original = base_loader.process_weights_after_loading
+    if getattr(original, _INSTALLED_ATTR, False):
+        return
+
+    @functools.wraps(original)
+    def process_weights_after_loading(model, model_config, target_device):
+        result = original(model, model_config, target_device)
+        route_measured_model(model, model_config)
+        return result
+
+    setattr(process_weights_after_loading, _INSTALLED_ATTR, True)
+    base_loader.process_weights_after_loading = process_weights_after_loading
 
 
 def output_projection(
