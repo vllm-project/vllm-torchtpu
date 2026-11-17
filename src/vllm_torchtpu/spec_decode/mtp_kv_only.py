@@ -32,8 +32,10 @@ Pass 1 is `MlaKvWriteOp` (layers/adapter/custom_ops/mla_attention_op.py): the
 latents come from the wrapper's and indexer's own projections, and the rows go
 through the same cache writers the attention and indexer ops call, with the
 same owner masks and slots, so every entry it writes is the entry the full
-pass writes. Only the upstream MTP prefix up to the decoder layer's input norm
-(`mtp_layer_input`) is mirrored here.
+pass writes. Pass 1 runs the draft's own upstream predictor and MTP layer
+forwards with a stand-in for the decoder layer (`kv_only_predictor`), so one
+code path computes the layer input for both passes; only the decoder layer's
+input norm before its attention is mirrored here.
 
 This lives outside eagle3.py because that module uses postponed annotations,
 which ``support_torch_compile`` cannot read.
@@ -92,7 +94,7 @@ def _mtp_layer(
 def kv_only_unsupported_reason(mtp: nn.Module) -> str | None:
     """Why pass 1 cannot serve this draft, or None when it can.
 
-    Pass 1 mirrors one specific forward: a single-layer `DeepSeekMTP` whose
+    Pass 1 serves one specific draft: a single-layer `DeepSeekMTP` whose
     decoder layer runs the TPU sparse (DSA) MLA wrapper with its own indexer.
     """
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
@@ -136,12 +138,13 @@ def _not_the_mirrored_forwards(
     layer: DeepSeekMultiTokenPredictorLayer,
     wrapper: Any,
 ) -> str | None:
-    """Pass 1 mirrors the upstream MTP prefix (`mtp_layer_input`) and assumes
-    the full pass runs the forwards whose projections and writers
-    `MlaKvWriteOp` shares. A forward a subclass overrides, or a patch replaces
-    on the class itself, may compute something else, so refuse it rather than
-    drift. That includes a draft whose own forward evaluates step 0 on
-    selected rows: the two-pass step 0 assumes the upstream forward."""
+    """Pass 1 runs the upstream predictor and MTP layer forwards
+    (`kv_only_predictor`) and assumes the full pass runs the forwards whose
+    projections and writers `MlaKvWriteOp` shares. A forward a subclass
+    overrides, or a patch replaces on the class itself, may compute something
+    else, so refuse it rather than drift. That includes a draft whose own
+    forward evaluates step 0 on selected rows: the two-pass step 0 assumes the
+    upstream forward."""
     from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         VllmTPUIndexer,
@@ -181,32 +184,57 @@ def _not_the_mirrored_forwards(
     return None
 
 
-def mtp_layer_input(
-    mtp: DeepSeekMTP,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
-) -> tuple[nn.Module, torch.Tensor]:
-    """The MTP decoder layer and what its attention receives at draft step 0.
+class _KvOnlyDecoderLayer(nn.Module):
+    """Pass 1's stand-in for the MTP decoder layer (`mtp_block`).
 
-    A copy of the prefix of `DeepSeekMultiTokenPredictor.forward` ->
-    `DeepSeekMultiTokenPredictorLayer.forward` -> `DeepseekV2DecoderLayer
-    .forward` (residual None) up to the `self_attn` call, as in vLLM v0.33.0,
-    the version `pyproject.toml` pins. `kv_only_unsupported_reason` refuses a
-    subclass or patch of those forwards, but it cannot see an upstream change
-    to their bodies: on a vLLM pin bump,
-    `test_mtp_layer_input_matches_the_upstream_prefix`
+    It hands what the layer's attention would receive to `write` and skips
+    the attention, the MoE and the rest of the layer. With residual None,
+    `DeepseekV2DecoderLayer.forward` runs only `input_layernorm` before
+    `self_attn` (vLLM v0.33.0, the version `pyproject.toml` pins); on a pin
+    bump, `test_kv_only_stand_in_sees_the_attention_input`
     (tests/spec_decode/test_mtp_kv_only.py) is the guard.
     """
+
+    def __init__(self, block: DeepseekV2DecoderLayer, write: Any) -> None:
+        super().__init__()
+        self.input_layernorm = block.input_layernorm
+        # Read by the MTP layer's forward after the decoder layer.
+        self.use_sequence_parallel_moe = block.use_sequence_parallel_moe
+        self._write = write
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert residual is None
+        self._write(positions, self.input_layernorm(hidden_states))
+        # (hidden_states, residual) as the decoder layer returns them; the
+        # MTP layer's tail runs on them, and pass 1 keeps one row of it.
+        return hidden_states, hidden_states
+
+
+def _with_child(module: nn.Module, name: str, child: nn.Module) -> nn.Module:
+    """A shallow copy of `module` whose child `name` is `child`; the
+    parameters and every other child are shared with `module`."""
+    copied = copy.copy(module)
+    copied.__dict__["_modules"] = {**module._modules, name: child}
+    return copied
+
+
+def kv_only_predictor(mtp: DeepSeekMTP, write: Any) -> nn.Module:
+    """`mtp`'s predictor with `_KvOnlyDecoderLayer` in place of its decoder
+    layer. Its upstream forwards (embedding, the position-0 mask, enorm,
+    hnorm, eh_proj) compute the layer input for pass 1 as they do for the
+    full pass; `mtp` itself is unchanged."""
     predictor = mtp.model
     layer = _mtp_layer(predictor)
-    inputs_embeds = predictor.embed_tokens(input_ids)
-    # masking inputs at position 0, as not needed by MTP
-    inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
-    inputs_embeds = layer.enorm(inputs_embeds)
-    previous_hidden_states = layer.hnorm(hidden_states)
-    hidden = layer.eh_proj(torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
-    return layer, layer.mtp_block.input_layernorm(hidden)
+    kv_layer = _with_child(
+        layer, "mtp_block", _KvOnlyDecoderLayer(layer.mtp_block, write)
+    )
+    layers = nn.ModuleDict({str(predictor.mtp_start_layer_idx): kv_layer})
+    return _with_child(predictor, "layers", layers)
 
 
 @support_torch_compile(dynamic_arg_dims=MTP_KV_ONLY_DYNAMIC_ARG_DIMS)
@@ -233,10 +261,10 @@ class MtpKvOnlyModel(nn.Module):
         reason = kv_only_unsupported_reason(mtp)
         if reason is not None:
             raise NotImplementedError(reason)
-        self.mtp = mtp
         wrapper = _mtp_layer(mtp.model).mtp_block.self_attn.mla_attn
         assert isinstance(wrapper, VllmTPUMultiHeadLatentAttentionWrapper)
         self._write = MlaKvWriteOp(wrapper, mesh)
+        self.predictor = kv_only_predictor(mtp, self._write)
 
     def forward(
         self,
@@ -244,8 +272,10 @@ class MtpKvOnlyModel(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        _, attn_input = mtp_layer_input(self.mtp, input_ids, positions, hidden_states)
-        return self._write(positions, attn_input)
+        hidden, _ = self.predictor(input_ids, positions, hidden_states)
+        # The writes are what pass 1 is for; one row keeps the program's
+        # output small, and the rest of the layer's tail is never computed.
+        return hidden[:1]
 
 
 def _sizes_at_or_above(sizes: Iterable[int | str], min_tokens: int) -> list[int | str]:

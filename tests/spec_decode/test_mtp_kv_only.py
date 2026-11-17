@@ -13,8 +13,9 @@
 # limitations under the License.
 """The two-pass MTP draft step 0 (spec_decode/mtp_kv_only.py) on CPU.
 
-* `mtp_layer_input` vs the upstream `DeepSeekMultiTokenPredictor` ->
-  `DeepSeekMultiTokenPredictorLayer` -> `DeepseekV2DecoderLayer` prefix;
+* pass 1's decoder-layer stand-in sees what the upstream
+  `DeepSeekMultiTokenPredictor` -> `DeepSeekMultiTokenPredictorLayer` ->
+  `DeepseekV2DecoderLayer` forwards hand its attention;
 * which drafts `kv_only_unsupported_reason` accepts;
 * `MtpKvOnlyModel` hands the write op the MTP layer's attention input;
 * the proposer side (`TPU_MTP_KV_ONLY_STEP0`): `MtpKvOnlyStep0`'s build,
@@ -123,6 +124,7 @@ def _upstream_mtp(self_attn: nn.Module, seed=0, hidden=MTP_HIDDEN) -> DeepSeekMT
         hnorm=_rms_norm(gen, hidden),
         eh_proj=eh_proj,
         mtp_block=block,
+        shared_head=nn.Identity(),
     )
     predictor = _module(
         DeepSeekMultiTokenPredictor,
@@ -142,18 +144,28 @@ def _mtp_inputs():
     return input_ids, positions, hidden
 
 
-def test_mtp_layer_input_matches_the_upstream_prefix():
-    """The guard on a vLLM pin bump: `mtp_layer_input` is a copy of the
-    upstream forwards up to the attention call."""
+def test_kv_only_stand_in_sees_the_attention_input():
+    """The guard on a vLLM pin bump: the upstream predictor and MTP layer
+    forwards hand pass 1's stand-in the input norm of what they hand the
+    decoder layer, which is what its `self_attn` receives."""
     capture = _Capture()
     mtp = _upstream_mtp(capture)
     input_ids, positions, hidden = _mtp_inputs()
     with torch.no_grad(), pytest.raises(_Stop):
         mtp.model(input_ids, positions, hidden, None, 0)
+    seen = []
+    predictor = mtp_kv_only.kv_only_predictor(mtp, lambda pos, h: seen.append((pos, h)))
     with torch.no_grad():
-        layer, got = mtp_kv_only.mtp_layer_input(mtp, input_ids, positions, hidden)
-    assert layer is mtp.model.layers["78"]
+        predictor(input_ids, positions, hidden)
+    ((got_positions, got),) = seen
+    assert got_positions is positions
     assert torch.equal(got, capture.seen)
+    # The draft itself keeps its decoder layer; the copy shares its weights.
+    layer = mtp.model.layers["78"]
+    assert layer.mtp_block.self_attn is capture
+    kv_layer = predictor.layers["78"]
+    assert kv_layer is not layer and kv_layer.eh_proj is layer.eh_proj
+    assert predictor.embed_tokens is mtp.model.embed_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -322,12 +334,17 @@ def test_mtp_kv_only_model_writes_the_mtp_layers_attention_input(monkeypatch):
     assert write.wrapper is _parts(mtp)[1]
     assert write.mesh is mesh
     input_ids, positions, hidden = _mtp_inputs()
+    capture = _Capture()
+    _parts(mtp)[0].mtp_block.self_attn = capture
+    with torch.no_grad(), pytest.raises(_Stop):
+        mtp.model(input_ids, positions, hidden, None, 0)
     with torch.no_grad():
-        model(input_ids, positions, hidden)
-        _, attn_input = mtp_kv_only.mtp_layer_input(mtp, input_ids, positions, hidden)
+        out = model(input_ids, positions, hidden)
     ((got_positions, got_hidden),) = write.calls
     assert got_positions is positions
-    assert torch.equal(got_hidden, attn_input)
+    assert torch.equal(got_hidden, capture.seen)
+    # One row of output: the writes are the point.
+    assert out.shape == (1, hidden.shape[1])
 
 
 def test_mtp_kv_only_model_refuses_an_unsupported_draft(monkeypatch):
@@ -1389,19 +1406,39 @@ def test_lockstep_decision_ignores_the_chunks_own_prefill(monkeypatch):
 TPU_NAMES = ("kv_only_test.mtp.mla_attn", "kv_only_test.mtp.indexer.k_cache")
 
 
+class _AttentionOutput(nn.Module):
+    """The MTP decoder layer up to its attention output: the input norm, then
+    the wrapper's forward (indexer, sparse MLA). Its zero residual and the
+    identity shared head leave that output as the MTP layer's output."""
+
+    def __init__(self, block):
+        super().__init__()
+        self.input_layernorm = block.input_layernorm
+        self.mla_attn = block.self_attn.mla_attn
+        self.use_sequence_parallel_moe = False
+
+    def forward(self, positions, hidden_states, residual):
+        out = self.mla_attn(positions, self.input_layernorm(hidden_states))
+        return out, torch.zeros_like(out)
+
+
 class _Step0(nn.Module):
-    """Draft step 0 as the full pass runs it, up to the attention output: the
-    MTP prefix, then the wrapper's forward (indexer, sparse MLA)."""
+    """Draft step 0 as the full pass runs it, up to the attention output, on
+    the upstream predictor and MTP layer forwards."""
 
     def __init__(self, mtp):
         super().__init__()
-        self.mtp = mtp
+        layer = mtp.model.layers["78"]
+        step0_layer = mtp_kv_only._with_child(
+            layer, "mtp_block", _AttentionOutput(layer.mtp_block)
+        )
+        self.predictor = mtp_kv_only._with_child(
+            mtp.model, "layers", nn.ModuleDict({"78": step0_layer})
+        )
 
     def forward(self, input_ids, positions, hidden_states):
-        layer, attn_input = mtp_kv_only.mtp_layer_input(
-            self.mtp, input_ids, positions, hidden_states
-        )
-        return layer.mtp_block.self_attn.mla_attn(positions, attn_input)
+        out, _ = self.predictor(input_ids, positions, hidden_states)
+        return out
 
 
 @pytest.fixture(scope="module")
