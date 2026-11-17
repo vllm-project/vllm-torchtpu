@@ -70,3 +70,31 @@ def test_a_build_is_reused_within_its_operand_mode_only(tpu7x, monkeypatch):
     assert ffn_kernel.ffn_kernel(**BUILD) is operand_mode
     monkeypatch.setattr(layout, "SHARD_INDEX_OPERAND", False)
     assert ffn_kernel.ffn_kernel(**BUILD) is own_mode
+
+
+@pytest.mark.parametrize(
+    "fields,message",
+    [
+        (
+            dict(weight_format="bf16", intermediate="bf16", activation_block=128),
+            "one scale per row",
+        ),
+        (
+            dict(
+                token_rows="bf16",
+                stream_block=128,
+                activation_block=128,
+                sorted_rows=False,
+            ),
+            "copy of w1, which a streamed build does not make",
+        ),
+    ],
+    ids=["bf16_weights_bf16_intermediate_blocked", "bf16_token_rows_streamed"],
+)
+def test_builds_whose_bodies_cannot_run_them_are_refused(tpu7x, fields, message):
+    """Two builds no body implements: bf16 weights with the bf16 intermediate
+    scale the up projection per row, so blocked token rows cannot reach it;
+    bf16 token rows against scaled weights need the whole expert's bf16 copy
+    of w1, which a streamed build never writes."""
+    with pytest.raises(ValueError, match=message):
+        ffn_kernel.build_ffn_kernel(**{**BUILD, **fields})
