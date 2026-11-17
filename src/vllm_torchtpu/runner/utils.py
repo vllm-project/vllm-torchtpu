@@ -28,6 +28,7 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.frontend_options import SECTION as FRONTEND_OPTIONS_SECTION
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.worker.worker_options import SECTION as WORKER_OPTIONS_SECTION
 
 logger = init_logger(__name__)
 
@@ -49,10 +50,6 @@ PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
 PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
-
-# Host-only section: the worker's process placement (`worker.worker_options`)
-# never changes a compiled program.
-WORKER_OPTIONS_SECTION = "tpu_worker"
 
 # Keys that never change the compiled graph: the diagnostics-only profiler
 # knobs above, which only steer profiling, and the host-only sections, each
