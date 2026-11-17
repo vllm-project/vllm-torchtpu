@@ -11,26 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# IX point #1 (band A): the serve arguments and
-# environment each leg of the record job ran, for the main-based stack.
-# See README.md in this directory for how to read and use it.
+# InferenceX point 1 (interactivity band A): the serve arguments and
+# environment each leg of the record run used. See README.md in this
+# directory for how to read and use it.
 name: p01-band-a-dp4tp2-4p3d-c600
 point: 1
-sheet: ix-tpu-pd-cand4-llmd-oct28
 record:
-  job: j-b9ebbdbd-00b4-4351-8556
-  tree: 5a1c826860aaba32a961c15082a511577d9e9a78
   mtok_per_dollar: 259.22
   p90_interactivity: 101.71
+  # The record run's decode megakernel mode; this tree has no decode megakernel.
   decode_megakernel: "off"
-recipe:
-  repository: cloud-devkit-recipes
-  commit: 90863fb2
-  path: recipes/inferencex/qwen-3.5/pd-cand4/qwen35-pd-cand4-llmd-01-band-a-dp4tp2-4p3d-c600.jsonnet
-  base: agentx-397b-pd-baseline
 decode_layout: "DP4 x TP2, multi-port external LB"
 concurrency: 600
 chips: 28
+# Values the record run used that this tree cannot run yet (README.md).
+not_yet_supported:
+  decode:
+    MOE_FUSED_EP_KERNEL_IMPL: "the fused EP MoE v3 kernel (this tree accepts v2 and adaptive)"
+    TPU_EXPERT_PLACEMENT: "the expert placement table this path names (a permutation of the 512 experts over 8 ranks), which this tree does not ship"
 legs:
   prefill:
     replicas: 4
