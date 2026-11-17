@@ -417,13 +417,19 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     def _sample_decode(
         self, hidden: torch.Tensor, input_ids: torch.Tensor, block_size: int
     ) -> torch.Tensor | None:
+        rows = hidden.shape[0]
+        requests = rows // 5
+        # The Markov sampler takes 16 to 48 requests in whole 16-row tiles.
         if (
-            hidden.shape != (240, 5120)
+            hidden.shape != (rows, 5120)
             or hidden.dtype != torch.bfloat16
             or block_size != 5
+            or rows != 5 * requests
+            or requests % 16
+            or not 0 < requests <= 48
         ):
             return None
-        slot_hidden = hidden.view(48, 5, 5120).transpose(0, 1).reshape(240, 5120)
+        slot_hidden = hidden.view(requests, 5, 5120).transpose(0, 1).reshape(rows, 5120)
         if self._decode_logits is not None:
             assert self.lm_head is not None
             logits = self._decode_logits(
@@ -431,10 +437,10 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             )
         else:
             logits = self.compute_logits(slot_hidden)
-        if logits.shape != (240, 129280) or logits.dtype != torch.bfloat16:
+        if logits.shape != (rows, 129280) or logits.dtype != torch.bfloat16:
             return None
         markov = self.model.markov_head
-        anchors = input_ids[:240].view(48, 5)[:, 0]
+        anchors = input_ids[:rows].view(requests, 5)[:, 0]
         assert self._decode_samples is not None
         return self._decode_samples(
             logits,

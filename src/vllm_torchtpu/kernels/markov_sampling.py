@@ -108,11 +108,12 @@ def sample_slot(
     *,
     slot: int,
 ) -> jax.Array:
-    assert x.shape == (48, 256) and w.shape == (129280, 256)
-    assert base.shape == (240, 129280) and 0 <= slot < 5
+    m = x.shape[0]
+    assert x.shape == (m, 256) and m % 16 == 0 and 0 < m <= 48
+    assert w.shape == (129280, 256)
+    assert base.shape == (5 * m, 129280) and 0 <= slot < 5
     assert x.dtype == w.dtype == base.dtype == jnp.bfloat16
     group = 16384
-    m = x.shape[0]
     vocab_size = w.shape[0]
     nt = (vocab_size + group - 1) // group
 
