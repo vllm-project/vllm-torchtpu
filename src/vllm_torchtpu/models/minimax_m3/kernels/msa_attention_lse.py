@@ -185,19 +185,15 @@ def _fp4_ints(kv_ref) -> jax.Array:
     return pltpu.bitcast(words, jnp.int4)
 
 
-def _lane_column(x: jax.Array) -> jax.Array:
-    """A ``[1, S]`` lane vector as an ``[S, 1]`` column (one 8-row transpose)."""
-    return jnp.broadcast_to(x, (8, x.shape[1])).T[:, :1]
-
-
-# `prefill_precision_levers` "pv8": probabilities and values are scaled into
-# the fp8 normal range before the cast (p <= 1, |int4| <= 8), the output by
-# their inverse.
-_PV8_P_UNIT = 256.0
-_PV8_V_UNIT = 8.0
+# `prefill_precision_levers` "pv8": V enters the MXU as its exact int4 values
+# in fp8, and the probabilities carry the V scale times _PV8_UNIT (lifting
+# p * scale out of fp8's subnormal range), capped so that p * scale * unit
+# stays within fp8's range (V scales above _FP8_MAX / _PV8_UNIT = 7, |v| ~ 50,
+# would saturate); the output divides the unit out.
+_PV8_UNIT = 64.0
 _FP8_MAX = 448.0
 PREFILL_PRECISION_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
-_PRECISION_LEVERS = ("qk8", "pv8", "kfold", "vfold")
+_PRECISION_LEVERS = ("qk8", "pv8")
 
 
 def prefill_precision_levers(spec: str | None = None) -> frozenset:
@@ -458,10 +454,7 @@ def _kernel(
     # `precision` levers (4-bit pages, `prefill_precision_levers`).
     qk8 = fp4 and "qk8" in precision
     pv8 = fp4 and "pv8" in precision
-    kfold = fp4 and "kfold" in precision and not qk8
-    vfold = fp4 and "vfold" in precision and not pv8
-    # pv8 accumulates p * _PV8_P_UNIT against V * _PV8_V_UNIT.
-    out_unit = 1.0 / (_PV8_P_UNIT * _PV8_V_UNIT) if pv8 else 1.0
+    out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
         if not tiles_per_head:
@@ -823,7 +816,7 @@ def _kernel(
                     if from_bf16:
                         rows = bfc_ref[slot]
                         sk, sv = _fp4_scales(scale_ref, k_row, v_row)
-                    elif qk8 or pv8 or kfold or vfold:
+                    elif qk8 or pv8:
                         rows = _fp4_ints(kv_ref)  # int4 [S, 2D]
                         sk, sv = _fp4_scales(scale_ref, k_row, v_row)
                     else:
@@ -831,34 +824,13 @@ def _kernel(
                             kv_ref, scale_ref, k_row, v_row
                         )
                     k_int, v_int = rows[:, :head_dim], rows[:, head_dim:]
-                    if pv8:  # V * scale * unit, clipped to the fp8 range
-                        v_page = v_int.astype(jnp.float32) * _lane_column(
-                            sv * _PV8_V_UNIT
-                        )
-                        values.append(
-                            jnp.clip(v_page, -_FP8_MAX, _FP8_MAX).astype(
-                                jnp.float8_e4m3fn
-                            )
-                        )
-                    elif vfold:
-                        values.append(
-                            (v_int.astype(jnp.float32) * _lane_column(sv)).astype(
-                                jnp.bfloat16
-                            )
-                        )
-                    else:
-                        values.append(v_int.astype(jnp.bfloat16))
-                    if qk8:  # int4 keys are exact in fp8
-                        keys.append(k_int.astype(jnp.float8_e4m3fn))
-                    elif kfold:
-                        keys.append(
-                            (
-                                k_int.astype(jnp.float32)
-                                * _lane_column(sk * (sm_scale * _LOG2_E))
-                            ).astype(jnp.bfloat16)
-                        )
-                    else:
-                        keys.append(k_int.astype(jnp.bfloat16))
+                    # int4 values are exact in fp8; scales apply around the dots.
+                    values.append(
+                        v_int.astype(jnp.float8_e4m3fn if pv8 else jnp.bfloat16)
+                    )
+                    keys.append(
+                        k_int.astype(jnp.float8_e4m3fn if qk8 else jnp.bfloat16)
+                    )
                     k_scales.append(sk)
                     v_scales.append(sv)
                 elif packing == 4:
@@ -880,6 +852,8 @@ def _kernel(
             if fp4:
                 k_scale = jnp.concatenate(k_scales, axis=1) * scale
                 v_scale = jnp.concatenate(v_scales, axis=1)
+                if pv8:
+                    v_scale = jnp.minimum(v_scale * _PV8_UNIT, _FP8_MAX)
             part_heads = num_heads // row_split
             part_rows = part_heads * block_q
 
@@ -895,7 +869,7 @@ def _kernel(
                 s = jax.lax.dot_general(
                     q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
                 )
-                if fp4 and not kfold:  # x = int4 * scale: K scales the score columns
+                if fp4:  # x = int4 * scale: K scales the score columns, V scales p
                     s = s * k_scale
                 s = jnp.where(mask, s, -jnp.inf)
 
@@ -907,12 +881,7 @@ def _kernel(
                 m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
                 p = jnp.exp2(s - m_new)
                 l_cur = jnp.sum(p, axis=1, keepdims=True)
-                if pv8:
-                    p_v = p * _PV8_P_UNIT
-                elif fp4 and not vfold:  # V scales p
-                    p_v = p * v_scale
-                else:
-                    p_v = p
+                p_v = p * v_scale if fp4 else p
                 pv = jax.lax.dot_general(
                     p_v.astype(v.dtype),
                     v,

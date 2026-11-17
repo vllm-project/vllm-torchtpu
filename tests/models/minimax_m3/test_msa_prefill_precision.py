@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: 4-bit MSA prefill attention with
-fp8 / folded-scale levers against a float64 oracle (interpret).
+fp8 levers against a float64 oracle (interpret).
 
 Not bit-identical by design. Checks: the same -inf lse pattern, finite
 outputs, and output / lse error versus the oracle within each lever's bound;
@@ -32,9 +32,8 @@ INTERPRET = os.environ.get("INTERPRET", "1") == "1"
 S, D, K, HG = 128, 128, 16, 16
 ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
 # Relative rms output error bound vs the oracle (incumbent: bf16 rounding only).
-BOUNDS = {"": 1e-2, "kfold": 1e-2, "vfold": 1e-2, "kfold,vfold": 1e-2,
-          "qk8": 6e-2, "qk8,vfold": 6e-2, "qk8,pv8": 8e-2}
-LSE_BOUNDS = {"qk8": 0.3, "qk8,vfold": 0.3, "qk8,pv8": 0.3}
+BOUNDS = {"": 1e-2, "pv8": 4e-2, "qk8": 6e-2, "qk8,pv8": 8e-2}
+LSE_BOUNDS = {"": 1e-5, "pv8": 1e-5, "qk8": 0.3, "qk8,pv8": 0.3}
 
 
 def make(T, seed, G, wide=False):

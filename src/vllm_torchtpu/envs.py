@@ -1599,9 +1599,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax M3 MSA prefill attention on 4-bit caches (calls with the page
     # cache): ','-separated precision levers, empty = exact incumbent.
     # "qk8": fp8 queries x fp8 keys (int4 keys are exact in fp8) on the MXU;
-    # "pv8": fp8 probabilities x fp8 values scaled into the page;
-    # "kfold" / "vfold": K / V scales multiplied into the bf16 page rows
-    # instead of into every score / probability. Not bit-identical.
+    # "pv8": fp8 probabilities (carrying the V scales) x fp8 int4 values.
+    # Not bit-identical.
     "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION", ""
     ),
