@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 import yaml
@@ -29,6 +30,13 @@ POINTS = sorted(VALIDATION.glob("p[0-9][0-9]-*.yaml"))
 GATES = sorted(VALIDATION.glob("gate-*.yaml"))
 # The merge validation cap: no single deployment above 32 chips.
 MAX_CHIPS = 32
+# References outside readers cannot open: job ids, the private recipes
+# repository and its files, internal sheet codes, private branch names and
+# full commit ids of unpublished trees.
+INTERNAL_REFERENCE = re.compile(
+    r"\bj-[0-9a-f]{8}|cloud-devkit-recipes|\.jsonnet|\bix-tpu-|candidate\d"
+    r"|\b[0-9a-f]{40}\b"
+)
 
 
 def _load(path: pathlib.Path) -> dict:
@@ -46,8 +54,9 @@ def test_point_entry_is_well_formed(path):
     entry = _load(path)
     assert entry["name"] == path.stem
     assert entry["point"] == int(path.stem[1:3])
-    assert entry["record"]["job"].startswith("j-")
-    assert entry["recipe"]["path"].endswith(".jsonnet")
+    record = entry["record"]
+    assert record["mtok_per_dollar"] > 0
+    assert record["p90_interactivity"] > 0
     chips = 0
     for leg_name in ("prefill", "decode"):
         leg = entry["legs"][leg_name]
@@ -66,6 +75,43 @@ def test_point_env_uses_declared_variables_only(path):
     for leg_name, leg in entry["legs"].items():
         undeclared = sorted(set(leg["env"]) - set(envs.environment_variables))
         assert not undeclared, f"{leg_name}: {undeclared}"
+
+
+@pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
+def test_point_env_values_are_accepted_by_this_tree(path, monkeypatch):
+    """Each value a leg sets is accepted by this tree's envs.py reader, except
+    the ones listed under not_yet_supported, which name the capability they
+    need from a later change."""
+    entry = _load(path)
+    pending = entry.get("not_yet_supported", {})
+    assert set(pending) <= set(entry["legs"])
+    for leg_name, leg in entry["legs"].items():
+        skipped = pending.get(leg_name, {})
+        assert set(skipped) <= set(leg["env"]), f"{leg_name}: {sorted(skipped)}"
+        assert all(isinstance(need, str) and need for need in skipped.values())
+        with monkeypatch.context() as m:
+            for name, value in leg["env"].items():
+                if name in skipped:
+                    m.delenv(name, raising=False)
+                else:
+                    m.setenv(name, value)
+            for name, value in leg["env"].items():
+                if name in skipped:
+                    continue
+                try:
+                    envs.environment_variables[name]()
+                except ValueError as e:
+                    pytest.fail(f"{leg_name}: {name}={value!r} is rejected: {e}")
+
+
+@pytest.mark.parametrize("path", POINTS + GATES, ids=lambda p: p.stem)
+def test_entries_carry_no_internal_references(path):
+    text = path.read_text()
+    assert not INTERNAL_REFERENCE.findall(text)
+
+
+def test_readme_carries_no_internal_references():
+    assert not INTERNAL_REFERENCE.findall((VALIDATION / "README.md").read_text())
 
 
 @pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
