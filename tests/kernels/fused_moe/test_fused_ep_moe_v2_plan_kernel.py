@@ -178,9 +178,7 @@ def test_plan_kernel_matches_the_sharded_xla_plan(kind, t_local, topk, e_total):
             np.testing.assert_array_equal(g, w, err_msg=f"shard {me} table {k}")
         np.testing.assert_array_equal(got.expert_rows, want["expert_rows"])
         np.testing.assert_array_equal(got.slab_base, want["slab_base"])
-        np.testing.assert_array_equal(
-            got.visit, want["visit"]
-        )
+        np.testing.assert_array_equal(got.visit, want["visit"])
         np.testing.assert_array_equal(got.counts, want["counts"])
         np.testing.assert_array_equal(got.pos, want["pos"])
         np.testing.assert_array_equal(got.mirror_pos, want["mirror_pos"])

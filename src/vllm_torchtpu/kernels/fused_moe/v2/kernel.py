@@ -137,6 +137,7 @@ class _PackedColumn:
     def __getitem__(self, g):
         return self.ref[g, self.lane]
 
+
 # The HBM operands, in the order the kernel body unpacks them. Only these
 # two are on every build: the rest -- the activation row scale, the two
 # weight scale tables, the two expert bias tables -- are there where the
