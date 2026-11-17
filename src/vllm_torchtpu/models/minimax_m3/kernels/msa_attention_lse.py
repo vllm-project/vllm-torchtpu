@@ -53,6 +53,18 @@ _SUM_ROWS = 8
 # +1.5 % (twin j-d5d8af02 vs j-098b7ff3), while c48's 4-bit calls gained
 # 3-5 % in decode and mixed steps (j-a0b43b89 vs j-b068ae08).
 _INLINE_ISSUE_PAGES = 16
+# Scores need no running max: q and k come out of per-head RMS norms (weight
+# 1 + w; partial RoPE and the 4-bit Hadamard rotation keep norms), so |q.k| *
+# sm_scale <= sqrt(D) * max|1 + w_q| * max|1 + w_k| <= 57.8 over the
+# MiniMax-M3.1 checkpoint's 60 layers (85.7 with the worst 4-bit key rounding,
+# x1.476), inside exp's f32 range (88.7) both ways: p = exp2(s) never
+# overflows, and a row's largest p stays a normal float.
+MAX_FREE = True
+# With `MAX_FREE`, `attend_t` takes each token's mask from the QK matmul: the
+# keys carry a column block that is -_MASK_BIAS where a token does not see the
+# key, the queries a one-hot of their token there.
+MXU_MASK = False
+_MASK_BIAS = 1e30
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -267,7 +279,8 @@ def _kernel(
 
         @pl.when(first & jnp.logical_not(last))
         def _init():
-            m_ref[...] = jnp.full_like(m_ref, msa_attention._MASK_VALUE)
+            if not MAX_FREE:
+                m_ref[...] = jnp.full_like(m_ref, msa_attention._MASK_VALUE)
             l_ref[...] = jnp.zeros_like(l_ref)
             acc_ref[...] = jnp.zeros_like(acc_ref)
 
@@ -287,7 +300,46 @@ def _kernel(
             finite). A row that saw no slot has ``denom = 0`` and ``acc = 0``:
             its output is 0 and its lse ``m + log(0) = -inf`` with no select (a
             seen row has ``denom >= 1``)."""
-            write(acc * (1.0 / jnp.maximum(denom, 1.0)), m * _LN_2 + jnp.log(denom))
+            write(
+                acc * (1.0 / jnp.maximum(denom, _denom_floor())),
+                m * _LN_2 + jnp.log(denom),
+            )
+
+        def exp_scores(s, single, axis):
+            """``(p, m_prev, m_new)``: ``p = exp2(s - m_new)`` against the running
+            max, or against 0 with `MAX_FREE`."""
+            if MAX_FREE:
+                return jnp.exp2(s), 0.0, 0.0
+            # The running max starts at a finite floor (`_MASK_VALUE`), so a row
+            # with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
+            m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
+            m_new = jnp.maximum(m_prev, jnp.max(s, axis=axis, keepdims=True))
+            return jnp.exp2(s - m_new), m_prev, m_new
+
+        def update(m_prev, m_new, l_cur, pv, single, done):
+            """Folds a group's ``(l_cur, pv)`` into the tile's state, or ends the
+            tile with ``done(m, denom, acc)``."""
+            if single:
+                done(m_new, l_cur, pv)
+                return
+            if MAX_FREE:
+                l_new = l_ref[...] + l_cur
+                acc_new = acc_ref[...] + pv
+            else:
+                alpha = jnp.exp2(m_prev - m_new)
+                l_new = alpha * l_ref[...] + l_cur
+                acc_new = alpha * acc_ref[...] + pv
+
+            @pl.when(last)
+            def _finalize():
+                done(m_new, l_new, acc_new)
+
+            @pl.when(jnp.logical_not(last))
+            def _carry():
+                if not MAX_FREE:
+                    m_ref[...] = m_new
+                l_ref[...] = l_new
+                acc_ref[...] = acc_new
 
         def attend_t(width, single):
             """`attend` for 8/16-bit caches on transposed scores ``s^T [keys,
@@ -300,6 +352,7 @@ def _kernel(
             transposed (twin j-fa6121d0 vs glue-only j-2abe5011)."""
             if inline_issue and width > _INLINE_ISSUE_PAGES:
                 issue_next()
+            mxu_mask = MXU_MASK and MAX_FREE and block_q <= head_dim
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
                 if packing == 4
@@ -315,27 +368,46 @@ def _kernel(
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
-                if packing == 4:
+                if packing == 4 and mxu_mask:  # an additive mask needs finite keys
+                    rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
+                    rows = jnp.where(row_slots < seen, rows, 0)
+                    values.append(rows[:, head_dim:])
+                elif packing == 4:
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
                 else:
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
-                keys.append(rows[:, :head_dim])
-                # Rows are head-major (h * Bq + t): every head shares a token's mask.
-                masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
+                if mxu_mask:
+                    # [K | A]: A[key, t] = -_MASK_BIAS where token t does not
+                    # see the key; lanes past Bq meet zero query columns.
+                    limit = jnp.pad(limit, ((0, 0), (0, head_dim - block_q)))
+                    bias = jnp.where(row_slots < limit, 0.0, -_MASK_BIAS)
+                    keys.append(
+                        jnp.concatenate(
+                            [rows[:, :head_dim], bias.astype(rows.dtype)], 1
+                        )
+                    )
+                else:
+                    keys.append(rows[:, :head_dim])
+                    # Rows are head-major (h * Bq + t): heads share a token's mask.
+                    masks.append(row_slots < jnp.tile(limit, (1, num_heads)))
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
-            mask = jnp.concatenate(masks, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
+            if mxu_mask:  # [q | onehot(token)]
+                shape = (num_heads * block_q, head_dim)
+                row = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
+                col = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+                onehot = jnp.where(col == row % block_q, 1.0, 0.0).astype(q.dtype)
+                q = jnp.concatenate([q, onehot], axis=1)
             s = jax.lax.dot_general(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )  # [W * S, rows]
-            s = jnp.where(mask, s, -jnp.inf)
-            m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
-            m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
-            p = jnp.exp2(s - m_new)
+            if not mxu_mask:
+                s = jnp.where(jnp.concatenate(masks, axis=0), s, -jnp.inf)
+            p, m_prev, m_new = exp_scores(s, single, 0)
             # l = 1 . p comes out of the p @ v matmul as its row past the D
             # value rows (rows of ones streamed with v^T), not from a VPU add
             # per score vreg (the body is VALU-bound; kernel bench j-3e361d8c).
@@ -348,26 +420,11 @@ def _kernel(
                 preferred_element_type=jnp.float32,
             )  # [D + _SUM_ROWS, rows]
             l_cur, pv = pv[head_dim : head_dim + 1], pv[:head_dim]
-            if single:
-                finish_t(m_new, l_cur, pv)
-                return
-            alpha = jnp.exp2(m_prev - m_new)
-            l_new = alpha * l_ref[...] + l_cur
-            acc_new = alpha * acc_ref[...] + pv
-
-            @pl.when(last)
-            def _finalize():
-                finish_t(m_new, l_new, acc_new)
-
-            @pl.when(jnp.logical_not(last))
-            def _carry():
-                m_ref[...] = m_new
-                l_ref[...] = l_new
-                acc_ref[...] = acc_new
+            update(m_prev, m_new, l_cur, pv, single, finish_t)
 
         def finish_t(m, denom, acc_t):
             """`finish` for `attend_t`'s lane-vector state."""
-            put((acc_t * (1.0 / jnp.maximum(denom, 1.0))).T)
+            put((acc_t * (1.0 / jnp.maximum(denom, _denom_floor()))).T)
             lse_ref[...] = (m * _LN_2 + jnp.log(denom)).reshape(lse_ref.shape)
 
         def attend(width, single):
@@ -438,12 +495,7 @@ def _kernel(
             if fp4:  # x = int4 * scale: K scales the score columns, V scales p
                 s = s * (jnp.concatenate(k_scales, axis=1) * scale)
             s = jnp.where(mask, s, -jnp.inf)
-
-            # The running max starts at a finite floor (`_MASK_VALUE`), so a row
-            # with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
-            m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
-            m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-            p = jnp.exp2(s - m_new)
+            p, m_prev, m_new = exp_scores(s, single, 1)
             l_cur = jnp.sum(p, axis=1, keepdims=True)
             p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
             pv = jax.lax.dot_general(
@@ -452,22 +504,7 @@ def _kernel(
                 (((1,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
-            if single:
-                finish(m_new, l_cur, pv)
-                return
-            alpha = jnp.exp2(m_prev - m_new)
-            l_new = alpha * l_ref[...] + l_cur
-            acc_new = alpha * acc_ref[...] + pv
-
-            @pl.when(last)
-            def _finalize():
-                finish(m_new, l_new, acc_new)
-
-            @pl.when(jnp.logical_not(last))
-            def _carry():
-                m_ref[...] = m_new
-                l_ref[...] = l_new
-                acc_ref[...] = acc_new
+            update(m_prev, m_new, l_cur, pv, single, finish)
 
         # Slots past the group's pages hold stale bytes: their limits are 0, so
         # their scores are masked and their value rows zeroed.
@@ -501,6 +538,13 @@ def _kernel(
     if steps_per_call is not None:
         b = b % steps_per_call
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+
+
+def _denom_floor() -> float:
+    """The least softmax sum a tile divides by: a row that saw no slot has 0
+    (and a zero output). Against a true max a seen row's sum is >= 1; against
+    `MAX_FREE`'s 0 it is only positive."""
+    return float(jnp.finfo(jnp.float32).tiny) if MAX_FREE else 1.0
 
 
 def _merged_store_rows(block_q: int, num_heads: int, dtype) -> int:
