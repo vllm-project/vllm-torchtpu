@@ -38,9 +38,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
 
-from vllm_torchtpu import additional_config_sections
+from vllm_torchtpu import additional_config_sections, tpu_info
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -57,22 +58,15 @@ _QWEN35_SAFE_KV_SLOTS = 80
 # The budget was measured for this checkpoint shape (Qwen3.5-397B-A17B's text
 # config) on TPU7x devices, the per-device HBM the IX record jobs ran on.
 _CALIBRATED_SHAPE = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
-_CALIBRATED_CHIP = "7x"
+_CALIBRATED_CHIP = pltpu.ChipVersion.TPU_7X.value
 
 
 def _chip_family() -> str | None:
-    """The TPU chip family from the accelerator type ("7x" for tpu7x-8), or
-    None when it cannot be read. Never claims the chips."""
-    try:
-        from vllm_torchtpu import tpu_info
-
-        accelerator_type = tpu_info.get_tpu_type()
-    except Exception:  # noqa: BLE001 - an unknown device is not calibrated
-        return None
-    if not accelerator_type:
-        return None
-    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
-    return {"v7x": "7x"}.get(name, name)
+    """This host's TPU chip (the ``pltpu.ChipVersion`` value, "7x" for
+    TPU7x), or None when its accelerator type is unset or unrecognized.
+    Never claims the chips."""
+    chip_version = tpu_info.find_chip_version()
+    return None if chip_version is None else chip_version.value
 
 
 def _is_calibrated(model_config) -> bool:
