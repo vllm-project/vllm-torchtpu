@@ -79,6 +79,9 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_all_ranges", _ACTIVE),
+    # After compile_all_ranges: wraps the compile_all_ranges it installs under
+    # TPU_PARALLEL_PRECOMPILE.
+    Patch("vllm_torchtpu:_patch_vllm_bucket_filter", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_prefix_isolation", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_config_hash_ignore_diagnostics", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_disable_compile_ranges", _ACTIVE),
