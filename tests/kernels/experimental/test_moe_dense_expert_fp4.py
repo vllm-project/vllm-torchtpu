@@ -165,3 +165,58 @@ def test_fused_moe_func_dispatch(tpu):
 def test_set_dense_fp4_rejects_negative():
     with pytest.raises(ValueError, match="moe_dense_fp4_max_tokens"):
         F.set_dense_fp4(-1, False)
+
+
+@pytest.mark.parametrize("with_shared", [False, True])
+def test_fused_moe_custom_op_signature_accepted(monkeypatch, with_shared):
+    """torch_tpu's jax_op takes only arrays and POD types: fused_moe_func's
+    ``shared: SharedExpert | None`` must never reach its signature, with
+    moe_dense_fp4_shared off (routed op) or on (routed + shared op)."""
+    import functools
+    import inspect
+
+    from torch_tpu._internal.pallas import pallas as P
+
+    from vllm_torchtpu.layers.adapter import fused_moe as A
+
+    fn = A.fused_moe_jax_fn(
+        topk=TOPK, activation="swigluoai", use_ep=True, with_shared=with_shared
+    )
+    P._verify_signature(inspect.signature(fn), bound_names=P._get_bound_names(fn))
+    if not with_shared:
+        # Key off: the routed op is fused_moe_func with its default shared=None.
+        assert isinstance(fn, functools.partial) and fn.func is F.fused_moe_func
+        assert fn.keywords["shared"] is None and not fn.args
+    monkeypatch.setattr(A, "_fused_moe_kernel_cache", {})
+    op = A._build_fused_moe_custom_op(
+        topk=TOPK,
+        activation="swigluoai",
+        use_ep=True,
+        skip_padded_tokens=True,
+        with_shared=with_shared,
+    )
+    assert op is not None
+
+
+@pytest.mark.parametrize("shared_on", [False, True])
+def test_fused_moe_jax_fn_matches_fused_moe_func(tpu, shared_on):
+    """The op's JAX function returns fused_moe_func's result bit for bit:
+    shared expert tensors in, SharedExpert rebuilt inside."""
+    from vllm_torchtpu.layers.adapter import fused_moe as A
+
+    x, w1, w2, s1, s2, tw, ids = _inputs(8, 5)
+    shared = _shared(1) if shared_on else None
+    args = (x, w1, w2, s1, s2, None, None, tw, ids, None)
+    kw = dict(topk=TOPK, activation="swigluoai", use_ep=False, use_sparse_core=False)
+    fn = A.fused_moe_jax_fn(with_shared=shared_on, **kw)
+    try:
+        F.set_dense_fp4(8, shared_on)
+        jax.clear_caches()
+        want = F.fused_moe_func(*args, shared=shared, **kw)
+        got = fn(*args, *(shared or ()))
+    finally:
+        F.set_dense_fp4(0, False)
+        jax.clear_caches()
+    np.testing.assert_array_equal(
+        np.asarray(got.astype(jnp.float32)), np.asarray(want.astype(jnp.float32))
+    )

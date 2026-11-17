@@ -155,6 +155,53 @@ def _allocate_kernel_instance_id() -> int:
     return kernel_instance_id
 
 
+def fused_moe_jax_fn(*, with_shared: bool = False, **static_kwargs):
+    """The JAX function the fused MoE custom op wraps.
+
+    torch_tpu's jax_op accepts only jax.Arrays and POD types in the wrapped
+    function's signature (unbound parameters included), so fused_moe_func's
+    ``shared: SharedExpert | None`` never reaches it: the routed-only op binds
+    ``shared=None`` (fused_moe_func's default, so the op is unchanged), and the
+    moe_dense_fp4_shared op takes the SharedExpert as four tensors after the
+    routed operands and rebuilds it inside the traced function.
+    """
+    wrapped_fn = functools.partial(fused_moe_func, **static_kwargs)
+    if not with_shared:
+        return functools.partial(wrapped_fn, shared=None)
+
+    def routed_and_shared(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+        shared_w1: jax.Array,
+        shared_s1: jax.Array,
+        shared_w2: jax.Array,
+        shared_s2: jax.Array,
+    ) -> jax.Array:
+        return wrapped_fn(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            shared=SharedExpert(shared_w1, shared_s1, shared_w2, shared_s2),
+        )
+
+    return routed_and_shared
+
+
 def _build_fused_moe_custom_op(
     *,
     topk: int,
@@ -178,8 +225,7 @@ def _build_fused_moe_custom_op(
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
-    wrapped_fn = functools.partial(
-        fused_moe_func,
+    fn = fused_moe_jax_fn(
         topk=topk,
         activation=activation,
         use_ep=use_ep,
@@ -187,45 +233,9 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=with_shared,
     )
-
-    if with_shared:
-        # torch_tpu takes only arrays and POD types as op arguments, so the op
-        # passes fused_moe_func's SharedExpert as four tensors after the
-        # routed operands (moe_dense_fp4_shared).
-        def routed_and_shared(
-            hidden_states: jax.Array,
-            w1: jax.Array,
-            w2: jax.Array,
-            w1_scale: jax.Array | None,
-            w2_scale: jax.Array | None,
-            w1_bias: jax.Array | None,
-            w2_bias: jax.Array | None,
-            topk_weights: jax.Array,
-            topk_ids: jax.Array,
-            experts_start: jax.Array | None,
-            shared_w1: jax.Array,
-            shared_s1: jax.Array,
-            shared_w2: jax.Array,
-            shared_s2: jax.Array,
-        ) -> jax.Array:
-            return wrapped_fn(
-                hidden_states,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                w1_bias,
-                w2_bias,
-                topk_weights,
-                topk_ids,
-                experts_start,
-                shared=SharedExpert(shared_w1, shared_s1, shared_w2, shared_s2),
-            )
-
-        fused_moe_kernel_impl = pallas.jax_op(op_name, routed_and_shared)
-    else:
-        fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
+    fused_moe_kernel_impl = pallas.jax_op(op_name, fn)
 
     # We must overwrite the default fake implementation as vLLM uses dynamic
     # dimensions for the hidden_states.
