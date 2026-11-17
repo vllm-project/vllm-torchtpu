@@ -56,9 +56,10 @@ RPA_PAGE_SIZE_BRACKET_TOKENS: tuple[float, float] = (16.0, 64.0)
 GPU_MEM_UTIL_BRACKET: tuple[float, float] = (0.80, 0.95)
 
 # Fallback (hbm_bytes, hbm_bw, bf16_flops, fp8_flops, vmem_bytes) per TensorCore
-# matching jax._src.tpu_info.get_tpu_info_for_chip(ChipVersion.TPU_7X, 1).
+# matching jax._src.tpu_info for ChipVersion.TPU_7X and ChipVersion.TPU_V6E.
 FALLBACK_TPU_SPECS: dict[str, tuple[int, float, float, float, int]] = {
     "tpu7x": (103_000_000_000, 3.70e12, 1.155e15, 2.30e15, 67_108_864),
+    "tpu6e": (34_400_000_000, 1.64e12, 9.20e14, 9.20e14, 134_217_728),
 }
 
 # Supported Cloud TPU7x 3D physical slice shapes (minimum provisionable slice is 2x2x1).

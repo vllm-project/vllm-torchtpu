@@ -105,9 +105,11 @@ try:
 except ImportError:
     pltpu: _PltpuProto | None = None
     _TPU_7X_VERSION: object = "tpu7x"
+    _TPU_V6E_VERSION: object = "tpu6e"
 else:
     pltpu = _pltpu
     _TPU_7X_VERSION = _pltpu.ChipVersion.TPU_7X
+    _TPU_V6E_VERSION = getattr(_pltpu.ChipVersion, "TPU_V6E", "tpu6e")
 
 try:
     import jax as _jax
@@ -702,6 +704,23 @@ CHIPS: dict[str, ChipSpec] = {
         _TPU_7X_VERSION,
         ChipOverrides(),
     ),
+    # HBM, bandwidth, BF16/FP8 MXU peaks, and VMEM: JAX's TPU table
+    # (ChipVersion.TPU_V6E, single TensorCore per chip / is_lite=True).
+    "tpu6e": from_jax(
+        "tpu6e",
+        _TPU_V6E_VERSION,
+        ChipOverrides(
+            cores_per_chip=1,
+            # Peak ICI rate: 4 links x 200 GB/s bidirectional = 800 GB/s per chip, so
+            # 100 GB/s per link per direction and 400 GB/s egress per chip/core:
+            # Google Cloud TPU v6e docs (https://cloud.google.com/tpu/docs/v6e); note
+            # How To Scale Your Model uses a 90 GB/s per-link figure.
+            ici_link_bw=100.0e9,
+            d2d_bw=400.0e9,
+            ici_bw=400.0e9,
+            ici_hop_latency_s=1.0e-6,
+        ),
+    ),
 }
 
 SUPPORTED_CHIPS: frozenset[str] = frozenset(CHIPS)
@@ -709,3 +728,28 @@ SUPPORTED_CHIPS: frozenset[str] = frozenset(CHIPS)
 TOPOLOGIES: dict[str, SliceTopology] = {
     name: SliceTopology(name, axes) for name, axes in TOPOLOGY_AXES.items()
 }
+
+TPU6E_TOPOLOGIES: dict[str, SliceTopology] = {
+    # Cloud TPU v6e (Trillium) 2D torus slice shapes up to a 16x16 full pod
+    # (https://cloud.google.com/tpu/docs/v6e); per How To Scale Your Model,
+    # 2D torus wraparound applies along axes of extent 16 (8x16 and 16x16).
+    "1x1": SliceTopology("1x1", (1, 1, 1), 1, (False, False, False)),
+    "2x2": SliceTopology("2x2", (2, 2, 1), 1, (False, False, False)),
+    "2x4": SliceTopology("2x4", (2, 4, 1), 1, (False, False, False)),
+    "4x4": SliceTopology("4x4", (4, 4, 1), 1, (False, False, False)),
+    "4x8": SliceTopology("4x8", (4, 8, 1), 1, (False, False, False)),
+    "8x8": SliceTopology("8x8", (8, 8, 1), 1, (False, False, False)),
+    "8x16": SliceTopology("8x16", (8, 16, 1), 1, (False, True, False)),
+    "16x16": SliceTopology("16x16", (16, 16, 1), 1, (True, True, False)),
+}
+
+CHIP_TOPOLOGIES: dict[str, dict[str, SliceTopology]] = {
+    "tpu7x": TOPOLOGIES,
+    "tpu6e": TPU6E_TOPOLOGIES,
+}
+
+
+def topologies_for_chip(chip: ChipSpec | str) -> dict[str, SliceTopology]:
+    """Return physical slice topologies registered for ``chip``."""
+    name = chip.name if isinstance(chip, ChipSpec) else chip
+    return CHIP_TOPOLOGIES[name]
