@@ -44,14 +44,6 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 from vllm_torchtpu.logger import init_logger
 
-
-def _get_topk_weights_dtype(default_dtype: jnp.dtype) -> jnp.dtype:
-    """Returns jnp.float32 if TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled,
-    else default_dtype.
-    """
-    return jnp.float32 if envs.TPU_MOE_TOPK_WEIGHTS_FLOAT32 else default_dtype
-
-
 logger = init_logger(__name__)
 
 
@@ -733,10 +725,12 @@ def fused_moe_func(
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
 
-    # Pin topk_weights to hidden_states.dtype (or float32 if
-    # TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled) so the EP mask, GMM reduce,
+    # Routing returns float32 top-k weights when
+    # additional_config["tpu_moe_topk_weights_float32"] is set; keep those, and
+    # pin any other dtype to hidden_states.dtype, so the EP mask, GMM reduce,
     # and `where` propagate appropriately.
-    topk_weights = topk_weights.astype(_get_topk_weights_dtype(hidden_states.dtype))
+    if topk_weights.dtype != jnp.float32:
+        topk_weights = topk_weights.astype(hidden_states.dtype)
 
     if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
         # The one-hot permute and unpermute are matmuls across all tokens, and

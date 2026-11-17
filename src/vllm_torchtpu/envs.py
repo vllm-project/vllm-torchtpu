@@ -105,7 +105,6 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
-    TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     TPU_MOE_EP_HIER_RS: str = "off"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
@@ -846,12 +845,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
-    ),
-    # Keep FusedMoE top-k routing weights in float32 precision instead of casting
-    # to the activation dtype (e.g. bfloat16) in fused_moe_gmm. Improves numerical
-    # parity with training frameworks (e.g. MaxText) in RL and distillation workloads.
-    "TPU_MOE_TOPK_WEIGHTS_FLOAT32": env_bool(
-        "TPU_MOE_TOPK_WEIGHTS_FLOAT32", default=False
     ),
     # Runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore
     # kernels instead of the group's, with this wire dtype between chips.

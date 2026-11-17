@@ -27,11 +27,20 @@ logger = init_logger(__name__)
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
 
 
+# additional_config["tpu_moe_topk_weights_float32"]: set at weight load by
+# TpuMoEActivationMixin, before the forward is compiled. Process-wide, like
+# every additional_config value.
+_TOPK_WEIGHTS_FLOAT32 = False
+
+
+def set_topk_weights_float32(enabled: bool) -> None:
+    global _TOPK_WEIGHTS_FLOAT32
+    _TOPK_WEIGHTS_FLOAT32 = enabled
+
+
 def _get_topk_weights_dtype(default_dtype: torch.dtype) -> torch.dtype:
-    """Returns torch.float32 if TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled,
-    else default_dtype.
-    """
-    return torch.float32 if envs.TPU_MOE_TOPK_WEIGHTS_FLOAT32 else default_dtype
+    """float32 when tpu_moe_topk_weights_float32 is set, else default_dtype."""
+    return torch.float32 if _TOPK_WEIGHTS_FLOAT32 else default_dtype
 
 
 def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:

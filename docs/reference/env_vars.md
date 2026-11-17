@@ -75,7 +75,6 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
-| `TPU_MOE_TOPK_WEIGHTS_FLOAT32` | `False` | Opt-in reference-parity setting for RL and distillation. Keeps MoE top-k routing weights and the expert combine in `float32` instead of the activation dtype. See [MoE reference parity](#moe-reference-parity). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
@@ -89,12 +88,12 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 
 ### MoE reference parity
 
-RL and distillation workloads that compare TPU rollouts with an unfused `bfloat16` MoE (the GPU vLLM path: `w13` GEMM -> `bfloat16` -> `SiluAndMul` -> `w2` GEMM -> `bfloat16` -> top-k combine) can turn on two independent settings, each of which changes one rounding point:
+RL and distillation workloads that compare TPU rollouts with an unfused `bfloat16` MoE (the GPU vLLM path: `w13` GEMM -> `bfloat16` -> `SiluAndMul` -> `w2` GEMM -> `bfloat16` -> top-k combine) can turn on two independent `--additional-config` settings, each of which changes one rounding point:
 
-- `TPU_MOE_TOPK_WEIGHTS_FLOAT32=1` keeps the top-k weights and the combine in `float32`.
-- `--additional-config '{"tpu_moe_silu_bf16": true}'` rounds the `gmm_v2`-fused SwiGLU `gate`, `up`, and `silu(gate)` to `bfloat16`, as upstream `SiluAndMul` does. It applies only to the `silu` activation: other activations, and the clamped SiLU of DeepSeek-V4 MXFP4 layers (`silu_and_mul_with_clamp`), keep `float32` intermediates. SiLU layers then run on `gmm_v2`, so the v2 fused EP (`USE_MOE_FUSED_EP_KERNEL`), `FUSED_MOE_DECODE_KERNEL`, `USE_MOE_TP_DECODE_KERNEL`, and `TPU_MOE_DENSE_EXPERT_THRESHOLD` paths are not used for them, and `MOE_FUSED_EP_KERNEL_IMPL=adaptive` fails at startup.
+- `"tpu_moe_topk_weights_float32": true` keeps the top-k routing weights and the expert combine in `float32` instead of the activation dtype. It replaces the removed `TPU_MOE_TOPK_WEIGHTS_FLOAT32` environment variable; startup fails if that variable is still set.
+- `"tpu_moe_silu_bf16": true` rounds the `gmm_v2`-fused SwiGLU `gate`, `up`, and `silu(gate)` to `bfloat16`, as upstream `SiluAndMul` does. It applies only to the `silu` activation: other activations, and the clamped SiLU of DeepSeek-V4 MXFP4 layers (`silu_and_mul_with_clamp`), keep `float32` intermediates. SiLU layers then run on `gmm_v2`, so the v2 fused EP (`USE_MOE_FUSED_EP_KERNEL`), `FUSED_MOE_DECODE_KERNEL`, `USE_MOE_TP_DECODE_KERNEL`, and `TPU_MOE_DENSE_EXPERT_THRESHOLD` paths are not used for them, and `MOE_FUSED_EP_KERNEL_IMPL=adaptive` fails at startup.
 
-Both are off by default; set both to reproduce the unfused `bfloat16` MoE's rounding.
+Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_float32": true, "tpu_moe_silu_bf16": true}'`) to reproduce the unfused `bfloat16` MoE's rounding.
 
 ---
 

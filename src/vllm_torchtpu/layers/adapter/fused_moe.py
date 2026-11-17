@@ -16,13 +16,14 @@
 import enum
 import functools
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config import get_current_vllm_config_or_none
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -31,6 +32,10 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     unpack_fp4_to_e2m1,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.moe_reference_parity import (
+    SILU_BF16_KEY,
+    get_moe_reference_parity,
+)
 
 logger = init_logger(__name__)
 
@@ -47,24 +52,6 @@ def resolve_activation_name(activation: Any) -> str:
     if isinstance(activation, enum.Enum):
         return activation.value
     return activation.value if hasattr(activation, "value") else str(activation)
-
-
-# `--additional-config` key: round the gmm_v2-fused SwiGLU like upstream
-# SiluAndMul (see silu_and_mul_bf16 in kernels/megablox/gmm_v2.py).
-SILU_BF16_CONFIG_KEY = "tpu_moe_silu_bf16"
-
-
-def silu_bf16_enabled(vllm_config: VllmConfig | None) -> bool:
-    """Whether `additional_config["tpu_moe_silu_bf16"]` is set (default off)."""
-    if vllm_config is None:
-        return False
-    additional_config = cast("dict[str, Any]", vllm_config.additional_config)
-    value = additional_config.get(SILU_BF16_CONFIG_KEY, False)
-    if not isinstance(value, bool):
-        raise ValueError(
-            f"additional_config[{SILU_BF16_CONFIG_KEY!r}] must be a bool, got {value!r}"
-        )
-    return value
 
 
 def resolve_silu_bf16(activation: str, enabled: bool) -> str:
@@ -116,27 +103,28 @@ class TpuMoEActivationMixin:
     def _set_tpu_activation(self, layer) -> str:
         """Resolve and store; returns it, since callers also use it locally.
 
+        Also applies the MoE reference-parity settings (moe_reference_parity.py).
         Runs at weight load, so the `additional_config` read and the logging
         stay out of the compiled forward.
         """
+        parity = get_moe_reference_parity(get_current_vllm_config_or_none())
+        moe_routing.set_topk_weights_float32(parity.topk_weights_float32)
         activation = self._resolve_tpu_activation(layer)
-        resolved = resolve_silu_bf16(
-            activation, silu_bf16_enabled(get_current_vllm_config_or_none())
-        )
+        resolved = resolve_silu_bf16(activation, parity.silu_bf16)
         if resolved != activation:
             logger.info_once(
                 "additional_config[%r]=true: SiLU MoE layers run gmm_v2 with "
                 "activation 'silu_bf16'; the v2 fused EP, fused decode, TP "
                 "decode and dense-expert MoE kernels, which fuse only 'silu', "
                 "are not used.",
-                SILU_BF16_CONFIG_KEY,
+                SILU_BF16_KEY,
             )
             if envs.TPU_MOE_DENSE_EXPERT_THRESHOLD > 0:
                 logger.warning_once(
                     "additional_config[%r]=true turns off the dense-expert MoE "
                     "path that TPU_MOE_DENSE_EXPERT_THRESHOLD=%d selects: "
                     "dense_expert_moe fuses only 'silu'.",
-                    SILU_BF16_CONFIG_KEY,
+                    SILU_BF16_KEY,
                     envs.TPU_MOE_DENSE_EXPERT_THRESHOLD,
                 )
         self._tpu_activation_str = resolved
