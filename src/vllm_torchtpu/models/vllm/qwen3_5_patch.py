@@ -39,7 +39,6 @@ import torch
 from torch import _check as torch_check
 from vllm.distributed import (
     get_tp_group,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
@@ -48,6 +47,7 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5Model
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.collectives import quantized_all_gather
+from vllm_torchtpu.layers.adapter import dense_sequence_parallel
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.qwen3_next_patch import all_gather_sharded_stream
 
@@ -70,20 +70,6 @@ def _overlap_min_tokens(hidden_size: int, tp_size: int, element_size: int) -> in
     )
 
 
-def _in_overlap_trace() -> bool:
-    """Return True in eager mode or during a shape-variant backbone warmup trace."""
-    # Only the backbone warmup gives each side of this branch its own trace.
-    # The MTP drafter compiles outside warmup, so it keeps the all-reduce path.
-    return (
-        not torch.compiler.is_compiling() or shape_variants.aot_cache_tag() is not None
-    )
-
-
-def _narrow_all_gather(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
-    """All-gather across TP ranks and trim padded rows to num_tokens."""
-    return tensor_model_parallel_all_gather(x, 0).narrow(0, 0, num_tokens)
-
-
 def _is_sharded_residual_active(
     layer: Qwen3_5DecoderLayer,
     num_tokens: int,
@@ -92,7 +78,7 @@ def _is_sharded_residual_active(
     layer_any: Any = layer
     return (
         layer_any.uses_sharded_residual
-        and _in_overlap_trace()
+        and shape_variants.can_branch_on_token_count()
         and num_tokens >= layer_any.fp8_overlap_min_tokens
     )
 
@@ -214,7 +200,9 @@ def _overlap_forward(
         overlap = fp8_overlap
     else:
         min_tokens = _overlap_min_tokens(attn.shape[-1], tp_size, attn.element_size())
-        overlap = _in_overlap_trace() and num_tokens >= min_tokens
+        overlap = (
+            shape_variants.can_branch_on_token_count() and num_tokens >= min_tokens
+        )
     if overlap:
         if fp8_overlap and not is_first_layer:
             attn_loc = tensor_model_parallel_reduce_scatter(attn, 0)
@@ -225,11 +213,11 @@ def _overlap_forward(
             if fp8_overlap:
                 residual = x_loc
         logits_loc, _ = mlp.gate(h_loc)
-        logits = _narrow_all_gather(logits_loc, num_tokens)
+        logits = dense_sequence_parallel.all_gather_tokens(logits_loc, num_tokens)
         if fp8_overlap:
             h = quantized_all_gather(h_loc, get_tp_group()).narrow(0, 0, num_tokens)
         else:
-            h = _narrow_all_gather(h_loc, num_tokens)
+            h = dense_sequence_parallel.all_gather_tokens(h_loc, num_tokens)
     else:
         h, residual = self.post_attention_layernorm(
             tensor_model_parallel_all_reduce(attn), residual

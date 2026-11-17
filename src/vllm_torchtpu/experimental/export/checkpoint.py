@@ -389,7 +389,11 @@ def run_cpu_load_worker(args: argparse.Namespace) -> None:
     vllm_config = universal_adapter.create_export_vllm_config(args)
     # vLLM runs on its CPU platform here, which skips the TPU platform's patches;
     # apply them so the model has the parameters and buffers it has on TPU.
-    patch_registry.apply("platform_activation", model_config=vllm_config.model_config)
+    patch_registry.apply(
+        "platform_activation",
+        model_config=vllm_config.model_config,
+        vllm_config=vllm_config,
+    )
     universal_adapter.check_supported_parallelism(vllm_config.parallel_config)
     with set_current_vllm_config(vllm_config):
         if not dist.is_initialized():

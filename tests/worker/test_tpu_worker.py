@@ -815,6 +815,7 @@ def test_load_model_patches_loads_releases_then_sets_runtime_threads(
         monkeypatch.delenv(OMP_NUM_THREADS_SET_BY_VLLM, raising=False)
     events = []
     config = object()
+    vllm_config = object()
     monkeypatch.setattr(
         patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
     )
@@ -824,6 +825,7 @@ def test_load_model_patches_loads_releases_then_sets_runtime_threads(
     )
     worker = SimpleNamespace(
         model_config=config,
+        vllm_config=vllm_config,
         model_runner=SimpleNamespace(
             load_model=lambda: events.append(("load", torch.get_num_threads()))
         ),
@@ -833,7 +835,7 @@ def test_load_model_patches_loads_releases_then_sets_runtime_threads(
         torch.set_num_threads(2)
         TPUWorker.load_model(worker)
         assert events == [
-            ("model_load", {"model_config": config}),
+            ("model_load", {"model_config": config, "vllm_config": vllm_config}),
             ("load", 2),
             ("release", 2),
         ]
