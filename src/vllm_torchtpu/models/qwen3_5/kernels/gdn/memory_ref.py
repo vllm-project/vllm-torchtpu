@@ -17,6 +17,10 @@
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
 # Changes from the source:
+# - InBufferedRef.copy_in and wait_in, and create_allocs: 2D bf16 qkv rows in
+#   16-row aligned DMA windows.
+# - StateInBufferedRef.wait_in and StateOutBufferedRef.wait_out: one wait per
+#   issued copy instead of one aggregate wait.
 # - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
 #   (main lists the source's errors in .pyrefly-baseline-full.json).
 

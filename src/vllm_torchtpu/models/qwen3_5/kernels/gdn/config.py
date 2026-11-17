@@ -16,7 +16,8 @@
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
-# Changes from the source: none.
+# Changes from the source:
+# - GDNConfig.qkv_2d and the act_scratch_ref scratch for 2D bf16 qkv rows.
 
 import dataclasses
 import enum

@@ -16,7 +16,9 @@
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
-# Changes from the source: none.
+# Changes from the source:
+# - causal_conv1d_out and conv_state_rows: the conv output rows and the conv
+#   state of a PER_SEQ chunked tile, for wrapper.py's lazy conv state.
 
 import jax
 import jax.numpy as jnp
