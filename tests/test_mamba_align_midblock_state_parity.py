@@ -34,7 +34,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-jax.config.update("jax_platforms", "cpu")
+
+@pytest.fixture(autouse=True)
+def _cpu_device():
+    """Run on the host CPU device without changing the process-wide JAX
+    platform, so TPU tests collected in the same session keep their backend."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        yield
+
 
 BS, HB = 20, 4
 N_KQ, N_V, D_K, D_V, K = 1, 2, 8, 8, 4
