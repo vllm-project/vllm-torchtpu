@@ -16,6 +16,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+from vllm.config import KVTransferConfig
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.request import RequestStatus
@@ -59,6 +61,7 @@ def _make_scheduler(
     s.running = []
     s.policy = SchedulingPolicy.FCFS
     s.WINDOW = window
+    s._is_kv_consumer = False
     s._paw_n = 0
     s._paw_cold_tokens = 0
     s._paw_prompt_tokens = 0
@@ -288,6 +291,7 @@ def _make_step_scheduler(running, monkeypatch, budget=8192):
 
     monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = True
     s.running = list(running)
     s.max_num_scheduled_tokens = budget
     return s, seen
@@ -324,8 +328,8 @@ def test_decoders_first_is_noop_without_a_mix(monkeypatch):
 
 
 def test_no_step_token_cap_with_many_decoders(monkeypatch):
-    """The validated policy has no decode-protect cap: the step budget stays
-    max_num_batched_tokens however many requests decode."""
+    """Decoders first leaves the step budget at max_num_scheduled_tokens
+    however many requests decode."""
     running = [_running_request(f"d{i}", 100, 100) for i in range(24)]
     running.append(_running_request("p", 100_000, 0))
     s, seen = _make_step_scheduler(running, monkeypatch, budget=8192)
@@ -336,6 +340,7 @@ def test_no_step_token_cap_with_many_decoders(monkeypatch):
 
 def test_waiting_loop_stop_reason_and_admission_telemetry():
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = True
     s.running = []
     s.waiting = [object()]
     s.kv_holding_waiting = []
@@ -441,6 +446,7 @@ def test_schedule_polls_the_connector_before_vllm_schedules(monkeypatch):
 
     monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = True
     s.running = []
     s.connector = SimpleNamespace(
         poll_and_complete_transfers=lambda sched: events.append(("poll", sched))
@@ -468,21 +474,92 @@ def _init_with(monkeypatch, kv_transfer_config, calls=None):
     return PrefixAwareScheduler()
 
 
-def test_kv_role_detection(monkeypatch):
-    s = _init_with(monkeypatch, None)
-    assert (s._is_disagg, s._is_kv_producer, s._is_kv_consumer) == (False,) * 3
-    s = _init_with(monkeypatch, SimpleNamespace(kv_role="kv_producer"))
-    assert (s._is_disagg, s._is_kv_producer, s._is_kv_consumer) == (True, True, False)
-    s = _init_with(monkeypatch, SimpleNamespace(kv_role="kv_consumer"))
-    assert (s._is_disagg, s._is_kv_producer, s._is_kv_consumer) == (True, False, True)
+def _kv_transfer_config(role):
+    if role is None:
+        return None
+    return KVTransferConfig(kv_connector="TPURaidenConnector", kv_role=role)
 
 
-def test_init_enables_the_memo_without_patching_vllm(monkeypatch):
+@pytest.mark.parametrize(
+    ("role", "consumer"),
+    [(None, False), ("kv_producer", False), ("kv_both", False), ("kv_consumer", True)],
+)
+def test_decode_leg_levers_only_on_a_kv_consumer(monkeypatch, role, consumer):
     def fail():
         raise AssertionError("the scheduler must not install patches")
 
     monkeypatch.setattr(prefix_change_log, "install_epoch", fail)
     monkeypatch.setattr(prefix_change_log, "install", fail)
     calls = []
-    _init_with(monkeypatch, None, calls)
-    assert calls == ["memo"]
+    s = _init_with(monkeypatch, _kv_transfer_config(role), calls)
+    assert s._is_kv_consumer is consumer
+    assert calls == (["memo"] if consumer else [])
+
+
+@pytest.mark.parametrize("role", [None, "kv_producer", "kv_both"])
+def test_off_a_decode_leg_schedule_is_the_warmest_first_admission(monkeypatch, role):
+    """No decoders first, only the first non-empty waiting queue promoted, no
+    packed prompt ids and no resend trim."""
+    from vllm.v1.core.sched.output import CachedRequestData
+
+    s = _init_with(monkeypatch, _kv_transfer_config(role))
+    now = time.time()
+    queued = [
+        _make_request("cold", arrival_time=now - 10),
+        _make_request("warm", arrival_time=now - 5),
+    ]
+    holding = [
+        _make_request("hold_cold", arrival_time=now - 10),
+        _make_request("hold_warm", arrival_time=now - 5),
+    ]
+    template = _make_scheduler(queued + holding, {"warm": 800, "hold_warm": 800})
+    s.kv_cache_manager = template.kv_cache_manager
+    s.waiting = template.waiting
+    s.kv_holding_waiting = FCFSRequestQueue()
+    for r in holding:
+        s.waiting.remove(r)
+        s.kv_holding_waiting.add_request(r)
+    s.policy = SchedulingPolicy.FCFS
+    s._paw_scoring_broken = False
+    s._paw_n = s._paw_cold_tokens = s._paw_prompt_tokens = 0
+    s.running = [
+        _running_request("p1", prompt=10_000, computed=640),
+        _running_request("d1", prompt=500, computed=501),
+    ]
+    prompt = list(range(4096))
+    new_req = SimpleNamespace(
+        prompt_token_ids=prompt,
+        mm_features=None,
+        prompt_embeds=None,
+        prompt_is_token_ids=None,
+        sampling_params=SimpleNamespace(
+            thinking_token_budget=None, prompt_logprobs=None, extra_args=None
+        ),
+    )
+    out = SimpleNamespace(scheduled_new_reqs=[new_req])
+    seen = {}
+
+    def fake_schedule(self, *args, **kwargs):
+        seen["running"] = [r.request_id for r in self.running]
+        return out
+
+    def fake_cached(self, *args, **kwargs):
+        return CachedRequestData(
+            req_ids=["a"],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={"a": [1, 2, 3, 4, 5]},
+            new_block_ids=[None],
+            num_computed_tokens=[3],
+            num_output_tokens=[2],
+        )
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
+    monkeypatch.setattr(AsyncScheduler, "_make_cached_request_data", fake_cached)
+    assert s.schedule() is out
+    assert seen["running"] == ["p1", "d1"]
+    assert [r.request_id for r in s.kv_holding_waiting] == ["hold_warm", "hold_cold"]
+    assert [r.request_id for r in s.waiting] == ["cold", "warm"]
+    assert new_req.prompt_token_ids is prompt
+    cached = s._make_cached_request_data([], [], {}, {}, {})
+    assert cached.all_token_ids == {"a": [1, 2, 3, 4, 5]}

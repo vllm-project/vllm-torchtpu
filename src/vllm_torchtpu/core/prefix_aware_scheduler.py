@@ -24,12 +24,13 @@ prioritizes requests with the fewest uncached prompt tokens. It modifies only
 the admission ordering; memory management, eviction, and preemption policies
 remain untouched.
 
-On a prefill/decode-disaggregated decode leg (a KV consumer) it also runs
-decoding requests ahead of partial prefills, promotes the warmest request of
-both waiting queues (``kv_holding_waiting`` and ``waiting``), memoises
-``find_longest_cache_hit`` across steps, ships long prompts to the workers as
-packed int32 and trims re-sent token ids. Its helpers are shared with the
-pipeline-parallel prefill scheduler.
+On a prefill/decode-disaggregated decode leg (``kv_role`` ``kv_consumer``)
+it also runs decoding requests ahead of partial prefills, promotes the
+warmest request of both waiting queues (``kv_holding_waiting`` and
+``waiting``), memoises ``find_longest_cache_hit`` across steps, ships long
+prompts to the workers as packed int32, trims re-sent token ids and logs
+per-minute admission telemetry. Every other engine (no KV transfer, a KV
+producer, or ``kv_both``) keeps the warmest-first admission alone.
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -165,25 +166,25 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
-        kv_transfer_cfg = getattr(
-            getattr(self, "vllm_config", None), "kv_transfer_config", None
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        # The decode-leg levers were measured on the decode legs of
+        # prefill/decode disaggregation only. kv_both (an offloading connector
+        # on an aggregated engine) is also a producer and keeps the admission.
+        self._is_kv_consumer = (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_consumer
+            and not kv_transfer_config.is_kv_producer
         )
-        kv_role = getattr(kv_transfer_cfg, "kv_role", None)
-        self._is_disagg = (
-            kv_transfer_cfg is not None or getattr(self, "connector", None) is not None
-        )
-        self._is_kv_producer = self._is_disagg and kv_role == "kv_producer"
-        self._is_kv_consumer = self._is_disagg and not self._is_kv_producer
-        self._enable_memo_xstep()
+        self._memo_xstep = False
+        if self._is_kv_consumer:
+            self._enable_memo_xstep()
 
         logger.info(
-            "PrefixAwareScheduler ACTIVE (window=%d, decoders first, "
-            "kv_role=%s, memo_xstep=%s)",
+            "PrefixAwareScheduler ACTIVE (window=%d, decode-leg levers=%s, "
+            "memo_xstep=%s)",
             self.WINDOW,
-            "consumer"
-            if self._is_kv_consumer
-            else ("producer" if self._is_kv_producer else "none"),
-            getattr(self, "_memo_xstep", False),
+            self._is_kv_consumer,
+            self._memo_xstep,
         )
 
     # ------------------------------------------------------------------
@@ -319,8 +320,10 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _note_waiting_stop(self, request: Request, reason: str) -> None:
         """Records why the waiting loop stopped at ``request`` (first stop of
         the step wins; running requests are ignored)."""
-        if getattr(self, "_step_wait_event", None) is None and is_waiting_status(
-            request
+        if (
+            self._is_kv_consumer
+            and getattr(self, "_step_wait_event", None) is None
+            and is_waiting_status(request)
         ):
             self._step_wait_event = reason
 
@@ -342,6 +345,8 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def _make_cached_request_data(self, *args, **kwargs):
         cached = super()._make_cached_request_data(*args, **kwargs)
+        if not self._is_kv_consumer:
+            return cached
         if getattr(self, "_trim_resend", None) is None:
             self._trim_resend = True
             self._trim_resend_n = 0
@@ -370,6 +375,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         return cached
 
     def schedule(self, *args, **kwargs):
+        if not self._is_kv_consumer:
+            # Off a decode leg: the warmest-first admission alone.
+            self._promote_warmest(self.kv_holding_waiting or self.waiting)
+            return super().schedule(*args, **kwargs)
         connector = getattr(self, "connector", None)
         if connector is not None:
             poll_fn = getattr(connector, "poll_and_complete_transfers", None)
