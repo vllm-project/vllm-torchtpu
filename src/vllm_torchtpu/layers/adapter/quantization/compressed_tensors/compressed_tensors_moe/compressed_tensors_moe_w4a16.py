@@ -36,8 +36,8 @@ from vllm.model_executor.utils import set_weight_attrs
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
+    TpuMoEActivationMixin,
     fused_moe_gmm,
-    get_fused_moe_activation,
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -58,7 +58,9 @@ if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 
-class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
+class VllmCompressedTensorsW4A16MoEMethod(
+    TpuMoEActivationMixin, CompressedTensorsWNA16MoEMethod
+):
     """TPU compressed-tensors packed-weight W4 MoE implementation."""
 
     _PACKED_WEIGHT_NAMES = (
@@ -358,7 +360,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         release_memory_to_os()
 
-        activation_str = get_fused_moe_activation(layer.activation, layer.moe_config)
+        activation_str = self._set_tpu_activation(layer)
         moe_routing.register_experts_start_buffer(
             layer, device=layer.w13_weight_packed.device
         )
@@ -377,7 +379,10 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer = cast("TpuRoutedExperts", layer)
-        activation_str = get_fused_moe_activation(layer.activation, layer.moe_config)
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer"
+        )
 
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

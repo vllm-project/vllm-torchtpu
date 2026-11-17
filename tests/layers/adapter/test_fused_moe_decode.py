@@ -134,6 +134,20 @@ def test_glm_admission(monkeypatch):
     assert bridge._admit(_glm_runner(other), 2) is None
 
 
+def test_admission_declines_silu_bf16(monkeypatch):
+    """The kernel fuses float32 SiLU; a "silu_bf16" layer must stay on gmm_v2
+    for every token count, or one server would mix two roundings."""
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128))
+    assert bridge._admit(runner, 2) is not None
+    runner._quant_method._tpu_activation_str = "silu_bf16"
+    assert bridge._admit(runner, 2) is None
+
+
 def test_admission_declines_attention_narrower_than_mesh(monkeypatch):
     """PCP2 (or DP2) at TP1: the EP group spans the mesh, attention does not, so
     MoERunner still runs a collective after the op."""

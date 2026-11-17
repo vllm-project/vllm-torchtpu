@@ -1040,6 +1040,14 @@ def test_fused_moe_func_silu_bf16_matches_unfused_silu_and_mul(monkeypatch):
     finally:
         fused_moe_func.clear_cache()
 
+    # Every element within 2 bfloat16 ULPs; most are bit-equal.
+    assert np.isfinite(silu_bf16.astype(np.float32)).all()
+    np.testing.assert_allclose(
+        silu_bf16.astype(np.float32),
+        expected.astype(np.float32),
+        rtol=2**-6,
+        atol=2**-10,
+    )
     bf16_equal = np.mean(silu_bf16 == expected)
     fp32_equal = np.mean(silu == expected)
     assert bf16_equal > 0.99, (bf16_equal, fp32_equal)

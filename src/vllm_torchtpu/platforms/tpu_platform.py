@@ -494,10 +494,6 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_ITER_MODE",
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
-        # Numerics settings: a Ray worker without them would compute MoE
-        # layers with different rounding than the driver's configuration.
-        "TPU_MOE_TOPK_WEIGHTS_FLOAT32",
-        "TPU_MOE_SILU_BF16",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",

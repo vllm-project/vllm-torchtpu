@@ -19,12 +19,19 @@ import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter import fused_moe
-from vllm_torchtpu.layers.adapter.fused_moe import get_fused_moe_activation
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    TpuMoEActivationMixin,
+    get_fused_moe_activation,
+    resolve_silu_bf16,
+    silu_bf16_enabled,
+)
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (  # noqa: E501
+    VllmCompressedTensorsW4A16MoEMethod,
+)
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
     VllmDeepseekV4Mxfp4MoEMethod,
     VllmMxfp4MoEMethod,
 )
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
 class _Activation(Enum):
@@ -36,65 +43,90 @@ def test_get_fused_moe_activation_preserves_standard_activations(activation):
     assert get_fused_moe_activation(activation, object()) == "silu"
 
 
-@pytest.mark.parametrize("silu_bf16", [False, True])
+def _vllm_config(**additional_config):
+    return SimpleNamespace(additional_config=additional_config)
+
+
 @pytest.mark.parametrize(
-    "activation", ["silu", _Activation.SILU, "gelu", "swigluoai", "situ"]
+    "vllm_config,expected",
+    [
+        (None, False),
+        (_vllm_config(), False),
+        (_vllm_config(tpu_moe_silu_bf16=False), False),
+        (_vllm_config(tpu_moe_silu_bf16=True), True),
+    ],
 )
-def test_get_fused_moe_activation_resolves_silu_bf16(
-    monkeypatch, silu_bf16, activation
-):
-    monkeypatch.setattr(fused_moe.envs, "TPU_MOE_SILU_BF16", silu_bf16)
-    moe_config = SimpleNamespace(
-        activation_situ_beta=4.0, activation_situ_linear_beta=None
-    )
-    expected = {
-        "silu": "silu_bf16" if silu_bf16 else "silu",
-        _Activation.SILU: "silu_bf16" if silu_bf16 else "silu",
-        "gelu": "gelu",
-        "swigluoai": "swigluoai",
-        "situ": "situ:4.0:none",
-    }[activation]
-    assert get_fused_moe_activation(activation, moe_config) == expected
+def test_silu_bf16_enabled(vllm_config, expected):
+    assert silu_bf16_enabled(vllm_config) is expected
 
 
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_silu_bf16_rejects_non_bool(value):
+    with pytest.raises(ValueError, match="tpu_moe_silu_bf16"):
+        silu_bf16_enabled(_vllm_config(tpu_moe_silu_bf16=value))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "activation",
+    ["silu", "gelu", "swigluoai", "silu_and_mul_with_clamp", "situ:4.0:none"],
+)
+def test_resolve_silu_bf16_maps_only_silu(enabled, activation):
+    expected = "silu_bf16" if enabled and activation == "silu" else activation
+    assert resolve_silu_bf16(activation, enabled) == expected
+
+
+class _Method(TpuMoEActivationMixin):
+    pass
+
+
+@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("threshold", [0, 64])
-def test_silu_bf16_warns_when_it_turns_off_dense_expert(monkeypatch, threshold):
+def test_set_tpu_activation_reads_additional_config(monkeypatch, enabled, threshold):
     warnings = []
-    monkeypatch.setattr(fused_moe.envs, "TPU_MOE_SILU_BF16", True)
+    monkeypatch.setattr(
+        fused_moe,
+        "get_current_vllm_config_or_none",
+        lambda: _vllm_config(tpu_moe_silu_bf16=enabled),
+    )
     monkeypatch.setattr(fused_moe.envs, "TPU_MOE_DENSE_EXPERT_THRESHOLD", threshold)
     monkeypatch.setattr(
-        fused_moe.logger,
-        "warning_once",
-        lambda msg, *args: warnings.append(msg % args),
+        fused_moe.logger, "warning_once", lambda msg, *a: warnings.append(msg % a)
     )
+    method = _Method()
+    layer = SimpleNamespace(activation=_Activation.SILU, moe_config=None)
 
-    assert fused_moe.resolve_silu_bf16("silu") == "silu_bf16"
-    if threshold:
+    expected = "silu_bf16" if enabled else "silu"
+    assert method._set_tpu_activation(layer) == expected
+    assert method._tpu_activation_str == expected
+    if enabled and threshold:
         assert len(warnings) == 1
-        assert "TPU_MOE_SILU_BF16=1" in warnings[0]
+        assert "tpu_moe_silu_bf16" in warnings[0]
         assert "TPU_MOE_DENSE_EXPERT_THRESHOLD=64" in warnings[0]
     else:
         assert warnings == []
 
 
-@pytest.mark.parametrize("silu_bf16", [False, True])
-def test_mxfp4_resolves_silu_bf16_but_keeps_clamped_kernel(monkeypatch, silu_bf16):
-    monkeypatch.setattr(fused_moe.envs, "TPU_MOE_SILU_BF16", silu_bf16)
-    layer = SimpleNamespace(activation=_Activation.SILU)
-
-    assert VllmMxfp4MoEMethod._resolve_tpu_activation(None, layer) == (
-        "silu_bf16" if silu_bf16 else "silu"
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mxfp4_methods_resolve_silu_bf16(monkeypatch, enabled):
+    monkeypatch.setattr(
+        fused_moe,
+        "get_current_vllm_config_or_none",
+        lambda: _vllm_config(tpu_moe_silu_bf16=enabled),
     )
-    # The clamped kernel keeps float32 intermediates in both settings.
-    assert (
-        VllmDeepseekV4Mxfp4MoEMethod._resolve_tpu_activation(None, layer)
-        == "silu_and_mul_with_clamp"
-    )
+    layer = SimpleNamespace(activation=_Activation.SILU, moe_config=None)
+
+    plain = VllmMxfp4MoEMethod.__new__(VllmMxfp4MoEMethod)
+    assert plain._set_tpu_activation(layer) == ("silu_bf16" if enabled else "silu")
+    # DeepSeek-V4's clamped SiLU keeps float32 intermediates in both settings.
+    clamped = VllmDeepseekV4Mxfp4MoEMethod.__new__(VllmDeepseekV4Mxfp4MoEMethod)
+    assert clamped._set_tpu_activation(layer) == "silu_and_mul_with_clamp"
 
 
-def test_moe_numerics_env_vars_reach_ray_workers():
-    assert "TPU_MOE_TOPK_WEIGHTS_FLOAT32" in TpuPlatform.additional_env_vars
-    assert "TPU_MOE_SILU_BF16" in TpuPlatform.additional_env_vars
+def test_w4a16_resolves_activation_at_weight_load():
+    # Resolution reads additional_config and logs, which the compiled forward
+    # must not do; the method stores the string at load like the others.
+    assert issubclass(VllmCompressedTensorsW4A16MoEMethod, TpuMoEActivationMixin)
 
 
 @pytest.mark.parametrize(

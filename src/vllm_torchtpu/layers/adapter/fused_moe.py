@@ -16,10 +16,11 @@
 import enum
 import functools
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch_tpu._internal import pallas
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -41,44 +42,50 @@ _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
 
 
-def _resolve_activation_name(activation: Any) -> str:
+def resolve_activation_name(activation: Any) -> str:
+    """Plain string for vLLM's MoE activation enum or string."""
     if isinstance(activation, enum.Enum):
         return activation.value
     return activation.value if hasattr(activation, "value") else str(activation)
 
 
-def resolve_silu_bf16(activation: str) -> str:
-    """Return gmm_v2's "silu_bf16" for "silu" when TPU_MOE_SILU_BF16 is set.
+# `--additional-config` key: round the gmm_v2-fused SwiGLU like upstream
+# SiluAndMul (see silu_and_mul_bf16 in kernels/megablox/gmm_v2.py).
+SILU_BF16_CONFIG_KEY = "tpu_moe_silu_bf16"
 
-    Resolved once per layer at weight load, outside jit, so the name is a
-    static argument of every compiled MoE program and every kernel cache key.
-    The v2 fused EP, fused decode, TP decode and dense-expert kernels fuse only
+
+def silu_bf16_enabled(vllm_config: VllmConfig | None) -> bool:
+    """Whether `additional_config["tpu_moe_silu_bf16"]` is set (default off)."""
+    if vllm_config is None:
+        return False
+    additional_config = cast("dict[str, Any]", vllm_config.additional_config)
+    value = additional_config.get(SILU_BF16_CONFIG_KEY, False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"additional_config[{SILU_BF16_CONFIG_KEY!r}] must be a bool, got {value!r}"
+        )
+    return value
+
+
+def resolve_silu_bf16(activation: str, enabled: bool) -> str:
+    """Return gmm_v2's "silu_bf16" for "silu" when `enabled`.
+
+    Called once per layer at weight load, outside jit, so the name is a static
+    argument of every compiled MoE program and every kernel cache key. The v2
+    fused EP, fused decode, TP decode and dense-expert kernels fuse only
     "silu" and decline "silu_bf16" in their admission checks, so the layer
     runs on gmm_v2; the adaptive fused EP kernel raises on it at startup.
-    Other activations are returned unchanged.
+    Other activations, including the clamped "silu_and_mul_with_clamp", are
+    returned unchanged.
     """
-    if activation != "silu" or not envs.TPU_MOE_SILU_BF16:
-        return activation
-    logger.info_once(
-        "TPU_MOE_SILU_BF16=1: SiLU MoE layers run gmm_v2 with activation "
-        "'silu_bf16'; the v2 fused EP, fused decode, TP decode and "
-        "dense-expert MoE kernels, which fuse only 'silu', are not used."
-    )
-    if envs.TPU_MOE_DENSE_EXPERT_THRESHOLD > 0:
-        logger.warning_once(
-            "TPU_MOE_SILU_BF16=1 turns off the dense-expert MoE path that "
-            "TPU_MOE_DENSE_EXPERT_THRESHOLD=%d selects: dense_expert_moe "
-            "fuses only 'silu'.",
-            envs.TPU_MOE_DENSE_EXPERT_THRESHOLD,
-        )
-    return "silu_bf16"
+    return "silu_bf16" if enabled and activation == "silu" else activation
 
 
 def get_fused_moe_activation(activation, moe_config) -> str:
     """Encode vLLM's activation config for the Pallas GMM kernel."""
-    activation = _resolve_activation_name(activation)
+    activation = resolve_activation_name(activation)
     if activation != "situ":
-        return resolve_silu_bf16(activation)
+        return activation
 
     beta = moe_config.activation_situ_beta
     linear_beta = moe_config.activation_situ_linear_beta
@@ -107,9 +114,33 @@ class TpuMoEActivationMixin:
         return get_fused_moe_activation(layer.activation, layer.moe_config)
 
     def _set_tpu_activation(self, layer) -> str:
-        """Resolve and store; returns it, since callers also use it locally."""
-        self._tpu_activation_str = self._resolve_tpu_activation(layer)
-        return self._tpu_activation_str
+        """Resolve and store; returns it, since callers also use it locally.
+
+        Runs at weight load, so the `additional_config` read and the logging
+        stay out of the compiled forward.
+        """
+        activation = self._resolve_tpu_activation(layer)
+        resolved = resolve_silu_bf16(
+            activation, silu_bf16_enabled(get_current_vllm_config_or_none())
+        )
+        if resolved != activation:
+            logger.info_once(
+                "additional_config[%r]=true: SiLU MoE layers run gmm_v2 with "
+                "activation 'silu_bf16'; the v2 fused EP, fused decode, TP "
+                "decode and dense-expert MoE kernels, which fuse only 'silu', "
+                "are not used.",
+                SILU_BF16_CONFIG_KEY,
+            )
+            if envs.TPU_MOE_DENSE_EXPERT_THRESHOLD > 0:
+                logger.warning_once(
+                    "additional_config[%r]=true turns off the dense-expert MoE "
+                    "path that TPU_MOE_DENSE_EXPERT_THRESHOLD=%d selects: "
+                    "dense_expert_moe fuses only 'silu'.",
+                    SILU_BF16_CONFIG_KEY,
+                    envs.TPU_MOE_DENSE_EXPERT_THRESHOLD,
+                )
+        self._tpu_activation_str = resolved
+        return resolved
 
 
 def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:

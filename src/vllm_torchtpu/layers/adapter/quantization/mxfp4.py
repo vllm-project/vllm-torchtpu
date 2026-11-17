@@ -71,7 +71,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
     quantize_native_fp4_kmajor,
-    resolve_silu_bf16,
+    resolve_activation_name,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -198,11 +198,6 @@ def _dequantize_mxfp4_packed_on_device(
     return dequantize_tensor(unpacked, scale, axis, out_dtype)
 
 
-def _get_activation_str(activation) -> str:
-    """Convert MoEActivation enum or string to plain string."""
-    return activation.value if hasattr(activation, "value") else str(activation)
-
-
 class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     """
     TPU-specific implementation of MXFP4 MoE quantization.
@@ -241,7 +236,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     def _resolve_tpu_activation(self, layer) -> str:
         # Deliberately not get_fused_moe_activation: that also encodes the
         # situ beta parameters, which this kernel path does not take.
-        return resolve_silu_bf16(_get_activation_str(layer.activation))
+        return resolve_activation_name(layer.activation)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
@@ -460,10 +455,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # This variant runs the clamped kernel, so the string is not
         # recoverable from layer.activation alone -- resolving it at apply
         # time instead of storing it here would silently drop the clamp.
-        # Reads the activation name directly rather than super(), which maps
-        # "silu" to "silu_bf16" under TPU_MOE_SILU_BF16: the clamped kernel
-        # keeps float32 intermediates, so that setting does not apply here.
-        activation_str = _get_activation_str(layer.activation)
+        activation_str = super()._resolve_tpu_activation(layer)
         if activation_str.lower() in ("silu", "silu_and_mul", "swiglu"):
             return "silu_and_mul_with_clamp"
         return activation_str

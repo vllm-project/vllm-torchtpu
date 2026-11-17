@@ -93,21 +93,32 @@ def test_apply_act_fn_silu_bf16_rounds_intermediates_to_bfloat16(monkeypatch):
         "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
         lambda: SimpleNamespace(num_lanes=1),
     )
-    gate = jnp.asarray([-1.2345679, 0.33333334, 2.7182817], dtype=jnp.float32)
-    up = jnp.asarray([1.1111112, -0.7654321, 3.1415927], dtype=jnp.float32)
+    gate = jnp.asarray([-3.86777902], dtype=jnp.float32)
+    up = jnp.asarray([2.9283731], dtype=jnp.float32)
     interleaved = interleave_lane(gate, up)
 
     actual = apply_act_fn(interleaved, "silu_bf16")
 
-    # bf16(silu(bf16(gate))) * bf16(up), rounded to bfloat16. Without the
-    # rounding of silu(gate) the second value becomes -0.1494140625.
-    expected = np.asarray([-0.30859375, -0.1484375, 8.0], dtype=np.float32)
+    # bf16(bf16(silu(bf16(gate))) * bf16(up)). Dropping any one of the three
+    # intermediate casts changes the value (checked below), so the test fails
+    # if the kernel skips one.
+    expected = np.asarray([-0.2294921875], dtype=np.float32)
     assert actual.dtype == jnp.float32
     np.testing.assert_array_equal(np.asarray(actual), expected)
     np.testing.assert_array_equal(
         np.asarray(silu_and_mul_bf16(gate, up).astype(jnp.float32)), expected
     )
-    assert not np.array_equal(np.asarray(apply_act_fn(interleaved, "silu")), expected)
+    bf16, f32 = jnp.bfloat16, jnp.float32
+    silu_of_bf16_gate = jax.nn.silu(gate.astype(bf16).astype(f32))
+    without_one_cast = {
+        "gate": jax.nn.silu(gate).astype(bf16) * up.astype(bf16),
+        "up": silu_of_bf16_gate.astype(bf16).astype(f32) * up,
+        "silu": silu_of_bf16_gate * up.astype(bf16).astype(f32),
+        "all": jax.nn.silu(gate) * up,
+    }
+    for name, value in without_one_cast.items():
+        value = np.asarray(value.astype(bf16).astype(f32))
+        assert not np.array_equal(value, expected), name
 
 
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
@@ -389,6 +400,12 @@ def test_gmm_fused_silu_bf16_matches_unfused_silu_and_mul(
     actual_silu = np.asarray(run("silu").astype(jnp.bfloat16))
 
     assert actual_silu_bf16.dtype == jnp.bfloat16
+    actual = np.asarray(actual_silu_bf16).astype(np.float32)
+    # Every element within 2 bfloat16 ULPs; most are bit-equal.
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(
+        actual, expected.astype(np.float32), rtol=2**-6, atol=2**-10
+    )
     bf16_equal = np.mean(np.asarray(actual_silu_bf16) == expected)
     fp32_equal = np.mean(actual_silu == expected)
     assert bf16_equal > 0.99, (bf16_equal, fp32_equal)

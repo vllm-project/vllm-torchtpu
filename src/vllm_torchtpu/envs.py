@@ -107,7 +107,6 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     TPU_MOE_EP_HIER_RS: str = "off"
-    TPU_MOE_SILU_BF16: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -860,15 +859,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_EP_HIER_RS": env_with_choices(
         "TPU_MOE_EP_HIER_RS", "off", ["off", "bf16"]
     ),
-    # Round the gmm_v2-fused SwiGLU ("silu") gate, up and silu(gate) to
-    # bfloat16, as upstream SiluAndMul does, for reference parity in RL and
-    # distillation workloads. Independent of TPU_MOE_TOPK_WEIGHTS_FLOAT32: the
-    # two change different rounding points and each closes part of the gap.
-    # Other activations do not apply it. The v2 fused EP, fused decode, TP
-    # decode and dense-expert kernels decline SiLU layers, which run on gmm_v2
-    # instead; the adaptive fused EP kernel refuses them at startup.
-    # Remove once full-model evals make this rounding the default for "silu".
-    "TPU_MOE_SILU_BF16": env_bool("TPU_MOE_SILU_BF16", default=False),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

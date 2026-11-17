@@ -336,8 +336,8 @@ def test_refused_when_the_expert_blocks_are_not_equal():
 
 @pytest.mark.parametrize("activation", ["gelu", "silu_bf16"])
 def test_refused_on_a_non_silu_activation(activation):
-    # "silu_bf16" (TPU_MOE_SILU_BF16) needs bfloat16 roundings this kernel
-    # does not fuse, so such a layer must stay on gmm_v2.
+    # "silu_bf16" (additional_config tpu_moe_silu_bf16) needs bfloat16
+    # roundings this kernel does not fuse, so such a layer must stay on gmm_v2.
     assert _prebuild(_layer(), activation=activation) is None
 
 
