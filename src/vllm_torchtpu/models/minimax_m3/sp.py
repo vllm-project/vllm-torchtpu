@@ -211,7 +211,7 @@ def all_gather(x: torch.Tensor, fp8: bool, num_tokens: int) -> torch.Tensor:
     fp8: each row goes over the wire as e4m3 with one f32 scale (amax / 448)
     and is expanded back after the gather.
 
-    num_tokens: T, the step's token count (`positions.shape[0]`). The gather's
+    num_tokens: T, the step's token count (`input_ids.shape[0]`). The gather's
     output is viewed with it so the traced size is the step's own symbol, not
     tp * (T // tp): DCP code that splits the token dim (`gather_group_kv` at
     DCP 8) cannot hand a derived size to a torch collective.

@@ -126,22 +126,24 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor | None,
         residual: torch.Tensor,
+        num_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`forward` on the sequence-parallel stream: `hidden_states` and
         `residual` hold this rank's tokens (None for the first layer, whose
-        residual is the embedding), as do the returned pair."""
+        residual is the embedding), as do the returned pair. num_tokens: the
+        step's token count, `input_ids.shape[0]`."""
         self._check_partial_outputs()
         if hidden_states is None:
             hidden_states = self.input_layernorm(residual)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = sp.all_gather(
-            hidden_states, self.sp_fp8_attn_gather, positions.shape[0]
+            hidden_states, self.sp_fp8_attn_gather, num_tokens
         )
         hidden_states = sp.reduce_scatter(self.self_attn(positions, hidden_states))
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = sp.all_gather(
-            hidden_states, self.sp_fp8_gather, positions.shape[0]
+            hidden_states, self.sp_fp8_gather, num_tokens
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         return sp.reduce_scatter(ffn(hidden_states)), residual
@@ -218,23 +220,27 @@ class MiniMaxM3Model(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """`forward` on the sequence-parallel stream (`sp`). Reads the same
         parameters and buffers as `forward`, in the same order."""
+        # The token count as the input_ids symbol: it is lifted first in both
+        # traces, so viewing the gathers with it keeps the graph inputs of the
+        # all-reduce trace (positions has its own symbol, lifted later).
+        num_tokens = input_ids.shape[0]
         residual = sp.reduce_scatter(sp.embed_partial(self.embed_tokens, input_ids))
         hidden_states = None
         aux_hidden_states = []
         if 0 in self.aux_hidden_state_layers:
-            aux_hidden_states.append(sp.all_gather(residual, False, positions.shape[0]))
+            aux_hidden_states.append(sp.all_gather(residual, False, num_tokens))
         for idx, layer in enumerate(self.layers):
             hidden_states, residual = layer.forward_sp(
-                positions, hidden_states, residual
+                positions, hidden_states, residual, num_tokens
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(
                     sp.all_gather(
-                        hidden_states + residual, False, positions.shape[0]
+                        hidden_states + residual, False, num_tokens
                     )
                 )
         hidden_states, _ = self.norm(hidden_states, residual)
-        hidden_states = sp.all_gather(hidden_states, False, positions.shape[0])
+        hidden_states = sp.all_gather(hidden_states, False, num_tokens)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
