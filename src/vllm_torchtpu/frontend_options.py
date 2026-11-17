@@ -21,12 +21,14 @@ defaults to off, which is vLLM's own behaviour. The patches run on the host and
 never change a compiled program, so the section stays out of the compile-cache
 key (``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``).
 
-The platform calls :func:`install` from ``check_and_update_config``, which runs
-in every process that builds the engine config, including each API server.
+Each patch has an installer registered in ``patch_registry.PATCHES`` for the
+``platform_activation`` stage, which ``check_and_update_config`` applies with
+the engine config in every process that builds it, including each API server.
 The reasoning-count and detokenizer patches only apply in the API server
 processes; the tokenization cache is only reached through vLLM's renderer.
 """
 
+import importlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,30 +70,49 @@ def get(vllm_config: Any) -> FrontendOptions:
     return config_section.get(FrontendOptions, SECTION, vllm_config)
 
 
-def install(vllm_config: Any) -> FrontendOptions:
-    """Install the patches the options turn on. Idempotent per process.
+def install_tokenize_prefix_cache(vllm_config: Any = None) -> bool | None:
+    """patch_registry installer of ``tokenize_prefix_cache``."""
+    return _install(
+        vllm_config,
+        "tokenize_prefix_cache",
+        "vllm_torchtpu.frontend_tokcache",
+        "maybe_install_tokenize_prefix_cache",
+    )
 
-    A patch that cannot be installed logs a warning and leaves vLLM's own path
-    in place; it never stops the server from starting.
+
+def install_lazy_reasoning_count(vllm_config: Any = None) -> bool | None:
+    """patch_registry installer of ``lazy_reasoning_count``."""
+    return _install(
+        vllm_config,
+        "lazy_reasoning_count",
+        "vllm_torchtpu.frontend_fix",
+        "maybe_install_lazy_reasoning_count",
+    )
+
+
+def install_detok_prompt_tail(vllm_config: Any = None) -> bool | None:
+    """patch_registry installer of ``detok_prompt_tail``."""
+    return _install(
+        vllm_config,
+        "detok_prompt_tail",
+        "vllm_torchtpu.frontend_fix",
+        "maybe_install_detok_prompt_tail",
+    )
+
+
+def _install(vllm_config: Any, name: str, module: str, installer: str) -> bool | None:
+    """Install option ``name``'s patch with ``module.installer`` when the engine
+    config turns it on.
+
+    Off, this returns False, which keeps the registry entry eligible: a later
+    engine config built in the same process may still turn it on. A patch that
+    cannot be installed logs a warning and leaves vLLM's own path in place; it
+    never stops the server from starting.
     """
-    options = get(vllm_config)
-    if options.tokenize_prefix_cache:
-        from vllm_torchtpu.frontend_tokcache import maybe_install_tokenize_prefix_cache
-
-        _install_or_warn("tokenize_prefix_cache", maybe_install_tokenize_prefix_cache)
-    if options.lazy_reasoning_count:
-        from vllm_torchtpu.frontend_fix import maybe_install_lazy_reasoning_count
-
-        _install_or_warn("lazy_reasoning_count", maybe_install_lazy_reasoning_count)
-    if options.detok_prompt_tail:
-        from vllm_torchtpu.frontend_fix import maybe_install_detok_prompt_tail
-
-        _install_or_warn("detok_prompt_tail", maybe_install_detok_prompt_tail)
-    return options
-
-
-def _install_or_warn(name: str, install_fn) -> None:
+    if vllm_config is None or not getattr(get(vllm_config), name):
+        return False
     try:
-        install_fn()
+        getattr(importlib.import_module(module), installer)()
     except Exception as e:
         logger.warning("%s.%s: install failed (%r)", SECTION, name, e)
+    return None
