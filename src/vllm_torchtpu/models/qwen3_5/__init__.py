@@ -11,4 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5: the megakernel model folder (`megakernel/`)."""
+"""Qwen3.5 MoE model folder (see README.md)."""
