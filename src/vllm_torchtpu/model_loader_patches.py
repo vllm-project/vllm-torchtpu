@@ -1025,19 +1025,108 @@ def patch_moe_expert_write_staging() -> None:
             )
         return result
 
+    @functools.wraps(orig_process)
     def process_weights_after_loading(model, model_config, target_device):
-        during_load = stager.flushed
-        stager.flush_all()
-        logger.info(
-            "Expert parameters written to the device: %d as their last "
-            "expert landed, %d at the end of loading.",
-            during_load,
-            stager.flushed - during_load,
+        from contextlib import nullcontext
+
+        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.quantization.base_config import (
+            QuantizeMethodBase,
         )
-        return orig_process(model, model_config, target_device)
+        from vllm.model_executor.layers.quantization.online.fp8 import (
+            OnlineLinearBase,
+        )
+        from vllm.model_executor.layers.quantization.online.moe_base import (
+            OnlineMoEMethodBase,
+        )
+        from vllm.model_executor.model_loader import utils as loader_utils
+
+        has_moe = len(stager) > 0 or any(
+            isinstance(m, RoutedExperts) for m in model.modules()
+        )
+        if not has_moe:
+            return orig_process(model, model_config, target_device)
+
+        if loader_utils.is_weights_pre_processed():
+            stager.flush_all()
+            return orig_process(model, model_config, target_device)
+
+        # Process dense LinearBase modules before flushing staged expert tensors
+        # and running RoutedExperts post-load hooks: shrinking or repacking
+        # dense weights first lowers the HBM high-water mark ahead of MoE
+        # expert requantization.
+        done_modules: set[int] = set()
+        saved_qms: dict[int, tuple[typing.Any, typing.Any, bool]] = {}
+        try:
+            for module in model.modules():
+                qm = getattr(module, "quant_method", None)
+                if not (
+                    isinstance(module, LinearBase)
+                    and qm is not None
+                    and isinstance(qm, QuantizeMethodBase)
+                ):
+                    continue
+                qm_id = id(qm)
+                if qm_id not in saved_qms:
+                    orig_pwal = qm.process_weights_after_loading
+                    orig_req_dev = bool(getattr(qm, "requires_device_loading", True))
+                    saved_qms[qm_id] = (qm, orig_pwal, orig_req_dev)
+
+                    def _guarded_pwal(m, _orig=orig_pwal):
+                        if id(m) not in done_modules:
+                            return _orig(m)
+                        return None
+
+                    typing.cast(
+                        typing.Any, qm
+                    ).process_weights_after_loading = _guarded_pwal
+                else:
+                    _, orig_pwal, orig_req_dev = saved_qms[qm_id]
+
+                loading_ctx = (
+                    loader_utils.device_loading_context(module, target_device)
+                    if orig_req_dev
+                    else nullcontext()
+                )
+                timing_ctx = (
+                    loader_utils.online_quantization_timing_context(module, qm)
+                    if isinstance(qm, (OnlineLinearBase, OnlineMoEMethodBase))
+                    else nullcontext()
+                )
+                with loading_ctx, timing_ctx:
+                    orig_pwal(module)
+                if hasattr(module, "update_param_tp_status"):
+                    module.update_param_tp_status()
+                done_modules.add(id(module))
+
+            # Avoid redundant CPU-offload H2D/D2H copies in orig_process for
+            # quant_methods whose modules have all completed processing.
+            non_linear_qms = {
+                id(getattr(m, "quant_method", None))
+                for m in model.modules()
+                if not isinstance(m, LinearBase)
+            }
+            for qm_id, (qm, _, _) in saved_qms.items():
+                if qm_id not in non_linear_qms:
+                    typing.cast(typing.Any, qm).requires_device_loading = False
+
+            during_load = stager.flushed
+            stager.flush_all()
+            logger.info(
+                "Expert parameters written to the device: %d as their last "
+                "expert landed, %d at the end of loading.",
+                during_load,
+                stager.flushed - during_load,
+            )
+            return orig_process(model, model_config, target_device)
+        finally:
+            for qm, orig_pwal, orig_req_dev in saved_qms.values():
+                typing.cast(typing.Any, qm).process_weights_after_loading = orig_pwal
+                typing.cast(typing.Any, qm).requires_device_loading = orig_req_dev
 
     RoutedExperts.weight_loader = weight_loader
     RoutedExperts._tpu_expert_staging_patch = True
+    RoutedExperts._tpu_expert_stager = stager
     base_loader.process_weights_after_loading = process_weights_after_loading
     logger.info(
         "Applied TPU patch: expert parameters are staged on the host "

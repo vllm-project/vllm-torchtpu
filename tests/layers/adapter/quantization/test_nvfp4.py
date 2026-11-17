@@ -721,3 +721,133 @@ class TestNvfp4MoEMethod:
             out = method.apply_monolithic(layer, x, router_logits)
             assert torch.equal(out, torch.ones(4, 64))
             mock_pipe.assert_called_once()
+
+    def test_install_prepared_moe_weights_replaces_w13_before_w2_requant(self):
+        from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
+            _install_prepared_moe_weights,
+        )
+
+        layer = FakeRoutedExperts(use_ep=False)
+        e, two_i, h, group_size = 2, 1024, 512, 16
+        inter = two_i // 2
+        orig_w13 = torch.zeros(e, two_i, h // 2, dtype=torch.uint8)
+        orig_w2 = torch.ones(e, h, inter // 2, dtype=torch.uint8)
+        layer.w13_weight = torch.nn.Parameter(orig_w13, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(orig_w2, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(e, two_i, h // group_size, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones(e, h, inter // group_size, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(e, 2, dtype=torch.float32), requires_grad=False
+        )
+        layer.w2_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(e, dtype=torch.float32), requires_grad=False
+        )
+
+        events: list[str] = []
+        out_w13 = torch.full((e, h, inter), 3, dtype=torch.uint8)
+        out_s13 = torch.ones(e, 1, 1, two_i, dtype=torch.float32)
+        out_w2 = torch.full((e, inter, h // 2), 5, dtype=torch.uint8)
+        out_s2 = torch.ones(e, 1, 1, h, dtype=torch.float32)
+
+        def _fake_requant(buf: torch.Tensor, scale_f: torch.Tensor, block: int):
+            assert block == 512
+            if len(events) == 0:
+                events.append("requant:w13")
+                assert hasattr(layer, "w13_weight_scale_2")
+                return out_w13, out_s13
+            # Before w2 requantization begins, checkpoint w13 and its global
+            # scale must already be detached from layer so HBM can be reclaimed.
+            assert layer.w13_weight.data_ptr() == out_w13.data_ptr()
+            assert layer.w13_weight_scale.data_ptr() == out_s13.data_ptr()
+            assert not hasattr(layer, "w13_weight_scale_2")
+            events.append("requant:w2")
+            return out_w2, out_s2
+
+        with (
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4.fresh_buffer",
+                side_effect=lambda t: t,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4.requant_load_kmajor_fp4",
+                side_effect=_fake_requant,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4.synchronize_tensors"
+            ) as mock_sync,
+        ):
+            _, mode = _install_prepared_moe_weights(layer, requant_block=512)
+
+        assert mode == "FP4 (jax requant block-512)"
+        assert events == ["requant:w13", "requant:w2"]
+        assert not hasattr(layer, "w2_weight_scale_2")
+        mock_sync.assert_not_called()
+
+    @pytest.mark.tpu_test
+    def test_install_prepared_moe_weights_synchronizes_w13_before_w2_tpu(self):
+        import jax
+
+        from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
+            _install_prepared_moe_weights,
+            synchronize_tensors,
+        )
+
+        if jax.default_backend() != "tpu":
+            pytest.fail(f"Expected JAX TPU backend, got {jax.default_backend()!r}")
+        device = torch.device("tpu:0")
+        layer = FakeRoutedExperts(use_ep=False)
+        e, two_i, h, group_size = 2, 1024, 512, 16
+        inter = two_i // 2
+        layer.w13_weight = torch.nn.Parameter(
+            torch.zeros(e, two_i, h // 2, dtype=torch.uint8, device=device),
+            requires_grad=False,
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            torch.zeros(e, h, inter // 2, dtype=torch.uint8, device=device),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                e, two_i, h // group_size, dtype=torch.float8_e4m3fn, device=device
+            ),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                e, h, inter // group_size, dtype=torch.float8_e4m3fn, device=device
+            ),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(e, 2, dtype=torch.float32, device=device), requires_grad=False
+        )
+        layer.w2_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(e, dtype=torch.float32, device=device), requires_grad=False
+        )
+
+        sync_counts: list[int] = []
+
+        def _spy_sync(tensors):
+            sync_counts.append(len(tensors))
+            synchronize_tensors(tensors)
+
+        with patch(
+            "vllm_torchtpu.layers.adapter.quantization.nvfp4.synchronize_tensors",
+            side_effect=_spy_sync,
+        ):
+            (w13, w2, s13, s2), mode = _install_prepared_moe_weights(
+                layer, requant_block=512
+            )
+
+        assert mode == "FP4 (jax requant block-512)"
+        assert sync_counts == [2, 2]
+        assert w13.dtype == torch.float4_e2m1fn_x2
+        assert w2.dtype == torch.float4_e2m1fn_x2
+        assert s13.shape == (e, 1, 1, two_i)
+        assert s2.shape == (e, 1, 1, h)

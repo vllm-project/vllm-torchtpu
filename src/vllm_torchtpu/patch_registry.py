@@ -127,6 +127,9 @@ PATCHES = (
         "vllm_torchtpu.model_loader_patches:patch_default_model_loader_page_cache",
         _ACTIVE,
     ),
+    # Keep patch_expert_placement_routers registered after
+    # patch_moe_expert_write_staging so outer router permutation runs before
+    # early LinearBase weight processing transposes gate.weight.
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
     Patch("vllm_torchtpu.model_loader_patches:patch_expert_placement_routers", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),

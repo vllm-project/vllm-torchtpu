@@ -157,6 +157,7 @@ def _requant_moe_w4a8(
     )
     w13_out = pack_fp4_indices(w13_idx)  # [E, 2*I_pad, H/2]
     w13_scale_4d = _to_kernel_scale(w13_s.to(torch.float32))
+    del w13_f, gate, up, w13_idx, w13_s
 
     # w2: dequant block-16 -> [E, H, I] fp32; pad contracting dim I -> I_pad.
     w2_f = dequantize_tensor(unpack_uint8_to_fp4(w2_u8), w2_scale_f, axis=-1)
@@ -165,6 +166,7 @@ def _requant_moe_w4a8(
     w2_idx, w2_s = quantize_tensor_to_fp4(w2_f, axis=-1, block_size=block)
     w2_out = pack_fp4_indices(w2_idx)  # [E, H, I_pad/2]
     w2_scale_4d = _to_kernel_scale(w2_s.to(torch.float32))
+    del w2_f, w2_idx, w2_s
 
     return (
         fresh_buffer(w13_out),
@@ -174,30 +176,104 @@ def _requant_moe_w4a8(
     )
 
 
-def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):
-    """Prepare a candidate weight set without replacing checkpoint tensors."""
-    w13, w2 = layer.w13_weight.data, layer.w2_weight.data
-    if requant_block:
-        requant_block = int(requant_block)
-        hidden, inter = w13.shape[-1] * 2, w2.shape[-1] * 2
-        if hidden % requant_block == 0 and inter % requant_block == 0:
-            w13, s13 = requant_load_kmajor_fp4(
-                fresh_buffer(w13), w13_scale_f, requant_block
-            )
-            w2, s2 = requant_load_kmajor_fp4(
-                fresh_buffer(w2), w2_scale_f, requant_block
-            )
-            return (w13, w2, s13, s2), f"FP4 (jax requant block-{requant_block})"
-        # Pad each gate/up half and w2's contracting dimension together.
-        w13, s13, w2, s2 = _requant_moe_w4a8(
-            w13, w13_scale_f, w2, w2_scale_f, requant_block
+def _expand_w13_scale(layer: TpuRoutedExperts) -> torch.Tensor:
+    """Fuse E4M3 block scale * FP32 per-w1/w3 global scale [E, 2] -> FP32."""
+    w13_scale = layer.w13_weight_scale.data  # [E, 2I, H/group] e4m3
+    g13 = layer.w13_weight_scale_2.data.to(torch.float32)  # [E, 2]
+    half = w13_scale.shape[1] // 2
+    s_gate = w13_scale[:, :half, :].to(torch.float32) * g13[:, 0].view(-1, 1, 1)
+    s_up = w13_scale[:, half:, :].to(torch.float32) * g13[:, 1].view(-1, 1, 1)
+    return torch.cat([s_gate, s_up], dim=1)
+
+
+def _expand_w2_scale(layer: TpuRoutedExperts) -> torch.Tensor:
+    """Fuse E4M3 block scale * FP32 per-expert global scale [E] -> FP32."""
+    w2_scale = layer.w2_weight_scale.data  # [E, H, I/group] e4m3
+    g2 = layer.w2_weight_scale_2.data.to(torch.float32)  # [E]
+    return w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
+
+
+def _drop_attrs(layer: Any, *names: str) -> None:
+    for attr in names:
+        if hasattr(layer, attr):
+            delattr(layer, attr)
+
+
+def _install_prepared_moe_weights(
+    layer: TpuRoutedExperts, requant_block: int | None
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], str]:
+    """Prepare and install w13 before expanding/preparing w2 to bound peak HBM."""
+    hidden = layer.w13_weight.shape[-1] * 2
+    inter = layer.w2_weight.shape[-1] * 2
+    block = int(requant_block) if requant_block else 0
+
+    if block and (hidden % block != 0 or inter % block != 0):
+        # Padded fallback: transform both together then install.
+        w13_scale_f = _expand_w13_scale(layer)
+        w2_scale_f = _expand_w2_scale(layer)
+        w13_u8, s13, w2_u8, s2 = _requant_moe_w4a8(
+            layer.w13_weight.data, w13_scale_f, layer.w2_weight.data, w2_scale_f, block
         )
-        mode = f"FP4 (torch requant block-{requant_block})"
+        del w13_scale_f, w2_scale_f
+        w13 = load_kmajor_fp4(w13_u8)
+        w2 = load_kmajor_fp4(w2_u8)
+        _drop_attrs(
+            layer,
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+            "w13_input_scale",
+            "w2_input_scale",
+        )
+        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
+        if layer.w13_weight.device.type == "tpu":
+            synchronize_tensors(
+                [
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale,
+                    layer.w2_weight_scale,
+                ]
+            )
+        return (w13, w2, s13, s2), f"FP4 (torch requant block-{block})"
+
+    # Sequential w13 -> replace & sync -> w2 -> replace & sync so checkpoint
+    # w13 HBM and its FP32 block-16 scale tensor are freed before w2 starts.
+    w13_scale_f = _expand_w13_scale(layer)
+    if block:
+        w13, s13 = requant_load_kmajor_fp4(
+            fresh_buffer(layer.w13_weight.data), w13_scale_f, block
+        )
+        mode = f"FP4 (jax requant block-{block})"
     else:
-        w13, w2 = fresh_buffer(w13), fresh_buffer(w2)
-        s13, s2 = _to_kernel_scale(w13_scale_f), _to_kernel_scale(w2_scale_f)
+        w13 = load_kmajor_fp4(fresh_buffer(layer.w13_weight.data))
+        s13 = _to_kernel_scale(w13_scale_f)
         mode = "FP4 (block-16)"
-    return (load_kmajor_fp4(w13), load_kmajor_fp4(w2), s13, s2), mode
+    del w13_scale_f
+    _drop_attrs(layer, "w13_weight_scale_2", "w13_input_scale")
+    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
+    if layer.w13_weight.device.type == "tpu":
+        synchronize_tensors([layer.w13_weight, layer.w13_weight_scale])
+
+    w2_scale_f = _expand_w2_scale(layer)
+    if block:
+        w2, s2 = requant_load_kmajor_fp4(
+            fresh_buffer(layer.w2_weight.data), w2_scale_f, block
+        )
+    else:
+        w2 = load_kmajor_fp4(fresh_buffer(layer.w2_weight.data))
+        s2 = _to_kernel_scale(w2_scale_f)
+    del w2_scale_f
+    _drop_attrs(layer, "w2_weight_scale_2", "w2_input_scale")
+    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
+    if layer.w2_weight.device.type == "tpu":
+        synchronize_tensors([layer.w2_weight, layer.w2_weight_scale])
+
+    return (w13, w2, s13, s2), mode
 
 
 def _prebuild_w4a8(layer, activation, configured_block):
@@ -396,20 +472,6 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
-        # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
-        # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the
-        # gate (first half) and up (second half) output rows respectively.
-        w13_scale = layer.w13_weight_scale.data  # [E, 2I, H/group] e4m3
-        g13 = layer.w13_weight_scale_2.data.to(torch.float32)  # [E, 2]
-        half = w13_scale.shape[1] // 2
-        s_gate = w13_scale[:, :half, :].to(torch.float32) * g13[:, 0].view(-1, 1, 1)
-        s_up = w13_scale[:, half:, :].to(torch.float32) * g13[:, 1].view(-1, 1, 1)
-        w13_scale_f = torch.cat([s_gate, s_up], dim=1)  # [E, 2I, H/group] fp32
-
-        w2_scale = layer.w2_weight_scale.data  # [E, H, I/group] e4m3
-        g2 = layer.w2_weight_scale_2.data.to(torch.float32)  # [E]
-        w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
-
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
             fused_moe_ep_unsupported_reason,
@@ -426,9 +488,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
         else:
             op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
-        weights, mode = _prepare_moe_weights(
-            layer, w13_scale_f, w2_scale_f, requant_block
-        )
+        weights, mode = _install_prepared_moe_weights(layer, requant_block)
         if op is not None:
             validate_prepared = (
                 adaptive_moe.fused_moe_ep_unsupported_reason
@@ -448,32 +508,6 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 raise ValueError(f"adaptive NVFP4 prepared weights: {reason}")
             assert reason is None, (
                 f"NVFP4 fused EP prepared weights violate the admitted layout: {reason}"
-            )
-        w13, w2, w13_scale_4d, w2_scale_4d = weights
-
-        for attr in (
-            "w13_weight_scale_2",
-            "w2_weight_scale_2",
-            "w13_input_scale",
-            "w2_input_scale",
-        ):
-            if hasattr(layer, attr):
-                delattr(layer, attr)
-
-        # Install only the admitted W4A8 candidate or the original GMM recipe.
-        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale_4d, requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale_4d, requires_grad=False)
-
-        if layer.w13_weight.device.type == "tpu":
-            synchronize_tensors(
-                [
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    layer.w13_weight_scale,
-                    layer.w2_weight_scale,
-                ]
             )
 
         logger.info_once(
