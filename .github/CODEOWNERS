@@ -175,6 +175,9 @@
 /src/vllm_torchtpu/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 /tests/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 
+# Models: Qwen4 Experimental
+/src/vllm_torchtpu/models/vllm/qwen4_exp/ @HandsomeHow @zwzmzd @acczz @zhubin086
+
 # Models: Qwen3.8 Flash
 /src/vllm_torchtpu/models/qwen38_flash/ @DRZDONG @caojx-google
 /tests/models/qwen38_flash/ @DRZDONG @caojx-google
