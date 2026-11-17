@@ -338,63 +338,33 @@ def test_fork_during_application_retains_completed_patches(registry):
     assert seen == ["completed", "pending"]
 
 
-def test_sequence_parallel_moe_admission(monkeypatch):
-    # Save original property and guard flag so teardown restores them cleanly
+@pytest.mark.parametrize(
+    "enabled,ep,tp,dp,expected",
+    [
+        (False, True, 8, 1, False),  # off by default
+        (True, False, 8, 1, False),  # no EP: the expert sum is never reduced
+        (True, False, 2, 4, False),
+        (True, True, 1, 1, False),  # no TP: nothing to slice
+        (True, True, 1, 8, False),
+        (True, True, 8, 1, True),
+        # attention data parallelism over the EP ranks
+        (True, True, 8, 2, True),
+        (True, True, 4, 2, True),
+        (True, True, 2, 4, True),
+    ],
+)
+def test_sequence_parallel_moe_admission(monkeypatch, enabled, ep, tp, dp, expected):
+    # Save original property and guard flag so teardown restores them cleanly;
+    # raising=False records an absent flag, so teardown removes it again.
     monkeypatch.setattr(
         ParallelConfig,
         "use_sequence_parallel_moe",
         ParallelConfig.use_sequence_parallel_moe,
     )
-    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
-        monkeypatch.setattr(
-            ParallelConfig,
-            "_tpu_no_sp_moe_patch",
-            ParallelConfig._tpu_no_sp_moe_patch,
-        )
-    else:
-        monkeypatch.setattr(
-            ParallelConfig,
-            "_tpu_no_sp_moe_patch",
-            False,
-            raising=False,
-        )
-
-    # Case 1: envs.TPU_MOE_SEQUENCE_PARALLEL = False
-    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
-    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
-        del ParallelConfig._tpu_no_sp_moe_patch
+    monkeypatch.setattr(ParallelConfig, "_tpu_no_sp_moe_patch", False, raising=False)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", enabled)
     _patch_sequence_parallel_moe_admission()
     cfg = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
+        enable_expert_parallel=ep, tensor_parallel_size=tp, data_parallel_size=dp
     )
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg)
-
-    # Case 2: envs.TPU_MOE_SEQUENCE_PARALLEL = True
-    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
-    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
-        del ParallelConfig._tpu_no_sp_moe_patch
-    _patch_sequence_parallel_moe_admission()
-
-    # EP=False, TP=8, DP=1 -> False
-    cfg_no_ep = Mock(
-        enable_expert_parallel=False, tensor_parallel_size=8, data_parallel_size=1
-    )
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_no_ep)
-
-    # EP=True, TP=1, DP=1 -> False
-    cfg_tp1 = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=1, data_parallel_size=1
-    )
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_tp1)
-
-    # EP=True, TP=8, DP=2 -> True (attention data parallelism over EP ranks)
-    cfg_dp2 = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=2
-    )
-    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp2)
-
-    # EP=True, TP=8, DP=1 -> True
-    cfg_sp = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
-    )
-    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)
+    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg) is expected
