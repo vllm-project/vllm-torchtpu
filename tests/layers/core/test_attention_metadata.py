@@ -638,6 +638,44 @@ class TestAttentionMetadataBuilderPlumbing:
         builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
         assert source.call_count == 1  # build() did not read it again
 
+    def test_staged_build_gives_the_pcp_manager_the_block_table(self):
+        """Under PCP the walk still stages (a zeroed buffer), so build() takes
+        the staged branch; the manager slices its split and replicated tables
+        out of the group's block table at the group's width, so it must still
+        get both."""
+        runner = self._make_runner_mock(num_groups=2)
+        runner.pcp_manager = MagicMock()
+        builders = [
+            self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4,), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        stage_block_table_uploads(runner, ctx, 4)
+        assert set(ctx.staged_block_tables) == {0, 1}
+
+        for gid, builder in enumerate(builders):
+            runner.pcp_manager.build_metadata.reset_mock()
+            meta = builder.build(
+                common_prefix_len=0, common_attn_metadata=self._make_cm(4)
+            )
+            runner.pcp_manager.build_metadata.assert_called_once_with(
+                runner=runner,
+                block_table_obj=runner.input_batch.block_table[gid],
+                target_num_reqs=4,
+                target_num_blocks=4,
+            )
+            assert meta.pcp_metadata is runner.pcp_manager.build_metadata.return_value
+            # The staged (zeroed) table is what the layers outside PCP read.
+            assert meta.block_tables is ctx.staged_block_tables[gid]
+
     def test_staging_respects_gid_subset_and_dummy_override(self):
         runner = self._make_runner_mock(num_groups=2)
         builders = [
