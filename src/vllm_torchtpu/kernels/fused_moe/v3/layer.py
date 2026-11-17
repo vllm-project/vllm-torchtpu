@@ -500,6 +500,11 @@ def _pallas_step(
         blocks_per_step=blocks_per_step,
         zero_words_per_step=config.tables_zero_words,
         shard_index=shard_index,
+        # The select kernel's top-k picks distinct experts, so a shard sends
+        # an expert at most one pair per token; a caller's routing may not.
+        pairs_per_expert=(
+            message_tokens if routing_indices is None else message_tokens * top_k
+        ),
     )
     (
         _,
