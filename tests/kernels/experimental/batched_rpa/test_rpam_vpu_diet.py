@@ -17,8 +17,13 @@ Qwen3.5 TP8 per device: 4 q heads, 1 KV head, head_dim 256, fp8 SEQ_ALONG_LANE
 (HND) cache with 128-token pages. Covers:
 
 * The default bq_sz=1024 prefill tiling, whose new-KV stitch rolls the whole
+  KV window by a dynamic lane shift. Histories end on, before and after
+  page/lane boundaries, and reach 160k tokens.
 * The DCP passes (CACHE_ONLY / NEW_TOKENS_ONLY with return_lse), with and
   without a 4-way interleaved context-parallel cache shard.
+* The VPU diet (scale folded into q when the folded scale is a power of two,
+  mask skipped for KV blocks below the causal diagonal) against the original
+  path: must be bit-identical.
 
 Inputs and references are built on device so 160k contexts stay fast.
 """
@@ -222,6 +227,10 @@ _TOL = dict(atol=1.5e-2, rtol=2e-2)
 @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
 def test_bq1024_prefill_matches_reference(monkeypatch, kv_dtype, seqs):
     if kv_dtype == jnp.bfloat16 and seqs is _LONG:
+        # Independent of the diet: when this skip was added, the DECODE block
+        # picker chose bkv=1792 for bf16 SEQ_ALONG_LANE at this page-table size
+        # and the RPAd compile overshot TPU7x VMEM by ~28 KB. The served KV
+        # cache at these shapes is fp8, which this case covers at 160k.
         pytest.skip("RPAd bf16 HND VMEM estimate (pre-existing); fp8 covers 160k")
     inputs, logical, page_table = _setup(kv_dtype, seqs)
     total = int(inputs["cu_q_lens"][-1])
@@ -235,6 +244,8 @@ def test_bq1024_prefill_matches_reference(monkeypatch, kv_dtype, seqs):
 def test_bq1024_matches_bq128_bkv128(monkeypatch):
     # bq_sz capped at num_lanes takes the O(1) per-vreg stitch. That stitch
     # covers at most two lane columns of new tokens, so bkv_sz must be capped
+    # too for a MIXED block to be correct: bq_sz=128 with bkv_sz > 128 can
+    # misplace new KV that does not start on a lane boundary.
     inputs, logical, page_table = _setup(jnp.float8_e4m3fn, _SHORT)
     total = int(inputs["cu_q_lens"][-1])
     blocks = configs.BlockSizes(bq_sz=128, bq_c_sz=64, bkv_sz=128, batch_size=2)
@@ -323,10 +334,13 @@ def test_vpu_diet_bit_exact_scoped(monkeypatch, scope, cp):
 
 
 def test_vpu_diet_non_pow2_k_scale(monkeypatch):
+    # The folded scale is not a power of two, so the diet keeps the original
+    # path's multiplies and only skips masks.
     inputs, logical, _ = _setup(jnp.float8_e4m3fn, _SHORT, seed=2)
     total = int(inputs["cu_q_lens"][-1])
     old, _ = _run(monkeypatch, inputs, diet=False, k_scale=0.37)
     new, _ = _run(monkeypatch, inputs, diet=True, k_scale=0.37)
+    np.testing.assert_array_equal(new[:total], old[:total])
     np.testing.assert_allclose(
         new[:total], _reference(inputs, logical, _SHORT, k_scale=0.37)[0], **_TOL
     )
