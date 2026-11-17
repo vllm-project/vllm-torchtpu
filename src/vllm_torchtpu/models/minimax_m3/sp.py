@@ -63,6 +63,8 @@ _SCALE_FLOOR = 1e-12
 class _Ops:
     n: int
     reduce_scatter: Any
+    # The Pallas all-reduce's rank tensor when that op is armed, else None.
+    rank: torch.Tensor | None
     all_gather: Any
     all_gather_fp8: Any
 
@@ -82,29 +84,46 @@ def active(num_tokens: int, min_tokens: int, tp_size: int) -> bool:
     return num_tokens >= min_tokens and num_tokens % tp_size == 0
 
 
-def _jax_op(name: str, body, mesh, fake):
+def _jax_op(name: str, body, mesh, fake, with_rank: bool = False):
+    """A torch op running `body` per rank. with_rank: the op also takes the
+    Pallas all-reduce's rank operand ([1, 1] int32, unused by `body`)."""
     axis = mesh.axis_names[0]
+    specs = (P(axis), P(axis)) if with_rank else (P(axis),)
+
+    def per_rank(x, *_rank):
+        return body(x)
+
     sharded = jax.shard_map(
-        body, mesh=mesh, in_specs=(P(axis),), out_specs=P(axis), check_vma=False
+        per_rank, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
     )
 
-    # torch_tpu reads the operand types from this annotation.
-    def fn(x: jax.Array) -> jax.Array:
-        return sharded(jax.device_put(x, NamedSharding(mesh, P(axis))))
+    def put(args):
+        return (jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+
+    # torch_tpu reads the operand types from these annotations.
+    if with_rank:
+
+        def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+            return sharded(*put((x, rank)))
+
+    else:
+
+        def fn(x: jax.Array) -> jax.Array:
+            return sharded(*put((x,)))
 
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         name,
         fn,
         mesh=mesh,
-        input_partition_specs=(P(axis),),
+        input_partition_specs=specs,
         output_partition_specs=P(axis),
     )
-    op.register_fake(fake)
+    op.register_fake(lambda x, *_rank: fake(x))
     return op
 
 
-def _make_ops(mesh) -> _Ops:
+def _make_ops(mesh, rank: torch.Tensor | None) -> _Ops:
     axis = mesh.axis_names[0]
     n = int(mesh.size)
 
@@ -132,7 +151,10 @@ def _make_ops(mesh) -> _Ops:
 
     return _Ops(
         n=n,
-        reduce_scatter=_jax_op("minimax_sp::reduce_scatter", rs, mesh, fake_rs),
+        reduce_scatter=_jax_op(
+            "minimax_sp::reduce_scatter", rs, mesh, fake_rs, with_rank=rank is not None
+        ),
+        rank=rank,
         all_gather=_jax_op("minimax_sp::all_gather", ag, mesh, fake_ag),
         all_gather_fp8=_jax_op("minimax_sp::all_gather_fp8", ag8, mesh, fake_ag),
     )
@@ -158,7 +180,15 @@ def arm() -> None:
     mesh = build_ep_mesh()
     if mesh is None:
         raise ValueError("TPU_MINIMAX_M3_SP_MIN_TOKENS: no EP mesh")
-    _OPS = _make_ops(mesh)
+    # The all-reduce stream lifts the Pallas all-reduce's rank tensor as a
+    # graph input (it is that op's operand); the reduce-scatter takes it too,
+    # so both traces of the backbone have the same inputs and a token bucket
+    # can be handed between them (`shape_variants`).
+    from vllm_torchtpu.distributed import pallas_all_reduce
+
+    armed = pallas_all_reduce._ARMED
+    rank = armed.rank if armed is not None and armed.ranks == tp_ranks else None
+    _OPS = _make_ops(mesh, rank)
     logger.info(
         "TPU_MINIMAX_M3_SP_MIN_TOKENS: sequence-parallel collectives armed over "
         "%d ranks.",
@@ -170,6 +200,8 @@ def reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     """A 1/TP token slice of the TP sum of `x`: [T, H] -> [T / tp, H]. The
     slices are in mesh order, the order `all_gather` puts them back in."""
     assert _OPS is not None
+    if _OPS.rank is not None:
+        return _OPS.reduce_scatter(x, _OPS.rank)
     return _OPS.reduce_scatter(x)
 
 
