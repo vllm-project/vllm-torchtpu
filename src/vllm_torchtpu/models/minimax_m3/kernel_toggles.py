@@ -139,6 +139,49 @@ def _prefill_step_widths(additional_config: Any) -> tuple[int, ...]:
     return msa_attention_lse_r6._STEP_WIDTHS
 
 
+def _tiles(additional_config: Any, key: str) -> tuple[int, int] | None:
+    """"<block_q>:<pages per step>" -> ints; None when empty."""
+    raw = option(additional_config, key).strip()
+    if not raw:
+        return None
+    try:
+        block_q, pages = (int(x) for x in raw.split(":"))
+    except ValueError:
+        raise ValueError(
+            f"additional_config.{key}={raw!r}: want <block_q>:<pages per step>"
+        ) from None
+    if block_q <= 0 or block_q % 8 or pages <= 0:
+        raise ValueError(
+            f"additional_config.{key}={raw!r}: block_q a positive multiple of 8, "
+            "pages per step positive"
+        )
+    return block_q, pages
+
+
+def _apply_dcp_tiles(additional_config: Any) -> None:
+    for key, attr in (
+        ("minimax_dcp_small_batch_tokens", "SMALL_BATCH_TOKENS"),
+        ("minimax_dcp_small_batch_wide_pages", "SMALL_BATCH_WIDE_PAGES"),
+    ):
+        _set_value(
+            additional_config, key, msa_dcp, attr, _non_negative(additional_config, key)
+        )
+    for key, attr in (
+        ("minimax_dcp_prefill_tiles", "PREFILL_TILES"),
+        ("minimax_dcp_prefill_tiles_4bit", "PREFILL_TILES_4BIT"),
+    ):
+        _set_value(additional_config, key, msa_dcp, attr, _tiles(additional_config, key))
+    key = "minimax_msa_dense_work_list_elems"
+    _set_value(
+        additional_config,
+        key,
+        msa_attention,
+        "_DENSE_WORK_LIST_ELEMS",
+        _non_negative(additional_config, key)
+        or msa_attention.DEFAULT_DENSE_WORK_LIST_ELEMS,
+    )
+
+
 def _apply_r6(additional_config: Any) -> None:
     r6 = msa_attention_lse_r6
     _set_value(
@@ -223,6 +266,7 @@ def apply(additional_config: Any) -> None:
         _large_pages_per_step(additional_config),
     )
     _apply_r6(additional_config)
+    _apply_dcp_tiles(additional_config)
     # The DCP op factory (`ops.msa`) reads this one when it builds the op.
     from vllm_torchtpu.models.minimax_m3.ops import msa as msa_ops
 

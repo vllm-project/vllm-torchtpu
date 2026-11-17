@@ -263,6 +263,19 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # instead of XLA fusions. Same math (f32 norm rounded to bf16, f32
     # rotation rounded once); not checked bitwise on TPU.
     "minimax_qk_norm_rope_kernel": False,
+    # MiniMax M3 MSA DCP attention tiles (`kernels/msa_dcp.attend_tiles`):
+    # 8-token tiles up to this many tokens (0 = 128); groups of this many
+    # pages for those calls above 128 tokens (0 = 16); larger calls of the
+    # default lse kernel (not r6, which has its own keys) over 8/16-bit and
+    # 4-bit caches as "<block_q>:<pages per step>" ("" = 16:16). Not bitwise
+    # (accumulation order).
+    "minimax_dcp_small_batch_tokens": 0,
+    "minimax_dcp_small_batch_wide_pages": 0,
+    "minimax_dcp_prefill_tiles": "",
+    "minimax_dcp_prefill_tiles_4bit": "",
+    # MSA work list: dense-compare unions up to this many pairwise elements
+    # (0 = 1 << 20), sorted ones above. Same unions, bitwise.
+    "minimax_msa_dense_work_list_elems": 0,
 }
 
 

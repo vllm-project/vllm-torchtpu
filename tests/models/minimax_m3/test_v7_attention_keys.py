@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.models.minimax_m3 import kernel_toggles
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse
+from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_attention_lse
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse_r6 as r6
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_dcp_heads
 from vllm_torchtpu.models.minimax_m3.ops import msa as msa_ops
@@ -188,3 +188,84 @@ def test_c64_prefill_tiles_match_the_default_config(monkeypatch):
     out2, lse2 = _attend(args)
     np.testing.assert_array_equal(out2, out)
     np.testing.assert_array_equal(lse2, lse)
+
+
+# --- DCP attention tiles (r10 line values) ---
+
+
+def test_dcp_tile_keys():
+    try:
+        kernel_toggles.apply(
+            {
+                "minimax_dcp_small_batch_tokens": 1024,
+                "minimax_dcp_small_batch_wide_pages": 32,
+                "minimax_dcp_prefill_tiles": "32:32",
+                "minimax_dcp_prefill_tiles_4bit": "8:32",
+                "minimax_msa_dense_work_list_elems": 1 << 18,
+            }
+        )
+        assert msa_dcp.attend_tiles(64, False, False) == (8, 16)
+        assert msa_dcp.attend_tiles(384, True, False) == (8, 32)
+        assert msa_dcp.attend_tiles(1024, False, True) == (8, 32)
+        assert msa_dcp.attend_tiles(2048, False, False) == (32, 32)
+        assert msa_dcp.attend_tiles(2048, True, False) == (8, 32)
+        assert msa_dcp.attend_tiles(2048, True, True) == (16, 16)  # r6: own keys
+        assert msa_attention._DENSE_WORK_LIST_ELEMS == 1 << 18
+        for bad in ("32", "12:32", "32:0", "a:b"):
+            with pytest.raises(ValueError, match="minimax_dcp_prefill_tiles"):
+                kernel_toggles.apply({"minimax_dcp_prefill_tiles": bad})
+    finally:
+        kernel_toggles.apply({})
+    # Unset: the old tiles.
+    for n, want in ((1, (8, 16)), (128, (8, 16)), (129, (16, 16)), (8192, (16, 16))):
+        for fp4 in (False, True):
+            for r6_on in (False, True):
+                assert msa_dcp.attend_tiles(n, fp4, r6_on) == want
+    assert msa_attention._DENSE_WORK_LIST_ELEMS == 1 << 20
+
+
+def test_dense_and_sorted_unions_agree():
+    rng = np.random.default_rng(5)
+    per_tile = rng.integers(0, 40, size=(6, 128)).astype(np.int32)
+    per_tile[rng.random(per_tile.shape) < 0.3] = msa_attention._NO_PAGE
+    per_tile = jnp.asarray(per_tile)
+    np.testing.assert_array_equal(
+        msa_attention._dense_unions(per_tile), msa_attention._sorted_unions(per_tile)
+    )
+
+
+@pytest.mark.parametrize("fp4", [True, False])
+def test_v3_prefill_tiles_match_the_default_tiles(monkeypatch, fp4):
+    """The default (v3) lse kernel at the r10 prefill tiles (32-page groups
+    with the 16 / 24-page widths): same values up to accumulation order."""
+    from tests.models.minimax_m3.packing import pack, rounded
+
+    monkeypatch.setattr(msa_attention_lse, "R6_KERNEL", False)
+    args = list(_inputs(1))
+    if not fp4:
+        rng = np.random.default_rng(1)
+        rows = rounded(rng.standard_normal((PAGES, S, 2 * D)), jnp.bfloat16)
+        args[1], args[6] = pack(rows, jnp.bfloat16), None
+    jax.clear_caches()
+    want_out, want_lse = _attend(args)
+    monkeypatch.setattr(msa_dcp, "PREFILL_TILES", (32, 32))
+    monkeypatch.setattr(msa_dcp, "PREFILL_TILES_4BIT", (8, 32))
+    jax.clear_caches()
+    out, lse = _attend(args)
+    np.testing.assert_allclose(lse, want_lse, rtol=0, atol=1e-4)
+    np.testing.assert_allclose(out, want_out, rtol=2e-2, atol=2e-2)
+
+
+def test_small_batch_wide_groups_match(monkeypatch):
+    """8-token tiles in 32-page groups for a 256-token call (r10 decode
+    config at c48 sizes): same values up to accumulation order."""
+    monkeypatch.setattr(msa_attention_lse, "R6_KERNEL", False)
+    args = _inputs(2, t=256)
+    jax.clear_caches()
+    want_out, want_lse = _attend(args)
+    monkeypatch.setattr(msa_dcp, "SMALL_BATCH_TOKENS", 1024)
+    monkeypatch.setattr(msa_dcp, "SMALL_BATCH_WIDE_PAGES", 32)
+    jax.clear_caches()
+    out, lse = _attend(args)
+    np.testing.assert_allclose(lse, want_lse, rtol=0, atol=1e-4)
+    np.testing.assert_allclose(out, want_out, rtol=2e-2, atol=2e-2)

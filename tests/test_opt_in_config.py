@@ -119,11 +119,21 @@ SAMPLE = {
     "minimax_dcp_qcand_gather_max_tokens": 512,
     "minimax_sp_mode": "full",
     "minimax_sp_min_tokens": 1024,
+    "minimax_dcp_small_batch_tokens": 1024,
+    "minimax_dcp_small_batch_wide_pages": 32,
+    "minimax_dcp_prefill_tiles": "32:32",
+    "minimax_dcp_prefill_tiles_4bit": "8:32",
+    "minimax_msa_dense_work_list_elems": 262144,
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {
     "raiden_offload_refresh_lru",
     "minimax_qk_norm_rope_kernel",
+    "minimax_dcp_small_batch_tokens",
+    "minimax_dcp_small_batch_wide_pages",
+    "minimax_dcp_prefill_tiles",
+    "minimax_dcp_prefill_tiles_4bit",
+    "minimax_msa_dense_work_list_elems",
     "minimax_indexer_hoist_metadata",
     "minimax_indexer_row_gather",
     # --- v7 MoE / grouped GEMM ---

@@ -39,6 +39,11 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 # unions of served c64 DCP 4 prefill (-1.8% kernel time over 80 real
 # selections, bitwise equal, j-7ea3ab27).
 _STEP_WIDTHS = (4, 8, 12)
+# Extra widths of groups wider than 16 pages (32-page groups from keys
+# minimax_dcp_small_batch_wide_pages / minimax_dcp_prefill_tiles*): a 17-24
+# page remainder is common there. 16-page groups never take them, so their
+# programs do not change.
+_WIDE_STEP_WIDTHS = (16, 24)
 _LOG2_E = math.log2(math.e)
 # Opt-in: run r6's kernel (`msa_attention_lse_r6`: several tiles per grid
 # step, a deeper 4-bit page prefetch ring, transposed scores for 8/16-bit
@@ -373,7 +378,9 @@ def _kernel(
     # standalone j-952e8a64), and a 16-token tile's union is ~8-12 of its
     # rank's pages at DCP 2, ~2-8 at DCP 8.
     single = first & last
-    widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+    widths = [
+        n for n in _STEP_WIDTHS + _WIDE_STEP_WIDTHS if n < pages_per_step
+    ] + [pages_per_step]
     for i, width in enumerate(widths):
         fits = count > (widths[i - 1] if i else 0)
         if width < pages_per_step:

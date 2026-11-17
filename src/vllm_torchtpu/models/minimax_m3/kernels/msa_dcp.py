@@ -72,6 +72,35 @@ _MIN_CANDIDATE_TOKENS = 1024
 # 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
 # j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
 DCP_SMALL_BATCH_TOKENS = 128
+# Keys (set by `kernel_toggles.apply`; 0 / None = the defaults above):
+# minimax_dcp_small_batch_tokens moves the 8-token-tile limit (the r10 line
+# ran 1024: with dispersed selections a 16-token tile holds two requests'
+# disjoint unions); minimax_dcp_small_batch_wide_pages runs those 8-token
+# tiles of calls of more than 128 tokens in groups of this many pages (r10:
+# 32, a 128-row tile's score tile then matches a 16-token tile's 16-page
+# one); minimax_dcp_prefill_tiles / minimax_dcp_prefill_tiles_4bit give the
+# (block_q, pages per step) of larger calls of the default lse kernel over
+# 8/16-bit / 4-bit caches (r10: (32, 32) / (8, 32)). Each changes how a
+# call's rows and pages are tiled, so outputs differ by accumulation order.
+SMALL_BATCH_TOKENS = 0
+SMALL_BATCH_WIDE_PAGES = 0
+_WIDE_GROUP_MIN_TOKENS = 129
+PREFILL_TILES: tuple[int, int] | None = None
+PREFILL_TILES_4BIT: tuple[int, int] | None = None
+
+
+def attend_tiles(num_tokens: int, fp4: bool, r6: bool) -> tuple[int, int]:
+    """``(block_q, pages_per_step)`` of an `msa_attend_dcp` call of
+    `num_tokens` tokens (before r6's own prefill keys)."""
+    if num_tokens <= (SMALL_BATCH_TOKENS or DCP_SMALL_BATCH_TOKENS):
+        pages = msa_attention.DEFAULT_PAGES_PER_STEP
+        if SMALL_BATCH_WIDE_PAGES and num_tokens >= _WIDE_GROUP_MIN_TOKENS:
+            pages = SMALL_BATCH_WIDE_PAGES
+        return msa_attention.SMALL_BATCH_BLOCK_Q, pages
+    tiles = None if r6 else (PREFILL_TILES_4BIT if fp4 else PREFILL_TILES)
+    if tiles is not None:
+        return tiles
+    return msa_attention.DEFAULT_BLOCK_Q, msa_attention.DEFAULT_PAGES_PER_STEP
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -1702,14 +1731,13 @@ def msa_attend_dcp(
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    block_q, pages_per_step = attend_tiles(
+        num_tokens, scale_cache is not None, msa_attention_lse.R6_KERNEL
+    )
     common = dict(
         sm_scale=sm_scale,
-        block_q=(
-            msa_attention.SMALL_BATCH_BLOCK_Q
-            if num_tokens <= DCP_SMALL_BATCH_TOKENS
-            else msa_attention.DEFAULT_BLOCK_Q
-        ),
-        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        block_q=block_q,
+        pages_per_step=pages_per_step,
         interpret=interpret,
     )
     lse_kernel = msa_attention_lse

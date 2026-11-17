@@ -358,8 +358,12 @@ _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
 # `_work_list` builds small batches' unions from dense compares when the
-# pairwise array (tiles x union^2) is at most this.
+# pairwise array (tiles x union^2) is at most this. Key
+# minimax_msa_dense_work_list_elems sets it (the r10 line ran 1 << 18: 4
+# heads x 64 decode tiles of 8 tokens took 31.5 us per layer dense against
+# 17.6 sorted); both give the same unions.
 _DENSE_WORK_LIST_ELEMS = 1 << 20
+DEFAULT_DENSE_WORK_LIST_ELEMS = _DENSE_WORK_LIST_ELEMS
 
 
 def _dense_unions(per_tile: jax.Array) -> jax.Array:
