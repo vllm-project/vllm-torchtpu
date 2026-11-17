@@ -9122,10 +9122,18 @@ class TPUModelRunner(GPUModelRunner):
         ladder tops out at num_groups * max_num_reqs; src and dst must be
         DISTINCT tensors or dynamo specializes the migrate graph on
         src-is-dst and the real two-tensor call retraces mid-serving.
+
+        With a checkpoint window and an unsplit pool, a crossing takes the
+        fused spec-seed gather and rollback reset instead
+        (`_collect_mamba_state_seed_copies`), so that program is warmed too:
+        same bucket lengths, a `[n, window]` checkpoint table, and
+        execute_model's no_grad, since dynamo guards on grad mode.
         """
         offsets = self.mamba_slot_read_offsets
         if offsets is None:
             return
+        window = self._mamba_ckpt_window
+        warm_spec_seed = window > 1 and self._pool_block_split == 1
         with self._precompile_timed("mamba rollback helpers"):
             num_groups = max(
                 1,
@@ -9141,6 +9149,15 @@ class TPUModelRunner(GPUModelRunner):
                 dst = torch.zeros(n, dtype=torch.long).to(offsets.device)
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
+                if warm_spec_seed:
+                    ckpt = torch.zeros((n, window), dtype=torch.int32).to(
+                        offsets.device
+                    )
+                    with torch.no_grad():
+                        seed_src = _spec_seed_and_rollback_compiled(
+                            offsets, src, ckpt, dst
+                        )
+                    synchronize_tensors(seed_src)
                 n *= 4
 
     def _precompile_spec_boundary_copies(self) -> None:
