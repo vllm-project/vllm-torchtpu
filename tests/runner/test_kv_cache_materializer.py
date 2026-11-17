@@ -404,18 +404,18 @@ def _hybrid_groups(cfg: KVCacheConfig) -> list[list[AttentionGroup]]:
     return [[attn_group], [mamba_group]]
 
 
-def test_pool_fp8_is_born_uninitialized_without_zero_fill(monkeypatch):
-    # fp8 pools cannot zero-fill on TPU (and slots are overwritten before
-    # use), so the pool must be allocated via torch.empty; the monkeypatch
-    # makes any fp8 torch.zeros call fail loudly.
-    torch_zeros = torch.zeros
+def test_pool_fp8_is_zero_filled(monkeypatch):
+    # The pool keeps the contract of every other KV cache array: it is
+    # zero-filled in every dtype, fp8 included (an fp8 byte can encode NaN).
+    # The monkeypatch makes any fp8 torch.empty call fail loudly.
+    torch_empty = torch.empty
 
-    def zeros_without_fp8(*args, **kwargs):
+    def empty_without_fp8(*args, **kwargs):
         if kwargs.get("dtype") in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise RuntimeError("fp8 pool must not require zero_")
-        return torch_zeros(*args, **kwargs)
+            raise RuntimeError("fp8 pool must be zero-filled")
+        return torch_empty(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "zeros", zeros_without_fp8)
+    monkeypatch.setattr(torch, "empty", empty_without_fp8)
     cfg = make_hybrid_config(num_blocks=4, attn_dtype=torch.float8_e4m3fn)
 
     materialized = materialize_kv_cache_tensors(
@@ -435,6 +435,7 @@ def test_pool_fp8_is_born_uninitialized_without_zero_fill(monkeypatch):
     assert isinstance(mamba_cache, list)
     assert len(mamba_cache) == 1
     assert mamba_cache[0] is attn_cache
+    assert not attn_cache.view(torch.uint8).any()
 
 
 def test_pool_layout_summary_shows_single_pool_state():

@@ -31,8 +31,6 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.utils import synchronize_tensors
 
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
-
 type LayerKVCache = torch.Tensor | list[torch.Tensor]
 
 
@@ -296,12 +294,10 @@ def allocate_raw_kv_cache_tensors(
         shapes = [(num_blocks, num_pools * split) + page_shape]
     else:
         shapes = [region_shape] * num_pools
+    # Zero-filled in every dtype, FP8 included, like the arrays from
+    # `DeviceKVCacheAllocator`.
     for shape in shapes:
-        if spec.dtype in _FP8_DTYPES:
-            raw = torch.empty(shape, dtype=spec.dtype, device=device)
-        else:
-            raw = torch.zeros(shape, dtype=spec.dtype, device=device)
-        raw_tensors.append(raw)
+        raw_tensors.append(torch.zeros(shape, dtype=spec.dtype, device=device))
     for layer_name, pool_index in pool_indices.items():
         layer_to_raw[layer_name] = raw_tensors[0 if block_major else pool_index]
     return layer_to_raw, raw_tensors, layout
@@ -322,7 +318,9 @@ class DeviceKVCacheAllocator:
     token has written yet, and some need them to be finite: paths in the MLA
     kernels (`kernels/mla/v2`, `kernels/deepseek_v4`) mask only the scores
     of invalid entries, and 0 * NaN is NaN. Fresh device memory can hold any
-    bits, while zero bits are finite in every cache dtype.
+    bits, while zero bits are finite in every cache dtype. FP8 arrays are
+    zero-filled too: the MLA kernels read FP8 caches, and an FP8 byte can
+    encode NaN.
     """
 
     def __init__(self, device: torch.device) -> None:
