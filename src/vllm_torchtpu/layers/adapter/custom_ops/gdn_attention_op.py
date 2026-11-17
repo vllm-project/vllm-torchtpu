@@ -365,7 +365,8 @@ _shared_gdn_op_ids = itertools.count()
 def _split_ba(
     layer: QwenGatedDeltaNetAttention, ba: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split in_proj_ba's output into the b and a halves.
+    """Split in_proj_ba's output into the b and a halves for the ops that run
+    the kernel `gdn_attention.gdn_kernel_wrapper` selects.
 
     The Qwen3.5 MoE architectures pass the halves as chunk views, because the
     Qwen3.5 GDN kernel pads and stacks them itself (two fewer copies per GDN
@@ -1190,7 +1191,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         assert gdn_pooled_pcp_op is not None
         qkvz_weight, qkvz_weight_scale = self._require_pcp_projection_parameters()
         ba, _ = self.in_proj_ba(hidden_states)
-        b, a = _split_ba(self, ba)
+        # This op runs gdn_pcp_fused, not the kernel `gdn_kernel_wrapper`
+        # selects, so it keeps main's contiguous b and a halves.
+        b, a = ba.chunk(2, dim=-1)
+        b = b.contiguous()
+        a = a.contiguous()
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
