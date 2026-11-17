@@ -79,12 +79,14 @@ def _nearest_candidate(value: float, candidates: Sequence[int]) -> int:
 
 
 def decode_tile_target(num_seqs: int, n_v: int) -> int:
-    """Returns the smallest T within 2% of the measured decode optimum.
+    """Returns the DECODE_TILE_SIZES candidate nearest, in log2 space, to the
+    square-root balance point sqrt(2 * N * O_step / w_seq(n_v)) of the step
+    model.
 
     Model: t(T) = O_step * ceil(N / T) + w_seq(n_v) * ceil(N / T) * T. The
-    square-root balance point reproduces the measured knee for N <= 256 and
-    n_v in {8, 32, 64}; DECODE_TILE_SIZES bounds it where the model does not
-    encode spill growth.
+    balance point reproduces the measured knee for N <= 256 and n_v in
+    {8, 32, 64}; DECODE_TILE_SIZES bounds it where the model does not encode
+    spill growth.
     """
     if num_seqs <= 0 or n_v <= 0:
         return 1
