@@ -958,6 +958,68 @@ def test_compacted_prior_turn_is_evicted_before_the_oldest_conversation():
     assert list(ret._conv_lru) == [("c", 0)]
 
 
+def test_shutdown_releases_the_pins_and_the_retained_entries():
+    # A decoding request's pinned snapshot.
+    r, pool, req, attn, state, other = _setup()
+    r.pin_running([req])
+    assert state.ref_cnt == 1 and state not in pool.free_block_queue.q
+    r.shutdown()
+    assert not r.enabled
+    assert state.ref_cnt == 0 and state in pool.free_block_queue.q
+    assert not r._pinned and not r._fork_pinned
+    # A finished request's snapshot kept for its next turn.
+    r, pool, req, attn, state, other = _setup()
+    r.pin_running([req])
+    snap = r.snapshot_attention_blocks(req)
+    _scheduler_free(pool, attn)
+    r.on_request_freed(req, snap)
+    assert state.ref_cnt == 1 and r._conv_lru
+    r.shutdown()
+    assert state.ref_cnt == 0 and state in pool.free_block_queue.q
+    assert not r._conv_lru and not r._fork_lru and r.num_pinned_blocks() == 0
+    assert not r._tracked_blocks
+
+
+def test_after_shutdown_the_hooks_call_vllms_methods_unchanged():
+    from vllm_torchtpu.core.hybrid_retention import ALLOC_NONE_REASONS
+
+    kvm = _GuardKVM(free=100, need=200)
+    seen = []
+
+    def cache_partial(request, num_tokens, retention_interval):
+        seen.append((request.num_prompt_tokens, num_tokens, retention_interval))
+        return "cached"
+
+    kvm.mamba_mgr._cache_partial_tail_block = cache_partial
+    ret = HybridStateRetention(kvm, max_conversations=256)
+    assert ret.enabled
+    entry_blocks = [SimpleNamespace(ref_cnt=1, is_null=False) for _ in range(5)]
+    ret._conv_lru[("c", 0)] = _ConvLRUEntry(
+        conv_key=("c", 0),
+        req_id="r0",
+        first_hash=None,
+        boundary_idx=0,
+        boundary_hash=None,
+        blocks=entry_blocks,
+        hit=640,
+    )
+    ret.shutdown()
+    assert kvm.pool.free == 105 and all(b.ref_cnt == 0 for b in entry_blocks)
+    # vLLM's refusal stands and retention records nothing.
+    ret.begin_step()
+    assert kvm.allocate_slots(_waiting_req(), 0) is None
+    assert ret.alloc_none == dict.fromkeys(ALLOC_NONE_REASONS, 0)
+    assert ret.step_waiting_none == [] and ret.step_admits == 0
+    # A 2563-token prompt ends 3 tokens past the 2560 boundary, inside the
+    # safe-tail offset: retention would skip caching that tainted boundary.
+    # After shutdown it reaches vLLM's method with the prompt as it is, and
+    # nothing is tracked.
+    req = SimpleNamespace(request_id="r", num_prompt_tokens=2563)
+    assert kvm.mamba_mgr._cache_partial_tail_block(req, 2560, 0) == "cached"
+    assert seen == [(2563, 2560, 0)]
+    assert ret._tracked_blocks == {}
+
+
 # ---------------------------------------------- the pinned vLLM's own classes
 
 _REAL_BS = 16

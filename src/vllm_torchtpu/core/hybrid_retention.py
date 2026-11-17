@@ -311,6 +311,8 @@ class HybridStateRetention:
                     _gid: int = gid,
                     **kwargs: Any,
                 ) -> Any:
+                    if not self.enabled:
+                        return _orig(request, num_tokens, *args, **kwargs)
                     orig_prompt = int(getattr(request, "num_prompt_tokens", 0) or 0)
                     eff_prompt = self._effective_prompt_tokens(orig_prompt)
                     hb = self._alignment_tokens()
@@ -368,6 +370,8 @@ class HybridStateRetention:
                     _mgr: Any = mgr,
                     _gid: int = gid,
                 ) -> Any:
+                    if not self.enabled:
+                        return _orig(request_id, num_tokens, num_tokens_main_model)
                     partial_reqs = getattr(_mgr, "_partial_hit_reqs", None)
                     had_partial = (
                         partial_reqs.get(request_id)
@@ -470,6 +474,8 @@ class HybridStateRetention:
     ) -> Any:
         """Calls allocate_slots; on a real block shortage evicts the shortfall
         from the retained entries and retries."""
+        if not self.enabled:
+            return orig(*args, **kwargs)
         request = args[0] if args else kwargs["request"]
         self._last_need = None
         res = orig(*args, **kwargs)
@@ -1104,6 +1110,26 @@ class HybridStateRetention:
             else:
                 break
         return count
+
+    def shutdown(self) -> None:
+        """Stops retention for the rest of the engine's life.
+
+        Releases every Mamba block retention holds (the running requests'
+        pins and the cross-turn entries), drops the per-request records and
+        clears ``enabled``, so every hook calls vLLM's method unchanged from
+        then on. The scheduler calls it when a retention call raises.
+        """
+        self.enabled = False
+        self.evict_all_conversations()
+        for pins in (self._pinned, self._fork_pinned):
+            for blocks, _ in pins.values():
+                self.block_pool.free_blocks(blocks)
+            pins.clear()
+        self._tracked_blocks.clear()
+        self._pending_partial.clear()
+        self._fork_decision.clear()
+        self._missed.clear()
+        self._gave_up.clear()
 
     def _enforce_pinned_block_cap(self) -> None:
         """Enforce ``self.max_pinned_blocks`` across ``_conv_lru`` and

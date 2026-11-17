@@ -463,10 +463,22 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_squares += float(tokens) * tokens
 
     def _retention_failed(self) -> None:
+        """Turns retention off after one of its calls raised: it releases
+        the blocks it holds and its hooks fall through to vLLM's methods."""
         logger.exception(
             "Pipeline chunk scheduler: hybrid state retention failed; disabling it."
         )
-        self._retention = None
+        retention, self._retention = self._retention, None
+        if retention is None:
+            return
+        try:
+            retention.shutdown()
+        except Exception:
+            # The blocks it still pins stay pinned; scheduling goes on.
+            logger.exception(
+                "Pipeline chunk scheduler: shutting hybrid state retention down "
+                "failed; its pinned blocks stay pinned."
+            )
 
     def _connector_finished(self, request: Any):
         result = super()._connector_finished(request)
