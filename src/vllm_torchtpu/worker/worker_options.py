@@ -21,9 +21,10 @@ section stays out of the compile-cache key
 (``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``). Parse once at init with :func:`get`.
 """
 
-import dataclasses
 from dataclasses import dataclass
 from typing import Any
+
+from vllm_torchtpu import config_section
 
 SECTION = "tpu_worker"
 
@@ -38,39 +39,10 @@ class WorkerOptions:
 
 
 def parse(raw: Any) -> WorkerOptions:
-    """The ``tpu_worker`` section as options; None gives the defaults.
-
-    Strict: an unknown key, or a value whose type is not exactly the field's
-    (``1`` for a bool, say), raises ``ValueError``.
-    """
-    if raw is None:
-        return WorkerOptions()
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"additional_config.{SECTION} must be a JSON object, "
-            f"got {type(raw).__name__}"
-        )
-    fields = {f.name: f.type for f in dataclasses.fields(WorkerOptions)}
-    unknown = sorted(set(raw) - set(fields))
-    if unknown:
-        raise ValueError(
-            f"additional_config.{SECTION} has unknown keys {unknown}; "
-            f"valid keys: {sorted(fields)}"
-        )
-    for name, value in raw.items():
-        want = fields[name]
-        assert isinstance(want, type)  # the annotations are classes, not strings
-        if type(value) is not want:
-            raise ValueError(
-                f"additional_config.{SECTION}.{name} must be a "
-                f"{want.__name__}, got {value!r}"
-            )
-    return WorkerOptions(**raw)
+    """The ``tpu_worker`` section as options (see ``config_section.parse``)."""
+    return config_section.parse(WorkerOptions, SECTION, raw)
 
 
 def get(vllm_config: Any) -> WorkerOptions:
     """The engine's worker options."""
-    additional = getattr(vllm_config, "additional_config", None)
-    if not isinstance(additional, dict):
-        return WorkerOptions()
-    return parse(additional.get(SECTION))
+    return config_section.get(WorkerOptions, SECTION, vllm_config)
