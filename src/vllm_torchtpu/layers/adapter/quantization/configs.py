@@ -75,11 +75,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _matches_dot_bounded_prefix(prefix: str, patterns: list[str]) -> bool:
+    padded = f".{prefix}."
+    return any(f".{p.strip('.')}." in padded for p in patterns)
+
+
 def should_quantize_on_load(prefix: str) -> bool:
     """Return True if prefix matches any dot-bounded pattern in
     QUANTIZE_ON_LOAD_PREFIXES."""
-    padded = f".{prefix}."
-    return any(f".{p.strip('.')}." in padded for p in envs.QUANTIZE_ON_LOAD_PREFIXES)
+    return _matches_dot_bounded_prefix(prefix, envs.QUANTIZE_ON_LOAD_PREFIXES)
+
+
+def should_requantize_fp4(prefix: str) -> bool:
+    """Return True if FP4 linear requantization is allowed for `prefix`.
+
+    When `REQUANTIZE_FP4_PREFIXES` is empty, all eligible linear layers may
+    requantize to FP4; otherwise `prefix` must match a dot-bounded pattern.
+    """
+    patterns = envs.REQUANTIZE_FP4_PREFIXES
+    if not patterns:
+        return True
+    return _matches_dot_bounded_prefix(prefix, patterns)
 
 
 class VllmQuantLinearConfig:

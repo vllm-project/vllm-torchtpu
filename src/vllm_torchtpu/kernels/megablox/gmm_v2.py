@@ -965,7 +965,8 @@ def calculate_tiling(
 
     # Initialize tile_k and tile_n to their maximum valid values.
     num_k_tiles = num_n_tiles = 1
-    num_lanes = pltpu.get_tpu_info().num_lanes
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
     tile_k = align_to(dims.size_k, num_lanes)
     tile_n = align_to(size_n_per_rhs, num_lanes)
 
@@ -973,13 +974,28 @@ def calculate_tiling(
         # 1. LHS tile (double-buffered HBM load)
         lhs_tile_bytes = lhs_bits // 8
         lhs_vmem = 2 * tm * tk * lhs_tile_bytes
+        rhs_upcast_vmem = 0
         # If LHS is quantized on-the-fly, we need an extra single-buffered cast
-        # buffer in VMEM.
+        # buffer in VMEM, plus upcast/scale temporaries when 4-bit RHS is
+        # widened to LHS's quantized dtype inside inner_kernel.
         if lhs_cfgs.should_quantize:
-            lhs_quant_bits = jax.dtypes.itemsize_bits(
-                cast(jnp.dtype, lhs_cfgs.quant_dtype)
-            )
-            lhs_vmem += tm * tk * (lhs_quant_bits // 8)
+            lhs_q_dtype = cast(jnp.dtype, lhs_cfgs.quant_dtype)
+            lhs_quant_bytes = jax.dtypes.itemsize_bits(lhs_q_dtype) // 8
+            lhs_vmem += tm * tk * lhs_quant_bytes
+            if not tpu_info.is_matmul_supported(lhs_q_dtype, rhs_dtype):
+                rhs_upcast_vmem += fuse_act_factor * tk * tn * lhs_quant_bytes
+            if (
+                rhs_cfgs.should_dequantize_after_matmul
+                and rhs_cfgs.quant_block_size is not None
+            ):
+                num_qblocks = pl.cdiv(tk, rhs_cfgs.quant_block_size)
+                rhs_upcast_vmem += (
+                    fuse_act_factor
+                    * num_qblocks
+                    * tm
+                    * min(tn, tpu_info.mxu_column_size)
+                    * 4
+                )
 
         # 2. RHS tile (triple-buffered, includes scale and bias if present)
         # If fuse_act is enabled, we have both gate and up weights,
@@ -992,14 +1008,18 @@ def calculate_tiling(
         rhs_bias_vmem = 0
         if rhs_cfgs.has_bias:
             rhs_bias_vmem = tn * 4
-        rhs_vmem = fuse_act_factor * (
-            3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+        rhs_vmem = (
+            fuse_act_factor
+            * (3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem)
+            + rhs_upcast_vmem
         )
 
-        # 3. Accumulator
+        # 3. Accumulator (quantized LHS accumulates per MXU column chunk in
+        # acc_list and concatenates into acc while chunks remain live).
         acc_cols = fuse_act_factor * tn
         acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
-        acc_vmem = tm * acc_cols * acc_dtype_bytes
+        acc_copies = 2 if lhs_cfgs.should_quantize else 1
+        acc_vmem = acc_copies * tm * acc_cols * acc_dtype_bytes
 
         # 4. Output tile (double-buffered)
         out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
