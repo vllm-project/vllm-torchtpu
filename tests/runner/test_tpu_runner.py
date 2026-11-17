@@ -2852,6 +2852,54 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
     assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] == [15, 15]
 
 
+@pytest.mark.parametrize(
+    "drafts", [None, [], [7], [7, 8], [7, 8, 9], [7, 8, 9, 10, 11]]
+)
+def test_spec_token_room_guard_fast_path_matches_upstream(drafts):
+    """With room for every draft, the guard stages the drafts itself instead of
+    calling vLLM's InputBatch.update_req_spec_token_ids. It must leave the
+    batch, the request and the scheduled dict exactly as the pinned upstream
+    method does (which writes no per-request token count)."""
+    from vllm.v1.worker.gpu_input_batch import InputBatch
+
+    def batch():
+        # The fields update_req_spec_token_ids reads and writes.
+        ib = object.__new__(InputBatch)
+        ib.req_id_to_index = {"a": 0, "b": 1}
+        ib.num_tokens_no_spec = np.array([5, 9], dtype=np.int32)
+        ib.token_ids_cpu = np.full((2, 16), -1, dtype=np.int32)
+        ib.is_token_ids = np.zeros((2, 16), dtype=bool)
+        ib.spec_token_ids = [[1, 2], [3]]
+        return ib
+
+    def scheduled():
+        return {} if drafts is None else {"b": list(drafts)}
+
+    ref, ref_req, ref_scheduled = batch(), SimpleNamespace(req_id="b"), scheduled()
+    ref_req.prev_num_draft_len = 4
+    InputBatch.update_req_spec_token_ids(ref, ref_req, ref_scheduled)
+
+    runner = SimpleNamespace(input_batch=batch())
+    upstream_calls = []
+    upstream = runner.input_batch.update_req_spec_token_ids
+    runner.input_batch.update_req_spec_token_ids = lambda *a: (
+        upstream_calls.append(a),
+        upstream(*a),
+    )
+    TPUModelRunner._install_spec_token_room_guard(runner)
+    req, sched = SimpleNamespace(req_id="b", prev_num_draft_len=4), scheduled()
+    runner.input_batch.update_req_spec_token_ids(req, sched)
+
+    ib = runner.input_batch
+    np.testing.assert_array_equal(ib.token_ids_cpu, ref.token_ids_cpu)
+    np.testing.assert_array_equal(ib.is_token_ids, ref.is_token_ids)
+    assert ib.spec_token_ids == ref.spec_token_ids
+    assert req.prev_num_draft_len == ref_req.prev_num_draft_len
+    assert sched == ref_scheduled
+    # Every case here took the guard's own path, not upstream's.
+    assert upstream_calls == []
+
+
 class TestBuildAttentionMetadataForLayers:
     """Tests TPUModelRunner.build_attention_metadata_for_layers."""
 

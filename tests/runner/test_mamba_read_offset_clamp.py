@@ -61,3 +61,15 @@ def test_read_offset_scatters_clamp_indices():
         torch.tensor([2, -3], dtype=torch.long),
     )
     assert offs.tolist() == [107, 101, 101, 103, 104, 105, 106, 107]
+    # The fused spec-seed gather clamps the state ids it reads offsets at
+    # (1 << 20 -> 7, -5 -> 0) and the rollback ids it zeroes.
+    offs = torch.tensor([0, 1, 2, 0, 1, 2, 0, 2], dtype=torch.int32)
+    ckpt = torch.tensor([[10, 11, 12], [20, 21, 22], [30, 31, 32]], dtype=torch.int32)
+    src = g["_spec_seed_and_rollback_impl"](
+        offs,
+        torch.tensor([1 << 20, -5, 4], dtype=torch.long),
+        ckpt,
+        torch.tensor([1 << 20, -5], dtype=torch.long),
+    )
+    assert src.tolist() == [12, 20, 31]
+    assert offs.tolist() == [0, 1, 2, 0, 1, 2, 0, 0]
