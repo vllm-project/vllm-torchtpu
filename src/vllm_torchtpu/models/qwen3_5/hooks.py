@@ -37,11 +37,17 @@ entries (``validation/``). Every other engine keeps main's behaviour.
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
   resolves its hash block size from its KV cache groups.
+- ``additional_config["tpu_kv_transfer"]["kernel_page_tokens"]``: 128, for an
+  engine of the calibrated checkpoint shape with a KV transfer config and
+  without prefill context parallelism, so the prefill and decode legs of a
+  pair page their seq-along-lane caches alike (see
+  ``attention.kv_transfer_kernel_page``). A PCP prefill engine and other
+  checkpoints keep vLLM's page choice, as on main.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
@@ -73,6 +79,11 @@ _CALIBRATED_DECODE_LAYOUTS = frozenset({(8, 1, 4)})
 # scratch buffers.
 _CALIBRATED_KV_BYTES = 33_500_000_000
 
+# The batched-RPA kernel page both legs of a KV-transfer pair of the calibrated
+# checkpoint run at: every block either leg sizes (2304 tokens at a TP1
+# prefill, 640 at a TP8 decode) is a multiple of it.
+_KV_TRANSFER_PAGE_TOKENS = 128
+
 
 def _chip_family() -> str | None:
     """This host's TPU chip (the ``pltpu.ChipVersion`` value, "7x" for
@@ -83,8 +94,8 @@ def _chip_family() -> str | None:
 
 
 def has_calibrated_shape(model_config) -> bool:
-    """Whether the checkpoint has the shape the IX points ran
-    (Qwen3.5-397B-A17B's text config), whatever the device."""
+    """Whether the checkpoint has the calibrated shape (Qwen3.5-397B-A17B's
+    text config), whatever the device."""
     text = getattr(model_config, "hf_text_config", None)
     return all(getattr(text, k, None) == v for k, v in _CALIBRATED_SHAPE.items())
 
@@ -212,11 +223,30 @@ def _apply_kv_budget(vllm_config: VllmConfig, calibrated: bool) -> None:
     cache_config.kv_cache_memory_bytes = safe_kv
 
 
+def _apply_kv_transfer_page(vllm_config: VllmConfig) -> None:
+    if vllm_config.kv_transfer_config is None:
+        return
+    if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+        return
+    if not has_calibrated_shape(vllm_config.model_config):
+        return
+    from vllm_torchtpu.layers.adapter.attention import KV_TRANSFER_SECTION
+
+    additional_config = cast("dict[str, Any]", vllm_config.additional_config)
+    # An explicit section, valid or not, is the user's: the platform validates it.
+    if KV_TRANSFER_SECTION in additional_config:
+        return
+    additional_config[KV_TRANSFER_SECTION] = {
+        "kernel_page_tokens": _KV_TRANSFER_PAGE_TOKENS
+    }
+
+
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
     """Fill the Qwen3.5 TPU serving defaults the user did not set."""
     calibrated = _is_calibrated(vllm_config.model_config)
     _apply_prefix_match_unit(vllm_config, calibrated)
     _apply_kv_budget(vllm_config, calibrated)
+    _apply_kv_transfer_page(vllm_config)
 
 
 class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):

@@ -193,34 +193,58 @@ KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] 
     VllmKVCacheLayout.BLHNC: batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
 }
 
-# The batched-RPA kernel page of a Qwen3.5 engine that transfers KV in the
-# seq-along-lane layout (see qwen3_5_kv_transfer_page).
-QWEN3_5_KV_TRANSFER_PAGE_TOKENS = 128
+# The --additional-config section that pins a KV-transfer engine's batched-RPA
+# kernel page (see kv_transfer_kernel_page).
+KV_TRANSFER_SECTION = "tpu_kv_transfer"
 
 
-def qwen3_5_kv_transfer_page(vllm_config: VllmConfig) -> int | None:
-    """The kernel page a Qwen3.5 engine with KV transfer runs the batched-RPA
-    seq-along-lane cache at, or None to keep vLLM's choice.
+def kv_transfer_page_option(vllm_config: VllmConfig) -> int | None:
+    """``additional_config["tpu_kv_transfer"]["kernel_page_tokens"]``, or None
+    when unset. A malformed section raises ValueError."""
+    section = cast("dict[str, Any]", vllm_config.additional_config).get(
+        KV_TRANSFER_SECTION
+    )
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError(
+            f"additional_config[{KV_TRANSFER_SECTION!r}] must be an object"
+        )
+    unknown = sorted(str(k) for k in section if k != "kernel_page_tokens")
+    if unknown:
+        raise ValueError(
+            f"Unknown key(s) {unknown} in additional_config[{KV_TRANSFER_SECTION!r}]; "
+            "known keys: ['kernel_page_tokens']"
+        )
+    page = section.get("kernel_page_tokens")
+    if page is not None and (type(page) is not int or page <= 0):
+        raise ValueError(
+            f"additional_config[{KV_TRANSFER_SECTION!r}]['kernel_page_tokens'] "
+            f"must be a positive int, got {page!r}"
+        )
+    return page
+
+
+def kv_transfer_kernel_page(vllm_config: VllmConfig) -> int | None:
+    """The kernel page ``tpu_kv_transfer`` pins for this engine's batched-RPA
+    seq-along-lane cache, or None to keep vLLM's choice.
 
     In the seq-along-lane layout the tokens of one kernel page lie on the
     lane axis of the cache, so the page is part of the bytes a prefill and a
     decode engine exchange: the Raiden transfer lowers its byte spans per
     kernel page, and its layout fingerprint pins the page
     (``fa_kernel_page_tokens``), so a pair whose pages differ is refused.
-    Each engine sizes its block to hold its own GDN state (2304 tokens at a
-    TP1 prefill, 640 at a TP8 decode), and vLLM picks the largest supported
-    page that divides the block: 256 and 128 there. Every block this backend
-    serves is a multiple of 128, so both engines page at 128.
+    vLLM picks the largest supported page that divides an engine's block, so
+    two engines whose blocks differ (for Qwen3.5-397B-A17B, 2304 tokens at a
+    TP1 prefill and 640 at a TP8 decode) page differently unless both set the
+    same page.
 
-    The condition is that the engine has a KV transfer config, whatever its
+    The section applies to an engine with a KV transfer config, whatever its
     role: vLLM's MultiConnector gives each child connector a copy of the
     engine config carrying that child's own role (``kv_both`` for an
     offloading connector inside a prefill engine), and the child must resolve
-    the page the runner allocated. Other models, engines without KV transfer
-    and the head-along-sublane layout keep vLLM's choice. So do other
-    Qwen3.5 checkpoints than the one the IX points ran (Qwen3.5-397B-A17B):
-    their peer may be a PCP prefill engine, which keeps vLLM's choice, so a
-    fixed page there would make the two fingerprints differ instead.
+    the page the runner allocated. The head-along-sublane layout keeps vLLM's
+    choice: its pages are not part of the transferred bytes.
     """
     if vllm_config.kv_transfer_config is None:
         return None
@@ -230,14 +254,7 @@ def qwen3_5_kv_transfer_page(vllm_config: VllmConfig) -> int | None:
         is not batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
     ):
         return None
-    from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
-    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
-
-    if not qwen3_5_settings.is_qwen3_5(vllm_config.model_config):
-        return None
-    if not qwen3_5_hooks.has_calibrated_shape(vllm_config.model_config):
-        return None
-    return QWEN3_5_KV_TRANSFER_PAGE_TOKENS
+    return kv_transfer_page_option(vllm_config)
 
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
@@ -877,17 +894,26 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
+        vllm_config = get_current_vllm_config()
+        supported: list[int | MultipleOf]
         if (
-            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+            vllm_config.cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
-            and get_current_vllm_config().parallel_config.prefill_context_parallel_size
-            > 1
+            and vllm_config.parallel_config.prefill_context_parallel_size > 1
         ):
-            return [128, 256, 512, 1024, 2048, 4096]
-        page = qwen3_5_kv_transfer_page(get_current_vllm_config())
-        if page is not None:
-            return [page]
-        return [128, 256]
+            supported = [128, 256, 512, 1024, 2048, 4096]
+        else:
+            supported = [128, 256]
+        page = kv_transfer_kernel_page(vllm_config)
+        if page is None:
+            return supported
+        if page not in supported:
+            raise ValueError(
+                f"additional_config[{KV_TRANSFER_SECTION!r}]['kernel_page_tokens']"
+                f"={page} is not a batched-RPA kernel page of this engine; "
+                f"supported pages: {supported}."
+            )
+        return [page]
 
 
 class PallasAttentionBackendImpl(AttentionImpl):

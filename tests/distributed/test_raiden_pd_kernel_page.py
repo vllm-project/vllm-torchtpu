@@ -11,15 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A Qwen3.5 prefill engine and its decode engine page their seq-along-lane
-KV caches alike, so their Raiden layout fingerprints agree.
+"""A prefill engine and its decode engine page their seq-along-lane KV caches
+alike when both carry ``tpu_kv_transfer.kernel_page_tokens``, so their Raiden
+layout fingerprints agree; Qwen3.5-397B-A17B engines with KV transfer get the
+setting from the Qwen3.5 config hook.
 
 The fingerprint of the seq-along-lane FA pool pins the batched-RPA kernel
 page. A TP1 prefill runs 2304-token blocks and a TP8 decode 640-token blocks;
 vLLM's own choice, the largest supported page that divides the block, gives
 256 and 128. The fingerprints then differ and the source controller refuses
 every transfer ("Layout fingerprint mismatch between source and
-destination"), which is what the pair below reproduces without the rule.
+destination"), which is what the pair below reproduces without the setting.
 """
 
 import contextlib
@@ -32,14 +34,16 @@ from vllm.v1.worker.utils import select_common_block_size
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
 from vllm_torchtpu.layers.adapter.attention import PallasBatchedRPAAttentionBackend
+from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
 
 from .raiden_test_utils import FakeTensor
 
 BATCHED = PallasBatchedRPAAttentionBackend
 QWEN35 = "Qwen3_5MoeForConditionalGeneration"
 OTHER = "Qwen3NextForCausalLM"
-# The text-config shape of the checkpoint the IX points ran (Qwen3.5-397B-A17B),
-# and of Qwen3.5-35B-A3B, which main's PCP disagg integration runs serve.
+# The text-config shape of Qwen3.5-397B-A17B, whose engines the config hook
+# pages at 128, and of Qwen3.5-35B-A3B, which main's PCP disagg integration
+# runs serve.
 SHAPE_397B = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
 SHAPE_35B = {"num_experts": 256, "hidden_size": 2048, "num_hidden_layers": 40}
 
@@ -61,11 +65,21 @@ SOL_LAYOUT = ((4, 3, 2, 1, 0), ((4, 128), (4, 1)), 8)
 
 @contextlib.contextmanager
 def _engine(
-    monkeypatch, *, kv_role, arch=QWEN35, layout="HND", pcp=1, shape=SHAPE_397B
+    monkeypatch,
+    *,
+    kv_role,
+    arch=QWEN35,
+    layout="HND",
+    pcp=1,
+    shape=SHAPE_397B,
+    section=None,
 ):
     """A current vLLM config for one engine: the KV cache layout resolved as
     the runner resolves it, the model's architecture and text-config shape,
-    and a KV transfer config with ``kv_role`` (None: no KV transfer)."""
+    a KV transfer config with ``kv_role`` (None: no KV transfer), an explicit
+    ``tpu_kv_transfer`` section (None: absent), and, for a Qwen3.5
+    architecture, the Qwen3.5 config hook's serving defaults applied, as vLLM
+    applies them while it builds the config."""
     from vllm import envs as vllm_envs
     from vllm.config import (
         DeviceConfig,
@@ -108,6 +122,12 @@ def _engine(
             config.kv_transfer_config = KVTransferConfig(
                 kv_connector="TPURaidenConnector", kv_role=kv_role
             )
+        if section is not None:
+            config.additional_config["tpu_kv_transfer"] = section
+        if arch == QWEN35:
+            # No device here: the KV budget default stays off.
+            monkeypatch.setattr(qwen3_5_hooks, "_chip_family", lambda: None)
+            qwen3_5_hooks.apply_serving_defaults(config)
         with set_current_vllm_config(config):
             yield config
     finally:
@@ -158,9 +178,22 @@ def _leg_fingerprint(*, block, kernel_page, num_kv_heads, gdn):
     )
 
 
-def test_prefill_and_decode_register_the_same_layout(monkeypatch):
-    prefill_page = _kernel_page(monkeypatch, PREFILL_BLOCK, kv_role="kv_producer")
-    decode_page = _kernel_page(monkeypatch, DECODE_BLOCK, kv_role="kv_consumer")
+@pytest.mark.parametrize(
+    "engine",
+    [
+        # Qwen3.5-397B: the config hook sets the page.
+        {},
+        # Any model: both legs carry the setting.
+        {"arch": OTHER, "section": {"kernel_page_tokens": 128}},
+    ],
+)
+def test_prefill_and_decode_register_the_same_layout(monkeypatch, engine):
+    prefill_page = _kernel_page(
+        monkeypatch, PREFILL_BLOCK, kv_role="kv_producer", **engine
+    )
+    decode_page = _kernel_page(
+        monkeypatch, DECODE_BLOCK, kv_role="kv_consumer", **engine
+    )
     prefill_fp, prefill_payload = _leg_fingerprint(
         block=PREFILL_BLOCK, kernel_page=prefill_page, num_kv_heads=2, gdn=TP1_GDN
     )
@@ -248,8 +281,8 @@ def test_engine_configs_leave_no_global_state(monkeypatch):
 
 
 def test_other_qwen3_5_checkpoints_keep_vllms_page(monkeypatch):
-    # The 128-token page is for the checkpoint the IX points ran. Any other
-    # Qwen3.5 checkpoint keeps vLLM's choice, as on main.
+    # The hook's 128-token page is for Qwen3.5-397B-A17B. Any other Qwen3.5
+    # checkpoint keeps vLLM's choice, as on main.
     with _engine(monkeypatch, kv_role="kv_consumer", shape=SHAPE_35B):
         assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
     assert (
@@ -272,3 +305,78 @@ def test_pcp_prefill_and_its_decode_page_alike_on_mains_runs(monkeypatch):
         monkeypatch, 2304, kv_role="kv_consumer", shape=SHAPE_35B
     )
     assert prefill_page == decode_page == 256
+
+
+def _section(engine):
+    return engine.additional_config.get("tpu_kv_transfer")
+
+
+def test_hook_sets_the_page_only_for_a_397b_engine_with_kv_transfer(monkeypatch):
+    with _engine(monkeypatch, kv_role="kv_consumer") as config:
+        assert _section(config) == {"kernel_page_tokens": 128}
+    # A PCP prefill engine keeps its page list, as on main.
+    with _engine(monkeypatch, kv_role="kv_producer", pcp=4) as config:
+        assert _section(config) is None
+    with _engine(monkeypatch, kv_role=None) as config:
+        assert _section(config) is None
+    with _engine(monkeypatch, kv_role="kv_consumer", shape=SHAPE_35B) as config:
+        assert _section(config) is None
+    # The user's own section wins.
+    explicit = {"kernel_page_tokens": 256}
+    with _engine(monkeypatch, kv_role="kv_consumer", section=explicit) as config:
+        assert _section(config) is explicit
+        assert BATCHED.get_supported_kernel_block_sizes() == [256]
+
+
+def test_pcp_engine_honours_the_setting(monkeypatch):
+    with _engine(
+        monkeypatch,
+        kv_role="kv_producer",
+        pcp=4,
+        shape=SHAPE_35B,
+        section={"kernel_page_tokens": 128},
+    ):
+        assert BATCHED.get_supported_kernel_block_sizes() == [128]
+
+
+def test_head_along_sublane_ignores_the_setting(monkeypatch):
+    with _engine(
+        monkeypatch,
+        kv_role="kv_producer",
+        arch=OTHER,
+        layout="NHD",
+        section={"kernel_page_tokens": 128},
+    ):
+        assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
+
+
+def test_a_page_the_kernel_lacks_is_refused(monkeypatch):
+    engine = _engine(
+        monkeypatch,
+        kv_role="kv_producer",
+        arch=OTHER,
+        section={"kernel_page_tokens": 512},
+    )
+    refused = pytest.raises(ValueError, match=r"supported pages: \[128, 256\]")
+    with engine, refused:
+        BATCHED.get_supported_kernel_block_sizes()
+
+
+@pytest.mark.parametrize(
+    "section,match",
+    [
+        (128, "must be an object"),
+        ({"page": 128}, "Unknown key"),
+        ({"kernel_page_tokens": True}, "positive int"),
+        ({"kernel_page_tokens": 0}, "positive int"),
+        ({"kernel_page_tokens": "128"}, "positive int"),
+    ],
+)
+def test_malformed_setting_is_refused(section, match):
+    from vllm_torchtpu.layers.adapter.attention import kv_transfer_page_option
+
+    with pytest.raises(ValueError, match=match):
+        kv_transfer_page_option(
+            SimpleNamespace(additional_config={"tpu_kv_transfer": section})
+        )
+    assert kv_transfer_page_option(SimpleNamespace(additional_config={})) is None
