@@ -92,7 +92,9 @@ def prefill_config(monkeypatch):
     monkeypatch.setattr(lse_mod, "PREFILL_PAGE_CACHE_SLOTS", 512)
     monkeypatch.setattr(lse_mod, "PREFILL_PAGES_PER_STEP", 32)
     monkeypatch.setattr(lse_mod, "PREFILL_STEP_WIDTHS", (2, 4, 8, 12, 16, 20, 24))
-    monkeypatch.setattr(lse_mod, "PREFILL_BLOCK_Q", 0)
+    # 16-token narrow tiles (the 4-bit prefill default is 8,
+    # `msa_attention.PREFILL_BLOCK_Q_4BIT`), so the wide pick differs.
+    monkeypatch.setattr(lse_mod, "PREFILL_BLOCK_Q", 16)
     monkeypatch.setattr(lse_mod, "PAGE_CACHE_TILE_PAGES", 64)
     monkeypatch.delenv(lse_mod.ADAPTIVE_ENV, raising=False)
     return monkeypatch
@@ -127,7 +129,7 @@ def test_adaptive_gives_the_picked_configuration(prefill_config, num_heads):
     prefill_config.setattr(lse_mod, "PAGE_CACHE_TILE_PAGES", 32)
     jax.clear_caches()
     small = [_attend(narrow), _attend(wide)]
-    prefill_config.setattr(lse_mod, "PREFILL_BLOCK_Q", 0)
+    prefill_config.setattr(lse_mod, "PREFILL_BLOCK_Q", 16)
     prefill_config.setattr(lse_mod, "PAGE_CACHE_TILE_PAGES", 64)
 
     prefill_config.setenv(lse_mod.ADAPTIVE_ENV, "28:8:32")

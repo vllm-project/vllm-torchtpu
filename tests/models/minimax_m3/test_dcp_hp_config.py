@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: the head-parallel prefill attention
-kernel config, and its numerics against the default config (interpret)."""
+kernel config, and its numerics against the kernel's default tiles (interpret)."""
 
 import math
 
@@ -22,7 +22,6 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.models.minimax_m3.kernels import (
-    msa_attention,
     msa_attention_lse,
     msa_dcp_heads,
     msa_fp4,
@@ -31,11 +30,11 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 ENV = msa_dcp_heads.HP_PREFILL_CONFIG_ENV
 
 
-def test_unset_is_kernel_default(monkeypatch):
+def test_unset_is_module_default(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
     assert msa_dcp_heads.hp_prefill_kernel_kwargs() == dict(
-        block_q=msa_attention.DEFAULT_BLOCK_Q,
-        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        block_q=msa_dcp_heads._BLOCK_Q,
+        pages_per_step=msa_dcp_heads._PAGES_PER_STEP,
     )
 
 
@@ -82,7 +81,8 @@ def _attend(args, **kw):
 @pytest.mark.parametrize("spec", ["16:16:2/4/6/8/12:0", "16:16:2/4/6/8/12:512", "32:16:2/4/6/8/12:512", "8:16::0"])
 def test_numerics_vs_default(monkeypatch, spec):
     args = _inputs()
-    monkeypatch.delenv(ENV, raising=False)
+    # The reference: the kernel's default 16-token tiles of 16 pages.
+    monkeypatch.setenv(ENV, "16:16::0")
     o0, l0 = _attend(args, **msa_dcp_heads.hp_prefill_kernel_kwargs())
     monkeypatch.setenv(ENV, spec)
     o1, l1 = _attend(args, **msa_dcp_heads.hp_prefill_kernel_kwargs())
