@@ -236,6 +236,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
     VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON: float = 1.0
+    VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH: bool = False
 
 
 def env_with_choices(
@@ -1454,6 +1455,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON": env_nonnegative_float(
         "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON", 1.0
     ),
+    # Raiden KV offload: when a request finishes, move the host-resident prefix
+    # of its KV chain to the most recently used end of the host pool's LRU
+    # (head last), so a live conversation's oldest chunks are not evicted first.
+    "VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH": env_bool("VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH"),
 }
 
 

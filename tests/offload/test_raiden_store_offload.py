@@ -1114,6 +1114,102 @@ class TestTouchAndMisc(unittest.TestCase):
         self.assertEqual(len(self.store.calls_named("release")), 1)
         self.assertEqual(self.store.pinned_hashes(), {})
 
+    def test_touch_chain_releases_resident_prefix_head_last(self):
+        # One lookup over the whole chain pins its resident prefix (it stops at
+        # the first miss); one release hands it back tail first, so the head
+        # is the most recently used entry.
+        seed_host_entries(self.store, _key(0))
+        seed_host_entries(self.store, _key(1))
+        seed_host_entries(self.store, _key(3))
+        self.store.calls.clear()
+
+        self.manager.touch_chain([_key(0), _key(1), _key(2), _key(3)])
+        (lookup,) = self.store.calls_named("lookup")
+        self.assertTrue(lookup.args[2], "touch_chain must pin what it finds")
+        (release,) = self.store.calls_named("release")
+        prefix = sub_hashes(_key(0)) + sub_hashes(_key(1))
+        self.assertEqual(release.args[0], prefix[::-1])
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        self.store.calls.clear()
+        self.manager.touch_chain([_key(2), _key(0)])
+        self.manager.touch_chain([])
+        self.assertEqual(self.store.calls_named("release"), [])
+
+    def test_touch_chain_skips_storage_tier_hits(self):
+        seed_host_entries(self.store, _key(0))
+        self.store.storage_entries.update(sub_hashes(_key(1)))
+        self.store.calls.clear()
+        self.manager.touch_chain([_key(0), _key(1)])
+        (release,) = self.store.calls_named("release")
+        self.assertEqual(release.args[0], sub_hashes(_key(0))[::-1])
+
+    def test_request_finished_touches_chain_only_when_enabled(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            OffloadingConnectorScheduler,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        manager = MagicMock()
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched._raiden_manager = manager
+        keys = [_key(0), _key(1)]
+        sched._req_status = {
+            "r1": SimpleNamespace(group_states=[SimpleNamespace(offload_keys=keys)])
+        }
+        request = SimpleNamespace(request_id="r1")
+        with patch.object(
+            OffloadingConnectorScheduler, "request_finished", return_value=(False, None)
+        ):
+            for enabled in ("0", "1"):
+                with patch.dict(
+                    os.environ, {"VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH": enabled}
+                ):
+                    self.assertEqual(sched.request_finished(request), (False, None))
+            sched.request_finished(SimpleNamespace(request_id="untracked"))
+        manager.touch_chain.assert_called_once_with(keys)
+
+    def test_write_back_flush_touches_chain_again(self):
+        from collections import Counter, OrderedDict
+
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingScheduler,
+            WriteBackPolicy,
+        )
+
+        manager = MagicMock()
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched._raiden_manager = manager
+        sched._write_back = WriteBackPolicy()
+        sched._block_pool = None  # every held request flushes this step
+        sched._wb_blocks, sched._wb_owners = OrderedDict(), {}
+        sched.wb_counters = Counter()
+        sched.config = SimpleNamespace(blocks_per_chunk=1)
+        keys = [_key(0), _key(1)]
+        group = SimpleNamespace(
+            next_stored_chunk_idx=0, offload_keys=keys, block_ids=[7, 8]
+        )
+        sched._req_status = {"r1": SimpleNamespace(group_states=[group])}
+        out = SimpleNamespace(
+            finished_req_ids={"r1"},
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+            kv_cache_block_copies=None,
+            num_scheduled_tokens={},
+        )
+        with (
+            patch(
+                "vllm_torchtpu.offload.raiden_connector._allocated_block_ids",
+                return_value=set(),
+            ),
+            patch("dataclasses.replace", side_effect=lambda o, **kw: kw),
+            patch.dict(os.environ, {"VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH": "1"}),
+        ):
+            flushed = sched._write_back_output(out)
+        self.assertEqual(flushed["finished_req_ids"], {"r1"})
+        manager.touch_chain.assert_called_once_with(keys)
+
     def test_touch_never_resurrects_displaced_entries(self):
         # A displaced entry sits in Raiden's eviction-candidate list: invisible
         # to lookup, and a lookup pins only what it can see, so a touch cannot

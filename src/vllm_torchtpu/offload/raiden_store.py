@@ -926,6 +926,23 @@ class RaidenOffloadingManager(OffloadingManager):
             if held:
                 self._store.release(held)
 
+    def touch_chain(self, keys: Sequence[OffloadKey]) -> None:
+        """`touch` the host-resident prefix of a request's key chain in two
+        store calls, head last: the head ends up most recently used, so the
+        pool evicts the chain from its tail, not from the chunks every later
+        turn of the conversation needs first."""
+        if not keys:
+            return
+        # As in `touch`: peer and storage-tier hits hold no pin to give back.
+        skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        held = [
+            sub_hash
+            for sub_hash, block in self._store.lookup(self._expand_keys(list(keys)))
+            if block.status not in skip
+        ]
+        if held:
+            self._store.release(held[::-1])
+
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
         sub_hashes = self._expand_keys(keys)

@@ -292,6 +292,22 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._wb_owners: dict[int, set[str]] = {}
         self.wb_counters: Counter[str] = Counter()
 
+    def request_finished(self, request: Request):
+        result = super().request_finished(request)
+        self._touch_chain(request.request_id)
+        return result
+
+    def _touch_chain(self, req_id: str) -> None:
+        """With ``VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH``, refresh the request's
+        host-resident chain. The pool's LRU otherwise ages a chunk from its
+        insert (only a load refreshes it), so a long conversation would lose
+        its head first. Write-back touches again at the flush, so the head is
+        not left older than the tail chunks that flush stores."""
+        req_status = self._req_status.get(req_id)
+        if tpu_envs.VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH and req_status is not None:
+            for group_state in req_status.group_states:
+                self._raiden_manager.touch_chain(group_state.offload_keys)
+
     def attach_block_pool(self, block_pool) -> None:
         """`EvictionAwareConnector`: the scheduler's block pool, whose free
         queue tells write-back which finished requests near eviction. Its
@@ -423,6 +439,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         flush = self._wb_near_eviction()
         for req_id in flush:
             self._wb_unregister(req_id)
+            self._touch_chain(req_id)
         self.wb_counters["flushed_requests"] += len(flush)
         self.wb_counters["held_requests"] = len(self._wb_blocks)
         self._maybe_log_write_back()
