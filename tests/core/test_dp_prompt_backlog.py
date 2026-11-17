@@ -263,7 +263,8 @@ def test_request_leaves_engine_behind_long_prefill(installed):
     for idx in range(1, ENGINES):
         rows[idx][1] = 4
     client.lb_engines = rows
-    assert DPLBAsyncMPClient.get_core_engine_for_request(client, request("a", 1)) != 0
+    chosen = DPLBAsyncMPClient.get_core_engine_for_request(client, request("a", 1))
+    assert chosen != client.core_engines[0]
 
     client = Client()
     client.lb_engines = rows
@@ -300,6 +301,12 @@ def test_follow_up_and_pinned_requests_bypass(installed):
         client, request("d", 10, data_parallel_rank=2)
     )
     assert pinned == client.core_engines[2]
+
+    # A request already routed (a streaming-input session) stays where it is.
+    client.reqs_in_flight["g"] = client.core_engines[2]
+    follow_up = DPLBAsyncMPClient.get_core_engine_for_request(client, request("g", 10))
+    assert follow_up == client.core_engines[2]
+    assert client._lb_pending[2] == 500_000
 
 
 def test_late_interaction_request_stays_on_its_engine(installed):
