@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """additional_config["tpu_frontend"]: strict parsing, off by default, and each
-option installs exactly its own API-server patch from the platform hook."""
+option installs exactly its own API-server patch through patch_registry."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -27,6 +27,17 @@ _INSTALLERS = {
     "lazy_reasoning_count": (frontend_fix, "maybe_install_lazy_reasoning_count"),
     "detok_prompt_tail": (frontend_fix, "maybe_install_detok_prompt_tail"),
 }
+# The patch_registry callback of each option.
+_CALLBACKS = {name: f"install_{name}" for name in _INSTALLERS}
+
+
+def _run_callbacks(config):
+    """Call every option's registry callback the way patch_registry does;
+    returns their results by option."""
+    return {
+        name: getattr(frontend_options, callback)(vllm_config=config)
+        for name, callback in _CALLBACKS.items()
+    }
 
 
 def _config(section=None):
@@ -71,15 +82,22 @@ def test_parse_is_strict(raw, message):
         frontend_options.parse(raw)
 
 
-def test_install_by_default_patches_nothing(installed):
-    assert frontend_options.install(_config()) == FrontendOptions()
+@pytest.mark.parametrize("config", [_config(), None])
+def test_by_default_nothing_is_patched_and_every_callback_stays_eligible(
+    installed, config
+):
+    # False keeps a registry entry eligible, so a later engine config built in
+    # the same process can still turn its option on.
+    assert _run_callbacks(config) == dict.fromkeys(_INSTALLERS, False)
     assert installed == []
 
 
 @pytest.mark.parametrize("name", sorted(_INSTALLERS))
 def test_each_option_installs_only_its_patch(installed, name):
-    frontend_options.install(_config({name: True}))
+    results = _run_callbacks(_config({name: True}))
     assert installed == [name]
+    # The installed option is complete; the others stay eligible.
+    assert results == {other: None if other == name else False for other in results}
 
 
 def test_failed_install_does_not_stop_startup(monkeypatch):
@@ -87,8 +105,24 @@ def test_failed_install_does_not_stop_startup(monkeypatch):
         raise RuntimeError("vLLM moved")
 
     monkeypatch.setattr(frontend_fix, "maybe_install_detok_prompt_tail", broken)
-    options = frontend_options.install(_config({"detok_prompt_tail": True}))
-    assert options.detok_prompt_tail
+    config = _config({"detok_prompt_tail": True})
+    assert frontend_options.install_detok_prompt_tail(vllm_config=config) is None
+
+
+def test_each_callback_is_registered_for_platform_activation_with_the_config():
+    from vllm_torchtpu import patch_registry
+
+    entries = {
+        p.target: p
+        for p in patch_registry.PATCHES
+        if p.target.startswith("vllm_torchtpu.frontend_options:")
+    }
+    assert sorted(entries) == sorted(
+        f"vllm_torchtpu.frontend_options:{cb}" for cb in _CALLBACKS.values()
+    )
+    for entry in entries.values():
+        assert entry.stages == ("platform_activation",)
+        assert entry.vllm_config and not entry.model_config
 
 
 def test_section_is_kept_out_of_the_compile_cache_key():
@@ -108,19 +142,30 @@ def _platform_patches():
     )
 
 
-def test_platform_hook_installs_from_the_engine_config(installed):
+def test_platform_hook_applies_the_registry_with_the_engine_config():
     from vllm.config import VllmConfig
 
     p1, p2, p3 = _platform_patches()
-    with p1, p2, p3:
-        VllmConfig(additional_config={"tpu_frontend": {"tokenize_prefix_cache": True}})
-    assert installed == ["tokenize_prefix_cache"]
+    with p1 as apply, p2, p3:
+        config = VllmConfig(
+            additional_config={"tpu_frontend": {"tokenize_prefix_cache": True}}
+        )
+    calls = [c for c in apply.call_args_list if c.args == ("platform_activation",)]
+    assert calls and all(c.kwargs["vllm_config"] is config for c in calls)
 
 
-def test_platform_hook_rejects_an_unknown_option(installed):
+@pytest.mark.parametrize(
+    "additional",
+    [
+        {"tpu_frontend": {"tokenize_cache": True}},
+    ],
+)
+def test_platform_hook_rejects_a_bad_host_only_section(installed, additional):
+    """Before any patch installs and before a worker starts."""
     from vllm.config import VllmConfig
 
     p1, p2, p3 = _platform_patches()
-    with p1, p2, p3, pytest.raises(ValueError, match="unknown keys"):
-        VllmConfig(additional_config={"tpu_frontend": {"tokenize_cache": True}})
+    with p1 as apply, p2, p3, pytest.raises(ValueError, match="additional_config"):
+        VllmConfig(additional_config=additional)
+    apply.assert_not_called()
     assert installed == []

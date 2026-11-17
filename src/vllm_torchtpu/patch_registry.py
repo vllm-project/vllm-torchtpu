@@ -26,10 +26,10 @@ import logging
 import os
 from dataclasses import dataclass
 from threading import RLock
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig
+    from vllm.config import ModelConfig, VllmConfig
 
 Stage = Literal[
     "import", "platform_activation", "engine_core", "worker_init", "model_load"
@@ -44,6 +44,7 @@ class Patch:
     stages: tuple[Stage, ...]
     model_config: bool = False
     refresh: str | None = None
+    vllm_config: bool = False
 
 
 # Processes can enter through different lifecycle boundaries. _ACTIVE covers
@@ -152,6 +153,23 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    # API-server patches, each installed only when its
+    # additional_config["tpu_frontend"] option is on (frontend_options).
+    Patch(
+        "vllm_torchtpu.frontend_options:install_tokenize_prefix_cache",
+        ("platform_activation",),
+        vllm_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.frontend_options:install_lazy_reasoning_count",
+        ("platform_activation",),
+        vllm_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.frontend_options:install_detok_prompt_tail",
+        ("platform_activation",),
+        vllm_config=True,
+    ),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
@@ -204,7 +222,12 @@ def _invoke(target: str, **kwargs):
     return None
 
 
-def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
+def apply(
+    stage: Stage,
+    *,
+    model_config: "ModelConfig | None" = None,
+    vllm_config: "VllmConfig | None" = None,
+) -> None:
     """Applies a stage once per patch and refreshes late module bindings.
 
     Import-triggered re-entry into the same stage returns immediately: the
@@ -234,9 +257,11 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
                     continue
                 _applying.add(patch.target)
                 try:
-                    kwargs = (
-                        {"model_config": model_config} if patch.model_config else {}
-                    )
+                    kwargs: dict[str, Any] = {}
+                    if patch.model_config:
+                        kwargs["model_config"] = model_config
+                    if patch.vllm_config:
+                        kwargs["vllm_config"] = vllm_config
                     result = _invoke(patch.target, **kwargs)
                 finally:
                     _applying.discard(patch.target)
