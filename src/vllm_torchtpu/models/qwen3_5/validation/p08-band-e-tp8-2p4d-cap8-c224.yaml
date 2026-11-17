@@ -11,26 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# IX point #8 (band E): the serve arguments and
-# environment each leg of the record job ran, for the main-based stack.
-# See README.md in this directory for how to read and use it.
+# InferenceX point 8 (interactivity band E): the serve arguments and
+# environment each leg of the record run used. See README.md in this
+# directory for how to read and use it.
 name: p08-band-e-tp8-2p4d-cap8-c224
 point: 8
-sheet: ix-tpu-pd-cand4-llmd-oct28
 record:
-  job: j-ddeda4e7-fb15-4602-924d
-  tree: f0e45f67708ea2132e9eb14eaee098d5875fdf30
   mtok_per_dollar: 136.04
   p90_interactivity: 329.95
+  # The record run's decode megakernel mode; this tree has no decode megakernel.
   decode_megakernel: "on (mode ep)"
-recipe:
-  repository: cloud-devkit-recipes
-  commit: 90863fb2
-  path: recipes/inferencex/qwen-3.5/pd-cand4/qwen35-pd-cand4-llmd-08-band-e-tp8-2p4d-cap8-c224.jsonnet
-  base: agentx-397b-pd-baseline
 decode_layout: "TP8 + DCP4"
 concurrency: 224
 chips: 24
+# Values the record run used that this tree cannot run yet (README.md).
+not_yet_supported:
+  decode:
+    MOE_FUSED_EP_KERNEL_IMPL: "the fused EP MoE v3 kernel (this tree accepts v2 and adaptive)"
+    TPU_EXPERT_PLACEMENT: "the expert placement table this path names (68 slots per rank: 64 experts and 4 copies) and placement with expert copies; this tree ships no table and places permutations only"
 legs:
   prefill:
     replicas: 2
