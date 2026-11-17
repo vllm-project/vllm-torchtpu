@@ -43,8 +43,10 @@ from jax.extend.mlir import ir
 
 reinterpret_cast_p = jex_core.Primitive("vllm_tpu_reinterpret_cast")
 reinterpret_cast_p.ref_primitive = True
+# Required by JAX's jaxpr effect checker (`make_jaxpr_effects` / `check_jaxpr`):
+# a primitive returning a non-invar `AbstractRef` must set `ref_allocating` so
+# subsequent effects on the returned alias pass validation.
 reinterpret_cast_p.ref_allocating = True
-reinterpret_cast_p.is_effectful = lambda params: True
 
 
 @reinterpret_cast_p.def_impl
@@ -71,9 +73,27 @@ def _reinterpret_cast_abstract_eval(
     return out_aval, {state.ReadEffect(0), state.WriteEffect(0)}
 
 
+def _dtype_bits(dt: jnp.dtype[Any]) -> int:
+    """Return bitwidth for supported 8-, 16-, or 32-bit numeric dtypes."""
+    if jnp.issubdtype(dt, jnp.integer):
+        bits = jnp.iinfo(dt).bits
+    elif jnp.issubdtype(dt, jnp.floating):
+        bits = jnp.finfo(dt).bits
+    else:
+        raise ValueError(
+            f"pool_alias supports 8-, 16-, or 32-bit numeric dtypes, got {dt.name}"
+        )
+    if bits not in (8, 16, 32):
+        raise ValueError(
+            f"pool_alias supports 8-, 16-, or 32-bit numeric dtypes, "
+            f"got {dt.name} ({bits}-bit)"
+        )
+    return bits
+
+
 def _tiled_layout_attr(shape: tuple[int, ...], dtype: jnp.dtype[Any]) -> ir.Attribute:
     num_sublanes, num_lanes = pltpu.Tiling.COMPACT.shape
-    bits = dtype.itemsize * 8
+    bits = _dtype_bits(dtype)
     packing = 32 // bits
     rows = num_sublanes * packing
     columns = (shape[-1] + num_lanes - 1) // num_lanes
@@ -115,14 +135,20 @@ def _reinterpret_cast_lowering(
 
 def storage_size(shape: Sequence[int], dtype: Any) -> int:
     """Bytes occupied by native `(sublanes, lanes)`-tiled VMEM layout."""
+    dims = tuple(int(d) for d in shape)
+    if len(dims) < 2 or any(d < 0 for d in dims):
+        raise ValueError(
+            f"pool_alias.storage_size requires shape with >= 2 non-negative dims, "
+            f"got {dims}"
+        )
     dt = jnp.dtype(dtype)
+    bits = _dtype_bits(dt)
     num_sublanes, num_lanes = pltpu.Tiling.COMPACT.shape
-    bits = 4 if dt in (jnp.int4, jnp.uint4) else dt.itemsize * 8
     rows = num_sublanes * (32 // bits)
-    row_tiles = (shape[-2] + rows - 1) // rows
-    lane_tiles = (shape[-1] + num_lanes - 1) // num_lanes
+    row_tiles = (dims[-2] + rows - 1) // rows
+    lane_tiles = (dims[-1] + num_lanes - 1) // num_lanes
     return (
-        math.prod(shape[:-2]) * row_tiles * lane_tiles * (num_sublanes * num_lanes * 4)
+        math.prod(dims[:-2]) * row_tiles * lane_tiles * (num_sublanes * num_lanes * 4)
     )
 
 
@@ -130,8 +156,9 @@ def view(ref: Any, shape: Sequence[int], dtype: Any) -> Any:
     """Return a `shape`/`dtype` view aliasing `ref`'s physical tiled storage.
 
     Args:
-        ref: Source VMEM reference (or tile-aligned slice) holding the exact
-            bytes required by `shape` and `dtype`.
+        ref: Source VMEM reference (or tile-aligned slice) with at least 2
+            positive dimensions holding the exact bytes required by `shape`
+            and `dtype`.
         shape: Target view shape with at least 2 positive dimensions.
         dtype: Target 8-, 16-, or 32-bit numeric dtype.
 
@@ -140,24 +167,20 @@ def view(ref: Any, shape: Sequence[int], dtype: Any) -> Any:
         returned view must be overwritten before it is read.
 
     Raises:
-        ValueError: If `shape` or `dtype` is invalid, requires edge-tile
-            padding, or does not match `ref`'s byte size.
+        ValueError: If `ref`, `shape`, or `dtype` is invalid, requires
+            edge-tile padding, or does not match `ref`'s byte size.
     """
     target_shape = tuple(int(d) for d in shape)
-    dt = jnp.dtype(dtype)
     if len(target_shape) < 2 or any(d <= 0 for d in target_shape):
         raise ValueError(
             f"pool_alias.view requires shape with >= 2 positive dims, "
             f"got {target_shape}"
         )
-    bits = dt.itemsize * 8
-    if bits not in (8, 16, 32):
-        raise ValueError(
-            f"pool_alias.view supports 8-, 16-, or 32-bit dtypes, got {dt.name}"
-        )
+    dt = jnp.dtype(dtype)
+    bits = _dtype_bits(dt)
     num_sublanes, num_lanes = pltpu.Tiling.COMPACT.shape
     tile_rows = num_sublanes * (32 // bits)
-    nbytes = math.prod(target_shape) * dt.itemsize
+    nbytes = math.prod(target_shape) * (bits // 8)
     tiled_bytes = storage_size(target_shape, dt)
     if tiled_bytes != nbytes:
         raise ValueError(
@@ -166,9 +189,15 @@ def view(ref: Any, shape: Sequence[int], dtype: Any) -> Any:
             f"shape[-2] to a multiple of {tile_rows} and shape[-1] to a "
             f"multiple of {num_lanes}"
         )
-    ref_dtype = jnp.dtype(ref.dtype)
     ref_shape = tuple(int(d) for d in ref.shape)
-    ref_nbytes = math.prod(ref_shape) * ref_dtype.itemsize
+    if len(ref_shape) < 2 or any(d <= 0 for d in ref_shape):
+        raise ValueError(
+            f"pool_alias.view requires source ref with >= 2 positive dims, "
+            f"got {ref_shape}"
+        )
+    ref_dtype = jnp.dtype(ref.dtype)
+    ref_bits = _dtype_bits(ref_dtype)
+    ref_nbytes = math.prod(ref_shape) * (ref_bits // 8)
     ref_tiled_bytes = storage_size(ref_shape, ref_dtype)
     if ref_nbytes != nbytes or ref_tiled_bytes != nbytes:
         raise ValueError(
