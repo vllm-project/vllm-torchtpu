@@ -47,15 +47,14 @@ def fake_load_file(monkeypatch):
     _patch_omnivoice_cpu_safetensors_load.cache_clear()
     _patch_omnivoice_cpu_safetensors_load()
     yield _load_file, calls, fail_on
-    # The next test applies the patch on its own fake again.
-    _patch_omnivoice_cpu_safetensors_load.cache_clear()
 
 
 def test_torch_tpu_safetensors_still_rejects_tpu_device(tmp_path):
     """Canary: the real safetensors still cannot load straight to TPU.
 
-    Informational only: once this fails, the fallback in
-    _patch_omnivoice_cpu_safetensors_load never runs and the patch can go.
+    This test is meant to fail once safetensors accepts torch_tpu devices. When
+    it does, the fallback in _patch_omnivoice_cpu_safetensors_load no longer
+    runs: remove the patch and this test file (see the TODO on the patch).
     """
     path = tmp_path / "w.safetensors"
     safetensors_torch.save_file({"w": torch.ones(2)}, str(path))
@@ -105,13 +104,14 @@ def test_extra_arguments_are_passed_through(fake_load_file):
     ]
 
 
-def test_cpu_load_errors_surface_the_original_error(fake_load_file):
-    """A failing CPU load is retried once on CPU, then its own error is raised."""
+@pytest.mark.parametrize("device", ["cpu", "cuda:0", torch.device("cpu")])
+def test_non_tpu_errors_are_reraised_without_fallback(fake_load_file, device):
+    """Only TPU devices get the CPU fallback; other devices fail as before."""
     _, calls, fail_on = fake_load_file
-    fail_on["cpu"] = SafetensorError("bad header")
+    fail_on[str(device)] = SafetensorError("bad header")
     with pytest.raises(SafetensorError, match="bad header"):
-        safetensors_torch.load_file("f", device="cpu")
-    assert calls == [("cpu", {}), ("cpu", {})]
+        safetensors_torch.load_file("f", device=device)
+    assert calls == [(str(device), {})]  # read once, no CPU retry
 
 
 def test_file_errors_surface_the_original_error(fake_load_file):

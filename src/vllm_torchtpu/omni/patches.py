@@ -22,8 +22,8 @@ apply_omni_model_specific_patches() at attention backend selection
 patch_registry.py.
 """
 
-import functools
 from functools import cache as run_once
+from functools import wraps
 from typing import Any
 
 import torch
@@ -651,6 +651,12 @@ def _patch_ltx2_split_rope() -> None:
 
 @run_once
 def _patch_omnivoice_cpu_safetensors_load() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once safetensors accepts torch_tpu devices in load_file
+    # and the safetensorspin is bumped to that release, or once vLLM-Omni's
+    # OmniVoice/HiggsAudio loaders read the checkpoint on CPU before moving it
+    # to the device.
+    #
     # Problem: OmniVoiceGenerator.load_weights and the OmniVoice/HiggsAudio
     #   decoder loaders call safetensors.torch.load_file(path,
     #   device=str(device)). On TPU that is "tpu:N". safetensors resolves the
@@ -658,15 +664,15 @@ def _patch_omnivoice_cpu_safetensors_load() -> None:
     #   raises `SafetensorError: device tpu is invalid`, so the k2-fsa/OmniVoice
     #   diffusion worker dies at weight load.
     # Fix: load_file is wrapped to try the requested device first. On
-    #   SafetensorError the file is read on CPU and each tensor is moved with
-    #   torch's .to(), which every registered backend (including torch_tpu)
-    #   supports. If the CPU read also fails, the problem is the file rather
-    #   than the device, so the original error is re-raised. Keyword arguments
-    #   (e.g. backend= in safetensors >= 0.8) are passed through. Calls that
-    #   succeed today return unchanged, and once safetensors supports the device
-    #   the fallback never runs. The loaders import load_file inside the
-    #   function at call time, so rebinding the safetensors.torch attribute
-    #   covers every caller.
+    #   SafetensorError for a TPU device, the file is read on CPU and each
+    #   tensor is moved with torch's .to(), which torch_tpu supports. Errors for
+    #   any other device are re-raised unchanged. If the CPU read also fails,
+    #   the problem is the file rather than the device, so the original error
+    #   is re-raised. Keyword arguments (e.g. backend= in safetensors >= 0.8)
+    #   are passed through. Calls that succeed today return unchanged, and once
+    #   safetensors supports the device the fallback never runs. The loaders
+    #   import load_file inside the function at call time, so rebinding the
+    #   safetensors.torch attribute covers every caller.
     # Effect: k2-fsa/OmniVoice loads its generator and decoder weights on TPU.
     # -------------------------------------------------------------------------
     import safetensors.torch as safetensors_torch
@@ -674,13 +680,15 @@ def _patch_omnivoice_cpu_safetensors_load() -> None:
 
     original = safetensors_torch.load_file
 
-    @functools.wraps(original)
+    @wraps(original)
     def load_file(
         filename: Any, device: Any = "cpu", **kwargs: Any
     ) -> dict[str, torch.Tensor]:
         try:
             return original(filename, device, **kwargs)
         except SafetensorError as device_error:
+            if str(device).split(":")[0] != "tpu":
+                raise
             try:
                 state = original(filename, "cpu", **kwargs)
             except Exception as cpu_error:
