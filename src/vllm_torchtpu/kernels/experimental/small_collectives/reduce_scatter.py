@@ -38,47 +38,70 @@ COLLECTIVE_ID = 7
 SUBLANES = 8
 
 
-def reference(blocks, core):
-    """[cores, cores * rows, hidden] -> core ``core``'s output."""
-    rows = blocks.shape[1] // blocks.shape[0]
-    mine = blocks[:, core * rows : (core + 1) * rows, :]
-    return jnp.sum(mine.astype(jnp.float32), axis=0).astype(blocks.dtype)
-
-
 def small_reduce_scatter(
-    x, *, num_cores, axis, rank=None, form=None, collective_id=COLLECTIVE_ID
+    x,
+    *,
+    num_cores,
+    axis,
+    rank=None,
+    form=None,
+    block_order=None,
+    collective_id=COLLECTIVE_ID,
 ):
-    """Block r of ``x`` summed onto core r of mesh axis ``axis``, inside a
-    shard_map over that axis; ``rank`` as in ``small_all_reduce``."""
+    """The sum over the cores of mesh axis ``axis`` of one block of ``x`` onto
+    each core, inside a shard_map over that axis.
+
+    Args:
+      x: [num_cores * rows, hidden], this core's blocks; hidden a multiple of
+        LANES.
+      rank: as in ``small_all_reduce``.
+      form: "hier" (8 cores as 4 chips x 2 cores) or "flat" (any core count);
+        by default "hier" on 8 cores and "flat" otherwise.
+      block_order: the block each core receives, a permutation of
+        ``range(num_cores)``: core c gets the sum of block ``block_order[c]``.
+        None gives block c to core c. A caller whose blocks are in another
+        order than the mesh's cores passes it, e.g. the DP MoE combine, whose
+        block r is DP rank r's while the EP mesh is in device-id order.
+    """
     total, hidden = x.shape
     n = num_cores
     if hidden % LANES:
         raise ValueError(f"hidden {hidden} is not a multiple of {LANES} lanes")
     if total % n:
         raise ValueError(f"{total} rows do not split over {n} cores")
+    form = form or ("hier" if n == 8 else "flat")
+    if form not in ("hier", "flat"):
+        raise ValueError(f"unknown reduce-scatter form {form!r}; use 'hier' or 'flat'")
+    if form == "hier" and n != 8:
+        raise ValueError(f"the 'hier' reduce-scatter runs on 8 cores, not {n}")
+    order = tuple(range(n)) if block_order is None else tuple(block_order)
+    if sorted(order) != list(range(n)):
+        raise ValueError(f"block_order {block_order} is not a permutation of {n} cores")
     rows = total // n
     padded = -(-rows // SUBLANES) * SUBLANES
-    impl = (
-        _hier_reduce_scatter
-        if (form or ("hier" if n == 8 else "flat")) == "hier"
-        else _reduce_scatter
-    )
+    impl = _hier_reduce_scatter if form == "hier" else _reduce_scatter
     if padded == rows:
-        return impl(x, n, axis, rank, collective_id)
+        return impl(x, n, axis, rank, collective_id, order)
     x = jnp.pad(x.reshape(n, rows, hidden), ((0, 0), (0, padded - rows), (0, 0)))
-    out = impl(x.reshape(n * padded, hidden), n, axis, rank, collective_id)
+    out = impl(x.reshape(n * padded, hidden), n, axis, rank, collective_id, order)
     return out[:rows]
 
 
-def _hier_reduce_scatter(x, n, axis, rank, collective_id):
+def _hier_reduce_scatter(x, n, axis, rank, collective_id, order):
     """2-stage topology-aware Reduce-Scatter on 8 cores (4 chips x 2 cores/chip):
     Stage 1 (Intra-chip): Core `me` pushes the 4 blocks belonging to
-      `partner = me ^ 1`'s subcore parity (`r = 2*c + (1 - subcore)` for c in
-      0..3) to `s1_recv` on `partner`, and sums its own 4 parity blocks
-      (`r = 2*c + subcore`) with `s1_recv` into `chip_blocks`.
+      `partner = me ^ 1`'s subcore parity (the blocks for cores
+      `r = 2*c + (1 - subcore)`, c in 0..3) to `s1_recv` on `partner`, and sums
+      its own 4 parity blocks (cores `r = 2*c + subcore`) with `s1_recv` into
+      `chip_blocks`. The block for core r is block `order[r]` of `x`.
     Stage 2 (Inter-chip): Core `me` pushes `chip_blocks[c]` for `c != chip` to
       `(c << 1) | subcore` (3 inter-chip DMAs vs 6 in flat reduce-scatter) and
       sums the 4 chip blocks into `o_ref`.
+
+    The stage-1 partial sums are rounded to the input dtype before stage 2,
+    which sums in float32 and rounds once more: two roundings in all, the
+    bound the kernel tests check. Which cores share a chip affects only speed:
+    every core's data is summed exactly once for any placement of the cores.
     """
     total, hidden = x.shape
     rows = total // n
@@ -110,7 +133,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 push(
-                    x_ref.at[pl.ds((2 * c + 1) * rows, rows)],
+                    x_ref.at[pl.ds(order[2 * c + 1] * rows, rows)],
                     s1_recv.at[c],
                     send1,
                     recv1,
@@ -123,7 +146,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 push(
-                    x_ref.at[pl.ds((2 * c) * rows, rows)],
+                    x_ref.at[pl.ds(order[2 * c] * rows, rows)],
                     s1_recv.at[c],
                     send1,
                     recv1,
@@ -138,7 +161,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 chip_blocks[c] = (
-                    x_ref[pl.ds((2 * c) * rows, rows), :].astype(jnp.float32)
+                    x_ref[pl.ds(order[2 * c] * rows, rows), :].astype(jnp.float32)
                     + s1_recv[c].astype(jnp.float32)
                 ).astype(x_ref.dtype)
 
@@ -146,7 +169,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 chip_blocks[c] = (
-                    x_ref[pl.ds((2 * c + 1) * rows, rows), :].astype(jnp.float32)
+                    x_ref[pl.ds(order[2 * c + 1] * rows, rows), :].astype(jnp.float32)
                     + s1_recv[c].astype(jnp.float32)
                 ).astype(x_ref.dtype)
 
@@ -189,7 +212,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
     )
 
 
-def _reduce_scatter(x, n, axis, rank, collective_id):
+def _reduce_scatter(x, n, axis, rank, collective_id, order):
     total, hidden = x.shape
     rows = total // n
     dict_ids = rank is not None
@@ -199,13 +222,13 @@ def _reduce_scatter(x, n, axis, rank, collective_id):
             refs, dict_ids, axis
         )
         barrier(n, axis, dict_ids)
-        # block r into slot `me` of core r's slices
+        # core r's block into slot `me` of core r's slices
         for r in range(n):
 
             @pl.when(jnp.int32(r) != me)
             def _(r=r):
                 push(
-                    x_ref.at[pl.ds(r * rows, rows)],
+                    x_ref.at[pl.ds(order[r] * rows, rows)],
                     slices.at[me],
                     send_sem,
                     recv_sem,
@@ -219,7 +242,7 @@ def _reduce_scatter(x, n, axis, rank, collective_id):
 
             @pl.when(jnp.int32(r) == me)
             def _(r=r):
-                slices[pl.ds(me, 1)] = x_ref[pl.ds(r * rows, rows), :][None]
+                slices[pl.ds(me, 1)] = x_ref[pl.ds(order[r] * rows, rows), :][None]
 
         wait_bytes_of(slices.at[pl.ds(0, n - 1)], recv_sem)
         o_ref[...] = sum_slots(slices, n).astype(o_ref.dtype)

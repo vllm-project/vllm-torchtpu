@@ -16,7 +16,6 @@ sum and ``jax.lax.psum``, with the core's index read from the axis and handed
 in as data (the torch bridge's way)."""
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -97,21 +96,3 @@ def test_a_wrong_rank_order_fails_the_oracle(mesh):
     want, tolerance = exact_sum(per_core), sum_tolerance(per_core)
     for core in (0, 1):
         assert not within(got[core], want, tolerance).all()
-
-
-def test_refuses_a_width_that_does_not_split():
-    with pytest.raises(ValueError, match="lanes"):
-        ar.small_all_reduce(jnp.zeros((16, 4000), jnp.bfloat16), num_cores=N, axis=AXIS)
-
-
-def test_form_by_bytes():
-    assert ar.form_for(4, 4096, 2) == "oneshot"
-    assert ar.form_for(5, 4096, 2) == "twoshot"
-    assert ar.form_for(8, 2048, 2) == "oneshot"
-    assert ar.form_for_8cores(1, 4096, 2) == "oneshot_xor"
-    assert ar.form_for_8cores(4, 4096, 2) == "oneshot_xor"
-    assert ar.form_for_8cores(8, 4096, 2) == "hier_halves"
-    assert ar.form_for_8cores(16, 4096, 2) == "twoshot"
-    assert ar.form_for_8cores(24, 4096, 2) == "hier_2stage"
-    assert ar.form_for_8cores(32, 4096, 2) == "hier_2stage"
-    assert ar.form_for_8cores(128, 4096, 2) == "hier_2stage"

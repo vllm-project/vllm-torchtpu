@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch custom operator wrapper for the low-latency Pallas ICI all-reduce kernel."""
+"""Torch custom ops for the low-latency Pallas ICI small collectives: the TP
+all-reduce of a small block, and the reduce-scatter of the DP MoE combine."""
 
 import contextlib
 from typing import Any
@@ -26,6 +27,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
     ep_mesh_index,
+    ep_rank_order,
     get_ep_group,
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
@@ -38,13 +40,17 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Largest TP all-reduce, in rows, the kernel takes: at H=4096 bf16 on 8 cores
-# 2-stage hierarchical all-reduce beats XLA through 128 rows (j-c8c95322).
+# Largest TP all-reduce, in rows, the kernel takes. Measured on the 8 cores of
+# one TPU7x host, [rows, 4096] bf16, as the marginal time per all-reduce in a
+# chain of them: the 2-stage hierarchical form takes 21.3 us at 128 rows
+# against XLA's 24.8 us, ties XLA at 160 to 192 rows, and loses at 256 (34.0
+# against 33.1 us).
 MAX_ROWS = 128
-# Largest DP combine, in rows per engine, the reduce-scatter takes: measured
-# crossover between 40 and 48 (j-a8d66cde, j-e6f25e61, j-de6349e8). The win
-# relies on XLA lowering psum_scatter to a full all-reduce when rows per engine
-# is not a multiple of 16, which depends on libtpu: re-measure on a bump.
+# Largest DP combine, in rows per engine, the reduce-scatter takes: on one
+# TPU7x host the kernel was faster than XLA's reduce-scatter at 40 rows per
+# engine and slower at 48. The win relies on XLA lowering psum_scatter to a
+# full all-reduce when rows per engine is not a multiple of 16, which depends
+# on libtpu: re-measure on a bump.
 COMBINE_MAX_ROWS = 40
 
 _AR_OP = None
@@ -103,13 +109,13 @@ def _build_all_reduce(mesh):
     )
 
 
-def _build_reduce_scatter(mesh):
+def _build_reduce_scatter(mesh, block_order):
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def body(block, rank):
         return reduce_scatter.small_reduce_scatter(
-            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank
+            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank, block_order=block_order
         )
 
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
@@ -151,11 +157,16 @@ def prebuild(vllm_config: Any) -> None:
     ep_group = get_ep_group()
     assert ep_group is not None  # build_ep_mesh found the group
     _MESH_RANKS = tuple(int(r) for r in ep_group.ranks)
-    _RANK = torch.tensor([ep_mesh_index()], dtype=torch.int32, device="tpu")
+    _RANK = _rank_tensor(ep_mesh_index())
     _AR_OP = _build_all_reduce(mesh)
-    _RS_OP = _build_reduce_scatter(mesh)
-    # The mesh is rank-ordered (ep_mesh.build_ep_mesh), so when the DP group
-    # is the mesh, DP rank r's rows go to mesh core r.
+    # The combine's block r is DP rank r's rows, and when the DP group is the
+    # mesh, DP rank r is EP rank r. The mesh core at index i is EP rank
+    # ep_rank_order()[i], which is not i when the mesh is in device-id order
+    # (ep_mesh._ep_mesh_order), so core i gets block ep_rank_order()[i].
+    order = ep_rank_order()
+    _RS_OP = _build_reduce_scatter(
+        mesh, None if order == tuple(range(_CORES)) else order
+    )
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
     logger.info(
@@ -169,6 +180,11 @@ def prebuild(vllm_config: Any) -> None:
         tp_all_reduce,
         _DP_COMBINE,
     )
+
+
+def _rank_tensor(mesh_index: int | None) -> torch.Tensor:
+    """This core's mesh index as the kernels' int32 [1] rank operand."""
+    return torch.tensor([mesh_index], dtype=torch.int32, device="tpu")
 
 
 def _fits(x: torch.Tensor, width_multiple: int, *, allow_forced: bool = False) -> bool:
