@@ -83,6 +83,7 @@ from collections import OrderedDict
 from typing import Any, NamedTuple
 
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 logger = init_logger("vllm." + __name__)
 
@@ -125,10 +126,6 @@ def is_waiting_status(request: Any) -> bool:
 def format_counts(counts: dict[str, int]) -> str:
     """Formats a reason -> count map as ``a:1,b:2`` for a telemetry field."""
     return ",".join(f"{k}:{v}" for k, v in counts.items()) or "-"
-
-
-def _is_spec(spec: Any, name: str) -> bool:
-    return any(c.__name__ == name for c in type(spec).__mro__)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -182,11 +179,11 @@ class HybridStateRetention:
         coordinator = getattr(kv_cache_manager, "coordinator", None)
         groups = list(getattr(coordinator, "attention_groups", None) or ())
         self.coordinator: Any = coordinator
-        self.mamba_groups = [g for g in groups if _is_spec(g.spec, "MambaSpec")]
+        self.mamba_groups = [g for g in groups if isinstance(g.spec, MambaSpec)]
         self.attn_group_ids = [
             gid
             for g in groups
-            if _is_spec(g.spec, "FullAttentionSpec")
+            if isinstance(g.spec, FullAttentionSpec)
             for gid in g.group_ids
         ]
         self.enabled = bool(

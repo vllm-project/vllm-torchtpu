@@ -17,6 +17,8 @@ cross-turn Mamba boundary + partial-tail LRU retention."""
 from types import SimpleNamespace
 from typing import NamedTuple
 
+import torch
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention, _ConvLRUEntry
@@ -25,12 +27,19 @@ BS = 256  # attention / mamba block size
 HB = 128  # hash block size (fine-grained partial hits)
 
 
-class FullAttentionSpec:
-    pass
+def _attn_spec(block_size: int = BS) -> FullAttentionSpec:
+    return FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
 
 
-class MambaSpec:
-    pass
+def _mamba_spec(block_size: int = BS) -> MambaSpec:
+    return MambaSpec(
+        block_size=block_size,
+        shapes=(1, 1),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
 
 
 class SpecGroup(NamedTuple):
@@ -143,10 +152,10 @@ def _setup(prompt=1000, osl=600, mamba=True, max_conversations=None, bs=BS):
     pool = Pool()
     attn_mgr = SimpleNamespace(block_size=bs, req_to_blocks={}, dcp_world_size=1)
     mamba_mgr = SimpleNamespace(block_size=bs, req_to_blocks={}, dcp_world_size=1)
-    groups = [SpecGroup(FullAttentionSpec(), [0], FakeAttnManager, False)]
+    groups = [SpecGroup(_attn_spec(), [0], FakeAttnManager, False)]
     managers = [attn_mgr]
     if mamba:
-        groups.append(SpecGroup(MambaSpec(), [1], FakeMambaManager, False))
+        groups.append(SpecGroup(_mamba_spec(), [1], FakeMambaManager, False))
         managers.append(mamba_mgr)
     coord = SimpleNamespace(
         attention_groups=groups,
@@ -185,6 +194,15 @@ def _scheduler_free(pool, attn):
 def test_disabled_without_mamba():
     r, *_ = _setup(mamba=False)
     assert not r.enabled
+
+
+def test_spec_groups_are_found_by_type_not_by_name():
+    lookalike = type("MambaSpec", (), {})  # vLLM's class name, not its class
+    r, *_ = _setup()
+    assert r.enabled and r.mamba_groups
+    groups = r.coordinator.attention_groups
+    groups[1] = groups[1]._replace(spec=lookalike())
+    assert not HybridStateRetention(r.kvm).enabled
 
 
 def test_pin_then_release_puts_state_after_attention_and_demotes_output():
@@ -494,8 +512,8 @@ def test_mamba_manager_cache_partial_tail_hook_with_safe_tail_offset():
 
     mamba_mgr = HookableMambaMgr()
     groups = [
-        SpecGroup(FullAttentionSpec(), [0], FakeAttnManager, False),
-        SpecGroup(MambaSpec(), [1], FakeMambaManager, False),
+        SpecGroup(_attn_spec(), [0], FakeAttnManager, False),
+        SpecGroup(_mamba_spec(), [1], FakeMambaManager, False),
     ]
     coord = SimpleNamespace(
         attention_groups=groups,
@@ -639,20 +657,6 @@ def test_fork_candidate_off_without_smart_fork():
     assert r._fork_decision == {}
 
 
-class _MambaSpec:
-    pass
-
-
-_MambaSpec.__name__ = "MambaSpec"
-
-
-class _FullAttentionSpec:
-    pass
-
-
-_FullAttentionSpec.__name__ = "FullAttentionSpec"
-
-
 class _GuardPool:
     num_gpu_blocks = 8000
 
@@ -677,8 +681,8 @@ class _GuardKVM:
         self.need = need
         self.mamba_mgr = SimpleNamespace(block_size=640, cached_blocks_this_step=set())
         groups = [
-            SimpleNamespace(spec=_FullAttentionSpec(), group_ids=[0]),
-            SimpleNamespace(spec=_MambaSpec(), group_ids=[1]),
+            SimpleNamespace(spec=_attn_spec(640), group_ids=[0]),
+            SimpleNamespace(spec=_mamba_spec(640), group_ids=[1]),
         ]
         self.coordinator = SimpleNamespace(
             attention_groups=groups,
