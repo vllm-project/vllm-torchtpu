@@ -138,8 +138,18 @@ def _make_ops(mesh, rank: torch.Tensor | None) -> _Ops:
         scale = jnp.maximum(jnp.max(jnp.abs(xf), axis=-1, keepdims=True), _SCALE_FLOOR)
         scale = scale / FP8_MAX
         q = (xf / scale).astype(jnp.float8_e4m3fn)
-        q = lax.all_gather(lax.bitcast_convert_type(q, jnp.uint8), axis, axis=0, tiled=True)
-        q = lax.bitcast_convert_type(q, jnp.float8_e4m3fn)
+        # Four e4m3 bytes per uint32 word on the wire (a SparseCore-offloaded
+        # all-gather of a uint8 array does not complete).
+        rows, hidden = q.shape
+        words = lax.bitcast_convert_type(
+            lax.bitcast_convert_type(q, jnp.uint8).reshape(rows, hidden // 4, 4),
+            jnp.uint32,
+        )
+        words = lax.all_gather(words, axis, axis=0, tiled=True)
+        q = lax.bitcast_convert_type(
+            lax.bitcast_convert_type(words, jnp.uint8).reshape(-1, hidden),
+            jnp.float8_e4m3fn,
+        )
         scale = lax.all_gather(scale, axis, axis=0, tiled=True)
         return (q.astype(jnp.float32) * scale).astype(x.dtype)
 
