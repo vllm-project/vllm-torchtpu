@@ -87,10 +87,11 @@ def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetad
     return {
         RaidenOffloadMetricName.HIT_TOKENS: OffloadingCounterMetadata(
             documentation=(
-                "Number of prompt tokens matched and pinned in external KV "
-                "offload tiers at scheduler admission, labeled by source and "
-                "backend. Unlike vllm:prompt_tokens_cached_by_source, splits "
-                "disk hits by storage backend and counts only pinned tokens."
+                "Number of prompt tokens matched in external KV offload tiers, "
+                "labeled by source and backend. Counted at scheduler admission, "
+                "for each load that prepare_load accepted. Unlike "
+                "vllm:prompt_tokens_cached_by_source, splits disk hits by storage "
+                "backend and leaves out hits whose load was not accepted."
             ),
             labelnames=SOURCE_LABELNAMES,
         ),

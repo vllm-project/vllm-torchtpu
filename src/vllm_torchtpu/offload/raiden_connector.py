@@ -285,8 +285,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         if num_external_tokens == 0:
             return {}
         # `update_state_after_alloc` computes no split for an unpinned load:
-        # the load fails and recomputes, but the scheduler has already counted
-        # its tokens as hits, so they are reported as unspecified.
+        # the load fails, and the scheduler recomputes or fails the request,
+        # per `kv_load_failure_policy`. The scheduler has already counted the
+        # tokens as hits, so they are reported as unspecified.
         tokens_by_source = self._load_spec(request.request_id).tokens_by_source
         return split_external_hit(tokens_by_source or {}, num_external_tokens)
 
