@@ -13,9 +13,9 @@
 # limitations under the License.
 """Fused gated q split + QK RMS norm + RoPE for ``Qwen3NextAttention``.
 
-vLLM fuses these on CUDA only. Where the kernel was measured (the rule in
-:func:`maybe_install_qk_norm_rope_patch` and the per-device head counts in
-:func:`_unsupported_reason`, both from ``measured``), token buckets in
+vLLM fuses these on CUDA only. Where the kernel was measured (the rule
+``measured.maybe_install_fused_norm_kernels`` and the per-device head counts
+in :func:`_unsupported_reason`, both from ``measured``), token buckets in
 ``[MIN_ROWS, MAX_ROWS]`` run the ``qk_norm_rope_gate`` kernel, which tiles
 large row counts in VMEM, instead of the eager split, per-head norms and
 rope; buckets outside that range run the JAX reference inside the same custom
@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, cast
 import jax
 import torch
 from torch_tpu._internal import pallas
-from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5.kernels import measured
@@ -206,7 +206,9 @@ def install_qk_norm_rope_patch() -> None:
 
     Idempotent. Each layer arms the fused path at construction
     (:func:`_prebuild`) and keeps vLLM's eager path when the kernel cannot
-    compute it or was not measured at its head counts.
+    compute it or was not measured at its head counts. The patch is
+    class-wide, so the MTP draft's attention, built after the target's, takes
+    the fused path too.
     """
     from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
@@ -229,24 +231,3 @@ def install_qk_norm_rope_patch() -> None:
     setattr(_project_qkv_gate, _INSTALLED_ATTR, True)
     Qwen3NextAttention.__init__ = __init__
     Qwen3NextAttention._project_qkv_gate = _project_qkv_gate
-
-
-def maybe_install_qk_norm_rope_patch(model_config: ModelConfig | None) -> bool | None:
-    """Qwen3.5 rule: the engine the kernel was measured on
-    (``measured.is_measured_model``: Qwen3.5-397B-A17B on TPU7x) runs the fused
-    q/k norm + rope.
-
-    Registered as a model-specific patch (``patch_registry``). Returns False
-    until such a model config is available, so other models, including
-    Qwen3-Next, which shares ``Qwen3NextAttention``, and every other Qwen3.5
-    checkpoint or device, never install it and keep vLLM's eager path. The
-    patch is class-wide, so the MTP draft's attention, built after the
-    target's config is seen, takes the fused path too. A config without
-    architectures (the stand-ins callers hand the patch registry) is not a
-    Qwen3.5 config.
-    """
-    if not measured.is_measured_model(model_config):
-        return False
-    install_qk_norm_rope_patch()
-    logger.info("Applied TPU patch: Qwen3.5 fused q/k norm + rope.")
-    return None
