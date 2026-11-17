@@ -63,6 +63,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    PrequantLinearMethod,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -90,7 +91,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
+class VllmUnquantizedLinearMethod(UnquantizedLinearMethod, PrequantLinearMethod):
     """Dense linear on the canonical (k, n) weight layout.
 
     vLLM's stock `UnquantizedLinearMethod` runs `F.linear(x, W)` with `W`
