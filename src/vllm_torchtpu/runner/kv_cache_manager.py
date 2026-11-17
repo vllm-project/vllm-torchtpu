@@ -92,7 +92,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
-from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -1381,9 +1380,27 @@ class KVCacheManager:
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
+        # For hybrid models with spec decoding on the unified pool, keep a
+        # per-block device buffer of mamba read offsets (num_accepted - 1
+        # from each request's last verify step), indexed by manager block
+        # id. The GDN kernel reads a request's initial state from checkpoint
+        # `offset` of its state block, which is how rejected draft tokens
+        # are rolled back (by selecting the checkpoint of the last accepted
+        # token, never by copying state). The offsets follow the state
+        # block through the align-mode seed copies (see
+        # `_collect_mamba_state_seed_copies`).
+        if (
+            self.runner._unified_kv_layout
+            and kv_cache_config.has_mamba_layers
+            and self.runner.speculative_config is not None
+        ):
+            self.runner.mamba_slot_read_offsets = allocator.allocate(
+                (kv_cache_config.num_blocks,), torch.int32
+            )
+
         if self.runner._unified_kv_layout:
-            # Flush the zero fill of every cache above, pools and direct
-            # attention caches alike, before any compiled execution. PJRT
+            # Flush the zero fill of every array above (pools or direct attention
+            # caches, and the mamba read offsets) before any compiled execution. PJRT
             # only donates quiescent buffers: a pending write at enqueue time
             # makes every donated pool parameter fall back to a fresh
             # pool-sized output copy (a 2x-pool transient that OOMs at high
@@ -1419,24 +1436,6 @@ class KVCacheManager:
                 kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self.runner)
-
-        # For hybrid models with spec decoding on the unified pool, keep a
-        # per-block device buffer of mamba read offsets (num_accepted - 1
-        # from each request's last verify step), indexed by manager block
-        # id. The GDN kernel reads a request's initial state from checkpoint
-        # `offset` of its state block, which is how rejected draft tokens
-        # are rolled back (by selecting the checkpoint of the last accepted
-        # token, never by copying state). The offsets follow the state
-        # block through the align-mode seed copies (see
-        # `_collect_mamba_state_seed_copies`).
-        if (
-            self.runner._unified_kv_layout
-            and kv_cache_config.has_mamba_layers
-            and self.runner.speculative_config is not None
-        ):
-            self.runner.mamba_slot_read_offsets = torch.zeros(
-                kv_cache_config.num_blocks, dtype=torch.int32
-            ).to(self.runner.device)
 
         if not self.runner.enforce_eager:
             self.runner._precompile_substitute_placeholder_token()
@@ -1621,6 +1620,10 @@ class KVCacheManager:
             for module in self.runner.vllm_config.compilation_config.static_forward_context.values()  # noqa: E501
         )
 
+        # Every array below is zero-filled on the device and flushed once,
+        # after the allocation loop.
+        allocator = DeviceKVCacheAllocator(self.runner.device)
+
         # ---- Block-major KV Cache Initialization (VLLM_TPU_BLOCK_MAJOR_KV) ----
         # Bundles all attention layer fragments into a single contiguous array in HBM:
         #   [num_blocks, num_layers, page_size, K2/p, p, head_dim]
@@ -1705,15 +1708,13 @@ class KVCacheManager:
             )[1:]
             page_bytes = math.prod(page_shape) * sample_spec.dtype.itemsize
             indices = block_major_layer_indices(kv_cache_config, page_bytes)
-            bundle = torch.zeros(
+            bundle = allocator.allocate(
                 (kv_cache_config.num_blocks, len(set(indices.values())), *page_shape),
-                dtype=sample_spec.dtype,
-                device=self.runner.device,
+                sample_spec.dtype,
             )
             # Kernels donate the full bundle; views serve metadata and DMA
             # registration, retaining the native descriptor's byte offsets.
             self.runner._kv_cache_bundle = bundle
-            synchronize_tensors(bundle, wait=True)
             for name, index in indices.items():
                 self.runner._kv_cache_bundle_layer_index[name] = index
                 bundle_view_by_name[name] = bundle[:, index]
@@ -1723,9 +1724,6 @@ class KVCacheManager:
                 bundle.dtype,
             )
 
-        # Every cache below is zero-filled on the device and flushed once,
-        # after the allocation loop.
-        allocator = DeviceKVCacheAllocator(self.runner.device)
         if _is_ds_v4:
             self.ds_v4._initialize_ds_v4_kv_cache(
                 kv_cache_config,
@@ -1924,10 +1922,29 @@ class KVCacheManager:
                 else:
                     raise NotImplementedError
 
-        # torch_tpu defers a device zero-fill until first use. Flush every cache
-        # allocated above, the DeepSeek-V4 arrays included, so the precompile
-        # below sees them in HBM, as the unified path flushes its pool (where
-        # PJRT donates only buffers with no pending write).
+        # Compact pool counterpart of the read-offset buffer allocated in
+        # `_initialize_unified_kv_cache`, indexed over the mamba slot pool
+        # rather than the unified pool's blocks: here checkpoint `offset` of a
+        # request is the slot `base_slot + offset`.
+        if (
+            allocated_mamba_num_blocks is not None
+            and self.runner.speculative_config is not None
+        ):
+            if self.runner._uniform_mamba_layout:
+                raise NotImplementedError(
+                    "Speculative decoding with mamba layers requires the "
+                    "compact mamba slot layout (unsupported with "
+                    "kv_transfer_config / uniform mamba layout)."
+                )
+            self.runner.mamba_slot_read_offsets = allocator.allocate(
+                (allocated_mamba_num_blocks,), torch.int32
+            )
+
+        # torch_tpu defers a device zero-fill until first use. Flush every array
+        # allocated above (the block-major bundle, the DeepSeek-V4 arrays and
+        # the mamba read offsets included) so the precompile below sees them in
+        # HBM, as the unified path flushes its pool (where PJRT donates only
+        # buffers with no pending write).
         allocator.synchronize()
 
         self._add_shared_kv_cache_aliases(kv_caches)
@@ -2020,24 +2037,6 @@ class KVCacheManager:
             self.runner._init_mamba_slot_pool(allocated_mamba_num_blocks)
             owns_mamba_slots = True
         check_runner_slot_groups(kv_cache_config, runner_owns_slots=owns_mamba_slots)
-
-        # Compact pool counterpart of the read-offset buffer allocated in
-        # `initialize_kv_cache`, indexed over the mamba slot pool rather
-        # than the unified pool's blocks: here checkpoint `offset` of a
-        # request is the slot `base_slot + offset`.
-        if (
-            allocated_mamba_num_blocks is not None
-            and self.runner.speculative_config is not None
-        ):
-            if self.runner._uniform_mamba_layout:
-                raise NotImplementedError(
-                    "Speculative decoding with mamba layers requires the "
-                    "compact mamba slot layout (unsupported with "
-                    "kv_transfer_config / uniform mamba layout)."
-                )
-            self.runner.mamba_slot_read_offsets = torch.zeros(
-                allocated_mamba_num_blocks, dtype=torch.int32
-            ).to(self.runner.device)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.

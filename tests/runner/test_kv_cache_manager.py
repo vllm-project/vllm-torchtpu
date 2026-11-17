@@ -247,6 +247,29 @@ def _mamba_config(vllm_config):
     )
 
 
+def _block_major_attention_config(vllm_config):
+    """Two full-attention layers in vLLM's block-outermost placement."""
+    spec = PallasAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+        )
+    )
+    layers = ["attn.0", "attn.1"]
+    num_blocks = 4
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_blocks * len(layers) * spec.page_size_bytes,
+                layers=layers,
+                layer_stride=spec.page_size_bytes,
+                block_stride=len(layers) * spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=layers, kv_cache_spec=spec)],
+    )
+
+
 def _unified_hybrid_config(vllm_config):
     """An attention layer and a Mamba layer in one unified pool."""
     attention = PallasAttentionBackend.customize_spec(
@@ -521,6 +544,77 @@ def test_initialize_unified_kv_cache_synchronizes_new_caches_once_before_binding
     synchronized = synchronize_mock.call_args.args[0]
     assert sorted(map(id, synchronized)) == sorted(map(id, _cache_arrays(caches)))
     assert {array.device.type for array in synchronized} == {"meta"}
+
+
+def test_initialize_kv_cache_allocates_the_block_major_bundle_once(
+    meta_runner, synchronize_mock
+):
+    """The block-major bundle comes from the allocator: it is created on the
+    device, not staged on the host, and synchronized in the one synchronize,
+    before any layer is bound to a view of it."""
+    # The block-major gates read parallel_config and model_config.
+    meta_runner.parallel_config = meta_runner.vllm_config.parallel_config
+    meta_runner.model_config = MagicMock()
+    meta_runner.kv_cache_dtype = torch.bfloat16
+    synchronize_mock.side_effect = _assert_not_bound_yet
+
+    with (
+        patch("vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV", True),
+        _RecordHostTensors() as host,
+    ):
+        caches = _initialize_kv_cache(
+            meta_runner, _block_major_attention_config(meta_runner.vllm_config)
+        )
+
+    bundle = meta_runner._kv_cache_bundle
+    assert bundle.device.type == "meta"
+    assert all(cache._base is bundle for cache in caches.values())
+    synchronize_mock.assert_called_once()
+    assert list(map(id, synchronize_mock.call_args.args[0])) == [id(bundle)]
+    assert max(host.nbytes, default=0) < bundle.nbytes // bundle.shape[0]
+
+
+@pytest.mark.parametrize("unified", [False, True])
+def test_initialize_kv_cache_allocates_mamba_read_offsets_with_the_caches(
+    meta_runner, synchronize_mock, unified
+):
+    """With speculative decoding, the Mamba read offsets come from the
+    caches' allocator: created on the device and synchronized with them,
+    before binding."""
+    meta_runner.speculative_config = MagicMock()
+    if unified:
+        meta_runner._unified_kv_layout = True
+        meta_runner._resolve_tpu_group_backend.return_value = PallasAttentionBackend
+        meta_runner.kv_cache_dtype = torch.bfloat16
+        config = _unified_hybrid_config(meta_runner.vllm_config)
+    else:
+        config = _mamba_config(meta_runner.vllm_config)
+    synchronize_mock.side_effect = _assert_not_bound_yet
+
+    caches = _initialize_kv_cache(meta_runner, config)
+
+    offsets = meta_runner.mamba_slot_read_offsets
+    assert offsets.device.type == "meta"
+    assert offsets.dtype == torch.int32
+    assert tuple(offsets.shape) == (config.num_blocks,)
+    synchronize_mock.assert_called_once()
+    synchronized = synchronize_mock.call_args.args[0]
+    expected = [*_cache_arrays(caches), offsets]
+    assert sorted(map(id, synchronized)) == sorted(map(id, expected))
+
+
+def test_initialize_kv_cache_rejects_spec_decode_on_uniform_mamba_layout(
+    meta_runner, synchronize_mock
+):
+    """The uniform Mamba layout has no slot pool to index read offsets by,
+    so initialization fails before anything is synchronized or bound."""
+    meta_runner.speculative_config = MagicMock()
+    meta_runner._uniform_mamba_layout = True
+
+    with pytest.raises(NotImplementedError, match="compact mamba slot layout"):
+        _initialize_kv_cache(meta_runner, _mamba_config(meta_runner.vllm_config))
+
+    synchronize_mock.assert_not_called()
 
 
 @pytest.mark.tpu_test
