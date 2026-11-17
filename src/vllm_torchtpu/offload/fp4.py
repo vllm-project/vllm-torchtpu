@@ -399,11 +399,14 @@ class Fp4Transcoder:
         for b in BUCKETS:
             self.quantize([(0, i) for i in range(b)])
             self.dequantize([(b - 1, 0)] * b)
-            # Run them now (execution is lazy): a program that cannot load fails
-            # here, attributed to its bucket, not in a later reader of the pool.
-            for r, pool in self.pools.items():
-                pool[:1, :1].cpu()
-                self.staging[r][:1, :1].cpu()
+            # Run them now (execution is deferred): a program that cannot load fails
+            # here, attributed to its bucket. Sync the whole tensors (as
+            # pooled_cache does), never a slice: a slice read joined the deferred
+            # writeback into a program that kept the pool alive, and the copy_ became
+            # a 30 GiB copy (j-b32f9066-e0ee-48cc-91cc).
+            from vllm_torchtpu.utils import synchronize_tensors
+
+            synchronize_tensors(list(self.pools.values()) + list(self.staging.values()))
             logger.info("offload fp4: bucket %d programs ran", b)
         return self.selftest()
 
