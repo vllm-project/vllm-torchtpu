@@ -32,10 +32,12 @@ The upstream modules are real instances built without their `__init__`
 import contextlib
 import dataclasses
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config.compilation import CompilationMode
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
@@ -378,16 +380,66 @@ def test_schedules_prefill(q_lens, expected):
     assert schedules_prefill(q_lens, num_speculative_tokens=3) is expected
 
 
+@pytest.fixture(autouse=True)
+def _measured_chip(monkeypatch):
+    """The dispatch table is measured on TPU7x: build there, without asking
+    the host which chip it is."""
+    monkeypatch.setattr(
+        mtp_kv_only, "get_chip_version", lambda: pltpu.ChipVersion.TPU_7X
+    )
+
+
+@pytest.fixture
+def fixed_gate(monkeypatch):
+    """Dispatch on `MtpKvOnlyStep0.min_tokens` alone, as if every loop
+    bucket's measured threshold were below it."""
+    monkeypatch.setattr(mtp_kv_only, "two_pass_min_tokens", lambda loop_bucket: 0)
+
+
+def test_two_pass_min_tokens_reads_the_table(monkeypatch):
+    monkeypatch.setattr(mtp_kv_only, "_TWO_PASS_MIN_TOKENS", {16: 256, 64: 512})
+    log = MagicMock()
+    monkeypatch.setattr(mtp_kv_only.logger, "info_once", log)
+    assert mtp_kv_only.two_pass_min_tokens(16) == 256
+    assert mtp_kv_only.two_pass_min_tokens(64) == 512
+    assert log.call_count == 0
+    # Between entries, and below the smallest: the next larger entry's
+    # threshold (a smaller p only makes pass 2 cheaper), so it never falls
+    # as p grows.
+    assert mtp_kv_only.two_pass_min_tokens(24) == 512
+    assert mtp_kv_only.two_pass_min_tokens(8) == 256
+    # Above the largest: its T/p, rounded up.
+    assert mtp_kv_only.two_pass_min_tokens(96) == 768
+    # Each miss names its loop bucket, the threshold and the entry it used.
+    assert [c.args[1:] for c in log.call_args_list] == [
+        (24, 512, 64),
+        (8, 256, 16),
+        (96, 768, 64),
+    ]
+
+
+def test_takes_two_pass_needs_the_loop_buckets_threshold(monkeypatch):
+    monkeypatch.setattr(mtp_kv_only, "_TWO_PASS_MIN_TOKENS", {16: 64, 32: 256})
+    step0 = MtpKvOnlyStep0(object(), 64, object())
+    assert step0.takes_two_pass(64, 16, True)
+    assert not step0.takes_two_pass(32, 16, True)  # below the p=16 threshold
+    assert not step0.takes_two_pass(128, 32, True)  # below the p=32 threshold
+    assert step0.takes_two_pass(256, 32, True)
+    assert not step0.takes_two_pass(4096, 16, False)  # verify only
+
+
 def _gate_proposer(min_tokens=8):
     proposer = make_proposer(method="mtp")
     proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner.num_tokens_paddings = [8, 16, 32]
     proposer._mtp_kv_only = MtpKvOnlyStep0(object(), min_tokens, object())
     return proposer
 
 
 def _qsl(q_lens):
     return SimpleNamespace(
-        query_start_loc_np=np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+        num_reqs=len(q_lens),
+        query_start_loc_np=np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32),
     )
 
 
@@ -400,9 +452,26 @@ def _qsl(q_lens):
         ([4, 4, 4, 4], 16, False),  # verify only
     ],
 )
-def test_takes_two_pass_step0_gate(q_lens, num_tokens, expected):
+def test_takes_two_pass_step0_gate(fixed_gate, q_lens, num_tokens, expected):
     proposer = _gate_proposer()
     assert proposer._takes_two_pass_step0(_qsl(q_lens), num_tokens) is expected
+
+
+def test_takes_two_pass_step0_reads_the_chunks_loop_bucket(monkeypatch):
+    # The real table lookup: p is the token bucket the chunk's requests pad to.
+    monkeypatch.setattr(mtp_kv_only, "_TWO_PASS_MIN_TOKENS", {8: 16, 16: 32})
+    proposer = _gate_proposer()
+    three = _qsl([4, 6, 5])  # p = 8
+    nine = [1] * 8  # with one prefill span below, p = 16
+    assert proposer._takes_two_pass_step0(three, 16) is True
+    assert proposer._takes_two_pass_step0(_qsl([*nine, 8]), 16) is False
+    assert proposer._takes_two_pass_step0(_qsl([*nine, 24]), 32) is True
+    assert proposer.takes_two_pass_prefill(16, 3) is True
+    assert proposer.takes_two_pass_prefill(16, 9) is False
+    assert proposer.takes_two_pass_prefill(32, 9) is True
+    with proposer.single_pass_step0():
+        assert proposer._takes_two_pass_step0(three, 16) is False
+    assert proposer._takes_two_pass_step0(three, 16) is True
 
 
 def test_takes_two_pass_step0_needs_the_switch():
@@ -475,14 +544,17 @@ def _patch_builder(monkeypatch, reason=None, raises=False):
 def test_build_compiles_only_the_buckets_it_dispatches(monkeypatch):
     proposer = _build_proposer()
     built = _patch_builder(monkeypatch)
+    monkeypatch.setattr(mtp_kv_only, "_TWO_PASS_MIN_TOKENS", {16: 64, 32: 128})
     logs = []
     monkeypatch.setattr(
         mtp_kv_only.logger, "info", lambda msg, *args: logs.append(msg % args)
     )
     step0 = MtpKvOnlyStep0.build(proposer, _attn_layers())
-    # One token above the largest loop bucket (32).
-    assert step0.min_tokens == 33
-    assert step0.takes_two_pass(33, True) and not step0.takes_two_pass(32, True)
+    # The loop buckets reach 32 (max_num_reqs 32); the smallest threshold
+    # among them is p=16's.
+    assert step0.min_tokens == 64
+    assert step0.takes_two_pass(64, 16, True) and not step0.takes_two_pass(64, 32, True)
+    assert step0.takes_two_pass(128, 32, True)
     (kwargs,) = built
     assert step0.model is not None
     config = kwargs["vllm_config"]
@@ -494,7 +566,7 @@ def test_build_compiles_only_the_buckets_it_dispatches(monkeypatch):
     assert kwargs["mesh"] is proposer.runner.mesh
     assert kwargs["prefix"] == "mtp_prefill_kv_only"
     (log,) = logs
-    assert ">= 33 padded tokens" in log
+    assert "from 64 padded tokens" in log
 
 
 def test_set_draft_compile_sizes_keeps_the_kv_only_copy_at_its_gate(monkeypatch):
@@ -542,13 +614,14 @@ def test_kv_only_missing_buckets_is_empty_while_the_switch_is_off():
         ("unsupported", "not DSA"),
         ("two_mla_layers", "not one of each"),
         ("no_indexer_cache", "not one of each"),
-        ("loop_bucket_is_the_largest", "the largest is 4096"),
+        ("no_bucket_reaches_it", "no token bucket reaches 8192 tokens"),
+        ("unmeasured_chip", "dispatch table is measured on TPU7x, not v6e"),
     ],
 )
-def test_build_refusals_raise(monkeypatch, setup, message):
-    """The switch is explicit: a draft or layout that cannot take the
-    two-pass step 0 raises at load instead of keeping the single pass. (The
-    draft method and PCP are refused before load, by the platform.)"""
+def test_build_keeps_the_single_pass(monkeypatch, setup, message):
+    """A draft or layout that cannot take the two-pass step 0 (or no token
+    bucket where it would pay off) keeps the single pass and says why. (The
+    draft method and PCP are decided before load, by the platform.)"""
     proposer = _build_proposer()
     built = _patch_builder(
         monkeypatch, reason="not DSA" if setup == "unsupported" else None
@@ -560,17 +633,20 @@ def test_build_refusals_raise(monkeypatch, setup, message):
     proposer._draft_attn_layer_names = set(layers)
     if setup == "kv_shared":
         proposer._draft_kv_shared = True
-    if setup == "loop_bucket_is_the_largest":
-        # max_num_reqs pads to the largest bucket, so no chunk could ever
-        # reach the gate one past it.
-        proposer.runner.max_num_reqs = 4096
-    # A draft or layout it does not support yet is NotImplementedError; a
-    # bucket set that cannot reach the gate is a bad value.
-    error = ValueError if setup == "loop_bucket_is_the_largest" else NotImplementedError
-    with pytest.raises(error, match="TPU_MTP_KV_ONLY_STEP0 is set") as e:
-        MtpKvOnlyStep0.build(proposer, layers)
-    assert message in str(e.value)
-    # Every refusal is decided before the op is built (and registered).
+    if setup == "no_bucket_reaches_it":
+        monkeypatch.setattr(mtp_kv_only, "_TWO_PASS_MIN_TOKENS", {16: 8192})
+    if setup == "unmeasured_chip":
+        monkeypatch.setattr(
+            mtp_kv_only, "get_chip_version", lambda: pltpu.ChipVersion.TPU_V6E
+        )
+    logs = []
+    monkeypatch.setattr(
+        mtp_kv_only.logger, "info", lambda msg, *args: logs.append(msg % args)
+    )
+    assert MtpKvOnlyStep0.build(proposer, layers) is None
+    (log,) = logs
+    assert "keeps the single pass" in log and message in log
+    # Decided before the op is built (and registered).
     assert built == []
 
 
@@ -579,7 +655,8 @@ def test_build_under_ep_dp_lockstep(monkeypatch):
     proposer = _build_proposer()
     built = _patch_builder(monkeypatch)
     proposer._dp_lockstep_sharded = lambda: True
-    assert MtpKvOnlyStep0.build(proposer, _attn_layers()).min_tokens == 33
+    step0 = MtpKvOnlyStep0.build(proposer, _attn_layers())
+    assert step0 is not None
     assert len(built) == 1
 
 
@@ -595,7 +672,8 @@ def test_build_error_propagates(monkeypatch):
 def test_precompile_gather_rows_warms_every_shape_the_two_passes_take(
     monkeypatch,
 ):
-    """T: every token bucket at or above the gate; p: every loop bucket."""
+    """Every (T, p) the table selects: T a token bucket, p a loop bucket."""
+    monkeypatch.setattr(mtp_kv_only, "_TWO_PASS_MIN_TOKENS", {16: 1024, 32: 4096})
     proposer = make_proposer(method="mtp")
     proposer.runner = SimpleNamespace(
         num_tokens_paddings=[16, 32, 64, 128, 1024, 4096],
@@ -615,7 +693,6 @@ def test_precompile_gather_rows_warms_every_shape_the_two_passes_take(
     MtpKvOnlyStep0(object(), 1024, object()).precompile_gather_rows(proposer)
     assert [(x[0], idx[0]) for x, _, _, idx in seen] == [
         (1024, 16),
-        (1024, 32),
         (4096, 16),
         (4096, 32),
     ]
@@ -946,6 +1023,14 @@ _CHUNK0 = [
     _ReqSpec("r1", 0, 6, 0, (13,), (13, -1, -1, -1)),
     _ReqSpec("r2", 3, 5, discard=True),
 ]
+# A prefill-only chunk (16 padded tokens), as a prefill-only producer drafts
+# it with K = 1: two prompts complete (6 tokens at positions 0..5, 5 tokens at
+# 4..8) and an intermediate chunk (4 tokens at 3..6) is discarded.
+_PREFILL_CHUNK = [
+    _ReqSpec("p0", 0, 6, 0, (13,)),
+    _ReqSpec("p1", 4, 5, 0, (14,)),
+    _ReqSpec("p2", 3, 4, discard=True),
+]
 # Chunk 1 (8 tokens, below the gate -> single pass): two verify requests.
 _CHUNK1 = [
     _ReqSpec("r3", 4, 4, 1, (21, 22, 23), (21, 22, 23, -1), 3),
@@ -1010,8 +1095,8 @@ def _chunk(specs, start, padded, request_width=None):
 REQUEST_WIDTH = KNR + 2
 
 
-def _scenario(mode: str, num_chunks: int):
-    chunk_specs = [_CHUNK0, _CHUNK1][:num_chunks]
+def _scenario(mode: str, num_chunks: int, chunk_specs=None):
+    chunk_specs = chunk_specs or [_CHUNK0, _CHUNK1][:num_chunks]
     specs = [sp for cs in chunk_specs for sp in cs]
     width = REQUEST_WIDTH if mode == "async_padded" else None
     chunks, start = [], 0
@@ -1078,6 +1163,8 @@ def _run(
     mode: str,
     num_chunks: int = 1,
     loop: str = "indexshare",
+    num_spec: int = 3,
+    chunk_specs=None,
 ):
     import torch._dynamo
 
@@ -1089,9 +1176,11 @@ def _run(
         monkeypatch.setattr(
             e3.Eagle3Proposer, name, _eager_body(getattr(e3.Eagle3Proposer, name))
         )
-    chunks, requests, kwargs, prefix_lens, specs = _scenario(mode, num_chunks)
+    chunks, requests, kwargs, prefix_lens, specs = _scenario(
+        mode, num_chunks, chunk_specs
+    )
     world = _ToyWorld(len(specs), 24, prefix_lens)
-    K = 3
+    K = num_spec
 
     proposer = make_proposer(method="mtp")
     proposer.speculative_config.num_speculative_tokens = K
@@ -1160,7 +1249,9 @@ def _run(
 @pytest.mark.parametrize("loop", ["indexshare", "separate", "fused"])
 @pytest.mark.parametrize("num_chunks", [1, 2])
 @pytest.mark.parametrize("mode", ["sync", "async", "async_padded"])
-def test_two_pass_step0_matches_the_single_pass(monkeypatch, mode, num_chunks, loop):
+def test_two_pass_step0_matches_the_single_pass(
+    fixed_gate, monkeypatch, mode, num_chunks, loop
+):
     opts = dict(mode=mode, num_chunks=num_chunks, loop=loop)
     ref = _run(monkeypatch, two_pass=False, **opts)
     new = _run(monkeypatch, two_pass=True, **opts)
@@ -1196,6 +1287,23 @@ def test_two_pass_step0_matches_the_single_pass(monkeypatch, mode, num_chunks, l
     # The last chunk's per-request top-k rows (IndexShare) are the same.
     num_last = len(_CHUNK0 if num_chunks == 1 else _CHUNK1)
     assert torch.equal(new.world.topk_buf[:num_last], ref.world.topk_buf[:num_last])
+
+
+def test_two_pass_step0_matches_the_single_pass_with_one_draft_token(
+    fixed_gate, monkeypatch
+):
+    """K = 1, as a prefill-only producer drafts: step 0 and no loop step."""
+    opts = dict(mode="sync", loop="separate", num_spec=1, chunk_specs=[_PREFILL_CHUNK])
+    ref = _run(monkeypatch, two_pass=False, **opts)
+    new = _run(monkeypatch, two_pass=True, **opts)
+    assert ref.kv_only_calls == 0
+    assert ref.world.step0_rows_seen == [16]
+    assert new.kv_only_calls == 1
+    assert new.world.kv_only_rows_seen == [15]
+    assert new.world.step0_rows_seen == [4]
+    assert new.drafts == ref.drafts
+    assert torch.equal(new.world.kv, ref.world.kv)
+    assert torch.equal(new.world.idx, ref.world.idx)
 
 
 # ---------------------------------------------------------------------------
@@ -1364,7 +1472,7 @@ def _expected_trace(bucket, num_chunks, two_pass, p=4):
     ],
 )
 def test_lockstep_idle_ranks_replay_the_busy_ranks_programs(
-    monkeypatch, q_lens, bucket, any_prefill, two_pass
+    fixed_gate, monkeypatch, q_lens, bucket, any_prefill, two_pass
 ):
     """Collectives pair across EP-DP ranks in emission order, so a busy
     rank (one real chunk and one padding chunk) and an idle rank (two
@@ -1386,7 +1494,7 @@ def test_lockstep_idle_ranks_replay_the_busy_ranks_programs(
     assert idle == busy
 
 
-def test_lockstep_decision_ignores_the_chunks_own_prefill(monkeypatch):
+def test_lockstep_decision_ignores_the_chunks_own_prefill(fixed_gate, monkeypatch):
     """A rank whose own chunk prefills follows the DP-wide bit too: it is
     set whenever this rank prefills, so a False here is only reachable in
     this test, and the chunk keeps the single pass like its peers."""
@@ -1396,6 +1504,23 @@ def test_lockstep_decision_ignores_the_chunks_own_prefill(monkeypatch):
     assert proposer._takes_two_pass_step0(_busy_chunk([4, 6, 5], 16), 16) is False
     proposer.runner._dp_step_any_prefill = True
     assert proposer._takes_two_pass_step0(_busy_chunk([4, 4, 4], 16), 16) is True
+
+
+def test_lockstep_decision_reads_the_dp_wide_loop_bucket(monkeypatch):
+    """Under lockstep p is the step's DP-wide loop bucket, not the chunk's:
+    a peer with more requests raises the threshold on every rank."""
+    monkeypatch.setattr(mtp_kv_only, "_TWO_PASS_MIN_TOKENS", {4: 16, 16: 32})
+    proposer, _ = _lockstep_proposer(
+        monkeypatch, bucket=16, any_prefill=True, num_chunks=1
+    )
+    chunk = _busy_chunk([4, 6, 5], 16)
+    assert proposer._takes_two_pass_step0(chunk, 16) is True  # p = 4
+    proposer.runner._dp_step_max_reqs = 9  # a peer's chunk: p = 16
+    assert proposer._takes_two_pass_step0(chunk, 16) is False
+    assert proposer._dp_two_pass_step0() is False
+    proposer.runner._dp_step_max_reqs = 3
+    with proposer.single_pass_step0():
+        assert proposer._dp_two_pass_step0() is False
 
 
 # ---------------------------------------------------------------------------

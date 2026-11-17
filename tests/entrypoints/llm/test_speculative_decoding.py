@@ -2459,7 +2459,7 @@ KV_ONLY_MAX_TOKENS = 24
 # Generous for one engine's build, warmup and generate.
 KV_ONLY_CHILD_TIMEOUT_S = 480
 KV_ONLY_DP_SIZE = 2
-KV_ONLY_BUILT_LOG = "MTP draft step 0 of chunks with"
+KV_ONLY_BUILT_LOG = "with a prefill span runs a KV-only pass over every row"
 # Logged (at debug level) each time a padding chunk replays the two passes.
 KV_ONLY_REPLAY_LOG = "replaying the two-pass draft step 0"
 KV_ONLY_PROPOSER_LOGGER = "vllm.vllm_torchtpu.spec_decode.eagle3"

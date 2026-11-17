@@ -46,10 +46,10 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
     _validate_lora_config,
-    _validate_mtp_kv_only_step0,
     _validate_peer_replay_config,
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
+    mtp_kv_only_step0_config_reason,
 )
 
 
@@ -1043,9 +1043,9 @@ class TestTpuPlatform:
         assert get_device_name() == expected_name
 
 
-class TestMtpKvOnlyStep0ConfigValidation:
-    """TPU_MTP_KV_ONLY_STEP0 on a configuration that cannot take the two-pass
-    draft step 0 is refused before any weights load."""
+class TestMtpKvOnlyStep0ConfigReason:
+    """Which configurations keep the MTP draft's single step-0 pass, decided
+    before any weights load (TPU_MTP_KV_ONLY_STEP0 is on by default)."""
 
     @staticmethod
     def _config(method="mtp"):
@@ -1055,26 +1055,29 @@ class TestMtpKvOnlyStep0ConfigValidation:
         )
         return vllm_config
 
-    def test_off_accepts_any_configuration(self, monkeypatch):
+    def test_an_mtp_draft_without_pcp_may_take_the_two_passes(self, monkeypatch):
         monkeypatch.delenv("TPU_MTP_KV_ONLY_STEP0", raising=False)
-        _validate_mtp_kv_only_step0(self._config("eagle3"), pcp_enabled=True)
+        assert mtp_kv_only_step0_config_reason(self._config(), False) is None
 
-    def test_mtp_without_pcp_passes(self, monkeypatch):
-        monkeypatch.setenv("TPU_MTP_KV_ONLY_STEP0", "1")
-        _validate_mtp_kv_only_step0(self._config(), pcp_enabled=False)
+    def test_the_kill_switch_keeps_the_single_pass(self, monkeypatch):
+        monkeypatch.setenv("TPU_MTP_KV_ONLY_STEP0", "0")
+        reason = mtp_kv_only_step0_config_reason(self._config(), False)
+        assert reason == "TPU_MTP_KV_ONLY_STEP0 is 0"
 
     @pytest.mark.parametrize(
         "method, message", [("eagle3", "'eagle3'"), (None, "None")]
     )
-    def test_a_draft_other_than_mtp_is_refused(self, monkeypatch, method, message):
-        monkeypatch.setenv("TPU_MTP_KV_ONLY_STEP0", "1")
-        with pytest.raises(NotImplementedError, match=f"draft method is {message}"):
-            _validate_mtp_kv_only_step0(self._config(method), pcp_enabled=False)
+    def test_a_draft_other_than_mtp_keeps_the_single_pass(
+        self, monkeypatch, method, message
+    ):
+        monkeypatch.delenv("TPU_MTP_KV_ONLY_STEP0", raising=False)
+        reason = mtp_kv_only_step0_config_reason(self._config(method), False)
+        assert reason == f"the draft method is {message}"
 
-    def test_prefill_context_parallelism_is_refused(self, monkeypatch):
-        monkeypatch.setenv("TPU_MTP_KV_ONLY_STEP0", "1")
-        with pytest.raises(NotImplementedError, match="prefill context parallelism"):
-            _validate_mtp_kv_only_step0(self._config(), pcp_enabled=True)
+    def test_prefill_context_parallelism_keeps_the_single_pass(self, monkeypatch):
+        monkeypatch.delenv("TPU_MTP_KV_ONLY_STEP0", raising=False)
+        reason = mtp_kv_only_step0_config_reason(self._config(), True)
+        assert reason == "prefill context parallelism is on"
 
 
 class TestPhasedProfilingConfigValidation:

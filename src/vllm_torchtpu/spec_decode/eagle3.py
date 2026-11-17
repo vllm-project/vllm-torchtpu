@@ -42,6 +42,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.platforms.tpu_platform import mtp_kv_only_step0_config_reason
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -338,6 +339,9 @@ class Eagle3Proposer:
         # (see mtp_kv_only.py). Built in load_model; None keeps the single
         # full step-0 pass.
         self._mtp_kv_only: MtpKvOnlyStep0 | None = None
+        # Set while a warmup runs the single pass on shapes the two passes
+        # would otherwise take (`single_pass_step0`).
+        self._single_pass_step0 = False
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -409,7 +413,10 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
-        if envs.TPU_MTP_KV_ONLY_STEP0:
+        if (
+            mtp_kv_only_step0_config_reason(self.vllm_config, self.runner._pcp_enabled)
+            is None
+        ):
             from vllm_torchtpu.spec_decode.mtp_kv_only import MtpKvOnlyStep0
 
             self._mtp_kv_only = MtpKvOnlyStep0.build(self, all_attn_layers)
@@ -756,6 +763,24 @@ class Eagle3Proposer:
         (TPU_MTP_KV_ONLY_STEP0)."""
         return self._mtp_kv_only is not None
 
+    def takes_two_pass_prefill(self, num_tokens: int, num_reqs: int) -> bool:
+        """Whether a step 0 of `num_tokens` padded tokens over `num_reqs`
+        requests with a prefill span takes the two passes."""
+        return self._mtp_kv_only is not None and self._mtp_kv_only.takes_two_pass(
+            num_tokens, self._loop_bucket(num_reqs), carries_prefill=True
+        )
+
+    @contextlib.contextmanager
+    def single_pass_step0(self):
+        """Run every draft step 0 as the single pass. The warmup's
+        single-request specs warm the draft at p = T this way, where the two
+        passes would run it at a smaller p."""
+        self._single_pass_step0 = True
+        try:
+            yield
+        finally:
+            self._single_pass_step0 = False
+
     def kv_only_missing_buckets(self, target_buckets: Iterable[int]) -> list[int]:
         """Target token buckets the two-pass step 0 can run at but its
         KV-only pass has no compiled graph for; empty while it is off."""
@@ -779,7 +804,7 @@ class Eagle3Proposer:
         scheduler output, decides the same way. Under EP-DP lockstep the
         decision is the step's, the same for every DP rank and chunk.
         """
-        if self._mtp_kv_only is None:
+        if self._mtp_kv_only is None or self._single_pass_step0:
             return False
         if self._dp_lockstep_sharded():
             # Every chunk's step 0 is padded to the coordinated bucket.
@@ -790,6 +815,7 @@ class Eagle3Proposer:
             return self._dp_two_pass_step0()
         return self._mtp_kv_only.takes_two_pass(
             num_tokens,
+            self._loop_bucket(chunk.num_reqs),
             schedules_prefill(
                 np.diff(chunk.query_start_loc_np),
                 self.speculative_config.num_speculative_tokens,
@@ -801,18 +827,22 @@ class Eagle3Proposer:
         passes, on every chunk of every DP rank, padding chunks included.
 
         Decided from DP-wide values only, so every rank emits the same
-        programs in the same order: the coordinated token bucket and whether
-        any rank's step carries a prefill span, both from
+        programs in the same order: the coordinated token bucket, the step's
+        largest per-chunk request count (its loop bucket) and whether any
+        rank's step carries a prefill span, all from
         `TPUModelRunner._dp_coordinated_step`'s all-reduce. A chunk that
         takes the two passes without a prefill span of its own still gets
         the single pass's draft tokens and caches.
         """
         runner = self.runner
-        if self._mtp_kv_only is None:
+        if self._mtp_kv_only is None or self._single_pass_step0:
             return False
         assert runner._dp_target_bucket is not None
+        # Under lockstep the loop bucket is the step's DP-wide one.
         return self._mtp_kv_only.takes_two_pass(
-            runner._dp_target_bucket, runner._dp_step_any_prefill
+            runner._dp_target_bucket,
+            self._loop_bucket(runner._dp_step_max_reqs),
+            runner._dp_step_any_prefill,
         )
 
     def _run_kv_only_pass(

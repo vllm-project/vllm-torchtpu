@@ -46,6 +46,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
@@ -65,6 +66,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
@@ -278,6 +280,45 @@ class MtpKvOnlyModel(nn.Module):
         return hidden[:1]
 
 
+# The smallest padded step 0 (T tokens) that takes the two passes, per loop
+# bucket p (the token bucket its requests pad to). Measured on TPU v7x with a
+# one-layer GLM-5.2-dims draft (TP8, fp8 KV cache, K = 3) at an 8k-token
+# context, on steps with requests decoding while one more prefills (and, at
+# p = 16, one request prefilling alone): from each entry up, the two passes
+# were faster in every measured step. For p >= 32 the entry is the smallest T
+# measured, where they were already faster. At a 64k context the crossover was
+# no higher. A loop bucket above 256 keeps p = 256's T/p (extrapolated).
+_TWO_PASS_MIN_TOKENS: dict[int, int] = {16: 256, 32: 256, 64: 256, 128: 512, 256: 1024}
+
+
+def two_pass_min_tokens(loop_bucket: int) -> int:
+    """The smallest padded step 0 that takes the two passes when its requests
+    pad to `loop_bucket`.
+
+    A bucket the table does not list takes the next larger entry's threshold
+    (a smaller p only makes pass 2 cheaper), or, above the largest, that
+    entry's T/p.
+    """
+    table = _TWO_PASS_MIN_TOKENS
+    if loop_bucket in table:
+        return table[loop_bucket]
+    above = [p for p in table if p > loop_bucket]
+    if above:
+        p = min(above)
+        min_tokens = table[p]
+    else:
+        p = max(table)
+        min_tokens = -(-table[p] * loop_bucket // p)
+    logger.info_once(
+        "MTP two-pass draft step 0: no measured threshold for loop bucket %d; "
+        "taking the two passes from %d padded tokens (from p = %d's entry).",
+        loop_bucket,
+        min_tokens,
+        p,
+    )
+    return min_tokens
+
+
 def _sizes_at_or_above(sizes: Iterable[int | str], min_tokens: int) -> list[int | str]:
     """Pass 1's compile sizes: the draft's token buckets at or above the
     gate, the only ones `MtpKvOnlyStep0.takes_two_pass` dispatches."""
@@ -289,9 +330,9 @@ def _sizes_at_or_above(sizes: Iterable[int | str], min_tokens: int) -> list[int 
 def _layout_unsupported_reason(
     proposer: "Eagle3Proposer", all_attn_layers: dict[str, AttentionLayerBase]
 ) -> str | None:
-    """Why `proposer`'s loaded draft cannot take the two-pass step 0. The
-    configuration (draft method, PCP) is checked before any weights load, in
-    `TpuPlatform.check_and_update_config`."""
+    """Why `proposer`'s loaded draft cannot take the two-pass step 0 on this
+    chip. The configuration (draft method, PCP) is checked before any weights
+    load, in `TpuPlatform.check_and_update_config`."""
     if proposer._draft_kv_shared:
         return "the draft reads the target's KV cache"
     assert proposer.draft_model is not None
@@ -309,16 +350,21 @@ def _layout_unsupported_reason(
             f"the draft registered MLA layers {mla_names} and indexer caches "
             f"{indexer_names}, not one of each"
         )
+    chip = get_chip_version()
+    if chip is not pltpu.ChipVersion.TPU_7X:
+        return f"its dispatch table is measured on TPU7x, not {chip.value}"
     return None
 
 
 class MtpKvOnlyStep0:
     """What `TPU_MTP_KV_ONLY_STEP0` adds to `Eagle3Proposer`.
 
-    Pass 1's compiled program (`model`), the smallest padded step 0 that
-    takes the two passes (`min_tokens`), and the copy of the draft's config
-    pass 1 compiles under, whose `compile_sizes` keep only the buckets at or
-    above that gate. The proposer runs the two passes
+    Pass 1's compiled program (`model`), the smallest padded step 0 that can
+    take the two passes at any loop bucket the draft reaches (`min_tokens`),
+    and the copy of the draft's config pass 1 compiles under, whose
+    `compile_sizes` keep only the buckets at or above it. A step 0 takes the
+    two passes where `two_pass_min_tokens` says they beat the single pass
+    (`takes_two_pass`). The proposer runs them
     (`Eagle3Proposer._two_pass_step0`).
     """
 
@@ -334,35 +380,34 @@ class MtpKvOnlyStep0:
         cls,
         proposer: "Eagle3Proposer",
         all_attn_layers: dict[str, AttentionLayerBase],
-    ) -> "MtpKvOnlyStep0":
-        """Pass 1 for `proposer`'s loaded draft.
+    ) -> "MtpKvOnlyStep0 | None":
+        """Pass 1 for `proposer`'s loaded draft, or None when the draft or its
+        layout cannot take the two passes, or no token bucket would.
 
-        The switch is explicit, so a draft or layout that cannot take the
-        path raises, and so does a failed build: falling back on one rank
-        would leave it on the single pass while its TP peers run the two
-        passes, and their collectives would not match.
+        That decision depends only on the configuration and the draft's
+        structure, so every rank makes the same one. A build that fails
+        raises instead: falling back on one rank would leave it on the single
+        pass while its TP peers run the two passes, and their collectives
+        would not match.
         """
         runner = proposer.runner
         reason = _layout_unsupported_reason(proposer, all_attn_layers)
         if reason is not None:
-            raise NotImplementedError(
-                f"TPU_MTP_KV_ONLY_STEP0 is set, but {reason}. Unset it to keep "
-                "the single full draft step 0."
-            )
-        # A step 0 of at most the largest loop bucket is also a loop-step
-        # shape: the warmup's single-request specs at those sizes are what
-        # warm the draft at p = T, and the two passes would run it at a
-        # smaller p instead. Pass 2 at p ~ T would save nearly nothing there
-        # anyway.
-        min_tokens = proposer._max_loop_bucket() + 1
+            logger.info("MTP draft step 0 keeps the single pass: %s.", reason)
+            return None
+        loop_buckets = [
+            p for p in runner.num_tokens_paddings if p <= proposer._max_loop_bucket()
+        ]
+        min_tokens = min(two_pass_min_tokens(p) for p in loop_buckets)
         largest_bucket = max(runner.num_tokens_paddings)
         if min_tokens > largest_bucket:
-            raise ValueError(
-                f"TPU_MTP_KV_ONLY_STEP0 is set, but no token bucket reaches its "
-                f"{min_tokens}-token gate (the largest is {largest_bucket}). Raise "
-                "max_num_batched_tokens above the largest draft loop bucket, or "
-                "unset it."
+            logger.info(
+                "MTP draft step 0 keeps the single pass: no token bucket reaches "
+                "%d tokens (the largest is %d).",
+                min_tokens,
+                largest_bucket,
             )
+            return None
         assert proposer.draft_model is not None
         config = copy.copy(proposer.draft_vllm_config)
         config.compilation_config = copy.copy(config.compilation_config)
@@ -381,17 +426,22 @@ class MtpKvOnlyStep0:
                 mesh=runner.mesh,
             )
         logger.info(
-            "MTP draft step 0 of chunks with >= %d padded tokens and a prefill "
-            "span runs a KV-only pass over every row, then the full layer on "
-            "one row per request.",
+            "MTP draft step 0 of a chunk with a prefill span runs a KV-only pass "
+            "over every row, then the full layer on one row per request, from "
+            "%d padded tokens (more as the request count grows).",
             min_tokens,
         )
         return cls(model, min_tokens, config)
 
-    def takes_two_pass(self, num_tokens: int, carries_prefill: bool) -> bool:
-        """Whether a step 0 of `num_tokens` padded tokens takes the two
-        passes; verify-only steps keep the single pass."""
-        return carries_prefill and num_tokens >= self.min_tokens
+    def takes_two_pass(
+        self, num_tokens: int, loop_bucket: int, carries_prefill: bool
+    ) -> bool:
+        """Whether a step 0 of `num_tokens` padded tokens, whose requests pad
+        to `loop_bucket`, takes the two passes; verify-only steps keep the
+        single pass."""
+        return carries_prefill and num_tokens >= max(
+            self.min_tokens, two_pass_min_tokens(loop_bucket)
+        )
 
     def set_compile_sizes(self, draft_sizes: Iterable[int | str]) -> None:
         """Follow the draft's token buckets (the runner adds pipeline-chunk
@@ -415,10 +465,11 @@ class MtpKvOnlyStep0:
 
     def precompile_gather_rows(self, proposer: "Eagle3Proposer") -> None:
         """Warm pass 2's input gather (`_draft_gather_rows`) on every (T, p)
-        it can take: T a token bucket at or above the gate, p a loop bucket."""
+        the two passes take: T a token bucket, p a loop bucket, and
+        `takes_two_pass` true for them."""
         runner = proposer.runner
         max_loop_bucket = proposer._max_loop_bucket()
-        # p is always `_loop_bucket(num_reqs)`, a token padding below the gate.
+        # p is always `_loop_bucket(num_reqs)`, a token padding.
         idx_sizes = [t for t in runner.num_tokens_paddings if t <= max_loop_bucket]
         hidden_size = proposer._draft_hidden_size()
         with runner._precompile_timed("drafter two-pass gather_rows"):
@@ -434,6 +485,8 @@ class MtpKvOnlyStep0:
                     (num_tokens, hidden_size), dtype=runner._hidden_states_dtype
                 ).to(runner.device)
                 for p in idx_sizes:
+                    if not self.takes_two_pass(num_tokens, p, carries_prefill=True):
+                        continue
                     idx = torch.zeros(p, dtype=torch.int64).to(runner.device)
                     synchronize_tensors(
                         proposer._draft_gather_rows(ids, pos, hidden, idx)
