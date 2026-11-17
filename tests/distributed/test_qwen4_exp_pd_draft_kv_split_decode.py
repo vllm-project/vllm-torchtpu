@@ -7,7 +7,7 @@ decode whose compressed keys are split over the DCP ranks
 * The real StagedConsumer, built on all 8 ranks from the real pooled layout
   with his decode's layout flags (DCP4, VLLM_TPU_QSA_MTP_KV_DCP,
   VLLM_TPU_QSA_COMPRESSED_DCP, packed compressed keys, paired main KV off and
-  on): refuses F2 with the key off (test_qwen4_exp_decode_prefix_cache.py's
+  on, routed staging QWEN4_EXP_PD_ROUTED_DST off and on): refuses F2 with the key off (test_qwen4_exp_decode_prefix_cache.py's
   test_draft_kv_refuses_compressed_dcp, kept), builds with it on (that test
   inverted), stages the draft's three owners and logs the engagement line.
 * The decode emulation of test_qwen4_exp_decode_prefix_cache.py, its reads
@@ -58,6 +58,16 @@ def pack_main(request, monkeypatch):
     return request.param
 
 
+@pytest.fixture(params=["route_off", "route_his"])
+def routed(request, monkeypatch):
+    # His served legs run QWEN4_EXP_PD_ROUTED_DST=8:4:512 (TP8, DCP4, 512-token pages).
+    if request.param == "route_his":
+        monkeypatch.setenv("QWEN4_EXP_PD_ROUTED_DST", f"{TP}:{DCP}:{PAGE}")
+    else:
+        monkeypatch.delenv("QWEN4_EXP_PD_ROUTED_DST", raising=False)
+    return request.param
+
+
 def _consumers(ranks=range(TP)):
     import torch
 
@@ -88,7 +98,7 @@ def _consumers(ranks=range(TP)):
 
 
 @pytest.mark.usefixtures("engine_patches", "draft_kv", "compressed_dcp")
-def test_key_off_refuses_on_his_decode_layout(monkeypatch, pack_main):
+def test_key_off_refuses_on_his_decode_layout(monkeypatch, pack_main, routed):
     monkeypatch.delenv(KEY, raising=False)
     layout = scheduler_plan(decode_config())[0]
     assert _DRAFT + ".compressed_k" in layout.main_dcp_owners
@@ -97,7 +107,7 @@ def test_key_off_refuses_on_his_decode_layout(monkeypatch, pack_main):
 
 
 @pytest.mark.usefixtures("engine_patches", "draft_kv", "split_keys")
-def test_key_on_builds_every_rank_and_logs_the_engagement(monkeypatch, pack_main):
+def test_key_on_builds_every_rank_and_logs_the_engagement(monkeypatch, pack_main, routed):
     from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
 
     lines = []
@@ -115,6 +125,10 @@ def test_key_on_builds_every_rank_and_logs_the_engagement(monkeypatch, pack_main
         assert {_DRAFT, draft_ck, _DRAFT + ".raw_ring"} <= set(c._src_owner)
         assert draft_ck in c._dst_compressed and draft_ck in c._dcp_owners
         assert c._split_rank(draft_ck) is c.rank
+        # Routed staging engaged exactly when his route key is set.
+        assert (c.route is not None) == (routed == "route_his")
+        if c.route is not None:
+            assert (c.route.tp, c.route.dcp, c.route.dst_block) == (TP, DCP, PAGE)
     engaged = [m for m in lines if m.startswith("Qwen PD F2 draft KV split keys: rank ")]
     assert len(engaged) == TP and all(draft_ck in m and "DCP 4" in m for m in engaged)
 
