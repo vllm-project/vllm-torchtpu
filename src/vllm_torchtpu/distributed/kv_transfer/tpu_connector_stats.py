@@ -20,11 +20,16 @@ from typing import Any, cast
 import numpy as np
 from prometheus_client import Counter, Gauge, Histogram
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
     KVConnectorStats,
     PromMetric,
     PromMetricT,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
+    MultiKVConnectorStats,
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 
@@ -34,8 +39,35 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
     parse_raiden_metric_key,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.forward_metrics import FORWARD_METRICS, ForwardSample
 
 logger = init_logger(__name__)
+
+
+def attach_forward_metrics(
+    connector: KVConnectorBase_V1,
+    stats: KVConnectorStats | None,
+    samples: list[ForwardSample],
+) -> KVConnectorStats | None:
+    """Carry forward observations even when the connector has no KV events."""
+    if not samples:
+        return stats
+    if isinstance(connector, MultiConnector):
+        result = MultiKVConnectorStats()
+        for child in connector._connectors:
+            child_stats = attach_forward_metrics(child, None, samples)
+            if child_stats is not None:
+                result.data[child.__class__.__name__] = child_stats
+                break  # One carrier per worker; never duplicate observations.
+        if result.is_empty():
+            return stats
+        return result if stats is None else stats.aggregate(result)
+    leaf = connector.build_kv_connector_stats()
+    if not isinstance(leaf, TpuKVConnectorStats):
+        return stats
+    leaf.data["forward_samples"].extend(samples)
+    return leaf if stats is None else stats.aggregate(leaf)
+
 
 # Prometheus metric type constants
 METRIC_TYPE_HISTOGRAM = "histogram"
@@ -114,7 +146,9 @@ class TpuKVConnectorStats(KVConnectorStats):
 
     def reset(self):
         # Must be serializable
-        self.data: dict[str, list[float | int | tuple[str, str, float]]] = {
+        self.data: dict[
+            str, list[float | int | tuple[str, str, float] | ForwardSample]
+        ] = {
             "d2h_transfer_time": [],
             "h2d_transfer_time": [],
             "kv_pull_time": [],
@@ -124,6 +158,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
             "runner_device_elapsed_seconds": [],
+            "forward_samples": [],
         }
 
     def clone_and_reset(self) -> "TpuKVConnectorStats":
@@ -177,7 +212,9 @@ class TpuKVConnectorStats(KVConnectorStats):
             if h2d_transfer_time.size > 0
             else 0.0,
             "Num successful transfers": self.num_successful_transfers,
-            "Num failed transfers": self.data["num_failed_transfers"],
+            "Num failed transfers": sum(
+                cast(list[int], self.data["num_failed_transfers"])
+            ),
             "Avg KV pull time (ms)": round(kv_pull_time.mean(), 3)
             if kv_pull_time.size > 0
             else 0.0,
@@ -295,6 +332,15 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             buckets=RUNNER_TIMING_BUCKETS_SECONDS,
             labelnames=runner_labels,
         )
+        self.forward_metrics = {
+            name: self._histogram_cls(
+                name=f"vllm:tpu_forward_{name}",
+                documentation=description,
+                buckets=buckets,
+                labelnames=[*labelnames, "rank", "bucket"],
+            )
+            for name, (description, buckets) in FORWARD_METRICS.items()
+        }
         counter_tpu_num_failed_transfers = self._counter_cls(
             name="vllm:tpu_num_failed_transfers",
             documentation="Number of failed TPU KV Cache transfers.",
@@ -392,6 +438,10 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         engine_labels = self.per_engine_labelvalues[engine_idx]
+        for rank, bucket, name, value in transfer_stats_data.get("forward_samples", []):
+            self.forward_metrics[name].labels(*engine_labels, rank, bucket).observe(
+                value
+            )
         for rank, stage, seconds in transfer_stats_data.get(
             "runner_cpu_issue_seconds", []
         ):

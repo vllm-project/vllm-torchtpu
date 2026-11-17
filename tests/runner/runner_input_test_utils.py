@@ -53,6 +53,8 @@ def _make_runner(
 
     runner = SimpleNamespace()
     runner._stage_timing = MagicMock()
+    runner._forward_timing = MagicMock()
+    runner._forward_timing.take_forward_samples.return_value = []
     runner.device = torch.device("cpu")
     runner.most_model_len = None
     runner.num_reqs_max_model_len = target_num_reqs
