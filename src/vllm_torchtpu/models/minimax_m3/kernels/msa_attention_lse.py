@@ -68,6 +68,11 @@ _MAX_FREE_SCORE_BOUND = 75.0
 # key, the queries a one-hot of their token there.
 MXU_MASK = True
 _MASK_BIAS = 1e30
+# 4-bit calls of prefill size take their tokens' page limits from a table the
+# caller builds (`_page_limits`), spread over a group's slots by one matmul:
+# comparing every page against the tile's selections, with a lane reduction
+# each, cost ~12 % of a 4-bit 8-token call (r9 kernel bench j-ecb17102).
+LIMIT_TABLE = True
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -97,6 +102,7 @@ def _kernel(
     transposed: bool = False,
     steps_per_call: int | None = None,
     inline_issue: bool = False,
+    limited: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -127,10 +133,14 @@ def _kernel(
     output blocks hold those tiles. With `steps_per_call`, the grid runs
     several calls' steps back to back and ``b`` counts within the call."""
     fp4 = fp4_rows is not None
-    tail = refs[len(refs) - (9 if fp4 else 7) :]
+    tail = refs[len(refs) - (9 if fp4 else 7) - limited :]
     o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref = tail[:7]
     scale_hbm_ref = refs[0] if fp4 else None
-    scale_buf_ref, scale_sem_ref = tail[7:] if fp4 else (None, None)
+    scale_buf_ref, scale_sem_ref = tail[7:9] if fp4 else (None, None)
+    # `limited`: each union slot's limit per token (`_page_limits`, blocked
+    # per grid step) and the one-hot that spreads a page's over its slots.
+    limit_ref = refs[1] if limited else None
+    spread_ref = tail[-1] if limited else None
     pages_per_step = buf_ref.shape[1]
     ring = buf_ref.shape[0]  # prefetched groups + the running one
     steps = pl.num_programs(0) if steps_per_call is None else steps_per_call
@@ -245,6 +255,12 @@ def _kernel(
 
         @pl.when(w == 0)
         def _first():
+            if limited:
+                key = jax.lax.broadcasted_iota(jnp.int32, spread_ref.shape, 1)
+                slot = jax.lax.broadcasted_iota(jnp.int32, spread_ref.shape, 0)
+                spread_ref[...] = jnp.where(key // page_size == slot, 1, 0).astype(
+                    spread_ref.dtype
+                )
             for d in range(ring - 1):
                 pl.when(d < num_groups)(functools.partial(start_group, d, d))
 
@@ -447,14 +463,28 @@ def _kernel(
             local_page = local_page_ref[...]
             local_limit = local_limit_ref[...]
             keys, values, masks, k_scales, v_scales = [], [], [], [], []
+            if limited:  # the group's [Bq, W] limits spread over its W x S slots
+                row = meta >> msa_attention._ROW_SHIFT
+                limits = limit_ref[
+                    row // groups_per_tile % tiles_per_step, row % groups_per_tile
+                ]  # [Bq, pages_per_step]
+                limit = jax.lax.dot_general(
+                    limits[:, :width].astype(spread_ref.dtype),
+                    spread_ref[:width, : width * page_size],
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )  # [Bq, W * S]
+                spot = jax.lax.broadcasted_iota(jnp.int32, (1, width * page_size), 1)
+                masks.append((spot % page_size).astype(jnp.float32) < limit)
             for g, kv_ref in enumerate(kv_refs[:width]):
-                page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
-                is_selected = jnp.max(
-                    (selected == page).astype(jnp.int32), axis=1, keepdims=True
-                )
-                limit = jnp.where(local_page == page, local_limit, page_size)
-                limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
-                seen = jnp.max(limit)
+                if not limited:
+                    page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
+                    is_selected = jnp.max(
+                        (selected == page).astype(jnp.int32), axis=1, keepdims=True
+                    )
+                    limit = jnp.where(local_page == page, local_limit, page_size)
+                    limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
+                    seen = jnp.max(limit)
                 if fp4:
                     # Stale or unwritten slots hold finite int4 values and
                     # scales that `_fp4_page` reads as 0 when non-finite, so
@@ -483,7 +513,8 @@ def _kernel(
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
                 keys.append(rows[:, :head_dim])
-                masks.append(slots < limit)  # [Bq, S]
+                if not limited:
+                    masks.append(slots < limit)  # [Bq, S]
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
             mask = jnp.concatenate(masks, axis=1)
@@ -631,7 +662,7 @@ def _attention_call(
     num_q_heads, num_tokens, head_dim = q.shape
     num_heads = q_per_head
     topk = selected.shape[2]
-    packed, tiles, tiles_per_step = work
+    packed, tiles, tiles_per_step, *limits = work  # limits: `_page_limits`
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
     num_steps = tiles // tiles_per_step
     sections, length = _work_layout(
@@ -676,6 +707,18 @@ def _attention_call(
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
+    limited = bool(limits)
+    if limited and (calls > 1 or not fp4):
+        raise ValueError("page-limit tables serve one 4-bit call per grid")
+    limit_specs = [
+        pl.BlockSpec((tiles_per_step,) + x.shape[1:], lambda b, *_: (b, 0, 0, 0))
+        for x in limits
+    ]
+    page_size = msa_attention.page_tokens(kv_cache)
+    spread = [
+        pltpu.VMEM((pages_per_step, pages_per_step * page_size), jnp.bfloat16)
+        for _ in limits
+    ]
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
         grid=(calls * num_steps,),
@@ -688,6 +731,7 @@ def _attention_call(
             pl.BlockSpec((tiles_per_step * block_q, 1), tile_block),
             pl.BlockSpec(memory_space=pl.ANY),
             *(pl.BlockSpec(memory_space=pl.ANY) for _ in scale_inputs),
+            *limit_specs,
             *in_place,
         ],
         out_specs=[
@@ -703,9 +747,10 @@ def _attention_call(
             kv_cache,
             scale_cache if fp4 else None,
             transposed,
-        ),
+        )
+        + spread,
     )
-    num_inputs = 4 + 5 + len(scale_inputs)
+    num_inputs = 4 + 5 + len(scale_inputs) + len(limits)
     return pl.pallas_call(
         functools.partial(
             kernel,
@@ -715,6 +760,7 @@ def _attention_call(
             groups_per_tile=groups_per_tile,
             transposed=transposed,
             inline_issue=inline_issue,
+            limited=limited,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -752,6 +798,7 @@ def _attention_call(
         local_limit,
         kv_cache,
         *scale_inputs,
+        *limits,
         *(out if aliased else ()),
     )
 
@@ -996,6 +1043,26 @@ def _packed_work(selected, block_q, pages_per_step, align=1):
     return jnp.concatenate([pages, meta, counts, starts], axis=1), tiles_per_step
 
 
+def _page_limits(
+    unions, selected, local_page, local_limit, block_q, pages_per_step, page_size
+):
+    """What `_kernel`'s `attend` computes per page as ``limit`` (the local
+    page's visible slots, a whole page if selected, else 0), for every call's
+    union slots: ``[calls, tiles, groups per tile, Bq, pages per step]`` from
+    the unions (``-1`` past a tile's), ``selected [calls, T, K]`` and
+    ``local_page`` / ``local_limit [calls, T]``."""
+    calls, num_tokens, topk = selected.shape
+    tiles = num_tokens // block_q
+    pages = unions.reshape(calls, tiles, -1, 1, pages_per_step)
+    sel = selected.reshape(calls, tiles, 1, block_q, 1, topk)
+    hit = jnp.any(sel == pages[..., None], axis=-1)
+    tok = (calls, tiles, 1, block_q, 1)
+    limit = jnp.where(
+        local_page.reshape(tok) == pages, local_limit.reshape(tok), page_size
+    )
+    return jnp.where((pages >= 0) & hit, limit, 0).astype(jnp.int32)
+
+
 def _dense_unions(keys, num_tiles):
     """`msa_attention._dense_unions` of each of the first `num_tiles` rows of
     ``keys [rows, 128]`` (`_NO_PAGE` for no page), in VMEM."""
@@ -1171,6 +1238,26 @@ def _chunked_call(
         pages_per_step,
         align=_merged_store_rows(block_q, num_q_heads // num_heads, q.dtype),
     )
+    limits = None
+    if (
+        LIMIT_TABLE
+        and scale_rows is not None
+        and step >= msa_attention.SMALL_BATCH_TOKENS
+        and not (num_chunks == 1 and num_heads > 1)
+    ):  # 4-bit prefill-size calls, one per grid
+        calls = num_heads * num_chunks
+        groups_per_tile = msa_attention._groups_per_tile(
+            block_q, selected.shape[2], pages_per_step
+        )
+        limits = _page_limits(
+            packed[:, : step // block_q * groups_per_tile * pages_per_step],
+            selected.reshape(calls, step, selected.shape[2]),
+            jnp.tile(local_page.reshape(num_chunks, step), (num_heads, 1)),
+            jnp.tile(local_limit.reshape(num_chunks, step), (num_heads, 1)),
+            block_q,
+            pages_per_step,
+            msa_attention.page_tokens(kv_cache),
+        )
 
     def head_chunk(i, out):
         h, c = i // num_chunks, i % num_chunks
@@ -1186,7 +1273,8 @@ def _chunked_call(
             heads,
             offset,
             out,
-            (packed[i], step // block_q, tiles_per_step),
+            (packed[i], step // block_q, tiles_per_step)
+            + (() if limits is None else (limits[i],)),
         )
 
     if num_chunks == 1 and num_heads > 1:
