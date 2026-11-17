@@ -7192,6 +7192,9 @@ class TPURaidenConnectorWorker:
                     req_id is not None
                     and req_id in self._stage3_controller_accepted
                     and req_id not in self._stage3_inflight_submits
+                    # Still in the leader's fan-out of the submit outcome:
+                    # marked terminal now, it would be fanned out as failed.
+                    and req_id not in self._stage3_tp_submits
                     and req_id not in self._stage3_terminal_loads
                     and req_id not in self._reported_recving
                     and req_id not in self._suppress_done_recving
