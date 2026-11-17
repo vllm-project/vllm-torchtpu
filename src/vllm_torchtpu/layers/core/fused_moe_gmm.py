@@ -23,6 +23,7 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.megablox import tc_combine
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
     gmm_v2,
@@ -171,6 +172,29 @@ def set_bounded_onehot(enabled: bool) -> None:
     global _BOUNDED_ONEHOT
     _BOUNDED_ONEHOT = bool(enabled)
     logger.info("MoE bounded one-hot permute/combine: %s", _BOUNDED_ONEHOT)
+
+
+# r10's TensorCore EP combine (kernels/megablox/tc_combine.py): every EP step
+# whose shape it admits (tokens a multiple of 256) combines the expert outputs
+# with one MXU product per 256-row chunk of the staged 16-row tiles against a
+# [256, rows] routing-weight matrix, instead of the SparseCore gather-reduce.
+# Key moe_tc_combine (`set_tc_combine`; off by default). Not the same kernel
+# as moe_tc_combine_min_tokens (tc_slab_combine: 0/1 selection matmul then
+# the SparseCore v3 top-k-order f32 sum, bitwise); the two keys exclude each
+# other.
+_R10_TC_COMBINE = False
+
+
+def set_tc_combine(enabled: bool) -> None:
+    """Key moe_tc_combine."""
+    global _R10_TC_COMBINE
+    if enabled and _TC_COMBINE_MIN_TOKENS:
+        raise ValueError(
+            "additional_config moe_tc_combine and moe_tc_combine_min_tokens select "
+            "two different TensorCore MoE combines; set at most one"
+        )
+    _R10_TC_COMBINE = bool(enabled)
+    logger.info("MoE r10 TensorCore combine (moe_tc_combine): %s", _R10_TC_COMBINE)
 
 
 def _zero_non_finite(x: jax.Array) -> jax.Array:
@@ -838,6 +862,18 @@ def moe_gmm(
                 reduce_group_size=topk,
             ).astype(x.dtype)
 
+        if _R10_TC_COMBINE and tc_combine.supported(
+            num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype
+        ):
+            logger.info_once("moe_tc_combine: r10 TensorCore MoE combine armed")
+            return tc_combine.tc_combine(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                group_sizes,
+                topk=topk,
+            ).astype(x.dtype)
         if (
             _TC_COMBINE_MIN_TOKENS
             and num_tokens >= _TC_COMBINE_MIN_TOKENS

@@ -6087,6 +6087,11 @@ class TPUModelRunner(GPUModelRunner):
 
             # Logs the resolved values (the payload sort needs the v3 combine).
             fused_moe_gmm.set_row_movement(*moe_row_movement)
+        if option(additional, "moe_tc_combine"):
+            from vllm_torchtpu.layers.core import fused_moe_gmm
+
+            # Logs the value; refuses moe_tc_combine_min_tokens alongside.
+            fused_moe_gmm.set_tc_combine(True)
         nvfp4_skip_padded = option(additional, "moe_nvfp4_skip_padded")
         skip_padded_min_routes = option(additional, "moe_skip_padded_min_routes")
         if nvfp4_skip_padded or skip_padded_min_routes:

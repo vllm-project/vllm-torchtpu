@@ -180,6 +180,13 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # combine sums the same nonzero products (f32 accumulation), possibly in
     # another MXU order: bitwise in the CPU tests, not guaranteed on TPU.
     "moe_bounded_onehot": False,
+    # EP MoE combine (ragged path, tokens a multiple of 256) on the TensorCore
+    # with r10's kernel (`kernels/megablox/tc_combine.py`: staged 16-row tiles
+    # times a routing-weight matrix on the MXU) instead of the SparseCore
+    # gather-reduce. Not bitwise (MXU f32 sum order; bf16 weights multiply in
+    # the MXU). Excludes moe_tc_combine_min_tokens (a different, bitwise
+    # TensorCore combine): setting both fails at init.
+    "moe_tc_combine": False,
 }
 
 
