@@ -29,13 +29,11 @@ small HBM staging buffers that the class registers in place of the pool:
 Staging layout per region: ``[slots, stage_rows, 4, 256]`` uint8, the pool's
 own 1,024-byte row shape. Per slot, the packed values (``rows * 4`` runs of
 128 bytes: one head slot of 256 lanes) are followed by the scales (``rows *
-32`` bytes), then zero rows up to a multiple of 64 rows. A 3,200-token page
-packs into 1,700 rows and stages in 1,728 (1,769,472 B, 54% of the FP8 page).
-Pool rows move only by DMA, as in the PD repack: ``dma_row_gather`` reads them
-as uint8 (XLA must never gather or bitcast FP8 KV bytes as FP8 -> integer,
-which canonicalised NaN encodings), and the aliased DMA row writer stores in
-place. The FP8 interpretation happens only on values about to be quantized or
-just dequantized.
+32`` bytes). A 3,200-token page packs into 1,700 rows (1,740,800 B, 53% of
+the FP8 page). Writes into the pool and staging are whole-page DMAs into the
+aliased target (``page_scatter``), so no buffer is ever rebound; pool pages are
+read as FP8 values and only converted to float (never bitcast FP8 -> integer
+in XLA, which canonicalised NaN encodings).
 """
 
 # No `from __future__ import annotations`: pallas.jax_op reads the kernels' argument
@@ -70,8 +68,6 @@ SCALE_BIAS = 127
 # Batch sizes compiled for each direction (a batch is padded up to the next one by
 # repeating its last pair, which rewrites the same bytes; bigger batches are split).
 BUCKETS = (1, 4, 16, 64)
-# Rows a grid step of the aliased DMA row writer (pd_staging.REPACK_TILE).
-TILE = 64
 
 
 def page_rows(page_bytes: int) -> int:
@@ -92,28 +88,63 @@ def packed_rows(rows: int) -> int:
 
 
 def stage_rows(rows: int) -> int:
-    """Rows of one staging slot: ``packed_rows`` rounded up to the writer's tile."""
-    return -(-packed_rows(rows) // TILE) * TILE
+    """Rows of one staging slot (the page writer DMAs whole slots: no tile padding)."""
+    return packed_rows(rows)
 
 
 def fp4_page_bytes(page_bytes: int) -> int:
-    """Host bytes of one main-KV page in MXFP4 (values + scales + tile padding)."""
+    """Host bytes of one main-KV page in MXFP4 (values + scales)."""
     return stage_rows(page_rows(page_bytes)) * ROW_VALUES
 
 
 def staging_shape(page_bytes: int, slots: int) -> tuple[int, int, int, int]:
-    """``[slots, stage_rows, 4, 256]`` uint8: the pool's own row shape, so the PD
-    repack's aliased DMA row writer stores into it in place."""
+    """``[slots, stage_rows, 4, 256]`` uint8, in the pool's 1,024-byte row shape."""
     return (slots, stage_rows(page_rows(page_bytes)), ROW_SLOTS, ROW_LANES)
+
+
+def page_scatter(target, values, dst):
+    """``target[dst[i]] = values[i]`` in place: one HBM-to-HBM DMA per page, the
+    target aliased to the output (donated by the caller). One SMEM index per page;
+    the PD row writer's four per-row index vectors overflowed SMEM at 64 pages of
+    3,200 rows (j-de0946ff-9209-4465-8784: 1.27M of 1.00M). Repeated destinations
+    must carry identical bytes (a padded bucket repeats its last pair)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    def kernel(dst_ref, src_ref, _old_ref, out_ref, sem):
+        i = pl.program_id(0)
+        pltpu.async_copy(src_ref.at[i], out_ref.at[dst_ref[i]], sem).wait()
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(values.shape[0],),
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        out_shape=jax.ShapeDtypeStruct(target.shape, target.dtype),
+        input_output_aliases={2: 0},
+        name="qwen4_offload_fp4_page_scatter",
+    )(dst.astype(jnp.int32), values, target)
 
 
 # -- the two transforms (JAX; traced inside pallas.jax_op) ---------------------
 
 
-def quantize_pages(pages_u8, jnp, lax):
-    """``[n, rows, 4, 256]`` uint8 FP8 bytes -> ``[n, rows*4 + rows//4, 128]`` uint8 MXFP4."""
-    n, rows = pages_u8.shape[0], pages_u8.shape[1]
-    x = lax.bitcast_convert_type(pages_u8, jnp.float8_e4m3fn).astype(jnp.float32)
+def quantize_pages(pages, jnp, lax):
+    """``[n, rows, 4, 256]`` FP8 values (or their uint8 bytes) -> ``[n, rows*4 +
+    rows//4, 128]`` uint8 MXFP4."""
+    n, rows = pages.shape[0], pages.shape[1]
+    if pages.dtype == jnp.uint8:
+        pages = lax.bitcast_convert_type(pages, jnp.float8_e4m3fn)
+    x = pages.astype(jnp.float32)
     g = x.reshape(n, rows, ROW_SLOTS, ROW_LANES // GROUP, GROUP)
     amax = jnp.max(jnp.abs(g), axis=-1, keepdims=True)
     # Smallest power of two s with amax / s <= 6: s = 2^ceil(log2(amax / 6)).
@@ -132,8 +163,9 @@ def quantize_pages(pages_u8, jnp, lax):
     return jnp.concatenate([packed.reshape(n, rows * ROW_SLOTS, 128), scales], axis=1)
 
 
-def dequantize_pages(staged_u8, rows: int, jnp, lax):
-    """``[n, rows*4 + rows//4, 128]`` uint8 MXFP4 -> ``[n, rows, 4, 256]`` uint8 FP8 bytes."""
+def dequantize_pages(staged_u8, rows: int, jnp, lax, as_fp8: bool = False):
+    """``[n, rows*4 + rows//4, 128]`` uint8 MXFP4 -> ``[n, rows, 4, 256]`` uint8 FP8
+    bytes (``as_fp8``: the FP8 values themselves, with no FP8 -> integer bitcast)."""
     n = staged_u8.shape[0]
     packed = staged_u8[:, : rows * ROW_SLOTS].reshape(n, rows, ROW_SLOTS, PACKED_LANES)
     scales = staged_u8[:, rows * ROW_SLOTS :].reshape(
@@ -147,6 +179,8 @@ def dequantize_pages(staged_u8, rows: int, jnp, lax):
     val = jnp.where((nib >> 3) == 1, -mag, mag)
     val = val * jnp.exp2(scales.astype(jnp.float32) - SCALE_BIAS)
     val = jnp.clip(val, -FP8_MAX, FP8_MAX).astype(jnp.float8_e4m3fn)
+    if as_fp8:
+        return val.reshape(n, rows, ROW_SLOTS, ROW_LANES)
     return lax.bitcast_convert_type(val, jnp.uint8).reshape(n, rows, ROW_SLOTS, ROW_LANES)
 
 
@@ -179,13 +213,13 @@ class Fp4Transcoder:
     ``pools`` are the model's own typed FP8 region tensors (``[pages, kernel rows,
     *row]``, one 1,024-byte token row per kernel row), never reinterpreted views:
     the raiden managers (this connector's and the PD connector's) pin each
-    storage's current device buffer, and a program that writes a view of another
-    dtype rebinds the storage to a new buffer, which the PD admission then finds
-    without its TPU layout. Both programs therefore move pool rows only by DMA,
-    as the PD repack does: ``dma_row_gather`` reads pages as uint8 rows, and the
-    aliased DMA row writer (``_write_main_cache_universal``, donated, with the
-    ``copy_`` writeback inside ``torch.compile``) stores into the pool and the
-    staging buffer in place.
+    storage's current device buffer, and a program that wrote a view of another
+    dtype rebound the storage to a new buffer, which the PD admission then found
+    without its TPU layout (j-fdf67c82-4a51-4f6f-a226). Writes into the pool and
+    into staging go through ``page_scatter`` (whole-page DMAs, aliased, donated,
+    with the ``copy_`` writeback inside ``torch.compile``). Pool pages are read
+    with a plain gather as FP8 values and converted to float, never bitcast to an
+    integer type (main-KV pages hold FP8 KV values, not reinterpreted bytes).
     """
 
     def __init__(self, pools: dict[int, torch.Tensor], page_bytes: int, slots: int):
@@ -194,16 +228,15 @@ class Fp4Transcoder:
         self.rows = page_rows(page_bytes)
         self.slots = slots
         for r, p in self.pools.items():
-            kr = int(p.shape[1])
             if (
                 p.dim() < 3
+                or p.dtype != torch.float8_e4m3fn
                 or math.prod(p.shape[2:]) * p.element_size() != ROW_VALUES
-                or self.rows % kr
-                or kr % TILE
+                or self.rows % int(p.shape[1])
             ):
                 raise ValueError(
                     f"VLLM_TPU_OFFLOAD_FP4: region {r} tensor {tuple(p.shape)} {p.dtype} is not "
-                    f"[pages, k*{TILE} rows, 1,024-byte row] for a {self.rows}-row page"
+                    f"FP8 [pages, rows, 1,024-byte row] dividing a {self.rows}-row page"
                 )
         self.staging: dict[int, torch.Tensor] = {
             r: torch.zeros(staging_shape(page_bytes, slots), dtype=torch.uint8, device=p.device)
@@ -221,27 +254,20 @@ class Fp4Transcoder:
         op = self._ops.get(kind)
         if op is not None:
             return op
-        import functools
-
         import jax
         import jax.numpy as jnp
         from jax import lax
         from torch_tpu._internal import pallas
 
-        from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import _write_main_cache_universal
-        from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import dma_row_gather
+        rows, srow = self.rows, stage_rows(self.rows)
 
-        write = functools.partial(_write_main_cache_universal, tile=TILE, overlap_edges=True)
-        rows, prow = self.rows, packed_rows(self.rows)
-        srow = stage_rows(self.rows)
-
-        def flat_rows(ids, per):
-            return (ids.astype(jnp.int32)[:, None] * per + jnp.arange(per, dtype=jnp.int32)).reshape(-1)
-
-        def store(target, values, flat):
-            # values [n, *target row]; flat rows into target [pages, page rows, *row].
-            valid = jnp.ones(flat.shape, jnp.bool_)
-            return write(target, values, flat // target.shape[1], flat, valid)
+        def kernel_pages(pool, blocks):
+            # Scheduler block b -> its kernel pages b*split .. b*split+split-1.
+            split = rows // pool.shape[1]
+            ids = blocks.astype(jnp.int32)
+            if split == 1:
+                return ids
+            return (ids[:, None] * split + jnp.arange(split, dtype=jnp.int32)).reshape(-1)
 
         if kind == "quant":
             # pallas.jax_op reads the argument types from the annotations.
@@ -249,13 +275,9 @@ class Fp4Transcoder:
                 pool: jax.Array, staging: jax.Array, blocks: jax.Array, slots: jax.Array
             ) -> tuple[jax.Array, jax.Array]:
                 n = blocks.shape[0]
-                stage = pool.reshape(-1, ROW_SLOTS, ROW_LANES)
-                pages = dma_row_gather(stage, flat_rows(blocks, rows), out_dtype=jnp.uint8)
-                q = quantize_pages(pages.reshape(n, rows, ROW_SLOTS, ROW_LANES), jnp, lax)
-                q = q.reshape(n, prow, ROW_SLOTS, ROW_LANES)
-                q = jnp.pad(q, ((0, 0), (0, srow - prow), (0, 0), (0, 0)))
-                values = q.reshape(-1, ROW_SLOTS, ROW_LANES)
-                return store(staging, values, flat_rows(slots, srow)), slots[0]
+                pages = pool[kernel_pages(pool, blocks)].reshape(n, rows, ROW_SLOTS, ROW_LANES)
+                q = quantize_pages(pages, jnp, lax).reshape(n, srow, ROW_SLOTS, ROW_LANES)
+                return page_scatter(staging, q, slots), slots[0]
 
             op = pallas.jax_op("pallas::qwen4_offload_fp4_quant", quant_fn, donate_argnums=(1,))
             op.register_fake(
@@ -270,11 +292,11 @@ class Fp4Transcoder:
                 pool: jax.Array, staging: jax.Array, slots: jax.Array, blocks: jax.Array
             ) -> tuple[jax.Array, jax.Array]:
                 n = slots.shape[0]
-                staged = staging[slots.astype(jnp.int32)][:, :prow]  # uint8: a plain gather is exact
+                staged = staging[slots.astype(jnp.int32)]  # uint8: a plain gather is exact
                 staged = staged.reshape(n, rows * ROW_SLOTS + rows * SCALES_PER_ROW // 128, 128)
-                pages = dequantize_pages(staged, rows, jnp, lax)  # uint8 FP8 bytes
-                values = lax.bitcast_convert_type(pages, pool.dtype).reshape(-1, *pool.shape[2:])
-                return store(pool, values, flat_rows(blocks, rows)), blocks[0]
+                vals = dequantize_pages(staged, rows, jnp, lax, as_fp8=True).astype(pool.dtype)
+                values = vals.reshape(-1, *pool.shape[1:])
+                return page_scatter(pool, values, kernel_pages(pool, blocks)), blocks[0]
 
             op = pallas.jax_op("pallas::qwen4_offload_fp4_dequant", dequant_fn, donate_argnums=(0,))
             op.register_fake(

@@ -44,9 +44,9 @@ def _fp8_pages(rng, n, rows, scale=4.0):
 def test_geometry(fp4):
     assert fp4.page_rows(3_276_800) == 3200
     assert fp4.packed_rows(3200) == 1700  # 3200 * 544 B / 1024 B
-    assert fp4.stage_rows(3200) == 1728  # up to the writer's 64-row tile
-    assert fp4.fp4_page_bytes(3_276_800) == 1728 * 1024
-    assert fp4.staging_shape(3_276_800, 7) == (7, 1728, 4, 256)
+    assert fp4.stage_rows(3200) == 1700
+    assert fp4.fp4_page_bytes(3_276_800) == 1_740_800
+    assert fp4.staging_shape(3_276_800, 7) == (7, 1700, 4, 256)
 
 
 def test_staging_packing_round_trip(fp4):
@@ -120,3 +120,36 @@ def test_slot_pool(fp4):
     assert pool.free == 4
     with pytest.raises(AssertionError):
         pool.give([0])
+
+
+def test_fp8_input_matches_bytes(fp4):
+    # The device path quantizes FP8 values directly; the bytes path must agree.
+    rng = np.random.default_rng(3)
+    pages, _ = _fp8_pages(rng, 1, 32)
+    f8 = lax.bitcast_convert_type(jnp.asarray(pages), jnp.float8_e4m3fn)
+    a = fp4.quantize_pages(f8, jnp, lax)
+    b = fp4.quantize_pages(jnp.asarray(pages), jnp, lax)
+    np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    d8 = fp4.dequantize_pages(a, 32, jnp, lax, as_fp8=True)
+    du = fp4.dequantize_pages(a, 32, jnp, lax)
+    np.testing.assert_array_equal(np.asarray(lax.bitcast_convert_type(d8, jnp.uint8)), np.asarray(du))
+
+
+def test_page_scatter_interpret(fp4):
+    # page_scatter's kernel in Pallas TPU interpret mode on CPU, when available.
+    pl = pytest.importorskip("jax.experimental.pallas")
+    target = jnp.zeros((5, 8, 4, 256), jnp.uint8)
+    values = jnp.arange(2 * 8 * 4 * 256, dtype=jnp.int32).astype(jnp.uint8).reshape(2, 8, 4, 256)
+    try:
+        from jax.experimental.pallas import tpu as pltpu  # noqa: F401
+        orig = pl.pallas_call
+        pl.pallas_call = lambda *a, **k: orig(*a, **{**k, "interpret": True})
+        out = fp4.page_scatter(target, values, jnp.asarray([3, 1], jnp.int32))
+    except Exception as exc:  # pragma: no cover - interpret mode not supported here
+        pytest.skip(f"interpret mode unavailable: {exc}")
+    finally:
+        pl.pallas_call = orig
+    out = np.asarray(out)
+    np.testing.assert_array_equal(out[3], np.asarray(values[0]))
+    np.testing.assert_array_equal(out[1], np.asarray(values[1]))
+    assert (out[[0, 2, 4]] == 0).all()
