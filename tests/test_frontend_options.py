@@ -188,6 +188,8 @@ def test_platform_hook_applies_the_registry_with_the_engine_config():
     "additional",
     [
         {"tpu_frontend": {"tokenize_cache": True}},
+        {"tpu_worker": {"numa": True}},
+        {"tpu_worker": {"numa_bind": 1}},
     ],
 )
 def test_platform_hook_rejects_a_bad_host_only_section(installed, additional):
