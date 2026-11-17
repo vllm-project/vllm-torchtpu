@@ -1217,6 +1217,7 @@ class TpuPlatform(Platform):
                     "DP scheduler is off: scheduler %s is configured.",
                     scheduler_config.scheduler_cls,
                 )
+        _configure_prefill_spacing_scheduler(vllm_config)
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
@@ -1441,6 +1442,51 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
             len(paddings),
         )
     return paddings
+
+
+def _configure_prefill_spacing_scheduler(vllm_config: VllmConfig) -> None:
+    """With additional_config ``prefill_spacing_scheduler``, serve with
+    PrefillSpacingScheduler in place of an unset or PrefixAwareScheduler
+    ``--scheduler-cls`` (it extends PrefixAwareScheduler); any other
+    configured scheduler is an error. Off: nothing changes."""
+    from vllm_torchtpu.opt_in_config import option
+
+    if not option(vllm_config.additional_config, "prefill_spacing_scheduler"):
+        return
+    from vllm_torchtpu.core.prefill_spacing_scheduler import (
+        SCHEDULER_CLS,
+        spacing_options,
+    )
+
+    scheduler_config = vllm_config.scheduler_config
+    replaceable = (
+        None,
+        SCHEDULER_CLS,
+        "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler",
+    )
+    current = scheduler_config.scheduler_cls
+    if current not in replaceable:
+        raise ValueError(
+            "additional_config.prefill_spacing_scheduler needs no --scheduler-cls "
+            f"or PrefixAwareScheduler; got {current!r}"
+        )
+    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    frac, long_tokens, target_s, max_hold_s, priced = spacing_options(
+        vllm_config.additional_config
+    )
+    logger.info(
+        "additional_config prefill_spacing_scheduler: %s (was %s; "
+        "prefill_spacing_frac=%.2f prefill_spacing_min_tokens=%d "
+        "prefill_tpot_target_ms=%.1f prefill_tpot_max_hold_s=%.1f "
+        "prefill_tpot_priced=%s)",
+        SCHEDULER_CLS,
+        current,
+        frac,
+        long_tokens,
+        target_s * 1e3,
+        max_hold_s,
+        priced,
+    )
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:

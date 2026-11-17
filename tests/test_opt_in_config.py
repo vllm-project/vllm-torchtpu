@@ -88,6 +88,12 @@ REPLACED_ENV = {
     "minimax_sp_fp8_attn_gather": "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER",
     "minimax_fp8_linears": "TPU_MINIMAX_M3_FP8_LINEARS",
     "minimax_fp8_draft_linears": "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS",
+    # --- v7 scheduler ---
+    "prefill_spacing_frac": "VLLM_TPU_PREFILL_SPACING_FRAC",
+    "prefill_spacing_min_tokens": "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS",
+    "prefill_tpot_target_ms": "VLLM_TPU_PREFILL_TPOT_TARGET_MS",
+    "prefill_tpot_max_hold_s": "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S",
+    "prefill_tpot_priced": "VLLM_TPU_PREFILL_TPOT_PRICED",
 }
 # Served values of the value-bearing keys (the rest are booleans).
 SAMPLE = {
@@ -124,6 +130,11 @@ SAMPLE = {
     "minimax_dcp_prefill_tiles": "32:32",
     "minimax_dcp_prefill_tiles_4bit": "8:32",
     "minimax_msa_dense_work_list_elems": 262144,
+    # --- v7 scheduler ---
+    "prefill_spacing_frac": 0.7,
+    "prefill_spacing_min_tokens": 8192,
+    "prefill_tpot_target_ms": 6.5,
+    "prefill_tpot_max_hold_s": 10.0,
 }
 # Keys added after the env-var migration: they never had an env var.
 NEW_KEYS = {
@@ -141,6 +152,8 @@ NEW_KEYS = {
     "minimax_indexer_row_gather",
     # --- v7 MoE / grouped GEMM ---
     "gmm_scale_lookahead",
+    # --- v7 scheduler ---
+    "prefill_spacing_scheduler",
 }
 # Dropped with no key: hid the offload connector from draft forwards, which
 # v3's skip_draft_kv unbinding already covers in every served config.

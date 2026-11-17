@@ -290,6 +290,31 @@ DEFAULTS: dict[str, bool | int | float | str] = {
     # head's replicas all-gathers only its 1 / replicas part of the new K / V
     # / index-query rows (the replicas' rows are equal). Bitwise.
     "minimax_dcp_split_kv_gather": False,
+    # --- v7 scheduler ---
+    # Scheduler: PrefillSpacingScheduler (`core/prefill_spacing_scheduler`,
+    # shortest remaining prefill first over RUNNING and WAITING, on top of
+    # PrefixAwareScheduler) replaces an unset or PrefixAwareScheduler
+    # --scheduler-cls. Host-only; changes which tokens each step schedules,
+    # not any request's tokens.
+    "prefill_spacing_scheduler": False,
+    # PrefillSpacingScheduler: decode-only time owed after a step that runs a
+    # chunk of a long prompt, as a fraction of that step's measured time
+    # (0.0 = no spacing; r10's default was 0.5).
+    "prefill_spacing_frac": 0.0,
+    # PrefillSpacingScheduler: a prompt is long while at least this many of
+    # its prompt tokens are left (0 = 8192, r10's default).
+    "prefill_spacing_min_tokens": 0,
+    # PrefillSpacingScheduler: TPOT target in ms; prefill is deferred while a
+    # long-chunk step would push a decoding request that can still meet it
+    # past it (projected from max_tokens; 0.0 = off).
+    "prefill_tpot_target_ms": 0.0,
+    # PrefillSpacingScheduler: longest run of steps, in seconds, that the TPOT
+    # target alone may defer prefill for (0.0 = 10 s, r10's default).
+    "prefill_tpot_max_hold_s": 0.0,
+    # PrefillSpacingScheduler: while the TPOT target defers prefill, still run
+    # whole remaining prefills up to the largest prefill-token bin
+    # (512-4096) whose measured step time fits every decoding request's slack.
+    "prefill_tpot_priced": False,
 }
 
 
