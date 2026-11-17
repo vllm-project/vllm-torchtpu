@@ -279,8 +279,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/pcp_kv_gather.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
-    # The batched RPA decode settings, behind torch custom-op boundaries.
+    # The batched RPA decode lanes and reduced-precision modes: the kernel
+    # entries behind torch custom-op boundaries pick kernel arguments from them.
     "vllm_torchtpu/layers/adapter/batched_rpa_decode.py",
+    "vllm_torchtpu/layers/adapter/native_fp8_scope.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
