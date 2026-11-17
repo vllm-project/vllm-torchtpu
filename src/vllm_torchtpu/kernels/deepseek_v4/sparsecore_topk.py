@@ -62,6 +62,9 @@ NUM_BUCKETS = 256
 # memory). Parts up to this long are double-buffered across waves; a longer part
 # (up to twice this) fills the whole buffer and is fetched single-buffered.
 MAX_SLICE_WORDS = 32 * 1024
+# TPU_SC_TOPK_BY_LENGTH: one subcore's whole-row buffer at k = 1024, no keys
+# (see `_by_length_slot_words`).
+BY_LENGTH_SLOT_WORDS = 124 * 1024
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
 
@@ -118,8 +121,12 @@ def _topk_body(
     rank_major_dcp: int = 0,
     coop_v2: bool = False,
     merge_coop_dcp: int = 0,
+    by_length_meta_words: int = 0,
 ):
     dcp_merge = local_idxs_hbm is not None
+    # TPU_SC_TOPK_BY_LENGTH (`_sc_topk_by_length`): p == 1, rows of n words in
+    # HBM, each fetched up to its length into one `slice_len`-word buffer.
+    by_length = by_length_meta_words > 0
     if rank_major_dcp:
         # Unpadded DCP merge (see `_sc_topk_direct`): one wave at P = 1, the
         # row fetched as `rank_major_dcp` k-word pieces.
@@ -1069,6 +1076,67 @@ def _topk_body(
         if return_scores:
             pltpu.sync_copy(keybuf_vmem.at[pl.ds(0, k)], keys_hbm.at[pl.ds(out_off, k)])
 
+    if by_length:
+        assert p == 1 and not dcp_merge
+        # Even waves fill the buffer from the front and odd waves from the back,
+        # so the next wave's row is fetched during this one whenever both fit.
+        meta_words = by_length_meta_words
+        pltpu.sync_copy(
+            lengths_hbm.at[pl.ds(pl.multiple_of(flat * meta_words, LANES), meta_words)],
+            meta_vmem.at[pl.ds(0, meta_words)],
+        )
+
+        def bl_info(wave):
+            row = wave * cores_per_chip + flat
+            row_len = jnp.where(row < b, vec_at(meta_vmem, wave), 0)
+            words = pl.multiple_of(_cdiv_dyn(jnp.maximum(row_len, 0)) * LANES, LANES)
+            front = jnp.bitwise_and(wave, 1) == 0
+            off = jnp.where(front, 0, slice_len - words)
+            return row, row_len, words, pl.multiple_of(off, LANES)
+
+        def bl_copy(wave):
+            row, _, words, off = bl_info(wave)
+            return pltpu.make_async_copy(
+                scores_hbm.at[pl.ds(pl.multiple_of(row * n, LANES), words)],
+                slices_vmem.at[pl.ds(off, words)],
+                slice_sems.at[0],
+            )
+
+        def bl_start(wave):
+            @pl.when(bl_info(wave)[2] > 0)
+            def _():
+                bl_copy(wave).start()
+
+        def bl_wave(wave, carry):
+            row, row_len, words, off = bl_info(wave)
+            nxt = jnp.minimum(wave + 1, num_waves - 1)
+            overlap = (wave + 1 < num_waves) & (words + bl_info(nxt)[2] <= slice_len)
+
+            @pl.when(words > 0)
+            def _():
+                bl_copy(wave).wait()
+
+            pl.when(overlap)(functools.partial(bl_start, nxt))
+            pl.when(row_len > 0)(
+                functools.partial(
+                    _run_step,
+                    slices_vmem.at[pl.ds(off, slice_len)],
+                    None,
+                    w=wave,
+                    row_len=row_len,
+                )
+            )
+            if write_empty:
+                pl.when((row_len <= 0) & (row < b))(
+                    functools.partial(write_empty_row, row)
+                )
+            pl.when((wave + 1 < num_waves) & ~overlap)(functools.partial(bl_start, nxt))
+            return carry
+
+        bl_start(jnp.int32(0))
+        lax.fori_loop(0, num_waves, bl_wave, jnp.int32(0))
+        return
+
     # Each row is split over its group's p subcores by its OWN length, not by
     # the width of the score matrix: rows are usually far shorter than
     # max-model-len, and a fixed n / p split leaves one subcore doing a short
@@ -1407,6 +1475,100 @@ def _sc_topk_direct(
     return slots_2d
 
 
+def _by_length_slot_words(k: int, return_scores: bool) -> int:
+    """The by-length row buffer: BY_LENGTH_SLOT_WORDS less the tile memory
+    that a row buffer past k = 1024, and the keys buffer, take."""
+    extra = (k + LANES) * (2 if return_scores else 1) - (1024 + LANES)
+    return BY_LENGTH_SLOT_WORDS - _align_to(max(extra, 0), 1024)
+
+
+def _sc_topk_by_length(
+    scores: jax.Array,  # i32[b, n] of f32 bits
+    k: int,
+    row_lengths: jax.Array,  # i32[b], each at most slot_words
+    *,
+    slot_words: int,
+    write_empty: bool = True,
+    return_scores: bool = False,
+    scheduling_group_id: int | None = None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """One row per subcore, each fetched up to its own length.
+
+    Selects what the P == 1 path selects, so the same as every P: ties go to
+    the lowest columns and winners come out in column order. A row must fit
+    the `slot_words` buffer; the caller routes longer rows elsewhere.
+    """
+    b, n = scores.shape
+    sc = pltpu.get_tpu_info().sparse_core
+    if sc is None:
+        raise NotImplementedError("SparseCore is not available")
+    cores = sc.num_cores * sc.num_subcores
+    num_waves = _cdiv(b, cores)
+    padded_b = num_waves * cores
+    # Padding rows are never fetched (length 0), so the scores stay unpadded.
+    lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
+    # Subcore `flat` handles rows `wave * cores + flat`; vec_at reads 16 lanes.
+    meta_words = _align_to(num_waves, LANES) + LANES
+    table = jnp.pad(
+        lengths.reshape(num_waves, cores).T, ((0, 0), (0, meta_words - num_waves))
+    )
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=sc.num_cores,
+        num_subcores=sc.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
+    scratch_types = (
+        pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),  # glob_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32),  # rowbuf_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32) if return_scores else None,  # keybuf
+        *(None,) * 7,  # peer_* / shared_*: p == 1
+        pltpu.VMEM((meta_words,), jnp.int32),  # meta_vmem
+        pltpu.VMEM((slot_words,), jnp.int32),  # slices_vmem
+        pltpu.SemaphoreType.DMA((1,)),  # slice_sems
+    )
+    body_fn = functools.partial(
+        _topk_body,
+        b=b,
+        n=n,
+        k=k,
+        p=1,
+        slice_len=slot_words,
+        num_waves=num_waves,
+        write_empty=write_empty,
+        return_scores=return_scores,
+        by_length_meta_words=meta_words,
+    )
+    cost_bytes = envs.TPU_SC_TOPK_COST_BYTES
+    cost = (
+        pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=cost_bytes)
+        if cost_bytes > 0 and b <= 32
+        else None
+    )
+    out = pl.kernel(
+        body_fn,
+        out_type=(slot_type, slot_type if return_scores else None),
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True, needs_layout_passes=False
+        ),
+        scratch_types=scratch_types,
+        mesh=mesh,
+        cost_estimate=cost,
+        name=f"sc_topk_bylen_b{b}_n{n}_k{k}_s{slot_words}",
+    )(scores.reshape(-1), table.reshape(-1))
+    if scheduling_group_id is not None:
+        out = xla_metadata.set_xla_metadata(
+            out, _scheduling_group_id=scheduling_group_id
+        )
+    slots, keys = cast(tuple[jax.Array, jax.Array | None], out)
+    slots_2d = slots.reshape(padded_b, k)[:b]
+    if return_scores:
+        assert keys is not None
+        return slots_2d, keys.reshape(padded_b, k)[:b]
+    return slots_2d
+
+
 def rank_major_merge_fits(b: int) -> bool:
     """Whether `sparsecore_topk_dcp_merge` takes ``rank_major`` scores for
     ``b`` rows: one wave of the 32 P = 1 subcores, ``b <= 32``. Wider calls
@@ -1447,6 +1609,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "scheduling_group_id",
         "return_scores",
         "coop_v2",
+        "by_length",
     ),
 )
 def sparsecore_topk(
@@ -1458,11 +1621,17 @@ def sparsecore_topk(
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
     coop_v2: bool | None = None,
+    by_length: bool | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
     ``coop_v2`` (None reads ``TPU_SC_TOPK_COOP_V2``): at ``p > 1``, the level
     loop and the gather described in the module docstring. Bitwise identical.
+
+    ``by_length`` (None reads ``TPU_SC_TOPK_BY_LENGTH``): at ``p > 1`` and
+    ``b >= 32``, rows that fit one subcore's buffer are selected whole there
+    (`_sc_topk_by_length`); only longer rows take the cooperative call. Same
+    index (and key) arrays, order included.
 
     When ``p > 1`` (for ``b < 32`` or ``n > 64K``), subcores on the same
     SparseCore cooperatively compute a global histogram in ``VMEM_SHARED`` to
@@ -1489,16 +1658,58 @@ def sparsecore_topk(
 
     if coop_v2 is None:
         coop_v2 = envs.TPU_SC_TOPK_COOP_V2
+    if by_length is None:
+        by_length = envs.TPU_SC_TOPK_BY_LENGTH
     p = _pick_partition(b, n, k)
-    return _sc_topk_direct(
-        scores,
+    # Below one row per subcore (b < 32) the cooperative split keeps every
+    # subcore busy; one subcore per row leaves 32 - b idle and is slower.
+    if p == 1 or not by_length or b < 32:
+        return _sc_topk_direct(
+            scores,
+            k,
+            row_lengths,
+            p=p,
+            write_empty=write_empty_rows,
+            return_scores=return_scores,
+            scheduling_group_id=scheduling_group_id,
+            coop_v2=coop_v2,
+        )
+    # Rows are usually far shorter than n: one that fits a subcore's buffer is
+    # selected there, whole; only longer rows pay the cooperative path's
+    # cross-subcore synchronisation. Both select the same columns in the same
+    # order (see `_sc_topk_by_length`).
+    words = (
+        scores
+        if scores.dtype == jnp.int32
+        else lax.bitcast_convert_type(scores, jnp.int32)
+    )
+    slot = min(_by_length_slot_words(k, return_scores), n)
+    lengths = jnp.clip(row_lengths, 0, n)
+    fits = lengths <= slot
+    by_len = _sc_topk_by_length(
+        words,
         k,
-        row_lengths,
-        p=p,
+        jnp.where(fits, lengths, 0),
+        slot_words=slot,
         write_empty=write_empty_rows,
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
+    )
+    if n <= slot:
+        return by_len
+    # Rows it does not own are never read, so it need not write them either.
+    cooperative = _sc_topk_direct(
+        words,
+        k,
+        jnp.where(fits, 0, lengths),
+        p=p,
+        write_empty=False,
+        return_scores=return_scores,
+        scheduling_group_id=scheduling_group_id,
         coop_v2=coop_v2,
+    )
+    return jax.tree.map(
+        lambda c, s: jnp.where(fits[:, None], s, c), cooperative, by_len
     )
 
 

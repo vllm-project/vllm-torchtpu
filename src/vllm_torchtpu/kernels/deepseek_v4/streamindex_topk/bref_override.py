@@ -27,7 +27,7 @@ def _step_offset(meta_ref: Any, chunk_idx: int):
     return sum(meta_ref.num_steps[m] for m in range(chunk_idx))
 
 
-def _token_window(
+def token_window(
     refs: tuple[Any, ...],
     p_id: int | jax.Array,
     chunk_tokens: int,
@@ -450,7 +450,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
 
-        q_len_start, total_sz = _token_window(
+        q_len_start, total_sz = token_window(
             src_ref,
             grid_indices[0],
             self.chunk_tokens,
@@ -479,7 +479,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
         # Must match copy_in's size exactly or the semaphore never clears.
-        _, total_sz = _token_window(
+        _, total_sz = token_window(
             src_ref,
             grid_indices[0],
             self.chunk_tokens,
@@ -582,7 +582,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         sem = self.sem_sends.at[slot]
         vmem_src: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
 
-        token_start, total_sz = _token_window(
+        token_start, total_sz = token_window(
             dst_ref,
             grid_indices[0],
             scores_hbm.shape[0],
@@ -618,7 +618,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         vmem_src: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
 
         # Must match copy_out's size exactly or the semaphore never clears.
-        _, total_sz = _token_window(
+        _, total_sz = token_window(
             dst_ref,
             grid_indices[0],
             dst_ref[0].shape[0],

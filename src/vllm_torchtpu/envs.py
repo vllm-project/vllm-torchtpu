@@ -187,9 +187,13 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
     TPU_STREAMIDX_DECODE_PACK: bool = True
     TPU_STREAMIDX_SHARED_META: bool = True
+    TPU_STREAMIDX_Q_TRIM: bool = False
+    TPU_STREAMIDX_NO_STEP_MASK: bool = False
+    TPU_STREAMIDX_CHUNK4: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
     TPU_SC_TOPK_COOP_V2: bool = True
     TPU_SC_TOPK_COOP_MERGE: bool = True
+    TPU_SC_TOPK_BY_LENGTH: bool = False
     TPU_DCP_INDEXER_SMALL_AG: bool = True
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1566,6 +1570,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # depth, 1 decoder: 21 layers x (3 schedule conds + 1 operand fusion)
     # = 190 us per step. Same operands, same result.
     "TPU_STREAMIDX_SHARED_META": env_bool("TPU_STREAMIDX_SHARED_META", default=True),
+    # StreamIdx MIXED pass (q block 128, i.e. buckets above the small-bucket
+    # cap): a q block with at most 32 real rows (an MTP verify request, a
+    # chunk's tail) scores only its first 32-token block, and with
+    # TPU_STREAMIDX_MIXED_KV_PAGES >= 4 one with at most 16 only that half.
+    # Padding rows are never copied out. Bit-identical indices and scores.
+    "TPU_STREAMIDX_Q_TRIM": env_bool("TPU_STREAMIDX_Q_TRIM", default=False),
+    # StreamIdx per-step passes (decode, small-bucket and packed MTP bodies):
+    # skip the causal/end-of-sequence -inf mask, as the multi-token pass
+    # already does. Every top-k and DCP merge reads a row only up to its
+    # rank-local row_lengths, which is that limit. Bit-identical.
+    "TPU_STREAMIDX_NO_STEP_MASK": env_bool(
+        "TPU_STREAMIDX_NO_STEP_MASK", default=False
+    ),
+    # StreamIdx buckets of >= 1024 tokens with TPU_STREAMIDX_CHUNK_TOKENS unset
+    # run as 4 pipelined pieces (chunk_tokens = T / 4), so 3 of the 4
+    # SparseCore top-k calls overlap the next piece's scoring. Same result.
+    "TPU_STREAMIDX_CHUNK4": env_bool("TPU_STREAMIDX_CHUNK4", default=False),
     # KV pages per block of the StreamIndex top-k MIXED (multi-token) pass for
     # every bucket that does not take the small-bucket sizes (with
     # TPU_STREAMIDX_SMALL_BUCKET_BQ set, buckets above
@@ -1599,6 +1620,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # subcore walking all dcp * k scores; only the subcore holding this rank's
     # segment emits. T > 16 keeps the one-subcore merge. Bitwise identical.
     "TPU_SC_TOPK_COOP_MERGE": env_bool("TPU_SC_TOPK_COOP_MERGE", default=True),
+    # `sparsecore_topk` at P > 1 with >= 32 rows (n > 64K words): select each
+    # row that fits one subcore's buffer (~120K words) whole on that subcore,
+    # fetched up to its own length (`sparsecore_topk._sc_topk_by_length`);
+    # only longer rows take the cooperative call, a select merges the two.
+    # Same index and key arrays, order included, so the DCP merges see the
+    # same candidate lists. Fewer rows keep the cooperative split.
+    "TPU_SC_TOPK_BY_LENGTH": env_bool("TPU_SC_TOPK_BY_LENGTH", default=False),
     # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat path, buckets T <= 8
     # (streamindex_topk.SMALL_AG_MAX_TOKENS): the DCP
     # indexer's candidate all-gather (dcp x T * k int32 words) as one Pallas
