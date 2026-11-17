@@ -125,6 +125,81 @@ def hp_prefill_kernel_kwargs() -> dict:
     return kw
 
 
+# TPU_MINIMAX_M3_DCP_HP_BALANCE=<rows>: the head-parallel attention balances
+# its KV heads' work across the DCP ranks. A head's rank pair attends every
+# prefill row of the head, and the heads' selections differ in how many pages
+# each 16-token tile scores (the kernel's cost is linear in the tiles' page
+# unions), so the ranks of the heaviest head finish ~1.3x after the mean and
+# every other rank waits for them at the next collective (served c64 8K steps:
+# 51 of 239 ms of attention + wait, j-c59f7fa8). With the flag, every rank
+# all-gathers its head's work (the sum of its tiles' page unions), the heads
+# hand work around a ring (head h to head h - 1) so that each ends at the
+# mean, and a rank hands at most <rows> tail rows: their queries and
+# selections go to its helper (same replica index of the previous head), which
+# also receives this head's pages by a second exchange, attends them with the
+# same kernel and returns the output rows.
+HP_BALANCE_ENV = "TPU_MINIMAX_M3_DCP_HP_BALANCE"
+# Work of a tile beyond its page union (the per-tile fixed cost, in pages).
+_BALANCE_TILE_COST = 12
+_balance_logged = False
+
+
+def hp_balance_rows(block_q: int, num_tokens: int) -> int:
+    """Tail rows a rank may hand to its helper (`HP_BALANCE_ENV`), a
+    `block_q` multiple below `num_tokens`; 0 = off."""
+    global _balance_logged
+    from vllm_torchtpu import envs
+
+    rows = int(envs.TPU_MINIMAX_M3_DCP_HP_BALANCE or 0)
+    rows = min(rows, num_tokens // 2) // block_q * block_q
+    if rows <= 0:
+        return 0
+    if not _balance_logged:
+        _balance_logged = True
+        init_logger(__name__).warning(
+            "%s=1: head-parallel MSA attention balances KV heads over a ring, "
+            "up to %d tail rows per rank.",
+            HP_BALANCE_ENV,
+            rows,
+        )
+    return rows
+
+
+def tile_unions(keys: jax.Array, block_q: int) -> jax.Array:
+    """Distinct page keys (``>= 0``) of each `block_q`-row tile of ``keys [T,
+    K]``: ``int32[T / block_q]``."""
+    tiles = jnp.sort(keys.reshape(keys.shape[0] // block_q, -1), axis=1)
+    new = jnp.concatenate(
+        [tiles[:, :1] >= 0, (tiles[:, 1:] != tiles[:, :-1]) & (tiles[:, 1:] >= 0)],
+        axis=1,
+    )
+    return jnp.sum(new, axis=1, dtype=jnp.int32)
+
+
+def ring_offload(work: jax.Array, replicas: int) -> jax.Array:
+    """``work [dcp]`` per rank (the ranks of a head hold equal work) -> the
+    work each head hands to the previous one around the ring, ``f [heads]``
+    (``>= 0``, one of them 0), so that ``work_h - f_h + f_{h + 1}`` is the
+    mean for every head."""
+    w = work.reshape(-1, replicas).astype(jnp.float32).max(axis=1)
+    excess = w - jnp.mean(w)
+    # f_h - f_{h + 1} = excess_h: suffix sums, shifted to a zero minimum.
+    g = jnp.cumsum(excess[::-1])[::-1]
+    g = g - g[0]  # g_0 = sum(excess) = 0 up to rounding
+    return g - jnp.min(g)
+
+
+def _offload_split(unions, offload, rows, block_q):
+    """First tile handed to the helper: the tail tiles whose work (unions
+    plus the per-tile cost) fits `offload`, at most `rows` rows."""
+    work = jnp.where(unions > 0, unions + _BALANCE_TILE_COST, 0).astype(jnp.float32)
+    tail = jnp.cumsum(work[::-1])[::-1]  # work of tiles t..end
+    num_tiles = unions.shape[0]
+    t = jnp.arange(num_tiles, dtype=jnp.int32)
+    first = jnp.min(jnp.where(tail <= offload, t, num_tiles))
+    return jnp.maximum(first, num_tiles - rows // block_q)
+
+
 def uses_dcp_attention(
     num_tokens: int,
     max_num_seqs: int,
@@ -254,9 +329,12 @@ def exchange_head_pages(
     replicas: int,
     head_width: int,
     interpret: bool = False,
+    shift: int = 0,
 ) -> jax.Array:
     """Inside a ``shard_map`` over `axis`: every rank's pages of the KV head
-    this rank (``rank``, ``int32[1]``) owns, ``[replicas, dcp, L / replicas,
+    this rank (``rank``, ``int32[1]``) owns (with `shift`, of the KV head
+    `shift` after it, cyclically: the head it helps under
+    `HP_BALANCE_ENV`), ``[replicas, dcp, L / replicas,
     R, P, head_width]``: ``[j, src, i]`` is rank ``src``'s page ``pages[j *
     L / replicas + i]``, for the `live_part` of ``live`` (``int32[1]``)
     pages of each part ``j``; the others are left unset.
@@ -304,14 +382,17 @@ def exchange_head_pages(
         # Every rank has entered the call: its output buffer is live.
         pl.semaphore_wait(barrier, dcp)
 
+        heads = dcp // replicas
+
         def sends(i, op):
             for d in range(dcp):
                 head, j = divmod(d, replicas)
+                dest = (head - shift) % heads * replicas + j
 
-                def send(d=d, head=head, j=j):
+                def send(dest=dest, head=head, j=j):
                     columns = pl.ds(head * head_width, head_width)
                     src = kv_ref.at[pages_ref[j * part + i], :, :, columns]
-                    op(remote(src, out_ref.at[j, me, i], send_sem, recv_sem, d))
+                    op(remote(src, out_ref.at[j, me, i], send_sem, recv_sem, dest))
 
                 pl.when(i < counts[j])(send)
 
@@ -390,8 +471,10 @@ def _exchange_pages(
     head_width,
     axis,
     interpret,
+    shift=0,
 ):
-    """Every rank's ``pages [L]`` of the KV head each rank owns:
+    """Every rank's ``pages [L]`` of the KV head each rank owns (`shift`:
+    of the head `shift` after it, `exchange_head_pages`):
     ``(kv [L * dcp, S / 8, 4, 2 * D], scales [L * dcp, SCALE_ROWS, 128])``,
     rank ``src``'s page ``pages[j * L / replicas + i]`` at slot ``(j * dcp +
     src) * L / replicas + i``; only the pages `exchange_head_pages` calls
@@ -420,10 +503,13 @@ def _exchange_pages(
         replicas=replicas,
         head_width=head_width,
         interpret=interpret,
+        shift=shift,
     )
-    # Destination rank d = h * replicas + j gets part j of head h.
+    # Destination rank d = h * replicas + j gets part j of head h (+ shift).
     sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
     sc = sc.reshape(replicas, part, heads, 2, sc.shape[-1])
+    if shift:
+        sc = jnp.roll(sc, -shift, axis=2)
     # [dcp, part * 2, lanes]: a [.., 2, lanes] block pads its (8, 128) tiles
     # four times over.
     send_sc = jnp.moveaxis(sc, 2, 0).reshape(dcp, part * 2, sc.shape[-1])
@@ -587,6 +673,8 @@ def _head_parallel_attend(
             # One call over every row: the kernel chunks the rows and writes
             # its output in place; rows outside the round see no page and
             # come back zero (cheap empty tiles).
+            if balance_rows:
+                return balanced(plan, kv, sc, keys, local, limit, page_table, attend, pages)
             out, _ = attend(q, kv, keys, local, limit, page_table)
             return out
 
@@ -602,6 +690,84 @@ def _head_parallel_attend(
             return jax.lax.dynamic_update_slice_in_dim(acc, out, start, 1)
 
         return jax.lax.fori_loop(0, -(-(hi - lo) // window), window_body, acc)
+
+    block_q = hp_prefill_kernel_kwargs()["block_q"]
+    heads = dcp // replicas
+    balance_rows = (
+        hp_balance_rows(block_q, num_tokens)
+        if heads > 1 and num_tokens % block_q == 0
+        else 0
+    )
+
+    def balanced(plan, kv, sc, keys, local, limit, page_table, attend, pages):
+        """The first round with the heads' work balanced (`HP_BALANCE_ENV`):
+        this rank attends its rows before its split, its helper (same
+        replica index, previous head) the rest of its last `balance_rows`
+        rows; it attends the tail rows of the next head itself."""
+        rows = balance_rows
+        single = plan[4] >= max_num_seqs  # one round holds every request
+        unions = tile_unions(keys, block_q)
+        work = jnp.sum(jnp.where(unions > 0, unions + _BALANCE_TILE_COST, 0))
+        work_all = jax.lax.all_gather(work, axis)  # [dcp]
+        offload = ring_offload(work_all, replicas)
+        active = single & (jnp.max(offload) > 0)
+        num_tiles = num_tokens // block_q
+        split = jnp.where(
+            active,
+            _offload_split(unions, offload[rank // replicas], rows, block_q),
+            num_tiles,
+        )
+        row = jnp.arange(num_tokens, dtype=jnp.int32)
+        handed = row >= split * block_q
+        own_keys = jnp.where(handed[:, None], -1, keys)
+        own_local = jnp.where(handed, -1, local)
+        out, _ = attend(q, kv, own_keys, own_local, limit, page_table)
+
+        def help_ring(out):
+            perm = [(d, (d // replicas - 1) % heads * replicas + d % replicas) for d in range(dcp)]
+            back = [(b, a) for a, b in perm]
+            tail = slice(num_tokens - rows, num_tokens)
+            given = handed[tail]
+            meta = jnp.concatenate(
+                [
+                    jnp.where(given[:, None], keys[tail], -1),
+                    jnp.where(given, local[tail], -1)[:, None],
+                    limit[tail][:, None],
+                ],
+                axis=1,
+            )
+            q_in = jax.lax.ppermute(q[tail], axis, perm)
+            meta_in = jax.lax.ppermute(meta, axis, perm)
+            kv2, sc2 = _exchange_pages(
+                kv_cache,
+                scale_cache,
+                pages,
+                plan[3],
+                rank,
+                dcp=dcp,
+                replicas=replicas,
+                head_width=2 * head_dim,
+                axis=axis,
+                interpret=interpret,
+                shift=1,
+            )
+            topk_in = meta_in.shape[1] - 2
+            helped, _ = attend(
+                q_in,
+                kv2,
+                meta_in[:, :topk_in],
+                meta_in[:, topk_in],
+                meta_in[:, topk_in + 1],
+                page_table,
+                scale_cache=sc2,
+            )
+            ret = jax.lax.ppermute(helped, axis, back)  # [Hl, rows, D]
+            mine_tail = jnp.where(given[None, :, None], ret, out[:, tail])
+            return jax.lax.dynamic_update_slice_in_dim(
+                out, mine_tail, num_tokens - rows, 1
+            )
+
+        return jax.lax.cond(active, help_ring, lambda o: o, out)
 
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
     plan = plan_round(first)

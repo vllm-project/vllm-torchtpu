@@ -253,6 +253,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
+    TPU_MINIMAX_M3_DCP_HP_BALANCE: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
 
 
@@ -1610,6 +1611,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bit. Empty always sorts TILE_PAGES entries per tile.
     "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS": env_str(
         "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS", ""
+    ),
+    # MiniMax M3 head-parallel MSA prefill attention (DCP over several KV
+    # heads): balance the KV heads' attention work across the DCP ranks. Each
+    # rank may hand up to this many tail rows of its KV head to the ranks of
+    # the previous KV head (a ring), sized from every head's selected-page
+    # work, so no rank waits for the slowest head. 0 = off.
+    "TPU_MINIMAX_M3_DCP_HP_BALANCE": lambda: int(
+        os.getenv("TPU_MINIMAX_M3_DCP_HP_BALANCE", "0") or 0
     ),
     # MiniMax M3 MSA prefill attention on 4-bit caches (calls with the page
     # cache): ','-separated precision levers, empty = exact incumbent.
