@@ -34,9 +34,11 @@ class WorkerOptions:
     numa_bind: bool = False
     """Before the TPU runtime starts, narrow each worker's CPU set to the NUMA
     node its chip is attached to and prefer that node's memory (see
-    ``vllm_torchtpu.worker.numa_bind``). The inherited CPU set is only ever
-    narrowed, and a rank that does not map onto a chip is left alone. Off by
-    default."""
+    ``vllm_torchtpu.worker.numa_bind``). Ranks are spread evenly over the
+    host's chips, which assumes this engine and its host-local DP engines use
+    the whole host; an engine with a TPU_LOCAL_RANK_OFFSET is left alone. The
+    inherited CPU set is only ever narrowed, and a rank that does not map onto
+    a chip is left alone. Off by default."""
 
 
 def parse(raw: Any) -> WorkerOptions:

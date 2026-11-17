@@ -172,6 +172,18 @@ def test_bind_counts_the_hosts_workers(dp_size, dp_local, expected_ranks):
     bind.assert_called_once_with(3, expected_ranks)
 
 
+def test_bind_leaves_an_engine_with_a_rank_offset_alone():
+    """With TPU_LOCAL_RANK_OFFSET=4 the engine's local ranks 0-3 run on chips
+    past the first four, so mapping them as the host's first ranks would bind
+    them to the wrong node."""
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+    worker = _worker({"numa_bind": True})
+    with patch("vllm_torchtpu.worker.tpu_worker.bind_to_chip_numa_node") as bind:
+        TPUWorker._maybe_bind_numa(worker, 3, dp_size=1, local_rank_offset=4)
+    bind.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "raw, message",
     [
