@@ -46,6 +46,7 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import operator
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
@@ -85,9 +86,8 @@ def _placeholder_value(node: fx.Node) -> Any:
     return node.meta.get("example_value", node.meta.get("val"))
 
 
-def _placeholder_values(graph: fx.GraphModule | Sequence[fx.Node]) -> list[Any]:
-    nodes = _placeholder_nodes(graph) if isinstance(graph, fx.GraphModule) else graph
-    values = (_placeholder_value(node) for node in nodes)
+def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
+    values = (_placeholder_value(node) for node in _placeholder_nodes(graph))
     return [value for value in values if value is not None]
 
 
@@ -171,19 +171,46 @@ def _meta_entry(value: Any) -> Any:
     return (str(value.dtype), dims)
 
 
-def _signature(graph: fx.GraphModule | Sequence[fx.Node]) -> tuple:
+@dataclasses.dataclass(frozen=True)
+class _Input:
+    """A placeholder as a handover compares and names it, without its graph.
+
+    A stored bucket's inputs live until the warmup ends. The fx.Node itself
+    would keep its whole GraphModule -- the compiler's deep copy, with every
+    intermediate's metadata -- alive through ``node.graph`` for that long, one
+    per subgraph and bucket. The example value and Dynamo's source do not.
+    """
+
+    name: str
+    value: Any
+    source: Any  # torch._dynamo.source.Source, or None
+
+
+def _inputs(graph: fx.GraphModule) -> list[_Input]:
+    return [
+        _Input(
+            node.name,
+            _placeholder_value(node),
+            getattr(node.meta.get("grapharg"), "source", None),
+        )
+        for node in _placeholder_nodes(graph)
+    ]
+
+
+def _signature(graph: fx.GraphModule | Sequence[_Input]) -> tuple:
     """The submodule input list, by dtype and shape."""
-    return tuple(_meta_entry(value) for value in _placeholder_values(graph))
+    inputs = _inputs(graph) if isinstance(graph, fx.GraphModule) else graph
+    return tuple(_meta_entry(i.value) for i in inputs if i.value is not None)
 
 
-def _handover_inputs(nodes: Sequence[fx.Node]) -> tuple[tuple[str, Any], ...]:
+def _handover_inputs(inputs: Sequence[_Input]) -> tuple[tuple[str, Any], ...]:
     """The submodule's arguments in call order, by name, dtype and shape.
 
     A handed-over runnable takes its arguments positionally, and two traces of
     one model may lift the same buffers in a different order, so inputs with
     the same names are matched by name rather than position.
     """
-    return tuple((node.name, _meta_entry(_placeholder_value(node))) for node in nodes)
+    return tuple((i.name, _meta_entry(i.value)) for i in inputs)
 
 
 def _input_permutation(
@@ -200,11 +227,11 @@ def _is_int_input(value: Any) -> bool:
     return isinstance(value, (int, torch.SymInt))
 
 
-def _input_source(node: fx.Node) -> str | None:
+def _input_source(graph_input: _Input) -> str | None:
     """Where Dynamo read a graph input from (``L['positions'].size()[0]``),
     or None for a placeholder that is not a Dynamo graph input, such as a
     split subgraph's intermediate."""
-    source = getattr(node.meta.get("grapharg"), "source", None)
+    source = graph_input.source
     return None if source is None else _source_name(source)
 
 
@@ -226,25 +253,25 @@ def _symbol_sources(value: Any) -> str | None:
     return ", ".join(_source_name(s) for s in sources) if sources else None
 
 
-def _describe_input(node: fx.Node) -> str:
-    value = _placeholder_value(node)
-    parts = [f"{node.name} {_meta_entry(value)}"]
+def _describe_input(graph_input: _Input) -> str:
+    value = graph_input.value
+    parts = [f"{graph_input.name} {_meta_entry(value)}"]
     if isinstance(value, torch.SymInt):
         parts.append(f"expr={value.node.expr}")
-    source = _input_source(node) or _symbol_sources(value)
+    source = _input_source(graph_input) or _symbol_sources(value)
     if source:
         parts.append(f"from {source}")
     return " ".join(parts)
 
 
-def _symbol_fate(nodes: Sequence[fx.Node], source: str | None) -> str | None:
+def _symbol_fate(inputs: Sequence[_Input], source: str | None) -> str | None:
     """What a trace's ShapeEnv concluded about the symbol read from ``source``:
     its replacement when it was specialized, else its value range."""
     if source is None:
         return None
     shape_env = None
-    for node in nodes:
-        value = _placeholder_value(node)
+    for graph_input in inputs:
+        value = graph_input.value
         if isinstance(value, torch.SymInt):
             shape_env = value.node.shape_env
         else:
@@ -282,7 +309,7 @@ def _signature_delta(stored: Sequence[Any], current: Sequence[Any]) -> str:
 _NAMED_INPUTS_SHOWN = 8
 
 
-def _input_delta(stored: Sequence[fx.Node], current: Sequence[fx.Node]) -> str:
+def _input_delta(stored: Sequence[_Input], current: Sequence[_Input]) -> str:
     """:func:`_signature_delta` of two traces' inputs, naming the inputs that
     account for it: placeholder, dtype and shape, and the source Dynamo read it
     from, so the model code that lifts one and not the other can be found."""
@@ -290,27 +317,27 @@ def _input_delta(stored: Sequence[fx.Node], current: Sequence[fx.Node]) -> str:
     current_entries = _signature(current)
     delta = _signature_delta(stored_entries, current_entries)
 
-    def unmatched(side: Sequence[fx.Node], other: Sequence[fx.Node]) -> list[fx.Node]:
+    def unmatched(side: Sequence[_Input], other: Sequence[_Input]) -> list[_Input]:
         extra = Counter(_signature(side)) - Counter(_signature(other))
         other_keys = set(_handover_inputs(other))
-        nodes = []
-        for node, key in zip(side, _handover_inputs(side)):
+        inputs = []
+        for graph_input, key in zip(side, _handover_inputs(side)):
             if key not in other_keys and extra[key[1]] > 0:
                 extra[key[1]] -= 1
-                nodes.append(node)
-        return nodes
+                inputs.append(graph_input)
+        return inputs
 
-    def render(nodes: list[fx.Node], other: Sequence[fx.Node]) -> str:
+    def render(inputs: list[_Input], other: Sequence[_Input]) -> str:
         shown = []
-        for node in nodes[:_NAMED_INPUTS_SHOWN]:
-            text = _describe_input(node)
-            if _is_int_input(_placeholder_value(node)):
-                fate = _symbol_fate(other, _input_source(node))
+        for graph_input in inputs[:_NAMED_INPUTS_SHOWN]:
+            text = _describe_input(graph_input)
+            if _is_int_input(graph_input.value):
+                fate = _symbol_fate(other, _input_source(graph_input))
                 if fate:
                     text += f" ({fate})"
             shown.append(text)
-        if len(nodes) > _NAMED_INPUTS_SHOWN:
-            shown.append(f"... {len(nodes) - _NAMED_INPUTS_SHOWN} more")
+        if len(inputs) > _NAMED_INPUTS_SHOWN:
+            shown.append(f"... {len(inputs) - _NAMED_INPUTS_SHOWN} more")
         return "; ".join(shown)
 
     only_stored = unmatched(stored, current)
@@ -360,7 +387,7 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], list[fx.Node]]
+            tuple[str | None, str], tuple[Callable[..., Any], list[_Input]]
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
@@ -371,20 +398,20 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, stored_nodes = found
-        current_nodes = _placeholder_nodes(graph)
-        stored = _handover_inputs(stored_nodes)
-        current = _handover_inputs(current_nodes)
+        runnable, stored_inputs = found
+        current_inputs = _inputs(graph)
+        stored = _handover_inputs(stored_inputs)
+        current = _handover_inputs(current_inputs)
         if stored == current:
             return runnable
         if sorted(name for name, _ in stored) != sorted(name for name, _ in current):
             # Renamed placeholders: match by position, dtype and shape.
-            if _signature(current_nodes) == _signature(stored_nodes):
+            if _signature(current_inputs) == _signature(stored_inputs):
                 return runnable
-            raise _handover_error(key, _input_delta(stored_nodes, current_nodes))
+            raise _handover_error(key, _input_delta(stored_inputs, current_inputs))
         perm = _input_permutation(stored, current)
         if perm is None:
-            raise _handover_error(key, _input_delta(stored_nodes, current_nodes))
+            raise _handover_error(key, _input_delta(stored_inputs, current_inputs))
         logger.info(
             "[shape-variants] %s handed over with %d of %d inputs reordered",
             key,
@@ -406,10 +433,10 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        # The placeholders are kept, not just their dtypes and shapes, so a
-        # refused handover can name the inputs that differ and where Dynamo
-        # read them from.
-        self._runnables[(cache_dir, key)] = (runnable, _placeholder_nodes(graph))
+        # The inputs' names, values and sources are kept, not just their dtypes
+        # and shapes, so a refused handover can name the inputs that differ and
+        # where Dynamo read them from.
+        self._runnables[(cache_dir, key)] = (runnable, _inputs(graph))
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
