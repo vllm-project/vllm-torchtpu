@@ -85,7 +85,9 @@ def test_options_are_strict(raw, message):
 
 def test_hook_is_installed_at_platform_import():
     import vllm_torchtpu.platforms  # noqa: F401
+    from vllm_torchtpu import patch_registry
 
+    assert "vllm_torchtpu.compilation.fast_dispatch:install" in patch_registry._applied
     assert fast_dispatch._INSTALLED
     assert torch.compile.__name__ == "compile"
     assert torch.compile.__code__.co_name == "compile_hook"
