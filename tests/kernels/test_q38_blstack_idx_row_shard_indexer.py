@@ -183,12 +183,12 @@ CASES = {
 }
 
 
-def _decode_env(monkeypatch, query_block, mixed_only):
+def _decode_env(monkeypatch, query_block, mixed_only, kv_block=1024):
     monkeypatch.setattr(pooled_qsa, "decode_query_chunk_size", lambda pages: 4)
     if query_block:
         monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", str(query_block))
-        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", "1024")
-        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", "1024")
+        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", str(kv_block))
+        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", str(kv_block))
     else:
         monkeypatch.delenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", raising=False)
     if mixed_only:
@@ -197,29 +197,36 @@ def _decode_env(monkeypatch, query_block, mixed_only):
         monkeypatch.delenv("VLLM_TPU_QSA_INDEXER_MIXED_ONLY", raising=False)
 
 
-# (data, DCP, query block, mixed-only): the served decode indexer shape (query
-# block 4, mixed pass only, DCP 4) on integer, Gaussian and dyadic data, plus
-# the decode passes and the per-token path at DCP 2 / 4.
+# (data, DCP, query block, mixed-only, KV block): the served decode indexer
+# shape (query block 4, mixed pass only, DCP 4) on integer, Gaussian and dyadic
+# data, plus the decode passes and the per-token path at DCP 2 / 4. With the
+# decode passes on (mixed-only off) a shard can start a window on a 1-row
+# request, which then takes a decode pass instead of the mixed pass; XLA:CPU
+# rounds that pass's 1024-key reduction of integer data differently in the last
+# bit (blidx-dev2 j-c8822ecd: 4 of 176 scores, 1 ULP), the case
+# test_qwen4_exp_shared_stream_indexer.py checks with dyadic data. So those
+# variants use dyadic data at 1024 keys and integer data at 256 keys.
 VARIANTS = [
-    ("integer", 4, 4, True),
-    ("normal", 4, 4, True),
-    ("dyadic", 2, 4, True),
-    ("integer", 2, 4, False),
-    ("integer", 4, 0, False),
+    ("integer", 4, 4, True, 1024),
+    ("normal", 4, 4, True, 1024),
+    ("dyadic", 2, 4, True, 1024),
+    ("dyadic", 2, 4, False, 1024),
+    ("integer", 2, 4, False, 256),
+    ("integer", 4, 0, False, 1024),
 ]
 
 
 @pytest.mark.parametrize("case", sorted(CASES))
-@pytest.mark.parametrize("data,d,query_block,mixed_only", VARIANTS)
+@pytest.mark.parametrize("data,d,query_block,mixed_only,kv_block", VARIANTS)
 def test_row_shards_equal_unsharded_lists(
-    monkeypatch, reference_kernel, case, data, d, query_block, mixed_only
+    monkeypatch, reference_kernel, case, data, d, query_block, mixed_only, kv_block
 ):
     q_lens, context, tokens = CASES[case]
     args = inputs(len(case) + 7 * d, q_lens, context, tokens, data)
-    _decode_env(monkeypatch, query_block, mixed_only)
+    _decode_env(monkeypatch, query_block, mixed_only, kv_block)
     n = check_row_shards(args, d, 2, max(q_lens), exact=data != "normal")
     print(f"Q38_BLIDX ROWSHARD_EQUAL case={case} data={data} d={d} shards=2 "
-          f"qb={query_block} mixed_only={int(mixed_only)} rows_checked={n}")
+          f"qb={query_block} mixed_only={int(mixed_only)} kv={kv_block} rows_checked={n}")
 
 
 @pytest.mark.parametrize("case", ["short_and_long", "verify_aligned"])
