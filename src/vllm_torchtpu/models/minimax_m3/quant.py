@@ -222,8 +222,9 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             _get_quantized_matmul_op()
             logger.info_once(
                 "MXFP8 linears run W8A8 (per-token e4m3 activations, fp8 MXU) "
-                "for token buckets of <= %d rows "
-                "(TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS).",
+                "for token buckets of %d..%d rows "
+                "(TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS/MAX_ROWS).",
+                max(1, envs.TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS),
                 envs.TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS,
             )
         logger.debug(
@@ -243,8 +244,11 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         if layer.weight.dtype != torch.float8_e4m3fn:
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
         rows = math.prod(x.shape[:-1])
-        if 0 < rows <= envs.TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS and (
-            x.dtype == torch.bfloat16
+        if (
+            max(1, envs.TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS)
+            <= rows
+            <= envs.TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS
+            and x.dtype == torch.bfloat16
         ):
             # Rows are static at trace time, so each bucket picks one path.
             return quantized_matmul(x, layer.weight, layer.weight_scale)
