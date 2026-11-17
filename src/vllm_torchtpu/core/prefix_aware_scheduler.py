@@ -39,7 +39,6 @@ Do not name it on a pipeline-parallel (PP > 1) leg: the platform then keeps
 the configured class and turns pipeline chunk sizing off.
 """
 
-import math
 import time
 from bisect import bisect_right
 from itertools import islice
@@ -71,27 +70,12 @@ _PACK_PROMPT_IDS_MIN_TOKENS = 1024
 _SMALL_STEP_BLOCKS = 2
 
 # Priority tiers: lower values admit earlier.
-_TIER_FREE_BLOCK_FIT = 0
 _TIER_PREEMPTED = 1
 _TIER_NORMAL = 2
 
 
 def _is_decoding(request: Request) -> bool:
     return request.num_computed_tokens >= request.num_prompt_tokens > 0
-
-
-def _wait_seconds(request: Request, now: float) -> float:
-    """Seconds since ``request.arrival_time``.
-
-    ``arrival_time`` is the wall-clock time (``time.time()``) at which this
-    engine's API server received the request; on a disaggregated prefill leg
-    that is the proxy's prefill hop. It covers time in the waiting queue and
-    time in ``running``, and does not reset on preemption.
-    """
-    arrival = getattr(request, "arrival_time", None)
-    if arrival is None:
-        return 0.0
-    return max(now - float(arrival), 0.0)
 
 
 def _hit_signature(result) -> tuple:
@@ -304,19 +288,6 @@ class PrefixAwareScheduler(AsyncScheduler):
             cast(Any, request)._paw_hit_cache = cached
         return cached
 
-    def _get_paw_aging_rate(self) -> float:
-        """Uncached prompt tokens credited per second a request has waited.
-
-        0 (no aging) unless a scheduler that borrows these helpers sets
-        ``_paw_aging_tok_per_s``.
-        """
-        return float(getattr(self, "_paw_aging_tok_per_s", 0.0) or 0.0)
-
-    def _now(self) -> float:
-        """Wall-clock time of the current schedule() call."""
-        now = getattr(self, "_step_wall_time", None)
-        return time.time() if now is None else now
-
     def _note_waiting_stop(self, request: Request, reason: str) -> None:
         """Records why the waiting loop stopped at ``request`` (first stop of
         the step wins; running requests are ignored)."""
@@ -394,8 +365,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         # partial prefill takes min(remaining, budget), so a prefill ahead of
         # a decoder can leave it no tokens. Stably move every decoding request
         # ahead of every prefilling one.
-        now_wall = time.time()
-        self._step_wall_time = now_wall
         decoding = [r for r in self.running if _is_decoding(r)]
         prefilling = [r for r in self.running if not _is_decoding(r)]
         if prefilling and decoding:
@@ -440,7 +409,6 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
             return out
         finally:
-            self._step_wall_time = None
             self._step_wait_event = None
 
     def _waiting_loop_stop_reason(self, out, waiting_at_start: int) -> str:
@@ -515,13 +483,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Formats the sampled step's admission state plus the per-minute step
         counters, and resets the counters."""
         tm = getattr(self, "_tm", None) or {}
-        reserved = "-"
-        fn = getattr(self, "_inflight_prefill_reserved_blocks", None)
-        if callable(fn) and hasattr(self, "_inflight_prefills"):
-            try:
-                reserved = str(fn())
-            except Exception:
-                reserved = "-"
         pool_free = "-"
         pool = getattr(getattr(self, "kv_cache_manager", None), "block_pool", None)
         get_free = getattr(pool, "get_num_free_blocks", None)
@@ -533,7 +494,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         stops = dict(sorted((tm.get("stops") or {}).items(), key=lambda kv: -kv[1]))
         text = (
             f"stop={stop} "
-            f"inflight_reserved={reserved} pool_free={pool_free} "
+            f"pool_free={pool_free} "
             f"min_steps={tm.get('steps', 0)} "
             f"min_small_steps_waiting={tm.get('small_steps_waiting', 0)} "
             f"min_stops={format_counts(stops)}"
@@ -607,34 +568,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         except Exception:
             return None
         if isinstance(free_blocks, int) and not isinstance(free_blocks, bool):
-            retention = getattr(self, "_retention", None) or getattr(
-                self, "_hybrid_retention", None
-            )
-            num_pinned_fn = (
-                getattr(retention, "num_pinned_blocks", None)
-                if retention is not None
-                else None
-            )
-            if callable(num_pinned_fn):
-                free_blocks += int(num_pinned_fn())
-            else:
-                for lru_attr in ("_conv_lru", "_fork_lru"):
-                    lru = (
-                        getattr(retention, lru_attr, None)
-                        if retention is not None
-                        else None
-                    )
-                    if lru:
-                        for entry in lru.values():
-                            blocks = getattr(entry, "blocks", None)
-                            if (
-                                blocks is None
-                                and isinstance(entry, tuple)
-                                and len(entry) > 1
-                            ):
-                                blocks = entry[1]
-                            if isinstance(blocks, (list, tuple, set)):
-                                free_blocks += len(blocks)
             return free_blocks
         return None
 
@@ -754,33 +687,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         cast(Any, request)._tpu_local_hit_tokens = num_local
         return blocks, num_local, shared_prefix_boundary, hit_diverged
 
-    def _external_warmth(self, request: Request, local_warmth: int) -> int:
-        if getattr(self, "_is_kv_consumer", False):
-            return 0
-        connector = getattr(self, "connector", None)
-        if connector is None:
-            return 0
-        fn = getattr(connector, "estimate_external_hit_tokens", None)
-        if not callable(fn):
-            return 0
-        if request.num_tokens - local_warmth < self._get_block_size():
-            return 0
-        try:
-            return max(0, int(fn(request, local_warmth) or 0))
-        except Exception:
-            return 0
-
     def _rank_and_warmth(
-        self,
-        request: Request,
-        free_blocks_for_fit: int | None = None,
-        now: float | None = None,
+        self, request: Request
     ) -> tuple[tuple[int, float, float], int]:
-        """Return (sort_key, warmth). Lower sort_key is admitted first.
-
-        ``_promote_warmest`` also passes ``free_blocks_for_fit`` and ``now``,
-        which the pipeline-parallel prefill scheduler's own ranking uses.
-        """
+        """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
@@ -809,31 +719,7 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         window = list(islice(queue, self.WINDOW))
         head = window[0]
-        now = self._now()
-        head_scored = self._rank_and_warmth(head, now=now)
-        head_local_warmth = self._prefix_warmth(head)
-
-        free_blocks = (
-            None
-            if getattr(self, "_is_kv_consumer", False)
-            else self._get_num_free_blocks()
-        )
-        free_blocks_for_fit: int | None = None
-        if free_blocks is not None:
-            head_cold_tokens = max(head.num_tokens - head_local_warmth, 0)
-            head_needed_blocks = math.ceil(head_cold_tokens / self._get_block_size())
-            if free_blocks < head_needed_blocks:
-                free_blocks_for_fit = free_blocks
-
-        scored = [(head_scored, head)] + [
-            (
-                self._rank_and_warmth(
-                    r, free_blocks_for_fit=free_blocks_for_fit, now=now
-                ),
-                r,
-            )
-            for r in window[1:]
-        ]
+        scored = [(self._rank_and_warmth(r), r) for r in window]
         (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
 
         if best is not head and best_rank < scored[0][0][0]:
