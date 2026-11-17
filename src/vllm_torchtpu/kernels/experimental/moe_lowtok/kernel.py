@@ -607,8 +607,12 @@ def table_offsets(n_experts, nc=HOT_SLOTS):
     return o_gid, o_hot, o_hprim, o_hcopy, o_slot, length
 
 
-def pack_tables(rank, gid, hot, hprim, hcopy, slot):
-    """Pack the scalar tables for a copy-enabled layer into one flat int32 array."""
+def pack_tables(experts_start, gid, hot, hprim, hcopy, slot):
+    """Pack the scalar tables for a copy-enabled layer into one flat int32 array.
+
+    `experts_start` is the rank's first primary id, rank * owned; the kernel
+    recovers the rank from it (`tab_s[0] // owned`).
+    """
     gid = np.asarray(gid, np.int32).reshape(-1)
     hot, hprim, hcopy = (
         np.asarray(t, np.int32).reshape(-1) for t in (hot, hprim, hcopy)
@@ -622,7 +626,7 @@ def pack_tables(rank, gid, hot, hprim, hcopy, slot):
         raise ValueError("hot, hprim and hcopy must be the same length")
     o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(gid.size, hot.size)
     tab = np.full((length,), -1, np.int32)
-    tab[0] = int(rank)
+    tab[0] = int(experts_start)
     tab[o_gid : o_gid + gid.size] = gid
     tab[o_hot : o_hot + hot.size] = hot
     tab[o_hprim : o_hprim + hot.size] = hprim
