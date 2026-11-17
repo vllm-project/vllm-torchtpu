@@ -49,6 +49,7 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, get_ep_group
 from vllm_torchtpu.logger import init_logger
@@ -87,7 +88,8 @@ def active(num_tokens: int, min_tokens: int, tp_size: int) -> bool:
 def _jax_op(name: str, body, mesh, fake, with_rank: bool = False):
     """A torch op running `body` per rank. with_rank: the op also takes the
     Pallas all-reduce's rank operand ([1, 1] int32, unused by `body`)."""
-    axis = mesh.axis_names[0]
+    axis = tuple(mesh.axis_names)
+    axis = axis[0] if len(axis) == 1 else axis
     specs = (P(axis), P(axis)) if with_rank else (P(axis),)
 
     def per_rank(x, *_rank):
@@ -123,24 +125,62 @@ def _jax_op(name: str, body, mesh, fake, with_rank: bool = False):
     return op
 
 
+def _chip_mesh(mesh):
+    """`mesh` as a (chip, core) mesh, the same devices in the same order, when
+    each chip's cores sit next to each other in it; else None."""
+    import numpy as np
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
+
+    topo = get_chip_topology()
+    if topo is None or topo.cores_per_chip < 2:
+        return None
+    cpc = topo.cores_per_chip
+    chip_of = {d: i for i, ids in enumerate(topo.chips) for d in ids}
+    devices = list(mesh.devices.flat)
+    if len(devices) % cpc:
+        return None
+    for i in range(0, len(devices), cpc):
+        if len({chip_of.get(int(d.id)) for d in devices[i : i + cpc]}) != 1:
+            return None
+    return Mesh(
+        np.asarray(devices).reshape(len(devices) // cpc, cpc),
+        axis_names=("chip", "core"),
+    )
+
+
 def _make_ops(mesh, rank: torch.Tensor | None) -> _Ops:
-    axis = mesh.axis_names[0]
     n = int(mesh.size)
+    if len(mesh.axis_names) == 2:
+        # Reduce over the cores of a chip first (half the bytes stay on the
+        # chip), then over the chips; the gather undoes it in reverse, so the
+        # token slices come back in order.
+        def rs(x):
+            x = lax.psum_scatter(x, "core", scatter_dimension=0, tiled=True)
+            return lax.psum_scatter(x, "chip", scatter_dimension=0, tiled=True)
 
-    def rs(x):
-        return lax.psum_scatter(x, axis, scatter_dimension=0, tiled=True)
+        def ag(x):
+            x = lax.all_gather(x, "chip", axis=0, tiled=True)
+            return lax.all_gather(x, "core", axis=0, tiled=True)
 
-    def ag(x):
-        return lax.all_gather(x, axis, axis=0, tiled=True)
+    else:
+        axis = mesh.axis_names[0]
+
+        def rs(x):
+            return lax.psum_scatter(x, axis, scatter_dimension=0, tiled=True)
+
+        def ag(x):
+            return lax.all_gather(x, axis, axis=0, tiled=True)
 
     def ag8(x):
         xf = x.astype(jnp.float32)
         scale = jnp.maximum(jnp.max(jnp.abs(xf), axis=-1, keepdims=True), _SCALE_FLOOR)
         scale = scale / FP8_MAX
         q = (xf / scale).astype(jnp.float8_e4m3fn)
-        q = lax.all_gather(lax.bitcast_convert_type(q, jnp.uint8), axis, axis=0, tiled=True)
+        q = ag(lax.bitcast_convert_type(q, jnp.uint8))
         q = lax.bitcast_convert_type(q, jnp.float8_e4m3fn)
-        scale = lax.all_gather(scale, axis, axis=0, tiled=True)
+        scale = ag(scale)
         return (q.astype(jnp.float32) * scale).astype(x.dtype)
 
     def fake_rs(x):
@@ -188,11 +228,23 @@ def arm() -> None:
 
     armed = pallas_all_reduce._ARMED
     rank = armed.rank if armed is not None and armed.ranks == tp_ranks else None
+    hier = False
+    if envs.TPU_MINIMAX_M3_SP_HIERARCHICAL:
+        chip_mesh = _chip_mesh(mesh)
+        if chip_mesh is None:
+            logger.warning(
+                "TPU_MINIMAX_M3_SP_HIERARCHICAL: the TP mesh does not hold each "
+                "chip's cores together; flat collectives."
+            )
+        else:
+            mesh, hier = chip_mesh, True
     _OPS = _make_ops(mesh, rank)
     logger.info(
         "TPU_MINIMAX_M3_SP_MIN_TOKENS: sequence-parallel collectives armed over "
-        "%d ranks.",
+        "%d ranks (TPU_MINIMAX_M3_SP_HIERARCHICAL=%d, mesh %s).",
         _OPS.n,
+        int(hier),
+        dict(mesh.shape),
     )
 
 

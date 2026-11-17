@@ -257,6 +257,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_MIN_TOKENS: int = 0
     TPU_MINIMAX_M3_SP_GATHER: str = "bf16"
     TPU_MINIMAX_M3_SP_ATTN_GATHER: str = "bf16"
+    TPU_MINIMAX_M3_SP_HIERARCHICAL: bool = False
 
 
 def env_with_choices(
@@ -1639,6 +1640,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The same for the all-gather in front of the attention qkv projection.
     "TPU_MINIMAX_M3_SP_ATTN_GATHER": env_with_choices(
         "TPU_MINIMAX_M3_SP_ATTN_GATHER", "bf16", ["bf16", "fp8"]
+    ),
+    # The sequence-parallel reduce-scatter and all-gather in two steps, over
+    # the cores of a chip and then over the chips (the order the all-reduce's
+    # SparseCore hierarchical lowering takes), instead of one flat collective
+    # over the TP group.
+    "TPU_MINIMAX_M3_SP_HIERARCHICAL": env_bool(
+        "TPU_MINIMAX_M3_SP_HIERARCHICAL", default=False
     ),
 }
 
