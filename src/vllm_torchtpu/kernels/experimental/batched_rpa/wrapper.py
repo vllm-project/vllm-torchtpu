@@ -243,6 +243,8 @@ def calculate_block_sizes(
     ``decode_batch_size`` is the most sequences one decode step works on
     concurrently; 8 is the experimentally chosen default.
 
+    ``tuned_tiles`` applies the tile rules tuned with this kernel (a model
+    rule in the attention backend turns them on):
     - decode VMEM counts the compute tiles once rather than per lane, plus the
       K/V tiles and sub-chunk scores Mosaic spills when q is split, against a
       cap of 85% of VMEM with an fp8 KV cache and 75% otherwise;
@@ -672,6 +674,9 @@ def ragged_paged_attention(
         decode_query_size: Number of query tokens in decode (1 by default, can be
             higher in case of speculative decoding).
         decode_batch_size: Most sequences a decode step works on concurrently.
+        tuned_tiles: Choose the default block sizes with the tuned tile rules
+            (see `calculate_block_sizes`). Defaults to False: the heuristic's
+            tiles.
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
