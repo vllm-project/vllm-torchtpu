@@ -88,7 +88,7 @@ def rotary_embedding_wan_forward(
 
 @functools.cache
 def _first_half_lanes(width: int, head_dim: int, device: torch.device) -> torch.Tensor:
-    return (torch.arange(width) % head_dim < head_dim // 2).to(device)
+    return torch.arange(width, device=device) % head_dim < head_dim // 2
 
 
 def split_rope_natural_tables(
@@ -129,8 +129,14 @@ def apply_split_rotary_half_swap(
     processor casts it.
     """
     half = head_dim // 2
+    width = x.shape[-1]
+    lanes = (
+        torch.arange(width, device=x.device) % head_dim < half
+        if torch.compiler.is_compiling()
+        else _first_half_lanes(width, head_dim, x.device)
+    )
     swapped = torch.where(
-        _first_half_lanes(x.shape[-1], head_dim, x.device),
+        lanes,
         x.roll(-half, dims=-1),
         x.roll(half, dims=-1),
     )
