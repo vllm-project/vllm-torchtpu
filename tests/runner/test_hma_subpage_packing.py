@@ -275,7 +275,7 @@ def _call_rpa_impl(
     *,
     seq_len: int,
     skip_kv_update: bool = False,
-    subpage_split: int = 1,
+    page_stride: int | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     num_q = query.shape[0]
     return attn_module._pallas_rpa_kernel_impl(
@@ -295,7 +295,7 @@ def _call_rpa_impl(
         sliding_window=None,
         skip_kv_update=skip_kv_update,
         rpa_func=None,
-        subpage_split=subpage_split,
+        page_stride=page_stride,
     )
 
 
@@ -596,10 +596,10 @@ def test_shared_cache_materializer_rejects_incompatible_subpage_specs():
         )
 
 
-def test_pallas_rpa_kernel_impl_4d_pool_rem_stride_for_subpages(
+def test_pallas_rpa_kernel_impl_4d_pool_page_stride_for_subpages(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """4D pool reshape scales block_tables by page_stride // subpage_split."""
+    """4D pool reshape scales block_tables by page_stride (or _page_stride)."""
     captured_metadata: list[Any] = []
     captured_kv_shapes: list[tuple[int, ...]] = []
 
@@ -617,7 +617,7 @@ def test_pallas_rpa_kernel_impl_4d_pool_rem_stride_for_subpages(
     block_tables = jnp.array([[2, 3, 6, 7]], dtype=jnp.int32)
 
     new_pool, _ = _call_rpa_impl(
-        pool_4d, query, key, value, block_tables, seq_len=512, subpage_split=2
+        pool_4d, query, key, value, block_tables, seq_len=512, page_stride=1
     )
     assert new_pool.shape == pool_4d.shape
     assert captured_kv_shapes[-1] == (8, 256, 2, 2, 512)
@@ -625,7 +625,7 @@ def test_pallas_rpa_kernel_impl_4d_pool_rem_stride_for_subpages(
 
     unsplit_tables = jnp.array([[1, 3]], dtype=jnp.int32)
     _call_rpa_impl(
-        pool_4d, query, key, value, unsplit_tables, seq_len=512, subpage_split=1
+        pool_4d, query, key, value, unsplit_tables, seq_len=512, page_stride=None
     )
     assert jnp.array_equal(captured_metadata[-1].block_tables, unsplit_tables * 2)
 
@@ -693,7 +693,7 @@ def test_write_then_read_4d_pool_subpage_byte_equivalence(
         val_512,
         kernel_bt,
         seq_len=num_tokens,
-        subpage_split=2,
+        page_stride=1,
     )
     assert written_pool_4d.shape == (4, 256, 2, 2048)
     for b in (0, 1, 3):
@@ -709,7 +709,7 @@ def test_write_then_read_4d_pool_subpage_byte_equivalence(
         kernel_bt,
         seq_len=num_tokens,
         skip_kv_update=True,
-        subpage_split=2,
+        page_stride=1,
     )
     assert len(read_back_kv) == 1
     recovered_k, recovered_v = read_back_kv[0]
@@ -717,8 +717,8 @@ def test_write_then_read_4d_pool_subpage_byte_equivalence(
     assert jnp.array_equal(recovered_v, val_512)
 
 
-def test_default_pallas_backend_impl_rejects_subpage_split_gt_1():
-    """Default PallasAttentionBackendImpl raises NotImplementedError on split > 1."""
+def test_default_pallas_backend_impl_rejects_custom_page_stride():
+    """Default PallasAttentionBackendImpl rejects custom page_stride."""
     impl = PallasAttentionBackendImpl(
         num_heads=4,
         head_size=256,
@@ -728,10 +728,10 @@ def test_default_pallas_backend_impl_rejects_subpage_split_gt_1():
         sliding_window=None,
         kv_cache_dtype="auto",
     )
-    impl.set_subpage_split(2)
+    impl.set_page_stride(1)
     with (
         set_vllm_model_wrapper_context(mesh=cast(Any, None)),
-        pytest.raises(NotImplementedError, match="does not support sub-page split"),
+        pytest.raises(NotImplementedError, match="does not support custom page_stride"),
     ):
         impl._build_rpa_kernel(None, None, None)
 
@@ -898,10 +898,10 @@ def test_initialize_kv_cache_subpage_glue_and_shared_layer_aliases(
         512,
     )
 
-    assert impl_swa._subpage_split == 1
-    assert impl_full_shared_region._subpage_split == 2
-    assert impl_full_unpaired_5d._subpage_split == 2
-    assert impl_full_kv_alias._subpage_split == 2
+    assert impl_swa._page_stride is None
+    assert impl_full_shared_region._page_stride == 1
+    assert impl_full_unpaired_5d._page_stride == 1
+    assert impl_full_kv_alias._page_stride == 1
     assert subpage_glue_env.runner._attention_kernel_block_size == 256
     assert subpage_glue_env.runner._attention_kv_cache_group_id == 1
 

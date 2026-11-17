@@ -624,14 +624,23 @@ class KVCacheManager:
             for entry in supported
         )
 
-    def _try_shrink_swa_specs(
+    def _adjust_swa_specs(
         self,
         kv_cache_specs: dict[str, KVCacheSpec],
         native_bytes: dict[str, int],
         backend_cls: type[_TpuKVCacheBackend],
         block_size: int,
     ) -> dict[str, KVCacheSpec] | None:
-        """Shrink oversized `SlidingWindowSpec` blocks so all groups share `min_bs`."""
+        """Adjust oversized `SlidingWindowSpec` blocks so all groups share `min_bs`.
+
+        When auto-selected `block_size` (e.g. 256 at `2048 < max_model_len <= 8192`)
+        makes SWA native pages larger than the smallest-page group, scaling up the
+        smaller group would coarsen `scheduler_block_size` without relieving
+        per-request KV reservation. Shrinking SWA `block_size` to match
+        `min_native_bytes` keeps `scheduler_block_size` fine-grained, provided the
+        smaller kernel page size is supported and fits within the SMEM per-request
+        page-table bound (`min_tpu_page`).
+        """
         if self.runner.cache_config.user_specified_block_size:
             return None
 
@@ -698,7 +707,7 @@ class KVCacheManager:
         )
         return shrunk_specs
 
-    def _scale_up_smaller_specs(
+    def _pad_to_uniform_page_size(
         self,
         kv_cache_specs: dict[str, KVCacheSpec],
         native_bytes: dict[str, int],
@@ -756,16 +765,21 @@ class KVCacheManager:
         if native_bytes is None:
             return kv_cache_specs
 
-        shrunk = self._try_shrink_swa_specs(
-            kv_cache_specs, native_bytes, backend_cls, block_size
-        )
-        if shrunk is not None:
+        if (
+            shrunk := self._adjust_swa_specs(
+                kv_cache_specs, native_bytes, backend_cls, block_size
+            )
+        ) is not None:
             return shrunk
 
-        scaled = self._scale_up_smaller_specs(
-            kv_cache_specs, native_bytes, backend_cls, block_size
-        )
-        return scaled if scaled is not None else kv_cache_specs
+        if (
+            scaled := self._pad_to_uniform_page_size(
+                kv_cache_specs, native_bytes, backend_cls, block_size
+            )
+        ) is not None:
+            return scaled
+
+        return kv_cache_specs
 
     def _pad_native_attention_regions(
         self,
@@ -2297,7 +2311,7 @@ class KVCacheManager:
             if isinstance(attn_mod, Attention) and isinstance(
                 attn_mod.impl, PallasAttentionBackendImpl
             ):
-                attn_mod.impl.set_subpage_split(split)
+                attn_mod.impl.set_page_stride(1 if split > 1 else None)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.

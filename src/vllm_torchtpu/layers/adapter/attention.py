@@ -282,7 +282,7 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
-    subpage_split: int = 1,
+    page_stride: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
@@ -315,20 +315,22 @@ def _pallas_rpa_kernel_impl(
             )
         native_page_elements = math.prod(native_shape[1:])
         # A padded pool page can span several of this layer's native pages.
-        page_stride = math.prod(pool_shape[1:]) // native_page_elements
+        _page_stride = math.prod(pool_shape[1:]) // native_page_elements
         packing = native_shape[3]
         packed_pool_shape = (pool_shape[0], pool_shape[1], 1, packing, pool_shape[3])
         kv_cache = _reshape_packed_kv_cache(
             kv_cache.reshape(packed_pool_shape),
-            (pool_shape[0] * page_stride, *native_shape[1:]),
+            (pool_shape[0] * _page_stride, *native_shape[1:]),
         )
-        assert page_stride % subpage_split == 0, (
-            f"page_stride ({page_stride}) must be divisible by "
-            f"subpage_split ({subpage_split})"
-        )
-        rem_stride = page_stride // subpage_split
-        if rem_stride > 1:
-            block_tables = block_tables * rem_stride
+        if page_stride is None:
+            page_stride = _page_stride
+        else:
+            assert _page_stride % page_stride == 0, (
+                f"native page_stride ({_page_stride}) must be divisible by "
+                f"page_stride ({page_stride})"
+            )
+        if page_stride > 1:
+            block_tables = block_tables * page_stride
     metadata = AttentionMetadata(
         # NOTE: vLLM applies RoPE before attention,
         # so input_positions is not consumed here.
@@ -563,7 +565,7 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     block_major: bool = False,
-    subpage_split: int = 1,
+    page_stride: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
@@ -595,7 +597,7 @@ def _pallas_rpa_kernel_batched(
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
         block_major=block_major,
-        subpage_split=subpage_split,
+        page_stride=page_stride,
     )
 
 
@@ -963,13 +965,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # `(pool_index, layout)` identifying this layer's region in the merged
         # block-major unified pool; populated by `set_block_major_pool()`.
         self._bm_region: tuple[int, BlockMajorPoolLayout] | None = None
-        self._subpage_split: int = 1
+        self._page_stride: int | None = None
 
-    def set_subpage_split(self, subpage_split: int) -> None:
-        """Set the `KernelBlockTable` sub-page split factor for this layer."""
-        assert subpage_split >= 1
-        if self._subpage_split != subpage_split:
-            self._subpage_split = subpage_split
+    def set_page_stride(self, page_stride: int | None) -> None:
+        """Override the 4D KV pool's `block_tables` stride for this layer."""
+        assert page_stride is None or page_stride >= 1
+        if self._page_stride != page_stride:
+            self._page_stride = page_stride
             self._kernel_config_cache.clear()
 
     def set_block_major_pool(
@@ -1019,7 +1021,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
-            self._subpage_split,
+            self._page_stride,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1062,7 +1064,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
-            self._subpage_split,
+            self._page_stride,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1112,13 +1114,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         "pool"
                     )
                 entry_kwargs["block_major"] = True
-            if self._subpage_split > 1:
-                if "subpage_split" not in entry_params:
+            if self._page_stride is not None:
+                if "page_stride" not in entry_params:
                     raise NotImplementedError(
                         f"{type(self).__name__} kernel {self._kernel_entry.__name__} "
-                        "does not support sub-page split KV cache blocks"
+                        "does not support custom page_stride"
                     )
-                entry_kwargs["subpage_split"] = self._subpage_split
+                entry_kwargs["page_stride"] = self._page_stride
             wrapped_fn = functools.partial(
                 self._kernel_entry,
                 mesh=mesh,
