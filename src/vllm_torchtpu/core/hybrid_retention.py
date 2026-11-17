@@ -251,8 +251,39 @@ class HybridStateRetention:
         self._last_need: int | None = None
 
         if self.enabled:
+            missing = self._missing_hook_targets()
+            if missing:
+                # Hooks installed without these would pin snapshots without
+                # the partial-tail tracking or the eviction under pressure.
+                logger.warning_once(
+                    "Hybrid-state retention is off: this vLLM has no %s, which "
+                    "the retention hooks wrap. GDN snapshots are not kept "
+                    "across turns.",
+                    ", ".join(missing),
+                )
+                self.enabled = False
+        if self.enabled:
             self._install_mamba_manager_hooks()
             self._install_block_pool_guards()
+
+    def _missing_hook_targets(self) -> list[str]:
+        """The vLLM methods the hooks wrap that this vLLM does not have."""
+        managers = self.coordinator.single_type_managers
+        targets: list[tuple[str, Any, str]] = [
+            ("BlockPool", self.block_pool, "get_new_blocks"),
+            ("BlockPool", self.block_pool, "reset_prefix_cache"),
+            ("KVCacheCoordinator", self.coordinator, "get_num_blocks_to_allocate"),
+            ("KVCacheManager", self.kvm, "allocate_slots"),
+        ]
+        for group in self.mamba_groups:
+            for gid in group.group_ids:
+                for name in ("_cache_partial_tail_block", "allocate_new_blocks"):
+                    targets.append((f"MambaManager (group {gid})", managers[gid], name))
+        return [
+            f"{owner}.{name}"
+            for owner, obj, name in targets
+            if not callable(getattr(obj, name, None))
+        ]
 
     def _get_keep_prior_turns(self) -> int:
         if self._explicit_keep_prior is not None:
