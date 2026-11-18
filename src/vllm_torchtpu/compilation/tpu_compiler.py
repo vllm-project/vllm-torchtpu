@@ -324,6 +324,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    # Builds the hierrs_tc reduce-scatter op for the EP MoE combine.
+    "vllm_torchtpu/distributed/hier_reduce_scatter.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
@@ -339,6 +341,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
     # MiniMax-M3 MSA kernels, behind the custom ops of models/minimax_m3/ops.
     "vllm_torchtpu/models/minimax_m3/kernels",
+    # MiniMax-M3 sequence-parallel collectives (JAX ops over the EP mesh).
+    "vllm_torchtpu/models/minimax_m3/sp.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion

@@ -13,12 +13,17 @@
 # limitations under the License.
 """MiniMax M3 (text) on TPU."""
 
-from collections.abc import Iterable
+import contextlib
+from collections.abc import Iterable, Iterator
 
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -33,6 +38,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
+from vllm_torchtpu.models.minimax_m3 import sp
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
@@ -67,6 +73,51 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
+        # Sequence parallelism (`sp`, TPU_MINIMAX_M3_SP_MODE; off = OFF).
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.sp = sp.config_from_env() if self.tp_size > 1 else sp.OFF
+
+    @contextlib.contextmanager
+    def _layer_owned_reductions(self) -> Iterator[None]:
+        """While tracing a sequence-parallel step, o_proj and the FFN return
+        per-rank partial sums and the layer reduces them; every other trace
+        keeps their own all-reduces, so decode programs are unchanged."""
+        o_proj = self.self_attn.o_proj
+        if self.is_moe_layer:
+            experts = self.block_sparse_moe.experts
+            # A MoE op that all-reduces inside it (fused MoE decode / TP
+            # decode kernel) would ignore skip_final_all_reduce.
+            from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+                moe_tp_decode_supported,
+            )
+
+            if getattr(experts, "_fused_moe_decode_armed", False) or (
+                moe_tp_decode_supported(getattr(experts, "_quant_method", None))
+            ):
+                raise ValueError(
+                    "TPU_MINIMAX_M3_SP_MODE needs a MoE that leaves its "
+                    "all-reduce to the model; this layer's MoE op reduces "
+                    "inside it (fused MoE decode / TP decode kernel)."
+                )
+            cfg = experts.moe_config
+            saved = (o_proj.reduce_results, cfg.skip_final_all_reduce)
+            o_proj.reduce_results, cfg.skip_final_all_reduce = False, True
+        else:
+            down = self.mlp.down_proj
+            saved = (o_proj.reduce_results, down.reduce_results)
+            o_proj.reduce_results = down.reduce_results = False
+        try:
+            yield
+        finally:
+            if self.is_moe_layer:
+                o_proj.reduce_results, cfg.skip_final_all_reduce = saved
+            else:
+                o_proj.reduce_results, down.reduce_results = saved
+
+    def _attn(self, positions, hidden_states, index_reuse):
+        if index_reuse is None:
+            return self.self_attn(positions, hidden_states)
+        return self.self_attn(positions, hidden_states, index_reuse)
 
     def forward(
         self,
@@ -74,21 +125,86 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         index_reuse: dict | None = None,
+        attn_rs_tokens=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`index_reuse` (MSA index reuse on) is the step's shared selection
-        dict (`MiniMaxM3SparseAttention.forward`)."""
+        dict (`MiniMaxM3SparseAttention.forward`). `attn_rs_tokens` (an
+        SP_MODE=attn step: the step's token count) reduce-scatters the
+        attention output instead of all-reducing it."""
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        if index_reuse is None:
-            hidden_states = self.self_attn(positions, hidden_states)
-        else:
-            hidden_states = self.self_attn(positions, hidden_states, index_reuse)
+        if attn_rs_tokens is not None:
+            with self._layer_owned_reductions():
+                return self._attn_rs(
+                    positions, hidden_states, residual, index_reuse, attn_rs_tokens
+                )
+        hidden_states = self._attn(positions, hidden_states, index_reuse)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         return ffn(hidden_states), residual
+
+    def _attn_rs(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        index_reuse: dict | None,
+        num_tokens,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each rank gets the new residual stream of its token shard,
+        normalizes it and all-gathers it as the FFN input; the attention
+        partial rides the FFN all-reduce. The returned residual is the
+        pre-attention one, so the next fused add + norm sees
+        ``ffn + attn + residual``."""
+        attn = self._attn(positions, hidden_states, index_reuse)
+        shard = sp.reduce_scatter(attn + residual / self.tp_size)
+        normed = sp.all_gather(
+            self.post_attention_layernorm(shard), self.sp.fp8_gather, num_tokens
+        )
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        out = ffn(normed) + attn
+        return tensor_model_parallel_all_reduce(out), residual
+
+    def forward_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        shard: torch.Tensor | None,
+        num_tokens,
+        index_reuse: dict | None = None,
+    ) -> torch.Tensor:
+        """Sequence-parallel layer (SP_MODE=full): the residual stream stays
+        a token shard.
+
+        `shard` is this rank's rows of the residual stream (None for the
+        first layer, whose `hidden_states` is the full embedding). Norms run
+        on the shard, all-gathers feed attention and the FFN, and their
+        partial outputs are reduce-scattered back onto the shard.
+        `num_tokens`: the step's token count symbol (`sp.all_gather`).
+        """
+        with self._layer_owned_reductions():
+            cfg = self.sp
+            if shard is None:
+                attn = self._attn(
+                    positions, self.input_layernorm(hidden_states), index_reuse
+                )
+                shard = sp.reduce_scatter(
+                    attn + hidden_states / self.tp_size, cfg.attn_hier_rs
+                )
+            else:
+                normed = sp.all_gather(
+                    self.input_layernorm(shard), cfg.fp8_attn_gather, num_tokens
+                )
+                attn = self._attn(positions, normed, index_reuse)
+                shard = shard + sp.reduce_scatter(attn, cfg.attn_hier_rs)
+            ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+            normed = sp.all_gather(
+                self.post_attention_layernorm(shard), cfg.fp8_gather, num_tokens
+            )
+            return shard + sp.reduce_scatter(ffn(normed), cfg.ffn_hier_rs)
 
 
 @support_torch_compile(
@@ -118,6 +234,9 @@ class MiniMaxM3Model(nn.Module):
         self.index_reuse = any(
             layer.self_attn.index_reuse_full is not None for layer in self.layers
         )
+        # Sequence parallelism of large steps (`sp`, TPU_MINIMAX_M3_SP_MODE).
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.sp = sp.config_from_env() if self.tp_size > 1 else sp.OFF
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -136,11 +255,30 @@ class MiniMaxM3Model(nn.Module):
         if 0 in self.aux_hidden_state_layers:
             aux_hidden_states.append(inputs_embeds)
         reuse = {"index_reuse": {}} if getattr(self, "index_reuse", False) else {}
-        for idx, layer in enumerate(self.layers):
-            hidden_states, residual = layer(positions, hidden_states, residual, **reuse)
-            if idx + 1 in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states + residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+        sp_cfg = getattr(self, "sp", sp.OFF)
+        # The token count as the input_ids symbol (lifted first in every
+        # trace; `sp.all_gather` views its output with it).
+        num_tokens = (input_ids if input_ids is not None else inputs_embeds).shape[0]
+        sp_step = sp_cfg.on and sp.step(sp_cfg, num_tokens, self.tp_size)
+        if sp_step and sp_cfg.mode == "full":
+            shard = None
+            for idx, layer in enumerate(self.layers):
+                shard = layer.forward_sp(
+                    positions, inputs_embeds, shard, num_tokens, **reuse
+                )
+                if idx + 1 in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(sp.all_gather(shard, False, num_tokens))
+            hidden_states = sp.all_gather(self.norm(shard), False, num_tokens)
+        else:
+            if sp_step:
+                reuse["attn_rs_tokens"] = num_tokens
+            for idx, layer in enumerate(self.layers):
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, **reuse
+                )
+                if idx + 1 in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(hidden_states + residual)
+            hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

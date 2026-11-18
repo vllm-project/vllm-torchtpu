@@ -6168,6 +6168,30 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.distributed import pallas_all_reduce
 
             pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
+        self._arm_hier_reduce_scatter()
+        if envs.TPU_MINIMAX_M3_SP_MODE != "off" and any(
+            type(m).__name__ == "MiniMaxM3Model" for m in self.model.modules()
+        ):
+            # After the Pallas all-reduce (its rank operand) and hierrs_tc.
+            from vllm_torchtpu.models.minimax_m3 import sp as minimax_m3_sp
+
+            minimax_m3_sp.arm()
+
+    def _arm_hier_reduce_scatter(self) -> None:
+        """Arms TPU_MOE_COMBINE_HIER_RS once, outside Dynamo: it runs
+        collectives."""
+        if not envs.TPU_MOE_COMBINE_HIER_RS:
+            return
+        from vllm_torchtpu.distributed.hier_reduce_scatter import (
+            hier_rs_config,
+            prebuild_hier_reduce_scatter,
+        )
+
+        spec = self.speculative_config
+        prebuild_hier_reduce_scatter(
+            hier_rs_config(),
+            draft_model=spec is not None and spec.method != "ngram",
+        )
 
     def load_lora_model(
         self,

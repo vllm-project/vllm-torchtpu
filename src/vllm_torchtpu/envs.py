@@ -256,6 +256,14 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
     TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE: str = ""
+    TPU_MINIMAX_M3_SP_MODE: str = "off"
+    TPU_MINIMAX_M3_SP_MIN_TOKENS: int = 4096
+    TPU_MINIMAX_M3_SP_FP8_GATHER: bool = False
+    TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
+    TPU_MOE_COMBINE_HIER_RS: bool = False
+    TPU_MOE_COMBINE_HIER_RS_FP8_WIRE: bool = False
+    TPU_MOE_COMBINE_HIER_RS_FP8_SCALE: float = 0.0
+    TPU_MINIMAX_M3_SP_ATTN_HIER_RS: bool = False
 
 
 def env_with_choices(
@@ -1639,6 +1647,53 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Lossy. Prefill steps are unchanged.
     "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE": env_str(
         "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE", ""
+    ),
+    # MiniMax M3 sequence parallelism on steps of at least
+    # TPU_MINIMAX_M3_SP_MIN_TOKENS tokens that are a multiple of TP (0 = never;
+    # `models.minimax_m3.sp`). "attn": the attention output is reduce-scattered
+    # with the residual, the FFN input all-gathered from the normalized token
+    # shard, and the attention partial rides the FFN all-reduce. "full": the
+    # residual stream stays a token shard through every layer (norms on the
+    # shard, all-gather before attention and FFN, reduce-scatter after).
+    # "off": two all-reduces per layer on every step. Not bitwise
+    # (reduction order); decode-sized steps are unchanged.
+    "TPU_MINIMAX_M3_SP_MODE": env_with_choices(
+        "TPU_MINIMAX_M3_SP_MODE", "off", ["off", "attn", "full"]
+    ),
+    "TPU_MINIMAX_M3_SP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_MIN_TOKENS", 4096
+    ),
+    # The FFN-input (and, for "full", the attention-input) all-gather of the
+    # SP stream sends the normalized shard as e4m3 with one f32 scale per row:
+    # half the bytes, and a change to that input's precision (lossy).
+    "TPU_MINIMAX_M3_SP_FP8_GATHER": env_bool(
+        "TPU_MINIMAX_M3_SP_FP8_GATHER", default=False
+    ),
+    "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER": env_bool(
+        "TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER", default=False
+    ),
+    # Hierarchical TensorCore reduce-scatter (`kernels/collectives/hierrs_tc`:
+    # the two cores of each chip first, then a 2-step hypercube between chips)
+    # instead of the group's XLA collective. Armed at load
+    # (`distributed/hier_reduce_scatter.py`) on one tpu7x 2x2x1 host with an
+    # 8-device EP group equal to the DP group (vLLM's MoE combine) or to the TP
+    # group (MiniMax M3 TPU_MINIMAX_M3_SP_MODE=full: the FFN-output
+    # reduce-scatter of its sequence-parallel steps). Calls the kernel cannot
+    # take keep the collective. Not bitwise (bf16 sums in another order).
+    "TPU_MOE_COMBINE_HIER_RS": env_bool("TPU_MOE_COMBINE_HIER_RS", default=False),
+    # With TPU_MOE_COMBINE_HIER_RS: e4m3 between chips, scaled by
+    # TPU_MOE_COMBINE_HIER_RS_FP8_SCALE (required, > 0; partial sums above
+    # 448 / scale clip), on calls of >= 16 MiB per device. LOSSY.
+    "TPU_MOE_COMBINE_HIER_RS_FP8_WIRE": env_bool(
+        "TPU_MOE_COMBINE_HIER_RS_FP8_WIRE", default=False
+    ),
+    "TPU_MOE_COMBINE_HIER_RS_FP8_SCALE": env_float(
+        "TPU_MOE_COMBINE_HIER_RS_FP8_SCALE", 0.0
+    ),
+    # MiniMax M3, TPU_MINIMAX_M3_SP_MODE=full with TPU_MOE_COMBINE_HIER_RS
+    # armed: the attention-output reduce-scatters also run on hierrs_tc.
+    "TPU_MINIMAX_M3_SP_ATTN_HIER_RS": env_bool(
+        "TPU_MINIMAX_M3_SP_ATTN_HIER_RS", default=False
     ),
 }
 
