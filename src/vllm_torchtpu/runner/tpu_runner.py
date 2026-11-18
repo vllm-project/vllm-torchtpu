@@ -102,6 +102,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.sample import vocab_parallel
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     _random_rejection_sample_with_segment_impl,
@@ -246,6 +247,33 @@ _SAMPLER_LIGHT_DEFAULT_RADIX_BITS = 1
 # length it trims (the variants _precompile_spec_sample_verify_fused warms).
 _VERIFY_TRIM_ROWS = 8
 _VERIFY_TRIM_MAX_LEN = 32
+
+
+@dataclass(frozen=True)
+class _LmHeadShard:
+    """This rank's slice of a TP-sharded LM head, for
+    TPU_SAMPLER_VERIFY_VOCAB_PARALLEL.
+
+    With it set, compute_selected_logits and compute_logits_from_hidden_states
+    return this rank's logits shard ([rows, local_width]) instead of the
+    all-gathered full-vocab logits ([rows, org_vocab_size]). A consumer that
+    needs the full logits calls gather_shard_logits, which runs the same
+    all-gather the LM head's logits processor would have run.
+    """
+
+    # Module holding lm_head and logits_processor (greedy_top_tokens).
+    owner: torch.nn.Module
+    # Columns of the shard, padding included (num_embeddings_per_partition).
+    local_width: int
+    # Width of the full logits after the gather drops the vocab padding.
+    org_vocab_size: int
+    # int32 scalars on the device: global token id of local column 0, and
+    # the number of real (non-padding) columns. Device tensors, not ints, so
+    # the compiled verify program is the same on every rank.
+    vocab_start: torch.Tensor
+    vocab_valid: torch.Tensor
+
+
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
@@ -1091,6 +1119,17 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
+        # Set at load when TPU_SAMPLER_VERIFY_VOCAB_PARALLEL is on and the
+        # LM head qualifies (_resolve_lm_head_shard).
+        self._lm_head_shard: _LmHeadShard | None = None
+        self._vocab_parallel_digit_bits = (
+            envs.TPU_SAMPLER_VERIFY_VOCAB_PARALLEL_DIGIT_BITS
+        )
+        if not 1 <= self._vocab_parallel_digit_bits <= 8:
+            raise ValueError(
+                "TPU_SAMPLER_VERIFY_VOCAB_PARALLEL_DIGIT_BITS must be 1 to 8, "
+                f"got {self._vocab_parallel_digit_bits}."
+            )
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(
@@ -4473,6 +4512,17 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 target_argmax=target_argmax,
             )
+        if self._is_shard_logits(logits):
+            # TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: logits is this rank's LM head
+            # shard. Sample on it when the chunk qualifies; otherwise gather
+            # the full logits and take the usual paths below.
+            if self._verify_vocab_parallel_applies(
+                grammar_output, all_greedy, cur_start_idx, cur_end_idx
+            ):
+                return self._sample_spec_verify_vocab_parallel(
+                    logits, md, cur_start_idx, cur_end_idx, sampling_generator
+                )
+            logits = self.gather_shard_logits(logits)
         req_temperatures = req_top_k = req_top_p = None
         topk_candidates = 0
         if (
@@ -4673,6 +4723,103 @@ class TPUModelRunner(GPUModelRunner):
             **verify_kwargs,
         )
 
+    def _verify_vocab_parallel_applies(
+        self,
+        grammar_output: "GrammarOutput | None",
+        all_greedy: bool,
+        cur_start_idx: int,
+        cur_end_idx: int,
+    ) -> bool:
+        """TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: whether a verify chunk whose
+        logits are shard logits takes the vocab-parallel sampler.
+
+        Not for all-greedy steps (the greedy verify needs only an argmax, and
+        TPU_GREEDY_TOP_TOKENS covers it), grammar steps (the mask needs the
+        full logits), logprobs steps (they read the full logits after the
+        verify) and TPU_SAMPLER_TOPK_CANDIDATES chunks (a different top-k).
+        """
+        return (
+            self.rejection_sampler is not None
+            and not all_greedy
+            and grammar_output is None
+            and self.input_batch.max_num_logprobs is None
+            and not self._sampler_topk_candidates(cur_start_idx, cur_end_idx, None)
+        )
+
+    def _sample_spec_verify_vocab_parallel(
+        self,
+        shard_logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: bonus sampling and draft
+        rejection of one verify chunk on this rank's LM head shard
+        (vocab_parallel.spec_verify).
+
+        Draws from the sampling generator, which is identical on every TP
+        rank: the accept uniforms at the shape the usual paths draw them, then
+        two int32 seeds of the Gumbel noise. The verify-row trim
+        (TPU_SAMPLER_VERIFY_TRIM, TPU_SAMPLER_VERIFY_TRIM_ROWS) applies as on
+        the fused chain.
+        """
+        assert self.speculative_config is not None
+        assert self._lm_head_shard is not None
+        assert md.draft_token_ids is not None
+        req_temperatures, req_top_k, req_top_p = self._build_padded_sampling_params(
+            cur_start_idx,
+            cur_end_idx,
+            shard_logits,
+            padded_num_reqs=md.bonus_logits_indices.shape[0],
+        )
+        accept_u = torch.rand(
+            md.draft_token_ids.shape,
+            dtype=torch.float32,
+            device=shard_logits.device,
+            generator=sampling_generator,
+        )
+        # 24 random bits per seed (the resolution of a float32 uniform).
+        noise_seeds = (
+            torch.rand(
+                (2,),
+                dtype=torch.float32,
+                device=shard_logits.device,
+                generator=sampling_generator,
+            )
+            * float(1 << 24)
+        ).to(torch.int32)
+        kwargs: dict[str, Any] = {}
+        if self._sampler_light:
+            kwargs["need_top_k"] = self._sampler_need_top_k
+            kwargs["need_top_p"] = self._sampler_need_top_p
+        if rows := self._verify_trim_rows(
+            md.target_logits_indices.shape[0], md.draft_lengths_cpu
+        ):
+            kwargs["verify_rows"] = rows
+        logger.info_once(
+            "TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: a verify chunk took the "
+            "vocab-parallel sampler"
+        )
+        return self.spec_sample_verify_vocab_parallel(
+            shard_logits,
+            self._lm_head_shard.vocab_start,
+            self._lm_head_shard.vocab_valid,
+            md.bonus_logits_indices,
+            md.target_logits_indices,
+            req_temperatures,
+            req_top_k,
+            req_top_p,
+            md.draft_token_ids,
+            md.draft_lengths,
+            md.segment_ids,
+            md.group_indices,
+            accept_u,
+            noise_seeds,
+            self.speculative_config.num_speculative_tokens,
+            **kwargs,
+        )
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -4749,6 +4896,11 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_idx_list,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
+                if md is None or needs_logprobs:
+                    # TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: these read the full
+                    # logits; a verify chunk without logprobs may keep the
+                    # shard (_sample_spec_verify_chunk decides).
+                    logits = self._full_logits(logits)
                 if md is not None:
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
@@ -4860,6 +5012,9 @@ class TPUModelRunner(GPUModelRunner):
                 state.logits_list, state.num_reqs_list, mamba_idx_list
             ):
                 cur_end_idx = cur_start_idx + num_reqs
+                # TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: only a verify samples on
+                # the LM head shard.
+                logits = self._full_logits(logits)
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
@@ -5310,6 +5465,12 @@ class TPUModelRunner(GPUModelRunner):
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
                 self.model, self._dp_lockstep_enabled()
             )
+        if (
+            envs.TPU_SAMPLER_VERIFY_VOCAB_PARALLEL
+            and self._pp_is_last
+            and not self.is_pooling_model
+        ):
+            self._lm_head_shard = self._resolve_lm_head_shard()
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -6111,6 +6272,7 @@ class TPUModelRunner(GPUModelRunner):
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
+                    self._precompile_gather_shard_logits(out)
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
                     )
@@ -6149,6 +6311,7 @@ class TPUModelRunner(GPUModelRunner):
                 indices = torch.zeros(logits_len, dtype=torch.int32).to(self.device)
                 out = self.compute_selected_logits(dummy_hidden, indices)
                 synchronize_tensors(out)
+                self._precompile_gather_shard_logits(out)
                 if top_tokens:
                     out = self.compute_selected_top_tokens(dummy_hidden, indices)
                     synchronize_tensors(out)
@@ -6168,7 +6331,14 @@ class TPUModelRunner(GPUModelRunner):
                 ).to(self.device)
                 out = self.compute_logits_from_hidden_states(dummy_hidden)
                 synchronize_tensors(out)
+                self._precompile_gather_shard_logits(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
+
+    def _precompile_gather_shard_logits(self, logits: torch.Tensor) -> None:
+        """TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: warm the all-gather that every
+        step not sampled on the shard runs on these shard logits."""
+        if self._is_shard_logits(logits):
+            synchronize_tensors(self.gather_shard_logits(logits))
 
     def _precompile_compute_top_tokens(self) -> None:
         if self._greedy_head_owner is None:
@@ -6511,6 +6681,9 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((num_tokens, num_reqs))
                 if num_reqs >= min(num_tokens, self.max_num_reqs):
                     break
+        # The vocab-parallel verify holds TP collectives, so every rank warms
+        # it in the same order: before the rotation below.
+        collective_pairs = list(pairs)
         if envs.TPU_PARALLEL_PRECOMPILE and pairs:
             # Every rank walks every shape. Starting each local rank at its own
             # share of the sweep (8 local ranks per host, as compile_all_ranges
@@ -6670,6 +6843,71 @@ class TPUModelRunner(GPUModelRunner):
                         group_indices,
                         k,
                     )
+                logger.info(
+                    "  -- padded_logits_length: %d, num_seqs: %d",
+                    num_tokens,
+                    num_reqs,
+                )
+        if self._lm_head_shard is not None:
+            self._precompile_vocab_parallel_verify(collective_pairs)
+
+    def _precompile_vocab_parallel_verify(self, pairs: list[tuple[int, int]]) -> None:
+        """TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: warm spec_sample_verify_vocab_
+        parallel at every (padded_logits_length, padded_num_reqs) verify
+        bucket, every verify-row trim bucket of it, and every top-k / top-p
+        variant _sample_spec_verify_vocab_parallel can pass. Input dtypes
+        mirror get_spec_decode_metadata and _build_padded_sampling_params."""
+        assert self._lm_head_shard is not None
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        shard = self._lm_head_shard
+        variants = (
+            [
+                {"need_top_k": top_k, "need_top_p": top_p}
+                for top_k in (False, True)
+                for top_p in (False, True)
+            ]
+            if self._sampler_light
+            else [{}]
+        )
+        with self._precompile_timed("vocab-parallel verify"):
+            for num_tokens, num_reqs in pairs:
+                shard_logits = torch.zeros(
+                    (num_tokens, shard.local_width), dtype=self._hidden_states_dtype
+                ).to(self.device)
+                slots_i32 = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+                segment_ids = torch.zeros(num_tokens, dtype=torch.int64).to(self.device)
+                reqs_i32 = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                temperatures = torch.ones(
+                    (num_reqs, 1), dtype=self._hidden_states_dtype
+                ).to(self.device)
+                top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
+                top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+                accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(self.device)
+                noise_seeds = torch.zeros(2, dtype=torch.int32).to(self.device)
+                for rows in [0, *self._verify_trim_buckets(num_tokens)]:
+                    trim = {"verify_rows": rows} if rows else {}
+                    for kwargs in variants:
+                        out = self.spec_sample_verify_vocab_parallel(
+                            shard_logits,
+                            shard.vocab_start,
+                            shard.vocab_valid,
+                            reqs_i32,
+                            slots_i32,
+                            temperatures,
+                            top_k,
+                            top_p,
+                            slots_i32,
+                            reqs_i32,
+                            segment_ids,
+                            slots_i32,
+                            accept_u,
+                            noise_seeds,
+                            k,
+                            **kwargs,
+                            **trim,
+                        )
+                        synchronize_tensors(out)
                 logger.info(
                     "  -- padded_logits_length: %d, num_seqs: %d",
                     num_tokens,
@@ -7981,13 +8219,114 @@ class TPUModelRunner(GPUModelRunner):
         if self.is_pooling_model:
             return torch.empty((0,), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        if self._lm_head_shard is not None:
+            return self._shard_logits(selected)
         return self.model.compute_logits(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        if self._lm_head_shard is not None:
+            return self._shard_logits(hidden_states)
         return self.model.compute_logits(hidden_states)
+
+    def _shard_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: this rank's logits shard, the
+        LM head's logits processor without its TP all-gather (soft cap and
+        scale, which are elementwise, are applied to the shard). Traced inside
+        the compiled logits programs."""
+        assert self._lm_head_shard is not None
+        owner = self._lm_head_shard.owner
+        return owner.logits_processor(owner.lm_head, hidden_states, skip_gather=True)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def gather_shard_logits(self, shard_logits: torch.Tensor) -> torch.Tensor:
+        """TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: the full-vocab logits from the
+        shard logits, by the logits processor's own all-gather and padding
+        slice. Bitwise the logits the processor returns with the gather."""
+        assert self._lm_head_shard is not None
+        processor = self._lm_head_shard.owner.logits_processor
+        full = processor._gather_logits(shard_logits)
+        return full[..., : self._lm_head_shard.org_vocab_size]
+
+    def _is_shard_logits(self, logits: torch.Tensor) -> bool:
+        """Whether ``logits`` is an LM head shard (see _LmHeadShard) rather
+        than full-vocab logits or greedy tokens. The widths differ:
+        _resolve_lm_head_shard refuses a head whose shard is as wide as the
+        vocabulary."""
+        return (
+            self._lm_head_shard is not None
+            and logits.dim() == 2
+            and logits.shape[-1] == self._lm_head_shard.local_width
+        )
+
+    def _full_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """``logits`` as full-vocab logits: shard logits are all-gathered,
+        anything else is returned as is."""
+        if self._is_shard_logits(logits):
+            return self.gather_shard_logits(logits)
+        return logits
+
+    def _resolve_lm_head_shard(self) -> _LmHeadShard | None:
+        """TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: this rank's LM head shard, or
+        None (with a warning) when the vocab-parallel verify cannot apply.
+
+        It applies when the model has a spec-decode rejection sampler, its
+        logits come from vLLM's LogitsProcessor over a VocabParallelEmbedding
+        head (the same check as TPU_GREEDY_TOP_TOKENS), the head is split over
+        the whole TP group with no added (LoRA) vocabulary, and no expert-
+        parallel DP lockstep runs (an idle engine replays the full-logits
+        collective of its busy peers).
+        """
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        def refuse(reason: str) -> None:
+            logger.warning("TPU_SAMPLER_VERIFY_VOCAB_PARALLEL is off: %s", reason)
+
+        if self.speculative_config is None or self.rejection_sampler is None:
+            refuse("no speculative decoding rejection sampler.")
+            return None
+        if self._dp_lockstep_enabled():
+            refuse("expert-parallel DP lockstep is not supported.")
+            return None
+        try:
+            owner = greedy_top_tokens.resolve_head_owner(self.model, False)
+        except NotImplementedError as e:
+            refuse(str(e))
+            return None
+        head = owner.lm_head
+        processor = owner.logits_processor
+        shard = head.shard_indices
+        tp_size = int(head.tp_size)
+        local_width = int(head.num_embeddings_per_partition)
+        org_vocab_size = int(processor.org_vocab_size)
+        if tp_size <= 1 or tp_size != get_tensor_model_parallel_world_size():
+            refuse(f"the LM head is split {tp_size} ways, not over the TP group.")
+            return None
+        if shard.num_added_elements > 0 or processor.logits_as_input:
+            refuse("the LM head has added vocabulary or takes logits as input.")
+            return None
+        if local_width == org_vocab_size:
+            refuse("the LM head shard is as wide as the vocabulary.")
+            return None
+        start = int(shard.org_vocab_start_index)
+        valid = int(shard.org_vocab_end_index) - start
+        logger.info(
+            "TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: LM head shard of %d columns "
+            "(%d real) from token %d, %d ranks.",
+            local_width,
+            valid,
+            start,
+            tp_size,
+        )
+        return _LmHeadShard(
+            owner=owner,
+            local_width=local_width,
+            org_vocab_size=org_vocab_size,
+            vocab_start=torch.tensor(start, dtype=torch.int32).to(self.device),
+            vocab_valid=torch.tensor(valid, dtype=torch.int32).to(self.device),
+        )
 
     def _greedy_top_tokens_this_step(self) -> bool:
         return self._greedy_head_owner is not None and greedy_top_tokens.step_eligible(
@@ -8258,6 +8597,60 @@ class TPUModelRunner(GPUModelRunner):
             need_top_p=need_top_p,
             radix_bits=radix_bits,
             fast_top_p=fast_top_p,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_sample_verify_vocab_parallel(
+        self,
+        shard_logits: torch.Tensor,
+        vocab_start: torch.Tensor,
+        vocab_valid: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        req_temperatures: torch.Tensor,
+        req_top_k: torch.Tensor,
+        req_top_p: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        accept_u: torch.Tensor,
+        noise_seeds: torch.Tensor,
+        max_draft_tokens: int,
+        need_top_k: bool = True,
+        need_top_p: bool = True,
+        verify_rows: int = 0,
+    ) -> torch.Tensor:
+        """TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: one program for the bonus
+        sampling and the draft rejection of a verify chunk on this rank's LM
+        head shard, with the TP collectives inside (vocab_parallel.spec_verify).
+        Static: max_draft_tokens, need_top_k, need_top_p, verify_rows."""
+        assert self.rejection_sampler is not None
+        return vocab_parallel.spec_verify(
+            shard_logits,
+            vocab_start,
+            vocab_valid,
+            bonus_logits_indices,
+            target_logits_indices,
+            req_temperatures,
+            req_top_k,
+            req_top_p,
+            draft_token_ids,
+            draft_lengths,
+            segment_ids,
+            group_indices,
+            accept_u,
+            noise_seeds,
+            max_draft_tokens,
+            self.rejection_sampler.synthetic_conditional_rates,
+            self.rejection_sampler.synthetic_mode,
+            vocab_parallel.tp_all_reduce,
+            vocab_parallel.tp_all_gather,
+            need_top_k=need_top_k,
+            need_top_p=need_top_p,
+            radix_bits=self._sampler_radix_bits,
+            digit_bits=self._vocab_parallel_digit_bits,
+            verify_rows=verify_rows,
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

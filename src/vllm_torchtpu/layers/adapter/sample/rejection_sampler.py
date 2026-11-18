@@ -487,8 +487,6 @@ def _random_rejection_sample_with_segment_impl(
         top_p = top_p[:verify_rows]
         accept_u = accept_u[:verify_rows]
         recover_u = recover_u[:verify_rows]
-    total_tokens = draft_token_ids.shape[0]
-    batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
     vocab_size = target_logits.shape[-1]
 
@@ -570,6 +568,52 @@ def _random_rejection_sample_with_segment_impl(
         recovered_token_ids,
     )
 
+    return _assemble_selected_tokens(
+        draft_token_ids,
+        accepted,
+        recovered_token_ids,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+def _assemble_selected_tokens(
+    draft_token_ids: torch.Tensor,
+    accepted: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """Lays out the tokens of a non-greedy verify per request.
+
+    Each request keeps its drafts up to the first rejected slot, then the
+    recovered token of that slot; a request with no rejected slot (or no
+    drafts) gets its bonus token after the drafts.
+
+    Args:
+      draft_token_ids: int64 [slots], negative for placeholder drafts.
+      accepted: bool [slots], the accept decision of each slot.
+      recovered_token_ids: int32 [slots], the token each slot emits if it is
+        the first rejected slot of its request.
+      num_draft_tokens: [batch_size] declared drafts per request.
+      bonus_token_ids: [batch_size] bonus token per request.
+      segment_ids: [slots] request of each slot.
+      group_indices: [slots] position of each slot within its request.
+      max_draft_tokens: drafts per request at most.
+
+    Returns:
+      int32 [batch_size, max_draft_tokens + 1], padded with
+      PLACEHOLDER_TOKEN_ID.
+    """
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
     # Only declared draft slots may participate in rejection sampling.

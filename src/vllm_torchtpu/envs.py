@@ -367,6 +367,8 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
     TPU_SAMPLER_VERIFY_TRIM_ROWS: list[int] = []
+    TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: bool = False
+    TPU_SAMPLER_VERIFY_VOCAB_PARALLEL_DIGIT_BITS: int = 5
 
 
 def _positive_int_list(env_name: str) -> list[int]:
@@ -2491,6 +2493,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real slot's computation are unchanged. Empty (default): off.
     "TPU_SAMPLER_VERIFY_TRIM_ROWS": lambda: _positive_int_list(
         "TPU_SAMPLER_VERIFY_TRIM_ROWS"
+    ),
+    # Non-greedy spec verify with a tensor-parallel LM head: each rank samples
+    # the bonus and recovered tokens and runs the top-k / top-p threshold
+    # search on its own vocab shard (layers/adapter/sample/vocab_parallel.py).
+    # The ranks exchange only per-row values: softmax max and sum, threshold
+    # search masses or counts, and one (value, token id) pair per row. The
+    # full-vocab logits are then never all-gathered for this step. Applies to
+    # the fused chain and to the unfused path that synthetic acceptance
+    # takes, on steps with no grammar, no logprobs and no
+    # TPU_SAMPLER_TOPK_CANDIDATES; other steps all-gather the shard logits
+    # and run the usual sampler. Same sampling distribution and the same
+    # greedy tokens; the random draws differ, so sampled tokens are not
+    # bitwise those of the usual sampler.
+    "TPU_SAMPLER_VERIFY_VOCAB_PARALLEL": env_bool("TPU_SAMPLER_VERIFY_VOCAB_PARALLEL"),
+    # With TPU_SAMPLER_VERIFY_VOCAB_PARALLEL: bits of the top-p threshold
+    # resolved per search pass. Each pass is one all-reduce of
+    # [2**bits - 1, rows] masses, so 5 bits cover the 30 searched bits of a
+    # probability in 6 passes. More bits: fewer collectives, more shard-local
+    # compare work per pass. Must be 1 to 8 (checked at model load).
+    "TPU_SAMPLER_VERIFY_VOCAB_PARALLEL_DIGIT_BITS": env_nonnegative_int(
+        "TPU_SAMPLER_VERIFY_VOCAB_PARALLEL_DIGIT_BITS", 5
     ),
     # With TPU_SAMPLER_FUSED_CHAIN: the fused verify chain draws its three
     # uniforms (bonus_u, accept_u, recover_u) inside the compiled program
