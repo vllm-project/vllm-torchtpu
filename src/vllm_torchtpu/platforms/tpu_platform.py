@@ -861,7 +861,7 @@ class TpuPlatform(Platform):
         from vllm_torchtpu.worker import worker_options
 
         frontend_options.get(vllm_config)
-        worker_options.get(vllm_config)
+        worker_options.check(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

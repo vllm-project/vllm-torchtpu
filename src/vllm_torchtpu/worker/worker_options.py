@@ -34,11 +34,16 @@ class WorkerOptions:
     numa_bind: bool = False
     """Before the TPU runtime starts, narrow each worker's CPU set to the NUMA
     node its chip is attached to and prefer that node's memory (see
-    ``vllm_torchtpu.worker.numa_bind``). Ranks are spread evenly over the
-    host's chips, which assumes this engine and its host-local DP engines use
-    the whole host; an engine with a TPU_LOCAL_RANK_OFFSET is left alone. The
-    inherited CPU set is only ever narrowed, and a rank that does not map onto
-    a chip is left alone. Off by default."""
+    ``vllm_torchtpu.worker.numa_bind``). The node of each TPU device is read
+    from sysfs, so no per-host node list is needed. Ranks are spread evenly
+    over the host's TPU devices, which assumes this engine and its host-local
+    DP engines use the whole host. A rank that does not map onto a device
+    (an engine on part of a host, or a dense-model DP engine, which vLLM runs
+    as an independent engine) is left alone, and so is an engine whose ranks
+    are moved to other devices (TPU_LOCAL_RANK_OFFSET,
+    DEBUG_TPU_LOCAL_RANK_OFFSET, VLLM_TPU_DEVICE_ORDER). The inherited CPU set
+    is only ever narrowed. Cannot be combined with vLLM's ``--numa-bind``,
+    which binds the same workers through numactl. Off by default."""
 
 
 def parse(raw: Any) -> WorkerOptions:
@@ -49,3 +54,17 @@ def parse(raw: Any) -> WorkerOptions:
 def get(vllm_config: Any) -> WorkerOptions:
     """The engine's worker options."""
     return config_section.get(WorkerOptions, SECTION, vllm_config)
+
+
+def check(vllm_config: Any) -> WorkerOptions:
+    """The engine's worker options, refusing ``numa_bind`` together with
+    vLLM's ``--numa-bind``: vLLM starts each worker under ``numactl
+    --membind``, and this bind would then replace that strict memory policy
+    with a preferred one, possibly for another node."""
+    options = get(vllm_config)
+    if options.numa_bind and vllm_config.parallel_config.numa_bind:
+        raise ValueError(
+            f"additional_config.{SECTION}.numa_bind and --numa-bind both bind "
+            "each TPU worker to a NUMA node; turn one of them off."
+        )
+    return options

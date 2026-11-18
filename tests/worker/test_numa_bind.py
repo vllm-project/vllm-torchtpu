@@ -71,7 +71,8 @@ def test_chip_without_numa_node_is_left_alone():
 @pytest.mark.parametrize(
     "local_ranks, num_chips, expected",
     [
-        (8, 4, [0, 0, 1, 1, 2, 2, 3, 3]),  # tpu7x: 2 TensorCores per chip
+        (8, 4, [0, 0, 1, 1, 2, 2, 3, 3]),  # two ranks per TPU PCI function
+        (8, 8, list(range(8))),  # tpu7x: one PCI function per device
         (4, 4, [0, 1, 2, 3]),
         (1, 1, [0]),
         (6, 4, [None] * 6),  # ranks do not divide over the chips
@@ -182,6 +183,89 @@ def test_bind_leaves_an_engine_with_a_rank_offset_alone():
     with patch("vllm_torchtpu.worker.tpu_worker.bind_to_chip_numa_node") as bind:
         TPUWorker._maybe_bind_numa(worker, 3, dp_size=1, local_rank_offset=4)
     bind.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        # The legacy init path adds it to each worker's local rank.
+        {"DEBUG_TPU_LOCAL_RANK_OFFSET": "4"},
+        # Worker spawn pins local rank r to device order[r].
+        {"VLLM_TPU_DEVICE_ORDER": "0,4,1,5"},
+    ],
+)
+def test_bind_leaves_an_engine_with_moved_ranks_alone(monkeypatch, env):
+    """TP4 on devices 4-7, or in the order 0,4,1,5: mapping local ranks 0-3
+    onto the host's first devices would bind some of them to the wrong node."""
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    worker = _worker({"numa_bind": True})
+    with (
+        patch("vllm_torchtpu.worker.tpu_worker.bind_to_chip_numa_node") as bind,
+        patch("vllm_torchtpu.worker.tpu_worker.logger") as logger,
+    ):
+        TPUWorker._maybe_bind_numa(worker, 3, dp_size=1)
+    bind.assert_not_called()
+    (call,) = logger.info.call_args_list
+    assert call.args[1] == "{}={}".format(*next(iter(env.items())))
+
+
+@pytest.mark.parametrize(
+    "local_ranks, num_devices",
+    [
+        (4, 8),  # TP4 on half of an 8-device host
+        (2, 8),  # a dense-model DP engine: vLLM sets its local DP size to 1
+    ],
+)
+def test_ranks_on_part_of_a_host_are_left_unbound(local_ranks, num_devices):
+    """The host's TPU PCI functions are its devices (8 on a tpu7x host), so an
+    engine with fewer ranks than devices does not map and is left alone."""
+    devices = [f"d{i}" for i in range(num_devices)]
+    with (
+        patch.object(numa_bind, "tpu_pci_devices", return_value=devices),
+        patch.object(numa_bind, "pci_numa_node") as node,
+        patch("os.sched_setaffinity") as setaffinity,
+    ):
+        for rank in range(local_ranks):
+            numa_bind.bind_to_chip_numa_node(rank, local_ranks)
+    node.assert_not_called()
+    setaffinity.assert_not_called()
+
+
+def _engine_config(numa_bind, vllm_numa_bind):
+    return SimpleNamespace(
+        additional_config={"tpu_worker": {"numa_bind": numa_bind}},
+        parallel_config=SimpleNamespace(numa_bind=vllm_numa_bind),
+    )
+
+
+def test_vllms_numa_bind_and_this_one_are_refused_together():
+    with pytest.raises(ValueError, match="--numa-bind"):
+        worker_options.check(_engine_config(True, True))
+    for numa_bind_on, vllm_on in [(True, False), (False, True), (False, False)]:
+        options = worker_options.check(_engine_config(numa_bind_on, vllm_on))
+        assert options.numa_bind is numa_bind_on
+
+
+def test_platform_hook_refuses_both_numa_binds():
+    """Before any patch installs and before a worker starts."""
+    from vllm.config import ParallelConfig, VllmConfig
+
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    with (
+        patch("vllm_torchtpu.patch_registry.apply") as apply,
+        patch.object(TpuPlatform, "_prepare_singlehost_tpu_env"),
+        patch.object(TpuPlatform, "uses_host_device_handling", return_value=True),
+        pytest.raises(ValueError, match="--numa-bind"),
+    ):
+        VllmConfig(
+            parallel_config=ParallelConfig(numa_bind=True),
+            additional_config={"tpu_worker": {"numa_bind": True}},
+        )
+    apply.assert_not_called()
 
 
 @pytest.mark.parametrize(
