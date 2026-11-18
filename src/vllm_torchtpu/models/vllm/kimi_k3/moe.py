@@ -104,9 +104,9 @@ class KimiMoE(nn.Module):
             torch.zeros(config.num_experts)
         )
 
-        # Replicated by default; sharded across a chip's cores under
-        # TPU_LATENT_PROJ_INTRA_CHIP_TP. These two are the model's largest
-        # unquantized weights and are read in full by every rank each step.
+        # TP-sharded on single-core chips, or sharded across a chip's cores
+        # under TPU_LATENT_PROJ_INTRA_CHIP_TP; replicated otherwise. These two
+        # are the model's largest unquantized weights.
         self.routed_expert_down_proj = (
             make_latent_projection(
                 hidden_size,
