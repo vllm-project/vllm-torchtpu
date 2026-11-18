@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    VLLM_TPU_GLM53_MHC_IMPL: str = "pallas"
     VLLM_TPU_GLM53_MLA_IMPL: str = "rpa"
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
@@ -494,6 +495,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fingerprint.
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
+    ),
+    # GLM-5.3-Flash mHC (manifold-constrained hyper-connections):
+    # "pallas" runs the Pallas mHC kernels with each post fused into the next
+    # pre; "compiled" runs the torch.compile'd reference ops.
+    "VLLM_TPU_GLM53_MHC_IMPL": lambda: (
+        env_with_choices("VLLM_TPU_GLM53_MHC_IMPL", "pallas", ["pallas", "compiled"])()
+        or "pallas"
     ),
     # GLM-5.3-Flash NoPE MLA layers: "rpa" expands the latent with kv_b_proj
     # and runs ragged paged attention on per-head K/V; "absorbed" caches the
