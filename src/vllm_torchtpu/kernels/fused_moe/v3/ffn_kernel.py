@@ -26,7 +26,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from . import device, ffn, layout, transport, vmem
 from . import ffn_body as body
-from . import ffn_expert_streamed as streamed
 from . import ffn_expert_whole as whole
 from .config import (
     ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
@@ -36,8 +35,8 @@ from .config import (
     WEIGHT_PREFETCH_DEFAULT,
     WEIGHT_SLOTS_DEFAULT,
 )
-from .formats import PACKED_ROW_TILE, WEIGHT_BLOCK_DEFAULT, WeightFormat, weight_form
-from .layout import LANES, ROW_BLOCK, SUBLANES
+from .formats import WeightFormat, weight_form
+from .layout import LANES, ROW_BLOCK
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +69,10 @@ class Operands:
     tokens: object  # [tokens, lane blocks, LANES] fp8 rows
     token_scales: object  # [scale planes, scale rows, LANES] i32: f32
     # bits, one word per row per plane
-    w1: object  # [G, hidden, cols] weights (packed u32 for fp4)
+    w1: object  # [G, hidden, cols] weights
     w2: object  # [G, inter, hidden]
-    w1_scales: object  # [G, cols] or [G, blocks, cols] f32, or None
-    w2_scales: object  # [G, hidden] or [G, blocks, hidden] f32, or None
+    w1_scales: object  # [G, cols] f32, or None (bf16 weights)
+    w2_scales: object  # [G, hidden] f32, or None
     w1_bias: object  # [G, cols] f32 or None
     w2_bias: object  # [G, hidden] f32 or None
     transport_send_sem: object = None  # pallas mode: the start call's
@@ -94,34 +93,20 @@ class Outputs:
 
 @dataclasses.dataclass(frozen=True)
 class Scratch:
-    """The VMEM buffers, in vmem.scratch_arrays' order. A streamed build
-    holds a group's rows and scale windows double-buffered (the leading
-    axis 2 instead of the result slots), the up-projection scales and bias
-    per weight slot, and the group's running sum."""
+    """The VMEM buffers, in vmem.scratch_arrays' order."""
 
     rows: object  # [result slots, tile rows, lane blocks, LANES] fp8
-    w1: object  # [weight slots, ...]
-    w2: object
-    # [hidden, cols] fp8, the current expert widened (whole-expert fp4 builds),
-    # or None
-    w1_fp8: object
-    w2_fp8: object  # [inter, hidden] fp8, the same
-    # [inter, hidden] bf16, the current expert (intermediate "bf16"), or None
-    w2_bf16: object
-    # [hidden, cols] bf16, the current expert (bf16 token rows on fp8 weights),
-    # or None
-    w1_bf16: object
-    w1_scales: object  # [G, ...] resident, or [weight slots, ...]
-    w2_scales: object
-    w1_bias: object  # [G, cols] or [weight slots, 1, cols] or None
+    w1: object  # [weight slots, hidden, cols]
+    w2: object  # [weight slots, inter, hidden]
+    w1_scales: object  # [G, cols] resident, or None
+    w2_scales: object  # [G, hidden] resident, or None
+    w1_bias: object  # [G, cols] or None
     w2_bias: object  # [G, hidden] or None
     row_scales: object  # [result slots, planes, window rows, LANES] i32
     result_rows: object  # [result slots, tile rows, result blocks, LANES]
     result_scales: object  # [result slots, tile blocks, 1, ROW_BLOCK] f32
-    acc: object = None  # [stream rows, hidden] f32, streamed builds
-    # Scalar-memory windows of the routed-row token table: one per row
-    # buffer (result slot, or group buffer when streamed), and the next
-    # expert's first tiles (whole-expert builds).
+    # Scalar-memory windows of the routed-row token table: one per result
+    # slot, and the next expert's first tiles.
     token_window: object = None  # [row buffers, blocks, 1, LANES] i32, SMEM
     token_head: object = None  # [row_fetch_ahead, blocks, 1, LANES] i32
 
@@ -152,58 +137,16 @@ def _check_build(
     tile_rows,
     hidden,
     inter,
-    weight_format,
-    weight_block,
     routed_rows,
     weight_slots,
     weight_prefetch,
     result_slots,
     row_fetch_ahead,
     activation_block,
-    stream_block=0,
-    stream_rows=0,
     token_block=None,
 ):
     """Raises ValueError for a build the kernel does not support, naming
     the operand."""
-    form = weight_form(weight_format)
-    if stream_block:
-        if stream_block % LANES or inter % stream_block:
-            raise ValueError(
-                f"stream block {stream_block}: a whole number of "
-                f"{LANES}-lane blocks dividing inter={inter}"
-            )
-        if not activation_block:
-            raise ValueError(
-                f"a streamed expert (stream block {stream_block}) rounds its "
-                "intermediate per activation block, one block at a time, "
-                "so activation_block has to be set; one scale per whole "
-                "row cannot be formed "
-                "before every block has been seen"
-            )
-        if stream_block % activation_block:
-            raise ValueError(
-                f"stream block {stream_block} is not a whole "
-                f"number of activation blocks of "
-                f"{activation_block}"
-            )
-        if stream_rows < tile_rows or stream_rows % tile_rows:
-            raise ValueError(
-                f"stream rows {stream_rows}: a whole number of {tile_rows}-row tiles"
-            )
-        if form.block_scaled and stream_block % weight_block:
-            raise ValueError(
-                f"stream block {stream_block} is not a whole "
-                f"number of weight blocks of {weight_block}"
-            )
-        if form.block_scaled and (stream_block // weight_block) % SUBLANES:
-            raise ValueError(
-                f"stream block {stream_block} covers "
-                f"{stream_block // weight_block} weight blocks of "
-                f"{weight_block}; a streamed block-scaled expert copies its "
-                "scale rows one sublane tile at a time, so that count has "
-                f"to be a whole number of {SUBLANES}"
-            )
     if activation_block:
         if activation_block % LANES:
             raise ValueError(
@@ -214,13 +157,6 @@ def _check_build(
             raise ValueError(
                 f"activation block {activation_block} does not "
                 f"divide both hidden={hidden} and inter={inter}"
-            )
-        if form.block_scaled and activation_block != weight_block:
-            raise ValueError(
-                f"activation block {activation_block} against a weight block "
-                f"of {weight_block}: the block-scaled path scales its "
-                "contraction per weight block, so an activation block has "
-                "to be that block"
             )
     # The token rows' own block, checked after the activation block so a
     # build wrong in both names the activation block first.
@@ -234,13 +170,6 @@ def _check_build(
         if hidden % token_block:
             raise ValueError(
                 f"token block {token_block} does not divide hidden={hidden}"
-            )
-        if form.block_scaled and token_block != weight_block:
-            raise ValueError(
-                f"token block {token_block} against a weight block of "
-                f"{weight_block}: the block-scaled path scales its contraction "
-                "per weight block, so a nonzero token block has to be that "
-                "block"
             )
     if not 1 <= weight_prefetch < weight_slots:
         raise ValueError(
@@ -258,23 +187,6 @@ def _check_build(
             f"{ROW_BLOCK}-row blocks, the unit every transport "
             "moves"
         )
-    if form.block_scaled:
-        if weight_block < 1:
-            raise ValueError(
-                f"weight block {weight_block}: a scale covers at "
-                "least one contraction row"
-            )
-        if hidden % weight_block or inter % weight_block:
-            raise ValueError(
-                f"the weight block {weight_block} has to divide "
-                f"both hidden={hidden} and inter={inter}"
-            )
-        if weight_block % PACKED_ROW_TILE:
-            raise ValueError(
-                f"the weight block {weight_block} is not a whole "
-                f"number of the packed-weight row tile "
-                f"({PACKED_ROW_TILE} rows)"
-            )
     if hidden < LANES or hidden % LANES:
         raise ValueError(
             f"hidden {hidden} is not a whole number of "
@@ -300,7 +212,6 @@ def build_ffn_kernel(
     num_shards,
     mesh_axes=(layout.MESH_AXIS,),
     weight_format,
-    weight_block=WEIGHT_BLOCK_DEFAULT,
     routed_rows,
     activation="silu",
     has_w1_bias=False,
@@ -315,16 +226,11 @@ def build_ffn_kernel(
     activation_block=0,
     result_rows="fp8",
     elementwise_dtype="float32",
-    stream_block=0,
-    stream_rows=0,
-    swiglu_limit=ffn.SWIGLU_LIMIT_DEFAULT,
     vmem_fraction=device.VMEM_FRACTION,
     activation_columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
     weight_dma_priority=WEIGHT_DMA_PRIORITY_DEFAULT,
     token_block=None,
-    intermediate="fp8",
     sorted_rows=False,
-    token_rows="fp8",
 ):
     """Builds the program for one layer shape and returns the function that
     runs it (see `run` below). pallas_transport: the token buffer is the
@@ -333,16 +239,12 @@ def build_ffn_kernel(
     row of each matmul's input (0: one scale per row); the row scales
     arrive as hidden // activation_block planes of the scale table.
     token_block: the token rows' own rounding block when it differs
-    (None: activation_block; 0: one scale per row), so the up projection
-    is one plain matmul while a streamed intermediate stays blocked.
+    (None: activation_block; 0: one scale per row).
     result_rows: "fp8" (rows with one scale per row) or "bf16" (rows
     alone; the scale buffers and their transfers are left out).
     elementwise_dtype: the element type of the vector math after each
-    matmul (Config.elementwise_dtype). stream_block: 0 holds whole experts
-    in the weight slots; a count streams each expert in column blocks of
-    that many intermediate columns, with a group of stream_rows rows and
-    their float32 running sum resident, the intermediate rounded per
-    activation block (Config.stream_block, Config.stream_rows)."""
+    matmul (Config.elementwise_dtype). The weight slots hold whole
+    experts."""
     form = weight_form(weight_format)
     if elementwise_dtype not in ("float32", "bfloat16"):
         raise ValueError(
@@ -352,34 +254,7 @@ def build_ffn_kernel(
     if result_rows not in ("fp8", "bf16"):
         raise ValueError(f"result_rows {result_rows!r} is fp8 or bf16")
     result_dtype = ffn.FP8 if result_rows == "fp8" else jnp.bfloat16
-    if intermediate not in ("fp8", "bf16"):
-        raise ValueError(f"intermediate {intermediate!r} is fp8 or bf16")
-    if intermediate == "bf16" and (stream_block or form.block_scaled):
-        raise ValueError(
-            'intermediate "bf16" runs whole-expert builds with fp8 '
-            "or bf16 weights: a streamed or block-scaled build "
-            "keeps the fp8 intermediate"
-        )
-    rows_block = activation_block if token_block is None else token_block
-    if intermediate == "bf16" and not form.has_scales and rows_block:
-        raise ValueError(
-            'intermediate "bf16" with bf16 weights runs the up projection as '
-            "one matmul scaled per row: the token rows take one scale per row, "
-            f"not one per {rows_block}-value block"
-        )
-    if token_rows == "bf16" and stream_block and form.has_scales:
-        raise ValueError(
-            "bf16 token rows with scaled weights take a whole-expert build: "
-            "the up matmul runs on a per-expert bf16 copy of w1, which a "
-            "streamed build does not make"
-        )
     has_result_scales = result_rows == "fp8"
-    if sorted_rows and stream_block:
-        raise ValueError(
-            "sorted_rows fetches each tile as one copy from rows "
-            "sorted into expert order: a whole-expert build; a "
-            "streamed build reads its rows by group"
-        )
     if pallas_transport:
         transport.check_width(num_shards)
     activations = ffn.NO_GATE_ACTIVATIONS if no_gate else ffn.ACTIVATIONS
@@ -389,23 +264,16 @@ def build_ffn_kernel(
         tile_rows=tile_rows,
         hidden=hidden,
         inter=inter,
-        weight_format=weight_format,
-        weight_block=weight_block,
         routed_rows=routed_rows,
         weight_slots=weight_slots,
         weight_prefetch=weight_prefetch,
         result_slots=result_slots,
         row_fetch_ahead=row_fetch_ahead,
         activation_block=activation_block,
-        stream_block=stream_block,
-        stream_rows=stream_rows,
         token_block=token_block,
     )
     token_block = activation_block if token_block is None else token_block
     device.check_generation()
-    token_dtype = jnp.bfloat16 if token_rows == "bf16" else jnp.float8_e4m3fn
-    if form.packed:
-        device.check_u32_sublane_tile()
     lane_blocks = layout.row_lane_blocks(hidden)
     result_blocks = layout.result_lane_blocks(hidden)
     scale_lanes = vmem.SCALE_WORDS  # words per block of scales
@@ -420,17 +288,12 @@ def build_ffn_kernel(
         weight_slots=weight_slots,
         result_slots=result_slots,
         weight_format=weight_format,
-        weight_block=weight_block,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
         no_gate=no_gate,
         activation_block=activation_block,
         result_dtype=result_dtype,
-        stream_block=stream_block,
-        stream_rows=stream_rows,
         token_block=token_block,
-        intermediate=intermediate,
-        token_dtype=token_dtype,
     )
     needed = vmem.estimate_bytes(
         experts_per_shard,
@@ -440,17 +303,12 @@ def build_ffn_kernel(
         weight_slots=weight_slots,
         result_slots=result_slots,
         weight_format=weight_format,
-        weight_block=weight_block,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
         no_gate=no_gate,
         activation_block=activation_block,
         result_dtype=result_dtype,
-        stream_block=stream_block,
-        stream_rows=stream_rows,
         token_block=token_block,
-        intermediate=intermediate,
-        token_dtype=token_dtype,
     )
     limit = device.vmem_limit(vmem_fraction)
     if needed > limit:
@@ -483,10 +341,6 @@ def build_ffn_kernel(
         rows=True,
         w1=True,
         w2=True,
-        w1_fp8=form.packed and not stream_block,
-        w2_fp8=form.packed and not stream_block,
-        w2_bf16=intermediate == "bf16",
-        w1_bf16=(token_rows == "bf16" and form.has_scales and not form.block_scaled),
         w1_scales=form.has_scales,
         w2_scales=form.has_scales,
         w1_bias=has_w1_bias,
@@ -494,7 +348,6 @@ def build_ffn_kernel(
         row_scales=True,
         result_rows=True,
         result_scales=True,
-        acc=bool(stream_block),
         token_window=True,
         token_head=True,
     )
@@ -516,22 +369,6 @@ def build_ffn_kernel(
         tables = Tables(*(next(it) for _ in dataclasses.fields(Tables)))
         shard_ref = next(it) if layout.SHARD_INDEX_OPERAND else None
         operands = Operands(**take_fields(it, operand_present))
-        if form.packed:
-            # The four-bit weights as packed 32-bit words, so the DMA moves
-            # half the bytes. This ref-level bitcast is a private jax
-            # method with no public equivalent, so its absence is an error.
-            if not hasattr(operands.w1, "bitcast"):
-                raise NotImplementedError(
-                    "the four-bit weight stream views a memory ref as packed "
-                    f"32-bit words through the private "
-                    f"{type(operands.w1).__name__}.bitcast, which jax "
-                    f"{device.jax_version()} no longer carries"
-                )
-            operands = dataclasses.replace(
-                operands,
-                w1=cast(Any, operands.w1).bitcast(jnp.uint32),
-                w2=cast(Any, operands.w2).bitcast(jnp.uint32),
-            )
         outputs = Outputs(*(next(it) for _ in dataclasses.fields(Outputs)))
         scratch = Scratch(**take_fields(it, scratch_present))
         sems = Semaphores(*(next(it) for _ in dataclasses.fields(Semaphores)))
@@ -543,15 +380,12 @@ def build_ffn_kernel(
         inter=inter,
         num_shards=num_shards,
         mesh_axes=tuple(mesh_axes),
-        token_dtype=token_dtype,
         experts_per_shard=experts_per_shard,
         form=form,
-        weight_block=weight_block,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
         no_gate=no_gate,
         activation=activation,
-        swiglu_limit=swiglu_limit,
         pallas_transport=pallas_transport,
         weight_slots=weight_slots,
         weight_prefetch=weight_prefetch,
@@ -562,11 +396,8 @@ def build_ffn_kernel(
         result_dtype=result_dtype,
         elementwise=elementwise,
         has_result_scales=has_result_scales,
-        stream_block=stream_block,
-        stream_rows=stream_rows,
         activation_columns_per_pass=activation_columns_per_pass,
         weight_dma_priority=weight_dma_priority,
-        intermediate=intermediate,
         sorted_rows=sorted_rows,
         lane_blocks=lane_blocks,
         result_blocks=result_blocks,
@@ -575,7 +406,7 @@ def build_ffn_kernel(
         scale_lanes=scale_lanes,
         window_rows=window_rows,
     )
-    step = streamed if stream_block else whole
+    step = whole
 
     def kernel_body(*refs):
         tables, operands, outputs, scratch, sems, shard_ref = unpack(refs)
@@ -628,12 +459,9 @@ def build_ffn_kernel(
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
     scratch = [pltpu.VMEM(shape, dtype) for _, shape, dtype in scratch_shapes]
-    # The routed-row token table's windows in scalar memory: the rows of one
-    # row buffer (a group when streamed, a tile otherwise) per buffer, and
-    # the next expert's first tiles.
-    row_buffers, window_len = (
-        (2, stream_rows) if stream_block else (result_slots, tile_rows)
-    )
+    # The routed-row token table's windows in scalar memory: one tile's rows
+    # per result slot, and the next expert's first tiles.
+    row_buffers, window_len = result_slots, tile_rows
     table_rows = layout.align_up(routed_rows, LANES)  # the layer's table
     table_blocks = table_rows // LANES
     scratch += [
@@ -680,17 +508,13 @@ def build_ffn_kernel(
     name = (
         "fused_ep_moe"
         f"{'' if form.name == WeightFormat.FP8 else '_' + form.name}"
-        f"{'' if activation == 'silu' else '_' + activation}"
         f"{'_w1bias' if has_w1_bias else ''}{'_w2bias' if has_w2_bias else ''}"
         f"{'_pallas' if pallas_transport else ''}"
         f"{'_a' + str(activation_block) if activation_block else ''}"
         f"{'_k' + str(token_block) if token_block != activation_block else ''}"
         f"{'_bf16out' if not has_result_scales else ''}"
         f"{'_e16' if elementwise_dtype == 'bfloat16' else ''}"
-        f"{'_c' + str(stream_block) + 'r' + str(stream_rows) if stream_block else ''}"
-        f"{'_l' + str(swiglu_limit) if activation == 'swigluoai' else ''}"
         f"{columns_tag}{priority_tag}"
-        f"{'_m16' if intermediate == 'bf16' else ''}"
         f"_g{experts_per_shard}_t{tile_rows}_w{weight_slots}_s{result_slots}"
     )
 

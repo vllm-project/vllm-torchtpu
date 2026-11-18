@@ -15,16 +15,14 @@
 Fused EP MoE v3."""
 
 import dataclasses
-from typing import cast
 
-import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from . import ffn
-from .layout import FP4_PER_WORD, LANES, MESH_AXIS, ROW_BLOCK, device_coords
+from .layout import LANES, MESH_AXIS, ROW_BLOCK, device_coords
 from .routing_tables import COUNT_ROWS
 
 # Rows of the count table, in the order routing_tables.shard_counts writes
@@ -41,8 +39,7 @@ from .routing_tables import COUNT_ROWS
 @dataclasses.dataclass(frozen=True)
 class Build:
     """Everything static a program body reads: the shape, the format, the
-    depths, the rounding, the streaming and the geometry of one built
-    kernel."""
+    depths, the rounding and the geometry of one built kernel."""
 
     tile_rows: int
     hidden: int
@@ -50,12 +47,10 @@ class Build:
     num_shards: int
     experts_per_shard: int
     form: object
-    weight_block: object
     has_w1_bias: bool
     has_w2_bias: bool
     no_gate: bool
     activation: str
-    swiglu_limit: float
     pallas_transport: bool
     weight_slots: int
     weight_prefetch: int
@@ -66,14 +61,11 @@ class Build:
     result_dtype: object
     elementwise: object
     has_result_scales: bool
-    stream_block: int
-    stream_rows: int
     activation_columns_per_pass: int
     weight_dma_priority: int
     # each tile fetched as one copy from rows sorted into expert order (no token
     # windows)
     sorted_rows: bool
-    intermediate: str  # "fp8" (requantized between the matmuls) or "bf16"
     lane_blocks: int
     result_blocks: int
     tile_blocks: int
@@ -83,23 +75,6 @@ class Build:
     mesh_axes: tuple = (
         MESH_AXIS,
     )  # the mesh's axes; MESH_AXIS is the expert-parallel one
-    token_dtype: object = jnp.float8_e4m3fn  # the token rows' element type on the wire
-
-    @property
-    def rows_bf16(self):
-        """bf16 token rows (Config.token_rows): the up matmul runs in bf16."""
-        token_dtype = cast("jax.typing.DTypeLike", self.token_dtype)
-        return jnp.dtype(token_dtype) == jnp.dtype(jnp.bfloat16)
-
-    @property
-    def n_stream_blocks(self):
-        """Streamed blocks the intermediate width splits into."""
-        return self.inter // self.stream_block if self.stream_block else 1
-
-    @property
-    def tiles_per_group(self):
-        """Row tiles per streamed row group (0 with whole experts)."""
-        return (self.stream_rows // self.tile_rows) if self.stream_block else 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -169,48 +144,15 @@ def resident_copy(ctx, src, dst):
 
 
 def resident_copies(ctx):
-    """The prologue's resident tables: the whole-expert build keeps every
-    expert's up scales and bias resident; a streamed build carries them
-    per weight slot and keeps only the down scales and bias."""
+    """The prologue's resident tables: every expert's scales and biases."""
     b = ctx.b
-    if b.form.has_scales and not (b.stream_block and b.form.block_scaled):
-        if not b.stream_block:
-            resident_copy(ctx, ctx.operands.w1_scales, ctx.scratch.w1_scales)
+    if b.form.has_scales:
+        resident_copy(ctx, ctx.operands.w1_scales, ctx.scratch.w1_scales)
         resident_copy(ctx, ctx.operands.w2_scales, ctx.scratch.w2_scales)
-    if b.has_w1_bias and not b.stream_block:
+    if b.has_w1_bias:
         resident_copy(ctx, ctx.operands.w1_bias, ctx.scratch.w1_bias)
     if b.has_w2_bias:
         resident_copy(ctx, ctx.operands.w2_bias, ctx.scratch.w2_bias)
-
-
-def upcast_blocks(ctx, slot):
-    """(w1_block, w2_block): the fp8 readers of one contraction block of the
-    current expert's weights: from the slabs widened once per expert in a
-    whole-expert build, or widened here per tile from packed weight slot
-    `slot` in a streamed one."""
-    block = ctx.b.weight_block
-    if ctx.scratch.w1_fp8 is not None:
-        return (
-            lambda blk: ctx.scratch.w1_fp8[pl.ds(blk * block, block), :],
-            lambda blk: ctx.scratch.w2_fp8[pl.ds(blk * block, block), :],
-        )
-    if not ctx.b.form.packed:
-        # Block-scaled fp8: the weights sit in their slot as the matmul
-        # reads them.
-        return (
-            lambda blk: ctx.scratch.w1[slot, pl.ds(blk * block, block), :],
-            lambda blk: ctx.scratch.w2[slot, pl.ds(blk * block, block), :],
-        )
-    packed_rows = block // FP4_PER_WORD
-    dtype = ctx.b.form.weight_dtype
-    return (
-        lambda blk: ffn.upcast_packed_block_to_fp8(
-            ctx.scratch.w1, slot, packed_rows, blk, dtype
-        ),
-        lambda blk: ffn.upcast_packed_block_to_fp8(
-            ctx.scratch.w2, slot, packed_rows, blk, dtype
-        ),
-    )
 
 
 # ---- the row streams ----
@@ -384,74 +326,21 @@ def drain_commits(ctx, carry):
 
 
 # ---- the arithmetic of one tile ----
-def up_scales_and_bias(ctx, expert, weight_slot):
-    """(w1_scales, w1_bias) of the expert, or of the column block in
-    `weight_slot` for a streamed build: [1, cols] each (fp4 scales
-    [blocks, cols]), None where absent."""
+def up_scales_and_bias(ctx, expert):
+    """(w1_scales, w1_bias) of the expert: [1, cols] each, None where
+    absent."""
     b, scratch = ctx.b, ctx.scratch
-    if b.stream_block:
-        scales = scratch.w1_scales[weight_slot] if b.form.has_scales else None
-        bias = scratch.w1_bias[weight_slot] if b.has_w1_bias else None
-        return scales, bias
-    scales = None
-    if b.form.block_scaled:
-        scales = scratch.w1_scales[expert]
-    elif b.form.has_scales:
-        scales = scratch.w1_scales[pl.ds(expert, 1), :]
+    scales = scratch.w1_scales[pl.ds(expert, 1), :] if b.form.has_scales else None
     bias = scratch.w1_bias[pl.ds(expert, 1), :] if b.has_w1_bias else None
     return scales, bias
 
 
 def down_product(ctx, expert, weight_slot, rows, row_scales):
-    """One tile's rows through the FFN of the weights in `weight_slot` (an
-    expert, or one column block of it): the down matmul's accumulator and,
-    for the whole-row rounding, the intermediate row scales not yet
-    applied."""
+    """One tile's rows through the FFN of the expert in `weight_slot`: the
+    down matmul's accumulator and, for the whole-row rounding, the
+    intermediate row scales not yet applied."""
     b, scratch = ctx.b, ctx.scratch
-    w1_scales, w1_bias = up_scales_and_bias(ctx, expert, weight_slot)
-    # bf16 token rows against fp8 weights: the up matmul runs in bf16 on
-    # the expert's widened copy of w1 with per-channel scales applied
-    # after the matmul (block-scaled forms are unsupported).
-    w1_widened = b.rows_bf16 and b.form.has_scales and not b.form.block_scaled
-    w1_up = scratch.w1_bf16[...] if w1_widened else scratch.w1[weight_slot]
-    if b.form.block_scaled:
-        w1_block, w2_block = upcast_blocks(ctx, weight_slot)
-        w2_scales = (
-            scratch.w2_scales[weight_slot]
-            if b.stream_block
-            else scratch.w2_scales[expert]
-        )
-        return ffn.expert_ffn_fp4(
-            rows,
-            row_scales,
-            w1_block,
-            w2_block,
-            w1_scales,
-            w2_scales,
-            block=b.weight_block,
-            activation=b.activation,
-            w1_bias=w1_bias,
-            no_gate=b.no_gate,
-            activation_block=b.activation_block,
-            elementwise=b.elementwise,
-            swiglu_limit=b.swiglu_limit,
-            columns_per_pass=b.activation_columns_per_pass,
-            token_block=b.token_block,
-        )
-    if b.intermediate == "bf16":
-        return ffn.expert_ffn_bf16_intermediate(
-            rows,
-            row_scales,
-            w1_up,
-            scratch.w2_bf16[...],
-            w1_scales,
-            activation=b.activation,
-            w1_bias=w1_bias,
-            no_gate=b.no_gate,
-            swiglu_limit=b.swiglu_limit,
-            token_block=b.token_block,
-            weights_bf16=not b.form.has_scales,
-        )
+    w1_scales, w1_bias = up_scales_and_bias(ctx, expert)
     if not b.form.has_scales:
         return ffn.expert_ffn_bf16(
             rows,
@@ -463,14 +352,13 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
             no_gate=b.no_gate,
             block=b.activation_block,
             elementwise=b.elementwise,
-            swiglu_limit=b.swiglu_limit,
             columns_per_pass=b.activation_columns_per_pass,
             token_block=b.token_block,
         )
     return ffn.expert_ffn_fp8(
         rows,
         row_scales,
-        w1_up,
+        scratch.w1[weight_slot],
         scratch.w2[weight_slot],
         w1_scales,
         activation=b.activation,
@@ -478,7 +366,6 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
         no_gate=b.no_gate,
         block=b.activation_block,
         elementwise=b.elementwise,
-        swiglu_limit=b.swiglu_limit,
         columns_per_pass=b.activation_columns_per_pass,
         token_block=b.token_block,
     )
@@ -488,11 +375,7 @@ def finish_rows(ctx, expert, acc2, mid_scales):
     """The down accumulator as result rows: the expert's down scales (fp8
     weights) and bias applied, then the rows quantized."""
     b, scratch = ctx.b, ctx.scratch
-    w2_scales = (
-        scratch.w2_scales[pl.ds(expert, 1), :]
-        if b.form.has_scales and not b.form.block_scaled
-        else None
-    )
+    w2_scales = scratch.w2_scales[pl.ds(expert, 1), :] if b.form.has_scales else None
     w2_bias = scratch.w2_bias[pl.ds(expert, 1), :] if b.has_w2_bias else None
     return ffn.result_rows(
         acc2,
