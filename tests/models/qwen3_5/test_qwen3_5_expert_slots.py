@@ -67,6 +67,9 @@ def test_tp8_decode_legs_get_the_budget_they_ran_with(table):
 
 
 def test_a_permutation_table_budgets_like_no_table(table):
+    """A table that only permutes the 512 experts over 8 ranks holds 64 slots
+    per rank in every layer, as no table does. The budget applies only at the
+    measured TP8 + DCP4 decode layout, so the table is checked there."""
     table(DP8_TABLE)
-    cfg = _run_hook(_vllm_config(tp=2, dp=4, dcp=1, max_num_seqs=28))
-    assert cfg.cache_config.kv_cache_memory_bytes == 32_500_000_000 + CREDIT_EP8
+    cfg = _run_hook(_vllm_config(tp=8, dp=1, dcp=4, max_num_seqs=8))
+    assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
