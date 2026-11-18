@@ -7151,6 +7151,30 @@ class TPUModelRunner(GPUModelRunner):
             and not self._is_dspark_pd_producer
         ):
             if is_spec_step:
+                # Two chunks that fit one bucket: the drafter returns chunk 0's
+                # slice only and skips the multi-chunk concat (it consumes and
+                # resets the flag in propose()).
+                drafter = getattr(self, "drafter", None)
+                if (
+                    is_async
+                    and drafter is not None
+                    and len(next_tokens_per_chunk) == 2
+                    and not getattr(
+                        scheduler_output, "has_structured_output_requests", False
+                    )
+                    and getattr(self, "max_num_reqs", None) is not None
+                    and next_tokens_per_chunk[0].device.type == "tpu"
+                    and (
+                        next_tokens_per_chunk[0].shape[0]
+                        + next_tokens_per_chunk[1].shape[0]
+                        <= self.max_num_reqs
+                    )
+                    and (
+                        self.speculative_config is None
+                        or self.speculative_config.draft_tensor_parallel_size != 1
+                    )
+                ):
+                    drafter._skip_next_multi_chunk_draft_cat = True
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,
