@@ -13,6 +13,10 @@
 # limitations under the License.
 """Direct HBM -> peer VMEM weight streaming (`ep_tp_size > 1`) in fused_ep_moe_v2."""
 
+import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -329,3 +333,111 @@ def test_single_host_ep_tp2_matches_ep_tp1_reference(wire_dtype, sparse_empty_ex
         np.dot(got.ravel(), ref.ravel()) / (np.linalg.norm(got) * np.linalg.norm(ref))
     )
     assert cos > 0.9985, cos
+
+
+# eager_push changes only WHEN each tile's rows are pushed, so it has to be
+# bit-identical to the per-visit pushes. Checked in Pallas TPU interpret mode
+# on eight host devices, in a worker process because the device count is
+# fixed when the backend starts, at a shape the two-hop transport serves (the
+# ragged stride bound is over ep * g_local * capacity, so tiles stage through
+# the slab) with one hot expert, so that a visit runs many tiles, under the
+# served TP-pair schedule.
+EAGER = dict(
+    ep=8, ep_tp=2, g_local=2, capacity=32, tokens=256, hidden=256, inter=256, topk=4
+)
+
+
+def _eager_outputs():
+    """(per-visit, eager) bf16-wire outputs on one routing, as numpy."""
+    from jax._src import mesh as mesh_lib
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.fused_moe.v2 import host
+
+    ep, ep_tp, g_local, cap = (EAGER[k] for k in ("ep", "ep_tp", "g_local", "capacity"))
+    tokens, hidden, inter = EAGER["tokens"], EAGER["hidden"], EAGER["inter"]
+    topk = EAGER["topk"]
+    e_total = ep * g_local
+    assert host.ragged_stride_bound(tokens, topk, e_total, cap) > ep * g_local * cap
+    rng = np.random.default_rng(23)
+    n_w, si = e_total * ep_tp, inter // ep_tp
+    fp8 = jnp.float8_e4m3fn
+    gate = rng.standard_normal((tokens, e_total)).astype(np.float32)
+    gate[:, 0] += 4.0  # one hot expert: a visit of several tiles
+    gate[:, 3::4] = -1e9  # and empty experts: empty pair steps
+    mesh = Mesh(np.asarray(jax.devices()[:ep]), (AXIS,))
+    sh = NamedSharding(mesh, P(AXIS))
+    put = lambda a: jax.device_put(jnp.asarray(a), sh)  # noqa: E731
+    operands = (
+        put(jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)),
+        put(jnp.asarray(rng.standard_normal((n_w, hidden, 2 * si)) * 48, fp8)),
+        put(jnp.asarray(rng.standard_normal((n_w, si, hidden)) * 48, fp8)),
+        put(rng.uniform(0.5, 1.5, (n_w, 2 * si)).astype(np.float32) / 2400),
+        put(rng.uniform(0.5, 1.5, (n_w, hidden)).astype(np.float32) / 2400),
+        put(gate),
+    )
+    rank = put(np.arange(ep, dtype=np.int32).reshape(ep, 1))
+    # The kernel sizes its VMEM and SMEM from the TPU it targets; the host is not one.
+    target = mesh_lib.AbstractMesh(
+        (1,),
+        ("x",),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=mesh_lib.AbstractDevice(
+            device_kind="TPU7x", num_cores=1, platform="tpu"
+        ),
+    )
+    with mesh_lib.use_abstract_mesh(target):
+        info = pltpu.get_tpu_info()
+    outs = []
+    with patch.object(pltpu, "get_tpu_info", lambda: info), (
+        pltpu.force_tpu_interpret_mode()
+    ):
+        for eager in (False, True):
+            out = fused_ep_moe_v2(
+                *operands,
+                rank=rank,
+                topk=topk,
+                renormalize=True,
+                mesh=mesh,
+                capacity=cap,
+                sharded_plan=True,
+                scoring_fn="sigmoid",
+                wire_dtype=jnp.bfloat16,
+                ep_tp_size=ep_tp,
+                eager_push=eager,
+            )
+            outs.append(np.asarray(jax.block_until_ready(out)).astype(np.float32))
+    return outs
+
+
+def test_eager_push_is_bit_identical_to_per_visit_pushes():
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"--xla_force_host_platform_device_count={EAGER['ep']}",
+    )
+    proc = subprocess.run(
+        [sys.executable, __file__],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
+    result = json.loads(lines[-1][len("RESULT ") :])
+    assert result["finite"]
+    assert result["differs"] == 0, result
+
+
+if __name__ == "__main__":
+    per_visit, eager = _eager_outputs()
+    print(
+        "RESULT "
+        + json.dumps(
+            dict(
+                differs=int(np.sum(per_visit != eager)),
+                finite=bool(np.isfinite(per_visit).all()),
+            )
+        )
+    )
