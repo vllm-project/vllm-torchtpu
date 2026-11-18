@@ -32,8 +32,9 @@ SECTION = "tpu_scheduler"
 class SchedulerOptions:
     promote_warmest: bool = True
     """Promote the warmest request of each waiting queue to its head once per
-    step (``PrefixAwareScheduler``). False admits in FCFS order. The IX TP8
-    points ran false; #1 ran the default."""
+    step (``PrefixAwareScheduler``). False admits in FCFS order. The TP8
+    decode legs of the validation entries run false; p01's runs the
+    default."""
 
     kv_prefetch: bool = False
     """Start remote KV loads for the head of ``waiting`` while the running set

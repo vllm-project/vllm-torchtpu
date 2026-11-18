@@ -251,7 +251,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     # ------------------------------------------------------------------
     _KV_PREFETCH_LOG_INTERVAL_S = 60.0
     # Requests held for a free slot at most, and blocks kept for the running
-    # set (every IX decode leg ran 8 and the 512 default).
+    # set (every decode leg of the validation entries runs 8 and the 512 default).
     _KV_PREFETCH_MAX_HELD = 8
     _KV_PREFETCH_RESERVE_BLOCKS = 512
 
@@ -643,8 +643,8 @@ class PrefixAwareScheduler(AsyncScheduler):
     # on a KV consumer with DCP > 1): refuse a new remote load while this many
     # loads are in flight, or while running plus in-flight requests reach
     # max_num_seqs plus the overprovision; otherwise reserve max(the reserved
-    # blocks, the per-sequence blocks x (running + in flight)). Every IX
-    # decode leg with DCP 4 ran these values.
+    # blocks, the per-sequence blocks x (running + in flight)). Every decode
+    # leg of the validation entries with DCP 4 runs these values.
     _DECODE_MAX_STAGE3_INFLIGHT = 16
     _DECODE_STAGE3_OVERPROVISION = 32
     _DECODE_RESERVED_BLOCKS = 128
