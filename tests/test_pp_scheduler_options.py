@@ -229,6 +229,15 @@ def test_prefix_aware_opts_the_pool_into_the_memo():
     assert s._paw_sort
 
 
+def test_quadratic_cost_opts_the_pool_into_the_memo_without_the_admission():
+    # Under quadratic_cost the pending work counts every waiting request's
+    # prefix hit on every step, so the memo is on; the prefix-aware admission
+    # stays off.
+    s, calls = _built({"tpu_pp_scheduler": {"quadratic_cost": True}})
+    assert "memo" in calls and s._memo_xstep
+    assert not s._prefix_aware and not s._paw_sort and not s._promote_waiting
+
+
 def test_quadratic_cost_needs_the_equal_cost_model():
     # Without equal-cost chunking the stages are not timed and no cost model
     # exists to price the attention pairs, so the option is refused.

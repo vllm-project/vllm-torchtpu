@@ -52,6 +52,7 @@ from vllm_torchtpu.core import prefix_change_log  # noqa: E402
 from vllm_torchtpu.core.pp_chunk_scheduler import (  # noqa: E402
     TpuPipelineChunkScheduler,
 )
+from vllm_torchtpu.core.pp_chunks import StepCostModel  # noqa: E402
 
 HASH_BS = 2
 BS = 4
@@ -216,3 +217,31 @@ def test_a_reset_through_retention_reaches_the_epoch_and_the_change_log(
     assert pool.__dict__[prefix_change_log.EPOCH] == epoch + 1
     assert pool.__dict__[prefix_change_log.LOG] == []
     assert scheduler._retention is not None
+
+
+def _model(granularity: int = 4) -> StepCostModel:
+    buckets = [4, 8, 12, 16]
+    linear = {b: 12.0 + 0.0109 * b for b in buckets}
+    full = linear[16] + 1.5e-7 * 16**2 / 2
+    return StepCostModel(buckets, linear, 1.5e-7, full * 1.1, granularity)
+
+
+def test_quadratic_cost_reuses_prefix_hits_across_steps(engine_block_pool):
+    kvm = _manager()
+    scheduler = _scheduler(kvm, {"quadratic_cost": True})
+    assert scheduler._memo_xstep and not scheduler._prefix_aware
+    scheduler.install_cost_model(_model())
+    prompt = _cached_prompt(kvm)
+    scheduler.waiting = [
+        _request(f"w{i}", prompt + [200 + i] * (3 + i)) for i in range(4)
+    ]
+    assert all(_fresh_hit(kvm, r) > 0 for r in scheduler.waiting)
+    first = scheduler._pending_step_limit()
+    computes = scheduler._memo_computes
+    assert computes == len(scheduler.waiting)
+    # Nothing in the cache changed: the next step reuses every lookup.
+    assert scheduler._pending_step_limit() == first
+    assert scheduler._memo_computes == computes
+    # The memo answers what fresh lookups answer.
+    for request in scheduler.waiting:
+        assert scheduler._prefix_warmth(request) == _fresh_hit(kvm, request)
