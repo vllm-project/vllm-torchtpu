@@ -133,6 +133,11 @@ def _make_runner(
     runner._check_attention_schedule = types.MethodType(
         TPUModelRunner._check_attention_schedule, runner
     )
+    # The real rope position check; these stubs truncate no rope cache.
+    runner._rope_position_limit = None
+    runner._check_rope_positions = types.MethodType(
+        TPUModelRunner._check_rope_positions, runner
+    )
     # Spec-decode mamba rollback is inactive in these PCP layout tests; the
     # runner leaves the read-offset buffer unset (None) unless speculative
     # decoding is enabled, so _prepare_inputs / dummy_run skip the windowed

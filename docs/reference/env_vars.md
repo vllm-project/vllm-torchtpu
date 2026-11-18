@@ -74,6 +74,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_MLA_MASKED_DENSE_ENABLED` | `False` | Enables the masked-dense MLA attention path for short KV lengths. |
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
+| `TPU_ROPE_CACHE_TRUNCATE` | `True` | Slices the rotary cos/sin caches to `max_model_len` at load (text-only); a step that would rope a position past the cut is refused on the host. The default steps aside under speculative decoding (drafts rope positions past `max_model_len`) and when `max_model_len` fits in a token bucket. |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
 
 ---

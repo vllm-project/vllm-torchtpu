@@ -601,6 +601,39 @@ def _rope_cache_row_major(runner: Any) -> bool:
     return True
 
 
+def _rope_cache_truncate(runner: Any) -> bool:
+    """``TPU_ROPE_CACHE_TRUNCATE`` as it applies to ``runner``'s model.
+
+    A speculative draft ropes positions past the last scheduled token, and
+    `get_rope` hands it the target's rope modules, so their rows cannot stop
+    at max_model_len: the default steps aside and an explicit setting is
+    refused. The default also steps aside when max_model_len fits in a token
+    bucket: the row-major relayout pins entry layouts by (dtype, shape), and
+    a step activation could then share the cut table's shape.
+    """
+    if not envs.TPU_ROPE_CACHE_TRUNCATE:
+        return False
+    explicit = envs.is_set("TPU_ROPE_CACHE_TRUNCATE")
+    if runner.speculative_config is not None:
+        if explicit:
+            raise NotImplementedError(
+                "TPU_ROPE_CACHE_TRUNCATE with speculative decoding: the draft "
+                "ropes positions past max_model_len through the target's rope "
+                "caches. Unset it."
+            )
+        logger.info_once(
+            "TPU_ROPE_CACHE_TRUNCATE default skipped under speculative decoding."
+        )
+        return False
+    if runner.max_model_len <= runner.max_num_tokens and not explicit:
+        logger.info_once(
+            "TPU_ROPE_CACHE_TRUNCATE default skipped: max_model_len fits in a "
+            "token bucket, whose activations could share the cut table's shape."
+        )
+        return False
+    return True
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -902,6 +935,9 @@ class TPUModelRunner(GPUModelRunner):
             self.max_num_tokens, dtype=torch.int32, device="cpu"
         )
         self.positions_np = self.positions_cpu.numpy()
+        # Rows of the rope caches once `_truncate_rope_caches` cut them to
+        # max_model_len; `_check_rope_positions` refuses a step past them.
+        self._rope_position_limit: int | None = None
         self.block_table_cpu = torch.zeros(
             (self.max_num_reqs, self.max_num_blocks_per_req),
             dtype=torch.int32,
@@ -1390,8 +1426,9 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_hash_tables(model)
 
     def _truncate_rope_caches(self) -> None:
-        """Slice rotary cos_sin caches to max_model_len which can reduce
-        the overhead of xla layout data copy. Applicable to text-only.
+        """Slice rotary cos_sin caches to max_model_len: vLLM schedules no
+        position at or past it, so the rows beyond only hold HBM and cost
+        xla layout copies. Applicable to text-only.
         """
         multimodal_config = self.model_config.multimodal_config
         if self.model_config.is_multimodal_model and not (
@@ -1430,9 +1467,11 @@ class TPUModelRunner(GPUModelRunner):
                         buf.shape[0],
                         max_len,
                     )
+        if num_truncated:
+            self._rope_position_limit = max_len
         if num_eligible:
             logger.info("Truncated %d of %d rope caches", num_truncated, num_eligible)
-        else:
+        elif envs.is_set("TPU_ROPE_CACHE_TRUNCATE"):
             logger.warning(
                 "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
                 "position-indexed rope cache, nothing was truncated"
@@ -3045,6 +3084,7 @@ class TPUModelRunner(GPUModelRunner):
             ]
             + num_scheduled_tokens_per_req
         )
+        self._check_rope_positions(num_reqs)
         self._check_attention_schedule(
             num_reqs,
             num_scheduled_tokens_per_req,
@@ -5252,7 +5292,7 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
-        if envs.TPU_ROPE_CACHE_TRUNCATE:
+        if _rope_cache_truncate(self):
             self._truncate_rope_caches()
         if _rope_cache_row_major(self):
             runner_utils.relayout_rope_caches(self.model)
@@ -5866,6 +5906,19 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 pages_per_seq = cdiv(self.most_model_len, page_size)
         return num_seqs, pages_per_seq, page_size
+
+    def _check_rope_positions(self, num_reqs: int) -> None:
+        """Refuse a step that ropes a position past the truncated rope caches:
+        the device gather would read their last row in its place."""
+        if self._rope_position_limit is None or num_reqs <= 0:
+            return
+        last = int(self.seq_lens_np[:num_reqs].max()) - 1
+        if last >= self._rope_position_limit:
+            raise RuntimeError(
+                f"This step ropes position {last}, past the "
+                f"{self._rope_position_limit} rows the rope caches were "
+                "truncated to (max_model_len) at load."
+            )
 
     def _check_attention_schedule(
         self,
