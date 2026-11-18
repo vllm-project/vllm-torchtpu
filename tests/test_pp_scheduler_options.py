@@ -182,6 +182,7 @@ def _built(
     retention_enabled=True,
     architecture="Qwen3_5MoeForConditionalGeneration",
     equal_cost=True,
+    connector=None,
 ):
     """Runs TpuPipelineChunkScheduler.__init__ over a stub base __init__, with
     main's equal-cost chunking ``equal_cost``; returns the scheduler and the
@@ -199,7 +200,7 @@ def _built(
         )
         self.need_mamba_block_aligned_split = False
         self.kv_cache_manager = SimpleNamespace()
-        self.connector = None
+        self.connector = connector
 
     class FakeRetention:
         def __init__(self, kvm):
@@ -602,3 +603,16 @@ def test_free_blocks_count_the_blocks_retention_pins():
     assert s._get_num_free_blocks() == 10
     s._retention = SimpleNamespace(num_pinned_blocks=lambda: 5)
     assert s._get_num_free_blocks() == 15
+
+
+def test_the_connector_estimate_is_read_through_the_named_interface():
+    class Estimator:
+        def estimate_external_hit_tokens(self, request, num_local_tokens):
+            return 0
+
+    connector = Estimator()
+    s, _ = _built(connector=connector)
+    assert s._hit_estimator is connector
+    # A connector without the method (main's connectors) gives no estimate.
+    s, _ = _built(connector=SimpleNamespace())
+    assert s._hit_estimator is None
