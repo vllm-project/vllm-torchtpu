@@ -187,3 +187,55 @@ def test_decode_fp8_kv(mode, kv_lens_list):
     assert not np.isnan(out).any()
     rel = np.linalg.norm(out - ref) / np.linalg.norm(ref)
     assert rel < tol, rel
+
+
+_STATIC = configs.Fp8Operand.STATIC
+# The decode levers: the base-2 softmax, the static fp8 PV (softmax weights
+# times P_SCALE), both together (the weights leave the exponential already
+# scaled), and a static fp8 QK on top. (native_fp8, decode_exp2, tolerance).
+_LEVERS = {
+    "exp2": (configs.NativeFp8(), True, 0.03),
+    "pv_static": (configs.NativeFp8(pv=_STATIC), False, 0.03),
+    "pv_static_exp2": (configs.NativeFp8(pv=_STATIC), True, 0.03),
+    "qk_static_pv_static_exp2": (
+        configs.NativeFp8(qk=_STATIC, pv=_STATIC),
+        True,
+        0.12,
+    ),
+}
+
+
+@pytest.mark.parametrize("lever", list(_LEVERS))
+@pytest.mark.parametrize(
+    "kv_lens_list",
+    [[300], [5000, 9000 + 37, 131], [33000 + 61] + [4096 * 3] * 4],
+)
+def test_decode_levers_fp8_kv(lever, kv_lens_list):
+    native_fp8, decode_exp2, tol = _LEVERS[lever]
+    if not jtu.is_device_tpu_at_least(version=7):
+        pytest.skip("Expect TPU v7+ (native fp8 MXU)")
+    inp = _inputs(kv_lens_list)
+    ref = _reference(inp, kv_lens_list)
+    out, _ = wrapper.ragged_paged_attention(
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["kv_cache"],
+        inp["kv_lens"],
+        inp["page_indices"],
+        inp["cu_q_lens"],
+        inp["distribution"],
+        sm_scale=_SM_SCALE,
+        k_scale=1.0,
+        v_scale=1.0,
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        decode_query_size=_QLEN,
+        native_fp8=native_fp8,
+        decode_exp2=decode_exp2,
+        tuned_tiles=True,
+        skip_empty_mixed=True,
+    )
+    out = np.asarray(out[: len(kv_lens_list) * _QLEN].astype(jnp.float32))
+    assert not np.isnan(out).any()
+    rel = np.linalg.norm(out - ref) / np.linalg.norm(ref)
+    assert rel < tol, rel
