@@ -262,6 +262,13 @@ ZERO_THINK_TIME_WARNING: str = (
 
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
+ACTIVATION_HULL_SCHEMA: str = "vllm_torchtpu.roofline.moe_activation_hull/v1"
+# Float64 slope rounding scales as ulp(active) / spacing (~1e-13 for 512
+# experts); 1e-9 experts/token absorbs JSON float formatting slack.
+HULL_CONCAVITY_SLOPE_TOLERANCE: float = 1e-9
+# Absorbs 6-decimal JSON rounding (0.5e-6 half-ULP with 2x margin,
+# unit: experts) when comparing exported knots to the Bernoulli cap.
+HULL_BERNOULLI_CAP_TOLERANCE: float = 1e-6
 MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2
 MIN_TOP_LAYOUTS_FOR_BOUND_BEST: int = 3
 DEFAULT_TOP_K: int = 5

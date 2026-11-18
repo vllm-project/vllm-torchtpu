@@ -182,6 +182,21 @@ def scale_pp_stage_floor(
                 bf16_flops_min=(
                     None if m.bf16_flops_min is None else m.bf16_flops_min * ratio
                 ),
+                hbm_bytes_envelope=(
+                    None
+                    if m.hbm_bytes_envelope is None
+                    else m.hbm_bytes_envelope * ratio
+                ),
+                fp8_flops_envelope=(
+                    None
+                    if m.fp8_flops_envelope is None
+                    else m.fp8_flops_envelope * ratio
+                ),
+                bf16_flops_envelope=(
+                    None
+                    if m.bf16_flops_envelope is None
+                    else m.bf16_flops_envelope * ratio
+                ),
                 collectives=tuple(colls),
                 unique_collectives=None,
             )

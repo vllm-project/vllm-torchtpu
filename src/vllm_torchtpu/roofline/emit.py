@@ -144,6 +144,7 @@ class SolvePayload(TypedDict, total=False):
     reference: Mapping[str, object]
     dtypes: Mapping[str, object]
     single_host_fit: dict[str, object]
+    activation_regime: str
 
 
 class CeilingRow(TypedDict):
@@ -665,12 +666,27 @@ def _decode_group_key(
     )
 
 
-def _skyline_preference(point: ParetoPoint) -> tuple[bool, bool, float, float, float]:
+@dataclass(frozen=True, slots=True)
+class _SkylineFillConfig:
+    """Slot limit and TPOT lower-bound selector for skyline filling."""
+
+    max_slots: int
+    use_envelope: bool
+
+
+def _skyline_tpot_floor(point: ParetoPoint, *, use_envelope: bool) -> float:
+    """Return active TPOT lower bound used consistently across skyline orderings."""
+    return point.envelope_tpot_ms if use_envelope else point.bound_tpot_ms
+
+
+def _skyline_preference(
+    point: ParetoPoint, *, use_envelope: bool = False
+) -> tuple[bool, bool, float, float, float]:
     """Order candidate variants within one mesh family by verdict and 3 objectives."""
     return (
         point.slo_met,
         point.slo_verdict != SLO_VERDICT_RULED_OUT,
-        -point.bound_tpot_ms,
+        -_skyline_tpot_floor(point, use_envelope=use_envelope),
         point.token_throughput_per_chip,
         point.est_interactivity_tok_s,
     )
@@ -681,20 +697,20 @@ def _fill_skyline_slots(
     chosen_keys: set[tuple[object, ...]],
     candidates: Sequence[ParetoPoint],
     key_fn: Callable[[ParetoPoint], tuple[object, ...]],
-    k: int,
+    config: _SkylineFillConfig,
 ) -> None:
-    """Fill remaining skyline slots up to k without duplicating keys."""
+    """Fill remaining skyline slots up to max_slots without duplicating keys."""
     ordered = sorted(
         (pt for pt in candidates if key_fn(pt) not in chosen_keys),
         key=lambda pt: (
             not pt.slo_met,
-            pt.bound_tpot_ms,
+            _skyline_tpot_floor(pt, use_envelope=config.use_envelope),
             -pt.token_throughput_per_chip,
             -pt.est_interactivity_tok_s,
         ),
     )
     for point in ordered:
-        if len(selected) >= k:
+        if len(selected) >= config.max_slots:
             break
         selected.append(point)
         chosen_keys.add(key_fn(point))
@@ -703,20 +719,26 @@ def _fill_skyline_slots(
 def _select_concurrency_skyline(
     points: Sequence[ParetoPoint],
     k: int,
+    *,
+    use_envelope: bool = False,
 ) -> tuple[ParetoPoint, ...]:
     """Select up to k pure 3-objective Pareto skyline points at one concurrency."""
     best_by_pair: dict[tuple[object, ...], ParetoPoint] = {}
     for point in points:
         pair_key = _pair_family_key(point)
         current = best_by_pair.get(pair_key)
-        if current is None or _skyline_preference(point) > _skyline_preference(current):
+        if current is None or _skyline_preference(
+            point, use_envelope=use_envelope
+        ) > _skyline_preference(current, use_envelope=use_envelope):
             best_by_pair[pair_key] = point
 
     best_by_group: dict[tuple[object, ...], ParetoPoint] = {}
     for point in best_by_pair.values():
         group_key = _decode_group_key(point)
         current = best_by_group.get(group_key)
-        if current is None or _skyline_preference(point) > _skyline_preference(current):
+        if current is None or _skyline_preference(
+            point, use_envelope=use_envelope
+        ) > _skyline_preference(current, use_envelope=use_envelope):
             best_by_group[group_key] = point
 
     group_pool = list(best_by_group.values())
@@ -725,7 +747,7 @@ def _select_concurrency_skyline(
             group_pool,
             key=lambda pt: (
                 not pt.slo_met,
-                pt.bound_tpot_ms,
+                _skyline_tpot_floor(pt, use_envelope=use_envelope),
                 -pt.token_throughput_per_chip,
                 -pt.est_interactivity_tok_s,
             ),
@@ -735,7 +757,7 @@ def _select_concurrency_skyline(
             key=lambda pt: (
                 pt.slo_met,
                 pt.token_throughput_per_chip,
-                -pt.bound_tpot_ms,
+                -_skyline_tpot_floor(pt, use_envelope=use_envelope),
                 pt.est_interactivity_tok_s,
             ),
         ),
@@ -744,7 +766,7 @@ def _select_concurrency_skyline(
             key=lambda pt: (
                 pt.slo_met,
                 pt.est_interactivity_tok_s,
-                -pt.bound_tpot_ms,
+                -_skyline_tpot_floor(pt, use_envelope=use_envelope),
                 pt.token_throughput_per_chip,
             ),
         ),
@@ -760,19 +782,26 @@ def _select_concurrency_skyline(
             selected.append(anchor)
             chosen_groups.add(group_key)
 
-    _fill_skyline_slots(selected, chosen_groups, group_pool, _decode_group_key, k)
+    fill_cfg = _SkylineFillConfig(max_slots=k, use_envelope=use_envelope)
+    _fill_skyline_slots(
+        selected, chosen_groups, group_pool, _decode_group_key, fill_cfg
+    )
     if len(selected) < k:
         chosen_pairs: set[tuple[object, ...]] = {
             _pair_family_key(pt) for pt in selected
         }
         _fill_skyline_slots(
-            selected, chosen_pairs, list(best_by_pair.values()), _pair_family_key, k
+            selected,
+            chosen_pairs,
+            list(best_by_pair.values()),
+            _pair_family_key,
+            fill_cfg,
         )
 
     selected.sort(
         key=lambda pt: (
             -pt.token_throughput_per_chip,
-            pt.bound_tpot_ms,
+            _skyline_tpot_floor(pt, use_envelope=use_envelope),
             -pt.est_interactivity_tok_s,
         )
     )
@@ -796,7 +825,11 @@ def pareto_skyline_by_concurrency(
             pt for pt in conc_points if pt.slo_verdict != SLO_VERDICT_RULED_OUT
         ]
         pool = not_ruled_out if not_ruled_out else conc_points
-        result[concurrency] = _select_concurrency_skyline(pool, k)
+        result[concurrency] = _select_concurrency_skyline(
+            pool,
+            k,
+            use_envelope=plan.activation_model.prunes_on_envelope,
+        )
     return result
 
 
@@ -925,9 +958,11 @@ def point_launch_args(
 
 
 def _plan_dict(plan: ServingPlan) -> dict[str, object]:
-    """Convert ``ServingPlan`` to dict excluding internal ``sweep_candidates``."""
+    """Convert ``ServingPlan`` to dict with serialized ``activation_regime``."""
     data: dict[str, object] = dict(asdict(plan).items())
     data.pop("sweep_candidates", None)
+    data.pop("activation_model", None)
+    data["activation_regime"] = plan.activation_model.regime
     return data
 
 
@@ -1380,7 +1415,9 @@ def build_solve_payload(
         "calibrated": False,
         "basis": (
             "analytical roofline bounds and estimates; est_* values are "
-            "modeled estimates, bound_* values are physical lower bounds"
+            "modeled estimates, bound_* values are physical lower bounds, "
+            "and envelope_* values reflect the active activation_regime "
+            "(empirical_hull drives SLO ruling out)"
         ),
     }
     chip_dict: dict[str, object] = dict(asdict(chip).items())

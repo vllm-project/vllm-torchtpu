@@ -1072,6 +1072,18 @@ def render_html(payload: Mapping[str, object]) -> str:  # noqa: PLR0915
     not_ruled_out_count = _as_int(search.get("not_ruled_out"))
     slo_cnt = _as_int(search.get("slo_met"))
     front_cnt = _as_int(search.get("frontier"))
+    raw_regime = payload.get("activation_regime")
+    funnel_heading = (
+        f"Search Funnel (MoE Activation: {_escape(raw_regime)})"
+        if isinstance(raw_regime, str) and raw_regime
+        else "Search Funnel"
+    )
+    envelope_feasible_html = (
+        '        <div class="stat-label" style="margin-top:2px;">'
+        f"{_as_int(search['envelope_feasible'])} Envelope Feasible</div>"
+        if "envelope_feasible" in search
+        else ""
+    )
 
     warnings_html = _render_warnings_html(warnings)
     launch_cmds_html = _render_launch_cmds_html(top_k)
@@ -1239,7 +1251,7 @@ def render_html(payload: Mapping[str, object]) -> str:  # noqa: PLR0915
         "  </section>",
         sh_fit_html,
         '  <section id="search-funnel" class="card">',
-        "    <h2>Search Funnel</h2>",
+        f"    <h2>{funnel_heading}</h2>",
         '    <div class="funnel-container">',
         '      <div class="funnel-step">',
         '        <div class="stat-label">Enumerated</div>',
@@ -1256,6 +1268,7 @@ def render_html(payload: Mapping[str, object]) -> str:  # noqa: PLR0915
         f'        <div class="stat-value">{not_ruled_out_count}</div>',
         '        <div class="stat-label" style="margin-top:4px;">'
         f"{slo_cnt} SLO Met</div>",
+        envelope_feasible_html,
         "      </div>",
         '      <div class="funnel-arrow">&rarr;</div>',
         '      <div class="funnel-step" style="border-color:var(--primary); '

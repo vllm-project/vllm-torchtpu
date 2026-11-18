@@ -63,6 +63,7 @@ from .emit import (
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
+from .occupancy import ExpertActivationModel, parse_activation_spec
 from .report import write_html
 from .serving import ServingRequest, plan
 from .solver import (
@@ -643,6 +644,15 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
         help=(
             "Fraction of per-core HBM capacity usable for weights, state, "
             "and KV cache (unit: ratio, scope: core)."
+        ),
+    )
+    p.add_argument(
+        "--moe-activation",
+        type=str,
+        default=ExpertActivationModel().regime,
+        help=(
+            "Routed MoE expert activation envelope mode: pigeonhole, bernoulli, "
+            "or hull:<path> (unit: spec, scope: workload)."
         ),
     )
 
@@ -1421,6 +1431,18 @@ def _build_cli_reference_report(
     )
 
 
+def _parse_cli_activation_model(
+    spec: str,
+    geom: ModelGeometry,
+    parser: argparse.ArgumentParser,
+) -> ExpertActivationModel:
+    """Parse CLI --moe-activation spec or exit via parser.error on failure."""
+    try:
+        return parse_activation_spec(spec, geom)
+    except (OSError, TypeError, ValueError) as exc:
+        parser.error(f"invalid --moe-activation {spec!r}: {exc}")
+
+
 def _dispatch_solve_family(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -1469,6 +1491,7 @@ def _dispatch_solve_family(
         else ("pins" if has_pins else "serve_command")
     )
     dt_auto = _resolve_solve_dtypes(args, cfg, serve_parsed)
+    activation_model = _parse_cli_activation_model(args.moe_activation, geom, parser)
     solve_opts = SolveOptions(
         mode=args.mode,
         max_chips=eff_max_chips,
@@ -1479,6 +1502,7 @@ def _dispatch_solve_family(
         decode_topology=args.decode_topology,
         pd_ratio=pd_ratio,
         budget_source=budget_source,
+        activation_model=activation_model,
     )
     try:
         splan = solve_serving_plan(

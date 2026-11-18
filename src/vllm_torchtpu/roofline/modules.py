@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from .collectives import Algo, Collective, CollectiveConfig, Kind, make, padded_rows
@@ -35,6 +35,13 @@ from .constants import (
     VECTOR_SUB_BYTE_ELEMENTS_PER_WORD,
 )
 from .geometry import LayerCounts, count_layer_types, layer_ffn_kinds
+from .occupancy import (
+    ExpertActivationModel,
+    ExpertDispatch,
+    active_experts_envelope,
+    bernoulli_expected_experts,
+    min_experts_per_ep_shard,
+)
 
 if TYPE_CHECKING:
     from .geometry import ModelGeometry
@@ -116,6 +123,9 @@ class ModuleCost:
     bf16_flops_min: float | None = None
     vpu_flops: float = 0.0
     strict_vpu_flops: float = 0.0
+    hbm_bytes_envelope: float | None = None
+    fp8_flops_envelope: float | None = None
+    bf16_flops_envelope: float | None = None
 
     @property
     def ici_bytes(self) -> float:
@@ -152,14 +162,37 @@ class ModuleCost:
         """Unpadded lower-bound BF16 FLOPs when available, else nominal BF16 FLOPs."""
         return self.bf16_flops if self.bf16_flops_min is None else self.bf16_flops_min
 
+    @property
+    def envelope_hbm_bytes(self) -> float:
+        """Activation-envelope byte count when available, else strict bytes."""
+        return (
+            self.strict_hbm_bytes
+            if self.hbm_bytes_envelope is None
+            else self.hbm_bytes_envelope
+        )
+
+    @property
+    def envelope_fp8_flops(self) -> float:
+        """Activation-envelope FP8 FLOPs when available, else strict FP8 FLOPs."""
+        return (
+            self.strict_fp8_flops
+            if self.fp8_flops_envelope is None
+            else self.fp8_flops_envelope
+        )
+
+    @property
+    def envelope_bf16_flops(self) -> float:
+        """Activation-envelope BF16 FLOPs when available, else strict BF16 FLOPs."""
+        return (
+            self.strict_bf16_flops
+            if self.bf16_flops_envelope is None
+            else self.bf16_flops_envelope
+        )
+
 
 def experts_touched(num_experts: int, top_k: int, rows: int) -> float:
     """Expected distinct routed experts touched under uniform routing."""
-    if num_experts <= 0 or top_k <= 0 or rows <= 0:
-        return 0.0
-    if top_k >= num_experts:
-        return float(num_experts)
-    return float(num_experts) * (1.0 - (1.0 - top_k / num_experts) ** rows)
+    return bernoulli_expected_experts(num_experts, top_k, rows)
 
 
 def ep_busiest_experts(num_experts: int, top_k: int, rows: int, ranks: int) -> float:
@@ -288,6 +321,9 @@ class _StepContext:
     mxu_m_tile: int = 1
     mxu_lhs_rows_bf16: int = 16
     mxu_lhs_rows_fp8: int = 32
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1221,6 +1257,118 @@ def _compute_kda_cost(
     )
 
 
+_DEFAULT_ACTIVATION_MODEL: ExpertActivationModel = ExpertActivationModel()
+
+
+@dataclass(frozen=True, slots=True)
+class _RoutedEnvelopeSpec:
+    """Precomputed routed MoE terms needed for activation-envelope sizing."""
+
+    ep_shards: int
+    decode_tokens: int
+    prefill_tokens: int
+    routed_rows: int
+    routed_unit: float
+    non_routed_weight_bytes: float
+    routed_base_fp8_flops: float
+    routed_base_bf16_flops: float
+    lhs_floor: int
+
+
+def _resolve_envelope_experts(
+    geom: ModelGeometry,
+    eval_context: _StepContext,
+    spec: _RoutedEnvelopeSpec,
+) -> tuple[float, float]:
+    """Resolve per-shard and global active expert counts across decode/prefill/mixed."""
+    model = eval_context.activation_model
+    has_decode = spec.decode_tokens > 0
+    has_prefill = spec.prefill_tokens > 0
+    if has_decode and has_prefill and model.prunes_on_envelope:
+        # Mixed step under empirical hull: set-union monotonicity guarantees
+        # |E_decode U E_prefill| >= max(|E_decode|, |E_prefill|).
+        decode_dispatch = ExpertDispatch(
+            num_experts=geom.num_experts,
+            experts_per_token=geom.top_k,
+            dispatched_tokens=spec.decode_tokens,
+            ep_shards=spec.ep_shards,
+            is_prefill=False,
+            tokens_per_seq=max(1, eval_context.rows_per_seq),
+        )
+        prefill_dispatch = ExpertDispatch(
+            num_experts=geom.num_experts,
+            experts_per_token=geom.top_k,
+            dispatched_tokens=spec.prefill_tokens,
+            ep_shards=spec.ep_shards,
+            is_prefill=True,
+            tokens_per_seq=1,
+        )
+        return (
+            max(
+                min_experts_per_ep_shard(model, decode_dispatch),
+                min_experts_per_ep_shard(model, prefill_dispatch),
+            ),
+            max(
+                active_experts_envelope(model, decode_dispatch),
+                active_experts_envelope(model, prefill_dispatch),
+            ),
+        )
+    is_prefill = has_prefill and not has_decode
+    tokens_per_seq = 1 if is_prefill else max(1, eval_context.rows_per_seq)
+    dispatch = ExpertDispatch(
+        num_experts=geom.num_experts,
+        experts_per_token=geom.top_k,
+        dispatched_tokens=spec.decode_tokens + spec.prefill_tokens,
+        ep_shards=spec.ep_shards,
+        is_prefill=is_prefill,
+        tokens_per_seq=tokens_per_seq,
+    )
+    return (
+        min_experts_per_ep_shard(model, dispatch),
+        active_experts_envelope(model, dispatch),
+    )
+
+
+def _compute_routed_moe_envelope(
+    geom: ModelGeometry,
+    dt: Dtypes,
+    eval_context: _StepContext,
+    spec: _RoutedEnvelopeSpec,
+) -> tuple[float, float, float]:
+    """Compute activation-envelope routed MoE weight bytes and FP8/BF16 FLOPs."""
+    experts_per_shard_envelope, total_active_envelope = _resolve_envelope_experts(
+        geom, eval_context, spec
+    )
+    moe_weight_bytes_envelope = (
+        experts_per_shard_envelope * spec.routed_unit * dt.w_expert
+        + spec.non_routed_weight_bytes
+    )
+    routed_fp8_envelope = spec.routed_base_fp8_flops
+    routed_bf16_envelope = spec.routed_base_bf16_flops
+    if (
+        spec.lhs_floor > 1
+        and spec.routed_rows > 0
+        and experts_per_shard_envelope > 0.0
+        and geom.top_k > 0
+    ):
+        strict_padded_rows = float(
+            math.ceil(spec.routed_rows / spec.lhs_floor) * spec.lhs_floor
+        )
+        pad_multiplier_strict = strict_padded_rows / float(spec.routed_rows)
+        total_assignments = float(spec.routed_rows * geom.top_k)
+        envelope_padded_tiles = max(
+            float(math.ceil(total_assignments / spec.lhs_floor)),
+            total_active_envelope,
+        )
+        pad_multiplier_envelope = max(
+            pad_multiplier_strict,
+            (envelope_padded_tiles * float(spec.lhs_floor)) / total_assignments,
+        )
+        routed_fp8_envelope *= pad_multiplier_envelope
+        routed_bf16_envelope *= pad_multiplier_envelope
+    return (moe_weight_bytes_envelope, routed_fp8_envelope, routed_bf16_envelope)
+
+
 def _compute_routed_moe_cost(  # noqa: PLR0915
     geom: ModelGeometry,
     parallel: Parallel,
@@ -1321,17 +1469,21 @@ def _compute_routed_moe_cost(  # noqa: PLR0915
     r_fp8_min, r_bf16_min = _split_matmul_flops(
         routed_rows, routed_act_elems_min, dt.w_expert, dt.act
     )
+    routed_base_fp8_flops = r_fp8_min
+    routed_base_bf16_flops = r_bf16_min
+    latent_fp8_flops = 0.0
+    latent_bf16_flops = 0.0
     if geom.routed_expert_hidden > 0:
         latent_flops_elems = float(
             n_m_eff * 2 * geom.hidden * geom.routed_expert_hidden / tp
         )
-        l_fp8, l_bf16 = _split_matmul_flops(
+        latent_fp8_flops, latent_bf16_flops = _split_matmul_flops(
             eval_context.rows, latent_flops_elems, dt.w_dense, dt.act
         )
-        r_fp8 += l_fp8
-        r_bf16 += l_bf16
-        r_fp8_min += l_fp8
-        r_bf16_min += l_bf16
+        r_fp8 += latent_fp8_flops
+        r_bf16 += latent_bf16_flops
+        r_fp8_min += latent_fp8_flops
+        r_bf16_min += latent_bf16_flops
     if eval_context.mxu_m_tile > 1 and routed_rows > 0 and ed > 0.0 and geom.top_k > 0:
         ed_global = (
             experts_touched(geom.num_experts, geom.top_k, routed_rows)
@@ -1352,6 +1504,7 @@ def _compute_routed_moe_cost(  # noqa: PLR0915
         if dt.w_expert <= FP8_BYTES
         else eval_context.mxu_lhs_rows_bf16
     )
+    pad_mult_strict = 1.0
     if lhs_floor > 1 and routed_rows > 0 and ed_min > 0.0 and geom.top_k > 0:
         # Concentrated K-expert lower bound: all routed_rows tokens hit the
         # same top_k experts.
@@ -1359,6 +1512,43 @@ def _compute_routed_moe_cost(  # noqa: PLR0915
         pad_mult_strict = strict_padded_rows / float(routed_rows)
         r_fp8_min *= pad_mult_strict
         r_bf16_min *= pad_mult_strict
+    non_routed_weight_bytes = (
+        shared_elems * dt.w_dense
+        + router_elems * dt.router
+        + (latent_proj_sharded * dt.w_dense if geom.routed_expert_hidden > 0 else 0.0)
+    )
+    decode_tokens_for_envelope = (
+        eval_context.decode_rows * dp_per_ep
+        if parallel.moe == "ep" and parallel.ep > 1
+        else eval_context.decode_rows
+    )
+    prefill_tokens_for_envelope = (
+        eval_context.eff_prefill * pcp_per_ep * dp_per_ep
+        if parallel.moe == "ep" and parallel.ep > 1
+        else eval_context.eff_prefill
+    )
+    (
+        moe_weight_bytes_envelope,
+        routed_fp8_envelope,
+        routed_bf16_envelope,
+    ) = _compute_routed_moe_envelope(
+        geom,
+        dt,
+        eval_context,
+        _RoutedEnvelopeSpec(
+            ep_shards=ep_ranks if parallel.moe == "ep" else 1,
+            decode_tokens=decode_tokens_for_envelope,
+            prefill_tokens=prefill_tokens_for_envelope,
+            routed_rows=routed_rows,
+            routed_unit=routed_unit,
+            non_routed_weight_bytes=non_routed_weight_bytes,
+            routed_base_fp8_flops=routed_base_fp8_flops,
+            routed_base_bf16_flops=routed_base_bf16_flops,
+            lhs_floor=lhs_floor,
+        ),
+    )
+    routed_fp8_envelope += latent_fp8_flops * pad_mult_strict
+    routed_bf16_envelope += latent_bf16_flops * pad_mult_strict
     s_fp8, s_bf16 = _split_matmul_flops(sh_rows, shared_mxu_elems, dt.w_dense, dt.act)
     s_fp8_min, s_bf16_min = _split_matmul_flops(
         sh_rows, shared_elems, dt.w_dense, dt.act
@@ -1427,6 +1617,9 @@ def _compute_routed_moe_cost(  # noqa: PLR0915
         bf16_flops_min=r_bf16_min + s_bf16_min + rt_bf16,
         vpu_flops=vpu_flops,
         strict_vpu_flops=strict_vpu_flops,
+        hbm_bytes_envelope=moe_weight_bytes_envelope,
+        fp8_flops_envelope=routed_fp8_envelope + s_fp8_min + rt_fp8,
+        bf16_flops_envelope=routed_bf16_envelope + s_bf16_min + rt_bf16,
     )
 
 
@@ -1605,6 +1798,7 @@ def pass_costs(  # noqa: PLR0913
     mxu_m_tile: int = 1,
     mxu_lhs_rows_bf16: int = 16,
     mxu_lhs_rows_fp8: int = 32,
+    activation_model: ExpertActivationModel = _DEFAULT_ACTIVATION_MODEL,
 ) -> tuple[ModuleCost, ...]:
     """Compute per-module resource work for one decode, prefill, or mixed pass."""
     _validate_pass_costs_config(geom, parallel)
@@ -1647,6 +1841,7 @@ def pass_costs(  # noqa: PLR0913
         mxu_m_tile=mxu_m_tile,
         mxu_lhs_rows_bf16=mxu_lhs_rows_bf16,
         mxu_lhs_rows_fp8=mxu_lhs_rows_fp8,
+        activation_model=activation_model,
     )
 
     counts = count_layer_types(geom)

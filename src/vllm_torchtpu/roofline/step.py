@@ -44,6 +44,7 @@ from .modules import (
     _split_matmul_flops,
     pass_costs,
 )
+from .occupancy import ExpertActivationModel
 
 if TYPE_CHECKING:
     from .chips import ChipSpec, SliceTopology
@@ -54,11 +55,14 @@ type _CollKey = tuple[str, float, int, float, float, int]
 
 @dataclass(frozen=True, slots=True)
 class FloorOptions:
-    """Optional dtype, latency, and topology parameters for step_floor calls."""
+    """Optional dtype, latency, topology, and activation parameters for step_floor."""
 
     dt: Dtypes = field(default_factory=Dtypes)
     collective_latency_s: float = 0.0
     topology: SliceTopology | None = None
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +92,7 @@ class StepFloor:
     vpu_bound_s: float = 0.0
     coll_bound_s: float = 0.0
     latency_assumed_s: float = 0.0
+    envelope_floor_s: float = 0.0
 
     @property
     def resource_bound_s(self) -> float:
@@ -228,6 +233,20 @@ def _sum_module_resources(
     )
 
 
+def _sum_envelope_resources(
+    modules: tuple[ModuleCost, ...],
+    chip: ChipSpec,
+) -> tuple[float, float]:
+    """Sum per-module activation-envelope memory and matrix-compute spans."""
+    total_bytes_envelope = sum(module.envelope_hbm_bytes for module in modules)
+    total_fp8_envelope = sum(module.envelope_fp8_flops for module in modules)
+    total_bf16_envelope = sum(module.envelope_bf16_flops for module in modules)
+    return (
+        total_bytes_envelope / chip.hbm_bw,
+        total_fp8_envelope / chip.fp8_flops + total_bf16_envelope / chip.bf16_flops,
+    )
+
+
 def combine_modules(
     modules: tuple[ModuleCost, ...],
     chip: ChipSpec,
@@ -279,6 +298,13 @@ def combine_modules(
 
     hard_floor_s = max(hbm_bound_s, matmul_bound_s, vpu_bound_s, coll_bound_s)
     serial_estimate_s = mod_serial_s + chain_s
+    memory_envelope_s, matmul_envelope_s = _sum_envelope_resources(modules, chip)
+    envelope_floor_s = max(
+        memory_envelope_s,
+        matmul_envelope_s,
+        vpu_bound_s,
+        coll_bound_s,
+    )
     if hard_floor_s == hbm_bound_s:
         binding = "hbm"
     elif hard_floor_s == matmul_bound_s:
@@ -304,6 +330,7 @@ def combine_modules(
         vpu_bound_s=vpu_bound_s,
         coll_bound_s=coll_bound_s,
         latency_assumed_s=hop_lat_s,
+        envelope_floor_s=envelope_floor_s,
     )
 
 
@@ -326,6 +353,7 @@ def step_floor(
             mxu_m_tile=chip.mxu_m_tile,
             mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
             mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
+            activation_model=opts.activation_model,
         ),
         chip,
         collective_latency_s=opts.collective_latency_s,
@@ -359,6 +387,7 @@ def spec_cycle_floor(
             mxu_m_tile=chip.mxu_m_tile,
             mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
             mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
+            activation_model=opts.activation_model,
         )
     )
     if spec.k <= 0:
@@ -420,6 +449,7 @@ def spec_cycle_floor(
         mxu_m_tile=chip.mxu_m_tile,
         mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
         mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
+        activation_model=opts.activation_model,
     )
 
     fc_elems = DRAFT_PROJECTION_HIDDEN_VECTORS * float(
@@ -471,6 +501,17 @@ def spec_cycle_floor(
             ),
             vpu_flops=m.vpu_flops * spec.k,
             strict_vpu_flops=m.strict_vpu_flops * spec.k,
+            hbm_bytes_envelope=(
+                None if m.hbm_bytes_envelope is None else m.hbm_bytes_envelope * spec.k
+            ),
+            fp8_flops_envelope=(
+                None if m.fp8_flops_envelope is None else m.fp8_flops_envelope * spec.k
+            ),
+            bf16_flops_envelope=(
+                None
+                if m.bf16_flops_envelope is None
+                else m.bf16_flops_envelope * spec.k
+            ),
         )
         for m in one_draft
     )

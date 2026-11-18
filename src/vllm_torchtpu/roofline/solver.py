@@ -61,6 +61,7 @@ from .memory import (
     smem_max_seqs,
 )
 from .modules import Dtypes, Parallel, StepShape
+from .occupancy import ExpertActivationModel
 from .partition import (
     PpStageOptions,
     count_full_attn_layers,
@@ -276,6 +277,7 @@ class SearchStats:
     not_ruled_out: int
     slo_met: int
     frontier: int
+    envelope_feasible: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +332,9 @@ class ParetoPoint:
     effective_prefix_hit_rate: float | None = None
     min_decode_seqs: float = 0.0
     floor_throughput_per_chip: float = 0.0
+    envelope_tpot_ms: float = 0.0
+    envelope_ttft_ms: float = 0.0
+    envelope_decode_seqs: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +361,9 @@ class ServingPlan:
     budget_source: str = "flag"
     max_instances: int | None = None
     pins: dict[str, object] | None = None
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +380,9 @@ class SolveOptions:
     decode_topology: str | None = None
     pd_ratio: tuple[int, int] | None = None
     budget_source: str = "flag"
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
 
 
 def _divisors(n: int) -> tuple[int, ...]:
@@ -706,6 +717,9 @@ class _SolveContext:
     prefill_topology: str | None = None
     decode_topology: str | None = None
     pd_ratio: tuple[int, int] | None = None
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
     enumerated: int = 0
     hbm_fit: int = 0
     decode_floor_cache: dict[tuple[str, Parallel, int], StepFloor] = field(
@@ -732,6 +746,7 @@ class _PrefillOption:
     hbm_bd: HbmBreakdown
     pp_part: tuple[int, ...] | None = None
     bound_ttft_ms: float = 0.0
+    envelope_ttft_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -811,15 +826,17 @@ class _MixedLoopInput:
     ttft_upper_s: float | None = None
 
 
-type _StepDurationKind = Literal["serial_estimate", "hard_floor"]
+type _StepDurationKind = Literal["serial_estimate", "hard_floor", "envelope_floor"]
 
 
 def _step_duration_s(
     step_floor_val: StepFloor, duration_kind: _StepDurationKind
 ) -> float:
-    """Select the modeled or hard-floor step duration in seconds."""
+    """Select the modeled, hard-floor, or envelope-floor step duration in seconds."""
     if duration_kind == "hard_floor":
         return step_floor_val.hard_floor_s
+    if duration_kind == "envelope_floor":
+        return step_floor_val.envelope_floor_s
     return step_floor_val.serial_estimate_s
 
 
@@ -849,6 +866,28 @@ class _DisaggMetricsOutput:
     bound_sf_d: StepFloor
     min_decode_seqs: float
     floor_throughput_per_chip: float
+    envelope_step_floor: StepFloor
+    envelope_decode_seqs: float
+
+
+@dataclass(frozen=True, slots=True)
+class _MixedEnvelopeBounds:
+    """Typed mixed-serving residency state for envelope floor evaluation."""
+
+    concurrency: int
+    min_decode_seqs: float
+    est_decode_seqs: float
+    bound_step_floor: StepFloor
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectivePrefill:
+    """Cached prefill latency, throughput rate, hard bound, and envelope bound."""
+
+    ttft_ms: float
+    rate_p: float
+    bound_ttft_ms: float
+    envelope_ttft_ms: float
 
 
 def _floor_times(step_floor_val: StepFloor) -> FloorTimes:
@@ -983,6 +1022,17 @@ def _pcie_read_s(
     return 0.0
 
 
+def _within_slo_bounds(
+    scen: TrafficScenario,
+    ttft_ms: float,
+    tpot_ms: float,
+) -> bool:
+    """Return True when both TTFT and TPOT stay within any configured SLOs."""
+    ttft_ok = scen.ttft_slo_ms is None or ttft_ms <= scen.ttft_slo_ms
+    tpot_ok = scen.tpot_slo_ms is None or tpot_ms <= scen.tpot_slo_ms
+    return ttft_ok and tpot_ok
+
+
 def _resolve_slo_verdict(
     scen: TrafficScenario,
     est_ttft_ms: float,
@@ -990,16 +1040,14 @@ def _resolve_slo_verdict(
     bound_ttft_ms: float,
     bound_tpot_ms: float,
 ) -> SloVerdict:
-    """Classify hard-bound vs modeled-estimate SLO feasibility verdict."""
-    slo_ruled_out = (
-        scen.ttft_slo_ms is not None and bound_ttft_ms > scen.ttft_slo_ms
-    ) or (scen.tpot_slo_ms is not None and bound_tpot_ms > scen.tpot_slo_ms)
-    if slo_ruled_out:
+    """Classify lower-bound vs modeled-estimate SLO feasibility verdict."""
+    if not _within_slo_bounds(scen, bound_ttft_ms, bound_tpot_ms):
         return SLO_VERDICT_RULED_OUT
-    est_ok = (scen.ttft_slo_ms is None or est_ttft_ms <= scen.ttft_slo_ms) and (
-        scen.tpot_slo_ms is None or est_tpot_ms <= scen.tpot_slo_ms
+    return (
+        SLO_VERDICT_ESTIMATE_MEETS
+        if _within_slo_bounds(scen, est_ttft_ms, est_tpot_ms)
+        else SLO_VERDICT_UNDECIDED
     )
-    return SLO_VERDICT_ESTIMATE_MEETS if est_ok else SLO_VERDICT_UNDECIDED
 
 
 def _eval_decode_floor(
@@ -1013,7 +1061,11 @@ def _eval_decode_floor(
     cached = eval_context.decode_floor_cache.get(key)
     if cached is not None:
         return cached
-    opts = FloorOptions(dt=eval_context.dtypes, topology=topo)
+    opts = FloorOptions(
+        dt=eval_context.dtypes,
+        topology=topo,
+        activation_model=eval_context.activation_model,
+    )
     sf = (
         spec_cycle_floor(
             eval_context.geom,
@@ -1054,7 +1106,11 @@ def _prefill_step_floor(
             prefill_tokens=eval_context.scenario.isl,
             prefix_hit_rate=prefix_hit_rate,
         ),
-        FloorOptions(dt=eval_context.dtypes, topology=topo),
+        FloorOptions(
+            dt=eval_context.dtypes,
+            topology=topo,
+            activation_model=eval_context.activation_model,
+        ),
     )
 
 
@@ -1193,6 +1249,7 @@ def _find_prefill_options(
                     hbm_bd=hbm_bd,
                     pp_part=pp_part_opt,
                     bound_ttft_ms=sf_p.hard_floor_s * UNIT_MILLIS_PER_SECOND,
+                    envelope_ttft_ms=sf_p.envelope_floor_s * UNIT_MILLIS_PER_SECOND,
                 )
         prefill_options.extend(best_by_class.values())
     return (prefill_options, min_req_ttft_ms)
@@ -1282,7 +1339,11 @@ def _solve_mixed_decode_fixed_point(
     dp_val = max(1, par.dp)
     max_decode_seqs = float(loop_in.b_res * dp_val)
     b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), float(c)))
-    opts = FloorOptions(dt=eval_context.dtypes, topology=topo)
+    opts = FloorOptions(
+        dt=eval_context.dtypes,
+        topology=topo,
+        activation_model=eval_context.activation_model,
+    )
 
     sf_dec = _eval_decode_floor(eval_context, topo, par, 1)
     sf_mix = sf_dec
@@ -1424,6 +1485,7 @@ def _evaluate_mixed_point(
     pcie_read_s = _pcie_read_s(eval_context, bounds.b_kv_phys_core, h_eff, h_hbm_only)
     ttft_service_s = sf_ttft_c.serial_estimate_s + pcie_read_s
     bound_ttft_ms = sf_ttft_c.hard_floor_s * UNIT_MILLIS_PER_SECOND
+    envelope_ttft_ms = sf_ttft_c.envelope_floor_s * UNIT_MILLIS_PER_SECOND
 
     eff_isl_c = max(1, math.ceil((1.0 - h_eff) * eval_context.scenario.isl))
     n_chunks_c = max(
@@ -1470,21 +1532,41 @@ def _evaluate_mixed_point(
     if eval_context.scenario.think_time_s <= 0.0:
         min_decode_seqs = solved.decode_seqs
         bound_sf_dec = solved.sf_dec
+        envelope_decode_seqs = solved.decode_seqs
+        envelope_step_floor = solved.sf_dec
     else:
         min_decode_seqs = min(solved.decode_seqs, floor_solved.decode_seqs)
         floor_b_replica = max(
             1, min(b_res, math.ceil(min_decode_seqs / float(max(1, par.dp))))
         )
         bound_sf_dec = _eval_decode_floor(eval_context, topo, par, floor_b_replica)
+        envelope_decode_seqs, envelope_step_floor = _resolve_mixed_envelope_floor(
+            eval_context,
+            topo,
+            par,
+            replace(
+                mixed_in, duration_kind="envelope_floor", ttft_upper_s=ttft_upper_s
+            ),
+            _MixedEnvelopeBounds(
+                concurrency=c,
+                min_decode_seqs=min_decode_seqs,
+                est_decode_seqs=solved.decode_seqs,
+                bound_step_floor=bound_sf_dec,
+            ),
+        )
     bound_tpot_ms = (
         bound_sf_dec.hard_floor_s * UNIT_MILLIS_PER_SECOND
     ) / eval_context.eff_al
+    envelope_tpot_ms = (
+        envelope_step_floor.envelope_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / eval_context.eff_al
+    use_envelope = eval_context.activation_model.prunes_on_envelope
     verdict = _resolve_slo_verdict(
         eval_context.scenario,
         solved.est_ttft_ms,
         solved.est_tpot_ms,
-        bound_ttft_ms,
-        bound_tpot_ms,
+        envelope_ttft_ms if use_envelope else bound_ttft_ms,
+        envelope_tpot_ms if use_envelope else bound_tpot_ms,
     )
 
     max_seqs_flag = b_res if b_res < b_local else eval_context.scenario.max_num_seqs
@@ -1532,6 +1614,39 @@ def _evaluate_mixed_point(
         effective_prefix_hit_rate=h_eff,
         min_decode_seqs=min_decode_seqs,
         floor_throughput_per_chip=floor_tput,
+        envelope_tpot_ms=envelope_tpot_ms,
+        envelope_ttft_ms=envelope_ttft_ms,
+        envelope_decode_seqs=envelope_decode_seqs,
+    )
+
+
+def _resolve_mixed_envelope_floor(
+    eval_context: _SolveContext,
+    topo: SliceTopology,
+    par: Parallel,
+    envelope_loop_input: _MixedLoopInput,
+    bounds: _MixedEnvelopeBounds,
+) -> tuple[float, StepFloor]:
+    """Resolve envelope decode residency and step floor for mixed serving."""
+    if eval_context.activation_model.matches_hard_floor:
+        return (bounds.min_decode_seqs, bounds.bound_step_floor)
+    envelope_solved = _solve_mixed_decode_fixed_point(
+        eval_context, topo, par, bounds.concurrency, envelope_loop_input
+    )
+    envelope_decode_seqs = max(
+        bounds.min_decode_seqs,
+        min(bounds.est_decode_seqs, envelope_solved.decode_seqs),
+    )
+    envelope_replica_batch = max(
+        1,
+        min(
+            envelope_loop_input.b_res,
+            math.ceil(envelope_decode_seqs / float(max(1, par.dp))),
+        ),
+    )
+    return (
+        envelope_decode_seqs,
+        _eval_decode_floor(eval_context, topo, par, envelope_replica_batch),
     )
 
 
@@ -1770,6 +1885,8 @@ def _compute_disagg_metrics(
     if think <= 0.0:
         min_decode_seqs = est_decode_seqs
         bound_sf_d = sf_d
+        envelope_decode_seqs = est_decode_seqs
+        envelope_step_floor = sf_d
     else:
         min_decode_seqs = min(est_decode_seqs, floor_decode_seqs)
         floor_b_replica = max(
@@ -1778,6 +1895,30 @@ def _compute_disagg_metrics(
         bound_sf_d = _eval_decode_floor(
             eval_context, dec.topo, dec.par, floor_b_replica
         )
+        if eval_context.activation_model.matches_hard_floor:
+            envelope_decode_seqs = min_decode_seqs
+            envelope_step_floor = bound_sf_d
+        else:
+            _, _, _, _, raw_envelope_decode_seqs = _run_disagg_decode_loop(
+                eval_context,
+                dec,
+                target,
+                batch_stats,
+                (ttft_upper_s, "envelope_floor"),
+            )
+            envelope_decode_seqs = max(
+                min_decode_seqs, min(est_decode_seqs, raw_envelope_decode_seqs)
+            )
+            envelope_replica_batch = max(
+                1,
+                min(
+                    batch_stats.b_res,
+                    math.ceil(envelope_decode_seqs / float(idp_val)),
+                ),
+            )
+            envelope_step_floor = _eval_decode_floor(
+                eval_context, dec.topo, dec.par, envelope_replica_batch
+            )
     return _DisaggMetricsOutput(
         est_ttft_ms=est_ttft_d_ms,
         est_tpot_ms=est_tpot_ms,
@@ -1788,6 +1929,8 @@ def _compute_disagg_metrics(
         bound_sf_d=bound_sf_d,
         min_decode_seqs=min_decode_seqs,
         floor_throughput_per_chip=floor_tput,
+        envelope_step_floor=envelope_step_floor,
+        envelope_decode_seqs=envelope_decode_seqs,
     )
 
 
@@ -1817,11 +1960,16 @@ def _resolve_effective_prefill(
     eval_context: _SolveContext,
     pref: _PrefillOption,
     h_eff: float,
-    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]],
-) -> tuple[float, float, float]:
-    """Recompute cached prefill (ttft_ms, rate_p, bound_ttft_ms) when h is clamped."""
+    cache: dict[tuple[str, Parallel, float], _EffectivePrefill],
+) -> _EffectivePrefill:
+    """Recompute cached prefill TTFT, rate, hard bound, and envelope bound."""
     if h_eff >= eval_context.scenario.prefix_hit_rate:
-        return (pref.ttft_ms, pref.rate_p, pref.bound_ttft_ms)
+        return _EffectivePrefill(
+            ttft_ms=pref.ttft_ms,
+            rate_p=pref.rate_p,
+            bound_ttft_ms=pref.bound_ttft_ms,
+            envelope_ttft_ms=pref.envelope_ttft_ms,
+        )
     p_key = (pref.topo.name, pref.par, round(h_eff, 6))
     cached_p = cache.get(p_key)
     if cached_p is not None:
@@ -1840,10 +1988,11 @@ def _resolve_effective_prefill(
         * UNIT_MILLIS_PER_SECOND
     )
     rate_p_eff = 1.0 / max(1e-9, sf_p_eff.serial_estimate_s)
-    cached_p = (
-        ttft_p_eff,
-        rate_p_eff,
-        sf_p_eff.hard_floor_s * UNIT_MILLIS_PER_SECOND,
+    cached_p = _EffectivePrefill(
+        ttft_ms=ttft_p_eff,
+        rate_p=rate_p_eff,
+        bound_ttft_ms=sf_p_eff.hard_floor_s * UNIT_MILLIS_PER_SECOND,
+        envelope_ttft_ms=sf_p_eff.envelope_floor_s * UNIT_MILLIS_PER_SECOND,
     )
     cache[p_key] = cached_p
     return cached_p
@@ -1876,7 +2025,7 @@ def _evaluate_disagg_instance_pair(
     dec: _DisaggDecodeState,
     pref: _PrefillOption,
     target: _DisaggRatioTarget,
-    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]],
+    cache: dict[tuple[str, Parallel, float], _EffectivePrefill],
 ) -> ParetoPoint | None:
     """Evaluate one instance ratio pair (xP, yD) for disaggregated serving."""
     if dec.b_hbm_max < 1 or dec.b_smem_max < 1:
@@ -1909,9 +2058,9 @@ def _evaluate_disagg_instance_pair(
         eval_context.kv_fit_cache[kv_key] = cached_kv
     cap_tok, h_eff = cached_kv
     cap_tok_int = None if math.isinf(cap_tok) else int(cap_tok)
-    ttft_eff_ms, rate_p_eff, bound_ttft_ms = _resolve_effective_prefill(
-        eval_context, pref, h_eff, cache
-    )
+    eff_prefill = _resolve_effective_prefill(eval_context, pref, h_eff, cache)
+    bound_ttft_ms = eff_prefill.bound_ttft_ms
+    envelope_ttft_ms = eff_prefill.envelope_ttft_ms
     disagg_metrics = _compute_disagg_metrics(
         eval_context,
         dec,
@@ -1920,20 +2069,24 @@ def _evaluate_disagg_instance_pair(
         _DisaggBatchStats(
             b_res=b_res,
             b_local=b_local,
-            ttft_eff_ms=ttft_eff_ms,
-            rate_p_eff=rate_p_eff,
+            ttft_eff_ms=eff_prefill.ttft_ms,
+            rate_p_eff=eff_prefill.rate_p,
             h_eff=h_eff,
         ),
     )
     bound_tpot_ms = (
         disagg_metrics.bound_sf_d.hard_floor_s * UNIT_MILLIS_PER_SECOND
     ) / eval_context.eff_al
+    envelope_tpot_ms = (
+        disagg_metrics.envelope_step_floor.envelope_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / eval_context.eff_al
+    use_envelope = eval_context.activation_model.prunes_on_envelope
     verdict = _resolve_slo_verdict(
         eval_context.scenario,
         disagg_metrics.est_ttft_ms,
         disagg_metrics.est_tpot_ms,
-        bound_ttft_ms,
-        bound_tpot_ms,
+        envelope_ttft_ms if use_envelope else bound_ttft_ms,
+        envelope_tpot_ms if use_envelope else bound_tpot_ms,
     )
 
     max_seqs_d = b_res if b_res < b_local else eval_context.scenario.max_num_seqs
@@ -1993,6 +2146,9 @@ def _evaluate_disagg_instance_pair(
         effective_prefix_hit_rate=h_eff,
         min_decode_seqs=disagg_metrics.min_decode_seqs,
         floor_throughput_per_chip=disagg_metrics.floor_throughput_per_chip,
+        envelope_tpot_ms=envelope_tpot_ms,
+        envelope_ttft_ms=envelope_ttft_ms,
+        envelope_decode_seqs=disagg_metrics.envelope_decode_seqs,
     )
 
 
@@ -2001,7 +2157,7 @@ def _search_disagg_instance_ratios(
     dec: _DisaggDecodeState,
     pref: _PrefillOption,
     c: int,
-    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]],
+    cache: dict[tuple[str, Parallel, float], _EffectivePrefill],
 ) -> list[ParetoPoint]:
     """Search instance multiplier ratios (x_p, y_d) for one prefill-decode pair."""
     dec_steps_per_req = max(1.0, eval_context.scenario.osl / eval_context.eff_al)
@@ -2061,7 +2217,7 @@ def _evaluate_disaggregated_candidates(
     if eval_context.mode not in ("auto", "disagg") or not prefill_options:
         return []
     candidates: list[ParetoPoint] = []
-    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]] = {}
+    cache: dict[tuple[str, Parallel, float], _EffectivePrefill] = {}
     for topo_d in topos:
         if (
             eval_context.decode_topology is not None
@@ -2359,6 +2515,7 @@ def solve_serving_plan(
         prefill_topology=opts.prefill_topology,
         decode_topology=opts.decode_topology,
         pd_ratio=opts.pd_ratio,
+        activation_model=opts.activation_model,
         gpu_memory_utilization=opts.gpu_memory_utilization,
         hbm_limit_b=hbm_limit_b,
         hbm_limit_gb=hbm_limit_b / UNIT_GIGA,
@@ -2453,6 +2610,15 @@ def solve_serving_plan(
             not_ruled_out=len(not_ruled_out_candidates),
             slo_met=sum(1 for candidate in candidates if candidate.slo_met),
             frontier=len(frontier),
+            envelope_feasible=sum(
+                1
+                for candidate in candidates
+                if _within_slo_bounds(
+                    scenario,
+                    candidate.envelope_ttft_ms,
+                    candidate.envelope_tpot_ms,
+                )
+            ),
         ),
         sweep_candidates=pruned_sweep,
         spec_tokens=spec_k,
@@ -2470,6 +2636,7 @@ def solve_serving_plan(
             if opts.pd_ratio and opts.prefill_topology and opts.decode_topology
             else None
         ),
+        activation_model=opts.activation_model,
     )
     win_range, cross_rate = sweep_prefix_hit_crossovers(geom, dtypes, chip, base_plan)
     return replace(

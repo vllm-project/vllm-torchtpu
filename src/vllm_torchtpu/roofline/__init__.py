@@ -32,6 +32,7 @@ from .collectives import (
     torus_collective_s,
 )
 from .constants import (
+    ACTIVATION_HULL_SCHEMA,
     DEFAULT_GPU_MEMORY_UTILIZATION,
     DEFAULT_TOP_K,
     EXAMPLE_CONCURRENCIES,
@@ -86,6 +87,16 @@ from .modules import (
     kv_bytes_per_token_per_layer,
     pass_costs,
 )
+from .occupancy import (
+    ActivationRegime,
+    ExpertActivationModel,
+    ExpertDispatch,
+    active_experts_envelope,
+    bernoulli_expected_experts,
+    load_activation_hull,
+    min_experts_per_ep_shard,
+    parse_activation_spec,
+)
 from .partition import partition_pp_layers
 from .report import render_html, write_html
 from .serving import ConcurrencyRow, ServingRequest, plan
@@ -106,6 +117,7 @@ from .solver import (
 from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_floor
 
 __all__ = [
+    "ACTIVATION_HULL_SCHEMA",
     "CHIPS",
     "DEFAULT_GPU_MEMORY_UTILIZATION",
     "DEFAULT_TOP_K",
@@ -117,6 +129,7 @@ __all__ = [
     "SUPPORTED_CHIPS",
     "SUPPORTED_MODEL_TYPES",
     "TOPOLOGIES",
+    "ActivationRegime",
     "CeilingRow",
     "ChipOverrides",
     "ChipSpec",
@@ -125,6 +138,8 @@ __all__ = [
     "ConcurrencyRow",
     "ConstantSpec",
     "Dtypes",
+    "ExpertActivationModel",
+    "ExpertDispatch",
     "FloorOptions",
     "FloorTimes",
     "HbmBreakdown",
@@ -153,6 +168,8 @@ __all__ = [
     "TopKEntry",
     "TrafficScenario",
     "UnsupportedArchitectureError",
+    "active_experts_envelope",
+    "bernoulli_expected_experts",
     "build_example_scenario",
     "build_solve_payload",
     "chip_catalog",
@@ -168,9 +185,12 @@ __all__ = [
     "hbm_footprint_per_core_bytes",
     "kv_bytes_per_token_per_layer",
     "layer_ffn_kinds",
+    "load_activation_hull",
     "load_hf_config",
     "max_ep_load_ratio",
+    "min_experts_per_ep_shard",
     "pareto_skyline_by_concurrency",
+    "parse_activation_spec",
     "parse_layout",
     "partition_pp_layers",
     "pass_costs",
