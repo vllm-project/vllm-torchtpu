@@ -260,6 +260,10 @@ def make_compile_hook(orig_compile: Any) -> Any:
         # unless drop_global_state_guard is on when Dynamo compiles the frame.
         ckw["options"] = {"guard_filter_fn": _drop_global_state}
         out = orig_compile(model, **ckw)
+        if out is model:
+            # Dynamo is disabled (TORCHDYNAMO_DISABLE=1): torch.compile hands
+            # back the function itself, which has no cache entries to dispatch.
+            return out
         if callable(out):
             return _wrap(out, model)
         return out

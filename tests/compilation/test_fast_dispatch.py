@@ -135,6 +135,49 @@ def test_hook_wraps_eligible_functions_and_calls_through(form):
     assert _calls(wrapped, 3) == [2, 1]
 
 
+def test_hook_returns_the_function_when_dynamo_is_disabled():
+    """With TORCHDYNAMO_DISABLE=1, torch.compile returns the function itself."""
+
+    def f(x):
+        return x * 2 + 1
+
+    def disabled(model=None, **kwargs):
+        return model
+
+    hook = fast_dispatch.make_compile_hook(disabled)
+    assert hook(f, **ELIGIBLE) is f
+    assert hook(**ELIGIBLE)(f) is f
+
+
+def test_decorated_modules_import_with_dynamo_disabled():
+    """A module-level decorated site imports and runs with Dynamo disabled, as
+    on main: the decorator leaves the plain function."""
+    import os
+    import subprocess
+    import sys
+
+    code = """
+import torch
+import vllm_torchtpu.platforms  # installs the hook
+from vllm_torchtpu.kernels import partial_kv_update
+fn = partial_kv_update.pallas_index_copy_
+assert not hasattr(fn, "_fast_dispatch_state"), fn
+assert fn.__code__.co_name == "pallas_index_copy_", fn
+assert torch.compile.__code__.co_name == "compile_hook"
+print("ok")
+"""
+    env = dict(os.environ, TORCHDYNAMO_DISABLE="1")
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
 class _Module(torch.nn.Module):
     def forward(self, x):
         return x
