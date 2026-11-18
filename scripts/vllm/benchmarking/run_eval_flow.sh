@@ -18,6 +18,7 @@ set -euo pipefail
 
 PORT="${PORT:-8000}"
 HOST=""
+HOST_PORT_CLI=0
 CONFIG_NAME=""
 RESULTS_DIR=""
 RUN_LM_EVAL=0
@@ -76,11 +77,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         --host)
             HOST="$2"
+            HOST_PORT_CLI=1
             START_SERVER=0
             shift 2
             ;;
         --port)
             PORT="$2"
+            HOST_PORT_CLI=1
             shift 2
             ;;
         --skip-db-upload)
@@ -120,18 +123,36 @@ done
 # BASE_URL is the one endpoint every client below is given. --base-url keeps
 # its scheme and any path prefix, since a gateway may serve the API over https
 # or under a path; only a trailing slash or /v1 is dropped, because each client
-# appends its own /v1/... route.
+# appends its own /v1/... route. A bare host with no scheme and no port means
+# port 8000, as --host does; a URL with a scheme keeps that scheme's default.
 if [ -n "$BASE_URL_CLI" ]; then
+    if [ "$HOST_PORT_CLI" = "1" ]; then
+        echo "ERROR: --base-url cannot be combined with --host or --port"
+        exit 1
+    fi
     BASE_URL=$(python3 -c '
 import sys
 from urllib.parse import urlparse
 raw = sys.argv[1].strip()
-if "://" not in raw:
-    raw = "http://" + raw
-url = urlparse(raw)
-if url.scheme not in ("http", "https") or not url.hostname or url.query or url.fragment:
+bare = "://" not in raw
+try:
+    url = urlparse("http://" + raw if bare else raw)
+    port = url.port
+except ValueError:
     sys.exit(f"Invalid --base-url: {sys.argv[1]}")
-base = raw.rstrip("/")
+# Credentials in the URL would be echoed into the logs with every command.
+if (
+    url.scheme not in ("http", "https")
+    or not url.hostname
+    or url.username is not None
+    or url.query
+    or url.fragment
+):
+    sys.exit(f"Invalid --base-url: {sys.argv[1]}")
+netloc = url.netloc
+if bare and port is None:
+    netloc += ":8000"
+base = f"{url.scheme}://{netloc}{url.path}".rstrip("/")
 if base.endswith("/v1"):
     base = base[: -len("/v1")]
 print(base.rstrip("/"))
@@ -142,6 +163,13 @@ else
         HOST="localhost"
     fi
     BASE_URL="http://$HOST:$PORT"
+fi
+
+# A server this script starts serves the config's MODEL, so another name would
+# send every request to a model that is not there.
+if [ -n "$SERVED_MODEL_NAME_CLI" ] && [ "$START_SERVER" = "1" ]; then
+    echo "ERROR: --served-model-name needs a running server (--base-url, or --host and --port)"
+    exit 1
 fi
 
 if [ -z "$CONFIG_NAME" ]; then
@@ -602,17 +630,23 @@ fi
 # is what a server this script starts, or one reached by --host, serves. Behind
 # --base-url a router may serve the model under another name, so there the
 # explicit name wins, then the endpoint's own answer when it lists one model.
+# The endpoint is asked once, with no wait: the caller starts this script when
+# the endpoint is ready.
 SERVED_MODEL="$SERVED_MODEL_NAME_CLI"
 if [ -z "$SERVED_MODEL" ] && [ -n "$BASE_URL_CLI" ]; then
     SERVED_MODEL="${SERVED_MODEL_NAME:-}"
     if [ -z "$SERVED_MODEL" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
-        SERVED_MODEL=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
-import sys
-from eval_json_schema import auto_detect_model
+        SERVED_MODEL=$(python3 -c '
+import json, sys, urllib.request
+models_url = sys.argv[1] + "/v1/models"
 try:
-    print(auto_detect_model(sys.argv[1]))
-except RuntimeError as err:
-    print(f"Served model not resolved from the endpoint: {err}", file=sys.stderr)
+    with urllib.request.urlopen(models_url, timeout=30) as resp:
+        ids = [entry["id"] for entry in json.load(resp)["data"]]
+except Exception as err:
+    print(f"Could not list the served models at {models_url}: {err}", file=sys.stderr)
+else:
+    if len(ids) == 1:
+        print(ids[0])
 ' "$BASE_URL")
     fi
 fi

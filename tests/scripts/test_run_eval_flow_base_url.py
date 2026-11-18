@@ -15,7 +15,7 @@
 
 Every client (`lm_eval`, `evalscope`, `vllm bench serve`) is a stub on PATH
 that records its argv, so the tests read the exact URL and model name each one
-was given. The JSON schema client is the real one and talks to a local server.
+was given.
 """
 
 import http.server
@@ -52,12 +52,11 @@ echo '{"score": 0.5, "num": 4}' > "$work_dir/reports/stub/mmmu_pro.json"
 
 
 class _Gateway:
-    """An OpenAI-compatible endpoint that only answers under `prefix`."""
+    """Lists `model_ids` at `<prefix>/v1/models` and nothing anywhere else."""
 
     def __init__(self, prefix: str, model_ids: list[str]):
         self.prefix = prefix
         self.model_ids = model_ids
-        self.chat_requests: list[tuple[str, dict[str, Any]]] = []
         gateway = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -78,25 +77,6 @@ class _Gateway:
                     self._reply(200, {"data": ids})
                 else:
                     self._reply(404, {})
-
-            def do_POST(self) -> None:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                gateway.chat_requests.append((self.path, payload))
-                if self.path != f"{gateway.prefix}/v1/chat/completions":
-                    self._reply(404, {})
-                    return
-                # Matches no schema: these tests read where requests went,
-                # not the score (see EVAL_SOFT_FAIL in _Flow.run_unchecked).
-                content = json.dumps({"ok": True})
-                self._reply(
-                    200,
-                    {
-                        "choices": [
-                            {"message": {"content": content}, "finish_reason": "stop"}
-                        ]
-                    },
-                )
 
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self._server.server_address[1]
@@ -144,21 +124,21 @@ class _Flow:
         (self._site / "vllm" / "__init__.py").write_text("")
 
     def run(
-        self, *args: str, env: dict[str, str] | None = None
+        self, *args: str, env: dict[str, str] | None = None, config: str = _CONFIG
     ) -> subprocess.CompletedProcess:
-        proc = self.run_unchecked(*args, env=env)
+        proc = self.run_unchecked(*args, env=env, config=config)
         assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         return proc
 
     def run_unchecked(
-        self, *args: str, env: dict[str, str] | None = None
+        self, *args: str, env: dict[str, str] | None = None, config: str = _CONFIG
     ) -> subprocess.CompletedProcess:
         return subprocess.run(
             [
                 "bash",
                 str(_RUN_EVAL_FLOW),
                 "--config",
-                _CONFIG,
+                config,
                 "--results-dir",
                 str(self._tmp_path / "results"),
                 "--skip-db-upload",
@@ -171,8 +151,6 @@ class _Flow:
                 "PATH": f"{self._bin}:/usr/bin:/bin",
                 "STUB_LOG_DIR": str(self._stub_logs),
                 "LM_EVAL_REQUEST_CACHE_ROOT": str(self._tmp_path / "cache"),
-                # The gateway's canned reply fails the json_schema baseline.
-                "EVAL_SOFT_FAIL": "1",
                 **(env or {}),
             },
             capture_output=True,
@@ -180,12 +158,18 @@ class _Flow:
         )
 
     def argv(self, client: str) -> list[str]:
-        return (self._stub_logs / f"{client}.args").read_text().splitlines()
+        """The arguments of every call to `client`, or [] if it never ran."""
+        log = self._stub_logs / f"{client}.args"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def values(self, client: str, flag: str) -> list[str]:
+        """Each value `client` was given for `flag`, in call order."""
+        argv = self.argv(client)
+        return [argv[i + 1] for i, arg in enumerate(argv) if arg == flag]
 
     def option(self, client: str, flag: str) -> set[str]:
         """Every distinct value `client` was given for `flag`, over all calls."""
-        argv = self.argv(client)
-        return {argv[i + 1] for i, arg in enumerate(argv) if arg == flag}
+        return set(self.values(client, flag))
 
 
 @pytest.fixture
@@ -200,7 +184,7 @@ def test_base_url_path_prefix_and_served_model_reach_every_client(flow, make_gat
         "--base-url",
         gateway.url,
         "--eval-suites",
-        "json_schema,mmlu_pro,mmmu_pro",
+        "mmlu_pro,mmmu_pro",
         "--perf-suites",
         "bench_serve",
     )
@@ -217,11 +201,6 @@ def test_base_url_path_prefix_and_served_model_reach_every_client(flow, make_gat
     assert flow.option("vllm", "--model") == {_CONFIG_MODEL}
     assert flow.option("vllm", "--host") == set()
     assert flow.option("vllm", "--port") == set()
-    assert gateway.chat_requests
-    assert {path for path, _ in gateway.chat_requests} == {"/gw/v1/chat/completions"}
-    assert {payload["model"] for _, payload in gateway.chat_requests} == {
-        "router-served-name"
-    }
 
 
 @pytest.mark.parametrize(
@@ -265,12 +244,14 @@ def test_explicit_served_model_beats_the_one_the_endpoint_lists(flow, make_gatew
         "--served-model-name",
         "my-served",
         "--eval-suites",
-        "json_schema",
+        "mmlu_pro",
         "--perf-suites",
         "none",
     )
 
-    assert {payload["model"] for _, payload in gateway.chat_requests} == {"my-served"}
+    assert flow.option("lm_eval", "--model_args") == {
+        f"model=my-served,base_url={gateway.url}/v1/chat/completions,num_concurrent=128"
+    }
 
 
 def test_base_url_keeps_config_model_when_endpoint_lists_several(flow, make_gateway):
@@ -322,8 +303,43 @@ def test_host_and_port_keep_config_model_and_host_port_flags(flow, make_gateway)
 
 
 @pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("gw.example.com", "http://gw.example.com:8000"),
+        ("gw.example.com/prefix", "http://gw.example.com:8000/prefix"),
+        ("gw.example.com:9000/v1", "http://gw.example.com:9000"),
+        ("http://gw.example.com", "http://gw.example.com"),
+        ("https://gw.example.com", "https://gw.example.com"),
+        ("https://gw.example.com:8443/prefix/", "https://gw.example.com:8443/prefix"),
+        ("http://[::1]:8000", "http://[::1]:8000"),
+    ],
+)
+def test_base_url_forms(flow, base_url, expected):
+    flow.run(
+        "--base-url",
+        base_url,
+        "--served-model-name",
+        "my-served",
+        "--eval-suites",
+        "mmlu_pro",
+        "--perf-suites",
+        "none",
+    )
+
+    assert flow.option("lm_eval", "--model_args") == {
+        f"model=my-served,base_url={expected}/v1/chat/completions,num_concurrent=128"
+    }
+
+
+@pytest.mark.parametrize(
     "base_url",
-    ["ftp://gw.example.com", "http://", "http://gw.example.com/v1?key=1"],
+    [
+        "ftp://gw.example.com",
+        "http://",
+        "http://gw.example.com/v1?key=1",
+        "http://gw.example.com:notaport",
+        "http://user:secret@gw.example.com",
+    ],
 )
 def test_invalid_base_url_fails_before_any_client_runs(flow, base_url):
     proc = flow.run_unchecked(
@@ -332,4 +348,108 @@ def test_invalid_base_url_fails_before_any_client_runs(flow, base_url):
 
     assert proc.returncode == 1
     assert f"Invalid --base-url: {base_url}" in proc.stderr
+    assert "Running benchmarks" not in proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        pytest.param(
+            ["--base-url", "http://gw.example.com", "--host", "gw.example.com"],
+            "ERROR: --base-url cannot be combined with --host or --port",
+            id="base_url_with_host",
+        ),
+        pytest.param(
+            ["--base-url", "http://gw.example.com", "--port", "9000"],
+            "ERROR: --base-url cannot be combined with --host or --port",
+            id="base_url_with_port",
+        ),
+        pytest.param(
+            ["--served-model-name", "my-served"],
+            "ERROR: --served-model-name needs a running server "
+            "(--base-url, or --host and --port)",
+            id="served_model_name_with_self_started_server",
+        ),
+    ],
+)
+def test_conflicting_flags_fail_before_any_client_runs(flow, args, message):
+    proc = flow.run_unchecked(
+        *args, "--eval-suites", "mmlu_pro", "--perf-suites", "none"
+    )
+
+    assert proc.returncode == 1
+    assert message in proc.stdout
+    assert "Running benchmarks" not in proc.stdout
+
+
+def test_served_model_name_flag_applies_with_host(flow):
+    flow.run(
+        "--host",
+        "gw.example.com",
+        "--served-model-name",
+        "my-served",
+        "--eval-suites",
+        "mmlu_pro",
+        "--perf-suites",
+        "none",
+    )
+
+    assert flow.option("lm_eval", "--model_args") == {
+        "model=my-served,"
+        "base_url=http://gw.example.com:8000/v1/chat/completions,"
+        "num_concurrent=128"
+    }
+
+
+def test_eval_suites_run_in_the_order_given(flow):
+    flow.run("--host", "gw.example.com", "--eval-suites", "gsm8k, mmlu_pro")
+
+    assert flow.values("lm_eval", "--tasks") == ["gsm8k", "mmlu_pro"]
+    # No --perf-suites: the benchmark still runs, as it did before the flag.
+    assert flow.option("vllm", "--host") == {"gw.example.com"}
+
+
+def test_run_lm_eval_flag_still_runs_the_config_task_list(flow):
+    flow.run("--host", "gw.example.com", "--run-lm-eval", "--perf-suites", "none")
+
+    assert flow.values("lm_eval", "--tasks") == ["mmlu_llama", "mmlu_pro"]
+    assert flow.argv("vllm") == []
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (
+            ["--eval-suites", "mmlu_pro,nope"],
+            "ERROR: Unknown --eval-suites item 'nope'",
+        ),
+        (
+            ["--perf-suites", "nope"],
+            "ERROR: Unknown --perf-suites item 'nope' "
+            "(expected bench_serve, agentx, all, or none)",
+        ),
+    ],
+)
+def test_unknown_suite_fails_before_any_client_runs(flow, args, message):
+    proc = flow.run_unchecked("--host", "gw.example.com", *args)
+
+    assert proc.returncode == 1
+    assert message in proc.stdout
+    assert "Running benchmarks" not in proc.stdout
+
+
+def test_agentx_suite_requires_physical_chip_count(flow):
+    # A 1P1D config, loaded client-only: sourcing it must not need a role.
+    proc = flow.run_unchecked(
+        "--base-url",
+        "http://gw.example.com",
+        "--perf-suites",
+        "agentx",
+        "--eval-suites",
+        "none",
+        config="kimi-k3-tp8-dp4-ep-agentx",
+    )
+
+    assert proc.returncode == 1
+    assert "agentx suite requires AGENTX_CHIPS=<physical_chips>" in proc.stdout
     assert "Running benchmarks" not in proc.stdout

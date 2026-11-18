@@ -110,10 +110,11 @@ while [[ $# -gt 0 ]]; do
             BENCHMARK_MODE_CLI="$2"
             shift 2
             ;;
-        # A running server by its full URL, for one that --host and --port
-        # cannot name: https, or an API served under a path prefix.
+        # A running server by its API root (the URL without /v1), for one
+        # that --host and --port cannot name: https, or a path prefix.
         --base-url)
             BASE_URL="${2%/}"
+            BASE_URL="${BASE_URL%/v1}"
             START_SERVER=0
             shift 2
             ;;
@@ -283,7 +284,7 @@ if [ "$BENCHMARK_MODE" != "spec_bench" ]; then
     fi
 else
     if [ "$START_SERVER" != "1" ]; then
-        echo "ERROR: --host is not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
+        echo "ERROR: --host and --base-url are not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
         exit 1
     fi
     if [ -z "${SPEC_K_LIST// /}" ]; then
