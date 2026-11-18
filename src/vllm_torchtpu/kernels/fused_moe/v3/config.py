@@ -23,13 +23,11 @@ import jax
 import jax.numpy as jnp
 
 from .device import VMEM_FRACTION
-from .layout import LANES, ROW_BLOCK, SUBLANES
+from .layout import LANES, SUBLANES
 
 # How an expert's result rows travel to the token's shard: fp8 rows with one
 # scale per row (half the bytes), or bf16 rows.
 RESULT_ROWS = ("fp8", "bf16")
-TOKEN_ROWS = ("fp8", "bf16")
-INTERMEDIATES = ("fp8", "bf16")
 # The element type the fp8 scaling products are formed in (the row
 # quantizer, the intermediate, the result epilogue); the rest of the vector
 # math runs on the matmuls' float32 accumulators.
@@ -48,8 +46,6 @@ WEIGHT_PREFETCH_DEFAULT = 2
 # takes the largest count that pads no further than the smallest does.
 TABLES_BLOCKS_PER_STEP_MAX = 8
 TABLES_BLOCKS_PER_STEP_AUTOMATIC = 0
-STREAM_BLOCK_AUTOMATIC = 0
-STREAM_ROWS_DEFAULT = 1024
 # The share of the chip's VMEM one kernel may plan for (device.py's).
 VMEM_FRACTION_DEFAULT = VMEM_FRACTION
 # The programs' geometry, each a field so a sweep can set it per shape.
@@ -97,8 +93,8 @@ class Config:
       row_fetch_ahead: tiles ahead of compute a tile's rows are fetched,
         into the slot its results will be staged in. Smaller than
         result_slots so that slot is free.
-      weight_slots: the most buffers an expert's weight matrices are
-        streamed into. The layer takes the largest count up to it whose VMEM
+      weight_slots: the most buffers whole experts' weight matrices are
+        fetched into. The layer takes the largest count up to it whose VMEM
         estimate fits the chip's budget, so a wide expert runs at two.
       weight_prefetch: experts ahead of compute a weight refill is issued.
         Smaller than weight_slots so the refill's slot is not a live one.
@@ -108,52 +104,20 @@ class Config:
         layer take, per call, the largest count up to
         TABLES_BLOCKS_PER_STEP_MAX that pads no further than the gather's
         own unit does.
-      stream_block: columns of the intermediate per streamed weight block.
-        0 chooses for the shape: whole-expert weight slots when they fit
-        the VMEM budget, else the widest block that fits. A count forces
-        the streamed build: the weight slots hold column blocks of one
-        expert, a group of stream_rows token rows keeps its float32
-        running sum in VMEM, and the intermediate is rounded per
-        activation block, which has to divide the stream block.
-      stream_rows: token rows per group of a streamed expert (the rows
-        whose running sum is resident), a multiple of the tile height.
       vmem_fraction: the share of the chip's VMEM the kernels plan for
-        (the weight-slot fit, the streaming choice, each program's limit).
+        (the weight-slot fit, each program's limit).
       activation_block: how each matmul's input is rounded to fp8: 0 is
         one scale per token row over the whole width; a multiple of 128
         that divides hidden and inter is one scale per that many values
-        of a row, for the token rows and the intermediate alike. With
-        four-bit weights the block has
-        to be the weight block.
+        of a row, for the token rows and the intermediate alike.
       token_block: how the token rows are rounded to fp8 on their way into
         the up projection, when it differs from activation_block: None
-        (the default) follows activation_block, except that a streamed
-        expert (fp8 or bf16 weights) takes 0, the layer's choice; 0 is one
-        scale per row
+        (the default) follows activation_block; 0 is one scale per row
         over the whole width; a multiple of 128 dividing hidden is one
-        scale per that many values. With activation_block set, a streamed
-        expert rounds its intermediate per block (it has to), while the
-        token rows need no blocked scale: token_block 0 leaves the up
-        projection one plain matmul with a single rescale, where a blocked
-        contraction rescales its accumulator once per block on the vector
-        unit. With four-bit weights a nonzero token block has to be the
-        weight block.
-      intermediate: the rows between the two matmuls: "fp8" requantizes
-        the activated rows to fp8 with one scale per row (or per
-        activation block) and runs the down matmul in fp8; "bf16" keeps
-        them in bfloat16, no requantization, and runs the down matmul in
-        bfloat16 against a per-expert bfloat16 copy of w2 (whole-expert
-        builds with fp8 or bf16 weights).
+        scale per that many values.
       result_rows: "fp8" sends each expert's result rows between shards as
         fp8 with one scale per row; "bf16" sends bf16 rows, twice the
         bytes and no third rounding.
-      token_rows: "fp8" quantizes the token rows to fp8 with one scale per
-        row (or per token block) before the dispatch, the largest of the
-        kernel's roundings; "bf16" dispatches them as they are, twice the
-        bytes and no rounding, and the up matmul runs in bf16: as the
-        weights are with bf16 weights, or on a per-expert bf16 copy of w1
-        with fp8 weights (whole-expert builds; not the block-scaled
-        forms).
       elementwise_dtype: the element type the fp8 scaling products are
         formed in (the row quantizer, the intermediate, the result
         epilogue). "bfloat16", the default, is a packed bf16 multiply that
@@ -195,11 +159,10 @@ class Config:
         False: one copy per row from the token buffer, whose rows are in
         token order. The copies overlap the result push.
         True: a sparse-core gather sorts the routed rows into expert
-        order first, and the kernel fetches each tile as one copy.
-        Whole-expert builds only: a streamed build keeps
-        the per-row fetch, and so does a width the gather cannot move or
-        a table whose sort program is over the sparse core's program
-        size. None (the default): sorted_rows_by_shape decides from the
+        order first, and the kernel fetches each tile as one copy. A
+        width the gather cannot move, or a table whose sort program is
+        over the sparse core's program size, keeps the per-row fetch.
+        None (the default): sorted_rows_by_shape decides from the
         shard's experts and tokens.
     """
 
@@ -208,14 +171,10 @@ class Config:
     weight_slots: int = WEIGHT_SLOTS_DEFAULT
     weight_prefetch: int = WEIGHT_PREFETCH_DEFAULT
     tables_blocks_per_step: int = TABLES_BLOCKS_PER_STEP_AUTOMATIC
-    stream_block: int = STREAM_BLOCK_AUTOMATIC
-    stream_rows: int = STREAM_ROWS_DEFAULT
     vmem_fraction: float = VMEM_FRACTION_DEFAULT
     activation_block: int = 0
     token_block: object = None
     result_rows: str = "fp8"
-    token_rows: str = "fp8"
-    intermediate: str = "fp8"
     elementwise_dtype: str = "bfloat16"
     combine_dtype: str = "float32"
     row_scale_dtype: jax.typing.DTypeLike = jnp.float32
@@ -230,11 +189,6 @@ class Config:
     tables_zero_words: int = TABLES_ZERO_WORDS_DEFAULT
     weight_dma_priority: int = WEIGHT_DMA_PRIORITY_DEFAULT
     sorted_rows: object = None
-
-    @property
-    def token_dtype(self):
-        """The token rows' element type on the wire."""
-        return jnp.bfloat16 if self.token_rows == "bf16" else jnp.float8_e4m3fn
 
     @property
     def token_rows_block(self):
@@ -294,20 +248,10 @@ class Config:
                 f"{self.tables_blocks_per_step}: a count of "
                 "routing blocks, or 0 for the layer's choice"
             )
-        if self.stream_block < 0 or self.stream_block % LANES:
-            raise ValueError(
-                f"stream_block {self.stream_block}: 0 (the "
-                f"layer's choice) or a multiple of {LANES}"
-            )
         if not 0.0 < self.vmem_fraction <= 1.0:
             raise ValueError(
                 f"vmem_fraction {self.vmem_fraction}: a share of "
                 "the chip's VMEM, above 0 and at most 1"
-            )
-        if self.stream_rows < ROW_BLOCK or self.stream_rows % ROW_BLOCK:
-            raise ValueError(
-                f"stream_rows {self.stream_rows}: a whole number "
-                f"of {ROW_BLOCK}-row blocks"
             )
         if self.combine_dtype not in ELEMENTWISE_DTYPES:
             raise ValueError(
@@ -319,17 +263,9 @@ class Config:
                 f"elementwise_dtype {self.elementwise_dtype!r} "
                 f"is not one of {ELEMENTWISE_DTYPES}"
             )
-        if self.intermediate not in INTERMEDIATES:
-            raise ValueError(
-                f"intermediate {self.intermediate!r} is not one of {INTERMEDIATES}"
-            )
         if self.result_rows not in RESULT_ROWS:
             raise ValueError(
                 f"result_rows {self.result_rows!r} is not one of {RESULT_ROWS}"
-            )
-        if self.token_rows not in TOKEN_ROWS:
-            raise ValueError(
-                f"token_rows {self.token_rows!r} is not one of {TOKEN_ROWS}"
             )
         if self.activation_block < 0 or self.activation_block % LANES:
             raise ValueError(

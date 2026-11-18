@@ -30,14 +30,13 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.fused_moe.v3 import transport
 from vllm_torchtpu.kernels.fused_moe.v3.layout import MESH_AXIS
-from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8
 
 pytestmark = pytest.mark.cpu_test
 
 HIDDEN, PAIRS = 256, 1024
 
 
-def _trace_start(tokens, token_dtype):
+def _trace_start(tokens):
     """The start program over `tokens` rows on a one-shard mesh, traced."""
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]), (MESH_AXIS,))
     message_rows = transport.message_rows(tokens, PAIRS)
@@ -48,7 +47,6 @@ def _trace_start(tokens, token_dtype):
             message,
             scale_base=transport.scale_row_offset(PAIRS),
             num_shards=1,
-            token_dtype=token_dtype,
         )[3]
 
     program = jax.shard_map(
@@ -64,12 +62,9 @@ def _trace_start(tokens, token_dtype):
     )
 
 
-@pytest.mark.parametrize("token_dtype", [jnp.bfloat16, FP8], ids=["bf16", "fp8"])
 @pytest.mark.parametrize("tokens", [128, 136, 192])
-def test_start_traces_with_a_partial_last_tile(tokens, token_dtype):
-    """136 and 192 rows end in a partial tile of 8 and 64 rows. bf16 rows
-    carry unit scales, which must be a whole tile tall like the quantized
-    rows' scales: a scale column the height of the partial tile cannot be
-    broadcast to the tile's message rows."""
+def test_start_traces_with_a_partial_last_tile(tokens):
+    """136 and 192 rows end in a partial tile of 8 and 64 rows; each tile's
+    scale column is a whole tile tall and fills one message row."""
     assert transport.quant_tiles(tokens) == -(-tokens // transport.QUANT_TILE_ROWS)
-    _trace_start(tokens, token_dtype)
+    _trace_start(tokens)
