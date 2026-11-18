@@ -1,0 +1,139 @@
+{
+  "schema_version": "1.0",
+  "metrics": {
+    "vllm:prefix_cache_hits": {
+      "type": "counter",
+      "description": "Prefix cache hits, in terms of number of cached tokens.",
+      "series": [
+        {
+          "endpoint_url": "http://prefill-0:8000/metrics",
+          "labels": {
+            "engine": "0",
+            "model_name": "Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          "stats": {
+            "total": 18400000.0,
+            "rate": 10222.222222222223
+          }
+        },
+        {
+          "endpoint_url": "http://decode-0:8000/metrics",
+          "labels": {
+            "engine": "0",
+            "model_name": "Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          "stats": {
+            "total": 0.0,
+            "rate": 0.0
+          }
+        }
+      ]
+    },
+    "vllm:prefix_cache_queries": {
+      "type": "counter",
+      "description": "Prefix cache queries, in terms of number of queried tokens.",
+      "series": [
+        {
+          "endpoint_url": "http://prefill-0:8000/metrics",
+          "labels": {
+            "engine": "0",
+            "model_name": "Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          "stats": {
+            "total": 20000000.0,
+            "rate": 11111.111111111111
+          }
+        },
+        {
+          "endpoint_url": "http://decode-0:8000/metrics",
+          "labels": {
+            "engine": "0",
+            "model_name": "Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          "stats": {
+            "total": 0.0,
+            "rate": 0.0
+          }
+        }
+      ]
+    },
+    "vllm:num_requests_running": {
+      "type": "gauge",
+      "description": "Number of requests in model execution batches.",
+      "unit": "requests",
+      "series": [
+        {
+          "endpoint_url": "http://prefill-0:8000/metrics",
+          "labels": {
+            "engine": "0",
+            "model_name": "Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          "stats": {
+            "avg": 4.0,
+            "min": 0.0,
+            "max": 16.0,
+            "std": 2.0,
+            "p50": 4.0,
+            "p90": 16.0,
+            "p99": 16.0
+          }
+        },
+        {
+          "endpoint_url": "http://decode-0:8000/metrics",
+          "labels": {
+            "engine": "0",
+            "model_name": "Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          "stats": {
+            "avg": 12.0,
+            "min": 0.0,
+            "max": 16.0,
+            "std": 2.0,
+            "p50": 12.0,
+            "p90": 16.0,
+            "p99": 16.0
+          }
+        }
+      ]
+    },
+    "vllm:num_requests_waiting": {
+      "type": "gauge",
+      "description": "Number of requests waiting to be processed.",
+      "unit": "requests",
+      "series": [
+        {
+          "endpoint_url": "http://prefill-0:8000/metrics",
+          "labels": {
+            "engine": "0",
+            "model_name": "Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          "stats": {
+            "avg": 0.5,
+            "min": 0.0,
+            "max": 16.0,
+            "std": 2.0,
+            "p50": 0.5,
+            "p90": 16.0,
+            "p99": 16.0
+          }
+        },
+        {
+          "endpoint_url": "http://decode-0:8000/metrics",
+          "labels": {
+            "engine": "0",
+            "model_name": "Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          "stats": {
+            "avg": 0.0,
+            "min": 0.0,
+            "max": 16.0,
+            "std": 2.0,
+            "p50": 0.0,
+            "p90": 16.0,
+            "p99": 16.0
+          }
+        }
+      ]
+    }
+  }
+}

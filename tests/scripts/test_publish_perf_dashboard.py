@@ -16,6 +16,7 @@
 import importlib.util
 import json
 import pathlib
+import sys
 
 import pytest
 
@@ -26,6 +27,8 @@ _SCRIPT = (
     / "benchmarking"
     / "publish_perf_dashboard.py"
 )
+# The script is run as a script, so it imports its sibling bq_utils.
+sys.path.insert(0, str(_SCRIPT.parent))
 _spec = importlib.util.spec_from_file_location("publish_perf_dashboard", _SCRIPT)
 publish_perf_dashboard = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(publish_perf_dashboard)
