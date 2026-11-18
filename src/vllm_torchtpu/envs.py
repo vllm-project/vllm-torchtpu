@@ -328,6 +328,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_VOCAB_PARALLEL: bool = True
     TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
     TPU_DCP_LSE_SMALL_ALL_GATHER: bool = False
+    TPU_DCP_SMALL_REDUCE_SCATTER: bool = False
     TPU_SMALL_ALL_REDUCE_CHIP_PAIRS: int = 0
     TPU_FUSED_OPROJ_AR: bool = True
     TPU_FUSED_OPROJ_AR_WAVES: bool = True
@@ -2356,6 +2357,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cores costs 15-19 us, most of it fixed cost. The result is bitwise
     # the same (the kernel copies bytes).
     "TPU_DCP_LSE_SMALL_ALL_GATHER": env_bool("TPU_DCP_LSE_SMALL_ALL_GATHER"),
+    # With TPU_SMALL_ALL_REDUCE: the reduce-scatter of the DCP merge
+    # (`dcp_comm.cp_lse_ag_out_rs`, bf16 head-major operand of at most
+    # small_all_reduce_op.DCP_RS_MAX_BYTES per core) runs as the Pallas
+    # reduce-scatter (small_collectives/reduce_scatter.py) over the
+    # expert-parallel mesh, under the same conditions as
+    # TPU_DCP_LSE_SMALL_ALL_GATHER. XLA's reduce-scatter of bf16[64, 64, 512]
+    # at a 64-token decode bucket on 16 cores costs about 33 us per layer,
+    # about 29 us of it fixed cost. The kernel sums in float32 and rounds
+    # once, so the result is not bitwise XLA's.
+    "TPU_DCP_SMALL_REDUCE_SCATTER": env_bool("TPU_DCP_SMALL_REDUCE_SCATTER"),
     # With TPU_SMALL_ALL_REDUCE: kernel all-reduces of at least this many rows
     # (up to TPU_SMALL_ALL_REDUCE_MAX_ROWS) run the two-shot by chip pairs
     # (small_collectives/all_reduce.py, form "pairs"): each core sends its

@@ -104,7 +104,14 @@ def cp_lse_ag_out_rs(
         # it reads the weighted partial without a transposing copy.
         wire_dtype = str(rs_dtype or torch.float32).removeprefix("torch.")
         weighted = _lse_rescale_head_major(output, lse, merged_lse, wire_dtype)
-        merged = group.reduce_scatter(weighted, dim=0).transpose(0, 1).contiguous()
+        scattered = None
+        if envs.TPU_DCP_SMALL_REDUCE_SCATTER:
+            from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+            scattered = small_all_reduce_op.dcp_reduce_scatter_heads(weighted, group)
+        if scattered is None:
+            scattered = group.reduce_scatter(weighted, dim=0)
+        merged = scattered.transpose(0, 1).contiguous()
     else:
         # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
         weight = torch.exp(lse - merged_lse).unsqueeze(-1)

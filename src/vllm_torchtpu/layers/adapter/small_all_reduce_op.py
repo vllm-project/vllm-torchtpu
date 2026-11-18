@@ -695,6 +695,41 @@ def dcp_lse_all_gather(lse: torch.Tensor, group) -> torch.Tensor | None:
     return flat.view(_CORES, *lse.shape)
 
 
+# Largest operand, in bytes per core, that the DCP merge's reduce-scatter
+# gives the kernel. The kernel holds the operand and an equal-size scratch in
+# VMEM, so 4 MiB (the bf16 [64 heads, 64 tokens, 512] operand of a 64-token
+# decode bucket) uses 8 MiB of VMEM. Larger buckets keep XLA's.
+DCP_RS_MAX_BYTES = 4 << 20
+
+
+def dcp_reduce_scatter_heads(x: torch.Tensor, group) -> torch.Tensor | None:
+    """``group.reduce_scatter(x, dim=0)`` for a head-major bf16 operand ``x``
+    [heads, tokens, dim], as the Pallas reduce-scatter
+    (TPU_DCP_SMALL_REDUCE_SCATTER): rank r gets heads [r * heads / world,
+    (r + 1) * heads / world), [heads / world, tokens, dim]. Returns None when
+    the kernel cannot take this call: not a backbone warmup trace, the group
+    is not the mesh, not bf16, dim not a multiple of 128 lanes, heads not
+    divisible by the ranks, or more than DCP_RS_MAX_BYTES. The kernel sums in
+    float32 in rank order and rounds once, so the result is not bitwise
+    XLA's bf16 reduce-scatter."""
+    if (
+        _RS_OP is None
+        or not envs.TPU_DCP_SMALL_REDUCE_SCATTER
+        or not _covers(group)
+        or not torch.compiler.is_compiling()
+        or not shape_variants.in_warmup()
+        or x.dim() != 3
+        or x.dtype != torch.bfloat16
+        or x.shape[2] % LANES
+        or x.shape[0] % _CORES
+        or x.numel() * x.element_size() > DCP_RS_MAX_BYTES
+    ):
+        return None
+    heads, tokens, dim = x.shape
+    out = _RS_OP(x.reshape(heads * tokens, dim).contiguous(), _RANK)
+    return out.view(heads // _CORES, tokens, dim)
+
+
 def _fused_layer_weights(layer):
     """(w [k, n] fp8, w_s [n] f32) when ``layer`` is a per-channel FP8 layer on the
     weight-streaming kernel with the kernel's own weight (no padded copy, no
