@@ -1356,6 +1356,32 @@ class TpuPlatform(Platform):
         return backends[0] if backends else None
 
     @classmethod
+    def _find_dense_attention_backend(
+        cls, vllm_config: VllmConfig
+    ) -> "type[AttentionBackend] | None":
+        """Backend that lays out the plain `Attention` caches, or None.
+
+        `_find_non_ssm_backend` returns the first backend in layer order. When
+        the target's layers declare an MLA-family backend (e.g. caches that
+        the model owns) and a drafter adds plain `Attention` layers, the
+        drafter's pages would take the MLA geometry. With an fp8 cache, a
+        128-token block becomes a 32-token page, so the RPA kernel indexes the
+        block table at 4x the block count and, past a quarter of
+        max_model_len, beyond the table. A bf16 cache packs two tokens per
+        word, so the page is 64 tokens and the factor is 2x.
+
+        Returns the backend of the first plain `Attention` layer. Without one
+        (e.g. pure MLA, or caches that the model owns), returns
+        `_find_non_ssm_backend`.
+        """
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention import Attention
+
+        for layer in get_layers_from_vllm_config(vllm_config, Attention).values():
+            return layer.get_attn_backend()
+        return cls._find_non_ssm_backend(vllm_config)
+
+    @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
         backend_cls = cast(
