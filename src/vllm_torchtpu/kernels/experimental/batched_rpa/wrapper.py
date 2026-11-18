@@ -18,6 +18,7 @@ and invokes the Pallas Batched RPA kernel.
 """
 
 import math
+from collections.abc import Callable
 from typing import cast
 
 import jax
@@ -560,11 +561,9 @@ def calculate_block_sizes(
         if tuned_tiles and fixed_bq_sz is None:
             # Clamp prefill/mixed bq_sz to the aligned total_q_tokens bucket so
             # small token buckets do not allocate 1024-token Q/O VMEM buffers.
-            max_useful_bq_sz = max(
-                mxu_column_size,
-                utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size),
+            bq_sz = min(
+                bq_sz, max_useful_bq_sz(serve_cfgs.total_q_tokens, mxu_column_size)
             )
-            bq_sz = min(bq_sz, max_useful_bq_sz)
 
         # Step 3: Given current tile size, calculate compute tile size.
         return configs.BlockSizes(
@@ -579,26 +578,43 @@ def calculate_block_sizes(
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
     if tuned_tiles:
+        # The table's tiles get the VMEM check and cap the heuristic's prefill
+        # tiles get in find_best_block_sizes.
         prefill_block_sizes = tuned_prefill_block_sizes(
-            prefill_block_sizes, model_cfgs, serve_cfgs, mxu_column_size
+            prefill_block_sizes,
+            model_cfgs,
+            serve_cfgs,
+            tpu_info,
+            fits=lambda b: calculate_vmem_usage(b.batch_size, b.bq_sz, b.bkv_sz)
+            < vmem_limit_bytes * 0.8,
         )
 
     return decode_block_sizes, prefill_block_sizes
 
 
-# Prefill/mixed tiles (bq, bq_c, bkv, batch) tuned for one layer shape:
-# (q heads, KV heads, head_dim, fp8 KV) per device. The heuristic grows bq and
-# bkv together, so with many q heads per KV head (32 q / 2 KV heads on a PP=8
-# stage of Qwen3.5-397B) VMEM stops both at 256 and every 256-key block pays a
-# full accumulator rescale. A 1024-key block with a small q sub-chunk fits:
-# 256,32,1024,1 ran the prefill kernel ~20% faster at 87K context (standalone
-# kernel benchmark, TPU7x), and 256,16,1024,1 cut the PP8 prefill engine step
-# a further 4.8% (137.5 -> 130.9 ms) with GSM8K at 97.80%.
-_TUNED_PREFILL_TILES: dict[tuple[int, int, int, bool], tuple[int, int, int, int]] = {
-    (32, 2, 256, True): (256, 16, 1024, 1),
+def max_useful_bq_sz(total_q_tokens: int, mxu_column_size: int) -> int:
+    """The largest prefill/mixed bq a call can fill: its token count aligned
+    to the MXU width, and at least one MXU width."""
+    return max(mxu_column_size, utils.align_to(total_q_tokens, mxu_column_size))
+
+
+# Prefill/mixed tiles (bq, bq_c, bkv, batch) tuned for one layer shape on one
+# chip: (chip, q heads, KV heads, head_dim, fp8 KV) per device. The heuristic
+# grows bq and bkv together, so with many q heads per KV head (32 q / 2 KV
+# heads on a PP=8 stage of Qwen3.5-397B) VMEM stops both at 256 and every
+# 256-key block pays a full accumulator rescale. A 1024-key block with a small
+# q sub-chunk fits: 256,32,1024,1 ran the prefill kernel ~20% faster at 87K
+# context (standalone kernel benchmark, TPU7x), and 256,16,1024,1 cut the PP8
+# prefill engine step a further 4.8% (137.5 -> 130.9 ms) with GSM8K at 97.80%.
+# TpuInfo types its chip_version as jax's ChipVersion base class, hence object.
+_TUNED_PREFILL_TILES: dict[
+    tuple[object, int, int, int, bool], tuple[int, int, int, int]
+] = {
+    (pltpu.ChipVersion.TPU_7X, 32, 2, 256, True): (256, 16, 1024, 1),
 }
 # Tiles that produced wrong outputs at the tuned shape: 128,16,1024,1 scored
-# 78.01% on GSM8K (gate 97%). No table entry may use them.
+# 78.01% on GSM8K (gate 97%). No table entry, and no table entry after the bq
+# clamp, may use them.
 _UNSAFE_PREFILL_TILES = frozenset({(128, 16, 1024, 1)})
 
 
@@ -606,20 +622,25 @@ def tuned_prefill_block_sizes(
     default: configs.BlockSizes,
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
-    mxu_column_size: int,
+    tpu_info: pltpu.TpuInfo,
+    *,
+    fits: Callable[[configs.BlockSizes], bool],
 ) -> configs.BlockSizes:
-    """The prefill tiles from `_TUNED_PREFILL_TILES` for this layer shape, or
-    `default` (the heuristic's) for any other shape. Applied with
-    ``tuned_tiles`` only.
+    """The prefill tiles from `_TUNED_PREFILL_TILES` for this chip and layer
+    shape, or `default` (the heuristic's). Applied with ``tuned_tiles`` only.
 
     bq is clamped to the aligned token count as the heuristic does, and bq_c
-    to a divisor of bq.
+    to a divisor of bq. A shape the table does not list, a page size that does
+    not divide the table's bkv, a clamp that lands on `_UNSAFE_PREFILL_TILES`,
+    and tiles that do not pass `fits` (the VMEM check) each take `default`
+    and log it once.
     """
     is_fp8_kv = jnp.dtype(serve_cfgs.dtype_kv) in (
         jnp.dtype(jnp.float8_e4m3fn),
         jnp.dtype(jnp.float8_e5m2),
     )
     key = (
+        tpu_info.chip_version,
         model_cfgs.num_q_heads,
         model_cfgs.num_kv_heads,
         model_cfgs.head_dim,
@@ -627,18 +648,52 @@ def tuned_prefill_block_sizes(
     )
     tiles = _TUNED_PREFILL_TILES.get(key)
     if tiles is None:
+        logger.warning_once(
+            "Batched RPA: no tuned prefill tiles for (chip, q heads, KV heads, "
+            "head_dim, fp8 KV) = %s; using the heuristic's %s.",
+            key,
+            default,
+        )
         return default
     if tiles in _UNSAFE_PREFILL_TILES:
         raise ValueError(f"prefill tiles {tiles} for {key} are known to be wrong")
     bq, bq_c, bkv, batch = tiles
     if bkv % serve_cfgs.page_size:
+        logger.warning_once(
+            "Batched RPA: the tuned prefill tiles %s for %s need a page size "
+            "that divides bkv %d, not %d; using the heuristic's %s.",
+            tiles,
+            key,
+            bkv,
+            serve_cfgs.page_size,
+            default,
+        )
         return default
-    max_useful_bq_sz = max(
-        mxu_column_size, utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size)
-    )
-    bq = min(bq, max_useful_bq_sz)
+    bq = min(bq, max_useful_bq_sz(serve_cfgs.total_q_tokens, tpu_info.mxu_column_size))
     bq_c = math.gcd(bq, min(bq_c, bq))
-    return configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=batch)
+    clamped = configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=batch)
+    if (bq, bq_c, bkv, batch) in _UNSAFE_PREFILL_TILES:
+        logger.warning_once(
+            "Batched RPA: clamping the tuned prefill tiles %s for %s to %d "
+            "tokens gives %s, which are known to be wrong; using the "
+            "heuristic's %s.",
+            tiles,
+            key,
+            serve_cfgs.total_q_tokens,
+            clamped,
+            default,
+        )
+        return default
+    if not fits(clamped):
+        logger.warning_once(
+            "Batched RPA: the tuned prefill tiles %s for %s do not fit the "
+            "VMEM limit; using the heuristic's %s.",
+            clamped,
+            key,
+            default,
+        )
+        return default
+    return clamped
 
 
 @jax.jit(
