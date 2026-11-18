@@ -179,6 +179,7 @@ def _build_op(
     token_replica_groups=None,
     wire_dtype=None,
     ep_tp_size: int = 1,
+    eager_push: bool = False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -198,6 +199,7 @@ def _build_op(
         token_replica_groups,
         wire_dtype,
         ep_tp_size,
+        eager_push,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -215,6 +217,8 @@ def _build_op(
         routing_kw["wire_dtype"] = wire_dtype
     if ep_tp_size != 1:
         routing_kw["ep_tp_size"] = ep_tp_size
+    if eager_push:
+        routing_kw["eager_push"] = True
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
         # The router's top-k selector writes into an f32 accumulator ref, so a
@@ -753,6 +757,7 @@ def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: 
             [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
         )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
+    wire_dtype = None if envs.TPU_MOE_PREFILL_SP_FP8_WIRE else jnp.bfloat16
     return _build_op(
         mesh,
         topk,
@@ -769,8 +774,13 @@ def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: 
         routed_scale,
         False,
         token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
-        wire_dtype=None if envs.TPU_MOE_PREFILL_SP_FP8_WIRE else jnp.bfloat16,
+        wire_dtype=wire_dtype,
         ep_tp_size=ep_tp,
+        # A bf16 wire doubles the combine's bytes, and the busiest chip's
+        # first-hop link then outlasts its compute; pushing each result tile
+        # as soon as it is staged keeps that link busy from the first visit
+        # on. Same rows, same arrival offsets: bit-identical outputs.
+        eager_push=wire_dtype is not None,
     )
 
 
