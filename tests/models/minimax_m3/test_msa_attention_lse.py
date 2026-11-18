@@ -19,7 +19,11 @@ import numpy as np
 import pytest
 
 from tests.models.minimax_m3.packing import CACHE_DTYPES, pack, rounded
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention,
+    msa_attention_lse,
+    msa_fp4,
+)
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention_lse import (
     msa_sparse_attention_lse,
     msa_sparse_attention_lse_heads,
@@ -271,15 +275,21 @@ def _fp4_cache(rng, num_kv_heads):
     return kv, scales, rows
 
 
+@pytest.mark.parametrize("limit_table", [False, True])
 @pytest.mark.parametrize("head_major,q_head_major", LAYOUTS)
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
 def test_fp4_lse_matches_dense_reference(
-    num_kv_heads, head_major, q_head_major, monkeypatch
+    num_kv_heads, head_major, q_head_major, limit_table, monkeypatch
 ):
     """4-bit pages and their scale pages, copied by the kernel beside each
     page: single-head calls (static scale rows) and every head at once
-    (rows of the cache-row head). Scale pages nobody selects hold NaN."""
+    (rows of the cache-row head). Scale pages nobody selects hold NaN.
+    `limit_table`: the calls take their page limits from the caller's table
+    (prefill-size calls)."""
     monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", 32)
+    monkeypatch.setattr(
+        msa_attention_lse, "_LIMIT_TABLE_MIN_TOKENS", 32 if limit_table else 1 << 30
+    )
     num_tokens = 70
     rng = np.random.default_rng(11 + num_kv_heads)
     q, _, _, table, keys, local_key, local_limit = _inputs(

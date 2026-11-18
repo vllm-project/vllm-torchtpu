@@ -73,6 +73,7 @@ _MASK_BIAS = 1e30
 # comparing every page against the tile's selections, with a lane reduction
 # each, cost ~12 % of a 4-bit 8-token call (r9 kernel bench j-ecb17102).
 LIMIT_TABLE = True
+_LIMIT_TABLE_MIN_TOKENS = msa_attention.SMALL_BATCH_TOKENS
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -1242,7 +1243,7 @@ def _chunked_call(
     if (
         LIMIT_TABLE
         and scale_rows is not None
-        and step >= msa_attention.SMALL_BATCH_TOKENS
+        and step >= _LIMIT_TABLE_MIN_TOKENS
         and not (num_chunks == 1 and num_heads > 1)
     ):  # 4-bit prefill-size calls, one per grid
         calls = num_heads * num_chunks
