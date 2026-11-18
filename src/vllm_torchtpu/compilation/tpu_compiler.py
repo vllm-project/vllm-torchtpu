@@ -298,6 +298,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Last pipeline stage replies from the output thread (host only;
     # runner/pp_last_async_output.py).
     "VLLM_TPU_PP_LAST_ASYNC_OUTPUT",
+    # q38 PPARF: the same with a prefill-only MTP drafter (host only: the
+    # drafter's graph is unchanged; runner/pp_last_async_drafter.py).
+    "VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER",
     # Engine-core KV cache bookkeeping shortcut (core/kv_decode_fast_path.py).
     "VLLM_TPU_KV_DECODE_FAST_PATH",
     # q38 SEED-SPEC (runner/l6_seedspec.py): whether the block-edge GDN seed

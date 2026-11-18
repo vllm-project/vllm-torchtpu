@@ -388,6 +388,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
     VLLM_TPU_PP_LAST_ASYNC_OUTPUT: bool = False
+    VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER: bool = False
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_CPU_PIN: str = "off"
     VLLM_TPU_WEIGHT_DIGEST_RANKS: str = ""
@@ -2630,6 +2631,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # step's host work overlaps the forward (runner/pp_last_async_output.py).
     "VLLM_TPU_PP_LAST_ASYNC_OUTPUT": env_bool(
         "VLLM_TPU_PP_LAST_ASYNC_OUTPUT", default=False
+    ),
+    # q38 PPARF: PP last async output also admits a prefill-only MTP producer;
+    # its drafts stay on device and the copy gate is re-armed behind them
+    # (runner/pp_last_async_drafter.py). Host only.
+    "VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER": env_bool(
+        "VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER", default=False
     ),
     # Async spec decode: derive the draft seed (token, position, rejected
     # count) from the rejection-sampler output in one compiled program per

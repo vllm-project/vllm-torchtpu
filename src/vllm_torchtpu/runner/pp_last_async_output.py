@@ -42,12 +42,16 @@ from typing import Any
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import pp_last_async_drafter as _pparf  # q38 PPARF (default off)
 
 logger = init_logger(__name__)
 
 
 def decide(
-    vllm_config: Any, is_last_stage: bool, is_pooling_model: bool
+    vllm_config: Any,
+    is_last_stage: bool,
+    is_pooling_model: bool,
+    prefill_only_drafter: bool = False,
 ) -> tuple[bool, str]:
     """(on, reason): whether this worker's runner returns unwaited outputs."""
     if not envs.VLLM_TPU_PP_LAST_ASYNC_OUTPUT:
@@ -59,7 +63,12 @@ def decide(
         return False, "not the last stage"
     if vllm_config.scheduler_config.async_scheduling:
         return False, "async scheduling already replies from the output thread"
-    if vllm_config.speculative_config is not None:
+    # q38 PPARF (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER): a prefill-only MTP
+    # producer (the runner's _mtp_prefill_only) never verifies and seeds on
+    # device, so with the flag on it is admitted; a verifying drafter is not.
+    if vllm_config.speculative_config is not None and not (
+        _pparf.enabled() and prefill_only_drafter
+    ):
         # Sync pipeline spec decode drafts from host tokens after the wait.
         return False, "speculative decoding"
     if is_pooling_model:
