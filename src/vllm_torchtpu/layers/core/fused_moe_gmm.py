@@ -24,6 +24,7 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    MOE_LOWTOK_MAX_TOKENS,
     can_use_moe_lowtok,
     moe_lowtok,
 )
@@ -100,16 +101,31 @@ _COUNTING_SORT_BLOCK = 512
 # Ragged permute keeps the packed sort so SparseCore gather overlap is
 # unchanged, and past one block the scatter costs more than that sort.
 _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
-# The few-token kernel's row cap for routed ids, 0 while it is not armed: the
-# low-token MoE adapter sets it at weight load (set_lowtok_max_tokens), before
-# anything is traced.
+# The few-token kernel's row cap for routed ids, 0 while it is not armed. A
+# model rule sets it at weight load (set_lowtok_max_tokens). The fused MoE op
+# takes the cap as fused_moe_func's static `lowtok_max_tokens` and keys its
+# cache on it (layers/adapter/fused_moe.py), so an op built under one cap is
+# never reused under another.
 _MOE_LOWTOK_MAX_TOKENS = 0
 
 
 def set_lowtok_max_tokens(rows: int) -> None:
-    """Arm (rows > 0) or disarm (0) the few-token kernel for routed ids."""
+    """Arm (0 < rows <= MOE_LOWTOK_MAX_TOKENS) or disarm (0) the few-token
+    kernel for routed ids, for the fused MoE ops built from then on."""
     global _MOE_LOWTOK_MAX_TOKENS
-    _MOE_LOWTOK_MAX_TOKENS = int(rows)
+    rows = int(rows)
+    if not 0 <= rows <= MOE_LOWTOK_MAX_TOKENS:
+        raise ValueError(
+            f"the few-token MoE row cap must be 0 (off) to "
+            f"{MOE_LOWTOK_MAX_TOKENS}, the most rows its kernel is built for; "
+            f"got {rows}"
+        )
+    _MOE_LOWTOK_MAX_TOKENS = rows
+
+
+def armed_lowtok_max_tokens() -> int:
+    """The few-token kernel's row cap for routed ids, 0 when it is not armed."""
+    return _MOE_LOWTOK_MAX_TOKENS
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -690,6 +706,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "lowtok_max_tokens",
     ),
 )
 def fused_moe_func(
@@ -710,6 +727,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    lowtok_max_tokens: int = 0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -729,6 +747,10 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    ``lowtok_max_tokens`` (static) arms the few-token kernel for EP calls of at
+    most that many rows (0, the default: off); the fused MoE op passes the cap
+    armed when it was built (``set_lowtok_max_tokens``).
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -770,10 +792,10 @@ def fused_moe_func(
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
     if (
-        _MOE_LOWTOK_MAX_TOKENS > 0
+        lowtok_max_tokens > 0
         and use_ep
         and experts_start is not None
-        and 0 < num_tokens <= _MOE_LOWTOK_MAX_TOKENS
+        and 0 < num_tokens <= lowtok_max_tokens
         and can_use_moe_lowtok(
             hidden_states,
             w1,
@@ -788,7 +810,7 @@ def fused_moe_func(
     ):
         logger.info_once(
             "Selected experimental small-batch MoE (max tokens %d)",
-            _MOE_LOWTOK_MAX_TOKENS,
+            lowtok_max_tokens,
         )
         route = moe_lowtok_routing_table(topk_ids, topk_weights, w1.shape[0])
         return moe_lowtok(hidden_states, route, w1, w1_scale, w2, w2_scale)

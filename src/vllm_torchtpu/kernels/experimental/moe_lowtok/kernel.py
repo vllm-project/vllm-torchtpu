@@ -34,11 +34,8 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# The most rows per call the kernel is built for: the largest row cap the
-# adapter selects it at (moe_lowtok_scores.MAX_TOKENS_BY_EP). Against
-# dense-expert MoE it wins 1.14x (scores) / 1.09x (ids) at 128 rows on recorded
-# skew and is at parity at 256 (1.01x / 0.93x). The Qwen3.5 EP8 decode legs
-# run it up to 448 rows.
+# The most rows per call the kernel is built for; moe_lowtok and the routed-ids
+# cap (fused_moe_gmm.set_lowtok_max_tokens) refuse more.
 MOE_LOWTOK_MAX_TOKENS = 448
 HOT_SLOTS = 128
 _MAX_LOCAL_EXPERTS = 128
@@ -54,12 +51,16 @@ _FP8_MAX = 448.0
 
 
 def can_use_moe_lowtok(hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_dtype):
-    """Check arithmetic/layout support; the caller applies the token cap."""
+    """Check arithmetic and layout support, rows included (at most
+    MOE_LOWTOK_MAX_TOKENS). The chip is not checked: the kernel computes with
+    FP8 activations (W8A8), so it is armed only where the chip has native FP8."""
     if activation != "silu" or rhs_quant_dtype is not None:
         return False
     if b1 is not None or b2 is not None or s1 is None or s2 is None:
         return False
     if hidden.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
+        return False
+    if hidden.shape[0] > MOE_LOWTOK_MAX_TOKENS:
         return False
     h = hidden.shape[1]
     e, i, out = w2.shape
@@ -719,6 +720,11 @@ def moe_lowtok(
     kernel assigns each hit copied expert to the less-loaded holder.
     """
     tokens, hidden = x.shape
+    if tokens > MOE_LOWTOK_MAX_TOKENS:
+        raise ValueError(
+            f"moe_lowtok is built for at most {MOE_LOWTOK_MAX_TOKENS} rows, "
+            f"got {tokens}"
+        )
     n_experts, inter, w13_parts, rows = _layout(x, w13)
     lanes = pl.cdiv(route.shape[1], _LANE) * _LANE
     x_rows = jnp.pad(x, ((0, rows - tokens), (0, 0)))
