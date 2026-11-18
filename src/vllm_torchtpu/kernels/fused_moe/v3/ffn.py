@@ -22,7 +22,6 @@ from jax import lax
 from .config import ACTIVATION_COLUMNS_PER_PASS_DEFAULT
 from .rowquant import FP8, apply_row_scale, quantize_rows, row_scale
 
-# Contraction dimension numbers of a plain [m, k] @ [k, n] matmul.
 # The dot dimension numbers of every matmul in the package: the rows'
 # last axis against the weight's first, no batch axes.
 DOT_ROWS_BY_COLUMNS = (((1,), (0,)), ((), ()))
