@@ -78,7 +78,14 @@ def _kv_cache_config(*specs, num_blocks=64):
 
 
 def _stub_config(
-    *, unit=UNIT, dcp=DCP, pcp=1, caching=True, connector=False, block_size=BLOCK_SIZE
+    *,
+    unit=UNIT,
+    dcp=DCP,
+    pcp=1,
+    tp=DCP,
+    caching=True,
+    connector=False,
+    block_size=BLOCK_SIZE,
 ):
     return SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -89,6 +96,7 @@ def _stub_config(
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=dcp,
             prefill_context_parallel_size=pcp,
+            tensor_parallel_size=tp,
         ),
         kv_transfer_config=(
             SimpleNamespace(kv_connector=connector)
@@ -136,6 +144,31 @@ def test_resolve_gated_to_single_group_dcp():
     )
     with pytest.raises(ValueError, match="divisible"):
         _resolve(mla, _stub_config(unit=384))
+
+
+def test_resolve_pcp_needs_pcp_manager_dcp_only_kv(monkeypatch):
+    """PCP keeps block-aligned hits unless the PCP manager shards KV by DCP only.
+
+    With USE_TPU_PCP_MANAGER and DCP = TP x PCP the KV pages span the DCP
+    ranks alone and the scheduler hashes with pcp_world_size=1, as without
+    PCP, so the fine unit applies.
+    """
+    from vllm_torchtpu import envs
+
+    mla = _kv_cache_config(_mla_spec())
+    pcp16 = _stub_config(pcp=DCP, tp=1)
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", False, raising=False)
+    assert _resolve(mla, pcp16) == (LOGICAL_BLOCK, LOGICAL_BLOCK)
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True, raising=False)
+    assert _resolve(mla, pcp16) == (LOGICAL_BLOCK, UNIT)
+    assert _resolve(
+        mla, _stub_config(pcp=8, tp=2, connector="TPURaidenOffloadingConnector")
+    ) == (LOGICAL_BLOCK, UNIT)
+    # DCP != TP x PCP: KV would span dcp x pcp ranks.
+    assert _resolve(mla, _stub_config(pcp=2, tp=DCP)) == (
+        LOGICAL_BLOCK,
+        LOGICAL_BLOCK,
+    )
 
 
 def test_resolve_leaves_multi_group_to_previous_resolver():
