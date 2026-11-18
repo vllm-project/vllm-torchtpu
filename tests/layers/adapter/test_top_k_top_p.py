@@ -271,3 +271,19 @@ def test_fused_candidates_reject_a_zero_probability_draft_at_u_zero():
         [[0.5] * 4] * 4,
     )
     assert out == [[20, -1], [20, 30]]
+
+
+def test_fused_candidates_greedy_row_recovers_the_first_argmax():
+    # Three candidates tie (ids 7, 3, 9; first argmax 3) and the draft is the
+    # last of them, so the greedy row rejects it. Its recovered token must be
+    # the first argmax whatever the noise, which here favours the other
+    # remaining tie (id 7).
+    tied3 = ([5.0, 5.0, 5.0, 0.0], [7, 3, 9, 11])
+    out = _fused_candidates_cpu(
+        [tied3, _SAMPLED_DRAFT, tied3, _SAMPLED_BONUS],
+        [9, 20],
+        [0.0, 1.0],
+        [0.1, 0.5],
+        [[0.5] * 4, [0.5] * 4, [0.99, 0.01, 0.5, 0.5], [0.5] * 4],
+    )
+    assert out == [[3, -1], [20, 30]]
