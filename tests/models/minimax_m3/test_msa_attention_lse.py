@@ -275,17 +275,21 @@ def _fp4_cache(rng, num_kv_heads):
     return kv, scales, rows
 
 
-@pytest.mark.parametrize("limit_table", [False, True])
+@pytest.mark.parametrize(
+    "limit_table,kernel_limits", [(False, False), (False, True), (True, False)]
+)
 @pytest.mark.parametrize("head_major,q_head_major", LAYOUTS)
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
 def test_fp4_lse_matches_dense_reference(
-    num_kv_heads, head_major, q_head_major, limit_table, monkeypatch
+    num_kv_heads, head_major, q_head_major, limit_table, kernel_limits, monkeypatch
 ):
     """4-bit pages and their scale pages, copied by the kernel beside each
     page: single-head calls (static scale rows) and every head at once
     (rows of the cache-row head). Scale pages nobody selects hold NaN.
     `limit_table`: the calls take their page limits from the caller's table
-    (prefill-size calls)."""
+    (prefill-size calls); `kernel_limits`: without it, from the kernel's
+    per-group compare (decode-size calls), else per page."""
+    monkeypatch.setattr(msa_attention_lse, "KERNEL_LIMITS", kernel_limits)
     monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", 32)
     monkeypatch.setattr(
         msa_attention_lse, "_LIMIT_TABLE_MIN_TOKENS", 32 if limit_table else 1 << 30

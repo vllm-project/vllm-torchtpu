@@ -743,9 +743,11 @@ def _attention_call(
     ]
     page_size = msa_attention.page_tokens(kv_cache)
     kernel_limits = KERNEL_LIMITS and fp4 and not limited
-    spread = [
-        pltpu.VMEM((pages_per_step, pages_per_step * page_size), jnp.bfloat16)
-    ] * (limited or kernel_limits)
+    spread = (
+        [pltpu.VMEM((pages_per_step, pages_per_step * page_size), jnp.bfloat16)]
+        if limited or kernel_limits
+        else []
+    )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
         grid=(calls * num_steps,),
