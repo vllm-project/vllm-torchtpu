@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    TPU_MOE_REQUANT_CHUNK_BYTES: int = 1 << 30
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_SKIP_MAMBA_SCHEDULER_BLOCKS: bool = True
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
@@ -610,6 +611,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
     else None,
+    # Float32 bytes one load-time MoE requantization chunk materializes on
+    # the device. The quantized chunk, its scales and the formatting
+    # temporaries come on top. A chunk always holds at least one expert.
+    # Unset or empty keeps 1 GiB; a value <= 0 raises.
+    "TPU_MOE_REQUANT_CHUNK_BYTES": lambda: (
+        env_positive_int_or_none("TPU_MOE_REQUANT_CHUNK_BYTES")() or 1 << 30
+    ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
