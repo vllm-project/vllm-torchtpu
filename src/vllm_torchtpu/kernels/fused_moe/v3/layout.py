@@ -17,15 +17,12 @@
 # blocks, and every (SUBLANES, LANES) tile of 32-bit words the tables, the
 # routing message and the arrival scale rows move is this wide.
 LANES = 128
-# Sublane count of a 32-bit tile. A packed four-bit weight block has to be a
-# whole number of these deep. device.check_u32_sublane_tile checks the
-# literal against the chip at build time.
+# Sublane count of a 32-bit tile: the routing message, the tables and the
+# combine's staging move in (SUBLANES, LANES) tiles.
 SUBLANES = 8
 # Every transport moves whole ROW_BLOCK-row blocks. Dynamic DMA offsets are
 # block-aligned.
 ROW_BLOCK = 8
-# Eight four-bit values pack into one 32-bit word.
-FP4_PER_WORD = 8
 # Bytes in a 32-bit word, the unit the sparse-core gathers and the word
 # views move.
 WORD_BYTES = 4
