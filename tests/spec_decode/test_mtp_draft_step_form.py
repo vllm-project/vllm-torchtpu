@@ -24,7 +24,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import sequence_parallel
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
@@ -36,7 +35,6 @@ def test_an_mtp_drafter_keeps_the_layouts_row_threshold(monkeypatch, layout, thr
     """With a drafter and a model that follows each step's form, the row
     threshold is the layout's, and the draft path slices a draft forward's
     rows exactly from that threshold."""
-    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
     monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", True)
     monkeypatch.setattr(sequence_parallel, "_HAS_DRAFTER", True)
     monkeypatch.setattr(
