@@ -61,3 +61,22 @@ def test_execute_model_strips_before_the_states_and_the_refusal():
     states = src.index("self._update_states(scheduler_output)")
     refusal = src.index("refusing decode/verify")
     assert gate < strip < states < refusal
+
+
+def test_strip_count_moves_only_when_a_request_is_trimmed():
+    """q38 BLSTACK-RFIX: the per-process count adds trimmed requests and rows, and nothing otherwise."""
+    from vllm_torchtpu.runner import tpu_runner as tr
+
+    before = dict(tr._PREFILL_ONLY_STRIP)
+    so = _so({"x": 3, "y": 2}, {"x": [-1, -1], "y": [17]}, new=[_new("x", 50, 51), _new("y", 50, 51)])
+    assert TPUModelRunner._strip_prefill_only_padding(_runner(), so) == 1
+    assert tr._PREFILL_ONLY_STRIP == {"requests": before["requests"] + 1, "rows": before["rows"] + 2}
+    so = _so({"b": 2}, {"b": [-1]}, new=[_new("b", 100, 5000)])
+    assert TPUModelRunner._strip_prefill_only_padding(_runner(), so) == 0
+    assert tr._PREFILL_ONLY_STRIP == {"requests": before["requests"] + 1, "rows": before["rows"] + 2}
+
+
+def test_strip_count_log_cadence():
+    from vllm_torchtpu.runner.tpu_runner import _prefill_only_strip_log_due as due
+
+    assert [n for n in range(0, 2100) if due(n)] == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]

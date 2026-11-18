@@ -826,6 +826,16 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
+# q38 BLSTACK-RFIX: per-process count of the prefill-only padding strip (TPUModelRunner._strip_prefill_only_padding).
+# Host Python only (no env key, no traced code); touched only when a request is trimmed.
+_PREFILL_ONLY_STRIP = {"requests": 0, "rows": 0}
+
+
+def _prefill_only_strip_log_due(requests: int) -> bool:
+    """Log the running strip count at 1, 2, 4, ... 1024 trimmed requests, then every 1024."""
+    return requests > 0 and (requests & (requests - 1) == 0 or requests % 1024 == 0)
+
+
 class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
@@ -4124,6 +4134,15 @@ class TPUModelRunner(GPUModelRunner):
                     "token of request %s (num_computed_tokens=%d, num_prompt_tokens=%d).",
                     len(drafts), req_id, computed, prompt,
                 )
+                # q38 BLSTACK-RFIX: how often the strip fires (warning_once shows only the first), host only.
+                _PREFILL_ONLY_STRIP["requests"] += 1
+                _PREFILL_ONLY_STRIP["rows"] += len(drafts)
+                if _prefill_only_strip_log_due(_PREFILL_ONLY_STRIP["requests"]):
+                    logger.info(
+                        "Prefill-only MTP padding strip: %d request(s), %d draft-placeholder row(s) trimmed in "
+                        "this process so far",
+                        _PREFILL_ONLY_STRIP["requests"], _PREFILL_ONLY_STRIP["rows"],
+                    )
         return trimmed
 
     @torch.no_grad()
