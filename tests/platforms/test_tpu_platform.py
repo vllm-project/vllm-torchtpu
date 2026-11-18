@@ -565,6 +565,19 @@ class TestTpuPlatform:
             with pytest.raises(Admitted):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_malformed_kv_transfer_page_is_refused_at_startup(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.additional_config = {
+            "tpu_kv_transfer": {"kernel_page_tokens": "128"}
+        }
+        with pytest.raises(ValueError, match="positive int"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(

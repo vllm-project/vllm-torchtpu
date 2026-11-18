@@ -881,6 +881,7 @@ class TpuPlatform(Platform):
         from vllm_torchtpu.layers.adapter.attention import (
             PallasAttentionBackend,
             PallasBatchedRPAAttentionBackend,
+            kv_transfer_page_option,
         )
 
         # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
@@ -921,6 +922,8 @@ class TpuPlatform(Platform):
                 "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
             )
         kv_cache_layout = get_flashinfer_layout_string(layout)
+        # A malformed tpu_kv_transfer section fails here, not at KV cache setup.
+        kv_transfer_page_option(vllm_config)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             kv_cache_layout=kv_cache_layout,
