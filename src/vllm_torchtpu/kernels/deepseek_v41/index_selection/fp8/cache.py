@@ -276,25 +276,22 @@ def _write_sorted_packed_pages(
     run_first = page_first | (
         valid & (columns != jnp.pad(columns[:-1], (1, 0), constant_values=-2) + 1)
     )
-    run_ids = jnp.cumsum(run_first, dtype=jnp.int32) - 1
-    page_ids = jnp.cumsum(page_first, dtype=jnp.int32) - 1
-    size = steps * batch + 1
+    run_ends = jnp.cumsum(run_first, dtype=jnp.int32)
+    page_ends = jnp.cumsum(page_first, dtype=jnp.int32)
+    used = valid.sum(dtype=jnp.int32)
+    index = jnp.arange(steps * batch + 1, dtype=jnp.int32)
 
-    def compact(first, ids, values, end):
-        return (
-            jnp.full((size,), end, jnp.int32)
-            .at[jnp.where(first, ids, size)]
-            .set(values, mode="drop")
-        )
+    def starts(ends):
+        # Item i starts at the first record whose running count passes i;
+        # past the last item every entry is the end of the valid records.
+        found = jnp.searchsorted(ends, index, side="right", method="compare_all")
+        return jnp.minimum(found, used).astype(jnp.int32)
 
-    run_starts = compact(
-        run_first,
-        run_ids,
-        jnp.arange(count, dtype=jnp.int32),
-        valid.sum(dtype=jnp.int32),
-    )
-    page_bases = compact(page_first, page_ids, bases, total_rows)
-    page_runs = compact(page_first, page_ids, run_ids, run_first.sum(dtype=jnp.int32))
+    run_starts = starts(run_ends)
+    page_starts = jnp.minimum(starts(page_ends), count - 1)
+    pages_used = index < page_ends[-1]
+    page_bases = jnp.where(pages_used, bases[page_starts], total_rows)
+    page_runs = jnp.where(pages_used, run_ends[page_starts] - 1, run_ends[-1])
 
     def kernel(page_base_ref, page_run_ref, run_ref, column_ref, value_ref, *refs):
         outputs = refs[len(banks) : 2 * len(banks)]
