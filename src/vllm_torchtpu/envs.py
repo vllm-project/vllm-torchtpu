@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = True
     TPU_DCP_INDEXER_HIST_MERGE: bool = True
+    TPU_DCP_INDEXER_HIST_MERGE_OVERLAP: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
@@ -1792,6 +1793,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep the all-gather merge: there the exchange rounds' latency outweighs
     # the merge they save.
     "TPU_DCP_INDEXER_HIST_MERGE": env_bool("TPU_DCP_INDEXER_HIST_MERGE", default=True),
+    # On buckets that take the histogram merge (TPU_DCP_INDEXER_HIST_MERGE),
+    # pin the TPU_INDEXER_QB_OVERLAP work (the q_b projection) under the
+    # SparseCore top-k call, up to 64 tokens. Without it the work is pinned
+    # only up to 16 tokens and never on the histogram-merge path, so on a
+    # 64-token decode bucket the TensorCore idles for the whole top-k call
+    # (about 50 us per indexer layer) and runs q_b after it. Same result.
+    "TPU_DCP_INDEXER_HIST_MERGE_OVERLAP": env_bool(
+        "TPU_DCP_INDEXER_HIST_MERGE_OVERLAP", default=False
+    ),
     # Smallest padded token bucket that takes the all-to-all merge when
     # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
     # variant picks one merge with no runtime cost.

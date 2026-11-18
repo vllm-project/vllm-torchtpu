@@ -749,6 +749,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         hist_merge = envs.TPU_DCP_INDEXER_HIST_MERGE
+        hist_merge_overlap = envs.TPU_DCP_INDEXER_HIST_MERGE_OVERLAP
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         small_bucket = (
@@ -836,16 +837,24 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
                 q.shape[0], *small_bucket, mixed_bkvp, decode_pack
             )
+            # The histogram merge, if on, replaces the all-to-all one.
+            large = _dcp_indexer_a2a_for_bucket(q.shape[0], True, a2a_min_tokens)
             overlap = {}
             if qb_overlap:
+                # Decode buckets only: the skinny kernel's M range.
+                pin_max_tokens = fp8_skinny.MAX_M
+                pin_hist = hist_merge_overlap and large and hist_merge
+                if pin_hist:
+                    # The histogram-merge top-k call costs about 50 us at any
+                    # decode bucket, which hides the q_b GEMM of up to 64
+                    # tokens (about 15 us at 64).
+                    pin_max_tokens = max(pin_max_tokens, 64)
                 overlap = dict(
                     overlap_fn=qb_overlap_fn,
                     overlap_args=tuple(qb_args),
-                    # Decode buckets only: the skinny kernel's M range.
-                    overlap_pin_max_tokens=fp8_skinny.MAX_M,
+                    overlap_pin_max_tokens=pin_max_tokens,
+                    hist_merge_pin=pin_hist,
                 )
-            # The histogram merge, if on, replaces the all-to-all one.
-            large = _dcp_indexer_a2a_for_bucket(q.shape[0], True, a2a_min_tokens)
             out = streamindex_topk_dcp(
                 q,
                 weights,

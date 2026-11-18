@@ -2268,6 +2268,7 @@ SMALL_AG_MAX_TOKENS = 8
         "overlap_fn",
         "merge_overlap_fn",
         "overlap_pin_max_tokens",
+        "hist_merge_pin",
         "flat_merge",
         "small_all_gather",
         "decode_pack",
@@ -2308,6 +2309,7 @@ def streamindex_topk_dcp(
     overlap_args: tuple = (),
     merge_overlap_fn=None,
     overlap_pin_max_tokens: int | None = None,
+    hist_merge_pin: bool = False,
     flat_merge: bool | None = None,
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
@@ -2422,6 +2424,13 @@ def streamindex_topk_dcp(
       overlap_pin_max_tokens: pin only buckets of at most this many tokens
         (the decode buckets, whose TensorCore idles on the SparseCore calls);
         larger ones run the work unpinned. None pins every bucket.
+      hist_merge_pin: with `hist_merge` and a pinned bucket, also make the
+        returned top-k wait for `overlap_fn`'s result with an
+        `optimization_barrier`. The work's input is already tied to the
+        scores of the last SparseCore call (`final_sc_tie`), so the work can
+        then land only under that call. Without this barrier XLA may schedule
+        the work after the call, and the TensorCore idles while the call
+        runs. Same result.
       flat_merge: all-gather merge only, `padded_num_tokens <= 32`: gather the
         scores flat (`[T * k] -> [dcp_size * T * k]`, rank-major) and merge
         them in place (`sparsecore_topk_dcp_merge(rank_major=True)`), with no
@@ -2615,6 +2624,10 @@ def streamindex_topk_dcp(
             return topk, out
 
         if hist_merge:
+            if pin and hist_merge_pin:
+                # The top-k's consumers wait for the work, so the work runs
+                # under the SparseCore call instead of after it.
+                idxs, ov = lax.optimization_barrier((idxs, ov))
             # The chunks' top-k already is this rank's share of the global one.
             return _ret(idxs)
 
