@@ -22,10 +22,14 @@ from vllm import SamplingParams
 
 from tests_omni.conftest import OmniRunner
 
+# qwen3_omni_moe_thinking.yaml runs with tensor_parallel_size=2 via
+# TpuMultiprocExecutor, so keep it in the multichip nightly lane rather than
+# sharing a pytest process with single-device in-process DiffusionEngine tests.
 pytestmark = [
     pytest.mark.omni,
     pytest.mark.nightly,
     pytest.mark.spawns_tpu_workers,
+    pytest.mark.multichip,
 ]
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
