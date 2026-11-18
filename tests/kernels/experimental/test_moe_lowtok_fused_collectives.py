@@ -41,25 +41,20 @@ E, H, INTER, TOPK = 2, 512, 256, 2
 # hidden 4096, expert intermediate 1024, top-10.
 Q35_GEOMETRY = (64, 4096, 1024, 10)
 REL_L2 = 1e-2
-# rows per engine, dispatch form, combine form, FP8 dispatch, routed-row
-# gather, rank as data, weight ring depth. The first is the served form at a
-# 32-row step.
+# rows per engine, FP8 dispatch. The first is the torch op's call at a 32-row
+# step.
 CASES = {
-    "served_32": (32, "hier", "hier", True, True, True, 1),
-    "bf16_dispatch_32": (32, "hier", "hier", False, True, True, 1),
-    "no_gather_32": (32, "hier", "hier", True, False, True, 1),
-    "rank_from_axis_32": (32, "hier", "hier", True, True, False, 1),
-    "padded_13": (13, "hier", "hier", False, True, True, 1),
-    "rows_16": (16, "hier", "hier", False, True, True, 1),
-    "flat_forms_16": (16, "flat", "flat", False, True, True, 1),
-    "ring_2_32": (32, "hier", "hier", True, True, True, 2),
+    "served_32": (32, True),
+    "bf16_dispatch_32": (32, False),
+    "padded_13": (13, False),
+    "rows_16": (16, False),
 }
-# At the 397B shapes, the forms the torch op runs: FP8 rows where a step's
+# At the 397B shapes, the calls the torch op makes: FP8 rows where a step's
 # rows per engine pad to a multiple of 32, bf16 rows otherwise.
 Q35_CASES = {
-    "q35_served_64": (64, "hier", "hier", True, True, True, 1),
-    "q35_served_48": (48, "hier", "hier", False, True, True, 1),
-    "q35_served_8": (8, "hier", "hier", False, True, True, 1),
+    "q35_served_64": (64, True),
+    "q35_served_48": (48, False),
+    "q35_served_8": (8, False),
 }
 
 
@@ -144,7 +139,7 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
             out = out + w[:, None] * (o * a_s * s2[expert].reshape(1, -1))
         return np.asarray(out.astype(jnp.bfloat16)).astype(np.float64)
 
-    def run(rows, dform, cform, fp8, gather, rank_operand, depth):
+    def run(rows, fp8):
         x, logits = inputs(rows)
 
         def body(x, logits, w13, w2, s13, s2, start, rank):
@@ -156,15 +151,11 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
                 w2,
                 s2,
                 start[0],
+                rank=rank.reshape(2),
                 topk=topk,
                 dp=DP,
                 tp=TP,
-                dispatch_form=dform,
-                combine_form=cform,
-                depth=depth,
                 dispatch_fp8=fp8,
-                rank=rank.reshape(2) if rank_operand else None,
-                gather_rows=gather,
             )
 
         # Each core's output stacked, so both cores of a TP pair are compared.
@@ -277,12 +268,6 @@ def _worker():
     result["fp8_dispatch_bit_identical"] = bool(
         np.array_equal(bits["served_32"], bits["bf16_dispatch_32"])
     )
-    result["rank_from_axis_bit_identical"] = bool(
-        np.array_equal(bits["served_32"], bits["rank_from_axis_32"])
-    )
-    result["ring_depth_bit_identical"] = bool(
-        np.array_equal(bits["served_32"], bits["ring_2_32"])
-    )
     print("RESULT " + json.dumps(result))
 
 
@@ -326,30 +311,12 @@ def test_fp8_dispatch_moves_the_same_expert_inputs(on_8_devices):
     assert on_8_devices["fp8_dispatch_bit_identical"]
 
 
-@pytest.mark.cpu_test
-def test_rank_as_data_matches_the_axis_index(on_8_devices):
-    assert on_8_devices["rank_from_axis_bit_identical"]
-
-
-@pytest.mark.cpu_test
-def test_a_deeper_weight_ring_gives_the_same_bytes(on_8_devices):
-    """The ring depth changes only how far ahead the weights are fetched."""
-    assert on_8_devices["ring_depth_bit_identical"]
-
-
 def _call(rows=32, **kwargs):
     import jax.numpy as jnp
 
     from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
 
-    statics = dict(
-        topk=TOPK,
-        dp=DP,
-        tp=TP,
-        dispatch_form="hier",
-        combine_form="hier",
-        depth=1,
-    )
+    statics = dict(rank=jnp.zeros((2,), jnp.int32), topk=TOPK, dp=DP, tp=TP)
     statics.update(kwargs)
     return fc.moe_lowtok_fused(
         jnp.zeros((rows, H), jnp.bfloat16),
@@ -368,10 +335,8 @@ def _call(rows=32, **kwargs):
     [
         (dict(tp=4), "tp == 2"),
         (dict(rows=16, dispatch_fp8=True), "multiple of 32"),
-        (dict(dispatch_form="ring"), "forms are one of"),
-        (dict(depth=0), "depth is at least 1"),
     ],
-    ids=["hier_needs_tp2", "fp8_rows", "form", "depth"],
+    ids=["hier_needs_tp2", "fp8_rows"],
 )
 def test_refuses_unsupported_calls(kwargs, match):
     rows = kwargs.pop("rows", 32)

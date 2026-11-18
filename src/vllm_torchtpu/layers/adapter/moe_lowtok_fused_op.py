@@ -25,14 +25,11 @@ all-gather, the grouped-matmul MoE and XLA's reduce-scatter and all-reduce.
 
 from __future__ import annotations
 
-from typing import Any
-
 import jax
 import numpy as np
 import torch
 from jax import lax
 from jax.sharding import Mesh, PartitionSpec
-from vllm.config import get_current_vllm_config_or_none
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -43,7 +40,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives
 from vllm_torchtpu.layers.adapter import (
-    moe_options,
     sequence_parallel,
     small_all_reduce_op,
     token_padding,
@@ -53,17 +49,6 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# The kernel's forms on the DP x TP decode layout: the hierarchical dispatch
-# and combine (half the inter-chip bytes per core over a chip's TP pair), a
-# weight ring of one expert, and each expert applied to its routed rows only.
-# Every DP x TP decode leg ran these values. Whether the rows travel as
-# per-row FP8 is the tpu_moe.lowtok_fused_fp8_dispatch option (on by default,
-# as those legs ran it), read when the op is armed.
-DISPATCH_FORM = "hier"
-COMBINE_FORM = "hier"
-RING_DEPTH = 1
-ROUTED_ROW_GATHER = True
-
 _OPS: dict[int, torch.library.CustomOpDef] = {}
 # This core's (dp, tp) index on the mesh view, as an int32 [2] device tensor.
 _RANK = None
@@ -71,31 +56,28 @@ _DP = 0
 _TP = 0
 _ARMED = False
 _CHECKED = False
-_FP8_DISPATCH = False
 
 
 def maybe_prebuild(layer, scores_op) -> None:
     """:func:`prebuild` for a MoE layer the few-token kernel's scores entry
     serves (``scores_op``, from ``moe_lowtok_scores.prebuild``) under expert
-    parallelism; nothing for any other layer. Call it under the loader's
-    config context, which supplies the tpu_moe options."""
+    parallelism; nothing for any other layer."""
     if scores_op is None or not layer.moe_config.moe_parallel_config.use_ep:
         return
-    prebuild(get_current_vllm_config_or_none(), int(layer.moe_config.experts_per_token))
+    prebuild(int(layer.moe_config.experts_per_token))
 
 
-def prebuild(vllm_config: Any, topk: int) -> None:
+def prebuild(topk: int) -> None:
     """Arm the op for this deployment, outside any traced region.
 
     The caller calls it for a layer the few-token kernel serves. Armed when
     the layout is DP x TP over the EP mesh with TP pairs on consecutive cores;
-    otherwise a no-op. ``vllm_config`` supplies the tpu_moe options.
+    otherwise a no-op.
     """
-    global _RANK, _DP, _TP, _ARMED, _CHECKED, _FP8_DISPATCH
+    global _RANK, _DP, _TP, _ARMED, _CHECKED
     if _CHECKED:
         return
     _CHECKED = True
-    fp8_dispatch = moe_options.get(vllm_config).lowtok_fused_fp8_dispatch
     from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 
     mesh = build_ep_mesh()
@@ -104,38 +86,29 @@ def prebuild(vllm_config: Any, topk: int) -> None:
     cores = mesh.shape[EP_AXIS_NAME]
     tp = int(get_tp_group().world_size)
     dp = int(get_dp_group().world_size)
-    forms = (DISPATCH_FORM, COMBINE_FORM)
     index = ep_mesh_index()
     assert index is not None  # build_ep_mesh found the EP group
     if (
         dp * tp != cores
         or dp < 2
-        or (tp != 2 and "hier" in forms)
+        or tp != 2
         or not small_all_reduce_op.groups_match_mesh(index, tp, dp)
     ):
         logger.debug(
             "moe_lowtok fused collectives not armed: dp=%d x tp=%d is not the "
-            "%d-core EP mesh with TP pairs on consecutive cores (forms %s)",
+            "%d-core EP mesh with TP pairs on consecutive cores",
             dp,
             tp,
             cores,
-            forms,
         )
         return
     _DP, _TP = dp, tp
-    _FP8_DISPATCH = fp8_dispatch
     _RANK = torch.tensor([index // tp, index % tp], dtype=torch.int32, device="tpu")
     _ARMED = True
     logger.info(
-        "moe_lowtok fused collectives armed | dp=%d tp=%d | dispatch=%s combine=%s | "
-        "fp8_dispatch=%s | ring_depth=%d | gather_rows=%s | few-token cap %d rows",
+        "moe_lowtok fused collectives armed | dp=%d tp=%d | few-token cap %d rows",
         dp,
         tp,
-        forms[0],
-        forms[1],
-        _FP8_DISPATCH,
-        RING_DEPTH,
-        ROUTED_ROW_GATHER,
         moe_lowtok_scores.armed_max_tokens(),
     )
     _build_op(topk)
@@ -152,16 +125,13 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
     rows = PartitionSpec("dp")
     experts = PartitionSpec(("dp", "tp"))
     cap = moe_lowtok_scores.armed_max_tokens()
-    forms = (DISPATCH_FORM, COMBINE_FORM)
-    fp8_dispatch = _FP8_DISPATCH
-    depth = RING_DEPTH
-    gather_rows = ROUTED_ROW_GATHER
 
     def body(x, scores, w13, w2, s13, s2, experts_start, rank):
         start = experts_start[0]
         rows_l = x.shape[0]
         if 0 < dp * rows_l <= cap:
             padded = -(-rows_l // 16) * 16
+            # The rows travel as per-row FP8 wherever the kernel takes them.
             return fused_collectives.moe_lowtok_fused(
                 x,
                 scores,
@@ -170,15 +140,11 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
                 w2,
                 s2,
                 start,
+                rank=rank,
                 topk=topk,
                 dp=dp,
                 tp=tp,
-                dispatch_form=forms[0],
-                combine_form=forms[1],
-                depth=depth,
-                dispatch_fp8=fp8_dispatch and padded % 32 == 0,
-                rank=rank,
-                gather_rows=gather_rows,
+                dispatch_fp8=padded % 32 == 0,
             )
         # Above the cap: the served path, inside the op.
         xg = lax.all_gather(x, "dp", axis=0, tiled=True)

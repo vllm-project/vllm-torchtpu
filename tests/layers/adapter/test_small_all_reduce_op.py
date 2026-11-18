@@ -420,7 +420,7 @@ def test_prebuild_arms_the_tp_pair_on_dp4_tp2(prebuild_layout):
     assert op._AR_TP_OP is builders.tp.return_value
     assert op._TP_RANKS == (2, 3)
     assert op._TP_RANK.tolist() == [1]  # mesh index 3 is TP rank 1
-    builders.tp.assert_called_once_with(mesh, 2, "oneshot")
+    builders.tp.assert_called_once_with(mesh, 2)
     builders.pairs.assert_called_once_with(3, 2)
 
 

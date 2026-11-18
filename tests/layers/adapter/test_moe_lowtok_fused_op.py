@@ -33,10 +33,6 @@ pytestmark = pytest.mark.cpu_test
 TOPK = 10
 
 
-def _config(additional_config=None):
-    return SimpleNamespace(additional_config=additional_config or {})
-
-
 @pytest.fixture
 def fresh(monkeypatch):
     """Unarmed module state, the op build stubbed, and rank tensors on the host."""
@@ -47,7 +43,6 @@ def fresh(monkeypatch):
         ("_TP", 0),
         ("_ARMED", False),
         ("_CHECKED", False),
-        ("_FP8_DISPATCH", False),
     ):
         monkeypatch.setattr(op, name, value)
     build = Mock(name="_build_op")
@@ -81,7 +76,7 @@ def _layout(monkeypatch, *, dp, tp, cores=8, mesh=True, groups_match=True, index
 
 def test_dp4_tp2_arms_the_op(monkeypatch, fresh):
     check = _layout(monkeypatch, dp=4, tp=2, index=5)
-    op.prebuild(_config(), TOPK)
+    op.prebuild(TOPK)
     assert op._ARMED is True
     assert (op._DP, op._TP) == (4, 2)
     # Mesh index 5 is DP rank 2, TP rank 1 of the (dp, tp) view.
@@ -108,7 +103,7 @@ def test_other_layouts_leave_it_unarmed_without_the_groups_collective(
     that is not the EP mesh, or one engine on a chip's pair (nothing to
     dispatch over DP): the default MoE path, and no collective."""
     check = _layout(monkeypatch, **layout)
-    op.prebuild(_config(), TOPK)
+    op.prebuild(TOPK)
     assert op._ARMED is False
     assert op._RANK is None
     check.assert_not_called()
@@ -117,49 +112,24 @@ def test_other_layouts_leave_it_unarmed_without_the_groups_collective(
 
 def test_tp_groups_off_the_mesh_blocks_leave_it_unarmed(monkeypatch, fresh):
     _layout(monkeypatch, dp=4, tp=2, groups_match=False)
-    op.prebuild(_config(), TOPK)
+    op.prebuild(TOPK)
     assert op._ARMED is False
     fresh.assert_not_called()
 
 
 def test_no_expert_parallel_mesh_leaves_it_unarmed(monkeypatch, fresh):
     _layout(monkeypatch, dp=4, tp=2, mesh=False)
-    op.prebuild(_config(), TOPK)
+    op.prebuild(TOPK)
     assert op._ARMED is False
     fresh.assert_not_called()
 
 
 def test_prebuild_checks_the_layout_once(monkeypatch, fresh):
     check = _layout(monkeypatch, dp=4, tp=2)
-    op.prebuild(_config(), TOPK)
-    op.prebuild(_config(), TOPK)
+    op.prebuild(TOPK)
+    op.prebuild(TOPK)
     check.assert_called_once()
     fresh.assert_called_once()
-
-
-def test_fp8_dispatch_is_on_by_default(monkeypatch, fresh):
-    _layout(monkeypatch, dp=4, tp=2)
-    op.prebuild(_config(), TOPK)
-    assert op._FP8_DISPATCH is True
-
-
-def test_fp8_dispatch_option_off(monkeypatch, fresh):
-    _layout(monkeypatch, dp=4, tp=2)
-    op.prebuild(_config({"tpu_moe": {"lowtok_fused_fp8_dispatch": False}}), TOPK)
-    assert op._ARMED is True
-    assert op._FP8_DISPATCH is False
-
-
-def test_a_malformed_option_fails_at_prebuild(monkeypatch, fresh):
-    _layout(monkeypatch, dp=4, tp=2)
-    with pytest.raises(ValueError, match="lowtok_fused_fp8_dispatch"):
-        op.prebuild(_config({"tpu_moe": {"lowtok_fused_fp8_dispatch": 1}}), TOPK)
-
-
-def test_forms_are_the_dp_tp_decode_values():
-    assert (op.DISPATCH_FORM, op.COMBINE_FORM) == ("hier", "hier")
-    assert op.RING_DEPTH == 1
-    assert op.ROUTED_ROW_GATHER is True
 
 
 @pytest.fixture
@@ -284,13 +254,6 @@ def test_v3_entry_keeps_vllms_dispatch_otherwise(monkeypatch, v3_method):
     method.apply_monolithic_external_dispatch.assert_called_once()
 
 
-def test_prebuild_without_an_engine_config_uses_the_default_options(monkeypatch, fresh):
-    _layout(monkeypatch, dp=4, tp=2)
-    op.prebuild(None, TOPK)
-    assert op._ARMED is True
-    assert op._FP8_DISPATCH is True
-
-
 def _moe_layer(use_ep=True, topk=TOPK):
     return SimpleNamespace(
         moe_config=SimpleNamespace(
@@ -302,12 +265,10 @@ def _moe_layer(use_ep=True, topk=TOPK):
 
 def test_maybe_prebuild_arms_for_a_scores_layer_under_ep(monkeypatch):
     """The FP8 MoE method's weight processing calls it for every MoE layer."""
-    config = _config()
     prebuild = Mock(name="prebuild")
     monkeypatch.setattr(op, "prebuild", prebuild)
-    monkeypatch.setattr(op, "get_current_vllm_config_or_none", lambda: config)
     op.maybe_prebuild(_moe_layer(), object())
-    prebuild.assert_called_once_with(config, TOPK)
+    prebuild.assert_called_once_with(TOPK)
 
 
 @pytest.mark.parametrize(
