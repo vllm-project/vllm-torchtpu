@@ -67,6 +67,7 @@ from vllm_torchtpu.core.prefix_aware_scheduler import (
     _TIER_FREE_BLOCK_FIT,
     _TIER_NORMAL,
     _TIER_PREEMPTED,
+    ExternalHitEstimator,
     PrefixAwareScheduler,
     _is_decoding,
     _wait_seconds,
@@ -130,7 +131,6 @@ class TpuPipelineChunkScheduler(Scheduler):
     _memo_compute = PrefixAwareScheduler._memo_compute
     _get_prefix_cache_epoch: Any = PrefixAwareScheduler._get_prefix_cache_epoch
     _get_block_size: Any = PrefixAwareScheduler._get_block_size
-    _get_num_free_blocks = PrefixAwareScheduler._get_num_free_blocks
     _prefix_warmth: Any = PrefixAwareScheduler._prefix_warmth
     _external_warmth: Any = PrefixAwareScheduler._external_warmth
     _get_paw_aging_rate: Any = PrefixAwareScheduler._get_paw_aging_rate
@@ -193,6 +193,11 @@ class TpuPipelineChunkScheduler(Scheduler):
             options.prefix_aware
             and scheduler_options.get(self.vllm_config).promote_warmest
         )
+        # The connector's host-tier estimate (#3083), read by the borrowed
+        # _external_warmth.
+        self._hit_estimator: ExternalHitEstimator | None = (
+            self.connector if isinstance(self.connector, ExternalHitEstimator) else None
+        )
         self._retention: HybridStateRetention | None = None
         if _retains_hybrid_state(self.vllm_config):
             retention = HybridStateRetention(self.kv_cache_manager)
@@ -219,6 +224,16 @@ class TpuPipelineChunkScheduler(Scheduler):
             self._promote_waiting,
             self._memo_xstep,
         )
+
+    def _get_num_free_blocks(self) -> int | None:
+        """Free HBM blocks, with the Mamba blocks hybrid-state retention pins
+        counted as free: retention evicts them when an allocation needs
+        them."""
+        # PrefixAwareScheduler's pool count; self is not one, hence the cast.
+        free_blocks = cast(Any, PrefixAwareScheduler)._get_num_free_blocks(self)
+        if free_blocks is not None and self._retention is not None:
+            free_blocks += self._retention.num_pinned_blocks()
+        return free_blocks
 
     def _quad_cost(self, tokens: int, prefix: int) -> float:
         """Quadratic FLOPs-equivalent token cost under the step cost model

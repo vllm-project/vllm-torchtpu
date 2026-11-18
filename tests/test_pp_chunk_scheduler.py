@@ -82,6 +82,7 @@ def _scheduler(
     scheduler._clips = 0
     scheduler._waits = 0
     scheduler._retention = None
+    scheduler._hit_estimator = None
     scheduler.kv_cache_manager = SimpleNamespace()
     for name, value in options.items():
         setattr(scheduler, name, value)

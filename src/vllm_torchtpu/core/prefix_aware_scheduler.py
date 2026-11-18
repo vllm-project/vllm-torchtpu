@@ -79,12 +79,27 @@ _PACK_PROMPT_IDS_MIN_TOKENS = 1024
 _SMALL_STEP_BLOCKS = 2
 
 # Priority tiers: lower values admit earlier.
+_TIER_FREE_BLOCK_FIT = 0
 _TIER_PREEMPTED = 1
 _TIER_NORMAL = 2
 
 
 def _is_decoding(request: Request) -> bool:
     return request.num_computed_tokens >= request.num_prompt_tokens > 0
+
+
+def _wait_seconds(request: Request, now: float) -> float:
+    """Seconds since ``request.arrival_time``.
+
+    ``arrival_time`` is the wall-clock time (``time.time()``) at which this
+    engine's API server received the request; on a disaggregated prefill leg
+    that is the proxy's prefill hop. It covers time in the waiting queue and
+    time in ``running``, and does not reset on preemption.
+    """
+    arrival = getattr(request, "arrival_time", None)
+    if arrival is None:
+        return 0.0
+    return max(now - float(arrival), 0.0)
 
 
 def _hit_signature(result) -> tuple:
@@ -500,6 +515,19 @@ class PrefixAwareScheduler(AsyncScheduler):
             base, max(min_reserved, per_seq_reserved * (num_running + num_inflight))
         )
 
+    def _get_paw_aging_rate(self) -> float:
+        """Uncached prompt tokens credited per second a request has waited.
+
+        0 (no aging) unless a scheduler that borrows these helpers sets
+        ``_paw_aging_tok_per_s``.
+        """
+        return float(getattr(self, "_paw_aging_tok_per_s", 0.0) or 0.0)
+
+    def _now(self) -> float:
+        """Wall-clock time of the current schedule() call."""
+        now = getattr(self, "_step_wall_time", None)
+        return time.time() if now is None else now
+
     def _note_waiting_stop(self, request: Request, reason: str) -> None:
         """Records why the waiting loop stopped at ``request`` (first stop of
         the step wins; running requests are ignored)."""
@@ -874,9 +902,16 @@ class PrefixAwareScheduler(AsyncScheduler):
         return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
 
     def _rank_and_warmth(
-        self, request: Request
+        self,
+        request: Request,
+        free_blocks_for_fit: int | None = None,
+        now: float | None = None,
     ) -> tuple[tuple[int, float, float], int]:
-        """Return (sort_key, warmth). Lower sort_key is admitted first."""
+        """Return (sort_key, warmth). Lower sort_key is admitted first.
+
+        ``_promote_warmest`` also passes ``free_blocks_for_fit`` and ``now``,
+        which the pipeline-parallel prefill scheduler's own ranking uses.
+        """
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
@@ -903,7 +938,31 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         window = list(islice(queue, self.WINDOW))
         head = window[0]
-        scored = [(self._rank_and_warmth(r), r) for r in window]
+        now = self._now()
+        head_scored = self._rank_and_warmth(head, now=now)
+        head_local_warmth = self._prefix_warmth(head)
+
+        free_blocks = (
+            None
+            if getattr(self, "_is_kv_consumer", False)
+            else self._get_num_free_blocks()
+        )
+        free_blocks_for_fit: int | None = None
+        if free_blocks is not None:
+            head_cold_tokens = max(head.num_tokens - head_local_warmth, 0)
+            head_needed_blocks = math.ceil(head_cold_tokens / self._get_block_size())
+            if free_blocks < head_needed_blocks:
+                free_blocks_for_fit = free_blocks
+
+        scored = [(head_scored, head)] + [
+            (
+                self._rank_and_warmth(
+                    r, free_blocks_for_fit=free_blocks_for_fit, now=now
+                ),
+                r,
+            )
+            for r in window[1:]
+        ]
         (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
 
         if best is not head and best_rank < scored[0][0][0]:

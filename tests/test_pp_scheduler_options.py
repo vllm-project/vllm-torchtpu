@@ -93,6 +93,7 @@ def _sched(cost=None, running=(), waiting=(), **attrs) -> TpuPipelineChunkSchedu
     s._clips = 0
     s._waits = 0
     s._retention = None
+    s._hit_estimator = None
     s.kv_cache_manager = SimpleNamespace()
     for k, v in attrs.items():
         setattr(s, k, v)
@@ -181,6 +182,7 @@ def _built(
         )
         self.need_mamba_block_aligned_split = False
         self.kv_cache_manager = SimpleNamespace()
+        self.connector = None
 
     class FakeRetention:
         def __init__(self, kvm):
@@ -548,3 +550,42 @@ def test_the_prefill_legs_run_what_the_record_jobs_ran():
         assert "tpu_pp_scheduler" not in entry["legs"]["decode"]["additional_config"]
         seen.append(entry["point"])
     assert seen == [1, 5, 8, 10, 12]
+
+
+# -- what the prefix-aware admission borrows from PrefixAwareScheduler ----------
+
+
+def test_promotion_ranks_with_the_free_block_fit_and_the_step_time():
+    # The head (old, so aged ahead) does not fit the free blocks; a warm
+    # request that fits takes the free-block-fit tier and is promoted. Without
+    # the fit input the head's aging keeps it first.
+    from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+
+    step_time = 1_000.0
+    head = SimpleNamespace(
+        request_id="head", num_tokens=10_000, num_preemptions=0, arrival_time=990.0
+    )
+    fits = SimpleNamespace(
+        request_id="fits", num_tokens=10_000, num_preemptions=0, arrival_time=1_000.0
+    )
+    warmth = {"head": 2_000, "fits": 5_000}
+    for free_blocks, promoted in ((3, "fits"), (None, "head")):
+        queue = FCFSRequestQueue()
+        queue.add_request(head)
+        queue.add_request(fits)
+        s = _sched(_paw_aging_tok_per_s=3_000.0, _step_wall_time=step_time)
+        s.policy = SchedulingPolicy.FCFS
+        s._paw_n = s._paw_cold_tokens = s._paw_prompt_tokens = 0
+        s._prefix_warmth = lambda request: warmth[request.request_id]
+        s._get_block_size = lambda: 2_176
+        s._get_num_free_blocks = lambda free=free_blocks: free
+        s._promote_warmest(queue)
+        assert next(iter(queue)).request_id == promoted, free_blocks
+
+
+def test_free_blocks_count_the_blocks_retention_pins():
+    pool = SimpleNamespace(get_num_free_blocks=lambda: 10)
+    s = _sched(kv_cache_manager=SimpleNamespace(block_pool=pool))
+    assert s._get_num_free_blocks() == 10
+    s._retention = SimpleNamespace(num_pinned_blocks=lambda: 5)
+    assert s._get_num_free_blocks() == 15
