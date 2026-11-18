@@ -24,11 +24,6 @@ record:
 decode_layout: "TP8 + DCP4"
 concurrency: 224
 chips: 24
-# Values the record run used that this tree cannot run yet (README.md).
-not_yet_supported:
-  decode:
-    MOE_FUSED_EP_KERNEL_IMPL: "the fused EP MoE v3 kernel (this tree accepts v2 and adaptive)"
-    TPU_EXPERT_PLACEMENT: "an expert placement table with 68 slots per rank (64 experts and 4 copies) and placement with expert copies; this tree ships no table and places permutations only"
 legs:
   prefill:
     replicas: 2

@@ -116,10 +116,13 @@ def test_a_permutation_table_budgets_like_no_table(table):
 
 @pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
 def test_decode_legs_place_their_experts_with_a_table_here(path):
+    """Each decode leg names its table through the $EXPERT_PLACEMENT_TABLE
+    placeholder; README.md says which table of this directory it stands for."""
     entry = yaml.safe_load(path.read_text())
     decode, prefill = entry["legs"]["decode"], entry["legs"]["prefill"]
-    name = pathlib.PurePosixPath(decode["env"]["TPU_EXPERT_PLACEMENT"]).name
-    placement = expert_placement.parse(json.loads((VALIDATION / name).read_text()))
+    assert decode["env"]["TPU_EXPERT_PLACEMENT"] == "$EXPERT_PLACEMENT_TABLE"
+    table = DP8_TABLE if "dp4tp2" in path.stem else TP8_TABLE
+    placement = expert_placement.parse(json.loads(table.read_text()))
     # TP8 decode carries the copies table, DP4 x TP2 decode the permutation.
     want = 64 if "dp4tp2" in path.stem else 68
     assert placement.slots_per_rank == want
