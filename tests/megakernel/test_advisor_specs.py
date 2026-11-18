@@ -24,6 +24,7 @@ from unittest import mock
 
 import pytest
 
+from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     chips,
     constants,
@@ -674,3 +675,68 @@ def test_quantization_peak_flops_and_hf_subchannel_parsing() -> None:
     assert p_subchannel.weight_block_k == expected_block_k
     assert p_subchannel.act_dtype == "bf16"
     assert p_subchannel.weight_dtype == "fp8"
+
+
+def test_kimi_k3_declares_eight_expert_owner_groups() -> None:
+    """Verify Kimi-K3 decode and saturation presets declare 8 expert owner groups."""
+    kimi_preset = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    assert kimi_preset.decode is not None
+    assert kimi_preset.decode.megakernel is not None
+    # Kimi-K3's 32-rank megakernel shards each expert across 4 TP ranks (32 // 4 == 8).
+    tp_ranks_per_expert_group = 4
+    expected_owner_groups = kimi_preset.decode.ep // tp_ranks_per_expert_group
+    assert kimi_preset.decode.megakernel["expert_owner_groups"] == expected_owner_groups
+    assert kimi_preset.saturation is not None
+    assert kimi_preset.saturation.megakernel is not None
+    assert (
+        kimi_preset.saturation.megakernel["expert_owner_groups"]
+        == expected_owner_groups
+    )
+
+
+@pytest.mark.parametrize("bad_groups", [0, True, "8", 6, 64])
+def test_parse_parallel_layout_rejects_invalid_expert_owner_groups(
+    bad_groups: object,
+) -> None:
+    """Reject non-int, out-of-range, or ep-non-dividing expert_owner_groups."""
+    ep_size = 32
+    with pytest.raises(errors.MegakernelConfigError, match="expert_owner_groups"):
+        models.parse_parallel_layout(
+            {
+                "tp": 32,
+                "ep": ep_size,
+                "megakernel": {
+                    "source": "unit test invalid owner groups",
+                    "scopes": ["whole_step"],
+                    "ranks": 32,
+                    "expert_owner_groups": bad_groups,
+                },
+            }
+        )
+
+
+def test_validate_declared_layouts_rejects_non_dividing_or_unknown_owner_groups() -> (
+    None
+):
+    """Reject owner_groups that do not divide num_experts or unknown preset slugs."""
+    non_dividing_layout = models.parse_parallel_layout(
+        {
+            "tp": 6,
+            "ep": 6,
+            "megakernel": {
+                "source": "unit test non-dividing owner groups",
+                "scopes": ["whole_step"],
+                "ranks": 6,
+                "expert_owner_groups": 6,
+            },
+        }
+    )
+    prefill_layout = models.parse_parallel_layout({"tp": 32, "ep": 16, "pcp": 32})
+    bad_preset = models.DeploymentPreset(
+        decode=non_dividing_layout,
+        prefill=prefill_layout,
+    )
+    with pytest.raises(errors.MegakernelConfigError, match="divide num_experts"):
+        models.validate_declared_layouts("kimi-k3", bad_preset)
+    with pytest.raises(KeyError):
+        models.validate_declared_layouts("unknown-preset-slug", bad_preset)
