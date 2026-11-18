@@ -17,30 +17,15 @@
     moe_expert_placement.py --shards 16 --layers 3:60 \\
         --out placement.json TAP_DIR [TAP_DIR ...]
 
-Each rank's load is its last snapshot minus its `--skip`-th (1-based; 0 keeps
-everything), which drops warmup and compile traffic; ranks are then summed.
-Only the latest run in a directory counts: a restarted server numbers its
-snapshots after the old ones and starts its `step` over, so the snapshots from
-the last drop in `step` on are one run's.
-
-A layer is as slow as its costliest rank, and a rank's cost is the sum of its
-slots' costs (VisitModel: weight stream floor, full and short tiles). Each
-layer is placed to minimise the EXPECTED straggler over steps sampled from the
-measured per-expert means and variances: costliest-first onto the cheapest
-rank, then pairwise swaps off the rank that is most often the straggler. A
-layer whose expected straggler does not drop by --min-gain-us stays
-contiguous. A placement only permutes a layer's experts over the ranks,
-experts / shards to a rank; it never replicates one. The cost defaults are
-fitted to the fused EP kernel on DeepSeek-V4-Pro; for another kernel or model,
-pass its own --floor-us, --visit-us, --tile-us, --short-tile-us, --row-us,
---rung and --tile-rows. Without such a fit, `--floor-us 0 --visit-us 0
---tile-us 0 --short-tile-us 0 --row-us 1` makes a slot's cost its row count,
-so each layer is placed to even out the expected rows per rank (and
---min-gain-us is then in rows per step).
-
-Layers are numbered as TPU_EXPERT_PLACEMENT numbers them: the tap records each
-layer's table number, so a drafter's MoE layer i of an n-layer target is n + i
-whatever its module is named.
+Each rank's load is its last snapshot minus its `--skip`-th (dropping warmup),
+from the latest run in each directory (a restart starts `step` over); ranks are
+summed. Each layer, numbered as the tap recorded it, is placed to minimise the
+expected costliest rank over steps sampled from the measured means and
+variances, under a per-slot cost model (VisitModel); a layer that gains less
+than --min-gain-us stays contiguous. The cost defaults fit the fused EP kernel
+on DeepSeek-V4-Pro; `--floor-us 0 --visit-us 0 --tile-us 0 --short-tile-us 0
+--row-us 1` instead balances the expected rows per rank (--min-gain-us is then
+in rows per step).
 """
 
 import argparse
@@ -68,7 +53,6 @@ def load_counts(dirs, skip):
     mean, var, names, indices, first = None, None, None, None, None
     for key, snaps in sorted(by_rank.items()):
         snaps.sort()
-        # The latest run: everything from the last restart of `step` on.
         steps = [int(np.load(path)["step"]) for _, path in snaps]
         restarts = [i for i in range(1, len(steps)) if steps[i] <= steps[i - 1]]
         snaps = snaps[restarts[-1] :] if restarts else snaps
@@ -101,15 +85,9 @@ def load_counts(dirs, skip):
 
 
 class VisitModel:
-    """Device time of one expert slot holding `rows` rows in one step (us).
-
-    A visited slot costs max(floor, its tiles) plus a fixed visit cost: full
-    tiles of tile_rows rows, a tail tile at the short rung's cost when it fits
-    in it, and a small per-row term. Not visited (no rows): nothing. Defaults
-    are a least-squares fit to 36 measured EP8 cells of the fused EP kernel
-    (synthetic Zipf and replayed production routing, three placements each;
-    RMSE 9 us of 440-820 us layers).
-    """
+    """Device time (us) of one expert slot holding `rows` rows in one step:
+    max(floor, its tiles) plus a visit cost, or nothing without rows. Defaults
+    are a least-squares fit to 36 measured EP8 cells of the fused EP kernel."""
 
     def __init__(self, floor, visit, full_tile, short_tile, per_row, rung, tile_rows):
         self.floor, self.visit = floor, visit
@@ -126,21 +104,17 @@ class VisitModel:
 
 
 def sample_rows(mu, var, steps, rng):
-    """[experts, steps] per-step rows: normal at the measured mean and variance
-    (at least Poisson), rounded and clipped at zero."""
+    """[experts, steps] rows: normal at the measured mean and variance (at
+    least Poisson), rounded and clipped at zero."""
     sd = np.sqrt(np.maximum(var, mu))
     noise = rng.standard_normal((mu.size, steps))
     return np.maximum(0, np.rint(mu[:, None] + sd[:, None] * noise))
 
 
 def place(mu, var, shards, model, steps=64, sweeps=200, seed=0):
-    """(per rank the experts it holds, expected straggler us).
-
-    The objective is the mean over sampled steps of the costliest rank, so a
-    placement is judged on the steps it will actually see rather than on the
-    expected rows alone. Greedy costliest-first, then pairwise swaps off the
-    rank that is most often the straggler while the objective improves.
-    """
+    """(per rank the experts it holds, expected straggler us): costliest-first
+    onto the cheapest rank, then swaps off the most frequent straggler while
+    the mean over sampled steps of the costliest rank improves."""
     rng = np.random.default_rng(seed)
     experts = mu.size
     width = experts // shards

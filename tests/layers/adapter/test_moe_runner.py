@@ -216,12 +216,10 @@ def test_binder_hooks_the_layer_route_reads(capture_runner):
     [
         (1, 1, False, False, (False, False)),
         (4, 1, False, False, (True, False)),
-        # A method that owns its dispatch gets this rank's own rows.
-        (4, 1, True, False, (False, False)),
+        (4, 1, True, False, (False, False)),  # the method owns its dispatch
         (1, 2, False, False, (False, True)),
         (4, 2, False, False, (True, True)),
-        # An armed fused EP layer owns the PCP collectives as well.
-        (4, 2, True, True, (False, False)),
+        (4, 2, True, True, (False, False)),  # armed fused EP: PCP too
     ],
 )
 def test_rows_gathered_follows_maybe_dispatch(
@@ -243,8 +241,7 @@ def test_rows_gathered_follows_maybe_dispatch(
 
 
 def test_the_count_tap_sees_every_layer_the_runner_applies(monkeypatch):
-    """Whatever the quant method: the tap records the rows, logits and ids
-    the method is handed, then the method runs as before."""
+    """The tap records what the quant method is handed, then it runs."""
     from vllm_torchtpu.layers.adapter import expert_count_tap
 
     recorded = []

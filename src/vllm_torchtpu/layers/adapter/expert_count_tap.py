@@ -13,54 +13,28 @@
 # limitations under the License.
 """TPU_MOE_EXPERT_COUNT_TAP_DIR: per-layer routed-expert counts from a live server.
 
-An expert placement is only as good as the routing statistics it is built
-from, and a fused kernel selects inside its own program, so its choices never
-reach the host. With the tap on, every MoE layer, whatever its kernel, re-runs
-the same selection in the traced forward, as the TPU MoE methods make it
-(`moe_routing.route`: a model's custom routing function, else hash table or
-scored top-k), and accumulates, on the device, per global expert:
+A fused kernel selects experts inside its own program, so its choices never
+reach the host. With the tap on, every MoE layer re-runs the selection the TPU
+MoE methods make (`moe_routing.route`) in the traced forward and accumulates on
+the device, per global expert: row 0 the sum over steps of c, row 1 of c * c,
+row 2 [steps, valid tokens, 0, ...], where c is this rank's per-step count of
+valid tokens that selected the expert (the mean and variance of its load).
 
-    row 0: routed pairs           sum over steps of c
-    row 1: squared per-step count sum over steps of c * c
-    row 2: [steps, valid tokens, 0, ...]
+Every TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS runner steps the f32 device buffers
+are drained into host-side running totals, so no sum overflows, and each EP
+rank writes the totals to <dir>/counts_ep<rank>_<seq>.npz (counts [layers, 3,
+experts] i64, layer_names, layer_indices, step, wall). A restarted process
+numbers its snapshots after the existing ones, and its `step` starts over.
+Each token is counted once over the ranks: only TP rank 0 counts the rows a TP
+group replicates, and a rank counts only its own share of rows the runner
+gathered over DP or PCP. Experts are numbered as in the checkpoint, also in a
+placed layer; `layer_indices` numbers the layers as a TPU_EXPERT_PLACEMENT
+table does (`expert_placement.layer_index`), or -1.
 
-where c is this rank's per-step count of valid (non-padding) tokens that
-selected the expert. Rows 0-1 give the mean and the step-to-step variance of
-each expert's load from this rank.
-
-The device buffers are f32 and only ever hold the steps since the last
-snapshot: every TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS runner steps (an idle DP
-rank's dummy step included, so every rank snapshots on the same steps) the
-runner copies them to the host, adds them to this process's running totals and
-zeroes them, so no sum outgrows its type however long the server runs (an
-int32 sum of squares of a hot expert's count wraps within the hour at
-1024-token steps). The snapshot is the running total, never overwritten:
-
-    <dir>/counts_ep<rank>_<seq>.npz   counts [layers, 3, experts] i64,
-                                      layer_names, layer_indices, step, wall
-
-<rank> is the layer's EP rank. Each token is counted once over the ranks'
-snapshots: where the MoE input is replicated over a TP group (the fused
-kernel's token replica groups), only TP rank 0 records, and where the MoE
-runner has gathered the rows over DP or PCP, each rank counts only its own.
-Experts are numbered as in the checkpoint, also in a layer an expert placement
-has renumbered, so a placement built from the counts names the same experts.
-`layer_indices` holds each layer's number in a TPU_EXPERT_PLACEMENT table, as
-the loader numbers it (`expert_placement.layer_index`: a drafter's MoE layer i
-of an n-layer target is n + i, whatever its module is named), or -1.
-A restarted process numbers its snapshots after the ones already in <dir>;
-its `step` starts over, which is how a reader tells the runs apart.
-
-Padding rows are told apart by the runner's token padding mask, which it keeps
-with TPU_MOE_SKIP_PADDED_TOKENS=1 (or an mxfp4 MoE) and which is exact only in
-the ALL sequence layout; the tap is refused at load otherwise
-(`require_padding_mask`). It is also refused with pipeline parallelism, whose
-stages share EP ranks and so snapshot names.
-
-Snapshots are cumulative so a reader can difference any two of them to drop
-warmup and compile traffic. The tap only reads the routing inputs: the model's
-outputs are unchanged, but the forward does extra work, so a tapped run is a
-diagnostic, not a benchmark arm.
+Padding rows are told apart by the runner's token padding mask, so the tap is
+refused unless that mask is kept and exact (`require_padding_mask`), and with
+pipeline parallelism, whose stages share EP ranks. The outputs are unchanged,
+but the forward does extra work: a tapped run is a diagnostic, not a benchmark.
 """
 
 import glob
@@ -77,21 +51,15 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 COUNTS_ATTR = "_tpu_expert_counts"
-# A tapped layer's [DP rank, PCP rank], to find this rank's own rows among
-# rows its runner gathered.
+# A tapped layer's [DP rank, PCP rank]: its share of rows gathered over them.
 RANKS_ATTR = "_tpu_expert_count_ranks"
 
-# (layer name, layer, slot order or None, table layer or -1) for every tapped
-# layer of this process, in registration order. The layers own the buffers;
-# this only lists them for the dump, with the order that maps a placed layer's
-# slots back to the checkpoint's experts.
+# (name, layer, slot order or None, table layer or -1) per tapped layer.
 _TAPPED: list[tuple[str, torch.nn.Module, tuple[int, ...] | None, int]] = []
 
 
 def _fresh_state() -> dict:
-    # steps: runner steps seen; seq: the next snapshot's number (decided at
-    # the first dump); rank: the EP rank the snapshots are named for; total:
-    # the f64 running totals [layers, 3, experts] the snapshots hold.
+    # Runner steps, next snapshot number, EP rank, f64 running totals.
     return {"steps": 0, "seq": None, "rank": None, "total": None}
 
 
@@ -100,17 +68,6 @@ _STATE = _fresh_state()
 
 def enabled() -> bool:
     return bool(envs.TPU_MOE_EXPERT_COUNT_TAP_DIR)
-
-
-def _directory() -> str:
-    # Pod specs pass env values verbatim, e.g. "$CDK_OUTPUT_DIR/moe_counts".
-    directory = os.path.expandvars(envs.TPU_MOE_EXPERT_COUNT_TAP_DIR)
-    if "$" in directory:
-        raise ValueError(
-            "TPU_MOE_EXPERT_COUNT_TAP_DIR="
-            f"{envs.TPU_MOE_EXPERT_COUNT_TAP_DIR!r} references an unset variable"
-        )
-    return directory
 
 
 def _tp_rank() -> int:
@@ -126,63 +83,49 @@ def _pp_size() -> int:
 
 
 def reset_model_state() -> None:
-    """Forget the tapped layers and the running totals, so a second model load
-    in the process starts from nothing (its snapshots number after the ones
-    already written, and their `step` starts over)."""
+    """Forget the tapped layers and the totals, for another model load."""
     _TAPPED.clear()
     _STATE.clear()
     _STATE.update(_fresh_state())
 
 
 def require_padding_mask(tracked: bool, all_layout: bool) -> None:
-    """Refuse the tap unless the runner's token padding mask marks every step's
-    padding rows: the tap counts only real tokens, and tells them by that mask.
-
-    `tracked`: the runner keeps a padding mask. `all_layout`: its sequence
-    layout is ALL, the only one the mask is exact for.
-    """
+    """Refuse the tap unless the runner keeps a token padding mask (`tracked`)
+    and it is exact, which it is only in the ALL sequence layout."""
     if not enabled():
         return
     if not tracked:
         raise ValueError(
-            "TPU_MOE_EXPERT_COUNT_TAP_DIR counts only real tokens, telling "
-            "padding rows apart by the runner's token padding mask: set "
-            "TPU_MOE_SKIP_PADDED_TOKENS=1 so the runner keeps one"
+            "TPU_MOE_EXPERT_COUNT_TAP_DIR counts only real tokens, told apart "
+            "by the token padding mask: set TPU_MOE_SKIP_PADDED_TOKENS=1"
         )
     if not all_layout:
         raise ValueError(
             "TPU_MOE_EXPERT_COUNT_TAP_DIR needs the ALL sequence layout: under "
-            "PCP streaming or the PCP manager the token padding mask marks "
-            "every row valid, so padding would be counted"
+            "PCP streaming or the PCP manager the padding mask marks every row "
+            "valid"
         )
 
 
 def _repeats_another_rank(layer) -> bool:
-    """Whether this rank's MoE rows are a copy of another rank's.
-
-    The fused kernel's token replica groups are the TP groups unless MoE
-    sequence parallelism partitions the rows (see
-    `ep_mesh.ep_token_replica_groups`); every member sees the whole group's
-    rows, so only the first one counts them.
-    """
+    # The fused kernel's token replica groups are the TP groups unless MoE
+    # sequence parallelism splits the rows; only their first member counts.
     if layer.moe_config.moe_parallel_config.is_sequence_parallel:
         return False
     return _tp_rank() != 0
 
 
 def register(layer) -> None:
-    """Give a RoutedExperts layer its count buffer. The TPU MoE runner calls
-    this for every layer it builds, after any expert placement is applied."""
+    """Give a RoutedExperts layer its count buffer (the TPU MoE runner calls
+    this for every layer, after any expert placement)."""
     if not enabled():
         return
-    _directory()  # an unresolvable directory fails at load, not hours later
     if envs.TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS <= 0:
         raise ValueError(
             "TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS must be a positive step "
             f"count; got {envs.TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS}"
         )
     if _pp_size() > 1:
-        # Snapshots are named by EP rank, which every pipeline stage repeats.
         raise NotImplementedError(
             "TPU_MOE_EXPERT_COUNT_TAP_DIR does not support pipeline "
             "parallelism: its stages would write the same snapshot files"
@@ -190,9 +133,9 @@ def register(layer) -> None:
     if _repeats_another_rank(layer):
         return
     _STATE["rank"] = layer.expert_map_manager.ep_rank
-    experts = layer.global_num_experts
     weight = next(layer.parameters(), None)
     device = None if weight is None else weight.device
+    experts = layer.global_num_experts
     layer.register_buffer(
         COUNTS_ATTR,
         torch.zeros((3, experts), dtype=torch.float32, device=device),
@@ -205,14 +148,8 @@ def register(layer) -> None:
         persistent=False,
     )
     index = expert_placement.layer_index(layer.layer_name)
-    _TAPPED.append(
-        (
-            layer.layer_name,
-            layer,
-            expert_placement.expert_order(layer),
-            -1 if index is None else index,
-        )
-    )
+    order = expert_placement.expert_order(layer)
+    _TAPPED.append((layer.layer_name, layer, order, -1 if index is None else index))
 
 
 def is_tapped(layer) -> bool:
@@ -220,8 +157,7 @@ def is_tapped(layer) -> bool:
 
 
 def _dp_pcp() -> tuple[tuple[int, int], tuple[int, int]]:
-    """This rank's (rank, size) in the DP group and in the PCP group, the
-    groups a MoE runner can gather its rows over."""
+    """This rank's (rank, size) in the DP group and in the PCP group."""
     from vllm.distributed.parallel_state import get_dp_group
 
     from vllm_torchtpu.distributed.pcp import get_pcp_group
@@ -235,14 +171,10 @@ def _dp_pcp() -> tuple[tuple[int, int], tuple[int, int]]:
 def _counted_rows(
     layer, rows: int, over_dp: bool, over_pcp: bool, device
 ) -> torch.Tensor:
-    """[rows] bool: the rows this rank counts, its own tokens' valid ones.
-
-    Rows the runner gathered over DP, then PCP, are every rank's, in equal
-    shares in group-rank order (as `token_padding.
-    zero_routing_weights_for_padding` reads them too). This rank's share is
-    picked by comparing with its position, held as data so that every rank
-    traces the same program.
-    """
+    """[rows] bool: this rank's own valid rows. Rows gathered over DP, then
+    PCP, are every rank's, in equal shares in group-rank order (as
+    `token_padding.zero_routing_weights_for_padding` reads them); the share is
+    picked by a position held as data, so every rank traces one program."""
     dp_size = pcp_size = 1
     if over_dp or over_pcp:
         (_, dp_world), (_, pcp_world) = _dp_pcp()
@@ -256,7 +188,8 @@ def _counted_rows(
             "ranks"
         )
     local = rows // shares
-    padding = token_padding.local_padding_mask(local)
+    state = token_padding._padding_state
+    padding = None if state is None else state.get_local_padding_mask(local)
     valid = (
         torch.ones((local,), dtype=torch.bool, device=device)
         if padding is None
@@ -281,20 +214,13 @@ def record(
     over_dp: bool = False,
     over_pcp: bool = False,
 ) -> None:
-    """Accumulate this step's selections into the layer's buffer (traced).
-
-    `hidden_states`: the rows the experts get, for a routing function that
-    reads them (the logits stand in when not given). `over_dp` / `over_pcp`:
-    the runner gathered the rows over that group before the experts got them,
-    so this rank holds every rank's rows.
-    """
+    """Add this step's selections to the layer's buffer (traced). `over_dp` /
+    `over_pcp`: the runner gathered the rows over that group."""
     counts = getattr(layer, COUNTS_ATTR, None)
     if counts is None:
         return
-    # The selection `moe_routing.route` makes for the TPU MoE methods, a
-    # custom routing function's included, so the counts are the experts the
-    # kernel runs. Not `route` itself: its routed-experts capture hook must
-    # fire once per layer, from the quant method's own routing.
+    # route()'s selection without its capture hook, which the quant method's
+    # own routing fires once per layer.
     _, topk_ids = moe_routing._select_routing(
         layer,
         router_logits if hidden_states is None else hidden_states,
@@ -308,8 +234,7 @@ def record(
     hit = topk_ids.to(torch.int32).unsqueeze(-1) == torch.arange(
         experts, dtype=torch.int32, device=device
     )
-    # A step's count is at most its token count, exact in f32; its square is
-    # exact up to 4096 and otherwise within f32 rounding.
+    # Exact in f32: a step's count, and its square up to 4096.
     per_step = (hit & valid[:, None, None]).sum(dim=(0, 1), dtype=torch.float32)
     meta = torch.cat(
         [
@@ -328,16 +253,13 @@ def _first_seq(directory: str, rank: int) -> int:
         for path in glob.glob(os.path.join(directory, f"counts_ep{rank}_*.npz"))
         if (m := re.search(rf"counts_ep{rank}_(\d+)\.npz$", path))
     ]
-    if not seqs:
-        return 0
-    logger.warning(
-        "Expert count tap: %s already holds snapshots of EP rank %d from an "
-        "earlier run; numbering this run's after them. Their step count "
-        "starts over, which tells the runs apart.",
-        directory,
-        rank,
-    )
-    return max(seqs) + 1
+    if seqs:
+        logger.warning(
+            "Expert count tap: numbering after EP rank %d's earlier snapshots in %s",
+            rank,
+            directory,
+        )
+    return max(seqs) + 1 if seqs else 0
 
 
 def maybe_dump() -> None:
@@ -355,12 +277,11 @@ def maybe_dump() -> None:
         buffer.zero_()
     for counts, (_, _, order, _) in zip(interval, _TAPPED, strict=True):
         if order is not None:
-            # A placed layer counts by slot; slot s holds expert order[s].
-            # Row 2 is not per expert.
+            # Slot s holds expert order[s]; row 2 is not per expert.
             counts[:2, list(order)] = counts[:2].copy()
     total = _STATE["total"]
     _STATE["total"] = interval if total is None else total + interval
-    directory = _directory()
+    directory = envs.TPU_MOE_EXPERT_COUNT_TAP_DIR
     os.makedirs(directory, exist_ok=True)
     rank = _STATE["rank"]
     if _STATE["seq"] is None:

@@ -182,8 +182,7 @@ class VllmMoERunner(MoERunner):
         return super()._maybe_combine(shared_output, hidden_states)
 
     def _rows_gathered(self) -> tuple[bool, bool]:
-        """Whether `_maybe_dispatch` gathered this layer's rows over DP, and
-        whether over PCP, before the quant method sees them."""
+        """Whether `_maybe_dispatch` gathered the rows over DP, and over PCP."""
         if self._fused_ep_owns_pcp_collectives():
             return False, False
         over_pcp = (
@@ -200,8 +199,7 @@ class VllmMoERunner(MoERunner):
         input_ids: torch.Tensor | None = None,
         shared_experts_overlapping: bool = False,
     ):
-        # Here the rows, logits and ids line up as the experts get them,
-        # whatever the kernel, so the count tap sees every MoE layer alike.
+        # Every MoE layer passes here, whatever its kernel.
         if expert_count_tap.is_tapped(self.routed_experts):
             over_dp, over_pcp = self._rows_gathered()
             expert_count_tap.record(

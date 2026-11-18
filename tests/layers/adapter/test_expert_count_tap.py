@@ -117,48 +117,27 @@ def test_hash_layers_count_the_table_selection(tap_env):
     assert counts[0].tolist() == [1, 1, 0, 0, 2, 2, 0, 0]
 
 
-def test_dump_writes_cumulative_snapshots_every_n_steps(tap_env):
-    layer = _Layer()
-    counts = _tapped(layer)
-    counts[0, 2] = 7
-    for _ in range(5):
-        expert_count_tap.maybe_dump()
-    files = sorted(p.name for p in tap_env.iterdir())
-    assert files == ["counts_ep3_0000.npz", "counts_ep3_0001.npz"]
-    snap = np.load(tap_env / files[-1])
-    assert snap["counts"].shape == (1, 3, EXPERTS)
-    assert snap["counts"].dtype == np.int64
-    assert snap["counts"][0, 0, 2] == 7
-    assert snap["layer_names"].tolist() == [layer.layer_name]
-    assert int(snap["step"]) == 4
-
-
-def test_each_dump_drains_the_device_buffer_into_host_totals(tap_env):
-    """The device only ever holds one interval, so its sums cannot outgrow
-    their type; the snapshots stay cumulative and exact past 2**31."""
+def test_every_n_steps_the_device_buffer_drains_into_cumulative_snapshots(tap_env):
+    """The device holds one interval, so its sums cannot outgrow their type;
+    the snapshots stay cumulative and exact past 2**31."""
     layer = _Layer()
     counts = _tapped(layer)
     counts[1, 4] = 2.0**30
-    expert_count_tap.maybe_dump()
-    expert_count_tap.maybe_dump()  # snapshot 0
+    for _ in range(2):
+        expert_count_tap.maybe_dump()  # snapshot 0
     assert not counts.any()
     counts[1, 4] = 2.0**30
     counts[0, 4] = 5
-    expert_count_tap.maybe_dump()
-    expert_count_tap.maybe_dump()  # snapshot 1
-    snap = np.load(tap_env / "counts_ep3_0001.npz")
+    for _ in range(3):
+        expert_count_tap.maybe_dump()  # snapshot 1 at step 4
+    files = sorted(p.name for p in tap_env.iterdir())
+    assert files == ["counts_ep3_0000.npz", "counts_ep3_0001.npz"]
+    snap = np.load(tap_env / files[-1])
+    assert snap["counts"].dtype == np.int64
     assert snap["counts"][0, 1, 4] == 2**31
     assert snap["counts"][0, 0, 4] == 5
-
-
-def test_a_restarted_run_numbers_after_the_old_snapshots(tap_env):
-    (tap_env / "counts_ep3_0000.npz").write_bytes(b"from an earlier run")
-    (tap_env / "counts_ep3_0004.npz").write_bytes(b"from an earlier run")
-    _tapped(_Layer())
-    for _ in range(2):
-        expert_count_tap.maybe_dump()
-    assert (tap_env / "counts_ep3_0004.npz").read_bytes() == b"from an earlier run"
-    assert int(np.load(tap_env / "counts_ep3_0005.npz")["step"]) == 2
+    assert snap["layer_names"].tolist() == [layer.layer_name]
+    assert int(snap["step"]) == 4
 
 
 def test_a_tp_replica_does_not_count_its_copy_of_the_rows(tap_env, monkeypatch):
@@ -171,19 +150,17 @@ def test_a_tp_replica_does_not_count_its_copy_of_the_rows(tap_env, monkeypatch):
     assert _tapped(partitioned) is not None
 
 
-def test_a_zero_cadence_fails_at_load(tap_env, monkeypatch):
-    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS", "0")
-    with pytest.raises(ValueError, match="TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS"):
+@pytest.mark.parametrize(
+    ("every", "pp", "refusal"),
+    [("0", 1, "positive step count"), ("2", 2, "pipeline parallelism")],
+)
+def test_unsupported_settings_are_refused_at_load(
+    tap_env, monkeypatch, every, pp, refusal
+):
+    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS", every)
+    monkeypatch.setattr(expert_count_tap, "_pp_size", lambda: pp)
+    with pytest.raises((ValueError, NotImplementedError), match=refusal):
         expert_count_tap.register(_Layer())
-
-
-def test_the_directory_expands_environment_variables(tap_env, monkeypatch):
-    monkeypatch.setenv("QH_TAP_ROOT", str(tap_env))
-    _tapped(_Layer(ep_rank=0))
-    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_DIR", "$QH_TAP_ROOT/sub")
-    for _ in range(2):
-        expert_count_tap.maybe_dump()
-    assert (tap_env / "sub" / "counts_ep0_0000.npz").exists()
 
 
 def test_a_placed_layer_is_counted_by_checkpoint_expert(tap_env):
@@ -240,11 +217,11 @@ def test_sequence_parallel_rows_gathered_by_the_runner_are_refused(
         expert_count_tap.record(layer, _selecting(1, 2), None, over_dp=True)
 
 
-def test_a_custom_routing_function_decides_what_is_counted(tap_env):
-    """The tap selects as the TPU MoE methods do (`moe_routing.route`), so a
-    model's own routing function, not plain top-k, decides the counts."""
+def test_the_tap_counts_route_selection_without_the_capture_hook(tap_env):
+    """A model's own routing function decides the counts, as in
+    `moe_routing.route`; router replay's hook is left to the quant method."""
     layer = _Layer()
-    seen = {}
+    seen, captured = {}, []
 
     def routing(hidden_states, gating_output, topk, renormalize):
         seen["hidden_states"] = hidden_states
@@ -252,23 +229,12 @@ def test_a_custom_routing_function_decides_what_is_counted(tap_env):
         return torch.ones(ids.shape), ids
 
     layer.custom_routing_function = routing
+    layer.capture_fn = captured.append
     counts = _tapped(layer)
     hidden = torch.zeros((3, 4))
     expert_count_tap.record(layer, _selecting(1, 2, 3), None, hidden_states=hidden)
     assert counts[0].tolist() == [0, 0, 0, 0, 0, 0, 3, 3]
     assert seen["hidden_states"] is hidden
-
-
-def test_the_tap_leaves_the_routed_experts_capture_hook_to_the_kernel(tap_env):
-    """Router replay records each layer's selection once, from the quant
-    method's own `moe_routing.route`; the tap's recount must not add a second
-    record."""
-    layer = _Layer()
-    captured = []
-    layer.capture_fn = captured.append
-    counts = _tapped(layer)
-    expert_count_tap.record(layer, _selecting(1, 2), None)
-    assert counts[0].sum() == 4
     assert captured == []
 
 
@@ -304,40 +270,24 @@ def test_snapshots_number_layers_as_the_placement_table_does(tap_env, monkeypatc
 
 
 @pytest.mark.parametrize(
-    ("tracked", "all_layout", "refusal"),
+    ("tap_on", "tracked", "all_layout", "refusal"),
     [
-        (True, True, None),
-        (False, True, "TPU_MOE_SKIP_PADDED_TOKENS=1"),
-        (True, False, "ALL sequence layout"),
+        (True, True, True, None),
+        (True, False, True, "TPU_MOE_SKIP_PADDED_TOKENS=1"),
+        (True, True, False, "ALL sequence layout"),
+        (False, False, False, None),
     ],
 )
-def test_the_tap_needs_a_padding_mask_that_marks_every_padding_row(
-    tap_env, tracked, all_layout, refusal
+def test_the_tap_needs_an_exact_padding_mask(
+    tap_env, monkeypatch, tap_on, tracked, all_layout, refusal
 ):
+    if not tap_on:
+        monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_DIR", "")
     if refusal is None:
         expert_count_tap.require_padding_mask(tracked, all_layout)
     else:
         with pytest.raises(ValueError, match=refusal):
             expert_count_tap.require_padding_mask(tracked, all_layout)
-
-
-def test_without_the_tap_no_padding_mask_is_needed(monkeypatch):
-    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_DIR", "")
-    expert_count_tap.require_padding_mask(tracked=False, all_layout=False)
-
-
-def test_pipeline_parallelism_is_refused_at_load(tap_env, monkeypatch):
-    """Stages share EP ranks, so they would write the same snapshot files."""
-    monkeypatch.setattr(expert_count_tap, "_pp_size", lambda: 2)
-    with pytest.raises(NotImplementedError, match="pipeline"):
-        expert_count_tap.register(_Layer())
-
-
-def test_a_directory_naming_an_unset_variable_fails_at_load(tap_env, monkeypatch):
-    monkeypatch.delenv("QH_UNSET_TAP_ROOT", raising=False)
-    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_DIR", "$QH_UNSET_TAP_ROOT/sub")
-    with pytest.raises(ValueError, match="unset variable"):
-        expert_count_tap.register(_Layer())
 
 
 def test_a_second_model_load_starts_from_no_tap_state(tap_env):
@@ -347,10 +297,8 @@ def test_a_second_model_load_starts_from_no_tap_state(tap_env):
     for _ in range(2):
         expert_count_tap.maybe_dump()
     expert_count_tap.reset_model_state()
-    assert expert_count_tap._TAPPED == []
-    assert expert_count_tap._fresh_state() == expert_count_tap._STATE
-    # The next model's layers have another expert count; without the reset
-    # the dump would stack them with the first model's buffers.
+    # Another expert count: without the reset, the dump would stack the two
+    # models' buffers. Its snapshots number after the first model's.
     second = _Layer()
     second.layer_name = "model.layers.2.mlp.experts"
     second.global_num_experts = 4

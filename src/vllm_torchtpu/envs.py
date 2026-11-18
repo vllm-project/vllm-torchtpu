@@ -896,10 +896,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
-    # Directory the per-layer routed-expert counts are written to
-    # (layers/adapter/expert_count_tap.py). A diagnostic: every MoE forward
-    # recounts its routing. Needs TPU_MOE_SKIP_PADDED_TOKENS=1, so padding rows
-    # are told apart. Empty disables the tap and leaves the program unchanged.
+    # Directory for routed-expert count snapshots (expert_count_tap.py); needs
+    # TPU_MOE_SKIP_PADDED_TOKENS=1. Empty disables the tap.
     "TPU_MOE_EXPERT_COUNT_TAP_DIR": env_str("TPU_MOE_EXPERT_COUNT_TAP_DIR", ""),
     # Runner steps between the tap's snapshots; <= 0 is refused at load.
     "TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS": env_int(

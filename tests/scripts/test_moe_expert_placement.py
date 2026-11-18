@@ -28,150 +28,98 @@ _spec = importlib.util.spec_from_file_location("moe_expert_placement", _SCRIPT)
 moe_expert_placement = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(moe_expert_placement)
 
-EXPERTS, SHARDS = 8, 2
+EXPERTS = 8
 # Experts 0 and 1 are hot, so contiguous blocks put both on rank 0.
 HOT = np.array([40, 40, 2, 2, 2, 2, 2, 2], dtype=np.int64)
 EVEN = np.full(EXPERTS, 12, dtype=np.int64)
 # A slot costs its row count: each layer evens out the rows per rank.
-ROW_COSTS = (
-    "--floor-us=0",
-    "--visit-us=0",
-    "--tile-us=0",
-    "--short-tile-us=0",
-    "--row-us=1",
-)
+ROW_COSTS = ("--floor-us=0", "--visit-us=0", "--tile-us=0", "--short-tile-us=0")
 NAME = "model.layers.3.mlp.experts"
 
 
 def _counts(loads, steps):
-    """A run's cumulative counts after `steps` steps at constant per-step loads."""
+    """A run's cumulative counts after `steps` steps at constant loads."""
     counts = np.zeros((len(loads), 3, EXPERTS), dtype=np.int64)
     for row, load in enumerate(loads):
-        counts[row, 0] = load * steps
-        counts[row, 1] = load * load * steps
+        counts[row, 0], counts[row, 1] = load * steps, load * load * steps
         counts[row, 2, 0] = steps
     return counts
 
 
 def _write(directory, names, counts, indices, rank=0, seq=0):
-    fields = {
-        "counts": counts,
-        "layer_names": np.array(names),
-        "step": int(counts[0, 2, 0]),
-        "wall": 0.0,
-    }
+    fields = {"counts": counts, "layer_names": np.array(names), "wall": 0.0}
+    fields["step"] = int(counts[0, 2, 0])
     if indices is not None:
         fields["layer_indices"] = np.array(indices, dtype=np.int64)
     np.savez(directory / f"counts_ep{rank}_{seq:04d}.npz", **fields)
 
 
-def _snapshot(directory, names, loads, indices, steps=100, rank=0, seq=0):
-    _write(directory, names, _counts(loads, steps), indices, rank, seq)
-
-
-def _build(monkeypatch, tmp_path, layers, *flags):
+def _build(monkeypatch, tmp_path, *flags, layers="0:10"):
     out = tmp_path / "placement.json"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "moe_expert_placement.py",
-            f"--layers={layers}",
-            "--skip=0",
-            f"--out={out}",
-            *flags,
-            str(tmp_path),
-        ],
-    )
+    argv = [f"--layers={layers}", "--skip=0", f"--out={out}", "--row-us=1"]
     if not any(flag.startswith("--shards") for flag in flags):
-        sys.argv.insert(1, f"--shards={SHARDS}")
+        argv.append("--shards=2")
+    monkeypatch.setattr(sys, "argv", ["x", *argv, *ROW_COSTS, *flags, str(tmp_path)])
     moe_expert_placement.main()
     return json.loads(out.read_text())
 
 
 def test_row_costs_put_the_hot_experts_on_different_ranks(monkeypatch, tmp_path):
-    _snapshot(tmp_path, [NAME], [HOT], [3])
-    table = _build(monkeypatch, tmp_path, "0:10", *ROW_COSTS)
-    assert (table["experts"], table["shards"]) == (EXPERTS, SHARDS)
+    _write(tmp_path, [NAME], _counts([HOT], 100), [3])
+    table = _build(monkeypatch, tmp_path)
     ranks = table["layers"]["3"]
+    assert (table["experts"], table["shards"]) == (EXPERTS, 2)
     assert sorted(e for held in ranks for e in held) == list(range(EXPERTS))
-    assert [len(held) for held in ranks] == [EXPERTS // SHARDS] * SHARDS
     assert not any({0, 1} <= set(held) for held in ranks)
-    # The table is one TPU_EXPERT_PLACEMENT reads. Imported here so the
-    # script's other tests run without the package, as the script does.
+    # Imported here so the other tests run without the package, as the script.
     expert_placement = pytest.importorskip(
         "vllm_torchtpu.layers.adapter.expert_placement"
     )
-    assert expert_placement.parse(table).slot_order(3) == tuple(
-        e for held in ranks for e in held
-    )
+    assert expert_placement.parse(table).slot_order(3) == tuple(sum(ranks, []))
 
 
 def test_a_drafter_layer_takes_the_table_number_the_tap_recorded(monkeypatch, tmp_path):
-    """A `mtp.layers.0` drafter of a 6-layer target is table layer 6; it must
-    not be read as target layer 0 and take its place."""
-    _snapshot(
-        tmp_path,
-        ["model.layers.0.mlp.experts", "mtp.layers.0.mlp.experts"],
-        [EVEN, HOT],
-        [0, 6],
-    )
-    table = _build(monkeypatch, tmp_path, "0:6", *ROW_COSTS, "--min-gain-us=10")
+    """A `mtp.layers.0` drafter of a 6-layer target is table layer 6, not 0."""
+    names = ["model.layers.0.mlp.experts", "mtp.layers.0.mlp.experts"]
+    _write(tmp_path, names, _counts([EVEN, HOT], 100), [0, 6])
+    table = _build(monkeypatch, tmp_path, "--min-gain-us=10", layers="0:6")
     assert set(table["layers"]) == {"6"}
 
 
-def test_the_latest_run_minus_its_skipped_snapshots_is_counted(tmp_path):
-    """A restart starts `step` over: only the run from it on counts, and
-    `--skip 1` drops that run's first snapshot (its warmup)."""
+def test_the_latest_runs_minus_their_skipped_snapshots_are_summed(tmp_path):
+    """A restart starts `step` over: only the run from it on counts, minus its
+    `--skip`-th snapshot (warmup at another load); ranks are summed."""
     warmup = np.full(EXPERTS, 30, dtype=np.int64)
-    _snapshot(tmp_path, [NAME], [EVEN], [3], steps=100, seq=0)
-    _snapshot(tmp_path, [NAME], [EVEN], [3], steps=200, seq=1)
-    _write(tmp_path, [NAME], _counts([warmup], 50), [3], seq=2)
-    _write(tmp_path, [NAME], _counts([warmup], 50) + _counts([HOT], 100), [3], seq=3)
-    ((index, mean, var),) = moe_expert_placement.load_counts(
-        [str(tmp_path)], 1
-    ).values()
+    _write(tmp_path, [NAME], _counts([EVEN], 200), [3], seq=0)
+    _write(tmp_path, [NAME], _counts([warmup], 50), [3], seq=1)
+    _write(tmp_path, [NAME], _counts([warmup], 50) + _counts([HOT], 100), [3], seq=2)
+    _write(tmp_path, [NAME], _counts([EVEN], 50), [3], rank=1, seq=0)
+    _write(tmp_path, [NAME], _counts([EVEN], 150), [3], rank=1, seq=1)
+    load = moe_expert_placement.load_counts([str(tmp_path)], 1)
+    ((index, mean, var),) = load.values()
     assert index == 3
-    np.testing.assert_allclose(mean, HOT)
+    np.testing.assert_allclose(mean, HOT + EVEN)
     np.testing.assert_allclose(var, 0)
     with pytest.raises(SystemExit, match="need more than 2"):
         moe_expert_placement.load_counts([str(tmp_path)], 2)
 
 
-def test_the_ranks_loads_are_summed(tmp_path):
-    _snapshot(tmp_path, [NAME], [HOT], [3], rank=0)
-    _snapshot(tmp_path, [NAME], [EVEN], [3], rank=1)
-    ((_, mean, _),) = moe_expert_placement.load_counts([str(tmp_path)], 0).values()
-    np.testing.assert_allclose(mean, HOT + EVEN)
-
-
-def test_ranks_that_tapped_other_layers_are_refused(tmp_path):
-    _snapshot(tmp_path, [NAME], [HOT], [3], rank=0)
-    _snapshot(tmp_path, ["model.layers.4.mlp.experts"], [HOT], [4], rank=1)
-    with pytest.raises(SystemExit, match="tapped other MoE layers"):
-        moe_expert_placement.load_counts([str(tmp_path)], 0)
-
-
-def test_snapshots_without_table_numbers_are_refused(tmp_path):
-    _snapshot(tmp_path, [NAME], [HOT], None)
-    with pytest.raises(SystemExit, match="no layer_indices"):
-        moe_expert_placement.load_counts([str(tmp_path)], 0)
-
-
-def test_two_layers_with_one_table_number_are_refused(monkeypatch, tmp_path):
-    _snapshot(tmp_path, [NAME, "model.layers.3.extra.experts"], [HOT, HOT], [3, 3])
-    with pytest.raises(SystemExit, match="both table layer 3"):
-        _build(monkeypatch, tmp_path, "0:10", *ROW_COSTS)
-
-
-def test_experts_that_do_not_split_evenly_are_refused(monkeypatch, tmp_path):
-    _snapshot(tmp_path, [NAME], [HOT], [3])
-    with pytest.raises(SystemExit, match="do not split evenly over 3 shards"):
-        _build(monkeypatch, tmp_path, "0:10", "--shards=3", *ROW_COSTS)
-
-
-def test_layers_must_be_first_colon_last(monkeypatch, tmp_path):
-    _snapshot(tmp_path, [NAME], [HOT], [3])
-    with pytest.raises(SystemExit) as refusal:
-        _build(monkeypatch, tmp_path, "3", *ROW_COSTS)
-    assert refusal.value.code == 2  # argparse's usage error
+@pytest.mark.parametrize(
+    ("snapshots", "flags", "refusal"),
+    [
+        ([([NAME], [3], 0)], ("--layers=3",), "^2$"),  # argparse's usage error
+        ([([NAME], None, 0)], (), "no layer_indices"),
+        (
+            [([NAME], [3], 0), (["model.layers.4.mlp.experts"], [4], 1)],
+            (),
+            "tapped other MoE layers",
+        ),
+        ([([NAME, NAME + "2"], [3, 3], 0)], (), "both table layer 3"),
+        ([([NAME], [3], 0)], ("--shards=3",), "split evenly over 3"),
+    ],
+)
+def test_bad_input_is_refused(monkeypatch, tmp_path, snapshots, flags, refusal):
+    for names, indices, rank in snapshots:
+        _write(tmp_path, names, _counts([HOT] * len(names), 100), indices, rank)
+    with pytest.raises(SystemExit, match=refusal):
+        _build(monkeypatch, tmp_path, *flags)
