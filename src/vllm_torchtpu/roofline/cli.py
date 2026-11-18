@@ -1333,6 +1333,29 @@ def _resolve_solve_dtypes(
     )
 
 
+def _parse_pd_ratio(
+    raw_pd: str,
+    parser: argparse.ArgumentParser,
+) -> tuple[int, int]:
+    """Parse --pd PREFILL:DECODE ratio as two positive integers or exit with usage."""
+    usage_msg = (
+        "--pd must be PREFILL:DECODE with two positive integers "
+        f"(for example, 1:2), got {raw_pd!r}"
+    )
+    prefill_instances = 0
+    decode_instances = 0
+    prefill_part, separator, decode_part = raw_pd.partition(":")
+    if separator and ":" not in decode_part:
+        try:
+            prefill_instances = int(prefill_part)
+            decode_instances = int(decode_part)
+        except ValueError:
+            prefill_instances = 0
+    if prefill_instances < 1 or decode_instances < 1:
+        parser.error(usage_msg)
+    return (prefill_instances, decode_instances)
+
+
 def _parse_cli_reference_layout(
     reference_layout: str | None,
     parser: argparse.ArgumentParser,
@@ -1404,10 +1427,7 @@ def _dispatch_solve_family(
     src, cfg, geom, chip = model_ctx
     serve_parsed, _ = parsed
     scen, eff_gmu, cmd_max_model_len = _build_cli_scenario(args, parser, parsed)
-    pd_ratio = None
-    if args.pd:
-        parts = args.pd.split(":")
-        pd_ratio = (int(parts[0]), int(parts[1]))
+    pd_ratio = _parse_pd_ratio(args.pd, parser) if args.pd else None
 
     eff_max_chips = args.max_chips
     if eff_max_chips is None and serve_parsed:
@@ -1477,9 +1497,6 @@ def _build_plan_par_dtypes(
     cfg: dict[str, object] | None = None,
 ) -> tuple[Parallel, Dtypes, float]:
     """Build Parallel, Dtypes, and latency override from plan/explain flags."""
-    if args.tp is None or args.tp <= 0:
-        msg = f"--tp must be >= 1, got {args.tp}"
-        raise ValueError(msg)
     par = Parallel(
         tp=args.tp,
         kv_split=args.kv_split,
@@ -1662,6 +1679,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("the following arguments are required: cmd")
     if args.cmd in ("plan", "explain") and args.tp is None:
         parser.error("the following arguments are required: --tp")
+    if args.cmd in ("plan", "explain") and args.tp <= 0:
+        parser.error(f"--tp must be a positive integer (>= 1), got {args.tp}")
     is_solve_cmd = args.cmd in ("solve", "emit", "ceiling")
     serve_parsed = (
         _parse_serve_cmd(args.from_serve_cmd)

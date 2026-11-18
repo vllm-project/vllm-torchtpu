@@ -33,6 +33,9 @@ from .constants import (
     MIN_TOP_LAYOUTS_FOR_FASTEST,
     NO_FEASIBLE_LAYOUT_WARNING,
     PERCENT_SCALE,
+    SLO_VERDICT_ESTIMATE_MEETS,
+    SLO_VERDICT_RANK,
+    SLO_VERDICT_RULED_OUT,
     SOLVE_SCHEMA,
     TOPOLOGY_AXES,
 )
@@ -439,10 +442,16 @@ def _select_diverse_top_layouts(
 
 
 def _filter_eligible(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
-    """Return SLO-met points, preferring `estimate_meets` when any exist."""
-    slo_pts = [pt for pt in points if pt.slo_met]
-    est_pts = [pt for pt in slo_pts if pt.slo_verdict == "estimate_meets"]
-    return est_pts if est_pts else slo_pts
+    """Return points not ruled out by SLO bounds, preferring `estimate_meets`."""
+    eligible_points = [
+        point for point in points if point.slo_verdict != SLO_VERDICT_RULED_OUT
+    ]
+    estimate_meets_points = [
+        point
+        for point in eligible_points
+        if point.slo_verdict == SLO_VERDICT_ESTIMATE_MEETS
+    ]
+    return estimate_meets_points if estimate_meets_points else eligible_points
 
 
 def _best_by_struct_key(
@@ -755,7 +764,10 @@ def emit_launch_args(
     )
     warnings = list(plan.warnings)
     recommended_point = plan.recommended
-    if recommended_point is None or not recommended_point.slo_met:
+    if (
+        recommended_point is None
+        or recommended_point.slo_verdict == SLO_VERDICT_RULED_OUT
+    ):
         if not warnings:
             warnings.append(NO_FEASIBLE_LAYOUT_WARNING)
         return {
@@ -810,7 +822,10 @@ def _compute_single_host_fit(plan: ServingPlan) -> dict[str, object]:
     if four_chip_points:
         best_pt = max(
             four_chip_points,
-            key=lambda p: (p.slo_met, p.token_throughput_per_chip),
+            key=lambda point: (
+                SLO_VERDICT_RANK[point.slo_verdict],
+                point.token_throughput_per_chip,
+            ),
         )
         pool = best_pt.decode_pool
         return {
@@ -1212,5 +1227,5 @@ def emit_ceiling_rows(plan: ServingPlan) -> list[CeilingRow]:
             "binding_unit": pt.binding,
         }
         for pt in plan.frontier
-        if pt.slo_met
+        if pt.slo_verdict != SLO_VERDICT_RULED_OUT
     ]

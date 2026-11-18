@@ -30,6 +30,7 @@ from .constants import (
     MAX_SVG_BG_POINTS,
     MIN_FRONTIER_POINTS_FOR_POLYLINE,
     PREFIX_RANGE_PAIR_LEN,
+    SLO_VERDICT_RULED_OUT,
     SVG_GRID_CELL_PX,
     UNIT_GIGA,
     UNIT_MEGA,
@@ -587,7 +588,7 @@ def _extract_recommended_view(
     rec: Mapping[str, object] | None,
 ) -> tuple[dict[str, object], list[Mapping[str, object]], str]:
     """Extract display metrics, instance pools, and summary for recommended."""
-    if rec is not None and bool(rec.get("slo_met", True)):
+    if rec is not None and rec.get("slo_verdict") != SLO_VERDICT_RULED_OUT:
         pools_list: list[Mapping[str, object]] = []
         p_pool = _as_mapping(rec.get("prefill_pool"))
         d_pool = _as_mapping(rec.get("decode_pool"))
@@ -1011,7 +1012,11 @@ def render_html(payload: Mapping[str, object]) -> str:  # noqa: PLR0915
         "</", "<\\/"
     )
 
-    if rec is not None and not bool(rec.get("slo_met", True)) and not warnings:
+    if (
+        rec is not None
+        and rec.get("slo_verdict") == SLO_VERDICT_RULED_OUT
+        and not warnings
+    ):
         warnings = [
             "No candidate layout met latency SLOs; recommended layout is infeasible.",
         ]
@@ -1027,6 +1032,7 @@ def render_html(payload: Mapping[str, object]) -> str:  # noqa: PLR0915
 
     enum_cnt = _as_int(search.get("enumerated"))
     hbm_cnt = _as_int(search.get("hbm_fit"))
+    not_ruled_out_count = _as_int(search.get("not_ruled_out"))
     slo_cnt = _as_int(search.get("slo_met"))
     front_cnt = _as_int(search.get("frontier"))
 
@@ -1209,8 +1215,10 @@ def render_html(payload: Mapping[str, object]) -> str:  # noqa: PLR0915
         "      </div>",
         '      <div class="funnel-arrow">&rarr;</div>',
         '      <div class="funnel-step">',
-        '        <div class="stat-label">SLO Met</div>',
-        f'        <div class="stat-value">{slo_cnt}</div>',
+        '        <div class="stat-label">Not Ruled Out</div>',
+        f'        <div class="stat-value">{not_ruled_out_count}</div>',
+        '        <div class="stat-label" style="margin-top:4px;">'
+        f"{slo_cnt} SLO Met</div>",
         "      </div>",
         '      <div class="funnel-arrow">&rarr;</div>',
         '      <div class="funnel-step" style="border-color:var(--primary); '

@@ -63,6 +63,10 @@ QWEN35_CFG: dict[str, object] = {
 }
 
 
+# argparse.ArgumentParser.error exits with status code 2.
+_ARGPARSE_USAGE_EXIT_CODE: int = 2
+
+
 def _iter_subcommand_options(
     parser: argparse.ArgumentParser,
 ) -> list[tuple[str, tuple[str, ...], str | None]]:
@@ -153,12 +157,18 @@ def test_cli_explain_spec_window_includes_draft_modules(
     assert "draft_fc" in names
 
 
-def test_cli_rejects_non_positive_tp(tmp_path: Path) -> None:
-    """Verify explain command rejects non-positive tensor parallel values."""
+def test_cli_rejects_non_positive_tp(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify explain command exits with usage error on non-positive --tp."""
     cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(json.dumps(QWEN35_CFG))
-    with pytest.raises(ValueError, match="--tp must be >= 1"):
+    cfg_path.write_text(json.dumps(QWEN35_CFG), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc_info:
         cli.main(["explain", "--config", str(cfg_path), "--tp", "0"])
+    assert exc_info.value.code == _ARGPARSE_USAGE_EXIT_CODE
+    stderr_text = capsys.readouterr().err
+    assert "--tp" in stderr_text
+    assert ">= 1" in stderr_text
 
 
 def test_cli_plan_axes_flags(
@@ -1374,3 +1384,79 @@ def test_example_scenario_with_other_draft_count_assumes_all_drafts_accepted(
     expected_accept_len_c = 3.0
     assert payload_c["scenario"]["accept_len"] == expected_accept_len_c
     assert not any("acceptance length" in w.lower() for w in payload_c["warnings"])
+
+
+def test_pd_with_one_part_exits_with_a_usage_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reject --pd without exactly two colon-separated parts via parser.error."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(QWEN35_CFG), encoding="utf-8")
+    for raw_pd in ("1", "1:2:3"):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(
+                [
+                    "solve",
+                    "--config",
+                    str(config_path),
+                    "--mode",
+                    "disagg",
+                    "--prefill-topology",
+                    "2x2x1",
+                    "--decode-topology",
+                    "2x2x1",
+                    "--pd",
+                    raw_pd,
+                    "--example-scenario",
+                    "chat-8k1k",
+                ]
+            )
+        assert exc_info.value.code == _ARGPARSE_USAGE_EXIT_CODE
+        stderr_text = capsys.readouterr().err
+        assert "--pd" in stderr_text
+        assert "PREFILL:DECODE" in stderr_text
+
+
+def test_pd_with_non_integer_parts_exits_with_a_usage_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reject non-positive or non-integer --pd parts via parser.error."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(QWEN35_CFG), encoding="utf-8")
+    for raw_pd in ("a:b", "0:1"):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(
+                [
+                    "solve",
+                    "--config",
+                    str(config_path),
+                    "--mode",
+                    "disagg",
+                    "--prefill-topology",
+                    "2x2x1",
+                    "--decode-topology",
+                    "2x2x1",
+                    "--pd",
+                    raw_pd,
+                    "--example-scenario",
+                    "chat-8k1k",
+                ]
+            )
+        assert exc_info.value.code == _ARGPARSE_USAGE_EXIT_CODE
+        stderr_text = capsys.readouterr().err
+        assert "--pd" in stderr_text
+        assert "PREFILL:DECODE" in stderr_text
+
+
+def test_plan_with_zero_tp_exits_with_a_usage_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reject plan --tp 0 via parser.error naming --tp and accepted range."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(QWEN35_CFG), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["plan", "--config", str(config_path), "--tp", "0"])
+    assert exc_info.value.code == _ARGPARSE_USAGE_EXIT_CODE
+    stderr_text = capsys.readouterr().err
+    assert "--tp" in stderr_text
+    assert ">= 1" in stderr_text

@@ -170,9 +170,10 @@ def test_report_slo_unmet_recommended_renders_warning_banner(
 
     payload: dict[str, object] = dict(sample_payload)
     assert sample_payload["recommended"] is not None
-    rec_unmet = dict(sample_payload["recommended"])
-    rec_unmet["slo_met"] = False
-    payload["recommended"] = rec_unmet
+    recommended_ruled_out = dict(sample_payload["recommended"])
+    recommended_ruled_out["slo_met"] = False
+    recommended_ruled_out["slo_verdict"] = "ruled_out"
+    payload["recommended"] = recommended_ruled_out
     payload["top_k"] = []
     payload["warnings"] = []
     html_unmet = render_html(payload)
@@ -378,3 +379,31 @@ def test_report_uses_explicit_concurrency_hit_rate_and_chip_headers(
     assert not re.search(r"<th[^>]*>\s*c\s*</th>", html, re.IGNORECASE)
     assert not re.search(r"<th[^>]*>\s*h\s*</th>", html, re.IGNORECASE)
     assert not re.search(r"\d+c / \d+h", html)
+
+
+def test_report_undecided_recommended_renders_funnel_counts(
+    sample_payload: SolvePayload,
+) -> None:
+    """Render undecided recommendation without infeasible banner and show counts."""
+    undecided_payload: dict[str, object] = dict(sample_payload)
+    assert sample_payload["recommended"] is not None
+    recommended_undecided = dict(sample_payload["recommended"])
+    recommended_undecided["slo_met"] = False
+    recommended_undecided["slo_verdict"] = "undecided"
+    undecided_search = dict(sample_payload["search"])
+    expected_not_ruled_out = 11
+    expected_slo_met = 3
+    undecided_search["not_ruled_out"] = expected_not_ruled_out
+    undecided_search["slo_met"] = expected_slo_met
+    undecided_payload["recommended"] = recommended_undecided
+    undecided_payload["search"] = undecided_search
+    undecided_payload["warnings"] = []
+    html_undecided = render_html(undecided_payload)
+    assert "INFEASIBLE" not in html_undecided
+    assert "recommended layout is infeasible" not in html_undecided
+    assert (
+        '        <div class="stat-label">Not Ruled Out</div>\n'
+        f'        <div class="stat-value">{expected_not_ruled_out}</div>\n'
+        '        <div class="stat-label" style="margin-top:4px;">'
+        f"{expected_slo_met} SLO Met</div>"
+    ) in html_undecided

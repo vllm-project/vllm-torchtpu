@@ -34,6 +34,7 @@ from .step import (
     SpecShape,
     StepFloor,
     combine_modules,
+    module_serial_s,
     spec_cycle_floor,
     step_floor,
 )
@@ -135,11 +136,7 @@ def scaled_ep_serial_s(
     mod_s = 0.0
     for m in step_floor_val.modules:
         scale_factor = ratio if m.name in ("moe", "draft_moe") else 1.0
-        hb_s = m.hbm_bytes / chip.hbm_bw
-        matmul_s = (m.fp8_flops * scale_factor) / chip.fp8_flops + (
-            m.bf16_flops * scale_factor
-        ) / chip.bf16_flops
-        mod_s += max(hb_s, matmul_s)
+        mod_s += module_serial_s(m, chip, matmul_scale=scale_factor)
     return mod_s + step_floor_val.chain_s
 
 

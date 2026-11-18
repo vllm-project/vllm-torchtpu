@@ -1188,7 +1188,11 @@ def test_search_stats_funnel_is_monotone(
     )
     assert splan.search is not None
     stats = splan.search
-    assert stats.enumerated >= stats.hbm_fit >= stats.slo_met >= stats.frontier >= 1
+    frontier_pool = stats.not_ruled_out if stats.not_ruled_out > 0 else stats.hbm_fit
+    assert (
+        stats.enumerated >= stats.hbm_fit >= stats.not_ruled_out >= stats.slo_met >= 0
+    )
+    assert frontier_pool >= stats.frontier >= 1
     assert stats.frontier == len(splan.frontier)
 
 
@@ -2689,3 +2693,220 @@ def test_pd_ratio_chip_count_matches_served_points() -> None:
     assert plan_4_3.budget == expected_chips_4_3
     assert plan_4_3.candidates
     assert all(pt.total_chips == expected_chips_4_3 for pt in plan_4_3.candidates)
+
+
+def _undecided_slo_scenario() -> TrafficScenario:
+    """Build 1024/8192 c=64 scenario where Qwen3.5 4-chip candidates are undecided."""
+    return TrafficScenario(
+        name="custom",
+        isl=1024,
+        osl=8192,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(64,),
+        kv_working_set_turns=1.0,
+        tpot_slo_ms=10.0,
+    )
+
+
+def _decode_layout_text(pool: PoolMeshPlan) -> str:
+    """Format decode pool parallelism using the keys format_parallelism reads."""
+    return rf.format_parallelism(
+        {
+            "tp": pool.tp,
+            "pp": pool.pp,
+            "dp": pool.dp,
+            "ep": pool.ep,
+            "pcp": pool.pcp,
+            "kv_split": pool.kv_split,
+        }
+    )
+
+
+def test_undecided_layout_is_not_counted_as_meeting_the_slo() -> None:
+    """Count undecided candidates under not_ruled_out and keep slo_met false."""
+    geometry = rf.from_hf_config(QWEN35_CFG)
+    dtypes = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0, act="a8")
+    chip = CHIPS["tpu7x"]
+    scenario = _undecided_slo_scenario()
+    serving_plan = solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert len(serving_plan.candidates) >= 1
+    assert all(
+        candidate.slo_verdict == "undecided" for candidate in serving_plan.candidates
+    )
+    assert all(not candidate.slo_met for candidate in serving_plan.candidates)
+    assert serving_plan.search is not None
+    assert serving_plan.search.slo_met == 0
+    assert serving_plan.search.not_ruled_out == len(serving_plan.candidates)
+    assert serving_plan.search.not_ruled_out >= serving_plan.search.frontier >= 1
+
+
+def test_single_host_fit_ranks_estimate_meets_above_faster_undecided() -> None:
+    """Rank estimate_meets above faster undecided and undecided above ruled_out."""
+    geometry = rf.from_hf_config(QWEN35_CFG)
+    dtypes = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0, act="a8")
+    chip = CHIPS["tpu7x"]
+    scenario = _undecided_slo_scenario()
+    serving_plan = solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    point_first = serving_plan.candidates[0]
+    expected_layout_text = _decode_layout_text(point_first.decode_pool)
+    point_other = next(
+        candidate
+        for candidate in serving_plan.candidates
+        if _decode_layout_text(candidate.decode_pool) != expected_layout_text
+    )
+    slower_meets = dc_replace(
+        point_first,
+        slo_verdict="estimate_meets",
+        slo_met=True,
+        token_throughput_per_chip=100.0,
+    )
+    # Keep slo_met=True so the old (slo_met, throughput) key picks faster_undecided.
+    faster_undecided = dc_replace(
+        point_other,
+        slo_verdict="undecided",
+        slo_met=True,
+        token_throughput_per_chip=900.0,
+    )
+    meets_vs_undecided_plan = dc_replace(
+        serving_plan,
+        frontier=(faster_undecided, slower_meets),
+        candidates=(faster_undecided, slower_meets),
+        recommended=slower_meets,
+    )
+    meets_payload = build_solve_payload(
+        meets_vs_undecided_plan, chip=chip, dtypes=dtypes
+    )
+    single_host_meets = meets_payload["single_host_fit"]
+    assert isinstance(single_host_meets, dict)
+    assert single_host_meets["best_parallelism"] == expected_layout_text
+
+    slower_undecided = dc_replace(
+        point_first,
+        slo_verdict="undecided",
+        slo_met=False,
+        token_throughput_per_chip=100.0,
+    )
+    faster_ruled_out = dc_replace(
+        point_other,
+        slo_verdict="ruled_out",
+        slo_met=False,
+        token_throughput_per_chip=900.0,
+    )
+    undecided_vs_ruled_out_plan = dc_replace(
+        serving_plan,
+        frontier=(faster_ruled_out, slower_undecided),
+        candidates=(faster_ruled_out, slower_undecided),
+        recommended=slower_undecided,
+    )
+    undecided_payload = build_solve_payload(
+        undecided_vs_ruled_out_plan, chip=chip, dtypes=dtypes
+    )
+    single_host_undecided = undecided_payload["single_host_fit"]
+    assert isinstance(single_host_undecided, dict)
+    assert single_host_undecided["best_parallelism"] == expected_layout_text
+
+
+def test_recommended_layout_whose_estimate_misses_the_slo_carries_a_warning() -> None:
+    """Append an undecided-SLO warning whenever the recommended layout is undecided."""
+    geometry = rf.from_hf_config(QWEN35_CFG)
+    quantized_dtypes = Dtypes(
+        w_dense=1.0,
+        w_expert=1.0,
+        kv=1.0,
+        act="a8",
+        w_dense_source="quantization_config",
+        w_expert_source="quantization_config",
+    )
+    chip = CHIPS["tpu7x"]
+    scenario = _undecided_slo_scenario()
+    serving_plan = solve_serving_plan(
+        geometry,
+        quantized_dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert serving_plan.recommended is not None
+    assert serving_plan.recommended.slo_verdict == "undecided"
+    assert not serving_plan.recommended.slo_met
+    assert serving_plan.warnings == (rf.constants.UNDECIDED_SLO_WARNING,)
+
+    # Also appended when another warning (missing quantization_config) already exists.
+    default_dtypes = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0, act="a8")
+    combined_plan = solve_serving_plan(
+        geometry,
+        default_dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    expected_combined_warnings = 2
+    assert combined_plan.recommended is not None
+    assert combined_plan.recommended.slo_verdict == "undecided"
+    assert len(combined_plan.warnings) == expected_combined_warnings
+    assert rf.constants.UNDECIDED_SLO_WARNING in combined_plan.warnings
+
+
+def test_ep_scaled_serial_time_includes_the_vector_term() -> None:
+    """Include per-module vector time when scaling serial step latency under EP."""
+    geometry = rf.from_hf_config(QWEN35_CFG)
+    # Throttle vector throughput so the vector term dominates HBM and matmul times.
+    vector_bound_chip = dc_replace(CHIPS["tpu7x"], vpu_flops=1.0e8)
+    parallel = rf.Parallel(
+        tp=1,
+        dp=8,
+        ep=8,
+        moe="ep",
+        moe_dispatch="ag_ep",
+        ranks_per_chip=vector_bound_chip.cores_per_chip,
+    )
+    base_floor = step_floor(
+        geometry,
+        vector_bound_chip,
+        parallel,
+        rf.StepShape(batch=1, rows_per_seq=1, context=1024),
+        rf.FloorOptions(
+            dt=Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0, act="a8"),
+            topology=rf.TOPOLOGIES["2x2x1"],
+        ),
+    )
+    global_tokens = 8
+    scaled_floor = scale_ep_moe_floor(
+        base_floor,
+        vector_bound_chip,
+        EpLoadSpec(geom=geometry, par=parallel, global_tokens=global_tokens),
+        topology=rf.TOPOLOGIES["2x2x1"],
+    )
+    scaled_serial = scaled_ep_serial_s(
+        base_floor,
+        vector_bound_chip,
+        geometry,
+        parallel,
+        global_tokens,
+    )
+    independent_vector_floor_s = (
+        sum(module.vpu_flops for module in base_floor.modules)
+        / vector_bound_chip.vpu_flops
+        + base_floor.chain_s
+    )
+    assert (
+        independent_vector_floor_s
+        > base_floor.hbm_s + base_floor.matmul_s + base_floor.chain_s
+    )
+    assert scaled_serial >= independent_vector_floor_s
+    assert scaled_serial >= base_floor.serial_estimate_s
+    assert scaled_serial == pytest.approx(scaled_floor.serial_estimate_s, rel=1e-12)

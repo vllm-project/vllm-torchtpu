@@ -34,9 +34,15 @@ from .constants import (
     MIN_MOE_INTERMEDIATE_ALIGNMENT,
     MIN_SLICE_CHIPS,
     NO_FEASIBLE_LAYOUT_WARNING,
+    SLO_VERDICT_ESTIMATE_MEETS,
+    SLO_VERDICT_RANK,
+    SLO_VERDICT_RULED_OUT,
+    SLO_VERDICT_UNDECIDED,
+    UNDECIDED_SLO_WARNING,
     UNIT_GIBI,
     UNIT_GIGA,
     UNIT_MILLIS_PER_SECOND,
+    SloVerdict,
 )
 from .crossover import (
     prune_sweep_candidates,
@@ -266,6 +272,7 @@ class SearchStats:
 
     enumerated: int
     hbm_fit: int
+    not_ruled_out: int
     slo_met: int
     frontier: int
 
@@ -316,7 +323,7 @@ class ParetoPoint:
     slo_met: bool
     bound_tpot_ms: float = 0.0
     bound_ttft_ms: float = 0.0
-    slo_verdict: Literal["ruled_out", "estimate_meets", "undecided"] = "estimate_meets"
+    slo_verdict: SloVerdict = SLO_VERDICT_ESTIMATE_MEETS
     decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
@@ -620,13 +627,6 @@ def _resolve_prefill_moe(
     return moe_mode, (tp if moe_mode == "ep" else 1)
 
 
-_VERDICT_RANK: dict[str, int] = {
-    "ruled_out": 0,
-    "undecided": 1,
-    "estimate_meets": 2,
-}
-
-
 def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
     """Filter points to non-dominated Pareto frontier sorted by concurrency."""
     if not points:
@@ -634,7 +634,7 @@ def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
     ordered = sorted(
         points,
         key=lambda x: (
-            -_VERDICT_RANK[x.slo_verdict],
+            -SLO_VERDICT_RANK[x.slo_verdict],
             x.concurrency,
             -x.output_throughput_per_chip,
             -x.est_interactivity_tok_s,
@@ -642,16 +642,16 @@ def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
     )
     frontier: list[ParetoPoint] = []
     for p in ordered:
-        p_rank = _VERDICT_RANK[p.slo_verdict]
+        p_rank = SLO_VERDICT_RANK[p.slo_verdict]
         # Dominance is transitive across verdict tier, concurrency, throughput,
         # and interactivity; ordered guarantees no later point dominates p.
         dominated = any(
-            _VERDICT_RANK[q.slo_verdict] >= p_rank
+            SLO_VERDICT_RANK[q.slo_verdict] >= p_rank
             and q.concurrency <= p.concurrency
             and q.output_throughput_per_chip >= p.output_throughput_per_chip
             and q.est_interactivity_tok_s >= p.est_interactivity_tok_s
             and (
-                _VERDICT_RANK[q.slo_verdict] > p_rank
+                SLO_VERDICT_RANK[q.slo_verdict] > p_rank
                 or q.concurrency < p.concurrency
                 or q.output_throughput_per_chip > p.output_throughput_per_chip
                 or q.est_interactivity_tok_s > p.est_interactivity_tok_s
@@ -949,17 +949,17 @@ def _resolve_slo_verdict(
     est_tpot_ms: float,
     bound_ttft_ms: float,
     bound_tpot_ms: float,
-) -> tuple[Literal["ruled_out", "estimate_meets", "undecided"], bool]:
+) -> SloVerdict:
     """Classify hard-bound vs modeled-estimate SLO feasibility verdict."""
     slo_ruled_out = (
         scen.ttft_slo_ms is not None and bound_ttft_ms > scen.ttft_slo_ms
     ) or (scen.tpot_slo_ms is not None and bound_tpot_ms > scen.tpot_slo_ms)
     if slo_ruled_out:
-        return ("ruled_out", False)
+        return SLO_VERDICT_RULED_OUT
     est_ok = (scen.ttft_slo_ms is None or est_ttft_ms <= scen.ttft_slo_ms) and (
         scen.tpot_slo_ms is None or est_tpot_ms <= scen.tpot_slo_ms
     )
-    return ("estimate_meets" if est_ok else "undecided", True)
+    return SLO_VERDICT_ESTIMATE_MEETS if est_ok else SLO_VERDICT_UNDECIDED
 
 
 def _eval_decode_floor(
@@ -1411,7 +1411,7 @@ def _evaluate_mixed_point(
     bound_tpot_ms = (
         solved.sf_dec.hard_floor_s * UNIT_MILLIS_PER_SECOND
     ) / eval_context.eff_al
-    verdict, slo_ok = _resolve_slo_verdict(
+    verdict = _resolve_slo_verdict(
         eval_context.scenario,
         solved.est_ttft_ms,
         solved.est_tpot_ms,
@@ -1455,7 +1455,7 @@ def _evaluate_mixed_point(
         token_throughput_per_chip=tot_tput,
         p_mixed=solved.p_mix,
         binding=binding,
-        slo_met=slo_ok,
+        slo_met=verdict == SLO_VERDICT_ESTIMATE_MEETS,
         bound_tpot_ms=bound_tpot_ms,
         bound_ttft_ms=bound_ttft_ms,
         slo_verdict=verdict,
@@ -1801,7 +1801,7 @@ def _evaluate_disagg_instance_pair(
         )
     )
     bound_tpot_ms = (sf_d.hard_floor_s * UNIT_MILLIS_PER_SECOND) / eval_context.eff_al
-    verdict, slo_ok = _resolve_slo_verdict(
+    verdict = _resolve_slo_verdict(
         eval_context.scenario, est_ttft_d_ms, est_tpot_ms, bound_ttft_ms, bound_tpot_ms
     )
 
@@ -1853,7 +1853,7 @@ def _evaluate_disagg_instance_pair(
         token_throughput_per_chip=tot_tput,
         p_mixed=0.0,
         binding=sf_d.binding,
-        slo_met=slo_ok,
+        slo_met=verdict == SLO_VERDICT_ESTIMATE_MEETS,
         bound_tpot_ms=bound_tpot_ms,
         bound_ttft_ms=bound_ttft_ms,
         slo_verdict=verdict,
@@ -2290,20 +2290,28 @@ def solve_serving_plan(  # noqa: C901, PLR0915
             f"single-request prefill floor {min_req_ttft_ms:.2f} ms",
         )
 
-    slo_candidates = [p for p in candidates if p.slo_met]
-    pool_for_frontier = slo_candidates if slo_candidates else candidates
+    not_ruled_out_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.slo_verdict != SLO_VERDICT_RULED_OUT
+    ]
+    pool_for_frontier = (
+        not_ruled_out_candidates if not_ruled_out_candidates else candidates
+    )
     if not candidates and not warnings:
         warnings.append(NO_FEASIBLE_LAYOUT_WARNING)
-    elif candidates and not slo_candidates and not warnings:
+    elif candidates and not not_ruled_out_candidates and not warnings:
         warnings.append("SLO_UNMET: no feasible topology met both TTFT and TPOT bounds")
 
     frontier = _pareto_filter(pool_for_frontier)
-    rec_pool = [p for p in frontier if p.slo_verdict == "estimate_meets"]
+    rec_pool = [p for p in frontier if p.slo_verdict == SLO_VERDICT_ESTIMATE_MEETS]
     if not rec_pool:
         rec_pool = list(frontier)
     recommended = (
         max(rec_pool, key=lambda p: p.token_throughput_per_chip) if rec_pool else None
     )
+    if recommended is not None and recommended.slo_verdict == SLO_VERDICT_UNDECIDED:
+        warnings.append(UNDECIDED_SLO_WARNING)
     pruned_sweep = prune_sweep_candidates(geom, dtypes, chip, scenario, candidates)
     base_plan = ServingPlan(
         model_layers=geom.num_layers,
@@ -2318,7 +2326,8 @@ def solve_serving_plan(  # noqa: C901, PLR0915
         search=SearchStats(
             enumerated=eval_context.enumerated,
             hbm_fit=eval_context.hbm_fit,
-            slo_met=len(slo_candidates),
+            not_ruled_out=len(not_ruled_out_candidates),
+            slo_met=sum(1 for candidate in candidates if candidate.slo_met),
             frontier=len(frontier),
         ),
         sweep_candidates=pruned_sweep,

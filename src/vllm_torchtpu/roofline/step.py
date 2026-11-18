@@ -159,6 +159,21 @@ def _dedup_module_collectives(
     return coll_counts, coll_samples
 
 
+def module_serial_s(
+    module: ModuleCost,
+    chip: ChipSpec,
+    *,
+    matmul_scale: float = 1.0,
+) -> float:
+    """Return single-module serial time across HBM, matmul, and vector units."""
+    return max(
+        module.hbm_bytes / chip.hbm_bw,
+        (module.fp8_flops * matmul_scale) / chip.fp8_flops
+        + (module.bf16_flops * matmul_scale) / chip.bf16_flops,
+        module.vpu_flops / chip.vpu_flops,
+    )
+
+
 def _sum_module_resources(
     modules: tuple[ModuleCost, ...],
     chip: ChipSpec,
@@ -192,11 +207,7 @@ def _sum_module_resources(
         tot_vpu_min += m.strict_vpu_flops
         if has_finite_ici:
             tot_ici_b += m.ici_bytes
-        mod_serial_s += max(
-            hbm_bytes / chip.hbm_bw,
-            fp8_flops / chip.fp8_flops + bf16_flops / chip.bf16_flops,
-            vpu_flops / vpu_peak,
-        )
+        mod_serial_s += module_serial_s(m, chip)
     hbm_s = tot_hbm_b / chip.hbm_bw
     matmul_s = tot_fp8 / chip.fp8_flops + tot_bf16 / chip.bf16_flops
     vpu_s = tot_vpu / vpu_peak

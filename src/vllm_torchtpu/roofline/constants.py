@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 # Collective & TPU topology constants.
 AR_PHASES: int = 2
 DEFAULT_CORES_PER_CHIP: int = 2
@@ -227,6 +229,26 @@ EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
 # Warning a serving plan carries when no layout fits the chip budget and HBM.
 NO_FEASIBLE_LAYOUT_WARNING: str = (
     "No feasible layout met memory and latency constraints."
+)
+
+# Three-valued SLO feasibility verdicts and ascending rank order.
+type SloVerdict = Literal["ruled_out", "estimate_meets", "undecided"]
+
+SLO_VERDICT_RULED_OUT: SloVerdict = "ruled_out"
+SLO_VERDICT_UNDECIDED: SloVerdict = "undecided"
+SLO_VERDICT_ESTIMATE_MEETS: SloVerdict = "estimate_meets"
+
+SLO_VERDICT_RANK: dict[str, int] = {
+    SLO_VERDICT_RULED_OUT: 0,
+    SLO_VERDICT_UNDECIDED: 1,
+    SLO_VERDICT_ESTIMATE_MEETS: 2,
+}
+
+# Warning a serving plan carries when the recommended layout's SLO verdict is undecided.
+UNDECIDED_SLO_WARNING: str = (
+    "Recommended layout has SLO verdict 'undecided': its modeled estimate "
+    "misses the latency SLO, though the physical lower bound does not rule "
+    "the layout out."
 )
 
 # Versioned solve JSON payload and top-K diversity selection constants.
