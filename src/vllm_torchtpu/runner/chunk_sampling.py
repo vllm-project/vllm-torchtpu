@@ -47,7 +47,6 @@ class StepContext:
     sampling_generator: torch.Generator | None
     grammar_output: GrammarOutput | None
     scheduler_output: SchedulerOutput
-    is_spec_step: bool
     min_toks: min_tokens_mask.MinTokensState
     rep_pen: bool
 
@@ -117,9 +116,9 @@ def sample_plain_chunk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``.
 
-    ``step.is_spec_step`` marks a draft-less chunk inside a speculative step,
-    whose grammar rows follow ``scheduled_spec_decode_tokens``. With
-    ``step.top_tokens``, ``logits`` holds each row's greedy token instead.
+    With ``step.top_tokens``, ``logits`` holds each row's greedy token instead.
+    In a speculative step, no request of a plain chunk has drafts, so
+    ``mask_logits`` reads the bitmask row of each request's next token.
     ``step.rep_pen`` is ``RepetitionPenaltyTracker.begin_step`` for this step.
     ``processors`` run after the ``min_tokens`` mask and the repetition
     penalty, in order (``chunk_processors.PlainChunkProcessor``).
@@ -130,20 +129,9 @@ def sample_plain_chunk(
     has no logprobs_mode).
     """
     if step.grammar_output is not None:
-        if step.is_spec_step:
-            _, logits = runner.structured_decoding_manager.mask_spec_logits(
-                None,
-                logits,
-                step.grammar_output,
-                step.scheduler_output.scheduled_spec_decode_tokens,
-                None,
-                cur_start_idx,
-                cur_end_idx,
-            )
-        else:
-            logits = runner.structured_decoding_manager.mask_logits(
-                logits, step.grammar_output, cur_start_idx, cur_end_idx
-            )
+        logits = runner.structured_decoding_manager.mask_logits(
+            logits, step.grammar_output, cur_start_idx, cur_end_idx
+        )
     logprob_logits = logits
     min_tokens_rows = min_tokens_mask.plain_rows(
         step.min_toks, cur_start_idx, cur_end_idx
@@ -265,7 +253,6 @@ def sample_spec_verify_chunk(
                         cur_end_idx,
                     )
                 )
-                assert target_logits is not None
                 draft_token_ids = (
                     runner.structured_decoding_manager.mask_invalid_draft_tokens(
                         draft_token_ids,

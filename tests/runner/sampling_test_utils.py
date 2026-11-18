@@ -71,7 +71,6 @@ def _sampling_step(**fields) -> chunk_sampling.StepContext:
             "sampling_generator": None,
             "grammar_output": None,
             "scheduler_output": SimpleNamespace(scheduled_spec_decode_tokens={}),
-            "is_spec_step": False,
             "min_toks": {},
             "rep_pen": False,
             **fields,

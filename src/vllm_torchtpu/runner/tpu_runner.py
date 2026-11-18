@@ -5440,7 +5440,6 @@ class TPUModelRunner(GPUModelRunner):
             sampling_generator=sampling_generator,
             grammar_output=grammar_output,
             scheduler_output=scheduler_output,
-            is_spec_step=is_spec_step,
             min_toks=min_toks,
             rep_pen=rep_pen,
         )

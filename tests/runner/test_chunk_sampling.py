@@ -41,8 +41,7 @@ def _below_min_tokens(stop_token: int) -> min_tokens.MinTokensState:
 
 
 @pytest.mark.parametrize("all_greedy", [True, False], ids=["greedy", "sampled"])
-@pytest.mark.parametrize("is_spec_step", [False, True], ids=["plain", "spec_step"])
-def test_plain_chunk_masks_then_samples(is_spec_step: bool, all_greedy: bool) -> None:
+def test_plain_chunk_masks_then_samples(all_greedy: bool) -> None:
     runner = _sampling_runner(temperature=0.7)
     grammar_calls: list[str] = []
 
@@ -55,13 +54,7 @@ def test_plain_chunk_masks_then_samples(is_spec_step: bool, all_greedy: bool) ->
         grammar_calls.append("plain")
         return block_99(logits)
 
-    def mask_spec_logits(target, logits, _grammar_output, spec_tokens, *_args):
-        grammar_calls.append(f"spec:{spec_tokens}")
-        return target, block_99(logits)
-
-    runner.structured_decoding_manager = SimpleNamespace(
-        mask_logits=mask_logits, mask_spec_logits=mask_spec_logits
-    )
+    runner.structured_decoding_manager = SimpleNamespace(mask_logits=mask_logits)
     # Row 0 prefers token 99 (grammar-blocked), then the stop token 12 (below
     # min_tokens), then token 40; every other logit is far below token 40, so
     # sampling picks it too.
@@ -72,8 +65,6 @@ def test_plain_chunk_masks_then_samples(is_spec_step: bool, all_greedy: bool) ->
         all_greedy=all_greedy,
         sampling_generator=torch.Generator().manual_seed(0),
         grammar_output=object(),
-        scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={"r0": [5]}),
-        is_spec_step=is_spec_step,
         min_toks=_below_min_tokens(12),
     )
     selected, logprob_logits = chunk_sampling.sample_plain_chunk(
@@ -81,7 +72,7 @@ def test_plain_chunk_masks_then_samples(is_spec_step: bool, all_greedy: bool) ->
     )
 
     assert int(selected[0, 0]) == 40
-    assert grammar_calls == ["spec:{'r0': [5]}" if is_spec_step else "plain"]
+    assert grammar_calls == ["plain"]
     # Logprobs see the grammar mask but not the min_tokens mask.
     assert logprob_logits[0, 99].item() == NEG_INF
     assert logprob_logits[0, 12].item() == 9.0
@@ -226,9 +217,8 @@ class _PlainRecorder:
 
 
 @pytest.mark.parametrize("all_greedy", [True, False], ids=["greedy", "sampled"])
-@pytest.mark.parametrize("is_spec_step", [False, True], ids=["plain", "spec_step"])
 def test_plain_chunk_processors_run_in_order_after_the_masks(
-    is_spec_step: bool, all_greedy: bool
+    all_greedy: bool,
 ) -> None:
     runner = _sampling_runner(temperature=0.7)
     runner.structured_decoding_manager = _grammar_blocking(99)
@@ -245,8 +235,6 @@ def test_plain_chunk_processors_run_in_order_after_the_masks(
         all_greedy=all_greedy,
         sampling_generator=torch.Generator().manual_seed(0),
         grammar_output=object(),
-        scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={"r0": [5]}),
-        is_spec_step=is_spec_step,
         min_toks=_below_min_tokens(12),
     )
     selected, logprob_logits = chunk_sampling.sample_plain_chunk(
