@@ -725,3 +725,14 @@ def test_the_ids_entry_refuses_a_routing_table_narrower_than_its_slots(interpret
     out = jax.eval_shape(kernel.moe_lowtok, x, narrow, w13, s13, w2, s2)
     assert out.shape == (4, 512)
 
+
+def test_the_kernel_streams_gate_and_up_as_two_units(interpret):
+    """Admission takes gate|up widths that are multiples of 512, the only
+    layout the kernel streams; another width is refused, not mis-streamed."""
+    route = jax.ShapeDtypeStruct((4, 8), jnp.float32)
+    x, w13, w2, s13, s2 = _shapes(4, 512, 256, 8)
+    out = jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
+    assert out.shape == (4, 512)
+    x, w13, w2, s13, s2 = _shapes(4, 512, 384, 8)
+    with pytest.raises(ValueError, match="multiple of 256"):
+        jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
