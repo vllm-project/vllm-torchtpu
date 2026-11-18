@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from einops import rearrange
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
@@ -41,6 +42,7 @@ from vllm_torchtpu.block_major_pool import (
     kernel_view,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.pcp import (
     get_or_create_pcp_mesh,
     get_pcp_rank,
@@ -51,6 +53,10 @@ from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import projection_scale
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
+)
+from vllm_torchtpu.kernels.gdn.split_pack_qkvz import (
+    can_split_pack_qkvz,
+    split_pack_gdn_qkvz,
 )
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
@@ -70,6 +76,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import fresh_buffer
 
 _GDN_PCP_AXIS_NAME = "pcp"
@@ -378,6 +385,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
     _checkpoint_alignment: int | None = None
+    _pcp_streaming_configured: bool = False
+    _chip_vmem_capacity_bytes: int | None = None
+    gdn_pack_qkvz_op: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -392,9 +402,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # pyrefly: ignore[bad-assignment]
         self.kv_cache = None
         # The wrapper context types vllm_config as object.
-        vllm_config = cast(
-            VllmConfig | None, get_vllm_model_wrapper_context().vllm_config
-        )
+        vllm_context = get_vllm_model_wrapper_context()
+        vllm_config = cast(VllmConfig | None, vllm_context.vllm_config)
         self._bm_kernel = vllm_config is not None and unified_block_major_enabled(
             vllm_config
         )
@@ -403,6 +412,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
         self._keep_qkvz_layout(pcp_enabled)
+        if envs.TPU_GDN_PACK_QKVZ and not pcp_enabled and hasattr(self, "in_proj_qkvz"):
+            self._chip_vmem_capacity_bytes = pltpu.get_tpu_info_for_chip(
+                get_chip_version(), 1
+            ).vmem_capacity_bytes
+            self.gdn_pack_qkvz_op = self._build_pack_qkvz_op()
+        else:
+            self.gdn_pack_qkvz_op = None
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
         )
@@ -615,13 +631,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # conv-state tail is preserved by gdn_attention_core_tpu_pcp_prefill.
         num_spec_tokens = self.num_spec
 
-        def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state, *args, **kwargs):
+        def _fake_gdn(mixed_qkv, b, _a, conv_state, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
             out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            out_dtype = b.dtype if mixed_qkv.ndim == 3 else mixed_qkv.dtype
             return (
                 torch.empty_like(conv_state),
                 torch.empty_like(recurrent_state),
-                torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device),
+                torch.empty(out_shape, dtype=out_dtype, device=mixed_qkv.device),
             )
 
         if pcp_streaming:
@@ -833,10 +850,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             new_pool, output = result
             return new_pool.reshape(recurrent_state.shape), output
 
-        def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
+        def _fake_gdn(mixed_qkv, b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
             out_shape = (num_tokens, local_num_v_heads, d_v)
-            out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+            out_dtype = b.dtype if mixed_qkv.ndim == 3 else mixed_qkv.dtype
+            out = torch.empty(out_shape, dtype=out_dtype, device=mixed_qkv.device)
             return torch.empty_like(recurrent_state), out
 
         def build_op(op_name: str):
@@ -910,6 +928,74 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             return outputs
 
         return gdn_impl
+
+    def _build_pack_qkvz_op(self):
+        qkv_size = self.tp_head_geometry.local_conv_dim(
+            self.head_k_dim, self.head_v_dim
+        )
+        local_num_v_heads = self.num_v_heads // self.tp_size
+        d_v = self.head_v_dim
+
+        def wrapped_fn(mixed_qkvz: jax.Array) -> tuple[jax.Array, jax.Array]:
+            return split_pack_gdn_qkvz(
+                mixed_qkvz,
+                qkv_size=qkv_size,
+                local_num_v_heads=local_num_v_heads,
+                head_v_dim=d_v,
+            )
+
+        def _fake_pack(mixed_qkvz: torch.Tensor):
+            num_tokens = mixed_qkvz.size(0)
+            return (
+                torch.empty(
+                    (num_tokens, 1, qkv_size),
+                    dtype=torch.float32,
+                    device=mixed_qkvz.device,
+                ),
+                torch.empty(
+                    (num_tokens, local_num_v_heads, d_v),
+                    dtype=mixed_qkvz.dtype,
+                    device=mixed_qkvz.device,
+                ),
+            )
+
+        def build_op(op_name: str):
+            op = pallas.jax_op(op_name, wrapped_fn)
+            op.register_fake(_fake_pack)
+            return op
+
+        return _get_shared_gdn_op(
+            "gdn_split_pack_qkvz",
+            (qkv_size, local_num_v_heads, d_v),
+            build_op,
+        )
+
+    def _can_pack_qkvz(
+        self, num_tokens: int, qkv_size: int, dtype: torch.dtype
+    ) -> bool:
+        if not envs.TPU_GDN_PACK_QKVZ or self.gdn_pack_qkvz_op is None:
+            return False
+        # Only backbone warmup retraces per ShapeEnv guard partition; modules
+        # compiled outside warmup (such as MTP drafters) trace once for all
+        # buckets and keep the unspecialized split path.
+        if torch.compiler.is_compiling() and shape_variants.aot_cache_tag() is None:
+            return False
+        if dtype not in (torch.bfloat16, torch.float32):
+            return False
+        vmem_cap = (
+            self._chip_vmem_capacity_bytes
+            if self._chip_vmem_capacity_bytes is not None
+            else pltpu.get_tpu_info_for_chip(get_chip_version(), 1).vmem_capacity_bytes
+        )
+        local_num_v_heads = self.num_v_heads // self.tp_size
+        return can_split_pack_qkvz(
+            num_tokens=num_tokens,
+            qkv_size=qkv_size,
+            local_num_v_heads=local_num_v_heads,
+            head_v_dim=self.head_v_dim,
+            dtype_itemsize=dtype.itemsize,
+            vmem_capacity_bytes=vmem_cap,
+        )
 
     def _build_pooled_pcp_gdn_op(self, *, block_major: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
@@ -1212,6 +1298,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 attn_metadata,
             )
 
+        has_allocated_kv = kv_cache is not None and kv_cache[0].numel() > 0
+        attn_metadata: _GdnAttentionMetadata | None = None
+        use_pcp_streaming = False
+        if has_allocated_kv:
+            assert kv_cache is not None
+            attn_metadata = cast(
+                "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
+            )[self.prefix]
+            if len(kv_cache) != 1:
+                use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
@@ -1232,8 +1329,20 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 self.head_k_dim, self.head_v_dim
             )
             z_size = self.value_dim // self.tp_size
-            mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            pack_op = self.gdn_pack_qkvz_op
+            skip_for_pcp = self._pcp_streaming_configured and (
+                not has_allocated_kv or use_pcp_streaming
+            )
+            if (
+                not skip_for_pcp
+                and pack_op is not None
+                and mixed_qkvz.is_contiguous()
+                and self._can_pack_qkvz(num_tokens, qkv_size, mixed_qkvz.dtype)
+            ):
+                mixed_qkv, z = pack_op(mixed_qkvz)
+            else:
+                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
@@ -1244,17 +1353,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_v_heads = self.num_v_heads // self.tp_size
 
         # During warmup or memory profiling, the kv_cache might not be allocated yet
-        if kv_cache is None or kv_cache[0].numel() == 0:
+        if not has_allocated_kv:
             core_attn_out = torch.zeros(
                 (num_tokens, local_num_v_heads, self.head_v_dim),
-                dtype=mixed_qkv.dtype,
+                dtype=b.dtype,
                 device=mixed_qkv.device,
             )
             recurrent_state = None
         else:
-            attn_metadata = cast(
-                "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
-            )[self.prefix]
+            assert kv_cache is not None and attn_metadata is not None
 
             if len(kv_cache) == 1:
                 # Unified block pool: the attention-shaped pool carries the
@@ -1345,7 +1452,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 )
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
-                use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
                 if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "

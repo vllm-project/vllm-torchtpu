@@ -66,3 +66,13 @@ def test_startup_accepts_the_knob_unset(
     monkeypatch.delenv(REMOVED, raising=False)
 
     TpuPlatform.check_and_update_config(vllm_config)
+
+
+def test_tpu_gdn_pack_qkvz_propagated_and_defaults_false(monkeypatch):
+    import vllm_torchtpu.envs as envs
+
+    assert "TPU_GDN_PACK_QKVZ" in TpuPlatform.additional_env_vars
+    monkeypatch.delenv("TPU_GDN_PACK_QKVZ", raising=False)
+    assert envs.environment_variables["TPU_GDN_PACK_QKVZ"]() is False
+    monkeypatch.setenv("TPU_GDN_PACK_QKVZ", "1")
+    assert envs.environment_variables["TPU_GDN_PACK_QKVZ"]() is True
