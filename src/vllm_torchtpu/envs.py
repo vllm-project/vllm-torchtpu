@@ -2248,7 +2248,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_FUSED_OPROJ_AR: the largest decode block, in rows, the fused kernel
     # takes. Above 16 rows the two-call path is XLA's matmul and its quantize, then
     # the small all-reduce; the fused kernel streams the weight under the barrier
-    # round there too. A power of 2 (a bucket edge), at most 64.
+    # round there too. At most 96 (fp8_oproj_all_reduce.LIMIT_M).
     "TPU_FUSED_OPROJ_AR_MAX_ROWS": env_nonnegative_int(
         "TPU_FUSED_OPROJ_AR_MAX_ROWS", 16
     ),

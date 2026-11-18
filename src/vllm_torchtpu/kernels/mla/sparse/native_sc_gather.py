@@ -57,9 +57,9 @@ QUAD_ROPE_WORDS = ROPE_PACKING * PACKED_ROPE_WORDS
 PACKED_OUT_ROWS = QUADS_PER_ATOM // 2
 # `write_rows` (the write phase's one operand), u32[3 * T, 128]: row blocks.
 WRITE_NOPE_PART, WRITE_ROPE_PART, WRITE_DST_PART, WRITE_PARTS = 0, 1, 2, 3
-# The write phase takes up to four rounds of `NUM_SUBCORES` tokens; rounds past
+# The write phase takes up to six rounds of `NUM_SUBCORES` tokens; rounds past
 # the second share one semaphore set (`write_semaphore_sets`).
-MAX_WRITE_TOKENS = 4 * NUM_SUBCORES
+MAX_WRITE_TOKENS = 6 * NUM_SUBCORES
 MAX_SEPARATE_WRITE_ROUNDS = 2
 # Window cache (`window_cache`, TPU_PREFILL_GATHER_WINDOW_CACHE): each call
 # copies WINDOW_ROWS cache rows (the request's newest) into each SparseCore's

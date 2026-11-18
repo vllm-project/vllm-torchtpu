@@ -59,6 +59,9 @@ def test_supports(m, kk, n, cores, ok):
         (48, 64, True),
         (64, 64, True),
         (65, 64, False),
+        (80, 96, True),
+        (96, 96, True),
+        (97, 96, False),
         (128, 128, False),  # above the kernel's VMEM limit
     ],
 )

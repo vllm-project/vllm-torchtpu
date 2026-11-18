@@ -60,7 +60,7 @@ def _max_ulps(a, b):
     return float(np.max(np.abs(a - b) / np.exp2(np.floor(np.log2(mag)) - 7)))
 
 
-@pytest.mark.parametrize("rows", [4, 8, 16, 32, 48, 64])
+@pytest.mark.parametrize("rows", [4, 8, 16, 32, 48, 64, 80, 96])
 def test_matches_today(rows):
     on_tpu = jax.devices()[0].platform == "tpu"
     args = _inputs(rows)

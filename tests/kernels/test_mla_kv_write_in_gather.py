@@ -54,8 +54,27 @@ FLAG = "TPU_MLA_KV_WRITE_IN_GATHER"
 MAX_TOKENS_FLAG = "TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS"
 OUT_SIZE = 4 * 2048  # 4 query tokens x topk 2048 (decode-sized gather)
 NUM_OWNERS = 32
-# The writer cells, and MTP steps of 16 sequences that start mid-chunk: the
-# 64-token bucket, four write rounds sharing one semaphore set.
+
+
+def _straddle(lens, seed):
+    """Steps of `lens` tokens per sequence, each starting mid-chunk (so it
+    straddles two ranks or more) in a distinct interleave cycle."""
+    rng = np.random.default_rng(seed)
+    num_cycles = (
+        tcw.PAGES_PER_SEQ * tcw.VIRTUAL_PAGE - tcw.CYCLE - max(lens)
+    ) // tcw.CYCLE + 1
+    cycles = rng.choice(num_cycles, size=len(lens), replace=False)
+    ranks = rng.integers(0, tcw.DCP_SIZE, len(lens))
+    offsets = rng.integers(1, tcw.INTERLEAVE, len(lens))
+    return [
+        (tcw._rank_chunk(int(r), int(c)) + int(off), int(n))
+        for r, c, off, n in zip(ranks, cycles, offsets, lens, strict=True)
+    ]
+
+
+# The writer cells, and MTP steps that start mid-chunk in the 64-, 80- and
+# 96-token buckets: four, five and six write rounds, the rounds past the second
+# sharing one semaphore set.
 _CELLS = {
     **tcw._CELLS,
     "straddle_chunk_t64": (
@@ -69,6 +88,10 @@ _CELLS = {
         ],
         64,
     ),
+    "straddle_chunk_t80": (_straddle((4,) * 20, seed=80), 80),
+    # 24 four-token steps would need 72 virtual pages, more than the writer
+    # harness's 64 per rank: 16 of 4 tokens and 4 of 8 fill the bucket.
+    "straddle_chunk_t96": (_straddle((4,) * 16 + (8,) * 4, seed=96), 96),
 }
 _WRITE_CELLS = tuple(
     n for n, (_, t) in _CELLS.items() if t <= native_sc_gather.MAX_WRITE_TOKENS
@@ -399,16 +422,16 @@ def test_flag_defaults_off():
 
 def test_write_semaphore_sets():
     """Up to two rounds each round keeps its own set (the 16- and 32-token
-    kernels as before); four rounds and the single-writer control share one,
-    the three semaphores of a one-round write."""
+    kernels as before); three to six rounds and the single-writer control share
+    one, the three semaphores of a one-round write."""
     sets = native_sc_gather.write_semaphore_sets
-    assert [sets(t, None) for t in (16, 32, 48, 64)] == [1, 2, 1, 1]
-    assert sets(32, "no_fence") == sets(64, "no_fence") == 1
+    assert [sets(t, None) for t in (16, 32, 48, 64, 80, 96)] == [1, 2, 1, 1, 1, 1]
+    assert sets(32, "no_fence") == sets(64, "no_fence") == sets(80, "no_fence") == 1
 
 
 def test_kv_write_in_gather_max_tokens():
-    """The 64-token bucket takes the write only under the knob, and no knob
-    value takes a bucket past four write rounds."""
+    """The 64-, 80- and 96-token buckets take the write only under the knob,
+    and no knob value takes a bucket past six write rounds."""
     from vllm_torchtpu.layers.core import attention_interface
 
     nope_spec, rope_spec = tcw._specs()
@@ -420,18 +443,24 @@ def test_kv_write_in_gather_max_tokens():
         assert not supported(nope_spec, rope_spec, 64, 2048)
     with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "64"}):
         assert supported(nope_spec, rope_spec, 64, 2048)
+        assert not supported(nope_spec, rope_spec, 80, 2048)
+    with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "96"}):
+        assert supported(nope_spec, rope_spec, 80, 2048)
+        assert supported(nope_spec, rope_spec, 96, 2048)
     with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "128"}):
         assert not supported(nope_spec, rope_spec, 128, 2048)
 
 
 def test_one_capped_gather_takes_the_one_chunk_live_group_bucket():
-    """Under the production chunking the 64-token bucket is one live-group
-    chunk (one gather); a bucket of two chunks is not."""
+    """Under the production chunking the 64-, 80- and 96-token buckets are
+    one live-group chunk (one gather); a bucket of two chunks is not."""
     from vllm_torchtpu.layers.core import attention_interface
 
     with mock.patch.dict(os.environ, prologue.PROD_ENV):
         assert attention_interface.one_capped_gather(32, 512)
         assert attention_interface.one_capped_gather(64, 512)
+        assert attention_interface.one_capped_gather(80, 512)
+        assert attention_interface.one_capped_gather(96, 512)
         assert not attention_interface.one_capped_gather(512, 512)
         assert not attention_interface.one_capped_gather(64, None)
 
