@@ -2761,6 +2761,106 @@ def test_loop_step_program_runs_the_drafts_own_forward():
     assert program.prefix == "mtp_index_share_loop"
 
 
+@pytest.mark.parametrize(
+    "dims",
+    [
+        # Qwen3.5's MTP draft: positions [3, p] (MRoPE), dynamic on the last dim.
+        {
+            "input_ids": 0,
+            "positions": -1,
+            "hidden_states": 0,
+            "intermediate_tensors": 0,
+            "inputs_embeds": 0,
+        },
+        # DeepSeek-style drafts: dim 0 of every tensor argument.
+        {
+            "input_ids": 0,
+            "positions": 0,
+            "hidden_states": 0,
+            "intermediate_tensors": 0,
+            "inputs_embeds": 0,
+        },
+    ],
+)
+def test_loop_step_program_built_with_the_drafts_dims(monkeypatch, dims):
+    """build_mtp_loop_step_model compiles a subclass of the IndexShare program
+    with the draft's own dynamic dims. It runs the draft's own forward with
+    every argument passed through, and its compile path marks the draft's dims
+    (positions dim 1 of Qwen3.5's [3, p] positions), not the dim-0 dims of the
+    class it subclasses."""
+    import inspect
+
+    from vllm.config import CompilationMode
+    from vllm.config.compilation import DynamicShapesType
+
+    from vllm_torchtpu.spec_decode.mtp_loop_model import build_mtp_loop_step_model
+
+    seen = {}
+
+    class _Mtp(torch.nn.Module):
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            spec_step_idx=0,
+        ):
+            seen.update(
+                self=self,
+                input_ids=input_ids,
+                positions=positions,
+                intermediate=intermediate_tensors,
+                embeds=inputs_embeds,
+                step=spec_step_idx,
+            )
+            return hidden_states + 1
+
+    mtp = _Mtp()
+    program = build_mtp_loop_step_model(
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(mode=CompilationMode.NONE)
+        ),
+        prefix="mtp_step_loop",
+        mtp=mtp,
+        dynamic_arg_dims=dims,
+    )
+    input_ids = torch.zeros(4, dtype=torch.int32)
+    positions = torch.zeros((3, 4), dtype=torch.int32)
+    hidden = torch.zeros(4, 3)
+
+    out = program(
+        input_ids=input_ids, positions=positions, hidden_states=hidden, spec_step_idx=1
+    )
+
+    assert torch.equal(out, torch.ones(4, 3))
+    assert seen["self"] is mtp and seen["input_ids"] is input_ids
+    assert seen["positions"] is positions
+    assert seen["intermediate"] is None and seen["embeds"] is None
+    assert seen["step"] == 1
+    assert program.prefix == "mtp_step_loop"
+
+    # The dims this class's compile path marks: its own __call__'s.
+    mark_inputs = inspect.getclosurevars(type(program).__call__).nonlocals[
+        "_mark_dynamic_inputs"
+    ]
+    assert inspect.getclosurevars(mark_inputs).nonlocals["dynamic_arg_dims"] == dims
+    marked = {}
+    monkeypatch.setattr(
+        torch._dynamo, "mark_dynamic", lambda t, d: marked.setdefault(id(t), d)
+    )
+    mark_inputs(
+        program,
+        DynamicShapesType.BACKED,
+        input_ids=input_ids,
+        positions=positions,
+        hidden_states=hidden,
+    )
+    assert marked[id(positions)] == [1 if dims["positions"] == -1 else 0]
+    assert marked[id(input_ids)] == [0] and marked[id(hidden)] == [0]
+
+
 def test_build_mtp_loop_model_uses_the_draft_config_and_its_own_prefix(monkeypatch):
     """Built like the draft itself: under the draft's config (the compile
     wrapper reads the current one), wrapping the draft, in a cache folder of
@@ -3817,6 +3917,151 @@ def test_propose_takes_step0_gather_indices_from_the_prep():
     assert proposer._step0_pad_len == 0
     assert proposer._last_step0_gather_indices is None
     assert drafts == [[7], [20]]
+
+
+class _GreedyProcessor:
+    """A logits processor whose get_top_tokens takes column 1 of the hidden
+    rows as the token, and records each call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get_top_tokens(self, lm_head, hidden):
+        self.calls.append((lm_head, tuple(hidden.shape)))
+        return hidden[:, 1].to(torch.int64)
+
+
+def _greedy_head_owner():
+    return SimpleNamespace(
+        logits_processor=_GreedyProcessor(),
+        lm_head=SimpleNamespace(_quant_desc="bf16"),
+    )
+
+
+def _no_compute_logits(_hidden):
+    raise AssertionError("the greedy head replaces compute_logits + argmax")
+
+
+def test_draft_greedy_head_takes_the_resolved_owner(monkeypatch):
+    """With greedy top tokens on, the draft's head is the owner the
+    vocabulary-parallel argmax resolves for the draft model."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    from vllm_torchtpu.runner import greedy_top_tokens
+
+    monkeypatch.setattr(e3.envs, "TPU_GREEDY_TOP_TOKENS", True)
+    owner = _greedy_head_owner()
+    seen = []
+
+    def resolve(model, _dp_lockstep):
+        seen.append(model)
+        return owner
+
+    monkeypatch.setattr(greedy_top_tokens, "resolve_head_owner", resolve)
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.draft_model = SimpleNamespace(draft_id_to_target_id=None)
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+
+    proposer._init_draft_greedy_head()
+
+    assert proposer._draft_greedy_head_owner is owner
+    assert seen == [proposer.draft_model]
+
+
+def test_draft_greedy_head_falls_back_with_a_warning(monkeypatch):
+    """A draft the vocabulary-parallel argmax cannot serve keeps
+    compute_logits + argmax, and says why once; a draft with a draft->target
+    id map does not ask."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    from vllm_torchtpu.runner import greedy_top_tokens
+
+    monkeypatch.setattr(e3.envs, "TPU_GREEDY_TOP_TOKENS", True)
+    calls = []
+
+    def resolve(model, _dp_lockstep):
+        calls.append(model)
+        raise NotImplementedError("no get_top_tokens on this head")
+
+    warnings = []
+    monkeypatch.setattr(greedy_top_tokens, "resolve_head_owner", resolve)
+    monkeypatch.setattr(
+        e3.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
+    )
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.draft_model = SimpleNamespace(draft_id_to_target_id=None)
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+
+    proposer._init_draft_greedy_head()
+
+    assert proposer._draft_greedy_head_owner is None
+    assert len(calls) == 1
+    assert len(warnings) == 1 and "no get_top_tokens on this head" in warnings[0]
+
+    proposer.draft_model = SimpleNamespace(draft_id_to_target_id=torch.zeros(3))
+    proposer._init_draft_greedy_head()
+    assert proposer._draft_greedy_head_owner is None
+    assert len(calls) == 1
+
+
+def test_draft_propose_token_takes_the_greedy_head():
+    """With a greedy head, each draft token is its vocabulary-parallel argmax
+    (get_top_tokens over the owner's lm_head), as int32."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.draft_model = SimpleNamespace(
+        draft_id_to_target_id=None, compute_logits=_no_compute_logits
+    )
+    owner = _greedy_head_owner()
+    proposer._draft_greedy_head_owner = owner
+    hidden = torch.tensor([[0.0, 7.0], [0.0, 3.0]])
+
+    tokens = Eagle3Proposer._draft_propose_token.__wrapped__.__wrapped__(
+        proposer, hidden
+    )
+
+    assert tokens.dtype == torch.int32
+    assert tokens.tolist() == [7, 3]
+    assert owner.logits_processor.calls == [(owner.lm_head, (2, 2))]
+
+
+def test_fused_loop_proposes_every_step_with_the_greedy_head():
+    """The fused loop's tokens, step 0's included, come from the greedy head
+    when one is set."""
+    from vllm_torchtpu.spec_decode.mtp_fused_loop import _MtpFusedLoop
+
+    class _Mtp(torch.nn.Module):
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            spec_step_idx=0,
+        ):
+            return hidden_states + 1.0
+
+        compute_logits = staticmethod(_no_compute_logits)
+
+    owner = _greedy_head_owner()
+    loop = _MtpFusedLoop(
+        vllm_config=SimpleNamespace(),
+        prefix="mtp_fused_loop_k3",
+        mtp=_Mtp(),
+        num_steps=2,
+        greedy_head_owner=owner,
+        propose_step0=True,
+    )
+    hidden = torch.tensor([[0.0, 7.0], [0.0, 3.0]])
+
+    stacked = loop(
+        None,
+        torch.zeros(2, dtype=torch.int32),
+        hidden,
+        torch.zeros(2, dtype=torch.int32),
+    )
+
+    assert stacked.dtype == torch.int32
+    assert stacked.tolist() == [[7, 8, 9], [3, 4, 5]]
+    assert len(owner.logits_processor.calls) == 3
 
 
 def _seed_precompile_pairs(monkeypatch, *, lockstep, dp_step_max_reqs):
