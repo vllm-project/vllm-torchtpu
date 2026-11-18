@@ -30,6 +30,14 @@
 # - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
 #   (main lists the source's errors in .pyrefly-baseline-full.json).
 # - A comment typo.
+# - At config.TILER_SHAPES: the tiler's prefill chunk (128 by default, a
+#   multiple of 16 above 16 tokens, whole triangular blocks below, capped at
+#   its VMEM fit) and decode tile, decode_tile_override (capped at the VMEM
+#   ceilings at every shape), the per-step trims (one pad for b and a, a_log
+#   and dt_bias padded once) and, for verify windows at
+#   config.FUSED_1DOT_SHAPES, the fused 1-dot recurrence (use_fused_1dot).
+#   Every other shape keeps main's tiles (MAIN_MIXED_TILE_SIZE) and code.
+# - Verify read offsets are clipped to the window.
 # No change targets AttentionMode.KDA, which this copy's callers never pass;
 # see compute_kda.py.
 

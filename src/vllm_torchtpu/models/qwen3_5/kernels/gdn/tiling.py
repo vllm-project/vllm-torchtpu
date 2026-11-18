@@ -20,6 +20,13 @@
 # - _QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN and the qkv_2d argument of
 #   get_vmem_estimate_bytes, calculate_mixed_tile_size and get_tile_sizes:
 #   the PER_SEQ VMEM term of 2D bf16 qkv rows.
+# - The Qwen3.5 tiler for config.TILER_SHAPES: decode_tile_target (measured step
+#   overhead against per-slot work), select_decode_tile_size and
+#   spec_window_tile_cap (the verify-window and VMEM caps and an explicit
+#   override), a decode VMEM estimate with 1 + window f32 working states per
+#   slot (main's has one), and a caller's prefill chunk capped at its VMEM fit,
+#   which get_tile_sizes keeps off clip_mixed_tile_size. main_decode_tile_target
+#   and main_decode_tile_size keep main's decode tile for every other shape.
 
 """Tile-size selection and VMEM estimation for the fused Conv1D-GDN v3 kernel."""
 
