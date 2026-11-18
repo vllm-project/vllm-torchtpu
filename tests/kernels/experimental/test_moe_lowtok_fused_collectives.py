@@ -82,11 +82,11 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
         rng = np.random.default_rng(0)
         w13 = jnp.asarray(
             np.clip(rng.standard_normal((n_experts, h, 2 * inter)) * 40, -448, 448),
-            kernel._FP8,
+            kernel.FP8_DTYPE,
         )
         w2 = jnp.asarray(
             np.clip(rng.standard_normal((n_experts, inter, h)) * 40, -448, 448),
-            kernel._FP8,
+            kernel.FP8_DTYPE,
         )
         s13 = jnp.asarray(
             rng.random((n_experts, 1, 1, 2 * inter)) / (40 * np.sqrt(h)), jnp.float32
@@ -102,7 +102,7 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
         def draw():
             def fp8(key, shape):
                 w = jax.random.normal(key, shape, jnp.float32) * 40
-                return jnp.clip(w, -448, 448).astype(kernel._FP8)
+                return jnp.clip(w, -448, 448).astype(kernel.FP8_DTYPE)
 
             return (
                 fp8(keys[0], (n_experts, h, 2 * inter)),
@@ -130,7 +130,7 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
     def reference(x, logits):
         """Plain JAX with the kernel's roundings: per-row FP8 activations, a
         softmax top-k renormalized over every expert, float32 sums."""
-        x_q, x_s = kernel._quantize_rows(x.astype(jnp.float32))
+        x_q, x_s = kernel.quantize_rows(x.astype(jnp.float32))
         weights, ids = jax.lax.top_k(jax.nn.softmax(logits.astype(jnp.float32)), topk)
         weights = weights / weights.sum(axis=1, keepdims=True)
         out = jnp.zeros((x.shape[0], h), jnp.float32)
@@ -139,7 +139,7 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
             hid = jnp.dot(x_q, w13[expert], preferred_element_type=jnp.float32)
             hid = hid * x_s * s13[expert].reshape(1, -1)
             a = jax.nn.silu(hid[:, :inter]) * hid[:, inter:]
-            a_q, a_s = kernel._quantize_rows(a)
+            a_q, a_s = kernel.quantize_rows(a)
             o = jnp.dot(a_q, w2[expert], preferred_element_type=jnp.float32)
             out = out + w[:, None] * (o * a_s * s2[expert].reshape(1, -1))
         return np.asarray(out.astype(jnp.bfloat16)).astype(np.float64)

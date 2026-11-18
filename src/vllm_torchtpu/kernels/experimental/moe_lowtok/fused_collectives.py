@@ -61,12 +61,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.moe_lowtok.kernel import (
-    _FP8,
-    _LANE,
-    _dot,
-    _layout,
-    _quantize_rows,
-    _select_topk,
+    FP8_DTYPE,
+    LANE,
+    dot_f32,
+    quantize_rows,
+    select_topk,
+    weight_layout,
 )
 
 # Rows per gathered block of the gather formulation: one fp8 sublane tile. An
@@ -175,7 +175,7 @@ def _stream_ring(
     rows = wtab_ref.shape[0]
     half = inter // w13_parts
     units = w13_parts + 1
-    lane_128 = lax.broadcasted_iota(jnp.int32, (rows, _LANE), 1)
+    lane_128 = lax.broadcasted_iota(jnp.int32, (rows, LANE), 1)
 
     def collect(e, n):
         h = hits_s[0, gid_s[0, e]]
@@ -298,14 +298,14 @@ def _stream_ring(
             raise NotImplementedError("the gather formulation needs two w13 units")
         _gather_prologue(gid_s, wtab_ref, x_all, xs_all, gather, rows)
     elif rows_fp8 is None:
-        x_q, x_s = _quantize_rows(x_all[...].astype(jnp.float32))
+        x_q, x_s = quantize_rows(x_all[...].astype(jnp.float32))
     else:
         x_q, x_s = rows_fp8()
 
     def routing_weight(expert):
         g = gid_s[0, expert]
-        blk = pl.multiple_of((g >> 7) << 7, _LANE)
-        w_slice = wtab_ref[:, pl.ds(blk, _LANE)]
+        blk = pl.multiple_of((g >> 7) << 7, LANE)
+        w_slice = wtab_ref[:, pl.ds(blk, LANE)]
         return jnp.sum(
             jnp.where(lane_128 + blk == g, w_slice, 0.0), axis=1, keepdims=True
         )
@@ -341,21 +341,21 @@ def _stream_ring(
 
                 @pl.when((part == 0) & (ring == r))
                 def _gate_half(r=r):
-                    h = _dot(x_q, w13_buf[2 * r])
+                    h = dot_f32(x_q, w13_buf[2 * r])
                     gate = h * x_s * s13_buf[2 * r]
                     h_acc[...] = gate * jax.nn.sigmoid(gate)
 
                 @pl.when((part == 1) & (ring == r))
                 def _up_half(r=r):
-                    h = _dot(x_q, w13_buf[2 * r + 1])
+                    h = dot_f32(x_q, w13_buf[2 * r + 1])
                     up = h * x_s * s13_buf[2 * r + 1]
                     h_acc[...] = h_acc[...] * up
 
                 @pl.when((part == 2) & (ring == r))
                 def _down(r=r):
-                    a_q, a_s = _quantize_rows(h_acc[...])
+                    a_q, a_s = quantize_rows(h_acc[...])
                     row_scale = a_s * routing_weight(expert)
-                    o = _dot(a_q, w2_buf[r])
+                    o = dot_f32(a_q, w2_buf[r])
                     acc[...] += (o * s2_buf[r]) * row_scale
             else:
                 for p in range(w13_parts):
@@ -363,7 +363,7 @@ def _stream_ring(
                     @pl.when((part == p) & (ring == r))
                     def _gate_up_half(p=p, r=r):
                         slot = r * w13_parts + p
-                        h = _dot(x_q, w13_buf[slot])
+                        h = dot_f32(x_q, w13_buf[slot])
                         scales = s13_buf[slot]
                         col = p * half
                         h_acc[:, col : col + half] = (
@@ -377,9 +377,9 @@ def _stream_ring(
                 def _down(r=r):
                     gate = h_acc[:, pl.ds(0, inter)]
                     up = h_acc[:, pl.ds(inter, inter)]
-                    a_q, a_s = _quantize_rows(gate * jax.nn.sigmoid(gate) * up)
+                    a_q, a_s = quantize_rows(gate * jax.nn.sigmoid(gate) * up)
                     row_scale = a_s * routing_weight(expert)
-                    o = _dot(a_q, w2_buf[r])
+                    o = dot_f32(a_q, w2_buf[r])
                     acc[...] += (o * s2_buf[r]) * row_scale
 
         return step(e_idx, part, ring)
@@ -390,7 +390,7 @@ def _stream_ring(
 def _gather_rows_of(rows):
     """Rows of the gather-side operands: the routed rows padded to whole
     128-row tiles."""
-    return max(_LANE, pl.cdiv(rows, _LANE) * _LANE)
+    return max(LANE, pl.cdiv(rows, LANE) * LANE)
 
 
 def _gather_scratch(sc, rows, hidden, inter, fp8_rows):
@@ -399,19 +399,19 @@ def _gather_scratch(sc, rows, hidden, inter, fp8_rows):
     g_rows = _gather_rows_of(rows)
     max_pass = pl.cdiv(rows, GATHER_ROWS)
     sc.vmem((g_rows, hidden), jnp.bfloat16)  # the routed rows as the gather operand
-    sc.vmem((g_rows, _LANE), jnp.float32)  # routing weights of the local lane block
-    sc.vmem((g_rows, _LANE), jnp.float32)  # exclusive prefix count per local lane
-    sc.vmem((_LANE, g_rows), jnp.float32)  # the same, transposed
-    sc.vmem((_LANE, g_rows), jnp.float32)  # routing weights, transposed
+    sc.vmem((g_rows, LANE), jnp.float32)  # routing weights of the local lane block
+    sc.vmem((g_rows, LANE), jnp.float32)  # exclusive prefix count per local lane
+    sc.vmem((LANE, g_rows), jnp.float32)  # the same, transposed
+    sc.vmem((LANE, g_rows), jnp.float32)  # routing weights, transposed
     sc.vmem((8, g_rows), jnp.float32)  # per-row scales as a lane row (fp8 rows)
-    sc.vmem((1, _LANE), jnp.int32)
-    sc.add(pltpu.SMEM((1, _LANE), jnp.int32), pltpu.SemaphoreType.DMA((1,)))
-    sc.vmem((max_pass, GATHER_ROWS, hidden), _FP8)  # gathered rows, quantized
-    sc.vmem((max_pass, GATHER_ROWS, _LANE), jnp.float32)  # their scales
-    sc.vmem((max_pass, GATHER_ROWS, _LANE), jnp.float32)  # their routing weights
+    sc.vmem((1, LANE), jnp.int32)
+    sc.add(pltpu.SMEM((1, LANE), jnp.int32), pltpu.SemaphoreType.DMA((1,)))
+    sc.vmem((max_pass, GATHER_ROWS, hidden), FP8_DTYPE)  # gathered rows, quantized
+    sc.vmem((max_pass, GATHER_ROWS, LANE), jnp.float32)  # their scales
+    sc.vmem((max_pass, GATHER_ROWS, LANE), jnp.float32)  # their routing weights
     sc.vmem((max_pass, GATHER_ROWS, inter), jnp.float32)  # gate, then gate * up
     sc.vmem(
-        (_LANE, hidden), jnp.bfloat16
+        (LANE, hidden), jnp.bfloat16
     )  # the contribution pieces, K rows of the scatter
     return 14
 
@@ -422,11 +422,11 @@ def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
     g_rows = x_g.shape[0]
     hidden = x_g.shape[1]
     first = gid_s[0, 0]
-    blk = pl.multiple_of((first >> 7) << 7, _LANE)
-    w_rows = wtab_ref[:, pl.ds(blk, _LANE)]
+    blk = pl.multiple_of((first >> 7) << 7, LANE)
+    w_rows = wtab_ref[:, pl.ds(blk, LANE)]
     if g_rows > rows:
         w_rows = jnp.concatenate(
-            [w_rows, jnp.zeros((g_rows - rows, _LANE), jnp.float32)], axis=0
+            [w_rows, jnp.zeros((g_rows - rows, LANE), jnp.float32)], axis=0
         )
         x_g[pl.ds(rows, g_rows - rows), :] = jnp.zeros(
             (g_rows - rows, hidden), jnp.bfloat16
@@ -453,7 +453,7 @@ def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
         xs_rows = xs_all[...]
         if g_rows > rows:
             xs_rows = jnp.concatenate(
-                [xs_rows, jnp.zeros((g_rows - rows, _LANE), jnp.float32)], axis=0
+                [xs_rows, jnp.zeros((g_rows - rows, LANE), jnp.float32)], axis=0
             )
         xs_t[...] = jnp.transpose(xs_rows)[0:8, :]
     g[-1][...] = jnp.zeros(g[-1].shape, g[-1].dtype)
@@ -499,8 +499,8 @@ def _gather_expert(
     blk = (first >> 7) << 7
     lane = expert + (first - blk)
     n_pass = (counts_s[0, lane] + (GATHER_ROWS - 1)) // GATHER_ROWS
-    lane_i = lax.broadcasted_iota(jnp.int32, (g_rows, _LANE), 1)
-    sub_i = lax.broadcasted_iota(jnp.int32, (_LANE, g_rows), 0)
+    lane_i = lax.broadcasted_iota(jnp.int32, (g_rows, LANE), 1)
+    sub_i = lax.broadcasted_iota(jnp.int32, (LANE, g_rows), 0)
     p_i = lax.broadcasted_iota(jnp.int32, (GATHER_ROWS, g_rows), 0).astype(jnp.float32)
 
     def row_tables():
@@ -525,16 +525,16 @@ def _gather_expert(
                 sel.astype(jnp.bfloat16), x_g[...], preferred_element_type=jnp.float32
             )
             if fp8_rows:
-                x_q = x_rows.astype(_FP8)
+                x_q = x_rows.astype(FP8_DTYPE)
                 x_s = jnp.sum(
                     jnp.where(sel != 0, xs_t[0:1, :], 0.0), axis=1, keepdims=True
                 )
             else:
-                x_q, x_s = _quantize_rows(x_rows)
+                x_q, x_s = quantize_rows(x_rows)
             xq_buf[k] = x_q
-            xs_buf[k] = jnp.broadcast_to(x_s, (GATHER_ROWS, _LANE))
-            wk_buf[k] = jnp.broadcast_to(w_k, (GATHER_ROWS, _LANE))
-            h = _dot(x_q, w_gate[...])
+            xs_buf[k] = jnp.broadcast_to(x_s, (GATHER_ROWS, LANE))
+            wk_buf[k] = jnp.broadcast_to(w_k, (GATHER_ROWS, LANE))
+            h = dot_f32(x_q, w_gate[...])
             gate = h * x_s * s_gate[...]
             h_g[k] = gate * jax.nn.sigmoid(gate)
             return carry
@@ -544,7 +544,7 @@ def _gather_expert(
     @pl.when((part == 1) & slot_ok)
     def _up():
         def pass_k(k, carry):
-            h = _dot(xq_buf[k], w_up[...])
+            h = dot_f32(xq_buf[k], w_up[...])
             up = h * xs_buf[k][:, 0:1] * s_up[...]
             h_g[k] = h_g[k] * up
             return carry
@@ -563,9 +563,9 @@ def _gather_expert(
         in_pieces = lane_i < _PIECES * GATHER_ROWS
 
         def pass_k(k, carry):
-            a_q, a_s = _quantize_rows(h_g[k])
+            a_q, a_s = quantize_rows(h_g[k])
             row_scale = a_s * wk_buf[k][:, 0:1]
-            o = _dot(a_q, w_down[...])
+            o = dot_f32(a_q, w_down[...])
             contrib = (o * s_down[...]) * row_scale
             hi = contrib.astype(jnp.bfloat16)
             rest = contrib - hi.astype(jnp.float32)
@@ -697,9 +697,9 @@ def _kernel_body(
     if dispatch_fp8:
         # The rows quantized per row before the push: the same values the
         # loop would produce from the gathered bf16 rows, in half the bytes.
-        x_q_l, x_s_l = _quantize_rows(x_ref[...].astype(jnp.float32))
+        x_q_l, x_s_l = quantize_rows(x_ref[...].astype(jnp.float32))
         x_all[mine, :] = x_q_l
-        xs_all[mine, :] = jnp.broadcast_to(x_s_l, (rows_l, _LANE))
+        xs_all[mine, :] = jnp.broadcast_to(x_s_l, (rows_l, LANE))
         for j in range(dp):
 
             @pl.when(j != d)
@@ -735,7 +735,7 @@ def _kernel_body(
 
     _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[1])
 
-    wtab[...] = _select_topk(lg_all[...], topk, from_logits=True)
+    wtab[...] = select_topk(lg_all[...], topk, from_logits=True)
     hit = jnp.any(wtab[...] != 0, axis=0, keepdims=True)
     hits_v[...] = jnp.where(hit, 1, 0).astype(jnp.int32)
     hcopy = pltpu.make_async_copy(hits_v, hits_s, hsem.at[0])
@@ -922,8 +922,8 @@ class _Scratch:
     def ring(self, hidden, inter, w13_parts, depth, rows):
         half = inter // w13_parts
         h_acc_cols = inter if w13_parts == 2 else 2 * inter
-        self.vmem((depth * w13_parts, hidden, 2 * half), _FP8)
-        self.vmem((depth, inter, hidden), _FP8)
+        self.vmem((depth * w13_parts, hidden, 2 * half), FP8_DTYPE)
+        self.vmem((depth, inter, hidden), FP8_DTYPE)
         self.vmem((depth * w13_parts, 1, 2 * half), jnp.float32)
         self.vmem((depth, 1, hidden), jnp.float32)
         self.add(
@@ -993,10 +993,10 @@ def moe_lowtok_fused(
     if depth < 1:
         raise ValueError("depth is at least 1")
     tokens, hidden = x.shape
-    if hidden % (2 * _LANE):
-        raise ValueError(f"hidden {hidden} is not a multiple of {2 * _LANE}")
-    n_experts, inter, w13_parts, _ = _layout(x, w13)
-    lanes = pl.cdiv(logits.shape[1], _LANE) * _LANE
+    if hidden % (2 * LANE):
+        raise ValueError(f"hidden {hidden} is not a multiple of {2 * LANE}")
+    n_experts, inter, w13_parts, _ = weight_layout(x, w13)
+    lanes = pl.cdiv(logits.shape[1], LANE) * LANE
     rows_l = pl.cdiv(tokens, _ROW_TILE) * _ROW_TILE
     rows = rows_l * dp
     if dispatch_fp8 and rows_l % 32:
@@ -1020,11 +1020,11 @@ def moe_lowtok_fused(
     out_rows = rows_l
 
     sc = _Scratch()
-    sc.vmem((rows, hidden), _FP8 if dispatch_fp8 else jnp.bfloat16)
+    sc.vmem((rows, hidden), FP8_DTYPE if dispatch_fp8 else jnp.bfloat16)
     sc.vmem((rows, lanes), lg_rows.dtype)
     sc.add(pltpu.SemaphoreType.DMA((7,)), pltpu.SemaphoreType.DMA((dp,)))
     if dispatch_fp8:
-        sc.vmem((rows, _LANE), jnp.float32)
+        sc.vmem((rows, LANE), jnp.float32)
     sc.add(pltpu.SMEM((n_experts,), jnp.int32))
     sc.vmem((1, lanes), jnp.int32)
     sc.add(pltpu.SMEM((1, lanes), jnp.int32), pltpu.SemaphoreType.DMA((1,)))
