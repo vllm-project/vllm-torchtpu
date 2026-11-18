@@ -62,9 +62,8 @@ def scale_seen_logits(
     and the others by ``penalties`` (``[rows, 1]``), as vLLM's torch path
     (``apply_repetition_penalties_torch``) does; vLLM's CUDA kernel divides
     instead. The reciprocal is taken per row, before the broadcast to
-    ``vocab``. The exported sampler keeps a copy
-    (``experimental/export/sampling.py``); ``test_sampler_parity.py`` checks
-    that the two agree bit for bit.
+    ``vocab``. The exported sampler (``experimental/export/sampling.py``)
+    calls this function too.
     """
     scale = torch.where(logits > 0, 1.0 / penalties, penalties)
     return torch.where(seen, logits * scale, logits)

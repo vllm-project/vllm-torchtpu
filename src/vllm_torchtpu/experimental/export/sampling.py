@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.experimental.export import api, random_sample, tpu_lowering
+from vllm_torchtpu.layers.adapter.sample.repetition_penalty import scale_seen_logits
 
 
 def greedy_tokens(logits: torch.Tensor) -> torch.Tensor:
@@ -109,17 +110,6 @@ def stochastic_tokens(
     """
     del min_p
     return _sample(logits, temperature, top_k, top_p, uniform, True)
-
-
-def scale_seen_logits(
-    logits: torch.Tensor, seen: torch.Tensor, penalties: torch.Tensor
-) -> torch.Tensor:
-    """The TPU runner's ``repetition_penalty`` scaling
-    (``vllm_torchtpu.layers.adapter.sample.repetition_penalty.scale_seen_logits``):
-    where ``seen``, positive logits are multiplied by ``1 / penalties`` and the
-    others by ``penalties`` (``[rows, 1]``), as in vLLM's torch path."""
-    scale = torch.where(logits > 0, 1.0 / penalties, penalties)
-    return torch.where(seen, logits * scale, logits)
 
 
 def penalized_tokens(

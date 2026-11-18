@@ -18,8 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu.experimental.export import random_sample, sampling
-from vllm_torchtpu.layers.adapter.sample import repetition_penalty
+from vllm_torchtpu.experimental.export import random_sample
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -53,16 +52,3 @@ def test_exporter_sampler_matches_the_tpu_runner(all_greedy, apply_topk_topp):
 
 def test_exporter_greedy_threshold_matches_the_tpu_runner():
     assert random_sample.SAMPLING_EPS == tpu_runner.SAMPLING_EPS
-
-
-def test_exporter_repetition_penalty_matches_the_tpu_runner():
-    generator = torch.Generator().manual_seed(0)
-    rows, vocab = 6, 97
-    logits = torch.randn(rows, vocab, generator=generator) * 20
-    logits[0, :4] = torch.tensor([0.0, float("-inf"), 1e-30, -1e-30])
-    seen = torch.rand(rows, vocab, generator=generator) < 0.3
-    penalties = torch.tensor([[1.05], [1.5], [1.0], [2.0], [0.8], [1.3]])
-
-    expected = repetition_penalty.scale_seen_logits(logits, seen, penalties)
-    actual = sampling.scale_seen_logits(logits, seen, penalties)
-    assert torch.equal(actual, expected)
