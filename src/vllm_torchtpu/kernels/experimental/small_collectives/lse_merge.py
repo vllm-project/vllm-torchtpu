@@ -34,8 +34,9 @@ The kernel, per core, in order:
    ``tc = T / chunks`` tokens, and signals the barrier.
 2. Relayouts each chunk head-major (``[tc, H, D] -> [H, tc, D]``), so core
    ``r``'s heads of a chunk are one contiguous ``[hl, tc, D]`` block, and pushes
-   that block into slot (chunk, me) of core ``r``'s receive buffer. The
-   relayout of chunk c + 1 overlaps the sends of chunk c.
+   that block into slot (chunk, me) of core ``r``'s receive buffer, to cores
+   me + 1, me + 2, ... in that order. The relayout of chunk c + 1 overlaps the
+   sends of chunk c.
 3. Pushes its log-sum-exp ``[T, H]`` into slot ``me`` of every core.
 4. Computes the weights of every sender, token and head from the gathered
    log-sum-exps, then selects the columns of its own ``hl`` heads with one
@@ -216,6 +217,10 @@ def small_lse_merge(
         def to_peer(j):
             return peer(j, axis, data_rank)
 
+        def peer_of(index):
+            """Device id of the core at a traced mesh index."""
+            return {axis: index} if data_rank else (index,)
+
         def in_copy(c):
             return pltpu.make_async_copy(
                 x_hbm.at[pl.ds(c * tc, tc)], xbuf.at[c], in_sems.at[c]
@@ -226,18 +231,19 @@ def small_lse_merge(
             send[c] = pltpu.einshape("thd->htd", xbuf[c])
 
         def send_chunk(c):
-            for j in range(n):
-
-                @pl.when(jnp.int32(j) != me)
-                def _(j=j):
-                    pltpu.make_async_remote_copy(
-                        src_ref=send.at[c, pl.ds(j * hl, hl)],
-                        dst_ref=recv.at[c, me],
-                        send_sem=send_sem,
-                        recv_sem=recv_sems.at[c],
-                        device_id=to_peer(j),
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
+            # Core me sends to me + 1, me + 2, ... (mod n), so no two cores
+            # start on the same receiver: 4 us faster than every core sending
+            # to 0, 1, 2, ... at n=16 on tpu7x 2x2x2 (j-7d826bc1).
+            for step in range(1, n):
+                dest = lax.rem(me + step, n)
+                pltpu.make_async_remote_copy(
+                    src_ref=send.at[c, pl.ds(dest * hl, hl)],
+                    dst_ref=recv.at[c, me],
+                    send_sem=send_sem,
+                    recv_sem=recv_sems.at[c],
+                    device_id=peer_of(dest),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
 
             own = send.at[c, pl.ds(pl.multiple_of(me * hl, hl), hl)]
             pltpu.make_async_copy(own, recv.at[c, me], local_sems.at[c]).start()
