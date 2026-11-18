@@ -226,8 +226,14 @@ def _mx_encode(g, jnp):
 
 
 def _mx_decode(nib, scales_u8, jnp):
-    grid = jnp.asarray(E2M1_GRID, jnp.float32)
-    mag = grid[(nib & 7).astype(jnp.int32)]
+    # Compares and selects, not a table lookup: on the TPU ``grid[codes]`` is an XLA
+    # gather per value (the main class's 16-page dequant spent 442 of 448 ms in it,
+    # j-84136a6b-98f3-48a8-9dba).
+    code = nib & 7
+    mag = jnp.zeros(code.shape, jnp.float32)
+    for k, v in enumerate(E2M1_GRID):
+        if v:
+            mag = jnp.where(code == k, jnp.float32(v), mag)
     val = jnp.where((nib >> 3) == 1, -mag, mag)
     return val * _pow2(scales_u8.astype(jnp.int32) - SCALE_BIAS, jnp)
 

@@ -928,19 +928,27 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
 
     def _fp4_slots_fit(self, keys) -> bool:
-        """Whether a load's main-class keys find staging slots now. A load needing
-        more slots than exist is let through (it fails, as before) rather than
-        waiting forever."""
+        """Whether a load's FP4 keys find staging slots now, in every FP4 kind's pool
+        (main, gdn). A load needing more slots of a kind than its pool holds is let
+        through (it fails, as before) rather than waiting forever."""
         manager = self._raiden_manager
-        fc = manager.fp4_class
-        if fc is None:
+        kinds = getattr(manager, "fp4_kinds", None)
+        if not kinds:
             return True
-        need = sum(1 for k in keys if manager.class_of(k) == fc)
-        if need == 0:
+        need: dict[str, int] = {}
+        for k in keys:
+            kind = kinds.get(manager.class_of(k))
+            if kind is not None:
+                need[kind] = need.get(kind, 0) + 1
+        if not need:
             return True
-        free = manager.fp4_free_slots
-        total = getattr(getattr(manager, "_fp4", None), "total", None)
-        return need <= free or (total is not None and need > total)
+        free = manager.fp4_free_by_kind()
+        pools = getattr(manager, "_fp4_pools", {})
+        for kind, n in need.items():
+            total = getattr(pools.get(kind), "total", None)
+            if n > free.get(kind, 0) and not (total is not None and n > total):
+                return False
+        return True
 
     def _submit_fp4_deferred_loads(self) -> None:
         """Submits, in arrival order, the loads that waited for a quantize of one of
