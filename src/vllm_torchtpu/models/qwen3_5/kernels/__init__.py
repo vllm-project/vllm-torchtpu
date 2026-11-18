@@ -11,5 +11,5 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5 kernel copies; each file carries a provenance header naming its source
-path and commit."""
+"""Qwen3.5 kernels. A file copied from another kernel carries a provenance header
+naming its source path and commit."""
