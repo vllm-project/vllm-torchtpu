@@ -1806,10 +1806,7 @@ def sparse_mla_pcp_write_split(
         taken = tuple(ws.take_chunk(c, pages, 0, prefetch_chunk_pages) for c in caches)
         # The take happens before anything downstream of the returned caches.
         caches, taken = jax.lax.optimization_barrier((caches, taken))
-        return (
-            *caches,
-            *(ws.gather_taken(t, axis_name=dcp_axis_name) for t in taken),
-        )
+        return (*caches, *ws.gather_taken_pair(*taken, axis_name=dcp_axis_name))
 
     return jax.jit(
         shard_map.shard_map(

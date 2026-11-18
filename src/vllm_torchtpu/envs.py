@@ -867,7 +867,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PCP_WS_NO_ZERO_FILL": env_bool("TPU_PCP_WS_NO_ZERO_FILL", default=False),
     # PCP manager split prefill: gather the latent workspace's first chunk in
     # the split-row write op, outside the attention's lax.cond / chunk loop,
-    # so it runs as an async all-gather overlapping the indexer. Same output.
+    # so XLA can run it as an async all-gather. Same output. It is only async
+    # as a SparseCore all-gather: NoPE + RoPE are one 36 MiB collective per
+    # 64k-token chunk, so also set SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES at
+    # or below 33554432 (default 64 MiB on v7x keeps it a synchronous
+    # TensorCore all-gather). XLA does not overlap it across a lax.cond (the
+    # indexer's), only with top-level work (e.g. the q projections).
     "TPU_PCP_GATHER_HOIST": env_bool("TPU_PCP_GATHER_HOIST", default=False),
     # DCP sparse MLA: chunks of at most this many query tokens take the
     # decode-sized (small-chunk) path -- TPU_DCP_MLA_SMALL_CHUNK_BATCH tokens
