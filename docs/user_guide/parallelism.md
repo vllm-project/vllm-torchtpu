@@ -147,3 +147,17 @@ Sizing:
 
 - `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the prefills in a step need more context tokens than this, the runner runs the step as several forwards. Must be at least `--max-model-len`. A prefill forward allocates a temporary workspace of this many tokens, reused across layers: about 0.6 GB for the MLA latents and 0.27 GB for the indexer K at the default. KV cache sizing does not reserve it yet, so leave room for it in `--gpu-memory-utilization`.
 - `TPU_PCP_KV_CHUNK_TOKENS` (default `65536`): context tokens moved by each all-gather.
+
+## 6. Worker CPU Pinning After Warmup
+
+A tpu7x host has two NUMA nodes, each with half of the chips. Some model directories turn on CPU pinning for their architectures (`register_cpu_pinning` in `vllm_torchtpu/worker/cpu_pinning.py`); other models are not pinned.
+
+For a registered architecture, each worker changes the CPU affinity of its threads after warmup, so warmup compiles still use every CPU of the host. Each thread is limited to the CPUs of its chip's NUMA node that it may already use, so a `taskset`, `numactl` or cgroup CPU set is never widened. Memory placement does not change. Each worker logs one line:
+
+```text
+CPU pin: rank 0 local_rank 0 node 0 cpus [0, 1, ...] (N threads)
+```
+
+When the node cannot be found or does not overlap the allowed CPUs, the worker logs `CPU pin skipped: ...` and stays unpinned.
+
+The only way to turn it off is vLLM's `--numa-bind`: with it, the worker logs `CPU pin skipped: --numa-bind is set` and keeps the binding that `numactl` gave it at launch. On TPU, `--numa-bind` also needs `--numa-bind-nodes`, because vLLM cannot detect the node of each TPU device.
