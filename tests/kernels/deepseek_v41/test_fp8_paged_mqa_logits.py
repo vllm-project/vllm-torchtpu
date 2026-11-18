@@ -158,3 +158,48 @@ def test_paged_mqa_logits_matches_vllm_reference(batch_size, next_n, page_size):
     np.testing.assert_array_equal(np.isneginf(logits), ~visible)
     diff = _calc_diff(np.where(visible, logits, 0), np.where(visible, ref, 0))
     assert diff < 1e-3, f"{diff=}"
+
+
+def test_unfilled_tiles_keep_every_visible_score():
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 scoring requires TPU")
+    rng = np.random.default_rng(3)
+    page_size, max_model_len = 256, 262144  # Four 64K key tiles.
+    counts = np.array([6, 6, 4])
+    # One tile, the first block of the third tile, and empty rows.
+    bases = np.array([1000, 2 * 65536 + 3, 0])
+    lengths = np.concatenate([b + np.arange(c) for b, c in zip(bases, counts)])
+    per_request = max_model_len // page_size
+    layout = PackedFP8Layout(len(counts) * per_request, page_size=page_size)
+    table = rng.permutation(layout.pages).reshape(len(counts), per_request)
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    pool, _ = _pack(keys, layout)
+    tokens = len(lengths)
+    q = jnp.asarray(rng.normal(size=(tokens, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.01, 0.1, (tokens, 32)), jnp.float32)
+
+    def scores(fill_unscored):
+        return np.asarray(
+            fp8_paged_mqa_logits(
+                q,
+                jnp.asarray(pool),
+                weights,
+                jnp.asarray(lengths, jnp.int32),
+                jnp.asarray(table, jnp.int32),
+                query_start_loc=jnp.asarray(
+                    np.concatenate(([0], np.cumsum(counts))), jnp.int32
+                ),
+                max_model_len=max_model_len,
+                q_scale=jnp.ones_like(weights),
+                query_size=6,
+                cache_layout=layout,
+                fill_unscored=fill_unscored,
+            )
+        )
+
+    filled, unfilled = scores(True), scores(False)
+    # Readers mask at the length but may load the rest of its 8-key block.
+    for row, length in enumerate(lengths):
+        end = -(-length // 8) * 8
+        np.testing.assert_array_equal(unfilled[row, :end], filled[row, :end])
+        assert np.isneginf(filled[row, length:]).all()

@@ -49,10 +49,11 @@ def _pick(future, ends, values):
 class _DenseKernel:
     """Refs and static tiling of one call."""
 
-    def __init__(self, smem, inputs, refs, config, info, layout, reuse_keys):
+    def __init__(self, smem, inputs, refs, config, info, layout, reuse_keys, fill):
         self.out, scratch = refs
         self.offsets, self.lengths, query_start = smem
         self.config, self.layout, self.reuse_keys = config, layout, reuse_keys
+        self.fill_unscored = fill
         self.mxu_size, self.sublanes = info.mxu_column_size, info.num_sublanes
         self.q, weights, self.pool, self.table = inputs
         buffers, semaphores = scratch
@@ -169,7 +170,8 @@ class _DenseKernel:
             initial.append(self.next_query(initial[-1]))
         for slot in range(8):
             self.counts[slot] = zero
-        self.padding[...] = jnp.full(self.padding.shape, -jnp.inf, jnp.float32)
+        if self.fill_unscored:
+            self.padding[...] = jnp.full(self.padding.shape, -jnp.inf, jnp.float32)
         self.copy_queries(initial[0], 0, zero=True)
         tiles = tuple(self.live_tiles(q) for q in initial)
         ready = jnp.int32(-1) if self.reuse_keys else zero
@@ -392,8 +394,9 @@ class _QueryBlock:
         for local in range(min(k.tiles, 2)):
             live = jnp.where(self.tile_count > local, query.count, 0)
             k.counts[2 * q_slot + local] = live
-        lax.fori_loop(self.tile_count, k.tiles, self.pad_tile, None)
-        k.counts[6 + q_slot] = (k.tiles - self.tile_count) * query.count
+        if k.fill_unscored:
+            lax.fori_loop(self.tile_count, k.tiles, self.pad_tile, None)
+            k.counts[6 + q_slot] = (k.tiles - self.tile_count) * query.count
 
         ready = jnp.minimum(2, self.next_tiles + self.ahead_tiles)
         if k.reuse_keys:
@@ -415,6 +418,7 @@ def _kernel(static, offsets, lengths, query_start, inputs, *refs):
         "query_size",
         "query_count",
         "reuse_keys",
+        "fill_unscored",
     )
 )
 def fp8_paged_mqa_logits(
@@ -432,8 +436,9 @@ def fp8_paged_mqa_logits(
     query_start: jax.Array | int = 0,
     query_count: int | None = None,
     reuse_keys: bool = False,
+    fill_unscored: bool = True,
 ) -> jax.Array:
-    """Return FP32 scores for the query window, with invalid positions set to -inf.
+    """Return FP32 scores for the query window; invalid scored positions are -inf.
 
     Args:
         q: FP8 E4M3FN [T,32,128], in request order.
@@ -450,6 +455,10 @@ def fp8_paged_mqa_logits(
         query_count: Output rows; defaults to the full query batch.
         reuse_keys: Keep a single complete K tile resident across query groups
             belonging to the same request. Multi-tile outputs retain prefetching.
+        fill_unscored: Write -inf to the key tiles past a query tile's longest
+            row. False leaves them unwritten, so the output costs only the live
+            context; scored tiles stay -inf past each row's length. Use it only
+            when every reader masks each row at its length.
     """
     tokens, heads, dim = q.shape
     tokens = tokens if query_count is None else query_count
@@ -498,7 +507,7 @@ def fp8_paged_mqa_logits(
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
     inputs = (q, weights * q_scale, banks, table)
     reuse_keys = reuse_keys and width == config.key_tile
-    kernel = partial(_kernel, (config, info, layout, reuse_keys))
+    kernel = partial(_kernel, (config, info, layout, reuse_keys, fill_unscored))
     out_shape = jax.ShapeDtypeStruct((tokens, width), jnp.float32)
     result = pl.pallas_call(
         kernel,

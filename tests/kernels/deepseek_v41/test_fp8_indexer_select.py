@@ -40,20 +40,20 @@ def _pack(keys, layout):
     return jnp.asarray(pool.reshape(-1, 128))
 
 
-def _select(rng, counts, padding, short):
+def _select(rng, counts, padding, short, width):
     """Request-major rows, then `padding` rows of request -1; returns inputs too."""
     requests = np.concatenate(
         (np.repeat(np.arange(len(counts)), counts), [-1] * padding)
     )
-    low, high = (0, TOPK) if short else (TOPK + 1, WIDTH)
+    low, high = (0, TOPK) if short else (TOPK + 1, width)
     lengths = np.where(requests >= 0, rng.integers(low, high + 1, TOKENS), 0)
     lengths = jnp.asarray(lengths, jnp.int32)
-    layout = PackedFP8Layout(512, page_size=PAGE)
+    layout = PackedFP8Layout(max(512, width // PAGE), page_size=PAGE)
     keys = jax.random.normal(
         jax.random.key(3), (layout.pages * PAGE, 128), jnp.bfloat16
     )
     pool = _pack(keys, layout)
-    table = rng.integers(0, layout.pages, (len(counts), WIDTH // PAGE)).astype(np.int32)
+    table = rng.integers(0, layout.pages, (len(counts), width // PAGE)).astype(np.int32)
     q = jnp.asarray(rng.normal(size=(TOKENS, 32, 128)), jnp.float8_e4m3fn)
     weights = jnp.asarray(rng.uniform(0.01, 0.1, (TOKENS, 32)), jnp.float32)
     # As query_start_loc: trailing padding rows are uncounted.
@@ -76,15 +76,17 @@ def _select(rng, counts, padding, short):
             False,
             False,
             True,
-            WIDTH,
+            width,
         )[0]
     )
     selected = np.asarray(select(q, weights, lengths))
     return selected, (q, pool, weights, lengths, jnp.asarray(table), offsets, layout)
 
 
+# Four 64K key tiles: rows of a short query tile leave the later tiles unscored.
+@pytest.mark.parametrize("width", [WIDTH, 4 * 65536], ids=["one_tile", "four_tiles"])
 @pytest.mark.parametrize("short", [False, True], ids=["long", "short_batch"])
-def test_ragged_requests_select_top_scores(short):
+def test_ragged_requests_select_top_scores(short, width):
     """Requests that are not whole six-query groups, then padding rows."""
     if jax.default_backend() != "tpu":
         pytest.skip("Packed FP8 selection requires TPU")
@@ -93,7 +95,7 @@ def test_ragged_requests_select_top_scores(short):
     counts = counts[np.cumsum(counts) <= TOKENS - padding]
     counts[-1] += TOKENS - padding - counts.sum()
     selected, (q, pool, weights, lengths, table, offsets, layout) = _select(
-        rng, counts, padding, short
+        rng, counts, padding, short, width
     )
     real, lengths = int(counts.sum()), np.asarray(lengths)
     assert (selected[real:] == -1).all()
@@ -111,7 +113,7 @@ def test_ragged_requests_select_top_scores(short):
             jnp.asarray(lengths[:real]),
             table,
             query_start_loc=offsets,
-            max_model_len=WIDTH,
+            max_model_len=width,
             q_scale=jnp.ones_like(weights[:real]),
             query_size=6,
             cache_layout=layout,

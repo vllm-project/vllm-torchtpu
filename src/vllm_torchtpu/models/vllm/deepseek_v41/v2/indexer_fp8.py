@@ -606,6 +606,9 @@ def _select_fp8_indexer_jax(
             query_start=start if shared else 0,
             query_count=rows,
             reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
+            # Its readers mask each row at its length, reading -inf at most to
+            # the end of the row's last 8-key block, which a scored tile holds.
+            fill_unscored=not stream_select,
         )
         if group is None:
             return scores

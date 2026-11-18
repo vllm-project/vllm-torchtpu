@@ -104,7 +104,8 @@ def block_topk(
     """Return ascending top-k key IDs per row, padded with -1.
 
     Args:
-        scores: FP32 [rows, width]; keys at or past a row's length are -inf.
+        scores: FP32 [rows, width]; keys from a row's length to the end of its
+            last block are -inf. Later keys are never read unmasked.
         lengths: Int32 [rows] visible keys, clipped to [0, width].
         k: Selected keys per row. Negative infinity is never selected.
         block_size: Keys per block maximum.
