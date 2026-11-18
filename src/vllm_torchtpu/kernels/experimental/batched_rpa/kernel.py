@@ -645,6 +645,7 @@ def rpa_body(
                 cfgs.bkv_sz,
             ),
             bq_start=bq_start,
+            stitch_meta=stitch_meta,
             step_meta=step_meta,
             cfgs=cfgs,
         )
