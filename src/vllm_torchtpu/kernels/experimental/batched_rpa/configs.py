@@ -245,6 +245,14 @@ class ServingConfigs:
     native_fp8: NativeFp8 = NATIVE_FP8_OFF
     native_fp8_prefill: NativeFp8 = NATIVE_FP8_OFF
     # Run the DECODE softmax in base 2: log2(e) is folded into the score
+    # scale and the exponentials are exp2. Equal in exact arithmetic, but
+    # where the scale is folded into q (`flash_attention.q_folded_scale`) it
+    # is cast to q's dtype: for a bf16 q at head_dim 256, log2(e) / 16 =
+    # 0.09016844 rounds to 0.09033203, so the scores are scaled 0.18% more
+    # than on the base-e path, and q * scale takes one more bf16 rounding.
+    # Not applied when the kernel returns the LSE (return_lse, as the DCP
+    # passes do): callers merge LSEs in natural log. The wrapper logs that
+    # once.
     decode_exp2: bool = False
 
     def __post_init__(self):

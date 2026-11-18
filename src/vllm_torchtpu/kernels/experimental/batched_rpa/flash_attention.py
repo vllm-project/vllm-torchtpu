@@ -57,6 +57,12 @@ def static_pv(cfgs: configs.RpaConfigs) -> bool:
 def decode_exp2(cfgs: configs.RpaConfigs) -> bool:
     """Whether this kernel's softmax runs in base 2 (`ServingConfigs.decode_exp2`).
 
+    Softmax is invariant to the base change in exact arithmetic. Where the
+    scale is folded into q, log2(e) * sm_scale is cast to q's dtype and
+    q * scale is rounded again: for a bf16 q at head_dim 256 the scale
+    0.09016844 becomes 0.09033203, so the scores are scaled 0.18% more than
+    on the base-e path. On the f32 score multiply (no fold) only the last
+    bits change.
     """
     return (
         cfgs.serve.decode_exp2
