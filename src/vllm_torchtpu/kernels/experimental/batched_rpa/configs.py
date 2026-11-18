@@ -144,7 +144,6 @@ class Fp8Operand(enum.StrEnum):
     - ROW: one dynamic scale per row of the operand.
     - SPLIT: ROW, with the rounding residual quantized as a second fp8 half
       stacked under the first along the matmul rows: about bf16 accuracy for
-      twice the LHS rows.
     """
 
     OFF = enum.auto()
@@ -154,7 +153,6 @@ class Fp8Operand(enum.StrEnum):
 
 @dataclasses.dataclass(frozen=True)
 class NativeFp8:
-    """Which DECODE matmuls run natively in the fp8 KV dtype.
 
     `qk` quantizes q per (token, head) row; `pv` quantizes the softmax weights
     per row. Every operand OFF (the default) is the dequantizing kernel.
@@ -223,18 +221,13 @@ class ServingConfigs:
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
             )
-        if self.native_fp8.any() and jnp.dtype(self.dtype_kv) not in (
+
             jnp.dtype(jnp.float8_e4m3fn),
             jnp.dtype(jnp.float8_e5m2),
         ):
             raise ValueError(
-                f"native_fp8={self.native_fp8} runs matmuls in the fp8 KV dtype, "
-                f"but the KV cache is {jnp.dtype(self.dtype_kv)}; use an fp8 KV "
-                "cache or leave native_fp8 off."
             )
-        if self.native_fp8.qk is not Fp8Operand.OFF and self.scale_q is not None:
             raise ValueError(
-                "native_fp8.qk with a static q scale: the q-scale path already "
                 "casts q to the KV dtype; pass one or the other."
             )
 
