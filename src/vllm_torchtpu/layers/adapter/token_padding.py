@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -56,6 +57,29 @@ class TokenPaddingState:
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        if "_preflat_base" in self.__dict__:
+            self._preflat_base_key = key
+
+    def update_from_device(
+        self,
+        local_valid_tokens: int,
+        local_padded_tokens: int,
+        device_mask: Callable[[], torch.Tensor],
+    ) -> None:
+        """update(), but the mask comes from ``device_mask()`` (a cached device
+        tensor of the same shape, e.g. Eagle3Proposer._device_constant) rather
+        than a host build and a synchronous H2D. Keeps the REUSE and PREFLAT
+        bookkeeping update() keeps (VLLM_TPU_MTP_DRAFT_PADDING_MASK)."""
+        key = (local_valid_tokens, local_padded_tokens)
+        if envs.VLLM_TPU_PREFLAT_FWD_ARGS and self._preflat_swap(key):
+            return
+        if "_preflat_base" in self.__dict__:
+            self._preflat_restore()
+        if envs.VLLM_TPU_TOKEN_PADDING_REUSE:
+            if self.__dict__.get("_last_key") == key:
+                return
+            self._last_key = key
+        self.local_padding_mask.copy_(device_mask())
         if "_preflat_base" in self.__dict__:
             self._preflat_base_key = key
 

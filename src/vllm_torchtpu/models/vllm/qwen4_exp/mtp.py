@@ -358,6 +358,11 @@ class Qwen4ExpMTP(nn.Module):
             return False
         target = layers[-1].self_attn
         width = target.max_selected_tokens
+        # VLLM_TPU_MTP_DRAFT_DECODE_ROWS: one row past the budget. The draft
+        # slices the carried rows by its token count, and a bound at the largest
+        # bucket can pin that bucket's trace (compilation/shape_variants.py).
+        if vllm_torchtpu_envs.VLLM_TPU_MTP_DRAFT_DECODE_ROWS:
+            max_tokens += 1
         sink = torch.full(
             (max_tokens, width), -1, dtype=torch.int32, device=target.rope_cache.device
         )

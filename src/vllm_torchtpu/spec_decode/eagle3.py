@@ -18,8 +18,10 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.spec_decode.shard_argmax import greedy_draft_token
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError, MegakernelSetupError
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     fixed_moe_collection_chunks,
 )
@@ -439,6 +441,12 @@ class Eagle3Proposer:
         # Draft step 0 evaluated at each request's last token only
         # (VLLM_TPU_MTP_DRAFT_ROWS). Resolved in load_model.
         self._draft_rows = False
+        # VLLM_TPU_MTP_DRAFT_DECODE_ROWS: step 0 at decode_rows_count(T) rows
+        # as its own program (_build_step0_programs), whether it has run once,
+        # and whether the capacity-row program (the draft's own) has.
+        self._decode_rows_model: torch.nn.Module | None = None
+        self._decode_rows_warm = False
+        self._draft_step0_warm = False
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -514,6 +522,7 @@ class Eagle3Proposer:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
         self._draft_rows = self._resolve_draft_rows()
+        self._build_step0_programs()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -607,6 +616,62 @@ class Eagle3Proposer:
             return False
         logger.info("MTP draft step 0 runs at each request's last token only.")
         return True
+
+    def _build_step0_programs(self) -> None:
+        """Build the step-0 program of VLLM_TPU_MTP_DRAFT_DECODE_ROWS."""
+        if not envs.VLLM_TPU_MTP_DRAFT_DECODE_ROWS:
+            return
+        draft_dims = getattr(self.draft_model, "_dynamic_arg_dims", None)
+        if not self._draft_rows or draft_dims is None:
+            logger.warning(
+                "VLLM_TPU_MTP_DRAFT_DECODE_ROWS needs VLLM_TPU_MTP_DRAFT_ROWS on "
+                "a compiled MTP draft; ignoring it."
+            )
+            return
+        from vllm_torchtpu.spec_decode.mtp_loop_model import (
+            build_mtp_step0_rows_model,
+        )
+
+        assert self.draft_model is not None
+        K = self.speculative_config.num_speculative_tokens
+        with (
+            set_model_tag("eagle_head"),
+            set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+            ),
+            set_current_vllm_config(self.draft_vllm_config),
+        ):
+            self._decode_rows_model = build_mtp_step0_rows_model(
+                vllm_config=self.draft_vllm_config,
+                prefix=f"mtp_step0_decode_rows_k{K}",
+                mtp=self.draft_model,
+                dynamic_arg_dims=draft_dims,
+                tokens_per_request=K + 1,
+            )
+        logger.info(
+            "MTP draft step 0 of a step with at most %d * ceil(T / %d) "
+            "requests evaluates that many rows.",
+            16,
+            16 * (K + 1),
+        )
+
+    def _min_draft_rows_len(self) -> int:
+        """The smaller request capacity a draft chunk can carry."""
+        runner = self.runner
+        caps = [
+            c
+            for c in (runner.num_reqs_max_model_len, runner.num_reqs_most_model_len)
+            if c is not None
+        ]
+        return int(min(caps))
+
+    def _decode_rows_serves(self, tokens: int) -> bool:
+        """Whether the decode-rows step-0 program has a ``tokens`` bucket:
+        those where it evaluates fewer rows than the capacity-row program."""
+        from vllm_torchtpu.spec_decode.mtp_loop_model import decode_rows_count
+
+        K = self.speculative_config.num_speculative_tokens
+        return decode_rows_count(tokens, K + 1) < self._min_draft_rows_len()
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.
@@ -895,6 +960,7 @@ class Eagle3Proposer:
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
+        self._mark_draft_padding(chunk.num_reqs, num_tokens)
         loop, warm_attr = self._mtp_fused_loop, "_mtp_fused_loop_warm"
         if self._mk_fused_loop_for(num_tokens) is not None:
             loop, warm_attr = self._mtp_fused_loop_mk, "_mtp_fused_loop_mk_warm"
@@ -1519,6 +1585,28 @@ class Eagle3Proposer:
         ).argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
+    def _mark_draft_padding(self, num_valid: int, num_rows: int) -> None:
+        """VLLM_TPU_MTP_DRAFT_PADDING_MASK: the MoE padding mask for a draft
+        forward over ``num_rows`` rows of which the first ``num_valid`` are
+        real. The next target forward writes its own (_token_padding_update)."""
+        state = token_padding._padding_state
+        if not envs.VLLM_TPU_MTP_DRAFT_PADDING_MASK or state is None:
+            return
+        length = state.local_padding_mask.shape[0]
+
+        def build() -> torch.Tensor:
+            host = torch.zeros(length, dtype=torch.bool)
+            host[num_valid:num_rows] = True
+            return host
+
+        state.update_from_device(
+            num_valid,
+            num_rows,
+            lambda: self._device_constant(
+                ("draft_padding", num_valid, num_rows, length), build
+            ),
+        )
+
     def _device_constant(self, key, build) -> torch.Tensor:
         """A small read-only device tensor that depends only on `key` (e.g.
         the request count), uploaded once instead of every step."""
@@ -1809,27 +1897,41 @@ class Eagle3Proposer:
                 positions_carry_per_chunk.append(positions_carry)
                 draft_tokens_per_chunk.append([fused_token0])
                 continue
-            last_hidden, hidden = self._forward_draft(
-                chunk=chunk,
-                input_ids=input_ids,
-                positions=positions,
-                target_hidden_states=target_hidden_states,
-                step_idx=0,
-                seq_lens_delta=0,
-                num_rejected_np=rejected_np_per_chunk[ci],
-                num_tokens_padded=input_ids.shape[0],
-                draft_rows=(
-                    (
-                        self._seed_extras[id(chunk)][0]
-                        if id(chunk) in self._seed_extras
-                        else self._padded_draft_rows(
-                            last_token_indices, self._draft_rows_len(chunk)
-                        )
+            capacity_rows = (
+                (
+                    self._seed_extras[id(chunk)][0]
+                    if id(chunk) in self._seed_extras
+                    else self._padded_draft_rows(
+                        last_token_indices, self._draft_rows_len(chunk)
                     )
-                    if self._draft_rows
-                    else None
-                ),
+                )
+                if self._draft_rows
+                else None
             )
+            if self._decode_rows_model is None and not (
+                envs.VLLM_TPU_MTP_DRAFT_PADDING_MASK and self._draft_rows
+            ):
+                last_hidden, hidden = self._forward_draft(
+                    chunk=chunk,
+                    input_ids=input_ids,
+                    positions=positions,
+                    target_hidden_states=target_hidden_states,
+                    step_idx=0,
+                    seq_lens_delta=0,
+                    num_rejected_np=rejected_np_per_chunk[ci],
+                    num_tokens_padded=input_ids.shape[0],
+                    draft_rows=capacity_rows,
+                )
+            else:
+                last_hidden, hidden = self._forward_draft_step0(
+                    chunk,
+                    input_ids,
+                    positions,
+                    target_hidden_states,
+                    rejected_np_per_chunk[ci],
+                    last_token_indices,
+                    capacity_rows,
+                )
             host_phases.mark("dp_forward0")
             # VLLM_TPU_DRAFT_ROWS_FRESH: (untrimmed last_hidden, hidden, rows)
             # when step 0's outputs are trimmed by a view below.
@@ -2990,6 +3092,83 @@ class Eagle3Proposer:
             last_hidden = hidden = out
         return last_hidden, hidden
 
+    def _forward_draft_step0(
+        self,
+        chunk: DraftChunkInputs,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        num_rejected_np: np.ndarray | None,
+        last_token_indices: torch.Tensor,
+        capacity_rows: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draft step 0 of one chunk on the program that serves it, with
+        VLLM_TPU_MTP_DRAFT_DECODE_ROWS or VLLM_TPU_MTP_DRAFT_PADDING_MASK.
+
+        With VLLM_TPU_MTP_DRAFT_ROWS the draft's own program evaluates the
+        chunk's request capacity of rows (``capacity_rows``).
+        VLLM_TPU_MTP_DRAFT_DECODE_ROWS runs a chunk with at most
+        decode_rows_count(T) requests on a second program that evaluates that
+        many. VLLM_TPU_MTP_DRAFT_PADDING_MASK marks the evaluated rows past the
+        chunk's requests as MoE padding first.
+        """
+        from vllm_torchtpu.spec_decode.mtp_loop_model import decode_rows_count
+
+        tokens = input_ids.shape[0]
+        K = self.speculative_config.num_speculative_tokens
+
+        def run(draft_rows, step0_model=None, serves=None):
+            if draft_rows is not None:
+                # The MoE runs on the evaluated rows: decode rows for the
+                # decode-row program (draft_rows is then token-length).
+                evaluated = (
+                    decode_rows_count(draft_rows.shape[0], K + 1)
+                    if step0_model is not None
+                    else draft_rows.shape[0]
+                )
+                self._mark_draft_padding(chunk.num_reqs, evaluated)
+            return self._forward_draft(
+                chunk=chunk,
+                input_ids=input_ids,
+                positions=positions,
+                target_hidden_states=target_hidden_states,
+                step_idx=0,
+                seq_lens_delta=0,
+                num_rejected_np=num_rejected_np,
+                num_tokens_padded=tokens,
+                draft_rows=draft_rows,
+                step0_model=step0_model,
+                serves=serves,
+            )
+
+        decode = self._decode_rows_model
+        if (
+            capacity_rows is None
+            or decode is None
+            or not self._decode_rows_serves(tokens)
+            or chunk.num_reqs > decode_rows_count(tokens, K + 1)
+        ):
+            if not self._draft_step0_warm and decode is not None:
+                # The first call compiles; its outputs can carry symbolic
+                # sizes, so run again compiled (same KV writes).
+                run(capacity_rows)
+            self._draft_step0_warm = True
+            return run(capacity_rows)
+        if not self._draft_step0_warm:
+            # Compile the capacity-row program now, inside the warmup, rather
+            # than on the first step with more requests than decode rows. It
+            # writes the same KV entries the call below writes again.
+            run(capacity_rows)
+            self._draft_step0_warm = True
+        serves = self._decode_rows_serves
+        # Token-length rows (-1 past the requests); the program evaluates the
+        # first decode_rows_count(T) of them.
+        rows = self._padded_draft_rows(last_token_indices, tokens)
+        if not self._decode_rows_warm:
+            run(rows, decode, serves)
+            self._decode_rows_warm = True
+        return run(rows, decode, serves)
+
     def _forward_draft(
         self,
         chunk: DraftChunkInputs,
@@ -3004,7 +3183,12 @@ class Eagle3Proposer:
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
         draft_rows: torch.Tensor | None = None,
+        step0_model: torch.nn.Module | None = None,
+        serves: Callable[[int], bool] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``step0_model``: an ``MtpStep0RowsModel`` program running step 0
+        instead of the draft's own, compiled for the ``serves`` buckets
+        (VLLM_TPU_MTP_DRAFT_DECODE_ROWS)."""
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
             step_idx=step_idx,
@@ -3025,13 +3209,16 @@ class Eagle3Proposer:
             "positions": positions,
             "hidden_states": target_hidden_states,
         }
-        if self.speculative_config.method == "mtp":
+        if self.speculative_config.method == "mtp" and step0_model is None:
             kwargs["spec_step_idx"] = step_idx
         if draft_rows is not None:
             kwargs["draft_rows"] = draft_rows
 
-        model = self._draft_model_for_step(step_idx)
+        model = step0_model or self._draft_model_for_step(step_idx)
         with (
+            bucket_filter.serving(serves)
+            if serves is not None
+            else contextlib.nullcontext(),
             set_model_tag("eagle_head"),
             set_forward_context(
                 attn_metadata,
