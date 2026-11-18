@@ -46,6 +46,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from tests.runner.runner_input_test_utils import (
+    attention_layer_mock as _attention_layer_mock,
+)
 from vllm_torchtpu import utils
 from vllm_torchtpu.core.runner_slot_mamba import RunnerSlotMambaSpec
 from vllm_torchtpu.layers.adapter.attention import (
@@ -66,18 +69,6 @@ from vllm_torchtpu.runner.kv_cache_manager import (
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
-
-
-def _attention_layer_mock():
-    """An `Attention` mock whose `get_attn_backend()` returns a real backend.
-
-    `get_kv_cache_spec` measures page padding through the backend the layer
-    reports. A bare `MagicMock` returns a mock shape, which iterates as empty
-    and silently makes that arithmetic meaningless.
-    """
-    layer = MagicMock(spec=Attention)
-    layer.get_attn_backend.return_value = PallasAttentionBackend
-    return layer
 
 
 class DummyMamba(MambaBase):

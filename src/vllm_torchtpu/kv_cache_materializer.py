@@ -330,12 +330,14 @@ def make_attention_cache_tensor(
 def can_share_attention_cache(
     specs: Sequence[KVCacheSpec],
     attn_backend: Any,
+    kernel_block_size: int | None = None,
 ) -> bool:
     """Return whether `AttentionSpec`s can share one 4D region tensor.
 
-    Specs may differ in `block_size` when each `block_size` is a multiple of
-    `min_block_size` and `split` native `min_block_size` pages divide
-    `page_size_bytes`.
+    `kernel_block_size` is the page size the pool is built with; `None` uses
+    the smallest `block_size` in `specs`. Specs may differ in `block_size`
+    when each one is a multiple of `kernel_block_size` and `split` native
+    kernel pages divide `page_size_bytes`.
     """
     if not specs:
         return False
@@ -352,13 +354,14 @@ def can_share_attention_cache(
         ):
             return False
         attn_specs.append(spec)
-    min_block_size = min(s.block_size for s in attn_specs)
+    if kernel_block_size is None:
+        kernel_block_size = min(s.block_size for s in attn_specs)
     for spec in attn_specs:
-        if spec.block_size % min_block_size != 0:
+        if spec.block_size % kernel_block_size != 0:
             return False
-        split = spec.block_size // min_block_size
+        split = spec.block_size // kernel_block_size
         shape = attn_backend.get_kv_cache_shape(
-            1, min_block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+            1, kernel_block_size, spec.num_kv_heads, spec.head_size, spec.dtype
         )
         if spec.page_size_bytes % (split * math.prod(shape) * spec.dtype.itemsize):
             return False
@@ -370,31 +373,31 @@ def materialize_shared_attention_cache(
     layer_specs: Sequence[tuple[str, AttentionSpec]],
     tensor_size: int,
     num_blocks: int,
+    kernel_block_size: int,
     attn_backend: Any,
     device: torch.device,
 ) -> torch.Tensor:
     """Allocate one tensor for attention groups sharing scheduler pages.
 
-    Axis 1 uses `min(ls.block_size)`; `kernel_block_sizes` must match.
+    Axis 1 is `kernel_block_size`, the page size the block tables index.
     """
     if not layer_specs:
         raise ValueError("layer_specs must contain an attention layer")
     spec = layer_specs[0][1]
-    min_block_size = min(ls.block_size for _, ls in layer_specs)
     page_elements = tensor_size // (num_blocks * spec.dtype.itemsize)
     shapes = []
     for name, layer_spec in layer_specs:
         if (
             layer_spec.dtype != spec.dtype
-            or layer_spec.block_size % min_block_size != 0
+            or layer_spec.block_size % kernel_block_size != 0
             or layer_spec.page_size_bytes * num_blocks != tensor_size
         ):
             raise ValueError(f"Incompatible shared KV cache spec for {name}")
-        split = layer_spec.block_size // min_block_size
+        split = layer_spec.block_size // kernel_block_size
         shape = tuple(
             attn_backend.get_kv_cache_shape(
                 num_blocks * split,
-                min_block_size,
+                kernel_block_size,
                 layer_spec.num_kv_heads,
                 layer_spec.head_size,
                 spec.dtype,
@@ -414,9 +417,9 @@ def materialize_shared_attention_cache(
         packing = 4 // spec.dtype.itemsize
         pool_shape = (
             num_blocks,
-            min_block_size,
+            kernel_block_size,
             packing,
-            page_elements // (min_block_size * packing),
+            page_elements // (kernel_block_size * packing),
         )
     return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
 
