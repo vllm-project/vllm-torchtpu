@@ -687,6 +687,25 @@ def test_edge_declines_a_multi_chunk_previous_step(monkeypatch):
     assert l6_seedspec.edge(r, "x", prev, 0, K, 3 * 8 + 1, 8) is True
 
 
+def test_edge_never_acts_on_a_request_absent_from_the_previous_step(monkeypatch):
+    """The F2 boundary (QWEN4_EXP_PD_DRAFT_KV, prefill-leg drafter): a request whose KV (target state and, with F2, the
+    MTP draft layer's QSA pages) has just landed is not in the previous step's results, so its first decode step has no
+    previous row and no previous drafts: the collector's stock crossing from the landed column runs and the lever never
+    stages a speculative seed for it, whatever lands. (F2 ships the draft layer's KV, not draft tokens:
+    tpu_runner._prefill_only_mtp; the MTP draft is one QSA layer with no GDN / PLE state, mtp.py, so no mamba group.)"""
+    _set_lever(monkeypatch, "1")
+    r = NS(mamba_slot_read_offsets=torch.zeros(4, dtype=torch.int32), _mamba_ckpt_window=W, _mamba_state_pos={"x": 2})
+    prev = NS(copy_state=NS(completed=False), num_chunks=1)
+    assert l6_seedspec.edge(r, "x", prev, None, K, 3 * 8 + 1, 8) is False  # landed this step: no previous row
+    assert l6_seedspec.edge(r, "x", prev, 0, 0, 3 * 8 + 1, 8) is False  # in the previous step without drafts
+    assert not r.__dict__.get("_seedspec_pending")
+    kw = dict(seed=18, stride=4, groups=3, log_groups=(0, 1), p_join=0.5, p_leave=0.3, near_edge=True)
+    off = _run(monkeypatch, "", **kw)
+    on = _run(monkeypatch, "1", **kw)
+    _assert_same(off, on, "landing-heavy (F2 boundary)")
+    assert on.stats["first_edge"] > 0 and on.stats["spec"] > 0, on.stats
+
+
 def test_decision_does_not_depend_on_this_ranks_copy_having_landed(monkeypatch):
     """Two TP ranks share the scheduler output but not their output threads' timing: one whose previous copy has
     always landed before the collector runs must stage the same seeds and reach the same states as one whose copy
