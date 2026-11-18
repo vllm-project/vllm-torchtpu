@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import types
 from collections.abc import Iterator
 from unittest.mock import patch
 
@@ -29,28 +30,26 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_BUCKETS,
     _AUDIO_CHUNK_LENGTHS_PATCHED,
-    _select_bucket,
+    _get_compiled_bucket_fn,
     maybe_patch_qwen3_omni_thinker,
 )
 
 pytestmark = pytest.mark.omni
 
 THINKER_ARCHS = ["Qwen3OmniMoeForConditionalGeneration"]
+_PATCHED_ATTRS = (
+    "forward",
+    "prepare_encoder_metadata",
+    "forward_with_encoder_metadata",
+    "_tpu_orig_forward",
+)
 
 
 @pytest.fixture(autouse=True)
 def _isolate_thinker_patch_targets() -> Iterator[None]:
     """Snapshot and restore Qwen3OmniMoeAudioEncoder attributes across each test."""
     cls = Qwen3OmniMoeAudioEncoder
-    saved = {
-        attr: cls.__dict__.get(attr)
-        for attr in (
-            "forward",
-            "prepare_encoder_metadata",
-            "forward_with_encoder_metadata",
-            "_tpu_orig_forward",
-        )
-    }
+    saved = {attr: cls.__dict__.get(attr) for attr in _PATCHED_ATTRS}
     try:
         yield
     finally:
@@ -69,8 +68,6 @@ class _DummyPosEmb(nn.Module):
 
 
 class _DummyReplicatedLinear(nn.Module):
-    """Minimal ReplicatedLinear stand-in returning ``(output, None)``."""
-
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
@@ -106,7 +103,7 @@ def _make_dummy_audio_encoder(
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             if seen_conv_batch_sizes is not None:
                 seen_conv_batch_sizes.append(int(x.shape[0]))
-            b, c, f, t = x.shape
+            b, c, f, _ = x.shape
             return x[:, :, : max(1, f // 2), :13]
 
     class _DummyEncoder(nn.Module):
@@ -114,6 +111,7 @@ def _make_dummy_audio_encoder(
             super().__init__()
             self.n_window = 50
             self.n_window_infer = 400
+            self.conv_chunksize = 500
             self.output_dim = 8
             self.conv2d1 = _Conv1()
             self.conv2d2 = nn.Identity()
@@ -132,18 +130,23 @@ def _make_dummy_audio_encoder(
     return _DummyEncoder()
 
 
-def test_non_omni_config_is_not_patched() -> None:
+@pytest.mark.parametrize(
+    "architectures",
+    [
+        None,
+        [],
+        ["LlamaForCausalLM"],
+        ["Qwen3OmniMoeThinkerForConditionalGeneration"],
+    ],
+)
+def test_non_omni_config_is_not_patched(architectures: list[str] | None) -> None:
     before = Qwen3OmniMoeAudioEncoder.forward
-    assert maybe_patch_qwen3_omni_thinker(None) is False
-    assert maybe_patch_qwen3_omni_thinker([]) is False
-    for arch in ("LlamaForCausalLM", "Qwen3OmniMoeThinkerForConditionalGeneration"):
-        assert maybe_patch_qwen3_omni_thinker([arch]) is False
+    assert maybe_patch_qwen3_omni_thinker(architectures) is False
     assert Qwen3OmniMoeAudioEncoder.forward is before
 
 
 def test_patch_moves_lengths_to_cpu_and_supports_metadata_api() -> None:
     cls = Qwen3OmniMoeAudioEncoder
-
     assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
     patched_forward = cls.forward
     assert getattr(patched_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
@@ -162,21 +165,36 @@ def test_patch_moves_lengths_to_cpu_and_supports_metadata_api() -> None:
     assert TrackedTensor.cpu_called is True
     assert out.shape == (104, 8)
 
-    # Also verify 0.33.0rc1 entrypoint: prepare_encoder_metadata +
-    # forward_with_encoder_metadata.
     metadata = cls.prepare_encoder_metadata(enc, [800, 250])
     assert metadata["aftercnn_lens"] == [104, 33]
     out_meta = cls.forward_with_encoder_metadata(enc, torch.zeros(16, 1050), metadata)
     assert out_meta.shape == (137, 8)
 
-    # Idempotent on repeated calls.
     assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is False
     assert cls.forward is patched_forward
 
 
-def test_audio_encoder_static_bucketing() -> None:
-    """Verify (8, 16, 32)-window bucketing, cu_seqlens padding, and >32 fallback."""
+@pytest.mark.parametrize(
+    ("clip_lens", "expected_buckets", "expected_cu_prefix"),
+    [
+        ([250], [8], [0, 33, 104, 105]),
+        ([250, 800], [16], [0, 33, 39, 91, 143, 208, 209]),
+        (
+            [2000, 2000],
+            [64],
+            [0, 52, 104, 156, 208, 260, 312, 364, 416, 468, 520, 832],
+        ),
+        ([25601, 200], [256, 8], [0, 52, 104, 156, 208]),
+    ],
+)
+def test_audio_encoder_static_bucketing_and_packing(
+    clip_lens: list[int],
+    expected_buckets: list[int],
+    expected_cu_prefix: list[int],
+) -> None:
+    """Verify power-of-2 (8..256) bucketing, multi-clip packing, and >256 split."""
     assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    assert _AUDIO_CHUNK_BUCKETS == (8, 16, 32, 64, 128, 256)
     cls = Qwen3OmniMoeAudioEncoder
 
     seen_conv_batch_sizes: list[int] = []
@@ -193,31 +211,42 @@ def test_audio_encoder_static_bucketing() -> None:
         "cpu",
         side_effect=AssertionError("Unexpected Module.cpu() host mutation"),
     ):
-        # 3 clips in one call spanning all 3 static buckets (8, 16, 32):
-        # - 250 frames (3 windows -> 33 tokens) -> 8-window bucket (104 tokens)
-        # - 900 frames (9 windows -> 117 tokens) -> 16-window bucket (208 tokens)
-        # - 2000 frames (20 windows -> 260 tokens) -> 32-window bucket (416 tokens)
-        feats = torch.zeros(16, 3150)
-        lens = torch.tensor([250, 900, 2000], dtype=torch.long)
+        feats = torch.zeros(16, sum(clip_lens))
+        lens = torch.tensor(clip_lens, dtype=torch.long)
         aftercnn = _get_feat_extract_output_lengths(lens)
         out = cls.forward(enc, feats, lens, aftercnn)
 
-        assert out.shape == (33 + 117 + 260, 8)
-        assert seen_conv_batch_sizes == [8, 16, 32]
-        assert seen_layer_seq_lens == [104, 104, 208, 208, 416, 416]
+        assert out.shape == (int(aftercnn.sum().item()), 8)
+        assert seen_conv_batch_sizes == expected_buckets
+        expected_seq_lens = [b * 13 for b in expected_buckets for _ in range(2)]
+        assert seen_layer_seq_lens == expected_seq_lens
         for cu in seen_cu_seqlens:
             assert len(cu) == 128
-        # Clip 1 (33 valid tokens, 8-window bucket = 104): [0, 33, 104, 105, ...]
-        assert seen_cu_seqlens[0][:4] == [0, 33, 104, 105]
-        # Clip 2 (117 valid tokens across 4+4+1 windows, 16-window bucket = 208):
-        # [0, 52, 104, 117, 208, 209, ...]
-        assert seen_cu_seqlens[2][:6] == [0, 52, 104, 117, 208, 209]
-        # Clip 3 (260 valid tokens across 5x4 windows, 32-window bucket = 416):
-        # [0, 52, 104, 156, 208, 260, 416, 417, ...]
-        assert seen_cu_seqlens[4][:8] == [0, 52, 104, 156, 208, 260, 416, 417]
+        assert seen_cu_seqlens[0][: len(expected_cu_prefix)] == expected_cu_prefix
 
-        assert _AUDIO_CHUNK_BUCKETS == (8, 16, 32)
-        assert _select_bucket(5, _AUDIO_CHUNK_BUCKETS, align=8) == 8
-        assert _select_bucket(9, _AUDIO_CHUNK_BUCKETS, align=8) == 16
-        assert _select_bucket(20, _AUDIO_CHUNK_BUCKETS, align=8) == 32
-        assert _select_bucket(33, _AUDIO_CHUNK_BUCKETS, align=8) == 40
+
+def test_compiled_bucket_cache_uses_distinct_code_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify per-bucket caching and distinct CodeTypes across >8 buckets."""
+    seen_calls: list[tuple[types.FunctionType, dict[str, object]]] = []
+
+    def _fake_compile(fn: types.FunctionType, **kwargs: object) -> types.FunctionType:
+        seen_calls.append((fn, kwargs))
+        return fn
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+    enc_a = _make_dummy_audio_encoder()
+    enc_b = _make_dummy_audio_encoder()
+
+    assert _get_compiled_bucket_fn(enc_a, 8) is _get_compiled_bucket_fn(enc_a, 8)
+    assert len(seen_calls) == 1
+
+    for b in _AUDIO_CHUNK_BUCKETS:
+        _get_compiled_bucket_fn(enc_a, b)
+        _get_compiled_bucket_fn(enc_b, b)
+
+    assert len(seen_calls) == 12
+    assert len({fn.__code__ for fn, _ in seen_calls}) == 12
+    for _, kwargs in seen_calls:
+        assert kwargs == {"backend": "tpu", "fullgraph": True, "dynamic": False}
