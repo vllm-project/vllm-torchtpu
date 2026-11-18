@@ -1644,6 +1644,9 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     # vllm.platforms while it is still loading (a cycle).
     from vllm_torchtpu.layers.adapter import sequence_parallel
 
+    # Before the threshold: with a drafter it stays at main's 0 until the
+    # proposer records each draft forward's form (sequence_parallel.gates_rows).
+    sequence_parallel.set_has_drafter(vllm_config.speculative_config is not None)
     # The engine's layout, not this process's groups: none exist yet here.
     min_rows = sequence_parallel.min_rows(parallel_config)
     original = [int(s) for s in cc.compile_sizes]

@@ -1508,6 +1508,9 @@ class TPUModelRunner(GPUModelRunner):
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
+        # Before the model loads: the sequence-parallel row threshold depends
+        # on whether a drafter runs (sequence_parallel.gates_rows).
+        sequence_parallel.set_has_drafter(speculative_config is not None)
         # The producer populates draft context KV without generating proposals.
         self._is_dspark_pd_producer = bool(
             transfer_config is not None

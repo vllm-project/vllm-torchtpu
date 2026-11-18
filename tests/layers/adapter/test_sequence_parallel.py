@@ -31,7 +31,9 @@ def _parallel(dp, tp):
 
 @pytest.fixture
 def groups(monkeypatch):
-    """Initialized model-parallel groups of a chosen (dp, tp) layout."""
+    """Initialized model-parallel groups of a chosen (dp, tp) layout, in an
+    engine without a drafter unless a test says otherwise."""
+    monkeypatch.setattr(sp, "_HAS_DRAFTER", False)
 
     def set_layout(dp, tp):
         monkeypatch.setattr(
@@ -103,6 +105,34 @@ def test_a_model_that_follows_the_form_raises_the_threshold(
     assert sp.follows_step_form()
     assert sp.min_rows() == threshold
     assert sp.min_rows(_parallel(*layout)) == threshold
+
+
+@pytest.mark.parametrize("layout,threshold", [((4, 2), 64), ((1, 8), 512)])
+def test_with_a_drafter_the_threshold_waits_for_the_draft_form_record(
+    groups, monkeypatch, layout, threshold
+):
+    """A drafter's forward and MoE read the last recorded step form. Until its
+    proposer records each draft forward's form (DRAFT_RECORDS_STEP_FORM), an
+    engine with a drafter keeps every sequence-parallel step sliced, as on
+    main; with the record the layout's threshold applies, and without a
+    drafter it applies as before."""
+    groups(*layout)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", False)
+    sp.set_has_drafter(True)
+    assert not sp.gates_rows()
+    assert sp.min_rows() == sp.min_rows(_parallel(*layout)) == 0
+    # A small step stays sliced, and its mask is each rank's slice.
+    assert sp.step_is_sequence_parallel(4)
+    assert sp.step_rows_are_sliced(4)
+    monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", True)
+    assert sp.gates_rows()
+    assert sp.min_rows() == sp.min_rows(_parallel(*layout)) == threshold
+    assert not sp.step_is_sequence_parallel(threshold - 1)
+    monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", False)
+    sp.set_has_drafter(False)
+    assert sp.min_rows() == threshold
 
 
 def test_a_step_is_sliced_only_for_a_model_that_follows_the_form(groups, monkeypatch):

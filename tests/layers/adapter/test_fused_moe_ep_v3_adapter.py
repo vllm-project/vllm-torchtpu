@@ -64,6 +64,11 @@ def _mesh(ep=EP, platform="tpu", device_kind="TPU7x"):
 
 @pytest.fixture
 def groups(monkeypatch):
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    # An engine without a drafter: the row threshold follows the model alone.
+    monkeypatch.setattr(sequence_parallel, "_HAS_DRAFTER", False)
+
     def set_layout(dp, tp):
         monkeypatch.setattr(
             parallel_state, "model_parallel_is_initialized", lambda: True
