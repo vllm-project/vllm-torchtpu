@@ -132,8 +132,8 @@ def test_the_ssm_region_follows_the_declared_ssm_dtype(
 @pytest.mark.parametrize(
     ("tp", "num_spec", "ssm_dtype", "user_block", "final_block"),
     [
-        # The --block-size values the measured serving points ran with, under
-        # main's fp32 conv state.
+        # The --block-size values the Qwen3.5-397B serving configurations used,
+        # under main's fp32 conv state.
         (1, 1, "bfloat16", 2176, 2304),
         (2, 3, "bfloat16", 640, 1280),
         (8, 3, "bfloat16", 640, 640),

@@ -75,8 +75,8 @@ def test_every_other_architecture_runs_the_shared_kernel(architecture):
     assert gdn_attention.gdn_kernel_wrapper(architecture) is main_gdn_wrapper
 
 
-# The PCP prefill keeps the shared kernel for every architecture until it is
-# routed through the dispatch too.
+# The PCP prefill keeps the shared kernel for every architecture: no serving
+# leg ran prefill context parallelism with the copy.
 _SHARED_KERNEL_CALLERS = ("gdn_kernel_wrapper", "run_jax_gdn_attention_pcp_tp_prefill")
 
 
