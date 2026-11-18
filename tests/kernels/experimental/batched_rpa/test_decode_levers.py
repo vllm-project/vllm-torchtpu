@@ -21,8 +21,6 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, flash_attention
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _serve(**kw):
     base = dict(
@@ -134,7 +132,10 @@ def test_wrapper_accepts_static_decode_modes(monkeypatch):
 
 
 @pytest.mark.parametrize("return_lse", [False, True])
-def test_exp2_dropped_for_an_lse_call_is_logged(monkeypatch, return_lse):
+@pytest.mark.parametrize("soft_cap", [None, 30.0])
+def test_exp2_dropped_for_an_lse_or_soft_cap_call_is_logged(
+    monkeypatch, return_lse, soft_cap
+):
     from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
 
     warnings = []
@@ -143,6 +144,9 @@ def test_exp2_dropped_for_an_lse_call_is_logged(monkeypatch, return_lse):
         "logger",
         SimpleNamespace(warning_once=lambda msg, *args: warnings.append(msg)),
     )
-    _wrapper_serving_config(monkeypatch, decode_exp2=True, return_lse=return_lse)
-    assert len(warnings) == int(return_lse)
+    _wrapper_serving_config(
+        monkeypatch, decode_exp2=True, return_lse=return_lse, soft_cap=soft_cap
+    )
+    assert sum("LSE" in w for w in warnings) == int(return_lse), warnings
+    assert sum("soft_cap" in w for w in warnings) == int(soft_cap is not None)
     assert all("decode_exp2" in w for w in warnings)
