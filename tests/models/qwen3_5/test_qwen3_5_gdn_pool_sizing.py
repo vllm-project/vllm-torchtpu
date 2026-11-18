@@ -112,7 +112,7 @@ def _resolve():
         # Prefill legs: TP1, MTP K = 1 widens the conv state to 4 taps.
         (1, 1, "bfloat16", 2048, 256),
         (1, 1, "float32", 4096, 256),
-        # #1 decode (DP4 x TP2) and #5-#12 decode (TP8): MTP K = 3.
+        # Decode legs at DP4 x TP2 (p01) and TP8 (p05 to p12): MTP K = 3.
         (2, 3, "bfloat16", 1024, 256),
         (2, 3, "float32", 2048, 256),
         (8, 3, "bfloat16", 256, 64),
