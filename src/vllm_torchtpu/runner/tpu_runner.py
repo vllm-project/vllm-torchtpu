@@ -6880,7 +6880,9 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        # Plus the drafter's lookahead, as in _warmup_one_spec_request.
+        lookahead = self.vllm_config.num_lookahead_tokens
+        max_pos = min(self.max_model_len, P + n_decode * (1 + K) + lookahead)
         # Per-group block counts at each group's own block size (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -6970,7 +6972,7 @@ class TPUModelRunner(GPUModelRunner):
                 P_mix = int(self.max_num_tokens) - R * (1 + K)
                 P_mix = max(P, min(P_mix, self.max_model_len - (1 + K) - 1))
                 mix_nblks = [
-                    _spec_warmup_group_num_blocks(self, g, P_mix + 1 + K)
+                    _spec_warmup_group_num_blocks(self, g, P_mix + 1 + K + lookahead)
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
                 mix_nblk = max(mix_nblks)
@@ -7067,7 +7069,12 @@ class TPUModelRunner(GPUModelRunner):
         # groups differ on hybrid models (mamba vs attention), and the
         # runner-level self.block_size predates the executor's post-load
         # block-size finalization.
-        max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
+        # The drafter also writes KV past the verify window, up to vLLM's
+        # num_lookahead_tokens further (the scheduler reserves them through
+        # allocate_slots). Without them a draft block that crosses into an
+        # unallocated page lands on block-table entry 0, the null block.
+        lookahead = self.vllm_config.num_lookahead_tokens
+        max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K) + lookahead)
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group = []
         max_nblk = 0
