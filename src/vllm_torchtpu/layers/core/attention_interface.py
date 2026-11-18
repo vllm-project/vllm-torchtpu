@@ -66,6 +66,37 @@ ragged_paged_attention = rpa_default.ragged_paged_attention
 ragged_paged_attention_batched = rpa_batched.ragged_paged_attention
 get_kv_cache_shape = rpa_default.get_kv_cache_shape
 
+# Programs of at most this many query rows are decode programs; with
+# TPU_RPA_DECODE_VMEM_MIB set, the batched attention kernel there takes that
+# VMEM limit and a smaller decode batch.
+RPA_DECODE_PROGRAM_ROWS = 64
+# Largest decode batch the batched attention kernel is tuned for.
+RPA_MAX_DECODE_BATCH = 8
+
+
+def batched_rpa_decode_overrides(num_q_rows: int, num_seqs: int) -> dict[str, int]:
+    """Batched attention kernel kwargs for a decode program.
+
+    Empty unless `TPU_RPA_DECODE_VMEM_MIB` is set and the program has at most
+    `RPA_DECODE_PROGRAM_ROWS` query rows, so other programs keep the kernel
+    defaults. The decode batch is `TPU_RPA_DECODE_BATCH`, or
+    `min(8, num_seqs)` when unset; `num_seqs` is the padded sequence count.
+    """
+    vmem_mib = envs.TPU_RPA_DECODE_VMEM_MIB
+    if vmem_mib <= 0 or num_q_rows > RPA_DECODE_PROGRAM_ROWS:
+        return {}
+    decode_batch = envs.TPU_RPA_DECODE_BATCH or min(RPA_MAX_DECODE_BATCH, num_seqs)
+    if decode_batch > RPA_MAX_DECODE_BATCH:
+        raise ValueError(
+            f"TPU_RPA_DECODE_BATCH={decode_batch} must be at most "
+            f"{RPA_MAX_DECODE_BATCH}, the batched attention kernel's decode batch."
+        )
+    return {
+        "vmem_limit_bytes": vmem_mib << 20,
+        "decode_batch_size": max(1, decode_batch),
+    }
+
+
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
 
@@ -465,6 +496,11 @@ def sharded_ragged_paged_attention(
         block_kwargs["m_block_sizes"] = _capped(rpa_default.RpaCase.MIXED)
         if attention_chunk_size is not None:
             block_kwargs["p_block_sizes"] = _capped(rpa_default.RpaCase.PREFILL)
+
+    # Speculative decoding passes the batched kernel as a functools.partial.
+    runs_batched = getattr(rpa_func, "func", rpa_func) is ragged_paged_attention_batched
+    if runs_batched and not use_hd64:
+        block_kwargs.update(batched_rpa_decode_overrides(q.shape[0], kv_lens.shape[0]))
 
     def _ragged_paged_attention(*args):
         return func(

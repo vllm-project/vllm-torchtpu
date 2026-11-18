@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import jax.numpy as jnp
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
@@ -82,3 +83,96 @@ def test_calculate_block_sizes_generation(
         )
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+def _decode_cfgs():
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=256,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=256,
+        total_q_tokens=64,
+        num_page_indices=8 * 64,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    return model_cfg, serve_cfg
+
+
+def test_default_decode_batch_size_is_eight():
+    model_cfg, serve_cfg = _decode_cfgs()
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x"),
+    ):
+        default = wrapper.calculate_block_sizes(model_cfg, serve_cfg, vmem_limit)
+        explicit = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit, decode_batch_size=8
+        )
+    assert default == explicit
+    assert default[0].batch_size == 8
+
+
+def test_decode_batch_size_changes_only_decode_blocks():
+    model_cfg, serve_cfg = _decode_cfgs()
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x"),
+    ):
+        default_decode, default_prefill = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit
+        )
+        small_decode, small_prefill = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit, decode_batch_size=2
+        )
+    assert small_prefill == default_prefill
+    assert small_decode.batch_size == 2
+    # Fewer lanes leave VMEM for a KV tile at least as large.
+    assert small_decode.bkv_sz >= default_decode.bkv_sz
+
+
+class _BlockSizesCalled(Exception):
+    pass
+
+
+@pytest.mark.parametrize(("decode_batch_size", "expected"), [(None, 8), (2, 2)])
+def test_ragged_paged_attention_passes_the_decode_batch_size(
+    monkeypatch, decode_batch_size, expected
+):
+    seen = []
+
+    def record(*args, **kwargs):
+        seen.append(kwargs["decode_batch_size"])
+        raise _BlockSizesCalled
+
+    monkeypatch.setattr(wrapper, "calculate_block_sizes", record)
+    tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    num_seqs, pages_per_seq, page_size, head_dim = 8, 4, 16, 128
+    cache_shape = wrapper.get_kv_cache_shape(
+        num_seqs * pages_per_seq, page_size, 1, head_dim, jnp.bfloat16
+    )
+    q = jnp.zeros((8, 4, head_dim), jnp.bfloat16)
+    kv = jnp.zeros((8, 1, head_dim), jnp.bfloat16)
+    with (
+        patch("jax.experimental.pallas.tpu.get_tpu_info", return_value=tpu_info),
+        pytest.raises(_BlockSizesCalled),
+    ):
+        wrapper.ragged_paged_attention(
+            q,
+            kv,
+            kv,
+            jnp.zeros(cache_shape, jnp.bfloat16),
+            jnp.ones((num_seqs,), jnp.int32),
+            jnp.zeros((num_seqs * pages_per_seq,), jnp.int32),
+            jnp.arange(num_seqs + 1, dtype=jnp.int32),
+            jnp.array([num_seqs, num_seqs, num_seqs], jnp.int32),
+            decode_batch_size=decode_batch_size,
+        )
+    assert seen == [expected]
