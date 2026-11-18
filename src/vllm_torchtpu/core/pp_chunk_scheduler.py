@@ -67,6 +67,7 @@ from vllm_torchtpu.core.prefix_aware_scheduler import (
     PrefixAwareScheduler,
     _is_decoding,
     _wait_seconds,
+    memo_local_prefix_cache_hit,
     trim_resend_token_ids,
 )
 from vllm_torchtpu.logger import init_logger
@@ -363,45 +364,11 @@ class TpuPipelineChunkScheduler(Scheduler):
     ) -> tuple["KVCacheBlocks", int, int, bool]:
         if not getattr(self, "_prefix_aware", False):
             return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+        hit = memo_local_prefix_cache_hit(self, request, max_cache_hit_length)
+        if hit is not None:
+            request._tpu_local_hit_tokens = hit[1]
+            return hit
         connector = getattr(self, "connector", None)
-        if connector is None or not connector.supports_divergent_local_hybrid_hits:
-            kvm = self.kv_cache_manager
-            epoch = self._get_prefix_cache_epoch()
-            if (
-                epoch is not None
-                and not (
-                    getattr(kvm, "enable_kv_cache_events", False)
-                    and getattr(request, "kv_cache_report_mode", "incremental")
-                    == "full"
-                )
-                and kvm.prefix_cache_lookup_enabled(request)
-            ):
-                max_len = (
-                    request.num_tokens - 1
-                    if max_cache_hit_length is None
-                    else max_cache_hit_length
-                )
-                cached = self._memo_get(request, epoch, max_len)
-                if cached is not None:
-                    hit = cached[2]
-                    if len(hit) == 3:
-                        computed_blocks, num_new_computed_tokens, num_uncached = hit
-                    else:
-                        computed_blocks, num_new_computed_tokens = hit
-                        num_uncached = 0
-                    if isinstance(computed_blocks, tuple):
-                        computed_blocks = tuple(list(b) for b in computed_blocks)
-                    shared_prefix_boundary = (
-                        num_new_computed_tokens + num_uncached if num_uncached else 0
-                    )
-                    blocks = kvm.create_kv_cache_blocks(computed_blocks)
-                    request._tpu_local_hit_tokens = num_new_computed_tokens
-                    return (
-                        blocks,
-                        num_new_computed_tokens,
-                        shared_prefix_boundary,
-                        False,
-                    )
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
             super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         )

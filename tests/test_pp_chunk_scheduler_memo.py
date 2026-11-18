@@ -219,6 +219,24 @@ def test_a_reset_through_retention_reaches_the_epoch_and_the_change_log(
     assert scheduler._retention is not None
 
 
+def test_the_prefix_aware_lookup_answers_from_the_memo_as_vllm_does(
+    engine_block_pool,
+):
+    # The local-hit lookup PrefixAwareScheduler and this scheduler share.
+    kvm = _manager()
+    scheduler = _scheduler(kvm, {"prefix_aware": True})
+    prompt = _cached_prompt(kvm)
+    returning = _request("returning", prompt + [91, 92, 93, 94])
+    expected_blocks, expected_hit, _ = kvm.get_computed_blocks(returning)
+    scheduler._prefix_warmth(returning)
+    computes = scheduler._memo_computes
+    blocks, hit, boundary, diverged = scheduler._get_local_prefix_cache_hit(returning)
+    assert scheduler._memo_computes == computes
+    assert hit == expected_hit > 0 and not diverged
+    assert blocks.get_block_ids() == expected_blocks.get_block_ids()
+    assert returning._tpu_local_hit_tokens == hit
+
+
 def _model(granularity: int = 4) -> StepCostModel:
     buckets = [4, 8, 12, 16]
     linear = {b: 12.0 + 0.0109 * b for b in buckets}
