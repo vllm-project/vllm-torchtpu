@@ -44,10 +44,11 @@ SECTION = "tpu_frontend"
 @dataclass(frozen=True)
 class FrontendOptions:
     detok_prompt_tail: bool = False
-    """Prime vLLM's incremental detokenizer with the last 8 prompt tokens
-    instead of the whole prompt when that suffix ends on a character boundary
-    (byte-identical output; see ``frontend_fix.safe_prompt_tail``). Saves
-    decoding the prompt twice on the first emitted token."""
+    """Prime vLLM's incremental detokenizer with the last
+    ``frontend_fix.DETOK_PROMPT_TAIL_TOKENS`` prompt tokens instead of the
+    whole prompt when that suffix ends on a character boundary (byte-identical
+    output; see ``frontend_fix.safe_prompt_tail``). Saves decoding the prompt
+    twice on the first emitted token."""
 
     tokenize_prefix_cache: bool = False
     """Tokenize chat prompts incrementally: reuse the token ids of the longest
@@ -58,7 +59,14 @@ class FrontendOptions:
     tokenize_prefix_cache_max_tokens: int = 256_000_000
     """Most token ids the tokenization cache keeps per API server; the least
     recently used prompts are evicted first. Read only with
-    ``tokenize_prefix_cache``."""
+    ``tokenize_prefix_cache``. This trades API-server host memory for
+    tokenization CPU time: a cached token id holds about 15 bytes (measured
+    with the Qwen3.5 tokenizer on multi-turn chats), so the default allows
+    about 4 GB per API server, and each DP API server has its own cache.
+    A smaller limit evicts more conversations, whose next turn is then
+    encoded in full (the token ids are the same either way). Lower it where
+    the API server's host shares its memory, as on a prefill host with a
+    host KV-cache tier."""
 
     def __post_init__(self) -> None:
         if self.tokenize_prefix_cache_max_tokens <= 0:
