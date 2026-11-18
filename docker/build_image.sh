@@ -25,8 +25,9 @@ Options:
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
       --vllm-rs            Compile vLLM's Rust frontend (vllm-rs) into the image; takes minutes
-      --rvllm              Include native Rust serving runtime (rvllm) in the image
-      --rvllm-url URL      Download URL for rvllm binary (default: gs://tpu-commons-ci/rvllm/releases/latest/rvllm)
+      --experimental-rvllm-url URL
+                           Include the native Rust serving runtime (rvllm),
+                           downloaded from URL (gs:// or https://)
   -h, --help               Show this help and exit
 
 Examples:
@@ -47,8 +48,8 @@ VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
 BUILD_VLLM_RS="false"
-WITH_RVLLM="false"
-RVLLM_DOWNLOAD_URL="gs://tpu-commons-ci/rvllm/releases/latest/rvllm"
+WITH_EXPERIMENTAL_RVLLM="false"
+EXPERIMENTAL_RVLLM_DOWNLOAD_URL=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -73,13 +74,9 @@ while [[ $# -gt 0 ]]; do
       BUILD_VLLM_RS="true"
       shift
       ;;
-    --rvllm)
-      WITH_RVLLM="true"
-      shift
-      ;;
-    --rvllm-url)
-      WITH_RVLLM="true"
-      RVLLM_DOWNLOAD_URL="$2"
+    --experimental-rvllm-url)
+      WITH_EXPERIMENTAL_RVLLM="true"
+      EXPERIMENTAL_RVLLM_DOWNLOAD_URL="$2"
       shift 2
       ;;
     -h|--help)
@@ -164,7 +161,7 @@ fi
 
 echo "Build Target: $TARGET"
 echo "Compile vllm-rs: $BUILD_VLLM_RS"
-echo "Include rvllm: $WITH_RVLLM"
+echo "Include rvllm: $WITH_EXPERIMENTAL_RVLLM"
 DOCKER_ARGS=(
   --progress=plain \
   -f "${SCRIPT_DIR}/Dockerfile" \
@@ -173,8 +170,8 @@ DOCKER_ARGS=(
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
   --build-arg BUILD_VLLM_RS="${BUILD_VLLM_RS}" \
-  --build-arg WITH_RVLLM="${WITH_RVLLM}" \
-  --build-arg RVLLM_DOWNLOAD_URL="${RVLLM_DOWNLOAD_URL}" \
+  --build-arg WITH_EXPERIMENTAL_RVLLM="${WITH_EXPERIMENTAL_RVLLM}" \
+  --build-arg EXPERIMENTAL_RVLLM_DOWNLOAD_URL="${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" \
 )
 
 # Run docker build

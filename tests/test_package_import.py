@@ -88,7 +88,7 @@ def test_sitecustomize_cold_import_serve_api_utils_subprocess():
 def test_sitecustomize_wraps_startup_cli_env_setup_subprocess():
     _run_python(
         "from vllm.entrypoints.common.startup import cli_env_setup; "
-        "assert getattr(cli_env_setup, '_rust_wrapped', False)"
+        "assert getattr(cli_env_setup, '_experimental_rust_wrapped', False)"
     )
 
 
@@ -108,8 +108,8 @@ def test_sitecustomize_rust_cli_delegation_subprocess():
         text=True,
         env={
             **dict(os.environ),
-            "VLLM_TPU_USE_RUST": "1",
-            "VLLM_TPU_RVLLM_BINARY": "/bin/true",
+            "VLLM_TPU_EXPERIMENTAL_USE_RUST": "1",
+            "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": "/bin/true",
         },
         timeout=30,
     )
