@@ -137,7 +137,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
-    TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_MOE_SKIP_PADDED_TOKENS: bool = True
     TPU_TOKEN_PADDING_SKIP_UNCHANGED: bool = True
     TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = True
     TPU_WORKER_CPU_PIN: bool = True
@@ -1284,8 +1284,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None
     else None,
     # Skip padded tokens from MoE, otherwise they will route like
-    # real tokens and activate experts whose output is thrown away.
-    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # real tokens and activate experts whose output is thrown away. The
+    # token-padding mask it keeps is also where TPU_ONE_ROW_ALL_REDUCE and
+    # USE_MOE_TP_DECODE_KERNEL read the valid-row count.
+    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS", default=True),
     # Skip the per-forward synchronous upload of the token padding mask when
     # its padding rows are unchanged since the last write (steady decode at a
     # fixed bucket). The device mask is then already what the upload would

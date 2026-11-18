@@ -51,6 +51,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_MOE_PREFILL_SEQUENCE_PARALLEL` | `True` | Shards the residual stream across TP around MoE blocks on prefill buckets (`>= 1024` tokens) for DeepSeek-V2 MLA + MoE models. With `TPU_DCP_PREFILL_TOKEN_PARALLEL` under query replication, each MoE layer's MLA attention block of buckets of `>= 2048` tokens (and at least `max_num_seqs` rows per rank) runs on the rank's own rows too: o_proj / W_UV shards gathered a layer ahead instead of the attention all-to-all and o_proj reduce-scatter. |
 | `TPU_MOE_PREFILL_SP_SHARED_GROUP` | `1` | Tensor-parallel subgroup size for the shared expert under `TPU_MOE_PREFILL_SEQUENCE_PARALLEL`. |
 | `TPU_MOE_PREFILL_SP_FP8_WIRE` | `True` | Uses `fp8` combine wire instead of `bfloat16` in `fused_ep_moe_v2` under `TPU_MOE_PREFILL_SEQUENCE_PARALLEL`. |
+| `TPU_MOE_SKIP_PADDED_TOKENS` | `True` | Keeps a bucket's padded tokens out of MoE routing and expert work (token-padding mask); `TPU_ONE_ROW_ALL_REDUCE` and `USE_MOE_TP_DECODE_KERNEL` read their valid-row count from that mask. |
 | `TPU_ONE_ROW_ALL_REDUCE` | `True` | Exchanges a single valid decode row (`n_valid == 1`) in one round of remote copies in `moe_tp_decode` and `fp8_oproj_all_reduce`. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
