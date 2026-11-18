@@ -641,3 +641,87 @@ def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots)
     w, ids = _router(scores, topk)
     want = _reference(x, ids, w, w13_all, s13_all, w2_all, s2_all)
     _assert_close(total_out.astype(jnp.bfloat16), want, 2.5e-2)
+
+
+def test_hot_order_refuses_an_expert_without_a_copy():
+    """An ordered expert with no copy would be served on its primary and also
+    assigned a holder, so its contribution would be added twice."""
+    prim = np.repeat(np.arange(8, dtype=np.int32), 64)
+    copy = np.full(512, -1, np.int32)
+    copy[[3, 70]] = [1, 2]
+    hot, _, hcopy = kernel.hot_tables(prim, copy, [70, 3])
+    assert np.asarray(hot)[:2].tolist() == [70, 3]
+    assert np.asarray(hcopy)[:2].tolist() == [2, 1]
+    with pytest.raises(ValueError, match=r"no copy: \[5\]"):
+        kernel.hot_tables(prim, copy, [70, 5, 3])
+
+
+def test_copy_tables_refuse_ids_outside_their_512_lanes():
+    gid = np.arange(64, dtype=np.int32)
+    assert np.asarray(kernel.slot_table(gid, 64))[63] == 63
+    with pytest.raises(ValueError, match=r"0\.\.511"):
+        kernel.slot_table(np.append(gid[:63], 512), 64)
+    with pytest.raises(ValueError, match="two local slots"):
+        kernel.slot_table(np.append(gid[:63], 0), 64)
+    hot = np.full(kernel.HOT_SLOTS, -1, np.int32)
+    hot[:2] = [511, 0]
+    assert np.asarray(kernel.hot_onehot(hot)).sum() == 2
+    hot[2] = 512
+    with pytest.raises(ValueError, match=r"-1 \(padding\) or in 0\.\.511"):
+        kernel.hot_onehot(hot)
+
+
+def _copies_args(tokens=4, experts=68, route_cols=512, nc=kernel.HOT_SLOTS):
+    x, w13, w2, s13, s2 = _shapes(tokens, 512, 256, experts)
+    length = kernel.table_offsets(experts, nc)[-1]
+    return (
+        x,
+        jax.ShapeDtypeStruct((tokens, route_cols), jnp.float32),
+        w13,
+        s13,
+        w2,
+        s2,
+        jax.ShapeDtypeStruct((), jnp.int32),
+        jax.ShapeDtypeStruct((length,), jnp.int32),
+        jax.ShapeDtypeStruct((route_cols,), jnp.int32),
+        jax.ShapeDtypeStruct((route_cols,), jnp.int32),
+        jax.ShapeDtypeStruct((route_cols, nc), jnp.bfloat16),
+    )
+
+
+@pytest.mark.parametrize(
+    "route_cols, ranks, owned, match",
+    [
+        (512, 8, 64, None),
+        (256, 8, 64, "serves 512 global experts"),
+        (512, kernel.HOT_SLOTS + 1, 64, "0 < ranks <= 128"),
+        (512, 8, 0, "0 < owned <= 68"),
+        (512, 4, 64, "ranks x owned = 512"),
+    ],
+)
+def test_the_copies_entry_refuses_layouts_its_tables_cannot_index(
+    interpret, route_cols, ranks, owned, match
+):
+    def call(*args):
+        return kernel.moe_lowtok(
+            *args, topk=10, ranks=ranks, owned=owned, has_copies=True
+        )
+
+    args = _copies_args(route_cols=route_cols)
+    if match is None:
+        assert jax.eval_shape(call, *args).shape == (4, 512)
+    else:
+        with pytest.raises(ValueError, match=match):
+            jax.eval_shape(call, *args)
+
+
+def test_the_ids_entry_refuses_a_routing_table_narrower_than_its_slots(interpret):
+    x, w13, w2, s13, s2 = _shapes(4, 512, 256, 136)
+    narrow = jax.ShapeDtypeStruct((4, 64), jnp.float32)
+    with pytest.raises(ValueError, match="do not cover the 136 weight slots"):
+        jax.eval_shape(kernel.moe_lowtok, x, narrow, w13, s13, w2, s2)
+    # 68 slots read lanes 0..67 of a 64-column table padded to 128 lanes.
+    x, w13, w2, s13, s2 = _shapes(4, 512, 256, 68)
+    out = jax.eval_shape(kernel.moe_lowtok, x, narrow, w13, s13, w2, s2)
+    assert out.shape == (4, 512)
+
