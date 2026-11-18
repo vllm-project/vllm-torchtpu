@@ -34,12 +34,16 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-_REPO_SRC = str(Path(__file__).resolve().parents[4] / "src")
-if _REPO_SRC not in sys.path:
-    sys.path.insert(0, _REPO_SRC)
+if __name__ == "__main__":
+    # The CPU worker subprocesses run this file as a script; make `src`
+    # importable there without changing `sys.path` for the pytest session.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
 from vllm_torchtpu.kernels.experimental.small_collectives import (  # noqa: E402
     dcp_lse_combine as comb,
+)
+from vllm_torchtpu.kernels.quantized_matmul import (  # noqa: E402
+    fp8_oproj_all_reduce as oproj_ar,
 )
 
 if __package__:
@@ -52,9 +56,19 @@ TOKEN_BUCKETS = (16, 32, 64, 80, 96)
 
 
 class _FakeDevice:
-    def __init__(self, coords: tuple[int, ...], core_on_chip: int):
+    def __init__(
+        self, coords: tuple[int, ...], core_on_chip: int, platform: str = "tpu"
+    ):
         self.coords = coords
         self.core_on_chip = core_on_chip
+        self.platform = platform
+
+
+class _FakeMesh:
+    def __init__(self, devices, axis_names):
+        self.devices = np.asarray(devices, dtype=object)
+        self.axis_names = axis_names
+        self.shape = dict(zip(axis_names, self.devices.shape, strict=True))
 
 
 def _make_inputs(
@@ -235,15 +249,12 @@ def test_trace_time_gate_keeps_the_token_count_dynamic():
 
 
 def test_mesh_has_chip_pairs_1d_and_2d():
-    class _FakeMesh:
-        def __init__(self, devices, axis_names):
-            self.devices = np.asarray(devices, dtype=object)
-            self.axis_names = axis_names
-            self.shape = dict(zip(axis_names, self.devices.shape, strict=True))
-
     paired_8 = [_FakeDevice((i // 2, 0, 0), i % 2) for i in range(8)]
     assert comb.mesh_has_chip_pairs(_FakeMesh(paired_8, ("dcp",)), "dcp")
     assert not comb.mesh_has_chip_pairs(_FakeMesh(paired_8, ("dcp",)), "other")
+    # The same placement on non-TPU devices (CPU virtual devices) is not paired.
+    cpu_8 = [_FakeDevice((i // 2, 0, 0), i % 2, platform="cpu") for i in range(8)]
+    assert not comb.mesh_has_chip_pairs(_FakeMesh(cpu_8, ("dcp",)), "dcp")
 
     scrambled_8 = [
         paired_8[0],
@@ -295,11 +306,9 @@ def test_clean_part_masks_inf_and_nan_padding():
     assert float(jnp.max(jnp.abs(cleaned[4:, :]))) == 0.0
 
 
-def test_envs_defaults_and_oproj_limit_m(monkeypatch):
+def test_env_default_and_choices(monkeypatch):
     from vllm_torchtpu import envs
-    from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
 
-    assert getattr(fp8_oproj_all_reduce, "LIMIT_M", fp8_oproj_all_reduce.MAX_M) >= 16
     monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE", raising=False)
     assert envs.TPU_DCP_ONLINE_LSE_COMBINE == ""
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "invalid_mode")
@@ -420,29 +429,290 @@ def test_a2a_merge_lifts_rank_and_lane_only_with_the_combine_on(
     assert (out is merged) == (not lifted)
 
 
-def _run_16cpu_worker() -> dict:
+@pytest.mark.parametrize("exchange", ["small", "group_rows", "unpack", "ragged"])
+@pytest.mark.parametrize(("mode", "lifted"), [("", False), ("pairs", True)])
+def test_send_layout_merge_lifts_rank_and_lane_only_with_the_combine_on(
+    monkeypatch, exchange, mode, lifted
+):
+    """As for the all-to-all branch: each exchange of the send-layout merge
+    (an 8-token bucket, which the combine does not take) returns its merge as
+    is with the combine off, and with it on also lifts the rank and lane
+    buffers the combine's buckets read."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_tpu")
+    import torch
+
+    from vllm_torchtpu.distributed import dcp
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
+
+    world, tokens, local, vdim = 16, 8, 4, 512
+    rows = tokens * local
+    fake_group = types.SimpleNamespace(
+        world_size=world, rank_in_group=0, ranks=list(range(world)), cpu_group=None
+    )
+    monkeypatch.setattr(cp, "get_dcp_group", lambda: fake_group)
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", mode)
+    monkeypatch.setattr(cp, "send_small_a2a_applies", lambda t: exchange == "small")
+    monkeypatch.setenv(
+        "TPU_DCP_MLA_SEND_GROUP_ROWS", "8" if exchange == "group_rows" else "0"
+    )
+    monkeypatch.setenv(
+        "TPU_DCP_MLA_SEND_LAYOUT_UNPACK", "1" if exchange == "unpack" else "0"
+    )
+    recv = (
+        torch.zeros(world, rows, vdim, dtype=torch.bfloat16),
+        torch.zeros(world, rows),
+    )
+    monkeypatch.setattr(dcp, "dcp_lane_operand", lambda device=None: None)
+    for prebuild in (
+        "prebuild_send_small",
+        "prebuild_send_group",
+        "prebuild_send_unpack",
+    ):
+        monkeypatch.setattr(cp, prebuild, lambda *args: None)
+    monkeypatch.setitem(cp._SEND_SMALL_OPS, world, lambda *args: recv)
+    monkeypatch.setitem(cp._SEND_GROUP_OPS, (world, 8), lambda *args: recv)
+    monkeypatch.setitem(cp._SEND_UNPACK_OPS, world, lambda *args: recv)
+    monkeypatch.setattr(cp, "_ragged_all_to_all", lambda send, *args, **kw: send)
+    merged = torch.zeros(tokens, local, vdim, dtype=torch.bfloat16)
+    monkeypatch.setattr(cp, "_merge_received", lambda o_recv, l_recv: merged)
+    retained = []
+    monkeypatch.setattr(cp, "_retain_rank", lambda out: retained.append(out) or out + 1)
+    send = torch.zeros(world, SEND_PAD_ROWS + rows, vdim, dtype=torch.int16)
+    out = cp.merge_send_layout(send, torch.tensor([0, 5], dtype=torch.int32), tokens)
+    assert retained == ([merged] if lifted else [])
+    assert (out is merged) == (not lifted)
+
+
+@pytest.mark.parametrize(
+    ("requested", "placed", "want"),
+    [
+        ("auto", "paired", "pairs"),
+        ("auto", "cpu", "flat"),
+        ("pairs", "paired", "pairs"),
+        ("pairs", "cpu", ValueError),
+        ("pairs", "scrambled", ValueError),
+        ("flat", "paired", "flat"),
+    ],
+)
+def test_resolve_online_combine_mode(monkeypatch, requested, placed, want):
+    """'auto' takes 'pairs' only on a chip-paired DCP mesh, 'pairs' raises on
+    any other mesh, and 'flat' never runs the pairing check (which may gather
+    across ranks)."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_tpu")
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
+
+    platform = "cpu" if placed == "cpu" else "tpu"
+    devices = [_FakeDevice((i // 2, 0, 0), i % 2, platform) for i in range(8)]
+    if placed == "scrambled":
+        devices[1], devices[2] = devices[2], devices[1]
+    mesh = _FakeMesh(
+        np.asarray(devices, dtype=object).reshape(1, 8), ("dcp_lane", "dcp")
+    )
+    monkeypatch.setattr(cp, "_DCP_CHIP_PAIRS_CACHE", {})
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", requested)
+    checked = []
+    pairs_ok = cp._dcp_chip_pairs_ok
+    monkeypatch.setattr(
+        cp, "_dcp_chip_pairs_ok", lambda m, g=None: checked.append(m) or pairs_ok(m, g)
+    )
+    if want is ValueError:
+        with pytest.raises(ValueError, match="requires even DCP world >= 4"):
+            cp._resolve_online_combine_mode(mesh)
+    else:
+        assert cp._resolve_online_combine_mode(mesh) == want
+    assert checked == ([] if requested == "flat" else [mesh])
+
+
+@pytest.mark.parametrize(
+    ("paired", "other_lane", "want"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
+def test_dcp_chip_pairs_ok_gathers_placement_the_mesh_lacks(
+    monkeypatch, paired, other_lane, want
+):
+    """When the mesh's devices carry no TPU placement, every rank of the DCP
+    group contributes its own device's chip and core, pairing is checked in
+    rank order, and on a multi-lane world every lane must agree."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_tpu")
+    import torch
+
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
+
+    world = 4
+    places = [((i // 2, 0, 0), i % 2) for i in range(world)]
+    if not paired:
+        places[1], places[2] = places[2], places[1]
+    cpu_devices = [_FakeDevice((0, 0, 0), 0, "cpu") for _ in range(2 * world)]
+    mesh = _FakeMesh(
+        np.asarray(cpu_devices, dtype=object).reshape(2, world), ("dcp_lane", "dcp")
+    )
+    group = types.SimpleNamespace(
+        world_size=world, rank_in_group=0, ranks=list(range(world)), cpu_group=object()
+    )
+    monkeypatch.setattr(cp, "_DCP_CHIP_PAIRS_CACHE", {})
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group=None: 2 * world
+    )
+    monkeypatch.setattr(cp.jax, "local_devices", lambda: [_FakeDevice(*places[0])])
+    gathers = []
+
+    def all_gather_object(out, obj, group=None):
+        gathers.append(group)
+        if group is None:  # the world: this lane's answer, then the other's
+            out[:] = [obj] * world + [other_lane] * world
+        else:  # the DCP group: every rank's (rank, coords, core), out of order
+            out[:] = [(r, *places[r]) for r in reversed(range(world))]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    assert cp._dcp_chip_pairs_ok(mesh, group) is want
+    assert gathers == [group.cpu_group, None]
+
+
+@pytest.mark.parametrize("multi_lane", [False, True])
+@pytest.mark.parametrize("with_qsl", [False, True])
+@pytest.mark.parametrize("partial_dtype", ["bfloat16", "float32"])
+def test_flag_on_merge_hands_the_combine_op_its_operands(
+    monkeypatch, multi_lane, with_qsl, partial_dtype
+):
+    """With TPU_DCP_ONLINE_LSE_COMBINE set, `merge_lse_partials_scatter_heads`
+    on a 32-token backbone bucket calls the combine op (a stand-in recording
+    its operands) with the partial in bf16, the f32 lse, the live count from
+    `query_start_loc`, then the rank and (multi-lane) lane buffers; lifts them
+    during warmup; and returns the op's result in the partial's dtype. The
+    kernel itself runs in the interpret and multichip tests."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_tpu")
+    import torch
+
+    from vllm_torchtpu.compilation import shape_variants
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
+
+    world, rank, tokens, local, vdim, live = 8, 3, 32, 8, 512, 27
+    group = types.SimpleNamespace(
+        world_size=world, rank_in_group=rank, ranks=list(range(world)), cpu_group=None
+    )
+    monkeypatch.setattr(cp, "get_dcp_group", lambda: group)
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "flat")
+    monkeypatch.setenv("TPU_DCP_RS_OUT_PRECISION", "1")
+    rank_buf = torch.tensor([rank], dtype=torch.int32)
+    lane_buf = torch.tensor([1], dtype=torch.int32) if multi_lane else None
+    monkeypatch.setattr(cp, "_DCP_RANK", rank_buf)
+    monkeypatch.setattr(cp, "_DCP_LANE", lane_buf)
+    merged = torch.randn(tokens, local, vdim).to(torch.bfloat16)
+    calls, built, retained = [], [], []
+
+    def op(*args):
+        calls.append(args)
+        return merged
+
+    def ensure(world_arg, *, use_live, out_vmem=True, group=None):
+        built.append((world_arg, use_live, group))
+        return op, multi_lane
+
+    monkeypatch.setattr(cp, "_ensure_online_lse_combine_op", ensure)
+    retain = cp._retain_rank
+    monkeypatch.setattr(
+        cp, "_retain_rank", lambda out: retained.append(out) or retain(out)
+    )
+
+    dtype = getattr(torch, partial_dtype)
+    output = torch.randn(tokens, world * local, vdim).to(dtype)
+    lse = torch.randn(tokens, world * local)
+    qsl = torch.tensor([0, 11, live], dtype=torch.int32) if with_qsl else None
+    with shape_variants.warmup():
+        got = cp.merge_lse_partials_scatter_heads(
+            output, lse, wire_dtype=torch.bfloat16, query_start_loc=qsl
+        )
+
+    assert built == [(world, with_qsl, group)]
+    (args,) = calls
+    part, lse_arg, *rest = args
+    assert part.dtype == torch.bfloat16
+    assert torch.equal(part, output.to(torch.bfloat16))
+    assert lse_arg.dtype == torch.float32 and torch.equal(lse_arg, lse)
+    if with_qsl:
+        live_arg, *rest = rest
+        assert live_arg.dtype == torch.int32 and live_arg.tolist() == [live]
+    assert len(rest) == (2 if multi_lane else 1)
+    assert rest[0] is rank_buf
+    assert not multi_lane or rest[1] is lane_buf
+    assert len(retained) == 1 and retained[0] is merged
+    assert got.dtype == dtype
+    assert torch.equal(got, merged.to(dtype))
+
+
+# The V-space o_proj chain the worker exports: DCP16, 4 heads per rank of
+# v_head_dim 256 into fp8_matmul_all_reduce's [1024, 6144] o_proj.
+CHAIN_CORES = 16
+CHAIN_LOCAL = 4
+CHAIN_VDIM = 256
+CHAIN_HIDDEN = 6144
+
+
+def _oproj_chain_tokens() -> list[int]:
+    """The combine buckets whose output `fp8_matmul_all_reduce` takes."""
+    k = CHAIN_LOCAL * CHAIN_VDIM
+    return [
+        t for t in TOKEN_BUCKETS if oproj_ar.supports(t, k, CHAIN_HIDDEN, CHAIN_CORES)
+    ]
+
+
+# Under the CPU lane's 600 s pytest timeout, so a slow or hung worker is killed
+# (and its output shown) by the test rather than by pytest. A passing worker16
+# run takes about 150-165 s on a 64-core host, adapter8 about 30 s.
+WORKER_TIMEOUT_SECONDS = 540
+
+
+def _run_cpu_worker(name: str, num_devices: int) -> dict:
     flags = os.environ.get("XLA_FLAGS", "")
     env = dict(
         os.environ,
         JAX_PLATFORMS="cpu",
-        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count=16"
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={num_devices}"
         " --xla_allow_excess_precision=false",
     )
-    proc = subprocess.run(
-        [sys.executable, __file__, "worker16"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, __file__, name],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=WORKER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Output captured so far, as bytes even with text=True.
+        tail = (exc.stdout or b"")[-4000:] + (exc.stderr or b"")[-4000:]
+        pytest.fail(
+            f"{name} timed out after {WORKER_TIMEOUT_SECONDS} s\n"
+            + tail.decode(errors="replace")
+        )
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-4000:] + proc.stderr[-4000:]
     return json.loads(lines[-1][len("RESULT ") :])
 
 
+def test_adapter_combine_op_function_in_interpret_mode():
+    """The JAX function the MLA adapter registers as the combine op runs the
+    kernel (not its XLA fallback), race free, within bf16 accuracy on every
+    rank of both lanes (`_adapter8_main`)."""
+    pytest.importorskip("torch_tpu")
+    cases = _run_cpu_worker("adapter8", 8)
+    assert len(cases) == 2 * 2 * 2 * 8, sorted(cases)
+    for key, case in sorted(cases.items()):
+        assert case["kernel"], (key, case)
+        assert not case["races_found"], (key, case)
+        assert case["nan"] == 0 and case["dead_positive_zero"], (key, case)
+        assert case["rel_l2"] < 8e-3 and case["cos"] > 0.99995, (key, case)
+
+
 @pytest.fixture(scope="module")
 def worker16_results():
-    return _run_16cpu_worker()
+    return _run_cpu_worker("worker16", 16)
 
 
 def test_interpret_dcp8_and_dcp16_race_free_and_accurate(worker16_results):
@@ -465,16 +735,22 @@ def test_tpu7x_mosaic_lowering_and_fp8_oproj_chain(worker16_results):
     for key, info in sorted(lowered.items()):
         assert info["ok"], (key, info)
         assert not info["has_partition_id"], (key, info)
-    for key, info in sorted(worker16_results["chained"].items()):
+    chain_tokens = _oproj_chain_tokens()
+    assert chain_tokens
+    chained = worker16_results["chained"]
+    assert sorted(chained) == sorted(f"v_chain_t{t}" for t in chain_tokens), chained
+    for key, info in sorted(chained.items()):
         assert info["ok"], (key, info)
         assert not info["has_partition_id"], (key, info)
 
 
 @pytest.mark.multichip
+@pytest.mark.parametrize("out_vmem", [True, False])
 @pytest.mark.parametrize("mode", ["pairs", "flat"])
 @pytest.mark.parametrize("tokens", TOKEN_BUCKETS)
-def test_multichip_tpu_dcp_online_lse_combine(mesh, mode, tokens):
-    """Compiled execution on the 8 TPU cores of one host across T=16..96."""
+def test_multichip_tpu_dcp_online_lse_combine(mesh, mode, tokens, out_vmem):
+    """Compiled execution on the 8 TPU cores of one host across T=16..96, with
+    the output in VMEM (as the MLA adapter builds the op) and in HBM."""
     local = 8
     vdim = 512
     live = max(0, tokens - 5)
@@ -499,7 +775,7 @@ def test_multichip_tpu_dcp_online_lse_combine(mesh, mode, tokens):
                 mode=mode,
                 rank=r,
                 live_tokens=lv,
-                out_vmem=False,
+                out_vmem=out_vmem,
             ),
             mesh=mesh,
             in_specs=(P(AXIS), P(AXIS), P(AXIS), P()),
@@ -517,8 +793,6 @@ def _worker16_main():
     from jax._src.pallas.mosaic import tpu_info
     from jax._src.pallas.mosaic.interpret import interpret_pallas_call
     from jax.interpreters import mlir
-
-    from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce as oproj_ar
 
     devices = jax.devices()
     assert len(devices) == 16, len(devices)
@@ -854,132 +1128,60 @@ def _worker16_main():
                         S((world,), jnp.int32, sharding=sh),
                     )
                     lowered[key] = {
-                        "ok": "tpu.custom_call" in asm or "custom_call" in asm,
+                        "ok": f"dcp_online_lse_combine_{mode}_n{world}_t{tokens}_"
+                        in asm,
                         "has_partition_id": (
                             "partition_id" in asm or "partition-id" in asm
                         ),
                     }
 
-    # Verify VMEM chaining into fp8_uv_matmul_all_reduce and fp8_matmul_all_reduce
-    # across T = 16, 64, 80, 96 (exercising LIMIT_M = 96).
+    # The combine's VMEM output (V space, D=256, out_vmem=True) chains into
+    # fp8_matmul_all_reduce for every bucket that kernel admits.
     chained = {}
     sh16 = NamedSharding(mesh16, P("dcp"))
     sh16_rep = NamedSharding(mesh16, P())
-    hidden = 6144
-    local16 = 4
-    heads16 = 16 * local16
-    import inspect
+    heads16 = CHAIN_CORES * CHAIN_LOCAL
+    k16 = CHAIN_LOCAL * CHAIN_VDIM
+    for tokens in _oproj_chain_tokens():
 
-    has_uv_oproj = hasattr(oproj_ar, "fp8_uv_matmul_all_reduce")
-    oproj_limit_m = getattr(oproj_ar, "LIMIT_M", oproj_ar.MAX_M)
-    oproj_has_max_m = (
-        "max_m" in inspect.signature(oproj_ar.fp8_matmul_all_reduce).parameters
-    )
-    oproj_kw = {"max_m": min(96, oproj_limit_m)} if oproj_has_max_m else {}
+        def fn_v_chain(p, ls, lv, r, w_q, w_s, *, _t=tokens):
+            def body(a, b, c, rk, q, s):
+                v_out = comb.dcp_online_lse_combine(
+                    a,
+                    b,
+                    num_cores=CHAIN_CORES,
+                    axis="dcp",
+                    mode="pairs",
+                    rank=rk,
+                    live_tokens=c,
+                    out_vmem=True,
+                ).reshape(_t, k16)
+                return oproj_ar.fp8_matmul_all_reduce(
+                    v_out, q, s, rk, num_cores=CHAIN_CORES, axis="dcp"
+                )
 
-    for tokens in (16, 64, 80, 96):
-        # 1) Latent combine (D=512, out_vmem=True) -> fp8_uv_matmul_all_reduce
-        if has_uv_oproj and tokens <= oproj_limit_m:
-            def fn_uv_chain(p, ls, lv, r, w_uv, w_q, w_s, *, _t=tokens):
-                def body(a, b, c, rk, uv, q, s):
-                    lat = comb.dcp_online_lse_combine(
-                        a,
-                        b,
-                        num_cores=16,
-                        axis="dcp",
-                        mode="pairs",
-                        rank=rk,
-                        live_tokens=c,
-                        out_vmem=True,
-                    ).reshape(_t, local16 * 512)
-                    return oproj_ar.fp8_uv_matmul_all_reduce(
-                        lat,
-                        uv,
-                        q,
-                        s,
-                        rk,
-                        num_cores=16,
-                        axis="dcp",
-                        out_dtype=jnp.bfloat16,
-                        **oproj_kw,
-                    )
+            return jax.shard_map(
+                body,
+                mesh=mesh16,
+                in_specs=(P("dcp"), P("dcp"), P(), P("dcp"), P("dcp"), P()),
+                out_specs=P("dcp"),
+                check_vma=False,
+            )(p, ls, lv, r, w_q, w_s)
 
-                return jax.shard_map(
-                    body,
-                    mesh=mesh16,
-                    in_specs=(
-                        P("dcp"),
-                        P("dcp"),
-                        P(),
-                        P("dcp"),
-                        P("dcp"),
-                        P("dcp"),
-                        P(),
-                    ),
-                    out_specs=P("dcp"),
-                    check_vma=False,
-                )(p, ls, lv, r, w_uv, w_q, w_s)
-
-            asm_uv = export_asm(
-                fn_uv_chain,
-                S((16 * tokens, heads16, 512), jnp.bfloat16, sharding=sh16),
-                S((16 * tokens, heads16), jnp.float32, sharding=sh16),
-                S((1,), jnp.int32, sharding=sh16_rep),
-                S((16,), jnp.int32, sharding=sh16),
-                S((16 * local16, 512, 256), jnp.float8_e4m3fn, sharding=sh16),
-                S((16 * local16 * 256, hidden), jnp.float8_e4m3fn, sharding=sh16),
-                S((hidden,), jnp.float32, sharding=sh16_rep),
-            )
-            chained[f"uv_chain_t{tokens}"] = {
-                "ok": "custom_call" in asm_uv,
-                "has_partition_id": "partition_id" in asm_uv or "partition-id" in asm_uv,
-            }
-
-        # 2) V-space combine (D=256, out_vmem=True) -> fp8_matmul_all_reduce
-        if tokens <= oproj_limit_m:
-            def fn_v_chain(p, ls, lv, r, w_q, w_s, *, _t=tokens):
-                def body(a, b, c, rk, q, s):
-                    v_out = comb.dcp_online_lse_combine(
-                        a,
-                        b,
-                        num_cores=16,
-                        axis="dcp",
-                        mode="pairs",
-                        rank=rk,
-                        live_tokens=c,
-                        out_vmem=True,
-                    ).reshape(_t, local16 * 256)
-                    return oproj_ar.fp8_matmul_all_reduce(
-                        v_out,
-                        q,
-                        s,
-                        rk,
-                        num_cores=16,
-                        axis="dcp",
-                        **oproj_kw,
-                    )
-
-                return jax.shard_map(
-                    body,
-                    mesh=mesh16,
-                    in_specs=(P("dcp"), P("dcp"), P(), P("dcp"), P("dcp"), P()),
-                    out_specs=P("dcp"),
-                    check_vma=False,
-                )(p, ls, lv, r, w_q, w_s)
-
-            asm_v = export_asm(
-                fn_v_chain,
-                S((16 * tokens, heads16, 256), jnp.bfloat16, sharding=sh16),
-                S((16 * tokens, heads16), jnp.float32, sharding=sh16),
-                S((1,), jnp.int32, sharding=sh16_rep),
-                S((16,), jnp.int32, sharding=sh16),
-                S((16 * local16 * 256, hidden), jnp.float8_e4m3fn, sharding=sh16),
-                S((hidden,), jnp.float32, sharding=sh16_rep),
-            )
-            chained[f"v_chain_t{tokens}"] = {
-                "ok": "custom_call" in asm_v,
-                "has_partition_id": "partition_id" in asm_v or "partition-id" in asm_v,
-            }
+        asm_v = export_asm(
+            fn_v_chain,
+            S((CHAIN_CORES * tokens, heads16, CHAIN_VDIM), jnp.bfloat16, sharding=sh16),
+            S((CHAIN_CORES * tokens, heads16), jnp.float32, sharding=sh16),
+            S((1,), jnp.int32, sharding=sh16_rep),
+            S((CHAIN_CORES,), jnp.int32, sharding=sh16),
+            S((CHAIN_CORES * k16, CHAIN_HIDDEN), jnp.float8_e4m3fn, sharding=sh16),
+            S((CHAIN_HIDDEN,), jnp.float32, sharding=sh16_rep),
+        )
+        chained[f"v_chain_t{tokens}"] = {
+            "ok": f"dcp_online_lse_combine_pairs_n{CHAIN_CORES}_t{tokens}_" in asm_v
+            and f"fp8_oproj_all_reduce_m{tokens}_" in asm_v,
+            "has_partition_id": "partition_id" in asm_v or "partition-id" in asm_v,
+        }
 
     print(
         "RESULT "
@@ -995,5 +1197,97 @@ def _worker16_main():
     )
 
 
+def _adapter8_main():
+    """The JAX function `_ensure_online_lse_combine_op` hands `sharded_jax_op`
+    (its shard_map, operand order, rank and lane operands, live count and mode
+    resolution), run with the kernel in TPU interpret mode on 8 CPU devices: as
+    one 8-rank DCP group and as two lanes of 4, `flat` and `pairs`, with and
+    without a live count. Both lanes get the same inputs, as replicated
+    operands; the lane operand differs per lane, as each rank's own buffer."""
+    import torch
+    from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+
+    from vllm_torchtpu.distributed import dcp
+    from vllm_torchtpu.distributed import sharded_jax_op as sjo
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
+
+    devices = jax.devices()
+    assert len(devices) == 8, len(devices)
+    built = {}
+
+    def capture(tag, fn, **kwargs):
+        built["fn"] = fn
+        return tag
+
+    sjo.sharded_jax_op = capture
+    # CPU devices carry no chip placement; the pairing check has its own tests.
+    cp._dcp_chip_pairs_ok = lambda mesh, group=None: True
+    cp._DCP_RANK = torch.zeros(1, dtype=torch.int32)
+    cp._DCP_LANE = torch.zeros(1, dtype=torch.int32)
+    tokens, heads, vdim = 32, 64, 256
+    cases = {}
+    for lanes, world in ((1, 8), (2, 4)):
+        mesh = Mesh(np.asarray(devices).reshape(lanes, world), ("dcp_lane", "dcp"))
+        dcp.get_or_create_dcp_mesh = lambda *args, _m=mesh, **kwargs: _m
+        group = types.SimpleNamespace(
+            world_size=world, rank_in_group=0, ranks=list(range(world)), cpu_group=None
+        )
+        spec = NamedSharding(mesh, P("dcp"))
+        lane_of = {dev: ln for (ln, _), dev in np.ndenumerate(mesh.devices)}
+        rank_of = {dev: d for (_, d), dev in np.ndenumerate(mesh.devices)}
+        rank = jax.device_put(jnp.arange(world, dtype=jnp.int32), spec)
+        lane = jax.make_array_from_single_device_arrays(
+            (world,),
+            spec,
+            [
+                jax.device_put(np.asarray([lane_of[dev]], np.int32), dev)
+                for dev in spec.addressable_devices_indices_map((world,))
+            ],
+        )
+        for mode in ("flat", "pairs"):
+            os.environ["TPU_DCP_ONLINE_LSE_COMBINE"] = mode
+            for live in (None, tokens - 5):
+                cp._ONLINE_COMBINE_OPS.clear()
+                _, multi_lane = cp._ensure_online_lse_combine_op(
+                    world, use_live=live is not None, group=group
+                )
+                assert multi_lane == (lanes > 1), (lanes, multi_lane)
+                part, lse = _make_inputs(world, tokens, heads // world, vdim, live=live)
+                ref = np.asarray(comb.reference_float64(part, lse, live_tokens=live))
+                args = [
+                    jax.device_put(
+                        jnp.asarray(part).reshape(world * tokens, heads, vdim), spec
+                    ),
+                    jax.device_put(
+                        jnp.asarray(lse).reshape(world * tokens, heads), spec
+                    ),
+                ]
+                if live is not None:
+                    args.append(jnp.asarray([live], dtype=jnp.int32))
+                args.append(rank)
+                if multi_lane:
+                    args.append(lane)
+                fn = jax.jit(built["fn"])
+                kernel = "dcp_online_lse_combine_" in str(jax.make_jaxpr(fn)(*args))
+                params = pltpu.InterpretParams(detect_races=True)
+                pltpu.reset_tpu_interpret_mode_state()
+                with (
+                    pltpu.force_tpu_interpret_mode(params),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    out = jax.block_until_ready(fn(*args))
+                races = bool(interpret_pallas_call.races.races_found)
+                eff_live = tokens if live is None else live
+                for shard in out.addressable_shards:
+                    d, ln = rank_of[shard.device], lane_of[shard.device]
+                    got = np.asarray(shard.data)[None]
+                    m = _metrics_vs_f64(got, ref[d][None], eff_live)
+                    m.update(kernel=kernel, races_found=races)
+                    cases[f"{lanes}x{world}_{mode}_live{live}_lane{ln}_rank{d}"] = m
+    print("RESULT " + json.dumps(cases), flush=True)
+
+
 if __name__ == "__main__" and sys.argv[1:] == ["worker16"]:
     _worker16_main()
+if __name__ == "__main__" and sys.argv[1:] == ["adapter8"]:
+    _adapter8_main()

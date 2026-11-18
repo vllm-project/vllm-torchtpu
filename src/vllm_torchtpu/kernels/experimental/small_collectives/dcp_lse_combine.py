@@ -68,33 +68,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-try:
-    from vllm_torchtpu.kernels.experimental.moe_tp_decode.all_reduce import (
-        check_chip_pairs,
-    )
-except ImportError:
-
-    def check_chip_pairs(places) -> None:
-        """Raise unless ``places`` pairs adjacent mesh indices ``(2i, 2i + 1)``
-        onto the two TensorCores of one chip, one pair per chip."""
-        n = len(places)
-        chips = [tuple(coords or ()) for coords, _ in places]
-        cores = [core for _, core in places]
-        if (
-            n % 2
-            or not all(chips)
-            or None in cores
-            or any(
-                chips[i] != chips[i ^ 1] or cores[i] == cores[i ^ 1]
-                for i in range(n)
-            )
-            or len(set(chips)) != n // 2
-        ):
-            raise ValueError(
-                "chip-pair combine: mesh indices 2i and 2i + 1 must be the two "
-                f"cores of one chip, one pair per chip; mesh coords {chips}, "
-                f"cores {cores}"
-            )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     LANES,
     MESH,
@@ -209,12 +182,29 @@ def online_lse_combine_supported(
     return _vmem_buffer_bytes(tokens, num_heads, num_cores, vdim, mode) <= budget
 
 
+def places_pair_chips(places: list[tuple[Any, Any]]) -> bool:
+    """Whether ``places``, one ``(chip coords, core on chip)`` per mesh index,
+    puts adjacent indices ``(2i, 2i + 1)`` on the two TensorCores of one chip,
+    one pair per chip."""
+    n = len(places)
+    chips = [tuple(coords or ()) for coords, _ in places]
+    cores = [core for _, core in places]
+    return not (
+        n % 2
+        or not all(chips)
+        or None in cores
+        or any(chips[i] != chips[i ^ 1] or cores[i] == cores[i ^ 1] for i in range(n))
+        or len(set(chips)) != n // 2
+    )
+
+
 def mesh_has_chip_pairs(mesh: jax.sharding.Mesh, axis: str) -> bool:
     """Whether every row of ``mesh`` along ``axis`` pairs adjacent indices
     ``(2c, 2c + 1)`` onto the two TensorCores of one TPU chip.
 
-    Returns ``False`` on non-TPU backends (e.g. CPU virtual devices without
-    ``coords`` / ``core_on_chip``) or when ``check_chip_pairs`` rejects a row.
+    Returns ``False`` when a device is not a TPU (e.g. CPU virtual devices) or
+    when ``places_pair_chips`` rejects a row. Reads only the mesh's global
+    device list, so every process gets the same answer.
     """
     if axis not in mesh.axis_names:
         return False
@@ -224,12 +214,10 @@ def mesh_has_chip_pairs(mesh: jax.sharding.Mesh, axis: str) -> bool:
     axis_pos = mesh.axis_names.index(axis)
     devs = np.moveaxis(mesh.devices, axis_pos, -1).reshape(-1, n)
     for row in devs:
-        if not all(hasattr(d, "coords") and hasattr(d, "core_on_chip") for d in row):
+        if any(d.platform != "tpu" for d in row):
             return False
         places = [(tuple(d.coords), int(d.core_on_chip)) for d in row]
-        try:
-            check_chip_pairs(places)
-        except ValueError:
+        if not places_pair_chips(places):
             return False
     return True
 
@@ -510,8 +498,8 @@ def dcp_online_lse_combine(
       live_tokens: optional ``int32[1]`` valid token count (same across ranks).
       mode: ``'pairs'`` (chip-pair-first 2-stage) or ``'flat'`` (1-stage).
       out_vmem: when ``True``, keep the ``[T, local, D]`` output in VMEM so a
-        downstream VMEM consumer (e.g. ``fp8_uv_oproj_all_reduce`` /
-        ``fp8_oproj_all_reduce``) avoids an HBM round-trip.
+        downstream VMEM consumer (e.g. ``fp8_oproj_all_reduce``) avoids an HBM
+        round-trip.
       vmem_limit_bytes: scoped VMEM limit for Mosaic compilation.
       collective_id: barrier semaphore ID (default ``21``).
       interpret: Pallas CPU interpret mode for unit testing.
@@ -600,6 +588,21 @@ def dcp_online_lse_combine(
         return peer_id
 
     def run_barrier(peer_id):
+        """Every core of the lane signals every core once, itself included,
+        and waits for ``num_cores`` signals: one barrier per call.
+
+        In ``pairs`` a core receives only from its chip mate and same-parity
+        cores, so it can finish call ``k`` and signal call ``k + 1`` while an
+        opposite-parity core is still waiting at the barrier of call ``k``
+        (``common.barrier``'s argument needs every core to receive from every
+        peer). It stays safe by counting: no core can enter call ``k + 1``
+        before some core passes the barrier of call ``k``, so the first core
+        to pass it has received the call-``k`` signal of every core. Any core
+        passing the barrier of call ``k`` therefore implies every core of the
+        lane has finished call ``k - 1``, including its last reads of the
+        receive buffers, and each core leaves call ``k`` only after waiting
+        for the exact bytes of every block sent to it in call ``k``.
+        """
         sem = pltpu.get_barrier_semaphore()
         for j in range(num_cores):
             pl.semaphore_signal(sem, 1, device_id=peer_id(j), device_id_type=MESH)

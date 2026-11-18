@@ -206,10 +206,8 @@ def merge_lse_partials_scatter_heads(
             send_dtype=wire_dtype if narrow else None,
             query_start_loc=query_start_loc,
         )
-        # The ragged exchange lifts the rank buffer itself. With the online
-        # combine on, the combine's buckets also lift the lane buffer, so this
-        # branch lifts it too (_retain_rank).
-        return _retain_rank(merged) if online_lse_combine_mode_requested() else merged
+        # The ragged exchange lifts the rank buffer itself.
+        return _retain_rank_with_online_combine(merged)
 
     # The drafter cannot compare the token count in torch, but JAX exports
     # each of its buckets at a concrete shape: one op picks the exchange
@@ -797,6 +795,15 @@ def merge_send_layout(
 
     Returns `[T, local, V]` bf16, this rank's head slice of the result.
     """
+    return _retain_rank_with_online_combine(
+        _merge_send_layout(send, query_start_loc, num_tokens)
+    )
+
+
+def _merge_send_layout(
+    send: torch.Tensor, query_start_loc: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    """`merge_send_layout`'s exchange and merge."""
     from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
 
     group = get_dcp_group()
@@ -916,6 +923,16 @@ def _retain_rank(out: torch.Tensor) -> torch.Tensor:
         lane_val = _DCP_LANE[0].to(out.dtype)
         zero = zero + (lane_val - lane_val)
     return out + zero
+
+
+def _retain_rank_with_online_combine(out: torch.Tensor) -> torch.Tensor:
+    """`_retain_rank(out)` with TPU_DCP_ONLINE_LSE_COMBINE requested, else
+    `out` unchanged. On a multi-lane mesh the combine's buckets lift the lane
+    buffer as well as the rank buffer, so a merge branch that lifts at most the
+    rank buffer itself lifts both here, and the warmup can hand buckets between
+    its trace and the combine's; with the flag off the traces stay as they
+    were."""
+    return _retain_rank(out) if online_lse_combine_mode_requested() else out
 
 
 def _build_ragged_all_to_all(world: int, skip: int = 0):
@@ -1717,8 +1734,8 @@ def _dcp_chip_pairs_ok(mesh: Any, group: Any | None = None) -> bool:
     """Whether adjacent DCP ranks ``(2c, 2c + 1)`` share one physical TPU chip."""
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
     from vllm_torchtpu.kernels.experimental.small_collectives.dcp_lse_combine import (
-        check_chip_pairs,
         mesh_has_chip_pairs,
+        places_pair_chips,
     )
 
     ranks_key = tuple(int(r) for r in group.ranks) if group is not None else ()
@@ -1727,6 +1744,8 @@ def _dcp_chip_pairs_ok(mesh: Any, group: Any | None = None) -> bool:
     if cached is not None:
         return cached
 
+    # `mesh_has_chip_pairs` reads every lane of the same global mesh, so every
+    # rank gets the same answer: all ranks run the gathers below, or none does.
     ok = mesh_has_chip_pairs(mesh, DCP_AXIS_NAME)
     if (
         not ok
@@ -1751,12 +1770,7 @@ def _dcp_chip_pairs_ok(mesh: Any, group: Any | None = None) -> bool:
         torch.distributed.all_gather_object(gathered, entry, group=group.cpu_group)
         if all(item is not None and item[1] is not None for item in gathered):
             ordered = sorted(gathered, key=lambda item: item[0])
-            places = [(c_xyz, c_id) for _, c_xyz, c_id in ordered]
-            try:
-                check_chip_pairs(places)
-                ok = True
-            except ValueError:
-                ok = False
+            ok = places_pair_chips([(c_xyz, c_id) for _, c_xyz, c_id in ordered])
         if torch.distributed.get_world_size() > int(group.world_size):
             all_lanes: list[Any] = [False] * torch.distributed.get_world_size()
             torch.distributed.all_gather_object(all_lanes, ok)
@@ -1771,19 +1785,19 @@ def _resolve_online_combine_mode(mesh: Any, group: Any | None = None) -> str:
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
 
     req = online_lse_combine_mode_requested()
+    if req not in ("auto", "pairs"):
+        return "flat"
     world = int(mesh.shape[DCP_AXIS_NAME])
     pairs_ok = world >= 4 and world % 2 == 0 and _dcp_chip_pairs_ok(mesh, group)
     if req == "auto":
         return "pairs" if pairs_ok else "flat"
-    if req == "pairs":
-        if not pairs_ok:
-            raise ValueError(
-                f"TPU_DCP_ONLINE_LSE_COMBINE='pairs' requires even DCP world >= 4 "
-                f"with adjacent ranks sharing each TPU chip (world={world}); "
-                "use 'auto' or 'flat' on non-paired topologies."
-            )
-        return "pairs"
-    return "flat"
+    if not pairs_ok:
+        raise ValueError(
+            f"TPU_DCP_ONLINE_LSE_COMBINE='pairs' requires even DCP world >= 4 "
+            f"with adjacent ranks sharing each TPU chip (world={world}); "
+            "use 'auto' or 'flat' on non-paired topologies."
+        )
+    return "pairs"
 
 
 def _ensure_online_lse_combine_op(

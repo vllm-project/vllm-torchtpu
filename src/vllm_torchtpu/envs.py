@@ -691,11 +691,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", 4
     ),
     # Single-kernel TensorCore online-LSE DCP combine (`small_collectives/
-    # dcp_lse_combine.py`) for backbone decode/mixed buckets supported by
-    # `online_lse_combine_supported`: \"\" / \"0\" = off (default),
-    # \"1\" / \"auto\" = chip-pair-first 2-stage combine (\"pairs\") when adjacent
-    # DCP ranks pair each chip's two TensorCores else 1-stage \"flat\",
-    # \"pairs\" = require chip-pair-first 2-stage combine, \"flat\" = 1-stage.
+    # dcp_lse_combine.py`) for the backbone decode/mixed buckets that
+    # `cp_mla_attention.online_lse_combine_applies` admits: "" / "0" = off
+    # (default), "1" / "auto" = chip-pair-first 2-stage combine ("pairs") when
+    # adjacent DCP ranks pair each chip's two TensorCores, else 1-stage
+    # "flat"; "pairs" = require the chip-pair-first combine; "flat" = 1-stage.
     "TPU_DCP_ONLINE_LSE_COMBINE": env_with_choices(
         "TPU_DCP_ONLINE_LSE_COMBINE",
         "",
