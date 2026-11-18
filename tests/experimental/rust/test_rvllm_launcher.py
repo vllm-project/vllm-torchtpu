@@ -167,8 +167,8 @@ def run(tmp_path, monkeypatch):
     empty_bin = tmp_path / "empty_bin"
     empty_bin.mkdir(exist_ok=True)
     monkeypatch.setenv("PATH", str(empty_bin))
-    monkeypatch.delenv("VLLM_TPU_USE_RUST", raising=False)
-    monkeypatch.delenv("VLLM_TPU_RVLLM_BINARY", raising=False)
+    monkeypatch.delenv("VLLM_TPU_EXPERIMENTAL_USE_RUST", raising=False)
+    monkeypatch.delenv("VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", raising=False)
     rvllm = tmp_path / "rvllm"
     rvllm.write_text(FAKE_RVLLM)
     rvllm.chmod(0o755)
@@ -265,7 +265,7 @@ def test_the_binary_option_is_checked(run, capsys, binary, message):
 
 
 def test_the_binary_can_be_provided_via_vllm_tpu_rvllm_binary(run, monkeypatch):
-    monkeypatch.setenv("VLLM_TPU_RVLLM_BINARY", str(run.record.rvllm))
+    monkeypatch.setenv("VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", str(run.record.rvllm))
     r = run("proxy", "--port", "8000", binary=None)
     assert r.execs == [[str(r.rvllm), "proxy", "--port", "8000"]]
 
@@ -274,7 +274,7 @@ def test_the_binary_error_mentions_vllm_tpu_rvllm_binary(run, capsys):
     with pytest.raises(SystemExit):
         run("proxy", binary=None)
     err = capsys.readouterr().err
-    assert "VLLM_TPU_RVLLM_BINARY" in err
+    assert "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY" in err
 
 
 @pytest.mark.parametrize(
@@ -303,9 +303,9 @@ def test_vllm_tpu_use_rust_env_triggers_launcher(
     monkeypatch.setattr("vllm_torchtpu.experimental.rust.launcher.main", fake_main)
 
     if env_val is None:
-        monkeypatch.delenv("VLLM_TPU_USE_RUST", raising=False)
+        monkeypatch.delenv("VLLM_TPU_EXPERIMENTAL_USE_RUST", raising=False)
     else:
-        monkeypatch.setenv("VLLM_TPU_USE_RUST", env_val)
+        monkeypatch.setenv("VLLM_TPU_EXPERIMENTAL_USE_RUST", env_val)
 
     monkeypatch.setattr(sys, "argv", argv)
     assert maybe_run_rust() is should_intercept
@@ -318,7 +318,7 @@ def test_vllm_tpu_use_rust_env_triggers_launcher(
 def test_vllm_tpu_use_rust_invalid_bool_raises(monkeypatch):
     from sitecustomize import maybe_run_rust
 
-    monkeypatch.setenv("VLLM_TPU_USE_RUST", "ture")
+    monkeypatch.setenv("VLLM_TPU_EXPERIMENTAL_USE_RUST", "ture")
     monkeypatch.setattr(sys, "argv", ["vllm", "serve", "m"])
     with pytest.raises(ValueError, match="Invalid boolean value 'ture'"):
         maybe_run_rust()

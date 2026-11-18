@@ -9,16 +9,16 @@ python -m vllm_torchtpu.experimental.rust serve Qwen/Qwen3-0.6B \
   --max-model-len 2048 --port 8000 --rvllm-binary /path/to/rvllm
 ```
 
-Alternatively, `vllm serve` can be run directly with `VLLM_TPU_USE_RUST=1` (analogous to `VLLM_USE_RUST_FRONTEND=1`):
+Alternatively, `vllm serve` can be run directly with `VLLM_TPU_EXPERIMENTAL_USE_RUST=1` (analogous to `VLLM_USE_RUST_FRONTEND=1`):
 
 ```bash
-export VLLM_TPU_USE_RUST=1
-export VLLM_TPU_RVLLM_BINARY=/path/to/rvllm
+export VLLM_TPU_EXPERIMENTAL_USE_RUST=1
+export VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY=/path/to/rvllm
 
 vllm serve Qwen/Qwen3-0.6B --max-model-len 2048 --port 8000
 ```
 
-`--rvllm-binary` (or environment variable `VLLM_TPU_RVLLM_BINARY`) points to the rvllm binary (see
+`--rvllm-binary` (or environment variable `VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY`) points to the rvllm binary (see
 [The rvllm binary](#the-rvllm-binary)); everything else is the `vllm serve`
 command line.
 
@@ -111,6 +111,6 @@ Downloaded binaries and exports are cached under `~/.cache/rvllm`.
 
 `--rvllm-binary` can appear anywhere on the command line, as
 `--rvllm-binary VALUE` or `--rvllm-binary=VALUE`. Alternatively, set
-`VLLM_TPU_RVLLM_BINARY` in the environment or place `rvllm`
+`VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY` in the environment or place `rvllm`
 on `PATH`. `vllm serve` has no `--rvllm-*`
 options, and any other one fails.

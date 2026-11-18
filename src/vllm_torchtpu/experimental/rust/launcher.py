@@ -33,12 +33,12 @@ with `vllm bench ...`; other subcommands (`proxy`, `--version`) with the rvllm
 binary.
 
 The rvllm binary can be specified via `--rvllm-binary`, the
-`VLLM_TPU_RVLLM_BINARY` environment variable, or discovered on `PATH`. It is
-not part of this repository: a local binary, used as is, or a location holding
-`rvllm` and a `metadata.json` whose `sha256` entry is the binary's SHA-256 in
-lowercase hex (`gs://...`, `https://...` or a local directory). A downloaded
-binary is checked against the sha256 and cached. The launcher takes
-`--rvllm-binary` out before the split, as `--rvllm-binary VALUE` or
+`VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY` environment variable, or discovered on
+`PATH`. It is not part of this repository: a local binary, used as is, or a
+location holding `rvllm` and a `metadata.json` whose `sha256` entry is the
+binary's SHA-256 in lowercase hex (`gs://...`, `https://...` or a local
+directory). A downloaded binary is checked against the sha256 and cached. The
+launcher takes `--rvllm-binary` out before the split, as `--rvllm-binary VALUE` or
 `--rvllm-binary=VALUE`; `vllm serve` has no `--rvllm-*` options, and any other
 one fails. Downloads and exports are cached under `~/.cache/rvllm`.
 """
@@ -319,10 +319,10 @@ def resolve_binary(location: str) -> Path:
     """The rvllm binary resolved from `--rvllm-binary`, env var, or PATH."""
     source = "--rvllm-binary"
     if not location:
-        env_val = envs.VLLM_TPU_RVLLM_BINARY
+        env_val = envs.VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY
         if env_val:
             location = env_val
-            source = "VLLM_TPU_RVLLM_BINARY"
+            source = "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY"
         else:
             which_path = shutil.which("rvllm")
             if which_path:
@@ -332,7 +332,7 @@ def resolve_binary(location: str) -> Path:
         raise LauncherError(
             "pass --rvllm-binary: an rvllm binary, or a location (gs://, https:// "
             "or a directory) holding rvllm and its metadata.json; alternatively "
-            "set VLLM_TPU_RVLLM_BINARY or ensure rvllm is on PATH"
+            "set VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY or ensure rvllm is on PATH"
         )
     path = Path(location)
     if path.is_file():
