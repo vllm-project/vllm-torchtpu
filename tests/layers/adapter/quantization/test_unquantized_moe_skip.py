@@ -18,12 +18,15 @@
 - Skipping off (flag off, an unsupported configuration, or a layer built
   outside the runner's policy scope): skip_padded_tokens=False and
   PaddedRowFilter.ZERO_WEIGHT (the stock kernel), without row_info.
+- On the TPU, the compiled forward reads local_valid_tokens when it runs, so
+  one program serves every count the runner writes.
 """
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch._dynamo.utils
 
 from vllm_torchtpu.layers.adapter import fused_moe as fused_moe_module
 from vllm_torchtpu.layers.adapter import moe_skip_policy, token_padding
@@ -260,3 +263,100 @@ def test_disable_moe_skip_disarms_and_prebuilds_stock_kernel(monkeypatch):
     assert method._skip_padded_tokens is False
     assert [call["skip_padded_tokens"] for call in prebuild_calls] == [False]
     assert prebuild_calls[0]["padded_row_filter"] is PaddedRowFilter.ZERO_WEIGHT
+
+
+def _top_logits(hidden_states, gating_output, topk, renormalize):
+    """Route each row to its topk largest logits, gated by their values.
+
+    Selection only, no arithmetic, so the stock and the row-count programs
+    route identically.
+    """
+    weights, ids = torch.topk(gating_output, topk, dim=-1)
+    return weights.to(hidden_states.dtype), ids.to(torch.int32)
+
+
+def _dynamo_graphs() -> int:
+    return torch._dynamo.utils.counters["stats"]["unique_graphs"]
+
+
+def _xla_cache_entries() -> int:
+    return len(torch.tpu._get_cache_stats().per_entry_stats)
+
+
+@pytest.mark.tpu_test
+def test_one_compiled_forward_reads_each_steps_row_count():
+    """row_info enters the compiled forward through
+    token_padding.get_local_valid_tokens(), not as an argument. One row-count
+    program, compiled for 16 rows, serves a warmup step (count 0) and then
+    counts 3, 16 and 5, which TokenPaddingState.update writes into the same
+    device tensor before each step, as the runner does. Each step's real rows
+    match the stock program bit for bit and its padded rows are zero, and no
+    step after the warmup traces or compiles again, so no count is baked in."""
+    num_tokens, experts, hidden, inter, topk = 16, 16, 2048, 768, 8
+    dev = torch.device("tpu")
+    gen = torch.Generator().manual_seed(0)
+    w13 = (torch.randn(experts, hidden, 2 * inter, generator=gen) * 0.02).to(
+        torch.bfloat16
+    )
+    w2 = (torch.randn(experts, inter, hidden, generator=gen) * 0.02).to(torch.bfloat16)
+    layer = SimpleNamespace(
+        w13_weight=w13.to(dev),
+        w2_weight=w2.to(dev),
+        _experts_start=None,
+        moe_config=SimpleNamespace(
+            experts_per_token=topk, moe_parallel_config=SimpleNamespace(use_ep=False)
+        ),
+        custom_routing_function=_top_logits,
+        renormalize=False,
+    )
+    stock_method = _method(skip_padded_tokens=False)
+    count_method = _method(skip_padded_tokens=True)
+    for method in (stock_method, count_method):
+        # _method skips __init__, but Dynamo reads the nn.Module state (the
+        # method is a vLLM CustomOp).
+        torch.nn.Module.__init__(method)
+        # The kernel process_weights_after_loading prebuilds for this method.
+        fused_moe_module.prebuild_fused_moe_kernel(
+            topk=topk,
+            activation="silu",
+            use_ep=False,
+            skip_padded_tokens=method._skip_padded_tokens,
+            padded_row_filter=method._padded_row_filter,
+        )
+
+    def stock_forward(x, logits):
+        return stock_method._forward_monolithic_tpu(layer, x, logits)
+
+    def count_forward(x, logits):
+        return count_method._forward_monolithic_tpu(layer, x, logits)
+
+    compile_opts = dict(backend="tpu", fullgraph=True, dynamic=False)
+    stock_forward = torch.compile(stock_forward, **compile_opts)
+    count_forward = torch.compile(count_forward, **compile_opts)
+
+    state = token_padding.TokenPaddingState.create(
+        num_tokens, dev, track_valid_tokens=True
+    )
+    token_padding.set_padding_state(state)
+    compiled = []
+    try:
+        for num_valid in (0, 3, 16, 5):
+            # Padded rows get large hidden states and, like every row,
+            # non-zero gates.
+            x = torch.randn(num_tokens, hidden, generator=gen)
+            x[num_valid:] *= 50
+            logits = torch.rand(num_tokens, experts, generator=gen) * 0.25 + 0.05
+            x, logits = x.to(torch.bfloat16).to(dev), logits.to(dev)
+            state.update(num_valid, num_tokens)
+            ref = stock_forward(x, logits).cpu()
+            out = count_forward(x, logits).cpu()
+            # The warmup step traces and compiles both programs; the later
+            # steps reuse them.
+            compiled.append((_dynamo_graphs(), _xla_cache_entries()))
+            assert compiled[-1] == compiled[0], (num_valid, compiled)
+            assert torch.equal(out[:num_valid], ref[:num_valid]), num_valid
+            assert torch.equal(out[num_valid:], torch.zeros_like(out[num_valid:]))
+            if num_valid < num_tokens:
+                assert ref[num_valid:].float().abs().max() > 0
+    finally:
+        token_padding.set_padding_state(None)
