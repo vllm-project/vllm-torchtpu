@@ -231,6 +231,7 @@ ignore = [
 "src/vllm_torchtpu/models/kimi_k3/megakernel/{__init__,config,layout}.py" = ["E501"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/common/**" = ["B023", "E501"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/**" = ["E501", "S110"]
+"src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/{__init__,load,mla_dcp,decode_megakernel,paged}.py" = ["B023", "E501", "E702", "T20"]
 
 # Library code logs through vllm_torchtpu.logger. Tests, scripts and
 # command-line tools print to the terminal on purpose.
@@ -241,6 +242,7 @@ ignore = [
 docstring-code-format = true
 exclude = [
     "src/vllm_torchtpu/models/kimi_k3/megakernel/common/**",
+    "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/{load,mla_dcp,decode_megakernel,paged}.py",
 ]
 
 [tool.pymarkdown]
@@ -285,6 +287,7 @@ ignore-missing-imports = [
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
+    "ml_dtypes", "ml_dtypes.*",
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
@@ -292,7 +295,9 @@ ignore-missing-imports = [
     "prometheus_client", "prometheus_client.*",
     "ray", "ray.*",
     "requests", "requests.*",
+    "safetensors", "safetensors.*",
     "sympy", "sympy.*",
+    "tiktoken", "tiktoken.*",
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
     "runai_model_streamer", "runai_model_streamer.*",
