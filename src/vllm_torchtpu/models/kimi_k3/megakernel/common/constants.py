@@ -43,6 +43,12 @@ CHUNK: int = HIDDEN_SIZE // 8
 FC_IN: int = 35840 // 4
 ROW_PACKED: int = HIDDEN_SIZE // 256
 KERNEL_SHARD_FORMAT: int = 1
+EXPERT_FAMILIES: tuple[str, ...] = (
+    "expert_gu",
+    "expert_gus",
+    "expert_down",
+    "expert_ds",
+)
 
 __all__ = [
     "AXIS_TP",
@@ -50,6 +56,7 @@ __all__ = [
     "CONV_HEAD_ROWS",
     "CONV_TAPS",
     "DP2_GROUPS",
+    "EXPERT_FAMILIES",
     "FC_IN",
     "GIB_BYTES",
     "HEAD_DIM",
