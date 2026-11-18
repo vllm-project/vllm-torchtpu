@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -24,7 +24,15 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+if TYPE_CHECKING:
+    from vllm_torchtpu.runner.device_decode.head import PackedLayout
+
 INVALID_TOKEN_ID = -1
+
+
+class DeviceDecodeInvariantError(RuntimeError):
+    """A device-decode step ran on device state that disagrees with the
+    host's (see `AsyncTPUCopyState.from_packed`)."""
 
 
 @dataclass
@@ -108,6 +116,39 @@ class AsyncTPUCopyState:
     logprobs: list[LogprobsChunk] | None = None
     # Device sources of `logprobs`, kept alive until the copy lands.
     _logprobs_tpu: list[LogprobsTensors] | None = None
+    # Device-decode step: the head's single int32 buffer (tokens, position
+    # echo, logprobs) in place of the chunks, with its device source.
+    packed_layout: "PackedLayout | None" = None
+    packed_cpu: torch.Tensor | None = None
+    _packed_tpu: torch.Tensor | None = None
+    # int32 [num_reqs]: each request's input position as the host saw it at
+    # dispatch, which the buffer's position echo must repeat.
+    expected_positions: np.ndarray | None = None
+
+    @classmethod
+    def from_packed(
+        cls,
+        packed_tpu: torch.Tensor,
+        layout: "PackedLayout",
+        num_reqs: int,
+        expected_positions: np.ndarray,
+    ) -> "AsyncTPUCopyState":
+        """Copies a device-decode step's packed buffer in one transfer.
+        `wait()` fails the step if a request's echoed position is not
+        `expected_positions`: its KV was written at the wrong position."""
+        assert len(expected_positions) == num_reqs <= layout.num_rows
+        packed_cpu = packed_tpu.to("cpu", non_blocking=True)
+        copy_ready_event = torch.tpu.Event()
+        copy_ready_event.record()
+        return cls(
+            chunks_cpu=[],
+            chunk_real_lens=[],
+            copy_ready_event=copy_ready_event,
+            packed_layout=layout,
+            packed_cpu=packed_cpu,
+            _packed_tpu=packed_tpu,
+            expected_positions=np.array(expected_positions, dtype=np.int32),
+        )
 
     @classmethod
     def from_device_chunks(
@@ -154,9 +195,38 @@ class AsyncTPUCopyState:
         if self.completed:
             return
         self.copy_ready_event.synchronize()
+        if self.packed_layout is not None:
+            # Before `completed`, so every later wait() fails the same way.
+            self._check_position_echo()
         self.chunks_tpu = None
         self._logprobs_tpu = None
+        self._packed_tpu = None
         self.completed = True
+
+    def _check_position_echo(self) -> None:
+        assert self.packed_cpu is not None and self.expected_positions is not None
+        expected = self.expected_positions
+        echo = self.packed_cpu[: len(expected), 1].numpy()
+        bad = np.flatnonzero(echo != expected)
+        if bad.size:
+            row = int(bad[0])
+            raise DeviceDecodeInvariantError(
+                f"Device decode ran request row {row} at position "
+                f"{int(echo[row])}, but the scheduler had it at "
+                f"{int(expected[row])}: the device slots diverged from the "
+                "host and this step wrote KV at the wrong position. Unset "
+                "VLLM_TPU_DEVICE_DECODE to serve on the stock decode path, and "
+                "report this."
+            )
+
+    def packed_logprobs(self) -> LogprobsLists | None:
+        """The logprobs of a device-decode step, after `wait()`."""
+        if self.packed_layout is None:
+            return None
+        assert self.packed_cpu is not None and self.expected_positions is not None
+        num_reqs = len(self.expected_positions)
+        _, _, logprobs = self.packed_layout.unpack(self.packed_cpu, num_reqs)
+        return logprobs
 
     @property
     def sampled_token_ids_cpu(self) -> torch.Tensor:
@@ -165,6 +235,10 @@ class AsyncTPUCopyState:
         Performed lazily after `wait()`; trims each bucketed chunk to its real
         length on the host (no device recompile).
         """
+        if self._sampled_token_ids_cpu is None and self.packed_layout is not None:
+            assert self.packed_cpu is not None and self.expected_positions is not None
+            num_reqs = len(self.expected_positions)
+            self._sampled_token_ids_cpu = self.packed_cpu[:num_reqs, :1].to(torch.int64)
         if self._sampled_token_ids_cpu is None:
             trimmed = [t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)]
             if len(trimmed) == 1:
@@ -218,6 +292,8 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             return self._model_runner_output
 
         self.copy_state.wait()
+        if self.copy_state.packed_layout is not None:
+            self._model_runner_output.logprobs = self.copy_state.packed_logprobs()
         selected_token_ids = self.copy_state.sampled_token_ids_cpu
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []
