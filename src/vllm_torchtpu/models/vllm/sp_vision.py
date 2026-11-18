@@ -27,8 +27,9 @@ to the device.
 Opt in with ``TPU_SP_VISION``; it serves every tower call, eager and the
 compiled encoder buckets alike. A one-layer bench on v7x-8 has it ahead of TP
 at every size, from 66 vs 125 us per layer (excluding attention) at 1024
-patches to 536 vs 1550 at 20992. The replica costs (tp - 1)/tp of the tower's
-projection weights per rank.
+patches to 536 vs 1550 at 20992. Every rank holds every rank's shard of the
+tower's projections, its own included, stacked in rank order: a projection's
+output is then the all-to-all's input as is.
 """
 
 from typing import TYPE_CHECKING, Any, Optional
@@ -40,9 +41,9 @@ from torch import nn
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.sequence_parallel import (
     RowExchange,
-    column,
-    gather_other_shards,
+    gather_shards,
     in_out,
+    row_parallel,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -124,11 +125,10 @@ class SequenceParallelVision(nn.Module):
             )
         # Row blocks of whole merge groups, so the patch merger stays local.
         self.row_multiple = self.exchange.world * tower.spatial_merge_unit
-        others = self.exchange.others
-        self.blocks = nn.ModuleList(_BlockShards(b, others) for b in tower.blocks)
-        self.merger = _MergerShards(tower.merger, others)
+        self.blocks = nn.ModuleList(_BlockShards(b) for b in tower.blocks)
+        self.merger = _MergerShards(tower.merger)
         self.deepstack_mergers = nn.ModuleList(
-            _MergerShards(m, others) for m in tower.deepstack_merger_list
+            _MergerShards(m) for m in tower.deepstack_merger_list
         )
 
     def forward(
@@ -201,49 +201,36 @@ class SequenceParallelVision(nn.Module):
         # Qwen2_5_VisionAttention.forward; rows are [rows, 1, hidden].
         attn, mlp = block.attn, block.mlp
         x = block.norm1(hidden_states)[:, 0]
-        own, rest = column(attn.qkv, shards.qkv, x)
-        qkv = self.exchange.rows_to_heads(own + attn.qkv.bias, rest + shards.qkv_bias)
-        context = _attend(attn, qkv[:, None], attention_inputs)[:, 0]
-        own, rest = self.exchange.heads_to_rows(context)
-        hidden_states = (
-            hidden_states + _row(shards.proj, own, rest, attn.proj.bias)[:, None]
-        )
+        qkv = torch.matmul(x, shards.qkv) + shards.qkv_bias
+        context = _attend(attn, self.exchange.rows_to_heads(qkv), attention_inputs)
+        out = row_parallel(self.exchange.heads_to_rows(context), shards.proj)
+        hidden_states = hidden_states + (out + attn.proj.bias)[:, None]
         x = block.norm2(hidden_states)[:, 0]
-        own, rest = column(mlp.linear_fc1, shards.fc1, x)
-        own = mlp.act_fn(own + mlp.linear_fc1.bias)
-        rest = mlp.act_fn(rest + shards.fc1_bias)
-        return hidden_states + _row(shards.fc2, own, rest, mlp.linear_fc2.bias)[:, None]
+        x = mlp.act_fn(torch.matmul(x, shards.fc1) + shards.fc1_bias)
+        out = row_parallel(x, shards.fc2) + mlp.linear_fc2.bias
+        return hidden_states + out[:, None]
 
 
 def _attend(
     attn: nn.Module, qkv: torch.Tensor, attention_inputs: dict[str, Any]
 ) -> torch.Tensor:
     """Qwen2_5_VisionAttention.forward between its qkv and proj projections:
-    [seq, 1, 3 * heads * head_dim] -> [seq, 1, heads * head_dim]."""
+    [seq, 3 * heads * head_dim] -> [seq, heads * head_dim]. q, k and v stay
+    views of qkv ("s (three head head_dim)"), rotated and read in place."""
     heads = attn.num_attention_heads_per_partition
     head_dim = attn.hidden_size_per_attention_head
-    seq_len, batch_size, _ = qkv.shape
-    # "s b (three head head_dim) -> b s three head head_dim"
-    qkv = qkv.view(seq_len, batch_size, 3, heads, head_dim).permute(1, 0, 2, 3, 4)
-    qk, v = qkv[:, :, :2], qkv[:, :, 2]
-    # "b s two head head_dim -> (two b) s head head_dim"
-    qk = qk.permute(2, 0, 1, 3, 4).reshape(2 * batch_size, seq_len, heads, head_dim)
-    qk = attn.apply_rotary_emb(
-        qk.contiguous(),
-        attention_inputs["rotary_pos_emb_cos"],
-        attention_inputs["rotary_pos_emb_sin"],
-    )
-    q, k = qk.view(2, batch_size, seq_len, heads, head_dim).unbind(dim=0)
+    q, k, v = qkv.unflatten(-1, (3, heads, head_dim))[None].unbind(2)
+    cos = attention_inputs["rotary_pos_emb_cos"]
+    sin = attention_inputs["rotary_pos_emb_sin"]
     context = attn.attn(
-        query=q,
-        key=k,
+        query=attn.apply_rotary_emb(q, cos, sin),
+        key=attn.apply_rotary_emb(k, cos, sin),
         value=v,
         cu_seqlens=attention_inputs["cu_seqlens"],
         max_seqlen=attention_inputs["max_seqlen"],
         sequence_lengths=attention_inputs["sequence_lengths"],
     )
-    # "b s h d -> s b (h d)"
-    return context.permute(1, 0, 2, 3).reshape(seq_len, batch_size, heads * head_dim)
+    return context[0].flatten(1)
 
 
 def _merge(
@@ -254,26 +241,15 @@ def _merge(
         x = merger.norm(hidden_states.view(-1, merger.hidden_size))
     else:
         x = merger.norm(hidden_states).view(-1, merger.hidden_size)
-    own, rest = column(merger.linear_fc1, shards.fc1, x)
-    own = merger.act_fn(own + merger.linear_fc1.bias)
-    rest = merger.act_fn(rest + shards.fc1_bias)
-    return _row(shards.fc2, own, rest, merger.linear_fc2.bias)
+    x = merger.act_fn(torch.matmul(x, shards.fc1) + shards.fc1_bias)
+    return row_parallel(x, shards.fc2) + merger.linear_fc2.bias
 
 
-def _row(
-    weight: torch.Tensor, own: torch.Tensor, rest: torch.Tensor, bias: torch.Tensor
-) -> torch.Tensor:
-    """A row-parallel projection of every rank's input block as one matmul over
-    the whole input, so it is rounded once, like the unsharded layer."""
-    x = torch.cat([own, rest.transpose(0, 1).flatten(1)], dim=-1)
-    return torch.matmul(x, weight) + bias
-
-
-def _replicate(module: nn.Module, others: list[int], **linears: nn.Module) -> None:
-    """Register each linear's weight shards for this rank's rows: a
-    column-parallel one's other shards as `<name>` [tp - 1, in, out] and their
-    biases as `<name>_bias`; a row-parallel one's whole weight as `<name>` [in,
-    out], in [own, *others] shard order."""
+def _replicate(module: nn.Module, **linears: nn.Module) -> None:
+    """Register every TP rank's shard of each linear, in rank order, as
+    `<name>` [tp, in, out], and a column-parallel one's bias shards as
+    `<name>_bias` [tp, 1, out]: the column-parallel output is then every head
+    group of the rows in the order the all-to-all sends them."""
     from vllm.model_executor.layers.linear import (
         ColumnParallelLinear,
         RowParallelLinear,
@@ -285,28 +261,24 @@ def _replicate(module: nn.Module, others: list[int], **linears: nn.Module) -> No
             raise ValueError(
                 f"TPU_SP_VISION supports unquantized projections, not {linear.prefix}."
             )
-        own = in_out(linear).data
-        rest = gather_other_shards(own, others)
         if isinstance(linear, ColumnParallelLinear):
-            bias = gather_other_shards(linear.bias.data, others)
-            module.register_buffer(name, rest, persistent=False)
-            module.register_buffer(f"{name}_bias", bias[:, None], persistent=False)
-        elif isinstance(linear, RowParallelLinear):
-            whole = torch.cat([own[None], rest]).flatten(0, 1)
-            module.register_buffer(name, whole, persistent=False)
-        else:
+            bias = gather_shards(linear.bias.data)[:, None]
+            module.register_buffer(f"{name}_bias", bias, persistent=False)
+        elif not isinstance(linear, RowParallelLinear):
             raise ValueError(f"{linear.prefix} is not a TP-parallel linear.")
+        module.register_buffer(
+            name, gather_shards(in_out(linear).data), persistent=False
+        )
 
 
 class _BlockShards(nn.Module):
-    """The other TP ranks' shards of one vision block's projections."""
+    """Every TP rank's shard of one vision block's projections."""
 
-    def __init__(self, block: nn.Module, others: list[int]) -> None:
+    def __init__(self, block: nn.Module) -> None:
         super().__init__()
         attn, mlp = block.attn, block.mlp
         _replicate(
             self,
-            others,
             qkv=attn.qkv,
             proj=attn.proj,
             fc1=mlp.linear_fc1,
@@ -315,8 +287,8 @@ class _BlockShards(nn.Module):
 
 
 class _MergerShards(nn.Module):
-    """The other TP ranks' shards of one patch merger's projections."""
+    """Every TP rank's shard of one patch merger's projections."""
 
-    def __init__(self, merger: nn.Module, others: list[int]) -> None:
+    def __init__(self, merger: nn.Module) -> None:
         super().__init__()
-        _replicate(self, others, fc1=merger.linear_fc1, fc2=merger.linear_fc2)
+        _replicate(self, fc1=merger.linear_fc1, fc2=merger.linear_fc2)
