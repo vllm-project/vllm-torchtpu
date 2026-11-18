@@ -50,7 +50,10 @@ def _make_proposer(
         tensor_parallel_size=target_tp, pipeline_parallel_size=1
     )
     vllm_config = SimpleNamespace(
-        speculative_config=speculative_config, parallel_config=parallel_config
+        speculative_config=speculative_config,
+        parallel_config=parallel_config,
+        # No target model, so no registered draft-path rule applies.
+        model_config=None,
     )
     return Eagle3Proposer(
         runner=mock.MagicMock(
