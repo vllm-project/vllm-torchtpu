@@ -111,6 +111,17 @@ def stochastic_tokens(
     return _sample(logits, temperature, top_k, top_p, uniform, True)
 
 
+def scale_seen_logits(
+    logits: torch.Tensor, seen: torch.Tensor, penalties: torch.Tensor
+) -> torch.Tensor:
+    """The TPU runner's ``repetition_penalty`` scaling
+    (``vllm_torchtpu.layers.adapter.sample.repetition_penalty.scale_seen_logits``):
+    where ``seen``, positive logits are multiplied by ``1 / penalties`` and the
+    others by ``penalties`` (``[rows, 1]``), as in vLLM's torch path."""
+    scale = torch.where(logits > 0, 1.0 / penalties, penalties)
+    return torch.where(seen, logits * scale, logits)
+
+
 def penalized_tokens(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -138,9 +149,9 @@ def penalized_tokens(
     seen = seen_acc.scatter_add(1, ids, valid.to(torch.float32)) > 0
     counts_acc = torch.zeros((rows, vocab), dtype=torch.float32, device=logits.device)
     counts = counts_acc.scatter_add(1, ids, generated.to(torch.float32))
-    rep = repetition_penalty.to(torch.float32).unsqueeze(-1)
-    repeated = torch.where(logits > 0, logits / rep, logits * rep)
-    logits = torch.where(seen, repeated, logits)
+    logits = scale_seen_logits(
+        logits, seen, repetition_penalty.to(torch.float32).unsqueeze(-1)
+    )
     logits = (
         logits
         - presence_penalty.to(torch.float32).unsqueeze(-1)

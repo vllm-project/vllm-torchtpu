@@ -133,6 +133,9 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.sample import (
+    repetition_penalty as repetition_penalty_op,
+)
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -172,6 +175,7 @@ from vllm_torchtpu.runner import (
     thinking_budget_tracker,
 )
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
+from vllm_torchtpu.runner import repetition_penalty as repetition_penalty_tracker
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
@@ -1156,6 +1160,12 @@ class TPUModelRunner(GPUModelRunner):
             upload=lambda key, host: self._upload_unless_unchanged(
                 key, host, non_blocking=False
             ),
+        )
+        self._repetition_penalty = repetition_penalty_tracker.RepetitionPenaltyTracker(
+            self.vocab_size,
+            self.max_num_reqs,
+            async_scheduling=self.scheduler_config.async_scheduling,
+            speculative_decoding=self.speculative_config is not None,
         )
         # 1 on TP rank 0, else 0; built lazily on first use by
         # _sync_replicated_drafts_across_tp (needs the TP group initialized).
@@ -5371,6 +5381,7 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         is_spec_step: bool,
         min_toks: min_tokens_mask.MinTokensState,
+        rep_pen: bool = False,
         processors: Sequence[chunk_processors.PlainChunkProcessor] = (),
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``.
@@ -5378,12 +5389,15 @@ class TPUModelRunner(GPUModelRunner):
         ``is_spec_step`` marks a draft-less chunk inside a speculative step,
         whose grammar rows follow ``scheduled_spec_decode_tokens``. With
         ``top_tokens``, ``logits`` holds each row's greedy token instead.
-        ``processors`` run after the ``min_tokens`` mask, in order
+        ``rep_pen`` is ``RepetitionPenaltyTracker.begin_step`` for this step.
+        ``processors`` run after the ``min_tokens`` mask and the repetition
+        penalty, in order
         (``chunk_processors.PlainChunkProcessor``).
 
         Returns ``(selected_token_ids, logprob_logits)``. Logprobs come from the
-        logits before the min_tokens mask, as vLLM's default raw_logprobs mode
-        precedes its logits processors (the TPU runner has no logprobs_mode).
+        logits before the min_tokens mask and the repetition penalty, as vLLM's
+        default raw_logprobs mode precedes its logits processors (the TPU runner
+        has no logprobs_mode).
         """
         if grammar_output is not None:
             if is_spec_step:
@@ -5409,6 +5423,17 @@ class TPUModelRunner(GPUModelRunner):
             # min_tokens on the full logits.
             assert not top_tokens
             logits = self._mask_min_tokens(logits, min_tokens_rows, min_toks)
+        if rep_pen:
+            # _greedy_top_tokens_this_step keeps a step with a penalized
+            # request on the full logits.
+            assert not top_tokens
+            logits = self._repetition_penalty.apply(
+                logits,
+                self.input_batch,
+                self.requests,
+                cur_start_idx,
+                cur_end_idx,
+            )
         if not top_tokens:
             for proc in processors:
                 logits = proc.apply(logits)
@@ -5610,6 +5635,7 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
+        rep_pen = self._repetition_penalty.begin_step(self.input_batch)
         min_toks = self._min_tokens_batch_state()
 
         # Used to keep rand draws consistent across TP ranks.
@@ -5631,8 +5657,14 @@ class TPUModelRunner(GPUModelRunner):
         needs_logprobs = max_num_logprobs is not None
         # step_eligible keeps grammar and logprobs steps on the full logits.
         assert not state.top_tokens or (
-            grammar_output is None and not needs_logprobs and not min_toks
-        ), "top_tokens chosen with grammar, logprobs or a request below min_tokens"
+            grammar_output is None
+            and not needs_logprobs
+            and not min_toks
+            and not rep_pen
+        ), (
+            "top_tokens chosen with grammar, logprobs, a request below min_tokens, "
+            "or repetition_penalty"
+        )
 
         # Per-chunk bucketed (padded) tensors plus their real (unpadded)
         # request counts; kept at bucketed shapes so the async D2H copy hits
@@ -5774,6 +5806,7 @@ class TPUModelRunner(GPUModelRunner):
                         scheduler_output=scheduler_output,
                         is_spec_step=True,
                         min_toks=min_toks,
+                        rep_pen=rep_pen,
                         processors=(tb_chunk,) if tb_chunk is not None else (),
                     )
                     assert self.speculative_config is not None
@@ -5830,6 +5863,7 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                     is_spec_step=False,
                     min_toks=min_toks,
+                    rep_pen=rep_pen,
                     processors=(tb_chunk,) if tb_chunk is not None else (),
                 )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
@@ -7276,6 +7310,27 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out)
                 logger.info("  -- num_rows: %d", num_rows)
 
+    def _precompile_repetition_penalty(self) -> None:
+        if not self._repetition_penalty.supported:
+            return
+        with self._precompile_timed("repetition_penalty"):
+            for num_rows in _rotate_precompile_sweep(
+                self.num_reqs_paddings, "repetition_penalty"
+            ):
+                logits = self._dummy_logits(num_rows)
+                num_words = cdiv(logits.shape[1], 32)
+                seen_bitmask = torch.zeros(
+                    (num_rows, num_words), dtype=torch.int32, device=self.device
+                )
+                penalties = torch.ones(
+                    (num_rows, 1), dtype=torch.float32, device=self.device
+                )
+                out = repetition_penalty_op.apply_repetition_penalty(
+                    logits, seen_bitmask, penalties
+                )
+                synchronize_tensors(out)
+                logger.info("  -- num_rows: %d", num_rows)
+
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
             for num_reqs in _rotate_precompile_sweep(
@@ -7609,6 +7664,7 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_structured_decoding()
         self._precompile_min_tokens_mask()
         self._precompile_thinking_budget()
+        self._precompile_repetition_penalty()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
 
@@ -9363,11 +9419,13 @@ class TPUModelRunner(GPUModelRunner):
         return self.model.compute_logits(hidden_states)
 
     def _greedy_top_tokens_this_step(self) -> bool:
-        # A request below min_tokens needs the full logits to mask its stops.
+        # A request below min_tokens or with repetition_penalty needs the full
+        # logits before picking a token.
         return (
             self._greedy_head_owner is not None
             and greedy_top_tokens.step_eligible(self.input_batch, self.requests)
             and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
+            and not self._repetition_penalty.active(self.input_batch)
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
