@@ -240,7 +240,7 @@ def prebuild_on_a_host(monkeypatch):
     mesh; returns the block order the reduce-scatter op was built with."""
     from vllm.distributed import parallel_state
 
-    group = SimpleNamespace(ranks=list(MESH))
+    group = SimpleNamespace(ranks=list(MESH), world_size=CORES)
     built = []
     monkeypatch.setattr(
         op, "build_ep_mesh", lambda: SimpleNamespace(shape={op.EP_AXIS_NAME: CORES})
