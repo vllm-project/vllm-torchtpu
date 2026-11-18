@@ -345,7 +345,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         "sample_tokens",
         "execute_model",
         "_take_steady_decode_carry",
-        "_plain_decode_carry",
+        "_decode_step_carry",
         "_sampling_logits",
         "_maybe_select_logits_hidden_states",
     ):

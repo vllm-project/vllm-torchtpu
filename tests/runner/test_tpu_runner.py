@@ -4062,6 +4062,32 @@ def test_steady_decode_inputs_match_the_host_inputs(
         assert torch.equal(got, want)
 
 
+def test_steady_verify_inputs_advance_by_the_kept_tokens():
+    """A steady verify step feeds each request its bonus token and drafts
+    from the substitution source, `T` positions on from the kept ones: all
+    `T` but the rejected drafts. Padding keeps its ids and positions."""
+    T = 4
+    qsl = torch.tensor([0, 4, 8, 8], dtype=torch.int32)
+    input_ids = torch.arange(10, dtype=torch.int32)
+    pos = torch.tensor([10, 11, 12, 13, 50, 51, 52, 53, 0, 0], dtype=torch.int32)
+    seq_lens = torch.tensor([14, 54, 0], dtype=torch.int32)
+    src = torch.arange(100, 100 + 4 * T, dtype=torch.int64)
+    # Request 0 kept its bonus only (3 rejected), request 1 all 4; the
+    # padded third row's count is never read.
+    rejected = torch.tensor([3, 0, 2, 2], dtype=torch.int32)
+    for positions in (pos, pos.expand(3, -1)):
+        ids, got_pos, got_lens = tpu_runner._advance_decode_inputs(
+            src, input_ids, positions, seq_lens, qsl, rejected, T
+        )
+        assert ids.tolist() == [*range(100, 108), 8, 9]
+        assert got_pos.reshape(-1, 10)[-1].tolist() == [
+            *(11, 12, 13, 14, 54, 55, 56, 57),
+            0,
+            0,
+        ]
+        assert got_lens.tolist() == [15, 58, 0]
+
+
 def _steady_scheduler_output(**overrides):
     out = SimpleNamespace(
         total_num_scheduled_tokens=2,
@@ -4078,28 +4104,47 @@ def _steady_scheduler_output(**overrides):
     return out
 
 
+_VERIFY = {
+    "total_num_scheduled_tokens": 8,
+    "scheduled_spec_decode_tokens": {"a": [-1] * 3, "b": [-1] * 3},
+}
+
+
 @pytest.mark.parametrize(
-    ("overrides", "batch_req_ids", "steady"),
+    ("overrides", "batch_req_ids", "k", "steady"),
     [
-        ({}, ["a", "b"], True),
-        ({"blocks": [None, ([7],)]}, ["a", "b"], False),
-        ({"resumed": {"b"}}, ["a", "b"], False),
-        ({"scheduled_new_reqs": [object()]}, ["a", "b"], False),
-        ({"scheduled_spec_decode_tokens": {"a": [1]}}, ["a", "b"], False),
-        ({"total_num_scheduled_tokens": 3}, ["a", "b"], False),
-        ({}, ["b", "a"], False),
-        ({}, ["a"], False),
+        ({}, ["a", "b"], 0, True),
+        ({"blocks": [None, ([7],)]}, ["a", "b"], 0, False),
+        ({"resumed": {"b"}}, ["a", "b"], 0, False),
+        ({"scheduled_new_reqs": [object()]}, ["a", "b"], 0, False),
+        ({"scheduled_spec_decode_tokens": {"a": [1]}}, ["a", "b"], 0, False),
+        ({"total_num_scheduled_tokens": 3}, ["a", "b"], 0, False),
+        ({}, ["b", "a"], 0, False),
+        ({}, ["a"], 0, False),
+        # A carried verify step of 1 + 3 tokens per request.
+        (_VERIFY, ["a", "b"], 3, True),
+        ({**_VERIFY, "blocks": [([7],), None]}, ["a", "b"], 3, False),
+        ({}, ["a", "b"], 3, False),
+        (
+            {**_VERIFY, "scheduled_spec_decode_tokens": {"a": [-1] * 3, "b": [-1]}},
+            ["a", "b"],
+            3,
+            False,
+        ),
+        (_VERIFY, ["a", "b"], 0, False),
     ],
 )
 def test_steady_decode_needs_the_same_rows_and_block_table(
-    overrides, batch_req_ids, steady
+    overrides, batch_req_ids, k, steady
 ):
-    """Only a step of the carried requests in their rows, one token each with
-    no new KV block, derives its inputs from the carry; any step takes it."""
-    carry = SimpleNamespace(req_ids=("a", "b"))
+    """Only a step of the carried requests in their rows, as many tokens each
+    as the carried step (one, or 1 + K drafts) with no new KV block, derives
+    its inputs from the carry; any step takes it."""
+    carry = SimpleNamespace(req_ids=("a", "b"), tokens_per_req=1 + k)
+    rejected = torch.zeros(2, dtype=torch.int32) if k else None
     runner = SimpleNamespace(
         _decode_carry=carry,
-        _pre_async_results=object(),
+        _pre_async_results=SimpleNamespace(spec_decode_num_rejected_tokens=rejected),
         input_batch=SimpleNamespace(req_ids=batch_req_ids, num_reqs=len(batch_req_ids)),
     )
     got = TPUModelRunner._take_steady_decode_carry(

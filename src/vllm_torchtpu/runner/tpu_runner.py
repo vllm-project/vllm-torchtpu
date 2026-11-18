@@ -277,9 +277,10 @@ class ExecuteModelState:
 
 @dataclass(frozen=True)
 class _DecodeCarry:
-    """A plain decode step's device inputs and attention metadata. The next
-    step derives its own from them on the device when it is steady: the same
-    requests in the same batch rows, one token each, no new KV block
+    """A decode or verify step's device inputs and attention metadata. The
+    next step derives its own from them on the device when it is steady: the
+    same requests in the same batch rows, the same tokens each (1, or 1 + K
+    under speculative decoding), no new KV block
     (`_take_steady_decode_carry`)."""
 
     req_ids: tuple[str, ...]
@@ -290,6 +291,13 @@ class _DecodeCarry:
     # Per layer; the groups share positions, seq_lens and query_start_loc.
     attn_metadata: dict[str, AttentionMetadata]
     logits_indices: torch.Tensor
+    # A verify step's metadata (its drafts change each step), else None.
+    spec_metadata: SpecDecodeMetadata | None = None
+
+    @property
+    def tokens_per_req(self) -> int:
+        md = self.spec_metadata
+        return 1 if md is None else 1 + int(md.draft_lengths_cpu[0])
 
 
 @dataclass(frozen=True)
@@ -478,27 +486,38 @@ def _advance_decode_inputs_impl(
     positions: torch.Tensor,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,
+    num_rejected: torch.Tensor | None = None,
+    tokens_per_req: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The inputs of a steady decode step, from the previous step's.
+    """The inputs of a steady decode or verify step, from the previous step's.
 
-    The previous step fed request ``i`` one token at index ``i`` (padding
-    requests have zero length in ``query_start_loc``) and sampled row ``i`` of
-    ``next_tokens``. Now each request feeds that token one position later and
-    attends one more key; padding keeps its ids and positions.
+    The previous step fed request ``i`` its ``T = tokens_per_req`` tokens at
+    indices ``[i * T, (i + 1) * T)`` (padding requests have zero length in
+    ``query_start_loc``), and ``next_tokens[i * T : (i + 1) * T]`` are the
+    ones it feeds now: its sampled token (decode), or its bonus token and new
+    drafts (verify, the async substitution source). Each request advances by
+    the tokens the previous step kept: all ``T`` but its ``num_rejected``
+    drafts. Padding keeps its ids and positions.
     """
     num_tokens = input_ids.shape[0]
     tokens = next_tokens.reshape(-1)[:num_tokens]
     if tokens.shape[0] < num_tokens:
         tokens = torch.nn.functional.pad(tokens, (0, num_tokens - tokens.shape[0]))
-    real = (
-        torch.arange(num_tokens, dtype=query_start_loc.dtype, device=input_ids.device)
-        < query_start_loc[-1]
-    )
+    idx = torch.arange(num_tokens, dtype=query_start_loc.dtype, device=input_ids.device)
+    real = idx < query_start_loc[-1]
     input_ids = torch.where(real, tokens.to(input_ids.dtype), input_ids)
-    positions = positions + real.to(positions.dtype)
-    seq_lens = seq_lens + (query_start_loc[1:] - query_start_loc[:-1]).to(
-        seq_lens.dtype
-    )
+    step = query_start_loc[1:] - query_start_loc[:-1]
+    if num_rejected is not None:
+        num_seqs = step.shape[0]
+        rejected = num_rejected[:num_seqs].to(step.dtype)
+        if rejected.shape[0] < num_seqs:
+            rejected = torch.nn.functional.pad(
+                rejected, (0, num_seqs - rejected.shape[0])
+            )
+        step = torch.where(step > 0, step - rejected, step)
+    req = (idx // tokens_per_req).clamp(max=step.shape[0] - 1)
+    positions = positions + torch.where(real, step[req], 0).to(positions.dtype)
+    seq_lens = seq_lens + step.to(seq_lens.dtype)
     return input_ids, positions, seq_lens
 
 
@@ -513,13 +532,23 @@ def _advance_decode_inputs(
     positions: torch.Tensor,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,
+    num_rejected: torch.Tensor | None = None,
+    tokens_per_req: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     fn = (
         _advance_decode_inputs_compiled
         if input_ids.device.type == "tpu"
         else _advance_decode_inputs_impl
     )
-    return fn(next_tokens, input_ids, positions, seq_lens, query_start_loc)
+    return fn(
+        next_tokens,
+        input_ids,
+        positions,
+        seq_lens,
+        query_start_loc,
+        num_rejected,
+        tokens_per_req,
+    )
 
 
 logger = init_logger(__name__)
@@ -2937,31 +2966,51 @@ class TPUModelRunner(GPUModelRunner):
         self._modify_prev_results()
         self._pre_async_results = None
 
-    def _plain_decode_carry(
+    def _decode_step_carry(
         self,
         scheduler_output: "SchedulerOutput",
         num_chunks: int,
         input_ids: torch.Tensor,
         attn_metadata: dict[str, AttentionMetadata],
         logits_indices: torch.Tensor,
+        spec_metadata: SpecDecodeMetadata | None,
     ) -> _DecodeCarry | None:
         """This step's inputs, if the next step may derive its own from them.
 
-        That takes one chunk of requests past their prompt, one token each,
-        whose sampled token feeds the next step from the device (async
-        scheduling, no drafts), on a runner whose decode inputs are only ids,
-        positions, seq_lens and a block table: no recurrent state, PCP, PP, DP
-        lockstep, KV transfer or LoRA mapping. The phased profiler counts the
-        steps `execute_model` prepares, so it keeps every step there.
+        That takes one chunk of requests past their prompt, each fed one
+        token, or under speculative decoding its bonus token and `K` drafts
+        from the device n-gram drafter, whose output feeds the next step from
+        the device (async scheduling), on a runner whose decode inputs are
+        only ids, positions, seq_lens and a block table: no recurrent state,
+        PCP, PP, DP lockstep, KV transfer or LoRA mapping. The phased profiler
+        counts the steps `execute_model` prepares, so it keeps every step
+        there.
         """
         batch = self.input_batch
         num_reqs = batch.num_reqs
         plan = self._last_sequence_layout_plan
+        spec = self.speculative_config
+        k = 0
+        if spec is not None:
+            # The n-gram drafter reads only the step's tokens (a hidden-state
+            # drafter reads its attention context, which `_prepare_inputs`
+            # builds), and only a full verify of every request repeats
+            # (adaptive verification trims per step).
+            if (
+                spec_metadata is None
+                or not isinstance(self.drafter, DeviceNgramProposer)
+                or self._adaptive_verification is not None
+                or (
+                    spec_metadata.draft_lengths_cpu[:num_reqs]
+                    != spec.num_speculative_tokens
+                ).any()
+            ):
+                return None
+            k = spec.num_speculative_tokens
         if not (
             num_chunks == 1
-            and scheduler_output.total_num_scheduled_tokens == num_reqs
+            and scheduler_output.total_num_scheduled_tokens == num_reqs * (1 + k)
             and self.scheduler_config.async_scheduling
-            and self.speculative_config is None
             and plan is not None
             and plan.kind is SequenceLayoutKind.ALL
             and not self._has_mamba_state
@@ -2988,25 +3037,33 @@ class TPUModelRunner(GPUModelRunner):
             query_start_loc=ctx.query_start_loc,
             attn_metadata=attn_metadata,
             logits_indices=logits_indices,
+            spec_metadata=spec_metadata,
         )
 
     def _take_steady_decode_carry(
         self, scheduler_output: "SchedulerOutput"
     ) -> _DecodeCarry | None:
-        """The previous step's carry, if this step is steady: it schedules one
-        token for each of the same requests, in the same batch rows (checked
-        after `_update_states`), and no request gets a new KV block, so the
-        block table on the device still holds."""
+        """The previous step's carry, if this step is steady: it schedules as
+        many tokens (one, or 1 + K for a verify step) for each of the same
+        requests, in the same batch rows (checked after `_update_states`), and
+        no request gets a new KV block, so the block table on the device still
+        holds."""
         carry, self._decode_carry = self._decode_carry, None
         if carry is None:
             return None
         batch = self.input_batch
         cached = scheduler_output.scheduled_cached_reqs
+        pre = self._pre_async_results
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        k = carry.tokens_per_req - 1
+        n = len(carry.req_ids)
         if (
-            self._pre_async_results is None
-            or scheduler_output.total_num_scheduled_tokens != len(carry.req_ids)
+            pre is None
+            or (pre.spec_decode_num_rejected_tokens is None) != (k == 0)
+            or scheduler_output.total_num_scheduled_tokens != n * (1 + k)
+            or len(spec_tokens) != (n if k else 0)
+            or any(len(ids) != k for ids in spec_tokens.values())
             or scheduler_output.scheduled_new_reqs
-            or scheduler_output.scheduled_spec_decode_tokens
             or cached.resumed_req_ids
             or any(ids is not None for ids in cached.new_block_ids)
             or tuple(batch.req_ids[: batch.num_reqs]) != carry.req_ids
@@ -4805,12 +4862,13 @@ class TPUModelRunner(GPUModelRunner):
                 )
             draft_input_ids_src = input_ids
             if chunk_index == 0:
-                self._decode_carry = self._plain_decode_carry(
+                self._decode_carry = self._decode_step_carry(
                     scheduler_output,
                     target_num_chunks,
                     input_ids,
                     attn_metadata,
                     logits_indices,
+                    spec_decode_metadata,
                 )
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
@@ -5144,18 +5202,36 @@ class TPUModelRunner(GPUModelRunner):
     def _execute_steady_decode(
         self, scheduler_output: "SchedulerOutput", carry: _DecodeCarry
     ) -> None:
-        """Run a steady decode step on inputs derived on the device from the
-        previous step's: no `_prepare_inputs`, H2D upload, attention metadata
-        build or staging fence (976 us of host time ahead of each launch,
-        profiled on a TP=8 megakernel decode)."""
-        assert self._pre_async_results is not None
+        """Run a steady decode or verify step on inputs derived on the device
+        from the previous step's: no `_prepare_inputs`, H2D upload, attention
+        metadata build or staging fence (976 us of host time ahead of each
+        launch, profiled on a TP=8 megakernel decode). A verify step advances
+        by the tokens the previous one kept and verifies the drafts proposed
+        from them, both on the device."""
+        pre = self._pre_async_results
+        assert pre is not None
+        md = carry.spec_metadata
         input_ids, positions, seq_lens = _advance_decode_inputs(
-            self._pre_async_results.next_tokens_tpu,
+            pre.next_tokens_tpu,
             carry.input_ids,
             carry.positions,
             carry.seq_lens,
             carry.query_start_loc,
+            pre.spec_decode_num_rejected_tokens if md is not None else None,
+            carry.tokens_per_req,
         )
+        if md is not None:
+            from vllm_torchtpu.runner.tpu_runner_async_output import (
+                extract_draft_token_ids,
+            )
+
+            md = dataclasses.replace(
+                md,
+                draft_token_ids=extract_draft_token_ids(
+                    input_ids, md.final_logits_indices, md.target_logits_indices
+                ),
+                deferred_draft_token_ids_cpu=None,
+            )
         # The builder puts the same positions and seq_lens in every group.
         replaced: dict[int, AttentionMetadata] = {}
         attn_metadata = {}
@@ -5174,6 +5250,7 @@ class TPUModelRunner(GPUModelRunner):
             positions=positions,
             seq_lens=seq_lens,
             attn_metadata=attn_metadata,
+            spec_metadata=md,
         )
 
         inputs_embeds = None
@@ -5223,12 +5300,29 @@ class TPUModelRunner(GPUModelRunner):
                 carry.logits_indices,
                 top_tokens,
             )
+        draft_chunks = []
+        if md is not None:
+            # The n-gram drafter reads only the chunk's batch rows.
+            draft_chunks.append(
+                DraftChunkInputs(
+                    input_ids=input_ids,
+                    position_ids=positions,
+                    query_start_loc_np=self.query_start_loc_np[: num_reqs + 1].copy(),
+                    attn_ctx=self._attn_metadata_builder_ctx,
+                    start_index=0,
+                    num_reqs=num_reqs,
+                    aux_hidden_states=[],
+                    draft_lengths=md.draft_lengths,
+                    attn_metadata=attn_metadata,
+                )
+            )
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=[logits],
             pooler_output_list=[],
             num_reqs_list=[num_reqs],
-            spec_decode_metadata_list=[None],
+            spec_decode_metadata_list=[md],
+            draft_chunks=draft_chunks,
             top_tokens=top_tokens,
         )
 
@@ -7761,13 +7855,19 @@ class TPUModelRunner(GPUModelRunner):
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
 
     def _precompile_advance_decode_inputs(self) -> None:
-        """Compile `_advance_decode_inputs` at every steady decode shape: the
-        token and request buckets of each batch size, per seq_lens width."""
-        if (
-            not self.scheduler_config.async_scheduling
-            or self.speculative_config is not None
+        """Compile `_advance_decode_inputs` at every steady decode (or, under
+        n-gram speculative decoding, verify) shape: the token and request
+        buckets of each batch size, per seq_lens width."""
+        spec = self.speculative_config
+        if not self.scheduler_config.async_scheduling or (
+            spec is not None
+            and (
+                not isinstance(self.drafter, DeviceNgramProposer)
+                or self._adaptive_verification is not None
+            )
         ):
             return
+        T = 1 if spec is None else 1 + spec.num_speculative_tokens
         widths = {self.num_reqs_max_model_len}
         if self.num_reqs_most_model_len is not None:
             widths.add(self.num_reqs_most_model_len)
@@ -7779,23 +7879,30 @@ class TPUModelRunner(GPUModelRunner):
                     runner=self,
                     scheduler_output=None,
                     start_index=0,
-                    num_scheduled_tokens_per_req=np.ones(n, dtype=np.int32),
+                    num_scheduled_tokens_per_req=np.full(n, T, dtype=np.int32),
                 ),
                 _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs),
             )
             for n in range(1, self.max_num_reqs + 1)
         }
         i32 = dict(dtype=torch.int32, device=self.device)
+        i64 = dict(dtype=torch.int64, device=self.device)
         with self._precompile_timed("advance_decode_inputs"):
             for num_tokens, num_reqs in sorted(buckets):
                 pos_shape = (3, num_tokens) if self.uses_mrope else (num_tokens,)
+                # A verify step's source is padded to max_num_reqs * T
+                # (`sample_tokens`), its rejected counts are per padded row.
+                rejected = torch.zeros(num_reqs, **i32) if T > 1 else None
+                src = num_reqs if T == 1 else self.max_num_reqs * T
                 for width in sorted(widths):
                     out = _advance_decode_inputs(
-                        torch.zeros(num_reqs, dtype=torch.int64, device=self.device),
+                        torch.zeros(src, **i64),
                         torch.zeros(num_tokens, **i32),
                         torch.zeros(pos_shape, **i32),
                         torch.zeros(width, **i32),
                         torch.zeros(width + 1, **i32),
+                        rejected,
+                        T,
                     )
                     synchronize_tensors(out)
 
