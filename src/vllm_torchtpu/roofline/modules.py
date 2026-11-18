@@ -715,7 +715,7 @@ def _compute_gqa_cost(
             + _align_mxu(out_sharded, eval_context)
         )
     )
-    gqa_kv_scale = (counts.kv_gqa / float(n_gqa)) if geom.compress_ratios else 1.0
+    gqa_kv_scale = (counts.eff_gqa / float(n_gqa)) if geom.compress_ratios else 1.0
     kv_dec_tokens = (
         float(eval_context.batch * eval_context.context)
         * gqa_kv_scale
@@ -934,8 +934,8 @@ def _compute_mla_dsa_costs(
     nq = max(1, geom.num_heads // tp) if geom.num_heads > 0 else 0
     out: list[ModuleCost] = []
     for fam_name, n_fam, kv_n_fam, is_sparse in (
-        ("mla", counts.mla, counts.kv_mla, False),
-        ("dsa", counts.dsa, counts.kv_dsa, True),
+        ("mla", counts.mla, counts.eff_mla, False),
+        ("dsa", counts.dsa, counts.eff_dsa, True),
     ):
         if n_fam <= 0:
             continue

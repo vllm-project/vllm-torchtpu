@@ -45,7 +45,7 @@ from .constants import (
     UNIT_GIGA,
     UNIT_KILO,
     UNIT_MEGA,
-    UNIT_MICROS_PER_SECOND,
+    UNIT_MICRO,
     WEIGHT_DTYPE_BYTES,
 )
 from .emit import (
@@ -374,7 +374,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         help="Dense linear projection weight storage dtype (unit: dtype, scope: core).",
     )
     p.add_argument(
-        "--expert-dtype",
+        "--expert-weight-dtype",
         choices=sorted(EXPERT_DTYPE_BYTES),
         default=None,
         help="Routed MoE expert weight storage dtype (unit: dtype, scope: core).",
@@ -719,7 +719,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_plan.add_argument(
-        "--acceptance-length",
+        "--accept-len",
         type=float,
         default=None,
         help=(
@@ -1514,8 +1514,8 @@ def _build_plan_par_dtypes(
             else base_dt.w_dense
         ),
         w_expert=(
-            EXPERT_DTYPE_BYTES[args.expert_dtype]
-            if args.expert_dtype is not None
+            EXPERT_DTYPE_BYTES[args.expert_weight_dtype]
+            if args.expert_weight_dtype is not None
             else base_dt.w_expert
         ),
         w_aux=(
@@ -1531,7 +1531,7 @@ def _build_plan_par_dtypes(
         ),
         act="a8" if args.act in ("a8", "fp8") else "a16",
     )
-    lat_s = (args.collective_latency_us or 0.0) * UNIT_MICROS_PER_SECOND
+    lat_s = (args.collective_latency_us or 0.0) * UNIT_MICRO
     return (par, dt, lat_s)
 
 
@@ -1543,8 +1543,8 @@ def _dispatch_plan_cmd(
     cfg: dict[str, object] | None = None,
 ) -> int:
     """Execute the plan subcommand across target concurrencies."""
-    if args.spec_window > 0 and args.acceptance_length is None:
-        parser.error("--acceptance-length is required when --spec-window > 0")
+    if args.spec_window > 0 and args.accept_len is None:
+        parser.error("--accept-len is required when --spec-window > 0")
     par, dt, _ = _build_plan_par_dtypes(args, cfg)
     concs_list = [int(x) for x in args.concurrency.split(",") if x.strip()]
     rows = plan(
@@ -1556,7 +1556,7 @@ def _dispatch_plan_cmd(
             context=args.context,
             concurrencies=concs_list,
             spec_window=args.spec_window,
-            acceptance_length=args.acceptance_length,
+            acceptance_length=args.accept_len,
             collective_latency_us=args.collective_latency_us,
         ),
     )

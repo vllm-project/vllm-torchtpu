@@ -616,14 +616,14 @@ def dtypes_from_hf_config(cfg: Mapping[str, object]) -> Dtypes:
     act_mode = _derive_activation_mode(qp, qcfg)
 
     w_dense_src: Literal["quantization_config", "flag", "default"] = (
-        "quantization_config" if has_qcfg else "default"
+        "quantization_config"
     )
     w_dense_dt = _derive_dense_dtype_name(
         qp, w_dense, fp8_b, base_name, attn_ignored=attn_ignored
     )
 
     w_expert_src: Literal["quantization_config", "flag", "default"] = (
-        "quantization_config" if has_qcfg else "default"
+        "quantization_config"
     )
     w_expert_dt = _derive_expert_dtype_name(qp, qcfg, w_expert, fp8_b, base_name)
 

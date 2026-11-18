@@ -494,9 +494,9 @@ def chip_catalog(chip: ChipSpec) -> dict[str, dict[str, object]]:
             scope="core",
             kind="derived",
             source=(
-                "8 x 128 lane-sublane pairs x 4 ops per cycle x 2.2e9 Hz = 9e12 "
-                "32-bit word ops/s per core (jax-ml.github.io/scaling-book/tpus); "
-                "packed elements run up to 4 per word"
+                "bf16_flops / 128 (DEFAULT_VPU_TO_BF16_RATIO = 1/128 of per-core "
+                "BF16 peak, jax-ml.github.io/scaling-book/tpus); 32-bit word ops/s "
+                "per core, with up to 4 packed elements per word"
             ),
             bracket=(
                 chip.bf16_flops * VPU_TO_BF16_RATIO_BRACKET[0],
@@ -630,6 +630,14 @@ def from_jax(  # noqa: PLR0913
         vpu_flops=eff_vpu_flops,
         mxu_lhs_rows_bf16=DEFAULT_MXU_LHS_ROWS_BF16,
         mxu_lhs_rows_fp8=DEFAULT_MXU_LHS_ROWS_FP8,
+    )
+
+
+def count_hosts(num_chips: int) -> int:
+    """Return physical host count for ``num_chips`` using ceiling division."""
+    return max(
+        1,
+        (num_chips + DEFAULT_CHIPS_PER_HOST - 1) // DEFAULT_CHIPS_PER_HOST,
     )
 
 

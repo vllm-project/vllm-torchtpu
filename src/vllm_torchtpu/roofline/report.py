@@ -21,9 +21,8 @@ import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from .chips import CHIPS, ChipSpec, chip_catalog, format_constant_display
+from .chips import CHIPS, ChipSpec, chip_catalog, count_hosts, format_constant_display
 from .constants import (
-    DEFAULT_CHIPS_PER_HOST,
     DEFAULT_CORES_PER_CHIP,
     DEFAULT_GPU_MEMORY_UTILIZATION,
     MAX_EMBEDDED_CANDIDATES,
@@ -252,15 +251,8 @@ def _render_limits_svg(floor: Mapping[str, object] | None) -> str:
         )
 
     hbm_ms = _as_float(floor.get("hbm_bound_ms", floor.get("hbm_ms")))
-    matmul_ms = _as_float(
-        floor.get(
-            "matmul_bound_ms",
-            floor.get("matmul_ms", floor.get("matmul_s", floor.get("mm_s", 0.0))),
-        )
-    )
-    vpu_ms = _as_float(
-        floor.get("vpu_bound_ms", floor.get("vpu_ms", floor.get("vpu_s", 0.0)))
-    )
+    matmul_ms = _as_float(floor.get("matmul_bound_ms", floor.get("matmul_ms")))
+    vpu_ms = _as_float(floor.get("vpu_bound_ms"))
     ici_ms = _as_float(floor.get("coll_bound_ms", floor.get("ici_ms")))
     chain_ms = _as_float(floor.get("chain_ms"))
     hop_ms = _as_float(floor.get("hop_latency_ms"))
@@ -726,7 +718,7 @@ def _render_table_rows(
         effective_hit_rate = _as_float(candidate_point.get("effective_prefix_hit_rate"))
         launch_command_str = _format_launch_lines(_as_sequence(launch.get("commands")))
 
-        host_count = max(1, total_chips // DEFAULT_CHIPS_PER_HOST)
+        host_count = count_hosts(total_chips)
         core_count = total_chips * DEFAULT_CORES_PER_CHIP
         host_suffix = "host" if host_count == 1 else "hosts"
         chips_description = (
@@ -741,7 +733,7 @@ def _render_table_rows(
             prefill_chips = (
                 _as_int(prefill_pool.get("chips_per_instance"), 0) * prefill_instances
             )
-            prefill_hosts = max(1, prefill_chips // DEFAULT_CHIPS_PER_HOST)
+            prefill_hosts = count_hosts(prefill_chips)
             prefill_cores = prefill_chips * DEFAULT_CORES_PER_CHIP
             h_suffix = "s" if prefill_hosts > 1 else ""
             prefill_pool_desc = (
@@ -755,7 +747,7 @@ def _render_table_rows(
             decode_chips = (
                 _as_int(decode_pool.get("chips_per_instance"), 0) * decode_instances
             )
-            decode_hosts = max(1, decode_chips // DEFAULT_CHIPS_PER_HOST)
+            decode_hosts = count_hosts(decode_chips)
             decode_cores = decode_chips * DEFAULT_CORES_PER_CHIP
             h_suffix = "s" if decode_hosts > 1 else ""
             decode_pool_desc = (
@@ -1051,7 +1043,7 @@ def render_html(payload: Mapping[str, object]) -> str:  # noqa: PLR0915
     budget_src = str(
         chip_budget.get("budget_source", payload.get("budget_source", "flag"))
     )
-    budget_hosts = max(1, budget_chips // DEFAULT_CHIPS_PER_HOST)
+    budget_hosts = count_hosts(budget_chips)
     budget_str = (
         f"Search Budget: {budget_chips} chips / {budget_hosts} hosts ({budget_src})"
         if budget_chips > 0
@@ -1164,7 +1156,7 @@ def render_html(payload: Mapping[str, object]) -> str:  # noqa: PLR0915
         f"      <strong>{_escape(pools_summary)}</strong> &bull; "
         f"Concurrency {rec_fields['concurrency']} across "
         f"{rec_fields['chips']} chips "
-        f"({max(1, _as_int(rec_fields['chips']) // DEFAULT_CHIPS_PER_HOST)} hosts)",
+        f"({count_hosts(_as_int(rec_fields['chips']))} hosts)",
         "    </div>",
         '    <div class="grid-stats">',
         '      <div class="stat-box">',

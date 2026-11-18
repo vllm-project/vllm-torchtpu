@@ -885,7 +885,7 @@ def test_bound_never_exceeds_estimate_across_families() -> None:
         )
         assert sf.hard_floor_s <= sf.serial_estimate_s + 1e-12
         assert sf_hi.hard_floor_s >= sf.hard_floor_s - 1e-12
-        if sf.lat_s > 0.0:
+        if sf.latency_assumed_s > 0.0:
             assert sf_hi.latency_assumed_s > sf.latency_assumed_s
 
 
@@ -1162,3 +1162,9 @@ def test_vpu_floor_and_lhs_row_tiles_bound_step() -> None:
     moe_mod = next(m for m in sf.modules if m.name == "moe")
     assert moe_mod.strict_fp8_flops > 0.0
     assert moe_mod.strict_vpu_flops > 0.0
+
+
+def test_count_hosts_rounds_up_partial_hosts() -> None:
+    """Round positive chip counts up to physical hosts using ceiling division."""
+    for num_chips, expected_hosts in ((0, 1), (4, 1), (5, 2), (8, 2), (9, 3)):
+        assert rf.chips.count_hosts(num_chips) == expected_hosts

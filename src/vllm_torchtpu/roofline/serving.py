@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .constants import UNIT_MICROS_PER_SECOND, UNIT_MILLIS_PER_SECOND
+from .constants import UNIT_MICRO, UNIT_MILLIS_PER_SECOND
 from .modules import Parallel, StepShape
 from .step import FloorOptions, SpecShape, spec_cycle_floor, step_floor
 
@@ -74,7 +74,7 @@ def plan(
         raise ValueError(msg)
     else:
         tokens = float(request.acceptance_length)
-    lat_s = (request.collective_latency_us or 0.0) * UNIT_MICROS_PER_SECOND
+    lat_s = (request.collective_latency_us or 0.0) * UNIT_MICRO
     opts = FloorOptions(dt=dt, collective_latency_s=lat_s)
     rows_out: list[ConcurrencyRow] = []
     for c in request.concurrencies:

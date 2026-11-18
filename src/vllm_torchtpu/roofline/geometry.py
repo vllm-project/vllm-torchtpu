@@ -94,26 +94,6 @@ class LayerCounts:
         """Total number of KV-bearing attention layers."""
         return self.gqa + self.swa + self.mla
 
-    @property
-    def kv_gqa(self) -> float:
-        """Compatibility alias for eff_gqa."""
-        return self.eff_gqa
-
-    @property
-    def kv_mla(self) -> float:
-        """Compatibility alias for eff_mla."""
-        return self.eff_mla
-
-    @property
-    def kv_dsa(self) -> float:
-        """Compatibility alias for eff_dsa."""
-        return self.eff_dsa
-
-    @property
-    def kv_swa(self) -> float:
-        """Compatibility alias for eff_swa."""
-        return self.eff_swa
-
 
 @dataclass(frozen=True, slots=True)
 class ModelGeometry:

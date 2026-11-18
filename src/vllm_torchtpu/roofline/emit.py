@@ -21,7 +21,7 @@ import shlex
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Final, TypedDict, cast
 
-from .chips import CHIPS, JAX_VERSION, ChipSpec, chip_catalog
+from .chips import CHIPS, JAX_VERSION, ChipSpec, chip_catalog, count_hosts
 from .constants import (
     DEEP_PP_THRESHOLD,
     DEFAULT_CHIPS_PER_HOST,
@@ -238,7 +238,7 @@ def pool_label(pool: Mapping[str, object]) -> str:
     layout_text = format_parallelism(pool)
     if total_chips <= 0:
         return f"{instance_prefix}{topology_name}: {layout_text}"
-    hosts = max(1, total_chips // DEFAULT_CHIPS_PER_HOST)
+    hosts = count_hosts(total_chips)
     host_description = "1 host" if hosts == 1 else f"{hosts} hosts"
     cores = total_chips * DEFAULT_CORES_PER_CHIP
     pool_description = f" ({total_chips} chips, {host_description}, {cores} cores)"

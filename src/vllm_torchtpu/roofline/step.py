@@ -30,7 +30,7 @@ from .collectives import (
 )
 from .constants import (
     ACTIVATION_BYTES_BF16,
-    MATMUL_FLOP_PER_MAC,
+    DRAFT_PROJECTION_HIDDEN_VECTORS,
     STEP_FLOOR_CACHE_MAXSIZE,
     UNIT_COLL_CACHE_MAXSIZE,
     VECTOR_MAX_ELEMENTS_PER_WORD,
@@ -83,7 +83,6 @@ class StepFloor:
     hard_floor_s: float
     serial_estimate_s: float
     binding: str
-    lat_s: float = 0.0
     hbm_bound_s: float = 0.0
     matmul_bound_s: float = 0.0
     vpu_bound_s: float = 0.0
@@ -300,7 +299,6 @@ def combine_modules(
         hard_floor_s=hard_floor_s,
         serial_estimate_s=serial_estimate_s,
         binding=binding,
-        lat_s=hop_lat_s,
         hbm_bound_s=hbm_bound_s,
         matmul_bound_s=matmul_bound_s,
         vpu_bound_s=vpu_bound_s,
@@ -424,7 +422,9 @@ def spec_cycle_floor(
         mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
     )
 
-    fc_elems = MATMUL_FLOP_PER_MAC * float(geom.hidden * geom.hidden // parallel.tp)
+    fc_elems = DRAFT_PROJECTION_HIDDEN_VECTORS * float(
+        geom.hidden * geom.hidden // parallel.tp
+    )
     fc_fp8, fc_bf16 = _split_matmul_flops(
         spec.batch, fc_elems, opts.dt.w_aux, opts.dt.act
     )

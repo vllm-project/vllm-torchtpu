@@ -522,7 +522,7 @@ def _candidate_decode_parallels(
         if (
             moe_mode == "ep"
             and dp == 1
-            and (tp == 1 or geom.moe_inter == 0 or geom.moe_inter % (tp * max_blk) == 0)
+            and (tp == 1 or geom.moe_inter % (tp * max_blk) == 0)
             and geom.moe_inter // tp >= MIN_MOE_INTERMEDIATE_ALIGNMENT
             and (geom.moe_inter // tp) % MIN_MOE_INTERMEDIATE_ALIGNMENT == 0
         ):
@@ -831,14 +831,14 @@ def _floor_times(step_floor_val: StepFloor) -> FloorTimes:
     coll_t = (
         step_floor_val.coll_bound_s
         if step_floor_val.coll_bound_s > 0.0
-        else step_floor_val.chain_s + step_floor_val.lat_s
+        else step_floor_val.chain_s + step_floor_val.latency_assumed_s
     )
     return FloorTimes(
         hbm_ms=hbm_t * UNIT_MILLIS_PER_SECOND,
         matmul_ms=matmul_t * UNIT_MILLIS_PER_SECOND,
         ici_ms=step_floor_val.ici_s * UNIT_MILLIS_PER_SECOND,
         chain_ms=step_floor_val.chain_s * UNIT_MILLIS_PER_SECOND,
-        hop_latency_ms=step_floor_val.lat_s * UNIT_MILLIS_PER_SECOND,
+        hop_latency_ms=step_floor_val.latency_assumed_s * UNIT_MILLIS_PER_SECOND,
         hard_floor_ms=step_floor_val.hard_floor_s * UNIT_MILLIS_PER_SECOND,
         binding=step_floor_val.binding,
         hbm_bound_ms=hbm_t * UNIT_MILLIS_PER_SECOND,
@@ -1250,6 +1250,7 @@ def _solve_mixed_decode_fixed_point(
     tpot_s = 0.0
     t_dec_s = 0.0
     x_capacity = 0.0
+    x_rate = 0.0
     for _ in range(3):
         b_replica = max(1, min(loop_in.b_res, math.ceil(b_dec / float(dp_val))))
         sf_dec = _eval_decode_floor(eval_context, topo, par, b_replica)
@@ -1303,10 +1304,6 @@ def _solve_mixed_decode_fixed_point(
             float(c) / max(1e-9, loop_in.ttft_service_s + t_dec_s + think),
         )
         b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), x_rate * t_dec_s))
-    x_rate = min(
-        x_capacity,
-        float(c) / max(1e-9, loop_in.ttft_service_s + t_dec_s + think),
-    )
     ttft_est_s = float(c) / max(1e-9, x_rate) - t_dec_s - think
     return _MixedLoopOutput(
         sf_dec=sf_dec,
@@ -1523,8 +1520,6 @@ def _evaluate_mixed_candidates(  # noqa: C901
         ):
             continue
         for parallel in _candidate_decode_parallels(eval_context.geom, topo):
-            if eval_context.spec_k > 0 and parallel.pp > 1:
-                continue
             logit_peak_mix_b = _peak_prefill_logit_bytes(
                 eval_context.geom,
                 eval_context.dtypes,
@@ -1634,6 +1629,7 @@ def _compute_disagg_metrics(
     tpot_s = 0.0
     t_dec_s = 0.0
     x_capacity = 0.0
+    x_rate = 0.0
     for _ in range(3):
         b_replica = max(1, min(batch_stats.b_res, math.ceil(b_dec / float(idp_val))))
         sf_d = _eval_decode_floor(eval_context, dec.topo, dec.par, b_replica)
@@ -1650,9 +1646,6 @@ def _compute_disagg_metrics(
             1.0, min(float(min(target.c, int(max_decode_seqs))), x_rate * t_dec_s)
         )
 
-    x_rate = min(
-        x_capacity, float(target.c) / max(1e-9, ttft_service_s + t_dec_s + think)
-    )
     ttft_est_s = float(target.c) / max(1e-9, x_rate) - t_dec_s - think
     est_ttft_d_ms = ttft_est_s * UNIT_MILLIS_PER_SECOND
     est_tpot_ms = tpot_s * UNIT_MILLIS_PER_SECOND

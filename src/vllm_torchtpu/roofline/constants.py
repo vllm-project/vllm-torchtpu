@@ -140,6 +140,9 @@ NON_FULL_ATTN_TOKENS: frozenset[str] = frozenset(
 # Unit scales and math constants.
 ACTIVATION_BYTES_BF16: float = 2.0
 MATMUL_FLOP_PER_MAC: float = 2.0
+# Draft fc weight maps concatenated token embedding and target hidden state
+# (two hidden-size vectors) to one hidden vector.
+DRAFT_PROJECTION_HIDDEN_VECTORS: float = 2.0
 UNIT_KILO: float = 1.0e3
 UNIT_MEGA: float = 1.0e6
 UNIT_GIGA: float = 1.0e9
@@ -147,7 +150,7 @@ UNIT_TERA: float = 1.0e12
 UNIT_PETA: float = 1.0e15
 UNIT_MILLI: float = 1.0e-3
 UNIT_MILLIS_PER_SECOND: float = 1.0e3
-UNIT_MICROS_PER_SECOND: float = 1.0e-6
+UNIT_MICRO: float = 1.0e-6
 BIN_KIBI: float = 1024.0
 BIN_MEBI: float = 1048576.0
 UNIT_GIBI: float = float(1 << 30)
