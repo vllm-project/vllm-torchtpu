@@ -180,6 +180,92 @@ class NativeScGatherTest(absltest.TestCase):
                     np.asarray(gathered_rope)[:groups], expected_rope[:groups]
                 )
 
+    def test_kv_write_matches_scatter_then_gather(self):
+        """`kv_write`: the gather first writes the step's tokens into both
+        caches, then gathers. Caches and gathered rows equal an XLA scatter of
+        the same rows followed by the plain gather, for the packed 64-byte and
+        the padded 128-byte ROPE cache, one and two subcore rounds of tokens,
+        and an idle gather (no live row) that still writes."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+        from vllm_torchtpu.kernels.mla import kv_cache_utils
+        from vllm_torchtpu.layers.core import attention_interface
+
+        pages, page_size = 16, 256
+        cache_tokens = pages * page_size
+        query_tokens, topk = 4, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20261111)
+        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
+        nope = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        for rope_bytes, num_tokens, num_live in (
+            (64, 4, count),
+            (64, 20, count),
+            (64, 20, 0),
+            (128, 4, count),
+            (128, 20, count),
+        ):
+            with self.subTest(
+                rope_bytes=rope_bytes, num_tokens=num_tokens, num_live=num_live
+            ):
+                rope_u8 = rng.integers(0, 256, (pages, page_size, rope_bytes), np.uint8)
+                rope = jnp.asarray(native_sc_cache_layout.pack_rope_packed(rope_u8))
+                kv_c = jnp.asarray(rng.integers(0, 256, (num_tokens, 512), np.uint8))
+                k_pe = jnp.asarray(rng.integers(0, 256, (num_tokens, 64), np.uint8))
+                dst = rng.choice(cache_tokens, num_tokens, replace=False)
+                dst[::3] = kv_cache_utils.SKIP_ROW  # rows another rank owns
+                owned = dst >= 0
+
+                want_nope = (
+                    nope.reshape(-1, 128)
+                    .at[dst[owned]]
+                    .set(kv_cache_utils.pack_tokens(kv_c, 512)[owned])
+                    .reshape(nope.shape)
+                )
+                want_rope = (
+                    rope.reshape(-1, rope_bytes // 4)
+                    .at[dst[owned]]
+                    .set(kv_cache_utils.pack_tokens(k_pe, rope_bytes)[owned])
+                    .reshape(rope.shape)
+                )
+                # Every owner's first gathered row is a written row, so a write
+                # that has not landed when the gather starts reads stale bytes.
+                flat = rng.integers(0, cache_tokens, count, dtype=np.int32)
+                first_rows = np.arange(32) * native_sc_gather.OCCURRENCES_PER_ATOM
+                flat[first_rows] = np.resize(dst[owned], first_rows.size)
+                indices = jnp.asarray(flat.reshape(query_tokens, topk))
+                kv_write = native_sc_gather.pack_write_rows(
+                    jnp.asarray(dst, jnp.int32),
+                    attention_interface._pack_lane_dense(kv_c, 512),
+                    attention_interface._pack_lane_dense(k_pe, rope_bytes),
+                )
+
+                common = dict(
+                    out_size=count,
+                    atoms_per_batch=1,
+                    num_live_indices=jnp.int32(num_live),
+                    live_multiple=topk,
+                )
+                got = jax.block_until_ready(
+                    native_sc_gather.dsa_gather_native_sc(
+                        nope, rope, indices, kv_write=kv_write, **common
+                    )
+                )
+                want = jax.block_until_ready(
+                    native_sc_gather.dsa_gather_native_sc(
+                        want_nope, want_rope, indices, **common
+                    )
+                )
+                groups = num_live // native_sc_gather.ROPE_PACKING
+                np.testing.assert_array_equal(
+                    np.asarray(got[0])[:num_live], np.asarray(want[0])[:num_live]
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(got[1])[:groups], np.asarray(want[1])[:groups]
+                )
+                np.testing.assert_array_equal(np.asarray(got[2]), want_nope)
+                np.testing.assert_array_equal(np.asarray(got[3]), want_rope)
+
 
 class NativeScGatherCpuTest(absltest.TestCase):
     def test_exported_mlir_has_no_allocate_buffer(self):
