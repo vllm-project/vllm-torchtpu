@@ -16,8 +16,9 @@
 The copy in models/qwen3_5/kernels/gdn starts from kernels/gdn/v3, and the
 Qwen3.5 changes keep its interface. Each test class of
 tests/kernels/test_gdn_attention_v3.py is collected here a second time with
-the kernel modules swapped for the copy's, so the copy is held to the same
-checks (the TPU-only classes run in TPU CI, the rest on CPU).
+every import of the kernel package (top-level and inside test methods)
+swapped for the copy's, so the copy is held to the same checks (the TPU-only
+classes run in TPU CI, the rest on CPU).
 """
 
 import pathlib
@@ -26,21 +27,18 @@ import types
 _MAIN_TESTS = (
     pathlib.Path(__file__).resolve().parents[2] / "kernels" / "test_gdn_attention_v3.py"
 )
-_MAIN_IMPORT = (
-    "from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling, wrapper"
-)
-_COPY_IMPORT = (
-    "from vllm_torchtpu.models.qwen3_5.kernels.gdn import "
-    "compute_gdn, config, tiling, wrapper"
-)
+_MAIN_PACKAGE = "vllm_torchtpu.kernels.gdn.v3"
+_COPY_PACKAGE = "vllm_torchtpu.models.qwen3_5.kernels.gdn"
+_MAIN_IMPORT = f"from {_MAIN_PACKAGE} import compute_gdn, config, tiling, wrapper"
 
 
 def _load_against_copy() -> types.ModuleType:
     source = _MAIN_TESTS.read_text()
     assert source.count(_MAIN_IMPORT) == 1, "main's GDN v3 test imports changed"
+    source = source.replace(_MAIN_PACKAGE, _COPY_PACKAGE)
     module = types.ModuleType(f"{__name__}._against_copy")
     module.__file__ = str(_MAIN_TESTS)
-    code = compile(source.replace(_MAIN_IMPORT, _COPY_IMPORT), str(_MAIN_TESTS), "exec")
+    code = compile(source, str(_MAIN_TESTS), "exec")
     exec(code, module.__dict__)  # noqa: S102
     return module
 

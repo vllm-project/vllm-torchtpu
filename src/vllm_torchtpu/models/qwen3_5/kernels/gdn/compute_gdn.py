@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Copied from src/vllm_torchtpu/kernels/gdn/v3/compute_gdn.py at vllm-torchtpu main
-# c350823af74ba9cdf728daad64df7dd5bcf84e8e, with its imports pointed at this copy.
+# 47f0d014a5458b5123be9efd1909f3e2f5658b3b, with its imports pointed at this copy.
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Upstream v3 changes are not picked up automatically.
@@ -49,6 +49,13 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     out_dtype = t.dtype
     chunk = t.shape[-1]
     block_size = min(block_size, chunk)
+    # The blocked solve covers exactly num_blocks * block_size rows. A
+    # remainder would be dropped and the output would no longer be
+    # (..., chunk, chunk), which downstream surfaces as an unrelated shape
+    # error (e.g. "array split does not result in an equal division").
+    assert chunk % block_size == 0, (
+        f"chunk ({chunk}) must be divisible by block_size ({block_size})"
+    )
     num_blocks = chunk // block_size
 
     def local_forward_sub(t_mat, b_mat):

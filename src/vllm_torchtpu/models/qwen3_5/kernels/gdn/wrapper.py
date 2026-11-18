@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Copied from src/vllm_torchtpu/kernels/gdn/v3/wrapper.py at vllm-torchtpu main
-# c350823af74ba9cdf728daad64df7dd5bcf84e8e, with its imports pointed at this copy.
+# 47f0d014a5458b5123be9efd1909f3e2f5658b3b, with its imports pointed at this copy.
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Upstream v3 changes are not picked up automatically.
 # Changes from the source:
-# - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
-#   (main lists the source's errors in .pyrefly-baseline-full.json).
+# - Own-line pyrefly ignores where jax's stubs are narrower than the runtime,
+#   and one where pyrefly cannot tell that out_act is set before the final
+#   reshape (main lists the source's errors in its pyrefly baselines).
 # No change targets AttentionMode.KDA, which this copy's callers never pass;
 # see compute_kda.py.
 
@@ -554,7 +555,6 @@ def fused_conv1d_gdn(
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
-    mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
@@ -587,6 +587,10 @@ def fused_conv1d_gdn(
             mixed_tile_size,
         )
     else:
+        # Round the static clip down to a power of two so a small
+        # non-power-of-two token bucket (e.g. TPU_TOKEN_BUCKET_EXTRA or tiny
+        # max_num_batched_tokens) stays divisible by triangular_block_size.
+        mixed_tile_size = tiling.clip_mixed_tile_size(mixed_tile_size, batch_size)
         # Each sequence holds 1 input state slot plus `window` output
         # checkpoint slots per buffer in VMEM, at every window size. Shrink
         # the tile so the double-buffered windows fit in roughly half the
