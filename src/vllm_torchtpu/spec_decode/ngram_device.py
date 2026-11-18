@@ -65,7 +65,7 @@ def _propose_impl(
     max_n: int,
     k: int,
     width: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Appends one step's tokens to the history rows and drafts from them.
 
     Args:
@@ -80,7 +80,9 @@ def _propose_impl(
         width: history columns to match over; base_len + S <= width.
 
     Returns:
-        [rows, k] int64 drafts, FILLER_TOKEN_ID where nothing matched.
+        [rows, k] int64 drafts, FILLER_TOKEN_ID where nothing matched, and the
+        next step's `meta` if every valid token commits: the same history
+        rows, each length past this step's tokens.
     """
     rows, steps = new_tokens.shape
     device = hist.device
@@ -122,7 +124,8 @@ def _propose_impl(
     draft_cols = draft_start[:, None] + torch.arange(k, device=device)  # [rows, k]
     drafts = tokens.gather(1, draft_cols.clamp(max=width - 1))
     keep = found[:, None] & (draft_cols < seq_len[:, None])
-    return torch.where(keep, drafts, FILLER_TOKEN_ID).long()
+    next_meta = torch.cat([meta[:rows], seq_len.to(meta.dtype)])
+    return torch.where(keep, drafts, FILLER_TOKEN_ID).long(), next_meta
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -159,6 +162,10 @@ class DeviceNgramProposer:
         self._hist: torch.Tensor | None = None
         # The match width buckets, ascending, the last the full width.
         self._match_widths: list[int] = []
+        # Per chunk `(start, num_reqs, rows)`, the `meta` the last step left
+        # on device, while its rows stay current and all its tokens commit:
+        # the next step reuses it instead of uploading the committed lengths.
+        self._next_meta: dict[tuple[int, int, int], torch.Tensor] = {}
         # The request whose history each batch row of `_hist` holds.
         self._row_req_ids: list[str | None] = []
 
@@ -194,13 +201,14 @@ class DeviceNgramProposer:
 
     def _step(
         self, meta: torch.Tensor, new_tokens: torch.Tensor, width: int
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._hist is not None
         fn = _propose_compiled if self._is_compiled() else _propose_impl
         return fn(self._hist, meta, new_tokens, self.min_n, self.max_n, self.k, width)
 
-    def _refresh_rows(self, scheduler_output: SchedulerOutput) -> None:
-        """Uploads the history of each batch row whose device copy is stale.
+    def _refresh_rows(self, scheduler_output: SchedulerOutput) -> bool:
+        """Uploads the history of each batch row whose device copy is stale;
+        whether any was.
 
         A row is current only when the previous step's propose saw the same
         request there and appended its tokens, and the request was not
@@ -213,10 +221,12 @@ class DeviceNgramProposer:
         rescheduled = {r.req_id for r in scheduler_output.scheduled_new_reqs}
         rescheduled |= scheduler_output.scheduled_cached_reqs.resumed_req_ids
         width = self._hist.shape[1]
+        stale = False
         for row in range(num_reqs):
             req_id = input_batch.req_ids[row]
             if self._row_req_ids[row] == req_id and req_id not in rescheduled:
                 continue
+            stale = True
             packed = zeros_h2d_source(self.runner, 1 + width)
             packed[0] = row
             packed[1 : 1 + self.max_model_len] = torch.from_numpy(
@@ -226,23 +236,32 @@ class DeviceNgramProposer:
             self._row_req_ids[row] = req_id
         # Rows past the batch miss this step's appends.
         self._row_req_ids[num_reqs:] = [None] * (len(self._row_req_ids) - num_reqs)
+        return stale
 
-    def _upload_meta(
-        self, start: int, num_reqs: int, rows: int, steps: int
+    def _chunk_meta(
+        self,
+        start: int,
+        num_reqs: int,
+        rows: int,
+        steps: int,
+        carried: torch.Tensor | None,
     ) -> tuple[torch.Tensor, int]:
-        """The chunk's `meta` on device, and the match width bucket that holds
-        its sequences after the step's `steps` appended tokens."""
-        meta = zeros_h2d_source(self.runner, 2 * rows)
-        meta[:rows] = self._dump_row
-        meta[:num_reqs] = torch.arange(start, start + num_reqs, dtype=torch.int32)
+        """The chunk's `meta` on device (`carried`, else uploaded), and the
+        match width bucket that holds its sequences after the step's `steps`
+        appended tokens."""
         committed = self.runner.input_batch.num_tokens_no_spec[start : start + num_reqs]
         # The step's 1 + K appended tokens must fit the history row.
         assert committed.max() <= self.max_model_len, (
             f"committed lengths {committed} exceed max_model_len {self.max_model_len}"
         )
-        meta[rows : rows + num_reqs] = torch.from_numpy(committed)
         need = int(committed.max()) + steps
         width = next(w for w in self._match_widths if w >= need)
+        if carried is not None:
+            return carried, width
+        meta = zeros_h2d_source(self.runner, 2 * rows)
+        meta[:rows] = self._dump_row
+        meta[:num_reqs] = torch.arange(start, start + num_reqs, dtype=torch.int32)
+        meta[rows : rows + num_reqs] = torch.from_numpy(committed)
         return stage_h2d_upload(self.runner, meta), width
 
     @torch.no_grad()
@@ -263,14 +282,16 @@ class DeviceNgramProposer:
         `next_tokens_per_chunk` (a verify step's `[rows, 1 + K]` output) or
         `device_seed` (one `[rows]` sample per chunk). A discarded partial
         prefill sample lands past the committed prompt, where the next sample
-        overwrites it. The host-seed arguments are unused; they keep the
-        signature `SpeculativeDecodingManager` calls every drafter with.
+        overwrites it. While a chunk's rows stay current and its tokens all
+        commit, the next step starts from the lengths this one leaves on
+        device, which equal `num_tokens_no_spec` then. The other host-seed
+        arguments are unused; they keep the signature
+        `SpeculativeDecodingManager` calls every drafter with.
 
         Returns:
             One `[rows, K]` int64 tensor per chunk, at the chunk's row bucket.
         """
-        del sampled_token_ids, discard_sampled_tokens_req_indices
-        del num_rejected_tokens_np
+        del sampled_token_ids, num_rejected_tokens_np
         assert return_device, "ngram_gpu drafts only under async scheduling"
         chunks = self.draft_chunks
         assert chunks, "ngram_gpu propose needs this step's chunks"
@@ -279,13 +300,21 @@ class DeviceNgramProposer:
         else:
             assert device_seed is not None
             new_tokens = [seed.view(-1, 1) for seed in device_seed]
-        self._refresh_rows(scheduler_output)
+        carried = {} if self._refresh_rows(scheduler_output) else self._next_meta
+        self._next_meta = {}
+        discarded = set(discard_sampled_tokens_req_indices)
         drafts = []
         for chunk, chunk_tokens in zip(chunks, new_tokens, strict=True):
-            meta, width = self._upload_meta(
-                chunk.start_index, chunk.num_reqs, *chunk_tokens.shape
+            start, num_reqs = chunk.start_index, chunk.num_reqs
+            key = (start, num_reqs, chunk_tokens.shape[0])
+            meta, width = self._chunk_meta(
+                start, num_reqs, *chunk_tokens.shape, carried.get(key)
             )
-            drafts.append(self._step(meta, chunk_tokens, width))
+            chunk_drafts, next_meta = self._step(meta, chunk_tokens, width)
+            drafts.append(chunk_drafts)
+            # A discarded sample does not commit: the next step uploads.
+            if not discarded.intersection(range(start, start + num_reqs)):
+                self._next_meta[key] = next_meta
         return drafts
 
     @torch.no_grad()
@@ -318,4 +347,6 @@ class DeviceNgramProposer:
                         (rows, steps), INVALID_TOKEN_ID, dtype=dtype
                     ).to(runner.device)
                     for width in self._match_widths:
-                        synchronize_tensors(self._step(meta_dev, new_tokens, width))
+                        synchronize_tensors(
+                            list(self._step(meta_dev, new_tokens, width))
+                        )
