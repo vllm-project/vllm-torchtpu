@@ -3319,7 +3319,8 @@ class TPUModelRunner(GPUModelRunner):
 
         Broadcast emulated as mask + all_reduce (tpu_dist has no broadcast);
         tiny (num_reqs x K int32), fully on device. No-ops for a sharded
-        drafter, TP=1, the sync host-list form, and empty steps. Bucketed
+        drafter, a drafter whose proposals are already identical on every
+        rank, TP=1, the sync host-list form, and empty steps. Bucketed
         drafters hand over one tensor per chunk; each is pinned.
         """
         if drafts is None:
@@ -3334,6 +3335,7 @@ class TPUModelRunner(GPUModelRunner):
         if (
             self.speculative_config is None
             or self.speculative_config.draft_tensor_parallel_size != 1
+            or getattr(self.drafter, "rank_identical_drafts", False)
         ):
             return drafts
         from vllm.distributed import (

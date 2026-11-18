@@ -137,6 +137,9 @@ class DeviceNgramProposer:
     bucketed_drafts = True
     # Token matching only: no draft network, no draft KV, no collectives.
     draft_model = None
+    # Integer matching over the sampled tokens, which every TP rank shares, so
+    # no rank-0 pin (an all-reduce per step) is needed.
+    rank_identical_drafts = True
 
     def __init__(self, runner: TPUModelRunner, vllm_config: VllmConfig):
         speculative_config = vllm_config.speculative_config
