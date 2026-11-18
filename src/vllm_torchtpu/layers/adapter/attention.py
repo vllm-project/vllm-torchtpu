@@ -249,12 +249,46 @@ def kv_transfer_kernel_page(vllm_config: VllmConfig) -> int | None:
     if vllm_config.kv_transfer_config is None:
         return None
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    if _kv_transfer_page_unused_reason(vllm_config, layout) is not None:
+        return None
+    return kv_transfer_page_option(vllm_config)
+
+
+def _kv_transfer_page_unused_reason(
+    vllm_config: VllmConfig, layout: VllmKVCacheLayout
+) -> str | None:
+    """Why this engine keeps vLLM's kernel page whatever ``tpu_kv_transfer``
+    sets, or None when the section's page applies (see
+    ``kv_transfer_kernel_page``)."""
+    if vllm_config.kv_transfer_config is None:
+        return "the engine has no kv_transfer_config"
     if (
         KV_LAYOUT_BY_VLLM_LAYOUT.get(layout)
         is not batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
     ):
-        return None
-    return kv_transfer_page_option(vllm_config)
+        return (
+            f"the {layout.name} KV cache layout is not seq-along-lane, so its "
+            "pages are not part of the transferred bytes"
+        )
+    return None
+
+
+def check_kv_transfer_page(vllm_config: VllmConfig, layout: VllmKVCacheLayout) -> None:
+    """Startup check of the ``tpu_kv_transfer`` section for an engine whose
+    KV cache layout resolved to ``layout``: a malformed section raises
+    ValueError, and a page the engine will not apply is logged once."""
+    page = kv_transfer_page_option(vllm_config)
+    if page is None:
+        return
+    reason = _kv_transfer_page_unused_reason(vllm_config, layout)
+    if reason is not None:
+        logger.warning_once(
+            "additional_config[%r]['kernel_page_tokens']=%d is ignored: %s; "
+            "vLLM picks this engine's kernel page.",
+            KV_TRANSFER_SECTION,
+            page,
+            reason,
+        )
 
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:

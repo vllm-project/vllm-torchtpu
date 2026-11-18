@@ -578,6 +578,33 @@ class TestTpuPlatform:
         with pytest.raises(ValueError, match="positive int"):
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch("vllm_torchtpu.layers.adapter.attention.logger")
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_kv_transfer_page_without_kv_transfer_is_logged_at_startup(
+        self, mock_prepare_env, mock_apply_patches, mock_logger, vllm_config
+    ):
+        """Stopped at the check that follows the page check."""
+
+        class Checked(Exception):
+            pass
+
+        vllm_config.kv_transfer_config = None
+        vllm_config.additional_config = {"tpu_kv_transfer": {"kernel_page_tokens": 128}}
+        with (
+            patch.object(
+                tpu_platform.PcpStaticSupportValidator,
+                "validate_platform_config",
+                side_effect=Checked,
+            ),
+            pytest.raises(Checked),
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+        (call,) = mock_logger.warning_once.call_args_list
+        assert call.args[3] == "the engine has no kv_transfer_config"
+
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
