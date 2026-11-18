@@ -83,7 +83,16 @@ def _scheduler(
     scheduler._waits = 0
     scheduler._retention = None
     scheduler._hit_estimator = None
-    scheduler.kv_cache_manager = SimpleNamespace()
+    scheduler.kv_cache_manager = SimpleNamespace(enable_caching=False)
+    scheduler.connector = None
+    scheduler._is_kv_consumer = False
+    scheduler._quadratic_cost = False
+    scheduler._prefix_aware = False
+    scheduler._srpf_running = False
+    scheduler._paw_sort = False
+    scheduler._promote_waiting = False
+    scheduler._memo_xstep = False
+    scheduler._trim_resend = True
     for name, value in options.items():
         setattr(scheduler, name, value)
     return scheduler
