@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass(frozen=True)
 class Tables:
     """The scalar-prefetch tables (SMEM), in operand order. Block units are
-    ROW_BLOCK-row blocks. E indexes a local expert, d a destination shard."""
+    ROW_BLOCK-row blocks. G is the shard's local expert count: row e of a
+    [G, num_shards] table is local expert e, column d destination shard d."""
 
     run_start: object  # [G, num_shards] block e's run for d starts at
     run_blocks: object  # [G, num_shards] blocks in that run (padded)
@@ -241,7 +242,8 @@ def build_ffn_kernel(
     token_block: the token rows' own rounding block when it differs
     (None: activation_block; 0: one scale per row).
     result_rows: "fp8" (rows with one scale per row) or "bf16" (rows
-    alone; the scale buffers and their transfers are left out).
+    alone: the scale scratch and both scale outputs are still allocated,
+    and nothing is written to them or transferred).
     elementwise_dtype: the element type of the vector math after each
     matmul (Config.elementwise_dtype). The weight slots hold whole
     experts."""
@@ -406,7 +408,6 @@ def build_ffn_kernel(
         scale_lanes=scale_lanes,
         window_rows=window_rows,
     )
-    step = whole
 
     def kernel_body(*refs):
         tables, operands, outputs, scratch, sems, shard_ref = unpack(refs)
@@ -431,7 +432,7 @@ def build_ffn_kernel(
         )
         # ---- prologue: the resident tables, the first weight refills ----
         body.resident_copies(ctx)
-        step.first_refills(ctx)
+        whole.first_refills(ctx)
         transport.all_shards_barrier(num_shards, build.mesh_axes)
         # ---- the program ----
         if pallas_transport:
@@ -446,12 +447,12 @@ def build_ffn_kernel(
                     mesh_axes=build.mesh_axes,
                 )
             )
-        step.issue_first(ctx)
+        whole.issue_first(ctx)
         lax.fori_loop(
             0,
             ctx.n_visit,
-            lambda visit_i, carry: step.visit(ctx, visit_i, carry),
-            step.initial_carry(ctx),
+            lambda visit_i, carry: whole.visit(ctx, visit_i, carry),
+            whole.initial_carry(ctx),
         )
         body.drain_transport(ctx)
         transport.all_shards_barrier(num_shards, build.mesh_axes)
