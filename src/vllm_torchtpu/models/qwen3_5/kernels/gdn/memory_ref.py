@@ -480,10 +480,10 @@ class StateOutBufferedRef(_GranuleStateRef):
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
-        # One wait per issued copy, mirroring copy_out's descriptors. A single
-        # aggregate wait over seq_tile_size * window_size checkpoints slices
-        # past the window axis for a W > 1 verify window at T >= 2 and left
-        # nondeterministic checkpoints on reused double-buffered tiles.
+        # One wait per issued copy, mirroring copy_out's descriptors: each
+        # waits for the one checkpoint row its copy moved, at that copy's
+        # sequence and window position, so every checkpoint has landed
+        # before its double-buffered tile is reused.
         vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]

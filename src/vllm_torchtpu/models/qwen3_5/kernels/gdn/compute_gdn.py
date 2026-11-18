@@ -387,6 +387,9 @@ def recurrent_gdn_per_seq(
         # [num_v_heads, 1, v_head_dim]
         v_curr = v_compact[:, c_idx]
 
+        # recurrent_gdn passes no k^T, so the else branch is main's
+        # precomputed-k^T form, kept so this function's diff from main's is
+        # the k transpose alone.
         if k_compact_t is None:
             # kb[h, r, :] = k[h, r]: k^T already broadcast along lanes, one
             # sublane broadcast and XLU transpose per kq head, shared by its
