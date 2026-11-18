@@ -334,6 +334,16 @@ def test_default_task_config_loads_all_shipped_cases():
     ]
     assert sum(len(c.samples) for c in cfg.cases) >= 20
 
+    flat_cfg_path = _BENCH_DIR / "task_configs" / "json_schema_flat.yaml"
+    assert flat_cfg_path.exists()
+    flat_cfg = mod.TaskConfig.from_yaml_file(flat_cfg_path)
+    assert [c.name for c in flat_cfg.cases] == [
+        "flat_json",
+        "character_schema",
+        "tool_call_arguments",
+    ]
+    assert sum(len(c.samples) for c in flat_cfg.cases) == 24
+
 
 def _chat_reply(obj: Any) -> tuple[int, dict[str, Any]]:
     message = {"content": json.dumps(obj)}
