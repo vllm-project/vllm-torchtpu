@@ -3971,9 +3971,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     )
 
     # 1. _precompile_sample_from_logits: the full graph, the no-top-k/top-p
-    # graph and the greedy graph.
+    # graph and the greedy graph, for bfloat16 logits and for the float32
+    # logits of a penalized chunk.
     TPUModelRunner._precompile_sample_from_logits(_precompile_runner(record_u_dtype))
-    assert seen_u_dtypes == [torch.float32] * 3
+    assert seen_u_dtypes == [torch.float32] * 3 * 2
     seen_u_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)

@@ -130,9 +130,13 @@ def step_eligible(
     input_batch: InputBatch, requests: Mapping[str, CachedRequestState]
 ) -> bool:
     """Whether the step's tokens are fully determined by the top tokens:
-    every request greedy, no logprobs and no grammar, which needs the full
-    logits to mask."""
-    if not input_batch.all_greedy or input_batch.max_num_logprobs is not None:
+    every request greedy, no logprobs, no penalties and no grammar, which need
+    the full logits to penalize or mask."""
+    if (
+        not input_batch.all_greedy
+        or input_batch.max_num_logprobs is not None
+        or not input_batch.no_penalties
+    ):
         return False
     for req_id in input_batch.req_ids:
         if req_id is None:

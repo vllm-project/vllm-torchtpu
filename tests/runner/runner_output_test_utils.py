@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Helpers for CPU tests of the runner's output path: the runner state that
-`TPUModelRunner.sample_tokens` reads, a stand-in for the async copy of its
+`TPUModelRunner.sample_tokens` reads (also for one plain greedy step, as the
+min_tokens and penalties tests drive it), a stand-in for the async copy of its
 sampled tokens and logprobs, and references for the logprobs it returns."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
+from vllm import SamplingParams
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
+from vllm_torchtpu.runner import min_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 
@@ -91,6 +94,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
             propose_draft_token_ids=lambda **_kwargs: None
         ),
         _min_tokens_batch_state=lambda: {},
+        _penalties_batch_state=lambda: False,
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda x: torch.argmax(x, dim=-1),
         _update_mamba_slot_read_offsets=lambda *_args: None,
@@ -125,6 +129,61 @@ def _host_copy_state(chunks, lengths, **kwargs):
         copy_ready_event=MagicMock(),
         **kwargs,
     )
+
+
+def _plain_step_runner(num_output, logits, req_id="r0"):
+    """The runner state sample_tokens reads for one greedy request in a plain
+    (non-speculative, synchronous) step, picking the argmax of what it gets,
+    with the runner's own min_tokens and penalty methods. With `num_output`,
+    request `req_id` has that many outputs, min_tokens 4 and stop token 3. No
+    request uses penalties; set the InputBatch penalty arrays and
+    `no_penalties=False` to turn them on (see test_penalties.py)."""
+    runner = _sample_tokens_runner(
+        [logits], [1], _min_tokens=min_tokens.MinTokensTracker()
+    )
+    batch = runner.input_batch
+    batch.num_tokens_no_spec = np.array([1])
+    batch.num_prompt_tokens = np.array([1])
+    batch.no_penalties = True
+    batch.repetition_penalties_cpu = np.ones(1, dtype=np.float32)
+    batch.presence_penalties_cpu = np.zeros(1, dtype=np.float32)
+    batch.frequency_penalties_cpu = np.zeros(1, dtype=np.float32)
+    # The staged H2D uploads _apply_penalties makes (host tensors on CPU).
+    runner.device = torch.device("cpu")
+    runner._registered_h2d_sources = set()
+    runner._free_h2d_sources = {}
+    runner._unfenced_h2d_sources = []
+    if num_output is not None:
+        runner._min_tokens.add(req_id, SamplingParams(min_tokens=4, stop_token_ids=[3]))
+        runner.requests[req_id] = SimpleNamespace(
+            num_computed_tokens=0, num_tokens=1, output_token_ids=[0] * num_output
+        )
+    for name in (
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
+        "_mask_min_tokens",
+        "_min_tokens_batch_state",
+        "_penalties_batch_state",
+        "_penalties_chunk",
+        "_apply_penalties",
+        "_settle_draft_placeholders_for_min_tokens",
+        "_num_output_tokens",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    return runner
+
+
+def _run_sample_tokens(runner):
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
+        ),
+        patch.object(
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
+        torch.compiler.set_stance("force_eager"),
+    ):
+        return TPUModelRunner.sample_tokens(runner, None)
 
 
 def _blocking_logprobs_lists(chunks):

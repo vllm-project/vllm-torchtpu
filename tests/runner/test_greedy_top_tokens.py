@@ -204,13 +204,14 @@ def test_resolve_head_owner_refuses_other_logits_processor_wrappers():
         greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
 
 
-def _batch(*params, max_num_logprobs=None):
+def _batch(*params, max_num_logprobs=None, no_penalties=True):
     requests = {
         f"r{i}": SimpleNamespace(sampling_params=p) for i, p in enumerate(params)
     }
     input_batch = SimpleNamespace(
         all_greedy=all(p.temperature == 0 for p in params),
         max_num_logprobs=max_num_logprobs,
+        no_penalties=no_penalties,
         req_ids=[*requests, None],
         req_id_to_index={r: i for i, r in enumerate(requests)},
     )
@@ -224,6 +225,8 @@ def test_step_eligible_for_greedy_batches_only():
         *_batch(greedy, SamplingParams(temperature=0.6))
     )
     assert not greedy_top_tokens.step_eligible(*_batch(greedy, max_num_logprobs=2))
+    # A penalized request needs the full logits to penalize.
+    assert not greedy_top_tokens.step_eligible(*_batch(greedy, no_penalties=False))
 
 
 def test_structured_output_falls_back_to_full_logits():
