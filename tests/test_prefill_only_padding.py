@@ -80,3 +80,11 @@ def test_strip_count_log_cadence():
     from vllm_torchtpu.runner.tpu_runner import _prefill_only_strip_log_due as due
 
     assert [n for n in range(0, 2100) if due(n)] == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+
+
+def test_leaves_placeholders_that_overshoot_the_prompt_alone():
+    """q38 BLSTACK-RFIX: all -1 placeholders, but the step crosses the prompt by more than them: untouched (the refusal
+    still sees it)."""
+    so = _so({"c": 5}, {"c": [-1]}, new=[_new("c", 126208, 126209)])
+    assert TPUModelRunner._strip_prefill_only_padding(_runner(), so) == 0
+    assert so.num_scheduled_tokens["c"] == 5 and so.scheduled_spec_decode_tokens == {"c": [-1]}
