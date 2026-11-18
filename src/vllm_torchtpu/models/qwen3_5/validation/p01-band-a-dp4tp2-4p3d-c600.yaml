@@ -28,7 +28,7 @@ chips: 28
 not_yet_supported:
   decode:
     MOE_FUSED_EP_KERNEL_IMPL: "the fused EP MoE v3 kernel (this tree accepts v2 and adaptive)"
-    TPU_EXPERT_PLACEMENT: "the expert placement table this path names (a permutation of the 512 experts over 8 ranks), which this tree does not ship"
+    TPU_EXPERT_PLACEMENT: "an expert placement table that permutes the 512 experts over 8 ranks, which this tree does not ship"
 legs:
   prefill:
     replicas: 4
@@ -217,7 +217,7 @@ legs:
       RAGGED_GATHER_REDUCE_VERSION: "v3"
       TPU_ENABLE_GDN_DYNAMIC_TILING: "1"
       TPU_EVICT_WEIGHTS_PAGE_CACHE: "1"
-      TPU_EXPERT_PLACEMENT: "/workspace/vllm-torchtpu/expert_placement/expert_placement_dp8_ep8.json"
+      TPU_EXPERT_PLACEMENT: "$EXPERT_PLACEMENT_TABLE"
       TPU_GDN_CONV_QK_PAIR_LAYOUT: "1"
       TPU_KV_SHM_POOL_GB: "8"
       TPU_MOE_SEQUENCE_PARALLEL: "1"
