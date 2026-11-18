@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import jax
@@ -90,9 +91,13 @@ def make_flat_pooled_step(
     _build_cache: dict[tuple[str, bool, int, bool], tuple[Any, dict[str, Any]]] = {}
 
     def _get_compiled(
-        act_mode: str, ckpt_2d: bool, ckpt_k: int, roff_1d: bool
+        act_mode: str,
+        ckpt_2d: bool,
+        ckpt_k: int,
+        roff_1d: bool,
+        step_shapes: tuple[tuple[int, ...], ...] = (),
     ) -> tuple[Any, dict[str, Any]]:
-        key = (act_mode, ckpt_2d, ckpt_k, roff_1d)
+        key = (act_mode, ckpt_2d, ckpt_k, roff_1d, step_shapes)
         if key not in _build_cache:
             ex_k = with_cache(
                 ex_paged,
@@ -101,6 +106,9 @@ def make_flat_pooled_step(
                 ckpt_k=ckpt_k,
                 roff_1d=roff_1d,
             )
+            if step_shapes:
+                tio_k = dataclasses.replace(token_io(ex_k), step_shapes=step_shapes)
+                ex_k = dataclasses.replace(ex_k, tokens=tio_k)
             _build_cache[key] = kernel.build(ms, ex_k)
         return _build_cache[key]
 
@@ -208,7 +216,15 @@ def make_flat_pooled_step(
                 int(ckpt_indices.shape[-1]) if ckpt_indices is not None else ex_paged.T
             )
             roff_1d_l = bool(read_offsets is not None and read_offsets.ndim == 1)
-            call_l, info_l = _get_compiled(act_mode_l, ckpt_2d_l, ckpt_k_l, roff_1d_l)
+            # Token step I/O: one kernel per runner padding of the step tensors.
+            shapes = (
+                tuple(tuple(x.shape) for x in (pos, hidden, page_table, tail[0]))
+                if tio is not None
+                else ()
+            )
+            call_l, info_l = _get_compiled(
+                act_mode_l, ckpt_2d_l, ckpt_k_l, roff_1d_l, shapes
+            )
             p_l = info_l["plan"]
             st_map_f: dict[str, Any] = {
                 POOL_STATE_NAME: raw_pools,

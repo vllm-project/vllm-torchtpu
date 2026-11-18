@@ -174,7 +174,7 @@ def _check_token_step(g, ex, spec, mesh, pos, hid, w_l, st_l, hid_out, pools_ref
         rope_dtype=F32,
     )
     assert tio.n_tiles == 2
-    ex_t = dataclasses.replace(ex, tokens=tio)
+    ex_t = dataclasses.replace(cache.with_cache(ex, fused_pool_io=True), tokens=tio)
     h = np.asarray(hid_out, np.float32).reshape(R, ex.M, g.H)[0, : ex.B]
     key = jax.random.PRNGKey(5)
     ids = np.array([7, 5 * shard + 9], np.int32)

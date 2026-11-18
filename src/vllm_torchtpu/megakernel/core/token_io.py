@@ -71,6 +71,10 @@ class TokenIO:
     rope_rows: int = 0  # rows of the RoPE cos / sin cache input (0: none)
     rope_cols: int = 0  # its columns (the rotated dims)
     rope_dtype: Any = F32  # its dtype
+    # Shapes of `(input_ids, positions, block_tables, seq_lens)`: the kernel is
+    # traced per runner padding (`cache_flat` sets them), since an HBM DMA of
+    # part of an array must move 512-byte multiples (`stage_inputs`).
+    step_shapes: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if self.tile <= 0 or self.tile % LANES:
@@ -135,12 +139,43 @@ def pack_head(w: Any, tio: TokenIO) -> Any:
     return wt.reshape(H, tio.n_tiles, tio.tile).transpose(1, 0, 2)
 
 
+# Block tables up to this many entries are copied whole into SMEM (64 KiB).
+WHOLE_TABLE_MAX = 1 << 14
+
+
+def _table_rows(shape: tuple[int, ...], n_seqs: int, max_pages: int) -> int:
+    """Entries of each block-table row the kernel copies by row DMA, or 0 to
+    copy the whole table (rows of 512-byte multiples are DMA-able alone)."""
+    width = shape[1] if len(shape) == 2 else math.prod(shape) // n_seqs
+    n_pt = min(width, max_pages)
+    if math.prod(shape) <= WHOLE_TABLE_MAX:
+        return 0
+    if (n_pt * 4) % 512:
+        raise MegakernelConfigError(
+            f"block table {shape}: rows of {n_pt} entries are neither 512-byte "
+            f"multiples nor part of a table of <= {WHOLE_TABLE_MAX} entries"
+        )
+    return n_pt
+
+
+def _step_shapes(ex: ExecSpec, max_pages: int) -> tuple[tuple[int, ...], ...]:
+    tio = token_io(ex)
+    assert tio is not None
+    return tio.step_shapes or ((ex.B,), (ex.B,), (ex.NS, max_pages), (ex.NS,))
+
+
 def scratch(ex: ExecSpec, H: int, max_pages: int) -> dict[str, Any]:
-    """SMEM staging of the step inputs, the embedding row window and the
-    `(max, index)` exchange buffers."""
+    """SMEM staging of the step inputs (each whole, but a large block table by
+    rows), the embedding row window and the `(max, index)` exchange buffers."""
     B, NS, MB, R = ex.B, ex.NS, ex.MB, ex.R
     tio = token_io(ex)
     assert tio is not None
+    ids_s, pos_s, bt_s, seq_s = _step_shapes(ex, max_pages)
+    whole_bt = (
+        {"tio_bt": pltpu.SMEM(bt_s, I32)}
+        if not _table_rows(bt_s, seq_s[0], max_pages)
+        else {}
+    )
     rope = (
         {
             "tio_rope": pltpu.VMEM(
@@ -152,9 +187,11 @@ def scratch(ex: ExecSpec, H: int, max_pages: int) -> dict[str, Any]:
     )
     return {
         **rope,
-        "tio_ids": pltpu.SMEM((B,), I32),
+        **whole_bt,
+        "tio_ids": pltpu.SMEM(ids_s, I32),
+        "tio_posn": pltpu.SMEM(pos_s, I32),
         "tio_rpos": pltpu.SMEM((B,), I32),
-        "tio_seq": pltpu.SMEM((NS,), I32),
+        "tio_seq": pltpu.SMEM(seq_s, I32),
         "tio_kv": pltpu.SMEM((B,), I32),
         "tio_pt": pltpu.SMEM((NS, max_pages), I32),
         "tio_sem": pltpu.SemaphoreType.DMA((4,)),
@@ -214,7 +251,7 @@ def gather_row(table: Any, row: Any, stage: Any) -> Any:
 def stage_inputs(
     ctx: Any, ids: Any, positions: Any, tables: Any, seq_lens: Any
 ) -> None:
-    """DMA the step tensors' used entries into SMEM; derive the KV indices.
+    """DMA the step tensors into SMEM; derive the KV indices and page rows.
 
     `positions` is `[P]` or `[3, P]` (M-RoPE: row 0 is the text position);
     `tables` is `[S, W]` or flat `[S * W]` with `S = seq_lens.shape[0]`.
@@ -227,7 +264,7 @@ def stage_inputs(
     S = seq_lens.shape[0]
     width = tables.shape[1] if tables.ndim == 2 else math.prod(tables.shape) // S
     n_pt = min(width, max_pages)
-    pos_row = positions.at[0] if positions.ndim == 2 else positions
+    by_rows = _table_rows(tables.shape, S, max_pages)
 
     def pt_row(s: int) -> Any:
         if tables.ndim == 2:
@@ -235,19 +272,33 @@ def stage_inputs(
         return tables.at[pl.ds(s * width, n_pt)]
 
     cps = [
-        pltpu.make_async_copy(ids.at[pl.ds(0, B)], scr["tio_ids"], sem.at[0]),
-        pltpu.make_async_copy(pos_row.at[pl.ds(0, B)], scr["tio_rpos"], sem.at[1]),
-        pltpu.make_async_copy(seq_lens.at[pl.ds(0, NS)], scr["tio_seq"], sem.at[2]),
+        pltpu.make_async_copy(ids, scr["tio_ids"], sem.at[0]),
+        pltpu.make_async_copy(positions, scr["tio_posn"], sem.at[1]),
+        pltpu.make_async_copy(seq_lens, scr["tio_seq"], sem.at[2]),
     ]
-    rows = [
-        pltpu.make_async_copy(pt_row(s), pt.at[s, pl.ds(0, n_pt)], sem.at[3])
-        for s in range(NS)
-    ]
-    for c in cps + rows:
+    if by_rows:
+        cps += [
+            pltpu.make_async_copy(pt_row(s), pt.at[s, pl.ds(0, n_pt)], sem.at[3])
+            for s in range(NS)
+        ]
+    else:
+        cps.append(pltpu.make_async_copy(tables, scr["tio_bt"], sem.at[3]))
+    for c in cps:
         c.start()
-    for c in cps + rows:
+    for c in cps:
         c.wait()
+    posn = scr["tio_posn"]
+    for b in range(B):
+        scr["tio_rpos"][b] = posn[0, b] if positions.ndim == 2 else posn[b]
+    bt = None if by_rows else scr["tio_bt"]
     for s in range(NS):
+        if bt is not None:
+
+            def copy(j: Any, c: Any, s: int = s) -> Any:
+                pt[s, j] = bt[s, j] if tables.ndim == 2 else bt[s * width + j]
+                return c
+
+            lax.fori_loop(0, n_pt, copy, 0)
         if n_pt < max_pages:
 
             def zero(j: Any, c: Any, s: int = s) -> Any:
