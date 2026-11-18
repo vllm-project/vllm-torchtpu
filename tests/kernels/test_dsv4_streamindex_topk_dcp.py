@@ -266,17 +266,24 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {n}")
 
 
-def _dcp_case(dcp_size, seed, compression_ratio=1, interleave_size=1, seq_len=None):
+def _dcp_case(
+    dcp_size,
+    seed,
+    compression_ratio=1,
+    interleave_size=1,
+    seq_len=None,
+    q_len=Q_LEN,
+):
     """Records plus the positional args and kwargs of one sharded DCP call.
 
     `seq_len` is in uncompressed tokens and defaults to filling the cache.
     """
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(seed))
-    q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
+    q = (jax.random.normal(kq, (q_len, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
         jnp.float8_e4m3fn
     )
-    weights = jax.random.normal(kw, (Q_LEN, H_IDX), jnp.float32).astype(jnp.bfloat16)
+    weights = jax.random.normal(kw, (q_len, H_IDX), jnp.float32).astype(jnp.bfloat16)
     if seq_len is None:
         seq_len = KV_LEN * compression_ratio
 
@@ -302,7 +309,7 @@ def _dcp_case(dcp_size, seed, compression_ratio=1, interleave_size=1, seq_len=No
         shards,
         jnp.array([seq_len], jnp.int32),
         jnp.arange(vpages, dtype=jnp.int32),
-        jnp.array([0, Q_LEN], jnp.int32),
+        jnp.array([0, q_len], jnp.int32),
         jnp.array([0, 0, 1], jnp.int32),
     )
     kwargs = dict(
@@ -320,13 +327,22 @@ def _dcp_case(dcp_size, seed, compression_ratio=1, interleave_size=1, seq_len=No
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("a2a_merge", [False, True])
-def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge):
+@pytest.mark.parametrize("q_len", [Q_LEN, 3])
+def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge, q_len):
     """Union the per-rank lists back together; it must be the global top-k.
-    Both merge paths; the unsharded reference is all they must agree on."""
+    Both merge paths; the unsharded reference is all they must agree on.
+
+    3 tokens divide no dcp_size, like a 4- or 8-token decode bucket at DCP16:
+    the all-gather merge takes them, the a2a merge splits tokens and refuses.
+    """
     _need_devices(dcp_size)
-    rec, args, kwargs = _dcp_case(dcp_size, 0)
+    rec, args, kwargs = _dcp_case(dcp_size, 0, q_len=q_len)
     kwargs["a2a_merge"] = a2a_merge
     q, weights = args[0], args[1]
+    if a2a_merge and q_len % dcp_size:
+        with pytest.raises(ValueError, match="divisible by dcp_size"):
+            streamindex_topk_dcp(*args, **kwargs)
+        return
 
     pages = KV_LEN // PAGE_SIZE
     reference = np.asarray(
@@ -336,7 +352,7 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge):
             rec.reshape(pages, PAGE_SIZE // 4, 4, WIDTH),
             jnp.array([KV_LEN], jnp.int32),
             jnp.arange(pages, dtype=jnp.int32),
-            jnp.array([0, Q_LEN], jnp.int32),
+            jnp.array([0, q_len], jnp.int32),
             jnp.array([0, 0, 1], jnp.int32),
             k=K,
             compression_ratio=1,
@@ -345,13 +361,13 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge):
         )
     )
 
-    # Global leading dim is dcp_size * Q_LEN, rank-major.
+    # Global leading dim is dcp_size * q_len, rank-major.
     local_topk = np.asarray(streamindex_topk_dcp(*args, **kwargs)).reshape(
-        dcp_size, Q_LEN, K
+        dcp_size, q_len, K
     )
     assert local_topk.max() < KV_LEN // dcp_size, "a rank got a foreign index"
 
-    for t in range(Q_LEN):
+    for t in range(q_len):
         got = set()
         for r in range(dcp_size):
             row = local_topk[r, t]

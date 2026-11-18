@@ -60,7 +60,8 @@ ROUTED_SCALE = 2.5
 # unpadded full run the same code at every row count, so 64 rows skip them
 # (the worker runs under a timeout); arming's all-reduce self-test runs both
 # at 64 rows on the device. The 16-row fold path runs through the adapter's
-# op body (BODY_CASE), which derives n_valid from a padding mask.
+# op body (BODY_CASES), which derives n_valid from a padding mask; 8 rows are
+# below the smallest row bucket, so the op body pads them to 16.
 CASES = (
     (16, 0),
     (16, 16),
@@ -71,7 +72,7 @@ CASES = (
     (64, 16),
     (64, 33),
 )
-BODY_CASE = (16, 7)
+BODY_CASES = ((16, 7), (8, 5))
 # A token count the kernel does not admit: the op body's psum path.
 CHAIN_ROWS = 128
 # Row 0 of OUTLIER_CASE gets OUTLIER at OUTLIER_COLUMN (inside the second
@@ -277,9 +278,11 @@ def test_routed_x_outlier_on_16_devices(on_16_devices_b):
     assert case["per_row_rel_l2"] >= 100 * EXPECTED_REL_L2, case
 
 
-def test_op_body_runs_the_kernel_with_n_valid_from_the_padding_mask(on_16_devices):
-    rows, n_valid = BODY_CASE
-    case = on_16_devices["body_kernel"]
+@pytest.mark.parametrize("rows, n_valid", BODY_CASES)
+def test_op_body_runs_the_kernel_with_n_valid_from_the_padding_mask(
+    on_16_devices, rows, n_valid
+):
+    case = on_16_devices["body_kernel"][f"{rows}:{n_valid}"]
     assert case["ranks_identical"], case
     assert case["padding_rows_positive_zero"], case
     assert not case["races_found"], case
@@ -413,13 +416,15 @@ def _expected(x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK):
 
 
 def _interpret(fn, *args):
-    """fn(*args) with fresh interpreter state; (out, whether races were found)."""
+    """fn(*args) with fresh interpreter state; (out, whether races were found).
+    No races are found when fn runs no Pallas call."""
     from jax._src.pallas.mosaic.interpret import interpret_pallas_call
 
     pltpu.reset_tpu_interpret_mode_state()
     with contextlib.redirect_stdout(io.StringIO()):
         out = np.asarray(jax.block_until_ready(fn(*args)))
-    return out, bool(interpret_pallas_call.races.races_found)
+    races = interpret_pallas_call.races
+    return out, races is not None and bool(races.races_found)
 
 
 def _race_control():
@@ -581,6 +586,14 @@ def _worker(part):
             body_specs,
         )
 
+    # The usual path is stubbed with ones on real rows: its own Pallas calls
+    # need a TPU, and a body case that misses the kernel then fails on the
+    # reference instead of crashing the worker.
+    def ones_on_real_rows(x, scores, bias, is_pad, *weights_and_statics):
+        return jnp.where(is_pad[:, None], 0.0, 1.0).astype(x.dtype) * jnp.ones_like(x)
+
+    adapter._tp_chain = ones_on_real_rows
+
     result = {"cases": {}}
     if part == "a":
         result["race_control"] = _race_control()
@@ -603,13 +616,14 @@ def _worker(part):
         )
 
     if part == "a":
-        rows, n_valid = BODY_CASE
-        x, scores = inputs(rows)
-        start = time.monotonic()
-        out, races = _interpret(run_body, *body_operands(x, scores, n_valid))
-        result["body_kernel"] = checks(
-            out, x, scores, rows, n_valid, races, start, rows
-        )
+        result["body_kernel"] = {}
+        for rows, n_valid in BODY_CASES:
+            x, scores = inputs(rows)
+            start = time.monotonic()
+            out, races = _interpret(run_body, *body_operands(x, scores, n_valid))
+            result["body_kernel"][f"{rows}:{n_valid}"] = checks(
+                out, x, scores, rows, n_valid, races, start, rows
+            )
         print("RESULT " + json.dumps(result))
         return
 
@@ -639,10 +653,6 @@ def _worker(part):
     case["per_row_rel_l2"] = rel_l2(got, per_row)
     result["outlier"] = case
 
-    def ones_on_real_rows(x, scores, bias, is_pad, *weights_and_statics):
-        return jnp.where(is_pad[:, None], 0.0, 1.0).astype(x.dtype) * jnp.ones_like(x)
-
-    adapter._tp_chain = ones_on_real_rows
     n_valid = CHAIN_ROWS - 5
     x, scores = inputs(CHAIN_ROWS)
     # No Pallas call at this token count, so no interpreter state to reset.
