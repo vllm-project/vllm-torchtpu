@@ -34,6 +34,7 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper as main_wrapper
 from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
     compute_conv1d,
     compute_gdn,
+    compute_kda,
     config,
     metadata,
     tiling,
@@ -610,17 +611,16 @@ def _per_seq_chunk(kernels):
 # Per-rank GDN shapes outside config.TILER_SHAPES, with token counts at
 # which the tiler's chunk would differ from main's: Qwen3.5-35B-A3B (16 kq and
 # 32 value heads) at TP4, as main's CI serves it, at TP2 and at TP1, and the
-# Qwen3.5-397B at TP4. A 24-token batch keeps a 24-token chunk, which the
-# tiler would round down to 16; it is used only where the chunked solve's
-# triangular block (8 or fewer rows above 8 value heads) divides 24.
+# Qwen3.5-397B at TP4. A 96-token batch takes main's 64-token chunk (the VMEM
+# fit is 64 as well), where the tiler would keep 96.
 _MAIN_CHUNK_CASES = [
     (4, 8, 96),
     (4, 8, 8192),
-    (8, 16, 24),
+    (8, 16, 96),
     (8, 16, 8192),
-    (16, 32, 24),
+    (16, 32, 96),
     (16, 32, 8192),
-    (4, 16, 24),
+    (4, 16, 96),
     (4, 16, 8192),
 ]
 
@@ -631,8 +631,8 @@ def test_off_the_tiler_shapes_the_prefill_chunk_is_mains(
     monkeypatch, n_kq, n_v, num_tokens, dynamic
 ):
     """Outside config.TILER_SHAPES the prefill/mixed kernel takes the
-    chunk main's kernel takes: 64 tokens by default (the batch, if smaller),
-    or the VMEM fit under dynamic tiling."""
+    chunk main's kernel takes: 64 tokens by default (the batch rounded down to
+    a power of two, if smaller), or the VMEM fit under dynamic tiling."""
     monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", dynamic)
     got = _per_seq_chunk(_call_kernels(n_kq, n_v, 1, 1, num_tokens, F32))
     want = _per_seq_chunk(
@@ -640,14 +640,111 @@ def test_off_the_tiler_shapes_the_prefill_chunk_is_mains(
     )
     assert got == want
     if not dynamic:
-        assert got == min(num_tokens, wrapper.MAIN_MIXED_TILE_SIZE)
+        assert got == tiling.clip_mixed_tile_size(
+            wrapper.MAIN_MIXED_TILE_SIZE, num_tokens
+        )
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize(
+    ("n_kq", "n_v"),
+    # Qwen3.5-35B-A3B at TP4, TP2 and TP1 (triangular blocks of 16, 8 and 4
+    # rows), and 24 value heads per rank, where the block's exact quotient
+    # 16 // 3 = 5 divides no power of two.
+    [(4, 8), (8, 16), (16, 32), (8, 24)],
+)
+def test_off_the_tiler_shapes_a_small_bucket_takes_a_power_of_two_chunk(
+    monkeypatch, n_kq, n_v, dynamic
+):
+    """Outside config.TILER_SHAPES a token bucket that is not a power of two
+    (TPU_TOKEN_BUCKET_EXTRA, a small max_num_batched_tokens) takes the largest
+    power of two below it as the chunk, which the triangular block divides,
+    as main's kernel does since #2438. A 24-token bucket at 8 value heads per
+    rank (blocks of 16) failed to trace with a 24-token chunk."""
+    monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", dynamic)
+    for num_tokens, chunk in ((3, 2), (5, 4), (12, 8), (24, 16), (48, 32), (96, 64)):
+        kernels = _call_kernels(n_kq, n_v, 1, 1, num_tokens, F32)
+        assert _per_seq_chunk(kernels) == chunk, num_tokens
+
+
+_GDN_BLOCKS = {8: 16, 16: 8, 24: 4, 32: 4, 40: 2, 48: 2, 64: 2}
+
+
+def test_the_triangular_block_is_a_power_of_two_dividing_every_chunk():
+    """B is the largest power of two within the head-group budget, for every
+    head count, GDN and KDA (main's rule since #2438). The Qwen3.5-397B blocks
+    (2 rows at 64 value heads per rank, 4 at 32, 16 at 8) are the old
+    quotient's."""
+    for n_v in (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 96, 128):
+        for mode in config.AttentionMode:
+            for chunk in tiling.MIXED_TILE_SIZES:
+                cfg = _cfg(
+                    config.GDNMode.PER_SEQ,
+                    chunk,
+                    n_kq=max(1, n_v // 4),
+                    n_v=n_v,
+                    attention_mode=mode,
+                )
+                b = cfg.triangular_block_size
+                assert b >= 2 and b & (b - 1) == 0, (n_v, mode, b)
+                assert cfg.chunk_size % min(b, cfg.chunk_size) == 0, (n_v, chunk)
+        if n_v in _GDN_BLOCKS:
+            assert config.gdn_triangular_block_size(n_v) == _GDN_BLOCKS[n_v]
+
+
+def test_the_solves_reject_a_block_that_does_not_divide_the_chunk():
+    """A non-dividing block fails at the solve with the divisibility message
+    instead of dropping the remainder rows (main's check since #2438)."""
+    t = jnp.tril(jnp.ones((2, 128, 128), F32))
+    with pytest.raises(AssertionError, match="divisible"):
+        compute_gdn.invert_triangular_matrix(t, block_size=5)
+    for block_size in (16, 8, 4, 2):
+        inv = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
+        assert inv.shape == t.shape
+
+    def kda(chunk):
+        cfg = _cfg(
+            config.GDNMode.PER_SEQ,
+            chunk,
+            n_kq=2,
+            n_v=8,
+            attention_mode=config.AttentionMode.KDA,
+        )
+        assert cfg.triangular_block_size == 16
+        return compute_kda.chunked_kda_per_seq(
+            q_large=jnp.zeros((2, chunk, D_K), F32),
+            k_large=jnp.zeros((2, chunk, D_K), F32),
+            v_large=jnp.zeros((8, chunk, D_V), F32),
+            gating_log=jnp.zeros((8, chunk, D_K), F32),
+            beta=jnp.zeros((1, chunk, 8), F32),
+            state_prev=jnp.zeros((8, D_K, D_V), F32),
+            cfg=cfg,
+        )
+
+    with pytest.raises(AssertionError, match="divisible"):
+        kda(24)
+    out, state = kda(32)
+    assert out.shape == (8, 32, D_V)
+    assert state.shape == (8, D_K, D_V)
+
+
+def test_every_power_of_two_block_inverts_the_same_matrix():
+    """The block only changes the solve's schedule: blocks of 16, 8, 4 and 2
+    rows give the same inverse of a unit lower-triangular matrix."""
+    strict = jnp.tril(jax.random.normal(jax.random.key(7), (3, 128, 128)) * 0.1, k=-1)
+    t = strict + jnp.eye(128)[None]
+    with jax.default_matmul_precision("highest"):
+        want = jnp.linalg.inv(t)
+        for block_size in (16, 8, 4, 2):
+            got = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
+            np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize(
     ("n_kq", "n_v", "num_tokens", "chunk"),
     [
         # The PP8 x TP1 prefill legs: the VMEM fit, and a 40-token batch
-        # rounded down to a multiple of 16 (main's chunk would be 40).
+        # rounded down to a multiple of 16.
         (16, 64, 8192, 64),
         (16, 64, 40, 32),
         # The DP4 x TP2 and TP8 decode legs: 128 fits.
@@ -655,6 +752,14 @@ def test_off_the_tiler_shapes_the_prefill_chunk_is_mains(
         (2, 8, 8192, 128),
         (8, 32, 40, 32),
         (2, 8, 40, 32),
+        # Compiled token buckets of the decode legs whose chunk is a multiple
+        # of 16 but not a power of two, which main's rule would round down to
+        # 32 or 64.
+        (8, 32, 48, 48),
+        (8, 32, 80, 80),
+        (8, 32, 112, 112),
+        (2, 8, 48, 48),
+        (2, 8, 96, 96),
     ],
 )
 def test_at_the_tiler_shapes_the_tiler_sizes_the_prefill_chunk(
