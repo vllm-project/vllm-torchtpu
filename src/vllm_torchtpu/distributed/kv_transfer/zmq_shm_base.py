@@ -1027,7 +1027,7 @@ class ZmqShmKvConnectorBase:
         )
         try:
             assert self._coord_pool is not None
-            slot_idx = self._coord_pool.acquire_slot(timeout=0.0)
+            slot_idx = self._coord_pool.acquire_slot(timeout=0.0, owner=req_meta.uuid)
         except Exception:
             # Pool full. Drop request; scheduler will surface a failure.
             with self._coord_lock:
@@ -1461,7 +1461,7 @@ class ZmqShmKvConnectorBase:
 
         try:
             assert self._coord_pool is not None
-            slot_idx = self._coord_pool.acquire_slot(timeout=0.0)
+            slot_idx = self._coord_pool.acquire_slot(timeout=0.0, owner=req_meta.uuid)
         except Exception:
             with self._coord_lock:
                 recv_holders = [
@@ -1752,7 +1752,7 @@ class ZmqShmKvConnectorBase:
                     self._coord_recv.pop(entry.uuid, None)
                     self._coord_done_recving.add(entry.req_id)
                 assert self._coord_pool is not None
-                self._coord_pool.release_slot(entry.slot_idx)
+                self._coord_pool.release_slot(entry.slot_idx, entry.uuid)
             entry.load_complete.set()
             logger.info(
                 "PERF D pull_complete req_id=%s uuid=%s ts=%.6f pull_ok=%s",
@@ -1966,7 +1966,7 @@ class ZmqShmKvConnectorBase:
                 self._coord_rank0_send_notify(dummy, uuid)
             finally:
                 assert self._coord_pool is not None
-                self._coord_pool.release_slot(entry_for_notify.slot_idx)
+                self._coord_pool.release_slot(entry_for_notify.slot_idx, uuid)
                 logger.info(
                     "PERF D scatter_complete req_id=%s uuid=%s ts=%.6f",
                     entry_for_notify.req_id,
@@ -2173,7 +2173,9 @@ class ZmqShmKvConnectorBase:
                         self._coord_rank0_send_notify(dummy, entry_for_notify.uuid)
                     finally:
                         assert self._coord_pool is not None
-                        self._coord_pool.release_slot(entry_for_notify.slot_idx)
+                        self._coord_pool.release_slot(
+                            entry_for_notify.slot_idx, entry_for_notify.uuid
+                        )
                         logger.info(
                             "PERF D scatter_complete req_id=%s uuid=%s ts=%.6f",
                             entry_for_notify.req_id,
@@ -2645,7 +2647,7 @@ class ZmqShmKvConnectorBase:
                         continue
                     self._coord_done_sending.add(entry.req_id)
                 assert self._coord_pool is not None
-                self._coord_pool.release_slot(entry.slot_idx)
+                self._coord_pool.release_slot(entry.slot_idx, uuid)
 
     # =========================================================
     # get_finished (coord mode)
@@ -2656,7 +2658,7 @@ class ZmqShmKvConnectorBase:
             return set(), set()
         done_sending: set[str] = set()
         done_recving: set[str] = set()
-        released_slots: list[int] = []
+        released_slots: list[tuple[int, int]] = []
         with self._coord_lock:
             # Producer: pull_acked → done_sending; scheduler unioning means
             # we only need to report once.
@@ -2665,7 +2667,7 @@ class ZmqShmKvConnectorBase:
                 if entry.pull_acked:
                     done_sending.add(entry.req_id)
                     del self._coord_send[uuid]
-                    released_slots.append(entry.slot_idx)
+                    released_slots.append((entry.slot_idx, uuid))
             # Merge in any expiration-sweeper results (already removed from
             # _coord_send by that thread, slot already released).
             if self._coord_done_sending:
@@ -2693,9 +2695,9 @@ class ZmqShmKvConnectorBase:
                 done_recving |= self._coord_done_recving
                 self._coord_done_recving.clear()
         # Free slots outside the lock to avoid nesting lock waits.
-        for sidx in released_slots:
+        for sidx, owner in released_slots:
             assert self._coord_pool is not None
-            self._coord_pool.release_slot(sidx)
+            self._coord_pool.release_slot(sidx, owner)
         for req_id, uuid in newly_done_recving:
             logger.info(
                 "PERF D done_recving req_id=%s uuid=%s ts=%.6f",

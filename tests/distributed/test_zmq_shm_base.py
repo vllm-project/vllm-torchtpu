@@ -192,14 +192,14 @@ class _RecordingPool(HostKVShmPool):
         self.mlocked_rank = None
         self.closed = False
 
-    def acquire_slot(self, timeout=None):
-        slot = super().acquire_slot(timeout=timeout)
+    def acquire_slot(self, timeout=None, *, owner=None):
+        slot = super().acquire_slot(timeout=timeout, owner=owner)
         self.acquired.append(slot)
         return slot
 
-    def release_slot(self, slot_idx):
+    def release_slot(self, slot_idx, owner):
         self.released.append(slot_idx)
-        super().release_slot(slot_idx)
+        super().release_slot(slot_idx, owner)
 
     def unpack_rank_layers(self, slot_idx, rank, num_blocks, layer_buffers):
         self.unpacked.append((slot_idx, rank, num_blocks, len(layer_buffers)))
@@ -490,7 +490,19 @@ def _drain_ipc(conn) -> list[tuple]:
         out.append((ident, tag, zsb._secure_loads(payload)))
 
 
+def _claim_slot_for_test(conn, slot_idx: int, owner: object) -> None:
+    """Reserve ``slot_idx`` under ``owner`` for synthetic send/recv entries."""
+    pool = conn._coord_pool
+    if pool is None or pool._free is None or pool._lock is None:
+        return
+    with pool._lock:
+        if slot_idx in pool._free.queue:
+            pool._free.queue.remove(slot_idx)
+            pool._slot_owners[slot_idx] = owner
+
+
 def _send_entry(conn, uuid=7, req_id="r0", slot_idx=0, num_blocks=2, ttl=60.0):
+    _claim_slot_for_test(conn, slot_idx, uuid)
     entry = zsb._CoordSendEntry(
         req_id=req_id,
         slot_idx=slot_idx,
@@ -512,6 +524,7 @@ def _recv_entry(
     remote_port=9100,
     side_port=None,
 ):
+    _claim_slot_for_test(conn, slot_idx, uuid)
     entry = zsb._CoordRecvEntry(
         req_id=req_id,
         uuid=uuid,
