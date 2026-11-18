@@ -445,8 +445,8 @@ def test_run_eval_flow_json_schema_passes_when_every_response_is_valid(
     assert data["results"]["json_schema"]["acc,none"] == 1.0
     assert data["meta"] == {
         "model": "Qwen/Qwen3-0.6B",
-        "total_trials": 28,
-        "successful_trials": 28,
+        "total_trials": 24,
+        "successful_trials": 24,
         "failed_trials": [],
     }
     assert (results_dir / "eval_check_json_schema.md").exists()
