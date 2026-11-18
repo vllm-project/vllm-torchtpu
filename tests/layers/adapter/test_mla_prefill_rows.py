@@ -80,6 +80,7 @@ class _Wrapper(nn.Module):
         self.o_proj = _OProj()
         self.mla_attn = _Backend()
         self.skip_topk = skip_topk
+        self.prefix = "layers.0.self_attn"
 
 
 class _MLP(nn.Module):
@@ -201,6 +202,10 @@ def test_rows_and_decode_traces_lift_the_same_named_inputs(monkeypatch):
         assert rows.applies(2048) and not sp.applies(16)
         decode, rows_bucket = _lifted(model, 16), _lifted(model, 2048)
     assert sorted(rows_bucket) == sorted(decode)
+    with pytest.raises(RuntimeError, match="must start with keep_list"):
+        rows.check_keep(
+            layers[2].self_attn.mla_attn, getattr(layers[2], sp.KEEP_ATTR)[1:]
+        )
     for name, meta in decode.items():
         if not name.startswith(("l_input_ids", "l_positions")):
             assert rows_bucket[name] == meta, name
