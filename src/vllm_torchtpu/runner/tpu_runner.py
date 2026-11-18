@@ -154,6 +154,7 @@ from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner import host_phases
 from vllm_torchtpu.runner import l6_seedspec as _l6_seedspec
 from vllm_torchtpu.runner import pp_last_async_output
+from vllm_torchtpu.runner import pp_last_async_drafter as _pparf  # q38 PPARF (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER, default off)
 from vllm_torchtpu.runner import host_admit_probe
 from vllm_torchtpu.runner import step_buckets
 from vllm_torchtpu.runner.tpu_pooling import (
@@ -896,11 +897,27 @@ class TPUModelRunner(GPUModelRunner):
         host (the consumer pulls as soon as the first token is out)."""
         if not self._is_async_drafter:
             return False
+        if _pparf.enabled():
+            # q38 PPARF: the connector registers ahead for every pipeline
+            # producer, whatever TPU_RAIDEN_STAGE3_REGISTER_AHEAD says.
+            return self._copygate_registers_ahead
         transfer_config = self.vllm_config.kv_transfer_config
         return (
             transfer_config is not None
             and bool(transfer_config.is_kv_producer)
             and dist_utils.get_stage3_register_ahead_enabled()
+        )
+
+    @property
+    def _copygate_registers_ahead(self) -> bool:
+        """q38 PPARF (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER): this producer's
+        Stage-3 send can be pulled before its finish
+        (pp_last_async_drafter.registers_ahead)."""
+        transfer_config = self.vllm_config.kv_transfer_config
+        return transfer_config is not None and _pparf.registers_ahead(
+            is_kv_producer=bool(transfer_config.is_kv_producer),
+            pipeline_parallel_size=int(self.parallel_config.pipeline_parallel_size),
+            register_ahead_flag=dist_utils.get_stage3_register_ahead_enabled(),
         )
 
     def __init__(
@@ -968,10 +985,21 @@ class TPUModelRunner(GPUModelRunner):
             self.model_config is not None and self.model_config.runner_type == "pooling"
         )
         self._pp_last_async_output, reason = pp_last_async_output.decide(
-            vllm_config, self._pp_is_last, self.is_pooling_model
+            vllm_config,
+            self._pp_is_last,
+            self.is_pooling_model,
+            prefill_only_drafter=self._mtp_prefill_only,
         )
         if envs.VLLM_TPU_PP_LAST_ASYNC_OUTPUT and self._pp_is_last:
             logger.info("PP last stage async output: %s", reason)
+        if _pparf.enabled():
+            # q38 PPARF: the one-time engagement line (flag off: nothing).
+            _pparf.note_decision(
+                self._pp_last_async_output,
+                reason,
+                is_last_stage=self._pp_is_last,
+                prefill_only_drafter=self._mtp_prefill_only,
+            )
         # Resolved in load_model; None keeps the eager pooler path.
         self._static_pooler_spec: StaticPoolerSpec | None = None
         self._static_pooler_reason = "not resolved"
@@ -4182,6 +4210,8 @@ class TPUModelRunner(GPUModelRunner):
             # Wang's tree): drop the all -1 draft-placeholder rows vLLM pads onto a final prompt token, before the states
             # absorb them and before the prefill-only refusal below would raise on them (F2 prefill under load).
             self._strip_prefill_only_padding(scheduler_output)
+        if _pparf.enabled():
+            _pparf.take_roots(self)  # q38 PPARF: the copy gate's roots are per step
         # Update cached state
         self._update_states(scheduler_output)
         host_phases.mark("update_states")
@@ -5876,6 +5906,13 @@ class TPUModelRunner(GPUModelRunner):
         # keeps proposing from the host-materialized output in the sync block
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
+        if _pparf.enabled() and self._pp_last_async_output:
+            # q38 PPARF: under PP last async output the prefill-only drafter
+            # returns its device drafts (the async return form), so its graph
+            # is not forced through a blocking host copy; the copy-gate fence
+            # below enqueues it without waiting. is_async picks only the
+            # return form here.
+            is_async = True
         eagle3_drafts = None
         if (
             self._is_async_drafter
@@ -5942,7 +5979,24 @@ class TPUModelRunner(GPUModelRunner):
             # barrier does not materialize their writes before Raiden reads.
             synchronize_tensors()
 
-        if copy_state is not None and self._fence_spec_kv_under_token_copy:
+        if copy_state is not None and _pparf.enabled() and self._copygate_registers_ahead:
+            # q38 PPARF copy-gate fence (port of HIGHC-PPAE1's
+            # TPU_PP_COPYGATE_FENCE mode 1): enqueue, in one non-blocking call,
+            # the drafter's graph (through its draft tokens, as below) and
+            # every KV-writing root registered for this step, then re-arm the
+            # gate, before the unwaited return. Applies to every producer that
+            # registers ahead, with or without a drafter
+            # (pp_last_async_drafter docstring).
+            _pparf_roots = [eagle3_drafts] if isinstance(eagle3_drafts, torch.Tensor) else []
+            _pparf_roots += _pparf.take_roots(self)
+            _pparf.fence(
+                copy_state,
+                _pparf_roots,
+                synchronize=lambda ts: synchronize_tensors(ts, wait=False),
+                skip_dispatch=False,
+                skip_fence=False,
+            )
+        elif copy_state is not None and self._fence_spec_kv_under_token_copy:
             # A Raiden producer registers a request's KV blocks ahead of its
             # finish, so a consumer may pull as soon as the first token is
             # out, while the drafter's KV writes above are still deferred.
