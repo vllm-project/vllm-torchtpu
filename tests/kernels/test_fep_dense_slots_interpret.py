@@ -120,15 +120,12 @@ def _reference(x, logits, w1, w2, s1, s2, real, valid):
                     w2[e],
                     s1[e : e + 1],
                     activation="silu",
-                    w1_bias=None,
-                    no_gate=False,
                     elementwise=jnp.bfloat16,
                 )
                 r, _ = ffn.result_rows(
                     a2,
                     ms,
                     w2_scales=s2[e : e + 1],
-                    w2_bias=None,
                     dtype=jnp.bfloat16,
                     elementwise=jnp.bfloat16,
                 )
