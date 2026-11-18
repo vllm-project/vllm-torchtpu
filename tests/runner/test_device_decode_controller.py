@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The device-decode controller: the flag, the configurations it refuses,
+"""The device-decode controller: the flags, the configurations it refuses,
 the programs it compiles, the steps it leaves to the stock path, and the
 checks that turn it off."""
 
@@ -52,6 +52,8 @@ from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import DeviceDecodeInvariantError
 
+VERIFY_FLAG = "VLLM_TPU_DEVICE_DECODE_VERIFY"
+
 
 def test_the_flag_creates_the_controller(monkeypatch):
     runner = make_runner(monkeypatch)
@@ -65,25 +67,26 @@ def test_the_flag_creates_the_controller(monkeypatch):
     )
 
 
-@pytest.mark.parametrize(("name", "value"), [(FLAG, "maybe")])
+@pytest.mark.parametrize(("name", "value"), [(FLAG, "maybe"), (VERIFY_FLAG, "-1")])
 def test_bad_flag_values_raise(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=name):
         getattr(envs, name)
 
 
-def test_every_rank_gets_the_flag():
-    assert FLAG in TpuPlatform.additional_env_vars
+def test_every_rank_gets_the_flags():
+    assert {FLAG, VERIFY_FLAG} <= set(TpuPlatform.additional_env_vars)
 
 
-def test_the_flag_stays_out_of_the_compile_cache_key(monkeypatch):
-    """The flag changes no program the compile cache holds, so it is not one
-    of the key's env factors."""
+def test_the_flags_stay_out_of_the_compile_cache_key(monkeypatch):
+    """Neither flag changes a program the compile cache holds, so neither is
+    one of the key's env factors."""
     from vllm_torchtpu.compilation import tpu_compiler
 
-    assert FLAG in tpu_compiler._TPU_COMPILE_ENV_IGNORED
-    monkeypatch.setenv(FLAG, "1")
-    assert FLAG not in tpu_compiler._tpu_compile_env_factors()
+    for name, value in ((FLAG, "1"), (VERIFY_FLAG, "4")):
+        assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        monkeypatch.setenv(name, value)
+        assert name not in tpu_compiler._tpu_compile_env_factors()
 
 
 EXCLUDED = {
@@ -502,3 +505,133 @@ def test_a_zero_token_step_frees_the_slots_it_preempts(monkeypatch):
     output = engine.step()
     assert output.total_num_scheduled_tokens == 0
     assert engine.controller.slots.slot_of("a") == NO_SLOT
+
+
+def _verify_engine(monkeypatch, *, async_scheduling=False):
+    monkeypatch.setenv(VERIFY_FLAG, "1")
+    engine = SimEngine(monkeypatch, async_scheduling=async_scheduling, device=True)
+    reference = SimEngine(monkeypatch, async_scheduling=async_scheduling, device=True)
+    monkeypatch.setattr(reference.controller, "try_execute", lambda *_args: False)
+    for e in (engine, reference):
+        e.add("a", 5, temperature=0.8, logprobs=2)
+        e.add("b", 9, temperature=0.0)
+        e.run(3)
+    return engine, reference
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_verify_mode_checks_every_device_step(monkeypatch, async_scheduling):
+    engine, reference = _verify_engine(monkeypatch, async_scheduling=async_scheduling)
+    for e in (engine, reference):
+        e.run_until_done()
+    assert engine.tokens == reference.tokens
+    assert engine.logprobs == reference.logprobs
+    counters = engine.controller.counters()
+    assert counters["verify_steps"] == counters["device_steps"] > 0
+    assert counters.get("verify_mismatches", 0) == 0
+    assert engine.controller.enabled
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_verify_mode_after_a_two_chunk_stock_step(monkeypatch, async_scheduling):
+    """With 12 attention rows, 14 requests prefill and decode in two stock
+    chunks, the first padded to 16 rows. Two requests then finish and the
+    other 12 decode on the device: verify mode must look each request's
+    previous token up where the stock substitution would, in the padded
+    chunks, not in the trimmed host copy."""
+    monkeypatch.setenv(VERIFY_FLAG, "1")
+    engine = SimEngine(
+        monkeypatch, async_scheduling=async_scheduling, device=True, target_rows=12
+    )
+    reference = SimEngine(
+        monkeypatch, async_scheduling=async_scheduling, device=True, target_rows=12
+    )
+    monkeypatch.setattr(reference.controller, "try_execute", lambda *_args: False)
+    for e in (engine, reference):
+        for i in range(14):
+            e.add(f"r{i:02d}", 3, temperature=0.8, max_tokens=2 if i < 2 else 6)
+        e.run_until_done()
+    assert engine.tokens == reference.tokens
+    counters = engine.controller.counters()
+    assert counters["multi_chunk"] >= 1 and counters["device_steps"] >= 1, counters
+    assert counters["verify_steps"] == counters["device_steps"], counters
+    assert counters.get("verify_mismatches", 0) == 0, counters
+    assert engine.controller.enabled, engine.controller.disabled_reason
+
+
+def test_verify_mode_copies_padded_tensors(monkeypatch):
+    """Verify mode copies whole bucketed tensors to the host and trims them
+    there: a device slice to the live request count would compile a program
+    per count."""
+    engine, _ = _verify_engine(monkeypatch)
+    controller = engine.controller
+    copies: list[tuple[int, tuple[int, ...]]] = []
+    live: list[int] = []
+    tensor_cpu = torch.Tensor.cpu
+
+    def cpu(self, *args, **kwargs):
+        if live:
+            copies.append((live[-1], tuple(self.shape)))
+        return tensor_cpu(self, *args, **kwargs)
+
+    def recording(method):
+        def run(*args, **kwargs):
+            live.append(engine.runner.input_batch.num_reqs)
+            try:
+                return method(*args, **kwargs)
+            finally:
+                live.pop()
+
+        return run
+
+    monkeypatch.setattr(torch.Tensor, "cpu", cpu)
+    for name in ("_input_mismatch", "_verify_head"):
+        monkeypatch.setattr(controller, name, recording(getattr(controller, name)))
+    engine.run_until_done()
+    assert controller.counters().get("verify_mismatches", 0) == 0
+    assert copies
+    # Every copy keeps a bucketed leading dimension (8 rows or more), above
+    # the live request count.
+    assert all(shape[0] >= 8 > num_reqs for num_reqs, shape in copies), copies
+
+
+def test_verify_mode_catches_a_corrupt_slot_before_the_forward(monkeypatch):
+    engine, reference = _verify_engine(monkeypatch)
+    slots = engine.controller.slots
+    slots.last_token[slots.slot_of("a")] += 1
+    for e in (engine, reference):
+        e.run_until_done()
+    # The step ran on the stock path, which samples what the slots would have.
+    assert engine.tokens == reference.tokens
+    assert engine.logprobs == reference.logprobs
+    assert not engine.controller.enabled
+    assert "input token" in engine.controller.disabled_reason
+    counters = engine.controller.counters()
+    assert counters["verify_mismatches"] == counters["verify_input_mismatch"] == 1
+
+
+def test_verify_mode_returns_the_stock_tokens_after_a_wrong_sample(monkeypatch):
+    engine, reference = _verify_engine(monkeypatch)
+    decode_head = controller_mod.decode_head
+
+    def wrong_first_token(*args, **kwargs):
+        tokens, packed = decode_head(*args, **kwargs)
+        packed[0, 0] = (packed[0, 0] + 1) % engine.runner.vocab_size
+        return tokens, packed
+
+    monkeypatch.setattr(controller_mod, "decode_head", wrong_first_token)
+    for e in (engine, reference):
+        e.run_until_done()
+    assert engine.tokens == reference.tokens
+    assert engine.logprobs == reference.logprobs
+    assert not engine.controller.enabled
+    assert "sampled token" in engine.controller.disabled_reason
+
+
+def test_verify_mode_stops_a_tensor_parallel_engine(monkeypatch):
+    engine, _ = _verify_engine(monkeypatch)
+    engine.runner.parallel_config.tensor_parallel_size = 2
+    slots = engine.controller.slots
+    slots.last_token[slots.slot_of("a")] += 1
+    with pytest.raises(DeviceDecodeInvariantError, match="input token"):
+        engine.step()

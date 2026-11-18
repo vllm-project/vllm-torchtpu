@@ -515,6 +515,7 @@ class TpuPlatform(Platform):
         "TPU_KV_RESHARD_TRANSPORT",
         # Every TP rank must take the same path through each decode step.
         "VLLM_TPU_DEVICE_DECODE",
+        "VLLM_TPU_DEVICE_DECODE_VERIFY",
     ]
 
     @classmethod

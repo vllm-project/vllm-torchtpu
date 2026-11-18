@@ -32,7 +32,7 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.forward_context import set_forward_context
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -88,8 +88,13 @@ PROMPT_LOGPROBS = "prompt_logprobs"
 UNSUPPORTED_SAMPLING = "unsupported_sampling"
 ENCODER_OR_KV = "encoder_or_kv"
 UNREGISTERED_SHAPE = "unregistered_shape"
-# The other counter.
+# Last, on a verified step: its inputs built on the device disagree with the
+# stock ones, so it runs on the stock path and device steps turn off.
+VERIFY_INPUT_MISMATCH = "verify_input_mismatch"
+# The other counters.
 DEVICE_STEPS = "device_steps"
+VERIFY_STEPS = "verify_steps"
+VERIFY_MISMATCHES = "verify_mismatches"
 
 # A request whose slot disagrees with the runner on this many checks in a
 # row points at a slot bug, not at a rollback the write-back repairs. A
@@ -166,6 +171,7 @@ class DeviceDecodeState:
     logits: torch.Tensor
     # int32 [num_reqs]: the input position of each request, before the step.
     expected_positions: np.ndarray
+    verify: bool
 
 
 class DeviceDecodeController:
@@ -189,6 +195,7 @@ class DeviceDecodeController:
         # it runs on the stock path instead of compiling mid-serving.
         self.registry: set[tuple] = set()
         self._counters: Counter[str] = Counter()
+        self._verify_every = envs.VLLM_TPU_DEVICE_DECODE_VERIFY
         # Live requests asking for logits processing the TPU samplers skip.
         self._logits_processor_reqs: set[str] = set()
         self._mirror_mismatches: tuple[str | None, int] = (None, 0)
@@ -309,6 +316,10 @@ class DeviceDecodeController:
         expected_positions = r.input_batch.num_computed_tokens_cpu[:num_reqs].astype(
             np.int32
         )
+        verify = (
+            self._verify_every > 0
+            and self._counters[DEVICE_STEPS] % self._verify_every == 0
+        )
         r._wait_input_staging_fence()
         r.seq_lens_np[:num_reqs] = expected_positions + 1
         r._check_attention_schedule(num_reqs, self._ones[:num_reqs], num_reqs)
@@ -319,6 +330,14 @@ class DeviceDecodeController:
         inputs = prepare_decode_inputs(
             self.slots, idx_mapping, shape, self.geometry, offsets
         )
+        if verify:
+            self._counters[VERIFY_STEPS] += 1
+            mismatch = self._input_mismatch(inputs, shape)
+            if mismatch is not None:
+                self._counters[VERIFY_MISMATCHES] += 1
+                self._count_stock_step(VERIFY_INPUT_MISMATCH)
+                self._disable(f"verified inputs: {mismatch}")
+                return False
         attn_metadata = build_decode_attention_metadata(r, inputs, shape, offsets)
         r._last_sequence_layout_plan = self._layout_plan(scheduler_output, shape)
         r._collect_mamba_state_seed_copies(scheduler_output, 0, num_reqs)
@@ -338,6 +357,7 @@ class DeviceDecodeController:
             idx_np=idx_np,
             logits=logits,
             expected_positions=expected_positions,
+            verify=verify,
         )
         return True
 
@@ -370,8 +390,16 @@ class DeviceDecodeController:
             copy_state = AsyncTPUCopyState.from_packed(
                 packed, layout, shape.num_reqs, state.expected_positions
             )
+        next_tokens: torch.Tensor = tokens
+        logprobs: LogprobsLists | None = None
+        if state.verify:
+            stock = self._verify_head(state, copy_state)
+            if stock is not None:
+                copy_state, next_tokens, logprobs = stock
         r._update_num_xla_graphs("device_decode_step")
-        return self._finish_step(state.scheduler_output, copy_state, tokens)
+        return self._finish_step(
+            state.scheduler_output, copy_state, next_tokens, logprobs
+        )
 
     def stock_chunk_plan(
         self,
@@ -401,9 +429,9 @@ class DeviceDecodeController:
             )
 
     def counters(self) -> dict[str, int]:
-        """Device steps and stock steps by reason. Only steps planned while
-        device steps are on count: once a check turns them off, later steps
-        are not counted."""
+        """Device steps, stock steps by reason, verified steps and verify
+        mismatches. Only steps planned while device steps are on count: once
+        a check turns them off, later steps are not counted."""
         return dict(self._counters)
 
     def _plan_step(
@@ -628,6 +656,7 @@ class DeviceDecodeController:
         scheduler_output: Any,
         copy_state: AsyncTPUCopyState,
         next_tokens: torch.Tensor,
+        logprobs: LogprobsLists | None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         """`TPUModelRunner.sample_tokens` after sampling, for one plain
         chunk."""
@@ -678,7 +707,7 @@ class DeviceDecodeController:
                 req_ids=req_ids,
                 req_id_to_index=dict(input_batch.req_id_to_index),
                 sampled_token_ids=[],
-                logprobs=None,
+                logprobs=logprobs,
                 prompt_logprobs_dict={},
                 pooler_output=[],
                 kv_connector_output=kv_connector_output,
@@ -704,3 +733,180 @@ class DeviceDecodeController:
             input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
             req_state.output_token_ids.extend(valid_tokens)
         return output
+
+    def _input_mismatch(self, inputs: DecodeInputs, shape: DecodeShape) -> str | None:
+        """How the live part of the device-built inputs differs from what the
+        stock path stages for the step, or None. Syncs the host."""
+        r = self.runner
+        assert self.geometry is not None
+        input_batch = r.input_batch
+        num_reqs = shape.num_reqs
+        num_computed = input_batch.num_computed_tokens_cpu[:num_reqs]
+
+        def host(tensor: torch.Tensor) -> np.ndarray:
+            # Copy the padded tensor and trim on the host: a device slice
+            # would compile a program per request count.
+            return tensor.cpu().numpy()[:num_reqs]
+
+        checks = [
+            ("position", host(inputs.positions), num_computed),
+            ("sequence length", host(inputs.seq_lens), num_computed + 1),
+            ("input token", host(inputs.input_ids), self._input_tokens(num_reqs)),
+        ]
+        if inputs.mamba_state_indices is not None:
+            req_ids = input_batch.req_ids[:num_reqs]
+            mamba_slots = [r._mamba_slot_by_req_id[req_id] for req_id in req_ids]
+            checks.append(
+                ("mamba state slot", host(inputs.mamba_state_indices), mamba_slots)
+            )
+        for name, got, want in checks:
+            bad = np.flatnonzero(got != np.asarray(want))
+            if bad.size:
+                row = int(bad[0])
+                return (
+                    f"request row {row} has {name} {int(got[row])} on the device "
+                    f"and {int(np.asarray(want)[row])} on the host"
+                )
+        for gid, width in zip(self.geometry.gids, self.geometry.widths):
+            table = inputs.staged_block_tables[gid].cpu().numpy()
+            table = table.reshape(shape.target_rows, width)[:num_reqs]
+            block_table = input_batch.block_table[gid]
+            num_blocks = block_table.num_blocks_per_row[:num_reqs]
+            filled = np.arange(width) < num_blocks[:, None]
+            stale = (
+                table != block_table.get_cpu_tensor()[:num_reqs, :width].numpy()
+            ) & filled
+            bad = np.flatnonzero(stale.any(axis=1))
+            if bad.size:
+                return (
+                    f"request row {int(bad[0])} has a stale block table row in "
+                    f"KV cache group {gid}"
+                )
+        return None
+
+    def _input_tokens(self, num_reqs: int) -> np.ndarray:
+        """Each request's input token by the stock rule: the previous step's
+        sampled token where its async copy holds it, else the token buffer."""
+        r = self.runner
+        input_batch = r.input_batch
+        rows = np.arange(num_reqs)
+        positions = input_batch.num_computed_tokens_cpu[:num_reqs]
+        tokens = input_batch.token_ids_cpu[rows, positions].astype(np.int64)
+        previous = r._pre_async_results
+        if previous is not None and previous.req_id_to_index_copy:
+            sampled = _next_tokens_cpu(previous)
+            for row, req_id in enumerate(input_batch.req_ids[:num_reqs]):
+                index = previous.req_id_to_index_copy.get(req_id)
+                if index is not None:
+                    tokens[row] = int(sampled[index])
+        return tokens
+
+    def _verify_head(
+        self, state: DeviceDecodeState, copy_state: AsyncTPUCopyState
+    ) -> tuple[AsyncTPUCopyState, torch.Tensor, LogprobsLists | None] | None:
+        """Samples the step's logits again with the stock programs and the
+        same noise and compares. On a mismatch, returns the stock results,
+        written back into the slots, and turns the device path off."""
+        r = self.runner
+        assert self.slots is not None
+        shape, variant = state.shape, state.variant
+        num_reqs, num_rows = shape.num_reqs, shape.num_reqs_padded
+        live = np.arange(num_rows) < num_reqs
+        positions = np.zeros(num_rows, dtype=np.int32)
+        positions[:num_reqs] = state.expected_positions
+        plan = StockChunkPlan(
+            num_rows_padded=num_rows,
+            slots=state.idx_np[:num_rows].copy(),
+            positions=positions,
+            produced=live,
+            new_num_computed=np.where(live, positions + 1, 0).astype(np.int32),
+        )
+        chunk = StockChunk(plan, plan.to_device(r), self.slots)
+        logits = state.logits
+        if variant.all_greedy:
+            stock_tokens = r._greedy_sample(logits)
+        else:
+            temperatures, top_k, top_p = r._build_padded_sampling_params(
+                0, num_reqs, logits
+            )
+            stock_tokens = r.sample_from_logits_func(
+                logits,
+                temperatures,
+                chunk.uniform(logits.shape[-1]),
+                top_k,
+                top_p,
+                all_greedy=False,
+                topk_candidates=variant.topk_candidates,
+                apply_topk_topp=variant.apply_topk_topp,
+            )
+        stock_logprobs = (
+            r.gather_logprobs(logits, stock_tokens)
+            if variant.num_logprobs >= 0
+            else None
+        )
+        # The padded results reach the host whole and are trimmed there: a
+        # device slice would compile a program per request count.
+        stock_tokens_cpu = stock_tokens.cpu()[:num_reqs]
+        logprobs = None
+        if stock_logprobs is not None:
+            padded = stock_logprobs.tolists()
+            logprobs = LogprobsLists(
+                logprob_token_ids=padded.logprob_token_ids[:num_reqs],
+                logprobs=padded.logprobs[:num_reqs],
+                sampled_token_ranks=padded.sampled_token_ranks[:num_reqs],
+            )
+        mismatch = _head_mismatch(copy_state, stock_tokens_cpu, logprobs)
+        if mismatch is None:
+            return None
+        self._counters[VERIFY_MISMATCHES] += 1
+        self.slots.write_back_stock_chunk(r, plan, stock_tokens, chunk.plan_dev)
+        stock_copy = AsyncTPUCopyState.from_device_chunks([stock_tokens], [num_reqs])
+        self._disable(f"verified sampling: {mismatch}")
+        return stock_copy, stock_tokens.view(-1), logprobs
+
+
+def _next_tokens_cpu(previous: AsyncPreResults) -> np.ndarray:
+    """The host copy of `previous.next_tokens_tpu`, which the stock token
+    substitution indexes with `req_id_to_index_copy`: a device step's token
+    column, or a stock step's chunks at their padded lengths, back to back
+    (unlike the trimmed `sampled_token_ids_cpu`). Waits for the copy."""
+    copy_state = previous.copy_state
+    assert copy_state is not None
+    copy_state.wait()
+    if copy_state.packed_cpu is not None:
+        return copy_state.packed_cpu[:, 0].numpy()
+    return torch.cat([chunk.reshape(-1) for chunk in copy_state.chunks_cpu]).numpy()
+
+
+def _head_mismatch(
+    copy_state: AsyncTPUCopyState,
+    stock_tokens: torch.Tensor,
+    stock_logprobs: LogprobsLists | None,
+) -> str | None:
+    """How the device step's copied results differ from the stock sampler's
+    (host copies of the live rows), or None. Waits for the copy."""
+    copy_state.wait()
+    got = copy_state.sampled_token_ids_cpu
+    bad = torch.nonzero(got.view(-1) != stock_tokens.view(-1))
+    if bad.numel():
+        row = int(bad[0])
+        return (
+            f"request row {row} sampled token {int(got[row, 0])} on the device "
+            f"and {int(stock_tokens[row, 0])} on the stock path"
+        )
+    if stock_logprobs is None:
+        return None
+    lists = copy_state.packed_logprobs()
+    assert lists is not None
+    cols = lists.logprob_token_ids.shape[1]
+    values = stock_logprobs.logprobs[:, :cols]
+    same = (
+        np.array_equal(
+            lists.logprob_token_ids, stock_logprobs.logprob_token_ids[:, :cols]
+        )
+        and np.array_equal(lists.logprobs.view(np.int32), values.view(np.int32))
+        and np.array_equal(
+            lists.sampled_token_ranks, stock_logprobs.sampled_token_ranks
+        )
+    )
+    return None if same else "the logprobs differ from the stock gather_logprobs"

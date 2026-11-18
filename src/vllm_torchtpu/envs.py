@@ -211,6 +211,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_DEVICE_DECODE: bool = False
+    VLLM_TPU_DEVICE_DECODE_VERIFY: int = 0
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1299,6 +1300,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Random sampling then draws its noise from a (seed, position) keyed RNG,
     # so random token streams differ from the default (greedy ones do not).
     "VLLM_TPU_DEVICE_DECODE": env_bool("VLLM_TPU_DEVICE_DECODE"),
+    # With VLLM_TPU_DEVICE_DECODE: check every N-th device step against the
+    # stock computation (syncs the host; debug only). 0 checks none.
+    "VLLM_TPU_DEVICE_DECODE_VERIFY": env_nonnegative_int(
+        "VLLM_TPU_DEVICE_DECODE_VERIFY", 0
+    ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
