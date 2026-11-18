@@ -30,7 +30,7 @@ import pytest
 import torch
 
 from vllm_torchtpu import utils as vu
-from vllm_torchtpu.compilation import fast_dispatch as qx
+from vllm_torchtpu.compilation import fast_dispatch as fd
 from vllm_torchtpu.runner import fast_forward_context as ffc
 from vllm_torchtpu.runner import host_trims, runner_options
 
@@ -48,43 +48,43 @@ def _fn_shape(x):
 def _wrapped(fn):
     torch._dynamo.reset()
     compiled = torch.compile(fn, backend="eager", fullgraph=True, dynamic=False)
-    return qx._wrap(compiled, fn)
+    return fd.wrap(compiled, fn)
 
 
 @pytest.fixture
 def memo_on(monkeypatch):
     # The memo sits on the direct dispatch, which tpu_compile.fast_compiled_call
     # arms; both are off by default.
-    monkeypatch.setitem(qx._CONFIG, "fast", True)
-    monkeypatch.setitem(qx._MEMO, "on", True)
-    for k in qx._MEMO_STATS:
-        monkeypatch.setitem(qx._MEMO_STATS, k, 0)
+    monkeypatch.setitem(fd._CONFIG, "fast", True)
+    monkeypatch.setitem(fd._MEMO, "on", True)
+    for k in fd._MEMO_STATS:
+        monkeypatch.setitem(fd._MEMO_STATS, k, 0)
     yield
 
 
 def test_memo_key_covers_metadata_scalars_and_identity():
     a, b = torch.zeros(4, 8), torch.zeros(4, 8)
     obj = object()
-    k1 = qx._memo_key((a, 3, None, "s", obj, [b, 2]))
-    assert k1 == qx._memo_key((torch.ones(4, 8), 3, None, "s", obj, [b, 2]))
+    k1 = fd._memo_key((a, 3, None, "s", obj, [b, 2]))
+    assert k1 == fd._memo_key((torch.ones(4, 8), 3, None, "s", obj, [b, 2]))
     # Tensor values are not part of the key; metadata is.
-    assert k1 != qx._memo_key((torch.zeros(4, 9), 3, None, "s", obj, [b, 2]))
-    assert k1 != qx._memo_key((torch.zeros(8, 4).t(), 3, None, "s", obj, [b, 2]))
-    assert k1 != qx._memo_key((a.to(torch.bfloat16), 3, None, "s", obj, [b, 2]))
-    assert k1 != qx._memo_key((a.requires_grad_(False), 4, None, "s", obj, [b, 2]))
-    assert k1 != qx._memo_key((a, 3, None, "s", object(), [b, 2]))
-    assert k1 != qx._memo_key((a, 3, None, "s", obj, [b, 3]))
-    assert k1 != qx._memo_key((a, True, None, "s", obj, [b, 2]))  # bool vs int
-    assert qx._memo_key(([0] * (qx._MEMO_MAX_SEQ + 1),)) is None
+    assert k1 != fd._memo_key((torch.zeros(4, 9), 3, None, "s", obj, [b, 2]))
+    assert k1 != fd._memo_key((torch.zeros(8, 4).t(), 3, None, "s", obj, [b, 2]))
+    assert k1 != fd._memo_key((a.to(torch.bfloat16), 3, None, "s", obj, [b, 2]))
+    assert k1 != fd._memo_key((a.requires_grad_(False), 4, None, "s", obj, [b, 2]))
+    assert k1 != fd._memo_key((a, 3, None, "s", object(), [b, 2]))
+    assert k1 != fd._memo_key((a, 3, None, "s", obj, [b, 3]))
+    assert k1 != fd._memo_key((a, True, None, "s", obj, [b, 2]))  # bool vs int
+    assert fd._memo_key(([0] * (fd._MEMO_MAX_SEQ + 1),)) is None
 
 
 def test_memo_key_tells_aliased_tensor_arguments_apart():
     # Dynamo guards whether two tensor inputs are the same tensor, so the
     # same tensor twice and two equal-metadata tensors need different keys.
     a, b = torch.zeros(4), torch.zeros(4)
-    assert qx._memo_key((a, a)) != qx._memo_key((a, b))
-    assert qx._memo_key((a, [a])) != qx._memo_key((a, [b]))
-    assert qx._memo_key((a, b)) == qx._memo_key((b, a))
+    assert fd._memo_key((a, a)) != fd._memo_key((a, b))
+    assert fd._memo_key((a, [a])) != fd._memo_key((a, [b]))
+    assert fd._memo_key((a, b)) == fd._memo_key((b, a))
 
 
 class _Owner:
@@ -109,20 +109,20 @@ def test_memo_never_hits_for_a_recycled_object_id(memo_on, monkeypatch):
     first = _Owner(2)
     for _ in range(3):
         torch.testing.assert_close(w(x, first), x * 2)
-    assert qx._MEMO_STATS["store"] == 1
-    (key,) = w._qx_fast_state["memo"]
+    assert fd._MEMO_STATS["store"] == 1
+    (key,) = w._fast_dispatch_state["memo"]
     first_id = id(first)
     del first
     gc.collect()
     second = _Owner(5)
     real_id = builtins.id
     monkeypatch.setattr(
-        qx, "id", lambda o: first_id if o is second else real_id(o), raising=False
+        fd, "id", lambda o: first_id if o is second else real_id(o), raising=False
     )
-    assert qx._memo_key((x, second)) == key
-    hits = qx._MEMO_STATS["hit"]
+    assert fd._memo_key((x, second)) == key
+    hits = fd._MEMO_STATS["hit"]
     torch.testing.assert_close(w(x, second), x * 5)
-    assert qx._MEMO_STATS["hit"] == hits
+    assert fd._MEMO_STATS["hit"] == hits
 
 
 class _Slotted:
@@ -135,15 +135,15 @@ def test_memo_holds_objects_without_weak_references_alive():
     obj = _Slotted()
     with pytest.raises(TypeError):
         weakref.ref(obj)
-    (ref,) = qx._memo_refs([obj])
+    (ref,) = fd._memo_refs([obj])
     assert ref() is obj
-    assert qx._memo_live((ref,), [obj])
-    assert not qx._memo_live((ref,), [_Slotted()])
+    assert fd._memo_live((ref,), [obj])
+    assert not fd._memo_live((ref,), [_Slotted()])
 
 
 def test_memo_default_off_leaves_dispatch_unchanged(monkeypatch):
-    monkeypatch.setitem(qx._CONFIG, "fast", True)
-    monkeypatch.setitem(qx._MEMO, "on", False)
+    monkeypatch.setitem(fd._CONFIG, "fast", True)
+    monkeypatch.setitem(fd._MEMO, "on", False)
     w = _wrapped(_fn_scale)
     x = torch.arange(6.0)
     for _ in range(4):
@@ -158,8 +158,8 @@ def test_memo_hits_and_results_match_eager(memo_on):
         for x in xs:
             for n in (2, 5):
                 torch.testing.assert_close(w(x, n), _fn_scale(x, n))
-    assert qx._MEMO_STATS["hit"] > 0
-    assert qx._MEMO_STATS["store"] >= 2
+    assert fd._MEMO_STATS["hit"] > 0
+    assert fd._MEMO_STATS["store"] >= 2
     # Same shape and n -> one memo entry serves both tensor values.
     keys = w._fast_dispatch_state["memo"]
     assert all(len(k) == 2 for k in keys)
@@ -173,11 +173,11 @@ def test_memo_respects_scalar_value_and_shape(memo_on):
         torch.testing.assert_close(w(x6, 7), _fn_scale(x6, 7))
         torch.testing.assert_close(w(x10, 2), _fn_scale(x10, 2))
     # After warm-up every repeat is a memo hit, and still right.
-    hits = qx._MEMO_STATS["hit"]
+    hits = fd._MEMO_STATS["hit"]
     for n in (2, 7):
         torch.testing.assert_close(w(x6, n), _fn_scale(x6, n))
     torch.testing.assert_close(w(x10, 2), _fn_scale(x10, 2))
-    assert qx._MEMO_STATS["hit"] == hits + 3
+    assert fd._MEMO_STATS["hit"] == hits + 3
 
 
 def test_memo_never_reuses_an_entry_across_shapes(memo_on):
@@ -186,7 +186,7 @@ def test_memo_never_reuses_an_entry_across_shapes(memo_on):
     for _ in range(3):
         torch.testing.assert_close(w(x6), x6 + 6)
         torch.testing.assert_close(w(x10), x10 + 10)
-    assert qx._MEMO_STATS["hit"] >= 2
+    assert fd._MEMO_STATS["hit"] >= 2
 
 
 def test_memo_cleared_when_cache_entries_change(memo_on):
@@ -440,11 +440,11 @@ def test_configure_turns_every_trim_on_and_off(restore_trims):
     host_trims.configure(_config(1, "kv_consumer"))
     assert host_trims.ENABLED and host_trims.AOT_SKIP_GUARDS
     assert host_trims.CONN_STATS_EVERY == host_trims.CONN_STATS_EVERY_ON == 16
-    assert ffc.enabled() and qx._MEMO["on"] and vu._dp_size_cache_on
+    assert ffc.enabled() and fd._MEMO["on"] and vu._dp_size_cache_on
     host_trims.configure(_config(2, "kv_consumer"))
     assert not host_trims.ENABLED and not host_trims.AOT_SKIP_GUARDS
     assert host_trims.CONN_STATS_EVERY == 1
-    assert not ffc.enabled() and not qx._MEMO["on"] and not vu._dp_size_cache_on
+    assert not ffc.enabled() and not fd._MEMO["on"] and not vu._dp_size_cache_on
 
 
 def test_old_environment_switches_are_ignored(monkeypatch, restore_trims):
@@ -461,7 +461,7 @@ def test_old_environment_switches_are_ignored(monkeypatch, restore_trims):
     monkeypatch.setenv("VLLM_TPU_T3_SWITCH_US", "200")
     monkeypatch.setenv("VLLM_TPU_T3_GC", "freeze")
     host_trims.configure(_config(4))
-    assert not host_trims.ENABLED and not ffc.enabled() and not qx._MEMO["on"]
+    assert not host_trims.ENABLED and not ffc.enabled() and not fd._MEMO["on"]
     assert host_trims.CONN_STATS_EVERY == 1 and not host_trims.STEP_HOOK
 
 
