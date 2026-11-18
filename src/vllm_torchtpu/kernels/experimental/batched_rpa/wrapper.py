@@ -1010,6 +1010,8 @@ def ragged_paged_attention(
     # DECODE alone over every sequence, and any other call skips MIXED at run
     # time (lax.cond) when its sequence range is empty. Otherwise DECODE and
     # MIXED both run on every call. The conditional, one per attention layer,
+    # changes how XLA schedules and places the whole compiled step, which can
+    # change the rounding of other ops in the step; so it is opt-in.
     effective_decode_blocks = decode_block_sizes or default_decode
     if (
         skip_empty_mixed
