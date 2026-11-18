@@ -259,6 +259,11 @@ def calculate_block_sizes(
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
+    if decode_batch_size < 1:
+        raise ValueError(
+            f"decode_batch_size must be at least 1, got {decode_batch_size}."
+        )
+
     # Calculate aligned model dimensions.
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
     aligned_num_q_heads_per_kv_head = utils.align_to(
