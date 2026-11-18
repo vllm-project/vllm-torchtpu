@@ -113,10 +113,11 @@ FALLBACK_SHAPES = [(6144, 2624), (1024, 6144)]
 
 @pytest.mark.parametrize("k,n", FALLBACK_SHAPES)
 @pytest.mark.parametrize("m", [17, 32])
-def test_fallback_path_reads_the_original_weight(k, n, m):
+def test_fallback_path_reads_the_original_weight(monkeypatch, k, n, m):
     """M > 16 stays on XLA and reads the original (unpadded) weight, so it is the
     incumbent's computation exactly, with or without a padded kernel copy. The
     shapes are tuned, so only the row count keeps these calls off the kernel."""
+    monkeypatch.setattr(fp8_skinny, "_on_tuned_generation", lambda: True)
     rng = np.random.default_rng(0)
     x = jnp.asarray(rng.standard_normal((m, k), dtype=np.float32), jnp.bfloat16)
     w = np.clip(rng.standard_normal((k, n)) * 50, -448, 448)
@@ -127,7 +128,7 @@ def test_fallback_path_reads_the_original_weight(k, n, m):
     wp = wp.astype(jnp.float8_e4m3fn)
     sp = jnp.pad(s, (0, n_pad - n), constant_values=1.0)
     # Control: the kernel takes this weight at 16 rows but not at m rows.
-    assert fp8_skinny.supports(16, wp, sp) and not fp8_skinny.supports(m, wp, sp)
+    assert fp8_skinny.supports(x[:16], wp, sp) and not fp8_skinny.supports(x, wp, sp)
     ref = np.asarray(jax.jit(xla_quantized_matmul)(x, w, s), np.float32)
     y1 = jax.jit(_fp8_linear_pallas_jax)(x, w, s, wp, sp)
     y0 = jax.jit(_fp8_linear_pallas_jax)(x, w, s)
@@ -344,7 +345,7 @@ def test_small_rows_call_the_kernel(k, n, m):
         wk = wk.astype(jnp.float8_e4m3fn)
         sk = jnp.pad(s, (0, n_pad - n), constant_values=1.0)
         y = jax.jit(_fp8_linear_pallas_jax)(x, w, s, wk, sk)
-    assert fp8_skinny.supports(m, wk, sk)
+    assert fp8_skinny.supports(x, wk, sk)
     want = jax.jit(lambda a, b, c: fp8_skinny.fp8_skinny_matmul(a, b, c, n_logical=n))(
         x, wk, sk
     )

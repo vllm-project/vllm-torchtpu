@@ -282,7 +282,7 @@ def _fp8_linear_pallas_jax(
     """
     n_out = w_q.shape[1]
     kw, ks = (w_q, w_s) if w_k is None else (w_k, s_k)
-    if fp8_skinny.supports(x.shape[0], kw, ks):
+    if fp8_skinny.supports(x, kw, ks):
         return fp8_skinny.fp8_skinny_matmul(x, kw, ks, n_logical=n_out)
     return xla_quantized_matmul(x, w_q, w_s)
 
@@ -332,9 +332,10 @@ def quantized_matmul_pallas(
       s_kernel: Scales `[padded_n(n)]` of `w_kernel`, 1.0 in the padded columns.
 
     Returns:
-      `[..., n]` in `x.dtype`. A call whose `x` has at most 16 rows after
-      flattening, on a weight shape that `fp8_skinny.supports()` accepts, runs
-      `fp8_skinny`. Other calls run `xla_quantized_matmul` on `(w_q, w_s)`.
+      `[..., n]` in `x.dtype`. A call that `fp8_skinny.supports()` accepts (a
+      bf16 `x` of at most 16 rows after flattening, a tuned weight shape, a v7x
+      TPU) runs `fp8_skinny`. Other calls run `xla_quantized_matmul` on
+      `(w_q, w_s)`.
 
     Raises:
       ValueError: If the last dimension of `x` is not `k`.
