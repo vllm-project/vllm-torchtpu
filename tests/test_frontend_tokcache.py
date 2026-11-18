@@ -12,8 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import unittest
+from unittest.mock import Mock
 
 import pytest
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+from transformers import PreTrainedTokenizerFast
+from vllm.renderers import base as rbase
+from vllm.renderers.hf import HfRenderer
+from vllm.renderers.params import TokenizeParams
 
 from vllm_torchtpu import frontend_tokcache as tokcache_mod
 
@@ -78,10 +84,106 @@ class TestFrontendTokCache(unittest.TestCase):
         self.assertFalse(cache.disabled)
 
 
-def _toy_hf_tokenizer():
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
-    from transformers import PreTrainedTokenizerFast
+B = tokcache_mod.BOUNDARY
+BID = 151644
 
+
+def _encode(s: str, *, context_after_bang: bool = False, fake_boundary: str = ""):
+    """A character-level encoder with BID for each boundary.
+
+    ``context_after_bang``: a character right after a boundary that follows
+    "!" gets a different id, so encoding the text after that boundary on its
+    own differs from encoding the whole prompt (a merge across the boundary).
+    ``fake_boundary``: this substring also encodes to BID (more boundary
+    tokens than boundary substrings)."""
+    if fake_boundary:
+        s = s.replace(fake_boundary, "\x00")
+    out: list[int] = []
+    for i, part in enumerate(s.split(B)):
+        ids = [BID if ch == "\x00" else ord(ch) for ch in part]
+        if i > 0:
+            out.append(BID)
+            if context_after_bang and ids and out[-2:-1] == [ord("!")]:
+                ids[0] += 100_000
+        out.extend(ids)
+    return out
+
+
+def _chat(turns: int, final: str = "") -> str:
+    """A chat prompt whose turns each end with "!" before the next boundary."""
+    body = "".join(f"{B}user\nturn {i} text!" for i in range(turns))
+    return body + f"{B}user\n{final}"
+
+
+def _counting(encode):
+    calls = []
+
+    def fn(s):
+        calls.append(s)
+        return encode(s)
+
+    return fn, calls
+
+
+def test_a_verify_mismatch_returns_the_full_encode_and_turns_the_cache_off():
+    def encode(s):
+        return _encode(s, context_after_bang=True)
+
+    fn, calls = _counting(encode)
+    cache = tokcache_mod.PrefixTokenCache(fn, BID, min_tokens=1)
+    first = _chat(2)
+    assert cache.encode(first) == encode(first)  # a miss, cached
+    second = _chat(3)
+    # The cached prefix plus the suffix encoded alone differ from the full
+    # encode; the check of the first hits catches it.
+    assert cache.encode(second) == encode(second)
+    assert cache.disabled and cache.verified == 1 and cache.hits == 1
+    calls.clear()
+    third = _chat(4)
+    assert cache.encode(third) == encode(third)
+    assert calls == [third]  # later prompts take the full encode only
+    assert cache.calls == 2
+
+
+def test_a_suffix_with_an_extra_boundary_token_takes_the_full_encode(monkeypatch):
+    logger = Mock()
+    monkeypatch.setattr(tokcache_mod, "logger", logger)
+
+    def encode(s):
+        return _encode(s, fake_boundary="@@")
+
+    cache = tokcache_mod.PrefixTokenCache(encode, BID, min_tokens=1)
+    first = _chat(2)
+    assert cache.encode(first) == encode(first)
+    second = _chat(2, final="look @@ here")
+    assert cache.encode(second) == encode(second)
+    (call,) = logger.warning_once.call_args_list
+    assert "boundary/token mismatch" in call.args[0]
+    assert cache.hits == 0 and not cache.disabled
+
+
+def test_the_cache_evicts_the_least_recently_used_prompts_to_its_limits():
+    fn, calls = _counting(_encode)
+    cache = tokcache_mod.PrefixTokenCache(fn, BID, min_tokens=1, max_entries=2)
+    prompts = [_chat(2, final=f"conversation {i}") for i in range(3)]
+    sizes = [len(_encode(p)) for p in prompts]
+    for p in prompts:
+        cache.encode(p)
+    assert len(cache._entries) == 2 and cache._total_tokens == sum(sizes[1:])
+    # The oldest conversation's keys left the index with it: its next turn
+    # finds no cached prefix of its own beyond what the others share.
+    assert all(v[0] != 0 for v in cache._index.values())
+
+    by_tokens = tokcache_mod.PrefixTokenCache(
+        _encode, BID, min_tokens=1, max_tokens=sizes[0] + sizes[1]
+    )
+    for p in prompts:
+        by_tokens.encode(p)
+    assert len(by_tokens._entries) == 2
+    assert by_tokens._total_tokens <= sizes[0] + sizes[1]
+
+
+def _toy_hf_tokenizer():
     t = Tokenizer(models.BPE())
     t.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     t.decoder = decoders.ByteLevel()
@@ -114,9 +216,6 @@ def test_installed_cache_uses_the_deployed_sizes():
 def patched_renderer(monkeypatch):
     """A real HfRenderer around the toy tokenizer, with the tokenization cache
     installed on BaseRenderer; returns it and vLLM's unpatched method."""
-    from vllm.renderers import base as rbase
-    from vllm.renderers.hf import HfRenderer
-
     unpatched = rbase.BaseRenderer._tokenize_prompt
     # Restored at teardown, after the install below replaces it.
     monkeypatch.setattr(rbase.BaseRenderer, "_tokenize_prompt", unpatched)
@@ -154,8 +253,6 @@ def _turns(n):
 def test_patched_renderer_matches_vllms_tokens_on_a_multi_turn_chat(
     patched_renderer, cache_encodes, add_special_tokens
 ):
-    from vllm.renderers.params import TokenizeParams
-
     renderer, unpatched = patched_renderer
     params = TokenizeParams(
         max_total_tokens=None, add_special_tokens=add_special_tokens
@@ -172,8 +269,6 @@ def test_patched_renderer_matches_vllms_tokens_on_a_multi_turn_chat(
 def test_first_unexpected_error_turns_the_cache_off(patched_renderer, monkeypatch):
     """The failing prompt and every later one get vLLM's own tokens, and the
     cache is not tried again after the first error."""
-    from vllm.renderers.params import TokenizeParams
-
     renderer, unpatched = patched_renderer
     calls = []
 
@@ -193,10 +288,6 @@ def test_first_unexpected_error_turns_the_cache_off(patched_renderer, monkeypatc
 def test_installed_wrapper_builds_its_cache_with_the_token_limit(
     monkeypatch, cache_encodes
 ):
-    from vllm.renderers import base as rbase
-    from vllm.renderers.hf import HfRenderer
-    from vllm.renderers.params import TokenizeParams
-
     monkeypatch.setattr(
         rbase.BaseRenderer, "_tokenize_prompt", rbase.BaseRenderer._tokenize_prompt
     )
@@ -211,9 +302,26 @@ def test_installed_wrapper_builds_its_cache_with_the_token_limit(
     assert cache._max_tokens == 64_000_000
 
 
-def test_patched_renderer_leaves_truncation_to_vllm(patched_renderer, cache_encodes):
-    from vllm.renderers.params import TokenizeParams
+def test_vllm_gets_a_copy_of_the_cached_token_ids(patched_renderer, cache_encodes):
+    """vLLM's _build_tokens_prompt copies the ids into the prompt it returns,
+    so changing that list in place (RequestState.apply_streaming_update
+    extends a streaming-input request's prompt_token_ids) leaves the cache's
+    entries, and later hits, unchanged."""
+    renderer, unpatched = patched_renderer
+    params = TokenizeParams(max_total_tokens=None)
+    first = renderer._tokenize_prompt({"prompt": _turns(1)}, params)
+    (cache,) = set(cache_encodes)
+    stored = [e.ids for e in cache._entries.values()]
+    assert all(first["prompt_token_ids"] is not ids for ids in stored)
+    first["prompt_token_ids"].extend([7, 7, 7])
+    for n in (1, 2):
+        prompt = {"prompt": _turns(n)}
+        expected = unpatched(renderer, dict(prompt), params)
+        assert renderer._tokenize_prompt(dict(prompt), params) == expected
+    assert cache.hits >= 2
 
+
+def test_patched_renderer_leaves_truncation_to_vllm(patched_renderer, cache_encodes):
     renderer, unpatched = patched_renderer
     params = TokenizeParams(max_total_tokens=None, truncate_prompt_tokens=10)
     prompt = {"prompt": _turns(1)}

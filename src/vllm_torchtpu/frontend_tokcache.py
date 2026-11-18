@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Segment-level chat message tokenization cache for OpenAI-compatible serving.
+"""Prefix tokenization cache for chat prompts in OpenAI-compatible serving.
 
-Caches tokenized message segments across multi-turn agentic conversations to
-avoid redundant re-tokenization of shared conversation prefixes. Installed by
+Caches whole tokenized prompts, each addressable by the prefixes that end at a
+``<|im_start|>`` boundary, so a multi-turn conversation reuses the token ids of
+its earlier turns and encodes only the new suffix. Installed by
 ``additional_config["tpu_frontend"]["tokenize_prefix_cache"]`` (off by
 default; see ``frontend_options``).
 """
@@ -87,12 +88,12 @@ class PrefixTokenCache:
         encode_fn,
         boundary_id: int,
         *,
-        max_entries: int = 64,
-        max_tokens: int = 16_000_000,
-        min_tokens: int = 2048,
-        verify_first: int = 8,
+        max_entries: int = MAX_ENTRIES,
+        max_tokens: int = MAX_TOKENS,
+        min_tokens: int = MIN_TOKENS,
+        verify_first: int = VERIFY_FIRST,
         verify_every: int = 0,
-        log_period_s: float = 60.0,
+        log_period_s: float = LOG_PERIOD_S,
     ):
         self._encode = encode_fn  # str -> list[int] (full, no truncation)
         self._bid = boundary_id
@@ -383,6 +384,15 @@ class PrefixTokenCache:
 _INSTALLED = False
 
 
+def _rust_backend(tokenizer):
+    """The ``tokenizers.Tokenizer`` behind a Hugging Face fast tokenizer, or
+    None (``backend_tokenizer`` is the public name, ``_tokenizer`` the
+    attribute behind it)."""
+    return getattr(tokenizer, "backend_tokenizer", None) or getattr(
+        tokenizer, "_tokenizer", None
+    )
+
+
 def _build_cache_for(
     tokenizer, max_tokens: int = MAX_TOKENS
 ) -> PrefixTokenCache | None:
@@ -391,9 +401,7 @@ def _build_cache_for(
         from tokenizers import Tokenizer
     except Exception:  # pragma: no cover
         return None
-    backend = getattr(tokenizer, "backend_tokenizer", None) or getattr(
-        tokenizer, "_tokenizer", None
-    )
+    backend = _rust_backend(tokenizer)
     if backend is None or not isinstance(backend, Tokenizer):
         logger.warning(
             "%s tokenizer %s has no Rust backend; not enabled",
@@ -436,15 +444,7 @@ def _build_cache_for(
     ):
         logger.warning("%s tokenizer safety probe failed; not enabled", _P)
         return None
-    return PrefixTokenCache(
-        encode,
-        boundary_id,
-        max_entries=MAX_ENTRIES,
-        max_tokens=max_tokens,
-        min_tokens=MIN_TOKENS,
-        verify_first=VERIFY_FIRST,
-        log_period_s=LOG_PERIOD_S,
-    )
+    return PrefixTokenCache(encode, boundary_id, max_tokens=max_tokens)
 
 
 def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
