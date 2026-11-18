@@ -25,6 +25,11 @@ row) sums them. Block b+1's tiles load while block b computes.
 Against the SparseCore gather-reduce this moves ~2-3x the routed bytes (tile
 rounding), at TensorCore HBM bandwidth, and frees the SparseCore for the
 residual all-reduces.
+
+With ``shared_down`` the block also adds a shared expert's down projection
+(its [TB, i_s] activation against e4m3 weights held in VMEM), rounded as
+fused_moe_gmm.shared_expert_mlp rounds it, so the routed sum is not written to
+HBM and read back by a separate add.
 """
 
 import functools
@@ -42,6 +47,8 @@ _CHUNK_ROWS = 256
 _TILES_PER_CHUNK = _CHUNK_ROWS // TILE_ROWS
 TOKEN_BLOCK = 256
 _VMEM_LIMIT_BYTES = 60 * 1024 * 1024
+# Output columns per shared-expert product (bounds its f32 temporary).
+_SHARED_COLS = 512
 
 
 def max_tiles(token_block: int, topk: int, num_experts: int) -> int:
@@ -51,14 +58,27 @@ def max_tiles(token_block: int, topk: int, num_experts: int) -> int:
     return -(-tiles // _TILES_PER_CHUNK) * _TILES_PER_CHUNK
 
 
-def supported(num_tokens: int, hidden: int, topk: int, num_experts: int, dtype) -> bool:
+def supported(
+    num_tokens: int,
+    hidden: int,
+    topk: int,
+    num_experts: int,
+    dtype,
+    shared_inter: int = 0,
+) -> bool:
+    """``shared_inter``: the fused shared expert's intermediate size, 0 for
+    none."""
     if dtype != jnp.bfloat16 or hidden % 128 or num_tokens % TOKEN_BLOCK:
+        return False
+    if shared_inter and (shared_inter % 128 or hidden % _SHARED_COLS):
         return False
     tiles = max_tiles(TOKEN_BLOCK, topk, num_experts)
     vmem = (
         2 * tiles * TILE_ROWS * hidden * 2  # double-buffered tiles
         + TOKEN_BLOCK * hidden * 4  # f32 accumulator
         + 2 * TOKEN_BLOCK * hidden * 2  # output blocks
+        + shared_inter * hidden  # e4m3 shared weights
+        + 2 * TOKEN_BLOCK * shared_inter * 2  # activation blocks
     )
     return vmem <= _VMEM_LIMIT_BYTES - 8 * 1024 * 1024
 
@@ -118,14 +138,19 @@ def _kernel(
     row_ref,  # VMEM [TB, k]
     w_ref,  # VMEM [TB, k]
     x_hbm,  # ANY [Mx, H]
-    out_ref,  # VMEM [TB, H]
-    buf,  # VMEM [2, maxt * 16, H]
-    acc,  # VMEM [TB, H] f32
-    sems,  # DMA [2]
-    *,
+    *refs,
     maxt: int,
     topk: int,
+    shared: bool,
 ):
+    if shared:
+        act_ref, w2s_ref, s2s_ref, *refs = refs  # [TB, i_s] bf16, [i_s, H], [1, H]
+    (
+        out_ref,  # VMEM [TB, H]
+        buf,  # VMEM [2, maxt * 16, H]
+        acc,  # VMEM [TB, H] f32
+        sems,  # DMA [2]
+    ) = refs
     b = pl.program_id(0)
     nb = pl.num_programs(0)
 
@@ -231,6 +256,17 @@ def _kernel(
     def _():
         out_ref[...] = acc[...].astype(out_ref.dtype)
 
+    if shared:
+        act = act_ref[...]
+        for c0 in range(0, hidden, _SHARED_COLS):
+            cols = slice(c0, c0 + _SHARED_COLS)
+            y = jnp.dot(act, w2s_ref[:, cols], preferred_element_type=jnp.float32)
+            y = (y.astype(jnp.bfloat16).astype(jnp.float32) * s2s_ref[:, cols]).astype(
+                jnp.bfloat16
+            )
+            routed = out_ref[:, cols].astype(jnp.float32)
+            out_ref[:, cols] = (routed + y.astype(jnp.float32)).astype(out_ref.dtype)
+
 
 @functools.partial(jax.jit, static_argnames=("topk", "interpret"))
 def tc_combine(
@@ -241,12 +277,15 @@ def tc_combine(
     group_sizes: jax.Array,
     *,
     topk: int,
+    shared_down: tuple[jax.Array, jax.Array, jax.Array] | None = None,
     interpret=False,
 ) -> jax.Array:
     """out[t] = sum_j where(valid, weights * x[pos], 0) over j < topk, f32
     accumulation, bf16 out. `x` rows [0, sum(group_sizes)) are the GMM output
     grouped by local expert (sizes `group_sizes`), tokens ascending within a
-    group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order."""
+    group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order.
+    ``shared_down`` (activation [T, i_s] bf16, w2 [i_s, H] e4m3, s2 [1, H]
+    f32) adds bf16(bf16(act @ w2) * s2) to the bf16 sum, in bf16."""
     num_tokens = pos.shape[0] // topk
     hidden = x.shape[1]
     num_experts = group_sizes.shape[0]
@@ -262,6 +301,15 @@ def tc_combine(
     w = weights.reshape(num_tokens, topk)
     if w.dtype != jnp.bfloat16:
         w = w.astype(jnp.float32)
+    shared_operands, shared_specs = (), []
+    if shared_down is not None:
+        act, w2s, s2s = shared_down
+        shared_operands = (act, w2s, s2s.astype(jnp.float32).reshape(1, hidden))
+        shared_specs = [
+            pl.BlockSpec((token_block, act.shape[1]), lambda b, *_: (b, 0)),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ]
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,
         grid=(nb,),
@@ -269,6 +317,7 @@ def tc_combine(
             pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
             pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
             pl.BlockSpec(memory_space=pl.ANY),
+            *shared_specs,
         ],
         out_specs=pl.BlockSpec((token_block, hidden), lambda b, *_: (b, 0)),
         scratch_shapes=[
@@ -278,7 +327,9 @@ def tc_combine(
         ],
     )
     combine = pl.pallas_call(
-        functools.partial(_kernel, maxt=maxt, topk=topk),
+        functools.partial(
+            _kernel, maxt=maxt, topk=topk, shared=shared_down is not None
+        ),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
@@ -292,12 +343,17 @@ def tc_combine(
     # rows are not in token order; then take the plain gather.
     return lax.cond(
         jnp.any(counts > maxt),
-        lambda: _gather_combine(x, pos, weights, valid, topk),
-        lambda: combine(tiles, counts, valid_rows, rows, w, x),
+        lambda: _gather_combine(x, pos, weights, valid, topk, shared_down),
+        lambda: combine(tiles, counts, valid_rows, rows, w, x, *shared_operands),
     )
 
 
-def _gather_combine(x, pos, weights, valid, topk):
+def _gather_combine(x, pos, weights, valid, topk, shared_down=None):
     rows = x[pos].astype(jnp.float32) * weights.astype(jnp.float32)[:, None]
     rows = jnp.where(valid[:, None], rows, 0.0)
-    return rows.reshape(-1, topk, x.shape[1]).sum(axis=1).astype(jnp.bfloat16)
+    out = rows.reshape(-1, topk, x.shape[1]).sum(axis=1).astype(jnp.bfloat16)
+    if shared_down is None:
+        return out
+    act, w2s, s2s = shared_down
+    y = jnp.matmul(act, w2s.astype(jnp.bfloat16)).astype(jnp.float32) * s2s
+    return y.astype(jnp.bfloat16) + out

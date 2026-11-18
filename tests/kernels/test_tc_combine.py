@@ -153,3 +153,37 @@ def test_supported_shapes():
     assert tc_combine.supported(4096, 6144, TOPK, 16, jnp.bfloat16)
     assert not tc_combine.supported(4100, 6144, TOPK, 16, jnp.bfloat16)
     assert not tc_combine.supported(8192, 6144, TOPK, 16, jnp.float32)
+
+
+@pytest.mark.parametrize("hidden, inter", [(512, 128), (1024, 256)])
+def test_shared_down_matches_unfused(hidden, inter):
+    """The fused shared-expert down projection equals the XLA path's
+    bf16(bf16(act @ w2) * s2) + routed (shared_expert_mlp's rounding)."""
+    num_tokens = 512
+    x, pos, w, valid, group_sizes = _routes(num_tokens, hidden, 0.5, 9, seed=3)
+    rng = np.random.default_rng(4)
+    act = jnp.asarray(rng.standard_normal((num_tokens, inter)), jnp.bfloat16)
+    w2 = jnp.asarray(rng.standard_normal((inter, hidden)) * 0.1, jnp.float8_e4m3fn)
+    s2 = jnp.asarray(rng.random((1, hidden)) + 0.5, jnp.float32)
+    args = (
+        jnp.asarray(x, jnp.bfloat16),
+        jnp.asarray(pos),
+        jnp.asarray(w, jnp.bfloat16),
+        jnp.asarray(valid),
+        jnp.asarray(group_sizes),
+    )
+    routed = tc_combine.tc_combine(*args, topk=TOPK, interpret=pltpu.InterpretParams())
+    fused = tc_combine.tc_combine(
+        *args,
+        topk=TOPK,
+        shared_down=(act, w2, s2),
+        interpret=pltpu.InterpretParams(detect_races=True),
+    )
+    y = jnp.matmul(act, w2.astype(jnp.bfloat16)).astype(jnp.float32) * s2
+    ref = y.astype(jnp.bfloat16) + routed
+    got = np.asarray(fused.astype(jnp.float32))
+    assert not np.isnan(got).any()
+    np.testing.assert_allclose(
+        got, np.asarray(ref.astype(jnp.float32)), rtol=1e-2, atol=2e-2
+    )
+    assert tc_combine.supported(8192, 6144, 4, 16, jnp.bfloat16, shared_inter=384)

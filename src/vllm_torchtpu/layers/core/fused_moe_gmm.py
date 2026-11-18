@@ -618,6 +618,11 @@ def prepare_routed_gmm_inputs(
     )
 
 
+# A shared expert's down projection still to apply: (activation [T, i_s]
+# bf16, w2 [i_s, H] e4m3, s2 [1, H] f32).
+SharedDown = tuple[jax.Array, jax.Array, jax.Array]
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -639,8 +644,11 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    shared_down: SharedDown | None = None,
 ) -> jax.Array:
-    """Run grouped GEMM for routed tokens and reduce back to tokens.
+    """Run grouped GEMM for routed tokens and reduce back to tokens, plus
+    the shared expert's down projection when ``shared_down`` is given (the
+    TensorCore combine evaluates it in the same pass).
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
@@ -727,13 +735,16 @@ def moe_gmm(
             gmm2_res = gmm2_res.at[row].set(
                 jnp.where(unwritten, 0, gmm2_res[row]).astype(gmm2_res.dtype)
             )
-        return pair_combine.pair_combine(
-            gmm2_res,
-            argsort_revert_indices,
-            topk_weights_flat,
-            valid_mask_flat,
-            topk=topk,
-        ).astype(x.dtype)
+        return _add_shared_down(
+            pair_combine.pair_combine(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                topk=topk,
+            ).astype(x.dtype),
+            shared_down,
+        )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (
@@ -771,13 +782,16 @@ def moe_gmm(
             alignment = token_block_alignment(gmm2_res.shape[-1], tpu_info)
             padded_tokens = -(-num_tokens // alignment) * alignment
             if num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3:
-                return ragged_gather_reduce_v3(
-                    gmm2_res,
-                    argsort_revert_indices,
-                    topk_weights_flat,
-                    valid_mask_flat,
-                    reduce_group_size=topk,
-                ).astype(x.dtype)
+                return _add_shared_down(
+                    ragged_gather_reduce_v3(
+                        gmm2_res,
+                        argsort_revert_indices,
+                        topk_weights_flat,
+                        valid_mask_flat,
+                        reduce_group_size=topk,
+                    ).astype(x.dtype),
+                    shared_down,
+                )
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -807,24 +821,30 @@ def moe_gmm(
                     gmm2_res.shape[1],
                     num_tokens,
                 )
-                return blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                ).astype(x.dtype)
+                return _add_shared_down(
+                    blockwise_onehot_unpermute(
+                        gmm2_res,
+                        token_indices_sorted,
+                        topk_weights_sorted,
+                        valid_count,
+                        num_tokens=num_tokens,
+                    ).astype(x.dtype),
+                    shared_down,
+                )
             # The dense combine one-hot takes the weights' dtype; the kernel
             # multiplies in the routed rows' dtype.
             if topk_weights.dtype == gmm2_res.dtype and _use_bounded_onehot(
                 num_tokens, argsort_revert_indices.size, gmm2_res
             ):
-                return bounded_onehot_combine(
-                    gmm2_res,
-                    argsort_revert_indices,
-                    jnp.where(valid_mask, topk_weights, 0),
-                    valid_count,
-                ).astype(x.dtype)
+                return _add_shared_down(
+                    bounded_onehot_combine(
+                        gmm2_res,
+                        argsort_revert_indices,
+                        jnp.where(valid_mask, topk_weights, 0),
+                        valid_count,
+                    ).astype(x.dtype),
+                    shared_down,
+                )
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -839,36 +859,66 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
             )
-            return (combine @ gmm2_res).astype(x.dtype)
-        if envs.TPU_MOE_TC_COMBINE and tc_combine.supported(
-            num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype
-        ):
-            return tc_combine.tc_combine(
+            return _add_shared_down((combine @ gmm2_res).astype(x.dtype), shared_down)
+        tc_args = (num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0])
+        if envs.TPU_MOE_TC_COMBINE and tc_combine.supported(*tc_args, gmm2_res.dtype):
+            fuse = shared_down is not None and tc_combine.supported(
+                *tc_args, gmm2_res.dtype, shared_inter=shared_down[0].shape[1]
+            )
+            return _add_shared_down(
+                tc_combine.tc_combine(
+                    gmm2_res,
+                    argsort_revert_indices,
+                    topk_weights_flat,
+                    valid_mask_flat,
+                    group_sizes,
+                    topk=topk,
+                    shared_down=shared_down if fuse else None,
+                ).astype(x.dtype),
+                None if fuse else shared_down,
+            )
+        return _add_shared_down(
+            ragged_gather_reduce(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
                 valid_mask_flat,
-                group_sizes,
-                topk=topk,
-            ).astype(x.dtype)
-        return ragged_gather_reduce(
-            gmm2_res,
-            argsort_revert_indices,
-            topk_weights_flat,
-            valid_mask_flat,
-            reduce_group_size=topk,
-        ).astype(x.dtype)
+                reduce_group_size=topk,
+            ).astype(x.dtype),
+            shared_down,
+        )
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return _add_shared_down(token_topk_hidden.sum(axis=1).astype(x.dtype), shared_down)
 
 
 # MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows.
 _SHARED_UPCAST_MIN_ROWS = 4096
+
+
+def _shared_projection(v: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
+    w = w.astype(jnp.bfloat16)
+    if v.shape[0] >= _SHARED_UPCAST_MIN_ROWS:
+        w = jax.lax.optimization_barrier(w)
+    y = jnp.matmul(v, w).astype(jnp.float32) * scale
+    return y.astype(jnp.bfloat16)
+
+
+def shared_expert_down(x: jax.Array, shared: SharedExpert) -> SharedDown:
+    """`shared`'s gate_up and activation on the bf16 tokens ``x``."""
+    gate, up = jnp.split(_shared_projection(x, shared.w1, shared.s1), 2, axis=-1)
+    act = shared_activation(gate.astype(jnp.float32), up.astype(jnp.float32))
+    return act.astype(jnp.bfloat16), shared.w2, shared.s2
+
+
+def _add_shared_down(routed: jax.Array, shared_down: SharedDown | None) -> jax.Array:
+    if shared_down is None:
+        return routed
+    return _shared_projection(*shared_down) + routed
 
 
 def shared_expert_mlp(
@@ -876,17 +926,7 @@ def shared_expert_mlp(
 ) -> jax.Array:
     """``routed`` plus `shared` on the bf16 tokens ``x``, rounded as
     SharedExpert describes."""
-
-    def projection(v, w, scale):
-        w = w.astype(jnp.bfloat16)
-        if v.shape[0] >= _SHARED_UPCAST_MIN_ROWS:
-            w = jax.lax.optimization_barrier(w)
-        y = jnp.matmul(v, w).astype(jnp.float32) * scale
-        return y.astype(jnp.bfloat16)
-
-    gate, up = jnp.split(projection(x, shared.w1, shared.s1), 2, axis=-1)
-    act = shared_activation(gate.astype(jnp.float32), up.astype(jnp.float32))
-    return projection(act.astype(jnp.bfloat16), shared.w2, shared.s2) + routed
+    return _add_shared_down(routed, shared_expert_down(x, shared))
 
 
 @functools.partial(
@@ -921,6 +961,7 @@ def fused_moe_func(
     skip_padded_tokens: bool = False,
     shared: SharedExpert | None = None,
     tp_experts: TpSlicedExperts | None = None,
+    shared_down: SharedDown | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -992,7 +1033,9 @@ def fused_moe_func(
     if shared is not None and activation != "swigluoai":
         raise NotImplementedError(f"shared experts take swigluoai, not {activation}")
     if shared is not None and not (dense_fp4 or dual):
-        routed = fused_moe_func(
+        # The routed op adds the shared expert's down projection (the
+        # TensorCore combine fuses it).
+        return fused_moe_func(
             hidden_states,
             w1,
             w2,
@@ -1010,8 +1053,8 @@ def fused_moe_func(
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            shared_down=shared_expert_down(hidden_states, shared),
         )
-        return shared_expert_mlp(hidden_states, shared, routed)
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
@@ -1030,13 +1073,16 @@ def fused_moe_func(
 
     if dual:
         logger.info_once("Selected dense fp4 decode MoE on TP-sliced experts")
-        return dense_expert_moe_fp4(
-            hidden_states,
-            *tp_experts,
-            topk_weights,
-            topk_ids,
-            activation=activation,
-            shared=shared,
+        return _add_shared_down(
+            dense_expert_moe_fp4(
+                hidden_states,
+                *tp_experts,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                shared=shared,
+            ),
+            shared_down,
         )
 
     onehot_permute = (
@@ -1073,8 +1119,11 @@ def fused_moe_func(
         logger.info_once("Selected experimental dense-expert decode MoE")
         if onehot_permute:
             hidden_states = _zero_non_finite(hidden_states)
-        return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+        return _add_shared_down(
+            dense_expert_moe(
+                hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            ),
+            shared_down,
         )
 
     # Decode: a core holds few routed rows per expert and weight streaming
@@ -1083,16 +1132,19 @@ def fused_moe_func(
     # slice).
     if dense_fp4:
         logger.info_once("Selected dense-expert fp4 decode MoE")
-        return dense_expert_moe_fp4(
-            hidden_states,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            topk_weights,
-            topk_ids,
-            activation=activation,
-            shared=shared,
+        return _add_shared_down(
+            dense_expert_moe_fp4(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                shared=shared,
+            ),
+            shared_down,
         )
 
     (
@@ -1134,5 +1186,8 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        shared_down=shared_down if padded_hidden_size == hidden_size else None,
     )
+    if padded_hidden_size != hidden_size:
+        return _add_shared_down(x[:num_tokens, :hidden_size], shared_down)
     return x[:num_tokens, :hidden_size]
