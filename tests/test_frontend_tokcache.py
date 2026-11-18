@@ -96,7 +96,7 @@ def _toy_hf_tokenizer():
 
 
 def test_installed_cache_uses_the_deployed_sizes():
-    """2048 entries and 64M tokens: what every IX prefill leg ran."""
+    """The installed cache keeps at most 2048 prompts and 64M token ids."""
     cache = tokcache_mod._build_cache_for(_toy_hf_tokenizer())
     assert cache is not None
     assert (cache._max_entries, cache._max_tokens) == (2048, 64_000_000)

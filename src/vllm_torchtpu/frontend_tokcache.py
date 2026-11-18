@@ -36,8 +36,8 @@ BOUNDARY = "<|im_start|>"
 _BOUNDARY_B = BOUNDARY.encode("utf-8")
 
 
-# Cache sizing of the installed cache. 2048 entries and 64M tokens are what
-# every prefill leg of the IX Qwen3.5 deployment ran.
+# Size limits of the installed cache: at most 2048 prompts and 64M cached
+# token ids per API server; the least recently used entries are evicted first.
 MAX_ENTRIES = 2048
 MAX_TOKENS = 64_000_000
 # Prompts shorter than this are encoded directly.
