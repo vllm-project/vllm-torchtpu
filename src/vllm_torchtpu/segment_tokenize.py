@@ -54,6 +54,16 @@ an added token could match across ``e``: that needs ``text[p:e]`` to be a
 proper prefix of an added token for some ``p <= s``, which is checked, and
 such an end is not reused. The ids before ``e`` are then those of the same
 pieces, and the rest is split from ``e`` as the full scan would.
+
+Trusted ids: before a request
+leaves the API server, vLLM checks that every prompt id is in the vocabulary
+with a ``max()`` and ``min()`` over the whole id list, ~20 us per 1,000
+tokens on the event loop. Every id this module returns comes from the
+tokenizer's own output or its added-token table, so the check cannot fail.
+The id list each patched tokenization returns is remembered by identity, and
+``validate_token_ids`` skips that one list once, while it is unchanged in
+length. Truncation, padding and multimodal processing build new lists and so
+keep the check, as do prompts sent as ids and every other tokenization path.
 """
 
 from __future__ import annotations
@@ -433,6 +443,38 @@ def _backend_of(tokenizer: Any) -> Any:
     return backend
 
 
+class TokenizerMadeIds:
+    """Prompt id lists built from the tokenizer's own ids, remembered by
+    identity until vLLM's vocabulary check takes them.
+
+    Each entry holds its list, so its id is never reused by another list while
+    the entry exists. Lists whose check never comes are dropped oldest first.
+    """
+
+    def __init__(self, capacity: int = 64):
+        self._capacity = capacity
+        self._lists: OrderedDict[int, tuple[list[int], int]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def add(self, ids: list[int]) -> None:
+        with self._lock:
+            self._lists[id(ids)] = (ids, len(ids))
+            while len(self._lists) > self._capacity:
+                self._lists.popitem(last=False)
+
+    def take(self, ids: Any) -> bool:
+        """Whether ``ids`` is a remembered list of its remembered length; forgets it."""
+        with self._lock:
+            entry = self._lists.pop(id(ids), None)
+        return entry is not None and entry[0] is ids and entry[1] == len(ids)
+
+    def __len__(self) -> int:
+        return len(self._lists)
+
+
+TOKENIZER_MADE_IDS = TokenizerMadeIds()
+
+
 # Keyed by id(tokenizer); each entry holds the tokenizer, so its id is never
 # reused by another object while the entry exists.
 _INSTANCES: dict[int, tuple[Any, SegmentTokenizer | None]] = {}
@@ -506,12 +548,27 @@ def patch_renderer_segment_tokenize() -> None:
         ):
             # Over-long prompt: keep the tokenizer's own truncation semantics.
             return orig(self, prompt, params)
-        return self._build_tokens_prompt(ids, prompt, offset_mapping=None)
+        tokens_prompt = self._build_tokens_prompt(ids, prompt, offset_mapping=None)
+        TOKENIZER_MADE_IDS.add(tokens_prompt["prompt_token_ids"])
+        return tokens_prompt
 
     cls._tokenize_prompt = _tokenize_prompt
     cls._tpu_segment_tokenize = True
+    _patch_validate_token_ids(cls)
     logger.info(
         "VLLM_TPU_SEGMENT_TOKENIZE: patched BaseRenderer._tokenize_prompt "
-        "(prefix reuse over %d recent prompts)",
+        "(prefix reuse over %d recent prompts; vocabulary check skipped for "
+        "its ids)",
         max_prompts,
     )
+
+
+def _patch_validate_token_ids(cls: Any) -> None:
+    orig = cls.validate_token_ids
+
+    def validate_token_ids(self, token_ids, *, parameter=None):
+        if TOKENIZER_MADE_IDS.take(token_ids):
+            return
+        return orig(self, token_ids, parameter=parameter)
+
+    cls.validate_token_ids = validate_token_ids
