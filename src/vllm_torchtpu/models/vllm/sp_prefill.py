@@ -39,8 +39,13 @@ import torch
 from torch import nn
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.collectives import all_to_all
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.distributed.sequence_parallel import (
+    RowExchange,
+    column,
+    gather_other_shards,
+    in_out,
+    row,
+)
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -130,11 +135,10 @@ class SequenceParallelPrefill(nn.Module):
 
     def __init__(self, backbone: nn.Module, min_tokens: int) -> None:
         super().__init__()
-        from vllm.distributed import get_pp_group, get_tp_group
+        from vllm.distributed import get_pp_group
 
-        self.group = get_tp_group()
-        self.world = self.group.world_size
-        if get_pp_group().world_size != 1 or self.world == 1:
+        self.exchange = RowExchange(backbone.norm.weight.device)
+        if get_pp_group().world_size != 1 or self.exchange.world == 1:
             raise ValueError(
                 "TPU_SP_PREFILL_MIN_TOKENS needs TP > 1 and no pipeline parallelism."
             )
@@ -143,28 +147,12 @@ class SequenceParallelPrefill(nn.Module):
                 "TPU_SP_PREFILL_MIN_TOKENS does not return auxiliary hidden states."
             )
         self.min_tokens = min_tokens
-        rank = self.group.rank_in_group
-        others = [r for r in range(self.world) if r != rank]
-        device = backbone.norm.weight.device
-
-        def index(values: list[int]) -> torch.Tensor:
-            return torch.tensor(values, dtype=torch.int32, device=device)
-
-        # Device tensors, not Python ints: every rank must compile the same
-        # program, or torch_tpu pairs their collectives wrongly.
-        self.register_buffer("rank", index([rank]), persistent=False)
-        self.register_buffer("others", index(others), persistent=False)
-        # Where destination rank d's block sits in [own, *others].
-        send_order = [
-            0 if d == rank else 1 + others.index(d) for d in range(self.world)
-        ]
-        self.register_buffer("send_order", index(send_order), persistent=False)
         self.layers = nn.ModuleList(
-            _OtherShards(layer, others) for layer in backbone.layers
+            _OtherShards(layer, self.exchange.others) for layer in backbone.layers
         )
 
     def serves(self, num_tokens: int) -> bool:
-        return num_tokens >= self.min_tokens and num_tokens % self.world == 0
+        return num_tokens >= self.min_tokens and num_tokens % self.exchange.world == 0
 
     def forward(
         self,
@@ -177,7 +165,8 @@ class SequenceParallelPrefill(nn.Module):
         # Mirrors Qwen3LLMModel.forward (no pipeline, no auxiliary states).
         if inputs_embeds is None:
             inputs_embeds = backbone.embed_input_ids(input_ids)
-        hidden_states, residual = self._own_rows(inputs_embeds), None
+        exchange = self.exchange
+        hidden_states, residual = exchange.own_rows(inputs_embeds), None
         for layer_idx, (layer, replica) in enumerate(
             zip(backbone.layers, self.layers, strict=True)
         ):
@@ -187,11 +176,11 @@ class SequenceParallelPrefill(nn.Module):
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
             ):
-                hidden_states = hidden_states + self._own_rows(
+                hidden_states = hidden_states + exchange.own_rows(
                     deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
                 )
         hidden_states, _ = backbone.norm(hidden_states, residual)
-        return self.group.all_gather(hidden_states, dim=0)
+        return exchange.group.all_gather(hidden_states, dim=0)
 
     def _layer(
         self,
@@ -209,63 +198,28 @@ class SequenceParallelPrefill(nn.Module):
         else:
             hidden_states, residual = layer.input_layernorm(hidden_states, residual)
         attn, mlp = layer.self_attn, layer.mlp
-        qkv = self._rows_to_heads(*_column(attn.qkv_proj, replica.qkv, hidden_states))
+        qkv = self.exchange.rows_to_heads(
+            *column(attn.qkv_proj, replica.qkv, hidden_states)
+        )
         q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // attn.head_dim, attn.head_dim)
         q = attn.q_norm(q_by_head).view(q.shape)
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // attn.head_dim, attn.head_dim)
         k = attn.k_norm(k_by_head).view(k.shape)
         q, k = attn.rotary_emb(positions, q, k)
-        hidden_states = _row(
-            attn.o_proj, replica.o, *self._heads_to_rows(attn.attn(q, k, v))
+        hidden_states = row(
+            attn.o_proj, replica.o, *self.exchange.heads_to_rows(attn.attn(q, k, v))
         )
         hidden_states, residual = layer.post_attention_layernorm(
             hidden_states, residual
         )
         # The MLP pairs each rank's gate-up block with its down block, in the
         # [own, *others] order they come in; no exchange, so no reordering.
-        own, rest = _column(mlp.gate_up_proj, replica.gate_up, hidden_states)
-        hidden_states = _row(
+        own, rest = column(mlp.gate_up_proj, replica.gate_up, hidden_states)
+        hidden_states = row(
             mlp.down_proj, replica.down, mlp.act_fn(own), mlp.act_fn(rest)
         )
         return hidden_states, residual
-
-    def _own_rows(self, x: torch.Tensor) -> torch.Tensor:
-        """This rank's block of the token rows."""
-        return x.unflatten(0, (self.world, -1)).index_select(0, self.rank)[0]
-
-    def _rows_to_heads(self, own: torch.Tensor, rest: torch.Tensor) -> torch.Tensor:
-        """Head groups of this rank's rows -> this rank's head group of all rows."""
-        blocks = torch.cat([own[None], rest]).index_select(0, self.send_order)
-        return all_to_all(blocks, self.group).flatten(0, 1)
-
-    def _heads_to_rows(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """This rank's head group of all rows -> every head group of its rows,
-        as (own group, the others')."""
-        blocks = all_to_all(x.unflatten(0, (self.world, -1)), self.group)
-        return blocks.index_select(0, self.rank)[0], blocks.index_select(0, self.others)
-
-
-def _in_out(linear: nn.Module) -> torch.Tensor:
-    """A linear's own weight shard as [in, out]; the TPU linear method keeps
-    most weights flipped that way."""
-    weight = linear.weight
-    return weight if getattr(linear, WEIGHT_FLIPPED_ATTR, False) else weight.t()
-
-
-def _column(
-    linear: nn.Module, rest: torch.Tensor, x: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """A column-parallel projection: [rows, out] own, [tp - 1, rows, out] rest."""
-    return torch.matmul(x, _in_out(linear)), torch.matmul(x, rest)
-
-
-def _row(
-    linear: nn.Module, rest: torch.Tensor, x_own: torch.Tensor, x_rest: torch.Tensor
-) -> torch.Tensor:
-    """A row-parallel projection of every rank's input block, summed."""
-    rest_out = torch.matmul(x_rest.transpose(0, 1).flatten(1), rest.flatten(0, 1))
-    return torch.matmul(x_own, _in_out(linear)) + rest_out
 
 
 class _OtherShards(nn.Module):
@@ -274,7 +228,6 @@ class _OtherShards(nn.Module):
 
     def __init__(self, layer: nn.Module, others: list[int]) -> None:
         super().__init__()
-        from vllm.distributed import tensor_model_parallel_all_gather
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
         def gather(linear: nn.Module) -> torch.Tensor:
@@ -285,9 +238,7 @@ class _OtherShards(nn.Module):
                     "TPU_SP_PREFILL_MIN_TOKENS supports unquantized projections "
                     f"without bias, not {linear.prefix}."
                 )
-            shard = _in_out(linear).data.contiguous()
-            every = tensor_model_parallel_all_gather(shard[None], dim=0)
-            return every[others].contiguous()
+            return gather_other_shards(in_out(linear).data, others)
 
         attn, mlp = layer.self_attn, layer.mlp
         for name, linear in (
