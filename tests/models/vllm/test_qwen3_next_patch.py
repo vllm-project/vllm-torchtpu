@@ -115,6 +115,7 @@ def restore_forwards(monkeypatch):
         "_FOLLOWS_STEP_FORM",
         patch_mod.sequence_parallel._FOLLOWS_STEP_FORM,
     )
+    monkeypatch.setattr(patch_mod.sequence_parallel, "_HAS_DRAFTER", False)
     return monkeypatch
 
 
@@ -1570,3 +1571,33 @@ def test_sp_row_decision_inside_and_outside_shape_variant_warmup(monkeypatch):
     with shape_variants.warmup():
         assert not patch_mod._rows_are_sequence_parallel(4)
         assert patch_mod._rows_are_sequence_parallel(512)
+
+
+def test_a_draft_trace_reads_a_sliced_form_until_the_draft_form_is_recorded(
+    monkeypatch,
+):
+    """The MTP drafter is compiled once outside the shape-variant warmup, so
+    its sequence-parallel decision is the last recorded step form. Without a
+    proposer that records each draft forward's form, a target step below the
+    layout's threshold would leave a replicated form behind; with a drafter
+    the threshold therefore stays 0, so every recorded form is sliced and the
+    draft slices its rows, as main's drafter does. With the record, the
+    target's small step is replicated and the draft's own record decides."""
+    sp = patch_mod.sequence_parallel
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setattr(sp, "_HAS_DRAFTER", True)
+    monkeypatch.setattr(sp, "_ACTIVE", sp._ACTIVE)
+    monkeypatch.setattr(sp, "parallel_layout", lambda parallel_config=None: (1, 8))
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(patch_mod, "_step0_gather_indices", None)
+
+    monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", False)
+    sp.set_active(sp.step_is_sequence_parallel(4))  # the runner's 4-row target step
+    assert patch_mod._rows_are_sequence_parallel(4)
+
+    monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", True)
+    sp.set_active(sp.step_is_sequence_parallel(4))
+    assert not patch_mod._rows_are_sequence_parallel(4)
+    sp.set_active(True)  # the proposer records a sliced draft forward
+    assert patch_mod._rows_are_sequence_parallel(4)

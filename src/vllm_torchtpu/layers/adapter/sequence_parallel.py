@@ -48,6 +48,17 @@ STEP_FORM_MIN_ROWS = 512
 _MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {(4, 2): 64, (1, 8): 512}
 _FOLLOWS_STEP_FORM = False
 
+# A speculative drafter is compiled apart from the model, so its forward and
+# MoE read whatever step form was recorded last. Only an MTP proposer that
+# records each draft forward's own form with set_active before running it
+# lets a draft run replicated rows; with any other, a draft would run on the
+# form of the target step before it. So for an engine with a drafter the row
+# threshold stays DEFAULT_MIN_ROWS (every sequence-parallel step sliced, the
+# draft included, as on main) until the proposer records the draft's form.
+# The proposer change that records it sets this to True.
+DRAFT_RECORDS_STEP_FORM = False
+_HAS_DRAFTER = False
+
 
 def parallel_layout(
     parallel_config: ParallelConfig | None = None,
@@ -84,12 +95,28 @@ def follows_step_form() -> bool:
     return _FOLLOWS_STEP_FORM
 
 
+def set_has_drafter(has_drafter: bool) -> None:
+    """Record whether the engine runs a speculative drafter. The platform's
+    sequence-parallel check records it in the engine process, and the runner
+    in each worker, before any compile size or step is sized."""
+    global _HAS_DRAFTER
+    _HAS_DRAFTER = bool(has_drafter)
+
+
+def gates_rows() -> bool:
+    """Whether steps below the layout's threshold run replicated: the model
+    follows each step's form, and the engine has no drafter or one whose
+    proposer records each draft forward's form (DRAFT_RECORDS_STEP_FORM)."""
+    return _FOLLOWS_STEP_FORM and (DRAFT_RECORDS_STEP_FORM or not _HAS_DRAFTER)
+
+
 def min_rows(parallel_config: ParallelConfig | None = None) -> int:
     """The row threshold for the layout of ``parallel_config``, or of this
     process's model-parallel groups when it is None: DEFAULT_MIN_ROWS until a
-    model follows each step's form, then the layout's entry or
-    STEP_FORM_MIN_ROWS."""
-    if not _FOLLOWS_STEP_FORM:
+    model follows each step's form (and, with a drafter, until its proposer
+    records each draft forward's form; see gates_rows), then the layout's
+    entry or STEP_FORM_MIN_ROWS."""
+    if not gates_rows():
         return DEFAULT_MIN_ROWS
     layout = parallel_layout(parallel_config)
     if layout is None:
