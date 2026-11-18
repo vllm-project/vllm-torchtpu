@@ -1752,7 +1752,18 @@ class ZmqShmKvConnectorBase:
                     self._coord_recv.pop(entry.uuid, None)
                     self._coord_done_recving.add(entry.req_id)
                 assert self._coord_pool is not None
-                self._coord_pool.release_slot(entry.slot_idx, entry.uuid)
+                try:
+                    self._coord_pool.release_slot(entry.slot_idx, entry.uuid)
+                except ValueError:
+                    logger.exception(
+                        "TPUConnectorWorker(%d) rank0 --> unexpected slot "
+                        "release error on pull failure req_id=%s uuid=%s "
+                        "slot=%d",
+                        self.node_id,
+                        entry.req_id,
+                        entry.uuid,
+                        entry.slot_idx,
+                    )
             entry.load_complete.set()
             logger.info(
                 "PERF D pull_complete req_id=%s uuid=%s ts=%.6f pull_ok=%s",
@@ -2647,7 +2658,16 @@ class ZmqShmKvConnectorBase:
                         continue
                     self._coord_done_sending.add(entry.req_id)
                 assert self._coord_pool is not None
-                self._coord_pool.release_slot(entry.slot_idx, uuid)
+                try:
+                    self._coord_pool.release_slot(entry.slot_idx, uuid)
+                except ValueError:
+                    logger.exception(
+                        "TPUConnectorWorker(%d) rank0 --> unexpected slot "
+                        "release error on expire uuid=%s slot=%d",
+                        self.node_id,
+                        uuid,
+                        entry.slot_idx,
+                    )
 
     # =========================================================
     # get_finished (coord mode)

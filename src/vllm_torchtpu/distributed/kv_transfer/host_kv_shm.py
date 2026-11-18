@@ -134,12 +134,13 @@ class HostKVShmPool:
         # Only rank 0 uses the free list.
         self._free: queue.Queue | None = None
         self._lock: threading.Lock | None = None
-        self._slot_owners: dict[int, object] = {}
+        self._slot_owners: dict[int, object] | None = None
         if owner:
             self._free = queue.Queue(maxsize=spec.num_slots)
             for i in range(spec.num_slots):
                 self._free.put(i)
             self._lock = threading.Lock()
+            self._slot_owners = {}
 
     # ---- mlock / munlock ----------------------------------------------
     def mlock_async(self, my_rank: int | None = None) -> threading.Thread:
@@ -286,6 +287,7 @@ class HostKVShmPool:
         assert self._owner, "acquire_slot: only rank 0 manages the free list"
         assert self._free is not None
         assert self._lock is not None
+        assert self._slot_owners is not None
         slot_owner = object() if owner is None else owner
         slot_idx = self._free.get(timeout=timeout)
         with self._lock:
@@ -302,6 +304,7 @@ class HostKVShmPool:
         assert self._owner, "release_slot: only rank 0 manages the free list"
         assert self._free is not None
         assert self._lock is not None
+        assert self._slot_owners is not None
         if owner is None:
             raise ValueError("release_slot requires a non-None owner")
         with self._lock:

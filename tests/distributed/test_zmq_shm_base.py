@@ -495,14 +495,21 @@ def _claim_slot_for_test(conn, slot_idx: int, owner: object) -> None:
     pool = conn._coord_pool
     if pool is None or pool._free is None or pool._lock is None:
         return
+    assert pool._slot_owners is not None
     with pool._lock:
-        if slot_idx in pool._free.queue:
-            pool._free.queue.remove(slot_idx)
-            pool._slot_owners[slot_idx] = owner
+        assert slot_idx in pool._free.queue, (
+            f"slot {slot_idx} is not on the free list; pass claim_slot=False "
+            "for log-only entries after draining the pool"
+        )
+        pool._free.queue.remove(slot_idx)
+        pool._slot_owners[slot_idx] = owner
 
 
-def _send_entry(conn, uuid=7, req_id="r0", slot_idx=0, num_blocks=2, ttl=60.0):
-    _claim_slot_for_test(conn, slot_idx, uuid)
+def _send_entry(
+    conn, uuid=7, req_id="r0", slot_idx=0, num_blocks=2, ttl=60.0, *, claim_slot=True
+):
+    if claim_slot:
+        _claim_slot_for_test(conn, slot_idx, uuid)
     entry = zsb._CoordSendEntry(
         req_id=req_id,
         slot_idx=slot_idx,
@@ -523,8 +530,11 @@ def _recv_entry(
     remote_host="10.0.0.2",
     remote_port=9100,
     side_port=None,
+    *,
+    claim_slot=True,
 ):
-    _claim_slot_for_test(conn, slot_idx, uuid)
+    if claim_slot:
+        _claim_slot_for_test(conn, slot_idx, uuid)
     entry = zsb._CoordRecvEntry(
         req_id=req_id,
         uuid=uuid,
@@ -1196,8 +1206,8 @@ class TestHandleNewSend:
     def test_pool_exhaustion_surfaces_done_sending(self):
         conn = _attach_runner(_make_conn(), num_slots=1)
         conn._coord_pool.acquire_slot()
-        _send_entry(conn, uuid=1, req_id="older")
-        _recv_entry(conn, uuid=2)
+        _send_entry(conn, uuid=1, req_id="older", claim_slot=False)
+        _recv_entry(conn, uuid=2, claim_slot=False)
         meta = SendMeta(uuid=42, local_block_ids=[0], expiration_time=0.0)
         conn._coord_rank0_handle_new_send("req-a", meta)
         assert conn._coord_done_sending == {"req-a"}
@@ -1472,8 +1482,8 @@ class TestHandleNewLoad:
     def test_pool_exhaustion_surfaces_done_recving(self):
         conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
         conn._coord_pool.acquire_slot()
-        _recv_entry(conn, uuid=1)
-        _send_entry(conn, uuid=2)
+        _recv_entry(conn, uuid=1, claim_slot=False)
+        _send_entry(conn, uuid=2, claim_slot=False)
         conn._coord_rank0_handle_new_load("d1", _load_meta())
         assert conn._coord_done_recving == {"d1"}
         assert 11 not in conn._coord_recv
@@ -2398,6 +2408,33 @@ class TestExpireLoop:
         conn = _attach_runner(_make_conn())
         conn._stop_event.set()
         conn._coord_rank0_expire_loop()
+
+    def test_stale_slot_release_in_expire_loop_logs_and_keeps_sweeping(self):
+        conn = _attach_runner(_make_conn())
+        # First entry's slot is NOT owned by uuid=7 (simulating a stale/corrupt
+        # owner); second entry is legitimately owned by uuid=8.
+        _send_entry(conn, uuid=7, req_id="r7", slot_idx=0, ttl=-1.0, claim_slot=False)
+        _send_entry(conn, uuid=8, req_id="r8", slot_idx=1, ttl=-1.0)
+        conn._stop_event = _ScriptedEvent([False])
+        conn._coord_rank0_expire_loop()
+        # Sweeper survived ValueError on uuid=7 and still expired & released uuid=8.
+        assert conn._coord_done_sending == {"r7", "r8"}
+        assert conn._coord_pool.released == [0, 1]
+        assert 1 in conn._coord_pool._free.queue
+
+    def test_stale_slot_release_in_failed_pull_still_sets_load_complete(self):
+        conn = _attach_runner(_make_conn(is_producer=False))
+        conn._coord_channel_executor = _InlineExecutor()
+        entry = _recv_entry(conn, uuid=11, req_id="d1", claim_slot=False)
+        sock = _FakeSocket(inbound=[[_frame(zsb._MSG_ERR)]])
+        with (
+            patch(f"{_BASE}.make_zmq_socket", return_value=sock),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
+            conn._coord_rank0_pull(entry)
+        assert not entry.pull_ok
+        assert entry.load_complete.is_set()
+        assert conn._coord_done_recving == {"d1"}
 
 
 # ---------------------------------------------------------------------------
