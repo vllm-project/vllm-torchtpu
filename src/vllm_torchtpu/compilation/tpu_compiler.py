@@ -314,6 +314,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     "vllm_torchtpu/layers/adapter/dcp_token_parallel_op.py",
     "vllm_torchtpu/layers/adapter/moe_prefill_sp.py",
+    "vllm_torchtpu/layers/adapter/mla_prefill_rows.py",
     "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The HBM-streaming LM head op.
     "vllm_torchtpu/layers/adapter/lm_head_hbm.py",

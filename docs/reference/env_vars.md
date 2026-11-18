@@ -48,7 +48,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `MOE_FUSED_EP_ENABLE_W4A8` | `False` | Enables 4-bit weight / 8-bit activation (`W4A8`) execution in the fused EP MoE kernel. |
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
-| `TPU_MOE_PREFILL_SEQUENCE_PARALLEL` | `True` | Shards the residual stream across TP around MoE blocks on prefill buckets (`>= 1024` tokens) for DeepSeek-V2 MLA + MoE models. |
+| `TPU_MOE_PREFILL_SEQUENCE_PARALLEL` | `True` | Shards the residual stream across TP around MoE blocks on prefill buckets (`>= 1024` tokens) for DeepSeek-V2 MLA + MoE models. With `TPU_DCP_PREFILL_TOKEN_PARALLEL` under query replication, each MoE layer's MLA attention block of buckets of `>= 2048` tokens (and at least `max_num_seqs` rows per rank) runs on the rank's own rows too: o_proj / W_UV shards gathered a layer ahead instead of the attention all-to-all and o_proj reduce-scatter. |
 | `TPU_MOE_PREFILL_SP_SHARED_GROUP` | `1` | Tensor-parallel subgroup size for the shared expert under `TPU_MOE_PREFILL_SEQUENCE_PARALLEL`. |
 | `TPU_MOE_PREFILL_SP_FP8_WIRE` | `True` | Uses `fp8` combine wire instead of `bfloat16` in `fused_ep_moe_v2` under `TPU_MOE_PREFILL_SEQUENCE_PARALLEL`. |
 | `TPU_ONE_ROW_ALL_REDUCE` | `True` | Exchanges a single valid decode row (`n_valid == 1`) in one round of remote copies in `moe_tp_decode` and `fp8_oproj_all_reduce`. |
