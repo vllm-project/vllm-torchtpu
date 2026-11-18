@@ -183,18 +183,39 @@ class _Input:
 
     name: str
     value: Any
-    source: Any  # torch._dynamo.source.Source, or None
+    source: Any  # torch._dynamo.source.Source, when the graph still has it
+    graph_input: bool  # one of Dynamo's graph inputs, named after its source
 
 
 def _graph_input_source(node: fx.Node) -> Any:
-    """The Dynamo source of a graph input, or None for a placeholder that is
-    not one. Dynamo records a lifted input's GraphArg under
-    ``meta["grapharg"]``, and torch's ``split_module`` copies a placeholder's
-    meta into every subgraph that takes it, while a split subgraph's
-    intermediates carry the meta of the node that computed them, which has
-    no GraphArg."""
+    """The Dynamo source recorded on a graph input, or None. Dynamo deletes
+    each placeholder's GraphArg before it calls the backend, so the graphs
+    vLLM compiles carry none; only graphs built without that step do."""
     grapharg = node.meta.get("grapharg")
     return grapharg.source if grapharg is not None else None
+
+
+def _is_graph_input(node: fx.Node) -> bool:
+    """Whether a placeholder is one of Dynamo's graph inputs, which Dynamo
+    names after their source (``l_self_..._weight_``, the size symbol
+    ``s77``), rather than a split subgraph's intermediate, which is named
+    after the parent graph's node that computed it.
+
+    torch's ``split_module`` copies a parent placeholder's meta into every
+    subgraph that takes it, and an intermediate gets the meta of the node
+    that computed it. Dynamo records a tensor input's attributes under
+    ``meta["tensor_dict"]`` and nothing computed in the graph has them; an
+    int input is the bare size symbol it is named after.
+    """
+    if node.meta.get("grapharg") is not None:
+        return True
+    value = _placeholder_value(node)
+    if isinstance(value, torch.Tensor):
+        return "tensor_dict" in node.meta
+    if isinstance(value, torch.SymInt):
+        expr = value.node.expr
+        return bool(getattr(expr, "is_Symbol", False)) and str(expr) == node.name
+    return False
 
 
 def _inputs(graph: fx.GraphModule) -> list[_Input]:
@@ -203,6 +224,7 @@ def _inputs(graph: fx.GraphModule) -> list[_Input]:
             node.name,
             _placeholder_value(node),
             _graph_input_source(node),
+            _is_graph_input(node),
         )
         for node in _placeholder_nodes(graph)
     ]
@@ -242,12 +264,8 @@ def _input_permutation(
     if len(stored) != len(current):
         return None
     identity = list(range(len(stored)))
-    named = [
-        i for i, graph_input in enumerate(stored) if graph_input.source is not None
-    ]
-    if named == [
-        i for i, graph_input in enumerate(current) if graph_input.source is not None
-    ]:
+    named = [i for i, graph_input in enumerate(stored) if graph_input.graph_input]
+    if named == [i for i, graph_input in enumerate(current) if graph_input.graph_input]:
         stored_keys = _handover_inputs(stored)
         current_keys = _handover_inputs(current)
         position = {current_keys[i]: i for i in named}
@@ -271,8 +289,10 @@ def _is_int_input(value: Any) -> bool:
 
 def _input_source(graph_input: _Input) -> str | None:
     """Where Dynamo read a graph input from (``L['positions'].size()[0]``),
-    or None for a placeholder that is not a Dynamo graph input, such as a
-    split subgraph's intermediate."""
+    when the graph records it, else None: always for a split subgraph's
+    intermediate, and for every input of the graphs vLLM compiles, whose
+    GraphArgs Dynamo has deleted (an int input's symbol still names its
+    sources, see _symbol_sources)."""
     source = graph_input.source
     return None if source is None else source.name
 
