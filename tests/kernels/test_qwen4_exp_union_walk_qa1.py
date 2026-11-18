@@ -331,6 +331,8 @@ def test_qa1_on_a_peaked_softmax(kernels):
 
 
 def _union_sizes(step, group):
+    """Each walked group's union as union_bits_plan counts it: the rows' selected ids plus each row's partial tail group
+    (``length // ratio`` when ``length % ratio``); requests start on group boundaries of the walk layout."""
     q, gate, blocks, lengths, table, pool, starts = step
     sizes = []
     st = np.asarray(starts)
@@ -338,7 +340,9 @@ def _union_sizes(step, group):
     for r in range(len(st) - 1):
         for g0 in range(st[r], st[r + 1], group):
             g1 = min(g0 + group, st[r + 1])
-            sizes.append(len({int(b) for b in bl[g0:g1].reshape(-1) if b >= 0}))
+            ids = {int(b) for b in bl[g0:g1].reshape(-1) if b >= 0}
+            ids |= {int(n) // RATIO for n in ln[g0:g1] if n > 0 and n % RATIO}
+            sizes.append(len(ids))
     return sizes
 
 
