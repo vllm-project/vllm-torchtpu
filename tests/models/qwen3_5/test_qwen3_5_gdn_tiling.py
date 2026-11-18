@@ -241,17 +241,18 @@ def _call_kernels(
 
 
 # (label, n_kq, n_v, window, sequences, tokens, SSM state, override, kernels)
-# under dynamic tiling, as the IX legs run the copy. The first is the
-# k_gdn_copy TPU case (64 verify windows, 250 tokens): its override T = 4 needed
-# 61.56 MiB of scoped VMEM against the 57.60 MiB limit, so the override now
-# stops at the ceilings' T = 2. The rest are the validation entries' shapes
-# (max-num-seqs sequences, a compiled token bucket), unchanged by the cap: the
-# DP4 x TP2 decode with its layout tile 1 and with the tiler's pick, the f32
-# state of the gates' off arm, the TP8 + DCP4 decodes at 16, 8, 3 and 1
-# sequences, and the PP8 x TP1 prefill leg with MTP 1. The last case is an
-# override of 16 at TP8, where the VMEM fit (8) is below spec_tile_cap (10).
+# under dynamic tiling, which the served Qwen3.5-397B legs enable. The first is
+# a TPU run of the copy's kernel at the DP4 x TP2 decode shape (64 verify
+# windows, 250 tokens): its override T = 4 needed 61.56 MiB of scoped VMEM
+# against the 57.60 MiB limit, so the override now stops at the ceilings' T =
+# 2. The rest are the validation entries' shapes (max-num-seqs sequences, a
+# compiled token bucket), unchanged by the cap: the DP4 x TP2 decode with its
+# layout tile 1 and with the tiler's pick, the f32 state of the gates' off arm,
+# the TP8 + DCP4 decodes at 16, 8, 3 and 1 sequences, and the PP8 x TP1 prefill
+# leg with MTP 1. The last case is an override of 16 at TP8, where the VMEM fit
+# (8) is below spec_tile_cap (10).
 _CALLS = [
-    ("k_gdn_copy_tp2_t4_c64", 8, 32, 4, 64, 250, BF16, 4, ("b2_c4_w4", "c128")),
+    ("tp2_override4_c64", 8, 32, 4, 64, 250, BF16, 4, ("b2_c4_w4", "c128")),
     ("dp4tp2_layout_tile", 8, 32, 4, 28, 112, BF16, 1, ("b1_c4_w4", "c112")),
     ("dp4tp2_pick", 8, 32, 4, 28, 112, BF16, 0, ("b2_c4_w4", "c112")),
     ("dp4tp2_f32_state", 8, 32, 4, 28, 112, F32, 1, ("b1_c4_w4", "c112")),
