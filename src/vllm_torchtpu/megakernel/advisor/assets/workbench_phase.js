@@ -443,27 +443,53 @@
       if (st) st.textContent = 'Rejected: payload lacks usable calibration measurements';
       return;
     }
+    const parsedCalls = [];
+    const isPriorSource = Boolean(obj.source && obj.source.kind === 'architectural_prior');
+    if (hasColls && !isPriorSource) {
+      for (const c of obj.collectives) {
+        if (!c || typeof c !== 'object' || typeof c.latency_us !== 'number') continue;
+        if (!Number.isFinite(c.latency_us) || c.latency_us < 0) {
+          const st = document.getElementById('wb-cal-status');
+          if (st) st.textContent = 'Rejected: invalid collective latency';
+          return;
+        }
+        const rawPath = (c.path === undefined || c.path === null) ? 'xla' : String(c.path);
+        if (rawPath !== 'xla' && rawPath !== 'in_kernel') {
+          const st = document.getElementById('wb-cal-status');
+          if (st) st.textContent = 'Rejected: invalid collective path';
+          return;
+        }
+        let meanLatencyUs = null;
+        if (c.mean_latency_us !== undefined && c.mean_latency_us !== null) {
+          if (typeof c.mean_latency_us !== 'number' ||
+              !Number.isFinite(c.mean_latency_us) || c.mean_latency_us < 0) {
+            const st = document.getElementById('wb-cal-status');
+            if (st) st.textContent = 'Rejected: invalid collective mean latency';
+            return;
+          }
+          meanLatencyUs = c.mean_latency_us;
+        }
+        const opNorm = (c.op === undefined || c.op === null)
+          ? '' : String(c.op).trim().toLowerCase().replace(/_/g, '-');
+        const grp = Math.max(2, Math.trunc(Number(c.group_size ?? 2)) || 2);
+        const nVal = Math.max(0, Math.trunc(Number(c.n ?? 1)));
+        parsedCalls.push({
+          path: rawPath,
+          op: opNorm,
+          group_size: grp,
+          latency_us: c.latency_us,
+          mean_latency_us: meanLatencyUs,
+          n: nVal
+        });
+      }
+    }
     if (hasGap) {
       const p50 = obj.launch_gap_us.p50;
       document.getElementById('ctl-launch-gap').value = String(p50);
       STATE.launchGapHiUs = typeof obj.launch_gap_us.p90 === 'number'
         ? Math.max(p50, obj.launch_gap_us.p90) : p50;
     }
-    if (hasColls) {
-      let minHop = null;
-      for (const c of obj.collectives) {
-        if (c && typeof c.latency_us === 'number') {
-          const grp = Math.max(2, parseInt(c.group_size || 2, 10));
-          const hopUs = c.latency_us / Math.max(1, Math.round(Math.log2(grp)));
-          if (minHop === null || hopUs < minHop) minHop = hopUs;
-        }
-      }
-      if (minHop !== null) {
-        const cVal = Number(minHop.toFixed(3));
-        document.getElementById('ctl-coll-hop').value = String(cVal);
-        STATE.collHopHiUs = cVal;
-      }
-    }
+    STATE.collectiveCalls = parsedCalls;
     if (hasRing) {
       const rp = obj.ring_plan;
       if (rp.dense_slots) {
@@ -586,7 +612,8 @@
       }
     }
 
-    if (!launchGapPayload) {
+    // No step event: gaps between device events are not launch gaps.
+    if (!launchGapPayload && steps.length > 0) {
       const streamSpans = new Map();
       for (const sp of spans) {
         const key = `${sp.pid || 0}:${sp.tid || 0}`;
