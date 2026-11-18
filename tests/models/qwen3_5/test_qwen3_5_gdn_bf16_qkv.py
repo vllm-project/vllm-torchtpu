@@ -177,6 +177,25 @@ def test_mode_2_falls_back_when_the_tiler_picks_a_short_chunk():
     assert ((16, DIM), jnp.dtype(jnp.bfloat16)) not in operands
 
 
+def test_the_2d_check_sees_the_chunk_clipped_to_the_batch():
+    """Five 4-token verify windows (20 tokens) clip the default 64-token chunk
+    to 20 rows, which is not a multiple of 8, so the call keeps f32 rows. Main
+    clips the chunk only in its static-tiling branch; the copy clips it before
+    the 2D check reads it."""
+    inputs = _verify_window_batch(num_seqs=5)
+    kwargs = dict(_kwargs(2, 4), mixed_tile_size=64)
+    with use_abstract_mesh(
+        AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    ):
+        jaxpr = jax.make_jaxpr(
+            lambda x: wrapper.fused_conv1d_gdn.__wrapped__(**x, **kwargs)
+        )(inputs)
+    (call,) = [e for e in jaxpr.jaxpr.eqns if e.primitive.name == "pallas_call"]
+    operands = [(tuple(v.aval.shape), jnp.dtype(v.aval.dtype)) for v in call.invars]
+    assert ((20, 1, DIM), jnp.dtype(jnp.float32)) in operands
+    assert all(dtype != jnp.bfloat16 or len(shape) != 2 for shape, dtype in operands)
+
+
 def test_mode_2_matches_mode_0_on_verify_windows():
     """W=4 verify windows at decode tile 2: bit-identical outputs and states."""
     results = {}
