@@ -230,6 +230,144 @@ def test_folded_prologue_is_bitwise_the_unfolded_call(mesh, monkeypatch, tokens)
     np.testing.assert_array_equal(outs[1], outs[0])
 
 
+
+def _routing_cases(rng, m, real):
+    """(name, ids, tw) for the routed-mode checks, rows past `real` padded the
+    way TPU_MOE_SKIP_PADDED_TOKENS leaves them (route weights 0): random
+    routes; one expert (global 5) owned by a single row; rank 7 with no
+    active expert."""
+    ids = np.stack([rng.choice(N * E, TOPK, replace=False) for _ in range(m)])
+    tw = rng.dirichlet(np.ones(TOPK), size=m)
+    tw[real:] = 0
+    one = np.where(ids == 5, 6, ids)
+    one[3, 0] = 5
+    idle = ids % (N * E - E)  # global experts 0 .. 27: rank 7 owns none
+    return [("random", ids, tw), ("one-row expert", one, tw), ("idle rank", idle, tw)]
+
+
+def _routed_outputs(mesh, tokens, real, routed_list):
+    """Each routed setting's output, as uint16, per routing case."""
+    rng = np.random.default_rng(7)
+    _, w1, w1_s, w2, w2_s, sw1, sw2, gate, _, _ = _inputs(2)
+    x = jnp.asarray(rng.normal(size=(tokens, H)), jnp.bfloat16)
+    padded = [
+        pad_shared_intermediate(_torch(sw1[r]), _torch(sw2[r]), INTER_S_PAD)
+        for r in range(N)
+    ]
+    psw1 = jnp.stack([_jax(p[0]) for p in padded])
+    psw2 = jnp.stack([_jax(p[1]) for p in padded])
+    sh, rep = NamedSharding(mesh, P("d")), NamedSharding(mesh, P())
+    rank = np.stack([np.arange(N), np.arange(N) * E], 1).astype(np.int32)
+
+    def body(routed, rank, w1, w2, w1_s, w2_s, sw1, sw2, x, gate_row, tw, ids):
+        return kmod.fused_moe_decode(
+            rank,
+            x,
+            w1[0],
+            w2[0],
+            w1_s[0][:, :, None, :],
+            w2_s[0][:, :, None, :],
+            sw1[0],
+            jnp.ones((2 * INTER_S_PAD,), jnp.float32),
+            sw2[0],
+            jnp.ones((H,), jnp.float32),
+            gate_row,
+            tw,
+            ids,
+            n_ranks=N,
+            expert_start="rank",
+            fold=True,
+            interpret=True,
+            routed=routed,
+        )[None]
+
+    out = {}
+    for name, ids, tw in _routing_cases(rng, tokens, real):
+        args = [
+            jax.device_put(rank, sh),
+            *(jax.device_put(a, sh) for a in (w1, w2, w1_s, w2_s, psw1, psw2)),
+            *(
+                jax.device_put(a, rep)
+                for a in (
+                    x,
+                    gate.reshape(1, H),
+                    jnp.asarray(tw, jnp.bfloat16),
+                    jnp.asarray(ids, jnp.int32),
+                )
+            ),
+        ]
+        out[name] = [
+            np.asarray(
+                jax.jit(
+                    jax.shard_map(
+                        functools.partial(body, routed),
+                        mesh=mesh,
+                        in_specs=(P("d"),) * 7 + (P(),) * 4,
+                        out_specs=P("d"),
+                        check_vma=False,
+                    )
+                )(*args).view(jnp.uint16)
+            )
+            for routed in routed_list
+        ]
+    return out
+
+
+@pytest.mark.parametrize("tokens, real", [(64, 64), (64, 51), (57, 57)])
+@pytest.mark.parametrize("block", [1, 8, 16])
+def test_routed_is_bitwise_the_dense_call(mesh, monkeypatch, tokens, real, block):
+    """routed=(block, 64) adds each expert's routed blocks into the same rows in
+    the same expert order as the dense call, so the output is the dense output
+    bit for bit: zero-weight padded rows, rows padded by the kernel (57 tokens),
+    an expert with one row, a rank with no active expert. One tile holds every
+    block here, so the matmuls see the dense call's row count; the CPU's dot
+    may round a row differently at another row count (see the multi-tile test),
+    and the TPU kernel bench checks bit-identity there."""
+    monkeypatch.setattr(kmod, "_vmem_capacity", lambda: 64 << 20)
+    for name, (dense, routed) in _routed_outputs(
+        mesh, tokens, real, [None, (block, 64)]
+    ).items():
+        np.testing.assert_array_equal(routed, dense, err_msg=name)
+
+
+def test_routed_multi_tile_matches_dense(mesh, monkeypatch):
+    """Tiles of 32 rows, so experts that own rows in all 8 blocks run two
+    tiles on one ring slot. Must-fail control: a wrong block or coefficient
+    shifts whole rows by O(1); the CPU's dot at 32 rows rounds a few
+    elements of a row differently from 64 rows, within a bf16 ulp."""
+    monkeypatch.setattr(kmod, "_vmem_capacity", lambda: 64 << 20)
+    for name, (dense, routed) in _routed_outputs(mesh, 64, 51, [None, (8, 32)]).items():
+        d = np.asarray(dense.view(jnp.bfloat16), np.float32)
+        r = np.asarray(routed.view(jnp.bfloat16), np.float32)
+        scale = np.abs(d).max(axis=-1, keepdims=True)
+        assert np.all(np.abs(r - d) <= scale * 2.0**-7), name
+
+
+def test_routed_block_flags_skip_padded_rows():
+    """routed_block_flags flags block b for expert e exactly when a row of b
+    has a nonzero coefficient for e; rows with all route weights 0 (padding
+    under TPU_MOE_SKIP_PADDED_TOKENS) set nothing, so a block of padded rows
+    only is never scheduled for any expert."""
+    rng = np.random.default_rng(3)
+    m, real, lanes = 208, 181, 128
+    coeff = np.zeros((m, lanes), np.float32)
+    for t in range(real):
+        coeff[t, rng.choice(64, 10, replace=False)] = rng.random(10) + 0.1
+    for block in (1, 8, 16):
+        flags = np.concatenate(
+            [np.asarray(f) for f in kmod.routed_block_flags(jnp.asarray(coeff), block)]
+        ).astype(np.int64)
+        nblk = m // block
+        got = np.array(
+            [[(flags[b // 16, e] >> (b % 16)) & 1 for e in range(lanes)] for b in range(nblk)]
+        )
+        want = (coeff.reshape(nblk, block, lanes) != 0).any(axis=1)
+        np.testing.assert_array_equal(got, want.astype(np.int64))
+        padded_only = np.arange(nblk) * block >= real
+        assert padded_only.any() and not got[padded_only].any()
+        assert got[:, 64:].sum() == 0  # lanes past the 64 experts
+
+
 @pytest.mark.parametrize("fold", [False, True])
 @pytest.mark.parametrize("h", [H, 2560])
 def test_exact_width_is_bitwise_the_sliced_output(mesh, monkeypatch, fold, h):

@@ -77,6 +77,8 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_FOLD: str = "off"
     FUSED_MOE_DECODE_EXACT_WIDTH: bool = False
     FUSED_MOE_DECODE_KERNEL_PADDING_MASK: bool = False
+    FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS: int = 0
+    FUSED_MOE_DECODE_KERNEL_ROUTED_MIN_TOKENS: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1698,6 +1700,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # both masks.
     "FUSED_MOE_DECODE_KERNEL_PADDING_MASK": env_bool(
         "FUSED_MOE_DECODE_KERNEL_PADDING_MASK"
+    ),
+    # Fused MoE decode kernel calls of at least this many (padded) rows run the
+    # TP all-reduce as a reduction over the chip mate and the two link
+    # directions (AR2D, fused_moe_decode_kernel.py `_ar2d_exchange`) instead of
+    # the all-to-all + all-gather, when the layer has 8 ranks, hidden 2560 and
+    # whole experts and the row count is a multiple of 64. Not bitwise the
+    # all-to-all's output (other summation order, ar2d_reference.py); every
+    # rank holds the same bits. 0: never.
+    "FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS": env_nonnegative_int(
+        "FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS", 0
+    ),
+    # Fused MoE decode kernel calls of at least this many (padded) rows run
+    # each active expert only over the row blocks that hold its routed rows
+    # (routed mode, fused_moe_decode_kernel.py `_kernel`), bitwise the dense
+    # output; smaller calls stay dense. Needs FUSED_MOE_DECODE_KERNEL_FOLD.
+    # 0: dense at every row count. (Came along with the AR2D port: the kernel
+    # code and scripts/bench_moe_ar2d.py use it; served gain is at 208+ rows.)
+    "FUSED_MOE_DECODE_KERNEL_ROUTED_MIN_TOKENS": env_nonnegative_int(
+        "FUSED_MOE_DECODE_KERNEL_ROUTED_MIN_TOKENS", 0
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
