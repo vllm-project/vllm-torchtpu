@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.small_collectives import common as sc_common
@@ -131,6 +132,37 @@ def test_other_layouts_leave_it_unarmed_without_the_groups_collective(
     assert op._RANK is None
     check.assert_not_called()
     fresh.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "chip,cores_per_device,armed",
+    [
+        (pltpu.ChipVersion.TPU_7X, 1, True),
+        (pltpu.ChipVersion.TPU_V5P, 2, False),
+    ],
+    ids=["tpu7x", "v5p_megacore"],
+)
+def test_the_device_info_decides_and_a_disarmed_tp_pair_is_logged(
+    monkeypatch, fresh, chip, cores_per_device, armed
+):
+    """The DP4 x TP2 layout arms on TPU7x's device info (two devices per chip)
+    without a warning; where the device info reports one device per chip the
+    op stays off and says so once, with the reported value."""
+    devices_per_chip = sc_common.devices_per_chip
+    _layout(monkeypatch, dp=4, tp=2)
+    info = pltpu.get_tpu_info_for_chip(chip, cores_per_device)
+    monkeypatch.setattr(sc_common, "devices_per_chip", devices_per_chip)
+    monkeypatch.setattr(sc_common.pltpu, "get_tpu_info", lambda: info)
+    logger = Mock(name="logger")
+    monkeypatch.setattr(small_all_reduce_op, "logger", logger)
+    op.prebuild(TOPK)
+    assert op._ARMED is armed
+    if armed:
+        logger.warning_once.assert_not_called()
+    else:
+        logger.warning_once.assert_called_once()
+        _, what, reported, tp, _ = logger.warning_once.call_args.args
+        assert (what, reported, tp) == ("The moe_lowtok fused collectives", 1, 2)
 
 
 def test_tp_groups_off_the_mesh_blocks_leave_it_unarmed(monkeypatch, fresh):

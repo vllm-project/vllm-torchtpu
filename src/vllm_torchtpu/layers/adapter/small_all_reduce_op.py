@@ -72,6 +72,10 @@ _TP_RANKS: tuple[int, ...] = ()
 TP_PAIR_FORM = "oneshot"
 _PAIR_DP_AXIS = "dp_"
 _PAIR_TP_AXIS = "tp_"
+# The TP size of those measured layouts. Arming reads the device info; this
+# only decides when a TP group the device info does not call one chip is
+# worth a warning (tp_group_is_one_chip).
+_MEASURED_TP = 2
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
 # data (see small_collectives/common.py).
 _RANK = None
@@ -161,6 +165,27 @@ def _build_tp_all_reduce(mesh, tp: int):
         output_partition_specs=spec,
         fake=fake,
     )
+
+
+def tp_group_is_one_chip(tp: int, what: str) -> bool:
+    """Whether a TP group of ``tp`` devices is one chip's devices, by the device
+    info (``sc_common.devices_per_chip``). When it is not and ``tp`` is the
+    measured TP pair, ``what`` stays off on a layout it was measured on, so
+    that is logged once with the reported value."""
+    chip_devices = sc_common.devices_per_chip()
+    if tp == chip_devices:
+        return True
+    if tp == _MEASURED_TP:
+        logger.warning_once(
+            "%s not armed: pltpu.get_tpu_info() reports %d device(s) per chip, "
+            "so a TP group of %d is not one chip's cores; the DP x TP%d layout "
+            "keeps the XLA collectives",
+            what,
+            chip_devices,
+            tp,
+            tp,
+        )
+    return False
 
 
 def _groups_on_mesh_blocks(
@@ -277,9 +302,9 @@ def prebuild(vllm_config: Any) -> None:
     assert index is not None  # build_ep_mesh found the EP group
     if (
         not tp_all_reduce
-        and tp == sc_common.devices_per_chip()
         and tp < _CORES
         and _CORES % tp == 0
+        and tp_group_is_one_chip(tp, "The TP-pair small all-reduce")
         and groups_match_mesh(index, tp)
     ):
         _TP_RANKS = tuple(int(r) for r in get_tp_group().ranks)

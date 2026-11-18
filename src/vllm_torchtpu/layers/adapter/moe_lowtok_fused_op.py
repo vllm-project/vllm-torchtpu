@@ -39,7 +39,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives
-from vllm_torchtpu.kernels.experimental.small_collectives import common as sc_common
 from vllm_torchtpu.layers.adapter import (
     sequence_parallel,
     small_all_reduce_op,
@@ -93,7 +92,9 @@ def prebuild(topk: int) -> None:
         dp * tp != cores
         or dp < 2
         or tp != fused_collectives.TP_PAIR
-        or tp != sc_common.devices_per_chip()
+        or not small_all_reduce_op.tp_group_is_one_chip(
+            tp, "The moe_lowtok fused collectives"
+        )
         or not small_all_reduce_op.groups_match_mesh(index, tp, dp)
     ):
         logger.debug(
