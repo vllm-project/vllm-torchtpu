@@ -61,12 +61,12 @@ from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 
 # Smallest bucket that takes the split (a power of two: `bucket_gate_edge`).
 MIN_TOKENS = 1024
-# Virtual pages the gather buffer holds past one max-model-len request: the
-# other requests a chunked-prefill step can carry next to it.
-EXTRA_PAGES = 4
 # Rows [0, split_rows) stay on the DCP path; a multiple of this.
 SPLIT_ROWS_ALIGN = 16
-# Gather sizes (virtual pages) below the buffer's capacity a step may take.
+# Gather sizes (virtual pages) below the buffer's capacity a step may take; the
+# buffer's capacity (`dcp_token_parallel.max_step_pages`) is always the last.
+# 44 is one max-model-len request (163840 / 4096) plus four pages: the steps of
+# a long prompt gather no more than that.
 GATHER_CAPS = (4, 8, 12, 16, 20, 24, 32, 44)
 
 
@@ -85,10 +85,15 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
     parallel = vllm_config.parallel_config
     dcp = int(parallel.decode_context_parallel_size)
     page_size = int(vllm_config.cache_config.block_size)
-    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
-    vps = page_size * dcp
-    max_model_len = int(vllm_config.model_config.max_model_len)
-    max_pages = -(-max_model_len // vps) + EXTRA_PAGES
+    scheduler = vllm_config.scheduler_config
+    max_num_seqs = int(scheduler.max_num_seqs)
+    max_pages = dcp_token_parallel.max_step_pages(
+        page_size * dcp,
+        int(vllm_config.model_config.max_model_len),
+        int(scheduler.max_num_batched_tokens),
+        max_num_seqs,
+        int(scheduler.long_prefill_token_threshold or 0),
+    )
     base_caps = GATHER_CAPS
     return dcp_token_parallel.TokenParallelLayout(
         dcp_size=dcp,
