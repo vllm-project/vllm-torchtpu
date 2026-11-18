@@ -120,6 +120,20 @@ def test_a_model_that_follows_the_form_gets_the_slice_by_default(
     assert runner._token_padding_state.get_local_valid_tokens().item() == rank_valid
 
 
+def test_an_explicit_replicated_decision_overrides_the_slice(sp_on, monkeypatch):
+    """rows_sliced=False is the caller's decision for a replicated forward of
+    a step the target would slice: other ranks' real rows must not read as
+    padding."""
+    monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setattr(tpu_runner, "get_tensor_model_parallel_rank", lambda: 1)
+    runner = _padding_runner(tp=4)
+    TPUModelRunner._token_padding_update(
+        runner, 512, num_valid_tokens=300, rows_sliced=False
+    )
+    assert _mask(runner, 512) == [i >= 300 for i in range(512)]
+    assert runner._token_padding_state.get_local_valid_tokens().item() == 300
+
+
 def test_a_small_step_of_a_model_that_follows_the_form_masks_every_row(
     sp_on, monkeypatch
 ):
