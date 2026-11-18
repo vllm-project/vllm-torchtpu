@@ -21,6 +21,13 @@ from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
 BRANCHES, HIDDEN, LOWRANK, EPS = 4, 2560, 320, 1e-6
 
 
+@pytest.fixture(autouse=True)
+def _pretranspose(monkeypatch):
+    # transpose_up_weight is a no-op unless VLLM_TPU_HC_UP_PRETRANSPOSE (or
+    # TPU_QWEN4_HC_DECODE_FUSED, which it follows) is on.
+    monkeypatch.setenv("VLLM_TPU_HC_UP_PRETRANSPOSE", "1")
+
+
 def _module(seed, hidden=HIDDEN, lowrank=LOWRANK):
     torch.manual_seed(seed)
     module = GatedResidual(

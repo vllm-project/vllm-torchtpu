@@ -5,6 +5,7 @@ Reuse the common checkpoint structure with a TPU-specific SiLU precision
 boundary; the NVIDIA model owns CUDA kernels and is not imported here.
 """
 
+import dataclasses
 import math
 import os
 from collections.abc import Callable
@@ -65,6 +66,29 @@ def prefill_full_variant() -> tuple[bool, bool]:
     return up_t, inject
 
 
+def legacy_prefill_policy() -> bool:
+    """VLLM_TPU_HC_PREFILL_TILE unset: the pre-auto prefill HC policy.
+
+    The additional-config tiles (0 when absent) apply on whole tile pairs (the
+    full mix and the combine at ``rows % (2 * tile) == 0``, the widest
+    full-mix tile whose pairs divide the rows), the ops build without the
+    hardware admission when the hardware is unknown, the SP shard aligns to
+    twice the full-mix tile and the MTP draft keeps its prefill ops: the
+    served routing of the za10q base.
+    """
+    return envs.VLLM_TPU_HC_PREFILL_TILE is None
+
+
+def _full_tile(hc, rows: int, ops) -> int | None:
+    """The full-mix tile of ``rows`` rows among ``ops`` (widest first)."""
+    if getattr(hc, "_legacy_pairs", False):
+        base = hc.prefill_full_tile
+        if not base or rows < 2 * base or rows % (2 * base):
+            return None
+        return next((tile for tile in ops if rows % (2 * tile) == 0), None)
+    return select_mix_tile(rows, ops)
+
+
 def _same_tpu_bf16(reference: torch.Tensor, *tensors: torch.Tensor) -> bool:
     return reference.device.type == "tpu" and all(
         tensor.device == reference.device and tensor.dtype == torch.bfloat16
@@ -97,9 +121,10 @@ class GatedResidual(common_hc.GatedResidual):
             raise ValueError("HC prefill up tile must be a multiple of 128")
         if prefill_norm_tile and (prefill_norm_tile < 64 or prefill_norm_tile % 64):
             raise ValueError("HC prefill norm tile must be a multiple of 64")
+        legacy = legacy_prefill_policy()
         if prefill_full_tile is None:
             tile = envs.VLLM_TPU_HC_PREFILL_TILE
-            prefill_full_tile = "auto" if tile is None else tile
+            prefill_full_tile = 0 if tile is None else tile
         prefill_full_tile = validate_hc_prefill_mode(prefill_full_tile, full_mix=True)
         if prefill_combine_tile is None:
             prefill_combine_tile = prefill_full_tile
@@ -119,6 +144,8 @@ class GatedResidual(common_hc.GatedResidual):
         self.prefill_norm_tile = prefill_norm_tile
         self.prefill_full_tile = prefill_full_tile
         self.prefill_combine_tile = prefill_combine_tile
+        # Legacy tile pairs (see legacy_prefill_policy); never with "auto".
+        self._legacy_pairs = legacy and isinstance(prefill_full_tile, int)
         wide = envs.VLLM_TPU_HC_PREFILL_WIDE_TILE
         if wide and isinstance(prefill_full_tile, int) and prefill_full_tile:
             if wide % prefill_full_tile or wide <= prefill_full_tile:
@@ -197,6 +224,10 @@ class GatedResidual(common_hc.GatedResidual):
         # Worker initialization owns the device. Unknown layout/resources keep
         # the existing Torch path; CPU construction never initializes a TPU.
         hardware = current_hc_hardware()
+        if self._legacy_pairs and hardware is not None:
+            # The za10q kernels: no static admission (it rejects the served v7x
+            # 256-row combine full mix, 65.8 MiB estimated) and a 60 MiB limit.
+            hardware = dataclasses.replace(hardware, vmem_bytes=60 << 20, admit=False)
         self._hardware = hardware
         if self.use_combine and self._combine_token_tile:
             if (
@@ -211,6 +242,10 @@ class GatedResidual(common_hc.GatedResidual):
                 )
             if supports_residual(
                 self.hc_count, self.hidden_size, self._combine_token_tile, hardware
+            ) or (
+                self._legacy_pairs
+                and self.hidden_size % 128 == 0
+                and self._combine_token_tile % 128 == 0
             ):
                 self._prefill_combine_op = build_gated_residual_op(
                     self.hc_count, self.hidden_size, self._combine_token_tile, hardware
@@ -255,6 +290,12 @@ class GatedResidual(common_hc.GatedResidual):
         so smaller SP shards stay on ROW_ALIGNMENT without padding.
         """
         tiles: list[int] = [self.prefill_up_tile, self.prefill_norm_tile]
+        if self._legacy_pairs:
+            # Whole full-mix tile pairs; the combine tile is the full-mix tile.
+            tiles.append(2 * self.prefill_full_tile)
+            if isinstance(self.prefill_combine_tile, int):
+                tiles.append(2 * self.prefill_combine_tile)
+            return math.lcm(1, *(tile for tile in tiles if tile))
         if (
             isinstance(self.prefill_full_tile, int)
             and self.prefill_full_tile
@@ -332,6 +373,11 @@ class GatedResidual(common_hc.GatedResidual):
 
         lowrank = self.input_mix_weight_down.weight.shape[0]
         eps = self.hc_norm.variance_epsilon
+        if self._legacy_pairs:
+            # The za10q base built these ops without the static VMEM admission
+            # (it rejects the served v7x 256-row combine full mix, 65.8 MiB
+            # estimated vs 64 MiB, which compiles and runs there).
+            supports_full_mix = lambda *a, **k: True  # noqa: E731
         has_variant = self._prefill_full_up_t or self._prefill_inject or up_transposed
         self._prefill_full_ops = {
             tile: (
@@ -428,7 +474,8 @@ class GatedResidual(common_hc.GatedResidual):
         module parameter order across shape-variant buckets.
         """
         if (
-            not self.use_mix
+            not envs.VLLM_TPU_HC_UP_PRETRANSPOSE
+            or not self.use_mix
             or not hasattr(self, "input_mix_weight_up")
             or self._up_transposed
         ):
@@ -456,7 +503,7 @@ class GatedResidual(common_hc.GatedResidual):
             not self._prefill_disabled
             and self.prefill_full_tile
             and self.config.hc_per_branch_norm
-            and self._hardware is not None
+            and (self._hardware is not None or self._legacy_pairs)
         ):
             self._build_prefill_full_ops(self._hardware, up_transposed=True)
 
@@ -507,7 +554,7 @@ class GatedResidual(common_hc.GatedResidual):
                 self.input_mix_weight_up.weight,
                 *extra,
             )
-            and select_mix_tile(hyper_input.shape[0], self._prefill_full_ops)
+            and _full_tile(self, hyper_input.shape[0], self._prefill_full_ops)
             is not None
         )
 
@@ -566,7 +613,7 @@ class GatedResidual(common_hc.GatedResidual):
                 return mixed, (hyper_input, injection)
             return out, (hyper_input, None)
         if not small_rows and self._use_prefill_mix(hyper_input):
-            tile = select_mix_tile(hyper_input.shape[0], self._prefill_full_ops)
+            tile = _full_tile(self, hyper_input.shape[0], self._prefill_full_ops)
             assert tile is not None
             if getattr(self, "_prefill_inject", False):
                 mixed, second = self._prefill_full_ops[tile](
@@ -623,6 +670,8 @@ class GatedResidual(common_hc.GatedResidual):
         return 2.0 * torch.sigmoid(injection.float() / self.hc_count)
 
     def _use_prefill_combine(self, block_output, hyper_input, hyper_input_normed):
+        # Legacy policy: whole tile pairs (legacy_prefill_policy).
+        pairs = 2 if getattr(self, "_legacy_pairs", False) else 1
         return (
             self.use_combine
             and self._prefill_combine_op is not None
@@ -636,8 +685,8 @@ class GatedResidual(common_hc.GatedResidual):
                 self.prefill_combine_tile != "auto"
                 or hyper_input.shape[0] >= AUTO_MIN_TOKENS
             )
-            and hyper_input.shape[0] >= self._combine_token_tile
-            and hyper_input.shape[0] % self._combine_token_tile == 0
+            and hyper_input.shape[0] >= self._combine_token_tile * pairs
+            and hyper_input.shape[0] % (self._combine_token_tile * pairs) == 0
             and _same_tpu_bf16(
                 hyper_input,
                 block_output,
@@ -712,8 +761,8 @@ class GatedResidual(common_hc.GatedResidual):
             and next_hc._use_prefill_mix(hyper_input)
             and self._use_prefill_combine(block_output, hyper_input, gate)
         ):
-            tile = select_mix_tile(
-                hyper_input.shape[0], next_hc._prefill_combine_full_ops
+            tile = _full_tile(
+                next_hc, hyper_input.shape[0], next_hc._prefill_combine_full_ops
             )
             if tile is not None:
                 mixed, second, combined = next_hc._prefill_combine_full_ops[tile](
@@ -731,6 +780,7 @@ __all__ = [
     "GroupedGemmaRMSNorm",
     "HyperConnectionBase",
     "HyperConnectionConfig",
+    "legacy_prefill_policy",
     "prefill_full_variant",
     "sparse_core_all_gather_offload",
 ]

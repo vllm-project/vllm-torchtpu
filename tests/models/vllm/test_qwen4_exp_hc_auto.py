@@ -17,6 +17,13 @@ from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
 MEASURED = HcHardware("7x", 64 << 20, 128, 16, 8, 256)
 
 
+@pytest.fixture(autouse=True)
+def _auto_policy(monkeypatch):
+    # These tests cover the hardware-aware policy; unset keeps the legacy one
+    # (tests/models/vllm/test_qwen4_exp_hc_legacy.py).
+    monkeypatch.setenv("VLLM_TPU_HC_PREFILL_TILE", "auto")
+
+
 @pytest.fixture
 def boundaries(monkeypatch):
     from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
@@ -705,6 +712,7 @@ def test_transpose_up_weight_rebuilds_full_and_combine_full_ops(
     monkeypatch.setattr(envs, "VLLM_TPU_HC_PREFILL_COMBINE_MIX", True)
     monkeypatch.setattr(envs, "VLLM_TPU_HC_PREFILL_UP_T", True)
     monkeypatch.setattr(envs, "VLLM_TPU_HC_PREFILL_INJECT", True)
+    monkeypatch.setattr(envs, "VLLM_TPU_HC_UP_PRETRANSPOSE", True)
 
     full_calls = []
     combine_calls = []
