@@ -568,8 +568,15 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    w1s_expert_second_minor=False,
+    w2s_expert_second_minor=False,
 ):
-    """Build the pallas_call and the function that invokes it."""
+    """Build the pallas_call and the function that invokes it.
+
+    `w1s_expert_second_minor` / `w2s_expert_second_minor` take that
+    per-contraction-block scale table as [blocks, G, N] rather than
+    [G, blocks, N]; an expert's table is then a strided slice.
+    """
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
@@ -985,6 +992,9 @@ def _build_fused_ep_moe_kernel(
             """The down weight slab of `expert`, into weight slot `slot`."""
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
+        def scale_table(hbm, expert, expert_second_minor):
+            return hbm.at[:, expert] if expert_second_minor else hbm.at[expert]
+
         def w1_chunk_copy(expert, slot, c):
             """Gate/up column chunk `c` of `expert`, into weight slot `slot`."""
             assert w1c_sems is not None
@@ -1003,11 +1013,13 @@ def _build_fused_ep_moe_kernel(
 
         def w1s_copy(expert, slot):
             assert w1s_hbm is not None
-            return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
+            table = scale_table(w1s_hbm, expert, w1s_expert_second_minor)
+            return _slot_copy(table, w1s_vm, w1s_sems, slot)
 
         def w2s_copy(expert, slot):
             assert w2s_hbm is not None
-            return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
+            table = scale_table(w2s_hbm, expert, w2s_expert_second_minor)
+            return _slot_copy(table, w2s_vm, w2s_sems, slot)
 
         def weight_starts(expert, slot, scale_slot=None):
             """Start every buffer slot `slot` holds for `expert`.
@@ -2194,11 +2206,17 @@ def _build_fused_ep_moe_kernel(
         bias_tag = ("_w13bias" if has_w1_bias else "") + (
             "_w2bias" if has_w2_bias else ""
         )
+        # A scale table read expert-second-minor is named by its layout,
+        # {2,0,1}, so the two addressings are told apart in a profile.
+        scale_tag = ("_w13s201" if w1s_expert_second_minor else "") + (
+            "_w2s201" if w2s_expert_second_minor else ""
+        )
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
+            f"{scale_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
         )
         return pl.pallas_call(

@@ -23,6 +23,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_output_test_utils import (
+    _assert_same_logprobs_lists,
+    _blocking_logprobs_lists,
+    _sample_tokens_runner,
+)
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -75,6 +80,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
+    AsyncTPUModelRunnerOutput,
 )
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
@@ -83,7 +89,11 @@ def _warmup_requests():
     return defaultdict(lambda: SimpleNamespace(output_token_ids=[]))
 
 
-def test_idle_dp_rank_encodes_before_decoder_pairing():
+@pytest.mark.parametrize("pp_is_last", [True, False])
+def test_idle_dp_rank_encodes_before_decoder_pairing(pp_is_last):
+    """Encoder, target forwards, the prompt-logprob logits calls (on the last
+    pipeline stage only), then draft forwards: the order busy engines run them
+    in."""
     order = []
     runner = SimpleNamespace(
         _is_dspark_pd_producer=False,
@@ -94,10 +104,14 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
         _async_drafter=SimpleNamespace(
             run_dp_dummy_draft=lambda chunks: order.append(("draft", chunks))
         ),
+        _dp_prompt_logprob_calls=lambda bucket, chunks: 3,
+        _dp_prompt_logprob_dummies=lambda n, bucket: order.append(("logits", n)),
+        _pp_is_last=pp_is_last,
     )
     TPUModelRunner._run_dp_idle_pairing(runner, 8, 2)
     assert runner._dp_target_bucket == 8
-    assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
+    logits = [("logits", 3)] if pp_is_last else []
+    assert order == ["encoder", ("decoder", 8), ("decoder", 8), *logits, ("draft", 2)]
 
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
@@ -828,6 +842,9 @@ def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
             _async_drafter=MagicMock(),
             speculative_config=_spec(),
             drafter=None,
+            _dp_prompt_logprob_calls=lambda bucket, chunks: 0,
+            _dp_prompt_logprob_dummies=lambda num_calls, bucket: None,
+            _pp_is_last=True,
         )
 
     middle = runner(False)
@@ -3799,6 +3816,119 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     assert not (flat_logits.float().gather(-1, skip.long()) >= fifth).all()
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("max_logprobs", [None, 0, 3])
+def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
+    monkeypatch, max_logprobs, async_scheduling
+):
+    """Each decode chunk's gathered logprobs ride the async output copy as one
+    chunk with a row per real request, in chunk order, and the step's
+    logprobs equal what the former blocking per-step copy built from the same
+    device tensors, for two decode chunks with padded rows and a discarded
+    request. Without logprobs requested, nothing is gathered and the output's
+    logprobs stay None. With async scheduling, sample_tokens returns before
+    anything waits on the copy, and get_output() then returns the tokens and
+    logprobs of the synchronous step."""
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tpu_runner, "has_kv_transfer_group", lambda: False, raising=False
+    )
+    captured = []
+    from_device_chunks = tpu_runner.AsyncTPUCopyState.from_device_chunks
+
+    def capture_from_device_chunks(*args, **kwargs):
+        captured.append(kwargs.get("logprobs"))
+        return from_device_chunks(*args, **kwargs)
+
+    monkeypatch.setattr(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        capture_from_device_chunks,
+    )
+    g = torch.Generator().manual_seed(0)
+    logits_list = [torch.randn(4, 64, generator=g), torch.randn(4, 64, generator=g)]
+    num_reqs_list = [4, 2]
+
+    gathered = []
+
+    def run(async_scheduling):
+        captured.clear()
+        gathered.clear()
+        runner = _sample_tokens_runner(
+            logits_list,
+            num_reqs_list,
+            scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+            model_config=SimpleNamespace(max_logprobs=max_logprobs),
+            # Temperature 0: every row samples its argmax, whatever the noise.
+            _build_padded_sampling_params=lambda start, end, logits: (
+                torch.zeros((logits.shape[0], 1)),
+                torch.zeros((logits.shape[0], 1), dtype=torch.int32),
+                torch.ones((logits.shape[0], 1)),
+            ),
+            _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_applies_topk_topp=lambda: False,
+        )
+        runner.input_batch.max_num_logprobs = max_logprobs
+        runner.input_batch.all_greedy = False
+        # A partial prefill: its token is discarded.
+        runner.requests["r1"].num_tokens = 2
+        runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+        runner.sample_from_logits_func = (
+            TPUModelRunner.sample_from_logits.__wrapped__.__get__(runner)
+        )
+        gather_logprobs = TPUModelRunner.gather_logprobs.__wrapped__.__get__(runner)
+
+        def recording_gather_logprobs(*args, **kwargs):
+            gathered.append(gather_logprobs(*args, **kwargs))
+            return gathered[-1]
+
+        runner.gather_logprobs = recording_gather_logprobs
+        return TPUModelRunner.sample_tokens(runner, None)
+
+    deferred = run(async_scheduling)
+    if async_scheduling:
+        # Nothing has waited on the copy yet; get_output() does.
+        assert isinstance(deferred, AsyncTPUModelRunnerOutput)
+        copy_state = deferred.copy_state
+        assert not copy_state.completed
+        assert copy_state.copy_ready_event.synchronized == 0
+        deferred = deferred.get_output()
+        assert copy_state.completed
+        assert copy_state.copy_ready_event.synchronized == 1
+    argmax = [
+        [int(t)]
+        for logits, n in zip(logits_list, num_reqs_list)
+        for t in logits[:n].argmax(dim=-1)
+    ]
+    argmax[1] = []  # r1's token is discarded.
+    assert deferred.sampled_token_ids == argmax
+    (chunks,) = captured
+    if max_logprobs is None:
+        assert chunks == [] and gathered == []
+        assert deferred.logprobs is None
+    else:
+        # The copied chunks are the gathered device tensors, with one row
+        # start per real request, in chunk order.
+        assert len(chunks) == len(gathered) == len(num_reqs_list)
+        for chunk, tensors, n in zip(chunks, gathered, num_reqs_list):
+            assert chunk.tensors is tensors
+            assert np.array_equal(chunk.row_starts, np.arange(n))
+        assert deferred.logprobs.logprob_token_ids.shape == (6, max_logprobs + 1)
+        _assert_same_logprobs_lists(
+            deferred.logprobs, _blocking_logprobs_lists(zip(gathered, num_reqs_list))
+        )
+    if async_scheduling:
+        synchronous = run(async_scheduling=False)
+        assert deferred.sampled_token_ids == synchronous.sampled_token_ids
+        if max_logprobs is None:
+            assert synchronous.logprobs is None
+        else:
+            _assert_same_logprobs_lists(deferred.logprobs, synchronous.logprobs)
+
+
 def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     """All TPUModelRunner call sites into sample_from_logits_func must draw
     uniform random noise `u` in float32 even when logits are bfloat16."""
@@ -3878,79 +4008,20 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
 
     # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
     for spec_method in (None, "ngram"):
-        scheduler_output = SimpleNamespace(
-            num_scheduled_tokens={"r0": 1, "r1": 1},
-            finished_req_ids=set(),
-            has_structured_output_requests=False,
-        )
-        runner = SimpleNamespace(
-            _pp_handoff=None,
-            _dp_step_other_decode=False,
-            num_prompt_logprobs={},
-            execute_model_state=SimpleNamespace(
-                scheduler_output=scheduler_output,
-                draft_chunks=[],
-                logits_list=[bf16_logits],
-                num_reqs_list=[2],
-                spec_decode_metadata_list=[None],
-                mamba_state_indices_list=None,
-                mamba_boundary_plans=None,
-                pooler_output_list=[],
-                top_tokens=False,
-                kv_save_nan_check=None,
-                prompt_logprobs_chunks=[],
-            ),
-            input_batch=SimpleNamespace(
-                max_num_logprobs=None,
-                num_reqs=2,
-                req_ids=["r0", "r1"],
-                req_id_to_index={"r0": 0, "r1": 1},
-                all_greedy=False,
-                num_tokens_no_spec=[1, 1],
-                token_ids_cpu=np.zeros((2, 8), dtype=np.int32),
-            ),
-            requests={
-                "r0": SimpleNamespace(
-                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
-                ),
-                "r1": SimpleNamespace(
-                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
-                ),
-            },
+        runner = _sample_tokens_runner(
+            [bf16_logits],
+            [2],
             speculative_config=(
                 None
                 if spec_method is None
                 else SimpleNamespace(method=spec_method, num_speculative_tokens=1)
             ),
-            scheduler_config=SimpleNamespace(async_scheduling=False),
-            _is_async_drafter=False,
-            _is_dspark_pd_producer=False,
-            _fence_spec_kv_under_token_copy=False,
-            _min_tokens_batch_state=lambda: {},
-            _adaptive_verification=None,
-            is_pooling_model=False,
-            drafter=SimpleNamespace(),
-            spec_decode_manager=SimpleNamespace(
-                propose_draft_token_ids=lambda **kw: None
-            ),
-            _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
             _sampler_applies_topk_topp=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
-            _update_mamba_slot_read_offsets=lambda *_args: None,
-            _update_num_xla_graphs=lambda *_args: None,
-            _stage_timing=MagicMock(),
         )
-        runner._stage_timing.take_samples.return_value = ([], [])
-        for name in (
-            "_sample_chunk_logits",
-            "_sample_plain_chunk",
-            "maybe_wait_for_kv_save",
-            "get_finished_kv_transfers",
-            "_build_kv_connector_output",
-        ):
-            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        runner.input_batch.all_greedy = False
 
         TPUModelRunner.sample_tokens(runner, None)
 

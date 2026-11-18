@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_output_test_utils import _host_copy_state
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
@@ -142,15 +143,6 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     return runner
 
 
-def _host_copy(chunks, lengths, spec_logprobs=None):
-    return AsyncTPUCopyState(
-        chunks_cpu=chunks,
-        chunk_real_lens=lengths,
-        copy_ready_event=MagicMock(),
-        spec_logprobs=spec_logprobs,
-    )
-
-
 @pytest.mark.parametrize(
     "method,is_async,verify",
     [
@@ -187,7 +179,9 @@ def test_device_drafter_runs_before_kv_connector_save(
             "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
             return_value=connector,
         ),
-        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
+        patch.object(
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
     ):
         output = TPUModelRunner.sample_tokens(runner, None)
 
@@ -234,8 +228,8 @@ def test_spec_kv_fence_runs_after_drafter_before_connector_save(is_async):
         assert wait is False
         events.append("fence")
 
-    def host_copy(chunks, lengths, spec_logprobs=None):
-        state = _host_copy(chunks, lengths, spec_logprobs)
+    def host_copy(chunks, lengths, **kwargs):
+        state = _host_copy_state(chunks, lengths, **kwargs)
         state.fence_pending_device_work = lambda: events.append("rearm")
         return state
 

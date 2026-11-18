@@ -107,6 +107,14 @@ def _prebuild(
 
 
 @pytest.fixture(autouse=True)
+def _default_scale_layouts():
+    """Every scale table here gets the default layout unless a test says
+    otherwise: torch_tpu's layout query needs a TPU."""
+    with patch.object(bridge, "_default_scale_layout", return_value=[2, 1, 0]) as query:
+        yield query
+
+
+@pytest.fixture(autouse=True)
 def _armed():
     """Every test here runs as if the operator asked for the kernel."""
     with (
@@ -134,6 +142,68 @@ def test_native_replica_groups_reach_prebuilt_op():
         == "op"
     )
     assert seen[0]["token_replica_groups"] == groups
+
+
+@pytest.mark.parametrize(
+    "w1_minor,w2_minor", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_fp4_scale_layouts_reach_prebuilt_op(
+    _default_scale_layouts, w1_minor, w2_minor
+):
+    # Each table is read in the layout torch_tpu gives its own [E, blocks, N]
+    # shape: w13 has 2 blocks here and w2 has 4.
+    def layout(shape):
+        minor = w1_minor if shape[1] == 2 else w2_minor
+        return [2, 0, 1] if minor else [2, 1, 0]
+
+    _default_scale_layouts.side_effect = layout
+    seen = []
+    assert (
+        _prebuild(
+            _fp4_layer(hidden=1024, inter=2048),
+            weight_format="fp4",
+            rhs_qb=512,
+            build_op=lambda *args, **kw: seen.append(kw) or "op",
+        )
+        == "op"
+    )
+    queried = {c.args[0] for c in _default_scale_layouts.call_args_list}
+    assert queried == {(1, 2, 4096), (1, 4, 1024)}
+    assert seen[0]["w1_scales_expert_second_minor"] is w1_minor
+    assert seen[0]["w2_scales_expert_second_minor"] is w2_minor
+
+
+def test_fp8_never_reads_scales_expert_second_minor(_default_scale_layouts):
+    _default_scale_layouts.return_value = [2, 0, 1]
+    seen = []
+    assert (
+        _prebuild(_layer(), build_op=lambda *args, **kw: seen.append(kw) or "op")
+        == "op"
+    )
+    _default_scale_layouts.assert_not_called()
+    assert seen[0]["w1_scales_expert_second_minor"] is False
+    assert seen[0]["w2_scales_expert_second_minor"] is False
+
+
+@pytest.mark.parametrize(
+    "staged,expected,warns",
+    [
+        ([2, 0, 1], [2, 0, 1], False),
+        ([2, 1, 0], [2, 1, 0], False),
+        ([2, 1, 0], [2, 0, 1], True),
+        ([2, 0, 1], [2, 1, 0], True),
+    ],
+)
+def test_staged_scale_layout_mismatch_warns(
+    _default_scale_layouts, staged, expected, warns
+):
+    _default_scale_layouts.return_value = expected
+    with (
+        patch.object(bridge, "_staged_scale_layout", return_value=staged),
+        patch.object(bridge.logger, "warning_once") as warning,
+    ):
+        bridge._check_staged_scale_layouts([torch.ones(24, 14, 256)])
+    assert warning.called is warns
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True])
@@ -180,9 +250,11 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         dict(scoring_fn="sigmoid" if scoring_fn == "softmax" else "softmax"),
         dict(has_score_bias=not has_bias),
         dict(routed_scaling_factor=scale + 1.0),
+        dict(w1_scales_expert_second_minor=True),
+        dict(w2_scales_expert_second_minor=True),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
-    assert len(closures) == 5
+    assert len(closures) == 7
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
     operands = (
@@ -202,6 +274,8 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
     assert forwarded["scoring_fn"] == scoring_fn
     assert forwarded["routed_scaling_factor"] == scale
     assert forwarded["sharded_plan"] is sharded_plan
+    assert forwarded["w1_scales_expert_second_minor"] is False
+    assert forwarded["w2_scales_expert_second_minor"] is False
     if has_bias:
         np.testing.assert_array_equal(forwarded["score_bias"], bias)
         assert forwarded["score_bias"].dtype == jnp.float32

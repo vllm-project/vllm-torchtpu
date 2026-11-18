@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_output_test_utils import _host_copy_state
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
@@ -245,6 +246,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _reorder_batch_for_rpa=lambda _so: (0, 0),
         _count_input_chunks=lambda _so: (2, 1),
         _dp_coordinated_step=lambda *_args, **_kwargs: (2, 3),
+        _dp_local_prompt_logprob_rows=lambda _so: 0,
+        _dp_step_prompt_logprob_rows=0,
         _dp_num_tokens_across_dp=lambda _n: None,
         supports_mm_inputs=False,
         phase_based_profiler=None,
@@ -369,14 +372,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             side_effect=lambda *_a, **_kw: contextlib.nullcontext(),
         ),
         patch.object(
-            AsyncTPUCopyState,
-            "from_device_chunks",
-            side_effect=lambda chunks, lengths, spec_logprobs=None: AsyncTPUCopyState(
-                chunks_cpu=chunks,
-                chunk_real_lens=lengths,
-                copy_ready_event=MagicMock(),
-                spec_logprobs=spec_logprobs,
-            ),
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
         ),
     ):
         assert runner.execute_model(scheduler_output) is None

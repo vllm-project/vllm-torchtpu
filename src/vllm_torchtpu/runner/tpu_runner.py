@@ -81,7 +81,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
-    LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
 )
@@ -205,7 +204,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
-    SpecLogprobsChunk,
+    LogprobsChunk,
 )
 from vllm_torchtpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
@@ -968,6 +967,8 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
         self._dp_step_has_encoder_inputs = False
+        # The DP-wide maximum of the prompt rows an engine scores this step.
+        self._dp_step_prompt_logprob_rows = 0
         # Whether another DP rank ran a decode this step; SrptPrefillScheduler
         # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
         self._dp_step_other_decode = False
@@ -4136,9 +4137,11 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
+        local_prompt_logprob_rows: int = 0,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._dp_step_other_decode = False
+        self._dp_step_prompt_logprob_rows = 0
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -4159,6 +4162,7 @@ class TPUModelRunner(GPUModelRunner):
                 # tell under a MAX reduction whether another one decodes.
                 int(local_any_decode) * (dp_rank + 1),
                 int(local_any_decode) * (dp_size - dp_rank),
+                int(local_prompt_logprob_rows),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -4173,6 +4177,7 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
+        self._dp_step_prompt_logprob_rows = int(t[6].item())
         highest, lowest = int(t[4].item()) - 1, dp_size - int(t[5].item())
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
@@ -4262,6 +4267,11 @@ class TPUModelRunner(GPUModelRunner):
         # Phase 1: all TARGET dummy forwards.
         for _ in range(num_chunks):
             self._run_dp_dummy_chunk(bucket)
+        if self._pp_is_last:
+            # Only the last pipeline stage scores prompt rows.
+            self._dp_prompt_logprob_dummies(
+                self._dp_prompt_logprob_calls(bucket, num_chunks), bucket
+            )
         # Phase 2: pair the context updates or draft forwards on drafter workers.
         if num_chunks > 0 and self._is_async_drafter:
             if self._is_dspark_pd_producer:
@@ -4341,6 +4351,9 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             local_any_decode=self._any_decode(scheduler_output),
+            local_prompt_logprob_rows=self._dp_local_prompt_logprob_rows(
+                scheduler_output
+            ),
         )
         self._dp_step_num_chunks = target_num_chunks
         readmitted = self._readmit_trimmed_drafts(
@@ -4426,7 +4439,9 @@ class TPUModelRunner(GPUModelRunner):
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         mamba_boundary_plans: list[spec_boundary_state.SpecBoundaryPlan | None] = []
         draft_chunks: list[DraftChunkInputs] = []
-        prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = []
+        prompt_logprobs_chunks: list[
+            tuple[prompt_logprobs.PromptLogprobsChunk, torch.Tensor]
+        ] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
 
@@ -4695,10 +4710,10 @@ class TPUModelRunner(GPUModelRunner):
                 if self.num_prompt_logprobs:
                     assert isinstance(hidden_states, torch.Tensor)
                     prompt_chunk = self._prompt_logprobs_chunk(
-                        scheduler_output, hidden_states, start_index, num_reqs
+                        scheduler_output, start_index, num_reqs
                     )
                     if prompt_chunk is not None:
-                        prompt_logprobs_chunks.append(prompt_chunk)
+                        prompt_logprobs_chunks.append((prompt_chunk, hidden_states))
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -4757,6 +4772,8 @@ class TPUModelRunner(GPUModelRunner):
             self._pp_pending_scheduler_output = scheduler_output
             self._pp_pending_kv_save_nan_check = nan_check
             return None
+        if prompt_logprobs_chunks or self._dp_step_prompt_logprob_rows:
+            self._score_prompt_logprobs(prompt_logprobs_chunks)
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=logits_list,
@@ -4768,7 +4785,7 @@ class TPUModelRunner(GPUModelRunner):
             mamba_boundary_plans=mamba_boundary_plans,
             top_tokens=top_tokens,
             kv_save_nan_check=nan_check,
-            prompt_logprobs_chunks=prompt_logprobs_chunks,
+            prompt_logprobs_chunks=[chunk for chunk, _ in prompt_logprobs_chunks],
         )
 
         if self.is_pooling_model:
@@ -4780,7 +4797,6 @@ class TPUModelRunner(GPUModelRunner):
         it can. Read from the PCP manager when USE_TPU_PCP_MANAGER replaces the
         sequence layout planner."""
         return prompt_logprobs.unsupported_reason(
-            dp_vocab_logits=self._dp_vocab_logits,
             selected_logits_hidden_states=(
                 self.get_pcp_planner().uses_selected_logits_hidden_states
             ),
@@ -4790,16 +4806,11 @@ class TPUModelRunner(GPUModelRunner):
     def _prompt_logprobs_chunk(
         self,
         scheduler_output: "SchedulerOutput",
-        hidden_states: torch.Tensor,
         start_index: int,
         num_reqs: int,
     ) -> prompt_logprobs.PromptLogprobsChunk | None:
-        """Score the prompt rows of this chunk's prompt-logprob requests.
-
-        The rows go through compute_selected_logits and gather_logprobs in
-        slices of at most the request bucket both precompile for this token
-        bucket, so a step with prompt logprobs compiles nothing new.
-        """
+        """Plan the prompt rows of this chunk's prompt-logprob requests;
+        _score_prompt_logprobs scores them after the chunk loop."""
         if self._prompt_logprobs_unsupported is not None:
             # TODO: support them in these configurations. Skipping returns the
             # request without prompt logprobs, as before they were computed,
@@ -4819,28 +4830,118 @@ class TPUModelRunner(GPUModelRunner):
             self.requests,
             self.num_prompt_logprobs,
         )
-        if not spans:
-            return None
-        chunk = prompt_logprobs.PromptLogprobsChunk(spans)
-        rows, targets = prompt_logprobs.rows_and_targets(spans, self.requests)
-        max_slice = _get_padded_num_reqs_with_upper_limit(
-            min(hidden_states.shape[0], self.max_num_reqs), self.max_num_reqs
+        return prompt_logprobs.PromptLogprobsChunk(spans) if spans else None
+
+    def _score_prompt_logprobs(
+        self,
+        chunks: list[tuple[prompt_logprobs.PromptLogprobsChunk, torch.Tensor]],
+    ) -> None:
+        """Score the step's planned prompt rows, each chunk's from its hidden
+        states, through compute_selected_logits and gather_logprobs in calls of
+        at most _prompt_logprob_rows_per_call rows.
+
+        Under DP lockstep (DP with expert parallelism) every DP engine must
+        issue the same logits collectives each step (see _dummy_run), at the
+        same shapes under TPU_DP_VOCAB_PARALLEL, so every engine runs the same
+        number of these calls, after its chunks: this engine pads its own with
+        dummy calls up to the DP-wide bound, and idle engines run the bound in
+        _run_dp_idle_pairing.
+        """
+        lockstep = self._dp_lockstep_enabled()
+        num_calls = 0
+        for chunk, hidden_states in chunks:
+            rows, targets = prompt_logprobs.rows_and_targets(chunk.spans, self.requests)
+            rows_per_call = self._prompt_logprob_rows_per_call(hidden_states.shape[0])
+            for lo in range(0, rows.shape[0], rows_per_call):
+                n = min(rows_per_call, rows.shape[0] - lo)
+                # Lockstep engines must match shapes; otherwise a partial call
+                # pads only to its own request bucket.
+                padded = (
+                    rows_per_call
+                    if lockstep
+                    else _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)
+                )
+                indices = np.zeros(padded, dtype=np.int32)
+                indices[:n] = rows[lo : lo + n]
+                target_ids = np.zeros((padded, 1), dtype=np.int64)
+                target_ids[:n, 0] = targets[lo : lo + n]
+                logits = self.compute_selected_logits(
+                    hidden_states, torch.from_numpy(indices).to(self.device)
+                )
+                tensors = self.gather_logprobs(
+                    logits, torch.from_numpy(target_ids).to(self.device)
+                )
+                chunk.slices.append((tensors, n))
+                num_calls += 1
+        if lockstep:
+            bucket = self._dp_target_bucket
+            assert bucket is not None
+            # Every chunk is raised to the DP-wide bucket, so every engine's
+            # calls have the same shapes.
+            assert all(hidden.shape[0] == bucket for _, hidden in chunks)
+            bound = self._dp_prompt_logprob_calls(bucket, self._dp_step_num_chunks)
+            assert num_calls <= bound, (num_calls, bound)
+            self._dp_prompt_logprob_dummies(bound - num_calls, bucket)
+
+    def _prompt_logprob_rows_per_call(self, num_tokens: int) -> int:
+        """The prompt rows one logits call scores in a chunk of `num_tokens`
+        padded tokens: the largest request bucket compute_selected_logits is
+        precompiled for at that token bucket."""
+        return _get_padded_num_reqs_with_upper_limit(
+            min(num_tokens, self.max_num_reqs), self.max_num_reqs
         )
-        for lo in range(0, rows.shape[0], max_slice):
-            n = min(max_slice, rows.shape[0] - lo)
-            padded = _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)
-            indices = np.zeros(padded, dtype=np.int32)
-            indices[:n] = rows[lo : lo + n]
-            target_ids = np.zeros((padded, 1), dtype=np.int64)
-            target_ids[:n, 0] = targets[lo : lo + n]
-            logits = self.compute_selected_logits(
-                hidden_states, torch.from_numpy(indices).to(self.device)
-            )
-            tensors = self.gather_logprobs(
-                logits, torch.from_numpy(target_ids).to(self.device)
-            )
-            chunk.slices.append((tensors, n))
-        return chunk
+
+    def _dp_local_prompt_logprob_rows(self, scheduler_output: "SchedulerOutput") -> int:
+        """The prompt rows this engine scores this step, for the DP-wide bound
+        under DP lockstep; 0 without it and on stages before the last, which
+        score none."""
+        if not (
+            self._dp_lockstep_enabled()
+            and self._pp_is_last
+            and self.num_prompt_logprobs
+            and self._prompt_logprobs_unsupported is None
+        ):
+            return 0
+        num_reqs = self.input_batch.num_reqs
+        # Only the row count matters here, and it does not depend on where the
+        # rows sit in the chunk, so all-zero offsets (query_start_loc) will do.
+        spans = prompt_logprobs.plan_chunk(
+            cast(list[str], self.input_batch.req_ids[:num_reqs]),
+            np.zeros(num_reqs + 1, dtype=np.int32),
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            scheduler_output.num_scheduled_tokens,
+            self.requests,
+            self.num_prompt_logprobs,
+        )
+        return sum(span.num_rows for span in spans)
+
+    def _dp_prompt_logprob_calls(self, bucket: int, num_chunks: int) -> int:
+        """The prompt-logprob logits calls every DP engine runs this step under
+        DP lockstep: no engine needs more for the DP-wide maximum of prompt rows
+        that _dp_coordinated_step all-reduces."""
+        return prompt_logprobs.max_logits_calls(
+            self._dp_step_prompt_logprob_rows,
+            self._prompt_logprob_rows_per_call(bucket),
+            num_chunks,
+        )
+
+    def _dp_prompt_logprob_dummies(self, num_calls: int, bucket: int) -> None:
+        """Run `num_calls` dummy prompt-logprob logits calls at the DP-wide
+        bucket, pairing with other engines' real ones."""
+        if num_calls == 0:
+            return
+        hidden_states = torch.empty(
+            (bucket, self.model_config.get_hidden_size()),
+            dtype=self._hidden_states_dtype,
+            device=self.device,
+        )
+        indices = torch.zeros(
+            self._prompt_logprob_rows_per_call(bucket),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for _ in range(num_calls):
+            self.compute_selected_logits(hidden_states, indices)
 
     def _pool_chunk(
         self,
@@ -5481,10 +5582,9 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
-        combined_logprobs: list[Any] = []
-        # Spec step only: per-chunk logprobs, filtered to the accepted tokens
-        # once they reach the host (AsyncTPUModelRunnerOutput.get_output).
-        spec_logprobs_chunks: list[SpecLogprobsChunk] = []
+        # Per-chunk logprobs, cut to each request's generated tokens once they
+        # reach the host (AsyncTPUModelRunnerOutput.get_output).
+        logprobs_chunks: list[LogprobsChunk] = []
 
         # True if the step has drafts to verify (a request carried drafts in
         # from the previous step). Not the same as self.speculative_config, the
@@ -5548,8 +5648,8 @@ class TPUModelRunner(GPUModelRunner):
                             md.draft_lengths,
                             md.final_logits_indices,
                         )
-                        spec_logprobs_chunks.append(
-                            SpecLogprobsChunk(
+                        logprobs_chunks.append(
+                            LogprobsChunk(
                                 tensors=self.gather_logprobs(logits, row_tokens),
                                 row_starts=np.concatenate(
                                     ([0], np.cumsum(md.draft_lengths_cpu + 1)[:-1])
@@ -5584,8 +5684,8 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(padded)
                     if needs_logprobs:
-                        spec_logprobs_chunks.append(
-                            SpecLogprobsChunk(
+                        logprobs_chunks.append(
+                            LogprobsChunk(
                                 tensors=self.gather_logprobs(logprob_logits, selected),
                                 row_starts=np.arange(num_reqs),
                             )
@@ -5624,11 +5724,15 @@ class TPUModelRunner(GPUModelRunner):
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
                 # sure `sample_from_logits` does not modify the logits in-place.
-                logprobs = (
-                    self.gather_logprobs(logprob_logits, selected_token_ids)
-                    if needs_logprobs
-                    else None
-                )
+                if needs_logprobs:
+                    logprobs_chunks.append(
+                        LogprobsChunk(
+                            tensors=self.gather_logprobs(
+                                logprob_logits, selected_token_ids
+                            ),
+                            row_starts=np.arange(num_reqs),
+                        )
+                    )
 
                 # Keep the bucketed (padded) tensor; trim happens on the host
                 # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
@@ -5641,15 +5745,6 @@ class TPUModelRunner(GPUModelRunner):
                             next_tokens_tpu_offset + req_idx - cur_start_idx
                         )
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
-                if needs_logprobs:
-                    assert logprobs is not None
-                    sliced_logprobs = LogprobsTensors(
-                        logprobs.logprob_token_ids[:num_reqs],
-                        logprobs.logprobs[:num_reqs],
-                        logprobs.selected_token_ranks[:num_reqs],
-                        logprobs.cu_num_generated_tokens,
-                    )
-                    combined_logprobs.append(sliced_logprobs)
 
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
@@ -5658,28 +5753,6 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        logprobs = []
-        if needs_logprobs and len(combined_logprobs):
-            # TODO: concatenate the LogprobsTensors (torch) first, then
-            # call .tolists() once to match the GPU path and avoid the
-            # per-chunk numpy round-trip.
-            combined_logprobs_lists = []
-            for i in range(len(combined_logprobs)):
-                logprobs = combined_logprobs[i].tolists()
-                combined_logprobs_lists.append(logprobs)
-
-            logprobs_lists = LogprobsLists(
-                logprob_token_ids=np.concatenate(
-                    [lp.logprob_token_ids for lp in combined_logprobs_lists]
-                ),
-                logprobs=np.concatenate(
-                    [lp.logprobs for lp in combined_logprobs_lists]
-                ),
-                sampled_token_ranks=np.concatenate(
-                    [lp.sampled_token_ranks for lp in combined_logprobs_lists]
-                ),
-            )
-            logprobs = logprobs_lists
 
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
@@ -5713,7 +5786,7 @@ class TPUModelRunner(GPUModelRunner):
                 copy_state = AsyncTPUCopyState.from_device_chunks(
                     combined_selected_tokens,
                     combined_selected_tokens_real_lens,
-                    spec_logprobs=spec_logprobs_chunks,
+                    logprobs=logprobs_chunks,
                 )
 
         if self.scheduler_config.async_scheduling:
@@ -5941,7 +6014,7 @@ class TPUModelRunner(GPUModelRunner):
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
                 req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
-                logprobs=logprobs,
+                logprobs=None,  # Filled in AsyncTPUModelRunnerOutput get_output
                 prompt_logprobs_dict=prompt_logprobs.emit(
                     state.prompt_logprobs_chunks,
                     self.requests,
@@ -7548,8 +7621,15 @@ class TPUModelRunner(GPUModelRunner):
                 self.vllm_config, self.device, self.model
             )
             if self.encoder_cudagraph_manager is not None:
+                max_step_tokens = (
+                    self.mm_budget.get_encoder_budget()
+                    if self.mm_budget is not None
+                    else self.scheduler_config.max_num_encoder_input_tokens
+                )
                 with self._precompile_timed("multimodal vision encoder"):
-                    self.encoder_cudagraph_manager.precompile_vision_encoder()
+                    self.encoder_cudagraph_manager.precompile_vision_encoder(
+                        max_step_tokens=max_step_tokens
+                    )
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.

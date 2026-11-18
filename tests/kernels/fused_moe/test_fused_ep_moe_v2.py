@@ -32,6 +32,8 @@ test's choosing; ``test_the_mesh_axis_name_is_the_one_the_kernel_reads`` pins
 that constraint, which the layer's own signature does not state.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1051,6 +1053,111 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
         topk=4,
     )
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
+
+
+# 4 / 2 blocks over 4 local experts, and DeepSeek-V4's 14 / 6 blocks over 8:
+# the served 14-row table is one full sublane tile and a partial one.
+SECOND_MINOR_SHAPES = [
+    dict(hidden=2048, inter=1024, rhs_qb=512, e_total=32),
+    dict(hidden=896, inter=384, rhs_qb=64, e_total=64),
+]
+
+
+@pytest.mark.parametrize("shape", SECOND_MINOR_SHAPES)
+@pytest.mark.parametrize(
+    "w1_minor,w2_minor", [(True, False), (False, True), (True, True)]
+)
+def test_fp4_expert_second_minor_scale_reads_are_bit_exact(shape, w1_minor, w2_minor):
+    """Reading either scale table expert-second-minor changes only its
+    addressing."""
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh,
+        44,
+        hidden=shape["hidden"],
+        inter=shape["inter"],
+        e_total=shape["e_total"],
+        rhs_qb=shape["rhs_qb"],
+    )
+    x, gating = _make_inputs(
+        mesh, 45, tokens=256, hidden=shape["hidden"], e_total=shape["e_total"]
+    )
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=shape["rhs_qb"],
+        sharded_plan=True,
+    )
+    default_layout = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    second_minor = fused_ep_moe_v2(
+        x,
+        *weights,
+        *scales,
+        gating,
+        w1_scales_expert_second_minor=w1_minor,
+        w2_scales_expert_second_minor=w2_minor,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(second_minor), np.asarray(default_layout))
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_fp4_expert_second_minor_scales_reach_the_kernel_uncopied(flag):
+    """Scale tables staged {2,0,1} reach the kernel with no copy when the
+    flags say so. Without them XLA copies both into the default layout, which
+    shows the check can see a copy."""
+    from jax._src.layout import Format, Layout
+
+    shape = SECOND_MINOR_SHAPES[1]
+    hidden, inter, qb, e_total = (
+        shape[k] for k in ("hidden", "inter", "rhs_qb", "e_total")
+    )
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 46, hidden=hidden, inter=inter, e_total=e_total, rhs_qb=qb
+    )
+    x, gating = _make_inputs(mesh, 47, tokens=256, hidden=hidden, e_total=e_total)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=qb,
+        sharded_plan=True,
+        w1_scales_expert_second_minor=flag,
+        w2_scales_expert_second_minor=flag,
+    )
+    # [E, blocks, N] with minor-to-major {2,0,1}, as torch_tpu stages it.
+    second_minor = Format(
+        Layout(major_to_minor=(1, 0, 2)), NamedSharding(mesh, P(AXIS))
+    )
+    fn = jax.jit(
+        lambda x, w1, w2, s1, s2, g: fused_ep_moe_v2(x, w1, w2, s1, s2, g, **common),
+        in_shardings=(None, None, None, second_minor, second_minor, None),
+    )
+    hlo = fn.lower(x, *weights, *scales, gating).compile().as_text()
+    # Each shard's tables, in either order of their two major dimensions.
+    local = e_total // EP
+    tables = [
+        (local, hidden // qb, 2 * inter),
+        (local, inter // qb, hidden),
+    ]
+    shapes = "|".join(
+        ",".join(map(str, dims))
+        for e, b, n in tables
+        for dims in ((e, b, n), (b, e, n))
+    )
+    producers = [
+        line.strip()
+        for line in hlo.splitlines()
+        if re.search(rf"= f32\[({shapes})\]", line)
+        and not re.search(r"\b(parameter|bitcast|get-tuple-element)\(", line)
+    ]
+    assert (producers == []) is flag, producers
 
 
 # --------------------------------------------------------------------------- #
