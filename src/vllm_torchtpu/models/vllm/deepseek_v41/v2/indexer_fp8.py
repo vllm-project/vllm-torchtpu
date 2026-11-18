@@ -30,10 +30,12 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
     fp8_paged_mqa_logits,
+    fp8_paged_mqa_logits_inline,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import (
     candidate_windows,
     fp8_gathered_mqa_logits,
+    fp8_gathered_mqa_logits_inline,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
@@ -372,7 +374,7 @@ def _score_and_select_candidates(
 
     def score(start, group):
         scorer = (
-            fp8_gathered_mqa_logits.__wrapped__
+            fp8_gathered_mqa_logits_inline
             if query_chunk_size < num_queries
             else fp8_gathered_mqa_logits
         )
@@ -588,9 +590,6 @@ def _select_fp8_indexer_jax(
             if shared
             else (jax.lax.dynamic_slice_in_dim(x, start, rows) for x in inputs[:3])
         )
-        # Pipelined tiles inline inside the outer model jit so scheduling
-        # metadata reaches the Pallas call instead of the inner jit boundary.
-        scorer = fp8_paged_mqa_logits.__wrapped__ if pipelined else fp8_paged_mqa_logits
         output_width = capacity if stream_select else width
         # Prefill scores one K tile at a time, each kept resident while every
         # query of the chunk reads it. A multi-tile call reloads every tile
@@ -599,6 +598,15 @@ def _select_fp8_indexer_jax(
             output_width // key_tile
             if prefill_chunk_rows is not None and output_width % key_tile == 0
             else 1
+        )
+        # Scheduling metadata tags the op producing the scores. A single
+        # pipelined call is inlined so that op is the Pallas call itself;
+        # K tiles meet in a concatenate, so their calls stay behind a jit
+        # boundary, whose lowering is also shared.
+        scorer = (
+            fp8_paged_mqa_logits_inline
+            if pipelined and tiles == 1
+            else fp8_paged_mqa_logits
         )
         tile_width = output_width // tiles
         tile_pages = tile_width // layout.page_size

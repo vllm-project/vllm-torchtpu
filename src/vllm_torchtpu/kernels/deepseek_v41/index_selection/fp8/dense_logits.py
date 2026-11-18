@@ -408,15 +408,16 @@ def _kernel(static, offsets, lengths, query_start, inputs, *refs):
     _DenseKernel((offsets, lengths, query_start), inputs, refs, *static).run()
 
 
-@jax.jit(
-    static_argnames=(
-        "cache_layout",
-        "max_model_len",
-        "query_size",
-        "query_count",
-        "reuse_keys",
-    )
+_STATIC_ARGNAMES = (
+    "cache_layout",
+    "max_model_len",
+    "query_size",
+    "query_count",
+    "reuse_keys",
 )
+
+
+@jax.jit(static_argnames=_STATIC_ARGNAMES)
 def fp8_paged_mqa_logits(
     q: jax.Array,
     kv_cache: jax.Array | tuple[jax.Array, jax.Array],
@@ -521,3 +522,10 @@ def fp8_paged_mqa_logits(
         name="fp8_paged_mqa_logits_dense",
     )(query_start_loc, context_lens, jnp.asarray(query_start, jnp.int32), inputs)
     return result[:, :max_model_len]
+
+
+# Traced once per signature, then inlined into the caller, so metadata set on
+# its output tags the Pallas call itself rather than a call boundary.
+fp8_paged_mqa_logits_inline = jax.jit(
+    fp8_paged_mqa_logits.__wrapped__, static_argnames=_STATIC_ARGNAMES, inline=True
+)

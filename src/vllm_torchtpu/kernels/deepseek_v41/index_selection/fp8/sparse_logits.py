@@ -336,7 +336,10 @@ def _kernel(
         release(slot)
 
 
-@jax.jit(static_argnames=("output_width", "query_count"))
+_STATIC_ARGNAMES = ("output_width", "query_count")
+
+
+@jax.jit(static_argnames=_STATIC_ARGNAMES)
 def fp8_gathered_mqa_logits(
     q: jax.Array,
     keys: jax.Array,
@@ -417,3 +420,9 @@ def fp8_gathered_mqa_logits(
         jnp.asarray(query_start, jnp.int32),
         (q, weights, keys),
     )[:, :output_width]
+
+
+# Traced once per signature, then inlined into the caller like the body itself.
+fp8_gathered_mqa_logits_inline = jax.jit(
+    fp8_gathered_mqa_logits.__wrapped__, static_argnames=_STATIC_ARGNAMES, inline=True
+)
