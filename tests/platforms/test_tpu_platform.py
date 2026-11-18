@@ -512,14 +512,16 @@ class TestTpuPlatform:
         class Admitted(Exception):
             pass
 
-        admit = tpu_platform.validate_decode_context_parallel_config
+        admit = tpu_platform.DcpStaticSupportValidator.validate_platform_config
 
         def admit_then_stop(config):
             admit(config)
             raise Admitted
 
         monkeypatch.setattr(
-            tpu_platform, "validate_decode_context_parallel_config", admit_then_stop
+            tpu_platform.DcpStaticSupportValidator,
+            "validate_platform_config",
+            staticmethod(admit_then_stop),
         )
         monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", pcp > 1)
         vllm_config.model_config.get_total_num_kv_heads = lambda: kv_heads
