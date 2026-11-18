@@ -932,3 +932,27 @@ def test_pcp_indexer_topk_sal_matches_has(monkeypatch, scenario, pcp, compact):
                 _check_topk(topk[sal][d, i], scores, pos, where)
                 checked += 1
     assert checked > 0
+
+
+@pytest.mark.parametrize("ws_no_zero_fill", [False, True])
+@pytest.mark.parametrize("hoist", [False, True])
+def test_pcp_adapter_ops_build_under_flags(monkeypatch, hoist, ws_no_zero_fill):
+    """The adapter's PCP write / split prefill torch ops register under
+    TPU_PCP_GATHER_HOIST / TPU_PCP_WS_NO_ZERO_FILL: `pallas.jax_op` accepts
+    only explicit array parameters and a tuple-of-arrays return annotation."""
+    from vllm_torchtpu.layers.adapter import attention as adapter_attention
+
+    mesh = _mesh()
+    monkeypatch.setattr(envs, "TPU_PCP_GATHER_HOIST", hoist)
+    monkeypatch.setattr(envs, "TPU_PCP_WS_NO_ZERO_FILL", ws_no_zero_fill)
+    impl = SimpleNamespace(
+        _dcp_mesh=mesh, dcp_size=DCP, pcp_size=2, dcp_interleave_size=INTERLEAVE
+    )
+    layer = SimpleNamespace(
+        layer_name=f"model.layers.0.attn_flags_{int(hoist)}{int(ws_no_zero_fill)}",
+        mla_kv_spec=_specs(KVCacheLayout.SPARSECORE, packed_rope=True),
+        kv_cache_quantized_dtype=None,
+    )
+    cls = adapter_attention.PallasMLAttentionBackendImpl
+    assert callable(cls._build_pcp_write_split_op(impl, layer))
+    assert callable(cls._build_pcp_prefill_op(impl, layer))
