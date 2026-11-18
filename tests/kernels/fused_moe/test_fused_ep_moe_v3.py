@@ -50,8 +50,8 @@ primaries and must never read a copy slot.
 The same check covers what the Qwen3.5 DP4 x TP2 decode layout runs
 (``fused_moe_ep_v3.QWEN3_5_CONFIG_BY_LAYOUT[(4, 2)]``): the layer with that
 entry's settings (``combine_real_tokens``, ``sort_index_compare``,
-``compact_message``, ``reorder_chain``), which must also give the layer's
-values without them bit for bit, and the dense-slots layer
+``reorder_chain``), which must also give the layer's values without them bit
+for bit, and the dense-slots layer
 (``models/qwen3_5/kernels/dense_slots.py``) the entry selects for calls of at
 most 64 rows per shard, which with float32 scaling products must give the
 values of this layer with bf16 result rows bit for bit.
@@ -1058,9 +1058,10 @@ def test_fused_ep_moe_matches_the_reference(eight_tpu7x_cores, mode, name, resul
 @pytest.mark.multichip
 @pytest.mark.parametrize("name", list(CASES))
 def test_dp4tp2_settings_keep_the_layers_values(eight_tpu7x_cores, fresh_builds, name):
-    """The v3 settings of the Qwen3.5 DP4 x TP2 entry change schedules and the
-    routing message's layout, not values: with them the layer is within the
-    reference's bound and gives every value it gives without them."""
+    """The v3 settings of the Qwen3.5 DP4 x TP2 entry change what is gathered
+    and summed and the programs' schedule, not values: with them the layer is
+    within the reference's bound and gives every value it gives without
+    them."""
     plain, want, rows = _run_case(name, "bridge_sorted", "bf16")
     got, _, _ = _run_case(name, "bridge_sorted", "bf16", settings=_dp4tp2_settings())
     assert _compare(got, want, rows)["pass"], _compare(got, want, rows)

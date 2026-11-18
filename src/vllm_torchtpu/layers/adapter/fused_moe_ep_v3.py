@@ -98,15 +98,14 @@ WEIGHT_FORMAT = "fp8"
 # Kernel settings beyond Config.for_shape, per Qwen3.5 decode layout
 # (data_parallel_size, tensor_parallel_size). (4, 2) is what the DP4 x TP2
 # decode legs ran: the combine over real tokens, the sort-index live mask, the
-# compact routing message, the reordered program chain, and the dense-slots
-# layer for calls of at most Config.dense_slots_max_tokens rows per shard.
+# reordered program chain, and the dense-slots layer for calls of at most
+# Config.dense_slots_max_tokens rows per shard.
 # Other models, and other layouts, keep for_shape's settings: these paths were
 # validated on Qwen3.5 only.
 QWEN3_5_CONFIG_BY_LAYOUT: dict[tuple[int, int], dict[str, Any]] = {
     (4, 2): {
         "combine_real_tokens": True,
         "sort_index_compare": True,
-        "compact_message": True,
         "reorder_chain": True,
         "dense_slots": True,
     },
