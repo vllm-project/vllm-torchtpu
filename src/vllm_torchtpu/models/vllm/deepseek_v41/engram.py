@@ -111,7 +111,7 @@ def _gather_engram_rows(rows: torch.Tensor, dim: int) -> torch.Tensor:
         TP all-gathered tensor with trailing alignment padding stripped (Created).
     """
     width = rows.shape[-1]
-    pad = 0 if rows.dtype == torch.int32 else (-width) % _TPU_LANE_ALIGNMENT
+    pad = (-width) % _TPU_LANE_ALIGNMENT
     padded = F.pad(rows, (0, pad)) if pad else rows
     gathered = tensor_model_parallel_all_gather(padded, dim=dim)
     if pad:
@@ -242,7 +242,7 @@ class NgramHashState(upstream.NgramHashState):
     """Subclass upstream ``NgramHashState`` replacing Triton kernels with PyTorch.
 
     Data lifecycle:
-        - Created: ``hash_on_host`` and ``forward`` return ``int32[tokens, layers,
+        - Created: ``forward`` return ``int32[tokens, layers,
           n_hash_cols]`` hash index tensors.
         - Used: ``input_ids``, ``positions``, ``query_start_loc``, ``dead_mask``,
           ``lookback_ids``, ``lookback_dead``, and ``block_table``.
@@ -250,8 +250,6 @@ class NgramHashState(upstream.NgramHashState):
           ``forward`` updates ``_cache`` at active ``slot_mapping`` slots outside
           ``null_block=0``.
     """
-
-    _cached_cpu_tables: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
 
     def ensure_cache(self) -> bool:
         """Synchronize ``block_size`` with ``swa_cache_module`` and allocate slots.
@@ -261,10 +259,8 @@ class NgramHashState(upstream.NgramHashState):
         """
         swa = cast(DeepseekV4SWACache, self.swa_cache_module)
         kv_cache = cast(Tensor, swa.kv_cache)
-        if torch.compiler.is_compiling():
-            if self.use_slot_cache:
-                return self._cache is not None
-            return kv_cache.numel() > 0
+        # We shouldn't invoke this method within a compiled function.
+        assert not torch.compiler.is_compiling()
 
         if kv_cache.numel():
             resolved_block_size: int | None = int(
@@ -280,39 +276,6 @@ class NgramHashState(upstream.NgramHashState):
             self.block_size = int(resolved_block_size)
             self._kv_cache_ref = None
         return super().ensure_cache()
-
-    def hash_on_host(
-        self,
-        input_ids: Tensor,
-        positions: Tensor,
-        query_start_loc: Tensor,
-        dead_mask: Tensor,
-        lookback_ids: Tensor,
-        lookback_dead: Tensor,
-    ) -> Tensor:
-        """Compute ``int32[tokens, layers, n_hash_cols]`` hashes on CPU tensors."""
-        tables = self._cached_cpu_tables
-        if tables is None:
-            token_map_cpu = self.token_map.cpu()
-            multipliers_cpu = self.multipliers.cpu()
-            primes_cpu = self.primes.cpu()
-            offsets_cpu = self.offsets.cpu()
-            tables = (token_map_cpu, multipliers_cpu, primes_cpu, offsets_cpu)
-            self._cached_cpu_tables = tables
-
-        def fallback_pad(_past: Tensor, _reqs: Tensor, window: Tensor) -> Tensor:
-            return torch.full_like(window, self.pad_id)
-
-        return self._hash(
-            tables,
-            input_ids,
-            positions,
-            query_start_loc,
-            dead_mask,
-            lookback_ids,
-            lookback_dead,
-            fallback_pad,
-        )
 
     # pyrefly: ignore[bad-override-param-name]
     def forward(
@@ -494,12 +457,10 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         # self.dp_size = 1, while use_thp is retained for upstream constructor
         # signature compatibility.
         nn.Module.__init__(self)
-        host_offload = bool(cpu_offload)
-        self.cpu_offload = host_offload
-        self.host_offload = host_offload
-        shared_mem = bool(dp_shared_memory) and host_offload
-        self.dp_shared_memory = shared_mem
-        self._dp_shared_memory = shared_mem
+        # TODO(Wenqin): we could add a new flag for TPU to keep only the first
+        # layer of Engram on HBM.
+        self.cpu_offload = bool(cpu_offload)
+        self.dp_shared_memory = bool(dp_shared_memory) and self.cpu_offload
         self.use_thp = use_thp
         self.dp_size = 1 if self.dp_shared_memory else get_engram_dp_size()
         self.num_embeddings = num_embeddings
@@ -534,9 +495,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Allocate weights in HBM, shared ``/dev/shm``, or private CPU RAM."""
-        if not self.host_offload:
+        if not self.cpu_offload:
             return super()._allocate_weights()
-        if self._dp_shared_memory:
+        if self.dp_shared_memory:
             group = get_engram_dp_group()
             assert group is not None
             storage = TpuDPSharedEngramStorage(
@@ -697,6 +658,7 @@ class Engram(upstream.Engram):
             if num_tokens == max_tokens:
                 staged = self._staged_raw
             else:
+                # init staged buffer on CPU to avoid create new graph on TPU.
                 init = torch.zeros(num_tokens * words_per_token, dtype=torch.int32)
                 init[raw_words:].fill_(-1)
                 staged = init.to(self._staged_raw.device)
