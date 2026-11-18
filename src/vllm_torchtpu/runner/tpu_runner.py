@@ -163,6 +163,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
 from vllm_torchtpu.megakernel import adapter as megakernel_adapter
+from vllm_torchtpu.models.vllm import sp_prefill
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -6570,6 +6571,7 @@ class TPUModelRunner(GPUModelRunner):
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
         self._megakernel = megakernel_adapter.maybe_create(self)
+        sp_prefill.maybe_install(self.model)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
