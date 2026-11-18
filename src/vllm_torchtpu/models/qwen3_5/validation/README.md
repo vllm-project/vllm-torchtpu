@@ -3,9 +3,9 @@
 One YAML file per serving configuration that Qwen3.5 changes are validated
 against:
 
-- `pNN-*.yaml`: five points of the InferenceX benchmark submission for
-  Qwen3.5-397B-A17B-FP8, each a prefill/decode disaggregated deployment.
-  `pNN` is the point's number on the submitted throughput/interactivity curve
+- `pNN-*.yaml`: five benchmark points of Qwen3.5-397B-A17B-FP8, each a
+  prefill/decode disaggregated deployment.
+  `pNN` is the point's number on the published throughput/interactivity curve
   and `band-X` its interactivity band, from A (lowest interactivity, highest
   throughput per dollar) to H. The rest of the name is the decode layout, the
   prefill and decode replica counts (`4p3d`: four prefill and three decode
@@ -19,7 +19,7 @@ against:
 
 `record` holds the published result of the point: Mtok/$ and p90
 interactivity (tokens per second per user). The record run used an earlier,
-unreleased tree of this repository (the submission tree), so `record` also
+unreleased tree of this repository (the record tree), so `record` also
 notes that tree's decode megakernel mode, which this tree does not have: run
 the decode megakernel off here.
 
@@ -40,11 +40,11 @@ Each leg (`prefill`, `decode`) lists:
 
 The decode legs run MTP with synthetic rejection sampling at a fixed
 acceptance length of 3.39 (`--speculative-config`), the acceptance length the
-InferenceX benchmark fixes for this model, so the `record` numbers are at
+benchmark fixes for this model, so the `record` numbers are at
 that acceptance length. The gates use real rejection sampling and report the
 real acceptance length.
 
-The submission tree's environment variables are being turned into settings,
+The record tree's environment variables are being turned into settings,
 rules or `additional_config` options change by change, and each change that
 turns one that the points use into a setting or section updates the entries.
 A value that this tree cannot run yet is kept as the record run used it and

@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Accuracy gate, TP8 + DCP4 decode (the layout of points #5-#12), one prefill
+# Accuracy gate, TP8 + DCP4 decode (the layout of entries p05 to p12), one prefill
 # and one decode replica. See README.md in this directory.
 name: gate-tp8-dcp4-1p1d
 purpose: >-
   Accuracy of this tree at the TP8 + DCP4 decode layout, and the
   cost of the Qwen3.5 FP8 trade-off settings, measured as an on/off pair.
-  The submission tree has no gate of its own at this layout.
+  The record tree has no gate of its own at this layout.
 base_point: 8
 chips: 8
 legs:
@@ -50,4 +50,4 @@ noise:
 references:
   - {tree: "an earlier tree", layout: "TP8 + DCP4 1P1D", gsm8k: "98.10%"}
   - {tree: "an earlier tree", layout: "TP8 1P1D", gsm8k: "97.73%"}
-  - {tree: "an earlier submission candidate", layout: "TP8, decode megakernel in EP mode, thinking on", gsm8k: "97.88%"}
+  - {tree: "an earlier candidate tree", layout: "TP8, decode megakernel in EP mode, thinking on", gsm8k: "97.88%"}
