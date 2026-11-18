@@ -46,9 +46,10 @@ def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
-    from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
+    from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig, mtp_draft_path
     from vllm_torchtpu.models.qwen3_5.settings import ARCHITECTURES as QWEN3_5_ARCHS
     from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
+    from vllm_torchtpu.spec_decode import draft_path_rules
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
@@ -69,3 +70,4 @@ def register_models() -> None:
     # Qwen3.5 serving defaults and settings; see models/qwen3_5/hooks.py.
     for arch in QWEN3_5_ARCHS:
         MODELS_CONFIG_MAP[arch] = TPUQwen35MoeConfig
+    draft_path_rules.register(mtp_draft_path)

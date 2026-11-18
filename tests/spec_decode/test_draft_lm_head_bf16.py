@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_torchtpu.runner import greedy_top_tokens as gtt
@@ -43,7 +44,8 @@ class _UnquantizedMethod:
 
 
 class ParallelLMHead(torch.nn.Module):
-    """Same class name as vLLM's, which is what the post-load hook matches."""
+    """Stands in for vLLM's ParallelLMHead; the fixture below makes the
+    post-load hook's exact-type check match this class."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -172,6 +174,13 @@ def test_draft_head_logits_are_bf16_exact_target_logits_are_fp8():
 
     assert torch.equal(draft_logits, ref)
     assert not torch.equal(target_logits, ref)
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_lm_head_class(monkeypatch):
+    from vllm_torchtpu.models.vllm import qwen3_next_patch
+
+    monkeypatch.setattr(qwen3_next_patch, "ParallelLMHead", ParallelLMHead)
 
 
 def _fake_qwen3_next_model(head: torch.nn.Module) -> torch.nn.Module:

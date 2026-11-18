@@ -99,6 +99,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader import base_loader
 from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 from vllm.sequence import IntermediateTensors
@@ -1023,10 +1024,15 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         for module in model.modules()
     ):
         return
-    is_mtp_wrapper = type(model).__name__ in (
-        "Qwen3NextMTP",
-        "Qwen3_5MTP",
-        "Qwen3_5MoeMTP",
+    from vllm.model_executor.models import qwen3_5_mtp
+
+    is_mtp_wrapper = isinstance(
+        model,
+        (
+            qwen3_next_mtp.Qwen3NextMTP,
+            qwen3_5_mtp.Qwen3_5MTP,
+            qwen3_5_mtp.Qwen3_5MoeMTP,
+        ),
     )
     hoisted_norm_tensors: list[torch.Tensor] = []
     for module in model.modules():
@@ -1074,7 +1080,7 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         ):
             maybe_flip_gdn_in_proj_qkvz_weight(module)
         elif (
-            type(module).__name__ == "ParallelLMHead"
+            type(module) is ParallelLMHead
             and not is_mtp_wrapper
             and _quantize_target_lm_head()
         ):
