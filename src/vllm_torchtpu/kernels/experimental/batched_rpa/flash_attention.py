@@ -28,8 +28,15 @@ def vpu_diet_enabled() -> bool:
 
     Always on; a function so tests can compare it with the plain path. Both
     paths give the same bits: the mask skip is exact, and the scale is folded
+    into q only when `q_folded_scale` finds sm_scale and k_scale each a power
+    of two (sm_scale=1/16, k_scale=1 for head_dim 256). Any other scale takes
+    the plain path's multiplies, one factor at a time.
     """
     return True
+
+
+def _is_power_of_two(x: float) -> bool:
+    return x > 0.0 and math.isfinite(x) and math.frexp(x)[0] == 0.5
 
 
 def q_folded_scale(cfgs: configs.RpaConfigs) -> float | None:
@@ -37,6 +44,10 @@ def q_folded_scale(cfgs: configs.RpaConfigs) -> float | None:
 
     Scaling a bf16/f32 q by a power of two only changes its exponent, so
     dot(q * s, k) is bit-identical to dot(q, k) * s while touching a
+    [TQ, head_dim] tile instead of the [TQ, bkv] f32 score tile. The plain
+    path multiplies the score tile by sm_scale and then by k_scale, rounding
+    after each, so the fold equals it only when each factor is a power of two
+    (a power-of-two product of two other factors does not round the same).
     """
     serve = cfgs.serve
     if serve.scale_q is not None or serve.per_token_scale:
@@ -45,8 +56,12 @@ def q_folded_scale(cfgs: configs.RpaConfigs) -> float | None:
         return None
     if jnp.dtype(serve.dtype_q).itemsize < 2:
         return None
+    factors = [float(cfgs.model.sm_scale)]
     if serve.scale_k is not None:
+        factors.append(float(serve.scale_k))
+    if not all(_is_power_of_two(f) for f in factors):
         return None
+    return math.prod(factors)
 
 
 def flash_attention_qk_softmax(

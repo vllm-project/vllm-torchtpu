@@ -14,6 +14,9 @@
 """The batched RPA score scaling keeps the plain path's bits.
 
 `flash_attention_qk_softmax` folds the static score scale into q only when
+sm_scale and k_scale are each a power of two, so the fold is exact. Every other
+scale (head_dim 128, a calibrated k_scale, a static q scale, per-token scales,
+or a k_scale whose product with sm_scale happens to be a power of two) must
 take the plain path's multiplies one factor at a time: merging the factors
 first rounds differently.
 """
@@ -101,6 +104,9 @@ _INEXACT = {
     "q_scale": (128, 2.5, None, False),
     "q_and_k_scale": (128, 2.5, 0.37, False),
     "per_token": (128, None, None, True),
+    # sm_scale 1/sqrt(128) times this k_scale is exactly 0.125 in double, but
+    # neither factor is a power of two, so the plain path rounds twice.
+    "k_scale_cancels_sm_scale": (128, None, 1.414213562373095, False),
 }
 
 
