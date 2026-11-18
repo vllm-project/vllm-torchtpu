@@ -53,6 +53,7 @@ from .emit import (
     build_solve_payload,
     emit_ceiling_rows,
     emit_launch_args,
+    pareto_skyline_by_concurrency,
     parse_layout,
     pool_label,
     reference_layout_report,
@@ -1222,6 +1223,29 @@ def _render_solve_ascii_table(
         )
 
 
+def _render_concurrency_skyline_lines(serving_plan: ServingPlan, top_k: int) -> None:
+    """Write one-rank-per-line Top-K Pareto skyline lines per concurrency."""
+    skyline = pareto_skyline_by_concurrency(serving_plan, k=top_k)
+    if not skyline:
+        return
+    sys.stdout.write("# Top-K Skyline by Concurrency\n")
+    for concurrency, points in skyline.items():
+        sys.stdout.write(f"# c={concurrency}:\n")
+        for rank, point in enumerate(points, 1):
+            label = (
+                f"P {pool_label(asdict(point.prefill_pool))} + "
+                f"D {pool_label(asdict(point.decode_pool))}"
+                if point.prefill_pool is not None
+                else pool_label(asdict(point.decode_pool))
+            )
+            sys.stdout.write(
+                f"#   #{rank} {label} | bound_tpot_ms={point.bound_tpot_ms:.2f} "
+                f"| interactivity={point.est_interactivity_tok_s:.1f} tok/s "
+                f"| throughput={point.token_throughput_per_chip:.1f} tok/s/chip "
+                f"| min_decode_seqs={point.min_decode_seqs:.1f}\n"
+            )
+
+
 def _render_solve_output(
     args: argparse.Namespace,
     splan: ServingPlan,
@@ -1254,6 +1278,7 @@ def _render_solve_output(
         sys.stdout.write(json.dumps(payload) + "\n")
         return 0
     _render_solve_ascii_table(splan, args.top_k, dt_auto, ref_report=ref_report)
+    _render_concurrency_skyline_lines(splan, args.top_k)
     sys.stdout.write(
         "# Note: bound_* columns are hard physical lower bounds; "
         "est_* columns are model estimates.\n",

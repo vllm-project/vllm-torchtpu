@@ -254,6 +254,12 @@ UNDECIDED_SLO_WARNING: str = (
     "the layout out."
 )
 
+# Informational warning emitted when closed-loop think_time_s is zero.
+ZERO_THINK_TIME_WARNING: str = (
+    "Closed-loop scenario evaluated with zero think time: decode residency "
+    "matches concurrency up to the HBM/SMEM cap without client request pauses."
+)
+
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
 MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2

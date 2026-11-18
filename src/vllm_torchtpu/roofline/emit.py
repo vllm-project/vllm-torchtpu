@@ -129,6 +129,7 @@ class SolvePayload(TypedDict, total=False):
     chip_spec: Mapping[str, object]
     model: str | None
     top_k: list[TopKEntry]
+    concurrency_top_k: dict[str, list[TopKEntry]]
     winner_prefix_hit_range: tuple[float, float] | None
     prefix_hit_crossover_rate: float | None
     spec_tokens: int
@@ -158,6 +159,8 @@ class CeilingRow(TypedDict):
     total_chips: int
     mode: str
     binding_unit: str
+    min_decode_seqs: float
+    floor_throughput_per_chip: float
 
 
 def pool_cli_args(
@@ -619,6 +622,182 @@ def top_layouts(
                 k,
             )
     return selected
+
+
+def _pool_mesh_family(pool: PoolMeshPlan | None) -> tuple[object, ...] | None:
+    """Return mesh family key ignoring KV split and identical-CLI MoE dispatch."""
+    if pool is None:
+        return None
+    return (
+        pool.topology,
+        pool.instances,
+        pool.tp,
+        pool.dp,
+        pool.ep,
+        pool.pp,
+        pool.pcp,
+    )
+
+
+def _pair_family_key(
+    point: ParetoPoint,
+) -> tuple[str, tuple[object, ...] | None, tuple[object, ...] | None]:
+    """Return full (mode, prefill_mesh_family, decode_mesh_family) key."""
+    return (
+        point.mode,
+        _pool_mesh_family(point.prefill_pool),
+        _pool_mesh_family(point.decode_pool),
+    )
+
+
+def _decode_group_key(
+    point: ParetoPoint,
+) -> tuple[str, int, int, tuple[object, ...] | None]:
+    """Return decode-pool and xP:yD instance-ratio diversity group key."""
+    prefill_instances = (
+        point.prefill_pool.instances if point.prefill_pool is not None else 0
+    )
+    return (
+        point.mode,
+        prefill_instances,
+        point.decode_pool.instances,
+        _pool_mesh_family(point.decode_pool),
+    )
+
+
+def _skyline_preference(point: ParetoPoint) -> tuple[bool, bool, float, float, float]:
+    """Order candidate variants within one mesh family by verdict and 3 objectives."""
+    return (
+        point.slo_met,
+        point.slo_verdict != SLO_VERDICT_RULED_OUT,
+        -point.bound_tpot_ms,
+        point.token_throughput_per_chip,
+        point.est_interactivity_tok_s,
+    )
+
+
+def _fill_skyline_slots(
+    selected: list[ParetoPoint],
+    chosen_keys: set[tuple[object, ...]],
+    candidates: Sequence[ParetoPoint],
+    key_fn: Callable[[ParetoPoint], tuple[object, ...]],
+    k: int,
+) -> None:
+    """Fill remaining skyline slots up to k without duplicating keys."""
+    ordered = sorted(
+        (pt for pt in candidates if key_fn(pt) not in chosen_keys),
+        key=lambda pt: (
+            not pt.slo_met,
+            pt.bound_tpot_ms,
+            -pt.token_throughput_per_chip,
+            -pt.est_interactivity_tok_s,
+        ),
+    )
+    for point in ordered:
+        if len(selected) >= k:
+            break
+        selected.append(point)
+        chosen_keys.add(key_fn(point))
+
+
+def _select_concurrency_skyline(
+    points: Sequence[ParetoPoint],
+    k: int,
+) -> tuple[ParetoPoint, ...]:
+    """Select up to k pure 3-objective Pareto skyline points at one concurrency."""
+    best_by_pair: dict[tuple[object, ...], ParetoPoint] = {}
+    for point in points:
+        pair_key = _pair_family_key(point)
+        current = best_by_pair.get(pair_key)
+        if current is None or _skyline_preference(point) > _skyline_preference(current):
+            best_by_pair[pair_key] = point
+
+    best_by_group: dict[tuple[object, ...], ParetoPoint] = {}
+    for point in best_by_pair.values():
+        group_key = _decode_group_key(point)
+        current = best_by_group.get(group_key)
+        if current is None or _skyline_preference(point) > _skyline_preference(current):
+            best_by_group[group_key] = point
+
+    group_pool = list(best_by_group.values())
+    anchors = (
+        min(
+            group_pool,
+            key=lambda pt: (
+                not pt.slo_met,
+                pt.bound_tpot_ms,
+                -pt.token_throughput_per_chip,
+                -pt.est_interactivity_tok_s,
+            ),
+        ),
+        max(
+            group_pool,
+            key=lambda pt: (
+                pt.slo_met,
+                pt.token_throughput_per_chip,
+                -pt.bound_tpot_ms,
+                pt.est_interactivity_tok_s,
+            ),
+        ),
+        max(
+            group_pool,
+            key=lambda pt: (
+                pt.slo_met,
+                pt.est_interactivity_tok_s,
+                -pt.bound_tpot_ms,
+                pt.token_throughput_per_chip,
+            ),
+        ),
+    )
+
+    selected: list[ParetoPoint] = []
+    chosen_groups: set[tuple[object, ...]] = set()
+    for anchor in anchors:
+        if len(selected) >= k:
+            break
+        group_key = _decode_group_key(anchor)
+        if group_key not in chosen_groups:
+            selected.append(anchor)
+            chosen_groups.add(group_key)
+
+    _fill_skyline_slots(selected, chosen_groups, group_pool, _decode_group_key, k)
+    if len(selected) < k:
+        chosen_pairs: set[tuple[object, ...]] = {
+            _pair_family_key(pt) for pt in selected
+        }
+        _fill_skyline_slots(
+            selected, chosen_pairs, list(best_by_pair.values()), _pair_family_key, k
+        )
+
+    selected.sort(
+        key=lambda pt: (
+            -pt.token_throughput_per_chip,
+            pt.bound_tpot_ms,
+            -pt.est_interactivity_tok_s,
+        )
+    )
+    return tuple(selected)
+
+
+def pareto_skyline_by_concurrency(
+    plan: ServingPlan,
+    k: int = DEFAULT_TOP_K,
+) -> dict[int, tuple[ParetoPoint, ...]]:
+    """Select up to k pure 3-objective Pareto skyline layouts per concurrency."""
+    if k <= 0 or not plan.candidates:
+        return {}
+    by_concurrency: dict[int, list[ParetoPoint]] = {}
+    for point in plan.candidates:
+        by_concurrency.setdefault(point.concurrency, []).append(point)
+    result: dict[int, tuple[ParetoPoint, ...]] = {}
+    for concurrency in sorted(by_concurrency):
+        conc_points = by_concurrency[concurrency]
+        not_ruled_out = [
+            pt for pt in conc_points if pt.slo_verdict != SLO_VERDICT_RULED_OUT
+        ]
+        pool = not_ruled_out if not_ruled_out else conc_points
+        result[concurrency] = _select_concurrency_skyline(pool, k)
+    return result
 
 
 def top_layout_roles(
@@ -1231,6 +1410,19 @@ def build_solve_payload(
         for pt, role, margin in top_layout_roles(top_pts)
     ]
     payload["top_k"] = top_entries
+    skyline_by_conc = pareto_skyline_by_concurrency(plan, top_k)
+    payload["concurrency_top_k"] = {
+        str(conc): [
+            {
+                "frontier_role": role,
+                "margin_vs_rank1_pct": margin,
+                "point": asdict(pt),
+                "launch": point_launch_args(pt, opts),
+            }
+            for pt, role, margin in top_layout_roles(conc_pts)
+        ]
+        for conc, conc_pts in skyline_by_conc.items()
+    }
     if dtypes is not None:
         payload["dtypes"] = asdict(dtypes)
     return cast("SolvePayload", payload)
@@ -1250,6 +1442,8 @@ def emit_ceiling_rows(plan: ServingPlan) -> list[CeilingRow]:
             "total_chips": pt.total_chips,
             "mode": pt.mode,
             "binding_unit": pt.binding,
+            "min_decode_seqs": pt.min_decode_seqs,
+            "floor_throughput_per_chip": pt.floor_throughput_per_chip,
         }
         for pt in plan.frontier
         if pt.slo_verdict != SLO_VERDICT_RULED_OUT

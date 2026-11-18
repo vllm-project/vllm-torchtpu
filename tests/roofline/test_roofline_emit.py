@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING, Literal
 
 import pytest
 
-from tests.roofline.conftest import QWEN35_CFG, make_pareto_point
+from tests.roofline.conftest import (
+    QWEN35_CFG,
+    SMALL_HYBRID_MOE_CFG,
+    make_pareto_point,
+)
 from vllm_torchtpu.roofline import (
     CHIPS,
     SOLVE_SCHEMA,
@@ -40,10 +44,12 @@ from vllm_torchtpu.roofline import (
     emit_launch_args,
     format_parallelism,
     from_hf_config,
+    pareto_skyline_by_concurrency,
     parse_layout,
     point_launch_args,
     pool_cli_args,
     pool_label,
+    render_html,
     solve_serving_plan,
     top_layouts,
 )
@@ -1429,3 +1435,198 @@ def test_emit_cli_uses_serve_cmd_model_ahead_of_config_path(
     assert f"vllm serve {serve_model_id} --tensor-parallel-size" in captured.out
     assert _MODEL_PLACEHOLDER not in captured.out
     assert _UNKNOWN_MODEL_WARNING not in captured.err
+
+
+@pytest.mark.parametrize("expected_k", [5])
+def test_pareto_skyline_by_concurrency_retains_all_concurrencies_and_xpyd_families(
+    expected_k: int,
+) -> None:
+    """Retain every concurrency and distinct mixed or xP:yD decode pool families."""
+    mix_tp8 = _sample_pool(
+        "mixed", _PoolConfig(instances=1, topology="2x2x1", chips=4, tp=8, dp=1, ep=8)
+    )
+    mix_tp8_dcp2 = _sample_pool(
+        "mixed",
+        _PoolConfig(
+            instances=1, topology="2x2x1", chips=4, tp=8, dp=1, ep=8, kv_split=2
+        ),
+    )
+    mix_tp4_dp2 = _sample_pool(
+        "mixed", _PoolConfig(instances=1, topology="2x2x1", chips=4, tp=4, dp=2, ep=8)
+    )
+    pref_pp2 = _sample_pool(
+        "prefill",
+        _PoolConfig(instances=1, topology="2x2x1", chips=4, tp=4, dp=1, ep=4, pp=2),
+    )
+    pref_pcp2 = _sample_pool(
+        "prefill",
+        _PoolConfig(instances=1, topology="2x2x1", chips=4, tp=4, dp=1, ep=4, pcp=2),
+    )
+    pref_2p = _sample_pool(
+        "prefill",
+        _PoolConfig(instances=2, topology="2x2x1", chips=4, tp=8, dp=1, ep=8),
+    )
+    dec_2d = _sample_pool(
+        "decode",
+        _PoolConfig(instances=2, topology="2x2x1", chips=4, tp=8, dp=1, ep=8),
+    )
+    dec_6d = _sample_pool(
+        "decode",
+        _PoolConfig(instances=6, topology="2x2x1", chips=4, tp=8, dp=1, ep=8),
+    )
+
+    c4_fast = dc_replace(
+        make_pareto_point(mix_tp8, 4, 1500.0, 220.0), bound_tpot_ms=3.2
+    )
+    c4_dup_dcp = dc_replace(
+        make_pareto_point(mix_tp8_dcp2, 4, 1480.0, 215.0), bound_tpot_ms=3.4
+    )
+    c4_tput = dc_replace(
+        make_pareto_point(mix_tp4_dp2, 4, 2100.0, 140.0), bound_tpot_ms=5.1
+    )
+    c4_1p2d_pp = dc_replace(
+        make_pareto_point(dec_2d, 4, 1950.0, 190.0, prefill_pool=pref_pp2),
+        bound_tpot_ms=3.9,
+    )
+    c4_1p2d_pcp = dc_replace(
+        make_pareto_point(dec_2d, 4, 1850.0, 185.0, prefill_pool=pref_pcp2),
+        bound_tpot_ms=4.0,
+    )
+    c4_2p6d = dc_replace(
+        make_pareto_point(dec_6d, 4, 2300.0, 175.0, prefill_pool=pref_2p),
+        bound_tpot_ms=4.1,
+    )
+    c64_dp2 = dc_replace(
+        make_pareto_point(mix_tp4_dp2, 64, 5200.0, 80.0),
+        bound_tpot_ms=8.5,
+        slo_met=False,
+        slo_verdict="undecided",
+    )
+
+    all_points = (
+        c4_fast,
+        c4_dup_dcp,
+        c4_tput,
+        c4_1p2d_pp,
+        c4_1p2d_pcp,
+        c4_2p6d,
+        c64_dp2,
+    )
+    scenario = TrafficScenario(
+        name="skyline-multi-conc",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(4, 64),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = ServingPlan(
+        model_layers=8,
+        chip="tpu7x",
+        scenario=scenario,
+        mode="both",
+        recommended=c64_dp2,
+        frontier=(c4_fast, c4_2p6d, c64_dp2),
+        warnings=(),
+        candidates=all_points,
+    )
+
+    skyline = pareto_skyline_by_concurrency(serving_plan, k=expected_k)
+    assert set(skyline.keys()) == {4, 64}
+    c4_selected = skyline[4]
+    assert len(c4_selected) == expected_k
+    # Pure kv_split duplicate collapsed; all 4 distinct decode/ratio groups plus
+    # the Pass-2 PCP prefill variant fill the 5 skyline slots.
+    assert c4_dup_dcp not in c4_selected
+    assert c4_fast in c4_selected
+    assert c4_tput in c4_selected
+    assert c4_1p2d_pp in c4_selected
+    assert c4_2p6d in c4_selected
+    assert c4_1p2d_pcp in c4_selected
+    assert skyline[64] == (c64_dp2,)
+
+
+def test_solve_payload_emits_concurrency_top_k_preserving_legacy_top_k(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Emit additive concurrency_top_k in solve/v2 while preserving legacy top_k."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(SMALL_HYBRID_MOE_CFG), encoding="utf-8")
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = _dtypes_from_cfg(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    scenario = TrafficScenario(
+        name="emit-concurrency-skyline",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(4, 16),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    payload = build_solve_payload(
+        serving_plan, chip=chip, dtypes=dt, model="org/qwen35", top_k=3
+    )
+    assert payload["schema"] == SOLVE_SCHEMA
+    legacy_top_k = payload["top_k"]
+    assert len(legacy_top_k) == len(top_layouts(serving_plan, 3))
+    conc_map = payload["concurrency_top_k"]
+    assert set(conc_map.keys()) == {"4", "16"}
+    for entries in conc_map.values():
+        assert entries
+        for entry in entries:
+            assert set(entry.keys()) == {
+                "frontier_role",
+                "margin_vs_rank1_pct",
+                "point",
+                "launch",
+            }
+            assert entry["launch"]["commands"]
+    ceiling_rows = emit_ceiling_rows(serving_plan)
+    assert ceiling_rows
+    assert "min_decode_seqs" in ceiling_rows[0]
+    assert "floor_throughput_per_chip" in ceiling_rows[0]
+
+    html_out = render_html(payload)
+    assert "Top-K Skyline by Concurrency" in html_out
+    assert "#1 " in html_out
+
+    exit_code = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "4,16",
+            "--isl",
+            "2048",
+            "--osl",
+            "256",
+            "--prefix-hit-rate",
+            "0.0",
+            "--accept-len",
+            "1.0",
+            "--think-time-s",
+            "0.0",
+            "--top-k",
+            "3",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Top-K Skyline by Concurrency" in captured.out
+    assert "#1 " in captured.out

@@ -42,6 +42,7 @@ from .constants import (
     UNIT_GIBI,
     UNIT_GIGA,
     UNIT_MILLIS_PER_SECOND,
+    ZERO_THINK_TIME_WARNING,
     SloVerdict,
 )
 from .crossover import (
@@ -327,6 +328,8 @@ class ParetoPoint:
     decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
+    min_decode_seqs: float = 0.0
+    floor_throughput_per_chip: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -804,11 +807,25 @@ class _MixedLoopInput:
     chunk_tok_c: int
     ttft_service_s: float
     pcie_read_s: float
+    duration_kind: _StepDurationKind = "serial_estimate"
+    ttft_upper_s: float | None = None
+
+
+type _StepDurationKind = Literal["serial_estimate", "hard_floor"]
+
+
+def _step_duration_s(
+    step_floor_val: StepFloor, duration_kind: _StepDurationKind
+) -> float:
+    """Select the modeled or hard-floor step duration in seconds."""
+    if duration_kind == "hard_floor":
+        return step_floor_val.hard_floor_s
+    return step_floor_val.serial_estimate_s
 
 
 @dataclass(frozen=True, slots=True)
 class _MixedLoopOutput:
-    """Solved fixed-point mixed step floors, latencies, and request rate."""
+    """Solved fixed-point mixed step floors, latencies, rate, and residency."""
 
     sf_dec: StepFloor
     sf_mix: StepFloor
@@ -816,6 +833,22 @@ class _MixedLoopOutput:
     est_ttft_ms: float
     est_tpot_ms: float
     x_rate: float
+    decode_seqs: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _DisaggMetricsOutput:
+    """Solved disaggregated latency, throughput, residency, and floor times."""
+
+    est_ttft_ms: float
+    est_tpot_ms: float
+    interactivity: float
+    out_tput: float
+    tot_tput: float
+    sf_d: StepFloor
+    bound_sf_d: StepFloor
+    min_decode_seqs: float
+    floor_throughput_per_chip: float
 
 
 def _floor_times(step_floor_val: StepFloor) -> FloorTimes:
@@ -1277,9 +1310,9 @@ def _solve_mixed_decode_fixed_point(
             if eval_context.spec_k > 0
             else sf_dec
         )
-        draft_serial_s = max(
-            0.0, sf_dec.serial_estimate_s - sf_ver_only.serial_estimate_s
-        )
+        dec_step_s = _step_duration_s(sf_dec, loop_in.duration_kind)
+        ver_step_s = _step_duration_s(sf_ver_only, loop_in.duration_kind)
+        draft_step_s = max(0.0, dec_step_s - ver_step_s)
         sf_mix = step_floor(
             eval_context.geom,
             eval_context.chip,
@@ -1294,21 +1327,26 @@ def _solve_mixed_decode_fixed_point(
             ),
             opts,
         )
-        mix_serial_s = sf_mix.serial_estimate_s + draft_serial_s
+        mix_step_s = _step_duration_s(sf_mix, loop_in.duration_kind) + draft_step_s
         bn = float(b_replica * loop_in.n_chunks_c)
         p_mix = min(1.0, bn / max(1.0, dec_steps_per_req + bn))
-        est_step_s = (1.0 - p_mix) * sf_dec.serial_estimate_s + p_mix * mix_serial_s
-        tpot_s = est_step_s / eff_al
+        effective_step_s = (1.0 - p_mix) * dec_step_s + p_mix * mix_step_s
+        tpot_s = effective_step_s / eff_al
         t_dec_s = osl * tpot_s
         total_req_work_s = (
-            dec_steps_per_req * sf_dec.serial_estimate_s
-            + float(loop_in.b_res * loop_in.n_chunks_c) * mix_serial_s
+            dec_steps_per_req * dec_step_s
+            + float(loop_in.b_res * loop_in.n_chunks_c) * mix_step_s
             + float(loop_in.b_res) * loop_in.pcie_read_s
         )
         x_capacity = max_decode_seqs / max(1e-9, total_req_work_s)
+        prefill_wait_s = (
+            loop_in.ttft_upper_s
+            if loop_in.ttft_upper_s is not None
+            else loop_in.ttft_service_s
+        )
         x_rate = min(
             x_capacity,
-            float(c) / max(1e-9, loop_in.ttft_service_s + t_dec_s + think),
+            float(c) / max(1e-9, prefill_wait_s + t_dec_s + think),
         )
         b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), x_rate * t_dec_s))
     ttft_est_s = float(c) / max(1e-9, x_rate) - t_dec_s - think
@@ -1319,6 +1357,7 @@ def _solve_mixed_decode_fixed_point(
         est_ttft_ms=ttft_est_s * UNIT_MILLIS_PER_SECOND,
         est_tpot_ms=tpot_s * UNIT_MILLIS_PER_SECOND,
         x_rate=x_rate,
+        decode_seqs=b_dec,
     )
 
 
@@ -1392,19 +1431,14 @@ def _evaluate_mixed_point(
     )
     chunk_tok_c = min(eff_isl_c, eval_context.scenario.prefill_chunk)
 
-    solved = _solve_mixed_decode_fixed_point(
-        eval_context,
-        topo,
-        par,
-        c,
-        _MixedLoopInput(
-            b_res=b_res,
-            n_chunks_c=n_chunks_c,
-            chunk_tok_c=chunk_tok_c,
-            ttft_service_s=ttft_service_s,
-            pcie_read_s=pcie_read_s,
-        ),
+    mixed_in = _MixedLoopInput(
+        b_res=b_res,
+        n_chunks_c=n_chunks_c,
+        chunk_tok_c=chunk_tok_c,
+        ttft_service_s=ttft_service_s,
+        pcie_read_s=pcie_read_s,
     )
+    solved = _solve_mixed_decode_fixed_point(eval_context, topo, par, c, mixed_in)
     interactivity = UNIT_MILLIS_PER_SECOND / max(1e-9, solved.est_tpot_ms)
     out_tput = (solved.x_rate * float(eval_context.scenario.osl)) / float(
         topo.num_chips
@@ -1412,8 +1446,38 @@ def _evaluate_mixed_point(
     tot_tput = (
         solved.x_rate * float(eval_context.scenario.isl + eval_context.scenario.osl)
     ) / float(topo.num_chips)
+    ttft_slo_ms = eval_context.scenario.ttft_slo_ms
+    ttft_upper_s = (
+        max(ttft_service_s, ttft_slo_ms / UNIT_MILLIS_PER_SECOND)
+        if ttft_slo_ms is not None
+        else ttft_service_s
+    )
+    floor_solved = _solve_mixed_decode_fixed_point(
+        eval_context,
+        topo,
+        par,
+        c,
+        replace(mixed_in, duration_kind="hard_floor", ttft_upper_s=ttft_upper_s),
+    )
+    floor_tput = max(
+        tot_tput,
+        (
+            floor_solved.x_rate
+            * float(eval_context.scenario.isl + eval_context.scenario.osl)
+        )
+        / float(topo.num_chips),
+    )
+    if eval_context.scenario.think_time_s <= 0.0:
+        min_decode_seqs = solved.decode_seqs
+        bound_sf_dec = solved.sf_dec
+    else:
+        min_decode_seqs = min(solved.decode_seqs, floor_solved.decode_seqs)
+        floor_b_replica = max(
+            1, min(b_res, math.ceil(min_decode_seqs / float(max(1, par.dp))))
+        )
+        bound_sf_dec = _eval_decode_floor(eval_context, topo, par, floor_b_replica)
     bound_tpot_ms = (
-        solved.sf_dec.hard_floor_s * UNIT_MILLIS_PER_SECOND
+        bound_sf_dec.hard_floor_s * UNIT_MILLIS_PER_SECOND
     ) / eval_context.eff_al
     verdict = _resolve_slo_verdict(
         eval_context.scenario,
@@ -1463,9 +1527,11 @@ def _evaluate_mixed_point(
         bound_tpot_ms=bound_tpot_ms,
         bound_ttft_ms=bound_ttft_ms,
         slo_verdict=verdict,
-        decode_floor=_floor_times(solved.sf_dec),
+        decode_floor=_floor_times(bound_sf_dec),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
+        min_decode_seqs=min_decode_seqs,
+        floor_throughput_per_chip=floor_tput,
     )
 
 
@@ -1572,20 +1638,56 @@ def _evaluate_mixed_candidates(
     return (candidates, min_c1_tpot_ms, min_req_ttft_ms)
 
 
+def _run_disagg_decode_loop(
+    eval_context: _SolveContext,
+    dec: _DisaggDecodeState,
+    target: _DisaggRatioTarget,
+    batch_stats: _DisaggBatchStats,
+    loop_ctrl: tuple[float, _StepDurationKind],
+) -> tuple[StepFloor, float, float, float, float]:
+    """Solve 3-step Little's-law fixed point for a disaggregated decode pool."""
+    prefill_wait_s, duration_kind = loop_ctrl
+    eff_al = eval_context.eff_al
+    dec_steps_per_req = max(1.0, eval_context.scenario.osl / eff_al)
+    think = eval_context.scenario.think_time_s
+    osl = float(eval_context.scenario.osl)
+    idp_val = max(1, target.y_d * dec.par.dp)
+    max_decode_seqs = float(batch_stats.b_res * idp_val)
+    b_dec = max(1.0, min(float(min(target.c, int(max_decode_seqs))), float(target.c)))
+    sf_d = _eval_decode_floor(eval_context, dec.topo, dec.par, 1)
+    tpot_s = 0.0
+    t_dec_s = 0.0
+    x_rate = 0.0
+    for _ in range(3):
+        b_replica = max(1, min(batch_stats.b_res, math.ceil(b_dec / float(idp_val))))
+        sf_d = _eval_decode_floor(eval_context, dec.topo, dec.par, b_replica)
+        step_s = _step_duration_s(sf_d, duration_kind)
+        tpot_s = step_s / eff_al
+        t_dec_s = osl * tpot_s
+        rate_d_cap = float(batch_stats.b_res * idp_val) / (
+            dec_steps_per_req * max(1e-9, step_s)
+        )
+        x_capacity = min(float(target.x_p) * batch_stats.rate_p_eff, rate_d_cap)
+        x_rate = min(
+            x_capacity, float(target.c) / max(1e-9, prefill_wait_s + t_dec_s + think)
+        )
+        b_dec = max(
+            1.0, min(float(min(target.c, int(max_decode_seqs))), x_rate * t_dec_s)
+        )
+    return (sf_d, tpot_s, t_dec_s, x_rate, b_dec)
+
+
 def _compute_disagg_metrics(
     eval_context: _SolveContext,
     dec: _DisaggDecodeState,
     pref: _PrefillOption,
     target: _DisaggRatioTarget,
     batch_stats: _DisaggBatchStats,
-) -> tuple[float, float, float, float, float, StepFloor]:
+) -> _DisaggMetricsOutput:
     """Solve coupled Little's-law fixed point for a disaggregated candidate."""
-    dec_steps_per_req = max(1.0, eval_context.scenario.osl / eval_context.eff_al)
-    eff_al = eval_context.eff_al
     think = eval_context.scenario.think_time_s
     osl = float(eval_context.scenario.osl)
     idp_val = max(1, target.y_d * dec.par.dp)
-    max_decode_seqs = float(batch_stats.b_res * idp_val)
 
     kv_key_d = (dec.par, batch_stats.b_res, batch_stats.b_local, 0.0)
     cached_kv_d = eval_context.kv_fit_cache.get(kv_key_d)
@@ -1631,28 +1733,13 @@ def _compute_disagg_metrics(
         batch_stats.ttft_eff_ms + pcie_d_ms + kv_xfer_ms
     ) / UNIT_MILLIS_PER_SECOND
 
-    b_dec = max(1.0, min(float(min(target.c, int(max_decode_seqs))), float(target.c)))
-    sf_d = _eval_decode_floor(eval_context, dec.topo, dec.par, 1)
-    tpot_s = 0.0
-    t_dec_s = 0.0
-    x_capacity = 0.0
-    x_rate = 0.0
-    for _ in range(3):
-        b_replica = max(1, min(batch_stats.b_res, math.ceil(b_dec / float(idp_val))))
-        sf_d = _eval_decode_floor(eval_context, dec.topo, dec.par, b_replica)
-        tpot_s = sf_d.serial_estimate_s / eff_al
-        t_dec_s = osl * tpot_s
-        rate_d_cap = float(batch_stats.b_res * idp_val) / (
-            dec_steps_per_req * max(1e-9, sf_d.serial_estimate_s)
-        )
-        x_capacity = min(float(target.x_p) * batch_stats.rate_p_eff, rate_d_cap)
-        x_rate = min(
-            x_capacity, float(target.c) / max(1e-9, ttft_service_s + t_dec_s + think)
-        )
-        b_dec = max(
-            1.0, min(float(min(target.c, int(max_decode_seqs))), x_rate * t_dec_s)
-        )
-
+    sf_d, tpot_s, t_dec_s, x_rate, est_decode_seqs = _run_disagg_decode_loop(
+        eval_context,
+        dec,
+        target,
+        batch_stats,
+        (ttft_service_s, "serial_estimate"),
+    )
     ttft_est_s = float(target.c) / max(1e-9, x_rate) - t_dec_s - think
     est_ttft_d_ms = ttft_est_s * UNIT_MILLIS_PER_SECOND
     est_tpot_ms = tpot_s * UNIT_MILLIS_PER_SECOND
@@ -1661,7 +1748,47 @@ def _compute_disagg_metrics(
     tot_tput = (
         x_rate * float(eval_context.scenario.isl + eval_context.scenario.osl)
     ) / float(target.total_chips)
-    return (est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput, sf_d)
+
+    ttft_slo_ms = eval_context.scenario.ttft_slo_ms
+    ttft_upper_s = (
+        max(ttft_service_s, ttft_slo_ms / UNIT_MILLIS_PER_SECOND)
+        if ttft_slo_ms is not None
+        else ttft_service_s
+    )
+    _, _, _, floor_x_rate, floor_decode_seqs = _run_disagg_decode_loop(
+        eval_context,
+        dec,
+        target,
+        batch_stats,
+        (ttft_upper_s, "hard_floor"),
+    )
+    floor_tput = max(
+        tot_tput,
+        (floor_x_rate * float(eval_context.scenario.isl + eval_context.scenario.osl))
+        / float(target.total_chips),
+    )
+    if think <= 0.0:
+        min_decode_seqs = est_decode_seqs
+        bound_sf_d = sf_d
+    else:
+        min_decode_seqs = min(est_decode_seqs, floor_decode_seqs)
+        floor_b_replica = max(
+            1, min(batch_stats.b_res, math.ceil(min_decode_seqs / float(idp_val)))
+        )
+        bound_sf_d = _eval_decode_floor(
+            eval_context, dec.topo, dec.par, floor_b_replica
+        )
+    return _DisaggMetricsOutput(
+        est_ttft_ms=est_ttft_d_ms,
+        est_tpot_ms=est_tpot_ms,
+        interactivity=interactivity,
+        out_tput=out_tput,
+        tot_tput=tot_tput,
+        sf_d=sf_d,
+        bound_sf_d=bound_sf_d,
+        min_decode_seqs=min_decode_seqs,
+        floor_throughput_per_chip=floor_tput,
+    )
 
 
 def _solve_disagg_think_batch(
@@ -1785,24 +1912,28 @@ def _evaluate_disagg_instance_pair(
     ttft_eff_ms, rate_p_eff, bound_ttft_ms = _resolve_effective_prefill(
         eval_context, pref, h_eff, cache
     )
-    est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput, sf_d = (
-        _compute_disagg_metrics(
-            eval_context,
-            dec,
-            pref,
-            target,
-            _DisaggBatchStats(
-                b_res=b_res,
-                b_local=b_local,
-                ttft_eff_ms=ttft_eff_ms,
-                rate_p_eff=rate_p_eff,
-                h_eff=h_eff,
-            ),
-        )
+    disagg_metrics = _compute_disagg_metrics(
+        eval_context,
+        dec,
+        pref,
+        target,
+        _DisaggBatchStats(
+            b_res=b_res,
+            b_local=b_local,
+            ttft_eff_ms=ttft_eff_ms,
+            rate_p_eff=rate_p_eff,
+            h_eff=h_eff,
+        ),
     )
-    bound_tpot_ms = (sf_d.hard_floor_s * UNIT_MILLIS_PER_SECOND) / eval_context.eff_al
+    bound_tpot_ms = (
+        disagg_metrics.bound_sf_d.hard_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / eval_context.eff_al
     verdict = _resolve_slo_verdict(
-        eval_context.scenario, est_ttft_d_ms, est_tpot_ms, bound_ttft_ms, bound_tpot_ms
+        eval_context.scenario,
+        disagg_metrics.est_ttft_ms,
+        disagg_metrics.est_tpot_ms,
+        bound_ttft_ms,
+        bound_tpot_ms,
     )
 
     max_seqs_d = b_res if b_res < b_local else eval_context.scenario.max_num_seqs
@@ -1846,20 +1977,22 @@ def _evaluate_disagg_instance_pair(
         total_chips=target.total_chips,
         prefill_pool=p_pool,
         decode_pool=d_pool,
-        est_ttft_ms=est_ttft_d_ms,
-        est_tpot_ms=est_tpot_ms,
-        est_interactivity_tok_s=interactivity,
-        output_throughput_per_chip=out_tput,
-        token_throughput_per_chip=tot_tput,
+        est_ttft_ms=disagg_metrics.est_ttft_ms,
+        est_tpot_ms=disagg_metrics.est_tpot_ms,
+        est_interactivity_tok_s=disagg_metrics.interactivity,
+        output_throughput_per_chip=disagg_metrics.out_tput,
+        token_throughput_per_chip=disagg_metrics.tot_tput,
         p_mixed=0.0,
-        binding=sf_d.binding,
+        binding=disagg_metrics.sf_d.binding,
         slo_met=verdict == SLO_VERDICT_ESTIMATE_MEETS,
         bound_tpot_ms=bound_tpot_ms,
         bound_ttft_ms=bound_ttft_ms,
         slo_verdict=verdict,
-        decode_floor=_floor_times(sf_d),
+        decode_floor=_floor_times(disagg_metrics.bound_sf_d),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
+        min_decode_seqs=disagg_metrics.min_decode_seqs,
+        floor_throughput_per_chip=disagg_metrics.floor_throughput_per_chip,
     )
 
 
@@ -2301,6 +2434,8 @@ def solve_serving_plan(
     )
     if recommended is not None and recommended.slo_verdict == SLO_VERDICT_UNDECIDED:
         warnings.append(UNDECIDED_SLO_WARNING)
+    if scenario.think_time_s <= 0.0:
+        warnings.append(ZERO_THINK_TIME_WARNING)
     pruned_sweep = prune_sweep_candidates(geom, dtypes, chip, scenario, candidates)
     base_plan = ServingPlan(
         model_layers=geom.num_layers,

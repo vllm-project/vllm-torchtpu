@@ -3181,7 +3181,10 @@ def test_recommended_layout_whose_estimate_misses_the_slo_carries_a_warning() ->
     assert serving_plan.recommended is not None
     assert serving_plan.recommended.slo_verdict == "undecided"
     assert not serving_plan.recommended.slo_met
-    assert serving_plan.warnings == (rf.constants.UNDECIDED_SLO_WARNING,)
+    assert serving_plan.warnings == (
+        rf.constants.UNDECIDED_SLO_WARNING,
+        rf.constants.ZERO_THINK_TIME_WARNING,
+    )
 
     # Also appended when another warning (missing quantization_config) already exists.
     default_dtypes = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0, act="a8")
@@ -3192,7 +3195,7 @@ def test_recommended_layout_whose_estimate_misses_the_slo_carries_a_warning() ->
         scenario,
         SolveOptions(mode="mixed", max_chips=4),
     )
-    expected_combined_warnings = 2
+    expected_combined_warnings = 3
     assert combined_plan.recommended is not None
     assert combined_plan.recommended.slo_verdict == "undecided"
     assert len(combined_plan.warnings) == expected_combined_warnings
@@ -3316,3 +3319,145 @@ def test_sub_block_tp_refinement_admits_qwen38_shared_expert() -> None:
     assert tp8_ep8, (
         "Expected TP8 x EP8 layout to be enumerated under sub-block FP8 refinement"
     )
+
+
+def _estimate_decode_seqs(point: rf.ParetoPoint) -> float:
+    """Reconstruct Little's-law estimate decode residency from emitted rates."""
+    raw_seqs = (
+        point.output_throughput_per_chip
+        * float(point.total_chips)
+        * point.est_tpot_ms
+        / UNIT_MILLIS_PER_SECOND
+    )
+    return max(1.0, min(float(point.concurrency), raw_seqs))
+
+
+def test_residency_floor_seqs_never_exceed_serial_estimate_seqs() -> None:
+    """Keep residency-floor decode rows at or below estimate rows under think time."""
+    geometry = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dtypes = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    scenario = TrafficScenario(
+        name="positive-think-residency",
+        isl=2048,
+        osl=1024,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.5,
+        concurrencies=(128,),
+        kv_working_set_turns=1.0,
+    )
+    mixed_plan = solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    disagg_plan = solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="disagg", max_chips=8),
+    )
+    assert mixed_plan.candidates
+    assert disagg_plan.candidates
+    for point in (*mixed_plan.candidates, *disagg_plan.candidates):
+        est_seqs = _estimate_decode_seqs(point)
+        assert point.min_decode_seqs >= 1.0
+        assert point.min_decode_seqs <= est_seqs + 1e-6
+        assert point.bound_tpot_ms <= point.est_tpot_ms + 1e-9
+        assert point.floor_throughput_per_chip >= point.token_throughput_per_chip - 1e-6
+    assert any(
+        point.min_decode_seqs < _estimate_decode_seqs(point) - 1e-6
+        for point in mixed_plan.candidates
+    )
+    assert any(
+        point.min_decode_seqs < _estimate_decode_seqs(point) - 1e-6
+        for point in disagg_plan.candidates
+    )
+
+
+def test_bound_tpot_reads_residency_floor_seqs() -> None:
+    """Evaluate bound_tpot_ms at the residency-floor decode batch, not estimate rows."""
+    geometry = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dtypes = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    scenario = TrafficScenario(
+        name="floor-rows-bound",
+        isl=2048,
+        osl=1024,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.5,
+        concurrencies=(128,),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert serving_plan.candidates
+    target_point = next(
+        point
+        for point in serving_plan.candidates
+        if point.min_decode_seqs < _estimate_decode_seqs(point) - 1e-6
+    )
+    pool = target_point.decode_pool
+    topo = TOPOLOGIES[pool.topology]
+    parallel = Parallel(
+        tp=pool.tp,
+        dp=pool.dp,
+        ep=pool.ep,
+        pp=pool.pp,
+        pcp=pool.pcp,
+        kv_split=pool.kv_split,
+        moe="ep" if pool.ep > 1 else "tp_slice",
+        moe_dispatch=pool.moe_dispatch,
+        ranks_per_chip=topo.cores_per_chip,
+    )
+    replica_batch = max(1, math.ceil(target_point.min_decode_seqs / float(pool.dp)))
+    ctx_mid = scenario.isl + scenario.osl // 2
+    recomputed_floor = step_floor(
+        geometry,
+        chip,
+        parallel,
+        StepShape(batch=replica_batch, rows_per_seq=1, context=ctx_mid, state_writes=1),
+        FloorOptions(dt=dtypes, topology=topo),
+    )
+    expected_bound_tpot_ms = recomputed_floor.hard_floor_s * UNIT_MILLIS_PER_SECOND
+    assert target_point.bound_tpot_ms == pytest.approx(expected_bound_tpot_ms, rel=1e-9)
+
+
+def test_zero_think_time_preserves_estimate_seqs_and_warns() -> None:
+    """Short-circuit residency floor rows when think_time_s is zero and emit warning."""
+    geometry = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dtypes = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    scenario = TrafficScenario(
+        name="zero-think-warning",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8,),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert serving_plan.candidates
+    assert rf.constants.ZERO_THINK_TIME_WARNING in serving_plan.warnings
+    for point in serving_plan.candidates:
+        est_seqs = _estimate_decode_seqs(point)
+        assert point.min_decode_seqs == pytest.approx(est_seqs, rel=1e-6)
+        assert point.floor_throughput_per_chip >= point.token_throughput_per_chip - 1e-6
