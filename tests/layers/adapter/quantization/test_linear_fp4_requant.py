@@ -86,10 +86,13 @@ def test_linear_quant_config_fp4_validation_and_block_multiples(monkeypatch):
     _, _, explicit_block, _ = _get_linear_quant_config(None)
     assert explicit_block == 1024
 
-    # Non-512-multiple block sizes must raise NotImplementedError rather than
-    # silently mis-indexing gmm_v2's W4A8 LHS block loop.
     monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "256")
-    with pytest.raises(NotImplementedError, match="multiple of 512"):
+    _, _, block_256, _ = _get_linear_quant_config(None)
+    assert block_256 == 256
+
+    # Blocks that are not a multiple of the MXU width cannot run W4A8.
+    monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "384")
+    with pytest.raises(NotImplementedError, match="multiple of 256"):
         _get_linear_quant_config(None)
 
     # Invalid REQUANTIZE_WEIGHT_DTYPE typos must fail eagerly on onload configs too.
@@ -344,17 +347,23 @@ def _require_tpu_v7x() -> None:
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("block_size", [256, 512])
 @pytest.mark.parametrize("n_out", [192, 256])
-def test_tpu_device_fp4_linear_w4a8_b512(monkeypatch, n_out: int):
+def test_tpu_device_fp4_linear_w4a8(monkeypatch, n_out: int, block_size: int):
     """Validates 128-aligned (256) and non-aligned (192) output widths + 3D x."""
     _require_tpu_v7x()
     monkeypatch.setenv("REQUANTIZE_WEIGHT_DTYPE", "fp4")
     monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
-    monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "512")
+    monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", str(block_size))
     monkeypatch.delenv("REQUANTIZE_FP4_PREFIXES", raising=False)
 
     torch.manual_seed(0)
     w_ref = torch.randn((n_out, 1024), dtype=torch.bfloat16, device="tpu") * 0.05
+    # Give alternate 256-wide input blocks very different magnitudes so a
+    # weight scale applied to the wrong block shows up in the output.
+    block_gain = torch.ones((4, 256), dtype=torch.bfloat16)
+    block_gain[1::2] = 16.0
+    w_ref = w_ref * block_gain.reshape(1024).to(w_ref.device)
     x_3d = torch.randn((2, 8, 1024), dtype=torch.bfloat16, device="tpu")
     y_ref = (x_3d.float() @ w_ref.float().T).to(torch.bfloat16)
 
@@ -370,7 +379,7 @@ def test_tpu_device_fp4_linear_w4a8_b512(monkeypatch, n_out: int):
     assert layer.weight.device.type == "tpu"
     assert layer.weight.dtype == torch.float4_e2m1fn_x2
     assert tuple(layer.weight.shape) == (1024, n_out // 2)
-    assert tuple(layer.weight_scale.shape) == (1, 2, 1, n_out)
+    assert tuple(layer.weight_scale.shape) == (1, 1024 // block_size, 1, n_out)
 
     y_fp4 = method.apply(layer, x_3d)
     assert tuple(y_fp4.shape) == (2, 8, n_out)

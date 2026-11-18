@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -23,6 +24,9 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+# Default block size for dynamic activation quantization.
+_LHS_QUANT_BLOCK_SIZE = 512
 
 # Util.
 
@@ -1243,8 +1247,14 @@ def make_gmm_configs(
         # Input quantization involves reading all elements in a block to compute
         # scale value. Since this operation is very memory intensive, we use a
         # block size that is small enough to minimize memory overhead but large
-        # enough to minimize compute overhead of quantization.
-        quant_block_size=512,
+        # enough to minimize compute overhead of quantization. The kernel applies
+        # one rhs scale per lhs block, so a quantized lhs block must also divide
+        # the rhs quant block (e.g. 256 for a block-256 rhs).
+        quant_block_size=(
+            math.gcd(_LHS_QUANT_BLOCK_SIZE, block_size)
+            if lhs_q_dtype is not None
+            else _LHS_QUANT_BLOCK_SIZE
+        ),
         dtype=lhs.dtype,
     )
 

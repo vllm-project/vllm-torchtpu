@@ -287,13 +287,13 @@ def _get_linear_quant_config(
         _ensure_native_fp4_supported(desired_quant_dtype)
         if requant_block_size is None:
             requant_block_size = 512
-        if requant_block_size <= 0 or requant_block_size % 512 != 0:
-            # TODO(#3396): Allow smaller sublane-aligned block sizes once gmm_v2
-            # decouples its W4A8 LHS activation block size from 512.
+        if requant_block_size <= 0 or requant_block_size % 256 != 0:
+            # Blocks under the MXU width (256) would make gmm_v2 dequantize the
+            # weight before the matmul instead of running W4A8.
             raise NotImplementedError(
                 f"REQUANTIZE_WEIGHT_DTYPE={desired_quant_dtype!r} currently "
                 "requires REQUANTIZE_BLOCK_SIZE to be a positive multiple of "
-                f"512; got {requant_block_size}."
+                f"256; got {requant_block_size}."
             )
 
     if enable_quantized_matmul_kernel and not requant_block_size:

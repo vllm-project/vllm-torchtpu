@@ -19,6 +19,7 @@ test runner.
 """
 
 import collections
+import math
 from types import SimpleNamespace
 
 import jax
@@ -306,6 +307,68 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
     ).astype(lhs.dtype)
 
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("block_size", [256, 512])
+def test_gmm_quantized_lhs_uses_each_rhs_block_scale(block_size):
+    """W8A8 with an rhs quant block smaller than the default lhs block (512)."""
+    _require_tpu()
+
+    batch_size = 128
+    in_size = 1024
+    out_size = 512
+    num_groups = 4
+    key_lhs, key_rhs = jax.random.split(jax.random.key(0))
+
+    lhs = jax.random.uniform(key_lhs, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        key_rhs, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    # Alternate 256-row blocks of rhs differ 16x in magnitude, so applying one
+    # block's scale to its neighbor changes the result by far more than the
+    # quantization error.
+    block_gain = jnp.tile(jnp.array([1.0, 16.0], jnp.bfloat16), in_size // 512)
+    rhs = rhs * jnp.repeat(block_gain, 256)[None, :, None]
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array([0], dtype=jnp.int32)
+
+    # The kernel quantizes lhs to fp8 in blocks of gcd(512, block_size).
+    lhs_block_size = math.gcd(512, block_size)
+    lhs_q, lhs_scale = quantize_tensor(
+        lhs, jnp.float8_e4m3fn, axis=1, block_size=lhs_block_size
+    )
+    lhs_simulated = (
+        (
+            lhs_q.reshape(batch_size, -1, lhs_block_size).astype(jnp.float32)
+            * jnp.expand_dims(lhs_scale, axis=2)
+        )
+        .reshape(lhs.shape)
+        .astype(lhs.dtype)
+    )
+    expected = reference_gmm(
+        lhs_simulated,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+    ).astype(jnp.float32)
+
+    actual = gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=True,
+    ).astype(jnp.float32)
+
+    rel_err = jnp.linalg.norm(actual - expected) / jnp.linalg.norm(expected)
+    assert float(rel_err) < 0.05
 
 
 @pytest.mark.tpu_test
