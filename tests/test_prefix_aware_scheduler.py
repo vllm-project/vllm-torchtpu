@@ -316,6 +316,9 @@ def _make_step_scheduler(running, monkeypatch, budget=8192):
     s.waiting = FCFSRequestQueue()
     s.kv_holding_waiting = FCFSRequestQueue()
     s.max_num_scheduled_tokens = budget
+    # Read by the admission telemetry's inflight_reserved field.
+    s._inflight_prefills = set()
+    s._decode_throttle_switch = False
     return s, seen
 
 

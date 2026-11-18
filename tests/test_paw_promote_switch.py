@@ -41,7 +41,11 @@ def test_schedule_promotes_only_when_on(monkeypatch, on):
     calls = []
     monkeypatch.setattr(AsyncScheduler, "schedule", lambda self, *a, **k: "out")
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    # The promotion switch acts on a decode leg (a KV consumer).
+    s._is_kv_consumer = True
     s.running = []
+    s._inflight_prefills = set()
+    s._decode_throttle_switch = False
     s._promote_warmest_switch = on
     s._select_waiting_queue_for_scheduling = lambda: calls.append(1)
     assert s.schedule() == "out"
