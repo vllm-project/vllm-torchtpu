@@ -49,8 +49,6 @@ def _load(name: str, path: pathlib.Path):
     return module
 
 
-import bq_utils  # noqa: E402
-
 upload_results = _load("upload_results", _BENCHMARKING / "upload_results.py")
 parse_gke_results = _load(
     "parse_gke_results", _REPO / ".buildkite" / "scripts" / "parse_gke_results.py"
@@ -203,7 +201,12 @@ _SPEED_GRID_ROW = {
     "repository": "vllm-torchtpu",
     "run_type": "DAILY",
     "model_id": _MODEL,
-    "metrics": {"vllm_bench": _BENCH_METRICS, "lm_eval": {"gsm8k": 0.98}},
+    "metrics": {
+        "vllm_bench": _BENCH_METRICS,
+        "lm_eval": {"gsm8k": 0.98},
+        # 1000 / the median, P90 and P99 TPOT of 32, 40 and 50 ms.
+        "derived": {"median_intvty": 31.25, "p90_intvty": 25.0, "p99_intvty": 20.0},
+    },
     "config": {
         **_BASE_CONFIG,
         "backend": "openai-chat",
@@ -299,6 +302,122 @@ def test_gke_row_carries_the_cell(tmp_path, capsys):
     assert rows == [_GKE_ROW]
 
 
+def test_speed_grid_row_divides_throughput_by_the_stated_chips(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json", "isl1024_osl8192_c256.json")
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir, "--chips", 4)
+
+    assert returncode == 0
+    (row,) = rows
+    # 6168 output and 6936 total tok/s on 4 chips, not on TP x DP = 8 ranks.
+    assert row["metrics"] == {
+        "vllm_bench": _BENCH_METRICS,
+        "derived": {
+            "num_chips": 4,
+            "output_tput_per_chip": 1542.0,
+            "total_tput_per_chip": 1734.0,
+            "input_tput_per_chip": 192.0,
+            "median_intvty": 31.25,
+            "p90_intvty": 25.0,
+            "p99_intvty": 20.0,
+        },
+    }
+    assert row["config"] == _SPEED_GRID_ROW["config"]
+
+
+_ACCURACY_CONFIG = {**_BASE_CONFIG, "engine_flags": _ENGINE_FLAGS}
+
+
+@pytest.mark.parametrize(
+    ("fixture", "scores"),
+    [
+        ("lm_eval", {"gsm8k": 0.98}),
+        ("evalscope", {"mmmu_pro": 0.61}),
+        ("json_schema", {"json_schema": 0.95}),
+    ],
+)
+def test_accuracy_only_run_writes_one_accuracy_row(
+    tmp_path, monkeypatch, capsys, fixture, scores
+):
+    results_dir = _results_dir(tmp_path, "config.json", fixture)
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert rows == [
+        {
+            "table": _TABLE,
+            "record_id": _record_id(1),
+            "created_time": "CURRENT_TIMESTAMP()",
+            "repository": "vllm-torchtpu",
+            "run_type": "DAILY",
+            "model_id": _MODEL,
+            "metrics": {"lm_eval": scores},
+            "config": _ACCURACY_CONFIG,
+        }
+    ]
+
+
+def test_accuracy_only_run_merges_every_suite_into_the_one_row(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(
+        tmp_path, "config.json", "lm_eval", "evalscope", "json_schema"
+    )
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    (row,) = rows
+    assert row["metrics"] == {
+        "lm_eval": {"gsm8k": 0.98, "mmmu_pro": 0.61, "json_schema": 0.95}
+    }
+
+
+def test_accuracy_row_statement_is_the_documented_insert(tmp_path, monkeypatch, capsys):
+    results_dir = _results_dir(tmp_path, "evalscope")
+    (results_dir / "config.json").write_text(json.dumps({"model": "org/it's"}))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["upload_results.py", "--results-dir", str(results_dir), "--skip-db-upload"],
+    )
+
+    assert upload_results.main() == 0
+
+    statements = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("INSERT INTO `")
+    ]
+    assert statements == [
+        "INSERT INTO `" + _TABLE + "` ( record_id, created_time, repository, "
+        "run_type, model_id, metrics, config ) VALUES ( "
+        "'00000000-0000-0000-0000-000000000001', CURRENT_TIMESTAMP(), "
+        "'vllm-torchtpu', 'DAILY', 'org/it''s', "
+        """[STRUCT('lm_eval', PARSE_JSON('{"mmmu_pro": 0.61}', """
+        "wide_number_mode=>'round'))], "
+        """PARSE_JSON('{"code_hash": "0123abcd", "created_by": "buildkite-agent", """
+        """"device_type": "tpu7x-2x2x1", "run_by": "kube-agent-1", """
+        """"job_reference": "4242", "profile_gcs_dir": null, "engine_flags": """
+        """{"max_num_seqs": null, "max_num_batched_tokens": null, """
+        """"tensor_parallel_size": null, "data_parallel_size": 1, """
+        """"max_model_len": null, "enable_ep": false, "quantization": null, """
+        """"multihost_backend": null}}', wide_number_mode=>'round') );"""
+    ]
+
+
+def test_run_with_no_results_uploads_nothing(tmp_path, monkeypatch, capsys):
+    results_dir = _results_dir(tmp_path, "config.json")
+    monkeypatch.delenv("BUILDKITE_COMMIT")
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert (returncode, rows) == (0, [])
+
+
 _AGENTX_METRICS = {
     "request_throughput_avg": 0.25,
     "request_count_avg": 500.0,
@@ -325,48 +444,68 @@ _AGENTX_METRICS = {
     "scenario": "agentx",
     "submission_valid": True,
 }
+_AGENTX_CONFIG = {
+    **_BASE_CONFIG,
+    "engine_flags": _ENGINE_FLAGS,
+    "workload": {
+        "scenario": "agentx",
+        "dataset": "semianalysis_cc_traces_weka_062126_256k",
+        "max_context_length": 262144,
+        "max_concurrency": 16,
+    },
+}
+# The fixture's two engines: the prefill engine answered 18.4M of 20M queried
+# prompt tokens from cache, and 4 and 12 requests ran on average against 16
+# batch slots each.
 _AGENTX_ROUTING = {"prefix_cache_hit_rate": 0.92, "batch_utilization": 0.5}
 
 
 def test_created_time_sql_converts_an_offset_to_utc():
     assert (
-        bq_utils.created_time_sql("2026-11-02T09:18:05+08:00")
+        upload_results.bq_utils.created_time_sql("2026-11-02T09:18:05+08:00")
         == "TIMESTAMP '2026-11-02T01:18:05Z'"
     )
     assert (
-        bq_utils.created_time_sql("2026-11-02T01:18:05")
+        upload_results.bq_utils.created_time_sql("2026-11-02T01:18:05")
         == "TIMESTAMP '2026-11-02T01:18:05Z'"
     )
 
 
-def test_agentx_helpers_extract_metrics_per_chip_throughput_and_server_routing():
-    artifacts = _DATA / "agentx" / "conc_16" / "aiperf_artifacts"
-    export = json.loads((artifacts / "profile_export_aiperf.json").read_text())
-    server = json.loads((artifacts / "server_metrics_export.json").read_text())
-    chips = bq_utils.physical_chips(prefill_chips=16, decode_chips=16)
+def test_agentx_point_row_has_per_chip_throughput_and_p90_interactivity(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json", "agentx")
 
-    assert chips == 32
-    assert bq_utils.agentx_concurrency(export) == 16
-    assert (
-        bq_utils.created_time_sql(export["end_time"])
-        == "TIMESTAMP '2026-10-28T08:35:19Z'"
+    returncode, rows = _upload(
+        monkeypatch, capsys, results_dir, "--prefill-chips", 16, "--decode-chips", 16
     )
-    assert bq_utils.extract_agentx_metrics(export) == _AGENTX_METRICS
-    assert bq_utils.agentx_derived_metrics(export, chips) == {
-        "num_chips": 32,
-        "output_tput_per_chip": 40.0,
-        "total_tput_per_chip": 400.0,
-        "input_tput_per_chip": 360.0,
-        "median_intvty": 80.0,
-        "p90_intvty": 40.0,
-        "p99_intvty": 12.5,
-    }
-    assert bq_utils.agentx_derived_metrics(export) == {
-        "median_intvty": 80.0,
-        "p90_intvty": 40.0,
-        "p99_intvty": 12.5,
-    }
-    assert bq_utils.server_routing_metrics(server, max_num_seqs=16) == _AGENTX_ROUTING
+
+    assert returncode == 0
+    assert rows == [
+        {
+            "table": _TABLE,
+            "record_id": _record_id(1),
+            "created_time": "TIMESTAMP '2026-10-28T08:35:19Z'",
+            "repository": "vllm-torchtpu",
+            "run_type": "DAILY",
+            "model_id": _MODEL,
+            "metrics": {
+                "agentx": _AGENTX_METRICS,
+                "derived": {
+                    # 16 prefill + 16 decode chips, not either pool alone.
+                    "num_chips": 32,
+                    "output_tput_per_chip": 40.0,
+                    "total_tput_per_chip": 400.0,
+                    "input_tput_per_chip": 360.0,
+                    "median_intvty": 80.0,
+                    "p90_intvty": 40.0,
+                    "p99_intvty": 12.5,
+                },
+                "routing": _AGENTX_ROUTING,
+            },
+            "config": _AGENTX_CONFIG,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -377,11 +516,120 @@ def test_agentx_helpers_extract_metrics_per_chip_throughput_and_server_routing()
         ({"PREFILL_CHIPS": "16", "DECODE_CHIPS": "8", "NUM_CHIPS": "4"}, 24),
     ],
 )
-def test_chip_count_falls_back_to_the_launcher_environment(monkeypatch, env, num_chips):
+def test_chip_count_falls_back_to_the_launcher_environment(
+    tmp_path, monkeypatch, capsys, env, num_chips
+):
+    results_dir = _results_dir(tmp_path, "config.json", "agentx")
     for name, value in env.items():
         monkeypatch.setenv(name, value)
 
-    assert bq_utils.chips_from_env() == num_chips
+    _, (row,) = _upload(monkeypatch, capsys, results_dir)
+
+    assert row["metrics"]["derived"]["num_chips"] == num_chips
+    assert row["metrics"]["derived"]["output_tput_per_chip"] == 1280.0 / num_chips
+
+
+def test_agentx_row_without_a_chip_count_has_no_per_chip_throughput(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json", "agentx")
+
+    _, (row,) = _upload(monkeypatch, capsys, results_dir)
+
+    assert row["metrics"]["derived"] == {
+        "median_intvty": 80.0,
+        "p90_intvty": 40.0,
+        "p99_intvty": 12.5,
+    }
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--prefill-chips", "16"),
+        ("--decode-chips", "16"),
+        ("--chips", "0"),
+        ("--chips", "four"),
+    ],
+)
+def test_bad_chip_arguments_are_rejected_before_any_row(
+    tmp_path, monkeypatch, capsys, args
+):
+    results_dir = _results_dir(tmp_path, "config.json", "agentx")
+
+    with pytest.raises(SystemExit) as exit_info:
+        _upload(monkeypatch, capsys, results_dir, *args)
+
+    assert exit_info.value.code == 2
+    assert _rows(capsys.readouterr().out) == []
+
+
+def test_agentx_run_with_accuracy_writes_a_point_row_and_an_accuracy_row(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json", "agentx", "lm_eval")
+    (results_dir / "agentx" / "conc_16" / "aiperf_artifacts").joinpath(
+        "server_metrics_export.json"
+    ).unlink()
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir, "--chips", 32)
+
+    assert returncode == 0
+    assert [(row["record_id"], sorted(row["metrics"])) for row in rows] == [
+        (_record_id(1), ["agentx", "derived"]),
+        (_record_id(2), ["lm_eval"]),
+    ]
+    assert rows[1]["metrics"] == {"lm_eval": {"gsm8k": 0.98}}
+
+
+def test_unreadable_agentx_export_fails_the_upload_but_keeps_other_points(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json", "agentx")
+    broken = results_dir / "agentx" / "conc_32" / "aiperf_artifacts"
+    broken.mkdir(parents=True)
+    (broken / "profile_export_aiperf.json").write_text('{"request_count": {"av')
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert [row["config"]["workload"]["max_concurrency"] for row in rows] == [16]
+
+
+def test_agentx_export_outside_conc_layout_is_ignored(tmp_path, monkeypatch, capsys):
+    results_dir = _results_dir(tmp_path, "config.json", "agentx")
+    stray = results_dir / "wrong_location"
+    stray.mkdir()
+    (stray / "profile_export_aiperf.json").write_text(
+        json.dumps(
+            {
+                "end_time": "2026-10-28T08:35:19+00:00",
+                "input_config": {"models": {"items": [{"name": _MODEL}]}},
+                "request_count": {"avg": 999.0},
+            }
+        )
+    )
+
+    _, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert [row["config"]["workload"]["max_concurrency"] for row in rows] == [16]
+
+
+def test_run_level_routing_metrics_ride_every_row(tmp_path, monkeypatch, capsys):
+    results_dir = _results_dir(
+        tmp_path, "config.json", "isl1024_osl8192_c256.json", "lm_eval"
+    )
+    (results_dir / "routing_metrics.json").write_text(
+        json.dumps({"prefix_cache_hit_rate": 0.93, "batch_utilization": 0.74})
+    )
+
+    _, (row,) = _upload(monkeypatch, capsys, results_dir)
+
+    assert row["metrics"]["routing"] == {
+        "prefix_cache_hit_rate": 0.93,
+        "batch_utilization": 0.74,
+    }
+    assert row["metrics"]["vllm_bench"] == _BENCH_METRICS
 
 
 @pytest.mark.parametrize(
@@ -399,15 +647,15 @@ def test_chip_count_falls_back_to_the_launcher_environment(monkeypatch, env, num
     ],
 )
 def test_routing_metrics_outside_the_contract_are_left_out(
-    tmp_path, capsys, routing_file, expected
+    tmp_path, monkeypatch, capsys, routing_file, expected
 ):
-    shutil.copytree(_DATA / "gke", tmp_path / "gke")
-    (tmp_path / "gke" / "routing_metrics.json").write_text(json.dumps(routing_file))
+    results_dir = _results_dir(tmp_path, "config.json", "evalscope")
+    (results_dir / "routing_metrics.json").write_text(json.dumps(routing_file))
 
-    ok, (row,) = _parse_gke(capsys, tmp_path / "gke")
+    _, (row,) = _upload(monkeypatch, capsys, results_dir)
 
-    assert ok
     assert row["metrics"].get("routing") == expected
+    assert row["metrics"]["lm_eval"] == {"mmmu_pro": 0.61}
 
 
 def test_speculative_decoding_acceptance_is_kept_when_the_bench_reports_it(
