@@ -516,11 +516,6 @@ def fp4_indices_to_float(indices: torch.Tensor) -> torch.Tensor:
     return FP4_VALUES[indices.to(torch.int64)]
 
 
-# CLAUDE COMMENT: everything below is ported from the per-token-fp4-quantization
-# branch (layers/common/quantization.py there) to back --kv-cache-dtype nvfp4 on
-# the batched RPA (CUSTOM) backend. The Hadamard rotation that branch once had
-# is intentionally not ported.
-
 # Largest magnitude representable in FP4 e2m1.
 FP4_E2M1_MAX = 6.0
 
@@ -556,10 +551,6 @@ def _quantize_to_fp4_per_token(
     """
     if tensor.shape[-1] % 2:
         raise ValueError(f"FP4 packing needs an even head_dim, got {tensor.shape[-1]}")
-    # CLAUDE COMMENT: change vs. the branch: round the scale to the dtype it is
-    # stored in *before* dividing by it. The branch divided by the float32 scale
-    # and stored a bf16-rounded copy, so the kernel dequantized with a scale up
-    # to ~0.4% off the one used to quantize.
     scale = (
         (tensor.abs().amax(dim=-1, keepdim=True).to(torch.float32) / FP4_E2M1_MAX)
         .to(scale_dtype)

@@ -906,11 +906,10 @@ class TpuPlatform(Platform):
             and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
         ):
             supported = ["BLHNC"]
-        # CLAUDE COMMENT: per-token FP4 (--kv-cache-dtype nvfp4) stores each
-        # token's per-token scale in the trailing sublanes of its K/V row, which
-        # only the batched RPA kernel's SEQ_ALONG_LANE layout (vLLM's HND /
-        # LBHNC) implements. Pin the layout here so users do not also have to
-        # set VLLM_KV_CACHE_LAYOUT=HND, and fail early for unsupported setups.
+        # Per-token FP4 (--kv-cache-dtype nvfp4) only supports the batched RPA kernel's
+        # SEQ_ALONG_LANE layout (vLLM's HND / LBHNC) implements. Pin the layout here so
+        # users do not also have to set VLLM_KV_CACHE_LAYOUT=HND, and fail early for
+        # unsupported setups.
         if vllm_config.cache_config.cache_dtype == "nvfp4":
             if backend is not PallasBatchedRPAAttentionBackend:
                 raise NotImplementedError(
@@ -927,7 +926,22 @@ class TpuPlatform(Platform):
                     "has no head_dim==64 variant. Use --kv-cache-dtype fp8 or "
                     "auto for this model."
                 )
-            # CLAUDE COMMENT: the unified KV pool stores hybrid models' GDN
+            # Spec decode is not currently supported because the draft model's attention
+            # layers can have the same KV pool but with a different head_dim. However,
+            # because the head_dim of the existing model KV entries is not the exact
+            # head_dim, but rather, a packed and padded version, and so it's impossible
+            # to retrieve the original head_dim to know how much to pad the draft
+            # output.
+            # So, we fail closed until the pool's logical head width is passed down
+            # explicitly.
+            # TODO: support speculative decoding with nvfp4.
+            if vllm_config.speculative_config is not None:
+                raise NotImplementedError(
+                    "--kv-cache-dtype nvfp4 does not support speculative "
+                    "decoding yet. Remove --speculative-config or use "
+                    "--kv-cache-dtype fp8 or auto."
+                )
+            # The unified KV pool stores hybrid models' GDN
             # state in rows exactly one attention token wide and needs that
             # width in whole 512-byte granules (gdn_pool_layout.GRANULE_BYTES).
             # A per-token FP4 row is head_dim / 2 plus the scale bytes, padded

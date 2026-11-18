@@ -100,6 +100,8 @@ from vllm_torchtpu.layers.core.attention_interface import (
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
+
+# Quantize_kv_fp4_per_token added for the per-token FP4 KV cache.
 from vllm_torchtpu.layers.core.quantization import (
     quantize_kv,
     quantize_kv_fp4_per_token,
@@ -154,7 +156,7 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
-    # CLAUDE COMMENT: per-token FP4 KV cache, packed two e2m1 values per byte.
+    # Per-token FP4 KV cache, packed two e2m1 values per uint8.
     "nvfp4": torch.uint8,
 }
 
@@ -163,16 +165,16 @@ def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
     return cache_dtype_str.lower().strip() in frozenset(("fp8", "fp8_e4m3", "fp8_e5m2"))
 
 
-# CLAUDE COMMENT: per-token FP4 KV cache helpers, ported from the
-# per-token-fp4-quantization branch. Callers hand the CUSTOM backend either the
-# "nvfp4" string or the already-resolved torch.uint8 storage dtype, and on that
-# (non-MLA) backend a uint8 KV cache only ever comes from nvfp4.
+# Determines whether the provided datatype would require fp4 quantization
+# i.e. if it's uint8_t or fp4
 def _is_per_token_fp4_kv_cache_dtype(cache_dtype: str | torch.dtype) -> bool:
     if isinstance(cache_dtype, torch.dtype):
         return cache_dtype == torch.uint8
     return cache_dtype.lower().strip() in ("nvfp4", "uint8")
 
 
+# Determines the dtype of the scale factors themselves, based on the value of
+# the TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE env variable. By default, it's bf16
 def _per_token_scale_dtype() -> torch.dtype:
     """Dtype of the per-token FP4 KV scales (TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE)."""
     name = str(envs.TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE).lower()
@@ -333,6 +335,7 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
+    # Per-token FP4 KV scales and their dtype (None unless nvfp4).
     dynamic_k_scale: jax.Array | None = None,
     dynamic_v_scale: jax.Array | None = None,
     per_token_scale_dtype: Any = None,
@@ -346,12 +349,15 @@ def _pallas_rpa_kernel_impl(
     packed_pool_shape = None
     if kv_cache.ndim == 4:
         if per_token_scale_dtype is not None:
-            # CLAUDE COMMENT: a per-token FP4 layer's native page is the packed
-            # e2m1 + scale page, not a uint8 page of the full head width.
-            native_shape = _per_token_fp4_kv_cache_shape(
-                1, pool_shape[1], key.shape[1], query.shape[2], per_token_scale_dtype
+            # A 4-D shared packed pool holds layers of differing
+            # page geometry; re-viewing it as packed FP4 pages is untested, so
+            # fail closed. TODO: support nvfp4 on shared packed KV pools.
+            raise NotImplementedError(
+                "--kv-cache-dtype nvfp4 does not support shared packed KV pools "
+                "(attention layers of differing page geometry in one pool) yet. "
+                "Use --kv-cache-dtype fp8 or auto for this model."
             )
-        elif (
+        if (
             kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
             and query.shape[2] != 64
         ):
@@ -411,6 +417,7 @@ def _pallas_rpa_kernel_impl(
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
+        # Forward the per-token FP4 KV scales (None unless nvfp4).
         dynamic_k_scale=dynamic_k_scale,
         dynamic_v_scale=dynamic_v_scale,
         per_token_scale_dtype=per_token_scale_dtype,
@@ -653,12 +660,8 @@ def _pallas_rpa_kernel_batched(
     )
 
 
-# CLAUDE COMMENT: kernel entry for the per-token FP4 KV cache (--kv-cache-dtype
-# nvfp4), ported from the per-token-fp4-quantization branch. Unlike the static
-# fp8 scales the entries above bake in, per-token scales change every step, so
-# they are positional array arguments that `pallas.jax_op` converts from torch.
-# PCP streaming, DCP and the block-major bundled pool are not supported; the
-# impl rejects them before building this kernel.
+# Kernel function for per-token fp4 quantization specifically. Adds dynamic scale
+# factor arguments instead of the prior k_scale and v_scale arguments.
 def _pallas_rpa_kernel_batched_per_token(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -904,7 +907,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     for every multiple of 128 listed below.
     """
 
-    # CLAUDE COMMENT: nvfp4 is the per-token FP4 KV cache, which only this
+    # Nvfp4 is the per-token FP4 KV cache, which only this
     # backend implements (see `_per_token_fp4_kv_cache_shape`).
     supported_kv_cache_dtypes = [
         *PallasAttentionBackend.supported_kv_cache_dtypes,
@@ -935,8 +938,8 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             isinstance(cache_dtype_str, str)
             and cache_dtype_str.lower().strip() == "auto"
         )
-        # CLAUDE COMMENT: per-token FP4 always uses SEQ_ALONG_LANE (the platform
-        # pins vLLM's layout to HND for nvfp4), so it skips the layout lookup.
+        # Per-token FP4 always uses SEQ_ALONG_LANE KV cache layout,
+        # so it skips the layout lookup.
         if not is_auto and _is_per_token_fp4_kv_cache_dtype(cache_dtype_str):
             return _per_token_fp4_kv_cache_shape(
                 num_blocks,
@@ -1078,7 +1081,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             isinstance(self, PallasBatchedRPAAttentionBackendImpl)
             and self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
         )
-        # CLAUDE COMMENT: per-token FP4 KV cache (--kv-cache-dtype nvfp4). K/V
+        # Per-token FP4 KV cache (--kv-cache-dtype nvfp4). K/V
         # are quantized in `forward` with one scale per token and KV head; the
         # scales ride inside each K/V row of the SEQ_ALONG_LANE pool.
         self._per_token_fp4 = _is_per_token_fp4_kv_cache_dtype(kv_cache_dtype)
@@ -1162,7 +1165,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
-            self._per_token_scale_dtype,  # CLAUDE COMMENT: per-token FP4 variant
+            self._per_token_scale_dtype,  # Per-token FP4 variant
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1205,7 +1208,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
-            self._per_token_scale_dtype,  # CLAUDE COMMENT: per-token FP4 variant
+            self._per_token_scale_dtype,  # Per-token FP4 variant
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1232,12 +1235,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
-            # CLAUDE COMMENT: per-token FP4 swaps in the entry that takes the
-            # per-token scales as array arguments instead of static fp8 scales.
             kernel_entry = self._kernel_entry
             scale_kwargs: dict[str, Any] = dict(
                 q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
             )
+            # Eliminate the part of the code that takes in static per-tensor scales
+            # for fp4, and instead only set the scale_dtype as a static argument.
             if self._per_token_fp4:
                 kernel_entry = _pallas_rpa_kernel_batched_per_token
                 scale_kwargs = dict(
@@ -1268,6 +1271,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         "pool"
                     )
                 entry_kwargs["block_major"] = True
+            # `kernel_entry` and `scale_kwargs` replace the fixed
+            # `self._kernel_entry` and q/k/v_scale keywords (see above).
             wrapped_fn = functools.partial(
                 kernel_entry,
                 mesh=mesh,
@@ -1403,7 +1408,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "VLLM_KV_CACHE_LAYOUT=HND without an FP8 KV cache"
                 )
         if self._per_token_fp4:
-            # CLAUDE COMMENT: the PCP streaming kernel has no per-token scales.
+            # The PCP streaming kernel has no per-token scales.
             unsupported_features.append("--kv-cache-dtype nvfp4")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
@@ -1530,7 +1535,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         parameters are bound into the compiled op.
         """
         if self._per_token_fp4:
-            # CLAUDE COMMENT: the bundled kernel has no per-token scale inputs.
+            # The bundled kernel has no per-token scale inputs.
             raise NotImplementedError(
                 "VLLM_TPU_BLOCK_MAJOR_KV=1 does not support --kv-cache-dtype "
                 "nvfp4. Unset VLLM_TPU_BLOCK_MAJOR_KV or use another KV dtype."
@@ -1596,7 +1601,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         )
         if dcp_configured:
             if self._per_token_fp4:
-                # CLAUDE COMMENT: the DCP kernels have no per-token scale inputs.
+                # The DCP kernels have no per-token scale inputs.
                 raise NotImplementedError(
                     "Decode context parallelism does not support "
                     "--kv-cache-dtype nvfp4. Use --kv-cache-dtype fp8 or auto."
@@ -1769,7 +1774,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             assert quantized_value is not None
             value = quantized_value
-        # CLAUDE COMMENT: per-token FP4. Packs K/V to uint8 [T, H_kv, D // 2]
+        # Per-token FP4. Packs K/V to uint8 [T, H_kv, D // 2]
         # and returns their [T, H_kv, 1] scales, passed to the kernel below.
         per_token_scales: tuple[torch.Tensor, ...] = ()
         if self._per_token_fp4:
@@ -1875,7 +1880,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 attn_metadata.query_start_loc,
                 attn_metadata.request_distribution,
                 sink,
-                *per_token_scales,  # CLAUDE COMMENT: empty unless nvfp4
+                *per_token_scales,  # Empty unless nvfp4
             )
 
         # Drop the padding added above so callers see the layer's own width.

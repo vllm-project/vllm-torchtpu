@@ -391,6 +391,7 @@ def sharded_ragged_paged_attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    # Per-token FP4 KV scales and their dtype (None unless nvfp4).
     dynamic_k_scale: jax.Array | None = None,
     dynamic_v_scale: jax.Array | None = None,
     per_token_scale_dtype: jnp.dtype | None = None,
@@ -438,11 +439,10 @@ def sharded_ragged_paged_attention(
         in_specs += (P("model"),)
         args += (attention_sink,)
 
-    # CLAUDE COMMENT: per-token FP4 KV cache (--kv-cache-dtype nvfp4). The
+    # Per-token FP4 KV cache (--kv-cache-dtype nvfp4). The
     # `[T, num_kv_heads, 1]` scales are passed to shard_map as arguments sharded
     # on the KV-head axis like k/v, so each TP shard gets only its own heads'
-    # scales. The per-token-fp4-quantization branch closed over them instead,
-    # which handed every shard the full global tensor and broke for TP > 1.
+    # scales.
     use_per_token_scale = dynamic_k_scale is not None
     if use_per_token_scale:
         if dynamic_v_scale is None or per_token_scale_dtype is None:
@@ -490,7 +490,7 @@ def sharded_ragged_paged_attention(
             block_kwargs["p_block_sizes"] = _capped(rpa_default.RpaCase.PREFILL)
 
     def _ragged_paged_attention(*args):
-        # CLAUDE COMMENT: peel the per-token scales appended above back off the
+        # Peel the per-token scales appended above back off the
         # positional args; the batched RPA wrapper takes them as keywords.
         scale_kwargs: dict[str, Any] = {}
         if use_per_token_scale:
@@ -513,7 +513,7 @@ def sharded_ragged_paged_attention(
             use_causal_mask=use_causal_mask,
             **layout_kwargs,
             **block_kwargs,
-            **scale_kwargs,
+            **scale_kwargs,  # Per-token FP4 scales (empty dict otherwise)
         )
 
     if not shard:
@@ -678,6 +678,7 @@ def attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    # Per-token FP4 KV scales and their dtype (None unless nvfp4).
     dynamic_k_scale: jax.Array | None = None,
     dynamic_v_scale: jax.Array | None = None,
     per_token_scale_dtype: jnp.dtype | None = None,
@@ -726,7 +727,7 @@ def attention(
         shard=shard,
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
-        # CLAUDE COMMENT: per-token FP4 KV scales (None unless nvfp4).
+        # Per-token FP4 KV scales (None unless nvfp4).
         dynamic_k_scale=dynamic_k_scale,
         dynamic_v_scale=dynamic_v_scale,
         per_token_scale_dtype=per_token_scale_dtype,
