@@ -504,6 +504,42 @@ def test_write_back_sets_tokens_of_produced_rows_only(monkeypatch):
     assert slots.mismatch_reason(runner, 2) is None
 
 
+def test_a_step_without_a_token_leaves_the_slot_not_ready(monkeypatch):
+    """A failed KV load rolls a decode-ready request back; its recompute
+    chunk produces no token, so `last_token` is stale until one does."""
+    runner = make_runner(monkeypatch)
+    sched = Scheduler(runner)
+    slots = make_slots(runner)
+    sync(slots, runner, sched.step(new={r: SamplingParams() for r in "ab"}))
+    a, b = (slots.slot_of(r) for r in "ab")
+    null = slots.config.null_slot
+
+    def write_back(produced, new_num_computed, token):
+        plan = StockChunkPlan(
+            num_rows_padded=8,
+            slots=np.array([a, b] + [null] * 6, dtype=np.int32),
+            positions=np.array([n - 1 for n in new_num_computed] + [0] * 6, np.int32),
+            produced=np.array(produced + [False] * 6),
+            new_num_computed=np.array(new_num_computed + [0] * 6, dtype=np.int32),
+        )
+        sampled = torch.full((8, 1), token, dtype=torch.int64)
+        slots.write_back_stock_chunk(runner, plan, sampled)
+
+    write_back([True, True], [40, 40], 7)
+    assert slots.decode_ready(a) and slots.decode_ready(b)
+    # Row a recomputes some of its tokens and produces nothing.
+    write_back([False, True], [38, 41], 9)
+    assert not slots.decode_ready(a) and slots.decode_ready(b)
+    assert slots.last_token[[a, b]].tolist() == [7, 9]
+    runner.input_batch.num_computed_tokens_cpu[:2] = [38, 41]
+    assert slots.mismatch_reason(runner, 2) == SLOT_NOT_READY
+    assert slots.last_mismatch_req_id == "a"
+    # The step that finishes the recompute produces a token again.
+    write_back([True, True], [41, 42], 11)
+    assert slots.decode_ready(a)
+    assert slots.last_token[[a, b]].tolist() == [11, 11]
+
+
 def test_plan_follows_the_stock_discard_rule(monkeypatch):
     runner = make_runner(monkeypatch)
     sched = Scheduler(runner)

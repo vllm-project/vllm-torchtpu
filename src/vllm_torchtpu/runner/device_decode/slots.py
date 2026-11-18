@@ -262,7 +262,8 @@ class DecodeSlots:
         return self._slot_by_req.get(req_id, NO_SLOT)
 
     def decode_ready(self, slot: int) -> bool:
-        """Whether a step that produced a token for the slot's request ran."""
+        """Whether the last step of the slot's request produced a token, so
+        that `last_token` holds the token it feeds next."""
         return bool(self._ready[slot])
 
     def sync_from_runner(self, runner: Any, scheduler_output: Any) -> None:
@@ -417,10 +418,14 @@ class DecodeSlots:
     ) -> None:
         """Writes a stock chunk's outcome into its slots: `last_token` where
         a token was produced, `num_computed` for every live row. `sampled`
-        holds the chunk's [P, 1] (or [P]) tokens. One H2D, one program."""
+        holds the chunk's [P, 1] (or [P]) tokens. One H2D, one program.
+
+        A live row that produced no token (a prefill chunk, also one that
+        recomputes a decode-ready request's tokens after a failed KV load)
+        leaves its slot not decode-ready: its `last_token` is stale."""
         live = plan.slots != self.config.null_slot
         self._scalars[plan.slots[live], _COL_NUM_COMPUTED] = plan.new_num_computed[live]
-        self._ready[plan.slots[live & plan.produced]] = True
+        self._ready[plan.slots[live]] = plan.produced[live]
         plan_dev = plan.to_device(runner)
         fn = _write_back_compiled if plan_dev.device.type == "tpu" else _write_back_impl
         with torch.no_grad():
