@@ -83,10 +83,9 @@ def _vmem_budget(rows, hidden, inter, w13_parts, lanes):
     A shape-dependent reservation leaves room for neighbouring ops to
     prefetch their weights.
     """
-    h_acc_cols = inter if w13_parts == 2 else 2 * inter
     weights = w13_parts * (hidden * 2 * (inter // w13_parts)) + inter * hidden
     scales = w13_parts * 4 * (2 * (inter // w13_parts)) + 4 * hidden
-    accumulators = rows * 4 * (h_acc_cols + hidden)
+    accumulators = rows * 4 * (inter + hidden)
     # x in and out, scores, tables, one-hot.
     operands = (
         rows * 2 * hidden * 2 + rows * 4 * lanes + 4 * lanes * 8 + 2 * lanes * lanes
@@ -141,9 +140,7 @@ def _stream(
     if gid_of is None:
         gid_of = lambda e: gid_s[0, e]  # noqa: E731
     rows = wtab_ref.shape[0]
-    half = inter // w13_parts
     units = w13_parts + 1
-    slots = units
     lane_128 = jax.lax.broadcasted_iota(jnp.int32, (rows, _LANE), 1)
 
     def collect(e, n):
@@ -162,44 +159,19 @@ def _stream(
     def unit_copies(e_idx, part):
         expert = ids[e_idx]
         slot = jnp.minimum(part, w13_parts - 1)
-        if w13_parts == 2:
-            col = pl.multiple_of(slot * inter, inter)
-            w13_copies = (
-                pltpu.make_async_copy(
-                    w13_hbm.at[expert, :, pl.ds(col, inter)],
-                    w13_buf.at[slot],
-                    w13_sem.at[slot],
-                ),
-                pltpu.make_async_copy(
-                    s13_hbm.at[expert, :, pl.ds(col, inter)],
-                    s13_buf.at[slot],
-                    w13_sem.at[slot],
-                ),
-            )
-        else:
-            col = pl.multiple_of(slot * half, half)
-            w13_copies = (
-                pltpu.make_async_copy(
-                    w13_hbm.at[expert, :, pl.ds(col, half)],
-                    w13_buf.at[slot, :, pl.ds(0, half)],
-                    w13_sem.at[slot],
-                ),
-                pltpu.make_async_copy(
-                    w13_hbm.at[expert, :, pl.ds(inter + col, half)],
-                    w13_buf.at[slot, :, pl.ds(half, half)],
-                    w13_sem.at[slot],
-                ),
-                pltpu.make_async_copy(
-                    s13_hbm.at[expert, :, pl.ds(col, half)],
-                    s13_buf.at[slot, :, pl.ds(0, half)],
-                    w13_sem.at[slot],
-                ),
-                pltpu.make_async_copy(
-                    s13_hbm.at[expert, :, pl.ds(inter + col, half)],
-                    s13_buf.at[slot, :, pl.ds(half, half)],
-                    w13_sem.at[slot],
-                ),
-            )
+        col = pl.multiple_of(slot * inter, inter)
+        w13_copies = (
+            pltpu.make_async_copy(
+                w13_hbm.at[expert, :, pl.ds(col, inter)],
+                w13_buf.at[slot],
+                w13_sem.at[slot],
+            ),
+            pltpu.make_async_copy(
+                s13_hbm.at[expert, :, pl.ds(col, inter)],
+                s13_buf.at[slot],
+                w13_sem.at[slot],
+            ),
+        )
         w2_copies = (
             pltpu.make_async_copy(w2_hbm.at[expert], w2_buf.at[0], w2_sem.at[0]),
             pltpu.make_async_copy(s2_hbm.at[expert], s2_buf.at[0], w2_sem.at[0]),
@@ -238,7 +210,7 @@ def _stream(
             for c in w2_copies:
                 c.wait()
 
-    for ahead in range(slots - 1):
+    for ahead in range(units - 1):
 
         @pl.when(ahead < n_units)
         def _prime(ahead=ahead):
@@ -248,7 +220,7 @@ def _stream(
         n_before = n_hit
         n_hit = choice(n_hit)
         n_units = n_hit * units
-        for ahead in range(slots - 1):
+        for ahead in range(units - 1):
 
             @pl.when((n_before == 0) & (ahead < n_units))
             def _prime_late(ahead=ahead):
@@ -261,96 +233,54 @@ def _stream(
         e_idx, part = carry
         expert = ids[e_idx]
 
-        @pl.when(u + slots - 1 < n_units)
+        @pl.when(u + units - 1 < n_units)
         def _prefetch():
-            start(*advance(e_idx, part, slots - 1))
+            start(*advance(e_idx, part, units - 1))
 
         wait(e_idx, part)
 
-        if w13_parts == 2:
+        @pl.when(part == 0)
+        def _gate_half():
+            h = jax.lax.dot_general(
+                x_q,
+                w13_buf[0],
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            gate = h * x_s * s13_buf[0]
+            h_acc[...] = gate * jax.nn.sigmoid(gate)
 
-            @pl.when(part == 0)
-            def _gate_half():
-                h = jax.lax.dot_general(
-                    x_q,
-                    w13_buf[0],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-                gate = h * x_s * s13_buf[0]
-                h_acc[...] = gate * jax.nn.sigmoid(gate)
+        @pl.when(part == 1)
+        def _up_half():
+            h = jax.lax.dot_general(
+                x_q,
+                w13_buf[1],
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            up = h * x_s * s13_buf[1]
+            h_acc[...] = h_acc[...] * up
 
-            @pl.when(part == 1)
-            def _up_half():
-                h = jax.lax.dot_general(
-                    x_q,
-                    w13_buf[1],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-                up = h * x_s * s13_buf[1]
-                h_acc[...] = h_acc[...] * up
-
-            @pl.when(part == 2)
-            def _down():
-                a = h_acc[...]
-                a_q, a_s = _quantize_rows(a)
-                g = gid_of(expert)
-                blk = pl.multiple_of((g >> 7) << 7, _LANE)
-                w_slice = wtab_ref[:, pl.ds(blk, _LANE)]
-                w = jnp.sum(
-                    jnp.where(lane_128 + blk == g, w_slice, 0.0),
-                    axis=1,
-                    keepdims=True,
-                )
-                row_scale = a_s * w
-                o = jax.lax.dot_general(
-                    a_q,
-                    w2_buf[0],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-                acc[...] += (o * s2_buf[0]) * row_scale
-        else:
-            for p in range(w13_parts):
-
-                @pl.when(part == p)
-                def _gate_up_half(p=p):
-                    h = jax.lax.dot_general(
-                        x_q,
-                        w13_buf[p],
-                        (((1,), (0,)), ((), ())),
-                        preferred_element_type=jnp.float32,
-                    )
-                    scales = s13_buf[p]
-                    col = p * half
-                    h_acc[:, col : col + half] = h[:, :half] * x_s * scales[:, :half]
-                    h_acc[:, inter + col : inter + col + half] = (
-                        h[:, half:] * x_s * scales[:, half:]
-                    )
-
-            @pl.when(part == w13_parts)
-            def _down():
-                gate = h_acc[:, pl.ds(0, inter)]
-                up = h_acc[:, pl.ds(inter, inter)]
-                a = gate * jax.nn.sigmoid(gate) * up
-                a_q, a_s = _quantize_rows(a)
-                g = gid_of(expert)
-                blk = pl.multiple_of((g >> 7) << 7, _LANE)
-                w_slice = wtab_ref[:, pl.ds(blk, _LANE)]
-                w = jnp.sum(
-                    jnp.where(lane_128 + blk == g, w_slice, 0.0),
-                    axis=1,
-                    keepdims=True,
-                )
-                row_scale = a_s * w
-                o = jax.lax.dot_general(
-                    a_q,
-                    w2_buf[0],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-                acc[...] += (o * s2_buf[0]) * row_scale
+        @pl.when(part == 2)
+        def _down():
+            a = h_acc[...]
+            a_q, a_s = _quantize_rows(a)
+            g = gid_of(expert)
+            blk = pl.multiple_of((g >> 7) << 7, _LANE)
+            w_slice = wtab_ref[:, pl.ds(blk, _LANE)]
+            w = jnp.sum(
+                jnp.where(lane_128 + blk == g, w_slice, 0.0),
+                axis=1,
+                keepdims=True,
+            )
+            row_scale = a_s * w
+            o = jax.lax.dot_general(
+                a_q,
+                w2_buf[0],
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            acc[...] += (o * s2_buf[0]) * row_scale
 
         return advance(e_idx, part, 1)
 
@@ -573,18 +503,19 @@ def _layout(x, w13):
     tokens, _ = x.shape
     n_experts, _, two_inter = w13.shape
     inter = two_inter // 2
-    if inter % _LANE:
+    if inter % (2 * _LANE):
+        # can_use_moe_lowtok admits gate|up widths that are multiples of 512;
+        # the kernel streams the gate columns and the up columns as two units.
         raise ValueError(
-            f"the intermediate width {inter} must be a multiple of {_LANE} lanes"
+            f"the intermediate width {inter} must be a multiple of {2 * _LANE}"
         )
-    w13_parts = 2 if (inter // 2) % _LANE == 0 else 1
+    w13_parts = 2
     rows = pl.cdiv(tokens, _ROW_TILE) * _ROW_TILE
     return n_experts, inter, w13_parts, rows
 
 
 def _stream_scratch(rows, hidden, inter, w13_parts):
     half = inter // w13_parts
-    h_acc_cols = inter if w13_parts == 2 else 2 * inter
     return (
         pltpu.VMEM((w13_parts, hidden, 2 * half), _FP8),
         pltpu.VMEM((1, inter, hidden), _FP8),
@@ -592,7 +523,7 @@ def _stream_scratch(rows, hidden, inter, w13_parts):
         pltpu.VMEM((1, 1, hidden), jnp.float32),
         pltpu.SemaphoreType.DMA((w13_parts,)),
         pltpu.SemaphoreType.DMA((1,)),
-        pltpu.VMEM((rows, h_acc_cols), jnp.float32),
+        pltpu.VMEM((rows, inter), jnp.float32),
         pltpu.VMEM((rows, hidden), jnp.float32),
     )
 
