@@ -839,6 +839,38 @@ def synthetic_uniforms_fit(num_tokens: int, num_reqs: int) -> bool:
     return num_tokens <= num_reqs * SYNTHETIC_ACCEPT_LANES
 
 
+def synthetic_shard_width(shard_vocab: int) -> int:
+    """Lanes per LM head shard in the row split's layout
+    (`synthetic_sample_rows_and_assemble`): the shard padded to whole lane
+    groups (the sampler masks the padding)."""
+    return -(-shard_vocab // 128) * 128
+
+
+def synthetic_uniforms_shape(
+    num_reqs: int, vocab: int, shards: tuple[int, int] | None = None
+) -> tuple[int, ...]:
+    """The one draw's shape. With ``shards`` ``(tp, shard vocab)`` the row
+    split's layout, ``[rows + 1, tp, synthetic_shard_width]``: each request
+    a dense slab of whole tiles, the layout the top-p kernel reads, and the
+    accepts in the extra leading row (a major-axis slice; uniforms taken
+    across the middle axis made XLA relay out the whole draw, 34-48 us at
+    c48/c64, twin j-cff16624, j-eee68f3c). Otherwise ``[rows, vocab +
+    SYNTHETIC_ACCEPT_LANES]``, the accepts in the last lanes."""
+    if shards is not None:
+        tp, shard_vocab = shards
+        return (num_reqs + 1, tp, synthetic_shard_width(shard_vocab))
+    return (num_reqs, vocab + SYNTHETIC_ACCEPT_LANES)
+
+
+def _accept_uniforms(uniforms: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    if uniforms.dim() == 3:
+        # Gather the accept row first: indexing the draw itself lowers to an
+        # as_strided copy of all of it (31 us at c48 b37, twin j-3d92658b).
+        last = torch.full((1,), uniforms.shape[0] - 1, device=uniforms.device)
+        return uniforms.index_select(0, last)[0, 0, :num_tokens]
+    return uniforms[:, -SYNTHETIC_ACCEPT_LANES:].reshape(-1)[:num_tokens]
+
+
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def synthetic_verify_rows_from_uniforms(
     draft_token_ids: torch.Tensor,
@@ -852,8 +884,9 @@ def synthetic_verify_rows_from_uniforms(
     synthetic_conditional_rates: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """`synthetic_verify_rows` with its accept uniforms taken from the last
-    `SYNTHETIC_ACCEPT_LANES` lanes of ``uniforms`` (row-major)."""
-    accept_u = uniforms[:, -SYNTHETIC_ACCEPT_LANES:].reshape(-1)
+    `SYNTHETIC_ACCEPT_LANES` lanes of ``uniforms`` (row-major,
+    `synthetic_uniforms_shape`)."""
+    accept_u = _accept_uniforms(uniforms, draft_token_ids.shape[0])
     return _synthetic_verify_rows(
         draft_token_ids,
         num_draft_tokens,
@@ -862,7 +895,7 @@ def synthetic_verify_rows_from_uniforms(
         target_logits_indices,
         bonus_logits_indices,
         final_logits_indices,
-        accept_u[: draft_token_ids.shape[0]],
+        accept_u,
         synthetic_conditional_rates,
     )
 
@@ -980,8 +1013,7 @@ def synthetic_sample_and_assemble(
     A rejected row samples the target distribution with the rejected draft
     removed (`_recover_tokens`, draft one-hot); a bonus row (`recover_draft`
     -1) samples the full target distribution, as the bonus sampler does.
-    ``recover_u`` may be wider than the vocabulary (the lanes past it are
-    the accept uniforms, `SYNTHETIC_ACCEPT_LANES`).
+    ``recover_u`` may be the one draw of `synthetic_uniforms_shape`.
     """
     recover_u = recover_u[:, : logits.shape[-1]]
     sampled = _recover_tokens(
@@ -1022,44 +1054,94 @@ def synthetic_sample_rows_and_assemble(
     segment_ids: torch.Tensor,
     group_indices: torch.Tensor,
     max_draft_tokens: int,
+    row_width: int,
+    vocab: int,
     topk_candidates: int = 0,
     apply_topk_topp: bool = True,
     apply_top_k: bool = True,
 ) -> torch.Tensor:
     """`synthetic_sample_and_assemble` with the requests' rows split over the
-    TP ranks: ``logit_rows`` holds this rank's block of them (block ``rank``
-    of ``tp``, full vocabulary). Each rank samples its block, the ranks
-    all-gather the sampled tokens and every rank lays out the whole batch.
-    Same tokens: sampling is row-wise and every row sees the same inputs."""
-    from vllm.distributed import tensor_model_parallel_all_gather
-
-    per_rank = logit_rows.shape[0]
-    recover_u = recover_u[:, : logit_rows.shape[-1]]
+    TP ranks: ``logit_rows [rows / tp, tp, synthetic_shard_width]`` holds
+    this rank's block of them (block ``rank`` of ``tp``) as the TP ranks' LM
+    head shards side by side (vocab id ``s * row_width + w`` at ``[s, w]``,
+    ``vocab`` ids, lanes past ``row_width`` padding;
+    `TPUModelRunner.compute_selected_logit_rows`), and ``recover_u`` every
+    request's uniforms in the same layout (`synthetic_uniforms_shape`). Each
+    rank samples its block, the ranks all-gather the sampled tokens and every
+    rank lays out the whole batch. Same distribution as one rank sampling
+    every row: sampling is row-wise and every row sees the same inputs."""
+    per_rank, tp = logit_rows.shape[:2]
+    block = rank.view(-1) * per_rank + torch.arange(
+        per_rank, dtype=rank.dtype, device=rank.device
+    )
 
     def rows(x: torch.Tensor) -> torch.Tensor:
-        # One block index, so a slice of the block rather than a row gather
-        # (which read all of `recover_u [rows, vocab]`, ~27 us at 64 rows).
-        blocks = x.reshape(-1, per_rank, *x.shape[1:])
-        return blocks.index_select(0, rank.view(-1)).view(per_rank, *x.shape[1:])
+        # A gather along the leading axis: whole rows, or whole slabs of the
+        # draw. (Viewing x as [tp, rows / tp, ...] blocks first lowered to an
+        # as_strided copy, ~6 us per tensor at c48 b37, twin j-3d92658b.)
+        return x.index_select(0, block)
 
-    sampled_rows = _recover_tokens(
-        logit_rows,
-        rows(recover_draft),
-        rows(temperatures),
-        rows(top_k),
-        rows(top_p),
-        rows(recover_u),
-        topk_candidates,
-        apply_topk_topp,
-        None,
-        apply_top_k=apply_top_k,
+    u_rows = rows(recover_u)
+    if (
+        topk_candidates == 0
+        and not (apply_topk_topp and apply_top_k)
+        and top_p_sample.applies_shards(logit_rows, row_width, vocab)
+    ):
+        # The shards as they came: no relayout of the rows into one vocab.
+        sampled_rows = top_p_sample.recover_shards(
+            logit_rows,
+            rows(recover_draft),
+            rows(temperatures),
+            rows(top_p) if apply_topk_topp else None,
+            u_rows,
+            row_width,
+            vocab,
+        )
+    else:
+
+        def flat(x: torch.Tensor) -> torch.Tensor:
+            return x[:, :, :row_width].reshape(per_rank, tp * row_width)[:, :vocab]
+
+        sampled_rows = _recover_tokens(
+            flat(logit_rows),
+            rows(recover_draft),
+            rows(temperatures),
+            rows(top_k),
+            rows(top_p),
+            flat(u_rows),
+            topk_candidates,
+            apply_topk_topp,
+            None,
+            apply_top_k=apply_top_k,
+        )
+    return _gather_and_assemble(
+        sampled_rows,
+        accepted_count,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
     )
+
+
+def _gather_and_assemble(
+    sampled_rows: torch.Tensor,
+    accepted_count: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """`_assemble_synthetic` of every rank's sampled rows."""
+    from vllm.distributed import tensor_model_parallel_all_gather
+
     # Exchanged as float32, which holds every id below 2**24 exactly, as the
     # vocab-parallel argmax exchanges its ids.
     sampled = tensor_model_parallel_all_gather(sampled_rows.float(), dim=0)
-    sampled = sampled.to(torch.int32)
     return _assemble_synthetic(
-        sampled,
+        sampled.to(torch.int32),
         accepted_count,
         draft_token_ids,
         num_draft_tokens,

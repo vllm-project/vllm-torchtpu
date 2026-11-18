@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     synthetic_sample_and_assemble,
     synthetic_sample_rows_and_assemble,
+    synthetic_shard_width,
     synthetic_verify_rows,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
@@ -494,8 +495,9 @@ def test_synthetic_one_row_verify_matches_rejection_sampler(device, seed):
 @pytest.mark.parametrize("seed", range(3))
 def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
     """`synthetic_sample_rows_and_assemble`: each of tp ranks samples its block
-    of the request rows and the all-gathered tokens lay out exactly like
-    `synthetic_sample_and_assemble` on every row (top-p sampling included)."""
+    of the request rows (each rank's vocab shard side by side) and the
+    all-gathered tokens lay out exactly like `synthetic_sample_and_assemble`
+    on every row (top-p sampling included)."""
     import vllm.distributed
 
     gen = torch.Generator().manual_seed(seed)
@@ -517,6 +519,17 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
         logits, recover_draft, accepted, temps, top_k, top_p, recover_u, *tables
     )
 
+    # `compute_selected_logit_rows`'s side-by-side layout, padded.
+    width = vocab // tp
+    padded = synthetic_shard_width(width)
+    layout = {"row_width": width, "vocab": vocab}
+
+    def side_by_side(x):
+        out = torch.full((x.shape[0], tp, padded), float("nan"))
+        out[:, :, :width] = x.view(-1, tp, width)
+        return out
+
+    logits, recover_u = side_by_side(logits), side_by_side(recover_u)
     per_rank = reqs // tp
     blocks = []
     for rank in range(tp):
@@ -529,6 +542,7 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
             logits[rank * per_rank : (rank + 1) * per_rank],
             torch.tensor([rank], dtype=torch.int32),
             recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
+            **layout,
         )
     gathered = torch.cat(blocks)
     monkeypatch.setattr(
@@ -538,6 +552,7 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
         logits[:per_rank],
         torch.tensor([0], dtype=torch.int32),
         recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
+        **layout,
     )
     assert torch.equal(output, expected)
 
