@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the endpoint and model name run_eval_flow.sh hands its clients.
+"""Tests for run_eval_flow.sh's flags: suites, endpoint, and served model name.
 
 Every client (`lm_eval`, `evalscope`, `vllm bench serve`) is a stub on PATH
 that records its argv, so the tests read the exact URL and model name each one
 was given.
+
+No test here lets the script start a server itself: that path runs
+cleanup_server.sh, which kills processes and removes lock files on the host.
 """
 
 import http.server
@@ -35,6 +38,15 @@ _CONFIG_MODEL = "Qwen/Qwen3-0.6B"
 
 _RECORD_ARGV = """#!/bin/bash
 printf '%s\\n' "$@" >> "$STUB_LOG_DIR/$(basename "$0").args"
+"""
+
+_SAFE_RM_STUB = """#!/bin/bash
+for arg in "$@"; do
+    case "$arg" in
+        /tmp/libtpu_lockfile*) exit 0 ;;
+    esac
+done
+exec /bin/rm "$@"
 """
 
 # evalscope must leave a report behind, or the flow fails the suite.
@@ -114,6 +126,11 @@ class _Flow:
             ("lm_eval", _RECORD_ARGV),
             ("vllm", _RECORD_ARGV),
             ("evalscope", _EVALSCOPE_STUB),
+            ("pkill", _RECORD_ARGV),
+            ("lsof", _RECORD_ARGV),
+            ("fuser", _RECORD_ARGV),
+            ("sleep", _RECORD_ARGV),
+            ("rm", _SAFE_RM_STUB),
         ):
             stub = self._bin / name
             stub.write_text(body)
@@ -453,3 +470,46 @@ def test_agentx_suite_requires_physical_chip_count(flow):
     assert proc.returncode == 1
     assert "agentx suite requires AGENTX_CHIPS=<physical_chips>" in proc.stdout
     assert "Running benchmarks" not in proc.stdout
+
+
+@pytest.fixture
+def config_with_custom_lm_eval_task():
+    """A config whose LM_EVAL_TASKS names a task --eval-suites does not list."""
+    configs_dir = _RUN_EVAL_FLOW.parent / "configs"
+    name = "tmp-test-run-eval-flow-cli-custom-task"
+    config = configs_dir / f"{name}.sh"
+    config.write_text(
+        (configs_dir / f"{_CONFIG}.sh").read_text()
+        + '\nLM_EVAL_TASKS="mmlu_pro arc_easy"\n'
+    )
+    try:
+        yield name
+    finally:
+        config.unlink()
+
+
+def test_run_lm_eval_runs_config_tasks_the_suite_list_does_not_name(
+    flow, config_with_custom_lm_eval_task
+):
+    flow.run(
+        "--host",
+        "gw.example.com",
+        "--run-lm-eval",
+        "--perf-suites",
+        "none",
+        config=config_with_custom_lm_eval_task,
+    )
+
+    assert flow.values("lm_eval", "--tasks") == ["mmlu_pro", "arc_easy"]
+
+
+def test_skip_benchmark_without_host_keeps_legacy_dry_run_behavior(flow):
+    proc = flow.run("--skip-benchmark", "--run-lm-eval")
+
+    assert "[DRY RUN] Skipping server launch" in proc.stdout
+    assert flow.argv("vllm") == []
+    assert flow.option("lm_eval", "--model_args") == {
+        f"model={_CONFIG_MODEL},"
+        "base_url=http://localhost:8000/v1/chat/completions,"
+        "num_concurrent=128"
+    }

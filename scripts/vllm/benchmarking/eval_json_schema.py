@@ -304,12 +304,24 @@ class SuiteResult:
         }
         for case_name, score in sorted(self.per_case_accuracy.items()):
             task_entry[f"case_{case_name}_acc,none"] = score
+        failed_trials = [
+            {
+                "case_name": t.case_name,
+                "sample_id": t.sample_id,
+                "run_idx": t.run_idx,
+                "finish_reason": t.finish_reason,
+                "error": t.validation.error_message,
+            }
+            for t in self.trials
+            if not t.validation.is_valid
+        ]
         return {
             "results": {self.task_name: task_entry},
             "meta": {
                 "model": self.model_name,
                 "total_trials": self.total_trials,
                 "successful_trials": self.successful_trials,
+                "failed_trials": failed_trials,
             },
         }
 
@@ -329,7 +341,47 @@ class SchemaValidator:
 
     Uses `jsonschema` when installed and `use_external=True`, falling back to a
     recursive standard-library validator so CPU test runners need no extra deps.
+    The fallback implements a subset of the keywords and refuses a schema that
+    uses any other, so an unchecked constraint never reads as a valid response.
     """
+
+    # Checked by _validate_node.
+    _CHECKED_KEYWORDS = frozenset(
+        {
+            "$ref",
+            "additionalProperties",
+            "allOf",
+            "anyOf",
+            "const",
+            "enum",
+            "items",
+            "maxItems",
+            "maxLength",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minimum",
+            "oneOf",
+            "pattern",
+            "properties",
+            "required",
+            "type",
+        }
+    )
+    # Constrain nothing, so skipping them cannot pass an invalid instance.
+    _ANNOTATION_KEYWORDS = frozenset(
+        {
+            "$comment",
+            "$defs",
+            "$id",
+            "$schema",
+            "default",
+            "definitions",
+            "description",
+            "examples",
+            "title",
+        }
+    )
 
     def __init__(self, root_schema: dict[str, Any], *, use_external: bool = True):
         self._root_schema = root_schema
@@ -341,6 +393,35 @@ class SchemaValidator:
                 self._external_validator = jsonschema.Draft202012Validator(root_schema)
             except Exception:
                 self._external_validator = None
+        if self._external_validator is None:
+            self._require_checked_keywords(root_schema, "#")
+
+    def _require_checked_keywords(self, schema: Any, where: str) -> None:
+        """Raise ValueError if the fallback would skip a constraint in `schema`."""
+        if isinstance(schema, bool):
+            raise ValueError(f"Boolean schema at {where} needs the jsonschema package")
+        if not isinstance(schema, Mapping):
+            raise ValueError(f"Schema at {where} is not an object")
+        unchecked = sorted(
+            set(schema) - self._CHECKED_KEYWORDS - self._ANNOTATION_KEYWORDS
+        )
+        if unchecked:
+            raise ValueError(
+                f"Schema keywords {unchecked} at {where} need the jsonschema "
+                "package; the built-in validator does not check them"
+            )
+        for keyword in ("properties", "$defs", "definitions"):
+            for name, sub in schema.get(keyword, {}).items():
+                self._require_checked_keywords(sub, f"{where}/{keyword}/{name}")
+        for keyword in ("anyOf", "oneOf", "allOf"):
+            for idx, sub in enumerate(schema.get(keyword, ())):
+                self._require_checked_keywords(sub, f"{where}/{keyword}/{idx}")
+        if "items" in schema:
+            self._require_checked_keywords(schema["items"], f"{where}/items")
+        if isinstance(schema.get("additionalProperties"), Mapping):
+            self._require_checked_keywords(
+                schema["additionalProperties"], f"{where}/additionalProperties"
+            )
 
     def validate(
         self,
@@ -634,10 +715,28 @@ def _run_one_trial(
         with urllib.request.urlopen(req, timeout=config.timeout_seconds) as resp:
             raw_body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace")
+        detail = err.read().decode("utf-8", errors="replace").strip()
+        if 400 <= err.code < 500:
+            # An HTTP 4xx response (for example the server rejecting a schema)
+            # is a server correctness outcome: record it as a failed trial with
+            # the status and body snippet so the suite finishes and reports it.
+            return SampleTrialResult(
+                case_name=case.name,
+                sample_id=sample.sample_id,
+                run_idx=run_idx,
+                validation=ValidationResult(
+                    is_valid=False,
+                    json_parse_ok=False,
+                    schema_ok=False,
+                    non_truncated=True,
+                    error_message=f"HTTP {err.code}: {detail[:500]}",
+                ),
+                finish_reason=None,
+                latency_ms=(time.monotonic() - t0) * 1000.0,
+            )
         raise RuntimeError(
             f"HTTP {err.code} from {chat_url} on case '{case.name}' "
-            f"sample '{sample.sample_id}': {detail}"
+            f"sample '{sample.sample_id}': {detail[:500]}"
         ) from err
     except Exception as err:
         raise RuntimeError(
@@ -806,11 +905,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     config = TaskConfig.from_yaml_file(args.task_config)
-    summary = evaluate_json_schema(
-        base_url=args.base_url,
-        task_config=config,
-        model=args.model,
-    )
+    try:
+        summary = evaluate_json_schema(
+            base_url=args.base_url,
+            task_config=config,
+            model=args.model,
+        )
+    except (RuntimeError, ValueError) as err:
+        # No results file: the endpoint could not be reached, or a schema
+        # cannot be checked here. The caller fails the suite on the exit code.
+        print(f"ERROR: {err}", file=sys.stderr)
+        return 1
     summary.write_regression_json(args.output_json)
     print(
         f"[{summary.task_name}] model={summary.model_name} "

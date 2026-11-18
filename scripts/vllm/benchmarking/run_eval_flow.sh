@@ -401,21 +401,19 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
     fi
 }
 
+# The pass rule is fixed, not calibrated: every response must be valid, on
+# every config, so there is no per-config baseline and no tolerance.
 run_json_schema_eval() {
     local task="json_schema"
-    local baseline="scripts/vllm/benchmarking/baselines/eval/${BASELINE_CONFIG}.${task}.baseline.json"
+    local pass_rule="$SCRIPT_DIR/baselines/eval/json_schema.pass_rule.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
     local results_json="${RESULTS_DIR}/results_${task}.json"
     local task_cfg="${JSON_SCHEMA_TASK_CONFIG:-$SCRIPT_DIR/task_configs/json_schema_default.yaml}"
 
     echo "Running JSON Schema evaluation ($task_cfg)..."
-    local model_arg=()
-    if [ -n "${MODEL:-}" ]; then
-        model_arg=(--model "$MODEL")
-    fi
     if ! python3 "$SCRIPT_DIR/eval_json_schema.py" \
         --base-url "$BASE_URL" \
-        "${model_arg[@]}" \
+        --model "$MODEL" \
         --task-config "$task_cfg" \
         --output-json "$results_json"; then
         echo "::error::JSON Schema evaluation client failed."
@@ -423,16 +421,21 @@ run_json_schema_eval() {
         return
     fi
 
-    if [ -f "$baseline" ]; then
-        echo "=== Checking Eval Regression for $task ==="
-        python3 scripts/vllm/benchmarking/check_regression.py \
-          --mode eval \
-          --tolerance "$EVAL_TOLERANCE" \
-          --results-dir "$RESULTS_DIR" \
-          --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
-    else
-        echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
-    fi
+    echo "=== Checking Eval Regression for $task ==="
+    python3 scripts/vllm/benchmarking/check_regression.py \
+      --mode eval \
+      --tolerance 0 \
+      --results-dir "$RESULTS_DIR" \
+      --baseline "$pass_rule" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
+    # check_regression.py widens the allowed drop by a reported stderr, which a
+    # task config with deterministic: false produces. The count has no such band.
+    python3 -c '
+import json, sys
+meta = json.load(open(sys.argv[1]))["meta"]
+valid, total = meta["successful_trials"], meta["total_trials"]
+if total == 0 or valid != total:
+    sys.exit(f"json_schema: {valid} of {total} responses are schema-valid; the pass rule is all of them")
+' "$results_json" || eval_regression_failed "$task"
 }
 
 run_agentx_perf() {
@@ -679,7 +682,10 @@ if [ -n "$SERVED_MODEL" ]; then
   BENCH_ARGS+=(--served-model-name "$SERVED_MODEL")
 fi
 if [ "$RUN_BENCH_SERVE" = "0" ]; then
-  if [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+  # --skip-benchmark keeps its meaning: no server is started, and the evals
+  # go to one that is already running. --perf-suites without bench_serve
+  # starts the server for the suites that were asked for.
+  if [ "$SKIP_BENCHMARK" = "0" ] && [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
     BENCH_ARGS+=(--skip-bench-cells)
   else
     # A dry run still writes the config.json the evals below read.
@@ -748,6 +754,11 @@ for suite in "${SELECTED_EVAL_SUITES[@]}"; do
         bfcl|ruler)
             echo "::error::Accuracy suite '$suite' runner is not wired in yet."
             fail=1
+            ;;
+        # --eval-suites names are checked above, so this is a name from a
+        # config's LM_EVAL_TASKS under --run-lm-eval: any lm-eval task.
+        *)
+            run_lm_eval "$suite"
             ;;
     esac
 done

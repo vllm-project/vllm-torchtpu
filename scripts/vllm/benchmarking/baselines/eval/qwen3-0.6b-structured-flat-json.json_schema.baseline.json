@@ -1,9 +1,0 @@
-{
-  "_source": {
-    "description": "Deterministic xgrammar JSON Schema conformance gate: 100% of responses must parse as valid JSON and satisfy their Draft-07/2020-12 schema without truncation."
-  },
-  "json_schema": {
-    "acc,none": 1.0,
-    "acc_stderr,none": 0.0
-  }
-}

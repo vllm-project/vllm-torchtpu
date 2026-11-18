@@ -331,77 +331,72 @@ def test_default_task_config_loads_all_shipped_cases():
     assert sum(len(c.samples) for c in cfg.cases) >= 20
 
 
-def test_run_eval_flow_base_url_and_suite_flags(tmp_path, mock_openai_server):
-    base_url, handler = mock_openai_server
+def _chat_reply(obj: Any) -> tuple[int, dict[str, Any]]:
+    message = {"content": json.dumps(obj)}
+    return 200, {"choices": [{"message": message, "finish_reason": "stop"}]}
 
-    def responder(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        schema = payload["response_format"]["json_schema"]["schema"]
-        props = schema.get("properties", {})
-        if "users" in props:
-            obj = {
-                "users": [
-                    {
-                        "name": "a",
-                        "age": 1,
-                        "email": "a@b.c",
-                        "is_active": True,
-                        "role": "user",
-                    }
-                    for _ in range(10)
-                ]
-            }
-        elif "expressions" in props:
-            obj = {
-                "expressions": [
-                    {"ast": {"op": "+", "left": 1, "right": 2}, "description": "d"}
-                    for _ in range(10)
-                ]
-            }
-        elif "house" in props:
-            obj = {
-                "name": "Harry Potter",
-                "house": "Gryffindor",
-                "blood status": "Half-blood",
-                "occupation": "auror",
-                "wand": {"wood": "Holly", "core": "Phoenix", "length": 11},
-                "alive": "Alive",
-                "patronus": "Stag",
-                "bogart": "Dementor",
-            }
-        else:
-            obj = {
-                "tool_name": "query_logs",
-                "arguments": {"service": "gateway", "limit": 10, "severity": "ERROR"},
-            }
-        return (
-            200,
-            {
-                "choices": [
-                    {"message": {"content": json.dumps(obj)}, "finish_reason": "stop"}
-                ]
-            },
-        )
 
-    handler.responder = staticmethod(responder)
+def _valid_reply(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """A schema-valid answer to any case of json_schema_default.yaml."""
+    schema = payload["response_format"]["json_schema"]["schema"]
+    props = schema.get("properties", {})
+    if "users" in props:
+        obj = {
+            "users": [
+                {
+                    "name": "a",
+                    "age": 1,
+                    "email": "a@b.c",
+                    "is_active": True,
+                    "role": "user",
+                }
+                for _ in range(10)
+            ]
+        }
+    elif "expressions" in props:
+        obj = {
+            "expressions": [
+                {"ast": {"op": "+", "left": 1, "right": 2}, "description": "d"}
+                for _ in range(10)
+            ]
+        }
+    elif "house" in props:
+        obj = {
+            "name": "Harry Potter",
+            "house": "Gryffindor",
+            "blood status": "Half-blood",
+            "occupation": "auror",
+            "wand": {"wood": "Holly", "core": "Phoenix", "length": 11},
+            "alive": "Alive",
+            "patronus": "Stag",
+            "bogart": "Dementor",
+        }
+    else:
+        obj = {
+            "tool_name": "query_logs",
+            "arguments": {"service": "gateway", "limit": 10, "severity": "ERROR"},
+        }
+    return _chat_reply(obj)
+
+
+def _run_flow_json_schema(
+    tmp_path: pathlib.Path,
+    base_url: str,
+    config: str,
+    env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+    """Runs only the json_schema suite of `config` against `base_url`."""
     results_dir = tmp_path / "flow_results"
-    fake_bin = tmp_path / "fake_bin"
-    fake_bin.mkdir()
     # Stub vllm pkg on PYTHONPATH so run_benchmarks.sh --dry-run runs on CPU.
     fake_site = tmp_path / "fake_site"
     (fake_site / "vllm").mkdir(parents=True)
     (fake_site / "vllm" / "__init__.py").write_text("")
-
-    env = dict(
-        PYTHONPATH=f"{fake_site}",
-        PATH=f"{fake_bin}:/usr/bin:/bin",
-        SKIP_DB_UPLOAD="1",
-    )
     proc = subprocess.run(
         [
             "bash",
             str(_BENCH_DIR / "run_eval_flow.sh"),
             "--config",
-            "qwen3-0.6b-structured-flat-json",
+            config,
             "--base-url",
             base_url,
             "--perf-suites",
@@ -413,18 +408,247 @@ def test_run_eval_flow_base_url_and_suite_flags(tmp_path, mock_openai_server):
             "--skip-db-upload",
         ],
         cwd=str(_REPO_ROOT),
-        env=env,
+        env={"PYTHONPATH": str(fake_site), "PATH": "/usr/bin:/bin", **(env or {})},
         capture_output=True,
         text=True,
     )
+    return proc, results_dir
+
+
+def test_run_eval_flow_json_schema_passes_when_every_response_is_valid(
+    tmp_path, mock_openai_server
+):
+    base_url, handler = mock_openai_server
+    handler.responder = staticmethod(_valid_reply)
+
+    # The config's own EVAL_SUITES names json_schema too; the flag is explicit.
+    proc, results_dir = _run_flow_json_schema(
+        tmp_path, base_url, "qwen3-0.6b-structured-flat-json"
+    )
+
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
-    out_file = results_dir / "results_json_schema.json"
-    assert out_file.exists()
-    data = json.loads(out_file.read_text())
+    data = json.loads((results_dir / "results_json_schema.json").read_text())
     assert data["results"]["json_schema"]["acc,none"] == 1.0
+    assert data["meta"] == {
+        "model": "Qwen/Qwen3-0.6B",
+        "total_trials": 28,
+        "successful_trials": 28,
+        "failed_trials": [],
+    }
     assert (results_dir / "eval_check_json_schema.md").exists()
     assert "PASS: all evaluated tasks within tolerance." in proc.stdout
     # The client is given the model name the endpoint serves.
     assert {request["model"] for request in handler.recorded_requests} == {
         "Qwen/Qwen3-0.6B"
     }
+
+
+def test_run_eval_flow_json_schema_fails_on_one_invalid_response(
+    tmp_path, mock_openai_server
+):
+    base_url, handler = mock_openai_server
+    replies = {"count": 0}
+
+    def one_invalid(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        replies["count"] += 1
+        if replies["count"] == 5:
+            return _chat_reply({"not": "what the schema asked for"})
+        return _valid_reply(payload)
+
+    handler.responder = staticmethod(one_invalid)
+
+    # qwen3-0.6b-tp1 ships no json_schema baseline: the rule needs none, and
+    # its 0.015 eval tolerance (above 1/28) does not apply.
+    proc, results_dir = _run_flow_json_schema(tmp_path, base_url, "qwen3-0.6b-tp1")
+
+    assert proc.returncode == 1, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "| `json_schema` | acc,none | 0.9643 | 1.0000 |" in proc.stdout
+    assert "FAIL" in (results_dir / "eval_check_json_schema.md").read_text()
+    assert "json_schema: 27 of 28 responses are schema-valid" in proc.stderr
+    assert "::error::Eval regression check failed for json_schema!" in proc.stdout
+
+
+def test_run_eval_flow_json_schema_rule_ignores_reported_stderr(
+    tmp_path, mock_openai_server
+):
+    # deterministic: false reports a binomial stderr, which check_regression.py
+    # turns into an allowed drop. One invalid response in 50 must still fail.
+    base_url, handler = mock_openai_server
+    replies = {"count": 0}
+
+    def one_invalid(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        replies["count"] += 1
+        return _chat_reply({"answer": "wrong" if replies["count"] == 7 else 42})
+
+    handler.responder = staticmethod(one_invalid)
+    task_config = tmp_path / "task.json"
+    task_config.write_text(
+        json.dumps(
+            {
+                "task": "json_schema",
+                "deterministic": False,
+                "cases": [
+                    {
+                        "name": "simple_answer",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "integer"}},
+                            "required": ["answer"],
+                        },
+                        "prompts": [f"q{i}" for i in range(50)],
+                    }
+                ],
+            }
+        )
+    )
+
+    proc, _ = _run_flow_json_schema(
+        tmp_path,
+        base_url,
+        "qwen3-0.6b-tp1",
+        env={"JSON_SCHEMA_TASK_CONFIG": str(task_config)},
+    )
+
+    assert proc.returncode == 1, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "PASS: all evaluated tasks within tolerance." in proc.stdout
+    assert "json_schema: 49 of 50 responses are schema-valid" in proc.stderr
+
+
+def _write_single_case_task(tmp_path: pathlib.Path, prompts: list[str]) -> pathlib.Path:
+    task_config = tmp_path / "task.json"
+    task_config.write_text(
+        json.dumps(
+            {
+                "task": "json_schema",
+                "concurrency": 1,
+                "cases": [
+                    {
+                        "name": "simple_answer",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "integer"}},
+                            "required": ["answer"],
+                        },
+                        "prompts": prompts,
+                    }
+                ],
+            }
+        )
+    )
+    return task_config
+
+
+def test_http_error_response_counts_as_an_invalid_trial(tmp_path, mock_openai_server):
+    mod = _load_eval_json_schema()
+    base_url, handler = mock_openai_server
+    replies = {"count": 0}
+
+    def reject_second(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        replies["count"] += 1
+        if replies["count"] == 2:
+            return 400, {"error": {"message": "schema not supported"}}
+        return _chat_reply({"answer": 42})
+
+    handler.responder = staticmethod(reject_second)
+    out_json = tmp_path / "results_json_schema.json"
+
+    rc = mod.main(
+        [
+            "--base-url",
+            base_url,
+            "--task-config",
+            str(_write_single_case_task(tmp_path, ["q1", "q2", "q3", "q4"])),
+            "--output-json",
+            str(out_json),
+        ]
+    )
+
+    assert rc == 0
+    data = json.loads(out_json.read_text())
+    assert data["results"]["json_schema"]["acc,none"] == 0.75
+    assert data["meta"]["total_trials"] == 4
+    assert data["meta"]["successful_trials"] == 3
+    assert data["meta"]["failed_trials"] == [
+        {
+            "case_name": "simple_answer",
+            "sample_id": "1",
+            "run_idx": 0,
+            "finish_reason": None,
+            "error": 'HTTP 400: {"error": {"message": "schema not supported"}}',
+        }
+    ]
+
+
+def test_unreachable_endpoint_exits_with_one_line_and_no_results(tmp_path, capsys):
+    mod = _load_eval_json_schema()
+    out_json = tmp_path / "results_json_schema.json"
+
+    rc = mod.main(
+        [
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--model",
+            "any",
+            "--task-config",
+            str(_write_single_case_task(tmp_path, ["q1"])),
+            "--output-json",
+            str(out_json),
+        ]
+    )
+
+    assert rc == 1
+    assert not out_json.exists()
+    stderr_lines = capsys.readouterr().err.splitlines()
+    assert len(stderr_lines) == 1
+    assert stderr_lines[0].startswith(
+        "ERROR: Request to http://127.0.0.1:9/v1/chat/completions failed on case "
+        "'simple_answer' sample "
+    )
+
+
+@pytest.mark.parametrize(
+    ("schema", "message"),
+    [
+        (
+            {"type": "integer", "exclusiveMinimum": 0},
+            "Schema keywords ['exclusiveMinimum'] at # need the jsonschema package",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"tags": {"type": "array", "uniqueItems": True}},
+            },
+            "Schema keywords ['uniqueItems'] at #/properties/tags need the "
+            "jsonschema package",
+        ),
+        (
+            {"anyOf": [{"type": "string", "format": "email"}]},
+            "Schema keywords ['format'] at #/anyOf/0 need the jsonschema package",
+        ),
+        (
+            {"type": "array", "items": {"type": "number", "multipleOf": 5}},
+            "Schema keywords ['multipleOf'] at #/items need the jsonschema package",
+        ),
+        (
+            {"type": "array", "items": [{"type": "integer"}]},
+            "Schema at #/items is not an object",
+        ),
+    ],
+)
+def test_builtin_validator_refuses_schema_keywords_it_does_not_check(schema, message):
+    mod = _load_eval_json_schema()
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.SchemaValidator(schema, use_external=False)
+
+    assert message in str(excinfo.value)
+
+
+def test_builtin_validator_accepts_every_shipped_schema():
+    mod = _load_eval_json_schema()
+    config = mod.TaskConfig.from_yaml_file(
+        _BENCH_DIR / "task_configs" / "json_schema_default.yaml"
+    )
+
+    for case in config.cases:
+        mod.SchemaValidator(case.schema, use_external=False)
