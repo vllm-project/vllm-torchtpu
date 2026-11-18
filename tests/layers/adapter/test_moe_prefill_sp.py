@@ -14,16 +14,43 @@
 """TPU_MOE_PREFILL_SEQUENCE_PARALLEL: the bucket gate, the refusals, the
 re-sharded shared expert and the fused EP op it builds. No TPU."""
 
+import dataclasses
+import os
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import jax.numpy as jnp
 import pytest
 import torch
+from torch import fx, nn
+from torch._dynamo.backends.common import aot_autograd
+from torch._functorch._aot_autograd.schemas import SerializableAOTDispatchCompiler
+from torch._functorch.partitioners import min_cut_rematerialization_partition
+from torch._inductor.output_code import OutputCode
+from torch_tpu._internal.compile._backend import (
+    _TPU_DECOMPOSITIONS,
+    _serialization_context,
+)
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import (
+    CompilationConfig,
+    CompilationMode,
+    DeviceConfig,
+    SchedulerConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
+from vllm.model_executor.models import deepseek_v2
+from vllm.platforms import current_platform
 
+import vllm_torchtpu
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.compilation import shape_variants, tpu_compiler
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 from vllm_torchtpu.layers.adapter import moe_prefill_sp as sp
+from vllm_torchtpu.layers.adapter import rmsnorm
+from vllm_torchtpu.layers.adapter.linear_common import PREQUANT_ATTR, PrequantSlot
 
 
 def _shards(full: torch.Tensor, tp: int, dim: int) -> list[torch.Tensor]:
@@ -420,3 +447,505 @@ def test_gather_projections_slim_qrows_matches_full_gather(tp, num_tokens, split
         torch.testing.assert_close(got_kv, full_kv, rtol=0, atol=0)
         assert pre_kw is not None
         torch.testing.assert_close(pre_kw, full_kw, rtol=0, atol=0)
+
+
+def test_should_select_intra_chip_dense_group_when_tp_is_even():
+    assert sp._dense_group_size(16, 4) == 2  # noqa: SLF001 -- policy unit test
+    assert sp._dense_group_size(2, 2) == 2  # noqa: SLF001 -- policy unit test
+    assert sp._dense_group_size(16, 1) == 1  # noqa: SLF001 -- policy unit test
+    assert sp._dense_group_size(3, 3) == 1  # noqa: SLF001 -- policy unit test
+
+
+def test_should_match_vocab_parallel_all_reduce_slice_when_embed_reduce_scatters():
+    vllm_torchtpu._patch_vllm_vocab_parallel_embedding()  # noqa: SLF001 -- installs TPU-patched mask helper used at runtime
+    tp, num_tokens, vocab_per_rank, hidden = 4, 16, 8, 6
+    rows_local = num_tokens // tp
+    full_table = torch.randn(tp * vocab_per_rank, hidden, dtype=torch.bfloat16)
+    input_ids = torch.randint(0, tp * vocab_per_rank, (num_tokens,), dtype=torch.int32)
+    expected_full = full_table[input_ids.long()]
+
+    partials = []
+    embeds = []
+    for r in range(tp):
+        start = r * vocab_per_rank
+        end = (r + 1) * vocab_per_rank
+        shard_w = full_table[start:end]
+
+        class _FakeQuant:
+            def embedding(self, layer, idx):
+                return layer.weight[idx]
+
+        added_bound = tp * vocab_per_rank
+        embed = SimpleNamespace(
+            weight=shard_w,
+            tp_size=tp,
+            use_fused_embedding=False,
+            org_vocab_start_index=torch.tensor(start, dtype=torch.int32),
+            org_vocab_end_index=torch.tensor(end, dtype=torch.int32),
+            num_org_vocab_padding=torch.tensor(0, dtype=torch.int32),
+            added_vocab_start_index=torch.tensor(added_bound, dtype=torch.int32),
+            added_vocab_end_index=torch.tensor(added_bound, dtype=torch.int32),
+            shard_indices=SimpleNamespace(
+                org_vocab_start_index=start,
+                org_vocab_end_index=end,
+                num_org_vocab_padding=0,
+                added_vocab_start_index=added_bound,
+                added_vocab_end_index=added_bound,
+            ),
+            quant_method=_FakeQuant(),
+        )
+        embeds.append(embed)
+        masked, mask = sp.vpe.get_masked_input_and_mask(
+            input_ids,
+            embed.org_vocab_start_index,
+            embed.org_vocab_end_index,
+            embed.num_org_vocab_padding,
+            embed.added_vocab_start_index,
+            embed.added_vocab_end_index,
+        )
+        out = shard_w[masked.long()]
+        out.masked_fill_(mask.unsqueeze(-1), 0)
+        partials.append(out)
+
+    summed = sum(partials)
+    for r, embed in enumerate(embeds):
+        with patch.object(
+            sp,
+            "tensor_model_parallel_reduce_scatter",
+            side_effect=lambda t, dim, rank=r: summed[
+                rank * rows_local : (rank + 1) * rows_local
+            ],
+        ) as rs_mock:
+            got = sp._embed_reduce_scatter(embed, input_ids)  # noqa: SLF001 -- verifying embed reduce-scatter parity directly
+        assert rs_mock.call_count == 1
+        assert rs_mock.call_args.args[1] == 0
+        torch.testing.assert_close(
+            got,
+            expected_full[r * rows_local : (r + 1) * rows_local],
+            rtol=0,
+            atol=0,
+        )
+
+
+def _make_fp8_linear(k: int, n: int, *, fp8: bool = True) -> torch.nn.Module:
+    mod = torch.nn.Module()
+    mod.weight = torch.nn.Parameter(
+        torch.zeros(k, n, dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16),
+        requires_grad=False,
+    )
+    mod.weight_scale = torch.nn.Parameter(torch.ones(n), requires_grad=False)
+    mod.bias = None
+    setattr(mod, sp.WEIGHT_FLIPPED_ATTR, True)
+    return mod
+
+
+def _make_fake_mla():
+    class _FakeMLA:
+        kimi_preprocess = None
+        q_lora_rank = 1536
+        g_proj = None
+
+        def forward(
+            self,
+            positions,
+            hidden_states,
+            llama_4_scaling=None,
+            prefill_group=None,
+        ):
+            return hidden_states
+
+    return _FakeMLA()
+
+
+def test_should_arm_dense_layers_and_embed_rs_when_dense_mlps_are_fp8():
+    class _FakeDenseMLP(deepseek_v2.DeepseekV2MLP):
+        def __init__(self, *, fp8: bool = True):
+            torch.nn.Module.__init__(self)
+            self.gate_up_proj = _make_fp8_linear(8, 12, fp8=fp8)
+            self.down_proj = _make_fp8_linear(6, 8, fp8=fp8)
+
+    class _FakeMoEMLP(deepseek_v2.DeepseekV2MoE):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.routed_scaling_factor = 1.0
+            self.shared_experts = _FakeDenseMLP(fp8=True)
+            self.experts = SimpleNamespace(
+                routed_experts=SimpleNamespace(
+                    routed_scaling_factor=1.0,
+                    moe_config=SimpleNamespace(experts_per_token=2),
+                    renormalize=True,
+                    quant_method=SimpleNamespace(_tpu_activation_str="silu"),
+                )
+            )
+
+    class _FakeEmbed(sp.vpe.VocabParallelEmbedding):
+        def __init__(self, tp_size: int):
+            torch.nn.Module.__init__(self)
+            self.tp_size = tp_size
+            self.use_fused_embedding = False
+            self.quant_method = SimpleNamespace()
+
+    class _FakeBackbone(deepseek_v2.DeepseekV2Model):
+        def __init__(self, layers, tp_size: int):
+            torch.nn.Module.__init__(self)
+            self.config = SimpleNamespace(llama_4_scaling=None)
+            self.aux_hidden_state_layers = ()
+            self.start_layer = 0
+            self.end_layer = len(layers)
+            self.layers = torch.nn.ModuleList(layers)
+            self.embed_tokens = _FakeEmbed(tp_size)
+
+    def _layer(mlp, *, pair_prequant: bool = False):
+        m = torch.nn.Module()
+        m.mlp = mlp
+        m.self_attn = SimpleNamespace(mla_attn=_make_fake_mla())
+        if pair_prequant:
+            with patch.object(
+                type(current_platform),
+                "check_and_update_config",
+                classmethod(lambda cls, cfg: None),
+            ):
+                cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+            with set_current_vllm_config(cfg):
+                ln_post = rmsnorm.TpuRMSNorm(8, eps=1e-6)
+            slot = PrequantSlot()
+            ln_post._prequant_slot = slot  # noqa: SLF001 -- seeding prequant slot as rmsnorm._pair does at load
+            setattr(mlp.gate_up_proj, PREQUANT_ATTR, slot)
+            m.post_attention_layernorm = ln_post
+        return m
+
+    tp = 4
+    backbone = _FakeBackbone(
+        [_layer(_FakeDenseMLP(fp8=True), pair_prequant=True), _layer(_FakeMoEMLP())],
+        tp_size=tp,
+    )
+    assert backbone.layers[0].post_attention_layernorm.is_prequant_armed() is True
+    assert hasattr(backbone.layers[0].mlp.gate_up_proj, PREQUANT_ATTR)
+    model = SimpleNamespace(model=backbone)
+    fake_rank = torch.zeros((1, 1), dtype=torch.int32)
+    fake_tp_group = SimpleNamespace(
+        rank_in_group=1,
+        all_gather=lambda t, dim: torch.cat([t] * tp, dim=dim),
+    )
+
+    def _run_arm(target_model):
+        vllm_torchtpu._patch_vllm_vocab_parallel_embedding()  # noqa: SLF001 -- runtime vocab patch gate
+        extra = [
+            patch.object(
+                deepseek_v2.DeepseekV2Model, "forward", new=sp.patched_model_forward
+            ),
+            patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp),
+            patch.object(sp, "get_tp_group", return_value=fake_tp_group),
+            patch.object(torch.distributed, "get_world_size", return_value=tp),
+            patch.object(sp, "ep_mesh_index", return_value=1),
+            patch.object(
+                sp.fused_moe_ep, "build_sequence_parallel_op", return_value="moe_op"
+            ),
+            patch.object(sp.fused_moe_ep, "rank_operand", return_value=fake_rank),
+            patch.object(sp.fused_moe_decode, "rank_operand", return_value=fake_rank),
+            patch.object(sp, "_build_shared_op", side_effect=lambda g: f"shared_g{g}"),
+        ]
+        for p in extra:
+            p.start()
+        patches = [*_with_envs(TPU_MOE_PREFILL_SP_SHARED_GROUP=4), *extra]
+        try:
+            return sp.arm(target_model, _config(tensor_parallel_size=tp))
+        finally:
+            for p in patches:
+                p.stop()
+
+    armed = _run_arm(model)
+    assert armed == 1
+    assert getattr(backbone, sp.EMBED_RS_ATTR) is True
+    assert hasattr(backbone.layers[0], sp.KEEP_ATTR)
+    assert getattr(backbone.layers[0].mlp, sp.DENSE_OP) == "shared_g2"
+    assert getattr(backbone.layers[0].mlp, sp.DENSE_INDEX) == 0
+    assert backbone.layers[0].post_attention_layernorm.is_prequant_armed() is False
+    assert not hasattr(backbone.layers[0].mlp.gate_up_proj, PREQUANT_ATTR)
+    for buf_name in sp.DENSE_STACK:
+        assert hasattr(backbone, buf_name)
+
+    backbone_bf16 = _FakeBackbone(
+        [_layer(_FakeDenseMLP(fp8=False), pair_prequant=True), _layer(_FakeMoEMLP())],
+        tp_size=tp,
+    )
+    _run_arm(SimpleNamespace(model=backbone_bf16))
+    assert getattr(backbone_bf16, sp.EMBED_RS_ATTR) is False
+    assert not hasattr(backbone_bf16.layers[0], sp.KEEP_ATTR)
+    assert not hasattr(backbone_bf16.layers[0].mlp, sp.DENSE_OP)
+    assert backbone_bf16.layers[0].post_attention_layernorm.is_prequant_armed() is True
+    assert hasattr(backbone_bf16.layers[0].mlp.gate_up_proj, PREQUANT_ATTR)
+
+
+def test_should_dispatch_dense_sp_layer_and_embed_rs_in_forward():
+    num_tokens, tp, hidden = 16, 4, 8
+    rows = num_tokens // tp
+    positions = torch.arange(num_tokens, dtype=torch.int32)
+    x_sp = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    seen_groups = []
+    seen_dense = []
+
+    class _FakeNorm:
+        def __call__(self, x, residual=None):
+            if residual is None:
+                return x
+            return x + residual, residual
+
+    class _FakeAttn:
+        def __call__(self, pos, x, scaling, *, prefill_group):
+            seen_groups.append(prefill_group)
+            return x
+
+    def _run_dense_op(x, *w):
+        seen_dense.append((x.shape, len(w)))
+        return x
+
+    dense_stack = (
+        torch.zeros((1, hidden, 12), dtype=torch.float8_e4m3fn),
+        torch.ones((1, 12)),
+        torch.zeros((1, 6, hidden), dtype=torch.float8_e4m3fn),
+        torch.ones((1, 2, hidden)),
+    )
+    mlp = SimpleNamespace()
+    setattr(mlp, sp.DENSE_ATTR, dense_stack)
+    setattr(mlp, sp.DENSE_INDEX, 0)
+    setattr(mlp, sp.DENSE_OP, _run_dense_op)
+    layer = SimpleNamespace(
+        input_layernorm=_FakeNorm(),
+        post_attention_layernorm=_FakeNorm(),
+        self_attn=SimpleNamespace(mla_attn=_FakeAttn()),
+        mlp=mlp,
+    )
+    with patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp):
+        out, res = sp._sequence_parallel_layer_forward(  # noqa: SLF001 -- verifying dense SP dispatch directly
+            layer, positions, x_sp, None, None
+        )
+    assert seen_groups == [sp._GATHER_PROJECTIONS]  # noqa: SLF001 -- verifying gather-projections hook selected on sharded input
+    assert seen_dense == [((rows, hidden), 4)]
+    assert tuple(out.shape) == (rows, hidden)
+    assert tuple(res.shape) == (rows, hidden)
+
+
+def test_should_retain_small_all_reduce_buffers_when_embed_rs_skips_all_reduce():
+    num_tokens, tp, hidden = 16, 4, 8
+    rows = num_tokens // tp
+    input_ids = torch.arange(num_tokens, dtype=torch.int64)
+    positions = torch.arange(num_tokens, dtype=torch.int32)
+    embed_out = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    retain_calls = []
+
+    def _fake_retain(x: torch.Tensor) -> torch.Tensor:
+        retain_calls.append(tuple(x.shape))
+        return x
+
+    def _fake_layer(pos, x, res, scaling):
+        return x, x if res is None else res
+
+    def _fake_norm(x, res):
+        return x, res
+
+    model = SimpleNamespace(
+        embed_tokens=SimpleNamespace(),
+        layers=[_fake_layer],
+        start_layer=0,
+        end_layer=1,
+        norm=_fake_norm,
+    )
+    setattr(model, sp.KEEP_ATTR, True)
+    setattr(model, sp.EMBED_RS_ATTR, True)
+    with (
+        patch.object(sp, "applies", return_value=True),
+        patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp),
+        patch.object(sp, "_embed_reduce_scatter", return_value=embed_out),
+        patch.object(sp.small_all_reduce_op, "retain", side_effect=_fake_retain),
+        patch.object(
+            sp, "_all_rows", side_effect=lambda x, n: x.repeat(n // x.shape[0], 1)
+        ),
+    ):
+        out = sp.patched_model_forward(model, input_ids, positions)
+    assert retain_calls == [(rows, hidden)]
+    assert tuple(out.shape) == (num_tokens, hidden)
+
+
+class _CpuOutputCode(OutputCode):
+    def __init__(self, out_metas):
+        self.out_metas = out_metas
+
+    def prepare_for_serialization(self) -> None:
+        pass
+
+    def post_compile(self, example_inputs, constants, graph_kwargs) -> None:
+        pass
+
+    def __call__(self, args):
+        args.clear()
+        return [torch.zeros(shape, dtype=dtype) for shape, dtype in self.out_metas]
+
+
+class _CpuAotBackend:
+    def __call__(self, graph_module: fx.GraphModule, example_inputs):
+        def _fw(gm: fx.GraphModule, _inps):
+            outs = gm.graph.output_node().args[0]
+            metas = [
+                None
+                if o is None
+                else (
+                    tuple(
+                        int(d)
+                        for d in o.meta.get("val", o.meta.get("example_value")).shape
+                    ),
+                    o.meta.get("val", o.meta.get("example_value")).dtype,
+                )
+                for o in outs
+            ]
+            code = _CpuOutputCode(metas)
+            code._boxed_call = True  # noqa: SLF001 -- torch aot_autograd boxed call protocol
+            return code
+
+        fw_compiler = SerializableAOTDispatchCompiler(
+            output_code_ty=_CpuOutputCode, compiler_fn=_fw
+        )
+        with _serialization_context(example_inputs, enable=True) as captured:
+            fn = aot_autograd(
+                fw_compiler=fw_compiler,
+                bw_compiler=_fw,
+                partition_fn=min_cut_rematerialization_partition,
+                decompositions=_TPU_DECOMPOSITIONS,
+                keep_inference_input_mutations=False,
+            )(graph_module, example_inputs)
+            if captured is not None and captured[0] is not None:
+                entry = captured[0]
+                fn.serialize = lambda: entry
+            return fn
+
+
+def _run_handover_prequant_case(disarm: bool) -> list[tuple[int, ...]]:
+    @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": 0})
+    class _HandoverModel(nn.Module):
+        def __init__(self, *, vllm_config: VllmConfig) -> None:
+            super().__init__()
+            self.embed_w = nn.Parameter(torch.ones(32, 8, dtype=torch.bfloat16))
+            self.dense_w = nn.Parameter(torch.ones(8, 8, dtype=torch.bfloat16))
+            self.register_buffer(
+                "dense_stack_w",
+                torch.ones(1, 8, 8, dtype=torch.bfloat16),
+                persistent=False,
+            )
+            self.post_attention_layernorm = rmsnorm.TpuRMSNorm(8, eps=1e-6)
+            slot = PrequantSlot()
+            self.post_attention_layernorm._prequant_slot = slot  # noqa: SLF001 -- seeding prequant slot as rmsnorm._pair does
+            self.gate_up_proj = nn.Module()
+            setattr(self.gate_up_proj, PREQUANT_ATTR, slot)
+            self.mlp = SimpleNamespace(gate_up_proj=self.gate_up_proj)
+
+        def forward(
+            self, input_ids: torch.Tensor, positions: torch.Tensor
+        ) -> torch.Tensor:
+            n = positions.shape[0]
+            slot = getattr(self.gate_up_proj, PREQUANT_ATTR, None)
+            if n <= 8:
+                out = torch.nn.functional.embedding(input_ids, self.embed_w)
+                z = self.dense_stack_w.reshape(-1)[0]
+                out = out + (z - z)
+                if slot is not None and slot.value is not None:
+                    slot.value = None
+                return out @ self.dense_w
+            torch._check(n % 4 == 0)  # noqa: SLF001 -- torch symbolic divisibility guard matching moe_prefill_sp._check_divides
+            out = torch.nn.functional.embedding(input_ids, self.embed_w)
+            out = out.view(4, n // 4, 8)[0]
+            z = self.dense_w.reshape(-1)[0]
+            out = out + (z - z)
+            if self.post_attention_layernorm.is_prequant_armed() and slot is not None:
+                slot.value = (
+                    out.to(torch.float8_e4m3fn),
+                    torch.ones((out.shape[0], 1), dtype=torch.float32),
+                )
+            out = out @ self.dense_stack_w[0]
+            return out.repeat(4, 1).narrow(0, 0, n)
+
+    with tempfile.TemporaryDirectory() as cache_root:
+        env_patch = {
+            "VLLM_CACHE_ROOT": cache_root,
+            "VLLM_DISABLE_COMPILE_CACHE": "0",
+            "VLLM_USE_AOT_COMPILE": "1",
+            "VLLM_USE_MEGA_AOT_ARTIFACT": "0",
+            "TPU_PARALLEL_PRECOMPILE": "1",
+            "LOCAL_RANK": "0",
+        }
+        buckets = [4, 8, 64]
+        with patch.dict(os.environ, env_patch):
+            with patch.object(
+                type(current_platform),
+                "check_and_update_config",
+                classmethod(lambda cls, cfg: None),
+            ):
+                config = VllmConfig(
+                    device_config=DeviceConfig(device="cpu"),
+                    scheduler_config=SchedulerConfig(
+                        max_num_batched_tokens=16384,
+                        max_model_len=16384,
+                        is_encoder_decoder=False,
+                    ),
+                    compilation_config=CompilationConfig(
+                        mode=CompilationMode.VLLM_COMPILE,
+                        backend="",
+                        compile_sizes=list(buckets),
+                        splitting_ops=[],
+                        cudagraph_capture_sizes=[],
+                    ),
+                )
+            for field in dataclasses.fields(config.compilation_config.pass_config):
+                val = getattr(config.compilation_config.pass_config, field.name)
+                if isinstance(val, bool):
+                    setattr(config.compilation_config.pass_config, field.name, False)
+
+            vllm_torchtpu._patch_vllm_aot_compile_cache_key()  # noqa: SLF001 -- runtime compile hook setup
+            vllm_torchtpu._patch_vllm_compile_all_ranges()  # noqa: SLF001 -- runtime compile hook setup
+            vllm_torchtpu._patch_vllm_piecewise_backend()  # noqa: SLF001 -- runtime compile hook setup
+
+            with (
+                patch.object(
+                    type(config.compilation_config),
+                    "get_compile_ranges",
+                    lambda self: [],
+                ),
+                patch.object(
+                    tpu_compiler,
+                    "compute_tpu_compilation_hash",
+                    lambda _cfg: f"n37_{disarm}",
+                ),
+                patch.object(tpu_compiler, "_tpu_backend", _CpuAotBackend()),
+                set_current_vllm_config(config),
+            ):
+                model = _HandoverModel(vllm_config=config)
+                if disarm:
+                    rmsnorm.disarm_post_attention_prequant(model)
+
+                with shape_variants.warmup() as tracked:
+                    with shape_variants.trace_only() as deferred:
+                        for n in buckets:
+                            if tracked.needs_retrace(n):
+                                shape_variants.retrace(model, config)
+                            model(
+                                torch.zeros(n, dtype=torch.int64),
+                                torch.arange(n, dtype=torch.int32),
+                            )
+                    deferred.compile()
+
+                return [
+                    tuple(
+                        model(
+                            torch.zeros(n, dtype=torch.int64),
+                            torch.arange(n, dtype=torch.int32),
+                        ).shape
+                    )
+                    for n in buckets
+                ]
+
+
+def test_should_keep_single_submod_output_when_dense_sp_disarms_post_norm_prequant():
+    with pytest.raises(IndexError, match="list index out of range"):
+        _run_handover_prequant_case(disarm=False)
+
+    shapes = _run_handover_prequant_case(disarm=True)
+    assert shapes == [(4, 8), (8, 8), (64, 8)]

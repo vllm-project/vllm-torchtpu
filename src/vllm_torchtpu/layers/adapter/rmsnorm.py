@@ -32,14 +32,14 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 from vllm.model_executor.layers.layernorm import RMSNorm
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_WEIGHT,
     PREQUANT_ATTR,
     PrequantSlot,
 )
-
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
 
 _ops: dict[tuple[float, bool], Callable[..., Any]] = {}
 _ops_lock = Lock()
@@ -211,6 +211,15 @@ def arm_prequant(model: torch.nn.Module) -> int:
     return n
 
 
+def disarm_post_attention_prequant(layer: torch.nn.Module) -> None:
+    ln_post = getattr(layer, "post_attention_layernorm", None)
+    if isinstance(ln_post, TpuRMSNorm):
+        ln_post.disarm_prequant()
+    gate_up = getattr(getattr(layer, "mlp", None), "gate_up_proj", None)
+    if gate_up is not None and hasattr(gate_up, PREQUANT_ATTR):
+        delattr(gate_up, PREQUANT_ATTR)
+
+
 _quant_moe_ops: dict[float, object] = {}
 
 
@@ -334,6 +343,13 @@ class TpuRMSNorm(RMSNorm):
         if self._pallas_ok:
             self._op_res = _get_op(self.variance_epsilon, True)
             self._op_nores = _get_op(self.variance_epsilon, False)
+
+    def disarm_prequant(self) -> None:
+        self._prequant_slot = None
+        self._op_quant = None
+
+    def is_prequant_armed(self) -> bool:
+        return self._prequant_slot is not None
 
     def _use_pallas(self, x: torch.Tensor, residual: torch.Tensor | None) -> bool:
         if not self._pallas_ok or x.device.type != "tpu":

@@ -55,16 +55,11 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.model_executor.layers import vocab_parallel_embedding as vpe
 from vllm.model_executor.models import deepseek_v2
-from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
-from vllm_torchtpu.layers.adapter.linear_common import (
-    KEEP_VLLM_LAYOUT_ATTR,
-    WEIGHT_FLIPPED_ATTR,
-)
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import fresh_buffer
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     grouped_shared_expert_sharded,
 )
@@ -72,9 +67,17 @@ from vllm_torchtpu.layers.adapter import (
     dcp_token_parallel_op,
     fused_moe_decode,
     fused_moe_ep,
+    rmsnorm,
+    small_all_reduce_op,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
 
@@ -96,10 +99,20 @@ SHARED_STACK = (
     "_tpu_sp_shared_w2",
     "_tpu_sp_shared_s2",
 )
+DENSE_STACK = (
+    "_tpu_sp_dense_w13",
+    "_tpu_sp_dense_s13",
+    "_tpu_sp_dense_w2",
+    "_tpu_sp_dense_s2",
+)
 # On an armed decoder layer's mlp: the stacked tensors, its row in them, the op.
 SHARED_ATTR = "_tpu_sp_shared"
 SHARED_INDEX = "_tpu_sp_shared_index"
 SHARED_OP = "_tpu_sp_shared_op"
+DENSE_ATTR = "_tpu_sp_dense"
+DENSE_INDEX = "_tpu_sp_dense_index"
+DENSE_OP = "_tpu_sp_dense_op"
+EMBED_RS_ATTR = "_tpu_sp_embed_rs"
 OP_ATTR = "_tpu_sp_moe_op"
 SCALE_ATTR = "_tpu_sp_routed_scale"
 
@@ -174,33 +187,39 @@ def _gather(t: torch.Tensor, dim: int) -> torch.Tensor:
     return get_tp_group().all_gather(t, dim)
 
 
+def _is_per_channel_fp8(linear: Any) -> bool:
+    w = getattr(linear, "weight", None)
+    s = getattr(linear, "weight_scale", None)
+    return (
+        w is not None
+        and w.dtype == torch.float8_e4m3fn
+        and s is not None
+        and s.dim() == 1
+        and bool(getattr(linear, WEIGHT_FLIPPED_ATTR, False))
+        and not bool(getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False))
+        and getattr(linear, "bias", None) is None
+    )
+
+
 def _per_channel_fp8(linear: Any) -> tuple[torch.Tensor, torch.Tensor]:
     w, s = linear.weight, getattr(linear, "weight_scale", None)
-    if (
-        w.dtype != torch.float8_e4m3fn
-        or s is None
-        or s.dim() != 1
-        or not getattr(linear, WEIGHT_FLIPPED_ATTR, False)
-        or getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False)
-        or getattr(linear, "bias", None) is not None
-    ):
+    if not _is_per_channel_fp8(linear):
         raise NotImplementedError(
             "TPU_MOE_PREFILL_SEQUENCE_PARALLEL re-shards a shared expert held as "
             "per-channel fp8 (k, n) linears without bias; got "
             f"{w.dtype} weight {tuple(w.shape)}, scale "
             f"{None if s is None else tuple(s.shape)}"
         )
+    assert s is not None
     return w.data, s.data
 
 
-def _group_shared_expert(
-    mlp: Any, tp: int, rank: int, group: int
+def _group_mlp_block(
+    mlp_block: Any, tp: int, rank: int, group: int
 ) -> tuple[torch.Tensor, ...]:
-    """This rank's member slice of the layer's shared expert (w13, s13, w2,
-    s2); the fp8 weights still as the bf16 they were gathered in (exact)."""
-    shared = mlp.shared_experts
-    w13, s13 = _per_channel_fp8(shared.gate_up_proj)
-    w2, s2 = _per_channel_fp8(shared.down_proj)
+    """This rank's member slice of a `DeepseekV2MLP` block (`w13, s13, w2, s2`)."""
+    w13, s13 = _per_channel_fp8(mlp_block.gate_up_proj)
+    w2, s2 = _per_channel_fp8(mlp_block.down_proj)
     return member_slice(
         _gather(w13, 1),
         _gather(s13, 0),
@@ -212,12 +231,25 @@ def _group_shared_expert(
     )
 
 
-def _stack_shared_experts(
-    backbone: Any, mlps: list[Any], parts: list[tuple[torch.Tensor, ...]]
+def _group_shared_expert(
+    mlp: Any, tp: int, rank: int, group: int
+) -> tuple[torch.Tensor, ...]:
+    """Return this rank's member slice of the layer's shared expert."""
+    return _group_mlp_block(mlp.shared_experts, tp, rank, group)
+
+
+def _stack_mlp_parts(
+    backbone: Any,
+    mlps: list[Any],
+    parts: list[tuple[torch.Tensor, ...]],
+    *,
+    stack_names: tuple[str, str, str, str],
+    attr: str,
+    index_attr: str,
 ) -> None:
     stacked = []
     dtypes = (torch.float8_e4m3fn, torch.float32, torch.float8_e4m3fn, torch.float32)
-    for name, column, dtype in zip(SHARED_STACK, zip(*parts), dtypes):
+    for name, column, dtype in zip(stack_names, zip(*parts), dtypes):
         # A fresh buffer, not a view: torch_tpu hands the executable the buffer
         # behind a tensor, and peer-replayed programs then disagree with this
         # rank's argument shapes. Stacked before the fp8 cast (exact).
@@ -225,8 +257,21 @@ def _stack_shared_experts(
         backbone.register_buffer(name, t, persistent=False)
         stacked.append(t)
     for i, mlp in enumerate(mlps):
-        setattr(mlp, SHARED_ATTR, tuple(stacked))
-        setattr(mlp, SHARED_INDEX, i)
+        setattr(mlp, attr, tuple(stacked))
+        setattr(mlp, index_attr, i)
+
+
+def _stack_shared_experts(
+    backbone: Any, mlps: list[Any], parts: list[tuple[torch.Tensor, ...]]
+) -> None:
+    _stack_mlp_parts(
+        backbone,
+        mlps,
+        parts,
+        stack_names=SHARED_STACK,
+        attr=SHARED_ATTR,
+        index_attr=SHARED_INDEX,
+    )
 
 
 _SHARED_OPS: dict[tuple, Any] = {}
@@ -263,6 +308,51 @@ def _build_shared_op(group: int) -> Any:
 def _shared_expert(mlp: Any, x: torch.Tensor) -> torch.Tensor:
     i = getattr(mlp, SHARED_INDEX)
     return getattr(mlp, SHARED_OP)(x, *(t[i] for t in getattr(mlp, SHARED_ATTR)))
+
+
+def _dense_mlp(mlp: Any, x: torch.Tensor) -> torch.Tensor:
+    i = getattr(mlp, DENSE_INDEX)
+    return getattr(mlp, DENSE_OP)(x, *(t[i] for t in getattr(mlp, DENSE_ATTR)))
+
+
+def _embed_reduce_scatter(embed: Any, input_ids: torch.Tensor) -> torch.Tensor:
+    """Vocab-parallel embedding reduced onto sequence-parallel rows `[T / tp, H]`.
+
+    Reads the same shard-bound buffers and weight in the same order as
+    `VocabParallelEmbedding.forward` so decode and prefill buckets lift
+    identical arguments for bucket hand-over.
+    """
+    masked_input, input_mask = vpe.get_masked_input_and_mask(
+        input_ids,
+        getattr(
+            embed,
+            "org_vocab_start_index",
+            embed.shard_indices.org_vocab_start_index,
+        ),
+        getattr(
+            embed,
+            "org_vocab_end_index",
+            embed.shard_indices.org_vocab_end_index,
+        ),
+        getattr(
+            embed,
+            "num_org_vocab_padding",
+            embed.shard_indices.num_org_vocab_padding,
+        ),
+        getattr(
+            embed,
+            "added_vocab_start_index",
+            embed.shard_indices.added_vocab_start_index,
+        ),
+        getattr(
+            embed,
+            "added_vocab_end_index",
+            embed.shard_indices.added_vocab_end_index,
+        ),
+    )
+    output_parallel = embed.quant_method.embedding(embed, masked_input.long())
+    output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+    return tensor_model_parallel_reduce_scatter(output_parallel, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +515,8 @@ def _sequence_parallel_layer_forward(
     if not sharded_in:
         residual = own_rows(residual, fused_moe_ep.rank_operand(), tp)
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+    if hasattr(layer.mlp, DENSE_OP):
+        return _dense_mlp(layer.mlp, hidden_states), residual
     return _moe(layer.mlp, hidden_states, num_tokens, tp), residual
 
 
@@ -462,9 +554,21 @@ def patched_model_forward(
         return UPSTREAM_MODEL_FORWARD(
             self, input_ids, positions, intermediate_tensors, inputs_embeds
         )
-    hidden_states = (
-        inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
-    )
+    if inputs_embeds is not None:
+        hidden_states = inputs_embeds
+    elif (
+        getattr(self, EMBED_RS_ATTR, False)
+        and input_ids is not None
+        and input_ids.ndim == 1
+    ):
+        _check_divides(num_tokens)
+        hidden_states = _embed_reduce_scatter(self.embed_tokens, input_ids)
+    else:
+        hidden_states = self.embed_input_ids(input_ids)
+    # Avoid ShapeSpecializationError on warmup bucket handover: when
+    # embed_tokens and all leading dense layers take SP collectives, no
+    # all-reduce runs on the prefill branch to lift small_all_reduce_op._RANK.
+    hidden_states = small_all_reduce_op.retain(hidden_states)
     residual = None
     for layer in islice(self.layers, self.start_layer, self.end_layer):
         hidden_states, residual = layer(positions, hidden_states, residual, None)
@@ -550,10 +654,61 @@ def _keep_list(mlp: torch.nn.Module) -> list[torch.Tensor]:
     return list(seen.values())
 
 
+def _keep_list_dense(mlp: torch.nn.Module) -> list[torch.Tensor]:
+    """Buffers lifted by either branch of an armed dense decoder layer."""
+    seen: dict[int, torch.Tensor] = {}
+    extra = (fused_moe_ep.rank_operand(),)
+    for t in (*mlp.parameters(), *mlp.buffers(), *getattr(mlp, DENSE_ATTR), *extra):
+        if t is not None:
+            seen.setdefault(id(t), t)
+    return list(seen.values())
+
+
+def _dense_group_size(tp: int, shared_group: int) -> int:
+    # Avoid group=4 for the few dense layers: group=2 keeps dense MLP
+    # communication intra-chip (zero inter-chip traffic) at ~340 MB/TC total.
+    return 2 if (shared_group >= 2 and tp % 2 == 0) else 1
+
+
+def _can_arm_dense_layer(layer: Any) -> bool:
+    if not isinstance(layer.mlp, deepseek_v2.DeepseekV2MLP):
+        return False
+    mla = getattr(getattr(layer, "self_attn", None), "mla_attn", None)
+    if (
+        mla is None
+        or "prefill_group" not in inspect.signature(type(mla).forward).parameters
+        or mla.kimi_preprocess is not None
+        or mla.q_lora_rank is None
+        or mla.g_proj is not None
+    ):
+        return False
+    return _is_per_channel_fp8(layer.mlp.gate_up_proj) and _is_per_channel_fp8(
+        layer.mlp.down_proj
+    )
+
+
+def _can_embed_reduce_scatter(backbone: Any, tp: int) -> bool:
+    embed = getattr(backbone, "embed_tokens", None)
+    return (
+        tp > 1
+        and isinstance(embed, vpe.VocabParallelEmbedding)
+        and getattr(embed, "tp_size", 1) == tp
+        and bool(
+            getattr(
+                vpe.VocabParallelEmbedding, "_tpu_vocab_parallel_embedding_patch", False
+            )
+        )
+        and not bool(getattr(embed, "use_fused_embedding", False))
+        and hasattr(embed, "quant_method")
+    )
+
+
 def arm(model: torch.nn.Module, vllm_config: Any) -> int:
-    """Prepare every MoE layer of the backbone; returns how many. Collective
-    over the TP group (weight gathers, the EP mesh). Raises for anything the
-    split cannot serve."""
+    """Arm MoE and eligible leading dense layers for sequence-parallel prefill.
+
+    Collective over the TP group (weight gathers, the EP mesh). Returns how many
+    MoE layers were armed; raises for anything the split cannot serve.
+    """
     check_config(vllm_config)
     backbone = _backbone(model)
     tp = get_tensor_model_parallel_world_size()
@@ -571,6 +726,7 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         raise NotImplementedError(
             "the split needs every layer after the first MoE layer to be MoE"
         )
+    tp_rank = get_tp_group().rank_in_group
     shared_parts = []
     for layer in layers[first:]:
         mla = getattr(layer.self_attn, "mla_attn", None)
@@ -602,16 +758,14 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             renormalize=experts.renormalize,
             activation=experts.quant_method._tpu_activation_str,
         )
-        if ep_mesh_index() != get_tp_group().rank_in_group:
+        if ep_mesh_index() != tp_rank:
             raise NotImplementedError(
                 "the EP mesh index must be the TP rank (a rank-ordered EP mesh, "
                 "as under DCP): the rank operand also picks the residual rows"
             )
         setattr(mlp, OP_ATTR, op)
         setattr(mlp, SCALE_ATTR, float(mlp.routed_scaling_factor))
-        shared_parts.append(
-            _group_shared_expert(mlp, tp, get_tp_group().rank_in_group, group)
-        )
+        shared_parts.append(_group_shared_expert(mlp, tp, tp_rank, group))
         setattr(mlp, SHARED_OP, _build_shared_op(group))
     _stack_shared_experts(
         backbone, [layer.mlp for layer in layers[first:]], shared_parts
@@ -619,14 +773,50 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     del shared_parts
     for layer in layers[first:]:
         setattr(layer, KEEP_ATTR, _keep_list(layer.mlp))
+
+    dense_armed = 0
+    dense_group = _dense_group_size(tp, group)
+    dense_layers = layers[:first]
+    if dense_layers and all(_can_arm_dense_layer(layer) for layer in dense_layers):
+        dense_parts = [
+            _group_mlp_block(layer.mlp, tp, tp_rank, dense_group)
+            for layer in dense_layers
+        ]
+        _stack_mlp_parts(
+            backbone,
+            [layer.mlp for layer in dense_layers],
+            dense_parts,
+            stack_names=DENSE_STACK,
+            attr=DENSE_ATTR,
+            index_attr=DENSE_INDEX,
+        )
+        del dense_parts
+        dense_op = _build_shared_op(dense_group)
+        for layer in dense_layers:
+            # Avoid leaving post_attention_layernorm paired with gate_up_proj:
+            # _dense_mlp bypasses gate_up_proj, leaving PrequantSlot.value set
+            # on SP traces and emitting extra Dynamo outputs (submod_0[1:]).
+            rmsnorm.disarm_post_attention_prequant(layer)
+            setattr(layer.mlp, DENSE_OP, dense_op)
+            setattr(layer, KEEP_ATTR, _keep_list_dense(layer.mlp))
+        dense_armed = len(dense_layers)
+
+    embed_rs = (first == 0 or dense_armed == first) and _can_embed_reduce_scatter(
+        backbone, tp
+    )
+    setattr(backbone, EMBED_RS_ATTR, embed_rs)
     setattr(backbone, KEEP_ATTR, True)
     n = len(layers) - first
     logger.info(
-        "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers armed (layers %d..%d), "
-        "buckets > %d tokens, tp=%d",
+        "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers (layers %d..%d) and "
+        "%d dense layers (dense_group=%d, embed_rs=%s) armed, buckets > %d tokens, "
+        "tp=%d",
         n,
         backbone.start_layer + first,
         backbone.end_layer - 1,
+        dense_armed,
+        dense_group,
+        embed_rs,
         envs.bucket_gate_edge(MIN_TOKENS),
         tp,
     )
