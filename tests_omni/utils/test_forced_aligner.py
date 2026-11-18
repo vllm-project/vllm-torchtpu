@@ -50,6 +50,7 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 from tests_omni.omni_test_utils import NIGHTLY_TIMEOUT_S
 
 pytestmark = [
+    pytest.mark.omni_feature,
     pytest.mark.omni,
     pytest.mark.nightly,
     pytest.mark.multichip,

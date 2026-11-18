@@ -21,7 +21,11 @@ import torch.nn.functional as F
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 REF_KV_MAX_REL_L2 = {"none": 2.0e-2, "int8": 6.0e-2}
 NUM_LAYERS = 2

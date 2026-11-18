@@ -34,11 +34,13 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 
 import contextlib
 import copy
+import functools
 import gc
 import json
 import re
 import threading
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 import psutil
@@ -49,6 +51,43 @@ from tests.tpu_release import wait_for_tpu_release
 
 omni_fixture_lock = threading.Lock()
 _TPU_DEVICE_NODE = re.compile(r"/dev/(?:accel|vfio/)\d+")
+_SUITE_MARK = "pytest.mark.omni_feature"
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--omni-feature-only",
+        action="store_true",
+        help="Collect only test modules marked omni_feature; never import the others.",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the marker that selects the omni feature suite."""
+    config.addinivalue_line(
+        "markers", "omni_feature: vllm-omni feature suite, one test per Features row"
+    )
+
+
+@functools.cache
+def _suite_paths(root: Path) -> frozenset[Path]:
+    """Test modules under root that carry the omni_feature mark, and their dirs."""
+    modules = {p for p in root.rglob("test_*.py") if _SUITE_MARK in p.read_text()}
+    dirs = {d for p in modules for d in p.parents if d.is_relative_to(root)}
+    return frozenset(modules | dirs)
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    """With --omni-feature-only, skip test files and dirs without suite tests."""
+    if not config.getoption("omni_feature_only", default=False):
+        return None
+    root, path = Path(__file__).resolve().parent, collection_path.resolve()
+    if path == root or not path.is_relative_to(root):
+        return None
+    collectable = path.is_dir() or path.name.startswith("test_")
+    if collectable and path not in _suite_paths(root):
+        return True
+    return None
 
 # TpuPlatform._prepare_singlehost_tpu_env writes these into the parent pytest
 # environment when building a multi-rank LLM stage config, and skips recomputing

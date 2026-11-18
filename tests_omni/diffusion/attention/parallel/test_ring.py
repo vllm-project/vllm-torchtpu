@@ -43,6 +43,7 @@ from tests_omni.omni_test_utils import NIGHTLY_TIMEOUT_S
 from tests_omni.tiny_models import tiny_diffusion_dir
 
 pytestmark = [
+    pytest.mark.omni_feature,
     pytest.mark.omni,
     pytest.mark.nightly,
     pytest.mark.multichip,

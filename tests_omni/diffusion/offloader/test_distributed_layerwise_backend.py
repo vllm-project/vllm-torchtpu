@@ -34,7 +34,11 @@ from vllm_omni.diffusion.offloader.startup import attach_offload_startup_state
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 MAX_REL_L2 = 2.0e-2
 MAX_ABS = 5.0e-2

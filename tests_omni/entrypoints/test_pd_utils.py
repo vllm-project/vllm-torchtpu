@@ -30,6 +30,7 @@ from vllm_omni.worker.omni_connector_validation import validate_worker_omni_conn
 from tests_omni.omni_test_utils import PR_TIMEOUT_S
 
 pytestmark = [
+    pytest.mark.omni_feature,
     pytest.mark.omni,
     pytest.mark.timeout(PR_TIMEOUT_S),
 ]

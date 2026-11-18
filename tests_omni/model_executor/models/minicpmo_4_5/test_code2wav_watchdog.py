@@ -23,7 +23,11 @@ from vllm_omni.platforms import current_omni_platform
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 WATCHDOG_TIMEOUT_S = 0.05
 STALL_SLEEP_S = 0.15

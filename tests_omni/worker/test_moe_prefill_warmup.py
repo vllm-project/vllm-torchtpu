@@ -24,7 +24,11 @@ from vllm_omni.worker.omni_connector_validation import _resolve_worker_cls
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 _MAX_CUDAGRAPH_SIZE = 8
 _MAX_NUM_TOKENS = 64

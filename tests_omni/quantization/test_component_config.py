@@ -42,7 +42,11 @@ from vllm_torchtpu.layers.adapter.quantization.fp8 import (
     VllmFp8LinearMethodTPU,
 )
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 FP8_MAX_REL_L2 = 1.2e-1
 FP8_MAX_ABS = 2.0e-1

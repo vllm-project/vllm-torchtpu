@@ -44,7 +44,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from tests_omni.omni_test_utils import NIGHTLY_TIMEOUT_S, PR_TIMEOUT_S, assert_parity
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-pytestmark = [pytest.mark.omni]
+pytestmark = [pytest.mark.omni_feature, pytest.mark.omni]
 
 GGUF_MAX_REL_L2 = 5.0e-2
 GGUF_MAX_ABS = 1.0e-1

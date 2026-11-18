@@ -27,7 +27,11 @@ from vllm_omni.utils import speaker_cache as speaker_cache_mod
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 _RESOLVE_MAX_ENTRIES = 2
 _WAVEFORM_SAMPLES = 4

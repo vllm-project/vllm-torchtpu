@@ -30,7 +30,11 @@ from vllm_omni.diffusion.forward_context import (
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 from tests_omni.tiny_models import tiny_diffusion_dir
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 MAX_REL_L2 = 2e-2
 MAX_ABS = 5e-2

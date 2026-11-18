@@ -28,7 +28,11 @@ from vllm_omni.plugins import (
 from tests_omni.omni_test_utils import PR_TIMEOUT_S
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 _EXPECTED_ENTRYPOINT = "vllm_torchtpu.omni:register_omni_tpu_platform"
 _EXPECTED_QUALNAME = "vllm_torchtpu.omni.platform.OmniTpuPlatform"
