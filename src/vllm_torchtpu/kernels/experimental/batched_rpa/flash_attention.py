@@ -135,7 +135,6 @@ def flash_attention_qk_softmax(
     b, k_heads, tq, h_size = q.shape
 
     diet = vpu_diet_enabled()
-    folded_scale = q_folded_scale(cfgs) if diet else None
     row_scale = None
     qk_operand = _native_fp8(cfgs).qk
     native_qk = qk_operand is not configs.Fp8Operand.OFF
@@ -176,7 +175,6 @@ def flash_attention_qk_softmax(
         qk = _merge_split(qk, tq)
     qk = qk.reshape(b, k_heads, tq, s)
 
-    if folded_scale is None:
     if native_qk:
         # Native QK: the static factors (and the q row scales) scale the
         # [TQ, S] f32 tile in one multiply; a per-token k_scale is only
