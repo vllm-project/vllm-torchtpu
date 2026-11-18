@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     VLLM_TPU_GDN_WINDOW_LOG: bool = False
+    VLLM_TPU_L6_SEED_SPEC: str = ""
     VLLM_TPU_GDN_WINDOW_FACTORED: bool = False
     VLLM_TPU_GDN_LEAN_GLUE: bool = False
     VLLM_TPU_GDN_PREFILL_BF16_QKV_2D: bool = False
@@ -671,6 +672,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # next step applies the first read-offset logged positions on load.
     # Refused with the megakernel and on any other leg.
     "VLLM_TPU_GDN_WINDOW_LOG": env_bool("VLLM_TPU_GDN_WINDOW_LOG"),
+    # q38 SEED-SPEC (HCDEC-HOSTADM, ported by BLSTACK-SEED; runner/l6_seedspec.py,
+    # core/l6_ab.py shim; host-only): unset / 0 off, 1 on; "ab:" is refused.
+    # On, a request whose last token of the step sits within the previous
+    # step's draft count past a GDN state-column edge no longer makes
+    # _collect_mamba_state_seed_copies wait for the previous step's sampled
+    # copy: in the canonical case (recorded column = the low side, all
+    # accepted = low + 1, speculative checkpoint seed) the seed is staged as
+    # for a crossing and the column is resolved at the next step from that
+    # copy. Same programs and shapes; never part of the compile key.
+    "VLLM_TPU_L6_SEED_SPEC": env_str("VLLM_TPU_L6_SEED_SPEC", ""),
     # With VLLM_TPU_GDN_WINDOW_LOG: the BATCHED GDN kernel runs the verify
     # window in factored form (one product of the window's keys and queries
     # with the stored state, the logged and window updates as vector work, one

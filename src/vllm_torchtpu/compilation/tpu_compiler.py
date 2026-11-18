@@ -300,6 +300,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_PP_LAST_ASYNC_OUTPUT",
     # Engine-core KV cache bookkeeping shortcut (core/kv_decode_fast_path.py).
     "VLLM_TPU_KV_DECODE_FAST_PATH",
+    # q38 SEED-SPEC (runner/l6_seedspec.py): whether the block-edge GDN seed
+    # waits for the previous step's copy; the seed rows, their programs and
+    # every model program are the same.
+    "VLLM_TPU_L6_SEED_SPEC",
     # Engine-core cap on remote KV loads started a pass (core/kv_load_pacing.py).
     "VLLM_TPU_KV_LOAD_STARTS_PER_STEP",
     # New-request prompt arrays (core/prompt_token_array.py).
