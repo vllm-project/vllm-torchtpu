@@ -156,7 +156,7 @@ class GQAModule(Module):
             return []
         if (tio := token_io(ex)) is not None:
             # Token step I/O: the rows' cos / sin come from the runner's cache.
-            if tio.rope_cols != g.ROT:
+            if tio.rope_rows == 0 or tio.rope_cols != g.ROT:
                 raise MegakernelConfigError(
                     f"GQAModule rotates {g.ROT} dims; the RoPE cache has "
                     f"{tio.rope_cols} columns"

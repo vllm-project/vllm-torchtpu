@@ -79,6 +79,15 @@ class TokenIO:
             )
         if self.shard <= 0 or self.vocab <= 0:
             raise MegakernelConfigError(f"TokenIO needs vocab and shard > 0: {self}")
+        # Rows are gathered through whole-tile windows (`gather_row`).
+        for name, rows, dt in (
+            ("shard", self.shard, BF16),
+            ("rope_rows", self.rope_rows, self.rope_dtype),
+        ):
+            if rows % _window(dt):
+                raise MegakernelConfigError(
+                    f"TokenIO.{name}={rows} must be a multiple of {_window(dt)}"
+                )
 
     @property
     def n_tiles(self) -> int:
@@ -216,7 +225,7 @@ def stage_inputs(
     pt = scr["tio_pt"]
     max_pages = pt.shape[1]
     S = seq_lens.shape[0]
-    width = math.prod(tables.shape) // S
+    width = tables.shape[1] if tables.ndim == 2 else math.prod(tables.shape) // S
     n_pt = min(width, max_pages)
     pos_row = positions.at[0] if positions.ndim == 2 else positions
 
@@ -269,10 +278,7 @@ def embed(ctx: Any, table: Any, ar_slot: int) -> None:
         x = jnp.where(jnp.logical_and(rows == b, mine), row, x)
     scr["res"][...] = jnp.zeros(scr["res"].shape, F32)
     comm.add_residual(comm.allreduce(ar_slot, x, True))
-    if comm.comm:
-        for rnd_i in comm.cp.AR_ROUNDS:
-            for d in comm.ar_copies(ar_slot, rnd_i):
-                d.wait_send()
+    comm.drain_slot(ar_slot)
 
 
 def head(ctx: Any, x: Any, out_ref: Any) -> None:
@@ -295,7 +301,8 @@ def head(ctx: Any, x: Any, out_ref: Any) -> None:
         pltpu.make_async_copy(ctx.W[HEAD_WEIGHT].at[0], w, scr["dsem"].at[bank]).wait()
         logits = round_bf16(stream.mm(x, w[...]))
         gid = cols + j * TN
-        logits = jnp.where(gid < tio.shard, logits, -jnp.inf)
+        real = jnp.logical_and(gid < tio.shard, gid + me * tio.shard < tio.vocab)
+        logits = jnp.where(real, logits, -jnp.inf)
         m = jnp.max(logits, axis=1, keepdims=True)
         i = jnp.min(jnp.where(logits == m, gid, big), axis=1, keepdims=True)
         stream.dgive(g0 + j)
@@ -305,7 +312,6 @@ def head(ctx: Any, x: Any, out_ref: Any) -> None:
     init = (jnp.full((MB, 1), -jnp.inf, F32), jnp.zeros((MB, 1), I32))
     best_v, best_i = lax.fori_loop(0, tio.n_tiles, tile, init)
     gidx = best_i + me * tio.shard
-    best_v = jnp.where(gidx < tio.vocab, best_v, -jnp.inf)
     lane = lax.broadcasted_iota(I32, (MB, LANES), 1)
     scr["tio_best"][...] = jnp.where(
         lane == 0, best_v, jnp.where(lane == 1, gidx.astype(F32), 0.0)

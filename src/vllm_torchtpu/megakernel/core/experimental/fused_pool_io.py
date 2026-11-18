@@ -49,9 +49,10 @@ CPU vs TPU code-path differences (beyond aliasing):
 ---------------------------------------------------
 The `if interpret:` branches below emulate TPU ref views with value ops, so CPU
 tests cover the arithmetic but not every TPU lowering:
-- FP8 page access: CPU uses value-level `lax.bitcast_convert_type` + `swapaxes`
-  on whole pages; TPU uses ref `.bitcast(...).reshape(...)` views (sublane-packed
-  `(4, page_size)` layout).
+- KV block access (fp8 or bf16 pages, `PK = 4 // itemsize` values per 32-bit
+  word; one 128-lane block of the page is staged): CPU uses value-level
+  `lax.bitcast_convert_type` + `swapaxes`; TPU uses ref `.bitcast(...)
+  .reshape(...)` views (sublane-packed `(PK, lanes)` layout).
 - KV column placement (RMW of the new token's KV lane): CPU selects the column
   with a masked lane sum; TPU rotates it with `pltpu.roll` (same bit pattern).
 - GDN recurrent state: CPU materializes the whole `[vh, KD, VD]` state as a value
@@ -149,17 +150,23 @@ def kv_rmw_lanes(ex: ExecSpec) -> int:
     return min(LANES, cache_exec(ex).page_size)
 
 
+# Staged KV blocks: layer `a` uses buffer `a % 2`, and layer `a + 1`'s block is
+# read while layer `a` runs, so the read is not queued behind the weight tiles
+# in flight when it is needed (in-step: +230 us a step at 64 layers otherwise).
+KV_NBUF = 2
+
+
 def gqa_fused_scratch(ex: ExecSpec, ap: Any) -> dict[str, Any]:
     """Scratch buffers for in-kernel KV block RMW (`CacheExec.FUSED`)."""
-    pk = ap.KV_PK
+    pk, nb = ap.KV_PK, KV_NBUF
     return {
         "kv_scat_page": pltpu.VMEM(
-            (ex.NS, 2, ap.HD // pk, pk, kv_rmw_lanes(ex)), ap.KV_DT
+            (nb, ex.NS, 2, ap.HD // pk, pk, kv_rmw_lanes(ex)), ap.KV_DT
         ),
-        "kv_rd_sem": pltpu.SemaphoreType.DMA((ex.NS,)),
-        "kv_wr_sem": pltpu.SemaphoreType.DMA((ex.NS,)),
-        "kv_rd_pend": pltpu.SMEM((ex.NS,), I32),
-        "kv_wr_pend": pltpu.SMEM((ex.NS,), I32),
+        "kv_rd_sem": pltpu.SemaphoreType.DMA((nb, ex.NS)),
+        "kv_wr_sem": pltpu.SemaphoreType.DMA((nb, ex.NS)),
+        "kv_rd_pend": pltpu.SMEM((nb, ex.NS), I32),
+        "kv_wr_pend": pltpu.SMEM((nb, ex.NS), I32),
         "kv_kp0": pltpu.SMEM((ex.NS,), I32),
         "kv_lb0": pltpu.SMEM((ex.NS,), I32),
         "kv_mode": pltpu.SMEM((ex.NS,), I32),
@@ -208,15 +215,17 @@ def _gqa_tok_kp(ctx: Any, s: Any, t: int) -> tuple[Any, Any, Any, Any]:
 
 def gqa_fused_init_buffers(ctx: Any) -> None:
     """Initialize per-sequence KV RMW mode (`0`=inactive, `1`=fast, `2`=slow),
-    target KV page `kv_kp0` and lane block `kv_lb0` once per step in SMEM.
+    target KV page `kv_kp0` and lane block `kv_lb0` once per step in SMEM, and
+    start reading layer 0's blocks.
     """
     ex, scr = ctx.ex, ctx.scr
     NS, T = ex.NS, ex.T
     act_list = [_gqa_seq_active(ctx, s) for s in range(NS)]
     kp_st: list[list[Any]] = []
     for s in range(NS):
-        scr["kv_rd_pend"][s] = jnp.int32(0)
-        scr["kv_wr_pend"][s] = jnp.int32(0)
+        for buf in range(KV_NBUF):
+            scr["kv_rd_pend"][buf, s] = jnp.int32(0)
+            scr["kv_wr_pend"][buf, s] = jnp.int32(0)
         toks = [_gqa_tok_kp(ctx, s, t) for t in range(T)]
         kps_s = [kp for kp, _, _, _ in toks]
         oks_s = [ok for _, _, _, ok in toks]
@@ -255,67 +264,84 @@ def gqa_fused_init_buffers(ctx: Any) -> None:
                 jnp.where(do_fast, jnp.int32(1), jnp.int32(2)),
                 jnp.int32(0),
             )
+    if "kv" not in ctx.skip:
+        _prefetch(ctx, 0, 0)
 
 
-def _gqa_wait_kv_rd(ctx: Any, s: int) -> None:
+def _gqa_wait_kv_rd(ctx: Any, buf: Any, s: int) -> None:
     scr = ctx.scr
     pltpu.make_async_copy(
         _kv_block(ctx.ex, ctx.raw_refs[0], 0, 0),
-        scr["kv_scat_page"].at[s],
-        scr["kv_rd_sem"].at[s],
+        scr["kv_scat_page"].at[buf, s],
+        scr["kv_rd_sem"].at[buf, s],
     ).wait()
 
 
-def _gqa_wait_kv_wr(ctx: Any, s: int) -> None:
+def _gqa_wait_kv_wr(ctx: Any, buf: Any, s: int) -> None:
     if "kv" in ctx.skip:
         return
     scr = ctx.scr
     wr_pend = scr["kv_wr_pend"]
-    pend = wr_pend[s]
+    pend = wr_pend[buf, s]
 
     @pl.when(pend != 0)
     def _():
         pltpu.make_async_copy(
-            scr["kv_scat_page"].at[s],
+            scr["kv_scat_page"].at[buf, s],
             _kv_block(ctx.ex, ctx.raw_refs[0], 0, 0),
-            scr["kv_wr_sem"].at[s],
+            scr["kv_wr_sem"].at[buf, s],
         ).wait()
 
-    wr_pend[s] = jnp.int32(0)
+    wr_pend[buf, s] = jnp.int32(0)
 
 
-def _start_kv_copy(ctx: Any, a_cur: Any, s: int, kp: Any, lb: Any, *, read: bool):
-    """Start the DMA of sequence `s`'s staged block from / to layer `a_cur`'s
-    pool."""
+def _start_kv_copy(
+    ctx: Any, a: Any, buf: Any, s: int, kp: Any, lb: Any, *, read: bool
+) -> None:
+    """Start the DMA of sequence `s`'s block staged in `buf` from / to layer
+    `a`'s pool."""
     scr, ex = ctx.scr, ctx.ex
-    stage = scr["kv_scat_page"].at[s]
+    stage = scr["kv_scat_page"].at[buf, s]
 
     def one(r: Any) -> None:
         blk = _kv_block(ex, r, kp, lb)
         if read:
-            pltpu.make_async_copy(blk, stage, scr["kv_rd_sem"].at[s]).start()
+            pltpu.make_async_copy(blk, stage, scr["kv_rd_sem"].at[buf, s]).start()
         else:
-            pltpu.make_async_copy(stage, blk, scr["kv_wr_sem"].at[s]).start()
+            pltpu.make_async_copy(stage, blk, scr["kv_wr_sem"].at[buf, s]).start()
 
-    bswitch(a_cur, [lambda r=r: one(r) for r in ctx.raw_refs])
+    if isinstance(a, int):
+        one(ctx.raw_refs[a])
+    else:
+        bswitch(a, [lambda r=r: one(r) for r in ctx.raw_refs])
 
 
-def gqa_fused_kvrd_issue(ctx: Any, a_cur: Any) -> None:
-    """Prefetch the target KV block of each fast-path sequence into
-    `kv_scat_page`."""
-    if "kv" in ctx.skip:
-        return
+def _prefetch(ctx: Any, a: Any, buf: Any) -> None:
+    """Read layer `a`'s target block of each fast-path sequence into `buf`
+    (after the write of the layer that used `buf` before)."""
     scr = ctx.scr
     rd_pend, kv_mode = scr["kv_rd_pend"], scr["kv_mode"]
     for s in range(ctx.ex.NS):
-        _gqa_wait_kv_wr(ctx, s)
+        _gqa_wait_kv_wr(ctx, buf, s)
         do_rd = kv_mode[s] == 1
         kp0_s, lb0_s = scr["kv_kp0"][s], scr["kv_lb0"][s]
-        rd_pend[s] = jnp.where(do_rd, 1, 0).astype(I32)
+        rd_pend[buf, s] = jnp.where(do_rd, 1, 0).astype(I32)
 
         @pl.when(do_rd)
         def _(s=s, kp0_s=kp0_s, lb0_s=lb0_s):
-            _start_kv_copy(ctx, a_cur, s, kp0_s, lb0_s, read=True)
+            _start_kv_copy(ctx, a, buf, s, kp0_s, lb0_s, read=True)
+
+
+def gqa_fused_kvrd_issue(ctx: Any, a_cur: Any) -> None:
+    """Prefetch the next attention layer's target KV blocks (layer 0's are
+    read in `gqa_fused_init_buffers`)."""
+    if "kv" in ctx.skip:
+        return
+    nxt = a_cur + 1
+
+    @pl.when(nxt < len(ctx.raw_refs))
+    def _():
+        _prefetch(ctx, nxt, lax.rem(nxt, KV_NBUF))
 
 
 def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
@@ -331,6 +357,7 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
     kv_scat = scr["kv_scat_page"]
     rd_pend, wr_pend = scr["kv_rd_pend"], scr["kv_wr_pend"]
     kv_mode = scr["kv_mode"]
+    buf = lax.rem(a_cur, KV_NBUF)
     lanes = kv_rmw_lanes(ex)
     if lanes < ex.MR:
         raise MegakernelConfigError(
@@ -364,12 +391,12 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
         v_view: Any = None
         if interpret:
             k_cur, v_cur = (
-                lax.bitcast_convert_type(jnp.swapaxes(kv_scat[s, i], 1, 2), I32)
+                lax.bitcast_convert_type(jnp.swapaxes(kv_scat[buf, s, i], 1, 2), I32)
                 for i in (0, 1)
             )
         else:
-            k_view = kv_scat.at[s, 0].bitcast(I32).reshape(h4, lanes)
-            v_view = kv_scat.at[s, 1].bitcast(I32).reshape(h4, lanes)
+            k_view = kv_scat.at[buf, s, 0].bitcast(I32).reshape(h4, lanes)
+            v_view = kv_scat.at[buf, s, 1].bitcast(I32).reshape(h4, lanes)
             k_cur, v_cur = k_view[...], v_view[...]
         for b_t, ln_b, ok in toks:
             mask_ln = jnp.logical_and(ok, lane_iota_kv == ln_b)
@@ -377,8 +404,8 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
             k_cur = jnp.where(mask_ln, k_col, k_cur)
             v_cur = jnp.where(mask_ln, v_col, v_cur)
         if interpret:
-            kv_scat[s, 0] = lax.bitcast_convert_type(k_cur, page_dt).swapaxes(1, 2)
-            kv_scat[s, 1] = lax.bitcast_convert_type(v_cur, page_dt).swapaxes(1, 2)
+            kv_scat[buf, s, 0] = lax.bitcast_convert_type(k_cur, page_dt).swapaxes(1, 2)
+            kv_scat[buf, s, 1] = lax.bitcast_convert_type(v_cur, page_dt).swapaxes(1, 2)
         else:
             k_view[...] = k_cur
             v_view[...] = v_cur
@@ -386,46 +413,46 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
     slow_list: list[Any] = []
     any_slow = jnp.bool_(False)
     for s in range(NS):
-        do_fast = rd_pend[s] != 0
-        rd_pend[s] = jnp.int32(0)
+        do_fast = rd_pend[buf, s] != 0
+        rd_pend[buf, s] = jnp.int32(0)
         slow_s = kv_mode[s] == 2
         slow_list.append(slow_s)
         any_slow = jnp.logical_or(any_slow, slow_s)
 
         @pl.when(do_fast)
         def _(s=s):
-            _gqa_wait_kv_rd(ctx, s)
+            _gqa_wait_kv_rd(ctx, buf, s)
             toks = []
             for t in range(T):
                 _, _, ln_b, ok = _gqa_tok_kp(ctx, s, t)
                 toks.append((s * T + t, ln_b, ok))
             _place(s, toks)
             _start_kv_copy(
-                ctx, a_cur, s, scr["kv_kp0"][s], scr["kv_lb0"][s], read=False
+                ctx, a_cur, buf, s, scr["kv_kp0"][s], scr["kv_lb0"][s], read=False
             )
 
-        wr_pend[s] = jnp.where(do_fast, 1, 0).astype(I32)
+        wr_pend[buf, s] = jnp.where(do_fast, 1, 0).astype(I32)
 
     if T > 1:
 
         @pl.when(any_slow)
         def _():
             for sp in range(NS):
-                _gqa_wait_kv_wr(ctx, sp)
+                _gqa_wait_kv_wr(ctx, buf, sp)
             for s in range(NS):
 
                 @pl.when(slow_list[s])
                 def _(s=s):
                     for t in range(T):
                         kp_t, lb_t, ln_b, ok = _gqa_tok_kp(ctx, s, t)
-                        _start_kv_copy(ctx, a_cur, s, kp_t, lb_t, read=True)
-                        _gqa_wait_kv_rd(ctx, s)
+                        _start_kv_copy(ctx, a_cur, buf, s, kp_t, lb_t, read=True)
+                        _gqa_wait_kv_rd(ctx, buf, s)
                         _place(s, [(s * T + t, ln_b, ok)])
-                        _start_kv_copy(ctx, a_cur, s, kp_t, lb_t, read=False)
+                        _start_kv_copy(ctx, a_cur, buf, s, kp_t, lb_t, read=False)
                         pltpu.make_async_copy(
-                            kv_scat.at[s],
+                            kv_scat.at[buf, s],
                             _kv_block(ex, ctx.raw_refs[0], 0, 0),
-                            scr["kv_wr_sem"].at[s],
+                            scr["kv_wr_sem"].at[buf, s],
                         ).wait()
 
 
@@ -433,8 +460,9 @@ def gqa_fused_epilogue(ctx: Any) -> None:
     """Drain any in-flight KV block RMW DMA writes at the end of the layer loop."""
     if "kv" in ctx.skip:
         return
-    for s in range(ctx.ex.NS):
-        _gqa_wait_kv_wr(ctx, s)
+    for buf in range(KV_NBUF):
+        for s in range(ctx.ex.NS):
+            _gqa_wait_kv_wr(ctx, buf, s)
 
 
 # ---------------------------------------------------------------------------

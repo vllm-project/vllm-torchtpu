@@ -163,7 +163,7 @@ def _check_token_step(g, ex, spec, mesh, pos, hid, w_l, st_l, hid_out, pools_ref
     cache rows hold the table, and the LM head ties two ids across ranks (row
     0) and across tiles of one rank (row 1) above every other logit, with a
     larger one past the vocabulary."""
-    shard = 300
+    shard = 304
     vocab = R * shard - 5
     tio = tio_mod.TokenIO(
         vocab=vocab,
@@ -180,7 +180,7 @@ def _check_token_step(g, ex, spec, mesh, pos, hid, w_l, st_l, hid_out, pools_ref
     ids = np.array([7, 5 * shard + 9], np.int32)
     emb = jax.random.normal(key, (R * shard, g.H), F32).astype(BF16)
     emb = emb.at[ids].set(hid[: ex.B].astype(BF16))
-    head = np.asarray(jax.random.normal(key, (R * shard, g.H), F32) * 0.05)
+    head = np.array(jax.random.normal(key, (R * shard, g.H), F32) * 0.05)
     ties = ([3, shard + 1], [2 * shard + 5, 2 * shard + tio.tile + 7])
     for b, rows in enumerate(ties):
         head[rows] = 4 * h[b] / np.linalg.norm(h[b])

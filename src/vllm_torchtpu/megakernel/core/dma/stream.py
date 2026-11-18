@@ -97,9 +97,11 @@ class TwoRing:
 
         `issue(j, bank)` starts the DMAs of tile `j` into bank `bank`; the
         module waits for them, reads the bank and releases it with
-        `dgive(tail_start() + j)`. Must be called before the first `fetch`.
+        `dgive(tail_start() + j)`. Must be called before the first `fetch`;
+        streams without `rel_fetch` only (its refills don't reach the tail).
         """
         assert self._tail is None, "one tail segment per stream"
+        assert not self.sp.rel_fetch, "a tail segment needs absolute fetches"
         self._tail = (count, issue)
 
     def end_layers(self) -> None:

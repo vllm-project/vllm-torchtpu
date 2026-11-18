@@ -256,6 +256,15 @@ class AllReduceRing:
         for d in descs:
             d.wait_send()
 
+    def drain_slot(self, slot: int) -> None:
+        """Wait for `slot`'s sends now, so the next all-reduce on it may start
+        with `first=True` and `drain_sends` doesn't wait for them again."""
+        if self.comm:
+            for rnd_i in self.cp.AR_ROUNDS:
+                for d in self.ar_copies(slot, rnd_i):
+                    d.wait_send()
+        self._used_slots.discard(slot)
+
     def drain_sends(self):
         """Wait for the last layer's all-reduce sends before kernel exit."""
         if self.comm:
