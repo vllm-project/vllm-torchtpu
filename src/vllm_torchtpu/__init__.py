@@ -1642,7 +1642,7 @@ def _patch_vllm_compile_prefix_isolation() -> None:
     breaks that, and one layer's executable can be reused by another (XLA
     e0102). Keying on self.prefix is a no-op for shape-uniform models.
     """
-    import itertools
+    import collections
 
     from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 
@@ -1650,7 +1650,7 @@ def _patch_vllm_compile_prefix_isolation() -> None:
     if getattr(original_init, "_tpu_compile_prefix_isolation_patch", False):
         return
 
-    counter = itertools.count()
+    ordinals: collections.Counter[str] = collections.Counter()
 
     def patched_init(self, compile_prefix: str = "", is_encoder: bool = False) -> None:
         if not compile_prefix and not is_encoder:
@@ -1658,14 +1658,15 @@ def _patch_vllm_compile_prefix_isolation() -> None:
             if prefix:
                 compile_prefix = prefix
             else:
-                # No self.prefix: fall back to a counter. Stable within a
-                # process but not across restarts, so the cache won't persist.
-                compile_prefix = f"_tpu_instance_{next(counter)}"
-                logger.warning(
-                    "compile_prefix isolation: %s has no self.prefix; using "
-                    "non-deterministic fallback %s (its on-disk compile "
-                    "cache will not persist across restarts).",
-                    type(self).__name__,
+                # No self.prefix (e.g. DeepseekV2Model): the class name and its
+                # construction ordinal, which every start of the same model
+                # reproduces, so the on-disk cache dir is found again.
+                name = type(self).__name__
+                compile_prefix = f"{name}_{ordinals[name]}"
+                ordinals[name] += 1
+                logger.info(
+                    "compile_prefix isolation: %s has no self.prefix; using %s.",
+                    name,
                     compile_prefix,
                 )
         original_init(self, compile_prefix=compile_prefix, is_encoder=is_encoder)
