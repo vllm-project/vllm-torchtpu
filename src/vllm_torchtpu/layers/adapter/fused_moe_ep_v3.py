@@ -323,38 +323,6 @@ def _step_min_tokens() -> int:
     return step_min_tokens()
 
 
-def maybe_fused_moe_ep(
-    layer,
-    x: torch.Tensor,
-    router_logits: torch.Tensor,
-    top_k: int | None = None,
-    renormalize: bool = True,
-    activation: str = "silu",
-    sp_input: bool = False,
-) -> torch.Tensor | None:
-    if not fused_moe_ep_supported(layer):
-        return None
-    num_tokens = int(x.shape[0])
-    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
-    from vllm_torchtpu.kernels.fused_moe.v3 import transport as v3_transport
-
-    ep_size = _EP_SIZE
-    assert ep_size is not None  # set before the op exists
-    row_multiple = v3_layer.ROW_BLOCK * v3_transport.token_multiple(ep_size)
-    tokens_per_rank = (
-        num_tokens
-        if sp_input
-        else (num_tokens // ep_size if num_tokens % ep_size == 0 else -1)
-    )
-    if tokens_per_rank < _step_min_tokens() or tokens_per_rank % row_multiple != 0:
-        return None
-    w1 = layer.w13_weight
-    w2 = layer.w2_weight
-    w1_scale = layer.w13_weight_scale_inv
-    w2_scale = layer.w2_weight_scale_inv
-    return fused_moe_ep(x, w1, w2, w1_scale, w2_scale, router_logits)
-
-
 def fused_moe_ep(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
