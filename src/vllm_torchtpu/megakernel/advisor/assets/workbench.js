@@ -39,6 +39,7 @@
   meshDirty: false, calibrated: false, dispatchRegime: 'compiled_xla',
   selectedTopic: { kind: 'scope', scope: 'whole_step', sub: 'total' },
   calSource: '', calStepTimeUs: null, launchGapHiUs: 1.5,
+  collectiveCalls: [],
   denseSlotBytes: 2097152, collHopHiUs: (CHIP.collective_latency_us_bracket ||
   [1.0, 5.0])[1], expertSlotBytes: 1048576, presets: [], resetSeq: 0,
   maxVmemMib: Math.round(((CHIP.vmem_usable_bytes || 65011712) / 1048576) * 10) / 10 };
@@ -95,6 +96,7 @@
   etaHbm: parseFloat(el('ctl-eta-hbm').value) || 0.82,
   etaIci: parseFloat(el('ctl-eta-ici').value) || 0.75,
   launchGapHiUs: STATE.launchGapHiUs, collHopHiUs: STATE.collHopHiUs,
+  collectiveCalls: STATE.collectiveCalls || [],
   denseSlotBytes: STATE.denseSlotBytes, expertSlotBytes: STATE.expertSlotBytes }; }
   function regimeToWorkload(idx) {
   const reg = REGIMES[idx] || REGIMES[0] || {}, rw = reg.workload || {};
@@ -525,6 +527,7 @@
   `wbPinRegime(${i}, 'B')">B</button></div>`; }).join(''); }
   window.wbSetDispatchRegime = function(mode) {
   STATE.dispatchRegime = mode; STATE.hwDirty = false; STATE.calibrated = false;
+  STATE.collectiveCalls = [];
   if (mode === 'zero_floor') {
     el('ctl-launch-gap').value = '0'; STATE.launchGapHiUs = 0.0;
   } else if (mode === 'compiled_xla') {
@@ -564,7 +567,7 @@
   window.wbResetSliders = function() {
   STATE.pinA = 0; STATE.pinB = -1; STATE.resetSeq = (STATE.resetSeq || 0) + 1;
   STATE.customDirty = false; STATE.meshDirty = false;
-  STATE.hwDirty = false; STATE.calibrated = false;
+  STATE.hwDirty = false; STATE.calibrated = false; STATE.collectiveCalls = [];
   STATE.dispatchRegime = 'compiled_xla'; STATE.launchGapHiUs = 1.5;
   el('ctl-vmem').value = String(Math.min(STATE.maxVmemMib,
   Math.max(2.0, DATA.vmem_budget_mib || STATE.maxVmemMib)));
