@@ -120,6 +120,67 @@ def _pair_halves(w_q, w_s, dcp):
     )
 
 
+def _whole_k_fp8(rng, k, n):
+    """Whole-K per-channel FP8 o_proj: `[k, n]` and its `[n]` scale."""
+    w = rng.standard_normal((k, n)).astype(np.float32)
+    w[: k // 3] *= 7.0
+    scale = (np.abs(w).max(axis=0) / 448.0).astype(np.float32)
+    return np.asarray(jnp.asarray(w / scale).astype(jnp.float8_e4m3fn)), scale
+
+
+def _fp8_rows(x):
+    """Per-row FP8 round trip, as `quantize_rows` then dequantization."""
+    x_q, scale = tp.quantize_rows(jnp.asarray(x))
+    return np.asarray(x_q).astype(np.float32) * np.asarray(scale)
+
+
+@pytest.mark.parametrize("dcp", [4, 16])
+def test_should_match_fp8_product_when_o_proj_is_whole_k_pair_halves(dcp):
+    rng = np.random.default_rng(100 + dcp)
+    mesh = _mesh(dcp)
+    split_rows, heads_per_rank, latent, v_dim, hidden = 8, 2, 16, 8, 24
+    layout = _layout(dcp, split_rows)
+    heads = dcp * heads_per_rank
+    num_tokens = dcp * 2 * split_rows
+    lead_partial = rng.standard_normal((dcp, split_rows, heads, latent)).astype(
+        np.float32
+    )
+    lead_lse = rng.uniform(-3.0, 3.0, (dcp, split_rows, heads)).astype(np.float32)
+    w_uv = rng.standard_normal((heads, latent, v_dim)).astype(np.float32)
+    tail_v = rng.standard_normal((num_tokens - split_rows, heads, v_dim)).astype(
+        np.float32
+    )
+    w_q, w_s = _whole_k_fp8(rng, heads * v_dim, hidden)
+    m = np.logaddexp.reduce(lead_lse, axis=0)
+    lead_latent = (lead_partial * np.exp(lead_lse - m[None])[..., None]).sum(axis=0)
+    lead_v = np.einsum("rhl,hlv->rhv", lead_latent, w_uv)
+    step_v = np.concatenate([lead_v, tail_v])
+    expected = _fp8_rows(step_v.reshape(num_tokens, -1)) @ (
+        w_q.astype(np.float32) * w_s[None, :]
+    )
+    half = heads * v_dim // 2
+    w_arg = np.concatenate(
+        [w_q[(r % 2) * half : (r % 2 + 1) * half] for r in range(dcp)]
+    )
+
+    out = tp.project_sequence_rows(
+        layout,
+        mesh,
+        AXIS,
+        _sharded(mesh, lead_partial.reshape(dcp * split_rows, heads, latent)),
+        _sharded(mesh, lead_lse.reshape(dcp * split_rows, heads)),
+        _sharded(mesh, _own_rows_global(step_v, dcp, split_rows)),
+        _sharded(mesh, np.arange(dcp, dtype=np.int32)),
+        jnp.asarray(w_uv),
+        _sharded(mesh, w_arg),
+        _sharded(mesh, np.tile(w_s, dcp)),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(out), expected, rtol=1e-3, atol=1e-3 * np.abs(expected).max()
+    )
+
+
 @pytest.mark.parametrize("pair_halves", [False, True], ids=["own_shard", "pair_half"])
 @pytest.mark.parametrize("dcp", [4, 16])
 def test_should_match_head_sharded_oproj_reduce_scatter_when_projecting_split_step(

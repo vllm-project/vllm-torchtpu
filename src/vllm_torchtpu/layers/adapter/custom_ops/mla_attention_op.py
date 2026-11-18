@@ -2016,6 +2016,11 @@ class VllmTPUMLAAttention(MLAAttention):
                     if self.W_UV_tp_all.device.type == "tpu":
                         synchronize_tensors([self.W_UV_tp_all])
                     self._build_o_proj_pair_half(dcp_group)
+                # Avoid leaving TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES's whole-K
+                # o_proj resident where no half was cut from it: 100 MB/layer.
+                source = getattr(self, "sp_o_proj_source", None)
+                if source and getattr(source[0], "weight_dcp", None) is not None:
+                    del source[0].weight_dcp, source[0].weight_scale_dcp
                 indexer_op = getattr(self.indexer, "indexer_op", None)
                 if (
                     self.dcp_q_replicate
@@ -2077,17 +2082,28 @@ class VllmTPUMLAAttention(MLAAttention):
             or not dcp_token_parallel_op.serves_sequence_row_oproj(o_proj)
         ):
             return
-        shards = dcp_group.all_gather(o_proj.weight.contiguous(), dim=0)
-        scales = dcp_group.all_gather(o_proj.weight_scale.reshape(1, -1), dim=0)
-        half_rows = shards.shape[0] // 2
         parity = int(dcp_group.rank_in_group) % 2
-        self.W_O_tp_half = fresh_buffer(
-            shards[parity * half_rows : (parity + 1) * half_rows]
-        )
-        self.W_O_tp_half_scale = fresh_buffer(
-            scales[parity * (world // 2) : (parity + 1) * (world // 2)]
-        )
-        del shards, scales
+        whole_k = getattr(o_proj, "weight_dcp", None)
+        if whole_k is not None and world > 2:
+            # TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: one per-channel scale over
+            # all of K, shared by both halves.
+            half_rows = whole_k.shape[0] // 2
+            self.W_O_tp_half = fresh_buffer(
+                whole_k[parity * half_rows : (parity + 1) * half_rows]
+            )
+            self.W_O_tp_half_scale = fresh_buffer(o_proj.weight_scale_dcp)
+            del o_proj.weight_dcp, o_proj.weight_scale_dcp
+        else:
+            shards = dcp_group.all_gather(o_proj.weight.contiguous(), dim=0)
+            scales = dcp_group.all_gather(o_proj.weight_scale.reshape(1, -1), dim=0)
+            half_rows = shards.shape[0] // 2
+            self.W_O_tp_half = fresh_buffer(
+                shards[parity * half_rows : (parity + 1) * half_rows]
+            )
+            self.W_O_tp_half_scale = fresh_buffer(
+                scales[parity * (world // 2) : (parity + 1) * (world // 2)]
+            )
+            del shards, scales
         if self.W_O_tp_half.device.type == "tpu":
             synchronize_tensors([self.W_O_tp_half, self.W_O_tp_half_scale])
 
@@ -2229,6 +2245,18 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: the attention's load hook reads
         # o_proj's finished shard (a tuple, so it is not a second submodule).
         self.mla_attn.sp_o_proj_source = (self.o_proj,)
+        if (
+            envs.TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES
+            and envs.TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES
+            and not getattr(self.o_proj, DCP_ROWS_ATTR, False)
+            and self.mla_attn.dcp_q_replicate
+            and self.g_proj is None
+            and not self.gate_is_fused
+        ):
+            # The FP8 loader also quantizes the whole-K o_proj once per output
+            # channel from the checkpoint (`weight_dcp`); the load hook keeps
+            # this rank's half of it and drops the rest.
+            setattr(self.o_proj, DCP_ROWS_ATTR, True)
 
         self.prefix = prefix
 

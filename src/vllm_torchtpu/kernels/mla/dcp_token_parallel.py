@@ -63,6 +63,9 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 
+FP8_MAX = 448.0
+
+
 def _search(keys: jax.Array, values: jax.Array, side: str) -> jax.Array:
     """`searchsorted` over a few keys (requests, caps): one broadcast compare,
     not the default binary-search while loop."""
@@ -484,15 +487,24 @@ def project_all_heads(
 ) -> jax.Array:
     """Per rank: `rows` `[M, G * k]` (every head) -> `rows @ o_proj` `[M, n]`.
 
-    The rank holds part of o_proj's `G` FP8 row shards (`k` rows each, each
-    with its own per-channel scale) in one of two layouts, told apart by the
-    scale's rank:
-      * its own shard, `w_local` `[k, n]`, `s_local` `[n]`: every shard is
-        all-gathered over `axis_name`;
-      * a pair half, `w_local` `[G / 2 * k, n]`, `s_local` `[G / 2, n]`: ranks
-        `2j` and `2j + 1` (the two cores of one chip) hold shards `[0, G / 2)`
-        and `[G / 2, G)`, and swap them with one `ppermute` instead.
+    The rank holds part of o_proj in one of three layouts, told apart by the
+    shapes:
+      * its own row shard, `w_local` `[K / G, n]`, `s_local` `[n]` (each shard
+        quantized per channel on its own): every shard is all-gathered over
+        `axis_name`;
+      * a pair half of row shards, `w_local` `[K / 2, n]`, `s_local`
+        `[G / 2, n]`: ranks `2j` and `2j + 1` (the two cores of one chip) hold
+        shards `[0, G / 2)` and `[G / 2, G)` and swap them with one
+        `ppermute`;
+      * a pair half of a whole-K per-channel FP8 o_proj, `w_local` `[K / 2,
+        n]`, `s_local` `[n]` (one scale per channel over all of K): the halves
+        swap as above, and both halves contract FP8 x FP8 against the rows'
+        per-row FP8 quantization (`quantize_rows`) under that one scale.
     """
+    if s_local.ndim == 1 and axis_size > 2 and 2 * w_local.shape[0] == rows.shape[1]:
+        return _project_fp8_pair_halves(
+            rows, w_local, s_local, rank, axis_name, axis_size
+        )
     if s_local.ndim == 1:
         w_all = dequantize_row_shards(
             lax.all_gather(w_local, axis_name, axis=0, tiled=True),
@@ -521,6 +533,39 @@ def project_all_heads(
         preferred_element_type=jnp.float32,
     )
     return y.astype(rows.dtype)
+
+
+def quantize_rows(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`[M, K]` -> (`[M, K]` FP8 e4m3, `[M, 1]` f32 scale), one scale per row."""
+    x32 = x.astype(jnp.float32)
+    scale = jnp.max(jnp.abs(x32), axis=-1, keepdims=True) * (1.0 / FP8_MAX)
+    scale = jnp.where(scale == 0.0, 1.0, scale)
+    x_q = jnp.clip(x32 * (1.0 / scale), -FP8_MAX, FP8_MAX).astype(jnp.float8_e4m3fn)
+    return x_q, scale
+
+
+def _project_fp8_pair_halves(
+    rows: jax.Array,
+    w_local: jax.Array,
+    s_local: jax.Array,
+    rank: jax.Array,
+    axis_name: str,
+    axis_size: int,
+) -> jax.Array:
+    if axis_size % 2:
+        raise ValueError(f"pair halves need an even axis, got {axis_size}")
+    pairs = [(i, i ^ 1) for i in range(axis_size)]
+    w_peer = lax.ppermute(w_local, axis_name, pairs)
+    half = w_local.shape[0]
+    parity = lax.rem(rank, 2)
+    x_q, x_scale = quantize_rows(rows)
+    mine = lax.dynamic_slice_in_dim(x_q, parity * half, half, axis=1)
+    peer = lax.dynamic_slice_in_dim(x_q, (1 - parity) * half, half, axis=1)
+    dims = (((1,), (0,)), ((), ()))
+    y = lax.dot_general(
+        mine, w_local, dims, preferred_element_type=jnp.float32
+    ) + lax.dot_general(peer, w_peer, dims, preferred_element_type=jnp.float32)
+    return (y * x_scale * s_local.astype(jnp.float32)[None, :]).astype(rows.dtype)
 
 
 def project_sequence_rows(

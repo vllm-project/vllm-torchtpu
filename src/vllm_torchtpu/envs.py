@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
+    TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: bool = True
     TPU_MLA_DECODE_LOCAL_Q_AG: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
@@ -849,6 +850,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # HBM.
     "TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES": env_bool(
         "TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: keep the halves from o_proj
+    # quantized once per output channel over the whole K (the FP8 loader's
+    # DCP-gathered rows) so both halves share one scale and contract FP8 x FP8
+    # against the per-row FP8 activation, as the other per-channel FP8
+    # linears do, instead of bf16 against per-shard dequantized weights.
+    "TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES": env_bool(
+        "TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES", default=True
     ),
     # Decode local-Q projection under query-replicated DCP: compute each rank's
     # local head-slice columns via the fused FP8 column-window matmul + 1-round
