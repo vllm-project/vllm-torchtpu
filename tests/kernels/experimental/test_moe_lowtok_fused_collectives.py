@@ -366,23 +366,31 @@ def test_fp8_dispatch_fits_whole_fp8_tiles_of_engine_rows():
 @pytest.mark.cpu_test
 def test_each_collective_of_the_decode_program_has_its_own_barrier_group():
     """The kernels that can run in one decode program on the DP x TP layout:
-    the small all-reduce and reduce-scatter, this kernel and the fused EP v3
-    kernels."""
+    every id in the registry (small_collectives/common.py) and the fused EP v3
+    kernels' two; and each kernel of this package takes its id from the
+    registry."""
     from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
     from vllm_torchtpu.kernels.experimental.small_collectives import (
         all_reduce,
+        common,
         reduce_scatter,
     )
     from vllm_torchtpu.kernels.fused_moe.v3 import layout
 
-    ids = (
-        all_reduce.COLLECTIVE_ID,
-        reduce_scatter.COLLECTIVE_ID,
-        fc.COLLECTIVE_ID,
+    registered = {
+        name: value
+        for name, value in vars(common).items()
+        if name.endswith("_COLLECTIVE_ID")
+    }
+    ids = [
+        *registered.values(),
         layout.COLLECTIVE_ID_FFN,
         layout.COLLECTIVE_ID_TRANSPORT,
-    )
-    assert len(set(ids)) == len(ids), ids
+    ]
+    assert len(set(ids)) == len(ids), registered
+    assert all_reduce.COLLECTIVE_ID == common.ALL_REDUCE_COLLECTIVE_ID
+    assert reduce_scatter.COLLECTIVE_ID == common.REDUCE_SCATTER_COLLECTIVE_ID
+    assert fc.COLLECTIVE_ID == common.MOE_LOWTOK_FUSED_COLLECTIVE_ID
 
 
 @pytest.fixture(scope="module")
