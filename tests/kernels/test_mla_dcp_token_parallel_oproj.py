@@ -109,8 +109,22 @@ def _random_fp8_row_shards(
     return w_q.reshape(groups * k, n), scale.astype(np.float32)
 
 
+def _pair_halves(w_q, w_s, dcp):
+    """Every rank's chip-pair half: even ranks shards [0, dcp/2), odd the rest."""
+    k = w_q.shape[0] // dcp
+    halves = [w_q[: dcp // 2 * k], w_q[dcp // 2 * k :]]
+    scales = [w_s[: dcp // 2], w_s[dcp // 2 :]]
+    return (
+        np.concatenate([halves[r % 2] for r in range(dcp)]),
+        np.concatenate([scales[r % 2] for r in range(dcp)]),
+    )
+
+
+@pytest.mark.parametrize("pair_halves", [False, True], ids=["own_shard", "pair_half"])
 @pytest.mark.parametrize("dcp", [4, 16])
-def test_should_match_head_sharded_oproj_reduce_scatter_when_projecting_split_step(dcp):
+def test_should_match_head_sharded_oproj_reduce_scatter_when_projecting_split_step(
+    dcp, pair_halves
+):
     rng = np.random.default_rng(dcp)
     mesh = _mesh(dcp)
     split_rows, heads_per_rank, latent, v_dim, hidden = 8, 2, 16, 8, 24
@@ -145,6 +159,10 @@ def test_should_match_head_sharded_oproj_reduce_scatter_when_projecting_split_st
     own_out = _own_rows_global(
         np.concatenate([lead_v, tail_v]), dcp, split_rows
     )  # [dcp * R, H, V]
+    if pair_halves:
+        w_arg, s_arg = _pair_halves(w_q, w_s, dcp)
+    else:
+        w_arg, s_arg = w_q, w_s.reshape(-1)
     out = tp.project_sequence_rows(
         layout,
         mesh,
@@ -154,8 +172,8 @@ def test_should_match_head_sharded_oproj_reduce_scatter_when_projecting_split_st
         _sharded(mesh, own_out),
         _sharded(mesh, np.arange(dcp, dtype=np.int32)),
         jnp.asarray(w_uv),
-        _sharded(mesh, w_q),
-        _sharded(mesh, w_s.reshape(-1)),
+        _sharded(mesh, w_arg),
+        _sharded(mesh, s_arg),
     )
 
     assert out.shape == (num_tokens, hidden)

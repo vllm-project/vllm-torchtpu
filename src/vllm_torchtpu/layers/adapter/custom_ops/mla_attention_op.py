@@ -2015,6 +2015,7 @@ class VllmTPUMLAAttention(MLAAttention):
                     )
                     if self.W_UV_tp_all.device.type == "tpu":
                         synchronize_tensors([self.W_UV_tp_all])
+                    self._build_o_proj_pair_half(dcp_group)
                 indexer_op = getattr(self.indexer, "indexer_op", None)
                 if (
                     self.dcp_q_replicate
@@ -2059,6 +2060,36 @@ class VllmTPUMLAAttention(MLAAttention):
         # pass, which runs after every linear has been quantized and flipped.
         for hook in getattr(self, "post_load_hooks", ()):
             hook()
+
+    def _build_o_proj_pair_half(self, dcp_group: Any) -> None:
+        """Keep this rank's chip-pair half of o_proj's FP8 row shards.
+
+        TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES (`dcp_token_parallel.
+        project_all_heads`): even ranks keep shards `[0, G / 2)`, odd ranks
+        `[G / 2, G)`."""
+        source = getattr(self, "sp_o_proj_source", None)
+        o_proj = source[0] if source else None
+        world = int(dcp_group.world_size)
+        if (
+            not envs.TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES
+            or o_proj is None
+            or world % 2
+            or not dcp_token_parallel_op.serves_sequence_row_oproj(o_proj)
+        ):
+            return
+        shards = dcp_group.all_gather(o_proj.weight.contiguous(), dim=0)
+        scales = dcp_group.all_gather(o_proj.weight_scale.reshape(1, -1), dim=0)
+        half_rows = shards.shape[0] // 2
+        parity = int(dcp_group.rank_in_group) % 2
+        self.W_O_tp_half = fresh_buffer(
+            shards[parity * half_rows : (parity + 1) * half_rows]
+        )
+        self.W_O_tp_half_scale = fresh_buffer(
+            scales[parity * (world // 2) : (parity + 1) * (world // 2)]
+        )
+        del shards, scales
+        if self.W_O_tp_half.device.type == "tpu":
+            synchronize_tensors([self.W_O_tp_half, self.W_O_tp_half_scale])
 
     def forward(
         self,
@@ -2195,6 +2226,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # heads.
             setattr(self.o_proj, DCP_ROWS_ATTR, True)
             self.mla_attn.o_proj = self.o_proj
+        # TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: the attention's load hook reads
+        # o_proj's finished shard (a tuple, so it is not a second submodule).
+        self.mla_attn.sp_o_proj_source = (self.o_proj,)
 
         self.prefix = prefix
 
@@ -2661,7 +2695,12 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and dcp_token_parallel_op.applies(kv_c_normed.shape[0])
             and dcp_token_parallel_op.serves_sequence_row_oproj(self.o_proj)
         ):
-            sp_o_proj = (self.o_proj.weight, self.o_proj.weight_scale)
+            w_half = getattr(self.mla_attn, "W_O_tp_half", None)
+            sp_o_proj = (
+                (self.o_proj.weight, self.o_proj.weight_scale)
+                if w_half is None
+                else (w_half, self.mla_attn.W_O_tp_half_scale)
+            )
 
         attn_out = self.mla_attn(
             (q_nope, q_pe),
@@ -2678,12 +2717,18 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             return _retain_buffers(
                 attn_out,
                 self.mla_attn.W_UV,
+                cast(torch.Tensor, self.o_proj.weight),
+                cast(torch.Tensor, self.o_proj.weight_scale),
                 getattr(self.o_proj, FP8_PALLAS_WEIGHT, None),
                 getattr(self.o_proj, FP8_PALLAS_SCALE, None),
             )
-        w_uv_tp_all = getattr(self.mla_attn, "W_UV_tp_all", None)
-        if w_uv_tp_all is not None and isinstance(attn_out, torch.Tensor):
-            attn_out = _retain_buffers(attn_out, w_uv_tp_all)
+        if isinstance(attn_out, torch.Tensor):
+            attn_out = _retain_buffers(
+                attn_out,
+                getattr(self.mla_attn, "W_UV_tp_all", None),
+                getattr(self.mla_attn, "W_O_tp_half", None),
+                getattr(self.mla_attn, "W_O_tp_half_scale", None),
+            )
 
         if output_gate is not None:
             attn_out *= output_gate.sigmoid()
