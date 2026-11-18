@@ -70,7 +70,7 @@ def _pack_kv_for_cache(
 ) -> jax.Array:
     """Pack K and V together before converting to the cache dtype."""
     dummy_q = jnp.zeros_like(k)
-    _, packed_kv = batched_rpa_wrapper.prepare_inputs(
+    _, packed_kv, _ = batched_rpa_wrapper.prepare_inputs(
         dummy_q,
         k,
         v,

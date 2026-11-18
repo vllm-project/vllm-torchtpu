@@ -11,13 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
-from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule, utils
 
 
 def flash_attention_qk_softmax(
@@ -26,12 +24,13 @@ def flash_attention_qk_softmax(
     k: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
     m_prev: jax.Array,  # [KV, TQ, 128]
     l_prev: jax.Array,  # [KV, TQ, 128]
-    is_last_k: SmemWrapper,  # [steps, B]
+    is_last_k: schedule.SmemWrapper,  # [steps, B]
     *,
     custom_mask: jax.Array,
     cfgs: configs.RpaConfigs,
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]
+    attention_sink: jax.Array | None = None,  # [KV, TQ, 128]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, h_size = q.shape
@@ -86,6 +85,7 @@ def flash_attention_qk_softmax(
 
     alpha_list = []
     m_next_list = []
+    m_reset = -jnp.inf if attention_sink is None else attention_sink
 
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
@@ -93,26 +93,19 @@ def flash_attention_qk_softmax(
         alpha_b = jnp.exp(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
-        m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
+        m_prev = jnp.where(is_last_k[step, b_idx], m_reset, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
+    l_reset = 0.0 if attention_sink is None else 1.0
     for b_idx in range(cfgs.block.batch_size):
         l_next_b = alpha_list[b_idx] * l_prev + p_rowsum[b_idx]
         l_next_list.append(l_next_b)
-        if cfgs.fuse_accum:
-            # Reset with a select rather than relying on alpha == 0 (since
-            # 0 * NaN == NaN). Note: these NaNs are not produced by this kernel
-            # itself; they are observed mid-batch during decode when a corrupted
-            # MTP draft writes NaN into one sequence's KV cache, which would
-            # otherwise leak into every subsequent sequence in the batch. The
-            # normal/default prefill path (`not cfgs.fuse_accum`) is unaffected
-            # and skips this select to avoid extra vector ops across `bq_c`
-            # query chunks.
-            l_prev = jnp.where(is_last_k[step, b_idx], 0.0, l_next_b)
+        if cfgs.fuse_accum or attention_sink is not None:
+            l_prev = jnp.where(is_last_k[step, b_idx], l_reset, l_next_b)
         else:
             l_prev = l_next_b
 
@@ -127,9 +120,10 @@ def flash_attention_pv(
     alpha_list: list[jax.Array],  # B * [KV, TQ, 128]
     o_prev: jax.Array,  # [KV, TQ, H]
     step: jax.Array,
-    is_last_k: SmemWrapper,  # [steps, B]
+    is_last_k: schedule.SmemWrapper,  # [steps, B]
     cfgs: configs.RpaConfigs,
     v_scale: jax.Array | None = None,  # [B, KV, S]
+    attention_sink: jax.Array | None = None,  # [KV, TQ, 128]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, s = p.shape
@@ -143,6 +137,9 @@ def flash_attention_pv(
         # We can scale p or v, and because p will be smaller especially for decode
         # workflows, we scale p to save some time.
         p = p.astype(v_sc.dtype) * v_sc
+
+    if cfgs.serve.quantize_p:
+        p = p.astype(v.dtype)
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         h_size = v.shape[-2]
@@ -170,7 +167,7 @@ def flash_attention_pv(
         alpha_b = utils.broadcast_minor(alpha_list[b_idx], o_prev.shape)
         o_next_b = alpha_b * o_prev + pv[b_idx]
         o_next_list.append(o_next_b)
-        if cfgs.fuse_accum:
+        if cfgs.fuse_accum or attention_sink is not None:
             # Same select reset as l_prev in flash_attention_qk_softmax.
             o_prev = jnp.where(is_last_k[step, b_idx], 0.0, o_next_b)
         else:
