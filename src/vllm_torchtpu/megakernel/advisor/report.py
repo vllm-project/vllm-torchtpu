@@ -896,16 +896,41 @@ def _resolve_facts_card_data(sweep: AdvisorSweepReport) -> _FactsCardData:
     coll_metric = (
         first_entry.metrics.get("collective_latency_us", {}) if first_entry else {}
     )
+    coll_xla_metric = (
+        first_entry.metrics.get("collective_call_us_xla", {}) if first_entry else {}
+    )
+    coll_in_kernel_metric = (
+        first_entry.metrics.get("collective_call_us_in_kernel", {})
+        if first_entry
+        else {}
+    )
     cov_metric = first_entry.metrics.get("step_coverage", {}) if first_entry else {}
 
     handoff = sweep.disagg_handoff
     dcn_tag = handoff.dcn_provenance if handoff is not None else "ASSUMED"
     lg_tag = str(lg_metric.get("tag", "ASSUMED"))
     coll_tag = str(coll_metric.get("tag", "ASSUMED"))
+    coll_xla_tag = str(coll_xla_metric.get("tag", "ASSUMED"))
+    coll_in_kernel_tag = str(coll_in_kernel_metric.get("tag", "ASSUMED"))
     cov_tag = str(cov_metric.get("tag", "ASSUMED"))
-    is_calibrated = "MEASURED" in (lg_tag, coll_tag, cov_tag, dcn_tag)
+    is_calibrated = "MEASURED" in (
+        lg_tag,
+        coll_tag,
+        coll_xla_tag,
+        coll_in_kernel_tag,
+        cov_tag,
+        dcn_tag,
+    )
     measured = [
-        m for m in (lg_metric, coll_metric, cov_metric) if m.get("tag") == "MEASURED"
+        m
+        for m in (
+            lg_metric,
+            coll_metric,
+            coll_xla_metric,
+            coll_in_kernel_metric,
+            cov_metric,
+        )
+        if m.get("tag") == "MEASURED"
     ]
     meas_source = (
         str(measured[0].get("source", ""))
