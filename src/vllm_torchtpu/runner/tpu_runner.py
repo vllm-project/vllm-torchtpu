@@ -4718,6 +4718,11 @@ class TPUModelRunner(GPUModelRunner):
             tuple[prompt_logprobs.PromptLogprobsChunk, torch.Tensor]
         ] = []
         is_draft_model = self._is_async_drafter
+        # The device n-gram drafter reads only tokens, so its steps may take
+        # the megakernel's token step, which leaves no hidden states.
+        draft_reads_states = is_draft_model and not isinstance(
+            self.drafter, DeviceNgramProposer
+        )
         top_tokens = self._greedy_top_tokens_this_step()
 
         # NOTE: setup current batch's metadata for kv connector.
@@ -4930,8 +4935,7 @@ class TPUModelRunner(GPUModelRunner):
                     and inputs_embeds is None
                     and intermediate_tensors is None
                     and nan_check is None
-                    and spec_decode_metadata is None
-                    and not is_draft_model
+                    and not draft_reads_states
                     and not self.num_prompt_logprobs
                     else None
                 )
@@ -5028,7 +5032,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
             )
             if is_draft_model:
-                assert isinstance(hidden_states, torch.Tensor)
+                assert tokens is not None or isinstance(hidden_states, torch.Tensor)
                 # Capture this chunk's draft inputs while they are valid.
                 assert draft_sequence_layout_plan is not None, (
                     "the PCP manager does not support speculative decoding"
@@ -5094,9 +5098,12 @@ class TPUModelRunner(GPUModelRunner):
         """A greedy step's tokens, `[rows of logits_indices, 1]` int64 like
         `compute_selected_top_tokens`, from the megakernel's token step (one
         program from the embedding through the LM head argmax), or `None` to
-        run `forward_model` and `_sampling_logits`. Call it in the step's
+        run `forward_model` and `_sampling_logits`. The token step serves only
+        steps whose `logits_indices` are their rows in order: one token per
+        request (decode) or all `1 + K` (verify). Call it in the step's
         forward context, on a `top_tokens` step whose hidden states nothing
-        else reads (no drafter, prompt logprobs or KV NaN check)."""
+        else reads (no hidden-state drafter, prompt logprobs or KV NaN
+        check)."""
         if self._megakernel is None:
             return None
         tok = self._megakernel.try_greedy_tokens(
