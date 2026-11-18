@@ -22,7 +22,10 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from vllm_torchtpu.layers.adapter import rmsnorm as tpu_rmsnorm  # noqa: E402
-from vllm_torchtpu.layers.adapter.linear_common import PREQUANT_ATTR  # noqa: E402
+from vllm_torchtpu.layers.adapter.linear_common import (  # noqa: E402
+    FP8_PALLAS_WEIGHT,
+    PREQUANT_ATTR,
+)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (  # noqa: E402
     VllmFp8LinearMethodTPU,
 )
@@ -132,6 +135,18 @@ def test_decode_rows_keep_old_path(vllm_config_context):
 def test_w8a16_buckets_are_not_paired(vllm_config_context):
     n, lin = _norm(), _Linear()
     lin.quant_method.w8a16_max_rows = n._min_rows
+    assert not tpu_rmsnorm._pair(n, lin, False)
+    assert getattr(lin, PREQUANT_ATTR, None) is None
+
+
+def test_linear_with_padded_kernel_copy_is_not_paired(vllm_config_context):
+    """A linear that TPU_FP8_LINEAR_PALLAS_SITES gave a padded weight copy reads
+    that copy on its unpaired path and not on the paired one, so it is not paired."""
+    n, lin = _norm(), _Linear()
+    pad = torch.zeros(H, 2688).to(torch.float8_e4m3fn)
+    lin.register_parameter(
+        FP8_PALLAS_WEIGHT, torch.nn.Parameter(pad.to("tpu"), requires_grad=False)
+    )
     assert not tpu_rmsnorm._pair(n, lin, False)
     assert getattr(lin, PREQUANT_ATTR, None) is None
 
