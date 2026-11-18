@@ -67,7 +67,7 @@ E2M1_TIE_UP = (False, True, False, True, False, True, False)
 SCALE_BIAS = 127
 # Batch sizes compiled for each direction (a batch is padded up to the next one by
 # repeating its last pair, which rewrites the same bytes; bigger batches are split).
-BUCKETS = (1, 4, 16, 64)
+BUCKETS = (1, 4, 16, 32, 64)
 
 
 def page_rows(page_bytes: int) -> int:
@@ -167,19 +167,24 @@ def page_gather(source, ids):
 
 def quantize_pages(pages, jnp, lax):
     """``[n, rows, 4, 256]`` FP8 values (or their uint8 bytes) -> ``[n, rows*4 +
-    rows//4, 128]`` uint8 MXFP4."""
+    rows//4, 128]`` uint8 MXFP4.
+
+    The page-sized math runs in bfloat16: FP8 e4m3 values, their powers-of-two
+    rescaling and the e2m1 thresholds are all exact in bf16, so the codes match the
+    float32 formulation bit for bit while the page-sized temporaries are half the
+    bytes. Only the per-group scale (1/32 of the page) is computed in float32."""
     n, rows = pages.shape[0], pages.shape[1]
     if pages.dtype == jnp.uint8:
         pages = lax.bitcast_convert_type(pages, jnp.float8_e4m3fn)
-    x = pages.astype(jnp.float32)
+    x = pages.astype(jnp.bfloat16)
     g = x.reshape(n, rows, ROW_SLOTS, ROW_LANES // GROUP, GROUP)
-    amax = jnp.max(jnp.abs(g), axis=-1, keepdims=True)
+    amax = jnp.max(jnp.abs(g), axis=-1, keepdims=True).astype(jnp.float32)
     # Smallest power of two s with amax / s <= 6: s = 2^ceil(log2(amax / 6)).
     mant, expo = jnp.frexp(amax / 6.0)  # amax/6 = mant * 2^expo, mant in [0.5, 1)
     e = expo - (mant == 0.5).astype(expo.dtype)
     e = jnp.where(amax > 0, e, 0)
     e = jnp.clip(e, -SCALE_BIAS + 1, SCALE_BIAS)
-    y = jnp.abs(g) * jnp.exp2(-e.astype(jnp.float32))
+    y = jnp.abs(g) * jnp.exp2(-e.astype(jnp.float32)).astype(jnp.bfloat16)
     code = jnp.zeros(y.shape, jnp.uint8)
     for t, up in zip(E2M1_THRESHOLDS, E2M1_TIE_UP):
         code = code + ((y >= t) if up else (y > t)).astype(jnp.uint8)
@@ -192,7 +197,12 @@ def quantize_pages(pages, jnp, lax):
 
 def dequantize_pages(staged_u8, rows: int, jnp, lax, as_fp8: bool = False):
     """``[n, rows*4 + rows//4, 128]`` uint8 MXFP4 -> ``[n, rows, 4, 256]`` uint8 FP8
-    bytes (``as_fp8``: the FP8 values themselves, with no FP8 -> integer bitcast)."""
+    bytes (``as_fp8``: the FP8 values themselves, with no FP8 -> integer bitcast).
+
+    The e2m1 magnitude is decoded with compares and selects, not a table lookup (an
+    XLA gather per value on the TPU), and the page-sized math runs in bfloat16:
+    every e2m1 value times a power of two in FP8 range is exact in bf16, so the FP8
+    bytes match the float32 formulation."""
     n = staged_u8.shape[0]
     packed = staged_u8[:, : rows * ROW_SLOTS].reshape(n, rows, ROW_SLOTS, PACKED_LANES)
     scales = staged_u8[:, rows * ROW_SLOTS :].reshape(
@@ -201,10 +211,16 @@ def dequantize_pages(staged_u8, rows: int, jnp, lax, as_fp8: bool = False):
     nib = jnp.stack([packed & 0xF, packed >> 4], axis=-1).reshape(
         n, rows, ROW_SLOTS, ROW_LANES // GROUP, GROUP
     )
-    grid = jnp.asarray(E2M1_GRID, jnp.float32)
-    mag = grid[(nib & 7).astype(jnp.int32)]
+    code = nib & 7
+    mag = jnp.zeros(code.shape, jnp.bfloat16)
+    for k, v in enumerate(E2M1_GRID):
+        if v:
+            mag = jnp.where(code == k, jnp.bfloat16(v), mag)
     val = jnp.where((nib >> 3) == 1, -mag, mag)
-    val = val * jnp.exp2(scales.astype(jnp.float32) - SCALE_BIAS)
+    # 2^(e - 127) is exact in bf16 (float32's exponent range), and so is its product
+    # with an e2m1 value (at most 2 significant bits); above FP8_MAX the clip saturates.
+    scale = jnp.exp2(scales.astype(jnp.float32) - SCALE_BIAS).astype(jnp.bfloat16)
+    val = val * scale
     val = jnp.clip(val, -FP8_MAX, FP8_MAX).astype(jnp.float8_e4m3fn)
     if as_fp8:
         return val.reshape(n, rows, ROW_SLOTS, ROW_LANES)
