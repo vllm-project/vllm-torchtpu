@@ -17,6 +17,7 @@ of non-fused projections without bias or packed weights."""
 
 from types import SimpleNamespace
 
+import jax.numpy as jnp
 import pytest
 
 from vllm_torchtpu.kernels.megablox import gmm_v2
@@ -67,3 +68,35 @@ def test_set_rhs_stream_switches_it(monkeypatch):
     assert gmm_v2.RHS_STREAM is True
     gmm_v2.set_rhs_stream(False)
     assert gmm_v2.RHS_STREAM is False
+
+
+# group_sizes past the 8 the kernel is given hold garbage, as the scalar
+# memory past the array would; local groups 0..3 are lhs groups 4..7.
+_SIZES_AND_GARBAGE = [5, 7, 9, 12, 0, 0, 0, 0, 3, 3, 3, 3]
+
+
+@pytest.mark.parametrize(
+    "lhs_groups, offset, sizes, first, bound",
+    [
+        # No local group has rows: nothing is streamed, and the search never
+        # reads past the lhs groups (index 8 holds garbage).
+        (8, 4, _SIZES_AND_GARBAGE, 4, 4),
+        (8, 4, [5, 7, 9, 12, 0, 6, 0, 0], 1, 4),
+        # A copy-slot rhs at offset 0: the bound is the lhs groups.
+        (8, 0, [0, 0, 4, 0, 0, 0, 0, 0], 2, 8),
+        (8, 0, [0] * 8 + [3], 8, 8),
+    ],
+)
+def test_the_first_streamed_group_stays_inside_the_lhs_groups(
+    lhs_groups, offset, sizes, first, bound
+):
+    """The stream starts its first slab only for a local group below
+    fill_metadata's bound, which clips the rhs groups to the lhs groups past
+    the offset, so a copy-slot rhs (more weight slots than lhs groups) never
+    streams a slab for rows past the array."""
+    dims = SimpleNamespace(size_group=8, size_lhs_group=lhs_groups)
+    cfgs = SimpleNamespace(dims=dims)
+    got_first, got_bound = gmm_v2.first_stream_group(
+        jnp.asarray(sizes, jnp.int32), jnp.int32(offset), cfgs
+    )
+    assert (int(got_first), int(got_bound)) == (first, bound)
