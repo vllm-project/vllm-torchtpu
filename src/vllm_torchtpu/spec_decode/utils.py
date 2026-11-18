@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutPlan,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.spec_decode import draft_path_rules
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -97,46 +98,32 @@ def _static_shape_args(fn):
     return wrapper
 
 
-def qwen3_5_mtp(vllm_config: Any) -> bool:
-    """A Qwen3.5 target with an MTP draft.
-
-    Main keeps the greedy top tokens, fast token substitution and the fused
-    MTP draft loop opt-in (TPU_GREEDY_TOP_TOKENS,
-    VLLM_TPU_FAST_TOKEN_SUBSTITUTION, VLLM_TPU_FUSED_DRAFT_LOOP). This
-    configuration runs them by rule: the Qwen3.5 PD deployments ran all three
-    on every leg.
-    """
-    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
-
-    spec = getattr(vllm_config, "speculative_config", None)
-    return (
-        spec is not None
-        and getattr(spec, "method", None) == "mtp"
-        and qwen3_5_settings.is_qwen3_5(getattr(vllm_config, "model_config", None))
-    )
-
-
 def greedy_top_tokens_enabled(vllm_config: Any) -> bool:
-    """TPU_GREEDY_TOP_TOKENS, or the Qwen3.5 MTP rule. Greedy steps (all
-    requests greedy, no logprobs, no grammar) then take the vocab-parallel
-    argmax; the tokens are those of the full-logits argmax."""
-    return bool(envs.TPU_GREEDY_TOP_TOKENS) or qwen3_5_mtp(vllm_config)
+    """TPU_GREEDY_TOP_TOKENS, or a model-provided draft-path rule
+    (spec_decode/draft_path_rules.py). Greedy steps (all requests greedy, no
+    logprobs, no grammar) then take the vocab-parallel argmax; the tokens are
+    those of the full-logits argmax."""
+    return bool(envs.TPU_GREEDY_TOP_TOKENS) or draft_path_rules.holds(vllm_config)
 
 
 def fast_token_substitution_enabled(vllm_config: Any) -> bool:
-    """VLLM_TPU_FAST_TOKEN_SUBSTITUTION, or the Qwen3.5 MTP rule."""
-    return bool(envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION) or qwen3_5_mtp(vllm_config)
+    """VLLM_TPU_FAST_TOKEN_SUBSTITUTION, or a model-provided draft-path rule."""
+    return bool(envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION) or draft_path_rules.holds(
+        vllm_config
+    )
 
 
 def fused_draft_loop_enabled(
     vllm_config: Any, *, draft_kv_shared: bool, dp_lockstep: bool
 ) -> bool:
-    """VLLM_TPU_FUSED_DRAFT_LOOP, or the Qwen3.5 MTP rule: on unless the
-    draft shares the target's KV cache or EP-DP runs in lockstep (main lists
-    both as unsupported by the fused loop)."""
+    """VLLM_TPU_FUSED_DRAFT_LOOP, or a model-provided draft-path rule: on
+    unless the draft shares the target's KV cache or EP-DP runs in lockstep
+    (main lists both as unsupported by the fused loop)."""
     if envs.VLLM_TPU_FUSED_DRAFT_LOOP:
         return True
-    return qwen3_5_mtp(vllm_config) and not draft_kv_shared and not dp_lockstep
+    return (
+        draft_path_rules.holds(vllm_config) and not draft_kv_shared and not dp_lockstep
+    )
 
 
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:

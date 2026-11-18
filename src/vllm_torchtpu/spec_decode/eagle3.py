@@ -779,8 +779,8 @@ class Eagle3Proposer:
     def _build_mtp_fused_loop(self) -> None:
         """Compile an MTP draft's loop steps 1..K-1 as one program, so the
         host dispatches once per propose for them instead of twice per step.
-        On with `VLLM_TPU_FUSED_DRAFT_LOOP=1`, and by rule for a Qwen3.5
-        target with an MTP draft (fused_draft_loop_enabled); off, the per-step
+        On with `VLLM_TPU_FUSED_DRAFT_LOOP=1`, and where a model-provided
+        draft-path rule holds (fused_draft_loop_enabled); off, the per-step
         loop runs. Not under EP-DP lockstep, where propose always runs the
         per-step loop, so neither the program nor its warm-up would ever be
         used.

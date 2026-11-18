@@ -60,7 +60,7 @@ class Qwen35Settings:
     (models/vllm/qwen3_next_patch.py). The MTP draft keeps a BF16 copy of the
     checkpoint head. Off by default: it is a quality/speed trade-off (the
     target's logits are computed in FP8), measured in the trade-offs-on
-    validation arms. The Qwen3.5 PD deployments ran it on every leg."""
+    validation arms."""
 
 
 def _field_types() -> dict[str, Any]:
