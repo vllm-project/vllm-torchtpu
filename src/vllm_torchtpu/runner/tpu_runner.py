@@ -5210,25 +5210,27 @@ class TPUModelRunner(GPUModelRunner):
         from them, both on the device."""
         pre = self._pre_async_results
         assert pre is not None
-        md = carry.spec_metadata
+        spec_md = carry.spec_metadata
         input_ids, positions, seq_lens = _advance_decode_inputs(
             pre.next_tokens_tpu,
             carry.input_ids,
             carry.positions,
             carry.seq_lens,
             carry.query_start_loc,
-            pre.spec_decode_num_rejected_tokens if md is not None else None,
+            pre.spec_decode_num_rejected_tokens if spec_md is not None else None,
             carry.tokens_per_req,
         )
-        if md is not None:
+        if spec_md is not None:
             from vllm_torchtpu.runner.tpu_runner_async_output import (
                 extract_draft_token_ids,
             )
 
-            md = dataclasses.replace(
-                md,
+            spec_md = dataclasses.replace(
+                spec_md,
                 draft_token_ids=extract_draft_token_ids(
-                    input_ids, md.final_logits_indices, md.target_logits_indices
+                    input_ids,
+                    spec_md.final_logits_indices,
+                    spec_md.target_logits_indices,
                 ),
                 deferred_draft_token_ids_cpu=None,
             )
@@ -5250,7 +5252,7 @@ class TPUModelRunner(GPUModelRunner):
             positions=positions,
             seq_lens=seq_lens,
             attn_metadata=attn_metadata,
-            spec_metadata=md,
+            spec_metadata=spec_md,
         )
 
         inputs_embeds = None
@@ -5301,7 +5303,7 @@ class TPUModelRunner(GPUModelRunner):
                 top_tokens,
             )
         draft_chunks = []
-        if md is not None:
+        if spec_md is not None:
             # The n-gram drafter reads only the chunk's batch rows.
             draft_chunks.append(
                 DraftChunkInputs(
@@ -5312,7 +5314,7 @@ class TPUModelRunner(GPUModelRunner):
                     start_index=0,
                     num_reqs=num_reqs,
                     aux_hidden_states=[],
-                    draft_lengths=md.draft_lengths,
+                    draft_lengths=spec_md.draft_lengths,
                     attn_metadata=attn_metadata,
                 )
             )
@@ -5321,7 +5323,7 @@ class TPUModelRunner(GPUModelRunner):
             logits_list=[logits],
             pooler_output_list=[],
             num_reqs_list=[num_reqs],
-            spec_decode_metadata_list=[md],
+            spec_decode_metadata_list=[spec_md],
             draft_chunks=draft_chunks,
             top_tokens=top_tokens,
         )
