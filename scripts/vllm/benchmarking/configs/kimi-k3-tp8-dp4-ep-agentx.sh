@@ -59,10 +59,15 @@ AGENTX_PRECISION=fp4
 # agentic row gets as a separate eval-only job, is not the config's to name.
 AGENTX_POST_EVAL_SUITES="kimi_tool_call_schema_full"
 
-# What the client pod puts in front of the pair: "toy" (examples/disagg/
-# toy_proxy_server.py, the default) or "router" (vllm-router in its
-# prefill/decode mode, built into the image). Same two-hop protocol.
-AGENTX_PROXY=toy
+# What the client pod puts in front of the pair: "router" (vllm-router in its
+# prefill/decode mode, built into the image, the default) or "toy"
+# (examples/disagg/toy_proxy_server.py). Same two-hop protocol.
+AGENTX_PROXY="${AGENTX_PROXY:-router}"
+# agentx_client.sh already runs InferenceX's reasoning-patched 100-sample GSM8K
+# probe before the replay, so run_eval_flow.sh gates mmlu_pro and json_schema
+# without running GSM8K a second time on 32 chips.
+EVAL_SUITES="mmlu_pro,json_schema"
+PERF_SUITES="agentx"
 
 # An assertion, not an override: the base is 8 too, but as a single-request
 # probe's value, and it only happens to equal twice this ladder's top

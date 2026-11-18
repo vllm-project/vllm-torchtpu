@@ -122,12 +122,15 @@ FORWARD=(
   # Names the directory whose contents the pod uploads as artifacts.
   ARTIFACTS_DIR
   # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh
-  # and the megakernel recipe: the eval-only job, the eval smoke, and skipping
-  # the post-replay eval.
-  AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL
+  # and the megakernel recipe: the eval-only job, the eval smoke, skipping
+  # the post-replay eval, and choosing the toy proxy.
+  AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL AGENTX_PROXY
   # The config both engines of the pair and its client read, when a step serves
   # another than the manifest's default (a Kimi-K3 megakernel recipe point).
   K3_PD_CONFIG
+  # 1P1D proxy and unified run_eval_flow.sh suite overrides on the client pods.
+  DISAGG_PROXY DISAGG_CONFIG DISAGG_BASELINE_CONFIG DISAGG_EVAL_SUITES DISAGG_PERF_SUITES
+  K3_EVAL_SUITES K3_PERF_SUITES K3_BASELINE_CONFIG
 )
 
 # The `tests` plugin mints these on the agent and their two-hour life starts

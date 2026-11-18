@@ -211,6 +211,8 @@ spec:
                 # Off unless the step says otherwise; see pipeline_perf.yml.
                 - name: BQ_UPLOAD
                   value: "0"
+                - name: ARTIFACTS_DIR
+                  value: perf_eval_results
                 # Loading the torchtpu platform plugin on this CPU client makes
                 # vLLM's CLI call torch.device("tpu"), which fails without
                 # import torch_tpu.
