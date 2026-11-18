@@ -45,7 +45,9 @@ warmest-first admission, each step this scheduler:
   fixed debt, prefill then runs as soon as every such request's slack covers
   ``VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON`` times that step's extra time (the
   horizon gates only whether to hold, not the priced bins below). At most
-  ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are deferred this way.
+  ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are deferred this way,
+  and none while a pending prefill arrived more than
+  ``VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S`` ago (when set).
   With ``VLLM_TPU_PREFILL_TPOT_PRICED`` such a step is not decode-only when a
   shorter step fits: it runs, in the scheduler's order
   (running chunks, then the waiting window, each shortest first), the whole
@@ -57,7 +59,7 @@ Select with ``--scheduler-cls``
 """
 
 import time
-from itertools import islice
+from itertools import chain, islice
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy
@@ -99,6 +101,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.max_hold_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S
         self.priced = envs.VLLM_TPU_PREFILL_TPOT_PRICED
         self.hold_horizon = envs.VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON
+        self.max_wait_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S
         # Decoding request id -> when it was first scheduled to decode, and
         # its output tokens at the previous step (TPOT projection).
         self._decode_t0: dict[str, float] = {}
@@ -222,6 +225,8 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._track_decoders(decoders, now)
         pending = bool(queue) or any(r.is_prefill_chunk for r in self.running)
         hold = pending and self._short_of_slack(decoders, now)
+        if hold and self.max_wait_s > 0 and self._waited_too_long(queue):
+            hold = False
         if not hold:
             self._held_since = None
         elif self._held_since is None:
@@ -231,6 +236,25 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self._held_since = None
             hold = False
         return hold
+
+    def _waited_too_long(self, queue: RequestQueue | None) -> bool:
+        """Whether a request still waiting for its first token, with a prefill
+        that can run (waiting and not blocked, or a running chunk), arrived
+        more than ``max_wait_s`` ago: holds then stop adding to its TTFT. A few
+        long prompts held step after step otherwise set the mean TTFT."""
+        waiting = (
+            r for r in queue or () if not self._is_blocked_waiting_status(r.status)
+        )
+        chunks = (r for r in self.running if r.is_prefill_chunk)
+        oldest = min(
+            (
+                r.arrival_time
+                for r in chain(waiting, chunks)
+                if r.num_output_tokens == 0
+            ),
+            default=None,
+        )
+        return oldest is not None and time.time() - oldest > self.max_wait_s
 
     def _track_decoders(self, decoders: list[Request], now: float) -> None:
         tokens = rows = 0

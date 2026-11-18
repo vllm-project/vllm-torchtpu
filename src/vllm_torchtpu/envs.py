@@ -236,6 +236,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
     VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON: float = 1.0
+    VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S: float = 0.0
     VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH: bool = False
 
 
@@ -1454,6 +1455,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # already queued when the decision is made.
     "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON": env_nonnegative_float(
         "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON", 1.0
+    ),
+    # PrefillSpacingScheduler: the TPOT target does not defer prefill while a
+    # pending prefill (waiting or chunking) arrived more than this many seconds
+    # ago, which bounds how long holds starve a prompt's TTFT. 0 turns it off.
+    "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S", 0.0
     ),
     # Raiden KV offload: when a request finishes, move the host-resident prefix
     # of its KV chain to the most recently used end of the host pool's LRU

@@ -222,6 +222,41 @@ def test_tpot_target_defers_prefill_at_most_max_hold(model_config, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("max_wait_s", "waited_s", "held"),
+    [
+        (0.0, 60.0, True),  # off: holds whatever the wait
+        (5.0, 1.0, True),  # the oldest pending prefill waited 1 s of 5
+        (5.0, 6.0, False),  # past 5 s: the chunk runs
+    ],
+)
+def test_max_wait_stops_holding_a_long_pending_prefill(
+    model_config, monkeypatch, max_wait_s, waited_s, held
+):
+    scheduler, _, _ = _tpot_scheduler(model_config, monkeypatch, target_ms=40.3)
+    scheduler.max_wait_s = max_wait_s
+    long = scheduler.requests["long"]
+    monkeypatch.setattr(pss.time, "time", lambda: long.arrival_time + waited_s)
+    scheduled = set(scheduler.schedule().num_scheduled_tokens)
+    assert scheduled == ({"dec"} if held else {"dec", "long"})
+
+
+def test_max_wait_ignores_blocked_and_already_answered_requests(
+    model_config, monkeypatch
+):
+    scheduler, _, hasher = _tpot_scheduler(model_config, monkeypatch, target_ms=40.3)
+    scheduler.max_wait_s = 5.0
+    old = _request("old", 32, hasher, seed=3)
+    old.arrival_time -= 60.0
+    scheduler.waiting.add_request(old)
+    monkeypatch.setattr(scheduler, "_is_blocked_waiting_status", lambda status: True)
+    assert not scheduler._waited_too_long(scheduler.waiting)
+    monkeypatch.setattr(scheduler, "_is_blocked_waiting_status", lambda status: False)
+    assert scheduler._waited_too_long(scheduler.waiting)
+    old.append_output_token_ids(7)  # preempted after its first token
+    assert not scheduler._waited_too_long(scheduler.waiting)
+
+
+@pytest.mark.parametrize(
     ("bin_s", "scheduled"),
     [
         # A 512-token step is 0.03 s longer than decode: fits the 0.037 s slack,
