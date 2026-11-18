@@ -51,6 +51,7 @@ from .models import (
 )
 from .specs import (
     SUPPORTED_ONCHIP_FAMILIES,
+    CollectiveCall,
     DispatchRegime,
     EfficiencySpec,
     FusionScope,
@@ -84,6 +85,7 @@ __all__ = [
     "TPU6E_TOPOLOGIES",
     "TPU7X_TOPOLOGIES",
     "ChipSpec",
+    "CollectiveCall",
     "DeploymentPreset",
     "DispatchRegime",
     "EfficiencySpec",
