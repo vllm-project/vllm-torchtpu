@@ -190,6 +190,9 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -1088,6 +1091,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GATHERED_LEAN (with IN_PLACE; ignored without it): the in-place gathered walk takes no union words and no page
     # rows, which it never reads (no per-chunk union-word slices / padding / staging, no per-word pool bases). Bitwise.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN"),
+    # q38 QA-1 (PREFILL-10 / QA1BUILD; all default off; bitwise on finite pools; gathered walk only):
+    # MASK_VIEW: the walk tile applies its [rows, keys] visibility on a [q heads per KV head, rows, keys] view of the
+    # scores instead of materializing the per-head broadcast (the same select, so the same scores).
+    "VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW": env_bool("VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW"),
+    # VGUARD_LEAN: the walk tile's value guard keeps only its `written` term (no isfinite test). Every row the
+    # gathered walk reads is a written pool row (union ranks, or the padding row = word 0 of the group's page
+    # row), so on a finite pool the isfinite term is always true and the select is the same.
+    "VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN"),
+    # ALIGN_GATHER (PA-0): union_walk_prefill builds its group-aligned row layout by an inverse row gather (each
+    # aligned slot computes its source row) instead of a fill + scatter. Pure data movement: bit-identical.
+    "VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER": env_bool("VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
