@@ -166,11 +166,10 @@ class TestCompilePrefixIsolation:
             )
         assert prefixes == ["model.layers.0", "model.layers.1"]
 
-    def test_missing_prefix_falls_back_to_a_unique_counter(self, prefixes):
+    def test_missing_prefix_falls_back_to_class_ordinal(self, prefixes):
         for _ in range(2):
             TorchCompileWithNoGuardsWrapper.__init__(_Wrapped())
-        assert all(p.startswith("_tpu_instance_") for p in prefixes)
-        assert len(set(prefixes)) == 2
+        assert prefixes == ["_Wrapped_0", "_Wrapped_1"]
 
     def test_explicit_prefix_is_left_alone(self, prefixes):
         TorchCompileWithNoGuardsWrapper.__init__(
