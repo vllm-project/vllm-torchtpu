@@ -151,7 +151,8 @@ def test_gdn_gate_binding_and_validation() -> None:
 
     g_sig = _SigmoidGDNModel.derive_geometry()
     assert g_sig.gdn_gate == "sigmoid"
-    # Direct binding.resolve(hf_config) lets hf_config override static binding option
+    # Static literal bind(gate="sigmoid") option takes precedence over hf_config
+    # gdn_gate, while an unbound gate reads gdn_gate from hf_config.
     assert (
         _SigmoidGDNModel.linear.resolve(
             {
@@ -160,7 +161,17 @@ def test_gdn_gate_binding_and_validation() -> None:
                 "gdn_gate": "silu",
             }
         ).gate
-        == "silu"
+        == "sigmoid"
+    )
+    assert (
+        _SynthBaseModel.linear.resolve(
+            {
+                "hidden_size": 256,
+                **_SynthBaseModel.default_hf_config,
+                "gdn_gate": "sigmoid",
+            }
+        ).gate
+        == "sigmoid"
     )
     # hf_config_for_geometry preserves non-default gdn_gate even when not in
     # explicit_fields
