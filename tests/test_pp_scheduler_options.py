@@ -48,7 +48,7 @@ from vllm_torchtpu.runner.utils import (
 
 BUCKETS = [4096, 8192, 12288, 16384]
 _EMPTY_STEP = SimpleNamespace(total_num_scheduled_tokens=0)
-_IX_PREFILL = {
+_ENTRY_PREFILL = {
     "quadratic_cost": True,
     "prefix_aware": True,
     "paw_aging_tok_per_s": 3000,
@@ -138,7 +138,7 @@ def test_defaults_are_the_schedulers_behaviour_without_options():
 
 def test_parse_reads_every_option():
     opts = pp_scheduler_options.get(
-        SimpleNamespace(additional_config={"tpu_pp_scheduler": _IX_PREFILL})
+        SimpleNamespace(additional_config={"tpu_pp_scheduler": _ENTRY_PREFILL})
     )
     assert opts.quadratic_cost and opts.prefix_aware
     # A JSON integer is taken for the float option.
@@ -247,7 +247,7 @@ def test_no_option_turns_on_no_lever():
 def test_prefix_aware_opts_the_pool_into_the_memo():
     # The epoch and change-log wrappers are registry patches; the scheduler
     # only opts its pool in, through _enable_memo_xstep.
-    s, calls = _built({"tpu_pp_scheduler": _IX_PREFILL})
+    s, calls = _built({"tpu_pp_scheduler": _ENTRY_PREFILL})
     assert "memo" in calls
     assert s._memo_xstep
     assert s._prefix_aware and s._srpf_running
@@ -604,7 +604,7 @@ def test_a_waiting_prefix_hit_counts_as_done_only_under_quadratic_cost():
     assert quad._waiting_warmth(_req(2048, 8192)) == 2048
 
 
-# -- the IX validation entries ---------------------------------------------------
+# -- the validation entries ----------------------------------------------------
 
 
 def _point_entries():

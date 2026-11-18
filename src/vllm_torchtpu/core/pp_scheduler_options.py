@@ -44,8 +44,8 @@ class PPSchedulerOptions:
     """Uncached prompt tokens credited per second a request has waited, in the
     ``prefix_aware`` orders (waiting-queue sort, running-prefill order,
     warmest-first promotion). 0 is no aging. Only meaningful with
-    ``prefix_aware``, so a positive value without it is refused. The IX
-    prefill legs ran 3000."""
+    ``prefix_aware``, so a positive value without it is refused. The
+    validation entries' prefill legs run 3000."""
 
     prefix_aware: bool = False
     """Borrow ``PrefixAwareScheduler``'s admission on a pipeline: the
@@ -54,8 +54,8 @@ class PPSchedulerOptions:
     ``tpu_scheduler.promote_warmest`` is false), the cross-step prefix-hit
     memo, divergent hybrid hits resolved through the KV connector, the
     trimmed token-id resend, packed prompt ids, and the connector's
-    completion poll at the start of each step. The IX prefill legs ran
-    true."""
+    completion poll at the start of each step. The validation entries'
+    prefill legs run true."""
 
     quadratic_cost: bool = False
     """Price prefill work by its attention cost as well as its token count,
@@ -63,7 +63,7 @@ class PPSchedulerOptions:
     each pending request's (chunk, prefix) pairs and a waiting request's
     prefix hit, and the ``prefix_aware`` orders rank by effective tokens.
     Needs ``TPU_PP_EQUAL_COST_CHUNKS`` (on by default); the scheduler refuses
-    it otherwise. The IX prefill legs ran true."""
+    it otherwise. The validation entries' prefill legs run true."""
 
 
 def parse(raw: Any) -> PPSchedulerOptions:
