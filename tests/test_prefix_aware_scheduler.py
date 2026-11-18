@@ -69,6 +69,7 @@ def _make_scheduler(
     warmth_map: dict[str, int],
     window: int = 64,
     enable_caching: bool = True,
+    raise_on_lookup: bool = False,
     tier_warmth: bool = False,
     connector: object | None = None,
 ) -> PrefixAwareScheduler:
@@ -83,12 +84,15 @@ def _make_scheduler(
     s._paw_n = 0
     s._paw_cold_tokens = 0
     s._paw_prompt_tokens = 0
+    s._paw_scoring_broken = False
     s._init_tier_warmth(tier_warmth)
     s.connector = connector
 
     coordinator = MagicMock()
 
     def find_hit(block_hashes, max_len):
+        if raise_on_lookup:
+            raise RuntimeError("simulated coordinator failure")
         for r in requests:
             if r.block_hashes is block_hashes:
                 return ({}, warmth_map.get(r.request_id, 0), 0)
@@ -104,6 +108,18 @@ def _make_scheduler(
     kvm.coordinator = coordinator
     s.kv_cache_manager = kvm
     return s
+
+
+def test_coordinator_failure_falls_back_to_fcfs():
+    now = time.time()
+    r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 10)
+    r2 = _make_request("r2", num_tokens=1000, arrival_time=now - 5)
+    s = _make_scheduler([r1, r2], {"r1": 0, "r2": 500}, raise_on_lookup=True)
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["r1", "r2"]
+    assert s._paw_scoring_broken is True
 
 
 # --- Offload-tier warmth (TPU_PREFIX_AWARE_TIER_WARMTH) ---------------------

@@ -172,6 +172,9 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         self._paw_n = 0
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
+        # Set after the first failed prefix-cache lookup in warmth scoring, so
+        # the exception is logged once.
+        self._paw_scoring_broken = False
         self._init_tier_warmth(envs.TPU_PREFIX_AWARE_TIER_WARMTH)
 
         self.follow_shared_prefix = envs.VLLM_TPU_FOLLOW_SHARED_PREFIX
@@ -781,7 +784,19 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             return 0, 0
         if request.num_computed_tokens > 0:
             return request.num_computed_tokens, 0
-        hbm_tokens = self._cached_prefix_tokens(request)
+        try:
+            hbm_tokens = self._cached_prefix_tokens(request)
+        except Exception:
+            # A failed lookup scores the request as cold (warmth 0). When every
+            # lookup fails, all requests tie and the window keeps arrival
+            # order, so the scheduler degrades to FCFS instead of failing the
+            # engine step.
+            if not self._paw_scoring_broken:
+                self._paw_scoring_broken = True
+                logger.exception(
+                    "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
+                )
+            return 0, 0
         tier_tokens = self._tier_tokens(request, hbm_tokens)
         return hbm_tokens + tier_tokens, tier_tokens
 
