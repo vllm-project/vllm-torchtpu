@@ -2611,13 +2611,23 @@ def build_combine_kernel(**kwargs):
 # per-token scales resident in SMEM. XLA's own gather costs more than the
 # scatter it would replace on TPU8i, which is why this is a kernel.
 SCALE_SLAB_WINDOW = 512
-# SMEM the per-token scale table may take. Above it the layer keeps the scatter.
+# SMEM the per-token scale table may take: half of the 1 MiB SMEM of every
+# current chip, which leaves the rest to the two windows and Mosaic's scalar
+# working set. Above it the layer keeps the scatter.
 SCALE_SLAB_MAX_TABLE_BYTES = 512 * 1024
 
 
-def scale_slab_fits(n_tokens):
-    """Whether the lookup form's per-token table fits its SMEM budget."""
-    return n_tokens * 4 <= SCALE_SLAB_MAX_TABLE_BYTES
+def scale_slab_fits(n_tokens, info=None):
+    """Whether the lookup form's per-token table fits its SMEM budget.
+
+    The budget is SCALE_SLAB_MAX_TABLE_BYTES, or half of this chip's SMEM
+    where that is less, so a chip with a smaller SMEM keeps the scatter
+    rather than failing to allocate the table.
+    """
+    if info is None:
+        info = pltpu.get_tpu_info()
+    budget = min(SCALE_SLAB_MAX_TABLE_BYTES, info.smem_capacity_bytes // 2)
+    return n_tokens * 4 <= budget
 
 
 def _build_act_scale_slab(*, n_tokens, table_rows, out_rows):
@@ -2693,10 +2703,22 @@ def _build_act_scale_slab(*, n_tokens, table_rows, out_rows):
     )
 
     def fn(live_rows, token_gather, scale_bits):
+        # Bounds checks are off in this kernel, so the operands are checked
+        # here: both are read as int32 words, the windows assume the table's
+        # length and the SMEM copy the scales'. A cast would hide a caller
+        # passing f32 scales rather than their bits.
+        for name, arr, rows in (
+            ("token_gather", token_gather, table_rows),
+            ("scale_bits", scale_bits, n_tokens),
+        ):
+            if arr.dtype != jnp.int32 or tuple(arr.shape) != (rows,):
+                raise ValueError(
+                    f"{name} must be int32[{rows}], got {arr.dtype}{list(arr.shape)}"
+                )
         return call(
             live_rows.astype(jnp.int32).reshape(1),
-            token_gather.astype(jnp.int32),
-            scale_bits.astype(jnp.int32),
+            token_gather,
+            scale_bits,
             jnp.zeros((out_rows,), jnp.int32),
         )
 

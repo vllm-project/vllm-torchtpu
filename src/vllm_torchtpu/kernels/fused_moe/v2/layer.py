@@ -717,7 +717,8 @@ def fused_ep_moe_v2(
             routing, me, e_total=e_total, ep=ep
         )
         row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
-        # Both slab tables scatter onto this shard's own slab. The rows of
+        # The slab scatters (the token-gather table, and the scale slab where
+        # it is not a lookup) run against this shard's own slab. The rows of
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
         slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)

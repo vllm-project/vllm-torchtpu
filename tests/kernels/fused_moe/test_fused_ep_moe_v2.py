@@ -680,32 +680,47 @@ def test_slab_scatter_set_and_add_are_bit_exact(
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
 @pytest.mark.parametrize(
-    "shape",
+    "shape,shared_weights",
     [
-        pytest.param(dict(SMALL), id="small"),
-        pytest.param(dict(PROD, tokens=PROD_TOKENS[0]), id="prod_t2048"),
-        pytest.param(dict(PROD, tokens=PROD_TOKENS[1]), id="prod_t16384"),
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so these shapes run against the
+        # module's one build of them rather than making their own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[1]), "production_weights", id="prod_t16384"
+        ),
     ],
 )
-def test_scale_slab_lookup_and_scatter_are_bit_exact(monkeypatch, sharded_plan, shape):
+def test_scale_slab_lookup_and_scatter_are_bit_exact(
+    request, monkeypatch, sharded_plan, shape, shared_weights
+):
     """The scale slab built by lookup gives the layer the scatter's output.
 
     The lookup leaves token 0's scale on the ROWBLK padding rows where the
     scatter leaves zero; the kernel commits neither, so the output is the
     same bits. The scatter form is forced by declaring the scales too large
     for SMEM; the TensorCore builds are forced on, so the lookup runs on a
-    chip whose SparseCore would otherwise keep the scatter-add.
+    chip whose SparseCore would otherwise keep the scatter-add. The lowered
+    programs must hold the lookup kernel exactly where it is forced on, so
+    the agreement is not vacuous: were the choice ever dropped from the
+    layer's shard_map cache key, the second build would reuse the first one's
+    body and fail here.
     """
     monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(
-        mesh,
-        50,
-        hidden=shape["hidden"],
-        inter=shape["inter"],
-        e_total=shape["e_total"],
-        weight_format=WeightFormat.FP8,
-    )
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            50,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
     x, gating = _make_inputs(
         mesh,
         51,
@@ -713,17 +728,14 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(monkeypatch, sharded_plan, 
         hidden=shape["hidden"],
         e_total=shape["e_total"],
     )
-    outs = []
-    for fits in (True, False):
-        monkeypatch.setattr(layer, "scale_slab_fits", lambda _n, fits=fits: fits)
-        outs.append(
-            fused_ep_moe_v2(
-                x,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                gating,
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the form is read while tracing, so reusing one `run` would lower the
+        # first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
                 topk=shape["topk"],
                 renormalize=True,
                 mesh=mesh,
@@ -731,8 +743,19 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(monkeypatch, sharded_plan, 
                 weight_format=WeightFormat.FP8,
                 sharded_plan=sharded_plan,
             )
-        )
-    np.testing.assert_array_equal(np.asarray(outs[0]), np.asarray(outs[1]))
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, has_lookup = {}, {}
+    for fits in (True, False):
+        monkeypatch.setattr(layer, "scale_slab_fits", lambda _n, fits=fits: fits)
+        run = make_run()
+        program = jax.jit(run).lower(*args).as_text()
+        has_lookup[fits] = "fused_ep_moe_v2_scale_slab" in program
+        outs[fits] = np.asarray(run(*args))
+    assert has_lookup == {True: True, False: False}, has_lookup
+    np.testing.assert_array_equal(outs[True], outs[False])
 
 
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
@@ -923,14 +946,25 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
 
 
+@pytest.mark.parametrize(
+    "tensorcore_tables", [False, True], ids=["chip_tables", "tensorcore_tables"]
+)
 @pytest.mark.parametrize("sharded_plan", [False, True])
-def test_split_stages_with_a_reordered_gather_are_bit_exact(sharded_plan):
+def test_split_stages_with_a_reordered_gather_are_bit_exact(
+    monkeypatch, sharded_plan, tensorcore_tables
+):
     """route, a caller-side gather in another order, compute == fused.
 
     The caller gathers the wire rows in an order of its own -- block i of q_g
     holds mesh index order[i]'s rows -- and tells compute where each mesh
     index's block landed. Nothing else about the layer may change.
+
+    With the TensorCore table builds forced on, the scale slab is a lookup
+    through the token-gather table, and it has to read the table in mesh
+    order -- the order the scales were gathered in -- not in q_g's order.
     """
+    if tensorcore_tables:
+        monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = _make_weights(
         mesh,
