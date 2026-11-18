@@ -885,19 +885,29 @@ def test_partial_tail_hook_passes_vllm_arguments_through():
     assert seen == [(896, 0)]
 
 
+_HOOK_TARGETS = [
+    ("pool", "get_new_blocks", "BlockPool.get_new_blocks"),
+    ("pool", "reset_prefix_cache", "BlockPool.reset_prefix_cache"),
+    (
+        "coordinator",
+        "get_num_blocks_to_allocate",
+        "KVCacheCoordinator.get_num_blocks_to_allocate",
+    ),
+    ("kvm", "allocate_slots", "KVCacheManager.allocate_slots"),
+    (
+        "mamba_mgr",
+        "_cache_partial_tail_block",
+        "MambaManager (group 1)._cache_partial_tail_block",
+    ),
+    ("mamba_mgr", "allocate_new_blocks", "MambaManager (group 1).allocate_new_blocks"),
+]
+
+
 @pytest.mark.parametrize(
-    ("missing", "named"),
-    [
-        ("reset_prefix_cache", "BlockPool.reset_prefix_cache"),
-        ("allocate_slots", "KVCacheManager.allocate_slots"),
-        (
-            "_cache_partial_tail_block",
-            "MambaManager (group 1)._cache_partial_tail_block",
-        ),
-    ],
+    ("owner", "missing", "named"), _HOOK_TARGETS, ids=[t[1] for t in _HOOK_TARGETS]
 )
 def test_missing_vllm_method_turns_retention_off_with_a_warning(
-    monkeypatch, missing, named
+    monkeypatch, owner, missing, named
 ):
     warnings = []
     monkeypatch.setattr(
@@ -906,15 +916,22 @@ def test_missing_vllm_method_turns_retention_off_with_a_warning(
         lambda msg, *args: warnings.append(msg % args),
     )
     kvm = _GuardKVM(free=100, need=1)
-    owner = {"reset_prefix_cache": kvm.pool, "allocate_slots": kvm}.get(
-        missing, kvm.mamba_mgr
-    )
-    setattr(owner, missing, None)
+    owners = {
+        "pool": kvm.pool,
+        "coordinator": kvm.coordinator,
+        "kvm": kvm,
+        "mamba_mgr": kvm.mamba_mgr,
+    }
+    setattr(owners[owner], missing, None)
+    before = {(key, name): getattr(owners[key], name) for key, name, _ in _HOOK_TARGETS}
     ret = HybridStateRetention(kvm, max_conversations=256)
     assert not ret.enabled
     assert len(warnings) == 1 and named in warnings[0]
-    # Nothing is wrapped: no hook runs while retention is off.
-    for obj in (kvm, kvm.pool, kvm.mamba_mgr):
+    # Nothing is installed: every target keeps what it had, no guard or hook
+    # marker is set, so no hook runs while retention is off.
+    for (key, name), value in before.items():
+        assert getattr(owners[key], name) == value, name
+    for obj in owners.values():
         assert not getattr(obj, "_hybrid_retention_guarded", False)
         assert not getattr(obj, "_hybrid_retention_hooked", False)
 
