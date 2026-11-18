@@ -145,6 +145,7 @@ PATCHES = (
     Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
     # Multimodal input loading and processing (the API server runs both).
     Patch("vllm_torchtpu.video_decode_patch:patch_opencv_one_pass_decode", _ACTIVE),
+    Patch("vllm_torchtpu.video_decode_patch:patch_opencv_decode_threads", _ACTIVE),
     Patch(
         "vllm_torchtpu.mm_processor_threads_patch:patch_mm_processor_threads", _ACTIVE
     ),

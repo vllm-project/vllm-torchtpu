@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One-pass OpenCV decode for vLLM's frame-sampling video loaders.
+"""OpenCV decode for vLLM's frame-sampling video loaders: one pass, bounded threads.
 
 vLLM's `decode_opencv` reads the source metadata with `get_video_metadata`,
 which opens the stream a second time and seeks to its end and back to check
@@ -24,12 +24,17 @@ lowers the count, so the frames and metadata equal upstream's. Otherwise (a
 header that over-counts, no header count, other indices, frame recovery) it
 takes upstream's path.
 
-The function is a drop-in for `vllm.multimodal.video_decoders.opencv.
-decode_opencv`, written to move there unchanged.
+`open_video_capture` opens each capture with an explicit thread count (see
+`DECODE_THREADS`).
+
+Both functions are drop-ins for their namesakes in `vllm.multimodal.
+video_decoders.opencv`, written to move there unchanged.
 """
 
 from __future__ import annotations
 
+import os
+from io import BytesIO
 from typing import Any
 
 import numpy.typing as npt
@@ -44,6 +49,30 @@ from vllm.multimodal.video_decoders.base import (
 # their sources.
 UPSTREAM_DECODE_OPENCV = opencv.decode_opencv
 UPSTREAM_GET_VIDEO_METADATA = opencv.OpenCVVideoBackendMixin.get_video_metadata
+UPSTREAM_OPEN_VIDEO_CAPTURE = opencv.OpenCVVideoBackendMixin.open_video_capture
+
+# OpenCV caps FFmpeg's decoder at min(CPUs, 16) threads, but unless the capture
+# is opened with CAP_PROP_N_THREADS it hands every CPU to the frame converter
+# (swscale). On a 224-CPU host that takes the 61-frame 480x832 H.264 clip from
+# 37 to 54 ms. A 4..64-thread sweep is flat at 37-39 ms from 12 to 20 threads.
+DECODE_THREADS = 16
+
+
+def decode_threads() -> int:
+    """Decoder and converter threads: OpenCV's decoder cap, within our CPUs."""
+    return min(DECODE_THREADS, len(os.sched_getaffinity(0)))
+
+
+def open_video_capture(cls: Any, data: bytes) -> Any:
+    cv2 = opencv.cv2
+    cap = cv2.VideoCapture(
+        BytesIO(data),
+        cls.get_cv2_video_api(),
+        [cv2.CAP_PROP_N_THREADS, decode_threads()],
+    )
+    if not cap.isOpened():
+        raise ValueError("Could not open video stream")
+    return cap
 
 
 def decode_opencv(
@@ -107,3 +136,12 @@ def patch_opencv_one_pass_decode() -> None:
     replacing the module attribute is enough.
     """
     opencv.decode_opencv = decode_opencv
+
+
+def patch_opencv_decode_threads() -> None:
+    """Open vLLM's OpenCV video captures with `decode_threads()` threads.
+
+    The thread count does not change the frames: the sweep's were bit-equal
+    at every count from 4 to 64.
+    """
+    opencv.OpenCVVideoBackendMixin.open_video_capture = classmethod(open_video_capture)

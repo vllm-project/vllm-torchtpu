@@ -35,6 +35,9 @@ PINNED_SOURCE_HASHES = {
     "get_video_metadata": (
         "955354bc80417a7a11752afdf03c80acd06f516298f9ba25191b6e72c37ede0a"
     ),
+    "open_video_capture": (
+        "5b14dd5a610ba31df88091fe507ee3fe191e07384b6baa10f8d8816737bdd0d9"
+    ),
 }
 
 
@@ -47,10 +50,11 @@ PINNED_SOURCE_HASHES = {
     [
         ("decode_opencv", video_decode_patch.UPSTREAM_DECODE_OPENCV),
         ("get_video_metadata", video_decode_patch.UPSTREAM_GET_VIDEO_METADATA),
+        ("open_video_capture", video_decode_patch.UPSTREAM_OPEN_VIDEO_CAPTURE),
     ],
 )
 def test_upstream_sources_unchanged(name, fn):
-    """Fail when upstream changes what the one-pass decode reproduces."""
+    """Fail when upstream changes what the decode patches reproduce."""
     digest = hashlib.sha256(inspect.getsource(fn).encode("utf-8")).hexdigest()
     assert digest == PINNED_SOURCE_HASHES[name], (
         f"Upstream {name} has drifted; re-sync src/vllm_torchtpu/video_decode_patch.py."
@@ -104,3 +108,24 @@ def test_one_pass_decode_matches_upstream(
     # The honest header skips upstream's seek-to-end check; the over-count
     # takes upstream's path.
     assert metadata.called is not one_pass
+
+
+def test_decode_threads_capture_matches_upstream(tmp_path):
+    """The thread-bounded capture decodes upstream's frames with its threads."""
+    data = _clip(tmp_path, "mp4v", "mp4")
+    target = VideoTargetMetadata(-1, 2, 300)
+    want = video_decode_patch.UPSTREAM_DECODE_OPENCV(
+        Qwen3VLVideoBackend, data, target, {}
+    )
+    with patch.object(
+        opencv.OpenCVVideoBackendMixin,
+        "open_video_capture",
+        classmethod(video_decode_patch.open_video_capture),
+    ):
+        cap = opencv.OpenCVVideoBackendMixin.open_video_capture(data)
+        got = video_decode_patch.UPSTREAM_DECODE_OPENCV(
+            Qwen3VLVideoBackend, data, target, {}
+        )
+    assert cap.get(cv2.CAP_PROP_N_THREADS) == video_decode_patch.decode_threads()
+    assert np.array_equal(got[0], want[0])
+    assert got[1:] == want[1:]
