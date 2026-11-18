@@ -296,6 +296,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # And the mesh they export with: `build_ep_mesh` decides the axis, the
     # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",
+    "vllm_torchtpu/distributed/dp_tp_mesh.py",
     "vllm_torchtpu/distributed/pcp.py",
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
