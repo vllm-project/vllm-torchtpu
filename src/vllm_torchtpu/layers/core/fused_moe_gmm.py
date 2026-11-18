@@ -216,6 +216,7 @@ def gmm_wrapper(
     fuse_act=None,
     preferred_element_type=None,
     rhs_quant_dtype=None,
+    rhs_group_base=None,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -236,6 +237,7 @@ def gmm_wrapper(
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_group_base=rhs_group_base,
     )
 
 

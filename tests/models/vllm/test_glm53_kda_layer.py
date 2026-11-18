@@ -725,6 +725,45 @@ def test_forward_direct_profiles_with_zeros_before_the_cache_exists(
     torch.testing.assert_close(got, mods.o_proj(torch.zeros(T, PROJ)))
 
 
+@torch.no_grad()
+def test_forward_direct_sequence_parallel_gathers_and_reduce_scatters(
+    monkeypatch: pytest.MonkeyPatch, builders: dict
+) -> None:
+    layer = _bound_layer(monkeypatch, [_pool()])
+    mods = _with_projections(layer)
+    op = layer.pooled_kda_op = _RecordingOp()
+    _set_context(monkeypatch, _metadata())
+    seen = {}
+
+    def all_gather(x):
+        seen["gathered"] = x
+        return torch.cat([x, x], dim=0)
+
+    def reduce_scatter(x):
+        seen["scattered"] = x
+        return x[: x.shape[0] // 2]
+
+    monkeypatch.setattr(
+        L,
+        "_sp_collectives",
+        lambda: SimpleNamespace(
+            token_all_gather=all_gather, token_reduce_scatter=reduce_scatter
+        ),
+    )
+    local = torch.randn(T // 2, HIDDEN)
+    got = layer.forward_direct(local, None, sequence_parallel=True)
+
+    assert seen["gathered"] is local
+    (args,) = op.calls
+    assert args[0].shape == (T, DIM)
+    # o_proj's partial sums go through quant_method.apply, not the reducing
+    # module call.
+    torch.testing.assert_close(
+        seen["scattered"], mods.o_proj(op.output.reshape(T, PROJ)) * 10.0
+    )
+    assert got.shape == (T // 2, HIDDEN)
+
+
 # Multi-step batches through the unified pool, with the Pallas pieces replaced
 # by pure-JAX stand-ins.
 

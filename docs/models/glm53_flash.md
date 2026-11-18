@@ -31,8 +31,12 @@
 - **Pallas mHC kernels** (`VLLM_TPU_GLM53_MHC_IMPL=pallas`, default): fuses the
   post-sublayer stream update of site `k` with the Sinkhorn-Knopp pre-collapse
   and RMSNorm of site `k + 1`.
-- **MoE**: vLLM's `FusedMoE` on the TPU grouped-matmul MoE kernels, with the
-  clamped SwiGLU kernel variant for GLM's `swiglu_limit=10.0`.
+- **One-dispatch FP8 MoE** (`VLLM_TPU_GLM53_MOE_IMPL=fused`, default): fuses
+  router GEMM, Pallas `noaux_tc` top-k routing, bitpacked activation sort,
+  Megablox FP8 GMMs, and the shared expert into a single JAX op per layer.
+- **Sequence-parallel prefill** (`VLLM_TPU_GLM53_SP_PREFILL=1`, default):
+  shards the token axis across TP ranks when `num_tokens >= VLLM_TPU_GLM53_SP_MIN_TOKENS`
+  so mHC sites, norms, and replicated MLA projections run on `T / tp` tokens.
 
 ## Serving on TPU v7x (`TP=8`)
 

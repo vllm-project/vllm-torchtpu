@@ -44,6 +44,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DP_VOCAB_PARALLEL` | `False` | Opt-in. Shards the input embedding and lm_head over every DP x TP rank (the EP group) instead of each DP engine's TP group, cutting their HBM per device by DP x. Needs DP with expert parallelism; ignored, with a warning, under pipeline or context parallelism, speculative decoding, LoRA, pooling or multimodal models, or `TPU_GREEDY_TOP_TOKENS`. |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
+| `VLLM_TPU_GLM53_SP_PREFILL` | `True` | Shards the GLM-5.3-Flash token axis across TP during prefill so the hyper-connection sites, sublayer norms and replicated MLA projections run on `T / tp` tokens. |
+| `VLLM_TPU_GLM53_SP_MIN_TOKENS` | `256` | Minimum batch token count for `VLLM_TPU_GLM53_SP_PREFILL` (rounded up to a multiple of `tp_size * 32`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
 
@@ -67,6 +69,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `MOE_FUSED_EP_ENABLE_W4A8` | `False` | Enables 4-bit weight / 8-bit activation (`W4A8`) execution in the fused EP MoE kernel. |
 | `MOE_FUSED_EP_SORTED_GATHER` | `False` | Keeps the fused EP MoE mesh in EP-rank order and performs the activation all-gather outside the kernel over a process group in ascending device-id order. |
 | `FUSED_MOE_DECODE_KERNEL` | `False` | Serves eligible MoE layers (TP experts, or EP with TP attention) up to `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens with the fused MoE decode Pallas kernel (routed experts, shared expert, and all-reduce in one call); arming refuses a cap whose buffers do not fit in VMEM. |
+| `VLLM_TPU_GLM53_MOE_IMPL` | `"fused"` | GLM-5.3-Flash MoE block: `"fused"` runs the router, routing, routed grouped matmul and shared expert as one JAX op per layer; `"vllm"` uses vLLM's `FusedMoE` layer. |
 | `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` | `256` | Maximum token count per step for `FUSED_MOE_DECODE_KERNEL`; larger steps fall back to the grouped-matmul MoE path. |
 | `USE_MOE_TP_DECODE_KERNEL` | `False` | Serves eligible tensor-parallel FP8 MoE layers with a fused TP decode MoE Pallas kernel (in-kernel routing, shared expert, and all-reduce; requires `TPU_MOE_SKIP_PADDED_TOKENS=1`, and arms nothing while `FUSED_MOE_DECODE_KERNEL` is set). |
 | `TPU_EXPERT_PLACEMENT` | `""` | Static expert placement for `EP`: a JSON table (a local path or a `gs://` URI) that sets, per MoE layer, which experts each EP rank holds, as a permutation. Applied at weight load to the experts and the router, so every MoE kernel serves it unchanged. With Ray DP engines, also list it in `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`: vLLM copies only `VLLM_` variables and the names listed there to the engine actors. |
