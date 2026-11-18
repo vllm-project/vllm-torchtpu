@@ -9472,27 +9472,7 @@ class TPUModelRunner(GPUModelRunner):
         ):
             knr_buckets.add(num_reqs_most)
         bound = self.max_num_reqs * (1 + k)
-        req_loop_pairs = sorted(
-            {
-                (
-                    self.num_reqs_paddings[
-                        bisect.bisect_left(self.num_reqs_paddings, r)
-                    ],
-                    _get_padded_token_len(
-                        self.num_tokens_paddings,
-                        max(r, self.num_reqs_paddings[0]),
-                    ),
-                )
-                for r in range(1, self.max_num_reqs + 1)
-            }
-            | {
-                (
-                    b,
-                    _get_padded_token_len(self.num_tokens_paddings, b),
-                )
-                for b in self.num_reqs_paddings
-            }
-        )
+        req_loop_pairs, two_chunk_pairs = _async_spec_assembly_shapes(self)
         if self.scheduler_config.async_scheduling:
             with self._precompile_timed("async_spec_assembly"):
                 for num_reqs in self.num_reqs_paddings:
@@ -9522,33 +9502,28 @@ class TPUModelRunner(GPUModelRunner):
                         nt_warm, drafts_warm, dl_warm, bound, self.max_num_reqs
                     )
                     synchronize_tensors(out_asm)
-                for b0, p0 in req_loop_pairs:
+                for (b0, p0), (b1, p1) in two_chunk_pairs:
                     nt0_w = torch.zeros(
                         (b0, k + 1), dtype=torch.int32, device=self.device
                     )
                     d0_w = torch.zeros((p0, k), dtype=torch.int32, device=self.device)
                     dl0_w = torch.zeros(b0, dtype=torch.int32, device=self.device)
-                    for b1, p1 in req_loop_pairs:
-                        if b0 + b1 > self.max_num_reqs:
-                            continue
-                        nt1_w = torch.zeros(
-                            (b1, k + 1), dtype=torch.int32, device=self.device
-                        )
-                        d1_w = torch.zeros(
-                            (p1, k), dtype=torch.int32, device=self.device
-                        )
-                        dl1_w = torch.zeros(b1, dtype=torch.int32, device=self.device)
-                        out_asm2 = _compiled_assemble_two_chunks_spec_and_rejected(
-                            nt0_w,
-                            d0_w,
-                            dl0_w,
-                            nt1_w,
-                            d1_w,
-                            dl1_w,
-                            bound,
-                            self.max_num_reqs,
-                        )
-                        synchronize_tensors(out_asm2)
+                    nt1_w = torch.zeros(
+                        (b1, k + 1), dtype=torch.int32, device=self.device
+                    )
+                    d1_w = torch.zeros((p1, k), dtype=torch.int32, device=self.device)
+                    dl1_w = torch.zeros(b1, dtype=torch.int32, device=self.device)
+                    out_asm2 = _compiled_assemble_two_chunks_spec_and_rejected(
+                        nt0_w,
+                        d0_w,
+                        dl0_w,
+                        nt1_w,
+                        d1_w,
+                        dl1_w,
+                        bound,
+                        self.max_num_reqs,
+                    )
+                    synchronize_tensors(out_asm2)
                 rej_warm = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, device=self.device
                 )
@@ -10499,6 +10474,11 @@ class TPUModelRunner(GPUModelRunner):
                 k_plus_1 = k + 1
                 bound = self.max_num_reqs * k_plus_1
                 num_idx_groups = len(self._mamba_copy_plan) or 1
+                assembly_shapes = (
+                    _async_spec_assembly_shapes(self)
+                    if self.scheduler_config.async_scheduling and self._is_async_drafter
+                    else None
+                )
                 widths = sorted(
                     {
                         w
@@ -10526,27 +10506,6 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     _reset_read_offsets_compiled(offsets, keep_zero_dev, stacked, null)
                     _clear_read_offsets_compiled(offsets, stacked)
-                    req_loop_pairs = sorted(
-                        {
-                            (
-                                self.num_reqs_paddings[
-                                    bisect.bisect_left(self.num_reqs_paddings, r)
-                                ],
-                                _get_padded_token_len(
-                                    self.num_tokens_paddings,
-                                    max(r, self.num_reqs_paddings[0]),
-                                ),
-                            )
-                            for r in range(1, self.max_num_reqs + 1)
-                        }
-                        | {
-                            (
-                                b,
-                                _get_padded_token_len(self.num_tokens_paddings, b),
-                            )
-                            for b in self.num_reqs_paddings
-                        }
-                    )
                     for num_reqs in self.num_reqs_paddings:
                         if num_reqs > width:
                             continue
@@ -10561,10 +10520,8 @@ class TPUModelRunner(GPUModelRunner):
                                 _update_read_offsets_verify_compiled(
                                     offsets, stacked, dummy_next
                                 )
-                    if (
-                        self.scheduler_config.async_scheduling
-                        and self._is_async_drafter
-                    ):
+                    if assembly_shapes is not None:
+                        req_loop_pairs, two_chunk_pairs = assembly_shapes
                         for num_reqs, p in req_loop_pairs:
                             if num_reqs > width:
                                 continue
@@ -10592,34 +10549,46 @@ class TPUModelRunner(GPUModelRunner):
                                 )
                             )
                             synchronize_tensors(list(out_asm_off))
-                            for b1, p1 in req_loop_pairs:
-                                if num_reqs + b1 > self.max_num_reqs:
-                                    continue
-                                nt1_warm = torch.full(
-                                    (b1, k_plus_1),
-                                    INVALID_TOKEN_ID,
-                                    dtype=torch.int32,
-                                    device=offsets.device,
-                                )
-                                drafts1_warm = torch.zeros(
-                                    (p1, k), dtype=torch.int32, device=offsets.device
-                                )
-                                dl1_warm = torch.zeros(
-                                    b1, dtype=torch.int32, device=offsets.device
-                                )
-                                out_asm2_off = _compiled_assemble_two_chunks_spec_rejected_and_read_offsets(  # noqa: E501
-                                    nt_warm,
-                                    drafts_warm,
-                                    dl_warm,
-                                    nt1_warm,
-                                    drafts1_warm,
-                                    dl1_warm,
-                                    offsets,
-                                    stacked,
-                                    bound,
-                                    self.max_num_reqs,
-                                )
-                                synchronize_tensors(list(out_asm2_off))
+                        for (b0, p0), (b1, p1) in two_chunk_pairs:
+                            if b0 > width:
+                                continue
+                            nt0_warm = torch.full(
+                                (b0, k_plus_1),
+                                INVALID_TOKEN_ID,
+                                dtype=torch.int32,
+                                device=offsets.device,
+                            )
+                            drafts0_warm = torch.zeros(
+                                (p0, k), dtype=torch.int32, device=offsets.device
+                            )
+                            dl0_warm = torch.zeros(
+                                b0, dtype=torch.int32, device=offsets.device
+                            )
+                            nt1_warm = torch.full(
+                                (b1, k_plus_1),
+                                INVALID_TOKEN_ID,
+                                dtype=torch.int32,
+                                device=offsets.device,
+                            )
+                            drafts1_warm = torch.zeros(
+                                (p1, k), dtype=torch.int32, device=offsets.device
+                            )
+                            dl1_warm = torch.zeros(
+                                b1, dtype=torch.int32, device=offsets.device
+                            )
+                            out_asm2_off = _compiled_assemble_two_chunks_spec_rejected_and_read_offsets(  # noqa: E501
+                                nt0_warm,
+                                drafts0_warm,
+                                dl0_warm,
+                                nt1_warm,
+                                drafts1_warm,
+                                dl1_warm,
+                                offsets,
+                                stacked,
+                                bound,
+                                self.max_num_reqs,
+                            )
+                            synchronize_tensors(list(out_asm2_off))
 
     def _precompile_spec_boundary_copies(self) -> None:
         """Run the boundary copies at every entries shape
@@ -12316,6 +12285,50 @@ def _get_padded_token_len(paddings: list[int], x: int) -> int:
             f"bucket {paddings[-1]} (available paddings: {paddings})"
         )
     return paddings[index]
+
+
+ChunkShape = tuple[int, int]
+
+
+def _async_spec_assembly_shapes(
+    runner: "TPUModelRunner",
+) -> tuple[list[ChunkShape], list[tuple[ChunkShape, ChunkShape]]]:
+    """The shapes the async-spec assembly programs take while serving.
+
+    Per chunk, a ``(request bucket, loop bucket)`` pair: the rows of the
+    chunk's sampled tokens and of the drafter's padded drafts. Per two-chunk
+    step, the pairs of those that fit ``max_num_reqs``. The loop bucket is the
+    drafter's (``Eagle3Proposer._reachable_loop_buckets``): off EP-DP lockstep
+    it is the chunk's own, and under lockstep it follows the step's DP-wide
+    largest chunk, any count from the chunk's own up to ``max_num_reqs``, so
+    both chunks of a step share it. The warm-ups compile exactly these, or a
+    serving step compiles while its lockstep peers wait.
+    """
+    paddings = runner.num_reqs_paddings
+    drafter = runner.drafter
+    eagle3 = drafter if isinstance(drafter, Eagle3Proposer) else None
+    pairs = {
+        (b, _get_padded_token_len(runner.num_tokens_paddings, b)) for b in paddings
+    }
+    for r in range(1, runner.max_num_reqs + 1):
+        b = paddings[bisect.bisect_left(paddings, r)]
+        if eagle3 is not None:
+            loops = eagle3._reachable_loop_buckets(r)
+        else:
+            loops = {
+                _get_padded_token_len(runner.num_tokens_paddings, max(r, paddings[0]))
+            }
+        pairs.update((b, p) for p in loops)
+    one_chunk = sorted(pairs)
+    shared_loop_bucket = eagle3 is not None and eagle3._dp_lockstep_sharded()
+    two_chunks = [
+        (c0, c1)
+        for c0 in one_chunk
+        for c1 in one_chunk
+        if c0[0] + c1[0] <= runner.max_num_reqs
+        and (not shared_loop_bucket or c0[1] == c1[1])
+    ]
+    return one_chunk, two_chunks
 
 
 def _get_padded_num_kv_cache_update_slices(

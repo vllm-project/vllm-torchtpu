@@ -727,7 +727,12 @@ _ASSEMBLY_PROGRAMS = (
 
 
 def _assembly_warmup_calls(
-    monkeypatch, *, async_scheduling=True, most=None, async_drafter=True
+    monkeypatch,
+    *,
+    async_scheduling=True,
+    most=None,
+    async_drafter=True,
+    runner_fields=None,
 ):
     """Run _precompile_async_spec_assembly on a stub runner and record the
     shapes each assembly program was warmed with."""
@@ -759,8 +764,11 @@ def _assembly_warmup_calls(
         num_reqs_most_model_len=most,
         uses_mrope=False,
         device=torch.device("cpu"),
+        drafter=None,
         _precompile_timed=lambda name: contextlib.nullcontext(),
     )
+    for name, value in (runner_fields or {}).items():
+        setattr(runner, name, value)
     tpu_runner.TPUModelRunner._precompile_async_spec_assembly(runner)  # type: ignore[arg-type]
     return calls
 
@@ -797,6 +805,169 @@ def test_async_spec_assembly_warmup_needs_async_scheduling(monkeypatch):
 def test_async_spec_assembly_warmup_needs_an_async_drafter(monkeypatch):
     calls = _assembly_warmup_calls(monkeypatch, async_drafter=False)
     assert all(not c for c in calls.values())
+
+
+# A 32-request engine: request buckets 8/16/32, loop buckets 16/32/64.
+_LOCKSTEP_FIELDS = dict(
+    max_num_reqs=32,
+    num_reqs_paddings=[8, 16, 32],
+    num_tokens_paddings=[16, 32, 64],
+    num_reqs_max_model_len=32,
+)
+
+
+def _sharded_mtp_drafter(runner, lockstep):
+    """A TP-sharded Eagle3 drafter on `runner`, under EP-DP lockstep or not."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    runner._dp_lockstep_enabled = lambda: lockstep
+    runner._dp_step_max_reqs = 0
+    drafter = object.__new__(Eagle3Proposer)
+    drafter.runner = runner
+    drafter._draft_replicated = False
+    return drafter
+
+
+def _served_assembly_shapes(runner, drafter, lockstep):
+    """The shapes the compiled assembly takes while serving: per chunk, its
+    request bucket and the drafter's padded draft rows (the program runs when
+    the drafts cover the sampled rows); per two-chunk step, both chunks of one
+    step, whose request buckets fit max_num_reqs. Under lockstep every step's
+    DP-wide largest chunk m is walked, with every chunk of at most m requests."""
+    top = runner.max_num_reqs
+    one, two = set(), set()
+    for m in range(1, top + 1) if lockstep else [0]:
+        runner._dp_step_max_reqs = m
+        chunks = set()
+        for n in range(1, (m if lockstep else top) + 1):
+            shape = (
+                tpu_runner._get_padded_num_reqs_with_upper_limit(n, top),
+                drafter._loop_bucket(n),
+            )
+            if shape[1] >= shape[0]:
+                chunks.add(shape)
+        one |= chunks
+        two |= {(c0, c1) for c0 in chunks for c1 in chunks if c0[0] + c1[0] <= top}
+    runner._dp_step_max_reqs = 0
+    return one, two
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_async_spec_assembly_warmup_covers_the_drafters_loop_buckets(
+    monkeypatch, lockstep
+):
+    """Under EP-DP lockstep the drafter pads a chunk's drafts to the loop
+    bucket of the step's DP-wide largest chunk, so a chunk pairs with every
+    loop bucket from its own up; the warm-up compiles each pair the serving
+    assembly takes, and off lockstep the same pairs as before."""
+    runner = SimpleNamespace(**_LOCKSTEP_FIELDS)
+    drafter = _sharded_mtp_drafter(runner, lockstep)
+    calls = _assembly_warmup_calls(
+        monkeypatch, runner_fields=dict(_LOCKSTEP_FIELDS, drafter=drafter)
+    )
+    one, two = _served_assembly_shapes(runner, drafter, lockstep)
+    if lockstep:
+        assert (8, 32) in one and (16, 32) in one
+    else:
+        assert one == {(8, 16), (16, 16), (32, 32)}
+    for name in (
+        "_compiled_assemble_spec_and_rejected",
+        "_compiled_assemble_prefill_bootstrap",
+    ):
+        assert {(c[0][0], c[1][0]) for c in calls[name]} == one, name
+    warmed_two = {
+        ((c[0][0], c[1][0]), (c[3][0], c[4][0]))
+        for c in calls["_compiled_assemble_two_chunks_spec_and_rejected"]
+    }
+    assert warmed_two == two
+
+
+_READ_OFFSET_PROGRAMS = (
+    "_reset_read_offsets_compiled",
+    "_clear_read_offsets_compiled",
+    "_update_read_offsets_verify_compiled",
+    "_compiled_assemble_spec_rejected_and_read_offsets",
+    "_compiled_assemble_two_chunks_spec_rejected_and_read_offsets",
+)
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_mamba_read_offset_warmup_covers_every_spec_shape(
+    monkeypatch, lockstep, async_scheduling
+):
+    """The spec-decode half of _precompile_mamba_rollback_helpers warms the
+    read-offset reset, clear and verify scatters at every batch width, and,
+    under async scheduling, the assembly programs that fold the read-offset
+    scatter in at every shape the serving assembly takes for that width."""
+    calls: dict[str, list[tuple]] = {name: [] for name in _READ_OFFSET_PROGRAMS}
+
+    def recorder(name):
+        def record(*args):
+            calls[name].append(
+                tuple(
+                    (tuple(a.shape), a.dtype) if isinstance(a, torch.Tensor) else a
+                    for a in args
+                )
+            )
+            return (torch.zeros(1), torch.zeros(1))
+
+        return record
+
+    for name in _READ_OFFSET_PROGRAMS:
+        monkeypatch.setattr(tpu_runner, name, recorder(name))
+    for name in (
+        "_rollback_offsets_seed_compiled",
+        "_rollback_offsets_migrate_compiled",
+    ):
+        monkeypatch.setattr(tpu_runner, name, lambda *_a: None)
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    runner = SimpleNamespace(
+        **_LOCKSTEP_FIELDS,
+        mamba_slot_read_offsets=torch.zeros(64, dtype=torch.int32),
+        _mamba_ckpt_window=1,
+        _pool_block_split=1,
+        _mamba_copy_plan=[(0, [])],
+        kv_cache_config=None,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        num_reqs_most_model_len=None,
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        _is_async_drafter=True,
+        _read_offset_scratch={},
+        _bucket_len=tpu_runner.TPUModelRunner._bucket_len,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+    )
+    runner._read_offset_reset_scratch = (
+        tpu_runner.TPUModelRunner._read_offset_reset_scratch.__get__(runner)
+    )
+    runner.drafter = _sharded_mtp_drafter(runner, lockstep)
+    tpu_runner.TPUModelRunner._precompile_mamba_rollback_helpers(runner)  # type: ignore[arg-type]
+
+    widths = [8, 16, 32]
+    for name in ("_reset_read_offsets_compiled", "_clear_read_offsets_compiled"):
+        assert sorted(
+            c[2 if name.startswith("_reset") else 1][0] for c in calls[name]
+        ) == [(w,) for w in widths], name
+    assert sorted(
+        (c[1][0][0], c[2][0], str(c[2][1]))
+        for c in calls["_update_read_offsets_verify_compiled"]
+    ) == sorted(
+        (w, (w, 4), str(dt)) for w in widths for dt in (torch.int32, torch.int64)
+    )
+    one, two = _served_assembly_shapes(runner, runner.drafter, lockstep)
+    warmed_one = {
+        (c[0][0][0], c[1][0][0], c[4][0][0])
+        for c in calls["_compiled_assemble_spec_rejected_and_read_offsets"]
+    }
+    warmed_two = {
+        ((c[0][0][0], c[1][0][0]), (c[3][0][0], c[4][0][0]), c[7][0][0])
+        for c in calls["_compiled_assemble_two_chunks_spec_rejected_and_read_offsets"]
+    }
+    if not async_scheduling:
+        assert not warmed_one and not warmed_two
+        return
+    assert warmed_one == {(b, p, w) for b, p in one for w in widths if b <= w}
+    assert warmed_two == {(c0, c1, w) for c0, c1 in two for w in widths if c0[0] <= w}
 
 
 @pytest.mark.parametrize(
