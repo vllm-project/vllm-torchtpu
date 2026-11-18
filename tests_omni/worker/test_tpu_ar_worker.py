@@ -13,7 +13,9 @@
 # limitations under the License.
 """Unit tests for src/vllm_torchtpu/omni/worker/base.py and tpu_ar_worker.py."""
 
+import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -42,6 +44,11 @@ def test_tpu_ar_worker_wiring():
 
 
 @pytest.mark.parametrize(
+    "worker_cls",
+    [OmniTPUWorkerBase, TPUARWorker],
+    ids=["base", "ar_worker"],
+)
+@pytest.mark.parametrize(
     ("method", "args"),
     [
         ("handle_sleep_task", ({"task_id": 1, "level": 1},)),
@@ -49,9 +56,9 @@ def test_tpu_ar_worker_wiring():
         ("encoder_loaded", ()),
     ],
 )
-def test_worker_base_refuses_unimplemented_orchestrator_hooks(method, args):
+def test_worker_base_refuses_unimplemented_orchestrator_hooks(worker_cls, method, args):
     """Refuse unimplemented hooks; replace with functional tests once implemented."""
-    worker = OmniTPUWorkerBase.__new__(OmniTPUWorkerBase)
+    worker = worker_cls.__new__(worker_cls)
     with pytest.raises(NotImplementedError, match="TPU"):
         getattr(worker, method)(*args)
 
@@ -137,7 +144,8 @@ def test_tpu_ar_worker_init_device_builds_ar_model_runner(
         is_driver_worker=True,
     )
     worker.devices = [torch.device("cpu")]
-    worker.init_device()
+    with patch.dict(os.environ):
+        worker.init_device()
 
     assert isinstance(worker.model_runner, TPUARModelRunner)
     assert (worker.model_runner.model_stage, worker.model_runner.stage_id) == (

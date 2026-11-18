@@ -63,7 +63,7 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
             raise NotImplementedError(
                 f"Stage {self.stage_id} ({self.model_stage!r}) needs inter-stage Omni "
                 "connectors, which are not wired on TPU yet. Run the thinker-only "
-                "pipeline (qwen3_omni_moe_thinker_only) or another single-stage "
+                "pipeline (qwen3_omni_moe_thinking.yaml) or another single-stage "
                 "deployment."
             )
         if self.speculative_config is not None:
