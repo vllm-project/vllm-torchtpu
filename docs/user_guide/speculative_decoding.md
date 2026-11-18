@@ -123,7 +123,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
   }'
 ```
 
-`"ngram"` drafts on the host from the committed tokens, which async scheduling holds back a step, so it requires `--no-async-scheduling`. `"ngram_gpu"` applies the same matching rule on the TPU to each step's sampled tokens, so it keeps async scheduling (and requires it). It holds each request slot's token history in HBM, 4 bytes per `--max-model-len` token per slot.
+`"ngram"` drafts on the host from the committed tokens, which async scheduling holds back a step, so it requires `--no-async-scheduling`. `"ngram_gpu"` applies the same matching rule on the TPU to each step's sampled tokens, so it keeps async scheduling (and requires it). It holds each request slot's token history in HBM, 4 bytes per `--max-model-len` token per slot. With a decode megakernel that declares speculative decoding (`VLLM_TPU_MEGAKERNEL=qwen3_vl`), a greedy verify step of `1 + K` tokens runs as one megakernel token step, and while the batch stays the same its next inputs are derived on the device from the accepted tokens.
 
 ```bash
 vllm serve meta-llama/Llama-3.1-8B-Instruct \
