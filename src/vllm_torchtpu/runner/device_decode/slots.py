@@ -415,11 +415,17 @@ class DecodeSlots:
         )
 
     def write_back_stock_chunk(
-        self, runner: Any, plan: StockChunkPlan, sampled: torch.Tensor
+        self,
+        runner: Any,
+        plan: StockChunkPlan,
+        sampled: torch.Tensor,
+        plan_dev: torch.Tensor | None = None,
     ) -> None:
         """Writes a stock chunk's outcome into its slots: `last_token` where
         a token was produced, `num_computed` for every live row. `sampled`
-        holds the chunk's [P, 1] (or [P]) tokens. One H2D, one program.
+        holds the chunk's [P, 1] (or [P]) tokens. One H2D, one program;
+        `plan_dev`, the plan's `to_device` copy if the caller already made
+        one, saves the H2D.
 
         A live row that produced no token (a prefill chunk, also one that
         recomputes a decode-ready request's tokens after a failed KV load)
@@ -427,7 +433,8 @@ class DecodeSlots:
         live = plan.slots != self.config.null_slot
         self._scalars[plan.slots[live], _COL_NUM_COMPUTED] = plan.new_num_computed[live]
         self._ready[plan.slots[live]] = plan.produced[live]
-        plan_dev = plan.to_device(runner)
+        if plan_dev is None:
+            plan_dev = plan.to_device(runner)
         fn = _write_back_compiled if plan_dev.device.type == "tpu" else _write_back_impl
         with torch.no_grad():
             fn(
