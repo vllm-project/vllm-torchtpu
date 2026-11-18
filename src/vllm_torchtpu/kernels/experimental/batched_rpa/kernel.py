@@ -955,10 +955,6 @@ def rpa_kernel(
                 q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(
                     -1, num_lanes
                 )
-                kv_ref_flat = kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
-                    -1, num_lanes
-                # Explicitly zero out scratches and Q/KV buffers.
-                for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
                 # Explicitly zero out scratches and the Q buffer, and the KV
                 # buffer when V is not masked on load.
                 zeroed = [scratches[1], scratches[2], q_ref_flat]
