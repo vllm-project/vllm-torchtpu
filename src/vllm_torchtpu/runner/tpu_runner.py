@@ -6382,11 +6382,7 @@ class TPUModelRunner(GPUModelRunner):
                         cur_start_idx, cur_end_idx, logits
                     )
                 )
-                if (
-                    logits.device.type == "tpu"
-                    and "sample_from_packed_candidates"
-                    not in getattr(self, "__dict__", {})
-                ):
+                if logits.device.type == "tpu":
                     # Drawn inside the compiled sampler (see _get_sampling_generator).
                     u = None
                 else:
@@ -6451,10 +6447,8 @@ class TPUModelRunner(GPUModelRunner):
         target_argmax: torch.Tensor | None = None
         params: _ChunkSamplingParams | None = None
         if top_tokens:
-            if (
-                logits.device.type == "tpu"
-                and isinstance(self.rejection_sampler, RejectionSampler)
-                and "spec_bonus_and_target_tokens" not in getattr(self, "__dict__", {})
+            if logits.device.type == "tpu" and isinstance(
+                self.rejection_sampler, RejectionSampler
             ):
                 accept_u = (
                     torch.rand(
@@ -6598,11 +6592,8 @@ class TPUModelRunner(GPUModelRunner):
                         topk_candidates=topk_candidates,
                     )
             if all_greedy and grammar_output is None and not processors:
-                if (
-                    logits.device.type == "tpu"
-                    and isinstance(self.rejection_sampler, RejectionSampler)
-                    and "spec_bonus_and_target_logits"
-                    not in getattr(self, "__dict__", {})
+                if logits.device.type == "tpu" and isinstance(
+                    self.rejection_sampler, RejectionSampler
                 ):
                     accept_u = (
                         torch.rand(
