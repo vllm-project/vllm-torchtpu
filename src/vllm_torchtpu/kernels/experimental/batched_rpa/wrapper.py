@@ -259,6 +259,11 @@ def calculate_block_sizes(
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
+    if decode_batch_size < 1:
+        raise ValueError(
+            f"decode_batch_size must be at least 1, got {decode_batch_size}."
+        )
+
     # Calculate aligned model dimensions.
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
     aligned_num_q_heads_per_kv_head = utils.align_to(
@@ -991,8 +996,8 @@ def ragged_paged_attention(
     # DECODE alone over every sequence, and any other call skips MIXED at run
     # time (lax.cond) when its sequence range is empty. Otherwise DECODE and
     # MIXED both run on every call. The conditional, one per attention layer,
-    # changes how XLA schedules and places the whole compiled step; that alone
-    # changed other models' greedy outputs, with every kernel's results equal.
+    # changes how XLA schedules and places the whole compiled step, which can
+    # change the rounding of other ops in the step; so it is opt-in.
     effective_decode_blocks = decode_block_sizes or default_decode
     if (
         skip_empty_mixed
