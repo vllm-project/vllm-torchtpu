@@ -94,6 +94,7 @@ def kda_attention_ref(
     kernel_size: int,
     attention_mode: config.AttentionMode = config.AttentionMode.KDA,
     gate_lower_bound: float | None = None,
+    beta_scale: float = 1.0,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Reference conv1d + silu + KDA, sequence by sequence in eager mode.
 
@@ -171,7 +172,7 @@ def kda_attention_ref(
         q_seq = _l2_normalize(q_seq)
         k_seq = _l2_normalize(k_seq)
 
-        beta_seq = 1.0 / (1.0 + np.exp(-np.asarray(b[start:end], np.float64)))
+        beta_seq = beta_scale / (1.0 + np.exp(-np.asarray(b[start:end], np.float64)))
 
         # The gate is per (head, channel): [T, H, K].
         a_seq = np.asarray(a[start:end], np.float64).reshape(query_len, n_v, d_k)
@@ -340,6 +341,18 @@ _SHAPES = (
         distribution=[0, 2, 2],
         n_v=32,
     ),
+    # OLMo 3.5: value heads twice as wide as key heads (256 / 512), one head
+    # per TP8 rank, and beta in [0, 2) (allow_neg_eigval).
+    dict(
+        name="olmo35_heads",
+        max_reqs=3,
+        q_loc=[0, 1, 129, 200],
+        distribution=[1, 3, 3],
+        n_v=1,
+        d_k=256,
+        d_v=512,
+        beta_scale=2.0,
+    ),
 )
 
 # Kimi-Linear-48B sets no bound; every K3 variant sets -5.0.
@@ -365,11 +378,19 @@ def _cases():
 class KdaAttentionV3Test(parameterized.TestCase):
     @parameterized.named_parameters(*_cases())
     def test_kda_matches_the_recurrence(
-        self, max_reqs, q_loc, distribution, gate_lower_bound, n_v=4, prefill_only=False
+        self,
+        max_reqs,
+        q_loc,
+        distribution,
+        gate_lower_bound,
+        n_v=4,
+        d_k=128,
+        d_v=128,
+        beta_scale=1.0,
+        prefill_only=False,
     ):
-        # K3 and Kimi-Linear both run KDA without GQA, so n_kq == n_v.
+        # K3, Kimi-Linear and OLMo 3.5 all run KDA without GQA: n_kq == n_v.
         n_kq = n_v
-        d_k = d_v = 128
         kernel_size = 4
 
         q_loc = jnp.array(q_loc, dtype=jnp.int32)
@@ -421,6 +442,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
             kernel_size=kernel_size,
             attention_mode=config.AttentionMode.KDA,
             gate_lower_bound=gate_lower_bound,
+            beta_scale=beta_scale,
         )
 
         (_, ref_state), ref_out = kda_attention_ref(**common_kwargs)
@@ -435,6 +457,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
                 "kernel_size",
                 "attention_mode",
                 "gate_lower_bound",
+                "beta_scale",
                 "prefill_only",
             ],
         )

@@ -329,6 +329,8 @@ def chunked_kda(
 
     # (seqs, 1, chunk, num_v_heads)
     beta = jax.nn.sigmoid(b_large.astype(jnp.float32))
+    if cfg.beta_scale != 1.0:
+        beta = beta * cfg.beta_scale
     beta = jnp.where(mask, beta, 0.0)
 
     a_log_kda = a_log.reshape(1, -1, 1, 1).astype(jnp.float32)
@@ -447,8 +449,11 @@ def recurrent_kda(
     q = _l2_norm_f32(q) * (cfg.kq_head_dim**-0.5)
     k = _l2_norm_f32(k)
 
-    # Delta rule step-size beta in [0, 1]
-    beta = jnp.where(mask, jax.nn.sigmoid(b_compact.astype(jnp.float32)), 0.0)
+    # Delta rule step-size beta in [0, beta_scale]
+    beta = jax.nn.sigmoid(b_compact.astype(jnp.float32))
+    if cfg.beta_scale != 1.0:
+        beta = beta * cfg.beta_scale
+    beta = jnp.where(mask, beta, 0.0)
     beta = compute_gdn.fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
     beta = beta[:, : cfg.num_v_heads, :, 0, :]
 

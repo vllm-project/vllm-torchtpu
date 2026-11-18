@@ -248,9 +248,9 @@ def _short_conv_tokens(
 
 
 def _gated_output_norm(
-    output: jax.Array,  # [num_rows, H, D]
-    output_gate: jax.Array,  # [num_rows, H * D] raw gate
-    norm_weight: jax.Array,  # [D]
+    output: jax.Array,  # [num_rows, H, V]
+    output_gate: jax.Array,  # [num_rows, H * V] raw gate
+    norm_weight: jax.Array,  # [V]
     eps: float,
     activation_dtype,
 ) -> jax.Array:
@@ -273,28 +273,30 @@ def _check_kda_abi(
     query_start_loc: jax.Array,
     state_indices: jax.Array,
     seq_lens: jax.Array,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     """Validate the shared KDA operand contract; return the shape tuple.
 
     Deliberately the same contract `ragged_kda` enforces, so swapping ops cannot
-    silently change what a caller is allowed to pass.
+    silently change what a caller is allowed to pass. The value head size
+    comes from the recurrent state's last axis: Kimi has it equal to the
+    key head size, OLMo 3.5 twice as wide.
     """
     num_tokens, mixed_dim = mixed_qkv.shape
-    num_heads, head_dim, state_v_dim = recurrent_state.shape[1:]
-    if state_v_dim != head_dim or mixed_dim != 3 * num_heads * head_dim:
+    num_heads, head_dim, head_v_dim = recurrent_state.shape[1:]
+    if mixed_dim != num_heads * (2 * head_dim + head_v_dim):
         raise ValueError("Incompatible KDA activation and state shapes")
     if raw_gate.shape != (num_tokens, num_heads * head_dim):
         raise ValueError("Incompatible KDA gate shape")
     if beta.shape != (num_tokens, num_heads):
         raise ValueError("Incompatible KDA beta shape")
-    if output_gate.shape != (num_tokens, num_heads * head_dim):
+    if output_gate.shape != (num_tokens, num_heads * head_v_dim):
         raise ValueError("Incompatible KDA output-gate shape")
     num_sequences = state_indices.shape[0]
     if a_log.shape != (num_heads,):
         raise ValueError("KDA A_log shape does not match the head count")
     if dt_bias.shape != (num_heads * head_dim,):
         raise ValueError("KDA dt_bias shape does not match the projection")
-    if norm_weight.shape != (head_dim,):
+    if norm_weight.shape != (head_v_dim,):
         raise ValueError("KDA norm weight shape does not match the head size")
     if query_start_loc.shape != (num_sequences + 1,):
         raise ValueError("KDA query starts and state indices disagree")
@@ -316,10 +318,15 @@ def _check_kda_abi(
         or seq_lens.dtype != jnp.int32
     ):
         raise TypeError("KDA metadata tensors must be int32")
-    return num_tokens, num_sequences, num_heads, head_dim
+    return num_tokens, num_sequences, num_heads, head_dim, head_v_dim
 
 
-def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: int = 0):
+def _build_fused_core(
+    lower_bound: float | None,
+    eps: float,
+    num_spec_tokens: int = 0,
+    beta_scale: float = 1.0,
+):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
     The fused kernel replaces the four-stage manual pipeline and
@@ -333,16 +340,16 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
     """
 
     def fused_core(
-        mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
+        mixed_qkv: jax.Array,  # [T, H * (2 * D + V)], pre-convolution
         raw_gate: jax.Array,  # [T, H * D]
         beta: jax.Array,  # [T, H]
-        output_gate: jax.Array,  # [T, H * D]
-        conv_state: jax.Array,  # [num_slots, K - 1, 1, 3 * H * D] or flat 3-D
-        recurrent_state: jax.Array,  # [num_slots, H, K, V]
-        conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
+        output_gate: jax.Array,  # [T, H * V]
+        conv_state: jax.Array,  # [num_slots, K - 1, 1, H * (2D + V)] or flat
+        recurrent_state: jax.Array,  # [num_slots, H, D, V]
+        conv_weight: jax.Array,  # [kernel_size, ...], channels in qkv order
         a_log: jax.Array,  # [H]
         dt_bias: jax.Array,  # [H * D]
-        norm_weight: jax.Array,  # [D]
+        norm_weight: jax.Array,  # [V]
         query_start_loc: jax.Array,  # [N + 1]
         state_indices: jax.Array,  # [N]
         seq_lens: jax.Array,  # [N]
@@ -350,7 +357,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         window_distribution: jax.Array | None = None,
         slot_read_offsets: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        num_tokens, _, num_heads, head_dim = _check_kda_abi(
+        num_tokens, _, num_heads, head_dim, head_v_dim = _check_kda_abi(
             mixed_qkv,
             raw_gate,
             beta,
@@ -406,10 +413,11 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 n_kq=num_heads,
                 n_v=num_heads,
                 d_k=head_dim,
-                d_v=head_dim,
+                d_v=head_v_dim,
                 kernel_size=kernel_size,
                 attention_mode=gdn_config.AttentionMode.KDA,
                 gate_lower_bound=lower_bound,
+                beta_scale=beta_scale,
                 num_spec_tokens=num_spec_tokens,
                 batched_only=batched_only,
                 prefill_only=prefill_only,
@@ -417,7 +425,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
 
         if num_spec_tokens > 0:
             window_end = window_distribution[0]
-            empty_out = jnp.zeros((num_tokens, num_heads * head_dim), mixed_qkv.dtype)
+            empty_out = jnp.zeros((num_tokens, num_heads * head_v_dim), mixed_qkv.dtype)
             (verify_states, verify_out) = _guard_kda_verify_window(
                 window_end,
                 lambda: run_kernel(conv_state, recurrent_state, batched_only=True),
@@ -438,7 +446,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         else:
             (new_conv_state, new_pool), out = run_kernel(conv_state, recurrent_state)
 
-        output = out.reshape(num_tokens, num_heads, head_dim)
+        output = out.reshape(num_tokens, num_heads, head_v_dim)
         output = _gated_output_norm(
             output, output_gate, norm_weight, eps, mixed_qkv.dtype
         )
@@ -454,9 +462,10 @@ def build_kimi_dispatched_kda_op(
     eps: float,
     state_dim_first: bool,
     num_spec_tokens: int = 0,
+    beta_scale: float = 1.0,
 ):
     """Build fused KDA with separately guarded speculative and prefill segments."""
-    core = _build_fused_core(lower_bound, eps, num_spec_tokens)
+    core = _build_fused_core(lower_bound, eps, num_spec_tokens, beta_scale)
     variant = "fused_window" if num_spec_tokens else "fused"
     logger.info("KDA op %s: using the %s GDN v3 path.", prefix, variant)
     op_name = f"pallas::kimi_dispatched_kda_{variant}_{prefix.replace('.', '_')}"
@@ -472,9 +481,9 @@ def build_kimi_dispatched_kda_op(
         *args,
         **kwargs,
     ):
-        num_heads, head_dim = recurrent_state.shape[1:3]
+        num_heads, head_v_dim = recurrent_state.shape[1], recurrent_state.shape[3]
         output = torch.empty(
-            (mixed_qkv.size(0), num_heads, head_dim),
+            (mixed_qkv.size(0), num_heads, head_v_dim),
             dtype=mixed_qkv.dtype,
             device=mixed_qkv.device,
         )

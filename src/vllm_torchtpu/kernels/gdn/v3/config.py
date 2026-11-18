@@ -65,6 +65,10 @@ class GDNConfig:
     # KDA only, and must be negative. Selects the bounded gate form over the
     # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
     gate_lower_bound: float | None = None
+    # KDA only. Multiplies the delta-rule step size: beta = beta_scale *
+    # sigmoid(b). 1.0 keeps beta in [0, 1]; OLMo 3.5's KDA trains with
+    # allow_neg_eigval, i.e. 2.0 and beta in [0, 2).
+    beta_scale: float = 1.0
     num_buffers: int = 2
     # Max tokens per speculative verify window (= num_speculative_tokens + 1),
     # which is also the number of state checkpoints kept per sequence. The
@@ -188,6 +192,8 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
+        if self.is_kda and self.beta_scale != 1.0:
+            suffix += "_beta_scaled"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
