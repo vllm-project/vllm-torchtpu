@@ -27,7 +27,8 @@ Optional extensions, disabled by default:
   FP8 with a caller-supplied static scale (`fp8_wire.quantize`).
 * ``reduce_scatter_epilogue_stream_local``: runs ``residual_epilogue`` on each
   reduced block while it is still in VMEM, returning the updated residual rows
-  and, optionally, the FP8-quantized next RMSNorm rows and scales. With
+  and, optionally, the next RMSNorm rows (FP8 + scales by default, or
+  unquantized bf16 with ``next_act_dtype=jnp.bfloat16``). With
   ``fp8_wire=True``, inter-chip steps quantize to FP8 with one dynamic bf16
   scale per column of each half block packed behind the payload columns.
 """
@@ -120,7 +121,9 @@ def supports_stream(rows: Any, hidden: int, itemsize: int) -> bool:
     )
 
 
-def _epilogue_vmem_bytes(hidden: int, lanes: int, *, wire: _WireMode) -> int:
+def _epilogue_vmem_bytes(
+    hidden: int, lanes: int, *, wire: _WireMode, next_act_dtype: Any
+) -> int:
     shapes = _vmem_shapes(
         hidden,
         jnp.bfloat16,
@@ -129,6 +132,7 @@ def _epilogue_vmem_bytes(hidden: int, lanes: int, *, wire: _WireMode) -> int:
         num_chips=4,
         residual=True,
         rows_out=True,
+        next_act_dtype=next_act_dtype,
     )
     scratch = sum(
         0 if item is None else math.prod(item[0]) * jnp.dtype(item[1]).itemsize
@@ -140,34 +144,60 @@ def _epilogue_vmem_bytes(hidden: int, lanes: int, *, wire: _WireMode) -> int:
     return scratch + weight_bytes
 
 
-_EPILOGUE_HIDDEN_SUPPORT: dict[int, bool] = {}
+_EPILOGUE_HIDDEN_SUPPORT: dict[tuple[int, bool], bool] = {}
 
 
-def supports_stream_epilogue_hidden(hidden: int) -> bool:
+def _is_fp8_next_act_dtype(next_act_dtype: Any) -> bool:
+    """Returns True for `float8_e4m3fn`, False for `bfloat16`, else raises.
+
+    Identity checks avoid calling `jnp.dtype` or comparing `ml_dtypes` objects
+    during TorchDynamo fullgraph tracing.
+    """
+    if next_act_dtype is jnp.float8_e4m3fn:
+        return True
+    if next_act_dtype is jnp.bfloat16:
+        return False
+    next_dtype = jnp.dtype(next_act_dtype)
+    if next_dtype == jnp.dtype(jnp.float8_e4m3fn):
+        return True
+    if next_dtype == jnp.dtype(jnp.bfloat16):
+        return False
+    raise ValueError(f"Unsupported next_act_dtype: {next_act_dtype}")
+
+
+def supports_stream_epilogue_hidden(
+    hidden: int, next_act_dtype: Any = jnp.float8_e4m3fn
+) -> bool:
     """Whether `hidden` fits VMEM and lane alignment for the epilogue kernel."""
-    supported = _EPILOGUE_HIDDEN_SUPPORT.get(hidden)
+    is_fp8 = _is_fp8_next_act_dtype(next_act_dtype)
+    cache_key = (hidden, is_fp8)
+    supported = _EPILOGUE_HIDDEN_SUPPORT.get(cache_key)
     if supported is not None:
         return supported
     lanes = int(tpu_info().num_lanes)
     if hidden % lanes != 0:
         supported = False
     else:
+        next_dtype = jnp.float8_e4m3fn if is_fp8 else jnp.bfloat16
         vmem_bytes = max(
-            _epilogue_vmem_bytes(hidden, lanes, wire=_WireMode.BF16),
-            _epilogue_vmem_bytes(hidden, lanes, wire=_WireMode.FP8_PACKET),
+            _epilogue_vmem_bytes(hidden, lanes, wire=wire, next_act_dtype=next_dtype)
+            for wire in (_WireMode.BF16, _WireMode.FP8_PACKET)
         )
         supported = vmem_bytes <= epilogue_vmem_limit_bytes() - _VMEM_HEADROOM_BYTES
-    _EPILOGUE_HIDDEN_SUPPORT[hidden] = supported
+    _EPILOGUE_HIDDEN_SUPPORT[cache_key] = supported
     return supported
 
 
 def supports_stream_epilogue(
-    rows: Any, hidden: int, num_devices: int = _NUM_DEVICES
+    rows: Any,
+    hidden: int,
+    num_devices: int = _NUM_DEVICES,
+    next_act_dtype: Any = jnp.float8_e4m3fn,
 ) -> bool:
     """Whether `[rows, hidden]` fits the streaming reduce-scatter + epilogue."""
-    return supports_stream_epilogue_hidden(hidden) and _has_aligned_stream_rows(
-        rows, num_devices
-    )
+    return supports_stream_epilogue_hidden(
+        hidden, next_act_dtype=next_act_dtype
+    ) and _has_aligned_stream_rows(rows, num_devices)
 
 
 def _packet_cols(hidden: int, lanes: int) -> tuple[int, int, int]:
@@ -242,12 +272,16 @@ def _kernel(
     inv_scale: float,
     eps: float,
     num_chips: int,
+    quantize_next: bool,
 ):
     if next_norm_ref is None:
         o_ref, *scratch = out_and_scratch
         next_out_ref = xs_ref = None
-    else:
+    elif quantize_next:
         o_ref, next_out_ref, xs_ref, *scratch = out_and_scratch
+    else:
+        o_ref, next_out_ref, *scratch = out_and_scratch
+        xs_ref = None
     (
         sums,
         p1_recv_buf,
@@ -270,7 +304,7 @@ def _kernel(
         # None without an epilogue.
         residual_buf,
         residual_sem,
-        # None unless the epilogue returns next-norm rows.
+        # None unless the epilogue returns next-norm rows; xs_* None on bf16.
         next_out_buf,
         xs_buf,
         next_out_sem,
@@ -357,17 +391,20 @@ def _kernel(
                 sums.at[sl, chip], o_ref.at[out_rows(blk), :], store_sem.at[sl]
             )
         ]
-        if next_out_ref is not None and xs_ref is not None:
-            copies += [
+        if next_out_ref is not None:
+            copies.append(
                 pltpu.make_async_copy(
                     next_out_buf.at[sl],
                     next_out_ref.at[out_rows(blk), :],
                     next_out_sem.at[sl],
-                ),
+                )
+            )
+        if xs_ref is not None:
+            copies.append(
                 pltpu.make_async_copy(
                     xs_buf.at[sl], xs_ref.at[out_rows(blk), :], xs_sem.at[sl]
-                ),
-            ]
+                )
+            )
         return copies
 
     def wait_stores(blk, sl):
@@ -482,18 +519,25 @@ def _kernel(
 
         if residual_ref is not None:
             load_residual(blk, sl).wait()
-            rows_out, x_q, x_scale = residual_epilogue.apply_residual_epilogue(
+            rows_out, x_next, x_scale = residual_epilogue.apply_residual_epilogue(
                 sums.at[sl, chip][...],
                 residual_buf.at[sl][...],
                 post_norm_weight=None if post_norm_ref is None else post_norm_ref[...],
                 scale=None if scale_ref is None else scale_ref[...],
                 next_norm_weight=None if next_norm_ref is None else next_norm_ref[...],
                 eps=eps,
+                next_act_dtype=jnp.float8_e4m3fn if quantize_next else jnp.bfloat16,
             )
             sums.at[sl, chip][...] = rows_out
-            if x_q is not None and x_scale is not None:
-                next_out_buf.at[sl][...] = lax.bitcast_convert_type(x_q, jnp.uint8)
-                xs_buf.at[sl][...] = jnp.broadcast_to(x_scale, (block_rows, lanes))
+            if x_next is not None:
+                if quantize_next:
+                    assert x_scale is not None
+                    next_out_buf.at[sl][...] = lax.bitcast_convert_type(
+                        x_next, jnp.uint8
+                    )
+                    xs_buf.at[sl][...] = jnp.broadcast_to(x_scale, (block_rows, lanes))
+                else:
+                    next_out_buf.at[sl][...] = x_next
 
         for copy in stores(blk, sl):
             copy.start()
@@ -558,6 +602,7 @@ def _vmem_shapes(
     num_chips: int = 4,
     residual: bool,
     rows_out: bool,
+    next_act_dtype: Any = jnp.float8_e4m3fn,
 ) -> list[tuple[tuple[int, ...], Any] | None]:
     """VMEM scratch `(shape, dtype)` entries in `_kernel` parameter order."""
     two_step = num_chips == 4
@@ -574,6 +619,8 @@ def _vmem_shapes(
     s0_wire = (_SLOTS, 2, 2, _HALF_ROWS, wire_cols)
     s1_wire = (_SLOTS, 2, _HALF_ROWS, wire_cols)
     block = (_SLOTS, _ROW_BLOCK, hidden)
+    quantize_next = jnp.dtype(next_act_dtype) == jnp.float8_e4m3fn
+    next_buf_dtype = jnp.uint8 if quantize_next else dtype
     return [
         ((_SLOTS, num_chips, _ROW_BLOCK, hidden), dtype),
         ((_SLOTS, num_chips, _ROW_BLOCK, hidden), dtype),
@@ -582,8 +629,10 @@ def _vmem_shapes(
         (s0_wire, wire_dtype) if (two_step and uses_send_pkt) else None,
         (s1_wire, wire_dtype) if uses_send_pkt else None,
         (block, dtype) if residual else None,
-        (block, jnp.uint8) if rows_out else None,
-        ((_SLOTS, _ROW_BLOCK, lanes), jnp.float32) if rows_out else None,
+        (block, next_buf_dtype) if rows_out else None,
+        ((_SLOTS, _ROW_BLOCK, lanes), jnp.float32)
+        if (rows_out and quantize_next)
+        else None,
     ]
 
 
@@ -596,9 +645,11 @@ def _scratch(
     num_chips: int = 4,
     residual: bool,
     rows_out: bool,
+    next_act_dtype: Any = jnp.float8_e4m3fn,
 ) -> list[Any]:
     """Scratch shapes in `_kernel` parameter order (`None` when unused)."""
     two_step = num_chips == 4
+    quantize_next = jnp.dtype(next_act_dtype) == jnp.float8_e4m3fn
     vmem = [
         None if item is None else pltpu.VMEM(*item)
         for item in _vmem_shapes(
@@ -609,6 +660,7 @@ def _scratch(
             num_chips=num_chips,
             residual=residual,
             rows_out=rows_out,
+            next_act_dtype=next_act_dtype,
         )
     ]
     dma = pltpu.SemaphoreType.DMA
@@ -630,7 +682,7 @@ def _scratch(
         dma((_SLOTS,)) if residual else None,
         *vmem[7:],
         dma((_SLOTS,)) if rows_out else None,
-        dma((_SLOTS,)) if rows_out else None,
+        dma((_SLOTS,)) if (rows_out and quantize_next) else None,
     ]
 
 
@@ -646,6 +698,7 @@ def _call(
     order: tuple[int, ...] | None,
     wire: _WireMode,
     fp8_static_scale: float = 16.0,
+    next_act_dtype: Any = jnp.float8_e4m3fn,
 ) -> Any:
     rows_per_device, hidden = local_x.shape
     lanes = int(tpu_info().num_lanes)
@@ -658,6 +711,8 @@ def _call(
     assert wire != _WireMode.FP8_PACKET or hidden % lanes == 0, (
         f"hidden {hidden} with fp8_wire"
     )
+    quantize_next = _is_fp8_next_act_dtype(next_act_dtype)
+    next_dtype = jnp.float8_e4m3fn if quantize_next else jnp.bfloat16
     chunk_rows = rows_per_device // num_devices
     num_blocks = chunk_rows // _ROW_BLOCK
     dtype = local_x.dtype
@@ -699,23 +754,30 @@ def _call(
         inv_scale=fp8_static_scale,
         eps=eps,
         num_chips=num_chips,
+        quantize_next=quantize_next,
     )
     name = f"hier_rs_stream_r{_ROW_BLOCK}"
     name += "" if num_devices == _NUM_DEVICES else f"_d{num_devices}"
     name += "_fp8" if wire != _WireMode.BF16 else ""
     name += "_epilogue" if residual is not None else ""
+    name += "_bf16next" if (rows_out and not quantize_next) else ""
+    if not rows_out:
+        out_shape: Any = out
+        out_specs: Any = hbm
+    elif quantize_next:
+        out_shape = (
+            out,
+            jax.ShapeDtypeStruct((chunk_rows, hidden), jnp.uint8),
+            jax.ShapeDtypeStruct((chunk_rows, lanes), jnp.float32),
+        )
+        out_specs = (hbm, hbm, hbm)
+    else:
+        out_shape = (out, out)
+        out_specs = (hbm, hbm)
     vmem_limit = _VMEM_LIMIT_BYTES if residual is None else epilogue_vmem_limit_bytes()
     return pl.pallas_call(
         kernel,
-        out_shape=(
-            (
-                out,
-                jax.ShapeDtypeStruct((chunk_rows, hidden), jnp.uint8),
-                jax.ShapeDtypeStruct((chunk_rows, lanes), jnp.float32),
-            )
-            if rows_out
-            else out
-        ),
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
@@ -723,7 +785,7 @@ def _call(
                 None if residual is None else hbm,
                 *(None if w is None else vmem for w in operands[2:]),
             ],
-            out_specs=(hbm, hbm, hbm) if rows_out else hbm,
+            out_specs=out_specs,
             scratch_shapes=_scratch(
                 hidden,
                 dtype,
@@ -732,6 +794,7 @@ def _call(
                 num_chips=num_chips,
                 residual=residual is not None,
                 rows_out=rows_out,
+                next_act_dtype=next_dtype,
             ),
             grid=(num_blocks,),
         ),
@@ -784,17 +847,23 @@ def reduce_scatter_epilogue_stream_local(
     axis_name: str = "x",
     order: tuple[int, ...] | None = None,
     fp8_wire: bool = False,
+    next_act_dtype: Any = jnp.float8_e4m3fn,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
     """`reduce_scatter_stream_local` fused with `apply_residual_epilogue` per block.
 
     `residual` holds this device's `[rows // num_devices, hidden]` rows.
-    Returns updated residual rows and, when `next_norm_weight` is provided, FP8
-    next-norm rows (`uint8`) plus `f32[rows // num_devices, 1]` row scales.
+    Returns updated residual rows and, when `next_norm_weight` is provided,
+    either FP8 next-norm rows (`uint8`) plus `f32[rows // num_devices, 1]` row
+    scales (`float8_e4m3fn`) or unquantized `bf16` rows with `None` scale
+    (`bfloat16`).
     """
     num_devices = _NUM_DEVICES if order is None else len(order)
-    assert supports_stream_epilogue(local_x.shape[0], local_x.shape[1], num_devices), (
-        f"{local_x.shape[0]} x {local_x.shape[1]} per device over {num_devices}"
-    )
+    assert supports_stream_epilogue(
+        local_x.shape[0],
+        local_x.shape[1],
+        num_devices,
+        next_act_dtype=next_act_dtype,
+    ), f"{local_x.shape[0]} x {local_x.shape[1]} per device over {num_devices}"
     out = _call(
         local_x,
         residual,
@@ -805,9 +874,13 @@ def reduce_scatter_epilogue_stream_local(
         axis_name=axis_name,
         order=order,
         wire=_WireMode.FP8_PACKET if fp8_wire else _WireMode.BF16,
+        next_act_dtype=next_act_dtype,
     )
     if next_norm_weight is None:
         return out, None, None
+    if jnp.dtype(next_act_dtype) == jnp.bfloat16:
+        rows_out, x_norm = out
+        return rows_out, x_norm, None
     rows_out, x_q, x_scale = out
     # VMEM->HBM async DMA requires lane-width minor dims; slice column 0.
     return rows_out, x_q, x_scale[:, :1]

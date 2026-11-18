@@ -92,11 +92,21 @@ _EPS = 1e-6
 
 
 def _reduce_scatter_epilogue(
-    x, residual, post_norm_weight, scale, next_norm_weight, *, mesh, order, fp8_wire
+    x,
+    residual,
+    post_norm_weight,
+    scale,
+    next_norm_weight,
+    *,
+    mesh,
+    order,
+    fp8_wire,
+    next_act_dtype=jnp.float8_e4m3fn,
 ):
     """Outputs are stacked by mesh index."""
     axis = mesh.axis_names[0]
     sharded, replicated = P(axis, None), P()
+    quantize_next = jnp.dtype(next_act_dtype) == jnp.float8_e4m3fn
 
     def local(x, residual, post_norm_weight, scale, next_norm_weight):
         out = kernel_stream.reduce_scatter_epilogue_stream_local(
@@ -109,14 +119,22 @@ def _reduce_scatter_epilogue(
             axis_name=axis,
             order=order,
             fp8_wire=fp8_wire,
+            next_act_dtype=next_act_dtype,
         )
-        return out[0] if next_norm_weight is None else out
+        if next_norm_weight is None:
+            return out[0]
+        return out if quantize_next else out[:2]
 
+    out_specs = (
+        sharded
+        if next_norm_weight is None
+        else ((sharded,) * 3 if quantize_next else (sharded, sharded))
+    )
     return jax.shard_map(
         local,
         mesh=mesh,
         in_specs=(sharded, sharded, replicated, replicated, replicated),
-        out_specs=sharded if next_norm_weight is None else (sharded,) * 3,
+        out_specs=out_specs,
         check_vma=False,
     )(x, residual, post_norm_weight, scale, next_norm_weight)
 
@@ -788,9 +806,10 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
         order=[(0, 1, 2, 3), (2, 3, 0, 1)],
         fp8_wire=[False, True],
         rows_per_device=[4 * 128, 4 * 512],
+        next_act_dtype=[jnp.float8_e4m3fn, jnp.bfloat16],
     )
     def test_stream_epilogue_two_chips_matches_reference(
-        self, order, fp8_wire, rows_per_device
+        self, order, fp8_wire, rows_per_device, next_act_dtype
     ):
         """Four devices (two chips, one inter-chip step), 1 and 4 blocks per device."""
         self._requires_devices(4)
@@ -821,6 +840,7 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
                 mesh=mesh,
                 order=order,
                 fp8_wire=fp8_wire,
+                next_act_dtype=next_act_dtype,
             )
             return [np.asarray(a) for a in out]
 
@@ -833,15 +853,97 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
         snr = _snr_db(jnp.asarray(ref), jnp.asarray(got - ref))
         self.assertGreater(snr, min_snr, msg=f"residual SNR {snr:.1f} dB")
 
-        _, x_q, x_scale = first
-        self.assertEqual(x_q.shape, (rows_per_device, hidden))
-        self.assertEqual(x_scale.shape, (rows_per_device, 1))
         expected = _rms_norm(got, np.asarray(next_norm_weight, np.float32))
-        dequantized = (
-            np.asarray(x_q.view(jnp.float8_e4m3fn), np.float32) * x_scale
-        ).reshape(n, chunk, hidden)
-        snr = _snr_db(jnp.asarray(expected), jnp.asarray(dequantized - expected))
-        self.assertGreater(snr, _MIN_FP8_SNR_DB, msg=f"FP8 rows SNR {snr:.1f} dB")
+        if next_act_dtype == jnp.bfloat16:
+            _, x_norm = first
+            self.assertEqual(x_norm.dtype, jnp.bfloat16)
+            self.assertEqual(x_norm.shape, (rows_per_device, hidden))
+            got_norm = x_norm.astype(np.float32).reshape(n, chunk, hidden)
+            snr = _snr_db(jnp.asarray(expected), jnp.asarray(got_norm - expected))
+            self.assertGreater(snr, _MIN_BF16_SNR_DB, msg=f"bf16 norm SNR {snr:.1f} dB")
+        else:
+            _, x_q, x_scale = first
+            self.assertEqual(x_q.shape, (rows_per_device, hidden))
+            self.assertEqual(x_scale.shape, (rows_per_device, 1))
+            dequantized = (
+                np.asarray(x_q.view(jnp.float8_e4m3fn), np.float32) * x_scale
+            ).reshape(n, chunk, hidden)
+            snr = _snr_db(jnp.asarray(expected), jnp.asarray(dequantized - expected))
+            self.assertGreater(snr, _MIN_FP8_SNR_DB, msg=f"FP8 rows SNR {snr:.1f} dB")
+
+        for a, b in zip(first, run()):
+            self.assertTrue(
+                np.array_equal(a.view(np.uint8), b.view(np.uint8)),
+                msg="two runs on identical input disagree -- race, not precision",
+            )
+
+    @parameterized.product(
+        order=[tuple(range(8)), _TPU7X_RANK_AT_MESH_INDEX],
+        fp8_wire=[False, True],
+        post_norm=[False, True],
+        with_scale=[False, True],
+    )
+    def test_stream_epilogue_unquantized_next_norm(
+        self, order, fp8_wire, post_norm, with_scale
+    ):
+        """`next_act_dtype=jnp.bfloat16` returns bf16 next-norm rows matching ref."""
+        self._requires_devices(8)
+        axis_name, hidden, n, rows_per_device = "x", 1024, 8, 4096
+        chunk = rows_per_device // n
+        mesh = _make_mesh(n, axis_name)
+        sharding = jax.sharding.NamedSharding(mesh, P(axis_name, None))
+        seed = 100 + order[2] + 2 * fp8_wire + 4 * post_norm + 8 * with_scale
+        keys = jax.random.split(jax.random.key(seed), 4)
+        x = jax.random.normal(
+            keys[0], (n * rows_per_device, hidden), dtype=jnp.bfloat16
+        )
+        residual = jax.random.normal(keys[1], (n * chunk, hidden), dtype=jnp.bfloat16)
+
+        def weight(key):
+            return 1.0 + 0.1 * jax.random.normal(key, (hidden,), dtype=jnp.bfloat16)
+
+        post_norm_weight = weight(keys[2]) if post_norm else None
+        next_norm_weight = weight(keys[3])
+        scale = jnp.asarray([0.75], jnp.bfloat16) if with_scale else None
+
+        def run():
+            out = _reduce_scatter_epilogue(
+                jax.device_put(x, sharding),
+                jax.device_put(residual, sharding),
+                post_norm_weight,
+                scale,
+                next_norm_weight,
+                mesh=mesh,
+                order=order,
+                fp8_wire=fp8_wire,
+                next_act_dtype=jnp.bfloat16,
+            )
+            return [np.asarray(a) for a in out]
+
+        first = run()
+        ref = np.asarray(x, np.float32).reshape(n, n, chunk, hidden).sum(axis=0)
+        ref = ref[list(order)]
+        if post_norm:
+            ref = _rms_norm(ref, np.asarray(post_norm_weight, np.float32))
+        ref = ref + np.asarray(residual, np.float32).reshape(n, chunk, hidden)
+        if with_scale:
+            ref = ref * 0.75
+        got, x_norm = first
+        self.assertEqual(x_norm.dtype, jnp.bfloat16)
+        self.assertEqual(x_norm.shape, (rows_per_device, hidden))
+        got_f32 = got.astype(np.float32).reshape(n, chunk, hidden)
+        min_snr = _MIN_FP8_SNR_DB if fp8_wire else _MIN_BF16_SNR_DB
+        snr = _snr_db(jnp.asarray(ref), jnp.asarray(got_f32 - ref))
+        self.assertGreater(snr, min_snr, msg=f"residual SNR {snr:.1f} dB")
+
+        expected_norm = _rms_norm(got_f32, np.asarray(next_norm_weight, np.float32))
+        got_norm = x_norm.astype(np.float32).reshape(n, chunk, hidden)
+        norm_snr = _snr_db(
+            jnp.asarray(expected_norm), jnp.asarray(got_norm - expected_norm)
+        )
+        self.assertGreater(
+            norm_snr, _MIN_BF16_SNR_DB, msg=f"bf16 norm SNR {norm_snr:.1f} dB"
+        )
 
         for a, b in zip(first, run()):
             self.assertTrue(

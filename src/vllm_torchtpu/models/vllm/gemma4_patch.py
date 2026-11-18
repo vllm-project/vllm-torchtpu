@@ -16,17 +16,18 @@
 When `use_sequence_parallel` admits a padded token bucket (`>=
 MIN_TOKENS_PER_RANK` tokens per TP rank, TP-divisible, during backbone warmup),
 each sublayer reduce-scatters its `o_proj` / `down_proj` partial sum along the
-token axis, runs RMSNorms, residual adds, and FP8 activation quantization on
-`num_tokens // tp_size` tokens per rank, and all-gathers 1-byte FP8 rows plus
-f32 row scales into `qkv_proj` / `gate_up_proj`. Layer 0 slices its token shard
-from the replicated embedding output and the final layer all-gathers the
-residual back to `[num_tokens, H]`.
+token axis, runs RMSNorms, residual adds, and (on FP8 linears) FP8 activation
+quantization on `num_tokens // tp_size` tokens per rank, and all-gathers the
+inputs (1-byte FP8 rows plus f32 row scales, or bf16 rows on unquantized
+linears) into `qkv_proj` / `gate_up_proj`. Layer 0 slices its token shard from
+the replicated embedding output and the final layer all-gathers the residual
+back to `[num_tokens, H]`.
 
 When `TPU_DENSE_SP_HIER_RS=bf16|fp8` is set on a 4- or 8-TensorCore tpu7x TP
 group, buckets `>= 128 * tp_size` fuse each reduce-scatter and its
-residual/RMSNorm/FP8 epilogue in the streaming kernel, while at `TP=8` aligned
-buckets in `256 <= tokens < 1024` fuse reduce-scatter, the epilogue, and the
-rank-ordered FP8 all-gather in a single-shot VMEM kernel.
+residual/RMSNorm epilogue in the streaming kernel, while (on FP8 linears) at
+`TP=8` aligned buckets in `256 <= tokens < 1024` fuse reduce-scatter, the
+epilogue, and the rank-ordered FP8 all-gather in a single-shot VMEM kernel.
 
 `_attention_partial_sum`, `_sequence_parallel_forward`, and
 `_fused_sequence_parallel_forward` are adapted from upstream vLLM
@@ -36,10 +37,9 @@ rank-ordered FP8 all-gather in a single-shot VMEM kernel.
   buckets delegate directly to upstream `Gemma4DecoderLayer.forward`, while
   the sequence-parallel forwards invoke `quant_method.apply(..., None)`
   followed by `reduce_scatter` (or the fused hierarchical kernel).
-- `qkv_proj` and `gate_up_proj` consume pre-quantized FP8 rows gathered across
-  TP ranks (`k_eq_v` global-attention layers load `K` weights into both `K` and
-  `V` slots of `QKVParallelLinear` upstream, so `[q_size, kv_size, kv_size]`
-  holds).
+- `qkv_proj` and `gate_up_proj` consume gathered rows across TP ranks (`k_eq_v`
+  global-attention layers load `K` weights into both `K` and `V` slots of
+  `QKVParallelLinear` upstream, so `[q_size, kv_size, kv_size]` holds).
 - Layer 0 applies `replicated_tokens` (all-reduce) or `slice_token_shard`
   (sequence-parallel) using a per-rank int32 buffer `_tpu_sp_tp_rank` so all
   paths lift identical Dynamo symbolic inputs and all TP ranks trace one graph
@@ -81,6 +81,9 @@ logger = init_logger(__name__)
 _orig_layer_init = Gemma4DecoderLayer.__init__
 _orig_layer_forward = Gemma4DecoderLayer.forward
 _CarriedSublayerTail = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+# Expected next-activation dtype across layers of the model currently being
+# constructed; reset on layer 0 so mixed FP8/bf16 checkpoints fail fast.
+_MODEL_NEXT_ACT_DTYPE: torch.dtype | None = None
 
 
 @dataclass(frozen=True)
@@ -136,8 +139,29 @@ def _configure_layer(
                 "tpu_dense_sequence_parallel requires row-parallel o_proj and "
                 "down_proj with input_is_parallel=True and a quant_method"
             )
-    dense_sequence_parallel.validate_fp8_linear_for_sp(layer.self_attn.qkv_proj)
-    dense_sequence_parallel.validate_fp8_linear_for_sp(layer.mlp.gate_up_proj)
+    dense_sequence_parallel.validate_linear_for_sp(layer.self_attn.qkv_proj)
+    dense_sequence_parallel.validate_linear_for_sp(layer.mlp.gate_up_proj)
+    unquant_qkv = dense_sequence_parallel.is_unquantized_linear(
+        layer.self_attn.qkv_proj
+    )
+    unquant_mlp = dense_sequence_parallel.is_unquantized_linear(layer.mlp.gate_up_proj)
+    if unquant_qkv != unquant_mlp:
+        raise NotImplementedError(
+            "tpu_dense_sequence_parallel requires qkv_proj and gate_up_proj to "
+            "use the same quantization"
+        )
+    next_act_dtype = torch.bfloat16 if unquant_qkv else torch.float8_e4m3fn
+    # Fused collectives carry each layer's un-reduced down_proj tail into the
+    # next layer, so every layer in a model must agree on quantization (and
+    # therefore on whether single-shot decode and streaming VMEM limits arm).
+    global _MODEL_NEXT_ACT_DTYPE
+    if layer.layer_idx == 0:
+        _MODEL_NEXT_ACT_DTYPE = next_act_dtype
+    elif _MODEL_NEXT_ACT_DTYPE is not None and next_act_dtype != _MODEL_NEXT_ACT_DTYPE:
+        raise NotImplementedError(
+            "tpu_dense_sequence_parallel requires all decoder layers to "
+            "use the same quantization"
+        )
     _validate_layer_norms(layer)
     fp8_linear_op.register_fp8_linear_ops()
     if layer.layer_idx == 0:
@@ -156,11 +180,13 @@ def _configure_layer(
         hidden = layer.input_layernorm.weight.shape[0]
         eps = layer.input_layernorm.variance_epsilon
         if fused_rs_epilogue_op.supports_streaming_sublayer(
-            fused_rs_epilogue_op.MIN_STREAMING_RS_TOKENS, hidden
+            fused_rs_epilogue_op.MIN_STREAMING_RS_TOKENS,
+            hidden,
+            next_act_dtype=next_act_dtype,
         ):
             streaming_collectives = (
                 fused_rs_epilogue_op.build_streaming_sublayer_collectives(
-                    eps, fp8_wire=payload == "fp8"
+                    eps, fp8_wire=payload == "fp8", next_act_dtype=next_act_dtype
                 )
             )
         else:
@@ -170,21 +196,22 @@ def _configure_layer(
                 payload,
                 hidden,
             )
-        if fused_rs_epilogue_op.supports_oneshot_sublayer(
-            fused_rs_epilogue_op.MIN_ONESHOT_RS_AG_TOKENS, hidden, tp_size
-        ):
-            oneshot_collectives = (
-                fused_rs_epilogue_op.build_oneshot_sublayer_collectives(eps)
-            )
-        elif tp_size in fused_rs_epilogue_op.ONESHOT_SUPPORTED_TP_SIZES:
-            logger.warning_once(
-                "TPU_DENSE_SP_HIER_RS=%s is set, but hidden=%d does not fit "
-                "the single-shot decode kernel; keeping XLA all-reduce below "
-                "%d tokens.",
-                payload,
-                hidden,
-                dense_sequence_parallel.MIN_TOKENS_PER_RANK * tp_size,
-            )
+        if not unquant_qkv:
+            if fused_rs_epilogue_op.supports_oneshot_sublayer(
+                fused_rs_epilogue_op.MIN_ONESHOT_RS_AG_TOKENS, hidden, tp_size
+            ):
+                oneshot_collectives = (
+                    fused_rs_epilogue_op.build_oneshot_sublayer_collectives(eps)
+                )
+            elif tp_size in fused_rs_epilogue_op.ONESHOT_SUPPORTED_TP_SIZES:
+                logger.warning_once(
+                    "TPU_DENSE_SP_HIER_RS=%s is set, but hidden=%d does not fit "
+                    "the single-shot decode kernel; keeping XLA all-reduce below "
+                    "%d tokens.",
+                    payload,
+                    hidden,
+                    dense_sequence_parallel.MIN_TOKENS_PER_RANK * tp_size,
+                )
     cast("Any", layer)._tpu_dense_sp_num_layers = (
         num_hidden_layers
         if num_hidden_layers is not None
@@ -265,7 +292,7 @@ def _sequence_parallel_forward(
             attn.o_proj.tp_size,
         )
     residual = hidden_states
-    qkv = dense_sequence_parallel.quantize_all_gather_linear(
+    qkv = dense_sequence_parallel.all_gather_linear(
         attn.qkv_proj, layer.input_layernorm(residual), num_tokens
     )
     hidden_states = tensor_model_parallel_reduce_scatter(
@@ -275,7 +302,7 @@ def _sequence_parallel_forward(
     hidden_states = hidden_states + residual
     residual = hidden_states
 
-    gate_up = dense_sequence_parallel.quantize_all_gather_linear(
+    gate_up = dense_sequence_parallel.all_gather_linear(
         layer.mlp.gate_up_proj,
         layer.pre_feedforward_layernorm(hidden_states),
         num_tokens,
@@ -293,19 +320,25 @@ def _sequence_parallel_forward(
     return hidden_states
 
 
-def _apply_quantized_linear(
+def _run_fused_next_linear(
     linear: LinearBase,
-    x_q: torch.Tensor,
-    x_scale: torch.Tensor,
+    epilogue_outputs: tuple[torch.Tensor, ...],
     num_tokens: int | torch.SymInt,
-    *,
-    outputs_gathered: bool,
-) -> torch.Tensor:
-    if not outputs_gathered:
-        return dense_sequence_parallel.all_gather_prequantized_fp8_linear(
+    collectives: fused_rs_epilogue_op.FusedSublayerCollectives,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if collectives.next_act_dtype == torch.bfloat16:
+        residual, x_norm = epilogue_outputs
+        return residual, dense_sequence_parallel.all_gather_linear(
+            linear, x_norm, num_tokens
+        )
+    residual, x_q, x_scale = epilogue_outputs
+    if not collectives.outputs_gathered:
+        return residual, dense_sequence_parallel.all_gather_prequantized_fp8_linear(
             linear, x_q, x_scale, num_tokens
         )
-    return dense_sequence_parallel.apply_prequantized_fp8_linear(linear, x_q, x_scale)
+    return residual, dense_sequence_parallel.apply_prequantized_fp8_linear(
+        linear, x_q, x_scale
+    )
 
 
 def _fused_sequence_parallel_forward(
@@ -339,38 +372,34 @@ def _fused_sequence_parallel_forward(
                 layer.input_layernorm(hidden_states.narrow(0, 0, num_tokens))
             )
         else:
-            qkv = dense_sequence_parallel.quantize_all_gather_linear(
+            qkv = dense_sequence_parallel.all_gather_linear(
                 attn.qkv_proj, layer.input_layernorm(residual), num_tokens
             )
     else:
         residual, post_norm_weight, scale = carried
-        residual, x_q, x_scale = collectives.norm_add_scale_next_norm(
-            hidden_states,
-            residual,
-            post_norm_weight,
-            scale,
-            layer.input_layernorm.weight,
-        )
-        qkv = _apply_quantized_linear(
+        residual, qkv = _run_fused_next_linear(
             attn.qkv_proj,
-            x_q,
-            x_scale,
+            collectives.norm_add_scale_next_norm(
+                hidden_states,
+                residual,
+                post_norm_weight,
+                scale,
+                layer.input_layernorm.weight,
+            ),
             num_tokens,
-            outputs_gathered=collectives.outputs_gathered,
+            collectives,
         )
 
-    residual, x_q, x_scale = collectives.norm_add_next_norm(
-        _attention_partial_sum(attn, positions, qkv),
-        residual,
-        layer.post_attention_layernorm.weight,
-        layer.pre_feedforward_layernorm.weight,
-    )
-    gate_up = _apply_quantized_linear(
+    residual, gate_up = _run_fused_next_linear(
         layer.mlp.gate_up_proj,
-        x_q,
-        x_scale,
+        collectives.norm_add_next_norm(
+            _attention_partial_sum(attn, positions, qkv),
+            residual,
+            layer.post_attention_layernorm.weight,
+            layer.pre_feedforward_layernorm.weight,
+        ),
         num_tokens,
-        outputs_gathered=collectives.outputs_gathered,
+        collectives,
     )
     mlp_partial = _mlp_partial_sum(layer.mlp, gate_up)
     post_norm_weight = layer.post_feedforward_layernorm.weight
@@ -407,7 +436,11 @@ def _dense_sequence_parallel_forward(
     if dense_sequence_parallel.use_sequence_parallel(num_tokens, tp_size):
         if (
             state.streaming_collectives is not None
-            and fused_rs_epilogue_op.supports_streaming_sublayer(num_tokens, hidden)
+            and fused_rs_epilogue_op.supports_streaming_sublayer(
+                num_tokens,
+                hidden,
+                next_act_dtype=state.streaming_collectives.next_act_dtype,
+            )
         ):
             return _fused_sequence_parallel_forward(
                 self,

@@ -15,8 +15,8 @@
 
 Wraps `hierrs_tc/kernel_stream.py` (streaming buckets `>= 128 * TP` on 4- or
 8-TensorCore tpu7x TP groups, returning token-sharded outputs) and
-`hierrs_tc/kernel_oneshot_rs_ag.py` (decode buckets `256 <= tokens < 1024` on
-8-TensorCore tpu7x TP groups, returning rank-ordered gathered outputs). Because
+`hierrs_tc/kernel_oneshot_rs_ag.py` (FP8 decode buckets `256 <= tokens < 1024`
+on 8-TensorCore tpu7x TP groups, returning rank-ordered gathered outputs). Because
 torch custom ops require fixed tensor arities, one op is registered per operand
 combination used by dense decoder sublayers.
 """
@@ -28,6 +28,7 @@ from collections.abc import Callable
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 import torch.distributed as dist
 from jax.sharding import PartitionSpec as P
@@ -61,6 +62,7 @@ ONESHOT_SUPPORTED_TP_SIZES = kernel_oneshot_rs_ag.SUPPORTED_NUM_DEVICES
 _SHARDED: Any = P(TP_AXIS_NAME, None)
 _REPLICATED: Any = P()
 _QUANTIZED_OUT = (_SHARDED, _SHARDED, _SHARDED)
+_BF16_NEXT_OUT = (_SHARDED, _SHARDED)
 _ONESHOT_QUANTIZED_OUT = (_SHARDED, _REPLICATED, _REPLICATED)
 
 
@@ -69,16 +71,18 @@ class FusedSublayerCollectives:
     """Custom ops fusing TP reduce-scatter with a decoder sublayer's epilogue."""
 
     # (partial, residual, post_norm_weight, next_norm_weight)
-    #   -> (residual, x_q, x_scale)
+    #   -> (residual, x_q, x_scale) for float8_e4m3fn else (residual, x_norm)
     norm_add_next_norm: Callable
     # (partial, residual, post_norm_weight, scale, next_norm_weight)
-    #   -> (residual, x_q, x_scale)
+    #   -> (residual, x_q, x_scale) for float8_e4m3fn else (residual, x_norm)
     norm_add_scale_next_norm: Callable
     # (partial, residual, post_norm_weight, scale) -> residual
     norm_add_scale: Callable
-    # True when `x_q`, `x_scale`, and `norm_add_scale`'s output are already
-    # gathered across all TP ranks in rank order.
+    # True when the next-sublayer activation (`x_q`/`x_scale` or `x_norm`) and
+    # `norm_add_scale`'s output are already gathered across all TP ranks in rank order.
     outputs_gathered: bool = False
+    # Output dtype of the next-sublayer activation (`float8_e4m3fn` or `bfloat16`).
+    next_act_dtype: torch.dtype = torch.float8_e4m3fn
 
 
 _STREAM_COLLECTIVES_CACHE: dict[tuple, FusedSublayerCollectives] = {}
@@ -91,13 +95,31 @@ def _eps_op_tag(eps: float) -> str:
     return f"{eps:.8g}".replace("-", "m").replace("+", "p").replace(".", "_")
 
 
-def supports_streaming_sublayer(num_tokens: Any, hidden: int) -> bool:
+def _to_jax_next_act_dtype(next_act_dtype: torch.dtype) -> Any:
+    if next_act_dtype == torch.float8_e4m3fn:
+        return jnp.float8_e4m3fn
+    if next_act_dtype == torch.bfloat16:
+        return jnp.bfloat16
+    raise ValueError(f"Unsupported next_act_dtype: {next_act_dtype}")
+
+
+def supports_streaming_sublayer(
+    num_tokens: Any,
+    hidden: int,
+    next_act_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> bool:
     """Whether `[num_tokens, hidden]` fits the streaming reduce-scatter op."""
+    jax_dtype = _to_jax_next_act_dtype(next_act_dtype)
     if _RESOLVED_TP_TOPOLOGY is None:
         # Before the TP group is resolved, only `hidden` is being checked.
-        return kernel_stream.supports_stream_epilogue(num_tokens, hidden)
+        return kernel_stream.supports_stream_epilogue(
+            num_tokens, hidden, next_act_dtype=jax_dtype
+        )
     return kernel_stream.supports_stream_epilogue(
-        num_tokens, hidden, num_devices=len(_RESOLVED_TP_TOPOLOGY[1])
+        num_tokens,
+        hidden,
+        num_devices=len(_RESOLVED_TP_TOPOLOGY[1]),
+        next_act_dtype=jax_dtype,
     )
 
 
@@ -204,14 +226,18 @@ def _register_sublayer_ops(
 
 
 def build_streaming_sublayer_collectives(
-    eps: float, *, fp8_wire: bool
+    eps: float,
+    *,
+    fp8_wire: bool,
+    next_act_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> FusedSublayerCollectives | None:
     """Builds streaming fused RS + epilogue ops for the active TP group."""
+    jax_next_dtype = _to_jax_next_act_dtype(next_act_dtype)
     resolved = _resolve_tp_mesh_and_order()
     if resolved is None:
         return None
     mesh, order, device_ids = resolved
-    key = (device_ids, order, eps, fp8_wire)
+    key = (device_ids, order, eps, fp8_wire, next_act_dtype)
     cached = _STREAM_COLLECTIVES_CACHE.get(key)
     if cached is not None:
         return cached
@@ -227,27 +253,7 @@ def build_streaming_sublayer_collectives(
             axis_name=TP_AXIS_NAME,
             order=order,
             fp8_wire=fp8_wire,
-        )
-
-    def norm_add_next_norm(
-        partial: jax.Array,
-        residual: jax.Array,
-        post_norm_weight: jax.Array,
-        next_norm_weight: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        return _shard_map_sublayer(
-            mesh, lambda p, r, w, n: local(p, r, w, None, n), 2, _QUANTIZED_OUT
-        )(partial, residual, post_norm_weight, next_norm_weight)
-
-    def norm_add_scale_next_norm(
-        partial: jax.Array,
-        residual: jax.Array,
-        post_norm_weight: jax.Array,
-        scale: jax.Array,
-        next_norm_weight: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        return _shard_map_sublayer(mesh, local, 3, _QUANTIZED_OUT)(
-            partial, residual, post_norm_weight, scale, next_norm_weight
+            next_act_dtype=jax_next_dtype,
         )
 
     def norm_add_scale(
@@ -260,34 +266,55 @@ def build_streaming_sublayer_collectives(
             mesh, lambda p, r, w, s: local(p, r, w, s, None)[0], 2, _SHARDED
         )(partial, residual, post_norm_weight, scale)
 
-    def fake_quantized(partial, residual: torch.Tensor, *weights):
-        del partial, weights
-        return (
-            torch.empty_like(residual),
-            residual.new_empty(residual.shape, dtype=torch.uint8),
-            residual.new_empty((residual.shape[0], 1), dtype=torch.float32),
-        )
-
     def fake_residual(partial, residual: torch.Tensor, *weights):
         del partial, weights
         return torch.empty_like(residual)
 
     wire = "fp8" if fp8_wire else "bf16"
+    eps_tag = _eps_op_tag(eps)
     order_tag = "_".join(str(r) for r in order)
-    ops = _register_sublayer_ops(
-        mesh,
-        "dense_sp_rs",
-        f"{wire}_{_eps_op_tag(eps)}_ord_{order_tag}",
-        (
+    if next_act_dtype == torch.float8_e4m3fn:
+
+        def norm_add_next_norm_fp8(
+            partial: jax.Array,
+            residual: jax.Array,
+            post_norm_weight: jax.Array,
+            next_norm_weight: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _shard_map_sublayer(
+                mesh, lambda p, r, w, n: local(p, r, w, None, n), 2, _QUANTIZED_OUT
+            )(partial, residual, post_norm_weight, next_norm_weight)
+
+        def norm_add_scale_next_norm_fp8(
+            partial: jax.Array,
+            residual: jax.Array,
+            post_norm_weight: jax.Array,
+            scale: jax.Array,
+            next_norm_weight: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _shard_map_sublayer(mesh, local, 3, _QUANTIZED_OUT)(
+                partial, residual, post_norm_weight, scale, next_norm_weight
+            )
+
+        def fake_quantized(partial, residual: torch.Tensor, *weights):
+            del partial, weights
+            return (
+                torch.empty_like(residual),
+                residual.new_empty(residual.shape, dtype=torch.uint8),
+                residual.new_empty((residual.shape[0], 1), dtype=torch.float32),
+            )
+
+        name_suffix = f"{wire}_{eps_tag}_ord_{order_tag}"
+        variants: tuple[tuple[Callable, Callable, int, Any, str], ...] = (
             (
-                norm_add_next_norm,
+                norm_add_next_norm_fp8,
                 fake_quantized,
                 2,
                 _QUANTIZED_OUT,
                 "norm_add_next_norm",
             ),
             (
-                norm_add_scale_next_norm,
+                norm_add_scale_next_norm_fp8,
                 fake_quantized,
                 3,
                 _QUANTIZED_OUT,
@@ -295,10 +322,64 @@ def build_streaming_sublayer_collectives(
             ),
             # Single-element tuple: torch_tpu iterates a bare PartitionSpec as a list.
             (norm_add_scale, fake_residual, 2, (_SHARDED,), "norm_add_scale"),
-        ),
-    )
+        )
+    else:
 
-    built = FusedSublayerCollectives(*ops, outputs_gathered=False)
+        def norm_add_next_norm_bf16(
+            partial: jax.Array,
+            residual: jax.Array,
+            post_norm_weight: jax.Array,
+            next_norm_weight: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return _shard_map_sublayer(
+                mesh,
+                lambda p, r, w, n: local(p, r, w, None, n)[:2],
+                2,
+                _BF16_NEXT_OUT,
+            )(partial, residual, post_norm_weight, next_norm_weight)
+
+        def norm_add_scale_next_norm_bf16(
+            partial: jax.Array,
+            residual: jax.Array,
+            post_norm_weight: jax.Array,
+            scale: jax.Array,
+            next_norm_weight: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return _shard_map_sublayer(
+                mesh,
+                lambda p, r, w, s, n: local(p, r, w, s, n)[:2],
+                3,
+                _BF16_NEXT_OUT,
+            )(partial, residual, post_norm_weight, scale, next_norm_weight)
+
+        def fake_bf16_next(partial, residual: torch.Tensor, *weights):
+            del partial, weights
+            return (torch.empty_like(residual), torch.empty_like(residual))
+
+        name_suffix = f"{wire}_bf16act_{eps_tag}_ord_{order_tag}"
+        variants = (
+            (
+                norm_add_next_norm_bf16,
+                fake_bf16_next,
+                2,
+                _BF16_NEXT_OUT,
+                "norm_add_next_norm",
+            ),
+            (
+                norm_add_scale_next_norm_bf16,
+                fake_bf16_next,
+                3,
+                _BF16_NEXT_OUT,
+                "norm_add_scale_next_norm",
+            ),
+            (norm_add_scale, fake_residual, 2, (_SHARDED,), "norm_add_scale"),
+        )
+
+    ops = _register_sublayer_ops(mesh, "dense_sp_rs", name_suffix, variants)
+
+    built = FusedSublayerCollectives(
+        *ops, outputs_gathered=False, next_act_dtype=next_act_dtype
+    )
     _STREAM_COLLECTIVES_CACHE[key] = built
     return built
 
@@ -404,6 +485,8 @@ def build_oneshot_sublayer_collectives(
         ),
     )
 
-    built = FusedSublayerCollectives(*ops, outputs_gathered=True)
+    built = FusedSublayerCollectives(
+        *ops, outputs_gathered=True, next_act_dtype=torch.float8_e4m3fn
+    )
     _ONESHOT_COLLECTIVES_CACHE[key] = built
     return built

@@ -23,7 +23,9 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 # Sequence parallelism for dense tensor-parallel decoder layers (wired for
-# dense per-channel or per-tensor FP8 Gemma 4). Off by default.
+# dense per-channel/per-tensor FP8 or unquantized bf16 Gemma 4; unquantized
+# linears gather bf16 rows without FP8 quantization or the single-shot decode
+# kernel). Off by default.
 KEY = "tpu_dense_sequence_parallel"
 
 
