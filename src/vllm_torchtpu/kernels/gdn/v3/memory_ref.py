@@ -280,9 +280,11 @@ class OutBufferedRef(BaseBufferedRef):
 class _GranuleStateRef(BaseBufferedRef):
     """Shared addressing of the per-sequence state refs below.
 
-    A state block is addressed in 512-byte granules (`granule_view`): one
-    unified-pool row holds both state regions, told apart by `offset`, and a
-    dense state tensor is the same view with `offset` 0.
+    A state block is addressed in granules (`granule_view`): one unified-pool
+    row holds both state regions, told apart by `offset`, and a dense state
+    tensor is the same view with `offset` 0. Granules are one 512-byte lane
+    row, except for a dense fp32 state, whose granule is its own last axis
+    (see `_granule_width`).
     """
 
     # HBM address offset.

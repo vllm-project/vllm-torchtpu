@@ -54,6 +54,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     tiling,
     wrapper,
 )
+from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op
 
 
 class _TracedKdaInputs(NamedTuple):
@@ -1663,3 +1664,118 @@ class KdaTilingAndValidationTest(parameterized.TestCase):
                         rtol=0.0,
                         atol=0.0,
                     )
+
+class KdaCustomOpWideValueHeadTest(parameterized.TestCase):
+    """The fused KDA custom op, not just the kernel, with d_v != d_k and a
+    beta scale: the relaxed ABI check, the `head_v_dim` output reshape, the
+    verify path's `empty_out` shape and the `beta_scale` plumbing through
+    `_build_fused_core`.
+    """
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="decode_and_prefill",
+            q_loc=[0, 1, 129, 200],
+            distribution=[1, 3, 3],
+            num_spec_tokens=0,
+        ),
+        # With speculative decoding on and no verify window in the batch, the
+        # verify segment is skipped and `empty_out` stands in for its output;
+        # a wrong width would fail to combine with the prefill output.
+        dict(
+            testcase_name="speculative_empty_verify_window",
+            q_loc=[0, 70, 129],
+            distribution=[0, 2, 2],
+            num_spec_tokens=1,
+        ),
+    )
+    def test_op_matches_the_recurrence(self, q_loc, distribution, num_spec_tokens):
+        num_heads, d_k, d_v, kernel_size = 1, 256, 512, 4
+        beta_scale, eps = 2.0, 1e-5
+        max_reqs = len(q_loc) - 1
+        q_loc = jnp.array(q_loc, dtype=jnp.int32)
+        distribution = jnp.array(distribution, dtype=jnp.int32)
+        num_tokens = int(q_loc[-1])
+        dim = num_heads * (2 * d_k + d_v)
+        num_slots = max_reqs + 1
+
+        rngs = iter(jax.random.split(jax.random.key(1), 9))
+        mixed_qkv = jax.random.normal(next(rngs), (num_tokens, dim))
+        raw_gate = jax.random.normal(next(rngs), (num_tokens, num_heads * d_k))
+        beta = jax.random.normal(next(rngs), (num_tokens, num_heads))
+        output_gate = jax.random.normal(next(rngs), (num_tokens, num_heads * d_v))
+        # The op takes [kernel_size, dim] with channels in qkv order.
+        conv_weight = jax.random.normal(next(rngs), (kernel_size, dim))
+        a_log = jax.random.normal(next(rngs), (num_heads,))
+        dt_bias = jax.random.normal(next(rngs), (num_heads * d_k,))
+        norm_weight = 1.0 + 0.1 * jax.random.normal(next(rngs), (d_v,))
+        conv_state = jnp.zeros((num_slots, kernel_size - 1, dim))
+        recurrent_state = jnp.zeros((num_slots, num_heads, d_k, d_v))
+        state_indices = jnp.arange(1, max_reqs + 1, dtype=jnp.int32)
+        seq_lens = (q_loc[1:] - q_loc[:-1]).astype(jnp.int32)
+
+        (ref_conv, ref_state), ref_out = kda_attention_ref(
+            qkv=mixed_qkv,
+            b=beta,
+            a=raw_gate,
+            states=(conv_state, recurrent_state),
+            conv_weight=jnp.transpose(conv_weight)[:, None, :],
+            conv_bias=None,
+            a_log=a_log,
+            dt_bias=dt_bias.reshape(num_heads, d_k),
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=num_heads,
+            n_v=num_heads,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            gate_lower_bound=None,
+            beta_scale=beta_scale,
+        )
+        ref_out = kda_attention_op._gated_output_norm(
+            jnp.asarray(ref_out, jnp.float32).reshape(num_tokens, num_heads, d_v),
+            output_gate,
+            norm_weight,
+            eps,
+            jnp.float32,
+        )
+
+        core = kda_attention_op._build_fused_core(
+            None, eps, num_spec_tokens=num_spec_tokens, beta_scale=beta_scale
+        )
+        out, new_conv, new_state = jax.jit(core)(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            conv_state,
+            recurrent_state,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            q_loc,
+            state_indices,
+            seq_lens,
+            distribution,
+            slot_read_offsets=jnp.zeros((num_slots,), jnp.int32),
+        )
+
+        self.assertEqual(out.shape, (num_tokens, num_heads, d_v))
+        np.testing.assert_allclose(
+            np.asarray(out, np.float64),
+            np.asarray(ref_out, np.float64),
+            rtol=2e-2,
+            atol=1e-2,
+        )
+        # The conv state update is pure data movement.
+        np.testing.assert_array_equal(np.asarray(new_conv), np.asarray(ref_conv))
+        np.testing.assert_allclose(
+            np.asarray(new_state, np.float64),
+            np.asarray(ref_state, np.float64),
+            rtol=2e-2,
+            atol=1e-2,
+        )
