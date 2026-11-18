@@ -26,23 +26,19 @@ destination"), which is what the pair below reproduces without the setting.
 import contextlib
 import os
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from vllm.v1.worker.utils import select_common_block_size
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
+from vllm_torchtpu.layers.adapter import attention
 from vllm_torchtpu.layers.adapter.attention import PallasBatchedRPAAttentionBackend
 
 from .raiden_test_utils import FakeTensor
 
 BATCHED = PallasBatchedRPAAttentionBackend
-QWEN35 = "Qwen3_5MoeForConditionalGeneration"
-OTHER = "Qwen3NextForCausalLM"
-# The text-config shape of Qwen3.5-397B-A17B, and of Qwen3.5-35B-A3B, which
-# main's PCP disagg integration runs serve.
-SHAPE_397B = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
-SHAPE_35B = {"num_experts": 256, "hidden_size": 2048, "num_hidden_layers": 40}
 
 # Block sizes on main's GDN state sizing (bf16 SSM, fp32 conv).
 PREFILL_BLOCK = 2304  # TP1 (pipeline-parallel) prefill
@@ -65,16 +61,14 @@ def _engine(
     monkeypatch,
     *,
     kv_role,
-    arch=QWEN35,
     layout="HND",
     pcp=1,
-    shape=SHAPE_397B,
     section=None,
 ):
     """A current vLLM config for one engine: the KV cache layout resolved as
-    the runner resolves it, the model's architecture and text-config shape,
-    a KV transfer config with ``kv_role`` (None: no KV transfer) and an
-    explicit ``tpu_kv_transfer`` section (None: absent)."""
+    the runner resolves it, a KV transfer config with ``kv_role`` (None: no
+    KV transfer) and an explicit ``tpu_kv_transfer`` section (None:
+    absent)."""
     from vllm import envs as vllm_envs
     from vllm.config import (
         DeviceConfig,
@@ -110,9 +104,6 @@ def _engine(
         )
         resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
         config.parallel_config.prefill_context_parallel_size = pcp
-        config.model_config = SimpleNamespace(
-            architectures=[arch], hf_text_config=SimpleNamespace(**shape)
-        )
         if kv_role is not None:
             config.kv_transfer_config = KVTransferConfig(
                 kv_connector="TPURaidenConnector", kv_role=kv_role
@@ -172,8 +163,8 @@ def _leg_fingerprint(*, block, kernel_page, num_kv_heads, gdn):
 @pytest.mark.parametrize(
     "engine",
     [
-        # Any model: both legs carry the setting.
-        {"arch": OTHER, "section": {"kernel_page_tokens": 128}},
+        # Both legs carry the setting.
+        {"section": {"kernel_page_tokens": 128}},
     ],
 )
 def test_prefill_and_decode_register_the_same_layout(monkeypatch, engine):
@@ -209,17 +200,11 @@ def test_differing_pages_are_refused_by_the_fingerprint():
     }
 
 
-def test_other_models_keep_vllms_page(monkeypatch):
-    with _engine(monkeypatch, kv_role="kv_producer", arch=OTHER):
+def test_unset_keeps_vllms_page(monkeypatch):
+    with _engine(monkeypatch, kv_role="kv_producer"):
         assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
-    assert (
-        _kernel_page(monkeypatch, PREFILL_BLOCK, kv_role="kv_producer", arch=OTHER)
-        == 256
-    )
-    assert (
-        _kernel_page(monkeypatch, DECODE_BLOCK, kv_role="kv_consumer", arch=OTHER)
-        == 128
-    )
+    assert _kernel_page(monkeypatch, PREFILL_BLOCK, kv_role="kv_producer") == 256
+    assert _kernel_page(monkeypatch, DECODE_BLOCK, kv_role="kv_consumer") == 128
 
 
 def test_engine_configs_leave_no_global_state(monkeypatch):
@@ -238,11 +223,7 @@ def test_engine_configs_leave_no_global_state(monkeypatch):
 
 def test_pcp_engine_honours_the_setting(monkeypatch):
     with _engine(
-        monkeypatch,
-        kv_role="kv_producer",
-        pcp=4,
-        shape=SHAPE_35B,
-        section={"kernel_page_tokens": 128},
+        monkeypatch, kv_role="kv_producer", pcp=4, section={"kernel_page_tokens": 128}
     ):
         assert BATCHED.get_supported_kernel_block_sizes() == [128]
 
@@ -251,19 +232,40 @@ def test_head_along_sublane_ignores_the_setting(monkeypatch):
     with _engine(
         monkeypatch,
         kv_role="kv_producer",
-        arch=OTHER,
         layout="NHD",
         section={"kernel_page_tokens": 128},
     ):
         assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
 
 
+@pytest.mark.parametrize(
+    "kv_role,layout,reason",
+    [
+        (None, "HND", "the engine has no kv_transfer_config"),
+        ("kv_producer", "NHD", "the LBNHC KV cache layout is not seq-along-lane"),
+        ("kv_producer", "HND", None),
+    ],
+)
+def test_a_page_the_engine_does_not_apply_is_logged(
+    monkeypatch, kv_role, layout, reason
+):
+    logger = Mock()
+    section = {"kernel_page_tokens": 128}
+    with _engine(monkeypatch, kv_role=kv_role, layout=layout, section=section) as c:
+        monkeypatch.setattr(attention, "logger", logger)
+        attention.check_kv_transfer_page(
+            c, c.cache_config.get_resolved_kv_cache_layout()
+        )
+    if reason is None:
+        logger.warning_once.assert_not_called()
+    else:
+        (call,) = logger.warning_once.call_args_list
+        assert call.args[2] == 128 and call.args[3].startswith(reason)
+
+
 def test_a_page_the_kernel_lacks_is_refused(monkeypatch):
     engine = _engine(
-        monkeypatch,
-        kv_role="kv_producer",
-        arch=OTHER,
-        section={"kernel_page_tokens": 512},
+        monkeypatch, kv_role="kv_producer", section={"kernel_page_tokens": 512}
     )
     refused = pytest.raises(ValueError, match=r"supported pages: \[128, 256\]")
     with engine, refused:
