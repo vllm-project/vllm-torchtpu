@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import os
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1147,6 +1149,107 @@ def test_ltx2_split_rope_lane_mask_built_on_host(monkeypatch):
     omni_rope._first_half_lanes.cache_clear()
 
 
+def _ltx2_sp_shard(tables, start=4, end=8):
+    # A fresh dim-2 slice of each table, as the sequence-parallel hook cuts.
+    return tuple(t[:, :, start:end, :] for t in tables)
+
+
+def test_ltx2_split_rope_tables_found_by_identity(ltx2, table_syncs, monkeypatch):
+    # Every attention layer of a forward is handed the same (cos, sin)
+    # objects: after their first rotation they are found by identity, with no
+    # storage or layout query. A fresh slice of the same tables reads them.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    tables = rope(_ltx2_coords(batch=2, tokens=8), out_dtype=torch.bfloat16)
+    cases = [
+        (_ltx2_sp_shard(tables), torch.randn(2, 4, 24, dtype=torch.bfloat16)),
+        (tables, torch.randn(2, 8, 24, dtype=torch.bfloat16)),  # not sharded
+    ]
+    wants = [ltx2.apply_split_rotary_emb(x, freqs, head_dim=8) for freqs, x in cases]
+    syncs = len(table_syncs)
+
+    def layout_query(self, *args, **kwargs):
+        raise AssertionError("layout query")
+
+    for name in ("is_contiguous", "storage_offset", "untyped_storage"):
+        monkeypatch.setattr(torch.Tensor, name, layout_query)
+    for (freqs, x), want in zip(cases, wants, strict=True):
+        got = ltx2.apply_split_rotary_emb(x, freqs, head_dim=8)
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    with pytest.raises(AssertionError, match="layout query"):
+        ltx2.apply_split_rotary_emb(cases[0][1], _ltx2_sp_shard(tables), head_dim=8)
+    assert len(table_syncs) == syncs
+
+
+def test_ltx2_split_rope_identity_checks_width(ltx2, table_syncs, monkeypatch):
+    # The lanes cut for tensor parallelism depend on the width of q/k, so a
+    # pair found by identity is reused only for the width it was cut for.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=4, head_dim=8)
+    coords = _ltx2_coords()
+    tables = rope(coords)
+    cos, sin = _UPSTREAM_ROPE_FORWARD(rope, coords)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_rank", lambda: 1)
+    x = torch.randn(2, 5, 2 * 8)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, (cos[:, 2:], sin[:, 2:]), head_dim=8)
+    for _ in range(2):
+        out = ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
+        torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
+    assert len(table_syncs) == 2  # the tables, then the lanes of rank 1
+
+    x_full = torch.randn(2, 5, 4 * 8)
+    out = ltx2.apply_split_rotary_emb(x_full, tables, head_dim=8)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x_full, (cos, sin), head_dim=8)
+    torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
+    assert len(table_syncs) == 2
+
+
+def test_ltx2_split_rope_owned_tables_follow_new_tables(ltx2, table_syncs):
+    # A new request builds new tables with the same slice layout. Their owned
+    # copies replace the previous request's, whose tables are then released.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    x = torch.randn(2, 4, 24, dtype=torch.bfloat16)
+
+    tables = rope(_ltx2_coords(batch=2, tokens=8), out_dtype=torch.bfloat16)
+    old_table = weakref.ref(tables[0])
+    ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables), head_dim=8)
+
+    coords = _ltx2_coords(batch=2, tokens=8)
+    tables = rope(coords, out_dtype=torch.bfloat16)
+    syncs = len(table_syncs)
+    out = ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables), head_dim=8)
+    assert len(table_syncs) == syncs + 1
+    upstream = _UPSTREAM_ROPE_FORWARD(rope, coords, None, torch.bfloat16)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, _ltx2_sp_shard(upstream), head_dim=8)
+    torch.testing.assert_close(out, want.to(torch.bfloat16), rtol=0, atol=0)
+
+    table_syncs.clear()  # the fixture's record holds the tables too
+    gc.collect()
+    assert old_table() is None
+
+
+def test_ltx2_split_rope_rotates_views_of_unknown_storage(
+    ltx2, table_syncs, monkeypatch
+):
+    # A storage without a data pointer cannot be told apart from another, so
+    # its slices are rotated as they are, without an owned copy.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    coords = _ltx2_coords(batch=2, tokens=8)
+    tables = rope(coords, out_dtype=torch.bfloat16)
+    syncs = len(table_syncs)
+    monkeypatch.setattr(torch.UntypedStorage, "data_ptr", lambda self: 0)
+    x = torch.randn(2, 4, 24, dtype=torch.bfloat16)
+    upstream = _UPSTREAM_ROPE_FORWARD(rope, coords, None, torch.bfloat16)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, _ltx2_sp_shard(upstream), head_dim=8)
+    for _ in range(2):
+        out = ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables), head_dim=8)
+        torch.testing.assert_close(out, want.to(torch.bfloat16), rtol=0, atol=0)
+    assert len(table_syncs) == syncs
+
+
 @pytest.mark.parametrize("batch", [1, 2], ids=["b1_c4u2", "b2_c2u4"])
 def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batch):
     torch.manual_seed(0)
@@ -1170,6 +1273,11 @@ def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batc
         freqs_view = (cos_full[:, :, start:end, :], sin_full[:, :, start:end, :])
         out1 = ltx2.apply_split_rotary_emb(x_shard, freqs_view, head_dim=8)
         assert len(table_syncs) == 1 + rank
+        # The synced copies own a buffer of the slice's shape.
+        for owned, view in zip(table_syncs[-1], freqs_view, strict=True):
+            assert torch.equal(owned, view)
+            assert owned.is_contiguous() and owned.storage_offset() == 0
+            assert owned.untyped_storage().nbytes() == view.numel() * 2
         # Fresh view object over the same storage hits the shard cache across 48 blocks.
         out2 = ltx2.apply_split_rotary_emb(
             x_shard,

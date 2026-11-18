@@ -26,6 +26,7 @@ until Omni patches are unified with patch_registry.py (tracked in #1862); see
 qwen3omni_thinker.py.
 """
 
+import weakref
 from functools import cache as run_once
 from typing import Any
 
@@ -572,6 +573,13 @@ def _patch_ltx2_split_rope() -> None:
     #   - Interleaved RoPE and (B, H, T, D/2) tables use the original
     #     functions.
     #   - synchronize_tensors materializes the cached tables once.
+    #   - SP hands each rank a dim-2 slice of the tables, and TP the lanes of
+    #     its heads. torch_tpu passes a program the buffer behind each
+    #     argument, so a rotation that reads a slice takes the full table as
+    #     an input and slices it again, in every attention layer. The
+    #     rotation reads fresh_buffer copies with a buffer of the slice's
+    #     shape instead, built once per table and slice layout; a slice whose
+    #     storage has no data pointer is rotated as before.
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 
@@ -579,7 +587,7 @@ def _patch_ltx2_split_rope() -> None:
         apply_split_rotary_half_swap,
         split_rope_natural_tables,
     )
-    from vllm_torchtpu.utils import synchronize_tensors
+    from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
     rope_cls = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed
     if getattr(rope_cls.forward, _SPLIT_ROPE_PATCHED, False):
@@ -623,17 +631,119 @@ def _patch_ltx2_split_rope() -> None:
         self._tpu_split_rope_cache = (coords, key, tables)
         return tables
 
-    shard_cache: dict[
+    # (cos, sin) the rotation is handed -> the tables it reads.
+    #   - tables_by_view finds them by identity. The same tensor objects reach
+    #     every attention layer of a forward, so the hot path makes no storage
+    #     or layout query. An entry holds the pair by weak reference (a dead
+    #     reference never matches a tensor that reuses its id), the q/k width
+    #     and TP layout its lanes were cut for, and the owned tables, or None
+    #     for a pair that is rotated as is (never one whose lanes were cut).
+    #   - owned_by_layout holds one pair of owned tables per view layout
+    #     (storage offset, shape and stride of cos and sin, dtype, device),
+    #     with the storage they were copied from. Each forward slices fresh
+    #     views of the same tables, which hit here. A new request builds new
+    #     tables: they replace the entry, which releases the previous
+    #     request's tables.
+    tables_by_view: dict[
+        int,
+        tuple[
+            weakref.ref[torch.Tensor],
+            weakref.ref[torch.Tensor],
+            int,
+            tuple[int, int] | None,
+            tuple[torch.Tensor, torch.Tensor] | None,
+        ],
+    ] = {}
+    owned_by_layout: dict[
         tuple[Any, ...],
-        tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+        tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ] = {}
 
-    def _is_sharded_view(t: torch.Tensor) -> bool:
+    def _is_view(t: torch.Tensor) -> bool:
         return (
             not t.is_contiguous()
             or t.storage_offset() != 0
             or t.untyped_storage().nbytes() != t.numel() * t.element_size()
         )
+
+    def _tp_layout() -> tuple[int, int]:
+        return (
+            ltx2_transformer.get_tensor_model_parallel_world_size(),
+            ltx2_transformer.get_tensor_model_parallel_rank(),
+        )
+
+    def _local_lanes(
+        cos: torch.Tensor, sin: torch.Tensor, width: int, tp_layout: tuple[int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tp_size, tp_rank = tp_layout
+        if cos.shape[-1] != width * tp_size:
+            raise ValueError(
+                f"LTX-2 split RoPE tables of width {cos.shape[-1]} do not "
+                f"match q/k of width {width} on {tp_size} tensor-parallel "
+                "ranks; the tables must cover all heads of all ranks."
+            )
+        start = tp_rank * width
+        return cos[..., start : start + width], sin[..., start : start + width]
+
+    def _rotation_tables(
+        cos: torch.Tensor, sin: torch.Tensor, width: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tables for the rotation of ``width`` channels with ``(cos, sin)``."""
+        entry = tables_by_view.get(id(cos))
+        if (
+            entry is not None
+            and entry[0]() is cos
+            and entry[1]() is sin
+            and entry[2] == width
+            and (entry[3] is None or entry[3] == _tp_layout())
+        ):
+            return entry[4] or (cos, sin)
+        tp_layout = None if cos.shape[-1] == width else _tp_layout()
+        local = (
+            (cos, sin)
+            if tp_layout is None
+            else _local_lanes(cos, sin, width, tp_layout)
+        )
+        owned = None
+        if _is_view(local[0]) or _is_view(local[1]):
+            cos_ptr = local[0].untyped_storage().data_ptr()
+            sin_ptr = local[1].untyped_storage().data_ptr()
+            if cos_ptr == 0 or sin_ptr == 0:
+                return local  # Unknown storage: rotate with the views.
+            layout = (
+                local[0].storage_offset(),
+                tuple(local[0].shape),
+                local[0].stride(),
+                local[1].storage_offset(),
+                tuple(local[1].shape),
+                local[1].stride(),
+                local[0].dtype,
+                local[0].device,
+            )
+            cached = owned_by_layout.get(layout)
+            if cached is None or cached[0] != cos_ptr or cached[1] != sin_ptr:
+                owned = (fresh_buffer(local[0]), fresh_buffer(local[1]))
+                synchronize_tensors(list(owned), wait=False)
+                if cached is None and len(owned_by_layout) >= 8:
+                    owned_by_layout.clear()
+                # The entry keeps the views: their storage, and with it the
+                # data pointers above, stays valid while it is cached.
+                owned_by_layout[layout] = (cos_ptr, sin_ptr, *local, *owned)
+                tables_by_view.clear()
+            else:
+                owned = (cached[4], cached[5])
+        if owned is None and tp_layout is not None:
+            return local  # Lanes without an owned copy are cut again next time.
+        if len(tables_by_view) >= 16:
+            tables_by_view.clear()
+        tables_by_view[id(cos)] = (
+            weakref.ref(cos),
+            weakref.ref(sin),
+            width,
+            tp_layout,
+            owned,
+        )
+        return owned or local
 
     def _apply_split_rotary_emb(
         x: torch.Tensor,
@@ -645,56 +755,10 @@ def _patch_ltx2_split_rope() -> None:
         if cos.ndim != 4 or cos.shape[1] != 1 or cos.shape[-1] == head_dim // 2:
             return orig_apply_split_rotary_emb(x, freqs, head_dim=head_dim)
         width = x.shape[-1]
-        if cos.shape[-1] != width:
-            tp_size = ltx2_transformer.get_tensor_model_parallel_world_size()
-            if cos.shape[-1] != width * tp_size:
-                raise ValueError(
-                    f"LTX-2 split RoPE tables of width {cos.shape[-1]} do not "
-                    f"match q/k of width {width} on {tp_size} tensor-parallel "
-                    "ranks; the tables must cover all heads of all ranks."
-                )
-            start = ltx2_transformer.get_tensor_model_parallel_rank() * width
-            cos = cos[..., start : start + width]
-            sin = sin[..., start : start + width]
-        if not torch.compiler.is_compiling() and (
-            _is_sharded_view(cos) or _is_sharded_view(sin)
-        ):
-            cos_ptr = cos.untyped_storage().data_ptr()
-            sin_ptr = sin.untyped_storage().data_ptr()
-            if cos_ptr != 0 and sin_ptr != 0:
-                shard_key = (
-                    cos_ptr,
-                    cos.storage_offset(),
-                    tuple(cos.shape),
-                    cos.stride(),
-                    sin_ptr,
-                    sin.storage_offset(),
-                    tuple(sin.shape),
-                    sin.stride(),
-                    cos.dtype,
-                    cos.device,
-                )
-                entry = shard_cache.get(shard_key)
-                if (
-                    entry is not None
-                    and entry[0].untyped_storage().data_ptr() == cos_ptr
-                    and entry[1].untyped_storage().data_ptr() == sin_ptr
-                ):
-                    cos, sin = entry[2]
-                else:
-                    cos_local = torch.empty(
-                        cos.shape, dtype=cos.dtype, device=cos.device
-                    )
-                    cos_local.copy_(cos)
-                    sin_local = torch.empty(
-                        sin.shape, dtype=sin.dtype, device=sin.device
-                    )
-                    sin_local.copy_(sin)
-                    synchronize_tensors([cos_local, sin_local], wait=False)
-                    if len(shard_cache) >= 8:
-                        shard_cache.clear()
-                    shard_cache[shard_key] = (cos, sin, (cos_local, sin_local))
-                    cos, sin = cos_local, sin_local
+        if not torch.compiler.is_compiling():
+            cos, sin = _rotation_tables(cos, sin, width)
+        elif cos.shape[-1] != width:
+            cos, sin = _local_lanes(cos, sin, width, _tp_layout())
         return apply_split_rotary_half_swap(x, cos, sin, head_dim)
 
     setattr(_cached_rope_forward, _SPLIT_ROPE_PATCHED, True)
