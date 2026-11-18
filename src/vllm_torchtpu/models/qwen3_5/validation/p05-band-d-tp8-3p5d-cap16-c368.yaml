@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# InferenceX point 5 (interactivity band D): the serve arguments and
+# Benchmark point 5: the serve arguments and
 # environment each leg of the record run used. See README.md in this
 # directory for how to read and use it.
 name: p05-band-d-tp8-3p5d-cap16-c368
