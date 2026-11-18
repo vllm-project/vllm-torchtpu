@@ -6740,12 +6740,10 @@ class TPUModelRunner(GPUModelRunner):
             }
 
         # Every row of a warmup step is padding; a profile step's real
-        # tokens are its requests' query tokens. The guard is for runner
-        # stand-ins with neither a padding state nor _token_padding_update.
-        if getattr(self, "_token_padding_state", None) is not None:
-            self._token_padding_update(
-                num_tokens, sum(profile_query_lens) if profiling else 0
-            )
+        # tokens are its requests' query tokens.
+        self._token_padding_update(
+            num_tokens, sum(profile_query_lens) if profiling else 0
+        )
         self._record_input_staging_fence()
         intermediate_tensors = None
         if through_handoff:
