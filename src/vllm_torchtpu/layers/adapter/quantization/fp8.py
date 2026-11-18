@@ -1089,8 +1089,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
             # Under the loader's config context; a no-op unless the
-            # tpu_collectives.small_all_reduce option is on.
-            small_all_reduce_op.prebuild(get_current_vllm_config_or_none())
+            # tpu_collectives.small_all_reduce option is on. Without a config
+            # context (weights processed directly) there is nothing to build.
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is not None:
+                small_all_reduce_op.prebuild(vllm_config)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         self._moe_lowtok_scores_op = moe_lowtok_scores.prebuild(
             self, layer, activation_str
