@@ -45,7 +45,10 @@ def test_worker_starts_follow_the_parallel_spawn_switch(monkeypatch, parallel_sp
     monkeypatch.setenv("TPU_PARALLEL_WORKER_SPAWN", parallel_spawn)
     executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
     with patch.object(
-        MultiprocExecutor, "_can_start_workers_concurrently", return_value=True
+        MultiprocExecutor,
+        "_can_start_workers_concurrently",
+        return_value=True,
+        create=True,  # older vLLM starts workers serially and has no such hook
     ):
         assert executor._can_start_workers_concurrently(None) is (parallel_spawn == "1")
 
