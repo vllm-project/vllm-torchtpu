@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     TPU_PCP_PACKED_ROPE: bool = False
     TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
     TPU_PCP_KV_CHUNK_TOKENS: int = 65536
+    TPU_PCP_WS_NO_ZERO_FILL: bool = False
+    TPU_PCP_GATHER_HOIST: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -859,6 +861,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
     # PCP manager: context tokens gathered per all-gather chunk.
     "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
+    # PCP manager split prefill: do not zero the latent KV workspace
+    # (TPU_PCP_KV_WORKSPACE_TOKENS rows) before the chunks land on every layer;
+    # only gathered rows are ever attended. Same output.
+    "TPU_PCP_WS_NO_ZERO_FILL": env_bool("TPU_PCP_WS_NO_ZERO_FILL", default=False),
+    # PCP manager split prefill: gather the latent workspace's first chunk in
+    # the split-row write op, outside the attention's lax.cond / chunk loop,
+    # so it runs as an async all-gather overlapping the indexer. Same output.
+    "TPU_PCP_GATHER_HOIST": env_bool("TPU_PCP_GATHER_HOIST", default=False),
     # DCP sparse MLA: chunks of at most this many query tokens take the
     # decode-sized (small-chunk) path -- TPU_DCP_MLA_SMALL_CHUNK_BATCH tokens
     # per grid step and the one-atom live-bounded SparseCore gather

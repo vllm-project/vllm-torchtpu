@@ -64,6 +64,48 @@ def gather_workspace(
     return lax.all_gather(cache[pages], axis_name, tiled=False)
 
 
+def take_chunk(
+    cache: jax.Array, pages: jax.Array, chunk: jax.Array | int, chunk_pages: int
+) -> jax.Array:
+    """This rank's `[chunk_pages, *page]` cache pages of workspace chunk `chunk`."""
+    ids = lax.dynamic_slice_in_dim(pages, chunk * chunk_pages, chunk_pages)
+    return cache[ids]
+
+
+def gather_taken(taken: jax.Array, *, axis_name: str) -> jax.Array:
+    """All-gather `take_chunk` pages over DCP into the chunk's
+    `[dcp * chunk_pages, *page]` workspace rows (rank major)."""
+    g = lax.all_gather(taken, axis_name, tiled=False)
+    return g.reshape(-1, *g.shape[2:])
+
+
+# `latent_workspace(fill=...)`: "zeros" (the default), "empty" (no defined
+# contents, TPU_PCP_WS_NO_ZERO_FILL) and "nan" (test only: every byte 0xFF, an
+# fp8 e4m3 NaN, to prove the attention never uses rows no chunk wrote).
+WORKSPACE_FILLS = ("zeros", "empty", "nan")
+
+
+def latent_workspace(num_rows: int, like: jax.Array, fill: str) -> jax.Array:
+    """`[num_rows, *like.shape[1:]]` latent workspace before any chunk lands.
+
+    Only rows of gathered chunks are ever attended: valid top-k entries map
+    into the request's own pages (all inside the chunks in use), and the
+    sparse kernel zeroes every key past a token's kv_len before QK and PV, so
+    the -1 tail it reads from hashed rows anywhere in the workspace cannot
+    leak a value, NaN or not (`sparse_attention_chunk`). "empty" therefore
+    gives the same output as "zeros" without writing the whole workspace
+    (1M tokens of 640 B, ~0.2 ms per layer on v7x).
+    """
+    shape = (num_rows, *like.shape[1:])
+    if fill == "zeros":
+        return jnp.zeros(shape, like.dtype)
+    if fill == "empty":
+        return lax.empty(shape, like.dtype)
+    if fill == "nan":
+        return jnp.full(shape, jnp.iinfo(like.dtype).max, like.dtype)
+    raise ValueError(f"fill must be one of {WORKSPACE_FILLS}, got {fill!r}")
+
+
 def position_ordered(workspace: jax.Array, interleave: int) -> jax.Array:
     """Reorder the rank-major `[dcp, Pw, P/4, 4, W]` workspace to
     `[Pw, dcp * P/4, 4, W]`."""
