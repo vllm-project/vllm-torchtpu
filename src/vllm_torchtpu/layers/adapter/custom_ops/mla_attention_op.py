@@ -1505,11 +1505,8 @@ class VllmTPUIndexer(Indexer):
         `wk_weights_proj` output, when the caller already projected the rows
         (only their count is then read from `hidden_states`). `q_rows`: when
         `qr` holds only the rows this rank attends (`s + T // dcp`)."""
-        # Fused wk + weights_proj: one GEMM, then split
-        if kw is None:
-            kw, _ = self.wk_weights_proj(hidden_states)
         q_fp8, q_scale, k, weights = self._project(
-            qr, positions, rotary_emb, kw, q_rows
+            hidden_states, qr, positions, rotary_emb, kw, q_rows
         )
         return self._finish_forward(
             hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
@@ -1523,13 +1520,19 @@ class VllmTPUIndexer(Indexer):
         `_finish_forward` scales them, and the K rows packed as the cache
         stores them (`pack_index_k`). For a caller that runs the top-k itself
         (`mla_prefill_rows`)."""
-        q_fp8, q_scale, k, weights = self._project(qr, positions, rotary_emb, kw, None)
+        q_fp8, q_scale, k, weights = self._project(
+            None, qr, positions, rotary_emb, kw, None
+        )
         return q_fp8, self._scaled_weights(weights, q_scale), pack_index_k(k)
 
-    def _project(self, qr, positions, rotary_emb, kw, q_rows):
-        """`(fp8 q, q scale, roped k, raw weights)` of each row."""
+    def _project(self, hidden_states, qr, positions, rotary_emb, kw, q_rows):
+        """`(fp8 q, q scale, roped k, raw weights)` of each row; `kw` is
+        projected from `hidden_states` when not given."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
+        # Fused wk + weights_proj: one GEMM, then split
+        if kw is None:
+            kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
         if q_rows is not None:
@@ -1895,9 +1898,13 @@ class VllmTPUMLAAttention(MLAAttention):
             dcp_token_parallel_op.check_config(
                 vllm_config, q_replicate=bool(dcp_q_replicate)
             )
-            if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS:
-                mla_prefill_rows.check_config(vllm_config)
             self.token_parallel_layout = dcp_token_parallel_op.layout_for(vllm_config)
+        if (
+            envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
+            and use_sparse
+            and vllm_config is not None
+        ):
+            mla_prefill_rows.check_config(vllm_config)
 
         # For compatibility reasons.
         self.prefix = prefix
