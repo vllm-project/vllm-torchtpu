@@ -28,9 +28,17 @@ rather than an error:
    against head-0 pages on ranks 0..3. An MLA cache is one latent that every
    rank holds, so every DCP size vLLM admits holds one head, including the
    PCP manager's DCP = TP x PCP (GLM-5.2 at TP2, PCP4, DCP8).
-2. The Raiden Stage-3 admission names consumer layouts tp{T}dcp{D}_decode
-   only for dp == 1; with attention-DP it returns dp{N}[tp{T}]_decode without
-   reading DCP, so the producer and consumer would disagree on the page owner.
+2. The Raiden connector names a decode engine's layout from its parallel
+   sizes (``TPURaidenConnectorWorker._raiden_qwen35_admission_topology`` and
+   ``_raiden_glm_admission_topology`` in
+   ``distributed/kv_transfer/tpu_connector.py``): tp{T}dcp{D}_decode only for
+   dp == 1. With attention-DP it returns dp{N}[tp{T}]_decode without reading
+   DCP, so the producer and consumer would disagree on the page owner. The
+   check covers every engine with a KV transfer config, whatever its role or
+   connector name: ``TPUConnector`` runs that worker when its Raiden backend
+   is switched on, and a MultiConnector hands each child a copy of the engine
+   config with the child's own role (``kv_both``), so neither the name nor the
+   role tells whether the naming runs.
 
 pcp_validation.py and the PCP manager own the other PCP x DCP rules.
 """
@@ -133,10 +141,10 @@ class DcpStaticSupportValidator:
             raise NotImplementedError(
                 f"data_parallel_size={config.dp_size} with "
                 f"decode_context_parallel_size={config.dcp_size} on a KV "
-                f"{config.kv_role}: the Raiden Stage-3 admission names "
+                f"{config.kv_role}: the Raiden connector names this layout "
                 "dp{N}[tp{T}]_decode without the DCP axis, so the peers would "
                 "disagree on page ownership. Use dp 1 (tp{T}dcp{D}_decode) until "
-                "the admission names the dp x tp x dcp layout."
+                "the connector names the dp x tp x dcp layout."
             )
         logger.info(
             "DCP admitted: dcp=%d tp=%d pcp=%d kv_heads=%d%s, "
@@ -148,7 +156,3 @@ class DcpStaticSupportValidator:
             " (MLA latent)" if config.use_mla else "",
         )
         return config
-
-
-def validate_decode_context_parallel_config(vllm_config: Any) -> DcpStaticConfig:
-    return DcpStaticSupportValidator.validate_platform_config(vllm_config)

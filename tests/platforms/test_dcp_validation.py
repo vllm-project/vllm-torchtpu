@@ -32,7 +32,6 @@ import vllm  # noqa: F401
 from vllm_torchtpu.platforms.dcp_validation import (
     DcpStaticSupportValidator,
     admissible_dcp_sizes,
-    validate_decode_context_parallel_config,
 )
 
 
@@ -128,7 +127,7 @@ def test_admissible_sizes_are_vllms_groups_that_hold_one_head(tp, pcp, heads):
     [(8, 1), (8, 2), (8, 4), (16, 8), (32, 16), (32, 4)],
 )
 def test_plan_layouts_are_admitted(tp, dcp):
-    config = validate_decode_context_parallel_config(
+    config = DcpStaticSupportValidator.validate_platform_config(
         _vllm_config(tp_size=tp, dcp_size=dcp, kv_role="kv_consumer")
     )
     assert config.dcp_size == dcp
@@ -138,14 +137,16 @@ def test_plan_layouts_are_admitted(tp, dcp):
 @pytest.mark.parametrize("tp,dcp", [(8, 8), (16, 16), (32, 32), (4, 4)])
 def test_group_crossing_kv_heads_is_rejected(tp, dcp):
     with pytest.raises(ValueError, match="must share one KV head"):
-        validate_decode_context_parallel_config(_vllm_config(tp_size=tp, dcp_size=dcp))
+        DcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(tp_size=tp, dcp_size=dcp)
+        )
 
 
 def test_qwen3_5_397b_at_tp8_admits_exactly_dcp_1_2_4():
     admitted = set()
     for dcp in (1, 2, 4, 8):
         try:
-            validate_decode_context_parallel_config(
+            DcpStaticSupportValidator.validate_platform_config(
                 _vllm_config(tp_size=8, dcp_size=dcp, kv_heads=2)
             )
         except ValueError:
@@ -160,7 +161,7 @@ def test_pcp_manager_layouts_are_admitted(tp, pcp, dcp):
     # GLM-5.2 example is TP2 / PCP4 / DCP8). MLA checkpoints report their
     # query heads as num_key_value_heads (128 for DeepSeek-V3), but the cache
     # is one latent every rank holds.
-    config = validate_decode_context_parallel_config(
+    config = DcpStaticSupportValidator.validate_platform_config(
         _vllm_config(tp_size=tp, pcp_size=pcp, dcp_size=dcp, kv_heads=128, use_mla=True)
     )
     assert config.dcp_size == dcp and config.num_kv_heads == 1
@@ -168,33 +169,35 @@ def test_pcp_manager_layouts_are_admitted(tp, pcp, dcp):
 
 def test_mla_without_pcp_admits_every_divisor_of_tp():
     for dcp in (2, 4, 8):
-        validate_decode_context_parallel_config(
+        DcpStaticSupportValidator.validate_platform_config(
             _vllm_config(tp_size=8, dcp_size=dcp, kv_heads=128, use_mla=True)
         )
 
 
 def test_gqa_group_over_tp_x_pcp_crossing_heads_is_rejected():
     # 2 KV heads at TP2 x PCP4: a DCP group of 8 spans both TP ranks.
-    validate_decode_context_parallel_config(
+    DcpStaticSupportValidator.validate_platform_config(
         _vllm_config(tp_size=2, pcp_size=4, dcp_size=4, kv_heads=2)
     )
     with pytest.raises(ValueError, match="must share one KV head"):
-        validate_decode_context_parallel_config(
+        DcpStaticSupportValidator.validate_platform_config(
             _vllm_config(tp_size=2, pcp_size=4, dcp_size=8, kv_heads=2)
         )
 
 
 def test_dcp_must_divide_tp_x_pcp_before_the_head_rule():
     with pytest.raises(ValueError, match="divisible"):
-        validate_decode_context_parallel_config(_vllm_config(tp_size=8, dcp_size=3))
+        DcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(tp_size=8, dcp_size=3)
+        )
     with pytest.raises(ValueError, match="divisible"):
-        validate_decode_context_parallel_config(
+        DcpStaticSupportValidator.validate_platform_config(
             _vllm_config(tp_size=2, pcp_size=4, dcp_size=16, use_mla=True)
         )
 
 
 def test_no_model_config_keeps_only_the_vllm_rule():
-    config = validate_decode_context_parallel_config(
+    config = DcpStaticSupportValidator.validate_platform_config(
         _vllm_config(tp_size=8, dcp_size=8, kv_heads=None)
     )
     assert config.total_num_kv_heads == 0
@@ -202,11 +205,11 @@ def test_no_model_config_keeps_only_the_vllm_rule():
 
 def test_attention_dp_consumer_with_dcp_is_refused_until_admission_names_it():
     with pytest.raises(NotImplementedError, match="dp x tp x dcp"):
-        validate_decode_context_parallel_config(
+        DcpStaticSupportValidator.validate_platform_config(
             _vllm_config(tp_size=4, dcp_size=2, dp_size=2, kv_role="kv_consumer")
         )
     # Without a KV transfer there is no Raiden admission to disagree with.
-    validate_decode_context_parallel_config(
+    DcpStaticSupportValidator.validate_platform_config(
         _vllm_config(tp_size=4, dcp_size=2, dp_size=2)
     )
 
