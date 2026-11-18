@@ -942,8 +942,7 @@ def rpa_kernel(
             # step's KV, which is not NaN. With `mask_invalid_v` every step zeroes
             # the V rows past each lane's KV end as it loads them, and NaNs in
             # unattended K only reach masked scores, which `jnp.where` replaces,
-            # so the KV buffers (~27 MB of VMEM for decode, a fixed few us per
-            # call) are not zeroed.
+            # so the KV buffers (~27 MB of VMEM for decode) are not zeroed.
 
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
 

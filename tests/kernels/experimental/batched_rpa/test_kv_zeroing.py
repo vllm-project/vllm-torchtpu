@@ -17,8 +17,8 @@ P @ V multiplies masked scores' zero weights by every V row of a block, and
 0 * NaN = NaN. With `mask_invalid_v` (default for SEQ_ALONG_LANE) every step
 zeroes the V rows past each lane's KV end as it loads them, so the kernel
 skips zeroing its KV buffer. Without it (default for HEAD_ALONG_SUBLANE) the
-kernel zeroes the buffer once per call, as main's kernel does, so rows a step
-does not fetch never hold NaN.
+kernel zeroes the buffer once per call, so rows a step does not fetch never
+hold NaN.
 """
 
 import re
@@ -37,8 +37,12 @@ _HEAD = configs.KVLayout.HEAD_ALONG_SUBLANE
 _SEQ = configs.KVLayout.SEQ_ALONG_LANE
 
 _VMEM_BF16 = re.compile(r"Ref<vmem>\{bf16\[([0-9,]+)\]\}")
+# A u32 zeros constant, then a store of exactly that constant through the
+# window's u32 [rows, 128] view.
 _ZERO_STORE = re.compile(
-    r"\{reshape\(\[([0-9]+), 128\]\)\} <- \S+\{bitcast\(uint32\)\}"
+    r"(\w+):u32\[([0-9]+),128\] = broadcast_in_dim 0:u32\[\]\n"
+    r"\s*\w+:u32\[\2,128\], \w+\{bitcast\(uint32\)\}\{reshape\(\[\2, 128\]\)\} <- "
+    r"\S+\{bitcast\(uint32\)\}\{reshape\(\[\2, 128\]\)\}, \1\n"
 )
 
 
@@ -114,7 +118,7 @@ def _zeroes_kv_buffer(kernel_text):
     windows = {s for s in _VMEM_BF16.findall(kernel_text) if len(s.split(",")) == 6}
     assert len(windows) == 1, windows
     rows = int(np.prod([int(d) for d in windows.pop().split(",")])) * 2 // (4 * 128)
-    return rows in {int(r) for r in _ZERO_STORE.findall(kernel_text)}
+    return rows in {int(r) for _, r in _ZERO_STORE.findall(kernel_text)}
 
 
 @pytest.mark.parametrize(
