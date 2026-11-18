@@ -134,6 +134,31 @@ def test_glm_admission(monkeypatch):
     assert bridge._admit(_glm_runner(other), 2) is None
 
 
+def test_admission_declines_a_layer_with_copy_slots(monkeypatch, tmp_path):
+    """Under an expert placement with copy slots a placed layer holds its 4
+    primaries and a copy; the kernel would serve all 5 slots as primaries, so
+    the layer keeps the grouped path, which is bounded to the primaries. A
+    layer the table does not place holds no copies and is admitted."""
+    import vllm.distributed
+
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    table = tmp_path / "copies.json"
+    table.write_text(
+        '{"experts": 8, "shards": 2, "copies_per_rank": 1, '
+        '"layers": {"3": [[7, 0, 5, 2, 1], [1, 6, 3, 4, 7]]}}'
+    )
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(table))
+    placed = _glm_runner(DeepseekV2MLP(256, 128), e=5)
+    # `apply` records the primaries on a placed layer.
+    setattr(placed.routed_experts, expert_placement.PRIMARY_EXPERTS_ATTR, 4)
+    assert bridge._admit(placed, 2) is None
+    assert bridge._admit(_glm_runner(DeepseekV2MLP(256, 128)), 2) is not None
+
+
 def test_admission_declines_attention_narrower_than_mesh(monkeypatch):
     """PCP2 (or DP2) at TP1: the EP group spans the mesh, attention does not, so
     MoERunner still runs a collective after the op."""

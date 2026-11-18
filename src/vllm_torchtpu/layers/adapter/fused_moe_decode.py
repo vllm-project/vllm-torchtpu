@@ -66,6 +66,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     plan_weight_ring,
     vmem_bytes,
 )
+from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -427,6 +428,10 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     # shared-expert slice, and MoERunner runs no DP/PCP collective after the op.
     sharded_ok = sharded_ok and get_tensor_model_parallel_world_size() == n_ranks
     if not isinstance(qm, VllmFp8MoEMethodTPU) or not sharded_ok:
+        return None
+    if expert_placement.primary_experts(layer) not in (None, layer.w13_weight.shape[0]):
+        # The layer holds copy slots after its primaries (an expert placement
+        # with copies); the kernel would serve every slot as a primary.
         return None
     if qm._tpu_activation_str != "silu":
         return None
