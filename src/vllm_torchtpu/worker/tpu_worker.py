@@ -584,9 +584,15 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes, so subtract them from the KV-cache
         # budget.
         reserves = self.model_runner.post_profile_hbm_reserves()
-        available = utils.min_across_ep_dp(
-            self.parallel_config, budget.available - sum(reserves)
-        )
+        local_available = budget.available - sum(reserves)
+        # A model adapter that owns its cache can report the bytes that cache
+        # may take, e.g. after profiling on a scratch pool.
+        adapter = getattr(self.model_runner, "model_adapter", None)
+        adapter_budget = getattr(adapter, "kv_cache_memory_budget", None)
+        sized = adapter_budget() if callable(adapter_budget) else None
+        if isinstance(sized, int):
+            local_available = sized
+        available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
@@ -857,6 +863,11 @@ class TPUWorker(WorkerBase):
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
         _release_free_host_heap()
+        from vllm_torchtpu.worker import cpu_pinning
+
+        policy = cpu_pinning.policy_for(self.model_config.architecture)
+        if policy is not None:
+            cpu_pinning.apply(self.rank, self.local_rank, *policy)
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
