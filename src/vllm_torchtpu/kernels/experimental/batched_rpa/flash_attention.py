@@ -62,7 +62,8 @@ def decode_exp2(cfgs: configs.RpaConfigs) -> bool:
     q * scale is rounded again: for a bf16 q at head_dim 256 the scale
     0.09016844 becomes 0.09033203, so the scores are scaled 0.18% more than
     on the base-e path. On the f32 score multiply (no fold) only the last
-    bits change.
+    bits change. Off for calls that return the LSE or use soft_cap; the
+    wrapper logs each once.
     """
     return (
         cfgs.serve.decode_exp2
