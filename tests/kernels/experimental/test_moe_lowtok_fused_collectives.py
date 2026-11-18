@@ -344,6 +344,47 @@ def test_refuses_unsupported_calls(kwargs, match):
         _call(rows=rows, **kwargs)
 
 
+@pytest.mark.cpu_test
+def test_fp8_dispatch_fits_whole_fp8_tiles_of_engine_rows():
+    """Rows per engine pad to whole bf16 tiles (16); FP8 rows need whole fp8
+    tiles (32): the torch op's dispatch choice and the kernel's refusal share
+    this rule."""
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
+
+    assert [fc.engine_rows(t) for t in (1, 13, 16, 17, 48, 64)] == [
+        16,
+        16,
+        16,
+        32,
+        48,
+        64,
+    ]
+    fits = [t for t in range(1, 97) if fc.fp8_dispatch_fits(t)]
+    assert fits == list(range(17, 33)) + list(range(49, 65)) + list(range(81, 97))
+
+
+@pytest.mark.cpu_test
+def test_each_collective_of_the_decode_program_has_its_own_barrier_group():
+    """The kernels that can run in one decode program on the DP x TP layout:
+    the small all-reduce and reduce-scatter, this kernel and the fused EP v3
+    kernels."""
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
+    from vllm_torchtpu.kernels.experimental.small_collectives import (
+        all_reduce,
+        reduce_scatter,
+    )
+    from vllm_torchtpu.kernels.fused_moe.v3 import layout
+
+    ids = (
+        all_reduce.COLLECTIVE_ID,
+        reduce_scatter.COLLECTIVE_ID,
+        fc.COLLECTIVE_ID,
+        layout.COLLECTIVE_ID_FFN,
+        layout.COLLECTIVE_ID_TRANSPORT,
+    )
+    assert len(set(ids)) == len(ids), ids
+
+
 @pytest.fixture(scope="module")
 def tpu_mesh():
     """The eight cores of one host as the (dp, tp) mesh. A fixture, not a

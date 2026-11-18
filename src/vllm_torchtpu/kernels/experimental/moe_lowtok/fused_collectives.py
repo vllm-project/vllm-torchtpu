@@ -52,26 +52,45 @@ from vllm_torchtpu.kernels.experimental.moe_lowtok.kernel import (
     select_topk,
     weight_layout,
 )
+from vllm_torchtpu.kernels.experimental.small_collectives.common import (
+    MOE_LOWTOK_FUSED_COLLECTIVE_ID,
+)
 
+# Row blocks are pushed by DMA and sliced by rows; bf16 tiles are 16 sublanes.
+_ROW_TILE = 16
+# Rows of one fp8 sublane tile: FP8 rows are pushed in whole tiles.
+FP8_ROW_TILE = 32
 # Rows per gathered block of the gather formulation: one fp8 sublane tile. An
 # expert routed more rows runs several passes over the same resident weights.
-GATHER_ROWS = 32
+GATHER_ROWS = FP8_ROW_TILE
 # The scatter-back carries each f32 contribution as three bf16 pieces stacked
 # along the contraction dim, so one matmul reconstructs it exactly.
 _PIECES = 3
 
-# Barrier semaphore group; the small collectives use 5 and 7, the fused EP
-# kernels 0.
-COLLECTIVE_ID = 9
+# Barrier semaphore group, kept apart from the others in
+# small_collectives/common.py.
+COLLECTIVE_ID = MOE_LOWTOK_FUSED_COLLECTIVE_ID
 # Experts in the weight ring.
 _RING_DEPTH = 1
 MESH = pl.DeviceIdType.MESH
 DP_AXIS = "dp"
 TP_AXIS = "tp"
-# Row blocks are pushed by DMA and sliced by rows; bf16 tiles are 16 sublanes.
-_ROW_TILE = 16
+# Cores in a TP pair: the dispatch and combine split each row block into two
+# column halves, one per core of a chip.
+TP_PAIR = 2
 _VMEM_FRACTION = 0.92
 _VMEM_MARGIN = 1.3
+
+
+def engine_rows(tokens: int) -> int:
+    """Rows per engine the kernel moves: ``tokens`` padded to whole bf16 tiles."""
+    return pl.cdiv(tokens, _ROW_TILE) * _ROW_TILE
+
+
+def fp8_dispatch_fits(tokens: int) -> bool:
+    """Whether ``dispatch_fp8`` can push ``tokens`` rows per engine: the row
+    blocks must be whole fp8 tiles."""
+    return engine_rows(tokens) % FP8_ROW_TILE == 0
 
 
 def _push(src, dst, send_sem, recv_sem, dp_idx, tp_idx):
@@ -789,20 +808,23 @@ def moe_lowtok_fused(
     [experts_start, experts_start + E). `dispatch_fp8` pushes
     the rows quantized per row to fp8 with their scale (half the bytes, the
     same values the kernel computes from bf16 rows); it needs row blocks of
-    whole fp8 tiles (32 rows per engine).
+    whole fp8 tiles (`fp8_dispatch_fits`).
     """
-    if tp != 2:
-        raise ValueError("the hier forms pair the two cores of a chip (tp == 2)")
+    if tp != TP_PAIR:
+        raise ValueError(
+            f"the hier forms pair the two cores of a chip (tp == {TP_PAIR})"
+        )
     tokens, hidden = x.shape
     if hidden % (2 * LANE):
         raise ValueError(f"hidden {hidden} is not a multiple of {2 * LANE}")
     n_experts, inter, w13_parts, _ = weight_layout(x, w13)
     lanes = pl.cdiv(logits.shape[1], LANE) * LANE
-    rows_l = pl.cdiv(tokens, _ROW_TILE) * _ROW_TILE
+    rows_l = engine_rows(tokens)
     rows = rows_l * dp
-    if dispatch_fp8 and rows_l % 32:
+    if dispatch_fp8 and not fp8_dispatch_fits(tokens):
         raise ValueError(
-            f"dispatch_fp8 needs {rows_l} rows per engine to be a multiple of 32"
+            f"dispatch_fp8 needs {rows_l} rows per engine to be a multiple of "
+            f"{FP8_ROW_TILE}"
         )
     pad_rows = rows_l - tokens
     x_rows = jnp.pad(x, ((0, pad_rows), (0, 0)))

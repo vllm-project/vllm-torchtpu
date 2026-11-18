@@ -39,6 +39,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives
+from vllm_torchtpu.kernels.experimental.small_collectives import common as sc_common
 from vllm_torchtpu.layers.adapter import (
     sequence_parallel,
     small_all_reduce_op,
@@ -91,12 +92,13 @@ def prebuild(topk: int) -> None:
     if (
         dp * tp != cores
         or dp < 2
-        or tp != 2
+        or tp != fused_collectives.TP_PAIR
+        or tp != sc_common.devices_per_chip()
         or not small_all_reduce_op.groups_match_mesh(index, tp, dp)
     ):
         logger.debug(
             "moe_lowtok fused collectives not armed: dp=%d x tp=%d is not the "
-            "%d-core EP mesh with TP pairs on consecutive cores",
+            "%d-core EP mesh with each chip's TP pair on consecutive cores",
             dp,
             tp,
             cores,
@@ -121,16 +123,18 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
     mesh = build_ep_mesh()
     assert mesh is not None  # prebuild armed the op on this mesh
     dp, tp = _DP, _TP
-    mesh2 = Mesh(np.asarray(mesh.devices).reshape(dp, tp), axis_names=("dp", "tp"))
-    rows = PartitionSpec("dp")
-    experts = PartitionSpec(("dp", "tp"))
+    dp_axis, tp_axis = fused_collectives.DP_AXIS, fused_collectives.TP_AXIS
+    mesh2 = Mesh(
+        np.asarray(mesh.devices).reshape(dp, tp), axis_names=(dp_axis, tp_axis)
+    )
+    rows = PartitionSpec(dp_axis)
+    experts = PartitionSpec((dp_axis, tp_axis))
     cap = moe_lowtok_scores.armed_max_tokens()
 
     def body(x, scores, w13, w2, s13, s2, experts_start, rank):
         start = experts_start[0]
         rows_l = x.shape[0]
         if 0 < dp * rows_l <= cap:
-            padded = -(-rows_l // 16) * 16
             # The rows travel as per-row FP8 wherever the kernel takes them.
             return fused_collectives.moe_lowtok_fused(
                 x,
@@ -144,16 +148,16 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
                 topk=topk,
                 dp=dp,
                 tp=tp,
-                dispatch_fp8=padded % 32 == 0,
+                dispatch_fp8=fused_collectives.fp8_dispatch_fits(rows_l),
             )
         # Above the cap: the served path, inside the op.
-        xg = lax.all_gather(x, "dp", axis=0, tiled=True)
-        lg = lax.all_gather(scores, "dp", axis=0, tiled=True)
+        xg = lax.all_gather(x, dp_axis, axis=0, tiled=True)
+        lg = lax.all_gather(scores, dp_axis, axis=0, tiled=True)
         out = moe_lowtok_scores.moe_scores_fn(
             xg, lg, w13, w2, s13, s2, start, topk=topk
         )
-        out = lax.psum_scatter(out, "dp", scatter_dimension=0, tiled=True)
-        return lax.psum(out, "tp")
+        out = lax.psum_scatter(out, dp_axis, scatter_dimension=0, tiled=True)
+        return lax.psum(out, tp_axis)
 
     def fn(
         x: jax.Array,

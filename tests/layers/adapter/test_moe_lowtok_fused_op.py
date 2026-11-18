@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
+from vllm_torchtpu.kernels.experimental.small_collectives import common as sc_common
 from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op as op
 from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
@@ -56,10 +57,23 @@ def fresh(monkeypatch):
     return build
 
 
-def _layout(monkeypatch, *, dp, tp, cores=8, mesh=True, groups_match=True, index=5):
-    """The model-parallel groups and EP mesh prebuild reads; the groups check
-    (a collective over the EP group) as a mock."""
+def _layout(
+    monkeypatch,
+    *,
+    dp,
+    tp,
+    cores=8,
+    mesh=True,
+    groups_match=True,
+    index=5,
+    chip_devices=2,
+):
+    """The model-parallel groups, EP mesh and devices per chip prebuild reads
+    (TPU7x: two); the groups check (a collective over the EP group) as a
+    mock."""
     import vllm.distributed.parallel_state as ps
+
+    monkeypatch.setattr(sc_common, "devices_per_chip", lambda: chip_devices)
 
     monkeypatch.setattr(
         op,
@@ -93,15 +107,24 @@ def test_dp4_tp2_arms_the_op(monkeypatch, fresh):
         dict(dp=2, tp=4),
         dict(dp=4, tp=2, cores=16),
         dict(dp=1, tp=2, cores=2),
+        dict(dp=4, tp=2, chip_devices=1),
     ],
-    ids=["tp8", "dp8_tp1", "dp2_tp4", "not_the_mesh", "one_engine_tp2"],
+    ids=[
+        "tp8",
+        "dp8_tp1",
+        "dp2_tp4",
+        "not_the_mesh",
+        "one_engine_tp2",
+        "tp2_on_two_chips",
+    ],
 )
 def test_other_layouts_leave_it_unarmed_without_the_groups_collective(
     monkeypatch, fresh, layout
 ):
     """TP8 (the other measured decode layout), TP other than a chip's pair, a DP x TP
-    that is not the EP mesh, or one engine on a chip's pair (nothing to
-    dispatch over DP): the default MoE path, and no collective."""
+    that is not the EP mesh, one engine on a chip's pair (nothing to
+    dispatch over DP), or a TP pair across two single-device chips: the
+    default MoE path, and no collective."""
     check = _layout(monkeypatch, **layout)
     op.prebuild(TOPK)
     assert op._ARMED is False

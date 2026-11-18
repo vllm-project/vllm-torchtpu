@@ -25,6 +25,21 @@ from jax.experimental.pallas import tpu as pltpu
 LANES = 128
 MESH = pl.DeviceIdType.MESH
 
+# Barrier semaphore groups (pltpu.CompilerParams.collective_id) of the Pallas
+# collectives that can run in one decode program; each needs its own. The fused
+# EP MoE kernels use 0 and 3 (kernels/fused_moe/v3/layout.py).
+ALL_REDUCE_COLLECTIVE_ID = 5
+REDUCE_SCATTER_COLLECTIVE_ID = 7
+MOE_LOWTOK_FUSED_COLLECTIVE_ID = 9
+
+
+def devices_per_chip() -> int:
+    """JAX devices on one TPU chip: the chip's TensorCores over the cores one
+    device drives (TPU7x devices are single cores, so 2; one under megacore)."""
+    info = pltpu.get_tpu_info()
+    return info.chip_version.num_physical_tensor_cores_per_chip // info.num_cores
+
+
 # Axis names of the mesh the kernels are traced under, in mesh order, when it has more
 # axes than the collective's own: a mesh device id names every axis, so the peer id
 # carries this core's index on each other axis. () is a one-axis mesh.
