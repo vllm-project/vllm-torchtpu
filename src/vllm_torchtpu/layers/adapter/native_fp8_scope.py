@@ -17,6 +17,9 @@ speculative draft.
 The batched RPA kernel can run its QK and/or PV matmuls in fp8 (``native_fp8``
 for the decode kernel, ``native_fp8_prefill`` for the prefill and mixed
 kernels; ``configs.NativeFp8``) and its decode softmax in base 2
+(``decode_exp2``). All three trade precision for speed (fp8 operands; for
+the base-2 softmax, a folded scale rounded to bf16, 0.18% larger at head_dim
+256), and all are off unless a model turns them on for its attention layers
 (``PallasAttentionBackendImpl.attention_modes``).
 A draft model must run at the precision it ships with, so its attention keeps
 the full-precision path whatever the target uses.
