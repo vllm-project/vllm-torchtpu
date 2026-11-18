@@ -230,7 +230,16 @@ def test_the_prefix_aware_lookup_answers_from_the_memo_as_vllm_does(
     expected_blocks, expected_hit, _ = kvm.get_computed_blocks(returning)
     scheduler._prefix_warmth(returning)
     computes = scheduler._memo_computes
-    blocks, hit, boundary, diverged = scheduler._get_local_prefix_cache_hit(returning)
+
+    def fresh_lookup(*args, **kwargs):
+        raise AssertionError("the admission lookup recomputed the prefix hit")
+
+    # Every fresh lookup, the scheduler's own and vLLM's get_computed_blocks,
+    # goes through the coordinator: the answer must come from the memo.
+    with patch.object(kvm.coordinator, "find_longest_cache_hit", fresh_lookup):
+        blocks, hit, boundary, diverged = scheduler._get_local_prefix_cache_hit(
+            returning
+        )
     assert scheduler._memo_computes == computes
     assert hit == expected_hit > 0 and not diverged
     assert blocks.get_block_ids() == expected_blocks.get_block_ids()
