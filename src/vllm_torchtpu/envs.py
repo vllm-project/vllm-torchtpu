@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     USE_TPU_PCP_MANAGER: bool = False
     TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
     TPU_PCP_KV_CHUNK_TOKENS: int = 65536
+    TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
+    TPU_DCP_MLA_FUSED_PREP: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -487,6 +489,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
     # PCP manager: context tokens gathered per all-gather chunk.
     "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
+    # DCP sparse MLA, decode buckets (<= 32 tokens): the kernel writes lse
+    # -inf and output 0 for a token whose top-k this rank does not own, so no
+    # dummy key or owns mask is needed. Same merge result.
+    "TPU_DCP_MLA_MASK_IN_KERNEL": env_bool("TPU_DCP_MLA_MASK_IN_KERNEL", default=False),
+    # With TPU_DCP_MLA_MASK_IN_KERNEL, decode buckets: build the capped window
+    # indices and the SparseCore gather's live bound in one Pallas call.
+    # Same gathered rows.
+    "TPU_DCP_MLA_FUSED_PREP": env_bool("TPU_DCP_MLA_FUSED_PREP", default=False),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
