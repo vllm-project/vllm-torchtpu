@@ -450,3 +450,36 @@ def maybe_patch_qwen3_vl_video_prompt(
             "Applied TPU patch: Qwen3-VL videos expand in the trained prompt format."
         )
     return None
+
+
+def maybe_patch_qwen3_vl_image_hf_text(
+    model_config: Optional["ModelConfig"] = None,
+) -> bool | None:
+    """Process Qwen3-VL images without the dummy prompt vLLM tokenizes and drops.
+
+    vLLM's Qwen3-VL processor hands the HF processor a dummy prompt with one
+    placeholder per item. HF expands each image's placeholder to one token per
+    merged patch and tokenizes the result. vLLM discards those ids, because the
+    renderer has already tokenized the real prompt, and the image fields come
+    from the image processor alone. Skipping the prompt takes the HF step of
+    Cosmos3-Super's 3-image request (5841 image tokens) from 30 to 19 ms, with
+    the same image fields. A request with a video keeps the dummy prompt:
+    Qwen3-VL's processor reads `input_ids` back from that call.
+    """
+    if model_config is None or not _has_qwen3_vl_vision(model_config):
+        return False
+    from vllm.model_executor.models import qwen3_vl
+
+    processor_cls = qwen3_vl.Qwen3VLMultiModalProcessor
+    if not getattr(processor_cls, "_tpu_image_hf_text_skipped", False):
+        upstream = processor_cls._get_hf_mm_text
+
+        def _get_hf_mm_text(self, mm_counts):
+            if mm_counts.get("video", 0):
+                return upstream(self, mm_counts)
+            return None
+
+        processor_cls._get_hf_mm_text = _get_hf_mm_text
+        processor_cls._tpu_image_hf_text_skipped = True
+        logger.info("Applied TPU patch: Qwen3-VL images skip the HF dummy prompt.")
+    return None
