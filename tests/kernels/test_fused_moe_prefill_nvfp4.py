@@ -2764,6 +2764,68 @@ def test_adapter_flag_off_unchanged_and_flag_on_admission(
     assert "synthetic test refusal" in rt.warnings_once[0]
 
 
+@pytest.mark.parametrize("cfg", [ADAPTER_SMALL_EP2TP4, ADAPTER_SMALL_TP8])
+def test_adapter_precheck_probes_the_proposed_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg: dict[str, int],
+):
+    """precheck_admission runs before load-time requantization, while the layer
+    still holds the checkpoint's packed uint8 tensors. The prefill probe takes
+    the proposed (K-major FP4) weights, so a prefill the kernel will serve is
+    not logged as refused; a refusal names the probed weights."""
+    _install_mock_tpu7x(monkeypatch)
+    monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "0")
+    monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "0")
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raising=False)
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
+    rt = _load_nvfp4_adapter_for_test(monkeypatch)
+    adapter = rt.adapter
+    runner = _make_stub_runner(rt, cfg)
+    layer = runner.routed_experts
+    sds = adapter.fp8_decode._sds
+    proposed = (
+        sds(layer.w13_weight),
+        sds(layer.w2_weight),
+        (sds(layer.w13_weight_scale), sds(layer.w2_weight_scale)),
+    )
+    el, h, i = cfg["e"] // cfg["ep"], cfg["h"], cfg["i"]
+    # The checkpoint layout before requantization: packed uint8, N-major.
+    layer.w13_weight = rt.torch.Tensor((el, 2 * i, h // 2), dtype=rt.torch.uint8)
+    layer.w2_weight = rt.torch.Tensor((el, h, i // 2), dtype=rt.torch.uint8)
+
+    probed: list[tuple[Any, Any]] = []
+    orig_reason = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason
+
+    def spy_reason(x: Any, w13: Any, w2: Any, *rest: Any, **kw: Any) -> str | None:
+        probed.append((w13.dtype, w2.dtype))
+        return orig_reason(x, w13, w2, *rest, **kw)
+
+    monkeypatch.setattr(
+        adapter.prefill_nvfp4, "fused_moe_prefill_nvfp4_unsupported_reason", spy_reason
+    )
+    adm = adapter._admit(runner, N_RANKS, proposed_routed=proposed)
+    assert not isinstance(adm, str), adm
+    assert adm.statics.prefill_above == 2047
+    fp4 = jnp.dtype(jnp.float4_e2m1fn)
+    assert probed == [(fp4, fp4)]
+    assert rt.warnings_once == []
+
+    # Control: a prefill refusal still warns, naming the probed (proposed)
+    # weights rather than the layer's checkpoint tensors.
+    monkeypatch.setattr(
+        adapter.prefill_nvfp4,
+        "fused_moe_prefill_nvfp4_unsupported_reason",
+        lambda *_a, **_k: "synthetic test refusal",
+    )
+    adm_refused = adapter._admit(runner, N_RANKS, proposed_routed=proposed)
+    assert not isinstance(adm_refused, str), adm_refused
+    assert adm_refused.statics.prefill_above is None
+    assert len(rt.warnings_once) == 1
+    msg = rt.warnings_once[0]
+    assert f"w13={(el, h, 2 * i)} float4_e2m1fn" in msg
+    assert "uint8" not in msg
+
+
 def test_adapter_mode_cutoffs_and_prefill_refusal_warning_once(
     monkeypatch: pytest.MonkeyPatch,
 ):

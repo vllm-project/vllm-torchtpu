@@ -157,6 +157,14 @@ def _admit(
         layer = rnr.routed_experts
         w13_scale, w2_scale = scales
         sw13_t, ss13_t, sw2_t, ss2_t = shared
+        # Probe the weights being admitted: before load-time requantization
+        # (precheck_admission) the layer still holds the checkpoint's packed
+        # uint8 tensors, which the prefill kernel never sees.
+        w13_probe, w2_probe = (
+            (proposed_routed[0], proposed_routed[1])
+            if proposed_routed is not None
+            else (layer.w13_weight, layer.w2_weight)
+        )
         prefill_above: int | None = None
         prefill_act_mode: prefill_nvfp4.ActMode = "w4a16"
         if envs.FUSED_MOE_PREFILL_NVFP4_KERNEL:
@@ -165,8 +173,8 @@ def _admit(
             )
             reason = prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason(
                 jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, hidden), jnp.bfloat16),
-                fp8_decode._sds(layer.w13_weight),
-                fp8_decode._sds(layer.w2_weight),
+                fp8_decode._sds(w13_probe),
+                fp8_decode._sds(w2_probe),
                 fp8_decode._sds(w13_scale),
                 fp8_decode._sds(w2_scale),
                 fp8_decode._sds(sw13_t),
@@ -187,9 +195,9 @@ def _admit(
                     "refused prefill (act_mode=%s, w13=%s %s, w2=%s, "
                     "s13=%s, s2=%s, shared_w13=%s): %s",
                     cand_act_mode,
-                    tuple(layer.w13_weight.shape),
-                    str(layer.w13_weight.dtype),
-                    tuple(layer.w2_weight.shape),
+                    tuple(w13_probe.shape),
+                    str(w13_probe.dtype),
+                    tuple(w2_probe.shape),
                     tuple(w13_scale.shape),
                     tuple(w2_scale.shape),
                     tuple(sw13_t.shape),
