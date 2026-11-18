@@ -37,10 +37,11 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 # The architectures the Qwen3.5 GDN copy is validated for: the Qwen3.5 MoE
-# checkpoints the prefill/decode-disaggregated submission ran. The other Qwen
-# GDN architectures in gdn_pool_layout (Qwen3-Next, dense Qwen3.5, Qwen4Exp)
-# keep the shared kernel until they are validated on the copy; add them here
-# in the change that does so.
+# checkpoints (Qwen3.5-397B-A17B's prefill/decode-disaggregated serving
+# configurations ran the copy's changes; Qwen3.5-35B-A3B runs in CI). The
+# other Qwen GDN architectures in gdn_pool_layout (Qwen3-Next, dense Qwen3.5,
+# Qwen4Exp) keep the shared kernel until they are validated on the copy; add
+# them here in the change that does so.
 QWEN3_5_GDN_COPY_ARCHITECTURES = frozenset(
     {
         "Qwen3_5MoeForCausalLM",
