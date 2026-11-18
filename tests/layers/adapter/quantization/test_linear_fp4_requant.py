@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import VllmMLAAttention
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -159,12 +160,30 @@ def test_mla_kv_b_proj_and_parallel_lm_head_stay_fp8(monkeypatch):
         _fake_quantize_fp4_kmajor,
     )
 
-    # 1. FP8 MLA kv_b_proj marked KEEP_VLLM_LAYOUT_ATTR=True by
-    # VllmTPUMLAAttention.__init__.
+    # 1. VllmMLAAttention marks its FP8 kv_b_proj KEEP_VLLM_LAYOUT_ATTR.
     kv_b = _make_linear(
         n_in=512, n_out=256, prefix="model.layers.0.self_attn.kv_b_proj"
     )
-    setattr(kv_b, KEEP_VLLM_LAYOUT_ATTR, True)
+
+    def _stub_mla_init(self, *args, **kwargs):
+        self.kv_cache_dtype = "auto"
+        self.layer_name = "model.layers.0.self_attn.attn"
+
+    with patch(
+        "vllm.model_executor.layers.attention.mla_attention.MLAAttention.__init__",
+        _stub_mla_init,
+    ):
+        VllmMLAAttention(
+            num_heads=2,
+            scale=1.0,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            q_lora_rank=None,
+            kv_lora_rank=512,
+            kv_b_proj=kv_b,
+        )
+    assert getattr(kv_b, KEEP_VLLM_LAYOUT_ATTR, False) is True
     kv_b.weight = torch.nn.Parameter(
         torch.ones((256, 512), dtype=torch.float8_e4m3fn), requires_grad=False
     )
@@ -195,6 +214,68 @@ def test_mla_kv_b_proj_and_parallel_lm_head_stay_fp8(monkeypatch):
     )
     assert lm_head.weight.dtype == torch.float8_e4m3fn
     assert tuple(lm_head.weight.shape) == (512, 128)
+
+
+@pytest.mark.parametrize("serialized", [True, False])
+@pytest.mark.parametrize(
+    ("n_in", "n_out"),
+    [
+        (640, 64),  # n_in not a multiple of the block
+        (256, 64),  # n_in smaller than the block
+        (1024, 63),  # odd n_out cannot pair into fp4x2
+    ],
+)
+def test_fp4_ineligible_shape_falls_back_to_per_channel_fp8(
+    monkeypatch, serialized: bool, n_in: int, n_out: int
+):
+    monkeypatch.setenv("REQUANTIZE_WEIGHT_DTYPE", "fp4")
+    monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+    monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "512")
+    monkeypatch.delenv("REQUANTIZE_FP4_PREFIXES", raising=False)
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.quantization.fp8._ensure_native_fp4_supported",
+        lambda _dtype: None,
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.quantization.fp8.quantize_native_fp4_kmajor",
+        _fake_quantize_fp4_kmajor,
+    )
+
+    layer = _make_linear(n_in=n_in, n_out=n_out, prefix="model.layers.0.mlp.down_proj")
+    if serialized:
+        layer.weight = torch.nn.Parameter(
+            torch.ones((n_out, n_in), dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.tensor([0.5], dtype=torch.float32), requires_grad=False
+        )
+    else:
+        layer.weight = torch.nn.Parameter(
+            torch.randn((n_out, n_in), dtype=torch.bfloat16), requires_grad=False
+        )
+    cfg = VllmFp8Config(
+        is_checkpoint_fp8_serialized=serialized,
+        activation_scheme="static" if serialized else "dynamic",
+    )
+    method = VllmFp8LinearMethodTPU(cfg, prefix=layer.prefix)
+    method.process_weights_after_loading(layer)
+
+    assert layer.weight.dtype == torch.float8_e4m3fn
+    assert tuple(layer.weight.shape) == (n_in, n_out)
+    assert tuple(layer.weight_scale.shape) == (n_out,)
+
+    x = torch.ones((4, n_in), dtype=torch.bfloat16)
+    fp8_module = "vllm_torchtpu.layers.adapter.quantization.fp8"
+    with (
+        patch(
+            f"{fp8_module}.quantized_matmul",
+            return_value=torch.zeros((4, n_out), dtype=torch.bfloat16),
+        ) as mock_fp8_mm,
+        patch(f"{fp8_module}.quantized_matmul_fp4") as mock_fp4_mm,
+    ):
+        method.apply(layer, x)
+    mock_fp8_mm.assert_called_once()
+    mock_fp4_mm.assert_not_called()
 
 
 def test_requantize_fp4_prefixes_blocks_empty_and_non_matching_prefixes(monkeypatch):
@@ -309,6 +390,8 @@ def test_tpu_device_fp4_linear_qkvz_large_shape_vmem(monkeypatch):
     monkeypatch.delenv("REQUANTIZE_FP4_PREFIXES", raising=False)
 
     x = torch.randn((2048, 8192), dtype=torch.bfloat16, device="tpu") * 0.1
+    # Every dequantized weight is 0.02, so each output column is 0.02 * sum(x).
+    y_ref = x.float().sum(dim=-1, keepdim=True) * 0.02
     cfg = VllmFp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="static")
     for n_out in (8192, 18432):
         layer = _make_linear(
@@ -328,3 +411,7 @@ def test_tpu_device_fp4_linear_qkvz_large_shape_vmem(monkeypatch):
         method.process_weights_after_loading(layer)
         out = method.apply(layer, x)
         assert tuple(out.shape) == (2048, n_out)
+        cos = torch.nn.functional.cosine_similarity(
+            y_ref.expand(-1, n_out).flatten(), out.float().flatten(), dim=0
+        ).item()
+        assert cos > 0.99

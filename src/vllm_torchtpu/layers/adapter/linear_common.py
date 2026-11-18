@@ -22,7 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import calculate_tiling, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.logger import init_logger
 
@@ -194,9 +194,9 @@ def _quantized_matmul_fp4_jax(
     load); it only needs a leading group axis for the gmm_v2 rhs layout
     [1, n_in, n_out]. `w_s` is the fused fp32 block scale [1, num_blocks, 1,
     n_out]. gmm_v2 selects W4A16 when block < mxu_column_size and W4A8 when
-    block >= mxu_column_size. Single-group dense matmul visits all `x.shape[0]`
-    rows, so `zero_initialize=False` avoids allocating the zero-fill VMEM
-    scratch and issuing a redundant zeroing DMA.
+    block >= mxu_column_size. The single group covers all `x.shape[0]` rows,
+    so there are no unvisited rows to zero, and `zero_initialize=False` frees
+    the VMEM scratch the zero fill would reserve.
     """
     rhs = w_q[None]  # [n_in, n_out] fp4 -> [1, n_in, n_out]
     return gmm_v2(
@@ -205,7 +205,6 @@ def _quantized_matmul_fp4_jax(
         group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
         rhs_scale=w_s,
         group_offset=jnp.array([0], dtype=jnp.int32),
-        tile_info=calculate_tiling,
         preferred_element_type=x.dtype,
         maybe_quantize_lhs=True,
         zero_initialize=False,

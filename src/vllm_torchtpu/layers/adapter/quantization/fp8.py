@@ -137,6 +137,13 @@ _LINEAR_REQUANT_WEIGHT_DTYPES = {
 
 LinearQuantConfig = tuple[str, torch.dtype, int | None, bool]
 
+_PER_CHANNEL_FP8_LINEAR_CONFIG: LinearQuantConfig = (
+    "float8_e4m3fn",
+    torch.float8_e4m3fn,
+    None,
+    False,
+)
+
 
 def _dequantize_fp8_linear(
     weight: torch.Tensor,
@@ -329,6 +336,32 @@ def _can_requant_linear_to_fp4(
     )
 
 
+def _log_fp4_linear_fallback(
+    prefix: str,
+    shape: tuple[int, int],
+    *,
+    is_linear: bool,
+    keep_vllm_layout: bool,
+    block_size: int | None,
+) -> None:
+    logger.debug(
+        "FP4 linear requantization skipped for prefix=%r shape=%s "
+        "(is_linear=%s, keep_vllm_layout=%s, block=%s); using per-channel "
+        "float8_e4m3fn.",
+        prefix,
+        shape,
+        is_linear,
+        keep_vllm_layout,
+        block_size,
+    )
+    logger.warning_once(
+        "Some linear layers cannot be requantized to FP4 (non-LinearBase, kept "
+        "in vLLM's weight layout, n_in not a multiple of REQUANTIZE_BLOCK_SIZE, "
+        "or odd n_out) and use per-channel float8_e4m3fn instead. Enable debug "
+        "logging to list them."
+    )
+
+
 def _quantize_linear_kmajor_fp4(
     weight_f_n_major: torch.Tensor,
     block_size: int,
@@ -373,9 +406,6 @@ def _process_fp8_linear_weights(
     weight_block_size: tuple[int, int] | None,
     linear_config: VllmQuantLinearConfig | None,
     linear_quant_config: LinearQuantConfig | None = None,
-    keep_vllm_layout: bool = False,
-    is_linear: bool = True,
-    prefix: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, str, int | None]:
     """Convert checkpoint FP8 dense linear weights to the runtime FP8/FP4 layout.
 
@@ -405,33 +435,9 @@ def _process_fp8_linear_weights(
         out_dtype=torch.float32,
     )
     if requant_dtype == torch.float4_e2m1fn_x2:
-        n_out, n_in = weight_f.shape
-        if _can_requant_linear_to_fp4(
-            n_out,
-            n_in,
-            requant_block_size,
-            keep_vllm_layout=keep_vllm_layout,
-            is_linear=is_linear,
-        ):
-            assert requant_block_size is not None
-            weight, weight_scale = _quantize_linear_kmajor_fp4(
-                weight_f, requant_block_size
-            )
-            return weight, weight_scale, desired_quant_dtype, requant_block_size
-        logger.warning_once(
-            "FP4 linear requantization skipped for prefix=%r shape=%s "
-            "(is_linear=%s, keep_vllm_layout=%s, block=%s); falling back to "
-            "per-channel float8_e4m3fn.",
-            prefix,
-            tuple(weight_f.shape),
-            is_linear,
-            keep_vllm_layout,
-            requant_block_size,
-        )
-        desired_quant_dtype = "float8_e4m3fn"
-        requant_dtype = torch.float8_e4m3fn
-        requant_block_size = None
-        blockwise_kernel = False
+        assert requant_block_size is not None
+        weight, weight_scale = _quantize_linear_kmajor_fp4(weight_f, requant_block_size)
+        return weight, weight_scale, desired_quant_dtype, requant_block_size
     if requant_block_size is not None and weight_f.shape[-1] < requant_block_size:
         # Sub-block TP partition along the contracting dimension (e.g. RowParallel
         # down_proj with input_size_per_partition=64 < 128 at TP=16) has a single
@@ -1521,22 +1527,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         )
         self._linear_quant_config: LinearQuantConfig
         if wants_fp4 and self.prefix and not should_requantize_fp4(self.prefix):
-            self._linear_quant_config = (
-                "float8_e4m3fn",
-                torch.float8_e4m3fn,
-                None,
-                False,
-            )
+            self._linear_quant_config = _PER_CHANNEL_FP8_LINEAR_CONFIG
         elif quant_config.is_checkpoint_fp8_serialized or wants_fp4:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
         else:
             # Load-time quantization has its own fixed per-channel contract.
-            self._linear_quant_config = (
-                "float8_e4m3fn",
-                torch.float8_e4m3fn,
-                None,
-                False,
-            )
+            self._linear_quant_config = _PER_CHANNEL_FP8_LINEAR_CONFIG
 
     def create_weights(
         self,
@@ -1688,21 +1684,26 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False) or is_embedding
         ckpt_n_out, ckpt_n_in = layer.weight.shape
 
-        linear_quant_config: LinearQuantConfig = (
-            self._linear_quant_config
-            if hasattr(self, "_linear_quant_config")
-            else _get_linear_quant_config(self.linear_config)
-        )
-        effective_prefix = self.prefix or getattr(layer, "prefix", "")
-        if linear_quant_config[
-            1
-        ] == torch.float4_e2m1fn_x2 and not should_requantize_fp4(effective_prefix):
-            linear_quant_config = (
-                "float8_e4m3fn",
-                torch.float8_e4m3fn,
-                None,
-                False,
-            )
+        linear_quant_config = self._linear_quant_config
+        if linear_quant_config[1] == torch.float4_e2m1fn_x2:
+            effective_prefix = self.prefix or getattr(layer, "prefix", "")
+            if not should_requantize_fp4(effective_prefix):
+                linear_quant_config = _PER_CHANNEL_FP8_LINEAR_CONFIG
+            elif not _can_requant_linear_to_fp4(
+                ckpt_n_out,
+                ckpt_n_in,
+                linear_quant_config[2],
+                keep_vllm_layout=keep_vllm_layout,
+                is_linear=is_linear,
+            ):
+                _log_fp4_linear_fallback(
+                    effective_prefix,
+                    (ckpt_n_out, ckpt_n_in),
+                    is_linear=is_linear,
+                    keep_vllm_layout=keep_vllm_layout,
+                    block_size=linear_quant_config[2],
+                )
+                linear_quant_config = _PER_CHANNEL_FP8_LINEAR_CONFIG
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             raw_layer_block = getattr(layer, "weight_block_size", None)
@@ -1720,9 +1721,6 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     else None,
                     linear_config=self.linear_config,
                     linear_quant_config=linear_quant_config,
-                    keep_vllm_layout=keep_vllm_layout,
-                    is_linear=is_linear,
-                    prefix=effective_prefix,
                 )
             )
         elif self.online_fp8:
@@ -1738,35 +1736,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 linear_quant_config
             )
             weight_f = layer.weight.data.to(torch.float32)
-            if requant_dtype == torch.float4_e2m1fn_x2 and _can_requant_linear_to_fp4(
-                ckpt_n_out,
-                ckpt_n_in,
-                requant_block_size,
-                keep_vllm_layout=keep_vllm_layout,
-                is_linear=is_linear,
-            ):
+            if requant_dtype == torch.float4_e2m1fn_x2:
                 assert requant_block_size is not None
                 weight, weight_scale = _quantize_linear_kmajor_fp4(
                     weight_f, requant_block_size
                 )
-                requant_dtype_name = desired_quant_dtype
             else:
-                if requant_dtype == torch.float4_e2m1fn_x2:
-                    logger.warning_once(
-                        "FP4 load-time quantization skipped for prefix=%r shape=%s "
-                        "(is_linear=%s, keep_vllm_layout=%s, block=%s); falling "
-                        "back to per-channel float8_e4m3fn.",
-                        effective_prefix,
-                        tuple(weight_f.shape),
-                        is_linear,
-                        keep_vllm_layout,
-                        requant_block_size,
-                    )
-                    desired_quant_dtype = "float8_e4m3fn"
-                    requant_dtype = torch.float8_e4m3fn
-                    requant_block_size = None
-                    blockwise_kernel = False
-                elif (
+                if (
                     requant_block_size is not None
                     and weight_f.shape[-1] < requant_block_size
                 ):
@@ -1782,7 +1758,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     weight_scale,
                     blockwise_kernel=blockwise_kernel,
                 )
-                requant_dtype_name = desired_quant_dtype
+            requant_dtype_name = desired_quant_dtype
 
         # Canonical (k, n) layout: the runtime matmul is (m, k) @ (k, n), so
         # the checkpoint's [n_out, n_in] weight is transposed once here at load

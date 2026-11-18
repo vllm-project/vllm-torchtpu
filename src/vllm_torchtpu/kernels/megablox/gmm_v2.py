@@ -970,31 +970,35 @@ def calculate_tiling(
     tile_k = align_to(dims.size_k, num_lanes)
     tile_n = align_to(size_n_per_rhs, num_lanes)
 
+    # Native FP4 RHS against a quantized LHS is widened to the LHS quantized
+    # dtype inside inner_kernel. Only this path adds the upcast, scale and
+    # second accumulator terms below, so other dtypes keep their tiling.
+    fp4_rhs_upcast = (
+        lhs_cfgs.should_quantize
+        and rhs_dtype == jnp.dtype(jnp.float4_e2m1fn)
+        and not tpu_info.is_matmul_supported(
+            cast(jnp.dtype, lhs_cfgs.quant_dtype), rhs_dtype
+        )
+    )
+
     def _gmm_vmem_estimate(tm: int, tn: int, tk: int) -> int:
         # 1. LHS tile (double-buffered HBM load)
         lhs_tile_bytes = lhs_bits // 8
         lhs_vmem = 2 * tm * tk * lhs_tile_bytes
         rhs_upcast_vmem = 0
         # If LHS is quantized on-the-fly, we need an extra single-buffered cast
-        # buffer in VMEM, plus upcast/scale temporaries when 4-bit RHS is
-        # widened to LHS's quantized dtype inside inner_kernel.
+        # buffer in VMEM.
         if lhs_cfgs.should_quantize:
-            lhs_q_dtype = cast(jnp.dtype, lhs_cfgs.quant_dtype)
-            lhs_quant_bytes = jax.dtypes.itemsize_bits(lhs_q_dtype) // 8
-            lhs_vmem += tm * tk * lhs_quant_bytes
-            if not tpu_info.is_matmul_supported(lhs_q_dtype, rhs_dtype):
-                rhs_upcast_vmem += fuse_act_factor * tk * tn * lhs_quant_bytes
-            if (
-                rhs_cfgs.should_dequantize_after_matmul
-                and rhs_cfgs.quant_block_size is not None
-            ):
+            lhs_quant_bits = jax.dtypes.itemsize_bits(
+                cast(jnp.dtype, lhs_cfgs.quant_dtype)
+            )
+            lhs_vmem += tm * tk * (lhs_quant_bits // 8)
+            if fp4_rhs_upcast:
+                # Widened RHS tile plus the per-quant-block scaled partials.
                 num_qblocks = pl.cdiv(tk, rhs_cfgs.quant_block_size)
-                rhs_upcast_vmem += (
-                    fuse_act_factor
-                    * num_qblocks
-                    * tm
-                    * min(tn, tpu_info.mxu_column_size)
-                    * 4
+                rhs_upcast_vmem = fuse_act_factor * (
+                    tk * tn * (lhs_quant_bits // 8)
+                    + num_qblocks * tm * min(tn, tpu_info.mxu_column_size) * 4
                 )
 
         # 2. RHS tile (triple-buffered, includes scale and bias if present)
@@ -1014,11 +1018,11 @@ def calculate_tiling(
             + rhs_upcast_vmem
         )
 
-        # 3. Accumulator (quantized LHS accumulates per MXU column chunk in
-        # acc_list and concatenates into acc while chunks remain live).
+        # 3. Accumulator. The FP4 upcast path also keeps the per-MXU-column
+        # acc_list chunks live while they are concatenated into acc.
         acc_cols = fuse_act_factor * tn
         acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
-        acc_copies = 2 if lhs_cfgs.should_quantize else 1
+        acc_copies = 2 if fp4_rhs_upcast else 1
         acc_vmem = acc_copies * tm * acc_cols * acc_dtype_bytes
 
         # 4. Output tile (double-buffered)

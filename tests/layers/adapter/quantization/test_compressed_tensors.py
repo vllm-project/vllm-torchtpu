@@ -431,6 +431,8 @@ class TestCompressedTensorsQuantMethod:
         )
         method = cfg.get_quant_method(linear_layer, "proj")
         assert isinstance(method, VllmFp8LinearMethodTPU)
+        # REQUANTIZE_FP4_PREFIXES is matched against this prefix.
+        assert method.prefix == "proj"
 
     def test_get_quant_method_linear_scheme_none_fallback(
         self, linear_layer, monkeypatch

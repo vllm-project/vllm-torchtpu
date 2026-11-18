@@ -25,10 +25,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    Dimensions,
+    InputConfigs,
     TileSizes,
     apply_act_fn,
+    calculate_tiling,
     gmm_v2,
     interleave_lane,
     situ_and_mul,
@@ -85,6 +89,55 @@ def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
 
     actual = apply_act_fn(interleave_lane(gate, up), f"situ:4.0:{linear_beta}")
     _assert_allclose(actual, expected)
+
+
+# Expected tiles for the FP8 and INT4 cases are what calculate_tiling returns
+# without the FP4 upcast terms. FP4 needs room for the widened RHS tile, so
+# the same shape gets a smaller tile_m than INT4.
+@pytest.mark.parametrize(
+    ("rhs_dtype", "size_m", "size_k", "size_n", "block", "expected"),
+    [
+        # FP8 MoE w2 with a per-channel weight scale.
+        (jnp.float8_e4m3fn, 8192, 2048, 7168, 2048, TileSizes(256, 2048, 7168, 128)),
+        # Blockwise FP8 dense linear.
+        (jnp.float8_e4m3fn, 2048, 7168, 2048, 512, TileSizes(256, 7168, 2048, 128)),
+        # INT4 W4A8 MoE w2.
+        (jnp.int4, 8192, 2048, 7168, 512, TileSizes(512, 2048, 7168, 128)),
+        # Native FP4 W4A8 dense linear.
+        (jnp.float4_e2m1fn, 8192, 2048, 7168, 512, TileSizes(256, 2048, 7168, 128)),
+    ],
+)
+def test_calculate_tiling_adds_upcast_terms_only_for_fp4(
+    monkeypatch, rhs_dtype, size_m, size_k, size_n, block, expected
+):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info", lambda: info
+    )
+    dims = Dimensions(
+        size_m=size_m,
+        size_k=size_k,
+        size_n=size_n,
+        size_group=1,
+        size_lhs_group=1,
+        size_lhs_sublane=16,
+    )
+    lhs_cfgs = InputConfigs(
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        quant_block_size=512,
+        dtype=jnp.dtype(jnp.bfloat16),
+    )
+    rhs_cfgs = InputConfigs(
+        quant_dtype=jnp.dtype(rhs_dtype),
+        quant_block_size=block,
+        dtype=jnp.dtype(rhs_dtype),
+        has_scale=True,
+    )
+    vmem_limit_bytes = int(info.vmem_capacity_bytes * 0.9)
+
+    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes)
+
+    assert tiles == expected
 
 
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
