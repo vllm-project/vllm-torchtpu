@@ -249,6 +249,17 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
 
 
+def test_router_permutation_wraps_expert_write_staging():
+    """The later patch wraps process_weights_after_loading outermost, so the
+    routers are renumbered before the staging patch processes LinearBase
+    weights early and transposes gate.weight."""
+    reg = _load_registry()
+    targets = [p.target.split(":")[-1] for p in reg.PATCHES]
+    assert targets.index("patch_moe_expert_write_staging") < targets.index(
+        "patch_expert_placement_routers"
+    )
+
+
 def test_plugin_import_sets_environment_before_jax():
     import os
     import subprocess

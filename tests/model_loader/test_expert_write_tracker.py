@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
+from types import SimpleNamespace
+from typing import Any, cast
+
+import pytest
 import torch
 
 from vllm_torchtpu.model_loader_patches import ExpertParamStager, ExpertWriteTracker
@@ -179,95 +184,96 @@ def test_interleaved_parameters_sharing_pooled_buffers_keep_their_experts():
         assert torch.equal(param.data[:, 2:], torch.full((2, 2, 2), float(w3)))
 
 
-def test_the_patched_loader_keeps_the_upstream_loader_attributes(monkeypatch):
+@pytest.fixture
+def staging_patch_undo(monkeypatch):
+    """Undo patch_moe_expert_write_staging after the test.
+
+    The patch is process-wide; undoing it lets later tests load expert weights
+    through the stock loader and start from a fresh stager.
+    """
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.model_loader import base_loader
 
-    from vllm_torchtpu.model_loader_patches import patch_moe_expert_write_staging
-
-    # The patch is process-wide; undo it after the test so later tests load
-    # expert weights through the stock loader.
     monkeypatch.setattr(RoutedExperts, "weight_loader", RoutedExperts.weight_loader)
     monkeypatch.setattr(
         RoutedExperts, "_tpu_expert_staging_patch", False, raising=False
     )
+    monkeypatch.setattr(RoutedExperts, "_tpu_expert_stager", None, raising=False)
     monkeypatch.setattr(
         base_loader,
         "process_weights_after_loading",
         base_loader.process_weights_after_loading,
     )
+
+
+def test_the_patched_loader_keeps_the_upstream_loader_attributes(staging_patch_undo):
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    from vllm_torchtpu.model_loader_patches import patch_moe_expert_write_staging
+
     patch_moe_expert_write_staging()
     loader = RoutedExperts.weight_loader
     assert loader.supports_moe_loading is True
     assert loader.__name__ == "weight_loader"
 
 
-def test_linear_weights_processed_before_expert_flush_and_not_rerun(monkeypatch):
-    from types import SimpleNamespace
-    from typing import Any, cast
+_MODEL_CONFIG = SimpleNamespace(dtype=torch.bfloat16, quantization=None)
 
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-    from vllm.model_executor.layers.linear import LinearBase
+
+def _quant_method(process):
+    """A quant method whose process_weights_after_loading calls `process`."""
     from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+
+    class _QuantMethod(QuantizeMethodBase):
+        def create_weights(self, layer: torch.nn.Module, *args: Any, **kwargs: Any):
+            return None
+
+        def apply(self, layer: torch.nn.Module, *args: Any, **kwargs: Any):
+            return None
+
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            process(layer)
+
+    return _QuantMethod()
+
+
+def _tagged(module: Any, quant_method: Any, tag: str) -> Any:
+    module.quant_method = quant_method
+    module.tag = tag
+    return module
+
+
+def _linear(quant_method: Any, tag: str) -> Any:
+    from vllm.model_executor.layers.linear import LinearBase
+
+    linear = LinearBase.__new__(LinearBase)
+    torch.nn.Module.__init__(linear)
+    return _tagged(linear, quant_method, tag)
+
+
+def _experts(quant_method: Any = None) -> Any:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    experts = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(experts)
+    return _tagged(experts, quant_method, "experts")
+
+
+def _model(**children: torch.nn.Module) -> torch.nn.Module:
+    model = torch.nn.Module()
+    for name, child in children.items():
+        model.add_module(name, child)
+    return model
+
+
+@pytest.fixture
+def post_load(staging_patch_undo, monkeypatch):
+    """Upstream's process_weights_after_loading wrapped by the staging patch."""
     from vllm.model_executor.model_loader import base_loader
     from vllm.model_executor.model_loader import utils as loader_utils
 
     from vllm_torchtpu.model_loader_patches import patch_moe_expert_write_staging
 
-    events: list[str] = []
-
-    experts = RoutedExperts.__new__(RoutedExperts)
-    torch.nn.Module.__init__(experts)
-    experts.w2 = _param(2, 4, 4)
-
-    class _SharedLinearQuantMethod(QuantizeMethodBase):
-        def create_weights(self, layer: torch.nn.Module, *args: Any, **kwargs: Any):
-            return None
-
-        def apply(self, layer: torch.nn.Module, *args: Any, **kwargs: Any):
-            return None
-
-        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-            # LinearBase must run while staged expert writes are still buffered
-            # on host (before stager.flush_all() writes experts.w2 to device).
-            assert torch.equal(experts.w2.data[0], torch.zeros((4, 4)))
-            events.append(f"linear:{cast(Any, layer).tag}")
-
-    class _ExpertsQuantMethod(QuantizeMethodBase):
-        def create_weights(self, layer: torch.nn.Module, *args: Any, **kwargs: Any):
-            return None
-
-        def apply(self, layer: torch.nn.Module, *args: Any, **kwargs: Any):
-            return None
-
-        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-            # RoutedExperts must run after stager.flush_all() has landed w2.
-            assert torch.equal(experts.w2.data[0], torch.full((4, 4), 9.0))
-            events.append("experts")
-
-    shared_qm = _SharedLinearQuantMethod()
-    orig_qm_fn = shared_qm.process_weights_after_loading
-    experts_qm = _ExpertsQuantMethod()
-    cast(Any, experts).quant_method = experts_qm
-
-    def _make_linear(tag: str) -> LinearBase:
-        lin = LinearBase.__new__(LinearBase)
-        torch.nn.Module.__init__(lin)
-        cast(Any, lin).quant_method = shared_qm
-        cast(Any, lin).tag = tag
-        return lin
-
-    class _Model(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.experts = experts
-            self.lin_a = _make_linear("a")
-            self.lin_b = _make_linear("b")
-
-    monkeypatch.setattr(RoutedExperts, "weight_loader", RoutedExperts.weight_loader)
-    monkeypatch.setattr(
-        RoutedExperts, "_tpu_expert_staging_patch", False, raising=False
-    )
     monkeypatch.setattr(
         base_loader,
         "process_weights_after_loading",
@@ -277,79 +283,130 @@ def test_linear_weights_processed_before_expert_flush_and_not_rerun(monkeypatch)
         loader_utils, "maybe_retie_word_embeddings", lambda *a, **kw: None
     )
     patch_moe_expert_write_staging()
+    return lambda model: base_loader.process_weights_after_loading(
+        model, _MODEL_CONFIG, torch.device("cpu")
+    )
 
-    model = _Model()
+
+def test_linear_weights_processed_before_expert_flush_and_not_rerun(post_load):
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    events: list[str] = []
+
+    def process_experts(layer: Any) -> None:
+        # RoutedExperts runs after stager.flush_all() has written w2.
+        assert torch.equal(layer.w2.data[0], torch.full((4, 4), 9.0))
+        events.append(layer.tag)
+
+    experts = _experts(_quant_method(process_experts))
+    experts.w2 = _param(2, 4, 4)
+
+    def process_linear(layer: Any) -> None:
+        # LinearBase runs while expert writes are still staged on the host.
+        assert torch.equal(experts.w2.data[0], torch.zeros((4, 4)))
+        events.append(layer.tag)
+
+    shared_qm = _quant_method(process_linear)
+    model = _model(
+        experts=experts,
+        lin_a=_linear(shared_qm, "a"),
+        lin_b=_linear(shared_qm, "b"),
+    )
     stager = cast(Any, RoutedExperts)._tpu_expert_stager
-    # Stage only expert 0 of 2 so w2 remains host-staged until flush_all().
+    # Stage only expert 0 of 2 so w2 stays on the host until flush_all().
     stager.host_param(experts.w2)[0] = 9.0
     assert not stager.written(experts.w2, 0, "w2")
-    assert torch.equal(experts.w2.data[0], torch.zeros((4, 4)))
 
-    model_cfg = SimpleNamespace(
-        dtype=torch.bfloat16,
-        quantization=None,
-        hf_config=SimpleNamespace(tie_word_embeddings=False),
+    post_load(model)
+
+    assert events == ["a", "b", "experts"]
+    # The overrides are removed rather than shadowed by instance attributes.
+    assert "process_weights_after_loading" not in vars(shared_qm)
+    assert "requires_device_loading" not in vars(shared_qm)
+
+
+def test_offloaded_linear_modules_are_not_moved_to_the_device_twice(
+    post_load, monkeypatch
+):
+    """Under CPU offloading, upstream's pass skips the device round trip for
+    linear modules the early pass already processed."""
+    from vllm.model_executor.model_loader import utils as loader_utils
+
+    entered: list[str] = []
+
+    @contextlib.contextmanager
+    def spy_device_loading(module, target_device):
+        entered.append(module.tag)
+        yield module
+
+    monkeypatch.setattr(loader_utils, "device_loading_context", spy_device_loading)
+    shared_qm = _quant_method(lambda layer: None)
+    model = _model(
+        experts=_experts(_quant_method(lambda layer: None)),
+        lin_a=_linear(shared_qm, "a"),
+        lin_b=_linear(shared_qm, "b"),
     )
-    base_loader.process_weights_after_loading(model, model_cfg, torch.device("cpu"))
 
-    assert events == ["linear:a", "linear:b", "experts"]
-    assert shared_qm.process_weights_after_loading == orig_qm_fn
-    assert shared_qm.requires_device_loading is True
+    post_load(model)
+
+    assert entered == ["a", "b", "experts"]
 
 
-def test_linear_weights_exception_restores_quant_methods(monkeypatch):
-    from typing import Any, cast
+def test_quant_method_shared_with_a_non_linear_module_keeps_device_loading(
+    post_load,
+):
+    events: list[tuple[str, bool]] = []
 
-    import pytest
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-    from vllm.model_executor.layers.linear import LinearBase
-    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    def process(layer: Any) -> None:
+        events.append((layer.tag, shared_qm.requires_device_loading))
+
+    shared_qm = _quant_method(process)
+    model = _model(
+        experts=_experts(),
+        lin=_linear(shared_qm, "lin"),
+        other=_tagged(torch.nn.Module(), shared_qm, "other"),
+    )
+
+    post_load(model)
+
+    assert events == [("lin", True), ("other", True)]
+
+
+def test_dense_model_takes_the_upstream_path(staging_patch_undo, monkeypatch):
     from vllm.model_executor.model_loader import base_loader
 
     from vllm_torchtpu.model_loader_patches import patch_moe_expert_write_staging
 
-    class _BoomQuantMethod(QuantizeMethodBase):
-        def create_weights(self, layer: torch.nn.Module, *args: Any, **kwargs: Any):
-            return None
-
-        def apply(self, layer: torch.nn.Module, *args: Any, **kwargs: Any):
-            return None
-
-        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-            if cast(Any, layer).fail:
-                raise RuntimeError("boom in early linear pwal")
-
-    shared_qm = _BoomQuantMethod()
-    orig_qm_fn = shared_qm.process_weights_after_loading
-
-    def _make_linear(fail: bool) -> LinearBase:
-        lin = LinearBase.__new__(LinearBase)
-        torch.nn.Module.__init__(lin)
-        cast(Any, lin).quant_method = shared_qm
-        cast(Any, lin).fail = fail
-        return lin
-
-    class _Model(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.experts = RoutedExperts.__new__(RoutedExperts)
-            torch.nn.Module.__init__(self.experts)
-            self.lin_ok = _make_linear(False)
-            self.lin_fail = _make_linear(True)
-
-    monkeypatch.setattr(RoutedExperts, "weight_loader", RoutedExperts.weight_loader)
+    calls: list[tuple[Any, ...]] = []
     monkeypatch.setattr(
-        RoutedExperts, "_tpu_expert_staging_patch", False, raising=False
-    )
-    monkeypatch.setattr(
-        base_loader,
-        "process_weights_after_loading",
-        base_loader.process_weights_after_loading,
+        base_loader, "process_weights_after_loading", lambda *a: calls.append(a)
     )
     patch_moe_expert_write_staging()
+    events: list[str] = []
+    qm = _quant_method(lambda layer: events.append(layer.tag))
+    model = _model(lin=_linear(qm, "lin"))
+    device = torch.device("cpu")
 
-    with pytest.raises(RuntimeError, match="boom in early linear pwal"):
-        base_loader.process_weights_after_loading(_Model(), None, torch.device("cpu"))
+    base_loader.process_weights_after_loading(model, _MODEL_CONFIG, device)
 
-    assert shared_qm.process_weights_after_loading == orig_qm_fn
-    assert shared_qm.requires_device_loading is True
+    assert calls == [(model, _MODEL_CONFIG, device)]
+    assert events == []
+
+
+def test_failed_expert_processing_restores_quant_methods(post_load):
+    def process_experts(layer: Any) -> None:
+        # The early pass has finished, so the overrides are in place.
+        assert shared_qm.requires_device_loading is False
+        raise RuntimeError("boom in expert pwal")
+
+    shared_qm = _quant_method(lambda layer: None)
+    model = _model(
+        experts=_experts(_quant_method(process_experts)),
+        lin=_linear(shared_qm, "lin"),
+    )
+
+    with pytest.raises(RuntimeError, match="boom in expert pwal"):
+        post_load(model)
+
+    assert "process_weights_after_loading" not in vars(shared_qm)
+    assert "requires_device_loading" not in vars(shared_qm)

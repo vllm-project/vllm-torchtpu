@@ -13,8 +13,8 @@
 # limitations under the License.
 """Tests for NVFP4 (ModelOpt FP4) quantization support for TPU.
 
-Verifies helper functions (fresh_buffer, _to_kernel_scale, _requant_moe_w4a8),
-VllmNvfp4Config dispatch, VllmNvfp4LinearMethod (create_weights,
+Verifies helper functions (fresh_buffer, _to_kernel_scale, _requant_w13_padded,
+_requant_w2_padded), VllmNvfp4Config dispatch, VllmNvfp4LinearMethod (create_weights,
 process_weights_after_loading, apply), and VllmNvfp4MoEMethod (create_weights,
 process_weights_after_loading across W4A16 and W4A8 paths, apply_monolithic).
 """
@@ -36,7 +36,8 @@ from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4LinearMethod,
     VllmNvfp4MoEMethod,
     _NullInputQuantKernel,
-    _requant_moe_w4a8,
+    _requant_w2_padded,
+    _requant_w13_padded,
     _to_kernel_scale,
 )
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
@@ -125,9 +126,8 @@ class TestNvfp4Helpers:
         w2_u8 = torch.randint(0, 256, (E, H, inter // 2), dtype=torch.uint8)
         w2_scale_f = torch.rand(E, H, inter // 16, dtype=torch.float32) + 0.1
 
-        w13_out, w13_s4, w2_out, w2_s4 = _requant_moe_w4a8(
-            w13_u8, w13_scale_f, w2_u8, w2_scale_f, block
-        )
+        w13_out, w13_s4 = _requant_w13_padded(w13_u8, w13_scale_f, block)
+        w2_out, w2_s4 = _requant_w2_padded(w2_u8, w2_scale_f, block)
 
         assert w13_out.shape == (E, two_i, H // 2)
         assert w13_s4.shape == (E, H // block, 1, two_i)
@@ -144,9 +144,8 @@ class TestNvfp4Helpers:
         w2_u8 = torch.randint(0, 256, (E, H, inter // 2), dtype=torch.uint8)
         w2_scale_f = torch.rand(E, H, inter // 16, dtype=torch.float32) + 0.1
 
-        w13_out, w13_s4, w2_out, w2_s4 = _requant_moe_w4a8(
-            w13_u8, w13_scale_f, w2_u8, w2_scale_f, block
-        )
+        w13_out, w13_s4 = _requant_w13_padded(w13_u8, w13_scale_f, block)
+        w2_out, w2_s4 = _requant_w2_padded(w2_u8, w2_scale_f, block)
 
         assert w13_out.shape == (E, 64, H // 2)
         assert w13_s4.shape == (E, H // block, 1, 64)
@@ -158,11 +157,9 @@ class TestNvfp4Helpers:
         E, two_i, H_unaligned, block = 2, 32, 30, 16
         w13_u8 = torch.randint(0, 256, (E, two_i, H_unaligned // 2), dtype=torch.uint8)
         w13_scale_f = torch.rand(E, two_i, 2, dtype=torch.float32)
-        w2_u8 = torch.randint(0, 256, (E, H_unaligned, 8), dtype=torch.uint8)
-        w2_scale_f = torch.rand(E, H_unaligned, 1, dtype=torch.float32)
 
         with pytest.raises(AssertionError, match="divisible by block"):
-            _requant_moe_w4a8(w13_u8, w13_scale_f, w2_u8, w2_scale_f, block)
+            _requant_w13_padded(w13_u8, w13_scale_f, block)
 
 
 @pytest.mark.tpu_test
@@ -587,8 +584,11 @@ class TestNvfp4MoEMethod:
 
         with (
             patch(
-                "vllm_torchtpu.layers.adapter.quantization.nvfp4._requant_moe_w4a8"
-            ) as mock_torch_requant,
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4._requant_w13_padded"
+            ) as mock_w13_requant,
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4._requant_w2_padded"
+            ) as mock_w2_requant,
             patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.load_kmajor_fp4"
             ) as mock_load,
@@ -596,15 +596,18 @@ class TestNvfp4MoEMethod:
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.prebuild_fused_moe_kernel"
             ),
         ):
-            mock_torch_requant.return_value = (
+            mock_w13_requant.return_value = (
                 torch.zeros(E, 64, 32, dtype=torch.uint8),
                 torch.zeros(E, 2, 1, 64),
+            )
+            mock_w2_requant.return_value = (
                 torch.zeros(E, 64, 16, dtype=torch.uint8),
                 torch.zeros(E, 1, 1, 64),
             )
             mock_load.side_effect = lambda t: t
             method.process_weights_after_loading(layer)
-            mock_torch_requant.assert_called_once()
+            mock_w13_requant.assert_called_once()
+            mock_w2_requant.assert_called_once()
             assert mock_load.call_count == 2
 
     def test_process_weights_with_expert_parallel(self):
@@ -722,13 +725,24 @@ class TestNvfp4MoEMethod:
             assert torch.equal(out, torch.ones(4, 64))
             mock_pipe.assert_called_once()
 
-    def test_install_prepared_moe_weights_replaces_w13_before_w2_requant(self):
+    @pytest.mark.parametrize(
+        "two_i, expected_mode",
+        [
+            (1024, "FP4 (jax requant block-512)"),
+            # inter=384 is not a multiple of the block, so it takes the padded
+            # torch requant.
+            (768, "FP4 (torch requant block-512)"),
+        ],
+    )
+    def test_install_prepared_moe_weights_replaces_w13_before_w2_requant(
+        self, two_i, expected_mode
+    ):
         from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
             _install_prepared_moe_weights,
         )
 
         layer = FakeRoutedExperts(use_ep=False)
-        e, two_i, h, group_size = 2, 1024, 512, 16
+        e, h, group_size = 2, 512, 16
         inter = two_i // 2
         orig_w13 = torch.zeros(e, two_i, h // 2, dtype=torch.uint8)
         orig_w2 = torch.ones(e, h, inter // 2, dtype=torch.uint8)
@@ -775,7 +789,19 @@ class TestNvfp4MoEMethod:
                 side_effect=lambda t: t,
             ),
             patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4.load_kmajor_fp4",
+                side_effect=lambda t: t,
+            ),
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.requant_load_kmajor_fp4",
+                side_effect=_fake_requant,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4._requant_w13_padded",
+                side_effect=_fake_requant,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.nvfp4._requant_w2_padded",
                 side_effect=_fake_requant,
             ),
             patch(
@@ -784,7 +810,7 @@ class TestNvfp4MoEMethod:
         ):
             _, mode = _install_prepared_moe_weights(layer, requant_block=512)
 
-        assert mode == "FP4 (jax requant block-512)"
+        assert mode == expected_mode
         assert events == ["requant:w13", "requant:w2"]
         assert not hasattr(layer, "w2_weight_scale_2")
         mock_sync.assert_not_called()

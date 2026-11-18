@@ -121,32 +121,26 @@ def _to_kernel_scale(scale_f32: torch.Tensor) -> torch.Tensor:
     return fresh_buffer(s.unsqueeze(-2))  # [*, num_blocks, 1, out]
 
 
-def _requant_moe_w4a8(
-    w13_u8: torch.Tensor,
-    w13_scale_f: torch.Tensor,
-    w2_u8: torch.Tensor,
-    w2_scale_f: torch.Tensor,
-    block: int,
-):
-    """Requantize NVFP4 MoE weights from native block-16 to block-`block` fp4
+def _requant_w13_padded(
+    w13_u8: torch.Tensor, w13_scale_f: torch.Tensor, block: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Requantize NVFP4 MoE w13 from native block-16 to block-`block` fp4
     for either W4A16 GMM or W4A8 fused EP execution.
 
-    Dequantizes with the fused block-16 scale, pads the MoE intermediate up to a
-    multiple of `block` (zero-pad: w13's two output halves and w2's contracting
-    dim; the padded region is zero-weight so it is numerically inert), then
-    requantizes to block-`block` fp4. Pure PyTorch, reusing the common fp4
-    toolkit (the only fp4 ops that cannot be torch live at the kernel boundary).
-    Returns packed (w13_u8, w13_scale_4d, w2_u8, w2_scale_4d).
+    Dequantizes with the fused block-16 scale, zero-pads each output half (gate
+    and up) of the MoE intermediate up to a multiple of `block` (the padded
+    rows are zero-weight, so they are numerically inert), then requantizes.
+    Pure PyTorch, reusing the common fp4 toolkit. Returns packed
+    (w13_u8, w13_scale_4d).
     """
     H = w13_u8.shape[-1] * 2  # contracting dim of w13
-    two_i = w13_u8.shape[1]
-    inter = two_i // 2  # MoE intermediate (per expert)
+    inter = w13_u8.shape[1] // 2  # MoE intermediate (per expert)
     assert H % block == 0, (
         f"NVFP4 requant needs hidden ({H}) divisible by block ({block})."
     )
     inter_pad = align_to(inter, block) - inter
 
-    # w13: dequant block-16 -> [E, 2I, H] fp32; pad each output half I -> I_pad.
+    # Dequant block-16 -> [E, 2I, H] fp32; pad each output half I -> I_pad.
     w13_f = dequantize_tensor(unpack_uint8_to_fp4(w13_u8), w13_scale_f, axis=-1)
     gate, up = w13_f[:, :inter, :], w13_f[:, inter:, :]
     if inter_pad:
@@ -155,25 +149,33 @@ def _requant_moe_w4a8(
     w13_idx, w13_s = quantize_tensor_to_fp4(
         torch.cat([gate, up], dim=1), axis=-1, block_size=block
     )
+    del w13_f, gate, up
     w13_out = pack_fp4_indices(w13_idx)  # [E, 2*I_pad, H/2]
     w13_scale_4d = _to_kernel_scale(w13_s.to(torch.float32))
-    del w13_f, gate, up, w13_idx, w13_s
+    del w13_idx, w13_s
+    return fresh_buffer(w13_out), fresh_buffer(w13_scale_4d)
 
-    # w2: dequant block-16 -> [E, H, I] fp32; pad contracting dim I -> I_pad.
+
+def _requant_w2_padded(
+    w2_u8: torch.Tensor, w2_scale_f: torch.Tensor, block: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Requantize NVFP4 MoE w2 from native block-16 to block-`block` fp4,
+    zero-padding its contracting dim (the MoE intermediate) up to a multiple
+    of `block`. Returns packed (w2_u8, w2_scale_4d).
+    """
+    inter = w2_u8.shape[-1] * 2
+    inter_pad = align_to(inter, block) - inter
+
+    # Dequant block-16 -> [E, H, I] fp32; pad contracting dim I -> I_pad.
     w2_f = dequantize_tensor(unpack_uint8_to_fp4(w2_u8), w2_scale_f, axis=-1)
     if inter_pad:
         w2_f = torch.nn.functional.pad(w2_f, (0, inter_pad))
     w2_idx, w2_s = quantize_tensor_to_fp4(w2_f, axis=-1, block_size=block)
+    del w2_f
     w2_out = pack_fp4_indices(w2_idx)  # [E, H, I_pad/2]
     w2_scale_4d = _to_kernel_scale(w2_s.to(torch.float32))
-    del w2_f, w2_idx, w2_s
-
-    return (
-        fresh_buffer(w13_out),
-        fresh_buffer(w13_scale_4d),
-        fresh_buffer(w2_out),
-        fresh_buffer(w2_scale_4d),
-    )
+    del w2_idx, w2_s
+    return fresh_buffer(w2_out), fresh_buffer(w2_scale_4d)
 
 
 def _expand_w13_scale(layer: TpuRoutedExperts) -> torch.Tensor:
@@ -193,86 +195,54 @@ def _expand_w2_scale(layer: TpuRoutedExperts) -> torch.Tensor:
     return w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
 
-def _drop_attrs(layer: Any, *names: str) -> None:
-    for attr in names:
+def _install_moe_weight(
+    layer: TpuRoutedExperts, prefix: str, weight: torch.Tensor, scale: torch.Tensor
+) -> None:
+    """Replace one projection's checkpoint tensors with its prepared weight."""
+    for attr in (f"{prefix}_weight_scale_2", f"{prefix}_input_scale"):
         if hasattr(layer, attr):
             delattr(layer, attr)
+    weight_param = torch.nn.Parameter(weight, requires_grad=False)
+    scale_param = torch.nn.Parameter(scale, requires_grad=False)
+    setattr(layer, f"{prefix}_weight", weight_param)
+    setattr(layer, f"{prefix}_weight_scale", scale_param)
+    if weight.device.type == "tpu":
+        synchronize_tensors([weight_param, scale_param])
 
 
 def _install_prepared_moe_weights(
     layer: TpuRoutedExperts, requant_block: int | None
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], str]:
-    """Prepare and install w13 before expanding/preparing w2 to bound peak HBM."""
+    """Prepare and install w13, then w2, so checkpoint w13 and its FP32
+    block-16 scale are freed before w2 is expanded and prepared."""
     hidden = layer.w13_weight.shape[-1] * 2
     inter = layer.w2_weight.shape[-1] * 2
     block = int(requant_block) if requant_block else 0
+    # A block that does not divide hidden or inter takes the torch requant,
+    # which pads the intermediate.
+    padded = bool(block) and (hidden % block != 0 or inter % block != 0)
 
-    if block and (hidden % block != 0 or inter % block != 0):
-        # Padded fallback: transform both together then install.
-        w13_scale_f = _expand_w13_scale(layer)
-        w2_scale_f = _expand_w2_scale(layer)
-        w13_u8, s13, w2_u8, s2 = _requant_moe_w4a8(
-            layer.w13_weight.data, w13_scale_f, layer.w2_weight.data, w2_scale_f, block
-        )
-        del w13_scale_f, w2_scale_f
-        w13 = load_kmajor_fp4(w13_u8)
-        w2 = load_kmajor_fp4(w2_u8)
-        _drop_attrs(
-            layer,
-            "w13_weight_scale_2",
-            "w2_weight_scale_2",
-            "w13_input_scale",
-            "w2_input_scale",
-        )
-        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
-        if layer.w13_weight.device.type == "tpu":
-            synchronize_tensors(
-                [
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    layer.w13_weight_scale,
-                    layer.w2_weight_scale,
-                ]
-            )
-        return (w13, w2, s13, s2), f"FP4 (torch requant block-{block})"
+    def prepare(w_u8, scale_f, requant_padded):
+        if padded:
+            w_u8, scale = requant_padded(w_u8, scale_f, block)
+            return load_kmajor_fp4(w_u8), scale
+        if block:
+            return requant_load_kmajor_fp4(fresh_buffer(w_u8), scale_f, block)
+        return load_kmajor_fp4(fresh_buffer(w_u8)), _to_kernel_scale(scale_f)
 
-    # Sequential w13 -> replace & sync -> w2 -> replace & sync so checkpoint
-    # w13 HBM and its FP32 block-16 scale tensor are freed before w2 starts.
-    w13_scale_f = _expand_w13_scale(layer)
-    if block:
-        w13, s13 = requant_load_kmajor_fp4(
-            fresh_buffer(layer.w13_weight.data), w13_scale_f, block
-        )
+    w13, s13 = prepare(
+        layer.w13_weight.data, _expand_w13_scale(layer), _requant_w13_padded
+    )
+    _install_moe_weight(layer, "w13", w13, s13)
+    w2, s2 = prepare(layer.w2_weight.data, _expand_w2_scale(layer), _requant_w2_padded)
+    _install_moe_weight(layer, "w2", w2, s2)
+
+    if padded:
+        mode = f"FP4 (torch requant block-{block})"
+    elif block:
         mode = f"FP4 (jax requant block-{block})"
     else:
-        w13 = load_kmajor_fp4(fresh_buffer(layer.w13_weight.data))
-        s13 = _to_kernel_scale(w13_scale_f)
         mode = "FP4 (block-16)"
-    del w13_scale_f
-    _drop_attrs(layer, "w13_weight_scale_2", "w13_input_scale")
-    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
-    layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
-    if layer.w13_weight.device.type == "tpu":
-        synchronize_tensors([layer.w13_weight, layer.w13_weight_scale])
-
-    w2_scale_f = _expand_w2_scale(layer)
-    if block:
-        w2, s2 = requant_load_kmajor_fp4(
-            fresh_buffer(layer.w2_weight.data), w2_scale_f, block
-        )
-    else:
-        w2 = load_kmajor_fp4(fresh_buffer(layer.w2_weight.data))
-        s2 = _to_kernel_scale(w2_scale_f)
-    del w2_scale_f
-    _drop_attrs(layer, "w2_weight_scale_2", "w2_input_scale")
-    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
-    layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
-    if layer.w2_weight.device.type == "tpu":
-        synchronize_tensors([layer.w2_weight, layer.w2_weight_scale])
-
     return (w13, w2, s13, s2), mode
 
 

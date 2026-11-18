@@ -1036,9 +1036,6 @@ def patch_moe_expert_write_staging() -> None:
         from vllm.model_executor.layers.quantization.online.fp8 import (
             OnlineLinearBase,
         )
-        from vllm.model_executor.layers.quantization.online.moe_base import (
-            OnlineMoEMethodBase,
-        )
         from vllm.model_executor.model_loader import utils as loader_utils
 
         has_moe = len(stager) > 0 or any(
@@ -1055,22 +1052,29 @@ def patch_moe_expert_write_staging() -> None:
         # and running RoutedExperts post-load hooks: shrinking or repacking
         # dense weights first lowers the HBM high-water mark ahead of MoE
         # expert requantization.
+        patched_attrs = ("process_weights_after_loading", "requires_device_loading")
         done_modules: set[int] = set()
-        saved_qms: dict[int, tuple[typing.Any, typing.Any, bool]] = {}
+        # id(qm) -> (qm, its original patched_attrs values, and the subset
+        # that qm held as instance attributes).
+        saved_qms: dict[
+            int, tuple[typing.Any, typing.Any, bool, dict[str, typing.Any]]
+        ] = {}
         try:
             for module in model.modules():
                 qm = getattr(module, "quant_method", None)
                 if not (
                     isinstance(module, LinearBase)
-                    and qm is not None
                     and isinstance(qm, QuantizeMethodBase)
                 ):
                     continue
                 qm_id = id(qm)
                 if qm_id not in saved_qms:
                     orig_pwal = qm.process_weights_after_loading
-                    orig_req_dev = bool(getattr(qm, "requires_device_loading", True))
-                    saved_qms[qm_id] = (qm, orig_pwal, orig_req_dev)
+                    orig_req_dev = qm.requires_device_loading
+                    own_attrs = {
+                        k: v for k, v in vars(qm).items() if k in patched_attrs
+                    }
+                    saved_qms[qm_id] = (qm, orig_pwal, orig_req_dev, own_attrs)
 
                     def _guarded_pwal(m, _orig=orig_pwal):
                         if id(m) not in done_modules:
@@ -1081,7 +1085,7 @@ def patch_moe_expert_write_staging() -> None:
                         typing.Any, qm
                     ).process_weights_after_loading = _guarded_pwal
                 else:
-                    _, orig_pwal, orig_req_dev = saved_qms[qm_id]
+                    _, orig_pwal, orig_req_dev, _ = saved_qms[qm_id]
 
                 loading_ctx = (
                     loader_utils.device_loading_context(module, target_device)
@@ -1090,7 +1094,7 @@ def patch_moe_expert_write_staging() -> None:
                 )
                 timing_ctx = (
                     loader_utils.online_quantization_timing_context(module, qm)
-                    if isinstance(qm, (OnlineLinearBase, OnlineMoEMethodBase))
+                    if isinstance(qm, OnlineLinearBase)
                     else nullcontext()
                 )
                 with loading_ctx, timing_ctx:
@@ -1106,7 +1110,7 @@ def patch_moe_expert_write_staging() -> None:
                 for m in model.modules()
                 if not isinstance(m, LinearBase)
             }
-            for qm_id, (qm, _, _) in saved_qms.items():
+            for qm_id, (qm, _, _, _) in saved_qms.items():
                 if qm_id not in non_linear_qms:
                     typing.cast(typing.Any, qm).requires_device_loading = False
 
@@ -1120,9 +1124,15 @@ def patch_moe_expert_write_staging() -> None:
             )
             return orig_process(model, model_config, target_device)
         finally:
-            for qm, orig_pwal, orig_req_dev in saved_qms.values():
-                typing.cast(typing.Any, qm).process_weights_after_loading = orig_pwal
-                typing.cast(typing.Any, qm).requires_device_loading = orig_req_dev
+            # Popping rather than assigning back lets the class attributes show
+            # through again; assigning the saved bound method would leave an
+            # instance attribute that references qm itself.
+            for qm, _, _, own_attrs in saved_qms.values():
+                for name in patched_attrs:
+                    if name in own_attrs:
+                        setattr(qm, name, own_attrs[name])
+                    else:
+                        vars(qm).pop(name, None)
 
     RoutedExperts.weight_loader = weight_loader
     RoutedExperts._tpu_expert_staging_patch = True
