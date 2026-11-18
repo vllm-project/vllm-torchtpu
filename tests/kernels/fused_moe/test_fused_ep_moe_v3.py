@@ -54,13 +54,15 @@ entry's settings (``combine_real_tokens``, ``sort_index_compare``,
 for bit, and the dense-slots layer
 (``models/qwen3_5/kernels/dense_slots.py``) the entry selects for calls of at
 most 64 rows per shard, which with float32 scaling products must give the
-values of this layer with bf16 result rows bit for bit.
+values of this layer with bf16 result rows bit for bit. The dense-slots check
+also runs worlds where experts get no rows, so the program skips their weight
+streams and fills its weight slots by list position.
 
 The layer does not run in the TPU interpreter on CPU: its token exchange
 returns DMA semaphores from one Pallas program to the next, which the
 interpreter cannot do. The CPU tests here check the reference itself, in
 interpret mode, against a by-hand computation and against routing errors.
-Small shapes: hidden 1024, intermediate 128, 16 or 32 experts, top-k 4.
+Small shapes: hidden 1024, intermediate 128, 16, 32 or 64 experts, top-k 4.
 """
 
 import importlib
@@ -90,6 +92,17 @@ RESULT_ROWS = ("fp8", "bf16")
 # carry them, the kernel routes over the primaries only and never reads them
 # (they hold NaN here, so a read shows in the output).
 COPY_SLOTS = {"copy_slots": 2}
+# Worlds of the dense-slots check where experts get no rows: 64 experts, 8 per
+# shard, and local experts 1, 3, 5 and 6 of every shard never selected. The
+# program lists its first dense_slots.WEIGHT_SLOTS - 1 experts whatever their
+# rows (their weights stream before the tables exist), skips the cold ones
+# after them, and gives each listed expert the weight slot of its list
+# position, which differs from its expert index once one is skipped.
+COLD_CASES = {
+    "cold_experts": (64, 24, "cold", 0),
+    "cold_short_shards": (64, 32, "cold", 5),
+}
+COLD_LOCAL_EXPERTS = (1, 3, 5, 6)
 # The serving bridge passes each shard's index as an operand
 # (no side effects, no jit of the layer's own); the kernel's own mode reads
 # the mesh axis. mode: (shard index operand, sorted rows, cases)
@@ -114,6 +127,11 @@ def _world(experts, real, routing, seed=0, shards=D, hidden=H, inter=INTER):
         # (two of them with 2 experts a shard): those receive every row, the
         # others none.
         logits[:, :K] += 20.0
+    elif routing == "cold":
+        # COLD_LOCAL_EXPERTS of every shard are never selected.
+        per_shard = experts // shards
+        cold = [d * per_shard + c for d in range(shards) for c in COLD_LOCAL_EXPERTS]
+        logits[:, cold] -= 30.0
     w1f = rng.standard_normal((experts, hidden, 2 * inter)).astype(np.float32) / 10
     w2f = rng.standard_normal((experts, inter, hidden)).astype(np.float32) / 10
     s1 = np.abs(w1f).max(1) / 448.0
@@ -956,7 +974,7 @@ def _run_case(name, mode, result_rows, settings=None, dense_slots=False):
     from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
 
     bridge, sorted_rows, _ = MODES[mode]
-    experts, real, routing, short = CASES[name]
+    experts, real, routing, short = {**CASES, **COLD_CASES}[name]
     x, logits, w1, w2, s1, s2 = _world(experts, real, routing)
     mesh = Mesh(np.asarray(jax.devices()[:D]), (MESH_AXIS,))
     sharded = NamedSharding(mesh, P(MESH_AXIS))
@@ -1068,13 +1086,48 @@ def test_dp4tp2_settings_keep_the_layers_values(eight_tpu7x_cores, fresh_builds,
     np.testing.assert_array_equal(got[rows], plain[rows])
 
 
+def _skipped_experts(name):
+    """Per shard, the local experts the dense-slots program skips: past its
+    first WEIGHT_SLOTS - 1 (listed whatever their rows) and selected by no
+    valid row with a nonzero weight. Also each shard's routed rows per local
+    expert."""
+    from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as ds
+
+    experts, real, routing, short = {**CASES, **COLD_CASES}[name]
+    _, logits, *_ = _world(experts, real, routing)
+    valid = [real - (short if d % 2 else 0) for d in range(D)]
+    weights, chosen = _routes(logits, real, valid)
+    per_shard = experts // D
+    counts = np.zeros((D, per_shard), np.int64)
+    for t in _valid_rows(real, valid):
+        for k in range(K):
+            if weights[t, k] != 0:
+                e = int(chosen[t, k])
+                counts[e // per_shard, e % per_shard] += 1
+    first = min(ds.WEIGHT_SLOTS - 1, per_shard)
+    skipped = [[e for e in range(first, per_shard) if c[e] == 0] for c in counts]
+    return skipped, counts
+
+
+def _check_experts_are_skipped(name):
+    """On every shard a cold expert past the listed ones is skipped and a live
+    expert after it takes an earlier list position (so a weight slot by
+    expert index would be the wrong one)."""
+    skipped, counts = _skipped_experts(name)
+    for d, (cold, c) in enumerate(zip(skipped, counts)):
+        assert cold and (c[min(cold) + 1 :] > 0).any(), (name, d, c.tolist())
+
+
 @pytest.mark.multichip
-@pytest.mark.parametrize("name", list(CASES))
+@pytest.mark.parametrize("name", list(CASES) + list(COLD_CASES))
 def test_dense_slots_layer_matches_the_reference(eight_tpu7x_cores, fresh_builds, name):
     """The dense-slots layer as the Qwen3.5 DP4 x TP2 entry runs it: within the
     reference's bound, and the bound must fail with two tokens' rows swapped;
     with float32 scaling products, bit-identical to this layer with bf16
-    result rows (the same per-row math)."""
+    result rows (the same per-row math). In the COLD_CASES worlds the program
+    skips experts with no rows on every shard."""
+    if name in COLD_CASES:
+        _check_experts_are_skipped(name)
     settings = _dp4tp2_settings()
     got, want, rows = _run_case(
         name, "bridge_sorted", "bf16", settings, dense_slots=True
