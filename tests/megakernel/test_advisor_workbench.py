@@ -386,7 +386,7 @@ def test_workbench_phase_map_and_calibration_dropzone_markup() -> None:
         "new FileReader()",
         "new DecompressionStream('gzip')",
         "traceEventsToMeas",
-        "minHop.toFixed(3)",
+        "STATE.collectiveCalls = parsedCalls",
         "advisor.measurements.v1",
         "advisor.bucket_schedule.v1",
         "advisory_offline_v1",
@@ -1120,9 +1120,7 @@ def test_js_trace_calibration_parity_and_empty_rejection(tmp_path: Path) -> None
         },
     )
     coarse_meas = cast("dict[str, Any]", coarse_res["meas"])
-    expected_coarse_n = 2
-    assert "launch_gap_us" in coarse_meas
-    assert coarse_meas["launch_gap_us"]["n"] == expected_coarse_n
+    assert "launch_gap_us" not in coarse_meas
 
     zero_events = [
         {"name": "op_solo", "ph": "X", "pid": 1, "tid": 1, "ts": 100.0, "dur": 50.0}
@@ -1197,6 +1195,7 @@ def test_coalesced_bucket_schedule_updates_splits(tmp_path: Path) -> None:
                 "tp": 8,
                 "dp": 1,
                 "ep": 8,
+                "dcp": 4,
                 "context": 4096,
             },
         },
@@ -1380,6 +1379,41 @@ def test_phase_map_shows_recommended_scope_on_each_role(tmp_path: Path) -> None:
     )
     assert len(plain_row) == len(constants.PHASE_T_GRID)
     assert all(phase == "decode" for phase, _ in plain_row)
+
+
+def test_js_trace_without_step_event_omits_launch_gap_and_keeps_collectives(
+    tmp_path: Path,
+) -> None:
+    """Verify trace converter omits launch gap and keeps collectives when step-less."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    expected_collective_count = 1
+    expected_op = "all-reduce"
+    cal_payload: dict[str, object] = {
+        "schema": "advisor.measurements.v1",
+        "collectives": [
+            {
+                "op": expected_op,
+                "group_size": 8,
+                "bytes": 4096,
+                "latency_us": 10.0,
+                "mean_latency_us": 10.0,
+                "n": 2,
+            }
+        ],
+    }
+    res = _run_workbench_phase_runner(
+        tmp_path,
+        sweep_report,
+        {
+            "action": "trace_to_meas",
+            "raw": cal_payload,
+            "fileName": "step_less_trace.json",
+        },
+    )
+    meas = cast("dict[str, Any]", res["meas"])
+    assert "launch_gap_us" not in meas
+    assert len(meas["collectives"]) == expected_collective_count
+    assert meas["collectives"][0]["op"] == expected_op
 
 
 def _eval_workbench_custom_steps(
