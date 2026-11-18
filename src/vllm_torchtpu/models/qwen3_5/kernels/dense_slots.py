@@ -475,8 +475,6 @@ def build_kernel(
                 w2_vmem[wslot],
                 w1s_ref[pl.ds(e, 1), :],
                 activation="silu",
-                w1_bias=None,
-                no_gate=False,
                 elementwise=elementwise,
                 columns_per_pass=columns_per_pass,
             )
@@ -484,7 +482,6 @@ def build_kernel(
                 acc2,
                 mid_scales,
                 w2_scales=w2s_ref[pl.ds(e, 1), :],
-                w2_bias=None,
                 dtype=jnp.bfloat16,
                 elementwise=elementwise,
             )
