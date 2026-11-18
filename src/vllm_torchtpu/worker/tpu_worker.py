@@ -571,7 +571,12 @@ class TPUWorker(WorkerBase):
                 self.cache_config.num_gpu_blocks_override,
             )
         else:
-            self.model_runner.profile_run(self.model_runner.max_num_tokens)
+            # In serving's global state, like the warm-up (see
+            # compile_or_warm_up_model): the warm-up then finds this run's
+            # sampling graphs in dynamo's cache instead of re-tracing them (40 s).
+            set_torch_threads_for_runtime()
+            with torch.no_grad():
+                self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
         # VLLM directive of the percentage of HBM memory the model executor can use
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
@@ -841,11 +846,14 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        if getattr(self, "speculative_config", None) is not None:
-            # Record the warm-up traces under the serving thread count. Other
-            # models keep upstream's warm-up at the startup count.
-            set_torch_threads_for_runtime()
-        self.model_runner.capture_model()
+        # Warm up in serving's global state: dynamo guards every compiled graph
+        # on the torch thread count and grad mode, so a graph traced at the
+        # startup count (cores / TP) or with grad on misses at serving, under
+        # execute_model's no_grad, and re-traces there. That cost a Cosmos3-Super
+        # image 9.6 s on the first request of each encoder budget.
+        set_torch_threads_for_runtime()
+        with torch.no_grad():
+            self.model_runner.capture_model()
         # After the stock precompile too: the megakernel's once-per-bind hook.
         if self.model_runner._megakernel is not None:
             self.model_runner._megakernel.on_warmup_done(self.model_runner)

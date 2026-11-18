@@ -608,9 +608,8 @@ def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
-@pytest.mark.parametrize("speculative", [False, True])
 def test_warmup_restores_runtime_threads_without_overriding_user_choice(
-    monkeypatch, managed_by_vllm, runtime_threads, speculative
+    monkeypatch, managed_by_vllm, runtime_threads
 ):
     from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 
@@ -623,12 +622,11 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
     warmup_threads = []
 
     def capture_model():
-        warmup_threads.append(torch.get_num_threads())
+        warmup_threads.append((torch.get_num_threads(), torch.is_grad_enabled()))
 
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(capture_model=capture_model, _megakernel=None),
         compilation_config=SimpleNamespace(compilation_time=0.0),
-        speculative_config=object() if speculative else None,
     )
     previous_threads = torch.get_num_threads()
     try:
@@ -642,9 +640,8 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
             result = TPUWorker.compile_or_warm_up_model(worker)
         freeze.assert_called_once_with()
         gc_debug.assert_called_once_with()
-        # Speculative decoding warms up at the serving thread count; other
-        # models keep the startup count during warm-up.
-        assert warmup_threads == [runtime_threads if speculative else 2]
+        # Every model warms up at the serving thread count, without grad.
+        assert warmup_threads == [(runtime_threads, False)]
         assert torch.get_num_threads() == runtime_threads
         assert result.language_model == worker.compilation_config.compilation_time
         assert result.encoder == 0.0
