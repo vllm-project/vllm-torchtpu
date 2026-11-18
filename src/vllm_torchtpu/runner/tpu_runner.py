@@ -182,7 +182,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm_torchtpu.runner import (
     chunk_processors,
     greedy_top_tokens,
@@ -191,6 +190,7 @@ from vllm_torchtpu.runner import (
     spec_boundary_state,
     thinking_budget_tracker,
 )
+from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
