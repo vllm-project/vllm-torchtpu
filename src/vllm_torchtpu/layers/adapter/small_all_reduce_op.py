@@ -82,6 +82,7 @@ from vllm_torchtpu.kernels.experimental.small_collectives import (
     all_gather,
     all_reduce,
     lse_merge,
+    lse_merge_tree,
     reduce_scatter,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
@@ -128,8 +129,20 @@ _AR_SIZED_OP = None
 _RS_OP = None
 # The DCP merge's LSE all-gather (TPU_DCP_LSE_SMALL_ALL_GATHER).
 _AG_OP = None
-# The fused DCP merge (TPU_DCP_FUSED_LSE_MERGE).
+# The fused DCP merge (TPU_DCP_FUSED_LSE_MERGE), and whether it is the
+# recursive-halving kernel (else the one-shot exchange).
 _LSE_MERGE_OP = None
+_LSE_MERGE_TREE = False
+
+
+def tree_parts(tokens: int) -> int:
+    """Token parts of the recursive-halving merge: 16-row chunks, at most 4
+    (one per pipelined part), 0 when ``tokens`` has no such split."""
+    for parts in (4, 2, 1):
+        tc = tokens // parts
+        if tokens % parts == 0 and tc % 16 == 0 and tc <= 128:
+            return parts
+    return 0
 # The valid-rows all-reduce (TPU_SMALL_ALL_REDUCE_VALID_ROWS) and the bf16 row
 # tile its fold path folds into.
 _AR_VALID_OP = None
@@ -357,14 +370,29 @@ def _build_all_gather(mesh):
     )
 
 
-def _build_lse_merge(mesh):
+def _build_lse_merge(mesh, tree=None):
     """The fused DCP merge op over ``mesh``: fn(output [T, H, D] bf16, lse
     [T, H] f32, rank int32 [1]) per core -> [H / cores, T, D], core r's heads
-    merged over the mesh (kernels/experimental/small_collectives/lse_merge.py)."""
+    merged over the mesh. ``tree`` = (labels, core_bit) from
+    ``lse_merge_tree.hypercube_labels`` selects the recursive-halving kernel
+    (small_collectives/lse_merge_tree.py); None the one-shot exchange
+    (small_collectives/lse_merge.py)."""
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def body(output, lse, rank):
+        if tree is not None:
+            labels, core_bit = tree
+            return lse_merge_tree.small_lse_merge_tree(
+                output,
+                lse,
+                num_cores=n,
+                axis=EP_AXIS_NAME,
+                labels=labels,
+                rank=rank,
+                parts=tree_parts(output.shape[0]),
+                first_bit=core_bit,
+            )
         return lse_merge.small_lse_merge(
             output, lse, num_cores=n, axis=EP_AXIS_NAME, rank=rank
         )
@@ -537,7 +565,7 @@ def prebuild(hidden_size: int = 0) -> None:
     hidden_size is the model's, the width of the chip-pair self-test."""
     global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
     global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP, _UV_MM_AR_OP, _PAIR_ROWS
-    global _AG_OP, _LSE_MERGE_OP
+    global _AG_OP, _LSE_MERGE_OP, _LSE_MERGE_TREE
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -571,7 +599,20 @@ def prebuild(hidden_size: int = 0) -> None:
     if envs.TPU_DCP_LSE_SMALL_ALL_GATHER:
         _AG_OP = _build_all_gather(mesh)
     if envs.TPU_DCP_FUSED_LSE_MERGE:
-        _LSE_MERGE_OP = _build_lse_merge(mesh)
+        tree = None
+        if not envs.TPU_DCP_FUSED_LSE_MERGE_FLAT:
+            places = _chip_places(mesh, mesh_index, who="fused DCP merge")
+            tree = lse_merge_tree.hypercube_labels(places)
+            n = len(places)
+            if tree is not None and n & (n - 1):
+                tree = None
+        _LSE_MERGE_TREE = tree is not None
+        _LSE_MERGE_OP = _build_lse_merge(mesh, tree)
+        logger.info(
+            "Fused DCP merge armed | kernel=%s | labels=%s",
+            "tree" if tree is not None else "one-shot",
+            None if tree is None else tree[0],
+        )
     if envs.TPU_SMALL_ALL_REDUCE_VALID_ROWS:
         from jax.experimental.pallas import tpu as pltpu
 
@@ -807,6 +848,8 @@ def dcp_fused_lse_merge(
             tuple(output.shape), "bfloat16", tuple(lse.shape), "float32", _CORES
         )
     except ValueError:
+        return None
+    if _LSE_MERGE_TREE and not tree_parts(output.shape[0]):
         return None
     return _LSE_MERGE_OP(output.contiguous(), lse.contiguous(), _RANK)
 
