@@ -1008,12 +1008,63 @@ def local_slab_rows(routing, me, *, shard_stride):
     )
 
 
-def shard_token_gather(routing, me, *, shard_stride, rows=None):
+# The most SparseCore vector subcores (SparseCores x subcores each) a chip
+# may have and still build the slab tables on the TensorCore. Where the
+# compiler offloads a scatter-add to a full SparseCore (v7x and TPU8t: 2 x 16;
+# v6e 2 x 16; v5p 4 x 16), both slab tables stay scatter-adds: the SparseCore
+# runs them async, beside the activation all-gather, and they cost the
+# TensorCore almost nothing, while a scatter-set stays on the TensorCore at
+# about three times the add's wall. TPU8i's SparseCore is 1 x 4 and XLA
+# offloads neither scatter form, so both run on the TensorCore one element at
+# a time; there the set costs about half the add, which reads each destination
+# back first (1.74x at 16k tokens, 1.76x at 1.5k, measured on TPU8i). A chip
+# without a SparseCore keeps the add too: the set has not been measured there.
+TENSORCORE_TABLES_MAX_SC_SUBCORES = 4
+
+
+def slab_tables_on_tensorcore(info=None):
+    """Whether this chip builds the slab tables on the TensorCore.
+
+    True, for a chip whose SparseCore has at most
+    TENSORCORE_TABLES_MAX_SC_SUBCORES subcores, selects the TensorCore builds
+    (today a scatter-set for both slab tables). False keeps both tables
+    scatter-adds: a full SparseCore runs them, and a chip without one keeps
+    them until the set is measured there. Read off the same device record the
+    VMEM accounting reads, so the layer answers it once per build.
+    """
+    if info is None:
+        info = pltpu.get_tpu_info()
+    sc = info.sparse_core
+    return sc is not None and sc.num_cores * sc.num_subcores <= (
+        TENSORCORE_TABLES_MAX_SC_SUBCORES
+    )
+
+
+def slab_scatter(size, rows, values, *, by_set):
+    """`zeros([size]).at[rows]` <- `values`, the out-of-range rows dropped.
+
+    Every live row receives at most one routed pair and the destination
+    starts at zero, so the add and the set build the same bits, and `by_set`
+    picks whichever the chip builds faster (slab_tables_on_tensorcore). The
+    two differ only at or past row shard_stride, the slab's end, where
+    local_slab_rows sends every off-shard pair: rows past `size` are dropped,
+    and the few the activation-scale view holds past the slab's end are never
+    read. On those rows the add sums the colliding pairs and the set keeps
+    one of them.
+    """
+    slab = jnp.zeros((size,), values.dtype).at[rows]
+    if by_set:
+        return slab.set(values, mode="drop")
+    return slab.add(values, mode="drop")
+
+
+def shard_token_gather(routing, me, *, shard_stride, rows=None, by_set=False):
     """The token number each of shard `me`'s slab rows computes, [stride].
 
     `rows` is the destination slab row of each routed pair, which is derived
     here when the caller does not hold it already; passing it in keeps both
-    slab scatters on one index.
+    slab scatters on one index. `by_set` is the scatter form, as
+    slab_tables_on_tensorcore answers it for this chip.
 
     The scatter runs against this shard's slab alone rather than against the
     replicated ep-wide slab followed by a slice, which built seven eighths
@@ -1044,9 +1095,7 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
         else rows
     )
     gather_lo, gather_hi = gather_clamp_bounds(T)
-    scattered = (
-        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
-    )
+    scattered = slab_scatter(shard_stride, row, token_of_pair, by_set=by_set)
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 

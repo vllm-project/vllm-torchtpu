@@ -49,6 +49,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     shard_push_tables_in_rows,
     shard_token_gather,
     shard_transport_tables_in_blocks,
+    slab_scatter,
+    slab_tables_on_tensorcore,
     token_gather_window_rows,
     weight_form,
     weight_format_of_dtype,
@@ -64,6 +66,9 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # The scoring functions the router can apply to the gate logits. These
 # mirror `layers/adapter/moe_routing._apply_scoring_fn` exactly.
@@ -507,6 +512,18 @@ def fused_ep_moe_v2(
         w1s_expert_second_minor=w1_scales_expert_second_minor,
         w2s_expert_second_minor=w2_scales_expert_second_minor,
     )
+    # How the two slab tables are built, read off the same device record as
+    # the kernel's VMEM budget: on a chip whose small SparseCore does not take
+    # the scatter-add (see TENSORCORE_TABLES_MAX_SC_SUBCORES) both scatters
+    # are sets, built on the TensorCore; otherwise both stay scatter-adds. The
+    # mesh in the cache key below already pins the chip; the choice is in the
+    # key as well, so a caller that forces it (a test, an A/B) never gets the
+    # other form's cached body.
+    slab_by_set = slab_tables_on_tensorcore()
+    logger.info_once(
+        "fused_ep_moe_v2: slab tables built with a scatter-%s",
+        "set" if slab_by_set else "add",
+    )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
     wire_width = _exchange_layout(t_wire, topk, e_total, form.quantized_activations)[-1]
@@ -693,17 +710,27 @@ def fused_ep_moe_v2(
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
         slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
-        # The two slab scatters and the activation all-gather are offloaded to
-        # the SAME SparseCore. Ordering the scatters behind the collective
-        # enqueues it 129 us earlier and costs them the cover they had; that
-        # trade measures +2.80% at 2048 local tokens and negative at every
-        # smaller shape, so it is taken only where the routing plan in front
-        # of the collective is longer than the scatters behind it. Same bits
-        # either way; only the queue moves.
+        # On a chip with a full SparseCore the two slab scatters and the
+        # activation all-gather are offloaded to the SAME SparseCore, where
+        # the slabs are built with an add (see
+        # TENSORCORE_TABLES_MAX_SC_SUBCORES). Ordering the scatters behind the
+        # collective enqueues it 129 us earlier and costs them the cover they
+        # had; that trade measures +2.80% at 2048 local tokens and negative at
+        # every smaller shape, so it is taken only where the routing plan in
+        # front of the collective is longer than the scatters behind it. Same
+        # bits either way; only the queue moves. The barrier is taken on every
+        # chip, including one that builds the tables on the TensorCore: there
+        # the scatters share no queue with the collective, the barrier holds
+        # them until the gathered activations arrive, and that trade has not
+        # been measured.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
+            routing,
+            me,
+            shard_stride=ragged_stride,
+            rows=slab_row,
+            by_set=slab_by_set,
         )
         if gather_positions is not None:
             # The rows were gathered in another order than the mesh's, so
@@ -739,9 +766,12 @@ def fused_ep_moe_v2(
             scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
+                slab_scatter(
+                    scale_rows * HIDDEN_LANE_BLOCK,
+                    slab_row,
+                    scale_bits,
+                    by_set=slab_by_set,
+                ),
                 jnp.float32,
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
@@ -972,6 +1002,7 @@ def fused_ep_moe_v2(
         gather_positions,
         bool(w1_scales_expert_second_minor),
         bool(w2_scales_expert_second_minor),
+        slab_by_set,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),
