@@ -20,8 +20,6 @@ MaxText `decoder_block: olmoe3` configs; the defaults are OLMo 3.5 Small
 
 from __future__ import annotations
 
-import contextlib
-
 from transformers import PretrainedConfig
 
 
@@ -41,7 +39,7 @@ class Olmo35Config(PretrainedConfig):
         head_dim: int = 256,
         full_attention_interval: int = 8,
         use_scalable_softmax: bool = True,
-        # Kimi Delta Attention on every other layer.
+        # Kimi Delta Attention on every layer that is not full attention.
         linear_num_heads: int = 8,
         linear_key_head_dim: int = 256,
         linear_value_head_dim: int = 512,
@@ -110,6 +108,9 @@ class Olmo35Config(PretrainedConfig):
         if len(layer_types) != num_hidden_layers:
             raise ValueError("layer_types needs one entry per layer")
         self.layer_types = layer_types
+        if tie_word_embeddings:
+            # The model has its own lm_head and the loader has no tied path.
+            raise ValueError("OLMo 3.5 does not support tie_word_embeddings=True")
         super().__init__(**kwargs)
         self.tie_word_embeddings = tie_word_embeddings
 
@@ -117,7 +118,17 @@ class Olmo35Config(PretrainedConfig):
 def register_olmo35_config() -> None:
     """Make `AutoConfig` (and so vLLM) resolve `model_type: olmo35`."""
     from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    # ValueError: already registered in this process.
-    with contextlib.suppress(ValueError):
+    try:
+        registered = CONFIG_MAPPING[Olmo35Config.model_type]
+    except KeyError:
         AutoConfig.register(Olmo35Config.model_type, Olmo35Config)
+        return
+    # `register_models()` can run more than once per process. A repeat call is
+    # a no-op only when the name already maps to this class.
+    if registered is not Olmo35Config:
+        raise ValueError(
+            f"model_type {Olmo35Config.model_type!r} is already registered to "
+            f"{registered.__module__}.{registered.__qualname__}"
+        )
