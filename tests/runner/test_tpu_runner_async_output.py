@@ -434,6 +434,17 @@ def test_deferred_logprobs_from_device_match_a_blocking_cpu_copy(
     ]
 
 
+def _eagle3_drafter_stand_in(**fields):
+    """An Eagle3Proposer carrying only the given fields: the runner's fused
+    assembly takes its fast path only for a bucketed Eagle3 drafter."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    drafter = object.__new__(Eagle3Proposer)
+    for name, value in fields.items():
+        setattr(drafter, name, value)
+    return drafter
+
+
 @pytest.mark.tpu_test
 def test_compiled_async_spec_helpers_match_eager(device):
     if device.type != "tpu":
@@ -475,7 +486,7 @@ def test_compiled_async_spec_helpers_match_eager(device):
     runner.max_num_reqs = 8
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     drafts_view = drafts_p[:2]
-    runner.drafter = SimpleNamespace(
+    runner.drafter = _eagle3_drafter_stand_in(
         _last_padded_drafts_per_chunk=[drafts_p],
         _last_propose_device_out=drafts_view,
     )
@@ -549,7 +560,7 @@ def test_compiled_async_spec_helpers_match_eager(device):
         dtype=torch.int32,
         device=device,
     )
-    runner.drafter = SimpleNamespace(
+    runner.drafter = _eagle3_drafter_stand_in(
         _last_padded_drafts_per_chunk=[drafts_p, drafts_p1],
         _last_propose_device_out=drafts_view,
     )
@@ -841,3 +852,61 @@ def test_fused_assembly_stays_off_under_adaptive_verification():
         _last_propose_device_out=drafts, _last_padded_drafts_per_chunk=padded
     )
     assert TPUModelRunner._drafter_padded_drafts(runner, drafts, 1) is None
+
+
+def test_sample_tokens_rolls_back_through_the_rule_after_the_drafter():
+    """The call site in TPUModelRunner: defer_modify_prev comes from
+    _defers_prev_rollback, the early rollback runs only when it is False, and
+    the deferred rollback runs after the drafter's propose call (structural:
+    sample_tokens needs a TPU-backed runner to execute)."""
+    import ast
+    import inspect
+
+    import vllm_torchtpu.runner.tpu_runner as tr
+
+    tree = ast.parse(inspect.getsource(tr))
+    fn = next(
+        f
+        for f in ast.walk(tree)
+        if isinstance(f, ast.FunctionDef)
+        and any(
+            isinstance(n, ast.Name) and n.id == "defer_modify_prev" for n in ast.walk(f)
+        )
+    )
+    assigns = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "defer_modify_prev" for t in n.targets
+        )
+    ]
+    assert len(assigns) == 1
+    call = assigns[0].value
+    assert isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+    assert call.func.attr == "_defers_prev_rollback"
+
+    def rollbacks_under(test_src):
+        out = []
+        for n in ast.walk(fn):
+            if isinstance(n, ast.If) and ast.unparse(n.test) == test_src:
+                out += [
+                    c.lineno
+                    for c in ast.walk(n)
+                    if isinstance(c, ast.Call)
+                    and isinstance(c.func, ast.Attribute)
+                    and c.func.attr == "_modify_prev_results"
+                ]
+        return out
+
+    early = rollbacks_under("is_async and (not defer_modify_prev)")
+    late = rollbacks_under("defer_modify_prev")
+    propose = [
+        c.lineno
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call)
+        and isinstance(c.func, ast.Attribute)
+        and c.func.attr == "propose_draft_token_ids"
+    ]
+    assert len(early) == 1 and len(late) == 1 and propose
+    assert early[0] < min(propose) < late[0]
