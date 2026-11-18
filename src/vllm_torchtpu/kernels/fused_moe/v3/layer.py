@@ -35,7 +35,7 @@ from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
 from . import combine as combine_lib
-from . import device, ffn, layout, row_tables_kernel, transport, vmem
+from . import device, layout, row_tables_kernel, transport, vmem
 from . import routing_tables as tables
 from . import routing_tables_kernel as tables_kernel
 from . import row_gather_kernel as gather
@@ -47,7 +47,7 @@ from .config import (
     sorted_rows_by_shape,
 )
 from .ffn_kernel import ffn_kernel
-from .formats import WEIGHT_BLOCK_DEFAULT, WeightFormat, weight_form
+from .formats import WeightFormat, weight_form
 from .layout import (
     LANES,
     MIB,
@@ -170,19 +170,6 @@ def _shard_biases(w1_bias, w2_bias, w1_cols, hidden):
     )
 
 
-def stream_blocks_for(inter, activation_block, weight_block=None):
-    """The column-block widths a streamed expert may take, widest first:
-    divisors of inter that are whole numbers of activation blocks, below
-    the whole width. With block-scaled weights a block also covers a whole
-    number of SUBLANES weight blocks: a streamed block's scale rows are
-    copied as one slice of the [experts, blocks, columns] scale table, and
-    a slice along its sublane-tiled block axis has to be whole tiles."""
-    unit = activation_block
-    if weight_block:
-        unit = math.lcm(unit, weight_block * SUBLANES)
-    return [b for b in range(inter - unit, 0, -unit) if inter % b == 0]
-
-
 def expert_buffers_that_fit(
     experts_per_shard,
     tile_rows,
@@ -191,29 +178,21 @@ def expert_buffers_that_fit(
     *,
     config,
     weight_format,
-    weight_block,
     has_w1_bias,
     has_w2_bias,
     no_gate,
     activation_block=0,
     result_rows="fp8",
     token_block=None,
-    token_rows="fp8",
 ):
-    """(weight_slots, weight_prefetch, stream_block, stream_rows): the
-    expert buffers the kernel is built with. Whole-expert weight slots
-    first, the most up to `config.weight_slots` whose VMEM estimate fits
-    the chip's budget, the prefetch depth clipped under the count. When no
-    count of whole-expert slots fits (or config.stream_block asks for
-    it), the expert streams in column blocks: the widest block, then the
-    most slots, then the most rows per group down from config.stream_rows,
-    that fit. Streaming rounds the intermediate per activation block, so
-    it needs one; without one the whole-expert refusal is raised here."""
+    """(weight_slots, weight_prefetch): the whole-expert weight slots the
+    kernel is built with, the most up to `config.weight_slots` whose VMEM
+    estimate fits the chip's budget, and the prefetch depth clipped under
+    the count. Raises ValueError when not even two slots fit."""
     limit = device.vmem_limit(config.vmem_fraction)
     result_dtype = jnp.bfloat16 if result_rows == "bf16" else FP8
-    form = weight_form(weight_format)
 
-    def needed(slots, block, rows):
+    def needed(slots):
         return vmem.estimate_bytes(
             experts_per_shard,
             tile_rows,
@@ -222,74 +201,22 @@ def expert_buffers_that_fit(
             weight_slots=slots,
             result_slots=config.result_slots,
             weight_format=weight_format,
-            weight_block=weight_block,
             has_w1_bias=has_w1_bias,
             has_w2_bias=has_w2_bias,
             no_gate=no_gate,
             activation_block=activation_block,
             result_dtype=result_dtype,
-            stream_block=block,
-            stream_rows=rows,
             token_block=token_block,
-            intermediate=config.intermediate,
-            token_dtype=jnp.bfloat16 if token_rows == "bf16" else FP8,
         )
 
-    def group_rows():
-        rows = config.stream_rows
-        while rows >= tile_rows:
-            yield rows
-            rows //= 2
-
-    slots_down = range(config.weight_slots, 1, -1)
-    if config.stream_block:
-        for slots in slots_down:
-            for rows in group_rows():
-                if needed(slots, config.stream_block, rows) <= limit:
-                    return (
-                        slots,
-                        min(config.weight_prefetch, slots - 1),
-                        config.stream_block,
-                        rows,
-                    )
-        # Nothing fits: the kernel refuses with its own message.
-        return (
-            config.weight_slots,
-            config.weight_prefetch,
-            config.stream_block,
-            config.stream_rows,
-        )
-    for slots in slots_down:
-        if needed(slots, 0, 0) <= limit:
-            return slots, min(config.weight_prefetch, slots - 1), 0, 0
-    whole = needed(2, 0, 0)
-    if not activation_block:
-        raise ValueError(
-            f"whole-expert weight buffers of {experts_per_shard} local experts "
-            f"of {hidden}x{inter} need {whole / MIB:.1f} MiB of VMEM at two "
-            f"slots, over the {limit / MIB:.1f} MiB budget. The expert can "
-            "stream in column blocks, which rounds the intermediate per "
-            "activation block: set activation_block"
-        )
-    blocks = stream_blocks_for(
-        inter, activation_block, weight_block if form.block_scaled else None
+    for slots in range(config.weight_slots, 1, -1):
+        if needed(slots) <= limit:
+            return slots, min(config.weight_prefetch, slots - 1)
+    raise ValueError(
+        f"whole-expert weight buffers of {experts_per_shard} local experts "
+        f"of {hidden}x{inter} need {needed(2) / MIB:.1f} MiB of VMEM at two "
+        f"slots, over the {limit / MIB:.1f} MiB budget"
     )
-    if not blocks:
-        raise ValueError(
-            f"whole-expert weight buffers of {experts_per_shard} local experts "
-            f"of {hidden}x{inter} need {whole / MIB:.1f} MiB of VMEM at two "
-            f"slots, over the {limit / MIB:.1f} MiB budget, and no column "
-            "block below the whole width can stream them: a streamed block "
-            f"covers a whole number of {SUBLANES} scale rows (one sublane "
-            f"tile of the scale table) and inter={inter} in weight blocks of "
-            f"{weight_block} has {inter // weight_block}"
-        )
-    for block in blocks:
-        for slots in slots_down:
-            for rows in group_rows():
-                if needed(slots, block, rows) <= limit:
-                    return (slots, min(config.weight_prefetch, slots - 1), block, rows)
-    return config.weight_slots, config.weight_prefetch, 0, 0
 
 
 def pallas_token_multiple(num_shards):
@@ -317,26 +244,22 @@ def message_token_multiple(tokens_per_tile=COMBINE_TOKENS_PER_TILE_DEFAULT):
 TABLES_STEP_CANDIDATES = tuple(
     2**i for i in range(TABLES_BLOCKS_PER_STEP_MAX.bit_length() - 1, -1, -1)
 )
-# The rank of a weight scale table: [experts, columns] per output channel,
-# [experts, blocks, columns] per contraction block.
+# The rank of a weight scale table: [experts, columns], one per output
+# channel.
 SCALES_RANK_PER_CHANNEL = 2
-SCALES_RANK_PER_BLOCK = 3
 
 # The forms the TPU reference test (tests/kernels/fused_moe/
 # test_fused_ep_moe_v3.py) covers: fp8 weights with one scale per output
-# channel, silu over a gate and an up half, no biases, whole experts in VMEM
-# with one fp8 scale per row, fp8 token rows and intermediate, and fp8 or
-# bf16 result rows. The kernel also carries the weight-streamed build, the
-# blocked row scales, the four-bit, block-scaled and bf16 weight formats,
-# expert biases, the other activations and the single projection, and bf16
-# token rows and intermediate. fused_ep_moe refuses those until a TPU case
-# against the reference covers each; the code stays so that adding the case
-# and the form to these sets is what admits it.
+# channel, silu over a gate and an up half, no biases, one fp8 scale per row,
+# and fp8 or bf16 result rows. The kernel also carries bf16 weights, expert
+# biases, the single projection and blocked row scales (the per-expert
+# helpers in ffn.py take them as parameters); fused_ep_moe refuses those until
+# a TPU case against the reference covers each, so adding the case and the
+# form here is what admits it.
 TESTED_WEIGHT_FORMATS = frozenset({WeightFormat.FP8})
-TESTED_ACTIVATIONS = frozenset({"silu"})
 
 
-def check_tested(form, *, activation, no_gate, has_bias, config):
+def check_tested(form, *, no_gate, has_bias, config):
     """Raises NotImplementedError for a form no TPU reference test covers
     (see TESTED_WEIGHT_FORMATS)."""
     untested = []
@@ -344,19 +267,10 @@ def check_tested(form, *, activation, no_gate, has_bias, config):
         untested.append(f"weight format {str(form.name)!r}")
     if no_gate:
         untested.append("the single projection (no_gate)")
-    elif activation not in TESTED_ACTIVATIONS:
-        untested.append(f"activation {activation!r}")
     if has_bias:
         untested.append("expert biases")
-    if config.activation_block or config.token_rows_block or config.stream_block:
-        untested.append(
-            "blocked row scales or a streamed build (Config.activation_block, "
-            "token_block, stream_block)"
-        )
-    if config.token_rows != "fp8":
-        untested.append(f"token_rows {config.token_rows!r}")
-    if config.intermediate != "fp8":
-        untested.append(f"intermediate {config.intermediate!r}")
+    if config.activation_block or config.token_rows_block:
+        untested.append("blocked row scales (Config.activation_block, token_block)")
     if untested:
         raise NotImplementedError(
             f"fused EP MoE v3: {', '.join(untested)} has no TPU test against "
@@ -457,7 +371,6 @@ def _pallas_step(
     config,
     sorted_rows,
     mesh_axes,
-    token_dtype,
     shard_index=None,
     valid_tokens=None,
 ):
@@ -516,7 +429,6 @@ def _pallas_step(
             scale_base=transport.scale_row_offset(pairs_per_shard),
             num_shards=num_shards,
             mesh_axes=mesh_axes,
-            token_dtype=token_dtype,
             scale_dtype=row_scale_dtype,
             activation_block=token_block,
             elementwise=elementwise,
@@ -759,9 +671,7 @@ def fused_ep_moe(
     routing_block=None,
     routed_rows_per_shard=None,
     weight_format=WeightFormat.FP8,
-    weight_block=None,
     activation="silu",
-    swiglu_limit=ffn.SWIGLU_LIMIT_DEFAULT,
     drop_nan_rows=False,
     no_gate=False,
     routing=None,
@@ -778,10 +688,7 @@ def fused_ep_moe(
         [experts, hidden, inter] with no_gate), in the format's dtype.
       w2: [experts, inter, hidden].
       w1_scales, w2_scales: f32, per output channel ([experts, N]) for fp8,
-        per contraction block ([experts, blocks, N]) for fp4 and for
-        fp8_block (fp8 weights with one scale per `weight_block` rows of
-        the contraction, the DeepSeek-family checkpoints' form), None for
-        bf16.
+        None for bf16.
       router_logits: [tokens, experts], any float type. Selection runs in
         float32. None when `routing` is given.
       routing: the caller's routing instead of the kernel's top-k:
@@ -805,15 +712,10 @@ def fused_ep_moe(
       routing_block: pairs per routing block. Derived when None.
       routed_rows_per_shard: routed rows per shard. The no-drop bound
         when None.
-      weight_format: "fp8", "fp8_block", "fp4", "int4" or "bf16"; only
-        "fp8" is admitted until the others have TPU tests (check_tested).
-      weight_block: contraction rows per fp4 scale. WEIGHT_BLOCK_DEFAULT
-        when None.
-      activation: "silu" or "swigluoai" ("silu", "gelu" or "relu" with
-        no_gate); only "silu" with the gate is admitted (check_tested).
-      swiglu_limit: the clip of the clamped swiglu ("swigluoai"), the
-        model's swiglu_limit (GPT-OSS ships 7.0); ignored by the other
-        activations.
+      weight_format: "fp8" or "bf16"; only "fp8" is admitted until bf16
+        has a TPU test (check_tested).
+      activation: "silu", over the gate (or, with no_gate, alone; refused
+        until tested).
       drop_nan_rows: route a row with any NaN logit nowhere, as the stock
         layer does, at one boolean sweep of the logits per call. Off, only
         all-garbage rows are dropped.
@@ -826,7 +728,6 @@ def fused_ep_moe(
     """
     form = weight_form(weight_format)
     weight_format = form.name
-    weight_block = WEIGHT_BLOCK_DEFAULT if weight_block is None else int(weight_block)
     for name, w in (("w1", w1), ("w2", w2)):
         if jnp.dtype(w.dtype) != jnp.dtype(form.weight_dtype):
             raise ValueError(
@@ -861,7 +762,7 @@ def fused_ep_moe(
     elif router_logits is None:
         raise ValueError("router_logits is None and no routing was given")
     w1_cols = inter if no_gate else 2 * inter
-    ndim = SCALES_RANK_PER_BLOCK if form.block_scaled else SCALES_RANK_PER_CHANNEL
+    ndim = SCALES_RANK_PER_CHANNEL
     for name, s, n in (
         ("w1_scales", w1_scales, w1_cols),
         ("w2_scales", w2_scales, hidden),
@@ -874,7 +775,7 @@ def fused_ep_moe(
                 )
             continue
         if s is None or s.ndim != ndim or s.shape[0] != num_experts or s.shape[-1] != n:
-            want = (num_experts, "blocks", n) if form.block_scaled else (num_experts, n)
+            want = (num_experts, n)
             raise ValueError(
                 f"{name} is {None if s is None else tuple(s.shape)}. "
                 f"the {form.scale_layout} form {want} is expected"
@@ -949,13 +850,11 @@ def fused_ep_moe(
         )
     check_tested(
         form,
-        activation=activation,
         no_gate=no_gate,
         has_bias=w1_bias is not None or w2_bias is not None,
         config=config,
     )
     partition = jax.sharding.PartitionSpec
-    token_dtype = config.token_dtype
     bound = tables.routed_rows_bound(tokens, top_k, num_experts, tile_rows)
     if routed_rows_per_shard is None:
         routed_rows_per_shard = bound
@@ -1009,62 +908,35 @@ def fused_ep_moe(
             inter,
             config=config,
             weight_format=weight_format,
-            weight_block=weight_block,
             has_w1_bias=has_w1_bias,
             has_w2_bias=has_w2_bias,
             no_gate=no_gate,
             activation_block=activation_block,
             result_rows=config.result_rows,
             token_block=token_block,
-            token_rows=config.token_rows,
         )
 
-    weight_slots, weight_prefetch, stream_block, stream_rows = buffers(token_block)
-    if stream_block and config.token_block is None and not (form.block_scaled):
-        # A streamed expert needs the blocked intermediate and nothing
-        # else: the token rows use one scale per row, allowing the up
-        # projection to use a single matmul and rescale. An explicit
-        # token_block is preserved; block-scaled weights require their block.
-        token_block = 0
-        weight_slots, weight_prefetch, stream_block, stream_rows = buffers(token_block)
+    weight_slots, weight_prefetch = buffers(token_block)
     # Sorted rows fetch each tile as one copy from rows the sparse cores
     # sorted into expert order (Config.sorted_rows, or the choice by the
-    # shard's shape); a streamed build fetches per row instead (its body
-    # reads the token table a block at a time), and so does a width whose
-    # lane blocks are not whole gather words (the gather moves rows as
-    # 32-bit words): the sort is skipped there rather than refused. A table
+    # shard's shape); a width whose lane blocks are not whole gather words
+    # (the gather moves rows as 32-bit words) fetches per row instead: the
+    # sort is skipped there rather than refused. A table
     # whose sort program is over the sparse core's program size (a width
     # whose rows do not move as one copy per block, at a large table) is
     # skipped by the choice by shape and refused when the sort was asked
     # for.
-    if config.token_rows == "bf16":
-        if form.block_scaled:
-            raise ValueError(
-                "bf16 token rows take fp8 weights with one scale "
-                "per channel or bf16 weights, not the "
-                f"block-scaled {form.name} form"
-            )
-        if stream_block and form.has_scales:
-            raise ValueError(
-                "bf16 token rows with fp8 weights take a "
-                "whole-expert build: the up matmul runs on a "
-                "per-expert bf16 copy of w1"
-            )
     sorted_rows = config.sorted_rows
     if sorted_rows is None:
         sorted_rows = sorted_rows_by_shape(experts_per_shard, tokens_per_shard)
-    sorted_rows = (
-        sorted_rows
-        and not stream_block
-        and gather.rows_gatherable(row_lane_blocks(hidden), token_dtype)
-    )
+    sorted_rows = sorted_rows and gather.rows_gatherable(row_lane_blocks(hidden), FP8)
     if sorted_rows:
         n_sorted = align_up(
             routed_rows_per_shard, gather.gather_rows_multiple(config.gather_block_rows)
         )
         per_subcore = n_sorted // gather.subcore_mesh()[1]
         bundles = gather.sort_program_bundles(
-            per_subcore, row_lane_blocks(hidden), token_dtype, config.gather_block_rows
+            per_subcore, row_lane_blocks(hidden), FP8, config.gather_block_rows
         )
         if bundles > gather.SORT_PROGRAM_BUNDLE_LIMIT:
             if config.sorted_rows:
@@ -1087,10 +959,8 @@ def fused_ep_moe(
         num_shards=num_shards,
         mesh_axes=tuple(mesh.axis_names),
         weight_format=weight_format,
-        weight_block=weight_block,
         routed_rows=routed_rows_per_shard,
         activation=activation,
-        swiglu_limit=swiglu_limit,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
         no_gate=no_gate,
@@ -1103,15 +973,11 @@ def fused_ep_moe(
         activation_block=activation_block,
         result_rows=config.result_rows,
         elementwise_dtype=config.elementwise_dtype,
-        stream_block=stream_block,
-        stream_rows=stream_rows,
         vmem_fraction=config.vmem_fraction,
         activation_columns_per_pass=config.activation_columns_per_pass,
         weight_dma_priority=config.weight_dma_priority,
         token_block=token_block,
-        intermediate=config.intermediate,
         sorted_rows=sorted_rows,
-        token_rows=config.token_rows,
     )
     # The arrival buffer: every routed pair of this shard's tokens plus the
     # row-block padding of every expert's run, in whole blocks.
@@ -1142,7 +1008,6 @@ def fused_ep_moe(
         config=config,
         sorted_rows=sorted_rows,
         mesh_axes=tuple(mesh.axis_names),
-        token_dtype=token_dtype,
     )
 
     handed_in = routing is not None
@@ -1213,9 +1078,7 @@ def fused_ep_moe(
         routing_block,
         routed_rows_per_shard,
         weight_format,
-        weight_block,
         activation,
-        swiglu_limit,
         bool(no_gate),
         config,
         bool(drop_nan_rows),

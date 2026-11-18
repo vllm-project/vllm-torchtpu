@@ -169,7 +169,6 @@ def _expert_rows(rows, tile_expert, w1, w2, s1, s2, config):
     # The forms this reference writes out: one scale per row for the token
     # rows and the intermediate, both FP8.
     assert config.activation_block == 0 and config.token_rows_block == 0, config
-    assert config.token_rows == config.intermediate == "fp8", config
     fp8_rows = config.result_rows == "fp8"
     result_dtype = rowquant.FP8 if fp8_rows else jnp.bfloat16
     hidden, columns = w1.shape[1], w1.shape[2]
@@ -614,59 +613,46 @@ def test_the_layer_cache_keys_on_the_module_flags(one_cpu_shard):
 
 # ---- the forms the layer admits ----
 
+# The forms the kernel carries without a TPU case: (name, check_tested
+# arguments over the plain form, Config fields).
+UNTESTED_FORMS = {
+    "bf16 weights": (dict(form="bf16"), {}),
+    "no_gate": (dict(no_gate=True), {}),
+    "biases": (dict(has_bias=True), {}),
+    "activation_block": ({}, dict(activation_block=128)),
+    "token_block": ({}, dict(token_block=128)),
+}
 
-def _untested_forms():
-    """(name, check_tested arguments) for each form without a TPU case."""
+
+def _check_tested_args(name):
     from vllm_torchtpu.kernels.fused_moe.v3 import Config, weight_form
 
-    fp8 = weight_form("fp8")
-    plain = dict(activation="silu", no_gate=False, has_bias=False, config=Config())
-    forms = [
-        (f"weight format {name}", dict(plain, form=weight_form(name)))
-        for name in ("fp8_block", "fp4", "int4", "bf16")
-    ]
-    forms += [
-        ("swigluoai", dict(plain, form=fp8, activation="swigluoai")),
-        ("gelu", dict(plain, form=fp8, activation="gelu")),
-        ("no_gate", dict(plain, form=fp8, no_gate=True)),
-        ("biases", dict(plain, form=fp8, has_bias=True)),
-    ]
-    for name, fields in (
-        ("activation_block", dict(activation_block=128)),
-        ("token_block", dict(token_block=128)),
-        ("stream_block", dict(stream_block=128)),
-        ("token_rows bf16", dict(token_rows="bf16")),
-        ("intermediate bf16", dict(intermediate="bf16")),
-    ):
-        forms.append((name, dict(plain, form=fp8, config=Config(**fields))))
-    return forms
+    overrides, fields = UNTESTED_FORMS[name]
+    args = {"form": "fp8", "no_gate": False, "has_bias": False, **overrides}
+    args["form"] = weight_form(args["form"])
+    return dict(args, config=Config(**fields))
 
 
 @pytest.mark.cpu_test
 def test_the_tested_forms_are_admitted():
-    """The serving bridge's form and the TPU test's: fp8 weights, silu, no
-    biases, whole experts, fp8 token rows and intermediate, either result
-    rows."""
+    """The serving bridge's form and the TPU test's: fp8 weights, silu over
+    the gate, no biases, one scale per row, either result rows."""
     from vllm_torchtpu.kernels.fused_moe.v3 import Config, weight_form
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
 
     for config in (Config(), Config(result_rows="bf16"), Config(sorted_rows=False)):
         v3_layer.check_tested(
-            weight_form("fp8"),
-            activation="silu",
-            no_gate=False,
-            has_bias=False,
-            config=config,
+            weight_form("fp8"), no_gate=False, has_bias=False, config=config
         )
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("name,kwargs", _untested_forms(), ids=lambda v: str(v))
-def test_untested_forms_are_refused(name, kwargs):
+@pytest.mark.parametrize("name", list(UNTESTED_FORMS))
+def test_untested_forms_are_refused(name):
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
 
     with pytest.raises(NotImplementedError, match="no TPU test"):
-        v3_layer.check_tested(**kwargs)
+        v3_layer.check_tested(**_check_tested_args(name))
 
 
 @pytest.mark.cpu_test
@@ -674,8 +660,15 @@ def test_the_layer_refuses_an_untested_form(one_cpu_shard):
     """fused_ep_moe itself refuses, before anything is built."""
     from vllm_torchtpu.kernels.fused_moe.v3 import Config
 
-    with pytest.raises(NotImplementedError, match="token_rows 'bf16'"):
-        one_cpu_shard(config=Config(token_rows="bf16"))
+    with pytest.raises(NotImplementedError, match="blocked row scales"):
+        one_cpu_shard(config=Config(activation_block=128))
+
+
+@pytest.mark.cpu_test
+def test_the_layer_takes_silu_only(one_cpu_shard):
+    """silu is the one activation the kernel computes."""
+    with pytest.raises(ValueError, match="activation 'gelu' is not one of"):
+        one_cpu_shard(activation="gelu")
 
 
 # ---- the layer on eight TPU7x cores ----
