@@ -558,6 +558,10 @@ def test_zero_prefix_fast_is_a_compile_key(monkeypatch):
     assert ignored and "VLLM_TPU_QSA_PREFIX_SLICE" not in ignored
     assert "VLLM_TPU_QSA_ZERO_PREFIX_FAST" not in ignored
     assert "VLLM_TPU_QSA_ZERO_PREFIX_FAST" in envs.environment_variables
+    # q38 BLSTACK-SEED (rw2g, Benliang Wang's tree): earlier tests' monkeypatch.setattr(envs, ...) undo leaves a real
+    # module attribute (their oldval was the lazily read value), which shadows envs.__getattr__ for the rest of the
+    # session on this tree; drop it so the registry entry itself is read.
+    envs.__dict__.pop("VLLM_TPU_QSA_ZERO_PREFIX_FAST", None)
     monkeypatch.setenv("VLLM_TPU_QSA_ZERO_PREFIX_FAST", "1")
     assert envs.VLLM_TPU_QSA_ZERO_PREFIX_FAST is True
     monkeypatch.delenv("VLLM_TPU_QSA_ZERO_PREFIX_FAST")
