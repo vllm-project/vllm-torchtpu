@@ -181,8 +181,10 @@ class Eagle3Proposer:
     tokens based on the target model's outputs.
 
     Current notes:
-    - Supports both greedy (temperature=0) and non-greedy (temperature, top-k,
-      top-p) speculative decoding on TPU.
+    - Greedy and non-greedy requests both run. The draft proposes its argmax
+      token, and the rejection sampler (layers/adapter/sample/rejection_sampler.py)
+      verifies a non-greedy request's drafts against the target distribution,
+      treating each draft as a one-hot proposal.
     - draft_tensor_parallel_size selects the draft's parallelism: 1 runs the
       eagle3/mtp head fully replicated on every TPU worker; target tp runs it
       sharded across the TP group.
@@ -280,6 +282,10 @@ class Eagle3Proposer:
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._mtp_fused_loop_warm = False
         self._mtp_fused_loop_max_p: int = 0
+        # Set by propose() around each chunk's _prepare_draft_inputs call: the
+        # loop bucket to pad the step-0 gather indices to (0: none), and
+        # whether the async prep also returns step 1's positions and seq_lens.
+        self._step0_pad_len: int = 0
         self._prep_step1_inputs: bool = False
         self._last_prep_step1: tuple[torch.Tensor, torch.Tensor] | None = None
         # Greedy draft head for greedy top tokens: the head owner that
@@ -1551,8 +1557,11 @@ class Eagle3Proposer:
         #     repeats the last valid request idempotently)
         #   ov_tokens: optional [B] int32 override tokens for partial-prefill
         #     requests (-1 for non-overridden requests).
-        # Folds the 11 eager tensor ops + unbucketed seed scatter + gather_indices
-        # pad + num_rejected pad into a single bucketed compiled graph.
+        # One bucketed program computes each request's seed token and its
+        # position from the rejection-sampler output, scatters the seeds into
+        # the shifted input ids, and returns the gather indices and the
+        # rejected counts padded to knr (with positions and seq_lens, also step
+        # 1's positions and seq_lens for the fused loop).
         B = next_tokens_device.shape[0]
         knr = query_start_loc.shape[0] - 1
         eff_b = min(B, knr)
@@ -2293,9 +2302,9 @@ class Eagle3Proposer:
                     )
                     ov_np[i] = req_state.get_token_id(seq_len)
                 ov_tokens_dev = _h2d_temp(runner, torch.from_numpy(ov_np))
-            step0_pad_len = int(getattr(self, "_step0_pad_len", 0) or 0)
+            step0_pad_len = self._step0_pad_len
             prep_step1 = (
-                bool(getattr(self, "_prep_step1_inputs", False))
+                self._prep_step1_inputs
                 and getattr(chunk.attn_ctx, "seq_lens", None) is not None
             )
             if prep_step1 and step0_pad_len > 0:
@@ -2480,7 +2489,7 @@ class Eagle3Proposer:
                 chunk.input_ids, last_token_indices, next_token_ids
             )
             gather_indices = last_token_indices
-            step0_pad_len = int(getattr(self, "_step0_pad_len", 0) or 0)
+            step0_pad_len = self._step0_pad_len
             if step0_pad_len > p:
                 s0_lti_np = np.zeros(step0_pad_len, dtype=np.int64)
                 s0_lti_np[:p] = lti_p_np
@@ -2506,7 +2515,7 @@ class Eagle3Proposer:
             # pyrefly: ignore[unbound-name]
             padded_lti_np[:num_reqs] = last_token_indices_np
             gather_indices = _h2d_temp(runner, torch.from_numpy(padded_lti_np))
-            step0_pad_len = int(getattr(self, "_step0_pad_len", 0) or 0)
+            step0_pad_len = self._step0_pad_len
             if step0_pad_len > p:
                 s0_lti_np = np.zeros(step0_pad_len, dtype=np.int64)
                 s0_lti_np[:num_reqs] = last_token_indices_np

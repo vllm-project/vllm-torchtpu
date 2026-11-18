@@ -334,16 +334,12 @@ class _CarryAggregationAfterGatherPlan:
 @pytest.mark.tpu_test
 def test_prepare_draft_inputs(device):
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
         _dp_lockstep_enabled=lambda: False,
-        # The runner's input-staging fence (stage_h2d_upload).
-        _unfenced_h2d_sources=[],
-        _registered_h2d_sources=set(),
-        _free_h2d_sources={},
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -621,16 +617,12 @@ def test_prepare_draft_inputs_async_device(device):
     (last_token_indices) and the rejected count from the on-device rejection
     output — matching the host path fed the equivalent num_rejected."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
         _dp_lockstep_enabled=lambda: False,
-        # The runner's input-staging fence (stage_h2d_upload).
-        _unfenced_h2d_sources=[],
-        _registered_h2d_sources=set(),
-        _free_h2d_sources={},
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -3630,16 +3622,12 @@ def test_run_mtp_fused_loop_records_row_form_and_proposes_step0(
 def _check_prep_emits_padded_step0_gather_indices(
     proposer, device, seed_source, pad_len
 ):
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
         _dp_lockstep_enabled=lambda: False,
-        # The runner's input-staging fence (stage_h2d_upload).
-        _unfenced_h2d_sources=[],
-        _registered_h2d_sources=set(),
-        _free_h2d_sources={},
     )
     chunk = _make_chunk(
         input_ids=torch.arange(8, dtype=torch.int32, device=device),
