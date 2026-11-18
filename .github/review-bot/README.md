@@ -1,6 +1,6 @@
 # Review bot settings and guide
 
-The review bot, `cbs-oss-review-bot`, reviews pull requests in this repo with
+The review bot, `tpu-oss-review-bot`, reviews pull requests in this repo with
 Claude. It posts a GitHub review with a summary and inline comments. It never
 approves a PR or blocks a merge. Repo owners control it with the files in this
 folder.
@@ -8,13 +8,16 @@ folder.
 The bot reads these files from `main`, so an edit takes effect once its PR
 merges. A PR that edits them is still reviewed with the settings on `main`.
 
+Each review ends with links to the instructions it followed (`REVIEW.md` and
+the code-rule files), at the commit it read them from.
+
 ## Files
 
 | File | What it does |
 | --- | --- |
 | `config.yaml` | Settings, listed below. A missing file or setting means the default. |
 | `REVIEW.md` | The review guide: what the bot checks and how it comments. See [REVIEW.md](#reviewmd). |
-| `AGENTS.md` (repo root and folders) | Code rules. The bot always checks changes against them. |
+| `AGENTS.md` (repo root and folders) | Code rules, by default (see `code_review_instructions`). The bot checks changes against them. |
 
 Put code rules in `AGENTS.md`, because people and coding agents read it too.
 Put instructions that are only for reviews in `REVIEW.md`. Where the two
@@ -31,9 +34,10 @@ The values in `config.yaml` today are the defaults.
 | `max_inline_comments` | Whole number, 0 to 30 | `15` | Most inline comments in one review, counting problems, nits and questions. Problems come first. Problems past the limit go to the summary under "More problems". `0` puts everything in the summary. |
 | `inline_labels` | `"blocking, should-fix"` or `blocking` | `"blocking, should-fix"` | Which problems get inline comments. A problem is labeled `blocking` (fix before merging) or `should-fix`. With only `blocking`, should-fix problems go to the summary under "More problems". |
 | `ignore_paths` | Glob patterns in double quotes, separated by commas, or empty | empty | Files the bot does not review. It leaves them out of the diff it reviews and drops nits and questions about them. A PR that changes only ignored files gets no automatic review. |
-| `cooldown_minutes` | Whole number, 15 to 1440 | `60` | Shortest time between two reviews of one PR. A request that comes sooner waits until the time is up. |
+| `cooldown_minutes` | Whole number, 15 to 1440 | `60` | Shortest time between two reviews of one PR. A request that comes sooner waits until the time is up, and the bot replies with how long. |
 | `automatic_reviews` | `on`, `off` | `on` | `on`: the bot reviews a PR once without being asked, when the PR is ready (see below). `off`: it reviews only when someone asks. |
 | `title_keywords_to_skip` | Words in double quotes, separated by commas, or empty | empty | More words that stop an automatic review when they appear anywhere in a PR title, ignoring case. They add to the built-in markers below. Asking for a review still works. |
+| `code_review_instructions` | File paths in double quotes, separated by commas, or empty | `AGENTS.md` | The files the bot treats as this repo's code rules and checks every change against. `AGENTS.md` means every AGENTS.md, at the root and in folders. Other paths replace it. Empty means no code rules, and the bot is told not to apply AGENTS.md, for a repo whose AGENTS.md holds instructions for other tools. Files these link to count too. |
 
 ### Format
 
@@ -95,8 +99,10 @@ Later reviews happen only on request.
 
 ## Other controls
 
-- **Ask for a review:** comment `@cbs-oss-review-bot` in the PR's
-  Conversation tab. Repo members, collaborators and allowlisted Google
+- **Ask for a review:** comment `@tpu-oss-review-bot` in the PR's
+  Conversation tab, or request it under Reviewers (its re-request button
+  works too). To get an answer on one of its inline comments, tag it in
+  your reply there. Repo members, collaborators and allowlisted Google
   accounts can ask.
 - **Skip a PR:** add the `skip-review-bot` label. The bot skips the PR, even
   when someone asks.
@@ -115,7 +121,7 @@ the bot reviews.
   guide for its own review.
 - If it defines a review format and a verdict line, the bot uses them.
   Otherwise the bot keeps its own format, which starts a clean review with
-  "Looks good.".
+  "✅ Ready for human review".
 - If the file is deleted, the bot falls back to a built-in guide kept in its
   own code.
 

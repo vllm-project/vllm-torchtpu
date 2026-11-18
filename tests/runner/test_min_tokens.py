@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_output_test_utils import _host_copy_state, _sample_tokens_runner
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -32,6 +33,9 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
+)
+from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
+    StructuredDecodingManager,
 )
 
 NEG_INF = float("-inf")
@@ -569,69 +573,24 @@ def test_top_tokens_step_needs_the_full_logits_below_min_tokens():
 
 def _plain_step_runner(num_output, logits, req_id="r0"):
     """The runner state sample_tokens reads for one greedy request in a plain
-    (non-speculative, synchronous) step, picking the argmax of what it gets.
-    With `num_output`, request `req_id` has that many outputs, min_tokens 4
-    and stop token 3."""
-    runner = SimpleNamespace(
-        execute_model_state=SimpleNamespace(
-            scheduler_output=SimpleNamespace(
-                num_scheduled_tokens={"r0": 1},
-                finished_req_ids=set(),
-                has_structured_output_requests=False,
-            ),
-            draft_chunks=[],
-            logits_list=[logits],
-            num_reqs_list=[1],
-            spec_decode_metadata_list=[None],
-            mamba_state_indices_list=None,
-            pooler_output_list=[],
-            top_tokens=False,
-            kv_save_nan_check=None,
-        ),
-        input_batch=SimpleNamespace(
-            max_num_logprobs=None,
-            num_reqs=1,
-            req_ids=["r0"],
-            req_id_to_index={"r0": 0},
-            all_greedy=True,
-            num_tokens_no_spec=[1],
-            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
-        ),
-        requests={
-            "r0": SimpleNamespace(
-                num_computed_tokens=0, num_tokens=1, output_token_ids=[]
-            )
-        },
-        _pre_async_results=None,
-        _pp_wave=None,
-        _dp_step_other_decode=False,
-        _min_tokens=min_tokens.MinTokensTracker(),
-        speculative_config=None,
-        scheduler_config=SimpleNamespace(async_scheduling=False),
-        _is_async_drafter=False,
-        _fence_spec_kv_under_token_copy=False,
-        _is_dspark_pd_producer=False,
-        is_pooling_model=False,
-        _get_sampling_generator=lambda: None,
-        _greedy_sample=lambda x: torch.argmax(x, dim=-1),
-        _update_mamba_slot_read_offsets=lambda *_args: None,
-        _update_num_xla_graphs=lambda *_args: None,
-        _modify_prev_results=lambda: None,
-        _stage_timing=MagicMock(),
+    (non-speculative, synchronous) step, picking the argmax of what it gets,
+    with the runner's own min_tokens methods. With `num_output`, request
+    `req_id` has that many outputs, min_tokens 4 and stop token 3."""
+    runner = _sample_tokens_runner(
+        [logits], [1], _min_tokens=min_tokens.MinTokensTracker()
     )
-    runner._stage_timing.take_samples.return_value = ([], [])
     if num_output is not None:
         runner._min_tokens.add(req_id, SamplingParams(min_tokens=4, stop_token_ids=[3]))
         runner.requests[req_id] = SimpleNamespace(
             num_computed_tokens=0, num_tokens=1, output_token_ids=[0] * num_output
         )
     for name in (
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
         "_mask_min_tokens",
         "_min_tokens_batch_state",
         "_settle_draft_placeholders_for_min_tokens",
         "_num_output_tokens",
-        "maybe_wait_for_kv_save",
-        "get_finished_kv_transfers",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
@@ -646,19 +605,13 @@ def test_plain_step_masks_below_min_tokens(num_output, expected):
     logits[0, 3], logits[0, 5] = 4.0, 2.0
     runner = _plain_step_runner(num_output, logits)
 
-    def host_copy(chunks, lengths, spec_logprobs=None):
-        return AsyncTPUCopyState(
-            chunks_cpu=chunks,
-            chunk_real_lens=lengths,
-            copy_ready_event=MagicMock(),
-            spec_logprobs=spec_logprobs,
-        )
-
     with (
         patch(
             "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
         ),
-        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
+        patch.object(
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
         torch.compiler.set_stance("force_eager"),
     ):
         output = TPUModelRunner.sample_tokens(runner, None)
@@ -732,19 +685,13 @@ def test_plain_step_logprobs_come_from_the_unmasked_logits():
 
     runner.gather_logprobs = gather_logprobs
 
-    def host_copy(chunks, lengths, spec_logprobs=None):
-        return AsyncTPUCopyState(
-            chunks_cpu=chunks,
-            chunk_real_lens=lengths,
-            copy_ready_event=MagicMock(),
-            spec_logprobs=spec_logprobs,
-        )
-
     with (
         patch(
             "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
         ),
-        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
+        patch.object(
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
         torch.compiler.set_stance("force_eager"),
     ):
         output = TPUModelRunner.sample_tokens(runner, None)
@@ -779,25 +726,14 @@ def test_draft_less_chunk_of_a_spec_step_masks_below_min_tokens(num_output, expe
         method="ngram", num_speculative_tokens=1
     )
     runner._sample_spec_verify_chunk = lambda *_args: torch.tensor([[7, -1]])
-    runner.drafter = SimpleNamespace()
-    runner.spec_decode_manager = SimpleNamespace(
-        propose_draft_token_ids=lambda **_kwargs: None
-    )
-    runner._sync_replicated_drafts_across_tp = lambda drafts: drafts
-
-    def host_copy(chunks, lengths, spec_logprobs=None):
-        return AsyncTPUCopyState(
-            chunks_cpu=chunks,
-            chunk_real_lens=lengths,
-            copy_ready_event=MagicMock(),
-            spec_logprobs=spec_logprobs,
-        )
 
     with (
         patch(
             "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
         ),
-        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
+        patch.object(
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
         torch.compiler.set_stance("force_eager"),
     ):
         output = TPUModelRunner.sample_tokens(runner, None)
@@ -836,28 +772,17 @@ def _spec_step_runner(num_output, logits_list, md_list, req_ids):
         "spec_gather_bonus_and_target_logits",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
-    runner.drafter = SimpleNamespace()
-    runner.spec_decode_manager = SimpleNamespace(
-        propose_draft_token_ids=lambda **_kwargs: None
-    )
-    runner._sync_replicated_drafts_across_tp = lambda drafts: drafts
     return runner
 
 
 def _run_sample_tokens(runner):
-    def host_copy(chunks, lengths, spec_logprobs=None):
-        return AsyncTPUCopyState(
-            chunks_cpu=chunks,
-            chunk_real_lens=lengths,
-            copy_ready_event=MagicMock(),
-            spec_logprobs=spec_logprobs,
-        )
-
     with (
         patch(
             "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
         ),
-        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
+        patch.object(
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
         torch.compiler.set_stance("force_eager"),
     ):
         return TPUModelRunner.sample_tokens(runner, None)
@@ -918,12 +843,20 @@ def test_spec_step_draft_less_chunk_logprobs_come_from_the_unmasked_logits():
     assert seen[-1][0, 3] == 4.0  # its logprobs from the raw ones
 
 
-def _verify(min_toks, grammar=False, start=0, grammar_only_stop=None, greedy=True):
+def _verify(
+    min_toks,
+    grammar=False,
+    start=0,
+    grammar_only_stop=None,
+    greedy=True,
+    num_acceptable_drafts=None,
+):
     """Two requests, drafts of 3 and 1, every draft the target argmax.
     Vocabulary 8; each row prefers token `t` (logit 4), then token 6 (logit 2).
     Not `greedy`: random sampling at temperature 0.01, where a logit gap of 2
-    is a factor e^200. Returns the selected tokens and whether the fused
-    greedy prelude ran."""
+    is a factor e^200. With `num_acceptable_drafts`, the structured requests
+    r0 and r1 get the real draft-token mask. Returns the selected tokens and
+    whether the fused greedy prelude ran."""
     draft_lengths = [3, 1]
     prefer = [[1, 1, 1, 3], [2, 5]]  # per request: draft rows, then the bonus
     rows = [t for req in prefer for t in req]
@@ -968,8 +901,24 @@ def _verify(min_toks, grammar=False, start=0, grammar_only_stop=None, greedy=Tru
                 target[0, grammar_only_stop] = 4.0
             return target, bonus
 
+        def mask_invalid_draft_tokens(draft_token_ids, *_args, **_kwargs):
+            return draft_token_ids
+
+        if num_acceptable_drafts is not None:
+            grammar_output = SimpleNamespace(
+                structured_output_request_ids=["r0", "r1"],
+                num_acceptable_drafts=num_acceptable_drafts,
+            )
+            manager = StructuredDecodingManager.__new__(StructuredDecodingManager)
+            manager.runner = SimpleNamespace(
+                input_batch=SimpleNamespace(
+                    req_id_to_index={"r0": start, "r1": start + 1}
+                )
+            )
+            mask_invalid_draft_tokens = manager.mask_invalid_draft_tokens
         runner.structured_decoding_manager = SimpleNamespace(
-            mask_spec_logits=mask_spec_logits
+            mask_spec_logits=mask_spec_logits,
+            mask_invalid_draft_tokens=mask_invalid_draft_tokens,
         )
     with torch.compiler.set_stance("force_eager"):
         out = TPUModelRunner._sample_spec_verify_chunk(
@@ -1027,6 +976,19 @@ def test_verify_masks_the_second_request_at_its_own_rows(grammar):
     (and after its three target rows once gathered)."""
     got, _ = _verify({1: (4, 2, (2,), False)}, grammar)
     assert got == [[1, 1, 1, 3], [6, -1, -1, -1]]
+
+
+@pytest.mark.parametrize("greedy", [True, False])
+def test_verify_rejects_drafts_past_the_grammar_acceptable_count(greedy):
+    """vLLM fills the bitmask rows past num_acceptable_drafts with the
+    all-permissive mask, so the drafts there are pinned to -1, and the
+    rejection sampler must see the pinned IDs, not the raw drafts."""
+    got, _ = _verify({}, grammar=True, greedy=greedy, num_acceptable_drafts=[1, 1])
+    # r0 keeps only its first draft; r1's single draft stands.
+    assert got == [[1, 1, -1, -1], [2, 5, -1, -1]]
+    # Control: with every draft acceptable, nothing is pinned.
+    got, _ = _verify({}, grammar=True, greedy=greedy, num_acceptable_drafts=[3, 1])
+    assert got == [[1, 1, 1, 3], [2, 5, -1, -1]]
 
 
 def test_verify_with_random_sampling_masks_drafts_and_bonus():

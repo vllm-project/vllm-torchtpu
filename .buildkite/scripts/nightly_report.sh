@@ -31,19 +31,20 @@ meta() {
   buildkite-agent meta-data get "$1" --default "$2"
 }
 
-# Every tests-lane step a nightly runs (every key but the (PR) ones') passed.
+# Every cpu/tests-lane step a nightly runs (every key but `(PR)` steps) passed.
 # A step the report did not wait for may have no outcome yet, which counts as
-# not passed: a nightly test missing from the step's depends_on can stop a
-# pair being recorded, never let one through.
+# not passed: a nightly test missing from the step's depends_on can stop a pair
+# being recorded, never let one through.
 tests_lane_passed() {
-  local file=".buildkite/pipeline_tests.yml" key outcome passed=true
+  local files=(".buildkite/pipeline_cpu.yml" ".buildkite/pipeline_tests.yml")
+  local key outcome passed=true
   while IFS= read -r key; do
     outcome=$(buildkite-agent step get outcome --step "${key}" 2>/dev/null || true)
     echo "tests lane ${key}: ${outcome:-no outcome}"
     if [[ "${outcome}" != "passed" ]]; then
       passed=false
     fi
-  done < <(grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${file}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
+  done < <(grep -hoE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${files[@]}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
   [[ "${passed}" == true ]]
 }
 

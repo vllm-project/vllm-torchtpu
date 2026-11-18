@@ -24,6 +24,7 @@ import pytest
 import torch
 from vllm.config import (
     CacheConfig,
+    CompilationConfig,
     KVTransferConfig,
     LoRAConfig,
     ModelConfig,
@@ -132,6 +133,7 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         block_size=16,
         use_eagle=False,
         use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
         mamba_shared_prefix_checkpoint=False,
@@ -416,6 +418,18 @@ class TestTpuPlatform:
             # deployments alike.
             vllm_config.kv_transfer_config = MagicMock()
             assert unified_kv_layout_enabled(vllm_config)
+
+    @pytest.mark.parametrize("method", ["block", "fly"])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_unsupported_rejection_sampling(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, method
+    ):
+        vllm_config.speculative_config = MagicMock(rejection_sample_method=method)
+        with pytest.raises(NotImplementedError, match="rejection_sample_method"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
@@ -906,6 +920,34 @@ class TestTpuPlatform:
     @pytest.mark.parametrize(
         ("initial_cls", "expected_cls"),
         [
+            ("auto", "vllm_torchtpu.worker.tpu_worker.TPUWorker"),
+            # A caller's choice (--worker-cls, or the stage worker vllm-omni
+            # resolves before this hook runs) is kept.
+            ("pkg.custom_worker.CustomWorker", "pkg.custom_worker.CustomWorker"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_resolves_only_auto_worker_cls(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        initial_cls,
+        expected_cls,
+    ):
+        vllm_config.cache_config.block_size = 16
+        vllm_config.parallel_config.worker_cls = initial_cls
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.parallel_config.worker_cls == expected_cls
+
+    @pytest.mark.parametrize(
+        ("initial_cls", "expected_cls"),
+        [
             (None, "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"),
             (
                 "vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler",
@@ -963,10 +1005,14 @@ class TestTpuPlatform:
         assert get_tpu_multihost_topology(128, device_name="TPU v5p") == "4,4,8,2"
         assert get_tpu_multihost_topology(256, device_name="TPU v4") == "4,8,8,2"
 
-        # Test dual-device 3D torus lookup (v7x / Ironwood). Same meshes as
-        # v4 / v5p, but each chip contributes two devices, so a given mesh is
-        # reached at twice the world size. Both spellings of the device name
-        # have to select this map.
+        # Test dual-device 3D torus lookup (v7x / Ironwood): single-host 2x2x1
+        # (8 devices) plus the v4 / v5p meshes at twice the world size (two
+        # devices per chip). Both spellings of the device name and the default
+        # TpuPlatform.get_device_name() fallback have to select this map.
+        assert get_tpu_multihost_topology(8, device_name="TPU v7x") == "2,2,1,2"
+        assert get_tpu_multihost_topology(8, device_name="TPU7x") == "2,2,1,2"
+        monkeypatch.setattr(TpuPlatform, "get_device_name", lambda: "TPU v7")
+        assert get_tpu_multihost_topology(8) == "2,2,1,2"
         assert get_tpu_multihost_topology(16, device_name="TPU v7") == "2,2,2,2"
         assert get_tpu_multihost_topology(32, device_name="TPU7x") == "2,2,4,2"
         assert get_tpu_multihost_topology(64, device_name="TPU v7x") == "2,4,4,2"
@@ -1013,7 +1059,7 @@ class TestTpuPlatform:
             ("TPU v8i", "TPU v8i"),
         ],
     )
-    @patch("jax.devices")
+    @patch("jax.local_devices")
     def test_get_device_name(self, mock_devices, raw_kind, expected_name):
         """Tests get_device_name across TPU generations."""
         mock_dev = MagicMock()
@@ -1187,6 +1233,48 @@ def test_check_and_update_config_accepts_a_config_without_a_model(
     assert vllm_config.parallel_config.is_moe_model is None
     # The hook reached its end rather than short-circuiting.
     assert vllm_config.compilation_config.splitting_ops == []
+
+
+@pytest.mark.parametrize("splitting_ops", [None, [], ["test::host_boundary"]])
+@pytest.mark.parametrize("kernel_iteration", [False, True])
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_check_and_update_config_keeps_declared_splitting_ops(
+    mock_prepare_env, mock_apply_patches, monkeypatch, splitting_ops, kernel_iteration
+):
+    """Boundaries a model config hook (or the caller) declared survive the
+    platform hook; kernel-iteration mode adds its RPA boundaries once."""
+    monkeypatch.setenv("TPU_KERNEL_ITER_MODE", str(int(kernel_iteration)))
+    expected = list(splitting_ops or [])
+    if kernel_iteration:
+        expected.extend(
+            f"pallas::{prefix}_{i}"
+            for prefix in ("rpa_kernel", "rpa_kernel_batched")
+            for i in range(64)
+        )
+    with _device_left_unset():
+        vllm_config = VllmConfig(
+            compilation_config=CompilationConfig(splitting_ops=splitting_ops)
+        )
+
+    assert vllm_config.compilation_config.splitting_ops == expected
+    # Running the hook again neither drops nor duplicates a boundary.
+    TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.compilation_config.splitting_ops == expected
+
+
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_check_and_update_config_rejects_rpa_boundaries_without_kernel_iteration(
+    mock_prepare_env, mock_apply_patches, monkeypatch
+):
+    """The RPA ops donate kv_cache unless TPU_KERNEL_ITER_MODE is set, so a
+    declared RPA boundary without it is rejected at startup."""
+    monkeypatch.setenv("TPU_KERNEL_ITER_MODE", "0")
+    with _device_left_unset(), pytest.raises(ValueError, match="RPA kernels"):
+        VllmConfig(
+            compilation_config=CompilationConfig(splitting_ops=["pallas::rpa_kernel_0"])
+        )
 
 
 @patch("vllm_torchtpu.patch_registry.apply")

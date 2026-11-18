@@ -28,6 +28,7 @@ from torch import nn
 from torch_tpu._internal import execution_mode
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers import (
+    BaseClassificationHeadWithLoRA,
     BaseLayerWithLoRA,
     ClassificationHeadWithLoRA,
     ColumnParallelLinearWithLoRA,
@@ -45,6 +46,9 @@ from vllm.lora.layers import (
     ReplicatedLinearWithLoRA,
     RowParallelLinearWithLoRA,
     RowParallelLinearWithShardedLoRA,
+    Step5FusedQKVIndexerWithLoRA,
+    Step5SparseIndexerWWithLoRA,
+    TokenClassificationHeadWithLoRA,
     VocabParallelEmbeddingWithLoRA,
 )
 from vllm.lora.lora_model import LoRAModel
@@ -484,7 +488,13 @@ def test_every_vllm_lora_layer_class_is_classified():
         FusedMoE3DWithLoRA,
         # Writes the saved classification head into full_weight_stacked and
         # full_bias_stacked, which the slot write does not carry.
+        BaseClassificationHeadWithLoRA,
         ClassificationHeadWithLoRA,
+        TokenClassificationHeadWithLoRA,
+        # Built only for Step5's indexer projections; the TPU platform does not
+        # serve Step5, so their slicing was not reviewed for the slot write.
+        Step5FusedQKVIndexerWithLoRA,
+        Step5SparseIndexerWWithLoRA,
     }
     exported = (getattr(vllm.lora.layers, name) for name in vllm.lora.layers.__all__)
     layer_classes = {

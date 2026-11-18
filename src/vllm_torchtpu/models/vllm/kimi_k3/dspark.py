@@ -165,6 +165,9 @@ class K3DSparkModel(nn.Module):
             self.config.markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        # load_weights skips the checkpoint's confidence head, so adaptive
+        # verification verifies every draft (see DSparkProposer.load_model).
+        self.confidence_head: nn.Module | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None

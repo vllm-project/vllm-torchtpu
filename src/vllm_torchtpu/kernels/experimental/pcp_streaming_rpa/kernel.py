@@ -1517,7 +1517,7 @@ def _run_pcp_page_groups_multi_head(
 
         def _round_loop(round_idx, carry):
             del carry
-            curr_slot = lax.rem(round_idx, 2)
+            curr_slot = lax.rem(round_idx, 3)
             src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
 
             @pl.when(round_idx > 0)
@@ -1535,19 +1535,15 @@ def _run_pcp_page_groups_multi_head(
                     lane=lane,
                 )
 
-            next_slot = 1 - curr_slot
+            next_slot = lax.rem(round_idx + 1, 3)
             safe_round_idx = jnp.minimum(round_idx, pcp_size - 2)
-            safe_prev_round_idx = jnp.minimum(round_idx - 1, pcp_size - 2)
+            safe_slot_free_round_idx = jnp.clip(round_idx - 2, 0, pcp_size - 2)
 
-            @pl.when(round_idx > 0)
+            @pl.when(jnp.logical_and(round_idx >= 2, round_idx < pcp_size - 1))
             def _wait_remote_sync():
-                @pl.when(round_idx == pcp_size - 1)
-                def _wait_last_round():
-                    pl.semaphore_wait(remote_sync_sems.at[lane, safe_prev_round_idx], 1)
-
-                @pl.when(round_idx < pcp_size - 1)
-                def _wait_middle_round():
-                    pl.semaphore_wait(remote_sync_sems.at[lane, safe_prev_round_idx], 2)
+                pl.semaphore_wait(
+                    remote_sync_sems.at[lane, safe_slot_free_round_idx], 1
+                )
 
             remote_op = pltpu.make_async_remote_copy(
                 src_ref=kv_group_ref.at[curr_slot],
@@ -1640,15 +1636,9 @@ def _run_pcp_page_groups_multi_head(
 
             @pl.when(round_idx < pcp_size - 1)
             def _finish_remote_copy():
-                remote_op.wait()
-                pl.semaphore_signal(
-                    remote_sync_sems.at[lane, safe_round_idx],
-                    1,
-                    device_id=next_device_id,
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
+                remote_op.wait_send()
 
-                @pl.when(round_idx < pcp_size - 2)
+                @pl.when(round_idx < pcp_size - 3)
                 def _signal_prev_device():
                     pl.semaphore_signal(
                         remote_sync_sems.at[lane, safe_round_idx],
@@ -1656,6 +1646,8 @@ def _run_pcp_page_groups_multi_head(
                         device_id=prev_device_id,
                         device_id_type=pl.DeviceIdType.MESH,
                     )
+
+                remote_op.wait_recv()
 
             return jnp.array(0, dtype=jnp.int32)
 
@@ -2069,7 +2061,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         packed_kv_groups = current_kv_local.shape[0]
         page_size = kv_cache_local.shape[-1]
-        kv_vmem_shape = (2, 1, *kv_cache_local.shape[2:])
+        kv_vmem_shape = (3, 1, *kv_cache_local.shape[2:])
         captured_kv_hbm_shape = (
             *current_kv_local.shape[:-1],
             local_tokens * pcp_size,
@@ -2078,7 +2070,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         packed_kv_groups = current_kv_local.shape[1]
         kv_packing = current_kv_local.shape[2]
         page_size = kv_cache_local.shape[2]
-        kv_vmem_shape = (2, 1, page_size, packed_kv_groups, kv_packing, head_dim)
+        kv_vmem_shape = (3, 1, page_size, packed_kv_groups, kv_packing, head_dim)
         captured_kv_hbm_shape = (
             local_tokens * pcp_size,
             *current_kv_local.shape[1:],
@@ -2217,12 +2209,12 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache_local.shape[-1]
         packed_kv_groups = kv_cache_local.shape[2]
-        kv_vmem_shape = (2, 1, *kv_cache_local.shape[2:])
+        kv_vmem_shape = (3, 1, *kv_cache_local.shape[2:])
     else:
         page_size = kv_cache_local.shape[2]
         packed_kv_groups = kv_cache_local.shape[3]
         kv_packing = kv_cache_local.shape[4]
-        kv_vmem_shape = (2, 1, page_size, packed_kv_groups, kv_packing, head_dim)
+        kv_vmem_shape = (3, 1, page_size, packed_kv_groups, kv_packing, head_dim)
     num_tiles = tile_plan.shape[0]
     max_page_groups = num_tiles * block_tables.shape[1]
     num_lanes = 1

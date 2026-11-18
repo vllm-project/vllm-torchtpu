@@ -38,6 +38,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     ragged_gather_reduce as ragged_gather_reduce_v3,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_scatter import ragged_scatter
+from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 
 pytestmark = pytest.mark.tpu_test
 
@@ -206,7 +207,7 @@ class ScatterTest(jtu.JaxTestCase):
         the kernel the input dtype.
         """
         info = pltpu.get_tpu_info()
-        if info.sparse_core is None:
+        if get_sparse_core_info(info) is None:
             self.skipTest("no SparseCore on this TPU")
         fixed = dataclasses.replace(info, vmem_capacity_bytes=64 * 1024 * 1024)
 
@@ -267,7 +268,7 @@ class ScatterTest(jtu.JaxTestCase):
         suite observes any of them.
         """
         live = pltpu.get_tpu_info()
-        if live.sparse_core is None:
+        if get_sparse_core_info(live) is None:
             self.skipTest("no SparseCore on this TPU")
 
         def tiling(input_size, hidden_size, sc_vmem_bytes, num_simd_lanes):

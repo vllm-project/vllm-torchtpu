@@ -25,11 +25,11 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
 from vllm.v1.core.kv_cache_utils import (
     get_group_id,
     get_request_block_hasher,
     init_none_hash,
-    is_kv_cache_spec_uniform,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -221,9 +221,9 @@ def upstream_block_pool(monkeypatch):
     """Undo the plugin's same-step prefix-hit patch, if installed.
 
     Once the platform activates (any earlier test in the process can trigger
-    it), every block hashed since the last `Scheduler.schedule()` is a miss.
-    These tests drive `KVCacheManager` without a scheduler, so all hits would
-    be 0.
+    it), every block hashed since the last `KVCacheManager.new_step_starts()`
+    is a miss. These tests drive `KVCacheManager` without starting a step, so
+    all hits would be 0.
     """
     for name in ("_insert_block_hash", "get_cached_block"):
         monkeypatch.setattr(BlockPool, name, inspect.unwrap(getattr(BlockPool, name)))

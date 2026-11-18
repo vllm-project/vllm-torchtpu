@@ -31,7 +31,7 @@ steps:
 
       - label: ":docker: Build and Push Omni CI Image"
         key: "build_docker_omni"
-        # Empty, and so not skipped, unless bootstrap.sh uploads no tests lane,
+        # Empty, and so not skipped, unless bootstrap.py uploads no tests lane,
         # the only lane that runs on this image.
         skip: "${OMNI_IMAGE_SKIP:-}"
         agents:

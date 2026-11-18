@@ -27,7 +27,7 @@ def _create_vllm_model(
 ):
     # lm-eval 0.5.0.dev1 imports `from vllm.entrypoints.chat_utils import
     # resolve_hf_chat_template` and passes `swap_space` to EngineArgs.
-    # Point it at the vLLM 0.32.0 locations (`vllm.renderers.chat_utils` and
+    # Point it at the vLLM 0.33.0 locations (`vllm.renderers.chat_utils` and
     # `vllm.renderers.hf.resolve_chat_template`) and drop `swap_space`.
     import vllm.entrypoints as vllm_entrypoints
     import vllm.renderers.chat_utils as chat_utils

@@ -80,11 +80,20 @@ _unused_weight_predicate: Callable[[str], bool] | None = None
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
+    from vllm_torchtpu.layers.adapter import expert_placement
+
     expert_id = parse_expert_id(name)
     if expert_id is None:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    if expert_placement.has_applied_layers():
+        # The placement's rank list for this tensor's layer, at the EP rank the
+        # layer's expert map was built for -- so the fetch and the expert map
+        # agree by construction, whatever derived that rank.
+        placed = expert_placement.fetch_filter_ids(name)
+        if placed is not None:
+            return expert_id not in placed
     return expert_id not in local_expert_ids
 
 
@@ -141,6 +150,8 @@ def _compute_local_expert_ids() -> set[int] | None:
         get_tensor_model_parallel_rank,
     )
 
+    from vllm_torchtpu import utils
+
     dp_size = parallel_config.data_parallel_size
     tp_size = parallel_config.tensor_parallel_size
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -148,7 +159,13 @@ def _compute_local_expert_ids() -> set[int] | None:
     tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
     pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
     ep_size = dp_size * pcp_size * tp_size
-    ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+    ep_rank = utils.ep_rank(
+        dp_rank=dp_rank,
+        pcp_rank=pcp_rank,
+        pcp_size=pcp_size,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
 
     # Use the loader's symbol instead of importing the base helper directly.
     # Hierarchical EP replaces this symbol with its chip-aware ownership map,
@@ -233,11 +250,13 @@ def _sharded_runai_weights_iterator(
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
     model: torch.nn.Module | None = None,
+    is_unused_weight: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
     Reads each file's safetensors header (via the Run:AI streamer, so
     ``gs://`` and local paths both work), drops non-local expert tensors
+    (and any checkpoint weights rejected by ``is_unused_weight``)
     from the request plan, and streams the surviving byte ranges as
     contiguous runs. The skipped bytes are never requested from storage.
     With ``model``, each decoder layer's online-FP8 linears are quantized
@@ -286,7 +305,9 @@ def _sharded_runai_weights_iterator(
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
+                if _should_skip(tensor_meta.name, local_expert_ids) or (
+                    is_unused_weight is not None and is_unused_weight(tensor_meta.name)
+                ):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -439,7 +460,12 @@ def patch_runai_sharded_expert_streaming() -> None:
         finally:
             self._loading_model = None
 
-    def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+    def _get_weights_iterator(
+        self,
+        model_or_path: str,
+        revision: str | None,
+        is_unused_weight: Callable[[str], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -457,7 +483,9 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
             local_expert_ids = None
         if local_expert_ids is None:
-            return original_get_iterator(self, model_or_path, revision)
+            return original_get_iterator(
+                self, model_or_path, revision, is_unused_weight
+            )
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank
             # broadcast mode would corrupt the chunk-id maps. Sharded
@@ -467,12 +495,15 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "'distributed': incompatible with per-rank sharded fetch "
                 "plans; streaming per rank instead."
             )
+        # The sharded iterator reads every shard header and skips unused
+        # tensors itself, so a shard of only unused tensors costs no fetch.
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
             hf_weights_files,
             local_expert_ids,
             self.load_config.use_tqdm_on_load,
             self._loading_model,
+            is_unused_weight=is_unused_weight,
         )
 
     rsl.RunaiModelStreamerLoader._loading_model = None
@@ -1012,3 +1043,32 @@ def patch_moe_expert_write_staging() -> None:
         "Applied TPU patch: expert parameters are staged on the host "
         "and written to the device once each."
     )
+
+
+def patch_expert_placement_routers() -> None:
+    """Renumber placed MoE layers' routers after every model's weights load.
+
+    TPU_EXPERT_PLACEMENT loads a placed layer's experts in slot order
+    (``expert_placement.apply``, from the TPU MoE runner). Its router has to
+    be renumbered the same way once the checkpoint is written and before
+    process_weights_after_loading stages anything derived from it. Every model
+    a loader builds, a drafter included, passes through here between the two,
+    so no model needs code of its own.
+    """
+    from vllm.model_executor.model_loader import base_loader
+
+    orig_process = base_loader.process_weights_after_loading
+    if getattr(orig_process, "_tpu_renumbers_expert_routers", False):
+        return
+
+    @functools.wraps(orig_process)
+    def process_weights_after_loading(model, model_config, target_device):
+        from vllm_torchtpu.layers.adapter import expert_placement
+
+        expert_placement.permute_routers(model)
+        return orig_process(model, model_config, target_device)
+
+    typing.cast(
+        typing.Any, process_weights_after_loading
+    )._tpu_renumbers_expert_routers = True
+    base_loader.process_weights_after_loading = process_weights_after_loading

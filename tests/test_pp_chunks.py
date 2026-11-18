@@ -20,6 +20,7 @@ from vllm_torchtpu.core.pp_chunks import (
     chunk_pairs,
     profile_points,
     schedule_pairs,
+    step_limit,
 )
 
 BUCKETS = [16, 4096, 8192, 12288, 16384]
@@ -258,3 +259,32 @@ def test_fit_keeps_the_schedule_capacity():
 def test_describe_names_target_buckets_and_granularity():
     text = _model().describe()
     assert "16384:" in text and "target" in text and "granularity 4096" in text
+
+
+def test_step_limit_spreads_pending_work_over_the_stages_in_granules():
+    # 32K over 8 stages: 4K steps.
+    assert step_limit(32768, 8, 2048, 16384) == 4096
+    # 9K over 8 stages is 1152 tokens a stage, rounded up to a granule.
+    assert step_limit(9216, 8, 1024, 16384) == 2048
+    assert step_limit(40000, 8, 2048, 16384) == 6144
+
+
+def test_step_limit_floors_at_one_granule():
+    assert step_limit(1, 8, 2048, 16384) == 2048
+    assert step_limit(8192, 8, 2048, 16384) == 2048
+
+
+def test_step_limit_is_none_without_pending_work():
+    assert step_limit(0, 8, 2048, 16384) is None
+    assert step_limit(-5, 8, 2048, 16384) is None
+
+
+def test_step_limit_is_none_when_the_spread_is_a_full_step():
+    assert step_limit(8 * 16384, 8, 2048, 16384) is None
+    assert step_limit(4 * 65536, 8, 2048, 16384) is None
+
+
+def test_step_limit_clamps_to_the_full_step():
+    # 14000 tokens a stage round up to 17408 with 4352-token granules, past
+    # the 16K step.
+    assert step_limit(8 * 14000, 8, 4352, 16384) == 16384

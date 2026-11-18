@@ -92,10 +92,10 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh
 
-      # PR builds only; a nightly does not run it.
+      # PR and merge-queue builds only; a nightly does not run it.
       - label: "Presubmit: disagg-single-host"
         key: "presubmit_disagg_single_host"
-        if: "build.pull_request.id != null"
+        if: "build.pull_request.id != null || build.merge_queue.base_branch != null"
         env:
           SHAPE: *shape_8_core
         <<: *integration_step

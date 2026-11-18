@@ -2,6 +2,11 @@
 # This Dockerfile builds images for running vLLM on Google Cloud TPUs.
 # It pre-installs all dependencies from pyproject.toml (including torch-tpu) in the base variant.
 
+# Whether to compile vllm-rs, vLLM's Rust frontend, into the images
+# (docker/build_image.sh --vllm-rs). See the vllm-rs stages below. Declared
+# before the first FROM so that a FROM line can read it.
+ARG BUILD_VLLM_RS=false
+
 # vllm-router (vllm-project/router), the prefill/decode router the
 # disaggregated benchmarks put in front of an engine pair. Built from source
 # in a stage of its own; the pin is a build arg so a run can try another
@@ -28,6 +33,48 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     install -m 0755 target/release/vllm-router /usr/local/bin/vllm-router && \
     vllm-router --version
 
+# vllm-rs, vLLM's Rust frontend, compiled from the vLLM commit the image
+# installs when BUILD_VLLM_RS=true. Off by default: the compile takes minutes,
+# and only runs that set VLLM_USE_RUST_FRONTEND=1 use the binary. vLLM's own
+# install builds it only when cargo is present, so it gets a stage of its own,
+# which keeps the toolchain out of the images.
+FROM python:3.12-slim-bookworm AS vllm-rs-true
+
+# perl (slim has only perl-base) for the vendored OpenSSL build.
+RUN apt-get update && apt-get install -y curl git build-essential perl && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+
+# Only vLLM's Rust sources, at the commit build_image.sh passes (the
+# pyproject.toml pin unless overridden), and the toolchain vLLM pins there.
+ARG VLLM_COMMIT_HASH
+WORKDIR /build/vllm
+RUN test -n "${VLLM_COMMIT_HASH}" || { echo "VLLM_COMMIT_HASH is required to build vllm-rs; build with docker/build_image.sh" >&2; exit 1; } && \
+    git clone --quiet --filter=blob:none --no-checkout https://github.com/vllm-project/vllm.git . && \
+    git sparse-checkout set rust && \
+    git checkout --quiet "${VLLM_COMMIT_HASH}" && \
+    rustup toolchain install --profile minimal "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+
+# The cargo build vLLM's setuptools-rust step runs (tools/build_rust.py),
+# with the version it would stamp. The soft open-file limit of a BuildKit RUN
+# step (1024) is too low for one rustc per core.
+RUN --mount=type=cache,target=/opt/cargo/registry \
+    --mount=type=cache,target=/opt/cargo/git \
+    ulimit -n "$(ulimit -Hn)" && \
+    version="$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)" && \
+    VLLM_RS_BUILD_VERSION="${version#v}" CARGO_TARGET_DIR=/build/target \
+    cargo build --release --locked --manifest-path rust/src/cmd/Cargo.toml --bin vllm-rs --features native-tls-vendored && \
+    install -D -m 0755 /build/target/release/vllm-rs /out/vllm-rs && \
+    /out/vllm-rs --version
+
+# BUILD_VLLM_RS=false: no vllm-rs.
+FROM python:3.12-slim-bookworm AS vllm-rs-false
+WORKDIR /out
+
+# The flag picks one of the two; BuildKit builds only the stage picked.
+FROM vllm-rs-${BUILD_VLLM_RS} AS vllm-rs
+
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
 # (including torch-tpu) pre-installed.
@@ -37,10 +84,13 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
 FROM python:3.12-slim-bookworm AS base
 
 # curl for health checks, git so uv can clone the vllm source dependency, the
-# toolchain for packages that build from source, and libgoogle-perftools4 for
-# the tcmalloc allocator enabled below. build-essential already pulls in gcc,
-# g++, make and libc6-dev.
-RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 && rm -rf /var/lib/apt/lists/*
+# toolchain for packages that build from source, libgoogle-perftools4 for the
+# tcmalloc allocator enabled below, numactl for vLLM's --numa-bind, which
+# launches each worker under it, and libibverbs1, which the tpu-sync-torch
+# extension links (for its Peregrine transport) and so needs at import even
+# when nothing uses RDMA. build-essential already pulls in gcc, g++, make and
+# libc6-dev.
+RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 numactl libibverbs1 && rm -rf /var/lib/apt/lists/*
 
 # tcmalloc for every derived image. Set after the install above, so that
 # intermediate steps do not fail preloading a library that is not there yet.
@@ -76,6 +126,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm
+
+# The Rust frontend, with BUILD_VLLM_RS=true: on PATH, and inside the vllm
+# package, where vLLM's build would install it and where
+# VLLM_RUST_FRONTEND_PATH=auto (the default) looks, so VLLM_USE_RUST_FRONTEND=1
+# alone selects it. The path is not set here: vLLM warns about it whenever it
+# reads its env vars without the frontend enabled.
+COPY --from=vllm-rs /out/ /usr/local/bin/
+RUN if [ -e /usr/local/bin/vllm-rs ]; then \
+      pkg="$(python -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("vllm").origin))')" && \
+      test -d "$pkg" && \
+      ln -s /usr/local/bin/vllm-rs "$pkg/vllm-rs"; \
+    fi
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
@@ -153,9 +215,14 @@ ARG VLLM_SOURCE
 # Copy vllm source (might be empty if not provided)
 COPY vllm /workspace/vllm-torchtpu/vllm
 
-# Install vllm from source if requested, otherwise clean up dummy dir
+# Install vllm from source if requested, otherwise clean up dummy dir. A source
+# install first drops a vllm-rs from the base stage and its link in the
+# installed vllm package: the binary matches the pinned vLLM, not this tree,
+# and the link would keep the old package directory from being removed.
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -n "$VLLM_SOURCE" ]; then \
+      pkg="$(python -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("vllm").origin))')" && \
+      rm -f /usr/local/bin/vllm-rs "$pkg/vllm-rs" && \
       uv pip install --system --no-deps \
         -e /workspace/vllm-torchtpu/vllm ; \
     else \

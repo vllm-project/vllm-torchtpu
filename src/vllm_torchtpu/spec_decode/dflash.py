@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import time
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -227,6 +228,8 @@ class DFlashProposer:
         self._draft_attn_layer_names = (
             set(all_attn_layers.keys()) - target_attn_layer_names
         )
+        for name in self._draft_attn_layer_names:
+            all_attn_layers[name].is_draft_layer = True
 
         # Share Embeddings and LM Head. DFlash drafts always predict target
         # vocab, so sharing is forced; DSpark overrides the flag because a
@@ -305,8 +308,7 @@ class DFlashProposer:
 
         The target's buckets stop at max_num_batched_tokens, but the draft
         forward is num_reqs * block_size tokens: the scheduler does not
-        charge drafting slots for these methods
-        (vllm_torchtpu._patch_dflash_drafting_slot_budget), so a request
+        charge drafting slots for these methods, so a request
         scheduled fewer than block_size tokens still drafts a full block,
         and a step's draft can outgrow the largest target bucket.
         """
@@ -315,6 +317,18 @@ class DFlashProposer:
         while paddings[-1] < max_draft_tokens:
             paddings.append(min(paddings[-1] * 2, max_draft_tokens))
         return paddings
+
+    def draft_forward_buckets(self) -> list[int]:
+        """Buckets a draft forward runs at: a full block up to a full chunk
+        (see _max_chunk_reqs)."""
+        max_draft_tokens = self._get_padded_len(
+            self._max_chunk_reqs() * self.block_size
+        )
+        return [
+            b
+            for b in self._draft_token_paddings()
+            if self.block_size <= b <= max_draft_tokens
+        ]
 
     def _get_padded_len(self, target_len: int) -> int:
         paddings = self._draft_token_paddings()
@@ -704,10 +718,9 @@ class DFlashProposer:
         logger.info("Precompiling DFlash draft model buckets...")
 
         runner = self.runner
-        block_size = self.block_size
-        # Warm draft forwards up to a full chunk (see _max_chunk_reqs), or
-        # the first such step compiles XLA mid-serving.
-        max_draft_tokens = self._get_padded_len(self._max_chunk_reqs() * block_size)
+        # Warm every draft-forward bucket, or the first step at one compiles
+        # XLA mid-serving.
+        draft_buckets = set(self.draft_forward_buckets())
         target_buckets = set(runner.num_tokens_paddings)
 
         with runner._precompile_timed("drafter first pass"):
@@ -734,7 +747,7 @@ class DFlashProposer:
 
                 # Context-KV updates allow short chunks;
                 # draft forward needs a full block.
-                if not block_size <= num_tokens <= max_draft_tokens:
+                if num_tokens not in draft_buckets:
                     continue
 
                 self._dummy_draft_forward(
@@ -895,6 +908,19 @@ class DFlashProposer:
                 input_ids, positions, block_size
             )
             synchronize_tensors(draft_tokens_chunk, wait=sync)
+
+    def profile_draft_ms(self, num_tokens: int) -> float:
+        """Wall time in ms of one draft forward at this draft-forward bucket,
+        the faster of two runs so a first run that compiles is not counted.
+
+        Every collective-emitting rank must call this with the same buckets in
+        the same order (the dummy forward pairs collectives like a warmup)."""
+        timings = []
+        for _ in range(2):
+            started = time.perf_counter()
+            self._dummy_draft_forward(num_tokens, use_max_model_len=True, sync=True)
+            timings.append((time.perf_counter() - started) * 1e3)
+        return min(timings)
 
     def _dp_draft_bucket(self, local_num_reqs: int = 0) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""

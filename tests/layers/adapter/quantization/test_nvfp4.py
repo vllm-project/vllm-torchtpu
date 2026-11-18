@@ -75,6 +75,8 @@ class FakeRoutedExperts(RoutedExperts):
         self.expert_placement_strategy = "linear"
         self.activation = FakeActivation(activation)
         self.use_grouped_topk = False
+        # Set by VllmMoERunner; moe_routing.route reads it.
+        self.capture_fn = None
 
 
 def make_linear_layer(input_size: int = 64, output_size: int = 32) -> LinearBase:

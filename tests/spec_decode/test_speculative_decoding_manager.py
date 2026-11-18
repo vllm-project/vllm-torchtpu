@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from vllm_torchtpu.runner.speculative_decoding_manager import (
@@ -102,10 +103,13 @@ def test_speculative_decoding_manager_metadata_indices(device):
     assert torch.equal(metadata.group_indices, expected_group_indices)
 
 
-def _make_manager_with_eagle3_drafter(num_reqs=2):
+def _make_manager_with_eagle3_drafter(num_reqs=2, dynamic_sd=False):
     mock_runner = MagicMock()
     mock_runner.input_batch.num_reqs = num_reqs
     mock_runner.speculative_config.method = "eagle3"
+    mock_runner.speculative_config.uses_dynamic_speculative_decoding.return_value = (
+        dynamic_sd
+    )
     mock_drafter = MagicMock(spec=Eagle3Proposer)
     mock_runner.drafter = mock_drafter
     mock_runner._async_drafter = mock_drafter
@@ -158,6 +162,41 @@ def test_propose_draft_token_ids_sync_device_seeded_caches_host_list():
     assert args[0] is None
     assert kwargs["return_device"] is False
     assert kwargs["next_tokens_per_chunk"] == ["chunk0"]
+
+
+@pytest.mark.parametrize(
+    ("dynamic_sd", "num_spec_tokens_to_schedule", "expected"),
+    [
+        (True, 0, [[], []]),
+        (True, 2, [[1, 2], [4, 5]]),
+        (True, 3, [[1, 2, 3], [4, 5, 6]]),
+        # Without a schedule the step's K is not read: SchedulerOutputs built
+        # by hand, as in warmup, leave it at 0.
+        (False, 0, [[1, 2, 3], [4, 5, 6]]),
+    ],
+)
+def test_propose_draft_token_ids_sync_cuts_drafts_to_dynamic_k(
+    dynamic_sd, num_spec_tokens_to_schedule, expected
+):
+    """Sync scheduling schedules every host draft it is handed, so a dynamic
+    speculative decoding schedule must cut them to the step's K."""
+    manager, mock_runner, mock_drafter = _make_manager_with_eagle3_drafter(
+        num_reqs=2, dynamic_sd=dynamic_sd
+    )
+    mock_runner.input_batch.req_ids = ["req-a", "req-b"]
+    mock_drafter.propose.return_value = [[1, 2, 3], [4, 5, 6]]
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_spec_tokens_to_schedule = num_spec_tokens_to_schedule
+
+    manager.propose_draft_token_ids(
+        sampled_token_ids=None,
+        scheduler_output=scheduler_output,
+        next_tokens_per_chunk=["chunk0"],
+    )
+
+    draft_token_ids = manager.take_draft_token_ids()
+    assert draft_token_ids is not None
+    assert draft_token_ids.draft_token_ids == expected
 
 
 def test_propose_draft_token_ids_async_spec_returns_device_tensor():

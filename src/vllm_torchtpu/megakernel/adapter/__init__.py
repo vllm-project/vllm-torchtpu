@@ -1,0 +1,74 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch/vLLM adapter for `megakernel` plugins."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .errors import MegakernelPluginError, MegakernelUnsupported
+from .hooks import StepContext, is_suppressed, suppressed
+
+_DRIVER_EXPORTS = frozenset({"ProgramDriver"})
+
+
+def _is_megakernel_requested(runner: Any = None) -> bool:
+    import vllm_torchtpu.envs as envs
+
+    from .config import collect_config
+
+    v_cfg = getattr(runner, "vllm_config", None) if runner is not None else None
+    add_cfg = getattr(v_cfg, "additional_config", None)
+    return collect_config(envs.VLLM_TPU_MEGAKERNEL, add_cfg).enabled
+
+
+def guard_weight_update(runner: Any) -> None:
+    """Raise `MegakernelUnsupported("weight_update")` while a megakernel serves
+    `runner`: its packed weights would go stale."""
+    if getattr(getattr(runner, "_megakernel", None), "serving", False) is True:
+        raise MegakernelUnsupported("weight_update")
+
+
+def maybe_create(runner: Any) -> Any:
+    """Create a megakernel driver for `runner` if enabled, importing lazily."""
+    if not _is_megakernel_requested(runner):
+        return None
+    from .driver import maybe_create as _driver_maybe_create
+
+    return _driver_maybe_create(runner)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _DRIVER_EXPORTS:
+        from . import driver
+
+        return getattr(driver, name)
+    if name == "find_backbone":
+        from .backbone import find_backbone
+
+        return find_backbone
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "MegakernelPluginError",
+    "MegakernelUnsupported",
+    "ProgramDriver",
+    "StepContext",
+    "find_backbone",
+    "guard_weight_update",
+    "is_suppressed",
+    "maybe_create",
+    "suppressed",
+]
