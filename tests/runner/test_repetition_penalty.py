@@ -236,6 +236,23 @@ class TestScalingMath:
         assert torch.isneginf(got[1, 5])
         assert torch.equal(got, ref)
 
+    @pytest.mark.parametrize("logits_width", [70, 96])
+    def test_logits_wider_than_the_bitmask_keep_their_extra_columns(self, logits_width):
+        """Logits padded past ``vocab_size`` 64, as ``apply_grammar_bitmask``
+        accepts: the bitmask has 64 bits, and the columns after it are not
+        seen."""
+        vocab_size = 64
+        logits = torch.full((2, logits_width), 2.0)
+        seen = np.zeros((2, vocab_size), dtype=np.bool_)
+        seen[0, [3, 63]] = True
+        penalties = np.array([[2.0], [1.0]], dtype=np.float32)
+
+        got = rep_pen.apply_penalties_table(logits, _pack_bool_mask(seen), penalties)
+
+        expected = logits.clone()
+        expected[0, [3, 63]] = 1.0
+        assert torch.equal(got, expected)
+
 
 def _penalized_runner(logits: torch.Tensor, penalty: float = 1.5):
     """`plain_step_runner` state where request `r0` has prompt `[4]` and

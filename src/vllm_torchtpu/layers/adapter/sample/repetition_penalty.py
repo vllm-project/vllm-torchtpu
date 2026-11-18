@@ -38,9 +38,17 @@ def _apply_repetition_penalty(
 ) -> torch.Tensor:
     """Unpack ``seen_bitmask`` (``[rows, cdiv(vocab_size, 32)]`` ``int32``) and
     scale ``logits`` in ``float32`` by ``1 / penalties`` where ``logits > 0`` and
-    ``penalties`` otherwise on seen positions, preserving ``logits.dtype``."""
+    ``penalties`` otherwise on seen positions, preserving ``logits.dtype``.
+
+    ``logits`` can be wider than the bitmask (columns after ``vocab_size``,
+    padded for hardware alignment, as ``apply_grammar_bitmask`` accepts). No
+    token id maps to those columns, so they are not seen and stay unchanged.
+    """
     shifts = torch.arange(32, dtype=torch.int32, device=seen_bitmask.device)
     seen_mask = unpack_token_bitmask(seen_bitmask, shifts, logits.shape[-1])
+    num_unmapped = logits.shape[-1] - seen_mask.shape[-1]
+    if num_unmapped > 0:
+        seen_mask = torch.nn.functional.pad(seen_mask, (0, num_unmapped), value=False)
     scaled = scale_seen_logits(logits.to(torch.float32), seen_mask, penalties)
     return scaled.to(logits.dtype)
 
