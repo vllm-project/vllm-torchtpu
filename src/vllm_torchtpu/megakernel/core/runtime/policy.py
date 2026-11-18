@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The bucket policy: the `T=1` decode and `T=4` MTP verify bucket lists,
-their parsing, and bucket selection (`BucketPolicy`).
+"""The bucket policy: the `T=1` decode and `T=verify_tokens` verify bucket
+lists (4 for MTP), their parsing, and bucket selection (`BucketPolicy`).
 
 Framework-free: imports no jax, torch or vLLM (stdlib only at run time).
 """
@@ -76,10 +76,15 @@ def parse_mk_buckets(val: str | Iterable[int]) -> tuple[int, ...]:
     )
 
 
-def parse_mk_verify_buckets(val: str | Iterable[int]) -> tuple[int, ...]:
-    """Parse `T=4` MTP verify row buckets from a string or iterable (`'0'` disables)."""
+def parse_mk_verify_buckets(
+    val: str | Iterable[int], verify_tokens: int = MTP_VERIFY_TOKENS
+) -> tuple[int, ...]:
+    """Parse verify row buckets (multiples of `verify_tokens` rows, at most 64)
+    from a string or iterable (`'0'` disables)."""
     return _parse_bucket_list(
-        val, valid_fn=lambda b: 4 <= b <= 64 and b % 4 == 0, label="verify_buckets"
+        val,
+        valid_fn=lambda b: verify_tokens <= b <= 64 and b % verify_tokens == 0,
+        label="verify_buckets",
     )
 
 
@@ -93,16 +98,22 @@ def select_bucket(num_tokens: int, buckets: Sequence[int] = DEFAULT_BUCKETS) -> 
 
 @dataclass(frozen=True)
 class BucketPolicy:
-    """Resolved `T=1` decode and `T=4` verify buckets and output-padding rules."""
+    """Resolved `T=1` decode and `T=verify_tokens` verify buckets and
+    output-padding rules."""
 
     buckets: tuple[int, ...] = DEFAULT_BUCKETS
     verify_buckets: tuple[int, ...] = DEFAULT_VERIFY_BUCKETS
     token_paddings: tuple[int, ...] = ()
+    # Tokens per sequence of a verify step: 1 + the drafts it verifies.
+    verify_tokens: int = MTP_VERIFY_TOKENS
 
     def __post_init__(self) -> None:
+        _need(self.verify_tokens >= 2, f"invalid verify_tokens={self.verify_tokens}")
         object.__setattr__(self, "buckets", parse_mk_buckets(self.buckets))
         object.__setattr__(
-            self, "verify_buckets", parse_mk_verify_buckets(self.verify_buckets)
+            self,
+            "verify_buckets",
+            parse_mk_verify_buckets(self.verify_buckets, self.verify_tokens),
         )
         pads = self.token_paddings
         if isinstance(pads, (str, bytes, bytearray)) or not isinstance(pads, Iterable):
@@ -159,7 +170,7 @@ class BucketPolicy:
         self, active_rows: int, tokens_per_seq: int = 1, *, clamp: bool = False
     ) -> int:
         """Select the smallest bucket for `(tokens_per_seq, active_rows)`."""
-        is_v = tokens_per_seq == MTP_VERIFY_TOKENS
+        is_v = tokens_per_seq == self.verify_tokens
         b_list = self.verify_buckets if is_v else self.buckets
         max_b = self.max_verify_bucket if is_v else self.max_bucket
         target = max(tokens_per_seq, min(active_rows, max_b)) if clamp else active_rows
@@ -175,4 +186,4 @@ class BucketPolicy:
         for b in self.buckets:
             yield (1, b)
         for b in self.verify_buckets:
-            yield (MTP_VERIFY_TOKENS, b)
+            yield (self.verify_tokens, b)

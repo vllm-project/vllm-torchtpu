@@ -96,6 +96,9 @@ def test_bucket_list_parsing_and_selection() -> None:
     for bad in ("6", "16, 16", "16, abc", (16, 16), [True], [16.5]):
         with pytest.raises(ValueError, match="verify_buckets"):
             parse_mk_verify_buckets(bad)
+    assert parse_mk_verify_buckets("8, 16", verify_tokens=8) == (8, 16)
+    with pytest.raises(ValueError, match="verify_buckets"):
+        parse_mk_verify_buckets("12", verify_tokens=8)
     assert select_bucket(5, (8, 16, 32)) == 8
     assert select_bucket(32, (8, 16, 32)) == 32
     with pytest.raises(ValueError, match="exceeds max bucket"):
@@ -283,6 +286,9 @@ def test_step_eligibility_cases():
     bs_runner = BatchShape(True, 2, 4, "ok")
     pol = BucketPolicy((8, 16), (16, 32), token_paddings=(16, 32))
     steps = {(1, 8): object(), (1, 16): object(), (4, 16): object(), (4, 32): object()}
+    # Verify steps of 1 + 7 drafts (an n-gram drafter's K): T=4 is unserved.
+    pol8 = BucketPolicy((1,), (8,), token_paddings=(16,), verify_tokens=8)
+    steps8 = {(1, 1): object(), (8, 8): object()}
 
     cases = [
         (
@@ -369,13 +375,34 @@ def test_step_eligibility_cases():
             "mk_t4_b16",
             16,
         ),
+        (
+            dict(
+                batch_shape=BatchShape(True, 1, 8, "ok"),
+                input_rows=16,
+                policy=(pol8, steps8),
+            ),
+            True,
+            "mk_t8_b8",
+            8,
+        ),
+        (
+            dict(
+                batch_shape=BatchShape(True, 1, 4, "ok"),
+                input_rows=16,
+                policy=(pol8, steps8),
+            ),
+            False,
+            "stock_q4",
+            0,
+        ),
     ]
     for kw, exp_el, exp_reason, exp_bkt in cases:
         bs_case = kw["batch_shape"]
+        case_pol, case_steps = kw.get("policy", (pol, steps))
         dec = check_step_eligibility(
             bs_case,
-            pol,
-            steps,
+            case_pol,
+            case_steps,
             input_rows=kw["input_rows"],
             mrope_ok=kw.get("mrope_ok", True),
         )
