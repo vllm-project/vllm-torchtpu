@@ -420,29 +420,70 @@ def test_spec_decode_metadata_deferred_draft_token_ids_and_lru_cache(device):
         assert getattr(m1_cached, f) is getattr(m1, f), f"{f} not reused from LRU"
     assert m1_cached.draft_lengths_cpu is m1.draft_lengths_cpu
     assert m1_cached.draft_token_ids is None
-    assert m1_cached.deferred_draft_token_ids_cpu is not None
-    assert np.array_equal(
-        m1_cached.deferred_draft_token_ids_cpu, m1.draft_token_ids.cpu().numpy()
-    )
+    # A cache hit extracts the host drafts on first use.
+    assert m1_cached.deferred_draft_token_ids_cpu is None
+    host = m1_cached.deferred_draft_token_ids_host()
+    assert host is not None
+    assert np.array_equal(host, m1.draft_token_ids.cpu().numpy())
     assert m1_cached.max_draft_input_index == m1.max_draft_input_index
 
 
-def test_metadata_uploads_are_released_at_the_runner_fence():
-    """The manager's temporary uploads go through the runner's input-staging
-    fence (stage_h2d_upload), which releases each source once the fence is
-    waited on, instead of a keepalive list that nothing clears."""
+def _staged_metadata_manager(input_ids):
+    """A metadata manager on a CPU runner with the input-staging registry."""
     from types import SimpleNamespace
-
-    from vllm_torchtpu.runner import speculative_decoding_manager as sdm
 
     runner = SimpleNamespace(
         device=torch.device("cpu"),
+        arange_np=np.arange(100, dtype=np.int32),
+        num_tokens_paddings=[8, 16, 32, 64],
+        input_ids_cpu=input_ids,
         _unfenced_h2d_sources=[],
         _registered_h2d_sources=set(),
         _free_h2d_sources={},
     )
-    host = torch.arange(4, dtype=torch.int32)
-    out = sdm._h2d_temp(runner, host)
+    return SpeculativeDecodingManager(runner)  # type: ignore[arg-type]
 
-    assert torch.equal(out, host)
-    assert [entry[0] for entry in runner._unfenced_h2d_sources] == [host]
+
+def test_metadata_uploads_are_released_at_the_runner_fence():
+    """The manager's uploads go through the runner's input-staging fence
+    (stage_h2d_upload), which releases each host source once the fence is
+    waited on, instead of a keepalive list that nothing clears."""
+    manager = _staged_metadata_manager(torch.arange(1, 21, dtype=torch.int32))
+    md = manager.get_spec_decode_metadata(
+        np.array([3, 2], dtype=np.int32), np.array([4, 7], dtype=np.int32), 4
+    )
+    staged = [entry[0] for entry in manager.runner._unfenced_h2d_sources]
+    uploads = (
+        md.draft_token_ids,
+        md.draft_lengths,
+        md.target_logits_indices,
+        md.bonus_logits_indices,
+        md.final_logits_indices,
+        md.segment_ids,
+        md.group_indices,
+    )
+    assert len(staged) == len(uploads)
+    for host, uploaded in zip(staged, uploads):
+        assert torch.equal(host, uploaded)
+    # A cache hit re-extracts and stages only the drafts.
+    manager.get_spec_decode_metadata(
+        np.array([3, 2], dtype=np.int32), np.array([4, 7], dtype=np.int32), 4
+    )
+    assert len(manager.runner._unfenced_h2d_sources) == len(uploads) + 1
+
+
+def test_metadata_cache_evicts_the_least_recently_used_layout():
+    """The metadata cache keeps 32 layouts and evicts the least recently used
+    one: a layout hit again moves to the back of the eviction order."""
+    manager = _staged_metadata_manager(torch.arange(1, 201, dtype=torch.int32))
+
+    def build(n):
+        return manager.get_spec_decode_metadata(
+            np.array([1, n], dtype=np.int32), np.array([2, 3 + n], dtype=np.int32), 4
+        )
+
+    first = {n: build(n) for n in range(32)}
+    assert build(0).final_logits_indices is first[0].final_logits_indices
+    build(32)  # Evicts layout 1, the least recently used, not layout 0.
+    assert build(0).final_logits_indices is first[0].final_logits_indices
+    assert build(1).final_logits_indices is not first[1].final_logits_indices
