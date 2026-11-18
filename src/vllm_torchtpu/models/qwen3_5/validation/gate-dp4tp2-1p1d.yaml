@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Accuracy gate, DP4 x TP2 decode (the layout of point #1), one prefill and one
+# Accuracy gate, DP4 x TP2 decode (the layout of entry p01), one prefill and one
 # decode replica. See README.md in this directory.
 name: gate-dp4tp2-1p1d
 purpose: >-
   Accuracy of this tree at the DP4 x TP2 decode layout, and the
   cost of the Qwen3.5 FP8 trade-off settings, measured as an on/off pair.
-  The submission tree's own gate at this layout showed a real acceptance
+  The record tree's own gate at this layout showed a real acceptance
   length 2.9% below the previous candidate's, cause not isolated.
 base_point: 1
 chips: 8
@@ -49,6 +49,6 @@ suite:
 noise:
   gsm8k_1319_samples: "+-0.42%"
 references:
-  - {tree: "the submission tree", layout: "DP4 x TP2", gsm8k: "97.73%", real_acceptance_length: 3.2528}
-  - {tree: "the previous submission candidate", layout: "DP4 x TP2", gsm8k: "97.50%", real_acceptance_length: 3.3498}
+  - {tree: "the record tree", layout: "DP4 x TP2", gsm8k: "97.73%", real_acceptance_length: 3.2528}
+  - {tree: "the previous candidate tree", layout: "DP4 x TP2", gsm8k: "97.50%", real_acceptance_length: 3.3498}
   - {tree: "an earlier DP4 x TP2 tree", layout: "DP4 x TP2", gsm8k: "97.80%", longbench: "65.41%"}
