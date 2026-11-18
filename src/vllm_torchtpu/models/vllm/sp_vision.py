@@ -43,7 +43,6 @@ from vllm_torchtpu.distributed.sequence_parallel import (
     column,
     gather_other_shards,
     in_out,
-    row,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -207,19 +206,13 @@ class SequenceParallelVision(nn.Module):
         context = _attend(attn, qkv[:, None], attention_inputs)[:, 0]
         own, rest = self.exchange.heads_to_rows(context)
         hidden_states = (
-            hidden_states
-            + (row(attn.proj, shards.proj, own, rest) + attn.proj.bias)[:, None]
+            hidden_states + _row(shards.proj, own, rest, attn.proj.bias)[:, None]
         )
         x = block.norm2(hidden_states)[:, 0]
         own, rest = column(mlp.linear_fc1, shards.fc1, x)
         own = mlp.act_fn(own + mlp.linear_fc1.bias)
         rest = mlp.act_fn(rest + shards.fc1_bias)
-        return (
-            hidden_states
-            + (row(mlp.linear_fc2, shards.fc2, own, rest) + mlp.linear_fc2.bias)[
-                :, None
-            ]
-        )
+        return hidden_states + _row(shards.fc2, own, rest, mlp.linear_fc2.bias)[:, None]
 
 
 def _attend(
@@ -264,12 +257,23 @@ def _merge(
     own, rest = column(merger.linear_fc1, shards.fc1, x)
     own = merger.act_fn(own + merger.linear_fc1.bias)
     rest = merger.act_fn(rest + shards.fc1_bias)
-    return row(merger.linear_fc2, shards.fc2, own, rest) + merger.linear_fc2.bias
+    return _row(shards.fc2, own, rest, merger.linear_fc2.bias)
+
+
+def _row(
+    weight: torch.Tensor, own: torch.Tensor, rest: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """A row-parallel projection of every rank's input block as one matmul over
+    the whole input, so it is rounded once, like the unsharded layer."""
+    x = torch.cat([own, rest.transpose(0, 1).flatten(1)], dim=-1)
+    return torch.matmul(x, weight) + bias
 
 
 def _replicate(module: nn.Module, others: list[int], **linears: nn.Module) -> None:
-    """Register the other ranks' shards of each linear as `<name>` [tp - 1,
-    in, out]; a column-parallel one's bias shards as `<name>_bias`."""
+    """Register each linear's weight shards for this rank's rows: a
+    column-parallel one's other shards as `<name>` [tp - 1, in, out] and their
+    biases as `<name>_bias`; a row-parallel one's whole weight as `<name>` [in,
+    out], in [own, *others] shard order."""
     from vllm.model_executor.layers.linear import (
         ColumnParallelLinear,
         RowParallelLinear,
@@ -281,12 +285,16 @@ def _replicate(module: nn.Module, others: list[int], **linears: nn.Module) -> No
             raise ValueError(
                 f"TPU_SP_VISION supports unquantized projections, not {linear.prefix}."
             )
-        weight = gather_other_shards(in_out(linear).data, others)
-        module.register_buffer(name, weight, persistent=False)
+        own = in_out(linear).data
+        rest = gather_other_shards(own, others)
         if isinstance(linear, ColumnParallelLinear):
             bias = gather_other_shards(linear.bias.data, others)
+            module.register_buffer(name, rest, persistent=False)
             module.register_buffer(f"{name}_bias", bias[:, None], persistent=False)
-        elif not isinstance(linear, RowParallelLinear):
+        elif isinstance(linear, RowParallelLinear):
+            whole = torch.cat([own[None], rest]).flatten(0, 1)
+            module.register_buffer(name, whole, persistent=False)
+        else:
             raise ValueError(f"{linear.prefix} is not a TP-parallel linear.")
 
 
