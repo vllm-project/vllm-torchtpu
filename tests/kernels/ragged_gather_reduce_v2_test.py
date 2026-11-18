@@ -185,6 +185,22 @@ class ScatterTest(jtu.JaxTestCase):
         indices = jax.random.permutation(key, out_size)
         topk_weights = jax.random.normal(key, (out_size,), jnp.bfloat16)
         valid_rows_mask = jnp.logical_and(start <= indices, indices < end)
+        # The SparseCore kernel, not the TensorCore fallback, has to serve this
+        # shape, or the test passes without reaching the column split.
+        cfg = rgr_v2_config.Config(
+            input_size=indices.size,
+            hidden_size=hidden,
+            source_rows=out_size,
+            reduce_group_size=rgs,
+            in_dtype=x.dtype,
+            core_axis_name="core",
+            subcore_axis_name="subcore",
+            tpu_info=pltpu.get_tpu_info(),
+        )
+        if get_sparse_core_info(cfg.tpu_info) is None:
+            self.skipTest("no SparseCore on this TPU")
+        self.assertFalse(cfg.should_fallback)
+        self.assertLessEqual(cfg.num_row_partitions, cfg.sc_info.num_lanes)
         desired = reference_ragged_gather_reduce(
             x, indices, topk_weights, valid_rows_mask, rgs
         )

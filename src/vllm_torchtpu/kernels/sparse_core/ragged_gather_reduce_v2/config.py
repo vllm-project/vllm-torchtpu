@@ -210,11 +210,12 @@ class Config:
                 break
 
             num_column_partitions = next_candidate
-        # A narrow hidden size (OLMo 3.5's 768-wide latent MoE) stops the loop
-        # above at the pipeline-depth preference while every SparseCore subcore
-        # is still its own row partition, more than there are SIMD lanes. Give
-        # up pipeline depth for a legal partitioning: keep halving the columns
-        # while they stay lane-aligned.
+        # A hidden size too narrow for the preferred pipeline depth per column
+        # partition (e.g. a 768-wide latent MoE) stops the loop above while
+        # every SparseCore subcore is still its own row partition, more than
+        # there are SIMD lanes. Give up pipeline depth for a legal
+        # partitioning: keep halving each column partition's width (doubling
+        # the partition count) while the partitions stay lane-aligned.
         while (
             self.num_tot_cores // num_column_partitions > num_simd_lanes
             and self.num_tot_cores % (num_column_partitions * 2) == 0
