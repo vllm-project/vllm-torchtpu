@@ -4657,7 +4657,10 @@ class TPUModelRunner(GPUModelRunner):
             )
         )
 
-        self._collect_mamba_state_seed_copies(scheduler_output, start_index, num_reqs)
+        if not envs.VLLM_TPU_SEED_COPIES_LATE:
+            self._collect_mamba_state_seed_copies(
+                scheduler_output, start_index, num_reqs
+            )
 
         return (
             per_layer_attn_metadata,
@@ -4671,6 +4674,31 @@ class TPUModelRunner(GPUModelRunner):
             request_major_input_ids,
             layout_plan,
         )
+
+    def _stage_seed_copies_late(
+        self, scheduler_output: "SchedulerOutput", start_index: int, num_reqs: int
+    ) -> None:
+        """VLLM_TPU_SEED_COPIES_LATE: the chunk's mamba seed copies, read-offset
+        resets and input-staging fence, issued right before the forward.
+
+        Near a mamba block edge `_collect_mamba_state_seed_copies` waits for
+        the previous step's sampled-token copy, which lands only once that
+        step has run; everything enqueued after the wait then reaches an idle
+        device. Issuing the substitution, the draft gather and the adapter's
+        input program first lets the device run them during the wait. None of
+        them reads the mamba state, the read offsets or the collector's host
+        state, and collect -> flush -> reset keep their relative order, so the
+        forward sees the same inputs. The fence moves with the uploads it has
+        to cover.
+        """
+        logger.info_once(
+            "VLLM_TPU_SEED_COPIES_LATE: mamba seed copies and read-offset resets "
+            "are staged right before the forward"
+        )
+        self._collect_mamba_state_seed_copies(scheduler_output, start_index, num_reqs)
+        self._flush_mamba_state_seed_copies()
+        self._reset_read_offsets_for_new_requests(start_index, num_reqs)
+        self._record_input_staging_fence()
 
     def _record_input_staging_fence(self) -> None:
         """Fence the uploads issued from the reusable host staging tensors.
@@ -5283,13 +5311,16 @@ class TPUModelRunner(GPUModelRunner):
             )
             host_phases.mark("prepare_inputs")
 
-            # Seed newly-advanced mamba state blocks before the forward reads
-            # them (chunk boundaries, decode crossings, prefix-cache resumes).
-            self._flush_mamba_state_seed_copies()
+            seed_late = envs.VLLM_TPU_SEED_COPIES_LATE
+            if not seed_late:
+                # Seed newly-advanced mamba state blocks before the forward
+                # reads them (chunk boundaries, decode crossings, prefix-cache
+                # resumes).
+                self._flush_mamba_state_seed_copies()
 
-            # A recycled slot/block still carries the previous request's read
-            # offset; clear it before this chunk's forward gathers it.
-            self._reset_read_offsets_for_new_requests(start_index, num_reqs)
+                # A recycled slot/block still carries the previous request's
+                # read offset; clear it before this chunk's forward gathers it.
+                self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
             fuse_extract = bool(
                 envs.VLLM_TPU_SUBST_EXTRACT_FUSED
@@ -5304,6 +5335,7 @@ class TPUModelRunner(GPUModelRunner):
                     spec_decode_metadata.final_logits_indices,
                     spec_decode_metadata.target_logits_indices,
                 )
+            pending_extract = None
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices
             )
@@ -5332,11 +5364,19 @@ class TPUModelRunner(GPUModelRunner):
                         if envs.VLLM_TPU_EXTRACT_DRAFTS_COMPILED
                         else extract_draft_token_ids
                     )
-                    spec_decode_metadata.draft_token_ids = extract(
+                    extract_args = (
                         input_ids,
                         spec_decode_metadata.final_logits_indices,
                         spec_decode_metadata.target_logits_indices,
                     )
+                    if envs.VLLM_TPU_EXTRACT_AFTER_FORWARD:
+                        # Only the rejection sampler reads the drafts:
+                        # enqueue the gather once the forward is launched.
+                        pending_extract = (extract, extract_args)
+                    else:
+                        spec_decode_metadata.draft_token_ids = extract(
+                            *extract_args
+                        )
             elif (
                 spec_decode_metadata is not None
                 and spec_decode_metadata.draft_token_ids is None
@@ -5371,7 +5411,8 @@ class TPUModelRunner(GPUModelRunner):
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             host_phases.mark("mm_slice")
-            self._record_input_staging_fence()
+            if not seed_late:
+                self._record_input_staging_fence()
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
                     input_ids, chunk_mm_inputs
@@ -5442,6 +5483,9 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
             host_phases.mark("adapter_prepare_inputs")
+            if seed_late:
+                self._stage_seed_copies_late(scheduler_output, start_index, num_reqs)
+                host_phases.mark("seed_copies_late")
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
                 trace_name += (
@@ -5479,6 +5523,15 @@ class TPUModelRunner(GPUModelRunner):
                     model_kwargs=model_kwargs,
                 )
             host_phases.mark("forward_dispatch")
+            if pending_extract is not None:
+                assert spec_decode_metadata is not None
+                extract, extract_args = pending_extract
+                spec_decode_metadata.draft_token_ids = extract(*extract_args)
+                logger.info_once(
+                    "VLLM_TPU_EXTRACT_AFTER_FORWARD: verified drafts are gathered "
+                    "after the forward launch"
+                )
+                host_phases.mark("extract_after_forward")
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling

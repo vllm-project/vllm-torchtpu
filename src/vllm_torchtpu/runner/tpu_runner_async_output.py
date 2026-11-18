@@ -87,6 +87,20 @@ def spec_logprobs_lists(
 # tensor whose pages the driver would have to pin and map on every step. A
 # buffer is reused after _PINNED_RING steps; `sampled_token_ids_cpu` copies out
 # of it at wait time, well within that window.
+_early_flush_logged = False
+
+
+def _log_early_flush() -> None:
+    global _early_flush_logged
+    _early_flush_logged = True
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "VLLM_TPU_TOKEN_COPY_EARLY_FLUSH: sampled-token chunks are materialized "
+        "before their D2H copy"
+    )
+
+
 _PINNED_RING = 8
 _pinned: dict[tuple[tuple[int, ...], torch.dtype], list[Any]] = {}
 
@@ -145,6 +159,17 @@ class AsyncTPUCopyState:
         spec_logprobs: list[SpecLogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
+        if envs.VLLM_TPU_TOKEN_COPY_EARLY_FLUSH:
+            # The chunks are deferred-graph tensors (views/slices of the
+            # sampler output). A non-blocking copy of one only starts once a
+            # later sync point runs its graph, which in a spec step is the
+            # drafter's launch, so the copy lands behind the draft programs.
+            # Enqueue the graph now (no host wait); the values are the same.
+            from vllm_torchtpu.utils import synchronize_tensors
+
+            synchronize_tensors(list(chunks_tpu), wait=False)
+            if not _early_flush_logged:
+                _log_early_flush()
         # Pinned ring reads race the device-to-host copy once TOKEN_PADDING_REUSE drops
         # the per-step host-to-device barrier (c32 GSM8K 0.14 with both on, 0.968 with
         # pinned off), so the pinned ring is only used without padding reuse.

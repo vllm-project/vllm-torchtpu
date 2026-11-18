@@ -417,6 +417,9 @@ if TYPE_CHECKING:
     VLLM_TPU_ENVS_FREEZE: bool = False
     VLLM_TPU_HOST_TOKEN_LISTS: bool = False
     VLLM_TPU_PREFILL_CKPT_DECODE_SKIP: bool = False
+    VLLM_TPU_SEED_COPIES_LATE: bool = False
+    VLLM_TPU_EXTRACT_AFTER_FORWARD: bool = False
+    VLLM_TPU_TOKEN_COPY_EARLY_FLUSH: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_STAGED_WALK_STACKED: bool = False
@@ -2630,6 +2633,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PREFILL_CKPT_DECODE_SKIP": env_bool(
         "VLLM_TPU_PREFILL_CKPT_DECODE_SKIP"
     ),
+    # Stage the mamba seed copies and read-offset resets after the token
+    # substitution and the adapter's input program instead of before them.
+    # Near a mamba block edge the seed-copy collector waits for the previous
+    # step's sampled tokens; done last, that wait overlaps work the device
+    # can already run. Same programs, same inputs; only their order changes.
+    "VLLM_TPU_SEED_COPIES_LATE": env_bool("VLLM_TPU_SEED_COPIES_LATE"),
+    # Enqueue the verified-draft gather (extract_draft_token_ids) after the
+    # forward: only the rejection sampler reads it, so it leaves the host's
+    # path to the forward launch. The forward does not write input_ids.
+    "VLLM_TPU_EXTRACT_AFTER_FORWARD": env_bool("VLLM_TPU_EXTRACT_AFTER_FORWARD"),
+    # Materialize the sampled-token chunks before their non-blocking D2H copy,
+    # so the copy is issued behind the sampler instead of behind the drafter's
+    # programs (deferred graphs run only when something forces them). The
+    # engine's next schedule and the runner's previous-results wait both wait
+    # on that copy.
+    "VLLM_TPU_TOKEN_COPY_EARLY_FLUSH": env_bool("VLLM_TPU_TOKEN_COPY_EARLY_FLUSH"),
     # Host-path pieces (q38f-int: default off, toggled per arm).
     # Record stage-timing device events only when a KV connector consumes them.
     "VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK": env_bool(
