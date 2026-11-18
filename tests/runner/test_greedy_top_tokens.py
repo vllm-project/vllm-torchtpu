@@ -386,6 +386,41 @@ def test_runner_topk_candidates_step_choice(monkeypatch):
     assert not runner._topk_candidates_this_step()
 
 
+def test_runner_keeps_thinking_budget_steps_off_the_topk_candidates(monkeypatch):
+    from vllm.config.reasoning import ReasoningConfig
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
+
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    sampled = SamplingParams(temperature=0.6, top_k=20)
+    runner = _runner(torch.zeros(8, 2))
+    runner.input_batch, runner.requests = _batch(sampled, sampled)
+    reasoning = ReasoningConfig(reasoning_parser="qwen3")
+    reasoning._reasoning_start_token_ids = [5]
+    reasoning._reasoning_end_token_ids = [6]
+    reasoning._natural_reasoning_end_token_ids = [6]
+    reasoning._enabled = True
+    runner._thinking_budget = ThinkingBudgetTracker(
+        reasoning, max_num_reqs=4, device=torch.device("cpu")
+    )
+    # Thinking budgets configured, but no request has one.
+    assert runner._topk_candidates_this_step()
+
+    # A budgeted request outside the batch leaves the step on the candidates.
+    runner._thinking_budget.add(
+        "elsewhere", SamplingParams(thinking_token_budget=8), [1]
+    )
+    assert runner._topk_candidates_this_step()
+
+    # One in the batch needs the full logits: its chunk processors cannot
+    # rewrite packed candidates.
+    runner._thinking_budget.add("r1", SamplingParams(thinking_token_budget=8), [1])
+    assert not runner._topk_candidates_this_step()
+    runner._thinking_budget.discard(["r1"])
+    assert runner._topk_candidates_this_step()
+
+
 K = 3
 
 
