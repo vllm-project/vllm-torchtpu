@@ -110,7 +110,12 @@ def maybe_install_detok_prompt_tail() -> bool:
         return False
     tail_n = DETOK_PROMPT_TAIL_TOKENS
     pname = multiprocessing.current_process().name
-    if not (pname == "MainProcess" or pname.startswith("ApiServer")):
+    # An API server is the main process, or a child vLLM's DP supervisor names
+    # APIServer_DPRank_<n> (ApiServer_<n> in older vLLM).
+    if not (pname == "MainProcess" or pname.lower().startswith("apiserver")):
+        logger.warning(
+            "%s not installed in process %r, which is not an API server", _DT, pname
+        )
         return False
     try:
         import inspect
