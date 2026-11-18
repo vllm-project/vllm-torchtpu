@@ -19,6 +19,7 @@ MIB_BYTES: int = 1 << 20
 GIB_BYTES: int = 1 << 30
 SUBLANE_ROWS: int = 8
 VREG_LANE_COUNT: int = 128
+BITS_PER_WORD: int = 32
 
 AXIS_TP: str = "tp"
 TP_SIZE: int = 32
@@ -49,9 +50,13 @@ EXPERT_FAMILIES: tuple[str, ...] = (
     "expert_down",
     "expert_ds",
 )
+REV_PREFIX_LEN: int = 8
+ROPE_POS_SLACK: int = 96
+MAX_DP_GROUPS: int = 2
 
 __all__ = [
     "AXIS_TP",
+    "BITS_PER_WORD",
     "CHUNK",
     "CONV_HEAD_ROWS",
     "CONV_TAPS",
@@ -63,11 +68,14 @@ __all__ = [
     "HIDDEN_SIZE",
     "KDA_HEADS",
     "KERNEL_SHARD_FORMAT",
+    "MAX_DP_GROUPS",
     "MIB_BYTES",
     "MLP_PADDED",
     "NUM_LAYERS",
     "OVERFLOW_WINDOW_TOKENS",
     "PREFILL_WINDOWS",
+    "REV_PREFIX_LEN",
+    "ROPE_POS_SLACK",
     "ROUTED_EXPERTS",
     "ROUTED_EXPERTS_PER_TOKEN",
     "ROW_PACKED",

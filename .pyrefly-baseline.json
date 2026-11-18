@@ -72,23 +72,23 @@
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unbound-name",
       "concise_description": "`payload` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
@@ -272,11 +272,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `num_lanes`"
     },
@@ -286,29 +281,14 @@
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
     },
     {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/decode.py",
-      "name": "bad-argument-count",
-      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.models.kimi_k3.megakernel.pools.KdaImporter.import_state`"
+      "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
     },
     {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/decode.py",
-      "name": "bad-argument-count",
-      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.models.kimi_k3.megakernel.pools.KdaImporter.import_state`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `read_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `mla_pools`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `write_packed`"
+      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
+      "name": "bad-return",
+      "concise_description": "Returned type `tuple[tuple[int, ...], tuple[int, int, int]]` is not assignable to declared return type `tuple[tuple[int, int], tuple[int, int, int]]`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
@@ -349,11 +329,6 @@
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `object` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[tuple[int, ...], tuple[int, int, int]]` is not assignable to declared return type `tuple[tuple[int, int], tuple[int, int, int]]`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py",
