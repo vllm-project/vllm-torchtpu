@@ -207,20 +207,51 @@ def _handover_inputs(inputs: Sequence[_Input]) -> tuple[tuple[str, Any], ...]:
     """The submodule's arguments in call order, by name, dtype and shape.
 
     A handed-over runnable takes its arguments positionally, and two traces of
-    one model may lift the same buffers in a different order, so inputs with
-    the same names are matched by name rather than position.
+    one model may lift the same buffers in a different order, so the named
+    graph inputs among them are matched by name (see :func:`_input_permutation`).
     """
     return tuple((i.name, _meta_entry(i.value)) for i in inputs)
 
 
 def _input_permutation(
-    stored: Sequence[tuple[str, Any]], current: Sequence[tuple[str, Any]]
+    stored: Sequence[_Input], current: Sequence[_Input]
 ) -> list[int] | None:
-    """Where each stored argument sits in ``current``; None unless a reordering."""
-    position = {entry: i for i, entry in enumerate(current)}
-    if len(stored) != len(current) or any(entry not in position for entry in stored):
+    """Where each stored argument sits in the current call, or None when the
+    two traces' inputs differ beyond that.
+
+    Only named graph inputs -- placeholders Dynamo read from a source and named
+    after it (``l_self_..._weight_``) -- are matched by name: two traces of one
+    model may lift the same buffers in a different order. A split subgraph's
+    intermediates are named after the parent graph's node in creation order
+    (``getitem_7``), so in another trace the same name can stand for a
+    different value; they keep their positions. When the named inputs differ,
+    or the intermediates are not at the same positions, every input is matched
+    by position, dtype and shape, as on main.
+    """
+    if len(stored) != len(current):
         return None
-    return [position[entry] for entry in stored]
+    identity = list(range(len(stored)))
+    named = [
+        i for i, graph_input in enumerate(stored) if graph_input.source is not None
+    ]
+    if named == [
+        i for i, graph_input in enumerate(current) if graph_input.source is not None
+    ]:
+        stored_keys = _handover_inputs(stored)
+        current_keys = _handover_inputs(current)
+        position = {current_keys[i]: i for i in named}
+        perm = list(identity)
+        for i in named:
+            perm[i] = position.get(stored_keys[i], -1)
+        named_set = set(named)
+        unnamed_match = all(
+            stored_keys[i][1] == current_keys[i][1]
+            for i in identity
+            if i not in named_set
+        )
+        if unnamed_match and sorted(perm) == identity:
+            return perm
+    return identity if _signature(stored) == _signature(current) else None
 
 
 def _is_int_input(value: Any) -> bool:
@@ -405,21 +436,12 @@ class BucketExecutables:
             return None
         runnable, stored_inputs = found
         current_inputs = _inputs(graph)
-        stored = _handover_inputs(stored_inputs)
-        current = _handover_inputs(current_inputs)
-        if stored == current:
-            return runnable
-        if sorted(name for name, _ in stored) != sorted(name for name, _ in current):
-            # Renamed placeholders: match by position, dtype and shape.
-            if _signature(current_inputs) == _signature(stored_inputs):
-                return runnable
-            raise _handover_error(key, _input_delta(stored_inputs, current_inputs))
-        perm = _input_permutation(stored, current)
+        perm = _input_permutation(stored_inputs, current_inputs)
         if perm is None:
             raise _handover_error(key, _input_delta(stored_inputs, current_inputs))
-        # Named, so a log shows whether the moved inputs are Dynamo graph
-        # inputs (named after their source) or a split subgraph's intermediates.
-        moved = [name for i, (name, _) in enumerate(stored) if perm[i] != i]
+        if perm == list(range(len(perm))):
+            return runnable
+        moved = [stored_inputs[i].name for i, j in enumerate(perm) if j != i]
         logger.info(
             "[shape-variants] %s handed over with %d of %d inputs reordered: %s%s",
             key,
