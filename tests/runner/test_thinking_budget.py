@@ -201,6 +201,7 @@ def _set_exec_state(
         mamba_boundary_plans=None,
         pooler_output_list=[],
         top_tokens=top_tokens,
+        topk_candidates_packed=False,
         kv_save_nan_check=None,
         prompt_logprobs_chunks=[],
     )
