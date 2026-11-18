@@ -97,6 +97,7 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
+        model_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor | IntermediateTensors, torch.Tensor | None]:
         """Run the stage model and return ``(hidden_states, aux_hidden_states)``.
 
@@ -115,7 +116,7 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         and falls back to ``TPUModelRunner.forward_model``'s unwrapping for
         plain vLLM models that do not define ``make_omni_output``.
         """
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = dict(model_kwargs or {})
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(

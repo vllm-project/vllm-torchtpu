@@ -560,6 +560,7 @@ def test_capture_model_passes_encoder_step_budget_to_precompile(
     runner.enforce_eager = False
     runner.lora_config = None
     runner.vllm_config = runner.device = runner.model = None
+    runner.model_adapter = None
     runner.mm_budget = (
         SimpleNamespace(get_encoder_budget=lambda: mm_budget_tokens)
         if mm_budget_tokens is not None
