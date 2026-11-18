@@ -528,8 +528,8 @@ def _inline_int_placeholders(graph: fx.GraphModule, example_inputs: list[Any]) -
     inlined = False
     for node, value in zip(shape_variants.placeholder_nodes(graph), example_inputs):
         if type(value) is int and node.users:
-            # torch.fx types replace_with as a Node, but substitutes any
-            # argument value into the users' args; here it is the int.
+            # torch.fx annotates replace_with as a Node, but any argument
+            # value is substituted into the users' args; here it is the int.
             # pyrefly: ignore[bad-argument-type]
             node.replace_all_uses_with(value)
             inlined = True
