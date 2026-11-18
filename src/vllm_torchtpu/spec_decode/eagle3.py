@@ -1556,9 +1556,10 @@ class Eagle3Proposer:
                 bonus, padded with INVALID_TOKEN_ID). When given, each request's
                 seed token is gathered from it on-device instead of from the
                 host ``sampled_token_ids`` list (which the async path lacks).
-            device_seed: prefill / non-spec async bootstrap only —
-                ``[total_reqs]`` device tensor of the just-sampled tokens
-                (sliced ``[start:start+num_reqs]`` per chunk).
+            device_seed: prefill / non-spec bootstrap, with sync or async
+                scheduling — ``[total_reqs]`` device tensor of the
+                just-sampled tokens; the chunk's rows are gathered from it at
+                the loop bucket p, padded rows repeating the last request.
 
         Returns:
             input_ids: [padded_chunk_tokens] shifted + bonus-patched
