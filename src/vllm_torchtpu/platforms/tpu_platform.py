@@ -780,6 +780,9 @@ class TpuPlatform(Platform):
             scheduler_config = vllm_config.scheduler_config
             budget = scheduler_config.max_num_batched_tokens
             extra_bucket_sizes = list(envs.TPU_TOKEN_BUCKET_EXTRA)
+            extra_bucket_sizes += _dcp_decode_buckets(
+                vllm_config.parallel_config.decode_context_parallel_size
+            )
             if envs.TPU_TOKEN_BUCKET_LINEAR:
                 extra_bucket_sizes += _get_linear_token_paddings(
                     budget,
@@ -1268,6 +1271,20 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
         )
     scheduler_config.scheduler_cls = SCHEDULER_CLS
     patch_engine_core_for_pp_chunks(vllm_config)
+
+
+# Decode buckets below the 16-token ladder floor under decode context
+# parallelism. Its decode kernels have small-bucket paths only up to 8 tokens
+# (the merge exchange fused into the sparse MLA kernel, see
+# TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS; the indexer's small all-gather,
+# streamindex_topk.SMALL_AG_MAX_TOKENS), so without these buckets a single
+# request decodes 16 rows on the plain XLA collectives.
+DCP_DECODE_BUCKETS = (4, 8)
+
+
+def _dcp_decode_buckets(dcp_size: int) -> list[int]:
+    """The extra token buckets a DCP group of `dcp_size` ranks decodes in."""
+    return list(DCP_DECODE_BUCKETS) if dcp_size > 1 else []
 
 
 def _get_token_paddings(
