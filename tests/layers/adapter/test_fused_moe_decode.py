@@ -102,6 +102,47 @@ def test_token_cap_dispatch(monkeypatch, tokens, expert_parallel):
     assert start == (192 if expert_parallel else None)
 
 
+@pytest.mark.parametrize(
+    "tokens, fold, routed_min, want",
+    [
+        (256, "xla", 0, None),
+        (256, "xla", 320, None),
+        (320, "xla", 320, (8, 64)),
+        (250, "xla", 256, (8, 64)),  # padded to 256 rows
+        (512, "xla", 256, (8, 64)),
+        (320, "off", 320, None),  # the routed mode needs the folded call
+    ],
+)
+def test_routed_min_dispatch(monkeypatch, tokens, fold, routed_min, want):
+    """FUSED_MOE_DECODE_KERNEL_ROUTED_MIN_TOKENS picks the routed mode for kernel
+    calls of at least that many padded rows, with the folded call only."""
+    monkeypatch.delenv("FUSED_MOE_DECODE_KERNEL_ROUTED_MIN_TOKENS", raising=False)
+    assert envs.FUSED_MOE_DECODE_KERNEL_ROUTED_MIN_TOKENS == 0
+    seen = []
+
+    def kernel(rank, x, *args, routed=None, **kwargs):
+        seen.append(routed)
+        return x
+
+    monkeypatch.setattr(bridge, "_kernel_body", kernel)
+    monkeypatch.setattr(bridge, "plan_weight_ring", lambda *a, **k: (None, 3))
+    w = np.zeros((1, 1), np.float32)
+    bridge._layer(
+        np.array([[3, 192]], np.int32),
+        np.zeros((tokens, H), np.float32),
+        *([w] * 9),
+        np.zeros((tokens, 2), np.float32),
+        np.zeros((tokens, 2), np.int32),
+        n_ranks=8,
+        topk=2,
+        expert_parallel=True,
+        max_tokens=512,
+        fold=fold,
+        routed_min=routed_min,
+    )
+    assert seen == [want]
+
+
 def _garbage_rows(tokens, n):
     rng = np.random.default_rng(tokens)
     x = rng.normal(size=(tokens, H)).astype(np.float32)

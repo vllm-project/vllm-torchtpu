@@ -90,6 +90,8 @@ def _call(
     *,
     flag,
     gate_in_kernel=False,
+    routed=None,
+    ar2d_min=0,
     exact_width=False,
     fp8_shared=False,
     seed=0,
@@ -119,7 +121,9 @@ def _call(
             expert_start="rank",
             fold=True,
             gate_in_kernel=gate_in_kernel,
+            routed=routed,
             interpret=True,
+            ar2d_min_tokens=ar2d_min,
             exact_width=exact_width,
             valid_rows=flag,
         )[None]
@@ -152,6 +156,8 @@ CASES = {
     "FP8 shared expert, gate in kernel": dict(
         tokens=16, n=5, fp8_shared=True, gate_in_kernel=True
     ),
+    "routed mode": dict(tokens=64, n=40, routed=(8, 64)),
+    "AR2D exchange": dict(tokens=64, n=50, ar2d_min=64, exact_width=True),
 }
 
 

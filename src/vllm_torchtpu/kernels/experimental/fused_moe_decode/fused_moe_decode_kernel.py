@@ -110,7 +110,7 @@ def _kernel(
     a2a_recv,
     ag_send,
     ag_recv,
-    *,
+    *routed_refs,
     m,
     h,
     i,
@@ -121,6 +121,10 @@ def _kernel(
     rows=None,
     ib=None,
     folded=False,
+    routed=None,
+    ar2d=False,
+    ar2d_delay_ns=None,
+    ar2d_partial_ref=None,
     exact_width=False,
     valid_rows=False,
 ):
@@ -176,19 +180,45 @@ def _kernel(
       a2a_send DMA [n], a2a_recv DMA: all-to-all.
       ag_send DMA [n], ag_recv DMA: all-gather.
 
+    ar2d (static): the TP all-reduce runs _ar2d_exchange instead. acc_bf16 is
+    then [m, h], recv the s1 receive [m, h / 2], red AF [m, h / 2], a2a_send and
+    a2a_recv DMA [len(AR2D_STREAMS)] (send and receive semaphore per stream),
+    ag_send and ag_recv unused, and routed_refs starts with _ar2d_scratch's
+    eight buffers. ar2d_delay_ns, ar2d_partial_ref: test-only, see
+    _ar2d_exchange.
+
     valid_rows (static, folded only): rank_ref[0, 2] is the count n of real
     rows; rows from n on read as zero hidden states, whatever x_ref holds
     there. The caller zeroes their coefficients and gives them a finite gate.
 
-    exact_width (static, TP all-reduce output only): the all-to-all and the
-    all-gather split h's lane tiles over the ranks as evenly as whole tiles
-    allow, so out_ref is [m, h] and no rank sends padding.
+    routed (static): None runs every active expert over all m rows (dense).
+    (block, tile_rows) runs each active expert only over the aligned blocks
+    of `block` rows that hold at least one of its routed rows: the blocks
+    are copied into a tile of tile_rows rows, the two matmuls run on the
+    tile, and each block's rows are added back into acc at their positions.
+    Rows of a copied block that the expert does not own carry coefficient 0
+    and add 0, as every row does in the dense mode, so each row receives the
+    same terms in the same expert order and the output is the dense mode's
+    bit for bit. An expert with more blocks than a tile runs further tiles
+    on the same ring slot. routed_refs then holds:
+      xqf_ref [m, h] f32: the quantized hidden states as f32 (exact), the
+        gather source;
+      xqt_f32 [tile_rows, h] f32, xq_t [tile_rows, h] weight_dtype,
+        xs_t [h / _Q_BLOCK, tile_rows, 128] f32, c_t [tile_rows, 128] f32:
+        one tile's rows, quantized rows, row scales and coefficients;
+      gm_ref [ngroups padded to 8, 128] f32: per local expert (lane), its
+        block flags in groups of 16 bits, block b at bit b % 16 of group
+        b // 16 (a sum of distinct powers of two below 2**16, exact in f32);
+      list_ref SMEM [m / block] int32: the current expert's block ids;
+      grp_ref SMEM [ngroups] int32: the current expert's flag groups.
     """
     nblk = 1 if ib is None else i // ib
     me = rank_ref[0, 0] if folded else rank_ref[0]
     keep = None
     if valid_rows:
         keep = lax.broadcasted_iota(jnp.int32, (m, 1), 0) < rank_ref[0, 2]
+    if ar2d:
+        ar2d_refs, routed_refs = routed_refs[:8], routed_refs[8:]
     qmax = float(jnp.finfo(weight_dtype).max)
     # Column chunk each rank reduces: h padded to n_ranks lanes of 128, so every
     # chunk is lane aligned (Qwen3.8-Flash: h 2560 over 8 ranks pads to 3072).
@@ -224,16 +254,46 @@ def _kernel(
     acc_ref[...] = jnp.zeros((m, h), jnp.float32)
     # K blocks lead xs_ref so each block's scales are one contiguous [m, 128]
     # plane (as in moe_dense_expert.py); K between tokens and lanes relayouts.
+    if routed is not None:
+        block, tile_rows, lists, store_all, pipeline = routed
+        xqf_ref, xqt_f32, xq_t, xs_t, c_t, gm_ref, list_ref, grp_ref = routed_refs[:8]
+        if lists != "scan":
+            tab_v, tab_s, tab_sem = routed_refs[8:11]
+            tab_hbm = routed_refs[11] if lists == "hbm" else None
     for k in range(0, h, _Q_BLOCK):
         x = x_ref[:, k : k + _Q_BLOCK].astype(jnp.float32)
         if keep is not None:
             x = jnp.where(keep, x, 0.0)
         xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / qmax
-        xq_ref[:, k : k + _Q_BLOCK] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(
-            weight_dtype
-        )
+        xq = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(weight_dtype)
+        xq_ref[:, k : k + _Q_BLOCK] = xq
+        if routed is not None:
+            xqf_ref[:, k : k + _Q_BLOCK] = xq.astype(jnp.float32)
         xs_ref[k // _Q_BLOCK] = jnp.broadcast_to(xsc, (m, 128))
     cols = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+    if routed is not None:
+        nblk = m // block
+        ngroups = -(-nblk // 16)
+        count_row = tab_v.shape[0] - 8 if lists != "scan" else 0
+        if lists == "scan":
+            for g, flags in enumerate(routed_block_flags(coeff_ref[...], block)):
+                gm_ref[g : g + 1, :] = flags
+        else:
+            # Every expert's block list at once, then one copy into SMEM:
+            # tab[s, e] is the s-th block holding a routed row of local expert
+            # e (ascending), tab[count_row, e] how many there are.
+            routed_block_table(coeff_ref[...], block, tab_v, count_row)
+            if lists == "vmem":
+                copy = pltpu.make_async_copy(tab_v, tab_s, tab_sem)
+                copy.start()
+                copy.wait()
+            else:
+                copy = pltpu.make_async_copy(tab_v, tab_hbm, tab_sem)
+                copy.start()
+                copy.wait()
+                copy = pltpu.make_async_copy(tab_hbm, tab_s, tab_sem)
+                copy.start()
+                copy.wait()
 
     def compact(e, count):
         @pl.when(active_ref[e] != 0)
@@ -295,27 +355,31 @@ def _kernel(
         )
         return copies
 
-    def first_matmul(w1):
+    def first_matmul(w1, xq_src=None, xs_src=None):
         """xq @ w1 ([h, 2 width] ref) in f32, each _Q_BLOCK-row slab of w1
         against its column block of the hidden states, scaled by that block's
-        row scales before the sum."""
+        row scales before the sum. xq_src / xs_src: a routed tile's rows in
+        place of all m rows."""
+        xq_src = xq_ref if xq_src is None else xq_src
+        xs_src = xs_ref if xs_src is None else xs_src
         acc = None
         for k in range(0, h, _Q_BLOCK):
             part = jnp.matmul(
-                xq_ref[:, k : k + _Q_BLOCK],
+                xq_src[:, k : k + _Q_BLOCK],
                 w1[k : k + _Q_BLOCK, :],
                 preferred_element_type=jnp.float32,
             )
-            xs = xs_ref[k // _Q_BLOCK]
+            xs = xs_src[k // _Q_BLOCK]
             part = part * jnp.concatenate([xs] * (part.shape[1] // 128), axis=1)
             acc = part if acc is None else acc + part
         return acc
 
-    def accumulate(acc1, coeff, w1_scale, w2, w2_scale):
-        """Finish one expert from its first-matmul result acc1 [m, 2 width]
+    def accumulate(acc1, coeff, w1_scale, w2, w2_scale, store=None):
+        """Finish one expert from its first-matmul result acc1 [rows, 2 width]
         (x scales applied): dequantize, SiLU(gate) * up weighted by coeff
-        [m, 1], quantize per row per _Q_BLOCK columns, and add the second
-        matmul with w2 [width, h] into acc_ref."""
+        [rows, 1], quantize per row per _Q_BLOCK columns, and add the second
+        matmul with w2 [width, h] into acc_ref (all m rows), or hand each
+        _N_CHUNK-column block to store(n, value) (a routed tile)."""
         width = acc1.shape[1] // 2  # the routed or the shared intermediate size
         acc1 = acc1 * w1_scale
         mid = jnp.where(
@@ -344,7 +408,10 @@ def _kernel(
                 )
                 part = part * ms
                 acc2 = part if acc2 is None else acc2 + part
-            acc_ref[:, n : n + _N_CHUNK] += acc2 * w2_scale[:, n : n + _N_CHUNK]
+            if store is None:
+                acc_ref[:, n : n + _N_CHUNK] += acc2 * w2_scale[:, n : n + _N_CHUNK]
+            else:
+                store(n, acc2 * w2_scale[:, n : n + _N_CHUNK])
 
     def accumulate_unquantized_shared(coeff):
         """A shared expert left unquantized (BF16 in the checkpoint, as
@@ -363,15 +430,12 @@ def _kernel(
                 shared_w2_vmem[:, n : n + _N_CHUNK],
                 preferred_element_type=jnp.float32,
             )
-            if keep is None:
-                acc_ref[:, n : n + _N_CHUNK] += (
-                    down.astype(x_ref.dtype).astype(jnp.float32) * coeff
-                )
-            else:
+            term = down.astype(x_ref.dtype).astype(jnp.float32) * coeff
+            if keep is not None:
                 # A zero row's term is a signed zero, and acc holds +0 there
                 # (the shared expert adds first), so +0 is the same sum.
-                term = down.astype(x_ref.dtype).astype(jnp.float32) * coeff
-                acc_ref[:, n : n + _N_CHUNK] += jnp.where(keep, term, 0.0)
+                term = jnp.where(keep, term, 0.0)
+            acc_ref[:, n : n + _N_CHUNK] += term
 
     # Prime the weight ring: start the weight transfers of the first
     # min(units, nb) ring units (active experts, or their blocks) into slots
@@ -402,10 +466,152 @@ def _kernel(
     else:
         accumulate_unquantized_shared(shared_coeff)
 
+    def expert_blocks(step):
+        """(local expert id, its block count, block_at(k) -> its k-th block)."""
+        e = ids_ref[step]
+        if lists != "scan":
+            return e, tab_s[count_row, e], lambda k: tab_s[k, e]
+        lane = lax.broadcasted_iota(jnp.int32, (1, gm_ref.shape[1]), 1)
+        for g in range(ngroups):
+            grp_ref[g] = jnp.sum(jnp.where(lane == e, gm_ref[g : g + 1, :], 0.0)).astype(
+                jnp.int32
+            )
+
+        def collect(b, n_blocks):
+            hit = lax.shift_right_logical(grp_ref[b // 16], b % 16) & 1
+
+            @pl.when(hit != 0)
+            def record():
+                list_ref[n_blocks] = b
+
+            return n_blocks + hit
+
+        return e, lax.fori_loop(0, nblk, collect, jnp.int32(0)), lambda k: list_ref[k]
+
+    def tile_srcs(n_blocks, block_at, t):
+        """First rows of tile t's blocks. Slots past the expert's last block
+        repeat it; their coefficient is zeroed."""
+        tb = tile_rows // block
+        return [
+            pl.multiple_of(block_at(jnp.minimum(t * tb + j, n_blocks - 1)) * block, block)
+            for j in range(tb)
+        ]
+
+    def gather(srcs, buf):
+        """Copies the blocks' quantized rows, row scales and coefficients into
+        tile buffer buf and casts the rows back to weight_dtype (exact)."""
+        for j, src in enumerate(srcs):
+            rows_j = slice(j * block, (j + 1) * block)
+            xqt_f32[buf, rows_j, :] = xqf_ref[pl.ds(src, block), :]
+            xs_t[buf, :, rows_j, :] = xs_ref[:, pl.ds(src, block), :]
+            c_t[buf, rows_j, :] = coeff_ref[pl.ds(src, block), :]
+        xq_t[buf] = xqt_f32[buf].astype(weight_dtype)
+
+    def finish(acc1, slot, e, n_blocks, srcs, t, buf):
+        """Accumulates tile t of expert e from its first-matmul result."""
+        tb = tile_rows // block
+        tile_slot = lax.broadcasted_iota(jnp.int32, (tile_rows, 1), 0) // block
+        tile_cols = lax.broadcasted_iota(jnp.int32, (tile_rows, c_t.shape[-1]), 1)
+        coeff = jnp.sum(jnp.where(tile_cols == e, c_t[buf], 0.0), axis=1, keepdims=True)
+        coeff = jnp.where(t * tb + tile_slot < n_blocks, coeff, 0.0)
+
+        def store(n, value):
+            for j, dst in enumerate(srcs):
+                if store_all:
+                    # A slot past the last block repeats it with coefficient
+                    # 0: its rows are exact zeros, and adding them changes no
+                    # accumulator element.
+                    acc_ref[pl.ds(dst, block), n : n + _N_CHUNK] += value[
+                        j * block : (j + 1) * block, :
+                    ]
+                    continue
+
+                @pl.when(t * tb + j < n_blocks)
+                def add(j=j, dst=dst):
+                    acc_ref[pl.ds(dst, block), n : n + _N_CHUNK] += value[
+                        j * block : (j + 1) * block, :
+                    ]
+
+        accumulate(
+            acc1, coeff, w1_scale_ring[slot], w2_ring.at[slot], w2_scale_ring[slot], store=store
+        )
+
+    def tile_matmul(slot, buf):
+        return first_matmul(w1_ring.at[slot], xq_t.at[buf], xs_t.at[buf])
+
+    def expert_tiles(step, e, n_blocks, block_at, first, buf):
+        """Tiles first.. of expert `step`, serially, in tile buffer buf."""
+        slot = step % nb
+        tb = tile_rows // block
+
+        def tile(t, carry):
+            srcs = tile_srcs(n_blocks, block_at, t)
+            gather(srcs, buf)
+            finish(tile_matmul(slot, buf), slot, e, n_blocks, srcs, t, buf)
+            return carry
+
+        lax.fori_loop(first, (n_blocks + tb - 1) // tb, tile, 0)
+
     @pl.when(count > 0)
     def run_routed():
         for copy in transfers(jnp.int32(0)):
             copy.wait()
+
+        if routed is not None and not pipeline:
+
+            def routed_body(step, carry):
+                @pl.when(step > 0)
+                def wait_current():
+                    for copy in transfers(step):
+                        copy.wait()
+
+                e, n_blocks, block_at = expert_blocks(step)
+                expert_tiles(step, e, n_blocks, block_at, 0, 0)
+
+                @pl.when(step + nb < units)
+                def refill():
+                    for copy in transfers(step + nb):
+                        copy.start()
+
+                return carry
+
+            lax.fori_loop(0, units, routed_body, 0)
+            return
+
+        if routed is not None:
+            # As the dense loop: the next expert's first tile is gathered and
+            # its first matmul issued before this expert's accumulate, so the
+            # MXU and the vector unit overlap across experts. Tile buffers
+            # alternate between experts; this expert's further tiles reuse its
+            # own buffer after its first tile.
+            e0, n0, at0 = expert_blocks(jnp.int32(0))
+            gather(tile_srcs(n0, at0, 0), 0)
+
+            def piped_body(step, acc1):
+                slot, buf = step % nb, step % 2
+                nxt = step + 1
+
+                @pl.when(nxt < units)
+                def wait_next():
+                    for copy in transfers(nxt):
+                        copy.wait()
+
+                e_n, n_n, at_n = expert_blocks(jnp.minimum(nxt, units - 1))
+                gather(tile_srcs(n_n, at_n, 0), nxt % 2)
+                acc1_next = tile_matmul(nxt % nb, nxt % 2)
+                e, n_blocks, block_at = expert_blocks(step)
+                finish(acc1, slot, e, n_blocks, tile_srcs(n_blocks, block_at, 0), 0, buf)
+                expert_tiles(step, e, n_blocks, block_at, 1, buf)
+
+                @pl.when(step + nb < units)
+                def refill():
+                    for copy in transfers(step + nb):
+                        copy.start()
+
+                return acc1_next
+
+            lax.fori_loop(0, units, piped_body, tile_matmul(0, 0))
+            return
 
         def expert_body(step, acc1):
             nxt = step + 1
@@ -480,6 +686,26 @@ def _kernel(
                 acc_bf16.dtype
             )
         all_to_all_sum(lambda d: acc_bf16.at[d], out_ref)
+        return
+
+    if ar2d:
+        _ar2d_exchange(
+            me,
+            barrier,
+            n_ranks,
+            acc_ref,
+            acc_bf16,
+            recv,
+            red,
+            out_ref,
+            a2a_send,
+            a2a_recv,
+            ar2d_refs,
+            m,
+            h,
+            ar2d_delay_ns,
+            ar2d_partial_ref,
+        )
         return
 
     # TP attention, all-reduce: all-to-all + local sum over column chunks (rank
@@ -569,6 +795,203 @@ def _kernel(
         copy.wait_send()
 
 
+# The AR2D exchange (_ar2d_exchange): its streams, each with its own send and
+# receive semaphore, and the one shape it serves.
+AR2D_STREAMS = ("s1", "r1x", "r1y", "r2y", "r2x", "r3y", "r3x", "r4x", "r4y", "s3")
+_AR2D_RANKS = 8
+_AR2D_HIDDEN = 2560
+# Test-only skew: pl.delay sleeps at most about 0.5 ms a call on tpu7x
+# (j-dac0e9c1), so longer delays are slept in steps.
+_DELAY_STEP_NS = 50_000
+
+
+def ar2d_applies(m, h, n_ranks, min_tokens, scatter_rows=False, whole_experts=True):
+    """Whether an m-row call (m padded to 16) runs the AR2D exchange in place of
+    the all-to-all + all-gather: FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS set and
+    at most m, 8 ranks, hidden 2560, the TP all-reduce output, whole experts,
+    and m / 4 a multiple of 16 so every copied region is whole bf16 tiles."""
+    return (
+        0 < min_tokens <= m
+        and n_ranks == _AR2D_RANKS
+        and h == _AR2D_HIDDEN
+        and not scatter_rows
+        and whole_experts
+        and m % 64 == 0
+    )
+
+
+def _ar2d_scratch(m, h, wire):
+    """The AR2D exchange's buffers beyond acc_bf16 [m, h], the s1 receive
+    [m, h / 2] and AF [m, h / 2]: r1x, r1y, B0, B1 [m / 2, h / 4], r2y, r2x
+    [m / 4, h / 4], B0f, B1f [m / 2, h / 4]. Every receive region is its own
+    storage."""
+    part = h // 4
+    half_rows, quarter_rows = (m // 2, part), (m // 4, part)
+    shapes = [half_rows] * 4 + [quarter_rows] * 2 + [half_rows] * 2
+    return [pltpu.VMEM(s, wire) for s in shapes]
+
+
+def _ar2d_exchange(
+    me, barrier, n_ranks, acc_ref, a, s1_recv, af, out_ref, ssem, rsem, bufs, m, h,
+    delay_ns, partial_ref,
+):
+    """The TP all-reduce of acc_ref [m, h] f32 into out_ref[:, :h] over the
+    chip mate (me ^ 1) and the two neighbours (me ^ 2, me ^ 4), me the mesh
+    index. Core c = me & 1 owns column half c; part 0 of the half (h / 4
+    columns) reduces across me ^ 4 then me ^ 2, part 1 across me ^ 2 then
+    me ^ 4, each over row halves then quarters, and gathers back in reverse:
+
+      s1  bf16 of the mate's half to me ^ 1; A = own half (f32) + received,
+          f32, in place in acc_ref; bf16(A) into a's own half, the r1 source
+      r1  A0 rows half (1 - xb) to me ^ 4, A1 rows half (1 - yb) to me ^ 2;
+          B0 = A0 rows half xb (f32) + received, f32, in place in acc_ref,
+          bf16(B0) into B0 (the r2 source); B1 likewise
+      r2  B0 quarter (1 - yb) to me ^ 2, B1 quarter (1 - xb) to me ^ 4;
+          C0 = bf16(B0 quarter yb (f32) + received) into B0f, C1 into B1f
+      r3  C0 to me ^ 2's B0f, C1 to me ^ 4's B1f, at this rank's quarter
+      r4  B0f to me ^ 4's AF part 0, B1f to me ^ 2's AF part 1, at this rank's
+          half; own B0f, B1f into own AF
+      s3  AF to me ^ 1's output at this rank's half; own half stored locally
+
+    At every sum the rank's own operand is its f32 value and only the operand
+    that crossed a wire was rounded to bf16; the sum is rounded once, at C.
+    Each sum is made by one rank and copied to the others, so all ranks hold
+    the same bits (model: ar2d_reference.py). Each copy has its
+    own semaphores and every receive region its own storage, so a copy from a
+    rank that is ahead lands where nothing else writes and each wait is met by
+    the one copy it names. Test-only: delay_ns, a per-rank delay (ns) before
+    the exchange, after the entry signals, slept in steps of at most
+    _DELAY_STEP_NS; partial_ref [m, h] f32, where the rank's accumulator (the
+    exchange's input) is stored."""
+    r1x, r1y, b0, b1, r2y, r2x, b0f, b1f = bufs
+    f32, bf16 = jnp.float32, a.dtype
+    half, part = h // 2, h // 4
+    rh, rq = m // 2, m // 4
+    c, yb, xb = me % 2, (me // 2) % 2, me // 4
+    idx = {name: k for k, name in enumerate(AR2D_STREAMS)}
+
+    def copy(src, dst, name, peer):
+        return pltpu.make_async_remote_copy(
+            src,
+            dst,
+            ssem.at[idx[name]],
+            rsem.at[idx[name]],
+            device_id=(peer,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    def rows(bit, n):
+        return pl.ds(pl.multiple_of(bit * n, 16), n)
+
+    def add(x, y):
+        return (x.astype(f32) + y.astype(f32)).astype(bf16)
+
+    def per_half(fn):
+        # Vector slices need static columns: one branch per column owner.
+        for cc in (0, 1):
+            pl.when(c == cc)(functools.partial(fn, cc * half))
+
+    if delay_ns is not None:
+        steps, rest = jnp.int32(0), jnp.int32(0)
+        for d, t in enumerate(delay_ns):
+            steps = jnp.where(me == d, jnp.int32(t // _DELAY_STEP_NS), steps)
+            rest = jnp.where(me == d, jnp.int32(t % _DELAY_STEP_NS), rest)
+
+        def sleep(i, carry):
+            pl.delay(jnp.int32(_DELAY_STEP_NS))
+            return carry
+
+        lax.fori_loop(0, steps, sleep, 0)
+        pl.delay(rest)
+    # Every peer has entered this call, so its receive buffers are live.
+    pl.semaphore_wait(barrier, n_ranks)
+    a[...] = acc_ref[...].astype(bf16)
+    if partial_ref is not None:
+        partial_ref[...] = acc_ref[...]
+    own = pl.multiple_of(c * half, 128)
+    mate = pl.multiple_of((1 - c) * half, 128)
+
+    d_s1 = copy(a.at[:, pl.ds(mate, half)], s1_recv, "s1", me ^ 1)
+    d_s1.start()
+    d_s1.wait_recv()
+
+    def form_a(c0):
+        # acc_ref is free once its bf16 copy exists: no copy reads or targets it.
+        v = acc_ref[:, c0 : c0 + half] + s1_recv[...].astype(f32)
+        acc_ref[:, c0 : c0 + half] = v
+        a[:, c0 : c0 + half] = v.astype(bf16)
+
+    per_half(form_a)
+
+    d_r1 = [
+        copy(a.at[rows(1 - xb, rh), pl.ds(own, part)], r1x, "r1x", me ^ 4),
+        copy(a.at[rows(1 - yb, rh), pl.ds(own + part, part)], r1y, "r1y", me ^ 2),
+    ]
+    for d in d_r1:
+        d.start()
+    for d in d_r1:
+        d.wait_recv()
+
+    def form_b(c0):
+        v0 = acc_ref[rows(xb, rh), c0 : c0 + part] + r1x[...].astype(f32)
+        acc_ref[rows(xb, rh), c0 : c0 + part] = v0
+        b0[...] = v0.astype(bf16)
+        v1 = acc_ref[rows(yb, rh), c0 + part : c0 + half] + r1y[...].astype(f32)
+        acc_ref[rows(yb, rh), c0 + part : c0 + half] = v1
+        b1[...] = v1.astype(bf16)
+
+    per_half(form_b)
+
+    d_r2 = [
+        copy(b0.at[rows(1 - yb, rq)], r2y, "r2y", me ^ 2),
+        copy(b1.at[rows(1 - xb, rq)], r2x, "r2x", me ^ 4),
+    ]
+    for d in d_r2:
+        d.start()
+    for d in d_r2:
+        d.wait_recv()
+    def form_c(c0):
+        # The quarter kept is at rows xb * rh + yb * rq of acc_ref (part 0) and
+        # yb * rh + xb * rq (part 1).
+        q0 = pl.ds(pl.multiple_of(xb * rh + yb * rq, 16), rq)
+        q1 = pl.ds(pl.multiple_of(yb * rh + xb * rq, 16), rq)
+        b0f[rows(yb, rq), :] = add(acc_ref[q0, c0 : c0 + part], r2y[...])
+        b1f[rows(xb, rq), :] = add(acc_ref[q1, c0 + part : c0 + half], r2x[...])
+
+    per_half(form_c)
+
+    d_r3 = [
+        copy(b0f.at[rows(yb, rq)], b0f.at[rows(yb, rq)], "r3y", me ^ 2),
+        copy(b1f.at[rows(xb, rq)], b1f.at[rows(xb, rq)], "r3x", me ^ 4),
+    ]
+    for d in d_r3:
+        d.start()
+    for d in d_r3:
+        d.wait_recv()
+
+    d_r4 = [
+        copy(b0f, af.at[rows(xb, rh), pl.ds(0, part)], "r4x", me ^ 4),
+        copy(b1f, af.at[rows(yb, rh), pl.ds(part, part)], "r4y", me ^ 2),
+    ]
+    for d in d_r4:
+        d.start()
+    af[rows(xb, rh), :part] = b0f[...]
+    af[rows(yb, rh), part:] = b1f[...]
+    for d in d_r4:
+        d.wait_recv()
+
+    d_s3 = copy(af, out_ref.at[:, pl.ds(own, half)], "s3", me ^ 1)
+    d_s3.start()
+
+    def store_own(c0):
+        out_ref[:, c0 : c0 + half] = af[...]
+
+    per_half(store_own)
+    d_s3.wait_recv()
+    for d in (d_s1, *d_r1, *d_r2, *d_r3, *d_r4, d_s3):
+        d.wait_send()
+
+
 class _ActiveBits:
     """The folded call's stand-in for active_ref: expert e's flag, read from
     16-bit groups of flags that the prologue moved to scalars (a sum of
@@ -596,6 +1019,7 @@ def _folded_kernel(
     expert_parallel,
     routed_scale,
     gate,
+    ar2d_partials=False,
     valid_rows=False,
     **kwargs,
 ):
@@ -622,13 +1046,23 @@ def _folded_kernel(
     """
     refs_any: Any = refs
     gate_ref, refs_any = (refs_any[0], refs_any[1:]) if gate else (None, refs_any)
-    hbm, out_ref, scratch = refs_any[:8], refs_any[8], refs_any[9:]
+    # The routed mode's "hbm" block lists take a second, HBM output as the
+    # staging buffer of their copy into SMEM.
+    routed = kwargs.get("routed")
+    staged = routed is not None and routed[2] == "hbm"
+    hbm, out_ref = refs_any[:8], refs_any[8]
+    if ar2d_partials:
+        # Test-only second output: the rank's bf16 partial (see _ar2d_exchange).
+        kwargs["ar2d_partial_ref"], refs_any = refs_any[9], refs_any[:9] + refs_any[10:]
+    tab_hbm, scratch = (refs_any[9], refs_any[10:]) if staged else (None, refs_any[9:])
     pad = m - tokens
     xpad_ref: Any = None
     if pad:
         *scratch_list, coeff_ref, shared_gate_ref, xpad_ref = scratch
     else:
         *scratch_list, coeff_ref, shared_gate_ref = scratch
+    if staged:
+        scratch_list = [*scratch_list, tab_hbm]
     f32 = jnp.float32
     h = x_ref.shape[1]
     if pad:
@@ -718,6 +1152,53 @@ def _folded_kernel(
     )
 
 
+def routed_block_flags(coeff, block):
+    """Which aligned `block`-row blocks of coeff [m, lanes] hold a nonzero
+    coefficient, per lane (local expert), as groups of 16 flag bits: one
+    [1, lanes] f32 row per group g, block 16 g + j at bit j. A row whose
+    route weights are all 0 (a padded row) sets no flag, so a block of padded
+    rows only is never scheduled. Sums of distinct powers of two below 2**16
+    are exact in f32."""
+    m, lanes = coeff.shape
+    nblk = m // block
+    out = []
+    for g in range(-(-nblk // 16)):
+        n = min(16, nblk - 16 * g)
+        rows = coeff[16 * g * block : (16 * g + n) * block, :]
+        nz = jnp.where(rows != 0, 1.0, 0.0)
+        if block > 1:
+            nz = jnp.max(nz.reshape(n, block, lanes), axis=1)
+        bit = jnp.left_shift(
+            jnp.int32(1), lax.broadcasted_iota(jnp.int32, (n, 1), 0)
+        ).astype(jnp.float32)
+        out.append(jnp.sum(nz * bit, axis=0, keepdims=True))
+    return out
+
+
+def routed_block_table(coeff, block, tab_ref, count_row):
+    """Writes, per lane e (local expert) of coeff [m, lanes], the aligned
+    `block`-row blocks holding a nonzero coefficient: tab_ref[s, e] the s-th
+    such block in ascending order (s below the count), tab_ref[count_row, e]
+    their count. Rows with route weights 0 (padding) add no block."""
+    m, lanes = coeff.shape
+    nblk = m // block
+    nz = jnp.where(coeff != 0, 1.0, 0.0)
+    bm = jnp.max(nz.reshape(nblk, block, lanes), axis=1) if block > 1 else nz
+    hit = bm > 0
+    b_ids = lax.broadcasted_iota(jnp.int32, (nblk, lanes), 0)
+    counts = jnp.sum(hit.astype(jnp.int32), axis=0, keepdims=True)
+    tab_ref[count_row : count_row + 1, :] = counts
+    big = jnp.int32(nblk)
+
+    def slot(s, prev):
+        nxt = jnp.min(jnp.where(hit & (b_ids > prev), b_ids, big), axis=0, keepdims=True)
+        tab_ref[pl.ds(s, 1), :] = nxt
+        return nxt
+
+    # Up to the largest count only: no lane reads a slot at or past its count.
+    lax.fori_loop(0, jnp.max(counts), slot, jnp.full((1, lanes), -1, jnp.int32))
+
+
 def _padded_hidden(h, n_ranks):
     """Width of the TP all-reduce buffers: h rounded up to n_ranks lanes."""
     return -(-h // (n_ranks * 128)) * (n_ranks * 128)
@@ -748,13 +1229,31 @@ def _unit_bytes(h, width, wt):
     return 3 * h * width * wt + (2 * width + h) * 4
 
 
-def _token_side_bytes(m, h, i_s, experts, n_ranks, wt):
+def _token_side_bytes(m, h, i_s, experts, n_ranks, wt, ar2d=False):
     """Everything the call declares but the routed weight ring: the shared
     expert (counted at 2 bytes per weight, its widest dtype) and the
-    token-proportional buffers."""
+    token-proportional buffers. ar2d: the exchange's buffers are the AR2D
+    exchange's (see _ar2d_scratch) instead of the all-to-all's."""
     f32, bf16 = 4, 2
     shared = _unit_bytes(h, i_s, max(wt, bf16))
     hp = _padded_hidden(h, n_ranks)
+    if ar2d:
+        part = h // 4
+        exchange = (
+            h * bf16  # accumulator in bf16, A formed in place
+            + (h // 2) * bf16  # s1 receive
+            + (h // 2) * bf16  # AF, the s3 source
+            + 2 * part * bf16 // 2  # r1 receives
+            + 2 * part * bf16 // 2  # B0, B1
+            + 2 * part * bf16 // 4  # r2 receives
+            + 2 * part * bf16 // 2  # B0f, B1f
+        )
+    else:
+        exchange = (
+            hp * bf16  # accumulator in bf16, the all-reduce source
+            + hp * bf16  # all-to-all receive slots
+            + (hp // n_ranks) * bf16  # reduced chunk
+        )
     rows = m * (
         h * bf16  # hidden
         + (experts + (-experts) % 128) * f32  # coeff
@@ -763,9 +1262,7 @@ def _token_side_bytes(m, h, i_s, experts, n_ranks, wt):
         + h * wt  # quantized hidden
         + (h // _Q_BLOCK) * 128 * f32  # per-block row scales, over lanes
         + h * f32  # accumulator
-        + hp * bf16  # accumulator in bf16, the all-reduce source
-        + hp * bf16  # all-to-all receive slots
-        + (hp // n_ranks) * bf16  # reduced chunk
+        + exchange
     )
     return shared + rows
 
@@ -795,6 +1292,8 @@ def plan_weight_ring(m, h, i, i_s, experts, n_ranks, weight_dtype, i_block=None)
 
     def fit(w):
         live = 2 * m * 2 * w * 4  # this unit's and the next's first-matmul result
+        # The all-to-all's count even under AR2D, which only runs with whole
+        # experts: the plan never depends on the exchange.
         free = (
             capacity
             - _VMEM_RESERVE
@@ -807,15 +1306,46 @@ def plan_weight_ring(m, h, i, i_s, experts, n_ranks, weight_dtype, i_block=None)
     return ib, max(3, min(_NUM_BUFFERS, fit(ib)))
 
 
-def vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype):
+def _routed_bytes(m, h, tile_rows, wt, tile_buffers=1):
+    """The routed mode's extra scratch (see _kernel): the f32 gather source,
+    the tile buffers, and the block flags and lists."""
+    tile = tile_rows * h * (4 + wt) + (h // _Q_BLOCK) * tile_rows * 128 * 4 + tile_rows * 128 * 4
+    return m * h * 4 + tile_buffers * tile + 2 * (m // 8 + 16) * 128 * 4
+
+
+# Rows per block of the routed mode: the unit it copies into a tile and adds
+# back into the accumulator, one f32 sublane tile.
+ROUTED_BLOCK = 8
+
+
+def routed_tile_rows(m):
+    """Tile height of the routed mode for an m-row call. 64 rows (8 blocks)
+    measured fastest at every bucket from 208 to 512 rows on AgentX routing
+    (32 and 128 slower: more passes of the weights, or more rows computed)."""
+    return 64
+
+
+def vmem_bytes(
+    tokens, h, i, i_s, experts, n_ranks, weight_dtype, routed=None, ar2d_min_tokens=0
+):
     """VMEM the call declares for `tokens` rows: its VMEM operands, output and
     scratch (compiler temporaries excluded). The weight ring takes about half
-    of VMEM, so the token-proportional buffers bound the rows one call takes."""
+    of VMEM, so the token-proportional buffers bound the rows one call takes.
+    routed: the (block, tile_rows) the call runs with, None for dense.
+    ar2d_min_tokens: FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS (see ar2d_applies)."""
     m = tokens + (-tokens) % 16
     wt = jnp.dtype(weight_dtype).itemsize
     ib, nb = plan_weight_ring(m, h, i, i_s, experts, n_ranks, weight_dtype)
-    return nb * _unit_bytes(h, i if ib is None else ib, wt) + _token_side_bytes(
-        m, h, i_s, experts, n_ranks, wt
+    ar2d = ar2d_applies(m, h, n_ranks, ar2d_min_tokens, whole_experts=ib is None)
+    extra = (
+        0
+        if routed is None
+        else _routed_bytes(m, h, routed[1], wt, 2 if len(routed) > 4 and routed[4] else 1)
+    )
+    return (
+        nb * _unit_bytes(h, i if ib is None else ib, wt)
+        + _token_side_bytes(m, h, i_s, experts, n_ranks, wt, ar2d)
+        + extra
     )
 
 
@@ -842,6 +1372,10 @@ def fused_moe_decode(
     interpret=False,
     fold=False,
     gate_in_kernel=False,
+    routed=None,
+    ar2d_min_tokens=0,
+    ar2d_delay_ns=None,
+    ar2d_partials=False,
     exact_width=False,
     valid_rows=False,
 ):
@@ -903,6 +1437,21 @@ def fused_moe_decode(
       gate_in_kernel: with fold, also compute sigmoid(hidden . w_g) inside
         the kernel (its bitwise match to XLA's dot is checked by test, not
         guaranteed by construction).
+      routed: (block, tile_rows) to run each active expert only over the
+        aligned `block`-row blocks that hold its routed rows (see _kernel);
+        bitwise the dense output. Needs fold, whole experts and the TP
+        all-reduce output; block divides the padded row count and tile_rows,
+        and tile_rows is a multiple of 32. None: dense.
+      ar2d_min_tokens: FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS. Calls that
+        ar2d_applies accepts run the TP all-reduce as _ar2d_exchange instead of
+        the all-to-all + all-gather; the output differs from it in rounding
+        (ar2d_reference.py), is identical on every rank, and the plan is the
+        same. 0: never.
+      ar2d_delay_ns: test-only, 8 per-rank delays in ns before the AR2D
+        exchange (skew injection); needs an AR2D call.
+      ar2d_partials: test-only, needs fold and an AR2D call: also return this
+        rank's f32 accumulator [m, H] (all padded rows), the exchange's input,
+        as a second output.
       exact_width: TP all-reduce only: the exchange splits H's lane tiles over
         the ranks as evenly as whole tiles allow (no rank sends padding, the
         same columns in the all-to-all and the all-gather) and the output is
@@ -935,6 +1484,9 @@ def fused_moe_decode(
     active: Any = None
     coeff: Any = None
     shared_gate: Any = None
+    if routed is not None:
+        if not fold or rows is not None or i_block is not None:
+            raise ValueError("routed needs fold, the all-reduce output and whole experts")
     if valid_rows and not fold:
         raise ValueError("valid_rows needs fold")
     if fold:
@@ -976,12 +1528,32 @@ def fused_moe_decode(
     i_s = shared_w2.shape[0]
     weight_dtype = w1.dtype
     ib, nb = plan_weight_ring(m, h, i, i_s, experts, n_ranks, weight_dtype, i_block)
+    if routed is not None:
+        routed = tuple(routed) + ("table", True, False)[len(routed) - 2 :]
+        block, tile_rows, lists, store_all, pipeline = routed
+        if ib is not None or m % block or tile_rows % block or tile_rows % 32:
+            raise ValueError(f"routed {routed} does not fit m={m} or blocked mode {ib}")
+        if lists == "table":
+            lists = "vmem"
+            routed = (block, tile_rows, lists, store_all, pipeline)
+        if lists not in ("scan", "vmem", "hbm") or (pipeline and lists == "scan"):
+            raise ValueError(f"routed lists {lists!r} (pipeline {pipeline})")
     w = i if ib is None else ib  # ring slot width
     hp = _padded_hidden(h, n_ranks)
     chunk = hp // n_ranks
     out_cols = h
+    ar2d = ar2d_applies(m, h, n_ranks, ar2d_min_tokens, rows is not None, ib is None)
+    if ar2d_delay_ns is not None and (not ar2d or len(ar2d_delay_ns) != n_ranks):
+        raise ValueError(f"ar2d_delay_ns needs an AR2D call and {n_ranks} delays")
+    if ar2d_partials and not (ar2d and fold):
+        raise ValueError("ar2d_partials needs fold and an AR2D call")
+    n_sem = len(AR2D_STREAMS) if ar2d else n_ranks
     if rows is None:
         exact_width = exact_width and h // 128 >= n_ranks
+    if ar2d:
+        out_rows, wire, out_cols = m, hidden.dtype, h if exact_width else hp
+        acc_bf16_shape, recv_shape, red_shape = (m, h), (m, h // 2), (m, h // 2)
+    elif rows is None:
         out_rows, wire, out_cols = m, hidden.dtype, h if exact_width else hp
         acc_bf16_shape, recv_shape, red_shape = (
             (m, hp),
@@ -1013,11 +1585,34 @@ def fused_moe_decode(
         pltpu.SMEM((experts,), jnp.int32),
         pltpu.SemaphoreType.DMA((nb, 4 if ib is None else 6)),
         pltpu.SemaphoreType.DMA((4,)),
-        pltpu.SemaphoreType.DMA((n_ranks,)),
-        pltpu.SemaphoreType.DMA(()),
+        pltpu.SemaphoreType.DMA((n_sem,)),
+        pltpu.SemaphoreType.DMA((n_sem,) if ar2d else ()),
         pltpu.SemaphoreType.DMA((n_ranks,)),
         pltpu.SemaphoreType.DMA(()),
     ]
+    if ar2d:
+        scratch_shapes += _ar2d_scratch(m, h, wire)
+    if routed is not None:
+        ngroups = -(-(m // block) // 16)
+        nbt = 2 if pipeline else 1  # tile buffers
+        scratch_shapes += [
+            pltpu.VMEM((m, h), jnp.float32),
+            pltpu.VMEM((nbt, tile_rows, h), jnp.float32),
+            pltpu.VMEM((nbt, tile_rows, h), weight_dtype),
+            pltpu.VMEM((nbt, h // _Q_BLOCK, tile_rows, 128), jnp.float32),
+            pltpu.VMEM((nbt, tile_rows, experts + (-experts) % 128), jnp.float32),
+            pltpu.VMEM((-(-ngroups // 8) * 8, experts + (-experts) % 128), jnp.float32),
+            pltpu.SMEM((m // block,), jnp.int32),
+            pltpu.SMEM((ngroups,), jnp.int32),
+        ]
+        if lists != "scan":
+            tab_rows = -(-(m // block) // 8) * 8 + 8
+            lanes_e = experts + (-experts) % 128
+            scratch_shapes += [
+                pltpu.VMEM((tab_rows, lanes_e), jnp.int32),
+                pltpu.SMEM((tab_rows, lanes_e), jnp.int32),
+                pltpu.SemaphoreType.DMA(()),
+            ]
     weights = (
         w1,
         w2,
@@ -1039,6 +1634,13 @@ def fused_moe_decode(
         rows=rows,
         ib=ib,
     )
+    if routed is not None:
+        kernel_kwargs["routed"] = tuple(routed)
+    if ar2d:
+        kernel_kwargs["ar2d"] = True
+        kernel_kwargs["ar2d_delay_ns"] = (
+            None if ar2d_delay_ns is None else tuple(int(t) for t in ar2d_delay_ns)
+        )
     if exact_width and rows is None:
         kernel_kwargs["exact_width"] = True
     if fold:
@@ -1054,6 +1656,7 @@ def fused_moe_decode(
             expert_parallel=expert_parallel,
             routed_scale=routed_scale,
             gate=gate,
+            ar2d_partials=ar2d_partials,
             valid_rows=valid_rows,
             **kernel_kwargs,
         )
@@ -1070,14 +1673,33 @@ def fused_moe_decode(
             *vmem_operands,
             *weights,
         )
+    routed_tag = (
+        ""
+        if routed is None
+        else f"-rb_{routed[0]}-rt_{routed[1]}-rl_{routed[2]}"
+        + ("-sa" if routed[3] else "")
+        + ("-pp" if routed[4] else "")
+    )
+    out_shape = jax.ShapeDtypeStruct((out_rows, out_cols), wire)
+    out_specs = pl.BlockSpec(memory_space=pltpu.VMEM)
+    staged = routed is not None and routed[2] == "hbm"
+    outs, specs = [out_shape], [out_specs]
+    if ar2d_partials:
+        outs.append(jax.ShapeDtypeStruct((m, h), jnp.float32))
+        specs.append(pl.BlockSpec(memory_space=pltpu.VMEM))
+    if staged:
+        outs.append(jax.ShapeDtypeStruct((tab_rows, lanes_e), jnp.int32))
+        specs.append(pl.BlockSpec(memory_space=pltpu.HBM))
+    if len(outs) > 1:
+        out_shape, out_specs = tuple(outs), tuple(specs)
     out = pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((out_rows, out_cols), wire),
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=num_scalar_prefetch,
             in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * len(vmem_operands)
             + [pl.BlockSpec(memory_space=pltpu.HBM)] * 8,
-            out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+            out_specs=out_specs,
             scratch_shapes=scratch_shapes,
         ),
         compiler_params=pltpu.CompilerParams(
@@ -1088,9 +1710,16 @@ def fused_moe_decode(
         f"-e_{experts}-m_{m}-h_{h}"
         f"-i_{i}-is_{i_s}{'' if shared_w1.dtype == weight_dtype else '_bf16'}"
         f"-n_{n_ranks}-buffers_{nb}{f'-ib_{ib}' if ib else ''}"
-        f"{'-vr' if valid_rows else ''}",
+        f"{routed_tag}{'-ar2d' if ar2d else ''}{'-vr' if valid_rows else ''}",
         interpret=pltpu.InterpretParams() if interpret else False,
     )(*operands)
+    partials = None
+    if ar2d_partials:
+        partials = out[1]
+    if staged or ar2d_partials:
+        out = out[0]
+    if partials is not None:
+        return (out[:, :h][:tokens], partials)
     if rows is not None:
         return out[:rows].astype(hidden.dtype)
     if hp != h and not exact_width:

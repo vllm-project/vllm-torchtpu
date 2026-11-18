@@ -71,6 +71,11 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     plan_weight_ring,
     vmem_bytes,
 )
+from vllm_torchtpu.kernels.experimental.fused_moe_decode.fused_moe_decode_kernel import (
+    ROUTED_BLOCK,
+    ar2d_applies,
+    routed_tile_rows,
+)
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -216,13 +221,15 @@ def _layer(
     shared_gated=True,
     routed_scale=1.0,
     fold="off",
+    routed_min=0,
+    ar2d_min=0,
     exact_width=False,
     padding_mask=False,
 ):
     """Per-rank body of the op: the kernel up to `max_tokens`, GMM MoE above.
     An ungated layer still passes its placeholder shared_gate_weight operand
-    (fixed op arity); shared_gated=False ignores it. exact_width: the TP
-    all-reduce output at [tokens, H] (FUSED_MOE_DECODE_EXACT_WIDTH).
+    (fixed op arity); shared_gated=False ignores it. With fold, kernel calls of
+    at least routed_min padded rows (0: none) run the kernel's routed mode.
     padding_mask (needs fold): rank is [1, 3], rank[0, 2] the real-row count;
     rows from it on are computed as zero hidden states with zero route weights."""
     start = rank[0, 1] if expert_parallel else None
@@ -261,11 +268,20 @@ def _layer(
         n_ranks,
         w1.dtype,
     )
+    m = x.shape[0] + (-x.shape[0]) % 16
+    routed = (
+        (ROUTED_BLOCK, routed_tile_rows(m))
+        if fold != "off" and ib is None and 0 < routed_min <= m
+        else None
+    )
+    ar2d = ar2d_applies(m, x.shape[1], n_ranks, ar2d_min, whole_experts=ib is None)
     logger.info(
-        "Fused MoE decode kernel traced for %d tokens (%s, ring %d)",
+        "Fused MoE decode kernel traced for %d tokens (%s, ring %d, %s, %s)",
         x.shape[0],
         "whole experts" if ib is None else f"blocked ib={ib}",
         nb,
+        "dense" if routed is None else f"routed block {routed[0]} tile {routed[1]}",
+        "AR2D exchange" if ar2d else "all-to-all exchange",
     )
     if fold != "off":
         # Operands as stored: per-call reshapes are XLA ops of their own.
@@ -288,6 +304,8 @@ def _layer(
             routed_scale=routed_scale,
             fold=True,
             gate_in_kernel=fold == "kernel",
+            routed=routed,
+            ar2d_min_tokens=ar2d_min,
             exact_width=exact_width,
             valid_rows=padding_mask,
         )
@@ -309,6 +327,7 @@ def _layer(
         n_ranks=n_ranks,
         expert_start=start,
         routed_scale=routed_scale,
+        ar2d_min_tokens=ar2d_min,
         exact_width=exact_width,
     )
 
@@ -324,6 +343,8 @@ def _build_op(
     padding_mask: bool = False,
 ):
     fold = envs.FUSED_MOE_DECODE_KERNEL_FOLD
+    routed_min = envs.FUSED_MOE_DECODE_KERNEL_ROUTED_MIN_TOKENS
+    ar2d_min = envs.FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS
     exact_width = envs.FUSED_MOE_DECODE_EXACT_WIDTH
     key = (
         id(mesh),
@@ -334,6 +355,8 @@ def _build_op(
         shared_gated,
         routed_scale,
         fold,
+        routed_min,
+        ar2d_min,
         exact_width,
         padding_mask,
     )
@@ -350,6 +373,8 @@ def _build_op(
         shared_gated=shared_gated,
         routed_scale=routed_scale,
         fold=fold,
+        routed_min=routed_min,
+        ar2d_min=ar2d_min,
         exact_width=exact_width,
         padding_mask=padding_mask,
     )
@@ -659,7 +684,24 @@ def _check_vmem(max_tokens: int, layer, i_s: int, n_ranks: int) -> None:
     as a Mosaic VMEM error when the first bucket above it compiles."""
     e, h, two_i = layer.w13_weight.shape
     weight_dtype = jnp.dtype(str(layer.w13_weight.dtype).removeprefix("torch."))
-    need = vmem_bytes(max_tokens, h, two_i // 2, i_s, e, n_ranks, weight_dtype)
+    m = max_tokens + (-max_tokens) % 16
+    routed_min = envs.FUSED_MOE_DECODE_KERNEL_ROUTED_MIN_TOKENS
+    routed = (
+        (ROUTED_BLOCK, routed_tile_rows(m))
+        if envs.FUSED_MOE_DECODE_KERNEL_FOLD != "off" and 0 < routed_min <= m
+        else None
+    )
+    need = vmem_bytes(
+        max_tokens,
+        h,
+        two_i // 2,
+        i_s,
+        e,
+        n_ranks,
+        weight_dtype,
+        routed=routed,
+        ar2d_min_tokens=envs.FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS,
+    )
     have = pltpu.get_tpu_info().vmem_capacity_bytes
     if need > have:
         raise ValueError(
