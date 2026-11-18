@@ -22,9 +22,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
-def _get_tpu_info() -> pltpu.TpuInfo:
+def get_tpu_info() -> pltpu.TpuInfo:
     """The local chip's TPU info; TPU7x's when JAX runs without a TPU backend
     (CPU tests and tracing), so the configs can still be computed. A TPU that
     JAX does not recognize raises rather than take TPU7x's SMEM and VMEM."""
@@ -33,6 +36,11 @@ def _get_tpu_info() -> pltpu.TpuInfo:
     except ValueError:
         if jax.default_backend() == "tpu":
             raise
+        logger.warning_once(
+            "Batched RPA: no TPU backend (JAX backend %s); sizing tiles and "
+            "schedules for TPU7x.",
+            jax.default_backend(),
+        )
         return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
 
 
@@ -428,7 +436,7 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
-        tpu_info = _get_tpu_info()
+        tpu_info = get_tpu_info()
         smem_limit_bytes = (
             tpu_info.smem_capacity_bytes - 32 * 1024
         ) * self.serve.smem_fraction_limit_for_schedule_generation
@@ -471,7 +479,7 @@ class RpaConfigs:
     def page_window_slot_len(self) -> int:
         """SMEM entries per window slot: lane-aligned, plus a lane group of slack
         when the window itself is not."""
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = get_tpu_info().num_lanes
         entries = self.page_window_entries
         return utils.align_to(entries, num_lanes) + (
             num_lanes if entries % num_lanes else 0
@@ -505,13 +513,13 @@ class RpaConfigs:
 
     @property
     def aligned_q_head_dim(self) -> int:
-        num_lanes = _get_tpu_info().num_lanes
+        num_lanes = get_tpu_info().num_lanes
         return utils.align_to(self.model.head_dim, num_lanes)
 
     # Actual head dimension used for compute, does not include scale factors.
     @property
     def compute_kv_head_dim(self) -> int:
-        tpu_info = _get_tpu_info()
+        tpu_info = get_tpu_info()
         num_lanes = tpu_info.num_lanes
         num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
@@ -523,7 +531,7 @@ class RpaConfigs:
     # per_token_scale is enabled.
     @property
     def aligned_kv_head_dim(self) -> int:
-        tpu_info = _get_tpu_info()
+        tpu_info = get_tpu_info()
         num_lanes = tpu_info.num_lanes
         num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
@@ -621,7 +629,7 @@ class RpaConfigs:
         the sublane dim, where single tokens are addressable.
         """
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            return _get_tpu_info().num_lanes
+            return get_tpu_info().num_lanes
         return 1
 
     @property
@@ -666,7 +674,7 @@ class RpaConfigs:
 
     @property
     def lm_scratch_shape(self):
-        num_lanes = _get_tpu_info().num_lanes
+        num_lanes = get_tpu_info().num_lanes
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
@@ -675,7 +683,7 @@ class RpaConfigs:
 
     @property
     def lse_vmem_shape(self):
-        num_lanes = _get_tpu_info().num_lanes
+        num_lanes = get_tpu_info().num_lanes
         q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
             self.block.batch_size,
