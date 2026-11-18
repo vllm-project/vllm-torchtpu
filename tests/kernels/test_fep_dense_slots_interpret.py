@@ -96,7 +96,7 @@ def _reference(x, logits, w1, w2, s1, s2, real, valid):
     quantized row, bf16 result rows, summed over k in order (a zero weight's term
     dropped)."""
     out = np.zeros(x.shape, np.float32)
-    q, qs = quantize_rows(x, jnp.float32, block=0, dtype=jnp.bfloat16)
+    q, qs = quantize_rows(x, jnp.float32, dtype=jnp.bfloat16)
     for d in range(D):
         rows = slice(d * real, (d + 1) * real)
         w, idx = v3_layer._select(
@@ -122,9 +122,7 @@ def _reference(x, logits, w1, w2, s1, s2, real, valid):
                     activation="silu",
                     w1_bias=None,
                     no_gate=False,
-                    block=0,
                     elementwise=jnp.bfloat16,
-                    token_block=0,
                 )
                 r, _ = ffn.result_rows(
                     a2,

@@ -324,7 +324,7 @@ def build_kernel(
         # shard's block of the peer's resident rows.
         keep = lax.broadcasted_iota(jnp.int32, (R, 1), 0) < nv_ref[0]
         x_in = jnp.where(keep, x_ref[...], jnp.zeros_like(x_ref[...]))
-        xq, xs = quantize_rows(x_in, jnp.float32, block=0, dtype=elementwise)
+        xq, xs = quantize_rows(x_in, jnp.float32, dtype=elementwise)
         block = pl.ds(pl.multiple_of(me * Tp, ROW_ALIGN), Tp)
         # Straight into every peer's resident copy (VMEM): no landing buffer,
         # no reload.
@@ -477,10 +477,8 @@ def build_kernel(
                 activation="silu",
                 w1_bias=None,
                 no_gate=False,
-                block=0,
                 elementwise=elementwise,
                 columns_per_pass=columns_per_pass,
-                token_block=0,
             )
             result, _ = ffn.result_rows(
                 acc2,
