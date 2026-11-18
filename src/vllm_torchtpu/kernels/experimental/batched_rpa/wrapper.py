@@ -380,13 +380,16 @@ def calculate_block_sizes(
 
         # To maximize MXU, we want bkv_sz to be at least MXU size.
         bkv_default = mxu_column_size
-        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # SEQ-ALONG-LANE does not support intra-page DMA offset.
-            # TODO(kyuyeunk): Reduce granularity to lane size.
-            bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
+        # The cached-KV schedule fetches block k from pages k * bkv_p with no
+        # intra-page offset, so bkv_sz must be a page multiple in every layout.
+        # TODO(kyuyeunk): Reduce granularity to lane size for SEQ_ALONG_LANE.
+        bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
+        # Page alignment can raise bkv_sz above the MXU width. bq has no page
+        # constraint, so scale it down to keep the QK tile at MXU x MXU.
+        bq_default = max(1, mxu_column_size * mxu_column_size // bkv_default)
         bkv_sz = bkv_stride = bkv_default
         if fixed_bq_sz is None:
-            bq_sz = bq_stride = bkv_sz
+            bq_sz = bq_stride = bq_default
         else:
             bq_sz = fixed_bq_sz
             bq_stride = 0
