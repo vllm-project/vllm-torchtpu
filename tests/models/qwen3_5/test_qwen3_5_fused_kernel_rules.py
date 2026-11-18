@@ -15,8 +15,8 @@
 measured on (Qwen3.5-397B-A17B on TPU7x) installs the fused q/k norm + rope
 and routes every model vLLM's loader finishes through the fused GDN gated norm
 + FP8 quantization bridge at the measured value heads per device; any other
-model, Qwen3.5 checkpoint or device is left as it was. Also every IX leg of
-the validation entries keeps both fused kernels."""
+model, Qwen3.5 checkpoint or device is left as it was. Also every leg of the
+validation entries keeps both fused kernels."""
 
 import inspect
 import pathlib
@@ -156,8 +156,8 @@ def test_validation_points_are_present():
 
 
 @pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
-def test_every_ix_leg_keeps_both_fused_kernels(monkeypatch, path):
-    """Each IX point's prefill and decode legs (397B on TPU7x, TP1, TP2 or
+def test_every_entry_leg_keeps_both_fused_kernels(monkeypatch, path):
+    """Each point entry's prefill and decode legs (397B on TPU7x, TP1, TP2 or
     TP8) are the measured model at measured head counts, so both kernels
     still run there; the gate entries reuse these legs."""
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
