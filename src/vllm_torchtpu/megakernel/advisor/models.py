@@ -921,21 +921,35 @@ def _preset_int(raw: Mapping[str, object], key: str, default: int) -> int:
             raise errors.MegakernelConfigError(msg)
 
 
-def _parse_parallel_layout(raw: Mapping[str, object]) -> ParallelLayout:
+def parse_parallel_layout(raw: Mapping[str, object]) -> ParallelLayout:
     """Parse a ParallelLayout mapping from deployments.json."""
     groups = _int_tuple(raw.get("layer_groups"), "layer_groups")
     mk_map = _as_mapping(raw.get("megakernel"))
     mk_decl: Mapping[str, object] | None = None
+    ep_size = _preset_int(raw, "ep", 1)
     if mk_map is not None:
         if not str(mk_map.get("source", "")).strip():
             msg = (
                 "megakernel declaration in deployments.json requires non-empty 'source'"
             )
             raise errors.MegakernelConfigError(msg)
+        if "expert_owner_groups" in mk_map:
+            raw_groups = mk_map["expert_owner_groups"]
+            if (
+                isinstance(raw_groups, bool)
+                or not isinstance(raw_groups, int)
+                or not (1 <= raw_groups <= ep_size)
+                or ep_size % raw_groups != 0
+            ):
+                msg = (
+                    "megakernel 'expert_owner_groups' must be an int in "
+                    f"[1, ep={ep_size}] that divides ep={ep_size}, got {raw_groups!r}"
+                )
+                raise errors.MegakernelConfigError(msg)
         mk_decl = dict(mk_map)
     return ParallelLayout(
         tp=_preset_int(raw, "tp", 1),
-        ep=_preset_int(raw, "ep", 1),
+        ep=ep_size,
         dp=_preset_int(raw, "dp", 1),
         pp=_preset_int(raw, "pp", 1),
         dcp=_preset_int(raw, "dcp", 1),
@@ -955,7 +969,7 @@ def _declared_strings(raw: object) -> tuple[str, ...]:
 
 
 def validate_declared_layouts(slug: str, preset: DeploymentPreset) -> None:
-    """Reject duplicate megakernel declarations sharing layout, scope, and phase."""
+    """Validate non-duplicate megakernel declarations and expert-group divisibility."""
     seen_keys: set[tuple[tuple[int, int, int, int, int], str, str]] = set()
     all_layouts = (
         preset.decode,
@@ -969,6 +983,18 @@ def validate_declared_layouts(slug: str, preset: DeploymentPreset) -> None:
         declaration = layout.megakernel
         if not str(declaration.get("source", "")).strip():
             continue
+        owner_groups = declaration.get("expert_owner_groups")
+        if isinstance(owner_groups, int) and not isinstance(owner_groups, bool):
+            model_profile = MODEL_PRESETS[slug]
+            if (
+                model_profile.num_experts > 0
+                and model_profile.num_experts % owner_groups != 0
+            ):
+                msg = (
+                    f"megakernel 'expert_owner_groups' ({owner_groups}) in {slug!r} "
+                    f"must divide num_experts ({model_profile.num_experts})"
+                )
+                raise errors.MegakernelConfigError(msg)
         axis_key = (layout.tp, layout.ep, layout.dp, layout.pp, layout.dcp)
         scopes = _declared_strings(declaration.get("scopes"))
         phases = _declared_strings(declaration.get("phases")) or DEFAULT_DECLARED_PHASES
@@ -1006,7 +1032,7 @@ def _parse_megakernel_layouts(slug: str, raw: object) -> tuple[ParallelLayout, .
                 f"deployments.json {slug!r} megakernel_layouts[{idx}] must be a mapping"
             )
             raise errors.MegakernelConfigError(msg)
-        layout = _parse_parallel_layout(item_map)
+        layout = parse_parallel_layout(item_map)
         if layout.megakernel is None:
             msg = (
                 f"deployments.json {slug!r} megakernel_layouts[{idx}] "
@@ -1028,12 +1054,12 @@ def _load_deployment_presets() -> tuple[
     for slug, entry in raw_deps.items():
         sources[slug] = str(entry.get("source", f"deployments.json:{slug}"))
         sat_map = _as_mapping(entry.get("saturation"))
-        sat = _parse_parallel_layout(sat_map) if sat_map is not None else None
+        sat = parse_parallel_layout(sat_map) if sat_map is not None else None
         windows = _int_tuple(entry.get("prefill_windows"), "prefill_windows")
         mk_layouts = _parse_megakernel_layouts(slug, entry.get("megakernel_layouts"))
         preset = DeploymentPreset(
-            decode=_parse_parallel_layout(entry["decode"]),
-            prefill=_parse_parallel_layout(entry["prefill"]),
+            decode=parse_parallel_layout(entry["decode"]),
+            prefill=parse_parallel_layout(entry["prefill"]),
             saturation=sat,
             prefill_windows=windows,
             megakernel_layouts=mk_layouts,
