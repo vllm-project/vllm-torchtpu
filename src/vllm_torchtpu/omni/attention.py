@@ -77,6 +77,8 @@ def _flash_attention_op():
 class TpuFlashAttentionImpl(TpuSDPAImpl):
     """Pallas flash attention for diffusion transformers on TPU."""
 
+    sdpa_fallback_count: int = 0
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         # Build the op outside any compiled region.
@@ -100,6 +102,7 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
             reason = f"query.dtype={query.dtype} (requires torch.bfloat16)"
         else:
             return False
+        TpuFlashAttentionImpl.sdpa_fallback_count += 1
         logger.warning_once(
             "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
             reason,
@@ -119,6 +122,26 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
                 f"num_heads ({query.shape[2]}) must be a multiple of "
                 f"num_kv_heads ({key.shape[2]})"
             )
+        if (
+            attn_metadata is not None
+            and attn_metadata.attn_mask is None
+            and not self.causal
+            and attn_metadata.extra
+        ):
+            valid_kv_length = attn_metadata.extra.get("valid_kv_length")
+            if valid_kv_length is not None:
+                if isinstance(valid_kv_length, bool) or not isinstance(
+                    valid_kv_length, int
+                ):
+                    raise ValueError("valid_kv_length must be a Python integer")
+                if not 0 < valid_kv_length <= key.shape[1]:
+                    raise ValueError(
+                        "valid_kv_length must be within the K/V sequence, "
+                        f"got {valid_kv_length} for length {key.shape[1]}"
+                    )
+                if valid_kv_length < key.shape[1]:
+                    key = key[:, :valid_kv_length]
+                    value = value[:, :valid_kv_length]
         if self._needs_sdpa_fallback(query, key, attn_metadata):
             return super().forward(query, key, value, attn_metadata)
         return self._op(query, key, value, self.softmax_scale)
@@ -126,6 +149,8 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
 
 class TpuFlashAttentionBackend(SDPABackend):
     """TPU diffusion attention backend using a Pallas flash kernel."""
+
+    supports_prefix_kv_slicing: bool = True
 
     @staticmethod
     def get_name() -> str:

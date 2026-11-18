@@ -22,6 +22,9 @@ apply_omni_model_specific_patches() at attention backend selection
 patch_registry.py.
 """
 
+import sys
+import types
+from contextlib import suppress
 from functools import cache as run_once
 from typing import Any
 
@@ -67,7 +70,281 @@ def apply_omni_tpu_patches() -> None:
     import os
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
+    os.environ.setdefault("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
+    _patch_tpu_broadcast()
+    _patch_tpu_empty_collectives()
+
+
+_TPU_BROADCAST_PATCHED = "_tpu_allreduce_bcast_patched"
+
+
+def _patch_tpu_broadcast() -> None:
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # Under torch_tpu's default DEFER_AND_FUSE mode, ProcessGroupTpu::broadcast
+    # (process_group_tpu.cc) fails across multi-rank diffusion workers for two
+    # reasons:
+    # 1. Rank-asymmetric deferred graph fusion: broadcast zeroes non-root buffers
+    #    via tensor.copy_(at::zeros_like(tensor)) before emitting an in-place
+    #    allreduce. When rank 0 queues rank-0-only preprocessing ops before
+    #    dist.broadcast_object_list / dist.broadcast, or when non-root ranks
+    #    fuse zero-copy + allreduce while root fuses only allreduce, ranks cut
+    #    mismatched StableHLO collectives and hang in PjRt rendezvous.
+    # 2. Tier-2 compilation cache key collision on root rank: the Tier-2 cache
+    #    key hashes StableHLO IR without rootRank, so a sub-group or non-0 root
+    #    broadcast can hit a cached executable compiled for a different root
+    #    role and silently corrupt outputs to zeros.
+    #
+    # Fix: For eager TPU tensors on the "tpu_dist" backend, synchronize pending
+    #   deferred ops on all ranks, explicitly zero_() non-root buffers and
+    #   synchronize before issuing a symmetric c10d.all_reduce(SUM), and
+    #   synchronize before returning (when not async_op). Bool and
+    #   non-contiguous tensors run through a contiguous scratch buffer (int32
+    #   for bool) and copy back.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once ProcessGroupTpu::broadcast flushes/isolates rank-asymmetric
+    # deferred ops and includes the root-rank role in its compilation cache key.
+    # -------------------------------------------------------------------------
+    import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
+
+    orig_broadcast = c10d.broadcast
+    if getattr(orig_broadcast, _TPU_BROADCAST_PATCHED, False):
+        return
+
+    def _tpu_safe_broadcast(
+        tensor: torch.Tensor,
+        src: int | None = None,
+        group: Any = None,
+        async_op: bool = False,
+        group_src: int | None = None,
+    ) -> Any:
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device.type != "tpu"
+            or torch.compiler.is_compiling()
+        ):
+            return orig_broadcast(
+                tensor, src=src, group=group, async_op=async_op, group_src=group_src
+            )
+
+        if group_src is None:
+            if src is None:
+                raise ValueError("Either src or group_src must be specified")
+        elif src is not None:
+            raise ValueError("Cannot specify both src and group_src")
+
+        if c10d._rank_not_in_group(group):
+            return None
+
+        try:
+            backend = c10d.get_backend(group)
+        except Exception:
+            backend = None
+        if backend != "tpu_dist":
+            return orig_broadcast(
+                tensor, src=src, group=group, async_op=async_op, group_src=group_src
+            )
+
+        if group_src is None:
+            assert src is not None
+            if group is None or group is c10d.GroupMember.WORLD:
+                resolved_src = src
+            else:
+                resolved_src = int(c10d.get_group_rank(group, src))
+        else:
+            resolved_src = group_src
+
+        group_world_size = c10d.get_world_size(group)
+        if not 0 <= resolved_src < group_world_size:
+            raise ValueError(
+                f"Invalid broadcast source rank {resolved_src} for group of size "
+                f"{group_world_size}"
+            )
+
+        # Flush any rank-asymmetric deferred ops before touching collective inputs.
+        torch.accelerator.synchronize()
+
+        if group_world_size <= 1 or tensor.numel() == 0:
+            return None
+
+        my_group_rank = c10d.get_rank(group)
+        needs_copy_back = tensor.dtype == torch.bool or not tensor.is_contiguous()
+        if needs_copy_back:
+            work_tensor = (
+                tensor.to(dtype=torch.int32)
+                if tensor.dtype == torch.bool
+                else tensor.contiguous()
+            )
+            if my_group_rank != resolved_src:
+                work_tensor.zero_()
+            torch.accelerator.synchronize()
+        else:
+            work_tensor = tensor
+            if my_group_rank != resolved_src:
+                work_tensor.zero_()
+                torch.accelerator.synchronize()
+
+        work = c10d.all_reduce(
+            work_tensor, op=c10d.ReduceOp.SUM, group=group, async_op=async_op
+        )
+
+        if needs_copy_back:
+            if work is not None:
+                work.wait()
+            tensor.copy_(
+                work_tensor.to(dtype=torch.bool)
+                if tensor.dtype == torch.bool
+                else work_tensor
+            )
+
+        if not async_op:
+            torch.accelerator.synchronize()
+        return work
+
+    setattr(_tpu_safe_broadcast, _TPU_BROADCAST_PATCHED, True)
+    c10d.broadcast = _tpu_safe_broadcast
+    dist.broadcast = _tpu_safe_broadcast
+    logger.info("Applied TPU patch: symmetric all_reduce broadcast for tpu_dist.")
+
+
+_TPU_EMPTY_COLLECTIVES_PATCHED = "_tpu_empty_collectives_patched"
+
+
+class _CompletedNoopWork:
+    """Minimal completed Work handle returned for 0-element async collectives."""
+
+    def wait(self, timeout: Any = None) -> bool:
+        return True
+
+    def is_completed(self) -> bool:
+        return True
+
+    def is_success(self) -> bool:
+        return True
+
+
+def _patch_tpu_empty_collectives() -> None:
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # Under hybrid SP x TP parallelism (e.g. Ulysses-2 x TP-4 on MiniMax-H3),
+    # modality-specific projections (such as text/audio embeddings located in
+    # one SP shard of a packed sequence) run TP collectives on 0-row tensors
+    # (`shape = [0, hidden]`) across all ranks of the other SP shard's TP group.
+    # ProcessGroupTpu lowers `all_gather_into_tensor` / `reduce_scatter_tensor`
+    # on 0-sized tensors into StableHLO collectives whose `all_gather_dim` /
+    # `scatter_dimension` has extent 0, failing MLIR verification with:
+    #   `error: dimension size of operand at 'all_gather_dim' cannot be zero`
+    #   `RuntimeError: failed to inline functions in MLIR module`.
+    #
+    # Fix: Short-circuit eager TPU `all_gather_single` (which backs
+    #   `all_gather_into_tensor`), `reduce_scatter_tensor`, and `all_reduce`
+    #   when both input and output tensors have `numel() == 0`.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once ProcessGroupTpu treats 0-element collectives as no-ops before
+    # emitting StableHLO IR.
+    # -------------------------------------------------------------------------
+    import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
+
+    orig_all_gather_single = c10d.all_gather_single
+    if getattr(orig_all_gather_single, _TPU_EMPTY_COLLECTIVES_PATCHED, False):
+        return
+
+    orig_reduce_scatter_tensor = c10d.reduce_scatter_tensor
+    orig_all_reduce = c10d.all_reduce
+    orig_barrier = c10d.barrier
+
+    def _sync_eager_tpu() -> None:
+        if not torch.compiler.is_compiling() and hasattr(torch, "accelerator"):
+            with suppress(Exception):
+                if torch.accelerator.is_available():
+                    torch.accelerator.synchronize()
+
+    def _is_empty_eager_tpu(*tensors: Any) -> bool:
+        return (
+            not torch.compiler.is_compiling()
+            and bool(tensors)
+            and all(
+                isinstance(t, torch.Tensor)
+                and t.device.type == "tpu"
+                and t.numel() == 0
+                for t in tensors
+            )
+        )
+
+    def _tpu_safe_all_gather_single(
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        group: Any = None,
+        async_op: bool = False,
+    ) -> Any:
+        if _is_empty_eager_tpu(output_tensor, input_tensor):
+            return _CompletedNoopWork() if async_op else None
+        is_eager_tpu = (
+            not torch.compiler.is_compiling()
+            and isinstance(output_tensor, torch.Tensor)
+            and output_tensor.device.type == "tpu"
+        )
+        if is_eager_tpu:
+            _sync_eager_tpu()
+        work = orig_all_gather_single(
+            output_tensor, input_tensor, group=group, async_op=async_op
+        )
+        if is_eager_tpu and not async_op:
+            _sync_eager_tpu()
+        return work
+
+    def _tpu_safe_reduce_scatter_tensor(
+        output: torch.Tensor,
+        input: torch.Tensor,
+        op: Any = c10d.ReduceOp.SUM,
+        group: Any = None,
+        async_op: bool = False,
+    ) -> Any:
+        if _is_empty_eager_tpu(output, input):
+            return _CompletedNoopWork() if async_op else None
+        return orig_reduce_scatter_tensor(
+            output, input, op=op, group=group, async_op=async_op
+        )
+
+    def _tpu_safe_all_reduce(
+        tensor: torch.Tensor,
+        op: Any = c10d.ReduceOp.SUM,
+        group: Any = None,
+        async_op: bool = False,
+    ) -> Any:
+        if _is_empty_eager_tpu(tensor):
+            return _CompletedNoopWork() if async_op else None
+        return orig_all_reduce(tensor, op=op, group=group, async_op=async_op)
+
+    def _tpu_safe_barrier(*args: Any, **kwargs: Any) -> Any:
+        _sync_eager_tpu()
+        work = orig_barrier(*args, **kwargs)
+        if not kwargs.get("async_op", False):
+            _sync_eager_tpu()
+        return work
+
+    for fn in (
+        _tpu_safe_all_gather_single,
+        _tpu_safe_reduce_scatter_tensor,
+        _tpu_safe_all_reduce,
+        _tpu_safe_barrier,
+    ):
+        setattr(fn, _TPU_EMPTY_COLLECTIVES_PATCHED, True)
+
+    c10d.all_gather_single = _tpu_safe_all_gather_single
+    dist.all_gather_single = _tpu_safe_all_gather_single
+    c10d.reduce_scatter_tensor = _tpu_safe_reduce_scatter_tensor
+    dist.reduce_scatter_tensor = _tpu_safe_reduce_scatter_tensor
+    c10d.all_reduce = _tpu_safe_all_reduce
+    dist.all_reduce = _tpu_safe_all_reduce
+    c10d.barrier = _tpu_safe_barrier
+    dist.barrier = _tpu_safe_barrier
+    logger.info("Applied TPU patch: short-circuit 0-element collectives for tpu_dist.")
 
 
 @run_once
@@ -84,6 +361,8 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_ulysses_batched_qkv_a2a()
+    _patch_tpu_fp16_sdpa()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +924,271 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_ULYSSES_BATCHED_A2A_PATCHED = "_tpu_ulysses_batched_a2a_patched"
+
+
+def _patch_ulysses_batched_qkv_a2a() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's UlyssesParallelAttention.pre_attention
+    # batches matching Q, K, V tensors into a single SeqAllToAll4D collective
+    # without mutating self._sp_ctx during TorchDynamo tracing.
+    #
+    # Problem: UlyssesParallelAttention.pre_attention issues three separate
+    #   SeqAllToAll4D.apply calls for Q, K, V in every transformer block (150
+    #   forward all-to-alls per step on 50-block DiTs).
+    # Fix: When Q, K, V share shape and dtype on TPU under standard strict
+    #   Ulysses SP (scatter_idx=2, gather_idx=1), concatenate (Q, K, V) along
+    #   batch dim 0, issue one SeqAllToAll4D.apply, and chunk(3, dim=0),
+    #   returning a fresh _UlyssesCtx in the 5-tuple without mutating self.
+    # Effect: Reduces forward Ulysses all-to-all launches by 3x (150 -> 50/step).
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.attention.parallel import ulysses as uly_mod
+    from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
+
+    cls = uly_mod.UlyssesParallelAttention
+    orig_pre = cls.pre_attention
+    if getattr(orig_pre, _ULYSSES_BATCHED_A2A_PATCHED, False):
+        return
+
+    def _tpu_pre_attention(
+        self: Any,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: Any,
+        *extra_args: Any,
+        **extra_kwargs: Any,
+    ) -> Any:
+        ulysses_mode = getattr(self, "_ulysses_mode", None)
+        if ulysses_mode is None and hasattr(uly_mod, "get_ulysses_mode"):
+            ulysses_mode = uly_mod.get_ulysses_mode(default="strict")
+        has_joint_or_gate = False
+        has_2d_mask = False
+        if attn_metadata is not None:
+            if (
+                attn_metadata.joint_query is not None
+                or attn_metadata.joint_key is not None
+                or attn_metadata.joint_value is not None
+                or (
+                    attn_metadata.extra is not None
+                    and attn_metadata.extra.get("gate_compress") is not None
+                )
+            ):
+                has_joint_or_gate = True
+            if (
+                attn_metadata.attn_mask is not None
+                and attn_metadata.attn_mask.ndim == 2
+            ) or (
+                attn_metadata.joint_attn_mask is not None
+                and attn_metadata.joint_attn_mask.ndim == 2
+            ):
+                has_2d_mask = True
+        if (
+            query.device.type != "tpu"
+            or ulysses_mode == "advanced_uaa"
+            or self._ulysses_a2a_permute
+            or self._scatter_idx != 2
+            or self._gather_idx != 1
+            or has_joint_or_gate
+            or has_2d_mask
+            or query.shape != key.shape
+            or query.shape != value.shape
+            or query.dtype != key.dtype
+            or query.dtype != value.dtype
+        ):
+            return orig_pre(
+                self, query, key, value, attn_metadata, *extra_args, **extra_kwargs
+            )
+
+        sp_group = getattr(self, "_sp_group", None)
+        ulysses_world_size = getattr(sp_group, "ulysses_world_size", None)
+        if ulysses_world_size is None:
+            ulysses_world_size = uly_mod.dist.get_world_size(self._ulysses_pg)
+        if int(query.shape[2]) % ulysses_world_size != 0:
+            return orig_pre(
+                self, query, key, value, attn_metadata, *extra_args, **extra_kwargs
+            )
+
+        qkv_batched = SeqAllToAll4D.apply(
+            self._ulysses_pg,
+            torch.cat((query, key, value), dim=0),
+            self._scatter_idx,
+            self._gather_idx,
+            self._use_sync,
+        )
+        q_ex, k_ex, v_ex = qkv_batched.chunk(3, dim=0)
+        ctx = uly_mod._UlyssesCtx(
+            name=self.name,
+            ulysses_pg=self._ulysses_pg,
+            scatter_idx=self._scatter_idx,
+            gather_idx=self._gather_idx,
+            use_sync=self._use_sync,
+        )
+        return q_ex, k_ex, v_ex, attn_metadata, ctx
+
+    setattr(_tpu_pre_attention, _ULYSSES_BATCHED_A2A_PATCHED, True)
+    cls.pre_attention = _tpu_pre_attention
+    logger.info("Applied TPU patch: batched QKV forward all_to_all for Ulysses SP.")
+
+
+_TPU_FP16_SDPA_PATCHED = "_tpu_fp16_sdpa_patched"
+
+
+def _patch_tpu_fp16_sdpa() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once torch_tpu's FLASH_ATTENTION SDPBackend supports float16
+    # inputs or upcasts them internally.
+    #
+    # Problem: TorchTPU's FLASH_ATTENTION SDPBackend accepts only float32 or
+    #   bfloat16 tensors and falls back with a warning on float16 (`Half`),
+    #   which remote-code VAEs such as MiniMax-H3's ViT video decoder emit under
+    #   `torch.autocast(..., dtype=torch.float16)`. Moreover, PyTorch's C++
+    #   autocast dispatcher re-downcasts bfloat16 arguments back to float16 if
+    #   autocast remains enabled around F.scaled_dot_product_attention.
+    # Fix: For TPU float16 inputs, cast Q, K, V (and floating-point attn_mask)
+    #   to bfloat16, run orig_sdpa under `torch.autocast("tpu", enabled=False)`,
+    #   and cast the output back to float16.
+    # Effect: Eliminates all <TorchTpu/Performance/> SDPA fallbacks during
+    #   MiniMax-H3 Video VAE decode and cuts non-DiT decode wall time by ~1.1 s.
+    # -------------------------------------------------------------------------
+    from contextlib import nullcontext
+
+    import torch.nn.functional as F
+
+    orig_sdpa = F.scaled_dot_product_attention
+    if getattr(orig_sdpa, _TPU_FP16_SDPA_PATCHED, False):
+        return
+
+    def _tpu_sdpa(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+    ) -> torch.Tensor:
+        if query.device.type != "tpu":
+            return orig_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+
+        was_fp16 = (
+            query.dtype == torch.float16
+            and key.dtype == torch.float16
+            and value.dtype == torch.float16
+        )
+        if was_fp16:
+            attn_mask = (
+                attn_mask.to(torch.bfloat16)
+                if (attn_mask is not None and attn_mask.is_floating_point())
+                else attn_mask
+            )
+            query = query.to(torch.bfloat16)
+            key = key.to(torch.bfloat16)
+            value = value.to(torch.bfloat16)
+
+        ac_ctx = (
+            torch.autocast(device_type="tpu", enabled=False)
+            if (was_fp16 and torch._C._is_any_autocast_enabled())
+            else nullcontext()
+        )
+        with ac_ctx:
+            if attn_mask is None and dropout_p == 0.0 and query.ndim == 4:
+                s_q = int(query.shape[-2])
+                s_kv = int(key.shape[-2])
+                d = int(query.shape[-1])
+                if is_causal and s_q == s_kv and d % 128 == 0 and s_q % 128 != 0:
+                    pad_len = ((s_q + 127) // 128) * 128 - s_q
+                    q_pad = F.pad(query, (0, 0, 0, pad_len))
+                    k_pad = F.pad(key, (0, 0, 0, pad_len))
+                    v_pad = F.pad(value, (0, 0, 0, pad_len))
+                    out = orig_sdpa(
+                        q_pad,
+                        k_pad,
+                        v_pad,
+                        attn_mask=None,
+                        dropout_p=0.0,
+                        is_causal=True,
+                        scale=scale,
+                        enable_gqa=enable_gqa,
+                    )[..., :s_q, :]
+                    return out.to(torch.float16) if was_fp16 else out
+                if (
+                    not is_causal
+                    and d % 128 == 0
+                    and s_kv % 128 == 0
+                    and s_q % 128 != 0
+                ):
+                    pad_len = ((s_q + 127) // 128) * 128 - s_q
+                    q_pad = F.pad(query, (0, 0, 0, pad_len))
+                    out = orig_sdpa(
+                        q_pad,
+                        key,
+                        value,
+                        attn_mask=None,
+                        dropout_p=0.0,
+                        is_causal=False,
+                        scale=scale,
+                        enable_gqa=enable_gqa,
+                    )[..., :s_q, :]
+                    return out.to(torch.float16) if was_fp16 else out
+                if (
+                    not is_causal
+                    and s_q > 2048
+                    and s_q * s_kv > 4_000_000
+                    and (d % 128 != 0 or s_kv % 128 != 0)
+                ):
+                    q_chunk = 2048
+                    out = torch.cat(
+                        [
+                            orig_sdpa(
+                                query[..., start : start + q_chunk, :],
+                                key,
+                                value,
+                                attn_mask=None,
+                                dropout_p=0.0,
+                                is_causal=False,
+                                scale=scale,
+                                enable_gqa=enable_gqa,
+                            )
+                            for start in range(0, s_q, q_chunk)
+                        ],
+                        dim=-2,
+                    )
+                    return out.to(torch.float16) if was_fp16 else out
+
+            out = orig_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+        return out.to(torch.float16) if was_fp16 else out
+
+    setattr(_tpu_sdpa, _TPU_FP16_SDPA_PATCHED, True)
+    F.scaled_dot_product_attention = _tpu_sdpa
+    sdpa_attr = "scaled_dot_product_attention"
+    for mod in list(sys.modules.values()):
+        if not isinstance(mod, types.ModuleType):
+            continue
+        if vars(mod).get(sdpa_attr) is orig_sdpa:
+            with suppress(Exception):
+                setattr(mod, sdpa_attr, _tpu_sdpa)
+    logger.info(
+        "Applied TPU patch: FP16->BF16 upcast for scaled_dot_product_attention."
+    )
