@@ -2534,6 +2534,86 @@ def test_rope_cache_row_major_default_steps_aside_for_multimodal(monkeypatch):
     assert not _rope_cache_row_major(config(multimodal=False))
 
 
+def test_rope_cache_truncate_default_steps_aside(monkeypatch):
+    """The default truncation skips speculative decoding (the draft ropes past
+    max_model_len through the target's rope modules) and a max_model_len that
+    fits in a token bucket (the row-major pin keys on the table's shape). An
+    explicit setting refuses the first and applies to the second."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner.tpu_runner import _rope_cache_truncate
+
+    def runner(spec=None, max_model_len=163840):
+        return SimpleNamespace(
+            speculative_config=spec, max_model_len=max_model_len, max_num_tokens=8192
+        )
+
+    mtp = SimpleNamespace(method="mtp")
+
+    monkeypatch.delenv("TPU_ROPE_CACHE_TRUNCATE", raising=False)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
+    assert _rope_cache_truncate(runner())
+    assert not _rope_cache_truncate(runner(spec=mtp))
+    assert not _rope_cache_truncate(runner(max_model_len=8192))
+
+    monkeypatch.setenv("TPU_ROPE_CACHE_TRUNCATE", "1")
+    assert _rope_cache_truncate(runner())
+    assert _rope_cache_truncate(runner(max_model_len=8192))
+    with pytest.raises(NotImplementedError, match="speculative decoding"):
+        _rope_cache_truncate(runner(spec=mtp))
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", False)
+    assert not _rope_cache_truncate(runner())
+
+
+def test_truncate_rope_caches_is_bitwise_below_max_model_len():
+    """Truncation keeps every row a scheduled position reads: the cache and the
+    rope applied with it equal the full table's bitwise at every position below
+    max_model_len, in the interleaved (MLA) and NeoX (indexer) styles alike.
+    A step past the rows is refused on the host, where the device gather would
+    clamp it to the last row."""
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    max_model_len = 1000
+
+    def rope(neox):
+        return RotaryEmbedding(64, 64, 4096, 8_000_000, neox, torch.bfloat16)
+
+    mla, indexer = rope(False), rope(True)
+    full = {}  # the untruncated tables, each holding its module's own rows
+    for module in (mla, indexer):
+        full[id(module)] = rope(module.is_neox_style)
+        full[id(module)].cos_sin_cache = module.cos_sin_cache.clone()
+    layer = torch.nn.ModuleDict({"rotary_emb": mla, "indexer_rope_emb": indexer})
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.model = torch.nn.ModuleList([layer, torch.nn.ModuleDict({"rope": mla})])
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=max_model_len
+    )
+    runner._rope_position_limit = None
+
+    TPUModelRunner._truncate_rope_caches(runner)
+
+    assert runner._rope_position_limit == max_model_len
+    positions = torch.cat(
+        [torch.arange(max_model_len), torch.randint(0, max_model_len, (512,))]
+    )
+    for module in (mla, indexer):
+        ref = full[id(module)]
+        assert tuple(module.cos_sin_cache.shape) == (max_model_len, 64)
+        assert torch.equal(module.cos_sin_cache, ref.cos_sin_cache[:max_model_len])
+        q = torch.randn(positions.numel(), 4, 64, dtype=torch.bfloat16)
+        k = torch.randn(positions.numel(), 1, 64, dtype=torch.bfloat16)
+        got = module.forward_native(positions, q.clone(), k.clone())
+        want = ref.forward_native(positions, q.clone(), k.clone())
+        assert all(torch.equal(g, w) for g, w in zip(got, want))
+
+    runner.seq_lens_np = np.array([max_model_len, 7], dtype=np.int32)
+    TPUModelRunner._check_rope_positions(runner, 2)
+    runner.seq_lens_np = np.array([7, max_model_len + 1], dtype=np.int32)
+    with pytest.raises(RuntimeError, match="past the 1000 rows"):
+        TPUModelRunner._check_rope_positions(runner, 2)
+
+
 def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
     from vllm_torchtpu.runner.tpu_runner import _torch_tpu_wrapper
 
