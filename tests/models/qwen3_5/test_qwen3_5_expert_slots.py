@@ -13,6 +13,7 @@
 # limitations under the License.
 """The expert placement tables' effect on the Qwen3.5 KV budget."""
 
+import json
 import pathlib
 
 import pytest
@@ -37,10 +38,9 @@ DP8_TABLE = VALIDATION / "expert_placement_dp8_ep8.json"
 
 @pytest.fixture(autouse=True)
 def _tpu7x(monkeypatch):
-    """The record jobs ran on TPU7x. Where the hook applies the calibrated KV
-    budget only on a TPU7x device, the device reads as TPU7x here too."""
-    if hasattr(hooks, "_chip_family"):
-        monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
+    """The measured runs were on TPU7x, and the hook applies the calibrated KV
+    budget only on a TPU7x device."""
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
 
 
 @pytest.fixture
@@ -60,10 +60,45 @@ def test_tp8_decode_legs_get_the_budget_they_ran_with(table):
     42,509,364,992 B."""
     table(TP8_TABLE)
     cfg = _run_hook(_vllm_config(tp=8, dp=1, dcp=4, max_num_seqs=8))
+    # 33,500,000,000 + (12 x 60 - 4) x 12,582,912 B.
     assert cfg.cache_config.kv_cache_memory_bytes == 42_509_364_992
-    assert 33_500_000_000 + ((80 - 68) * LAYERS - 4) * SLOT_LAYER_BYTES == (
-        42_509_364_992
-    )
+
+
+def _write(tmp_path, source, layers):
+    """`source`'s table, placing only `layers` (indices past the target's 60
+    take layer 0's placement)."""
+    data = json.loads(source.read_text())
+    data["layers"] = {str(n): data["layers"][str(n % LAYERS)] for n in layers}
+    if "copy_order" in data:
+        data["copy_order"] = {
+            str(n): data["copy_order"][str(n % LAYERS)] for n in layers
+        }
+    path = tmp_path / f"partial_{len(layers)}.json"
+    path.write_text(json.dumps(data))
+    return path
+
+
+@pytest.mark.parametrize(
+    "source, layers, credit",
+    [
+        # A permutation table that places half the layers: every layer still
+        # holds 64 slots per rank, as without a table.
+        (DP8_TABLE, range(30), CREDIT_EP8),
+        # A copies table that places half the layers: 68 slots in those, 64
+        # in the rest, and the drafter's 4 copy slots.
+        (TP8_TABLE, range(30), (12 * 30 + 16 * 30 - 4) * SLOT_LAYER_BYTES),
+        # A copies table that also lists the drafter's layer (index 60): that
+        # is not a 61st target layer.
+        (TP8_TABLE, range(61), (12 * LAYERS - 4) * SLOT_LAYER_BYTES),
+    ],
+    ids=["permutation_half", "copies_half", "copies_and_drafter"],
+)
+def test_layers_a_table_does_not_place_keep_their_credit(
+    table, tmp_path, source, layers, credit
+):
+    table(_write(tmp_path, source, list(layers)))
+    cfg = _run_hook(_vllm_config(tp=8, dp=1, dcp=4, max_num_seqs=8))
+    assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + credit
 
 
 def test_a_permutation_table_budgets_like_no_table(table):

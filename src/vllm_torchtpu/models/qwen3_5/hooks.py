@@ -98,43 +98,36 @@ def _is_calibrated(model_config) -> bool:
     return _chip_family() == _CALIBRATED_CHIP
 
 
-def _expert_slots_and_layers(model_config, parallel_config) -> tuple[int, int]:
-    """(slots, layers): the expert slots each EP rank holds and the MoE layers
-    that hold them. With a placement table (TPU_EXPERT_PLACEMENT), its slots
-    per rank (primaries and copy slots) over its placed layers; without one,
-    num_experts / EP in every layer."""
-    from vllm_torchtpu.layers.adapter import expert_placement
-
-    placement = expert_placement.current()
-    if placement is not None:
-        return placement.slots_per_rank, len(placement.layers)
-    text = model_config.hf_text_config
-    ep = parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
-    return text.num_experts // ep, text.num_hidden_layers
-
-
 def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, int]:
     """(credit, slots): HBM bytes per device freed (positive) or taken
     (negative) by the expert placement holding fewer (more) slots per rank
-    than the placement the Qwen3.5 safe_kv budgets were measured with: one FP8
+    than the placement the Qwen3.5 safe_kv budgets were measured with, one FP8
     expert (gate|up and down, 3 x hidden x moe_intermediate bytes) per slot
-    per placed MoE layer; and the slot count (for logging)."""
-    text = model_config.hf_text_config
-    slots, layers = _expert_slots_and_layers(model_config, parallel_config)
-    copies = _copy_slots_per_rank()
-    slot_bytes = 3 * text.hidden_size * text.moe_intermediate_size
-    # A table with copies also budgets the drafter's MoE layer for its copy
-    # slots, as the measured budgets did.
-    slot_layers = (_QWEN35_SAFE_KV_SLOTS - slots) * layers - copies
-    return slot_layers * slot_bytes, slots
+    per MoE layer of the target; and a placed layer's slot count (for
+    logging).
 
-
-def _copy_slots_per_rank() -> int:
-    """The placement table's copy slots per rank, 0 without a table."""
+    Every target layer holds num_experts / EP slots per rank, or the slots
+    per rank of a placement table (TPU_EXPERT_PLACEMENT) that places it, its
+    primaries and copy slots; table entries past the target's layers (a
+    drafter's) are not target layers. A table with copy slots also budgets
+    the drafter's MoE layer for its copy slots, whether or not the table
+    places it: the measured budgets did (every TP8 decode leg of the record
+    runs logged that budget), and it leaves copies x 3 x hidden x
+    moe_intermediate bytes (48 MiB for 4 copies at Qwen3.5-397B-A17B's shape)
+    unspent where the drafter's layer is not placed."""
     from vllm_torchtpu.layers.adapter import expert_placement
 
+    text = model_config.hf_text_config
+    ep = parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
+    unplaced = text.num_experts // ep
     placement = expert_placement.current()
-    return placement.copies_per_rank if placement is not None else 0
+    placed = unplaced if placement is None else placement.slots_per_rank
+    slot_layers = 0 if placement is None else -placement.copies_per_rank
+    for layer in range(text.num_hidden_layers):
+        is_placed = placement is not None and layer in placement.layers
+        slot_layers += _QWEN35_SAFE_KV_SLOTS - (placed if is_placed else unplaced)
+    slot_bytes = 3 * text.hidden_size * text.moe_intermediate_size
+    return slot_layers * slot_bytes, placed
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
