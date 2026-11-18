@@ -79,6 +79,23 @@ def gather_taken(taken: jax.Array, *, axis_name: str) -> jax.Array:
     return g.reshape(-1, *g.shape[2:])
 
 
+def gather_taken_pair(
+    nope: jax.Array, rope: jax.Array, *, axis_name: str
+) -> tuple[jax.Array, jax.Array]:
+    """`gather_taken` of the NoPE and RoPE pages as one all-gather (same
+    rows): one 36 MiB collective per 64k-token chunk instead of 32 + 4 MiB,
+    so one SparseCore offload floor (SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES)
+    puts both on the SparseCore, where XLA runs them async."""
+    if nope.shape[0] != rope.shape[0] or nope.shape[2:] != rope.shape[2:]:
+        return (
+            gather_taken(nope, axis_name=axis_name),
+            gather_taken(rope, axis_name=axis_name),
+        )
+    split = nope.shape[1]
+    both = gather_taken(jnp.concatenate([nope, rope], axis=1), axis_name=axis_name)
+    return both[:, :split], both[:, split:]
+
+
 # `latent_workspace(fill=...)`: "zeros" (the default), "empty" (no defined
 # contents, TPU_PCP_WS_NO_ZERO_FILL) and "nan" (test only: every byte 0xFF, an
 # fp8 e4m3 NaN, to prove the attention never uses rows no chunk wrote).
