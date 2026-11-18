@@ -43,8 +43,10 @@ NUM_CORES = 2
 NUM_SUBCORES = 16
 NUM_LANES = 16
 ROPE_PACKING = 4
+COMPACT_ROPE_PACKING = 8
 QUADS_PER_ATOM = 16
 OCCURRENCES_PER_ATOM = QUADS_PER_ATOM * ROPE_PACKING
+COMPACT_ROWS_PER_ATOM = OCCURRENCES_PER_ATOM // COMPACT_ROPE_PACKING
 ROPE_WORDS = 32  # one rope token on the SparseCore view of the rope cache
 # One rope token under packed rope (`TPU_SPARSE_MLA_PACKED_ROPE`): its 64 fp8
 # bytes alone, eight tokens per 128-word cache row instead of four.
@@ -170,6 +172,7 @@ def _kernel(
     write_fault: str | None = None,
     rope_words: int = ROPE_WORDS,
     wide_factor: int = 1,
+    compact_rope: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     late_drain = None
@@ -250,32 +253,65 @@ def _kernel(
                 for copy in nope_copies:
                     copy.wait()
 
-            for row in range(QUADS_PER_ATOM):
-                data = []
-                for token_slot in range(ROPE_PACKING):
-                    logical_rank = row * ROPE_PACKING + token_slot
-                    input_stream = logical_rank // NUM_LANES
-                    input_lane = logical_rank % NUM_LANES
-                    data.append(
-                        rope_inputs[input_stream][
-                            pl.ds(input_lane, 1), pl.ds(0, rope_words)
-                        ]
-                    )
+            if compact_rope:
+                # Pack two quads (8 packed-rope tokens = 128 words, 0 pad) per
+                # output row: lanes 0..63 hold tokens 0..31, lanes 64..127 hold
+                # tokens 32..63 so TC unpacks each atom of 64 tokens as two (8,128)
+                # tiles without sub-tile slicing.
+                half_atom = OCCURRENCES_PER_ATOM // 2
+                for row in range(COMPACT_ROWS_PER_ATOM):
+                    data_l = []
+                    data_r = []
+                    for token_slot in range(ROPE_PACKING):
+                        rank_l = row * ROPE_PACKING + token_slot
+                        rank_r = half_atom + rank_l
+                        data_l.append(
+                            rope_inputs[rank_l // NUM_LANES][
+                                pl.ds(rank_l % NUM_LANES, 1), pl.ds(0, rope_words)
+                            ]
+                        )
+                        data_r.append(
+                            rope_inputs[rank_r // NUM_LANES][
+                                pl.ds(rank_r % NUM_LANES, 1), pl.ds(0, rope_words)
+                            ]
+                        )
+                    data_l = transpose_quad(data_l)
+                    data_r = transpose_quad(data_r)
+                    for band in range(ROPE_PACKING):
+                        rope_output[
+                            pl.ds(row, 1), pl.ds(band * rope_words, rope_words)
+                        ] = data_l[band]
+                        rope_output[
+                            pl.ds(row, 1),
+                            pl.ds((ROPE_PACKING + band) * rope_words, rope_words),
+                        ] = data_r[band]
+            else:
+                for row in range(QUADS_PER_ATOM):
+                    data = []
+                    for token_slot in range(ROPE_PACKING):
+                        logical_rank = row * ROPE_PACKING + token_slot
+                        input_stream = logical_rank // NUM_LANES
+                        input_lane = logical_rank % NUM_LANES
+                        data.append(
+                            rope_inputs[input_stream][
+                                pl.ds(input_lane, 1), pl.ds(0, rope_words)
+                            ]
+                        )
 
-                data = transpose_quad(data)
-                for band in range(ROPE_PACKING):
-                    rope_output[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = (
-                        data[band]
-                    )
-                # Packed rope fills only the first ROPE_PACKING * rope_words
-                # lanes; zero the rest, which the consumer reads as the
-                # (zero-padded) rope tail, as the padded cache stores it.
-                # Garbage there could decode to fp8 NaN, and NaN * 0 poisons
-                # the score against q's zero pad.
-                for band in range(ROPE_PACKING, 128 // rope_words):
-                    rope_output[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = (
-                        jnp.zeros((1, rope_words), jnp.uint32)
-                    )
+                    data = transpose_quad(data)
+                    for band in range(ROPE_PACKING):
+                        rope_output[
+                            pl.ds(row, 1), pl.ds(band * rope_words, rope_words)
+                        ] = data[band]
+                    # Packed rope fills only the first ROPE_PACKING * rope_words
+                    # lanes; zero the rest, which the consumer reads as the
+                    # (zero-padded) rope tail, as the padded cache stores it.
+                    # Garbage there could decode to fp8 NaN, and NaN * 0 poisons
+                    # the score against q's zero pad.
+                    for band in range(ROPE_PACKING, 128 // rope_words):
+                        rope_output[
+                            pl.ds(row, 1), pl.ds(band * rope_words, rope_words)
+                        ] = jnp.zeros((1, rope_words), jnp.uint32)
 
             if wait_mode == "overlap_rope":
                 for copy in nope_copies:
@@ -295,8 +331,9 @@ def _kernel(
             )
             for stream in range(ROPE_PACKING)
         )
+        rope_rows_per_atom = COMPACT_ROWS_PER_ATOM if compact_rope else QUADS_PER_ATOM
         rope_out_spec = pl.BlockSpec(
-            (QUADS_PER_ATOM, 128),
+            (rope_rows_per_atom, 128),
             lambda atom: (logical_batch * atoms_per_batch + atom_of(atom), 0),
         )
 
@@ -304,8 +341,8 @@ def _kernel(
             super_atoms = atoms_per_batch // wide_factor
             occ_per_step = wide_factor * OCCURRENCES_PER_ATOM
             subchunks = occ_per_step // NUM_LANES
-            quads_per_step = occ_per_step // ROPE_PACKING
-            rope_row_base = logical_batch * atoms_per_batch * QUADS_PER_ATOM
+            rope_rows_per_step = wide_factor * rope_rows_per_atom
+            rope_row_base = logical_batch * atoms_per_batch * rope_rows_per_atom
 
             def idx_lanes(step, sub):
                 if linear_indices:
@@ -367,31 +404,78 @@ def _kernel(
                 )
                 nope_cp.start()
 
-                def transpose_row(q_idx, _c):
-                    base_t = q_idx * ROPE_PACKING
-                    data = [
-                        wide_rope_vm[slot, pl.ds(base_t + t, 1), pl.ds(0, rope_words)]
-                        for t in range(ROPE_PACKING)
-                    ]
-                    data = transpose_quad(data)
-                    for band in range(ROPE_PACKING):
-                        wide_rope_out_vm[
-                            0, pl.ds(q_idx, 1), pl.ds(band * rope_words, rope_words)
-                        ] = data[band]
-                    for band in range(ROPE_PACKING, 128 // rope_words):
-                        wide_rope_out_vm[
-                            0, pl.ds(q_idx, 1), pl.ds(band * rope_words, rope_words)
-                        ] = zeros_band
-                    return _c
+                if compact_rope:
 
-                # Avoid unrolling 64 quads in Python: lax.fori_loop keeps
-                # compile time ~0.2s and eliminates code-size bloat on SC.
-                lax.fori_loop(0, quads_per_step, transpose_row, jnp.int32(0))
+                    def transpose_compact_row(r_idx, _c):
+                        atom_i = lax.div(r_idx, jnp.int32(COMPACT_ROWS_PER_ATOM))
+                        in_atom = lax.rem(r_idx, jnp.int32(COMPACT_ROWS_PER_ATOM))
+                        base_l = atom_i * jnp.int32(
+                            OCCURRENCES_PER_ATOM
+                        ) + in_atom * jnp.int32(ROPE_PACKING)
+                        base_r = base_l + jnp.int32(OCCURRENCES_PER_ATOM // 2)
+                        data_l = transpose_quad(
+                            [
+                                wide_rope_vm[
+                                    slot, pl.ds(base_l + t, 1), pl.ds(0, rope_words)
+                                ]
+                                for t in range(ROPE_PACKING)
+                            ]
+                        )
+                        data_r = transpose_quad(
+                            [
+                                wide_rope_vm[
+                                    slot, pl.ds(base_r + t, 1), pl.ds(0, rope_words)
+                                ]
+                                for t in range(ROPE_PACKING)
+                            ]
+                        )
+                        for band in range(ROPE_PACKING):
+                            wide_rope_out_vm[
+                                0, pl.ds(r_idx, 1), pl.ds(band * rope_words, rope_words)
+                            ] = data_l[band]
+                            wide_rope_out_vm[
+                                0,
+                                pl.ds(r_idx, 1),
+                                pl.ds((ROPE_PACKING + band) * rope_words, rope_words),
+                            ] = data_r[band]
+                        return _c
+
+                    lax.fori_loop(
+                        0, rope_rows_per_step, transpose_compact_row, jnp.int32(0)
+                    )
+                else:
+
+                    def transpose_row(q_idx, _c):
+                        base_t = q_idx * ROPE_PACKING
+                        data = [
+                            wide_rope_vm[
+                                slot, pl.ds(base_t + t, 1), pl.ds(0, rope_words)
+                            ]
+                            for t in range(ROPE_PACKING)
+                        ]
+                        data = transpose_quad(data)
+                        for band in range(ROPE_PACKING):
+                            wide_rope_out_vm[
+                                0, pl.ds(q_idx, 1), pl.ds(band * rope_words, rope_words)
+                            ] = data[band]
+                        for band in range(ROPE_PACKING, 128 // rope_words):
+                            wide_rope_out_vm[
+                                0, pl.ds(q_idx, 1), pl.ds(band * rope_words, rope_words)
+                            ] = zeros_band
+                        return _c
+
+                    # Avoid unrolling 64 quads in Python: lax.fori_loop keeps
+                    # compile time ~0.2s and eliminates code-size bloat on SC.
+                    lax.fori_loop(0, rope_rows_per_step, transpose_row, jnp.int32(0))
 
                 rope_cp = pltpu.make_async_copy(
                     wide_rope_out_vm.at[0],
                     rope_out_hbm_ref.at[
-                        pl.ds(rope_row_base + step * quads_per_step, quads_per_step), :
+                        pl.ds(
+                            rope_row_base + step * rope_rows_per_step,
+                            rope_rows_per_step,
+                        ),
+                        :,
                     ],
                     wide_out_sem.at[1],
                 )
@@ -708,6 +792,7 @@ def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
         "live_vec_offset",
         "write_fault",
         "packed_rope",
+        "compact_rope",
     ),
 )
 def dsa_gather_native_sc(
@@ -729,6 +814,7 @@ def dsa_gather_native_sc(
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     write_fault: str | None = None,
     packed_rope: bool = False,
+    compact_rope: bool = False,
 ) -> tuple[jax.Array, ...]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -795,6 +881,8 @@ def dsa_gather_native_sc(
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
+    if compact_rope and not packed_rope:
+        raise ValueError("compact_rope requires packed_rope=True")
     if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
         raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
     if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
@@ -831,6 +919,7 @@ def dsa_gather_native_sc(
         raise ValueError(f"unknown {write_fault=}")
     # Arrays, or refs the kernel writes in place under `kv_write`.
     rope_words = PACKED_ROPE_WORDS if packed_rope else ROPE_WORDS
+    rope_out_packing = COMPACT_ROPE_PACKING if compact_rope else ROPE_PACKING
     nope_rows_view: Any = nope_cache.reshape(-1, 128)
     rope_rows_view: Any = rope_cache.reshape(-1, rope_words)
     if packed_rope and rope_rows_view.shape[0] != nope_rows_view.shape[0]:
@@ -853,13 +942,13 @@ def dsa_gather_native_sc(
     )
     if wide_factor > 1:
         occ_per_step = wide_factor * OCCURRENCES_PER_ATOM
-        quads_per_step = occ_per_step // ROPE_PACKING
+        rope_rows_per_step = occ_per_step // rope_out_packing
         scratch_types["wide_nope_vm"] = pltpu.VMEM((2, occ_per_step, 128), jnp.uint32)
         scratch_types["wide_rope_vm"] = pltpu.VMEM(
             (2, occ_per_step, rope_words), jnp.uint32
         )
         scratch_types["wide_rope_out_vm"] = pltpu.VMEM(
-            (1, quads_per_step, 128), jnp.uint32
+            (1, rope_rows_per_step, 128), jnp.uint32
         )
         scratch_types["wide_in_nope_sem"] = pltpu.SemaphoreType.DMA((2,))
         scratch_types["wide_in_rope_sem"] = pltpu.SemaphoreType.DMA((2,))
@@ -1004,6 +1093,7 @@ def dsa_gather_native_sc(
         **row_kwargs,
         rope_words=rope_words,
         wide_factor=wide_factor,
+        compact_rope=compact_rope,
     )
 
     def body(*refs, write_dst_vmem=None, write_dst_sem=None, write_sem=None, **scr):
@@ -1027,7 +1117,7 @@ def dsa_gather_native_sc(
         body,
         out_type=(
             jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
-            jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
+            jax.ShapeDtypeStruct((out_size // rope_out_packing, 128), jnp.uint32),
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=False,
@@ -1042,6 +1132,7 @@ def dsa_gather_native_sc(
             f"{'_rowlive' if row_kwargs else ''}"
             f"{'_kvw' if kv_write is not None else ''}"
             f"{'_packedrope' if packed_rope else ''}"
+            f"{'_compactrope' if compact_rope else ''}"
             f"{f'_w{wide_factor}' if wide_factor > 1 else ''}"
         ),
     )(*operands)

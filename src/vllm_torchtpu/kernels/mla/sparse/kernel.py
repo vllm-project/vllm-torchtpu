@@ -2073,11 +2073,10 @@ def _attention_kernel(
             nope_rows = (
                 slice_sz if sparsecore_layout else slice_sz * kv_cache_utils.WORD_BYTES
             )
-            rope_rows = (
-                slice_sz // native_sc_gather.ROPE_PACKING
-                if sparsecore_layout
-                else slice_sz
+            rope_packing = (
+                bkv_sz // cache_kv_rope_hbm_ref.shape[1] if sparsecore_layout else 1
             )
+            rope_rows = slice_sz // rope_packing if sparsecore_layout else slice_sz
             bkv_nope_vmem_ref = bkv_nope_x2_ref.at[
                 bkv_sem_idx, :, pl.ds(0, nope_rows), :
             ]
@@ -2786,6 +2785,26 @@ def _attention_kernel(
             pick = lax.broadcasted_iota(jnp.int32, tile_ref.shape, 0) == batch_idx
             tile_ref[...] = jnp.where(pick, row, tile_ref[...])
 
+    rope_packing = bkv_sz // cache_kv_rope_hbm_ref.shape[1] if sparsecore_layout else 1
+
+    def _unpack_sc_rope(raw_rope, slice_sz):
+        if rope_packing == native_sc_gather.COMPACT_ROPE_PACKING:
+            # Each atom of 64 tokens sits in one uint32[8, 128] tile: lanes 0..63
+            # hold tokens 0..31 and lanes 64..127 hold tokens 32..63.
+            n_atoms = slice_sz // native_sc_gather.OCCURRENCES_PER_ATOM
+            lane_id = lax.broadcasted_iota(jnp.int32, raw_rope.shape, 1)
+            left = jnp.where(lane_id < 64, raw_rope, jnp.uint32(0))
+            right = jnp.where(lane_id < 64, pltpu.roll(raw_rope, 64, 1), jnp.uint32(0))
+            tiles = []
+            for a in range(n_atoms):
+                r0 = a * native_sc_gather.COMPACT_ROWS_PER_ATOM
+                r1 = r0 + native_sc_gather.COMPACT_ROWS_PER_ATOM
+                tiles.append(left[r0:r1, :])
+                tiles.append(right[r0:r1, :])
+            expanded = jnp.concatenate(tiles, axis=0)
+            return pltpu.bitcast(expanded, jnp.uint8).reshape(slice_sz, 128)
+        return pltpu.bitcast(raw_rope, jnp.uint8).reshape(slice_sz, 128)
+
     def load_bkv_levers(bkv_sem_idx, batch_idx, rows, levers):
         """`load_bkv` for the live body with `body_levers` (see above)."""
         nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
@@ -2827,7 +2846,7 @@ def _attention_kernel(
                 words = jnp.where(key < kv_len, words, jnp.uint32(0))
             bkv_nope = pltpu.bitcast(words, jnp.uint8).reshape(rows, nope_dim)
             bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
-        bkv_rope = pltpu.bitcast(rope_ref[...], jnp.uint8).reshape(rows, 128)
+        bkv_rope = _unpack_sc_rope(rope_ref[...], rows)
         bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
         if bkv.shape[-1] < head_dim:
@@ -2872,17 +2891,11 @@ def _attention_kernel(
         if slice_sz == bkv_sz:
             bkv_rope = bkv_rope_ref[...]
         elif sparsecore_layout:
-            bkv_rope = bkv_rope_ref.at[
-                pl.ds(0, slice_sz // native_sc_gather.ROPE_PACKING), :
-            ][...]
+            bkv_rope = bkv_rope_ref.at[pl.ds(0, slice_sz // rope_packing), :][...]
         else:
             bkv_rope = bkv_rope_ref.at[pl.ds(0, slice_sz), :][...]
         if sparsecore_layout:
-            # The native gather's delta-swap produces four-token grouped
-            # uint32[128] rows. Expanding their byte lanes recovers one
-            # contiguous 128-byte row per selected token.
-            bkv_rope = pltpu.bitcast(bkv_rope, jnp.uint8)
-            bkv_rope = bkv_rope.reshape(slice_sz, 128)
+            bkv_rope = _unpack_sc_rope(bkv_rope, slice_sz)
         bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
@@ -5139,6 +5152,14 @@ def sparse_attention_chunk(
                     num_live_indices=num_valid_indices,
                     live_multiple=kernel_batch_size * topk,
                 )
+            compact_rope = (
+                packed_rope and not is_dcp_mode and topk % GATHER_ATOM_ROWS == 0
+            )
+            rope_out_packing = (
+                native_sc_gather.COMPACT_ROPE_PACKING
+                if compact_rope
+                else native_sc_gather.ROPE_PACKING
+            )
             gathered_nope_buffer, gathered_rope_buffer = (
                 native_sc_gather.dsa_gather_native_sc(
                     cache_kv_nope,
@@ -5152,12 +5173,13 @@ def sparse_attention_chunk(
                     linear_indices=not is_dcp_mode,
                     **({"is_dcp_mode": True} if is_dcp_mode else {}),
                     packed_rope=packed_rope,
+                    compact_rope=compact_rope,
                     **live_kwargs,
                 )
             )
             gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
             gathered_rope_buffer = gathered_rope_buffer.reshape(
-                chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
+                chunk_size, topk // rope_out_packing, 128
             )
         else:
             assert indices is not None
