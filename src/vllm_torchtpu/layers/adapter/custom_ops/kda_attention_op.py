@@ -276,10 +276,10 @@ def _check_kda_abi(
 ) -> tuple[int, int, int, int, int]:
     """Validate the shared KDA operand contract; return the shape tuple.
 
-    Deliberately the same contract `ragged_kda` enforces, so swapping ops cannot
-    silently change what a caller is allowed to pass. The value head size
-    comes from the recurrent state's last axis: Kimi has it equal to the
-    key head size, OLMo 3.5 twice as wide.
+    Mirrors the contract `ragged_kda` enforces, except that the value head
+    size may differ from the key head size: it comes from the recurrent
+    state's last axis (equal to the key head size for Kimi, twice as wide for
+    OLMo 3.5). `ragged_kda` still requires the two to match.
     """
     num_tokens, mixed_dim = mixed_qkv.shape
     num_heads, head_dim, head_v_dim = recurrent_state.shape[1:]
@@ -374,9 +374,9 @@ def _build_fused_core(
         if window_distribution is None:
             window_distribution = distribution
 
-        # `mixed_qkv` and `conv_weight` lay their channels out as (3, H, D) in
-        # row-major order, which is exactly the flat `dim` axis the fused
-        # kernel indexes -- the reshapes are free. The dense `conv_state`
+        # `mixed_qkv` and `conv_weight` lay their channels out as
+        # (q: H * D, k: H * D, v: H * V) in row-major order, which is exactly
+        # the flat `dim` axis the fused kernel indexes -- the reshapes are free. The dense `conv_state`
         # cache is declared in the kernel's (K - 1, 1, dim) slot layout so it
         # is read in place; the pooled path hands in its gathered slots flat.
         # The kernel wants the weight transposed to [dim, 1, kernel_size].
