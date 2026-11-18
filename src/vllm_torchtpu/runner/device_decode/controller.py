@@ -11,26 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The opt-in device-decode path (VLLM_TPU_DEVICE_DECODE): its startup, and
-the stock steps' write-back into the decode slots.
+"""The opt-in device-decode path (VLLM_TPU_DEVICE_DECODE): which steps run on
+the decode slots, the device step itself, and the stock steps' write-back.
 
-With the flag set, every step still runs on the stock path. Startup builds
-the decode slots, compiles the path's programs and, on TPU, runs the forward
-of a device step once per decode shape. Each stock chunk then draws its
-sampling noise from the slots' keyed RNG, as the head keys it, and writes
-its outcome back into the slots, which follow the runner's requests on
-every step.
+A pure-decode step whose requests all own a decode-ready slot builds its
+inputs on the device (`inputs`), runs the stock backbone and logits programs,
+then samples, advances the slots and packs its outputs in one program (`head`)
+that reaches the host in one copy. Any other step runs on the stock path,
+draws its sampling noise from the same keyed RNG and writes its outcome back
+into the slots, so a request samples the same token on either path.
 """
 
 from __future__ import annotations
 
 import contextlib
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
 from vllm.forward_context import set_forward_context
+from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -41,7 +43,13 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.runner.device_decode.head import SamplerVariant, precompile_head
+from vllm_torchtpu.runner.device_decode.head import (
+    PackedLayout,
+    SamplerVariant,
+    decode_head,
+    head_key,
+    precompile_head,
+)
 from vllm_torchtpu.runner.device_decode.inputs import (
     DecodeInputs,
     DecodeShape,
@@ -52,14 +60,42 @@ from vllm_torchtpu.runner.device_decode.inputs import (
 )
 from vllm_torchtpu.runner.device_decode.rng import counter_uniform_for_rows_impl
 from vllm_torchtpu.runner.device_decode.slots import (
+    MIRROR_MISMATCH,
+    SLOT_NOT_READY,
     DecodeSlots,
     SlotConfig,
     StockChunkPlan,
+)
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    AsyncPreResults,
+    AsyncTPUCopyState,
+    AsyncTPUModelRunnerOutput,
+    DeviceDecodeInvariantError,
 )
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+# Why a step runs on the stock path, in the order they are checked; the
+# slot checks (`slots.SLOT_NOT_READY`, `slots.MIRROR_MISMATCH`) come between
+# ENCODER_OR_KV and UNREGISTERED_SHAPE.
+NOT_PURE_DECODE = "not_pure_decode"
+MULTI_CHUNK = "multi_chunk"
+STRUCTURED_OUTPUT = "structured_output"
+MIN_TOKENS = "min_tokens"
+PROMPT_LOGPROBS = "prompt_logprobs"
+UNSUPPORTED_SAMPLING = "unsupported_sampling"
+ENCODER_OR_KV = "encoder_or_kv"
+UNREGISTERED_SHAPE = "unregistered_shape"
+# The other counter.
+DEVICE_STEPS = "device_steps"
+
+# A request whose slot disagrees with the runner on this many checks in a
+# row points at a slot bug, not at a rollback the write-back repairs. A
+# check where every mirror agrees ends the row; a step that never reaches
+# the check leaves it as it is.
+_MAX_MIRROR_MISMATCHES = 3
 
 
 def stock_uniform_key(num_rows_padded: int, vocab_size: int) -> tuple:
@@ -118,20 +154,44 @@ class StockChunk:
         )
 
 
+@dataclass
+class DeviceDecodeState:
+    """The `execute_model_state` a device step leaves for `sample_tokens`."""
+
+    scheduler_output: Any
+    shape: DecodeShape
+    variant: SamplerVariant
+    idx_mapping: torch.Tensor
+    idx_np: np.ndarray
+    logits: torch.Tensor
+    # int32 [num_reqs]: the input position of each request, before the step.
+    expected_positions: np.ndarray
+
+
 class DeviceDecodeController:
-    """Owns the decode slots: builds them at startup, follows the runner's
-    requests with them on every step (`on_states_updated`) and writes each
-    stock chunk's outcome back into them (`stock_chunk_plan`,
-    `after_stock_sampling`). All of it is a function of the scheduler output
-    and the host mirrors, so all TP ranks keep the same slots."""
+    """Owns the decode slots and decides, step by step, whether a step runs
+    on the device (`try_execute`, `sample_tokens`) or on the stock path,
+    whose chunks it then writes back (`stock_chunk_plan`,
+    `after_stock_sampling`). Every decision is a function of the scheduler
+    output and the host mirrors, so all TP ranks take the same path.
+
+    `enabled` allows device steps; the slots, once built, serve the stock
+    steps for the rest of the run even after a check turns device steps
+    off."""
 
     def __init__(self, runner: Any) -> None:
         self.runner = runner
+        self.enabled = False
         self.disabled_reason: str | None = None
         self.slots: DecodeSlots | None = None
         self.geometry: WalkGeometry | None = None
-        # Every program compiled at startup.
+        # Every program compiled at startup. A step whose programs are not in
+        # it runs on the stock path instead of compiling mid-serving.
         self.registry: set[tuple] = set()
+        self._counters: Counter[str] = Counter()
+        # Live requests asking for logits processing the TPU samplers skip.
+        self._logits_processor_reqs: set[str] = set()
+        self._mirror_mismatches: tuple[str | None, int] = (None, 0)
         self._ones = np.ones(0, dtype=np.int32)
 
     @classmethod
@@ -203,8 +263,17 @@ class DeviceDecodeController:
             )
         with r._precompile_timed("device_decode_slot_writes"):
             self.registry.update(self.slots.precompile(r))
+        if r.scheduler_config.async_scheduling:
+            # A stock step after a device step substitutes the head's tokens.
+            r._precompile_substitute_placeholder_token(torch.int32)
         if r.device.type == "tpu":
             self._dry_steps(shapes)
+        self.enabled = True
+        logger.info(
+            "Device decode is on: %d programs compiled for %d decode shapes.",
+            len(self.registry),
+            len(shapes),
+        )
 
     def on_states_updated(self, scheduler_output: Any) -> None:
         """Follows the runner's requests after `_update_states`, on every
@@ -212,8 +281,97 @@ class DeviceDecodeController:
         writes the slot rows that changed."""
         if self.slots is None:
             return
+        self._logits_processor_reqs.difference_update(scheduler_output.finished_req_ids)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            params = new_req.sampling_params
+            if params is not None and (params.min_p > 0.0 or params.logit_bias):
+                self._logits_processor_reqs.add(new_req.req_id)
+            else:
+                self._logits_processor_reqs.discard(new_req.req_id)
         self.slots.sync_from_runner(self.runner, scheduler_output)
         self.slots.apply_staged_writes(self.runner)
+
+    def try_execute(self, scheduler_output: Any, target_num_chunks: int) -> bool:
+        """Dispatches the step's forward and logits from the slots and leaves
+        a `DeviceDecodeState` for `sample_tokens`, or returns False to leave
+        the step to the stock path."""
+        if not self.enabled:
+            return False
+        plan = self._plan_step(scheduler_output, target_num_chunks)
+        if isinstance(plan, str):
+            self._count_stock_step(plan)
+            return False
+        shape, variant = plan
+        r = self.runner
+        assert self.slots is not None and self.geometry is not None
+        num_reqs = shape.num_reqs
+        idx_np = self.slots.idx_mapping_host(r.input_batch.req_ids[:num_reqs])
+        expected_positions = r.input_batch.num_computed_tokens_cpu[:num_reqs].astype(
+            np.int32
+        )
+        r._wait_input_staging_fence()
+        r.seq_lens_np[:num_reqs] = expected_positions + 1
+        r._check_attention_schedule(num_reqs, self._ones[:num_reqs], num_reqs)
+        idx_mapping = r._upload_unless_unchanged(
+            "device_decode_idx", torch.from_numpy(idx_np)
+        )
+        offsets = self._prefill_ckpt_offsets(num_reqs, shape.target_rows)
+        inputs = prepare_decode_inputs(
+            self.slots, idx_mapping, shape, self.geometry, offsets
+        )
+        attn_metadata = build_decode_attention_metadata(r, inputs, shape, offsets)
+        r._last_sequence_layout_plan = self._layout_plan(scheduler_output, shape)
+        r._collect_mamba_state_seed_copies(scheduler_output, 0, num_reqs)
+        r._flush_mamba_state_seed_copies()
+        r._record_input_staging_fence()
+        r._token_padding_update(shape.num_tokens_padded)
+        logits = self._forward(
+            attn_metadata, inputs, shape, r._stage_timing.stage("main_forward")
+        )
+        self.slots.note_device_step(idx_np[:num_reqs])
+        self._counters[DEVICE_STEPS] += 1
+        r.execute_model_state = DeviceDecodeState(
+            scheduler_output=scheduler_output,
+            shape=shape,
+            variant=variant,
+            idx_mapping=idx_mapping,
+            idx_np=idx_np,
+            logits=logits,
+            expected_positions=expected_positions,
+        )
+        return True
+
+    def sample_tokens(
+        self, state: DeviceDecodeState, grammar_output: Any
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        """The device step's head and single copy, then the bookkeeping
+        `TPUModelRunner.sample_tokens` does for a plain one-chunk step."""
+        assert grammar_output is None, "a structured-output step ran on the device"
+        r = self.runner
+        slots = self.slots
+        assert slots is not None
+        shape, variant = state.shape, state.variant
+        with r._stage_timing.stage("sample"):
+            tokens, packed = decode_head(
+                state.logits,
+                state.idx_mapping,
+                slots.num_computed,
+                slots.last_token,
+                slots.temperature,
+                slots.top_k,
+                slots.top_p,
+                slots.seed_lo,
+                slots.seed_hi,
+                variant=variant,
+                null_slot=slots.config.null_slot,
+            )
+        layout = PackedLayout(shape.num_reqs_padded, variant.num_logprobs)
+        with r._stage_timing.stage("sampled_token_d2h"):
+            copy_state = AsyncTPUCopyState.from_packed(
+                packed, layout, shape.num_reqs, state.expected_positions
+            )
+        r._update_num_xla_graphs("device_decode_step")
+        return self._finish_step(state.scheduler_output, copy_state, tokens)
 
     def stock_chunk_plan(
         self,
@@ -241,6 +399,113 @@ class DeviceDecodeController:
             self.slots.write_back_stock_chunk(
                 self.runner, chunk.plan, sampled, chunk.plan_dev
             )
+
+    def counters(self) -> dict[str, int]:
+        """Device steps and stock steps by reason. Only steps planned while
+        device steps are on count: once a check turns them off, later steps
+        are not counted."""
+        return dict(self._counters)
+
+    def _plan_step(
+        self, scheduler_output: Any, target_num_chunks: int
+    ) -> str | tuple[DecodeShape, SamplerVariant]:
+        """The first reason the step must run on the stock path, or its
+        device shape and sampler."""
+        r = self.runner
+        assert self.slots is not None
+        input_batch = r.input_batch
+        num_reqs = input_batch.num_reqs
+        req_ids = input_batch.req_ids[:num_reqs]
+        if scheduler_output.total_num_scheduled_tokens != num_reqs:
+            return NOT_PURE_DECODE
+        if target_num_chunks != 1:
+            return MULTI_CHUNK
+        if scheduler_output.has_structured_output_requests:
+            return STRUCTURED_OUTPUT
+        if r._min_tokens.any_in(input_batch.req_id_to_index):
+            return MIN_TOKENS
+        if r.num_prompt_logprobs and not r.num_prompt_logprobs.keys().isdisjoint(
+            req_ids
+        ):
+            return PROMPT_LOGPROBS
+        if self._unsupported_sampling(input_batch, req_ids):
+            return UNSUPPORTED_SAMPLING
+        # The stock sampler enforces thinking_token_budget; the head does not.
+        thinking_budget = r._thinking_budget
+        if thinking_budget and not thinking_budget.requests.keys().isdisjoint(req_ids):
+            return UNSUPPORTED_SAMPLING
+        if (
+            scheduler_output.scheduled_encoder_inputs
+            or scheduler_output.kv_connector_metadata is not None
+        ):
+            return ENCODER_OR_KV
+        mismatch = self.slots.mismatch_reason(r, num_reqs)
+        if mismatch is not None:
+            return mismatch
+        self._mirror_mismatches = (None, 0)
+        # A device step keeps every row's token and advances its slot, so a
+        # row with tokens left to compute after this one (whose token the
+        # stock path discards) runs on the stock path.
+        if not np.array_equal(
+            input_batch.num_tokens_no_spec[:num_reqs],
+            input_batch.num_computed_tokens_cpu[:num_reqs] + 1,
+        ):
+            return SLOT_NOT_READY
+        shape = DecodeShape.for_batch(r, num_reqs)
+        variant = SamplerVariant.for_batch(r, num_reqs)
+        if (
+            shape.program_key not in self.registry
+            or head_key(shape.num_reqs_padded, variant) not in self.registry
+        ):
+            return UNREGISTERED_SHAPE
+        return shape, variant
+
+    def _unsupported_sampling(self, input_batch: Any, req_ids: list[str]) -> bool:
+        """Sampling the head does not apply. It stays on the stock path, so it
+        behaves as it does with the flag off."""
+        max_num_logprobs = input_batch.max_num_logprobs
+        return bool(
+            not input_batch.no_penalties
+            or not input_batch.no_allowed_token_ids
+            or input_batch.bad_words_token_ids
+            or input_batch.logprob_token_ids
+            or (max_num_logprobs is not None and max_num_logprobs < 0)
+            or not self._logits_processor_reqs.isdisjoint(req_ids)
+        )
+
+    def _count_stock_step(self, reason: str) -> None:
+        self._counters[reason] += 1
+        if reason != MIRROR_MISMATCH:
+            return
+        assert self.slots is not None
+        req_id = self.slots.last_mismatch_req_id
+        last_req_id, count = self._mirror_mismatches
+        count = count + 1 if req_id == last_req_id else 1
+        self._mirror_mismatches = (req_id, count)
+        if count >= _MAX_MIRROR_MISMATCHES:
+            self._disable(
+                f"the slot of request {req_id!r} disagreed with the runner "
+                f"on {count} checks in a row"
+            )
+
+    def _disable(self, reason: str) -> None:
+        """Runs every later step on the stock path; with tensor parallelism,
+        stops the engine instead, so the ranks never part. Stock steps keep
+        the keyed noise and the slots, so no random stream changes source."""
+        if self.runner.parallel_config.tensor_parallel_size > 1:
+            raise DeviceDecodeInvariantError(
+                f"Device decode failed a check ({reason}). Every tensor "
+                "parallel rank must take the same decode path, so the engine "
+                "stops; unset VLLM_TPU_DEVICE_DECODE to serve on the stock "
+                "decode path."
+            )
+        logger.error(
+            "Device decode is off for the rest of the run (%s); unset "
+            "VLLM_TPU_DEVICE_DECODE to keep it off.",
+            reason,
+        )
+        self.enabled = False
+        self.disabled_reason = reason
 
     def _prefill_ckpt_offsets(
         self, num_reqs: int, target_rows: int
@@ -357,3 +622,85 @@ class DeviceDecodeController:
                 synchronize_tensors(uniform)
                 keys.append(stock_uniform_key(num_rows, r.vocab_size))
         return keys
+
+    def _finish_step(
+        self,
+        scheduler_output: Any,
+        copy_state: AsyncTPUCopyState,
+        next_tokens: torch.Tensor,
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        """`TPUModelRunner.sample_tokens` after sampling, for one plain
+        chunk."""
+        r = self.runner
+        input_batch = r.input_batch
+        num_reqs = input_batch.num_reqs
+        req_ids = list(input_batch.req_ids[:num_reqs])
+        # A device step keeps every token: `_plan_step` leaves a row whose
+        # token the stock rule discards to the stock path.
+        discard_sampled_tokens_req_indices: list[int] = []
+        request_seq_lens = []
+        for i, req_id in enumerate(req_ids):
+            req_state = r.requests[req_id]
+            seq_len = (
+                req_state.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens[req_id]
+            )
+            if seq_len < req_state.num_tokens:
+                raise DeviceDecodeInvariantError(
+                    f"Device decode sampled request {req_id!r} and advanced "
+                    "its slot, but the request still has tokens to compute, so "
+                    "the stock rule would discard that token. Unset "
+                    "VLLM_TPU_DEVICE_DECODE to serve on the stock decode path, "
+                    "and report this."
+                )
+            request_seq_lens.append((i, req_state, seq_len, req_id))
+        async_scheduling = r.scheduler_config.async_scheduling
+        if async_scheduling:
+            r._modify_prev_results()
+        r.maybe_wait_for_kv_save(None)
+        kv_connector_output = r._build_kv_connector_output(scheduler_output)
+        if async_scheduling:
+            req_id_to_index_copy = r._update_placeholder(
+                discard_sampled_tokens_req_indices,
+                request_seq_lens,
+                {i: i for i in range(num_reqs)},
+            )
+            r._pre_async_results = AsyncPreResults(
+                req_ids=req_ids,
+                next_tokens_tpu=next_tokens,
+                request_seq_lens=request_seq_lens,
+                discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                req_id_to_index_copy=req_id_to_index_copy,
+                copy_state=copy_state,
+            )
+        with r._stage_timing.host_stage("output_assembly"):
+            model_runner_output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=dict(input_batch.req_id_to_index),
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                kv_connector_output=kv_connector_output,
+            )
+            # pyrefly: ignore[missing-attribute]
+            model_runner_output.other_rank_decoding = r._dp_step_other_decode
+            async_output = AsyncTPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                copy_state=copy_state,
+                discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+            )
+        if async_scheduling:
+            return async_output
+        output = async_output.get_output()
+        for i, req_state, _seq_len, req_id in request_seq_lens:
+            valid_tokens = output.sampled_token_ids[i]
+            if not valid_tokens:
+                continue
+            req_idx = input_batch.req_id_to_index[req_id]
+            start_tok_idx = input_batch.num_tokens_no_spec[req_idx]
+            end_tok_idx = start_tok_idx + len(valid_tokens)
+            input_batch.token_ids_cpu[req_idx, start_tok_idx:end_tok_idx] = valid_tokens
+            input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
+            req_state.output_token_ids.extend(valid_tokens)
+        return output

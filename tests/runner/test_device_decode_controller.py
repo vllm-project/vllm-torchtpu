@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The device-decode controller: the flag, the configurations it refuses,
-the programs it compiles and warms up, and the stock steps' sampling noise
-and slot write-back."""
+the programs it compiles, the steps it leaves to the stock path, and the
+checks that turn it off."""
 
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,12 +26,14 @@ from device_decode_test_utils import (
     SimEngine,
     make_runner,
 )
+from vllm import SamplingParams
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.device_decode import controller as controller_mod
 from vllm_torchtpu.runner.device_decode.controller import (
     DeviceDecodeController,
+    DeviceDecodeState,
     stock_uniform,
     stock_uniform_key,
 )
@@ -38,11 +41,16 @@ from vllm_torchtpu.runner.device_decode.head import SamplerVariant, head_key
 from vllm_torchtpu.runner.device_decode.inputs import DecodeShape
 from vllm_torchtpu.runner.device_decode.rng import counter_uniform_impl
 from vllm_torchtpu.runner.device_decode.slots import (
+    MIRROR_MISMATCH,
     NO_SLOT,
+    SLOT_NOT_READY,
     block_write_key,
     scalar_write_key,
     write_back_key,
 )
+from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner_async_output import DeviceDecodeInvariantError
 
 
 def test_the_flag_creates_the_controller(monkeypatch):
@@ -113,7 +121,7 @@ def test_unsupported_configurations_stay_on_the_stock_path(monkeypatch, name):
     assert controller.static_gate_failures() == [name]
     controller.precompile_heads()
     controller.initialize_and_precompile()
-    assert controller.slots is None and name in controller.disabled_reason
+    assert not controller.enabled and name in controller.disabled_reason
     assert controller.registry == set()
 
 
@@ -159,6 +167,16 @@ def test_dry_steps_run_each_decode_shape_on_the_null_block(monkeypatch):
         torch.equal(a, b)
         for a, b in zip(before, (slots.num_computed, slots.last_token))
     )
+
+
+def test_async_scheduling_compiles_the_int32_token_substitution(monkeypatch):
+    calls = []
+    for async_scheduling in (False, True):
+        runner = make_runner(monkeypatch, async_scheduling=async_scheduling)
+        runner._precompile_substitute_placeholder_token = calls.append
+        monkeypatch.setenv(FLAG, "1")
+        DeviceDecodeController.maybe_create(runner).initialize_and_precompile()
+    assert calls == [torch.int32]
 
 
 def test_stock_noise_is_the_head_noise(monkeypatch):
@@ -235,6 +253,244 @@ def test_the_stock_noise_program_draws_the_host_bits_on_tpu(device):
     )
     mismatches = int((got.cpu().view(torch.int32) != want.view(torch.int32)).sum())
     assert mismatches == 0, f"{mismatches} of {want.numel()} uniforms differ"
+
+
+@pytest.mark.parametrize(
+    ("params", "reason"),
+    [
+        ({"min_p": 0.1}, "unsupported_sampling"),
+        ({"logit_bias": {3: 2.0}}, "unsupported_sampling"),
+        ({"presence_penalty": 0.5}, "unsupported_sampling"),
+        ({"repetition_penalty": 1.2}, "unsupported_sampling"),
+        ({"prompt_logprobs": 1}, "prompt_logprobs"),
+        ({"min_tokens": 3, "stop_token_ids": [5]}, "min_tokens"),
+    ],
+    ids=[
+        "min_p",
+        "logit_bias",
+        "penalty",
+        "repetition_penalty",
+        "prompt_logprobs",
+        "min_tokens",
+    ],
+)
+def test_sampling_the_head_cannot_apply_runs_on_the_stock_path(
+    monkeypatch, params, reason
+):
+    engine = SimEngine(monkeypatch, async_scheduling=False, device=True)
+    engine.add("a", 5, temperature=0.8)
+    engine.run(3)
+    assert engine.controller.counters()["device_steps"] == 2
+    engine.add("b", 4, temperature=0.8, max_tokens=4, **params)
+    engine.run(3)
+    counters = engine.controller.counters()
+    assert counters["device_steps"] == 2 and counters[reason] == 2, counters
+    # Without the request the batch decodes on the device again.
+    engine.run_until_done()
+    assert engine.controller.counters()["device_steps"] > 2
+
+
+def _track_thinking_budgets(runner, start: int, end: int) -> None:
+    """The runner's thinking_token_budget tracker, as __init__ builds it,
+    for a reasoning config with one-token start and end markers."""
+    runner._thinking_budget = ThinkingBudgetTracker(
+        SimpleNamespace(
+            enabled=True,
+            reasoning_start_token_ids=[start],
+            reasoning_end_token_ids=[end],
+            natural_reasoning_end_token_ids=[end],
+        ),
+        max_num_reqs=runner.max_num_reqs,
+        device=runner.device,
+        upload=lambda key, host: runner._upload_unless_unchanged(
+            key, host, non_blocking=False
+        ),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_a_thinking_budget_request_runs_on_the_stock_path(
+    monkeypatch, async_scheduling
+):
+    """The stock sampler enforces thinking_token_budget and the head does
+    not: while a request with a budget is in the batch, its steps run on the
+    stock path, so the budget ends its thinking as on the stock path. Once it
+    finishes, the batch decodes on the device again."""
+    start, end = 90, 91
+    device = SimEngine(monkeypatch, async_scheduling=async_scheduling, device=True)
+    stock = SimEngine(monkeypatch, async_scheduling=async_scheduling, device=True)
+    monkeypatch.setattr(stock.controller, "try_execute", lambda *_args: False)
+    for engine in (device, stock):
+        _track_thinking_budgets(engine.runner, start, end)
+        engine.add("p", 4, temperature=0.8)
+        # The prompt opens a thinking section; the budget ends it two tokens in.
+        params = SamplingParams(temperature=0.8, max_tokens=5, thinking_token_budget=2)
+        engine.sched.add("t", [3, 4, start], params)
+        engine.tokens["t"] = [[]]
+        engine.logprobs["t"] = [[]]
+        engine.run_until_done()
+    assert device.tokens == stock.tokens
+    assert device.tokens["t"][0][2] == end
+    counters = device.controller.counters()
+    assert counters["unsupported_sampling"] == 4, counters
+    assert counters["device_steps"] == 7, counters
+
+
+def test_a_step_without_compiled_programs_runs_on_the_stock_path(monkeypatch):
+    engine = SimEngine(monkeypatch, async_scheduling=False, device=True)
+    engine.add("a", 5, temperature=0.8)
+    engine.run(2)
+    registry = set(engine.controller.registry)
+    engine.controller.registry.clear()
+    engine.run(1)
+    assert engine.controller.counters()["unregistered_shape"] == 1
+    engine.controller.registry.update(registry)
+    engine.run(1)
+    assert engine.controller.counters()["device_steps"] == 2
+
+
+def test_a_caller_in_inference_mode_still_decodes_on_the_device(monkeypatch):
+    """Warmup ran outside inference mode and serving runs inside it: the
+    steps are not refused as unregistered shapes, and sample what the stock
+    path samples."""
+    device = SimEngine(monkeypatch, async_scheduling=True, device=True)
+    stock = SimEngine(monkeypatch, async_scheduling=True, device=True)
+    monkeypatch.setattr(stock.controller, "try_execute", lambda *_args: False)
+    with torch.inference_mode():
+        for engine in (device, stock):
+            engine.add("a", 5, temperature=0.8, logprobs=0)
+            engine.add("b", 3, temperature=0.0)
+            engine.run_until_done()
+    assert device.tokens == stock.tokens
+    assert device.logprobs == stock.logprobs
+    counters = device.controller.counters()
+    assert "unregistered_shape" not in counters, counters
+    assert counters["device_steps"] >= 8, counters
+
+
+def _decode_ready_step(monkeypatch):
+    """An engine whose request "a" decoded on the device once, and its next
+    pure-decode step after the state update."""
+    engine = SimEngine(monkeypatch, async_scheduling=False, device=True)
+    engine.add("a", 5, temperature=0.8)
+    engine.run(2)
+    assert engine.controller.counters()["device_steps"] == 1
+    return engine, engine.sched.schedule()
+
+
+def test_a_row_with_tokens_left_to_compute_runs_on_the_stock_path(monkeypatch):
+    """A device step keeps every row's token; a row whose token the stock
+    path would discard (it has tokens to compute after this one) sends the
+    step to the stock path before the forward."""
+    engine, output = _decode_ready_step(monkeypatch)
+    runner, controller = engine.runner, engine.controller
+    runner._update_states(output)
+    controller.on_states_updated(output)
+    assert not isinstance(controller._plan_step(output, 1), str)
+    runner.input_batch.num_tokens_no_spec[runner.input_batch.req_id_to_index["a"]] += 1
+    assert controller._plan_step(output, 1) == SLOT_NOT_READY
+
+
+def test_a_device_step_that_would_drop_its_token_stops_the_engine(monkeypatch):
+    """The step's slot has already advanced, so the step fails closed."""
+    engine, output = _decode_ready_step(monkeypatch)
+    runner = engine.runner
+    with torch.compiler.set_stance("force_eager"):
+        assert TPUModelRunner.execute_model(runner, output) is None
+        assert isinstance(runner.execute_model_state, DeviceDecodeState)
+        runner.requests["a"].output_token_ids.append(0)
+        with pytest.raises(DeviceDecodeInvariantError, match="tokens to compute"):
+            TPUModelRunner.sample_tokens(runner, None)
+
+
+def test_a_device_step_reads_no_stale_stock_host_inputs(monkeypatch):
+    """Device steps leave the stock path's host query_start_loc as the last
+    stock step wrote it. Nothing on a device step reads it (the default
+    layout plan reads only the token paddings), so overwriting it before
+    every step changes nothing."""
+    device = SimEngine(monkeypatch, async_scheduling=True, device=True)
+    stock = SimEngine(monkeypatch, async_scheduling=True, device=True)
+    monkeypatch.setattr(stock.controller, "try_execute", lambda *_args: False)
+    for engine in (device, stock):
+        engine.add("a", 5, temperature=0.8, max_tokens=14)
+        engine.add("b", 9, temperature=0.8)
+    for _ in range(3):
+        for engine in (device, stock):
+            engine.step()
+    for engine in (device, stock):
+        engine.add("c", 4, temperature=0.8, max_tokens=8)
+    for _ in range(60):
+        if not (device.sched.reqs or stock.sched.reqs):
+            break
+        device.runner.query_start_loc_np[:] = -7
+        device.step()
+        stock.step()
+    else:
+        raise AssertionError("requests left after 60 steps")
+    assert device.tokens == stock.tokens
+    assert device.controller.counters()["device_steps"] >= 8
+
+
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+def test_a_slot_that_keeps_disagreeing_turns_the_path_off(
+    monkeypatch, tensor_parallel_size
+):
+    engine = SimEngine(monkeypatch, async_scheduling=False, device=True)
+    engine.runner.parallel_config.tensor_parallel_size = tensor_parallel_size
+    engine.add("a", 5, temperature=0.8)
+    engine.run(2)
+    slots = engine.controller.slots
+
+    def drifted(runner, num_reqs):
+        slots.last_mismatch_req_id = "a"
+        return MIRROR_MISMATCH
+
+    monkeypatch.setattr(slots, "mismatch_reason", drifted)
+    engine.run(2)
+    assert engine.controller.enabled
+    if tensor_parallel_size > 1:
+        with pytest.raises(DeviceDecodeInvariantError, match="3 checks in a row"):
+            engine.step()
+        return
+    engine.run(1)
+    assert not engine.controller.enabled
+    assert "3 checks in a row" in engine.controller.disabled_reason
+    assert engine.controller.counters()[MIRROR_MISMATCH] == 3
+
+
+def test_a_check_where_the_mirrors_agree_ends_the_mismatch_run(monkeypatch):
+    """Three separate rollbacks of one request keep device steps on when a
+    check where every mirror agrees follows each of them, even with no
+    device step in between."""
+    engine = SimEngine(monkeypatch, async_scheduling=False, device=True)
+    engine.add("a", 5, temperature=0.8, max_tokens=20)
+    engine.run(2)
+    controller = engine.controller
+    slots = controller.slots
+    agrees = slots.mismatch_reason
+    checks = []
+
+    def every_other_check_drifts(runner, num_reqs):
+        checks.append(num_reqs)
+        if len(checks) % 2:
+            slots.last_mismatch_req_id = "a"
+            return MIRROR_MISMATCH
+        return agrees(runner, num_reqs)
+
+    monkeypatch.setattr(slots, "mismatch_reason", every_other_check_drifts)
+    # With no compiled programs, a step whose check passes still runs on the
+    # stock path, so no device step ends the run.
+    registry = set(controller.registry)
+    controller.registry.clear()
+    engine.run(6)
+    counters = controller.counters()
+    assert counters[MIRROR_MISMATCH] == 3, counters
+    assert counters["unregistered_shape"] == 3, counters
+    assert controller.enabled, controller.disabled_reason
+    monkeypatch.setattr(slots, "mismatch_reason", agrees)
+    controller.registry.update(registry)
+    engine.run(1)
+    assert controller.counters()["device_steps"] == 2
 
 
 def test_a_zero_token_step_frees_the_slots_it_preempts(monkeypatch):

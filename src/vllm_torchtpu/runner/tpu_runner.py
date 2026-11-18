@@ -176,6 +176,7 @@ from vllm_torchtpu.runner import repetition_penalty as repetition_penalty_tracke
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.device_decode.controller import (
     DeviceDecodeController,
+    DeviceDecodeState,
     StockChunk,
 )
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
@@ -1154,7 +1155,7 @@ class TPUModelRunner(GPUModelRunner):
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
         self.mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        self.execute_model_state: ExecuteModelState | None = None
+        self.execute_model_state: ExecuteModelState | DeviceDecodeState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
         # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
@@ -4473,6 +4474,11 @@ class TPUModelRunner(GPUModelRunner):
             )
             self.phase_based_profiler.step(batch_composition_stats)
 
+        if device_decode is not None and device_decode.try_execute(
+            scheduler_output, target_num_chunks
+        ):
+            return None
+
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
         # all scheduled tokens (req order); mm_embeds_flat is the concatenated
@@ -5688,6 +5694,9 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state = None
         rep_pen = self._repetition_penalty.begin_step(self.input_batch)
         device_decode = self._device_decode
+        if isinstance(state, DeviceDecodeState):
+            assert device_decode is not None
+            return device_decode.sample_tokens(state, grammar_output)
         if device_decode is not None and device_decode.slots is None:
             device_decode = None
         min_toks = self._min_tokens_batch_state()
@@ -7496,7 +7505,11 @@ class TPUModelRunner(GPUModelRunner):
                 out = self.gather_logprobs(self._dummy_logits(num_tokens), row_tokens)
                 synchronize_tensors(out.logprobs)
 
-    def _precompile_substitute_placeholder_token(self) -> None:
+    def _precompile_substitute_placeholder_token(
+        self, next_tokens_dtype: torch.dtype = torch.int64
+    ) -> None:
+        """`next_tokens_dtype` is the previous step's token dtype: int64 from
+        the stock samplers, int32 from a device-decode step."""
         if not self.scheduler_config.async_scheduling:
             return
         # next_tokens source shapes the runtime produces: [num_reqs, 1] buckets
@@ -7507,6 +7520,9 @@ class TPUModelRunner(GPUModelRunner):
         next_shapes: list[tuple[int, ...]] = [
             (nlen, 1) for nlen in self.num_reqs_paddings
         ]
+        if next_tokens_dtype == torch.int32:
+            # A device-decode step leaves 1D int32 [num_reqs] tokens (decode_head).
+            next_shapes = [(nlen,) for nlen in self.num_reqs_paddings]
         if self._is_async_drafter:
             assert self.speculative_config is not None
             next_shapes.append(
@@ -7527,7 +7543,9 @@ class TPUModelRunner(GPUModelRunner):
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
                 for shape in next_shapes:
-                    next_tokens = torch.zeros(shape, dtype=torch.int64).to(self.device)
+                    next_tokens = torch.zeros(shape, dtype=next_tokens_dtype).to(
+                        self.device
+                    )
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,

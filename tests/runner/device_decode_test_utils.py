@@ -282,9 +282,7 @@ def enable_device_decode(monkeypatch, runner):
     runner._device_decode = controller_mod.DeviceDecodeController.maybe_create(runner)
     runner._device_decode.precompile_heads()
     runner._device_decode.initialize_and_precompile()
-    assert runner._device_decode.slots is not None, (
-        runner._device_decode.disabled_reason
-    )
+    assert runner._device_decode.enabled, runner._device_decode.disabled_reason
     return runner._device_decode
 
 

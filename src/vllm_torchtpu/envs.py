@@ -1294,10 +1294,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
-    # Opt-in device decode (runner/device_decode/): keeps per-request decode
-    # state on the device, which every stock step writes back into. Random
-    # sampling then draws its noise from a (seed, position) keyed RNG, so
-    # random token streams differ from the default (greedy ones do not).
+    # Opt-in: run pure-decode steps from device-resident per-request state
+    # (runner/device_decode/); every other step stays on the stock path.
+    # Random sampling then draws its noise from a (seed, position) keyed RNG,
+    # so random token streams differ from the default (greedy ones do not).
     "VLLM_TPU_DEVICE_DECODE": env_bool("VLLM_TPU_DEVICE_DECODE"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
