@@ -750,8 +750,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     len(device_block_ids),
                     len(src_spec.keys),
                 )
-                if fp4 and any(
-                    b in self._fp4_busy or b in step_quant_blocks for b in device_block_ids
+                if fp4 and (
+                    any(b in self._fp4_busy or b in step_quant_blocks for b in device_block_ids)
+                    # Earlier waiters go first (FIFO), so a big load is not starved.
+                    or self._fp4_deferred_loads
+                    or not self._fp4_slots_fit(src_spec.keys)
                 ):
                     self._fp4_deferred_loads.append(
                         (job_id, src_spec.keys, device_block_ids, job.req_id, src_spec.pinned)
@@ -807,6 +810,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                         "ships (VLLM_TPU_OFFLOAD_TIER_CLASSES). Rerun."
                     )
 
+        if fp4:
+            # Loads parked for staging slots: slots freed since the last step (store
+            # saves that finished) take them before this step's new loads.
+            self._submit_fp4_deferred_loads()
         if self.__dict__.get("_fatal_drain", False):
             # Tier classes: a launched store whose source block this step
             # reallocates finishes before any load is submitted, so a load
@@ -882,15 +889,40 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             fp4_token=fp4_token,
         )
 
+    def _fp4_slots_fit(self, keys) -> bool:
+        """Whether a load's main-class keys find staging slots now. A load needing
+        more slots than exist is let through (it fails, as before) rather than
+        waiting forever."""
+        manager = self._raiden_manager
+        fc = manager.fp4_class
+        if fc is None:
+            return True
+        need = sum(1 for k in keys if manager.class_of(k) == fc)
+        if need == 0:
+            return True
+        free = manager.fp4_free_slots
+        total = getattr(getattr(manager, "_fp4", None), "total", None)
+        return need <= free or (total is not None and need > total)
+
     def _submit_fp4_deferred_loads(self) -> None:
-        """Submits the loads that waited for a quantize of one of their blocks."""
+        """Submits, in arrival order, the loads that waited for a quantize of one of
+        their blocks or for staging slots. Stops at the first load whose slots do not
+        fit yet (FIFO), so a big load is not starved by later small ones."""
         deferred = self.__dict__.get("_fp4_deferred_loads")
         if not deferred:
             return
         keep = []
+        blocked = False
         for job_id, keys, block_ids, req_id, pinned in deferred:
-            if any(b in self._fp4_busy for b in block_ids):
+            if blocked or any(b in self._fp4_busy for b in block_ids):
                 keep.append((job_id, keys, block_ids, req_id, pinned))
+                continue
+            if not self._fp4_slots_fit(keys):
+                blocked = True
+                keep.append((job_id, keys, block_ids, req_id, pinned))
+                self.telemetry["fp4_loads_slot_wait"] = (
+                    self.telemetry.get("fp4_loads_slot_wait", 0) + 1
+                )
                 continue
             self._raiden_manager.submit_load_job(job_id, keys, block_ids, req_id, pinned=pinned)
             self.telemetry["loads"] += 1
