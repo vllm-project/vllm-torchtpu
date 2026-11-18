@@ -57,8 +57,9 @@ def prepare_inputs(
     kv_packing = utils.get_dtype_packing(kv_dtype)
 
     aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head, q_packing)
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    num_sublanes = pltpu.get_tpu_info().num_sublanes
+    tpu_info = configs.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    num_sublanes = tpu_info.num_sublanes
     aligned_q_head_dim = utils.align_to(actual_q_head_dim, num_lanes)
 
     # Compute aligned kv head dimension, accounting for per-token scale if
@@ -133,7 +134,6 @@ def prepare_inputs(
         actual_kv_head_dim += num_scale_channels
 
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        num_lanes = pltpu.get_tpu_info().num_lanes
         align_tokens = max(num_lanes, page_size)
         padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
         new_kv_hbm = (
@@ -260,7 +260,7 @@ def calculate_block_sizes(
     models keep their tiles.
     """
 
-    tpu_info = configs._get_tpu_info()
+    tpu_info = configs.get_tpu_info()
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
@@ -905,7 +905,7 @@ def ragged_paged_attention(
     if mask_value is None:
         mask_value = cast(float, jnp.finfo(out_dtype).min)
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = cast(int, pltpu.get_tpu_info().vmem_capacity_bytes)
+        vmem_limit_bytes = cast(int, configs.get_tpu_info().vmem_capacity_bytes)
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache.shape[4]
@@ -1045,7 +1045,7 @@ def ragged_paged_attention(
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None
     if return_lse:
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = configs.get_tpu_info().num_lanes
         q_packing = utils.get_dtype_packing(queries.dtype)
         num_q_heads_per_kv_head = num_q_heads // num_kv_heads
         aligned_num_q_heads_per_kv_head = utils.align_to(
