@@ -18,8 +18,6 @@ match."""
 from . import device, ffn, layer, layout, vmem
 from .config import Config
 from .formats import (
-    PACKED_ROW_TILE,
-    WEIGHT_BLOCK_DEFAULT,
     WEIGHT_FORMAT_NAMES,
     WEIGHT_FORMS,
     WeightFormat,
@@ -44,10 +42,8 @@ __all__ = [
     "Config",
     "LANES",
     "MESH_AXIS",
-    "PACKED_ROW_TILE",
     "ROW_BLOCK",
     "SUPPORTED_GENERATIONS",
-    "WEIGHT_BLOCK_DEFAULT",
     "WEIGHT_FORMS",
     "WEIGHT_FORMAT_NAMES",
     "WeightFormat",
