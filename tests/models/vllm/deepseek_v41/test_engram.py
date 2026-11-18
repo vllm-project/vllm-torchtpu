@@ -193,10 +193,8 @@ def test_ngram_hash_state_ensure_cache_and_empty_inputs(
     """Verify NgramHashState.ensure_cache during compile/eager and empty inputs."""
     state = _make_ngram_state(monkeypatch)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    assert not state.ensure_cache()
-    state.use_slot_cache = False
-    assert state.ensure_cache()
-    state.use_slot_cache = True
+    with pytest.raises(AssertionError):
+        state.ensure_cache()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     assert state.ensure_cache() and state.block_size == 8
     assert state.ensure_cache()
@@ -241,15 +239,12 @@ def test_ngram_hash_state_ensure_cache_and_empty_inputs(
     assert state(
         empty_ids, empty_ids, qsl, empty_ids.bool(), z_lb, z_lbd, None, None
     ).shape == (0, 2, 6)
-    assert state.hash_on_host(
-        empty_ids, empty_ids, qsl, empty_ids.bool(), z_lb, z_lbd
-    ).shape == (0, 2, 6)
 
 
-def test_ngram_hash_state_slot_cache_and_host_parity(
+def test_ngram_hash_state_slot_cache_and_fallback_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify NgramHashState device slot-cache hashing and host hashing parity."""
+    """Verify NgramHashState slot-cache lookup and stateless pad fallback."""
     state = _make_ngram_state(monkeypatch)
     assert state.ensure_cache()
     ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
@@ -265,10 +260,10 @@ def test_ngram_hash_state_slot_cache_and_host_parity(
     assert h_slot.shape == (4, 2, 6) and h_slot.dtype == torch.int32
 
     state.use_slot_cache = False
-    h_noslot = state(ids, pos, qsl, dead, lb, lbd, None, None)
-    h_host1 = state.hash_on_host(ids, pos, qsl, dead, lb, lbd)
-    h_host2 = state.hash_on_host(ids, pos, qsl, dead, lb, lbd)
-    assert torch.equal(h_noslot, h_host1) and torch.equal(h_host1, h_host2)
+    h_noslot1 = state(ids, pos, qsl, dead, lb, lbd, None, None)
+    h_noslot2 = state(ids, pos, qsl, dead, lb, lbd, None, None)
+    assert torch.equal(h_noslot1, h_noslot2)
+    assert torch.equal(h_slot[:3], h_noslot1[:3])
 
 
 def test_parallel_engram_embedding_modes(
@@ -588,7 +583,9 @@ def test_tpu_engram_dequant_and_forward(
         None,
         None,
     )
-    h_host = state.hash_on_host(ids_cpu, pos_cpu, qsl_cpu, dead_cpu, lb_cpu, lbd_cpu)
+    state_cpu = _make_ngram_state(monkeypatch)
+    state_cpu.use_slot_cache = False
+    h_host = state_cpu(ids_cpu, pos_cpu, qsl_cpu, dead_cpu, lb_cpu, lbd_cpu, None, None)
     assert torch.equal(h_noslot_tpu.cpu(), h_host)
 
     # Verify POSIX /dev/shm storage + 1-D int32 H2D staging + Engram.forward().
