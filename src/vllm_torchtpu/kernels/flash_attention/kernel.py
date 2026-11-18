@@ -287,6 +287,7 @@ def _flash_attention(
 
 
 MIN_BLOCK_SIZE = 128
+_ROW_GROUP = 1024
 TRANS_B_DIM_NUMBERS = (((1,), (1,)), ((), ()))
 
 
@@ -370,24 +371,25 @@ def _flash_attention_kernel_single_batch(
 
     @pl.when(should_run)
     def run():
-        def _attend(start_k):
-            m_prev = m_scratch_ref[batch_idx]
-            l_prev = l_scratch_ref[batch_idx]
-            q = q_tile_ref[batch_idx]  # [block_q, head_dim]
+        def _attend_rows(start_k, block_k, row, rows):
+            rs = pl.dslice(row, rows)
+            m_prev = m_scratch_ref[(*batch_idx, rs)]
+            l_prev = l_scratch_ref[(*batch_idx, rs)]
+            q = q_tile_ref[(*batch_idx, rs)]  # [rows, head_dim]
             k = k_tile_ref[
                 (*batch_idx, pl.dslice(start_k, block_k), slice(None))
             ]  # [block_k, head_dim]
 
             s = jax.lax.dot_general(
                 q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            )  # [block_q, block_k]
+            )  # [rows, block_k]
 
             # Add attention bias if needed.
             # TODO(tanburn) Should the attention bias be added before or after
             # multiplication by sm_scale?
             if ab_tile_ref is not None:
                 ab = ab_tile_ref[
-                    (*batch_idx, pl.dslice(None), pl.dslice(start_k, block_k))
+                    (*batch_idx, rs, pl.dslice(start_k, block_k))
                 ].astype(jnp.float32)
                 s += ab
 
@@ -402,17 +404,17 @@ def _flash_attention_kernel_single_batch(
                         f"kv block size must be a multiple of {NUM_LANES}"
                     )
                 q_segment_ids = jnp.tile(
-                    q_segment_ids_tile_ref[batch_idx[0]], (1, repeats)
-                )  # [block_q, block_k].
+                    q_segment_ids_tile_ref[batch_idx[0], rs], (1, repeats)
+                )  # [rows, block_k].
                 kv_segment_ids = kv_segment_ids_tile_ref[
                     batch_idx[0], :1, pl.dslice(start_k, block_k)
                 ]  # [1, block_k].
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal:
-                mask_shape = (block_q, block_k)
+                mask_shape = (rows, block_k)
                 row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-                row_ids += q_seq_idx * block_q
+                row_ids += q_seq_idx * block_q + row
                 col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
                 col_ids += kv_seq_idx * block_k_major + start_k
                 causal_mask = col_ids <= row_ids
@@ -422,8 +424,8 @@ def _flash_attention_kernel_single_batch(
 
             s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
 
-            m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [block_q, 1].
-            m_next = jnp.maximum(m_prev, m_curr)  # Shape [block_q, 128].
+            m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [rows, 1].
+            m_next = jnp.maximum(m_prev, m_curr)  # Shape [rows, 128].
 
             block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
             if rem:
@@ -432,12 +434,12 @@ def _flash_attention_kernel_single_batch(
                 )
             p = jnp.exp(s - jnp.tile(m_next, (1, block_k_repeats)))
 
-            alpha = jnp.exp(m_prev - m_next)  # Shape [block_q, 128].
+            alpha = jnp.exp(m_prev - m_next)  # Shape [rows, 128].
 
             l_next = jnp.sum(p, axis=1)[:, None] + alpha * l_prev
 
-            l_scratch_ref[batch_idx] = l_next
-            m_scratch_ref[batch_idx] = m_next
+            l_scratch_ref[(*batch_idx, rs)] = l_next
+            m_scratch_ref[(*batch_idx, rs)] = m_next
 
             # acc stays unnormalized until the store: normalizing every step
             # costs a reciprocal and two more passes over acc per kv block,
@@ -446,9 +448,17 @@ def _flash_attention_kernel_single_batch(
             o_curr = jax.lax.dot(
                 p.astype(v.dtype), v, preferred_element_type=jnp.float32
             )
-            acc_scratch_ref[batch_idx] = (
-                acc_scratch_ref[batch_idx] * l_broadcast(alpha) + o_curr
+            acc_scratch_ref[(*batch_idx, rs)] = (
+                acc_scratch_ref[(*batch_idx, rs)] * l_broadcast(alpha) + o_curr
             )
+
+        def _attend(start_k, block_k=block_k):
+            # Row groups of at most _ROW_GROUP rows: the scheduler overlaps one
+            # group's softmax with the next group's matmuls, which a single
+            # [block_q, block_k] tile serializes (a full 32768 row of 2 heads
+            # of 72 at block_q 2048: 3.79 -> 3.36 ms).
+            for row in range(0, block_q, _ROW_GROUP):
+                _attend_rows(start_k, block_k, row, min(_ROW_GROUP, block_q - row))
 
         if kv_windows_ref is None:
             pl.loop(0, block_k_major, step=block_k, unroll=True)(_attend)
