@@ -20,6 +20,7 @@ from typing import Any
 
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental import pallas as pl
 
 from ...ops import I32
 from .context import MoEEmit
@@ -38,17 +39,25 @@ def dedup_vec(m: MoEEmit, NCP: int, MROW: int, nb_picks: int) -> tuple[Any, Any,
         def prim(s, n):
             e = base + s
             f = scr["hits"][lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)]
-            idx = jnp.minimum(n, nb_picks - 1)
-            scr["elist"][idx] = e
-            scr["wlist"][idx] = s
+
+            @pl.when(f > 0)
+            def _():
+                idx = jnp.minimum(n, nb_picks - 1)
+                scr["elist"][idx] = e
+                scr["wlist"][idx] = s
+
             return n + f
 
         n_hit = lax.fori_loop(0, ER, prim, jnp.int32(0), unroll=True)
 
         def cpl(j, n):
             v1 = scr["hits"][MROW, j]
-            idx = jnp.minimum(n, nb_picks - 1)
-            scr["cplist"][idx] = v1 - 1
+
+            @pl.when(v1 > 0)
+            def _():
+                idx = jnp.minimum(n, nb_picks - 1)
+                scr["cplist"][idx] = v1 - 1
+
             return n + jnp.where(v1 > 0, 1, 0).astype(I32)
 
         n_cp = lax.fori_loop(0, NCP, cpl, jnp.int32(0), unroll=True)
@@ -189,8 +198,8 @@ def po2c(m: MoEEmit, slot_ec: Any, n_tot: Any, n_hit: Any, n_cp: Any) -> Any:
         # accumulating, shifting on a 1-expert gap when either `r0` is above or
         # `r1` is below the mean load. Pass 2 refines against the completed
         # `rload` vector, so on a 1-expert gap it flips only when `cur` is
-        # strictly above AND `alt` is strictly below the mean (avoiding a no-op
-        # load swap `(k, k-1) -> (k-1, k)`).
+        # strictly above AND `alt` is strictly below the mean `n_tot / R`
+        # (avoiding flips when either rank is already at an integer mean).
         def po2c_pass1(j, _):
             e = scr["cplist"][j]
             r0 = lax.div(e, ER)
