@@ -14,7 +14,7 @@
 """Options of the API-server patches, from ``additional_config["tpu_frontend"]``.
 
     --additional-config '{"tpu_frontend": {"tokenize_prefix_cache": true,
-        "lazy_reasoning_count": true, "detok_prompt_tail": true}}'
+        "detok_prompt_tail": true}}'
 
 Each option installs one patch of vLLM's API-server path. Every option
 defaults to off, which is vLLM's own behaviour. The patches run on the host and
@@ -24,8 +24,8 @@ key (``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``).
 Each patch has an installer registered in ``patch_registry.PATCHES`` for the
 ``platform_activation`` stage, which ``check_and_update_config`` applies with
 the engine config in every process that builds it, including each API server.
-The reasoning-count and detokenizer patches only apply in the API server
-processes; the tokenization cache is only reached through vLLM's renderer.
+The detokenizer patch only applies in the API server processes; the
+tokenization cache is only reached through vLLM's renderer.
 """
 
 import importlib
@@ -47,11 +47,6 @@ class FrontendOptions:
     instead of the whole prompt when that suffix ends on a character boundary
     (byte-identical output; see ``frontend_fix.safe_prompt_tail``). Saves
     decoding the prompt twice on the first emitted token."""
-
-    lazy_reasoning_count: bool = False
-    """Skip recounting reasoning tokens on intermediate streaming chunks when
-    continuous usage stats are off, and return 0 when the reasoning parser's
-    state machine can never emit a reasoning chunk."""
 
     tokenize_prefix_cache: bool = False
     """Tokenize chat prompts incrementally: reuse the token ids of the longest
@@ -77,16 +72,6 @@ def install_tokenize_prefix_cache(vllm_config: Any = None) -> bool | None:
         "tokenize_prefix_cache",
         "vllm_torchtpu.frontend_tokcache",
         "maybe_install_tokenize_prefix_cache",
-    )
-
-
-def install_lazy_reasoning_count(vllm_config: Any = None) -> bool | None:
-    """patch_registry installer of ``lazy_reasoning_count``."""
-    return _install(
-        vllm_config,
-        "lazy_reasoning_count",
-        "vllm_torchtpu.frontend_fix",
-        "maybe_install_lazy_reasoning_count",
     )
 
 

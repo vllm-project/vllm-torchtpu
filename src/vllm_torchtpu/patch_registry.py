@@ -161,11 +161,6 @@ PATCHES = (
         vllm_config=True,
     ),
     Patch(
-        "vllm_torchtpu.frontend_options:install_lazy_reasoning_count",
-        ("platform_activation",),
-        vllm_config=True,
-    ),
-    Patch(
         "vllm_torchtpu.frontend_options:install_detok_prompt_tail",
         ("platform_activation",),
         vllm_config=True,

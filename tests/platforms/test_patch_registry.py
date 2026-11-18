@@ -255,7 +255,6 @@ def test_manifest_preserves_lifecycle_dependencies():
     # The API-server patches only install where the engine config is built.
     api_server = [
         "install_tokenize_prefix_cache",
-        "install_lazy_reasoning_count",
         "install_detok_prompt_tail",
     ]
     assert stages["platform_activation"] == (

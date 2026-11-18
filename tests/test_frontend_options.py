@@ -24,7 +24,6 @@ from vllm_torchtpu.frontend_options import FrontendOptions
 
 _INSTALLERS = {
     "tokenize_prefix_cache": (frontend_tokcache, "maybe_install_tokenize_prefix_cache"),
-    "lazy_reasoning_count": (frontend_fix, "maybe_install_lazy_reasoning_count"),
     "detok_prompt_tail": (frontend_fix, "maybe_install_detok_prompt_tail"),
 }
 # The patch_registry callback of each option.
@@ -61,8 +60,8 @@ def test_defaults_are_all_off():
 
 
 def test_get_reads_the_section():
-    options = frontend_options.get(_config({"lazy_reasoning_count": True}))
-    assert options == FrontendOptions(lazy_reasoning_count=True)
+    options = frontend_options.get(_config({"detok_prompt_tail": True}))
+    assert options == FrontendOptions(detok_prompt_tail=True)
     assert frontend_options.get(SimpleNamespace(additional_config=None)) == (
         FrontendOptions()
     )
