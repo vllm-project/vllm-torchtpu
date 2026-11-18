@@ -25,30 +25,43 @@ from .specs import SUPPORTED_ONCHIP_FAMILIES, WorkloadSpec
 from .support import CORE_LIMITS
 
 
+def _string_list(raw: object) -> list[str]:
+    """Return a JSON list or tuple as a list of strings, or an empty list."""
+    match raw:
+        case list() | tuple():
+            return [str(item) for item in raw]
+        case _:
+            return []
+
+
 def build_engine_seed_defaults() -> dict[str, object]:
     """Return Python-authoritative CORE_LIMITS and WorkloadSpec defaults for JS."""
     declared: dict[str, list[dict[str, object]]] = {}
     for model_name, dep in DEPLOYMENT_PRESETS.items():
         entries: list[dict[str, object]] = []
-        for layout in (dep.decode, dep.prefill, dep.saturation):
-            mk = layout.megakernel if layout is not None else None
-            if mk and str(mk.get("source", "")):
-                scopes_raw = mk.get("scopes")
-                scopes = (
-                    [str(s) for s in scopes_raw] if type(scopes_raw) is list else []
-                )
-                phases_raw = mk.get("phases")
+        all_layouts = (
+            dep.decode,
+            dep.prefill,
+            dep.saturation,
+            *dep.megakernel_layouts,
+        )
+        for layout in all_layouts:
+            if layout is None or layout.megakernel is None:
+                continue
+            mk = layout.megakernel
+            if str(mk.get("source", "")).strip():
                 entries.append(
                     {
-                        "scopes": scopes,
+                        "tp": layout.tp,
+                        "ep": layout.ep,
+                        "dp": layout.dp,
+                        "pp": layout.pp,
+                        "dcp": layout.dcp,
+                        "scopes": _string_list(mk.get("scopes")),
                         "max_rows": int(str(mk.get("max_rows", 0))),
                         "max_total_rows": int(str(mk.get("max_total_rows", 0))),
                         "ranks": int(str(mk.get("ranks", 0))),
-                        "phases": (
-                            [str(phase) for phase in phases_raw]
-                            if type(phases_raw) is list
-                            else []
-                        ),
+                        "phases": _string_list(mk.get("phases")),
                         "attention_dp_in_call": bool(
                             mk.get("attention_dp_in_call", False)
                         ),

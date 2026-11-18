@@ -896,7 +896,9 @@ def test_engine_parity_declared_preset_name_variant(
         "ranks": dep.decode.tp,
     }
     declared = dataclasses.replace(
-        dep, decode=dataclasses.replace(dep.decode, megakernel=declaration)
+        dep,
+        decode=dataclasses.replace(dep.decode, megakernel=declaration),
+        megakernel_layouts=(),
     )
     presets = {"Qwen3_5-397B": declared}
     monkeypatch.setattr(support, "DEPLOYMENT_PRESETS", presets)
@@ -1089,3 +1091,334 @@ def test_js_engine_physical_validation_vmem_overflow_and_tps_parity(
             assert got["scopes"]["whole_step"]["step_bound_us"] == pytest.approx(
                 report.scopes[-1].step_bound_us, abs=0.015
             )
+
+
+def test_engine_parity_measured_collective(tmp_path: Path) -> None:
+    """Verify parity between Python and JS engines for calibrated collective calls."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+
+    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
+    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    chip_dict = dataclasses.asdict(chip_spec)
+    model_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    prof_dict = dataclasses.asdict(model_profile)
+
+    workload = advisor.WorkloadSpec(phase="decode", batch=16, context=4096, tp=8, ep=1)
+
+    measurement_cases = [
+        None,
+        advisor.MeasurementsData(
+            source_desc="xla_coll_trace",
+            source_kind="trace",
+            collective_calls=(
+                advisor.CollectiveCall(
+                    path="xla",
+                    op="all-reduce",
+                    group_size=8,
+                    latency_us=15.0,
+                    mean_latency_us=18.0,
+                    n=10,
+                ),
+            ),
+        ),
+        advisor.MeasurementsData(
+            source_desc="in_kernel_coll_trace",
+            source_kind="trace",
+            collective_calls=(
+                advisor.CollectiveCall(
+                    path="in_kernel",
+                    op="all-reduce",
+                    group_size=8,
+                    latency_us=9.0,
+                    mean_latency_us=11.0,
+                    n=10,
+                ),
+            ),
+        ),
+        advisor.MeasurementsData(
+            source_desc="mismatched_coll_trace",
+            source_kind="trace",
+            collective_calls=(
+                advisor.CollectiveCall(
+                    path="xla",
+                    op="all-reduce",
+                    group_size=4,
+                    latency_us=25.0,
+                    n=10,
+                ),
+            ),
+        ),
+    ]
+
+    py_reports = [
+        advisor.advise(model_profile, workload, chip_spec, measurements=meas_case)
+        for meas_case in measurement_cases
+    ]
+
+    js_items = []
+    for meas_case in measurement_cases:
+        wl_dict = dataclasses.asdict(workload)
+        if meas_case is not None:
+            wl_dict["collective_calls"] = [
+                dataclasses.asdict(c) for c in meas_case.collective_calls
+            ]
+        js_items.append(
+            {
+                "params": {
+                    "only_validate": False,
+                    "profile": prof_dict,
+                    "chip": chip_dict,
+                    "wl": wl_dict,
+                }
+            }
+        )
+
+    in_json = tmp_path / "measured_coll_parity_in.json"
+    out_json = tmp_path / "measured_coll_parity_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": {
+                    "chip_spec": chip_dict,
+                    **workbench_engine.build_engine_seed_defaults(),
+                },
+                "items": js_items,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
+    records = json.loads(out_json.read_text(encoding="utf-8"))
+
+    tolerance_abs = 0.05
+    for py_rep, rec in zip(py_reports, records, strict=True):
+        js_scopes = rec["eval"]["scopes"]
+        for scope_name in ("per_op", "whole_step"):
+            py_scope = next(s for s in py_rep.scopes if s.scope == scope_name)
+            js_scope = js_scopes[scope_name]
+            assert js_scope["comm_us"] == pytest.approx(
+                py_scope.comm_us, abs=tolerance_abs
+            )
+            assert js_scope["step_achievable_us"] == pytest.approx(
+                py_scope.step_achievable_us, abs=tolerance_abs
+            )
+
+    num_all_reduce_calls = model_profile.ar_slots_per_layer * model_profile.num_layers
+
+    baseline_per_op = next(s for s in py_reports[0].scopes if s.scope == "per_op")
+    baseline_whole_step = next(
+        s for s in py_reports[0].scopes if s.scope == "whole_step"
+    )
+
+    xla_mean_rate_us = 18.0
+    assert next(
+        s for s in py_reports[1].scopes if s.scope == "per_op"
+    ).comm_us == pytest.approx(
+        num_all_reduce_calls * xla_mean_rate_us, abs=tolerance_abs
+    )
+    assert (
+        next(s for s in py_reports[1].scopes if s.scope == "whole_step").comm_us
+        == baseline_whole_step.comm_us
+    )
+
+    in_kernel_mean_rate_us = 11.0
+    assert next(
+        s for s in py_reports[2].scopes if s.scope == "whole_step"
+    ).comm_us == pytest.approx(
+        num_all_reduce_calls * in_kernel_mean_rate_us, abs=tolerance_abs
+    )
+    assert (
+        next(s for s in py_reports[2].scopes if s.scope == "per_op").comm_us
+        == baseline_per_op.comm_us
+    )
+
+    assert (
+        next(s for s in py_reports[3].scopes if s.scope == "per_op").comm_us
+        == baseline_per_op.comm_us
+    )
+    assert (
+        next(s for s in py_reports[3].scopes if s.scope == "whole_step").comm_us
+        == baseline_whole_step.comm_us
+    )
+
+
+def test_engine_parity_layout_declaration(tmp_path: Path) -> None:
+    """Verify JS and Python parity on layout declarations across serving meshes."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+
+    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
+    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    chip_dict = dataclasses.asdict(chip_spec)
+    model_name = "qwen3.5-397b"
+    prof_dict = dataclasses.asdict(models.resolve_model_profile(model_name))
+
+    workloads = [
+        advisor.WorkloadSpec(phase="decode", batch=16, context=4096, tp=8, ep=8, dcp=1),
+        advisor.WorkloadSpec(phase="decode", batch=16, context=4096, tp=8, ep=8, dcp=4),
+        advisor.WorkloadSpec(phase="decode", batch=16, context=4096, tp=8, ep=1, dcp=1),
+    ]
+    batch_items: list[_BatchScenarioItem] = [
+        {"only_validate": False, "model_name": model_name, "wl": wl} for wl in workloads
+    ]
+    expected = [_python_reference_eval(model_name, wl, chip_spec) for wl in workloads]
+
+    in_json = tmp_path / "layout_parity_in.json"
+    out_json = tmp_path / "layout_parity_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": {
+                    "chip_spec": chip_dict,
+                    **workbench_engine.build_engine_seed_defaults(),
+                },
+                "items": [
+                    {
+                        "params": {
+                            "only_validate": False,
+                            "profile": prof_dict,
+                            "chip": chip_dict,
+                            "wl": dataclasses.asdict(wl),
+                        }
+                    }
+                    for wl in workloads
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
+    records = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(records) == len(expected)
+
+    expected_coloc_rows = 64
+    expected_dcp4_rows = 112
+
+    # Layout 1 (TP8 x EP8)
+    exp_sc_1 = expected[0]["scopes"]["whole_step"]
+    rec_sc_1 = records[0]["eval"]["scopes"]["whole_step"]
+    assert exp_sc_1["support"] == "declared"
+    assert exp_sc_1["t_vmem_max"] == expected_coloc_rows
+    assert rec_sc_1["support"] == "declared"
+    assert rec_sc_1["t_vmem_max"] == expected_coloc_rows
+
+    # Layout 2 (TP8 x EP8 x DCP4)
+    exp_sc_2 = expected[1]["scopes"]["whole_step"]
+    rec_sc_2 = records[1]["eval"]["scopes"]["whole_step"]
+    assert exp_sc_2["support"] == "declared"
+    assert exp_sc_2["t_vmem_max"] == expected_dcp4_rows
+    assert rec_sc_2["support"] == "declared"
+    assert rec_sc_2["t_vmem_max"] == expected_dcp4_rows
+
+    # Layout 3 (TP8)
+    exp_sc_3 = expected[2]["scopes"]["whole_step"]
+    rec_sc_3 = records[2]["eval"]["scopes"]["whole_step"]
+    assert exp_sc_3["support"] == "hypothetical"
+    assert "layout_not_declared" in exp_sc_3["blockers"]
+    assert "rank_count_outside_core_grid" not in exp_sc_3["blockers"]
+    assert rec_sc_3["support"] == "hypothetical"
+    assert "layout_not_declared" in rec_sc_3["blockers"]
+    assert "rank_count_outside_core_grid" not in rec_sc_3["blockers"]
+
+    _verify_parity_records(batch_items, expected, records)
+
+
+def test_engine_parity_row_limit_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify row limit gating parity between Python advisor and JS engine."""
+    monkeypatch.setattr(support, "DEPLOYMENT_PRESETS", {})
+    monkeypatch.setattr(workbench_engine, "DEPLOYMENT_PRESETS", {})
+
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+
+    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
+    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    chip_dict = dataclasses.asdict(chip_spec)
+    model_name = "qwen3.5-397b"
+    prof_dict = dataclasses.asdict(models.resolve_model_profile(model_name))
+
+    workloads = [
+        advisor.WorkloadSpec(phase="decode", batch=32, tp=8, ep=8, context=4096),
+        advisor.WorkloadSpec(phase="decode", batch=33, tp=8, ep=8, context=4096),
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=33,
+            tp=8,
+            ep=8,
+            context=4096,
+            max_rows_per_call=64,
+        ),
+    ]
+    batch_items: list[_BatchScenarioItem] = [
+        {"only_validate": False, "model_name": model_name, "wl": wl} for wl in workloads
+    ]
+    expected = [_python_reference_eval(model_name, wl, chip_spec) for wl in workloads]
+
+    in_json = tmp_path / "row_limit_parity_in.json"
+    out_json = tmp_path / "row_limit_parity_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": {
+                    "chip_spec": chip_dict,
+                    **workbench_engine.build_engine_seed_defaults(),
+                },
+                "items": [
+                    {
+                        "params": {
+                            "only_validate": False,
+                            "profile": prof_dict,
+                            "chip": chip_dict,
+                            "wl": dataclasses.asdict(wl),
+                        }
+                    }
+                    for wl in workloads
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
+    records = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(records) == len(expected)
+
+    # batch=32: within core limits, no row limit blocker
+    exp_ws_32 = expected[0]["scopes"]["whole_step"]
+    rec_ws_32 = records[0]["eval"]["scopes"]["whole_step"]
+    assert exp_ws_32["support"] == "within_core_limits"
+    assert "row_limit_not_stated" not in exp_ws_32["blockers"]
+    assert rec_ws_32["support"] == "within_core_limits"
+    assert "row_limit_not_stated" not in rec_ws_32["blockers"]
+
+    # batch=33: exceeds default bucket, requires stated limit
+    exp_ws_33 = expected[1]["scopes"]["whole_step"]
+    rec_ws_33 = records[1]["eval"]["scopes"]["whole_step"]
+    assert exp_ws_33["support"] == "hypothetical"
+    assert "row_limit_not_stated" in exp_ws_33["blockers"]
+    assert rec_ws_33["support"] == "hypothetical"
+    assert "row_limit_not_stated" in rec_ws_33["blockers"]
+
+    # batch=33 with max_rows_per_call=64: within limits, blocker cleared
+    exp_ws_64 = expected[2]["scopes"]["whole_step"]
+    rec_ws_64 = records[2]["eval"]["scopes"]["whole_step"]
+    assert exp_ws_64["support"] == "within_core_limits"
+    assert "row_limit_not_stated" not in exp_ws_64["blockers"]
+    assert rec_ws_64["support"] == "within_core_limits"
+    assert "row_limit_not_stated" not in rec_ws_64["blockers"]
+
+    _verify_parity_records(batch_items, expected, records)
