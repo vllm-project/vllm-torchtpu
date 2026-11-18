@@ -656,8 +656,10 @@ def _size_copy_slots(manager, prefix: str) -> None:
         if manager._expert_map is not None
         else torch.device("cpu")
     )
-    expert_map = torch.full((placement.experts,), -1, dtype=torch.int32)
-    expert_map[list(held)] = torch.arange(len(held), dtype=torch.int32)
+    # Built on the host, as `apply` builds its map: vLLM computes the maps
+    # under the model's device, where the scatter would run on the chip.
+    expert_map = torch.full((placement.experts,), -1, dtype=torch.int32, device="cpu")
+    expert_map[list(held)] = torch.arange(len(held), dtype=torch.int32, device="cpu")
     manager._expert_map = expert_map.to(device)
     manager._local_num_experts = len(held) + manager.num_fused_shared_experts
 
