@@ -229,15 +229,16 @@ def test_prefix_aware_scheduler_itself_does_not_sort(monkeypatch):
 
 
 class _Estimator:
-    def __init__(self, answer=88_000, fail=False):
+    def __init__(self, answer=88_000, fail=False, error=RuntimeError):
         self.answer = answer
         self.fail = fail
+        self.error = error
         self.calls = []
 
     def estimate_external_hit_tokens(self, request, num_local_tokens):
         self.calls.append((request.request_id, num_local_tokens))
         if self.fail:
-            raise RuntimeError("store unreachable")
+            raise self.error(f"store unreachable for {request.request_id}")
         return self.answer
 
 
@@ -283,9 +284,23 @@ def test_the_estimate_is_asked_past_the_local_hit():
 def test_a_failing_estimate_is_logged_and_counts_as_zero():
     from vllm_torchtpu.core import prefix_aware_scheduler
 
-    s = _warmth_scheduler(_Estimator(fail=True))
+    estimator = _Estimator(fail=True)
+    s = _warmth_scheduler(estimator)
+    log = prefix_aware_scheduler.logger
     # The real warning_once runs; only the logger's output is captured.
-    with patch.object(prefix_aware_scheduler.logger, "warning") as warn:
-        assert s._external_warmth(_req("r-fails", 100_000, time.time()), 0) == 0
-    warn.assert_called_once()
-    assert "r-fails" in warn.call_args.args
+    with (
+        patch.object(log, "warning") as warn,
+        patch.object(log, "debug") as debug,
+    ):
+        for rid in ("r-fails", "r-fails-too"):
+            assert s._external_warmth(_req(rid, 100_000, time.time()), 0) == 0
+        # Two failures of one kind, with different requests and messages:
+        # one warning, naming the exception type; each failure in the debug
+        # log with its request.
+        warn.assert_called_once()
+        assert "RuntimeError" in warn.call_args.args
+        assert [c.args[1] for c in debug.call_args_list] == ["r-fails", "r-fails-too"]
+        # A different exception type is a different failure: warned once more.
+        estimator.error = ValueError
+        assert s._external_warmth(_req("r-other", 100_000, time.time()), 0) == 0
+        assert warn.call_count == 2 and "ValueError" in warn.call_args.args
