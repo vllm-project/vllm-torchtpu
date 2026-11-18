@@ -1149,8 +1149,7 @@ def _lockstep_draft_trace(
 
     `step0_gather` installs the MTP step-0 post-attention gather on the draft,
     with the separate loop-step program it gets when the fused loop is off,
-    and stubs `_forward_draft` on the class, since an instance stub turns the
-    gather off."""
+    and stubs `_forward_draft` on the class."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)

@@ -260,6 +260,11 @@ class Eagle3Proposer:
         # Zero [kernel_num_reqs] rejected counts per (knr, device), for the
         # post-step-0 bridge on an all-accept sync step.
         self._zero_rej_dev_cache: dict[tuple, torch.Tensor] = {}
+        # Base copies of RPA's request_distribution for draft step 0, keyed on
+        # the id of the runner's packed slice (_with_base_request_distribution).
+        self._base_request_distribution_cache: dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -876,7 +881,7 @@ class Eagle3Proposer:
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = int(positions.shape[-1])
-        max_p = getattr(self, "_mtp_fused_loop_max_p", 0)
+        max_p = self._mtp_fused_loop_max_p
         if max_p > 0 and hidden_states.shape[0] < max_p:
             hidden_states = _maybe_pad_dim0(hidden_states, max_p)
         # Every loop step runs at this one row count, so one decision covers
@@ -1469,8 +1474,7 @@ class Eagle3Proposer:
         if step0_post_attn_gathered:
             hidden_carry = (
                 hidden
-                if hidden.shape[0] == indices.shape[0]
-                or getattr(self, "_mtp_fused_loop_max_p", 0) > 0
+                if hidden.shape[0] == indices.shape[0] or self._mtp_fused_loop_max_p > 0
                 else hidden[: indices.shape[0]].clone()
             )
         else:
@@ -1741,17 +1745,8 @@ class Eagle3Proposer:
             and not runner._dp_lockstep_enabled()
         )
         # The post-step-0 bridge (_draft_post_step0_fused) replaces the
-        # separate carry / position / seq_lens helpers, so it is skipped when
-        # a test double stands in for one of them.
-        inst_dict = getattr(self, "__dict__", {})
-        can_use_post_step0_fused = (
-            use_fused_loop
-            and not self._share_mtp_indices
-            and "_draft_gather_carries" not in inst_dict
-            and "_draft_propose_token" not in inst_dict
-            and "_draft_add_delta" not in inst_dict
-            and "_draft_loop_seq_lens" not in inst_dict
-        )
+        # separate carry / position / seq_lens helpers ahead of the fused loop.
+        can_use_post_step0_fused = use_fused_loop and not self._share_mtp_indices
         for ci, chunk in enumerate(chunks):
             if uses_aux_hidden_state:
                 with set_model_tag("eagle_head"):
@@ -1795,7 +1790,7 @@ class Eagle3Proposer:
                 and can_use_post_step0_fused
                 and is_all_layout
                 and use_step0_gather
-                and getattr(self, "_mtp_fused_loop_max_p", 0) > 0
+                and self._mtp_fused_loop_max_p > 0
                 and getattr(chunk.input_ids, "device", None) is not None
                 and chunk.input_ids.device.type == "tpu"
                 and getattr(chunk.attn_ctx, "seq_lens", None) is not None
@@ -1886,7 +1881,7 @@ class Eagle3Proposer:
                 if (
                     cached_prep_step1 is not None
                     and step0_gather_indices is not None
-                    and getattr(self, "_mtp_fused_loop_max_p", 0) > 0
+                    and self._mtp_fused_loop_max_p > 0
                 ):
                     pos_step1, seq_lens_step1 = cached_prep_step1
                     hidden_carry = hidden
@@ -2580,7 +2575,7 @@ class Eagle3Proposer:
         forward on the megakernel the draft is its first consumer. Draft
         layers only read the RPA half, so they get a cached copy instead.
         """
-        cache = self.__dict__.setdefault("_base_request_distribution_cache", {})
+        cache = self._base_request_distribution_cache
         replaced: dict[int, AttentionMetadata] = {}
         result = {}
         for name, md in md_dict.items():
@@ -2931,7 +2926,6 @@ class Eagle3Proposer:
             self.speculative_config.method != "mtp"
             or self._share_mtp_indices
             or self._draft_kv_shared
-            or "_forward_draft" in getattr(self, "__dict__", {})
             or self._dp_lockstep_sharded()
         ):
             return False
@@ -3330,7 +3324,7 @@ class Eagle3Proposer:
                     for knr in sorted(knr_buckets):
                         qsl = torch.ones(knr + 1, dtype=torch.int32).to(runner.device)
                         if step0_pad_warm > 0:
-                            if getattr(self, "_mtp_fused_loop_max_p", 0) > 0:
+                            if self._mtp_fused_loop_max_p > 0:
                                 base_sl = torch.zeros(knr, dtype=torch.int32).to(
                                     runner.device
                                 )
