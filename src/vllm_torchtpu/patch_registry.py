@@ -143,6 +143,8 @@ PATCHES = (
     # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
     # before any RotaryEmbedding is constructed at model load.
     Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
+    # Multimodal input loading (the API server decodes media).
+    Patch("vllm_torchtpu.video_decode_patch:patch_opencv_one_pass_decode", _ACTIVE),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
