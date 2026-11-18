@@ -17,11 +17,12 @@ A tiny two-layer geometry (one KV head per rank, as the checkpoint at TP=8)
 runs one paged decode step with RoPE from a per-row table at an M-RoPE
 position 7 below the KV index, and the ungated attention, bf16 KV pages and
 dense FFN through the whole model reference, at the page sizes vLLM picks:
-128 tokens, and 512 when its SMEM page-table bound raises the block size. The
-in-kernel KV write (`fused_pool_io`) matches the scatter program bitwise, and
-the whole-step kernel (`TokenIO`: runner tensors in, greedy tokens out) leaves
-the same pages and returns the greedy tokens of the hidden step's output, ties
-going to the lowest id.
+128 tokens, and 512 when its SMEM page-table bound raises the block size; and
+one verify step of 8 tokens for each of two sequences, the second crossing a
+page. The in-kernel KV write (`fused_pool_io`) matches the scatter program
+bitwise, and the whole-step kernel (`TokenIO`: runner tensors in, greedy
+tokens out) leaves the same pages and returns the greedy tokens of the hidden
+step's output for every row, ties going to the lowest id.
 """
 
 from __future__ import annotations
@@ -70,17 +71,23 @@ def _check_close(got: np.ndarray, ref: np.ndarray, atol: float, rtol: float) -> 
 
 
 @pytest.mark.parametrize(
-    ("page_size", "kv_blk"),
-    [(128, 256), (512, 1024), (512, 256)],
-    ids=["p128_blk2pages", "p512_blk2pages", "p512_blk_rounds_up_to_1page"],
+    ("page_size", "kv_blk", "T"),
+    [(128, 256, 1), (512, 1024, 1), (512, 256, 1), (128, 256, 8), (512, 1024, 8)],
+    ids=[
+        "p128_blk2pages",
+        "p512_blk2pages",
+        "p512_blk_rounds_up_to_1page",
+        "p128_verify8",
+        "p512_verify8",
+    ],
 )
-def test_kernel_matches_model_reference(page_size: int, kv_blk: int) -> None:
+def test_kernel_matches_model_reference(page_size: int, kv_blk: int, T: int) -> None:
     mdef = model.register()
     g = tiny_geom(R=R)
     ex = ExecSpec(
         R=R,
-        B=2,
-        T=1,
+        B=2 * T,
+        T=T,
         ctx=4 * page_size,
         tiles=tiny_tiles(kv_blk=kv_blk),
         # 64 MiB pools: XLA stages a pool small enough for VMEM in a copy, which
@@ -96,9 +103,12 @@ def test_kernel_matches_model_reference(page_size: int, kv_blk: int) -> None:
     _, hid, w_l, st_l = random_logical_inputs(
         jax.random.PRNGKey(0), g, ex, model_def=mdef
     )
-    # The new tokens land past the first page: slot 7 of page 1, and the last
-    # page's slot `page_size - 5`.
-    pos = jnp.array([page_size + 7, 4 * page_size - 5], jnp.int32)
+    # The new tokens land past the first page: from slot 7 of page 1, and at the
+    # last page's slot `page_size - 5` (decode) or from 3 slots before page 3
+    # (verify: its 8 tokens cross into the next page).
+    last = 4 * page_size - 5 if T == 1 else 3 * page_size - 3
+    pos = jnp.array([page_size + 7, last], jnp.int32)[:, None] + jnp.arange(T)
+    pos = pos.reshape(-1).astype(jnp.int32)
     rope_cs = _rope_table(g, pos - 7, ex.MR)
     ref_out, ref_st = mdef.reference_step(
         g, ex, pos, hid, w_l, st_l, extra={ROPE_TABLE_INPUT: rope_cs}
@@ -162,7 +172,7 @@ def _check_token_step(g, ex, spec, mesh, pos, hid, w_l, st_l, hid_out, pools_ref
     """The token step on the same inputs: embedding rows hold `hid`, the RoPE
     cache rows hold the table, and the LM head ties two ids across ranks (row
     0) and across tiles of one rank (row 1) above every other logit, with a
-    larger one past the vocabulary."""
+    larger one past the vocabulary; the other rows take their plain argmax."""
     shard = 304
     vocab = R * shard - 5
     tio = tio_mod.TokenIO(
@@ -177,7 +187,9 @@ def _check_token_step(g, ex, spec, mesh, pos, hid, w_l, st_l, hid_out, pools_ref
     ex_t = dataclasses.replace(cache.with_cache(ex, fused_pool_io=True), tokens=tio)
     h = np.asarray(hid_out, np.float32).reshape(R, ex.M, g.H)[0, : ex.B]
     key = jax.random.PRNGKey(5)
-    ids = np.array([7, 5 * shard + 9], np.int32)
+    # Distinct ids, one per row.
+    ids = (np.arange(ex.B, dtype=np.int32) * 151 + 7) % vocab
+    ids[1] = 5 * shard + 9
     emb = jax.random.normal(key, (R * shard, g.H), F32).astype(BF16)
     emb = emb.at[ids].set(hid[: ex.B].astype(BF16))
     head = np.array(jax.random.normal(key, (R * shard, g.H), F32) * 0.05)
@@ -188,7 +200,7 @@ def _check_token_step(g, ex, spec, mesh, pos, hid, w_l, st_l, hid_out, pools_ref
     head = jnp.asarray(head, BF16)
     logits = (jnp.asarray(h, BF16).astype(F32) @ head.astype(F32).T)[:, :vocab]
     want = np.asarray(jnp.argmax(logits.astype(BF16).astype(F32), axis=-1))
-    np.testing.assert_array_equal(want, [t[0] for t in ties])
+    np.testing.assert_array_equal(want[:2], [t[0] for t in ties])
 
     half = g.ROT // 2
     inv = g.theta ** (-jnp.arange(half, dtype=F32) / half)
@@ -220,7 +232,7 @@ def _check_token_step(g, ex, spec, mesh, pos, hid, w_l, st_l, hid_out, pools_ref
     tables = np.zeros((ex.NS + 6, 6), np.int32)
     tables[: ex.NS, :4] = np.asarray(st_k["page_table"][: ex.NS])
     seq_lens = np.zeros((ex.NS + 6,), np.int32)
-    seq_lens[: ex.NS] = np.asarray(pos) + 1
+    seq_lens[: ex.NS] = np.asarray(pos).reshape(ex.NS, ex.T)[:, -1] + 1
     step, in_sp, _, _ = cache.make_flat_pooled_step(mesh, spec, ex_t)
     args = [
         jnp.pad(jnp.asarray(ids), (0, 3)),
