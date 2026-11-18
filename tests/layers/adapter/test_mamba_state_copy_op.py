@@ -11,45 +11,84 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-only tests: host-provided mamba copy indices are clamped into the pool
-before the (unchecked) copy kernel uses them.
-
-The module needs torch-tpu, so the helper is extracted with ``ast``.
+"""Host-provided Mamba copy indices are clamped into the pool before the copy
+kernel, which does no bounds checks, uses them: in both copy programs, for the
+source and the destination alike. The programs run here as plain JAX with the
+copy kernel replaced by a recorder.
 """
 
-import ast
-import pathlib
-import textwrap
+from unittest.mock import patch
 
-import pytest
+import jax.numpy as jnp
+import numpy as np
 
-ROOT = pathlib.Path(__file__).resolve().parents[3] / "src/vllm_torchtpu"
-COPY_OP = ROOT / "layers/adapter/custom_ops/mamba_state_copy_op.py"
+from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.layers.adapter.custom_ops import mamba_state_copy_op
 
-
-def _extract(path, names):
-    src = path.read_text()
-    out = {}
-    for node in ast.parse(src).body:
-        if isinstance(node, ast.FunctionDef) and node.name in names:
-            out[node.name] = textwrap.dedent(ast.get_source_segment(src, node))
-    assert set(out) == set(names), set(names) - set(out)
-    return out
+POOL_ROWS = 10
+# In range, then below zero and past the pool, at the int32 extremes too.
+INDICES = [0, 5, 9, -1, 2**30, -(2**31)]
+CLAMPED = [0, 5, 9, 0, 9, 0]
 
 
 def test_copy_indices_clamped_into_pool():
-    jnp = pytest.importorskip("jax.numpy")
-    g = {"jax": pytest.importorskip("jax"), "jnp": jnp}
-    exec(_extract(COPY_OP, ["_clamp_rows"])["_clamp_rows"], g)  # noqa: S102
-    idx = jnp.array([0, 5, 9, -1, 2**30, -(2**31)], dtype=jnp.int32)
-    out = g["_clamp_rows"](idx, 10)
+    idx = jnp.array(INDICES, dtype=jnp.int32)
+    out = mamba_state_copy_op._clamp_rows(idx, POOL_ROWS)
     assert out.dtype == idx.dtype
-    assert out.tolist() == [0, 5, 9, 0, 9, 0]
+    assert out.tolist() == CLAMPED
 
 
-def test_both_copy_programs_clamp_src_and_dst():
-    src = COPY_OP.read_text()
-    for fn in ("def _copy_fn(", "def _rows_fn("):
-        body = src[src.index(fn) : src.index("copy_blocks(", src.index(fn))]
-        assert "src = _clamp_rows(src, pool.shape[0])" in body, fn
-        assert "dst = _clamp_rows(dst, pool.shape[0])" in body, fn
+def _recorded_copy(program, *args):
+    """Run a copy program with the copy kernel recording its indices."""
+    seen = []
+
+    def copy_blocks(pool, src, dst):
+        seen.append((np.asarray(src).tolist(), np.asarray(dst).tolist()))
+        return pool
+
+    with patch.object(pool_adapters, "copy_blocks", copy_blocks):
+        program(*args)
+    (indices,) = seen
+    return indices
+
+
+def test_the_block_copy_clamps_src_and_dst():
+    pool = jnp.zeros((POOL_ROWS, 4), jnp.float32)
+    src = jnp.array(INDICES, dtype=jnp.int32)
+    dst = jnp.array(INDICES[::-1], dtype=jnp.int32)
+    assert _recorded_copy(mamba_state_copy_op._copy_fn, pool, src, dst) == (
+        CLAMPED,
+        CLAMPED[::-1],
+    )
+
+
+def _rows_fn(num_pools, split, step_rows):
+    """The row copy's program for one geometry, without registering an op."""
+    captured = {}
+
+    def jax_op(_name, fn, **_kwargs):
+        captured["fn"] = fn
+        return fn
+
+    with patch.object(mamba_state_copy_op.pallas, "jax_op", jax_op):
+        mamba_state_copy_op._row_copy_fn.__wrapped__(num_pools, split, step_rows)
+    return captured["fn"]
+
+
+def test_the_row_copy_clamps_src_and_dst_before_expanding_them():
+    """Each manager row expands into `steps` kernel-block steps; the clamped
+    row, not the garbage one, is what is expanded."""
+    num_pools, split, step_rows = 2, 2, 2
+    steps = num_pools * split // step_rows
+    pool = jnp.zeros((POOL_ROWS, num_pools * split, 3), jnp.float32)
+    src = jnp.array(INDICES, dtype=jnp.int32)
+    dst = jnp.array(INDICES[::-1], dtype=jnp.int32)
+
+    def expanded(rows):
+        return [r * steps + o for r in rows for o in range(steps)]
+
+    program = _rows_fn(num_pools, split, step_rows)
+    assert _recorded_copy(program, pool, src, dst) == (
+        expanded(CLAMPED),
+        expanded(CLAMPED[::-1]),
+    )
