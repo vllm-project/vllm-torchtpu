@@ -22,6 +22,7 @@ it in finished_recving.
 """
 
 import contextlib
+import inspect
 import json
 import random
 
@@ -43,6 +44,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -532,3 +535,24 @@ def test_a_kv_consumer_prefetches_only_with_the_option(tmp_path, monkeypatch):
     assert s._kv_prefetch_n == 0 and s._is_kv_consumer
     s = _make_sched(tmp_path, monkeypatch, prefetch=8)
     assert s._kv_prefetch_n == 8
+
+
+# The vLLM methods the prefix-cache epoch and change log wrap.
+_WRAPPED = (
+    (BlockPool, "_insert_block_hash"),
+    (BlockPool, "_remove_cached_block_hashes"),
+    (BlockPool, "reset_prefix_cache"),
+    (KVCacheManager, "new_step_starts"),
+)
+
+
+def test_building_the_scheduler_leaves_the_vllm_classes_alone(tmp_path, monkeypatch):
+    # The epoch and change-log wrappers are patch-registry entries applied at
+    # engine start; the constructor only opts its own block pool in, so a
+    # test that builds the scheduler leaves no class patch behind. Start from
+    # vLLM's own methods, whatever ran earlier in the process.
+    for cls, name in _WRAPPED:
+        monkeypatch.setattr(cls, name, inspect.unwrap(cls.__dict__[name]))
+    before = {(cls, name): cls.__dict__[name] for cls, name in _WRAPPED}
+    _make_sched(tmp_path, monkeypatch, prefetch=2)
+    assert {(cls, name): cls.__dict__[name] for cls, name in _WRAPPED} == before
