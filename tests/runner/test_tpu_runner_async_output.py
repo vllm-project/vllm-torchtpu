@@ -715,6 +715,179 @@ def test_subtract_and_substitute_draft_token_ids_and_two_chunk_mamba_offsets():
     assert int(read_offsets[5]) == 0
 
 
+class _TpuTyped(torch.Tensor):
+    """A CPU tensor whose ``device`` reads as a TPU device, so the runner's
+    TPU-only assembly branches run on CPU (with the programs' eager bodies)."""
+
+    @property
+    def device(self):
+        return SimpleNamespace(type="tpu")
+
+
+def _eager(program):
+    return program.__wrapped__._torchdynamo_orig_callable
+
+
+def _verify_output():
+    """A 4-row rejection output (K = 3): 3, 0 and 1 drafts accepted, one
+    padding row."""
+    return torch.tensor(
+        [
+            [10, 11, 12, 13],
+            [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            [30, 31, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            [0, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+    )
+
+
+def _padded_drafts(rows, k=3):
+    return 100 * torch.arange(1, rows + 1, dtype=torch.int32).unsqueeze(
+        1
+    ) + torch.arange(k, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("draft_rows", [2, 4, 8])
+@pytest.mark.parametrize("num_groups", [1, 2])
+def test_one_chunk_assembly_with_read_offsets_matches_the_separate_programs(
+    draft_rows, num_groups
+):
+    """The one-chunk program that folds in the mamba read-offset scatter
+    gives the eager assembly's substitution source and rejected counts and
+    the verify scatter's read offsets, for drafts with fewer, as many and
+    more rows than the sampled output, and one or two mamba groups."""
+    from vllm_torchtpu.runner.tpu_runner import (
+        _compiled_assemble_spec_rejected_and_read_offsets,
+        _update_read_offsets_verify_impl,
+    )
+    from vllm_torchtpu.spec_decode.utils import fit_rows
+
+    k, max_num_reqs = 3, 8
+    bound = max_num_reqs * (1 + k)
+    nt = _verify_output()
+    drafts = _padded_drafts(draft_rows)
+    draft_lengths = torch.tensor([3, 3, 3, 0], dtype=torch.int32)
+    groups = torch.tensor(
+        [[5, 7, 9, 0, 0, 0, 0, 0], [11, 13, 15, 0, 0, 0, 0, 0]], dtype=torch.int32
+    )
+    stacked = groups[0] if num_groups == 1 else groups
+    offsets = torch.full((16,), -7, dtype=torch.int32)
+    src, rejected = _eager(_compiled_assemble_spec_rejected_and_read_offsets)(
+        nt, drafts, draft_lengths, offsets, stacked, bound, max_num_reqs
+    )
+    want_offsets = torch.full((16,), -7, dtype=torch.int32)
+    _update_read_offsets_verify_impl(want_offsets, stacked, nt)
+    assert torch.equal(offsets, want_offsets)
+    assert offsets[[5, 7, 9]].tolist() == [3, 0, 1]
+    rows = nt.shape[0] * (1 + k)
+    assert src.shape == (bound,)
+    assert torch.equal(src[:rows], assemble_spec_next_tokens(nt, fit_rows(drafts, 4)))
+    assert not src[rows:].any()
+    assert rejected.shape == (max_num_reqs,)
+    assert torch.equal(rejected[:4], compute_num_rejected(nt, draft_lengths))
+    assert not rejected[4:].any()
+
+
+def _assembly_runner(drafts_view, padded):
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    runner = object.__new__(TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.max_num_reqs = 8
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner._adaptive_verification = None
+    runner._zero_draft_lengths_cache = {}
+    runner.drafter = _eagle3_drafter_stand_in(
+        _last_padded_drafts_per_chunk=padded, _last_propose_device_out=drafts_view
+    )
+    return runner
+
+
+def test_assembly_folds_deferred_read_offsets_into_the_one_chunk_program(
+    monkeypatch,
+):
+    """With deferred mamba indices, the one-chunk assembly runs the program
+    that scatters the read offsets too (not the separate scatter), with the
+    same source, rejected counts and offsets as the general path."""
+    from vllm_torchtpu.runner.tpu_runner import (
+        TPUModelRunner,
+        _compiled_assemble_spec_rejected_and_read_offsets,
+    )
+
+    ran = []
+
+    def fused(*args):
+        ran.append("fused")
+        return _eager(_compiled_assemble_spec_rejected_and_read_offsets)(*args)
+
+    def separate(*_args, **_kwargs):
+        raise AssertionError("the separate read-offset scatter ran")
+
+    monkeypatch.setattr(
+        tpu_runner, "_compiled_assemble_spec_rejected_and_read_offsets", fused
+    )
+    monkeypatch.setattr(TPUModelRunner, "_update_mamba_slot_read_offsets", separate)
+    padded = [_padded_drafts(8)]
+    drafts_view = padded[0][:3]
+    runner = _assembly_runner(drafts_view, padded)
+    runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
+    md = SimpleNamespace(
+        draft_lengths=torch.tensor([3, 3, 3, 0], dtype=torch.int32),
+        draft_lengths_cpu=np.array([3, 3, 3], dtype=np.int32),
+    )
+    state = SimpleNamespace(num_reqs_list=[3], spec_decode_metadata_list=[md])
+    indices = torch.tensor([5, 7, 9, 0, 0, 0, 0, 0], dtype=torch.int32)
+    nt = _verify_output()
+    chunks, next_idx, rejected, counts = runner._assemble_async_spec_substitution(
+        drafts_view,
+        [nt.as_subclass(_TpuTyped)],
+        state,
+        deferred_mamba_indices=[indices],
+    )
+    assert ran == ["fused"]
+    assert runner.mamba_slot_read_offsets[[5, 7, 9]].tolist() == [3, 0, 1]
+    assert next_idx == {0: 0, 1: 1, 2: 2} and counts == {0: 3, 1: 3, 2: 3}
+    want = assemble_spec_next_tokens(nt, padded[0], 3)
+    assert torch.equal(chunks[0][: want.shape[0]], want)
+    assert (
+        rejected[:3].tolist() == compute_num_rejected(nt, md.draft_lengths[:3]).tolist()
+    )
+
+
+@pytest.mark.parametrize("draft_rows", [4, 8])
+def test_prefill_bootstrap_program_matches_the_general_bootstrap(
+    monkeypatch, draft_rows
+):
+    """The compiled bootstrap (its eager body) parks each request's sampled
+    token and its drafts where the general bootstrap does, with no rejected
+    drafts and no drafts counted for this step."""
+    monkeypatch.setattr(
+        async_output,
+        "_compiled_assemble_prefill_bootstrap",
+        _eager(async_output._compiled_assemble_prefill_bootstrap),
+    )
+    n, k = 3, 3
+    padded = [_padded_drafts(draft_rows)]
+    drafts_view = padded[0][:n]
+    selected = torch.tensor([[71], [72], [73], [0]], dtype=torch.int64)
+    general = _assembly_runner(drafts_view, padded)._assemble_async_prefill_bootstrap(
+        drafts_view, [selected], [n]
+    )
+    fused = _assembly_runner(drafts_view, padded)._assemble_async_prefill_bootstrap(
+        drafts_view, [selected.as_subclass(_TpuTyped)], [n]
+    )
+    assert len(general[0]) == 1 and len(fused[0]) == 1
+    assert fused[0][0].shape == (8 * (1 + k),)
+    assert fused[1] == general[1] == {0: 0, 1: 1, 2: 2}
+    assert fused[3] == general[3] == {0: 0, 1: 0, 2: 0}
+    for src, _, _, _ in (general, fused):
+        assert [src[0][r * (1 + k) : (r + 1) * (1 + k)].tolist() for r in range(n)] == [
+            [71 + r] + padded[0][r].tolist() for r in range(n)
+        ]
+    assert not general[2].any() and not fused[2].any()
+
+
 _ASSEMBLY_PROGRAMS = (
     "_compiled_pad_non_spec_next_tokens",
     "_compiled_assemble_prefill_bootstrap",
