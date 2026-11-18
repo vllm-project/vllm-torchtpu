@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tiling and pipeline configuration dataclasses for Fused EP MoE v3.
+"""Build-time settings of Fused EP MoE v3 (the Config dataclass).
 
-Specifies token tile (`bt`), intermediate dimension tile (`bf`), hidden dimension
-tile (`bd`), and VMEM double-buffering parameters.
+The FFN kernel's buffer slots and prefetch depths, the tables kernels' step,
+the fp8 rounding forms of the token rows, the intermediate and the result
+rows, the element types of the scaling products and the combine, and the
+sparse-core gather, scatter and combine geometry, with their defaults.
 """
 
 import dataclasses
