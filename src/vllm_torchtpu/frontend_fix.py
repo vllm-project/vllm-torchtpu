@@ -11,16 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""API-server patches for reasoning-token counting and detokenizer priming.
+"""API-server patch that primes the detokenizer with a safe prompt tail.
 
-Both are off by default and installed by ``additional_config["tpu_frontend"]``
+Off by default and installed by ``additional_config["tpu_frontend"]``
 (see ``frontend_options``):
 
-* ``lazy_reasoning_count``: skips per-delta
-  ``DelegatingParser.count_reasoning_tokens`` recomputation on intermediate
-  streaming chunks when ``continuous_usage_stats`` is disabled, and
-  short-circuits to 0 when the ``StreamingParserEngine`` state machine has no
-  reachable ``REASONING_CHUNK`` transition or state.
 * ``detok_prompt_tail``: primes ``FastIncrementalDetokenizer``'s Rust
   ``DecodeStream`` with a UTF-8 boundary-verified suffix of the last
   ``DETOK_PROMPT_TAIL_TOKENS`` prompt tokens instead of decoding the full prompt
@@ -37,161 +32,6 @@ import time
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-_P = "tpu_frontend.lazy_reasoning_count:"
-_INSTALLED = False
-_LAZY_REASONING_COUNT_LOG_S = 60.0
-
-
-class _Stats:
-    skipped = 0
-    zero = 0
-    computed = 0
-    compute_s = 0.0
-    last_log = 0.0
-
-
-_ZERO_CACHE: dict = {}
-
-
-def _config_never_reasons(cfg) -> bool:
-    """True iff the engine state machine can never emit REASONING_CHUNK.
-
-    StreamingParserEngine only sets ``state`` to the config's initial state
-    (reset), a transition's ``next_state``, or CONTENT; REASONING_CHUNK events
-    come only from ``content_events[state]`` or ``transition.events``.  So if
-    no state reachable from {initial, CONTENT} maps to REASONING_CHUNK and no
-    reachable transition emits it, ``reasoning_token_count`` is always 0.
-    """
-    from vllm.parser.engine.events import EventType
-    from vllm.parser.engine.parser_engine_config import ParserState
-
-    rc = EventType.REASONING_CHUNK
-    reach = {cfg.initial_state, ParserState.CONTENT}
-    changed = True
-    while changed:
-        changed = False
-        for (src, _term), tr in cfg.transitions.items():
-            if src in reach:
-                if rc in tr.events:
-                    return False
-                if tr.next_state not in reach:
-                    reach.add(tr.next_state)
-                    changed = True
-    return all(cfg.content_events.get(s) != rc for s in reach)
-
-
-def _provably_zero(rp) -> bool:
-    try:
-        pe = rp._parser_engine
-        from vllm.parser.engine.parser_engine import ParserEngine
-        from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
-
-        # _config_never_reasons models exactly this engine's state machine, so
-        # a subclass, or a class of the same name, is not taken for it.
-        if (
-            type(pe).count_reasoning_tokens is not ParserEngine.count_reasoning_tokens
-            or type(pe._engine) is not StreamingParserEngine
-        ):
-            return False
-        cfg = pe.parser_engine_config
-    except Exception:
-        return False
-    key = id(cfg)
-    v = _ZERO_CACHE.get(key)
-    if v is None or v[0] is not cfg:
-        try:
-            v = (cfg, _config_never_reasons(cfg))
-        except Exception:
-            v = (cfg, False)
-        if len(_ZERO_CACHE) > 256:
-            _ZERO_CACHE.clear()
-        _ZERO_CACHE[key] = v
-    return v[1]
-
-
-def maybe_install_lazy_reasoning_count() -> bool:
-    global _INSTALLED
-    if _INSTALLED:
-        return False
-    pname = multiprocessing.current_process().name
-    if not (pname == "MainProcess" or pname.startswith("ApiServer")):
-        return False
-    try:
-        from vllm.parser.abstract_parser import DelegatingParser
-        from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
-    except Exception as e:
-        logger.warning("%s cannot import vLLM parser classes (%r); not enabled", _P, e)
-        return False
-
-    orig_parse_delta = DelegatingParser.parse_delta
-    orig_count = DelegatingParser.count_reasoning_tokens
-    log_s = _LAZY_REASONING_COUNT_LOG_S
-    _Stats.last_log = time.monotonic()
-
-    def parse_delta(self, *args, **kwargs):
-        res = orig_parse_delta(self, *args, **kwargs)
-        try:
-            finished = kwargs.get("finished", True)
-            request = kwargs.get("request", args[2] if len(args) > 2 else None)
-            so = getattr(request, "stream_options", None)
-            cont = bool(so is not None and getattr(so, "continuous_usage_stats", False))
-            self._tpu_skip_reasoning_count = (finished is False) and not cont
-        except Exception:
-            self._tpu_skip_reasoning_count = False
-        return res
-
-    def _maybe_log():
-        now = time.monotonic()
-        if now - _Stats.last_log >= log_s:
-            _Stats.last_log = now
-            logger.debug(
-                "%s stats zero=%d skipped=%d computed=%d compute_s=%.2f",
-                _P,
-                _Stats.zero,
-                _Stats.skipped,
-                _Stats.computed,
-                _Stats.compute_s,
-            )
-
-    def count_reasoning_tokens(self, token_ids):
-        skip = False
-        try:
-            skip = self.__dict__.pop("_tpu_skip_reasoning_count", False)
-            rp = getattr(self, "_reasoning_parser", None)
-            if isinstance(rp, ParserEngineReasoningAdapter) and not getattr(
-                rp, "_streaming_count_valid", True
-            ):
-                if _provably_zero(rp):
-                    _Stats.zero += 1
-                    _maybe_log()
-                    return 0
-            else:
-                skip = False
-        except Exception:
-            skip = False
-        if skip:
-            _Stats.skipped += 1
-            return self.__dict__.get("_tpu_last_reasoning_count", 0)
-        t0 = time.perf_counter()
-        n = orig_count(self, token_ids)
-        _Stats.computed += 1
-        _Stats.compute_s += time.perf_counter() - t0
-        with contextlib.suppress(Exception):
-            self._tpu_last_reasoning_count = n
-            _maybe_log()
-        return n
-
-    DelegatingParser.parse_delta = parse_delta
-    DelegatingParser.count_reasoning_tokens = count_reasoning_tokens
-    _INSTALLED = True
-    logger.info(
-        "%s installed DelegatingParser.parse_delta/count_reasoning_tokens "
-        "patch (pid %d, %s)",
-        _P,
-        os.getpid(),
-        pname,
-    )
-    return True
 
 
 # ---------------------------------------------------------------------------
