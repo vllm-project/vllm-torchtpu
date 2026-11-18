@@ -17,22 +17,38 @@ from __future__ import annotations
 
 from .chips import CHIPS, TOPOLOGIES, ChipOverrides, ChipSpec, SliceTopology
 from .collectives import Collective, CollectiveConfig, torus_collective_s
+from .constants import SOLVE_SCHEMA
 from .emit import (
     CeilingRow,
     LaunchPayload,
+    PointLaunchPayload,
+    ProvenancePayload,
+    SolvePayload,
+    TopKEntry,
+    build_solve_payload,
     emit_ceiling_rows,
     emit_launch_args,
+    point_launch_args,
     pool_cli_args,
+    top_layouts,
 )
 from .geometry import ModelGeometry, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
-from .memory import HbmBreakdown, KvFitInput, SeqKvLayout, hbm_footprint_per_core_bytes
+from .memory import (
+    HbmBreakdown,
+    KvFitInput,
+    SeqKvLayout,
+    hbm_breakdown_per_core_bytes,
+    hbm_footprint_per_core_bytes,
+)
 from .modules import Dtypes, ModuleCost, Parallel, StepShape, pass_costs
 from .serving import ConcurrencyRow, ServingRequest, plan
 from .solver import (
+    FloorTimes,
     ParetoPoint,
     PoolMeshPlan,
     ScenarioOverrides,
+    SearchStats,
     ServingPlan,
     SolveOptions,
     TrafficScenario,
@@ -43,6 +59,7 @@ from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_flo
 
 __all__ = [
     "CHIPS",
+    "SOLVE_SCHEMA",
     "TOPOLOGIES",
     "CeilingRow",
     "ChipOverrides",
@@ -52,6 +69,7 @@ __all__ = [
     "ConcurrencyRow",
     "Dtypes",
     "FloorOptions",
+    "FloorTimes",
     "HbmBreakdown",
     "KvFitInput",
     "LaunchPayload",
@@ -59,29 +77,38 @@ __all__ = [
     "ModuleCost",
     "Parallel",
     "ParetoPoint",
+    "PointLaunchPayload",
     "PoolMeshPlan",
+    "ProvenancePayload",
     "ScenarioOverrides",
+    "SearchStats",
     "SeqKvLayout",
     "ServingPlan",
     "ServingRequest",
     "SliceTopology",
     "SolveOptions",
+    "SolvePayload",
     "SpecShape",
     "StepFloor",
     "StepShape",
+    "TopKEntry",
     "TrafficScenario",
     "build_example_scenario",
+    "build_solve_payload",
     "dtypes_from_hf_config",
     "emit_ceiling_rows",
     "emit_launch_args",
     "from_hf_config",
+    "hbm_breakdown_per_core_bytes",
     "hbm_footprint_per_core_bytes",
     "load_hf_config",
     "pass_costs",
     "plan",
+    "point_launch_args",
     "pool_cli_args",
     "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
+    "top_layouts",
     "torus_collective_s",
 ]
