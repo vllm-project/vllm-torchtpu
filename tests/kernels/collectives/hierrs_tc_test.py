@@ -25,6 +25,7 @@ from jax._src import test_util as jtu
 from vllm_torchtpu.kernels.collectives.hierrs_tc import config as hrs_config
 from vllm_torchtpu.kernels.collectives.hierrs_tc import dispatch, kernel_stream
 from vllm_torchtpu.kernels.collectives.hierrs_tc import wrapper as hrs
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 
 jax.config.parse_flags_with_absl()
 
@@ -77,6 +78,45 @@ def _reduce_scatter_stream(x, *, mesh, order=None):
 _MIN_BF16_SNR_DB = 40.0
 
 _BF16_TRUTH_SLACK = 1.5
+
+# FP8 keeps 3 mantissa bits (~30 dB above rounding noise).
+_MIN_FP8_SNR_DB = 20.0
+
+_EPS = 1e-6
+
+
+def _reduce_scatter_epilogue(
+    x, residual, post_norm_weight, scale, next_norm_weight, *, mesh, order, fp8_wire
+):
+    """Outputs are stacked by mesh index."""
+    axis = mesh.axis_names[0]
+    sharded, replicated = P(axis, None), P()
+
+    def local(x, residual, post_norm_weight, scale, next_norm_weight):
+        out = kernel_stream.reduce_scatter_epilogue_stream_local(
+            x,
+            residual,
+            post_norm_weight=post_norm_weight,
+            scale=scale,
+            next_norm_weight=next_norm_weight,
+            eps=_EPS,
+            axis_name=axis,
+            order=order,
+            fp8_wire=fp8_wire,
+        )
+        return out[0] if next_norm_weight is None else out
+
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(sharded, sharded, replicated, replicated, replicated),
+        out_specs=sharded if next_norm_weight is None else (sharded,) * 3,
+        check_vma=False,
+    )(x, residual, post_norm_weight, scale, next_norm_weight)
+
+
+def _rms_norm(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + _EPS) * weight
 
 
 def _snr_db(signal: jax.Array, noise: jax.Array) -> float:
@@ -412,12 +452,101 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
         self.assertTrue(kernel_stream.supports_stream(8 * 1024, 6656, 2))
         self.assertFalse(kernel_stream.supports_stream(8 * 1024, 7168, 2))
 
+    @parameterized.product(
+        order=[tuple(range(8)), _TPU7X_RANK_AT_MESH_INDEX],
+        fp8_wire=[False, True],
+        post_norm=[False, True],
+        with_scale=[False, True],
+        next_norm=[False, True],
+    )
+    def test_stream_epilogue_matches_reference(
+        self, order, fp8_wire, post_norm, with_scale, next_norm
+    ):
+        """Every combination of optional epilogue operands on both wires."""
+        self._requires_devices(8)
+        # 4 blocks per device: one more than the kernel has slots.
+        axis_name, hidden, n, rows_per_device = "x", 1024, 8, 4096
+        chunk = rows_per_device // n
+        mesh = _make_mesh(n, axis_name)
+        sharding = jax.sharding.NamedSharding(mesh, P(axis_name, None))
+        seed = order[2] + 2 * fp8_wire + 4 * post_norm + 8 * with_scale
+        keys = jax.random.split(jax.random.key(seed), 4)
+        x = jax.random.normal(
+            keys[0], (n * rows_per_device, hidden), dtype=jnp.bfloat16
+        )
+        residual = jax.random.normal(keys[1], (n * chunk, hidden), dtype=jnp.bfloat16)
+
+        def weight(key):
+            return 1.0 + 0.1 * jax.random.normal(key, (hidden,), dtype=jnp.bfloat16)
+
+        post_norm_weight = weight(keys[2]) if post_norm else None
+        next_norm_weight = weight(keys[3]) if next_norm else None
+        scale = jnp.asarray([0.75], jnp.bfloat16) if with_scale else None
+
+        def run():
+            out = _reduce_scatter_epilogue(
+                jax.device_put(x, sharding),
+                jax.device_put(residual, sharding),
+                post_norm_weight,
+                scale,
+                next_norm_weight,
+                mesh=mesh,
+                order=order,
+                fp8_wire=fp8_wire,
+            )
+            return [np.asarray(a) for a in (out if next_norm else (out,))]
+
+        first = run()
+        ref = np.asarray(x, np.float32).reshape(n, n, chunk, hidden).sum(axis=0)
+        ref = ref[list(order)]
+        if post_norm:
+            ref = _rms_norm(ref, np.asarray(post_norm_weight, np.float32))
+        ref = ref + np.asarray(residual, np.float32).reshape(n, chunk, hidden)
+        if with_scale:
+            ref = ref * 0.75
+        got = first[0].astype(np.float32).reshape(n, chunk, hidden)
+        min_snr = _MIN_FP8_SNR_DB if fp8_wire else _MIN_BF16_SNR_DB
+        snr = _snr_db(jnp.asarray(ref), jnp.asarray(got - ref))
+        self.assertGreater(snr, min_snr, msg=f"residual SNR {snr:.1f} dB")
+
+        if next_norm:
+            _, x_q, x_scale = first
+            self.assertEqual(x_q.shape, (rows_per_device, hidden))
+            self.assertEqual(x_scale.shape, (rows_per_device, 1))
+            expected = _rms_norm(got, np.asarray(next_norm_weight, np.float32))
+            dequantized = (
+                np.asarray(x_q.view(jnp.float8_e4m3fn), np.float32) * x_scale
+            ).reshape(n, chunk, hidden)
+            snr = _snr_db(jnp.asarray(expected), jnp.asarray(dequantized - expected))
+            self.assertGreater(snr, _MIN_FP8_SNR_DB, msg=f"FP8 rows SNR {snr:.1f} dB")
+            ref_scale = quantize_block(
+                jnp.asarray(expected, jnp.bfloat16), -1, jnp.float8_e4m3fn
+            )[1]
+            np.testing.assert_allclose(
+                x_scale,
+                np.asarray(ref_scale, np.float32).reshape(rows_per_device, 1),
+                rtol=2e-2,
+            )
+
+        for a, b in zip(first, run()):
+            self.assertTrue(
+                np.array_equal(a.view(np.uint8), b.view(np.uint8)),
+                msg="two runs on identical input disagree -- race, not precision",
+            )
+
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class HierarchicalReduceScatterPlanningTest(jtu.JaxTestCase):
     PRODUCTION_ROWS = (32, 64, 128, 256, 512, 1024, 2048)
     HIDDEN = 4096
     BF16_ITEMSIZE = 2
+
+    def test_stream_epilogue_supported_shapes(self):
+        self.assertTrue(kernel_stream.supports_stream_epilogue(8 * 128, 5376))
+        self.assertTrue(kernel_stream.supports_stream_epilogue(8 * 2048, 5376))
+        self.assertFalse(kernel_stream.supports_stream_epilogue(8 * 64, 5376))
+        self.assertFalse(kernel_stream.supports_stream_epilogue(8 * 128, 5376 + 64))
+        self.assertFalse(kernel_stream.supports_stream_epilogue(8 * 128, 8192))
 
     def test_micro_batch_floor(self):
         self.assertEqual(
