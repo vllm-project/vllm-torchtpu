@@ -208,8 +208,10 @@ def engine_core_kwargs(kwargs: dict) -> dict:
     external-LB DP rank.
     """
     vllm_config = kwargs.get("vllm_config")
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    if parallel_config is None or not parallel_config.data_parallel_external_lb:
+    if vllm_config is None:
+        return kwargs
+    parallel_config = vllm_config.parallel_config
+    if not parallel_config.data_parallel_external_lb:
         return kwargs
     local_size = local_dp_size(vllm_config)
     if local_size <= 1:
