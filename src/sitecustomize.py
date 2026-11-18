@@ -42,6 +42,16 @@ def maybe_run_experimental_rust() -> bool:
     if not envs.VLLM_TPU_EXPERIMENTAL_USE_RUST:
         return False
 
+    import vllm.envs as vllm_envs
+
+    # vLLM's Rust frontend keeps the Python engine; rvllm replaces both.
+    if getattr(vllm_envs, "VLLM_USE_RUST_FRONTEND", False):
+        sys.stderr.write(
+            "rvllm: error: VLLM_TPU_EXPERIMENTAL_USE_RUST and "
+            "VLLM_USE_RUST_FRONTEND are both set; set only one\n"
+        )
+        raise SystemExit(2)
+
     from vllm_torchtpu.experimental.rust.launcher import main as rust_main
 
     rust_main(sys.argv[1:])
@@ -198,7 +208,10 @@ class _ExperimentalRustFinder(importlib.abc.MetaPathFinder):
 
         def _wrapped_cli_env_setup(*args: Any, **kwargs: Any) -> Any:
             res = orig(*args, **kwargs)
-            maybe_run_experimental_rust()
+            if maybe_run_experimental_rust():
+                # The launcher replaces this process. Returning here would
+                # serve with the Python engine instead of rvllm.
+                raise SystemExit("rvllm: error: the launcher returned without exec")
             return res
 
         _wrapped_cli_env_setup._experimental_rust_wrapped = True  # type: ignore[attr-defined]

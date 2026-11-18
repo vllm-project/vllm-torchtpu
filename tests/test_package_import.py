@@ -92,6 +92,9 @@ def test_sitecustomize_wraps_startup_cli_env_setup_subprocess():
     )
 
 
+# TODO: cover the success path (a fake rvllm binary is exec'ed for
+# `vllm serve --help`) and the default path (without the env var the command is
+# not delegated). Until then the success path is verified by hand on TPU.
 def test_sitecustomize_rust_cli_delegation_subprocess():
     import os
 

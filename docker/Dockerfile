@@ -8,9 +8,8 @@
 ARG BUILD_VLLM_RS=false
 
 # Whether to include rvllm, the native Rust serving runtime, in the images
-# (docker/build_image.sh --experimental-rvllm-url URL). Declared before the first
-# FROM so that
-# a FROM line can read it.
+# (docker/build_image.sh --experimental-rvllm-url URL). Declared before the
+# first FROM so that a FROM line can read it.
 ARG WITH_EXPERIMENTAL_RVLLM=false
 ARG EXPERIMENTAL_RVLLM_DOWNLOAD_URL=""
 
@@ -90,17 +89,19 @@ RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 ARG EXPERIMENTAL_RVLLM_DOWNLOAD_URL
 WORKDIR /out
+# TODO: verify the download against a sha256, and support private gs:// buckets
+# (a gs:// URL is fetched over public HTTPS).
 RUN if [ -z "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" ]; then \
       echo "EXPERIMENTAL_RVLLM_DOWNLOAD_URL must be set when WITH_EXPERIMENTAL_RVLLM=true" >&2; exit 1; \
     fi && \
-    if [ "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL#http}" != "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" ]; then \
-      curl -fsSL "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" -o /out/rvllm; \
-    elif [ "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL#gs://}" != "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" ]; then \
-      bucket_path="${EXPERIMENTAL_RVLLM_DOWNLOAD_URL#gs://}" && \
-      curl -fsSL "https://storage.googleapis.com/${bucket_path}" -o /out/rvllm; \
-    else \
-      echo "Unsupported EXPERIMENTAL_RVLLM_DOWNLOAD_URL scheme: ${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" >&2; exit 1; \
-    fi && \
+    case "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" in \
+      http://*|https://*) \
+        curl -fsSL "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" -o /out/rvllm ;; \
+      gs://*) \
+        curl -fsSL "https://storage.googleapis.com/${EXPERIMENTAL_RVLLM_DOWNLOAD_URL#gs://}" -o /out/rvllm ;; \
+      *) \
+        echo "Unsupported EXPERIMENTAL_RVLLM_DOWNLOAD_URL scheme: ${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" >&2; exit 1 ;; \
+    esac && \
     chmod 0755 /out/rvllm
 
 # WITH_EXPERIMENTAL_RVLLM=false: no rvllm binary.
