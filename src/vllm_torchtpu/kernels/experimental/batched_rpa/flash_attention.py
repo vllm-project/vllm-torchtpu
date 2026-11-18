@@ -86,6 +86,7 @@ def flash_attention_qk_softmax(
     b, k_heads, tq, h_size = q.shape
 
     diet = vpu_diet_enabled()
+    folded_scale = q_folded_scale(cfgs) if diet else None
     if folded_scale is not None and folded_scale != 1.0:
         q = q * jnp.asarray(folded_scale, dtype=q.dtype)
 
@@ -116,6 +117,7 @@ def flash_attention_qk_softmax(
         )
     qk = qk.reshape(b, k_heads, tq, s)
 
+    if folded_scale is None:
         qk *= cfgs.model.sm_scale
         if cfgs.serve.scale_q is not None:
             qk *= cfgs.serve.scale_q
