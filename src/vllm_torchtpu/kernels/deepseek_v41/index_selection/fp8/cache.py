@@ -354,26 +354,34 @@ def _write_sorted_packed_pages(
                     1,
                 )
 
-            word = jnp.concatenate(
-                [
-                    jnp.where(
-                        lanes < page_tokens - skew,
-                        block(index),
-                        block(index + 1),
+            def lane_block(index):
+                return jnp.where(
+                    lanes < page_tokens - skew, block(index), block(index + 1)
+                )
+
+            if page_size <= page_tokens:
+                word = lane_block(0)[:, :page_size].reshape(page_rows, page_tokens)
+                offset = positions % page_size - column
+                pages[slot] = jnp.where(
+                    (offset >= 0) & (offset < count) & (positions < fields * page_size),
+                    word,
+                    pages[slot],
+                )
+                return
+            # Field f's columns j*128..j*128+127 sit in page row f * blocks + j;
+            # update only the lane blocks the run reaches.
+            for index in range(blocks):
+                low = index * page_tokens
+
+                @pl.when((column < low + page_tokens) & (column + count > low))
+                def _():
+                    rows = pl.ds(index, padded_fields, stride=blocks)
+                    offset = lanes + low - column
+                    pages[slot, rows, :] = jnp.where(
+                        (offset >= 0) & (offset < count),
+                        lane_block(index),
+                        pages[slot, rows, :],
                     )
-                    for index in range(blocks)
-                ],
-                axis=1,
-            )
-            if page_size < page_tokens:
-                word = word[:, :page_size]
-            word = word.reshape(page_rows, page_tokens)
-            offset = positions % page_size - column
-            pages[slot] = jnp.where(
-                (offset >= 0) & (offset < count) & (positions < fields * page_size),
-                word,
-                pages[slot],
-            )
 
         def merge(slot, carry):
             start = pl.program_id(0) * batch + slot
