@@ -169,52 +169,63 @@ def _signature(graph: fx.GraphModule) -> tuple:
 
 
 def _inputs(graph: fx.GraphModule) -> tuple:
-    """Every placeholder as (module-state name or None, signature).
+    """Every placeholder as (identity or None, signature).
 
-    A variant that uses more of the model's weights than another -- say a
-    replica for a sequence-parallel bucket -- lifts more parameters and
-    buffers, which Dynamo names by their module path. Those are the only
-    inputs one trace may have and another lack; everything else (activations,
-    sizes) must line up one to one.
+    A variant that uses more of the model than another -- say a weight
+    replica for a sequence-parallel bucket -- lifts more inputs, and its own
+    sizes, so the two input lists differ beyond position. What identifies an
+    input across traces is what Dynamo recorded for it: a tensor it lifted
+    (marked ``tensor_dict``) is named after its source, uniquely within the
+    graph (``L['self'].norm.weight`` -> ``l_self_modules_norm_parameters_
+    weight_``); a size is the symbol the trace's ShapeEnv bound to sources.
+    An input with neither -- one a split subgraph receives from the subgraph
+    before it -- is identified only by its position.
     """
+    shape_env = trace_shape_env(graph)
 
     def entry(node: fx.Node) -> tuple:
         value = _placeholder_value(node)
+        identity: tuple | None = None
         if isinstance(value, torch.Tensor):
             dims = tuple(
                 "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
             )
             signature: Any = (str(value.dtype), dims)
+            if "tensor_dict" in node.meta:
+                identity = ("tensor", node.name)
         else:
             signature = type(value).__name__
-        state = node.name.lower().startswith(_MODULE_STATE)
-        return (node.name if state else None, signature)
+            if isinstance(value, torch.SymInt) and shape_env is not None:
+                sources = shape_env.var_to_sources.get(value.node.expr, ())
+                if sources:
+                    identity = ("size", frozenset(s.name for s in sources))
+        return (identity, signature)
 
     return tuple(entry(n) for n in graph.graph.nodes if n.op == "placeholder")
 
 
-# Dynamo names a lifted parameter or buffer after its path from the traced
-# module, ``L['self']``: ``l_self_modules_<child>_..._parameters_<name>_``.
-_MODULE_STATE = "l_self_"
-
-
 def _pick_inputs(handed: tuple, live: tuple) -> tuple[int, ...] | None:
     """Indices of the live graph's inputs that make up a handed graph's, or
-    None when the handed graph needs something the live one does not have."""
-    by_name = {name: i for i, (name, _) in enumerate(live) if name is not None}
-    others = [i for i, (name, _) in enumerate(live) if name is None]
-    picks, next_other = [], 0
-    for name, signature in handed:
-        if name is not None:
-            index = by_name.get(name)
-        elif next_other < len(others):
-            index, next_other = others[next_other], next_other + 1
+    None when the handed graph needs one the live graph does not have.
+
+    A size matches a live size bound to any of the same sources: the handed
+    trace's guards made those sources equal, so any of them holds its value.
+    """
+    tensors = {key: i for i, (key, _) in enumerate(live) if key and key[0] == "tensor"}
+    sizes = [(key[1], i) for i, (key, _) in enumerate(live) if key and key[0] == "size"]
+    positional = iter([i for i, (key, _) in enumerate(live) if key is None])
+    picks = []
+    for key, signature in handed:
+        if key is None:
+            index = next(positional, None)
+        elif key[0] == "tensor":
+            index = tensors.get(key)
         else:
-            return None
+            index = next((i for sources, i in sizes if sources & key[1]), None)
         if index is None or live[index][1] != signature:
             return None
         picks.append(index)
-    return tuple(picks) if next_other == len(others) else None
+    return tuple(picks) if next(positional, None) is None else None
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -265,8 +276,8 @@ class BucketExecutables:
                 f"{key} was compiled by another trace of this model whose "
                 f"inputs differ ({[sig for _, sig in inputs]} vs "
                 f"{[sig for _, sig in live]}). "
-                "Only module weights may differ, as a superset in the live "
-                "graph. If the graph is split, its subgraph boundaries move "
+                "The live graph may take more inputs than the handed one, but "
+                "not fewer. If the graph is split, its subgraph boundaries move "
                 "with the specialization and a bucket cannot be handed between "
                 "traces; unset TPU_KERNEL_ITER_MODE to serve this model."
             )

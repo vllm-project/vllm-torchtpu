@@ -129,20 +129,22 @@ class FlatModel(nn.Module):
         return WAVE(x)
 
 
-@support_torch_compile(dynamic_arg_dims={"x": 0})
+@support_torch_compile(dynamic_arg_dims={"x": 0, "y": 0})
 class ReplicaModel(nn.Module):
-    """Large buckets also read a second weight, as a sequence-parallel
-    variant reads its weight replica."""
+    """Large buckets also read a second weight, as a sequence-parallel variant
+    reads its weight replica, and split ``y`` rather than adding it to ``x``,
+    so their trace keeps a size of its own for ``y``."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(HIDDEN), requires_grad=False)
         self.replica = nn.Parameter(torch.ones(3, HIDDEN), requires_grad=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         if x.shape[0] >= 2048:
-            return WAVE(x * self.replica.sum(0) + self.weight)
-        return WAVE(x * self.weight)
+            y_half = y.unflatten(0, (2, -1))[0].sum()
+            return WAVE(x * self.replica.sum(0) * self.weight + y_half)
+        return WAVE(x * self.weight + y)
 
 
 @dataclasses.dataclass
@@ -343,7 +345,12 @@ def run(model: nn.Module, config: VllmConfig, num_tokens: int):
         return model(torch.zeros(num_tokens, HIDDEN))
 
 
-def warm(model, config, buckets=BUCKETS) -> int:
+def run_xy(model: nn.Module, config: VllmConfig, num_tokens: int):
+    with set_forward_context({}, config):
+        return model(torch.zeros(num_tokens, HIDDEN), torch.zeros(num_tokens, HIDDEN))
+
+
+def warm(model, config, buckets=BUCKETS, step=run) -> int:
     """What TPUModelRunner._precompile_backbone does, minus the runner.
 
     Returns the number of extra traces the ladder needed.
@@ -354,7 +361,7 @@ def warm(model, config, buckets=BUCKETS) -> int:
             if tracked.needs_retrace(num_tokens):
                 shape_variants.retrace(model, config)
                 retraces += 1
-            run(model, config, num_tokens)
+            step(model, config, num_tokens)
     return retraces
 
 
@@ -454,19 +461,19 @@ def test_three_tiers_each_keep_their_own_structure(tmp_path):
 def _superset_trace_serves_handed_buckets(cache_root):
     config, backend = prepare(cache_root)
     model = build(ReplicaModel, config)
-    assert warm(model, config) == 1
+    assert warm(model, config, step=run_xy) == 1
     assert backend.compiled == [(16, 1), (2048, 1), (4096, 1)]
 
-    # The live graph also takes the replica; the bucket handed to it from the
-    # first trace still gets exactly that trace's inputs.
+    # The live graph also takes the replica and a size for y; the bucket
+    # handed to it from the first trace still gets exactly that trace's inputs.
     ARGS.clear()
     for num_tokens in BUCKETS:
-        assert run(model, config, num_tokens).shape[0] == num_tokens
+        assert run_xy(model, config, num_tokens).shape[0] == num_tokens
     assert ARGS == [
-        [(HIDDEN,), (16, HIDDEN)],
-        [(3, HIDDEN), (HIDDEN,), (2048, HIDDEN)],
-        [(3, HIDDEN), (HIDDEN,), (4096, HIDDEN)],
-    ]
+        [(HIDDEN,), (16, HIDDEN), (16, HIDDEN)],
+        [(3, HIDDEN), (HIDDEN,), (2048, HIDDEN), (2048, HIDDEN)],
+        [(3, HIDDEN), (HIDDEN,), (4096, HIDDEN), (4096, HIDDEN)],
+    ], ARGS
 
 
 def test_trace_with_more_weights_serves_handed_buckets(tmp_path):
