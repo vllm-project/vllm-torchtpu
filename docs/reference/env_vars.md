@@ -65,6 +65,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `USE_MOE_FUSED_EP_KERNEL` | `False` | Enables the fused Expert-Parallel (`EP`) Pallas MoE kernel. |
 | `MOE_FUSED_EP_KERNEL_IMPL` | `None` | Selects a specific fused EP MoE kernel implementation (`"v1"` or `"v2"`). |
 | `MOE_FUSED_EP_ENABLE_W4A8` | `False` | Enables 4-bit weight / 8-bit activation (`W4A8`) execution in the fused EP MoE kernel. |
+| `MOE_FUSED_EP_COMBINE_DTYPE` | `None` | Opt-in dtype (`"fp4"`) for the fused EP MoE v2 combine collective (TPU v7x+). Applies a block-128 Walsh-Hadamard rotation before dynamic `FP4` (`e2m1`) row quantization to halve combine transport bytes on `FP4` MoE layers with `hidden % 8192 == 0`. |
 | `MOE_FUSED_EP_SORTED_GATHER` | `False` | Keeps the fused EP MoE mesh in EP-rank order and performs the activation all-gather outside the kernel over a process group in ascending device-id order. |
 | `FUSED_MOE_DECODE_KERNEL` | `False` | Serves eligible MoE layers (TP experts, or EP with TP attention) up to `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens with the fused MoE decode Pallas kernel (routed experts, shared expert, and all-reduce in one call); arming refuses a cap whose buffers do not fit in VMEM. |
 | `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` | `256` | Maximum token count per step for `FUSED_MOE_DECODE_KERNEL`; larger steps fall back to the grouped-matmul MoE path. |
