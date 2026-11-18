@@ -427,7 +427,7 @@ class Eagle3Proposer:
             and self.speculative_config.method == "mtp"
             and not self._share_mtp_indices
             and not self._draft_kv_shared
-            and getattr(self.speculative_config, "num_speculative_tokens", 0) > 1
+            and self.speculative_config.num_speculative_tokens > 1
             and not self._dp_lockstep_sharded()
         ):
             # Step 0 traces with the post-attention gather baked in, so the
@@ -474,7 +474,12 @@ class Eagle3Proposer:
             owner = greedy_top_tokens.resolve_head_owner(
                 draft_model, self.runner._dp_lockstep_enabled()
             )
-        except NotImplementedError:
+        except NotImplementedError as e:
+            logger.warning_once(
+                "Draft greedy head not available (%s); the draft keeps "
+                "compute_logits + argmax.",
+                str(e),
+            )
             return
         self._draft_greedy_head_owner = owner
         logger.info(
