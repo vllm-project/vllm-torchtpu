@@ -2869,6 +2869,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         dcp_size = self.dcp_size
         pcp_size = self.pcp_size
         interleave_size = self.dcp_interleave_size
+        # TPU_PCP_GATHER_HOIST: also gather the split prefill workspace's
+        # first chunk here (takes ws_req / ws_vpage, returns its rows).
+        hoist = envs.TPU_PCP_GATHER_HOIST
+
+        def chunk_pages() -> int:
+            # `mla_kv_spec` is recorded when the caches are allocated.
+            return pcp_chunk_pages(
+                envs.TPU_PCP_KV_CHUNK_TOKENS, layer.mla_kv_spec[0].page_size, dcp_size
+            )
 
         def pcp_write_split_core(
             kv_cache_nope: jax.Array,
@@ -2879,8 +2888,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             split_seq_lens: jax.Array,
             split_block_tables: jax.Array,
             split_query_start_loc: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
+            *ws_pages: jax.Array,
+        ) -> tuple[jax.Array, ...]:
             nope_spec, rope_spec = layer.mla_kv_spec
+            prefetch = (*ws_pages, chunk_pages()) if hoist else None
             return sparse_mla_pcp_write_split(
                 kv_cache_nope,
                 kv_cache_rope,
@@ -2896,6 +2907,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 dcp_size=dcp_size,
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
+                prefetch=prefetch,
             )
 
         sharded = P(DCP_AXIS_NAME)
@@ -2915,23 +2927,35 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 replicated,  # split_seq_lens
                 replicated,  # split_block_tables
                 replicated,  # split_query_start_loc
-            ),
-            output_partition_specs=(sharded, sharded),
+            )
+            + ((replicated, replicated) if hoist else ()),  # ws_req, ws_vpage
+            output_partition_specs=(sharded, sharded)
+            + ((sharded, sharded) if hoist else ()),  # chunk 0 workspace rows
         )
 
         def _fake(kv_cache_nope, kv_cache_rope, *rest, **kwargs):
             del rest, kwargs
-            return torch.empty_like(kv_cache_nope), torch.empty_like(kv_cache_rope)
+            caches = torch.empty_like(kv_cache_nope), torch.empty_like(kv_cache_rope)
+            if not hoist:
+                return caches
+            # Every rank's [dcp * chunk_pages, *page] rows, stacked over DCP.
+            return *caches, *(
+                c.new_empty((dcp_size * dcp_size * chunk_pages(), *c.shape[1:]))
+                for c in (kv_cache_nope, kv_cache_rope)
+            )
 
         jax_op.register_fake(_fake)
 
         def pcp_write_split_impl(
             kv_cache: tuple[torch.Tensor, torch.Tensor], *args: torch.Tensor
-        ) -> None:
+        ) -> tuple[torch.Tensor, ...]:
+            """Returns the first chunk's workspace rows under
+            TPU_PCP_GATHER_HOIST (pass `ws_req, ws_vpage` last), else ()."""
             nope_cache, rope_cache = kv_cache
-            new_nope, new_rope = jax_op(nope_cache, rope_cache, *args)
-            nope_cache.copy_(new_nope)
-            rope_cache.copy_(new_rope)
+            results = jax_op(nope_cache, rope_cache, *args)
+            nope_cache.copy_(results[0])
+            rope_cache.copy_(results[1])
+            return tuple(results[2:])
 
         return pcp_write_split_impl
 
@@ -2946,6 +2970,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         dcp_size = self.dcp_size
         interleave_size = self.dcp_interleave_size
         chunk_tokens = envs.TPU_PCP_KV_CHUNK_TOKENS
+        ws_fill = "empty" if envs.TPU_PCP_WS_NO_ZERO_FILL else "zeros"
+        hoist = envs.TPU_PCP_GATHER_HOIST
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
@@ -2964,6 +2990,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             request_distribution: jax.Array,
             num_split_reqs: jax.Array,
             ws_used_pages: jax.Array,
+            *chunk0: jax.Array,
         ) -> jax.Array:
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_pcp_prefill(
@@ -2990,6 +3017,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 chunk_pages=pcp_chunk_pages(
                     chunk_tokens, nope_spec.page_size, dcp_size
                 ),
+                ws_fill=ws_fill,
+                chunk0=(chunk0[0], chunk0[1]) if hoist else None,
             )
 
         sharded = P(DCP_AXIS_NAME)
@@ -3014,7 +3043,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 sharded,  # request_distribution: local
                 replicated,  # num_split_reqs
                 replicated,  # ws_used_pages
-            ),
+            )
+            + ((sharded, sharded) if hoist else ()),  # chunk 0 workspace rows
             output_partition_specs=(sharded,),  # output
         )
 
@@ -3058,7 +3088,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # All cache writes precede all cache reads, so XLA never copies the
         # cache: split rows, then the decode op (writes, then reads), then the
         # read-only split prefill op.
-        layer.pcp_write_split_op(
+        # TPU_PCP_GATHER_HOIST: the write also gathers the split prefill
+        # workspace's first chunk (async, overlapping the indexer).
+        hoist = envs.TPU_PCP_GATHER_HOIST
+        chunk0 = layer.pcp_write_split_op(
             kv_cache,
             kv_c_normed,
             k_pe,
@@ -3066,6 +3099,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             pcp.split_seq_lens,
             pcp.split_block_tables,
             pcp.split_query_start_loc,
+            *((pcp.ws_req, pcp.ws_vpage) if hoist else ()),
         )
         partial, lse = layer.sparse_mla_dcp_op(
             kv_cache,
@@ -3094,6 +3128,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             md.request_distribution,
             pcp.num_split_reqs,
             pcp.ws_used_pages,
+            *chunk0,
         )
         return kvg.merge_decode_rows(prefill_out, decode_out, md)
 

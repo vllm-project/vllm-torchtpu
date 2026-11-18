@@ -1801,7 +1801,8 @@ def sparse_mla_pcp_write_split(
     pcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
-) -> tuple[jax.Array, jax.Array]:
+    prefetch: tuple[jax.Array, jax.Array, int] | None = None,
+) -> tuple[jax.Array, ...]:
     """PCP manager: write the step's split prefill rows into the DCP shards.
 
     PCP-gathers the split rows' latents and writes the positions this rank
@@ -1809,7 +1810,19 @@ def sparse_mla_pcp_write_split(
     the cache. No `lax.cond`: with no split prefill every row is dropped as
     padding, and a cond result would force a rope cache relayout every step.
 
-    Returns the updated `(kv_cache_nope, kv_cache_rope)`.
+    `prefetch = (ws_req, ws_vpage, chunk_pages)` (TPU_PCP_GATHER_HOIST): also
+    gather the split prefill workspace's first chunk right after the write,
+    outside any control flow, so XLA issues it as an async all-gather that
+    overlaps the layer's indexer instead of a synchronous one inside the
+    attention's `lax.cond` and chunk loop. Its local page take is tied to
+    the cache by an optimization barrier, so it reads the cache before the
+    decode op's in-place write (which never touches split pages) and the
+    cache is not copied. Pass the result to `sparse_mla_attention_pcp_prefill
+    (chunk0=...)`. Gathered (and wasted) even when nothing is split.
+
+    Returns the updated `(kv_cache_nope, kv_cache_rope)`, then with
+    `prefetch` the first chunk's `(nope, rope)` workspace rows,
+    `[dcp * chunk_pages, *page]` per rank.
     """
     from vllm_torchtpu.kernels.mla import pcp_workspace as ws
 
@@ -1826,6 +1839,12 @@ def sparse_mla_pcp_write_split(
         replicated,  # split_query_start_loc
     )
     out_specs = (sharded, sharded)
+    prefetch_args: tuple[jax.Array, ...] = ()
+    if prefetch is not None:
+        prefetch_ws_req, prefetch_ws_vpage, prefetch_chunk_pages = prefetch
+        prefetch_args = (prefetch_ws_req, prefetch_ws_vpage)
+        in_specs += (replicated, replicated)  # ws_req, ws_vpage
+        out_specs += (sharded, sharded)  # chunk 0 workspace rows
 
     def _local(
         kv_cache_nope,
@@ -1836,11 +1855,12 @@ def sparse_mla_pcp_write_split(
         split_seq_lens_,
         split_block_tables_,
         split_qsl_,
+        *prefetch_args_,
     ):
         gather = functools.partial(
             ws.pcp_gather_rows, dcp_axis_name=dcp_axis_name, pcp_size=pcp_size
         )
-        return update_sparse_mla_kv_cache_dcp(
+        caches = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,
             gather(kv_c_normed, restore_idx_),
@@ -1853,6 +1873,23 @@ def sparse_mla_pcp_write_split(
             rope_spec=rope_spec,
             dcp_size=dcp_size,
             interleave_size=interleave_size,
+        )
+        if prefetch is None:
+            return caches
+        ws_req_, ws_vpage_ = prefetch_args_
+        pages = ws.workspace_pages(
+            split_block_tables_,
+            split_seq_lens_.shape[0],
+            ws_req_,
+            ws_vpage_,
+            nope_spec.num_pages,
+        )
+        taken = tuple(ws.take_chunk(c, pages, 0, prefetch_chunk_pages) for c in caches)
+        # The take happens before anything downstream of the returned caches.
+        caches, taken = jax.lax.optimization_barrier((caches, taken))
+        return (
+            *caches,
+            *(ws.gather_taken(t, axis_name=dcp_axis_name) for t in taken),
         )
 
     return jax.jit(
@@ -1868,6 +1905,7 @@ def sparse_mla_pcp_write_split(
         split_seq_lens,
         split_block_tables,
         split_query_start_loc,
+        *prefetch_args,
     )
 
 
@@ -1895,6 +1933,8 @@ def sparse_mla_attention_pcp_prefill(
     interleave_size: int,
     chunk_pages: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    ws_fill: str = "zeros",
+    chunk0: tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array:
     """PCP manager sparse MLA for the split prefill rows (read-only).
 
@@ -1902,6 +1942,13 @@ def sparse_mla_attention_pcp_prefill(
     a fixed-size workspace, `chunk_pages` pages per DCP all-gather and only as
     many chunks as in use, then attends the local queries' top-k (global
     positions) over it in one call.
+
+    `ws_fill` (`pcp_workspace.WORKSPACE_FILLS`): what the workspace holds
+    before the chunks land; "empty" (TPU_PCP_WS_NO_ZERO_FILL) skips zeroing
+    it, same output (`pcp_workspace.latent_workspace`).
+    `chunk0` (TPU_PCP_GATHER_HOIST): the first chunk's workspace rows, already
+    gathered by `sparse_mla_pcp_write_split(prefetch=...)`; only the chunks
+    after it are gathered here. Same output.
 
     Returns `[local_tokens, local_heads, lkv_dim]`; zeros when nothing is split.
     """
@@ -1932,6 +1979,8 @@ def sparse_mla_attention_pcp_prefill(
         replicated,  # num_split_reqs
         replicated,  # ws_used_pages
     )
+    if chunk0 is not None:
+        in_specs += (sharded, sharded)  # chunk 0 workspace rows
     out_specs = sharded
 
     def _local(
@@ -1948,11 +1997,12 @@ def sparse_mla_attention_pcp_prefill(
         rd_,
         num_split_,
         ws_used_pages_,
+        *chunk0_,
     ):
         num_tokens, num_heads, lkv_dim = ql_nope.shape
 
         def run(caches):
-            nope, rope = caches
+            nope, rope = caches[:2]
             pages = ws.workspace_pages(
                 split_block_tables_,
                 split_block_tables_.shape[0],
@@ -1999,13 +2049,29 @@ def sparse_mla_attention_pcp_prefill(
                 return buf_nope, buf_rope
 
             num_chunks = (ws_used_pages_[0] + chunk_pages - 1) // chunk_pages
-            # TODO(weiyulin): This line zero entire workspace, we should benchmark
-            # if this time-consuming.
-            init = (
-                jnp.zeros((ws_rows, *nope.shape[1:]), nope.dtype),
-                jnp.zeros((ws_rows, *rope.shape[1:]), rope.dtype),
-            )
-            ws_nope, ws_rope = jax.lax.fori_loop(0, num_chunks, gather_body, init)
+            if ws_fill == "zeros" and chunk0 is None:
+                # TODO(weiyulin): This line zero entire workspace, we should
+                # benchmark if this time-consuming.
+                init = (
+                    jnp.zeros((ws_rows, *nope.shape[1:]), nope.dtype),
+                    jnp.zeros((ws_rows, *rope.shape[1:]), rope.dtype),
+                )
+                ws_nope, ws_rope = jax.lax.fori_loop(0, num_chunks, gather_body, init)
+            else:
+                init = (
+                    ws.latent_workspace(ws_rows, nope, ws_fill),
+                    ws.latent_workspace(ws_rows, rope, ws_fill),
+                )
+                first = 0
+                if chunk0 is not None:
+                    init = tuple(
+                        jax.lax.dynamic_update_slice_in_dim(buf, rows, 0, axis=0)
+                        for buf, rows in zip(init, caches[2:])
+                    )
+                    first = 1
+                ws_nope, ws_rope = jax.lax.fori_loop(
+                    first, num_chunks, gather_body, init
+                )
 
             q = jnp.concatenate([ql_nope, q_pe], axis=-1)
             output = sparse_mla_kernel.sparse_ragged_paged_attention(
@@ -2031,7 +2097,7 @@ def sparse_mla_attention_pcp_prefill(
             return jnp.zeros((num_tokens, num_heads, lkv_dim), ql_nope.dtype)
 
         return jax.lax.cond(
-            num_split_[0] > 0, run, skip, (kv_cache_nope, kv_cache_rope)
+            num_split_[0] > 0, run, skip, (kv_cache_nope, kv_cache_rope, *chunk0_)
         )
 
     return jax.jit(
@@ -2052,4 +2118,5 @@ def sparse_mla_attention_pcp_prefill(
         request_distribution,
         num_split_reqs,
         ws_used_pages,
+        *(chunk0 or ()),
     )

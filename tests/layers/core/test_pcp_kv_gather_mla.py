@@ -339,7 +339,85 @@ def test_pcp_prefill_packed_rope_matches_unpacked(monkeypatch, scenario, pcp):
         )
 
 
-def _pcp_prefill_outputs(monkeypatch, scenario, pcp, layout, packed_rope=False):
+# (ws_fill, hoist) variants of the split prefill: TPU_PCP_WS_NO_ZERO_FILL
+# ("empty"), the test-only NaN workspace that no attended row may come from
+# ("nan"), and TPU_PCP_GATHER_HOIST (first chunk gathered by the write op).
+WORKSPACE_VARIANTS = [
+    ("empty", False),
+    ("nan", False),
+    ("zeros", True),
+    ("empty", True),
+    ("nan", True),
+]
+_DEFAULT_OUTPUTS: dict = {}
+
+
+def _default_outputs(monkeypatch, scenario, pcp, layout, packed_rope=False):
+    """`_pcp_prefill_outputs` of the default path, computed once per input."""
+    key = (scenario, pcp, layout, packed_rope)
+    if key not in _DEFAULT_OUTPUTS:
+        _DEFAULT_OUTPUTS[key] = _pcp_prefill_outputs(
+            monkeypatch, scenario, pcp, layout, packed_rope=packed_rope
+        )
+    return _DEFAULT_OUTPUTS[key]
+
+
+@pytest.mark.parametrize("ws_fill,hoist", WORKSPACE_VARIANTS)
+@pytest.mark.parametrize("layout", ["sparsecore", "tensorcore"])
+@pytest.mark.parametrize("pcp", [2, 8])
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_pcp_prefill_workspace_variants_match_default(
+    monkeypatch, scenario, pcp, layout, ws_fill, hoist
+):
+    """TPU_PCP_WS_NO_ZERO_FILL / TPU_PCP_GATHER_HOIST: every output row is bit
+    for bit the default path's, also when the workspace starts as fp8 NaN
+    (so unwritten rows reach no output), and the split rows match numpy."""
+    base = _default_outputs(monkeypatch, scenario, pcp, layout)
+    got = _pcp_prefill_outputs(
+        monkeypatch, scenario, pcp, layout, ws_fill=ws_fill, hoist=hoist
+    )
+    assert len(got) == len(base)
+    for step, ((out_g, mask_g), (out_b, mask_b)) in enumerate(zip(got, base)):
+        np.testing.assert_array_equal(mask_g, mask_b)
+        assert np.isfinite(out_g[mask_g]).all(), f"step {step}: non-finite row"
+        np.testing.assert_array_equal(
+            out_g[mask_g], out_b[mask_b], err_msg=f"step {step}: split rows"
+        )
+        np.testing.assert_array_equal(
+            out_g, out_b, err_msg=f"step {step}: unchecked rows"
+        )
+
+
+@pytest.mark.parametrize("ws_fill,hoist", [("empty", True)])
+@pytest.mark.parametrize("pcp", [2, 8])
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_pcp_prefill_workspace_variants_packed_rope(
+    monkeypatch, scenario, pcp, ws_fill, hoist
+):
+    """The L2b cache (TPU_PCP_PACKED_ROPE, sparsecore) with both flags."""
+    base = _default_outputs(monkeypatch, scenario, pcp, "sparsecore", True)
+    got = _pcp_prefill_outputs(
+        monkeypatch,
+        scenario,
+        pcp,
+        "sparsecore",
+        packed_rope=True,
+        ws_fill=ws_fill,
+        hoist=hoist,
+    )
+    for step, ((out_g, _), (out_b, _)) in enumerate(zip(got, base)):
+        np.testing.assert_array_equal(out_g, out_b, err_msg=f"step {step}")
+
+
+def _pcp_prefill_outputs(
+    monkeypatch,
+    scenario,
+    pcp,
+    layout,
+    packed_rope=False,
+    ws_fill="zeros",
+    hoist=False,
+):
     """Runs every step of `scenario` through the PCP write + prefill attention,
     checks each split prefill row against numpy, and returns per step
     `(output [DCP, local_padded, H, LKV_DIM], checked-row mask [DCP, local_padded])`.
@@ -409,7 +487,7 @@ def _pcp_prefill_outputs(monkeypatch, scenario, pcp, layout, packed_rope=False):
             [q_bf16[d // tp][:, (d % tp) * h : (d % tp + 1) * h] for d in range(DCP)]
         )
 
-        caches = attention_interface.sparse_mla_pcp_write_split(
+        written = attention_interface.sparse_mla_pcp_write_split(
             *caches,
             jnp.asarray(_by_dcp_rank(pcp, kv_rows)),
             jnp.asarray(_by_dcp_rank(pcp, pe_rows)),
@@ -423,7 +501,18 @@ def _pcp_prefill_outputs(monkeypatch, scenario, pcp, layout, packed_rope=False):
             dcp_size=DCP,
             pcp_size=pcp,
             interleave_size=INTERLEAVE,
+            prefetch=(
+                (
+                    _rep(plan0.host_metadata["ws_req"]),
+                    _rep(plan0.host_metadata["ws_vpage"]),
+                    chunk_pages,
+                )
+                if hoist
+                else None
+            ),
         )
+        caches, chunk0 = tuple(written[:2]), tuple(written[2:])
+        assert len(chunk0) == (2 if hoist else 0)
         out = attention_interface.sparse_mla_attention_pcp_prefill(
             *caches,
             jnp.asarray(q_global[..., :LKV_DIM], jnp.bfloat16),
@@ -447,6 +536,8 @@ def _pcp_prefill_outputs(monkeypatch, scenario, pcp, layout, packed_rope=False):
             dcp_size=DCP,
             interleave_size=INTERLEAVE,
             chunk_pages=chunk_pages,
+            ws_fill=ws_fill,
+            chunk0=chunk0 or None,
         )
         out = np.asarray(out.astype(jnp.float32)).reshape(
             DCP, local_padded, HEADS_PER_RANK, LKV_DIM

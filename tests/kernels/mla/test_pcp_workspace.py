@@ -13,6 +13,7 @@
 # limitations under the License.
 """Position-ordered indexer K workspace (`kernels/mla/pcp_workspace.py`)."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -137,3 +138,30 @@ def test_topk_rows_past_token_end_are_masked():
     # Masked rows read one in-bounds dummy key and nothing else.
     np.testing.assert_array_equal(idx[2:], [[0, -1, -1], [0, -1, -1]])
     assert idx[:2].max() < 2 * chunk_pages * dcp * page_size
+
+
+@pytest.mark.parametrize("dtype", [jnp.uint8, jnp.uint32])
+@pytest.mark.parametrize("fill", ws.WORKSPACE_FILLS)
+def test_latent_workspace_fills(fill, dtype):
+    like = jnp.zeros((3, 8, 128), dtype)
+    buf = ws.latent_workspace(5, like, fill)
+    assert buf.shape == (5, 8, 128) and buf.dtype == dtype
+    if fill == "zeros":
+        assert not np.asarray(buf).any()
+    if fill == "nan":
+        # Every byte 0xFF: an fp8 e4m3fn NaN wherever the attention reads it.
+        assert (np.asarray(buf).view(np.uint8) == 0xFF).all()
+        nan = jax.lax.bitcast_convert_type(jnp.uint8(0xFF), jnp.float8_e4m3fn)
+        assert np.isnan(np.float32(nan.astype(jnp.float32)))
+
+
+def test_latent_workspace_rejects_unknown_fill():
+    with pytest.raises(ValueError, match="fill must be one of"):
+        ws.latent_workspace(2, jnp.zeros((1, 4), jnp.uint8), "garbage")
+
+
+def test_take_chunk_reads_the_chunk_pages():
+    cache = jnp.arange(10 * 3, dtype=jnp.uint32).reshape(10, 3)
+    pages = jnp.asarray([7, 2, 5, 1, 9, 0], jnp.int32)
+    got = np.asarray(ws.take_chunk(cache, pages, 1, 2))
+    np.testing.assert_array_equal(got, np.asarray(cache)[[5, 1]])
