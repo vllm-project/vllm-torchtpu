@@ -1558,6 +1558,45 @@ def send_layout_shape(
     return (world, SEND_PAD_ROWS + num_tokens * (num_heads // world), vdim)
 
 
+def xchg_live_row_tiers(
+    slab_row0: int, send_per: int, num_tokens: int, xchg_rows: int
+) -> tuple[int, ...]:
+    if num_tokens <= 4:
+        token_breaks = (1, 2, 3)
+    elif num_tokens <= 8:
+        token_breaks = (2, 4, 6)
+    else:
+        token_breaks = (
+            max(1, num_tokens // 8),
+            max(1, num_tokens // 4),
+            max(1, num_tokens // 2),
+            max(1, (3 * num_tokens) // 4),
+        )
+    tiers = sorted(
+        {
+            min(xchg_rows, align_to(slab_row0 + tok * send_per, 8))
+            for tok in token_breaks
+        }
+        | {xchg_rows}
+    )
+    return tuple(tiers)
+
+
+def xchg_peer_order(me: Any, world: int) -> list[Any]:
+    # Avoid lockstep j=0..world-1 receiver incast; on world==16 launch the
+    # opposite 8-rank half first so inter-host transfers overlap local sends.
+    if world == 16:
+        low = me & 7
+        remote_hi = (me ^ 8) & 8
+        local_hi = me & 8
+        return [(((low + s) & 7) | remote_hi) for s in range(8)] + [
+            (((low + s) & 7) | local_hi) for s in range(1, 8)
+        ]
+    if isinstance(me, int):
+        return [(me + s) % world for s in range(1, world)]
+    return [lax.rem(me + jnp.int32(s), jnp.int32(world)) for s in range(1, world)]
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
@@ -1860,7 +1899,14 @@ def _attention_kernel(
         send_rows = num_tokens * send_per
         send_lanes = send_layout_lanes(num_tokens, num_q_heads, send_world)
     # First partial row of a destination's slab in the bo tile.
-    slab_row0 = SEND_SLAB_ROW0 if xchg else 0
+    # Avoid sending 7 empty header rows in private-VMEM xchg_merge (m=4):
+    # row 3 holds LSE words and rows 4..7 hold token 0, fitting B=1 in 8 rows.
+    compact_merge_slab = (
+        xchg_merge
+        and send_per == 4  # pyrefly: ignore[unbound-name]
+        and SEND_SLAB_ROW0 >= 8
+    )
+    slab_row0 = 4 if compact_merge_slab else (SEND_SLAB_ROW0 if xchg else 0)
     if xchg:
         assert not preserve_suffix and batch_size == num_tokens, (
             "the fused exchange runs on a one-step grid"
@@ -1871,6 +1917,16 @@ def _attention_kernel(
         # Rows each destination receives from row SEND_SLAB_ROW0 of its block.
         xchg_rows = SEND_SLAB_ROW0 + send_rows  # pyrefly: ignore[unbound-name]
         xchg_block = SEND_PAD_ROWS + send_rows
+        xchg_has_valid = start_end_seq_idx_ref.shape[0] >= 5
+        xchg_tiers = (
+            xchg_live_row_tiers(slab_row0, send_per, num_tokens, xchg_rows)
+            if (
+                xchg_has_valid
+                and fault
+                not in ("send_peer_drop", "send_peer_misorder", "send_xchg_rm_round")
+            )
+            else (xchg_rows,)
+        )
         assert bo_x2_ref.shape[2] == xchg_rows, bo_x2_ref.shape
         if xchg_merge:
             assert recv_v_ref is not None
@@ -2468,9 +2524,9 @@ def _attention_kernel(
             head = bo_x2_ref[0, :, pl.ds(0, SEND_PAD_ROWS), :]
             old = pltpu.bitcast(head, jnp.int32)
             tile = jnp.where(
-                r == SEND_SLAB_ROW0 // 2 - 1,
+                r == slab_row0 // 2 - 1,
                 word,
-                jnp.where(r < SEND_SLAB_ROW0 // 2, 0, old),
+                jnp.where(r < slab_row0 // 2, 0, old),
             )
             bo_x2_ref[0, :, pl.ds(0, SEND_PAD_ROWS), :] = pltpu.bitcast(tile, jnp.int16)
             return
@@ -2500,12 +2556,7 @@ def _attention_kernel(
             )
 
     def xchg_round():
-        """small_all_to_all's round on the slabs: slab d into rows
-        [me * block + SEND_SLAB_ROW0, (me + 1) * block) of rank d's output,
-        the own slab by a local copy, then wait for the n - 1 arrivals (bytes
-        counted on local descriptors) and for the own sends. One barrier per
-        call suffices as in small_all_to_all: a rank leaves call k only after
-        every peer's block of call k landed and its own sends are done."""
+        """Run slab exchange with live-row trimming and rotated Z-first peer order."""
         n = send_world
         me = start_end_seq_idx_ref[2]
         send_sem, recv_sem, local_sem = (xchg_sems.at[i] for i in range(3))
@@ -2515,50 +2566,108 @@ def _attention_kernel(
         expect = n - 2 if drop else n - 1
         slot = lax.rem(me + 1, n) if fault == "send_peer_misorder" else me
 
-        def rows_of(k):
+        def rows_of(k, nrows):
             if xchg_merge:
                 # Merge mode: slot k of the receive scratch (VMEM).
-                return recv_v_ref.at[k]
+                return (
+                    recv_v_ref.at[k]
+                    if nrows == xchg_rows
+                    else recv_v_ref.at[k, pl.ds(0, nrows)]
+                )
             start = k * xchg_block + SEND_SLAB_ROW0
             if not isinstance(k, int):
                 start = pl.multiple_of(start, 8)
-            return lse_hbm_ref.at[pl.ds(start, xchg_rows)]
+            return lse_hbm_ref.at[pl.ds(start, nrows)]
 
-        mine = rows_of(slot)
-        for j in range(n):
-            skip = jnp.int32(j) == me
-            if drop:
-                skip = skip | (jnp.int32(j) == lax.rem(me + 3, n))
+        def src_of(j, nrows):
+            return (
+                bo_x2_ref.at[0, j]
+                if nrows == xchg_rows
+                else bo_x2_ref.at[0, j, pl.ds(0, nrows)]
+            )
 
-            @pl.when(jnp.logical_not(skip))
-            def _(j=j):
-                if fault == "send_xchg_rm_round":
-                    # Timing only: the round without the peers -- slab j
-                    # copied into this rank's own slot j.
-                    pltpu.make_async_copy(
-                        bo_x2_ref.at[0, j], rows_of(j), recv_sem
+        def others_ref(nrows):
+            if xchg_merge:
+                return (
+                    recv_v_ref.at[pl.ds(0, expect)]
+                    if nrows == xchg_rows
+                    else recv_v_ref.at[pl.ds(0, expect), pl.ds(0, nrows)]
+                )
+            return lse_hbm_ref.at[pl.ds(0, expect * nrows)]
+
+        def _issue_and_wait_recv(nrows):
+            mine = rows_of(slot, nrows)
+            if fault == "send_xchg_rm_round":
+                for j in range(n):
+
+                    @pl.when(jnp.int32(j) != me)
+                    def _(j=j):
+                        pltpu.make_async_copy(
+                            src_of(j, nrows), rows_of(j, nrows), recv_sem
+                        ).start()
+            elif drop:
+                for j in range(n):
+                    skip = (jnp.int32(j) == me) | (jnp.int32(j) == lax.rem(me + 3, n))
+
+                    @pl.when(jnp.logical_not(skip))
+                    def _(j=j):
+                        pltpu.make_async_remote_copy(
+                            src_ref=src_of(j, nrows),
+                            dst_ref=mine,
+                            send_sem=send_sem,
+                            recv_sem=recv_sem,
+                            device_id=xchg_peer(j),
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
+            else:
+                for peer_j in xchg_peer_order(me, n):
+                    pltpu.make_async_remote_copy(
+                        src_ref=src_of(peer_j, nrows),
+                        dst_ref=mine,
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
+                        device_id=xchg_peer(peer_j),
+                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
-                    return
-                pltpu.make_async_remote_copy(
-                    src_ref=bo_x2_ref.at[0, j],
-                    dst_ref=mine,
-                    send_sem=send_sem,
-                    recv_sem=recv_sem,
-                    device_id=xchg_peer(j),
-                    device_id_type=pl.DeviceIdType.MESH,
-                ).start()
 
-        local = pltpu.make_async_copy(bo_x2_ref.at[0, me], rows_of(me), local_sem)
-        local.start()
-        others = (
-            recv_v_ref.at[pl.ds(0, expect)]
-            if xchg_merge
-            else lse_hbm_ref.at[pl.ds(0, expect * xchg_rows)]
-        )
-        pltpu.make_async_copy(others, others, recv_sem).wait()
-        local.wait()
-        if fault != "send_xchg_rm_round":
-            pltpu.make_async_copy(others, others, send_sem).wait()
+            local = pltpu.make_async_copy(
+                src_of(me, nrows), rows_of(me, nrows), local_sem
+            )
+            local.start()
+            others = others_ref(nrows)
+            pltpu.make_async_copy(others, others, recv_sem).wait()
+            local.wait()
+
+        def _wait_sends_for(nrows):
+            if fault != "send_xchg_rm_round":
+                others = others_ref(nrows)
+                pltpu.make_async_copy(others, others, send_sem).wait()
+
+        if len(xchg_tiers) == 1:
+            _issue_and_wait_recv(xchg_tiers[0])
+            return lambda: _wait_sends_for(xchg_tiers[0])
+
+        need_rows = jnp.int32(slab_row0) + jnp.maximum(
+            start_end_seq_idx_ref[4], jnp.int32(0)
+        ) * jnp.int32(send_per)
+
+        def _dispatch_tiers(fn):
+            for idx, tier_rows in enumerate(xchg_tiers):
+                if idx == 0:
+                    cond = need_rows <= jnp.int32(tier_rows)
+                elif idx == len(xchg_tiers) - 1:
+                    cond = need_rows > jnp.int32(xchg_tiers[idx - 1])
+                else:
+                    cond = (need_rows > jnp.int32(xchg_tiers[idx - 1])) & (
+                        need_rows <= jnp.int32(tier_rows)
+                    )
+
+                @pl.when(cond)
+                def _(tr=tier_rows):
+                    fn(tr)
+
+        _dispatch_tiers(_issue_and_wait_recv)
+        return lambda: _dispatch_tiers(_wait_sends_for)
 
     def xchg_merge_store():
         """Merge mode: the unpack + torch `_merge_received` on the W received
@@ -2587,10 +2696,10 @@ def _attention_kernel(
         c128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 1)
         l_cols = []
         for w in range(n):
-            # int16 words to int32 lanes (sign-extended): row SEND_SLAB_ROW0 - 1
+            # int16 words to int32 lanes (sign-extended): row slab_row0 - 1
             # of the slab is the lse word row.
             head = recv_v_ref[w, pl.ds(0, hdr), :].astype(jnp.int32)
-            words = head[SEND_SLAB_ROW0 - 1 : SEND_SLAB_ROW0]  # [1, o_dim]
+            words = head[slab_row0 - 1 : slab_row0]  # [1, o_dim]
             lo_src = pltpu.roll(words, o_dim - tl, 1)  # lane r <- lane tl + r
             bits = lax.shift_left(words, jnp.int32(16)) | (lo_src & 0xFFFF)
             l_row = lax.bitcast_convert_type(bits, jnp.float32)[:, :128]
@@ -2630,7 +2739,7 @@ def _attention_kernel(
             # zeroed as the merge does.
             xi = recv_v_ref[w].astype(jnp.int32)  # [SEND_SLAB_ROW0 + tl, o_dim]
             part = lax.bitcast_convert_type(
-                lax.shift_left(xi[SEND_SLAB_ROW0 : SEND_SLAB_ROW0 + tl], jnp.int32(16)),
+                lax.shift_left(xi[slab_row0 : slab_row0 + tl], jnp.int32(16)),
                 jnp.float32,
             )
             part = jnp.where(rows_i < live, part, 0.0)
@@ -3314,9 +3423,12 @@ def _attention_kernel(
     is_last = pl.program_id(0) == pl.num_programs(0) - 1
     if xchg:
         build_send_lse_words()
-        xchg_round()
+        wait_xchg_sends = xchg_round()
         if xchg_merge:
+            # Avoid blocking xchg_merge_store (reads recv_v_ref, writes bo slot 1)
+            # on trailing send_sem completions guarding bo slot 0.
             xchg_merge_store()
+        wait_xchg_sends()
     elif send:
         # Every token's lse is in `fill_ref` now; the words overlap the last
         # partial DMA.
@@ -4629,10 +4741,10 @@ def sparse_attention_chunk(
         if preserve_suffix:
             bounds.append(token_end)
         if send_exchange is not None:
-            # (rank, lane) ride the bounds prefetch: no extra operand.
+            # (rank, lane[, real_tokens]) ride the bounds prefetch: no extra operand.
             assert not preserve_suffix and send_peer is not None
             bounds += [send_peer[0], send_peer[1]]
-            if xchg_merge:
+            if xchg_merge or send_peer.shape[0] >= 3:
                 bounds.append(send_peer[2])  # real tokens
         scalar_prefetches = (
             kv_lens,

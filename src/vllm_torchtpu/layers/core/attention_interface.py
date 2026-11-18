@@ -5,10 +5,6 @@ from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
-import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
-import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
-import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
-import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -19,18 +15,18 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
+
+import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
+import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
+import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
+import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
-from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import get_megacore
-
-import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
@@ -39,6 +35,10 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache_dcp,
 )
 from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import get_megacore
 
 logger = init_logger(__name__)
 
@@ -1165,6 +1165,18 @@ def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
     return bool(pin), int(vmem_mib)
 
 
+def build_fused_exchange_peer(
+    dcp_rank: jax.Array, dcp_lane: jax.Array, query_start_loc: jax.Array
+) -> jax.Array:
+    return jnp.stack(
+        [
+            dcp_rank.astype(jnp.int32),
+            dcp_lane.astype(jnp.int32),
+            query_start_loc[-1].astype(jnp.int32),
+        ]
+    )
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1495,11 +1507,9 @@ def sparse_mla_attention_dcp(
                         bool(merge_here),
                     )
                     assert dcp_lane is not None  # lifted when fused_exchange
-                    peer = [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
-                    if merge_here:
-                        # The real-token count: the kernel's unpack mask.
-                        peer.append(query_start_loc_[-1].astype(jnp.int32))
-                    split_kwargs["send_peer"] = jnp.stack(peer)
+                    split_kwargs["send_peer"] = build_fused_exchange_peer(
+                        dcp_rank, dcp_lane, query_start_loc_
+                    )
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes

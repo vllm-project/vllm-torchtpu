@@ -32,10 +32,12 @@ halves) that must fail, by the write-tpu-kernels harness of close-gaps trial 6
 import os
 from unittest import mock
 
+import jax.numpy as jnp
 import pytest
 
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
 from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
+from vllm_torchtpu.layers.core import attention_interface as ai
 
 GATE_ENV = {
     "TPU_MLA_FUSED_SMALL_A2A": "1",
@@ -188,3 +190,38 @@ def test_merge_mode_constants():
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", None)
         assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS == 4
+
+
+def test_should_build_8row_aligned_live_tiers_for_decode_buckets():
+    assert sparse_mla.xchg_live_row_tiers(4, 4, 4, 24) == (8, 16, 24)
+    assert sparse_mla.xchg_live_row_tiers(8, 4, 8, 40) == (16, 24, 32, 40)
+    assert sparse_mla.xchg_live_row_tiers(8, 4, 16, 72) == (16, 24, 40, 56, 72)
+    assert sparse_mla.xchg_live_row_tiers(8, 4, 32, 136) == (24, 40, 72, 104, 136)
+    assert sparse_mla.xchg_live_row_tiers(8, 8, 4, 40) == (16, 24, 32, 40)
+
+
+@pytest.mark.parametrize("world", [2, 4, 8, 16])
+def test_should_produce_collision_free_rotated_peer_bijection(world):
+    schedules = [sparse_mla.xchg_peer_order(me, world) for me in range(world)]
+    for me, peers in enumerate(schedules):
+        assert len(peers) == world - 1
+        assert len(set(peers)) == world - 1
+        assert me not in peers
+        assert set(peers) == set(range(world)) - {me}
+        if world == 16:
+            assert all(((p ^ me) & 8) == 8 for p in peers[:8])
+            assert all(((p ^ me) & 8) == 0 for p in peers[8:])
+    for step in range(world - 1):
+        receivers = [schedules[me][step] for me in range(world)]
+        assert len(set(receivers)) == world
+
+
+def test_should_pack_valid_token_count_in_fused_exchange_peer():
+    peer = ai.build_fused_exchange_peer(
+        jnp.asarray(5, jnp.int32),
+        jnp.asarray(0, jnp.int32),
+        jnp.asarray([0, 1, 2, 3], jnp.int32),
+    )
+    assert peer.shape == (3,)
+    assert peer.dtype == jnp.int32
+    assert [int(x) for x in peer] == [5, 0, 3]
