@@ -15,6 +15,7 @@
 
 from collections.abc import Callable
 
+import torch
 from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
     RoutingSimulatorRouter,
 )
@@ -25,6 +26,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
+from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
@@ -56,6 +58,20 @@ class VllmMoERunner(MoERunner):
             # strategies without monolithic support). The TPU MoE methods
             # simulate routing themselves from the real logits (moe_routing).
             self.router.prepare_monolithic_logits = lambda router_logits: router_logits
+        # Before the weights load, and whatever the quant method and kernel:
+        # a placed layer loads its experts in slot order.
+        expert_placement.apply(self)
+        self.capture_fn = None
+
+    @property
+    def capture_fn(self) -> Callable[[torch.Tensor], None] | None:
+        # pyrefly: ignore[bad-return]
+        return self.routed_experts.capture_fn
+
+    @capture_fn.setter
+    def capture_fn(self, fn: Callable[[torch.Tensor], None] | None) -> None:
+        # pyrefly: ignore[bad-argument-type]
+        self.routed_experts.capture_fn = fn
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts

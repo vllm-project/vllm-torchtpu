@@ -129,6 +129,7 @@ def _make_self(
         "_expand_pool_split",
         "_spec_seed_sources",
         "_copy_mamba_state_blocks",
+        "_mamba_column_stride",
     ):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
     return ns, raws

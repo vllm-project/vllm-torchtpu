@@ -1026,7 +1026,7 @@ class TestTpuPlatform:
             ("TPU v8i", "TPU v8i"),
         ],
     )
-    @patch("jax.devices")
+    @patch("jax.local_devices")
     def test_get_device_name(self, mock_devices, raw_kind, expected_name):
         """Tests get_device_name across TPU generations."""
         mock_dev = MagicMock()

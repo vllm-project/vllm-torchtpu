@@ -86,7 +86,7 @@ Order findings blocking first, then should-fix, most severe first within each. B
 
 ## 4. Area rules
 
-### Kernels: `src/vllm_torchtpu/{kernels,megakernel}/**`
+### Kernels: `src/vllm_torchtpu/{kernels,megakernel/core}/**`
 
 - [B] **DMA bounds**. With `disable_bounds_checks=True`, every DMA stays inside live data: none for empty inputs or padded rows, sources clamped to the last live page, ring offsets wrapped, VMEM destinations in range at the largest loop index. The loop provably runs as many steps as the DMA prologue starts, and admission proves every whole DMA tile fits.
 - [B] **TPU test per path** (R-8.1, R-8.4). Each new Pallas kernel, argument, mode, or dtype path needs a `tpu_test` running the real kernel against an independent NumPy or JAX reference; plain JAX helpers can test on CPU (R-8.5). Patched-out kernels and Python stand-ins for a Pallas `Ref` do not count. An untested kernel is blocking; a missing case for a new argument is should-fix.
@@ -107,7 +107,7 @@ Order findings blocking first, then should-fix, most severe first within each. B
 
 - [B] **Declare only what works**. Declare only supported mixins and modality limits, and limit or reject at startup a capability that works only in some modes. Register every `architectures` name of the released checkpoint (also in `MODELS_CONFIG_MAP` if the model has TPU config checks), or state that the checkpoint does not run yet (should-fix). Load every key an accepted variant ships, or reject the variant at config time.
 
-### Runner and worker: `src/vllm_torchtpu/{runner,worker,core,executors,structured_decoding,spec_decode}/**`, `src/vllm_torchtpu/kv_cache_*.py`
+### Runner and worker: `src/vllm_torchtpu/{runner,worker,core,executors,structured_decoding,spec_decode,megakernel/adapter}/**`, `src/vllm_torchtpu/kv_cache_*.py`
 
 - [B] **Async placeholders**. Under async scheduling, `output_token_ids` holds `1 + num_draft` placeholders until `_modify_prev_results` runs; do not count or read them before. A layout that reorders tokens maps request-major order to local positions (`local_index_for_request_major_token`).
 - [B] **Idempotent helpers**. A helper that runs twice must not build on env values it exported, or reset state whose inputs did not change.

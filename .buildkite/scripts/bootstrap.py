@@ -54,6 +54,8 @@ _CI_MERGE_BOT_LOGIN = "github-actions[bot]"
 # fails rather than drop the requested extras.
 _MQ_EXTRAS_ATTEMPTS = 3
 _MQ_EXTRAS_RETRY_SECONDS = 10
+# History depths tried, in order, until a PR's merge-base with its base is found.
+_PR_FETCH_DEPTHS = (20, 200, 1000)
 _LABEL_EXTRAS = {"run-perf-eval": "perf-eval", "run-full-ci": "nightly-suite"}
 _PR_SUITE_LABELS = ("skip-tpu-ci", *_LABEL_EXTRAS)
 _VALID_CI_EXTRAS = frozenset(_LABEL_EXTRAS.values())
@@ -200,6 +202,15 @@ class BuildContext:
             return False
         # after cutover, PR pushes are CPU-only
         return not (self.is_pr and self.ci_pr_push_cpu_only)
+
+    # Whether this build runs pre-commit itself (pipeline_precommit.yml), so the
+    # required Buildkite status covers it: always in the queue, and on PR and /ci
+    # builds after cutover. Docs-only changes still get it.
+    @property
+    def runs_precommit(self) -> bool:
+        return self.is_merge_queue or (
+            self.ci_pr_push_cpu_only and (self.is_pr or self.is_ci_command)
+        )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> BuildContext:
@@ -533,7 +544,7 @@ def _git(
         cwd=cwd,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL if args[:1] == ("diff",) else None,
+        stderr=subprocess.DEVNULL if args[:1] in (("diff",), ("merge-base",)) else None,
         text=True,
         check=check,
     )
@@ -588,22 +599,33 @@ def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
         return []
     if ctx.is_pr:
         print(f"PR detected. Target branch: {ctx.pr_base_branch}")
-        if (
-            _git(
-                "fetch",
-                "origin",
-                ctx.pr_base_branch,
-                "--depth=20",
-                "--quiet",
-                env=env,
-            ).returncode
-            != 0
-        ):
-            print("Base fetch failed")
-        _git("fetch", "origin", ctx.commit, "--depth=20", "--quiet", env=env)
-        if files := _diff_names(
-            [f"origin/{ctx.pr_base_branch}...{ctx.commit}"], env=env
-        ):
+        base_ref = f"origin/{ctx.pr_base_branch}"
+        # A shallow fetch misses the merge-base of a PR that is many commits
+        # behind its base, and `base...commit` then fails. Fetch deeper until
+        # git finds it. Without a merge-base, run everything: diffing only the
+        # head commit would treat a multi-commit PR whose last commit is
+        # docs-only as a docs-only change.
+        for depth in _PR_FETCH_DEPTHS:
+            if (
+                _git(
+                    "fetch",
+                    "origin",
+                    ctx.pr_base_branch,
+                    f"--depth={depth}",
+                    "--quiet",
+                    env=env,
+                ).returncode
+                != 0
+            ):
+                print("Base fetch failed")
+            _git("fetch", "origin", ctx.commit, f"--depth={depth}", "--quiet", env=env)
+            if _git("merge-base", base_ref, ctx.commit, env=env).returncode == 0:
+                break
+            print(f"No merge-base with {base_ref} at depth {depth}")
+        else:
+            print(f"No merge-base with {base_ref}; running the full build")
+            return []
+        if files := _diff_names([f"{base_ref}...{ctx.commit}"], env=env):
             return files
         tree = _git(
             "diff-tree",
@@ -1025,6 +1047,10 @@ def run_bootstrap(
                     "Docs-only change; skipped CPU and TPU checks in the merge queue.",
                     env=child_env,
                 )
+            if ctx.runs_precommit:
+                print("Only documentation/non-code files changed. Running pre-commit.")
+                upload_stages((("precommit",),), child_env, repo_root=repo_root)
+                return 0
             print("Only documentation/non-code files changed. Skipping CI build.")
             return 0
         print("Code files changed. Proceeding with pipeline upload.")
@@ -1128,7 +1154,10 @@ def run_bootstrap(
         child_env["PR_TPU_CONCURRENCY_GROUP"] = concurrency_group
 
     # 6. Upload stage 0 (multi-stage suites chain later stages via upload-stages).
-    upload_stages(suite.stages, child_env, repo_root=repo_root)
+    stages = suite.stages
+    if ctx.runs_precommit:
+        stages = (("precommit", *stages[0]), *stages[1:])
+    upload_stages(stages, child_env, repo_root=repo_root)
     print("--- Buildkite Bootstrap Finished")
     return 0
 

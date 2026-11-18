@@ -70,6 +70,13 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
+    # TODO(google-pytorch/torch_tpu#4892): Remove this patch once the pinned
+    # torch_tpu skips AOTAutogradCache.save for synthetic `torchtpu_` keys.
+    Patch(
+        "vllm_torchtpu.compilation.aot_autograd_save_patch:"
+        "patch_torchtpu_skip_unread_aot_autograd_save",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_all_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_prefix_isolation", _ACTIVE),
@@ -121,7 +128,12 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
+    Patch("vllm_torchtpu.model_loader_patches:patch_expert_placement_routers", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
+    Patch(
+        "vllm_torchtpu.layers.adapter.dp_vocab_parallel:register_logits_processor",
+        _ACTIVE,
+    ),
     Patch(
         "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
         _ENGINE,

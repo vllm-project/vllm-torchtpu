@@ -32,6 +32,8 @@ test's choosing; ``test_the_mesh_axis_name_is_the_one_the_kernel_reads`` pins
 that constraint, which the layer's own signature does not state.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -465,6 +467,107 @@ def test_hash_routing_serves_the_ids_it_was_given():
     assert _relative_l2(selected, want) > ROTATED_CONTROL_FACTOR * error
 
 
+# Rows each shard's local experts receive, in visit order, and the token
+# count that gives a shard their sum. Every expert issues its successor's
+# first rows from its own last tile, from an index window started when its
+# last group became current. The first order is one tile, two, one, one:
+# it crosses one-tile -> multi-tile both ways and ends on a one-tile expert.
+# The second is one, one, two, three: a multi-tile -> multi-tile pair, an
+# expert of three tiles, and a multi-tile expert with no successor.
+MIXED_EXPERT_ROWS = (24, 136, 24, 72)
+MIXED_TOKENS = 512
+MIXED_CASES = [
+    (MIXED_EXPERT_ROWS, MIXED_TOKENS),
+    ((56, 24, 136, 296), 1024),
+]
+
+
+def _make_ids_with_expert_rows(mesh, seed, *, rows_per_local, tokens, topk, e_total):
+    """Hash ids that give local expert j of every shard rows_per_local[j] rows.
+
+    Each expert's slots are a contiguous run of the flat list, dealt out a
+    token at a time, so a run shorter than `tokens` never repeats an id
+    within a token.
+    """
+    g_local = len(rows_per_local)
+    counts = np.tile(rows_per_local, e_total // g_local)
+    assert counts.sum() == tokens * topk and counts.max() <= tokens
+    flat = np.repeat(np.arange(e_total, dtype=np.int32), counts)
+    ids = flat.reshape(topk, tokens).T
+    ids = ids[np.random.default_rng(seed).permutation(tokens)]
+    np.testing.assert_array_equal(np.bincount(ids.ravel(), minlength=e_total), counts)
+    assert all(len(set(row)) == topk for row in ids)
+    return jax.device_put(ids, NamedSharding(mesh, P(AXIS)))
+
+
+@pytest.mark.parametrize("rows_per_local,tokens", MIXED_CASES)
+def test_mixed_one_tile_and_multi_tile_experts_track_the_reference(
+    rows_per_local, tokens
+):
+    """One-tile and multi-tile experts next to each other match the reference.
+
+    Random routing gives every expert about the same rows, so the ids are
+    picked by hand to get these mixes.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        33,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh, 34, tokens=tokens, hidden=SMALL["hidden"], e_total=SMALL["e_total"]
+    )
+    hash_ids = _make_ids_with_expert_rows(
+        mesh,
+        35,
+        rows_per_local=rows_per_local,
+        tokens=tokens,
+        topk=SMALL["topk"],
+        e_total=SMALL["e_total"],
+    )
+    out = fused_ep_moe_v2(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        hash_topk_ids=hash_ids,
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+    )
+
+    def reference(roll):
+        def r(a):
+            return jnp.roll(a, roll, axis=0)
+
+        return _dense_reference(
+            mesh,
+            x,
+            r(w1),
+            r(w2),
+            r(w1_scale),
+            r(w2_scale),
+            gating,
+            topk=SMALL["topk"],
+            hash_ids=hash_ids,
+        )
+
+    want = reference(0)
+    error = _relative_l2(out, want)
+    assert error < FP8_RELATIVE_BOUND, f"relative L2 {error:.4f} past the band"
+    worst = _worst_token_relative_l2(out, want)
+    assert worst < FP8_TOKEN_BOUND, f"worst token {worst:.4f} past the band"
+    assert _relative_l2(out, reference(1)) > ROTATED_CONTROL_FACTOR * error
+
+
 def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     """Plan decomposition changes only how the kernel operands are built."""
     mesh = _mesh()
@@ -878,6 +981,111 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
 
 
+# 4 / 2 blocks over 4 local experts, and DeepSeek-V4's 14 / 6 blocks over 8:
+# the served 14-row table is one full sublane tile and a partial one.
+SECOND_MINOR_SHAPES = [
+    dict(hidden=2048, inter=1024, rhs_qb=512, e_total=32),
+    dict(hidden=896, inter=384, rhs_qb=64, e_total=64),
+]
+
+
+@pytest.mark.parametrize("shape", SECOND_MINOR_SHAPES)
+@pytest.mark.parametrize(
+    "w1_minor,w2_minor", [(True, False), (False, True), (True, True)]
+)
+def test_fp4_expert_second_minor_scale_reads_are_bit_exact(shape, w1_minor, w2_minor):
+    """Reading either scale table expert-second-minor changes only its
+    addressing."""
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh,
+        44,
+        hidden=shape["hidden"],
+        inter=shape["inter"],
+        e_total=shape["e_total"],
+        rhs_qb=shape["rhs_qb"],
+    )
+    x, gating = _make_inputs(
+        mesh, 45, tokens=256, hidden=shape["hidden"], e_total=shape["e_total"]
+    )
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=shape["rhs_qb"],
+        sharded_plan=True,
+    )
+    default_layout = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    second_minor = fused_ep_moe_v2(
+        x,
+        *weights,
+        *scales,
+        gating,
+        w1_scales_expert_second_minor=w1_minor,
+        w2_scales_expert_second_minor=w2_minor,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(second_minor), np.asarray(default_layout))
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_fp4_expert_second_minor_scales_reach_the_kernel_uncopied(flag):
+    """Scale tables staged {2,0,1} reach the kernel with no copy when the
+    flags say so. Without them XLA copies both into the default layout, which
+    shows the check can see a copy."""
+    from jax._src.layout import Format, Layout
+
+    shape = SECOND_MINOR_SHAPES[1]
+    hidden, inter, qb, e_total = (
+        shape[k] for k in ("hidden", "inter", "rhs_qb", "e_total")
+    )
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 46, hidden=hidden, inter=inter, e_total=e_total, rhs_qb=qb
+    )
+    x, gating = _make_inputs(mesh, 47, tokens=256, hidden=hidden, e_total=e_total)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=qb,
+        sharded_plan=True,
+        w1_scales_expert_second_minor=flag,
+        w2_scales_expert_second_minor=flag,
+    )
+    # [E, blocks, N] with minor-to-major {2,0,1}, as torch_tpu stages it.
+    second_minor = Format(
+        Layout(major_to_minor=(1, 0, 2)), NamedSharding(mesh, P(AXIS))
+    )
+    fn = jax.jit(
+        lambda x, w1, w2, s1, s2, g: fused_ep_moe_v2(x, w1, w2, s1, s2, g, **common),
+        in_shardings=(None, None, None, second_minor, second_minor, None),
+    )
+    hlo = fn.lower(x, *weights, *scales, gating).compile().as_text()
+    # Each shard's tables, in either order of their two major dimensions.
+    local = e_total // EP
+    tables = [
+        (local, hidden // qb, 2 * inter),
+        (local, inter // qb, hidden),
+    ]
+    shapes = "|".join(
+        ",".join(map(str, dims))
+        for e, b, n in tables
+        for dims in ((e, b, n), (b, e, n))
+    )
+    producers = [
+        line.strip()
+        for line in hlo.splitlines()
+        if re.search(rf"= f32\[({shapes})\]", line)
+        and not re.search(r"\b(parameter|bitcast|get-tuple-element)\(", line)
+    ]
+    assert (producers == []) is flag, producers
+
+
 # --------------------------------------------------------------------------- #
 # The weight-DMA schedule.
 #
@@ -1003,3 +1211,278 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
             deepest,
             err_msg=f"depth {depth} disagrees with the deepest schedule",
         )
+
+
+# The single-slot schedule at a batch whose experts each fit one tile, where
+# the slabs stream in column chunks: 256 * 4 / 32 = 32 rows an expert, and
+# at least two chunks per slab on each matmul.
+CHUNKED = dict(hidden=3584, inter=1024, e_total=32, topk=4, tokens=256)
+
+
+def test_fp4_chunked_stream_agrees_with_the_prefetch_schedule(at_prefetch_depth):
+    """Column-chunk refills compute what whole-slab prefetch computes, bit for
+    bit: they move only where each DMA starts and is waited."""
+    assert kernel.stream_chunk(2 * CHUNKED["inter"]) > 0
+    assert CHUNKED["hidden"] // kernel.stream_chunk(CHUNKED["hidden"]) == 2
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        46,
+        hidden=CHUNKED["hidden"],
+        inter=CHUNKED["inter"],
+        e_total=CHUNKED["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        47,
+        tokens=CHUNKED["tokens"],
+        hidden=CHUNKED["hidden"],
+        e_total=CHUNKED["e_total"],
+    )
+    common = dict(
+        topk=CHUNKED["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+    outs = {}
+    for depth in (2, 0):
+        at_prefetch_depth(depth)
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=CHUNKED["topk"])
+    assert _relative_l2(outs[0], ref) < FP8_RELATIVE_BOUND
+    np.testing.assert_array_equal(outs[0], outs[2])
+
+
+# The chunk-streamed path is chosen on the EXPECTED rows per expert, so one
+# skewed expert can still run several tiles on it. Two chunks per slab on
+# both matmuls, and MIXED_EXPERT_ROWS puts a two-tile expert between one-tile
+# ones on every shard. Hidden 3584 streams in 1792-column chunks, 4096 in
+# 2048-column ones.
+CHUNKED_MIXED = dict(inter=2048, e_total=32, topk=4)
+
+
+@pytest.mark.parametrize(
+    "width,chunk",
+    [
+        (6144, 2048),  # DeepSeek-V4 gate/up
+        (7168, 1792),  # DeepSeek-V4 down
+        (8192, 2048),  # Qwen3.8 down
+        (5120, 1280),
+        (1024, 1024),
+        (256 * 13, 0),  # no whole chunk from 1024 to 2048 columns
+        (768, 0),  # narrower than any chunk
+    ],
+)
+def test_stream_chunk_is_the_widest_dividing_width(width, chunk):
+    """The stream chunk is the widest whole number of the reader's output
+    chunk that divides the slab, within the chunk bounds, or 0 for none."""
+    assert kernel.stream_chunk(width) == chunk
+
+
+@pytest.mark.parametrize("hidden", [3584, 4096])
+@pytest.mark.parametrize("second_scale_slot", [True, False])
+def test_fp4_chunked_stream_holds_a_multi_tile_expert(
+    at_prefetch_depth, monkeypatch, second_scale_slot, hidden
+):
+    """A multi-tile expert on the chunk-streamed path reads its slab on every
+    tile: chunks are waited on its first tile and refilled after its last, so
+    the outputs match whole-slab prefetch bit for bit.
+
+    Without room for a second scale slot, the scales start after the tile
+    loop instead of at the visit's head; that schedule must match too.
+    """
+    assert (2 * CHUNKED_MIXED["inter"]) // kernel.stream_chunk(
+        2 * CHUNKED_MIXED["inter"]
+    ) == 2
+    assert hidden // kernel.stream_chunk(hidden) == 2
+    assert max(MIXED_EXPERT_ROWS) > CAPACITY
+    # Only the chunk-streamed build sizes a second scale slot, so a call for
+    # one shows the depth-zero build took that path rather than the old one.
+    scale_slots = []
+    real_estimate = host.vmem_estimate_bytes
+
+    def estimate(*args, **kwargs):
+        scale_slots.append(kwargs.get("scale_slots"))
+        if kwargs.get("scale_slots") == 2 and not second_scale_slot:
+            # Over any budget, so the build keeps a single scale slot. Only
+            # production shapes run out of room; this small one always fits.
+            return float("inf")
+        return real_estimate(*args, **kwargs)
+
+    monkeypatch.setattr(host, "vmem_estimate_bytes", estimate)
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        49,
+        hidden=hidden,
+        inter=CHUNKED_MIXED["inter"],
+        e_total=CHUNKED_MIXED["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        50,
+        tokens=MIXED_TOKENS,
+        hidden=hidden,
+        e_total=CHUNKED_MIXED["e_total"],
+    )
+    hash_ids = _make_ids_with_expert_rows(
+        mesh,
+        51,
+        rows_per_local=MIXED_EXPERT_ROWS,
+        tokens=MIXED_TOKENS,
+        topk=CHUNKED_MIXED["topk"],
+        e_total=CHUNKED_MIXED["e_total"],
+    )
+    common = dict(
+        hash_topk_ids=hash_ids,
+        topk=CHUNKED_MIXED["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+    outs = {}
+    for depth in (2, 0):
+        at_prefetch_depth(depth)
+        scale_slots.clear()
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+        assert (2 in scale_slots) == (depth == 0), (depth, scale_slots)
+    ref = _dense_reference(
+        mesh,
+        x,
+        *decoded,
+        None,
+        None,
+        gating,
+        topk=CHUNKED_MIXED["topk"],
+        hash_ids=hash_ids,
+    )
+    assert _relative_l2(outs[0], ref) < FP8_RELATIVE_BOUND
+    np.testing.assert_array_equal(outs[0], outs[2])
+
+
+# --------------------------------------------------------------------------- #
+# The tile-height ladder.
+#
+# Serving runs two rungs (MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE=2), whose short
+# rung sits at the expected rows per expert. Every other device test runs the
+# default four-rung ladder, so the heights only the two-rung ladder emits are
+# reached by setting the override, which the build reads.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def at_height_rungs(monkeypatch):
+    """Build with the height-rung override at `rungs` (None for the default),
+    and report the ladders built.
+
+    Yields `rungs -> observed`, where `observed` fills with each build's
+    ladder, so a case cannot pass on a ladder other than the one it names.
+    Both caches are cleared for the reason `at_prefetch_depth` gives: the
+    override is read at build time and is in neither cache key.
+    """
+    observed = []
+    real = kernel.tile_height_rungs
+
+    def recording(*args):
+        ladder = real(*args)
+        observed.append(ladder)
+        return ladder
+
+    monkeypatch.setattr(kernel, "tile_height_rungs", recording)
+
+    def clear():
+        kernel._BUILD_CACHE.clear()
+        layer._LAYER_SM_CACHE.clear()
+
+    def at(rungs):
+        if rungs is None:
+            monkeypatch.delenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", raising=False)
+        else:
+            monkeypatch.setenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", str(rungs))
+        observed.clear()
+        clear()
+        return observed
+
+    yield at
+    clear()
+
+
+@pytest.mark.parametrize(
+    "tokens,ladder,rows_per_local",
+    [
+        # Expected rows per expert 24 (+2 sd) -> a 48-row short rung. One
+        # expert past it runs the full-tile body, three under it the short.
+        (128, (48, CAPACITY), (52, 8, 2, 2)),
+        # Expected rows 16 (+2 sd) -> 32, the floor.
+        (64, (32, CAPACITY), (24, 6, 2, 0)),
+    ],
+    ids=["short48", "short32"],
+)
+def test_fp4_two_rung_ladder_matches_the_default_ladder(
+    at_height_rungs, tokens, ladder, rows_per_local
+):
+    """The two-rung ladder's short rung computes what the default ladder does.
+
+    A rung changes only how many rows a tile's body computes, never which, so
+    the outputs agree bit for bit; the dense reference keeps that agreement
+    from being vacuous.
+    """
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        46,
+        hidden=STREAM["hidden"],
+        inter=STREAM["inter"],
+        e_total=STREAM["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh, 47, tokens=tokens, hidden=STREAM["hidden"], e_total=STREAM["e_total"]
+    )
+    hash_ids = _make_ids_with_expert_rows(
+        mesh,
+        48,
+        rows_per_local=rows_per_local,
+        tokens=tokens,
+        topk=STREAM["topk"],
+        e_total=STREAM["e_total"],
+    )
+    common = dict(
+        hash_topk_ids=hash_ids,
+        topk=STREAM["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+    )
+
+    observed = at_height_rungs(2)
+    two_rung = np.asarray(fused_ep_moe_v2(x, *weights, *scales, gating, **common))
+    assert observed and all(built == ladder for built in observed), observed
+
+    observed = at_height_rungs(None)
+    default = np.asarray(fused_ep_moe_v2(x, *weights, *scales, gating, **common))
+    assert observed and all(len(built) == kernel.HEIGHT_RUNGS for built in observed)
+
+    np.testing.assert_array_equal(two_rung, default)
+    want = _dense_reference(
+        mesh, x, *decoded, None, None, gating, topk=STREAM["topk"], hash_ids=hash_ids
+    )
+    error = _relative_l2(two_rung, want)
+    assert error < FP8_RELATIVE_BOUND, f"relative L2 {error:.4f} past the band"
+    worst = _worst_token_relative_l2(two_rung, want)
+    assert worst < FP8_TOKEN_BOUND, f"worst token {worst:.4f} past the band"

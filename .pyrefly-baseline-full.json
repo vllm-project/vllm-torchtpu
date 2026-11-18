@@ -171,11 +171,6 @@
       "concise_description": "No attribute `tpu` in module `torch`"
     },
     {
-      "path": "src/vllm_torchtpu/distributed/pp_shift.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, ((x: Array) -> Array) | ((*xs: Array) -> tuple[Unknown, ...]), mesh=Mesh, input_partition_specs=tuple[P, ...], output_partition_specs=tuple[P, ...])"
-    },
-    {
       "path": "src/vllm_torchtpu/distributed/sharded_jax_op.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `tuple[P, ...]` is not assignable to parameter `input_partition_specs` with type `tuple[tuple[str, ...], ...] | None` in function `torch_tpu._internal.pallas.pallas.JaxCallable.__init__`"
@@ -1349,11 +1344,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-override-mutable-attribute",
       "concise_description": "Class member `TPUModelRunner.sample_tokens` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `LogprobsLists | list[Unknown]` is not assignable to parameter `logprobs` with type `LogprobsLists | None` in function `vllm.v1.outputs.ModelRunnerOutput.__init__`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",

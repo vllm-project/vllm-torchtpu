@@ -280,6 +280,8 @@ def fused_ep_moe_v2(
     stage="fused",
     routed=None,
     gather_positions=None,
+    w1_scales_expert_second_minor=False,
+    w2_scales_expert_second_minor=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -293,7 +295,7 @@ def fused_ep_moe_v2(
     2 * inter] and [experts, hidden], and per contraction block for fp4
     e2m1, [experts, blocks, 2 * inter] and [experts, blocks, hidden]; on an
     unquantized weight (bf16) there are no scales and both must be None.
-    Both are taken in the kernel's own operand layout, so a table shaped
+    Both are taken in the kernel's own operand shape, so a table shaped
     for a loader rather than for the kernel is refused. The token rows are
     quantized to fp8 only where the format's matmuls take fp8 rows: an
     unquantized weight gets unquantized activations, with no quantize and
@@ -341,6 +343,10 @@ def fused_ep_moe_v2(
     shard's q concatenated on axis 0, and returns what "fused" returns.
     gather_positions[i] is the block of q_g holding mesh index i's rows;
     None means mesh order.
+
+    w1_ / w2_scales_expert_second_minor say that scale table's device layout
+    is {2,0,1}. The kernel then reads it as [blocks, E, N]. A wrong flag
+    gives the same output, but copies the table on every call.
 
     hash_topk_ids [tokens, topk] i32 replaces the router's selection with
     expert ids the caller already chose -- DeepSeek-V4's bottom layers look
@@ -403,6 +409,14 @@ def fused_ep_moe_v2(
                     f"{form.scale_layout} form {want} the kernel "
                     f"takes"
                 )
+    if (
+        w1_scales_expert_second_minor or w2_scales_expert_second_minor
+    ) and form.scale_layout != "per_contraction_block":
+        raise ValueError(
+            "w1_ / w2_scales_expert_second_minor describe [E, blocks, N] scale "
+            f"tables; weight format {weight_format!r} has {form.scale_layout} "
+            "scales"
+        )
     (ax,) = mesh.axis_names
     ep = mesh.shape[ax]
     if mesh_ep_ranks is not None:
@@ -490,6 +504,8 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        w1s_expert_second_minor=w1_scales_expert_second_minor,
+        w2s_expert_second_minor=w2_scales_expert_second_minor,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -504,6 +520,14 @@ def fused_ep_moe_v2(
         operands = iter(scales_gating_biases)
         w1s_l = next(operands) if form.has_scales else None
         w2s_l = next(operands) if form.has_scales else None
+        # A bitcast for a table already laid out expert-second-minor; see
+        # above.
+        if w1_scales_expert_second_minor:
+            assert w1s_l is not None
+            w1s_l = jnp.transpose(w1s_l, (1, 0, 2))
+        if w2_scales_expert_second_minor:
+            assert w2s_l is not None
+            w2s_l = jnp.transpose(w2s_l, (1, 0, 2))
         gate_l = next(operands)
         hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
@@ -946,6 +970,8 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         stage,
         gather_positions,
+        bool(w1_scales_expert_second_minor),
+        bool(w2_scales_expert_second_minor),
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),
