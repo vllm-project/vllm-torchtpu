@@ -1401,6 +1401,9 @@ class TPUModelRunner(GPUModelRunner):
             tuple[int, str],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        # Zero draft lengths per (rows, device), for a chunk the async-spec
+        # assembly runs without spec-decode metadata.
+        self._zero_draft_lengths_cache: dict[tuple[int, str], torch.Tensor] = {}
         # DecodeBench fills local state instead of transferring manager blocks,
         # so it can retain the compact request-indexed Mamba layout.
         transfer_config = self.vllm_config.kv_transfer_config
@@ -4169,15 +4172,11 @@ class TPUModelRunner(GPUModelRunner):
         return scheduler_output, num_decode_reqs, num_windowed_reqs
 
     def _get_zero_draft_lengths(self, b: int) -> torch.Tensor:
-        cache = getattr(self, "_zero_draft_lengths_cache", None)
-        if cache is None:
-            cache = {}
-            self._zero_draft_lengths_cache = cache
         key = (b, str(self.device))
-        t = cache.get(key)
+        t = self._zero_draft_lengths_cache.get(key)
         if t is None:
             t = torch.zeros(b, dtype=torch.int32, device=self.device)
-            cache[key] = t
+            self._zero_draft_lengths_cache[key] = t
         return t
 
     def _assemble_async_spec_substitution(
@@ -7615,7 +7614,6 @@ class TPUModelRunner(GPUModelRunner):
         # manager for take_draft_token_ids(). ngram has no device path and
         # keeps proposing from the host-materialized output in the sync block
         # below.
-        is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
         if (
             self._is_async_drafter
@@ -10994,7 +10992,12 @@ class TPUModelRunner(GPUModelRunner):
         # The most requests one step may hold (see _spec_warmup_bucket_grid).
         max_seqs = int(self.scheduler_config.max_num_seqs)
         room = self.max_model_len - P
-        n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
+        # The mixed steps advance the batch two steps past the decode run, so
+        # they take two steps of room from it.
+        n_decode = min(
+            3 if short else max(5, K + 2),
+            max(0, room // (1 + K) - 1 - (2 if mixed else 0)),
+        )
         stride = TPUModelRunner._spec_warmup_nct_stride(self)
         # The mixed verify+prefill steps after the decode run advance the
         # batch's requests up to two more steps.

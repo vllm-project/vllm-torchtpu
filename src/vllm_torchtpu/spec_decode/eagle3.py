@@ -262,9 +262,9 @@ class Eagle3Proposer:
         # Zero [kernel_num_reqs] rejected counts per (knr, device), for the
         # post-step-0 bridge on an all-accept sync step.
         self._zero_rej_dev_cache: dict[tuple, torch.Tensor] = {}
-        # The last propose's per-chunk padded [p, K] drafts and its returned
-        # device tensor; tpu_runner's async substitution reads them to skip a
-        # re-pad when `drafts is _last_propose_device_out`.
+        # The last device-returning propose's per-chunk padded [p, K] drafts
+        # and the tensor it returned; tpu_runner's async substitution reads them
+        # to skip a re-pad when `drafts is _last_propose_device_out`.
         self._last_padded_drafts_per_chunk: list[torch.Tensor] | None = None
         self._last_propose_device_out: torch.Tensor | None = None
         # Set by tpu_runner for one propose: return chunk 0's slice instead of
@@ -2222,7 +2222,6 @@ class Eagle3Proposer:
             )
             for toks in draft_tokens_per_chunk
         ]
-        self._last_padded_drafts_per_chunk = per_chunk_stacked
         skip_cat = self._skip_next_multi_chunk_draft_cat
         self._skip_next_multi_chunk_draft_cat = False
         if return_device:
@@ -2234,6 +2233,7 @@ class Eagle3Proposer:
                 out = torch.cat(
                     [s[: c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)], dim=0
                 )
+            self._last_padded_drafts_per_chunk = per_chunk_stacked
             self._last_propose_device_out = out
             return out
         result = []

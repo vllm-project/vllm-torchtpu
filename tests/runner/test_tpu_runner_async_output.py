@@ -484,6 +484,7 @@ def test_compiled_async_spec_helpers_match_eager(device):
     runner = object.__new__(TPUModelRunner)
     runner.device = device
     runner.max_num_reqs = 8
+    runner._zero_draft_lengths_cache = {}
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     drafts_view = drafts_p[:2]
     runner.drafter = _eagle3_drafter_stand_in(
