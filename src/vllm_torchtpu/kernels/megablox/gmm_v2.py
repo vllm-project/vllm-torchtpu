@@ -242,14 +242,16 @@ def set_rhs_stream(enabled: bool) -> None:
 
 # The quantized-lhs tiling and rhs-scale placement tuned for Qwen3.5's FP8 MoE
 # (calculate_tiling, hoist_rhs_scale). Off by default, so every model keeps
-# main's tiles and main's order of scaling and accumulating; a model rule turns
-# it on before its kernels are traced (set_tuned_fp8_moe). The hoist changes
-# the bf16 accumulator's rounding, so it is not a free choice for other models.
+# the default tiles and the default order of scaling and accumulating; a model
+# rule turns it on before its kernels are traced (set_tuned_fp8_moe). The
+# hoist changes the bf16 accumulator's rounding, so it is not a free choice for
+# other models.
 TUNED_FP8_MOE: bool = False
 
 
 def set_tuned_fp8_moe(enabled: bool) -> None:
-    """Take the tuned FP8 MoE tiling and rhs-scale hoist (True) or main's."""
+    """Take the tuned FP8 MoE tiling and rhs-scale hoist (True) or the
+    default tiling and scale order (False)."""
     global TUNED_FP8_MOE
     TUNED_FP8_MOE = bool(enabled)
 
@@ -972,11 +974,33 @@ def kernel_main(
     *,
     cfgs: GmmConfigs,
 ):
-    """Entry point for the Pallas grouped matrix multiply (GMM) kernel.
+    """Entry point for GMM kernel.
 
-    Executes block-pipelined grouped matmul over ragged expert token ranges using
-    precomputed group offsets and tile schedules, with optional fused activation
-    and per-subchannel or per-channel RHS scale application.
+    Computes metadata to determine which rows of lhs needs processing and how
+    they will be tiled. And then, invoke inner kernel using metadata.
+
+    Uses the following notation:
+    - g: rhs group dimension
+    - m: Batch dimension
+    - gm: Batch tiling dimension. Aligned to size_lhs_sublane and has tile size
+        of tile_m. Skips over empty groups and accounts for revisited tiles.
+    - k: in dimension
+    - n: out dimension
+
+    Args:
+        lhs_group_sizes_ref: Reference to the group sizes of lhs.
+        group_offset_ref: Reference to the group offset.
+        lhs_ref: Reference to the lhs.
+        rhs_ref: Reference to the rhs.
+        out_ref: Reference to the out.
+        partial_out_ref: Reference to the partial output.
+        acc_ref: Reference to the accumulator.
+        metadata_ref: Reference to the metadata.
+        zero_ref: Scratch memory for storing zero values used in initialization.
+        semaphore_ref: Semaphore for zero initialization DMAs.
+        stream_ref: Scratch for streaming whole-expert rhs slabs by hand
+            (use_rhs_stream), or None when emit_pipeline brings the rhs.
+        cfgs: GmmConfigs.
     """
 
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
@@ -1194,9 +1218,7 @@ def calculate_tiling(
     if lhs_cfgs.should_quantize and not tuned:
         tile_m *= 2
     elif tuned:
-        effective_groups = (
-            min(dims.size_group, 64) if dims.size_group >= 64 else dims.size_group
-        )
+        effective_groups = min(dims.size_group, 64)
         rows_per_group = dims.size_m // max(1, effective_groups)
         if dims.size_group >= 16 and rows_per_group < 32:
             # When avg_tokens_per_expert < 32 (e.g. T <= 128 at topk=10 or

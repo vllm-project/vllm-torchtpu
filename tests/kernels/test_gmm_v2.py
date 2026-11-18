@@ -497,7 +497,7 @@ _FP8_MOE_TOLERANCE = 0.05
 
 def _fp8_moe_inputs(slots, group_sizes, as_arrays=True):
     """bf16 rows and a GMM2-shaped FP8 weight with one scale per output channel
-    (a single quant block over k), as main's FP8 MoE checkpoints load."""
+    (a single quant block over k), as FP8 MoE checkpoints load."""
     rows = int(sum(group_sizes))
     if not as_arrays:
         return (

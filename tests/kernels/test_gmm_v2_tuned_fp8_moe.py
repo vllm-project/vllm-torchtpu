@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The grouped matmul's tuned FP8 MoE tiling and rhs-scale hoist are off
-unless a model rule sets gmm_v2.TUNED_FP8_MOE: other models keep main's tiles
-and main's order of scaling and accumulating.
+unless a model rule sets gmm_v2.TUNED_FP8_MOE: other models keep the default
+tiles and the default order of scaling and accumulating.
 
-The expected tiles are what calculate_tiling returns on TPU7x: main's for the
-flag off, the tuned schedule for the flag on."""
+The expected tiles are what calculate_tiling returns on TPU7x: the default ones
+for the flag off, the tuned schedule for the flag on."""
 
 import jax.numpy as jnp
 import pytest
@@ -62,7 +62,7 @@ def _tiles(rows, k, n, groups, fuse_act):
     return (t.tile_m, t.tile_k, t.tile_n, t.bucket_base), gmm_v2.hoist_rhs_scale(cfgs)
 
 
-# rows, (k, n), groups, fuse_act, main's tiles, tuned tiles. Qwen3-30B-A3B's
+# rows, (k, n), groups, fuse_act, default tiles, tuned tiles. Qwen3-30B-A3B's
 # gate/up projection at TP8 (128 experts, 2 x 128 padded columns) for 16 and
 # 64 tokens; Qwen3.5's gate/up at 80 expert slots for 8 tokens (a table entry).
 CASES = [
