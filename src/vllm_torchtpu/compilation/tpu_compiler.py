@@ -260,6 +260,13 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Device decode: its programs are separate backend="tpu" helpers outside
+    # the backbone graph, which it feeds inputs of the stock dtypes and
+    # shapes. The stock sampler takes its noise as an input either way. When
+    # the profile run sizes the KV cache, VLLM_TPU_DEVICE_DECODE can still
+    # change the hash through num_gpu_blocks, since the head programs compile
+    # in that run.
+    "VLLM_TPU_DEVICE_DECODE",
     # `import torch_tpu` (via libtpu.configure_library_path()) sets this to
     # <site-packages>/libtpu/libtpu.so, so the raw path would change the key
     # with the venv prefix or mount path. get_libtpu_cache_key() already

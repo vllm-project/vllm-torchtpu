@@ -174,6 +174,10 @@ from vllm_torchtpu.runner import (
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import repetition_penalty as repetition_penalty_tracker
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.device_decode.controller import (
+    DeviceDecodeController,
+    StockChunk,
+)
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -718,6 +722,7 @@ class TPUModelRunner(GPUModelRunner):
     _dp_step_other_decode: bool = False
     _adaptive_verification: AdaptiveVerificationManager | None = None
     _thinking_budget: thinking_budget_tracker.ThinkingBudgetTracker | None = None
+    _device_decode: DeviceDecodeController | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
@@ -1282,6 +1287,7 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._device_decode = DeviceDecodeController.maybe_create(self)
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -4374,6 +4380,10 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
+        device_decode = self._device_decode
+        if device_decode is not None:
+            # Also on zero-token steps, which can free slots.
+            device_decode.on_states_updated(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -5369,11 +5379,13 @@ class TPUModelRunner(GPUModelRunner):
         all_greedy: bool,
         grammar_output: "GrammarOutput | None",
         sampling_generator: torch.Generator | None,
+        stock_chunk: StockChunk | None = None,
     ) -> tuple[torch.Tensor, _ChunkSamplingParams | None]:
         """Samples one token per row of a chunk's ``[rows, vocab]`` logits.
 
         Returns the ``[rows, 1]`` token IDs and, for a sampled (not all-greedy)
-        chunk, the padded sampling params that drew them.
+        chunk, the padded sampling params that drew them. With device decode,
+        ``stock_chunk`` keys the noise as a device step keys it.
         """
         if all_greedy:
             return self._greedy_sample(logits), None
@@ -5386,7 +5398,12 @@ class TPUModelRunner(GPUModelRunner):
             top_p,
             self._sampler_topk_candidates(cur_start_idx, cur_end_idx, grammar_output),
         )
-        u = torch.rand_like(logits, dtype=torch.float32, generator=sampling_generator)
+        if stock_chunk is None:
+            u = torch.rand_like(
+                logits, dtype=torch.float32, generator=sampling_generator
+            )
+        else:
+            u = stock_chunk.uniform(logits.shape[-1])
         token_ids = self.sample_from_logits_func(
             logits,
             temperatures,
@@ -5414,6 +5431,7 @@ class TPUModelRunner(GPUModelRunner):
         min_toks: min_tokens_mask.MinTokensState,
         rep_pen: bool = False,
         processors: Sequence[chunk_processors.PlainChunkProcessor] = (),
+        stock_chunk: StockChunk | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``.
 
@@ -5481,6 +5499,7 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=all_greedy,
                     grammar_output=grammar_output,
                     sampling_generator=sampling_generator,
+                    stock_chunk=stock_chunk,
                 )
             for proc in processors:
                 proc.on_sampled(selected)
@@ -5668,6 +5687,9 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
         rep_pen = self._repetition_penalty.begin_step(self.input_batch)
+        device_decode = self._device_decode
+        if device_decode is not None and device_decode.slots is None:
+            device_decode = None
         min_toks = self._min_tokens_batch_state()
 
         # Used to keep rand draws consistent across TP ranks.
@@ -5726,6 +5748,8 @@ class TPUModelRunner(GPUModelRunner):
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
+        # Device decode: each plain chunk's slot write-back and its tokens.
+        stock_chunks: list[tuple[StockChunk, torch.Tensor]] = []
         # Partial-prefill requests discard their sampled token. They are known
         # before sampling, for per-chunk processors; their generators are
         # rewound after sampling, below.
@@ -5884,6 +5908,13 @@ class TPUModelRunner(GPUModelRunner):
                         self.input_batch.req_ids, cur_start_idx, cur_end_idx
                     )
                 )
+                stock_chunk = (
+                    device_decode.stock_chunk_plan(
+                        scheduler_output, cur_start_idx, cur_end_idx, logits.shape[0]
+                    )
+                    if device_decode is not None
+                    else None
+                )
                 selected_token_ids, logprob_logits = self._sample_plain_chunk(
                     logits,
                     cur_start_idx=cur_start_idx,
@@ -5897,7 +5928,10 @@ class TPUModelRunner(GPUModelRunner):
                     min_toks=min_toks,
                     rep_pen=rep_pen,
                     processors=(tb_chunk,) if tb_chunk is not None else (),
+                    stock_chunk=stock_chunk,
                 )
+                if stock_chunk is not None:
+                    stock_chunks.append((stock_chunk, selected_token_ids))
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
@@ -5942,6 +5976,8 @@ class TPUModelRunner(GPUModelRunner):
             if generator is not None:
                 # This relies on cuda-specific torch-internal impl details
                 generator.set_offset(generator.get_offset() - 4)
+        if device_decode is not None and stock_chunks:
+            device_decode.after_stock_sampling(stock_chunks)
 
         next_tokens_tpu = None
         copy_state = None
@@ -7712,6 +7748,9 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_repetition_penalty()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
+        device_decode = self._device_decode
+        if device_decode is not None:
+            device_decode.precompile_heads()
 
     def _resolve_static_pooler(self) -> None:
         """Pick the static compiled pooler for eligible embed poolers."""
@@ -7819,6 +7858,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             self._pp_handoff.warmup()
         if self.enforce_eager:
+            if self._device_decode is not None:
+                self._device_decode.initialize_and_precompile()
             return
         if self.lora_config is not None:
             lora_manager = self.lora_manager
@@ -7877,6 +7918,8 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 if self._adaptive_verification is not None:
                     self._init_adaptive_verification()
+        if self._device_decode is not None:
+            self._device_decode.initialize_and_precompile()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
