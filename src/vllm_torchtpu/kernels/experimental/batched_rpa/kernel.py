@@ -734,7 +734,6 @@ def _rpa_step(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-            stitch_meta=stitch_meta,
         custom_mask = None
         if apply_mask:
             custom_mask = generate_mask(
