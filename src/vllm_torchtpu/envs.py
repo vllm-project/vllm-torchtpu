@@ -460,10 +460,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DENSE_SEQUENCE_PARALLEL": env_bool(
         "TPU_DENSE_SEQUENCE_PARALLEL", default=False
     ),
-    # With TPU_DENSE_SEQUENCE_PARALLEL: fuse each dense SP reduce-scatter and its
-    # RMSNorm/residual/FP8-quantization epilogue in VMEM on an 8-device tpu7x
-    # 2x2x1 TP group (falling back to XLA reduce-scatter elsewhere). The value
-    # selects the inter-chip payload; "fp8" is lossy.
+    # With TPU_DENSE_SEQUENCE_PARALLEL: on an 8-device tpu7x 2x2x1 TP group, fuse
+    # each dense SP reduce-scatter and its RMSNorm/residual/FP8 epilogue in VMEM:
+    # row-streaming on >= 1024 tokens ("bf16" or lossy "fp8" inter-chip hops,
+    # with XLA all-gathers) and single-shot VMEM reduce-scatter + gather on
+    # 128 <= tokens < 1024 (always bf16 inter-chip hops).
     "TPU_DENSE_SP_HIER_RS": env_with_choices(
         "TPU_DENSE_SP_HIER_RS", "off", ["off", "bf16", "fp8"]
     ),

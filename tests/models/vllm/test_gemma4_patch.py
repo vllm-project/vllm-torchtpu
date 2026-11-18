@@ -446,12 +446,12 @@ def test_hier_rs_warns_when_hidden_unsupported(
     monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
     warn = Mock()
     monkeypatch.setattr(gemma4_patch.logger, "warning_once", warn)
-    # HIDDEN = 24 is not 128-lane aligned, so supports_streaming_sublayer is False.
     layer = _make_layer(_make_weights(0), 0, tp=8)
     gemma4_patch._configure_layer(layer)
-    assert gemma4_patch._layer_state(layer).streaming_collectives is None
-    warn.assert_called_once()
-    assert "hidden=%d" in warn.call_args.args[0]
+    state = gemma4_patch._layer_state(layer)
+    assert state.streaming_collectives is None
+    assert state.oneshot_collectives is None
+    assert warn.call_count == 2
 
 
 def _patch_collectives(monkeypatch: pytest.MonkeyPatch, **fakes: object) -> None:
@@ -474,10 +474,10 @@ def _patch_fp8_ops_with_float_stand_ins(monkeypatch: pytest.MonkeyPatch) -> None
     )
 
 
-def test_build_streaming_sublayer_collectives_registers_jax_ops(
+def test_build_sublayer_collectives_registers_jax_ops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercises `pallas.jax_op` signature verification and FakeTensor shapes."""
+    """Exercises streaming and oneshot `pallas.jax_op` registration and FakeTensors."""
     mesh = jax.sharding.Mesh(
         np.asarray(jax.devices()[:1]), (fused_rs_epilogue_op.TP_AXIS_NAME,)
     )
@@ -487,12 +487,13 @@ def test_build_streaming_sublayer_collectives_registers_jax_ops(
         lambda: (mesh, (0,), (0,)),
     )
     monkeypatch.setattr(fused_rs_epilogue_op, "_STREAM_COLLECTIVES_CACHE", {})
+    monkeypatch.setattr(fused_rs_epilogue_op, "_ONESHOT_COLLECTIVES_CACHE", {})
 
     for fp8_wire in (False, True):
         ops = fused_rs_epilogue_op.build_streaming_sublayer_collectives(
             1e-6, fp8_wire=fp8_wire
         )
-        assert ops is not None
+        assert ops is not None and ops.outputs_gathered is False
         ops_alt = fused_rs_epilogue_op.build_streaming_sublayer_collectives(
             1e-5, fp8_wire=fp8_wire
         )
@@ -513,6 +514,27 @@ def test_build_streaming_sublayer_collectives_registers_jax_ops(
             assert (r2.shape, q2.shape, s2.shape) == ((2, 32), (2, 32), (2, 1))
             r3 = ops.norm_add_scale(p, r, w, s)
             assert (r3.shape, r3.dtype) == ((2, 32), torch.bfloat16)
+
+    oneshot = fused_rs_epilogue_op.build_oneshot_sublayer_collectives(1e-6)
+    assert oneshot is not None and oneshot.outputs_gathered is True
+    oneshot_alt = fused_rs_epilogue_op.build_oneshot_sublayer_collectives(1e-5)
+    assert oneshot_alt is not None and oneshot_alt is not oneshot
+    with torch._subclasses.FakeTensorMode():
+        p = torch.empty((16, 32), dtype=torch.bfloat16)
+        r = torch.empty((2, 32), dtype=torch.bfloat16)
+        w = torch.empty((32,), dtype=torch.bfloat16)
+        s = torch.empty((1,), dtype=torch.bfloat16)
+        r1, q1, s1 = oneshot.norm_add_next_norm(p, r, w, w)
+        assert (r1.shape, q1.shape, s1.shape) == ((2, 32), (16, 32), (16, 1))
+        assert (r1.dtype, q1.dtype, s1.dtype) == (
+            torch.bfloat16,
+            torch.uint8,
+            torch.float32,
+        )
+        r2, q2, s2 = oneshot.norm_add_scale_next_norm(p, r, w, s, w)
+        assert (r2.shape, q2.shape, s2.shape) == ((2, 32), (16, 32), (16, 1))
+        r3 = oneshot.norm_add_scale(p, r, w, s)
+        assert (r3.shape, r3.dtype) == ((16, 32), torch.bfloat16)
 
 
 def test_topology_guard_rejects_non_tpu7x_2x2x1(
@@ -670,7 +692,46 @@ def _fused_collectives_stand_in(
     )
 
 
-@pytest.mark.parametrize("path", ["replicated", "xla_sp", "hier_sp"])
+def _oneshot_collectives_stand_in(
+    exchange: Callable[[torch.Tensor], list[torch.Tensor]],
+    rank_fn: Callable[[], int],
+    tp_size: int,
+    eps: float,
+    counter: list[int],
+) -> fused_rs_epilogue_op.FusedSublayerCollectives:
+    def rs_local(partial: torch.Tensor) -> torch.Tensor:
+        if rank_fn() == 0:
+            counter[0] += 1
+        total = torch.stack(exchange(partial)).sum(0)
+        return total.chunk(tp_size, dim=0)[rank_fn()]
+
+    def gather_local(x: torch.Tensor) -> torch.Tensor:
+        return torch.cat(exchange(x), dim=0)
+
+    def norm_add_scale(partial, residual, post_norm_weight, scale):
+        reduced = _rms_norm_torch(rs_local(partial), post_norm_weight, eps)
+        return gather_local((reduced + residual) * scale)
+
+    def norm_add_scale_next_norm(
+        partial, residual, post_norm_weight, scale, next_norm_weight
+    ):
+        reduced = _rms_norm_torch(rs_local(partial), post_norm_weight, eps)
+        res_new = (reduced + residual) * scale
+        normed = _rms_norm_torch(res_new, next_norm_weight, eps)
+        row_scale = normed.abs().amax(-1, keepdim=True)
+        return res_new, gather_local(normed / row_scale), gather_local(row_scale)
+
+    return fused_rs_epilogue_op.FusedSublayerCollectives(
+        norm_add_next_norm=lambda partial, residual, post_norm_w, next_norm_w: (
+            norm_add_scale_next_norm(partial, residual, post_norm_w, 1.0, next_norm_w)
+        ),
+        norm_add_scale_next_norm=norm_add_scale_next_norm,
+        norm_add_scale=norm_add_scale,
+        outputs_gathered=True,
+    )
+
+
+@pytest.mark.parametrize("path", ["replicated", "xla_sp", "hier_sp", "hier_oneshot"])
 @pytest.mark.parametrize("tp", [2, 8])
 def test_forward_matches_upstream(
     monkeypatch: pytest.MonkeyPatch, tp: int, path: str
@@ -679,7 +740,7 @@ def test_forward_matches_upstream(
     monkeypatch.setattr(
         dense_sequence_parallel,
         "MIN_TOKENS_PER_RANK",
-        NUM_TOKENS + 1 if path == "replicated" else 0,
+        NUM_TOKENS + 1 if path in ("replicated", "hier_oneshot") else 0,
     )
     _patch_fp8_ops_with_float_stand_ins(monkeypatch)
     mock = TPCollectiveMock(tp)
@@ -689,7 +750,18 @@ def test_forward_matches_upstream(
         all_gather=mock.all_gather,
         reduce_scatter=mock.reduce_scatter,
     )
-    if path == "hier_sp":
+    oneshot_calls = [0]
+
+    def silent_exchange(tensor: torch.Tensor) -> list[torch.Tensor]:
+        mock.storage[mock.rank.value] = tensor
+        mock.barrier.wait(timeout=10.0)
+        parts = list(mock.storage)
+        mock.barrier.wait(timeout=10.0)
+        return parts
+
+    if path == "hier_oneshot":
+        monkeypatch.setattr(fused_rs_epilogue_op, "MIN_ONESHOT_RS_AG_TOKENS", 0)
+    if path in ("hier_sp", "hier_oneshot"):
         monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
         monkeypatch.setattr(
             fused_rs_epilogue_op,
@@ -699,7 +771,17 @@ def test_forward_matches_upstream(
             ),
         )
         monkeypatch.setattr(
+            fused_rs_epilogue_op,
+            "build_oneshot_sublayer_collectives",
+            lambda eps: _oneshot_collectives_stand_in(
+                silent_exchange, lambda: mock.rank.value, tp, eps, oneshot_calls
+            ),
+        )
+        monkeypatch.setattr(
             fused_rs_epilogue_op, "supports_streaming_sublayer", lambda *_: True
+        )
+        monkeypatch.setattr(
+            fused_rs_epilogue_op, "supports_oneshot_sublayer", lambda *_: True
         )
 
     weights = [_make_weights(seed) for seed in range(NUM_LAYERS)]
@@ -728,7 +810,7 @@ def test_forward_matches_upstream(
                     layer, positions, hidden, residual
                 )
                 assert (residual is not None) == (
-                    path == "hier_sp" and idx < NUM_LAYERS - 1
+                    path in ("hier_sp", "hier_oneshot") and idx < NUM_LAYERS - 1
                 )
                 if idx == 0:
                     rows_after_layer_0[rank] = hidden.shape[0]
@@ -749,7 +831,15 @@ def test_forward_matches_upstream(
     for out in outputs:
         assert out is not None
         torch.testing.assert_close(out, expected, rtol=1e-10, atol=1e-10)
-    if path != "replicated":
+    if path == "hier_oneshot":
+        assert rows_after_layer_0 == [NUM_TOKENS] * tp
+        assert oneshot_calls == [2 * NUM_LAYERS]
+        assert mock.calls == {
+            "all_reduce": 0,
+            "reduce_scatter": 0,
+            "all_gather": 0,
+        }
+    elif path != "replicated":
         rows = NUM_TOKENS if path == "hier_sp" else NUM_TOKENS // tp
         assert rows_after_layer_0 == [rows] * tp
         assert mock.calls == {
@@ -867,8 +957,8 @@ def test_token_buckets_share_one_graph_signature(
 def test_hier_collectives_trace_fullgraph_and_match_signature(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fused streaming RS + epilogue traces under fullgraph=True without calling
-    StrongLRUCache (`pltpu.get_tpu_info`) and matches replicated graph_signature."""
+    """Streaming (`1024`) and single-shot (`128`) ops trace under fullgraph=True
+    without calling StrongLRUCache (`pltpu.get_tpu_info`) and match graph_signature."""
     tp = 8
     wide_hidden = 256
     monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
@@ -888,8 +978,12 @@ def test_hier_collectives_trace_fullgraph_and_match_signature(
         lambda: (mesh, tuple(range(tp)), tuple(range(tp))),
     )
     monkeypatch.setattr(fused_rs_epilogue_op, "_STREAM_COLLECTIVES_CACHE", {})
+    monkeypatch.setattr(fused_rs_epilogue_op, "_ONESHOT_COLLECTIVES_CACHE", {})
     monkeypatch.setattr(
         fused_rs_epilogue_op.kernel_stream, "_EPILOGUE_HIDDEN_SUPPORT", {}
+    )
+    monkeypatch.setattr(
+        fused_rs_epilogue_op.kernel_oneshot_rs_ag, "_ONESHOT_HIDDEN_SUPPORT", {}
     )
 
     monkeypatch.setattr(sys.modules[__name__], "HIDDEN", wide_hidden)
@@ -920,12 +1014,17 @@ def test_hier_collectives_trace_fullgraph_and_match_signature(
             return hidden
 
     model = _Stack()
-    assert gemma4_patch._layer_state(model.layers[0]).streaming_collectives is not None
+    state0 = gemma4_patch._layer_state(model.layers[0])
+    assert state0.streaming_collectives is not None
+    assert state0.oneshot_collectives is not None
 
     def forbid_tpu_info() -> None:
         raise AssertionError("tpu_info must not run during TorchDynamo tracing")
 
     monkeypatch.setattr(fused_rs_epilogue_op.kernel_stream, "tpu_info", forbid_tpu_info)
+    monkeypatch.setattr(
+        fused_rs_epilogue_op.kernel_oneshot_rs_ag, "tpu_info", forbid_tpu_info
+    )
     monkeypatch.setattr(pltpu, "get_tpu_info", forbid_tpu_info)
 
     signatures = []
@@ -939,7 +1038,7 @@ def test_hier_collectives_trace_fullgraph_and_match_signature(
         return lambda *_args: torch.zeros(1, wide_hidden, dtype=torch.bfloat16)
 
     with shape_variants.warmup():
-        for num_tokens in (16, 1024, 1032):
+        for num_tokens in (16, 128, 1024, 1032):
             torch._dynamo.reset()
             compiled = torch.compile(model, backend=capture_backend, fullgraph=True)
             input_ids = torch.zeros(num_tokens, dtype=torch.int32)
@@ -948,8 +1047,9 @@ def test_hier_collectives_trace_fullgraph_and_match_signature(
             torch._dynamo.mark_dynamic(positions, 0)
             compiled(input_ids, positions)
 
-    assert len(signatures) == 3
-    assert signatures[0] == signatures[1] == signatures[2]
-    assert any("dense_sp_rs_" in op for op in seen_ops[1])
-    assert not any("dense_sp_rs_" in op for op in seen_ops[0])
-    assert not any("dense_sp_rs_" in op for op in seen_ops[2])
+    assert len(signatures) == 4
+    assert signatures[0] == signatures[1] == signatures[2] == signatures[3]
+    assert not any("dense_sp_" in op for op in seen_ops[0])
+    assert any("dense_sp_oneshot_" in op for op in seen_ops[1])
+    assert any("dense_sp_rs_" in op for op in seen_ops[2])
+    assert not any("dense_sp_" in op for op in seen_ops[3])
