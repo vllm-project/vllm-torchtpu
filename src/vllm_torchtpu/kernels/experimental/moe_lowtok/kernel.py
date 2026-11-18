@@ -637,7 +637,16 @@ def pack_tables(experts_start, gid, hot, hprim, hcopy, slot):
 
 
 def slot_table(gid, n_experts):
-    """This rank's local slot for each global expert (`-1` where absent)."""
+    """This rank's local slot for each of the 512 global experts (`-1` where
+    absent); `gid` lists the global expert in each local slot."""
+    ids = np.asarray(gid, np.int64).reshape(-1)
+    if ids.size and (ids.min() < 0 or ids.max() >= _TABLE_LANES):
+        raise ValueError(
+            f"slot table: expert ids must be in 0..{_TABLE_LANES - 1} (the copy "
+            f"tables are {_TABLE_LANES} lanes wide), got {ids.min()}..{ids.max()}"
+        )
+    if len(set(ids.tolist())) != ids.size:
+        raise ValueError("slot table: an expert is listed in two local slots")
     gid = jnp.asarray(gid, jnp.int32).reshape(-1)
     return (
         jnp.full((_TABLE_LANES,), -1, jnp.int32)
@@ -647,7 +656,14 @@ def slot_table(gid, n_experts):
 
 
 def hot_onehot(hot):
-    """One-hot gather matrix `[512, len(hot)]` bf16 for a hot expert table."""
+    """One-hot gather matrix `[512, len(hot)]` bf16 for a hot expert table
+    (`-1` entries are padding and get an empty column)."""
+    ids = np.asarray(hot, np.int64).reshape(-1)
+    if ((ids < -1) | (ids >= _TABLE_LANES)).any():
+        raise ValueError(
+            f"hot table: expert ids must be -1 (padding) or in "
+            f"0..{_TABLE_LANES - 1}, got {sorted(set(ids.tolist()))}"
+        )
     hot = jnp.asarray(hot, jnp.int32).reshape(-1)
     lanes = jax.lax.broadcasted_iota(jnp.int32, (_TABLE_LANES, hot.shape[0]), 0)
     return jnp.where(lanes == hot.reshape(1, -1), 1.0, 0.0).astype(jnp.bfloat16)
@@ -665,6 +681,11 @@ def hot_tables(prim, copy, order=None, slots=HOT_SLOTS):
             )
         if len(set(o)) != len(o) or any(e < 0 or e >= prim.shape[0] for e in o):
             raise ValueError("hot order must contain unique, valid expert ids")
+        uncopied = [e for e in o if int(copy[e]) < 0]
+        if uncopied:
+            # The kernel would serve such an expert on its primary and assign
+            # it a holder as well, adding its contribution twice.
+            raise ValueError(f"hot order lists experts with no copy: {uncopied}")
         hot = np.full(slots, -1, np.int32)
         hot[: len(o)] = o
         hot = jnp.asarray(hot)
@@ -726,7 +747,14 @@ def moe_lowtok(
             f"got {tokens}"
         )
     n_experts, inter, w13_parts, rows = _layout(x, w13)
-    lanes = pl.cdiv(route.shape[1], _LANE) * _LANE
+    route_cols = route.shape[1]
+    lanes = pl.cdiv(route_cols, _LANE) * _LANE
+    if topk is None and lanes < n_experts:
+        # Every weight slot looks up its routing-table lane.
+        raise ValueError(
+            f"the routing table's {route_cols} columns ({lanes} lanes) do not "
+            f"cover the {n_experts} weight slots"
+        )
     x_rows = jnp.pad(x, ((0, rows - tokens), (0, 0)))
     if from_logits:
         route_dtype = (
@@ -757,6 +785,22 @@ def moe_lowtok(
                 "has_copies=True requires tables, prim, copy, and hot1h tensors"
             )
         nc = int(hot1h.shape[-1])
+        if route_cols != _TABLE_LANES:
+            raise ValueError(
+                f"has_copies=True serves {_TABLE_LANES} global experts (the "
+                f"copy tables' width), got {route_cols}"
+            )
+        if not 0 < ranks <= nc or not 0 < owned <= n_experts:
+            raise ValueError(
+                f"has_copies=True needs 0 < ranks <= {nc} (the hot table's "
+                f"width) and 0 < owned <= {n_experts} (the weight slots), got "
+                f"ranks={ranks}, owned={owned}"
+            )
+        if ranks * owned != _TABLE_LANES:
+            raise ValueError(
+                f"has_copies=True needs ranks x owned = {_TABLE_LANES} primaries, "
+                f"got {ranks} x {owned}"
+            )
         o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(n_experts, nc)
         tab = jnp.asarray(tables, jnp.int32)
         if tab.shape != (length,):
