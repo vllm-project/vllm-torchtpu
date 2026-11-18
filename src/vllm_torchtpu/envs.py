@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    VLLM_TPU_GLM53_MLA_IMPL: str = "rpa"
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
@@ -493,6 +494,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fingerprint.
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
+    ),
+    # GLM-5.3-Flash NoPE MLA layers: "rpa" expands the latent with kv_b_proj
+    # and runs ragged paged attention on per-head K/V; "absorbed" caches the
+    # latent and runs the absorbed MLA kernel.
+    "VLLM_TPU_GLM53_MLA_IMPL": lambda: (
+        env_with_choices("VLLM_TPU_GLM53_MLA_IMPL", "rpa", ["rpa", "absorbed"])()
+        or "rpa"
     ),
     # Store GDN's in_proj_qkvz in the matmul's (k, n) layout, like every other
     # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)

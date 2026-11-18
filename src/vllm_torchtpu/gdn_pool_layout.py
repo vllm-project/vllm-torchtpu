@@ -56,6 +56,8 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
         # pool.
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
     }
 )
 
