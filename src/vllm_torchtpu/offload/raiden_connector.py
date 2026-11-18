@@ -337,10 +337,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         so completed H2D loads promote ``WAITING_FOR_REMOTE_KVS`` requests in
         the very next step instead of waiting 2 steps for the worker echo.
 
-        The prefix-aware schedulers call it at the start of each step
-        (PrefixAwareScheduler, #3080; the pipeline chunk scheduler's
-        prefix-aware admission, #3090); a scheduler that does not keeps the
-        worker echo."""
+        The pipeline chunk scheduler's prefix-aware admission (#3090) calls it
+        at the start of each step; a scheduler that does not keeps the worker
+        echo."""
         self._scheduler = scheduler
         t0_ns = time.perf_counter_ns()
         manager = self._raiden_manager
@@ -804,12 +803,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     ) -> int:
         """Host-tier tokens past ``num_local_tokens`` that a lookup would load.
 
-        ``PrefixAwareScheduler._external_warmth`` asks this for the waiting
-        sort, the warmest-first promotion and the pipeline scheduler's
-        pending-work estimate (#3080, #3090). Without an answer, a request
-        whose prefix is in the host tier but no longer in HBM is ranked as a
-        cold prompt and waits behind cheaper work while its host-tier entries
-        age towards eviction.
+        ``PrefixAwareScheduler._external_warmth`` (#3082) asks this; the
+        pipeline chunk scheduler (#3090) calls that for its waiting sort, its
+        warmest-first promotion and its pending-work estimate. Without an
+        answer, a request whose prefix is in the host tier but no longer in HBM
+        is ranked as a cold prompt and waits behind cheaper work while its
+        host-tier entries age towards eviction.
 
         The probe changes nothing: lookups take no pin and refresh no recency,
         no lookup event is emitted, and the lookup state the probe moves is
@@ -879,8 +878,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         in HBM when HBM has a divergent hybrid hit (FullAttention > Mamba), or
         None if Raiden CPU cannot advance past ``num_reconciled``.
 
-        The prefix-aware schedulers' local-hit lookup asks this when the
-        connector reports divergent local hybrid hits (#3080, #3090)."""
+        The pipeline chunk scheduler's local-hit lookup (#3090) asks this when
+        the connector reports divergent local hybrid hits."""
         if getattr(request, "skip_reading_prefix_cache", False):
             return None
         req_status = self._req_status.get(request.request_id)
