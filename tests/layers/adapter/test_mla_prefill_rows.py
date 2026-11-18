@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_MLA_PREFILL_SEQUENCE_ROWS: which layers take the rows block, and that a
-rows bucket's backbone trace lifts the same named inputs as a decode bucket's
-(the warmup hands a bucket over only between such traces). No TPU."""
+"""The MLA prefill rows block: which layers take it, and that a rows bucket's
+backbone trace lifts the same named inputs as a decode bucket's (the warmup
+hands a bucket over only between such traces). No TPU."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -42,6 +43,72 @@ TP, HIDDEN = 4, 8
 )
 def test_rows_layers_start_at_an_indexer_layer(skip_topk, want):
     assert rows.rows_layers(skip_topk) == want
+
+
+@pytest.mark.parametrize(
+    ("sequence_parallel", "dcp", "q_replicate", "want"),
+    [
+        (True, TP, True, True),
+        # The head-sharded query layout has no rows variant.
+        (True, TP, False, False),
+        # No token-parallel split (off, dense MLA, or no DCP).
+        (True, None, True, False),
+        (False, TP, True, False),
+        # DCP over part of the TP group: not every rank holds a DCP shard.
+        (True, TP // 2, True, False),
+    ],
+)
+def test_rows_block_serves_the_token_parallel_split_under_query_replication(
+    monkeypatch, sequence_parallel, dcp, q_replicate, want
+):
+    monkeypatch.setattr(envs, "TPU_MOE_PREFILL_SEQUENCE_PARALLEL", sequence_parallel)
+    monkeypatch.setattr(rows, "get_tensor_model_parallel_world_size", lambda: TP)
+    layout = None if dcp is None else SimpleNamespace(dcp_size=dcp)
+    attn = SimpleNamespace(token_parallel_layout=layout, dcp_q_replicate=q_replicate)
+    assert rows.serves(attn) is want
+
+
+def test_a_bucket_takes_the_block_when_every_rank_holds_the_dcp_rows(monkeypatch):
+    monkeypatch.setattr(rows, "get_tensor_model_parallel_world_size", lambda: TP)
+    layer = _Layer(False)
+    assert not rows.takes(layer, 4096)
+    setattr(layer.self_attn.mla_attn, rows.ROWS_ATTR, rows._Rows(None, None, 512))
+    assert not rows.takes(layer, 1024) and rows.takes(layer, 2048)
+
+
+def _served_mla(**attn):
+    """An MLA wrapper with the formats the rows block takes (`attn` overrides
+    the attention's)."""
+    o_proj = SimpleNamespace(
+        weight=torch.zeros(2, 2, dtype=torch.float8_e4m3fn),
+        weight_scale=torch.ones(2),
+        bias=None,
+    )
+    setattr(o_proj, rows.WEIGHT_FLIPPED_ATTR, True)
+    inner = dict(
+        sparse_mla_tp_rows_op=object(),
+        W_UK_T_dcp_qrep_scale=None,
+        W_UV=torch.zeros(1, dtype=torch.bfloat16),
+        kv_cache_quantized_dtype=torch.float8_e4m3fn,
+    )
+    return SimpleNamespace(
+        mla_attn=SimpleNamespace(**(inner | attn)),
+        q_lora_rank=8,
+        kimi_preprocess=None,
+        gate_is_fused=False,
+        g_proj=None,
+        is_sparse=True,
+        dcp_q_replicate=True,
+        o_proj=o_proj,
+        skip_topk=True,
+        indexer=None,
+    )
+
+
+def test_layers_without_the_block_formats_keep_the_split_path():
+    assert rows.armable([_served_mla(), _served_mla()])
+    bf16_kv = _served_mla(kv_cache_quantized_dtype=None)
+    assert not rows.armable([_served_mla(), bf16_kv])
 
 
 class _Norm(nn.Module):
@@ -173,10 +240,10 @@ def test_rows_and_decode_traces_lift_the_same_named_inputs(monkeypatch):
     for name, value in {
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL": True,
         "TPU_DCP_PREFILL_TOKEN_PARALLEL": True,
-        "TPU_MLA_PREFILL_SEQUENCE_ROWS": True,
     }.items():
         monkeypatch.setattr(envs, name, value)
     monkeypatch.setattr(sp, "get_tensor_model_parallel_world_size", lambda: TP)
+    monkeypatch.setattr(rows, "get_tensor_model_parallel_world_size", lambda: TP)
     monkeypatch.setattr(
         sp, "tensor_model_parallel_all_gather", lambda x, dim: x.repeat(TP, 1)
     )
@@ -194,7 +261,9 @@ def test_rows_and_decode_traces_lift_the_same_named_inputs(monkeypatch):
     armed = [False, *rows.rows_layers([True, False, True])]
     for layer, armed_rows in zip(layers[1:], armed[1:]):
         if armed_rows:
-            setattr(layer.self_attn.mla_attn, rows.ROWS_ATTR, rows._Rows(_gather, None))
+            setattr(
+                layer.self_attn.mla_attn, rows.ROWS_ATTR, rows._Rows(_gather, None, 16)
+            )
         setattr(layer, sp.KEEP_ATTR, sp.layer_keep(layer, armed_rows))
     model = _Backbone(layers)
     setattr(model, sp.KEEP_ATTR, True)

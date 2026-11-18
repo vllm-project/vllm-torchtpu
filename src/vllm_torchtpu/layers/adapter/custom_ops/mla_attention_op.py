@@ -604,7 +604,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
             )
             self.topk_op_tp = None
-            # TPU_MLA_PREFILL_SEQUENCE_ROWS: built with the attention's ops.
+            # The rows block's op (mla_prefill_rows): built with the
+            # attention's ops.
             self.topk_op_tp_rows = None
             if envs.TPU_DCP_PREFILL_TOKEN_PARALLEL:
                 self.topk_op_tp = dcp_token_parallel_op.build_indexer_op(
@@ -1899,12 +1900,6 @@ class VllmTPUMLAAttention(MLAAttention):
                 vllm_config, q_replicate=bool(dcp_q_replicate)
             )
             self.token_parallel_layout = dcp_token_parallel_op.layout_for(vllm_config)
-        if (
-            envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
-            and use_sparse
-            and vllm_config is not None
-        ):
-            mla_prefill_rows.check_config(vllm_config)
 
         # For compatibility reasons.
         self.prefix = prefix
@@ -2082,9 +2077,9 @@ class VllmTPUMLAAttention(MLAAttention):
                         self.token_parallel_layout,
                         q_own_rows=True,
                     )
-                # TPU_MLA_PREFILL_SEQUENCE_ROWS (mla_prefill_rows): the same
-                # split on each rank's sequence-parallel rows.
-                if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS and self.dcp_q_replicate:
+                # The rows block (mla_prefill_rows): the same split on each
+                # rank's sequence-parallel rows.
+                if mla_prefill_rows.serves(self):
                     rows_layout = dataclasses.replace(
                         self.token_parallel_layout, rows_aligned=True
                     )

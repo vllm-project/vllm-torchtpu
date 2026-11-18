@@ -30,11 +30,12 @@ owning the contiguous rows `[r * T / tp, (r + 1) * T / tp)`:
     of TPU_MOE_PREFILL_SP_SHARED_GROUP ranks (`member_slice`), which exchange their rows
     (`kernels/fused_moe/grouped_shared_expert.py`).
 
-With TPU_MLA_PREFILL_SEQUENCE_ROWS the attention block of a MoE layer runs on
-the rank's rows too (`mla_prefill_rows`): no projection all-gather, no o_proj
-reduce-scatter. The dense layers in front of the first MoE layer keep the
-replicated stream, and the model norm all-gathers the final rows. Buckets
-below `MIN_TOKENS` (decode) trace today's forward unchanged.
+With TPU_DCP_PREFILL_TOKEN_PARALLEL under query replication the attention
+block of a MoE layer runs on the rank's rows too on the buckets
+`mla_prefill_rows.takes`: no projection all-gather, no o_proj reduce-scatter.
+The dense layers in front of the first MoE layer keep the replicated stream,
+and the model norm all-gathers the final rows. Buckets below `MIN_TOKENS`
+(decode) trace today's forward unchanged.
 
 The backbone warmup hands a bucket between traces only when they lift the same
 buffers, so both branches of every MoE layer first route the layer's input
@@ -510,12 +511,14 @@ def patched_model_forward(
             # Gather the next layer's o_proj / W_UV shards from this layer's
             # input on: they run under this layer.
             current, gathered = gathered, None
-            if i + 1 < len(layers) and mla_prefill_rows.armed(layers[i + 1]):
+            if i + 1 < len(layers) and mla_prefill_rows.takes(
+                layers[i + 1], num_tokens
+            ):
                 after = layers[i + 1]
                 gathered = mla_prefill_rows.prefetch(
                     after, getattr(after, KEEP_ATTR), hidden_states
                 )
-            if mla_prefill_rows.armed(layer):
+            if mla_prefill_rows.takes(layer, num_tokens):
                 if current is None:
                     current = mla_prefill_rows.prefetch(
                         layer, getattr(layer, KEEP_ATTR), hidden_states
@@ -686,25 +689,24 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         backbone, [layer.mlp for layer in layers[first:]], shared_parts
     )
     del shared_parts
-    # TPU_MLA_PREFILL_SEQUENCE_ROWS: which MoE layers take the rows block.
+    # Which MoE layers take the rows block.
     rows_armed = [False] * (len(layers) - first)
-    if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS:
-        rows_armed = mla_prefill_rows.rows_layers(
-            [bool(layer.self_attn.mla_attn.skip_topk) for layer in layers[first:]]
-        )
+    mlas = [layer.self_attn.mla_attn for layer in layers[first:]]
+    if mla_prefill_rows.serves(mlas[0].mla_attn):
+        candidates = mla_prefill_rows.rows_layers([bool(m.skip_topk) for m in mlas])
+        if mla_prefill_rows.armable([m for m, c in zip(mlas, candidates) if c]):
+            rows_armed = candidates
     for layer, rows in zip(layers[first:], rows_armed):
         if rows:
             mla_prefill_rows.arm(layer.self_attn.mla_attn)
         setattr(layer, KEEP_ATTR, layer_keep(layer, rows))
     setattr(backbone, KEEP_ATTR, True)
-    if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS:
-        logger.info(
-            "TPU_MLA_PREFILL_SEQUENCE_ROWS: %d of %d MoE layers take the rows "
-            "block, buckets > %d tokens",
-            sum(rows_armed),
-            len(rows_armed),
-            envs.bucket_gate_edge(mla_prefill_rows.MIN_TOKENS),
-        )
+    logger.info(
+        "MLA prefill rows block: %d of %d MoE layers, buckets > %d tokens",
+        sum(rows_armed),
+        len(rows_armed),
+        envs.bucket_gate_edge(mla_prefill_rows.MIN_TOKENS),
+    )
     n = len(layers) - first
     logger.info(
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers armed (layers %d..%d), "

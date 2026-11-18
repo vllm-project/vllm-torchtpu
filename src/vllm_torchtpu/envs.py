@@ -110,7 +110,6 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_PREFILL_SEQUENCE_PARALLEL: bool = True
     TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 1
-    TPU_MLA_PREFILL_SEQUENCE_ROWS: bool = False
     TPU_MOE_PREFILL_SP_FP8_WIRE: bool = True
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
@@ -1143,18 +1142,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tensor-parallel subgroup size for the shared expert under
     # TPU_MOE_PREFILL_SEQUENCE_PARALLEL (1 replicates per rank).
     "TPU_MOE_PREFILL_SP_SHARED_GROUP": env_int("TPU_MOE_PREFILL_SP_SHARED_GROUP", 1),
-    # With TPU_MOE_PREFILL_SEQUENCE_PARALLEL and TPU_DCP_PREFILL_TOKEN_PARALLEL
-    # (query replication): on buckets of at least 2048 tokens each MoE layer's
-    # attention block runs on the rank's own residual rows
-    # (`layers/adapter/mla_prefill_rows.py`): per-row work on own rows, one
-    # all-gather of the cache-ready latent and index-K rows, token-parallel
-    # attention of own rows, and W_UV + o_proj of every head of them with the
-    # layer's o_proj / W_UV shards gathered while the layer before runs -- no
-    # projection all-gather, all-to-all or o_proj reduce-scatter. o_proj's
-    # shard partials are summed in f32.
-    "TPU_MLA_PREFILL_SEQUENCE_ROWS": env_bool(
-        "TPU_MLA_PREFILL_SEQUENCE_ROWS", default=False
-    ),
     # Use FP8 combine wire instead of bfloat16 in fused_ep_moe_v2 under
     # TPU_MOE_PREFILL_SEQUENCE_PARALLEL.
     "TPU_MOE_PREFILL_SP_FP8_WIRE": env_bool(

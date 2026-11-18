@@ -11,8 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_MLA_PREFILL_SEQUENCE_ROWS: the MLA attention block of a split prefill
-bucket on each rank's own residual rows.
+"""The MLA attention block of a split prefill bucket on each rank's own
+residual rows: every MoE layer's, wherever the MoE split and the token-parallel
+split under query replication both run over the whole TP group (`serves`) and
+the layers have the formats the block takes (`armable`); elsewhere the
+splits' own path runs.
 
 Under TPU_MOE_PREFILL_SEQUENCE_PARALLEL rank `r` holds the residual rows
 `[r * R, (r + 1) * R)`, `R = T / tp`. With TPU_DCP_PREFILL_TOKEN_PARALLEL each
@@ -63,6 +66,9 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.layers.core.quantization import quantize_kv
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Smallest bucket that takes the rows block (a power of two:
 # `bucket_gate_edge`). The shard gather is the same size at every bucket; the
@@ -79,11 +85,33 @@ def applies(num_tokens: int) -> bool:
     from vllm_torchtpu.layers.adapter import moe_prefill_sp
 
     return (
-        envs.TPU_MLA_PREFILL_SEQUENCE_ROWS
-        and num_tokens > envs.bucket_gate_edge(MIN_TOKENS)
+        num_tokens > envs.bucket_gate_edge(MIN_TOKENS)
         and moe_prefill_sp.applies(num_tokens)
         and dcp_token_parallel_op.applies(num_tokens)
     )
+
+
+def serves(attn: Any) -> bool:
+    """Whether the rows block can run the split buckets of this MLA attention
+    layer: the MoE prefill split is on and the layer has the token-parallel
+    split with query replication (the head-sharded query layout has no rows
+    variant) over the whole TP group (every rank holds a DCP shard and a
+    residual row block)."""
+    layout = attn.token_parallel_layout
+    if not (
+        envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
+        and layout is not None
+        and attn.dcp_q_replicate
+    ):
+        return False
+    if layout.dcp_size != get_tensor_model_parallel_world_size():
+        logger.warning_once(
+            "The MLA prefill rows block needs decode_context_parallel_size == "
+            "tensor_parallel_size; prefill attention keeps the token-parallel "
+            "path."
+        )
+        return False
+    return True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,35 +120,12 @@ class _Rows:
 
     prefetch_op: Any
     oproj_op: Any
+    # The DCP sub-batch's rows (rank 0's first rows): a bucket takes the block
+    # only when every rank's rows hold at least this many (`takes`).
+    split_rows: int
 
 
-def check_config(vllm_config: Any) -> None:
-    """Raise for a server config the rows block does not serve (at model
-    build, with TPU_DCP_PREFILL_TOKEN_PARALLEL's checks)."""
-    parallel = vllm_config.parallel_config
-    tp = int(parallel.tensor_parallel_size)
-    refusals = {
-        "needs TPU_MOE_PREFILL_SEQUENCE_PARALLEL": (
-            not envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
-        ),
-        "needs TPU_DCP_PREFILL_TOKEN_PARALLEL": not envs.TPU_DCP_PREFILL_TOKEN_PARALLEL,
-        "needs decode_context_parallel_size == tensor_parallel_size > 1 (every "
-        "rank holds a DCP shard and a residual row block)": (
-            parallel.decode_context_parallel_size != tp or tp < 2
-        ),
-    }
-    if not any(refusals.values()):
-        split_rows = dcp_token_parallel_op.layout_for(vllm_config).split_rows
-        refusals[
-            f"needs every bucket it takes to give rank 0 at least the {split_rows} "
-            "DCP rows"
-        ] = (envs.bucket_gate_edge(MIN_TOKENS) + 1) // tp < split_rows
-    bad = [why for why, hit in refusals.items() if hit]
-    if bad:
-        raise NotImplementedError("TPU_MLA_PREFILL_SEQUENCE_ROWS " + "; ".join(bad))
-
-
-def _check_layer(mla: Any) -> None:
+def _layer_problems(mla: Any) -> list[str]:
     attn = mla.mla_attn
     # The q_b overlap, the decode prologue and the local-q window act only on
     # the buckets the prefill splits leave (the wrapper's forward), never here.
@@ -154,18 +159,29 @@ def _check_layer(mla: Any) -> None:
         problems["the indexer's rows op"] = (
             getattr(indexer.indexer_op, "topk_op_tp_rows", None) is None
         )
-    bad = [what for what, hit in problems.items() if hit]
-    if bad:
-        raise NotImplementedError(
-            "TPU_MLA_PREFILL_SEQUENCE_ROWS needs " + "; ".join(bad) + f" ({mla.prefix})"
+    return [what for what, hit in problems.items() if hit]
+
+
+def armable(mlas: list[Any]) -> bool:
+    """Whether every MLA wrapper the block would arm (`rows_layers`) has the
+    formats it takes. Otherwise none is armed, with a warning: a layer that
+    reuses top-k rows must take the block when the indexer layer before it
+    does."""
+    problems = sorted({p for mla in mlas for p in _layer_problems(mla)})
+    if problems:
+        logger.warning_once(
+            "The MLA prefill rows block needs %s; prefill attention keeps the "
+            "sequence-parallel split's path.",
+            "; ".join(problems),
         )
+    return not problems
 
 
 # Built once: both ops take every shape from their operands.
-_OPS: list[_Rows] = []
+_OPS: list[tuple[Any, Any]] = []
 
 
-def _build_ops() -> _Rows:
+def _build_ops() -> tuple[Any, Any]:
     """The shard gather and the W_UV + o_proj ops (shared by every layer)."""
     if _OPS:
         return _OPS[0]
@@ -213,14 +229,14 @@ def _build_ops() -> _Rows:
             (out_latent.shape[0], w_o.shape[2])
         )
     )
-    _OPS.append(_Rows(prefetch_op, oproj_op))
+    _OPS.append((prefetch_op, oproj_op))
     return _OPS[0]
 
 
 def arm(mla: Any) -> None:
     """Prepare one MoE layer's MLA wrapper (at load, after weights are
-    processed). Raises for anything the rows block does not serve."""
-    _check_layer(mla)
+    processed; `armable`). Raises where the layer breaks what the block's
+    arithmetic assumes."""
     attn = mla.mla_attn
     tp = get_tensor_model_parallel_world_size()
     if get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME).devices.size != tp:
@@ -238,7 +254,7 @@ def arm(mla: Any) -> None:
             f"o_proj rows {mla.o_proj.weight.shape[0]} != the rank's heads x "
             f"v_head_dim {heads * v_head_dim} ({mla.prefix})"
         )
-    setattr(mla, ROWS_ATTR, _build_ops())
+    setattr(mla, ROWS_ATTR, _Rows(*_build_ops(), attn.token_parallel_layout.split_rows))
 
 
 def _prefetched(mla: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -306,9 +322,13 @@ def rows_layers(skip_topk: list[bool]) -> list[bool]:
     return out
 
 
-def armed(layer: Any) -> bool:
+def takes(layer: Any, num_tokens: int) -> bool:
+    """Whether `layer` runs the rows block on a bucket `applies` takes: it is
+    armed and every rank's rows hold the DCP sub-batch's."""
     mla = getattr(getattr(layer, "self_attn", None), "mla_attn", None)
-    return getattr(mla, ROWS_ATTR, None) is not None
+    rows: _Rows | None = getattr(mla, ROWS_ATTR, None)
+    tp = get_tensor_model_parallel_world_size()
+    return rows is not None and num_tokens // tp >= rows.split_rows
 
 
 def prefetch(
