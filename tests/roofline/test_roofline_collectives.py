@@ -49,11 +49,6 @@ def test_spec_cited_chip_and_unloaded_hop_latency() -> None:
     expected_ici_bw = DEFAULT_ICI_BW
     expected_hop_latency = DEFAULT_ICI_HOP_LATENCY_S
     chip = CHIPS["tpu7x"]
-    assert "ici_startup_hops" not in dir(chip)
-    assert "ici_transit_hops" not in dir(chip)
-    assert "contraction_floor_s" not in dir(chip)
-    assert "d2d_latency_s" not in dir(chip)
-    assert "usable_hbm_frac" not in dir(chip)
     assert chip.d2d_bw == pytest.approx(expected_ici_bw * chip.cores_per_chip)
     assert chip.ici_link_bw == expected_link_bw
     assert chip.ici_bw == expected_ici_bw

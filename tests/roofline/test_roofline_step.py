@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 import pytest
 
 import vllm_torchtpu.roofline as rf
+from tests.roofline.conftest import QWEN35_CFG
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
@@ -49,30 +50,6 @@ from vllm_torchtpu.roofline.collectives import submesh_for_group
 from vllm_torchtpu.roofline.hf_loader import load_hf_config
 from vllm_torchtpu.roofline.modules import experts_touched
 from vllm_torchtpu.roofline.partition import partition_pp_layers
-
-QWEN35_CFG: dict[str, object] = {
-    "text_config": {
-        "hidden_size": 4096,
-        "num_hidden_layers": 60,
-        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "attn_output_gate": True,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 64,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "num_experts": 512,
-        "num_experts_per_tok": 10,
-        "moe_intermediate_size": 1024,
-        "shared_expert_intermediate_size": 1024,
-        "vocab_size": 248320,
-        "mtp_num_hidden_layers": 1,
-        "dtype": "bfloat16",
-    }
-}
 
 DOC_DTYPES = Dtypes(kv=2.0, w_aux=1.0)
 EXAMPLE_FP8_DTYPES = Dtypes()

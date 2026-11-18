@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from vllm_torchtpu.roofline.modules import ModuleCost
 
 import vllm_torchtpu.roofline as rf
+from tests.roofline.conftest import NEMOTRON_CFG, QWEN35_CFG
 from vllm_torchtpu.roofline import (
     CHIPS,
     Dtypes,
@@ -33,6 +34,7 @@ from vllm_torchtpu.roofline import (
     StepShape,
     dtypes_from_hf_config,
     from_hf_config,
+    hbm_breakdown_per_core_bytes,
     pass_costs,
 )
 from vllm_torchtpu.roofline.constants import (
@@ -47,29 +49,6 @@ from vllm_torchtpu.roofline.modules import (
     experts_touched,
     kv_bytes_per_token_per_layer,
 )
-
-QWEN35_CFG: dict[str, object] = {
-    "text_config": {
-        "hidden_size": 4096,
-        "num_hidden_layers": 60,
-        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "attn_output_gate": True,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 64,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "num_experts": 512,
-        "num_experts_per_tok": 10,
-        "moe_intermediate_size": 1024,
-        "shared_expert_intermediate_size": 1024,
-        "vocab_size": 248320,
-        "mtp_num_hidden_layers": 1,
-    }
-}
 
 DOC_DTYPES = Dtypes(kv=2.0, w_aux=1.0)
 
@@ -780,23 +759,6 @@ def test_step_ffn_layers_match_capacity_ffn_layers() -> None:
         "interleave_moe_layer_step": 2,
         "vocab_size": 202048,
     }
-    nemotron_cfg: dict[str, object] = {
-        "model_type": "nemotron_h",
-        "hidden_size": 4096,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "mamba_num_heads": 64,
-        "mamba_head_dim": 64,
-        "conv_kernel": 4,
-        "hybrid_override_pattern": "M-M*ME",
-        "n_routed_experts": 16,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 2048,
-        "intermediate_size": 8192,
-        "vocab_size": 131072,
-    }
     dt = Dtypes()
     par = Parallel(tp=1)
     shape = StepShape(batch=4096, rows_per_seq=1, context=16)
@@ -813,7 +775,7 @@ def test_step_ffn_layers_match_capacity_ffn_layers() -> None:
     # Llama 4 FFN total bytes
     assert step_ffn_l4 == pytest.approx(6_417_776_640.0, abs=1.0)
 
-    geom_nh = from_hf_config(nemotron_cfg)
+    geom_nh = from_hf_config(NEMOTRON_CFG)
     expected_four = 4
     assert layer_ffn_kinds(geom_nh).count("dense") == 1
     assert layer_ffn_kinds(geom_nh).count("moe") == 1
@@ -982,3 +944,92 @@ def test_latent_projection_weights_charge_sub_byte_unpack() -> None:
 
     dense_elems = (moe_one.hbm_bytes - moe_half.hbm_bytes) / 0.5
     assert (moe_half.vpu_flops - moe_one.vpu_flops) == pytest.approx(2.0 * dense_elems)
+
+
+@pytest.mark.parametrize(
+    (
+        "lin_attn_cfg",
+        "expected_key_heads",
+        "expected_val_heads",
+        "expected_key_dim",
+        "expected_val_dim",
+    ),
+    [
+        (
+            {
+                "kda_layers": [1, 2, 3],
+                "num_key_heads": 8,
+                "num_value_heads": 12,
+                "key_head_dim": 64,
+                "value_head_dim": 96,
+                "short_conv_kernel_size": 4,
+            },
+            8,
+            12,
+            64,
+            96,
+        ),
+        (
+            {
+                "kda_layers": [1, 2, 3],
+                "short_conv_kernel_size": 4,
+            },
+            16,
+            16,
+            64,
+            64,
+        ),
+    ],
+    ids=["explicit_kda_heads", "fallback_to_attn_heads"],
+)
+def test_kda_linear_attention_hbm_matches_head_shapes(
+    lin_attn_cfg: dict[str, object],
+    expected_key_heads: int,
+    expected_val_heads: int,
+    expected_key_dim: int,
+    expected_val_dim: int,
+) -> None:
+    """Verify KDA linear-attention weight and state HBM bytes match head shapes."""
+    hidden, num_layers, inter, vocab = 1024, 4, 2048, 32000
+    tp, seqs_per_dp, context_len = 2, 3, 128
+    geom = from_hf_config(
+        {
+            "model_type": "kimi_linear",
+            "hidden_size": hidden,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 64,
+            "intermediate_size": inter,
+            "vocab_size": vocab,
+            "linear_attn_config": lin_attn_cfg,
+        }
+    )
+    dt = Dtypes()
+    par = Parallel(tp=tp, pp=1)
+    bd = hbm_breakdown_per_core_bytes(
+        geom, dt, par, SeqKvLayout(seqs_per_dp=seqs_per_dp, context=context_len)
+    )
+    key_heads_tp = expected_key_heads // tp
+    val_heads_tp = expected_val_heads // tp
+    n_kda, n_gqa = 3, 1
+    # KDA recurrent weights (2*kh*kd + 3*vh*vd) + 1 GQA + 4 FFNs + embed/head.
+    w_kda = (
+        n_kda
+        * hidden
+        * (2 * key_heads_tp * expected_key_dim + 3 * val_heads_tp * expected_val_dim)
+        * dt.w_dense
+    )
+    w_gqa = n_gqa * hidden * ((16 // tp) * 64 * 2 + 2 * (4 // tp) * 64) * dt.w_dense
+    w_ffn = num_layers * 3 * hidden * (inter // tp) * dt.w_dense
+    w_emb_head = 2 * (vocab * hidden // tp) * dt.lm_head
+    assert bd.weights == pytest.approx(w_kda + w_gqa + w_ffn + w_emb_head, rel=1e-12)
+    assert bd.state == pytest.approx(
+        seqs_per_dp
+        * n_kda
+        * val_heads_tp
+        * expected_key_dim
+        * expected_val_dim
+        * dt.state,
+        rel=1e-12,
+    )

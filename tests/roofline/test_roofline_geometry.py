@@ -21,41 +21,24 @@ from pathlib import Path
 from types import MappingProxyType
 
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.roofline as rf
+from tests.roofline.conftest import NEMOTRON_CFG
 from vllm_torchtpu.roofline import CHIPS, TOPOLOGIES, ChipOverrides, chips
 from vllm_torchtpu.roofline import constants as rf_constants
 from vllm_torchtpu.roofline import geometry as rf_geometry
 from vllm_torchtpu.roofline.constants import (
+    BITS_PER_BYTE,
     DEFAULT_ICI_BW,
     DEFAULT_ICI_HOP_LATENCY_S,
     DEFAULT_ICI_LINK_BW,
+    DEFAULT_VPU_TO_BF16_RATIO,
+    TPU7X_ICI_LINKS_PER_CHIP,
+    UNIT_GIGA,
 )
 from vllm_torchtpu.roofline.geometry import from_hf_config
 from vllm_torchtpu.roofline.partition import count_full_attn_layers
-
-QWEN35_CFG: dict[str, object] = {
-    "text_config": {
-        "hidden_size": 4096,
-        "num_hidden_layers": 60,
-        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "attn_output_gate": True,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 64,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "num_experts": 512,
-        "num_experts_per_tok": 10,
-        "moe_intermediate_size": 1024,
-        "shared_expert_intermediate_size": 1024,
-        "vocab_size": 248320,
-        "mtp_num_hidden_layers": 1,
-    }
-}
 
 
 def test_topologies_exclude_subhost_shapes() -> None:
@@ -375,24 +358,7 @@ def test_kimi_linear_and_hybrid_multimodel_configs() -> None:
     )
     assert mg.conv_kernel == 0
 
-    nemotron_cfg = {
-        "model_type": "nemotron_h",
-        "hidden_size": 4096,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "mamba_num_heads": 64,
-        "mamba_head_dim": 64,
-        "conv_kernel": 4,
-        "hybrid_override_pattern": "M-M*ME",
-        "n_routed_experts": 16,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 2048,
-        "intermediate_size": 8192,
-        "vocab_size": 131072,
-    }
-    ng = rf.from_hf_config(nemotron_cfg)
+    ng = rf.from_hf_config(NEMOTRON_CFG)
     exp_ffn_only = 2
     assert ng.layer_types.count("ffn_only") == exp_ffn_only
     assert ng.n_moe_layers == 1
@@ -404,24 +370,7 @@ def test_kimi_linear_and_hybrid_multimodel_configs() -> None:
 
 def test_ffn_only_hybrid_override_excluded_from_full_attn_count() -> None:
     """Verify ffn_only layers from hybrid_override are excluded from full-attn count."""
-    nemotron_cfg = {
-        "model_type": "nemotron_h",
-        "hidden_size": 4096,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "mamba_num_heads": 64,
-        "mamba_head_dim": 64,
-        "conv_kernel": 4,
-        "hybrid_override_pattern": "M-M*ME",
-        "n_routed_experts": 16,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 2048,
-        "intermediate_size": 8192,
-        "vocab_size": 131072,
-    }
-    ng = rf.from_hf_config(nemotron_cfg)
+    ng = rf.from_hf_config(NEMOTRON_CFG)
     exp_ffn_count = 2
     assert ng.layer_types.count("ffn_only") == exp_ffn_count
     assert ng.ffn_layer_counts() == (1, 1)
@@ -795,3 +744,53 @@ def test_moe_config_without_routed_experts_key_is_rejected() -> None:
     """Reject a MoE config that names no routed experts per token."""
     with pytest.raises(ValueError, match="routed experts per token"):
         from_hf_config(SAMPLING_TOP_K_MOE_CFG)
+
+
+def test_from_jax_applies_chip_overrides() -> None:
+    """Verify from_jax applies keyword and ChipOverrides rates over JAX info."""
+    tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    custom_cores = 4
+    custom_link_bw = 120.0 * UNIT_GIGA
+    custom_hop_s = 2.5e-6
+    base_overrides = ChipOverrides(
+        dcn_host_gbit_per_s=800.0,
+        chips_per_host=4,
+    )
+    spec_kw = chips.from_jax(
+        "tpu7x",
+        pltpu.ChipVersion.TPU_7X,
+        overrides=base_overrides,
+        cores_per_chip=custom_cores,
+        ici_link_bw=custom_link_bw,
+        ici_hop_latency_s=custom_hop_s,
+    )
+    expected_d2d = float(TPU7X_ICI_LINKS_PER_CHIP) * custom_link_bw
+    assert spec_kw.hbm_bytes == tpu_info.hbm_capacity_bytes
+    assert spec_kw.cores_per_chip == custom_cores
+    assert spec_kw.ici_hop_latency_s == pytest.approx(custom_hop_s, rel=1e-12)
+    assert spec_kw.d2d_bw == pytest.approx(expected_d2d, rel=1e-12)
+    assert spec_kw.ici_bw == pytest.approx(expected_d2d / custom_cores, rel=1e-12)
+    assert spec_kw.dcn_bw == pytest.approx(
+        (800.0 * UNIT_GIGA / BITS_PER_BYTE) / 4.0, rel=1e-12
+    )
+    assert spec_kw.vpu_flops == pytest.approx(
+        float(tpu_info.bf16_ops_per_second) * DEFAULT_VPU_TO_BF16_RATIO, rel=1e-12
+    )
+
+    explicit = ChipOverrides(
+        d2d_bw=500.0 * UNIT_GIGA,
+        ici_bw=220.0 * UNIT_GIGA,
+        dcn_bw=40.0 * UNIT_GIGA,
+        vpu_flops=12.0e12,
+    )
+    spec_exp = chips.from_jax("tpu7x", "tpu7x", overrides=explicit, ici_bw=210.0e9)
+    assert spec_exp.d2d_bw == pytest.approx(500.0 * UNIT_GIGA, rel=1e-12)
+    assert spec_exp.ici_bw == pytest.approx(210.0e9, rel=1e-12)
+    assert spec_exp.dcn_bw == pytest.approx(40.0 * UNIT_GIGA, rel=1e-12)
+    assert spec_exp.vpu_flops == pytest.approx(12.0e12, rel=1e-12)
+
+
+def test_from_jax_rejects_unknown_fallback_chip() -> None:
+    """Verify from_jax raises KeyError when fallback string chip is unknown."""
+    with pytest.raises(KeyError, match="Unknown fallback TPU chip"):
+        chips.from_jax("unknown_tpu", "unknown_tpu")

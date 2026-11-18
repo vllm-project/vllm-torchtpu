@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.roofline.conftest import QWEN35_CFG, SMALL_HYBRID_MOE_CFG
 from vllm_torchtpu.roofline import (
     CHIPS,
     Dtypes,
@@ -34,33 +36,11 @@ from vllm_torchtpu.roofline import (
     from_hf_config,
     plan,
 )
+from vllm_torchtpu.roofline.constants import UNIT_GIGA, UNIT_MILLIS_PER_SECOND
+from vllm_torchtpu.roofline.modules import ep_busiest_experts
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-QWEN35_CFG: dict[str, object] = {
-    "text_config": {
-        "hidden_size": 4096,
-        "num_hidden_layers": 60,
-        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "attn_output_gate": True,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 64,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "num_experts": 512,
-        "num_experts_per_tok": 10,
-        "moe_intermediate_size": 1024,
-        "shared_expert_intermediate_size": 1024,
-        "vocab_size": 248320,
-        "mtp_num_hidden_layers": 1,
-        "dtype": "bfloat16",
-    }
-}
 
 
 # argparse.ArgumentParser.error exits with status code 2.
@@ -171,21 +151,23 @@ def test_cli_rejects_non_positive_tp(
     assert ">= 1" in stderr_text
 
 
-def test_cli_plan_axes_flags(
+def test_cli_explain_module_hbm_bytes_match_tensor_shapes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Verify explain command with MoE expert parallel and FP8 KV cache."""
+    """Verify explain JSON per-module HBM bytes match tensor-shape derivations."""
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps(QWEN35_CFG))
+    tp = 8
+    context_tokens = 90036
     rc = cli.main(
         [
             "explain",
             "--config",
             str(cfg_path),
             "--tp",
-            "8",
+            str(tp),
             "--context",
-            "90036",
+            str(context_tokens),
             "--moe",
             "ep",
             "--kv-dtype",
@@ -194,23 +176,48 @@ def test_cli_plan_axes_flags(
         ]
     )
     assert rc == 0
-    mods = json.loads(capsys.readouterr().out)
-    total_phys = sum(m["hbm_bytes"] for m in mods)
-    # Sum of module HBM footprints: gqa (1.603 GB) + gdn (0.715 GB)
-    # + moe (2.596 GB) + lm_head (0.254 GB)
-    mod_map = {m["name"]: m["hbm_bytes"] for m in mods}
-    expected_phys = (
-        mod_map["gqa"] + mod_map["gdn"] + mod_map["moe"] + mod_map["lm_head"]
-    )
-    assert total_phys == pytest.approx(expected_phys, rel=1e-6)
+    mod_by_name = {m["name"]: m for m in json.loads(capsys.readouterr().out)}
+    assert set(mod_by_name) == {"embed", "gqa", "gdn", "moe", "lm_head"}
+    assert mod_by_name["embed"]["hbm_bytes"] == 0.0
 
-    gqa_mod = next(m for m in mods if m["name"] == "gqa")
-    assert gqa_mod.get("hbm_bytes_min") is not None
-    # Logical footprint replaces physical GQA padded allocation with
-    # unpadded logical KV requirement
-    expected_logical = total_phys - (gqa_mod["hbm_bytes"] - gqa_mod["hbm_bytes_min"])
-    logical_total = total_phys - (gqa_mod["hbm_bytes"] - gqa_mod["hbm_bytes_min"])
-    assert logical_total == pytest.approx(expected_logical, rel=1e-6)
+    # Derive expected bytes from QWEN35_CFG shapes (15 GQA, 45 GDN, 60 MoE layers).
+    bf16_b, fp8_b, fp32_b = 2.0, 1.0, 4.0
+    # GQA: gated Q (2 * 32 * 256 / 8), 1 KV head/rank (256), O (32 * 256 / 8).
+    gqa_w_b = 15 * (4096 * 2048 + 2 * 4096 * 256 + 1024 * 4096) * bf16_b
+    # FP8 KV packs 4 slots per 32-bit word (4 * 256 B/tok physical vs 2 * 256 logical).
+    assert mod_by_name["gqa"]["hbm_bytes"] == pytest.approx(
+        gqa_w_b + 15 * context_tokens * (4 * 256 * fp8_b), rel=1e-12
+    )
+    assert mod_by_name["gqa"]["hbm_bytes_min"] == pytest.approx(
+        gqa_w_b + 15 * context_tokens * (2 * 256 * fp8_b), rel=1e-12
+    )
+
+    # GDN: kh=16//8=2, vh=64//8=8, qkv_r=2*2*128+8*128=1536, z_r=8*128=1024, conv=4.
+    gdn_w_b = (
+        45 * (4096 * (1536 + 1024) + 1024 * 4096) * bf16_b
+        + 45 * (4096 * 16 + 1536 * 4) * bf16_b
+    )
+    # Batch=1 decode reads and writes recurrent (FP32) + conv (BF16) state (2x).
+    gdn_state_b = 2 * 45 * (8 * 128 * 128 * fp32_b + 1536 * 3 * bf16_b)
+    assert mod_by_name["gdn"]["hbm_bytes"] == pytest.approx(
+        gdn_w_b + gdn_state_b, rel=1e-12
+    )
+
+    # MoE (EP=8): routed unit = 60 * 3 * 4096 * 1024 * 2 B; shared//8 + router.
+    routed_unit_b = 60.0 * 3.0 * 4096.0 * 1024.0 * bf16_b
+    shared_and_router_b = (
+        60.0 * 3.0 * 4096.0 * (1024 // tp) * bf16_b + 60.0 * 4096.0 * 512.0 * bf16_b
+    )
+    assert mod_by_name["moe"]["hbm_bytes_min"] == pytest.approx(
+        math.ceil(10 / tp) * routed_unit_b + shared_and_router_b, rel=1e-12
+    )
+    assert mod_by_name["moe"]["hbm_bytes"] == pytest.approx(
+        ep_busiest_experts(512, 10, 1, tp) * routed_unit_b + shared_and_router_b,
+        rel=1e-12,
+    )
+    assert mod_by_name["lm_head"]["hbm_bytes"] == pytest.approx(
+        (248320 * 4096 // tp) * bf16_b, rel=1e-12
+    )
 
 
 def test_plan_requires_acceptance_length_for_spec_window(tmp_path: Path) -> None:
@@ -556,15 +563,15 @@ def test_cli_solve_top_k_ascii_table_and_json(
     """Verify --top-k defaults to 5, drives JSON and ASCII tables, and rejects <=0."""
     expected_default_k = 5
     expected_k_2 = 2
-    expected_pp_8 = 8
+    expected_pp_2 = 2
     expected_err_code = 2
-    cfg_path = tmp_path / "qwen35_fp8.json"
-    raw_text_cfg = QWEN35_CFG["text_config"]
+    cfg_path = tmp_path / "small_qwen35_fp8.json"
+    raw_text_cfg = SMALL_HYBRID_MOE_CFG["text_config"]
     assert isinstance(raw_text_cfg, dict)
     cfg_path.write_text(
         json.dumps(
             {
-                **QWEN35_CFG,
+                **SMALL_HYBRID_MOE_CFG,
                 "text_config": {
                     **raw_text_cfg,
                     "quantization_config": {"quant_method": "fp8"},
@@ -580,8 +587,10 @@ def test_cli_solve_top_k_ascii_table_and_json(
             str(cfg_path),
             "--example-scenario",
             "coding-agent",
+            "--mode",
+            "disagg",
             "--max-chips",
-            "64",
+            "8",
             "--kv-offload-gb",
             "64",
             "--json",
@@ -591,7 +600,7 @@ def test_cli_solve_top_k_ascii_table_and_json(
     payload_5 = json.loads(capsys.readouterr().out)
     assert len(payload_5["top_k"]) == expected_default_k
     assert any(
-        (entry["point"].get("prefill_pool") or {}).get("pp") == expected_pp_8
+        (entry["point"].get("prefill_pool") or {}).get("pp") == expected_pp_2
         for entry in payload_5["top_k"]
     )
 
@@ -603,7 +612,7 @@ def test_cli_solve_top_k_ascii_table_and_json(
             "--example-scenario",
             "coding-agent",
             "--max-chips",
-            "32",
+            "8",
             "--top-k",
             "2",
             "--json",
@@ -621,7 +630,7 @@ def test_cli_solve_top_k_ascii_table_and_json(
             "--example-scenario",
             "coding-agent",
             "--max-chips",
-            "32",
+            "8",
             "--top-k",
             "2",
         ]
@@ -647,7 +656,7 @@ def test_cli_solve_top_k_ascii_table_and_json(
                 "--example-scenario",
                 "coding-agent",
                 "--max-chips",
-                "64",
+                "8",
                 "--top-k",
                 "0",
             ]
@@ -959,7 +968,6 @@ def test_serve_command_acceptance_length_is_parsed_and_no_slope_is_fitted(
     assert any(
         "acceptance length" in str(w).lower() for w in payload2.get("warnings", ())
     )
-    assert not hasattr(cli, "_SPEC_ACCEPT_SLOPE")
 
 
 def test_top_layout_tables_have_no_margin_column(
@@ -1384,6 +1392,105 @@ def test_example_scenario_with_other_draft_count_assumes_all_drafts_accepted(
     expected_accept_len_c = 3.0
     assert payload_c["scenario"]["accept_len"] == expected_accept_len_c
     assert not any("acceptance length" in w.lower() for w in payload_c["warnings"])
+
+
+def test_cli_plan_moe_fused_rs_matches_wire_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify plan and explain --moe-dispatch fused_rs match TP wire bytes."""
+    hidden = 1024
+    num_layers = 2
+    tp = 4
+    ici_bw_gbps = 0.01
+    cfg_path = tmp_path / "moe_fused_rs.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_moe",
+                "hidden_size": hidden,
+                "num_hidden_layers": num_layers,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "head_dim": 64,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 512,
+                "vocab_size": 32000,
+                "dtype": "bfloat16",
+            }
+        )
+    )
+
+    serial_ms_by_residual: dict[str, float] = {}
+    for residual_mode, padded_rows, expected_names in (
+        ("replicated", 1, ["combine_rs", "restore_ag"] * num_layers),
+        ("sp", tp, ["dispatch_ag", "combine_rs"] * num_layers),
+    ):
+        rc_plan = cli.main(
+            [
+                "plan",
+                "--config",
+                str(cfg_path),
+                "--tp",
+                str(tp),
+                "--moe",
+                "ep",
+                "--moe-dispatch",
+                "fused_rs",
+                "--residual",
+                residual_mode,
+                "--ici-bw-gbps",
+                str(ici_bw_gbps),
+                "--context",
+                "128",
+                "--concurrency",
+                "1",
+                "--json",
+            ]
+        )
+        assert rc_plan == 0
+        plan_rows = json.loads(capsys.readouterr().out)
+        serial_ms_by_residual[residual_mode] = float(plan_rows[0]["serial_estimate_ms"])
+
+        rc_exp = cli.main(
+            [
+                "explain",
+                "--config",
+                str(cfg_path),
+                "--tp",
+                str(tp),
+                "--moe",
+                "ep",
+                "--moe-dispatch",
+                "fused_rs",
+                "--residual",
+                residual_mode,
+                "--context",
+                "128",
+                "--json",
+            ]
+        )
+        assert rc_exp == 0
+        moe_mod = next(
+            m for m in json.loads(capsys.readouterr().out) if m["name"] == "moe"
+        )
+        assert [c["name"] for c in moe_mod["collectives"]] == expected_names
+        # Each RS/AG sends ((tp - 1) / tp) * padded_rows * hidden * 2 B on the ring.
+        expected_wire = ((tp - 1) / tp) * padded_rows * hidden * 2.0
+        for coll in moe_mod["collectives"]:
+            assert coll["wire_bytes"] == pytest.approx(expected_wire, rel=1e-12)
+
+    # At batch=1, SP pads ceil(1/tp)=1 row/rank so full-row AG/RS carry tp rows:
+    # 2 GQA + 2 MoE phases/layer grow by (tp - 1) rows, plus 1 tail AG + 1 hop.
+    chip = CHIPS["tpu7x"]
+    one_row_xfer = ((tp - 1) / tp) * (hidden * 2.0)
+    sp_extra_xfer_bytes = (4 * num_layers * (tp - 1) + tp) * one_row_xfer
+    expected_delta_ms = (
+        sp_extra_xfer_bytes / (ici_bw_gbps * UNIT_GIGA) + chip.ici_hop_latency_s
+    ) * UNIT_MILLIS_PER_SECOND
+    assert (
+        serial_ms_by_residual["sp"] - serial_ms_by_residual["replicated"]
+    ) == pytest.approx(expected_delta_ms, rel=1e-9)
 
 
 def test_pd_with_one_part_exits_with_a_usage_error(

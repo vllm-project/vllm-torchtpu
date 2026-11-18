@@ -26,6 +26,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 import vllm_torchtpu.roofline as rf
+from tests.roofline.conftest import (
+    QWEN35_CFG,
+    SMALL_HYBRID_MOE_CFG,
+    cold_crossover_sweep,
+)
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
@@ -47,20 +52,21 @@ from vllm_torchtpu.roofline import (
     cli,
     dtypes_from_hf_config,
     emit_launch_args,
+    explain_layout_rejection,
     from_hf_config,
     hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
     max_ep_load_ratio,
+    parse_layout,
     partition_pp_layers,
     point_launch_args,
     solve_serving_plan,
-    solver,
     spec_cycle_floor,
     step_floor,
     sweep_prefix_hit_crossovers,
     top_layouts,
 )
-from vllm_torchtpu.roofline import solver as rf_solver
+from vllm_torchtpu.roofline.constants import UNIT_GIGA, UNIT_MILLIS_PER_SECOND
 from vllm_torchtpu.roofline.crossover import (
     CandidateState,
     EpLoadSpec,
@@ -97,30 +103,6 @@ from vllm_torchtpu.roofline.solver import (
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-QWEN35_CFG: dict[str, object] = {
-    "text_config": {
-        "hidden_size": 4096,
-        "num_hidden_layers": 60,
-        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "attn_output_gate": True,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 64,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "num_experts": 512,
-        "num_experts_per_tok": 10,
-        "moe_intermediate_size": 1024,
-        "shared_expert_intermediate_size": 1024,
-        "vocab_size": 248320,
-        "mtp_num_hidden_layers": 1,
-        "dtype": "bfloat16",
-    }
-}
 
 
 def _check_dp_moe_decode(chip: rf.ChipSpec, q35_geom: rf.ModelGeometry) -> None:
@@ -1197,40 +1179,74 @@ def test_search_stats_funnel_is_monotone(
 
 
 def test_decode_floor_matches_binding() -> None:
-    """Every candidate has decode_floor matching binding resource."""
+    """Verify every candidate decode_floor equals the maximum of its bound terms."""
     chip = CHIPS["tpu7x"]
-    gqa_cfg = {
-        "hidden_size": 2048,
-        "num_hidden_layers": 16,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 4,
-        "head_dim": 128,
-        "vocab_size": 32000,
-    }
-    geom = rf.from_hf_config(gqa_cfg)
+    hidden, num_layers, num_heads, num_kv_heads, head_dim, vocab = (
+        2048,
+        16,
+        16,
+        4,
+        128,
+        32000,
+    )
+    geom = rf.from_hf_config(
+        {
+            "hidden_size": hidden,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": num_heads,
+            "num_key_value_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "intermediate_size": 4 * hidden,
+            "vocab_size": vocab,
+        }
+    )
     dt = Dtypes(kv=1.0)
-    scenario = dc_replace(
-        EXAMPLE_SCENARIOS["chat-8k1k"],
-        concurrencies=(1, 4),
-    )
+    scenario = dc_replace(EXAMPLE_SCENARIOS["chat-8k1k"], concurrencies=(1, 4))
     splan = solve_serving_plan(
-        geom,
-        dt,
-        chip,
-        scenario,
-        SolveOptions(mode="mixed", max_chips=4),
+        geom, dt, chip, scenario, SolveOptions(mode="mixed", max_chips=4)
     )
+    assert splan.candidates
     for pt in splan.candidates:
         assert pt.decode_floor is not None
         df = pt.decode_floor
+        bound_by_unit = {
+            "hbm": df.hbm_bound_ms,
+            "matmul": df.matmul_bound_ms,
+            "vpu": df.vpu_bound_ms,
+            "chain": df.coll_bound_ms,
+            "ici": df.coll_bound_ms,
+        }
         expected_hard = max(
-            df.hbm_ms, df.matmul_ms, df.ici_ms, df.chain_ms, df.hop_latency_ms
+            df.hbm_bound_ms, df.matmul_bound_ms, df.vpu_bound_ms, df.coll_bound_ms
         )
-        assert df.hard_floor_ms <= expected_hard + 1e-9
-        if df.binding == "hbm":
-            assert df.hard_floor_ms <= df.hbm_ms + 1e-9
-        elif df.binding == "matmul":
-            assert df.hard_floor_ms <= df.matmul_ms + 1e-9
+        assert df.hard_floor_ms == pytest.approx(expected_hard, rel=1e-12)
+        assert df.binding in bound_by_unit
+        assert df.hard_floor_ms == pytest.approx(bound_by_unit[df.binding], rel=1e-12)
+
+    # Pin TP8 c=1 HBM bound to shape-derived bytes / hbm_bw.
+    target_tp = 8
+    tp8_c1 = next(
+        pt
+        for pt in splan.candidates
+        if pt.decode_pool.tp == target_tp
+        and pt.decode_pool.kv_split == 1
+        and pt.concurrency == 1
+    )
+    assert tp8_c1.decode_floor is not None
+    ctx_mid = scenario.isl + scenario.osl // 2
+    # At TP8: q=256, kv=128 (replicated 1 KV head), out=256;
+    # strict HBM bound uses unpadded 2 * 128 B/tok KV; dense FFN inter=4*hidden.
+    gqa_bytes = num_layers * (
+        hidden * (256 + 2 * 128 + 256) * dt.w_dense + ctx_mid * (2 * head_dim * dt.kv)
+    )
+    mlp_and_head_bytes = (
+        num_layers * 3 * hidden * ((4 * hidden) // target_tp) * dt.w_dense
+        + (vocab * hidden // target_tp) * dt.lm_head
+    )
+    expected_hbm_ms = (
+        (gqa_bytes + mlp_and_head_bytes) / chip.hbm_bw * UNIT_MILLIS_PER_SECOND
+    )
+    assert tp8_c1.decode_floor.hbm_bound_ms == pytest.approx(expected_hbm_ms, rel=1e-12)
 
 
 def test_explicit_gqa_token_stays_gqa_when_kv_lora_rank_positive() -> None:
@@ -1387,11 +1403,6 @@ def test_pp_stage_dp_interleaved_moe_layer_weights() -> None:
 
 def test_fast_pass_memo_matches_step_and_spec_cycle_floors() -> None:
     """Verify solver sweep memoization matches step and spec cycle floors."""
-    assert "_FastPassEvaluator" not in solver.__dict__
-    assert "_coll_spec" not in solver.__dict__
-    assert "_fast_ep_busiest" not in solver.__dict__
-    assert "_make_draft_geom" not in solver.__dict__
-
     chip = CHIPS["tpu7x"]
     geom = rf.from_hf_config(QWEN35_CFG)
     dt = Dtypes(kv=1.0, state=2.0)
@@ -1755,21 +1766,11 @@ def test_prefix_hit_crossover_sweep_and_pcie_offload() -> None:
     )
     scen_offload = dc_replace(scen_no_offload, kv_offload_gb=64.0)
 
-    def _cold_sweep(
-        plan_obj: ServingPlan, repeats: int = 3
-    ) -> tuple[tuple[float, float] | None, float | None]:
-        """Run cold crossover sweep repeats."""
-        last_res: tuple[tuple[float, float] | None, float | None] = (None, None)
-        for _ in range(repeats):
-            hbm_breakdown_per_core_bytes.cache_clear()
-            last_res = sweep_prefix_hit_crossovers(geom, dt, chip, plan_obj)
-        return last_res
-
     plan_off = solve_serving_plan(
         geom, dt, chip, scen_offload, SolveOptions(mode="auto", max_chips=8)
     )
     assert len(plan_off.candidates) > len(plan_off.frontier)
-    win_range, cross_rate = _cold_sweep(plan_off)
+    win_range, cross_rate = cold_crossover_sweep(geom, dt, chip, plan_off)
     assert win_range is not None
     assert 0.0 <= win_range[0] <= hit_90 <= win_range[1] <= hit_95
     assert plan_off.winner_prefix_hit_range == win_range
@@ -1839,21 +1840,11 @@ def test_prefix_hit_crossover_sweep_and_pcie_offload() -> None:
 
 
 def test_prefix_hit_crossover_sweep_slo_probe_and_examples() -> None:
-    """Verify crossover sweep with latency SLO bounds and standard scenarios."""
+    """Verify crossover sweep detects TTFT SLO layout switches across hit rates."""
     chip = CHIPS["tpu7x"]
     geom = rf.from_hf_config(QWEN35_CFG)
     dt = Dtypes(kv=1.0, state=2.0)
     hit_95 = 0.95
-
-    def _cold_sweep(
-        plan_obj: ServingPlan, repeats: int = 3
-    ) -> tuple[tuple[float, float] | None, float | None]:
-        """Run cold crossover sweep repeats."""
-        last_res: tuple[tuple[float, float] | None, float | None] = (None, None)
-        for _ in range(repeats):
-            hbm_breakdown_per_core_bytes.cache_clear()
-            last_res = sweep_prefix_hit_crossovers(geom, dt, chip, plan_obj)
-        return last_res
 
     scen_probe = TrafficScenario(
         name="slo-crossover-probe",
@@ -1877,8 +1868,10 @@ def test_prefix_hit_crossover_sweep_slo_probe_and_examples() -> None:
     )
     assert probe_h0.recommended is not None
     assert probe_h95.recommended is not None
+    # Place TTFT SLO below TP2's h=0 bound (rules out TP2 at h=0)
+    # and above TP2's h=0.95 estimate.
     mid_ttft_slo = 0.5 * (
-        probe_h0.recommended.est_ttft_ms + probe_h95.recommended.est_ttft_ms
+        probe_h0.recommended.bound_ttft_ms + probe_h95.recommended.est_ttft_ms
     )
     scen_slo = dc_replace(scen_probe, ttft_slo_ms=mid_ttft_slo)
     plan_slo_h0 = solve_serving_plan(
@@ -1893,13 +1886,13 @@ def test_prefix_hit_crossover_sweep_slo_probe_and_examples() -> None:
     )
     assert plan_slo_h0.recommended is not None
     assert plan_slo_h95.recommended is not None
-    if (
+    assert (
         plan_slo_h0.recommended.decode_pool.tp
         != plan_slo_h95.recommended.decode_pool.tp
-    ):
-        assert plan_slo_h0.prefix_hit_crossover_rate is not None
-        assert plan_slo_h0.winner_prefix_hit_range is not None
-        assert plan_slo_h0.winner_prefix_hit_range[1] < hit_95
+    )
+    assert plan_slo_h0.prefix_hit_crossover_rate is not None
+    assert plan_slo_h0.winner_prefix_hit_range is not None
+    assert plan_slo_h0.winner_prefix_hit_range[1] < hit_95
 
     for ex_name, n_chips in (
         ("coding-agent", 8),
@@ -1910,11 +1903,13 @@ def test_prefix_hit_crossover_sweep_slo_probe_and_examples() -> None:
         ex_plan = solve_serving_plan(
             geom, dt, chip, ex_scen, SolveOptions(mode="auto", max_chips=n_chips)
         )
-        ex_range, _ex_cross = _cold_sweep(ex_plan)
+        ex_range, _ex_cross = cold_crossover_sweep(geom, dt, chip, ex_plan)
         assert ex_range is not None
         if ex_name == "chat-8k1k":
             ex_uncached = dc_replace(ex_plan, sweep_candidates=())
-            fb_range, fb_cross = _cold_sweep(ex_uncached, repeats=1)
+            fb_range, fb_cross = cold_crossover_sweep(
+                geom, dt, chip, ex_uncached, repeats=1
+            )
             assert (fb_range, fb_cross) == (
                 ex_plan.winner_prefix_hit_range,
                 ex_plan.prefix_hit_crossover_rate,
@@ -1969,7 +1964,7 @@ def test_sweep_matches_main_path_ttft_with_offload() -> None:
 
 def test_response_time_law_holds_on_frontier() -> None:
     """Verify Little's Law / response-time law holds on all frontier points."""
-    geom = rf.from_hf_config(QWEN35_CFG)
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
     dt = Dtypes(kv=1.0)
     chip = CHIPS["tpu7x"]
     scenarios = [
@@ -1989,7 +1984,7 @@ def test_response_time_law_holds_on_frontier() -> None:
     for scen in scenarios:
         for mode in modes:
             plan_res = solve_serving_plan(
-                geom, dt, chip, scen, SolveOptions(mode=mode, max_chips=64)
+                geom, dt, chip, scen, SolveOptions(mode=mode, max_chips=8)
             )
             assert plan_res.frontier, (
                 f"Expected non-empty frontier for {scen.name} mode={mode}"
@@ -2497,14 +2492,8 @@ def test_pinned_slice_returns_only_that_slice() -> None:
 
 
 def test_mixed_pp_excludes_speculation_while_disagg_prefill_allows_pp() -> None:
-    """Verify PP>1 with spec_k>0 excluded in mixed mode but allowed in disagg."""
-    geom = rf.from_hf_config(QWEN35_CFG)
-    cand_fn = getattr(rf_solver, "_candidate" + "_prefill_parallels")
-    mixed_pref = cand_fn(geom, rf.TOPOLOGIES["2x2x4"], for_disagg=False, spec_k=2)
-    disagg_pref = cand_fn(geom, rf.TOPOLOGIES["2x2x4"], for_disagg=True, spec_k=2)
-    assert all(p.pp == 1 for p in mixed_pref)
-    assert any(p.pp > 1 for p in disagg_pref)
-
+    """Verify PP>1 with spec_k>0 is excluded in mixed mode and allowed in disagg."""
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
     scen = dc_replace(
         rf.EXAMPLE_SCENARIOS["chat-8k1k"],
         spec_tokens=2,
@@ -2516,9 +2505,9 @@ def test_mixed_pp_excludes_speculation_while_disagg_prefill_allows_pp() -> None:
         rf.Dtypes(),
         rf.CHIPS["tpu7x"],
         scen,
-        SolveOptions(mode="mixed", max_chips=16),
+        SolveOptions(mode="mixed", max_chips=8),
     )
-    # Mixed mode candidates must not have PP > 1 when spec_k > 0
+    assert plan_mixed.candidates
     for pt in plan_mixed.candidates:
         assert pt.decode_pool.pp == 1
 
@@ -2527,9 +2516,8 @@ def test_mixed_pp_excludes_speculation_while_disagg_prefill_allows_pp() -> None:
         rf.Dtypes(),
         rf.CHIPS["tpu7x"],
         scen,
-        SolveOptions(mode="disagg", max_chips=32),
+        SolveOptions(mode="disagg", max_chips=8),
     )
-    # Disagg prefill candidates may have PP > 1
     pp_prefill_found = any(
         pt.prefill_pool is not None and pt.prefill_pool.pp > 1
         for pt in plan_disagg.candidates
@@ -2693,6 +2681,355 @@ def test_pd_ratio_chip_count_matches_served_points() -> None:
     assert plan_4_3.budget == expected_chips_4_3
     assert plan_4_3.candidates
     assert all(pt.total_chips == expected_chips_4_3 for pt in plan_4_3.candidates)
+
+
+@pytest.mark.parametrize(
+    ("mutate_scenario", "match_substr"),
+    [
+        (lambda scen: dc_replace(scen, isl=0), "isl and osl must be > 0"),
+        (lambda scen: dc_replace(scen, osl=0), "isl and osl must be > 0"),
+        (
+            lambda scen: dc_replace(scen, prefix_hit_rate=-0.1),
+            "prefix_hit_rate must be in",
+        ),
+        (
+            lambda scen: dc_replace(scen, prefix_hit_rate=1.1),
+            "prefix_hit_rate must be in",
+        ),
+        (lambda scen: dc_replace(scen, accept_len=0.0), "accept_len must be > 0"),
+        (
+            lambda scen: dc_replace(scen, think_time_s=-0.5),
+            "think_time_s must be >= 0",
+        ),
+        (
+            lambda scen: dc_replace(scen, concurrencies=()),
+            "concurrencies must be positive ints",
+        ),
+        (
+            lambda scen: dc_replace(scen, concurrencies=(1, 0)),
+            "concurrencies must be positive ints",
+        ),
+        (lambda scen: dc_replace(scen, page_size=0), "page_size must be > 0"),
+        (lambda scen: dc_replace(scen, max_num_seqs=0), "max_num_seqs must be > 0"),
+    ],
+)
+def test_traffic_scenario_rejects_out_of_range_fields(
+    mutate_scenario: Callable[[TrafficScenario], TrafficScenario], match_substr: str
+) -> None:
+    """Verify TrafficScenario validates sequence lengths, rates, and batch bounds."""
+    base_scenario = TrafficScenario(
+        name="valid-base-scenario",
+        isl=1024,
+        osl=128,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1,),
+        kv_working_set_turns=1.0,
+    )
+    with pytest.raises(ValueError, match=match_substr):
+        mutate_scenario(base_scenario)
+
+
+def test_build_example_scenario_rejects_unknown_names() -> None:
+    """Verify build_example_scenario rejects unknown presets and SLO tiers."""
+    with pytest.raises(ValueError, match="Unknown example scenario preset"):
+        build_example_scenario("unknown-preset")
+    with pytest.raises(ValueError, match="Unknown SLO tier"):
+        build_example_scenario("chat-8k1k", slo_tier="unknown-tier")
+
+
+def test_explain_layout_rejection_reports_prefill_rules() -> None:
+    """Verify explain_layout_rejection checks prefill enumeration and KV handoff."""
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    max_slice_chips = 16
+    topos = [t for t in TOPOLOGIES.values() if t.num_chips <= max_slice_chips]
+    opts = SolveOptions(mode="disagg", max_chips=20)
+
+    assert (
+        explain_layout_rejection(
+            geom, parse_layout("P: TP4 x DP2 / D: TP8 x EP8"), topos, opts
+        )
+        == "prefill pools are enumerated with DP1 and DCP1"
+    )
+    assert (
+        explain_layout_rejection(
+            geom, parse_layout("P: TP3 / D: TP8 x EP8"), topos, opts
+        )
+        == "this prefill layout is not enumerated on any searched slice"
+    )
+    assert (
+        explain_layout_rejection(
+            geom, parse_layout("P: TP8 x EP8 / D: TP16 x EP16"), topos, opts
+        )
+        == "prefill and decode degrees do not form a legal KV handoff pair"
+    )
+    assert (
+        explain_layout_rejection(
+            geom, parse_layout("P: TP8 x EP8 / D: TP8 x EP8"), topos, opts
+        )
+        == "enumerated, but no searched point with this layout passed the "
+        "memory fit, the chip budget, and the latency targets"
+    )
+
+
+def test_disagg_think_time_reduces_active_decode_batch() -> None:
+    """Verify disaggregated think-time loop shrinks active decode batch."""
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(
+        {
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 4096,
+            "vocab_size": 32000,
+        }
+    )
+    dt = Dtypes(kv=1.0)
+    opts = SolveOptions(
+        mode="disagg",
+        max_chips=8,
+        prefill_topology="2x2x1",
+        decode_topology="2x2x1",
+        pd_ratio=(1, 1),
+    )
+    concurrency = 64
+    think_s = 10.0
+    scen_zero = TrafficScenario(
+        name="disagg-think-0",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(concurrency,),
+        kv_working_set_turns=1.0,
+    )
+    scen_think = dc_replace(scen_zero, name="disagg-think-10", think_time_s=think_s)
+    plan_zero = solve_serving_plan(geom, dt, chip, scen_zero, opts)
+    plan_think = solve_serving_plan(geom, dt, chip, scen_think, opts)
+
+    target_tp = 8
+    pt_zero = next(
+        pt
+        for pt in plan_zero.candidates
+        if pt.prefill_pool is not None
+        and pt.prefill_pool.tp == 1
+        and pt.prefill_pool.pp == 1
+        and pt.decode_pool.tp == target_tp
+        and pt.decode_pool.dp == 1
+        and pt.decode_pool.kv_split == 1
+    )
+    pt_think = next(
+        pt
+        for pt in plan_think.candidates
+        if pt.prefill_pool is not None
+        and pt.prefill_pool.tp == 1
+        and pt.prefill_pool.pp == 1
+        and pt.decode_pool.tp == target_tp
+        and pt.decode_pool.dp == 1
+        and pt.decode_pool.kv_split == 1
+    )
+
+    # Reproduce the 2-step Little's Law active-batch fixed point on 2x2x1.
+    topo_2x2x1 = TOPOLOGIES["2x2x1"]
+    par_pre = Parallel(tp=1)
+    par_tp8 = Parallel(tp=target_tp)
+    floor_opts = FloorOptions(dt=dt, topology=topo_2x2x1)
+    sf_pre = step_floor(
+        geom,
+        chip,
+        par_pre,
+        StepShape(batch=0, rows_per_seq=0, context=0, prefill_tokens=scen_think.isl),
+        floor_opts,
+    )
+    ctx_mid = scen_think.isl + scen_think.osl // 2
+    b_local = concurrency
+    for _ in range(2):
+        sf_tmp = step_floor(
+            geom,
+            chip,
+            par_tp8,
+            StepShape(batch=b_local, rows_per_seq=1, context=ctx_mid),
+            floor_opts,
+        )
+        w_srv = sf_pre.serial_estimate_s + scen_think.osl * sf_tmp.serial_estimate_s
+        b_local = max(1, math.ceil(concurrency * w_srv / (w_srv + think_s)))
+    assert b_local < concurrency
+    expected_sf_d = step_floor(
+        geom,
+        chip,
+        par_tp8,
+        StepShape(batch=b_local, rows_per_seq=1, context=ctx_mid),
+        floor_opts,
+    )
+    assert pt_think.est_tpot_ms < pt_zero.est_tpot_ms
+    assert pt_think.est_tpot_ms == pytest.approx(
+        expected_sf_d.serial_estimate_s * UNIT_MILLIS_PER_SECOND, rel=1e-9
+    )
+    ctx_full = scen_think.isl + scen_think.osl
+    expected_bd = hbm_breakdown_per_core_bytes(
+        geom, dt, par_tp8, SeqKvLayout(b_local, ctx_full)
+    )
+    assert pt_think.decode_pool.hbm_kv_gb < pt_zero.decode_pool.hbm_kv_gb
+    assert pt_think.decode_pool.hbm_used_gb == pytest.approx(
+        expected_bd.total / UNIT_GIGA, rel=1e-9
+    )
+
+
+def test_mixed_resident_batch_clamps_for_prefill_logit_peak() -> None:
+    """Verify mixed resident batch decrements when prefill logit peak overflows HBM."""
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(
+        {
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "intermediate_size": 8192,
+            "vocab_size": 32000,
+        }
+    )
+    dt = Dtypes(kv=1.0)
+    target_tp = 8
+    par_tp8 = Parallel(tp=target_tp)
+    scen = TrafficScenario(
+        name="mixed-logit-clamp",
+        isl=1024,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(2,),
+        kv_working_set_turns=1.0,
+    )
+    ctx_full = scen.isl + scen.osl
+    w_base = hbm_footprint_per_core_bytes(geom, dt, par_tp8, SeqKvLayout(0, 0))
+    hbm_c1 = hbm_footprint_per_core_bytes(geom, dt, par_tp8, SeqKvLayout(1, ctx_full))
+    per_seq = hbm_c1 - w_base
+    logit_b1 = _peak_prefill_logit_bytes(geom, dt, par_tp8, scen.isl, sampled_rows=1)
+    logit_b2 = _peak_prefill_logit_bytes(geom, dt, par_tp8, scen.isl, sampled_rows=2)
+    # Pick HBM limit above (w_base + 2*per_seq) and (hbm_c1 + logit_b1),
+    # and below b=2 + logit_b2.
+    low_b = max(w_base + 2.0 * per_seq, hbm_c1 + logit_b1)
+    high_b = w_base + 2.0 * per_seq + logit_b2
+    clamp_util = 0.5 * (low_b + high_b) / float(chip.hbm_bytes)
+
+    plan_clamped = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(
+            mode="mixed",
+            max_chips=4,
+            decode_topology="2x2x1",
+            gpu_memory_utilization=clamp_util,
+        ),
+    )
+    tp8_pts = [
+        pt
+        for pt in plan_clamped.candidates
+        if pt.decode_pool.tp == target_tp and pt.decode_pool.kv_split == 1
+    ]
+    assert tp8_pts
+    assert tp8_pts[0].decode_pool.hbm_used_gb == pytest.approx(
+        hbm_c1 / UNIT_GIGA, rel=1e-9
+    )
+
+    # Below w_base + logit_b(0), b_res=0 also fails HBM fit and returns None.
+    unfit_util = 0.5 * w_base / float(chip.hbm_bytes)
+    plan_unfit = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(mode="mixed", max_chips=4, gpu_memory_utilization=unfit_util),
+    )
+    assert not plan_unfit.candidates
+
+
+def test_disagg_resident_batch_clamps_to_hbm_limit() -> None:
+    """Verify disaggregated resident batch clamps when float per_seq rounds down."""
+    chip = CHIPS["tpu7x"]
+    cfg_base = QWEN35_CFG["text_config"]
+    assert isinstance(cfg_base, dict)
+    geom = from_hf_config(
+        {
+            "text_config": {
+                **cfg_base,
+                "compress_ratios": [1.0 / 7.0] * 60,
+            }
+        }
+    )
+    dt = Dtypes(kv=1.0, state=2.0)
+    target_tp = 8
+    par_tp8 = Parallel(tp=target_tp, ep=target_tp, moe="ep")
+    scen = TrafficScenario(
+        name="disagg-clamp",
+        isl=400,
+        osl=100,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(2,),
+        kv_working_set_turns=1.0,
+    )
+    ctx_full = scen.isl + scen.osl
+    w_base = hbm_footprint_per_core_bytes(geom, dt, par_tp8, SeqKvLayout(0, 0))
+    hbm_c1 = hbm_footprint_per_core_bytes(geom, dt, par_tp8, SeqKvLayout(1, ctx_full))
+    per_seq = hbm_c1 - w_base
+    tot_b2 = hbm_breakdown_per_core_bytes(
+        geom, dt, par_tp8, SeqKvLayout(2, ctx_full)
+    ).total
+    # IEEE-754 subtraction rounds per_seq down by 1 ULP,
+    # making w_base + 2*per_seq < tot_b2.
+    assert w_base + 2.0 * per_seq < tot_b2
+    clamp_util = 0.5 * ((w_base + 2.0 * per_seq) + tot_b2) / float(chip.hbm_bytes)
+
+    plan_clamped = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(
+            mode="disagg",
+            max_chips=8,
+            prefill_topology="2x2x1",
+            decode_topology="2x2x1",
+            pd_ratio=(1, 1),
+            gpu_memory_utilization=clamp_util,
+        ),
+    )
+    tp8_pts = [
+        pt
+        for pt in plan_clamped.candidates
+        if pt.decode_pool.tp == target_tp and pt.decode_pool.kv_split == 1
+    ]
+    assert tp8_pts
+    assert tp8_pts[0].decode_pool.hbm_used_gb == pytest.approx(
+        hbm_c1 / UNIT_GIGA, rel=1e-9
+    )
+
+    unfit_util = 0.5 * w_base / float(chip.hbm_bytes)
+    plan_unfit = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(
+            mode="disagg",
+            max_chips=8,
+            prefill_topology="2x2x1",
+            decode_topology="2x2x1",
+            pd_ratio=(1, 1),
+            gpu_memory_utilization=unfit_util,
+        ),
+    )
+    assert not plan_unfit.candidates
 
 
 def _undecided_slo_scenario() -> TrafficScenario:

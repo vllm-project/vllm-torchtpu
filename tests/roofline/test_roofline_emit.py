@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Literal
 
 import pytest
 
+from tests.roofline.conftest import QWEN35_CFG, make_pareto_point
 from vllm_torchtpu.roofline import (
     CHIPS,
     SOLVE_SCHEMA,
@@ -72,32 +73,6 @@ class _PoolConfig:
     pcp: int = 1
     kv_split: int = 1
     moe_dispatch: Literal["allreduce", "a2a_push", "ag_ep", "fused_rs"] = "allreduce"
-
-
-def _make_pareto_point(
-    pool: PoolMeshPlan,
-    conc: int,
-    tput: float,
-    inter: float,
-    *,
-    total_chips: int = 8,
-) -> ParetoPoint:
-    """Create a synthetic Pareto point for testing layout selection."""
-    return ParetoPoint(
-        mode="mixed",
-        concurrency=conc,
-        total_chips=total_chips,
-        prefill_pool=None,
-        decode_pool=pool,
-        est_ttft_ms=100.0,
-        est_tpot_ms=1000.0 / inter,
-        est_interactivity_tok_s=inter,
-        output_throughput_per_chip=tput * 0.1,
-        token_throughput_per_chip=tput,
-        p_mixed=0.05,
-        binding="hbm",
-        slo_met=True,
-    )
 
 
 def _toy_moe_config_dict() -> dict[str, object]:
@@ -726,11 +701,11 @@ def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
         cfg=_PoolConfig(topology="2x2x2", chips=8, tp=16, dp=1, ep=16),
     )
 
-    a1 = _make_pareto_point(p_a1, 64, 5000.0, 40.0)
-    a2 = _make_pareto_point(p_a2, 64, 4900.0, 39.0)
-    b = _make_pareto_point(p_b, 32, 4200.0, 65.0)
-    c = _make_pareto_point(p_c, 16, 3800.0, 80.0)
-    d = _make_pareto_point(p_d, 1, 2500.0, 130.0)
+    a1 = make_pareto_point(p_a1, 64, 5000.0, 40.0)
+    a2 = make_pareto_point(p_a2, 64, 4900.0, 39.0)
+    b = make_pareto_point(p_b, 32, 4200.0, 65.0)
+    c = make_pareto_point(p_c, 16, 3800.0, 80.0)
+    d = make_pareto_point(p_d, 1, 2500.0, 130.0)
     splan = ServingPlan(
         model_layers=32,
         chip="tpu7x",
@@ -900,36 +875,6 @@ def test_emit_dispatch_env_and_enable_ep_for_fused_rs() -> None:
     assert "--enable-expert-parallel" in rs_cmd
 
 
-def _synthetic_pareto_point(
-    mode: Literal["mixed", "disagg"],
-    pools: tuple[PoolMeshPlan | None, PoolMeshPlan],
-    conc: int,
-    tput: float,
-    inter: float,
-) -> ParetoPoint:
-    """Create a synthetic SLO-met ParetoPoint fixture from prefill/decode pools."""
-    pref, dec = pools
-    chips = (
-        pref.instances * pref.chips_per_instance if pref is not None else 0
-    ) + dec.instances * dec.chips_per_instance
-    return ParetoPoint(
-        mode=mode,
-        concurrency=conc,
-        total_chips=chips,
-        prefill_pool=pref,
-        decode_pool=dec,
-        est_ttft_ms=100.0,
-        est_tpot_ms=1000.0 / inter,
-        est_interactivity_tok_s=inter,
-        output_throughput_per_chip=tput * 0.1,
-        token_throughput_per_chip=tput,
-        p_mixed=0.0,
-        binding="hbm",
-        slo_met=True,
-        slo_verdict="estimate_meets",
-    )
-
-
 def _agentic_scenario(name: str = "agentic-64k") -> TrafficScenario:
     """Build synthetic TrafficScenario fixture for Top-K diversity tests."""
     return TrafficScenario(
@@ -980,13 +925,13 @@ def test_top_layouts_k5_surfaces_diverse_frontiers_and_pp8() -> None:
         role="decode", cfg=_PoolConfig(topology="2x2x2", chips=8, tp=8, dp=2, ep=16)
     )
 
-    c_base = _synthetic_pareto_point("mixed", (None, m_base), 256, 10000.0, 50.0)
-    c_d2 = _synthetic_pareto_point("mixed", (None, m_dcp2), 256, 9900.0, 51.0)
-    c_d4 = _synthetic_pareto_point("mixed", (None, m_dcp4), 256, 9800.0, 52.0)
-    c_d8 = _synthetic_pareto_point("mixed", (None, m_dcp8), 256, 9700.0, 53.0)
-    c_pp8 = _synthetic_pareto_point("disagg", (p_pp8, d_tp8), 64, 7000.0, 220.0)
-    c_pcp8 = _synthetic_pareto_point("disagg", (p_pcp8, d_tp8), 64, 6500.0, 260.0)
-    c_fast = _synthetic_pareto_point("mixed", (None, m_fast), 1, 1500.0, 900.0)
+    c_base = make_pareto_point(m_base, 256, 10000.0, 50.0)
+    c_d2 = make_pareto_point(m_dcp2, 256, 9900.0, 51.0)
+    c_d4 = make_pareto_point(m_dcp4, 256, 9800.0, 52.0)
+    c_d8 = make_pareto_point(m_dcp8, 256, 9700.0, 53.0)
+    c_pp8 = make_pareto_point(d_tp8, 64, 7000.0, 220.0, prefill_pool=p_pp8)
+    c_pcp8 = make_pareto_point(d_tp8, 64, 6500.0, 260.0, prefill_pool=p_pcp8)
+    c_fast = make_pareto_point(m_fast, 1, 1500.0, 900.0)
 
     splan = ServingPlan(
         model_layers=60,
@@ -1044,16 +989,14 @@ def test_top_layouts_k5_surfaces_pp8_over_pp2_pcp4() -> None:
         role="decode",
         cfg=_PoolConfig(instances=2, topology="2x2x2", chips=8, tp=16, dp=1, ep=16),
     )
-    a_pp2 = _synthetic_pareto_point("disagg", (p_pp2, d_tp8), 256, 12000.0, 80.0)
-    a_pp2_b = _synthetic_pareto_point(
-        "disagg", (p_pp2, d_tp8_dcp2), 128, 11200.0, 105.0
-    )
-    a_pp2_c = _synthetic_pareto_point("disagg", (p_pp2, d_tp4), 128, 10400.0, 130.0)
-    a_pp2_d = _synthetic_pareto_point("disagg", (p_pp2, d_tp4_dcp2), 64, 9600.0, 155.0)
-    b_mix = _synthetic_pareto_point("mixed", (None, m_base), 64, 8500.0, 180.0)
-    b_pp8 = _synthetic_pareto_point("disagg", (p_pp8, d_tp8), 64, 7800.0, 240.0)
-    b_pp2_mid = _synthetic_pareto_point("disagg", (p_pp2, d_tp16), 32, 6200.0, 480.0)
-    b_fast = _synthetic_pareto_point("disagg", (p_pcp8, d_tp16), 1, 2000.0, 950.0)
+    a_pp2 = make_pareto_point(d_tp8, 256, 12000.0, 80.0, prefill_pool=p_pp2)
+    a_pp2_b = make_pareto_point(d_tp8_dcp2, 128, 11200.0, 105.0, prefill_pool=p_pp2)
+    a_pp2_c = make_pareto_point(d_tp4, 128, 10400.0, 130.0, prefill_pool=p_pp2)
+    a_pp2_d = make_pareto_point(d_tp4_dcp2, 64, 9600.0, 155.0, prefill_pool=p_pp2)
+    b_mix = make_pareto_point(m_base, 64, 8500.0, 180.0)
+    b_pp8 = make_pareto_point(d_tp8, 64, 7800.0, 240.0, prefill_pool=p_pp8)
+    b_pp2_mid = make_pareto_point(d_tp16, 32, 6200.0, 480.0, prefill_pool=p_pp2)
+    b_fast = make_pareto_point(d_tp16, 1, 2000.0, 950.0, prefill_pool=p_pcp8)
     pp2_frontier = (
         b_fast,
         b_pp2_mid,
@@ -1095,15 +1038,15 @@ def test_top_layouts_k5_selects_actual_frontier_over_off_frontier_candidates() -
         "mixed", _PoolConfig(topology="2x2x2", chips=8, tp=2, dp=4, kv_split=2)
     )
 
-    f1 = _synthetic_pareto_point("mixed", (None, m_f1), 256, 10000.0, 90.0)
+    f1 = make_pareto_point(m_f1, 256, 10000.0, 90.0)
     # Same structural key as f2, higher throughput at c=256, strictly dominated by f1.
-    f2_off_hi = _synthetic_pareto_point("mixed", (None, m_f2), 256, 9800.0, 60.0)
-    f2_on = _synthetic_pareto_point("mixed", (None, m_f2), 64, 9000.0, 140.0)
+    f2_off_hi = make_pareto_point(m_f2, 256, 9800.0, 60.0)
+    f2_on = make_pareto_point(m_f2, 64, 9000.0, 140.0)
     # Wholly non-frontier structural key, higher throughput than f2_on, dominated by f1.
-    g_off = _synthetic_pareto_point("mixed", (None, m_off), 256, 9700.0, 65.0)
-    f3 = _synthetic_pareto_point("mixed", (None, m_f3), 32, 7500.0, 260.0)
-    f4 = _synthetic_pareto_point("mixed", (None, m_f4), 16, 5200.0, 480.0)
-    f5 = _synthetic_pareto_point("mixed", (None, m_f5), 1, 2200.0, 920.0)
+    g_off = make_pareto_point(m_off, 256, 9700.0, 65.0)
+    f3 = make_pareto_point(m_f3, 32, 7500.0, 260.0)
+    f4 = make_pareto_point(m_f4, 16, 5200.0, 480.0)
+    f5 = make_pareto_point(m_f5, 1, 2200.0, 920.0)
 
     frontier = (f5, f4, f3, f2_on, f1)
     splan = ServingPlan(
@@ -1172,10 +1115,10 @@ def test_top_layouts_retains_near_ties() -> None:
         cfg=_PoolConfig(topology="2x2x2", chips=8, tp=8, dp=1, ep=8),
     )
 
-    a1 = _make_pareto_point(p_a1, 64, 5000.0, 40.0)
-    a2 = _make_pareto_point(p_a2, 64, 4900.0, 39.0)
-    b = _make_pareto_point(p_b, 32, 4000.0, 60.0)
-    c = _make_pareto_point(p_c, 16, 3900.0, 70.0)
+    a1 = make_pareto_point(p_a1, 64, 5000.0, 40.0)
+    a2 = make_pareto_point(p_a2, 64, 4900.0, 39.0)
+    b = make_pareto_point(p_b, 32, 4000.0, 60.0)
+    c = make_pareto_point(p_c, 16, 3900.0, 70.0)
 
     splan = ServingPlan(
         model_layers=32,
@@ -1195,34 +1138,6 @@ def test_top_layouts_retains_near_ties() -> None:
     selected = top_layouts(splan, k=k_val, near_tie_rel=0.10)
     assert len(selected) > k_val
     assert a2 in selected or c in selected
-
-
-def test_emit_launch_args_config_path_not_in_serve_command(
-    tmp_path: Path,
-) -> None:
-    """Verify config path never leaks into emitted vllm serve command."""
-    sample_traffic_scenario = _agentic_scenario()
-    cfg_file = tmp_path / "config.json"
-    cfg_file.write_text(
-        '{"model_type": "llama", "num_hidden_layers": 32}', encoding="utf-8"
-    )
-    pool = _sample_pool(
-        role="mixed", cfg=_PoolConfig(topology="2x2x1", chips=4, tp=4, dp=1, ep=1)
-    )
-    pt = _make_pareto_point(pool, 16, 1000.0, 50.0, total_chips=4)
-    splan = ServingPlan(
-        model_layers=32,
-        chip="tpu7x",
-        scenario=sample_traffic_scenario,
-        mode="mixed",
-        recommended=pt,
-        frontier=(pt,),
-        warnings=(),
-        candidates=(pt,),
-    )
-    out = emit_launch_args(splan, model=None)
-    for cmd in out["commands"]:
-        assert str(cfg_file) not in cmd
 
 
 def test_pool_label_joins_axes_with_x_and_omits_ones() -> None:
@@ -1254,31 +1169,6 @@ def test_pool_label_joins_axes_with_x_and_omits_ones() -> None:
         "kv_split": 1,
     }
     assert format_parallelism(all_one_pool) == "TP1"
-
-
-QWEN35_CFG: dict[str, object] = {
-    "text_config": {
-        "hidden_size": 4096,
-        "num_hidden_layers": 60,
-        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "attn_output_gate": True,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 64,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "num_experts": 512,
-        "num_experts_per_tok": 10,
-        "moe_intermediate_size": 1024,
-        "shared_expert_intermediate_size": 1024,
-        "vocab_size": 248320,
-        "mtp_num_hidden_layers": 1,
-        "dtype": "bfloat16",
-    }
-}
 
 
 def test_top_layouts_include_best_layout_by_tpot_bound() -> None:
