@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_MEGAKERNEL: str = ""
+    VLLM_TPU_OMNI_TEXT_ENCODER_OFFLOAD: bool = False
 
 
 def env_with_choices(
@@ -1329,6 +1330,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
     # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").
     "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
+    # vLLM-Omni: offload QwenImagePipeline.text_encoder to CPU after
+    # encode_prompt completes (and restore before subsequent encode_prompt
+    # calls) to free HBM for VAE decode under tight memory budgets.
+    "VLLM_TPU_OMNI_TEXT_ENCODER_OFFLOAD": env_bool(
+        "VLLM_TPU_OMNI_TEXT_ENCODER_OFFLOAD", False
+    ),
 }
 
 
