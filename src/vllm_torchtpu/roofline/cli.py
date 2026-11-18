@@ -213,12 +213,17 @@ def _resolve_scenario(
     )
 
 
+def _write_warnings(warnings: Sequence[str]) -> None:
+    """Write formatted warning lines to stderr."""
+    for warning in warnings:
+        sys.stderr.write(f"WARNING: {warning}\n")
+
+
 def _dispatch_ceiling(args: argparse.Namespace, splan: ServingPlan) -> int:
     """Write Pareto ceiling rows as JSON array or JSON lines."""
     rows_ceil = emit_ceiling_rows(splan)
     if not rows_ceil:
-        for w in splan.warnings:
-            sys.stderr.write(f"WARNING: {w}\n")
+        _write_warnings(splan.warnings)
         if args.json:
             sys.stdout.write("[]\n")
         return 1
@@ -236,14 +241,14 @@ def _dispatch_emit(
     """Write emitted vLLM serve launch commands or JSON payload."""
     emitted = emit_launch_args(splan, dtypes=dt_auto, model=args.model)
     if not emitted["commands"]:
-        for w in emitted["warnings"]:
-            sys.stderr.write(f"WARNING: {w}\n")
+        _write_warnings(emitted["warnings"])
         if args.json:
             sys.stdout.write(json.dumps(emitted) + "\n")
         return 1
     if args.json:
         sys.stdout.write(json.dumps(emitted) + "\n")
         return 0
+    _write_warnings(emitted["warnings"])
     for cmd_line in emitted["commands"]:
         sys.stdout.write(cmd_line + "\n")
     return 0
@@ -258,9 +263,10 @@ def _dispatch_solve(
     scen = _resolve_scenario(args, parser)
     if args.max_chips is None and args.max_instances is None:
         parser.error("Either --max-chips or --max-instances is required.")
+    dt_auto = dtypes_from_hf_config(cfg)
     splan = solve_serving_plan(
         from_hf_config(cfg),
-        dtypes_from_hf_config(cfg),
+        dt_auto,
         CHIPS[args.chip],
         scen,
         SolveOptions(
@@ -273,12 +279,12 @@ def _dispatch_solve(
     if args.cmd == "ceiling":
         return _dispatch_ceiling(args, splan)
     if args.cmd == "emit":
-        return _dispatch_emit(args, splan, dtypes_from_hf_config(cfg))
+        return _dispatch_emit(args, splan, dt_auto)
     if args.json:
         sys.stdout.write(json.dumps(asdict(splan)) + "\n")
         return 0
-    for w in splan.warnings:
-        sys.stdout.write(f"WARNING: {w}\n")
+    for warning in splan.warnings:
+        sys.stdout.write(f"WARNING: {warning}\n")
     sys.stdout.write(
         f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
         f"{'p90_int_tok_s':>13}  {'tok_tput_chip':>13}  {'p90_ttft_ms':>11}  "

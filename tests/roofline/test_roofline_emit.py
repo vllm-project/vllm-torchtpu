@@ -36,6 +36,19 @@ from vllm_torchtpu.roofline import (
     pool_cli_args,
     solve_serving_plan,
 )
+from vllm_torchtpu.roofline.constants import NO_FEASIBLE_LAYOUT_WARNING
+from vllm_torchtpu.roofline.emit import (
+    _MODEL_PLACEHOLDER,
+    _UNKNOWN_MODEL_WARNING,
+)
+from vllm_torchtpu.roofline.hf_loader import dtypes_from_hf_config as _dtypes_from_cfg
+from vllm_torchtpu.roofline.memory import (
+    SeqKvLayout as _SeqKvLayout,
+)
+from vllm_torchtpu.roofline.memory import (
+    hbm_breakdown_per_core_bytes as _hbm_breakdown,
+)
+from vllm_torchtpu.roofline.modules import Parallel as _Parallel
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -367,6 +380,87 @@ def test_emit_ceiling_rows_and_cli_subcommands(
     assert rc_ceil == 0
     assert len(out_ceil) >= 1
     assert "p90_interactivity_tok_s" in out_ceil[0]
+
+
+_MIXED_SCENARIO_ARGS: tuple[str, ...] = (
+    "--example-scenario",
+    "chat-8k1k",
+    "--mode",
+    "mixed",
+    "--max-chips",
+    "4",
+    "--concurrency",
+    "8,32",
+)
+
+
+@pytest.mark.parametrize("model_flag", ["--config", "--model"])
+def test_emit_cli_prints_placeholder_when_model_source_is_a_config_file(
+    model_flag: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Print <MODEL>, not the config.json path, and warn on stderr."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(_toy_moe_config_dict()), encoding="utf-8")
+
+    exit_code = cli.main(["emit", model_flag, str(cfg_path), *_MIXED_SCENARIO_ARGS])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert f"vllm serve {_MODEL_PLACEHOLDER} --tensor-parallel-size" in captured.out
+    assert str(cfg_path) not in captured.out
+    assert f"WARNING: {_UNKNOWN_MODEL_WARNING}" in captured.err
+
+
+def test_emit_cli_prints_model_directory_in_serve_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Print a model directory given to --model as the model to serve."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(_toy_moe_config_dict()), encoding="utf-8"
+    )
+
+    exit_code = cli.main(["emit", "--model", str(tmp_path), *_MIXED_SCENARIO_ARGS])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert f"vllm serve {tmp_path} --tensor-parallel-size" in captured.out
+    assert _UNKNOWN_MODEL_WARNING not in captured.err
+
+
+def test_ceiling_cli_warns_when_no_layout_fits(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Write the no-feasible-layout warning to stderr when no layout fits in HBM."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(_toy_moe_config_dict()), encoding="utf-8")
+    # Smallest 4-chip (8-core) weight shard is TP=8; divide by 100 so no layout fits.
+    toy_cfg = _toy_moe_config_dict()
+    min_weight_bytes = _hbm_breakdown(
+        from_hf_config(toy_cfg),
+        _dtypes_from_cfg(toy_cfg),
+        _Parallel(tp=8, ep=1, moe="tp_slice"),
+        _SeqKvLayout(seqs_per_dp=1, context=1),
+    ).weights
+    no_layout_fits_memory_fraction = (
+        f"{(min_weight_bytes / CHIPS['tpu7x'].hbm_bytes) / 100.0:.4f}"
+    )
+
+    exit_code = cli.main(
+        [
+            "ceiling",
+            "--config",
+            str(cfg_path),
+            *_MIXED_SCENARIO_ARGS,
+            "--gpu-memory-utilization",
+            no_layout_fits_memory_fraction,
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out.strip() == "[]"
+    assert f"WARNING: {NO_FEASIBLE_LAYOUT_WARNING}" in captured.err
 
 
 def test_resident_batch_cap_emits_max_num_seqs_without_tput_inflation() -> None:
