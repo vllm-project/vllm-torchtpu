@@ -35,7 +35,11 @@ from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import pooled_gdn_state_dtypes
-from vllm_torchtpu.kv_cache_materializer import can_share_attention_cache
+from vllm_torchtpu.kv_cache_materializer import (
+    can_share_attention_cache,
+    compresses_rows,
+    stored_rows,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
@@ -71,6 +75,25 @@ def normalize_kv_cache_specs_for_tpu(
     not modelled by the page-size formulas here (`is_cache_for_ds_v4`).
     """
     exempt = exempt_layers or set()
+    row_compressing = sorted(
+        name
+        for name, spec in kv_cache_specs.items()
+        if name not in exempt and compresses_rows(spec)
+    )
+    if row_compressing and not (
+        enable_unified_kv_layout
+        and _has_hybrid_attention_and_mamba(
+            {k: v for k, v in kv_cache_specs.items() if k not in exempt}
+        )
+    ):
+        # Only the unified attention+mamba pool allocates the stored rows
+        # (`_pool_attention_geometry`); the other layouts allocate
+        # `block_size` rows per page.
+        raise NotImplementedError(
+            "attention specs whose page stores block_size // tokens_per_state "
+            "rows are supported only in the unified attention+mamba KV pool: "
+            f"{row_compressing}"
+        )
     normalized: dict[str, KVCacheSpec] = {}
     for layer_name, spec in kv_cache_specs.items():
         if layer_name in exempt:
@@ -378,7 +401,7 @@ def _normalize_one_spec(
         assert attention_backend is not None
         backend = attention_backend
     page_size = backend.get_kv_cache_page_size_bytes(
-        spec.block_size,
+        stored_rows(spec),
         spec.num_kv_heads,
         spec.head_size,
         kv_cache_dtype,
