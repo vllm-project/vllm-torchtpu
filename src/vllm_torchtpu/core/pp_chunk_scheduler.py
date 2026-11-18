@@ -201,10 +201,13 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._retention = retention
         self._memo_xstep = False
         self._paw_sort = False
-        if options.prefix_aware:
+        if options.prefix_aware or options.quadratic_cost:
+            # Both look up the prefix hit of every waiting request on every
+            # step; the memo reuses a lookup until the cache changes under it.
             # The patch registry installs the prefix-cache epoch and change
             # log at engine start; this opts the scheduler's pool in.
             self._enable_memo_xstep()
+        if options.prefix_aware:
             self._init_paw_sort()
         logger.info(
             "Pipeline chunk scheduler (lone-prompt %s, equal-cost %s): waiting "
