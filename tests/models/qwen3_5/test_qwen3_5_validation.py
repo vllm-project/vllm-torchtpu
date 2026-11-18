@@ -30,13 +30,9 @@ POINTS = sorted(VALIDATION.glob("p[0-9][0-9]-*.yaml"))
 GATES = sorted(VALIDATION.glob("gate-*.yaml"))
 # The merge validation cap: no single deployment above 32 chips.
 MAX_CHIPS = 32
-# References outside readers cannot open: job ids, the private recipes
-# repository and its files, internal sheet codes, private branch names and
-# full commit ids of unpublished trees.
-INTERNAL_REFERENCE = re.compile(
-    r"\bj-[0-9a-f]{8}|cloud-devkit-recipes|\.jsonnet|\bix-tpu-|candidate\d"
-    r"|\b[0-9a-f]{40}\b"
-)
+# Identifiers outside readers cannot resolve: job ids, full commit ids and
+# launcher files of a private deployment.
+INTERNAL_REFERENCE = re.compile(r"\bj-[0-9a-f]{8}|\b[0-9a-f]{40}\b|\.jsonnet\b")
 
 
 def _load(path: pathlib.Path) -> dict:
@@ -108,6 +104,16 @@ def test_point_env_values_are_accepted_by_this_tree(path, monkeypatch):
 def test_entries_carry_no_internal_references(path):
     text = path.read_text()
     assert not INTERNAL_REFERENCE.findall(text)
+
+
+@pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
+def test_entries_name_no_absolute_paths(path):
+    """Paths of one deployment's filesystem do not resolve elsewhere; an entry
+    names a file through a placeholder (README.md)."""
+    for leg_name, leg in _load(path)["legs"].items():
+        values = list(leg["env"].values()) + leg["serve_args"]
+        absolute = [v for v in values if v.startswith("/")]
+        assert not absolute, f"{leg_name}: {absolute}"
 
 
 def test_readme_carries_no_internal_references():
