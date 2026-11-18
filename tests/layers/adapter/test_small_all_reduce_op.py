@@ -23,7 +23,9 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.experimental.small_collectives import common as sc_common
 from vllm_torchtpu.layers.adapter import small_all_reduce_op as op
 
 pytestmark = pytest.mark.cpu_test
@@ -379,6 +381,8 @@ def prebuild_layout(monkeypatch):
     monkeypatch.setattr(op, "_build_reduce_scatter", builders.rs)
     monkeypatch.setattr(op, "_build_tp_all_reduce", builders.tp)
     monkeypatch.setattr(op, "groups_match_mesh", builders.pairs)
+    # TPU7x: each device is one of a chip's two cores.
+    monkeypatch.setattr(sc_common, "devices_per_chip", lambda: 2)
     for name, value in (
         ("_AR_OP", None),
         ("_RS_OP", None),
@@ -456,8 +460,38 @@ def test_prebuild_without_the_setting_builds_no_tp_pair(prebuild_layout):
     builders.pairs.assert_not_called()
 
 
+def test_prebuild_builds_no_tp_pair_across_chips(prebuild_layout, monkeypatch):
+    """A TP2 group is one chip's cores only where a chip holds two devices;
+    with one device per chip it keeps XLA's all-reduce and runs no
+    collective."""
+    builders, _ = prebuild_layout((2, 3))
+    monkeypatch.setattr(sc_common, "devices_per_chip", lambda: 1)
+    op.prebuild(ON)
+    assert op._AR_TP_OP is None
+    builders.tp.assert_not_called()
+    builders.pairs.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "chip,cores_per_device,want",
+    [
+        (pltpu.ChipVersion.TPU_7X, 1, 2),
+        (pltpu.ChipVersion.TPU_V6E, 1, 1),
+        (pltpu.ChipVersion.TPU_V5P, 1, 2),
+        (pltpu.ChipVersion.TPU_V5P, 2, 1),
+    ],
+    ids=["tpu7x", "v6e", "v5p_split", "v5p_megacore"],
+)
+def test_devices_per_chip_comes_from_the_device_info(
+    monkeypatch, chip, cores_per_device, want
+):
+    info = pltpu.get_tpu_info_for_chip(chip, cores_per_device)
+    monkeypatch.setattr(sc_common.pltpu, "get_tpu_info", lambda: info)
+    assert sc_common.devices_per_chip() == want
+
+
 def test_tp_pair_form_is_oneshot():
-    assert (op.TP_PAIR_SIZE, op.TP_PAIR_FORM) == (2, "oneshot")
+    assert op.TP_PAIR_FORM == "oneshot"
 
 
 # The layout predicate behind groups_match_mesh, on an 8-core mesh whose mesh

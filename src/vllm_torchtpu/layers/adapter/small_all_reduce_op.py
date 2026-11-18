@@ -65,11 +65,13 @@ _RS_OP = None
 _AR_TP_OP = None
 _TP_RANK = None
 _TP_RANKS: tuple[int, ...] = ()
-# The TP-pair all-reduce serves a TP group of this many cores inside a larger
-# mesh (so DP > 1): the two cores of a chip, the only layout it was measured
-# on (DP4 x TP2 decode). Its form: every such decode leg ran "oneshot".
-TP_PAIR_SIZE = 2
+# The TP-pair all-reduce serves a TP group of one chip's cores
+# (sc_common.devices_per_chip) inside a larger mesh (so DP > 1), the only layout
+# it was measured on (DP4 x TP2 decode). Its form: every such decode leg ran
+# "oneshot". It runs over a (dp, tp) view of the EP mesh with these axis names.
 TP_PAIR_FORM = "oneshot"
+_PAIR_DP_AXIS = "dp_"
+_PAIR_TP_AXIS = "tp_"
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
 # data (see small_collectives/common.py).
 _RANK = None
@@ -129,19 +131,18 @@ def _build_tp_all_reduce(mesh, tp: int):
     index i is the TP partner of i ^ (tp - 1) group-wise, which `prebuild`
     checks against the torch TP group before arming."""
     n = mesh.shape[EP_AXIS_NAME]
-    mesh2 = Mesh(
-        np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=("dp_", "tp_")
-    )
-    spec = PartitionSpec(("dp_", "tp_"))
+    axes = (_PAIR_DP_AXIS, _PAIR_TP_AXIS)
+    mesh2 = Mesh(np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=axes)
+    spec = PartitionSpec(axes)
 
     def body(block, rank):
         # A forced region (force_small_all_reduce) reaches here with any row
         # count; blocks above the cap take XLA's all-reduce inside the op.
         if block.shape[0] > MAX_ROWS:
-            return jax.lax.psum(block, axis_name="tp_")
-        with sc_common.mesh_axes(("dp_", "tp_")):
+            return jax.lax.psum(block, axis_name=_PAIR_TP_AXIS)
+        with sc_common.mesh_axes(axes):
             return all_reduce.small_all_reduce(
-                block, num_cores=tp, axis="tp_", rank=rank, form=TP_PAIR_FORM
+                block, num_cores=tp, axis=_PAIR_TP_AXIS, rank=rank, form=TP_PAIR_FORM
             )
 
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
@@ -276,7 +277,7 @@ def prebuild(vllm_config: Any) -> None:
     assert index is not None  # build_ep_mesh found the EP group
     if (
         not tp_all_reduce
-        and tp == TP_PAIR_SIZE
+        and tp == sc_common.devices_per_chip()
         and tp < _CORES
         and _CORES % tp == 0
         and groups_match_mesh(index, tp)

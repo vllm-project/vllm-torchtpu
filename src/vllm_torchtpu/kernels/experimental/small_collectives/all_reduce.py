@@ -51,6 +51,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
+    ALL_REDUCE_COLLECTIVE_ID,
     LANES,
     barrier,
     call,
@@ -68,8 +69,8 @@ ONE_SHOT_MAX_BYTES = 32 * 1024
 # two-shot to 4-step topology-aware intra-chip/inter-chip hierarchical RS+AG.
 HIER_2STAGE_MIN_ROWS = 24
 # Barrier semaphore group. Every kernel compiled with the same id in one
-# program shares it; the fused EP MoE kernels use 0.
-COLLECTIVE_ID = 5
+# program shares it (common.py keeps the groups apart).
+COLLECTIVE_ID = ALL_REDUCE_COLLECTIVE_ID
 
 
 def dispatch_form_for(rows, hidden, itemsize, num_cores=8):

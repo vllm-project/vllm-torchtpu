@@ -23,6 +23,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     LANES,
+    REDUCE_SCATTER_COLLECTIVE_ID,
     barrier,
     call,
     push,
@@ -31,8 +32,8 @@ from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     wait_bytes_of,
 )
 
-# A barrier group distinct from the all-reduce kernel's.
-COLLECTIVE_ID = 7
+# A barrier group distinct from the all-reduce kernel's (common.py).
+COLLECTIVE_ID = REDUCE_SCATTER_COLLECTIVE_ID
 # Each block's rows are padded to this multiple: Mosaic refuses a row slice
 # of the input that is not aligned to the sublane tile.
 SUBLANES = 8
