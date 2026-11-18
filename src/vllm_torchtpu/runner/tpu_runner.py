@@ -20,6 +20,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import functools
 import math
 import os
 import time
@@ -133,10 +134,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.sample import fused_spec_verify
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
-    apply_top_k_top_p,
     random_sampler_variants,
     select_topk_candidates,
     should_apply_top_k_top_p,
@@ -314,8 +315,47 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
+def _update_read_offsets_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    next_tokens: torch.Tensor,
+    num_reqs: torch.Tensor,
+) -> torch.Tensor:
+    """Post-verify read-offset scatter for every mamba group in one program.
+    Each of `groups` is a [width] slot tensor; `next_tokens` the rejection
+    sampler output ([>= num_reqs, K+1], INVALID_TOKEN_ID-padded); `num_reqs`
+    a 0-d tensor, so it enters as a value, not a shape. Rows past it take
+    offset 0 (their slots are the null block). Returns the offsets, one per
+    batch position."""
+    width = groups[0].shape[0]
+    rows = next_tokens.shape[0]
+    if rows >= width:
+        next_tokens = next_tokens[:width]
+    else:
+        next_tokens = torch.nn.functional.pad(
+            next_tokens, (0, 0, 0, width - rows), value=INVALID_TOKEN_ID
+        )
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(width, device=read_offsets.device) < num_reqs
+    offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(read_offsets.dtype)
+    indices = torch.cat(groups, dim=0).long()
+    read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
+    return offsets
+
+
+def _use_fused_read_offset_update(
+    read_offsets: torch.Tensor, next_tokens: torch.Tensor | None
+) -> bool:
+    """Verify chunks take `_update_read_offsets_compiled`; non-verify chunks
+    (`next_tokens is None`, offsets all 0) take the eager scatter. Serving
+    buffers are always on TPU; the device check only routes the CPU unit tests,
+    which the tpu backend cannot trace, to the eager path."""
+    return next_tokens is not None and read_offsets.device.type == "tpu"
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
+_update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
 
@@ -717,6 +757,7 @@ class TPUModelRunner(GPUModelRunner):
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
+    _fused_spec_sampler: bool = False
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -5088,6 +5129,14 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
             return None
+        if _use_fused_read_offset_update(self.mamba_slot_read_offsets, next_tokens):
+            assert next_tokens is not None
+            return _update_read_offsets_compiled(
+                self.mamba_slot_read_offsets,
+                list(indices_per_group),
+                next_tokens,
+                torch.tensor(num_reqs, dtype=torch.int64, device=self.device),
+            )
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
             dtype=torch.int32,
@@ -5108,6 +5157,34 @@ class TPUModelRunner(GPUModelRunner):
             all_indices = torch.cat(indices_per_group, dim=0).long()
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
+        return offsets
+
+    def _scatter_folded_read_offsets(
+        self, indices_per_group: list[torch.Tensor], row_offsets: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter the per-row read offsets the fused verify computed
+        (`spec_verify_sample_fused_read_offsets`) into the slot buffer, as
+        `_update_mamba_slot_read_offsets` would from the verify tokens.
+
+        Rows are padded or cut to the groups' width (padded rows' slots are the
+        null block). Eager: a compiled program mutating the slot buffer would
+        add its own mutation epilogue. Returns the offsets, one per batch
+        position."""
+        assert self.mamba_slot_read_offsets is not None
+        groups = list(indices_per_group)
+        width = groups[0].shape[0]
+        rows = row_offsets.shape[0]
+        offsets = (
+            row_offsets[:width]
+            if rows >= width
+            else torch.nn.functional.pad(row_offsets, (0, width - rows))
+        ).to(self.mamba_slot_read_offsets.dtype)
+        if len(groups) == 1:
+            self.mamba_slot_read_offsets.index_put_((groups[0].long(),), offsets)
+        else:
+            self.mamba_slot_read_offsets.index_put_(
+                (torch.cat(groups, dim=0).long(),), offsets.repeat(len(groups))
+            )
         return offsets
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
@@ -5331,6 +5408,7 @@ class TPUModelRunner(GPUModelRunner):
             all_greedy=False,
             topk_candidates=params.topk_candidates,
             apply_topk_topp=self._sampler_applies_topk_topp(),
+            apply_top_k=self._sampler_applies_top_k(),
         )
         return token_ids, params
 
@@ -5447,6 +5525,12 @@ class TPUModelRunner(GPUModelRunner):
                     min_tokens_rows = min_tokens_mask.verify_rows(
                         min_toks, cur_start_idx, draft_lengths.tolist()
                     )
+            if self._fused_spec_sampler and not all_greedy and grammar_output is None:
+                # Without a grammar, min_tokens rows were masked on the full
+                # logits above.
+                return self._sample_spec_verify_fused(
+                    logits, md, cur_start_idx, cur_end_idx, sampling_generator
+                )
             if all_greedy and grammar_output is None:
                 bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                     logits, md.bonus_logits_indices, md.target_logits_indices
@@ -5508,7 +5592,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         temperatures = top_k = top_p = recover_u = None
         topk_candidates = 0
-        apply_topk_topp = True
+        apply_topk_topp = apply_top_k = True
         if do_sampling:
             assert params is not None and target_logits is not None
             temperatures = params.temperatures[md.segment_ids]
@@ -5516,6 +5600,7 @@ class TPUModelRunner(GPUModelRunner):
             top_p = params.top_p[md.segment_ids]
             topk_candidates = params.topk_candidates
             apply_topk_topp = self._sampler_applies_topk_topp()
+            apply_top_k = self._sampler_applies_top_k()
             recover_u = torch.rand_like(
                 target_logits, dtype=torch.float32, generator=sampling_generator
             )
@@ -5536,6 +5621,93 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
+            apply_top_k=apply_top_k,
+        )
+
+    def _sample_spec_verify_fused(
+        self,
+        logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """The non-greedy, grammar-free branch of `_sample_spec_verify_chunk`
+        as one program (`fused_spec_verify.spec_verify_sample_fused`). Takes
+        the same random draws in the same order, so the tokens match."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        assert md.draft_token_ids is not None
+        num_reqs = md.bonus_logits_indices.shape[0]
+        num_tokens = md.target_logits_indices.shape[0]
+        vocab = logits.shape[-1]
+        req_temperatures, req_top_k, req_top_p = self._build_padded_sampling_params(
+            cur_start_idx,
+            cur_end_idx,
+            logits,
+            padded_num_reqs=num_reqs,
+        )
+        topk_candidates = self._sampler_topk_candidates(
+            cur_start_idx, cur_end_idx, None
+        )
+        draw = functools.partial(
+            torch.rand,
+            dtype=torch.float32,
+            device=logits.device,
+            generator=sampling_generator,
+        )
+        bonus_u = draw((num_reqs, vocab))
+        accept_u = draw(md.draft_token_ids.shape)
+        recover_u = draw((num_tokens, vocab))
+        fold = getattr(self, "_fold_read_offsets", None)
+        if fold is not None:
+            next_tokens, self._folded_row_offsets = (
+                fused_spec_verify.spec_verify_sample_fused_read_offsets(
+                    logits,
+                    md.bonus_logits_indices,
+                    md.target_logits_indices,
+                    md.draft_token_ids,
+                    md.draft_lengths,
+                    md.segment_ids,
+                    md.group_indices,
+                    req_temperatures,
+                    req_top_k,
+                    req_top_p,
+                    bonus_u,
+                    accept_u,
+                    recover_u,
+                    self.rejection_sampler.synthetic_conditional_rates,
+                    self.rejection_sampler.synthetic_mode,
+                    self.speculative_config.num_speculative_tokens,
+                    topk_candidates=topk_candidates,
+                    apply_topk_topp=self._sampler_applies_topk_topp(),
+                    apply_top_k=self._sampler_applies_top_k(),
+                    num_reqs=torch.tensor(
+                        fold[1], dtype=torch.int64, device=self.device
+                    ),
+                )
+            )
+            return next_tokens
+        return fused_spec_verify.spec_verify_sample_fused(
+            logits,
+            md.bonus_logits_indices,
+            md.target_logits_indices,
+            md.draft_token_ids,
+            md.draft_lengths,
+            md.segment_ids,
+            md.group_indices,
+            req_temperatures,
+            req_top_k,
+            req_top_p,
+            bonus_u,
+            accept_u,
+            recover_u,
+            self.rejection_sampler.synthetic_conditional_rates,
+            self.rejection_sampler.synthetic_mode,
+            self.speculative_config.num_speculative_tokens,
+            topk_candidates=topk_candidates,
+            apply_topk_topp=self._sampler_applies_topk_topp(),
+            apply_top_k=self._sampler_applies_top_k(),
         )
 
     def sample_tokens(
@@ -5619,6 +5791,16 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
+                    # A fused non-greedy verify also computes the read offsets
+                    # (see _sample_spec_verify_fused); the scatter stays here.
+                    self._fold_read_offsets = (
+                        (mamba_indices, num_reqs)
+                        if mamba_indices
+                        and self.mamba_slot_read_offsets is not None
+                        and self.mamba_slot_read_offsets.device.type == "tpu"
+                        else None
+                    )
+                    self._folded_row_offsets = None
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
                             logits,
@@ -5635,9 +5817,16 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    read_offsets = self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
-                    )
+                    if self._folded_row_offsets is not None:
+                        read_offsets = self._scatter_folded_read_offsets(
+                            mamba_indices, self._folded_row_offsets
+                        )
+                    else:
+                        read_offsets = self._update_mamba_slot_read_offsets(
+                            mamba_indices, next_tokens, num_reqs
+                        )
+                    self._fold_read_offsets = None
+                    self._folded_row_offsets = None
                     spec_boundary_state.copy_states(self, boundary_plan, read_offsets)
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
@@ -6104,6 +6293,12 @@ class TPUModelRunner(GPUModelRunner):
         self.model = model
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+        if self.speculative_config and self._pp_is_last:
+            # Non-greedy verify as one program (fused_spec_verify) when the
+            # model opts in; off by default.
+            self._fused_spec_sampler = fused_spec_verify.fused_sampler_enabled(
+                self.model
+            )
         self._dp_vocab_logits = dp_vocab_parallel.check_layers_sharded_over_dp(
             self.model
         )
@@ -7175,18 +7370,27 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                # (all_greedy, topk_candidates, apply_topk_topp): each graph the
-                # random path picks from (random_sampler_variants; per step,
-                # _sampler_topk_candidates and _sampler_applies_topk_topp
-                # choose), then the all-greedy one (_greedy_sample).
+                # (all_greedy, topk_candidates, apply_topk_topp, apply_top_k):
+                # each graph the random path picks from (random_sampler_variants;
+                # per step, _sampler_topk_candidates and
+                # _sampler_applies_topk_topp choose), the top-p-only graph under
+                # speculative decoding (_sampler_applies_top_k), then the
+                # all-greedy one (_greedy_sample).
                 variants = [
-                    (False, *variant)
+                    (False, *variant, True)
                     for variant in random_sampler_variants(
                         self._topk_candidate_blocks()
                     )
                 ]
-                variants.append((True, 0, True))
-                for all_greedy, topk_candidates, apply_topk_topp in variants:
+                if self.speculative_config is not None:
+                    variants.append((False, 0, True, False))
+                variants.append((True, 0, True, True))
+                for (
+                    all_greedy,
+                    topk_candidates,
+                    apply_topk_topp,
+                    apply_top_k,
+                ) in variants:
                     out = self.sample_from_logits_func(
                         dummy_logits,
                         dummy_temperatures,
@@ -7196,6 +7400,7 @@ class TPUModelRunner(GPUModelRunner):
                         all_greedy=all_greedy,
                         topk_candidates=topk_candidates,
                         apply_topk_topp=apply_topk_topp,
+                        apply_top_k=apply_top_k,
                     )
                     synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -7416,10 +7621,15 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=torch.float32,
                 ).to(self.device)
                 # Each graph the random path picks from, as in
-                # _precompile_sample_from_logits.
-                for topk_candidates, apply_topk_topp in random_sampler_variants(
-                    self._topk_candidate_blocks()
-                ):
+                # _precompile_sample_from_logits, and the top-p-only one.
+                rejection_variants = [
+                    (*variant, True)
+                    for variant in random_sampler_variants(
+                        self._topk_candidate_blocks()
+                    )
+                ]
+                rejection_variants.append((0, True, False))
+                for topk_candidates, apply_topk_topp, apply_top_k in rejection_variants:
                     out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
@@ -7436,13 +7646,107 @@ class TPUModelRunner(GPUModelRunner):
                         do_sampling=True,
                         topk_candidates=topk_candidates,
                         apply_topk_topp=apply_topk_topp,
+                        apply_top_k=apply_top_k,
                     )
                     synchronize_tensors(out)
+                if self._fused_spec_sampler:
+                    self._precompile_fused_spec_verify(
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        warm_accept_u,
+                        warm_recover_u,
+                    )
                 logger.info(
                     "  -- padded_logits_length: %d, num_seqs: %d",
                     num_tokens,
                     num_reqs,
                 )
+
+    def _precompile_fused_spec_verify(
+        self,
+        dummy_logits: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        warm_accept_u: torch.Tensor,
+        warm_recover_u: torch.Tensor,
+    ) -> None:
+        """Every `spec_verify_sample_fused` variant `_sample_spec_verify_fused`
+        can pick at this (num_tokens, num_reqs) bucket."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        num_reqs = bonus_logits_indices.shape[0]
+        device = dummy_logits.device
+        temps = torch.ones((num_reqs, 1), dtype=dummy_logits.dtype).to(device)
+        top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(device)
+        top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(device)
+        bonus_u = torch.zeros((num_reqs, self.vocab_size), dtype=torch.float32).to(
+            device
+        )
+        # (topk_candidates, apply_topk_topp, apply_top_k), as in the
+        # non-greedy warm-up of _precompile_rejection_sampler.
+        variants = [
+            (*variant, True)
+            for variant in random_sampler_variants(self._topk_candidate_blocks())
+        ]
+        variants.append((0, True, False))
+        for topk_candidates, apply_topk_topp, apply_top_k in variants:
+            out = fused_spec_verify.spec_verify_sample_fused(
+                dummy_logits,
+                bonus_logits_indices,
+                target_logits_indices,
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                temps,
+                top_k,
+                top_p,
+                bonus_u,
+                warm_accept_u,
+                warm_recover_u,
+                self.rejection_sampler.synthetic_conditional_rates,
+                self.rejection_sampler.synthetic_mode,
+                self.speculative_config.num_speculative_tokens,
+                topk_candidates=topk_candidates,
+                apply_topk_topp=apply_topk_topp,
+                apply_top_k=apply_top_k,
+            )
+            synchronize_tensors(out)
+            if getattr(self, "mamba_slot_read_offsets", None) is not None:
+                # Hybrid models take the variant that also returns the read
+                # offsets (see _sample_spec_verify_fused).
+                out = fused_spec_verify.spec_verify_sample_fused_read_offsets(
+                    dummy_logits,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                    temps,
+                    top_k,
+                    top_p,
+                    bonus_u,
+                    warm_accept_u,
+                    warm_recover_u,
+                    self.rejection_sampler.synthetic_conditional_rates,
+                    self.rejection_sampler.synthetic_mode,
+                    self.speculative_config.num_speculative_tokens,
+                    topk_candidates=topk_candidates,
+                    apply_topk_topp=apply_topk_topp,
+                    apply_top_k=apply_top_k,
+                    num_reqs=torch.tensor(1, dtype=torch.int64, device=device),
+                )
+                synchronize_tensors(out)
 
     def _precompile_top_token_verify(
         self,
@@ -9130,10 +9434,14 @@ class TPUModelRunner(GPUModelRunner):
         cur_start_idx: int,
         cur_end_idx: int,
         logits: torch.Tensor,
+        padded_num_reqs: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
+        # `logits` gives the dtype and device, and the row count unless
+        # `padded_num_reqs` is given.
+        if padded_num_reqs is None:
+            padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
         temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
@@ -9170,6 +9478,22 @@ class TPUModelRunner(GPUModelRunner):
         return should_apply_top_k_top_p(
             self.input_batch.no_top_k, self.input_batch.no_top_p
         )
+
+    def _sampler_applies_top_k(self) -> bool:
+        """False when speculative decoding is on, top-p is applied and no
+        running request sets top-k.
+
+        Then `apply_top_k_top_p` would still run the top-k bisection (32
+        reductions over the vocabulary per row) and discard it: every row's
+        top_k is 0 (`_build_padded_sampling_params` maps the vLLM "unset"
+        value, vocab_size, and the padding to 0). False drops it from the
+        graph and keeps top-p. Returns True whenever the top-k/top-p step is
+        skipped altogether or speculative decoding is off, so those paths keep
+        their existing graphs.
+        """
+        if not self._sampler_applies_topk_topp() or self.speculative_config is None:
+            return True
+        return not self.input_batch.no_top_k
 
     def _sampler_topk_candidates(
         self,
@@ -9340,6 +9664,7 @@ class TPUModelRunner(GPUModelRunner):
         all_greedy: bool = False,
         topk_candidates: int = 0,
         apply_topk_topp: bool = True,
+        apply_top_k: bool = True,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
@@ -9347,23 +9672,19 @@ class TPUModelRunner(GPUModelRunner):
         """
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
-        is_greedy = temperatures <= SAMPLING_EPS
-        scaled_logits = self._apply_temperature(logits, temperatures)
-        if apply_topk_topp:
-            masked_logits = apply_top_k_top_p(
-                scaled_logits, top_k, top_p, topk_candidates
-            )
-        else:
-            # No request sets top-k/top-p: skip the two 32-step vocabulary
-            # bisections (separate graph, warmed in the precompile).
-            masked_logits = scaled_logits
-        u_clamped = torch.clamp(
-            u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
+        # apply_topk_topp=False (no request sets top-k/top-p) skips the two
+        # 32-step vocabulary bisections, apply_top_k=False the top-k one
+        # (separate graphs, warmed in the precompile).
+        return fused_spec_verify.sample_rows(
+            logits,
+            temperatures,
+            u,
+            top_k,
+            top_p,
+            topk_candidates,
+            apply_topk_topp,
+            apply_top_k,
         )
-        gumbel_noise = -torch.log(-torch.log(u_clamped))
-        noisy_logits = masked_logits + gumbel_noise
-        final_logits = torch.where(is_greedy, logits, noisy_logits)
-        return torch.argmax(final_logits, dim=-1, keepdim=True)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_logprob_row_tokens(
