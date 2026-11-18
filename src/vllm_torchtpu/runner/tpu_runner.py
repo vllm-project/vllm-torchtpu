@@ -10438,17 +10438,6 @@ class TPUModelRunner(GPUModelRunner):
                             offsets, src, ckpt, dst
                         )
                     synchronize_tensors(seed_src)
-                if self.speculative_config is not None:
-                    ckpt = torch.zeros(
-                        (n, self.speculative_config.num_speculative_tokens + 1),
-                        dtype=torch.int32,
-                        device=offsets.device,
-                    )
-                    with torch.no_grad():
-                        out_seed = _spec_seed_and_rollback_compiled(
-                            offsets, src, ckpt, dst
-                        )
-                    synchronize_tensors(out_seed)
                 n *= 4
             if self.speculative_config is not None:
                 k = self.speculative_config.num_speculative_tokens
