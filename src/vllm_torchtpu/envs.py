@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_SP_PREFILL_MIN_TOKENS: int = 0
+    TPU_SP_VISION_MIN_PATCHES: int = 0
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -731,6 +732,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # off. Costs (tp - 1) / tp more dense weight HBM per rank, taken from the
     # KV cache. Qwen3-VL dense text backbones only.
     "TPU_SP_PREFILL_MIN_TOKENS": env_nonnegative_int("TPU_SP_PREFILL_MIN_TOKENS", 0),
+    # Qwen3-VL vision tower calls with at least this many patches run sequence
+    # parallel with replicated projection weights (models/vllm/sp_vision.py);
+    # 0 is off. Costs (tp - 1) / tp more vision weight HBM per rank.
+    "TPU_SP_VISION_MIN_PATCHES": env_nonnegative_int("TPU_SP_VISION_MIN_PATCHES", 0),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
