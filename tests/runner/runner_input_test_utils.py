@@ -141,6 +141,7 @@ def _make_runner(
     runner._cached_request_distribution = None
     runner._h2d_reuse = {}
     runner._fast_token_substitution = False
+    runner._static_verify_q_len = None
     runner._uniform_sched_arr_cache = {}
     runner._prepare_inputs_idx_cache = {}
     runner._async_subtract_idx_cache = {}

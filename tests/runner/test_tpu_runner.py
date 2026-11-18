@@ -1961,6 +1961,7 @@ class TestReorderBatchForRpa:
         runner = MagicMock(spec=TPUModelRunner)
         runner.input_batch = MagicMock()
         runner._masked_dense_groups_requests = groups_requests
+        runner._static_verify_q_len = None
         runner._reorder_batch_for_rpa = TPUModelRunner._reorder_batch_for_rpa.__get__(
             runner
         )

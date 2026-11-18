@@ -2108,7 +2108,7 @@ class TPUModelRunner(GPUModelRunner):
                     self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
                 )
                 return num_decode, num_decode
-        elif getattr(self, "_static_verify_q_len", None) is None:
+        elif self._static_verify_q_len is None:
             num_decode = 0
             num_windowed = 0
             prev_seg = 0
@@ -2181,7 +2181,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         # Pass 3: full-length verify windows first within the verify segment.
         self._num_static_verify_reqs = 0
-        q_len = getattr(self, "_static_verify_q_len", None)
+        q_len = self._static_verify_q_len
         if q_len is not None and num_decode < num_windowed:
             num_full = partition(
                 num_decode,
@@ -6051,21 +6051,19 @@ class TPUModelRunner(GPUModelRunner):
             # through the persistent all-False mask instead of an upload.
             active_keep_dev = keep_zero_dev
         # Stack groups and reset offsets across all groups in one compiled program.
-        ctx = getattr(self, "_attn_metadata_builder_ctx", None)
+        # The groups came from this chunk's metadata context, so it is set.
+        ctx = self._attn_metadata_builder_ctx
         groups_ids = tuple(id(g) for g in groups)
-        cached_stacked = (
-            getattr(ctx, "_stacked_mamba_groups", None) if ctx is not None else None
-        )
+        cached_stacked = ctx._stacked_mamba_groups
         if (
             isinstance(cached_stacked, torch.Tensor)
-            and getattr(ctx, "_stacked_mamba_groups_ids", None) == groups_ids
+            and ctx._stacked_mamba_groups_ids == groups_ids
         ):
             stacked = cached_stacked
         else:
             stacked = _stack_or_single_mamba_groups(groups)
-            if ctx is not None:
-                ctx._stacked_mamba_groups = stacked
-                ctx._stacked_mamba_groups_ids = groups_ids
+            ctx._stacked_mamba_groups = stacked
+            ctx._stacked_mamba_groups_ids = groups_ids
         _reset_read_offsets(
             self.mamba_slot_read_offsets, active_keep_dev, stacked, null
         )
