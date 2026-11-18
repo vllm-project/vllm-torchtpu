@@ -160,16 +160,6 @@ def _routing_from_caller(
     return weights, jnp.concatenate(parts, axis=0)
 
 
-def _shard_biases(w1_bias, w2_bias, w1_cols, hidden):
-    """The shard's per-expert biases as the kernel's [slots, N] tables: one
-    row per expert slot of the shard's weights, copy slots included (the
-    kernel reads the first experts_per_shard rows)."""
-    return (
-        None if w1_bias is None else w1_bias.reshape(-1, w1_cols),
-        None if w2_bias is None else w2_bias.reshape(-1, hidden),
-    )
-
-
 def expert_buffers_that_fit(
     experts_per_shard,
     tile_rows,
@@ -178,9 +168,6 @@ def expert_buffers_that_fit(
     *,
     config,
     weight_format,
-    has_w1_bias,
-    has_w2_bias,
-    no_gate,
     activation_block=0,
     result_rows="fp8",
     token_block=None,
@@ -201,9 +188,6 @@ def expert_buffers_that_fit(
             weight_slots=slots,
             result_slots=config.result_slots,
             weight_format=weight_format,
-            has_w1_bias=has_w1_bias,
-            has_w2_bias=has_w2_bias,
-            no_gate=no_gate,
             activation_block=activation_block,
             result_dtype=result_dtype,
             token_block=token_block,
@@ -250,25 +234,20 @@ SCALES_RANK_PER_CHANNEL = 2
 
 # The forms the TPU reference test (tests/kernels/fused_moe/
 # test_fused_ep_moe_v3.py) covers: fp8 weights with one scale per output
-# channel, silu over a gate and an up half, no biases, one fp8 scale per row,
-# and fp8 or bf16 result rows. The kernel also carries bf16 weights, expert
-# biases, the single projection and blocked row scales (the per-expert
-# helpers in ffn.py take them as parameters); fused_ep_moe refuses those until
-# a TPU case against the reference covers each, so adding the case and the
-# form here is what admits it.
+# channel, silu over a gate and an up half, one fp8 scale per row, and fp8
+# or bf16 result rows. The kernel also carries bf16 weights and blocked row
+# scales (the per-expert helpers in ffn.py take them as parameters);
+# fused_ep_moe refuses those until a TPU case against the reference covers
+# each, so adding the case and the form here is what admits it.
 TESTED_WEIGHT_FORMATS = frozenset({WeightFormat.FP8})
 
 
-def check_tested(form, *, no_gate, has_bias, config):
+def check_tested(form, *, config):
     """Raises NotImplementedError for a form no TPU reference test covers
     (see TESTED_WEIGHT_FORMATS)."""
     untested = []
     if form.name not in TESTED_WEIGHT_FORMATS:
         untested.append(f"weight format {str(form.name)!r}")
-    if no_gate:
-        untested.append("the single projection (no_gate)")
-    if has_bias:
-        untested.append("expert biases")
     if config.activation_block or config.token_rows_block:
         untested.append("blocked row scales (Config.activation_block, token_block)")
     if untested:
@@ -363,8 +342,6 @@ def _pallas_step(
     w2,
     w1_scales,
     w2_scales,
-    w1_bias,
-    w2_bias,
     routing_indices,
     routing_weights,
     *,
@@ -382,7 +359,6 @@ def _pallas_step(
     routed_rows_per_shard,
     row_scale_dtype,
     experts_per_shard,
-    w1_cols,
     arrival_rows,
     blocks_per_step,
     token_block,
@@ -521,7 +497,6 @@ def _pallas_step(
         routed_rows=routed_rows_per_shard,
     )
     token_scales = token_scales.reshape(n_scales, scale_rows, LANES)
-    w1_bias, w2_bias = _shard_biases(w1_bias, w2_bias, w1_cols, hidden)
     if sorted_rows:
         # The routed rows sorted into expert order on the sparse cores, so
         # the FFN kernel fetches each tile as one copy. The landing has to
@@ -610,8 +585,6 @@ def _pallas_step(
         w2,
         w1_scales,
         w2_scales,
-        w1_bias,
-        w2_bias,
         arrival_rows=arrival_rows,
         transport_sems=kernel_sems,
         shard_index=shard_index,
@@ -686,8 +659,6 @@ def fused_ep_moe(
     w1_scales,
     w2_scales,
     router_logits,
-    w1_bias=None,
-    w2_bias=None,
     *,
     top_k,
     renormalize,
@@ -698,7 +669,6 @@ def fused_ep_moe(
     weight_format=WeightFormat.FP8,
     activation="silu",
     drop_nan_rows=False,
-    no_gate=False,
     routing=None,
     config=None,
     shard_index=None,
@@ -711,8 +681,8 @@ def fused_ep_moe(
 
     Args:
       x: [tokens, hidden] activations, sharded over the mesh axis.
-      w1: [experts, hidden, 2 * inter] (gate and up halves side by side.
-        [experts, hidden, inter] with no_gate), in the format's dtype.
+      w1: [experts, hidden, 2 * inter] (gate and up halves side by side),
+        in the format's dtype.
       w2: [experts, inter, hidden].
       w1_scales, w2_scales: f32, per output channel ([experts, N]) for fp8,
         None for bf16.
@@ -726,9 +696,6 @@ def fused_ep_moe(
         and weights, the kernel moves rows and sums. An index outside
         the expert range routes nowhere with weight zero. renormalize
         and drop_nan_rows do not apply.
-      w1_bias, w2_bias: optional [experts, 1, N] f32, added to the post-scale
-        halves before the activation and to the down projection before it
-        travels between shards.
       top_k: selections per token, at least 1 and at most the expert count.
       renormalize: whether the selected weights are a softmax over the
         selected logits (True) or the full softmax's scores.
@@ -743,12 +710,10 @@ def fused_ep_moe(
         when None.
       weight_format: "fp8" or "bf16"; only "fp8" is admitted until bf16
         has a TPU test (check_tested).
-      activation: "silu", over the gate (or, with no_gate, alone; refused
-        until tested).
+      activation: "silu", over the gate.
       drop_nan_rows: route a row with any NaN logit nowhere, as the stock
         layer does, at one boolean sweep of the logits per call. Off, only
         all-garbage rows are dropped.
-      no_gate: a single projection with no gate half.
       config: a Config. None takes Config.for_shape: the defaults, with the
         fields TUNED_BY_SHAPE holds for this shape on top.
       shard_index: int32 [num_shards, 1], each shard's own index, handed to
@@ -792,7 +757,7 @@ def fused_ep_moe(
             )
     tokens, hidden = x.shape
     num_experts = w1.shape[0]
-    inter = w1.shape[2] // (1 if no_gate else 2)
+    inter = w1.shape[2] // 2
     if routing is not None:
         routing_indices, routing_weights = routing
         for name, r in (("indices", routing_indices), ("weights", routing_weights)):
@@ -812,7 +777,7 @@ def fused_ep_moe(
             )
     elif router_logits is None:
         raise ValueError("router_logits is None and no routing was given")
-    w1_cols = inter if no_gate else 2 * inter
+    w1_cols = 2 * inter
     ndim = SCALES_RANK_PER_CHANNEL
     # The kernel addresses the weights by these shapes with Mosaic's bounds
     # checks off (Config.bounds_checks), so a mismatch would read past them.
@@ -927,12 +892,7 @@ def fused_ep_moe(
         config = Config.for_shape(
             hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=top_k
         )
-    check_tested(
-        form,
-        no_gate=no_gate,
-        has_bias=w1_bias is not None or w2_bias is not None,
-        config=config,
-    )
+    check_tested(form, config=config)
     partition = jax.sharding.PartitionSpec
     bound = tables.routed_rows_bound(tokens, top_k, num_experts, tile_rows)
     if routed_rows_per_shard is None:
@@ -962,8 +922,6 @@ def fused_ep_moe(
             f"no-drop bound {bound}: one shard's routed rows could bleed "
             "into the next"
         )
-    has_w1_bias = w1_bias is not None
-    has_w2_bias = w2_bias is not None
     activation_block = config.activation_block
     if activation_block and (hidden % activation_block or inter % activation_block):
         raise ValueError(
@@ -987,9 +945,6 @@ def fused_ep_moe(
             inter,
             config=config,
             weight_format=weight_format,
-            has_w1_bias=has_w1_bias,
-            has_w2_bias=has_w2_bias,
-            no_gate=no_gate,
             activation_block=activation_block,
             result_rows=config.result_rows,
             token_block=token_block,
@@ -1040,9 +995,6 @@ def fused_ep_moe(
         weight_format=weight_format,
         routed_rows=routed_rows_per_shard,
         activation=activation,
-        has_w1_bias=has_w1_bias,
-        has_w2_bias=has_w2_bias,
-        no_gate=no_gate,
         pallas_transport=not sorted_rows,
         weight_slots=weight_slots,
         weight_prefetch=weight_prefetch,
@@ -1078,7 +1030,6 @@ def fused_ep_moe(
         routing_block=routing_block,
         routed_rows_per_shard=routed_rows_per_shard,
         experts_per_shard=experts_per_shard,
-        w1_cols=w1_cols,
         arrival_rows=arrival_rows,
         blocks_per_step=blocks_per_step,
         token_block=token_block,
@@ -1100,8 +1051,6 @@ def fused_ep_moe(
             logits, indices, weights = next(it), None, None
         w1_scales = next(it) if form.has_scales else None
         w2_scales = next(it) if form.has_scales else None
-        w1_bias = next(it) if has_w1_bias else None
-        w2_bias = next(it) if has_w2_bias else None
         shard_l = next(it).reshape(-1) if with_shard else None
         valid_l = next(it).reshape(-1) if with_valid_tokens else None
         return _pallas_step(
@@ -1111,8 +1060,6 @@ def fused_ep_moe(
             w2,
             w1_scales,
             w2_scales,
-            w1_bias,
-            w2_bias,
             indices,
             weights,
             row_scale_dtype=config.row_scale_dtype,
@@ -1123,11 +1070,10 @@ def fused_ep_moe(
 
     router = tuple(routing) if handed_in else (router_logits,)
     scales = (w1_scales, w2_scales) if form.has_scales else ()
-    biases = tuple(b for b in (w1_bias, w2_bias) if b is not None)
     shard_args = ((shard_index,) if with_shard else ()) + (
         (valid_tokens,) if with_valid_tokens else ()
     )
-    args = (x, w1, w2) + router + scales + biases + shard_args
+    args = (x, w1, w2) + router + scales + shard_args
     # The token rows split over every mesh axis; the experts over the
     # expert-parallel axis alone, copied over the others.
     rows_spec = partition(tuple(mesh.axis_names))
@@ -1135,16 +1081,12 @@ def fused_ep_moe(
     in_specs = (
         (rows_spec, experts_spec, experts_spec)
         + (rows_spec,) * len(router)
-        + (experts_spec,) * (len(scales) + len(biases))
+        + (experts_spec,) * len(scales)
         + (experts_spec,) * len(shard_args)
     )
     args = tuple(
         jax.device_put(a, jax.sharding.NamedSharding(mesh, spec))
         for a, spec in zip(args, in_specs)
-    )
-    bias_dtypes = (
-        w1_bias.dtype if has_w1_bias else None,
-        w2_bias.dtype if has_w2_bias else None,
     )
     key = (
         mesh,
@@ -1159,7 +1101,6 @@ def fused_ep_moe(
         routed_rows_per_shard,
         weight_format,
         activation,
-        bool(no_gate),
         config,
         bool(drop_nan_rows),
         bool(with_shard),
@@ -1171,7 +1112,7 @@ def fused_ep_moe(
         tuple(r.dtype for r in router),
         bool(side_effects),
         bool(wrap_in_jit),
-    ) + bias_dtypes
+    )
 
     def build():
         sm = jax.shard_map(
