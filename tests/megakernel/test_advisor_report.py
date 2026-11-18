@@ -49,6 +49,7 @@ def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
                 decode=dataclasses.replace(preset.decode, megakernel=None),
                 prefill=dataclasses.replace(preset.prefill, megakernel=None),
                 saturation=stripped_sat,
+                megakernel_layouts=(),
             ),
         )
 
@@ -553,3 +554,26 @@ def test_step_ranking_rejects_unequal_chip_layouts(objective: str) -> None:
     fastest = min(equal_rows, key=lambda row: row["step_floor_us"])
     assert equal["best_step_layout"] == fastest["layout"]
     assert equal["verdict"] != "not comparable"
+
+
+def test_html_badge_counts_a_measured_collective() -> None:
+    """Verify HTML report displays trace badge when trace has only collectives."""
+    measurements_payload = {
+        "schema": advisor.constants.MEASUREMENTS_SCHEMA,
+        "source": {"kind": "xplane", "file": "coll_only.xplane.pb"},
+        "collectives": [
+            {
+                "op": "all-reduce",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": 15.0,
+                "n": 10,
+            }
+        ],
+    }
+    sweep = advisor.advise_regimes(
+        "qwen3.5-397b", "tpu7x", measurements=measurements_payload
+    )
+    html_output = advisor.render_advisor_html(sweep)
+    assert "CALIBRATED TRACE" in html_output
+    assert "coll_only.xplane.pb" in html_output
