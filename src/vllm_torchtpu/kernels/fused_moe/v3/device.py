@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from .layout import SUBLANES, align_up
+from .layout import align_up
 
 # Supported TPU generations. Device properties are read at build time,
 # and check_generation rejects generations outside this set.
@@ -71,20 +71,6 @@ def array_vmem_bytes(shape, dtype, info):
     for dim in shape[:-2]:
         rows *= dim
     return rows * sublanes * lanes * itemsize
-
-
-def check_u32_sublane_tile(info=None):
-    """Raises ValueError on a chip whose 32-bit sublane tiling
-    is not layout.SUBLANES, the tile the packed four-bit weight layout is
-    written for."""
-    if info is None:
-        info = pltpu.get_tpu_info()
-    queried = info.get_sublane_tiling(jnp.uint32)
-    if queried != SUBLANES:
-        raise ValueError(
-            f"this chip tiles 32-bit words to {queried} sublanes. The packed "
-            f"four-bit weight layout is written for {SUBLANES}"
-        )
 
 
 def jax_version():

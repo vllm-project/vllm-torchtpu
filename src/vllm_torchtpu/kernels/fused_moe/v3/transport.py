@@ -481,7 +481,6 @@ def start_transport(
     activation_block=0,
     elementwise=jnp.float32,
     mesh_axes=(MESH_AXIS,),
-    token_dtype=FP8,
     shard_index=None,
     valid_tokens=None,
 ):
@@ -497,9 +496,6 @@ def start_transport(
         shard quantizes its rows and exchanges nothing.
       mesh_axes: the mesh's axis names; MESH_AXIS is the expert-parallel
         one, the others hold replicas.
-      token_dtype: the rows' element type on the wire, fp8 (quantized here,
-        one scale per row or per activation block) or bf16 (as they are,
-        unit scales).
       scale_dtype: the row scales' rounding.
       activation_block: values per fp8 scale of a row (0: one scale per
         row). Plane s of a tile's scales is message row
@@ -508,7 +504,7 @@ def start_transport(
         (Config.elementwise_dtype).
 
     Returns:
-      (gathered rows [num_shards * tokens, lane blocks, LANES] token_dtype with the
+      (gathered rows [num_shards * tokens, lane blocks, LANES] fp8 with the
       copies still landing, its send semaphore, its receive semaphores,
       routing messages [num_shards, message_rows, MESSAGE_LANES] int32).
 
@@ -633,17 +629,12 @@ def start_transport(
                     tile_rows_data,
                     jnp.zeros_like(tile_rows_data),
                 )
-            if jnp.dtype(token_dtype) == jnp.dtype(jnp.bfloat16):
-                # bf16 token rows: as they are, unit scales.
-                quantized = tile_rows_data.astype(jnp.bfloat16)
-                scale = jnp.ones((tile, n_scales), jnp.float32)
-            else:
-                quantized, scale = quantize_rows(
-                    tile_rows_data,
-                    scale_dtype,
-                    block=activation_block,
-                    dtype=elementwise,
-                )
+            quantized, scale = quantize_rows(
+                tile_rows_data,
+                scale_dtype,
+                block=activation_block,
+                dtype=elementwise,
+            )
             if i >= 2:
                 write_gathered_rows(i - 2).wait()
                 if num_shards > 1:
@@ -716,7 +707,7 @@ def start_transport(
         kernel,
         out_shape=(
             jax.ShapeDtypeStruct(
-                (num_shards * tokens, lane_blocks, MESSAGE_LANES), token_dtype
+                (num_shards * tokens, lane_blocks, MESSAGE_LANES), FP8
             ),
             pltpu.SemaphoreType.DMA(()),
             pltpu.SemaphoreType.DMA((receive_semaphores(num_shards),)),
@@ -728,7 +719,7 @@ def start_transport(
         out_specs=(hbm, sem, sem, hbm),
         scratch_shapes=[
             pltpu.VMEM((2, tile, hidden), rows.dtype),
-            pltpu.VMEM((2, tile, lane_blocks, MESSAGE_LANES), token_dtype),
+            pltpu.VMEM((2, tile, lane_blocks, MESSAGE_LANES), FP8),
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
