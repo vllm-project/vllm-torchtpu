@@ -12,11 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import torch
 
 _padding_state: "TokenPaddingState | None" = None
+# First step row of the tensors the model is tracing (`row_offset`): None
+# (row 0) except while a model runs part of a layer on a later row block of
+# the step. May be a SymInt, so it is never tested for truth.
+_row_offset = None
 
 
 @dataclass
@@ -40,7 +46,22 @@ class TokenPaddingState:
         self.local_padding_mask.copy_(host)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
+        if _row_offset is not None:
+            return self.local_padding_mask[_row_offset : _row_offset + num_tokens]
         return self.local_padding_mask[:num_tokens]
+
+
+@contextlib.contextmanager
+def row_offset(offset) -> Iterator[None]:
+    """While tracing ops on step rows [offset, offset + n) (a model that
+    splits a step into row blocks), the padding mask they read starts at row
+    `offset`. Trace-time state: the slice is part of the traced graph."""
+    global _row_offset
+    saved, _row_offset = _row_offset, offset
+    try:
+        yield
+    finally:
+        _row_offset = saved
 
 
 def set_padding_state(state: "TokenPaddingState | None") -> None:

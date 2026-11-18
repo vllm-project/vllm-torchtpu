@@ -256,6 +256,10 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
     TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE: str = ""
+    TPU_MINIMAX_M3_PREFILL_OVERLAP: bool = False
+    TPU_MINIMAX_M3_PREFILL_OVERLAP_MIN_TOKENS: int = 4096
+    TPU_MINIMAX_M3_PREFILL_OVERLAP_AR: str = "xla"
+    TPU_MINIMAX_M3_PREFILL_OVERLAP_QKV: bool = True
 
 
 def env_with_choices(
@@ -1639,6 +1643,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Lossy. Prefill steps are unchanged.
     "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE": env_str(
         "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE", ""
+    ),
+    # MiniMax M3 two-batch overlap of the TP all-reduces on steps of at least
+    # TPU_MINIMAX_M3_PREFILL_OVERLAP_MIN_TOKENS tokens (a multiple of 32;
+    # `models.minimax_m3.overlap`): after attention every layer runs o_proj,
+    # the post-attention norm, the FFN and their all-reduces on two token
+    # halves, so one half's all-reduce can run on the SparseCore while the
+    # TensorCore computes the other half. Not bitwise (half-size all-reduces
+    # and GEMMs round differently). Smaller steps are unchanged.
+    "TPU_MINIMAX_M3_PREFILL_OVERLAP": env_bool(
+        "TPU_MINIMAX_M3_PREFILL_OVERLAP", default=False
+    ),
+    "TPU_MINIMAX_M3_PREFILL_OVERLAP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_PREFILL_OVERLAP_MIN_TOKENS", 4096
+    ),
+    # How the half all-reduces are issued. "xla": a torch functional
+    # all-reduce, an XLA all-reduce in the step's own computation, which the
+    # latency-hiding scheduler can overlap with the other half. "group": the
+    # TP group's all-reduce (the Pallas all-reduce op when armed, whose psum
+    # sits in the op's called computation; overlaps only if libtpu inlines
+    # it, e.g. --xla_tpu_force_early_inlining_and_flattening).
+    "TPU_MINIMAX_M3_PREFILL_OVERLAP_AR": env_with_choices(
+        "TPU_MINIMAX_M3_PREFILL_OVERLAP_AR", "xla", ["xla", "group"]
+    ),
+    # With TPU_MINIMAX_M3_PREFILL_OVERLAP: also run the next layer's input
+    # norm and qkv_proj per half, so the first half's can overlap the second
+    # half's FFN all-reduce.
+    "TPU_MINIMAX_M3_PREFILL_OVERLAP_QKV": env_bool(
+        "TPU_MINIMAX_M3_PREFILL_OVERLAP_QKV", default=True
     ),
 }
 

@@ -13,12 +13,14 @@
 # limitations under the License.
 """MiniMax M3 (text) on TPU."""
 
-from collections.abc import Iterable
+import contextlib
+from collections.abc import Iterable, Iterator
 
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -33,6 +35,8 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
+from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.models.minimax_m3 import overlap
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
@@ -67,6 +71,106 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
+        # Two-batch overlap of large steps (`overlap`; off = overlap.OFF).
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.overlap = overlap.config_from_env() if self.tp_size > 1 else overlap.OFF
+
+    @contextlib.contextmanager
+    def _layer_owned_reductions(self) -> Iterator[None]:
+        """While tracing an overlap step, o_proj and the FFN return per-rank
+        partial sums and the layer all-reduces them; every other trace keeps
+        their own all-reduces, so the other programs are unchanged."""
+        o_proj = self.self_attn.o_proj
+        if self.is_moe_layer:
+            experts = self.block_sparse_moe.experts
+            # A MoE op that all-reduces inside it (fused MoE decode / TP
+            # decode kernel) would ignore skip_final_all_reduce.
+            from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+                moe_tp_decode_supported,
+            )
+
+            if getattr(experts, "_fused_moe_decode_armed", False) or (
+                moe_tp_decode_supported(getattr(experts, "_quant_method", None))
+            ):
+                raise ValueError(
+                    "TPU_MINIMAX_M3_PREFILL_OVERLAP needs a MoE that leaves its "
+                    "all-reduce to the model; this layer's MoE op reduces "
+                    "inside it (fused MoE decode / TP decode kernel)."
+                )
+            cfg = experts.moe_config
+            saved = (o_proj.reduce_results, cfg.skip_final_all_reduce)
+            o_proj.reduce_results, cfg.skip_final_all_reduce = False, True
+        else:
+            down = self.mlp.down_proj
+            saved = (o_proj.reduce_results, down.reduce_results)
+            o_proj.reduce_results = down.reduce_results = False
+        try:
+            yield
+        finally:
+            if self.is_moe_layer:
+                o_proj.reduce_results, cfg.skip_final_all_reduce = saved
+            else:
+                o_proj.reduce_results, down.reduce_results = saved
+
+    def _attend(self, positions, hidden_states, index_reuse, qkv=None):
+        if index_reuse is None:
+            return self.self_attn.attend(positions, hidden_states, qkv=qkv)
+        return self.self_attn.attend(positions, hidden_states, index_reuse, qkv=qkv)
+
+    def forward_overlap(
+        self,
+        positions: torch.Tensor,
+        hidden_states,
+        residual,
+        half,
+        index_reuse: dict | None = None,
+    ):
+        """Overlap layer (`overlap`): attention on every token, then o_proj,
+        the post-attention norm, the FFN and their all-reduces per token
+        half.
+
+        `hidden_states`: the full embedding (first layer, `residual` None)
+        or the previous layer's pair of in-flight FFN all-reduces; `residual`:
+        None or the pair of residual halves. `half`: rows per half (the
+        step's token count symbol // 2). Returns the pair of in-flight FFN
+        all-reduces and the pair of residual halves.
+        """
+        cfg = self.overlap
+        route = cfg.ar
+        with self._layer_owned_reductions():
+            attn_mod = self.self_attn
+            if residual is None:
+                res_a, res_b = overlap.split(hidden_states, half)
+                attn = self._attend(
+                    positions, self.input_layernorm(hidden_states), index_reuse
+                )
+            else:
+                ffn_a, ffn_b = hidden_states
+                res_a, res_b = residual
+                x_a, res_a = self.input_layernorm(overlap.wait(ffn_a), res_a)
+                if cfg.qkv:
+                    qkv_a, _ = attn_mod.qkv_proj(x_a)
+                    x_b, res_b = self.input_layernorm(overlap.wait(ffn_b), res_b)
+                    qkv_b, _ = attn_mod.qkv_proj(x_b)
+                    attn = self._attend(
+                        positions, None, index_reuse, torch.cat([qkv_a, qkv_b])
+                    )
+                else:
+                    x_b, res_b = self.input_layernorm(overlap.wait(ffn_b), res_b)
+                    attn = self._attend(positions, torch.cat([x_a, x_b]), index_reuse)
+            attn_a, attn_b = overlap.split(attn, half)
+            o_a, _ = attn_mod.o_proj(attn_a)
+            o_b, _ = attn_mod.o_proj(attn_b)
+            o_a = overlap.all_reduce(o_a, route)
+            o_b = overlap.all_reduce(o_b, route)
+            ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+            x_a, res_a = self.post_attention_layernorm(overlap.wait(o_a), res_a)
+            ffn_a = overlap.all_reduce(ffn(x_a), route)
+            x_b, res_b = self.post_attention_layernorm(overlap.wait(o_b), res_b)
+            with token_padding.row_offset(half):
+                ffn_b = ffn(x_b)
+            ffn_b = overlap.all_reduce(ffn_b, route)
+        return (ffn_a, ffn_b), (res_a, res_b)
 
     def forward(
         self,
@@ -118,6 +222,10 @@ class MiniMaxM3Model(nn.Module):
         self.index_reuse = any(
             layer.self_attn.index_reuse_full is not None for layer in self.layers
         )
+        # Two-batch overlap of large steps (`overlap`,
+        # TPU_MINIMAX_M3_PREFILL_OVERLAP).
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.overlap = overlap.config_from_env() if self.tp_size > 1 else overlap.OFF
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -136,14 +244,59 @@ class MiniMaxM3Model(nn.Module):
         if 0 in self.aux_hidden_state_layers:
             aux_hidden_states.append(inputs_embeds)
         reuse = {"index_reuse": {}} if getattr(self, "index_reuse", False) else {}
-        for idx, layer in enumerate(self.layers):
-            hidden_states, residual = layer(positions, hidden_states, residual, **reuse)
-            if idx + 1 in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states + residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+        ovl = getattr(self, "overlap", overlap.OFF)
+        # The token count as the input_ids symbol (lifted first in every
+        # trace); read only with the overlap on.
+        num_tokens = (
+            (input_ids if input_ids is not None else inputs_embeds).shape[0]
+            if ovl.on
+            else 0
+        )
+        if ovl.on and overlap.step(ovl, num_tokens, self.tp_size):
+            # Halves of the embedding's own row count (the same symbol as
+            # input_ids' when the embedding is computed here).
+            hidden_states = self._forward_overlap(
+                positions,
+                inputs_embeds,
+                inputs_embeds.shape[0] // 2,
+                aux_hidden_states,
+                reuse,
+            )
+        else:
+            for idx, layer in enumerate(self.layers):
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, **reuse
+                )
+                if idx + 1 in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(hidden_states + residual)
+            hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _forward_overlap(
+        self,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        half,
+        aux_hidden_states: list[torch.Tensor],
+        reuse: dict,
+    ) -> torch.Tensor:
+        """The layers on token halves (`overlap`); joined after the final
+        norm (and for each aux hidden state)."""
+        hidden, residual = inputs_embeds, None
+        for idx, layer in enumerate(self.layers):
+            hidden, residual = layer.forward_overlap(
+                positions, hidden, residual, half, **reuse
+            )
+            if idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    torch.cat(
+                        [overlap.wait(h) + r for h, r in zip(hidden, residual)]
+                    )
+                )
+        out = [self.norm(overlap.wait(h), r)[0] for h, r in zip(hidden, residual)]
+        return torch.cat(out)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # (param, checkpoint shard, shard id). Leading dots keep `.q_proj`

@@ -438,7 +438,21 @@ class MiniMaxM3SparseAttention(nn.Module):
         """``index_reuse`` (MSA index reuse on) is a dict the step's layers
         share: on a decode step a Full layer leaves its selection in it for
         the Shared layers after it."""
-        qkv, _ = self.qkv_proj(hidden_states)
+        output, _ = self.o_proj(self.attend(positions, hidden_states, index_reuse))
+        return output
+
+    def attend(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        index_reuse: dict | None = None,
+        qkv: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`forward` up to the o_proj input ([tokens, q_size], this rank's
+        heads). `qkv`: the qkv_proj output, when the caller already ran it
+        (`hidden_states` is then unused)."""
+        if qkv is None:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
@@ -449,7 +463,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.rotary_emb,
             self.norm_rope_op,
         )
-        num_tokens = hidden_states.shape[0]
+        num_tokens = qkv.shape[0]
         if not self.q_head_major:
             q = q.view(num_tokens, self.num_heads, self.head_dim)
         metadata = get_forward_context().attn_metadata
@@ -491,5 +505,4 @@ class MiniMaxM3SparseAttention(nn.Module):
                 layer_metadata,
                 **extra,
             ).reshape(num_tokens, self.q_size)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
