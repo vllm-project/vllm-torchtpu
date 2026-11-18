@@ -376,9 +376,10 @@ def _build_fused_core(
 
         # `mixed_qkv` and `conv_weight` lay their channels out as
         # (q: H * D, k: H * D, v: H * V) in row-major order, which is exactly
-        # the flat `dim` axis the fused kernel indexes -- the reshapes are free. The dense `conv_state`
-        # cache is declared in the kernel's (K - 1, 1, dim) slot layout so it
-        # is read in place; the pooled path hands in its gathered slots flat.
+        # the flat `dim` axis the fused kernel indexes -- the reshapes are
+        # free. The dense `conv_state` cache is declared in the kernel's
+        # (K - 1, 1, dim) slot layout so it is read in place; the pooled path
+        # hands in its gathered slots flat.
         # The kernel wants the weight transposed to [dim, 1, kernel_size].
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
