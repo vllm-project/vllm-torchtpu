@@ -49,6 +49,8 @@ def _load(name: str, path: pathlib.Path):
     return module
 
 
+import bq_utils  # noqa: E402
+
 upload_results = _load("upload_results", _BENCHMARKING / "upload_results.py")
 parse_gke_results = _load(
     "parse_gke_results", _REPO / ".buildkite" / "scripts" / "parse_gke_results.py"
@@ -256,7 +258,9 @@ _GKE_ROW = {
             "total_input_tokens": 655360,
             "total_output_tokens": 655360,
             "duration": 100.0,
-        }
+        },
+        # 1000 / the median, P90 and P99 TPOT of 8, 10 and 12.5 ms.
+        "derived": {"median_intvty": 125.0, "p90_intvty": 100.0, "p99_intvty": 80.0},
     },
     "config": {
         "code_hash": "0123abcd",
@@ -293,3 +297,187 @@ def test_gke_row_carries_the_cell(tmp_path, capsys):
 
     assert ok
     assert rows == [_GKE_ROW]
+
+
+_AGENTX_METRICS = {
+    "request_throughput_avg": 0.25,
+    "request_count_avg": 500.0,
+    "output_token_throughput_avg": 1280.0,
+    "input_token_throughput_avg": 11520.0,
+    "total_token_throughput_avg": 12800.0,
+    "time_to_first_token_avg": 1800.0,
+    "time_to_first_token_p50": 900.0,
+    "time_to_first_token_p90": 3800.0,
+    "time_to_first_token_p99": 25000.0,
+    "inter_token_latency_avg": 20.0,
+    "inter_token_latency_p50": 12.5,
+    "inter_token_latency_p90": 25.0,
+    "inter_token_latency_p99": 80.0,
+    "request_latency_avg": 9000.0,
+    "request_latency_p50": 4000.0,
+    "request_latency_p90": 22000.0,
+    "request_latency_p99": 58000.0,
+    "effective_concurrency_avg": 14.5,
+    "benchmark_duration_avg": 1800.0,
+    "theoretical_prefix_cache_hit_avg": 91.5,
+    "aiperf_version": "0.12.0",
+    "was_cancelled": False,
+    "scenario": "agentx",
+    "submission_valid": True,
+}
+_AGENTX_ROUTING = {"prefix_cache_hit_rate": 0.92, "batch_utilization": 0.5}
+
+
+def test_created_time_sql_converts_an_offset_to_utc():
+    assert (
+        bq_utils.created_time_sql("2026-11-02T09:18:05+08:00")
+        == "TIMESTAMP '2026-11-02T01:18:05Z'"
+    )
+    assert (
+        bq_utils.created_time_sql("2026-11-02T01:18:05")
+        == "TIMESTAMP '2026-11-02T01:18:05Z'"
+    )
+
+
+def test_agentx_helpers_extract_metrics_per_chip_throughput_and_server_routing():
+    artifacts = _DATA / "agentx" / "conc_16" / "aiperf_artifacts"
+    export = json.loads((artifacts / "profile_export_aiperf.json").read_text())
+    server = json.loads((artifacts / "server_metrics_export.json").read_text())
+    chips = bq_utils.physical_chips(prefill_chips=16, decode_chips=16)
+
+    assert chips == 32
+    assert bq_utils.agentx_concurrency(export) == 16
+    assert (
+        bq_utils.created_time_sql(export["end_time"])
+        == "TIMESTAMP '2026-10-28T08:35:19Z'"
+    )
+    assert bq_utils.extract_agentx_metrics(export) == _AGENTX_METRICS
+    assert bq_utils.agentx_derived_metrics(export, chips) == {
+        "num_chips": 32,
+        "output_tput_per_chip": 40.0,
+        "total_tput_per_chip": 400.0,
+        "input_tput_per_chip": 360.0,
+        "median_intvty": 80.0,
+        "p90_intvty": 40.0,
+        "p99_intvty": 12.5,
+    }
+    assert bq_utils.agentx_derived_metrics(export) == {
+        "median_intvty": 80.0,
+        "p90_intvty": 40.0,
+        "p99_intvty": 12.5,
+    }
+    assert bq_utils.server_routing_metrics(server, max_num_seqs=16) == _AGENTX_ROUTING
+
+
+@pytest.mark.parametrize(
+    ("env", "num_chips"),
+    [
+        ({"AGENTX_CHIPS": "8"}, 8),
+        ({"NUM_CHIPS": "4", "AGENTX_CHIPS": "8"}, 4),
+        ({"PREFILL_CHIPS": "16", "DECODE_CHIPS": "8", "NUM_CHIPS": "4"}, 24),
+    ],
+)
+def test_chip_count_falls_back_to_the_launcher_environment(monkeypatch, env, num_chips):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    assert bq_utils.chips_from_env() == num_chips
+
+
+@pytest.mark.parametrize(
+    ("routing_file", "expected"),
+    [
+        # A percentage where a fraction belongs would read as a pass.
+        (
+            {"prefix_cache_hit_rate": 93, "batch_utilization": 0.74},
+            {"batch_utilization": 0.74},
+        ),
+        ({"prefix_cache_hit_rate": "0.93"}, None),
+        ({"prefix_cache_hit_rate": True, "batch_utilization": -0.1}, None),
+        ({"unrelated": 1.0}, None),
+        ([0.93, 0.74], None),
+    ],
+)
+def test_routing_metrics_outside_the_contract_are_left_out(
+    tmp_path, capsys, routing_file, expected
+):
+    shutil.copytree(_DATA / "gke", tmp_path / "gke")
+    (tmp_path / "gke" / "routing_metrics.json").write_text(json.dumps(routing_file))
+
+    ok, (row,) = _parse_gke(capsys, tmp_path / "gke")
+
+    assert ok
+    assert row["metrics"].get("routing") == expected
+
+
+def test_speculative_decoding_acceptance_is_kept_when_the_bench_reports_it(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json", "isl1024_osl8192_c256.json")
+    cell_path = results_dir / "isl1024_osl8192_c256.json"
+    cell = json.loads(cell_path.read_text())
+    cell.update(
+        spec_decode_acceptance_rate=62.5,
+        spec_decode_acceptance_length=2.25,
+        spec_decode_num_drafts=1000,
+        spec_decode_draft_tokens=2000,
+        spec_decode_accepted_tokens=1250,
+    )
+    cell_path.write_text(json.dumps(cell))
+
+    _, (row,) = _upload(monkeypatch, capsys, results_dir)
+
+    assert row["metrics"]["vllm_bench"] == {
+        **_BENCH_METRICS,
+        "spec_decode_acceptance_rate": 62.5,
+        "spec_decode_acceptance_length": 2.25,
+        "spec_decode_num_drafts": 1000,
+        "spec_decode_draft_tokens": 2000,
+        "spec_decode_accepted_tokens": 1250,
+    }
+
+
+def test_gke_row_counts_both_pools_of_the_disaggregated_fleet(
+    tmp_path, monkeypatch, capsys
+):
+    shutil.copytree(_DATA / "gke", tmp_path / "gke")
+    monkeypatch.setenv("PREFILL_CHIPS", "16")
+    monkeypatch.setenv("DECODE_CHIPS", "16")
+    (tmp_path / "gke" / "routing_metrics.json").write_text(
+        json.dumps({"prefix_cache_hit_rate": 0.93, "batch_utilization": 0.74})
+    )
+
+    ok, (row,) = _parse_gke(capsys, tmp_path / "gke")
+
+    assert ok
+    assert row["metrics"] == {
+        "vllm_bench": _GKE_ROW["metrics"]["vllm_bench"],
+        "derived": {
+            # 6400 output and 12800 total tok/s on 16 + 16 chips.
+            "num_chips": 32,
+            "output_tput_per_chip": 200.0,
+            "total_tput_per_chip": 400.0,
+            "input_tput_per_chip": 200.0,
+            "median_intvty": 125.0,
+            "p90_intvty": 100.0,
+            "p99_intvty": 80.0,
+        },
+        "routing": {"prefix_cache_hit_rate": 0.93, "batch_utilization": 0.74},
+    }
+    assert row["config"] == _GKE_ROW["config"]
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"PREFILL_CHIPS": "16"}, {"NUM_CHIPS": "sixteen"}, {"NUM_CHIPS": "-4"}],
+)
+def test_gke_upload_fails_on_a_chip_count_it_cannot_trust(
+    tmp_path, monkeypatch, capsys, env
+):
+    shutil.copytree(_DATA / "gke", tmp_path / "gke")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    ok, rows = _parse_gke(capsys, tmp_path / "gke")
+
+    assert (ok, rows) == (False, [])
