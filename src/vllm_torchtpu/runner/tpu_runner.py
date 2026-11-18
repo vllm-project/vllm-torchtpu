@@ -8961,6 +8961,8 @@ class TPUModelRunner(GPUModelRunner):
                         apply_topk_topp=apply_topk_topp,
                     )
                     synchronize_tensors(out)
+                # The candidate blocks of TPU_SAMPLER_TOPK_CANDIDATES (0: off).
+                blocks = self._topk_candidate_blocks()
                 if blocks and warm_fused:
                     # Fused bonus sampling + rejection over the candidate
                     # blocks (`_sample_spec_verify_chunk`'s non-greedy path).
