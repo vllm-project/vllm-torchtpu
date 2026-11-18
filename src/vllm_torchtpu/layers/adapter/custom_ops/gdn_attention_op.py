@@ -1430,10 +1430,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                             "GDN PCP prefill op was not initialized during model "
                             "loading."
                         )
+                    # The PCP prefill runs main's kernel for every architecture
+                    # (`run_jax_gdn_attention_pcp_tp_prefill`), so it takes
+                    # main's contiguous b and a halves.
                     core_attn_out = gdn_pcp_op(
                         mixed_qkv,
-                        b,
-                        a,
+                        b.contiguous(),
+                        a.contiguous(),
                         conv_state,
                         recurrent_state,
                         self.conv1d.weight,

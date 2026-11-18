@@ -1038,6 +1038,11 @@ class TestVllmGatedDeltaNetAttention:
         core_args = attn.gdn_op.call_args[0]
         assert torch.all(core_args[9] == torch.tensor([3, 1], dtype=torch.int32))
 
+    # The Qwen3.5 MoE architectures hand the other GDN ops chunk views of b and
+    # a; the PCP prefill runs main's kernel, so it still gets contiguous halves.
+    @pytest.mark.parametrize(
+        "architecture", [None, "Qwen3_5MoeForConditionalGeneration"]
+    )
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
@@ -1046,7 +1051,7 @@ class TestVllmGatedDeltaNetAttention:
         return_value=1,
     )
     def test_forward_uses_native_gdn_pcp_op_for_pcp_prefill(
-        self, _mock_rank, mock_get_forward_context
+        self, _mock_rank, mock_get_forward_context, architecture
     ):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 1
@@ -1055,6 +1060,8 @@ class TestVllmGatedDeltaNetAttention:
         attn.tp_size = 1
         attn.prefix = "test_layer"
         attn.gqa_interleaved_layout = True
+        if architecture is not None:
+            attn.model_config = SimpleNamespace(architecture=architecture)
 
         attn.conv1d = MagicMock()
         attn.conv1d.weight = torch.randn(1)
@@ -1120,6 +1127,7 @@ class TestVllmGatedDeltaNetAttention:
         assert core_args[0] is mixed_local
         assert torch.equal(core_args[1], b_local)
         assert torch.equal(core_args[2], a_local)
+        assert core_args[1].is_contiguous() and core_args[2].is_contiguous()
         assert core_args[3] is attn.kv_cache[0]
         assert core_args[4] is attn.kv_cache[1]
         assert core_args[9] is mock_attn_metadata.mamba_state_indices
