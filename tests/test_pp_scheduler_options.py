@@ -21,17 +21,25 @@ lone-prompt and equal-cost chunking; each option turns on one lever.
 
 import itertools
 import math
+import pathlib
 import random
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import yaml
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import additional_config_sections
-from vllm_torchtpu.core import pp_chunk_scheduler, pp_scheduler_options
+from vllm_torchtpu.core import (
+    pp_chunk_scheduler,
+    pp_scheduler_options,
+    scheduler_options,
+)
 from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
 from vllm_torchtpu.core.pp_chunks import StepCostModel, step_limit
+from vllm_torchtpu.models import qwen3_5
 from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PP_SCHEDULER_OPTIONS_SECTION,
@@ -529,12 +537,6 @@ def test_a_waiting_prefix_hit_counts_as_done_only_under_quadratic_cost():
 
 
 def _point_entries():
-    import pathlib
-
-    import yaml
-
-    from vllm_torchtpu.models import qwen3_5
-
     folder = pathlib.Path(qwen3_5.__file__).parent / "validation"
     for path in sorted(folder.glob("p[0-9][0-9]-*.yaml")):
         with path.open() as f:
@@ -542,8 +544,6 @@ def _point_entries():
 
 
 def test_the_prefill_legs_run_what_the_record_jobs_ran():
-    from vllm_torchtpu.core import scheduler_options
-
     seen = []
     for name, entry in _point_entries():
         cfg = SimpleNamespace(
@@ -574,8 +574,6 @@ def test_promotion_ranks_with_the_free_block_fit_and_the_step_time():
     # The head (old, so aged ahead) does not fit the free blocks; a warm
     # request that fits takes the free-block-fit tier and is promoted. Without
     # the fit input the head's aging keeps it first.
-    from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
-
     step_time = 1_000.0
     head = SimpleNamespace(
         request_id="head", num_tokens=10_000, num_preemptions=0, arrival_time=990.0
