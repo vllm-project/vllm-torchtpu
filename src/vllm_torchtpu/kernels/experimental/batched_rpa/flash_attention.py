@@ -177,9 +177,14 @@ def flash_attention_qk_softmax(
     qk = qk.reshape(b, k_heads, tq, s)
 
     if folded_scale is None:
+    if native_qk:
+        # Native QK: the static factors (and the q row scales) scale the
+        # [TQ, S] f32 tile in one multiply; a per-token k_scale is only
+        # [B, KV, 1, S].
         scale = float(cfgs.model.sm_scale)
         if isinstance(k_scale, (int, float)):
             scale *= float(k_scale)
+        elif k_scale is not None and row_scale is None:
             k_scale = k_scale * scale
             scale = 1.0
         if row_scale is not None:
