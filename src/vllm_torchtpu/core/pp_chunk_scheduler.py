@@ -164,6 +164,9 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        # The trimmed token-id resend of the prefix-aware admission, until a
+        # trim fails.
+        self._trim_resend = True
         kv_transfer_config = self.vllm_config.kv_transfer_config
         self._is_kv_producer = (
             kv_transfer_config is not None
@@ -237,7 +240,7 @@ class TpuPipelineChunkScheduler(Scheduler):
     def _quad_cost(self, tokens: int, prefix: int) -> float:
         """Quadratic FLOPs-equivalent token cost under the step cost model
         (option quadratic_cost); the token count otherwise."""
-        if self._cost is not None and getattr(self, "_quadratic_cost", False):
+        if self._cost is not None and self._quadratic_cost:
             return self._cost.effective_tokens(tokens, prefix)
         return float(max(tokens, 0))
 
@@ -303,7 +306,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         aging = 0.0
         if rate > 0:
             aging = rate * _wait_seconds(request, time.time() if now is None else now)
-        if getattr(self, "_is_kv_consumer", False):
+        if self._is_kv_consumer:
             tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
             return (tier, hbm_eff_cost - aging, request.arrival_time), local_warmth
         if (
@@ -345,10 +348,8 @@ class TpuPipelineChunkScheduler(Scheduler):
 
     def _make_cached_request_data(self, *args, **kwargs):
         cached = super()._make_cached_request_data(*args, **kwargs)
-        if not getattr(self, "_prefix_aware", False):
+        if not self._prefix_aware:
             return cached
-        if getattr(self, "_trim_resend", None) is None:
-            self._trim_resend = True
         if self._trim_resend and getattr(cached, "all_token_ids", None):
             try:
                 trim_resend_token_ids(cached)
@@ -362,13 +363,13 @@ class TpuPipelineChunkScheduler(Scheduler):
     def _get_local_prefix_cache_hit(
         self, request: Any, max_cache_hit_length: int | None = None
     ) -> tuple["KVCacheBlocks", int, int, bool]:
-        if not getattr(self, "_prefix_aware", False):
+        if not self._prefix_aware:
             return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         hit = memo_local_prefix_cache_hit(self, request, max_cache_hit_length)
         if hit is not None:
             request._tpu_local_hit_tokens = hit[1]
             return hit
-        connector = getattr(self, "connector", None)
+        connector = self.connector
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
             super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         )
@@ -473,8 +474,8 @@ class TpuPipelineChunkScheduler(Scheduler):
         return result
 
     def schedule(self, throttle_prefills: bool = False):
-        prefix_aware = getattr(self, "_prefix_aware", False)
-        connector = getattr(self, "connector", None)
+        prefix_aware = self._prefix_aware
+        connector = self.connector
         poll = getattr(connector, "poll_and_complete_transfers", None)
         if prefix_aware and callable(poll):
             # Completed async loads promote their requests this step.
@@ -491,18 +492,18 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._retention_failed()
             else:
                 self._retention.begin_step()
-        if getattr(self, "_memo_xstep", False):
+        if self._memo_xstep:
             self._memo_trim_log()
         now_wall = time.time()
         self._step_wall_time = now_wall
-        if getattr(self, "_srpf_running", False) and len(self.running) > 1:
+        if self._srpf_running and len(self.running) > 1:
             decoding = [r for r in self.running if _is_decoding(r)]
             prefilling = [r for r in self.running if not _is_decoding(r)]
             if len(prefilling) > 1:
                 prefilling.sort(key=lambda r: self._aged_prefill_key(r, now_wall))
             if prefilling and (decoding or len(prefilling) > 1):
                 self.running[:] = decoding + prefilling
-        if getattr(self, "_paw_sort", False):
+        if self._paw_sort:
             try:
                 self._sort_waiting_queue()
             except Exception:
@@ -511,7 +512,7 @@ class TpuPipelineChunkScheduler(Scheduler):
                     "the sort off."
                 )
                 self._paw_sort = False
-        if getattr(self, "_promote_waiting", False):
+        if self._promote_waiting:
             try:
                 self._select_waiting_queue_for_scheduling()
             except Exception:
@@ -564,14 +565,9 @@ class TpuPipelineChunkScheduler(Scheduler):
         """Prompt tokens of a waiting request that need no prefill: its
         computed tokens, or under quadratic_cost its prefix hit."""
         computed = int(getattr(request, "num_computed_tokens", 0) or 0)
-        if (
-            computed > 0
-            or self._cost is None
-            or not getattr(self, "_quadratic_cost", False)
-        ):
+        if computed > 0 or self._cost is None or not self._quadratic_cost:
             return computed
-        kvm = getattr(self, "kv_cache_manager", None)
-        if not getattr(kvm, "enable_caching", False):
+        if not self.kv_cache_manager.enable_caching:
             return 0
         local_warmth = self._prefix_warmth(request)
         ext_warmth = self._external_warmth(request, local_warmth)
@@ -592,7 +588,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         granularity = self._granularity
         if not self._lone_prompt or granularity is None:
             return None
-        quadratic = getattr(self, "_quadratic_cost", False)
+        quadratic = self._quadratic_cost
         pending = 0
         pending_pairs = 0.0
         for request in self.running:

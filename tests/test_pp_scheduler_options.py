@@ -94,7 +94,16 @@ def _sched(cost=None, running=(), waiting=(), **attrs) -> TpuPipelineChunkSchedu
     s._waits = 0
     s._retention = None
     s._hit_estimator = None
-    s.kv_cache_manager = SimpleNamespace()
+    s.kv_cache_manager = SimpleNamespace(enable_caching=False)
+    s.connector = None
+    s._is_kv_consumer = False
+    s._quadratic_cost = False
+    s._prefix_aware = False
+    s._srpf_running = False
+    s._paw_sort = False
+    s._promote_waiting = False
+    s._memo_xstep = False
+    s._trim_resend = True
     for k, v in attrs.items():
         setattr(s, k, v)
     return s
