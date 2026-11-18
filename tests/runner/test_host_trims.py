@@ -311,6 +311,7 @@ def _get_finished(monkeypatch, every, samples=((), ())):
     runner = types.SimpleNamespace(
         _stage_timing=types.SimpleNamespace(take_samples=lambda: samples),
         kv_cache_config=types.SimpleNamespace(kv_cache_groups=[1]),
+        _conn_stats_step=0,
     )
     so = types.SimpleNamespace(finished_req_ids=set())
     outs = [

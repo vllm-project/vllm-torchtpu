@@ -1523,6 +1523,9 @@ class TPUModelRunner(GPUModelRunner):
         self._stage_timing = RunnerStageTiming(profiler_rank, enabled=stage_timing)
         # The batch-1 host trims and the process-wide tpu_runner settings.
         host_trims.configure(self.vllm_config)
+        # Steps since the KV connector's stats were last polled under the
+        # batch-1 rule (`get_finished_kv_transfers`).
+        self._conn_stats_step = 0
 
     @staticmethod
     def _stage_timing_enabled(
@@ -1711,9 +1714,8 @@ class TPUModelRunner(GPUModelRunner):
             # steps. Samples accumulate in the connector until the next poll,
             # so the totals the scheduler sees are unchanged; only their
             # cadence is.
-            n = self.__dict__.get("_conn_stats_step", 0) + 1
-            self.__dict__["_conn_stats_step"] = n
-            stats_due = n % host_trims.CONN_STATS_EVERY == 0
+            self._conn_stats_step += 1
+            stats_due = self._conn_stats_step % host_trims.CONN_STATS_EVERY == 0
             kv_connector_stats = (
                 kv_connector.get_kv_connector_stats() if stats_due else None
             )
