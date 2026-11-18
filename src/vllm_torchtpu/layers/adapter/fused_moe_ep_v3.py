@@ -498,6 +498,27 @@ def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
     logger.info_once("MoE kernels: %s.", rule)
 
 
+def sequence_parallel_threshold_unset(layer) -> bool:
+    """Whether this kernel would take ``layer``'s sequence-parallel steps under
+    tensor parallelism while the layout's sequence-parallel row threshold
+    (``sequence_parallel.min_rows``) is still 0.
+
+    The first sequence-parallel bucket is then one row, below every layout's
+    step gate, so the few-token kernel cannot meet this one there
+    (``check_kernel_threshold``) and must stay off; the threshold is 0 until
+    the model follows each step's form. The checks are the ones
+    ``prebuild_fused_moe_ep`` makes before it calls ``check_kernel_threshold``.
+    """
+    if not (envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"):
+        return False
+    if _pcp_size(layer) > 1 or _tensor_parallel_size() <= 1:
+        return False
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+    layer_is_sp = bool(getattr(layer.moe_config, "is_sequence_parallel", False))
+    return _sp.enabled() and layer_is_sp and _sp.min_rows() == 0
+
+
 def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) -> None:
     """Resolve the mesh and register the fused-EP op, once per process.
 
