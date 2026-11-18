@@ -289,12 +289,12 @@ def _verify_md(
 
 
 def _run_sample_tokens(runner: SimpleNamespace, grammar_output: object = None):
-    def host_copy(chunks, lengths, spec_logprobs=None):
+    def host_copy(chunks, lengths, **kwargs):
         return AsyncTPUCopyState(
             chunks_cpu=[c.detach().cpu() for c in chunks],
             chunk_real_lens=list(lengths),
             copy_ready_event=MagicMock(),
-            spec_logprobs=spec_logprobs,
+            **kwargs,
         )
 
     with (
