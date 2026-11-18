@@ -3296,6 +3296,72 @@ def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance
     assert torch.equal(torch.stack(steps, dim=1), stacked[:, 1:])
 
 
+@pytest.mark.parametrize("hidden_rows", [4, 8])
+@pytest.mark.parametrize("max_p", [0, 8])
+def test_post_step0_carries_keep_the_gathered_rows(hidden_rows, max_p):
+    """With the step-0 post-attention gather the step-0 forward already holds
+    each request's row in order, so neither helper gathers again
+    (step0_post_attn_gathered=True). _draft_gather_carries keeps the first p
+    rows. The fused bridge keeps the forward's rows whole while the fused loop
+    pads its carries to max_p (the loop slices them to p itself), else the
+    first p rows; the loop's step-0 token is the same either way."""
+    from vllm_torchtpu.spec_decode.mtp_fused_loop import _MtpFusedLoop
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_greedy_head_owner = None
+    proposer._mtp_fused_loop_max_p = max_p
+    hidden = torch.arange(hidden_rows * 4, dtype=torch.float32).reshape(hidden_rows, 4)
+    last_hidden = hidden + 100
+    positions = torch.arange(30, 30 + 3 * 8, dtype=torch.int32).reshape(3, 8)
+    idx = torch.tensor([2, 4, 5, 5], dtype=torch.int64)
+    base_seq_lens = torch.tensor([13, 22, 0, 0], dtype=torch.int32)
+    rejected = torch.tensor([1, 0, 0, 0], dtype=torch.int32)
+    p = idx.shape[0]
+
+    gather = Eagle3Proposer._draft_gather_carries.__wrapped__.__wrapped__
+    h, pos, lh = gather(proposer, hidden, positions, hidden, idx, True)
+    assert torch.equal(h, hidden[:p])
+    assert lh is h
+    assert torch.equal(pos, positions[:, idx])
+    _, _, lh = gather(proposer, hidden, positions, last_hidden, idx, True)
+    assert torch.equal(lh, last_hidden[:p])
+
+    bridge = Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__
+    carry, pos1, seq1 = bridge(
+        proposer, hidden, positions, idx, base_seq_lens, rejected, True
+    )
+    keep_all = hidden_rows == p or max_p > 0
+    assert torch.equal(carry, hidden if keep_all else hidden[:p])
+    assert torch.equal(pos1, positions[:, idx] + 1)
+    assert torch.equal(seq1, base_seq_lens + 1 - rejected)
+
+    class _DummyMtp(torch.nn.Module):
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            spec_step_idx=0,
+        ):
+            return hidden_states + 1.0
+
+        def compute_logits(self, h):
+            return h
+
+    loop = _MtpFusedLoop(
+        vllm_config=SimpleNamespace(),
+        prefix="mtp_fused_loop_k3",
+        mtp=_DummyMtp(),
+        num_steps=2,
+        propose_step0=True,
+    )
+    stacked = loop(None, pos1.clone(), carry.clone(), seq1.clone())
+    assert stacked.shape == (p, 3)
+    assert torch.equal(stacked[:, 0], hidden[:p].argmax(dim=-1).to(torch.int32))
+
+
 @pytest.mark.tpu_test
 def test_prepare_draft_inputs_device_seed_pure_partial_prefill_uses_bucketed_fast_path(
     device, monkeypatch
@@ -3561,6 +3627,111 @@ def test_prepare_draft_inputs_emits_padded_step0_gather_indices_cpu(
     _check_prep_emits_padded_step0_gather_indices(
         proposer, torch.device("cpu"), seed_source, pad_len
     )
+
+
+@pytest.mark.parametrize("step0_pad_len", [0, 8])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_draft_async_prepare_inputs_emits_step1_inputs(step0_pad_len, mrope):
+    """Given the step's positions and seq_lens, the async prep also returns
+    step 1's positions and seq_lens for the fused loop (each request's seed
+    position + 1, and seq_lens + 1 - rejected drafts), and with a step-0 pad
+    length the step-0 gather indices padded by repeating the last one."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    invalid = -1
+    next_tokens = torch.tensor(
+        [[11, 12, invalid, invalid], [21, invalid, invalid, invalid]],
+        dtype=torch.int32,
+    )
+    draft_lengths = torch.tensor([3, 3], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32)
+    pad_req_idx = torch.tensor([0, 1, 1, 1], dtype=torch.int64)
+    flat = torch.arange(100, 108, dtype=torch.int32)
+    positions = torch.stack([flat, flat + 10, flat + 20]) if mrope else flat
+    base_seq_lens = torch.tensor([40, 50], dtype=torch.int32)
+
+    out = Eagle3Proposer._draft_async_prepare_inputs.__wrapped__.__wrapped__(
+        proposer,
+        torch.arange(8, dtype=torch.int32),
+        next_tokens,
+        draft_lengths,
+        query_start_loc,
+        pad_req_idx,
+        None,
+        step0_pad_len,
+        positions,
+        base_seq_lens,
+    )
+
+    # Request 0 accepted one of three drafts (seed at token 4 - 1 - 2 = 1),
+    # request 1 none (seed at 8 - 1 - 3 = 4); the padded rows repeat request 1.
+    seeds = torch.tensor([1, 4, 4, 4])
+    pos_step1, seq_lens_step1 = out[-2], out[-1]
+    want_pos = (positions[:, seeds] if mrope else positions[seeds]) + 1
+    assert torch.equal(pos_step1, want_pos)
+    assert seq_lens_step1.tolist() == [40 + 1 - 2, 50 + 1 - 3]
+    if step0_pad_len:
+        assert out[-3].tolist() == [1, 4, 4, 4, 4, 4, 4, 4]
+
+
+@pytest.mark.parametrize("step0_pad_len", [0, 16])
+def test_prepare_draft_inputs_hands_step1_inputs_to_the_fused_loop(step0_pad_len):
+    """Asked for them (`_prep_step1_inputs`), the async prep leaves step 1's
+    positions and seq_lens for propose (`_last_prep_step1`) and, with a step-0
+    pad length, the padded step-0 gather indices. The compiled prep (TPU
+    backend) runs its eager body."""
+    import functools
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_async_prepare_inputs = functools.partial(
+        Eagle3Proposer._draft_async_prepare_inputs.__wrapped__.__wrapped__, proposer
+    )
+    proposer.runner = _staged_runner(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=torch.device("cpu"),
+        requests={},
+        num_tokens_paddings=[16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    seq_lens = torch.tensor([40, 50], dtype=torch.int32)
+    chunk = _make_chunk(
+        input_ids=torch.arange(8, dtype=torch.int32),
+        position_ids=torch.arange(100, 108, dtype=torch.int32),
+        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        device=torch.device("cpu"),
+        draft_lengths=torch.tensor([3, 3], dtype=torch.int32),
+        attn_ctx=SimpleNamespace(
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+            seq_lens=seq_lens,
+        ),
+    )
+    proposer._step0_pad_len = step0_pad_len
+    proposer._prep_step1_inputs = True
+    proposer._last_step0_gather_indices = None
+    proposer._last_prep_step1 = None
+
+    proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(
+            num_scheduled_tokens={}, scheduled_spec_decode_tokens={}
+        ),
+        next_tokens_device=torch.tensor(
+            [[91, 92, 201, -1], [202, -1, -1, -1]], dtype=torch.int32
+        ),
+    )
+
+    assert proposer._last_prep_step1 is not None
+    pos_step1, seq_lens_step1 = proposer._last_prep_step1
+    # Request 0 accepted two of three drafts (seed at 4 - 1 - 1 = 2), request
+    # 1 none (seed at 8 - 1 - 3 = 4); the loop bucket's 16 rows repeat it.
+    assert pos_step1.tolist() == [103, 105] + [105] * 14
+    assert seq_lens_step1.tolist() == [40 + 1 - 1, 50 + 1 - 3]
+    if step0_pad_len:
+        assert proposer._last_step0_gather_indices.tolist() == [2] + [4] * 15
 
 
 def test_propose_takes_step0_gather_indices_from_the_prep():
