@@ -173,13 +173,14 @@ def test_fp32_rotation_is_closer_to_fp64_than_upstream_bf16_path():
     assert err_tpu < err_upstream
 
 
-def test_apply_rotary_emb_instance_forward_is_fp32():
+@pytest.mark.parametrize("head_size", [HEAD, 72])
+def test_apply_rotary_emb_instance_forward_is_fp32(head_size: int):
     emb = ApplyRotaryEmb(is_neox_style=True)
     assert type(emb) is tpu_rope.TpuApplyRotaryEmb
     g = torch.Generator().manual_seed(2)
-    x = torch.randn(1, 16, 4, HEAD, generator=g).to(torch.bfloat16)
-    cos = torch.randn(16, HEAD // 2, generator=g).to(torch.bfloat16)
-    sin = torch.randn(16, HEAD // 2, generator=g).to(torch.bfloat16)
+    x = torch.randn(1, 16, 4, head_size, generator=g).to(torch.bfloat16)
+    cos = torch.randn(16, head_size // 2, generator=g).to(torch.bfloat16)
+    sin = torch.randn(16, head_size // 2, generator=g).to(torch.bfloat16)
     ref = ApplyRotaryEmb.forward_static(x, cos, sin, True, enable_fp32_compute=True)
     torch.testing.assert_close(emb(x, cos, sin), ref, rtol=0, atol=0)
     torch.testing.assert_close(emb.forward_native(x, cos, sin), ref, rtol=0, atol=0)

@@ -75,12 +75,44 @@ class TpuApplyRotaryEmb(ApplyRotaryEmb):
             **kwargs,
         )
 
+    def forward_native(  # pyrefly: ignore[bad-override]
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.is_neox_style:
+            return super().forward_native(x, cos, sin)
+        return _rotate_neox_fp32(x, cos, sin)
+
     def forward_oot(  # pyrefly: ignore[bad-override]
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
         return self.forward_native(x, cos, sin)
 
     forward_tpu = forward_oot  # pyrefly: ignore[bad-override]
+
+
+def _rotate_neox_fp32(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """``ApplyRotaryEmb.forward_static`` (NeoX, FP32) over whole heads.
+
+    ``x * [cos, cos] + roll(x, half) * [-sin, sin]`` is upstream's
+    ``cat(x1 * cos - x2 * sin, x2 * cos + x1 * sin)`` bit for bit, without its
+    half-width tensors: on TPU those make XLA lay the rotation out tokens-minor,
+    which costs a transpose into and out of it in every layer.
+
+    Args:
+        x: ``[..., seq, heads, 2 * half]``.
+        cos: ``[seq, half]``.
+        sin: ``[seq, half]``.
+    """
+    half = cos.shape[-1]
+    cos = cos.unsqueeze(-2).float()
+    sin = sin.unsqueeze(-2).float()
+    x32 = x.float()
+    rotated = x32 * torch.cat((cos, cos), dim=-1) + torch.roll(
+        x32, half, dims=-1
+    ) * torch.cat((-sin, sin), dim=-1)
+    return rotated.to(x.dtype)
 
 
 def _maybe_compact_neox_rope_cache(self: RotaryEmbedding) -> None:
