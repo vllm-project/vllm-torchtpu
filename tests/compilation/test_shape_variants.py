@@ -129,6 +129,22 @@ class FlatModel(nn.Module):
         return WAVE(x)
 
 
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class ReplicaModel(nn.Module):
+    """Large buckets also read a second weight, as a sequence-parallel
+    variant reads its weight replica."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(HIDDEN), requires_grad=False)
+        self.replica = nn.Parameter(torch.ones(3, HIDDEN), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] >= 2048:
+            return WAVE(x * self.replica.sum(0) + self.weight)
+        return WAVE(x * self.weight)
+
+
 @dataclasses.dataclass
 class FakeExecutable:
     """Picklable stand-in for torch_tpu's compiled executable.
@@ -142,6 +158,7 @@ class FakeExecutable:
 
     def __call__(self, *args):
         CALLS.append((self.rows, self.waves))
+        ARGS.append(sorted(tuple(a.shape) for a in args if isinstance(a, torch.Tensor)))
         return (torch.zeros(self.rows, HIDDEN),)
 
     def serialize(self):
@@ -156,6 +173,7 @@ class FakeExecutable:
 
 
 CALLS: list[tuple[int, int]] = []
+ARGS: list[list[tuple[int, ...]]] = []  # tensor input shapes per call
 
 
 class FakeTpuBackend:
@@ -431,6 +449,28 @@ def _three_tiers_keep_their_structure(cache_root):
 def test_three_tiers_each_keep_their_own_structure(tmp_path):
     """A graph that over-claimed a bucket would serve it the wrong rows."""
     in_child(partial(_three_tiers_keep_their_structure, str(tmp_path)))
+
+
+def _superset_trace_serves_handed_buckets(cache_root):
+    config, backend = prepare(cache_root)
+    model = build(ReplicaModel, config)
+    assert warm(model, config) == 1
+    assert backend.compiled == [(16, 1), (2048, 1), (4096, 1)]
+
+    # The live graph also takes the replica; the bucket handed to it from the
+    # first trace still gets exactly that trace's inputs.
+    ARGS.clear()
+    for num_tokens in BUCKETS:
+        assert run(model, config, num_tokens).shape[0] == num_tokens
+    assert ARGS == [
+        [(HIDDEN,), (16, HIDDEN)],
+        [(3, HIDDEN), (HIDDEN,), (2048, HIDDEN)],
+        [(3, HIDDEN), (HIDDEN,), (4096, HIDDEN)],
+    ]
+
+
+def test_trace_with_more_weights_serves_handed_buckets(tmp_path):
+    in_child(partial(_superset_trace_serves_handed_buckets, str(tmp_path)))
 
 
 def _split_graph_is_refused(cache_root):

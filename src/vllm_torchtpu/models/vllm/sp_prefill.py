@@ -15,29 +15,32 @@
 
 A TP prefill all-reduces the [tokens, hidden] activation twice per layer, about
 half its device time on v7x-8. Here each TP rank runs the dense layers on its
-1/tp of the rows with every rank's weight shard, and the ranks exchange only
-around attention: one all-to-all gives each rank its own head group for all
-rows, which is exactly the TP attention input, so the attention kernel, its
-metadata and the head-sharded KV pools stay as they are; a second all-to-all
-returns the output rows to their owners. That moves 9x fewer bytes per layer
-than the two all-reduces, at the price of (tp - 1) / tp more dense weight HBM
-per rank, which comes out of the KV cache.
+1/tp of the rows with every rank's weight shard -- its own, plus a replica of
+the others' -- and the ranks exchange only around attention: one all-to-all
+gives each rank its own head group for all rows, which is exactly the TP
+attention input, so the attention kernel, its metadata and the head-sharded KV
+pools stay as they are; a second all-to-all returns the output rows to their
+owners. That moves 9x fewer bytes per layer than the two all-reduces, at the
+price of the replica, (tp - 1) times the dense weight shard per rank, which
+comes out of the KV cache.
 
 Opt in with ``TPU_SP_PREFILL_MIN_TOKENS``: token buckets at or above it run this
 way and smaller ones (decode, short prompts) keep the TP graph, since streaming
 the full weights once costs more than the all-reduces of a short step. The
 choice is a branch on the token count, so each bucket compiles one of the two
-graphs (see ``vllm_torchtpu.compilation.shape_variants``).
+graphs (see ``vllm_torchtpu.compilation.shape_variants``). The TP graph's
+inputs are a subset of this one's, which is what lets the two share one live
+graph.
 """
 
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.collectives import all_to_all
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -140,16 +143,24 @@ class SequenceParallelPrefill(nn.Module):
                 "TPU_SP_PREFILL_MIN_TOKENS does not return auxiliary hidden states."
             )
         self.min_tokens = min_tokens
+        rank = self.group.rank_in_group
+        others = [r for r in range(self.world) if r != rank]
         device = backbone.norm.weight.device
-        # A device tensor, not a Python int: every rank must compile the same
+
+        def index(values: list[int]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.int32, device=device)
+
+        # Device tensors, not Python ints: every rank must compile the same
         # program, or torch_tpu pairs their collectives wrongly.
-        self.register_buffer(
-            "rank",
-            torch.tensor([self.group.rank_in_group], dtype=torch.int32, device=device),
-            persistent=False,
-        )
+        self.register_buffer("rank", index([rank]), persistent=False)
+        self.register_buffer("others", index(others), persistent=False)
+        # Where destination rank d's block sits in [own, *others].
+        send_order = [
+            0 if d == rank else 1 + others.index(d) for d in range(self.world)
+        ]
+        self.register_buffer("send_order", index(send_order), persistent=False)
         self.layers = nn.ModuleList(
-            _DenseReplica(layer, self.world) for layer in backbone.layers
+            _OtherShards(layer, others) for layer in backbone.layers
         )
 
     def serves(self, num_tokens: int) -> bool:
@@ -185,64 +196,88 @@ class SequenceParallelPrefill(nn.Module):
     def _layer(
         self,
         layer: nn.Module,
-        replica: "_DenseReplica",
+        replica: "_OtherShards",
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Mirrors Qwen3DecoderLayer.forward and Qwen3Attention.forward, with the
-        # projections on the replica and the reshards around attention.
+        # Mirrors Qwen3DecoderLayer.forward and Qwen3Attention.forward, with
+        # every rank's projections and the reshards around attention.
         if residual is None:
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
         else:
             hidden_states, residual = layer.input_layernorm(hidden_states, residual)
-        attn = layer.self_attn
-        qkv = self._rows_to_heads(F.linear(hidden_states, replica.qkv))
+        attn, mlp = layer.self_attn, layer.mlp
+        qkv = self._rows_to_heads(*_column(attn.qkv_proj, replica.qkv, hidden_states))
         q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // attn.head_dim, attn.head_dim)
         q = attn.q_norm(q_by_head).view(q.shape)
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // attn.head_dim, attn.head_dim)
         k = attn.k_norm(k_by_head).view(k.shape)
         q, k = attn.rotary_emb(positions, q, k)
-        hidden_states = F.linear(self._heads_to_rows(attn.attn(q, k, v)), replica.o)
+        hidden_states = _row(
+            attn.o_proj, replica.o, *self._heads_to_rows(attn.attn(q, k, v))
+        )
         hidden_states, residual = layer.post_attention_layernorm(
             hidden_states, residual
         )
-        hidden_states = layer.mlp.act_fn(F.linear(hidden_states, replica.gate_up))
-        return F.linear(hidden_states, replica.down), residual
+        # The MLP pairs each rank's gate-up block with its down block, in the
+        # [own, *others] order they come in; no exchange, so no reordering.
+        own, rest = _column(mlp.gate_up_proj, replica.gate_up, hidden_states)
+        hidden_states = _row(
+            mlp.down_proj, replica.down, mlp.act_fn(own), mlp.act_fn(rest)
+        )
+        return hidden_states, residual
 
     def _own_rows(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's block of the token rows."""
         return x.unflatten(0, (self.world, -1)).index_select(0, self.rank)[0]
 
-    def _rows_to_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """[rows / tp, tp * width] -> [rows, width]: rank d gets head group d."""
-        blocks = x.unflatten(-1, (self.world, -1)).transpose(0, 1)
+    def _rows_to_heads(self, own: torch.Tensor, rest: torch.Tensor) -> torch.Tensor:
+        """Head groups of this rank's rows -> this rank's head group of all rows."""
+        blocks = torch.cat([own[None], rest]).index_select(0, self.send_order)
         return all_to_all(blocks, self.group).flatten(0, 1)
 
-    def _heads_to_rows(self, x: torch.Tensor) -> torch.Tensor:
-        """[rows, width] -> [rows / tp, tp * width]: rank d gets row block d."""
+    def _heads_to_rows(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """This rank's head group of all rows -> every head group of its rows,
+        as (own group, the others')."""
         blocks = all_to_all(x.unflatten(0, (self.world, -1)), self.group)
-        return blocks.transpose(0, 1).flatten(1)
+        return blocks.index_select(0, self.rank)[0], blocks.index_select(0, self.others)
 
 
-class _DenseReplica(nn.Module):
-    """Every TP rank's shard of one decoder layer's projections.
+def _in_out(linear: nn.Module) -> torch.Tensor:
+    """A linear's own weight shard as [in, out]; the TPU linear method keeps
+    most weights flipped that way."""
+    weight = linear.weight
+    return weight if getattr(linear, WEIGHT_FLIPPED_ATTR, False) else weight.t()
 
-    Column-parallel weights stack the shards along the output rows, so the
-    output columns come rank by rank, as ``_rows_to_heads`` splits them;
-    row-parallel weights stack them along the input columns, as
-    ``_heads_to_rows`` and the gate-up activation concatenate them.
-    """
 
-    def __init__(self, layer: nn.Module, world: int) -> None:
+def _column(
+    linear: nn.Module, rest: torch.Tensor, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A column-parallel projection: [rows, out] own, [tp - 1, rows, out] rest."""
+    return torch.matmul(x, _in_out(linear)), torch.matmul(x, rest)
+
+
+def _row(
+    linear: nn.Module, rest: torch.Tensor, x_own: torch.Tensor, x_rest: torch.Tensor
+) -> torch.Tensor:
+    """A row-parallel projection of every rank's input block, summed."""
+    rest_out = torch.matmul(x_rest.transpose(0, 1).flatten(1), rest.flatten(0, 1))
+    return torch.matmul(x_own, _in_out(linear)) + rest_out
+
+
+class _OtherShards(nn.Module):
+    """The other TP ranks' shards of one decoder layer's projections, stacked
+    in rank order as [tp - 1, in, out]."""
+
+    def __init__(self, layer: nn.Module, others: list[int]) -> None:
         super().__init__()
         from vllm.distributed import tensor_model_parallel_all_gather
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
-        attn, mlp = layer.self_attn, layer.mlp
-        for linear in (attn.qkv_proj, attn.o_proj, mlp.gate_up_proj, mlp.down_proj):
+        def gather(linear: nn.Module) -> torch.Tensor:
             if linear.bias is not None or not isinstance(
                 linear.quant_method, UnquantizedLinearMethod
             ):
@@ -250,15 +285,15 @@ class _DenseReplica(nn.Module):
                     "TPU_SP_PREFILL_MIN_TOKENS supports unquantized projections "
                     f"without bias, not {linear.prefix}."
                 )
+            shard = _in_out(linear).data.contiguous()
+            every = tensor_model_parallel_all_gather(shard[None], dim=0)
+            return every[others].contiguous()
 
-        def gather(weight: torch.Tensor, dim: int) -> torch.Tensor:
-            return tensor_model_parallel_all_gather(weight.data, dim=dim)
-
-        # Each rank's gate-up rows are [gate; up]; regroup them as all gates,
-        # then all ups, for the activation that splits its input in halves.
-        gate_up = gather(mlp.gate_up_proj.weight, 0)
-        gate_up = gate_up.unflatten(0, (world, 2, -1)).transpose(0, 1).flatten(0, 2)
-        self.register_buffer("qkv", gather(attn.qkv_proj.weight, 0), persistent=False)
-        self.register_buffer("o", gather(attn.o_proj.weight, 1), persistent=False)
-        self.register_buffer("gate_up", gate_up.contiguous(), persistent=False)
-        self.register_buffer("down", gather(mlp.down_proj.weight, 1), persistent=False)
+        attn, mlp = layer.self_attn, layer.mlp
+        for name, linear in (
+            ("qkv", attn.qkv_proj),
+            ("o", attn.o_proj),
+            ("gate_up", mlp.gate_up_proj),
+            ("down", mlp.down_proj),
+        ):
+            self.register_buffer(name, gather(linear), persistent=False)

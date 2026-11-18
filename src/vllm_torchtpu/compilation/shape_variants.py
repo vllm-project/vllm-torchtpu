@@ -168,6 +168,55 @@ def _signature(graph: fx.GraphModule) -> tuple:
     return tuple(shape(value) for value in _placeholder_values(graph))
 
 
+def _inputs(graph: fx.GraphModule) -> tuple:
+    """Every placeholder as (module-state name or None, signature).
+
+    A variant that uses more of the model's weights than another -- say a
+    replica for a sequence-parallel bucket -- lifts more parameters and
+    buffers, which Dynamo names by their module path. Those are the only
+    inputs one trace may have and another lack; everything else (activations,
+    sizes) must line up one to one.
+    """
+
+    def entry(node: fx.Node) -> tuple:
+        value = _placeholder_value(node)
+        if isinstance(value, torch.Tensor):
+            dims = tuple(
+                "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
+            )
+            signature: Any = (str(value.dtype), dims)
+        else:
+            signature = type(value).__name__
+        state = node.name.lower().startswith(_MODULE_STATE)
+        return (node.name if state else None, signature)
+
+    return tuple(entry(n) for n in graph.graph.nodes if n.op == "placeholder")
+
+
+# Dynamo names a lifted parameter or buffer after its path from the traced
+# module, ``L['self']``: ``l_self_modules_<child>_..._parameters_<name>_``.
+_MODULE_STATE = "l_self_"
+
+
+def _pick_inputs(handed: tuple, live: tuple) -> tuple[int, ...] | None:
+    """Indices of the live graph's inputs that make up a handed graph's, or
+    None when the handed graph needs something the live one does not have."""
+    by_name = {name: i for i, (name, _) in enumerate(live) if name is not None}
+    others = [i for i, (name, _) in enumerate(live) if name is None]
+    picks, next_other = [], 0
+    for name, signature in handed:
+        if name is not None:
+            index = by_name.get(name)
+        elif next_other < len(others):
+            index, next_other = others[next_other], next_other + 1
+        else:
+            return None
+        if index is None or live[index][1] != signature:
+            return None
+        picks.append(index)
+    return tuple(picks) if next_other == len(others) else None
+
+
 def graph_signature(graph: fx.GraphModule) -> tuple:
     """:func:`_signature`, for callers outside this module.
 
@@ -206,16 +255,22 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
+        runnable, inputs = found
+        live = _inputs(graph)
+        if inputs == live:
+            return runnable
+        picks = _pick_inputs(inputs, live)
+        if picks is None:
             raise ShapeSpecializationError(
                 f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+                f"inputs differ ({[sig for _, sig in inputs]} vs "
+                f"{[sig for _, sig in live]}). "
+                "Only module weights may differ, as a superset in the live "
+                "graph. If the graph is split, its subgraph boundaries move "
+                "with the specialization and a bucket cannot be handed between "
+                "traces; unset TPU_KERNEL_ITER_MODE to serve this model."
             )
-        return runnable
+        return lambda *args: runnable(*[args[i] for i in picks])
 
     def put(
         self,
@@ -224,7 +279,7 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (runnable, _inputs(graph))
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
