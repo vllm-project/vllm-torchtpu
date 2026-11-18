@@ -21,7 +21,6 @@ import math
 from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from math import log2
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -169,7 +168,7 @@ class CollectiveSummary(TypedDict):
     group_size: int
     bytes: int
     latency_us: float
-    hop_latency_us: float
+    mean_latency_us: float
     n: int
 
 
@@ -652,14 +651,16 @@ def _collect_stream_gaps_and_collectives(
         return gaps, collectives
 
     trimmed = ordered[1:] if len(ordered) >= MIN_EVENTS_FOR_WARMUP_DROP else ordered
-    return _scan_event_window(trimmed)
+    # No step window: the gaps between device events are not launch gaps.
+    _, collectives = _scan_event_window(trimmed)
+    return [], collectives
 
 
 def _summarize_collectives(
     collectives: Sequence[_ComputeEvent],
     default_group_size: int | None = None,
 ) -> list[CollectiveSummary]:
-    """Group collective events by `(op, group_size, bytes)` and compute medians."""
+    """Group collectives by `(op, group_size, bytes)` and compute medians and means."""
     buckets: dict[tuple[str, int, int], list[float]] = {}
     for event in collectives:
         group_size = (
@@ -678,14 +679,15 @@ def _summarize_collectives(
     for (op_name, group_size, num_bytes), durations in sorted(buckets.items()):
         sorted_durations = sorted(durations)
         median_us = _percentile(sorted_durations, 0.5)
-        hops = max(1, round(log2(max(MIN_COLLECTIVE_GROUP_SIZE, group_size))))
         rows.append(
             {
                 "op": op_name,
                 "group_size": group_size,
                 "bytes": num_bytes,
                 "latency_us": median_us,
-                "hop_latency_us": round(median_us / hops, QUANTILE_DECIMALS),
+                "mean_latency_us": round(
+                    sum(sorted_durations) / len(sorted_durations), QUANTILE_DECIMALS
+                ),
                 "n": len(sorted_durations),
             }
         )

@@ -606,7 +606,6 @@ def test_calibrate_perfetto_extracts_launch_gap_and_collectives(
     assert coll_by_op["all-reduce"]["group_size"] == expected_group_size
     assert coll_by_op["all-reduce"]["bytes"] == expected_ar_bytes
     assert coll_by_op["all-reduce"]["latency_us"] == pytest.approx(12.0)
-    assert coll_by_op["all-reduce"]["hop_latency_us"] == pytest.approx(4.0)
     assert coll_by_op["all-reduce"]["n"] == expected_steady_steps
     assert coll_by_op["all-to-all"]["bytes"] == expected_a2a_bytes
     assert coll_by_op["all-to-all"]["latency_us"] == pytest.approx(18.0)
@@ -624,8 +623,10 @@ def test_calibrate_perfetto_extracts_launch_gap_and_collectives(
     assert report.confidence == "validated_end_to_end"
     assert report.metrics["launch_gap_us"]["tag"] == "MEASURED"
     assert report.metrics["launch_gap_us"]["value"] == pytest.approx(2.5)
-    assert report.metrics["collective_latency_us"]["tag"] == "MEASURED"
-    assert report.metrics["collective_latency_us"]["value"] == pytest.approx(4.0)
+    assert report.metrics["collective_call_us_xla"]["tag"] == "MEASURED"
+    assert report.metrics["collective_call_us_xla"]["value"] == pytest.approx(
+        coll_by_op["all-reduce"]["mean_latency_us"]
+    )
     assert report.metrics["step_coverage"]["tag"] == "MEASURED"
     assert report.metrics["step_coverage"]["value"] == pytest.approx(0.75)
 
@@ -669,7 +670,7 @@ def test_calibrate_xplane_roundtrip_with_in_repo_parser(tmp_path: Path) -> None:
     report = _advise_qwen3_30b_decode(out_multi)
     assert report.confidence == "validated_end_to_end"
     assert report.metrics["launch_gap_us"]["tag"] == "MEASURED"
-    assert report.metrics["collective_latency_us"]["tag"] == "MEASURED"
+    assert report.metrics["collective_call_us_xla"]["tag"] == "MEASURED"
 
 
 def test_calibrate_float_stats_and_empty_gaps_preserve_assumed_prior(
@@ -724,7 +725,7 @@ def test_calibrate_float_stats_and_empty_gaps_preserve_assumed_prior(
             measurements=out_json,
         )
         assert report.metrics["launch_gap_us"]["tag"] == "ASSUMED"
-        assert report.metrics["collective_latency_us"]["tag"] == "MEASURED"
+        assert report.metrics["collective_call_us_xla"]["tag"] == "MEASURED"
         assert report.metrics["step_coverage"]["tag"] == "MEASURED"
 
 
@@ -791,7 +792,6 @@ def test_calibrate_rejects_multi_session_and_unannotated_collectives(
     )
     assert len(tp_payload["collectives"]) == 1
     assert tp_payload["collectives"][0]["group_size"] == fallback_tp
-    assert tp_payload["collectives"][0]["hop_latency_us"] == pytest.approx(4.5)
 
 
 def test_steady_state_steps_drops_compilation_warmup_outlier(tmp_path: Path) -> None:
@@ -957,3 +957,163 @@ def test_calibrate_cli_validates_chip_tp_and_batch_upfront(tmp_path: Path) -> No
 
     with pytest.raises(errors.MegakernelConfigError, match="batch must be >= 1"):
         advisor.main([*base_argv, "--batch", "0"])
+
+
+def test_calibrate_xplane_without_step_windows_reports_no_launch_gap(
+    tmp_path: Path,
+) -> None:
+    """Verify XPlane trace without step markers produces no launch gap summary."""
+    space = xplane_pb2.XSpace()
+    space.hostnames.append("tpu-worker-0")
+
+    dev_plane = space.planes.add()
+    dev_plane.id = 1
+    dev_plane.name = "/device:TPU:0"
+
+    op_compute_meta_id = 1
+    all_reduce_meta_id = 2
+    dev_plane.event_metadata[op_compute_meta_id].id = op_compute_meta_id
+    dev_plane.event_metadata[op_compute_meta_id].name = "op_compute"
+    dev_plane.event_metadata[all_reduce_meta_id].id = all_reduce_meta_id
+    dev_plane.event_metadata[all_reduce_meta_id].name = "all-reduce.1"
+
+    group_size_stat_id = 1
+    bytes_stat_id = 2
+    dev_plane.stat_metadata[group_size_stat_id].id = group_size_stat_id
+    dev_plane.stat_metadata[group_size_stat_id].name = "group_size"
+    dev_plane.stat_metadata[bytes_stat_id].id = bytes_stat_id
+    dev_plane.stat_metadata[bytes_stat_id].name = "bytes"
+
+    ops_line = dev_plane.lines.add()
+    ops_line.id = 1
+    ops_line.name = "XLA Ops"
+
+    ps_per_us = int(constants.PS_PER_US)
+    gap_ps = 10_000
+    op_duration_ps = 10 * ps_per_us
+    collective_bytes = 32 * 1024
+    tp_group_size = 8
+
+    event_specs = (
+        (op_compute_meta_id, False),
+        (all_reduce_meta_id, True),
+        (op_compute_meta_id, False),
+        (all_reduce_meta_id, True),
+    )
+
+    current_offset_ps = 0
+    for meta_id, is_collective in event_specs:
+        event = ops_line.events.add()
+        event.metadata_id = meta_id
+        event.offset_ps = current_offset_ps
+        event.duration_ps = op_duration_ps
+        if is_collective:
+            _add_int_stat(event, group_size_stat_id, tp_group_size)
+            _add_int_stat(event, bytes_stat_id, collective_bytes)
+        current_offset_ps += op_duration_ps + gap_ps
+
+    pb_path = tmp_path / "no_steps.xplane.pb"
+    pb_path.write_bytes(bytes(space.SerializeToString()))
+
+    payload = advisor.calibrate_trace(pb_path)
+
+    expected_empty_gap = {"n": 0}
+    assert payload["launch_gap_us"] == expected_empty_gap
+    expected_collective_count = 1
+    assert len(payload["collectives"]) == expected_collective_count
+    assert payload["collectives"][0]["op"] == "all-reduce"
+
+
+def test_calibrate_perfetto_without_step_windows_reports_no_launch_gap(
+    tmp_path: Path,
+) -> None:
+    """Verify Perfetto trace without step markers produces no launch gap summary."""
+    op_duration_us = 10.0
+    gap_us = 0.01
+    tp_group_size = 8
+    collective_bytes = 32 * 1024
+
+    event_configs = (
+        ("op_compute_0", False),
+        ("all-reduce", True),
+        ("op_compute_1", False),
+        ("all-reduce", True),
+    )
+
+    events: list[dict[str, object]] = []
+    current_ts_us = 0.0
+    for op_name, is_collective in event_configs:
+        args: dict[str, object] = (
+            {"group_size": tp_group_size, "bytes": collective_bytes}
+            if is_collective
+            else {}
+        )
+        events.append(
+            {
+                "ph": "X",
+                "cat": "xla_op",
+                "name": op_name,
+                "pid": 1,
+                "tid": 1,
+                "ts": current_ts_us,
+                "dur": op_duration_us,
+                "args": args,
+            }
+        )
+        current_ts_us += op_duration_us + gap_us
+
+    trace_file = _write_json_trace(
+        tmp_path, "no_steps_perfetto.json", {"traceEvents": events}
+    )
+    payload = advisor.calibrate_trace(trace_file)
+
+    expected_empty_gap = {"n": 0}
+    assert payload["launch_gap_us"] == expected_empty_gap
+    expected_collective_count = 1
+    assert len(payload["collectives"]) == expected_collective_count
+    assert payload["collectives"][0]["op"] == "all-reduce"
+
+
+def test_calibrate_reports_mean_collective_latency(tmp_path: Path) -> None:
+    """Verify calibrated collective payload reports arithmetic mean latency."""
+    step_duration_us = 500
+    step_events = _make_step_events([(0, "decode", 0, step_duration_us)])
+
+    tp_group_size = 8
+    collective_bytes = 32 * 1024
+
+    collective_durations = (10.0, 10.0, 10.0, 20.0, 20.0)
+    base_ts_us = 50.0
+    ts_spacing_us = 60.0
+
+    op_events: list[dict[str, object]] = [
+        {
+            "ph": "X",
+            "cat": "xla_op",
+            "name": "all-reduce",
+            "pid": 1,
+            "tid": 1,
+            "ts": base_ts_us + idx * ts_spacing_us,
+            "dur": duration_us,
+            "args": {"group_size": tp_group_size, "bytes": collective_bytes},
+        }
+        for idx, duration_us in enumerate(collective_durations)
+    ]
+
+    trace_file = _write_json_trace(
+        tmp_path,
+        "mean_latency_trace.json",
+        {"traceEvents": [*step_events, *op_events]},
+    )
+    payload = advisor.calibrate_trace(trace_file)
+
+    expected_collective_count = 1
+    assert len(payload["collectives"]) == expected_collective_count
+    expected_median_latency_us = 10.0
+    expected_mean_latency_us = 14.0
+    assert payload["collectives"][0]["latency_us"] == pytest.approx(
+        expected_median_latency_us
+    )
+    assert payload["collectives"][0]["mean_latency_us"] == pytest.approx(
+        expected_mean_latency_us
+    )
