@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,28 @@ class TestTpuCompilerCache:
         assert base != different_batch
         assert base != different_kv
         assert base != different_threshold
+
+    def test_hash_factors_are_written_next_to_the_cache(self, tmp_path):
+        """The factors behind compute_hash land in the cache dir, once, and
+        hash back to the same key: two dirs can be diffed factor by factor."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        compiler = tpu_compiler.TpuCompilerAdaptor()
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            key = compiler.compute_hash(self._config())
+            assert key == tpu_compiler.compute_tpu_compilation_hash(self._config())
+        compiler.initialize_cache(str(tmp_path))
+
+        path = tmp_path / tpu_compiler.TpuCompilerAdaptor.FACTORS_FILE
+        assert os.listdir(tmp_path) == [path.name]
+        assert tpu_compiler._hash_factors(json.loads(path.read_text())) == key
+
+        compiler._key_factors = {"other": True}
+        compiler.initialize_cache(str(tmp_path))
+        assert tpu_compiler._hash_factors(json.loads(path.read_text())) == key
 
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
