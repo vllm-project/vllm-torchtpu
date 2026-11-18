@@ -24,11 +24,13 @@ from runner_output_test_utils import (
 )
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
+from vllm_torchtpu.runner.device_decode.head import PackedLayout
 from vllm_torchtpu.runner.tpu_runner import _spec_logprob_row_tokens
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
+    DeviceDecodeInvariantError,
     LogprobsChunk,
     assemble_spec_next_tokens,
     compute_num_rejected,
@@ -426,3 +428,120 @@ def test_deferred_logprobs_from_device_match_a_blocking_cpu_copy(
     assert out.sampled_token_ids == [
         [100 * i + j] for i, n in enumerate(real_rows) for j in range(n)
     ]
+
+
+@pytest.fixture
+def tpu_events(monkeypatch):
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
+    )
+
+
+def _packed(num_rows, num_logprobs, seed=0):
+    """A device-decode head's packed buffer for random tokens, positions and
+    logprobs, with the stock tensors it packs."""
+    rng = np.random.default_rng(seed)
+    tokens = torch.from_numpy(rng.integers(0, 248320, num_rows).astype(np.int32))
+    positions = rng.integers(0, 10240, num_rows).astype(np.int32)
+    columns = [tokens[:, None], torch.from_numpy(positions)[:, None]]
+    logprobs = None
+    if num_logprobs >= 0:
+        cols = 1 + num_logprobs
+        ids = torch.from_numpy(
+            rng.integers(0, 248320, (num_rows, cols)).astype(np.int32)
+        )
+        ids[:, 0] = tokens
+        values = -torch.from_numpy(
+            rng.exponential(3.0, (num_rows, cols)).astype(np.float32)
+        )
+        values[0, -1] = float("-inf")
+        ranks = torch.from_numpy(rng.integers(1, 1000, num_rows).astype(np.int32))
+        logprobs = LogprobsTensors(ids, values, ranks)
+        columns += [ids, values.view(torch.int32), ranks[:, None]]
+    packed = torch.cat(columns, dim=1)
+    assert packed.shape == (num_rows, PackedLayout(num_rows, num_logprobs).width)
+    return packed, tokens, positions, logprobs
+
+
+@pytest.mark.parametrize("num_logprobs", [-1, 0, 3])
+@pytest.mark.parametrize(("num_rows", "num_reqs"), [(8, 8), (16, 9)])
+def test_packed_copy_gives_the_stock_results(
+    tpu_events, num_logprobs, num_rows, num_reqs
+):
+    packed, tokens, positions, logprobs = _packed(num_rows, num_logprobs)
+    copy_state = AsyncTPUCopyState.from_packed(
+        packed, PackedLayout(num_rows, num_logprobs), num_reqs, positions[:num_reqs]
+    )
+    stock = AsyncTPUCopyState.from_device_chunks([tokens.long()[:, None]], [num_reqs])
+    copy_state.wait()
+    stock.wait()
+    assert copy_state.sampled_token_ids_cpu.dtype == torch.int64
+    assert torch.equal(copy_state.sampled_token_ids_cpu, stock.sampled_token_ids_cpu)
+    got = copy_state.packed_logprobs()
+    if logprobs is None:
+        assert got is None
+        return
+    want = LogprobsTensors(
+        logprobs.logprob_token_ids[:num_reqs],
+        logprobs.logprobs[:num_reqs],
+        logprobs.selected_token_ranks[:num_reqs],
+    ).tolists()
+    for name in ("logprob_token_ids", "logprobs", "sampled_token_ranks"):
+        a, b = getattr(got, name), getattr(want, name)
+        assert a.dtype == b.dtype, name
+        assert np.array_equal(a.view(np.int32), b.view(np.int32)), name
+
+
+@pytest.mark.parametrize("num_logprobs", [-1, 0])
+def test_packed_copy_fills_the_engine_output(tpu_events, num_logprobs):
+    packed, tokens, positions, logprobs = _packed(8, num_logprobs, seed=1)
+    out = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["a", "b", "c"],
+            req_id_to_index={"a": 0, "b": 1, "c": 2},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=AsyncTPUCopyState.from_packed(
+            packed, PackedLayout(8, num_logprobs), 3, positions[:3]
+        ),
+        discard_sampled_tokens_req_indices=[1],
+    ).get_output()
+    assert out.sampled_token_ids == [[int(tokens[0])], [], [int(tokens[2])]]
+    if logprobs is None:
+        assert out.logprobs is None
+    else:
+        assert out.logprobs.logprob_token_ids.tolist() == (
+            logprobs.logprob_token_ids[:3].tolist()
+        )
+
+
+def test_a_wrong_position_echo_fails_every_wait(tpu_events):
+    packed, _, positions, _ = _packed(8, 0, seed=2)
+    expected = positions[:6].copy()
+    expected[4] += 1
+    copy_state = AsyncTPUCopyState.from_packed(packed, PackedLayout(8, 0), 6, expected)
+    for _ in range(2):
+        with pytest.raises(DeviceDecodeInvariantError, match="row 4 at position"):
+            copy_state.wait()
+
+
+def test_only_request_rows_are_checked(tpu_events):
+    packed, _, positions, _ = _packed(16, -1, seed=3)
+    packed[9:, 1] = -7
+    copy_state = AsyncTPUCopyState.from_packed(
+        packed, PackedLayout(16, -1), 9, positions[:9]
+    )
+    copy_state.wait()
+    assert copy_state.sampled_token_ids_cpu.shape == (9, 1)
+
+
+def test_expected_positions_are_taken_at_dispatch(tpu_events):
+    """The check runs where vLLM waits on the copy, possibly another thread,
+    after the host has moved its counts on."""
+    packed, _, positions, _ = _packed(8, -1, seed=4)
+    host = positions.copy()
+    copy_state = AsyncTPUCopyState.from_packed(packed, PackedLayout(8, -1), 8, host)
+    host += 1
+    copy_state.wait()
