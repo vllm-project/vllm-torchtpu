@@ -376,3 +376,25 @@ def test_cli_plan_and_explain_auto_resolve_hf_dtypes(
     assert sum(float(row["hbm_bytes"]) for row in explain_bf16_auto) == pytest.approx(
         bf16_hbm
     )
+
+
+def test_cli_help_clarifies_l1_pruning_vs_uncalibrated_shortlisting(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify CLI help strings distinguish L1 pruning from uncalibrated shortlists."""
+    for argv, expected_substrings in (
+        (["--help"], ("L1 physical lower bounds", "uncalibrated serial-phase")),
+        (
+            ["solve", "--help"],
+            ("Prune parallel layouts via L1 HBM bounds", "uncalibrated"),
+        ),
+        (["ceiling", "--help"], ("uncalibrated", "L1 candidate")),
+        (["plan", "--help"], ("hard L1 physical step floors", "uncalibrated")),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(argv)
+        assert exc_info.value.code == 0
+        help_text = capsys.readouterr().out
+        assert "winning" not in help_text.lower()
+        for expected in expected_substrings:
+            assert expected in help_text

@@ -31,6 +31,7 @@ from .constants import (
     EXAMPLE_SLO_TIERS,
     MIN_MOE_INTERMEDIATE_ALIGNMENT,
     MIN_SLICE_CHIPS,
+    NO_FEASIBLE_LAYOUT_WARNING,
     UNIT_GIGA,
     UNIT_MICRO,
     UNIT_MILLIS_PER_SECOND,
@@ -1513,7 +1514,9 @@ def solve_serving_plan(
 
     slo_candidates = [p for p in candidates if p.slo_met]
     pool_for_frontier = slo_candidates if slo_candidates else candidates
-    if candidates and not slo_candidates and not warnings:
+    if not candidates and not warnings:
+        warnings.append(NO_FEASIBLE_LAYOUT_WARNING)
+    elif candidates and not slo_candidates and not warnings:
         warnings.append("SLO_UNMET: no feasible topology met both TTFT and TPOT bounds")
 
     frontier = _pareto_filter(pool_for_frontier)

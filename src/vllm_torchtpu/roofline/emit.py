@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Render vLLM serve CLI flags and Pareto ceiling curves from solved plans."""
+"""Render vLLM serve CLI flags and uncalibrated L1 candidate curves from plans."""
 
 from __future__ import annotations
 
@@ -19,10 +19,8 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING, TypedDict
 
 from .constants import (
-    DEFAULT_CHIPS_PER_HOST,
-    DEFAULT_CORES_PER_CHIP,
     KV_DTYPE_BYTES,
-    TOPOLOGY_AXES,
+    NO_FEASIBLE_LAYOUT_WARNING,
 )
 
 if TYPE_CHECKING:
@@ -31,18 +29,16 @@ if TYPE_CHECKING:
     from .modules import Dtypes
     from .solver import PoolMeshPlan, ServingPlan
 
-_POOL_AXES: tuple[tuple[str, str], ...] = (
-    ("TP", "tp"),
-    ("DP", "dp"),
-    ("EP", "ep"),
-    ("PP", "pp"),
-    ("PCP", "pcp"),
-    ("DCP", "kv_split"),
+# Printed in a command in place of a model that ``vllm serve`` cannot load.
+_MODEL_PLACEHOLDER = "<MODEL>"
+_UNKNOWN_MODEL_WARNING = (
+    f"The model to serve is not known: replace {_MODEL_PLACEHOLDER} in each "
+    "command with a model ID or a model directory."
 )
 
 
 class LaunchPayload(TypedDict):
-    """Structured vLLM serve CLI payload emitted for one serving plan."""
+    """Structured vLLM serve CLI payload emitted for the top-ranked L1 candidate."""
 
     mode: str
     cli_args: list[str]
@@ -53,7 +49,7 @@ class LaunchPayload(TypedDict):
 
 
 class CeilingRow(TypedDict):
-    """Single Pareto ceiling row exported by ``emit_ceiling_rows``."""
+    """Single uncalibrated L1 candidate row exported by ``emit_ceiling_rows``."""
 
     p90_interactivity_tok_s: float
     token_throughput_per_chip: float
@@ -98,53 +94,17 @@ def pool_cli_args(
     return args
 
 
-def _pool_int(val: object, default: int = 1) -> int:
-    """Extract positive integer from dictionary values safely."""
-    try:
-        return int(val)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
-
-
-def format_parallelism(pool: Mapping[str, object]) -> str:
-    """Format active parallelism axes joined by ' x ' in canonical order, or TP1."""
-    parts = [
-        f"{name}{_pool_int(pool.get(key))}"
-        for name, key in _POOL_AXES
-        if _pool_int(pool.get(key)) > 1
-    ]
-    return " x ".join(parts) if parts else "TP1"
-
-
-def pool_label(pool: Mapping[str, object]) -> str:
-    """Return a concise pool label.
-
-    Example: ``4x 2x2x2 (32 chips, 8 hosts, 64 cores): TP16 x EP16 x DCP2``.
-    """
-    instance_count = _pool_int(pool.get("instances"))
-    instance_prefix = f"{instance_count}x "
-    topology_name = str(pool.get("topology", ""))
-    chips_per_instance = _pool_int(pool.get("chips_per_instance"), default=0)
-    if chips_per_instance <= 0 and topology_name in TOPOLOGY_AXES:
-        topology_dimensions = TOPOLOGY_AXES[topology_name]
-        chips_per_instance = (
-            topology_dimensions[0] * topology_dimensions[1] * topology_dimensions[2]
-        )
-    total_chips = chips_per_instance * max(1, instance_count)
-    layout_text = format_parallelism(pool)
-    if total_chips <= 0:
-        return f"{instance_prefix}{topology_name}: {layout_text}"
-    hosts = max(1, total_chips // DEFAULT_CHIPS_PER_HOST)
-    host_description = "1 host" if hosts == 1 else f"{hosts} hosts"
-    cores = total_chips * DEFAULT_CORES_PER_CHIP
-    pool_description = f" ({total_chips} chips, {host_description}, {cores} cores)"
-    return f"{instance_prefix}{topology_name}{pool_description}: {layout_text}"
+def _servable_model(source: str | None) -> str | None:
+    """Return ``source`` unless it is None or names a ``.json`` config file."""
+    if source is None or source.endswith(".json"):
+        return None
+    return source
 
 
 def _format_server_cmd(cli_args: list[str], model: str | None) -> str:
     """Format launch CLI arguments as a standalone bash command string."""
     joined = " ".join(cli_args)
-    prefix = f"vllm serve {model}" if model else "vllm serve"
+    prefix = f"vllm serve {_servable_model(model) or _MODEL_PLACEHOLDER}"
     return f"{prefix} {joined}".strip()
 
 
@@ -154,7 +114,7 @@ def emit_launch_args(
     dtypes: Dtypes | None = None,
     model: str | None = None,
 ) -> LaunchPayload:
-    """Emit ``vllm serve`` CLI flags and commands for ``plan``."""
+    """Emit ``vllm serve`` CLI flags and commands for the top-ranked L1 candidate."""
     kv_str = (
         "fp8" if (dtypes is not None and dtypes.kv <= KV_DTYPE_BYTES["fp8"]) else "auto"
     )
@@ -162,7 +122,7 @@ def emit_launch_args(
     rec = plan.recommended
     if rec is None or not rec.slo_met:
         if not warnings:
-            warnings.append("No feasible layout met memory and latency constraints.")
+            warnings.append(NO_FEASIBLE_LAYOUT_WARNING)
         return {
             "mode": plan.mode,
             "cli_args": [],
@@ -198,6 +158,8 @@ def emit_launch_args(
     else:
         commands = [decode_cmd]
 
+    if _servable_model(model) is None:
+        warnings.append(_UNKNOWN_MODEL_WARNING)
     return {
         "mode": rec.mode,
         "cli_args": decode_args,
@@ -209,7 +171,7 @@ def emit_launch_args(
 
 
 def emit_ceiling_rows(plan: ServingPlan) -> list[CeilingRow]:
-    """Export Pareto ceiling rows leading with p90 interactivity and throughput."""
+    """Export uncalibrated L1 candidate rows by p90 interactivity and throughput."""
     return [
         {
             "p90_interactivity_tok_s": pt.p90_interactivity_tok_s,
