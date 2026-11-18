@@ -5526,7 +5526,10 @@ class TPUModelRunner(GPUModelRunner):
             )
         else:
             position_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
-        query_lens = profile_query_lens + [0] * (num_reqs - actual_num_reqs)
+        if profiling:
+            query_lens = profile_query_lens + [0] * (num_reqs - actual_num_reqs)
+        else:
+            query_lens = [1] * actual_num_reqs + [0] * (num_reqs - actual_num_reqs)
         query_start_loc = torch.cumsum(
             torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
         ).to(self.device)
@@ -5537,10 +5540,10 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens_cpu[0] += profile_prefix
         seq_lens = seq_lens_cpu.to(self.device)
         # V3: request_distribution = [decode_end, prefill_end, mixed_end].
-        # A profile run holds mixed requests, as a real prefill chunk does; a
-        # warmup or idle run has none. Values only: the tensor shapes, and so
-        # the compiled programs, are those of a serving step.
-        distribution = [0, 0, actual_num_reqs]
+        # Dummy runs use one scheduled token per active request, so model
+        # them as pure decode to match the real single-chip path; a profile
+        # run holds mixed requests, as a real prefill chunk does.
+        distribution = [0, 0, actual_num_reqs] if profiling else [actual_num_reqs] * 3
         request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
             self.device
         )
@@ -6880,9 +6883,7 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        # Plus the drafter's lookahead, as in _warmup_one_spec_request.
-        lookahead = self.vllm_config.num_lookahead_tokens
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K) + lookahead)
+        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
         # Per-group block counts at each group's own block size (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -6972,7 +6973,7 @@ class TPUModelRunner(GPUModelRunner):
                 P_mix = int(self.max_num_tokens) - R * (1 + K)
                 P_mix = max(P, min(P_mix, self.max_model_len - (1 + K) - 1))
                 mix_nblks = [
-                    _spec_warmup_group_num_blocks(self, g, P_mix + 1 + K + lookahead)
+                    _spec_warmup_group_num_blocks(self, g, P_mix + 1 + K)
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
                 mix_nblk = max(mix_nblks)
@@ -7069,10 +7070,8 @@ class TPUModelRunner(GPUModelRunner):
         # groups differ on hybrid models (mamba vs attention), and the
         # runner-level self.block_size predates the executor's post-load
         # block-size finalization.
-        # The drafter also writes KV past the verify window, up to vLLM's
-        # num_lookahead_tokens further (the scheduler reserves them through
-        # allocate_slots). Without them a draft block that crosses into an
-        # unallocated page lands on block-table entry 0, the null block.
+        # The drafter writes num_lookahead_tokens past the verify window, as
+        # the scheduler reserves; an unallocated page maps to the null block.
         lookahead = self.vllm_config.num_lookahead_tokens
         max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K) + lookahead)
         top = int(self.kv_cache_config.num_blocks)

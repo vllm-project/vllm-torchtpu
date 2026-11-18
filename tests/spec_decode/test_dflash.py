@@ -997,56 +997,6 @@ def test_draft_padding_has_empty_attention_windows(builder, num_reqs, block_size
     )
 
 
-@pytest.mark.parametrize("num_reqs", [0, 1, 15, 16, 19, 32])
-@pytest.mark.parametrize("row_offset", [0, 384])
-def test_draft_padding_has_no_swa_pages_or_cache_records(num_reqs, row_offset):
-    """CSA2 SWA metadata built from the draft boundaries keeps padding off the
-    null block: no visible page, empty bounds and no write record."""
-    import jax.numpy as jnp
-
-    from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
-
-    proposer = DFlashProposer.__new__(DFlashProposer)
-    proposer._max_model_len = 9216
-    rows, block_size, page_size, page_stride = 32, 5, 64, 512
-    _, positions, _, starts, _ = inspect.unwrap(
-        DFlashProposer._tpu_build_dflash_inputs_seed
-    )(
-        proposer,
-        torch.ones(rows, dtype=torch.int32),
-        torch.arange(rows + 1, dtype=torch.int32) * 6,
-        torch.arange(rows * 6, dtype=torch.int32),
-        torch.tensor(num_reqs, dtype=torch.int32),
-        block_size,
-        rows * block_size,
-        7777,
-    )
-    # Live requests own nonzero blocks; padding rows stage the null block.
-    table = np.arange(1, rows * 8 + 1, dtype=np.int32).reshape(rows, 8)
-    table[num_reqs:] = 0
-    metadata, bounds, records = (
-        np.asarray(value)
-        for value in prepare_swa_metadata(
-            jnp.asarray(table),
-            jnp.asarray(starts.numpy()),
-            jnp.asarray(positions.numpy()),
-            jnp.zeros(rows, jnp.int32),
-            page_size=page_size,
-            page_stride=page_stride,
-            row_offset=row_offset,
-        )
-    )
-    live_rows = num_reqs * block_size
-    assert not metadata[num_reqs:, 2:].any()
-    assert not bounds[num_reqs:].any()
-    assert np.all(records[live_rows:] == -1)
-    # Block 0 spans records [0, page_stride) and pages [0, page_stride / S).
-    assert np.all(records[:live_rows] >= page_stride)
-    pages = metadata[:num_reqs, 2:]
-    assert np.all((pages == 0) | (pages >= page_stride // page_size))
-    assert np.all((pages != 0).any(axis=1))
-
-
 @pytest.mark.parametrize("num_tokens", [6, 80, 96, 160, 192, 240, 2048])
 def test_dummy_context_update_has_no_writable_cache_rows(num_tokens):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark

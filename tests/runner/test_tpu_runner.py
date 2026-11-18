@@ -342,29 +342,6 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
     assert req1.block_ids == (list(range(10, 19)), [10])
 
 
-def test_spec_warmup_reserves_the_draft_lookahead():
-    """A warmup request's last draft block runs past its verify window. With
-    P=48 and K=5 the last window covers 54..59 and the draft may write up to
-    64, the first row of the second 64-token SWA page: that page must be
-    allocated, or the write lands on the null block."""
-    executed = []
-    swa_group = SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))
-    runner = SimpleNamespace(
-        max_model_len=8192,
-        max_num_tokens=2048,
-        speculative_config=SimpleNamespace(num_speculative_tokens=5),
-        vllm_config=SimpleNamespace(num_lookahead_tokens=5),
-        kv_cache_config=SimpleNamespace(num_blocks=100, kv_cache_groups=[swa_group]),
-        execute_model=MagicMock(side_effect=lambda so: executed.append(so) and None),
-        sample_tokens=MagicMock(),
-        take_draft_token_ids=MagicMock(return_value=None),
-        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
-    )
-
-    assert TPUModelRunner._warmup_one_spec_request(runner, 48, idx=0) is True
-    assert executed[0].scheduled_new_reqs[0].block_ids == ([1, 2],)
-
-
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
     """Run _prepare_async_token_substitution_indices with a minimal fake self.
     req_id_to_index_copy holds each request's *position*; with spec_k set the

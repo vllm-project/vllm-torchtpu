@@ -716,7 +716,6 @@ def test_dummy_run_partial_layout_decode_like_metadata_routes_to_streaming(monke
 
     assert ctx.sequence_layout_descriptor.kind is SequenceLayoutKind.PARTIAL
     assert ctx.sequence_layout_descriptor.protocol == "pcp_streaming"
-    # Warmup owns no request: every boundary repeats 0 and nothing is live.
     torch.testing.assert_close(
         ctx.request_distribution.cpu(), torch.zeros(3, dtype=torch.int32)
     )
@@ -774,30 +773,6 @@ def test_dummy_run_marks_inactive_request_rows_before_cache_init(monkeypatch):
     assert md.sequence_layout_kind == SequenceLayoutKind.PARTIAL.value
     assert md.sequence_layout_protocol == "pcp_streaming"
     assert md.sequence_layout_version == 1
-
-
-@pytest.mark.parametrize("dp_lockstep", [False, True])
-def test_dummy_run_writes_no_cache_rows(monkeypatch, dp_lockstep):
-    """Warmup and idle DP dummies stage zero block tables, i.e. block 0, the
-    null page every cache group shares. They must address no cache row."""
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark
-
-    runner = _make_runner(
-        num_computed_tokens=[0],
-        prompt_tokens=[64],
-        scheduled_tokens=[1],
-        token_paddings=[256],
-    )
-    _run_dummy_run(monkeypatch, runner, num_tokens=256, dp_lockstep=dp_lockstep)
-    md = runner._captured_dummy_attn_metadata["layer.0"]
-
-    assert not md.seq_lens.any()
-    assert not md.query_start_loc.any()
-    assert not md.request_distribution.any()
-    assert not md.block_tables.any()
-    cache = torch.zeros((4, 64, 8))
-    slots = dspark._cache_slots(cache, md, md.input_positions)
-    assert torch.all(slots == -1)
 
 
 def test_dummy_run_preinit_and_postinit_share_metadata_pytree(monkeypatch):

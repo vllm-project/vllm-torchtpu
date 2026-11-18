@@ -132,7 +132,6 @@ def test_plain_dummy_run_keeps_the_decode_shape_and_returns_nothing(monkeypatch)
     elapsed, md, seen = _profile_run(monkeypatch, _runner(), 256, None)
 
     assert elapsed is None
-    # A warmup run holds no request, only the serving tensor shapes.
     assert md.query_start_loc.tolist() == [0] * 9
     assert md.seq_lens.tolist() == [0] * 8
     assert md.request_distribution.tolist() == [0, 0, 0]
