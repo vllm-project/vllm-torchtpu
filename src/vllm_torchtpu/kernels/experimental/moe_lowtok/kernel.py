@@ -51,14 +51,15 @@ _MIN_HOT_SCAN = 32
 
 _ROW_TILE = 8  # sublane row alignment (avoids padding T=8,16 to 32)
 _NEG = -3.0e38  # router scores at or below this never win a pass
-_LANE = 128
+LANE = 128
 _VMEM_FRACTION = 0.75
 _VMEM_MARGIN = 1.50  # over declared scratch and operands, for compiler tiles
-_FP8 = jnp.float8_e4m3fn
+FP8_DTYPE = jnp.float8_e4m3fn
 _FP8_MAX = 448.0
 
 
-def _dot(a, b):
+def dot_f32(a, b):
+    """``a @ b`` for 2D operands, accumulated in float32."""
     return jax.lax.dot_general(
         a, b, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
     )
@@ -109,11 +110,11 @@ def _vmem_budget(rows, hidden, inter, w13_parts, lanes):
     return min(need, capacity)
 
 
-def _quantize_rows(v):
+def quantize_rows(v):
     """Per-row FP8 quantization of an f32 block: values and restoring scale."""
     amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
     scale = jnp.maximum(amax, 1e-12) / _FP8_MAX
-    return (v / scale).astype(_FP8), scale
+    return (v / scale).astype(FP8_DTYPE), scale
 
 
 def _stream(
@@ -155,7 +156,7 @@ def _stream(
         gid_of = lambda e: gid_s[0, e]  # noqa: E731
     rows = wtab_ref.shape[0]
     units = w13_parts + 1
-    lane_128 = jax.lax.broadcasted_iota(jnp.int32, (rows, _LANE), 1)
+    lane_128 = jax.lax.broadcasted_iota(jnp.int32, (rows, LANE), 1)
 
     def collect(e, n):
         h = hits_s[0, gid_of(e)]
@@ -241,7 +242,7 @@ def _stream(
                 start(jnp.int32(0), jnp.int32(ahead))
 
     acc[...] = jnp.zeros_like(acc)
-    x_q, x_s = _quantize_rows(x_ref[...].astype(jnp.float32))
+    x_q, x_s = quantize_rows(x_ref[...].astype(jnp.float32))
 
     def body(u, carry):
         e_idx, part = carry
@@ -255,30 +256,30 @@ def _stream(
 
         @pl.when(part == 0)
         def _gate_half():
-            h = _dot(x_q, w13_buf[0])
+            h = dot_f32(x_q, w13_buf[0])
             gate = h * x_s * s13_buf[0]
             h_acc[...] = gate * jax.nn.sigmoid(gate)
 
         @pl.when(part == 1)
         def _up_half():
-            h = _dot(x_q, w13_buf[1])
+            h = dot_f32(x_q, w13_buf[1])
             up = h * x_s * s13_buf[1]
             h_acc[...] = h_acc[...] * up
 
         @pl.when(part == 2)
         def _down():
             a = h_acc[...]
-            a_q, a_s = _quantize_rows(a)
+            a_q, a_s = quantize_rows(a)
             g = gid_of(expert)
-            blk = pl.multiple_of((g >> 7) << 7, _LANE)
-            w_slice = wtab_ref[:, pl.ds(blk, _LANE)]
+            blk = pl.multiple_of((g >> 7) << 7, LANE)
+            w_slice = wtab_ref[:, pl.ds(blk, LANE)]
             w = jnp.sum(
                 jnp.where(lane_128 + blk == g, w_slice, 0.0),
                 axis=1,
                 keepdims=True,
             )
             row_scale = a_s * w
-            o = _dot(a_q, w2_buf[0])
+            o = dot_f32(a_q, w2_buf[0])
             acc[...] += (o * s2_buf[0]) * row_scale
 
         return advance(e_idx, part, 1)
@@ -287,7 +288,7 @@ def _stream(
     out_ref[...] = acc[...].astype(out_ref.dtype)
 
 
-def _select_topk(scores, topk, *, from_logits: bool = False):
+def select_topk(scores, topk, *, from_logits: bool = False):
     """The served router as a routing table over global expert ids.
 
     `topk` max-and-mask passes over the softmax scores or raw router logits,
@@ -344,7 +345,7 @@ def _kernel(
         wtab_ref = route_ref
     else:
         wtab_ref, *scratch = scratch
-        wtab_ref[...] = _select_topk(route_ref[...], topk, from_logits=from_logits)
+        wtab_ref[...] = select_topk(route_ref[...], topk, from_logits=from_logits)
     # Lanes some row routes to; `collect` keeps the ones in this shard's gid.
     hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
     hits_v[...] = jnp.where(hit, 1, 0).astype(jnp.int32)
@@ -407,7 +408,7 @@ def _kernel_copies(
     o_gid, o_hot, o_hprim, o_hcopy, o_slot = offsets
     my_rank = tab_s[0] // owned
 
-    wt = _select_topk(scores_ref[...], topk, from_logits=from_logits)
+    wt = select_topk(scores_ref[...], topk, from_logits=from_logits)
     wtab_ref[...] = wt
     hit = jnp.any(wt != 0, axis=0, keepdims=True)
     prim = prim_ref[...]
@@ -498,15 +499,18 @@ def _kernel_copies(
     )
 
 
-def _layout(x, w13):
+def weight_layout(x, w13):
+    """(experts, intermediate width, w13 weight units, padded rows) of a call:
+    w13 streams as two units when each half of the intermediate width is
+    whole lanes, else as one."""
     tokens, _ = x.shape
     n_experts, _, two_inter = w13.shape
     inter = two_inter // 2
-    if inter % (2 * _LANE):
+    if inter % (2 * LANE):
         # can_use_moe_lowtok admits gate|up widths that are multiples of 512;
         # the kernel streams the gate columns and the up columns as two units.
         raise ValueError(
-            f"the intermediate width {inter} must be a multiple of {2 * _LANE}"
+            f"the intermediate width {inter} must be a multiple of {2 * LANE}"
         )
     w13_parts = 2
     rows = pl.cdiv(tokens, _ROW_TILE) * _ROW_TILE
@@ -516,8 +520,8 @@ def _layout(x, w13):
 def _stream_scratch(rows, hidden, inter, w13_parts):
     half = inter // w13_parts
     return (
-        pltpu.VMEM((w13_parts, hidden, 2 * half), _FP8),
-        pltpu.VMEM((1, inter, hidden), _FP8),
+        pltpu.VMEM((w13_parts, hidden, 2 * half), FP8_DTYPE),
+        pltpu.VMEM((1, inter, hidden), FP8_DTYPE),
         pltpu.VMEM((w13_parts, 1, 2 * half), jnp.float32),
         pltpu.VMEM((1, 1, hidden), jnp.float32),
         pltpu.SemaphoreType.DMA((w13_parts,)),
@@ -534,7 +538,7 @@ def table_offsets(n_experts, nc=HOT_SLOTS):
     o_hprim = o_hot + nc
     o_hcopy = o_hprim + nc
     o_slot = o_hcopy + nc
-    length = pl.cdiv(o_slot + _TABLE_LANES, _LANE) * _LANE
+    length = pl.cdiv(o_slot + _TABLE_LANES, LANE) * LANE
     return o_gid, o_hot, o_hprim, o_hcopy, o_slot, length
 
 
@@ -683,9 +687,9 @@ def moe_lowtok(
             "moe_lowtok: from_logits=True needs topk (the kernel runs the top-k "
             "on the router logits); pass a routing table with from_logits=False"
         )
-    n_experts, inter, w13_parts, rows = _layout(x, w13)
+    n_experts, inter, w13_parts, rows = weight_layout(x, w13)
     route_cols = route.shape[1]
-    lanes = pl.cdiv(route_cols, _LANE) * _LANE
+    lanes = pl.cdiv(route_cols, LANE) * LANE
     if topk is None and lanes < n_experts:
         # Every weight slot looks up its routing-table lane.
         raise ValueError(

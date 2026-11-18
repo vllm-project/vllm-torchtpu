@@ -183,7 +183,7 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
         # Above the cap: the served path, inside the op.
         xg = lax.all_gather(x, "dp", axis=0, tiled=True)
         lg = lax.all_gather(scores, "dp", axis=0, tiled=True)
-        out = moe_lowtok_scores._moe_scores_fn(
+        out = moe_lowtok_scores.moe_scores_fn(
             xg, lg, w13, w2, s13, s2, start, topk=topk
         )
         out = lax.psum_scatter(out, "dp", scatter_dimension=0, tiled=True)

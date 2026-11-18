@@ -276,7 +276,7 @@ def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
     return None
 
 
-def _moe_scores_fn(
+def moe_scores_fn(
     x: jax.Array,
     scores: jax.Array,
     w13: jax.Array,
@@ -375,7 +375,7 @@ def _build_op(topk: int, num_primary_experts: int | None) -> torch.library.Custo
         w2_scale: jax.Array,
         experts_start: jax.Array,
     ) -> jax.Array:
-        return _moe_scores_fn(
+        return moe_scores_fn(
             x,
             scores,
             w13,
@@ -419,7 +419,7 @@ def _build_copies_op(topk: int, ranks: int, owned: int) -> torch.library.CustomO
         copy: jax.Array,
         hot1h: jax.Array,
     ) -> jax.Array:
-        return _moe_scores_fn(
+        return moe_scores_fn(
             x,
             scores,
             w13,

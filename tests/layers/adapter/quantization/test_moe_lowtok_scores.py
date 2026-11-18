@@ -322,7 +322,7 @@ def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
     s13 = jnp.ones((4, 1, 1, 16), dtype=jnp.float32)
     s2 = jnp.ones((4, 1, 1, 8), dtype=jnp.float32)
     start = jnp.int32(0)
-    out = scores._moe_scores_fn(
+    out = scores.moe_scores_fn(
         x,
         s,
         w13,
@@ -366,7 +366,7 @@ def test_grouped_fallback_leaves_the_weight_dtype_to_fused_moe_func(monkeypatch)
     w2 = jnp.zeros((4, 8, 8), dtype=jnp.float8_e4m3fn)
     s13 = jnp.ones((4, 1, 1, 16), dtype=jnp.float32)
     s2 = jnp.ones((4, 1, 1, 8), dtype=jnp.float32)
-    scores._moe_scores_fn(x, logits, w13, w2, s13, s2, jnp.int32(0), topk=2)
+    scores.moe_scores_fn(x, logits, w13, w2, s13, s2, jnp.int32(0), topk=2)
     weights = scores.fused_moe_func.call_args.args[7]
     top2 = jax.lax.top_k(logits, 2)[0]
     assert weights.dtype == jnp.float32
@@ -542,7 +542,7 @@ def test_in_op_row_cap_dispatches_copy_aware_lowtok_or_fused_moe_func(
     prim = jnp.zeros((512,), dtype=jnp.int32)
     copy = jnp.full((512,), -1, dtype=jnp.int32)
     hot1h = jnp.zeros((512, 128), dtype=jnp.bfloat16)
-    out = scores._moe_scores_fn(
+    out = scores.moe_scores_fn(
         x,
         s,
         w13,
