@@ -173,10 +173,15 @@ def test_preempted_request_re_published_ahead_registers_its_fresh_send(kind, env
     assert _released(facade) == [(REQ, UUID_AHEAD)]
 
     # Resumed from 0 computed tokens: a new ahead send on new pages.
-    _step(worker, send=_send(UUID_FRESH, fresh, num_tokens, ahead=True))
+    send = _send(UUID_FRESH, fresh, num_tokens, ahead=True)
+    _step(worker, send=send)
     registration = worker._stage3_registered_sends[REQ]
     assert registration.uuid == UUID_FRESH
-    assert registration.group_block_ids == tuple(tuple(ids) for ids in fresh)
+    # The worker's own lowering of the fresh tables (DSv4 drops a sliding-window
+    # group's leading null blocks; Qwen PD keeps every table as is).
+    want_groups, _ = worker._stage3_grouped_spans(send, num_tokens)
+    assert registration.group_block_ids == want_groups
+    assert registration.local_block_ids == want_groups[0] == tuple(fresh[0])
     assert registration.finish_pending
     assert registration.expiration_time == float("inf")
     assert _registered_uuids(facade) == [UUID_AHEAD, UUID_FRESH]
