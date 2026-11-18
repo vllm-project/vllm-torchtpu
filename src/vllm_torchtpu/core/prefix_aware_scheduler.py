@@ -43,11 +43,12 @@ Do not name it on a pipeline-parallel (PP > 1) leg: the platform then keeps
 the configured class and turns pipeline chunk sizing off.
 """
 
+import math
 import time
 from bisect import bisect_right
 from itertools import islice
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -65,6 +66,18 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
 logger = init_logger("vllm." + __name__)
+
+
+@runtime_checkable
+class ExternalHitEstimator(Protocol):
+    """A KV connector that estimates how many prompt tokens past a request's
+    local hit a lookup would load from its external tier (the Raiden
+    offloading connector and the multi-connector of #3083)."""
+
+    def estimate_external_hit_tokens(
+        self, request: Request, num_local_tokens: int
+    ) -> int: ...
+
 
 _LOG_EVERY = 1000
 # New requests whose prompt has at least this many tokens ship it packed.
@@ -169,6 +182,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._memo_xstep = False
         if self._is_kv_consumer:
             self._enable_memo_xstep()
+        # The connector's host-tier estimate, for the waiting-queue sort.
+        self._hit_estimator: ExternalHitEstimator | None = (
+            self.connector if isinstance(self.connector, ExternalHitEstimator) else None
+        )
         self._init_paw_sort()
         self._init_kv_prefetch()
 
@@ -632,6 +649,14 @@ class PrefixAwareScheduler(AsyncScheduler):
             base, max(min_reserved, per_seq_reserved * (num_running + num_inflight))
         )
 
+    def _get_paw_aging_rate(self) -> float:
+        """Uncached prompt tokens credited per second a request has waited.
+
+        0 (no aging) unless a scheduler that borrows these helpers sets
+        ``_paw_aging_tok_per_s``.
+        """
+        return float(getattr(self, "_paw_aging_tok_per_s", 0.0) or 0.0)
+
     def _note_waiting_stop(self, request: Request, reason: str) -> None:
         """Records why the waiting loop stopped at ``request`` (first stop of
         the step wins; running requests are ignored)."""
@@ -842,9 +867,12 @@ class PrefixAwareScheduler(AsyncScheduler):
         tm = getattr(self, "_tm", None) or {}
         pool_free = self._get_num_free_blocks()
         stops = dict(sorted((tm.get("stops") or {}).items(), key=lambda kv: -kv[1]))
+        # The decode throttle's reservation (vLLM's own without it); not the
+        # prefetch-aware hook, which counts refusals while prefetch is armed.
+        reserved = self._decode_inflight_reserved_blocks()
         text = (
             f"stop={stop} "
-            f"pool_free={pool_free} "
+            f"inflight_reserved={reserved} pool_free={pool_free} "
             f"min_steps={tm.get('steps', 0)} "
             f"min_small_steps_waiting={tm.get('small_steps_waiting', 0)} "
             f"min_stops={format_counts(stops)}"
@@ -1008,6 +1036,30 @@ class PrefixAwareScheduler(AsyncScheduler):
                         False,
                     )
         return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+
+    def _external_warmth(self, request: Request, local_warmth: int) -> int:
+        """Prompt tokens past ``local_warmth`` the connector expects to load
+        from its external tier (``_hit_estimator``); 0 on a KV consumer,
+        without an estimating connector, or with less than a block past the
+        local hit. A failing estimate is logged and counts as 0."""
+        if self._is_kv_consumer:
+            return 0
+        estimator = self._hit_estimator
+        if estimator is None:
+            return 0
+        if request.num_tokens - local_warmth < self._get_block_size():
+            return 0
+        try:
+            estimate = estimator.estimate_external_hit_tokens(request, local_warmth)
+            return max(0, int(estimate or 0))
+        except Exception as exc:
+            logger.warning_once(
+                "estimate_external_hit_tokens failed for request %s (%r); "
+                "ranking it by its local prefix hit only.",
+                request.request_id,
+                exc,
+            )
+            return 0
 
     def _rank_and_warmth(
         self, request: Request
