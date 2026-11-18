@@ -24,6 +24,15 @@ from vllm_torchtpu.runner import decode_carry as dc
 QWEN35 = ["Qwen3_5MoeForConditionalGeneration"]
 
 
+@pytest.fixture(autouse=True)
+def _qwen3_5_draft_path_rule(monkeypatch):
+    """The registry holding Qwen3.5's rule, as register_models leaves it."""
+    from vllm_torchtpu.models.qwen3_5.hooks import mtp_draft_path
+    from vllm_torchtpu.spec_decode import draft_path_rules
+
+    monkeypatch.setattr(draft_path_rules, "_RULES", [mtp_draft_path])
+
+
 def _runner(*, arch=QWEN35, method="mtp", max_num_seqs=1, async_scheduling=True):
     ns = types.SimpleNamespace
     return ns(

@@ -31,9 +31,9 @@ previous step's corrected device tensors to
 takes the normal upload path. Padding slots keep their previous values, which the
 host also left unchanged (checked).
 
-It runs by rule on a Qwen3.5 MTP engine with batch-1 asynchronous decode
-(max_num_seqs == 1), the configuration it was measured on; every other engine
-keeps the uploads.
+It runs on batch-1 asynchronous decode (max_num_seqs == 1) of a configuration a
+model-provided draft-path rule covers (spec_decode/draft_path_rules.py), the
+configuration it was measured on; every other engine keeps the uploads.
 """
 
 from __future__ import annotations
@@ -47,18 +47,19 @@ _SEQ = itertools.count(1)
 
 
 def enabled(runner: Any) -> bool:
-    """The carry's rule, decided once per runner: a Qwen3.5 target with an
-    MTP draft, asynchronous scheduling and max_num_seqs == 1."""
+    """The carry's rule, decided once per runner: asynchronous scheduling,
+    max_num_seqs == 1, and a configuration a model-provided draft-path rule
+    covers (spec_decode/draft_path_rules.py)."""
     cached = runner.__dict__.get("_decode_carry_enabled")
     if cached is None:
-        from vllm_torchtpu.spec_decode.utils import qwen3_5_mtp
+        from vllm_torchtpu.spec_decode import draft_path_rules
 
         sched = getattr(runner, "scheduler_config", None)
         cached = bool(
             sched is not None
             and getattr(sched, "async_scheduling", False)
             and getattr(sched, "max_num_seqs", 0) == 1
-            and qwen3_5_mtp(getattr(runner, "vllm_config", None))
+            and draft_path_rules.holds(runner.vllm_config)
         )
         runner.__dict__["_decode_carry_enabled"] = cached
     return cached
@@ -120,11 +121,11 @@ def clear(runner: Any) -> None:
 def _host_positions(runner: Any, total: int) -> np.ndarray:
     if runner.uses_mrope:
         cpu = runner.mrope_positions.cpu
-        cached = runner.__dict__.get("_t3_mrope_np")
+        cached = runner.__dict__.get("_mrope_np_view")
         key = (id(cpu), cpu.data_ptr(), tuple(cpu.shape), cpu.dtype)
         if cached is None or cached[0] != key:
             cached = (key, cpu.numpy())
-            runner.__dict__["_t3_mrope_np"] = cached
+            runner.__dict__["_mrope_np_view"] = cached
         return np.asarray(cached[1][:, :total], dtype=np.int64)
     return np.asarray(runner.positions_np[:total], dtype=np.int64)
 
