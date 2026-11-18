@@ -288,6 +288,13 @@ def keep_list(mla: Any) -> list[torch.Tensor]:
     return list(seen.values())
 
 
+def check_keep(mla: Any, keep: list[torch.Tensor]) -> None:
+    """Raise unless a layer's keep list starts with `prefetch`'s operands."""
+    want = _prefetched(mla)
+    if len(keep) < len(want) or any(a is not b for a, b in zip(keep, want)):
+        raise RuntimeError(f"the keep list of {mla.prefix} must start with keep_list")
+
+
 def rows_layers(skip_topk: list[bool]) -> list[bool]:
     """Which of a model's MoE layers (in order; `skip_topk[i]`: layer i reuses
     the top-k rows of the indexer layer before it) take the rows block: a

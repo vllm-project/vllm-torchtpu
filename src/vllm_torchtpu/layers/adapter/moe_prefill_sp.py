@@ -610,7 +610,9 @@ def layer_keep(layer: Any, rows: bool) -> list[torch.Tensor]:
     leading entries)."""
     keep = _keep_list(layer.mlp)
     if rows:
-        keep = mla_prefill_rows.keep_list(layer.self_attn.mla_attn) + keep
+        mla = layer.self_attn.mla_attn
+        keep = mla_prefill_rows.keep_list(mla) + keep
+        mla_prefill_rows.check_keep(mla, keep)
     return keep
 
 
