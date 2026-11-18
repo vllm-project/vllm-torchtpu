@@ -1130,6 +1130,53 @@ class TPUModelRunner(GPUModelRunner):
             pcp_enabled or parallel_config.pipeline_parallel_size > 1
         )
 
+    def _drafter_padded_drafts(
+        self, drafts: Any, num_chunks: int
+    ) -> list[torch.Tensor] | None:
+        """The bucketed Eagle3 drafter's padded per-chunk drafts when ``drafts``
+        is its last device output and it has one padded block per chunk, else
+        None (another drafter, or drafts from elsewhere)."""
+        drafter = getattr(self, "drafter", None)
+        if (
+            not isinstance(drafter, Eagle3Proposer)
+            or drafts is not drafter._last_propose_device_out
+        ):
+            return None
+        padded = drafter._last_padded_drafts_per_chunk
+        if not padded or len(padded) != num_chunks:
+            return None
+        return padded
+
+    def _fused_assembly_padded_drafts(
+        self, drafts: Any, num_chunks: int
+    ) -> list[torch.Tensor] | None:
+        """``_drafter_padded_drafts`` for the compiled async-spec assembly, which
+        stays off under adaptive verification: the general path counts a draft
+        trimmed by adaptive verification as rejected, these programs do not."""
+        if self._adaptive_verification is not None:
+            return None
+        return self._drafter_padded_drafts(drafts, num_chunks)
+
+    def _defers_prev_rollback(
+        self,
+        combined_selected_tokens: Any,
+        discard_sampled_tokens_req_indices: Any,
+    ) -> bool:
+        """Whether the previous async step's rollback (_modify_prev_results)
+        waits until this step's drafter is dispatched, so the wait on the
+        previous step's sampled-token copy does not hold the draft back.
+
+        Only under async scheduling with an async hidden-state drafter, on a
+        step that sampled tokens and discards no request; otherwise the
+        rollback runs first, as before.
+        """
+        return (
+            bool(self.scheduler_config.async_scheduling)
+            and self._is_async_drafter
+            and bool(combined_selected_tokens)
+            and not discard_sampled_tokens_req_indices
+        )
+
     @property
     def _is_async_drafter(self) -> bool:
         """Whether this worker runs a hidden-state drafter.
@@ -4125,16 +4172,12 @@ class TPUModelRunner(GPUModelRunner):
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
-        drafter = getattr(self, "drafter", None)
-        padded_drafts = getattr(drafter, "_last_padded_drafts_per_chunk", None)
+        padded_drafts = self._fused_assembly_padded_drafts(
+            drafts, len(next_tokens_per_chunk)
+        )
         if (
             len(next_tokens_per_chunk) == 1
-            and drafts is getattr(drafter, "_last_propose_device_out", None)
-            # The general path below counts a draft trimmed by adaptive
-            # verification as rejected; these programs do not.
-            and getattr(self, "_adaptive_verification", None) is None
             and padded_drafts is not None
-            and len(padded_drafts) == 1
             and getattr(self, "max_num_reqs", None) is not None
             and next_tokens_per_chunk[0].device.type == "tpu"
             and padded_drafts[0].shape[0] >= next_tokens_per_chunk[0].shape[0]
@@ -4195,12 +4238,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         if (
             len(next_tokens_per_chunk) == 2
-            and drafts is getattr(drafter, "_last_propose_device_out", None)
-            # The general path below counts a draft trimmed by adaptive
-            # verification as rejected; these programs do not.
-            and getattr(self, "_adaptive_verification", None) is None
             and padded_drafts is not None
-            and len(padded_drafts) == 2
             and getattr(self, "max_num_reqs", None) is not None
             and next_tokens_per_chunk[0].device.type == "tpu"
             and padded_drafts[0].shape[0] >= next_tokens_per_chunk[0].shape[0]
@@ -4378,13 +4416,12 @@ class TPUModelRunner(GPUModelRunner):
             "async prefill bootstrap requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
-        drafter = getattr(self, "drafter", None)
-        padded_drafts = getattr(drafter, "_last_padded_drafts_per_chunk", None)
+        padded_drafts = self._drafter_padded_drafts(
+            drafts, len(combined_selected_tokens)
+        )
         if (
             len(combined_selected_tokens) == 1
-            and drafts is getattr(drafter, "_last_propose_device_out", None)
-            and padded_drafts
-            and len(padded_drafts) == 1
+            and padded_drafts is not None
             and padded_drafts[0].shape[0] >= combined_selected_tokens[0].shape[0]
             and getattr(self, "max_num_reqs", None) is not None
             and combined_selected_tokens[0].device.type == "tpu"
@@ -7525,11 +7562,8 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
         is_async = bool(self.scheduler_config.async_scheduling)
-        defer_modify_prev = (
-            is_async
-            and self._is_async_drafter
-            and bool(combined_selected_tokens)
-            and not discard_sampled_tokens_req_indices
+        defer_modify_prev = TPUModelRunner._defers_prev_rollback(
+            self, combined_selected_tokens, discard_sampled_tokens_req_indices
         )
         if is_async and not defer_modify_prev:
             self._modify_prev_results()

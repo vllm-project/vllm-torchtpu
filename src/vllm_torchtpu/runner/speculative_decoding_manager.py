@@ -90,9 +90,6 @@ class SpecDecodeMetadata:
     max_draft_input_index: int = 0
     _lazy_draft_extract: tuple[object, np.ndarray, int] | None = None
 
-    def __post_init__(self) -> None:
-        self._deferred_cpu = self.__dict__.get("deferred_draft_token_ids_cpu")
-
     def __getattribute__(self, name: str):
         if name == "deferred_draft_token_ids_cpu":
             val = object.__getattribute__(self, "__dict__").get(

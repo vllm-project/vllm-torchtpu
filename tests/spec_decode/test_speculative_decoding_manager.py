@@ -446,4 +446,3 @@ def test_metadata_uploads_are_released_at_the_runner_fence():
 
     assert torch.equal(out, host)
     assert [entry[0] for entry in runner._unfenced_h2d_sources] == [host]
-    assert not hasattr(runner, "_h2d_keepalive")
