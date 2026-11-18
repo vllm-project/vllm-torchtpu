@@ -69,8 +69,15 @@ logger = init_logger(__name__)
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms) is fetched by
 # every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
-# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts;
+# ``.weight_scale_inv`` is the FP8 block scale of DeepSeek-style FP8 checkpoints.
+_EXPERT_WEIGHT_SUFFIXES = (
+    ".weight",
+    ".weight_packed",
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".scale",
+)
 
 # Set to ``source.is_unused_weight`` while ``DefaultModelLoader._get_weights_iterator``
 # runs, so ``_should_skip_weight_tpu`` skips those tensors before ``get_tensor``.
@@ -104,9 +111,10 @@ def _should_skip_weight_tpu(
 
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
-    MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read. Also skips weights
-    marked unused by the loading model's ``is_unused_checkpoint_weight``.
+    MXFP4 ``.weight_packed`` and ``.weight_scale`` names and FP8 block-scale
+    ``.weight_scale_inv`` names, so non-local experts are skipped before
+    their bytes are read. Also skips weights marked unused by the loading
+    model's ``is_unused_checkpoint_weight``.
     """
     if _unused_weight_predicate is not None and _unused_weight_predicate(weight_name):
         # Unused by the loading model (e.g. MTP draft). Used tensors still

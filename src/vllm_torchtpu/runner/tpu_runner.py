@@ -213,6 +213,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.proposer_registry import select_draft_proposer
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -314,8 +315,47 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
+def _update_read_offsets_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    next_tokens: torch.Tensor,
+    num_reqs: torch.Tensor,
+) -> torch.Tensor:
+    """Post-verify read-offset scatter for every mamba group in one program.
+    Each of `groups` is a [width] slot tensor; `next_tokens` the rejection
+    sampler output ([>= num_reqs, K+1], INVALID_TOKEN_ID-padded); `num_reqs`
+    a 0-d tensor, so it enters as a value, not a shape. Rows past it take
+    offset 0 (their slots are the null block). Returns the offsets, one per
+    batch position."""
+    width = groups[0].shape[0]
+    rows = next_tokens.shape[0]
+    if rows >= width:
+        next_tokens = next_tokens[:width]
+    else:
+        next_tokens = torch.nn.functional.pad(
+            next_tokens, (0, 0, 0, width - rows), value=INVALID_TOKEN_ID
+        )
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(width, device=read_offsets.device) < num_reqs
+    offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(read_offsets.dtype)
+    indices = torch.cat(groups, dim=0).long()
+    read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
+    return offsets
+
+
+def _use_fused_read_offset_update(
+    read_offsets: torch.Tensor, next_tokens: torch.Tensor | None
+) -> bool:
+    """Verify chunks take `_update_read_offsets_compiled`; non-verify chunks
+    (`next_tokens is None`, offsets all 0) take the eager scatter. Serving
+    buffers are always on TPU; the device check only routes the CPU unit tests,
+    which the tpu backend cannot trace, to the eager path."""
+    return next_tokens is not None and read_offsets.device.type == "tpu"
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
+_update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
 
@@ -879,6 +919,9 @@ class TPUModelRunner(GPUModelRunner):
         # does not, e.g. a KV connector or CPU-only tests) — in which case
         # mamba and attention share the uniform `num_blocks` as before.
         self._mamba_num_blocks: int | None = None
+        # Optional model-owned inputs and cache (runner/model_adapters.py),
+        # selected in load_model; None keeps the ordinary path.
+        self.model_adapter = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
         # allocated when a request first appears and retained until its KV
         # ownership ends. Keying on req_id (rather than persistent-batch
@@ -1493,7 +1536,10 @@ class TPUModelRunner(GPUModelRunner):
             elif self.speculative_config.method == "dspark":
                 self.drafter = DSparkProposer(self, self.vllm_config)
             elif self.speculative_config.use_eagle():
-                self.drafter = Eagle3Proposer(self, self.vllm_config)
+                # A model directory may supply its own proposer for its draft
+                # architecture; none registered builds the shared one.
+                factory = select_draft_proposer(self.vllm_config) or Eagle3Proposer
+                self.drafter = factory(self, self.vllm_config)
             else:
                 raise NotImplementedError(
                     "Unsupported speculative decoding method: "
@@ -4381,6 +4427,10 @@ class TPUModelRunner(GPUModelRunner):
                 if has_encoder_inputs:
                     synchronize_tensors()
 
+        step_token_store = (
+            self.model_adapter.begin_step() if self.model_adapter is not None else None
+        )
+
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
         batch_composition_stats = None
@@ -4598,6 +4648,23 @@ class TPUModelRunner(GPUModelRunner):
                         src_key, "UNKNOWN" if src_key == "phase" else 0
                     )
 
+            model_kwargs = None
+            if self.model_adapter is not None:
+                from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot
+
+                assert step_token_store is not None
+                assert input_ids is not None
+                model_kwargs = self.model_adapter.prepare_inputs(
+                    ModelInputSnapshot(
+                        step_token_store,
+                        start_index,
+                        num_reqs,
+                        num_tokens_padded,
+                        attn_metadata,
+                        input_ids,
+                    )
+                )
+
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
                 trace_name += (
@@ -4632,6 +4699,7 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
                 )
 
             if nan_check is not None:
@@ -5088,6 +5156,14 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
             return None
+        if _use_fused_read_offset_update(self.mamba_slot_read_offsets, next_tokens):
+            assert next_tokens is not None
+            return _update_read_offsets_compiled(
+                self.mamba_slot_read_offsets,
+                list(indices_per_group),
+                next_tokens,
+                torch.tensor(num_reqs, dtype=torch.int64, device=self.device),
+            )
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
             dtype=torch.int32,
@@ -5789,7 +5865,17 @@ class TPUModelRunner(GPUModelRunner):
                     logprobs=logprobs_chunks,
                 )
 
-        if self.scheduler_config.async_scheduling:
+        # The previous step's sampled-token copy completes only behind this
+        # step's forward, so waiting on it here holds the draft's host-side
+        # preparation and launch until the forward finishes. Nothing the
+        # draft reads depends on the rollback it feeds (the draft seeds on
+        # device; host tokens are read for partial prefills only, i.e. from
+        # the prompt), so wait after the launch instead. With a KV connector
+        # keep the early wait: the save below relies on it.
+        defer_prev_wait = (
+            self.scheduler_config.async_scheduling and not has_kv_transfer_group()
+        )
+        if self.scheduler_config.async_scheduling and not defer_prev_wait:
             self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
@@ -5859,6 +5945,9 @@ class TPUModelRunner(GPUModelRunner):
                     )
         if self._adaptive_verification is not None:
             self._record_draft_confidences()
+
+        if defer_prev_wait:
+            self._modify_prev_results()
 
         if self._is_dspark_pd_producer:
             assert isinstance(self.drafter, DFlashProposer)
@@ -6070,6 +6159,10 @@ class TPUModelRunner(GPUModelRunner):
         return async_output
 
     def load_model(self) -> None:
+        from vllm_torchtpu.runner.model_adapters import select_model_adapter
+
+        self.model_adapter = select_model_adapter(self)
+        self.kv_cache_manager.model_adapter = self.model_adapter
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
@@ -6102,6 +6195,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self.model_adapter is not None:
+            self.model_adapter.bind_model(model)
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self._dp_vocab_logits = dp_vocab_parallel.check_layers_sharded_over_dp(
@@ -6145,6 +6240,10 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self._async_drafter.load_model(self.model)
+            # A model-owned cache binds and names the draft's own layers.
+            bind_draft = getattr(self.model_adapter, "bind_draft", None)
+            if bind_draft is not None:
+                bind_draft(self.drafter)
             # The draft reuses the target's Pallas ops (cached by op name),
             # which were traced against the target's relayouted tables. Its
             # own rope caches and hash tables need the same layout, or the
@@ -6463,6 +6562,10 @@ class TPUModelRunner(GPUModelRunner):
         # Same fence discipline as a serving chunk: release the previous
         # chunk's host sources, then fence this one's before its forward.
         self._wait_input_staging_fence()
+        if (adapter := getattr(self, "model_adapter", None)) is not None:
+            return adapter.dummy_run(
+                num_tokens, num_reqs, profile_prefix, dp_lockstep=dp_lockstep
+            )
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
         assert profile_decode_query_lens is None or profiling
@@ -7615,6 +7718,14 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
             self._precompile_spec_boundary_copies()
+            model_adapter = getattr(self, "model_adapter", None)
+            precompile_inputs = getattr(model_adapter, "precompile_fused_inputs", None)
+            if precompile_inputs is not None:
+                with self._precompile_timed("fused model-adapter inputs"):
+                    precompile_inputs(
+                        self.num_tokens_paddings,
+                        (self.num_reqs_max_model_len, self.num_reqs_most_model_len),
+                    )
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
@@ -7853,7 +7964,7 @@ class TPUModelRunner(GPUModelRunner):
                 for num_tokens in self._backbone_token_paddings():
                     logger.info("  -- num_tokens: %d", num_tokens)
                     if buckets.needs_retrace(num_tokens):
-                        shape_variants.retrace(self.model, self.vllm_config)
+                        shape_variants.retrace(self.model, self.vllm_config, num_tokens)
                     self._backbone_dummy_runs(num_tokens)
                 if buckets.refused:
                     # A refusal that no trace picked up leaves a raising
@@ -9014,11 +9125,16 @@ class TPUModelRunner(GPUModelRunner):
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(
-        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        intermediate_tensors=None,
+        model_kwargs=None,
     ):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
-        kwargs = {}
+        kwargs = {} if model_kwargs is None else dict(model_kwargs)
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(
