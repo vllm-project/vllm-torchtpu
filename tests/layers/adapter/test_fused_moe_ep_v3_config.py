@@ -73,15 +73,14 @@ def test_opt_in_kernel_flags_default_off():
     flags = (
         "combine_real_tokens",
         "sort_index_compare",
-        "compact_message",
         "reorder_chain",
     )
     for config in (Config(), A.apply_config_overrides(Config(), {})):
         assert {f: getattr(config, f) for f in flags} == dict.fromkeys(flags, False)
     on = A.apply_config_overrides(
-        Config(), {"compact_message": True, "reorder_chain": True}
+        Config(), {"sort_index_compare": True, "reorder_chain": True}
     )
-    assert on.compact_message is True and on.reorder_chain is True
+    assert on.sort_index_compare is True and on.reorder_chain is True
 
 
 def test_qwen3_5_dp4_tp2_takes_the_decode_entry():
@@ -89,7 +88,6 @@ def test_qwen3_5_dp4_tp2_takes_the_decode_entry():
     assert A.layout_overrides(_engine(QWEN3_5, 4, 2)) == {
         "combine_real_tokens": True,
         "sort_index_compare": True,
-        "compact_message": True,
         "reorder_chain": True,
         "dense_slots": True,
     }
