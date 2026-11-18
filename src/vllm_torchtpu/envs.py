@@ -109,7 +109,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_PREFILL_SEQUENCE_PARALLEL: bool = True
-    TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 1
+    TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 2
     TPU_MOE_PREFILL_SP_FP8_WIRE: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
@@ -1140,8 +1140,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL", default=True
     ),
     # Tensor-parallel subgroup size for the shared expert under
-    # TPU_MOE_PREFILL_SEQUENCE_PARALLEL (1 replicates per rank).
-    "TPU_MOE_PREFILL_SP_SHARED_GROUP": env_int("TPU_MOE_PREFILL_SP_SHARED_GROUP", 1),
+    # TPU_MOE_PREFILL_SEQUENCE_PARALLEL (1 replicates per rank; 2 halves the
+    # resident copy at the cost of a two-rank row exchange per layer).
+    "TPU_MOE_PREFILL_SP_SHARED_GROUP": env_int("TPU_MOE_PREFILL_SP_SHARED_GROUP", 2),
     # Use FP8 combine wire instead of bfloat16 in fused_ep_moe_v2 under
     # TPU_MOE_PREFILL_SEQUENCE_PARALLEL. Off by default: the routed experts'
     # outputs return to their token owners in bf16, as the dense path's do.
