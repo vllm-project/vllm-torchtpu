@@ -37,6 +37,22 @@ from .geometry import (
     count_layer_types,
     from_hf_config,
 )
+from .hf_loader import dtypes_from_hf_config, load_hf_config
+from .modules import (
+    Dtypes,
+    ModuleCost,
+    Parallel,
+    StepShape,
+    pass_costs,
+)
+from .serving import ConcurrencyRow, ServingRequest, plan
+from .step import (
+    FloorOptions,
+    SpecShape,
+    StepFloor,
+    spec_cycle_floor,
+    step_floor,
+)
 
 __all__ = [
     "CHIPS",
@@ -47,10 +63,25 @@ __all__ = [
     "ChipSpec",
     "Collective",
     "CollectiveConfig",
+    "ConcurrencyRow",
+    "Dtypes",
+    "FloorOptions",
     "LayerCounts",
     "ModelGeometry",
+    "ModuleCost",
+    "Parallel",
+    "ServingRequest",
     "SliceTopology",
+    "SpecShape",
+    "StepFloor",
+    "StepShape",
     "count_layer_types",
+    "dtypes_from_hf_config",
     "from_hf_config",
+    "load_hf_config",
+    "pass_costs",
+    "plan",
+    "spec_cycle_floor",
+    "step_floor",
     "torus_collective_s",
 ]
