@@ -22,8 +22,6 @@ import threading
 import jax
 import jax.numpy as jnp
 from jax import lax
-from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
-from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
@@ -58,6 +56,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     combine_step_tokens,
     rowquant_fp8,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
+from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 
 # The scoring functions the router can apply to the gate logits. These
 # mirror `layers/adapter/moe_routing._apply_scoring_fn` exactly.
@@ -242,6 +242,72 @@ AGQ_MIN_LOCAL_TOKENS = 1024
 # body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
+
+
+def rebalance_ep_tp_pair_experts(
+    pairs_g, local_blocks, block_hist, rows_by_dest, *, ep, ep_tp_size, g_local, e_total
+):
+    """Balance paired (j, j + g_local) experts across ep_tp=2 via VPU bitmask."""
+    g_shift = g_local.bit_length() - 1
+    chip_shift = g_shift + 1
+    n_chips = ep // ep_tp_size
+    counts_2 = rows_by_dest.sum(axis=0).reshape(n_chips, 2, g_local)
+    c0, c1 = counts_2[:, 0, :], counts_2[:, 1, :]
+    hi = jnp.maximum(c0, c1)
+    lo = jnp.minimum(c0, c1)
+    # Sort by 2*max - min so asymmetric heavy pairs alternate across cores while
+    # balanced (H, H) pairs do not skew the alternating parity.
+    pair_key = (2 * hi) - lo
+    pair_rank = jnp.argsort(jnp.argsort(-pair_key, axis=1, stable=True), axis=1).astype(
+        jnp.int32
+    )
+    flip = jnp.where((pair_rank & 1) == 0, c1 > c0, c0 > c1)
+    n_pairs = n_chips * g_local
+    n_words = (n_pairs + 31) // 32
+    flip_pad = jnp.pad(
+        flip.reshape(-1).astype(jnp.uint32), (0, n_words * 32 - n_pairs)
+    ).reshape(n_words, 32)
+    bit_weights = jnp.left_shift(jnp.uint32(1), jnp.arange(32, dtype=jnp.uint32))
+    words = jnp.sum(flip_pad * bit_weights[None, :], axis=1, dtype=jnp.uint32)
+
+    def _remap_ids(ids):
+        # Avoid 1D dynamic LUT gather over T*topk pairs: XLA offloads it to
+        # SparseCore and adds ~438us/layer overhead on uniform routing.
+        pair_idx = jnp.bitwise_or(
+            jnp.left_shift(jnp.right_shift(ids, chip_shift), g_shift),
+            jnp.bitwise_and(ids, jnp.int32(g_local - 1)),
+        )
+        word_idx = jnp.right_shift(pair_idx, 5)
+        bit_idx = jnp.bitwise_and(pair_idx, jnp.int32(31)).astype(jnp.uint32)
+        w = words[0]
+        for wi in range(1, n_words):
+            w = jnp.where(word_idx == jnp.int32(wi), words[wi], w)
+        bit = jnp.bitwise_and(jnp.right_shift(w, bit_idx), jnp.uint32(1))
+        do_flip = jnp.where(
+            (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total)),
+            bit.astype(jnp.int32),
+            jnp.int32(0),
+        )
+        return jnp.bitwise_xor(ids, jnp.left_shift(do_flip, g_shift))
+
+    def _swap_hist(h):
+        h4 = h.reshape(h.shape[0], n_chips, 2, g_local)
+        return jnp.where(flip[None, :, None, :], h4[:, :, ::-1, :], h4).reshape(h.shape)
+
+    base_phys = jnp.broadcast_to(
+        jnp.arange(2 * g_local, dtype=jnp.int32).reshape(1, 2, g_local),
+        (n_chips, 2, g_local),
+    )
+    tp_slot_to_local_phys = jnp.where(
+        flip[:, None, :], base_phys[:, ::-1, :], base_phys
+    ).reshape(n_chips, 2 * g_local)
+    return (
+        _remap_ids(pairs_g),
+        _remap_ids(local_blocks),
+        _swap_hist(block_hist),
+        _swap_hist(rows_by_dest),
+        tp_slot_to_local_phys,
+    )
 
 
 def fused_ep_moe_v2(
@@ -605,6 +671,30 @@ def fused_ep_moe_v2(
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
         )
+        tp_slot_to_local_phys = None
+        if (
+            ep_tp_size == 2
+            and not has_w1_bias
+            and not has_w2_bias
+            and g_local > 0
+            and (g_local & (g_local - 1)) == 0
+        ):
+            (
+                pairs_g,
+                local_blocks,
+                block_hist,
+                rows_by_dest,
+                tp_slot_to_local_phys,
+            ) = rebalance_ep_tp_pair_experts(
+                pairs_g,
+                local_blocks,
+                block_hist,
+                rows_by_dest,
+                ep=ep,
+                ep_tp_size=ep_tp_size,
+                g_local=g_local,
+                e_total=e_total,
+            )
         gathered = GatheredPairs(
             expert_blocks=pairs_g.reshape(T * topk // block, block),
             local_blocks=local_blocks,
@@ -701,7 +791,12 @@ def fused_ep_moe_v2(
             tp_order = jnp.argsort(-grp_rows, axis=1, stable=True).astype(jnp.int32)
             sorted_rows = jnp.take_along_axis(grp_rows, tp_order, axis=1)
             active_step = (sorted_rows.max(axis=0, keepdims=True) > 0).astype(jnp.int32)
-            visit = jnp.concatenate([tp_order, active_step], axis=0)
+            if tp_slot_to_local_phys is not None:
+                chip_phys = tp_slot_to_local_phys[tp_grp].reshape(ep_tp_size, g_local)
+                tp_phys_order = jnp.take_along_axis(chip_phys, tp_order, axis=1)
+                visit = jnp.concatenate([tp_order, active_step, tp_phys_order], axis=0)
+            else:
+                visit = jnp.concatenate([tp_order, active_step], axis=0)
         else:
             visit_1d, _ = expert_visit_list(expert_rows, g_local)
             visit = visit_1d[None, :]

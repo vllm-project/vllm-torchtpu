@@ -1597,6 +1597,7 @@ def tp_pair_vmem_bytes(
     *,
     tp_w1_slots=2,
     tp_w1p_slots=2,
+    tp_w2p_slots=1,
     tp_scl_slots=2,
     ep_tp_size=2,
     weight_format=WeightFormat.FP8,
@@ -1608,10 +1609,10 @@ def tp_pair_vmem_bytes(
 ):
     """VMEM bytes occupied by the TP-pair schedule (`ep_tp_size == 2`).
 
-    Replaces `w1_vm` with `(tp_w1_slots, hidden, 2 * inter_slice)`, `w1s_vm`
-    with `(tp_scl_slots, 2 * inter)`, `w2s_vm` with `(tp_scl_slots, ...)` plus
-    the pair's `tp_w2s_vm` and `tp_w1p_vm` scratch buffers, aligned to the
-    chip's lane and sublane tiling.
+    Replaces `w1_vm` with `(tp_w1_slots, hidden, 2 * inter_slice)`, `w2_vm`
+    with `(1, inter_slice, hidden)`, `w1s_vm` with `(tp_scl_slots, 2 * inter)`,
+    plus `tp_w2s_vm`, `tp_w1p_vm`, and `tp_w2p_vm` scratch buffers, aligned to
+    the chip's lane and sublane tiling.
     """
     if info is None:
         info = pltpu.get_tpu_info()
@@ -1633,12 +1634,15 @@ def tp_pair_vmem_bytes(
     for name, shape, dtype in scratch:
         if name == "w1_vm":
             shape = (tp_w1_slots, hidden, 2 * inter_slice)
+        elif name == "w2_vm":
+            shape = (1, inter_slice, hidden)
         elif name == "w1s_vm":
             shape = (tp_scl_slots, *shape[1:])
         arrays.append((name, shape, dtype))
     arrays += [
         ("tp_w2s_vm", (tp_scl_slots, ep_tp_size * hidden), jnp.float32),
         ("tp_w1p_vm", (tp_w1p_slots, hidden, 2 * inter_slice), form.weight_dtype),
+        ("tp_w2p_vm", (tp_w2p_slots, inter_slice, hidden), form.weight_dtype),
     ]
     arrays += vmem_tile_body_arrays(
         capacity,
