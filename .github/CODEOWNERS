@@ -92,9 +92,9 @@
 /tests/kernels/test_rpa_*.py @kyuyeunk @qizzzh @bigeye @jrplatin @kwang3939
 
 # Kernels: Multi-Head Latent Attention (MLA)
-/src/vllm_torchtpu/kernels/mla/ @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth
-/tests/kernels/test_*mla*.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth
-/tests/kernels/test_dsa_gather.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth
+/src/vllm_torchtpu/kernels/mla/ @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth @pritha90
+/tests/kernels/test_*mla*.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth @pritha90
+/tests/kernels/test_dsa_gather.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth @pritha90
 
 # Kernels: Fused MoE
 /src/vllm_torchtpu/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1
