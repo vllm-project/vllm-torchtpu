@@ -50,7 +50,7 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 
-# Host-only section: the runner's telemetry options (`runner_options`, which
+# Host-only section: the runner's host-side options (`runner_options`, which
 # owns the name) never change a compiled program.
 RUNNER_OPTIONS_SECTION = runner_options.SECTION
 
