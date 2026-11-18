@@ -995,3 +995,34 @@ def test_draft_padding_has_empty_attention_windows(builder, num_reqs, block_size
         torch.arange(1, num_reqs + 1, dtype=torch.int32)[:, None] * 6
         + torch.arange(block_size, dtype=torch.int32)[None, :],
     )
+
+
+@pytest.mark.parametrize("num_tokens", [6, 80, 96, 160, 192, 240, 2048])
+def test_dummy_context_update_has_no_writable_cache_rows(num_tokens):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark
+
+    proposer = _make_proposer()
+    proposer.vllm_config.model_config.get_hidden_size = lambda: 8
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=torch.nn.Embedding(2, 8))
+    )
+    hidden, metadata = proposer._dummy_kv_update_inputs(num_tokens, 48, 4)
+    assert proposer._dummy_kv_update_inputs(num_tokens, 48, 4) == (hidden, metadata)
+    assert not metadata.request_distribution.any()
+    assert not metadata.seq_lens.any()
+    attn = SimpleNamespace(
+        window_size=128,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.ones((2, 64, 8))),
+    )
+    before = attn.swa_cache_layer.kv_cache.clone()
+    slots = dspark._cache_slots(
+        attn.swa_cache_layer.kv_cache, metadata, metadata.input_positions
+    )
+    assert torch.all(slots == -1)
+    dspark._insert_context_kv(
+        attn,
+        torch.full_like(hidden[0], float("nan")),
+        metadata.input_positions,
+        metadata,
+    )
+    torch.testing.assert_close(attn.swa_cache_layer.kv_cache, before)

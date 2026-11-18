@@ -702,16 +702,13 @@ class DFlashProposer:
             (num_reqs * num_blocks,), dtype=torch.int32, device=runner.device
         )
         seq_lens = torch.zeros((num_reqs,), dtype=torch.int32, device=runner.device)
-        seq_lens[0] = num_tokens
 
         query_start_loc = torch.zeros(
             (num_reqs + 1,), dtype=torch.int32, device=runner.device
         )
-        query_start_loc[1:] = num_tokens
 
-        request_distribution = torch.tensor(
-            [0, 0, num_reqs], dtype=torch.int32, device=runner.device
-        )
+        # Idle ranks still join the KV-update graph, but own no cache rows.
+        request_distribution = torch.zeros(3, dtype=torch.int32, device=runner.device)
 
         dummy_attn_metadata = AttentionMetadata(
             input_positions=dummy_positions,

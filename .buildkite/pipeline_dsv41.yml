@@ -168,7 +168,7 @@ steps:
           - >-
             .buildkite/kubernetes/run.sh python -m pytest
             tests/spec_decode/test_dflash.py
-            -k "draft_padding_has_empty_attention_windows or dummy_draft_forward_marks_all_rows_padding"
+            -k "draft_padding_has_empty_attention_windows or dummy_draft_forward_marks_all_rows_padding or dummy_context_update_has_no_writable_cache_rows"
             -q --junitxml=perf_eval_results/dsv41-draft-padding.xml
 
       - label: "DeepSeek-V4.1 index configuration: CPU contracts"
