@@ -31,7 +31,7 @@ from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
-from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu import envs, frontend_options, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.distributed import collectives_options
 from vllm_torchtpu.logger import init_logger
@@ -858,7 +858,6 @@ class TpuPlatform(Platform):
         # Reject a bad host-only section here, where the config is first
         # known, rather than in every worker or at a patch's install. The
         # tpu_frontend patches install from patch_registry below.
-        from vllm_torchtpu import frontend_options
         from vllm_torchtpu.worker import worker_options
 
         frontend_options.get(vllm_config)
