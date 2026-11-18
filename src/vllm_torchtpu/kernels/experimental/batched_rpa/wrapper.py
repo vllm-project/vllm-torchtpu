@@ -865,7 +865,7 @@ def ragged_paged_attention(
             or STATIC operands). Defaults to every operand off.
         decode_exp2: Run the DECODE softmax in base 2; see
             `configs.ServingConfigs.decode_exp2`. Not applied with
-            return_lse. Defaults to False.
+            return_lse or soft_cap. Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -948,6 +948,11 @@ def ragged_paged_attention(
             "Batched RPA: decode_exp2 is not applied to calls that return the "
             "LSE (such as the DCP passes), whose callers merge LSEs in natural "
             "log; those calls keep the base-e decode softmax."
+        )
+    if decode_exp2 and soft_cap is not None:
+        logger.warning_once(
+            "Batched RPA: decode_exp2 is not applied with soft_cap, which caps "
+            "the base-e scores; those calls keep the base-e decode softmax."
         )
     serve_cfgs = configs.ServingConfigs(
         native_fp8=native_fp8,

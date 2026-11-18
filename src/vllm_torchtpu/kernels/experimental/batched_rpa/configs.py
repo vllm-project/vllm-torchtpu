@@ -251,8 +251,8 @@ class ServingConfigs:
     # 0.09016844 rounds to 0.09033203, so the scores are scaled 0.18% more
     # than on the base-e path, and q * scale takes one more bf16 rounding.
     # Not applied when the kernel returns the LSE (return_lse, as the DCP
-    # passes do): callers merge LSEs in natural log. The wrapper logs that
-    # once.
+    # passes do), since callers merge LSEs in natural log, nor with soft_cap,
+    # which caps the base-e scores. The wrapper logs either once.
     decode_exp2: bool = False
 
     def __post_init__(self):
