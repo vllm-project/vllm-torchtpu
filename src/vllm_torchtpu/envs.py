@@ -110,7 +110,7 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_PREFILL_SEQUENCE_PARALLEL: bool = True
     TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 1
-    TPU_MOE_PREFILL_SP_FP8_WIRE: bool = True
+    TPU_MOE_PREFILL_SP_FP8_WIRE: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1143,9 +1143,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MOE_PREFILL_SEQUENCE_PARALLEL (1 replicates per rank).
     "TPU_MOE_PREFILL_SP_SHARED_GROUP": env_int("TPU_MOE_PREFILL_SP_SHARED_GROUP", 1),
     # Use FP8 combine wire instead of bfloat16 in fused_ep_moe_v2 under
-    # TPU_MOE_PREFILL_SEQUENCE_PARALLEL.
+    # TPU_MOE_PREFILL_SEQUENCE_PARALLEL. Off by default: the routed experts'
+    # outputs return to their token owners in bf16, as the dense path's do.
     "TPU_MOE_PREFILL_SP_FP8_WIRE": env_bool(
-        "TPU_MOE_PREFILL_SP_FP8_WIRE", default=True
+        "TPU_MOE_PREFILL_SP_FP8_WIRE", default=False
     ),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense

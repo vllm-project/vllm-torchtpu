@@ -270,6 +270,13 @@ def test_op_takes_own_tokens_and_a_bf16_wire_without_arming_the_layer(monkeypatc
     assert not bridge.fused_moe_ep_supported(layer)
 
 
+def test_default_wire_is_bf16(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_PREFILL_SP_FP8_WIRE", raising=False)
+    _, seen = _build(_experts())
+    _, kw = seen[0]
+    assert kw["wire_dtype"] == jnp.bfloat16
+
+
 def test_fp8_wire_keeps_the_per_visit_pushes(monkeypatch):
     monkeypatch.setenv("TPU_MOE_PREFILL_SP_FP8_WIRE", "1")
     _, seen = _build(_experts())
