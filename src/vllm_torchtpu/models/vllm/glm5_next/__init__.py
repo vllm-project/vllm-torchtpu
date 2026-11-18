@@ -24,11 +24,18 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
+    from .mtp import Glm5NextMTP
 
-__all__ = ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]
+__all__ = [
+    "Glm5NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextMTP",
+]
 
 
 def __getattr__(name: str) -> Any:
+    if name == "Glm5NextMTP":
+        return getattr(importlib.import_module(".mtp", __name__), name)
     if name in __all__:
         return getattr(importlib.import_module(".model", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

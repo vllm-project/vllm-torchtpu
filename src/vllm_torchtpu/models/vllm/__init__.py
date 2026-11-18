@@ -29,6 +29,7 @@ _GLM5_NEXT_CAUSAL_LM = "vllm_torchtpu.models.vllm.glm5_next.model:Glm5NextForCau
 _GLM5_NEXT_COND_GEN = (
     "vllm_torchtpu.models.vllm.glm5_next.model:Glm5NextForConditionalGeneration"
 )
+_GLM5_NEXT_MTP_MODEL = "vllm_torchtpu.models.vllm.glm5_next.mtp:Glm5NextMTP"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -69,6 +70,7 @@ def register_models() -> None:
     ModelRegistry.register_model(
         "Glm5NextForConditionalGeneration", _GLM5_NEXT_COND_GEN
     )
+    ModelRegistry.register_model("Glm5NextMTPModel", _GLM5_NEXT_MTP_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
