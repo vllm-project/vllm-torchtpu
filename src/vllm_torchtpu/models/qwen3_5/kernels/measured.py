@@ -14,7 +14,7 @@
 """Where the fused q/k norm + rope and the fused GDN gated norm + FP8
 quantization were measured, and so where they run.
 
-Both kernels ran on every leg of the IX points: Qwen3.5-397B-A17B on TPU7x,
+Both kernels ran on every leg of the validation entries: Qwen3.5-397B-A17B on TPU7x,
 prefill legs at TP1 and decode legs at TP2 and TP8. Each changes the last
 bits of the forward pass (no bf16 rounding between the norm and the rope; the
 out_proj's FP8 rows quantized from the f32 gated norm), so they run only
