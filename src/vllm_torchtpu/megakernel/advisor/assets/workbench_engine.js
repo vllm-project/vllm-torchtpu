@@ -114,24 +114,39 @@
     return wl.phase === 'verify' ? Math.max(1, specTok) + 1 : 1;
   }
   const DEFAULT_DECLARED_PHASES = CORE_LIM.default_declared_phases || ['decode', 'verify'];
+  function sameLayout(d, wl) {
+    const wlTp = wl.tp ?? WL_DEF.tp ?? 8;
+    const wlEp = wl.ep ?? WL_DEF.ep ?? 1;
+    const wlDp = wl.dp ?? WL_DEF.dp ?? 1;
+    const wlPp = wl.pp ?? WL_DEF.pp ?? 1;
+    const wlDcp = wl.dcp ?? WL_DEF.dcp ?? 1;
+    return (d.tp ?? 1) === wlTp &&
+      (d.ep ?? 1) === wlEp &&
+      (d.dp ?? 1) === wlDp &&
+      (d.pp ?? 1) === wlPp &&
+      (d.dcp ?? 1) === wlDcp;
+  }
   // Deployment blocks that declare scope `sc` for the phase. A block without phases
   // covers decode and verify only, and a block needs a source and a rank count.
   function declaredBlocks(p, sc, phase) {
     return declaredFor(p.name).filter(
-      d => d && d.source && d.ranks > 0 && Array.isArray(d.scopes) && d.scopes.includes(sc) &&
+      d => d && String(d.source || '').trim() && d.ranks > 0 &&
+        Array.isArray(d.scopes) && d.scopes.includes(sc) &&
         (Array.isArray(d.phases) && d.phases.length ? d.phases : DEFAULT_DECLARED_PHASES)
           .includes(phase)
     );
   }
-  // The block that declares scope `sc` at this rank count for the phase.
-  function findDeclaration(p, sc, effTp, phase) {
-    return declaredBlocks(p, sc, phase).find(d => effTp === d.ranks) || null;
+  // The block that declares scope `sc` at this rank count, phase, and layout.
+  function findDeclaration(p, sc, effTp, wl) {
+    return declaredBlocks(p, sc, wl.phase).find(
+      d => effTp === d.ranks && sameLayout(d, wl)
+    ) || null;
   }
   // Most rows the megakernel serves in one decode or verify call (0: no declared limit).
   // The workload's own limit wins over a preset's.
   function singleCallRowLimit(p, wl, effTp) {
     if (wl.phase !== 'decode' && wl.phase !== 'verify') return 0;
-    const decl = findDeclaration(p, 'whole_step', effTp, wl.phase);
+    const decl = findDeclaration(p, 'whole_step', effTp, wl);
     return (wl.maxRowsPerCall ?? wl.max_rows_per_call ?? 0) ||
       (decl ? decl.max_rows : 0);
   }
@@ -142,15 +157,26 @@
       (decl ? (decl.max_total_rows || decl.max_rows) : 0) ||
       CORE_LIM.max_batch_rows;
   }
+  // Whether one call is larger than the core's default bucket list.
+  function exceedsDefaultBuckets(wl, rowsPerCall) {
+    if (wl.phase === 'decode') {
+      return rowsPerCall > CORE_LIM.default_decode_bucket_top;
+    }
+    if (wl.phase === 'verify') {
+      return rowsPerCall > CORE_LIM.default_verify_bucket_top;
+    }
+    return false;
+  }
   function evaluateSupport(sc, p, wl, ch, ctx) {
     const batchRaw = wl.batch !== undefined ? wl.batch : WL_DEF.batch;
     if (sc === 'per_op' || batchRaw <= 0) {
       return { support: 'baseline', blockers: [] };
     }
-    // A declaration states that a runtime exists for this model, scope, rank count and
-    // phase, so it supplies the row limit and layer families checked below.
+    // A declaration states that a runtime exists for this model, scope, phase, rank
+    // count, and layout, so it supplies the row limit and layer families checked below.
     const blocks = declaredBlocks(p, sc, wl.phase);
-    const decl = blocks.find(d => ctx.effTp === d.ranks) || null;
+    const rankMatches = blocks.filter(d => ctx.effTp === d.ranks);
+    const decl = rankMatches.find(d => sameLayout(d, wl)) || null;
     const fams = p.layer_families || [];
     const hasUnmodeled = !decl && fams.some(f => !SUPPORTED_FAM.has(f));
     const maxAr = CORE_LIM.max_ar_slots_per_layer;
@@ -171,9 +197,13 @@
     }
     // Declared rank counts restrict a model. Without a declaration for this scope and
     // phase, the core rank grid applies.
-    const rankBad = blocks.length > 0 ? !decl : !VERIFIED_RANKS.has(ctx.effTp);
+    const rankBad = blocks.length > 0
+      ? rankMatches.length === 0 : !VERIFIED_RANKS.has(ctx.effTp);
     if (rankBad) {
       blockers.push('rank_count_outside_core_grid');
+    }
+    if (rankMatches.length > 0 && !decl) {
+      blockers.push('layout_not_declared');
     }
     if (!CHIP_KINDS.has(chipKind)) {
       blockers.push('chip_without_core_budget');
@@ -184,6 +214,11 @@
     if (hasUnmodeled) blockers.push('unmodeled_layer_family');
     if (archUnv) blockers.push('model_type_unrecognized');
     if (plannerBad) blockers.push('planner_rejected');
+    const maxRowsPerCall = wl.maxRowsPerCall ?? wl.max_rows_per_call ?? 0;
+    if (sc === 'whole_step' && !decl && maxRowsPerCall === 0 &&
+        exceedsDefaultBuckets(wl, ctx.activeTokens)) {
+      blockers.push('row_limit_not_stated');
+    }
     if (blockers.length > 0) {
       return { support: 'hypothetical', blockers };
     }
@@ -481,6 +516,35 @@
     }
     return { lo: rawOp, hi: Math.max(rawOp, wl.launchGapHiUs ?? defaultGapUpper) };
   }
+  function resolveMeasuredArS(callsRaw, effTp, path, wl) {
+    if (effTp <= 1 || !Array.isArray(callsRaw) || callsRaw.length === 0) return null;
+    if (wl && (wl.source_kind === 'architectural_prior' ||
+               wl.sourceKind === 'architectural_prior')) {
+      return null;
+    }
+    const matched = [];
+    for (const c of callsRaw) {
+      if (!c || typeof c !== 'object') continue;
+      const cPath = (c.path === undefined || c.path === null) ? 'xla' : String(c.path);
+      const cOp = (c.op === undefined || c.op === null)
+        ? '' : String(c.op).trim().toLowerCase().replace(/_/g, '-');
+      const cGrp = Math.max(2, Math.trunc(Number(c.group_size ?? c.groupSize ?? 2)) || 2);
+      if (cPath !== path || cOp !== 'all-reduce' || cGrp !== effTp) continue;
+      const hasMean = typeof c.mean_latency_us === 'number' &&
+        Number.isFinite(c.mean_latency_us);
+      const hasMed = typeof c.latency_us === 'number' && Number.isFinite(c.latency_us);
+      if (!hasMean && !hasMed) continue;
+      const valUs = hasMean ? c.mean_latency_us : c.latency_us;
+      const nVal = Math.max(0, Math.trunc(Number(c.n ?? 1)));
+      matched.push({ valUs, n: nVal });
+    }
+    if (matched.length === 0) return null;
+    const totalN = matched.reduce((acc, m) => acc + m.n, 0);
+    const combinedUs = totalN > 0
+      ? (matched.reduce((acc, m) => acc + m.valUs * m.n, 0) / totalN)
+      : (matched.reduce((acc, m) => acc + m.valUs, 0) / matched.length);
+    return combinedUs * 1e-6;
+  }
   function evaluateWorkload(wl, profOverride, chipOverride) {
     const p = profOverride || PROF, ch = chipOverride || CHIP;
     const dtB = k => DTYPE_BYTES[String(p[k] || 'fp8').toLowerCase()] || 1.0;
@@ -627,10 +691,13 @@
     const bracketHi = ch.collective_latency_us_bracket
       ? ch.collective_latency_us_bracket[1] : defCollUs;
     const collUs = wl.collHopUs !== undefined ? wl.collHopUs : defCollUs;
-    const collHiUs = wl.calibrated
-      ? Math.max(collUs, wl.collHopHiUs ?? collUs)
-      : Math.max(collUs, wl.collHopHiUs ?? bracketHi);
+    const collHiUs = Math.max(collUs, wl.collHopHiUs ?? bracketHi);
     const latColl = collUs * 1e-6, latCollHi = collHiUs * 1e-6;
+    const rawCollectiveCalls = wl.collectiveCalls || wl.collective_calls || [];
+    const measuredArXlaS = resolveMeasuredArS(rawCollectiveCalls, effTp, 'xla', wl);
+    const measuredArInKernelS = resolveMeasuredArS(
+      rawCollectiveCalls, effTp, 'in_kernel', wl
+    );
     const arInfo = allReduceCost(tokResBytes, effTp, latColl, ch, wl);
     const numAr = (p.ar_slots_per_layer || 2) * layersLocal;
     const bwHbm = ch.hbm_bw_bytes_per_s;
@@ -808,7 +875,7 @@
       const isGrpMode = moeMode === 'grouped_on_chip';
       const canGroupMoe = !isFusedMulti || epDp === 1 ||
         ((effTp * epDp <= 8) && isGrpMode);
-      const moeDecl = findDeclaration(p, sc, effTp, wl.phase);
+      const moeDecl = findDeclaration(p, sc, effTp, wl);
       const declLayout = moeDecl ? String(moeDecl.moe_layout || '') : '';
       // A declared megakernel runs the expert layout its deployment states.
       const groupedMoe = declLayout === 'grouped' || (declLayout !== 'masked' &&
@@ -834,22 +901,31 @@
       if (tiled) {
         actBytes = Math.max(actBytes, 2.0 * resStreams * layersLocal * tokResBytes);
       }
+      const measuredArS = sc === 'per_op' ? measuredArXlaS : measuredArInKernelS;
+      const hasMeasuredAr = measuredArS !== null && effTp > 1;
+      const measuredArTotalS = hasMeasuredAr ? (numAr * nSplits * measuredArS) : 0.0;
       const xlaArFactor = (sc === 'per_op' && effTp > 1) ? 2 : 1;
-      const xlaHbmCollBytes = (sc === 'per_op' && effTp > 1)
+      const xlaHbmCollBytes = (!hasMeasuredAr && sc === 'per_op' && effTp > 1)
         ? 2.0 * numAr * tokResBytes : 0.0;
       const overlappedComm = isFusedMulti && nSplits === 1;
-      const arAndPcpS = numAr * (
-        arInfo.xferS + nSplits * xlaArFactor * arInfo.latS
-      ) + xlaHbmCollBytes / bwHbm + pcpRingTime;
+      const arAndPcpS = (hasMeasuredAr
+        ? measuredArTotalS
+        : (numAr * (arInfo.xferS + nSplits * xlaArFactor * arInfo.latS) +
+           xlaHbmCollBytes / bwHbm)
+      ) + pcpRingTime;
       const a2aSyncS = (lMoe > 0 && epDp > 1)
         ? lMoe * (a2aTime + 2 * nSplits * xlaArFactor * latColl) : 0.0;
-      const dcnSyncS = numAr * nSplits * xlaArFactor * arInfo.interLatS;
+      const dcnSyncS = hasMeasuredAr
+        ? 0.0 : (numAr * nSplits * xlaArFactor * arInfo.interLatS);
       const syncStageS = overlappedComm
         ? (dcnSyncS + ppStageTime + a2aSyncS)
         : (isFusedMulti ? (arAndPcpS + ppStageTime + a2aSyncS) : 0.0);
       const commS = overlappedComm
         ? (arAndPcpS - dcnSyncS)
         : (isFusedMulti ? 0.0 : (arAndPcpS + ppStageTime + a2aSyncS));
+      const commInCore = overlappedComm || !isFusedMulti;
+      const measuredInCommS = commInCore ? measuredArTotalS : 0.0;
+      const measuredInSyncS = commInCore ? 0.0 : measuredArTotalS;
       const effStateBytes = kvReadBytes + recRwBytes;
       let fillDrainS = (nOps - 1) * (firstSlot / bwHbm + 2.0 * latColl) + syncStageS;
       if (tiled) {
@@ -922,15 +998,19 @@
       const tVecMoeAch = (vecOpsMoe / vecRate) / Math.max(1e-3, etaDense);
       const tCompAch = tDenseAch + tMoeAch;
       const tHbmAch = tHbm / Math.max(1e-3, etaHbm);
-      const tCommAch = commS / Math.max(1e-3, etaIci);
+      const unmeasuredCommS = Math.max(0.0, commS - measuredInCommS);
+      const tCommAch = measuredInCommS + unmeasuredCommS / Math.max(1e-3, etaIci);
+      const unmeasuredSyncS = Math.max(0.0, syncStageS - measuredInSyncS);
       const syncExtraS = isFusedMulti
-        ? syncStageS * (1.0 / Math.max(1e-3, etaIci) - 1.0) : 0.0;
+        ? unmeasuredSyncS * (1.0 / Math.max(1e-3, etaIci) - 1.0) : 0.0;
       const routedHbmAchS = routedHbmS / Math.max(1e-3, etaHbm);
       const chainAchS = routedChain(tDenseAch, routedHbmAchS, tMoeAch, tVecMoeAch);
       const achCoreS = coreTime(tHbmAch, chainAchS, tCommAch, isFusedMulti) + syncExtraS;
       const stepAchUs = (achCoreS + fillDrainS) * 1e6 + repassUs + launchUs;
-      const arExtraS = (numAr * nSplits * xlaArFactor * arInfo.intraHops) *
-        Math.max(0.0, latCollHi - latColl);
+      const arExtraS = hasMeasuredAr ? 0.0 : (
+        (numAr * nSplits * xlaArFactor * arInfo.intraHops) *
+        Math.max(0.0, latCollHi - latColl)
+      );
       const a2aCnt = (lMoe > 0 && epDp > 1) ? (2 * lMoe * nSplits * xlaArFactor) : 0;
       const a2aExtraS = a2aCnt * Math.max(0.0, latCollHi - latColl);
       const chainHiS = routedChain(tDenseUpper, routedHbmS, tMoe, tVecMoe);
@@ -946,7 +1026,8 @@
         tMatmulDenseUpperAch,
         (vecOpsDense / vecRate) / Math.max(1e-3, etaDense)
       );
-      const tCommHiAch = (commS + arExtraS) / Math.max(1e-3, etaIci);
+      const tCommHiAch = measuredInCommS +
+        (unmeasuredCommS + arExtraS) / Math.max(1e-3, etaIci);
       const chainHiAchS = routedChain(tDenseHiAch, routedHbmAchS, tMoeAch, tVecMoeAch);
       const achHiCoreS = coreTime(tHbmAch, chainHiAchS, tCommHiAch, overlappedComm) +
         syncExtraS + (a2aExtraS / Math.max(1e-3, etaIci));
@@ -984,8 +1065,8 @@
       );
       // The strict floor prices all-reduce transfer at the egress sum. That transfer sits
       // in commS, or in the sync stage of fillDrainS when a fused scope runs several passes.
-      const arStrictSavingS = numAr * (arInfo.xferS - arInfo.xferStrictS);
-      const commInCore = overlappedComm || !isFusedMulti;
+      const arStrictSavingS = hasMeasuredAr
+        ? 0.0 : numAr * (arInfo.xferS - arInfo.xferStrictS);
       const commStrictS = commS - (commInCore ? arStrictSavingS : 0.0);
       const fillDrainStrictS = fillDrainS - (commInCore ? 0.0 : arStrictSavingS);
       const roofCoreStrictS = coreTime(tHbmStrict, chainStrictS, commStrictS, isFusedMulti);
