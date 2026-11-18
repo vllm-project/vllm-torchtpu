@@ -239,6 +239,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_POOL_STAGING_LEASES",
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
+    # Per-step host phase logging (runner/host_phases.py).
+    "VLLM_TPU_HOST_PHASES",
+    # Per-step token-bucket counts (runner/step_buckets.py).
+    "VLLM_TPU_LOG_STEP_BUCKETS",
     "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
     "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
     "TPU_RAIDEN_TRANSFER_NUM_SLOTS",

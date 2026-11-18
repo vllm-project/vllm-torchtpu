@@ -126,7 +126,12 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
+from vllm_torchtpu.runner import (
+    greedy_top_tokens,
+    host_phases,
+    spec_precompile_shapes,
+    step_buckets,
+)
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -1096,6 +1101,7 @@ class TPUModelRunner(GPUModelRunner):
         self._stage_timing = RunnerStageTiming(
             profiler_rank, enabled=self._stage_timing_has_consumer()
         )
+        host_phases.set_rank(profiler_rank)
         if envs.TPU_FOREACH_MUTATION_EPILOGUE:
             from vllm_torchtpu.compilation import foreach_epilogue
 
@@ -3701,6 +3707,7 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        host_phases.begin_step()
         pinner = getattr(self, "_cpu_pinner", None)
         if pinner is not None:
             pinner.maybe_pin()
@@ -3708,8 +3715,10 @@ class TPUModelRunner(GPUModelRunner):
             self._host_levers_first_step()
         # Update cached state
         self._update_states(scheduler_output)
+        host_phases.mark("update_states")
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
+            host_phases.mark("flush_async_results")
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -3750,6 +3759,7 @@ class TPUModelRunner(GPUModelRunner):
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
         )
         self._dp_step_num_chunks = target_num_chunks
+        host_phases.mark("reorder_count")
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -3862,6 +3872,7 @@ class TPUModelRunner(GPUModelRunner):
             ) = self._prepare_inputs(
                 scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
             )
+            host_phases.mark("prepare_inputs")
 
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
@@ -3874,6 +3885,7 @@ class TPUModelRunner(GPUModelRunner):
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices
             )
+            host_phases.mark("seed_reset_subst")
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
             # rejection sampler's draft_token_ids from the device.
@@ -3941,6 +3953,7 @@ class TPUModelRunner(GPUModelRunner):
             assert sizing_input is not None
             num_tokens_padded = sizing_input.shape[0]
             self._token_padding_update(num_tokens_padded)
+            step_buckets.count(num_tokens_padded)
             intermediate_tensors = None
             if self._pp_wave is not None:
                 intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
@@ -3974,6 +3987,7 @@ class TPUModelRunner(GPUModelRunner):
                         src_key, "UNKNOWN" if src_key == "phase" else 0
                     )
 
+            host_phases.mark("model_inputs")
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
                 trace_name += (
@@ -4009,6 +4023,7 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
                 )
+            host_phases.mark("forward_dispatch")
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
@@ -4120,6 +4135,7 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
             return None
+        host_phases.mark("post_forward")
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=logits_list,
@@ -4685,6 +4701,7 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
+        host_phases.mark("between_execute_and_sample")
 
         # Used to keep rand draws consistent across TP ranks.
         sampling_generator = self._get_sampling_generator()
@@ -4979,6 +4996,7 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
+        host_phases.mark("sample_verify")
         next_tokens_tpu = None
         copy_state = None
         if combined_selected_tokens:
@@ -4989,8 +5007,10 @@ class TPUModelRunner(GPUModelRunner):
                     spec_logprobs=spec_logprobs_chunks,
                 )
 
+        host_phases.mark("token_d2h_bookkeeping")
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
+        host_phases.mark("modify_prev_results")
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
         # (mirrors the tpu-inference reference, where a single
@@ -5038,6 +5058,7 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
+        host_phases.mark("draft_propose")
         if copy_state is not None and self._fence_spec_kv_under_token_copy:
             # A Raiden producer registers a request's KV blocks ahead of its
             # finish, so a consumer may pull as soon as the first token is
@@ -5053,6 +5074,7 @@ class TPUModelRunner(GPUModelRunner):
             if isinstance(eagle3_drafts, torch.Tensor):
                 synchronize_tensors([eagle3_drafts], wait=False)
             copy_state.fence_pending_device_work()
+        host_phases.mark("draft_fence")
 
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
@@ -5072,6 +5094,7 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_group_index,
             kv_connector_stats,
         ) = self.get_finished_kv_transfers(scheduler_output)
+        host_phases.mark("kv_save_and_finished")
 
         kv_connector_output = (
             None
@@ -5251,8 +5274,10 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                 )
 
+            host_phases.mark("sample_tail_sync")
             return final_output
 
+        host_phases.mark("sample_tail")
         return async_output
 
     def load_model(self) -> None:

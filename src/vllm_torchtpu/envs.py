@@ -303,6 +303,8 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_HOST_PHASES: int = 0
+    VLLM_TPU_LOG_STEP_BUCKETS: int = 0
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
@@ -2230,6 +2232,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Log each rank's per-step host time by runner phase every N steps
+    # (0 = off); runner/host_phases.py.
+    "VLLM_TPU_HOST_PHASES": env_nonnegative_int("VLLM_TPU_HOST_PHASES", 0),
+    # Log each rank's cumulative step counts per padded token bucket every N
+    # steps (0 = off); runner/step_buckets.py.
+    "VLLM_TPU_LOG_STEP_BUCKETS": env_nonnegative_int("VLLM_TPU_LOG_STEP_BUCKETS", 0),
     # API server: tokenize chat prompts piecewise between added tokens and
     # cache message-body pieces across turns (segment_tokenize.py). Exact;
     # falls back to full tokenization for ineligible tokenizers/requests.
