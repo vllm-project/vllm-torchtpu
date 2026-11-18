@@ -99,19 +99,22 @@ def check_config(vllm_config: Any) -> None:
     build, with TPU_DCP_PREFILL_TOKEN_PARALLEL's checks)."""
     parallel = vllm_config.parallel_config
     tp = int(parallel.tensor_parallel_size)
-    split_rows = dcp_token_parallel_op.layout_for(vllm_config).split_rows
     refusals = {
         "needs TPU_MOE_PREFILL_SEQUENCE_PARALLEL": (
             not envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
         ),
         "needs TPU_DCP_PREFILL_TOKEN_PARALLEL": not envs.TPU_DCP_PREFILL_TOKEN_PARALLEL,
-        "needs decode_context_parallel_size == tensor_parallel_size (every rank "
-        "holds a DCP shard and a residual row block)": (
-            parallel.decode_context_parallel_size != parallel.tensor_parallel_size
+        "needs decode_context_parallel_size == tensor_parallel_size > 1 (every "
+        "rank holds a DCP shard and a residual row block)": (
+            parallel.decode_context_parallel_size != tp or tp < 2
         ),
-        f"needs every bucket it takes to give rank 0 at least the {split_rows} "
-        "DCP rows": (envs.bucket_gate_edge(MIN_TOKENS) + 1) // tp < split_rows,
     }
+    if not any(refusals.values()):
+        split_rows = dcp_token_parallel_op.layout_for(vllm_config).split_rows
+        refusals[
+            f"needs every bucket it takes to give rank 0 at least the {split_rows} "
+            "DCP rows"
+        ] = (envs.bucket_gate_edge(MIN_TOKENS) + 1) // tp < split_rows
     bad = [why for why, hit in refusals.items() if hit]
     if bad:
         raise NotImplementedError("TPU_MLA_PREFILL_SEQUENCE_ROWS " + "; ".join(bad))
@@ -238,13 +241,21 @@ def arm(mla: Any) -> None:
     setattr(mla, ROWS_ATTR, _build_ops())
 
 
+def _prefetched(mla: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """What `prefetch` gathers: o_proj's weight, W_UV and o_proj's scale."""
+    return mla.o_proj.weight, mla.mla_attn.W_UV, mla.o_proj.weight_scale
+
+
 def keep_list(mla: Any) -> list[torch.Tensor]:
     """Every tensor the layer's attention reads on any bucket, for the layer's
     keep list (`moe_prefill_sp.KEEP_ATTR`): the warmup hands a bucket over
-    only between traces that lift the same buffers, and the rows block reads
-    neither the wrapper's operands (o_proj's kernel copy, the token-parallel
-    rank, the local-q window) nor the decode buckets' W_UV / W_UK copies,
-    while it reads o_proj's weight and W_UV, which the decode buckets need not."""
+    only between traces that lift the same buffers under the same names, and
+    the rows block reads neither the wrapper's operands (o_proj's kernel copy,
+    the token-parallel rank, the local-q window) nor the decode buckets' W_UV /
+    W_UK / W_O copies, while it reads o_proj's weight and W_UV, which the decode
+    buckets need not. `_prefetched(mla)` comes first: `prefetch` reads it from
+    the keep list (a layer early), so every trace names it as the keep list
+    does."""
     attn = mla.mla_attn
     tp_op = getattr(attn, "sparse_mla_tp_op", None)
     rotary = getattr(mla, "rotary_emb", None)
@@ -260,16 +271,18 @@ def keep_list(mla: Any) -> list[torch.Tensor]:
         *(
             getattr(attn, name, None)
             for name in (
-                "W_UV",
                 "W_UK_T",
+                "W_UK_T_scale",
                 "W_UK_T_dcp_qrep",
                 "W_UV_dcp_qrep",
                 "W_UV_dcp_qrep_scale",
+                "W_O_dcp_qrep",
+                "W_O_dcp_qrep_scale",
             )
         ),
     )
     seen: dict[int, torch.Tensor] = {}
-    for t in (*mla.parameters(), *mla.buffers(), *operands):
+    for t in (*_prefetched(mla), *mla.parameters(), *mla.buffers(), *operands):
         if isinstance(t, torch.Tensor):
             seen.setdefault(id(t), t)
     return list(seen.values())
@@ -292,20 +305,15 @@ def armed(layer: Any) -> bool:
 
 
 def prefetch(
-    layer: Any, after: torch.Tensor
+    layer: Any, keep: list[torch.Tensor], after: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Every rank's o_proj, W_UV and o_proj scale shard of `layer`
     (`rows_oproj.gather_shards`), gathered once `after` (this rank's rows of
     the layer input before) exists: the gather has no activation input, so it
-    can run under the layers in between."""
-    mla = layer.self_attn.mla_attn
-    rows: _Rows = getattr(mla, ROWS_ATTR)
-    return rows.prefetch_op(
-        mla.o_proj.weight,
-        mla.mla_attn.W_UV,
-        mla.o_proj.weight_scale,
-        after,
-    )
+    can run under the layers in between. `keep` is the layer's keep list,
+    `keep_list` first: the shards are read from it, not from the modules."""
+    rows: _Rows = getattr(layer.self_attn.mla_attn, ROWS_ATTR)
+    return rows.prefetch_op(keep[0], keep[1], keep[2], after)
 
 
 def _rope(mla: Any):
@@ -383,7 +391,9 @@ def forward(
     kv_all = payload[:, : mla.kv_lora_rank].view(kv_q.dtype)
     kpe_end = mla.kv_lora_rank + mla.qk_rope_head_dim
     kpe_all = payload[:, mla.kv_lora_rank : kpe_end].view(kpe_q.dtype)
-    # The DCP sub-batch's rows are rank 0's own first rows.
+    # The DCP sub-batch's rows are rank 0's own first rows. The rows buckets
+    # carry more than split_rows real tokens, so the TPU all-reduce's
+    # valid-row count (from the step's padding mask) covers all of them.
     src = torch.cat(src, dim=-1)
     src = tensor_model_parallel_all_reduce(
         torch.where(rank.reshape(1, 1) == 0, src, torch.zeros_like(src))

@@ -511,10 +511,15 @@ def patched_model_forward(
             # input on: they run under this layer.
             current, gathered = gathered, None
             if i + 1 < len(layers) and mla_prefill_rows.armed(layers[i + 1]):
-                gathered = mla_prefill_rows.prefetch(layers[i + 1], hidden_states)
+                after = layers[i + 1]
+                gathered = mla_prefill_rows.prefetch(
+                    after, getattr(after, KEEP_ATTR), hidden_states
+                )
             if mla_prefill_rows.armed(layer):
                 if current is None:
-                    current = mla_prefill_rows.prefetch(layer, hidden_states)
+                    current = mla_prefill_rows.prefetch(
+                        layer, getattr(layer, KEEP_ATTR), hidden_states
+                    )
                 hidden_states, residual = _rows_layer_forward(
                     layer, positions, hidden_states, residual, current
                 )
@@ -602,6 +607,16 @@ def _keep_list(mlp: torch.nn.Module) -> list[torch.Tensor]:
     return list(seen.values())
 
 
+def layer_keep(layer: Any, rows: bool) -> list[torch.Tensor]:
+    """An armed MoE layer's keep list; with the rows block, the attention's
+    `mla_prefill_rows.keep_list` first (`mla_prefill_rows.prefetch` reads its
+    leading entries)."""
+    keep = _keep_list(layer.mlp)
+    if rows:
+        keep = mla_prefill_rows.keep_list(layer.self_attn.mla_attn) + keep
+    return keep
+
+
 def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     """Prepare every MoE layer of the backbone; returns how many. Collective
     over the TP group (weight gathers, the EP mesh). Raises for anything the
@@ -676,11 +691,9 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             [bool(layer.self_attn.mla_attn.skip_topk) for layer in layers[first:]]
         )
     for layer, rows in zip(layers[first:], rows_armed):
-        keep = _keep_list(layer.mlp)
         if rows:
             mla_prefill_rows.arm(layer.self_attn.mla_attn)
-            keep += mla_prefill_rows.keep_list(layer.self_attn.mla_attn)
-        setattr(layer, KEEP_ATTR, keep)
+        setattr(layer, KEEP_ATTR, layer_keep(layer, rows))
     setattr(backbone, KEEP_ATTR, True)
     if envs.TPU_MLA_PREFILL_SEQUENCE_ROWS:
         logger.info(
