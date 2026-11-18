@@ -48,7 +48,7 @@ off by default, so a pipeline that sets none of them is scheduled as before.
 
 import math
 import time
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -85,6 +85,27 @@ SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler
 RETENTION_ARCHITECTURES = frozenset(
     {"Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"}
 )
+
+
+@runtime_checkable
+class TransferPoller(Protocol):
+    """A KV connector that completes finished async loads when the scheduler
+    polls it at the start of a step (the multi-connector and the Raiden
+    offloading connector of #3083)."""
+
+    def poll_and_complete_transfers(self, scheduler: Any) -> Any: ...
+
+
+@runtime_checkable
+class DivergentHitResolver(Protocol):
+    """A KV connector that decides how much of a diverged local hybrid hit to
+    keep: None keeps the reconciled hit, otherwise the number of local tokens
+    to keep (the multi-connector and the Raiden offloading connector of
+    #3083)."""
+
+    def resolve_divergent_local_hit_tokens(
+        self, request: Any, num_local: int, num_reconciled: int, block_size: int
+    ) -> int | None: ...
 
 
 def _retains_hybrid_state(vllm_config: Any) -> bool:
@@ -172,9 +193,12 @@ class TpuPipelineChunkScheduler(Scheduler):
             kv_transfer_config is not None
             and kv_transfer_config.kv_role == "kv_producer"
         )
+        # As in PrefixAwareScheduler: kv_both (an offloading connector on an
+        # aggregated engine) is also a producer, so it is not a consumer here.
         self._is_kv_consumer = (
             kv_transfer_config is not None
-            and kv_transfer_config.kv_role != "kv_producer"
+            and kv_transfer_config.is_kv_consumer
+            and not kv_transfer_config.is_kv_producer
         )
         options = pp_scheduler_options.get(self.vllm_config)
         if options.quadratic_cost and not self._equal_cost:
@@ -198,6 +222,30 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._hit_estimator: ExternalHitEstimator | None = (
             self.connector if isinstance(self.connector, ExternalHitEstimator) else None
         )
+        # The connector's async-load poll and divergent-hit decision, which
+        # the prefix-aware admission uses.
+        self._transfer_poller: TransferPoller | None = (
+            self.connector if isinstance(self.connector, TransferPoller) else None
+        )
+        self._hit_resolver: DivergentHitResolver | None = (
+            self.connector if isinstance(self.connector, DivergentHitResolver) else None
+        )
+        if self._prefix_aware and self.connector is not None:
+            missing = [
+                name
+                for name, hook in (
+                    ("poll_and_complete_transfers", self._transfer_poller),
+                    ("resolve_divergent_local_hit_tokens", self._hit_resolver),
+                )
+                if hook is None
+            ]
+            if missing:
+                logger.warning(
+                    "Pipeline chunk scheduler: the KV connector %s has no %s; "
+                    "the prefix-aware admission runs without it.",
+                    type(self.connector).__name__,
+                    " or ".join(missing),
+                )
         self._retention: HybridStateRetention | None = None
         if _retains_hybrid_state(self.vllm_config):
             retention = HybridStateRetention(self.kv_cache_manager)
@@ -369,17 +417,17 @@ class TpuPipelineChunkScheduler(Scheduler):
         if hit is not None:
             request._tpu_local_hit_tokens = hit[1]
             return hit
-        connector = self.connector
+        resolver = self._hit_resolver
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
             super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         )
-        if hit_diverged and hasattr(connector, "resolve_divergent_local_hit_tokens"):
+        if hit_diverged and resolver is not None:
             kvm = self.kv_cache_manager
             reconciled_blocks, num_reconciled, reconciled_boundary = (
                 kvm.get_computed_blocks(request, max_cache_hit_length)
             )
             block_size = self._get_block_size()
-            target_local = connector.resolve_divergent_local_hit_tokens(
+            target_local = resolver.resolve_divergent_local_hit_tokens(
                 request, num_local, num_reconciled, block_size
             )
             if target_local is None:
@@ -475,12 +523,11 @@ class TpuPipelineChunkScheduler(Scheduler):
 
     def schedule(self, throttle_prefills: bool = False):
         prefix_aware = self._prefix_aware
-        connector = self.connector
-        poll = getattr(connector, "poll_and_complete_transfers", None)
-        if prefix_aware and callable(poll):
+        poller = self._transfer_poller
+        if prefix_aware and poller is not None:
             # Completed async loads promote their requests this step.
             try:
-                poll(self)
+                poller.poll_and_complete_transfers(self)
             except Exception:
                 logger.exception(
                     "Pipeline chunk scheduler: poll_and_complete_transfers failed."

@@ -20,6 +20,7 @@ lone-prompt and equal-cost chunking; each option turns on one lever.
 """
 
 import itertools
+import json
 import math
 import pathlib
 import random
@@ -102,6 +103,8 @@ def _sched(cost=None, running=(), waiting=(), **attrs) -> TpuPipelineChunkSchedu
     s._waits = 0
     s._retention = None
     s._hit_estimator = None
+    s._transfer_poller = None
+    s._hit_resolver = None
     s.kv_cache_manager = SimpleNamespace(enable_caching=False)
     s.connector = None
     s._is_kv_consumer = False
@@ -176,6 +179,16 @@ def test_section_is_registered_and_kept_out_of_the_compile_cache_key():
 # -- __init__ wiring -----------------------------------------------------------
 
 
+def _kv(role):
+    """A KV transfer config stand-in with vLLM's role properties (kv_both is
+    both a producer and a consumer)."""
+    return SimpleNamespace(
+        kv_role=role,
+        is_kv_producer=role in ("kv_producer", "kv_both"),
+        is_kv_consumer=role in ("kv_consumer", "kv_both"),
+    )
+
+
 def _built(
     additional=None,
     kv_role="kv_producer",
@@ -192,9 +205,7 @@ def _built(
     def base_init(self, *args, **kwargs):
         self.vllm_config = SimpleNamespace(
             additional_config=additional,
-            kv_transfer_config=(
-                None if kv_role is None else SimpleNamespace(kv_role=kv_role)
-            ),
+            kv_transfer_config=None if kv_role is None else _kv(kv_role),
             parallel_config=SimpleNamespace(pipeline_parallel_size=8),
             model_config=SimpleNamespace(architectures=[architecture]),
         )
@@ -280,6 +291,59 @@ def test_promotion_needs_prefix_aware_and_follows_promote_warmest():
         }
     )
     assert not s._promote_waiting
+
+
+@pytest.mark.parametrize(
+    "kv_role,consumer",
+    [
+        ("kv_producer", False),
+        ("kv_consumer", True),
+        ("kv_both", False),
+        (None, False),
+    ],
+)
+def test_kv_both_is_not_a_kv_consumer(kv_role, consumer):
+    """As in PrefixAwareScheduler: kv_both (an offloading connector on an
+    aggregated engine) is also a producer, so it does not take the consumer's
+    sort tier."""
+    s, _ = _built(kv_role=kv_role)
+    assert s._is_kv_consumer is consumer
+
+
+class _HookedConnector:
+    """A connector with the two hooks the prefix-aware admission calls, as
+    the multi-connector and the Raiden offloading connector define them."""
+
+    def poll_and_complete_transfers(self, scheduler):
+        return 0, 0, 0, False
+
+    def resolve_divergent_local_hit_tokens(
+        self, request, num_local, num_reconciled, block_size
+    ):
+        return None
+
+
+def test_the_connector_hooks_are_read_through_named_interfaces(caplog):
+    connector = _HookedConnector()
+    with caplog.at_level("WARNING"):
+        s, _ = _built({"tpu_pp_scheduler": {"prefix_aware": True}}, connector=connector)
+    assert s._transfer_poller is connector and s._hit_resolver is connector
+    assert "has no" not in caplog.text
+
+
+def test_a_connector_without_the_hooks_is_named_in_a_warning(caplog):
+    """The prefix-aware admission runs without the poll and the divergent-hit
+    decision when the connector has neither, and says so instead of skipping
+    them silently."""
+    with caplog.at_level("WARNING"):
+        s, _ = _built({"tpu_pp_scheduler": {"prefix_aware": True}}, connector=object())
+    assert s._transfer_poller is None and s._hit_resolver is None
+    assert "has no poll_and_complete_transfers or" in caplog.text
+    caplog.clear()
+    # Without the prefix-aware admission nothing calls them, so nothing is said.
+    with caplog.at_level("WARNING"):
+        _built(connector=object())
+    assert "has no" not in caplog.text
 
 
 def test_retention_follows_the_kv_producer_rule():
@@ -405,6 +469,7 @@ def test_without_options_schedule_runs_none_of_the_prefix_aware_steps():
             cost=_model(),
             running=[deep, shallow],
             connector=connector,
+            _transfer_poller=connector,
             _prefix_aware=prefix_aware,
             _srpf_running=prefix_aware,
             _quadratic_cost=True,
@@ -450,7 +515,7 @@ def test_without_prefix_aware_the_local_hit_is_the_base_schedulers():
     )
     request = _req(0, 8192)
     with patch.object(Scheduler, "_get_local_prefix_cache_hit", base):
-        s = _sched(connector=connector)
+        s = _sched(connector=connector, _hit_resolver=connector)
         # vLLM passes the cap positionally.
         assert s._get_local_prefix_cache_hit(request, 2048) == (
             "blocks",
@@ -480,7 +545,12 @@ def test_prefix_aware_resolves_a_divergent_hit_through_the_connector():
     )
     request = _req(0, 16384)
     with patch.object(Scheduler, "_get_local_prefix_cache_hit", base):
-        s = _sched(connector=connector, _prefix_aware=True, kv_cache_manager=kvm)
+        s = _sched(
+            connector=connector,
+            _hit_resolver=connector,
+            _prefix_aware=True,
+            kv_cache_manager=kvm,
+        )
         s._get_block_size = lambda: 2048
         got = s._get_local_prefix_cache_hit(request, 12288)
     assert got == ("blocks[:4096]", 4096, 0, True)
@@ -566,6 +636,18 @@ def test_the_prefill_legs_run_what_the_record_jobs_ran():
         assert "tpu_pp_scheduler" not in entry["legs"]["decode"]["additional_config"]
         seen.append(entry["point"])
     assert seen == [1, 5, 8, 10, 12]
+
+
+def test_the_prefill_legs_are_kv_producers_not_consumers():
+    """Every prefill leg is a kv_producer, which both readings of the role
+    (``kv_role != "kv_producer"`` before, vLLM's role properties now) take as
+    not a consumer: its sort keeps the producer tiers."""
+    for name, entry in _point_entries():
+        args = entry["legs"]["prefill"]["serve_args"]
+        kv = json.loads(args[args.index("--kv-transfer-config") + 1])
+        assert kv["kv_role"] == "kv_producer", name
+        s, _ = _built(kv_role=kv["kv_role"])
+        assert not s._is_kv_consumer and s._is_kv_producer, name
 
 
 # -- what the prefix-aware admission borrows from PrefixAwareScheduler ----------

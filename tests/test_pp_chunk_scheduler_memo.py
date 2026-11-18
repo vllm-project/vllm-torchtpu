@@ -137,7 +137,9 @@ def _scheduler(kvm: KVCacheManager, options: dict) -> TpuPipelineChunkScheduler:
     def base_init(self, *args, **kwargs):
         self.vllm_config = SimpleNamespace(
             additional_config={"tpu_pp_scheduler": options},
-            kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+            kv_transfer_config=SimpleNamespace(
+                kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
+            ),
             parallel_config=SimpleNamespace(pipeline_parallel_size=8),
             model_config=SimpleNamespace(
                 architectures=["Qwen3_5MoeForConditionalGeneration"]
