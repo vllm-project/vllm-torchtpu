@@ -1077,21 +1077,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 activation=activation_str,
             )
             return
-        layer._gmm_primary_experts = (
-            (
-                int(expert_placement.owned())
-                if expert_placement.placed(getattr(layer, "layer_name", ""))
-                else int(layer.w13_weight.shape[0])
-            )
-            if expert_placement.has_copies()
-            else None
-        )
-        prebuild_fused_moe_kernel(
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            num_primary_experts=layer._gmm_primary_experts,
-        )
+        self._prebuild_grouped_path(layer, activation_str)
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
@@ -1122,6 +1108,20 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # 'score_bias'`. Passing the operand at the call site is not
             # sufficient on its own; it has to exist.
             register_score_bias_buffer(layer)
+
+    def _prebuild_grouped_path(
+        self, layer: TpuRoutedExperts, activation_str: str
+    ) -> None:
+        """Record the grouped path's bound on the layer's local slots (its
+        primaries under a placement with copy slots, see
+        expert_placement.primary_experts) and prebuild the op for it."""
+        layer._gmm_primary_experts = expert_placement.primary_experts(layer)
+        prebuild_fused_moe_kernel(
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            num_primary_experts=layer._gmm_primary_experts,
+        )
 
     def apply_monolithic(
         self,

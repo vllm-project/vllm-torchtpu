@@ -20,6 +20,7 @@ validation, the hook that sizes its layers before vLLM allocates their
 weights, and `apply`.
 """
 
+import functools
 import hashlib
 import json
 import sys
@@ -474,3 +475,86 @@ def test_a_placed_layers_map_is_built_on_the_host(tmp_path, monkeypatch):
         ep._size_copy_slots(manager, LAYER)
     assert manager._expert_map.device.type == "cpu"
     assert manager._expert_map.tolist() == [-1, 0, -1, 2, 3, -1, 1, 4]
+
+
+def _fp8_layer(name, slots):
+    layer = _Experts(rank=0, local=slots)
+    layer.layer_name = name
+    layer.moe_config.experts_per_token = 2
+    layer.moe_config.moe_parallel_config.use_ep = True
+    layer.w13_weight = torch.zeros(slots, 1, 1)
+    return layer
+
+
+@pytest.mark.parametrize("table", ["none", "permutation", "copies"])
+def test_the_fp8_method_bounds_the_grouped_path_to_a_layers_primaries(
+    tmp_path, monkeypatch, table
+):
+    """The FP8 method passes the grouped path the primaries `apply` recorded on
+    a placed layer of a copies table, every slot of a layer the table does not
+    place, and nothing without copies; the op it prebuilds takes the same."""
+    from vllm_torchtpu.layers.adapter.quantization import fp8
+
+    if table == "none":
+        monkeypatch.setenv("TPU_EXPERT_PLACEMENT", "")
+    else:
+        _use(tmp_path, monkeypatch, _copies() if table == "copies" else _permutation())
+    slots = 5 if table == "copies" else 4
+    placed = _fp8_layer(LAYER, slots)
+    runner = SimpleNamespace(gate=torch.nn.Linear(3, 8), routed_experts=placed)
+    assert ep.apply(runner) is (table != "none")
+    unplaced = _fp8_layer("model.layers.2.mlp.experts", 4)
+    prebuilt = []
+    monkeypatch.setattr(
+        fp8, "prebuild_fused_moe_kernel", lambda **kw: prebuilt.append(kw)
+    )
+    method = object.__new__(fp8.VllmFp8MoEMethodTPU)
+    for layer in (placed, unplaced):
+        method._prebuild_grouped_path(layer, "silu")
+    want = (4, 4) if table == "copies" else (None, None)
+    assert (placed._gmm_primary_experts, unplaced._gmm_primary_experts) == want
+    assert [kw["num_primary_experts"] for kw in prebuilt] == list(want)
+
+
+@pytest.mark.parametrize("table", ["permutation", "copies"])
+def test_the_grouped_op_needs_the_bound_under_copies_only_when_built(
+    tmp_path, monkeypatch, table
+):
+    """Under a copies table an op without num_primary_experts is refused when
+    it would be built; a cached op is returned without reading the table, so
+    the compiled forward's lookups never reach the table read."""
+    from vllm_torchtpu.layers.adapter import fused_moe
+
+    _use(tmp_path, monkeypatch, _copies() if table == "copies" else _permutation())
+    monkeypatch.setattr(fused_moe, "_fused_moe_kernel_cache", {})
+    built = []
+
+    class Op:
+        """Stands in for the registered custom op."""
+
+        def __init__(self, name, fn):
+            built.append(fn)
+
+        def register_fake(self, fake):
+            del fake
+
+    monkeypatch.setattr(fused_moe.pallas, "jax_op", Op)
+    get = functools.partial(
+        fused_moe._get_fused_moe_custom_op,
+        topk=2,
+        activation="silu",
+        use_ep=True,
+        skip_padded_tokens=False,
+    )
+    bound = 4 if table == "copies" else None
+    if table == "copies":
+        with pytest.raises(ValueError, match="holds copies"):
+            get()
+    op = get(num_primary_experts=bound)
+    assert len(built) == 1
+
+    def no_table_read():
+        raise AssertionError("the table was read on a cached lookup")
+
+    monkeypatch.setattr(fused_moe.expert_placement, "has_copies", no_table_read)
+    assert get(num_primary_experts=bound) is op

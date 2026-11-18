@@ -439,6 +439,18 @@ def holder_tables(layer: int, rank: int) -> tuple[list[int], list[int], list[int
     return _require().holder_tables(layer, rank)
 
 
+def primary_experts(layer) -> int | None:
+    """The local slots the grouped MoE path may serve for `layer`: None
+    without copy slots (every slot is a primary); under a table with copies,
+    the primaries `apply` recorded on a placed layer (PRIMARY_EXPERTS_ATTR),
+    else every local slot (an unplaced layer holds no copies). `apply` runs in
+    the MoE runner's constructor, before the weights load."""
+    if not has_copies():
+        return None
+    primaries = getattr(layer, PRIMARY_EXPERTS_ATTR, None)
+    return int(layer.w13_weight.shape[0]) if primaries is None else int(primaries)
+
+
 def hot_order(layer: int) -> list[int]:
     return _require().hot_order(layer)
 
