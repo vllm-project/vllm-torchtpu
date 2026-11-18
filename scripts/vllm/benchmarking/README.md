@@ -75,6 +75,25 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --baseline scripts/vllm/benchmarking/baselines/perf/<config>.baseline.json
 ```
 
+#### Roofline reporting (`--roofline-targets`)
+
+Pass `--roofline-targets` and `--config-name` in `--mode perf` to report
+physical-chip output throughput against `baselines/perf/roofline_targets.json`.
+State the physical chip count with `--chips <N>`, or `--prefill-chips <P>` and
+`--decode-chips <D>` for disaggregated serving; when omitted, the config's
+modeled `num_chips` is used. Entries with `status == "unverified"` are marked
+in the table, configs listed under `not_modeled` print a note, and the check is
+advisory (`exit 0`).
+
+```bash
+python3 scripts/vllm/benchmarking/check_regression.py \
+  --mode perf \
+  --results-dir <DIR> \
+  --roofline-targets scripts/vllm/benchmarking/baselines/perf/roofline_targets.json \
+  --config-name qwen3.5-397b-fp8-tp1-dp8-ep \
+  --chips 4
+```
+
 ### Accuracy (`--mode eval`)
 
 Compares `lm_eval` accuracy to `baselines/eval/<config>.<task>.baseline.json`.

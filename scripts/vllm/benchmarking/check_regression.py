@@ -33,7 +33,7 @@ import statistics
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 
 class Metric(NamedTuple):
@@ -192,6 +192,234 @@ def check_perf(
         )
     print()
     return failed
+
+
+ROOFLINE_CELL_STATUSES = ("ok", "unverified", "oom")
+
+
+class RooflineCellTarget(NamedTuple):
+    output_token_throughput_per_chip: float
+    status: str = "ok"
+
+
+class RooflineConfigTarget(NamedTuple):
+    num_chips: int | None
+    cells: dict[str, RooflineCellTarget]
+
+
+class NotModeledEntry(NamedTuple):
+    reason: str
+    detail: str
+
+
+class RooflineTargets(NamedTuple):
+    targets: dict[str, RooflineConfigTarget]
+    not_modeled: dict[str, NotModeledEntry]
+
+
+class RooflineRow(NamedTuple):
+    cell: str
+    metric: str
+    actual_per_chip: float
+    target_per_chip: float
+    ratio: float
+    target_status: str
+    status: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RooflineCheckResult:
+    """Advisory % of roofline report for one config."""
+
+    config_name: str
+    num_chips: int | None
+    rows: list[RooflineRow]
+    not_modeled: NotModeledEntry | None = None
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    val = float(value)
+    return val if math.isfinite(val) else None
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
+def resolve_physical_chips(
+    chips: int | None = None,
+    prefill_chips: int | None = None,
+    decode_chips: int | None = None,
+) -> int | None:
+    """Resolve total physical chips from single-pool or disaggregated flags."""
+    if chips is not None:
+        _positive_int(chips, "chips")
+    if prefill_chips is not None:
+        _positive_int(prefill_chips, "prefill_chips")
+    if decode_chips is not None:
+        _positive_int(decode_chips, "decode_chips")
+    if (prefill_chips is None) != (decode_chips is None):
+        raise ValueError("--prefill-chips and --decode-chips must be provided together")
+    if chips is not None and prefill_chips is not None:
+        raise ValueError(
+            "--chips cannot be combined with --prefill-chips/--decode-chips"
+        )
+    if prefill_chips is not None and decode_chips is not None:
+        return prefill_chips + decode_chips
+    return chips
+
+
+def _parse_roofline_config(name: str, raw: Any) -> RooflineConfigTarget:
+    if not isinstance(raw, dict):
+        raise ValueError(f"roofline config {name!r} must be an object")
+    num_chips = None
+    if raw.get("num_chips") is not None:
+        num_chips = _positive_int(raw["num_chips"], f"{name}.num_chips")
+    raw_cells = raw.get("cells")
+    if not isinstance(raw_cells, dict) or not raw_cells:
+        raise ValueError(f"{name}.cells must be a non-empty object")
+    cells: dict[str, RooflineCellTarget] = {}
+    for cell_key, cell in raw_cells.items():
+        if not isinstance(cell, dict):
+            raise ValueError(f"{name}.cells.{cell_key} must be an object")
+        status = cell.get("status", "ok")
+        if status not in ROOFLINE_CELL_STATUSES:
+            raise ValueError(
+                f"{name}.cells.{cell_key}.status must be one of "
+                f"{ROOFLINE_CELL_STATUSES}, got {status!r}"
+            )
+        tput = _finite_number(cell.get("output_token_throughput_per_chip"))
+        if status != "oom" and (tput is None or tput <= 0):
+            raise ValueError(
+                f"{name}.cells.{cell_key}.output_token_throughput_per_chip "
+                "must be positive"
+            )
+        cells[cell_key] = RooflineCellTarget(tput or 0.0, status)
+    return RooflineConfigTarget(num_chips, cells)
+
+
+def load_roofline_targets(path: Path) -> RooflineTargets:
+    """Load and validate a roofline_targets.json file."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"cannot read roofline targets {path}: {e}") from e
+    if not isinstance(raw, dict) or not isinstance(raw.get("targets"), dict):
+        raise ValueError(f"{path} must hold an object with a 'targets' map")
+
+    targets: dict[str, RooflineConfigTarget] = {}
+    for name, entry in raw["targets"].items():
+        targets[name] = _parse_roofline_config(name, entry)
+
+    raw_not_modeled = raw.get("not_modeled", {})
+    if not isinstance(raw_not_modeled, dict):
+        raise ValueError(f"{path}: 'not_modeled' must be an object")
+    not_modeled: dict[str, NotModeledEntry] = {}
+    for name, entry in raw_not_modeled.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: not_modeled.{name} must be an object")
+        reason = entry.get("reason")
+        detail = entry.get("detail", "")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"{path}: not_modeled.{name}.reason must be non-empty")
+        not_modeled[name] = NotModeledEntry(reason, str(detail))
+    return RooflineTargets(targets, not_modeled)
+
+
+def check_roofline(
+    results: dict[str, dict],
+    roofline_targets: RooflineTargets,
+    config_name: str,
+    chips: int | None = None,
+) -> RooflineCheckResult:
+    """Compare measured output throughput per physical chip against roofline."""
+    if config_name in roofline_targets.not_modeled:
+        note = roofline_targets.not_modeled[config_name]
+        print(f"\n## Roofline speed check (`{config_name}`: not modeled)\n")
+        print(
+            f"NOTE: `{config_name}` is not modeled in roofline targets "
+            f"({note.reason}: {note.detail})\n"
+        )
+        return RooflineCheckResult(config_name, chips, [], not_modeled=note)
+
+    config_target = roofline_targets.targets[config_name]
+    num_chips = chips if chips is not None else config_target.num_chips
+    if num_chips is None or num_chips <= 0:
+        raise ValueError(f"chip count required for roofline check of {config_name!r}")
+
+    rows: list[RooflineRow] = []
+    for key in sorted(results):
+        if key not in config_target.cells:
+            rows.append(
+                RooflineRow(key, "(no roofline cell)", 0.0, 0.0, 0.0, "", "SKIP")
+            )
+            continue
+        cell_target = config_target.cells[key]
+        raw_tput = _finite_number(results[key].get("output_throughput"))
+        if cell_target.status == "oom":
+            skip = "SKIP (oom)"
+            rows.append(
+                RooflineRow(
+                    key,
+                    "output_token_throughput_per_chip",
+                    0.0,
+                    cell_target.output_token_throughput_per_chip,
+                    0.0,
+                    cell_target.status,
+                    skip,
+                )
+            )
+            continue
+        if raw_tput is None or raw_tput < 0:
+            rows.append(
+                RooflineRow(
+                    key,
+                    "output_token_throughput_per_chip",
+                    0.0,
+                    cell_target.output_token_throughput_per_chip,
+                    0.0,
+                    cell_target.status,
+                    "SKIP",
+                )
+            )
+            continue
+        actual_per_chip = raw_tput / num_chips
+        ratio = actual_per_chip / cell_target.output_token_throughput_per_chip
+        status = (
+            "ADVISORY (unverified)"
+            if cell_target.status == "unverified"
+            else "ADVISORY"
+        )
+        rows.append(
+            RooflineRow(
+                key,
+                "output_token_throughput_per_chip",
+                actual_per_chip,
+                cell_target.output_token_throughput_per_chip,
+                ratio,
+                cell_target.status,
+                status,
+            )
+        )
+
+    print(
+        f"\n## Roofline speed check (`{config_name}`, "
+        f"{num_chips} physical chips, advisory)\n"
+    )
+    print("| key | metric | actual/chip | roofline/chip | % of roofline | status |")
+    print("|---|---|---:|---:|---:|---|")
+    for row in rows:
+        pct = "-" if row.status.startswith("SKIP") else f"{row.ratio * 100:.2f}%"
+        print(
+            f"| `{row.cell}` | {row.metric} | {row.actual_per_chip:.2f} | "
+            f"{row.target_per_chip:.2f} | {pct} | {row.status} |"
+        )
+    print()
+    return RooflineCheckResult(config_name, num_chips, rows)
 
 
 def calibrate_perf(
@@ -672,9 +900,45 @@ def main() -> int:
         "entries whose concurrency exceeds this, so TTFT is ungated there. "
         "0 ungates TTFT for every cell.",
     )
+    parser.add_argument(
+        "--roofline-targets",
+        type=Path,
+        help="Perf mode: roofline_targets.json for % of roofline reporting.",
+    )
+    parser.add_argument(
+        "--config-name",
+        help="Perf mode: config stem to look up in --roofline-targets.",
+    )
+    parser.add_argument(
+        "--chips",
+        type=int,
+        default=None,
+        help="Perf mode: total physical accelerator chips serving the run.",
+    )
+    parser.add_argument(
+        "--prefill-chips",
+        type=int,
+        default=None,
+        help="Perf mode: physical prefill chips in a disaggregated run.",
+    )
+    parser.add_argument(
+        "--decode-chips",
+        type=int,
+        default=None,
+        help="Perf mode: physical decode chips in a disaggregated run.",
+    )
     args = parser.parse_args()
 
+    perf_only = (
+        args.roofline_targets,
+        args.config_name,
+        args.chips,
+        args.prefill_chips,
+        args.decode_chips,
+    )
     if args.mode == "update":
+        if any(v is not None for v in perf_only):
+            parser.error("speed gate and chip flags are only valid in perf check mode")
         if args.baseline is None:
             parser.error("--baseline is required in update mode")
         try:
@@ -696,6 +960,11 @@ def main() -> int:
     tolerance = args.tolerance
     if tolerance is None:
         tolerance = 0.05 if args.mode == "perf" else 0.015
+
+    if (args.mode == "eval" or args.calibrate) and any(
+        v is not None for v in perf_only
+    ):
+        parser.error("speed gate and chip flags are only valid in perf check mode")
 
     if args.calibrate:
         if args.mode == "perf":
@@ -727,20 +996,9 @@ def main() -> int:
         sys.stdout.write("\n")
         return 0
 
-    if args.baseline is None:
-        parser.error("--baseline is required unless --calibrate is set")
-    if args.mode == "perf" and len(args.results_dir) != 1:
-        parser.error("--results-dir may only be given once in perf check mode")
-
-    if args.mode == "perf":
-        results = load_perf_results(args.results_dir[0])
-        if not results:
-            print(
-                f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
-                file=sys.stderr,
-            )
-            return 2
-    else:
+    if args.mode == "eval":
+        if args.baseline is None:
+            parser.error("--baseline is required unless --calibrate is set")
         runs = [load_eval_results(d) for d in args.results_dir]
         for results_dir, run in zip(args.results_dir, runs):
             if not run:
@@ -751,21 +1009,11 @@ def main() -> int:
                 return 2
         # One run passes through untouched; several are gated on their mean.
         results = runs[0] if len(runs) == 1 else aggregate_eval_runs(runs)
-
-    with args.baseline.open() as fh:
-        baseline = json.load(fh)
-    baseline = gated_entries(baseline)
-
-    if args.mode == "perf":
-        failed = check_perf(results, baseline, tolerance)
-        if failed:
-            print(
-                f"FAILED: {failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
-                file=sys.stderr,
-            )
-            return 1
-        print("PASS: all gated metrics within tolerance.")
-    else:
+        try:
+            baseline = gated_entries(load_baseline_file(args.baseline))
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         result = check_eval(results, baseline, tolerance)
         if result:
             tol_str = format_drop_range(
@@ -777,6 +1025,75 @@ def main() -> int:
             )
             return 1
         print("PASS: all evaluated tasks within tolerance.")
+        return 0
+
+    if len(args.results_dir) != 1:
+        parser.error("--results-dir may only be given once in perf check mode")
+    if args.baseline is None and args.roofline_targets is None:
+        parser.error(
+            "--baseline or --roofline-targets is required unless --calibrate is set"
+        )
+    if args.roofline_targets is not None and not args.config_name:
+        parser.error("--config-name is required with --roofline-targets")
+
+    try:
+        chips = resolve_physical_chips(
+            args.chips, args.prefill_chips, args.decode_chips
+        )
+        roofline_db = (
+            load_roofline_targets(args.roofline_targets)
+            if args.roofline_targets is not None
+            else None
+        )
+        if (
+            roofline_db is not None
+            and args.config_name not in roofline_db.targets
+            and args.config_name not in roofline_db.not_modeled
+        ):
+            raise ValueError(
+                f"config {args.config_name!r} not found in roofline targets"
+            )
+        baseline_entries = (
+            gated_entries(load_baseline_file(args.baseline))
+            if args.baseline is not None
+            else None
+        )
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    roofline_not_modeled = (
+        roofline_db is not None and args.config_name in roofline_db.not_modeled
+    )
+    results = load_perf_results(args.results_dir[0])
+    if not results and (baseline_entries is not None or not roofline_not_modeled):
+        print(
+            f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
+            file=sys.stderr,
+        )
+        return 2
+
+    perf_failed = 0
+    if baseline_entries is not None:
+        perf_failed = check_perf(results, baseline_entries, tolerance)
+
+    if roofline_db is not None:
+        try:
+            check_roofline(results, roofline_db, args.config_name, chips=chips)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+
+    if perf_failed:
+        print(
+            f"FAILED: {perf_failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
+            file=sys.stderr,
+        )
+        return 1
+    if baseline_entries is not None:
+        print("PASS: all gated metrics within tolerance.")
+    else:
+        print("PASS: advisory roofline check complete.")
     return 0
 
 
