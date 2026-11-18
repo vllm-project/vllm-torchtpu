@@ -148,7 +148,7 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
 
     (block_ids,) = captured[0].scheduled_new_reqs[0].block_ids
     # Five decode steps of 1 + K tokens follow the 8192-token prefill, so the
-    # request reaches position 8200; a row of the DCP8 block table covers
+    # request reaches position 8212; a row of the DCP8 block table covers
     # 40960 tokens in 40 entries of 1024, and the ids must fit that row.
     assert block_ids == list(range(1, 1 + expected_blocks))
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
@@ -733,13 +733,18 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
 
 
 def test_spec_warmup_keeps_optimistic_output_placeholders():
+    """Each verify step starts 1 + K tokens on, as the scheduler advances a
+    verified request (the device subtracts the rejected drafts), and keeps
+    the optimistic output placeholders."""
     captured = []
+    computed = []
     requests = _warmup_requests()
     spec = SimpleNamespace(max_num_blocks_per_req=lambda _config, _max_pos: 1)
 
     def execute_model(so):
         if so.scheduled_cached_reqs.req_ids:
             captured.append(list(so.scheduled_cached_reqs.num_output_tokens))
+            computed.append(list(so.scheduled_cached_reqs.num_computed_tokens))
         rid = "__spec_warmup_0__"
         requests[rid].output_token_ids.extend([0] * 8)
 
@@ -760,6 +765,7 @@ def test_spec_warmup_keeps_optimistic_output_placeholders():
     assert TPUModelRunner._warmup_one_spec_request(runner, 1, idx=0)
 
     assert captured == [[8 * (t + 1)] for t in range(9)]
+    assert computed == [[1 + 8 * t] for t in range(9)]
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():

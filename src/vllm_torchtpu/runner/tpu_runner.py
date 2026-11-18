@@ -9051,8 +9051,11 @@ class TPUModelRunner(GPUModelRunner):
         # The most requests one step may hold (see _spec_warmup_bucket_grid).
         max_seqs = int(self.scheduler_config.max_num_seqs)
         room = self.max_model_len - P
-        n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        n_mixed = 2 if mixed else 0
+        n_decode = min(
+            3 if short else max(5, K + 2), max(0, room // (1 + K) - 1 - n_mixed)
+        )
+        max_pos = min(self.max_model_len, P + (n_decode + n_mixed) * (1 + K))
         # Per-group block counts in the group's own block-table units (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -9130,7 +9133,8 @@ class TPUModelRunner(GPUModelRunner):
                 assert self.execute_model(so) is None
                 self.sample_tokens(None)
                 self.take_draft_token_ids()
-                nct = [x + 1 for x in nct]
+                # All 1 + K, as the scheduler advances a verified request.
+                nct = [x + 1 + K for x in nct]
             if (
                 mixed
                 and max_seqs >= R + 1
@@ -9203,7 +9207,7 @@ class TPUModelRunner(GPUModelRunner):
                     assert self.execute_model(so) is None
                     self.sample_tokens(None)
                     self.take_draft_token_ids()
-                    nct = [x + 1 for x in nct]
+                    nct = [x + 1 + K for x in nct]
                     prev_ids = [e.req_id for e in extras]
         except Exception:
             logger.exception("spec-decode warmup R=%d failed; continuing", R)
@@ -9233,10 +9237,12 @@ class TPUModelRunner(GPUModelRunner):
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
         # The contexts (num_computed_tokens) to run decode steps at: a short walk
-        # near the prefill.
+        # near the prefill. As the scheduler does, each verify step advances by
+        # all 1 + K tokens and the device subtracts the rejected ones; a shorter
+        # step leaves seq_len below the tokens the verify writes.
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
-        decode_ncts = [P + t for t in range(n_dec)]
+        decode_ncts = [P + t * (1 + K) for t in range(n_dec)]
         # Reuse low physical block ids, as in _warmup_spec_batch and vLLM's
         # LIFO reuse of freed blocks, rather than exercising the SC2-sensitive end
         # of the pool. Warmup runs before serving and tears down each request;
