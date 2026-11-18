@@ -25,7 +25,10 @@ from unittest.mock import MagicMock, patch
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
-from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
+from vllm_torchtpu.core.prefix_aware_scheduler import (
+    ExternalHitEstimator,
+    PrefixAwareScheduler,
+)
 
 
 def _req(
@@ -63,6 +66,7 @@ def _scheduler(monkeypatch, requests, warmth, sort="1", aging="0", window=None):
     s._paw_scoring_broken = False
     s._is_kv_producer = sort == "1"
     s._is_kv_consumer = False
+    s._hit_estimator = None
     s._kv_prefetch_n = 0
     s._kv_prefetch_cap = None
     s._select_waiting_queue_for_scheduling = lambda: None
@@ -173,7 +177,7 @@ def test_external_hit_counts_when_it_fits(monkeypatch):
     ]
     s = _scheduler(monkeypatch, reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
     s._is_kv_consumer = False
-    s.connector = SimpleNamespace(
+    s._hit_estimator = SimpleNamespace(
         estimate_external_hit_tokens=lambda r, local: 88_000
         if r.request_id == "dram_small"
         else 0
@@ -184,7 +188,7 @@ def test_external_hit_counts_when_it_fits(monkeypatch):
     s = _scheduler(monkeypatch, reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
     s._is_kv_consumer = False
     s._is_kv_producer = True
-    s.connector = SimpleNamespace(
+    s._hit_estimator = SimpleNamespace(
         estimate_external_hit_tokens=lambda r, local: 88_000
         if r.request_id == "dram_small"
         else 0
@@ -216,3 +220,69 @@ def test_sort_failure_disables_the_flag_and_schedule_still_runs(monkeypatch):
     s._paw_sort_key = boom
     assert _order_seen_by_base_schedule(s) == ["a", "b"]
     assert s._paw_sort is False
+
+
+# ---------------- the connector's host-tier estimate ----------------
+
+
+class _Estimator:
+    def __init__(self, answer=88_000, fail=False):
+        self.answer = answer
+        self.fail = fail
+        self.calls = []
+
+    def estimate_external_hit_tokens(self, request, num_local_tokens):
+        self.calls.append((request.request_id, num_local_tokens))
+        if self.fail:
+            raise RuntimeError("store unreachable")
+        return self.answer
+
+
+def _warmth_scheduler(estimator, consumer=False):
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = consumer
+    s._hit_estimator = estimator
+    s.block_size = 2176
+    return s
+
+
+def test_the_estimate_needs_the_named_interface(monkeypatch):
+    assert isinstance(_Estimator(), ExternalHitEstimator)
+    assert not isinstance(SimpleNamespace(), ExternalHitEstimator)
+
+    def fake_init(self, *args, **kwargs):
+        self.vllm_config = SimpleNamespace(kv_transfer_config=None)
+        self.connector = self._test_connector
+        self.kv_cache_manager = MagicMock()
+
+    monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
+    for connector, expected in ((_Estimator(), True), (SimpleNamespace(), False)):
+        monkeypatch.setattr(
+            PrefixAwareScheduler, "_test_connector", connector, raising=False
+        )
+        s = PrefixAwareScheduler()
+        assert (s._hit_estimator is connector) is expected
+
+
+def test_the_estimate_is_asked_past_the_local_hit():
+    estimator = _Estimator()
+    s = _warmth_scheduler(estimator)
+    req = _req("r", 100_000, time.time())
+    assert s._external_warmth(req, 10_000) == 88_000
+    assert estimator.calls == [("r", 10_000)]
+    # Less than a block past the local hit, or a KV consumer: not asked.
+    assert s._external_warmth(req, 100_000 - 2_000) == 0
+    assert _warmth_scheduler(estimator, consumer=True)._external_warmth(req, 0) == 0
+    assert _warmth_scheduler(None)._external_warmth(req, 0) == 0
+    assert estimator.calls == [("r", 10_000)]
+
+
+def test_a_failing_estimate_is_logged_and_counts_as_zero():
+    from vllm_torchtpu.core import prefix_aware_scheduler
+
+    s = _warmth_scheduler(_Estimator(fail=True))
+    # The real warning_once runs; only the logger's output is captured.
+    with patch.object(prefix_aware_scheduler.logger, "warning") as warn:
+        assert s._external_warmth(_req("r-fails", 100_000, time.time()), 0) == 0
+    warn.assert_called_once()
+    assert "r-fails" in warn.call_args.args

@@ -371,6 +371,7 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s.num_waiting_for_streaming_input = 0
     s.deferred_waiting = set()
     s.block_size = 640
+    s._inflight_prefills = set()
     out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
 
     s._step_wait_event = None
@@ -409,6 +410,7 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s._record_step_telemetry(out, 2, "drained")
     text = s._admission_telemetry("lookahead0")
     assert "stop=lookahead0" in text
+    assert "inflight_reserved=0" in text
     assert "min_steps=4 min_small_steps_waiting=2" in text
     assert "min_stops=lookahead0:2,drained:1" in text
     # The per-minute counters restart after each telemetry line.
