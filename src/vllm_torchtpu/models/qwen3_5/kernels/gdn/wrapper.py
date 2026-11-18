@@ -99,8 +99,8 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
-        act_scratch_ref: Optional VMEM scratch reference for post-conv1d f32
-            activations when qkv_slot_ref is bfloat16.
+        act_scratch_ref: Optional VMEM scratch reference for the f32 unpack
+            of 2D bf16 qkv rows (cfg.qkv_2d); None otherwise.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
