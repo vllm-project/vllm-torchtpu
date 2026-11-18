@@ -449,6 +449,11 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             "max_model_len": vllm_config.model_config.max_model_len,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,
             "max_num_seqs": scheduler_config.max_num_seqs,
+            # Sizes the token-parallel gather buffer (`max_step_pages`);
+            # vLLM's SchedulerConfig hash leaves it out.
+            "long_prefill_token_threshold": (
+                scheduler_config.long_prefill_token_threshold
+            ),
         },
         "speculative": {
             "model": spec.model if spec is not None else None,

@@ -440,3 +440,43 @@ def test_layout_rejects_unservable_buckets():
         tp.TokenParallelLayout(16, 4, 32, split_rows=16, max_pages=4)
     with pytest.raises(ValueError):
         tp.TokenParallelLayout(4, 4, 32, split_rows=16, max_pages=8, gather_caps=(4,))
+
+
+def _worst_steps(vps, mml, budget, seqs, threshold):
+    """Adversarial prefill steps: (seq_len, scheduled tokens) per request.
+    Conservative: one-token prompts sit past split_rows too, which the
+    runner's decode-first order never does."""
+    n_long = -(-budget // threshold) if threshold > 0 else 1
+    longs = [(mml, max(1, budget // (2 * n_long)))] * n_long
+    rest = seqs - n_long
+    per = max(1, (budget - sum(q for _, q in longs)) // rest)
+    yield longs + [(1, 1)] * rest  # long contexts next to one-token prompts
+    yield longs + [(per, per)] * rest  # ... next to prompts filling the budget
+    n_big = min(seqs, budget // (vps + 1))
+    yield [(vps + 1, vps + 1)] * n_big + [(1, 1)] * (seqs - n_big)
+
+
+@pytest.mark.parametrize(
+    "mml,budget,seqs,threshold",
+    [(163840, 8192, 64, 0), (163840, 16384, 64, 0), (163840, 16384, 64, 8192)],
+)
+def test_max_step_pages_holds_adversarial_steps(mml, budget, seqs, threshold):
+    """Every step the scheduler can form fits the buffer `layout_for` sizes;
+    the old `ceil(max_model_len / vps) + 4` does not."""
+    page_size, dcp, split_rows = 256, 16, 64
+    vps = page_size * dcp
+    bound = tp.max_step_pages(vps, mml, budget, seqs, threshold)
+    lay = tp.TokenParallelLayout(
+        dcp, 4, page_size, split_rows=split_rows, max_pages=bound
+    )
+    worst = 0
+    for step in _worst_steps(vps, mml, budget, seqs, threshold):
+        seq_lens = jnp.asarray([s for s, _ in step], jnp.int32)
+        q_lens = jnp.asarray([q for _, q in step], jnp.int32)
+        # Prefill rows follow the decode rows (decode-first batch order), so
+        # every one of them lies past split_rows and is gathered.
+        qsl = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(q_lens)])
+        need = int(tp.total_step_pages(lay, seq_lens, qsl + split_rows, len(step)))
+        worst = max(worst, need)
+        assert need <= bound, (step[:2], need, bound)
+    assert worst > -(-mml // vps) + 4

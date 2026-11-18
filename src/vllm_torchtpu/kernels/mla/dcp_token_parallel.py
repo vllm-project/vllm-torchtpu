@@ -153,6 +153,39 @@ def step_pages(
     return pages, jnp.cumsum(pages) - pages
 
 
+def max_step_pages(
+    virtual_page_size: int,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    max_num_seqs: int,
+    long_prefill_token_threshold: int = 0,
+) -> int:
+    """Upper bound on `total_step_pages` over every step the scheduler can form.
+
+    Decode-only requests sit in rows `[0, split_rows)` and are never gathered,
+    so only prefill requests count. A request carries computed context into a
+    step only if the previous step left it partial: it took a full
+    `long_prefill_token_threshold` chunk, or the budget ran out on it (one
+    request per step). So at most `n_long = ceil(budget / threshold)` do, one
+    when chunks are uncapped; each holds at most `ceil(max_model_len / vps)`
+    pages. Every other request starts this step, so its pages are its
+    scheduled tokens rounded up: at most `budget // vps` pages plus one each.
+
+    A small threshold grows the bound, and the buffer every token-parallel
+    program reserves, by `ceil(max_model_len / vps)` pages per budget slice.
+
+    Assumes no prefix caching (`check_config` refuses it) and no KV connector:
+    either hands a starting request computed context, and a step that then
+    exceeds the buffer is refused by `check_step_capacity`.
+    """
+    vps = virtual_page_size
+    budget = max_num_batched_tokens
+    threshold = long_prefill_token_threshold
+    n_long = -(-budget // threshold) if threshold > 0 else 1
+    n_long = min(n_long, max_num_seqs)
+    return n_long * -(-max_model_len // vps) + budget // vps + (max_num_seqs - n_long)
+
+
 def total_step_pages(
     layout: TokenParallelLayout,
     seq_lens: jax.Array,
