@@ -83,3 +83,38 @@ def test_torch_op_signature() -> None:
             torch.empty(3, dtype=torch.int32),
         )
     assert out.shape == (8, 128) and out.dtype == torch.int32
+
+
+def test_shards_side_by_side_match_the_dense_slab() -> None:
+    """The row split's layout (each TP rank's LM head shard as one row, padded
+    to whole lane groups, ids past the vocabulary padding) samples the tokens
+    the dense ``[vocab / 128, 128]`` slab does."""
+    rows, shards, width, padded = 8, 4, 1500, 1536  # 6000 ids cover VOCAB
+    logits, u, temp, top_p, draft = _case(rows, 4.0, 3)
+    params = jnp.asarray(torch.stack([temp, top_p]).numpy())
+    draft = jnp.asarray(draft.numpy().astype(np.int32))
+    want = top_p_rows(
+        jnp.asarray(logits.float().numpy(), jnp.bfloat16).reshape(rows, -1, 128),
+        jnp.asarray(u.numpy()).reshape(rows, -1, 128),
+        params,
+        draft,
+        interpret=True,
+    )
+
+    def side_by_side(x: np.ndarray) -> np.ndarray:
+        ids = np.full((rows, shards * width), np.nan, np.float32)
+        ids[:, :VOCAB] = x
+        out = np.full((rows, shards, padded), np.nan, np.float32)
+        out[:, :, :width] = ids.reshape(rows, shards, width)
+        return out
+
+    got = top_p_rows(
+        jnp.asarray(side_by_side(logits.float().numpy()), jnp.bfloat16),
+        jnp.asarray(side_by_side(u.numpy())),
+        params,
+        draft,
+        interpret=True,
+        row_width=width,
+        vocab=VOCAB,
+    )
+    np.testing.assert_array_equal(np.asarray(got)[:, 0], np.asarray(want)[:, 0])

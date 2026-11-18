@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Top-p token recovery of up to 8 rows, each row a dense ``[vocab / 128, 128]``
-slab in VMEM.
+slab in VMEM (or a vocab-parallel head's shards side by side, ``[tp,
+padded shard]``).
 
 XLA runs `rejection_sampler._recover_tokens` (softmax, the 31-step top-p
 bisection, the Gumbel argmax) as ~37 passes over ``[rows, vocab]``, where a
@@ -43,19 +44,32 @@ _THRESHOLD_BITS = 30
 
 
 def _full(x: jax.Array, op) -> jax.Array:
-    """Reduce a ``[G, 128]`` slab to ``[1, 1]``."""
-    return op(op(x, axis=0, keepdims=True), axis=1, keepdims=True)
+    """Reduce a ``[G, W]`` slab to ``[1, 1]``, the long axis first: it spans
+    vregs, which combine elementwise; the short one then reduces one vreg's
+    sublanes or lanes (reducing 8 sublanes first rotated every vreg)."""
+    first = 0 if x.shape[0] >= x.shape[1] else 1
+    return op(op(x, axis=first, keepdims=True), axis=1 - first, keepdims=True)
 
 
-def _kernel(params_ref, draft_ref, logits_ref, u_ref, out_ref, *, rows, groups):
-    ids = lax.broadcasted_iota(jnp.int32, (groups, 128), 0) * 128 + (
-        lax.broadcasted_iota(jnp.int32, (groups, 128), 1)
-    )
+def _kernel(
+    params_ref, draft_ref, logits_ref, u_ref, out_ref, *, rows, shape, width, vocab
+):
+    sub = lax.broadcasted_iota(jnp.int32, shape, 0)
+    col = lax.broadcasted_iota(jnp.int32, shape, 1)
+    ids = sub * width + col
+    # Columns past `width` (a shard's padding; their `ids` alias the next
+    # shard's, harmless only because they are masked here) and ids past the
+    # vocabulary.
+    valid = None
+    if width != shape[1] or vocab != shape[0] * width:
+        valid = (col < width) & (ids < vocab)
     sublane = lax.broadcasted_iota(jnp.int32, (ROWS, 128), 0)
     out = jnp.zeros((ROWS, 128), jnp.int32)
     for r in range(rows):
         temperature, top_p, draft = params_ref[0, r], params_ref[1, r], draft_ref[r]
         x = logits_ref[r].astype(jnp.float32)
+        if valid is not None:
+            x = jnp.where(valid, x, -jnp.inf)
         x_max = _full(x, jnp.max)
         argmax = _full(jnp.where(x == x_max, ids, _BIG), jnp.min)
         denom = temperature + TEMPERATURE_EPS
@@ -75,6 +89,8 @@ def _kernel(params_ref, draft_ref, logits_ref, u_ref, out_ref, *, rows, groups):
         q = jnp.where(ids == draft, 0.0, kept / _full(kept, jnp.sum))
         u = jnp.clip(u_ref[r], _TINY, 1.0 - _EPS)
         score = q / (-jnp.log(u) + _TINY)
+        if valid is not None:
+            score = jnp.where(valid, score, 0.0)  # whatever the padding's u
         token = _full(jnp.where(score == _full(score, jnp.max), ids, _BIG), jnp.min)
         sampled = (temperature != 0.0) & (_full(q, jnp.max) > 0.0)
         result = jnp.where(sampled, token, argmax)
@@ -92,20 +108,32 @@ def top_p_rows(
     params: jax.Array,
     draft: jax.Array,
     interpret: bool = False,
+    row_width: int | None = None,
+    vocab: int | None = None,
 ) -> jax.Array:
-    """Token per row of ``logits`` ``[rows, G, 128]`` (rows <= 8; vocab id
-    ``g * 128 + lane``), sampling with uniforms ``recover_u`` f32
-    ``[rows, G, 128]``. ``params`` f32 ``[2, rows]``: temperature (0:
-    greedy) and top_p (>= 1: no top-p); ``draft`` int32 ``[rows]``: the
-    rejected draft to exclude (-1: none). Returns int32 ``[8, 128]``, row r's
-    token in sublane r."""
+    """Token per row of ``logits`` ``[rows, G, W]`` (rows <= 8, W a multiple
+    of 128), sampling with uniforms ``recover_u`` f32 ``[rows, G, W]``. Vocab
+    id ``g * row_width + w`` sits at ``[g, w]``: ``row_width`` W (default) for
+    a dense ``[vocab / 128, 128]`` slab, or a vocab-parallel shard's width
+    for the shards side by side, columns past it padding; ids at or past
+    ``vocab`` (default ``G * row_width``) are padding too. ``params`` f32
+    ``[2, rows]``: temperature (0: greedy) and top_p (>= 1: no top-p);
+    ``draft`` int32 ``[rows]``: the rejected draft to exclude (-1: none).
+    Returns int32 ``[8, 128]``, row r's token in sublane r."""
     rows, groups, lanes = logits.shape
-    if lanes != 128 or not supports(rows, groups * 128):
+    if lanes % 128 or not supports(rows, groups * lanes):
         raise ValueError(f"top_p_rows does not take logits {logits.shape}")
+    width = lanes if row_width is None else row_width
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     return pl.pallas_call(
-        functools.partial(_kernel, rows=rows, groups=groups),
+        functools.partial(
+            _kernel,
+            rows=rows,
+            shape=(groups, lanes),
+            width=width,
+            vocab=groups * width if vocab is None else vocab,
+        ),
         in_specs=[smem, smem, vmem, vmem],
         out_specs=vmem,
         out_shape=jax.ShapeDtypeStruct((ROWS, 128), jnp.int32),

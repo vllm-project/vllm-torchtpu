@@ -67,8 +67,8 @@ class SpecDecodeMetadata:
     # only this rank's block of the request rows (`_synthetic_verify_logits`).
     synthetic_row_rank: torch.Tensor | None = None
     # The synthetic verify's uniforms, drawn in one call before the LM head
-    # (`rejection_sampler.SYNTHETIC_ACCEPT_LANES`): f32 [padded_num_reqs,
-    # vocab + lanes], the recovery uniforms then the accept uniforms.
+    # (`rejection_sampler.synthetic_uniforms_shape`): per request the
+    # recovery uniforms, then the accept uniforms.
     synthetic_uniforms: torch.Tensor | None = None
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
