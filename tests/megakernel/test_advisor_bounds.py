@@ -19,13 +19,19 @@ import ast
 import dataclasses
 import math
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 from tests.megakernel.core.megakernel_fakes import TINY_TILES, make_fake_model_spec
 from tests.megakernel.test_advisor_specs import DEEPSEEK_V3_CFG, QWEN35_397B_CFG
 from vllm_torchtpu.megakernel import advisor
-from vllm_torchtpu.megakernel.advisor import constants, spec_bridge, support
+from vllm_torchtpu.megakernel.advisor import (
+    constants,
+    models,
+    spec_bridge,
+    support,
+)
 from vllm_torchtpu.megakernel.advisor.roofline import (
     _build_scope_context,
     _compute_scope_matmuls,
@@ -120,6 +126,7 @@ def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
                 decode=dataclasses.replace(preset.decode, megakernel=None),
                 prefill=dataclasses.replace(preset.prefill, megakernel=None),
                 saturation=stripped_sat,
+                megakernel_layouts=(),
             ),
         )
 
@@ -1961,7 +1968,9 @@ def test_sourced_declaration_satisfies_rank_family_and_attention_dp_checks(
     assert deployment.saturation is not None
     assert deployment.saturation.megakernel is not None
     declared_rows = support.single_call_row_limit(
-        "kimi-k3", advisor.WorkloadSpec(phase="decode"), deployment.decode.tp
+        "kimi-k3",
+        advisor.WorkloadSpec(phase="decode", tp=32, ep=32, dcp=32),
+        deployment.decode.tp,
     )
     assert declared_rows > 0
 
@@ -2084,9 +2093,14 @@ def test_declaration_phase_filter_keeps_prefill_undeclared() -> None:
     prefill_report = advisor.advise(kimi_profile, prefill_workload, chip_spec)
     assert _whole_step_of(prefill_report).support == "hypothetical"
     ranks = prefill_workload.tp
-    assert support.find_declaration("kimi-k3", "whole_step", ranks, "prefill") is None
+    prefill_step = advisor.WorkloadSpec(phase="prefill", tp=32, ep=32, dcp=32)
+    decode_step = advisor.WorkloadSpec(phase="decode", tp=32, ep=32, dcp=32)
     assert (
-        support.find_declaration("kimi-k3", "whole_step", ranks, "decode") is not None
+        support.find_declaration("kimi-k3", "whole_step", ranks, prefill_step) is None
+    )
+    assert (
+        support.find_declaration("kimi-k3", "whole_step", ranks, decode_step)
+        is not None
     )
 
 
@@ -2280,3 +2294,265 @@ def test_layer_group_search_returns_lowest_bound_feasible_partition() -> None:
     assert search_res.gap_vs_per_op_us > 0.0
     assert "one fused kernel per group" in search_res.note
     assert "per_op" in search_res.note
+
+
+def test_declaration_matches_full_layout() -> None:
+    """Verify declarations match on full mesh layout."""
+    model_profile = models.resolve_model_profile("qwen3.5-397b")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    expected_dcp4_rows = 112
+    expected_coloc_rows = 64
+
+    wl_dcp = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8, dcp=4)
+    assert (
+        support.single_call_row_limit("qwen3.5-397b", wl_dcp, 8) == expected_dcp4_rows
+    )
+    rep_dcp = advisor.advise(model_profile, wl_dcp, chip_spec)
+    ws_dcp = next(s for s in rep_dcp.scopes if s.scope == "whole_step")
+    assert ws_dcp.support == "declared"
+    assert ws_dcp.t_vmem_max == expected_dcp4_rows
+
+    wl_coloc = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8, dcp=1)
+    assert (
+        support.single_call_row_limit("qwen3.5-397b", wl_coloc, 8)
+        == expected_coloc_rows
+    )
+    rep_coloc = advisor.advise(model_profile, wl_coloc, chip_spec)
+    ws_coloc = next(s for s in rep_coloc.scopes if s.scope == "whole_step")
+    assert ws_coloc.support == "declared"
+    assert ws_coloc.t_vmem_max == expected_coloc_rows
+
+    wl_verify_16 = advisor.WorkloadSpec(
+        phase="verify", spec_tokens=3, tp=8, ep=8, dcp=1, batch=16
+    )
+    rep_v16 = advisor.advise(model_profile, wl_verify_16, chip_spec)
+    ws_v16 = next(s for s in rep_v16.scopes if s.scope == "whole_step")
+    assert ws_v16.support == "declared"
+
+    wl_verify_20 = advisor.WorkloadSpec(
+        phase="verify", spec_tokens=3, tp=8, ep=8, dcp=1, batch=20
+    )
+    rep_v20 = advisor.advise(model_profile, wl_verify_20, chip_spec)
+    ws_v20 = next(s for s in rep_v20.scopes if s.scope == "whole_step")
+    assert ws_v20.support == "hypothetical"
+    assert "rows_exceed_core_max_batch_rows" in ws_v20.blockers
+
+    wl_v20_dcp = advisor.WorkloadSpec(
+        phase="verify", spec_tokens=3, tp=8, ep=8, dcp=4, batch=20
+    )
+    rep_v20_dcp = advisor.advise(model_profile, wl_v20_dcp, chip_spec)
+    ws_v20_dcp = next(s for s in rep_v20_dcp.scopes if s.scope == "whole_step")
+    assert ws_v20_dcp.support == "declared"
+
+
+def test_layout_mismatch_reports_layout_not_declared() -> None:
+    """Verify mismatched layout with matching ranks reports layout_not_declared."""
+    model_profile = models.resolve_model_profile("qwen3.5-397b")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+
+    wl_tp8 = advisor.WorkloadSpec(
+        phase="decode", batch=16, tp=8, ep=1, dp=1, pp=1, dcp=1
+    )
+    rep_tp8 = advisor.advise(model_profile, wl_tp8, chip_spec)
+    ws_tp8 = next(s for s in rep_tp8.scopes if s.scope == "whole_step")
+    assert ws_tp8.support == "hypothetical"
+    assert "layout_not_declared" in ws_tp8.blockers
+    assert "rank_count_outside_core_grid" not in ws_tp8.blockers
+
+    wl_tp4 = advisor.WorkloadSpec(
+        phase="decode", batch=16, tp=4, ep=1, dp=1, pp=1, dcp=1
+    )
+    rep_tp4 = advisor.advise(model_profile, wl_tp4, chip_spec)
+    ws_tp4 = next(s for s in rep_tp4.scopes if s.scope == "whole_step")
+    assert ws_tp4.support == "hypothetical"
+    assert "rank_count_outside_core_grid" in ws_tp4.blockers
+    assert "layout_not_declared" not in ws_tp4.blockers
+
+
+def test_tied_declarations_are_rejected_at_load() -> None:
+    """Verify conflicting declarations with identical layouts raise an error."""
+    decode_layout = models.ParallelLayout(
+        tp=8,
+        ep=8,
+        dp=1,
+        pp=1,
+        dcp=4,
+        megakernel={
+            "source": "Decode megakernel on TP8 x EP8 x DCP4",
+            "scopes": ["whole_step"],
+            "ranks": 8,
+            "max_rows": 112,
+            "phases": ["decode", "verify"],
+        },
+    )
+    prefill_layout = models.ParallelLayout(tp=1, ep=1, dp=1, pp=8, dcp=1)
+    tied_layout = models.ParallelLayout(
+        tp=8,
+        ep=8,
+        dp=1,
+        pp=1,
+        dcp=4,
+        megakernel={
+            "source": "Duplicate decode megakernel on TP8 x EP8 x DCP4",
+            "scopes": ["whole_step"],
+            "ranks": 8,
+            "max_rows": 64,
+            "phases": ["decode"],
+        },
+    )
+    tied_preset = models.DeploymentPreset(
+        decode=decode_layout,
+        prefill=prefill_layout,
+        megakernel_layouts=(tied_layout,),
+    )
+    with pytest.raises(MegakernelConfigError):
+        models.validate_declared_layouts("test-model", tied_preset)
+
+    disjoint_dcp_layout = models.ParallelLayout(
+        tp=8,
+        ep=8,
+        dp=1,
+        pp=1,
+        dcp=1,
+        megakernel={
+            "source": "Colocated decode megakernel on TP8 x EP8",
+            "scopes": ["whole_step"],
+            "ranks": 8,
+            "max_rows": 64,
+            "phases": ["decode"],
+        },
+    )
+    valid_dcp_preset = models.DeploymentPreset(
+        decode=decode_layout,
+        prefill=prefill_layout,
+        megakernel_layouts=(disjoint_dcp_layout,),
+    )
+    models.validate_declared_layouts("test-model", valid_dcp_preset)
+
+    disjoint_phase_layout = models.ParallelLayout(
+        tp=8,
+        ep=8,
+        dp=1,
+        pp=1,
+        dcp=4,
+        megakernel={
+            "source": "Verify-only megakernel on TP8 x EP8 x DCP4",
+            "scopes": ["whole_step"],
+            "ranks": 8,
+            "max_rows": 64,
+            "phases": ["verify"],
+        },
+    )
+    decode_only_layout = models.ParallelLayout(
+        tp=8,
+        ep=8,
+        dp=1,
+        pp=1,
+        dcp=4,
+        megakernel={
+            "source": "Decode-only megakernel on TP8 x EP8 x DCP4",
+            "scopes": ["whole_step"],
+            "ranks": 8,
+            "max_rows": 112,
+            "phases": ["decode"],
+        },
+    )
+    valid_phase_preset = models.DeploymentPreset(
+        decode=decode_only_layout,
+        prefill=prefill_layout,
+        megakernel_layouts=(disjoint_phase_layout,),
+    )
+    models.validate_declared_layouts("test-model", valid_phase_preset)
+
+
+@pytest.mark.usefixtures("without_declared_megakernels")
+def test_undeclared_fused_call_above_default_bucket_is_hypothetical() -> None:
+    """Verify undeclared fused calls above default buckets require stated limits."""
+    model_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+
+    def eval_whole_step(
+        phase: Literal["decode", "verify"],
+        batch: int,
+        spec_tokens: int = 0,
+        max_rows_per_call: int = 0,
+    ) -> tuple[advisor.AdvisorReport, advisor.ScopeEstimate]:
+        """Evaluate an undeclared Qwen3.5 step and return (report, whole_step)."""
+        wl = advisor.WorkloadSpec(
+            phase=phase,
+            batch=batch,
+            spec_tokens=spec_tokens,
+            max_rows_per_call=max_rows_per_call,
+            tp=8,
+            ep=8,
+            context=4096,
+        )
+        rep = advisor.advise(model_profile, wl, chip_spec)
+        ws = next(s for s in rep.scopes if s.scope == "whole_step")
+        return rep, ws
+
+    # Decode 32 rows: within core limits, no row limit blocker, no assumption.
+    rep_dec_32, ws_dec_32 = eval_whole_step(phase="decode", batch=32)
+    assert ws_dec_32.support == "within_core_limits"
+    assert "row_limit_not_stated" not in ws_dec_32.blockers
+    assert not any(
+        u["name"] == "max_rows_per_call" for u in rep_dec_32.unresolved_assumptions
+    )
+
+    # Decode 33 rows: exceeds default decode bucket, requires stated limit.
+    rep_dec_33, ws_dec_33 = eval_whole_step(phase="decode", batch=33)
+    assert ws_dec_33.support == "hypothetical"
+    assert "row_limit_not_stated" in ws_dec_33.blockers
+    assert rep_dec_33.recommended_scope == "per_op"
+    unres_dec_33 = [
+        u for u in rep_dec_33.unresolved_assumptions if u["name"] == "max_rows_per_call"
+    ]
+    assert len(unres_dec_33) == 1
+    item_dec_33 = unres_dec_33[0]
+    assert item_dec_33["affects"] == "support"
+    assert item_dec_33["unit"] == "rows"
+    assert item_dec_33["sensitivity_us"] == 0.0
+    assert item_dec_33["band"] == [
+        constants.CORE_LIMITS.default_decode_bucket_top,
+        constants.CORE_LIMITS.max_batch_rows,
+    ]
+    assert "--max-rows-per-call" in str(item_dec_33["how_to_settle"])
+
+    # Verify 64 rows: within default verify bucket (16 * 4 = 64).
+    _, ws_ver_64 = eval_whole_step(phase="verify", batch=16, spec_tokens=3)
+    assert ws_ver_64.support == "within_core_limits"
+    assert "row_limit_not_stated" not in ws_ver_64.blockers
+
+    # Verify 68 rows: exceeds default verify bucket (17 * 4 = 68).
+    rep_ver_68, ws_ver_68 = eval_whole_step(phase="verify", batch=17, spec_tokens=3)
+    assert ws_ver_68.support == "hypothetical"
+    assert "row_limit_not_stated" in ws_ver_68.blockers
+    unres_ver_68 = [
+        u for u in rep_ver_68.unresolved_assumptions if u["name"] == "max_rows_per_call"
+    ]
+    assert len(unres_ver_68) == 1
+    item_ver_68 = unres_ver_68[0]
+    assert item_ver_68["affects"] == "support"
+    assert item_ver_68["band"] == [
+        constants.CORE_LIMITS.default_verify_bucket_top,
+        constants.CORE_LIMITS.max_batch_rows,
+    ]
+
+    # Explicit max_rows_per_call clears the blocker and assumption.
+    rep_dec_33_exp, ws_dec_33_exp = eval_whole_step(
+        phase="decode", batch=33, max_rows_per_call=64
+    )
+    assert "row_limit_not_stated" not in ws_dec_33_exp.blockers
+    assert ws_dec_33_exp.support == "within_core_limits"
+    assert not any(
+        u["name"] == "max_rows_per_call" for u in rep_dec_33_exp.unresolved_assumptions
+    )
+
+    rep_ver_68_exp, ws_ver_68_exp = eval_whole_step(
+        phase="verify", batch=17, spec_tokens=3, max_rows_per_call=128
+    )
+    assert "row_limit_not_stated" not in ws_ver_68_exp.blockers
+    assert ws_ver_68_exp.support == "within_core_limits"
+    assert not any(
+        u["name"] == "max_rows_per_call" for u in rep_ver_68_exp.unresolved_assumptions
+    )

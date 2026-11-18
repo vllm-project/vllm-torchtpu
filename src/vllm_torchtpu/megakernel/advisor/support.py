@@ -23,7 +23,12 @@ from .constants import (
     DEFAULT_DECLARED_PHASES,
     CoreLimits,
 )
-from .models import DEPLOYMENT_PRESETS, DeploymentPreset, ModelProfile
+from .models import (
+    DEPLOYMENT_PRESETS,
+    DeploymentPreset,
+    ModelProfile,
+    ParallelLayout,
+)
 from .specs import (
     SUPPORTED_ONCHIP_FAMILIES,
     FusionScope,
@@ -74,10 +79,21 @@ def _declared_int(declaration: Mapping[str, object] | None, key: str) -> int:
     return int(str(declaration.get(key, 0))) if declaration else 0
 
 
-def _declared_blocks(
+def _same_layout(layout: ParallelLayout, workload: WorkloadSpec) -> bool:
+    """Return whether a declared layout has the workload's serving axes."""
+    return (layout.tp, layout.ep, layout.dp, layout.pp, layout.dcp) == (
+        workload.tp,
+        workload.ep,
+        workload.dp,
+        workload.pp,
+        workload.dcp,
+    )
+
+
+def _declared_layouts(
     profile_name: str, scope: FusionScope, phase: str
-) -> tuple[Mapping[str, object], ...]:
-    """Return the deployments.json megakernel blocks that declare scope for phase.
+) -> tuple[tuple[ParallelLayout, Mapping[str, object]], ...]:
+    """Return `(layout, megakernel)` pairs in deployments.json declaring scope.
 
     A block without `phases` covers decode and verify only, so a decode
     declaration never applies to a prefill step. A block needs a source and a
@@ -86,25 +102,31 @@ def _declared_blocks(
     dep = _find_deployment_preset(profile_name)
     if dep is None:
         return ()
-    blocks: list[Mapping[str, object]] = []
-    for layout in (dep.decode, dep.prefill, dep.saturation):
-        mk = layout.megakernel if layout is not None else None
-        if not mk or not str(mk.get("source", "")):
+    entries: list[tuple[ParallelLayout, Mapping[str, object]]] = []
+    for layout in (dep.decode, dep.prefill, dep.saturation, *dep.megakernel_layouts):
+        if layout is None or layout.megakernel is None:
+            continue
+        mk = layout.megakernel
+        if not str(mk.get("source", "")).strip():
             continue
         if _declared_int(mk, "ranks") <= 0:
             continue
         phases = _string_items(mk.get("phases")) or DEFAULT_DECLARED_PHASES
         if scope in _string_items(mk.get("scopes")) and phase in phases:
-            blocks.append(mk)
-    return tuple(blocks)
+            entries.append((layout, mk))
+    return tuple(entries)
 
 
 def find_declaration(
-    profile_name: str, scope: FusionScope, eff_tp: int, phase: str
+    profile_name: str, scope: FusionScope, eff_tp: int, workload: WorkloadSpec
 ) -> Mapping[str, object] | None:
-    """Return the megakernel block declaring scope at this rank count and phase."""
-    for mk in _declared_blocks(profile_name, scope, phase):
-        if eff_tp == _declared_int(mk, "ranks"):
+    """Return the megakernel block declared for this scope, phase, and layout.
+
+    A block matches when its rank count equals eff_tp and the layout entry
+    that holds it has the workload's tp, ep, dp, pp, and dcp.
+    """
+    for layout, mk in _declared_layouts(profile_name, scope, workload.phase):
+        if eff_tp == _declared_int(mk, "ranks") and _same_layout(layout, workload):
             return mk
     return None
 
@@ -132,12 +154,13 @@ def single_call_row_limit(
     """Return the megakernel's single-call row limit for a decode or verify step.
 
     The workload's own limit wins; otherwise a deployments.json declaration for
-    `whole_step` at this rank count supplies it. 0 means no declared limit.
+    `whole_step` at this rank count and layout supplies it. 0 means no declared
+    limit.
     """
     if workload.phase not in ("decode", "verify"):
         return 0
     return workload.max_rows_per_call or _declared_int(
-        find_declaration(profile_name, "whole_step", eff_tp, workload.phase),
+        find_declaration(profile_name, "whole_step", eff_tp, workload),
         "max_rows",
     )
 
@@ -160,16 +183,21 @@ def evaluate_support(
 ) -> tuple[SupportStatus, tuple[str, ...]]:
     """Return `(support_status, blockers)` for `scope` under `CORE_LIMITS`.
 
-    A deployments.json declaration for this scope, rank count, and phase states
-    that a runtime exists for the model. It then supplies the row limit and the
-    layer families that `CORE_LIMITS` checks otherwise.
+    A deployments.json declaration for this scope, phase, rank count, and
+    layout states that a runtime exists for the model. It then supplies the row
+    limit and the layer families that `CORE_LIMITS` checks otherwise.
     """
     if scope == "per_op" or workload.batch <= 0:
         return ("baseline", ())
 
-    declared_blocks = _declared_blocks(profile.name, scope, workload.phase)
+    declared = _declared_layouts(profile.name, scope, workload.phase)
+    rank_matches = [
+        (layout, mk)
+        for layout, mk in declared
+        if ctx.eff_tp == _declared_int(mk, "ranks")
+    ]
     declaration = next(
-        (mk for mk in declared_blocks if ctx.eff_tp == _declared_int(mk, "ranks")),
+        (mk for layout, mk in rank_matches if _same_layout(layout, workload)),
         None,
     )
     has_unmodeled = declaration is None and any(
@@ -178,10 +206,9 @@ def evaluate_support(
     # Declared rank counts restrict a model. Without a declaration for this scope
     # and phase, the core rank grid applies.
     rank_bad = (
-        declaration is None
-        if declared_blocks
-        else ctx.eff_tp not in CORE_LIMITS.verified_ranks
+        not rank_matches if declared else ctx.eff_tp not in CORE_LIMITS.verified_ranks
     )
+    layout_bad = bool(rank_matches) and declaration is None
     attention_dp_in_call = declaration is not None and bool(
         declaration.get("attention_dp_in_call", False)
     )
@@ -204,6 +231,10 @@ def evaluate_support(
             "rank_count_outside_core_grid",
         ),
         (
+            layout_bad,
+            "layout_not_declared",
+        ),
+        (
             CHIP_KIND_MAP.get(chip_spec.name.lower()) not in CORE_LIMITS.chip_kinds,
             "chip_without_core_budget",
         ),
@@ -211,6 +242,13 @@ def evaluate_support(
         (has_unmodeled, "unmodeled_layer_family"),
         (profile.architecture_unverified, "model_type_unrecognized"),
         (planner_bad, "planner_rejected"),
+        (
+            scope == "whole_step"
+            and declaration is None
+            and workload.max_rows_per_call == 0
+            and exceeds_default_buckets(workload, ctx.active_tokens),
+            "row_limit_not_stated",
+        ),
     )
     blockers = tuple(tag for cond, tag in checks if cond)
     if blockers:
