@@ -153,6 +153,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
     "VLLM_TPU_SRPT_ATTN_WORK_CAP",
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
+    # Rust native runtime launcher and binary path; intercepted at CLI startup
+    # before runtime and compilation.
+    "VLLM_TPU_USE_RUST",
+    "VLLM_TPU_RVLLM_BINARY",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",

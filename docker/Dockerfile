@@ -7,6 +7,12 @@
 # before the first FROM so that a FROM line can read it.
 ARG BUILD_VLLM_RS=false
 
+# Whether to include rvllm, the native Rust serving runtime, in the images
+# (docker/build_image.sh --rvllm). Declared before the first FROM so that
+# a FROM line can read it.
+ARG WITH_RVLLM=false
+ARG RVLLM_DOWNLOAD_URL="gs://tpu-commons-ci/rvllm/releases/latest/rvllm"
+
 # vllm-router (vllm-project/router), the prefill/decode router the
 # disaggregated benchmarks put in front of an engine pair. Built from source
 # in a stage of its own; the pin is a build arg so a run can try another
@@ -75,6 +81,34 @@ WORKDIR /out
 # The flag picks one of the two; BuildKit builds only the stage picked.
 FROM vllm-rs-${BUILD_VLLM_RS} AS vllm-rs
 
+# rvllm, the native Rust serving runtime, included when WITH_RVLLM=true.
+# Off by default. When enabled, downloads the binary from RVLLM_DOWNLOAD_URL.
+FROM python:3.12-slim-bookworm AS rvllm-true
+
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+ARG RVLLM_DOWNLOAD_URL
+WORKDIR /out
+RUN if [ -z "${RVLLM_DOWNLOAD_URL}" ]; then \
+      echo "RVLLM_DOWNLOAD_URL must be set when WITH_RVLLM=true" >&2; exit 1; \
+    fi && \
+    if [ "${RVLLM_DOWNLOAD_URL#http}" != "${RVLLM_DOWNLOAD_URL}" ]; then \
+      curl -fsSL "${RVLLM_DOWNLOAD_URL}" -o /out/rvllm; \
+    elif [ "${RVLLM_DOWNLOAD_URL#gs://}" != "${RVLLM_DOWNLOAD_URL}" ]; then \
+      bucket_path="${RVLLM_DOWNLOAD_URL#gs://}" && \
+      curl -fsSL "https://storage.googleapis.com/${bucket_path}" -o /out/rvllm; \
+    else \
+      echo "Unsupported RVLLM_DOWNLOAD_URL scheme: ${RVLLM_DOWNLOAD_URL}" >&2; exit 1; \
+    fi && \
+    chmod 0755 /out/rvllm
+
+# WITH_RVLLM=false: no rvllm binary.
+FROM python:3.12-slim-bookworm AS rvllm-false
+WORKDIR /out
+
+# The flag picks one of the two; BuildKit builds only the stage picked.
+FROM rvllm-${WITH_RVLLM} AS rvllm
+
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
 # (including torch-tpu) pre-installed.
@@ -138,6 +172,9 @@ RUN if [ -e /usr/local/bin/vllm-rs ]; then \
       test -d "$pkg" && \
       ln -s /usr/local/bin/vllm-rs "$pkg/vllm-rs"; \
     fi
+
+# The native Rust serving runtime (rvllm), with WITH_RVLLM=true: on PATH.
+COPY --from=rvllm /out/ /usr/local/bin/
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
