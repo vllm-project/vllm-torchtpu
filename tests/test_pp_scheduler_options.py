@@ -571,30 +571,56 @@ def test_the_prefill_legs_run_what_the_record_jobs_ran():
 # -- what the prefix-aware admission borrows from PrefixAwareScheduler ----------
 
 
-def test_promotion_ranks_with_the_free_block_fit_and_the_step_time():
+def _promote(head, other, warmth, free_blocks, step_time, aging=3_000.0):
+    """Runs the warmest-first promotion over ``[head, other]`` at
+    ``step_time`` and returns the request id it leaves first."""
+    queue = FCFSRequestQueue()
+    queue.add_request(head)
+    queue.add_request(other)
+    s = _sched(_paw_aging_tok_per_s=aging, _step_wall_time=step_time)
+    s.policy = SchedulingPolicy.FCFS
+    s._paw_n = s._paw_cold_tokens = s._paw_prompt_tokens = 0
+    s._prefix_warmth = lambda request: warmth[request.request_id]
+    s._get_block_size = lambda: 2_176
+    s._get_num_free_blocks = lambda: free_blocks
+    s._promote_warmest(queue)
+    return next(iter(queue)).request_id
+
+
+def _waiting(request_id: str, arrival_time: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        num_tokens=10_000,
+        num_preemptions=0,
+        arrival_time=arrival_time,
+    )
+
+
+def test_promotion_ranks_with_the_free_block_fit():
     # The head (old, so aged ahead) does not fit the free blocks; a warm
     # request that fits takes the free-block-fit tier and is promoted. Without
     # the fit input the head's aging keeps it first.
-    step_time = 1_000.0
-    head = SimpleNamespace(
-        request_id="head", num_tokens=10_000, num_preemptions=0, arrival_time=990.0
-    )
-    fits = SimpleNamespace(
-        request_id="fits", num_tokens=10_000, num_preemptions=0, arrival_time=1_000.0
-    )
+    head, fits = _waiting("head", 990.0), _waiting("fits", 1_000.0)
     warmth = {"head": 2_000, "fits": 5_000}
-    for free_blocks, promoted in ((3, "fits"), (None, "head")):
-        queue = FCFSRequestQueue()
-        queue.add_request(head)
-        queue.add_request(fits)
-        s = _sched(_paw_aging_tok_per_s=3_000.0, _step_wall_time=step_time)
-        s.policy = SchedulingPolicy.FCFS
-        s._paw_n = s._paw_cold_tokens = s._paw_prompt_tokens = 0
-        s._prefix_warmth = lambda request: warmth[request.request_id]
-        s._get_block_size = lambda: 2_176
-        s._get_num_free_blocks = lambda free=free_blocks: free
-        s._promote_warmest(queue)
-        assert next(iter(queue)).request_id == promoted, free_blocks
+    assert _promote(head, fits, warmth, free_blocks=3, step_time=1_000.0) == "fits"
+    assert _promote(head, fits, warmth, free_blocks=None, step_time=1_000.0) == "head"
+
+
+def test_promotion_ages_the_head_and_the_window_to_the_step_time():
+    # Aging is linear in the clock, so what matters is that the head and the
+    # rest of the window are aged to the same one, the step time. The step
+    # time here is far in the past of the real clock: a request aged to
+    # time.time() instead would win on aging alone. At the step time, one
+    # second of aging (3,000 tokens) is less than the 4,000-token cold-prefix
+    # difference, so the warmer request ranks first.
+    old_cold, new_warm = _waiting("old-cold", 999.0), _waiting("new-warm", 1_000.0)
+    warmth = {"old-cold": 2_000, "new-warm": 6_000}
+    # The head is the older, colder request: the warmer one is promoted
+    # (the head must be aged to the step time).
+    assert _promote(old_cold, new_warm, warmth, None, step_time=1_000.0) == "new-warm"
+    # The head is the warmer one: it stays first (the window's other
+    # requests must be aged to the step time too).
+    assert _promote(new_warm, old_cold, warmth, None, step_time=1_000.0) == "new-warm"
 
 
 def test_free_blocks_count_the_blocks_retention_pins():
