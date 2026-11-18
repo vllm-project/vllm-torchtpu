@@ -43,11 +43,6 @@ def holds(vllm_config: Any) -> bool:
     return any(rule(vllm_config) for rule in _RULES)
 
 
-def registered(rule: Callable[[Any], bool]) -> bool:
-    """Whether ``rule`` is registered."""
-    return rule in _RULES
-
-
 def matching(vllm_config: Any) -> list[str]:
     """Qualified names of the registered rules that hold for this
     configuration (logged at runner start)."""
