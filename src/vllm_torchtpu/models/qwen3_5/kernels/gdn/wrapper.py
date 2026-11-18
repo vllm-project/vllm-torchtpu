@@ -845,6 +845,10 @@ def fused_conv1d_gdn(
                 window_size=window_size,
             )
         else:
+            # main's static chunk (#2438): rounded down to a power of two, so
+            # a small non-power-of-two token bucket stays divisible by
+            # triangular_block_size.
+            mixed_tile_size = tiling.clip_mixed_tile_size(mixed_tile_size, batch_size)
             decode_tile_size = max(1, min(decode_tile_size, spec_tile_cap))
         if num_spec_tokens > 0 and is_kda:
             decode_tile_size = 1
