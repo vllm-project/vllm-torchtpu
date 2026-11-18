@@ -11,7 +11,6 @@ from typing import Any, ClassVar, cast
 
 import jax
 import torch
-import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.compilation import backends as vllm_compilation_backends
@@ -33,6 +32,9 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
+
+import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
+from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_kernel_ids,
@@ -45,6 +47,13 @@ from vllm_torchtpu.distributed.dcp import (
     get_or_create_dcp_mesh,
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME,
+    indexer_kv_layout,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    get_kv_cache_shape as _get_indexer_kv_cache_shape,
+)
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
@@ -56,42 +65,22 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op,
 )
-from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
+from vllm_torchtpu.kernels.mla import kv_cache_utils
+from vllm_torchtpu.kernels.mla.absorb_q import absorb_q, absorb_q_split
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    KVCacheLayout,
+    KVCacheType,
+    SparseMLAKVCacheSpec,
+)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
+from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
+from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
 from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
 )
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.core.quantization import quantize_kv
-from vllm_torchtpu.layers.core.sequence_layout import (
-    is_pcp_streaming_attention_metadata,
-)
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
-)
-from vllm_torchtpu.tpu_info import get_chip_version
-from vllm_torchtpu.utils import get_shared_jax_op, synchronize_tensors
-
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME,
-    indexer_kv_layout,
-)
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    get_kv_cache_shape as _get_indexer_kv_cache_shape,
-)
-from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.kv_cache_utils import (
-    KVCacheLayout,
-    KVCacheType,
-    SparseMLAKVCacheSpec,
-)
-from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
-from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
     all_gather_q_nope_pe_heads,
@@ -106,6 +95,17 @@ from vllm_torchtpu.layers.core.attention_interface import (
     ragged_paged_attention,
     ragged_paged_attention_batched,
 )
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.quantization import quantize_kv
+from vllm_torchtpu.layers.core.sequence_layout import (
+    is_pcp_streaming_attention_metadata,
+)
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
+from vllm_torchtpu.tpu_info import get_chip_version
+from vllm_torchtpu.utils import get_shared_jax_op, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -114,9 +114,21 @@ def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
     return q_nope.new_empty((*q_nope.shape[:2], w_uk_t.shape[2]))
 
 
+def _fake_absorb_q_split(
+    q_nope: torch.Tensor, w_uk_t: torch.Tensor, split_rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rank = w_uk_t.shape[2]
+    return (
+        q_nope.new_empty((split_rows, q_nope.shape[1], rank)),
+        q_nope.new_empty((q_nope.shape[0] - split_rows, q_nope.shape[1], rank)),
+    )
+
+
 # Registered at import: Dynamo cannot trace a lock-guarded registration.
 _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
+_absorb_q_split = pallas.jax_op("pallas::mla_absorb_q_split", absorb_q_split)
+_absorb_q_split.register_fake(_fake_absorb_q_split)
 
 
 def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
@@ -2911,7 +2923,29 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+        tp_op = getattr(layer, "sparse_mla_tp_op", None)
+        num_kv_tokens = kv_c_normed.view(-1, layer.kv_lora_rank).shape[0]
+        use_tp_split_absorb = (
+            topk_indices is not None
+            and tp_op is not None
+            and use_qrep
+            and dcp_token_parallel_op.applies(num_kv_tokens)
+            and getattr(tp_op, "split_q_inputs", False)
+            and q_nope.device.type == "tpu"
+            and w_uk_t_scale is None
+        )
+        ql_nope_split: tuple[torch.Tensor, torch.Tensor] | None = None
+        if use_tp_split_absorb:
+            assert tp_op is not None
+            ql_head, ql_tail = _absorb_q_split(
+                q_nope, w_uk_t_src.to(q_nope.dtype), tp_op.layout.split_rows
+            )
+            ql_nope_split = (
+                ql_head.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
+                ql_tail.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
+            )
+            ql_nope = ql_nope_split[0]
+        elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
             q_nope_t = q_nope.transpose(0, 1)
@@ -2941,15 +2975,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "sparse MLA layers use a native (nope, rope) split "
                 f"cache; got {type(kv_cache)}"
             )
-            if getattr(
-                layer, "sparse_mla_tp_op", None
-            ) is not None and dcp_token_parallel_op.applies(kv_c_normed_flat.shape[0]):
+            if tp_op is not None and dcp_token_parallel_op.applies(
+                kv_c_normed_flat.shape[0]
+            ):
                 # TPU_DCP_PREFILL_TOKEN_PARALLEL: the DCP path on the leading
                 # rows, the token-parallel split on the rest; merged outputs.
                 outputs = dcp_token_parallel_op.attention(
                     layer,
                     (kv_cache[0], kv_cache[1]),
-                    ql_nope_flat,
+                    ql_nope_split if ql_nope_split is not None else ql_nope_flat,
                     q_pe_flat,
                     kv_c_normed_flat,
                     k_pe_flat,

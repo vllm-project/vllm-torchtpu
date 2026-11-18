@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
+
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
     rank_major_merge_fits,
@@ -33,15 +34,14 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     sparsecore_topk_dcp_merge,
 )
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk_dcp import sparsecore_topk_dcp
-from vllm_torchtpu.kernels.experimental.small_collectives import (
-    all_gather as small_collectives_all_gather,
-)
-
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,
     dcp_sc_compact,
     metadata,
+)
+from vllm_torchtpu.kernels.experimental.small_collectives import (
+    all_gather as small_collectives_all_gather,
 )
 
 try:
@@ -2042,8 +2042,12 @@ def streamindex_topk(
 
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])
+        # Avoid default binary-search searchsorted: lowers to a gather
+        # while-loop on TPU (~640 us vs ~10 us at 1024 tokens).
         seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+            jnp.searchsorted(
+                cu_q_lens[1:], token_idx, side="right", method="compare_all"
+            ),
             seq_lens.shape[0] - 1,
         )
         seq_len = seq_lens[seq_idx]

@@ -427,6 +427,7 @@ def build_attention_op(
         w_uv: jax.Array | None = None,
         w_o: jax.Array | None = None,
         s_o: jax.Array | None = None,
+        q_tail: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if after is not None:
             kv_cache_nope, kv_cache_rope = _after_reads(
@@ -546,15 +547,29 @@ def build_attention_op(
             seq_lens, query_start_loc, request_distribution, s
         )
         if q_replicated:
-            q_dcp = jax.shard_map(
-                lambda x: x[:s], mesh=mesh, in_specs=shd, out_specs=rp, check_vma=False
-            )(q)
+            if q_tail is not None:
+                q_dcp = jax.shard_map(
+                    lambda x: x, mesh=mesh, in_specs=shd, out_specs=rp, check_vma=False
+                )(q)
+                q_tp = q_tail
+            else:
+                q_dcp = jax.shard_map(
+                    lambda x: x[:s],
+                    mesh=mesh,
+                    in_specs=shd,
+                    out_specs=rp,
+                    check_vma=False,
+                )(q)
+                q_tp = jax.shard_map(
+                    lambda x: x[s:],
+                    mesh=mesh,
+                    in_specs=shd,
+                    out_specs=shd,
+                    check_vma=False,
+                )(q)
             pe_dcp = jax.shard_map(
                 lambda x: x[:s], mesh=mesh, in_specs=shd, out_specs=rp, check_vma=False
             )(q_pe)
-            q_tp = jax.shard_map(
-                lambda x: x[s:], mesh=mesh, in_specs=shd, out_specs=shd, check_vma=False
-            )(q)
             pe_tp = jax.shard_map(
                 lambda x: x[s:], mesh=mesh, in_specs=shd, out_specs=shd, check_vma=False
             )(q_pe)
@@ -688,6 +703,7 @@ def build_attention_op(
         return kv_cache_nope, kv_cache_rope, full_out
 
     use_split_op = split_q or fused_subbatch
+    split_q_inputs = bool(fused_subbatch and q_replicated)
     sharded, rep = P(DCP_AXIS_NAME), P()
 
     def _build_wrapper(has_rank: bool, has_uv: bool):
@@ -706,6 +722,7 @@ def build_attention_op(
                 query_start_loc: jax.Array,
                 request_distribution: jax.Array,
                 *extra: jax.Array,
+                q_tail: jax.Array | None = None,
             ) -> tuple[jax.Array, jax.Array, jax.Array]:
                 r_id = extra[0] if has_rank else None
                 uv_w = extra[-1] if has_uv else None
@@ -724,7 +741,97 @@ def build_attention_op(
                     None,
                     r_id,
                     uv_w,
+                    q_tail=q_tail,
                 )
+
+            if split_q_inputs:
+                if (has_rank, has_uv) == (False, False):
+
+                    def ws0(
+                        n: jax.Array,
+                        r: jax.Array,
+                        qh: jax.Array,
+                        qt: jax.Array,
+                        qp: jax.Array,
+                        kc: jax.Array,
+                        kp: jax.Array,
+                        tk: jax.Array,
+                        sl: jax.Array,
+                        bt: jax.Array,
+                        qsl: jax.Array,
+                        rd: jax.Array,
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                        return _fn_fused(
+                            n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, q_tail=qt
+                        )
+
+                    return ws0
+                if (has_rank, has_uv) == (False, True):
+
+                    def ws1(
+                        n: jax.Array,
+                        r: jax.Array,
+                        qh: jax.Array,
+                        qt: jax.Array,
+                        qp: jax.Array,
+                        kc: jax.Array,
+                        kp: jax.Array,
+                        tk: jax.Array,
+                        sl: jax.Array,
+                        bt: jax.Array,
+                        qsl: jax.Array,
+                        rd: jax.Array,
+                        uv: jax.Array,
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                        return _fn_fused(
+                            n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, uv, q_tail=qt
+                        )
+
+                    return ws1
+                if (has_rank, has_uv) == (True, False):
+
+                    def ws2(
+                        n: jax.Array,
+                        r: jax.Array,
+                        qh: jax.Array,
+                        qt: jax.Array,
+                        qp: jax.Array,
+                        kc: jax.Array,
+                        kp: jax.Array,
+                        tk: jax.Array,
+                        sl: jax.Array,
+                        bt: jax.Array,
+                        qsl: jax.Array,
+                        rd: jax.Array,
+                        rk: jax.Array,
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                        return _fn_fused(
+                            n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, rk, q_tail=qt
+                        )
+
+                    return ws2
+
+                def ws3(
+                    n: jax.Array,
+                    r: jax.Array,
+                    qh: jax.Array,
+                    qt: jax.Array,
+                    qp: jax.Array,
+                    kc: jax.Array,
+                    kp: jax.Array,
+                    tk: jax.Array,
+                    sl: jax.Array,
+                    bt: jax.Array,
+                    qsl: jax.Array,
+                    rd: jax.Array,
+                    rk: jax.Array,
+                    uv: jax.Array,
+                ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                    return _fn_fused(
+                        n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, rk, uv, q_tail=qt
+                    )
+
+                return ws3
 
             if (has_rank, has_uv) == (False, False):
 
@@ -962,6 +1069,8 @@ def build_attention_op(
         return c3
 
     in_specs = (sharded, sharded, sharded)
+    if split_q_inputs:
+        in_specs += (sharded,)
     if use_split_op:
         in_specs += (sharded,)
     in_specs += (rep, rep, sharded, rep, rep, rep, rep)
@@ -973,9 +1082,11 @@ def build_attention_op(
         in_specs += (sharded,)
     fn = _build_wrapper(has_rank, uv_in_tp)
 
+    kv_c_rest_idx = 2 if split_q_inputs else (1 if use_split_op else 0)
+
     def _fake(kv_cache_nope, kv_cache_rope, q, *rest, **kwargs):
         del kwargs
-        kv_c_normed = rest[1] if use_split_op else rest[0]
+        kv_c_normed = rest[kv_c_rest_idx]
         return (
             torch.empty_like(kv_cache_nope),
             torch.empty_like(kv_cache_rope),
@@ -1023,28 +1134,56 @@ def build_attention_op(
     # rank operand and W_UV in the op; other layers keep o_proj outside.
     if envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ and fused_subbatch and has_rank and uv_in_tp:
 
-        def w_oproj(
-            n: jax.Array,
-            r: jax.Array,
-            qn: jax.Array,
-            qp: jax.Array,
-            kc: jax.Array,
-            kp: jax.Array,
-            tk: jax.Array,
-            sl: jax.Array,
-            bt: jax.Array,
-            qsl: jax.Array,
-            rd: jax.Array,
-            rk: jax.Array,
-            uv: jax.Array,
-            wo: jax.Array,
-            so: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            return _run(n, r, qn, qp, kc, kp, tk, sl, bt, qsl, rd, None, rk, uv, wo, so)
+        if split_q_inputs:
+
+            def w_oproj(
+                n: jax.Array,
+                r: jax.Array,
+                qh: jax.Array,
+                qt: jax.Array,
+                qp: jax.Array,
+                kc: jax.Array,
+                kp: jax.Array,
+                tk: jax.Array,
+                sl: jax.Array,
+                bt: jax.Array,
+                qsl: jax.Array,
+                rd: jax.Array,
+                rk: jax.Array,
+                uv: jax.Array,
+                wo: jax.Array,
+                so: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                return _run(
+                    n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, None, rk, uv, wo, so, qt
+                )
+
+        else:
+
+            def w_oproj(
+                n: jax.Array,
+                r: jax.Array,
+                qn: jax.Array,
+                qp: jax.Array,
+                kc: jax.Array,
+                kp: jax.Array,
+                tk: jax.Array,
+                sl: jax.Array,
+                bt: jax.Array,
+                qsl: jax.Array,
+                rd: jax.Array,
+                rk: jax.Array,
+                uv: jax.Array,
+                wo: jax.Array,
+                so: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                return _run(
+                    n, r, qn, qp, kc, kp, tk, sl, bt, qsl, rd, None, rk, uv, wo, so
+                )
 
         def _fake_oproj(kv_cache_nope, kv_cache_rope, q, *rest, **kwargs):
             del kwargs
-            kv_c_normed, w_o = rest[1], rest[-2]
+            kv_c_normed, w_o = rest[kv_c_rest_idx], rest[-2]
             return (
                 torch.empty_like(kv_cache_nope),
                 torch.empty_like(kv_cache_rope),
@@ -1082,7 +1221,7 @@ def build_attention_op(
 
     def run(
         kv_cache: tuple[torch.Tensor, torch.Tensor],
-        q: torch.Tensor,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         q_pe: torch.Tensor | None,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
@@ -1096,7 +1235,16 @@ def build_attention_op(
         w_o: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         nope_cache, rope_cache = kv_cache
-        q_args = (q, q_pe) if use_split_op else (q,)
+        if split_q_inputs:
+            if isinstance(q, tuple):
+                q_head, q_tail = q
+            else:
+                q_head, q_tail = q[: layout.split_rows], q[layout.split_rows :]
+            q_args: tuple[Any, ...] = (q_head, q_tail, q_pe)
+        elif use_split_op:
+            q_args = (q, q_pe)
+        else:
+            q_args = (q,)
         after_args = () if fused_subbatch else (after,)
         if w_o is not None:
             if oproj_op is None or w_uv is None or rank_tensor is None:
@@ -1145,6 +1293,7 @@ def build_attention_op(
     run.q_replicated = q_replicated  # type: ignore[attr-defined]
     run.uv_in_tp = uv_in_tp  # type: ignore[attr-defined]
     run.split_q = use_split_op  # type: ignore[attr-defined]
+    run.split_q_inputs = split_q_inputs  # type: ignore[attr-defined]
     run.fused_subbatch = fused_subbatch  # type: ignore[attr-defined]
     run.serves_oproj = oproj_op is not None  # type: ignore[attr-defined]
     # This rank's DCP index as data, for `q_rows` (built here, outside Dynamo).
@@ -1170,7 +1319,7 @@ def q_rows(tp_op: Any, num_tokens: int) -> torch.Tensor:
 def attention(
     layer: Any,
     kv_cache: tuple[torch.Tensor, torch.Tensor],
-    ql_nope: torch.Tensor,
+    ql_nope: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     q_pe: torch.Tensor,
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
@@ -1182,7 +1331,7 @@ def attention(
     """Sparse MLA of a split bucket: `[T, heads, kv_lora_rank]`, this rank's
     heads, merged; what the DCP path returns for the same step. `ql_nope` /
     `q_pe` hold this rank's heads of every row, or, under query replication,
-    every head of the `q_rows` rows.
+    every head of the `q_rows` rows (either contiguous or split `(head, tail)`).
 
     With `w_o` (this rank's FP8 o_proj row shard, canonical (k, n), and its
     per-channel scale): o_proj's output on this rank's sequence-parallel rows
@@ -1203,8 +1352,20 @@ def attention(
     s = layout.split_rows
     num_tokens = kv_c_normed.shape[0]
     rows = layout.rows_per_rank(num_tokens)
-    if q_replicated and ql_nope.shape[0] != s + rows:
-        raise ValueError(f"q has {ql_nope.shape[0]} rows, not the {s + rows} q_rows")
+    if isinstance(ql_nope, tuple):
+        q_head, q_tail = ql_nope
+        if q_replicated and (q_head.shape[0] != s or q_tail.shape[0] != rows):
+            raise ValueError(
+                f"split q has ({q_head.shape[0]}, {q_tail.shape[0]}) rows, "
+                f"not ({s}, {rows})"
+            )
+        q_dtype = q_head.dtype
+    else:
+        if q_replicated and ql_nope.shape[0] != s + rows:
+            raise ValueError(
+                f"q has {ql_nope.shape[0]} rows, not the {s + rows} q_rows"
+            )
+        q_dtype = ql_nope.dtype
     md = attn_metadata
     if w_o is not None and not getattr(tp_op, "fused_subbatch", False):
         raise NotImplementedError("sequence-row o_proj needs the fused sub-batch op")
@@ -1214,8 +1375,8 @@ def attention(
             # The sequence-row o_proj takes every head's W_UV (replicated).
             w_uv_src = layer.W_UV if w_o is None else layer.W_UV_tp_all
             w_uv_arg = (
-                w_uv_src.to(ql_nope.dtype)
-                if w_uv_src.dtype != ql_nope.dtype
+                w_uv_src.to(q_dtype)
+                if w_uv_src.dtype != q_dtype
                 else w_uv_src
             )
         out = tp_op(
@@ -1234,6 +1395,8 @@ def attention(
             w_o,
         )
         return _retain_rank(out)
+
+    assert isinstance(ql_nope, torch.Tensor)
 
     seq_s, qsl_s, dist_s = dcp_rows_metadata(
         md.seq_lens, md.query_start_loc, md.request_distribution, s

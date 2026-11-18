@@ -1753,3 +1753,40 @@ if __name__ == "__main__":
     from absl import app
 
     app.run(main)
+
+
+@pytest.mark.tpu_test
+def test_should_match_causal_fast_path_indices_with_compare_all_searchsorted():
+    num_tokens, k = 13, 16
+    q = jnp.zeros((num_tokens, 4, 128), dtype=jnp.float8_e4m3fn)
+    weights = jnp.zeros((num_tokens, 4), dtype=jnp.bfloat16)
+    k_cache = jnp.zeros((2, 16, 4, 256), dtype=jnp.uint8)
+    seq_lens = jnp.array([8, 4, 0, 0], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 5, 9, 9, 9], dtype=jnp.int32)
+    page_indices = jnp.zeros((8,), dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+    got = np.asarray(
+        streamindex_topk(
+            q,
+            weights,
+            k_cache,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            k=k,
+            compression_ratio=1,
+            num_kv_pages_per_block=2,
+            num_queries_per_block=4,
+            enable_early_exit=True,
+        )
+    )
+
+    expected = np.full((num_tokens, k), -1, dtype=np.int32)
+    for t in range(5):
+        max_pos = 3 + t
+        expected[t, : max_pos + 1] = np.arange(max_pos + 1, dtype=np.int32)
+    for t in range(4):
+        expected[5 + t, : t + 1] = np.arange(t + 1, dtype=np.int32)
+    np.testing.assert_array_equal(got, expected)
