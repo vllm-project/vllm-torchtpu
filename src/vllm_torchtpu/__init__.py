@@ -202,7 +202,8 @@ def _patch_vllm_aot_compile_cache_key() -> None:
 
 
 def _patch_vllm_config_hash_ignore_diagnostics() -> None:
-    """Keep diagnostics-only ``additional_config`` keys out of cache keys.
+    """Keep diagnostics-only and host-only ``additional_config`` keys out of
+    cache keys (``runner.utils.HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``).
 
     ``VllmConfig.compute_hash()`` unconditionally folds
     ``json.dumps(additional_config)`` into its result, and that hash feeds both
@@ -212,7 +213,9 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     full recompile on every server start. Upstream takes the same care in
     ``ProfilerConfig.compute_hash()`` ("this config will not affect the
     computation graph"); this is the equivalent carve-out for the plugin-owned
-    keys, mirroring ``_TPU_COMPILE_ENV_IGNORED`` for env vars.
+    keys, mirroring ``_TPU_COMPILE_ENV_IGNORED`` for env vars. The host-only
+    sections (the API-server patches' ``tpu_frontend``) never reach a compiled
+    program either.
     """
     import copy
 
