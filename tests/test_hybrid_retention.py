@@ -990,42 +990,82 @@ def _real_request(request_id: str, token_ids):
 
 def _run_turn(mgr, ret, request_id: str, prompt, decode_tokens: int):
     """Prefill ``prompt`` in block-aligned chunks, as the scheduler splits an
-    align-mode prompt, pin the released boundary state after the first decode
-    step, decode, then free the request the way the scheduler does. Returns
-    the request and its boundary state block."""
+    align-mode prompt, decode, then free the request the way the scheduler
+    does. With a retention, its hooks run where the scheduler calls them
+    (``pin_running`` once the first decode step released the boundary state,
+    ``on_request_freed`` after the free). Returns the boundary state block."""
     req = _real_request(request_id, prompt)
     boundary = (len(prompt) // _REAL_BS) * _REAL_BS
     for chunk in (boundary, len(prompt) - boundary):
         assert mgr.allocate_slots(req, chunk) is not None
         req.num_computed_tokens += chunk
-    state = None
+    mamba_blocks = mgr.coordinator.single_type_managers[1].req_to_blocks[request_id]
+    state = mamba_blocks[boundary // _REAL_BS - 1]
+    assert state.block_hash is not None
     for i in range(decode_tokens):
         req.append_output_token_ids(5000 + i)
         assert mgr.allocate_slots(req, 1) is not None
         req.num_computed_tokens += 1
-        if i == 0:
-            # The first decode step released the boundary state, still cached.
-            states, hit = ret._probe(req, len(prompt))
-            assert hit == boundary and len(states) == 1
-            (state,) = states
-            assert state.ref_cnt == 0
+        if i == 0 and ret is not None:
             ret.pin_running([req])
-            assert state.ref_cnt == 1
-            assert ret._pinned[request_id] == ([state], boundary)
-    attn = ret.snapshot_attention_blocks(req)
+    attn = None if ret is None else ret.snapshot_attention_blocks(req)
     mgr.free(req)
-    ret.on_request_freed(req, attn)
-    return req, state
+    if ret is not None:
+        ret.on_request_freed(req, attn)
+    return state
+
+
+def _first_cached_free_block(pool):
+    """(position, block) of the first free block that still holds a cached
+    prefix: the next one an allocation from the free queue evicts."""
+    queue = pool.free_block_queue
+    block = queue.fake_free_list_head.next_free_block
+    position = 0
+    while block is not queue.fake_free_list_tail:
+        if block.block_hash is not None:
+            return position, block
+        block = block.next_free_block
+        position += 1
+    raise AssertionError("no free block holds a cached prefix")
+
+
+def _evict_one_and_look_up(mgr, prompt):
+    """Allocate every free block up to and including the first one holding a
+    cached prefix, free them again, and look up a request that shares only
+    ``prompt``. Returns the evicted block and the lookup."""
+    pool = mgr.block_pool
+    position, victim = _first_cached_free_block(pool)
+    pool.free_blocks(pool.get_new_blocks(position + 1))
+    nxt = _real_request("next", prompt + list(range(7000, 7020)))
+    return victim, nxt, mgr.get_computed_blocks(nxt)
 
 
 def test_retention_on_the_pinned_vllm_kv_cache_manager():
-    """pin, free, retain, evict under pool pressure and reset on vLLM's own
-    KVCacheManager, MambaManager and BlockPool, so the hooks wrap the real
-    methods and BlockPool.touch gets the flat block list it takes."""
+    """On vLLM's own KVCacheManager, MambaManager and BlockPool: allocation
+    pressure that evicts the released boundary state without retention leaves
+    it pinned with retention, so the next turn hits at it; under full pressure
+    the pool guard gives it up, and the reset guard lets vLLM's reset run."""
+    prompt = list(range(1000, 1088))
+
+    # Without retention the boundary state, released at the first decode step,
+    # is the oldest cached free block: the first one pressure evicts.
+    control = _real_manager(48)
+    state = _run_turn(control, None, "turn0", prompt, decode_tokens=40)
+    victim, _, (_, hit, _) = _evict_one_and_look_up(control, prompt)
+    assert victim is state and hit == 0
+
     mgr = _real_manager(48)
     pool = mgr.block_pool
     ret = HybridStateRetention(mgr)
-    assert ret.enabled
+    state = _run_turn(mgr, ret, "turn0", prompt, decode_tokens=40)
+    victim, nxt, (blocks, hit, _) = _evict_one_and_look_up(mgr, prompt)
+    # The same pressure leaves the pinned state, and the next turn's hit ends
+    # on it (BlockPool.touch took the flat block list).
+    assert hit == 80 and victim is not state
+    assert blocks.blocks[1][-1] is state
+    assert state.ref_cnt == 1 and ret.num_pinned_blocks() == 1
+    assert [e.blocks for e in ret._conv_lru.values()] == [[state]]
+    # The hooks wrap vLLM's own instances.
     mamba = mgr.coordinator.single_type_managers[1]
     for owner, name in (
         (mamba, "_cache_partial_tail_block"),
@@ -1037,25 +1077,13 @@ def test_retention_on_the_pinned_vllm_kv_cache_manager():
     ):
         assert name in vars(owner), name
 
-    prompt = list(range(1000, 1088))
-    _, state = _run_turn(mgr, ret, "turn0", prompt, decode_tokens=40)
-    # The conversation LRU holds the boundary state across the think time.
-    assert state.ref_cnt == 1 and state.block_hash is not None
-    assert ret.num_pinned_blocks() == 1
-    assert [e.blocks for e in ret._conv_lru.values()] == [[state]]
-
-    # A request that shares the prompt but not the reply hits exactly at the
-    # retained boundary state.
-    nxt = _real_request("turn1", prompt + list(range(7000, 7020)))
-    assert mgr.get_computed_blocks(nxt)[1] == 80
-
-    # Pool pressure: the get_new_blocks guard evicts the retained entry so a
+    # Full pressure: the get_new_blocks guard evicts the retained entry so a
     # request for every block, the pinned one included, succeeds.
     need = pool.get_num_free_blocks() + 1
-    blocks = pool.get_new_blocks(need)
-    assert len(blocks) == need
+    taken = pool.get_new_blocks(need)
+    assert len(taken) == need
     assert ret.num_pinned_blocks() == 0 and not ret._conv_lru
-    pool.free_blocks(blocks)
+    pool.free_blocks(taken)
     assert mgr.get_computed_blocks(nxt)[1] == 0
 
     # A retained entry holds a block, which vLLM's reset refuses; the reset
