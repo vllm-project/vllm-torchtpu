@@ -206,6 +206,10 @@ def test_cli_end_to_end_and_check_regression_integration(tmp_path, mock_openai_s
     def responder(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         assert payload["model"] == "Qwen/Qwen3-0.6B"
         assert payload["response_format"]["type"] == "json_schema"
+        assert payload["chat_template_kwargs"] == {
+            "enable_thinking": False,
+            "thinking": False,
+        }
         call_idx["n"] += 1
         # 3 valid, 1 invalid JSON across 4 prompts -> acc = 0.75
         content = '{"answer": 42}' if call_idx["n"] <= 3 else '{"answer": "wrong"}'

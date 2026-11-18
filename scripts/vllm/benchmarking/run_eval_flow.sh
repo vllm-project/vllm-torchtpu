@@ -265,12 +265,23 @@ run_lm_eval() {
                 --apply_chat_template
             )
             local gen_kwargs
-            if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
-                gen_kwargs='{"chat_template_kwargs": {"enable_thinking": false}}'
-            else
-                lm_eval_args+=(--fewshot_as_multiturn true)
-                gen_kwargs='{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}'
-            fi
+            case "$task" in
+                gsm8k|gpqa_diamond|aime2026)
+                    gen_kwargs='{"chat_template_kwargs": {"enable_thinking": false}}'
+                    ;;
+                mmlu_pro)
+                    if [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
+                        gen_kwargs='{"chat_template_kwargs": {"enable_thinking": false}}'
+                    else
+                        lm_eval_args+=(--fewshot_as_multiturn true)
+                        gen_kwargs='{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}'
+                    fi
+                    ;;
+                *)
+                    lm_eval_args+=(--fewshot_as_multiturn true)
+                    gen_kwargs='{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}'
+                    ;;
+            esac
             # Replaced, not extended: --gen_kwargs is a merging argparse
             # action, so a second flag would union with the default.
             if [ -n "$LM_EVAL_GEN_KWARGS" ]; then

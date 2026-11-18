@@ -675,7 +675,10 @@ def build_request_payload(
         "messages": messages,
         "temperature": config.temperature,
         "max_tokens": case.max_tokens or config.max_tokens,
-        "chat_template_kwargs": {"enable_thinking": config.enable_thinking},
+        "chat_template_kwargs": {
+            "enable_thinking": config.enable_thinking,
+            "thinking": config.enable_thinking,
+        },
     }
     if mode == RequestMode.RESPONSE_FORMAT:
         payload["response_format"] = {

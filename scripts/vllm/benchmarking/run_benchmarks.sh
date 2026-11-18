@@ -796,7 +796,7 @@ run_spec_benchmarks() {
 # the client falls back to MODEL.
 PULLED_TOKENIZER_DIR=""
 if [ -z "${TOKENIZER:-}" ] && [ -n "$MODEL_URI" ]; then
-    PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1)
+    PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1 || true)
 fi
 
 bench_tokenizer_dir() {

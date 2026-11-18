@@ -513,3 +513,23 @@ def test_skip_benchmark_without_host_keeps_legacy_dry_run_behavior(flow):
         "base_url=http://localhost:8000/v1/chat/completions,"
         "num_concurrent=128"
     }
+
+
+def test_gsm8k_uses_plain_chat_gen_kwargs_without_continue_final_message(flow):
+    flow.run(
+        "--host",
+        "gw.example.com",
+        "--eval-suites",
+        "gsm8k,mmlu_llama",
+        "--perf-suites",
+        "none",
+    )
+
+    gen_kwargs = flow.values("lm_eval", "--gen_kwargs")
+    assert gen_kwargs == [
+        '{"chat_template_kwargs": {"enable_thinking": false}}',
+        '{"continue_final_message": true, "add_generation_prompt": false, '
+        '"chat_template_kwargs": {"enable_thinking": false}}',
+    ]
+    # Only mmlu_llama passed --fewshot_as_multiturn true (once across the 2 calls).
+    assert flow.values("lm_eval", "--fewshot_as_multiturn") == ["true"]
