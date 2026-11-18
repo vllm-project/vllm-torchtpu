@@ -30,6 +30,9 @@ from vllm_torchtpu.layers.adapter import small_all_reduce_op as op
 
 pytestmark = pytest.mark.cpu_test
 
+# The device-info reader itself, before prebuild_layout replaces it.
+DEVICES_PER_CHIP = sc_common.devices_per_chip
+
 CORES = 8
 MESH = tuple(range(CORES))
 HIDDEN = 4096
@@ -460,16 +463,57 @@ def test_prebuild_without_the_setting_builds_no_tp_pair(prebuild_layout):
     builders.pairs.assert_not_called()
 
 
-def test_prebuild_builds_no_tp_pair_across_chips(prebuild_layout, monkeypatch):
-    """A TP2 group is one chip's cores only where a chip holds two devices;
-    with one device per chip it keeps XLA's all-reduce and runs no
-    collective."""
+def _device_info(monkeypatch, chip, cores_per_device=1):
+    """The real devices_per_chip over a faked pltpu.get_tpu_info, and the
+    module logger as a mock."""
+    info = pltpu.get_tpu_info_for_chip(chip, cores_per_device)
+    monkeypatch.setattr(sc_common, "devices_per_chip", DEVICES_PER_CHIP)
+    monkeypatch.setattr(sc_common.pltpu, "get_tpu_info", lambda: info)
+    logger = Mock(name="logger")
+    monkeypatch.setattr(op, "logger", logger)
+    return logger
+
+
+def test_prebuild_builds_no_tp_pair_across_chips_and_says_so(
+    prebuild_layout, monkeypatch
+):
+    """A TP2 group is one chip's cores only where a chip holds two devices.
+    With one device per chip (the device info's report) the measured DP x TP2
+    layout keeps XLA's all-reduce, runs no collective, and warns once with the
+    reported value."""
     builders, _ = prebuild_layout((2, 3))
-    monkeypatch.setattr(sc_common, "devices_per_chip", lambda: 1)
+    logger = _device_info(monkeypatch, pltpu.ChipVersion.TPU_V6E)
     op.prebuild(ON)
     assert op._AR_TP_OP is None
     builders.tp.assert_not_called()
     builders.pairs.assert_not_called()
+    logger.warning_once.assert_called_once()
+    message, what, reported, tp, _ = logger.warning_once.call_args.args
+    assert "device(s) per chip" in message
+    assert (what, reported, tp) == ("The TP-pair small all-reduce", 1, 2)
+
+
+def test_prebuild_arms_the_tp_pair_on_tpu7x_device_info_without_a_warning(
+    prebuild_layout, monkeypatch
+):
+    builders, mesh = prebuild_layout((2, 3))
+    logger = _device_info(monkeypatch, pltpu.ChipVersion.TPU_7X)
+    op.prebuild(ON)
+    assert op._AR_TP_OP is builders.tp.return_value
+    builders.tp.assert_called_once_with(mesh, 2)
+    logger.warning_once.assert_not_called()
+
+
+def test_an_unmeasured_tp_size_off_the_chip_is_not_warned_about(
+    prebuild_layout, monkeypatch
+):
+    """TP4 was never served by the TP-pair kernel, so a chip that does not
+    hold four devices is no news."""
+    builders, _ = prebuild_layout((0, 1, 2, 3))
+    logger = _device_info(monkeypatch, pltpu.ChipVersion.TPU_7X)
+    op.prebuild(ON)
+    assert op._AR_TP_OP is None
+    logger.warning_once.assert_not_called()
 
 
 @pytest.mark.parametrize(
