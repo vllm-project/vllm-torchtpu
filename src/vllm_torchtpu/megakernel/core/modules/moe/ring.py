@@ -33,7 +33,7 @@ from .context import MoEEmit
 def fetch_e(m: MoEEmit, u, l_idx, t=None):
     """Issue routed expert unit `u` into dynamic bank `u % NBE`."""
     W, me, mp, scr, stream = m.W, m.me, m.mp, m.scr, m.stream
-    ECOPY, ER, NBE, NSS, T13, TE = mp.ECOPY, mp.ER, mp.NBE, mp.NSS, mp.T13, mp.TE
+    ECOPY, ER, NBE, T13, TE = mp.ECOPY, mp.ER, mp.NBE, mp.T13, mp.TE
     if t is None and isinstance(u, int):
         t = u % TE
     i = u // TE if t is None else (u - t) // TE
