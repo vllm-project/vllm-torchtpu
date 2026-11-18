@@ -607,10 +607,15 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     wire_dtype=None,
     ep_tp_size=1,
+    eager_push=False,
 ):
     """Build the pallas_call and the function that invokes it.
 
-    `wire_dtype` overrides the format's result wire (`host.weight_form`)."""
+    `wire_dtype` overrides the format's result wire (`host.weight_form`).
+    `eager_push` pushes each tile's share of its runs out of the contribution
+    slab as soon as the tile's commit has landed, instead of every run of a
+    visit after the visit's last tile; builds that ship tiles straight out of
+    `out_vm` already push per tile and are unchanged by it."""
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
@@ -902,6 +907,12 @@ def _build_fused_ep_moe_kernel(
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
     push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    # A visit's pushes leave after its last tile, so the links stand idle for
+    # the whole first visit and the busiest chip's egress ends the kernel
+    # behind its compute. Pushing each tile from the slab once its commit has
+    # landed starts the wire a few tiles in; the same bytes reach the same
+    # arrival rows, only earlier and in more pieces.
+    eager_slab_push = bool(eager_push) and not push_from_vmem
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
     gather_payload_rows = gather_tiles * tile_m
@@ -1904,6 +1915,15 @@ def _build_fused_ep_moe_kernel(
                         next_shift + next_within * tile_m,
                     )
 
+                # Tile t - 2's commit was waited by the reuse guard above,
+                # so its rows can leave now; issued behind tile t + 1's row
+                # fetch so that the fetch is not queued behind the wire.
+                if eager_slab_push:
+
+                    @pl.when(pending > 0)
+                    def _():
+                        push_tile(e, t - 2, (t - 2) * tile_blocks, pending)
+
                 # The next expert's index window, a tile early. This is the
                 # only arrival the kernel waits for with nothing issued
                 # behind it, so a tile of compute is what it costs to hide.
@@ -2218,6 +2238,90 @@ def _build_fused_ep_moe_kernel(
             def _():
                 prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
 
+        def push_tile(e, t, tile_block_base, live_blocks):
+            """Push tile t's share of each (expert, dest) run out of the slab.
+
+            The pieces of push_expert's copies that fall in this tile: the
+            run's true rows past `into_run`, and the tile's mirror sublane, at
+            the offsets the whole-run copies give them. Summed over a run's
+            tiles they are exactly push_expert's bytes, so the drain counts
+            and every arrival row are unchanged. The own-destination run moves
+            its aligned region on the hop semaphores, as push_expert does.
+            """
+            for d in range(ep):
+                run_start = commit_start_sm[e, d]
+                run_len = commit_len_sm[e, d]
+                lo = jnp.maximum(run_start, tile_block_base)
+                hi = jnp.minimum(run_start + run_len, tile_block_base + live_blocks)
+                overlap = jnp.maximum(hi - lo, 0)
+                # An empty intersection leaves lo unclamped; every copy below
+                # is predicated out rather than issued at zero length.
+                lo = jnp.minimum(lo, hi)
+                into_run = (lo - run_start) * ROWBLK
+                src_row = contrib_off_sm[e, d] * ROWBLK + into_run
+                dst_row = push_dst_sm[e, d] * ROWBLK + into_run
+                true_here = jnp.clip(true_rows_sm[e, d] - into_run, 0, overlap * ROWBLK)
+                is_me = jnp.int32(d) == me
+                src_sub = _mirror_base(e) + t
+                dst_sub = (
+                    jnp.right_shift(push_dst_sm[e, d], tile_block_shift)
+                    + 2 * (me * g_local + e)
+                    + t
+                    - jnp.right_shift(run_start, tile_block_shift)
+                )
+
+                @pl.when(_and_nonempty(jnp.logical_not(is_me), true_here))
+                def _(src_row=src_row, dst_row=dst_row, true_here=true_here, d=d):
+                    pltpu.make_async_remote_copy(
+                        src_ref=contrib_hbm.at[pl.ds(src_row, true_here)],
+                        dst_ref=recv_hbm.at[pl.ds(dst_row, true_here)],
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
+                        device_id=(jnp.int32(d),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(_and_nonempty(jnp.logical_not(is_me), overlap))
+                def _(src_sub=src_sub, dst_sub=dst_sub, d=d):
+                    pltpu.make_async_remote_copy(
+                        src_ref=cscl_hbm.at[pl.ds(src_sub, 1)],
+                        dst_ref=rscl_hbm.at[pl.ds(dst_sub, 1)],
+                        send_sem=send_scl_sem,
+                        recv_sem=recv_scl_sem,
+                        device_id=(jnp.int32(d),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(_and_nonempty(is_me, overlap))
+                def _(src_row=src_row, dst_row=dst_row, overlap=overlap):
+                    pltpu.make_async_copy(
+                        contrib_hbm.at[pl.ds(src_row, overlap * ROWBLK)],
+                        recv_hbm.at[pl.ds(dst_row, overlap * ROWBLK)],
+                        mehop_sem,
+                    ).start()
+
+                @pl.when(_and_nonempty(is_me, overlap))
+                def _(src_sub=src_sub, dst_sub=dst_sub):
+                    pltpu.make_async_copy(
+                        cscl_hbm.at[pl.ds(src_sub, 1)],
+                        rscl_hbm.at[pl.ds(dst_sub, 1)],
+                        mehop_scl_sem,
+                    ).start()
+
+        def push_tail(e, tile_count, pending):
+            """Push the visit's last two tiles, whose commits drain_commits
+            has just waited. `pending` is what each parity held before that
+            drain zeroed it; the parity of the visit's last tile holds tile
+            n - 1 and the other one tile n - 2."""
+            n_tiles = -(-expert_rows_sm[e] // tile_m)
+            last_parity = lax.rem(tile_count - 1, jnp.int32(OUT_PARITIES))
+            for p in range(OUT_PARITIES):
+
+                @pl.when(pending[p] > 0)
+                def _(p=p):
+                    t = jnp.where(p == last_parity, n_tiles - 1, n_tiles - 2)
+                    push_tile(e, t, t * tile_blocks, pending[p])
+
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
             # Remote pushes go per (expert, dest) at true length; run starts
@@ -2288,6 +2392,11 @@ def _build_fused_ep_moe_kernel(
             if push_from_vmem:
                 # Each tile shipped itself; there is nothing left to flush.
                 return carry
+            if eager_slab_push:
+                pending = carry[1:3]
+                carry = drain_commits(carry)
+                push_tail(e, carry[0], pending)
+                return carry
             carry = drain_commits(carry)
             push_expert(e)
             return carry
@@ -2357,6 +2466,11 @@ def _build_fused_ep_moe_kernel(
                 tp_after_visit(visit_i)
 
                 if push_from_vmem:
+                    return carry
+                if eager_slab_push:
+                    pending = carry[1:3]
+                    carry = drain_commits(carry)
+                    push_tail(e, carry[0], pending)
                     return carry
                 carry = drain_commits(carry)
 
@@ -2566,6 +2680,8 @@ def _build_fused_ep_moe_kernel(
             bias_tag += "_bf16wire"
         if ep_tp_size > 1:
             bias_tag += f"_eptp{ep_tp_size}"
+        if eager_slab_push:
+            bias_tag += "_eager"
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"

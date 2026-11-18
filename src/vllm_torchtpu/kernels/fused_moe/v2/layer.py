@@ -273,6 +273,7 @@ def fused_ep_moe_v2(
     token_replica_groups=None,
     wire_dtype=None,
     ep_tp_size=1,
+    eager_push=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -333,6 +334,11 @@ def fused_ep_moe_v2(
     which is what the reference hash router does. Everything downstream of
     selection -- renormalization, the routed scale, the empty-row mask,
     dispatch, the matmuls and the combine -- is the top-k path unchanged.
+
+    eager_push=True pushes each result tile toward its token owners as soon
+    as it is staged rather than after its expert's last tile
+    (`kernel.build_fused_ep_moe_kernel`): the same rows land in the same
+    places, so outputs are bit-identical; False leaves the program unchanged.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -484,6 +490,7 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
         **({} if wire_dtype is None else {"wire_dtype": jnp.dtype(wire_dtype)}),
         **({} if ep_tp_size == 1 else {"ep_tp_size": ep_tp_size}),
+        **({} if not eager_push else {"eager_push": True}),
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -828,6 +835,7 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         None if wire_dtype is None else jnp.dtype(wire_dtype),
         ep_tp_size,
+        bool(eager_push),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
