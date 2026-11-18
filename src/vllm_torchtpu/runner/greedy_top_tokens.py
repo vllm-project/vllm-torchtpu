@@ -422,7 +422,7 @@ def tpu_get_top_tokens(
         raise ValueError(
             f"scale must be > 0.0 for greedy argmax reduction, got {self.scale}"
         )
-    if getattr(lm_head, "_vp_draft", False):
+    if isinstance(lm_head, _VocabParallelDraftHead):
         return _vocab_parallel_draft_top_tokens(
             self, lm_head, hidden_states, embedding_bias
         )
@@ -990,7 +990,6 @@ class _VocabParallelDraftHead(torch.nn.Module):
             torch.tensor(perm, dtype=torch.int64, device=device),
             persistent=False,
         )
-        self._vp_draft = True
         self._quant_mode = None
         self._quant_group_size = None
         self._quant_desc = "bf16"
