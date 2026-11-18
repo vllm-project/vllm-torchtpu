@@ -222,7 +222,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         distribution: jax.Array | None = None,
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
-        mask_invalid_v: bool | None = None,
+        mask_invalid_v: bool = False,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -784,6 +784,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
             decode_query_size=q_len,
             nan_new_seq_idx=bad_sequence,
+            mask_invalid_v=True,
         )
 
     @parameterized.product(
