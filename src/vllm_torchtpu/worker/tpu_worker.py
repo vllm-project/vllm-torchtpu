@@ -96,6 +96,20 @@ def _release_free_host_heap() -> None:
         logger.info("Released free host heap via glibc malloc_trim.")
 
 
+def _device_remap(local_rank_offset: int) -> str | None:
+    """The setting that runs this engine's ranks on other TPU devices than
+    their host-local rank names, or None. TPU_LOCAL_RANK_OFFSET and
+    DEBUG_TPU_LOCAL_RANK_OFFSET shift every rank; VLLM_TPU_DEVICE_ORDER maps
+    each rank to a listed device at worker spawn."""
+    if local_rank_offset:
+        return f"TPU_LOCAL_RANK_OFFSET={local_rank_offset}"
+    if envs.DEBUG_TPU_LOCAL_RANK_OFFSET:
+        return f"DEBUG_TPU_LOCAL_RANK_OFFSET={envs.DEBUG_TPU_LOCAL_RANK_OFFSET}"
+    if envs.VLLM_TPU_DEVICE_ORDER:
+        return f"VLLM_TPU_DEVICE_ORDER={envs.VLLM_TPU_DEVICE_ORDER}"
+    return None
+
+
 class TPUWorker(WorkerBase):
     # Runner class to build in init_device(); Omni workers override it with a
     # runner that adds the stage-specific hooks.
@@ -208,16 +222,14 @@ class TPUWorker(WorkerBase):
         ``tpu_worker.numa_bind`` is on. The host's workers are this engine's
         local ranks times its host-local DP engines.
 
-        With a TPU_LOCAL_RANK_OFFSET the engine's ranks start past chip 0 and
-        the host holds workers this count does not see, so the rank-to-chip
-        mapping would pick the wrong node: placement is left unchanged."""
+        The bind assumes rank r runs on the host's r-th TPU device. A setting
+        that moves ranks to other devices (``_device_remap``) would make it
+        pick the wrong node, so then placement is left unchanged."""
         if not worker_options.get(self.vllm_config).numa_bind:
             return
-        if local_rank_offset:
-            logger.info(
-                "NUMA bind: TPU_LOCAL_RANK_OFFSET=%d; placement unchanged",
-                local_rank_offset,
-            )
+        remap = _device_remap(local_rank_offset)
+        if remap is not None:
+            logger.info("NUMA bind: %s moves the ranks; placement unchanged", remap)
             return
         pc = self.parallel_config
         dp_size_local = (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1

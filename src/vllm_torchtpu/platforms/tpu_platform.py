@@ -860,7 +860,7 @@ class TpuPlatform(Platform):
         # known, rather than in every worker or at a patch's install. The
         # tpu_frontend patches install from patch_registry below.
         frontend_options.get(vllm_config)
-        worker_options.get(vllm_config)
+        worker_options.check(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
