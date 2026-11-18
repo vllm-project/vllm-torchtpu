@@ -4572,7 +4572,10 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors()
                 self._execute_mm_encoder(scheduler_output)
                 if has_encoder_inputs:
-                    synchronize_tensors()
+                    # Enqueue the encoder as programs of its own, then prepare
+                    # the LM inputs while it runs. Waiting here left the device
+                    # idle for that preparation (5-6 ms per Cosmos3 request).
+                    synchronize_tensors(wait=False)
 
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
