@@ -303,8 +303,8 @@ def below_or_on_diag(r, r_blk_size, c, c_blk_size):
 
 
 def _flash_attention_kernel(*refs, kv_windows: bool, **kwargs):
-    # With segment ids, the scalar-prefetched kv window of every q block comes
-    # first.
+    # With segment ids, the scalar-prefetched kv windows of every q block's
+    # row groups come first.
     kv_windows_ref = None
     if kv_windows:
         kv_windows_ref, *refs = refs
@@ -393,9 +393,9 @@ def _flash_attention_kernel_single_batch(
             # TODO(tanburn) Should the attention bias be added before or after
             # multiplication by sm_scale?
             if ab_tile_ref is not None:
-                ab = ab_tile_ref[
-                    (*batch_idx, rs, pl.dslice(start_k, block_k))
-                ].astype(jnp.float32)
+                ab = ab_tile_ref[(*batch_idx, rs, pl.dslice(start_k, block_k))].astype(
+                    jnp.float32
+                )
                 s += ab
 
             if sm_scale != 1.0:
@@ -487,9 +487,7 @@ def _flash_attention_kernel_single_batch(
             # the rest with tail_k ones, placed inside the kv block: columns
             # they add past the window are masked like any other mismatch.
             lo = jnp.maximum(_window(g, 0), kv_start)
-            hi = jnp.minimum(
-                _window(g, 1), kv_start + block_k_major
-            )
+            hi = jnp.minimum(_window(g, 1), kv_start + block_k_major)
             width = jnp.maximum(hi - lo, 0)
             if tail_k == block_k:
                 num_main, num_tail = pl.cdiv(width, block_k), 0
@@ -822,7 +820,7 @@ def _flash_attention_impl(
 
     kv_windows = ()
     if segment_ids is not None:
-        # Each q block's kv window, for the kernel to skip the pairs that
+        # Each row group's kv window, for the kernel to skip the pairs that
         # cannot match (packed vision inputs: most).
         kv_windows = (_kv_windows(segment_ids, block_q),)
         num_prefetch = len(kv_windows)
@@ -888,23 +886,19 @@ def _block_ranges(segment_ids: jax.Array, block: int) -> jax.Array:
 
 
 def _kv_windows(segment_ids: SegmentIds, block_q: int) -> jax.Array:
-    """[batch, q blocks * row groups * 2] int32 (flat for SMEM): for each row
-    group of each q block, the kv columns [lo, hi) from the first to the last 128-column block
-    whose segment range meets the group's (empty: lo >= hi). Columns outside
-    cannot match any of the group's ids; with sorted ids (packed inputs) the
-    window holds only the group's segments."""
+    """[batch, q blocks * row groups * 2] int32, flat for SMEM: for each row
+    group of each q block, the kv columns [lo, hi) from the first to the last
+    128-column block whose segment range meets the group's (empty: lo >= hi).
+    Columns outside cannot match any of the group's ids; with sorted ids
+    (packed inputs) the window holds only the group's segments."""
     batch_size, seq_len = segment_ids.q.shape
     ids = jnp.pad(segment_ids.q, ((0, 0), (0, -seq_len % block_q)), mode="edge")
     ids = ids.reshape(batch_size, -1, block_q).astype(jnp.int32)
-    q = jnp.stack(
-        [
-            jnp.stack([ids[..., g : g + _ROW_GROUP].min(-1), ids[..., g : g + _ROW_GROUP].max(-1)], -1)
-            for g in range(0, block_q, _ROW_GROUP)
-        ],
-        axis=2,
-    )[:, :, :, None]  # [batch, q blocks, row groups, 1, 2]
+    groups = [ids[..., r : r + _ROW_GROUP] for r in range(0, block_q, _ROW_GROUP)]
+    q_lo = jnp.stack([g.min(axis=-1) for g in groups], axis=-1)[..., None]
+    q_hi = jnp.stack([g.max(axis=-1) for g in groups], axis=-1)[..., None]
     kv = _block_ranges(segment_ids.kv, NUM_LANES)[:, None, None]
-    meets = (q[..., 0] <= kv[..., 1]) & (kv[..., 0] <= q[..., 1])
+    meets = (q_lo <= kv[..., 1]) & (kv[..., 0] <= q_hi)  # [b, q, groups, kv]
     col = jnp.arange(kv.shape[3], dtype=jnp.int32) * NUM_LANES
     lo = jnp.min(jnp.where(meets, col, segment_ids.kv.shape[1]), axis=-1)
     hi = jnp.max(jnp.where(meets, col + NUM_LANES, 0), axis=-1)

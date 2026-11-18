@@ -13,7 +13,8 @@
 # limitations under the License.
 """The vision flash kernel on packed rows matches the reference attention (TPU).
 
-Packed rows skip the kv blocks whose segment ids cannot match a q block's.
+Packed rows walk only the kv columns whose segment ids can match a q block's
+row groups.
 """
 
 import jax
@@ -51,6 +52,10 @@ def _segment_ids(lengths: list[int], total: int) -> jax.Array:
         ([300, 1500], 2048, 72, BlockSizes(128, 128, 128, 1)),  # unaligned
         ([128, 256, 128], 1024, 72, BlockSizes(128, 512, 128, 1)),  # aligned
         ([700, 3000], 4096, 72, BlockSizes(256, 1024, 256, 1)),  # padding blocks
+        # Two row groups, the second straddling a boundary; 512-column tails.
+        ([1500, 2000], 4096, 72, BlockSizes(2048, 4096, 1024, 1)),
+        # Uneven row groups, a partial last q block, windows over two kv blocks.
+        ([3000, 900], 4096, 72, BlockSizes(1536, 2048, 1024, 1)),
     ],
 )
 def test_packed_rows_match_reference(lengths, total, head_dim, block_sizes):
