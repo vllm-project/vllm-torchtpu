@@ -3514,7 +3514,7 @@ class Eagle3Proposer:
             set_model_tag("eagle_head"),
             runner._precompile_timed("drafter compute_logits"),
         ):
-            for n in all_sizes:
+            for n in sorted(all_sizes):
                 dummy_hidden = torch.zeros(
                     (n, hidden_size),
                     dtype=runner._hidden_states_dtype,
