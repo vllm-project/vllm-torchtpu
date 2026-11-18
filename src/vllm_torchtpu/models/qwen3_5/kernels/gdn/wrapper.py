@@ -933,9 +933,10 @@ def fused_conv1d_gdn(
     if not prefill_only:
         out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
     if not batched_only:
-        if out_act is not None:
-            # Skip the PER_SEQ call when the batch has no prefill or mixed
-            # sequence (decode-only steps).
+        if out_act is not None and is_shared:
+            # Over the unified block pool, skip the PER_SEQ call when the batch
+            # has no prefill or mixed sequence (decode-only steps). The dense
+            # path calls it on every step, as main does.
             out_act, out_states = jax.lax.cond(
                 distribution[0] < distribution[2],
                 lambda act_states: call_kernel(
