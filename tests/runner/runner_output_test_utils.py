@@ -75,6 +75,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
             for r in req_ids
         },
         num_prompt_logprobs={},
+        _ZERO_PLACEHOLDERS=TPUModelRunner._ZERO_PLACEHOLDERS,
         _cached_output_req_ids_key=None,
         _cached_req_id_to_index_snap={},
         _pre_async_results=None,
