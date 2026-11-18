@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import functools
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, NamedTuple, cast
 
 import torch
@@ -624,6 +624,8 @@ class Glm5NextMLAAttention(nn.Module):
     module docstring for the sparse attention indexer.
     """
 
+    _latent_sink: Callable[[torch.Tensor], None] | None = None
+
     def __init__(
         self,
         config: Any,
@@ -725,6 +727,7 @@ class Glm5NextMLAAttention(nn.Module):
                     self.v_head_dim if self.v_head_dim != self.qk_head_dim else None
                 ),
             )
+        self._latent_sink: Callable[[torch.Tensor], None] | None = None
 
     def _project_output(
         self, attn_out: torch.Tensor, *, sequence_parallel: bool
@@ -769,6 +772,8 @@ class Glm5NextMLAAttention(nn.Module):
             q_lora, kv_latent = torch.split(
                 qkv_latent, [self.q_lora_rank, self.kv_lora_rank], dim=-1
             )
+        if self._latent_sink is not None:
+            self._latent_sink(kv_latent)
         q, _ = self.q_b_proj(q_lora)  # [T, H_local * qk_head_dim]
 
         if self.mla_attn is not None:
