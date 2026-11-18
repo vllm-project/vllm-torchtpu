@@ -187,8 +187,6 @@ def _expert_rows(rows, tile_expert, w1, w2, s1, s2, config):
             w2_ref[...],
             s1_ref[...],
             activation="silu",
-            w1_bias=None,
-            no_gate=False,
             block=0,
             elementwise=config.elementwise,
             columns_per_pass=config.activation_columns_per_pass,
@@ -198,7 +196,6 @@ def _expert_rows(rows, tile_expert, w1, w2, s1, s2, config):
             acc2,
             mid_scales,
             w2_scales=s2_ref[...],
-            w2_bias=None,
             dtype=result_dtype,
             elementwise=config.elementwise,
         )
@@ -650,8 +647,6 @@ def test_the_layer_cache_keys_on_the_lowering_arguments(one_cpu_shard):
 # arguments over the plain form, Config fields).
 UNTESTED_FORMS = {
     "bf16 weights": (dict(form="bf16"), {}),
-    "no_gate": (dict(no_gate=True), {}),
-    "biases": (dict(has_bias=True), {}),
     "activation_block": ({}, dict(activation_block=128)),
     "token_block": ({}, dict(token_block=128)),
 }
@@ -661,7 +656,7 @@ def _check_tested_args(name):
     from vllm_torchtpu.kernels.fused_moe.v3 import Config, weight_form
 
     overrides, fields = UNTESTED_FORMS[name]
-    args = {"form": "fp8", "no_gate": False, "has_bias": False, **overrides}
+    args = {"form": "fp8", **overrides}
     args["form"] = weight_form(args["form"])
     return dict(args, config=Config(**fields))
 
@@ -669,14 +664,12 @@ def _check_tested_args(name):
 @pytest.mark.cpu_test
 def test_the_tested_forms_are_admitted():
     """The serving bridge's form and the TPU test's: fp8 weights, silu over
-    the gate, no biases, one scale per row, either result rows."""
+    the gate, one scale per row, either result rows."""
     from vllm_torchtpu.kernels.fused_moe.v3 import Config, weight_form
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
 
     for config in (Config(), Config(result_rows="bf16"), Config(sorted_rows=False)):
-        v3_layer.check_tested(
-            weight_form("fp8"), no_gate=False, has_bias=False, config=config
-        )
+        v3_layer.check_tested(weight_form("fp8"), config=config)
 
 
 @pytest.mark.cpu_test
