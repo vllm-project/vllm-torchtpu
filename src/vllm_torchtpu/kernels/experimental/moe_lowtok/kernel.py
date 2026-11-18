@@ -40,6 +40,11 @@ MOE_LOWTOK_MAX_TOKENS = 448
 HOT_SLOTS = 128
 _MAX_LOCAL_EXPERTS = 128
 _TABLE_LANES = 512
+# The copy-aware entry's prefix scan over the hot table covers a power of two
+# at or above the layer's copy count; any such width counts every active copy.
+# It covers at least this many lanes, the width the 4-copies-per-rank layout
+# over 8 ranks (32 copies) needs.
+_MIN_HOT_SCAN = 32
 
 _ROW_TILE = 8  # sublane row alignment (avoids padding T=8,16 to 32)
 _NEG = -3.0e38  # router scores at or below this never win a pass
@@ -431,7 +436,7 @@ def _kernel_copies(
 
     nc = hot1h_ref.shape[1]
     max_copies = (n_experts - owned) * ranks if n_experts > owned else nc
-    n_hot_bound = min(nc, max(32, 1 << (max_copies - 1).bit_length()))
+    n_hot_bound = min(nc, max(_MIN_HOT_SCAN, 1 << (max_copies - 1).bit_length()))
     hit8 = jnp.broadcast_to(jnp.where(hit, 1.0, 0.0).astype(jnp.bfloat16), (8, lanes))
     hh = jnp.dot(hit8, hot1h_ref[...], preferred_element_type=jnp.float32)[:1]
     lane_c = jax.lax.broadcasted_iota(jnp.int32, (1, nc), 1)
@@ -669,7 +674,9 @@ def moe_lowtok(
     experts, the top-k runs in the kernel, and this shard holds experts
     [experts_start, experts_start + E). With `has_copies=True`, `tables`,
     `prim`, `copy`, and `hot1h` provide the placement's holder tables and the
-    kernel assigns each hit copied expert to the less-loaded holder.
+    kernel assigns each hit copied expert to the less-loaded holder; the rank
+    then comes from the packed tables (`pack_tables`' `experts_start`) and the
+    `experts_start` argument is not read. At most MOE_LOWTOK_MAX_TOKENS rows.
     """
     tokens, hidden = x.shape
     if tokens > MOE_LOWTOK_MAX_TOKENS:

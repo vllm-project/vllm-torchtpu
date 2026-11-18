@@ -260,6 +260,12 @@ def dense_expert_moe(
     IDs outside this rank must be -1. Scales use [E,1,1,N]. Callers must
     first check can_use_dense_expert. Shared experts and collectives stay
     outside this kernel, exactly as for fused_moe_func's standard path.
+    Rows that are a multiple of 8 but not of 16 are padded to 16 inside (the
+    padding routes nowhere) and sliced off the output.
+    `num_primary_experts` serves only the first that many local slots: a
+    layer whose weights hold copy slots after its primaries (expert
+    placement) passes its primary count, and ids in the copy slots add
+    nothing. None serves every slot.
     """
     m_orig, h = hidden.shape
     pad_m = (-m_orig) % 16
