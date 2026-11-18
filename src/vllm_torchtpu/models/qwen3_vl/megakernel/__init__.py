@@ -13,8 +13,9 @@
 # limitations under the License.
 """Qwen3-VL text decoder megakernel (the `qwen3_vl` shorthand).
 
-The megakernel serves the decoder's single-request decode steps; prefill,
-vision and every step with prompt tokens left stay on the stock model. Serve
+The megakernel serves the decoder's single-request decode steps and, under
+speculative decoding, their verify steps of `1 + K` tokens; prefill, vision
+and every step with prompt tokens left stay on the stock model. Serve
 it with `VLLM_TPU_MEGAKERNEL=1` (by the checkpoint's arch) or `qwen3_vl`, and
 the stock paths this kernel's KV pages match: `VLLM_KV_CACHE_LAYOUT=HND`,
 `--attention-backend CUSTOM`, at any page size of 128-token multiples.
@@ -31,7 +32,7 @@ SPEC = TpuMonoSpec(
     create=".adapter:create",
     chips=("TPU7x",),
     tp_sizes=(8,),
-    features=frozenset({"mrope", "multimodal", "prefix_caching"}),
+    features=frozenset({"mrope", "multimodal", "prefix_caching", "spec_decode"}),
     requires={"kv_cache_dtype": "auto"},
     # Cosmos3 is a Qwen3-VL whose decoder is the Qwen3-VL text model.
     architectures=("Cosmos3ForConditionalGeneration",),

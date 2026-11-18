@@ -21,7 +21,8 @@ vLLM picks at 256 sequences of 262144 tokens), warms up and serves a decode
 step through the CPU-interpret kernel, and leaves a step with prompt tokens to
 the stock model. A greedy step takes the whole-step kernel instead (token ids
 in, greedy token ids out), with the same KV write and the token the hidden
-step's output gives under vLLM's LM head.
+step's output gives under vLLM's LM head; so does a speculative verify step,
+for each of its rows.
 """
 
 from __future__ import annotations
@@ -106,7 +107,15 @@ def tiny_runner(
 ) -> Any:
     """A fake TP=1 multimodal runner over a tiny backbone of `request.param`-token
     KV pages, with this folder as the megakernel plugin (one `(1, 1)` bucket)."""
-    page_size = request.param
+    return _tiny_runner(request.param, mk_fake_runner, monkeypatch)
+
+
+def _tiny_runner(
+    page_size: int,
+    mk_fake_runner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    speculative_tokens: int = 0,
+) -> Any:
     g = tiny_geom(R=1)
     ex = ExecSpec(
         R=1,
@@ -131,7 +140,7 @@ def tiny_runner(
     )
     torch.manual_seed(0)
     qsl = np.zeros(16, dtype=np.int32)
-    qsl[:2] = [0, 1]
+    qsl[:2] = [0, 1 + speculative_tokens]
     return mk_fake_runner(
         model=SimpleNamespace(
             model=_backbone(g, page_size),
@@ -148,6 +157,7 @@ def tiny_runner(
         },
         mesh=Mesh(np.array(jax.devices("cpu")[:1]), ("tp",)),
         block_size=page_size,
+        speculative_tokens=speculative_tokens,
         supports_mm_inputs=True,
         uses_mrope=True,
         token_paddings=(1, 2, 4),
@@ -215,6 +225,44 @@ def test_serves_greedy_steps_with_the_token_step(tiny_runner: Any) -> None:
     head = tiny_runner.model.lm_head.weight.float()
     logits = (hid[:1].float() @ head.T).to(torch.bfloat16).float()
     assert int(tok[0]) == int(torch.argmax(logits[0]))
+
+
+def test_serves_verify_steps_with_the_token_step(
+    mk_fake_runner: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _tiny_runner(512, mk_fake_runner, monkeypatch, speculative_tokens=3)
+    ids = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
+    pos = (129 - 40 + torch.arange(4, dtype=torch.int32)).expand(3, 4)
+
+    def metadata(prog: Any) -> dict[str, Any]:
+        bt = torch.tensor([3, 4, 0, 0], dtype=torch.int32)
+        seq = torch.tensor([133, 0], dtype=torch.int32)
+        return {prog.attn_layer_name: SimpleNamespace(block_tables=bt, seq_lens=seq)}
+
+    res = run_cpu_e2e(None, runner, [(ids, pos)], metadata=metadata, greedy=True)
+    assert sorted(res.driver._token_steps) == [(1, 1), (4, 4)]
+    assert res.step_mix == {"mk_t4_b4": 1}
+    tok = res.outputs[0]
+    assert tok.dtype == torch.int32 and tok.shape == (4,)
+    layers = runner.model.model.layers
+    pages = [layer.self_attn.attn.kv_cache[0].clone() for layer in layers]
+    # The 4 tokens' K/V went to KV indices 129..132 of page 3.
+    for page in pages:
+        assert all(page[3][..., i].abs().sum() > 0 for i in range(129, 133))
+
+    # The hidden step on the same verify step: the same KV, and each row's
+    # hidden state gives that row's token under the LM head.
+    md = metadata(res.program)
+    with mock.patch.object(
+        stepping, "get_forward_context", lambda: SimpleNamespace(attn_metadata=md)
+    ):
+        hit, hid = res.driver.try_forward(runner, StepContext(ids, pos))
+    assert hit
+    for layer, page in zip(layers, pages, strict=True):
+        assert torch.equal(layer.self_attn.attn.kv_cache[0], page)
+    head = runner.model.lm_head.weight.float()
+    logits = (hid[:4].float() @ head.T).to(torch.bfloat16).float()
+    assert tok.tolist() == torch.argmax(logits, dim=-1).tolist()
 
 
 def test_serves_decode_and_leaves_prompt_steps_to_stock(tiny_runner: Any) -> None:

@@ -77,6 +77,7 @@ def _inspect_step_detail(
                 has_slot_read_offsets=has_roff,
                 decode_and_total_reqs=comb_wt,
                 query_start_loc=qsl_host,
+                past_prompt=_prompt_left(runner) is False,
             )
 
     # Fallback for unit tests passing CPU metadata without a full runner instance.
@@ -301,9 +302,10 @@ class StepRouting:
         the same `input_ids` / `positions` as for `try_forward`. On `None`
         (not routed to the program, no token step, the A/B calibrator on, a
         suppressed run) the runner takes its usual path, which may still route
-        the step through `try_forward`. The tokens are `[num_reqs]` int32,
-        the same on every TP rank, `argmax` of the bf16 logits with ties to
-        the lowest id; the step wrote its KV like the hidden step.
+        the step through `try_forward`. The tokens are int32, one per row
+        (`[num_reqs * T]`: a verify step's `T` per request), the same on
+        every TP rank, `argmax` of the bf16 logits with ties to the lowest id;
+        the step wrote its KV like the hidden step.
         """
         if (
             not self._token_steps

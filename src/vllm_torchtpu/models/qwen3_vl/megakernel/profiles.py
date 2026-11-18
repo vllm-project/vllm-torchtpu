@@ -17,7 +17,9 @@ One single-request decode bucket (`B=1`, `T=1`). Every layer streams ~122 MB
 of weights per rank, so the tiles keep HBM streaming: equal ~8 MiB dense
 tiles (slot count = byte count), no unrolled matmul (`dmm_unroll=8` lets one
 matmul pin every ring slot) and no lazy refill. The KV write is in-kernel
-(`fused_pool_io`).
+(`fused_pool_io`). Under speculative decoding the adapter adds the verify
+bucket of `T = 1 + K` rows; it streams the same weights, so it costs about
+one decode step (2613 vs 2465 us at T = 8).
 """
 
 from __future__ import annotations

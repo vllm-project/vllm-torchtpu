@@ -81,11 +81,14 @@ def inspect_batch_shape(
     fallback_decode_and_total_reqs: tuple[int, int] | None = None,
     fallback_num_seqs: int | None = None,
     fallback_query_start_loc: Any | None = None,
+    past_prompt: bool = False,
 ) -> BatchShape:
     """Determine `(eligible, num_reqs, tokens_per_req, reason)` from host metadata.
 
     `has_slot_read_offsets`: the runner has per-request recurrent-state slot
-    read offsets (MTP verify); without them a multi-token step is a prefill.
+    read offsets (MTP verify); `past_prompt`: every request of the step is
+    past its prompt. With neither, a multi-token step is a prefill; with
+    either, a uniform one is a verify step.
     `query_start_loc` / `fallback_query_start_loc`: host copies of the
     requests' token offsets, from the runner and from the attention metadata.
     """
@@ -101,7 +104,8 @@ def inspect_batch_shape(
 
     if query_start_loc is not None and num_reqs is not None:
         bs = check_query_start_loc_uniform(query_start_loc, num_reqs)
-        if bs.eligible and not has_slot_read_offsets and bs.tokens_per_req != 1:
+        verify = has_slot_read_offsets or past_prompt
+        if bs.eligible and not verify and bs.tokens_per_req != 1:
             return BatchShape(False, bs.num_reqs, 0, "stock_prefill")
         return bs
 

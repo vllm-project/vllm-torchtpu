@@ -101,13 +101,20 @@ def test_inspect_batch_shape_runner_and_fallback_paths() -> None:
     assert bs_no_qsl == BatchShape(False, 0, 0, "stock_no_qsl")
 
     # The runner's query_start_loc without slot read offsets rejects T=4
-    # (stock_prefill); the fallback query_start_loc allows T=4
+    # (stock_prefill) unless every request is past its prompt (a verify
+    # step); the fallback query_start_loc allows T=4
     bs_no_roff_q4 = inspect_batch_shape(
         num_reqs=2,
         has_slot_read_offsets=False,
         query_start_loc=np.array([0, 4, 8], dtype=np.int32),
     )
     assert bs_no_roff_q4 == BatchShape(False, 2, 0, "stock_prefill")
+    bs_verify_q4 = inspect_batch_shape(
+        num_reqs=2,
+        query_start_loc=np.array([0, 4, 8], dtype=np.int32),
+        past_prompt=True,
+    )
+    assert bs_verify_q4 == BatchShape(True, 2, 4, "ok")
     bs_fb_q4 = inspect_batch_shape(
         num_reqs=None,
         has_slot_read_offsets=False,

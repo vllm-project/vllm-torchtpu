@@ -15,15 +15,16 @@
 
 `create` checks the checkpoint without loading anything; `load` packs the
 bf16 weights of the loaded vLLM model; `bind` aliases its 64 per-layer bf16
-KV caches at their page size; `build` returns one bridge step per decode
-bucket, which embeds the ids, gathers each row's M-RoPE cos / sin from
-vLLM's rotary cache and runs the backbone through the final norm (the runner
-computes the logits); `build_tokens` returns the bucket's whole-step kernel
+KV caches at their page size; `build` returns one bridge step per bucket,
+which embeds the ids, gathers each row's M-RoPE cos / sin from vLLM's rotary
+cache and runs the backbone through the final norm (the runner computes the
+logits); `build_tokens` returns the bucket's whole-step kernel
 (`core.token_io`: the runner's ids, positions, block table and sequence
 lengths in, greedy token ids out) when vLLM's LM head is a plain
 vocabulary-parallel projection;
-`decide` / `forward` / `forward_tokens` route decode (`T=1`) steps whose
-requests are all past their prompt.
+`decide` / `forward` / `forward_tokens` route decode (`T=1`) steps, and with
+`K` speculative tokens the verify steps of `T = 1 + K` tokens per request,
+whose requests are all past their prompt.
 """
 
 from __future__ import annotations
@@ -122,16 +123,23 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen3VLProgram | Dec
     el = mk_rt.check_post_mesh_eligibility(tp_size=view.tp_size, bucket_policy=policy)
     if not el.eligible:
         return Decline(el.code, el.message, el.level)
+    k = view.speculative_tokens
     return Qwen3VLProgram(
-        view.model, tp_rank=view.tp_rank, profile=profile, buckets=policy.buckets
+        view.model,
+        tp_rank=view.tp_rank,
+        profile=profile,
+        buckets=policy.buckets,
+        verify_tokens=1 + k if k else 0,
     )
 
 
 class Qwen3VLProgram:
     """The Qwen3-VL text decoder megakernel on one TP rank (a `MonoProgram`).
 
-    `geom` / `base_exec` replace the checkpoint geometry and the derived
-    `ExecSpec` (tiny CPU tests).
+    `verify_tokens` (0: none) is the tokens per request of a verify step; each
+    decode bucket of `B` requests gets a verify bucket of `B * verify_tokens`
+    rows (up to 64). `geom` / `base_exec` replace the checkpoint geometry and
+    the derived `ExecSpec` (tiny CPU tests).
     """
 
     def __init__(
@@ -141,6 +149,7 @@ class Qwen3VLProgram:
         tp_rank: int,
         profile: Profile,
         buckets: Sequence[int],
+        verify_tokens: int = 0,
         geom: Any = None,
         base_exec: ExecSpec | None = None,
     ) -> None:
@@ -150,10 +159,16 @@ class Qwen3VLProgram:
         self.tp_rank = tp_rank
         self.profile = profile
         self.decode_buckets = tuple(buckets)
+        self.verify_tokens = verify_tokens
+        self.verify_buckets = tuple(
+            b * verify_tokens
+            for b in self.decode_buckets
+            if verify_tokens and b * verify_tokens <= 64
+        )
         self.geom = Qwen3VLText.derive_geometry() if geom is None else geom
         self._base_exec_arg = base_exec
         self.display_name = Qwen3VLText.display_name
-        self.bucket_policy = mk_rt.BucketPolicy(self.decode_buckets, ())
+        self.bucket_policy = self._policy(())
         self.view: RunnerView | None = None
         self.raw_pools: list[torch.Tensor] = []
         self._ir_checked: set[tuple[int, int]] = set()
@@ -171,7 +186,7 @@ class Qwen3VLProgram:
         self.mesh = mesh
         r_cnt = mesh.devices.size
         self.spec = self.model_def.to_model_spec(self.geom, R=r_cnt)
-        b_max = max(self.decode_buckets)
+        b_max = max(self.decode_buckets + self.verify_buckets)
         # The packed weight tiles are the buckets' (one tile rule for all).
         tiles = self.profile.tiles_for(b_max, R=r_cnt, g=self.geom)
         self.base_exec = self._base_exec_arg or ExecSpec(
@@ -278,21 +293,28 @@ class Qwen3VLProgram:
 
     # --- buckets and build ----------------------------------------------------
 
-    def buckets(self, token_paddings: Sequence[int]) -> list[Bucket]:
-        """One decode `(1, B)` bucket per configured batch size."""
-        self.bucket_policy = mk_rt.BucketPolicy(
-            self.decode_buckets, (), tuple(token_paddings)
+    def _policy(self, token_paddings: Sequence[int]) -> mk_rt.BucketPolicy:
+        verify = {"verify_tokens": self.verify_tokens} if self.verify_buckets else {}
+        return mk_rt.BucketPolicy(
+            self.decode_buckets, self.verify_buckets, tuple(token_paddings), **verify
         )
+
+    def buckets(self, token_paddings: Sequence[int]) -> list[Bucket]:
+        """One decode `(1, B)` bucket per configured batch size, then its
+        verify `(T, B * T)` bucket."""
+        self.bucket_policy = self._policy(token_paddings)
         self._ir_checked.clear()
         return [
-            Bucket(1, b, self.bucket_policy.out_rows(b)) for b in self.decode_buckets
+            Bucket(t, b, self.bucket_policy.out_rows(b))
+            for t, b in self.bucket_policy.iter_buckets()
         ]
 
     def build(self, bucket: Bucket) -> Any:
         """Check pool donation in the step's HLO; return the bridge step."""
-        b = bucket.B
+        b, T = bucket.B, bucket.T
+        ns = b // T
         ex, _, _ = mk_rt.bucket_exec_spec(
-            self.spec, self.base_exec, self.profile, bucket_t=b, tokens_per_seq=1
+            self.spec, self.base_exec, self.profile, bucket_t=b, tokens_per_seq=T
         )
         ok, why = mk_rt.verify_pooled_step_hlo(
             self.mesh,
@@ -311,7 +333,7 @@ class Qwen3VLProgram:
             self.mesh,
             self.spec,
             ex,
-            op_name=f"megakernel::{self.spec.name}_t1_b{b}",
+            op_name=f"megakernel::{self.spec.name}_t{T}_b{b}",
             donate_pools=True,
         )
         embed, rope = self.backbone.embed_tokens, self.rope_cache
@@ -327,10 +349,13 @@ class Qwen3VLProgram:
             weights: list[torch.Tensor],
             pools: list[torch.Tensor],
         ) -> torch.Tensor:
-            # The KV index of the new token; RoPE takes its M-RoPE position.
-            pos_b = (seq_lens[:b] - 1).clamp(min=0).to(torch.int32)
+            # The KV indices of each sequence's T new tokens; RoPE takes their
+            # M-RoPE positions.
+            t = torch.arange(T, dtype=seq_lens.dtype, device=seq_lens.device)
+            pos_b = (seq_lens[:ns, None] - T + t).reshape(-1)
+            pos_b = pos_b.clamp(min=0).to(torch.int32)
             rope_pos = (positions[0] if positions.ndim == 2 else positions)[:b]
-            pt = block_tables.reshape(seq_lens.shape[0], -1)[:b, :max_pages]
+            pt = block_tables.reshape(seq_lens.shape[0], -1)[:ns, :max_pages]
             pt = F.pad(pt, (0, max_pages - pt.shape[1]))
             # vLLM rotates with the cache in the activation dtype (bf16).
             cs = rope[rope_pos].to(torch.bfloat16).float()
@@ -345,14 +370,14 @@ class Qwen3VLProgram:
         return _step_impl
 
     def build_tokens(self, bucket: Bucket) -> Any:
-        """The bucket's whole decode step: `(input_ids, positions, block_tables,
-        seq_lens, weights, pools) -> [B]` int32 greedy tokens, writing the KV
-        like `build`'s step (`None` without a foldable LM head)."""
+        """The bucket's whole step: `(input_ids, positions, block_tables,
+        seq_lens, weights, pools) -> [B]` int32 greedy tokens, one per row,
+        writing the KV like `build`'s step (`None` without a foldable LM head)."""
         if self.tokens_io is None or self.greedy is None:
             return None
-        b = bucket.B
+        b, T = bucket.B, bucket.T
         ex, use_fused, _ = mk_rt.bucket_exec_spec(
-            self.spec, self.base_exec, self.profile, bucket_t=b, tokens_per_seq=1
+            self.spec, self.base_exec, self.profile, bucket_t=b, tokens_per_seq=T
         )
         if not use_fused:
             return None
@@ -361,7 +386,7 @@ class Qwen3VLProgram:
             self.mesh,
             self.spec,
             ex,
-            op_name=f"megakernel::{self.spec.name}_tokens_t1_b{b}",
+            op_name=f"megakernel::{self.spec.name}_tokens_t{T}_b{b}",
             donate_pools=True,
         )
         rope, folded = self.rope_cache, [self.greedy.embed, self.head_tiles]
@@ -442,7 +467,7 @@ class Qwen3VLProgram:
                     p[1].copy_(s)
 
     def warmup_inputs(self, bucket: Bucket, shape: RunnerShape) -> WarmupCase:
-        """One decode step at KV slot 0 of page 1 (free during warmup). The
+        """One step at KV slots `[0, T)` of page 1 (free during warmup). The
         output must be finite, and the first call must change that page in
         every layer's KV cache (the pools alias the runner's)."""
         dev = self.raw_pools[0].device
@@ -454,7 +479,7 @@ class Qwen3VLProgram:
         bt = torch.zeros((shape.req_pad, shape.blk_pad), **i32)
         bt[0, 0] = 1
         seq_lens = torch.zeros((shape.req_pad,), **i32)
-        seq_lens[: bucket.B] = 1
+        seq_lens[: bucket.B // bucket.T] = bucket.T
         check_writes, self._writes_checked = not self._writes_checked, True
         before = [
             p[1].view(torch.uint16).cpu().clone() if check_writes else None
@@ -480,8 +505,9 @@ class Qwen3VLProgram:
     # --- per step -------------------------------------------------------------
 
     def decide(self, ctx: Any, fwd: ForwardView) -> StepDecision | None:
-        """A decode step of `B` requests, all past their prompt, on bucket `B`
-        (`None`: no attention metadata, stock without counting)."""
+        """A decode step of `B` requests, or a verify step of `T` tokens for
+        each, all past their prompt, on bucket `B * T` (`None`: no attention
+        metadata, stock without counting)."""
         md = fwd.attn_metadata
         attn_md = md.get(self.attn_layer_name) if md else None
         if attn_md is None:
@@ -495,16 +521,17 @@ class Qwen3VLProgram:
         # A 1-token final prefill chunk looks like decode, but its M-RoPE
         # rows may differ (vision tokens); the stock model serves it.
         if fwd.prompt_left is not False:
-            return StepDecision(False, "stock_prompt", d.num_reqs, 1)
+            return StepDecision(False, "stock_prompt", d.num_reqs, d.tokens_per_seq)
         # Padded rows would scatter K/V at stale positions.
-        if d.bucket_t != d.num_reqs:
-            return StepDecision(False, f"stock_t1_pad{d.num_reqs}", d.num_reqs, 1)
+        T = d.tokens_per_seq
+        if d.bucket_t != d.num_reqs * T:
+            return StepDecision(False, f"stock_t{T}_pad{d.num_reqs}", d.num_reqs, T)
         return d
 
     def _run(self, decision: StepDecision | None, ctx: Any, fwd: ForwardView) -> Any:
         assert decision is not None and fwd.attn_metadata is not None
         attn_md = fwd.attn_metadata[self.attn_layer_name]
-        return fwd.steps[(1, decision.bucket_t)](
+        return fwd.steps[(decision.tokens_per_seq, decision.bucket_t)](
             ctx.input_ids,
             ctx.positions,
             attn_md.block_tables,
@@ -516,9 +543,9 @@ class Qwen3VLProgram:
     def forward_tokens(
         self, decision: StepDecision | None, ctx: Any, fwd: ForwardView
     ) -> torch.Tensor:
-        """Run the decided decode step's token step; `[num_reqs]` int32."""
+        """Run the decided step's token step; `[num_reqs * T]` int32."""
         assert decision is not None
-        return self._run(decision, ctx, fwd)[: decision.num_reqs]
+        return self._run(decision, ctx, fwd)[: decision.bucket_t]
 
     def forward(
         self, decision: StepDecision | None, ctx: Any, fwd: ForwardView
