@@ -197,11 +197,6 @@ def _built(
         patch.object(Scheduler, "__init__", base_init),
         patch.object(pp_chunk_scheduler.envs, "TPU_PP_EQUAL_COST_CHUNKS", equal_cost),
         patch.object(pp_chunk_scheduler, "HybridStateRetention", FakeRetention),
-        patch.object(
-            pp_chunk_scheduler.prefix_change_log,
-            "install_epoch",
-            lambda: calls.append("epoch"),
-        ),
         patch.object(TpuPipelineChunkScheduler, "_enable_memo_xstep", memo),
     ):
         s = TpuPipelineChunkScheduler()
@@ -217,12 +212,14 @@ def test_no_option_turns_on_no_lever():
     assert not s._promote_waiting
     assert not s._memo_xstep
     assert s._paw_aging_tok_per_s == 0.0
-    assert "epoch" not in calls and "memo" not in calls
+    assert "memo" not in calls
 
 
-def test_prefix_aware_installs_the_epoch_before_the_memo():
+def test_prefix_aware_opts_the_pool_into_the_memo():
+    # The epoch and change-log wrappers are registry patches; the scheduler
+    # only opts its pool in, through _enable_memo_xstep.
     s, calls = _built({"tpu_pp_scheduler": _IX_PREFILL})
-    assert calls.index("epoch") < calls.index("memo")
+    assert "memo" in calls
     assert s._memo_xstep
     assert s._prefix_aware and s._srpf_running
     assert s._quadratic_cost

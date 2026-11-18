@@ -53,11 +53,7 @@ from typing import TYPE_CHECKING, Any, cast
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.core import (
-    pp_scheduler_options,
-    prefix_change_log,
-    scheduler_options,
-)
+from vllm_torchtpu.core import pp_scheduler_options, scheduler_options
 from vllm_torchtpu.core.hybrid_retention import (
     HybridStateRetention,
     retention_wanted,
@@ -206,9 +202,8 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._memo_xstep = False
         self._paw_sort = False
         if options.prefix_aware:
-            # The memo is keyed on the prefix-cache epoch, which must be
-            # installed first or the memo silently stays empty.
-            prefix_change_log.install_epoch()
+            # The patch registry installs the prefix-cache epoch and change
+            # log at engine start; this opts the scheduler's pool in.
             self._enable_memo_xstep()
             self._init_paw_sort()
         logger.info(
