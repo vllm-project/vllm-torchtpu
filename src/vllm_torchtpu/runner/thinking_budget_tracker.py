@@ -217,7 +217,9 @@ class ThinkingBudgetTracker:
         state_table = self.prepare_step(batch_req_ids, requests, settle_outputs)
         if state_table is None:
             return None
-        return ThinkingBudgetStepState(self, state_table, markers, discard_req_ids)
+        return ThinkingBudgetStepState(
+            self, state_table, markers, batch_req_ids, discard_req_ids
+        )
 
     def on_resumed(
         self,
@@ -380,6 +382,7 @@ class ThinkingBudgetStepState:
     tracker: ThinkingBudgetTracker
     state_table: torch.Tensor
     markers: ThinkingBudgetMarkers
+    batch_req_ids: Sequence[str | None]
     discard_req_ids: AbstractSet[str]
 
     def commit(self) -> None:
@@ -387,69 +390,32 @@ class ThinkingBudgetStepState:
 
     def chunk_slot_ids(
         self,
-        batch_req_ids: Sequence[str | None],
         start_idx: int,
         end_idx: int,
     ) -> torch.Tensor | None:
         slot_ids = self.tracker.slots.allocator.build_chunk_slot_ids(
-            batch_req_ids, start_idx, end_idx, self.discard_req_ids
+            self.batch_req_ids, start_idx, end_idx, self.discard_req_ids
         )
         if slot_ids is None:
             return None
         return self.tracker.upload_slot_ids(start_idx, slot_ids)
 
-    def mask_plain_logits(
-        self, logits: torch.Tensor, slot_ids: torch.Tensor
-    ) -> torch.Tensor:
-        forced_ids = tb_kernels.query_forced_tokens(
-            self.state_table,
-            slot_ids,
-            self.markers.natural_end_ids,
-            self.markers.end_ids,
-        )
-        masked_logits, _ = tb_kernels.force_logits_rows(logits, forced_ids)
-        return masked_logits
-
-    def advance_plain(
-        self, slot_ids: torch.Tensor, selected_token_ids: torch.Tensor
-    ) -> None:
-        self.state_table = tb_kernels.advance_plain_states(
-            self.state_table,
-            slot_ids,
-            selected_token_ids,
-            *self.markers.kernel_args(),
-        )
-        self.commit()
-
-    def override_plain_top_tokens(
-        self, slot_ids: torch.Tensor, selected_token_ids: torch.Tensor
-    ) -> torch.Tensor:
-        return tb_kernels.override_plain_top_tokens(
-            self.state_table,
-            slot_ids,
-            selected_token_ids,
-            self.markers.natural_end_ids,
-            self.markers.end_ids,
-        )
-
     def plain_chunk(
         self,
-        batch_req_ids: Sequence[str | None],
         start_idx: int,
         end_idx: int,
     ) -> ThinkingBudgetPlainChunk | None:
-        slot_ids = self.chunk_slot_ids(batch_req_ids, start_idx, end_idx)
+        slot_ids = self.chunk_slot_ids(start_idx, end_idx)
         if slot_ids is None:
             return None
         return ThinkingBudgetPlainChunk(self, slot_ids)
 
     def spec_chunk(
         self,
-        batch_req_ids: Sequence[str | None],
         start_idx: int,
         end_idx: int,
     ) -> ThinkingBudgetSpecChunk | None:
-        slot_ids = self.chunk_slot_ids(batch_req_ids, start_idx, end_idx)
+        slot_ids = self.chunk_slot_ids(start_idx, end_idx)
         if slot_ids is None:
             return None
         return ThinkingBudgetSpecChunk(self, slot_ids)
@@ -463,13 +429,32 @@ class ThinkingBudgetPlainChunk:
     slot_ids: torch.Tensor
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        return self.step.mask_plain_logits(logits, self.slot_ids)
+        forced_ids = tb_kernels.query_forced_tokens(
+            self.step.state_table,
+            self.slot_ids,
+            self.step.markers.natural_end_ids,
+            self.step.markers.end_ids,
+        )
+        masked_logits, _ = tb_kernels.force_logits_rows(logits, forced_ids)
+        return masked_logits
 
     def override_top_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.step.override_plain_top_tokens(self.slot_ids, token_ids)
+        return tb_kernels.override_plain_top_tokens(
+            self.step.state_table,
+            self.slot_ids,
+            token_ids,
+            self.step.markers.natural_end_ids,
+            self.step.markers.end_ids,
+        )
 
     def on_sampled(self, token_ids: torch.Tensor) -> None:
-        self.step.advance_plain(self.slot_ids, token_ids)
+        self.step.state_table = tb_kernels.advance_plain_states(
+            self.step.state_table,
+            self.slot_ids,
+            token_ids,
+            *self.step.markers.kernel_args(),
+        )
+        self.step.commit()
 
 
 @dataclass(frozen=True)

@@ -1149,15 +1149,16 @@ class TPUModelRunner(GPUModelRunner):
         # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
         # scans, unused per-row state) on every batch update.
         self.input_batch.thinking_budget_state_holder = None
-        self._thinking_budget = thinking_budget_tracker.ThinkingBudgetTracker(
-            self.vllm_config.reasoning_config,
-            max_num_reqs=self.max_num_reqs,
-            device=self.device,
-            # Synchronous: sample_tokens() runs after the input-staging fence.
-            upload=lambda key, host: self._upload_unless_unchanged(
-                key, host, non_blocking=False
-            ),
-        )
+        if self._pp_is_last and not self.is_pooling_model:
+            self._thinking_budget = thinking_budget_tracker.ThinkingBudgetTracker(
+                self.vllm_config.reasoning_config,
+                max_num_reqs=self.max_num_reqs,
+                device=self.device,
+                # Synchronous: sample_tokens() runs after the input-staging fence.
+                upload=lambda key, host: self._upload_unless_unchanged(
+                    key, host, non_blocking=False
+                ),
+            )
         self._repetition_penalty = repetition_penalty_tracker.RepetitionPenaltyTracker(
             self.vocab_size,
             self.max_num_reqs,
@@ -5728,6 +5729,15 @@ class TPUModelRunner(GPUModelRunner):
                 discard_sampled_tokens_req_ids,
                 self._settle_in_flight_outputs,
             )
+
+        def plain_processors(
+            start_idx: int, end_idx: int
+        ) -> tuple[chunk_processors.PlainChunkProcessor, ...]:
+            if tb_step is None:
+                return ()
+            tb_chunk = tb_step.plain_chunk(start_idx, end_idx)
+            return () if tb_chunk is None else (tb_chunk,)
+
         if self.is_pooling_model:
             self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
@@ -5744,9 +5754,7 @@ class TPUModelRunner(GPUModelRunner):
                 if md is not None:
                     spec_processors: list[chunk_processors.SpecChunkProcessor] = []
                     if tb_step is not None:
-                        tb_chunk = tb_step.spec_chunk(
-                            self.input_batch.req_ids, cur_start_idx, cur_end_idx
-                        )
+                        tb_chunk = tb_step.spec_chunk(cur_start_idx, cur_end_idx)
                         if tb_chunk is not None:
                             spec_processors.append(tb_chunk)
                     with self._stage_timing.stage("sample"):
@@ -5788,13 +5796,6 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                 else:
-                    tb_chunk = (
-                        None
-                        if tb_step is None
-                        else tb_step.plain_chunk(
-                            self.input_batch.req_ids, cur_start_idx, cur_end_idx
-                        )
-                    )
                     selected, logprob_logits = self._sample_plain_chunk(
                         logits,
                         cur_start_idx=cur_start_idx,
@@ -5807,7 +5808,7 @@ class TPUModelRunner(GPUModelRunner):
                         is_spec_step=True,
                         min_toks=min_toks,
                         rep_pen=rep_pen,
-                        processors=(tb_chunk,) if tb_chunk is not None else (),
+                        processors=plain_processors(cur_start_idx, cur_end_idx),
                     )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -5845,13 +5846,6 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
-                tb_chunk = (
-                    None
-                    if tb_step is None
-                    else tb_step.plain_chunk(
-                        self.input_batch.req_ids, cur_start_idx, cur_end_idx
-                    )
-                )
                 selected_token_ids, logprob_logits = self._sample_plain_chunk(
                     logits,
                     cur_start_idx=cur_start_idx,
@@ -5864,7 +5858,7 @@ class TPUModelRunner(GPUModelRunner):
                     is_spec_step=False,
                     min_toks=min_toks,
                     rep_pen=rep_pen,
-                    processors=(tb_chunk,) if tb_chunk is not None else (),
+                    processors=plain_processors(cur_start_idx, cur_end_idx),
                 )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it

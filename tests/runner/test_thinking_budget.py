@@ -793,6 +793,27 @@ class TestKMPKernelsFuzz:
                 torch.zeros((2, 7), dtype=torch.int32),
             )
 
+    @pytest.mark.parametrize("fn", ["logits", "tokens", "plain", "top", "spec"])
+    def test_short_forced_or_slot_ids_raise(self, fn: str) -> None:
+        """Forced or slot IDs with fewer values than rows raise instead of
+        broadcasting."""
+        m = ThinkingBudgetMarkers.from_reasoning_config(_reasoning_config([5], [6, 7]))
+        assert m is not None
+        table = torch.zeros((2, 7), dtype=torch.int32)
+        ids = torch.ones(1, dtype=torch.int32)
+        toks = torch.zeros((2, 1), dtype=torch.int64)
+        call = {
+            "logits": lambda: force_logits_rows(torch.zeros((2, 8)), ids),
+            "tokens": lambda: force_token_ids(toks[:, 0], ids),
+            "plain": lambda: advance_plain_states(table, ids, toks, *m.kernel_args()),
+            "top": lambda: override_plain_top_tokens(
+                table, ids, toks, m.natural_end_ids, m.end_ids
+            ),
+            "spec": lambda: advance_spec_states(table, ids, toks, 0, *m.kernel_args()),
+        }[fn]
+        with pytest.raises(AssertionError, match="too few"):
+            call()
+
 
 class TestLifecyclePreemptionAndChunkedPrefill:
     """Lifecycle hooks, slot recycling, slot-ID uploads and real ``_update_states``."""
@@ -898,8 +919,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         batch: list[str | None] = ["a", "x", "b"]
         step = tracker.step_state(batch, reqs, frozenset({"b"}))
         assert step is not None
-        assert step.chunk_slot_ids(batch, 0, 2) is not None
-        assert step.chunk_slot_ids(batch, 2, 3) is None  # "b" is discarded
+        assert step.chunk_slot_ids(0, 2) is not None
+        assert step.chunk_slot_ids(2, 3) is None  # "b" is discarded
         slot_a = tracker.slots.allocator.slot_for("a")
         assert uploads == [("thinking_budget_slot_ids_0", [slot_a, 0, 0, 0])]
 
@@ -1149,8 +1170,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         runner._update_states(so_resub)
         assert dict(tracker.requests) == {"p": 5}
 
-    def test_async_cold_reseed_and_chunked_prefill_discard(self) -> None:
-        # 1a. Cold reseed in sample_tokens settles in-flight [0] placeholder first
+    def test_async_cold_reseed_of_an_in_flight_request_settles_first(self) -> None:
+        # Cold reseed in sample_tokens settles in-flight [0] placeholder first
         # when the cold request itself is in _pre_async_results.req_ids.
         p0 = SamplingParams(temperature=0.0, thinking_token_budget=0)
         req0 = _request_state("r0", [5, 6], p0, output_token_ids=[0])
@@ -1184,8 +1205,10 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         runner0._modify_prev_results()
         assert req0.output_token_ids == [42, 55]
 
-        # 1b. Cold re-entry of r0 when _pre_async_results only holds warm "other"
+    def test_async_cold_reseed_of_another_request_keeps_overlap(self) -> None:
+        # Cold re-entry of r0 when _pre_async_results only holds warm "other"
         # keeps async overlap (sample dispatches before wait_for_copy).
+        p0 = SamplingParams(temperature=0.0, thinking_token_budget=0)
         req_other = _request_state("other", [1, 2], p0, output_token_ids=[0])
         req_cold = _request_state("r0", [0], p0, output_token_ids=[7])
         runner1 = _make_sample_runner(
@@ -1219,7 +1242,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         ]
         assert events1 == ["sample", "copy"]
 
-        # 2. Chunked prefill (4/8 then 4/8 tokens) suppresses forcing & rewinds rng.
+    def test_chunked_prefill_discard_suppresses_forcing(self) -> None:
+        # Chunked prefill (4/8 then 4/8 tokens) suppresses forcing & rewinds rng.
         prompt = [1, 2, 3, 4, 5, *GEMMA4_START]
         req = _request_state(
             "r0",
@@ -1256,87 +1280,85 @@ class TestLifecyclePreemptionAndChunkedPrefill:
 class TestSampleTokens:
     """Plain and speculative ``sample_tokens`` integration tests."""
 
-    @pytest.mark.parametrize(
-        "mode", ["random_logprobs_min_tokens", "greedy_top_tokens", "async_dynamic"]
-    )
-    def test_plain_sample_tokens(self, mode: str) -> None:
+    def test_plain_sample_tokens_random_logprobs_min_tokens(self) -> None:
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
-        if mode == "random_logprobs_min_tokens":
-            params = SamplingParams(
-                temperature=0.7,
-                top_k=4,
-                top_p=0.95,
-                min_tokens=5,
-                stop_token_ids=[99],
-                thinking_token_budget=1,
-                logprobs=2,
-            )
-            req = _request_state("r0", [1, *GEMMA4_START], params)
-            runner = _make_sample_runner(cfg, ["r0"], {"r0": req}, all_greedy=False)
-            runner.input_batch.no_top_k = runner.input_batch.no_top_p = False
-            runner.input_batch.max_num_logprobs = 2
-            runner._build_padded_sampling_params = lambda *_a: (
-                torch.full((4, 1), 0.7),
-                torch.full((4, 1), 4, dtype=torch.int32),
-                torch.full((4, 1), 0.95),
-            )
-            base = torch.full((4, 256), -100.0)
-            base[0, 99], base[0, 50] = 20.0, 10.0
-            emitted: list[int] = []
-            ranks: list[int] = []
-            top1_raw_ids: list[int] = []
-            for _ in range(4):
-                _set_exec_state(runner, [base.clone()], {"r0": 1})
-                res = _run_sample_tokens(runner)
-                tok = res.sampled_token_ids[0][0]
-                emitted.append(tok)
-                req.num_computed_tokens += 1
-                lp = res.logprobs
-                assert lp is not None
-                assert np.isfinite(lp.logprobs[0]).all()
-                # Raw pre-mask top-1 token is always 99 (logit 20.0 > 10.0 > -100.0).
-                top1_raw_ids.append(int(lp.logprob_token_ids[0, 1]))
-                ranks.append(int(lp.sampled_token_ranks[0]))
-            assert emitted == [50, GEMMA4_END[0], GEMMA4_END[1], 50]
-            assert top1_raw_ids == [99, 99, 99, 99]
-            assert ranks[0] == 2 and all(1 <= r <= 256 for r in ranks)
-        elif mode == "greedy_top_tokens":
-            params = SamplingParams(temperature=0.0, thinking_token_budget=2)
-            req = _request_state("r0", [1, *GEMMA4_START], params)
-            runner = _make_sample_runner(cfg, ["r0"], {"r0": req}, top_tokens=True)
-            assert greedy_top_tokens.step_eligible(runner.input_batch, runner.requests)
-            assert runner._greedy_top_tokens_this_step()
-            emitted = []
-            for raw_tok in (30, 31, 32, 33, 34):
-                top_ids = torch.tensor([[raw_tok], [0], [0], [0]], dtype=torch.int64)
-                _set_exec_state(runner, [top_ids], {"r0": 1}, top_tokens=True)
-                emitted.append(_run_sample_tokens(runner).sampled_token_ids[0][0])
-                req.num_computed_tokens += 1
-            assert emitted == [30, 31, GEMMA4_END[0], GEMMA4_END[1], 34]
-        else:
-            params = SamplingParams(temperature=0.0, thinking_token_budget=2)
-            req = _request_state("r0", [1, 2], params, num_computed_tokens=0)
-            runner = _make_sample_runner(
-                cfg, ["r0"], {"r0": req}, vocab_size=4096, async_scheduling=True
-            )
-            stream = [10, *GEMMA4_START, 50, 51, 52, 53, 60]
-            next_tpu: list[int] = []
-            for idx, raw_tok in enumerate(stream):
-                logits = torch.zeros((4, 4096))
-                logits[0, raw_tok] = 9.0
-                sched = 2 if idx == 0 else 1
-                _set_exec_state(runner, [logits], {"r0": sched})
-                out = _run_sample_tokens(runner)
-                assert runner._pre_async_results is not None
-                next_tpu.append(
-                    int(runner._pre_async_results.next_tokens_tpu[0].item())
-                )
-                req.output_token_ids[-1] = -1
-                out.get_output()
-                req.num_computed_tokens += sched
-            runner._modify_prev_results()
-            expected = [10, *GEMMA4_START, 50, 51, *GEMMA4_END, 60]
-            assert req.output_token_ids == expected == next_tpu
+        params = SamplingParams(
+            temperature=0.7,
+            top_k=4,
+            top_p=0.95,
+            min_tokens=5,
+            stop_token_ids=[99],
+            thinking_token_budget=1,
+            logprobs=2,
+        )
+        req = _request_state("r0", [1, *GEMMA4_START], params)
+        runner = _make_sample_runner(cfg, ["r0"], {"r0": req}, all_greedy=False)
+        runner.input_batch.no_top_k = runner.input_batch.no_top_p = False
+        runner.input_batch.max_num_logprobs = 2
+        runner._build_padded_sampling_params = lambda *_a: (
+            torch.full((4, 1), 0.7),
+            torch.full((4, 1), 4, dtype=torch.int32),
+            torch.full((4, 1), 0.95),
+        )
+        base = torch.full((4, 256), -100.0)
+        base[0, 99], base[0, 50] = 20.0, 10.0
+        emitted: list[int] = []
+        ranks: list[int] = []
+        top1_raw_ids: list[int] = []
+        for _ in range(4):
+            _set_exec_state(runner, [base.clone()], {"r0": 1})
+            res = _run_sample_tokens(runner)
+            tok = res.sampled_token_ids[0][0]
+            emitted.append(tok)
+            req.num_computed_tokens += 1
+            lp = res.logprobs
+            assert lp is not None
+            assert np.isfinite(lp.logprobs[0]).all()
+            # Raw pre-mask top-1 token is always 99 (logit 20.0 > 10.0 > -100.0).
+            top1_raw_ids.append(int(lp.logprob_token_ids[0, 1]))
+            ranks.append(int(lp.sampled_token_ranks[0]))
+        assert emitted == [50, GEMMA4_END[0], GEMMA4_END[1], 50]
+        assert top1_raw_ids == [99, 99, 99, 99]
+        assert ranks[0] == 2 and all(1 <= r <= 256 for r in ranks)
+
+    def test_plain_sample_tokens_greedy_top_tokens(self) -> None:
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        params = SamplingParams(temperature=0.0, thinking_token_budget=2)
+        req = _request_state("r0", [1, *GEMMA4_START], params)
+        runner = _make_sample_runner(cfg, ["r0"], {"r0": req}, top_tokens=True)
+        assert greedy_top_tokens.step_eligible(runner.input_batch, runner.requests)
+        assert runner._greedy_top_tokens_this_step()
+        emitted = []
+        for raw_tok in (30, 31, 32, 33, 34):
+            top_ids = torch.tensor([[raw_tok], [0], [0], [0]], dtype=torch.int64)
+            _set_exec_state(runner, [top_ids], {"r0": 1}, top_tokens=True)
+            emitted.append(_run_sample_tokens(runner).sampled_token_ids[0][0])
+            req.num_computed_tokens += 1
+        assert emitted == [30, 31, GEMMA4_END[0], GEMMA4_END[1], 34]
+
+    def test_plain_sample_tokens_async_dynamic(self) -> None:
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        params = SamplingParams(temperature=0.0, thinking_token_budget=2)
+        req = _request_state("r0", [1, 2], params, num_computed_tokens=0)
+        runner = _make_sample_runner(
+            cfg, ["r0"], {"r0": req}, vocab_size=4096, async_scheduling=True
+        )
+        stream = [10, *GEMMA4_START, 50, 51, 52, 53, 60]
+        next_tpu: list[int] = []
+        for idx, raw_tok in enumerate(stream):
+            logits = torch.zeros((4, 4096))
+            logits[0, raw_tok] = 9.0
+            sched = 2 if idx == 0 else 1
+            _set_exec_state(runner, [logits], {"r0": sched})
+            out = _run_sample_tokens(runner)
+            assert runner._pre_async_results is not None
+            next_tpu.append(int(runner._pre_async_results.next_tokens_tpu[0].item()))
+            req.output_token_ids[-1] = -1
+            out.get_output()
+            req.num_computed_tokens += sched
+        runner._modify_prev_results()
+        expected = [10, *GEMMA4_START, 50, 51, *GEMMA4_END, 60]
+        assert req.output_token_ids == expected == next_tpu
 
     def test_structured_decoding_min_tokens_and_real_gather_logprobs(self) -> None:
         """Combine ``thinking_token_budget``, real ``StructuredDecodingManager``,
@@ -1451,7 +1473,7 @@ class TestSampleTokens:
 
         tb_step = runner._thinking_budget.step_state(["r0"], {"r0": req}, frozenset())
         assert tb_step is not None
-        tb_chunk = tb_step.plain_chunk(runner.input_batch.req_ids, 0, 1)
+        tb_chunk = tb_step.plain_chunk(0, 1)
         assert tb_chunk is not None
         selected, logprob_logits = runner._sample_plain_chunk(
             raw.clone(),
@@ -1475,198 +1497,185 @@ class TestSampleTokens:
         assert int(tb_step.state_table[slot_r0, COL_THINK_COUNT].item()) == 1
         assert int(tb_step.state_table[slot_r0, COL_END_MATCH].item()) == 1
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            "strict_greedy",
-            "top_tokens",
-            "random_temp",
-            "async_eagle3",
-            "grammar_partial_drafts",
-            "mixed_draftless_chunk",
-        ],
-    )
+    @pytest.mark.parametrize("mode", ["strict_greedy", "top_tokens", "random_temp"])
     def test_spec_verify_sample_tokens(self, mode: str) -> None:
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
-        if mode in ("strict_greedy", "top_tokens", "random_temp"):
-            greedy = mode != "random_temp"
-            use_top = mode == "top_tokens"
-            reqs = {
-                f"r{i}": _request_state(
-                    f"r{i}",
-                    [1, *GEMMA4_START],
-                    SamplingParams(
-                        temperature=0.0 if greedy else 0.7,
-                        top_k=-1 if greedy else 2,
-                        thinking_token_budget=b,
-                    ),
-                )
-                for i, b in enumerate((1, 3, 2))
-            }
-            runner = _make_sample_runner(
-                cfg,
-                ["r0", "r1", "r2"],
-                reqs,
-                all_greedy=greedy,
-                top_tokens=use_top,
-                spec_k=3,
-            )
-            if not greedy:
-                runner.input_batch.no_top_k = False
-            runner._build_padded_sampling_params = lambda *_a: (
-                torch.full((4, 1), 0.7),
-                torch.full((4, 1), 2, dtype=torch.int32),
-                torch.ones((4, 1)),
-            )
-            # Notice r1's bonus row (index 7) prefers 53 (10.0) while GEMMA4_END[0] is
-            # -50.0: pre-sampling bonus_logits forcing must mask row 7 to GEMMA4_END[0]
-            # BEFORE top-k=2 / temperature=0.7 sampling!
-            prefs = [40, 55, 56, 88, 50, 51, 52, 53, 69, 61, 62, 63]
-            logits = torch.full((16, 256), -50.0)
-            for idx, p in enumerate(prefs):
-                logits[idx, p] = 10.0
-            values = torch.argmax(logits, dim=-1, keepdim=True) if use_top else logits
-            drafts_per_req = [
-                [40, GEMMA4_END[0], GEMMA4_END[1]],
-                [50, 51, 52],
-                [60, 61, 62],
-            ]
-            _set_exec_state(
-                runner,
-                [values],
-                {"r0": 4, "r1": 4, "r2": 4},
-                md_list=[_verify_md(drafts_per_req, pad_tokens=16)],
-                spec_tokens={f"r{i}": d for i, d in enumerate(drafts_per_req)},
-                top_tokens=use_top,
-            )
-            assert _run_sample_tokens(runner).sampled_token_ids == [
-                [40, GEMMA4_END[0], GEMMA4_END[1], 88],
-                [50, 51, 52, GEMMA4_END[0]],
-                [69],
-            ]
-            # r2 keeps its slot, so this returns the committed table unchanged.
-            st_tbl = runner._thinking_budget.prepare_step(["r2"], runner.requests)
-            slot_r2 = runner._thinking_budget.slots.allocator.slot_for("r2")
-            assert st_tbl is not None and slot_r2 is not None
-            assert int(st_tbl[slot_r2, COL_THINK_COUNT].item()) == 1
-        elif mode == "async_eagle3":
-            req = _request_state(
-                "r0",
-                [1, *GEMMA4_START],
-                SamplingParams(temperature=0.0, thinking_token_budget=2),
-            )
-            runner = _make_sample_runner(
-                cfg,
-                ["r0"],
-                {"r0": req},
-                vocab_size=4096,
-                async_scheduling=True,
-                spec_k=2,
-                spec_method="eagle3",
-            )
-            for dev_drafts, row_prefs, exp in (
-                ([41, 42], [41, 42, 43], [41, 42, GEMMA4_END[0]]),
-                ([44, 45], [44, 45, 46], [GEMMA4_END[1]]),
-            ):
-                logits = torch.zeros((4, 4096))
-                for r_i, tok in enumerate(row_prefs):
-                    logits[r_i, tok] = 7.0
-                _set_exec_state(
-                    runner,
-                    [logits],
-                    {"r0": 3},
-                    md_list=[_verify_md([dev_drafts])],
-                    spec_tokens={"r0": [-1, -1]},
-                )
-                assert _run_sample_tokens(runner).get_output().sampled_token_ids == [
-                    exp
-                ]
-                req.output_token_ids[-3:] = [-1, -1, -1]
-                req.num_computed_tokens = req.num_tokens - 3
-            runner._modify_prev_results()
-            assert req.output_token_ids == [41, 42, *GEMMA4_END]
-        elif mode == "grammar_partial_drafts":
-            req = _request_state(
-                "r0",
+        greedy = mode != "random_temp"
+        use_top = mode == "top_tokens"
+        reqs = {
+            f"r{i}": _request_state(
+                f"r{i}",
                 [1, *GEMMA4_START],
                 SamplingParams(
-                    temperature=0.0,
-                    thinking_token_budget=2,
-                    structured_outputs=StructuredOutputsParams(regex=".*"),
+                    temperature=0.0 if greedy else 0.7,
+                    top_k=-1 if greedy else 2,
+                    thinking_token_budget=b,
                 ),
             )
-            runner = _make_sample_runner(
-                cfg, ["r0"], {"r0": req}, vocab_size=256, spec_k=3
-            )
-            logits = torch.full((4, 256), -20.0)
-            for idx, tok in enumerate((30, 31, 32, 33)):
-                logits[idx, tok] = 6.0
+            for i, b in enumerate((1, 3, 2))
+        }
+        runner = _make_sample_runner(
+            cfg,
+            ["r0", "r1", "r2"],
+            reqs,
+            all_greedy=greedy,
+            top_tokens=use_top,
+            spec_k=3,
+        )
+        if not greedy:
+            runner.input_batch.no_top_k = False
+        runner._build_padded_sampling_params = lambda *_a: (
+            torch.full((4, 1), 0.7),
+            torch.full((4, 1), 2, dtype=torch.int32),
+            torch.ones((4, 1)),
+        )
+        # Notice r1's bonus row (index 7) prefers 53 (10.0) while GEMMA4_END[0] is
+        # -50.0: pre-sampling bonus_logits forcing must mask row 7 to GEMMA4_END[0]
+        # BEFORE top-k=2 / temperature=0.7 sampling!
+        prefs = [40, 55, 56, 88, 50, 51, 52, 53, 69, 61, 62, 63]
+        logits = torch.full((16, 256), -50.0)
+        for idx, p in enumerate(prefs):
+            logits[idx, p] = 10.0
+        values = torch.argmax(logits, dim=-1, keepdim=True) if use_top else logits
+        drafts_per_req = [
+            [40, GEMMA4_END[0], GEMMA4_END[1]],
+            [50, 51, 52],
+            [60, 61, 62],
+        ]
+        _set_exec_state(
+            runner,
+            [values],
+            {"r0": 4, "r1": 4, "r2": 4},
+            md_list=[_verify_md(drafts_per_req, pad_tokens=16)],
+            spec_tokens={f"r{i}": d for i, d in enumerate(drafts_per_req)},
+            top_tokens=use_top,
+        )
+        assert _run_sample_tokens(runner).sampled_token_ids == [
+            [40, GEMMA4_END[0], GEMMA4_END[1], 88],
+            [50, 51, 52, GEMMA4_END[0]],
+            [69],
+        ]
+        # r2 keeps its slot, so this returns the committed table unchanged.
+        st_tbl = runner._thinking_budget.prepare_step(["r2"], runner.requests)
+        slot_r2 = runner._thinking_budget.slots.allocator.slot_for("r2")
+        assert st_tbl is not None and slot_r2 is not None
+        assert int(st_tbl[slot_r2, COL_THINK_COUNT].item()) == 1
+
+    def test_spec_verify_sample_tokens_async_eagle3(self) -> None:
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        req = _request_state(
+            "r0",
+            [1, *GEMMA4_START],
+            SamplingParams(temperature=0.0, thinking_token_budget=2),
+        )
+        runner = _make_sample_runner(
+            cfg,
+            ["r0"],
+            {"r0": req},
+            vocab_size=4096,
+            async_scheduling=True,
+            spec_k=2,
+            spec_method="eagle3",
+        )
+        for dev_drafts, row_prefs, exp in (
+            ([41, 42], [41, 42, 43], [41, 42, GEMMA4_END[0]]),
+            ([44, 45], [44, 45, 46], [GEMMA4_END[1]]),
+        ):
+            logits = torch.zeros((4, 4096))
+            for r_i, tok in enumerate(row_prefs):
+                logits[r_i, tok] = 7.0
             _set_exec_state(
                 runner,
                 [logits],
-                {"r0": 4},
-                md_list=[_verify_md([[30, 31, 32]])],
-                spec_tokens={"r0": [30, 31, 32]},
-                has_structured=True,
+                {"r0": 3},
+                md_list=[_verify_md([dev_drafts])],
+                spec_tokens={"r0": [-1, -1]},
             )
-            all_toks = list(range(256))
-            grammar_out = GrammarOutput(
-                structured_output_request_ids=["r0"],
-                grammar_bitmask=_pack_grammar_bitmask(256, [all_toks] * 4),
-                num_acceptable_drafts=[1],
-            )
-            assert _run_sample_tokens(runner, grammar_out).sampled_token_ids == [
-                [30, 31]
-            ]
-        else:
-            r0 = _request_state(
-                "r0", [1, *GEMMA4_START], SamplingParams(thinking_token_budget=1)
-            )
-            r1 = _request_state(
-                "r1",
-                [1, *GEMMA4_START],
-                SamplingParams(
-                    thinking_token_budget=0,
-                    logprobs=1,
-                    structured_outputs=StructuredOutputsParams(regex=".*"),
-                ),
-            )
-            runner = _make_sample_runner(
-                cfg, ["r0", "r1"], {"r0": r0, "r1": r1}, vocab_size=256, spec_k=2
-            )
-            runner.input_batch.max_num_logprobs = 1
-            v_logits, p_logits = (
-                torch.full((4, 256), -20.0),
-                torch.full((2, 256), -20.0),
-            )
-            for idx, tok in enumerate((30, 31, 32)):
-                v_logits[idx, tok] = 6.0
-            # On the draft-less chunk (r1), token 99 is disallowed by grammar (logit
-            # 15.0) while 77 (6.0) and GEMMA4_END[0] (-20.0) are allowed: post-grammar
-            # logprob_logits excludes 99 and reports 77 as raw top-1 while sampling
-            # emits forced GEMMA4_END[0] with finite logprob.
-            p_logits[0, 99] = 15.0
-            p_logits[0, 77] = 6.0
-            g_out = GrammarOutput(
-                structured_output_request_ids=["r1"],
-                grammar_bitmask=_pack_grammar_bitmask(
-                    256, [[77, *GEMMA4_END], [77], [77]]
-                ),
-            )
-            _set_exec_state(
-                runner,
-                [v_logits, p_logits],
-                {"r0": 3, "r1": 1},
-                num_reqs_list=[1, 1],
-                md_list=[_verify_md([[30, 31]]), None],
-                spec_tokens={"r0": [30, 31]},
-                has_structured=True,
-            )
-            res = _run_sample_tokens(runner, g_out)
-            assert res.sampled_token_ids == [[30, GEMMA4_END[0]], [GEMMA4_END[0]]]
-            assert res.logprobs is not None
-            assert math.isfinite(float(res.logprobs.logprobs[2, 0]))
-            assert int(res.logprobs.logprob_token_ids[2, 1]) == 77
+            assert _run_sample_tokens(runner).get_output().sampled_token_ids == [exp]
+            req.output_token_ids[-3:] = [-1, -1, -1]
+            req.num_computed_tokens = req.num_tokens - 3
+        runner._modify_prev_results()
+        assert req.output_token_ids == [41, 42, *GEMMA4_END]
+
+    def test_spec_verify_sample_tokens_grammar_partial_drafts(self) -> None:
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        req = _request_state(
+            "r0",
+            [1, *GEMMA4_START],
+            SamplingParams(
+                temperature=0.0,
+                thinking_token_budget=2,
+                structured_outputs=StructuredOutputsParams(regex=".*"),
+            ),
+        )
+        runner = _make_sample_runner(cfg, ["r0"], {"r0": req}, vocab_size=256, spec_k=3)
+        logits = torch.full((4, 256), -20.0)
+        for idx, tok in enumerate((30, 31, 32, 33)):
+            logits[idx, tok] = 6.0
+        _set_exec_state(
+            runner,
+            [logits],
+            {"r0": 4},
+            md_list=[_verify_md([[30, 31, 32]])],
+            spec_tokens={"r0": [30, 31, 32]},
+            has_structured=True,
+        )
+        all_toks = list(range(256))
+        grammar_out = GrammarOutput(
+            structured_output_request_ids=["r0"],
+            grammar_bitmask=_pack_grammar_bitmask(256, [all_toks] * 4),
+            num_acceptable_drafts=[1],
+        )
+        assert _run_sample_tokens(runner, grammar_out).sampled_token_ids == [[30, 31]]
+
+    def test_spec_verify_sample_tokens_mixed_draftless_chunk(self) -> None:
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        r0 = _request_state(
+            "r0", [1, *GEMMA4_START], SamplingParams(thinking_token_budget=1)
+        )
+        r1 = _request_state(
+            "r1",
+            [1, *GEMMA4_START],
+            SamplingParams(
+                thinking_token_budget=0,
+                logprobs=1,
+                structured_outputs=StructuredOutputsParams(regex=".*"),
+            ),
+        )
+        runner = _make_sample_runner(
+            cfg, ["r0", "r1"], {"r0": r0, "r1": r1}, vocab_size=256, spec_k=2
+        )
+        runner.input_batch.max_num_logprobs = 1
+        v_logits, p_logits = (
+            torch.full((4, 256), -20.0),
+            torch.full((2, 256), -20.0),
+        )
+        for idx, tok in enumerate((30, 31, 32)):
+            v_logits[idx, tok] = 6.0
+        # On the draft-less chunk (r1), token 99 is disallowed by grammar (logit
+        # 15.0) while 77 (6.0) and GEMMA4_END[0] (-20.0) are allowed: post-grammar
+        # logprob_logits excludes 99 and reports 77 as raw top-1 while sampling
+        # emits forced GEMMA4_END[0] with finite logprob.
+        p_logits[0, 99] = 15.0
+        p_logits[0, 77] = 6.0
+        g_out = GrammarOutput(
+            structured_output_request_ids=["r1"],
+            grammar_bitmask=_pack_grammar_bitmask(256, [[77, *GEMMA4_END], [77], [77]]),
+        )
+        _set_exec_state(
+            runner,
+            [v_logits, p_logits],
+            {"r0": 3, "r1": 1},
+            num_reqs_list=[1, 1],
+            md_list=[_verify_md([[30, 31]]), None],
+            spec_tokens={"r0": [30, 31]},
+            has_structured=True,
+        )
+        res = _run_sample_tokens(runner, g_out)
+        assert res.sampled_token_ids == [[30, GEMMA4_END[0]], [GEMMA4_END[0]]]
+        assert res.logprobs is not None
+        assert math.isfinite(float(res.logprobs.logprobs[2, 0]))
+        assert int(res.logprobs.logprob_token_ids[2, 1]) == 77
 
 
 class TestPrecompileAndTPU:
@@ -1754,9 +1763,11 @@ class TestPrecompileAndTPU:
                 st_table = tb.prepare_step(["r0"], {"r0": req})
                 assert st_table is not None
 
-                step = ThinkingBudgetStepState(tb, st_table, tb.markers, frozenset())
+                step = ThinkingBudgetStepState(
+                    tb, st_table, tb.markers, ["r0"], frozenset()
+                )
                 for num_reqs in runner.num_reqs_paddings:
-                    pchunk = step.plain_chunk(["r0"], 0, 1)
+                    pchunk = step.plain_chunk(0, 1)
                     assert pchunk is not None
                     pchunk.apply(torch.zeros((num_reqs, 128), dtype=torch.bfloat16))
                     tokens = torch.zeros((num_reqs, 1), dtype=torch.int64)
@@ -1770,7 +1781,7 @@ class TestPrecompileAndTPU:
                             num_tokens, num_reqs
                         ):
                             continue
-                        chunk = step.spec_chunk(["r0"], 0, 1)
+                        chunk = step.spec_chunk(0, 1)
                         assert chunk is not None
                         seg_ids = torch.full((num_tokens,), 1, dtype=torch.int64)
                         grp_ids = torch.zeros(num_tokens, dtype=torch.int32)

@@ -543,6 +543,7 @@ def force_logits_rows(
     already ``-inf`` (masked out by grammar or ``min_tokens``), the row is left
     unchanged and ``did_force[row]`` is False.
     """
+    torch._assert(forced_ids.shape[0] >= logits.shape[0], "too few forced_ids")
     forced_ids = forced_ids[: logits.shape[0]]
     safe_ids = forced_ids.clamp(min=0, max=logits.shape[-1] - 1).to(torch.int64)
     orig_forced = logits.gather(-1, safe_ids.unsqueeze(-1))
@@ -561,6 +562,7 @@ def force_token_ids(
 
     Only the first ``token_ids.shape[0]`` entries of ``forced_ids`` are used.
     """
+    torch._assert(forced_ids.shape[0] >= token_ids.shape[0], "too few forced_ids")
     forced_ids = forced_ids[: token_ids.shape[0]]
     did_force = forced_ids >= 0
     forced_out = torch.where(did_force, forced_ids.to(token_ids.dtype), token_ids)
@@ -595,6 +597,7 @@ def advance_plain_states(
     end_fail: tuple[int, ...],
 ) -> torch.Tensor:
     """Advance ``state_table`` for ``slot_ids[:selected_token_ids.shape[0]]``."""
+    torch._assert(slot_ids.shape[0] >= selected_token_ids.shape[0], "too few slot_ids")
     chunk_slots = slot_ids[: selected_token_ids.shape[0]]
     _, st = _select_slot_states(state_table, chunk_slots)
     next_st = _advance_state_tensor(
@@ -623,6 +626,7 @@ def override_plain_top_tokens(
     ``state_table`` is unchanged; ``advance_plain_states`` advances it with the
     result.
     """
+    torch._assert(slot_ids.shape[0] >= selected_token_ids.shape[0], "too few slot_ids")
     chunk_slots = slot_ids[: selected_token_ids.shape[0]]
     active_slot, st = _select_slot_states(state_table, chunk_slots)
     forced_id = _query_forced_token_tensor(st, nat_ids, end_ids)
@@ -736,6 +740,7 @@ def advance_spec_states(
     end_fail: tuple[int, ...],
 ) -> torch.Tensor:
     """Advance ``state_table`` across accepted/recovered/bonus ``next_tokens``."""
+    torch._assert(slot_ids.shape[0] >= next_tokens.shape[0], "too few slot_ids")
     chunk_slots = slot_ids[: next_tokens.shape[0]]
     active_slot, st = _select_slot_states(state_table, chunk_slots)
     for col_idx in range(max_draft_tokens + 1):
