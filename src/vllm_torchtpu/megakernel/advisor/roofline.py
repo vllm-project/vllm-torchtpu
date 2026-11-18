@@ -44,8 +44,12 @@ from .constants import (
     FP32_BYTES,
     GDN_STREAMED_HEADS_CAP,
     GROUPED_MOE_MODES,
+    MIN_EFFICIENCY_FLOOR,
     MIN_FIRST_DMA_SLOT_BYTES,
+    PER_OP_BASE_FFN_KERNELS_PER_LAYER,
     PER_OP_COLLECTIVE_CALL_FACTOR,
+    PER_OP_MIXER_KERNELS_PER_LAYER,
+    PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER,
     QUANTILE_DECIMALS,
     SUB_BYTE_EXPERT_DTYPES,
     SUBCHANNEL_BLOCK_K_THRESHOLD,
@@ -62,7 +66,12 @@ from .specs import (
     WorkloadSpec,
     default_double_buffer_ring_plan,
 )
-from .support import evaluate_support, find_declaration, single_call_row_limit
+from .support import (
+    effective_expert_owner_groups,
+    evaluate_support,
+    find_declaration,
+    single_call_row_limit,
+)
 from .vmem import (
     _mesh_divisibility_reasons,
     _scope_vmem_and_ops,
@@ -166,6 +175,121 @@ def _experts_hit(
     return max(1.0, experts_local * (1.0 - miss))
 
 
+def experts_hit_busiest(
+    tokens_ep: int,
+    top_k: int,
+    num_experts: int,
+    experts_local: int,
+    owner_groups: int,
+) -> float:
+    """Return expected per-rank active experts on the busiest owner group.
+
+    Models per-expert selection probability ``hit = 1 - (1 - min(1, top_k /
+    num_experts)) ** tokens_ep``, treats the ``owner_groups`` disjoint expert
+    groups of size ``E_g = num_experts // owner_groups`` as independent
+    ``Binomial(E_g, hit)`` draws so ``E[max] = sum_{m=0}^{E_g - 1} (1 -
+    F(m) ** owner_groups)`` in ``lgamma`` log space, and scales to per-rank
+    expert equivalents by ``experts_local / E_g`` (floored at ``1.0``).
+    """
+    if num_experts <= 0 or experts_local <= 0 or owner_groups > num_experts:
+        msg = (
+            "experts_hit_busiest requires num_experts > 0, experts_local > 0, "
+            f"and owner_groups <= num_experts; got num_experts={num_experts}, "
+            f"experts_local={experts_local}, owner_groups={owner_groups}"
+        )
+        raise ValueError(msg)
+    if owner_groups <= 1:
+        return _experts_hit(tokens_ep, top_k, num_experts, experts_local)
+    experts_per_group = num_experts // owner_groups
+    hit = 1.0 - (1.0 - min(1.0, top_k / num_experts)) ** tokens_ep
+    if hit <= 0.0:
+        return 1.0
+    if hit >= 1.0:
+        return max(1.0, float(experts_local))
+    log_fact_total = math.lgamma(experts_per_group + 1)
+    log_hit = math.log(hit)
+    log_miss = math.log1p(-hit)
+    cdf = 0.0
+    expected_group_max = 0.0
+    for count in range(experts_per_group):
+        log_pmf = (
+            log_fact_total
+            - math.lgamma(count + 1)
+            - math.lgamma(experts_per_group - count + 1)
+            + count * log_hit
+            + (experts_per_group - count) * log_miss
+        )
+        cdf = min(1.0, cdf + math.exp(log_pmf))
+        expected_group_max += 1.0 - cdf**owner_groups
+    return max(1.0, expected_group_max * (experts_local / experts_per_group))
+
+
+def _per_op_kernel_calls(scope_context: _ScopeContext, profile: ModelProfile) -> int:
+    """Return unfused operator kernel launches per step in `per_op` scope."""
+    shared_kernels = (
+        PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER * scope_context.l_moe
+        if profile.shared_expert_intermediate_size > 0
+        else 0
+    )
+    return max(
+        1,
+        (PER_OP_MIXER_KERNELS_PER_LAYER + PER_OP_BASE_FFN_KERNELS_PER_LAYER)
+        * scope_context.layers_local
+        + shared_kernels,
+    )
+
+
+def _boundary_fill_drain_s(
+    scope_context: _ScopeContext,
+    boundary_cfg: tuple[int, int, bool, float],
+    efficiencies: tuple[float, float] = (1.0, 1.0),
+) -> float:
+    """Return inter-call cold-slot fill, row-tile sync, and stage sync seconds."""
+    boundary_count, n_splits, tiled, sync_stage_s = boundary_cfg
+    eta_hbm, eta_ici = efficiencies
+    per_call_s = (scope_context.first_slot_bytes / scope_context.bw_hbm) / eta_hbm + (
+        BOUNDARY_SYNC_HOP_FACTOR * scope_context.lat_coll
+    ) / eta_ici
+    tiled_sync_s = (
+        (
+            (n_splits - 1)
+            * 2
+            * scope_context.layers_local
+            * BOUNDARY_SYNC_HOP_FACTOR
+            * scope_context.lat_coll
+        )
+        / eta_ici
+        if tiled
+        else 0.0
+    )
+    return (boundary_count * per_call_s + sync_stage_s) + tiled_sync_s
+
+
+def _achievable_fill_drain_s(
+    scope: FusionScope,
+    scope_context: _ScopeContext,
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    boundary_cfg: tuple[int, int, float],
+) -> float:
+    """Return achievable cold-slot fill and boundary sync seconds across scopes."""
+    n_ops, n_splits, sync_stage_s = boundary_cfg
+    eff = workload.efficiency
+    eta_hbm = max(MIN_EFFICIENCY_FLOOR, eff.eta_hbm)
+    eta_ici = max(MIN_EFFICIENCY_FLOOR, eff.eta_ici)
+    boundary_count = (
+        _per_op_kernel_calls(scope_context, profile) - 1
+        if scope == "per_op"
+        else n_ops - 1
+    )
+    tiled = scope in ("whole_step", "layer_group") and n_splits > 1
+    return _boundary_fill_drain_s(
+        scope_context,
+        (boundary_count, n_splits, tiled, sync_stage_s),
+        (eta_hbm, eta_ici),
+    )
+
+
 def _strict_moe_weights(scope_context: _ScopeContext, profile: ModelProfile) -> float:
     """Return strict lower-bound step weight bytes under perfectly balanced routing."""
     if scope_context.experts_local == 0:
@@ -241,8 +365,8 @@ def _resolve_scope_moe_and_acts(
     profile: ModelProfile,
     workload: WorkloadSpec,
     n_splits: int,
-) -> tuple[float, float, float, int, bool]:
-    """Return w_step, phi, extra activation bytes, tile_tokens, and grouped_moe."""
+) -> tuple[float, float, float, int, bool, Mapping[str, object] | None]:
+    """Return w_step, phi, extra_act, tile_tokens, grouped_moe, and declaration."""
     tiled = scope in ("whole_step", "layer_group") and n_splits > 1
     tile_tokens = ceil(scope_context.active_tokens / max(1, n_splits))
     can_group_moe = can_group_moe_in_scope(
@@ -286,7 +410,7 @@ def _resolve_scope_moe_and_acts(
         if tiled
         else 0.0
     )
-    return w_step, moe_pad_factor, extra_act, tile_tokens, grouped_moe
+    return w_step, moe_pad_factor, extra_act, tile_tokens, grouped_moe, declaration
 
 
 def _compute_scope_collective_times(
@@ -509,9 +633,8 @@ def _compute_scope_matmuls(
 def _compute_achievable_upper_us(
     scope_context: _ScopeContext,
     workload: WorkloadSpec,
-    flags: tuple[bool, bool, bool, int],
+    flags: tuple[bool, int],
     times: tuple[
-        float,
         float,
         float,
         float,
@@ -529,11 +652,10 @@ def _compute_achievable_upper_us(
     measured_in_comm_s: float = 0.0,
 ) -> float:
     """Compute achievable upper-bound step latency in microseconds."""
-    overlapped_comm, bf16_attention_upper, _, n_ops = flags
+    bf16_attention_upper, n_ops = flags
     (
         moe_pad_factor,
         eta_moe,
-        _,
         t_hbm_ach,
         comm_s,
         ar_extra_s,
@@ -547,48 +669,46 @@ def _compute_achievable_upper_us(
     ) = times
     vec_ops_dense, vec_ops_moe, vec_rate = vector_terms
     eff = workload.efficiency
+    eta_dense = max(MIN_EFFICIENCY_FLOOR, eff.eta_dense)
+    eta_hbm = max(MIN_EFFICIENCY_FLOOR, eff.eta_hbm)
+    eta_ici = max(MIN_EFFICIENCY_FLOOR, eff.eta_ici)
     t_matmul_dense_upper_ach = (
         (
             (
                 (scope_context.flops_dense - scope_context.flops_kv)
                 / scope_context.peak_w
             )
-            / max(1e-3, eff.eta_dense)
-            + (scope_context.flops_kv / scope_context.bf16_peak)
-            / max(1e-3, eff.eta_dense)
+            / eta_dense
+            + (scope_context.flops_kv / scope_context.bf16_peak) / eta_dense
         )
         if (
             scope_context.attn_is_bf16
             or (bf16_attention_upper and workload.phase in ("prefill", "mixed"))
         )
         and scope_context.flops_kv > 0
-        else (scope_context.flops_dense / scope_context.peak_w)
-        / max(1e-3, eff.eta_dense)
+        else (scope_context.flops_dense / scope_context.peak_w) / eta_dense
     )
     t_dense_upper_ach = max(
         t_matmul_dense_upper_ach,
-        (vec_ops_dense / vec_rate) / max(1e-3, eff.eta_dense),
+        (vec_ops_dense / vec_rate) / eta_dense,
     )
     unmeasured_comm_s = max(0.0, comm_s - measured_in_comm_s)
-    t_comm_upper_ach = measured_in_comm_s + (unmeasured_comm_s + ar_extra_s) / max(
-        1e-3, eff.eta_ici
-    )
+    t_comm_upper_ach = measured_in_comm_s + (unmeasured_comm_s + ar_extra_s) / eta_ici
     t_moe_ach = (
         (moe_pad_factor * scope_context.flops_moe) / scope_context.peak_e
-    ) / max(1e-3, eta_moe)
-    t_vec_moe_ach = (vec_ops_moe / vec_rate) / max(1e-3, eff.eta_dense)
+    ) / eta_moe
+    t_vec_moe_ach = (vec_ops_moe / vec_rate) / eta_dense
     chain_upper_ach_s = _routed_chain(
         t_dense_upper_ach,
-        routed_hbm_s / max(1e-3, eff.eta_hbm),
+        routed_hbm_s / eta_hbm,
         t_moe_ach,
         t_vec_moe_ach,
     )
     ach_upper_core_s = (
-        _core_time(
-            t_hbm_ach, chain_upper_ach_s, t_comm_upper_ach, fused=overlapped_comm
-        )
+        max(t_hbm_ach, chain_upper_ach_s)
+        + t_comm_upper_ach
         + sync_comm_extra_s
-        + a2a_extra_s / max(1e-3, eff.eta_ici)
+        + a2a_extra_s / eta_ici
     )
     return max(
         step_ach_us,
@@ -675,84 +795,6 @@ def _compute_strict_step_floor(
     return w_step_strict, step_floor_strict_us
 
 
-def _compute_ach_upper_and_strict(
-    scope_context: _ScopeContext,
-    profile: ModelProfile,
-    workload: WorkloadSpec,
-    flags_and_vectors: tuple[
-        tuple[bool, bool, bool, bool, int, int], tuple[float, float, float]
-    ],
-    times: tuple[float, ...],
-    measured_in_comm_s: float = 0.0,
-) -> tuple[float, float, float]:
-    """Return step_ach_upper_us, w_step_strict, and step_floor_strict_us."""
-    flags, vector_terms = flags_and_vectors
-    (
-        one_weight_pass,
-        is_fused_multi,
-        overlapped_comm,
-        bf16_attention_upper,
-        n_splits,
-        n_ops,
-    ) = flags
-    (
-        moe_pad_factor,
-        eta_moe,
-        t_comp_ach,
-        t_hbm_ach,
-        comm_s,
-        ar_extra_s,
-        a2a_extra_s,
-        sync_comm_extra_s,
-        pipeline_fill_drain_s,
-        repass_spill_us,
-        step_ach_us,
-        step_upper_us,
-        act_bytes,
-        eff_state_bytes,
-        base_ai,
-        routed_hbm_s,
-        ar_strict_saving_s,
-    ) = times
-    step_ach_upper_us = _compute_achievable_upper_us(
-        scope_context,
-        workload,
-        (overlapped_comm, bf16_attention_upper, one_weight_pass, n_ops),
-        (
-            moe_pad_factor,
-            eta_moe,
-            t_comp_ach,
-            t_hbm_ach,
-            comm_s,
-            ar_extra_s,
-            a2a_extra_s,
-            sync_comm_extra_s,
-            pipeline_fill_drain_s,
-            repass_spill_us,
-            step_ach_us,
-            step_upper_us,
-            routed_hbm_s,
-        ),
-        vector_terms,
-        measured_in_comm_s=measured_in_comm_s,
-    )
-    w_step_strict, step_floor_strict_us = _compute_strict_step_floor(
-        scope_context,
-        profile,
-        workload,
-        (one_weight_pass, is_fused_multi, overlapped_comm, n_splits, n_ops),
-        (
-            comm_s,
-            pipeline_fill_drain_s,
-            act_bytes,
-            eff_state_bytes,
-            base_ai,
-            ar_strict_saving_s,
-        ),
-    )
-    return step_ach_upper_us, w_step_strict, step_floor_strict_us
-
-
 def _upper_collective_extras(
     scope_context: _ScopeContext,
     n_splits: int,
@@ -792,9 +834,9 @@ def _compute_scope_achievable_step(
     timing_inputs: tuple[float, float, float, float, float, float, float, float],
     vector_terms: tuple[float, float, float] = (0.0, 0.0, 1.0),
     measured_ar_split: tuple[float, float] = (0.0, 0.0),
-) -> tuple[float, float, float, float, float, float]:
+) -> tuple[float, float, float, float, float]:
     """Compute achievable and upper-band step components for one FusionScope."""
-    is_fused_multi, grouped_moe, n_ops, _ = scope_flags
+    is_fused_multi, grouped_moe, n_ops, routed_ach_ratio = scope_flags
     (
         hbm_time_s,
         routed_hbm_s,
@@ -808,49 +850,51 @@ def _compute_scope_achievable_step(
     vec_ops_dense, vec_ops_moe, vec_rate = vector_terms
     measured_in_comm_s, measured_in_sync_s = measured_ar_split
     eff = workload.efficiency
-    eta_moe = (
+    eta_moe = max(
+        MIN_EFFICIENCY_FLOOR,
         eff.eta_moe_grouped
         if grouped_moe and scope_context.l_moe > 0
-        else eff.eta_dense
+        else eff.eta_dense,
     )
+    eta_hbm = max(MIN_EFFICIENCY_FLOOR, eff.eta_hbm)
+    eta_ici = max(MIN_EFFICIENCY_FLOOR, eff.eta_ici)
+    eta_dense = max(MIN_EFFICIENCY_FLOOR, eff.eta_dense)
     t_matmul_dense_ach = (
         (
             (
                 (scope_context.flops_dense - scope_context.flops_kv)
                 / scope_context.peak_w
             )
-            / max(1e-3, eff.eta_dense)
-            + (scope_context.flops_kv / scope_context.bf16_peak)
-            / max(1e-3, eff.eta_dense)
+            / eta_dense
+            + (scope_context.flops_kv / scope_context.bf16_peak) / eta_dense
         )
         if scope_context.attn_is_bf16 and scope_context.flops_kv > 0
-        else (scope_context.flops_dense / scope_context.peak_w)
-        / max(1e-3, eff.eta_dense)
+        else (scope_context.flops_dense / scope_context.peak_w) / eta_dense
     )
     t_dense_ach = max(
         t_matmul_dense_ach,
-        (vec_ops_dense / vec_rate) / max(1e-3, eff.eta_dense),
+        (vec_ops_dense / vec_rate) / eta_dense,
     )
-    t_hbm_ach = hbm_time_s / max(1e-3, eff.eta_hbm)
+    routed_hbm_busiest_s = routed_hbm_s * routed_ach_ratio
+    t_hbm_ach = (hbm_time_s + (routed_ach_ratio - 1.0) * routed_hbm_s) / eta_hbm
     unmeasured_comm_s = max(0.0, comm_s - measured_in_comm_s)
-    t_comm_ach = measured_in_comm_s + unmeasured_comm_s / max(1e-3, eff.eta_ici)
+    t_comm_ach = measured_in_comm_s + unmeasured_comm_s / eta_ici
     unmeasured_sync_s = max(0.0, sync_stage_s - measured_in_sync_s)
     sync_comm_extra_s = (
-        unmeasured_sync_s * (1.0 / max(1e-3, eff.eta_ici) - 1.0)
-        if is_fused_multi
-        else 0.0
+        unmeasured_sync_s * (1.0 / eta_ici - 1.0) if is_fused_multi else 0.0
     )
-    t_moe_ach = t_moe / max(1e-3, eta_moe)
-    t_vec_moe_ach = (vec_ops_moe / vec_rate) / max(1e-3, eff.eta_dense)
+    t_moe_ach = (t_moe * routed_ach_ratio) / eta_moe
+    t_vec_moe_ach = ((vec_ops_moe * routed_ach_ratio) / vec_rate) / eta_dense
     chain_ach_s = _routed_chain(
         t_dense_ach,
-        routed_hbm_s / max(1e-3, eff.eta_hbm),
+        routed_hbm_busiest_s / eta_hbm,
         t_moe_ach,
         t_vec_moe_ach,
     )
     step_ach_us = (
         (
-            _core_time(t_hbm_ach, chain_ach_s, t_comm_ach, fused=is_fused_multi)
+            max(t_hbm_ach, chain_ach_s)
+            + t_comm_ach
             + sync_comm_extra_s
             + pipeline_fill_drain_s
         )
@@ -867,7 +911,6 @@ def _compute_scope_achievable_step(
     )
     return (
         eta_moe,
-        t_dense_ach + t_moe_ach,
         t_hbm_ach,
         sync_comm_extra_s,
         step_ach_us,
@@ -900,9 +943,14 @@ def _evaluate_single_scope(
         selected_dense_slots,
         selected_expert_slots,
     ) = _scope_vmem_and_ops(scope, scope_context, profile, workload)
-    w_step, moe_pad_factor, extra_act, _, grouped_moe = _resolve_scope_moe_and_acts(
-        scope, scope_context, profile, workload, n_splits
-    )
+    (
+        w_step,
+        moe_pad_factor,
+        extra_act,
+        _,
+        grouped_moe,
+        declaration,
+    ) = _resolve_scope_moe_and_acts(scope, scope_context, profile, workload, n_splits)
     tiled = scope in ("whole_step", "layer_group") and n_splits > 1
     # A fused scope above its row limit and a single-layer kernel stream weights
     # once: their row tiles move the residual through HBM at every layer instead.
@@ -922,21 +970,13 @@ def _evaluate_single_scope(
     comm_in_core = overlapped_comm or not is_fused_multi
     measured_in_comm_s = measured_ar_total_s if comm_in_core else 0.0
     measured_in_sync_s = 0.0 if comm_in_core else measured_ar_total_s
-    pipeline_fill_drain_s = (n_ops - 1) * (
-        scope_context.first_slot_bytes / bw_hbm
-        + BOUNDARY_SYNC_HOP_FACTOR * scope_context.lat_coll
-    ) + sync_stage_s
+    # Each tile boundary adds a sync hop per layer. The residual bytes moved
+    # there are already in act_bytes.
+    pipeline_fill_drain_s = _boundary_fill_drain_s(
+        scope_context,
+        (n_ops - 1, n_splits, tiled, sync_stage_s),
+    )
     streams = max(1, profile.residual_streams)
-    if tiled:
-        # Each tile boundary adds a sync hop per layer. The residual bytes moved
-        # there are already in act_bytes.
-        pipeline_fill_drain_s += (
-            (n_splits - 1)
-            * 2
-            * layers_local
-            * BOUNDARY_SYNC_HOP_FACTOR
-            * scope_context.lat_coll
-        )
     (
         t_matmul,
         t_matmul_upper,
@@ -981,9 +1021,33 @@ def _evaluate_single_scope(
     pure_us = roof_us + repass_spill_us
     new_sub_pure_us = pure_us if scope == "per_op" else sub_pure_us
     step_us = pure_us + n_ops * workload.op_overhead_us
+    tokens_ep_step = scope_context.active_tokens * scope_context.ep_dp
+    routed_ach_ratio = (
+        experts_hit_busiest(
+            tokens_ep_step,
+            profile.top_k,
+            profile.num_experts,
+            scope_context.experts_local,
+            effective_expert_owner_groups(declaration, workload),
+        )
+        / _experts_hit(
+            tokens_ep_step,
+            profile.top_k,
+            profile.num_experts,
+            scope_context.experts_local,
+        )
+        if scope_context.experts_local > 0
+        else 1.0
+    )
+    achievable_fill_drain_s = _achievable_fill_drain_s(
+        scope,
+        scope_context,
+        profile,
+        workload,
+        (n_ops, n_splits, sync_stage_s),
+    )
     (
         eta_moe,
-        t_comp_ach,
         t_hbm_ach,
         sync_comm_extra_s,
         step_ach_us,
@@ -991,14 +1055,14 @@ def _evaluate_single_scope(
     ) = _compute_scope_achievable_step(
         scope_context,
         workload,
-        (is_fused_multi, grouped_moe, n_ops, moe_pad_factor),
+        (is_fused_multi, grouped_moe, n_ops, routed_ach_ratio),
         (
             hbm_time_s,
             routed_hbm_s,
             t_moe,
             comm_s,
             sync_stage_s,
-            pipeline_fill_drain_s,
+            achievable_fill_drain_s,
             repass_spill_us,
             t_matmul_upper,
         ),
@@ -1019,49 +1083,43 @@ def _evaluate_single_scope(
         step_us,
         roof_upper_us + repass_spill_us + n_ops * scope_context.launch_gap_upper_us,
     )
-    step_ach_upper_us, w_step_strict, step_floor_strict_us = (
-        _compute_ach_upper_and_strict(
-            scope_context,
-            profile,
-            workload,
-            (
-                (
-                    one_weight_pass,
-                    is_fused_multi,
-                    overlapped_comm,
-                    bf16_attention_upper,
-                    n_splits,
-                    n_ops,
-                ),
-                (vec_ops_dense, vec_ops_moe, vec_rate),
-            ),
-            (
-                moe_pad_factor,
-                eta_moe,
-                t_comp_ach,
-                t_hbm_ach,
-                comm_s,
-                ar_extra_s,
-                a2a_extra_s,
-                sync_comm_extra_s,
-                pipeline_fill_drain_s,
-                repass_spill_us,
-                step_ach_us,
-                step_upper_us,
-                act_bytes,
-                eff_state_bytes,
-                base_ai,
-                routed_hbm_s,
-                0.0
-                if has_measured_ar
-                else scope_context.num_ar
-                * (
-                    scope_context.ar_transfer_time_s
-                    - scope_context.ar_transfer_strict_s
-                ),
-            ),
-            measured_in_comm_s=measured_in_comm_s,
-        )
+    step_ach_upper_us = _compute_achievable_upper_us(
+        scope_context,
+        workload,
+        (bf16_attention_upper, n_ops),
+        (
+            moe_pad_factor * routed_ach_ratio,
+            eta_moe,
+            t_hbm_ach,
+            comm_s,
+            ar_extra_s,
+            a2a_extra_s,
+            sync_comm_extra_s,
+            achievable_fill_drain_s,
+            repass_spill_us,
+            step_ach_us,
+            step_upper_us,
+            routed_hbm_s * routed_ach_ratio,
+        ),
+        (vec_ops_dense, vec_ops_moe * routed_ach_ratio, vec_rate),
+        measured_in_comm_s=measured_in_comm_s,
+    )
+    w_step_strict, step_floor_strict_us = _compute_strict_step_floor(
+        scope_context,
+        profile,
+        workload,
+        (one_weight_pass, is_fused_multi, overlapped_comm, n_splits, n_ops),
+        (
+            comm_s,
+            pipeline_fill_drain_s,
+            act_bytes,
+            eff_state_bytes,
+            base_ai,
+            0.0
+            if has_measured_ar
+            else scope_context.num_ar
+            * (scope_context.ar_transfer_time_s - scope_context.ar_transfer_strict_s),
+        ),
     )
     support_status, blockers = evaluate_support(
         scope, profile, workload, scope_context.chip_spec, scope_context
