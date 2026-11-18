@@ -194,6 +194,10 @@ class DeclinedDriver:
     def on_warmup_done(self, runner: Any) -> None:
         del runner
 
+    def try_greedy_tokens(self, runner: Any, ctx: StepContext) -> None:
+        """No token step: the runner's `try_forward` path counts the step."""
+        del runner, ctx
+
     def try_forward(self, runner: Any, ctx: StepContext) -> tuple[bool, Any]:
         del ctx
         if is_suppressed(runner):

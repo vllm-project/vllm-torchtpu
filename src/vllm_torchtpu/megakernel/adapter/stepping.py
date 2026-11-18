@@ -17,6 +17,7 @@ step-mix log; plus the runner input shapes a bucket is warmed up with."""
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import time
 from collections.abc import Sequence
@@ -180,6 +181,7 @@ class StepRouting:
     _display_name: str
     _backbone: Any
     _steps: dict[tuple[int, int], StepFn]
+    _token_steps: dict[tuple[int, int], StepFn]
     _bound: bool
     _pending: tuple[Any, ForwardView, StepContext] | None
     _inspect: Any
@@ -220,7 +222,7 @@ class StepRouting:
         ctx = StepContext(input_ids, positions, inputs_embeds, intermediate_tensors)
         return self._route(ctx, runner)
 
-    def _route(self, ctx: StepContext, runner: Any) -> bool:
+    def _route(self, ctx: StepContext, runner: Any, count_stock: bool = True) -> bool:
         self._pending = None
         self.ab_calibrator.last_decision = ("stock_early", "stock")
         if (
@@ -239,7 +241,7 @@ class StepRouting:
         if decision is None:
             return False
         if not decision.eligible:
-            return self._note_step(decision.reason, False)
+            return self._note_step(decision.reason, False) if count_stock else False
         run = self._note_step(decision.reason, True)
         # The A/B calibrator may send an eligible step to the stock arm.
         self._pending = (decision, fwd, ctx) if run else None
@@ -289,6 +291,34 @@ class StepRouting:
             if ctx.input_ids is not input_ids or ctx.positions is not positions:
                 ctx = StepContext(input_ids, positions)
         return self.program.forward(decision, ctx, fwd)
+
+    def try_greedy_tokens(self, runner: Any, ctx: StepContext) -> torch.Tensor | None:
+        """The step's greedy token ids from the program's token step, or `None`.
+
+        The runner calls this instead of `forward_model` + logits + sampling on
+        a step whose tokens are all greedy with nothing else read from the
+        logits (no logprobs, grammar, penalties or LM head LoRA). `ctx` holds
+        the same `input_ids` / `positions` as for `try_forward`. On `None`
+        (not routed to the program, no token step, the A/B calibrator on, a
+        suppressed run) the runner takes its usual path, which may still route
+        the step through `try_forward`. The tokens are `[num_reqs]` int32,
+        the same on every TP rank, `argmax` of the bf16 logits with ties to
+        the lowest id; the step wrote its KV like the hidden step.
+        """
+        if (
+            not self._token_steps
+            or is_suppressed(runner)
+            or ctx.model_kwargs
+            or self.ab_calibrator.enabled
+            # A declined step is counted by the `try_forward` that follows.
+            or not self._route(ctx, runner, count_stock=False)
+        ):
+            self._pending = None
+            return None
+        decision, fwd, _ = self._pending
+        self._pending = None
+        fwd = dataclasses.replace(fwd, steps=self._token_steps)
+        return self.program.forward_tokens(decision, ctx, fwd)
 
     def try_forward(self, runner: Any, ctx: StepContext) -> tuple[bool, Any]:
         """Try to execute the current forward step on the megakernel.

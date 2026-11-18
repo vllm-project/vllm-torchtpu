@@ -200,6 +200,7 @@ def run_cpu_e2e(
     *,
     metadata: Mapping[str, Any] | Callable[[Any], Mapping[str, Any]] | None = None,
     options: Mapping[str, Any] | None = None,
+    greedy: bool = False,
 ) -> CpuE2EResult:
     """Start `plugin` on `runner` and serve `steps`, as the runner would.
 
@@ -208,7 +209,10 @@ def run_cpu_e2e(
     `options` are written into its megakernel config. `steps` are
     `StepContext`s or `(input_ids, positions)` pairs, or a callable of the
     program returning them; `metadata` (or a callable of the program) is the
-    forward context's attention metadata during the steps. Raises
+    forward context's attention metadata during the steps. With `greedy`,
+    each step is a greedy one: the runner asks for the token step first
+    (`try_greedy_tokens`, its tokens are the step's output) and falls back to
+    `try_forward`. Raises
     `AssertionError` if the megakernel doesn't serve after startup or bind.
     """
     from . import maybe_create, stepping
@@ -234,7 +238,8 @@ def run_cpu_e2e(
     fwd_ctx = SimpleNamespace(attn_metadata=md)
     with mock.patch.object(stepping, "get_forward_context", lambda: fwd_ctx):
         for ctx in _step_contexts(ctxs):
-            hit, out = drv.try_forward(runner, ctx)
+            tok = drv.try_greedy_tokens(runner, ctx) if greedy else None
+            hit, out = (True, tok) if tok is not None else drv.try_forward(runner, ctx)
             hits.append(hit)
             outputs.append(out)
     return CpuE2EResult(drv, runner, hits, outputs)

@@ -18,9 +18,12 @@ bf16 weights of the loaded vLLM model; `bind` aliases its 64 per-layer bf16
 KV caches at their page size; `build` returns one bridge step per decode
 bucket, which embeds the ids, gathers each row's M-RoPE cos / sin from
 vLLM's rotary cache and runs the backbone through the final norm (the runner
-computes the logits);
-`decide` / `forward` route decode (`T=1`) steps whose requests are all past
-their prompt.
+computes the logits); `build_tokens` returns the bucket's whole-step kernel
+(`core.token_io`: the runner's ids, positions, block table and sequence
+lengths in, greedy token ids out) when vLLM's LM head is a plain
+vocabulary-parallel projection;
+`decide` / `forward` / `forward_tokens` route decode (`T=1`) steps whose
+requests are all past their prompt.
 """
 
 from __future__ import annotations
@@ -42,6 +45,12 @@ from vllm_torchtpu.megakernel.adapter import (
     load_vllm_weights,
 )
 from vllm_torchtpu.megakernel.adapter.plugin import ForwardView, RunnerView
+from vllm_torchtpu.megakernel.adapter.token_step import (
+    GreedyHead,
+    greedy_head,
+    pack_head_tiles,
+    token_io_for,
+)
 from vllm_torchtpu.megakernel.core import CacheExec, ExecSpec, Profile
 from vllm_torchtpu.megakernel.core import runtime as mk_rt
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
@@ -136,6 +145,7 @@ class Qwen3VLProgram:
         base_exec: ExecSpec | None = None,
     ) -> None:
         self.model_def = Qwen3VLText
+        self.model = model
         self.backbone = find_backbone(model)
         self.tp_rank = tp_rank
         self.profile = profile
@@ -149,6 +159,9 @@ class Qwen3VLProgram:
         self._ir_checked: set[tuple[int, int]] = set()
         self._ir_error: str | None = None
         self._writes_checked = False
+        self.greedy: GreedyHead | None = None
+        self.tokens_io: Any = None
+        self.head_tiles: torch.Tensor | None = None
 
     # --- load ---------------------------------------------------------------
 
@@ -173,6 +186,14 @@ class Qwen3VLProgram:
             tp_rank=self.tp_rank,
         )
         self.w_flat: list[torch.Tensor] = self.weights["w_flat"]
+        gh = greedy_head(self.model, self.backbone.embed_tokens, self.tp_rank)
+        if isinstance(gh, str):
+            logger.info("%s megakernel: no token step (%s)", self.display_name, gh)
+        else:
+            # The LM head's one packed copy (194.5 MB a rank for Cosmos3-Super).
+            self.greedy = gh
+            tio = token_io_for(gh, self.base_exec.resolved_tiles.bank, None)
+            self.head_tiles = pack_head_tiles(gh, tio)
         logger.info(
             "Packed %s megakernel weights (%d flat tensors) in %.2fs",
             self.display_name,
@@ -241,6 +262,10 @@ class Qwen3VLProgram:
         self.num_pages = num_pages
         self.max_pages_per_seq = view.max_pages_per_seq
         self.rope_cache = rope.cos_sin_cache
+        if self.greedy is not None:
+            self.tokens_io = token_io_for(
+                self.greedy, self.base_exec.resolved_tiles.bank, self.rope_cache
+            )
         self.attn_layer_name = self.backbone.layers[0].self_attn.attn.layer_name
         self.base_exec = mk_rt.align_cache_exec(
             self.base_exec,
@@ -318,6 +343,58 @@ class Qwen3VLProgram:
             return F.pad(out[:out_rows], (0, 0, 0, max(0, out_rows - m_rows)))
 
         return _step_impl
+
+    def build_tokens(self, bucket: Bucket) -> Any:
+        """The bucket's whole decode step: `(input_ids, positions, block_tables,
+        seq_lens, weights, pools) -> [B]` int32 greedy tokens, writing the KV
+        like `build`'s step (`None` without a foldable LM head)."""
+        if self.tokens_io is None or self.greedy is None:
+            return None
+        b = bucket.B
+        ex, use_fused, _ = mk_rt.bucket_exec_spec(
+            self.spec, self.base_exec, self.profile, bucket_t=b, tokens_per_seq=1
+        )
+        if not use_fused:
+            return None
+        ex = dataclasses.replace(ex, tokens=self.tokens_io)
+        op, _, _, _ = build_pooled_step_op(
+            self.mesh,
+            self.spec,
+            ex,
+            op_name=f"megakernel::{self.spec.name}_tokens_t1_b{b}",
+            donate_pools=True,
+        )
+        rope, folded = self.rope_cache, [self.greedy.embed, self.head_tiles]
+
+        def _step_impl(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            block_tables: torch.Tensor,
+            seq_lens: torch.Tensor,
+            weights: list[torch.Tensor],
+            pools: list[torch.Tensor],
+        ) -> torch.Tensor:
+            return execute_pooled_step_inplace(
+                op,
+                input_ids,
+                positions,
+                block_tables,
+                [rope, seq_lens],
+                [*weights, *folded],
+                pools,
+            )
+
+        return _step_impl
+
+    def check_warmup_tokens(self, tokens: torch.Tensor, bucket: Bucket) -> None:
+        """Warmup token ids are real vocabulary ids."""
+        assert self.greedy is not None
+        t = tokens[: bucket.B].cpu()
+        if not bool(((t >= 0) & (t < self.greedy.vocab)).all()):
+            raise RuntimeError(
+                f"{self.display_name} megakernel warmup: token ids {t.tolist()} "
+                f"outside [0, {self.greedy.vocab})"
+            )
 
     def check_compiled_ir(self, debug: Any, bucket: Bucket) -> None:
         """The compiled step donates and aliases every KV pool."""
@@ -424,14 +501,10 @@ class Qwen3VLProgram:
             return StepDecision(False, f"stock_t1_pad{d.num_reqs}", d.num_reqs, 1)
         return d
 
-    def forward(
-        self, decision: StepDecision | None, ctx: Any, fwd: ForwardView
-    ) -> torch.Tensor:
-        """Run the decided decode step; returns the rows the stock model would."""
+    def _run(self, decision: StepDecision | None, ctx: Any, fwd: ForwardView) -> Any:
         assert decision is not None and fwd.attn_metadata is not None
         attn_md = fwd.attn_metadata[self.attn_layer_name]
-        step_fn = fwd.steps[(1, decision.bucket_t)]
-        out = step_fn(
+        return fwd.steps[(1, decision.bucket_t)](
             ctx.input_ids,
             ctx.positions,
             attn_md.block_tables,
@@ -439,6 +512,19 @@ class Qwen3VLProgram:
             self.w_flat,
             self.raw_pools,
         )
+
+    def forward_tokens(
+        self, decision: StepDecision | None, ctx: Any, fwd: ForwardView
+    ) -> torch.Tensor:
+        """Run the decided decode step's token step; `[num_reqs]` int32."""
+        assert decision is not None
+        return self._run(decision, ctx, fwd)[: decision.num_reqs]
+
+    def forward(
+        self, decision: StepDecision | None, ctx: Any, fwd: ForwardView
+    ) -> torch.Tensor:
+        """Run the decided decode step; returns the rows the stock model would."""
+        out = self._run(decision, ctx, fwd)
         n = fwd.num_tokens if fwd.num_tokens is not None else ctx.input_ids.shape[0]
         return out[:n] if out.shape[0] >= n else F.pad(out, (0, 0, 0, n - out.shape[0]))
 

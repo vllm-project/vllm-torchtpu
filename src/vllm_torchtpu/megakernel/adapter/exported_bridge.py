@@ -56,6 +56,7 @@ from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.pool.config import cache_exec
 from vllm_torchtpu.megakernel.core.runtime import build_global_avals
 from vllm_torchtpu.megakernel.core.spec import ModelSpec
+from vllm_torchtpu.megakernel.core.token_io import token_io
 
 
 @dataclass(frozen=True)
@@ -154,8 +155,13 @@ def build_pooled_step_op(
     Returns `(op, in_specs, out_specs, donate_argnums)` where `op` takes
     `(pos, hidden, page_table, step_meta, weights, pools)`: `step_meta` is the
     flat step's arguments after the page table (`ckpt_indices`, `read_offsets`
-    for recurrent pools, then the module extra inputs).
+    for recurrent pools, then the module extra inputs). Under token step I/O
+    (`ExecSpec.tokens`) the first three are the runner's `input_ids`,
+    `positions` and `block_tables`, `step_meta` ends with its `seq_lens`, and
+    the first output is the `[B]` int32 greedy tokens instead of the hidden
+    states.
     """
+    tokens = token_io(ex) is not None
     global _OP_COUNTER
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
         mesh, spec, ex, donate_pools=donate_pools
@@ -220,7 +226,7 @@ def build_pooled_step_op(
                 for t, sh in zip(all_tensors, in_sh, strict=True)
             ]
             jax_outs = cpu_jit_fn(*jax_inputs)
-            like_tensors = [hidden, *pools]
+            like_tensors = [_first_out(hidden), *pools]
             return [
                 _jax_to_torch_cpu(o, lk)
                 for o, lk in zip(jax_outs, like_tensors, strict=True)
@@ -240,7 +246,12 @@ def build_pooled_step_op(
         weights: list[torch.Tensor],
         pools: list[torch.Tensor],
     ) -> list[torch.Tensor]:
-        return [torch.empty_like(hidden)] + [torch.empty_like(p) for p in pools]
+        return [_first_out(hidden)] + [torch.empty_like(p) for p in pools]
+
+    def _first_out(hidden: torch.Tensor) -> torch.Tensor:
+        if tokens:
+            return hidden.new_empty((ex.B,), dtype=torch.int32)
+        return torch.empty_like(hidden)
 
     return op, in_specs, out_specs, donate_argnums
 

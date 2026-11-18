@@ -19,7 +19,9 @@ a tiny geometry; the program packs the fake vLLM backbone's bf16 weights,
 binds its per-layer bf16 KV caches at their page size (128 tokens, or 512 as
 vLLM picks at 256 sequences of 262144 tokens), warms up and serves a decode
 step through the CPU-interpret kernel, and leaves a step with prompt tokens to
-the stock model.
+the stock model. A greedy step takes the whole-step kernel instead (token ids
+in, greedy token ids out), with the same KV write and the token the hidden
+step's output gives under vLLM's LM head.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import dataclasses
 import sys
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import jax
 import numpy as np
@@ -35,6 +38,8 @@ import pytest  # pyrefly: ignore[missing-import]
 import torch
 from jax.sharding import Mesh
 
+from vllm_torchtpu.megakernel.adapter import stepping
+from vllm_torchtpu.megakernel.adapter.hooks import StepContext
 from vllm_torchtpu.megakernel.adapter.testkit import check_plugin_spec, run_cpu_e2e
 from vllm_torchtpu.megakernel.core import CacheExec, ExecSpec
 
@@ -43,6 +48,15 @@ from .tiny import tiny_geom, tiny_tiles
 
 FOLDER = (__package__ or "").rpartition(".")[0]
 NUM_PAGES = 16
+
+
+VOCAB = 64
+
+
+class LogitsProcessor:
+    """vLLM's plain logits processor: `hidden @ lm_head.T`."""
+
+    scale, soft_cap, org_vocab_size = 1.0, None, VOCAB
 
 
 def _w(*shape: int) -> SimpleNamespace:
@@ -82,7 +96,7 @@ def _backbone(g: Any, page_size: int) -> SimpleNamespace:
                 ),
             )
         )
-    embed = torch.nn.Embedding(64, g.H, dtype=torch.bfloat16)
+    embed = torch.nn.Embedding(VOCAB, g.H, dtype=torch.bfloat16)
     return SimpleNamespace(embed_tokens=embed, layers=layers, norm=_w(g.H))
 
 
@@ -119,7 +133,11 @@ def tiny_runner(
     qsl = np.zeros(16, dtype=np.int32)
     qsl[:2] = [0, 1]
     return mk_fake_runner(
-        model=SimpleNamespace(model=_backbone(g, page_size)),
+        model=SimpleNamespace(
+            model=_backbone(g, page_size),
+            lm_head=SimpleNamespace(weight=_w(VOCAB, g.H).weight, bias=None),
+            logits_processor=LogitsProcessor(),
+        ),
         hf_config=SimpleNamespace(
             architectures=list(model.Qwen3VLText.hf_architectures)
         ),
@@ -151,6 +169,52 @@ def test_spec_loads_without_registering_anything() -> None:
     assert profiles.DEFAULT_PROFILE.name in profiles.PROFILES
     assert model.register() is model.Qwen3VLText
     assert model.register() is model.Qwen3VLText  # idempotent
+
+
+def _decode_step(tiny_runner: Any) -> tuple[Any, Any]:
+    ids = torch.tensor([5], dtype=torch.int32)
+    pos = torch.full((3, 1), 129 - 40, dtype=torch.int32)  # M-RoPE delta -40
+
+    def metadata(prog: Any) -> dict[str, Any]:
+        bt = torch.tensor([3, 4, 0, 0], dtype=torch.int32)
+        seq = torch.tensor([130, 0], dtype=torch.int32)
+        return {prog.attn_layer_name: SimpleNamespace(block_tables=bt, seq_lens=seq)}
+
+    return (ids, pos), metadata
+
+
+def test_serves_greedy_steps_with_the_token_step(tiny_runner: Any) -> None:
+    step, metadata = _decode_step(tiny_runner)
+    batch = tiny_runner.input_batch
+
+    def steps(prog: Any) -> Any:
+        yield step
+        batch.num_computed_tokens_cpu[0] = 99  # a 1-token final prefill chunk
+        yield step
+
+    res = run_cpu_e2e(None, tiny_runner, steps, metadata=metadata, greedy=True)
+    assert sorted(res.driver._token_steps) == [(1, 1)]
+    assert res.hits == [True, False]
+    assert res.step_mix == {"mk_t1_b1": 1, "stock_prompt": 1}
+    tok = res.outputs[0]
+    assert tok.dtype == torch.int32 and tok.shape == (1,)
+    layers = tiny_runner.model.model.layers
+    pages = [layer.self_attn.attn.kv_cache[0].clone() for layer in layers]
+
+    # The hidden step on the same decode step: the same KV, and its hidden
+    # states give the same greedy token under the LM head.
+    batch.num_computed_tokens_cpu[0] = 129
+    md = metadata(res.program)
+    with mock.patch.object(
+        stepping, "get_forward_context", lambda: SimpleNamespace(attn_metadata=md)
+    ):
+        hit, hid = res.driver.try_forward(tiny_runner, StepContext(*step))
+    assert hit
+    for layer, page in zip(layers, pages, strict=True):
+        assert torch.equal(layer.self_attn.attn.kv_cache[0], page)
+    head = tiny_runner.model.lm_head.weight.float()
+    logits = (hid[:1].float() @ head.T).to(torch.bfloat16).float()
+    assert int(tok[0]) == int(torch.argmax(logits[0]))
 
 
 def test_serves_decode_and_leaves_prompt_steps_to_stock(tiny_runner: Any) -> None:

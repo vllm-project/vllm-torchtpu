@@ -290,6 +290,7 @@ class ProgramDriver(StepRouting):
         self._backbone = backbone
         self._buckets: list[Bucket] = []
         self._steps: dict[tuple[int, int], StepFn] = {}
+        self._token_steps: dict[tuple[int, int], StepFn] = {}
         self._bound = False
         self._warmup_done = False
         self._pending: tuple[Any, ForwardView, StepContext] | None = None
@@ -415,7 +416,7 @@ class ProgramDriver(StepRouting):
 
     # --- bind, bind agreement, warmup -------------------------------------
 
-    def _compile(self, step: StepFn, bucket: Bucket) -> StepFn:
+    def _compile(self, step: StepFn, bucket: Bucket, kind: str = "step") -> StepFn:
         if not isinstance(step, types.FunctionType):
             inner = step
 
@@ -425,7 +426,7 @@ class ProgramDriver(StepRouting):
         # Give each bucket its own code object: nested closures share `__code__`,
         # and Dynamo caches compiled graphs per code object, so all buckets
         # would otherwise compete for one entry's `cache_size_limit`.
-        name = f"step_t{bucket.T}_b{bucket.B}"
+        name = f"{kind}_t{bucket.T}_b{bucket.B}"
         co = step.__code__.replace(co_name=name, co_qualname=name)
         fn = types.FunctionType(
             co, step.__globals__, name, step.__defaults__, step.__closure__
@@ -456,8 +457,15 @@ class ProgramDriver(StepRouting):
             for b in self.program.buckets(pads)
         ]
         self._steps.clear()
+        self._token_steps.clear()
+        build_tokens = getattr(self.program, "build_tokens", None)
         for b in buckets:
             self._steps[b.key] = self._compile(self.program.build(b), b)
+            tok = build_tokens(b) if callable(build_tokens) else None
+            if tok is not None:
+                self._token_steps[b.key] = self._compile(tok, b, "tokens")
+        if len(self._token_steps) != len(self._steps):
+            self._token_steps.clear()  # all buckets or none: routing is per step
         self._buckets = buckets
         self._bound = True
         self._warmup_done = False
@@ -560,17 +568,28 @@ class ProgramDriver(StepRouting):
                     if case is None:
                         continue
                     out = self._steps[b.key](*case.args)
-                    if is_tpu:
-                        from vllm_torchtpu.utils import synchronize_tensors
-
-                        leaves = out if isinstance(out, (tuple, list)) else (out,)
-                        if tensors := [
-                            t for t in leaves if isinstance(t, torch.Tensor)
-                        ]:
-                            synchronize_tensors(tensors)
+                    self._sync(out, is_tpu)
                     if case.check is not None:
                         case.check(out)
+                    # The token step takes the same arguments (and rewrites
+                    # the same KV slot).
+                    if b.key in self._token_steps:
+                        tok = self._token_steps[b.key](*case.args)
+                        self._sync(tok, is_tpu)
+                        check_tok = getattr(self.program, "check_warmup_tokens", None)
+                        if callable(check_tok):
+                            check_tok(tok, b)
         self.reset_stats()
+
+    @staticmethod
+    def _sync(out: Any, is_tpu: bool) -> None:
+        if not is_tpu:
+            return
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        leaves = out if isinstance(out, (tuple, list)) else (out,)
+        if tensors := [t for t in leaves if isinstance(t, torch.Tensor)]:
+            synchronize_tensors(tensors)
 
     def reset_stats(self) -> None:
         """Reset step-mix counters and A/B latency accumulators."""

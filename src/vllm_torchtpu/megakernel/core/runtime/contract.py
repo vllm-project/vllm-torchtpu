@@ -218,7 +218,12 @@ class MonoProgram(Protocol):
     `warmup_session()` (a context manager around warmup),
     `check_compiled_ir(debug, bucket)`, `attach_draft(drafter)` /
     `detach_draft()`, `on_warmup_done()` (called once per bind, after the
-    worker finishes its whole warmup).
+    worker finishes its whole warmup), and the token step: `build_tokens(
+    bucket)` returns the bucket's whole-step `StepFn` (the same arguments as
+    `build`'s, `[B]` int32 greedy token ids out, the same KV writes) or `None`,
+    `forward_tokens(decision, ctx, fwd)` runs it (`fwd.steps` are the token
+    steps) for the runner's greedy steps (`try_greedy_tokens`), and
+    `check_warmup_tokens(tokens, bucket)` checks its warmup output.
     `decide` may return `None` for a step it doesn't see (no metadata): stock,
     not counted in the step mix.
     """
