@@ -991,12 +991,17 @@ def _real_request(request_id: str, token_ids):
 def _run_turn(mgr, ret, request_id: str, prompt, decode_tokens: int):
     """Prefill ``prompt`` in block-aligned chunks, as the scheduler splits an
     align-mode prompt, decode, then free the request the way the scheduler
-    does. With a retention, its hooks run where the scheduler calls them
+    does. Each allocation is its own step, opened with ``new_step_starts`` as
+    ``Scheduler.schedule`` opens every step: vLLM's MambaManager and the TPU
+    same-step prefix-hit patch (installed process-wide once a test activates
+    the platform) both hide blocks cached in the current step until the next
+    one starts. With a retention, its hooks run where the scheduler calls them
     (``pin_running`` once the first decode step released the boundary state,
     ``on_request_freed`` after the free). Returns the boundary state block."""
     req = _real_request(request_id, prompt)
     boundary = (len(prompt) // _REAL_BS) * _REAL_BS
     for chunk in (boundary, len(prompt) - boundary):
+        mgr.new_step_starts()
         assert mgr.allocate_slots(req, chunk) is not None
         req.num_computed_tokens += chunk
     mamba_blocks = mgr.coordinator.single_type_managers[1].req_to_blocks[request_id]
@@ -1004,6 +1009,7 @@ def _run_turn(mgr, ret, request_id: str, prompt, decode_tokens: int):
     assert state.block_hash is not None
     for i in range(decode_tokens):
         req.append_output_token_ids(5000 + i)
+        mgr.new_step_starts()
         assert mgr.allocate_slots(req, 1) is not None
         req.num_computed_tokens += 1
         if i == 0 and ret is not None:
@@ -1037,6 +1043,7 @@ def _evict_one_and_look_up(mgr, prompt):
     position, victim = _first_cached_free_block(pool)
     pool.free_blocks(pool.get_new_blocks(position + 1))
     nxt = _real_request("next", prompt + list(range(7000, 7020)))
+    mgr.new_step_starts()
     return victim, nxt, mgr.get_computed_blocks(nxt)
 
 
