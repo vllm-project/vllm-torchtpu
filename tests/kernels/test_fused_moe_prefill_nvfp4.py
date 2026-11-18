@@ -2605,6 +2605,9 @@ def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
         sys.modules, "vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4", adapter
     )
     spec.loader.exec_module(adapter)
+    # The adapter imports the prefill kernel on first use; import it here, under
+    # the stubs, so the cleanup below covers it too.
+    adapter._prefill_kernel()
     # Modules first imported while the stubs above are installed (e.g.
     # vllm_torchtpu.utils) keep references to the fake torch after monkeypatch
     # restores sys.modules; re-register them so teardown removes them and later
@@ -2722,14 +2725,14 @@ def test_adapter_flag_off_unchanged_and_flag_on_admission(
     # 1. Flag OFF (default): prefill_above is None and prefill admission is not called.
     monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", raising=False)
     probe_calls: list[int] = []
-    orig_reason = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason
+    orig_reason = adapter._prefill_kernel().fused_moe_prefill_nvfp4_unsupported_reason
 
     def spy_reason(*a: Any, **kw: Any) -> str | None:
         probe_calls.append(1)
         return orig_reason(*a, **kw)
 
     monkeypatch.setattr(
-        adapter.prefill_nvfp4,
+        adapter._prefill_kernel(),
         "fused_moe_prefill_nvfp4_unsupported_reason",
         spy_reason,
     )
@@ -2752,7 +2755,7 @@ def test_adapter_flag_off_unchanged_and_flag_on_admission(
     # 3. Flag ON when prefill admission refuses: decode still arms cleanly,
     #    prefill_above falls back to None, and warning_once logs the refusal.
     monkeypatch.setattr(
-        adapter.prefill_nvfp4,
+        adapter._prefill_kernel(),
         "fused_moe_prefill_nvfp4_unsupported_reason",
         lambda *_a, **_k: "synthetic test refusal",
     )
@@ -2794,14 +2797,16 @@ def test_adapter_precheck_probes_the_proposed_weights(
     layer.w2_weight = rt.torch.Tensor((el, h, i // 2), dtype=rt.torch.uint8)
 
     probed: list[tuple[Any, Any]] = []
-    orig_reason = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason
+    orig_reason = adapter._prefill_kernel().fused_moe_prefill_nvfp4_unsupported_reason
 
     def spy_reason(x: Any, w13: Any, w2: Any, *rest: Any, **kw: Any) -> str | None:
         probed.append((w13.dtype, w2.dtype))
         return orig_reason(x, w13, w2, *rest, **kw)
 
     monkeypatch.setattr(
-        adapter.prefill_nvfp4, "fused_moe_prefill_nvfp4_unsupported_reason", spy_reason
+        adapter._prefill_kernel(),
+        "fused_moe_prefill_nvfp4_unsupported_reason",
+        spy_reason,
     )
     adm = adapter._admit(runner, N_RANKS, proposed_routed=proposed)
     assert not isinstance(adm, str), adm
@@ -2813,7 +2818,7 @@ def test_adapter_precheck_probes_the_proposed_weights(
     # Control: a prefill refusal still warns, naming the probed (proposed)
     # weights rather than the layer's checkpoint tensors.
     monkeypatch.setattr(
-        adapter.prefill_nvfp4,
+        adapter._prefill_kernel(),
         "fused_moe_prefill_nvfp4_unsupported_reason",
         lambda *_a, **_k: "synthetic test refusal",
     )
@@ -2920,7 +2925,7 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
         decode_calls.append(int(x_in.shape[0]))
         return jnp.full_like(x_in, 7.0)
 
-    orig_prefill_stage_a = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_stage_a
+    orig_prefill_stage_a = adapter._prefill_kernel().fused_moe_prefill_nvfp4_stage_a
     orig_tp_chain = rt.fp8_decode._tp_chain
 
     def spy_prefill(*a: Any, **kw: Any):
@@ -2933,7 +2938,7 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
 
     monkeypatch.setattr(adapter.kernel, "moe_tp_decode_nvfp4", fake_decode_kernel)
     monkeypatch.setattr(
-        adapter.prefill_nvfp4, "fused_moe_prefill_nvfp4_stage_a", spy_prefill
+        adapter._prefill_kernel(), "fused_moe_prefill_nvfp4_stage_a", spy_prefill
     )
     monkeypatch.setattr(rt.fp8_decode, "_tp_chain", spy_tp_chain)
 
@@ -3239,14 +3244,14 @@ def test_adapter_prefill_act_mode_admission(
     runner = _make_stub_runner(rt, cfg)
 
     probed_modes: list[str] = []
-    orig_reason = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason
+    orig_reason = adapter._prefill_kernel().fused_moe_prefill_nvfp4_unsupported_reason
 
     def spy_reason(*a: Any, **kw: Any) -> str | None:
         probed_modes.append(kw.get("act_mode", "w4a16"))
         return orig_reason(*a, **kw)
 
     monkeypatch.setattr(
-        adapter.prefill_nvfp4,
+        adapter._prefill_kernel(),
         "fused_moe_prefill_nvfp4_unsupported_reason",
         spy_reason,
     )
@@ -3315,7 +3320,7 @@ def test_adapter_op_body_w4a8_min_tokens_512_dispatch_small_shapes(
 
     prefill_calls: list[tuple[int, str]] = []
     tp_chain_calls: list[int] = []
-    orig_prefill_stage_a = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_stage_a
+    orig_prefill_stage_a = adapter._prefill_kernel().fused_moe_prefill_nvfp4_stage_a
     orig_tp_chain = rt.fp8_decode._tp_chain
 
     def spy_prefill(*a: Any, **kw: Any):
@@ -3327,7 +3332,7 @@ def test_adapter_op_body_w4a8_min_tokens_512_dispatch_small_shapes(
         return orig_tp_chain(*a, **kw)
 
     monkeypatch.setattr(
-        adapter.prefill_nvfp4, "fused_moe_prefill_nvfp4_stage_a", spy_prefill
+        adapter._prefill_kernel(), "fused_moe_prefill_nvfp4_stage_a", spy_prefill
     )
     monkeypatch.setattr(rt.fp8_decode, "_tp_chain", spy_tp_chain)
 

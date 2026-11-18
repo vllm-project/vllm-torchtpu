@@ -24,27 +24,30 @@ linear expert placement) and plain TP MoE (``tp_size == n_ranks``).
 """
 
 import dataclasses
-from typing import Any, cast
+import types
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import jax.numpy as jnp
 import torch
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.experimental import (
-    fused_moe_prefill_nvfp4 as prefill_nvfp4,
-)
 from vllm_torchtpu.kernels.experimental import moe_tp_decode_nvfp4 as kernel
 from vllm_torchtpu.layers.adapter import moe_tp_decode as fp8_decode
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import align_to
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.kernels.experimental import (
+        fused_moe_prefill_nvfp4 as prefill_nvfp4,
+    )
 
 logger = init_logger(__name__)
 
 _ENV_FLAG = "USE_MOE_TP_DECODE_NVFP4_KERNEL"
 _OP_ATTR = "_moe_tp_decode_nvfp4_op"
 _PREFILL_PROBE_ROWS = 128
-_PREFILL_MIN_TOKENS: dict[prefill_nvfp4.ActMode, int] = {
+_PREFILL_MIN_TOKENS: dict["prefill_nvfp4.ActMode", int] = {
     "w4a16": 2048,
     "w4a8": 512,
 }
@@ -61,9 +64,18 @@ _BUFFERS = (
 _OPS: dict[tuple, Any] = {}
 
 
+def _prefill_kernel() -> types.ModuleType:
+    """The NVFP4 prefill kernel package, imported on first use: only
+    FUSED_MOE_PREFILL_NVFP4_KERNEL=1 admission and the prefill buckets it
+    admits reach it."""
+    from vllm_torchtpu.kernels.experimental import fused_moe_prefill_nvfp4
+
+    return fused_moe_prefill_nvfp4
+
+
 @dataclasses.dataclass(frozen=True)
 class _OpStatics(fp8_decode._OpStatics):
-    prefill_act_mode: prefill_nvfp4.ActMode = "w4a16"
+    prefill_act_mode: "prefill_nvfp4.ActMode" = "w4a16"
     split_meta: bool = True
     w2_n_chunk: int = 2048
 
@@ -169,9 +181,9 @@ def _admit(
         prefill_act_mode: prefill_nvfp4.ActMode = "w4a16"
         if envs.FUSED_MOE_PREFILL_NVFP4_KERNEL:
             cand_act_mode = cast(
-                prefill_nvfp4.ActMode, envs.FUSED_MOE_PREFILL_NVFP4_ACT_MODE
+                "prefill_nvfp4.ActMode", envs.FUSED_MOE_PREFILL_NVFP4_ACT_MODE
             )
-            reason = prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason(
+            reason = _prefill_kernel().fused_moe_prefill_nvfp4_unsupported_reason(
                 jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, hidden), jnp.bfloat16),
                 fp8_decode._sds(w13_probe),
                 fp8_decode._sds(w2_probe),
@@ -286,7 +298,7 @@ def _prefill_chain(
         x.shape[0],
     )
     w, ids = fp8_decode._route(x, scores, bias, is_pad, st)
-    return prefill_nvfp4.fused_moe_prefill_nvfp4_stage_a(
+    return _prefill_kernel().fused_moe_prefill_nvfp4_stage_a(
         x,
         w13,
         w2,
@@ -330,7 +342,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         prequant,
     ):
         del prequant
-        if not prefill_nvfp4.can_use_fused_moe_prefill_nvfp4(
+        if not _prefill_kernel().can_use_fused_moe_prefill_nvfp4(
             x,
             w13,
             w2,
