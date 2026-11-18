@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
-from vllm_torchtpu.spec_decode.dspark import DSparkProposer
+from vllm_torchtpu.spec_decode.dspark import DraftMarkovArgmax, DSparkProposer
 
 
 class _FakeHFConfig:
@@ -339,3 +339,102 @@ def test_draft_aux_is_dropped_without_the_confidence_head():
         torch.ones(8, 4), 0, SimpleNamespace(start_index=0, num_reqs=8)
     )
     assert p.take_draft_confidences() is None
+
+
+class _ShardedFakeDraft(DraftMarkovArgmax, _FakeDraft):
+    """_FakeDraft with a token-dependent Markov bias that supplies its own
+    Markov argmax, simulating two ranks of half the vocab each."""
+
+    def __init__(self, enable=True, vocab=16):
+        super().__init__(vocab)
+        self.enable = enable
+        self.gathered_calls = 0
+
+    def compute_draft_logits(self, hidden):
+        self.gathered_calls += 1
+        return self._logits(hidden)
+
+    def _logits(self, hidden):
+        rows = hidden[:, 0]
+        return torch.cos(rows[:, None] * torch.arange(self.vocab)).round(decimals=1)
+
+    def markov_bias(self, markov_embed):
+        self.gathered_calls += 1
+        return self._bias(markov_embed)
+
+    def _bias(self, markov_embed):
+        return torch.sin(markov_embed * torch.arange(self.vocab)).round(decimals=1)
+
+    def enable_markov_argmax(self):
+        return self.enable
+
+    def markov_logits(self, hidden):
+        return self._logits(hidden)
+
+    def markov_argmax(self, logits, markov_embed):
+        # Each simulated rank reduces its half to (max, global id); the first
+        # rank with the largest max wins, as torch.argmax over the full row.
+        scores = logits + self._bias(markov_embed)
+        half = self.vocab // 2
+        maxes, ids = [], []
+        for r in range(2):
+            local_max, local_idx = scores[:, r * half : (r + 1) * half].max(dim=-1)
+            maxes.append(local_max)
+            ids.append(local_idx + r * half)
+        best = torch.stack(maxes, dim=-1).argmax(dim=-1, keepdim=True)
+        return torch.stack(ids, dim=-1).gather(-1, best).squeeze(-1)
+
+
+class _DefaultArgmaxDraft(DraftMarkovArgmax, _FakeDraft):
+    """Opts in but keeps the mixin's default methods."""
+
+    def enable_markov_argmax(self):
+        return True
+
+
+def _draft_with(monkeypatch, draft):
+    p = _make_proposer(
+        {"dspark_noise_token_id": 7, **_LAYER_IDS}, num_speculative_tokens=4
+    )
+    monkeypatch.setattr(
+        DFlashProposer,
+        "load_model",
+        lambda self, target_model: setattr(self, "draft_model", draft),
+    )
+    p.load_model(None)
+    return p
+
+
+_IDS = torch.tensor([5, 7, 7, 7, 9, 7, 7, 7, 3, 7, 7, 7])
+_POSITIONS = torch.zeros(12, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("enable", [True, False])
+def test_draft_markov_argmax_is_opt_in_and_exact(monkeypatch, enable):
+    forward = DSparkProposer._dflash_forward_and_sample.__wrapped__
+
+    reference = _draft_with(monkeypatch, _FakeDraft())
+    reference.draft_model = _ShardedFakeDraft(enable=False)
+    expected, _ = forward(reference, _IDS, _POSITIONS, 4)
+
+    draft = _ShardedFakeDraft(enable=enable)
+    p = _draft_with(monkeypatch, draft)
+    assert p._draft_markov_argmax is enable
+    drafts, _ = forward(p, _IDS, _POSITIONS, 4)
+    assert drafts.tolist() == expected.tolist()
+    # The drafter's path never calls compute_draft_logits or markov_bias.
+    assert (draft.gathered_calls == 0) is enable
+
+
+def test_default_markov_argmax_matches_the_proposer_path(monkeypatch):
+    forward = DSparkProposer._dflash_forward_and_sample.__wrapped__
+    expected, _ = forward(_draft_with(monkeypatch, _FakeDraft()), _IDS, _POSITIONS, 4)
+    p = _draft_with(monkeypatch, _DefaultArgmaxDraft())
+    assert p._draft_markov_argmax is True
+    drafts, _ = forward(p, _IDS, _POSITIONS, 4)
+    assert drafts.tolist() == expected.tolist()
+
+
+def test_drafts_without_the_mixin_keep_the_proposer_path(monkeypatch):
+    p = _draft_with(monkeypatch, _FakeDraft())
+    assert p._draft_markov_argmax is False
