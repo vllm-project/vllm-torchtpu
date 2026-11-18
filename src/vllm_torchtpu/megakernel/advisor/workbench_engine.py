@@ -66,6 +66,9 @@ def build_engine_seed_defaults() -> dict[str, object]:
                             mk.get("attention_dp_in_call", False)
                         ),
                         "moe_layout": str(mk.get("moe_layout", "")),
+                        "expert_owner_groups": int(
+                            str(mk.get("expert_owner_groups", 0))
+                        ),
                         "source": str(mk.get("source", "")),
                     }
                 )
@@ -95,6 +98,15 @@ def build_engine_seed_defaults() -> dict[str, object]:
         "compiled_xla_gap_p90_us": constants.COMPILED_XLA_GAP_P90_US,
         "unfused_eager_gap_us": constants.UNFUSED_EAGER_GAP_US,
         "default_launch_gap_upper_us": constants.DEFAULT_LAUNCH_GAP_UPPER_US,
+        "min_efficiency_floor": constants.MIN_EFFICIENCY_FLOOR,
+        "boundary_sync_hop_factor": constants.BOUNDARY_SYNC_HOP_FACTOR,
+        "per_op_mixer_kernels_per_layer": constants.PER_OP_MIXER_KERNELS_PER_LAYER,
+        "per_op_base_ffn_kernels_per_layer": (
+            constants.PER_OP_BASE_FFN_KERNELS_PER_LAYER
+        ),
+        "per_op_shared_expert_kernels_per_layer": (
+            constants.PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER
+        ),
         "workload_defaults": {
             "batch": wl_default.batch,
             "isl": wl_default.isl,
