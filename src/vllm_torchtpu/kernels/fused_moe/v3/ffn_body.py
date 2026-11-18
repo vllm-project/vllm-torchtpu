@@ -47,9 +47,6 @@ class Build:
     num_shards: int
     experts_per_shard: int
     form: object
-    has_w1_bias: bool
-    has_w2_bias: bool
-    no_gate: bool
     activation: str
     weight_slots: int
     weight_prefetch: int
@@ -145,15 +142,11 @@ def resident_copy(ctx, src, dst):
 
 
 def resident_copies(ctx):
-    """The prologue's resident tables: every expert's scales and biases."""
+    """The prologue's resident tables: every expert's scales."""
     b = ctx.b
     if b.form.has_scales:
         resident_copy(ctx, ctx.operands.w1_scales, ctx.scratch.w1_scales)
         resident_copy(ctx, ctx.operands.w2_scales, ctx.scratch.w2_scales)
-    if b.has_w1_bias:
-        resident_copy(ctx, ctx.operands.w1_bias, ctx.scratch.w1_bias)
-    if b.has_w2_bias:
-        resident_copy(ctx, ctx.operands.w2_bias, ctx.scratch.w2_bias)
 
 
 # ---- the row streams ----
@@ -316,13 +309,10 @@ def drain_commits(ctx, carry):
 
 
 # ---- the arithmetic of one tile ----
-def up_scales_and_bias(ctx, expert):
-    """(w1_scales, w1_bias) of the expert: [1, cols] each, None where
-    absent."""
+def up_scales(ctx, expert):
+    """The expert's w1_scales: [1, cols], None for bf16 weights."""
     b, scratch = ctx.b, ctx.scratch
-    scales = scratch.w1_scales[pl.ds(expert, 1), :] if b.form.has_scales else None
-    bias = scratch.w1_bias[pl.ds(expert, 1), :] if b.has_w1_bias else None
-    return scales, bias
+    return scratch.w1_scales[pl.ds(expert, 1), :] if b.form.has_scales else None
 
 
 def down_product(ctx, expert, weight_slot, rows, row_scales):
@@ -330,7 +320,7 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
     down matmul's accumulator and, for the whole-row rounding, the
     intermediate row scales not yet applied."""
     b, scratch = ctx.b, ctx.scratch
-    w1_scales, w1_bias = up_scales_and_bias(ctx, expert)
+    w1_scales = up_scales(ctx, expert)
     if not b.form.has_scales:
         return ffn.expert_ffn_bf16(
             rows,
@@ -338,8 +328,6 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
             scratch.w1[weight_slot],
             scratch.w2[weight_slot],
             activation=b.activation,
-            w1_bias=w1_bias,
-            no_gate=b.no_gate,
             block=b.activation_block,
             elementwise=b.elementwise,
             columns_per_pass=b.activation_columns_per_pass,
@@ -352,8 +340,6 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
         scratch.w2[weight_slot],
         w1_scales,
         activation=b.activation,
-        w1_bias=w1_bias,
-        no_gate=b.no_gate,
         block=b.activation_block,
         elementwise=b.elementwise,
         columns_per_pass=b.activation_columns_per_pass,
@@ -363,15 +349,13 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
 
 def finish_rows(ctx, expert, acc2, mid_scales):
     """The down accumulator as result rows: the expert's down scales (fp8
-    weights) and bias applied, then the rows quantized."""
+    weights) applied, then the rows quantized."""
     b, scratch = ctx.b, ctx.scratch
     w2_scales = scratch.w2_scales[pl.ds(expert, 1), :] if b.form.has_scales else None
-    w2_bias = scratch.w2_bias[pl.ds(expert, 1), :] if b.has_w2_bias else None
     return ffn.result_rows(
         acc2,
         mid_scales,
         w2_scales=w2_scales,
-        w2_bias=w2_bias,
         dtype=b.result_dtype,
         elementwise=b.elementwise,
     )

@@ -129,7 +129,7 @@ class Config:
         differ by an fp8 step on a few of the values, and is the faster
         form. "float32" rounds each product once, so every
         compilation, the eager reference and the Mosaic kernels agree to
-        the bit. The scales, bias and activation run on the float32
+        the bit. The scales and activation run on the float32
         accumulators either way.
       combine_dtype: the element type of the weighted sum over a token's
         selected experts at the end of the layer: "float32", or "bfloat16"

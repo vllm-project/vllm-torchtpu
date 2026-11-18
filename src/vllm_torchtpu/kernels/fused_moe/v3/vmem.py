@@ -47,9 +47,6 @@ def scratch_arrays(
     weight_slots=WEIGHT_SLOTS_DEFAULT,
     result_slots=RESULT_SLOTS_DEFAULT,
     weight_format=WeightFormat.FP8,
-    has_w1_bias=False,
-    has_w2_bias=False,
-    no_gate=False,
     activation_block=0,
     result_dtype=FP8,
     token_block=None,
@@ -68,7 +65,7 @@ def scratch_arrays(
     8-row transport offset needs.
     """
     form = weight_form(weight_format)
-    w1_cols = inter if no_gate else 2 * inter
+    w1_cols = 2 * inter
     lane_blocks = row_lane_blocks(hidden)
     result_blocks = result_lane_blocks(hidden)
     tile_blocks = tile_rows // ROW_BLOCK
@@ -83,15 +80,9 @@ def scratch_arrays(
             ("w1_scales_vmem", (experts_per_shard, w1_cols), jnp.float32),
             ("w2_scales_vmem", (experts_per_shard, hidden), jnp.float32),
         ]
-    biases = []
-    if has_w1_bias:
-        biases.append(("w1_bias_vmem", (experts_per_shard, w1_cols), jnp.float32))
-    if has_w2_bias:
-        biases.append(("w2_bias_vmem", (experts_per_shard, hidden), jnp.float32))
     return [
         ("rows_vmem", (result_slots, tile_rows, lane_blocks, LANES), FP8),
         *weights,
-        *biases,
         (
             "row_scales_vmem",
             (result_slots, scale_planes, scale_window_rows(tile_rows), LANES),
@@ -116,7 +107,6 @@ def tile_body_arrays(
     inter,
     *,
     weight_format=WeightFormat.FP8,
-    no_gate=False,
 ):
     """One tile body's live values besides the scratch, as (name, shape,
     dtype): the first accumulator, the bf16 intermediate column slices,
@@ -124,7 +114,7 @@ def tile_body_arrays(
     their fp8 form. Counted as though all were live at once, so the
     estimate is an upper bound."""
     form = weight_form(weight_format)
-    w1_cols = inter if no_gate else 2 * inter
+    w1_cols = 2 * inter
     arrays: list[tuple[str, tuple[int, ...], Any]] = [
         ("acc1", (tile_rows, w1_cols), jnp.float32),
         ("mid_column_slices", (tile_rows, inter), jnp.bfloat16),
@@ -153,9 +143,6 @@ def estimate_bytes(
     weight_slots=WEIGHT_SLOTS_DEFAULT,
     result_slots=RESULT_SLOTS_DEFAULT,
     weight_format=WeightFormat.FP8,
-    has_w1_bias=False,
-    has_w2_bias=False,
-    no_gate=False,
     activation_block=0,
     result_dtype=FP8,
     token_block=None,
@@ -172,14 +159,9 @@ def estimate_bytes(
         weight_slots=weight_slots,
         result_slots=result_slots,
         weight_format=weight_format,
-        has_w1_bias=has_w1_bias,
-        has_w2_bias=has_w2_bias,
-        no_gate=no_gate,
         activation_block=activation_block,
         result_dtype=result_dtype,
         token_block=token_block,
     )
-    arrays += tile_body_arrays(
-        tile_rows, hidden, inter, weight_format=weight_format, no_gate=no_gate
-    )
+    arrays += tile_body_arrays(tile_rows, hidden, inter, weight_format=weight_format)
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
