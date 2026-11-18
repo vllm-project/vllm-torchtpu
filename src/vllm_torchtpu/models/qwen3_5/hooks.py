@@ -28,10 +28,11 @@ Qwen3.5-397B-A17B on TPU7x, in the roles and layouts of the validation
 entries (``validation/``). Every other engine keeps main's behaviour.
 
 - ``kv_cache_memory_bytes``: a calibrated budget on a decode
-  (``kv_consumer``) leg at TP8 or DP4 x TP2 with expert parallelism and no
-  pipeline or prefill context parallelism (the entries' decode legs). Every
-  other engine, main's nightly TP1 x DP8 configs among them, stays on
-  ``gpu_memory_utilization``.
+  (``kv_consumer``) leg at TP8 + DCP4 with expert parallelism and no pipeline
+  or prefill context parallelism (the entries' TP8 decode legs). Every other
+  engine stays on ``gpu_memory_utilization``, among them the DP4 x TP2 decode
+  layout (its entry passes ``--kv-cache-memory-bytes``) and main's nightly
+  TP1 x DP8 configs.
 - ``prefix_match_unit``: 128 tokens on a prefill (``kv_producer``) leg
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
@@ -63,9 +64,14 @@ _QWEN35_SAFE_KV_SLOTS = 80
 # text config) on TPU7x devices.
 _CALIBRATED_SHAPE = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
 _CALIBRATED_CHIP = pltpu.ChipVersion.TPU_7X.value
-# The decode layouts (tensor parallel, data parallel size) the KV budget was
-# measured on, both with expert parallelism over their 8 ranks.
-_CALIBRATED_DECODE_LAYOUTS = frozenset({(8, 1), (2, 4)})
+# The decode layouts (tensor, data, decode context parallel size) whose legs
+# ran on the KV budget, with expert parallelism over their 8 ranks: the
+# validation entries' TP8 + DCP4 decode legs.
+_CALIBRATED_DECODE_LAYOUTS = frozenset({(8, 1, 4)})
+# The budget at 80 expert slots per rank (64 primary + 16 replicated slots),
+# reserving about 2.5 GiB of HBM for runtime activations and program-load
+# scratch buffers.
+_CALIBRATED_KV_BYTES = 33_500_000_000
 
 
 def _chip_family() -> str | None:
@@ -141,7 +147,7 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
 
 def _is_measured_kv_layout(vllm_config: VllmConfig) -> bool:
     """Whether the engine's role and layout are those the KV budget was
-    measured on: a decode (kv_consumer) leg at TP8 or DP4 x TP2 with expert
+    measured on: a decode (kv_consumer) leg at TP8 + DCP4 with expert
     parallelism and no pipeline or prefill context parallelism. There the
     expert-slot credit counts each rank's slots and layers exactly; PP splits
     the layers across stages and vLLM folds PCP into the EP size."""
@@ -150,6 +156,7 @@ def _is_measured_kv_layout(vllm_config: VllmConfig) -> bool:
     layout = (
         parallel_config.tensor_parallel_size,
         parallel_config.data_parallel_size,
+        parallel_config.decode_context_parallel_size,
     )
     return (
         kv_cfg is not None
@@ -171,37 +178,29 @@ def _apply_kv_budget(vllm_config: VllmConfig, calibrated: bool) -> None:
         logger.info(
             "Qwen3.5 kv_cache_memory_bytes left to gpu_memory_utilization: the "
             "calibrated budget was measured for Qwen3.5-397B-A17B decode "
-            "(kv_consumer) legs on TPU7x at TP8 or DP4 x TP2 with expert "
+            "(kv_consumer) legs on TPU7x at TP8 + DCP4 with expert "
             "parallelism and no PP or PCP (this engine: calibrated checkpoint "
-            "and device=%s, kv_role=%s, tp=%d, dp=%d, expert_parallel=%s, "
-            "pp=%d, pcp=%d).",
+            "and device=%s, kv_role=%s, tp=%d, dp=%d, dcp=%d, "
+            "expert_parallel=%s, pp=%d, pcp=%d).",
             calibrated,
             None if kv_cfg is None else kv_cfg.kv_role,
             parallel_config.tensor_parallel_size,
             parallel_config.data_parallel_size,
+            parallel_config.decode_context_parallel_size,
             parallel_config.enable_expert_parallel,
             parallel_config.pipeline_parallel_size,
             parallel_config.prefill_context_parallel_size,
         )
         return
-    scheduler_config = vllm_config.scheduler_config
-    dcp_size = parallel_config.decode_context_parallel_size
-    # Calibrated for 80 expert slots per rank (64 primary + 16 replicated slots)
-    # while reserving ~2.5 GiB of HBM headroom for runtime activations
-    # and program-load scratch buffers under DCP=1 and DCP>1.
-    if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
-        safe_kv = 32_500_000_000
-    else:
-        safe_kv = 33_500_000_000
     credit, slots = _expert_slot_kv_credit(vllm_config.model_config, parallel_config)
-    safe_kv += credit
+    safe_kv = _CALIBRATED_KV_BYTES + credit
     logger.info(
         "Qwen3.5-397B kv_cache_memory_bytes set to auto: %d (slots=%d, dcp=%d, "
         "seqs=%d).",
         safe_kv,
         slots,
-        dcp_size,
-        scheduler_config.max_num_seqs,
+        parallel_config.decode_context_parallel_size,
+        vllm_config.scheduler_config.max_num_seqs,
     )
     cache_config.kv_cache_memory_bytes = safe_kv
 
