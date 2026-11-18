@@ -51,7 +51,10 @@ import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    register_weight_loader_v2_supported_method,
+)
 from vllm.model_executor.layers.quantization import (
     QuantizationMethods,
     register_quantization_config,
@@ -116,6 +119,9 @@ def _normalize_layer_spec(entry: dict[str, Any]) -> LayerSpec:
     return algo, group_size
 
 
+# vLLM picks a layer's weight loader by the method's class name, so a
+# subclass must register again or fused layers lose per-shard scale loading.
+@register_weight_loader_v2_supported_method
 class _ModelOptFp8LinearMethodTPU(VllmFp8LinearMethodTPU):
     """FP8 linear method that frees the checkpoint's unused static input scale.
 

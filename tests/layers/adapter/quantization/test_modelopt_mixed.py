@@ -24,7 +24,7 @@ import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import WEIGHT_LOADER_V2_SUPPORTED, LinearBase
 from vllm.model_executor.layers.quantization import get_quantization_config
 
 from vllm_torchtpu.layers.adapter import linear_common
@@ -70,6 +70,8 @@ def _quant_config(extra_layers: dict | None = None) -> dict:
     quantized_layers = {
         f"{LAYER}.linear_attn.in_proj_qkv": {"quant_algo": "FP8"},
         f"{LAYER}.linear_attn.in_proj_z": {"quant_algo": "FP8"},
+        f"{LAYER}.linear_attn.in_proj_b": {"quant_algo": "FP8"},
+        f"{LAYER}.linear_attn.in_proj_a": {"quant_algo": "FP8"},
         f"{LAYER}.linear_attn.out_proj": {"quant_algo": "FP8"},
         f"{LAYER}.self_attn.q_proj": {"quant_algo": "FP8"},
         f"{LAYER}.self_attn.k_proj": {"quant_algo": "FP8"},
@@ -233,6 +235,7 @@ class TestDispatch:
             f"{LAYER}.linear_attn.out_proj",
             # Fused layers: every checkpoint shard is FP8.
             f"{LAYER}.linear_attn.in_proj_qkvz",
+            f"{LAYER}.linear_attn.in_proj_ba",
             f"{LAYER}.self_attn.qkv_proj",
         ],
     )
@@ -240,6 +243,9 @@ class TestDispatch:
         cfg = _make_config()
         method = cfg.get_quant_method(_linear(), prefix)
         assert isinstance(method, VllmFp8LinearMethodTPU)
+        # Fused layers load per-shard scales only through weight_loader_v2,
+        # which vLLM enables by the method's class name.
+        assert type(method).__name__ in WEIGHT_LOADER_V2_SUPPORTED
         assert method.prefix == prefix
         assert method.act_q_static
         assert not method.block_quant
