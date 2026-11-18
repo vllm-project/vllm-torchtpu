@@ -30,8 +30,10 @@ Each leg (`prefill`, `decode`) lists:
 - `serve_args`: the `vllm serve` arguments the record run's leg used.
   `$MODEL` and `$SERVED_MODEL` are the model path and served name.
 - `env`: the environment the leg set, limited to variables this package
-  declares in `envs.py`. Per-pod wiring (ports, hosts, engine ids, cache
-  directories) is deployment-specific and not recorded.
+  declares in `envs.py`. `$EXPERT_PLACEMENT_TABLE` is the path of the
+  decode leg's expert placement table, which `not_yet_supported` describes.
+  Per-pod wiring (ports, hosts, engine ids, cache directories) is
+  deployment-specific and not recorded.
 - `additional_config`: the `--additional-config` JSON for the leg. The
   `qwen3_5` section holds Qwen3.5 settings (`settings.py`); other sections
   belong to shared subsystems.
@@ -47,9 +49,11 @@ rules or `additional_config` options change by change, and each change that
 turns one that the points use into a setting or section updates the entries.
 A value that this tree cannot run yet is kept as the record run used it and
 listed under `not_yet_supported`, per leg, with the capability it needs; the
-change that adds the capability removes it from that list. Everything else
-in an entry runs on the tree it is in, and the entry tests check that this
-tree's `envs.py` accepts every other environment value.
+change that adds the capability removes it from that list. The entry tests
+check that this tree's `envs.py` accepts every other environment value. A leg
+run here without the listed values uses fused EP MoE v2 and main's
+permutation placement, so the `record` numbers are not expected to
+reproduce on this tree.
 
 ## Reading a gate entry
 
