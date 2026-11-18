@@ -463,3 +463,14 @@ def test_a_permutation_layer_gets_no_primary_count(tmp_path, monkeypatch):
     runner = _runner(rank=0, local=4)
     assert ep.apply(runner)
     assert not hasattr(runner.routed_experts, ep.PRIMARY_EXPERTS_ATTR)
+
+
+def test_a_placed_layers_map_is_built_on_the_host(tmp_path, monkeypatch):
+    """vLLM computes the maps under the model's device; the copy-slot map is
+    built on the host and then moved to the device vLLM's map is on."""
+    _use(tmp_path, monkeypatch, _copies())
+    manager = _manager(rank=1)
+    with torch.device("meta"):
+        ep._size_copy_slots(manager, LAYER)
+    assert manager._expert_map.device.type == "cpu"
+    assert manager._expert_map.tolist() == [-1, 0, -1, 2, 3, -1, 1, 4]
