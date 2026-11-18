@@ -80,6 +80,10 @@ GLM52_EP2TP4 = dict(h=6144, e=256, i=512, i_s=256, topk=8, qb1=512, bk2=512, ep=
 GLM52_EP2TP4_B256 = dict(h=6144, e=256, i=512, i_s=256, topk=8, qb1=512, bk2=256, ep=2)
 GLM52_TP8 = dict(h=6144, e=256, i=256, i_s=256, topk=8, qb1=512, bk2=256, ep=1)
 GLM52_EP8 = dict(h=6144, e=256, i=2048, i_s=256, topk=8, qb1=512, bk2=512, ep=8)
+# GLM-5.2 per-rank shapes with 16 experts (8 local under EP2): small enough to run
+# on TPU in CI, but with 12 w13 K-blocks and 3 production-width w2 N-chunks.
+PROD16_EP2TP4 = dict(GLM52_EP2TP4, e=16)
+PROD16_TP8 = dict(GLM52_TP8, e=16)
 
 
 def _tpu7x():
@@ -2136,6 +2140,91 @@ def test_tpu_hardware_correctness(
     assert _rel_l2(got, ora) <= 0.025
     assert _rel_l2(got, ref) <= (0.05 if act_mode == "w4a16" else 0.08)
     assert _cos_sim(got, ref) >= 0.998
+
+
+@pytest.mark.tpu_test
+@pytest.mark.multichip
+@pytest.mark.parametrize("cfg", [PROD16_EP2TP4, PROD16_TP8])
+@pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
+def test_tpu_hardware_correctness_production_shapes(
+    cfg: dict[str, int], act_mode: mod.ActMode
+):
+    """The kernel on TPU at GLM-5.2 per-rank shapes and T=4096, with the
+    Stage-A defaults the adapter runs: 12 w13 K-blocks, w2 in production-width
+    N-chunks, the 256-row tile, above both adapter cutoffs. Positive control: a
+    wrong block scale in w13 K-block 5, or in w2's last N-chunk, must break the
+    bound (so the bound can fail, and the b > 0 / chunk > 0 paths are live)."""
+    mesh = _require_tpu_mesh()
+    tokens = 4096
+    h = cfg["h"]
+    n_chunk = mod.STAGE_A_NVFP4["w2_n_chunk"]
+    assert h // cfg["qb1"] == 12
+    assert h // n_chunk >= 2 and h % n_chunk == 0
+    assert tokens >= mod.STAGE_A_NVFP4["tile_min"]  # the 256-row tile
+    rep = NamedSharding(mesh, P())
+    w1, w2, s1, s2, sw1, ss1, sw2, ss2, e0 = _build_small_sharded_weights(
+        mesh, cfg, seed=191
+    )
+    x_np, tw_np, ids_np = _make_inputs(
+        tokens, cfg, mode="uniform", seed=192, pad_tokens=8, poison_pad_nan=True
+    )
+    x = jax.device_put(jnp.asarray(x_np, dtype=BF16), rep)
+    tw = jax.device_put(jnp.asarray(tw_np, dtype=BF16), rep)
+    tids = jax.device_put(jnp.asarray(ids_np, dtype=jnp.int32), rep)
+    stage_a = dict(nb=mod.STAGE_A_NVFP4["nb"], w2_n_chunk=n_chunk)
+
+    def run(s1_: jax.Array, s2_: jax.Array) -> jax.Array:
+        return _run_kernel(
+            mesh,
+            cfg,
+            x,
+            w1,
+            w2,
+            s1_,
+            s2_,
+            sw1,
+            ss1,
+            sw2,
+            ss2,
+            None,
+            tw,
+            tids,
+            e0,
+            act_mode=act_mode,
+            **stage_a,
+        )
+
+    got = run(s1, s2)
+    ora, ref = _run_oracles(
+        mesh,
+        cfg,
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        sw1,
+        ss1,
+        sw2,
+        ss2,
+        None,
+        tw,
+        tids,
+        e0,
+        act_mode=act_mode,
+    )
+    assert np.isfinite(np.asarray(got)).all()
+    assert _rel_l2(got, ora) <= 0.025
+    assert _rel_l2(got, ref) <= (0.05 if act_mode == "w4a16" else 0.08)
+    assert _cos_sim(got, ref) >= 0.998
+
+    s1_bad = s1.at[:, 5].multiply(2.0)
+    s2_bad = s2.at[..., h - n_chunk :].multiply(2.0)
+    for name, bad in (
+        ("w13 K-block 5", run(s1_bad, s2)),
+        ("w2 last N-chunk", run(s1, s2_bad)),
+    ):
+        assert _rel_l2(bad, ora) > 0.025, f"a wrong {name} scale stays within the bound"
 
 
 # ==============================================================================
