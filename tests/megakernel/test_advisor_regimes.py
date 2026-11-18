@@ -122,6 +122,7 @@ def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
                 decode=dataclasses.replace(preset.decode, megakernel=None),
                 prefill=dataclasses.replace(preset.prefill, megakernel=None),
                 saturation=stripped_sat,
+                megakernel_layouts=(),
             ),
         )
 
@@ -752,11 +753,10 @@ def test_measurements_narrow_scope_band_and_settle_verdict(tmp_path: Path) -> No
     assert prior.fastest_verdict.startswith("tie(measure: ")
     row = advisor.advise("qwen3.5-397b", cliff_wl, "tpu7x", measurements=m_file)
     assert row.metrics["launch_gap_us"]["tag"] == "MEASURED"
-    assert row.metrics["collective_latency_us"]["tag"] == "MEASURED"
-    # Decode has no attention dtype band, so a degenerate box gives a zero-width band.
-    rec_scope = next(s for s in row.scopes if s.scope == row.fastest_scope)
-    assert rec_scope.step_upper_us == rec_scope.step_bound_us
-    assert not row.fastest_verdict.startswith("tie")
+    assert row.metrics["collective_call_us_xla"]["tag"] == "MEASURED"
+    lg_band = row.metrics["launch_gap_us"]["band"]
+    assert lg_band[0] == lg_band[1]
+    assert row.fastest_verdict != "tie(measure: launch_gap_us)"
 
 
 def test_single_layer_is_fused_layer_not_megakernel() -> None:
@@ -1209,18 +1209,27 @@ def test_measured_collective_latency_moves_step_bound() -> None:
     """Measured collective latency must reach the all-reduce base latency term."""
     workload = advisor.WorkloadSpec(phase="decode", batch=8, isl=128, osl=1, tp=8, ep=1)
     rep_default = advisor.advise("qwen3.5-397b", workload, chip="tpu7x")
+    tp_group_size = 8
+    ar_latency_us = 25.0
+    ar_calls = 10
     meas = advisor.MeasurementsData(
         source_desc="test_trace",
-        collective_hop_us=3.0,
-        collective_n=10,
+        collective_calls=(
+            advisor.CollectiveCall(
+                path="xla",
+                op="all-reduce",
+                group_size=tp_group_size,
+                latency_us=ar_latency_us,
+                n=ar_calls,
+            ),
+        ),
     )
     rep_calibrated = advisor.advise(
         "qwen3.5-397b", workload, chip="tpu7x", measurements=meas
     )
-    assert (
-        rep_calibrated.metrics["step_floor_us"]["value"]
-        > rep_default.metrics["step_floor_us"]["value"]
-    )
+    cal_per_op = next(s for s in rep_calibrated.scopes if s.scope == "per_op")
+    def_per_op = next(s for s in rep_default.scopes if s.scope == "per_op")
+    assert cal_per_op.step_bound_us > def_per_op.step_bound_us
 
 
 def test_custom_chip_spec_vmem_usable_bytes_preserved(tmp_path: Path) -> None:
@@ -1716,3 +1725,212 @@ def test_recommend_parallelism_multi_axis_dcp() -> None:
     )
     rec_kv2 = advisor.recommend_parallelism(kv2_profile, "tpu7x", dcp=0)
     assert rec_kv2.dcp >= 1
+
+
+def test_measured_collective_applies_only_at_its_group_size() -> None:
+    """Verify collective measurement is ignored when group size mismatches eff_tp."""
+    workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=4, ep=1)
+    baseline_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=None
+    )
+    measurements_payload = {
+        "schema": advisor.constants.MEASUREMENTS_SCHEMA,
+        "source": {"kind": "trace", "file": "trace.json"},
+        "collectives": [
+            {
+                "op": "all-reduce",
+                "path": "xla",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": 20.0,
+                "n": 10,
+            }
+        ],
+    }
+    calibrated_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=measurements_payload
+    )
+    baseline_per_op = next(s for s in baseline_report.scopes if s.scope == "per_op")
+    calibrated_per_op = next(s for s in calibrated_report.scopes if s.scope == "per_op")
+
+    tolerance_abs = 0.05
+    assert calibrated_per_op.comm_us == pytest.approx(
+        baseline_per_op.comm_us, abs=tolerance_abs
+    )
+    assert calibrated_per_op.step_bound_us == pytest.approx(
+        baseline_per_op.step_bound_us, abs=tolerance_abs
+    )
+    assert calibrated_report.metrics["collective_call_us_xla"]["tag"] == "ASSUMED"
+
+
+def test_measured_collective_is_charged_at_its_value() -> None:
+    """Verify measured all-reduce replaces transfer and overhead without eta_ici."""
+    workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=1)
+    baseline_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=None
+    )
+    measured_latency_us = 15.0
+    measurements_payload = {
+        "schema": advisor.constants.MEASUREMENTS_SCHEMA,
+        "source": {"kind": "trace", "file": "trace.json"},
+        "collectives": [
+            {
+                "op": "all-reduce",
+                "path": "xla",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": measured_latency_us,
+                "n": 10,
+            }
+        ],
+    }
+    calibrated_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=measurements_payload
+    )
+    baseline_per_op = next(s for s in baseline_report.scopes if s.scope == "per_op")
+    calibrated_per_op = next(s for s in calibrated_report.scopes if s.scope == "per_op")
+
+    model_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    num_all_reduce_calls = model_profile.ar_slots_per_layer * model_profile.num_layers
+    expected_comm_us = num_all_reduce_calls * measured_latency_us
+    assert calibrated_per_op.comm_us == pytest.approx(expected_comm_us, abs=0.02)
+
+    eta_ici = workload.efficiency.eta_ici
+    expected_step_achievable_us = (
+        baseline_per_op.step_achievable_us
+        - baseline_per_op.comm_us / eta_ici
+        + expected_comm_us
+    )
+    assert calibrated_per_op.step_achievable_us == pytest.approx(
+        expected_step_achievable_us, abs=0.05
+    )
+
+
+def test_measured_collective_charges_the_mean_per_call() -> None:
+    """Verify mean per-call collective latency is charged when available."""
+    workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=1)
+    model_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    num_all_reduce_calls = model_profile.ar_slots_per_layer * model_profile.num_layers
+
+    median_latency_us = 10.0
+    mean_latency_us = 14.0
+    sample_count = 5
+    measurements_with_mean = {
+        "schema": advisor.constants.MEASUREMENTS_SCHEMA,
+        "source": {"kind": "trace", "file": "trace.json"},
+        "collectives": [
+            {
+                "op": "all-reduce",
+                "path": "xla",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": median_latency_us,
+                "mean_latency_us": mean_latency_us,
+                "n": sample_count,
+            }
+        ],
+    }
+    report_with_mean = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=measurements_with_mean
+    )
+    per_op_with_mean = next(s for s in report_with_mean.scopes if s.scope == "per_op")
+    assert per_op_with_mean.comm_us == pytest.approx(
+        num_all_reduce_calls * mean_latency_us, abs=0.02
+    )
+
+    measurements_without_mean = {
+        "schema": advisor.constants.MEASUREMENTS_SCHEMA,
+        "source": {"kind": "trace", "file": "trace.json"},
+        "collectives": [
+            {
+                "op": "all-reduce",
+                "path": "xla",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": median_latency_us,
+                "n": sample_count,
+            }
+        ],
+    }
+    report_without_mean = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=measurements_without_mean
+    )
+    per_op_without_mean = next(
+        s for s in report_without_mean.scopes if s.scope == "per_op"
+    )
+    assert per_op_without_mean.comm_us == pytest.approx(
+        num_all_reduce_calls * median_latency_us, abs=0.02
+    )
+
+
+def test_xla_measurement_does_not_price_a_fused_scope() -> None:
+    """Verify XLA path collective measurements do not price whole_step fused scope."""
+    workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=1)
+    baseline_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=None
+    )
+    measurements_payload = {
+        "schema": advisor.constants.MEASUREMENTS_SCHEMA,
+        "source": {"kind": "trace", "file": "trace.json"},
+        "collectives": [
+            {
+                "op": "all-reduce",
+                "path": "xla",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": 20.0,
+                "n": 10,
+            }
+        ],
+    }
+    calibrated_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=measurements_payload
+    )
+    baseline_whole_step = next(
+        s for s in baseline_report.scopes if s.scope == "whole_step"
+    )
+    calibrated_whole_step = next(
+        s for s in calibrated_report.scopes if s.scope == "whole_step"
+    )
+
+    assert calibrated_whole_step.step_bound_us == baseline_whole_step.step_bound_us
+    assert (
+        calibrated_whole_step.step_achievable_us
+        == baseline_whole_step.step_achievable_us
+    )
+    assert calibrated_whole_step.step_upper_us == baseline_whole_step.step_upper_us
+    assert calibrated_whole_step.comm_us == baseline_whole_step.comm_us
+
+
+def test_prior_file_collectives_do_not_change_prices() -> None:
+    """Verify architectural_prior sources do not override roofline collective prices."""
+    workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=1)
+    baseline_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=None
+    )
+    prior_measurements = {
+        "schema": advisor.constants.MEASUREMENTS_SCHEMA,
+        "source": {"kind": "architectural_prior", "file": "priors.json"},
+        "collectives": [
+            {
+                "op": "all-reduce",
+                "group_size": 8,
+                "bytes": 32768,
+                "latency_us": 50.0,
+                "n": 100,
+            }
+        ],
+    }
+    prior_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=prior_measurements
+    )
+
+    baseline_scopes = {s.scope: s for s in baseline_report.scopes}
+    prior_scopes = {s.scope: s for s in prior_report.scopes}
+
+    for scope_name, baseline_scope in baseline_scopes.items():
+        prior_scope = prior_scopes[scope_name]
+        assert prior_scope.step_bound_us == baseline_scope.step_bound_us
+        assert prior_scope.step_achievable_us == baseline_scope.step_achievable_us
+        assert prior_scope.step_upper_us == baseline_scope.step_upper_us
+        assert prior_scope.comm_us == baseline_scope.comm_us
