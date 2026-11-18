@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_COOP_V2: bool = True
     TPU_SC_TOPK_COOP_MERGE: bool = True
     TPU_DCP_INDEXER_SMALL_AG: bool = True
+    TPU_DCP_INDEXER_A2A_SMALL_COLL: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
@@ -209,6 +210,7 @@ if TYPE_CHECKING:
     TPU_MLA_DECODE_PROLOGUE: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
+    TPU_INDEXER_OVERLAP_QB_ABSORB: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
@@ -961,6 +963,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # would otherwise idle on the top-k's call-done. Same kernel, same inputs:
     # bit-identical q. Needs the fp8 Pallas q_b site (TPU_FP8_LINEAR_PALLAS).
     "TPU_INDEXER_QB_OVERLAP": env_bool("TPU_INDEXER_QB_OVERLAP", default=False),
+    # Run both the MLA q_b projection (prequantized from TPU_FUSED_NORM_QKVA,
+    # fp8_skinny, or xla_quantized_matmul) and the W_UK query absorption
+    # (`absorb_q`) inside the DCP indexer op, pinned under the local SparseCore
+    # top-k and the cross-rank SparseCore merge / compaction calls respectively
+    # on decode buckets. Hands the pre-absorbed `ql_nope` straight to MLA
+    # attention so `_absorb_q` is skipped after the indexer wait. Bit-identical.
+    "TPU_INDEXER_OVERLAP_QB_ABSORB": env_bool(
+        "TPU_INDEXER_OVERLAP_QB_ABSORB", default=False
+    ),
     # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
     # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
     # latent cache from 640 to 576 B/token. SparseCore layouts only; the
@@ -1623,6 +1634,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 13-17 us per idx layer. Needs TPU_DCP_RANK_OPERAND (the kernel's peer
     # addresses take the rank and lane as data). Same bytes, same result.
     "TPU_DCP_INDEXER_SMALL_AG": env_bool("TPU_DCP_INDEXER_SMALL_AG", default=True),
+    # On eligible DCP indexer buckets taking `a2a_merge`
+    # (`supports_indexer_score_all_to_all`), replace XLA's candidate
+    # `all_to_all` and slot `all_gather` with Pallas remote-DMA small
+    # collectives (`small_indexer_score_all_to_all` + `small_all_gather`) over
+    # flat 1-D HBM buffers, eliminating XLA's multi-stage collective schedule
+    # and 2-D sublane relayouts. Bit-identical.
+    "TPU_DCP_INDEXER_A2A_SMALL_COLL": env_bool(
+        "TPU_DCP_INDEXER_A2A_SMALL_COLL", default=False
+    ),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
     # skip_topk layers read, instead of the fresh rows. One expression lets XLA
