@@ -1422,3 +1422,128 @@ def test_engine_parity_row_limit_gate(
     assert "row_limit_not_stated" not in rec_ws_64["blockers"]
 
     _verify_parity_records(batch_items, expected, records)
+
+
+def test_js_engine_parity_composition_busiest_groups_and_per_op_boundaries(
+    tmp_path: Path,
+) -> None:
+    """Verify JS parity on collective composition, owner groups, and boundaries."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+
+    seed_defaults = workbench_engine.build_engine_seed_defaults()
+    assert (
+        seed_defaults["per_op_mixer_kernels_per_layer"]
+        == constants.PER_OP_MIXER_KERNELS_PER_LAYER
+    )
+    core_limits_seed = seed_defaults["core_limits"]
+    assert isinstance(core_limits_seed, dict)
+    declared_map = core_limits_seed["declared_megakernels"]
+    assert isinstance(declared_map, dict)
+    kimi_entries = declared_map["kimi-k3"]
+    assert isinstance(kimi_entries, list)
+    kimi_preset = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    assert kimi_preset.decode is not None
+    assert kimi_preset.decode.megakernel is not None
+    expected_owner_groups = int(
+        str(kimi_preset.decode.megakernel["expert_owner_groups"])
+    )
+    assert all(
+        entry["expert_owner_groups"] == expected_owner_groups for entry in kimi_entries
+    )
+
+    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
+    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    chip_dict = dataclasses.asdict(chip_spec)
+    qwen_workload = advisor.WorkloadSpec(
+        phase="verify",
+        spec_tokens=3,
+        batch=1,
+        context=16384,
+        osl=1,
+        tp=8,
+        ep=8,
+    )
+    scenarios = [
+        (
+            "kimi-k3",
+            advisor.WorkloadSpec(
+                phase="decode",
+                batch=4,
+                context=32768,
+                osl=1,
+                tp=32,
+                ep=32,
+                dcp=32,
+            ),
+        ),
+        ("qwen3.5-397b", qwen_workload),
+    ]
+    batch_items: list[_BatchScenarioItem] = []
+    js_items: list[dict[str, object]] = []
+    expected: list[dict[str, object]] = []
+    for model_name, wl in scenarios:
+        prof_dict = dataclasses.asdict(models.resolve_model_profile(model_name))
+        batch_items.append({"only_validate": False, "model_name": model_name, "wl": wl})
+        expected.append(_python_reference_eval(model_name, wl, chip_spec))
+        js_items.append(
+            {
+                "params": {
+                    "only_validate": False,
+                    "profile": prof_dict,
+                    "chip": chip_dict,
+                    "wl": dataclasses.asdict(wl),
+                }
+            }
+        )
+
+    in_json = tmp_path / "owner_group_parity_in.json"
+    out_json = tmp_path / "owner_group_parity_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": {
+                    "chip_spec": chip_dict,
+                    **seed_defaults,
+                },
+                "items": js_items,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
+    records = json.loads(out_json.read_text(encoding="utf-8"))
+    _verify_parity_records(batch_items, expected, records)
+
+    records_by_model = {
+        model_name: rec["eval"]
+        for (model_name, _), rec in zip(scenarios, records, strict=True)
+    }
+    qwen_profile = models.resolve_model_profile("qwen3.5-397b")
+    qwen_eff = qwen_workload.efficiency
+    extra_per_op_boundaries = (
+        constants.PER_OP_MIXER_KERNELS_PER_LAYER
+        + constants.PER_OP_BASE_FFN_KERNELS_PER_LAYER
+        + constants.PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER
+        - constants.SUBLAYER_BOUNDARIES_PER_LAYER
+    ) * qwen_profile.num_layers
+    per_boundary_ach_us = (
+        (constants.DENSE_SLOT_DEFAULT_BYTES / chip_spec.hbm_bw_bytes_per_s)
+        / qwen_eff.eta_hbm
+        + (constants.BOUNDARY_SYNC_HOP_FACTOR * chip_spec.collective_latency_s)
+        / qwen_eff.eta_ici
+    ) * 1e6
+    qwen_per_op = records_by_model["qwen3.5-397b"]["scopes"]["per_op"]
+    qwen_whole_step = records_by_model["qwen3.5-397b"]["scopes"]["whole_step"]
+    assert (
+        qwen_per_op["step_achievable_us"] - qwen_per_op["step_bound_us"]
+        >= extra_per_op_boundaries * per_boundary_ach_us
+    )
+    assert qwen_whole_step["step_achievable_us"] >= (
+        qwen_whole_step["hbm_us"] / qwen_eff.eta_hbm
+        + qwen_whole_step["comm_us"] / qwen_eff.eta_ici
+    )
