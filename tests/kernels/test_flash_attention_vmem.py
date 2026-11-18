@@ -67,9 +67,12 @@ def test_tuned_entries_use_valid_blocks() -> None:
 def test_tuning_table_has_requested_vision_grids() -> None:
     kimi_seq_lens = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 67328)
     qwen_seq_lens = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)
-    expected = {(12, 128, seq_len) for seq_len in kimi_seq_lens} | {
-        (16, 80, seq_len) for seq_len in qwen_seq_lens
-    }
+    cosmos3_seq_lens = (4096, 8192, 16384, 32768)
+    expected = (
+        {(12, 128, seq_len) for seq_len in kimi_seq_lens}
+        | {(16, 80, seq_len) for seq_len in qwen_seq_lens}
+        | {(2, 72, seq_len) for seq_len in cosmos3_seq_lens}
+    )
     actual = {
         (key.num_heads, key.head_dim, key.q_seq_len) for key in tuned_params_mapping
     }

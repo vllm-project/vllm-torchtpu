@@ -99,6 +99,16 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     _vision_tuning_key(num_heads=12, seq_len=67_328, head_dim=128): TunableParams(
         8_192, 256, 256, 1
     ),
+    # Cosmos3-Super (Qwen3-VL tower) at TP=8: the packed encoder buckets.
+    # Tiled kv blocks let the kernel skip pairs whose segments cannot match;
+    # two images and 31% padding in 32768 rows take 3.21 ms vs 4.25 for the
+    # whole-kv default (a row of one image, 5.49 vs 4.28).
+    **{
+        _vision_tuning_key(num_heads=2, seq_len=seq_len, head_dim=72): TunableParams(
+            2_048, 4_096, 512, 1
+        )
+        for seq_len in (4_096, 8_192, 16_384, 32_768)
+    },
     # Qwen2.5-VL.
     _vision_tuning_key(num_heads=16, seq_len=256, head_dim=80): TunableParams(
         256, 256, 256, 1
