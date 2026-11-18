@@ -99,7 +99,6 @@ from vllm.v1.kv_offload.base import (
     Medium,
     OffloadingEvent,
     OffloadingManager,
-    OffloadingMetricMetadata,
     OffloadingSpec,
     OffloadingWorker,
     OffloadKey,
@@ -120,20 +119,10 @@ from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
     resolve_block_major_contract,
 )
-from vllm_torchtpu.offload.metrics import (
-    HOST_OFFLOAD_LABELS,
-    P2P_OFFLOAD_LABELS,
-    RaidenOffloadStatsCollector,
-    SubBlockSourceCounts,
-    build_raiden_offload_metric_definitions,
-    disk_offload_labels,
-)
+from vllm_torchtpu.offload.metrics import SubBlockSourceCounts
 
 if TYPE_CHECKING:
     import torch
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
-        OffloadingConnectorStats,
-    )
 
 logger = init_logger(__name__)
 
@@ -375,8 +364,6 @@ class RaidenOffloadingManager(OffloadingManager):
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
         dp_rank: int = 0,
-        # Labels the storage tier in metrics (None: DRAM-only).
-        storage_backend: str | None = None,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -529,15 +516,6 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
-        self._metrics = RaidenOffloadStatsCollector(storage_backend=storage_backend)
-
-    def record_admission_hits(
-        self,
-        tokens_by_source: Mapping[CacheHitSource, int],
-        *,
-        preempted: bool = False,
-    ) -> None:
-        self._metrics.record_admission_hits(tokens_by_source, preempted=preempted)
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -972,9 +950,6 @@ class RaidenOffloadingManager(OffloadingManager):
         # read_remote. Drop the leftovers each step; a request retried
         # next step re-runs lookup() and repopulates the stash.
         self._remote_slices.clear()
-
-    def get_stats(self) -> OffloadingConnectorStats | None:
-        return self._metrics.pop_stats()
 
     def reset_cache(self) -> None:
         # Backstop only: TPURaidenOffloadingConnector.reset_cache() reports
@@ -2233,13 +2208,6 @@ def _ensure_writable_dir(path: str) -> None:
         )
 
 
-def _storage_type(extra_config: Mapping[str, Any]) -> str:
-    return (
-        _storage_setting(extra_config, _STORAGE_TYPE_KEY, envs.RAIDEN_STORAGE_TYPE)
-        or _POSIX_STORAGE_TYPE
-    ).lower()
-
-
 def resolve_storage_config(
     extra_config: Mapping[str, Any],
     *,
@@ -2265,7 +2233,10 @@ def resolve_storage_config(
     )
     if not root_dir:
         return None
-    storage_type = _storage_type(extra_config)
+    storage_type = (
+        _storage_setting(extra_config, _STORAGE_TYPE_KEY, envs.RAIDEN_STORAGE_TYPE)
+        or _POSIX_STORAGE_TYPE
+    ).lower()
     if storage_type != _POSIX_STORAGE_TYPE:
         raise ValueError(
             f"TPURaidenOffloadingConnector: storage type {storage_type!r} "
@@ -2330,23 +2301,6 @@ def resolve_storage_config(
         capacity_bytes=capacity_bytes,
         properties=tuple(sorted(properties.items())),
     )
-
-
-def configured_tier_labels(
-    extra_config: Mapping[str, Any],
-) -> tuple[tuple[str, str], ...]:
-    """`(source, backend)` metric labels of the offload tiers the config enables.
-
-    Host DRAM is always on, peers need `global_registry_address`, and storage
-    needs a storage path. Runs none of `resolve_storage_config`'s checks, so
-    the API server can call it.
-    """
-    labels = [HOST_OFFLOAD_LABELS]
-    if str(extra_config.get("global_registry_address", "")):
-        labels.append(P2P_OFFLOAD_LABELS)
-    if _storage_setting(extra_config, _STORAGE_PATH_KEY, envs.RAIDEN_STORAGE_PATH):
-        labels.append(disk_offload_labels(_storage_type(extra_config)))
-    return tuple(labels)
 
 
 @dataclass(frozen=True)
@@ -2496,12 +2450,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
     and KV cache configurations, compute hardware block capacities, and configure
     distributed registry settings.
     """
-
-    @classmethod
-    def build_metric_definitions(
-        cls, extra_config: dict[str, Any]
-    ) -> dict[str, OffloadingMetricMetadata]:
-        return build_raiden_offload_metric_definitions()
 
     def __init__(
         self,
@@ -2761,7 +2709,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
                 dp_rank=self.dp_rank,
-                storage_backend=storage.storage_type if storage is not None else None,
             )
         return self._manager
 

@@ -11,67 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Observability metrics and collectors for Raiden KV cache offloading.
+"""Per-tier hit-source attribution helpers for Raiden KV cache offloading.
 
-In vLLM V1, the scheduler (`EngineCore`) and Prometheus `/metrics` endpoint
-(`API Server`) run in separate processes, and Raiden executes all HBM <->
-Host/Peer/Storage transfers from the scheduler-side `KVCacheStore` controller
-(worker-side `get_finished()` is always empty):
-
-- `compute_load_tokens_by_source` runs in `EngineCore`, computing deduplicated
-  token counts per tier for one offload hit.
-- `RaidenOffloadStatsCollector` runs in `EngineCore`, counting hit tokens per
-  tier and draining per-step deltas as `OffloadingConnectorStats` via
-  `pop_stats()`.
-- `RaidenOffloadPromMetrics` runs in the API server process, registering
-  Raiden's `OffloadingSpec` metric definitions and applying IPC stats deltas to
-  Prometheus counters and histograms.
+`compute_load_tokens_by_source` and `split_external_hit` run in `EngineCore`
+to split each external prefix-cache hit across `host`, `p2p`, and `disk` for
+vLLM's `vllm:prompt_tokens_cached_by_source` counter.
 """
 
 from __future__ import annotations
 
-import copy
-import enum
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping
 
-from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
-    PromMetric,
-    PromMetricT,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
-    OffloadingConnectorStats,
-    OffloadPromMetrics,
-)
-from vllm.v1.kv_offload.base import (
-    OffloadingCounterMetadata,
-    OffloadingMetricMetadata,
-    OffloadingSpec,
-    OffloadKey,
-    get_offload_group_idx,
-)
+from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-# `source` labels where data is read from, aligned with
-# upstream `vllm:prompt_tokens_cached_by_source` for PromQL rollups. `backend`
-# names what serves the tier: `dram` for host, `rdma` for p2p, and the
-# configured storage type for disk, so a new storage backend adds label values
-# rather than metrics.
-SOURCE_LABELNAMES: tuple[str, str] = ("source", "backend")
-UNKNOWN_BACKEND_LABEL = "unknown"
-HOST_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.HOST.value, "dram")
-P2P_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.P2P.value, "rdma")
-
-
-def disk_offload_labels(storage_backend: str) -> tuple[str, str]:
-    """Labels of the storage tier, for example `("disk", "posix")`."""
-    return (CacheHitSource.DISK.value, storage_backend)
 
 
 # Tier of each sub-block of one `OffloadKey`, as `(source, count)` runs of
@@ -80,82 +37,6 @@ def disk_offload_labels(storage_backend: str) -> tuple[str, str]:
 # `((HOST, 3), (DISK, 1))` means sub-blocks 0-2 are in host DRAM and 3 is on
 # disk, and a key entirely in host DRAM is `((HOST, 4),)`.
 SubBlockSourceCounts = tuple[tuple[CacheHitSource, int], ...]
-
-
-class RaidenOffloadMetricName(enum.StrEnum):
-    """Prometheus metrics emitted by Raiden KV offload."""
-
-    HIT_TOKENS = "vllm:kv_offload_raiden_hit_tokens"
-
-
-def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
-    """Return Prometheus metric definitions for TPURaidenStoreOffloadingSpec."""
-    return {
-        RaidenOffloadMetricName.HIT_TOKENS: OffloadingCounterMetadata(
-            documentation=(
-                "Number of prompt tokens matched in external KV offload tiers, "
-                "labeled by source and backend. Counted at scheduler admission, "
-                "for each load that prepare_load accepted. Unlike "
-                "vllm:prompt_tokens_cached_by_source, splits disk hits by storage "
-                "backend and leaves out hits whose load was not accepted."
-            ),
-            labelnames=SOURCE_LABELNAMES,
-        ),
-    }
-
-
-class RaidenOffloadPromMetrics(OffloadPromMetrics):
-    """Prometheus metrics binder for TPURaidenOffloadingConnector.
-
-    `TPURaidenOffloadingConnector` instantiates `TPURaidenStoreOffloadingSpec`
-    directly (bypassing `OffloadingSpecFactory`), whereas upstream
-    `OffloadPromMetrics.__init__` in the API server process resolves
-    `spec_cls.build_metric_definitions` via `OffloadingSpecFactory` using
-    `kv_connector_extra_config["spec_name"]`. This subclass names `spec_cls` as
-    an out-of-tree spec (`spec_name` + `spec_module_path`) on shallow config
-    copies, so neither the factory registry nor the caller's `VllmConfig` and
-    `KVTransferConfig` are mutated.
-
-    `configured_tier_labels` holds the `(source, backend)` labels of the tiers
-    the deployment enables. Each engine's `vllm:kv_offload_raiden_hit_tokens` series
-    for these tiers are created at 0 on startup. Prometheus counts a series
-    from the first value it scrapes, so `rate()` and `increase()` would miss
-    the first hit of a series that only appeared with that hit.
-    """
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        metric_types: dict[type[PromMetric], type[PromMetricT]],
-        labelnames: list[str],
-        per_engine_labelvalues: dict[int, list[object]],
-        *,
-        spec_cls: type[OffloadingSpec],
-        configured_tier_labels: Collection[tuple[str, str]],
-    ):
-        kv_transfer_config = vllm_config.kv_transfer_config
-        assert kv_transfer_config is not None
-        scoped_transfer_config = copy.copy(kv_transfer_config)
-        scoped_transfer_config.kv_connector_extra_config = {
-            **kv_transfer_config.kv_connector_extra_config,
-            "spec_name": spec_cls.__name__,
-            "spec_module_path": spec_cls.__module__,
-        }
-        scoped_vllm_config = copy.copy(vllm_config)
-        scoped_vllm_config.kv_transfer_config = scoped_transfer_config
-        super().__init__(
-            scoped_vllm_config,
-            metric_types,
-            labelnames,
-            per_engine_labelvalues,
-        )
-        zero_hits = OffloadingConnectorStats()
-        for labelvalues in configured_tier_labels:
-            zero_hits.increase_counter(
-                RaidenOffloadMetricName.HIT_TOKENS, 0, labelvalues=labelvalues
-            )
-        for engine_idx in per_engine_labelvalues:
-            self.observe(zero_hits.data, engine_idx)
 
 
 def external_sources_with_tokens(
@@ -297,74 +178,3 @@ def compute_load_tokens_by_source(
         active[source] += delta
         position = boundary
     return external_sources_with_tokens(sources)
-
-
-class RaidenOffloadStatsCollector:
-    """Scheduler-side collector producing `OffloadingConnectorStats` deltas."""
-
-    def __init__(self, *, storage_backend: str | None = None):
-        self._storage_backend = storage_backend
-        self._stats = OffloadingConnectorStats()
-
-    def source_labels(self, source: CacheHitSource) -> tuple[str, str]:
-        """Map an external `CacheHitSource` to `(source, backend)` labels.
-
-        For example, `HOST` maps to `("host", "dram")`, `P2P` to
-        `("p2p", "rdma")`, and `DISK` to `("disk", "posix")` with a POSIX
-        storage tier.
-
-        Assumes one storage backend per engine: Raiden's `SHARED_STORAGE`
-        status does not say which backend holds a block. If an engine read from
-        two storage backends, hits from both would get the `storage_backend`
-        label until Raiden reports the backend per block.
-        """
-        # Reject raw `str` before `==` checks since `CacheHitSource` is a `str`.
-        if not isinstance(source, CacheHitSource):
-            raise ValueError(f"Unsupported offload source for metrics: {source!r}")
-        if source == CacheHitSource.HOST:
-            return HOST_OFFLOAD_LABELS
-        if source == CacheHitSource.P2P:
-            return P2P_OFFLOAD_LABELS
-        if source == CacheHitSource.DISK:
-            if self._storage_backend is None:
-                logger.warning_once(
-                    "TPURaidenOffloadingConnector: disk source observed without "
-                    "configured storage_backend; using backend=%r.",
-                    UNKNOWN_BACKEND_LABEL,
-                )
-                return disk_offload_labels(UNKNOWN_BACKEND_LABEL)
-            return disk_offload_labels(self._storage_backend)
-        raise ValueError(f"Unsupported offload source for metrics: {source!r}")
-
-    def record_admission_hits(
-        self,
-        tokens_by_source: Mapping[CacheHitSource, int],
-        *,
-        preempted: bool = False,
-    ) -> None:
-        """Increment `vllm:kv_offload_raiden_hit_tokens` for non-preempted admissions.
-
-        Matches upstream `Scheduler.schedule()`: re-admissions after preemption
-        (`request.num_preemptions > 0`) skip `HIT_TOKENS` so per-request prefix
-        hits are not double-counted.
-        """
-        if preempted:
-            return
-        for source, count in external_sources_with_tokens(tokens_by_source).items():
-            self._stats.increase_counter(
-                RaidenOffloadMetricName.HIT_TOKENS,
-                count,
-                labelvalues=self.source_labels(source),
-            )
-
-    def pop_stats(self) -> OffloadingConnectorStats | None:
-        """Drain accumulated per-step stats deltas for IPC, or `None` if idle.
-
-        Resets `self._stats` so each delta is shipped to `RaidenOffloadPromMetrics`
-        in the API server process at most once.
-        """
-        if self._stats.is_empty():
-            return None
-        stats = self._stats
-        self._stats = OffloadingConnectorStats()
-        return stats

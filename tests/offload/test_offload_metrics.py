@@ -11,64 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for Raiden KV offload Prometheus metrics and stats collectors."""
+"""Unit tests for Raiden KV offload per-tier hit-source attribution."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
-import prometheus_client
 import pytest
-from vllm.config import KVTransferConfig, VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import PromMetric
 from vllm.v1.kv_offload.base import OffloadKey, make_offload_key
-from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
-from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
-from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiConnector
 from vllm_torchtpu.offload.metrics import (
-    SOURCE_LABELNAMES,
-    RaidenOffloadMetricName,
-    RaidenOffloadPromMetrics,
-    RaidenOffloadStatsCollector,
     SubBlockSourceCounts,
-    build_raiden_offload_metric_definitions,
     compute_load_tokens_by_source,
     external_sources_with_tokens,
     split_external_hit,
 )
-from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
-
-
-def _make_prom_metric_types(
-    registry: prometheus_client.CollectorRegistry,
-) -> dict[type[PromMetric], type[PromMetric]]:
-    class _Counter(prometheus_client.Counter):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, registry=registry, **kwargs)
-
-    class _Gauge(prometheus_client.Gauge):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, registry=registry, **kwargs)
-
-    class _Histogram(prometheus_client.Histogram):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, registry=registry, **kwargs)
-
-    return {
-        prometheus_client.Counter: _Counter,
-        prometheus_client.Gauge: _Gauge,
-        prometheus_client.Histogram: _Histogram,
-    }
-
-
-def test_metric_definitions_have_source_labels() -> None:
-    defs = build_raiden_offload_metric_definitions()
-    assert set(defs.keys()) == {m.value for m in RaidenOffloadMetricName}
-    assert defs[RaidenOffloadMetricName.HIT_TOKENS].labelnames == SOURCE_LABELNAMES
 
 
 def test_external_sources_with_tokens() -> None:
@@ -84,25 +42,6 @@ def test_external_sources_with_tokens() -> None:
         CacheHitSource.DISK: 128,
         CacheHitSource.EXTERNAL_UNSPECIFIED: 32,
     }
-
-
-def test_collector_labels_disk_without_storage_backend_as_unknown() -> None:
-    collector = RaidenOffloadStatsCollector(storage_backend=None)
-    assert collector.source_labels(CacheHitSource.DISK) == ("disk", "unknown")
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        CacheHitSource.DEVICE,
-        CacheHitSource.EXTERNAL_UNSPECIFIED,
-        pytest.param("host", id="raw str"),
-    ],
-)
-def test_collector_rejects_unsupported_sources(source: Any) -> None:
-    collector = RaidenOffloadStatsCollector(storage_backend=None)
-    with pytest.raises(ValueError, match="Unsupported offload source"):
-        collector.source_labels(source)
 
 
 _KEY_0 = make_offload_key(b"key0", 0)
@@ -289,191 +228,3 @@ def test_split_external_hit_sums_to_hit_count() -> None:
     ) == {CacheHitSource.DISK: 8, CacheHitSource.EXTERNAL_UNSPECIFIED: 24}
     assert split_external_hit({CacheHitSource.P2P: 16}, 16) == {CacheHitSource.P2P: 16}
     assert split_external_hit({}, 16) == {CacheHitSource.EXTERNAL_UNSPECIFIED: 16}
-
-
-def test_prom_metrics_registration_and_end_to_end_observation() -> None:
-    registry = prometheus_client.CollectorRegistry()
-    extra = {"cpu_bytes_to_use": 1 << 20}
-    kv_transfer_config = KVTransferConfig(
-        kv_connector="TPURaidenOffloadingConnector",
-        kv_connector_module_path="vllm_torchtpu.offload.raiden_connector",
-        kv_role="kv_both",
-        kv_connector_extra_config=dict(extra),
-    )
-    vllm_config = cast(
-        VllmConfig, SimpleNamespace(kv_transfer_config=kv_transfer_config)
-    )
-
-    prom = TPURaidenOffloadingConnector.build_prom_metrics(
-        vllm_config,
-        _make_prom_metric_types(registry),
-        ["model_name", "engine"],
-        {0: ["test-model", "0"]},
-    )
-    assert isinstance(prom, RaidenOffloadPromMetrics)
-    assert not prom._observe_deprecated_metrics
-    # The spec is named on a config copy: neither the caller's extra_config
-    # nor the upstream spec registry is mutated.
-    assert "spec_name" not in kv_transfer_config.kv_connector_extra_config
-    assert "spec_module_path" not in kv_transfer_config.kv_connector_extra_config
-    assert "TPURaidenStoreOffloadingSpec" not in OffloadingSpecFactory._registry
-    # Raiden's definitions are registered, and CPUOffloadingSpec's are not.
-    families = {metric.name for metric in registry.collect()}
-    assert RaidenOffloadMetricName.HIT_TOKENS in families
-    assert not any(name.startswith("vllm:kv_offload_cpu_") for name in families)
-
-    collector = RaidenOffloadStatsCollector(
-        storage_backend="posix",
-    )
-    collector.record_admission_hits({CacheHitSource.DISK: 32})
-
-    raw_stats = collector.pop_stats()
-    assert raw_stats is not None
-    # The scheduler adds the manager's config info to an engine's first
-    # payload. The Raiden manager reports none.
-    raw_stats.set_info([{}])
-    # Ship the payload through the real EngineCore -> API server codec, which
-    # must preserve the label-value tuple keys.
-    ipc_stats = MsgpackDecoder(SchedulerStats).decode(
-        MsgpackEncoder().encode(SchedulerStats(kv_connector_stats=raw_stats.to_dict()))
-    )
-    assert ipc_stats.kv_connector_stats is not None
-    prom.observe(ipc_stats.kv_connector_stats, engine_idx=0)
-
-    base_labels = {"model_name": "test-model", "engine": "0"}
-    # Raiden's spec declares no config info labels.
-    assert registry.get_sample_value("vllm:kv_offload_config_info", base_labels) == 1.0
-    disk_load_labels = {**base_labels, "source": "disk", "backend": "posix"}
-
-    assert (
-        registry.get_sample_value(
-            "vllm:kv_offload_raiden_hit_tokens_total", disk_load_labels
-        )
-        == 32.0
-    )
-    # Deprecated CPUOffloadingSpec metric stays at its initial 0.0 value.
-    assert (
-        registry.get_sample_value(
-            "vllm:kv_offload_total_bytes_total",
-            {**base_labels, "transfer_type": "CPU_to_GPU"},
-        )
-        == 0.0
-    )
-
-
-@pytest.mark.parametrize(
-    ("tier_config", "env", "configured_tiers"),
-    [
-        ({}, {}, {("host", "dram")}),
-        ({"raiden_storage_path": "/mnt/kv"}, {}, {("host", "dram"), ("disk", "posix")}),
-        (
-            {},
-            {"RAIDEN_STORAGE_PATH": "/mnt/kv", "RAIDEN_STORAGE_TYPE": "POSIX"},
-            {("host", "dram"), ("disk", "posix")},
-        ),
-        (
-            {"global_registry_address": "registry:2379"},
-            {},
-            {("host", "dram"), ("p2p", "rdma")},
-        ),
-    ],
-)
-def test_prom_metrics_start_each_configured_tier_hit_series_at_zero(
-    monkeypatch: pytest.MonkeyPatch,
-    tier_config: dict[str, Any],
-    env: dict[str, str],
-    configured_tiers: set[tuple[str, str]],
-) -> None:
-    """`rate()` misses the first hit of a series that only appears with it."""
-    for name in ("RAIDEN_STORAGE_PATH", "RAIDEN_STORAGE_TYPE"):
-        monkeypatch.delenv(name, raising=False)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    registry = prometheus_client.CollectorRegistry()
-    kv_transfer_config = KVTransferConfig(
-        kv_connector="TPURaidenOffloadingConnector",
-        kv_connector_module_path="vllm_torchtpu.offload.raiden_connector",
-        kv_role="kv_both",
-        kv_connector_extra_config={"cpu_bytes_to_use": 1 << 20, **tier_config},
-    )
-
-    TPURaidenOffloadingConnector.build_prom_metrics(
-        cast(VllmConfig, SimpleNamespace(kv_transfer_config=kv_transfer_config)),
-        _make_prom_metric_types(registry),
-        ["model_name", "engine"],
-        {0: ["test-model", "0"], 1: ["test-model", "1"]},
-    )
-
-    for engine in ("0", "1"):
-        for source, backend in (("host", "dram"), ("p2p", "rdma"), ("disk", "posix")):
-            value = registry.get_sample_value(
-                "vllm:kv_offload_raiden_hit_tokens_total",
-                {
-                    "model_name": "test-model",
-                    "engine": engine,
-                    "source": source,
-                    "backend": backend,
-                },
-            )
-            assert value == (0.0 if (source, backend) in configured_tiers else None)
-
-
-def test_tpu_multi_connector_builds_and_observes_raiden_offload_prom_metrics() -> None:
-    registry = prometheus_client.CollectorRegistry()
-    kv_transfer_config = KVTransferConfig(
-        kv_connector="TPUMultiConnector",
-        kv_connector_module_path=(
-            "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"
-        ),
-        kv_role="kv_both",
-        kv_connector_extra_config={
-            "connectors": [
-                {
-                    "kv_connector": "TPURaidenConnector",
-                    "kv_connector_module_path": (
-                        "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
-                    ),
-                    "kv_role": "kv_both",
-                },
-                {
-                    "kv_connector": "TPURaidenOffloadingConnector",
-                    "kv_connector_module_path": (
-                        "vllm_torchtpu.offload.raiden_connector"
-                    ),
-                    "kv_role": "kv_both",
-                    "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 20},
-                },
-            ]
-        },
-    )
-    vllm_config = cast(
-        VllmConfig, SimpleNamespace(kv_transfer_config=kv_transfer_config)
-    )
-    multi_prom = TPUMultiConnector.build_prom_metrics(
-        vllm_config,
-        _make_prom_metric_types(registry),
-        ["model_name"],
-        {0: ["disagg-model"]},
-    )
-    assert multi_prom is not None
-
-    collector = RaidenOffloadStatsCollector(storage_backend="posix")
-    collector.record_admission_hits({CacheHitSource.DISK: 64})
-    offload_stats = collector.pop_stats()
-    assert offload_stats is not None
-
-    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
-        MultiKVConnectorStats,
-    )
-
-    multi_stats = MultiKVConnectorStats(
-        data={"TPURaidenOffloadingConnector": offload_stats}
-    )
-    multi_prom.observe(multi_stats.to_dict(), engine_idx=0)
-    assert (
-        registry.get_sample_value(
-            "vllm:kv_offload_raiden_hit_tokens_total",
-            {"model_name": "disagg-model", "source": "disk", "backend": "posix"},
-        )
-        == 64.0
-    )

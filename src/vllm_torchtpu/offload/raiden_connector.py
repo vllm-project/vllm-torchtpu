@@ -61,11 +61,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorTransferResults,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
-    KVConnectorPromMetrics,
-    PromMetric,
-    PromMetricT,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
 )
@@ -97,7 +92,6 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.metrics import (
-    RaidenOffloadPromMetrics,
     compute_load_tokens_by_source,
     split_external_hit,
 )
@@ -106,7 +100,6 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenLoadStoreSpec,
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
-    configured_tier_labels,
 )
 
 if TYPE_CHECKING:
@@ -267,9 +260,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if isinstance(group.kv_cache_spec, MambaSpec)
             },
         )
-        self._raiden_manager.record_admission_hits(
-            src_spec.tokens_by_source, preempted=request.num_preemptions > 0
-        )
 
     def get_external_cache_hit_sources(
         self, request: Request, num_external_tokens: int
@@ -401,33 +391,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
-
-    @classmethod
-    def build_prom_metrics(
-        cls,
-        vllm_config: VllmConfig,
-        metric_types: dict[type[PromMetric], type[PromMetricT]],
-        labelnames: list[str],
-        per_engine_labelvalues: dict[int, list[object]],
-    ) -> KVConnectorPromMetrics:
-        """Build the API server's Prometheus binder for Raiden's offload stats.
-
-        The inherited binder looks up the spec by `spec_name`, which defaults to
-        `CPUOffloadingSpec`, so it would register `vllm:kv_offload_cpu_*`
-        (never fed by Raiden) and reject Raiden's stats as unregistered.
-        """
-        kv_transfer_config = vllm_config.kv_transfer_config
-        assert kv_transfer_config is not None
-        return RaidenOffloadPromMetrics(
-            vllm_config,
-            metric_types,
-            labelnames,
-            per_engine_labelvalues,
-            spec_cls=TPURaidenStoreOffloadingSpec,
-            configured_tier_labels=configured_tier_labels(
-                kv_transfer_config.kv_connector_extra_config
-            ),
-        )
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:

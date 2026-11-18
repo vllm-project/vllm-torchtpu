@@ -3860,7 +3860,6 @@ class TestStorageSpec(unittest.TestCase):
         self.assertEqual(spec.dp_rank, 0)
         manager_kwargs, worker_kwargs = self._get_manager_and_worker(spec)
         self.assertEqual(manager_kwargs["secondary_backend_configs"], [])
-        self.assertIsNone(manager_kwargs["storage_backend"])
         self.assertEqual(manager_kwargs["dp_rank"], 0)
         self.assertEqual(worker_kwargs["backend_configs"], [])
 
@@ -3909,7 +3908,6 @@ class TestStorageSpec(unittest.TestCase):
         self.assertEqual(store_cfg.parallelism.pp_size, -1)
         self.assertNotIn("tp_size", store_cfg.properties)
         self.assertEqual(store_cfg.properties["direct_io"], "true")
-        self.assertEqual(manager_kwargs["storage_backend"], "posix")
         # The worker registers under its engine-local rank -- its TP rank
         # here, not its world rank -- and writes as its TP rank.
         self.assertEqual(worker_kwargs["rank"], 2)
@@ -4397,72 +4395,46 @@ class TestHitSourcesBySource(unittest.TestCase):
 
     BLOCK = 16
 
-    def test_mixed_host_p2p_disk_prefix_hit_split_and_backend_labels(self):
+    def test_mixed_host_p2p_disk_prefix_hit_split(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
-        from vllm.v1.core.sched.output import SchedulerOutput
         from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        store = FakeKVCacheStore()
+        manager = make_global_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        req = _make_hashed_request("req", 5 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
 
-        for backend_label in ("posix", "test-backend"):
-            with self.subTest(backend=backend_label):
-                store = FakeKVCacheStore()
-                manager = make_global_manager(
-                    store,
-                    storage_backend=backend_label,
-                )
-                sched = _make_real_scheduler(manager, block_size=self.BLOCK)
-                req = _make_hashed_request("req", 5 * self.BLOCK + 1, self.BLOCK)
-                sched.on_new_request(req)
+        k = [make_offload_key(req.block_hashes[i], 0) for i in range(5)]
+        # Chunk 0 is local HBM hit; chunk 1 is HOST; chunk 2 is P2P;
+        # chunks 3 and 4 are SHARED_STORAGE (disk).
+        seed_host_entries(store, k[1])
+        seed_global_entries(store, k[2])
+        seed_storage_entries(store, k[3])
+        seed_storage_entries(store, k[4])
 
-                k = [make_offload_key(req.block_hashes[i], 0) for i in range(5)]
-                # Chunk 0 is local HBM hit; chunk 1 is HOST; chunk 2 is P2P;
-                # chunks 3 and 4 are SHARED_STORAGE (disk).
-                seed_host_entries(store, k[1])
-                seed_global_entries(store, k[2])
-                seed_storage_entries(store, k[3])
-                seed_storage_entries(store, k[4])
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, self.BLOCK)
+        self.assertEqual(ext_tokens, 4 * self.BLOCK)
 
-                ext_tokens, _ = sched.get_num_new_matched_tokens(req, self.BLOCK)
-                self.assertEqual(ext_tokens, 4 * self.BLOCK)
-
-                blocks = [KVCacheBlock(bid) for bid in (10, 11, 12, 13, 14)]
-                sched.update_state_after_alloc(
-                    req, KVCacheBlocks(blocks=(blocks,)), ext_tokens
-                )
-                hit_sources = sched.get_external_cache_hit_sources(req, ext_tokens)
-                self.assertEqual(
-                    hit_sources,
-                    {
-                        CacheHitSource.HOST: self.BLOCK,
-                        CacheHitSource.P2P: self.BLOCK,
-                        CacheHitSource.DISK: 2 * self.BLOCK,
-                    },
-                )
-                sched.build_connector_meta(SchedulerOutput.make_empty())
-                stats = sched.get_stats()
-                self.assertIsNotNone(stats)
-                assert stats is not None
-                self.assertEqual(
-                    stats.data["data"][RaidenOffloadMetricName.HIT_TOKENS],
-                    {
-                        ("host", "dram"): self.BLOCK,
-                        ("p2p", "rdma"): self.BLOCK,
-                        ("disk", backend_label): 2 * self.BLOCK,
-                    },
-                )
+        blocks = [KVCacheBlock(bid) for bid in (10, 11, 12, 13, 14)]
+        sched.update_state_after_alloc(req, KVCacheBlocks(blocks=(blocks,)), ext_tokens)
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {
+                CacheHitSource.HOST: self.BLOCK,
+                CacheHitSource.P2P: self.BLOCK,
+                CacheHitSource.DISK: 2 * self.BLOCK,
+            },
+        )
 
     def test_concurrent_promotion_to_host_before_prepare_load_updates_source(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
-        from vllm.v1.core.sched.output import SchedulerOutput
         from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
-
         store = FakeKVCacheStore()
-        manager = make_global_manager(store, storage_backend="posix")
+        manager = make_global_manager(store)
         sched = _make_real_scheduler(manager, block_size=self.BLOCK)
         req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
         sched.on_new_request(req)
@@ -4480,24 +4452,14 @@ class TestHitSourcesBySource(unittest.TestCase):
             sched.get_external_cache_hit_sources(req, ext_tokens),
             {CacheHitSource.HOST: self.BLOCK},
         )
-        sched.build_connector_meta(SchedulerOutput.make_empty())
-        stats = sched.get_stats()
-        assert stats is not None
-        self.assertEqual(
-            stats.data["data"][RaidenOffloadMetricName.HIT_TOKENS],
-            {("host", "dram"): self.BLOCK},
-        )
 
-    def test_preempted_request_skips_hit_tokens_and_hybrid_deduplicates(self):
+    def test_hybrid_hit_deduplicates_overlapping_groups(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
-        from vllm.v1.core.sched.output import SchedulerOutput
         from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
-
         store = FakeKVCacheStore()
-        manager = make_manager(store, storage_backend="posix")
+        manager = make_manager(store)
         sched = _make_real_scheduler(manager, block_size=self.BLOCK, hybrid=True)
 
         req = _make_hashed_request("req", 3 * self.BLOCK + 1, self.BLOCK)
@@ -4518,43 +4480,11 @@ class TestHitSourcesBySource(unittest.TestCase):
         sched.update_state_after_alloc(
             req, KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)), ext_tokens
         )
-        # Hybrid Attention + Mamba over [0, 32) counts 32 tokens, not 48
-        # (even when get_external_cache_hit_sources was not called first).
-        sched.build_connector_meta(SchedulerOutput.make_empty())
-        stats = sched.get_stats()
-        assert stats is not None
+        # Hybrid Attention + Mamba over [0, 32) counts 32 tokens, not 48.
         self.assertEqual(
-            stats.data["data"][RaidenOffloadMetricName.HIT_TOKENS],
-            {("disk", "posix"): 2 * self.BLOCK},
-        )
-        for key in (k_attn0, k_attn1, k_mamba1):
-            store.complete_remote_read(sub_hashes(key))
-        (first_finished,) = manager.poll_finished_jobs()
-        self.assertTrue(first_finished.success)
-        _ = sched.get_stats()
-
-        # Simulate host eviction + request preemption and re-admission from
-        # shared storage: get_external_cache_hit_sources still reports DISK,
-        # while HIT_TOKENS is not incremented again.
-        store.entries.clear()
-        sched2 = _make_real_scheduler(manager, block_size=self.BLOCK, hybrid=True)
-        req2 = _make_hashed_request("req2", 3 * self.BLOCK + 1, self.BLOCK)
-        req2.num_preemptions = 1
-        sched2.on_new_request(req2)
-        ext2, _ = sched2.get_num_new_matched_tokens(req2, 0)
-        self.assertEqual(ext2, 2 * self.BLOCK)
-        sched2.update_state_after_alloc(
-            req2, KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)), ext2
-        )
-        self.assertEqual(
-            sched2.get_external_cache_hit_sources(req2, ext2),
+            sched.get_external_cache_hit_sources(req, ext_tokens),
             {CacheHitSource.DISK: 2 * self.BLOCK},
         )
-        sched2.build_connector_meta(SchedulerOutput.make_empty())
-        stats2 = sched2.get_stats()
-        assert stats2 is not None
-        self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, stats2.data["data"])
-        self.assertIsNone(manager.get_stats())
 
     def test_hybrid_hit_with_mixed_recurrent_state_counts_in_its_slowest_tier(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -4562,7 +4492,7 @@ class TestHitSourcesBySource(unittest.TestCase):
         from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
         store = FakeKVCacheStore()
-        manager = make_manager(store, storage_backend="posix")
+        manager = make_manager(store)
         sched = _make_real_scheduler(manager, block_size=self.BLOCK, hybrid=True)
         req = _make_hashed_request("req", 3 * self.BLOCK + 1, self.BLOCK)
         sched.on_new_request(req)
@@ -4597,16 +4527,13 @@ class TestHitSourcesBySource(unittest.TestCase):
             {CacheHitSource.DISK: 2 * self.BLOCK},
         )
 
-    def test_unpinned_load_reports_unspecified_and_no_hit_tokens(self):
+    def test_unpinned_load_reports_unspecified(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
-        from vllm.v1.core.sched.output import SchedulerOutput
         from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
-
         store = FakeKVCacheStore()
-        manager = make_manager(store, storage_backend="posix")
+        manager = make_manager(store)
         sched = _make_real_scheduler(manager, block_size=self.BLOCK)
         req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
         sched.on_new_request(req)
@@ -4625,20 +4552,13 @@ class TestHitSourcesBySource(unittest.TestCase):
             sched.get_external_cache_hit_sources(req, ext_tokens),
             {CacheHitSource.EXTERNAL_UNSPECIFIED: self.BLOCK},
         )
-        sched.build_connector_meta(SchedulerOutput.make_empty())
-        stats = sched.get_stats()
-        assert stats is not None
-        self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, stats.data["data"])
 
-    def test_request_without_offload_hit_records_nothing(self):
+    def test_request_without_offload_hit_returns_empty_sources(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
-        from vllm.v1.core.sched.output import SchedulerOutput
-
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
 
         store = FakeKVCacheStore()
-        manager = make_manager(store, storage_backend="posix")
+        manager = make_manager(store)
         sched = _make_real_scheduler(manager, block_size=self.BLOCK)
         req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
         sched.on_new_request(req)
@@ -4649,21 +4569,14 @@ class TestHitSourcesBySource(unittest.TestCase):
             req, KVCacheBlocks(blocks=([KVCacheBlock(10), KVCacheBlock(11)],)), 0
         )
         self.assertEqual(sched.get_external_cache_hit_sources(req, 0), {})
-        sched.build_connector_meta(SchedulerOutput.make_empty())
-        stats = sched.get_stats()
-        assert stats is not None
-        self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, stats.data["data"])
 
     def test_two_requests_in_one_step_keep_their_own_sources(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
-        from vllm.v1.core.sched.output import SchedulerOutput
         from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
-
         store = FakeKVCacheStore()
-        manager = make_manager(store, storage_backend="posix")
+        manager = make_manager(store)
         sched = _make_real_scheduler(manager, block_size=self.BLOCK)
         num_tokens = 2 * self.BLOCK + 1
         host_req = _make_hashed_request("host_req", num_tokens, self.BLOCK)
@@ -4690,24 +4603,14 @@ class TestHitSourcesBySource(unittest.TestCase):
             sched.get_external_cache_hit_sources(disk_req, self.BLOCK),
             {CacheHitSource.DISK: self.BLOCK},
         )
-        sched.build_connector_meta(SchedulerOutput.make_empty())
-        stats = sched.get_stats()
-        assert stats is not None
-        self.assertEqual(
-            stats.data["data"][RaidenOffloadMetricName.HIT_TOKENS],
-            {("host", "dram"): self.BLOCK, ("disk", "posix"): self.BLOCK},
-        )
 
     def test_mixed_sub_block_sources_within_single_key_preserve_host_tokens(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
-        from vllm.v1.core.sched.output import SchedulerOutput
         from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
-
         store = FakeKVCacheStore()
-        manager = make_global_manager(store, storage_backend="posix")
+        manager = make_global_manager(store)
         sched = _make_real_scheduler(manager, block_size=self.BLOCK)
         req = _make_hashed_request("mixed_sub_req", 2 * self.BLOCK + 1, self.BLOCK)
         sched.on_new_request(req)
@@ -4732,8 +4635,6 @@ class TestHitSourcesBySource(unittest.TestCase):
             KVCacheBlocks(blocks=([KVCacheBlock(10), KVCacheBlock(11)],)),
             ext_tokens,
         )
-        # Both get_external_cache_hit_sources and Raiden hit_tokens preserve
-        # exact sub-block counts (8 HOST, 4 P2P, 4 DISK).
         self.assertEqual(sched.get_external_cache_hit_sources(req, 0), {})
         self.assertEqual(
             sched.get_external_cache_hit_sources(req, ext_tokens),
@@ -4741,17 +4642,6 @@ class TestHitSourcesBySource(unittest.TestCase):
                 CacheHitSource.HOST: 8,
                 CacheHitSource.P2P: 4,
                 CacheHitSource.DISK: 4,
-            },
-        )
-        sched.build_connector_meta(SchedulerOutput.make_empty())
-        hit_stats = sched.get_stats()
-        assert hit_stats is not None
-        self.assertEqual(
-            hit_stats.data["data"][RaidenOffloadMetricName.HIT_TOKENS],
-            {
-                ("host", "dram"): 8,
-                ("p2p", "rdma"): 4,
-                ("disk", "posix"): 4,
             },
         )
 
@@ -4763,7 +4653,7 @@ class TestHitSourcesBySource(unittest.TestCase):
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
         store = FakeKVCacheStore()
-        manager = make_manager(store, storage_backend="posix")
+        manager = make_manager(store)
         spec, vllm_config, kv_cache_config = _make_scheduler_args(
             manager, block_size=self.BLOCK
         )
@@ -4815,7 +4705,7 @@ class TestHitSourcesBySource(unittest.TestCase):
         for through_multi_connector in (False, True):
             with self.subTest(through_multi_connector=through_multi_connector):
                 store = FakeKVCacheStore()
-                manager = make_manager(store, storage_backend="posix")
+                manager = make_manager(store)
                 spec, vllm_config, kv_cache_config = _make_scheduler_args(
                     manager, block_size=self.BLOCK
                 )
