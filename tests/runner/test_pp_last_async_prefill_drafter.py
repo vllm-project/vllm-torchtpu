@@ -13,7 +13,7 @@ every event record and every event wait. The gate is right when the event the
 worker's output thread waits on (get_output) was recorded after every
 KV-writing root of the step was enqueued. Each assertion message starts with
 a name the CDK CPU proof's mutants are matched against (ADMIT, FLAGSOFF,
-DEVICE, ORDER, ROOTS, COVER, NODRAFT, STEP, ENGAGE).
+DEVICE, EAGERSHAPE, ASYNC, ORDER, ROOTS, COVER, NODRAFT, STEP, ENGAGE).
 """
 
 import inspect
@@ -43,6 +43,9 @@ ENGAGED = (
     "(VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER=1)"
 )
 _MTP = NS(method="mtp", num_speculative_tokens=1)
+# The drafter's per-chunk row buckets in these tests: the device drafts may only
+# ever take these [p, K] shapes (the ones the synchronous .cpu() copies).
+_BUCKETS = {(16, 1), (32, 1)}
 
 
 @pytest.fixture(autouse=True)
@@ -192,7 +195,8 @@ class _Device:
         self.Event = Event
 
     def sync(self, tensors=None, wait=True):
-        self.log.append(("enqueue", tuple(id(t) for t in tensors or ()), wait))
+        tensors = list(tensors or ())
+        self.log.append(("enqueue", tuple(id(t) for t in tensors), wait, tuple(tuple(t.shape) for t in tensors)))
 
     def index(self, entry):
         return self.log.index(entry)
@@ -201,14 +205,16 @@ class _Device:
         return [e[1] for e in self.log if e[0] == "record"]
 
 
-def _runner(device, *, rows=None, drafter=True, prefill_only=True, ppa=False, producer=True, pp=8):
+def _runner(device, *, rows=None, drafter=True, prefill_only=True, ppa=False, producer=True, pp=8, buckets=(16,)):
     """The state sample_tokens reads on the last stage of a ``pp``-stage
     producer: requests ``rows`` = [(req_id, num_computed, num_scheduled,
     num_tokens)], greedy (row i samples 7 + i), with an MTP drafter whose
-    drafts are ``seed + 100`` and which, like the device drafter, returns its
-    tensor only when asked to (the synchronous form is a host list after a
-    blocking copy). The predicates are the real properties, evaluated on this
-    stub under the test's env."""
+    drafts are ``seed + 100`` and which, like the device drafter under the
+    flag (eagle3 propose's PPARF return), hands back its bucketed per-chunk
+    [p, K] tensors (rows padded to each bucket in ``buckets``) only when asked
+    to; the synchronous form is a host list after a blocking copy. The
+    predicates are the real properties, evaluated on this stub under the
+    test's env."""
     rows = rows or [("r0", 0, 1, 1)]
     n = len(rows)
     scheduler_output = NS(
@@ -265,9 +271,14 @@ def _runner(device, *, rows=None, drafter=True, prefill_only=True, ppa=False, pr
 
         def propose(**kwargs):
             device.log.append(("propose", kwargs["return_device"]))
-            drafts = (kwargs["device_seed"].view(-1, 1) + 100).to(torch.int32)
-            device.drafts = drafts
-            return drafts if kwargs["return_device"] else None
+            seed = (kwargs["device_seed"].view(-1, 1) + 100).to(torch.int32)
+            chunks = []
+            for p in buckets:
+                chunk = torch.zeros(p, 1, dtype=torch.int32)
+                chunk[: min(p, seed.shape[0])] = seed[:p]
+                chunks.append(chunk)
+            device.drafts = chunks
+            return chunks if kwargs["return_device"] else None
 
         runner.drafter = NS()
         runner._async_drafter = runner.drafter
@@ -328,33 +339,38 @@ def test_device_drafts_only_with_the_flag_and_ppa(monkeypatch, flag, ppa):
 # -- 3. the copy-gate fence --------------------------------------------------------------------------------
 
 
-def test_gate_rearmed_after_drafts_and_roots_before_the_unwaited_return(monkeypatch):
-    """On, under PPA: the draft tokens and every registered root are enqueued
-    in ONE non-blocking call, the gate is re-recorded after it and before the
-    KV save, sample_tokens returns without waiting, and the output thread's
-    get_output then waits on the re-armed gate only."""
+@pytest.mark.parametrize("buckets", [(16,), (16, 32)])
+def test_gate_rearmed_after_drafts_and_roots_before_the_unwaited_return(monkeypatch, buckets):
+    """On, under PPA: each bucketed draft chunk is enqueued in its own
+    non-blocking call (chunk order, the graphs the synchronous .cpu()
+    materializes), then every registered root in one call; the gate is
+    re-recorded after them and before the KV save, sample_tokens returns
+    without waiting, and the output thread's get_output then waits on the
+    re-armed gate only. No enqueued draft takes a shape outside the buckets."""
     _flag(monkeypatch, "1")
     _ahead(monkeypatch, False)  # a pipeline producer registers ahead whatever the flag says
     device = _Device()
-    runner = _runner(device, ppa=True, rows=[("r0", 0, 1, 1), ("r1", 4, 2, 6)])
+    runner = _runner(device, ppa=True, rows=[("r0", 0, 1, 1), ("r1", 4, 2, 6)], buckets=buckets)
     extra = torch.zeros(3)
     pparf.register_root(runner, extra)
 
     output, copy = _sample(device, runner, monkeypatch)
 
     enq = [e for e in device.log if e[0] == "enqueue"]
-    assert len(enq) == 1, f"ORDER: one enqueue before the gate expected, got {device.log}"
-    roots = set(enq[0][1])
-    assert device.drafts is not None and id(device.drafts) in roots, (
-        f"ORDER: the draft tokens must be enqueued, got {device.log}"
+    drafts = device.drafts or []
+    assert len(drafts) == len(buckets) and [e[1] for e in enq[: len(drafts)]] == [(id(d),) for d in drafts], (
+        f"ORDER: each bucketed draft chunk must be enqueued in its own call, in chunk order, got {device.log}"
     )
-    assert id(extra) in roots, f"ROOTS: a registered root must be enqueued in the same call, got {device.log}"
-    assert enq[0][2] is False, f"ORDER: the enqueue must not wait, got {device.log}"
+    assert {e[3][0] for e in enq[: len(drafts)]} <= _BUCKETS, f"EAGERSHAPE: draft enqueues off the bucket set: {device.log}"
+    assert len(enq) == len(drafts) + 1 and enq[-1][1] == (id(extra),), (
+        f"ROOTS: the registered root must be enqueued after the drafts, before the gate, got {device.log}"
+    )
+    assert all(e[2] is False for e in enq), f"ORDER: no enqueue may wait, got {device.log}"
     gate = copy.copy_ready_event
     first = device.records()[0]
     assert gate.id != first, f"ORDER: the gate must be re-armed, got {device.log}"
-    assert device.index(("record", gate.id)) > device.index(enq[0]), (
-        f"ORDER: the gate must be recorded after the enqueue, got {device.log}"
+    assert device.index(("record", gate.id)) > device.index(enq[-1]), (
+        f"ORDER: the gate must be recorded after every enqueue, got {device.log}"
     )
     assert device.index(("record", gate.id)) < device.index(("kv_save",)), (
         f"ORDER: the gate fence precedes the KV save, got {device.log}"
@@ -398,6 +414,49 @@ def test_flag_off_keeps_the_base_fence(monkeypatch, flag, ahead):
     assert not isinstance(output, AsyncTPUModelRunnerOutput), "FLAGSOFF: the synchronous return"
     assert [e for e in device.log if e[0] == "wait"] == [("wait", records[-1])], f"FLAGSOFF: one wait, got {device.log}"
     assert output.sampled_token_ids == [[7]] and runner.requests["r0"].output_token_ids == [7], "FLAGSOFF: commit"
+
+
+def _eagle3_tail():
+    """Eagle3Proposer.propose's own return block (from the final
+    ``if return_device:`` to the host copy), executed as written on the
+    per-chunk [p, K] drafts."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    src = inspect.getsource(Eagle3Proposer.propose)
+    s0 = src.index("per_chunk_stacked = [")
+    b = src.index("        result = []\n", s0)
+    a = src.rindex("        if return_device:\n", s0, b)
+    code = ("def _tail(per_chunk_stacked, chunks, runner, return_device):\n"
+            + textwrap.indent(textwrap.dedent(src[a:b]), "    ") + "    return 'host'\n")
+    ns = {"torch": torch, "_pparf": pparf}
+    exec(compile(code, "<Eagle3Proposer.propose return>", "exec"), ns)
+    return ns["_tail"]
+
+
+@pytest.mark.parametrize("flag", [None, "1"])
+@pytest.mark.parametrize("ppa", [False, True])
+def test_device_drafts_keep_the_bucketed_shapes(monkeypatch, flag, ppa):
+    """Under the flag and PPA the drafter's device return is its bucketed
+    per-chunk [p, K] tensors themselves (no slice / cat to the real request
+    count: no device program of a new shape). Otherwise (flag off, or an
+    async-scheduling drafter without PPA) it is the base [num_reqs, K] form."""
+    _flag(monkeypatch, flag)
+    tail = _eagle3_tail()
+    stacked = [torch.arange(16).view(16, 1), torch.arange(32).view(32, 1)]
+    chunks = [NS(num_reqs=5), NS(num_reqs=20)]
+    out = tail(stacked, chunks, NS(_pp_last_async_output=ppa), True)
+    if flag == "1" and ppa:
+        assert isinstance(out, list) and len(out) == 2 and all(o is t for o, t in zip(out, stacked)), (
+            f"EAGERSHAPE: the PPARF device return must be the bucketed chunks themselves, got {out}"
+        )
+        assert {tuple(o.shape) for o in out} <= _BUCKETS, f"EAGERSHAPE: shapes off the bucket set: {[o.shape for o in out]}"
+    else:
+        tag = "ASYNC" if flag == "1" else "FLAGSOFF"
+        assert isinstance(out, torch.Tensor) and tuple(out.shape) == (25, 1), (
+            f"{tag}: the base device return is one [num_reqs, K] tensor, got {out if not isinstance(out, torch.Tensor) else out.shape}"
+        )
+        assert out.view(-1).tolist() == list(range(5)) + list(range(20)), f"{tag}: the base rows"
+    assert tail(stacked, chunks, NS(_pp_last_async_output=ppa), False) == "host", "FLAGSOFF: the host form is untouched"
 
 
 def _stub(*, producer=True, pp=8, drafter=True, kv=True):
@@ -540,10 +599,10 @@ def test_fence_line_first_and_every_report(monkeypatch):
     lines = _lines(monkeypatch)
     monkeypatch.setattr(pparf, "REPORT_EVERY", 3)
     state = NS(fence_pending_device_work=lambda: None)
-    pparf.fence(state, [torch.zeros(1)], synchronize=lambda ts: None, skip_fence=True)
+    pparf.fence(state, [], [torch.zeros(1)], synchronize=lambda ts: None, skip_fence=True)
     assert lines == [], f"ENGAGE: a skipped fence must not log, got {lines}"
     for _ in range(3):
-        pparf.fence(state, [torch.zeros(1), torch.zeros(1)], synchronize=lambda ts: None)
+        pparf.fence(state, [torch.zeros(1)], [torch.zeros(1)], synchronize=lambda ts: None)
     assert len(lines) == 2, f"ENGAGE: the first re-arm and the REPORT_EVERY-th must log, got {lines}"
     assert lines[0].startswith(
         "q38 PPARF copy-gate fence (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER=1): 1 gate re-arm(s), 3 root(s)"

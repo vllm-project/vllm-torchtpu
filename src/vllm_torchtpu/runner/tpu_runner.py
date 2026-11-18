@@ -5981,16 +5981,18 @@ class TPUModelRunner(GPUModelRunner):
 
         if copy_state is not None and _pparf.enabled() and self._copygate_registers_ahead:
             # q38 PPARF copy-gate fence (port of HIGHC-PPAE1's
-            # TPU_PP_COPYGATE_FENCE mode 1): enqueue, in one non-blocking call,
-            # the drafter's graph (through its draft tokens, as below) and
-            # every KV-writing root registered for this step, then re-arm the
-            # gate, before the unwaited return. Applies to every producer that
+            # TPU_PP_COPYGATE_FENCE mode 1): enqueue without waiting the
+            # drafter's graph (through its bucketed per-chunk drafts, one call
+            # each, as the synchronous .cpu() materializes them) and every
+            # KV-writing root registered for this step, then re-arm the gate,
+            # before the unwaited return. Applies to every producer that
             # registers ahead, with or without a drafter
             # (pp_last_async_drafter docstring).
-            _pparf_roots = [eagle3_drafts] if isinstance(eagle3_drafts, torch.Tensor) else []
-            _pparf_roots += _pparf.take_roots(self)
+            _pparf_drafts = [eagle3_drafts] if isinstance(eagle3_drafts, torch.Tensor) else list(eagle3_drafts or ())
+            _pparf_roots = _pparf.take_roots(self)
             _pparf.fence(
                 copy_state,
+                _pparf_drafts,
                 _pparf_roots,
                 synchronize=lambda ts: synchronize_tensors(ts, wait=False),
                 skip_dispatch=False,
