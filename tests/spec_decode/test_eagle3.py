@@ -334,12 +334,16 @@ class _CarryAggregationAfterGatherPlan:
 @pytest.mark.tpu_test
 def test_prepare_draft_inputs(device):
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = _staged_runner(
+    proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
         _dp_lockstep_enabled=lambda: False,
+        # The runner's input-staging fence (stage_h2d_upload).
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -617,12 +621,16 @@ def test_prepare_draft_inputs_async_device(device):
     (last_token_indices) and the rejected count from the on-device rejection
     output — matching the host path fed the equivalent num_rejected."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = _staged_runner(
+    proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
         _dp_lockstep_enabled=lambda: False,
+        # The runner's input-staging fence (stage_h2d_upload).
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -3377,23 +3385,10 @@ def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance
         mtp=_DummyMtp(),
         num_steps=2,
         greedy_head_owner=None,
-        propose_step0=True,
     )
     stacked = loop_mod(None, pos1_f.clone(), h_f.clone(), seq1_f.clone())
     assert stacked.shape == (4, 3)
     assert torch.equal(stacked[:, 0], tok0_ref)
-
-    # Without propose_step0 (main's form) the program takes step 0's token
-    # and returns steps 1..K-1 one tensor each: the same tokens.
-    steps_mod = _MtpFusedLoop(
-        vllm_config=SimpleNamespace(),
-        prefix="mtp_fused_loop_k3",
-        mtp=_DummyMtp(),
-        num_steps=2,
-    )
-    steps = steps_mod(tok0_ref, pos1_f.clone(), h_f.clone(), seq1_f.clone())
-    assert isinstance(steps, tuple) and len(steps) == 2
-    assert torch.equal(torch.stack(steps, dim=1), stacked[:, 1:])
 
 
 @pytest.mark.parametrize("hidden_rows", [4, 8])
@@ -3455,7 +3450,6 @@ def test_post_step0_carries_keep_the_gathered_rows(hidden_rows, max_p):
         prefix="mtp_fused_loop_k3",
         mtp=_DummyMtp(),
         num_steps=2,
-        propose_step0=True,
     )
     stacked = loop(None, pos1.clone(), carry.clone(), seq1.clone())
     assert stacked.shape == (p, 3)
@@ -4048,7 +4042,6 @@ def test_fused_loop_proposes_every_step_with_the_greedy_head():
         mtp=_Mtp(),
         num_steps=2,
         greedy_head_owner=owner,
-        propose_step0=True,
     )
     hidden = torch.tensor([[0.0, 7.0], [0.0, 3.0]])
 

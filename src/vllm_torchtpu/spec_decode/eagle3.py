@@ -773,9 +773,9 @@ class Eagle3Proposer:
         positions and seq_lens fixed across steps where the program advances
         them.
 
-        The program also proposes step 0's token (`propose_step0`): propose
-        hands it step 0's hidden carry, and it returns the stacked [p, K]
-        drafts. Its lm-head is the greedy draft head when one is set.
+        The program also proposes step 0's token: propose hands it step 0's
+        hidden carry, and it returns the stacked [p, K] drafts. Its lm-head is
+        the greedy draft head when one is set.
         """
         draft_model = self.draft_model
         if (
@@ -825,7 +825,6 @@ class Eagle3Proposer:
                     num_steps=K - 1,
                     dynamic_arg_dims=loop_dims,
                     greedy_head_owner=self._draft_greedy_head_owner,
-                    propose_step0=True,
                 )
         except Exception:
             logger.warning(
@@ -1467,8 +1466,8 @@ class Eagle3Proposer:
         #   2. Advance pos_step1 = pos_carry + 1 (if advance_draft_positions)
         #   3. Compute seq_lens_step1 = base_seq_lens + sl_delta - num_rejected_dev
         # Step 0's token proposal (lm_head + argmax / get_top_tokens) runs at
-        # the start of _MtpFusedLoop.forward (built with propose_step0) so this
-        # bridge has zero matmuls or TP collectives.
+        # the start of _MtpFusedLoop.forward, so this bridge has zero matmuls
+        # or TP collectives.
         pos_carry = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
