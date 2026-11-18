@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU unit tests for Qwen3-Omni Thinker audio and vision encoder patches."""
+"""CPU unit tests for Qwen3-Omni Thinker encoder and multimodal merge patches."""
 
 from __future__ import annotations
 
@@ -22,8 +22,13 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn as nn
+import vllm.model_executor.models.utils as vllm_utils
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeVisionEncoderConfig,
+)
+from vllm.multimodal.utils import set_mm_embedding_modality
+from vllm_omni.model_executor.models.qwen3_omni import (
+    qwen3_omni_moe_thinker as thinker_mod,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer,
@@ -307,3 +312,126 @@ def test_qwen3_omni_vit_frame_chunking_and_parity(
     )
     assert seen_shapes == expected_chunks
     assert torch.allclose(out_patched, out_ref, atol=1e-5, rtol=1e-5)
+
+
+def test_qwen3_omni_embed_input_ids_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify embed_input_ids clears deepstack state and only moves mask on MM steps."""
+
+    class DummyMixin:
+        use_deepstack = True
+        deepstack_input_embeds_num_tokens = 12
+        deepstack_input_embeds = [torch.zeros(16, 8)]
+
+        def __init__(self) -> None:
+            self.cleared_tokens: list[int] = []
+
+        def _clear_deepstack_input_embeds(self, n: int) -> None:
+            self.cleared_tokens.append(n)
+            self.deepstack_input_embeds_num_tokens = 0
+
+        def embed_input_ids(
+            self, ids, multimodal_embeddings=None, *, is_multimodal=None
+        ):
+            return multimodal_embeddings, is_multimodal
+
+    class FakeDeviceMask:
+        def __init__(self) -> None:
+            self.device = torch.device("meta")
+            self.cpu_calls = 0
+
+        def cpu(self) -> torch.Tensor:
+            self.cpu_calls += 1
+            return torch.ones(5, dtype=torch.bool)
+
+    monkeypatch.setattr(
+        thinker_mod, "Qwen3OmniMoeThinkerForConditionalGeneration", DummyMixin
+    )
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+
+    vid_emb = torch.ones(6, 32)
+    vid_emb.modality = "video"
+    mixin = DummyMixin()
+    mm_mask = FakeDeviceMask()
+    kw_embeds, kw_mask = mixin.embed_input_ids(
+        input_ids=torch.zeros(5, dtype=torch.long),
+        multimodal_embeddings=(vid_emb,),
+        is_multimodal=mm_mask,
+    )
+    assert kw_embeds[0] is vid_emb
+    assert kw_embeds[0].modality == "video"
+    assert mm_mask.cpu_calls == 1
+    assert torch.equal(kw_mask, torch.ones(5, dtype=torch.bool))
+    assert mixin.cleared_tokens == [12]
+    assert mixin.deepstack_input_embeds_num_tokens == 0
+
+    # Decode / text-only step (multimodal_embeddings=None): mask is NOT copied to CPU.
+    decode_mask = FakeDeviceMask()
+    _, out_decode_mask = mixin.embed_input_ids(
+        input_ids=torch.zeros(5, dtype=torch.long),
+        multimodal_embeddings=None,
+        is_multimodal=decode_mask,
+    )
+    assert decode_mask.cpu_calls == 0
+    assert out_decode_mask is decode_mask
+
+
+def test_qwen3_omni_thinker_interleaved_mm_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test _check_interleaved, _merge_interleaved, and _omni_merge."""
+    seen_padded_rows: list[int] = []
+
+    def _fake_static_merge(inputs_embeds, multimodal_embeddings, is_multimodal):
+        flat = vllm_utils._flatten_embeddings(multimodal_embeddings)
+        seen_padded_rows.append(int(flat.shape[0]))
+        idx = torch.cumsum(is_multimodal, dim=0, dtype=torch.int32) - 1
+        idx = torch.clamp(idx, 0, flat.shape[0] - 1)
+        return torch.where(is_multimodal.unsqueeze(-1), flat[idx], inputs_embeds)
+
+    monkeypatch.setattr(vllm_utils, "_merge_multimodal_embeddings", _fake_static_merge)
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+
+    is_video = torch.tensor([False, True, False, True, False, False])
+    is_audio = torch.tensor([False, False, True, False, False, False])
+    is_image = torch.tensor([False, False, False, False, True, False])
+    is_mm = is_video | is_audio | is_image
+    assert thinker_mod.check_interleaved_audio_video(is_video, is_audio, 0, 1) is False
+    assert thinker_mod.check_interleaved_audio_video(is_video, is_audio, 2, 1) is True
+
+    inputs_embeds = torch.zeros(6, 4)
+    vid_emb = set_mm_embedding_modality(torch.tensor([[1.0] * 4, [2.0] * 4]), "video")
+    aud_emb = set_mm_embedding_modality(torch.tensor([[3.0] * 4]), "audio")
+    img_emb = set_mm_embedding_modality(torch.tensor([[4.0] * 4]), "image")
+
+    merged = thinker_mod.merge_interleaved_embeddings(
+        inputs_embeds.clone(),
+        [vid_emb, aud_emb, img_emb],
+        is_video,
+        is_audio,
+        is_mm,
+    )
+    expected = inputs_embeds.clone()
+    expected[is_video] = vid_emb
+    expected[is_audio] = aud_emb
+    expected[is_image] = img_emb
+    assert torch.equal(merged, expected)
+    assert seen_padded_rows == [6, 6, 6]
+
+    untagged = torch.ones(2, 4)
+    with pytest.raises(ValueError, match="Missing modality"):
+        thinker_mod.merge_interleaved_embeddings(
+            inputs_embeds.clone(),
+            [untagged, aud_emb, img_emb],
+            is_video,
+            is_audio,
+            is_mm,
+        )
+
+    with pytest.raises(ValueError, match="Attempted to assign 0 audio tokens to 1"):
+        thinker_mod.merge_interleaved_embeddings(
+            inputs_embeds.clone(),
+            [vid_emb, img_emb],
+            is_video,
+            is_audio,
+            is_mm,
+        )
