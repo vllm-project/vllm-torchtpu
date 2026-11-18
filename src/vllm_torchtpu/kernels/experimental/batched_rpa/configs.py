@@ -187,8 +187,10 @@ _FP8_OPERAND_SUFFIX = {
 class NativeFp8:
     """Which matmuls of a kernel run natively in the fp8 KV dtype.
 
-    `qk` quantizes q per (token, head) row; `pv` quantizes the softmax weights
-    per row. Every operand OFF (the default) is the dequantizing kernel.
+    `qk` casts q and `pv` the softmax weights to the KV dtype, each as its
+    `Fp8Operand` says: with one scale per row (q per (token, head) row, the
+    weights per row) for ROW and SPLIT, or with a fixed scale for STATIC.
+    Every operand OFF (the default) is the dequantizing kernel.
     """
 
     qk: Fp8Operand = Fp8Operand.OFF
