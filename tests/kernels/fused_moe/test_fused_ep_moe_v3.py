@@ -671,6 +671,34 @@ def test_the_layer_takes_silu_only(one_cpu_shard):
         one_cpu_shard(activation="gelu")
 
 
+@pytest.mark.cpu_test
+def test_the_scatter_drops_the_rows_the_shard_tables_drop(one_cpu_shard, monkeypatch):
+    """The shard tables write routed_rows_per_shard as the drop row, and the
+    token table is padded to whole LANES-row blocks past it when the bound
+    is not a multiple of LANES (tile_rows 32 here: a bound of 160 rows). The
+    row-table scatter has to drop the same row, not the padded length."""
+    from vllm_torchtpu.kernels.fused_moe.v3 import routing_tables_kernel
+    from vllm_torchtpu.kernels.fused_moe.v3 import row_tables_kernel as scatter
+
+    seen = {}
+    tables, rows = routing_tables_kernel.shard_tables_kernel, scatter.scatter_row_tables
+
+    def tables_spy(*args, **kwargs):
+        seen["tables"] = kwargs["routed_rows_per_shard"]
+        return tables(*args, **kwargs)
+
+    def scatter_spy(routed_row, messages, token_table, scale_table, **kwargs):
+        seen["scatter"] = kwargs.get("routed_rows", token_table.shape[0])
+        seen["table"] = token_table.shape[0]
+        return rows(routed_row, messages, token_table, scale_table, **kwargs)
+
+    monkeypatch.setattr(routing_tables_kernel, "shard_tables_kernel", tables_spy)
+    monkeypatch.setattr(scatter, "scatter_row_tables", scatter_spy)
+    one_cpu_shard()
+    assert seen["tables"] % LANES and seen["table"] > seen["tables"], seen
+    assert seen["scatter"] == seen["tables"], seen
+
+
 # ---- the layer on eight TPU7x cores ----
 
 

@@ -493,6 +493,9 @@ def _pallas_step(
         message_tokens=message_tokens,
         chunk_max=config.scatter_chunk_pairs,
         ring=config.scatter_ring,
+        # The drop row the shard tables wrote: the token table is longer
+        # (whole LANES-row blocks) when the bound is not a multiple of it.
+        routed_rows=routed_rows_per_shard,
     )
     token_scales = token_scales.reshape(n_scales, scale_rows, LANES)
     w1_bias, w2_bias = _shard_biases(w1_bias, w2_bias, w1_cols, hidden)
