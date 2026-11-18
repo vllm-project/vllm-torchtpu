@@ -4839,12 +4839,28 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
-                hidden_states, aux_hidden_states = self.forward_model(
-                    input_ids=input_ids,
-                    positions=self.position_ids,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
+                tokens = (
+                    self._megakernel_greedy_tokens(
+                        input_ids, self.position_ids, logits_indices
+                    )
+                    if top_tokens
+                    and inputs_embeds is None
+                    and intermediate_tensors is None
+                    and nan_check is None
+                    and spec_decode_metadata is None
+                    and not is_draft_model
+                    and not self.num_prompt_logprobs
+                    else None
                 )
+                if tokens is None:
+                    hidden_states, aux_hidden_states = self.forward_model(
+                        input_ids=input_ids,
+                        positions=self.position_ids,
+                        inputs_embeds=inputs_embeds,
+                        intermediate_tensors=intermediate_tensors,
+                    )
+                else:
+                    hidden_states, aux_hidden_states = None, None
 
             if nan_check is not None:
                 assert isinstance(hidden_states, (torch.Tensor, IntermediateTensors)), (
@@ -4880,7 +4896,9 @@ class TPUModelRunner(GPUModelRunner):
             hidden_states = cast(torch.Tensor, hidden_states)
 
             layout_plan = self._last_sequence_layout_plan
-            if self.is_pooling_model:
+            if tokens is not None:
+                logits = tokens
+            elif self.is_pooling_model:
                 hidden_states = self._finalize_hidden_states(hidden_states, layout_plan)
                 logits = torch.empty((0,), device=self.device)
                 pooler_output_list.append(
@@ -4984,6 +5002,31 @@ class TPUModelRunner(GPUModelRunner):
             return self.sample_tokens(None)
         return None
 
+    def _megakernel_greedy_tokens(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        logits_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """A greedy step's tokens, `[rows of logits_indices, 1]` int64 like
+        `compute_selected_top_tokens`, from the megakernel's token step (one
+        program from the embedding through the LM head argmax), or `None` to
+        run `forward_model` and `_sampling_logits`. Call it in the step's
+        forward context, on a `top_tokens` step whose hidden states nothing
+        else reads (no drafter, prompt logprobs or KV NaN check)."""
+        if self._megakernel is None:
+            return None
+        tok = self._megakernel.try_greedy_tokens(
+            self,
+            megakernel_adapter.StepContext(input_ids=input_ids, positions=positions),
+        )
+        if tok is None:
+            return None
+        tok = tok.to(torch.int64).view(-1, 1)
+        rows = logits_indices.shape[0]
+        pad = rows - tok.shape[0]
+        return tok if pad == 0 else torch.nn.functional.pad(tok, (0, 0, 0, pad))
+
     def _sampling_logits(
         self,
         hidden_states: torch.Tensor,
@@ -5069,18 +5112,27 @@ class TPUModelRunner(GPUModelRunner):
             ),
             self._stage_timing.stage("main_forward"),
         ):
-            hidden_states, _ = self.forward_model(
-                input_ids=input_ids,
-                positions=positions,
-                inputs_embeds=inputs_embeds,
+            top_tokens = self._greedy_top_tokens_this_step()
+            logits = (
+                self._megakernel_greedy_tokens(
+                    input_ids, positions, carry.logits_indices
+                )
+                if top_tokens and inputs_embeds is None
+                else None
             )
-        top_tokens = self._greedy_top_tokens_this_step()
-        logits, _ = self._sampling_logits(
-            cast(torch.Tensor, hidden_states),
-            self._last_sequence_layout_plan,
-            carry.logits_indices,
-            top_tokens,
-        )
+            if logits is None:
+                hidden_states, _ = self.forward_model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    inputs_embeds=inputs_embeds,
+                )
+        if logits is None:
+            logits, _ = self._sampling_logits(
+                cast(torch.Tensor, hidden_states),
+                self._last_sequence_layout_plan,
+                carry.logits_indices,
+                top_tokens,
+            )
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=[logits],
