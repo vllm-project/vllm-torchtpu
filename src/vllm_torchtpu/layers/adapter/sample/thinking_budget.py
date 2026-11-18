@@ -15,8 +15,8 @@
 
 Maintains a fixed-shape ``[capacity, 7]`` ``int32`` Knuth-Morris-Pratt (KMP)
 state table on device and shares one transition definition across host sequence
-replay and ``@torch.compile(backend="tpu", fullgraph=True, dynamic=False)``
-plain-decode and speculative-verification kernels.
+replay and the plain-decode and speculative-verification compiled sampler
+functions (``@torch.compile(backend="tpu", fullgraph=True, dynamic=False)``).
 """
 
 from __future__ import annotations
@@ -125,7 +125,7 @@ class ThinkingBudgetMarkers:
 
 
 # ---------------------------------------------------------------------------
-# Unified KMP state machine (shared by Python replay and compiled TPU kernels)
+# Unified KMP state machine (shared by Python replay and compiled sampler functions)
 # ---------------------------------------------------------------------------
 
 
@@ -500,7 +500,7 @@ def _advance_state_tensor(
 
 
 # ---------------------------------------------------------------------------
-# Compiled TPU kernels: shared forcing primitives, plain decode, & spec verify
+# Compiled sampler functions: shared forcing primitives, plain decode, & spec verify
 # ---------------------------------------------------------------------------
 
 

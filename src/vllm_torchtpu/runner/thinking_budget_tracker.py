@@ -15,12 +15,13 @@
 
 Keeps each budgeted request's KMP state in a ``RequestSlotTable`` row
 (``[max_num_reqs + 1, 7]`` int32 on the device) and delegates the transitions
-and forcing kernels to ``vllm_torchtpu.layers.adapter.sample.thinking_budget``.
+and forcing to the compiled sampler functions in
+``vllm_torchtpu.layers.adapter.sample.thinking_budget``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Container, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -71,11 +72,10 @@ def _compute_request_state(
       aligns ``req_state.output_token_ids`` to the scheduler's committed
       ``num_output_tokens``; negative scheduler placeholders are skipped by
       ``out_arr >= 0``.
-    * ``prepare_step`` only calls ``_compute_request_state`` on a cold reseed
-      when a budgeted request has neither an allocated slot nor a staged dirty
-      entry; ``TPUModelRunner.sample_tokens`` settles any in-flight
-      ``_pre_async_results`` placeholders via ``_modify_prev_results`` whenever
-      ``needs_output_reseed`` is true.
+    * ``prepare_step`` only calls ``_compute_request_state`` for a cold row,
+      when a budgeted request has neither a slot nor a staged row; its
+      ``settle_outputs`` hook first writes the request's in-flight
+      ``_pre_async_results`` tokens into ``output_token_ids``.
     """
     if req_state is None:
         return compute_sequence_state((), budget, markers)
@@ -143,20 +143,18 @@ class ThinkingBudgetTracker:
     def update_states(
         self,
         scheduler_output: SchedulerOutput,
-        req_id_to_index: Container[str],
         requests: Mapping[str, CachedRequestState],
     ) -> None:
         """Apply one step's request lifecycle changes, in order.
 
-        Runs after ``GPUModelRunner._update_states`` has updated
-        ``input_batch`` (``req_id_to_index``) and ``requests``: drops finished
-        requests, frees the slots of preempted requests and of budgeted
-        requests no longer in the batch, registers new requests, then reseeds
-        resumed requests from their committed outputs.
+        Runs after ``GPUModelRunner._update_states`` has updated ``requests``:
+        drops finished requests, frees the slots of preempted requests,
+        registers new requests, then reseeds resumed requests from their
+        committed outputs. A request that the step does not schedule keeps its
+        slot and state.
         """
         self.discard(scheduler_output.finished_req_ids)
         self.on_preempted(scheduler_output.preempted_req_ids)
-        self._slots.release_unscheduled(req_id_to_index)
         for new_req in scheduler_output.scheduled_new_reqs:
             self.add(new_req.req_id, new_req.sampling_params, new_req.prompt_token_ids)
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
@@ -204,24 +202,19 @@ class ThinkingBudgetTracker:
             ),
         )
 
-    def needs_output_reseed(self, batch_req_ids: Iterable[str | None]) -> bool:
-        """Return True if ``prepare_step`` will read ``output_token_ids``."""
-        if self._markers is None or not self._budgets:
-            return False
-        return self._slots.needs_cold_reseed(batch_req_ids, self._budgets)
-
     def step_state(
         self,
         batch_req_ids: Sequence[str | None],
         requests: Mapping[str, CachedRequestState],
         discard_req_ids: AbstractSet[str],
+        settle_outputs: Callable[[str], None] | None = None,
     ) -> ThinkingBudgetStepState | None:
         """Prepare this step's device KMP state for ``sample_tokens``."""
         if not self:
             return None
         markers = self._markers
         assert markers is not None
-        state_table = self.prepare_step(batch_req_ids, requests)
+        state_table = self.prepare_step(batch_req_ids, requests, settle_outputs)
         if state_table is None:
             return None
         return ThinkingBudgetStepState(self, state_table, markers, discard_req_ids)
@@ -246,17 +239,28 @@ class ThinkingBudgetTracker:
         self,
         batch_req_ids: Sequence[str | None],
         requests: Mapping[str, CachedRequestState],
+        settle_outputs: Callable[[str], None] | None = None,
     ) -> torch.Tensor | None:
-        """Ensure all scheduled budgeted requests own seeded slots."""
+        """Ensure all scheduled budgeted requests own seeded slots.
+
+        ``settle_outputs(req_id)`` runs before a cold row is rebuilt from the
+        request's ``output_token_ids``.
+        """
         if self._markers is None or not self._budgets:
             return None
         markers = self._markers
+
+        def compute_cold_row(req_id: str) -> StateTuple:
+            if settle_outputs is not None:
+                settle_outputs(req_id)
+            return _compute_request_state(
+                requests.get(req_id), self._budgets[req_id], markers
+            )
+
         return self._slots.sync_step(
             batch_req_ids=batch_req_ids,
             tracked_req_ids=self._budgets,
-            compute_cold_row=lambda req_id: _compute_request_state(
-                requests.get(req_id), self._budgets[req_id], markers
-            ),
+            compute_cold_row=compute_cold_row,
         )
 
     def precompile(

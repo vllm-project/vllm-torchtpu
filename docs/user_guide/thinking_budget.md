@@ -75,7 +75,7 @@ With `TPU_GREEDY_TOP_TOKENS`, greedy steps keep taking the vocabulary-parallel a
 
 - **Without a reasoning parser or `--reasoning-config`**, nothing is compiled or allocated and sampling is unchanged.
 - **With a parser, while no running request sets a budget**, sampling does no extra per-step work. In a mixed batch, requests without a budget are unaffected.
-- **Startup** precompiles the forcing kernels for every request bucket, plus every verify bucket with speculative decoding. On TPU v7x (`TP=8`), this took 3.7 s for plain decode (Qwen3-8B, 128 sequences), 15.7 s with MTP `K=2` (Qwen3.5-27B, 32 sequences), and 29.9 s with N-gram `K=3` (Qwen3-8B, 128 sequences). With `TPU_GREEDY_TOP_TOKENS`, which also warms the top-token variants, it took 5.6 s, 17.6 s, and 33.4 s. KV-cache capacity changed by at most one block.
+- **Startup** precompiles the thinking-budget sampler functions for every request bucket, plus every verify bucket with speculative decoding. On TPU v7x (`TP=8`), this took 3.7 s for plain decode (Qwen3-8B, 128 sequences), 15.7 s with MTP `K=2` (Qwen3.5-27B, 32 sequences), and 29.9 s with N-gram `K=3` (Qwen3-8B, 128 sequences). With `TPU_GREEDY_TOP_TOKENS`, which also warms the top-token variants, it took 5.6 s, 17.6 s, and 33.4 s. KV-cache capacity changed by at most one block.
 - **Decode** cost, measured on Qwen3-8B (TPU v7x, `TP=8`, greedy, `TPU_GREEDY_TOP_TOKENS=0`) with a budget large enough that no request was forced:
 
 | Mode | Sequences | TPOT, no budget | TPOT, every request budgeted |

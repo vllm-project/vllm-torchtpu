@@ -17,9 +17,9 @@ End-to-end tests for per-request ``thinking_token_budget`` on TPU.
 A real reasoning model served with ``reasoning_parser="qwen3"`` exercises what
 the CPU tests in tests/runner/test_thinking_budget.py cannot: vLLM deriving
 the reasoning marker token IDs from the tokenizer
-(``ReasoningConfig.initialize_token_ids``), and the compiled forcing kernels
-running through ``TPUModelRunner.sample_tokens`` at real logits shapes, on plain
-decode and on ngram speculative decoding.
+(``ReasoningConfig.initialize_token_ids``), and the forcing compiled sampler
+functions running through ``TPUModelRunner.sample_tokens`` at real logits shapes,
+on plain decode and on ngram speculative decoding.
 
 Mirrors upstream vLLM's
 tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py: count

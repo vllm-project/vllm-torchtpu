@@ -89,7 +89,7 @@ GEMMA4_START, GEMMA4_END = (105, 2364, 107), (106, 107)
 
 @pytest.fixture(autouse=True)
 def _eager_cpu_kernels(request: pytest.FixtureRequest):
-    """Run ``@torch.compile(backend="tpu")`` kernels eagerly in CPU tests."""
+    """Run the compiled sampler functions (``backend="tpu"``) eagerly in CPU tests."""
     if request.node.get_closest_marker("tpu_test") is not None:
         yield
         return
@@ -537,7 +537,7 @@ class TestUpstreamParityAndBoundaries:
         st_other = compute_sequence_state([1, 90, 10, 11], 2, markers)
         assert query_forced_token(st_other, markers) == end_ids[0]
 
-        # Plain decode kernels: query, force the logits, sample and advance.
+        # The plain-decode compiled sampler functions: query, force, sample, advance.
         table = torch.tensor([UNTRACKED_STATE, st], dtype=torch.int32)
         slots = torch.tensor([1, 0], dtype=torch.int32)
         logits = torch.zeros((2, 256))
@@ -712,7 +712,8 @@ class TestKMPKernelsFuzz:
             eff_t = invalidate_forced_drafts(draft_t, forced_tgt, did_f_t)
             raw_bonus_logits = torch.zeros((4, vocab_sz), dtype=torch.float32)
             raw_bonus_logits[:, 3] = 4.0
-            # [6] slot-width bonus IDs for 4 bonus rows: the kernels slice.
+            # [6] slot-width bonus IDs for 4 bonus rows: the compiled sampler
+            # functions slice them.
             fbonus_l, _ = force_logits_rows(raw_bonus_logits, forced_bonus)
             fbonus_t, _ = force_token_ids(
                 torch.full((4,), 3, dtype=torch.int64), forced_bonus
@@ -822,6 +823,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
 
         with pytest.raises(RuntimeError, match="RequestSlotAllocator is full"):
             tracker.prepare_step(["r0", "r1", "r2"], reqs)
+        # r0 keeps its slot while unscheduled; preempting it frees one for r2.
+        tracker.on_preempted(["r0"])
         assert (
             tracker.prepare_step(["r1", "r2"], {"r1": reqs["r1"], "r2": reqs["r2"]})
             is not None
@@ -903,9 +906,9 @@ class TestLifecyclePreemptionAndChunkedPrefill:
     def test_more_concurrent_requests_than_max_num_reqs_across_waves(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With > ``max_num_reqs`` live budgeted requests rotating across unscheduled
-        waves (``preempted_req_ids=None``), ``release_unscheduled`` frees slots on
-        wave swaps and re-entering requests reseed from committed outputs."""
+        """With > ``max_num_reqs`` live budgeted requests rotating across waves,
+        preempted requests free their slots and re-entering requests reseed from
+        committed outputs."""
         monkeypatch.setattr(
             gpu_model_runner, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
         )
@@ -918,8 +921,11 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         # Admit 5 concurrent budgeted requests across waves of size <= 2.
         budgets = {"r0": 2, "r1": 1, "r2": 0, "r3": 2, "r4": 1}
 
-        def schedule_wave(wave_ids: list[str], new_ids: list[str]) -> None:
+        def schedule_wave(
+            wave_ids: list[str], new_ids: list[str], preempted: set[str]
+        ) -> None:
             so = SchedulerOutput.make_empty()
+            so.preempted_req_ids = preempted
             so.num_scheduled_tokens = {
                 rid: (len(prompt) if rid in new_ids else 1) for rid in wave_ids
             }
@@ -978,22 +984,56 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             return toks
 
         # Wave 1: admit r0 (budget=2), r1 (budget=1); emit 1 token each.
-        schedule_wave(["r0", "r1"], ["r0", "r1"])
+        schedule_wave(["r0", "r1"], ["r0", "r1"], set())
         assert decode_wave(["r0", "r1"], [20, 30]) == [20, 30]
 
-        # Wave 2: evict r0, r1 implicitly (preempted_req_ids=None) & admit r2, r3.
-        schedule_wave(["r2", "r3"], ["r2", "r3"])
+        # Wave 2: preempt r0, r1 & admit r2, r3.
+        schedule_wave(["r2", "r3"], ["r2", "r3"], {"r0", "r1"})
         assert set(tracker.slots.allocator.allocated_req_ids()).isdisjoint({"r0", "r1"})
         assert decode_wave(["r2", "r3"], [40, 50]) == [GEMMA4_END[0], 50]
 
-        # Wave 3: admit r4 (5th live request!) alongside cold-reentering r0.
-        schedule_wave(["r4", "r0"], ["r4"])
+        # Wave 3: preempt r2, r3 & admit r4 (5th live request!) alongside
+        # cold-reentering r0.
+        schedule_wave(["r4", "r0"], ["r4"], {"r2", "r3"})
         assert len(runner.requests) == 5 and len(tracker.requests) == 5
-        assert tracker.needs_output_reseed(["r4", "r0"])
         # r0 already has [20] (1/2 budget used): next token [21] hits 2/2, then forces!
         assert decode_wave(["r4", "r0"], [60, 21]) == [60, 21]
         assert decode_wave(["r4", "r0"], [61, 22]) == [GEMMA4_END[0], GEMMA4_END[0]]
         assert decode_wave(["r4", "r0"], [62, 23]) == [GEMMA4_END[1], GEMMA4_END[1]]
+
+    def test_a_skipped_request_keeps_its_slot_and_state(self) -> None:
+        """A budgeted request that a step does not schedule keeps its slot and
+        its device state, and continues from them without a cold row."""
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=2, device=torch.device("cpu"))
+        markers = tracker.markers
+        assert markers is not None
+        prompt = [1, *GEMMA4_START]
+        sp = SamplingParams(thinking_token_budget=2)
+        reqs = {rid: _request_state(rid, prompt, sp) for rid in ("a", "b")}
+        for rid in reqs:
+            tracker.add(rid, sp, prompt)
+        cold_rows: list[str] = []
+
+        def decode(batch: list[str], raw_toks: list[int]) -> list[int]:
+            tracker.update_states(SchedulerOutput.make_empty(), reqs)
+            table = tracker.prepare_step(batch, reqs, cold_rows.append)
+            slots = _chunk_slot_ids(tracker, batch, 0, len(batch))
+            assert table is not None and slots is not None
+            sel = torch.tensor([[t] for t in raw_toks], dtype=torch.int64)
+            out, table = _override_and_advance(table, slots, sel, markers)
+            tracker.slots.commit_table(table)
+            return out[:, 0].tolist()
+
+        assert decode(["a", "b"], [20, 30]) == [20, 30]
+        slot_a = tracker.slots.allocator.slot_for("a")
+        # "a" is skipped for a step.
+        assert decode(["b"], [31]) == [31]
+        assert tracker.slots.allocator.slot_for("a") == slot_a
+        # "a" has 1 of its 2 tokens left, "b" none.
+        assert decode(["a", "b"], [21, 32]) == [21, GEMMA4_END[0]]
+        assert decode(["a", "b"], [22, 33]) == [GEMMA4_END[0], GEMMA4_END[1]]
+        assert cold_rows == []
 
     @pytest.mark.parametrize(
         ("explicit_preempt", "settled_outputs"),
@@ -1054,7 +1094,9 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         so_preempt.preempted_req_ids = {"p"} if explicit_preempt else None
         runner._update_states(so_preempt)
         assert "p" not in runner.input_batch.req_id_to_index
-        assert "p" not in tracker.slots.allocator.allocated_req_ids()
+        # Unreported, the preemption looks like a skipped step: "p" keeps its slot.
+        allocated = tracker.slots.allocator.allocated_req_ids()
+        assert ("p" in allocated) is not explicit_preempt
 
         all_toks = [*prompt, *settled_outputs]
         so_resume = SchedulerOutput.make_empty()

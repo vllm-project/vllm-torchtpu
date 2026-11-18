@@ -2959,9 +2959,7 @@ class TPUModelRunner(GPUModelRunner):
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
         if self._thinking_budget is not None:
-            self._thinking_budget.update_states(
-                scheduler_output, self.input_batch.req_id_to_index, self.requests
-            )
+            self._thinking_budget.update_states(scheduler_output, self.requests)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -5311,6 +5309,15 @@ class TPUModelRunner(GPUModelRunner):
                 self._pre_async_results = None
                 return
 
+    def _settle_in_flight_outputs(self, req_id: str) -> None:
+        """Write the previous step's async results into ``output_token_ids``
+        now if one of them belongs to ``req_id``. The thinking-budget tracker
+        calls it before it rebuilds a request's state from its outputs."""
+        pre = self._pre_async_results
+        if pre is not None and req_id in pre.req_ids:
+            self._modify_prev_results()
+            self._pre_async_results = None
+
     def _mask_min_tokens(
         self,
         logits: torch.Tensor,
@@ -5715,15 +5722,11 @@ class TPUModelRunner(GPUModelRunner):
 
         tb_step = None
         if not self.is_pooling_model and state.logits_list and self._thinking_budget:
-            if self._pre_async_results is not None:
-                in_flight = set(self._pre_async_results.req_ids)
-                if self._thinking_budget.needs_output_reseed(
-                    r for r in req_ids if r in in_flight
-                ):
-                    self._modify_prev_results()
-                    self._pre_async_results = None
             tb_step = self._thinking_budget.step_state(
-                req_ids, self.requests, discard_sampled_tokens_req_ids
+                req_ids,
+                self.requests,
+                discard_sampled_tokens_req_ids,
+                self._settle_in_flight_outputs,
             )
         if self.is_pooling_model:
             self._update_num_xla_graphs("pooling_step")
