@@ -22,7 +22,8 @@ import torch
 from vllm import SamplingParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.runner import min_tokens
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
+from vllm_torchtpu.runner import min_tokens, tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 NEG_INF = float("-inf")
@@ -512,3 +513,132 @@ def test_spec_verify_chunk_processors_run_after_grammar_and_min_tokens(
 
     assert seen == [(NEG_INF, NEG_INF)]
     assert out[0].tolist() == [30, 31, 35]
+
+
+# Processors and the packed top-k candidate paths: the fused verifies have no
+# processor hooks, and packed candidates are neither logits nor greedy tokens.
+
+
+class _TpuTopTokens:
+    """Greedy top tokens whose device reads as TPU, so the TPU-only fused
+    verify branch is the one under test."""
+
+    def __init__(self, values: torch.Tensor):
+        self.values = values
+        self.device = SimpleNamespace(type="tpu")
+
+
+def test_spec_verify_chunk_top_tokens_with_processors_skips_the_fused_verify(
+    monkeypatch,
+) -> None:
+    runner = _runner(spec_k=2)
+    fused = MagicMock(side_effect=AssertionError("fused verify with processors"))
+    monkeypatch.setattr(tpu_runner, "_fused_greedy_verify_from_top_tokens", fused)
+    gather = runner.spec_bonus_and_target_tokens
+    runner.spec_bonus_and_target_tokens = lambda tokens, *args: gather(
+        tokens.values, *args
+    )
+    logits = torch.full((4, 128), -20.0)
+    for row, tok in enumerate((30, 31, 32)):
+        logits[row, tok] = 6.0
+    tokens = _TpuTopTokens(torch.argmax(logits, -1, keepdim=True))
+    args = (
+        _verify_md([30, 31]),
+        None,
+        SimpleNamespace(scheduled_spec_decode_tokens={}),
+        0,
+        1,
+        True,
+        torch.Generator().manual_seed(0),
+        True,
+        {},
+    )
+    events: list[str] = []
+
+    out = runner._sample_spec_verify_chunk(
+        tokens, *args, [_SpecRecorder("p1", events, bonus=33)]
+    )
+
+    assert out[0].tolist() == [30, 31, 33]
+    assert events == ["p1.prepare_tokens", "p1.finish:[30, 31, 33]"]
+    # Without processors the same TPU chunk takes the fused verify.
+    fused.side_effect = None
+    fused.return_value = sentinel = torch.zeros((4, 3), dtype=torch.int64)
+    assert runner._sample_spec_verify_chunk(tokens, *args) is sentinel
+
+
+class _ReachedGather(Exception):
+    pass
+
+
+def test_spec_verify_chunk_with_processors_skips_the_candidate_verify() -> None:
+    runner = _runner(all_greedy=False, spec_k=2)
+    runner._sampler_topk_candidates = lambda *_args: 1
+    runner._build_padded_sampling_params = (
+        lambda _start, _end, logits, padded_num_reqs=None: (
+            torch.full((padded_num_reqs or logits.shape[0], 1), 0.7),
+            torch.full((padded_num_reqs or logits.shape[0], 1), 2, dtype=torch.int32),
+            torch.ones((padded_num_reqs or logits.shape[0], 1)),
+        )
+    )
+    fused = MagicMock(return_value=torch.zeros((4, 3), dtype=torch.int64))
+    runner.rejection_sampler.fused_verify_and_sample_candidates = fused
+    runner.spec_gather_bonus_and_target_logits = MagicMock(side_effect=_ReachedGather)
+    args = (
+        torch.zeros((4, 2 * CANDIDATE_BLOCK)),
+        _verify_md([30, 31]),
+        None,
+        SimpleNamespace(scheduled_spec_decode_tokens={}),
+        0,
+        1,
+        False,
+        torch.Generator().manual_seed(0),
+        False,
+        {},
+    )
+
+    # A sampled chunk within the candidate blocks takes the fused verify ...
+    assert runner._sample_spec_verify_chunk(*args) is fused.return_value
+    # ... unless it has processors: they need the gathered logits.
+    with pytest.raises(_ReachedGather):
+        runner._sample_spec_verify_chunk(*args, [_SpecRecorder("p1", [])])
+    assert fused.call_count == 1
+
+
+def test_packed_topk_candidates_never_meet_a_processor() -> None:
+    runner = _runner(all_greedy=False, spec_k=2)
+    packed = torch.zeros((4, 64))
+    events: list[str] = []
+
+    with pytest.raises(AssertionError):
+        runner._sample_plain_chunk(
+            packed,
+            cur_start_idx=0,
+            cur_end_idx=1,
+            top_tokens=False,
+            all_greedy=False,
+            sampling_generator=None,
+            grammar_output=None,
+            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+            is_spec_step=False,
+            min_toks={},
+            processors=[_PlainRecorder("p1", 50, 100.0, events)],
+            topk_candidates_packed=True,
+        )
+    with pytest.raises(AssertionError):
+        runner._sample_spec_verify_chunk(
+            packed,
+            _verify_md([30, 31]),
+            None,
+            SimpleNamespace(scheduled_spec_decode_tokens={}),
+            0,
+            1,
+            False,
+            None,
+            False,
+            {},
+            [_SpecRecorder("p1", events)],
+            True,
+        )
+    # Neither path ran a hook on the packed values.
+    assert events == []

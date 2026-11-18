@@ -6368,6 +6368,9 @@ class TPUModelRunner(GPUModelRunner):
             # min_tokens on the full logits.
             assert not top_tokens
             logits = self._mask_min_tokens(logits, min_tokens_rows, min_toks)
+        # _topk_candidates_this_step keeps a step with a thinking-token budget
+        # on the full logits, so packed candidates never meet a processor.
+        assert not (topk_candidates_packed and processors)
         if not top_tokens:
             for proc in processors:
                 logits = proc.apply(logits)
@@ -6447,8 +6450,12 @@ class TPUModelRunner(GPUModelRunner):
         target_argmax: torch.Tensor | None = None
         params: _ChunkSamplingParams | None = None
         if top_tokens:
-            if logits.device.type == "tpu" and isinstance(
-                self.rejection_sampler, RejectionSampler
+            # The fused verify has no processor hooks: a chunk with processors
+            # verifies through prepare_tokens below.
+            if (
+                not processors
+                and logits.device.type == "tpu"
+                and isinstance(self.rejection_sampler, RejectionSampler)
             ):
                 accept_u = (
                     torch.rand(
@@ -6486,6 +6493,9 @@ class TPUModelRunner(GPUModelRunner):
                     max_draft_tokens,
                 )
         elif topk_candidates_packed:
+            # _topk_candidates_this_step keeps thinking-budget steps off the
+            # packed candidates.
+            assert not processors
             padded_num_reqs = md.bonus_logits_indices.shape[0]
             req_temperatures, req_top_k, req_top_p = self._build_padded_sampling_params(
                 cur_start_idx,
@@ -6545,7 +6555,9 @@ class TPUModelRunner(GPUModelRunner):
                     min_tokens_rows = min_tokens_mask.verify_rows(
                         min_toks, cur_start_idx, draft_lengths.tolist()
                     )
-            if not all_greedy and grammar_output is None:
+            # As for the fused greedy verify below, a chunk with processors
+            # verifies on the gathered logits, after prepare_logits.
+            if not all_greedy and grammar_output is None and not processors:
                 topk_candidates = self._sampler_topk_candidates(
                     cur_start_idx, cur_end_idx, grammar_output
                 )
@@ -11027,7 +11039,18 @@ class TPUModelRunner(GPUModelRunner):
                 self.input_batch, self.requests
             )
             and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
+            # The thinking-token budget's chunk processors need the full logits
+            # here: they cannot rewrite packed candidates (chunk_processors).
+            and not self._thinking_budget_in_batch()
         )
+
+    def _thinking_budget_in_batch(self) -> bool:
+        """Whether a request in the batch has a thinking-token budget."""
+        tracker = self._thinking_budget
+        if not tracker:
+            return False
+        budgets = tracker.requests
+        return any(req_id in budgets for req_id in self.input_batch.req_id_to_index)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_top_tokens(
