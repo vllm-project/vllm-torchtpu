@@ -175,8 +175,11 @@
 /src/vllm_torchtpu/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 /tests/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 
+# Models: Qwen4 Experimental
+/src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+
 # Models: Qwen4 Experimental (Alibaba)
-/src/vllm_torchtpu/models/vllm/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
+/src/vllm_torchtpu/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 /tests/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 
 # Models: Qwen3.8 Flash
