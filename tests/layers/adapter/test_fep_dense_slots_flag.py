@@ -13,10 +13,10 @@
 # limitations under the License.
 """The dense-slots layer is off by default: every call takes the v3 layer. With
 the Config field dense_slots (set by the Qwen3.5 DP4 x TP2 layout table), calls
-of at most dense_slots_max_tokens rows per shard (default 64) take the
-dense-slots layer with the caller's operands, larger calls keep v3; a bad
-threshold raises. The layer hands its program the shard's rows unpadded when
-they are a multiple of 8 (CPU, no kernel is built)."""
+of at most dense_slots_max_tokens rows per shard (default 64), a multiple of 8,
+take the dense-slots layer with the caller's operands, other calls keep v3; a
+bad threshold raises. The layer hands its program the shard's rows unpadded and
+refuses a count that is not a multiple of 8 (CPU, no kernel is built)."""
 
 from types import SimpleNamespace
 
@@ -69,6 +69,8 @@ def test_on_takes_dense_up_to_the_threshold(monkeypatch):
         (8 * 48, "dense"),
         (8 * 56, "dense"),
         (8 * 64, "dense"),
+        (8 * 60, "v3"),
+        (8 * 20, "v3"),
         (8 * 72, "v3"),
         (8 * 1024, "v3"),
     ):
@@ -132,14 +134,15 @@ def _builder_kwargs(monkeypatch, rows_per_shard):
     return got
 
 
-@pytest.mark.parametrize(
-    "rows,real_rows,padded_to",
-    [(48, 48, 64), (64, 64, 64), (8, 8, 32), (20, None, 32), (60, None, 64)],
-)
-def test_the_program_takes_unpadded_rows_in_multiples_of_8(
-    monkeypatch, rows, real_rows, padded_to
-):
+@pytest.mark.parametrize("rows,padded_to", [(48, 64), (56, 64), (64, 64), (8, 32)])
+def test_the_program_takes_the_shards_rows_unpadded(monkeypatch, rows, padded_to):
     k = _builder_kwargs(monkeypatch, rows)
-    assert k["real_rows"] == real_rows
+    assert k["real_rows"] == rows
     assert k["tokens_per_shard"] == padded_to
     assert k["experts_per_shard"] == 64 and k["num_experts"] == EP * 64
+
+
+@pytest.mark.parametrize("rows", [20, 60])
+def test_rows_not_a_multiple_of_8_are_refused(monkeypatch, rows):
+    with pytest.raises(ValueError, match="multiple of 8"):
+        _builder_kwargs(monkeypatch, rows)

@@ -50,7 +50,7 @@ result_rows="bf16" (and elementwise float32, where every compilation agrees).
 """
 
 import functools
-from typing import Any, cast
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -219,6 +219,7 @@ def build_kernel(
     *,
     num_shards,
     tokens_per_shard,
+    real_rows,
     hidden,
     inter,
     experts_per_shard,
@@ -230,25 +231,23 @@ def build_kernel(
     result_slots=3,
     out_dtype=jnp.bfloat16,
     num_experts=None,
-    real_rows=None,
 ):
-    """The per-shard Pallas program: a callable of the shard index, (with
-    real_rows) the valid-row count, the shard's rows, top-k indices and
-    weights, and the local experts' weights and scales.
+    """The per-shard Pallas program: a callable of the shard index, the
+    valid-row count, the shard's rows, top-k indices and weights, and the
+    local experts' weights and scales.
 
-    The index exchange and the tables run inside the program, after the
-    first weight refills are issued (so they stream under the table math),
-    and reach the scalar core by a VMEM -> SMEM copy. The arrivals and the
-    weighted sum stay in VMEM."""
-    # real_rows: the program takes the shard's real rows, top-k and weights
-    # unpadded, plus the valid-row count, and does the padding and the
-    # valid-row masking itself (no XLA pads or masks around it).
-    R = tokens_per_shard if real_rows is None else real_rows
-    if real_rows is not None and (R % 8 or tokens_per_shard < R):
+    The program takes the shard's real_rows rows, top-k and weights
+    unpadded, plus the valid-row count, and does the padding to
+    tokens_per_shard rows and the valid-row masking itself (no XLA pads or
+    masks around it). The index exchange and the tables run inside the
+    program, after the first weight refills are issued (so they stream under
+    the table math), and reach the scalar core by a VMEM -> SMEM copy. The
+    arrivals and the weighted sum stay in VMEM."""
+    R = real_rows
+    if R % 8 or tokens_per_shard < R:
         raise ValueError(
             f"real_rows {real_rows}: a multiple of 8, at most {tokens_per_shard}"
         )
-    unpadded = real_rows is not None
     D, Tp, H, INTER, G, K, T = (
         num_shards,
         tokens_per_shard,
@@ -273,12 +272,8 @@ def build_kernel(
     E = num_experts if num_experts is not None else G * D
 
     def kernel(*refs):
-        # Bound below only with real_rows; Any, so the type checker neither
-        # narrows it to None nor reports it unbound.
-        keep: Any = None
         it = iter(refs)
-        me_ref = next(it)
-        nv_ref: Any = next(it) if unpadded else None
+        me_ref, nv_ref = next(it), next(it)
         x_ref, idx_ref, wts_ref = next(it), next(it), next(it)
         w1_ref, w2_ref, w1s_ref, w2s_ref = (next(it) for _ in range(4))
         out_ref = next(it)
@@ -327,30 +322,22 @@ def build_kernel(
         # The shard's rows quantized as v3's transport does (quantize_rows,
         # per-row scale), then all-gathered: one remote copy per peer into this
         # shard's block of the peer's resident rows.
-        if unpadded:
-            keep = lax.broadcasted_iota(jnp.int32, (R, 1), 0) < nv_ref[0]
-            x_in = jnp.where(keep, x_ref[...], jnp.zeros_like(x_ref[...]))
-        else:
-            x_in = x_ref[...]
+        keep = lax.broadcasted_iota(jnp.int32, (R, 1), 0) < nv_ref[0]
+        x_in = jnp.where(keep, x_ref[...], jnp.zeros_like(x_ref[...]))
         xq, xs = quantize_rows(x_in, jnp.float32, block=0, dtype=elementwise)
         block = pl.ds(pl.multiple_of(me * Tp, ROW_ALIGN), Tp)
         # Straight into every peer's resident copy (VMEM): no landing buffer,
         # no reload.
-        if unpadded:
-            real_block = pl.ds(pl.multiple_of(me * Tp, ROW_ALIGN), R)
-            rows_all[block, :] = jnp.zeros((Tp, H), FP8)
-            scales_all[block, :] = jnp.zeros((Tp, LANES), jnp.float32)
-            rows_all[real_block, :] = xq
-            scales_all[real_block, :] = jnp.broadcast_to(xs, (R, LANES))
-            w_in = jnp.where(keep, wts_ref[...], 0.0)
-            idx_in = jnp.where(keep & (w_in != 0), idx_ref[...], E)
-            idx_all[block, :] = jnp.full((Tp, LANES), E, jnp.int32)
-            idx_all[real_block, 0:K] = idx_in
-            coef_vmem[...] = w_in
-        else:
-            rows_all[block, :] = xq
-            scales_all[block, :] = jnp.broadcast_to(xs, (Tp, LANES))
-            idx_all[block, :] = idx_ref[...]
+        real_block = pl.ds(pl.multiple_of(me * Tp, ROW_ALIGN), R)
+        rows_all[block, :] = jnp.zeros((Tp, H), FP8)
+        scales_all[block, :] = jnp.zeros((Tp, LANES), jnp.float32)
+        rows_all[real_block, :] = xq
+        scales_all[real_block, :] = jnp.broadcast_to(xs, (R, LANES))
+        w_in = jnp.where(keep, wts_ref[...], 0.0)
+        idx_in = jnp.where(keep & (w_in != 0), idx_ref[...], E)
+        idx_all[block, :] = jnp.full((Tp, LANES), E, jnp.int32)
+        idx_all[real_block, 0:K] = idx_in
+        coef_vmem[...] = w_in
         ag_src = (rows_all.at[block], scales_all.at[block])
         ag_dst = ag_src
         _barrier(D, mesh_axes)
@@ -376,7 +363,7 @@ def build_kernel(
                 ).start()
         if D > 1:
             _wait_rows(sem_idx_recv, idx_all, (D - 1) * Tp)
-        own_idx = idx_all[block, :] if unpadded else idx_ref[...]
+        own_idx = idx_all[block, :]
         mp, tab, pos, misc = _tables_math(
             me, idx_all[...], own_idx, D=D, Tp=Tp, G=G, K=K, E=E
         )
@@ -571,12 +558,10 @@ def build_kernel(
             _wait_rows(sem_push_recv, arrivals_ref, recv_remote)
 
         del own_local  # local pushes are drained per slot above
+
         # v3's weighted_sum body on the arrivals in place: per token the top_k
         # rows (looked up by pair), k in order, each times its coefficient, a
         # zero coefficient's term dropped.
-        if not unpadded:
-            coef_vmem[...] = wts_ref[...]
-
         def token(t, carry):
             c = coef_vmem[pl.ds(t, 1), :]
             acc = None
@@ -644,7 +629,7 @@ def build_kernel(
     program = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2 if unpadded else 1,
+            num_scalar_prefetch=2,
             in_specs=in_specs,
             out_specs=out_specs,
             scratch_shapes=tuple(scratch),
@@ -652,7 +637,7 @@ def build_kernel(
         ),
         out_shape=out_shape,
         compiler_params=pltpu.CompilerParams(**params),
-        name=f"fused_ep_dense_slots_fm{'u' if unpadded else ''}s_g{G}_t{T}_n{N}",
+        name=f"fused_ep_dense_slots_fmus_g{G}_t{T}_n{N}",
     )
     return program
 
@@ -678,9 +663,9 @@ def dense_slots_moe(
     """The dense-slots layer: same operands and result as v3's fused_ep_moe
     with fp8 weights, per-channel scales, silu and bf16 result rows (the
     DP4xTP2 decode binding). x [tokens, hidden] bf16 sharded over the mesh
-    axis; router logits [tokens, num_experts]. A shard of a multiple of 8
-    rows hands the program its rows unpadded; any other count is padded to
-    ROW_ALIGN rows outside it."""
+    axis; router logits [tokens, num_experts]. Each shard's rows, a multiple
+    of 8, go to the program unpadded; it pads them to ROW_ALIGN rows
+    itself."""
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer  # select kernel
 
     if config is None:
@@ -694,13 +679,17 @@ def dense_slots_moe(
     G = experts_per_shard or num_experts_w // num_shards
     num_experts = G * num_shards
     real = tokens // num_shards
+    if real % 8:
+        raise ValueError(
+            f"{real} rows per shard: the dense-slots layer takes a multiple of 8 "
+            "(the fused EP adapter keeps other counts on the v3 layer)"
+        )
     Tp = _align(real, ROW_ALIGN)
     K = top_k
-    unpadded = real % 8 == 0
     program = build_kernel(
         out_dtype=x.dtype,
         num_experts=num_experts,
-        real_rows=real if unpadded else None,
+        real_rows=real,
         num_shards=num_shards,
         tokens_per_shard=Tp,
         hidden=hidden,
@@ -717,72 +706,32 @@ def dense_slots_moe(
     def body(x_l, logits_l, w1_l, w2_l, s1_l, s2_l, shard_l, *rest):
         me = shard_l.reshape(-1)[0]
         n_valid = rest[0].reshape(-1)[0] if with_valid else None
-        if unpadded:
-            weights, indices = v3_layer._select(
-                logits_l,
-                top_k=K,
-                tokens_per_shard=real,
-                renormalize=renormalize,
-                drop_nan_rows=drop_nan_rows,
-                message_rows=None,
-                valid_tokens=None if n_valid is None else n_valid.reshape(1),
-            )
-            nv = (
-                jnp.full((1,), real, jnp.int32)
-                if n_valid is None
-                else n_valid.astype(jnp.int32).reshape(1)
-            )
-            (out,) = program(
-                me.reshape(1),
-                nv,
-                x_l.astype(jnp.bfloat16),
-                indices.astype(jnp.int32),
-                weights.astype(jnp.float32),
-                w1_l[:G],
-                w2_l[:G],
-                s1_l[:G].astype(jnp.float32),
-                s2_l[:G].astype(jnp.float32),
-            )
-            return out
-        if Tp > real:
-            x_l = jnp.pad(x_l, ((0, Tp - real), (0, 0)))
-            logits_l = jnp.pad(
-                logits_l, ((0, Tp - real), (0, 0)), constant_values=jnp.nan
-            )
-        if n_valid is not None:
-            keep = jnp.arange(Tp, dtype=jnp.int32) < n_valid
-            x_l = jnp.where(keep[:, None], x_l, 0)
         weights, indices = v3_layer._select(
             logits_l,
             top_k=K,
-            tokens_per_shard=Tp,
+            tokens_per_shard=real,
             renormalize=renormalize,
             drop_nan_rows=drop_nan_rows,
             message_rows=None,
             valid_tokens=None if n_valid is None else n_valid.reshape(1),
         )
-        # A row with no finite logit gets weight zero from the select.
-        indices = jnp.where(weights != 0, indices, num_experts)
-        if n_valid is not None:
-            keep = (jnp.arange(Tp, dtype=jnp.int32) < n_valid)[:, None]
-            indices = jnp.where(keep, indices, num_experts)
-            weights = jnp.where(keep, weights, 0.0)
-        idx_pad = jnp.pad(
-            indices.astype(jnp.int32),
-            ((0, 0), (0, LANES - K)),
-            constant_values=num_experts,
+        nv = (
+            jnp.full((1,), real, jnp.int32)
+            if n_valid is None
+            else n_valid.astype(jnp.int32).reshape(1)
         )
         (out,) = program(
             me.reshape(1),
+            nv,
             x_l.astype(jnp.bfloat16),
-            idx_pad,
+            indices.astype(jnp.int32),
             weights.astype(jnp.float32),
             w1_l[:G],
             w2_l[:G],
             s1_l[:G].astype(jnp.float32),
             s2_l[:G].astype(jnp.float32),
         )
-        return out[:real]
+        return out
 
     if shard_index is None:
         shard_index = jnp.arange(num_shards, dtype=jnp.int32).reshape(num_shards, 1)
