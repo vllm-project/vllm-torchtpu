@@ -5067,6 +5067,34 @@ class TPURaidenConnectorWorker:
             self._stage3_reported_sends.discard(req_id)
             self._stage3_prune_state_send_tracking(req_id)
 
+        # Retires this rank's registration of a uuid the scheduler published
+        # ahead of the finish and did not hand to a consumer (the request was
+        # preempted, or its finish minted a fresh send or none), exactly as
+        # the ungrouped path does; no finished_sending is reported for it.
+        # Without this a preempted request's re-published send met the stale
+        # ahead registration and raised the duplicate-registration error
+        # (j-37f0b38b, PP8, c112).
+        for req_id, uuid in metadata.reqs_to_release.items():
+            registration = self._stage3_registered_sends.get(req_id)
+            if registration is None or registration.uuid != int(uuid):
+                continue
+            del self._stage3_registered_sends[req_id]
+            self._stage3_status_probe_next.pop(req_id, None)
+            facade.release_request_blocks(req_id=req_id, uuid=int(uuid))
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage3_registration_released",
+                        "req_id": req_id,
+                        "uuid": int(uuid),
+                        "transfer_rank": transfer_rank,
+                    },
+                    sort_keys=True,
+                ),
+            )
+
+        pipeline = _engine_is_pipeline(self.vllm_config)
         for req_id, req_meta in metadata.reqs_to_send.items():
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens or 0)
@@ -5161,11 +5189,20 @@ class TPURaidenConnectorWorker:
                     uuid,
                 )
                 continue
+            # Registered ahead of the scheduler's finish (every pipeline
+            # stage, or a send published in the prompt-completing step): no
+            # TTL and no status probe until finished_req_ids names the
+            # request, as on the ungrouped path. This also arms the replace
+            # branch above, which keys on finish_pending.
+            registered_ahead = (
+                pipeline or getattr(req_meta, "registered_ahead", False) is True
+            )
             self._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
                 uuid=uuid,
                 local_block_ids=registered_ids,
                 num_tokens=num_tokens,
-                expiration_time=expiration_time,
+                expiration_time=(float("inf") if registered_ahead else expiration_time),
+                finish_pending=registered_ahead,
                 group_block_ids=group_ids,
             )
             if not owned_spans:
