@@ -90,6 +90,12 @@ def cp_lse_ag_out_rs(
 
     # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
     lse = lse.to(torch.float32)
+    if envs.TPU_DCP_FUSED_LSE_MERGE and not return_lse and output.device.type == "tpu":
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+        scattered = small_all_reduce_op.dcp_fused_lse_merge(output, lse, group)
+        if scattered is not None:
+            return scattered.transpose(0, 1).contiguous().to(output.dtype)
     lses = None
     if envs.TPU_DCP_LSE_SMALL_ALL_GATHER and output.device.type == "tpu":
         from vllm_torchtpu.layers.adapter import small_all_reduce_op

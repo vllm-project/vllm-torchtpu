@@ -330,6 +330,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
     TPU_DCP_LSE_SMALL_ALL_GATHER: bool = False
     TPU_DCP_SMALL_REDUCE_SCATTER: bool = False
+    TPU_DCP_FUSED_LSE_MERGE: bool = False
     TPU_SMALL_ALL_REDUCE_CHIP_PAIRS: int = 0
     TPU_FUSED_OPROJ_AR: bool = True
     TPU_FUSED_OPROJ_AR_WAVES: bool = True
@@ -2379,6 +2380,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # about 29 us of it fixed cost. The kernel sums in float32 and rounds
     # once, so the result is not bitwise XLA's.
     "TPU_DCP_SMALL_REDUCE_SCATTER": env_bool("TPU_DCP_SMALL_REDUCE_SCATTER"),
+    # With TPU_SMALL_ALL_REDUCE: the whole DCP reduce-scatter merge
+    # (`dcp_comm.cp_lse_ag_out_rs`: LSE all-gather, rescale and
+    # reduce-scatter) runs as one Pallas kernel
+    # (small_collectives/lse_merge.py) over the expert-parallel mesh, when the
+    # DCP group is that mesh in the same rank order, in backbone warmup traces
+    # only, for a bf16 partial of at most
+    # small_all_reduce_op.DCP_LSE_MERGE_MAX_BYTES per core. Each core sends
+    # every other core the unscaled partial of that core's heads and its LSE
+    # in one round of remote DMAs; the receiver weights and sums in float32
+    # and rounds once. Replaces the two collectives and the rescale kernel
+    # (about 50 us per layer at a 64-token decode bucket on 16 cores), and
+    # takes precedence over TPU_DCP_LSE_SMALL_ALL_GATHER and
+    # TPU_DCP_SMALL_REDUCE_SCATTER where it applies. Not bitwise the
+    # two-collective merge (fewer roundings).
+    "TPU_DCP_FUSED_LSE_MERGE": env_bool("TPU_DCP_FUSED_LSE_MERGE"),
     # With TPU_SMALL_ALL_REDUCE: kernel all-reduces of at least this many rows
     # (up to TPU_SMALL_ALL_REDUCE_MAX_ROWS) run the two-shot by chip pairs
     # (small_collectives/all_reduce.py, form "pairs"): each core sends its

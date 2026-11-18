@@ -81,6 +81,7 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode.all_reduce import (
 from vllm_torchtpu.kernels.experimental.small_collectives import (
     all_gather,
     all_reduce,
+    lse_merge,
     reduce_scatter,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
@@ -127,6 +128,8 @@ _AR_SIZED_OP = None
 _RS_OP = None
 # The DCP merge's LSE all-gather (TPU_DCP_LSE_SMALL_ALL_GATHER).
 _AG_OP = None
+# The fused DCP merge (TPU_DCP_FUSED_LSE_MERGE).
+_LSE_MERGE_OP = None
 # The valid-rows all-reduce (TPU_SMALL_ALL_REDUCE_VALID_ROWS) and the bf16 row
 # tile its fold path folds into.
 _AR_VALID_OP = None
@@ -354,6 +357,41 @@ def _build_all_gather(mesh):
     )
 
 
+def _build_lse_merge(mesh):
+    """The fused DCP merge op over ``mesh``: fn(output [T, H, D] bf16, lse
+    [T, H] f32, rank int32 [1]) per core -> [H / cores, T, D], core r's heads
+    merged over the mesh (kernels/experimental/small_collectives/lse_merge.py)."""
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+
+    def body(output, lse, rank):
+        return lse_merge.small_lse_merge(
+            output, lse, num_cores=n, axis=EP_AXIS_NAME, rank=rank
+        )
+
+    def fn(output: jax.Array, lse: jax.Array, rank: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(output, lse, rank)
+
+    def fake(output, lse, rank):
+        tokens, heads, dim = output.shape
+        return output.new_empty((heads // n, tokens, dim))
+
+    return sharded_jax_op(
+        "pallas::small_lse_merge",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec, spec),
+        output_partition_specs=spec,
+        fake=fake,
+    )
+
+
 def _gather(obj) -> list:
     """all_gather_object over the EP group's CPU group, in group rank order."""
     group = get_ep_group()
@@ -499,7 +537,7 @@ def prebuild(hidden_size: int = 0) -> None:
     hidden_size is the model's, the width of the chip-pair self-test."""
     global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
     global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP, _UV_MM_AR_OP, _PAIR_ROWS
-    global _AG_OP
+    global _AG_OP, _LSE_MERGE_OP
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -532,6 +570,8 @@ def prebuild(hidden_size: int = 0) -> None:
     _RS_OP = _build_reduce_scatter(mesh)
     if envs.TPU_DCP_LSE_SMALL_ALL_GATHER:
         _AG_OP = _build_all_gather(mesh)
+    if envs.TPU_DCP_FUSED_LSE_MERGE:
+        _LSE_MERGE_OP = _build_lse_merge(mesh)
     if envs.TPU_SMALL_ALL_REDUCE_VALID_ROWS:
         from jax.experimental.pallas import tpu as pltpu
 
@@ -728,6 +768,47 @@ def dcp_reduce_scatter_heads(x: torch.Tensor, group) -> torch.Tensor | None:
     heads, tokens, dim = x.shape
     out = _RS_OP(x.reshape(heads * tokens, dim).contiguous(), _RANK)
     return out.view(heads // _CORES, tokens, dim)
+
+
+# Largest partial, in bytes per core, the fused DCP merge takes. The kernel
+# holds three buffers of this size in VMEM (input staging, head-major send
+# buffer, receive buffer): 4 MiB (bf16 [64 tokens, 64 heads, 512]) uses about
+# 13.5 MiB. Larger buckets keep the two-collective merge.
+DCP_LSE_MERGE_MAX_BYTES = 4 << 20
+
+
+def dcp_fused_lse_merge(
+    output: torch.Tensor, lse: torch.Tensor, group
+) -> torch.Tensor | None:
+    """The DCP reduce-scatter merge of ``output`` [T, H, D] (this rank's
+    partial for all heads) over its f32 log-sum-exp ``lse`` [T, H] as one
+    Pallas kernel (TPU_DCP_FUSED_LSE_MERGE): returns this rank's heads,
+    head-major [H / world, T, D] in ``output.dtype``, the layout
+    ``group.reduce_scatter`` of the rescaled head-major partial returns.
+
+    Returns None when the kernel cannot take this call: not a backbone warmup
+    trace, the group is not the mesh, ``output`` not bf16, ``lse`` not f32
+    [T, H], heads not divisible by the ranks, the head dim not a multiple of
+    128 lanes, T not a multiple of 16 rows, or more than
+    DCP_LSE_MERGE_MAX_BYTES. The kernel weights and sums in float32 and rounds
+    once, so the result is not bitwise the two-collective merge."""
+    if (
+        _LSE_MERGE_OP is None
+        or not _covers(group)
+        or not torch.compiler.is_compiling()
+        or not shape_variants.in_warmup()
+        or output.dtype != torch.bfloat16
+        or lse.dtype != torch.float32
+        or output.numel() * output.element_size() > DCP_LSE_MERGE_MAX_BYTES
+    ):
+        return None
+    try:
+        lse_merge.check_shapes(
+            tuple(output.shape), "bfloat16", tuple(lse.shape), "float32", _CORES
+        )
+    except ValueError:
+        return None
+    return _LSE_MERGE_OP(output.contiguous(), lse.contiguous(), _RANK)
 
 
 def _fused_layer_weights(layer):
