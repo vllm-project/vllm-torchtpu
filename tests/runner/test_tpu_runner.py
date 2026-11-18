@@ -3277,6 +3277,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             spec_decode_manager=SimpleNamespace(
                 propose_draft_token_ids=lambda **kw: None
             ),
+            _min_tokens_batch_state=lambda: {},
             _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
