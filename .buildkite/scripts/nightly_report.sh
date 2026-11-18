@@ -56,7 +56,8 @@ nightly_tests_lane_keys() {
 
 # Every step nightly_tests_lane_keys names passed. Another generation's steps
 # carry its own prefix and are not among them, so they do not hold back a
-# pair.
+# pair. A build that runs another generation alone (CI_TPU_GENERATIONS=v6e)
+# has none of the steps named here, so it records no pair.
 # A step the report did not wait for may have no outcome yet, which counts as
 # not passed: a nightly test missing from the step's depends_on can stop a pair
 # being recorded, never let one through.

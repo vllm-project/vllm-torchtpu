@@ -2112,8 +2112,15 @@ class TestBootstrapUnits(unittest.TestCase):
                         text=True,
                     )
 
+        # As bootstrap.py uploads it: the tests-lane keys behind the prefix of the
+        # generation every build but a single-generation one runs.
         verify_doc = yaml.safe_load(
-            (_REPO_ROOT / ".buildkite/pipeline_verify.yml").read_text(encoding="utf-8")
+            _expand_env(
+                (_REPO_ROOT / ".buildkite/pipeline_verify.yml").read_text(
+                    encoding="utf-8"
+                ),
+                {"TPU_KEY_PREFIX": self.bp.tests_lane_key_prefix()},
+            )
         )
         report_step = next(
             s
@@ -2207,10 +2214,10 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertNotIn("ci-tpu-generations", [c for _, c, _ in rec.annotations])
 
         # Refused with an error annotation, before any upload: an unknown value
-        # (a generation's name is not one), and a build none of whose lanes is
+        # (TPU_VERSION's tpu6e is not one), and a build none of whose lanes is
         # in TPU_GENERATION_FILES, which would ignore it.
         for env in (
-            {"CI_TPU_GENERATIONS": "v6e"},
+            {"CI_TPU_GENERATIONS": "tpu6e"},
             {
                 "CI_TPU_GENERATIONS": "all",
                 "BUILDKITE_PULL_REQUEST": "42",
@@ -2233,12 +2240,104 @@ class TestBootstrapUnits(unittest.TestCase):
         ):
             bp.upload_stages(
                 (("build", "cpu"), ("tests",)),
-                {"CI_TPU_GENERATIONS": "v6e"},
+                {"CI_TPU_GENERATIONS": "tpu6e"},
                 repo_root=_REPO_ROOT,
             )
         self.assertEqual(by_hand.uploads, [])
         with self.assertRaises(bp.BootstrapError):
-            bp.upload_generations(".buildkite/pipeline_tests.yml", "v6e")
+            bp.upload_generations(".buildkite/pipeline_tests.yml", "tpu6e")
+
+    def test_ci_tpu_generations_runs_one_generation_on_manual_builds(self) -> None:
+        bp = self.bp
+        gens = bp.tpu_generations
+        # A generation's name sends each per-generation file up for it alone;
+        # any other file goes up once. The nightly report then waits on that
+        # generation's tests-lane steps (TPU_KEY_PREFIX), and on v7x's when no
+        # generation runs alone.
+        for name, gen in gens.TPU_GENERATIONS.items():
+            for path in gens.TPU_GENERATION_FILES:
+                self.assertEqual(bp.upload_generations(path, name), (gen,))
+            self.assertEqual(
+                bp.upload_generations(".buildkite/pipeline_cpu.yml", name), (None,)
+            )
+            self.assertEqual(bp.tests_lane_key_prefix(name), gen.key_prefix)
+        for value in ("", gens.CI_TPU_GENERATIONS_ALL):
+            self.assertEqual(
+                bp.tests_lane_key_prefix(value), gens.VERIFIED_TPU_GENERATION.key_prefix
+            )
+
+        # A manual NIGHTLY=1 build: the full suite's tests, integration and perf
+        # lanes go up for v6e alone, its other lanes once, and the nightly report
+        # waits on v6e's tests-lane steps.
+        manual = self._run_bootstrap(
+            {"BUILDKITE_SOURCE": "ui", "CI_TPU_GENERATIONS": "v6e", "NIGHTLY": "1"}
+        )
+        self.assertEqual(
+            [u[0] for u in manual.uploads],
+            ["verify", "perf:v6e", "integration:v6e", "tests:v6e", "cpu", "build"],
+        )
+        self.assertEqual(
+            _tpu_generations_note(manual),
+            (
+                "info",
+                "Runs only the TPU v6e steps of the tests, integration and perf "
+                "lanes (`CI_TPU_GENERATIONS=v6e`).",
+            ),
+        )
+        verify = yaml.safe_load(manual.uploads[0][1])
+        (report,) = [s for s in verify["steps"] if s.get("key") == "nightly_report"]
+        self.assertIn("v6e_unit_tests_general_nightly", report["depends_on"])
+        self.assertNotIn("v7x_unit_tests_general_nightly", report["depends_on"])
+        # Over the API too, and the perf suite alone, for either generation.
+        perf_only = self._run_bootstrap(
+            {"BUILDKITE_SOURCE": "api", "CI_TPU_GENERATIONS": "v6e", "CI_SUITE": "perf"}
+        )
+        self.assertEqual([u[0] for u in perf_only.uploads], ["perf:v6e", "build"])
+        v7x_only = self._run_bootstrap(
+            {"BUILDKITE_SOURCE": "ui", "CI_TPU_GENERATIONS": "v7x"}
+        )
+        self.assertEqual(
+            [u[0] for u in v7x_only.uploads],
+            ["verify", "integration:v7x", "tests:v7x", "cpu", "build"],
+        )
+
+        # Refused, with an error annotation and before any upload, on every
+        # build but a UI or API one that is not a PR, merge-queue, /ci,
+        # release, tag or integration build: those must not skip v7x. Each
+        # case breaks one of those rules alone.
+        for env in (
+            {},
+            {"BUILDKITE_SOURCE": "webhook", "BUILDKITE_BRANCH": "main"},
+            {"BUILDKITE_SOURCE": "trigger_job"},
+            {"BUILDKITE_SOURCE": "schedule", "NIGHTLY": "1"},
+            {"BUILDKITE_SOURCE": "api", "BUILDKITE_PULL_REQUEST": "42"},
+            {
+                "BUILDKITE_SOURCE": "ui",
+                "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+            },
+            {"BUILDKITE_SOURCE": "api", "CI_RUN_TPU": "1"},
+            {
+                "BUILDKITE_SOURCE": "ui",
+                "BUILDKITE_BRANCH": "releases/v0.33.0",
+                "CI_SUITE": "perf",
+            },
+            {"BUILDKITE_SOURCE": "ui", "BUILDKITE_TAG": "experiment-1"},
+            {
+                "BUILDKITE_SOURCE": "api",
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration",
+                "CI_SUITE": "default",
+            },
+            {"BUILDKITE_SOURCE": "ui", "CI_SUITE": "integration"},
+        ):
+            with self.subTest(env=env):
+                refused = self._run_bootstrap(
+                    {"CI_TPU_GENERATIONS": "v6e", **env}, raises=bp.BootstrapError
+                )
+                self.assertEqual(
+                    refused.annotations[-1][:2], ("error", "ci-tpu-generations")
+                )
+                self.assertEqual(refused.uploads, [])
 
     def test_stamped_upload_fails_closed(self) -> None:
         bp = self.bp

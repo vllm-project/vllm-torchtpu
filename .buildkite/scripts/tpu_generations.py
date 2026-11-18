@@ -93,10 +93,16 @@ DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)
 # nightly_report.sh asks for the key prefix (`bootstrap.py verified-key-prefix`).
 VERIFIED_TPU_GENERATION = TPU_V7X
 # CI_TPU_GENERATIONS=all sends those files up for every generation they list,
-# side by side, on any build. The generation brings its shapes, so the build
-# names no KUBE_SHAPE_* of its own. The variable is not named TPU_VERSION
-# because that names one chip to the scripts and model files that read it.
+# side by side, on any build. A manual build may instead name one generation
+# (TPU_GENERATIONS) to run it alone, e.g. to see where v6e stands without
+# holding v7x slices; bootstrap.py refuses that on every other build. The
+# generation brings its shapes, so the build names no KUBE_SHAPE_* of its own.
+# The variable is not named TPU_VERSION because that names one chip to the
+# scripts and model files that read it.
 CI_TPU_GENERATIONS_ALL = "all"
+TPU_GENERATIONS: Mapping[str, TpuGeneration] = {
+    gen.name: gen for listed in TPU_GENERATION_FILES.values() for gen in listed
+}
 
 
 def _own_steps(steps: Sequence[Any]) -> list[dict[str, Any]]:

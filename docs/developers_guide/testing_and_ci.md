@@ -1,6 +1,6 @@
 # Testing & CI Guide
 
-`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_cpu.yml` and `.buildkite/pipeline_tests.yml`), with each step in a Kubernetes pod: CPU pods for unmarked tests and TPU v7x slices (1x1x1 and 2x2x1) for `tpu_test` and `multichip` tests. A build that sets `CI_TPU_GENERATIONS=all` also runs the same TPU tests on TPU v6e slices (1x1 and 2x4); see `.buildkite/README.md`.
+`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_cpu.yml` and `.buildkite/pipeline_tests.yml`), with each step in a Kubernetes pod: CPU pods for unmarked tests and TPU v7x slices (1x1x1 and 2x2x1) for `tpu_test` and `multichip` tests. A build that sets `CI_TPU_GENERATIONS=all` also runs the same TPU tests on TPU v6e slices (1x1 and 2x4), and a manual build that sets `CI_TPU_GENERATIONS=v6e` runs them on v6e alone; see `.buildkite/README.md`.
 
 ---
 

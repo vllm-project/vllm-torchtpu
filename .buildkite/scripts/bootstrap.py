@@ -383,11 +383,13 @@ _PR_SUITES: dict[str, Suite] = {
 
 
 def _check_ci_tpu_generations(value: str) -> None:
-    """Raise `BootstrapError` unless `value` is empty or CI_TPU_GENERATIONS_ALL."""
-    if value and value != tpu_generations.CI_TPU_GENERATIONS_ALL:
+    """Raise `BootstrapError` unless `value` is empty, CI_TPU_GENERATIONS_ALL or
+    a key of TPU_GENERATIONS."""
+    all_ = tpu_generations.CI_TPU_GENERATIONS_ALL
+    if value and value != all_ and value not in tpu_generations.TPU_GENERATIONS:
         raise BootstrapError(
-            f"ERROR: unknown CI_TPU_GENERATIONS '{value}'; the only value is "
-            f"{tpu_generations.CI_TPU_GENERATIONS_ALL}"
+            f"ERROR: unknown CI_TPU_GENERATIONS '{value}'; values are: "
+            f"{' '.join((all_, *tpu_generations.TPU_GENERATIONS))}"
         )
 
 
@@ -417,19 +419,40 @@ def choose_suite(ctx: BuildContext) -> Suite:
 def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
     """Check CI_TPU_GENERATIONS against the build; return its annotation, if any.
 
-    Unset runs DEFAULT_TPU_GENERATIONS, and CI_TPU_GENERATIONS_ALL every
-    generation a lane lists, on any build (see upload_generations).
+    Unset runs DEFAULT_TPU_GENERATIONS, CI_TPU_GENERATIONS_ALL every generation
+    a lane lists, on any build, and a key of TPU_GENERATIONS that generation
+    alone (see upload_generations). One generation alone is only for a UI or
+    API build that is not a PR, merge-queue, /ci, release, tag or integration
+    build, and runs no promote lane: those must not skip v7x.
 
-    Raises BootstrapError for an unknown value, or a value that no lane of the
-    build can use. Returns None when the value is unset or
-    CI_TPU_GENERATIONS_ALL adds nothing beyond the defaults.
+    Raises BootstrapError for an unknown value, a disallowed single generation,
+    or a value that no lane of the build can use. Returns None when the value
+    is unset or CI_TPU_GENERATIONS_ALL adds nothing beyond the defaults.
     """
     value = ctx.ci_tpu_generations
     if not value:
         return None
     _check_ci_tpu_generations(value)
+    single = tpu_generations.TPU_GENERATIONS.get(value)
     files = tpu_generations.TPU_GENERATION_FILES
     lanes = [lane for stage in suite.stages for lane in stage]
+    if single is not None and (
+        ctx.source not in ("ui", "api")
+        or ctx.is_pr
+        or ctx.is_merge_queue
+        or ctx.is_ci_command
+        or ctx.is_release
+        or ctx.tag
+        or ctx.is_integration
+        or "promote" in lanes
+    ):
+        raise BootstrapError(
+            f"ERROR: CI_TPU_GENERATIONS={value} runs one TPU generation, which "
+            "only a UI or API build that is not a PR, merge-queue, /ci, release, "
+            "tag or integration build may do; set CI_TPU_GENERATIONS="
+            f"{tpu_generations.CI_TPU_GENERATIONS_ALL} to run every generation, "
+            "or leave it unset to run the default ones"
+        )
     # Each lane of the build in TPU_GENERATION_FILES, with the generations its
     # file lists.
     in_build = {
@@ -442,6 +465,17 @@ def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
         raise BootstrapError(
             f"ERROR: CI_TPU_GENERATIONS={value} picks the TPU generations of the "
             f"{_lanes_phrase(per_generation)}, and this build runs none"
+        )
+    if single is not None:
+        runs = [lane for lane, gens in in_build.items() if single in gens]
+        if not runs:
+            raise BootstrapError(
+                f"ERROR: CI_TPU_GENERATIONS={value} runs only TPU {single.name} "
+                "steps, and no lane of this build has any"
+            )
+        return (
+            f"Runs only the TPU {single.name} steps of the {_lanes_phrase(runs)} "
+            f"(`CI_TPU_GENERATIONS={value}`)."
         )
     extra = list(
         dict.fromkeys(
@@ -991,19 +1025,34 @@ def upload_generations(
     """Return the TPU generation of each upload of `path`, in upload order.
 
     A file in TPU_GENERATION_FILES goes up once per generation in
-    DEFAULT_TPU_GENERATIONS, and with CI_TPU_GENERATIONS_ALL, once per
-    generation it lists; an unknown `ci_tpu_generations` is refused. Any other
-    file goes up once, for no generation (None), whatever `ci_tpu_generations`
-    is.
+    DEFAULT_TPU_GENERATIONS; with CI_TPU_GENERATIONS_ALL, once per generation
+    it lists; and with a key of TPU_GENERATIONS, for that generation alone. An
+    unknown `ci_tpu_generations` is refused. Any other file goes up once, for
+    no generation (None), whatever `ci_tpu_generations` is.
     """
     if path not in tpu_generations.TPU_GENERATION_FILES:
         return (None,)
     _check_ci_tpu_generations(ci_tpu_generations)
     generations = tpu_generations.TPU_GENERATION_FILES[path]
-    if ci_tpu_generations != tpu_generations.CI_TPU_GENERATIONS_ALL:
+    single = tpu_generations.TPU_GENERATIONS.get(ci_tpu_generations)
+    if single is not None:
+        generations = tuple(gen for gen in generations if gen is single)
+    elif ci_tpu_generations != tpu_generations.CI_TPU_GENERATIONS_ALL:
         defaults = tpu_generations.DEFAULT_TPU_GENERATIONS
         generations = tuple(gen for gen in generations if gen in defaults)
     return generations
+
+
+def tests_lane_key_prefix(ci_tpu_generations: str = "") -> str:
+    """The key prefix of the tests-lane steps a build has: the generation it
+    runs alone, else VERIFIED_TPU_GENERATION's, which every other build runs.
+
+    pipeline_verify.yml's nightly report waits on those steps
+    (TPU_KEY_PREFIX). nightly_report.sh still needs VERIFIED_TPU_GENERATION's
+    passed, so a build that runs another generation alone records no pair.
+    """
+    single = tpu_generations.TPU_GENERATIONS.get(ci_tpu_generations)
+    return (single or tpu_generations.VERIFIED_TPU_GENERATION).key_prefix
 
 
 def upload_stages(
@@ -1125,13 +1174,18 @@ def upload_stages(
             ):
                 print(f"Skipping {upload} (already uploaded for {stage_key})")
                 continue
+            # A file that goes up once may wait on tests-lane steps by key.
+            env = child_env
+            if generation is None:
+                key_prefix = tests_lane_key_prefix(ci_tpu_generations)
+                env = {**child_env, "TPU_KEY_PREFIX": key_prefix}
             upload_with_priority(
                 lane_file,
                 repo_root=repo_root,
                 job_priority=job_priority,
                 nightly=nightly,
                 pr_tpu_concurrency_group=concurrency_group,
-                env=child_env,
+                env=env,
                 tpu_generation=generation,
             )
             _agent("meta-data", "set", meta_key, "1", env=child_env)

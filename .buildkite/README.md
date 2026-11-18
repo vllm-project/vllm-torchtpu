@@ -22,8 +22,14 @@ By default, the TPU steps of the `tests`, `integration` and `perf` lanes run
 only on TPU v7x. To also run them on TPU v6e, start a build with the
 environment variable `CI_TPU_GENERATIONS=all` (set it in the Buildkite UI or
 API). The build then runs each of those steps twice, once on each chip (except
-the steps v6e cannot run, below), and shows the two sets side by side. Any
-other value is rejected, and so is a build that sets `KUBE_SHAPE_SINGLE` or
+the steps v6e cannot run, below), and shows the two sets side by side. A build
+you start from the UI or API can instead set `CI_TPU_GENERATIONS=v6e` or
+`CI_TPU_GENERATIONS=v7x` to run one chip alone, for example to look into v6e
+failures without also using v7x machines. Any other build refuses that, since
+a PR, merge-queue, `/ci`, release, tag, scheduled or integration build must
+not skip v7x. A build that runs v6e alone records no verified commit, and the
+release gate (`release/ci_gate.py`) only counts nightly steps that ran on v7x.
+Any other value is rejected, and so is a build that sets `KUBE_SHAPE_SINGLE` or
 `KUBE_SHAPE_MULTI`: the generation brings its shapes.
 
 The v6e steps do not pass yet, and they are not `soft_fail`, so a build with
