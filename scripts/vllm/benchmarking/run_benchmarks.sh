@@ -70,6 +70,8 @@ SERVE_ONLY=0
 SKIP_BENCH_CELLS=0
 HOST=""
 PORT="${PORT:-8000}"
+BASE_URL=""
+SERVED_MODEL_NAME_CLI=""
 START_SERVER=1
 
 while [[ $# -gt 0 ]]; do
@@ -108,13 +110,26 @@ while [[ $# -gt 0 ]]; do
             BENCHMARK_MODE_CLI="$2"
             shift 2
             ;;
+        # A running server by its full URL, for one that --host and --port
+        # cannot name: https, or an API served under a path prefix.
+        --base-url)
+            BASE_URL="${2%/}"
+            START_SERVER=0
+            shift 2
+            ;;
+        # The name the server serves the model under, when it is not MODEL.
+        # MODEL still names the tokenizer.
+        --served-model-name)
+            SERVED_MODEL_NAME_CLI="$2"
+            shift 2
+            ;;
         --port)
             PORT="$2"
             shift 2
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--skip-bench-cells] [--host HOST] [--port PORT]"
+            echo "Usage: $0 [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--skip-bench-cells] [--host HOST] [--port PORT] [--base-url URL] [--served-model-name NAME]"
             exit 1
             ;;
     esac
@@ -210,6 +225,16 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+if [ -n "$SERVED_MODEL_NAME_CLI" ]; then
+    SERVED_MODEL_NAME="$SERVED_MODEL_NAME_CLI"
+fi
+# Where vllm bench serve sends requests.
+if [ -n "$BASE_URL" ]; then
+    BENCH_ENDPOINT_ARGS=(--base-url "$BASE_URL")
+else
+    BENCH_ENDPOINT_ARGS=(--host "$HOST" --port "$PORT")
+fi
 
 if [ -n "${BENCHMARK_MODE_CLI:-}" ]; then
     BENCHMARK_MODE="$BENCHMARK_MODE_CLI"
@@ -544,6 +569,12 @@ run_benchmark_once() {
     local tokenizer_arg=()
     set_tokenizer_arg
 
+    # Only the flag: a config's SERVED_MODEL_NAME is for spec_bench mode.
+    local served_model_arg=()
+    if [ -n "$SERVED_MODEL_NAME_CLI" ]; then
+        served_model_arg=(--served-model-name "$SERVED_MODEL_NAME_CLI")
+    fi
+
     local extra_body_arg=()
     if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
         extra_body_arg=(--extra-body "$BENCHMARK_EXTRA_BODY")
@@ -577,10 +608,10 @@ run_benchmark_once() {
     vllm bench serve \
         --backend vllm \
         --model "$MODEL" \
+        "${served_model_arg[@]}" \
         "${tokenizer_arg[@]}" \
         --trust-remote-code \
-        --host "$HOST" \
-        --port "$PORT" \
+        "${BENCH_ENDPOINT_ARGS[@]}" \
         "${dataset_args[@]}" \
         --num-prompts "$num_prompts" \
         --max-concurrency "$concurrency" \
@@ -623,8 +654,7 @@ run_spec_bench_client() {
         "${served_model_arg[@]}" \
         "${tokenizer_arg[@]}" \
         --trust-remote-code \
-        --host "$HOST" \
-        --port "$PORT" \
+        "${BENCH_ENDPOINT_ARGS[@]}" \
         --dataset-name spec_bench \
         --dataset-path "$SPEC_BENCH_DATASET" \
         --spec-bench-category "$SPEC_BENCH_CATEGORY" \

@@ -31,6 +31,7 @@ BASELINE_CONFIG=""
 BASE_URL_CLI=""
 EVAL_SUITES_CLI=""
 PERF_SUITES_CLI=""
+SERVED_MODEL_NAME_CLI=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -53,6 +54,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --perf-suites)
             PERF_SUITES_CLI="$2"
+            shift 2
+            ;;
+        # The name the endpoint serves the model under, when a router or
+        # gateway does not serve it under the config's MODEL.
+        --served-model-name)
+            SERVED_MODEL_NAME_CLI="$2"
             shift 2
             ;;
         --run-lm-eval)
@@ -102,7 +109,7 @@ while [[ $# -gt 0 ]]; do
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--base-url URL] [--eval-suites LIST] [--perf-suites LIST] [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
+            echo "Usage: $0 --config CONFIG_NAME [--base-url URL] [--served-model-name NAME] [--eval-suites LIST] [--perf-suites LIST] [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
             # shellcheck disable=SC2016
             echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
             exit 1
@@ -110,19 +117,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# BASE_URL is the one endpoint every client below is given. --base-url keeps
+# its scheme and any path prefix, since a gateway may serve the API over https
+# or under a path; only a trailing slash or /v1 is dropped, because each client
+# appends its own /v1/... route.
 if [ -n "$BASE_URL_CLI" ]; then
-    read -r BASE_URL HOST PORT < <(python3 -c '
+    BASE_URL=$(python3 -c '
 import sys
 from urllib.parse import urlparse
 raw = sys.argv[1].strip()
 if "://" not in raw:
     raw = "http://" + raw
-u = urlparse(raw)
-if not u.hostname:
+url = urlparse(raw)
+if url.scheme not in ("http", "https") or not url.hostname or url.query or url.fragment:
     sys.exit(f"Invalid --base-url: {sys.argv[1]}")
-port = u.port or (443 if u.scheme == "https" else 8000)
-base = f"{u.scheme}://{u.hostname}:{port}"
-print(base, u.hostname, port)
+base = raw.rstrip("/")
+if base.endswith("/v1"):
+    base = base[: -len("/v1")]
+print(base.rstrip("/"))
 ' "$BASE_URL_CLI")
     START_SERVER=0
 else
@@ -190,7 +202,7 @@ run_lm_eval() {
 
     # --model_args is one comma-separated string, not a repeatable flag, so
     # config extras merge in here. Last-wins per key: an extra can override.
-    local model_args="model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+    local model_args="model=$MODEL,base_url=$BASE_URL/v1/chat/completions,num_concurrent=128"
     if [ -n "$EXTRA_LM_EVAL_MODEL_ARGS" ]; then
         model_args="$model_args,$EXTRA_LM_EVAL_MODEL_ARGS"
     fi
@@ -322,7 +334,7 @@ run_mm_eval() {
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 evalscope eval \
         --model "$MODEL" \
         --eval-type openai_api \
-        --api-url "http://$HOST:$PORT/v1/chat/completions" \
+        --api-url "$BASE_URL/v1/chat/completions" \
         --api-key EMPTY \
         --datasets "$task" \
         --limit "$mm_limit" \
@@ -586,6 +598,25 @@ if [ "$RUN_BENCH_SERVE" = "1" ] || [ "$RUN_AGENTX" = "1" ] || [ "${#SELECTED_EVA
     NEEDS_LIVE_SERVER=1
 fi
 
+# The name clients put in their requests. Empty means the config's MODEL, which
+# is what a server this script starts, or one reached by --host, serves. Behind
+# --base-url a router may serve the model under another name, so there the
+# explicit name wins, then the endpoint's own answer when it lists one model.
+SERVED_MODEL="$SERVED_MODEL_NAME_CLI"
+if [ -z "$SERVED_MODEL" ] && [ -n "$BASE_URL_CLI" ]; then
+    SERVED_MODEL="${SERVED_MODEL_NAME:-}"
+    if [ -z "$SERVED_MODEL" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+        SERVED_MODEL=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
+import sys
+from eval_json_schema import auto_detect_model
+try:
+    print(auto_detect_model(sys.argv[1]))
+except RuntimeError as err:
+    print(f"Served model not resolved from the endpoint: {err}", file=sys.stderr)
+' "$BASE_URL")
+    fi
+fi
+
 # ========================================================
 # 1. Initial Cleanup
 # ========================================================
@@ -604,10 +635,15 @@ BENCH_ARGS=(
 )
 if [ "$START_SERVER" = "1" ]; then
   BENCH_ARGS+=(--keep-alive)
+  BENCH_ARGS+=(--port "$PORT")
+elif [ -n "$BASE_URL_CLI" ]; then
+  BENCH_ARGS+=(--base-url "$BASE_URL")
 else
-  BENCH_ARGS+=(--host "$HOST")
+  BENCH_ARGS+=(--host "$HOST" --port "$PORT")
 fi
-BENCH_ARGS+=(--port "$PORT")
+if [ -n "$SERVED_MODEL" ]; then
+  BENCH_ARGS+=(--served-model-name "$SERVED_MODEL")
+fi
 if [ "$RUN_BENCH_SERVE" = "0" ]; then
   if [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
     BENCH_ARGS+=(--skip-bench-cells)
@@ -621,6 +657,14 @@ fi
 
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
+if [ -n "$SERVED_MODEL" ]; then
+    if [ "$SERVED_MODEL" != "$MODEL" ]; then
+        echo "Sending requests for served model $SERVED_MODEL (config model: $MODEL)"
+    fi
+    MODEL="$SERVED_MODEL"
+elif [ -n "$BASE_URL_CLI" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+    echo "No single served model at $BASE_URL/v1/models and no --served-model-name; using the config's model $MODEL"
+fi
 CONFIG_TP=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("tensor_parallelism", 1))' "$RESULTS_DIR/config.json")
 CONFIG_DP=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("data_parallelism", 1))' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
