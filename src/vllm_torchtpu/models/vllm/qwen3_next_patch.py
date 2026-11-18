@@ -984,15 +984,18 @@ def _patched_gemma_rmsnorm_forward_native(
     return x if residual is None else (x, residual)
 
 
-def _speculative_decoding_configured() -> bool:
-    """Whether the engine being loaded runs a draft model.
+def _draft_borrows_target_head() -> bool:
+    """Whether the engine being loaded runs a draft that borrows the target's
+    LM head: an EAGLE/MTP or DFlash draft (the runner's async drafters, whose
+    proposers bind it in maybe_share_lm_head). An n-gram drafter has no head.
 
     Read from the current vLLM config, which _quantize_target_lm_head has
     already read for the same head.
     """
     from vllm.config import get_current_vllm_config
 
-    return get_current_vllm_config().speculative_config is not None
+    spec = get_current_vllm_config().speculative_config
+    return spec is not None and (spec.use_eagle() or spec.method == "dflash")
 
 
 def _quantize_target_lm_head() -> bool:
@@ -1082,7 +1085,7 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
             # A draft that borrows this head (Qwen3.5 MTP has none of its
             # own) must keep the checkpoint's BF16 head: keep a BF16 twin
             # before the in-place quantization drops the weight.
-            if _speculative_decoding_configured():
+            if _draft_borrows_target_head():
                 greedy_top_tokens.keep_bf16_head_for_draft(module)
             greedy_top_tokens.quantize_lm_head(module, mode="fp8", in_place=True)
     if hoisted_norm_tensors:

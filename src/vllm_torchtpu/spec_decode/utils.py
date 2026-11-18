@@ -523,6 +523,10 @@ def maybe_share_lm_head(
             populate_draft_lm_head_from_target(
                 draft_model, cast("VocabParallelEmbedding", draft_lm_head)
             )
+        if not tp_layout_matches:
+            # The draft did not bind the BF16 twin: it keeps the head it
+            # loaded, or the replicated copy just gathered from the twin.
+            greedy_top_tokens.release_draft_bf16_head(target_lm_head)
         if tp_layout_matches or materialize_if_mismatched:
             logger.info(
                 "Draft lm_head precision: %s (target lm_head: %s; %s).",

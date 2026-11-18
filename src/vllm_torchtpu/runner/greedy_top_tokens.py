@@ -1159,12 +1159,11 @@ def draft_bf16_head_of(target_head: object) -> torch.nn.Module | None:
 
 
 def release_draft_bf16_head(target_head: object) -> None:
-    """Drops the BF16 head kept for a draft that turned out to have its own."""
+    """Drops the BF16 head kept for a draft that did not bind it."""
     state = getattr(target_head, "__dict__", None)
     if state is not None and state.pop(_DRAFT_BF16_HEAD_ATTR, None) is not None:
         logger.info(
-            "The draft has its own lm_head; released the BF16 copy of the "
-            "target's head."
+            "The draft does not use the BF16 copy of the target's lm_head; released it."
         )
 
 
