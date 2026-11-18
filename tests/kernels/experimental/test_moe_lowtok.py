@@ -153,7 +153,7 @@ def _assert_close(got, want, rel_l2=1e-2):
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32, 64, 128, 256])
+@pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32, 64, 128, 256, 448])
 @pytest.mark.parametrize("shape", [(8, 512, 256, 4), (64, 4096, 1024, 10)])
 def test_ids_entry_matches_reference(tokens, shape):
     _needs("tpu")
@@ -172,7 +172,7 @@ def test_no_local_expert_is_zero():
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32])
+@pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32, 448])
 @pytest.mark.parametrize("shape", [(8, 512, 256, 4, 16), (64, 4096, 1024, 10, 128)])
 def test_scores_entry_matches_router_then_ids_entry(tokens, shape):
     """Same experts and the same renormalized bf16 weights as the router."""
@@ -223,6 +223,67 @@ def test_interpreted_scores_entry_matches_router_then_reference(interpret, n_glo
     local = jnp.where((ids >= start) & (ids < start + experts), ids - start, -1)
     local = local.at[2].set(-1)
     _assert_close(got, _reference(x, local, w, *weights), 2.5e-2)
+
+
+def _logits_case(dtype, tokens=5, n_global=100):
+    """Router logits for the logits entry: a row count that is not a multiple
+    of 8 and fewer experts than one 128-lane tile, so the wrapper pads rows and
+    lanes; a padded engine row (all -inf) routes nowhere, and a row with two
+    finite logits, both below zero, keeps its top-k on those two (a padded lane
+    that could win would take the other slots and their weight)."""
+    experts, hidden, inter, topk, start = 8, 512, 256, 4, 16
+    rng = np.random.default_rng(31 + n_global)
+    x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
+    logits = rng.standard_normal((tokens, n_global)) * 2
+    logits[:, start : start + experts] += 3.0
+    logits[2] = -np.inf
+    logits[3] = -np.inf
+    logits[3, [start + 1, start + 5]] = [-1.0, -2.0]
+    logits = jnp.asarray(logits, dtype)
+    weights = _weights(rng, experts, hidden, inter)
+    return x, logits, weights, topk, start, experts
+
+
+def _logits_want(x, logits, weights, topk, start, experts):
+    """The served router on the softmax of the same logits, then the ids
+    entry's reference; the padded row adds nothing."""
+    scores = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+    scores = jnp.where(jnp.isnan(scores), 0.0, scores)
+    w, ids = _router(scores, topk)
+    local = jnp.where((ids >= start) & (ids < start + experts), ids - start, -1)
+    local = local.at[2].set(-1)
+    return _reference(x, local, w, *weights)
+
+
+def _logits_got(x, logits, weights, topk, start):
+    return np.asarray(
+        kernel.moe_lowtok(
+            x, logits, *weights, jnp.int32(start), topk=topk, from_logits=True
+        ),
+        np.float32,
+    )
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "f32"])
+def test_interpreted_logits_entry_matches_router_then_reference(interpret, dtype):
+    """The logits entry pads rows and lanes with a value that never wins (-inf
+    for bf16, the kernel's floor for f32) and matches the router on the softmax
+    of the same logits."""
+    x, logits, weights, topk, start, experts = _logits_case(dtype)
+    got = _logits_got(x, logits, weights, topk, start)
+    assert np.all(got[2] == 0)
+    _assert_close(got, _logits_want(x, logits, weights, topk, start, experts), 2.5e-2)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tokens", [5, 448])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "f32"])
+def test_logits_entry_matches_router_then_reference(dtype, tokens):
+    _needs("tpu")
+    x, logits, weights, topk, start, experts = _logits_case(dtype, tokens)
+    got = _logits_got(x, logits, weights, topk, start)
+    assert np.all(got[2] == 0)
+    _assert_close(got, _logits_want(x, logits, weights, topk, start, experts))
 
 
 ROUTER_EXPERTS = 512
@@ -571,12 +632,16 @@ def test_fused_moe_func_selects_kernel_and_matches_oracle(m):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("from_logits", [False, True], ids=["scores", "logits"])
 @pytest.mark.parametrize("tokens", [4, 16])
 @pytest.mark.parametrize("extra_slots", [4, 8])
-def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots):
+def test_scores_copies_entry_matches_reference_across_ranks(
+    tokens, extra_slots, from_logits
+):
     """With hot-expert copy slots (e.g. 4 or 8 copies/rank = 32 or 64 total copies),
     every hit expert is executed on exactly one of its holders (primary or copy)
-    and the sum across all 8 ranks matches the 512-expert reference."""
+    and the sum across all 8 ranks matches the 512-expert reference. The router
+    input is the softmax scores, or the bf16 logits they come from."""
     _needs("tpu")
     rng = np.random.default_rng(tokens * 100 + extra_slots)
     ranks, owned, hidden, inter, topk = 8, 64, 512, 256, 10
@@ -585,8 +650,13 @@ def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots)
     x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
     logits = rng.standard_normal((tokens, n_global)).astype(np.float32)
     logits = logits - logits.max(axis=1, keepdims=True)
-    exp = np.exp(logits)
-    scores = jnp.asarray(exp / exp.sum(axis=1, keepdims=True), jnp.float32)
+    if from_logits:
+        router_input = jnp.asarray(logits, jnp.bfloat16)
+        scores = jax.nn.softmax(router_input.astype(jnp.float32), axis=-1)
+    else:
+        exp = np.exp(logits)
+        scores = jnp.asarray(exp / exp.sum(axis=1, keepdims=True), jnp.float32)
+        router_input = scores
     w13_all, s13_all, w2_all, s2_all = _weights(rng, n_global, hidden, inter)
 
     prim = np.array([g // owned for g in range(n_global)], dtype=np.int32)
@@ -621,7 +691,7 @@ def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots)
         )
         part = kernel.moe_lowtok(
             x,
-            scores,
+            router_input,
             w13_all[gid],
             s13_all[gid],
             w2_all[gid],
@@ -635,6 +705,7 @@ def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots)
             ranks=ranks,
             owned=owned,
             has_copies=True,
+            from_logits=from_logits,
         )
         total_out = total_out + part.astype(jnp.float32)
 
