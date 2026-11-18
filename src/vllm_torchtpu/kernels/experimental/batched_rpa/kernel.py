@@ -94,6 +94,11 @@ def calculate_and_store_out(
     chunk_start: int = 0,
     cfgs: configs.RpaConfigs,
 ):
+    # Packed rows per token, and rows per KV head of a full q block, in the
+    # output and LSE windows.
+    q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
+    full_q_rows = cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head
+
     def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
         if flash_attention.static_pv(cfgs) and not flash_attention.p_prescaled(cfgs):
             # The accumulator carries P_SCALE; l sums the unscaled weights.
@@ -114,8 +119,6 @@ def calculate_and_store_out(
         pad_width = [[0, 0] for _ in range(out.ndim)]
         pad_width[-1][-1] = cfgs.aligned_q_head_dim - cfgs.compute_kv_head_dim
         out = jnp.pad(out, pad_width, constant_values=0)
-        q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
-        full_q_rows = cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head
         if chunk_start == 0 and (
             cfgs.model.num_kv_heads == 1 or out.shape[1] == full_q_rows
         ):
@@ -141,8 +144,6 @@ def calculate_and_store_out(
         lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
         lse_u32 = lse_o_vref.at[b_idx].bitcast(jnp.uint32)
         lse_ref = lse_u32.reshape(-1, lse_o_vref.shape[-1])
-        q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
-        full_q_rows = cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head
         if chunk_start == 0 and (
             cfgs.model.num_kv_heads == 1 or lse_val.shape[1] == full_q_rows
         ):
@@ -432,8 +433,6 @@ def generate_mask(
         cfgs.mode == configs.RpaCase.DECODE
         and cfgs.serve.attention_scope == configs.AttentionScope.FULL
         and cfgs.model.sliding_window is None
-        and step_meta.local_k_start is None
-        and step_meta.local_k_end is None
     )
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
