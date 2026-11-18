@@ -304,3 +304,55 @@ def test_maybe_prebuild_leaves_other_layers(monkeypatch, use_ep, scores_op):
     monkeypatch.setattr(op, "prebuild", prebuild)
     op.maybe_prebuild(_moe_layer(use_ep=use_ep), scores_op)
     prebuild.assert_not_called()
+
+
+class _Armed(Exception):
+    """Stops the FP8 MoE method's weight processing at the arming call."""
+
+
+def test_fp8_moe_weight_processing_offers_the_layer_to_the_op(monkeypatch):
+    """VllmFp8MoEMethodTPU.process_weights_after_loading hands the layer and
+    its scores entry to maybe_prebuild once the scores entry is built."""
+    from vllm_torchtpu.layers.adapter.quantization import fp8
+
+    experts, hidden, inter = 1, 512, 256
+    layer = torch.nn.Module()
+    layer.activation = "silu"
+    layer.moe_config = SimpleNamespace(
+        experts_per_token=TOPK, moe_parallel_config=SimpleNamespace(use_ep=False)
+    )
+    for name, shape in (
+        ("w13_weight", (experts, hidden, 2 * inter)),
+        ("w2_weight", (experts, inter, hidden)),
+    ):
+        weight = torch.empty(*shape, dtype=torch.float8_e4m3fn)
+        layer.register_parameter(name, torch.nn.Parameter(weight, requires_grad=False))
+    method = object.__new__(fp8.VllmFp8MoEMethodTPU)
+    method.moe = SimpleNamespace(has_bias=False, is_act_and_mul=True)
+    method.quant_config = SimpleNamespace(is_checkpoint_fp8_serialized=True)
+    method.weight_block_size = None
+    method.weight_scale_name = "weight_scale"
+
+    def converted(layer, **_kwargs):
+        return (
+            layer.w13_weight,
+            torch.ones(experts, 1, 1, 2 * inter),
+            layer.w2_weight,
+            torch.ones(experts, 1, 1, hidden),
+            "float8_e4m3fn",
+            None,
+        )
+
+    scores_op = object()
+    arm = Mock(name="maybe_prebuild", side_effect=_Armed)
+    monkeypatch.setattr(fp8, "RoutedExperts", torch.nn.Module)
+    monkeypatch.setattr(fp8, "_process_fp8_moe_weights", converted)
+    monkeypatch.setattr(
+        fp8.moe_routing, "register_experts_start_buffer", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(fp8.moe_lowtok_scores, "prebuild", lambda *a: scores_op)
+    monkeypatch.setattr(op, "maybe_prebuild", arm)
+    with pytest.raises(_Armed):
+        method.process_weights_after_loading(layer)
+    arm.assert_called_once_with(layer, scores_op)
+    assert method._moe_lowtok_scores_op is scores_op
