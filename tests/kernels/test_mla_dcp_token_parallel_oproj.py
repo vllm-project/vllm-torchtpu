@@ -153,7 +153,7 @@ def test_should_match_head_sharded_oproj_reduce_scatter_when_projecting_split_st
         _sharded(mesh, lead_lse.reshape(dcp * split_rows, heads)),
         _sharded(mesh, own_out),
         _sharded(mesh, np.arange(dcp, dtype=np.int32)),
-        _sharded(mesh, w_uv),
+        jnp.asarray(w_uv),
         _sharded(mesh, w_q),
         _sharded(mesh, w_s.reshape(-1)),
     )

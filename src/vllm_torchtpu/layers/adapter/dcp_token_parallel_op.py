@@ -589,6 +589,7 @@ def build_attention_op(
             w_uv=w_uv,
             q_pe=pe_tp,
             token_rows=w_o is not None,
+            w_uv_replicated=w_o is not None,
         )
 
         if w_o is not None:
@@ -976,13 +977,9 @@ def build_attention_op(
         sharers.append(weakref.ref(target_layer))
 
     oproj_op = None
-    if envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ:
-        if not (fused_subbatch and has_rank and uv_in_tp):
-            raise NotImplementedError(
-                "TPU_DCP_TP_PREFILL_LOCAL_OPROJ needs the fused sub-batch op with "
-                f"the DCP rank operand and W_UV in the op (fused={fused_subbatch}, "
-                f"rank={has_rank}, uv_in_tp={uv_in_tp})."
-            )
+    # TPU_DCP_TP_PREFILL_LOCAL_OPROJ needs the fused sub-batch op with the DCP
+    # rank operand and W_UV in the op; other layers keep o_proj outside.
+    if envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ and fused_subbatch and has_rank and uv_in_tp:
 
         def w_oproj(
             n: jax.Array,
@@ -1018,7 +1015,8 @@ def build_attention_op(
                 w_oproj,
                 donate_argnums=(0, 1),
                 mesh=mesh,
-                input_partition_specs=in_specs + (sharded, sharded),
+                # W_UV every head, replicated; o_proj's row shard + its scale.
+                input_partition_specs=in_specs[:-1] + (rep, sharded, sharded),
                 output_partition_specs=(sharded, sharded, sharded),
             )
             built.register_fake(_fake_oproj)
@@ -1106,6 +1104,7 @@ def build_attention_op(
     run.uv_in_tp = uv_in_tp  # type: ignore[attr-defined]
     run.split_q = use_split_op  # type: ignore[attr-defined]
     run.fused_subbatch = fused_subbatch  # type: ignore[attr-defined]
+    run.serves_oproj = oproj_op is not None  # type: ignore[attr-defined]
     # This rank's DCP index as data, for `q_rows` (built here, outside Dynamo).
     from vllm_torchtpu.distributed.dcp import dcp_rank_operand
 
@@ -1170,10 +1169,12 @@ def attention(
     if getattr(tp_op, "fused_subbatch", False):
         w_uv_arg = None
         if getattr(tp_op, "uv_in_tp", False):
+            # The sequence-row o_proj takes every head's W_UV (replicated).
+            w_uv_src = layer.W_UV if w_o is None else layer.W_UV_tp_all
             w_uv_arg = (
-                layer.W_UV.to(ql_nope.dtype)
-                if layer.W_UV.dtype != ql_nope.dtype
-                else layer.W_UV
+                w_uv_src.to(ql_nope.dtype)
+                if w_uv_src.dtype != ql_nope.dtype
+                else w_uv_src
             )
         out = tp_op(
             kv_cache,

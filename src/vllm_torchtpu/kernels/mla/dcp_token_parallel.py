@@ -500,7 +500,7 @@ def project_sequence_rows(
       own_out: `[dcp * R, H, V]`, every head of each rank's token-parallel rows
         (`sparse_mla_attention(..., token_rows=True)` with `w_uv`).
       rank_ids: i32[dcp] sharded, entry r = r.
-      w_uv: `[H, L, V]` sharded over heads.
+      w_uv: every head's `[H, L, V]`, replicated.
       w_o, w_o_scale: o_proj's `(H * V, n)` FP8 rows and `[dcp * n]` scales,
         sharded: rank r's `(h * V, n)` row shard with its own per-channel
         scale, as the row-parallel o_proj holds them.
@@ -512,39 +512,36 @@ def project_sequence_rows(
     """
     sharded = P(axis_name)
 
-    def _local(part, lse_part, own, rank_arr, w_uv_local, w_shard, s_shard):
+    def _local(part, lse_part, own, rank_arr, w_uv_all, w_shard, s_shard):
         lses = lax.all_gather(lse_part, axis_name, axis=0, tiled=False)
         m = jax.nn.logsumexp(lses, axis=0)
         safe_m = jnp.where(jnp.isfinite(m), m, 0.0)
         w = jnp.where(jnp.isfinite(lse_part), jnp.exp(lse_part - safe_m), 0.0)
         weighted = (part.astype(jnp.float32) * w[..., None]).astype(part.dtype)
-        head_local = lax.psum_scatter(
-            weighted, axis_name, scatter_dimension=1, tiled=True
-        )
-        head_v = jnp.einsum(
-            "rhl,hlv->rhv", head_local, w_uv_local.astype(head_local.dtype)
+        lead_latent = lax.psum(weighted, axis_name)
+        lead_v = jnp.einsum(
+            "rhl,hlv->rhv", lead_latent, w_uv_all.astype(lead_latent.dtype)
         ).astype(own.dtype)
-        w_mine = dequantize_row_shards(w_shard, s_shard[None, :], own.dtype)
-        lead_partial_rows = jnp.dot(
-            head_v.reshape(head_v.shape[0], -1),
-            w_mine,
-            preferred_element_type=jnp.float32,
-        ).astype(own.dtype)
-        lead = lax.psum(lead_partial_rows, axis_name)
         w_all = dequantize_row_shards(
             lax.all_gather(w_shard, axis_name, axis=0, tiled=True),
             lax.all_gather(s_shard, axis_name, axis=0, tiled=False),
             own.dtype,
         )
-        mine = jnp.dot(
-            own.reshape(own.shape[0], -1), w_all, preferred_element_type=jnp.float32
-        ).astype(own.dtype)
-        return token_rows_to_sequence_rows(layout, mine, lead, rank_arr[0], axis_name)
+        s = lead_v.shape[0]
+        rows = jnp.concatenate(
+            [lead_v.reshape(s, -1), own.reshape(own.shape[0], -1)], axis=0
+        )
+        projected = jnp.dot(rows, w_all, preferred_element_type=jnp.float32).astype(
+            own.dtype
+        )
+        return token_rows_to_sequence_rows(
+            layout, projected[s:], projected[:s], rank_arr[0], axis_name
+        )
 
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded,) * 7,
+        in_specs=(sharded, sharded, sharded, sharded, P(), sharded, sharded),
         out_specs=sharded,
         check_vma=False,
     )(lead_partial, lead_lse, own_out, rank_ids, w_uv, w_o, w_o_scale)
@@ -587,6 +584,7 @@ def sparse_mla_attention(
     w_uv: jax.Array | None = None,
     q_pe: jax.Array | None = None,
     token_rows: bool = False,
+    w_uv_replicated: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 
@@ -609,6 +607,8 @@ def sparse_mla_attention(
       being step row `split_rows + i`. With `token_rows`, `out` is instead
       `[dcp * R, H, L or V]`: every head of each rank's own token-parallel
       rows, with no all-to-all back to head sharding.
+      With `w_uv_replicated`, `w_uv` is every head's `[H, L, V]` on every
+      rank (no per-step all-gather of it).
     """
     dcp = layout.dcp_size
     sharded = P(axis_name)
@@ -660,7 +660,11 @@ def sparse_mla_attention(
 
         out = _switch_on_cap(layout, jnp.sum(pages), branch)
         if w_uv_local is not None:
-            w_uv_all = lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
+            w_uv_all = (
+                w_uv_local
+                if w_uv_replicated
+                else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
+            )
             out = (
                 jnp.einsum(
                     "hrl,hlv->hrv",
@@ -679,13 +683,15 @@ def sparse_mla_attention(
         extra = (*extra, q_pe)
     if rank_ids is not None:
         extra = (*extra, rank_ids)
+    extra_specs = (sharded,) * len(extra)
     if w_uv is not None:
         extra = (*extra, w_uv)
+        extra_specs = (*extra_specs, rep if w_uv_replicated else sharded)
     return jax.shard_map(
         _local,
         mesh=mesh,
         in_specs=(sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
-        + (sharded,) * len(extra),
+        + extra_specs,
         out_specs=(sharded, sharded, sharded),
         check_vma=False,
     )(

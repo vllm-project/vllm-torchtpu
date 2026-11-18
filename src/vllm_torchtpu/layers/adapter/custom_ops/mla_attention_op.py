@@ -2005,6 +2005,16 @@ class VllmTPUMLAAttention(MLAAttention):
                     self.token_parallel_layout,
                     q_replicated=bool(self.dcp_q_replicate),
                 )
+                # TPU_DCP_TP_PREFILL_LOCAL_OPROJ: every head's W_UV on every
+                # rank, so the token-parallel rows skip a per-step all-gather.
+                if getattr(self.sparse_mla_tp_op, "serves_oproj", False):
+                    dcp_group = get_dcp_group()
+                    assert dcp_group is not None
+                    self.W_UV_tp_all = fresh_buffer(
+                        dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
+                    )
+                    if self.W_UV_tp_all.device.type == "tpu":
+                        synchronize_tensors([self.W_UV_tp_all])
                 indexer_op = getattr(self.indexer, "indexer_op", None)
                 if (
                     self.dcp_q_replicate
@@ -2645,7 +2655,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and topk_indices is not None
             and output_gate is None
             and self.g_proj is None
-            and getattr(self.mla_attn, "sparse_mla_tp_op", None) is not None
+            and getattr(
+                getattr(self.mla_attn, "sparse_mla_tp_op", None), "serves_oproj", False
+            )
             and dcp_token_parallel_op.applies(kv_c_normed.shape[0])
             and dcp_token_parallel_op.serves_sequence_row_oproj(self.o_proj)
         ):
@@ -2660,8 +2672,18 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_dcp_replicated=q_dcp_replicated,
             sp_o_proj=sp_o_proj,
         )
+        # The two branches lift different W_UV buffers; each lifts the other's
+        # too, as the bucket warmup requires (_retain_buffers: no data read).
         if sp_o_proj is not None:
-            return attn_out
+            return _retain_buffers(
+                attn_out,
+                self.mla_attn.W_UV,
+                getattr(self.o_proj, FP8_PALLAS_WEIGHT, None),
+                getattr(self.o_proj, FP8_PALLAS_SCALE, None),
+            )
+        w_uv_tp_all = getattr(self.mla_attn, "W_UV_tp_all", None)
+        if w_uv_tp_all is not None and isinstance(attn_out, torch.Tensor):
+            attn_out = _retain_buffers(attn_out, w_uv_tp_all)
 
         if output_gate is not None:
             attn_out *= output_gate.sigmoid()
