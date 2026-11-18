@@ -287,6 +287,24 @@ def use_rhs_stream(cfgs: "GmmConfigs") -> bool:
     )
 
 
+def first_stream_group(lhs_group_sizes_ref, group_offset, cfgs: "GmmConfigs"):
+    """The first local group with rows, and the bound on local groups.
+
+    The bound is fill_metadata's: the rhs groups, clipped to the lhs groups
+    past `group_offset` (a copy-slot rhs may hold more groups than that). The
+    first group is valid, and its slab is streamed, only below the bound.
+    """
+    bound = jnp.minimum(cfgs.dims.size_group, cfgs.dims.size_lhs_group - group_offset)
+    first = lax.while_loop(
+        lambda g: jnp.logical_and(
+            g < bound, lhs_group_sizes_ref[g + group_offset] == 0
+        ),
+        lambda g: g + 1,
+        jnp.int32(0),
+    )
+    return first, bound
+
+
 def rhs_stream_copies(rhs_ref: "WeightsRef", stream_ref: RhsStreamRef, group_id, slot):
     """DMA descriptors that bring rhs[group_id] into stream slot `slot`.
 
@@ -970,22 +988,14 @@ def kernel_main(
 
     rhs_hbm_ref = rhs_ref
     if stream_ref is not None:
-        stream = stream_ref
-        max_active_group = min(cfgs.dims.size_group, cfgs.dims.size_lhs_group)
         with jax.named_scope("gmm_stream_first"):
-            group_offset = group_offset_ref[0]
-            first_group = lax.while_loop(
-                lambda g: jnp.logical_and(
-                    g < max_active_group,
-                    lhs_group_sizes_ref[g + group_offset] == 0,
-                ),
-                lambda g: g + 1,
-                jnp.int32(0),
+            first_group, num_local_groups = first_stream_group(
+                lhs_group_sizes_ref, group_offset_ref[0], cfgs
             )
 
-            @pl.when(first_group < max_active_group)
+            @pl.when(first_group < num_local_groups)
             def _():
-                for copy in rhs_stream_copies(rhs_hbm_ref, stream, first_group, 0):
+                for copy in rhs_stream_copies(rhs_hbm_ref, stream_ref, first_group, 0):
                     copy.start()
 
     # Fill metadata buffer and return number of group & m interations.

@@ -476,10 +476,16 @@ _FP8_MOE_K, _FP8_MOE_N = 1024, 4096  # GMM2: the down projection, one k tile
 # and rows of non-local groups on both sides. "single": one non-empty local
 # group, so the stream has one run. "slots": the weights hold two more slots
 # than group_sizes lists (a copy-slot layer); the kernel must not read them.
+# "tail" and "tail_empty": at offset 4 the 8 weight slots outnumber the 4 lhs
+# groups left, and the trailing local groups (all of them in "tail_empty") are
+# empty, so the stream's search for its first group must stop at the lhs
+# groups.
 _FP8_MOE_LAYOUTS = {
     "spread": (16, 8, 4, [5, 7, 0, 9, 12, 0, 20, 0, 0, 16, 8, 0, 30, 0, 21, 0]),
     "single": (16, 8, 4, [10, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 54, 0, 0, 0]),
     "slots": (8, 10, 0, [12, 0, 20, 0, 16, 8, 0, 72]),
+    "tail": (8, 8, 4, [5, 7, 9, 12, 0, 6, 0, 0]),
+    "tail_empty": (8, 8, 4, [5, 7, 9, 12, 0, 0, 0, 0]),
 }
 _WHOLE_EXPERT_TILES = TileSizes(
     tile_m=128, tile_k=_FP8_MOE_K, tile_n=_FP8_MOE_N, bucket_base=128
@@ -608,6 +614,10 @@ def test_gmm_fp8_moe_whole_expert_paths_match_reference(
         _WHOLE_EXPERT_TILES,
     )
     assert actual.shape == expected.shape
+    if not np.any(np.asarray(expected)):
+        # No local rows: nothing is computed and the output stays zero.
+        assert not np.any(np.asarray(actual))
+        return
     # The kernel quantizes the lhs to fp8 per 512-wide block, which alone puts
     # it about 2.6% (relative L2) from this unquantized reference; a slab from
     # the wrong expert or group is off by more than 100%.
