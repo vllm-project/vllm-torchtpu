@@ -23,6 +23,13 @@ from jax.experimental.pallas import tpu as pltpu
 LANES = 128
 MESH = pl.DeviceIdType.MESH
 
+# Barrier semaphore groups (pltpu.CompilerParams.collective_id) of the Pallas
+# kernels that can run in one decode program; each needs its own, because two
+# kernels with one id share a barrier semaphore. The small all-reduce and
+# reduce-scatter use 5 and 7 (all_reduce.py, reduce_scatter.py), the fused EP
+# MoE kernels 0 and 3 (kernels/fused_moe/v3/layout.py).
+DENSE_SLOTS_COLLECTIVE_ID = 11
+
 
 def peer(j, axis, dict_ids):
     return {axis: jnp.int32(j)} if dict_ids else (jnp.int32(j),)

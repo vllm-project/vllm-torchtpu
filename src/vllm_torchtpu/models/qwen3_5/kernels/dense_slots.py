@@ -58,13 +58,17 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.experimental.small_collectives.common import (
+    DENSE_SLOTS_COLLECTIVE_ID,
+)
 from vllm_torchtpu.kernels.fused_moe.v3 import device, ffn, layout
 from vllm_torchtpu.kernels.fused_moe.v3.config import Config
 from vllm_torchtpu.kernels.fused_moe.v3.layout import LANES, MESH_AXIS, device_coords
 from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8, quantize_rows
 
-# A barrier semaphore is shared by kernels with the same collective id.
-COLLECTIVE_ID_DENSE = 5
+# A barrier semaphore is shared by kernels with the same collective id, so the
+# layer takes its own from the registry.
+COLLECTIVE_ID_DENSE = DENSE_SLOTS_COLLECTIVE_ID
 # fp8 rows are tiled 32 sublanes deep: each shard's block of the resident rows
 # starts on a tile.
 ROW_ALIGN = 32

@@ -49,3 +49,26 @@ def test_the_shared_adapter_does_not_import_it_at_module_level():
         and "qwen3_5" in ast.unparse(node)
     ]
     assert not top_level
+
+
+def test_the_layer_has_its_own_barrier_group():
+    """It runs in one decode program with the small all-reduce and
+    reduce-scatter and with fused EP v3's kernels; a kernel that shared its
+    collective id would share its barrier semaphore."""
+    from vllm_torchtpu.kernels.experimental.small_collectives import (
+        all_reduce,
+        common,
+        reduce_scatter,
+    )
+    from vllm_torchtpu.kernels.fused_moe.v3 import layout
+    from vllm_torchtpu.models.qwen3_5.kernels import dense_slots
+
+    assert dense_slots.COLLECTIVE_ID_DENSE == common.DENSE_SLOTS_COLLECTIVE_ID
+    ids = (
+        dense_slots.COLLECTIVE_ID_DENSE,
+        all_reduce.COLLECTIVE_ID,
+        reduce_scatter.COLLECTIVE_ID,
+        layout.COLLECTIVE_ID_FFN,
+        layout.COLLECTIVE_ID_TRANSPORT,
+    )
+    assert len(set(ids)) == len(ids), ids
