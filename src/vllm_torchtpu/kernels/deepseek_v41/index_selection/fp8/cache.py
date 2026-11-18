@@ -281,17 +281,16 @@ def _write_sorted_packed_pages(
     used = valid.sum(dtype=jnp.int32)
     index = jnp.arange(steps * batch + 1, dtype=jnp.int32)
 
-    def starts(ends):
-        # Item i starts at the first record whose running count passes i;
-        # past the last item every entry is the end of the valid records.
-        found = jnp.searchsorted(ends, index, side="right", method="compare_all")
-        return jnp.minimum(found, used).astype(jnp.int32)
+    def marked(first, ends, values, end):
+        # The value at the i-th marked record, or `end` past the last mark:
+        # one fused compare and reduce, with no gather or scatter.
+        hit = first[None, :] & (ends[None, :] == index[:, None] + 1)
+        found = jnp.where(hit, values[None, :], 0).sum(1, dtype=jnp.int32)
+        return jnp.where(index < ends[-1], found, end)
 
-    run_starts = starts(run_ends)
-    page_starts = jnp.minimum(starts(page_ends), count - 1)
-    pages_used = index < page_ends[-1]
-    page_bases = jnp.where(pages_used, bases[page_starts], total_rows)
-    page_runs = jnp.where(pages_used, run_ends[page_starts] - 1, run_ends[-1])
+    run_starts = marked(run_first, run_ends, jnp.arange(count, dtype=jnp.int32), used)
+    page_bases = marked(page_first, page_ends, bases, total_rows)
+    page_runs = marked(page_first, page_ends, run_ends - 1, run_ends[-1])
 
     def kernel(page_base_ref, page_run_ref, run_ref, column_ref, value_ref, *refs):
         outputs = refs[len(banks) : 2 * len(banks)]
