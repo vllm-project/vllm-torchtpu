@@ -35,6 +35,9 @@ def parse[T](options_cls: type[T], section: str, raw: Any) -> T:
             f"additional_config.{section} must be a JSON object, "
             f"got {type(raw).__name__}"
         )
+    # dataclasses.fields is typed for DataclassInstance, which a type
+    # parameter cannot name; every caller passes a frozen dataclass.
+    # pyrefly: ignore[bad-argument-type]
     fields = {f.name: f.type for f in dataclasses.fields(options_cls)}
     unknown = sorted(set(raw) - set(fields))
     if unknown:
