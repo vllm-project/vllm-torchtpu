@@ -13,9 +13,9 @@
 # limitations under the License.
 # Not a copy of a kernel on main: a layer of its own that only the Qwen3.5
 # DP4 x TP2 decode layout runs (fused_moe_ep_v3.QWEN3_5_CONFIG_BY_LAYOUT turns it
-# on). It builds on the fused EP v3 package (kernels/fused_moe/v3: the select,
-# row quantization, FFN, combine and layout helpers) and does not pick up changes
-# to it automatically.
+# on). It calls the fused EP v3 package's select, row quantization, FFN and
+# layout helpers (kernels/fused_moe/v3); its in-program weighted sum repeats the
+# v3 combine's per-token sum, so a change to the combine does not reach it.
 """Fused EP MoE with landing rows fixed by the routing alone ("dense slots";
 the Qwen3.5 DP4xTP2 decode layout, default off).
 
