@@ -29,6 +29,7 @@ from .collectives import (
     torus_collective_s,
 )
 from .constants import (
+    ACTIVATION_HULL_SCHEMA,
     SUPPORTED_MODEL_TYPES,
 )
 from .geometry import (
@@ -37,20 +38,70 @@ from .geometry import (
     count_layer_types,
     from_hf_config,
 )
+from .hf_loader import dtypes_from_hf_config, load_hf_config
+from .modules import (
+    Dtypes,
+    ModuleCost,
+    Parallel,
+    StepShape,
+    pass_costs,
+)
+from .occupancy import (
+    ActivationRegime,
+    ExpertActivationModel,
+    ExpertDispatch,
+    active_experts_envelope,
+    bernoulli_expected_experts,
+    load_activation_hull,
+    min_experts_per_ep_shard,
+    parse_activation_spec,
+)
+from .serving import ConcurrencyRow, ServingRequest, plan
+from .step import (
+    FloorOptions,
+    SpecShape,
+    StepFloor,
+    spec_cycle_floor,
+    step_floor,
+)
 
 __all__ = [
+    "ACTIVATION_HULL_SCHEMA",
     "CHIPS",
     "SUPPORTED_CHIPS",
     "SUPPORTED_MODEL_TYPES",
     "TOPOLOGIES",
+    "ActivationRegime",
     "ChipOverrides",
     "ChipSpec",
     "Collective",
     "CollectiveConfig",
+    "ConcurrencyRow",
+    "Dtypes",
+    "ExpertActivationModel",
+    "ExpertDispatch",
+    "FloorOptions",
     "LayerCounts",
     "ModelGeometry",
+    "ModuleCost",
+    "Parallel",
+    "ServingRequest",
     "SliceTopology",
+    "SpecShape",
+    "StepFloor",
+    "StepShape",
+    "active_experts_envelope",
+    "bernoulli_expected_experts",
     "count_layer_types",
+    "dtypes_from_hf_config",
     "from_hf_config",
+    "load_activation_hull",
+    "load_hf_config",
+    "min_experts_per_ep_shard",
+    "parse_activation_spec",
+    "pass_costs",
+    "plan",
+    "spec_cycle_floor",
+    "step_floor",
     "torus_collective_s",
 ]
