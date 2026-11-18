@@ -2840,10 +2840,56 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             split_seq_lens: jax.Array,
             split_block_tables: jax.Array,
             split_query_start_loc: jax.Array,
-            *ws_pages: jax.Array,
-        ) -> tuple[jax.Array, ...]:
+        ) -> tuple[jax.Array, jax.Array]:
+            return pcp_write_split_any(
+                kv_cache_nope,
+                kv_cache_rope,
+                kv_c_normed,
+                k_pe,
+                restore_idx,
+                split_seq_lens,
+                split_block_tables,
+                split_query_start_loc,
+                None,
+            )
+
+        # `pallas.jax_op` takes explicit array arguments and a tuple of arrays.
+        def pcp_write_split_hoist_core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            restore_idx: jax.Array,
+            split_seq_lens: jax.Array,
+            split_block_tables: jax.Array,
+            split_query_start_loc: jax.Array,
+            ws_req: jax.Array,
+            ws_vpage: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return pcp_write_split_any(
+                kv_cache_nope,
+                kv_cache_rope,
+                kv_c_normed,
+                k_pe,
+                restore_idx,
+                split_seq_lens,
+                split_block_tables,
+                split_query_start_loc,
+                (ws_req, ws_vpage, chunk_pages()),
+            )
+
+        def pcp_write_split_any(
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            restore_idx,
+            split_seq_lens,
+            split_block_tables,
+            split_query_start_loc,
+            prefetch,
+        ):
             nope_spec, rope_spec = layer.mla_kv_spec
-            prefetch = (*ws_pages, chunk_pages()) if hoist else None
             return sparse_mla_pcp_write_split(
                 kv_cache_nope,
                 kv_cache_rope,
@@ -2867,7 +2913,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         op_name = f"pallas::pcp_write_split_{layer.layer_name.replace('.', '_')}"
         jax_op = pcp_streaming_jax_op(
             op_name,
-            pcp_write_split_core,
+            pcp_write_split_hoist_core if hoist else pcp_write_split_core,
             donate_argnums=(0, 1),
             mesh=mesh,
             input_partition_specs=(
@@ -2942,8 +2988,75 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             request_distribution: jax.Array,
             num_split_reqs: jax.Array,
             ws_used_pages: jax.Array,
-            *chunk0: jax.Array,
         ) -> jax.Array:
+            return pcp_prefill_any(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                topk_indices,
+                split_block_tables,
+                ws_req,
+                ws_vpage,
+                ws_page_offset,
+                query_start_loc,
+                request_distribution,
+                num_split_reqs,
+                ws_used_pages,
+                None,
+            )
+
+        # `pallas.jax_op` takes explicit array arguments.
+        def pcp_prefill_hoist_core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            topk_indices: jax.Array,
+            split_block_tables: jax.Array,
+            ws_req: jax.Array,
+            ws_vpage: jax.Array,
+            ws_page_offset: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            num_split_reqs: jax.Array,
+            ws_used_pages: jax.Array,
+            chunk0_nope: jax.Array,
+            chunk0_rope: jax.Array,
+        ) -> jax.Array:
+            return pcp_prefill_any(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                topk_indices,
+                split_block_tables,
+                ws_req,
+                ws_vpage,
+                ws_page_offset,
+                query_start_loc,
+                request_distribution,
+                num_split_reqs,
+                ws_used_pages,
+                (chunk0_nope, chunk0_rope),
+            )
+
+        def pcp_prefill_any(
+            kv_cache_nope,
+            kv_cache_rope,
+            ql_nope,
+            q_pe,
+            topk_indices,
+            split_block_tables,
+            ws_req,
+            ws_vpage,
+            ws_page_offset,
+            query_start_loc,
+            request_distribution,
+            num_split_reqs,
+            ws_used_pages,
+            chunk0,
+        ):
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_pcp_prefill(
                 kv_cache_nope,
@@ -2970,7 +3083,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     chunk_tokens, nope_spec.page_size, dcp_size
                 ),
                 ws_fill=ws_fill,
-                chunk0=(chunk0[0], chunk0[1]) if hoist else None,
+                chunk0=chunk0,
             )
 
         sharded = P(DCP_AXIS_NAME)
@@ -2978,7 +3091,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         op_name = f"pallas::pcp_prefill_mla_{layer.layer_name.replace('.', '_')}"
         jax_op = pcp_streaming_jax_op(
             op_name,
-            pcp_prefill_core,
+            pcp_prefill_hoist_core if hoist else pcp_prefill_core,
             donate_argnums=None,
             mesh=mesh,
             input_partition_specs=(
