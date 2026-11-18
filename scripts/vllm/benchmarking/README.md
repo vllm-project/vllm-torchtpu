@@ -152,6 +152,13 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 > wants `thinking`. Check the checkpoint's `chat_template.jinja` before assuming
 > the default lands.
 
+### `run_eval_flow.sh` flags
+
+- `--base-url URL`: Full endpoint URL with optional scheme, port, and path prefix. Bare host defaults to `:8000`; trailing `/` and `/v1` are stripped. The script connects to this endpoint instead of starting its own server.
+- `--served-model-name NAME`: Model name to use in requests when the endpoint serves it under a different name than the config's `MODEL`. With `--base-url`, the endpoint's `/v1/models` list is queried if no name is given.
+- `--eval-suites LIST`: Comma-separated list of accuracy suites to run (`mmlu_llama`, `mmlu_pro`, `gsm8k`, `humaneval_plus_tpu`, `mbpp_plus_tpu`, `mmmu_pro`, `json_schema`, `all`, or `none`). Overrides the config's `EVAL_SUITES` and legacy `--run-lm-eval` flags.
+- `--perf-suites LIST`: Comma-separated list of performance suites to run (`bench_serve`, `agentx`, `all`, or `none`). Defaults to `bench_serve` when omitted.
+
 ## Speculative Decoding (`run_benchmarks.sh --mode spec_bench`)
 
 `run_benchmarks.sh` supports two runner modes via `--mode serving|spec_bench`
