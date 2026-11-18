@@ -13,6 +13,8 @@
 # limitations under the License.
 """VMEM residual-stream epilogue fused into hierarchical reduce-scatter kernels."""
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -34,8 +36,9 @@ def apply_residual_epilogue(
     scale: jax.Array | None,
     next_norm_weight: jax.Array | None,
     eps: float,
+    next_act_dtype: Any = jnp.float8_e4m3fn,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
-    """Computes updated residual rows and optional FP8-quantized next RMSNorm.
+    """Computes updated residual rows and optional next-sublayer RMSNorm output.
 
     `reduced` (`bf16` or `f32`) and `residual` (`bf16`) have shape
     `[rows, hidden]`; weight operands are `f32[1, hidden]`. Computes:
@@ -43,8 +46,10 @@ def apply_residual_epilogue(
         residual_out = (residual + rms_norm(reduced, post_norm_weight)) [* scale]
 
     (skipping `post_norm_weight` when `None`). When `next_norm_weight` is
-    provided, also computes `rms_norm(residual_out, next_norm_weight)` quantized
-    per row to `float8_e4m3fn` plus `f32[rows, 1]` row scales.
+    provided, also computes `rms_norm(residual_out, next_norm_weight)`:
+    quantized per row to `float8_e4m3fn` plus `f32[rows, 1]` scales when
+    `next_act_dtype == jnp.float8_e4m3fn`, or unquantized `bf16` with `None`
+    scale when `next_act_dtype == jnp.bfloat16`.
     """
     if post_norm_weight is not None:
         reduced = _rms_norm(reduced, post_norm_weight, eps)
@@ -55,8 +60,13 @@ def apply_residual_epilogue(
         residual_out = residual_out * scale.astype(jnp.bfloat16)
     if next_norm_weight is None:
         return residual_out, None, None
+    normed = _rms_norm(residual_out, next_norm_weight, eps)
+    if jnp.dtype(next_act_dtype) == jnp.bfloat16:
+        return residual_out, normed, None
+    if jnp.dtype(next_act_dtype) != jnp.float8_e4m3fn:
+        raise ValueError(f"Unsupported next_act_dtype: {next_act_dtype}")
     x_q, x_scale = quantize_block(
-        _rms_norm(residual_out, next_norm_weight, eps),
+        normed,
         axis=-1,
         target_dtype=jnp.float8_e4m3fn,
     )

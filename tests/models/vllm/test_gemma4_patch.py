@@ -515,6 +515,28 @@ def test_build_sublayer_collectives_registers_jax_ops(
             r3 = ops.norm_add_scale(p, r, w, s)
             assert (r3.shape, r3.dtype) == ((2, 32), torch.bfloat16)
 
+        ops_bf16 = fused_rs_epilogue_op.build_streaming_sublayer_collectives(
+            1e-6, fp8_wire=fp8_wire, next_act_dtype=torch.bfloat16
+        )
+        assert (
+            ops_bf16 is not None
+            and not ops_bf16.outputs_gathered
+            and ops_bf16.next_act_dtype == torch.bfloat16
+        )
+        with torch._subclasses.FakeTensorMode():
+            p = torch.empty((16, 32), dtype=torch.bfloat16)
+            r = torch.empty((2, 32), dtype=torch.bfloat16)
+            w = torch.empty((32,), dtype=torch.bfloat16)
+            s = torch.empty((1,), dtype=torch.bfloat16)
+            r1, n1 = ops_bf16.norm_add_next_norm(p, r, w, w)
+            assert (r1.shape, n1.shape) == ((2, 32), (2, 32))
+            assert (r1.dtype, n1.dtype) == (torch.bfloat16, torch.bfloat16)
+            r2, n2 = ops_bf16.norm_add_scale_next_norm(p, r, w, s, w)
+            assert (r2.shape, n2.shape) == ((2, 32), (2, 32))
+            assert (r2.dtype, n2.dtype) == (torch.bfloat16, torch.bfloat16)
+            r3 = ops_bf16.norm_add_scale(p, r, w, s)
+            assert (r3.shape, r3.dtype) == ((2, 32), torch.bfloat16)
+
     oneshot = fused_rs_epilogue_op.build_oneshot_sublayer_collectives(1e-6)
     assert oneshot is not None and oneshot.outputs_gathered is True
     oneshot_alt = fused_rs_epilogue_op.build_oneshot_sublayer_collectives(1e-5)
@@ -766,8 +788,8 @@ def test_forward_matches_upstream(
         monkeypatch.setattr(
             fused_rs_epilogue_op,
             "build_streaming_sublayer_collectives",
-            lambda eps, *, fp8_wire: _fused_collectives_stand_in(
-                mock.reduce_scatter, eps
+            lambda eps, *, fp8_wire, next_act_dtype=torch.float8_e4m3fn: (
+                _fused_collectives_stand_in(mock.reduce_scatter, eps)
             ),
         )
         monkeypatch.setattr(
@@ -954,8 +976,23 @@ def test_token_buckets_share_one_graph_signature(
     assert signatures[0] == signatures[1] == signatures[2]
 
 
+def _mark_unquantized(layer: Gemma4DecoderLayer) -> Gemma4DecoderLayer:
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    method = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
+    for proj in (
+        layer.self_attn.qkv_proj,
+        layer.self_attn.o_proj,
+        layer.mlp.gate_up_proj,
+        layer.mlp.down_proj,
+    ):
+        proj.quant_method = method
+    return layer
+
+
+@pytest.mark.parametrize("unquantized", [False, True])
 def test_hier_collectives_trace_fullgraph_and_match_signature(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, unquantized: bool
 ) -> None:
     """Streaming (`1024`) and single-shot (`128`) ops trace under fullgraph=True
     without calling StrongLRUCache (`pltpu.get_tpu_info`) and match graph_signature."""
@@ -993,9 +1030,17 @@ def test_hier_collectives_trace_fullgraph_and_match_signature(
             super().__init__()
             self.embed = nn.Embedding(128, wide_hidden, dtype=torch.bfloat16)
             self.layers = nn.ModuleList(
-                _as_fp8_weights(
-                    _make_layer(
-                        _make_weights(idx, torch.bfloat16), idx, tp, num_layers=2
+                (
+                    _mark_unquantized(
+                        _make_layer(
+                            _make_weights(idx, torch.bfloat16), idx, tp, num_layers=2
+                        )
+                    )
+                    if unquantized
+                    else _as_fp8_weights(
+                        _make_layer(
+                            _make_weights(idx, torch.bfloat16), idx, tp, num_layers=2
+                        )
                     )
                 )
                 for idx in range(2)
@@ -1016,7 +1061,7 @@ def test_hier_collectives_trace_fullgraph_and_match_signature(
     model = _Stack()
     state0 = gemma4_patch._layer_state(model.layers[0])
     assert state0.streaming_collectives is not None
-    assert state0.oneshot_collectives is not None
+    assert (state0.oneshot_collectives is None) == unquantized
 
     def forbid_tpu_info() -> None:
         raise AssertionError("tpu_info must not run during TorchDynamo tracing")
@@ -1050,6 +1095,155 @@ def test_hier_collectives_trace_fullgraph_and_match_signature(
     assert len(signatures) == 4
     assert signatures[0] == signatures[1] == signatures[2] == signatures[3]
     assert not any("dense_sp_" in op for op in seen_ops[0])
-    assert any("dense_sp_oneshot_" in op for op in seen_ops[1])
+    assert any("dense_sp_oneshot_" in op for op in seen_ops[1]) == (not unquantized)
     assert any("dense_sp_rs_" in op for op in seen_ops[2])
     assert not any("dense_sp_" in op for op in seen_ops[3])
+
+
+def test_mixed_quantization_refused() -> None:
+    """Mismatched qkv_proj vs gate_up_proj quantization raises NotImplementedError."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    layer = _make_layer(_make_weights(0), 0, tp=2)
+    layer.self_attn.qkv_proj.quant_method = UnquantizedLinearMethod.__new__(
+        UnquantizedLinearMethod
+    )
+    with pytest.raises(NotImplementedError, match="same quantization"):
+        gemma4_patch._configure_layer(layer)
+
+
+@pytest.mark.parametrize("path", ["replicated", "xla_sp", "hier_sp"])
+@pytest.mark.parametrize("tp", [2, 8])
+def test_unquantized_forward_matches_upstream(
+    monkeypatch: pytest.MonkeyPatch, tp: int, path: str
+) -> None:
+    """Unquantized bf16 linears skip FP8 row quantization, gather bf16 rows directly,
+    keep < 1024 on all-reduce, and match upstream TP=1 output."""
+    monkeypatch.setattr(
+        dense_sequence_parallel,
+        "MIN_TOKENS_PER_RANK",
+        NUM_TOKENS + 1 if path == "replicated" else 0,
+    )
+    monkeypatch.setattr(fp8_linear_op, "register_fp8_linear_ops", lambda: None)
+
+    def forbid(*_a: object, **_kw: object) -> None:
+        raise AssertionError(
+            "FP8 row quantization should not run on unquantized linears"
+        )
+
+    monkeypatch.setattr(fp8_linear_op, "quantize_fp8_activations", forbid)
+    monkeypatch.setattr(
+        dense_sequence_parallel, "apply_prequantized_fp8_linear", forbid
+    )
+
+    mock = TPCollectiveMock(tp)
+    _patch_collectives(
+        monkeypatch,
+        all_reduce=mock.all_reduce,
+        all_gather=mock.all_gather,
+        reduce_scatter=mock.reduce_scatter,
+    )
+
+    def unquant_hier_ops(
+        eps: float,
+        *,
+        fp8_wire: bool,
+        next_act_dtype: torch.dtype = torch.float8_e4m3fn,
+    ) -> fused_rs_epilogue_op.FusedSublayerCollectives:
+        del fp8_wire
+        assert next_act_dtype == torch.bfloat16
+
+        def norm_add_scale(partial, residual, post_norm_weight, scale):
+            reduced = _rms_norm_torch(
+                mock.reduce_scatter(partial, 0), post_norm_weight, eps
+            )
+            return (reduced + residual) * scale
+
+        def norm_add_scale_next_norm(
+            partial, residual, post_norm_weight, scale, next_norm_weight
+        ):
+            res_new = norm_add_scale(partial, residual, post_norm_weight, scale)
+            return res_new, _rms_norm_torch(res_new, next_norm_weight, eps)
+
+        return fused_rs_epilogue_op.FusedSublayerCollectives(
+            norm_add_next_norm=lambda partial, residual, post_norm_w, next_norm_w: (
+                norm_add_scale_next_norm(
+                    partial, residual, post_norm_w, 1.0, next_norm_w
+                )
+            ),
+            norm_add_scale_next_norm=norm_add_scale_next_norm,
+            norm_add_scale=norm_add_scale,
+            next_act_dtype=torch.bfloat16,
+        )
+
+    if path in ("replicated", "hier_sp"):
+        # Also sets TPU_DENSE_SP_HIER_RS on `replicated` (< 1024) to verify
+        # unquantized linears do NOT build or dispatch oneshot_collectives.
+        monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
+        monkeypatch.setattr(fused_rs_epilogue_op, "MIN_ONESHOT_RS_AG_TOKENS", 0)
+        monkeypatch.setattr(
+            fused_rs_epilogue_op,
+            "build_streaming_sublayer_collectives",
+            unquant_hier_ops,
+        )
+        monkeypatch.setattr(
+            fused_rs_epilogue_op, "supports_streaming_sublayer", lambda *_: True
+        )
+
+    weights = [_make_weights(seed) for seed in range(NUM_LAYERS)]
+    g = torch.Generator().manual_seed(456)
+    embedding = torch.randn(NUM_TOKENS, HIDDEN, generator=g, dtype=torch.float64)
+    positions = torch.arange(NUM_TOKENS)
+
+    expected = embedding
+    for idx, layer_weights in enumerate(weights):
+        expected, _ = _UPSTREAM_FORWARD(
+            _mark_unquantized(_make_layer(layer_weights, idx)),
+            positions,
+            expected,
+            None,
+        )
+
+    outputs: list[torch.Tensor | None] = [None] * tp
+    errors: list[Exception | None] = [None] * tp
+
+    def worker(rank: int) -> None:
+        try:
+            mock.rank.value = rank
+            hidden, residual = embedding.clone(), None
+            for idx, layer_weights in enumerate(weights):
+                layer = _mark_unquantized(_make_layer(layer_weights, idx, tp, rank))
+                gemma4_patch._configure_layer(layer)
+                assert gemma4_patch._layer_state(layer).oneshot_collectives is None
+                hidden, residual = gemma4_patch._dense_sequence_parallel_forward(
+                    layer, positions, hidden, residual
+                )
+            outputs[rank] = hidden
+        except Exception as e:
+            errors[rank] = e
+            mock.barrier.abort()
+
+    threads = [threading.Thread(target=worker, args=(r,)) for r in range(tp)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+        assert not t.is_alive()
+    if any(errors):
+        raise next(e for e in errors if e is not None)
+
+    for out in outputs:
+        assert out is not None
+        torch.testing.assert_close(out, expected, rtol=1e-10, atol=1e-10)
+    if path == "replicated":
+        assert mock.calls == {
+            "all_reduce": 2 * NUM_LAYERS,
+            "reduce_scatter": 0,
+            "all_gather": 0,
+        }
+    else:
+        assert mock.calls == {
+            "all_reduce": 0,
+            "reduce_scatter": 2 * NUM_LAYERS,
+            "all_gather": 2 * NUM_LAYERS + 1,
+        }

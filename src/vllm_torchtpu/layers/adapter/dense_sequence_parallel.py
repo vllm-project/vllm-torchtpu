@@ -14,15 +14,16 @@
 """Model-independent sequence-parallel helpers for dense tensor-parallel layers.
 
 Instead of all-reducing each row-parallel linear's partial sum and repeating
-RMSNorms, residual adds, and FP8 quantization across all TP ranks, sequence
-parallelism reduce-scatters the partial sums along the token axis, runs the
-per-token ops on `num_tokens // tp_size` tokens per rank, and all-gathers the
-1-byte FP8 activations and f32 row scales for the next column-parallel linear.
+RMSNorms, residual adds, and (on FP8 models) row quantization across all TP
+ranks, sequence parallelism reduce-scatters the partial sums along the token
+axis, runs the per-token ops on `num_tokens // tp_size` tokens per rank, and
+all-gathers the next column-parallel linear's inputs (1-byte FP8 rows plus f32
+row scales for per-channel FP8 linears, or bf16 rows for unquantized linears).
 """
 
 import torch
 from vllm.distributed import tensor_model_parallel_all_gather
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
@@ -44,16 +45,29 @@ def validate_sequence_parallel_env() -> None:
         raise ValueError("TPU_DENSE_SP_HIER_RS requires TPU_DENSE_SEQUENCE_PARALLEL=1")
 
 
+def is_unquantized_linear(linear: LinearBase) -> bool:
+    """Whether `linear` uses `UnquantizedLinearMethod`."""
+    return isinstance(linear.quant_method, UnquantizedLinearMethod)
+
+
 def validate_fp8_linear_for_sp(linear: LinearBase) -> VllmFp8LinearMethodTPU:
     """Validates at layer init that `linear` uses bias-free per-channel FP8."""
     quant_method = linear.quant_method
     if not isinstance(quant_method, VllmFp8LinearMethodTPU):
         raise NotImplementedError(
             f"{linear.prefix}: TPU_DENSE_SEQUENCE_PARALLEL requires "
-            f"VllmFp8LinearMethodTPU, got {type(quant_method).__name__}"
+            f"VllmFp8LinearMethodTPU or UnquantizedLinearMethod, got "
+            f"{type(quant_method).__name__}"
         )
     quant_method.validate_prequantized_config(linear)
     return quant_method
+
+
+def validate_linear_for_sp(linear: LinearBase) -> None:
+    """Validates at layer init that `linear` supports sequence-parallel gather."""
+    if is_unquantized_linear(linear):
+        return
+    validate_fp8_linear_for_sp(linear)
 
 
 def use_sequence_parallel(num_tokens: int | torch.SymInt, tp_size: int) -> bool:
@@ -109,3 +123,13 @@ def quantize_all_gather_linear(
     return all_gather_prequantized_fp8_linear(
         linear, x_q_shard, x_scale_shard, num_tokens
     )
+
+
+def all_gather_linear(
+    linear: LinearBase, x_shard: torch.Tensor, num_tokens: int | torch.SymInt
+) -> torch.Tensor:
+    """All-gathers `x_shard` (quantizing first for FP8 linears) and runs `linear`."""
+    if is_unquantized_linear(linear):
+        out, bias = linear(all_gather_tokens(x_shard, num_tokens))
+        return out if bias is None else out + bias
+    return quantize_all_gather_linear(linear, x_shard, num_tokens)
