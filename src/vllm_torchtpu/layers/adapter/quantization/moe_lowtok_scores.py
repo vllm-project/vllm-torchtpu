@@ -467,6 +467,17 @@ def prebuild(
     if not cap:
         # Not measured at this expert-parallel size: the default MoE path.
         return None
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+
+    if fused_moe_ep_v3.sequence_parallel_threshold_unset(layer):
+        logger.warning_once(
+            "moe_lowtok: not armed. Fused EP v3 takes the sequence-parallel MoE "
+            "steps under tensor parallelism, and the sequence-parallel row "
+            "threshold is 0 until the model follows each step's form, so the "
+            "two kernels cannot meet (fused_moe_ep_v3.check_kernel_threshold). "
+            "The default MoE path serves the steps below the fused kernel's gate."
+        )
+        return None
     if _ARMED_MAX_TOKENS not in (0, cap):
         raise ValueError(
             f"moe_lowtok: MoE layers of one model have row caps {_ARMED_MAX_TOKENS} "
