@@ -228,9 +228,9 @@ def _primitives(fn, *args):
     return [e.primitive.name for e in jax.make_jaxpr(fn)(*args).jaxpr.eqns]
 
 
-def test_the_per_seq_call_sits_behind_a_cond():
-    """With a decode segment, fused_conv1d_gdn only runs the PER_SEQ kernel
-    when the batch holds a prefill or mixed sequence."""
+def _per_seq_primitives(pooled, batched_only):
+    """Top-level primitives of fused_conv1d_gdn for four 1-token decodes, over
+    dense states or over the unified block pool."""
     n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
     dim = 2 * n_kq * d_k + n_v * d_v
     num_seqs = 4
@@ -238,44 +238,63 @@ def test_the_per_seq_call_sits_behind_a_cond():
     qkv = jax.random.normal(next(rngs), (num_seqs, dim), jnp.bfloat16)
     b = jax.random.normal(next(rngs), (num_seqs, n_v), jnp.bfloat16)
     a = jax.random.normal(next(rngs), (num_seqs, n_v), jnp.bfloat16)
-    states = (
-        jnp.zeros((num_seqs, kernel_size - 1, dim), jnp.float32),
-        jnp.zeros((num_seqs, n_v, d_k, d_v), jnp.float32),
-    )
+    pool_kwargs = {}
+    if pooled:
+        # One logical block per sequence plus the null block: a 128-token SSM
+        # region (n_v * d_k * d_v * 4 bytes at 1 KiB per token) and a 128-token
+        # conv region, in the int8 (1, 4, 256) token layout of the unified pool.
+        states = jnp.zeros((num_seqs + 1, 256, 1, 4, 256), jnp.int8)
+        pool_kwargs = dict(
+            recurrent_dtype=jnp.dtype(jnp.float32), conv_dtype=jnp.dtype(jnp.float32)
+        )
+    else:
+        states = (
+            jnp.zeros((num_seqs, kernel_size - 1, dim), jnp.float32),
+            jnp.zeros((num_seqs, n_v, d_k, d_v), jnp.float32),
+        )
     conv_w = jax.random.normal(next(rngs), (dim, 1, kernel_size), jnp.bfloat16)
     a_log = jnp.zeros((n_v,), jnp.float32)
     dt_bias = jnp.zeros((n_v,), jnp.float32)
     q_loc = jnp.arange(num_seqs + 1, dtype=jnp.int32)
-    idx = jnp.arange(num_seqs, dtype=jnp.int32)
+    idx = jnp.arange(1, num_seqs + 1, dtype=jnp.int32)
     dist = jnp.array([num_seqs, num_seqs, num_seqs], jnp.int32)
     seq_lens = jnp.full((num_seqs,), 5, jnp.int32)
+    return _primitives(
+        lambda *x: wrapper.fused_conv1d_gdn.__wrapped__(
+            *x,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            decode_tile_size=2,
+            mixed_tile_size=1,
+            batched_only=batched_only,
+            **pool_kwargs,
+        ),
+        qkv,
+        b,
+        a,
+        states,
+        conv_w,
+        None,
+        a_log,
+        dt_bias,
+        q_loc,
+        idx,
+        dist,
+        seq_lens,
+    )
 
-    def run(batched_only):
-        return _primitives(
-            lambda *x: wrapper.fused_conv1d_gdn.__wrapped__(
-                *x,
-                n_kq=n_kq,
-                n_v=n_v,
-                d_k=d_k,
-                d_v=d_v,
-                kernel_size=kernel_size,
-                decode_tile_size=2,
-                mixed_tile_size=1,
-                batched_only=batched_only,
-            ),
-            qkv,
-            b,
-            a,
-            states,
-            conv_w,
-            None,
-            a_log,
-            dt_bias,
-            q_loc,
-            idx,
-            dist,
-            seq_lens,
-        )
 
-    assert "cond" in run(batched_only=False)
-    assert "cond" not in run(batched_only=True)
+def test_the_pooled_per_seq_call_sits_behind_a_cond():
+    """Over the unified block pool, fused_conv1d_gdn runs the PER_SEQ kernel
+    only when the batch holds a prefill or mixed sequence."""
+    assert "cond" in _per_seq_primitives(pooled=True, batched_only=False)
+    assert "cond" not in _per_seq_primitives(pooled=True, batched_only=True)
+
+
+def test_the_dense_per_seq_call_runs_on_every_step_as_on_main():
+    """With dense (non-pooled) states the PER_SEQ kernel runs unconditionally,
+    as main's kernel calls it."""
+    assert "cond" not in _per_seq_primitives(pooled=False, batched_only=False)
