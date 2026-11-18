@@ -26,6 +26,9 @@ from .chips import ChipSpec, resolve_chip_spec
 from .constants import (
     ATTN_TILE_TOKENS,
     BOUNDARY_SYNC_HOP_FACTOR,
+    COLLECTIVE_OP_ALL_REDUCE,
+    COLLECTIVE_PATH_IN_KERNEL,
+    COLLECTIVE_PATH_XLA,
     COMPILED_XLA_GAP_P50_US,
     COMPILED_XLA_GAP_P90_US,
     CORES_PER_HOST,
@@ -43,6 +46,7 @@ from .constants import (
     GROUPED_MOE_MODES,
     MIN_FIRST_DMA_SLOT_BYTES,
     PER_OP_COLLECTIVE_CALL_FACTOR,
+    QUANTILE_DECIMALS,
     SUB_BYTE_EXPERT_DTYPES,
     SUBCHANNEL_BLOCK_K_THRESHOLD,
     SUBCHANNEL_VPU_OPS_PER_BLOCK,
@@ -249,9 +253,7 @@ def _resolve_scope_moe_and_acts(
         or workload.moe_mode in GROUPED_MOE_MODES
         or tile_tokens * scope_context.ep_dp >= scope_context.row_floor
     )
-    declaration = find_declaration(
-        profile.name, scope, scope_context.eff_tp, workload.phase
-    )
+    declaration = find_declaration(profile.name, scope, scope_context.eff_tp, workload)
     declared_layout = str(declaration.get("moe_layout", "")) if declaration else ""
     if declared_layout in DECLARED_MOE_LAYOUTS:
         # A declared megakernel runs the expert layout its deployment states.
@@ -291,8 +293,8 @@ def _compute_scope_collective_times(
     scope: FusionScope,
     scope_context: _ScopeContext,
     n_splits: int,
-) -> tuple[float, float, int]:
-    """Compute sync stage time, comm time, and xla ar factor in seconds."""
+) -> tuple[float, float, int, float, bool]:
+    """Compute sync stage, comm time, xla ar factor, and measured ar info."""
     num_ar = scope_context.num_ar
     lat_coll = scope_context.lat_coll
     l_moe = scope_context.l_moe
@@ -301,6 +303,17 @@ def _compute_scope_collective_times(
     a2a_time = scope_context.a2a_time
     bw_hbm = scope_context.bw_hbm
 
+    measured_ar_s = (
+        scope_context.measured_ar_xla_s
+        if scope == "per_op"
+        else scope_context.measured_ar_in_kernel_s
+    )
+    has_measured_ar = measured_ar_s is not None and scope_context.eff_tp > 1
+    measured_ar_total_s = (
+        num_ar * n_splits * measured_ar_s
+        if has_measured_ar and measured_ar_s is not None
+        else 0.0
+    )
     xla_ar_factor = (
         PER_OP_COLLECTIVE_CALL_FACTOR
         if scope == "per_op" and scope_context.eff_tp > 1
@@ -308,26 +321,33 @@ def _compute_scope_collective_times(
     )
     xla_hbm_coll_bytes = (
         2.0 * num_ar * scope_context.token_residual_bytes
-        if scope == "per_op" and scope_context.eff_tp > 1
+        if not has_measured_ar and scope == "per_op" and scope_context.eff_tp > 1
         else 0.0
     )
     is_fused_multi = scope in ("whole_step", "layer_group")
     overlapped_comm = is_fused_multi and n_splits == 1
     ar_and_pcp_s = (
-        num_ar
-        * (
-            scope_context.ar_transfer_time_s
-            + n_splits * xla_ar_factor * scope_context.ar_base_lat_s
+        measured_ar_total_s
+        if has_measured_ar
+        else (
+            num_ar
+            * (
+                scope_context.ar_transfer_time_s
+                + n_splits * xla_ar_factor * scope_context.ar_base_lat_s
+            )
+            + xla_hbm_coll_bytes / bw_hbm
         )
-        + xla_hbm_coll_bytes / bw_hbm
-        + scope_context.pcp_ring_time
-    )
+    ) + scope_context.pcp_ring_time
     a2a_sync_s = (
         l_moe * (a2a_time + 2 * n_splits * xla_ar_factor * lat_coll)
         if l_moe > 0 and ep_dp > 1
         else 0.0
     )
-    dcn_sync_s = num_ar * n_splits * xla_ar_factor * scope_context.ar_inter_latency_s
+    dcn_sync_s = (
+        0.0
+        if has_measured_ar
+        else num_ar * n_splits * xla_ar_factor * scope_context.ar_inter_latency_s
+    )
     sync_stage_s = (
         (dcn_sync_s + pp_stage_time + a2a_sync_s)
         if overlapped_comm
@@ -342,7 +362,7 @@ def _compute_scope_collective_times(
         if is_fused_multi
         else (ar_and_pcp_s + pp_stage_time + a2a_sync_s)
     )
-    return sync_stage_s, comm_s, xla_ar_factor
+    return sync_stage_s, comm_s, xla_ar_factor, measured_ar_total_s, has_measured_ar
 
 
 def _routed_chain(
@@ -506,6 +526,7 @@ def _compute_achievable_upper_us(
         float,
     ],
     vector_terms: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    measured_in_comm_s: float = 0.0,
 ) -> float:
     """Compute achievable upper-bound step latency in microseconds."""
     overlapped_comm, bf16_attention_upper, _, n_ops = flags
@@ -548,7 +569,10 @@ def _compute_achievable_upper_us(
         t_matmul_dense_upper_ach,
         (vec_ops_dense / vec_rate) / max(1e-3, eff.eta_dense),
     )
-    t_comm_upper_ach = (comm_s + ar_extra_s) / max(1e-3, eff.eta_ici)
+    unmeasured_comm_s = max(0.0, comm_s - measured_in_comm_s)
+    t_comm_upper_ach = measured_in_comm_s + (unmeasured_comm_s + ar_extra_s) / max(
+        1e-3, eff.eta_ici
+    )
     t_moe_ach = (
         (moe_pad_factor * scope_context.flops_moe) / scope_context.peak_e
     ) / max(1e-3, eta_moe)
@@ -659,6 +683,7 @@ def _compute_ach_upper_and_strict(
         tuple[bool, bool, bool, bool, int, int], tuple[float, float, float]
     ],
     times: tuple[float, ...],
+    measured_in_comm_s: float = 0.0,
 ) -> tuple[float, float, float]:
     """Return step_ach_upper_us, w_step_strict, and step_floor_strict_us."""
     flags, vector_terms = flags_and_vectors
@@ -709,6 +734,7 @@ def _compute_ach_upper_and_strict(
             routed_hbm_s,
         ),
         vector_terms,
+        measured_in_comm_s=measured_in_comm_s,
     )
     w_step_strict, step_floor_strict_us = _compute_strict_step_floor(
         scope_context,
@@ -728,7 +754,11 @@ def _compute_ach_upper_and_strict(
 
 
 def _upper_collective_extras(
-    scope_context: _ScopeContext, n_splits: int, xla_ar_factor: float
+    scope_context: _ScopeContext,
+    n_splits: int,
+    xla_ar_factor: float,
+    *,
+    has_measured_ar: bool = False,
 ) -> tuple[float, float]:
     """Return extra all-reduce and all-to-all seconds at the upper latency.
 
@@ -737,8 +767,16 @@ def _upper_collective_extras(
     """
     extra_latency_s = max(0.0, scope_context.lat_coll_upper - scope_context.lat_coll)
     ar_extra_s = (
-        scope_context.num_ar * n_splits * xla_ar_factor * scope_context.ar_intra_hops
-    ) * extra_latency_s
+        0.0
+        if has_measured_ar
+        else (
+            scope_context.num_ar
+            * n_splits
+            * xla_ar_factor
+            * scope_context.ar_intra_hops
+        )
+        * extra_latency_s
+    )
     a2a_extra_s = (
         (2 * scope_context.l_moe * n_splits * xla_ar_factor)
         if scope_context.l_moe > 0 and scope_context.ep_dp > 1
@@ -753,6 +791,7 @@ def _compute_scope_achievable_step(
     scope_flags: tuple[bool, bool, int, float],
     timing_inputs: tuple[float, float, float, float, float, float, float, float],
     vector_terms: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    measured_ar_split: tuple[float, float] = (0.0, 0.0),
 ) -> tuple[float, float, float, float, float, float]:
     """Compute achievable and upper-band step components for one FusionScope."""
     is_fused_multi, grouped_moe, n_ops, _ = scope_flags
@@ -767,6 +806,7 @@ def _compute_scope_achievable_step(
         t_matmul_upper,
     ) = timing_inputs
     vec_ops_dense, vec_ops_moe, vec_rate = vector_terms
+    measured_in_comm_s, measured_in_sync_s = measured_ar_split
     eff = workload.efficiency
     eta_moe = (
         eff.eta_moe_grouped
@@ -792,9 +832,13 @@ def _compute_scope_achievable_step(
         (vec_ops_dense / vec_rate) / max(1e-3, eff.eta_dense),
     )
     t_hbm_ach = hbm_time_s / max(1e-3, eff.eta_hbm)
-    t_comm_ach = comm_s / max(1e-3, eff.eta_ici)
+    unmeasured_comm_s = max(0.0, comm_s - measured_in_comm_s)
+    t_comm_ach = measured_in_comm_s + unmeasured_comm_s / max(1e-3, eff.eta_ici)
+    unmeasured_sync_s = max(0.0, sync_stage_s - measured_in_sync_s)
     sync_comm_extra_s = (
-        sync_stage_s * (1.0 / max(1e-3, eff.eta_ici) - 1.0) if is_fused_multi else 0.0
+        unmeasured_sync_s * (1.0 / max(1e-3, eff.eta_ici) - 1.0)
+        if is_fused_multi
+        else 0.0
     )
     t_moe_ach = t_moe / max(1e-3, eta_moe)
     t_vec_moe_ach = (vec_ops_moe / vec_rate) / max(1e-3, eff.eta_dense)
@@ -868,9 +912,16 @@ def _evaluate_single_scope(
     act_bytes = max(act_bytes, extra_act)
     is_fused_multi = scope in ("whole_step", "layer_group")
     overlapped_comm = is_fused_multi and n_splits == 1
-    sync_stage_s, comm_s, xla_ar_factor = _compute_scope_collective_times(
-        scope, scope_context, n_splits
-    )
+    (
+        sync_stage_s,
+        comm_s,
+        xla_ar_factor,
+        measured_ar_total_s,
+        has_measured_ar,
+    ) = _compute_scope_collective_times(scope, scope_context, n_splits)
+    comm_in_core = overlapped_comm or not is_fused_multi
+    measured_in_comm_s = measured_ar_total_s if comm_in_core else 0.0
+    measured_in_sync_s = 0.0 if comm_in_core else measured_ar_total_s
     pipeline_fill_drain_s = (n_ops - 1) * (
         scope_context.first_slot_bytes / bw_hbm
         + BOUNDARY_SYNC_HOP_FACTOR * scope_context.lat_coll
@@ -952,9 +1003,10 @@ def _evaluate_single_scope(
             t_matmul_upper,
         ),
         (vec_ops_dense, vec_ops_moe, vec_rate),
+        (measured_in_comm_s, measured_in_sync_s),
     )
     ar_extra_s, a2a_extra_s = _upper_collective_extras(
-        scope_context, n_splits, xla_ar_factor
+        scope_context, n_splits, xla_ar_factor, has_measured_ar=has_measured_ar
     )
     roof_upper_us = (
         _core_time(
@@ -1000,12 +1052,15 @@ def _evaluate_single_scope(
                 eff_state_bytes,
                 base_ai,
                 routed_hbm_s,
-                scope_context.num_ar
+                0.0
+                if has_measured_ar
+                else scope_context.num_ar
                 * (
                     scope_context.ar_transfer_time_s
                     - scope_context.ar_transfer_strict_s
                 ),
             ),
+            measured_in_comm_s=measured_in_comm_s,
         )
     )
     support_status, blockers = evaluate_support(
@@ -1132,6 +1187,8 @@ def _evaluate_whole_step_microbatched(
             ar_base_lat_s=scope_context.ar_base_lat_s,
             ar_inter_latency_s=scope_context.ar_inter_latency_s,
             launch_gap_upper_us=scope_context.launch_gap_upper_us,
+            measured_ar_xla_s=scope_context.measured_ar_xla_s,
+            measured_ar_in_kernel_s=scope_context.measured_ar_in_kernel_s,
         )
         parts.append(
             _evaluate_single_scope(
@@ -1256,6 +1313,8 @@ class _ScopeContext:
     attn_is_bf16: bool
     plan_error: str
     chip_spec: ChipSpec
+    measured_ar_xla_s: float | None = None
+    measured_ar_in_kernel_s: float | None = None
 
 
 def _vmem_budget_bytes(workload: WorkloadSpec, chip_spec: ChipSpec) -> int:
@@ -1697,6 +1756,12 @@ def _build_scope_context(
         )
     )
     ar_intra_hops, ar_inter_latency_s = _compute_ar_hops_and_latency(geom.eff_tp)
+    measured_xla_us, _, _, _ = _resolve_measured_all_reduce(
+        meas, geom.eff_tp, COLLECTIVE_PATH_XLA
+    )
+    measured_in_kernel_us, _, _, _ = _resolve_measured_all_reduce(
+        meas, geom.eff_tp, COLLECTIVE_PATH_IN_KERNEL
+    )
     dense_bank, expert_bank = _extract_slot_banks(workload)
     pcp_ring_time = (
         (eff_pcp - 1)
@@ -1811,12 +1876,154 @@ def _build_scope_context(
         ),
         plan_error=plan_error,
         chip_spec=chip_spec,
+        measured_ar_xla_s=(
+            measured_xla_us * 1e-6 if measured_xla_us is not None else None
+        ),
+        measured_ar_in_kernel_s=(
+            measured_in_kernel_us * 1e-6 if measured_in_kernel_us is not None else None
+        ),
     )
+
+
+@dataclass(frozen=True)
+class ResolvedCollectiveCall:
+    """Per-path all-reduce call cost resolution for one rank count."""
+
+    measured_s: float | None
+    value_us: float
+    lo_us: float
+    hi_us: float
+    tag: ProvenanceTag
+    source: str
 
 
 def _is_calibrated_trace(meas: MeasurementsData | None) -> bool:
     """Return True if meas represents a calibrated empirical trace."""
     return meas is not None and meas.source_kind != "architectural_prior"
+
+
+def _format_unapplied_collectives(
+    meas: MeasurementsData | None,
+    *,
+    exclude_path_group: tuple[str, int] | None = None,
+) -> str:
+    """Summarize loaded collective entries that were not applied to a path."""
+    if meas is None or not meas.collective_calls:
+        return ""
+    unapplied = [
+        call
+        for call in meas.collective_calls
+        if exclude_path_group is None
+        or not (
+            call.op == COLLECTIVE_OP_ALL_REDUCE
+            and call.path == exclude_path_group[0]
+            and call.group_size == exclude_path_group[1]
+        )
+    ]
+    if not unapplied:
+        return ""
+    labels = list(
+        dict.fromkeys(
+            f"{call.op or 'unnamed'} (path={call.path}, group_size={call.group_size})"
+            for call in unapplied
+        )
+    )
+    prefix = (
+        f"; not applied from {meas.source_desc}"
+        if exclude_path_group is None
+        else "; not applied"
+    )
+    return f"{prefix}: {', '.join(labels)}"
+
+
+def _resolve_measured_all_reduce(
+    meas: MeasurementsData | None,
+    eff_tp: int,
+    path: str,
+) -> tuple[float | None, int, str, str]:
+    """Resolve measured all-reduce call latency in us, count, stat, and note."""
+    if meas is None or not _is_calibrated_trace(meas) or eff_tp <= 1:
+        return None, 0, "median", _format_unapplied_collectives(meas)
+    matched = [
+        call
+        for call in meas.collective_calls
+        if call.op == COLLECTIVE_OP_ALL_REDUCE
+        and call.path == path
+        and call.group_size == eff_tp
+    ]
+    if not matched:
+        return None, 0, "median", _format_unapplied_collectives(meas)
+    values = [
+        call.mean_latency_us if call.mean_latency_us is not None else call.latency_us
+        for call in matched
+    ]
+    total_n = sum(call.n for call in matched)
+    combined_us = (
+        sum(val * call.n for val, call in zip(values, matched)) / total_n
+        if total_n > 0
+        else sum(values) / len(values)
+    )
+    stat_label = (
+        "mean"
+        if any(call.mean_latency_us is not None for call in matched)
+        else "median"
+    )
+    note = _format_unapplied_collectives(meas, exclude_path_group=(path, eff_tp))
+    return combined_us, total_n, stat_label, note
+
+
+def _resolve_collective_call_prior(
+    scope_context: _ScopeContext,
+    meas: MeasurementsData | None,
+    path: str,
+) -> ResolvedCollectiveCall:
+    """Return single-call all-reduce cost, band, tag, and source on `path`."""
+    eff_tp = scope_context.eff_tp
+    if eff_tp <= 1:
+        return ResolvedCollectiveCall(
+            measured_s=None,
+            value_us=0.0,
+            lo_us=0.0,
+            hi_us=0.0,
+            tag="DERIVED",
+            source="single-rank workload (no tensor-parallel all-reduce)",
+        )
+    measured_us, total_n, stat_label, note = _resolve_measured_all_reduce(
+        meas, eff_tp, path
+    )
+    if measured_us is not None and meas is not None:
+        rounded_us = round(measured_us, QUANTILE_DECIMALS)
+        return ResolvedCollectiveCall(
+            measured_s=measured_us * 1e-6,
+            value_us=rounded_us,
+            lo_us=rounded_us,
+            hi_us=rounded_us,
+            tag="MEASURED",
+            source=f"{meas.source_desc} ({stat_label}, n={total_n}){note}",
+        )
+    call_factor = PER_OP_COLLECTIVE_CALL_FACTOR if path == COLLECTIVE_PATH_XLA else 1
+    hbm_staging_s = (
+        (2.0 * scope_context.token_residual_bytes) / scope_context.bw_hbm
+        if path == COLLECTIVE_PATH_XLA
+        else 0.0
+    )
+    lo_s = (
+        scope_context.ar_transfer_time_s
+        + call_factor * scope_context.ar_base_lat_s
+        + hbm_staging_s
+    )
+    extra_hop_s = max(0.0, scope_context.lat_coll_upper - scope_context.lat_coll)
+    hi_s = lo_s + call_factor * scope_context.ar_intra_hops * extra_hop_s
+    lo_us = round(lo_s * 1e6, QUANTILE_DECIMALS)
+    hi_us = round(hi_s * 1e6, QUANTILE_DECIMALS)
+    return ResolvedCollectiveCall(
+        measured_s=None,
+        value_us=lo_us,
+        lo_us=lo_us,
+        hi_us=hi_us,
+        tag="ASSUMED",
+        source=f"modelled {path} all-reduce call prior at group_size={eff_tp}{note}",
+    )
 
 
 def _resolve_launch_gap_prior(
@@ -1890,34 +2097,27 @@ def _resolve_calibrated_priors(
     tuple[float, float, float, ProvenanceTag, str],
     tuple[float, float, float, ProvenanceTag, str],
     tuple[float, list[float], ProvenanceTag, str],
+    ResolvedCollectiveCall,
+    ResolvedCollectiveCall,
 ]:
     """Return calibrated or assumed priors for launch gap, collectives, and coverage."""
     lg_info = _resolve_launch_gap_prior(workload, meas)
 
-    if meas is not None and meas.collective_hop_us is not None:
-        c_val = round(meas.collective_hop_us, 3)
-        is_cal = _is_calibrated_trace(meas)
-        c_tag: ProvenanceTag = "MEASURED" if is_cal else "ASSUMED"
-        n_sfx = f" (n={meas.collective_n})" if is_cal else ""
-        coll_info = (
-            c_val,
-            c_val,
-            c_val,
-            c_tag,
-            f"{meas.source_desc}{n_sfx}",
-        )
-    else:
-        c_lo, c_hi = chip_spec.collective_latency_us_bracket
-        c_src = (chip_spec.sources or {}).get(
-            "collective_latency_us_bracket", "uncalibrated ICI hop latency bracket"
-        )
-        coll_info = (
-            round(chip_spec.collective_latency_s * 1e6, 3),
-            c_lo,
-            c_hi,
-            "ASSUMED",
-            c_src,
-        )
+    c_lo, c_hi = chip_spec.collective_latency_us_bracket
+    c_src = (chip_spec.sources or {}).get(
+        "collective_latency_us_bracket", "uncalibrated ICI hop latency bracket"
+    )
+    coll_info: tuple[float, float, float, ProvenanceTag, str] = (
+        round(chip_spec.collective_latency_s * 1e6, 3),
+        c_lo,
+        c_hi,
+        "ASSUMED",
+        c_src,
+    )
+    xla_coll = _resolve_collective_call_prior(scope_context, meas, COLLECTIVE_PATH_XLA)
+    in_kernel_coll = _resolve_collective_call_prior(
+        scope_context, meas, COLLECTIVE_PATH_IN_KERNEL
+    )
 
     if meas is not None and meas.step_coverage is not None:
         cov_val = round(meas.step_coverage, 4)
@@ -1945,4 +2145,4 @@ def _resolve_calibrated_priors(
             "ASSUMED",
             "single-phase step coverage prior (settle via --measurements)",
         )
-    return lg_info, coll_info, cov_info
+    return lg_info, coll_info, cov_info, xla_coll, in_kernel_coll
