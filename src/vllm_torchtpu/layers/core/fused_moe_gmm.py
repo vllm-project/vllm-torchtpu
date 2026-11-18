@@ -379,6 +379,51 @@ def _sortfree_onehot_routing(
     return pos, token_indices_sorted
 
 
+def sorted_route_weights(
+    argsort_revert_indices: jax.Array, topk_weights_flat: jax.Array
+) -> jax.Array:
+    """Each route's weight at its sorted slot, `w_sorted[revert[i]] = w[i]`.
+
+    `argsort_revert_indices` is a permutation, so sorting it yields
+    0..n-1 and carries each route's weight to the slot it names. One
+    key-value sort instead of a scatter, which on TPU costs several times as
+    much at decode route counts (3072 routes: ~25 us vs ~5 us).
+    """
+    _, weights = jax.lax.sort(
+        (argsort_revert_indices, topk_weights_flat), num_keys=1, is_stable=False
+    )
+    return weights
+
+
+def onehot_combine_from_sorted(
+    gmm2_res: jax.Array,
+    token_indices_sorted: jax.Array,
+    topk_weights_sorted: jax.Array,
+    valid_count: jax.Array,
+    *,
+    num_tokens: int,
+) -> jax.Array:
+    """`out[t] = sum_p combine[t, p] * gmm2_res[p]` for the one-hot combine.
+
+    Route `p` of the sorted order belongs to token `token_indices_sorted[p]`
+    and carries `topk_weights_sorted[p]`; the rows past `valid_count` are the
+    invalid routes (non-local experts, skipped padded tokens), which the sort
+    puts after every valid one. So `combine[t, p]` is that weight when the
+    token matches and `p < valid_count`, else 0 -- the same entries as the
+    one-hot over `[tokens, topk, routes]` summed over topk, with one entry per
+    route instead of `topk`. The matrix is laid out `[tokens, routes]` by an
+    iota compare, so the matmul contracts its minor axis with no transpose.
+    """
+    routes = jnp.arange(token_indices_sorted.shape[0], dtype=jnp.int32)
+    weights = jnp.where(routes < valid_count.reshape(()), topk_weights_sorted, 0)
+    tokens = jnp.arange(num_tokens, dtype=jnp.int32)
+    dtype = jnp.result_type(gmm2_res.dtype, topk_weights_sorted.dtype)
+    combine = jnp.where(
+        tokens[:, None] == token_indices_sorted[None, :], weights[None, :], 0
+    ).astype(dtype)
+    return combine @ gmm2_res
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -650,7 +695,9 @@ def moe_gmm(
             # `argsort_revert_indices` is the inverse of the sort, so scattering
             # through it is the gather by the (unmaterialised) forward one.
             topk_weights_sorted = (
-                jnp.zeros_like(topk_weights_flat)
+                sorted_route_weights(argsort_revert_indices, topk_weights_flat)
+                if envs.TPU_MOE_ONEHOT_COMBINE_SORTED
+                else jnp.zeros_like(topk_weights_flat)
                 .at[argsort_revert_indices]
                 .set(topk_weights_flat)
             )
@@ -686,6 +733,14 @@ def moe_gmm(
                 dtype=jnp.int32
             )
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            if envs.TPU_MOE_ONEHOT_COMBINE_SORTED:
+                return onehot_combine_from_sorted(
+                    gmm2_res,
+                    token_indices_sorted,
+                    topk_weights_sorted,
+                    valid_count,
+                    num_tokens=num_tokens,
+                ).astype(x.dtype)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(
                 revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype

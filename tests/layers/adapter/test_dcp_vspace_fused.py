@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_DCP_MERGE_VSPACE_FUSED: the chunked merge with its operand
+"""TPU_DCP_MERGE_VSPACE_FUSED: the chunked merge (and, with
+TPU_DCP_MERGE_VSPACE_FUSED_UNCHUNKED, the unsplit merge) with its operand
 built in V space equals the latent merge followed by W_UV."""
 
 import numpy as np
@@ -67,8 +68,10 @@ class _Group:
         return total[self.rank_in_group * LOCAL : (self.rank_in_group + 1) * LOCAL]
 
 
-@pytest.mark.parametrize("lse_ag", [False, True])
-def test_vspace_merge_is_the_latent_merge_then_w_uv(monkeypatch, lse_ag):
+@pytest.mark.parametrize(
+    "lse_ag,chunks", [(False, 2), (True, 2), (False, 1), (True, 1)]
+)
+def test_vspace_merge_is_the_latent_merge_then_w_uv(monkeypatch, lse_ag, chunks):
     rng = np.random.default_rng(7)
     outputs = torch.from_numpy(rng.standard_normal((D, T, H, C)).astype(np.float32))
     lses = torch.from_numpy((rng.standard_normal((D, T, H)) * 3).astype(np.float32))
@@ -77,7 +80,8 @@ def test_vspace_merge_is_the_latent_merge_then_w_uv(monkeypatch, lse_ag):
     for k, val in {
         "TPU_DCP_MERGE_VSPACE_FUSED": True,
         "TPU_DCP_LSE_MERGE_A2A": False,
-        "TPU_DCP_MERGE_CHUNKED": 2,
+        "TPU_DCP_MERGE_VSPACE_FUSED_UNCHUNKED": False,
+        "TPU_DCP_MERGE_CHUNKED": chunks,
         "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 0,
         "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
         "TPU_DCP_MERGE_CHUNKED_LSE_AG": lse_ag,
@@ -87,6 +91,12 @@ def test_vspace_merge_is_the_latent_merge_then_w_uv(monkeypatch, lse_ag):
         "TPU_DCP_RS_OUT_PRECISION": False,
     }.items():
         monkeypatch.setattr(cp_mla.envs, k, val, raising=False)
+    if chunks == 1:
+        monkeypatch.setattr(
+            cp_mla, "get_dcp_group", lambda: _Group(outputs, lses, w_uv, 0)
+        )
+        assert not cp_mla.vspace_fused_applies(T, True)
+        monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_VSPACE_FUSED_UNCHUNKED", True)
     merged = torch.logsumexp(lses.double(), dim=0)
     w = torch.exp(lses.double() - merged)  # [D, T, H]
     latent = torch.einsum("dth,dthc->thc", w.nan_to_num(0), outputs.double())
@@ -100,6 +110,7 @@ def test_vspace_merge_is_the_latent_merge_then_w_uv(monkeypatch, lse_ag):
             outputs[rank], lses[rank], w_uv, None
         )
         assert got.shape == (T, LOCAL, V)
+        assert group.done == T
         torch.testing.assert_close(
             got.double(),
             want[:, rank * LOCAL : (rank + 1) * LOCAL],
