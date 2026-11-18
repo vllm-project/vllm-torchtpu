@@ -355,7 +355,6 @@ def derive_params(
         tiles.bank // KV_ITEM
         if cache_exec(ex).paged_kv
         and not KVE
-        and not cache_exec(ex).FUSED
         and not LAZY_ATT
         and not tiles.rel_fetch
         and len(plan.branch_counts) == 1
