@@ -120,6 +120,25 @@
       },
       "prefill_windows": [
         2176
+      ],
+      "megakernel_layouts": [
+        {
+          "tp": 8,
+          "ep": 8,
+          "megakernel": {
+            "source": "Colocated decode megakernel on TP8 x EP8: one call serves up to 64 rows without splitting, and each expert runs on a masked batch",
+            "scopes": [
+              "whole_step"
+            ],
+            "ranks": 8,
+            "max_rows": 64,
+            "phases": [
+              "decode",
+              "verify"
+            ],
+            "moe_layout": "masked"
+          }
+        }
       ]
     }
   }
