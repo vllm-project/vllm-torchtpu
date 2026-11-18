@@ -418,6 +418,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PROPOSE_DEVICE_CONSTANTS: bool = False
     VLLM_TPU_DRAFT_SHARD_ARGMAX: bool = False
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
+    VLLM_TPU_MTP_DRAFT_DECODE_ROWS: bool = False
+    VLLM_TPU_MTP_DRAFT_PADDING_MASK: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
     VLLM_TPU_GDN_MIXED_TILE_POW2: bool = False
@@ -2601,6 +2603,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token, the rows that produce a draft. Off by default until validated on
     # TPU. Not used with IndexShare, context parallelism or EP-DP lockstep.
     "VLLM_TPU_MTP_DRAFT_ROWS": env_bool("VLLM_TPU_MTP_DRAFT_ROWS"),
+    # With VLLM_TPU_MTP_DRAFT_ROWS: draft step 0 of a step with at most
+    # 16 * ceil(T / (16 * (K + 1))) requests (T the token bucket; a pure K=3
+    # decode step has at most T / 4) runs a second compiled program that
+    # evaluates that many rows instead of the chunk's request capacity. Steps
+    # with more requests keep the capacity-row program.
+    "VLLM_TPU_MTP_DRAFT_DECODE_ROWS": env_bool("VLLM_TPU_MTP_DRAFT_DECODE_ROWS"),
+    # With TPU_MOE_SKIP_PADDED_TOKENS: the MTP draft's row-evaluated forwards
+    # (step 0 at draft rows, the fused loop) write the MoE padding mask for
+    # their own rows first. Otherwise they read the target step's mask, and a
+    # padded draft row below the target's valid count keeps router weight: a
+    # zero row ties to the lowest expert ids, all on EP rank 0.
+    "VLLM_TPU_MTP_DRAFT_PADDING_MASK": env_bool("VLLM_TPU_MTP_DRAFT_PADDING_MASK"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
