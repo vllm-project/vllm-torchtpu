@@ -205,8 +205,9 @@ def run_moe_v3(
 
     # The dense-slots layer (models/qwen3_5/kernels/dense_slots.py): off by
     # default; the Qwen3.5 layout table turns it on at DP4 x TP2 for calls of
-    # at most Config.dense_slots_max_tokens rows per shard, and larger calls
-    # keep the v3 layer.
+    # at most Config.dense_slots_max_tokens rows per shard, a multiple of 8
+    # (every sequence-parallel step the fused EP gate admits there), and
+    # other calls keep the v3 layer.
     dense_on, dense_max = config.dense_slots, config.dense_slots_max_tokens
     if dense_on:
         logger.info_once(
@@ -229,6 +230,7 @@ def run_moe_v3(
         if (
             dense_on
             and x.shape[0] // ep <= dense_max
+            and (x.shape[0] // ep) % 8 == 0
             and activation == "silu"
             and WEIGHT_FORMAT == "fp8"
         ):

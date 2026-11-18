@@ -20,15 +20,15 @@ result_rows with
 bf16 result rows) and its k-ordered weighted sum.
 
 Small shapes: hidden 1024 (whole 8-sublane staging tiles), intermediate 128, 16, 32 or
-64 experts, top-k 4; shards of a multiple of 8 rows (the program takes them unpadded)
-and of 20 rows (padded outside it); worlds where experts go unrouted (their weight
+64 experts, top-k 4; shards of a multiple of 8 rows (the program takes them unpadded),
+some with rows past their valid count; worlds where experts go unrouted (their weight
 streams skipped).
 
 The checks need 8 CPU devices, and the host device count (XLA_FLAGS) must be set before
 JAX starts, so the tests run this file as a script in a subprocess, once per session,
 for the cases pytest selected, and each test reports its case. Regular CI runs the
-mutant check and two reference cases (unpadded rows on a world with cold experts, and
-padded rows); the rest of the grid is marked nightly.
+mutant check and two reference cases (a world with cold experts, and shards with rows
+past their valid count); the rest of the grid is marked nightly.
 """
 
 import json
@@ -211,13 +211,11 @@ WORLDS = [
     (64, 24, "cold", 0),
     (64, 32, "cold", 5),
     (64, 24, True, 0),
-    (16, 20, False, 0),
-    (64, 20, "cold", 3),
 ]
 # Regular CI: the mutant check (the comparison bites) and two reference cases,
-# unpadded rows where experts go unrouted and padded rows. Every other case runs
-# nightly.
-REGULAR_WORLDS = [(64, 24, "cold", 0), (16, 20, False, 0)]
+# a world where experts go unrouted and shards with rows past their valid count.
+# Every other case runs nightly.
+REGULAR_WORLDS = [(64, 24, "cold", 0), (32, 32, False, 5)]
 
 
 def _case_id(name, *params):
