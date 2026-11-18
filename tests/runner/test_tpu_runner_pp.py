@@ -347,12 +347,13 @@ class TestBufferedStepPosting:
             raise _Stop
 
         runner = SimpleNamespace(
+            decode_owner=None,
             execute_model_state=None,
             _update_states=lambda _so: None,
             scheduler_config=SimpleNamespace(async_scheduling=False),
             _mtp_prefill_only=False,
             _reorder_batch_for_rpa=lambda _so: (0, 0),
-            _count_input_chunks=lambda _so: (2, 1),
+            _count_input_chunks=lambda _so, _start=0: (2, 1),
             _any_decode=lambda _so: False,
             _dp_local_prompt_logprob_rows=lambda _so: 0,
             _dp_coordinated_step=lambda *_a, **_kw: (None, 2),

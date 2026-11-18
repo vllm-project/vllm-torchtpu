@@ -77,6 +77,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _dp_step_other_decode=False,
         num_prompt_logprobs={},
         _thinking_budget=None,
+        decode_owner=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -88,6 +89,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
             pooler_output_list=[],
             top_tokens=False,
             kv_save_nan_check=None,
+            owned_front=0,
             prompt_logprobs_chunks=[],
         ),
         input_batch=SimpleNamespace(

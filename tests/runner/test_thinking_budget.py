@@ -201,6 +201,7 @@ def _set_exec_state(
         pooler_output_list=[],
         top_tokens=top_tokens,
         kv_save_nan_check=None,
+        owned_front=0,
         prompt_logprobs_chunks=[],
     )
 
