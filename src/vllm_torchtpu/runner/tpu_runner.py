@@ -3486,7 +3486,7 @@ class TPUModelRunner(GPUModelRunner):
         """
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             assemble_spec_next_tokens,
-            compute_num_rejected,
+            spec_substitution,
         )
 
         assert drafts is not None, (
@@ -3515,19 +3515,24 @@ class TPUModelRunner(GPUModelRunner):
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
             drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
-            src = assemble_spec_next_tokens(
-                nt_chunk, drafts_chunk, None if bucketed else num_reqs
-            )
             scheduled = self._scheduled_draft_counts(
                 req_offset, num_reqs, chunk_padded_num_reqs, md
             )
             if md is not None:
                 if scheduled is None:
                     scheduled = fit_rows(md.draft_lengths, chunk_padded_num_reqs)
-                num_rejected_chunks.append(compute_num_rejected(nt_chunk, scheduled))
+                src, num_rejected = spec_substitution(
+                    nt_chunk if bucketed else nt_chunk[:num_reqs],
+                    drafts_chunk,
+                    scheduled,
+                )
+                num_rejected_chunks.append(num_rejected)
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
             else:
+                src = assemble_spec_next_tokens(
+                    nt_chunk, drafts_chunk, None if bucketed else num_reqs
+                )
                 # No drafts were verified this step, so there is no
                 # speculative output-placeholder rollback; drafts trimmed by
                 # adaptive verification still roll back as rejected.

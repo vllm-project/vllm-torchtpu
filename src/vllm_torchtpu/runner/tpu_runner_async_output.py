@@ -309,15 +309,29 @@ def subtract_num_rejected_tokens(
     return seq_lens, positions
 
 
+def _extract_draft_token_ids_impl(
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> torch.Tensor:
+    return input_ids[logits_indices[target_logits_indices + 1]]
+
+
 def extract_draft_token_ids(
     input_ids: torch.Tensor,
     logits_indices: torch.Tensor,
     target_logits_indices: torch.Tensor,
 ) -> torch.Tensor:
     """Gather the draft tokens the target just verified, from the (post-async-
-    substitution) device ``input_ids``.
+    substitution) device ``input_ids``. One program on TPU: each eager op of a
+    verify step's glue costs 15-30 us of host time ahead of the next launch.
     """
-    return input_ids[logits_indices[target_logits_indices + 1]]
+    fn = (
+        _extract_draft_token_ids_compiled
+        if input_ids.device.type == "tpu"
+        else _extract_draft_token_ids_impl
+    )
+    return fn(input_ids, logits_indices, target_logits_indices)
 
 
 def compute_num_rejected(
@@ -333,3 +347,30 @@ def compute_num_rejected(
     num_reqs = num_draft.shape[0]
     num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
     return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+
+
+def _spec_substitution_impl(
+    next_tokens: torch.Tensor, drafts: torch.Tensor, num_draft: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        assemble_spec_next_tokens(next_tokens, drafts),
+        compute_num_rejected(next_tokens, num_draft),
+    )
+
+
+def spec_substitution(
+    next_tokens: torch.Tensor, drafts: torch.Tensor, num_draft: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A verify chunk's `assemble_spec_next_tokens` source (bucketed rows) and
+    `compute_num_rejected` counts, in one program on TPU."""
+    fn = (
+        _spec_substitution_compiled
+        if next_tokens.device.type == "tpu"
+        else _spec_substitution_impl
+    )
+    return fn(next_tokens, drafts, num_draft)
+
+
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_extract_draft_token_ids_compiled = _tpu_compile(_extract_draft_token_ids_impl)
+_spec_substitution_compiled = _tpu_compile(_spec_substitution_impl)
