@@ -254,6 +254,103 @@ class NativeScGatherTest(absltest.TestCase):
                     np.asarray(rope)[group_live], expected_rope[group_live]
                 )
 
+    def test_should_match_wide_atom_gather_for_linear_and_packed_modes(self):
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+        pages, page_size = 32, 256
+        rng = np.random.default_rng(20261118)
+        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(0, 0x7E, (pages, page_size // 4, 4, 128), np.uint8)
+        rope_u8[..., 64:] = 0
+        nope_i32 = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        rope_padded = jnp.asarray(native_sc_cache_layout.pack_rope_banded(rope_u8))
+        flat_rope_u8 = rope_u8.reshape(-1, 128)
+        rope_packed = jnp.asarray(
+            native_sc_cache_layout.pack_rope_packed(
+                flat_rope_u8[:, :64].reshape(pages, page_size, 64)
+            )
+        )
+        flat_nope = native_sc_cache_layout.flatten_nope_rows(
+            native_sc_cache_layout.pack_nope(nope_u8)
+        )
+
+        cases = [
+            (64, 2048, 16, True, True, None),
+            (64, 2048, 16, True, False, None),
+            (64, 2048, 16, False, True, 48 * 2048),
+            (16, 512, 2, True, True, 12 * 512),
+        ]
+        for rows, topk, apb, packed, linear, num_live in cases:
+            with self.subTest(
+                rows=rows,
+                topk=topk,
+                apb=apb,
+                packed=packed,
+                linear=linear,
+                num_live=num_live,
+            ):
+                count = rows * topk
+                flat_indices = rng.integers(0, pages * page_size, count, np.int32)
+                idx = jnp.asarray(flat_indices.reshape(rows, topk))
+                kwargs = {}
+                if num_live is not None:
+                    kwargs["num_live_indices"] = jnp.int32(num_live)
+                got_nope, got_rope = jax.block_until_ready(
+                    native_sc_gather.dsa_gather_native_sc(
+                        nope_i32,
+                        rope_packed if packed else rope_padded,
+                        idx,
+                        out_size=count,
+                        atoms_per_batch=apb,
+                        packed_rope=packed,
+                        linear_indices=linear,
+                        **kwargs,
+                    )
+                )
+                live_n = count if num_live is None else num_live
+                np.testing.assert_array_equal(
+                    np.asarray(got_nope)[:live_n], flat_nope[flat_indices[:live_n]]
+                )
+                expected_rope = native_sc_cache_layout.pack_selected_rope_for_tc(
+                    flat_rope_u8[flat_indices]
+                )
+                groups = live_n // native_sc_gather.ROPE_PACKING
+                np.testing.assert_array_equal(
+                    np.asarray(got_rope)[:groups], expected_rope[:groups]
+                )
+
+    def test_should_select_wide_atom_factor_only_for_pipelined_overlap_batches(self):
+        self.assertEqual(
+            native_sc_gather._wide_atom_factor(  # noqa: SLF001 -- geometry helper
+                16,
+                wait_mode="overlap_rope",
+                serve_pipelined=True,
+                is_dcp_mode=False,
+                has_row_live_atoms=False,
+            ),
+            4,
+        )
+        self.assertEqual(
+            native_sc_gather._wide_atom_factor(  # noqa: SLF001 -- geometry helper
+                2,
+                wait_mode="overlap_rope",
+                serve_pipelined=True,
+                is_dcp_mode=False,
+                has_row_live_atoms=False,
+            ),
+            2,
+        )
+        self.assertEqual(
+            native_sc_gather._wide_atom_factor(  # noqa: SLF001 -- geometry helper
+                16,
+                wait_mode="overlap_rope",
+                serve_pipelined=True,
+                is_dcp_mode=True,
+                has_row_live_atoms=False,
+            ),
+            1,
+        )
+
 
 if __name__ == "__main__":
     absltest.main()

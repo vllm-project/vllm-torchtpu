@@ -109,6 +109,31 @@ def transpose_quad(data: list[Any]) -> list[Any]:
     return data
 
 
+def _wide_atom_factor(
+    atoms_per_batch: int,
+    *,
+    wait_mode: str,
+    serve_pipelined: bool,
+    is_dcp_mode: bool,
+    has_row_live_atoms: bool,
+) -> int:
+    # Avoid narrow 64-row indirect gathers on multi-atom batches: grouping up
+    # to 4 base atoms (256 rows) per pipeline step increases HBM gather
+    # concurrency without changing logical-batch or live_vec geometry.
+    if (
+        not serve_pipelined
+        or wait_mode != "overlap_rope"
+        or is_dcp_mode
+        or has_row_live_atoms
+    ):
+        return 1
+    if atoms_per_batch % 4 == 0:
+        return 4
+    if atoms_per_batch % 2 == 0:
+        return 2
+    return 1
+
+
 def _kernel(
     nope_hbm_ref: Any,
     rope_hbm_ref: Any,
@@ -118,6 +143,12 @@ def _kernel(
     sem_ref: Any,
     live_vmem_ref: Any = None,
     live_sem_ref: Any = None,
+    wide_nope_vm: Any = None,
+    wide_rope_vm: Any = None,
+    wide_rope_out_vm: Any = None,
+    wide_in_nope_sem: Any = None,
+    wide_in_rope_sem: Any = None,
+    wide_out_sem: Any = None,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
@@ -138,6 +169,7 @@ def _kernel(
     write_tokens: int = 0,
     write_fault: str | None = None,
     rope_words: int = ROPE_WORDS,
+    wide_factor: int = 1,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     late_drain = None
@@ -268,7 +300,112 @@ def _kernel(
             lambda atom: (logical_batch * atoms_per_batch + atom_of(atom), 0),
         )
 
+        def run_inner_wide():
+            super_atoms = atoms_per_batch // wide_factor
+            occ_per_step = wide_factor * OCCURRENCES_PER_ATOM
+            subchunks = occ_per_step // NUM_LANES
+            quads_per_step = occ_per_step // ROPE_PACKING
+            rope_row_base = logical_batch * atoms_per_batch * QUADS_PER_ATOM
+
+            def idx_lanes(step, sub):
+                if linear_indices:
+                    return indices_ref[
+                        pl.ds(step * occ_per_step + sub * NUM_LANES, NUM_LANES)
+                    ]
+                return indices_ref[0, step, sub, :]
+
+            # Avoid pl.Indirect(>16) offsets: older libtpu requires SparseCore
+            # indirect DMA offsets to match the 16-lane hardware vector width.
+            def start_fetch(step, slot):
+                for sub in range(subchunks):
+                    idx_v = idx_lanes(step, sub)
+                    pltpu.make_async_copy(
+                        nope_hbm_ref.at[idx_v, :],
+                        wide_nope_vm.at[slot, pl.ds(sub * NUM_LANES, NUM_LANES), :],
+                        wide_in_nope_sem.at[slot],
+                    ).start()
+                    pltpu.make_async_copy(
+                        rope_hbm_ref.at[idx_v, :],
+                        wide_rope_vm.at[slot, pl.ds(sub * NUM_LANES, NUM_LANES), :],
+                        wide_in_rope_sem.at[slot],
+                    ).start()
+
+            def wait_fetch(step, slot):
+                for sub in range(subchunks):
+                    idx_v = idx_lanes(step, sub)
+                    pltpu.make_async_copy(
+                        nope_hbm_ref.at[idx_v, :],
+                        wide_nope_vm.at[slot, pl.ds(sub * NUM_LANES, NUM_LANES), :],
+                        wide_in_nope_sem.at[slot],
+                    ).wait()
+                    pltpu.make_async_copy(
+                        rope_hbm_ref.at[idx_v, :],
+                        wide_rope_vm.at[slot, pl.ds(sub * NUM_LANES, NUM_LANES), :],
+                        wide_in_rope_sem.at[slot],
+                    ).wait()
+
+            zeros_band = jnp.zeros((1, rope_words), jnp.uint32)
+            start_fetch(jnp.int32(0), jnp.int32(0))
+
+            def run_step(step, carry):
+                slot = lax.rem(step, jnp.int32(2))
+                nxt = step + jnp.int32(1)
+                nslot = jnp.int32(1) - slot
+
+                wait_fetch(step, slot)
+
+                @pl.when(nxt < jnp.int32(super_atoms))
+                def _prefetch_next():
+                    start_fetch(nxt, nslot)
+
+                nope_cp = pltpu.make_async_copy(
+                    wide_nope_vm.at[slot],
+                    nope_out_hbm_ref.at[
+                        pl.ds(occurrence_base + step * occ_per_step, occ_per_step), :
+                    ],
+                    wide_out_sem.at[0],
+                )
+                nope_cp.start()
+
+                def transpose_row(q_idx, _c):
+                    base_t = q_idx * ROPE_PACKING
+                    data = [
+                        wide_rope_vm[slot, pl.ds(base_t + t, 1), pl.ds(0, rope_words)]
+                        for t in range(ROPE_PACKING)
+                    ]
+                    data = transpose_quad(data)
+                    for band in range(ROPE_PACKING):
+                        wide_rope_out_vm[
+                            0, pl.ds(q_idx, 1), pl.ds(band * rope_words, rope_words)
+                        ] = data[band]
+                    for band in range(ROPE_PACKING, 128 // rope_words):
+                        wide_rope_out_vm[
+                            0, pl.ds(q_idx, 1), pl.ds(band * rope_words, rope_words)
+                        ] = zeros_band
+                    return _c
+
+                # Avoid unrolling 64 quads in Python: lax.fori_loop keeps
+                # compile time ~0.2s and eliminates code-size bloat on SC.
+                lax.fori_loop(0, quads_per_step, transpose_row, jnp.int32(0))
+
+                rope_cp = pltpu.make_async_copy(
+                    wide_rope_out_vm.at[0],
+                    rope_out_hbm_ref.at[
+                        pl.ds(rope_row_base + step * quads_per_step, quads_per_step), :
+                    ],
+                    wide_out_sem.at[1],
+                )
+                rope_cp.start()
+                nope_cp.wait()
+                rope_cp.wait()
+                return carry
+
+            lax.fori_loop(0, super_atoms, run_step, jnp.int32(0))
+
         def run_inner():
+            if wide_factor > 1:
+                run_inner_wide()
+                return
             pltpu.emit_pipeline(
                 body,
                 grid=(num_atoms,),
@@ -301,6 +438,16 @@ def _kernel(
         indices_spec = pl.BlockSpec(
             (atoms_per_batch * OCCURRENCES_PER_ATOM,),
             lambda batch: (owner + batch * num_owners,),
+        )
+    elif wide_factor > 1:
+        indices_spec = pl.BlockSpec(
+            (
+                1,
+                atoms_per_batch // wide_factor,
+                wide_factor * ROPE_PACKING,
+                NUM_LANES,
+            ),
+            lambda batch: (owner + batch * num_owners, 0, 0, 0),
         )
     else:
         indices_spec = pl.BlockSpec(
@@ -697,14 +844,43 @@ def dsa_gather_native_sc(
         # `scatter_utils.scatter_rows` does); frozen back after the call.
         nope_rows_view = jax.new_ref(nope_rows_view)
         rope_rows_view = jax.new_ref(rope_rows_view)
+    wide_factor = _wide_atom_factor(
+        atoms_per_batch,
+        wait_mode=wait_mode,
+        serve_pipelined=serve_pipelined,
+        is_dcp_mode=is_dcp_mode,
+        has_row_live_atoms=row_live_atoms is not None,
+    )
+    if wide_factor > 1:
+        occ_per_step = wide_factor * OCCURRENCES_PER_ATOM
+        quads_per_step = occ_per_step // ROPE_PACKING
+        scratch_types["wide_nope_vm"] = pltpu.VMEM((2, occ_per_step, 128), jnp.uint32)
+        scratch_types["wide_rope_vm"] = pltpu.VMEM(
+            (2, occ_per_step, rope_words), jnp.uint32
+        )
+        scratch_types["wide_rope_out_vm"] = pltpu.VMEM(
+            (1, quads_per_step, 128), jnp.uint32
+        )
+        scratch_types["wide_in_nope_sem"] = pltpu.SemaphoreType.DMA((2,))
+        scratch_types["wide_in_rope_sem"] = pltpu.SemaphoreType.DMA((2,))
+        scratch_types["wide_out_sem"] = pltpu.SemaphoreType.DMA((2,))
+    if linear_indices:
+        indices_operand = indices.reshape(-1)
+    elif wide_factor > 1:
+        indices_operand = indices.reshape(
+            num_batches,
+            atoms_per_batch // wide_factor,
+            wide_factor * ROPE_PACKING,
+            NUM_LANES,
+        )
+    else:
+        indices_operand = indices.reshape(
+            num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES
+        )
     operands = [
         nope_rows_view,
         rope_rows_view,
-        (
-            indices.reshape(-1)
-            if linear_indices
-            else indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES)
-        ),
+        indices_operand,
     ]
     guard_tail = False
     if live_vec_offset is not None:
@@ -827,6 +1003,7 @@ def dsa_gather_native_sc(
         write_fault=write_fault,
         **row_kwargs,
         rope_words=rope_words,
+        wide_factor=wide_factor,
     )
 
     def body(*refs, write_dst_vmem=None, write_dst_sem=None, write_sem=None, **scr):
@@ -865,6 +1042,7 @@ def dsa_gather_native_sc(
             f"{'_rowlive' if row_kwargs else ''}"
             f"{'_kvw' if kv_write is not None else ''}"
             f"{'_packedrope' if packed_rope else ''}"
+            f"{f'_w{wide_factor}' if wide_factor > 1 else ''}"
         ),
     )(*operands)
     if kv_write is None:

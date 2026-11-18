@@ -5036,6 +5036,8 @@ def sparse_attention_chunk(
                     atoms_per_batch=(dcp_gather_atoms if is_dcp_mode else gather_atoms),
                     wait_mode=sparsecore_gather_wait_mode,
                     serve_pipelined=sparsecore_gather_pipelined,
+                    # Avoid 4-D index relayout copies on every prefill chunk.
+                    linear_indices=not is_dcp_mode,
                     **({"is_dcp_mode": True} if is_dcp_mode else {}),
                     packed_rope=packed_rope,
                     **live_kwargs,
