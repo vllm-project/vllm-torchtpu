@@ -119,7 +119,123 @@ def write_kv(
         _quantize(value, kv_cache.dtype, v_scale),
         kv_cache.shape[2:],
     )
-    return kv_cache.at[page, pos % page_size].set(rows, mode="drop")
+    slots = pos % page_size
+    # Off TPU (CPU tests) the scatter is the reference the run kernel matches.
+    if num_tokens < _RUN_WRITE_MIN_TOKENS or jax.default_backend() != "tpu":
+        return kv_cache.at[page, slots].set(rows, mode="drop")
+    # A rank owns whole pages, so a request's q tokens break into at most
+    # (q - 1) // page_size + 2 runs, the bound `max_write_runs` sums.
+    return write_runs(
+        kv_cache,
+        rows,
+        page,
+        slots,
+        max_runs=max_write_runs(num_tokens, max_seqs, page_size),
+    )
+
+
+# Below this many tokens an XLA scatter of the rows costs no more than the
+# run kernel's grid; the scatter's cost grows about linearly with the tokens.
+_RUN_WRITE_MIN_TOKENS = 1024
+
+
+def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
+    """Token runs: maximal spans of consecutive tokens writing one page.
+
+    Returns ``num_runs`` and ``[max_runs + 1]`` arrays of each run's page,
+    first slot, end slot and first token. Entries from ``num_runs`` on
+    repeat the last run, so that the pipeline's look-ahead past the last grid
+    step (entry ``num_runs``, at most ``max_runs``) neither reads out of
+    bounds nor fetches a new block."""
+    num_tokens = pages.shape[0]
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    valid = (pages >= 0) & (pages < num_pages)
+    prev_page = jnp.concatenate([jnp.full((1,), -1, pages.dtype), pages[:-1]])
+    prev_slot = jnp.concatenate([jnp.full((1,), -2, slots.dtype), slots[:-1]])
+    start = valid & ((pages != prev_page) | (slots != prev_slot + 1))
+    run_id = jnp.cumsum(start.astype(jnp.int32)) - 1
+    num_runs = jnp.minimum(jnp.sum(start.astype(jnp.int32)), max_runs)
+    size = max_runs + 1
+    at_start = jnp.where(start & (run_id < max_runs), run_id, size)
+    run_page = jnp.zeros(size, jnp.int32).at[at_start].set(pages, mode="drop")
+    run_lo = jnp.zeros(size, jnp.int32).at[at_start].set(slots, mode="drop")
+    run_tok0 = jnp.zeros(size, jnp.int32).at[at_start].set(tok, mode="drop")
+    count = (
+        jnp.zeros(size, jnp.int32)
+        .at[jnp.where(valid & (run_id < max_runs), run_id, size)]
+        .add(1, mode="drop")
+    )
+    run_hi = run_lo + count
+    last = jnp.maximum(num_runs - 1, 0)
+    padding = jnp.arange(size) >= num_runs
+    return (
+        num_runs,
+        *(jnp.where(padding, a[last], a) for a in (run_page, run_lo, run_hi, run_tok0)),
+    )
+
+
+def max_write_runs(num_tokens: int, max_num_seqs: int, page_size: int) -> int:
+    """Runs of a batch: a request's q tokens span at most
+    ``(q - 1) // page_size + 2`` pages, so the batch at most
+    ``num_tokens // page_size + 2 * max_num_seqs`` runs."""
+    return max(1, min(num_tokens, num_tokens // page_size + 2 * max_num_seqs))
+
+
+def write_runs(
+    kv_cache: jax.Array,
+    rows: jax.Array,
+    pages: jax.Array,
+    slots: jax.Array,
+    *,
+    max_runs: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """``kv_cache.at[pages, slots].set(rows, mode="drop")`` by DMA: one grid
+    step per token run (consecutive tokens taking consecutive slots of one
+    page), copying the run's rows from HBM in power-of-two pieces."""
+    num_pages, page_size = kv_cache.shape[:2]
+    pieces = [1 << b for b in reversed(range(page_size.bit_length()))]
+    num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
+        pages.astype(jnp.int32), slots.astype(jnp.int32), num_pages, max_runs
+    )
+
+    def kernel(
+        n_ref, page_ref, lo_ref, hi_ref, tok0_ref, rows_hbm, cache_in, cache_out, sem
+    ):
+        del cache_in
+        r = pl.program_id(0)
+        count = hi_ref[r] - lo_ref[r]
+        copies = []
+        for i, size in enumerate(pieces):
+            off = count & ~(2 * size - 1)  # after the larger pieces
+            copy = pltpu.make_async_copy(
+                rows_hbm.at[pl.ds(tok0_ref[r] + off, size)],
+                cache_out.at[page_ref[r], pl.ds(lo_ref[r] + off, size)],
+                sem.at[i],
+            )
+            todo = (r < n_ref[0]) & ((count & size) != 0)
+            pl.when(todo)(copy.start)
+            copies.append((todo, copy))
+        for todo, copy in copies:
+            pl.when(todo)(copy.wait)
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            grid=(max_runs,),
+            in_specs=[hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=[pltpu.SemaphoreType.DMA((len(pieces),))],
+        ),
+        out_shape=jax.ShapeDtypeStruct(kv_cache.shape, kv_cache.dtype),
+        # Operand 6 = the cache (after 5 scalar-prefetch operands and the rows).
+        input_output_aliases={6: 0},
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        interpret=interpret,
+        name="dcp_draft_write_runs",
+    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, rows, kv_cache)
 
 
 def gather_pages(
