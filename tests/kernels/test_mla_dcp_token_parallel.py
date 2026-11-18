@@ -440,3 +440,49 @@ def test_layout_rejects_unservable_buckets():
         tp.TokenParallelLayout(16, 4, 32, split_rows=16, max_pages=4)
     with pytest.raises(ValueError):
         tp.TokenParallelLayout(4, 4, 32, split_rows=16, max_pages=8, gather_caps=(4,))
+
+
+def test_should_bound_natural_page_table_to_gather_cap_when_cap_below_max_pages():
+    dcp = 4
+    mesh = _mesh(dcp)
+    lay = tp.TokenParallelLayout(
+        dcp, 4, 32, split_rows=16, max_pages=8, gather_caps=(2, 4, 8)
+    )
+    st = Step(lay, 256, [Req(50, 150)], max_reqs=4, seed=11)
+    seq_lens, qsl = jnp.asarray(st.seq_lens), jnp.asarray(st.qsl)
+    _, offsets = tp.step_pages(lay, seq_lens, qsl, st.num_seqs)
+    rr = tp.rank_rows(lay, jnp.int32(0), 256, seq_lens, qsl, st.num_seqs)
+
+    capped_tbl = np.asarray(
+        tp.natural_page_table(lay, rr, offsets, vpages_per_seq=8, cap=2)
+    )
+    uncapped_tbl = np.asarray(tp.natural_page_table(lay, rr, offsets, vpages_per_seq=8))
+    assert capped_tbl.shape == (4 * 2 * dcp,)
+    assert uncapped_tbl.shape == (4 * 8 * dcp,)
+    assert int(capped_tbl.max()) <= 2 * dcp - 1
+
+    vpages_per_seq = st.block_tables.shape[1]
+    seen_table_widths: list[int] = []
+    ref_select = _select_topk_ref(lay)
+
+    def strict_select(q, weights, natural, rr_arg, table):
+        num_reqs = rr_arg.seq_lens.shape[0]
+        cap = natural.shape[0] // dcp
+        seen_table_widths.append(table.shape[0] // num_reqs)
+        assert table.shape == (num_reqs * min(vpages_per_seq, cap) * dcp,)
+        in_bounds = (table >= 0) & (table < natural.shape[0])
+        out = ref_select(q, weights, natural, rr_arg, table)
+        return jnp.where(jnp.all(in_bounds), out, jnp.full_like(out, -999))
+
+    rng = np.random.default_rng(13)
+    q = rng.standard_normal((256, 1, IDX_ROWS * IDX_SUB)).astype(np.float32)
+    weights = np.ones((256, 1), np.float32)
+    flat = np.asarray(
+        jax.jit(
+            lambda *a: tp.indexer_topk(
+                lay, mesh, AXIS, *a, select_topk=strict_select, q_own_rows=False
+            )
+        )(jnp.asarray(st.idx_cache), jnp.asarray(q), jnp.asarray(weights), *st.args())
+    )
+    assert seen_table_widths == [min(vpages_per_seq, c) * dcp for c in lay.gather_caps]
+    assert (flat != -999).all()

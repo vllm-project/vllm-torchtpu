@@ -44,21 +44,21 @@ import torch
 from jax import lax
 from jax.sharding import PartitionSpec as P
 from vllm.compilation import backends as vllm_compilation_backends
-from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
-    pcp_streaming_jax_op,
-)
-from vllm_torchtpu.utils import get_shared_jax_op
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
     streamindex_topk,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
+    pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import dcp_token_parallel, page_gather
 from vllm_torchtpu.kernels.mla.kv_cache_utils import update_sparse_mla_kv_cache_dcp
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.utils import get_shared_jax_op
 
 # Smallest bucket that takes the split (a power of two: `bucket_gate_edge`).
 MIN_TOKENS = 1024
@@ -262,6 +262,42 @@ def make_attend(
     return attend
 
 
+_TP_STREAMIDX_MIN_BKVP = 8
+_TP_STREAMIDX_WIDE_KV_TOKENS = 65536
+_TP_STREAMIDX_WIDE_CHUNK_TOKENS = 128
+
+
+def _token_parallel_streamidx_knobs(
+    num_rows: int,
+    natural_shape: tuple[int, ...],
+    kv_layout: KVLayout,
+    mixed_bkvp: int | None,
+    chunk_tokens: int | None,
+) -> tuple[int | None, int | None]:
+    num_pages = natural_shape[0]
+    page_tokens = (
+        natural_shape[-1]
+        if kv_layout == KVLayout.SEQ_ALONG_LANE
+        else natural_shape[1] * natural_shape[2]
+    )
+    tp_mixed_bkvp = (
+        max(mixed_bkvp, _TP_STREAMIDX_MIN_BKVP)
+        if mixed_bkvp is not None and num_pages >= _TP_STREAMIDX_MIN_BKVP
+        else mixed_bkvp
+    )
+    tp_chunk_tokens = (
+        _TP_STREAMIDX_WIDE_CHUNK_TOKENS
+        if (
+            chunk_tokens == 256
+            and num_pages * page_tokens > _TP_STREAMIDX_WIDE_KV_TOKENS
+            and num_rows >= 256
+            and num_rows % _TP_STREAMIDX_WIDE_CHUNK_TOKENS == 0
+        )
+        else chunk_tokens
+    )
+    return tp_mixed_bkvp, tp_chunk_tokens
+
+
 def make_select_topk(
     topk: int,
     kv_layout: KVLayout,
@@ -280,10 +316,15 @@ def make_select_topk(
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 
     def select(q_r, w_r, natural, rr, table):
+        tp_mixed_bkvp, tp_chunk_tokens = _token_parallel_streamidx_knobs(
+            q_r.shape[0], natural.shape, kv_layout, mixed_bkvp, chunk_tokens
+        )
         bkvp, bq = mla_op._streamidx_block_sizes(
-            q_r.shape[0], *small_bucket, mixed_bkvp, decode_pack
+            q_r.shape[0], *small_bucket, tp_mixed_bkvp, decode_pack
         )
         zero = jnp.int32(0)
+        # Avoid decode_as_mixed=False on [0, 0, rr.num_seqs]: builds two dead
+        # decode schedules and compiles an unreachable distribution[1] > 0 cond.
         return streamindex_topk(
             q_r,
             w_r,
@@ -300,9 +341,10 @@ def make_select_topk(
             skip_empty_decode_chunked=skip_empty_decode_chunked,
             enable_early_exit=mla_op.STREAMIDX_ENABLE_EARLY_EXIT,
             kv_layout=kv_layout,
-            chunk_tokens=chunk_tokens,
+            chunk_tokens=tp_chunk_tokens,
             decode_pack=decode_pack,
             shared_meta=shared_meta,
+            decode_as_mixed=True,
         )
 
     return select
@@ -1261,7 +1303,6 @@ def build_indexer_op(
     [T / dcp, topk]` this rank's rows as flat gather-buffer rows. Writes every
     row's K into the cache first, as the DCP op does."""
     from vllm_torchtpu.distributed.dcp import dcp_lane_operand
-
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk_dcp
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 

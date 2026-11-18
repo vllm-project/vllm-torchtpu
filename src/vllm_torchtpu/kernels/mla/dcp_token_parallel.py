@@ -62,7 +62,6 @@ from jax import lax
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-
 FP8_MAX = 448.0
 
 
@@ -260,16 +259,25 @@ def row_requests(rr: RankRows, num_rows: int) -> jax.Array:
 
 
 def natural_page_table(
-    layout: TokenParallelLayout, rr: RankRows, offsets: jax.Array, vpages_per_seq: int
+    layout: TokenParallelLayout,
+    rr: RankRows,
+    offsets: jax.Array,
+    vpages_per_seq: int,
+    cap: int | None = None,
 ) -> jax.Array:
-    """i32[R * vpages_per_seq * dcp]: each local request's pages of the
-    natural-order index-K buffer (`gather_index_k`)."""
+    """Build `i32[R * min(vpages_per_seq, cap) * dcp]` natural-order page indices.
+
+    Clamps padding entries to `cap * dcp - 1` when `cap` is set so every page
+    index stays in bounds of a `cap * dcp`-page gathered buffer.
+    """
+    bound_pages = layout.max_pages if cap is None else cap
+    eff_vpages_per_seq = min(vpages_per_seq, bound_pages)
     num_reqs = rr.seq_lens.shape[0]
     k = jnp.arange(num_reqs, dtype=jnp.int32)
     req = jnp.minimum(rr.first_req + k, num_reqs - 1)
-    width = vpages_per_seq * layout.dcp_size
+    width = eff_vpages_per_seq * layout.dcp_size
     pages = offsets[req][:, None] * layout.dcp_size + jnp.arange(width)[None, :]
-    pages = jnp.minimum(pages, layout.max_pages * layout.dcp_size - 1)
+    pages = jnp.minimum(pages, bound_pages * layout.dcp_size - 1)
     return pages.reshape(-1).astype(jnp.int32)
 
 
@@ -840,7 +848,6 @@ def indexer_topk(
             else (own_rows(layout, q, rank), own_rows(layout, weights, rank))
         )
         vpages_per_seq = bt.shape[0] // seq_lens.shape[0]
-        table = natural_page_table(layout, rr, offsets, vpages_per_seq)
         il, ps = layout.interleave_size, layout.page_size
 
         def branch(cap: int) -> Callable[[], jax.Array]:
@@ -857,6 +864,10 @@ def indexer_topk(
                     .swapaxes(3, 4)
                     .reshape(cap * dcp, *cache.shape[1:])
                 )
+                # Avoid hoisting natural_page_table above branch(cap): full
+                # vpages_per_seq width inflates score buffers to max_pages * dcp
+                # and forces multi-partition top-k barriers on <=64K-token caps.
+                table = natural_page_table(layout, rr, offsets, vpages_per_seq, cap=cap)
                 return select_topk(q_r, w_r, nat, rr, table)
 
             return run
