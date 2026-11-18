@@ -786,3 +786,58 @@ def test_async_spec_assembly_warmup_needs_async_scheduling(monkeypatch):
 def test_async_spec_assembly_warmup_needs_an_async_drafter(monkeypatch):
     calls = _assembly_warmup_calls(monkeypatch, async_drafter=False)
     assert all(not c for c in calls.values())
+
+
+@pytest.mark.parametrize(
+    ("async_scheduling", "async_drafter", "sampled", "discarded", "deferred"),
+    [
+        (True, True, [torch.zeros(1)], [], True),
+        (False, True, [torch.zeros(1)], [], False),
+        (True, False, [torch.zeros(1)], [], False),
+        (True, True, [], [], False),
+        (True, True, [torch.zeros(1)], [0], False),
+    ],
+)
+def test_prev_rollback_waits_for_the_drafter_only_on_plain_async_drafter_steps(
+    async_scheduling, async_drafter, sampled, discarded, deferred
+):
+    """The previous step's rollback moves after the drafter dispatch only
+    under async scheduling with an async drafter, on a step that sampled
+    tokens and discards no request."""
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        _is_async_drafter=async_drafter,
+    )
+    assert TPUModelRunner._defers_prev_rollback(runner, sampled, discarded) is deferred
+
+
+def test_fused_assembly_stays_off_under_adaptive_verification():
+    """The compiled assembly takes the drafter's padded drafts only when the
+    drafts are the drafter's last device output, one block per chunk, and
+    adaptive verification is off; the prefill bootstrap has no adaptive
+    guard."""
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    drafts = torch.zeros(4, 3)
+    padded = [torch.zeros(8, 3)]
+    drafter = object.__new__(Eagle3Proposer)
+    drafter._last_propose_device_out = drafts
+    drafter._last_padded_drafts_per_chunk = padded
+    runner = SimpleNamespace(drafter=drafter, _adaptive_verification=None)
+    runner._drafter_padded_drafts = lambda d, n: TPUModelRunner._drafter_padded_drafts(
+        runner, d, n
+    )
+    fused = TPUModelRunner._fused_assembly_padded_drafts
+    assert fused(runner, drafts, 1) is padded
+    assert fused(runner, drafts, 2) is None
+    assert fused(runner, torch.zeros(4, 3), 1) is None
+    runner._adaptive_verification = object()
+    assert fused(runner, drafts, 1) is None
+    assert TPUModelRunner._drafter_padded_drafts(runner, drafts, 1) is padded
+    runner.drafter = SimpleNamespace(
+        _last_propose_device_out=drafts, _last_padded_drafts_per_chunk=padded
+    )
+    assert TPUModelRunner._drafter_padded_drafts(runner, drafts, 1) is None
