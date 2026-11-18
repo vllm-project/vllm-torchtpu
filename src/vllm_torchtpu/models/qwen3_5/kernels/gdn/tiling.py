@@ -484,7 +484,8 @@ def get_tile_sizes(
         decode_tile_size = decode_tile_target(active_num_seqs, n_v)
     decode_tile_size = min(decode_tile_size, vmem_fit)
 
-    if mixed_tile_size is None or mixed_tile_size <= 0:
+    caller_chunk = mixed_tile_size is not None and mixed_tile_size > 0
+    if not caller_chunk:
         # Size the prefill/mixed chunk from batch_size rather than comparing
         # against num_seqs * window_size, because num_seqs can be a static slot
         # capacity (such as under DCP=4) when a single prefill occupies the bucket.
@@ -506,9 +507,14 @@ def get_tile_sizes(
         )
 
     # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation,
-    # keeping mixed_tile_size a power of two so triangular_block_size divides it.
+    # keeping a derived mixed_tile_size a power of two so triangular_block_size
+    # divides it. A caller's chunk is the tiler's (fused_conv1d_gdn at
+    # config.TILER_SHAPES), which holds whole triangular blocks already.
     decode_tile_size = max(1, min(decode_tile_size, padded_batch_size))
-    mixed_tile_size = clip_mixed_tile_size(mixed_tile_size, batch_size)
+    if caller_chunk:
+        mixed_tile_size = max(1, min(mixed_tile_size, batch_size))
+    else:
+        mixed_tile_size = clip_mixed_tile_size(mixed_tile_size, batch_size)
     return decode_tile_size, mixed_tile_size
 
 
