@@ -1056,7 +1056,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Prompt tokens past ``local_warmth`` the connector expects to load
         from its external tier (``_hit_estimator``); 0 on a KV consumer,
         without an estimating connector, or with less than a block past the
-        local hit. A failing estimate is logged and counts as 0."""
+        local hit. A failing estimate counts as 0; it is logged once per
+        exception type (``warning_once`` keys on the arguments, so the request
+        and the exception text go to the debug log instead)."""
         if self._is_kv_consumer:
             return 0
         estimator = self._hit_estimator
@@ -1069,8 +1071,12 @@ class PrefixAwareScheduler(AsyncScheduler):
             return max(0, int(estimate or 0))
         except Exception as exc:
             logger.warning_once(
-                "estimate_external_hit_tokens failed for request %s (%r); "
-                "ranking it by its local prefix hit only.",
+                "estimate_external_hit_tokens raised %s; a request whose "
+                "estimate fails is ranked by its local prefix hit only.",
+                type(exc).__name__,
+            )
+            logger.debug(
+                "estimate_external_hit_tokens failed for request %s: %r",
                 request.request_id,
                 exc,
             )
