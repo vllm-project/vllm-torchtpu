@@ -16,6 +16,11 @@
 import numpy as np
 import torch
 
+# Per-test pytest-timeout limits. A PR test may run for 10 s; the limit adds headroom
+# for fixture setup and first-call compilation. A nightly test must finish in 5 min.
+PR_TIMEOUT_S = 120
+NIGHTLY_TIMEOUT_S = 300
+
 
 def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
     """Global (single-window) SSIM, mean over RGB channels."""

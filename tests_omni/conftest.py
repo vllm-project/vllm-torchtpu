@@ -36,6 +36,7 @@ import contextlib
 import copy
 import gc
 import json
+import re
 import threading
 from collections.abc import Generator
 from typing import Any
@@ -47,6 +48,7 @@ import torch
 from tests.tpu_release import wait_for_tpu_release
 
 omni_fixture_lock = threading.Lock()
+_TPU_DEVICE_NODE = re.compile(r"/dev/(?:accel|vfio/)\d+")
 
 # TpuPlatform._prepare_singlehost_tpu_env writes these into the parent pytest
 # environment when building a multi-rank LLM stage config, and skips recomputing
@@ -301,13 +303,36 @@ def _torchtpu_eager_mode(request: pytest.FixtureRequest) -> None:
 
 @pytest.fixture(autouse=True)
 def _sync_tpu(request: pytest.FixtureRequest) -> Generator[None, None, None]:
-    """Flush deferred torch_tpu ops between in-process TPU tests."""
+    """Flush deferred torch_tpu ops between in-process TPU tests.
+
+    - multichip tests do their TPU work in spawned workers, which cannot open a
+      device the pytest process holds. Such a test fails before it spawns
+      anything if pytest holds a device, and fails at teardown if it opened one.
+    """
+    if request.node.get_closest_marker("multichip"):
+        held = _pytest_tpu_devices()
+        assert not held, f"pytest already holds TPU devices {held}"
+        yield
+        held = _pytest_tpu_devices()
+        assert not held, f"{request.node.nodeid} opened TPU devices {held} in pytest"
+        return
     if request.node.get_closest_marker("spawns_tpu_workers"):
         yield
         return
     torch.accelerator.synchronize()
     yield
     torch.accelerator.synchronize()
+
+
+def _pytest_tpu_devices() -> list[str]:
+    """TPU device nodes that this pytest process holds open."""
+    held = []
+    for fd in os.listdir("/proc/self/fd"):
+        with contextlib.suppress(OSError):
+            target = os.readlink(f"/proc/self/fd/{fd}")
+            if _TPU_DEVICE_NODE.fullmatch(target):
+                held.append(target)
+    return held
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
