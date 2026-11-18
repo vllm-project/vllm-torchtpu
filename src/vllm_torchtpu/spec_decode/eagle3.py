@@ -764,6 +764,8 @@ class Eagle3Proposer:
         """Compile an MTP draft's loop steps 1..K-1 as one program, so the
         host dispatches once per propose for them instead of twice per step.
         Opt-in with `VLLM_TPU_FUSED_DRAFT_LOOP=1`; off, the per-step loop runs.
+        Not under EP-DP lockstep, where propose always runs the per-step loop,
+        so neither the program nor its warm-up would ever be used.
 
         Only for the plain case: IndexShare restores top-k rows between steps
         on the host, a draft->target id map would need its gather in the
@@ -779,6 +781,7 @@ class Eagle3Proposer:
         if (
             draft_model is None
             or not envs.VLLM_TPU_FUSED_DRAFT_LOOP
+            or self.runner._dp_lockstep_enabled()
             or self.speculative_config.method != "mtp"
             or self._share_mtp_indices
             or not self.advance_draft_positions

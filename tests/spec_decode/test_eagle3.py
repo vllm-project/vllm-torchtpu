@@ -1309,6 +1309,44 @@ def test_mtp_step0_post_attn_gather_off_under_dp_lockstep(monkeypatch, lockstep)
 
 
 @pytest.mark.parametrize("lockstep", [False, True])
+def test_fused_loop_is_not_built_under_dp_lockstep(monkeypatch, lockstep):
+    """propose runs the per-step loop under EP-DP lockstep, so the fused MTP
+    loop program, which _precompile_compute_logits would warm for every
+    bucket, is built only off lockstep."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    import vllm_torchtpu.spec_decode.mtp_fused_loop as mtp_fused_loop
+
+    monkeypatch.setattr(e3.envs, "VLLM_TPU_FUSED_DRAFT_LOOP", True)
+    built = []
+
+    def build(**kwargs):
+        built.append(kwargs)
+        return torch.nn.Identity()
+
+    monkeypatch.setattr(mtp_fused_loop, "build_mtp_fused_loop", build)
+    monkeypatch.setattr(
+        e3, "set_vllm_model_wrapper_context", lambda **_kw: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        e3, "set_current_vllm_config", lambda _config: contextlib.nullcontext()
+    )
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.draft_model = SimpleNamespace(
+        _dynamic_arg_dims={"input_ids": 0, "positions": 0, "hidden_states": 0}
+    )
+    proposer.runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: lockstep, mesh=None, max_num_reqs=8
+    )
+    proposer._get_loop_vllm_config = lambda: SimpleNamespace()
+
+    proposer._build_mtp_fused_loop()
+
+    assert (proposer._mtp_fused_loop is None) is lockstep
+    assert len(built) == (0 if lockstep else 1)
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
 def test_load_model_skips_step0_gather_loop_model_under_dp_lockstep(
     monkeypatch, lockstep
 ):
