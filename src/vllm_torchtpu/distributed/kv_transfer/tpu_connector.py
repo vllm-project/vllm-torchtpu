@@ -5099,15 +5099,16 @@ class TPURaidenConnectorWorker:
                     )
                 continue
             existing = self._stage3_registered_sends.get(req_id)
-            if (
-                existing is not None
-                and existing.finish_pending
-                and existing.uuid != uuid
-            ):
+            if existing is not None and existing.uuid != uuid:
                 # The scheduler minted a fresh send at the finish (its group
                 # pages differed from the send published ahead) and releases
                 # the ahead uuid; that release can trail this registration.
-                # Retire the ahead registration here.
+                # Retire the ahead registration here. The finish itself can also
+                # reach this worker before the fresh send's registration (the
+                # finish clears finish_pending first), so a different uuid on a
+                # live, non-terminal registration is the same replacement, not a
+                # conflict (j-7ead56d3-40eb-4bd0-8a6c, j-fc8072c8-8bf7-4486-9eb9:
+                # a 475-token request with no host load, two sends one step apart).
                 del self._stage3_registered_sends[req_id]
                 self._stage3_status_probe_next.pop(req_id, None)
                 facade.release_request_blocks(req_id=req_id, uuid=existing.uuid)
