@@ -43,61 +43,47 @@ from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     wait_bytes_of,
 )
 
-# Distinct from fused MoE (0), all-reduce (5), reduce-scatter (7),
-# small all-gather (9), MLA send small all-to-all (11), sparse MLA send (13),
-# rotated collectives (15), prefill (17, 19), and online-LSE combine (21).
+# Barrier semaphore group, distinct from the kernels on this branch: fused MoE
+# (0), all-reduce (5), reduce-scatter (7), small all-gather (9), MLA send small
+# all-to-all (11) and sparse MLA send (13). 15-21 stay free for kernels in
+# other open PRs, so the PRs can land in any order.
 COLLECTIVE_ID = 23
 
-# Default scoped VMEM cap when scratch is used so XLA keeps most of VMEM free
-# for surrounding weight prefetches across the custom call.
-DEFAULT_MIN_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
-
-
-def reference(blocks, *, tokens_per_core: int | None = None, k: int | None = None):
-    """Oracle for ``small_indexer_score_all_to_all``.
-
-    Accepts either a 3-D ``[cores, cores * tokens_per_core, k]`` array (returning
-    ``[cores, tokens_per_core, cores * k]``) or a flat 2-D
-    ``[cores, cores * tokens_per_core * k]`` array with ``tokens_per_core`` and
-    ``k`` specified (returning ``[cores, tokens_per_core * cores * k]``),
-    matching ``lax.all_to_all(scores_2d, axis, split_axis=0, concat_axis=1,
-    tiled=True)``.
-    """
-    n = blocks.shape[0]
-    is_3d = blocks.ndim == 3
-    if is_3d:
-        t_total, k_inferred = blocks.shape[1], blocks.shape[2]
-        assert t_total % n == 0, blocks.shape
-        tokens_per_core = t_total // n if tokens_per_core is None else tokens_per_core
-        k = k_inferred if k is None else k
-    else:
-        if tokens_per_core is None or k is None:
-            raise ValueError("tokens_per_core and k are required when blocks is 2-D")
-    shaped = blocks.reshape(n, n, tokens_per_core, k)
-    # Destination d gets shaped[s, d, t, :] at out[d, t, s, :].
-    transposed = shaped.transpose(1, 2, 0, 3).copy()
-    if is_3d:
-        return transposed.reshape(n, tokens_per_core, n * k)
-    return transposed.reshape(n, tokens_per_core * n * k)
-
-
+# Largest bucket the kernel is admitted for. Raising it to 256 did not
+# reliably beat XLA's collectives on one v7x host.
 MAX_SCORE_A2A_TOKENS = 224
 
+# The one top-k width admitted: the indexer's index_topk on GLM-5.2. With the
+# token cap it bounds the staging scratch (see VMEM_LIMIT_BYTES).
+SCORE_A2A_K = 2048
 
-def supports_indexer_score_all_to_all(
-    num_tokens: int,
-    dcp_size: int,
-    k: int,
-    max_tokens: int = MAX_SCORE_A2A_TOKENS,
-) -> bool:
-    """Whether ``(num_tokens, dcp_size, k)`` is eligible for the kernel."""
+# Scoped VMEM limit of the staging path (tokens_per_core > 1). Its two scratch
+# buffers take 2 * T * k * 4 bytes, 3.5 MiB at T = 224 and k = 2048, and must
+# fit in a quarter of it; the rest of VMEM stays free for the weight prefetches
+# XLA runs across the call.
+VMEM_LIMIT_BYTES = 16 * 1024 * 1024
+
+
+def reference(blocks):
+    """Oracle: every core's ``[T, k]`` scores, ``[cores, T, k]``, to what each
+    core receives, ``[cores, T // cores, cores * k]``, as
+    ``lax.all_to_all(scores, axis, split_axis=0, concat_axis=1, tiled=True)``
+    delivers it."""
+    n, t, k = blocks.shape
+    shaped = blocks.reshape(n, n, t // n, k)
+    # Destination d gets shaped[s, d, t, :] at out[d, t, s, :].
+    return shaped.transpose(1, 2, 0, 3).reshape(n, t // n, n * k)
+
+
+def supports_indexer_score_all_to_all(num_tokens: int, dcp_size: int, k: int) -> bool:
+    """Whether the a2a merge of a ``num_tokens`` bucket over ``dcp_size`` ranks
+    with top-k ``k`` takes the kernels: at most ``MAX_SCORE_A2A_TOKENS``
+    tokens, split evenly over the ranks, and ``k == SCORE_A2A_K``."""
     return (
         dcp_size > 1
-        and num_tokens > 0
-        and num_tokens <= max_tokens
+        and 0 < num_tokens <= MAX_SCORE_A2A_TOKENS
         and num_tokens % dcp_size == 0
-        and k > 0
-        and k % (8 * LANES) == 0
+        and k == SCORE_A2A_K
     )
 
 
@@ -113,7 +99,6 @@ def small_indexer_score_all_to_all(
     lane: jax.Array | None = None,
     collective_id: int = COLLECTIVE_ID,
     hbm_operand: bool = False,
-    vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
     """Flat 1-D score exchange for ``[T, k] -> [T // n, n * k]``.
 
@@ -129,7 +114,6 @@ def small_indexer_score_all_to_all(
       collective_id: barrier semaphore ID.
       hbm_operand: constrain ``x`` to HBM so XLA does not stage SparseCore's
         output into VMEM ahead of the call.
-      vmem_limit_bytes: optional scoped VMEM ceiling for the Pallas call.
     """
     if x.ndim != 1:
         raise ValueError(
@@ -153,6 +137,13 @@ def small_indexer_score_all_to_all(
         )
     if lane is not None and lane_axis is None:
         raise ValueError("lane requires lane_axis to be specified")
+    # The staging path's two VMEM scratch buffers hold T * k words each.
+    scratch_bytes = 2 * expected * x.dtype.itemsize
+    if tokens_per_core > 1 and 4 * scratch_bytes > VMEM_LIMIT_BYTES:
+        raise ValueError(
+            f"T={num_cores * tokens_per_core}, k={k} needs {scratch_bytes} bytes"
+            f" of VMEM scratch, over a quarter of the {VMEM_LIMIT_BYTES}-byte limit"
+        )
 
     n = num_cores
     k_rows = k // LANES  # multiple of 8
@@ -290,13 +281,9 @@ def small_indexer_score_all_to_all(
             pltpu.VMEM((tokens_per_core, n * k_rows, LANES), x.dtype),
             *[pltpu.SemaphoreType.DMA] * 4,
         ]
-        scratch_bytes = 2 * total_rows * LANES * x.dtype.itemsize
-        eff_vmem_limit = vmem_limit_bytes
-        if eff_vmem_limit is None:
-            eff_vmem_limit = max(DEFAULT_MIN_VMEM_LIMIT_BYTES, 4 * scratch_bytes)
         compiler_params = pltpu.CompilerParams(
             collective_id=collective_id,
-            vmem_limit_bytes=eff_vmem_limit,
+            vmem_limit_bytes=VMEM_LIMIT_BYTES,
         )
 
     out = pl.pallas_call(

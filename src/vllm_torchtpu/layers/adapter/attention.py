@@ -2850,7 +2850,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
-        ql_nope_absorbed = kwargs.get("ql_nope_absorbed")
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
         # the only consumer, hence the `topk_indices` term.
@@ -2894,9 +2893,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        if ql_nope_absorbed is not None:
-            ql_nope = ql_nope_absorbed.to(input_dtype)
-        elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
+        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
             q_nope_t = q_nope.transpose(0, 1)

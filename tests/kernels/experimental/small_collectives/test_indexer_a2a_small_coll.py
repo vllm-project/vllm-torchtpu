@@ -13,7 +13,8 @@
 # limitations under the License.
 """CPU Pallas interpret + race-detector + TPU_7X MLIR lowering tests for
 `TPU_DCP_INDEXER_A2A_SMALL_COLL` (`small_indexer_score_all_to_all` +
-`small_all_gather` in `streamindex_topk_dcp`).
+`small_all_gather` in `streamindex_topk_dcp`). The on-device tests are in
+test_indexer_a2a.py.
 """
 
 import contextlib
@@ -22,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +32,7 @@ import pytest
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
+import vllm_torchtpu
 from vllm_torchtpu.kernels.deepseek_v4 import sparsecore_topk as sc_module
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
@@ -42,25 +45,34 @@ from vllm_torchtpu.kernels.experimental.small_collectives import (
 from vllm_torchtpu.kernels.experimental.small_collectives import (
     indexer_a2a,
 )
-from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_prequantized_matmul
 
 N = 16
 AXIS = "dcp"
 LANE_AXIS = "dcp_lane"
+# Below the CPU lane's 600 s pytest timeout, so a hung worker fails here with
+# its output. The worker takes about 40 s on a 64-core workstation.
+WORKER_TIMEOUT_S = 480
 
 
 def test_supports_indexer_score_all_to_all():
-    assert indexer_a2a.supports_indexer_score_all_to_all(64, 16, 2048, 128)
-    assert indexer_a2a.supports_indexer_score_all_to_all(16, 16, 2048, 128)
-    assert indexer_a2a.supports_indexer_score_all_to_all(128, 16, 2048, 128)
-    # Exceeds max_tokens cap.
-    assert not indexer_a2a.supports_indexer_score_all_to_all(256, 16, 2048, 128)
-    # Not divisible by num_cores.
-    assert not indexer_a2a.supports_indexer_score_all_to_all(24, 16, 2048, 128)
-    # k not a multiple of 1024 (8 * 128).
-    assert not indexer_a2a.supports_indexer_score_all_to_all(64, 16, 512, 128)
-    assert not indexer_a2a.supports_indexer_score_all_to_all(64, 1, 2048, 128)
+    assert indexer_a2a.supports_indexer_score_all_to_all(64, 16, 2048)
+    assert indexer_a2a.supports_indexer_score_all_to_all(16, 16, 2048)
+    assert indexer_a2a.supports_indexer_score_all_to_all(224, 8, 2048)
+    # Over the token cap.
+    assert not indexer_a2a.supports_indexer_score_all_to_all(256, 16, 2048)
+    # Not divisible by the DCP size.
+    assert not indexer_a2a.supports_indexer_score_all_to_all(24, 16, 2048)
+    # Any top-k but the indexer's 2048.
+    assert not indexer_a2a.supports_indexer_score_all_to_all(64, 16, 1024)
+    assert not indexer_a2a.supports_indexer_score_all_to_all(64, 16, 4096)
+    assert not indexer_a2a.supports_indexer_score_all_to_all(64, 1, 2048)
+
+
+def test_largest_admitted_bucket_fits_the_vmem_limit():
+    """T = 224 at k = 2048 (any DCP size) needs 3.5 MiB of staging scratch,
+    within a quarter of the fixed limit."""
+    t, k = indexer_a2a.MAX_SCORE_A2A_TOKENS, indexer_a2a.SCORE_A2A_K
+    assert 4 * (2 * t * k * 4) <= indexer_a2a.VMEM_LIMIT_BYTES
 
 
 def test_validation_rejects_bad_shapes_and_dtypes():
@@ -105,6 +117,15 @@ def test_validation_rejects_bad_shapes_and_dtypes():
             k=2048,
             axis=AXIS,
         )
+    # T = 256 at k = 4096 would stage 8 MiB in VMEM: refused at trace time.
+    with pytest.raises(ValueError, match="VMEM scratch"):
+        indexer_a2a.small_indexer_score_all_to_all(
+            jnp.zeros((256 * 4096,), jnp.int32),
+            num_cores=16,
+            tokens_per_core=16,
+            k=4096,
+            axis=AXIS,
+        )
 
 
 def test_numpy_reference_matches_token_major_all_to_all():
@@ -120,23 +141,36 @@ def test_numpy_reference_matches_token_major_all_to_all():
                 assert np.array_equal(sl, raw[src, tok])
 
 
+def _tail(out) -> str:
+    if isinstance(out, bytes):
+        out = out.decode(errors="replace")
+    return (out or "")[-3000:]
+
+
 def _run_worker():
     flags = os.environ.get("XLA_FLAGS", "")
+    src = str(Path(vllm_torchtpu.__file__).resolve().parents[1])
     env = dict(
         os.environ,
         JAX_PLATFORMS="cpu",
         XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={N}"
         " --xla_allow_excess_precision=false",
+        # The worker imports the package this process imported.
+        PYTHONPATH=os.pathsep.join([src, os.environ.get("PYTHONPATH", "")]),
     )
-    proc = subprocess.run(
-        [sys.executable, __file__, "worker"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, __file__, "worker"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=WORKER_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        output = _tail(e.stdout) + _tail(e.stderr)
+        pytest.fail(f"worker timed out after {e.timeout} s\n{output}")
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
-    assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
+    assert proc.returncode == 0 and lines, _tail(proc.stdout) + _tail(proc.stderr)
     return json.loads(lines[-1][len("RESULT ") :])
 
 
@@ -202,7 +236,8 @@ def _asm(exported) -> str:
         return str(module.operation.get_asm(enable_debug_info=False))
 
 
-@pytest.mark.parametrize("tokens_per_core", [1, 4])
+# 14 tokens per core is the largest bucket admitted (T = 224), the most VMEM.
+@pytest.mark.parametrize("tokens_per_core", [1, 4, 14])
 @pytest.mark.parametrize("hbm_operand", [True, False])
 def test_tpu7x_lowering_of_indexer_score_a2a(tpu7x_info, tokens_per_core, hbm_operand):
     from jax.sharding import AbstractMesh, NamedSharding
@@ -242,12 +277,14 @@ def test_tpu7x_lowering_of_indexer_score_a2a(tpu7x_info, tokens_per_core, hbm_op
     assert "all_to_all" not in mlir_text
 
 
-def test_tpu7x_export_full_streamindex_topk_dcp_small_coll_and_qb_absorb(
-    monkeypatch, tpu7x_info
+@pytest.mark.parametrize("qb_overlap", [False, True])
+def test_tpu7x_export_streamindex_topk_dcp_with_small_collectives(
+    monkeypatch, tpu7x_info, qb_overlap
 ):
-    """Exports the complete GLM-5.2 DCP=16, T=64 `streamindex_topk_dcp` pipeline
-    to `TPU_7X` MLIR with both `a2a_small_coll=True` and overlapped prequantized
-    `q_b` + `absorb_q` enabled."""
+    """Exports the DCP = 16, T = 64 a2a merge of `streamindex_topk_dcp` with
+    `a2a_small_coll=True` to `TPU_7X` MLIR: both stages run as the kernels and
+    no XLA collective is left, alone and with TPU_INDEXER_QB_OVERLAP's side
+    work (a stand-in matmul) pinned under the local top-k."""
     from jax.sharding import AbstractMesh, NamedSharding
     from jax.sharding import PartitionSpec as P
 
@@ -255,12 +292,13 @@ def test_tpu7x_export_full_streamindex_topk_dcp_small_coll_and_qb_absorb(
 
     def _sc_topk_stub(scores, k_, row_lengths, **kwargs):
         del row_lengths
-        out = jnp.zeros((scores.shape[0], k_), jnp.int32)
-        return (out, out) if kwargs.get("return_scores", True) else out
+        vals, slots = lax.top_k(scores, k_)
+        slots = slots.astype(jnp.int32)
+        return (vals, slots) if kwargs.get("return_scores", True) else slots
 
     def _pack_stub(slots, idxs=None, dcp_rank=None):
-        del idxs, dcp_rank
-        return slots
+        assert idxs is not None and dcp_rank is not None
+        return slots + idxs * jnp.int32(0) + jnp.asarray(dcp_rank, jnp.int32) * 0
 
     def _scoring_stub(
         q,
@@ -278,15 +316,13 @@ def test_tpu7x_export_full_streamindex_topk_dcp_small_coll_and_qb_absorb(
         del (
             indexer_weights,
             cache_kv,
-            seq_lens,
             page_indices,
-            cu_q_lens,
             distribution,
             kwargs,
         )
         b = q.shape[0]
-        idxs = jnp.zeros((b, k), jnp.int32)
-        scores = jnp.zeros((b, k), jnp.int32)
+        idxs = jnp.broadcast_to(cu_q_lens[:b, None], (b, k))
+        scores = jnp.broadcast_to(seq_lens[:, None], (b, k))
         if final_sc_tie:
             return (
                 idxs,
@@ -303,17 +339,9 @@ def test_tpu7x_export_full_streamindex_topk_dcp_small_coll_and_qb_absorb(
     monkeypatch.setattr(stk_mod, "streamindex_topk", _scoring_stub)
 
     t, h_idx, d_idx, topk = 64, 32, 128, 2048
-    q_lora_rank, h_qrep, nope_dim, rope_dim, kv_lora_rank = 1536, 64, 192, 64, 512
-    q_out_dim = h_qrep * (nope_dim + rope_dim)
     mesh = AbstractMesh((1, N), (LANE_AXIS, DCP_AXIS_NAME))
     rep = NamedSharding(mesh, P())
     sharded = NamedSharding(mesh, P(DCP_AXIS_NAME))
-
-    def _absorb_fn(q_out, w_uk_t):
-        q_nope = q_out.reshape(q_out.shape[0], h_qrep, nope_dim + rope_dim)[
-            ..., :nope_dim
-        ]
-        return q_out, absorb_q(q_nope, w_uk_t.astype(q_nope.dtype))
 
     def run_pipeline(
         q,
@@ -323,14 +351,12 @@ def test_tpu7x_export_full_streamindex_topk_dcp_small_coll_and_qb_absorb(
         page_indices,
         cu_q_lens,
         dist,
-        rank_ids,
-        lane_ids,
-        qb_xq,
-        qb_xs,
-        qb_w,
-        qb_s,
-        w_uk_t,
+        ranks,
+        lanes,
+        x,
+        w,
     ):
+        overlap = dict(overlap_fn=jnp.dot, overlap_args=(x, w)) if qb_overlap else {}
         return streamindex_topk_dcp(
             q,
             weights,
@@ -346,16 +372,9 @@ def test_tpu7x_export_full_streamindex_topk_dcp_small_coll_and_qb_absorb(
             interleave_size=1,
             a2a_merge=True,
             a2a_small_coll=True,
-            dcp_rank_ids=rank_ids,
-            dcp_lane_ids=lane_ids,
-            overlap_fn=lambda xq, xs, wq, ws: xla_prequantized_matmul(
-                xq, xs, wq, ws, jnp.bfloat16
-            ),
-            overlap_args=(qb_xq, qb_xs, qb_w, qb_s),
-            merge_overlap_fn=_absorb_fn,
-            merge_overlap_args=(w_uk_t,),
-            overlap_pin_max_tokens=64,
-            overlap_out_specs=(P(), P()),
+            dcp_rank_ids=ranks,
+            dcp_lane_ids=lanes,
+            **overlap,
         )
 
     S = jax.ShapeDtypeStruct
@@ -369,23 +388,21 @@ def test_tpu7x_export_full_streamindex_topk_dcp_small_coll_and_qb_absorb(
         S((3,), jnp.int32, sharding=rep),
         S((N,), jnp.int32, sharding=sharded),
         S((N,), jnp.int32, sharding=sharded),
-        S((t, q_lora_rank), jnp.float8_e4m3fn, sharding=rep),
-        S((t, 1), jnp.float32, sharding=rep),
-        S((q_lora_rank, q_out_dim), jnp.float8_e4m3fn, sharding=rep),
-        S((q_out_dim,), jnp.float32, sharding=rep),
-        S((h_qrep, nope_dim, kv_lora_rank), jnp.bfloat16, sharding=rep),
+        S((t, 256), jnp.bfloat16, sharding=rep),
+        S((256, 512), jnp.bfloat16, sharding=rep),
     )
     mlir_text = _asm(exported)
     assert "small_idx_score_a2a_n16_t4_k2048" in mlir_text
     assert "small_all_gather_n16_l8192" in mlir_text
     assert "stablehlo.all_to_all" not in mlir_text
     assert "stablehlo.all_gather" not in mlir_text
-    assert mlir_text.count("stablehlo.optimization_barrier") >= 3
     out_avals = exported.out_avals
-    assert len(out_avals) == 3
     assert out_avals[0].shape == (N * t, topk)
-    assert out_avals[1].shape == (t, q_out_dim)
-    assert out_avals[2].shape == (t, h_qrep, kv_lora_rank)
+    if qb_overlap:
+        assert "stablehlo.optimization_barrier" in mlir_text
+        assert len(out_avals) == 2 and out_avals[1].shape == (t, 512)
+    else:
+        assert len(out_avals) == 1
 
 
 # --------------------------------------------------------------------------- #

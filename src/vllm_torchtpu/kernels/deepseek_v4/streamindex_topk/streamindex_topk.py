@@ -2084,9 +2084,6 @@ SMALL_AG_MAX_TOKENS = 8
         "global_scheduling_group_id",
         "overlap_fn",
         "merge_overlap_fn",
-        "overlap_in_specs",
-        "merge_overlap_in_specs",
-        "overlap_out_specs",
         "overlap_pin_max_tokens",
         "flat_merge",
         "small_all_gather",
@@ -2127,14 +2124,10 @@ def streamindex_topk_dcp(
     overlap_fn=None,
     overlap_args: tuple = (),
     merge_overlap_fn=None,
-    merge_overlap_args: tuple = (),
-    overlap_in_specs: tuple | None = None,
-    merge_overlap_in_specs: tuple | None = None,
-    overlap_out_specs: Any = None,
     overlap_pin_max_tokens: int | None = None,
     flat_merge: bool | None = None,
     small_all_gather: bool | None = None,
-    a2a_small_coll: bool | None = None,
+    a2a_small_coll: bool = False,
     decode_pack: bool = False,
     shared_meta: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
@@ -2228,25 +2221,20 @@ def streamindex_topk_dcp(
         one element instead of an `all_to_all` of an iota. Same result.
       overlap_fn: optional TensorCore work, independent of the top-k, to run while the
         TensorCore would otherwise idle on the SparseCore calls.
-        `overlap_fn(*overlap_args)` is pinned between the local top-k's input
-        scores and the candidate exchange by `optimization_barrier`s -- the only
-        window it can then land in is the local SparseCore call's. Only
-        `overlap_args[0]` (the activation) goes through the first barrier; the
-        rest (weights) are passed as they are, since a barrier on a parameter
-        makes XLA copy it. `merge_overlap_fn(result, *merge_overlap_args)`, if
-        given, is pinned the same way between the candidate exchange and the
-        merge's consumers, i.e. under the merge call. The barriers only add
-        ordering edges: the top-k and the work compute the same values as apart.
-      overlap_args: tuple of arrays `overlap_fn` takes.
+        `overlap_fn(*overlap_args)` (replicated args; result replicated) is pinned
+        between the local top-k's input scores and the candidate all-gather by
+        `optimization_barrier`s -- the only window it can then land in is the local
+        SparseCore call's. Only `overlap_args[0]` (the activation) goes through the
+        first barrier; the rest (weights) are passed as they are, since a barrier on a
+        parameter makes XLA copy it. `merge_overlap_fn(result)`, if given, is pinned the
+        same way between the all-gather and the merge's consumers, i.e. under the merge
+        call. The barriers only add ordering edges: the top-k and the work compute the
+        same values as apart. XLA scheduling groups (`_scheduling_group_id`) cannot do
+        this: `legalize-scheduling-annotations` strips groups that hold a SparseCore
+        kernel (it is not yet an async op there). With chunking or the a2a merge the
+        work runs unpinned.
+      overlap_args: tuple of replicated arrays `overlap_fn` takes.
       merge_overlap_fn: see `overlap_fn`.
-      merge_overlap_args: optional extra arrays passed into `merge_overlap_fn`
-        through `shard_map` without passing through the local top-k barrier.
-      overlap_in_specs: optional `PartitionSpec`s for `overlap_args` (defaults
-        to replicated).
-      merge_overlap_in_specs: optional `PartitionSpec`s for `merge_overlap_args`
-        (defaults to replicated).
-      overlap_out_specs: optional `PartitionSpec` pytree for the second output
-        returned alongside `local_topk` (defaults to replicated).
       overlap_pin_max_tokens: pin only buckets of at most this many tokens
         (the decode buckets, whose TensorCore idles on the SparseCore calls);
         larger ones run the work unpinned. None pins every bucket.
@@ -2262,15 +2250,18 @@ def streamindex_topk_dcp(
         a mesh with a lane axis of size > 1 the torch bridge must pass
         `dcp_lane_ids`. None reads `TPU_DCP_INDEXER_SMALL_AG`. Same
         bytes, so the same result.
-      a2a_small_coll: with `a2a_merge` on eligible buckets
-        (`supports_indexer_score_all_to_all`), run both the score `all_to_all`
-        and the slot `all_gather` as Pallas remote-DMA small collectives over
-        flat 1-D HBM buffers instead of XLA collectives. Same bytes, same
-        result.
+      a2a_small_coll: with `a2a_merge`, on the buckets
+        `small_collectives.indexer_a2a.supports_indexer_score_all_to_all`
+        admits: run the score `all_to_all` (stage 1) and the slot
+        `all_gather` (stage 3) as Pallas remote-DMA kernels
+        (`small_collectives.indexer_a2a`, `small_collectives.all_gather`)
+        over flat 1-D buffers instead of XLA's collectives. Under a mesh with
+        a lane axis of size > 1 the torch bridge must pass `dcp_lane_ids`.
+        Same bytes, so the same result.
       dcp_lane_ids: optional i32[dcp_size] sharded over `dcp_axis_name`,
         each shard holding its index on the mesh's other (lane) axis
         (`dcp_lane_operand`): the small collectives' peer addresses under the
-        torch bridge, where `lax.axis_index` is refused.
+        torch bridge, where `lax.axis_index` is refused. Read only by them.
 
     Returns:
       With `overlap_fn`, a pair `(local_topk, overlap_out)`. Otherwise:
@@ -2309,28 +2300,26 @@ def streamindex_topk_dcp(
 
     if overlap_fn is None and merge_overlap_fn is not None:
         raise ValueError("merge_overlap_fn needs overlap_fn")
-    if merge_overlap_args and merge_overlap_fn is None:
-        raise ValueError("merge_overlap_args needs merge_overlap_fn")
-    from vllm_torchtpu import envs as _envs
-
     if flat_merge is None:
-        flat_merge = _envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+        from vllm_torchtpu import envs
+
+        flat_merge = envs.TPU_SC_TOPK_DCP_MERGE_FLAT
     flat_merge = (
         bool(flat_merge) and not a2a_merge and rank_major_merge_fits(q.shape[0])
     )
     if small_all_gather is None:
-        small_all_gather = _envs.TPU_DCP_INDEXER_SMALL_AG
+        from vllm_torchtpu import envs
+
+        small_all_gather = envs.TPU_DCP_INDEXER_SMALL_AG
     small_all_gather = (
         bool(small_all_gather) and flat_merge and q.shape[0] <= SMALL_AG_MAX_TOKENS
     )
+    from vllm_torchtpu import envs as _envs
+
     a2a_small_coll = (
-        bool(a2a_small_coll)
+        a2a_small_coll
         and a2a_merge
-        and small_indexer_a2a.supports_indexer_score_all_to_all(
-            q.shape[0],
-            dcp_size,
-            k,
-        )
+        and small_indexer_a2a.supports_indexer_score_all_to_all(q.shape[0], dcp_size, k)
     )
     small_ag_hbm = _envs.TPU_SMALL_COLL_HBM_OPERAND
     lane_axes = tuple(a for a in mesh.axis_names if a != dcp_axis_name)
@@ -2339,6 +2328,8 @@ def streamindex_topk_dcp(
             f"small collectives take at most one axis beside {dcp_axis_name!r},"
             f" got mesh axes {mesh.axis_names}"
         )
+    # Pin only where each stage is one SparseCore call: an unchunked local
+    # top-k (as `streamindex_topk` decides it) and the all-gather merge.
     pin = (
         overlap_fn is not None
         and (overlap_pin_max_tokens is None or q.shape[0] <= overlap_pin_max_tokens)
@@ -2348,8 +2339,6 @@ def streamindex_topk_dcp(
             or q.shape[0] == chunk_tokens
         )
     )
-    ov_leaves = tuple(overlap_args) if overlap_fn is not None else ()
-    mov_leaves = tuple(merge_overlap_args) if merge_overlap_fn is not None else ()
 
     def _local(
         q,
@@ -2361,19 +2350,19 @@ def streamindex_topk_dcp(
         distribution,
         *extra,
     ):
-        # Trailing operands: this shard's rank (TPU_DCP_RANK_OPERAND), lane,
-        # overlap_fn's arguments, then merge_overlap_fn's extra arguments.
+        # Trailing operands: this shard's rank (TPU_DCP_RANK_OPERAND), then the
+        # overlap work's arguments (TPU_INDEXER_QB_OVERLAP).
         n_rank = 0 if dcp_rank_ids is None else 1
         n_lane = 0 if dcp_lane_ids is None else 1
-        n_ov = len(ov_leaves)
         rank_ids = extra[:n_rank]
         lane_ids = extra[n_rank : n_rank + n_lane]
-        ov_args = extra[n_rank + n_lane : n_rank + n_lane + n_ov]
-        mov_args = extra[n_rank + n_lane + n_ov :]
+        ov_args = extra[n_rank + n_lane :]
         if rank_ids:
             dcp_rank = rank_ids[0][0]
         else:
             dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
+        # The small collectives' lane index, as data where it is given; a
+        # size-1 lane axis is index 0; otherwise the kernels read the axis.
         lane_axis = lane_axes[0] if lane_axes else None
         lane = None
         if lane_axis is not None:
@@ -2381,10 +2370,6 @@ def streamindex_topk_dcp(
                 lane = lane_ids[0]
             elif mesh.shape[lane_axis] == 1:
                 lane = jnp.zeros((1,), jnp.int32)
-            elif a2a_small_coll:
-                lane = jnp.reshape(
-                    cp_rank_as_data(lane_axis, mesh.shape[lane_axis]), (1,)
-                )
         if lane_ids:
             # Keep the lane operand live on every bucket: the torch op passes
             # it on all of them, and JAX prunes an unused argument from the
@@ -2452,7 +2437,7 @@ def streamindex_topk_dcp(
                 return topk
             if merge_overlap_fn is None:
                 return topk, ov
-            out = merge_overlap_fn(ov, *mov_args) if mov_args else merge_overlap_fn(ov)
+            out = merge_overlap_fn(ov)
             if merge_pinned:
                 topk, out = lax.optimization_barrier((topk, out))
             return topk, out
@@ -2464,11 +2449,10 @@ def streamindex_topk_dcp(
         if a2a_merge:
             tokens_per_core = q.shape[0] // dcp_size
             rank_1d = jnp.reshape(dcp_rank, (1,))
-            merge_pinned = pin and merge_overlap_fn is not None
             # Stage 1. Rank `j` collects every rank's scores for token block
             # `j`: [T, k] -> [T / dcp, dcp * k], rank-major like the gather.
             if a2a_small_coll:
-                scores_1d = small_indexer_a2a.small_indexer_score_all_to_all(
+                scores = small_indexer_a2a.small_indexer_score_all_to_all(
                     scores,
                     num_cores=dcp_size,
                     tokens_per_core=tokens_per_core,
@@ -2478,16 +2462,11 @@ def streamindex_topk_dcp(
                     lane_axis=lane_axis,
                     lane=lane,
                     hbm_operand=small_ag_hbm,
-                )
-                if merge_pinned:
-                    _, ov = lax.optimization_barrier((scores_1d[:128], ov))
-                scores = scores_1d.reshape(tokens_per_core, dcp_size * k)
+                ).reshape(tokens_per_core, dcp_size * k)
             else:
                 scores = lax.all_to_all(
                     scores, dcp_axis_name, split_axis=0, concat_axis=1, tiled=True
                 )
-                if merge_pinned:
-                    _, ov = lax.optimization_barrier((scores[:1, :128], ov))
             # Stage 2. This block's exact global top-k. Full width as the row
             # length: -inf entries (unfilled local slots, padding tokens) are
             # never selected, so they need no masking.
@@ -2503,7 +2482,7 @@ def streamindex_topk_dcp(
             # slots. A slot names its source rank and that rank's own list, so
             # the owner filter resolves it against this rank's `idxs` as is.
             if a2a_small_coll:
-                slots_1d = small_collectives_all_gather.small_all_gather(
+                slots = small_collectives_all_gather.small_all_gather(
                     slots.reshape(-1),
                     num_cores=dcp_size,
                     axis=dcp_axis_name,
@@ -2511,14 +2490,10 @@ def streamindex_topk_dcp(
                     lane_axis=lane_axis,
                     lane=lane,
                     hbm_operand=small_ag_hbm,
-                )
-                slots = slots_1d.reshape(q.shape[0], k)
+                ).reshape(q.shape[0], k)
             else:
                 slots = lax.all_gather(slots, dcp_axis_name, axis=0, tiled=True)
-            return _ret(
-                dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank),
-                merge_pinned,
-            )
+            return _ret(dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank))
 
         # Stage 1. All-gather the scores; the indices stay home. Flat, the
         # gather is rank-major over whole [T * k] lists, which the merge reads
@@ -2564,17 +2539,7 @@ def streamindex_topk_dcp(
         )
 
     replicated = P()
-    eff_ov_in = (
-        tuple(overlap_in_specs)
-        if overlap_in_specs is not None
-        else (replicated,) * len(ov_leaves)
-    )
-    eff_mov_in = (
-        tuple(merge_overlap_in_specs)
-        if merge_overlap_in_specs is not None
-        else (replicated,) * len(mov_leaves)
-    )
-    eff_ov_out = replicated if overlap_out_specs is None else overlap_out_specs
+    ov_leaves = tuple(overlap_args) if overlap_fn is not None else ()
     return jax.shard_map(
         _local,
         mesh=mesh,
@@ -2588,11 +2553,10 @@ def streamindex_topk_dcp(
             replicated,  # distribution
             *((P(dcp_axis_name),) if dcp_rank_ids is not None else ()),  # rank ids
             *((P(dcp_axis_name),) if dcp_lane_ids is not None else ()),  # lane ids
-            *eff_ov_in,  # overlap_args
-            *eff_mov_in,  # merge_overlap_args
+            *(replicated for _ in ov_leaves),  # overlap_args
         ),
         out_specs=(
-            P(dcp_axis_name) if overlap_fn is None else (P(dcp_axis_name), eff_ov_out)
+            P(dcp_axis_name) if overlap_fn is None else (P(dcp_axis_name), replicated)
         ),
         check_vma=False,
     )(
@@ -2606,5 +2570,4 @@ def streamindex_topk_dcp(
         *((dcp_rank_ids,) if dcp_rank_ids is not None else ()),
         *((dcp_lane_ids,) if dcp_lane_ids is not None else ()),
         *ov_leaves,
-        *mov_leaves,
     )
