@@ -708,3 +708,49 @@ def test_flash_on_tpu_matches_float64_oracle(dcp, kv_heads, q_heads, dtype):
         with jax.default_matmul_precision("highest"):
             xla = _attend(case, r, cda.attend_cached, interpret=False)
         assert _errors(case, r, xla)[0] <= 1.0, r
+
+
+def _run_write_case(dcp, rank, seed):
+    """1024+ tokens of several requests (partial first and last pages, an
+    empty request, padding tokens), as `write_kv` resolves them on `rank`:
+    tokens of other ranks' blocks and padding go to page ``num_pages``."""
+    rng = np.random.default_rng(seed)
+    q_len = np.array([300, 7, 0, 650, 129], np.int32)
+    ctx = np.array([100, 5000, 0, 1, 60], np.int32)
+    seq_lens = jnp.asarray(ctx + q_len)
+    max_seqs = len(q_len)
+    per_seq = -(-int((ctx + q_len).max()) // PAGE) // dcp + 2
+    num_pages = max_seqs * per_seq + 3
+    tables = jnp.asarray(
+        rng.permutation(num_pages)[: max_seqs * per_seq].reshape(max_seqs, -1),
+        jnp.int32,
+    )
+    num_tokens = int(q_len.sum()) + 9
+    cu = jnp.asarray(np.concatenate([[0], np.cumsum(q_len)]), jnp.int32)
+    seq, pos, valid = cda._token_layout(seq_lens, cu, num_tokens)
+    block = pos // PAGE
+    mine = valid & (block % dcp == rank)
+    pages = jnp.where(mine, tables[seq, block // dcp], num_pages)
+    cache = jnp.asarray(
+        rng.standard_normal((num_pages, PAGE, 1, 2, HEAD_DIM)), jnp.bfloat16
+    )
+    rows = jnp.asarray(rng.standard_normal((num_tokens, 1, 2, HEAD_DIM)), jnp.bfloat16)
+    max_runs = cda.max_write_runs(num_tokens, max_seqs, PAGE)
+    return cache, rows, pages, pos % PAGE, max_runs
+
+
+@pytest.mark.parametrize("dcp,rank", [(1, 0), (2, 0), (2, 1)])
+def test_write_runs_matches_scatter(dcp, rank):
+    cache, rows, pages, slots, max_runs = _run_write_case(dcp, rank, seed=dcp + rank)
+    want = cache.at[pages, slots].set(rows, mode="drop")
+    got = cda.write_runs(cache, rows, pages, slots, max_runs=max_runs, interpret=True)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("dcp,rank", [(1, 0), (2, 1)])
+def test_write_runs_on_tpu_matches_scatter(dcp, rank):
+    cache, rows, pages, slots, max_runs = _run_write_case(dcp, rank, seed=7)
+    want = cache.at[pages, slots].set(rows, mode="drop")
+    got = cda.write_runs(cache, rows, pages, slots, max_runs=max_runs)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
