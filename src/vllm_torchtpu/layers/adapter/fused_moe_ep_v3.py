@@ -98,9 +98,8 @@ def served_config(
     logger.info_once(
         "Fused EP MoE (latest kernel) settings for hidden=%d inter=%d "
         "experts_per_shard=%d top_k=%d: tile_rows=%d weight_format=%s "
-        "token_rows=%s intermediate=%s result_rows=%s elementwise=%s "
-        "combine=%s row_scale_dtype=%s sorted_rows=%s "
-        "stream_block=%s token_block=%s weight_slots=%d weight_prefetch=%d "
+        "result_rows=%s elementwise=%s combine=%s row_scale_dtype=%s "
+        "sorted_rows=%s token_block=%s weight_slots=%d weight_prefetch=%d "
         "result_slots=%d row_fetch_ahead=%d vmem_fraction=%s",
         hidden,
         inter,
@@ -108,14 +107,11 @@ def served_config(
         top_k,
         TILE_ROWS,
         WEIGHT_FORMAT,
-        config.token_rows,
-        config.intermediate,
         config.result_rows,
         config.elementwise_dtype,
         config.combine_dtype,
         config.row_scale_dtype,
         config.sorted_rows,
-        config.stream_block,
         config.token_block,
         config.weight_slots,
         config.weight_prefetch,
