@@ -201,6 +201,7 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     runner.vllm_config.attention_config = None  # no HiSparse
     runner.use_spmd = False
     runner._hybrid_uniform_page_size_bytes = None
+    runner._subpage_kernel_block_size = None
     runner._unified_kv_layout = False
     runner._mamba_num_blocks = None
     runner._uniform_mamba_layout = False
@@ -275,6 +276,7 @@ class TestKVCacheManager:
         self.runner.cache_config = vllm_config.cache_config
         self.runner.scheduler_config = vllm_config.scheduler_config
         self.runner._hybrid_uniform_page_size_bytes = None
+        self.runner._subpage_kernel_block_size = None
         self.runner.max_num_reqs = 16
         self.runner.max_model_len = 1024
         self.runner.max_num_tokens = 2048
@@ -2725,6 +2727,7 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
         shared_kv_cache_layers={},
         runner_only_attn_layers=set(),
         _hybrid_uniform_page_size_bytes=None,
+        _subpage_kernel_block_size=None,
         _unified_kv_layout=False,
         _uniform_mamba_layout=False,
         _mamba_num_blocks=None,
