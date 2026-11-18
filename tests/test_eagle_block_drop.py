@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
+import pytest
+import torch
 import vllm.v1.core.sched.scheduler as scheduler_module
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
+    RequestOffloadState,
+    SchedulerOffloadConfig,
+)
 from vllm.v1.core.kv_cache_coordinator import SpecGroup
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+from vllm.v1.kv_offload.base import LookupResult
 
 from vllm_torchtpu.core import eagle_block_drop
+from vllm_torchtpu.core.eagle_block_drop import offload_config_without_eagle_groups
+from vllm_torchtpu.offload import raiden_connector
 
 BLOCK = 1152
 
@@ -98,3 +109,152 @@ def test_patch_is_noop_when_disabled(monkeypatch):
     before = (Scheduler.__init__, Scheduler._mamba_block_aligned_split)
     eagle_block_drop.patch_disable_eagle_block_drop()
     assert (Scheduler.__init__, Scheduler._mamba_block_aligned_split) == before
+
+
+CHUNK = 4096
+
+
+def _mtp_config() -> SchedulerOffloadConfig:
+    spec = SimpleNamespace(
+        tokens_per_block=[CHUNK],
+        blocks_per_chunk=1,
+        tokens_per_hash=CHUNK,
+        offload_prompt_only=False,
+    )
+    group = KVCacheGroupSpec(
+        layer_names=["model.layers.0.self_attn"],
+        kv_cache_spec=FullAttentionSpec(
+            block_size=CHUNK, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+        ),
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_eagle=lambda: True),
+        parallel_config=SimpleNamespace(world_size=8, decode_context_parallel_size=16),
+    )
+    return SchedulerOffloadConfig.from_spec(
+        spec, vllm_config, SimpleNamespace(kv_cache_groups=[group])
+    )
+
+
+def _hit_tokens(config, prompt_tokens: int, tier_chunks: int, local_chunks: int = 0):
+    keys = [f"chunk-{i}" for i in range(prompt_tokens // CHUNK)]
+    stored = set(keys[:tier_chunks])
+    scheduler = SimpleNamespace(
+        config=config,
+        _sliding_window_groups=(),
+        _lookup_groups=(0,),
+        _mamba_align_size=None,
+        _chunks_being_loaded=set(),
+        manager=SimpleNamespace(
+            lookup=lambda key, ctx: (
+                LookupResult.HIT if key in stored else LookupResult.MISS
+            )
+        ),
+        _events_tracker=SimpleNamespace(record_lookup=lambda *args: None),
+    )
+    scheduler._maximal_prefix_lookup = MethodType(
+        OffloadingConnectorScheduler._maximal_prefix_lookup, scheduler
+    )
+    req_status = SimpleNamespace(
+        num_locally_computed_tokens=local_chunks * CHUNK,
+        req=SimpleNamespace(num_tokens=prompt_tokens, request_id="r"),
+        group_states=[SimpleNamespace(offload_keys=keys)],
+        req_context=None,
+    )
+    return OffloadingConnectorScheduler._lookup_complete_chunks(scheduler, req_status)
+
+
+def test_upstream_marks_the_mla_group_as_a_draft_group_under_mtp():
+    assert [g.is_eagle_group for g in _mtp_config().kv_group_configs] == [True]
+
+
+def test_upstream_tier_hit_loads_one_chunk_short():
+    assert _hit_tokens(_mtp_config(), 6 * CHUNK + 100, tier_chunks=6) == 5 * CHUNK
+
+
+def test_cleared_config_loads_the_whole_tier_hit():
+    config = offload_config_without_eagle_groups(_mtp_config())
+    assert _hit_tokens(config, 6 * CHUNK + 100, tier_chunks=6) == 6 * CHUNK
+
+
+def test_cleared_config_keeps_the_last_chunk_after_an_hbm_hit():
+    upstream = _hit_tokens(_mtp_config(), 9 * CHUNK + 7, tier_chunks=7, local_chunks=3)
+    cleared = _hit_tokens(
+        offload_config_without_eagle_groups(_mtp_config()),
+        9 * CHUNK + 7,
+        tier_chunks=7,
+        local_chunks=3,
+    )
+    assert (upstream, cleared) == (3 * CHUNK, 4 * CHUNK)
+
+
+def test_one_chunk_tier_hit_is_loaded_instead_of_dropped():
+    config = offload_config_without_eagle_groups(_mtp_config())
+    assert _hit_tokens(_mtp_config(), 3 * CHUNK, tier_chunks=2, local_chunks=1) == 0
+    assert _hit_tokens(config, 3 * CHUNK, tier_chunks=2, local_chunks=1) == CHUNK
+
+
+def test_cleared_config_never_loads_past_the_stored_chunks():
+    config = offload_config_without_eagle_groups(_mtp_config())
+    assert _hit_tokens(config, 10 * CHUNK + 1, tier_chunks=4) == 4 * CHUNK
+    assert _hit_tokens(config, 10 * CHUNK + 1, tier_chunks=0) == 0
+
+
+def test_cleared_config_changes_only_the_draft_marks():
+    upstream = _mtp_config()
+    cleared = offload_config_without_eagle_groups(upstream)
+    assert cleared.kv_group_configs[0] == upstream.kv_group_configs[0]._replace(
+        is_eagle_group=False
+    )
+    assert cleared._replace(kv_group_configs=()) == upstream._replace(
+        kv_group_configs=()
+    )
+
+
+def _storable_chunks(config, prompt_tokens: int, offloadable_tokens: int) -> int:
+    request = SimpleNamespace(
+        req=SimpleNamespace(num_prompt_tokens=prompt_tokens), config=config
+    )
+    return RequestOffloadState.storable_chunks(
+        request,
+        config.kv_group_configs[0],
+        SimpleNamespace(block_ids=list(range(8))),
+        offloadable_tokens,
+    )
+
+
+def test_cleared_config_stores_the_trailing_chunk_while_decoding():
+    cleared = offload_config_without_eagle_groups(_mtp_config())
+    decoding = (2 * CHUNK + 10, 3 * CHUNK + 5)
+    assert _storable_chunks(_mtp_config(), *decoding) == 2
+    assert _storable_chunks(cleared, *decoding) == 3
+
+
+def test_prefill_stores_are_the_same_either_way():
+    cleared = offload_config_without_eagle_groups(_mtp_config())
+    prefill = (6 * CHUNK + 10, 5 * CHUNK)
+    assert _storable_chunks(_mtp_config(), *prefill) == 5
+    assert _storable_chunks(cleared, *prefill) == 5
+
+
+@pytest.mark.parametrize("switch", ["0", "1"])
+def test_raiden_scheduler_clears_draft_marks_only_when_switched_on(monkeypatch, switch):
+    monkeypatch.setenv("VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP", switch)
+
+    def base_init(self, spec, vllm_config, kv_cache_config):
+        self.config = _mtp_config()
+        self.manager = object.__new__(raiden_connector.RaidenOffloadingManager)
+
+    monkeypatch.setattr(OffloadingConnectorScheduler, "__init__", base_init)
+    scheduler = raiden_connector.TPURaidenOffloadingScheduler(
+        SimpleNamespace(extra_config={}), None, None
+    )
+    marks = [g.is_eagle_group for g in scheduler.config.kv_group_configs]
+    assert marks == [switch == "0"]
+
+
+def test_switch_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP", raising=False)
+    from vllm_torchtpu import envs
+
+    assert envs.VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP is False

@@ -1673,6 +1673,20 @@ def reduce_scatter_rows(y, axis_name, rank=None, rs_table=None):
     return lax.psum_scatter(y, axis_name, scatter_dimension=0, tiled=True)
 
 
+def rotated_scatter_rows(x, rank, table, axis_name):
+    """`scatter_rows` of x [tokens, h] bf16 as one rotated_collectives
+    reduce-scatter per combine chunk on the TensorCore, with `table`
+    (peer_table "reduce_scatter") and `rank` (this core's mesh index, int32
+    [1]); the same bf16 terms, added in another order. A chunk shape the kernel
+    does not take keeps scatter_rows."""
+    chunk = x.shape[0] // token_chunks(x.shape[0])
+    if not rotated_collectives.reduce_scatter_supports(chunk, x.shape[1]):
+        return scatter_rows(x, axis_name)
+    return rotated_collectives.reduce_scatter_chunks(
+        x, rank, jnp.asarray(table), axis=axis_name, chunk=chunk
+    )
+
+
 def combine(
     slab,
     slab_row,

@@ -93,6 +93,10 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_raiden_identity_keeps_cp_interleave", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch(
+        "vllm_torchtpu.core.deferred_step:patch_engine_core_deferred_step",
+        ("platform_activation", "engine_core"),
+    ),
+    Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,
     ),
@@ -138,6 +142,14 @@ PATCHES = (
     Patch("vllm_torchtpu.detok_prime:patch_detokenizer_prime_tail", _ACTIVE),
     # API-server output detokenization (VLLM_TPU_DETOK_SUFFIX_PRIME).
     Patch("vllm_torchtpu.detokenizer_suffix:patch_detokenizer_suffix_prime", _ACTIVE),
+    # Engine-core prompt block hashing (VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS).
+    Patch("vllm_torchtpu.core.block_hash_reuse:patch_block_hash_reuse", ("engine_core",)),
+    # API-server prompt id range check (VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK).
+    Patch(
+        "vllm_torchtpu.input_range_check:patch_skip_tokenizer_id_range_check", _ACTIVE
+    ),
+    # Prompt ids sent from the API server to the engine core (VLLM_TPU_SEND_NEW_PROMPT_IDS).
+    Patch("vllm_torchtpu.core.send_new_prompt_ids:patch_send_new_prompt_ids", _ENGINE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

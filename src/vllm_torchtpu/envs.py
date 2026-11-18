@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
+    TPU_DCP_MERGE_LSE_ROW_PAIRS: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
@@ -140,6 +141,10 @@ if TYPE_CHECKING:
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
     TPU_SHORT_PREFILL_FIRST_TOKENS: int = 0
+    TPU_DEFER_STEP: bool = False
+    VLLM_TPU_FOLLOW_SHARED_PREFIX: bool = False
+    TPU_PREFIX_AWARE_SHORT_PROMPTS: str = "off"
+    TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -286,6 +291,8 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -299,7 +306,13 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
+    VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: bool = False
     VLLM_TPU_DETOK_SUFFIX_PRIME: bool = False
+    VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
+    VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR: str = ""
+    VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS: int = 0
+    VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK: bool = False
+    VLLM_TPU_SEND_NEW_PROMPT_IDS: int = 0
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = True
@@ -330,6 +343,8 @@ if TYPE_CHECKING:
     TPU_FUSED_NORM_QKVA: bool = False
     TPU_PREFILL_SEQ_PARALLEL: bool = False
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
+    TPU_PREFILL_SEQ_PARALLEL_EP: bool = False
+    TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: bool = False
     TPU_MOE_PREFILL_GATHER_ONCE: bool = False
     TPU_MOE_PREFILL_ROTATED_COLLECTIVES: bool = False
     TPU_MOE_PREFILL_COMBINE_SCATTER: bool = False
@@ -905,6 +920,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cost ~36 ms per 4096-token step). Its buckets also take merge pieces down
     # to TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS (a sliced chunk is a slow copy).
     "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
+    # The V-space merge's lse all-gather sends f32[T, 64] rows, which sit in
+    # 8 x 128 tiles with half of each row padding, so the gather moves twice
+    # its bytes. On: gather the rows in pairs side by side, [T / 2, 128]. Only
+    # the layout of the sent values changes; the merge arithmetic is the same.
+    # Migration switch: delete it, gathering row pairs whenever
+    # TPU_DCP_MERGE_VSPACE_FUSED is on, once a serving run shows it no slower
+    # at every prefill size.
+    "TPU_DCP_MERGE_LSE_ROW_PAIRS": env_bool("TPU_DCP_MERGE_LSE_ROW_PAIRS"),
     # Where W_UV is replicated over the DCP group (TPU_DCP_MLA_UV_BEFORE_MERGE),
     # replicate o_proj too, so the backbone buckets that apply W_UV before the
     # merge (TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) and would reduce-scatter
@@ -1480,6 +1503,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # running prefill chunks (core/short_prefill_first_scheduler.py); 0 is off.
     "TPU_SHORT_PREFILL_FIRST_TOKENS": env_nonnegative_int(
         "TPU_SHORT_PREFILL_FIRST_TOKENS", 0
+    ),
+    # Behind a step in flight with prefill tokens, choose the next step shortly
+    # before that step is expected to end instead of at its start
+    # (core/deferred_step.py).
+    "TPU_DEFER_STEP": env_bool("TPU_DEFER_STEP"),
+    # PrefixAwareScheduler: a running prefill whose next chunk another request
+    # has already cached waits instead of computing it, then takes the cached
+    # tokens (core/prefix_aware_scheduler.py). Exact; off computes every chunk.
+    "VLLM_TPU_FOLLOW_SHARED_PREFIX": env_bool("VLLM_TPU_FOLLOW_SHARED_PREFIX"),
+    # PrefixAwareScheduler serves short prompts beside running longer
+    # prefills (core/prefix_aware_scheduler.py, _short_prompt_limit says
+    # which prompts are short).
+    # A tradeoff: short prompts reach their first token sooner, and a second
+    # running long prefill gets fewer tokens per step. "off" schedules as
+    # before; "first" serves short prompts first; "first-short-step" also
+    # starts them in a smaller step, the smallest compiled size that holds one
+    # chunk, where the oldest long prefill gets fewer tokens too.
+    "TPU_PREFIX_AWARE_SHORT_PROMPTS": env_with_choices(
+        "TPU_PREFIX_AWARE_SHORT_PROMPTS", "off", ["off", "first", "first-short-step"]
+    ),
+    # PrefixAwareScheduler: a waiting prompt whose first uncached block a
+    # running prefill is still computing waits until that block is cached
+    # (core/prefix_aware_scheduler.py). A tradeoff: the held prompt is
+    # admitted later and computes no prefix its sibling computes. Exact; off
+    # admits it at once.
+    "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX": env_bool(
+        "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX"
     ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
@@ -2126,6 +2176,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
         "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
     ),
+    # KV offloading: keep the trailing chunk of a tier hit that EAGLE/MTP
+    # normally drops on every lookup. Host-only.
+    "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP": env_bool(
+        "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP", default=False
+    ),
+    # Lazy KV offloading: also store a partly filled cached HBM block under
+    # the hash of its valid tokens, and load it as a request's partial tail.
+    # Needs VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP. Host-only.
+    "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS": env_bool(
+        "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS", default=False
+    ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),
@@ -2172,10 +2233,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
     "VLLM_TPU_DETOK_PRIME_TOKENS": env_int("VLLM_TPU_DETOK_PRIME_TOKENS", 32),
+    # Encode that cache's missed pieces with fastokens, which reads the same
+    # tokenizer file and returns the same ids, instead of the HF batch encode.
+    "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS": env_bool(
+        "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS"
+    ),
     # API server: prime each request's output detokenizer with the prompt's
     # last 4-24 tokens instead of the whole prompt (detokenizer_suffix.py).
     # Exact; a prompt that ends inside a character keeps the full prime.
     "VLLM_TPU_DETOK_SUFFIX_PRIME": env_bool("VLLM_TPU_DETOK_SUFFIX_PRIME"),
+    # Recent prompts whose ids a new prompt reuses up to the last added token
+    # they share (segment_tokenize.py). 0 keeps no prompts: every prompt is
+    # split and looked up piece by piece.
+    "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_int(
+        "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
+    ),
+    # Directory (e.g. /dev/shm/vllm-tpu-pieces) where every API server process
+    # of the container shares the segment tokenizer's encoded pieces, so a turn
+    # served by another process than its session's previous turn reuses the
+    # history's ids. Empty: each process keeps its own cache only.
+    "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR": lambda: os.getenv(
+        "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", ""
+    ),
+    # Engine core: the number of recent prompts whose block hashes a new prompt
+    # reuses for the blocks it shares with them (core/block_hash_reuse.py).
+    # Exact; 0 keeps none and hashes every block.
+    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS": env_int("VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS", 0),
+    # API server: prompt ids the server's own tokenizer made skip the max/min
+    # scan that checks each lies in the vocabulary (input_range_check.py).
+    # Exact; prompts sent as ids keep the check.
+    "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK": env_bool(
+        "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK"
+    ),
+    # API server and engine core: the number of recent prompts both keep, so a
+    # request carries only the ids after those it shares with one of them
+    # (core/send_new_prompt_ids.py). Exact; 0 keeps none and sends every id.
+    "VLLM_TPU_SEND_NEW_PROMPT_IDS": env_int("VLLM_TPU_SEND_NEW_PROMPT_IDS", 0),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
@@ -2406,6 +2499,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFILL_SEQ_PARALLEL": env_bool("TPU_PREFILL_SEQ_PARALLEL"),
     "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS": env_int(
         "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS", 256
+    ),
+    # TPU_PREFILL_SEQ_PARALLEL with expert-parallel MoE layers
+    # (--enable-expert-parallel, no stage-A prefill kernel): the split also
+    # arms on them. Each core routes its own rows, all-gathers the rows and
+    # their routes, runs the layer's EP experts and its slice of the shared
+    # expert on every row as today, and reduce-scatters the sum instead of
+    # all-reducing it, so the residual stream stays split across the layer.
+    # Same terms in every sum; the reduce-scatter may add them in another order.
+    # Migration switch: delete it, arming EP layers whenever
+    # TPU_PREFILL_SEQ_PARALLEL is on, once an EP model's serving run shows the
+    # split no slower at every prefill size.
+    "TPU_PREFILL_SEQ_PARALLEL_EP": env_bool("TPU_PREFILL_SEQ_PARALLEL_EP"),
+    # TPU_PREFILL_SEQ_PARALLEL_EP on a 2x2x2 slice of 2-core chips: the split
+    # EP MoE op's reduce-scatter runs as the rotated halving-doubling kernel
+    # (kernels/experimental/rotated_collectives.py) on the TensorCores, one
+    # kernel per combine chunk, instead of XLA's reduce-scatter. Same rows on
+    # each core; the bf16 sums may add their terms in another order. Other
+    # meshes log a warning and keep XLA's. Migration switch: delete it, taking
+    # the rotated kernel on every 2x2x2 slice, with TPU_PREFILL_SEQ_PARALLEL_EP.
+    "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER": env_bool(
+        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER"
     ),
     # TPU_PREFILL_SEQ_PARALLEL: the split MoE op all-gathers each core's rows
     # once, in core order, instead of once per combine chunk: the routes, their

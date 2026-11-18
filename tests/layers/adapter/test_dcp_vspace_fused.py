@@ -144,3 +144,107 @@ def test_vspace_operand_kernel_matches_reference(scaled):
         )
     ).astype(np.float32)
     np.testing.assert_allclose(bf, got, rtol=1e-2, atol=1e-3)
+
+
+class _ReplayGroup:
+    """Records each rank's all-gather shards on a first pass over the ranks,
+    returns every rank's recorded shards on a second; reduce_scatter returns
+    this rank's operand unreduced."""
+
+    def __init__(self, rank, shards, replay):
+        self.world_size, self.rank = D, rank
+        self.shards, self.replay, self.calls = shards, replay, 0
+
+    def all_gather(self, tensor, dim=0):
+        call, self.calls = self.calls, self.calls + 1
+        if not self.replay:
+            self.shards.setdefault(call, {})[self.rank] = tensor.clone()
+            return torch.cat([tensor] * D, dim=dim)
+        return torch.cat([self.shards[call][r] for r in range(D)], dim=dim)
+
+    def reduce_scatter(self, tensor, dim=0):
+        return tensor
+
+
+def _operands(monkeypatch, row_pairs, merge, rows, roll=False):
+    """Every rank's V-space reduce-scatter operand and the gathered shards."""
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_MERGE_LSE_ROW_PAIRS", row_pairs, raising=False
+    )
+    g = torch.Generator().manual_seed(rows)
+    lses = torch.randn(D, rows, H, generator=g) * 3 + 4
+    lses[torch.rand(D, rows, H, generator=g) < 0.08] = float("-inf")
+    outputs = torch.randn(D, rows, H, C, generator=g).to(torch.bfloat16)
+    vspace = (torch.randn(H, C, V, generator=g).to(torch.bfloat16), None)
+    shards: dict = {}
+    for rank in range(D):
+        merge(
+            outputs[rank],
+            lses[rank],
+            _ReplayGroup(rank, shards, False),
+            2,
+            None,
+            vspace=vspace,
+        )
+    if roll:
+        # Positive control: every shard's rows moved by one.
+        shards = {
+            k: {r: torch.roll(x, 1, dims=1) for r, x in v.items()}
+            for k, v in shards.items()
+        }
+    got = [
+        merge(
+            outputs[r], lses[r], _ReplayGroup(r, shards, True), 2, None, vspace=vspace
+        )
+        for r in range(D)
+    ]
+    return got, sorted({tuple(v[0].shape) for v in shards.values()})
+
+
+@pytest.mark.parametrize(
+    "path, pieces",
+    [("per_chunk", 0), ("gathered_once", 0), ("gathered_once", 2)],
+)
+def test_row_paired_lse_gather_gives_the_row_major_operand_bit_for_bit(
+    monkeypatch, path, pieces
+):
+    merge = {
+        "per_chunk": cp_mla._merge_chunked,
+        "gathered_once": cp_mla._merge_chunked_lse_gathered,
+    }[path]
+    for k, val in {
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
+        "TPU_DCP_MLA_MERGE_PIECES": pieces,
+        "TPU_DCP_MERGE_RS_BF16": 1,
+    }.items():
+        monkeypatch.setattr(cp_mla.envs, k, val, raising=False)
+    rows = 32
+    want, want_shards = _operands(monkeypatch, False, merge, rows)
+    got, shards = _operands(monkeypatch, True, merge, rows)
+    assert all(s[-1] == H for s in want_shards)
+    assert all(s[-1] == 2 * H for s in shards)  # [1, rows / 2, 2H]: no padded lane
+    for a, b in zip(want, got):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+    rolled, _ = _operands(monkeypatch, True, merge, rows, roll=True)
+    assert not torch.equal(want[0].float(), rolled[0].float())
+
+
+def test_row_paired_lse_gather_needs_an_even_row_count():
+    group = _ReplayGroup(0, {}, False)
+    with pytest.raises(NotImplementedError, match="even row count"):
+        cp_mla._gather_lse_row_pairs(torch.zeros(7, H), group)
+
+
+class _TwoRankEchoGroup:
+    def all_gather(self, x, dim=0):
+        return torch.cat([x, x + 1], dim=dim)
+
+
+def test_row_paired_lse_gather_compiles_with_a_symbolic_row_count():
+    def gather(lse):
+        return cp_mla._gather_lse_row_pairs(lse, _TwoRankEchoGroup())
+
+    compiled = torch.compile(gather, fullgraph=True, dynamic=True, backend="eager")
+    for rows in (8, 12):
+        lse = torch.randn(rows, H)
+        torch.testing.assert_close(compiled(lse), gather(lse))
