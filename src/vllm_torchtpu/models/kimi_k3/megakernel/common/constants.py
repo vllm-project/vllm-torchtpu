@@ -18,6 +18,7 @@ from __future__ import annotations
 MIB_BYTES: int = 1 << 20
 GIB_BYTES: int = 1 << 30
 SUBLANE_ROWS: int = 8
+VREG_LANE_COUNT: int = 128
 
 AXIS_TP: str = "tp"
 TP_SIZE: int = 32
@@ -30,6 +31,12 @@ HEAD_DIM: int = 128
 KDA_HEADS: int = 3
 CONV_TAPS: int = 3
 CONV_HEAD_ROWS: int = 4
+ROUTED_EXPERTS: int = 384
+ROUTED_EXPERTS_PER_TOKEN: int = 8
+
+OVERFLOW_WINDOW_TOKENS: int = 8192
+STORE_TILE: int = 128
+PREFILL_WINDOWS: tuple[int, ...] = (512, 1024, 2048, 4096, 8192)
 
 __all__ = [
     "AXIS_TP",
@@ -42,7 +49,13 @@ __all__ = [
     "KDA_HEADS",
     "MIB_BYTES",
     "NUM_LAYERS",
+    "OVERFLOW_WINDOW_TOKENS",
+    "PREFILL_WINDOWS",
+    "ROUTED_EXPERTS",
+    "ROUTED_EXPERTS_PER_TOKEN",
+    "STORE_TILE",
     "SUBLANE_ROWS",
     "TP_PEERS",
     "TP_SIZE",
+    "VREG_LANE_COUNT",
 ]

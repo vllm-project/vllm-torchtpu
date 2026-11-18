@@ -465,8 +465,8 @@ class PrefillProgram:
                 (rec, hist, rec_at, hist_at),
                 (latents,),
                 length,
-                segment_desc=segments,
-                arena=arena,
+                segments,
+                arena,
             )
             return (prefix, blocks, *kda_state, *mla_state, tap)
 
@@ -513,8 +513,8 @@ class PrefillProgram:
                 (latents,),
                 length,
                 pair,
-                segment_desc=segments,
-                arena=arena,
+                segments,
+                arena,
             )
             return (prefix, blocks, *kda_state, *mla_state, middle, tap)
 
@@ -544,8 +544,8 @@ class PrefillProgram:
                 w["moe"],
                 (latents,),
                 length,
-                segment_desc=segments,
-                arena=arena,
+                segments,
+                arena,
             )
             logits = logits_op(
                 prefix,
