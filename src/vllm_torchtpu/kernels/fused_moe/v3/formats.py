@@ -39,8 +39,7 @@ class WeightFormat(str, enum.Enum):
 class WeightForm(NamedTuple):
     """A weight format: the element type of the expert weights, and the
     layout of the scales the caller supplies: one f32 per output channel
-    ("per_channel"), or none for unscaled bf16 weights. Config selects the
-    result row format within the supported weight formats."""
+    ("per_channel"), or none for unscaled bf16 weights."""
 
     name: WeightFormat
     weight_dtype: jax.typing.DTypeLike
