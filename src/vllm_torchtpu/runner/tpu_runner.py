@@ -5512,7 +5512,13 @@ class TPUModelRunner(GPUModelRunner):
             )
         else:
             input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(self.device)
-            actual_num_reqs = min(num_tokens, num_reqs)
+            # Warmup and idle DP ranks own no request: every row is padding,
+            # as the padding state below records. Their zero block tables
+            # point at block 0, the null page of every cache group; under
+            # block-outer packing layers of different dtypes share it, so a
+            # dummy KV write there reads back as nonfinite values in other
+            # layers. Empty requests read and write no cache rows.
+            actual_num_reqs = 0
         inputs_embeds = None
         if self.uses_mrope:
             position_ids = torch.zeros((3, num_tokens), dtype=torch.int32).to(
@@ -5520,24 +5526,21 @@ class TPUModelRunner(GPUModelRunner):
             )
         else:
             position_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
-        if profiling:
-            query_lens = profile_query_lens + [0] * (num_reqs - actual_num_reqs)
-        else:
-            query_lens = [1] * actual_num_reqs + [0] * (num_reqs - actual_num_reqs)
+        query_lens = profile_query_lens + [0] * (num_reqs - actual_num_reqs)
         query_start_loc = torch.cumsum(
             torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
         ).to(self.device)
-        seq_lens_cpu = torch.ones((num_reqs,), dtype=torch.int32)
+        seq_lens_cpu = torch.full((num_reqs,), int(profiling), dtype=torch.int32)
         if profiling:
             for i, q in enumerate(profile_query_lens):
                 seq_lens_cpu[i] = q
             seq_lens_cpu[0] += profile_prefix
         seq_lens = seq_lens_cpu.to(self.device)
         # V3: request_distribution = [decode_end, prefill_end, mixed_end].
-        # Dummy runs use one scheduled token per active request, so model
-        # them as pure decode to match the real single-chip path; a profile
-        # run holds mixed requests, as a real prefill chunk does.
-        distribution = [0, 0, actual_num_reqs] if profiling else [actual_num_reqs] * 3
+        # A profile run holds mixed requests, as a real prefill chunk does; a
+        # warmup or idle run has none. Values only: the tensor shapes, and so
+        # the compiled programs, are those of a serving step.
+        distribution = [0, 0, actual_num_reqs]
         request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
             self.device
         )
