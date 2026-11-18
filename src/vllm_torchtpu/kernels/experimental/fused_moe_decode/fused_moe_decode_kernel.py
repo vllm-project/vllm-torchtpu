@@ -121,6 +121,8 @@ def _kernel(
     rows=None,
     ib=None,
     folded=False,
+    exact_width=False,
+    valid_rows=False,
 ):
     """One rank's MoE block. Shapes use m tokens (padded to 16), h hidden, i
     and i_s the routed and shared intermediate sizes of this rank's slice, E
@@ -173,9 +175,20 @@ def _kernel(
       shared_sem DMA [4]: shared expert transfers.
       a2a_send DMA [n], a2a_recv DMA: all-to-all.
       ag_send DMA [n], ag_recv DMA: all-gather.
+
+    valid_rows (static, folded only): rank_ref[0, 2] is the count n of real
+    rows; rows from n on read as zero hidden states, whatever x_ref holds
+    there. The caller zeroes their coefficients and gives them a finite gate.
+
+    exact_width (static, TP all-reduce output only): the all-to-all and the
+    all-gather split h's lane tiles over the ranks as evenly as whole tiles
+    allow, so out_ref is [m, h] and no rank sends padding.
     """
     nblk = 1 if ib is None else i // ib
     me = rank_ref[0, 0] if folded else rank_ref[0]
+    keep = None
+    if valid_rows:
+        keep = lax.broadcasted_iota(jnp.int32, (m, 1), 0) < rank_ref[0, 2]
     qmax = float(jnp.finfo(weight_dtype).max)
     # Column chunk each rank reduces: h padded to n_ranks lanes of 128, so every
     # chunk is lane aligned (Qwen3.8-Flash: h 2560 over 8 ranks pads to 3072).
@@ -213,6 +226,8 @@ def _kernel(
     # plane (as in moe_dense_expert.py); K between tokens and lanes relayouts.
     for k in range(0, h, _Q_BLOCK):
         x = x_ref[:, k : k + _Q_BLOCK].astype(jnp.float32)
+        if keep is not None:
+            x = jnp.where(keep, x, 0.0)
         xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / qmax
         xq_ref[:, k : k + _Q_BLOCK] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(
             weight_dtype
@@ -348,9 +363,15 @@ def _kernel(
                 shared_w2_vmem[:, n : n + _N_CHUNK],
                 preferred_element_type=jnp.float32,
             )
-            acc_ref[:, n : n + _N_CHUNK] += (
-                down.astype(x_ref.dtype).astype(jnp.float32) * coeff
-            )
+            if keep is None:
+                acc_ref[:, n : n + _N_CHUNK] += (
+                    down.astype(x_ref.dtype).astype(jnp.float32) * coeff
+                )
+            else:
+                # A zero row's term is a signed zero, and acc holds +0 there
+                # (the shared expert adds first), so +0 is the same sum.
+                term = down.astype(x_ref.dtype).astype(jnp.float32) * coeff
+                acc_ref[:, n : n + _N_CHUNK] += jnp.where(keep, term, 0.0)
 
     # Prime the weight ring: start the weight transfers of the first
     # min(units, nb) ring units (active experts, or their blocks) into slots
@@ -464,6 +485,65 @@ def _kernel(
     # TP attention, all-reduce: all-to-all + local sum over column chunks (rank
     # d keeps columns [d * chunk, (d + 1) * chunk) of every token), then an
     # all-gather of the reduced chunks.
+    if exact_width and h // 128 >= n_ranks:
+        # Balanced ownership of the h // 128 lane tiles: rank r keeps
+        # tiles(r) = base + (r < extra) tiles from tile r * base + min(r, extra)
+        # (Qwen3.8-Flash: 3, 3, 3, 3, 2, 2, 2, 2 tiles of 128), the same columns
+        # in the all-to-all and the all-gather, so every pair exchanges the
+        # owner's width and no rank sends padding. The receiver sums its slots
+        # in rank order whichever rank owns a column, as the padded split does.
+        base, extra = divmod(h // 128, n_ranks)
+        widths = [128 * (base + (r < extra)) for r in range(n_ranks)]
+        starts = [128 * (r * base + min(r, extra)) for r in range(n_ranks)]
+        acc_bf16[:, :h] = acc_ref[...].astype(acc_bf16.dtype)
+        # Every peer has entered the call, so its receive buffer is live.
+        pl.semaphore_wait(barrier, n_ranks)
+        scatter = [
+            pltpu.make_async_remote_copy(
+                acc_bf16.at[:, pl.ds(starts[d], widths[d])],
+                recv.at[me, :, pl.ds(0, widths[d])],
+                a2a_send.at[d],
+                a2a_recv,
+                device_id=(jnp.int32(d),),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            for d in range(n_ranks)
+        ]
+        for copy in scatter:
+            copy.start()
+        for owner in range(n_ranks):
+            width = widths[owner]
+
+            @pl.when(me == owner)
+            def reduce_and_gather(*, owner=owner, width=width):
+                # The receive wait counts the n slots of this rank's width.
+                received = recv.at[:, :, pl.ds(0, width)]
+                pltpu.make_async_copy(received, received, a2a_recv).wait()
+                acc = recv[0, :, :width].astype(jnp.float32)
+                for s in range(1, n_ranks):
+                    acc = acc + recv[s, :, :width].astype(jnp.float32)
+                red[:, :width] = acc.astype(red.dtype)
+                gather = [
+                    pltpu.make_async_remote_copy(
+                        red.at[:, pl.ds(0, width)],
+                        out_ref.at[:, pl.ds(starts[owner], width)],
+                        ag_send.at[d],
+                        ag_recv,
+                        device_id=(jnp.int32(d),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    for d in range(n_ranks)
+                ]
+                for copy in gather:
+                    copy.start()
+                # out_ref is [m, h]; the owners' widths sum to h.
+                pltpu.make_async_copy(out_ref, out_ref, ag_recv).wait()
+                for copy in gather:
+                    copy.wait_send()
+
+        for copy in scatter:
+            copy.wait_send()
+        return
     if hp != h:
         acc_bf16[:, h:] = jnp.zeros((m, hp - h), acc_bf16.dtype)
         acc_bf16[:, :h] = acc_ref[...].astype(acc_bf16.dtype)
@@ -516,13 +596,17 @@ def _folded_kernel(
     expert_parallel,
     routed_scale,
     gate,
+    valid_rows=False,
     **kwargs,
 ):
     """_kernel behind the routing prologue the unfolded call runs in XLA, so
     the call takes the router's outputs and the hidden states as they are.
 
     Scalar prefetch: rank_ref [1, 1 or 2] int32: this rank's mesh index and,
-    with expert parallelism, its first expert's global id.
+    with expert parallelism, its first expert's global id. With valid_rows,
+    [1, 3]: then rank_ref[0, 2] is the count n of real rows, and every row from
+    n on enters as the unfolded call's padded rows do: zero hidden states and
+    zero route weights, whatever x_ref, tw_ref and ti_ref hold there.
     Inputs in VMEM: x_ref [tokens, h] bf16; tw_ref [tokens, k] route weights
     (any float dtype); ti_ref [tokens, k] int32 global expert ids; then, by
     `gate`: "xla" gate_ref [tokens, 1] f32 = sigmoid(x . w_g) computed by the
@@ -563,6 +647,12 @@ def _folded_kernel(
     if expert_parallel:
         ids = ids - rank_ref[0, 1]
     w = tw_ref[...].astype(x_ref.dtype).astype(f32)
+    # With valid_rows, which of the m rows are real.
+    keep = None
+    if valid_rows:
+        n_valid = rank_ref[0, 2]
+        keep = lax.broadcasted_iota(jnp.int32, (m, 1), 0) < n_valid
+        w = jnp.where(lax.broadcasted_iota(jnp.int32, (tokens, 1), 0) < n_valid, w, 0.0)
     if routed_scale != 1.0:
         w = w * f32(routed_scale)
     coeff = jnp.zeros((tokens, epad), f32)
@@ -605,6 +695,10 @@ def _folded_kernel(
                 preferred_element_type=f32,
             )
         )
+    if keep is not None and gate is not None:
+        # sigmoid(0), the gate of a zero row. Any finite positive gate gives
+        # the same output: the row's shared expert output is a signed zero.
+        g = jnp.where(keep, g, 0.5)
     shared_gate_ref[...] = jnp.broadcast_to(g, (m, 128))
 
     cast(Any, _kernel)(
@@ -619,6 +713,7 @@ def _folded_kernel(
         m=m,
         experts=experts,
         folded=True,
+        valid_rows=valid_rows,
         **kwargs,
     )
 
@@ -747,6 +842,8 @@ def fused_moe_decode(
     interpret=False,
     fold=False,
     gate_in_kernel=False,
+    exact_width=False,
+    valid_rows=False,
 ):
     """Per-rank body; call inside shard_map over the TP mesh.
 
@@ -806,6 +903,17 @@ def fused_moe_decode(
       gate_in_kernel: with fold, also compute sigmoid(hidden . w_g) inside
         the kernel (its bitwise match to XLA's dot is checked by test, not
         guaranteed by construction).
+      exact_width: TP all-reduce only: the exchange splits H's lane tiles over
+        the ranks as evenly as whole tiles allow (no rank sends padding, the
+        same columns in the all-to-all and the all-gather) and the output is
+        [m, H] instead of [m, H padded to n_ranks lanes of 128] sliced
+        afterwards. Bitwise the same values. Needs H // 128 >= n_ranks;
+        smaller H keeps the padded split.
+      valid_rows: FUSED_MOE_DECODE_KERNEL_PADDING_MASK, needs fold. `rank` is
+        [1, 3] and rank[0, 2] the count n of real rows: rows from n on are
+        computed as zero hidden states with zero route weights, so the caller
+        passes them unmasked (they may hold any bits, NaN included) and the
+        output is bitwise the output for the masked inputs.
 
     The weights' dtype (FP8 in production) is also the dtype the kernel
     quantizes the hidden states and the activated intermediate to (one scale
@@ -827,6 +935,8 @@ def fused_moe_decode(
     active: Any = None
     coeff: Any = None
     shared_gate: Any = None
+    if valid_rows and not fold:
+        raise ValueError("valid_rows needs fold")
     if fold:
         expert_parallel = expert_start is not None
         if rows is not None:
@@ -835,6 +945,8 @@ def fused_moe_decode(
             raise ValueError('fold with expert parallelism needs expert_start="rank"')
         if rank.ndim != 2 or rank.shape[1] < 1 + expert_parallel:
             raise ValueError(f"fold needs rank [1, 1 or 2]: {rank.shape}")
+        if valid_rows and rank.shape[1] != 3:
+            raise ValueError(f"valid_rows needs rank [1, 3]: {rank.shape}")
         gate, gate_operands = None, []
         if shared_gate_weight is not None and gate_in_kernel:
             gate, gate_operands = "kernel", [shared_gate_weight]
@@ -869,7 +981,8 @@ def fused_moe_decode(
     chunk = hp // n_ranks
     out_cols = h
     if rows is None:
-        out_rows, wire, out_cols = m, hidden.dtype, hp
+        exact_width = exact_width and h // 128 >= n_ranks
+        out_rows, wire, out_cols = m, hidden.dtype, h if exact_width else hp
         acc_bf16_shape, recv_shape, red_shape = (
             (m, hp),
             (n_ranks, m, chunk),
@@ -926,6 +1039,8 @@ def fused_moe_decode(
         rows=rows,
         ib=ib,
     )
+    if exact_width and rows is None:
+        kernel_kwargs["exact_width"] = True
     if fold:
         scratch_shapes += [
             pltpu.VMEM((m, experts + (-experts) % 128), jnp.float32),
@@ -939,6 +1054,7 @@ def fused_moe_decode(
             expert_parallel=expert_parallel,
             routed_scale=routed_scale,
             gate=gate,
+            valid_rows=valid_rows,
             **kernel_kwargs,
         )
         num_scalar_prefetch = 1
@@ -971,12 +1087,13 @@ def fused_moe_decode(
         name=f"fused_moe_decode{'_rs' if rows else ''}{'_fold' if fold else ''}"
         f"-e_{experts}-m_{m}-h_{h}"
         f"-i_{i}-is_{i_s}{'' if shared_w1.dtype == weight_dtype else '_bf16'}"
-        f"-n_{n_ranks}-buffers_{nb}{f'-ib_{ib}' if ib else ''}",
+        f"-n_{n_ranks}-buffers_{nb}{f'-ib_{ib}' if ib else ''}"
+        f"{'-vr' if valid_rows else ''}",
         interpret=pltpu.InterpretParams() if interpret else False,
     )(*operands)
     if rows is not None:
         return out[:rows].astype(hidden.dtype)
-    if hp != h:
+    if hp != h and not exact_width:
         out = out[:, :h]
     return out[:tokens] if pad else out
 

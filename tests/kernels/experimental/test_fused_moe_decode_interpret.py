@@ -228,3 +228,85 @@ def test_folded_prologue_is_bitwise_the_unfolded_call(mesh, monkeypatch, tokens)
         for fold in (False, True)
     ]
     np.testing.assert_array_equal(outs[1], outs[0])
+
+
+@pytest.mark.parametrize("fold", [False, True])
+@pytest.mark.parametrize("h", [H, 2560])
+def test_exact_width_is_bitwise_the_sliced_output(mesh, monkeypatch, fold, h):
+    """exact_width=True (lane tiles split evenly over the ranks in both halves of
+    the exchange, output [m, h]) equals the padded split sliced to h byte for
+    byte. H = 1536: 12 tiles as 2, 2, 2, 2, 1, 1, 1, 1; 2560 (Qwen3.8-Flash):
+    20 tiles as 3, 3, 3, 3, 2, 2, 2, 2."""
+    monkeypatch.setattr(kmod, "_vmem_capacity", lambda: 64 << 20)
+    rng = np.random.default_rng(7)
+    w1, w1_s = _q(rng.normal(size=(N, E, h, 2 * INTER)) * 0.02, 2)
+    w2, w2_s = _q(rng.normal(size=(N, E, INTER, h)) * 0.02, 2)
+    psw1 = jnp.asarray(rng.normal(size=(N, h, 2 * INTER_S_PAD)) * 0.02, jnp.bfloat16)
+    psw2 = jnp.asarray(rng.normal(size=(N, INTER_S_PAD, h)) * 0.02, jnp.bfloat16)
+    gate_row = jnp.asarray(rng.normal(size=(1, h)) * 0.02, jnp.bfloat16)
+    x = jnp.asarray(rng.normal(size=(M, h)), jnp.bfloat16)
+    ids = jnp.asarray(
+        np.stack([rng.choice(N * E, TOPK, replace=False) for _ in range(M)]),
+        jnp.int32,
+    )
+    tw = jnp.asarray(rng.dirichlet(np.ones(TOPK), size=M), jnp.bfloat16)
+    sh, rep = NamedSharding(mesh, P("d")), NamedSharding(mesh, P())
+
+    def body(exact, rank, w1, w2, w1_s, w2_s, sw1, sw2, x, gate_row, tw, ids):
+        common = (x, w1[0], w2[0], w1_s[0][:, :, None, :], w2_s[0][:, :, None, :])
+        if fold:
+            return kmod.fused_moe_decode(
+                rank,
+                *common,
+                sw1[0],
+                jnp.ones((2 * INTER_S_PAD,), jnp.float32),
+                sw2[0],
+                jnp.ones((h,), jnp.float32),
+                gate_row,
+                tw,
+                ids,
+                n_ranks=N,
+                expert_start="rank",
+                fold=True,
+                interpret=True,
+                exact_width=exact,
+            )[None]
+        return kmod.fused_moe_decode(
+            rank[0, :1],
+            *common,
+            sw1[0],
+            jnp.ones((1, 2 * INTER_S_PAD), jnp.float32),
+            sw2[0],
+            jnp.ones((1, h), jnp.float32),
+            gate_row.reshape(-1, 1),
+            tw,
+            ids,
+            n_ranks=N,
+            expert_start=rank[0, 1],
+            interpret=True,
+            exact_width=exact,
+        )[None]
+
+    rank = np.stack([np.arange(N), np.arange(N) * E], 1).astype(np.int32)
+    args = [
+        jax.device_put(rank, sh),
+        *(jax.device_put(a, sh) for a in (w1, w2, w1_s, w2_s, psw1, psw2)),
+        *(jax.device_put(a, rep) for a in (x, gate_row, tw, ids)),
+    ]
+    outs = [
+        np.asarray(
+            jax.jit(
+                jax.shard_map(
+                    functools.partial(body, exact),
+                    mesh=mesh,
+                    in_specs=(P("d"),) * 7 + (P(),) * 4,
+                    out_specs=P("d"),
+                    check_vma=False,
+                )
+            )(*args).view(jnp.uint16)
+        )
+        for exact in (False, True)
+    ]
+    assert outs[0].shape == outs[1].shape == (N, M, h)
+    assert np.any(outs[0] != 0)
+    np.testing.assert_array_equal(outs[1], outs[0])

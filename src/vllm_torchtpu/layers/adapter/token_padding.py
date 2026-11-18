@@ -35,6 +35,13 @@ class TokenPaddingState:
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
+        # FUSED_MOE_DECODE_KERNEL_PADDING_MASK: one row past the largest token
+        # bucket. Slicing the mask by the token count bounds that count by the
+        # mask's length in the trace; a length equal to the largest bucket B,
+        # next to a ``tokens >= B`` gate, pins the trace at B to the constant B
+        # (compilation/shape_variants.py).
+        if envs.FUSED_MOE_DECODE_KERNEL_PADDING_MASK:
+            max_local_tokens += 1
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
@@ -147,6 +154,15 @@ def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
     """
     if _padding_state is not None:
         _padding_state.update(num_valid_tokens, num_padded_tokens)
+
+
+def local_valid_count(num_tokens: int) -> torch.Tensor:
+    """The rows before this rank's padding among its first `num_tokens`, as
+    int32 [1]: the mask marks a suffix of the rows (TokenPaddingState.update).
+    Needs a padding state (FUSED_MOE_DECODE_KERNEL_PADDING_MASK)."""
+    assert _padding_state is not None, "local_valid_count needs a padding state"
+    padding = _padding_state.get_local_padding_mask(num_tokens)
+    return (num_tokens - padding.sum(dtype=torch.int32)).reshape(1)
 
 
 def zero_routing_weights_for_padding(

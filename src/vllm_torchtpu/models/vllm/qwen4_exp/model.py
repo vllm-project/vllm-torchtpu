@@ -480,7 +480,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             valid_tokens = sp.shard(valid_tokens[:, None])[:, 0]
         if sp_pad:
             block = sp.unpad(block, rows)
-        block = torch.where(valid_tokens[:, None], block, 0)
+        from vllm_torchtpu.layers.adapter.fused_moe_decode import kernel_masks_padding
+
+        # FUSED_MOE_DECODE_KERNEL_PADDING_MASK: the armed MoE op zeroes the
+        # rows past the padding mask's real-row count itself.
+        if sequence_parallel or not kernel_masks_padding(self.mlp):
+            block = torch.where(valid_tokens[:, None], block, 0)
         if sequence_parallel:
             moe = self._sequence_parallel_moe(block, num_tokens)
         else:
