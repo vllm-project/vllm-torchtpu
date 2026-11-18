@@ -20,9 +20,10 @@ program, so the section stays out of the compile-cache key
 (``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``). Parse once at init with :func:`get`.
 """
 
-import dataclasses
 from dataclasses import dataclass
 from typing import Any
+
+from vllm_torchtpu import config_section
 
 SECTION = "tpu_runner"
 
@@ -44,35 +45,11 @@ def parse(raw: Any) -> RunnerOptions:
     """The ``tpu_runner`` section as options; None gives the defaults.
 
     Strict: an unknown key, or a value whose type is not exactly the field's
-    (``1`` for a bool, say), raises ``ValueError``.
+    (``1`` for a bool, say), raises ``ValueError`` (``config_section.parse``).
     """
-    if raw is None:
-        return RunnerOptions()
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"additional_config.{SECTION} must be a JSON object, "
-            f"got {type(raw).__name__}"
-        )
-    fields = {f.name: f.type for f in dataclasses.fields(RunnerOptions)}
-    unknown = sorted(set(raw) - set(fields))
-    if unknown:
-        raise ValueError(
-            f"additional_config.{SECTION} has unknown keys {unknown}; "
-            f"valid keys: {sorted(fields)}"
-        )
-    for name, value in raw.items():
-        expected = fields[name]
-        if type(value) is not expected:
-            kind = expected.__name__ if isinstance(expected, type) else expected
-            raise ValueError(
-                f"additional_config.{SECTION}.{name} must be a {kind}, got {value!r}"
-            )
-    return RunnerOptions(**raw)
+    return config_section.parse(RunnerOptions, SECTION, raw)
 
 
 def get(vllm_config: Any) -> RunnerOptions:
     """The engine's runner options."""
-    additional = getattr(vllm_config, "additional_config", None)
-    if not isinstance(additional, dict):
-        return RunnerOptions()
-    return parse(additional.get(SECTION))
+    return config_section.get(RunnerOptions, SECTION, vllm_config)
