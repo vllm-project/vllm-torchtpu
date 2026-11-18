@@ -11,20 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Undefined bytes past a sequence's cached tokens must not reach the output.
+"""Undefined bytes past a sequence's valid tokens must not reach the output.
 
-Under SEQ_ALONG_LANE the kernel DMAs whole pages, so the tail of the last
-cache page (and any page it never wrote) lands in VMEM. Those bytes are
-undefined: with the unified hybrid block pool they are recycled Mamba state,
-which often decodes as an fp8 NaN. Score masking alone cannot neutralize them
-because 0 * NaN = NaN in the P @ V matmul, so the stitch must zero them.
+Under SEQ_ALONG_LANE the kernel DMAs whole 128-token columns, so the tail of
+the last cache page lands in VMEM, and the new tokens' aligned fetch brings in
+the rows next to them, which can be rows that pad the bucket. Those bytes are
+undefined: with the unified hybrid block pool a page tail can be recycled
+Mamba state, which often decodes as an fp8 NaN. Score masking alone cannot
+neutralize them because 0 * NaN = NaN in the P @ V matmul. With
+`mask_invalid_v` on, V is zeroed past the valid tokens on load; with it off,
+the stitch (zeros past the valid tokens) and the score mask must keep them out.
 
-The CACHE_ONLY pass used by decode context parallelism fetches no new tokens,
-so every lane past the local cache is such a tail. With a prefill block
-larger than one lane register (bq_sz > 128) the MIXED kernel takes the
-`_stitch_prefill_lane` path, which must zero those lanes as well.
+The CACHE_ONLY pass used by decode context parallelism fetches no new tokens.
+With a prefill block larger than one lane register (bq_sz > 128) the MIXED
+kernel takes the `_stitch_prefill_lane` path.
 
-Each case fills every non-cached token slot with NaN and with 0, and checks
+Each case fills every non-cached token slot, and the new-token rows that pad
+the bucket, with NaN and with 0, with `mask_invalid_v` off and on, and checks
 that both runs are finite, identical, and match a float32 reference.
 """
 
@@ -49,7 +52,7 @@ _SEQ_LENS = ((1, 300), (1, 129), (200, 457), (256, 512), (64, 1000))
 _DISTRIBUTION = (2, 2, len(_SEQ_LENS))
 
 
-def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
+def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value, mask_invalid_v):
     rng = np.random.default_rng(0)
     q_lens = np.array([q for q, _ in _SEQ_LENS], np.int32)
     kv_lens = np.array([kv for _, kv in _SEQ_LENS], np.int32)
@@ -73,7 +76,7 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
     def rand(*shape):
         # Round through kv_dtype so the reference sees the stored values.
         x = rng.standard_normal(shape).astype(np.float32) * 0.5
-        return np.asarray(jnp.asarray(x, kv_dtype).astype(jnp.float32))
+        return np.array(jnp.asarray(x, kv_dtype).astype(jnp.float32))
 
     cache_shape = wrapper.get_kv_cache_shape(
         total_pages,
@@ -108,6 +111,10 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
     query = np.asarray(jnp.asarray(query, jnp.bfloat16).astype(jnp.float32))
     new_k = rand(max_tokens, _NUM_KV_HEADS, _HEAD_DIM)
     new_v = rand(max_tokens, _NUM_KV_HEADS, _HEAD_DIM)
+    # Rows past the last token pad the bucket and are undefined too; the new
+    # tokens' aligned fetch brings some of them into VMEM.
+    new_k[num_tokens:] = fill_value
+    new_v[num_tokens:] = fill_value
 
     cu_q_lens = np.zeros(_MAX_NUM_SEQS + 1, np.int32)
     cu_q_lens[1 : num_seqs + 1] = np.cumsum(q_lens)
@@ -134,6 +141,7 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         attention_scope=scope,
         return_lse=True,
+        mask_invalid_v=mask_invalid_v,
     )
     output = np.asarray(output[:num_tokens].astype(jnp.float32))
     lse = np.asarray(lse[:num_tokens].astype(jnp.float32))
@@ -177,13 +185,18 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
 # 128 keeps the MIXED kernel on the in-register decode stitch; 256 takes the
 # full-roll prefill stitch.
 @pytest.mark.parametrize("prefill_bq_sz", [128, 256])
-def test_unattended_kv_tail_does_not_leak(scope, kv_dtype, prefill_bq_sz):
+@pytest.mark.parametrize("mask_invalid_v", [False, True])
+def test_unattended_kv_tail_does_not_leak(
+    scope, kv_dtype, prefill_bq_sz, mask_invalid_v
+):
     if not jtu.is_device_tpu_at_least(version=5):
         pytest.skip("Expect TPUv5+")
     out_nan, lse_nan, ref_out, ref_lse = _run_case(
-        scope, kv_dtype, prefill_bq_sz, np.nan
+        scope, kv_dtype, prefill_bq_sz, np.nan, mask_invalid_v
     )
-    out_zero, lse_zero, _, _ = _run_case(scope, kv_dtype, prefill_bq_sz, 0.0)
+    out_zero, lse_zero, _, _ = _run_case(
+        scope, kv_dtype, prefill_bq_sz, 0.0, mask_invalid_v
+    )
 
     assert np.isfinite(out_zero).all()
     assert np.isfinite(out_nan).all(), (
