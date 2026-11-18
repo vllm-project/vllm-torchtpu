@@ -166,6 +166,27 @@ def test_patched_renderer_matches_vllms_tokens_on_a_multi_turn_chat(
     assert cache.hits >= 2 and not cache.disabled
 
 
+def test_first_unexpected_error_turns_the_cache_off(patched_renderer, monkeypatch):
+    """The failing prompt and every later one get vLLM's own tokens, and the
+    cache is not tried again after the first error."""
+    from vllm.renderers.params import TokenizeParams
+
+    renderer, unpatched = patched_renderer
+    calls = []
+
+    def broken(self, text):
+        calls.append(text)
+        raise RuntimeError("tokenizer state lost")
+
+    monkeypatch.setattr(tokcache_mod.PrefixTokenCache, "encode", broken)
+    params = TokenizeParams(max_total_tokens=None)
+    for n in (1, 2, 3):
+        prompt = {"prompt": _turns(n)}
+        expected = unpatched(renderer, dict(prompt), params)
+        assert renderer._tokenize_prompt(dict(prompt), params) == expected
+    assert len(calls) == 1
+
+
 def test_patched_renderer_leaves_truncation_to_vllm(patched_renderer, cache_encodes):
     from vllm.renderers.params import TokenizeParams
 

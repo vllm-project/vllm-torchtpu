@@ -457,7 +457,9 @@ def maybe_install_tokenize_prefix_cache() -> bool:
 
     orig = rbase.BaseRenderer._tokenize_prompt
     cache_lock = threading.Lock()
-    state: dict = {"cache": None, "tried": False}
+    # "off": set by the first unexpected error; from then on every prompt takes
+    # vLLM's own tokenization.
+    state: dict = {"cache": None, "tried": False, "off": False}
 
     def _get_cache(renderer):
         if not state["tried"]:
@@ -476,6 +478,8 @@ def maybe_install_tokenize_prefix_cache() -> bool:
         return state["cache"]
 
     def _tokenize_prompt(self, prompt, params):
+        if state["off"]:
+            return orig(self, prompt, params)
         try:
             if (
                 isinstance(self, HfRenderer)
@@ -496,12 +500,16 @@ def maybe_install_tokenize_prefix_cache() -> bool:
                         ):
                             return self._build_tokens_prompt(ids, prompt)
         except Exception as e:  # never break serving
-            # Once per exception type: a vLLM change that breaks this wrapper
-            # would otherwise log on every request.
-            logger.warning_once(
-                "%s %s in the cached tokenization; using vLLM's tokenization",
+            # The first unexpected error turns the cache off for good: a vLLM
+            # change that breaks this wrapper would otherwise fail, and log, on
+            # every request.
+            state["off"] = True
+            logger.warning(
+                "%s %s in the cached tokenization (%s); the cache is off and "
+                "every prompt now uses vLLM's tokenization",
                 _P,
                 type(e).__name__,
+                e,
             )
         return orig(self, prompt, params)
 
