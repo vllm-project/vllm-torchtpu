@@ -370,12 +370,13 @@ def _split_ba(
 
     The Qwen3.5 MoE architectures pass the halves as chunk views, because the
     Qwen3.5 GDN kernel pads and stacks them itself (two fewer copies per GDN
-    layer per step). Every other architecture keeps main's contiguous copies.
-    The layer's own model config decides, as it does for the kernel choice.
+    layer per step). Every other architecture gets contiguous copies, which
+    the shared `kernels/gdn/v3` kernel takes. The layer's own model config
+    decides, as it does for the kernel choice.
     """
     b, a = ba.chunk(2, dim=-1)
     # Upstream's GatedDeltaNetAttention.__init__ always sets model_config; only
-    # test and mock layers built without __init__ lack it, and they keep main's
+    # test and mock layers built without __init__ lack it, and they get
     # contiguous copies.
     model_config = getattr(layer, "model_config", None)
     if (
@@ -1199,7 +1200,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         qkvz_weight, qkvz_weight_scale = self._require_pcp_projection_parameters()
         ba, _ = self.in_proj_ba(hidden_states)
         # This op runs gdn_pcp_fused, not the kernel `gdn_kernel_wrapper`
-        # selects, so it keeps main's contiguous b and a halves.
+        # selects, so it keeps contiguous b and a halves.
         b, a = ba.chunk(2, dim=-1)
         b = b.contiguous()
         a = a.contiguous()
@@ -1430,9 +1431,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                             "GDN PCP prefill op was not initialized during model "
                             "loading."
                         )
-                    # The PCP prefill runs main's kernel for every architecture
-                    # (`run_jax_gdn_attention_pcp_tp_prefill`), so it takes
-                    # main's contiguous b and a halves.
+                    # The PCP prefill runs the shared kernels/gdn/v3 kernel for
+                    # every architecture (`run_jax_gdn_attention_pcp_tp_prefill`),
+                    # so it takes contiguous b and a halves.
                     core_attn_out = gdn_pcp_op(
                         mixed_qkv,
                         b.contiguous(),

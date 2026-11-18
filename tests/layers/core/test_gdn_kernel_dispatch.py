@@ -321,7 +321,7 @@ def test_ba_halves_are_views_only_for_the_qwen3_5_moe_architectures(
     architecture, views
 ):
     """The Qwen3.5 MoE architectures hand the b and a halves to the GDN op as
-    chunk views; every other architecture keeps main's contiguous copies."""
+    chunk views; every other architecture gets contiguous copies."""
     import torch
 
     ba = torch.arange(24, dtype=torch.float32).reshape(3, 8)
@@ -346,7 +346,7 @@ def test_ba_split_follows_the_layer_not_the_engine():
 
 def test_ba_split_of_a_layer_built_without_init_keeps_contiguous_copies():
     """A layer built without __init__ (a test double) has no model config and
-    keeps main's contiguous copies instead of failing in forward."""
+    gets contiguous copies instead of failing in forward."""
     import torch
 
     ba = torch.arange(24, dtype=torch.float32).reshape(3, 8)
@@ -357,7 +357,7 @@ def test_ba_split_of_a_layer_built_without_init_keeps_contiguous_copies():
 
 def test_the_pooled_pcp_op_keeps_contiguous_ba_halves(monkeypatch):
     """The pooled PCP op runs gdn_pcp_fused rather than the kernel the dispatch
-    selects, so even the Qwen3.5 MoE architectures hand it main's contiguous
+    selects, so even the Qwen3.5 MoE architectures hand it contiguous
     b and a halves."""
     import torch
 

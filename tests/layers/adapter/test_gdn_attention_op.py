@@ -1039,7 +1039,8 @@ class TestVllmGatedDeltaNetAttention:
         assert torch.all(core_args[9] == torch.tensor([3, 1], dtype=torch.int32))
 
     # The Qwen3.5 MoE architectures hand the other GDN ops chunk views of b and
-    # a; the PCP prefill runs main's kernel, so it still gets contiguous halves.
+    # a; the PCP prefill runs the shared kernel, so it still gets contiguous
+    # halves.
     @pytest.mark.parametrize(
         "architecture", [None, "Qwen3_5MoeForConditionalGeneration"]
     )
