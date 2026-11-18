@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 # Drafts past the matched continuation. Any in-vocab id is safe: greedy
 # verification accepts a draft only where it equals the target's own token.
 FILLER_TOKEN_ID = 0
+# The match scans only the leading history columns of a width bucket (powers
+# of 4 from this) that holds every row's sequence: the full 262152-token width
+# cost 0.41 ms per step on a few hundred tokens.
+MIN_MATCH_WIDTH = 1024
 
 
 def _write_row_impl(hist: torch.Tensor, packed: torch.Tensor) -> None:
@@ -60,23 +64,25 @@ def _propose_impl(
     min_n: int,
     max_n: int,
     k: int,
+    width: int,
 ) -> torch.Tensor:
     """Appends one step's tokens to the history rows and drafts from them.
 
     Args:
-        hist: [num_hist_rows, width] persistent token history, updated in place.
+        hist: [num_hist_rows, max_width] persistent token history, updated in
+            place.
         meta: [2 * rows] int32: each chunk row's history row (padded rows point
             at the dump row), then its committed length.
         new_tokens: [rows, S] tokens sampled this step, INVALID_TOKEN_ID padded
             at the end of each row.
         min_n, max_n: n-gram sizes to match.
         k: drafts per row.
+        width: history columns to match over; base_len + S <= width.
 
     Returns:
         [rows, k] int64 drafts, FILLER_TOKEN_ID where nothing matched.
     """
     rows, steps = new_tokens.shape
-    width = hist.shape[1]
     device = hist.device
     hist_rows = meta[:rows].long()
     base_len = meta[rows:].long()
@@ -84,7 +90,7 @@ def _propose_impl(
     # [rows, S] columns the step's tokens land in; base_len + S <= width. The
     # INVALID padding lands at or past seq_len, where nothing reads it.
     cols = base_len[:, None] + torch.arange(steps, device=device)
-    tokens = hist[hist_rows].scatter(1, cols, new)  # [rows, width]
+    tokens = hist[:, :width][hist_rows].scatter(1, cols, new)  # [rows, width]
     hist.index_put_((hist_rows[:, None].expand(-1, steps), cols), new)
     seq_len = base_len + (new != INVALID_TOKEN_ID).sum(dim=1)
 
@@ -148,6 +154,8 @@ class DeviceNgramProposer:
         # writes. A step appends at most 1 + K tokens past a committed length
         # of up to max_model_len.
         self._hist: torch.Tensor | None = None
+        # The match width buckets, ascending, the last the full width.
+        self._match_widths: list[int] = []
         # The request whose history each batch row of `_hist` holds.
         self._row_req_ids: list[str | None] = []
 
@@ -165,6 +173,12 @@ class DeviceNgramProposer:
         self._hist = torch.zeros(
             (self._dump_row + 1, width), dtype=torch.int32, device=self.runner.device
         )
+        self._match_widths = []
+        w = MIN_MATCH_WIDTH
+        while w < width:
+            self._match_widths.append(w)
+            w *= 4
+        self._match_widths.append(width)
         self._row_req_ids = [None] * self._dump_row
 
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
@@ -175,10 +189,12 @@ class DeviceNgramProposer:
         fn = _write_row_compiled if self._is_compiled() else _write_row_impl
         fn(self._hist, packed)
 
-    def _step(self, meta: torch.Tensor, new_tokens: torch.Tensor) -> torch.Tensor:
+    def _step(
+        self, meta: torch.Tensor, new_tokens: torch.Tensor, width: int
+    ) -> torch.Tensor:
         assert self._hist is not None
         fn = _propose_compiled if self._is_compiled() else _propose_impl
-        return fn(self._hist, meta, new_tokens, self.min_n, self.max_n, self.k)
+        return fn(self._hist, meta, new_tokens, self.min_n, self.max_n, self.k, width)
 
     def _refresh_rows(self, scheduler_output: SchedulerOutput) -> None:
         """Uploads the history of each batch row whose device copy is stale.
@@ -208,7 +224,11 @@ class DeviceNgramProposer:
         # Rows past the batch miss this step's appends.
         self._row_req_ids[num_reqs:] = [None] * (len(self._row_req_ids) - num_reqs)
 
-    def _upload_meta(self, start: int, num_reqs: int, rows: int) -> torch.Tensor:
+    def _upload_meta(
+        self, start: int, num_reqs: int, rows: int, steps: int
+    ) -> tuple[torch.Tensor, int]:
+        """The chunk's `meta` on device, and the match width bucket that holds
+        its sequences after the step's `steps` appended tokens."""
         meta = zeros_h2d_source(self.runner, 2 * rows)
         meta[:rows] = self._dump_row
         meta[:num_reqs] = torch.arange(start, start + num_reqs, dtype=torch.int32)
@@ -218,7 +238,9 @@ class DeviceNgramProposer:
             f"committed lengths {committed} exceed max_model_len {self.max_model_len}"
         )
         meta[rows : rows + num_reqs] = torch.from_numpy(committed)
-        return stage_h2d_upload(self.runner, meta)
+        need = int(committed.max()) + steps
+        width = next(w for w in self._match_widths if w >= need)
+        return stage_h2d_upload(self.runner, meta), width
 
     @torch.no_grad()
     def propose(
@@ -257,15 +279,16 @@ class DeviceNgramProposer:
         self._refresh_rows(scheduler_output)
         drafts = []
         for chunk, chunk_tokens in zip(chunks, new_tokens, strict=True):
-            meta = self._upload_meta(
-                chunk.start_index, chunk.num_reqs, chunk_tokens.shape[0]
+            meta, width = self._upload_meta(
+                chunk.start_index, chunk.num_reqs, *chunk_tokens.shape
             )
-            drafts.append(self._step(meta, chunk_tokens))
+            drafts.append(self._step(meta, chunk_tokens, width))
         return drafts
 
     @torch.no_grad()
     def precompile(self) -> None:
-        """Compiles the row upload and every (row bucket, S, dtype) step.
+        """Compiles the row upload and every (row bucket, S, dtype, match
+        width) step.
 
         Plain sampling yields int64 tokens ([rows] seeds, and the [rows,
         1 + K] padding of a spec step's chunk without drafts); the rejection
@@ -291,4 +314,5 @@ class DeviceNgramProposer:
                     new_tokens = torch.full(
                         (rows, steps), INVALID_TOKEN_ID, dtype=dtype
                     ).to(runner.device)
-                    synchronize_tensors(self._step(meta_dev, new_tokens))
+                    for width in self._match_widths:
+                        synchronize_tensors(self._step(meta_dev, new_tokens, width))

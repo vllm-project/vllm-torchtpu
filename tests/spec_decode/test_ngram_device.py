@@ -23,11 +23,19 @@ from vllm.v1.spec_decode.ngram_proposer import (
     _find_longest_matched_ngram_and_propose_tokens,
 )
 
+from vllm_torchtpu.spec_decode import ngram_device
 from vllm_torchtpu.spec_decode.ngram_device import DeviceNgramProposer
 
 MAX_MODEL_LEN = 64
 MAX_NUM_REQS = 4
 X = -1  # INVALID_TOKEN_ID: no token in this slot.
+
+
+@pytest.fixture(autouse=True)
+def _small_match_widths(monkeypatch):
+    """Match width buckets of 8, 32 and the full width, so the cases' 5- to
+    12-token sequences cross a bucket."""
+    monkeypatch.setattr(ngram_device, "MIN_MATCH_WIDTH", 8)
 
 
 def _make_proposer(device, histories, stale, min_n, max_n, k):
