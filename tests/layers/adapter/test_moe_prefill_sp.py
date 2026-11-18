@@ -263,10 +263,19 @@ def test_op_takes_own_tokens_and_a_bf16_wire_without_arming_the_layer(monkeypatc
     args, kw = seen[0]
     assert kw["token_replica_groups"] == ((0,), (1,))
     assert kw["wire_dtype"] == jnp.bfloat16
+    assert kw["eager_push"] is True
     assert args[5] is True  # sharded routing plan
     assert args[8:11] == ("sigmoid", True, 1.0)  # scoring, bias, routed scale
     # The other buckets keep the grouped-matmul path and its collectives.
     assert not bridge.fused_moe_ep_supported(layer)
+
+
+def test_fp8_wire_keeps_the_per_visit_pushes(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_PREFILL_SP_FP8_WIRE", "1")
+    _, seen = _build(_experts())
+    _, kw = seen[0]
+    assert kw["wire_dtype"] is None
+    assert kw["eager_push"] is False
 
 
 @pytest.mark.parametrize(
