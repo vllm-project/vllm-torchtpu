@@ -21,7 +21,7 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
 from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
 from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_gather_chunk_size,
-    csa2_pipeline,
+    csa2_pipeline_chunks,
 )
 from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
 
@@ -182,18 +182,22 @@ def _gather_attend(
     non_causal: bool,
     bq: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    records, counts = prepare_main_records(
-        selected,
-        pages,
-        main_starts,
-        page_size=main_page_size,
-        onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
-    )
-    output, words, scales = csa2_pipeline(
+    def chunk_records(start, end):
+        # Records are per row: a chunk's request boundaries are the batch's,
+        # shifted and clipped to the chunk.
+        return prepare_main_records(
+            selected[start:end],
+            pages,
+            jnp.clip(main_starts - start, 0, end - start),
+            page_size=main_page_size,
+            onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
+        )
+
+    return csa2_pipeline_chunks(
         q,
         raw if high is None else (raw, high),
         scales if high_scales is None else (scales, high_scales),
-        records,
+        chunk_records,
         swa_word_pages(swa if swa_high is None else (swa, swa_high), swa_page_size),
         starts,
         positions,
@@ -201,14 +205,12 @@ def _gather_attend(
         _inverse_rope(cos_sin, positions),
         metadata,
         bounds if non_causal else None,
-        counts,
         chunk_size=csa2_gather_chunk_size(q.shape[0]),
         bq=bq,
         scale=scale,
         compress_ratio=ratio,
         deep_gather=envs.TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER,
     )
-    return output, words, scales, counts
 
 
 def _fake_gather_attend(q, raw, high, scales, high_scales, *_):
