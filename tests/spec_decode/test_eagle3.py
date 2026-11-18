@@ -4045,6 +4045,107 @@ def test_fused_loop_proposes_every_step_with_the_greedy_head():
     assert len(owner.logits_processor.calls) == 3
 
 
+class _TpuTypedTensor(torch.Tensor):
+    """A CPU tensor whose ``device`` reads as a TPU device, so propose takes
+    its TPU-only branches (the post-step-0 bridge) on CPU."""
+
+    @property
+    def device(self):
+        return SimpleNamespace(type="tpu")
+
+
+def test_fused_loop_fallback_runs_the_steps_at_the_chunks_bucket(monkeypatch):
+    """Under the step-0 post-attention gather the post-step-0 bridge keeps the
+    gathered step-0 rows (max_p, the largest loop bucket) for the fused loop,
+    which slices them. When the loop program declines the chunk, the separate
+    steps must run at the chunk's own loop bucket p: step 0's token, the step
+    inputs and the hidden carry all p rows."""
+    import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
+
+    monkeypatch.setattr(
+        qwen3_next_patch, "is_step0_post_attn_gather_installed", lambda _m: True
+    )
+    p, max_p, hidden_size = 16, 32, 4
+    proposer = _make_proposer(draft_tp=2, target_tp=2, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.draft_model = SimpleNamespace()
+    proposer._mtp_fused_loop = object()
+    proposer._mtp_fused_loop_max_p = max_p
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=3),
+        max_num_reqs=max_p,
+        num_reqs_paddings=[8, 16, 32],
+        num_tokens_paddings=[p, max_p],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
+        device=torch.device("cpu"),
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    steps = []
+
+    def prepare(self, chunk, *_args, **_kwargs):
+        return (
+            torch.zeros(p, dtype=torch.int32),
+            torch.zeros(p, dtype=torch.int32),
+            torch.zeros(p, dtype=torch.int64),
+            torch.zeros(8, dtype=torch.int32),
+        )
+
+    def forward(self, *, input_ids, positions, step_idx, num_tokens_padded, **kw):
+        rows = num_tokens_padded
+        if step_idx == 0:
+            rows = kw["step0_gather_indices"].shape[0]
+        else:
+            steps.append(
+                (
+                    input_ids.shape[0],
+                    positions.shape[-1],
+                    kw["target_hidden_states"].shape[0],
+                    num_tokens_padded,
+                )
+            )
+        hidden = torch.zeros((rows, hidden_size)).as_subclass(_TpuTypedTensor)
+        return hidden, hidden
+
+    bridge = Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__
+    monkeypatch.setattr(Eagle3Proposer, "_prepare_draft_inputs", prepare)
+    monkeypatch.setattr(Eagle3Proposer, "_forward_draft", forward)
+    monkeypatch.setattr(Eagle3Proposer, "_draft_post_step0_fused", bridge)
+    monkeypatch.setattr(Eagle3Proposer, "_run_mtp_fused_loop", lambda self, **_kw: None)
+    monkeypatch.setattr(
+        Eagle3Proposer,
+        "_draft_propose_token",
+        lambda self, hidden: torch.zeros(hidden.shape[0], dtype=torch.int32),
+    )
+    proposer.draft_chunks = [
+        _make_chunk(
+            input_ids=torch.zeros(p, dtype=torch.int32),
+            position_ids=torch.zeros(p, dtype=torch.int32),
+            query_start_loc_np=np.arange(4, dtype=np.int32),
+            start_index=0,
+            num_reqs=3,
+            device=torch.device("cpu"),
+            hidden_states=torch.zeros((p, hidden_size)),
+            attn_ctx=SimpleNamespace(
+                use_max_model_len=True, seq_lens=torch.zeros(8, dtype=torch.int32)
+            ),
+        )
+    ]
+
+    drafts = proposer.propose(
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+        return_device=True,
+        next_tokens_per_chunk=[torch.zeros((8, 4), dtype=torch.int32)],
+    )
+
+    assert steps == [(p, p, p, p), (p, p, p, p)]
+    assert tuple(drafts.shape) == (3, 3)
+
+
 def _seed_precompile_pairs(monkeypatch, *, lockstep, dp_step_max_reqs):
     """Run _precompile_draft_seed with its compiled programs replaced by
     recorders, and return the (request bucket, loop bucket) pairs it warms the

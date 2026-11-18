@@ -2139,7 +2139,12 @@ class Eagle3Proposer:
                         continue
                     # This chunk's metadata doesn't fit the program, or its
                     # step-0 token cannot come from the hidden carry: run the
-                    # steps separately.
+                    # steps separately. Under the step-0 gather the carry
+                    # keeps the program's max_p rows (it slices them itself);
+                    # the separate steps run at the chunk's loop bucket.
+                    p_ci = padded_nr_per_chunk[ci]
+                    if loop_hidden[ci].shape[0] > p_ci:
+                        loop_hidden[ci] = loop_hidden[ci][:p_ci]
                     if not draft_tokens_per_chunk[ci]:
                         with set_model_tag("eagle_head"):
                             draft_tokens_per_chunk[ci].append(
