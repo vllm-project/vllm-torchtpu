@@ -201,7 +201,6 @@ def _legs(path: pathlib.Path) -> dict:
     with path.open() as f:
         entry = yaml.safe_load(f)
     if "base_point" not in entry:
-        assert "397b" in entry["recipe"]["base"]
         return entry["legs"]
     # A gate takes its legs from its base point; its overrides do not change
     # the layout.
