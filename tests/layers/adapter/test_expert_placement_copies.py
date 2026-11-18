@@ -113,8 +113,10 @@ def _base_parse(table: dict, source: str = "<dict>"):
 
 def _canonical_digest(table: dict) -> str:
     """The data that defines a placement: shape, per-layer rank lists and copy
-    order. The constants below are this digest of the record tree's two tables in
-    their original format, computed from those files."""
+    order. The constants below are this digest of the two tables the measured
+    runs read, computed from those files in their original format (before they
+    were carried into this directory), so the tables here hold the same
+    placements."""
     per_rank = table["experts"] // table["shards"]
     order = table.get("copy_order", {})
     canonical = {
@@ -134,7 +136,7 @@ def _canonical_digest(table: dict) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
-RECORD_TREE_DIGESTS = {
+MEASURED_RUN_DIGESTS = {
     DP8_TABLE: "da314f13b961c219b6a4d6d95dbf32cf0a88dbf66a7b84ec2f1491085e510232",
     TP8_TABLE: "d75857cc53b361c11c5e85edb8bbaaec3e726b9fe8ac156b95494fd69d16b320",
 }
@@ -271,9 +273,9 @@ def test_a_copied_expert_has_one_copy():
 
 
 @pytest.mark.parametrize("path", [DP8_TABLE, TP8_TABLE], ids=["dp8_ep8", "tp8"])
-def test_tables_hold_the_record_trees_placements(path):
+def test_tables_hold_the_measured_runs_placements(path):
     table = json.loads(path.read_text())
-    assert _canonical_digest(table) == RECORD_TREE_DIGESTS[path]
+    assert _canonical_digest(table) == MEASURED_RUN_DIGESTS[path]
     ep.parse(table, str(path))
 
 

@@ -129,6 +129,10 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
     Patch("vllm_torchtpu.model_loader_patches:patch_expert_placement_routers", _ACTIVE),
+    # Must stay after _patch_expert_map_host_lookup (above): that patch
+    # replaces ExpertMapManager._calculate_expert_maps without calling the
+    # original, and this hook wraps the one installed when it runs, so in the
+    # other order the replacement would drop the hook.
     Patch(
         "vllm_torchtpu.layers.adapter.expert_placement:patch_copy_slot_hook", _ACTIVE
     ),

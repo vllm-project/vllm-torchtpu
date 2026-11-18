@@ -605,5 +605,5 @@
  },
  "recording": "Per-layer expert activation statistics.",
  "algorithm": "vllm.distributed.eplb.policy.default.DefaultEplbPolicy.rebalance_experts (global: one group, one node)",
- "rule": "vLLM EPLB placement: each slot holds one logical expert; an expert in several slots is a copy; the first slot holding it is its owner for cores that hold no copy"
+ "rule": "A permutation: each of the 512 experts is in exactly one slot (no copies), 64 per rank"
 }
