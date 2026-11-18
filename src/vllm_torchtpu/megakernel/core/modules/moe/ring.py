@@ -37,20 +37,14 @@ def fetch_e(m: MoEEmit, u, l_idx, t=None):
     if t is None and isinstance(u, int):
         t = u % TE
     i = u // TE if t is None else (u - t) // TE
+    lst = scr["wlist"] if ECOPY else scr["elist"]
+    ic = i if isinstance(i, int) else jnp.minimum(i, lst.shape[0] - 1)
     if ECOPY:
-        w = scr["wlist"][i]
+        w = lst[ic]
     else:
-        e = scr["elist"][i]
+        e = lst[ic]
         w = e if mp.moe_tp else e - me * ER
     bank = u % NBE
-
-    def es_copy():
-        if "es" not in W:
-            return
-        s = i % NSS
-        pltpu.make_async_copy(
-            W["es"].at[l_idx, w], scr["es"].at[s], scr["es_sem"].at[s]
-        ).start()
 
     def e13_start(tt):
         if mp.stack_e:
@@ -82,7 +76,7 @@ def fetch_e(m: MoEEmit, u, l_idx, t=None):
         else:
             e2_start(t - T13)
         if t == 0:
-            es_copy()
+            _es_start(m, i, w, l_idx)
         return
     t = u - i * TE
 
@@ -94,7 +88,7 @@ def fetch_e(m: MoEEmit, u, l_idx, t=None):
     def _():
         e2_start(t - T13)
 
-    pl.when(t == 0)(es_copy)
+    pl.when(t == 0)(lambda: _es_start(m, i, w, l_idx))
 
 
 def etake(m: MoEEmit, kind: str, u):
