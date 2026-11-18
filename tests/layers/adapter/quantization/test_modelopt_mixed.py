@@ -48,6 +48,9 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 LAYER = "model.layers.0"
+# A layer with no entries in the base quantized_layers, for tests that add their
+# own layout.
+LAYER1 = "model.layers.1"
 
 # Qwen3_5ForCausalLMBase.packed_modules_mapping: vLLM's fused layer name to the
 # checkpoint names that quantized_layers is keyed by.
@@ -57,6 +60,10 @@ PACKED_MODULES = {
     "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
     "in_proj_ba": ["in_proj_b", "in_proj_a"],
 }
+
+
+def _nvfp4(group_size: int, algo: str = "NVFP4") -> dict:
+    return {"quant_algo": algo, "group_size": group_size}
 
 
 def _quant_config(extra_layers: dict | None = None) -> dict:
@@ -156,7 +163,24 @@ class TestRegistration:
     def test_platform_admits_method(self):
         assert "modelopt_mixed" in TpuPlatform.supported_quantization
 
-    def test_hf_quant_config_json_fallback(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("quantization_config", "text_quantization_config"),
+        [
+            pytest.param({"quant_method": "modelopt"}, None, id="config_json"),
+            pytest.param(None, {"quant_method": "modelopt"}, id="text_config"),
+            pytest.param(
+                {
+                    "quant_method": "modelopt",
+                    "quantization": {"quant_algo": "MIXED_PRECISION"},
+                },
+                None,
+                id="nested_quantization_without_layers",
+            ),
+        ],
+    )
+    def test_hf_quant_config_json_fallback(
+        self, tmp_path, quantization_config, text_quantization_config
+    ):
         from vllm.config import LoadConfig
 
         hf_quant = {
@@ -170,9 +194,14 @@ class TestRegistration:
             }
         }
         (tmp_path / "hf_quant_config.json").write_text(json.dumps(hf_quant))
+        text_config = (
+            None
+            if text_quantization_config is None
+            else SimpleNamespace(quantization_config=text_quantization_config)
+        )
         hf_config = SimpleNamespace(
-            quantization_config={"quant_method": "modelopt"},
-            text_config=None,
+            quantization_config=quantization_config,
+            text_config=text_config,
         )
         model_config = SimpleNamespace(
             model=str(tmp_path),
@@ -268,6 +297,116 @@ class TestDispatch:
         with pytest.raises(ValueError, match="Inconsistent quantization across shards"):
             cfg.get_quant_method(_linear(), f"{LAYER}.mlp.shared_expert.gate_up_proj")
 
+    @pytest.mark.parametrize(
+        ("extra_layers", "group_size"),
+        [
+            pytest.param(
+                {
+                    f"{LAYER1}.mlp.experts.{e}.{p}": _nvfp4(32)
+                    for e in range(2)
+                    for p in ("gate_proj", "up_proj", "down_proj")
+                },
+                32,
+                id="per_expert_keys",
+            ),
+            pytest.param(
+                {
+                    f"{LAYER1}.mlp.gate_proj": _nvfp4(32),
+                    f"{LAYER1}.mlp.up_proj": _nvfp4(32),
+                    f"{LAYER1}.mlp.down_proj": _nvfp4(32),
+                    # Not an expert projection, so the experts ignore its spec.
+                    f"{LAYER1}.mlp.shared_expert.down_proj": {"quant_algo": "FP8"},
+                },
+                32,
+                id="expert_projections_under_moe_block",
+            ),
+            pytest.param(
+                {
+                    f"{LAYER1}.mlp.experts.0.gate_proj": _nvfp4(16),
+                    f"{LAYER1}.mlp.experts.0.up_proj": {"quant_algo": "NVFP4"},
+                    f"{LAYER1}.mlp.experts.0.down_proj": _nvfp4(16, "W4A16_NVFP4"),
+                },
+                16,
+                id="nvfp4_family_per_expert_keys",
+            ),
+            pytest.param(
+                {
+                    f"{LAYER1}.mlp.gate_proj": _nvfp4(16),
+                    f"{LAYER1}.mlp.up_proj": {"quant_algo": "NVFP4"},
+                    f"{LAYER1}.mlp.down_proj": _nvfp4(16, "W4A16_NVFP4"),
+                },
+                16,
+                id="nvfp4_family_expert_projections",
+            ),
+        ],
+    )
+    def test_experts_spec_from_projection_keys(self, extra_layers, group_size):
+        cfg = _make_config(extra_layers)
+        method = cfg.get_quant_method(_FakeRoutedExperts(), f"{LAYER1}.mlp.experts")
+        assert isinstance(method, VllmNvfp4MoEMethod)
+        assert method.group_size == group_size
+
+    def test_nvfp4_family_fused_projection(self):
+        cfg = _make_config(
+            {
+                f"{LAYER1}.mlp.shared_expert.gate_proj": _nvfp4(16),
+                f"{LAYER1}.mlp.shared_expert.up_proj": {"quant_algo": "W4A16_NVFP4"},
+            }
+        )
+        method = cfg.get_quant_method(
+            _linear(), f"{LAYER1}.mlp.shared_expert.gate_up_proj"
+        )
+        assert isinstance(method, VllmNvfp4LinearMethod)
+        assert method.group_size == 16
+
+    def test_missing_group_size_uses_nvfp4_default(self):
+        # The first NVFP4 entry sets upstream's shared group_size to 32; a layer
+        # without its own group_size must still get ModelOpt's default of 16.
+        cfg = _make_config(
+            {
+                f"{LAYER}.mlp.experts": _nvfp4(32),
+                f"{LAYER}.mlp.down": {"quant_algo": "NVFP4"},
+            }
+        )
+        experts = cfg.get_quant_method(_FakeRoutedExperts(), f"{LAYER}.mlp.experts")
+        assert isinstance(experts, VllmNvfp4MoEMethod)
+        assert experts.group_size == 32
+        linear = cfg.get_quant_method(_linear(), f"{LAYER}.mlp.down")
+        assert isinstance(linear, VllmNvfp4LinearMethod)
+        assert linear.group_size == 16
+
+    def test_fused_shards_without_packed_modules_mapping(self):
+        cfg = _make_config()
+        cfg.packed_modules_mapping = {}
+        method = cfg.get_quant_method(_linear(), f"{LAYER}.self_attn.qkv_proj")
+        assert isinstance(method, VllmFp8LinearMethodTPU)
+
+    @pytest.mark.parametrize(
+        ("extra_layers", "match"),
+        [
+            pytest.param(
+                {
+                    f"{LAYER1}.mlp.experts.0.gate_proj": _nvfp4(16),
+                    f"{LAYER1}.mlp.experts.1.gate_proj": {"quant_algo": "FP8"},
+                },
+                "Mixed quantization specs under module",
+                id="per_expert_keys",
+            ),
+            pytest.param(
+                {
+                    f"{LAYER1}.mlp.gate_proj": _nvfp4(16),
+                    f"{LAYER1}.mlp.down_proj": _nvfp4(32),
+                },
+                "Mixed quantization specs for experts",
+                id="expert_projections_under_moe_block",
+            ),
+        ],
+    )
+    def test_mixed_expert_specs_raise_value_error(self, extra_layers, match):
+        cfg = _make_config(extra_layers)
+        with pytest.raises(ValueError, match=match):
+            cfg.get_quant_method(_FakeRoutedExperts(), f"{LAYER1}.mlp.experts")
+
     def test_quantize_on_load_prefix_wraps_unquantized_linear(self, monkeypatch):
         monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "shared_expert.")
         cfg = _make_config()
@@ -352,7 +491,7 @@ class TestForwardPass:
         torch.testing.assert_close(out_unq, x @ w_bf16.T, rtol=1e-2, atol=1e-2)
 
         # 2. Multi-partition fused ModelOpt FP8 linear (e.g. in_proj_qkvz)
-        # exercising static input_scale + per-partition weight_scale reduction.
+        # exercising per-partition weight_scale reduction.
         fp8_layer = _linear(input_size=64, output_size=32)
         fp8_method = cfg.get_quant_method(
             fp8_layer, f"{LAYER}.linear_attn.in_proj_qkvz"
@@ -375,9 +514,10 @@ class TestForwardPass:
         fp8_layer.weight.data[16:].copy_((w1 / s1).to(torch.float8_e4m3fn))
         fp8_layer.weight_scale.data[0] = s0
         fp8_layer.weight_scale.data[1] = s1
-        fp8_layer.input_scale.data[0] = 0.8
-        fp8_layer.input_scale.data[1] = 1.2
+        # The checkpoint's static input_scale loads but is unused at runtime.
+        assert hasattr(fp8_layer, "input_scale")
         fp8_method.process_weights_after_loading(fp8_layer)
+        assert not hasattr(fp8_layer, "input_scale")
 
         w_ref = torch.cat([w0, w1], dim=0)
         out_fp8 = fp8_method.apply(fp8_layer, x)

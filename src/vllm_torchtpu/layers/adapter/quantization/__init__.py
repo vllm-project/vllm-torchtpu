@@ -98,18 +98,22 @@ def get_tpu_quantization_config(
 
     # Upstream vLLM falls back to reading `hf_quant_config.json` when
     # `model_config.quantization == "modelopt_mixed"` and `config.json` omits
-    # `quantized_layers`. Preserve that fallback across the `tpu-` rename.
+    # `quantized_layers`. Preserve that fallback across the `tpu-` rename. The
+    # map may also sit under a nested `quantization` dict, which
+    # `ModelOptMixedPrecisionConfig.from_config` reads.
     if quant_config_cls is VllmModelOptMixedConfig:
         for cfg_holder in (
             model_config.hf_config,
             getattr(model_config.hf_config, "text_config", None),
         ):
             qcfg = getattr(cfg_holder, "quantization_config", None)
-            if (
-                isinstance(qcfg, dict)
-                and "quantized_layers" not in qcfg
-                and "quantization" not in qcfg
-            ):
+            if not isinstance(qcfg, dict):
+                continue
+            nested = qcfg.get("quantization")
+            has_layers = "quantized_layers" in qcfg or (
+                isinstance(nested, dict) and "quantized_layers" in nested
+            )
+            if not has_layers:
                 delattr(cfg_holder, "quantization_config")
 
     # Register the TPU quant method name so vLLM uses our custom config
