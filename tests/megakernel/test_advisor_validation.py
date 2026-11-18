@@ -122,6 +122,7 @@ def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
                 decode=dataclasses.replace(preset.decode, megakernel=None),
                 prefill=dataclasses.replace(preset.prefill, megakernel=None),
                 saturation=stripped_sat,
+                megakernel_layouts=(),
             ),
         )
 
