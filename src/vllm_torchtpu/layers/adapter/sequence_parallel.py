@@ -55,8 +55,9 @@ _FOLLOWS_STEP_FORM = False
 # form of the target step before it. So for an engine with a drafter the row
 # threshold stays DEFAULT_MIN_ROWS (every sequence-parallel step sliced, the
 # draft included, as on main) until the proposer records the draft's form.
-# The proposer change that records it sets this to True.
-DRAFT_RECORDS_STEP_FORM = False
+# The MTP proposer records it (`spec_decode/eagle3.py`, `_draft_rows_sliced`
+# and `sequence_parallel.set_active` before each draft forward).
+DRAFT_RECORDS_STEP_FORM = True
 _HAS_DRAFTER = False
 
 
