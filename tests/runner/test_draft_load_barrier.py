@@ -18,12 +18,16 @@ pipeline stage joins it, not only the last one, which hosts the draft."""
 
 import ast
 import inspect
+import multiprocessing
+import socket
 import textwrap
+import time
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch.distributed as dist
 from vllm.config import ParallelConfig
 
 from vllm_torchtpu.runner import tpu_runner
@@ -166,3 +170,63 @@ def test_load_model_reaches_the_barrier_outside_the_drafter_branch():
                 assert "_is_async_drafter" not in ast.unparse(node.test), (
                     "the draft load barrier is gated on this stage hosting a draft"
                 )
+
+
+# The failure the barrier fixes, on two gloo ranks. torch_tpu's new_group,
+# which the draft load calls, waits a fixed 300 s for every rank; a
+# monitored_barrier with a 1 s timeout stands in for it, and rank 1 finishes
+# "loading the target weights" 3 s after rank 0.
+_GROUP_WAIT = timedelta(seconds=1)
+_LATE_S = 3.0
+
+
+def _draft_load_on_rank(rank, port, align, results):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        if rank == 1:
+            time.sleep(_LATE_S)
+        if align:
+            runner = SimpleNamespace(
+                parallel_config=SimpleNamespace(cpu_distributed_timeout=None)
+            )
+            world = SimpleNamespace(world_size=2, rank=rank, cpu_group=dist.group.WORLD)
+            with patch.object(tpu_runner, "get_world_group", return_value=world):
+                TPUModelRunner._draft_load_barrier(runner)
+        dist.monitored_barrier(timeout=_GROUP_WAIT, wait_all_ranks=True)
+        results.put((rank, "ok"))
+    except Exception as e:  # the stand-in's timeout, reported to the parent
+        results.put((rank, type(e).__name__))
+    finally:
+        dist.destroy_process_group()
+
+
+def _draft_load_outcomes(align):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    ctx = multiprocessing.get_context("spawn")
+    results = ctx.Queue()
+    procs = [
+        ctx.Process(target=_draft_load_on_rank, args=(rank, port, align, results))
+        for rank in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    outcomes = dict(results.get(timeout=240) for _ in procs)
+    for proc in procs:
+        proc.join(timeout=60)
+    return outcomes
+
+
+def test_a_late_rank_fails_the_fixed_group_wait_without_the_barrier():
+    assert _draft_load_outcomes(align=False)[0] != "ok"
+
+
+def test_the_barrier_lets_a_late_rank_pass_the_fixed_group_wait():
+    assert _draft_load_outcomes(align=True) == {0: "ok", 1: "ok"}
