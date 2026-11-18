@@ -85,11 +85,12 @@ def test_split_operands_are_decode_only():
         _serve(jnp.float8_e4m3fn, native_fp8_prefill=split)
 
 
-def test_static_pv_rejects_per_token_v_scales():
-    with pytest.raises(ValueError, match="per-token V scales"):
+@pytest.mark.parametrize("name", ["native_fp8", "native_fp8_prefill"])
+def test_static_pv_rejects_per_token_v_scales(name):
+    with pytest.raises(ValueError, match=f"{name}.pv STATIC with per-token V scales"):
         _serve(
             jnp.float8_e4m3fn,
-            configs.NativeFp8(pv=_STATIC),
+            **{name: configs.NativeFp8(pv=_STATIC)},
             per_token_scale=True,
             per_token_scale_dtype=jnp.float32,
         )
