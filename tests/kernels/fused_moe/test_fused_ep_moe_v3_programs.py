@@ -20,8 +20,8 @@ its expert rows) hold the layer's selection and combine arithmetic and run
 as single-device programs. The layer as a whole does not run in the
 interpreter: its token exchange returns DMA semaphores from one Pallas
 program to the next, and the TPU interpreter cannot return a semaphore from
-a program. The layer end to end is ``test_fused_ep_moe_v3.py``, on an
-eight-core TPU host.
+a program. The layer's own TPU test, which comes with the layer, runs it end
+to end on an eight-core TPU host.
 """
 
 import jax
