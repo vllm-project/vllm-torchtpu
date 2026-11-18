@@ -176,16 +176,25 @@ def test_stacked_weight_index(config):
         )
 
 
-def test_supports():
+def test_supports(monkeypatch):
+    monkeypatch.setattr(fp8_skinny, "_on_tuned_generation", lambda: True)
     wq, ws = _w(1024, 6144)
-    assert fp8_skinny.supports(16, wq, ws)
-    assert not fp8_skinny.supports(17, wq, ws)
+    x = S((16, 1024), BF16)
+    assert fp8_skinny.supports(x, wq, ws)
+    assert not fp8_skinny.supports(S((17, 1024), BF16), wq, ws)
+    assert not fp8_skinny.supports(S((16, 1024), F32), wq, ws)  # bf16 only
+    assert not fp8_skinny.supports(S((1, 16, 1024), BF16), wq, ws)  # flatten first
     w2, s2 = _w(512, 640)  # correct, but untuned: stays on XLA
-    assert not fp8_skinny.supports(16, w2, s2)
+    assert not fp8_skinny.supports(S((16, 512), BF16), w2, s2)
     w3, s3 = _w(6144, 2624)
-    assert not fp8_skinny.supports(16, w3, s3)  # pad N at load first
-    assert not fp8_skinny.supports(16, wq, ws.reshape(1, 1, 1, -1))  # blockwise scale
-    assert not fp8_skinny.supports(16, wq.astype(jnp.bfloat16), ws)
+    assert not fp8_skinny.supports(S((16, 6144), BF16), w3, s3)  # pad N at load first
+    assert not fp8_skinny.supports(x, wq, ws.reshape(1, 1, 1, -1))  # blockwise scale
+    assert not fp8_skinny.supports(x, wq.astype(jnp.bfloat16), ws)
+    assert fp8_skinny.weight_refusal(1024, 6144) is None
+    assert "not in fp8_skinny.TUNED" in fp8_skinny.weight_refusal(512, 640)
+    monkeypatch.setattr(fp8_skinny, "_on_tuned_generation", lambda: False)
+    assert not fp8_skinny.supports(x, wq, ws)  # TUNED is measured on v7x only
+    assert "TPU7x" in fp8_skinny.weight_refusal(1024, 6144)
 
 
 # (x, weight, scale, part of the error message): inputs outside the kernel's
@@ -240,7 +249,7 @@ def _kernel_call(x, wq, ws):
     if n_pad != n:
         wq = jnp.pad(wq.astype(jnp.float32), ((0, 0), (0, n_pad - n))).astype(F8)
         ws = jnp.pad(ws, (0, n_pad - n), constant_values=1.0)
-    assert fp8_skinny.supports(x.shape[0], wq, ws)
+    assert fp8_skinny.supports(x, wq, ws)
 
     def f(a, b, c):
         return fp8_skinny.fp8_skinny_matmul(a, b, c, n_logical=n)

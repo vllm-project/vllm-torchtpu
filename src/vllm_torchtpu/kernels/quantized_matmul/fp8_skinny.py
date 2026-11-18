@@ -89,6 +89,38 @@ TUNED = {
     (1024, 6144): ("n", 2048, 3),
     (6144, 1536): ("k", 1536, 3),
 }
+# TPU generations TUNED was measured on, as jax reports `device_kind`.
+TUNED_DEVICE_KINDS = frozenset({"TPU7x"})
+
+
+@functools.cache
+def _on_tuned_generation() -> bool:
+    return jax.devices()[0].device_kind in TUNED_DEVICE_KINDS
+
+
+def weight_refusal(k: int, n: int) -> str | None:
+    """Returns why the kernel does not take a ``[k, n]`` weight, or None.
+
+    The one weight-shape and TPU-generation check: ``supports`` and the
+    load-time check of a caller both use it, so the two cannot disagree.
+
+    Args:
+      k: Input features (rows of the K-major weight).
+      n: Output features, already padded to a multiple of 128.
+
+    Returns:
+      None when ``(k, n)`` is in ``TUNED`` and the TPU is in
+      ``TUNED_DEVICE_KINDS``. Otherwise a short reason, for example "the weight
+      shape [2048, 4096] is not in fp8_skinny.TUNED".
+    """
+    if not _on_tuned_generation():
+        return (
+            f"fp8_skinny.TUNED is measured on {sorted(TUNED_DEVICE_KINDS)} only, "
+            f"not on {jax.devices()[0].device_kind}"
+        )
+    if (k, n) not in TUNED:
+        return f"the weight shape [{k}, {n}] is not in fp8_skinny.TUNED"
+    return None
 
 
 def pick_config(k: int, n: int) -> tuple[str, int, int]:
@@ -114,7 +146,7 @@ def pick_config(k: int, n: int) -> tuple[str, int, int]:
     return ("n", n, 1)
 
 
-def supports(m: int, w_q: jax.Array, w_s: jax.Array) -> bool:
+def supports(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> bool:
     """Returns whether the kernel takes this call.
 
     A caller that falls back to XLA otherwise uses this check. The kernel
@@ -122,25 +154,28 @@ def supports(m: int, w_q: jax.Array, w_s: jax.Array) -> bool:
     accepts only shapes in ``TUNED``: the default ring of an untuned shape can
     exceed VMEM, and it is not measured to be faster than XLA.
 
-    ``TUNED`` was measured on TPU v7x only, and this check does not read the TPU
-    generation. A caller on another generation must gate the call itself.
+    ``TUNED`` was measured on TPU v7x only, so this check also requires a TPU
+    in ``TUNED_DEVICE_KINDS`` (see ``weight_refusal``).
 
     Args:
-      m: Number of activation rows.
+      x: Activation, expected bf16 ``[m, k]`` (flatten leading dims first).
       w_q: Weight, expected FP8 E4M3 ``[k, n]``.
       w_s: Weight scale, expected float32 ``[n]`` (one per output column).
 
     Returns:
-      True when ``m <= MAX_M``, ``w_q`` is a 2-D FP8 E4M3 array whose shape is
-      in ``TUNED``, and ``w_s`` is 1-D with one value per column of ``w_q``.
+      True when ``x`` is a 2-D bf16 array with ``m <= MAX_M``, ``w_q`` is a 2-D
+      FP8 E4M3 array, ``w_s`` is 1-D with one value per column of ``w_q``, and
+      ``weight_refusal`` accepts the shape of ``w_q``.
     """
     return (
-        m <= MAX_M
+        x.ndim == 2
+        and x.shape[0] <= MAX_M
+        and x.dtype == jnp.bfloat16
         and w_q.ndim == 2
         and w_s.ndim == 1
         and w_q.dtype == jnp.float8_e4m3fn
-        and tuple(w_q.shape) in TUNED
         and w_s.shape[0] == w_q.shape[1]
+        and weight_refusal(*w_q.shape) is None
     )
 
 
