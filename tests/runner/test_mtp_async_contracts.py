@@ -194,6 +194,8 @@ def test_mamba_read_offset_follows_storage_owner(
         runner._attn_metadata_builder_ctx = SimpleNamespace(
             mamba_state_indices=indices if layout == "compact" else None,
             unified_mamba_state_indices=[indices] if layout == "unified" else None,
+            _stacked_mamba_groups=None,
+            _stacked_mamba_groups_ids=None,
         )
         runner._collect_mamba_state_seed_copies(output, 0, 1)
         assert not runner._pending_mamba_state_copies  # Away from block boundaries.
