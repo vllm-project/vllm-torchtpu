@@ -213,6 +213,18 @@ def test_exact_shape_replay_reuses_precompiled_dynamo_graph(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("linear", "budgets"),
+    [
+        (False, [64, 128, 256, 512, 1024, 2048, 4096, 8192]),
+        (True, [64, 128, 256, 512, 1024, 2048, *range(3072, 8193, 1024)]),
+    ],
+)
+def test_generated_budgets_take_the_linear_token_buckets(monkeypatch, linear, budgets):
+    monkeypatch.setattr(mm.envs, "TPU_TOKEN_BUCKET_LINEAR", linear)
+    assert mm.MMEncoderManager._generate_budgets(64, 8192) == budgets
+
+
+@pytest.mark.parametrize(
     ("tokens", "slot"),
     [(0, 4), (1, 4), (4, 4), (5, 8), (8, 8), (9, 16), (16, 16), (17, 24)],
 )

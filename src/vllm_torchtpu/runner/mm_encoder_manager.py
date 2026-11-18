@@ -24,6 +24,7 @@ from vllm.v1.worker.encoder_cudagraph import (
     EncoderCudaGraphManager,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.mm_video_chunking import (
     embed_multimodal_chunked,
@@ -83,6 +84,20 @@ class MMEncoderManager(EncoderCudaGraphManager):
            executed through the compiled XLA graph via ``_run_budget_graph``,
            and the resulting embeddings are cached for the decoder.
     """
+
+    @staticmethod
+    def _generate_budgets(min_budget: int, max_budget: int) -> list[int]:
+        """Upstream's power-of-two budgets, plus the prompt's linear token
+        buckets under ``TPU_TOKEN_BUCKET_LINEAR``: an encoder pass costs per
+        patch as a prompt pass costs per token, and doubling pads it by up to
+        half (a 23364-patch request ran the 32768-patch program)."""
+        from vllm_torchtpu.platforms.tpu_platform import _get_linear_token_paddings
+
+        budgets = EncoderCudaGraphManager._generate_budgets(min_budget, max_budget)
+        if not envs.TPU_TOKEN_BUCKET_LINEAR:
+            return budgets
+        linear = _get_linear_token_paddings(max_budget, max_budget)
+        return sorted({*budgets, *(b for b in linear if b >= min_budget)})
 
     def __init__(
         self,
