@@ -296,13 +296,23 @@ def below_or_on_diag(r, r_blk_size, c, c_blk_size):
     return ((r + 1) * r_blk_size - 1) > (c * c_blk_size)
 
 
-def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
+def _flash_attention_kernel(*refs, segment_ranges: bool, **kwargs):
+    # With segment ids, the scalar-prefetched [min, max] segment id of every q
+    # block and kv block come first.
+    q_ranges_ref = kv_ranges_ref = None
+    if segment_ranges:
+        q_ranges_ref, kv_ranges_ref, *refs = refs
+    q_tile_ref, *args = refs
     block_b = q_tile_ref.shape[0]
     # If we're not going to tile the softmax, then we can avoid a bunch of VPU ops.
     if kwargs["block_k"] == kwargs["kv_seq_len"]:
         kernel = _flash_attention_kernel_single_batch_single_step
     else:
-        kernel = _flash_attention_kernel_single_batch
+        kernel = functools.partial(
+            _flash_attention_kernel_single_batch,
+            q_ranges_ref=q_ranges_ref,
+            kv_ranges_ref=kv_ranges_ref,
+        )
     for batch_idx in range(block_b):
         kernel((batch_idx, 0), q_tile_ref, *args, **kwargs)
 
@@ -327,6 +337,8 @@ def _flash_attention_kernel_single_batch(
     block_k,
     kv_seq_len,
     mask_value,
+    q_ranges_ref=None,
+    kv_ranges_ref=None,
 ):
     block_k_major = k_tile_ref.shape[2]
     block_q = q_tile_ref.shape[2]
@@ -348,10 +360,19 @@ def _flash_attention_kernel_single_batch(
     else:
         should_run = True
 
+    head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
+    l_broadcast = lambda l: jnp.tile(l, (1, head_dim_repeats))
+    if rem:
+        if head_dim_repeats == 0:
+            l_broadcast = lambda l: l[:, :head_dim]
+        else:
+            raise NotImplementedError(
+                f"{head_dim=} should be a multiple of {MIN_BLOCK_SIZE} if larger"
+            )
+
     @pl.when(should_run)
     def run():
-        @pl.loop(0, block_k_major, step=block_k, unroll=True)
-        def _body(start_k):
+        def _attend(start_k):
             m_prev = m_scratch_ref[batch_idx]
             l_prev = l_scratch_ref[batch_idx]
             q = q_tile_ref[batch_idx]  # [block_q, head_dim]
@@ -419,15 +440,6 @@ def _flash_attention_kernel_single_batch(
 
             l_next = jnp.sum(p, axis=1)[:, None] + l_corr  # Shape [block_q, 128]
 
-            head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
-            l_broadcast = lambda l: jnp.tile(l, (1, head_dim_repeats))
-            if rem:
-                if head_dim_repeats == 0:
-                    l_broadcast = lambda l: l[:, :head_dim]
-                else:
-                    raise NotImplementedError(
-                        f"{head_dim=} should be a multiple of {MIN_BLOCK_SIZE} if larger"
-                    )
             l_scratch_ref[batch_idx] = l_next
             m_scratch_ref[batch_idx] = m_next
 
@@ -438,6 +450,32 @@ def _flash_attention_kernel_single_batch(
                 p.astype(v.dtype), v, preferred_element_type=jnp.float32
             )
             acc_scratch_ref[batch_idx] += o_curr * l_broadcast(l_next_inv_safe)
+
+        @pl.loop(0, block_k_major, step=block_k, unroll=True)
+        def _body(start_k):
+            if q_ranges_ref is None:
+                _attend(start_k)
+                return
+            # Segment ids can only match if the q block's [min, max] range meets
+            # the kv block's; otherwise every logit is masked.
+            batch = pl.program_id(0) * q_tile_ref.shape[0] + batch_idx[0]
+            kv_block = (kv_seq_idx * block_k_major + start_k) // block_k
+            q_lo = q_ranges_ref[batch, q_seq_idx, 0]
+            q_hi = q_ranges_ref[batch, q_seq_idx, 1]
+            kv_lo = kv_ranges_ref[batch, kv_block, 0]
+            kv_hi = kv_ranges_ref[batch, kv_block, 1]
+            overlap = jnp.logical_and(q_lo <= kv_hi, kv_lo <= q_hi)
+            pl.when(overlap)(lambda: _attend(start_k))
+
+            @pl.when(jnp.logical_not(overlap))
+            def _skip():
+                # Computing a fully masked block only rescales acc by
+                # l * (1 / l) in a row that has met its segment (a row that has
+                # not is reset by its first matching block either way), so that
+                # factor alone keeps the output bit-identical.
+                l_prev = l_scratch_ref[batch_idx]
+                l_inv_safe = jnp.where(l_prev == 0.0, 1.0, 1.0 / l_prev)
+                acc_scratch_ref[batch_idx] *= l_broadcast(l_prev * l_inv_safe)
 
     @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
     def store_output():
@@ -626,6 +664,7 @@ def _flash_attention_impl(
 
     kernel = functools.partial(
         _flash_attention_kernel,
+        segment_ranges=segment_ids is not None,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
         sm_scale=sm_scale,
@@ -722,10 +761,31 @@ def _flash_attention_impl(
         kv_segment_ids_spec,
     ]
 
+    segment_ranges = ()
+    if segment_ids is not None:
+        # The [min, max] segment id of every q block and kv block, for the
+        # kernel to skip pairs that cannot match (packed vision inputs: most).
+        segment_ranges = (
+            _block_ranges(segment_ids.q, block_q),
+            _block_ranges(segment_ids.kv, block_k),
+        )
+        num_prefetch = len(segment_ranges)
+
+        def with_prefetch(spec):
+            if spec is None:
+                return None
+            index_map = spec.index_map
+            return pl.BlockSpec(
+                spec.block_shape, lambda *idx: index_map(*idx[:-num_prefetch])
+            )
+
+        in_specs = [with_prefetch(spec) for spec in in_specs]
+        out_specs = [with_prefetch(spec) for spec in out_specs]
+
     o, *aux = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
+            num_scalar_prefetch=len(segment_ranges),
             grid=grid,
             in_specs=in_specs,
             out_specs=out_specs,
@@ -753,12 +813,22 @@ def _flash_attention_impl(
             kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids),
             kernel_outputs_specs=out_shape,
         ),
-    )(q, k, v, ab, q_segment_ids, kv_segment_ids)
+    )(*segment_ranges, q, k, v, ab, q_segment_ids, kv_segment_ids)
     if save_residuals:
         l, m = (v[..., 0] for v in aux[-2:])
         return (o, l, m)
     else:
         return o
+
+
+def _block_ranges(segment_ids: jax.Array, block: int) -> jax.Array:
+    """[batch, blocks, 2] int32: each block's lowest and highest segment id. A
+    partial last block repeats its last id."""
+    batch_size, seq_len = segment_ids.shape
+    pad = -seq_len % block
+    ids = jnp.pad(segment_ids, ((0, 0), (0, pad)), mode="edge")
+    ids = ids.reshape(batch_size, -1, block).astype(jnp.int32)
+    return jnp.stack([ids.min(axis=-1), ids.max(axis=-1)], axis=-1)
 
 
 # For autograd testing.
