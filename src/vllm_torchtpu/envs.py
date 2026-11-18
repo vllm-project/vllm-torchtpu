@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
-    VLLM_TPU_HC_PREFILL_TILE: int | None = None
+    VLLM_TPU_HC_PREFILL_TILE: int | str | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -57,7 +57,8 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
-    TPU_QWEN4_HC_DECODE_FUSED: bool = True
+    TPU_QWEN4_HC_DECODE_FUSED: bool = False
+    VLLM_TPU_HC_UP_PRETRANSPOSE: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
@@ -657,10 +658,18 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # HC debug override: auto/unset uses the kernel policy, 0 uses Torch,
-    # positive multiples of 128 override tile/profitability for both components.
-    "VLLM_TPU_HC_PREFILL_TILE": env_nonnegative_int_or_auto(
-        "VLLM_TPU_HC_PREFILL_TILE"
+    # qwen4_exp HC prefill tile policy. Unset keeps the legacy policy: the
+    # additional-config hc_prefill_*_tile values (0 when absent), each Pallas
+    # path on whole tile pairs. Set: "auto" uses the hardware-aware policy
+    # (256/128 full-mix tiles on >= 1024 rows), 0 uses Torch, a positive
+    # multiple of 128 forces that tile; it overrides the backbone's
+    # additional-config tiles, and the single-graph MTP draft stays unfused.
+    "VLLM_TPU_HC_PREFILL_TILE": lambda: (
+        None
+        if not (os.getenv("VLLM_TPU_HC_PREFILL_TILE") or "").strip()
+        else "auto"
+        if os.getenv("VLLM_TPU_HC_PREFILL_TILE", "").strip().lower() == "auto"
+        else env_nonnegative_int("VLLM_TPU_HC_PREFILL_TILE", 0)()
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
@@ -1602,7 +1611,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp: run each hyper-connection mix (per-branch norm, low-rank
     # gate, branch mean and the combine's injection gate) at <= 512 tokens as
     # one Pallas call, with the attn combine fused ahead of the mlp mix.
-    "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED", True),
+    "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
+    # qwen4_exp: store each mixing HC's input_mix_weight_up as [lowrank, hc*H]
+    # after loading (GatedResidual.transpose_up_weight), so the fused decode /
+    # prefill Pallas mixes read it without a per-step HBM relayout copy.
+    # Unset follows TPU_QWEN4_HC_DECODE_FUSED.
+    "VLLM_TPU_HC_UP_PRETRANSPOSE": lambda: env_bool(
+        "VLLM_TPU_HC_UP_PRETRANSPOSE",
+        default=env_bool("TPU_QWEN4_HC_DECODE_FUSED")(),
+    )(),
     # qwen4_exp: shard prefill-sized steps across TP ranks between attention
     # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps

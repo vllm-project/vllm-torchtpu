@@ -45,6 +45,9 @@ class HcHardware:
     bf16_rows: int
     fp32_rows: int
     mxu_columns: int
+    # False: skip the static VMEM admission (legacy prefill policy; the
+    # compiler still validates the lowering at vmem_bytes).
+    admit: bool = True
 
     @classmethod
     def from_tpu_info(cls, info: pltpu.TpuInfo) -> "HcHardware":
@@ -163,6 +166,8 @@ def supports_full_mix(
     combine: bool = False,
     inject: bool = False,
 ) -> bool:
+    if hardware is not None and not hardware.admit:
+        return True
     if (
         hardware is None
         or not hardware.supported
@@ -195,6 +200,8 @@ def supports_full_mix(
 def supports_residual(
     branches: int, hidden: int, tile: int, hardware: HcHardware | None
 ) -> bool:
+    if hardware is not None and not hardware.admit:
+        return True
     if (
         hardware is None
         or not hardware.supported

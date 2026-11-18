@@ -88,6 +88,9 @@ def _hc_prefill_mode_arg(
 ) -> HcPrefillMode | None:
     if key not in qwen_cfg or qwen_cfg[key] is None:
         return default
+    if default is None and envs.VLLM_TPU_HC_PREFILL_TILE is not None:
+        # The env policy overrides the backbone's additional-config tile.
+        return None
     val = qwen_cfg[key]
     if isinstance(val, str) and val == "auto":
         return "auto"

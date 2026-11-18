@@ -44,7 +44,7 @@ from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import mtp_layer_prefixes
-from .hyperconnection import GatedResidual
+from .hyperconnection import GatedResidual, legacy_prefill_policy
 from .model import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpForCausalLM,
@@ -174,7 +174,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         for module in self.modules():
             if isinstance(module, GatedResidual):
                 module.disable_decode_fused()
-                module.disable_prefill_fused()
+                if not legacy_prefill_policy():
+                    module.disable_prefill_fused()
         # Set by the Qwen3.8 megakernel driver before the first trace: the
         # layer's o_proj, both HCs and the MoE as one tail-kernel call.
         self.mk_tail: nn.Module | None = None
