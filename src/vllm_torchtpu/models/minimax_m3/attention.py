@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.models.minimax_m3 import sp_o_proj
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
@@ -291,6 +292,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        sp_o_proj.mark(self.o_proj)
         eps = config.rms_norm_eps
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=eps)
@@ -419,9 +421,11 @@ class MiniMaxM3SparseAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        project: bool = True,
     ) -> torch.Tensor:
         """``hidden_states`` may come as e4m3 rows with per-row f32 scales
-        (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3."""
+        (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3.
+        ``project=False`` returns this rank's heads before o_proj."""
         e4m3_apply = getattr(self.qkv_proj.quant_method, "apply_e4m3_rows", None)
         if isinstance(hidden_states, tuple) and e4m3_apply is None:
             q8, row_scale = hidden_states
@@ -474,5 +478,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 layer_metadata,
                 **extra,
             ).reshape(num_tokens, self.q_size)
+        if not project:
+            return attn_output
         output, _ = self.o_proj(attn_output)
         return output

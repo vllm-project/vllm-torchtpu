@@ -55,6 +55,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3 import sp_o_proj
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -226,6 +227,8 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if weight.device.type == "tpu":
             synchronize_tensors([layer.weight, layer.weight_scale])
+        if getattr(layer, sp_o_proj.PREPARE_ATTR, False):
+            sp_o_proj.prepare(layer)
         logger.info_once(
             "MXFP8 linears run on e4m3 weights with per-channel power-of-two scales."
         )
@@ -245,11 +248,12 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if layer.weight.dtype != torch.float8_e4m3fn:
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
+        w8 = sp_o_proj.local_weight(layer)
         rows = math.prod(x.shape[:-1])
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
-            weight = _materialized_bf16(layer.weight)
+            weight = _materialized_bf16(w8)
         else:
-            weight = layer.weight.to(x.dtype)
+            weight = w8.to(x.dtype)
         # The scale is a power of two, so this rounds once, like x @ bf16(W).
         return torch.matmul(x, weight) * layer.weight_scale
 
@@ -260,7 +264,8 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         as an e4m3 x e4m3 matmul when the weight is e4m3."""
         if layer.weight.dtype != torch.float8_e4m3fn:
             return self.apply(layer, (q.float() * row_scale).to(torch.bfloat16))
-        return _e4m3_matmul(q, row_scale, layer.weight, layer.weight_scale)
+        w8 = sp_o_proj.local_weight(layer)
+        return _e4m3_matmul(q, row_scale, w8, layer.weight_scale)
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):

@@ -44,6 +44,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter.quantization.fp8_lm_head import Fp8LMHeadMethod
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3 import sp_o_proj
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
@@ -207,11 +208,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
         update: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
         layer_input = None
+        o_proj = self.self_attn.o_proj
         if shard is None:
-            attn = self.self_attn(positions, self.input_layernorm(hidden_states))
-            shard = tensor_model_parallel_reduce_scatter(
-                attn + hidden_states / self.tp_size, 0
-            )
+            normed = self.input_layernorm(hidden_states)
+            if sp_o_proj.applies(o_proj):
+                attn = self.self_attn(positions, normed, project=False)
+                rows = sp_o_proj.local_rows(hidden_states)
+                shard = sp_o_proj.sp_o_proj(o_proj, attn) + rows
+            else:
+                attn = self.self_attn(positions, normed)
+                shard = tensor_model_parallel_reduce_scatter(
+                    attn + hidden_states / self.tp_size, 0
+                )
         else:
             shard, normed = self._norm_gather(
                 self.input_layernorm,
@@ -221,8 +229,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 envs.TPU_MINIMAX_M3_SP_E4M3_QKV,
             )
             layer_input = shard
-            attn = self.self_attn(positions, normed)
-            update = tensor_model_parallel_reduce_scatter(attn, 0)
+            if sp_o_proj.applies(o_proj):
+                attn = self.self_attn(positions, normed, project=False)
+                update = sp_o_proj.sp_o_proj(o_proj, attn)
+            else:
+                attn = self.self_attn(positions, normed)
+                update = tensor_model_parallel_reduce_scatter(attn, 0)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         shard, normed = self._norm_gather(
             self.post_attention_layernorm,

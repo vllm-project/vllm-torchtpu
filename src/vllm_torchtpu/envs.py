@@ -80,6 +80,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FUSED_NORM: bool = False
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
+    TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
+    TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
@@ -772,6 +774,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # contract the gathered e4m3 rows against their e4m3 weight (e4m3 x e4m3,
     # f32 accumulation) instead of dequantizing both to bf16.
     "TPU_MINIMAX_M3_SP_E4M3_QKV": env_bool("TPU_MINIMAX_M3_SP_E4M3_QKV", default=False),
+    # "full" SP: instead of reduce-scattering o_proj's per-rank partial sums
+    # (bf16 [T, hidden]), all-to-all the attention output (bf16 [T, heads/TP x
+    # head_dim], 1/6 of the bytes) so each rank holds every head of its token
+    # shard, and run o_proj over the full input dim on the shard. The full
+    # e4m3 weight is all-gathered per step ("gather") or kept on every rank
+    # from load ("replicate": +7/8 of o_proj's weight bytes per rank, held
+    # by decode steps too; gathered through the host at load, one layer at a
+    # time). Either way the shards are rescaled at load onto
+    # one per-channel scale, which every path (decode included) then uses:
+    # a small change to o_proj's numerics. Needs the armed Pallas TP
+    # all-reduce (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0) for its rank index.
+    "TPU_MINIMAX_M3_SP_A2A_OPROJ": env_with_choices(
+        "TPU_MINIMAX_M3_SP_A2A_OPROJ", "off", ["off", "gather", "replicate"]
+    ),
+    # With TPU_MINIMAX_M3_SP_A2A_OPROJ: the attention heads cross the
+    # all-to-all as e4m3 rows with power-of-two row scales, and o_proj
+    # contracts e4m3 x e4m3 (a change to o_proj's input precision).
+    "TPU_MINIMAX_M3_SP_A2A_E4M3": env_bool("TPU_MINIMAX_M3_SP_A2A_E4M3", default=False),
     # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
     # experts run the permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
