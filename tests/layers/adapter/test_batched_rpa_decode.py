@@ -23,8 +23,6 @@ import torch
 
 from vllm_torchtpu.layers.adapter import attention, batched_rpa_decode, cp_attention
 
-pytestmark = pytest.mark.cpu_test
-
 FP8 = torch.float8_e4m3fn
 
 

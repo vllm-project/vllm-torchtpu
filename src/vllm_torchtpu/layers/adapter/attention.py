@@ -866,6 +866,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
     )
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
+    # Decode lanes from the layer-shape table (batched_rpa_decode). They reach
+    # the batched kernel entry only; the DCP passes keep the wrapper's 8.
     decode_lanes: int | None = None
     # The tuned batched RPA tiles and decode lanes (wrapper.calculate_block_sizes,
     # batched_rpa_decode); off unless a model rule turns them on.
