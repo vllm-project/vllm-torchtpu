@@ -74,6 +74,7 @@ _EXPERT_WEIGHT_SUFFIXES = (
     ".weight",
     ".weight_packed",
     ".weight_scale",
+    ".weight_scale_inv",
     ".weight_scale_2",
     ".input_scale",
     ".scale",
