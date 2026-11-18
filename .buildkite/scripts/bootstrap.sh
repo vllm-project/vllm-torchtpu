@@ -15,6 +15,17 @@
 
 set -euo pipefail
 
+# partner/release-0.0.1 is unmaintained and its CI is retired; skip all builds
+# (including scheduled nightlies) without uploading any CPU/TPU/image steps.
+if [[ "${BUILDKITE_BRANCH:-}" == "partner/release-0.0.1" || "${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-}" == "partner/release-0.0.1" ]]; then
+  echo "CI for partner/release-0.0.1 is disabled (unmaintained release branch). Skipping build."
+  if command -v buildkite-agent >/dev/null 2>&1; then
+    buildkite-agent annotate --style warning --context partner-release-retired \
+      "CI for \`partner/release-0.0.1\` is retired (unmaintained); no steps uploaded." || true
+  fi
+  exit 0
+fi
+
 # Resolve the absolute directory path of the current script.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
