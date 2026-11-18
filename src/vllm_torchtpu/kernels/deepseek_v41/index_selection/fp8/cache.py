@@ -97,6 +97,12 @@ def _record_addresses(records: jax.Array, layout: PackedFP8Layout):
     return base, safe % layout.page_size, valid
 
 
+def _sort_by_slot(bases: jax.Array, columns: jax.Array):
+    """Order records by page, then column, so consecutive slots merge as one run."""
+    order = jnp.arange(bases.size, dtype=jnp.int32)
+    return jax.lax.sort((bases, columns.astype(jnp.int32), order), num_keys=2)
+
+
 def write_fp8_records(
     banks: tuple[jax.Array, ...],
     records: jax.Array,
@@ -114,9 +120,7 @@ def write_fp8_records(
     total_rows = sum(bank.shape[0] for bank in banks)
     valid = (bases >= 0) & (bases + layout.page_rows <= first_rows)
     valid |= (bases >= first_rows) & (bases + layout.page_rows <= total_rows)
-    bases, order = jax.lax.sort_key_val(
-        jnp.where(valid, bases, total_rows), jnp.arange(count, dtype=jnp.int32)
-    )
+    bases, _, order = _sort_by_slot(jnp.where(valid, bases, total_rows), columns)
     _, scales, _ = quantize_index_rows(keys)
     columns, values = prepare_sorted_fp8(keys, columns, order, scales)
     batch = min(count, PACKED_FP8_WRITE_BATCH)
@@ -232,10 +236,8 @@ def write_packed_pages(
     valid = (bases >= 0) & (bases + page_rows <= first_rows)
     if len(banks) == 2:
         valid |= (bases >= first_rows) & (bases + page_rows <= total_rows)
-    bases, order = jax.lax.sort_key_val(
-        jnp.where(valid, bases, total_rows), jnp.arange(count, dtype=jnp.int32)
-    )
-    columns, values = columns[order], values[order]
+    bases, columns, order = _sort_by_slot(jnp.where(valid, bases, total_rows), columns)
+    values = values[order]
     # The final sentinel terminates the last page's merge without an end scan.
     bases = jnp.pad(bases, (0, -count % batch + 1), constant_values=total_rows)
     columns = jnp.pad(columns, (0, -count % batch))
@@ -328,40 +330,70 @@ def _write_sorted_packed_pages(
         copies(write=False, wait=False)
         copies(write=False, wait=True)
 
+        value_lanes, column_count = value_ref.shape[1], column_ref.shape[0]
+        blocks = max(1, page_size // page_tokens)
+        lanes = jax.lax.broadcasted_iota(jnp.int32, (padded_fields, page_tokens), 1)
+        positions = jnp.arange(page_rows * page_tokens).reshape(page_rows, page_tokens)
+
+        def window(slot, start, count):
+            """Merge records start..start+count, whose columns are consecutive."""
+            column = column_ref[start]
+            # Column c takes value lane `start - column + c`: aligned lane
+            # blocks from `origin`, rotated left by `skew`. A block clamped to
+            # the value bounds holds only lanes outside the run, masked below.
+            source = start - column + blocks * page_tokens  # biased >= 0
+            skew = source % page_tokens
+            origin = source - skew - blocks * page_tokens
+            shift = (page_tokens - skew) % page_tokens
+
+            def block(index):
+                index = jnp.clip(origin + index * page_tokens, 0, value_lanes - page_tokens)
+                return pltpu.roll(
+                    value_ref[:, pl.ds(pl.multiple_of(index, page_tokens), page_tokens)],
+                    shift,
+                    1,
+                )
+
+            word = jnp.concatenate(
+                [
+                    jnp.where(
+                        lanes < page_tokens - skew,
+                        block(index),
+                        block(index + 1),
+                    )
+                    for index in range(blocks)
+                ],
+                axis=1,
+            )
+            if page_size < page_tokens:
+                word = word[:, :page_size]
+            word = word.reshape(page_rows, page_tokens)
+            offset = positions % page_size - column
+            pages[slot] = jnp.where(
+                (offset >= 0) & (offset < count) & (positions < fields * page_size),
+                word,
+                pages[slot],
+            )
+
         def merge(slot, carry):
             start = pl.program_id(0) * batch + slot
 
             @pl.when(first(start))
             def _():
-                def update(record):
-                    word = jnp.take_along_axis(
-                        value_ref[
-                            :, pl.ds(record // page_tokens * page_tokens, page_tokens)
-                        ],
-                        jnp.full((padded_fields, page_tokens), record % page_tokens),
-                        axis=1,
-                        mode="fill",
-                    )
-                    if page_size < page_tokens:
-                        word = word[:, :page_size].reshape(page_rows, page_tokens)
-                    elif page_size > page_tokens:
-                        word = jnp.tile(word, (1, page_size // page_tokens)).reshape(
-                            page_rows, page_tokens
-                        )
-                    positions = jnp.arange(page_rows * page_tokens).reshape(
-                        page_rows, page_tokens
-                    )
-                    pages[slot] = jnp.where(
-                        (positions % page_size == column_ref[record])
-                        & (positions < fields * page_size),
-                        word,
-                        pages[slot],
-                    )
-                    return record + 1
+                def same_page(record):
+                    return base_ref[record] == base_ref[start]
 
-                jax.lax.while_loop(
-                    lambda record: base_ref[record] == base_ref[start], update, start
-                )
+                def run(record):
+                    end = jax.lax.while_loop(
+                        lambda end: same_page(end)
+                        & (column_ref[jnp.minimum(end, column_count - 1)] == column_ref[end - 1] + 1),
+                        lambda end: end + 1,
+                        record + 1,
+                    )
+                    window(slot, record, end - record)
+                    return end
+
+                jax.lax.while_loop(same_page, run, start)
 
             return carry
 

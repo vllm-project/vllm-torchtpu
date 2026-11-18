@@ -58,8 +58,13 @@ def test_layout_contract_fallback(monkeypatch, change):
 
 
 @pytest.mark.parametrize("page_size", [128, 256])
-@pytest.mark.parametrize(("tokens", "invalid"), [(128, False), (288, True)])
-def test_sorted_write_matches_native(monkeypatch, page_size, tokens, invalid):
+@pytest.mark.parametrize(
+    ("tokens", "invalid", "contiguous"),
+    [(128, False, False), (288, True, False), (300, False, True)],
+)
+def test_sorted_write_matches_native(
+    monkeypatch, page_size, tokens, invalid, contiguous
+):
     """The fused writer (interpreted) is bitwise the native writer."""
     import functools
 
@@ -88,6 +93,8 @@ def test_sorted_write_matches_native(monkeypatch, page_size, tokens, invalid):
     )
     layout = cache.PackedFP8Layout(pages, stride, offset, page_size)
     records = rng.choice(pages * page_size, tokens, replace=False)
+    if contiguous:  # A prefill chunk: consecutive slots across pages, shuffled.
+        records = rng.permutation(37 + np.arange(tokens))
     if invalid:
         records[: tokens // 4] = -1
     records = jnp.asarray(records, jnp.int32)
