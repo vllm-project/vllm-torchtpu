@@ -37,9 +37,7 @@ prefetches remote KV for waiting requests past a full running set
 (``kv_prefetch``, which lifts ``max_num_active_reqs`` for vLLM's waiting loop
 and enforces the cap itself) and, with decode context parallelism, throttles
 how many remote loads it admits (``decode_inflight_throttle``, through the
-async-load block reservation). The waiting-queue sort helpers below are for
-the pipeline-parallel prefill scheduler (#3090); this scheduler does not
-sort.
+async-load block reservation).
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -48,12 +46,11 @@ Do not name it on a pipeline-parallel (PP > 1) leg: the platform then keeps
 the configured class and turns pipeline chunk sizing off.
 """
 
-import math
 import time
 from bisect import bisect_right
 from itertools import islice
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -71,17 +68,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
 logger = init_logger("vllm." + __name__)
-
-
-@runtime_checkable
-class ExternalHitEstimator(Protocol):
-    """A KV connector that estimates how many prompt tokens past a request's
-    local hit a lookup would load from its external tier (the Raiden
-    offloading connector and the multi-connector of #3083)."""
-
-    def estimate_external_hit_tokens(
-        self, request: Request, num_local_tokens: int
-    ) -> int: ...
 
 
 _LOG_EVERY = 1000
@@ -203,10 +189,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._memo_xstep = False
         if self._is_kv_consumer:
             self._enable_memo_xstep()
-        # The connector's host-tier estimate, for the waiting-queue sort.
-        self._hit_estimator: ExternalHitEstimator | None = (
-            self.connector if isinstance(self.connector, ExternalHitEstimator) else None
-        )
         self._init_kv_prefetch()
 
         logger.info(
@@ -375,128 +357,6 @@ class PrefixAwareScheduler(AsyncScheduler):
             len(self.running),
             len(self.waiting) + len(getattr(self, "kv_holding_waiting", ())),
         )
-
-    # ------------------------------------------------------------------
-    # Waiting-queue sort, for the pipeline chunk scheduler's prefix-aware
-    # admission (#3090), which borrows these helpers and turns the sort on
-    # for a KV producer together with its aging rate. PrefixAwareScheduler
-    # itself does not sort: none of its legs ran the sort, and without an
-    # aging rate a large prompt could be overtaken without bound.
-    #
-    # ``_promote_warmest`` moves one request per queue to the head. With the
-    # sort on, the borrowing scheduler's ``schedule()`` also stable-sorts the
-    # first _PAW_SORT_WINDOW requests of ``waiting`` before the base
-    # scheduler admits from it, so every admission of the step follows the
-    # order. The key is the request's estimated uncached prompt tokens
-    # (prompt minus local HBM hit minus a loadable external hit) minus
-    # the aging rate x seconds waited, which bounds how long a
-    # large prompt can be overtaken. Requests that already hold computed
-    # tokens or were preempted go first, and requests whose uncached tokens
-    # do not fit the free HBM blocks go last, so they cannot stall the head.
-    # ------------------------------------------------------------------
-    _PAW_SORT_LOG_INTERVAL_S = 60.0
-    _PAW_SORT_WINDOW = 128
-
-    def _init_paw_sort(self) -> None:
-        self._paw_sort = bool(getattr(self, "_is_kv_producer", False))
-        self._paw_sort_window = self._PAW_SORT_WINDOW
-        self._paw_sort_steps = 0
-        self._paw_sort_reordered = 0
-        self._paw_sort_moved = 0
-        self._paw_sort_head_cold = 0
-        self._paw_sort_log_t = time.monotonic()
-        if self._paw_sort:
-            logger.info(
-                "PrefixAwareScheduler: waiting-queue SRPF sort ACTIVE "
-                "(window=%d, aging_tok_per_s=%g)",
-                self._paw_sort_window,
-                self._get_paw_aging_rate(),
-            )
-
-    def _paw_sort_key(
-        self,
-        request: Request,
-        now: float,
-        free_blocks: int | None,
-        free_blocks_for_ext: int | None,
-    ) -> tuple[int, int, float, float]:
-        """Sort key of the waiting-queue sort; lower is admitted first."""
-        local_warmth = self._prefix_warmth(request)
-        num_tokens = int(request.num_tokens)
-        hbm_cold_tokens = max(num_tokens - local_warmth, 0)
-        block_size = self._get_block_size()
-        fits_hbm = (
-            free_blocks is None
-            or math.ceil(hbm_cold_tokens / block_size) <= free_blocks
-        )
-        ext_warmth = self._external_warmth(request, local_warmth)
-        if ext_warmth > 0 and not (
-            fits_hbm
-            and (
-                free_blocks_for_ext is None
-                or math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
-            )
-        ):
-            ext_warmth = 0
-        uncached = max(num_tokens - local_warmth - ext_warmth, 0)
-        arrival = float(getattr(request, "arrival_time", now) or now)
-        rate = self._get_paw_aging_rate()
-        aged = uncached - rate * max(0.0, now - arrival)
-        started = (
-            getattr(request, "num_preemptions", 0) > 0
-            or getattr(request, "num_computed_tokens", 0) > 0
-        )
-        return (0 if fits_hbm else 1, 0 if started else 1, aged, arrival)
-
-    def _sort_waiting_queue(self) -> None:
-        """Stable-sort the first _PAW_SORT_WINDOW waiting requests by
-        ``_paw_sort_key`` in place."""
-        queue = self.waiting
-        if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
-            return
-        window = list(islice(queue, self._paw_sort_window))
-        free_blocks = self._get_num_free_blocks()
-        free_blocks_for_ext = free_blocks
-        if (
-            free_blocks is not None
-            and getattr(self, "_is_kv_producer", False)
-            and hasattr(self, "_inflight_prefill_reserved_blocks")
-        ):
-            try:
-                reserved = int(self._inflight_prefill_reserved_blocks() or 0)
-            except Exception:
-                reserved = 0
-            free_blocks_for_ext = max(0, free_blocks - reserved)
-        now = time.time()
-        keys = [
-            self._paw_sort_key(r, now, free_blocks, free_blocks_for_ext) for r in window
-        ]
-        order = sorted(range(len(window)), key=lambda i: (keys[i], i))
-        self._paw_sort_steps += 1
-        head = window[order[0]]
-        self._paw_sort_head_cold += max(
-            int(head.num_tokens) - self._prefix_warmth(head), 0
-        )
-        if order != list(range(len(window))):
-            self._paw_sort_reordered += 1
-            self._paw_sort_moved += sum(1 for pos, i in enumerate(order) if pos != i)
-            # The window is the queue's head: pop it and put it back sorted.
-            for _ in window:
-                queue.pop_request()
-            # prepend_requests reverses its argument (deque.extendleft).
-            queue.prepend_requests([window[i] for i in reversed(order)])
-        now_m = time.monotonic()
-        if now_m - self._paw_sort_log_t >= self._PAW_SORT_LOG_INTERVAL_S:
-            self._paw_sort_log_t = now_m
-            logger.info(
-                "paw-sort telemetry: steps=%d reordered=%d moved=%d "
-                "mean_head_cold_tokens=%.0f waiting=%d",
-                self._paw_sort_steps,
-                self._paw_sort_reordered,
-                self._paw_sort_moved,
-                self._paw_sort_head_cold / max(self._paw_sort_steps, 1),
-                len(queue),
-            )
 
     # ------------------------------------------------------------------
     # Cross-step memo of find_longest_cache_hit.
@@ -672,14 +532,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         return max(
             base, max(min_reserved, per_seq_reserved * (num_running + num_inflight))
         )
-
-    def _get_paw_aging_rate(self) -> float:
-        """Uncached prompt tokens credited per second a request has waited.
-
-        0 (no aging) unless a scheduler that borrows these helpers sets
-        ``_paw_aging_tok_per_s``.
-        """
-        return float(getattr(self, "_paw_aging_tok_per_s", 0.0) or 0.0)
 
     def _note_waiting_stop(self, request: Request, reason: str) -> None:
         """Records why the waiting loop stopped at ``request`` (first stop of
@@ -1051,36 +903,6 @@ class PrefixAwareScheduler(AsyncScheduler):
                         False,
                     )
         return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
-
-    def _external_warmth(self, request: Request, local_warmth: int) -> int:
-        """Prompt tokens past ``local_warmth`` the connector expects to load
-        from its external tier (``_hit_estimator``); 0 on a KV consumer,
-        without an estimating connector, or with less than a block past the
-        local hit. A failing estimate counts as 0; it is logged once per
-        exception type (``warning_once`` keys on the arguments, so the request
-        and the exception text go to the debug log instead)."""
-        if self._is_kv_consumer:
-            return 0
-        estimator = self._hit_estimator
-        if estimator is None:
-            return 0
-        if request.num_tokens - local_warmth < self._get_block_size():
-            return 0
-        try:
-            estimate = estimator.estimate_external_hit_tokens(request, local_warmth)
-            return max(0, int(estimate or 0))
-        except Exception as exc:
-            logger.warning_once(
-                "estimate_external_hit_tokens raised %s; a request whose "
-                "estimate fails is ranked by its local prefix hit only.",
-                type(exc).__name__,
-            )
-            logger.debug(
-                "estimate_external_hit_tokens failed for request %s: %r",
-                request.request_id,
-                exc,
-            )
-            return 0
 
     def _rank_and_warmth(
         self, request: Request
