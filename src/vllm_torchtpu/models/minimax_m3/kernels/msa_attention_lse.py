@@ -74,6 +74,11 @@ _MASK_BIAS = 1e30
 # each, cost ~12 % of a 4-bit 8-token call (r9 kernel bench j-ecb17102).
 LIMIT_TABLE = True
 _LIMIT_TABLE_MIN_TOKENS = msa_attention.SMALL_BATCH_TOKENS
+# 4-bit calls without the table (decode) compute the same [Bq, W] limits in
+# the kernel, once per group: one compare per selection column against the
+# group's pages instead of a compare and a lane reduction per page (13 % of
+# a c64 decode call, kernel bench j-0a524278), then the same spread matmul.
+KERNEL_LIMITS = True
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -104,6 +109,7 @@ def _kernel(
     steps_per_call: int | None = None,
     inline_issue: bool = False,
     limited: bool = False,
+    kernel_limits: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -134,14 +140,15 @@ def _kernel(
     output blocks hold those tiles. With `steps_per_call`, the grid runs
     several calls' steps back to back and ``b`` counts within the call."""
     fp4 = fp4_rows is not None
-    tail = refs[len(refs) - (9 if fp4 else 7) - limited :]
+    spreads = limited or kernel_limits
+    tail = refs[len(refs) - (9 if fp4 else 7) - spreads :]
     o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref = tail[:7]
     scale_hbm_ref = refs[0] if fp4 else None
     scale_buf_ref, scale_sem_ref = tail[7:9] if fp4 else (None, None)
     # `limited`: each union slot's limit per token (`_page_limits`, blocked
     # per grid step) and the one-hot that spreads a page's over its slots.
     limit_ref = refs[1] if limited else None
-    spread_ref = tail[-1] if limited else None
+    spread_ref = tail[-1] if spreads else None
     pages_per_step = buf_ref.shape[1]
     ring = buf_ref.shape[0]  # prefetched groups + the running one
     steps = pl.num_programs(0) if steps_per_call is None else steps_per_call
@@ -256,7 +263,7 @@ def _kernel(
 
         @pl.when(w == 0)
         def _first():
-            if limited:
+            if spreads:
                 key = jax.lax.broadcasted_iota(jnp.int32, spread_ref.shape, 1)
                 slot = jax.lax.broadcasted_iota(jnp.int32, spread_ref.shape, 0)
                 spread_ref[...] = jnp.where(key // page_size == slot, 1, 0).astype(
@@ -448,6 +455,22 @@ def _kernel(
             put((acc_t * (1.0 / jnp.maximum(denom, _denom_floor()))).T)
             lse_ref[...] = (m * _LN_2 + jnp.log(denom)).reshape(lse_ref.shape)
 
+        def group_limits(width, selected, local_page, local_limit):
+            """Each token's limit on the group's first `width` pages, ``[Bq,
+            W]`` (as `_page_limits`): the pages down the sublanes, one compare
+            per selection column."""
+            slot = jax.lax.broadcasted_iota(jnp.int32, (width, 1), 0)
+            pages = jnp.zeros((width, 1), jnp.int32)
+            for g in range(width):
+                page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
+                pages = jnp.where(slot == g, page, pages)
+            sel_t = selected.T  # [K, Bq]
+            hit = sel_t[0:1] == pages
+            for k in range(1, sel_t.shape[0]):
+                hit = hit | (sel_t[k : k + 1] == pages)  # [W, Bq]
+            limit = jnp.where(pages == local_page.T, local_limit.T, page_size)
+            return jnp.where((pages >= 0) & hit, limit, 0).T
+
         def attend(width, single):
             """One softmax update over the group's first `width` slots; a
             `single` group (the tile's only one) needs no carried state."""
@@ -464,11 +487,14 @@ def _kernel(
             local_page = local_page_ref[...]
             local_limit = local_limit_ref[...]
             keys, values, masks, k_scales, v_scales = [], [], [], [], []
-            if limited:  # the group's [Bq, W] limits spread over its W x S slots
+            if limited:
                 row = meta >> msa_attention._ROW_SHIFT
                 limits = limit_ref[
                     row // groups_per_tile % tiles_per_step, row % groups_per_tile
                 ]  # [Bq, pages_per_step]
+            elif kernel_limits:
+                limits = group_limits(width, selected, local_page, local_limit)
+            if spreads:  # the group's [Bq, W] limits spread over its W x S slots
                 limit = jax.lax.dot_general(
                     limits[:, :width].astype(spread_ref.dtype),
                     spread_ref[:width, : width * page_size],
@@ -478,7 +504,7 @@ def _kernel(
                 spot = jax.lax.broadcasted_iota(jnp.int32, (1, width * page_size), 1)
                 masks.append((spot % page_size).astype(jnp.float32) < limit)
             for g, kv_ref in enumerate(kv_refs[:width]):
-                if not limited:
+                if not spreads:
                     page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
                     is_selected = jnp.max(
                         (selected == page).astype(jnp.int32), axis=1, keepdims=True
@@ -514,7 +540,7 @@ def _kernel(
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
                 keys.append(rows[:, :head_dim])
-                if not limited:
+                if not spreads:
                     masks.append(slots < limit)  # [Bq, S]
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
@@ -716,10 +742,10 @@ def _attention_call(
         for x in limits
     ]
     page_size = msa_attention.page_tokens(kv_cache)
+    kernel_limits = KERNEL_LIMITS and fp4 and not limited
     spread = [
         pltpu.VMEM((pages_per_step, pages_per_step * page_size), jnp.bfloat16)
-        for _ in limits
-    ]
+    ] * (limited or kernel_limits)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
         grid=(calls * num_steps,),
@@ -762,6 +788,7 @@ def _attention_call(
             transposed=transposed,
             inline_issue=inline_issue,
             limited=limited,
+            kernel_limits=kernel_limits,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
