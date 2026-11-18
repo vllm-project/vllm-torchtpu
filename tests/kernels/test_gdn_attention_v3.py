@@ -636,6 +636,78 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                     )
                     self.assertEqual(got, expected, msg=label)
 
+    def test_mixed_tile_target_caps_chunk_at_64(self):
+        """C = 64 at n_v >= 64 below 2,048 tokens and on fragmented mixed steps."""
+        # (label, n_v, batch_size, active_num_seqs, window_size, expected)
+        cases = [
+            # Guard 1: n_v >= 64 and batch_size < 2048.
+            ("n64_single_b512", 64, 512, 1, 1, 64),
+            ("n64_single_b1024", 64, 1024, 1, 1, 64),
+            ("n64_mixed_b1024_n93", 64, 1024, 93, 1, 64),
+            ("n64_single_b2048", 64, 2048, 1, 1, 128),
+            ("n64_mixed_b2048_n32", 64, 2048, 32, 1, 128),
+            ("n64_mixed_b8192_n49", 64, 8192, 49, 1, 128),
+            # Guard 2: fewer than max(256, 28 * n_v) prefill tokens remain after
+            # (active_num_seqs - 1) decodes of window_size tokens each.
+            ("n8_ragged_b248_n16", 8, 248, 16, 1, 64),  # 233 < 256
+            ("n8_mixed_b512_n280", 8, 512, 280, 1, 64),  # 233 < 256
+            ("n8_mixed_b1024_n64", 8, 1024, 64, 1, 128),  # 961 >= 256
+            ("n16_mixed_b1024_n329", 16, 1024, 329, 1, 128),  # 696 >= 448
+            ("n16_mixed_b1024_n600", 16, 1024, 600, 1, 64),  # 425 < 448
+            ("n32_mixed_b1024_n16", 32, 1024, 16, 1, 128),  # 1009 >= 896
+            ("n32_mixed_b1024_n160", 32, 1024, 160, 1, 64),  # 865 < 896
+            ("n32_mixed_b2048_n32", 32, 2048, 32, 1, 128),  # 2017 >= 896
+            ("n32_verify_w4_b1024_n64", 32, 1024, 64, 4, 64),  # 772 < 896
+            # Single sequences below 64 heads and decode/verify buckets stay at 128.
+            ("n8_single_b1024", 8, 1024, 1, 1, 128),
+            ("n32_single_b256", 32, 256, 1, 1, 128),
+            ("n8_decode_b16_n16", 8, 16, 16, 1, 128),
+            ("n32_verify_w4_b64_n16", 32, 64, 16, 4, 128),
+        ]
+        for label, n_v, b, n, w, expected in cases:
+            with self.subTest(label=label):
+                got = tiling.mixed_tile_target(b, n, n_v, w)
+                self.assertEqual(got, expected, msg=label)
+
+    def test_get_tile_sizes_takes_min_of_vmem_fit_and_mixed_tile_target(self):
+        """mixed_tile_size = min(mixed_tile_target, VMEM fit) unless overridden."""
+        d_k, d_v, kernel_size, n_kq, n_v = 128, 128, 4, 8, 64  # Qwen 3.8 at TP=2
+        limit_192mib = int(0.80 * 192 * 1024 * 1024)
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            limit_w1 = config.GDNConfig.get_vmem_limit_bytes(1)
+            limit_64mib = config.GDNConfig.get_vmem_limit_bytes()
+
+            def mixed_tile(b, n, mixed_limit, override=None):
+                return tiling.get_tile_sizes(
+                    batch_size=b,
+                    num_seqs=n,
+                    padded_batch_size=b,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    conv_state_dim_size=2 * n_kq * d_k + n_v * d_v,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=128,
+                    decode_vmem_limit_bytes=limit_w1,
+                    mixed_vmem_limit_bytes=mixed_limit,
+                    window_size=1,
+                    mixed_tile_size=override,
+                )[1]
+
+            # 192 MiB VMEM fits C=128 at n_v=64, but the target caps 1,024-token steps.
+            self.assertEqual(mixed_tile(1024, 93, limit_192mib), 64)
+            self.assertEqual(mixed_tile(8192, 1, limit_192mib), 128)
+            # 64 MiB VMEM cannot fit C=128 at n_v=64 even where the target allows it.
+            self.assertEqual(mixed_tile(8192, 1, limit_64mib), 64)
+            # An explicit mixed_tile_size bypasses the heuristic.
+            self.assertEqual(mixed_tile(1024, 93, limit_192mib, override=128), 128)
+
 
 class GDNStatePipelineRaceTest(parameterized.TestCase):
     """CPU interpret-mode checks of the state DMA pipeline."""

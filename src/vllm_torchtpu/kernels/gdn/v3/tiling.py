@@ -37,6 +37,105 @@ def decode_tile_target(num_seqs: int, n_v: int) -> int:
     return next((t for t in DECODE_TILE_SIZES if t * t * n_v <= budget), 1)
 
 
+# Guard 1: at >= 64 value heads per core (Qwen 3.8 at TP=2, Qwen 3.5 at DP=8),
+# the per-head 128x128 float32 chunk tiles spill vector registers to VMEM, so a
+# 128-token chunk costs nearly as much as two 64-token chunks. C = 128 only wins
+# once a batch holds at least 2,048 tokens (16 chunks of 128).
+_HIGH_V_HEAD_THRESHOLD = 64
+_MIN_HIGH_V_HEAD_BATCH_TOKENS_FOR_C128 = 2048
+
+# Guard 2: in a mixed batch, use C = 128 only if the prefill part has at least
+# max(256, 28 * n_v) tokens. Bigger chunks save a fixed setup cost per chunk, but
+# each prefill sequence is padded up to a whole chunk, and that padding costs
+# work on every value head. The crossover is about 28 tokens per value head.
+_MIN_MIXED_PREFILL_TOKENS_FLOOR = 256
+_MIN_MIXED_PREFILL_TOKENS_PER_V_HEAD = 28
+
+
+def has_prefill_tokens(batch_size: int, active_num_seqs: int, window_size: int) -> bool:
+    """Whether a batch holds more tokens than `active_num_seqs` decode windows.
+
+    A pure decode or speculative-verify bucket gives every sequence at most
+    `window_size` tokens (1 for decode, `num_spec_tokens + 1` for verify), so
+    its token count is at most `active_num_seqs * window_size`. Any token
+    beyond that must belong to a sequence being prefilled, which is the only
+    kind of sequence the chunked `PER_SEQ` path pads up to a whole chunk.
+    """
+    return batch_size > active_num_seqs * window_size
+
+
+def min_prefill_tokens_in_batch(
+    batch_size: int, active_num_seqs: int, window_size: int
+) -> int:
+    """Lower bound on the prefill tokens of a mixed batch.
+
+    The slot table says how many sequences are active, not which are prefills.
+    In the worst case for padding, all but one of them are decode or verify
+    windows, so at least `batch_size - (active_num_seqs - 1) * window_size`
+    tokens belong to prefills.
+    """
+    return batch_size - (active_num_seqs - 1) * window_size
+
+
+def mixed_tile_target(
+    batch_size: int,
+    active_num_seqs: int,
+    n_v: int,
+    window_size: int = 1,
+) -> int:
+    """Returns the speed-optimal upper bound (64 or 128) on the mixed chunk size.
+
+    `calculate_mixed_tile_size` only checks whether a chunk fits in VMEM. Even
+    when C = 128 fits, C = 64 is faster in two cases:
+
+    1. `n_v >= 64` and `batch_size < 2048`: the 128x128 per-head tiles spill
+       vector registers, and the batch is too short to amortize the spills.
+    2. Fragmented mixed steps: up to `active_num_seqs - 1` slots hold
+       `window_size`-token decodes, leaving
+       `batch_size - (active_num_seqs - 1) * window_size` prefill tokens. Below
+       `max(256, 28 * n_v)` of them, 128-token ragged-tail padding costs more
+       than the per-chunk overhead it saves.
+
+    Pure decode/verify buckets (no prefill tokens, see `has_prefill_tokens`)
+    are left uncapped at 128.
+
+    Args:
+        batch_size: Total unpadded token count in the batch.
+        active_num_seqs: Upper bound on active sequences in the batch.
+        n_v: Number of value heads per device.
+        window_size: Tokens per decode or speculative-verify sequence.
+
+    Returns:
+        Upper bound on the prefill/mixed chunk size (64 or 128).
+    """
+    max_chunk = MIXED_TILE_SIZES[0]
+
+    # Guard 1: register spills at high value-head counts.
+    if (
+        n_v >= _HIGH_V_HEAD_THRESHOLD
+        and batch_size < _MIN_HIGH_V_HEAD_BATCH_TOKENS_FOR_C128
+    ):
+        return min(max_chunk, 64)
+
+    # Guard 2: ragged-tail padding on fragmented mixed steps. Only a batch
+    # with more than one active sequence and at least one prefill token can
+    # be fragmented; a single prefill or a pure decode/verify bucket is not.
+    if active_num_seqs > 1 and has_prefill_tokens(
+        batch_size, active_num_seqs, window_size
+    ):
+        effective_prefill_tokens = min_prefill_tokens_in_batch(
+            batch_size, active_num_seqs, window_size
+        )
+        min_prefill_tokens = max(
+            _MIN_MIXED_PREFILL_TOKENS_FLOOR,
+            _MIN_MIXED_PREFILL_TOKENS_PER_V_HEAD * n_v,
+        )
+        if effective_prefill_tokens < min_prefill_tokens:
+            return min(max_chunk, 64)
+
+    return max_chunk
+
+
 def align_to(x: int, alignment: int) -> int:
     """Aligns an integer upward to the nearest multiple of alignment."""
     return pl.cdiv(x, alignment) * alignment
@@ -216,7 +315,7 @@ def calculate_mixed_tile_size(
 ) -> int:
     """Largest prefill chunk whose VMEM estimate fits the limit.
 
-    Searches candidate tile sizes within maximum VMEM capacity limits.
+    The speed optimum is mixed_tile_target; this is the feasibility ceiling.
 
     Args:
       seq_len: Upper bound on the longest prefill sequence, in tokens.
@@ -344,9 +443,9 @@ def get_tile_sizes(
         decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
 
     if mixed_tile_size is None or mixed_tile_size <= 0:
-        # Size the prefill/mixed chunk from batch_size rather than comparing
-        # against num_seqs * window_size, because num_seqs can be a static slot
-        # capacity (such as under DCP=4) when a single prefill occupies the bucket.
+        # Take the smaller of the largest chunk that fits in VMEM
+        # (`calculate_mixed_tile_size`) and the speed-optimal chunk bound
+        # (`mixed_tile_target`), mirroring `decode_tile_size` above.
         vmem_fit = calculate_mixed_tile_size(
             seq_len=batch_size,
             n_kq=n_kq,
@@ -360,7 +459,15 @@ def get_tile_sizes(
             vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
             kernel_size=kernel_size,
         )
-        mixed_tile_size = vmem_fit
+        mixed_tile_size = min(
+            mixed_tile_target(
+                batch_size=batch_size,
+                active_num_seqs=active_num_seqs,
+                n_v=n_v,
+                window_size=window_size,
+            ),
+            vmem_fit,
+        )
 
     # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation,
     # keeping mixed_tile_size a power of two so triangular_block_size divides it.
