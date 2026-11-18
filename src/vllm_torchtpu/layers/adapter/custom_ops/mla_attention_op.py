@@ -2016,11 +2016,6 @@ class VllmTPUMLAAttention(MLAAttention):
                     if self.W_UV_tp_all.device.type == "tpu":
                         synchronize_tensors([self.W_UV_tp_all])
                     self._build_o_proj_pair_half(dcp_group)
-                # Avoid leaving TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES's whole-K
-                # o_proj resident where no half was cut from it: 100 MB/layer.
-                source = getattr(self, "sp_o_proj_source", None)
-                if source and getattr(source[0], "weight_dcp", None) is not None:
-                    del source[0].weight_dcp, source[0].weight_scale_dcp
                 indexer_op = getattr(self.indexer, "indexer_op", None)
                 if (
                     self.dcp_q_replicate
@@ -2059,6 +2054,13 @@ class VllmTPUMLAAttention(MLAAttention):
                             send_layout=True,
                             fused_exchange=True,
                         )
+
+        # Avoid leaving TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES's whole-K o_proj
+        # resident wherever no half was cut from it (no token-parallel op, no
+        # DCP, a refused layer): 100 MB/layer.
+        source = getattr(self, "sp_o_proj_source", None)
+        if source and getattr(source[0], "weight_dcp", None) is not None:
+            del source[0].weight_dcp, source[0].weight_scale_dcp
 
         # Post-load work the owning wrapper registered: it holds the q / kv_a
         # projections, but is not itself visited by the loader's attention
@@ -2246,8 +2248,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # o_proj's finished shard (a tuple, so it is not a second submodule).
         self.mla_attn.sp_o_proj_source = (self.o_proj,)
         if (
-            envs.TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES
+            envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
+            and envs.TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES
             and envs.TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES
+            and getattr(self.mla_attn, "token_parallel_layout", None) is not None
             and not getattr(self.o_proj, DCP_ROWS_ATTR, False)
             and self.mla_attn.dcp_q_replicate
             and self.g_proj is None

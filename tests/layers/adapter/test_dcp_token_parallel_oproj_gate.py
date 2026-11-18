@@ -14,12 +14,17 @@
 """Which o_proj shards the token-parallel sequence-row o_proj takes."""
 
 import types
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+from vllm_torchtpu.layers.adapter.linear_common import (
+    DCP_ROWS_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 
 K_SHARD, N_OUT = 128, 256
 
@@ -58,3 +63,47 @@ def test_should_serve_canonical_fp8_per_channel_shard():
 )
 def test_should_refuse_shard_the_projection_cannot_take(layer):
     assert not dcp_token_parallel_op.serves_sequence_row_oproj(layer)
+
+
+def _wrapper_o_proj(token_parallel_layout):
+    """The MLA wrapper's o_proj, built with the attention stubbed to `layout`.
+
+    o_proj is a plain namespace, so an attribute the wrapper sets is observable."""
+
+    def fake_attention_init(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.token_parallel_layout = token_parallel_layout
+        self.dcp_q_replicate = True
+
+    mla_modules = MagicMock()
+    mla_modules.o_proj = types.SimpleNamespace()
+    mla_modules.g_proj = None
+    mla_modules.indexer = None
+    mla_modules.indexer_rotary_emb = None
+    mla_modules.is_sparse = True
+    with patch.object(
+        mla_attention_op.VllmMLAAttention, "__init__", fake_attention_init
+    ):
+        wrapper = mla_attention_op.VllmMultiHeadLatentAttentionWrapper(
+            hidden_size=1024,
+            num_heads=16,
+            scale=1.0,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            v_head_dim=256,
+            q_lora_rank=None,
+            kv_lora_rank=512,
+            mla_modules=mla_modules,
+        )
+    return wrapper.o_proj
+
+
+@pytest.mark.parametrize(
+    ("layout", "expect_rows"), [(None, False), (object(), True)], ids=["off", "on"]
+)
+def test_should_request_whole_k_o_proj_only_when_token_parallel_prefill_is_armed(
+    layout, expect_rows
+):
+    o_proj = _wrapper_o_proj(layout)
+
+    assert bool(getattr(o_proj, DCP_ROWS_ATTR, False)) is expect_rows
