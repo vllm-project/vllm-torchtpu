@@ -463,6 +463,16 @@ def _all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, 0).narrow(0, 0, num_tokens)
 
 
+def _zero_rank_dependency(tensor: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
+    # Avoid omitting this zero-delta dependency: without tying rank to the
+    # shared-expert output, XLA schedules shared_expert_blocked_down after
+    # fused_ep_moe_v2 instead of overlapping it inside MoE's async FP8
+    # all-gather. Reinterpreting low bits as int16->float32 keeps f - f == 0
+    # for all bit patterns (including NaN/Inf) while surviving simplification.
+    bits_f32 = tensor[:1, :1].reshape(1).view(torch.int16)[:1].to(torch.float32)
+    return rank + (bits_f32 - bits_f32).reshape(rank.shape).to(rank.dtype)
+
+
 def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
     """The MoE block on this rank's rows: routed (fused EP, own tokens) times
     the routed scale, plus the shared expert -- the runner's order."""
@@ -476,6 +486,8 @@ def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
             tp,
         )
         router_logits = torch.where(pad_mask[:, None], float("nan"), router_logits)
+    shared = _shared_expert(mlp, x)
+    routed_rank = _zero_rank_dependency(shared, rank)
     routed = fused_moe_ep.run_sequence_parallel_op(
         getattr(mlp, OP_ATTR),
         x,
@@ -484,13 +496,13 @@ def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
         experts.w13_weight_scale_inv,
         experts.w2_weight_scale_inv,
         router_logits,
-        rank,
+        routed_rank,
         experts.e_score_correction_bias,
     )
     scale = getattr(mlp, SCALE_ATTR)
     if scale != 1.0:
         routed = routed * scale
-    return _shared_expert(mlp, x) + routed
+    return shared + routed
 
 
 def _sequence_parallel_layer_forward(

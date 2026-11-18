@@ -949,3 +949,90 @@ def test_should_keep_single_submod_output_when_dense_sp_disarms_post_norm_prequa
 
     shapes = _run_handover_prequant_case(disarm=True)
     assert shapes == [(4, 8), (8, 8), (64, 8)]
+
+
+@pytest.mark.parametrize(
+    "first_val,dtype",
+    [
+        (float("nan"), torch.bfloat16),
+        (float("inf"), torch.bfloat16),
+        (float("-inf"), torch.bfloat16),
+        (-0.0, torch.bfloat16),
+        (float("nan"), torch.float32),
+    ],
+)
+def test_should_order_shared_before_routed_and_preserve_rank_for_edge_bit_patterns(
+    first_val, dtype
+):
+    events: list[str] = []
+    seen_ranks: list[int] = []
+    rank = torch.tensor([[7]], dtype=torch.int32)
+    tp = 4
+    num_tokens = 1024
+    rows = num_tokens // tp
+    positions = torch.arange(num_tokens, dtype=torch.int32)
+    hidden = torch.randn((rows, 8), dtype=dtype)
+    residual = torch.randn((rows, 8), dtype=dtype)
+    shared_out = torch.full((rows, 8), 2.5, dtype=dtype)
+    shared_out[0, 0] = first_val
+    routed_out = torch.full((rows, 8), 1.5, dtype=dtype)
+
+    def fake_shared_op(_x, *_weights):
+        events.append("shared")
+        return shared_out
+
+    def fake_routed_op(_op, _x, _w13, _w2, _s13, _s2, _logits, r, _bias):
+        events.append("routed")
+        seen_ranks.append(int(r.item()))
+        assert r is not rank
+        assert r.shape == rank.shape
+        assert r.dtype == rank.dtype
+        return routed_out
+
+    routed_experts = SimpleNamespace(
+        w13_weight=torch.zeros((1,)),
+        w2_weight=torch.zeros((1,)),
+        w13_weight_scale_inv=torch.zeros((1,)),
+        w2_weight_scale_inv=torch.zeros((1,)),
+        e_score_correction_bias=None,
+    )
+    mlp = SimpleNamespace(
+        experts=SimpleNamespace(routed_experts=routed_experts),
+        gate=lambda z: (torch.zeros((z.shape[0], 2)), None),
+    )
+    setattr(mlp, sp.OP_ATTR, object())
+    setattr(mlp, sp.SCALE_ATTR, 2.0)
+    setattr(mlp, sp.SHARED_OP, fake_shared_op)
+    setattr(mlp, sp.SHARED_ATTR, (torch.zeros((1,)),))
+    setattr(mlp, sp.SHARED_INDEX, 0)
+
+    layer = SimpleNamespace(
+        input_layernorm=lambda h, res=None: (h, res if res is not None else h),
+        post_attention_layernorm=lambda h, res: (h, res),
+        self_attn=SimpleNamespace(
+            mla_attn=lambda _pos, h, _scale, prefill_group=None: h
+        ),
+        mlp=mlp,
+    )
+    setattr(layer, sp.KEEP_ATTR, ())
+
+    with (
+        patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp),
+        patch.object(sp.fused_moe_ep, "rank_operand", return_value=rank),
+        patch.object(
+            sp.fused_moe_ep, "run_sequence_parallel_op", side_effect=fake_routed_op
+        ),
+        patch.object(sp.envs, "TPU_MOE_SKIP_PADDED_TOKENS", False),
+    ):
+        out, out_res = sp.patched_decoder_layer_forward(
+            layer, positions, hidden, residual
+        )
+
+    assert events == ["shared", "routed"]
+    assert seen_ranks == [7]
+    torch.testing.assert_close(out_res, residual)
+    torch.testing.assert_close(out[1:], (shared_out + routed_out * 2.0)[1:])
+    if torch.isnan(torch.tensor(first_val)):
+        assert torch.isnan(out[0, 0])
+    else:
+        torch.testing.assert_close(out[0, 0], shared_out[0, 0] + routed_out[0, 0] * 2.0)
