@@ -20,6 +20,24 @@ import torch
 from vllm_torchtpu.distributed import tpu_communicator as comm
 
 
+def _assert_one_packed_gather(group, result, tensors):
+    """Dispatch issued one packed all-gather and unpacked it exactly.
+
+    The fake all-gather appends the input with its rows reversed, standing in
+    for a second rank's distinct rows.
+    """
+    assert group.all_gather.call_count == 1
+    packed = group.all_gather.call_args.args[0]
+    assert packed.dtype == tensors[0].dtype
+    assert group.all_gather.call_args.kwargs == {"dim": 0}
+    assert len(result) == len(tensors)
+    for actual, expected in zip(result, tensors):
+        torch.testing.assert_close(
+            actual, torch.cat([expected, expected.flip(0)]), rtol=0, atol=0
+        )
+    group.reduce_scatter.assert_not_called()
+
+
 @pytest.fixture
 def communicator(monkeypatch):
     def init(instance, *args, **kwargs):
@@ -58,7 +76,7 @@ def test_dispatch_and_combine_use_dp_group(
     group = Mock(world_size=dp_size)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
     tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
-    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x.flip(0)], dim=dim)
     group.reduce_scatter.return_value = torch.tensor([[11, 12]])
     result = getattr(communicator, method)(*tensors)
     if method == "combine":
@@ -74,15 +92,7 @@ def test_dispatch_and_combine_use_dp_group(
         assert all(actual is expected for actual, expected in zip(result, tensors))
         group.all_gather.assert_not_called()
     else:
-        assert len(result) == count
-        for actual, expected, invocation in zip(
-            result, tensors, group.all_gather.call_args_list
-        ):
-            torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
-            assert invocation.args[0] is expected
-            assert invocation.kwargs == {"dim": 0}
-        assert group.all_gather.call_count == count
-        group.reduce_scatter.assert_not_called()
+        _assert_one_packed_gather(group, result, tensors)
 
 
 @pytest.mark.parametrize(
@@ -125,7 +135,7 @@ def test_dispatch_and_combine_with_sequence_parallel(
     ep_group = Mock(world_size=8)
     monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
     tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
-    ep_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
+    ep_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x.flip(0)], dim=dim)
     ep_group.reduce_scatter.return_value = torch.tensor([[11, 12]])
 
     result = getattr(communicator, method)(*tensors, is_sequence_parallel=True)
@@ -134,12 +144,94 @@ def test_dispatch_and_combine_with_sequence_parallel(
         assert result is ep_group.reduce_scatter.return_value
         ep_group.all_gather.assert_not_called()
     else:
-        assert len(result) == count
-        for actual, expected, invocation in zip(
-            result, tensors, ep_group.all_gather.call_args_list
-        ):
-            torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
-            assert invocation.args[0] is expected
-            assert invocation.kwargs == {"dim": 0}
-        assert ep_group.all_gather.call_count == count
-        ep_group.reduce_scatter.assert_not_called()
+        _assert_one_packed_gather(ep_group, result, tensors)
+
+
+def test_packed_gather_is_bit_exact_across_dtypes_and_shapes(monkeypatch, communicator):
+    """bf16 hidden states (with inf/nan), fp32 weights and int32 ids, with a
+    trailing extra dim, survive the byte packing bit for bit."""
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x.flip(0)], dim=dim)
+    hidden = torch.randn(3, 2, 4).to(torch.bfloat16)
+    hidden[0, 0, 0] = float("inf")
+    hidden[1, 1, 3] = float("nan")
+    weights = torch.rand(3, 8, dtype=torch.float32)
+    ids = torch.randint(0, 256, (3, 8), dtype=torch.int32)
+
+    out = communicator.dispatch(hidden, weights, ids)
+
+    assert group.all_gather.call_count == 1
+    for actual, expected in zip(out, (hidden, weights, ids)):
+        reference = torch.cat([expected, expected.flip(0)])
+        assert actual.dtype == expected.dtype
+        assert actual.shape == reference.shape
+        assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
+
+
+def test_packed_gather_handles_zero_tokens(monkeypatch, communicator):
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
+    hidden = torch.empty(0, 4, dtype=torch.bfloat16)
+    logits = torch.empty(0, 6, dtype=torch.float32)
+
+    out_hidden, out_logits = communicator.dispatch_router_logits(hidden, logits)
+
+    assert out_hidden.shape == (0, 4) and out_hidden.dtype == torch.bfloat16
+    assert out_logits.shape == (0, 6) and out_logits.dtype == torch.float32
+
+
+def test_packed_gather_rejects_mismatched_token_counts(monkeypatch, communicator):
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    with pytest.raises(ValueError, match="same token count"):
+        communicator.dispatch_router_logits(torch.ones(2, 4), torch.ones(3, 4))
+    group.all_gather.assert_not_called()
+
+
+def test_packed_gather_carrier_is_the_hidden_state_dtype(monkeypatch, communicator):
+    """fp32 logits ride inside a bf16 carrier as two bf16 lanes per value."""
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
+    hidden = torch.randn(4, 6).to(torch.bfloat16)
+    logits = torch.randn(4, 5, dtype=torch.float32)
+
+    communicator.dispatch_router_logits(hidden, logits)
+
+    packed = group.all_gather.call_args.args[0]
+    assert packed.dtype == torch.bfloat16
+    assert packed.shape == (4, 6 + 2 * 5)
+
+
+def test_packed_gather_falls_back_when_sizes_do_not_divide(monkeypatch, communicator):
+    """A carrier wider than another tensor's elements cannot hold it; each
+    tensor is then gathered on its own."""
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
+    hidden = torch.randn(4, 6, dtype=torch.float32)
+    logits = torch.randn(4, 5).to(torch.bfloat16)
+
+    out_hidden, out_logits = communicator.dispatch_router_logits(hidden, logits)
+
+    assert group.all_gather.call_count == 2
+    torch.testing.assert_close(out_hidden, torch.cat([hidden, hidden]))
+    torch.testing.assert_close(out_logits, torch.cat([logits, logits]))
+
+
+def test_prefill_sized_steps_are_gathered_tensor_by_tensor(monkeypatch, communicator):
+    """Above the decode-size cap the copies outweigh the saved collective."""
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
+    num_tokens = comm._PACK_MAX_TOKENS + 1
+    hidden = torch.zeros(num_tokens, 4, dtype=torch.bfloat16)
+    logits = torch.zeros(num_tokens, 3, dtype=torch.float32)
+
+    communicator.dispatch_router_logits(hidden, logits)
+
+    assert group.all_gather.call_count == 2
+    assert group.all_gather.call_args_list[0].args[0] is hidden
+    assert group.all_gather.call_args_list[1].args[0] is logits
