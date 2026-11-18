@@ -115,11 +115,14 @@ def _reference(inp, reqs):
 
 
 _ROW, _STATIC = configs.Fp8Operand.ROW, configs.Fp8Operand.STATIC
-# q at 3 mantissa bits dominates the native QK rows, as in the decode test.
+# Native QK casts q to fp8 (3 mantissa bits), per row for ROW and as is for
+# STATIC; that rounding dominates the error of the QK modes.
 _MODES = {
     "off": (configs.NativeFp8(), 0.03),
     "pv": (configs.NativeFp8(pv=_ROW), 0.03),
     "pv_static": (configs.NativeFp8(pv=_STATIC), 0.03),
+    "qk": (configs.NativeFp8(qk=_ROW), 0.12),
+    "qk_pv": (configs.NativeFp8(qk=_ROW, pv=_ROW), 0.12),
     "qk_static": (configs.NativeFp8(qk=_STATIC), 0.12),
     "qk_static_pv_static": (configs.NativeFp8(qk=_STATIC, pv=_STATIC), 0.12),
 }
@@ -150,8 +153,9 @@ def test_prefill_fp8_kv(mode, reqs):
         v_scale=1.0,
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         native_fp8_prefill=native_fp8_prefill,
-        # The tiles and call structure of the Qwen3.5 shapes these modes are
-        # tuned for.
+        # The tile rules and call structure the Qwen3.5 rule turns on. The
+        # prefill tile table has no entry for 4 q / 1 KV heads, so the
+        # tuned rules' heuristic tiles run.
         tuned_tiles=True,
         skip_empty_mixed=True,
     )
