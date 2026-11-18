@@ -61,18 +61,19 @@ class Qwen35Settings:
     and the exponentials are exp2. Equal to the base-e softmax in exact
     arithmetic, but where the scale is folded into a bf16 q it is rounded to
     bf16: at head_dim 256, 0.09016844 becomes 0.09033203, so the scores are
-    scaled 0.18% more. A speed/precision trade-off, off by default; the IX
-    decode legs ran it (TPU_RPA_DECODE_EXP2=1). It does nothing on a PD
-    prefill leg (kv_producer), whose decode kernel the IX prefill legs ran in
-    base e, and an engine that is neither refuses it. Speculative draft layers
-    never use it."""
+    scaled 0.18% more. A speed/precision trade-off, off by default; the
+    validation entries' decode legs run it (TPU_RPA_DECODE_EXP2=1). It does
+    nothing on a PD prefill leg (kv_producer), whose decode kernel their
+    prefill legs run in base e, and an engine that is neither refuses it.
+    Speculative draft layers never use it."""
 
     native_fp8_attention: bool = False
     """Run the target model's batched RPA P.V matmul natively in fp8 with a
-    static operand scale (Fp8Operand.STATIC on PV) in the kernels the IX legs
-    ran it in: the prefill and mixed kernels on a PD prefill leg (kv_role
-    kv_producer; TPU_RPA_NATIVE_FP8_PREFILL=pvs) and the decode kernel on a PD
-    decode leg (kv_consumer; TPU_RPA_NATIVE_FP8=pvs). The other kernels of
+    static operand scale (Fp8Operand.STATIC on PV) in the kernels the
+    validation entries' legs run it in: the prefill and mixed kernels on a
+    PD prefill leg (kv_role kv_producer; TPU_RPA_NATIVE_FP8_PREFILL=pvs) and
+    the decode kernel on a PD decode leg (kv_consumer;
+    TPU_RPA_NATIVE_FP8=pvs). The other kernels of
     each leg keep the full-precision P.V, and an engine that is neither
     refuses the setting. A speed/precision trade-off, off by default.
     Speculative draft layers never use it."""

@@ -1794,12 +1794,13 @@ def _qwen3_5_attention_modes(
     """The reduced-precision modes the Qwen3.5 settings ask of target layers
     (off for any other model).
 
-    The settings act per PD leg, in the kernels the IX legs ran them in. On a
-    prefill leg (kv_role kv_producer), native_fp8_attention runs the P.V
-    matmul of the prefill and mixed kernels in fp8 and exp2_softmax does
-    nothing. On a decode leg (kv_consumer), native_fp8_attention runs the
-    decode kernel's P.V matmul in fp8 and exp2_softmax its softmax in base 2.
-    An engine that is neither refuses them.
+    The settings act per PD leg, in the kernels the validation entries' legs
+    run them in. On a prefill leg (kv_role kv_producer), native_fp8_attention
+    runs the P.V matmul of the prefill and mixed kernels in fp8 and
+    exp2_softmax does nothing. On a decode leg (kv_consumer),
+    native_fp8_attention runs the decode kernel's P.V matmul in fp8 and
+    exp2_softmax its softmax in base 2. An engine that is neither refuses
+    them.
     """
     from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 

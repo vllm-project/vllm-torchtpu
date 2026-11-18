@@ -13,8 +13,8 @@
 # limitations under the License.
 """The Qwen3.5 trade-off settings native_fp8_attention and exp2_softmax: they
 parse strictly, are off by default, and set the target layers' batched RPA
-modes per PD leg, in the kernels the IX legs ran them in (speculative draft
-layers stay at full precision; see
+modes per PD leg, in the kernels the validation entries' legs run them in
+(speculative draft layers stay at full precision; see
 tests/layers/adapter/test_native_fp8_draft_scope.py)."""
 
 from types import SimpleNamespace
