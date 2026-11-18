@@ -1159,6 +1159,7 @@ def test_rollback_warmup_compiles_the_fused_spec_seed_program(
         _mamba_copy_plan=[(0, [])],
         kv_cache_config=None,
         max_num_reqs=10,
+        speculative_config=None,
         _bucket_len=TPUModelRunner._bucket_len,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
     )
