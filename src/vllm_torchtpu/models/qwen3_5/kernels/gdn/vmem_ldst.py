@@ -19,6 +19,8 @@
 # Changes from the source:
 # - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
 #   (main lists the source's errors in .pyrefly-baseline-full.json).
+# - With GDNConfig.step_trims, lane-aligned heads are sliced out of the conv
+#   output in registers instead of a VMEM store and reload.
 
 import jax
 import jax.numpy as jnp

@@ -23,6 +23,9 @@
 #   transposes k up front.
 # - chunked_gdn_per_seq computes (beta k) k^T as diag(beta) (k k^T), one dot
 #   per kq head, at config.SHARED_KKT_SHAPES only.
+# - recurrent_gdn_per_seq's fused 1-dot form (GDNConfig.fused_1dot,
+#   config.FUSED_1DOT_SHAPES): one dot against the undecayed state gives k S
+#   and q S, and the decay is applied to the products.
 
 import jax
 import jax.numpy as jnp

@@ -19,6 +19,9 @@
 # Changes from the source:
 # - causal_conv1d_out and conv_state_rows: the conv output rows and the conv
 #   state of a PER_SEQ chunked tile, for wrapper.py's lazy conv state.
+# - causal_conv1d's per-step trims (GDNConfig.step_trims, config.TILER_SHAPES):
+#   the conv taps start from the first product instead of a zero
+#   (_conv_out_rows, which causal_conv1d_out shares).
 
 import jax
 import jax.numpy as jnp

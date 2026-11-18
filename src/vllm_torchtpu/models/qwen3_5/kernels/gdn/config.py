@@ -20,6 +20,10 @@
 # - GDNConfig.qkv_2d and the act_scratch_ref scratch for 2D bf16 qkv rows.
 # - SHARED_KKT_SHAPES and GDNConfig.shared_kkt, read by
 #   compute_gdn.chunked_gdn_per_seq.
+# - TILER_SHAPES and GDNConfig.step_trims (the tiler and per-step trims), and
+#   FUSED_1DOT_SHAPES and GDNConfig.fused_1dot (the fused 1-dot recurrence).
+# - gdn_triangular_block_size: GDNConfig.triangular_block_size's GDN rule, which
+#   wrapper.py also reads.
 
 import dataclasses
 import enum

@@ -16,7 +16,12 @@
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
-# Changes from the source: none.
+# Changes from the source:
+# - compute_batched_seq_metadata pads its tables to whole decode tiles, so any
+#   tile divides the slot count.
+# - compute_per_seq_metadata sizes its tables by the tile-count bound
+#   cdiv(tokens, chunk) + sequences (one more per sequence with a prefill
+#   checkpoint) instead of the token count.
 
 import jax
 import jax.numpy as jnp
