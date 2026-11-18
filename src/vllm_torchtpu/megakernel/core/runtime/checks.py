@@ -127,7 +127,7 @@ def build_global_avals(
     if spec.cache_backend.has_recurrent_pool:
         avals += [((g_per_att, ex.NS, k_ckpt), i32), ((g_per_att, ex.NS), i32)]
     for x in extra_inputs(spec, ex):
-        lead = r_cnt if x.memory_space == "hbm" else 1
+        lead = r_cnt if x.sharded else 1
         avals.append(((lead * x.shape[0], *x.shape[1:]), x.dtype))
     return [_Sds(sh, dt) for sh, dt in avals]
 

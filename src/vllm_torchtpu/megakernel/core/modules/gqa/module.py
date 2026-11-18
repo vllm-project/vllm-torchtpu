@@ -36,6 +36,7 @@ from ...module import Module
 from ...ops import BF16, F32, FP8, I32, kv_page_shape
 from ...pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from ...spec import ExtraInput, SmallField, StateDecl, WeightDecl
+from ...token_io import ROPE_CACHE_INPUT, token_io
 from .attention import att_core
 from .context import GQAEmit
 from .decls import (
@@ -153,6 +154,19 @@ class GQAModule(Module):
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
         if not self.rope_table:
             return []
+        if (tio := token_io(ex)) is not None:
+            # Token step I/O: the rows' cos / sin come from the runner's cache.
+            if tio.rope_cols != g.ROT:
+                raise MegakernelConfigError(
+                    f"GQAModule rotates {g.ROT} dims; the RoPE cache has "
+                    f"{tio.rope_cols} columns"
+                )
+            shape = (tio.rope_rows, tio.rope_cols)
+            return [
+                ExtraInput(
+                    ROPE_CACHE_INPUT, "hbm", shape, tio.rope_dtype, replicated=True
+                )
+            ]
         return [ExtraInput(ROPE_TABLE_INPUT, "hbm", (2, ex.MR, g.ROT // 2), F32)]
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:

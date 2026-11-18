@@ -33,6 +33,8 @@ from ..ops import BF16, F32, FP8, round_up
 from ..planner import Plan, extra_inputs, plan
 from ..profiles.default import chip_budget
 from ..spec import ModelSpec, ScratchReq
+from ..token_io import HEAD_KIND, token_io
+from ..token_io import scratch as token_scratch
 from . import pool_alias
 
 logger = logging.getLogger(__name__)
@@ -285,6 +287,13 @@ def build_scratch(
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}
     vdtype = {k: kinds[k][2] for k in kinds}
+    tio = token_io(ex)
+    if tio is not None:  # LM head tiles stream through the dense ring banks
+        vshape[HEAD_KIND], vdtype[HEAD_KIND] = (H, tio.tile), BF16
+        if pool_alias.storage_size(vshape[HEAD_KIND], jnp.dtype(BF16)) > tiles.bank:
+            raise MegakernelConfigError(
+                f"LM head tile {vshape[HEAD_KIND]} bf16 exceeds a {tiles.bank} B bank"
+            )
     for k in kinds:
         assert pool_alias.storage_size(vshape[k], jnp.dtype(vdtype[k])) <= (
             tiles.ebank if k in p.dynamic_kinds else tiles.bank
@@ -309,6 +318,10 @@ def build_scratch(
         scratch["esem"] = pltpu.SemaphoreType.DMA((NBE,))
 
     scratch.update(stage_scratch(cp))
+    if tio is not None:
+        from ..pool.config import resolved_max_pages_per_seq
+
+        scratch.update(token_scratch(ex, H, resolved_max_pages_per_seq(ex)))
 
     phase_map: dict[str, str] = {k: "persistent" for k in scratch}
 
@@ -318,7 +331,8 @@ def build_scratch(
         _merge_scratch(scratch, phase_map, reqs)
 
     if typed:
-        for k in p.static_kinds:
+        head = (HEAD_KIND,) if tio is not None else ()
+        for k in (*p.static_kinds, *head):
             scratch["dring_" + k] = pltpu.VMEM((NBD,) + vshape[k], vdtype[k])
             phase_map["dring_" + k] = "persistent"
         for k in p.dynamic_kinds:

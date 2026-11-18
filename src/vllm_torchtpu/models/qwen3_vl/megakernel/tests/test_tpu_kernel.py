@@ -18,7 +18,10 @@ runs one paged decode step with RoPE from a per-row table at an M-RoPE
 position 7 below the KV index, and the ungated attention, bf16 KV pages and
 dense FFN through the whole model reference, at the page sizes vLLM picks:
 128 tokens, and 512 when its SMEM page-table bound raises the block size. The
-in-kernel KV write (`fused_pool_io`) matches the scatter program bitwise.
+in-kernel KV write (`fused_pool_io`) matches the scatter program bitwise, and
+the whole-step kernel (`TokenIO`: runner tensors in, greedy tokens out) leaves
+the same pages and returns the greedy tokens of the hidden step's output, ties
+going to the lowest id.
 """
 
 from __future__ import annotations
@@ -32,7 +35,8 @@ import pytest  # pyrefly: ignore[missing-import]
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel.core import CacheExec, ExecSpec, cache, pool
+from vllm_torchtpu.megakernel.core import CacheExec, ExecSpec, cache, planner, pool
+from vllm_torchtpu.megakernel.core import token_io as tio_mod
 from vllm_torchtpu.megakernel.core.modules.gqa.decls import ROPE_TABLE_INPUT
 from vllm_torchtpu.megakernel.core.ops import BF16, F32
 from vllm_torchtpu.megakernel.core.weights.synthetic import (
@@ -79,8 +83,13 @@ def test_kernel_matches_model_reference(page_size: int, kv_blk: int) -> None:
         T=1,
         ctx=4 * page_size,
         tiles=tiny_tiles(kv_blk=kv_blk),
+        # 64 MiB pools: XLA stages a pool small enough for VMEM in a copy, which
+        # an in-kernel KV write would miss (the serving pools are ~1.2 GB).
         cache=CacheExec(
-            paged_kv=True, page_size=page_size, num_pages=16, max_pages_per_seq=4
+            paged_kv=True,
+            page_size=page_size,
+            num_pages=(64 << 20) // (256 * page_size * 2),
+            max_pages_per_seq=4,
         ),
     )
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
@@ -126,6 +135,10 @@ def test_kernel_matches_model_reference(page_size: int, kv_blk: int) -> None:
             np.asarray(a).view(np.uint16), np.asarray(b).view(np.uint16)
         )
 
+    _check_token_step(
+        g, ex, spec, mesh, pos, hid, w_l, st_l, out_f, st_f[pool.POOL_STATE_NAME]
+    )
+
     out = np.asarray(out, np.float32).reshape(R, ex.M, g.H)[:, : ex.B]
     ref = np.asarray(ref_out, np.float32)
     for r in range(R):
@@ -138,3 +151,91 @@ def test_kernel_matches_model_reference(page_size: int, kv_blk: int) -> None:
     for k in ("kc", "vc"):
         got = np.asarray(kv[k], np.float32)
         _check_close(got, np.asarray(ref_st[k], np.float32), atol=3.5e-2, rtol=1.5e-2)
+
+
+def _flat_weights(spec: object, ex: ExecSpec, w: dict) -> list:
+    names = planner.plan(spec, cache.with_cache(ex, paged_kv=True)).w_names
+    return [x for n in names for x in (w[n] if isinstance(w[n], tuple) else (w[n],))]
+
+
+def _check_token_step(g, ex, spec, mesh, pos, hid, w_l, st_l, hid_out, pools_ref):
+    """The token step on the same inputs: embedding rows hold `hid`, the RoPE
+    cache rows hold the table, and the LM head ties two ids across ranks (row
+    0) and across tiles of one rank (row 1) above every other logit, with a
+    larger one past the vocabulary."""
+    shard = 300
+    vocab = R * shard - 5
+    tio = tio_mod.TokenIO(
+        vocab=vocab,
+        shard=shard,
+        tile=tio_mod.head_tile(g.H, shard, ex.tiles.bank),
+        rope_rows=4 * ex.ctx,
+        rope_cols=g.ROT,
+        rope_dtype=F32,
+    )
+    assert tio.n_tiles == 2
+    ex_t = dataclasses.replace(ex, tokens=tio)
+    h = np.asarray(hid_out, np.float32).reshape(R, ex.M, g.H)[0, : ex.B]
+    key = jax.random.PRNGKey(5)
+    ids = np.array([7, 5 * shard + 9], np.int32)
+    emb = jax.random.normal(key, (R * shard, g.H), F32).astype(BF16)
+    emb = emb.at[ids].set(hid[: ex.B].astype(BF16))
+    head = np.asarray(jax.random.normal(key, (R * shard, g.H), F32) * 0.05)
+    ties = ([3, shard + 1], [2 * shard + 5, 2 * shard + tio.tile + 7])
+    for b, rows in enumerate(ties):
+        head[rows] = 4 * h[b] / np.linalg.norm(h[b])
+    head[R * shard - 2] = 8 * h[0] / np.linalg.norm(h[0])  # padded vocab
+    head = jnp.asarray(head, BF16)
+    logits = (jnp.asarray(h, BF16).astype(F32) @ head.astype(F32).T)[:, :vocab]
+    want = np.asarray(jnp.argmax(logits.astype(BF16).astype(F32), axis=-1))
+    np.testing.assert_array_equal(want, [t[0] for t in ties])
+
+    half = g.ROT // 2
+    inv = g.theta ** (-jnp.arange(half, dtype=F32) / half)
+    ang = jnp.arange(tio.rope_rows, dtype=F32)[:, None] * inv
+    rope_cache = jnp.concatenate([jnp.cos(ang), jnp.sin(ang)], -1)
+    _, _, w_k, st_k = pack_inputs(
+        pos,
+        hid,
+        w_l,
+        st_l,
+        g,
+        ex,
+        mesh=mesh,
+        build_default_pool=True,
+        model_def=model.Qwen3VLText,
+    )
+    w_k = {
+        **w_k,
+        tio_mod.EMBED_WEIGHT: emb,
+        tio_mod.HEAD_WEIGHT: jnp.concatenate(
+            [
+                tio_mod.pack_head(head[r * shard : (r + 1) * shard], tio)
+                for r in range(R)
+            ]
+        ),
+    }
+    # The runner's padding: 3 more token rows, 6 sequences of 6 page slots.
+    positions = jnp.pad(jnp.tile(pos - 7, (3, 1)), ((0, 0), (0, 3)))
+    tables = np.zeros((ex.NS + 6, 6), np.int32)
+    tables[: ex.NS, :4] = np.asarray(st_k["page_table"][: ex.NS])
+    seq_lens = np.zeros((ex.NS + 6,), np.int32)
+    seq_lens[: ex.NS] = np.asarray(pos) + 1
+    step, in_sp, _, _ = cache.make_flat_pooled_step(mesh, spec, ex_t)
+    args = [
+        jnp.pad(jnp.asarray(ids), (0, 3)),
+        positions.astype(jnp.int32),
+        *_flat_weights(spec, ex_t, w_k),
+        *st_k[pool.POOL_STATE_NAME],
+        jnp.asarray(tables.reshape(-1)),
+        rope_cache,
+        jnp.asarray(seq_lens),
+    ]
+    outs = step(
+        *[jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, in_sp)]
+    )
+    np.testing.assert_array_equal(np.asarray(outs[0]), want)
+    for a, b in zip(outs[1:], pools_ref):
+        np.testing.assert_array_equal(
+            np.asarray(a).view(np.uint16), np.asarray(b).view(np.uint16)
+        )

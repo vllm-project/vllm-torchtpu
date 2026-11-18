@@ -225,6 +225,9 @@ class ExecSpec:
     # using plain states without page tables; one equal to its own defaults is
     # stored as None). Core execution config never reads it.
     cache: Any = None
+    # Token step I/O (`token_io.TokenIO`): the step takes the runner's token ids
+    # and returns greedy token ids. None: it maps hidden states.
+    tokens: Any = None
 
     def __post_init__(self) -> None:
         cx = self.cache

@@ -70,6 +70,8 @@ class TwoRing:
         # `(position in the layer, tile count, issue)` of the runtime segment.
         self._rt: tuple[int, Any, Any] | None = None
         self._rt_g0: Any = None
+        # `(tile count, issue)` of the tail segment.
+        self._tail: tuple[int, Any] | None = None
 
     def add_runtime_segment(self, after: str, count: Any, issue: Any) -> None:
         """Stream `count` (traced, the same every layer) module tiles right after
@@ -88,6 +90,29 @@ class TwoRing:
         )
         (pos,) = [hi for kind, _, hi, _ in sp.branch_segs[0] if kind == after]
         self._rt = (pos, count, issue)
+
+    def add_tail_segment(self, count: int, issue: Any) -> None:
+        """Stream `count` module tiles after the last layer's tiles, so the
+        ring prefetches them while the last layer runs.
+
+        `issue(j, bank)` starts the DMAs of tile `j` into bank `bank`; the
+        module waits for them, reads the bank and releases it with
+        `dgive(tail_start() + j)`. Must be called before the first `fetch`.
+        """
+        assert self._tail is None, "one tail segment per stream"
+        self._tail = (count, issue)
+
+    def end_layers(self) -> None:
+        """Leave the layer loop: later fetches (the tail segment) belong to no
+        layer, so none may read the loop's layer index."""
+        self._cur_layer = None
+
+    def tail_start(self) -> Any:
+        """Global tile index of the first tail-segment tile."""
+        sp = self.sp
+        if self._rt is None:
+            return sp.T_TOTAL
+        return sp.L * (sp.branch_tiles[0] + self._rt[1])
 
     def runtime_start(self) -> Any:
         """Global tile index of the current layer's first runtime-segment tile."""
@@ -371,6 +396,12 @@ class TwoRing:
         sp = self.sp
         if sp.T_TOTAL == 0:
             return
+        if self._tail is not None:
+            cnt, issue = self._tail
+            t0 = self.tail_start()
+            pl.when(jnp.logical_and(g >= t0, g < t0 + cnt))(
+                lambda: issue(g - t0, g % sp.NBD)
+            )
         if self._rt is not None:
             self._fetch_runtime(g)
             return

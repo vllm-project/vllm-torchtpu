@@ -26,6 +26,8 @@ from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .ops import BF16, F32, round_up
 from .spec import ExtraInput, ModelSpec, Module, Spec, StateDecl, SwitchSlot, WeightDecl
+from .token_io import EMBED_WEIGHT, HEAD_WEIGHT, token_io
+from .token_io import weight_shapes as token_weight_shapes
 
 
 def k_tile(K: int, N: int, dtype: Any, bank: int) -> int:
@@ -358,9 +360,10 @@ def plan(
         + list(dynamic_kinds)
         + list(hbm_weights.keys())
         + ["smalls", "final_norm"]
+        + ([EMBED_WEIGHT, HEAD_WEIGHT] if token_io(ex) is not None else [])
     )
     s_names = tuple(state_decls.keys())
-    o_names = ("hidden",) + tuple(output_decls.keys())
+    o_names = (step_output_name(ex),) + tuple(output_decls.keys())
 
     p_base = Plan(
         model_spec=model_spec,
@@ -402,6 +405,12 @@ def plan(
     )
 
 
+def step_output_name(ex: ExecSpec) -> str:
+    """The kernel's first output: the final hidden states, or the greedy token
+    ids under token step I/O (`ExecSpec.tokens`)."""
+    return "tokens" if token_io(ex) is not None else "hidden"
+
+
 def weight_shapes(
     model_spec: ModelSpec,
     ex: ExecSpec,
@@ -432,6 +441,8 @@ def weight_shapes(
                 out[name] = ((l_cnt, *w.lead_dims, w.K, w.N), w.dtype)
     out["smalls"] = ((g.L, 1, p.smalls_width), F32)
     out["final_norm"] = ((1, g.H), F32)
+    if (tio := token_io(ex)) is not None:
+        out.update(token_weight_shapes(tio, g.H))
     return out
 
 
@@ -465,7 +476,11 @@ def kernel_out_shapes(
     if p is None:
         p = plan(model_spec, ex)
     g = model_spec.config
-    out: dict[str, Any] = {"hidden": ((ex.M, g.H), BF16)}
+    out: dict[str, Any] = {
+        step_output_name(ex): ((ex.B,), jnp.int32)
+        if token_io(ex) is not None
+        else ((ex.M, g.H), BF16)
+    }
     for name, od in p.output_decls.items():
         owner = p.output_owners[name]
         l_cnt = max(1, p.module_layer_counts[owner])

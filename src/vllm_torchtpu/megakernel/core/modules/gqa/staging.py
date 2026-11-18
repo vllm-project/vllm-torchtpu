@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ...ops import BF16, F32, I32, rmsnorm, rope_partial, round_bf16, to_kv_dtype
 from ...pool.config import cache_exec
+from ...token_io import ROPE_CACHE_INPUT, rope_rows
 from .context import GQAEmit
 from .decls import ROPE_TABLE_INPUT
 from .params import GQAParams
@@ -45,7 +46,10 @@ def init_rope(ctx: Any, ap: GQAParams) -> None:
     ex, scr = ctx.ex, ctx.scr
     half = ap.ROT // 2
     if ap.ROPE_TABLE:
-        pltpu.sync_copy(ctx.extra[ROPE_TABLE_INPUT], scr["rcs"])
+        if ROPE_CACHE_INPUT in ctx.extra:
+            rope_rows(ctx, ctx.extra[ROPE_CACHE_INPUT], scr["rcs"])
+        else:
+            pltpu.sync_copy(ctx.extra[ROPE_TABLE_INPUT], scr["rcs"])
         if ap.QV:
             scr["rope"][:, :, :half] = scr["rcs"][...]
         return

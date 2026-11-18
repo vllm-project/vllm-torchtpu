@@ -125,7 +125,7 @@ def run_local(
         if not isinstance(out_vals_f, (tuple, list)):
             out_vals_f = (out_vals_f,)
         out_map_f = dict(zip(p_l.o_names, out_vals_f))
-        hid = out_map_f["hidden"]
+        hid = out_map_f[p_l.o_names[0]]
         if use_fused:
             raw_out = tuple(out_map_f[pool_key]) if pool_key in out_map_f else raw_in
         else:
@@ -169,7 +169,7 @@ def run_local(
     if not isinstance(out_vals, (tuple, list)):
         out_vals = (out_vals,)
     out_map = dict(zip(o_names, out_vals))
-    hid = out_map["hidden"]
+    hid = out_map[o_names[0]]
 
     raw_out = pb.scatter_states(
         ex_paged,
@@ -218,7 +218,7 @@ def raw_step(
         for k in weights
     }
     raw_spec = tuple(P("tp") for _ in raw_pools)
-    extra_specs = tuple(P("tp") if x.memory_space == "hbm" else P() for x in extras)
+    extra_specs = tuple(P("tp") if x.sharded else P() for x in extras)
 
     meta: dict[str, Any] = {pt_key: page_table}
     meta_specs: dict[str, Any] = {

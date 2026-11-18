@@ -29,6 +29,7 @@ from .cache_common import (
     should_use_pool_gather,
     validate_page_table_shape,
 )
+from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .planner import extra_inputs
 from .pool import check_ckpt_bounds
@@ -38,6 +39,7 @@ from .pool.config import (
     resolved_max_pages_per_seq,
     with_cache,
 )
+from .token_io import token_io
 
 
 def make_flat_pooled_step(
@@ -59,6 +61,12 @@ def make_flat_pooled_step(
       (`Module.extra_inputs`, sharded like `make_pooled_step`'s).
     Flat output signature:
       `(out_hidden, *raw_pools_out)`
+
+    Token step I/O (`ExecSpec.tokens`, fused pool I/O only) takes the runner's
+    step tensors as they are and returns the greedy token ids (`[B]` int32,
+    the same on every rank):
+      `(input_ids, positions, *w_flat, *raw_pools, block_tables, *extras,
+      seq_lens) -> (tokens, *raw_pools_out)`
     """
     ms = resolve_model_spec(model_spec)
     pb = require_pool_backend(ms)
@@ -116,18 +124,27 @@ def make_flat_pooled_step(
     donate_argnums = tuple(range(pool_start, pool_end)) if donate_pools else ()
     extras = extra_inputs(ms, ex_paged)
     n_rec = 2 if has_rec else 0
+    tio = token_io(ex_paged)
+    if tio is not None and not use_fused:
+        raise MegakernelConfigError(
+            "token step I/O writes the KV pages in-kernel: it needs fused pool I/O"
+        )
 
     in_specs = (
-        (P(), P("tp"))
+        ((P(), P()) if tio is not None else (P(), P("tp")))
         + (P("tp"),) * n_w_flat
         + (P("tp"),) * num_pools
         + (P(),) * (1 + n_rec)
-        + tuple(P("tp") if x.memory_space == "hbm" else P() for x in extras)
+        + tuple(P("tp") if x.sharded else P() for x in extras)
+        + ((P(),) if tio is not None else ())
     )
-    out_specs = (P("tp"),) + (P("tp"),) * num_pools
+    out_specs = (P() if tio is not None else P("tp"),) + (P("tp"),) * num_pools
     max_pt = resolved_max_pages_per_seq(ex_paged)
 
     def _body(pos: Any, hidden: Any, *rest: Any) -> tuple[Any, ...]:
+        # Token step I/O: `pos` / `hidden` are `input_ids` / `positions`.
+        tail = (rest[-1],) if tio is not None else ()
+        rest = rest[:-1] if tio is not None else rest
         w_flat = rest[:n_w_flat]
         raw_pools = tuple(
             r.squeeze(0) if r.ndim == 6 else r
@@ -165,11 +182,12 @@ def make_flat_pooled_step(
                 )
             w_idx += t_len
 
-        validate_page_table_shape(page_table, ex_paged)
-        if page_table.ndim == 3:
-            page_table = page_table.squeeze(0)
-        if page_table.shape[-1] > max_pt:
-            page_table = page_table[..., :max_pt]
+        if tio is None:
+            validate_page_table_shape(page_table, ex_paged)
+            if page_table.ndim == 3:
+                page_table = page_table.squeeze(0)
+            if page_table.shape[-1] > max_pt:
+                page_table = page_table[..., :max_pt]
         if ckpt_indices is not None and ckpt_indices.ndim == 4:
             ckpt_indices = ckpt_indices.squeeze(0)
         if read_offsets is not None and read_offsets.ndim == 3:
@@ -200,11 +218,11 @@ def make_flat_pooled_step(
                 st_map_f["ckpt_indices"] = ckpt_indices
                 st_map_f["read_offsets"] = read_offsets
             s_args_f = [st_map_f[k] for k in p_l.s_names]
-            out_vals_f = call_l(pos, hidden, *w_args, *s_args_f, *extra)
+            out_vals_f = call_l(pos, hidden, *w_args, *s_args_f, *extra, *tail)
             if not isinstance(out_vals_f, (tuple, list)):
                 out_vals_f = (out_vals_f,)
             out_map_f = dict(zip(p_l.o_names, out_vals_f))
-            hid = out_map_f["hidden"]
+            hid = out_map_f[p_l.o_names[0]]
             if use_fused:
                 raw_out = (
                     tuple(out_map_f[POOL_STATE_NAME])
@@ -250,7 +268,7 @@ def make_flat_pooled_step(
         if not isinstance(out_vals, (tuple, list)):
             out_vals = (out_vals,)
         out_map = dict(zip(o_names, out_vals))
-        hid = out_map["hidden"]
+        hid = out_map[o_names[0]]
 
         raw_out = pb.scatter_states(
             ex_paged,

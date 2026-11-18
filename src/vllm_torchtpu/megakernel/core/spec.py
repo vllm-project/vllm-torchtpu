@@ -128,7 +128,7 @@ class ExtraInput:
 
     Used for optional debug inputs (e.g. externally forced routing). Passed in
     module declaration order after the state inputs and exposed to the module as
-    `ctx.extra[name]`. HBM inputs are sharded across ranks,
+    `ctx.extra[name]`. HBM inputs are sharded across ranks unless `replicated`,
     SMEM inputs replicated and counted against the SMEM budget.
     """
 
@@ -136,6 +136,13 @@ class ExtraInput:
     memory_space: Literal["hbm", "smem"]
     shape: tuple[int, ...] = ()  # Per-rank shape (SMEM budget accounting)
     dtype: Any = None
+    # HBM only: the same array on every rank (e.g. a RoPE cache), not a shard.
+    replicated: bool = False
+
+    @property
+    def sharded(self) -> bool:
+        """Split across ranks along its leading dim (`P("tp")`)."""
+        return self.memory_space == "hbm" and not self.replicated
 
 
 @dataclass(frozen=True)

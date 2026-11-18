@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from . import token_io as tio_mod
 from .collectives import AllReduceRing
 from .dma.stream import TwoRing
 from .dma.vmem import CorePlan, build_scratch, fit_default_tiles
@@ -67,6 +68,7 @@ class KernelContext:
     sc: Any
     norm_x: Any = None
     raw_refs: Any = None
+    rope_pos: Any = None  # SMEM `[B]` RoPE positions (token step I/O)
 
     def module_params(self, name: str) -> Any:
         """Return the build-time parameters computed by `Module.plan_params`."""
@@ -134,6 +136,7 @@ def build(
     modules = model_spec.all_modules()
     extras = extra_inputs(model_spec, ex)
     x_names = [x.name for x in extras]
+    tio = tio_mod.token_io(ex)
 
     def kernel(*refs):
         pos_ref, hid_ref = refs[:2]
@@ -142,9 +145,17 @@ def build(
         k_ = 2 + n_w + n_s
         extra = dict(zip(x_names, refs[k_ : k_ + len(x_names)]))
         k_ += len(x_names)
+        if tio is not None:
+            seq_ref = refs[k_]
+            k_ += 1
         O = dict(zip(o_names, refs[k_ : k_ + len(o_names)]))  # noqa: E741
-        out_ref = O["hidden"]
+        out_ref = O[o_names[0]]
         scr = dict(zip(s_names, refs[k_ + len(o_names) :]))
+        if tio is not None:
+            # The step tensors as the runner passes them; the modules read the
+            # staged KV indices and page-table rows.
+            ids_ref, posn_ref, bt_ref = pos_ref, hid_ref, ST["page_table"]
+            pos_ref, ST["page_table"] = scr["tio_kv"], scr["tio_pt"]
         pool_key = POOL_STATE_NAME
         raw_refs = (
             (O[pool_key] if bool(ex.interpret) else ST[pool_key])
@@ -177,6 +188,7 @@ def build(
             skip=skip,
             sc=sc,
             raw_refs=raw_refs,
+            rope_pos=scr["tio_rpos"] if tio is not None else None,
         )
 
         def _emit_mod(mod: Any, lyr: Any, slot: Any) -> Any:
@@ -264,6 +276,17 @@ def build(
             return carry
 
         # ------------------------------ step prologue ------------------------------
+        if tio is not None:
+            tio_mod.stage_inputs(ctx, ids_ref, posn_ref, bt_ref, seq_ref)
+
+            def _issue_head(j, bank):
+                pltpu.make_async_copy(
+                    W[tio_mod.HEAD_WEIGHT].at[j],
+                    stream.dview(tio_mod.HEAD_KIND, bank),
+                    scr["dsem"].at[bank],
+                ).start()
+
+            stream.add_tail_segment(tio.n_tiles, _issue_head)
         # Module prologues first: they may add a runtime segment to the stream.
         for m in modules:
             with mod_sc(m, "prologue"):
@@ -285,7 +308,12 @@ def build(
                 )
             pl.semaphore_wait(barrier, ex.R - 1)
 
-        scr["res"][...] = jnp.where(live, hid_ref[: ex.MB].astype(F32), 0.0)
+        if tio is not None:
+            # Slot 1: layer 0's first all-reduce is on slot 0, so no rank can
+            # write slot 1 again before every rank has read this one.
+            tio_mod.embed(ctx, W[tio_mod.EMBED_WEIGHT], ar_slot=1)
+        else:
+            scr["res"][...] = jnp.where(live, hid_ref[: ex.MB].astype(F32), 0.0)
         scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
         for m in modules:
             with mod_sc(m, "init_buffers"):
@@ -302,12 +330,16 @@ def build(
         fn_cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["fn_sem"])
         fn_cp.start()
         fn_cp.wait()
-        out_ref[: ex.MB] = rmsnorm(
+        normed = rmsnorm(
             scr["res"][...],
             scr["fn"][...],
             g.eps,
             zero_centered=bool(g.zero_centered_norm),
         ).astype(BF16)
+        if tio is not None:
+            tio_mod.head(ctx, normed, out_ref)
+            return
+        out_ref[: ex.MB] = normed
         if ex.MB < ex.M:
             out_ref[ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
 
@@ -334,24 +366,40 @@ def build(
             for _ in ssh[k]
         )
         if p.state_decls[k].tupled
-        else pl.BlockSpec(memory_space=_mem_space(p.state_decls[k].memory_space))
+        else pl.BlockSpec(
+            memory_space=pltpu.HBM
+            if tio is not None and k == "page_table"
+            else _mem_space(p.state_decls[k].memory_space)
+        )
         for k in st_names
     ]
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    # Token step I/O: `(input_ids, positions, ..., block_tables, ..., seq_lens)`
+    # as the runner holds them, read in-kernel (`token_io.stage_inputs`).
+    head_specs = (
+        [hbm, hbm]
+        if tio is not None
+        else [
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ]
+    )
     in_specs = (
-        [pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec(memory_space=pltpu.VMEM)]
+        head_specs
         + w_specs
         + s_specs
         + [pl.BlockSpec(memory_space=_mem_space(x.memory_space)) for x in extras]
+        + ([hbm] if tio is not None else [])
     )
     out_shape = [
         tuple(jax.ShapeDtypeStruct(s.shape, s.dtype) for s in osh[k])
-        if (k != "hidden" and p.output_decls[k].tupled)
+        if (k != o_names[0] and p.output_decls[k].tupled)
         else jax.ShapeDtypeStruct(*osh[k])
         for k in o_names
     ]
     out_specs = [
-        pl.BlockSpec(memory_space=pltpu.VMEM)
-        if k == "hidden"
+        pl.BlockSpec(memory_space=pltpu.SMEM if tio is not None else pltpu.VMEM)
+        if k == o_names[0]
         else tuple(
             pl.BlockSpec(memory_space=_mem_space(p.output_decls[k].memory_space))
             for _ in osh[k]
@@ -380,7 +428,7 @@ def build(
             for k in st_names[: st_names.index(pool_key)]
         )
         raw_o_offset = sum(
-            len(osh[k]) if (k != "hidden" and p.output_decls[k].tupled) else 1
+            len(osh[k]) if (k != o_names[0] and p.output_decls[k].tupled) else 1
             for k in o_names[: o_names.index(pool_key)]
         )
         n_raw = len(ssh[pool_key]) if p.state_decls[pool_key].tupled else 1
@@ -598,7 +646,7 @@ def make_step(
         }
         ss = {k: _state_pspec(k, states[k]) for k in states}
         in_specs = (P(), P("tp"), ws, ss) + tuple(
-            P("tp") if x.memory_space == "hbm" else P() for x in extras
+            P("tp") if x.sharded else P() for x in extras
         )
         return jax.shard_map(
             local,
