@@ -174,7 +174,8 @@ class _DenseKernel:
             self.padding[...] = jnp.full(self.padding.shape, -jnp.inf, jnp.float32)
         self.copy_queries(initial[0], 0, zero=True)
         tiles = tuple(self.live_tiles(q) for q in initial)
-        ready = jnp.int32(-1) if self.reuse_keys else zero
+        # Reuse tracks the resident request and how many of its tiles are loaded.
+        ready = (jnp.int32(-1), zero) if self.reuse_keys else zero
         state = (*initial, tiles, zero, zero, ready)
         lax.while_loop(lambda s: s[0].start < self.end, self.query_block, state)
         self.release_outputs(0)
@@ -200,7 +201,7 @@ class _QueryBlock:
 
     def key_slot(self, tile):
         if self.k.reuse_keys:
-            return 0
+            return tile
         return lax.rem(self.tile_base + tile, self.k.config.key_buffers)
 
     def page_slot(self, tile):
@@ -230,10 +231,11 @@ class _QueryBlock:
         dma = pltpu.make_async_copy(k.table.at[row, tile], dst, k.page_sem.at[slot])
         (dma.wait if wait else dma.start)()
 
-    def fill_keys(self):
-        # A complete K tile stays resident across query groups of one request.
-        self.k.load_pages(0, self.k.tile_pages, self.page_slot(0), 0)
-        self.k.wait_keys(0)
+    def fill_keys(self, tile):
+        # Complete K tiles stay resident across query groups of one request.
+        slot = self.key_slot(tile)
+        self.k.load_pages(0, self.k.tile_pages, self.page_slot(tile), slot)
+        self.k.wait_keys(slot)
 
     def prefill(self, i):
         page_slot, key_slot = self.page_slot(i), self.key_slot(i)
@@ -341,6 +343,10 @@ class _QueryBlock:
         # One branch per tile: a per-page predicate costs scalar issue
         # slots in every fragment stage.
         if self.k.reuse_keys:
+            # Resident tiles still need their page table: stores read its
+            # valid bits. Tile 0's was awaited before the queries were loaded.
+            pl.when(tile > 0)(partial(self.load_table, tile, wait=True))
+            pl.when(tile >= self.resident)(partial(self.fill_keys, tile))
             self.score_tile(tile, False)
         else:
             score = partial(self.score_tile, tile)
@@ -370,8 +376,8 @@ class _QueryBlock:
         scored = self.tile_count > 0
         if k.reuse_keys:
             pl.when(scored)(partial(self.load_table, 0, wait=True))
-            # In this mode ready identifies the retained tile's request owner.
-            pl.when(scored & (self.ready != query.page_row))(self.fill_keys)
+            owner, loaded = self.ready
+            self.resident = jnp.where(owner == query.page_row, loaded, 0)
         else:
             for i in range(2):
                 needed = (i >= self.ready) & (i < self.total_tiles)
@@ -400,7 +406,11 @@ class _QueryBlock:
 
         ready = jnp.minimum(2, self.next_tiles + self.ahead_tiles)
         if k.reuse_keys:
-            ready = jnp.where(scored, query.page_row, self.ready)
+            loaded = jnp.maximum(self.resident, self.tile_count)
+            ready = tuple(
+                jnp.where(scored, new, old)
+                for new, old in zip((query.page_row, loaded), self.ready)
+            )
         tiles = (self.next_tiles, self.ahead_tiles, self.far_tiles)
         step, base = self.step + 1, self.tile_base + self.tile_count
         return self.following, self.lookahead, self.farthest, tiles, step, base, ready
@@ -453,8 +463,9 @@ def fp8_paged_mqa_logits(
         cache_layout: Shared cache placement; None means tightly packed pages.
         query_start: First query to read from the full input arrays and offsets.
         query_count: Output rows; defaults to the full query batch.
-        reuse_keys: Keep a single complete K tile resident across query groups
-            belonging to the same request. Multi-tile outputs retain prefetching.
+        reuse_keys: Keep each request's complete K tiles resident across its
+            query groups, loading each tile once. Outputs wider than the K
+            buffers retain prefetching.
         fill_unscored: Write -inf to the key tiles past a query tile's longest
             row. False leaves them unwritten, so the output costs only the live
             context; scored tiles stay -inf past each row's length. Use it only
@@ -506,7 +517,7 @@ def fp8_paged_mqa_logits(
     )
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
     inputs = (q, weights * q_scale, banks, table)
-    reuse_keys = reuse_keys and width == config.key_tile
+    reuse_keys = reuse_keys and width <= config.key_buffers * config.key_tile
     kernel = partial(_kernel, (config, info, layout, reuse_keys, fill_unscored))
     out_shape = jax.ShapeDtypeStruct((tokens, width), jnp.float32)
     result = pl.pallas_call(

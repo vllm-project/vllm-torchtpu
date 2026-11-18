@@ -127,3 +127,76 @@ def test_ragged_requests_select_top_scores(short, width):
         kth = np.sort(scores[row, : lengths[row]])[-TOPK]
         tolerance = 2e-2 * np.abs(scores[row, : lengths[row]]).max()
         assert scores[row, ids].min() >= kth - tolerance
+
+
+def test_long_decode_row_beside_a_prefill_chunk_selects_top_scores():
+    """A served mixed step: one long decode request and a 1,000-row chunk."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 selection requires TPU")
+    rng = np.random.default_rng(13)
+    tokens, width = 1024, 8 * 65536  # Wider than the four resident K tiles.
+    counts = np.array([6, 1000])
+    lengths = np.concatenate([150_000 + np.arange(6), 30_000 + np.arange(1000) // 2])
+    lengths = np.concatenate([lengths, np.zeros(tokens - counts.sum(), int)])
+    # Padding rows own the last request, as the attention layer clamps them.
+    requests = np.repeat([0, 1], [6, tokens - 6])
+    layout = PackedFP8Layout(1024, page_size=PAGE)
+    keys = jax.random.normal(
+        jax.random.key(5), (layout.pages * PAGE, 128), jnp.bfloat16
+    )
+    pool = _pack(keys, layout)
+    table = rng.integers(0, layout.pages, (2, width // PAGE)).astype(np.int32)
+    q = jnp.asarray(rng.normal(size=(tokens, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.01, 0.1, (tokens, 32)), jnp.float32)
+    offsets = jnp.asarray([0, 6, 1006], jnp.int32)
+    n = jnp.asarray(lengths, jnp.int32)
+    layout_args = (layout.pages, layout.page_stride, layout.page_offset, PAGE)
+    selected = np.asarray(
+        jax.jit(select_fp8_indexer_jax, static_argnums=range(9, 16))(
+            q,
+            (pool,),
+            jnp.asarray(table),
+            weights,
+            n,
+            jnp.empty((tokens, 0), jnp.int32),
+            jnp.asarray(requests),
+            n.max().reshape(1),
+            offsets,
+            layout_args,
+            TOPK,
+            8,
+            False,
+            False,
+            True,
+            width,
+        )[0]
+    )
+    # Reference scores in the selector's 256-row score tiles.
+    rows = 2**27 // width
+    bounds = offsets.at[-1].set(tokens)
+    scores = np.concatenate(
+        [
+            np.asarray(
+                fp8_paged_mqa_logits(
+                    q[start : start + rows],
+                    pool,
+                    weights[start : start + rows],
+                    n[start : start + rows],
+                    jnp.asarray(table),
+                    query_start_loc=jnp.clip(bounds - start, 0, rows),
+                    max_model_len=width,
+                    q_scale=jnp.ones_like(weights[start : start + rows]),
+                    query_size=6,
+                    cache_layout=layout,
+                )
+            )
+            for start in range(0, tokens, rows)
+        ]
+    )
+    for row in range(tokens):
+        ids = selected[row][selected[row] >= 0]
+        length = lengths[row]
+        assert np.unique(ids).size == ids.size == min(TOPK, length)
+        if length:
+            rest = np.delete(scores[row, :length], ids)
+            assert scores[row, ids].min() >= rest.max()

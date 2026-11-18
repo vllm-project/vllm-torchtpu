@@ -203,3 +203,45 @@ def test_unfilled_tiles_keep_every_visible_score():
         end = -(-length // 8) * 8
         np.testing.assert_array_equal(unfilled[row, :end], filled[row, :end])
         assert np.isneginf(filled[row, length:]).all()
+
+
+def test_resident_tiles_match_streamed_scores():
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 scoring requires TPU")
+    rng = np.random.default_rng(5)
+    page_size, max_model_len = 256, 262144  # Four 64K tiles, all resident.
+    # Requests span several query groups and grow, shrink and change tiles.
+    counts = np.array([13, 1, 20, 7, 6])
+    bases = np.array([65536 - 6, 200000, 1000, 131072 + 9, 0])
+    lengths = np.concatenate([b + 2 * np.arange(c) for b, c in zip(bases, counts)])
+    per_request = max_model_len // page_size
+    layout = PackedFP8Layout(len(counts) * per_request, page_size=page_size)
+    table = rng.permutation(layout.pages).reshape(len(counts), per_request)
+    table[3, 300] = -1
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    pool, _ = _pack(keys, layout)
+    split = int(layout.pages * 0.6) * layout.page_stride
+    tokens = len(lengths)
+    q = jnp.asarray(rng.normal(size=(tokens, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.01, 0.1, (tokens, 32)), jnp.float32)
+
+    def scores(reuse_keys):
+        return np.asarray(
+            fp8_paged_mqa_logits(
+                q,
+                (jnp.asarray(pool[:split]), jnp.asarray(pool[split:])),
+                weights,
+                jnp.asarray(lengths, jnp.int32),
+                jnp.asarray(table, jnp.int32),
+                query_start_loc=jnp.asarray(
+                    np.concatenate(([0], np.cumsum(counts))), jnp.int32
+                ),
+                max_model_len=max_model_len,
+                q_scale=jnp.ones_like(weights),
+                query_size=6,
+                cache_layout=layout,
+                reuse_keys=reuse_keys,
+            )
+        )
+
+    np.testing.assert_array_equal(scores(True), scores(False))

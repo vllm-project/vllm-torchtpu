@@ -39,6 +39,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
     indexer_query_rows,
     paged_mqa_key_tile,
+    paged_mqa_query_tile,
     topk_reconstruction_threshold,
 )
 
@@ -452,6 +453,7 @@ def _select_fp8_indexer_jax(
     score_width: int,
     *,
     prefill_chunk_rows: int | None = None,
+    reuse_keys: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     layout = PackedFP8Layout(*layout_args)
     tokens, width = q.shape[0], score_width
@@ -605,7 +607,7 @@ def _select_fp8_indexer_jax(
             cache_layout=layout,
             query_start=start if shared else 0,
             query_count=rows,
-            reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
+            reuse_keys=reuse_keys,
             # Its readers mask each row at its length, reading -inf at most to
             # the end of the row's last 8-key block, which a scored tile holds.
             fill_unscored=not stream_select,
@@ -784,14 +786,23 @@ def select_fp8_indexer_jax(
     ):
         return _select_fp8_indexer_jax(*arguments, score_width)
 
-    # Preserve score-buffer row boundaries for both widths. Only contexts
-    # covered by one K tile can narrow the scores and retain their keys.
+    # Preserve score-buffer row boundaries for both widths. Contexts that fit
+    # the scorer's K buffers narrow the scores and keep their keys resident,
+    # which pays only when requests span several query groups: one-group
+    # requests (decode rows) keep the streaming kernel's cross-group prefetch.
+    resident = min(score_width, width * PACKED_FP8_MQA_CONFIG.key_buffers)
     live = (requests >= 0) & (requests < page_table.shape[0])
     longest = jnp.where(live, lengths, 0).max()
     grouped = jnp.all(requests[1:] >= requests[:-1])
+    rows = query_start_loc[-1] - query_start_loc[0]
+    spans = (query_start_loc[1:] > query_start_loc[:-1]).sum()
+    group = paged_mqa_query_tile(PACKED_FP8_MQA_CONFIG.query_tile, q.shape[1])
+    shared_keys = rows >= 2 * group * spans
     return jax.lax.cond(
-        grouped & (longest <= width),
-        lambda: _select_fp8_indexer_jax(*arguments, width, prefill_chunk_rows=chunk),
+        grouped & shared_keys & (longest <= resident),
+        lambda: _select_fp8_indexer_jax(
+            *arguments, resident, prefill_chunk_rows=chunk, reuse_keys=True
+        ),
         lambda: _select_fp8_indexer_jax(
             *arguments, score_width, prefill_chunk_rows=chunk
         ),
