@@ -187,28 +187,47 @@ def _candidate_block_scores(scores, lengths, block_size, config):
     blocks = pl.cdiv(width, block_size)
     padded_blocks = pl.cdiv(blocks, block_tile) * block_tile
     token_tile = block_tile * block_size
+    # The last input window holding a visible column, per row tile: later
+    # windows repeat its block index, so the pipeline fetches nothing for them.
+    longest = lengths.reshape(rows // row_tile, row_tile).max(axis=1)
+    last_window = jnp.maximum(longest - 1, 0) // token_tile
 
-    def kernel(length_ref, score_ref, out_ref):
-        start = pl.program_id(1) * block_tile
-        limits = jnp.stack(
-            [length_ref[pl.program_id(0) * row_tile + i] for i in range(row_tile)]
-        )
-        columns = jnp.arange(token_tile) + start * block_size
-        values = jnp.where(columns[None, :] < limits[:, None], score_ref[...], -jnp.inf)
-        vectors = values.reshape(row_tile, token_tile // lanes, lanes)
-        # Each lane ending a block receives its maximum; gather those lanes
-        # without expanding the block axis into padded vectors.
-        for bit in range(block_size.bit_length() - 1):
-            vectors = jnp.maximum(vectors, pltpu.roll(vectors, 1 << bit, axis=2))
-        indices = jnp.arange(lanes // block_size) * block_size + block_size - 1
-        indices = jnp.broadcast_to(indices, (*vectors.shape[:-1], indices.size))
-        reduced = jnp.take_along_axis(vectors, indices, axis=2).reshape(
-            row_tile, block_tile
-        )
-        last = (limits - 1) // block_size
-        out_ref[...] = jnp.where(
-            jnp.arange(block_tile)[None, :] + start == last[:, None], jnp.inf, reduced
-        )
+    def kernel(length_ref, last_ref, score_ref, out_ref):
+        window = pl.program_id(1)
+        start = window * block_tile
+
+        @pl.when(window <= last_ref[pl.program_id(0)])
+        def reduce():
+            limits = jnp.stack(
+                [length_ref[pl.program_id(0) * row_tile + i] for i in range(row_tile)]
+            )
+            columns = jnp.arange(token_tile) + start * block_size
+            values = jnp.where(
+                columns[None, :] < limits[:, None], score_ref[...], -jnp.inf
+            )
+            vectors = values.reshape(row_tile, token_tile // lanes, lanes)
+            # Each lane ending a block receives its maximum; gather those lanes
+            # without expanding the block axis into padded vectors.
+            for bit in range(block_size.bit_length() - 1):
+                vectors = jnp.maximum(vectors, pltpu.roll(vectors, 1 << bit, axis=2))
+            indices = jnp.arange(lanes // block_size) * block_size + block_size - 1
+            indices = jnp.broadcast_to(indices, (*vectors.shape[:-1], indices.size))
+            reduced = jnp.take_along_axis(vectors, indices, axis=2).reshape(
+                row_tile, block_tile
+            )
+            last = (limits - 1) // block_size
+            out_ref[...] = jnp.where(
+                jnp.arange(block_tile)[None, :] + start == last[:, None],
+                jnp.inf,
+                reduced,
+            )
+
+        @pl.when(window > last_ref[pl.program_id(0)])
+        def invisible():
+            out_ref[...] = jnp.full(out_ref.shape, -jnp.inf, out_ref.dtype)
+
+    def score_window(i, j, _, last_ref):
+        return i, jnp.minimum(j, last_ref[i])
 
     # The final input window can be partial. Its invisible columns are masked
     # in the kernel, avoiding a full score-buffer copy to pad the DMA tile.
@@ -216,16 +235,16 @@ def _candidate_block_scores(scores, lengths, block_size, config):
         kernel,
         out_shape=jax.ShapeDtypeStruct((rows, padded_blocks), scores.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=2,
             grid=(rows // row_tile, padded_blocks // block_tile),
-            in_specs=(pl.BlockSpec((row_tile, token_tile), lambda i, j, _: (i, j)),),
-            out_specs=pl.BlockSpec((row_tile, block_tile), lambda i, j, _: (i, j)),
+            in_specs=(pl.BlockSpec((row_tile, token_tile), score_window),),
+            out_specs=pl.BlockSpec((row_tile, block_tile), lambda i, j, *_: (i, j)),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
         name="indexer_candidate_block_max",
-    )(lengths, scores)
+    )(lengths, last_window, scores)
     return result[:, :blocks]
 
 

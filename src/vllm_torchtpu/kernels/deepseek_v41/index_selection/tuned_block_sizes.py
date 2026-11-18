@@ -6,7 +6,9 @@ from dataclasses import dataclass
 # (TPU generation, score width, candidate count, records per candidate block).
 PUBLISH_CANDIDATE_SHAPES = frozenset({(7, 16384, 2048, 8)})
 # (generation, queries, token-score width, block size): (rows, output blocks).
-PUBLISH_BLOCK_MAX_CONFIG = {(7, 96, 98816, 8): (96, 1024)}
+PUBLISH_BLOCK_MAX_CONFIG = {(7, 96, 98816, 8): (96, 1024)} | {
+    (7, rows, 1048576, 8): (16, 4096) for rows in (16, 32, 48, 64, 128)
+}
 
 
 @dataclass(frozen=True)
