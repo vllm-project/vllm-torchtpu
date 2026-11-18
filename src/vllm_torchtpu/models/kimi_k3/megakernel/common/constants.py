@@ -17,12 +17,15 @@ from __future__ import annotations
 
 MIB_BYTES: int = 1 << 20
 GIB_BYTES: int = 1 << 30
+SUBLANE_ROWS: int = 8
 
 AXIS_TP: str = "tp"
 TP_SIZE: int = 32
 TP_PEERS: int = TP_SIZE - 1
+DP2_GROUPS: int = 2
 
 NUM_LAYERS: int = 93
+HIDDEN_SIZE: int = 7168
 HEAD_DIM: int = 128
 KDA_HEADS: int = 3
 CONV_TAPS: int = 3
@@ -32,11 +35,14 @@ __all__ = [
     "AXIS_TP",
     "CONV_HEAD_ROWS",
     "CONV_TAPS",
+    "DP2_GROUPS",
     "GIB_BYTES",
     "HEAD_DIM",
+    "HIDDEN_SIZE",
     "KDA_HEADS",
     "MIB_BYTES",
     "NUM_LAYERS",
+    "SUBLANE_ROWS",
     "TP_PEERS",
     "TP_SIZE",
 ]

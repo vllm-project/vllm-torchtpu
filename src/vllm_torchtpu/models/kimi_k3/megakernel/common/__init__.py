@@ -22,3 +22,4 @@ from vllm_torchtpu.megakernel.core import pool_alias as pool_alias
 
 from .constants import GIB_BYTES as GIB_BYTES
 from .constants import MIB_BYTES as MIB_BYTES
+from .constants import SUBLANE_ROWS as SUBLANE_ROWS

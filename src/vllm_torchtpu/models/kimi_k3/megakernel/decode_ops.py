@@ -898,7 +898,7 @@ class DecodeOps:
             group_rows = share * rows_per
             sources = jnp.concatenate([rows + k * group_rows for k in range(dp)])
             targets = jnp.concatenate([local + k * bank for k in range(dp)])
-        conv, recurrent = self.paged._commit_kda_states(
+        conv, recurrent = self.paged.commit_kda_states(
             conv, recurrent, new_conv, new_recurrent, targets, source_rows=sources
         )
         return decisions, conv, recurrent
