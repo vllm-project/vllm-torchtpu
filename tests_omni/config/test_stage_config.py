@@ -45,7 +45,11 @@ from vllm_omni.worker.mixins import OmniWorkerMixin
 from tests_omni.omni_test_utils import PR_TIMEOUT_S
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 BASE_STAGE_YAML = (
     "stages:\n"

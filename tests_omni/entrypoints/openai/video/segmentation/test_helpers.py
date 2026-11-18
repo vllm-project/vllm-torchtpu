@@ -34,6 +34,7 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from tests_omni.omni_test_utils import PR_TIMEOUT_S
 
 pytestmark = [
+    pytest.mark.omni_feature,
     pytest.mark.omni,
     pytest.mark.timeout(PR_TIMEOUT_S),
 ]

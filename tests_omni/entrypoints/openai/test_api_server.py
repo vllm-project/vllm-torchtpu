@@ -47,7 +47,7 @@ from tests_omni.omni_test_utils import NIGHTLY_TIMEOUT_S, PR_TIMEOUT_S, assert_p
 from tests_omni.tiny_models import tiny_flux_schnell
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-pytestmark = [pytest.mark.omni]
+pytestmark = [pytest.mark.omni_feature, pytest.mark.omni]
 
 SERVED_MODEL_NAME = "flux-tiny"
 PROMPT = "a red cube on a gray table"

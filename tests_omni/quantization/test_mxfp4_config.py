@@ -39,7 +39,11 @@ from vllm_omni.quantization.mxfp4_config import (
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 MXFP4_MAX_REL_L2 = 1.8e-1
 MXFP4_MAX_ABS = 7.5e-1

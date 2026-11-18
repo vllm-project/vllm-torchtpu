@@ -28,7 +28,11 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVStat
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 AR_KV_MAX_REL_L2 = 3.0e-2
 BLOCK = 16

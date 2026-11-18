@@ -36,7 +36,11 @@ from vllm_omni.worker.omni_connector_validation import (
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 _HIDDEN_DIM = 8
 _NUM_BLOCKS = 8

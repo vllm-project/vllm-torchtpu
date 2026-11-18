@@ -37,7 +37,11 @@ from vllm_omni.quantization.fp8_config import DiffusionFp8Config
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 FP8_MAX_REL_L2 = 5.0e-2
 FP8_MAX_ABS = 2.0e-1

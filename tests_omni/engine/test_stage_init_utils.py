@@ -42,6 +42,7 @@ from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 pytestmark = [
+    pytest.mark.omni_feature,
     pytest.mark.omni,
     pytest.mark.timeout(PR_TIMEOUT_S),
 ]

@@ -25,7 +25,11 @@ from vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector 
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 
 @pytest.mark.xfail(

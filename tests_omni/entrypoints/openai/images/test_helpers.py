@@ -54,7 +54,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from tests.tpu_release import wait_for_tpu_release
 from tests_omni.omni_test_utils import NIGHTLY_TIMEOUT_S, PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni]
+pytestmark = [pytest.mark.omni_feature, pytest.mark.omni]
 
 QWEN_EDIT_MODEL_ID = "Qwen/Qwen-Image-Edit"
 SERVED_EDIT_NAME = "qwen-edit-tiny"

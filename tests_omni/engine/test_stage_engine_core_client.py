@@ -46,7 +46,11 @@ from tests_omni.omni_test_utils import PR_TIMEOUT_S
 
 OmniChunkTransferAdapter = chunk_transfer_adapter.OmniChunkTransferAdapter
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 REL_L2_RATIO = 4.0
 REL_L2_FLOOR = 1e-2

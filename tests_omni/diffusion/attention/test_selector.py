@@ -30,7 +30,11 @@ from vllm_torchtpu.omni.attention import (
     TpuSDPAImpl,
 )
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 MAX_REL_L2 = 1e-2
 MAX_ABS = 2e-2

@@ -63,7 +63,7 @@ from tests_omni.omni_test_utils import (
 )
 from tests_omni.tiny_models import tiny_diffusion_dir, tiny_qwen_image
 
-pytestmark = [pytest.mark.omni]
+pytestmark = [pytest.mark.omni_feature, pytest.mark.omni]
 
 PARITY_MAX_REL_L2 = 2.0e-2
 PARITY_MAX_ABS = 5.0e-2

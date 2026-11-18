@@ -44,7 +44,7 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 from tests_omni.omni_test_utils import NIGHTLY_TIMEOUT_S, PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni]
+pytestmark = [pytest.mark.omni_feature, pytest.mark.omni]
 
 SPEECH_SAMPLE_RATE = 24000
 SPEECH_STEPS = 2

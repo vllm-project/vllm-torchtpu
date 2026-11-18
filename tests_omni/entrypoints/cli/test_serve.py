@@ -58,7 +58,7 @@ from tests.tpu_release import wait_for_tpu_release
 from tests_omni.omni_test_utils import NIGHTLY_TIMEOUT_S, PR_TIMEOUT_S
 from tests_omni.tiny_models import tiny_flux_schnell, tiny_qwen_image
 
-pytestmark = [pytest.mark.omni]
+pytestmark = [pytest.mark.omni_feature, pytest.mark.omni]
 
 IMAGE_SIZE = 256
 IMAGE_STEPS = 2

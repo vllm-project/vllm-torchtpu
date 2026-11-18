@@ -19,7 +19,11 @@ from vllm_omni.platforms import current_omni_platform
 from tests_omni.omni_test_utils import PR_TIMEOUT_S
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 _W3C_TRACE_ID = "12345678901234567890123456789012"
 _INBOUND_HEADERS = {

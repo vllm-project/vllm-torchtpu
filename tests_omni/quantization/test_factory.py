@@ -24,7 +24,11 @@ from vllm_omni.quantization import ComponentQuantizationConfig, build_quant_conf
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 MAX_REL_L2 = 5.0e-2
 MAX_ABS = 1.0e-1

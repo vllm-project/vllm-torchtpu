@@ -39,7 +39,11 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 ANCHOR_FRAME_MAX_REL_L2 = 1e-5
 RIFE_INTERP_MAX_REL_L2 = 1e-2

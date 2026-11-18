@@ -53,6 +53,7 @@ from tests_omni.tiny_models import tiny_diffusion_dir
 from vllm_torchtpu.layers.adapter.linear import TpuRowParallelLinear
 
 pytestmark = [
+    pytest.mark.omni_feature,
     pytest.mark.omni,
     pytest.mark.nightly,
     pytest.mark.multichip,

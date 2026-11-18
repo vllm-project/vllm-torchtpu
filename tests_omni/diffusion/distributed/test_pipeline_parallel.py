@@ -46,6 +46,7 @@ from tests_omni.omni_test_utils import NIGHTLY_TIMEOUT_S, assert_parity
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
 pytestmark = [
+    pytest.mark.omni_feature,
     pytest.mark.omni,
     pytest.mark.nightly,
     pytest.mark.multichip,

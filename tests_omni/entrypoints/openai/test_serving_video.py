@@ -52,6 +52,7 @@ from tests_omni.omni_test_utils import (
 from tests_omni.tiny_models import tiny_wan2_1_t2v
 
 pytestmark = [
+    pytest.mark.omni_feature,
     pytest.mark.omni,
     pytest.mark.nightly,
     pytest.mark.multichip,

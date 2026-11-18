@@ -33,7 +33,11 @@ from vllm_omni.worker.omni_connector_validation import validate_worker_omni_conn
 from tests_omni.omni_test_utils import PR_TIMEOUT_S, assert_parity
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
 
-pytestmark = [pytest.mark.omni, pytest.mark.timeout(PR_TIMEOUT_S)]
+pytestmark = [
+    pytest.mark.omni_feature,
+    pytest.mark.omni,
+    pytest.mark.timeout(PR_TIMEOUT_S),
+]
 
 MAX_REL_L2 = 2.0e-2
 MAX_ABS = 5.0e-2
