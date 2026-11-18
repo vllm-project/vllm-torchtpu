@@ -20,35 +20,19 @@ its own program. This entry runs the collectives as remote DMAs between the core
 of the (dp, tp) mesh inside one Pallas call: the rows and logits are pushed to
 the DP peers in the prologue while the expert weight ring primes, and the partial
 sums are reduced onto their owning engine in the epilogue. The expert loop is
-moe_lowtok's, with a weight ring of `depth` experts.
+moe_lowtok's, with a weight ring of one expert, and applies each expert to the
+rows routed to it only.
 
-Forms, per side:
-
-  dispatch "flat"   every core pushes its rows to the DP peers of its TP index
-                    (dp - 1 inter-chip DMAs of the full rows per core);
-  dispatch "hier"   each core pushes one column half of its rows to its DP peers
-                    and the TP pair exchanges the halves over the intra-chip
-                    link (half the inter-chip bytes; tp == 2);
-  combine "flat"    the foreign row blocks are pushed to their owners and summed
-                    there, then the TP pair exchanges its block and sums;
-  combine "hier"    the TP pair reduce-scatters column halves intra-chip, each
-                    core pushes its half of the foreign blocks to the owners,
-                    and the pair exchanges the finished halves (half the
-                    inter-chip bytes; tp == 2).
+The dispatch is hierarchical: each core pushes one column half of its rows to
+its DP peers and the TP pair exchanges the halves over the intra-chip link (half
+the inter-chip bytes). So is the combine: the TP pair reduce-scatters column
+halves intra-chip, each core pushes its half of the foreign blocks to the
+owners, and the pair exchanges the finished halves. Both need tp == 2.
 
 Every stage sums in float32 and rounds once; the two cores of a TP pair end with
 the same bytes. The caller runs the entry inside a shard_map over a mesh whose
-axes are ("dp", "tp") in that order, with TP pairs on one chip.
-
-The DP x TP decode op (layers/adapter/moe_lowtok_fused_op.py) runs the "hier"
-forms, a weight ring of one expert, the routed-row gather and the core's index
-as data. The other choices are kept for layouts that op does not arm, and the
-interpret-mode tests check each of them against the same reference: the
-"flat" forms work for any TP size (the "hier" forms need a chip's two cores),
-the dense loop (`gather_rows=False`) applies every hit expert to every row,
-which is cheaper when most rows hit most experts, a deeper ring (`depth`)
-prefetches further ahead at the cost of VMEM, and `rank=None` reads the index
-from the mesh axes for callers that can use `lax.axis_index`.
+axes are (DP_AXIS, TP_AXIS) in that order, with TP pairs on one chip, and passes
+the core's index on each axis as data.
 """
 
 import functools
@@ -79,6 +63,8 @@ _PIECES = 3
 # Barrier semaphore group; the small collectives use 5 and 7, the fused EP
 # kernels 0.
 COLLECTIVE_ID = 9
+# Experts in the weight ring.
+_RING_DEPTH = 1
 MESH = pl.DeviceIdType.MESH
 DP_AXIS = "dp"
 TP_AXIS = "tp"
@@ -86,7 +72,6 @@ TP_AXIS = "tp"
 _ROW_TILE = 16
 _VMEM_FRACTION = 0.92
 _VMEM_MARGIN = 1.3
-FORMS = ("flat", "hier")
 
 
 def _push(src, dst, send_sem, recv_sem, dp_idx, tp_idx):
@@ -143,39 +128,36 @@ def _stream_ring(
     s2_buf,
     w13_sem,
     w2_sem,
-    h_acc,
+    _h_acc,
     *,
     n_experts,
     inter,
     w13_parts,
-    depth,
     before_compute,
-    rows_fp8=None,
-    gather=None,
+    gather,
     xs_all=None,
 ):
-    """moe_lowtok's expert loop over a ring of `depth` experts' weight units.
+    """moe_lowtok's expert loop over a ring of `_RING_DEPTH` experts' weight
+    units, each expert applied only to the rows routed to it.
 
-    The ring holds `depth` w13 unit groups and `depth` w2 units; a unit is
-    prefetched `depth * units - 1` units ahead of its use. `before_compute()`
-    runs once the ring is primed and before the first matmul. `rows_fp8`
-    returns the rows already quantized per row (fp8 values and the restoring
-    scale) when the caller holds them that way; otherwise `x_all` holds bf16
-    rows and the loop quantizes them.
+    The ring holds `_RING_DEPTH` groups of the two w13 units and as many w2
+    units; a unit is prefetched `_RING_DEPTH * 3 - 1` units ahead of its use.
+    `before_compute()` runs once the ring is primed and before the first matmul.
 
-    With `gather` (the scratch of `_gather_scratch`), each expert is applied
-    only to the rows routed to it: a one-hot matmul gathers them into blocks of
-    GATHER_ROWS rows (several passes for an expert with more rows), the
-    matmuls run on the block, and a second one-hot matmul scatters the f32
-    contributions back into the accumulator, carried as three bf16 pieces so
-    the sum is the dense formulation's value. The row positions come from one
-    prefix-sum matmul over the routing mask per call. `xs_all` holds the
-    per-row scales when the rows arrive quantized.
+    `gather` is the scratch of `_gather_scratch`: a one-hot matmul gathers an
+    expert's rows into blocks of GATHER_ROWS rows (several passes for an expert
+    with more rows), the matmuls run on the block, and a second one-hot matmul
+    scatters the f32 contributions back into the accumulator, carried as three
+    bf16 pieces so the sum is exact. The row positions come from one prefix-sum
+    matmul over the routing mask per call. `xs_all` holds the per-row scales
+    when the rows arrive quantized. `_h_acc` is ring scratch the loop does not
+    use; it stays allocated so the kernel's VMEM plan is the one measured.
     """
+    if w13_parts != 2:
+        raise NotImplementedError("the gather formulation needs two w13 units")
+    depth = _RING_DEPTH
     rows = wtab_ref.shape[0]
-    half = inter // w13_parts
     units = w13_parts + 1
-    lane_128 = lax.broadcasted_iota(jnp.int32, (rows, LANE), 1)
 
     def collect(e, n):
         h = hits_s[0, gid_s[0, e]]
@@ -192,44 +174,19 @@ def _stream_ring(
     def unit_copies(e_idx, part, ring):
         expert = ids[e_idx]
         slot = ring * w13_parts + jnp.minimum(part, w13_parts - 1)
-        if w13_parts == 2:
-            col = pl.multiple_of(jnp.minimum(part, 1) * inter, inter)
-            w13_copies = (
-                pltpu.make_async_copy(
-                    w13_hbm.at[expert, :, pl.ds(col, inter)],
-                    w13_buf.at[slot],
-                    w13_sem.at[slot],
-                ),
-                pltpu.make_async_copy(
-                    s13_hbm.at[expert, :, pl.ds(col, inter)],
-                    s13_buf.at[slot],
-                    w13_sem.at[slot],
-                ),
-            )
-        else:
-            col = pl.multiple_of(jnp.minimum(part, w13_parts - 1) * half, half)
-            w13_copies = (
-                pltpu.make_async_copy(
-                    w13_hbm.at[expert, :, pl.ds(col, half)],
-                    w13_buf.at[slot, :, pl.ds(0, half)],
-                    w13_sem.at[slot],
-                ),
-                pltpu.make_async_copy(
-                    w13_hbm.at[expert, :, pl.ds(inter + col, half)],
-                    w13_buf.at[slot, :, pl.ds(half, half)],
-                    w13_sem.at[slot],
-                ),
-                pltpu.make_async_copy(
-                    s13_hbm.at[expert, :, pl.ds(col, half)],
-                    s13_buf.at[slot, :, pl.ds(0, half)],
-                    w13_sem.at[slot],
-                ),
-                pltpu.make_async_copy(
-                    s13_hbm.at[expert, :, pl.ds(inter + col, half)],
-                    s13_buf.at[slot, :, pl.ds(half, half)],
-                    w13_sem.at[slot],
-                ),
-            )
+        col = pl.multiple_of(jnp.minimum(part, 1) * inter, inter)
+        w13_copies = (
+            pltpu.make_async_copy(
+                w13_hbm.at[expert, :, pl.ds(col, inter)],
+                w13_buf.at[slot],
+                w13_sem.at[slot],
+            ),
+            pltpu.make_async_copy(
+                s13_hbm.at[expert, :, pl.ds(col, inter)],
+                s13_buf.at[slot],
+                w13_sem.at[slot],
+            ),
+        )
         w2_copies = (
             pltpu.make_async_copy(w2_hbm.at[expert], w2_buf.at[ring], w2_sem.at[ring]),
             pltpu.make_async_copy(s2_hbm.at[expert], s2_buf.at[ring], w2_sem.at[ring]),
@@ -293,22 +250,7 @@ def _stream_ring(
 
     before_compute()
     acc[...] = jnp.zeros_like(acc)
-    if gather is not None:
-        if w13_parts != 2:
-            raise NotImplementedError("the gather formulation needs two w13 units")
-        _gather_prologue(gid_s, wtab_ref, x_all, xs_all, gather, rows)
-    elif rows_fp8 is None:
-        x_q, x_s = quantize_rows(x_all[...].astype(jnp.float32))
-    else:
-        x_q, x_s = rows_fp8()
-
-    def routing_weight(expert):
-        g = gid_s[0, expert]
-        blk = pl.multiple_of((g >> 7) << 7, LANE)
-        w_slice = wtab_ref[:, pl.ds(blk, LANE)]
-        return jnp.sum(
-            jnp.where(lane_128 + blk == g, w_slice, 0.0), axis=1, keepdims=True
-        )
+    _gather_prologue(gid_s, wtab_ref, x_all, xs_all, gather, rows)
 
     def body(u, carry):
         e_idx, part, ring = carry
@@ -320,67 +262,22 @@ def _stream_ring(
 
         wait(e_idx, part, ring)
         for r in range(depth):
-            if gather is not None:
-                _gather_expert(
-                    gid_s,
-                    gather,
-                    expert,
-                    part,
-                    ring == r,
-                    w13_buf.at[2 * r],
-                    w13_buf.at[2 * r + 1],
-                    s13_buf.at[2 * r],
-                    s13_buf.at[2 * r + 1],
-                    w2_buf.at[r],
-                    s2_buf.at[r],
-                    acc,
-                    rows=rows,
-                    fp8_rows=xs_all is not None,
-                )
-            elif w13_parts == 2:
-
-                @pl.when((part == 0) & (ring == r))
-                def _gate_half(r=r):
-                    h = dot_f32(x_q, w13_buf[2 * r])
-                    gate = h * x_s * s13_buf[2 * r]
-                    h_acc[...] = gate * jax.nn.sigmoid(gate)
-
-                @pl.when((part == 1) & (ring == r))
-                def _up_half(r=r):
-                    h = dot_f32(x_q, w13_buf[2 * r + 1])
-                    up = h * x_s * s13_buf[2 * r + 1]
-                    h_acc[...] = h_acc[...] * up
-
-                @pl.when((part == 2) & (ring == r))
-                def _down(r=r):
-                    a_q, a_s = quantize_rows(h_acc[...])
-                    row_scale = a_s * routing_weight(expert)
-                    o = dot_f32(a_q, w2_buf[r])
-                    acc[...] += (o * s2_buf[r]) * row_scale
-            else:
-                for p in range(w13_parts):
-
-                    @pl.when((part == p) & (ring == r))
-                    def _gate_up_half(p=p, r=r):
-                        slot = r * w13_parts + p
-                        h = dot_f32(x_q, w13_buf[slot])
-                        scales = s13_buf[slot]
-                        col = p * half
-                        h_acc[:, col : col + half] = (
-                            h[:, :half] * x_s * scales[:, :half]
-                        )
-                        h_acc[:, inter + col : inter + col + half] = (
-                            h[:, half:] * x_s * scales[:, half:]
-                        )
-
-                @pl.when((part == w13_parts) & (ring == r))
-                def _down(r=r):
-                    gate = h_acc[:, pl.ds(0, inter)]
-                    up = h_acc[:, pl.ds(inter, inter)]
-                    a_q, a_s = quantize_rows(gate * jax.nn.sigmoid(gate) * up)
-                    row_scale = a_s * routing_weight(expert)
-                    o = dot_f32(a_q, w2_buf[r])
-                    acc[...] += (o * s2_buf[r]) * row_scale
+            _gather_expert(
+                gid_s,
+                gather,
+                expert,
+                part,
+                ring == r,
+                w13_buf.at[2 * r],
+                w13_buf.at[2 * r + 1],
+                s13_buf.at[2 * r],
+                s13_buf.at[2 * r + 1],
+                w2_buf.at[r],
+                s2_buf.at[r],
+                acc,
+                rows=rows,
+                fp8_rows=xs_all is not None,
+            )
 
         return step(e_idx, part, ring)
 
@@ -587,25 +484,17 @@ def _gather_expert(
 
 def _kernel(
     gid_s,
+    rank_s,
     *refs,
-    rank_operand,
     n_experts,
     inter,
     w13_parts,
     topk,
     dp,
     tp,
-    depth,
-    dispatch_form,
-    combine_form,
     dispatch_fp8,
-    gather_rows,
 ):
-    if rank_operand:
-        rank_s, *refs = refs
-        d, t = rank_s[0], rank_s[1]
-    else:
-        d, t = lax.axis_index(DP_AXIS), lax.axis_index(TP_AXIS)
+    d, t = rank_s[0], rank_s[1]
     _kernel_body(
         d,
         t,
@@ -617,11 +506,7 @@ def _kernel(
         topk=topk,
         dp=dp,
         tp=tp,
-        depth=depth,
-        dispatch_form=dispatch_form,
-        combine_form=combine_form,
         dispatch_fp8=dispatch_fp8,
-        gather_rows=gather_rows,
     )
 
 
@@ -643,11 +528,7 @@ def _kernel_body(
     topk,
     dp,
     tp,
-    depth,
-    dispatch_form,
-    combine_form,
     dispatch_fp8,
-    gather_rows,
 ):
     scratch = list(scratch)
 
@@ -658,29 +539,17 @@ def _kernel_body(
     hidden = x_ref.shape[1]
     half = hidden // 2
     rows_l = x_ref.shape[0]
-    # Bound below only for the forms and the FP8 dispatch that use them; Any,
-    # so the type checker does not narrow them to None or unbound.
+    # Bound below only for the FP8 dispatch; Any, so the type checker does not
+    # narrow it to None.
     xs_all: Any = None
-    dsem: Any = None
-    xrecv: Any = None
-    c_send: Any = None
-    c_recv1: Any = None
-    c_pair_send: Any = None
-    c_pair_recv: Any = None
-    c_half: Any = None
-    c_recv2: Any = None
-    csem: Any = None
     x_all, lg_all, dsem, xrecv = take(4)
     if dispatch_fp8:
         xs_all = take(1)[0]
     ids, hits_v, hits_s, hsem, wtab = take(5)
     ring = take(7)
     acc = take(1)[0]
-    if combine_form == "flat":
-        c_send, c_recv1, c_pair_send, c_pair_recv, csem = take(5)
-    else:
-        c_send, c_recv1, c_half, c_recv2, csem = take(5)
-    gscratch = tuple(take(14)) if gather_rows else None
+    c_send, c_recv1, c_half, c_recv2, csem = take(5)
+    gscratch = tuple(take(14))
     assert not scratch
 
     _barrier(dp, tp)
@@ -708,30 +577,22 @@ def _kernel_body(
 
     else:
         x_all[mine, :] = x_ref[...]
-    if dispatch_form == "flat":
-        for j in range(dp):
+    for u, cols in ((0, pl.ds(0, half)), (1, pl.ds(half, half))):
 
-            @pl.when(j != d)
-            def _(j=j):
-                _push(x_all.at[mine], x_all.at[mine], dsem.at[2], xrecv.at[d], j, t)
+        @pl.when(t == u)
+        def _(cols=cols):
+            for j in range(dp):
 
-    else:
-        for u, cols in ((0, pl.ds(0, half)), (1, pl.ds(half, half))):
-
-            @pl.when(t == u)
-            def _(cols=cols):
-                for j in range(dp):
-
-                    @pl.when(j != d)
-                    def _(j=j):
-                        _push(
-                            x_all.at[mine, cols],
-                            x_all.at[mine, cols],
-                            dsem.at[2],
-                            xrecv.at[d],
-                            j,
-                            t,
-                        )
+                @pl.when(j != d)
+                def _(j=j):
+                    _push(
+                        x_all.at[mine, cols],
+                        x_all.at[mine, cols],
+                        dsem.at[2],
+                        xrecv.at[d],
+                        j,
+                        t,
+                    )
 
     _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[1])
 
@@ -745,14 +606,6 @@ def _kernel_body(
     def rows_ready():
         if dispatch_fp8:
             _wait_bytes(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[6])
-        if dispatch_form == "flat":
-            for j in range(dp):
-
-                @pl.when(j != d)
-                def _(j=j):
-                    _wait_bytes(x_all.at[_rows_of(j, rows_l)], xrecv.at[j])
-
-            return
         # Each foreign block's column half lands from its DP peer and is
         # forwarded to the TP partner, whose other half arrives the same way.
         for u, cols in ((0, pl.ds(0, half)), (1, pl.ds(half, half))):
@@ -790,116 +643,82 @@ def _kernel_body(
         n_experts=n_experts,
         inter=inter,
         w13_parts=w13_parts,
-        depth=depth,
         before_compute=rows_ready,
-        rows_fp8=(lambda: (x_all[...], xs_all[:, 0:1])) if dispatch_fp8 else None,
         gather=gscratch,
         xs_all=xs_all if dispatch_fp8 else None,
     )
 
-    if combine_form == "flat":
-        c_send[...] = acc[...].astype(c_send.dtype)
-        c_recv1[pl.ds(d, 1)] = jnp.zeros((1, rows_l, hidden), c_recv1.dtype)
-        for j in range(dp):
+    c_send[...] = acc[...].astype(c_send.dtype)
+    # Stage 1: the partner's half of my partial sums, summed intra-chip.
+    for u, mine, theirs in (
+        (0, pl.ds(0, half), pl.ds(half, half)),
+        (1, pl.ds(half, half), pl.ds(0, half)),
+    ):
 
-            @pl.when(j != d)
-            def _(j=j):
-                _push(
-                    c_send.at[_rows_of(j, rows_l)],
-                    c_recv1.at[d],
-                    csem.at[0],
-                    csem.at[1],
-                    j,
-                    t,
-                )
+        @pl.when(t == u)
+        def _(theirs=theirs):
+            _push(c_send.at[:, theirs], c_recv1, csem.at[0], csem.at[1], d, 1 - t)
 
-        _wait_bytes(c_recv1.at[pl.ds(0, dp - 1)], csem.at[1])
-        s = acc[_rows_of(d, rows_l), :]
-        for j in range(dp):
-            s = s + c_recv1[j].astype(jnp.float32)
-        c_pair_send[...] = s.astype(c_pair_send.dtype)
-        _push(c_pair_send, c_pair_recv, csem.at[2], csem.at[3], d, 1 - t)
-        _wait_bytes(c_pair_recv, csem.at[3])
-        out_ref[...] = (
-            c_pair_send[...].astype(jnp.float32) + c_pair_recv[...].astype(jnp.float32)
-        ).astype(out_ref.dtype)
-        _wait_bytes(c_recv1.at[pl.ds(0, dp - 1)], csem.at[0])
-        _wait_bytes(c_pair_recv, csem.at[2])
-    else:
-        c_send[...] = acc[...].astype(c_send.dtype)
-        # Stage 1: the partner's half of my partial sums, summed intra-chip.
-        for u, mine, theirs in (
-            (0, pl.ds(0, half), pl.ds(half, half)),
-            (1, pl.ds(half, half), pl.ds(0, half)),
-        ):
+    _wait_bytes(c_recv1, csem.at[1])
+    for u, mine, theirs in (
+        (0, pl.ds(0, half), pl.ds(half, half)),
+        (1, pl.ds(half, half), pl.ds(0, half)),
+    ):
 
-            @pl.when(t == u)
-            def _(theirs=theirs):
-                _push(c_send.at[:, theirs], c_recv1, csem.at[0], csem.at[1], d, 1 - t)
+        @pl.when(t == u)
+        def _(mine=mine):
+            c_half[...] = (acc[:, mine] + c_recv1[...].astype(jnp.float32)).astype(
+                c_half.dtype
+            )
 
-        _wait_bytes(c_recv1, csem.at[1])
-        for u, mine, theirs in (
-            (0, pl.ds(0, half), pl.ds(half, half)),
-            (1, pl.ds(half, half), pl.ds(0, half)),
-        ):
+    # Stage 2: the chip partials of the foreign blocks to their owners.
+    c_recv2[pl.ds(d, 1)] = jnp.zeros((1, rows_l, half), c_recv2.dtype)
+    for j in range(dp):
 
-            @pl.when(t == u)
-            def _(mine=mine):
-                c_half[...] = (acc[:, mine] + c_recv1[...].astype(jnp.float32)).astype(
-                    c_half.dtype
-                )
+        @pl.when(j != d)
+        def _(j=j):
+            _push(
+                c_half.at[_rows_of(j, rows_l)],
+                c_recv2.at[d],
+                csem.at[2],
+                csem.at[3],
+                j,
+                t,
+            )
 
-        # Stage 2: the chip partials of the foreign blocks to their owners.
-        c_recv2[pl.ds(d, 1)] = jnp.zeros((1, rows_l, half), c_recv2.dtype)
-        for j in range(dp):
+    _wait_bytes(c_recv2.at[pl.ds(0, dp - 1)], csem.at[3])
+    fin = c_half[_rows_of(d, rows_l), :].astype(jnp.float32)
+    for j in range(dp):
+        fin = fin + c_recv2[j].astype(jnp.float32)
+    fin = fin.astype(out_ref.dtype)
+    # Stage 3: the finished halves exchanged intra-chip.
+    for u, mine, theirs in (
+        (0, pl.ds(0, half), pl.ds(half, half)),
+        (1, pl.ds(half, half), pl.ds(0, half)),
+    ):
 
-            @pl.when(j != d)
-            def _(j=j):
-                _push(
-                    c_half.at[_rows_of(j, rows_l)],
-                    c_recv2.at[d],
-                    csem.at[2],
-                    csem.at[3],
-                    j,
-                    t,
-                )
+        @pl.when(t == u)
+        def _(mine=mine):
+            out_ref[:, mine] = fin
+            _push(
+                out_ref.at[:, mine],
+                out_ref.at[:, mine],
+                csem.at[4],
+                csem.at[5],
+                d,
+                1 - t,
+            )
 
-        _wait_bytes(c_recv2.at[pl.ds(0, dp - 1)], csem.at[3])
-        fin = c_half[_rows_of(d, rows_l), :].astype(jnp.float32)
-        for j in range(dp):
-            fin = fin + c_recv2[j].astype(jnp.float32)
-        fin = fin.astype(out_ref.dtype)
-        # Stage 3: the finished halves exchanged intra-chip.
-        for u, mine, theirs in (
-            (0, pl.ds(0, half), pl.ds(half, half)),
-            (1, pl.ds(half, half), pl.ds(0, half)),
-        ):
-
-            @pl.when(t == u)
-            def _(mine=mine):
-                out_ref[:, mine] = fin
-                _push(
-                    out_ref.at[:, mine],
-                    out_ref.at[:, mine],
-                    csem.at[4],
-                    csem.at[5],
-                    d,
-                    1 - t,
-                )
-
-        _wait_bytes(out_ref.at[:, pl.ds(0, half)], csem.at[5])
-        _wait_bytes(c_recv1, csem.at[0])
-        _wait_bytes(c_recv2.at[pl.ds(0, dp - 1)], csem.at[2])
-        _wait_bytes(out_ref.at[:, pl.ds(0, half)], csem.at[4])
+    _wait_bytes(out_ref.at[:, pl.ds(0, half)], csem.at[5])
+    _wait_bytes(c_recv1, csem.at[0])
+    _wait_bytes(c_recv2.at[pl.ds(0, dp - 1)], csem.at[2])
+    _wait_bytes(out_ref.at[:, pl.ds(0, half)], csem.at[4])
 
     _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[0])
     if dispatch_fp8:
         _wait_bytes(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[5])
-    if dispatch_form == "flat":
-        _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[2])
-    else:
-        _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[2])
-        _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[3])
+    _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[2])
+    _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[3])
 
 
 class _Scratch:
@@ -942,16 +761,7 @@ def vmem_budget(scratch_bytes, operand_bytes):
 
 @functools.partial(
     jax.jit,
-    static_argnames=(
-        "topk",
-        "dp",
-        "tp",
-        "dispatch_form",
-        "combine_form",
-        "depth",
-        "dispatch_fp8",
-        "gather_rows",
-    ),
+    static_argnames=("topk", "dp", "tp", "dispatch_fp8"),
 )
 def moe_lowtok_fused(
     x,
@@ -962,36 +772,27 @@ def moe_lowtok_fused(
     s2,
     experts_start=0,
     *,
+    rank,
     topk,
     dp,
     tp,
-    dispatch_form="flat",
-    combine_form="hier",
-    depth=1,
     dispatch_fp8=False,
-    rank=None,
-    gather_rows=False,
 ):
     """The routed-expert sum of this engine's rows, with the collectives in the kernel.
 
-    Inside a shard_map over a ("dp", "tp") mesh; `rank` ([2] int32: this core's
-    index on each axis) when the caller's export path refuses `lax.axis_index`,
-    as the torch bridge does. `x` [rows, hidden] bf16 and `logits`
+    Inside a shard_map over a (DP_AXIS, TP_AXIS) mesh; `rank` ([2] int32) is
+    this core's index on each axis, as data (the torch bridge's export path
+    refuses `lax.axis_index`). `x` [rows, hidden] bf16 and `logits`
     [rows, experts] bf16 are this engine's own rows; the kernel gathers them
     over the DP axis, and the result is this engine's rows [rows, hidden]
     summed over every rank. This rank holds experts
     [experts_start, experts_start + E). `dispatch_fp8` pushes
     the rows quantized per row to fp8 with their scale (half the bytes, the
     same values the kernel computes from bf16 rows); it needs row blocks of
-    whole fp8 tiles (32 rows per engine). `gather_rows` applies each expert to its
-    routed rows only (see `_stream_ring`).
+    whole fp8 tiles (32 rows per engine).
     """
-    if dispatch_form not in FORMS or combine_form not in FORMS:
-        raise ValueError(f"forms are one of {FORMS}")
-    if tp != 2 and "hier" in (dispatch_form, combine_form):
+    if tp != 2:
         raise ValueError("the hier forms pair the two cores of a chip (tp == 2)")
-    if depth < 1:
-        raise ValueError("depth is at least 1")
     tokens, hidden = x.shape
     if hidden % (2 * LANE):
         raise ValueError(f"hidden {hidden} is not a multiple of {2 * LANE}")
@@ -1029,20 +830,14 @@ def moe_lowtok_fused(
     sc.vmem((1, lanes), jnp.int32)
     sc.add(pltpu.SMEM((1, lanes), jnp.int32), pltpu.SemaphoreType.DMA((1,)))
     sc.vmem((rows, lanes), jnp.float32)
-    sc.ring(hidden, inter, w13_parts, depth, rows)
+    sc.ring(hidden, inter, w13_parts, _RING_DEPTH, rows)
     sc.vmem((rows, hidden), jnp.float32)
     sc.vmem((rows, hidden), jnp.bfloat16)
-    if combine_form == "flat":
-        sc.vmem((dp, rows_l, hidden), jnp.bfloat16)
-        sc.vmem((rows_l, hidden), jnp.bfloat16)
-        sc.vmem((rows_l, hidden), jnp.bfloat16)
-    else:
-        sc.vmem((rows, half), jnp.bfloat16)
-        sc.vmem((rows, half), jnp.bfloat16)
-        sc.vmem((dp, rows_l, half), jnp.bfloat16)
+    sc.vmem((rows, half), jnp.bfloat16)
+    sc.vmem((rows, half), jnp.bfloat16)
+    sc.vmem((dp, rows_l, half), jnp.bfloat16)
     sc.add(pltpu.SemaphoreType.DMA((6,)))
-    if gather_rows:
-        _gather_scratch(sc, rows, hidden, inter, dispatch_fp8)
+    _gather_scratch(sc, rows, hidden, inter, dispatch_fp8)
     operand_bytes = (
         x_rows.size * 2
         + lg_rows.size * lg_rows.dtype.itemsize
@@ -1053,28 +848,20 @@ def moe_lowtok_fused(
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    name = (
-        f"moe_lowtok_fused_di{dispatch_form[0]}{'q' if dispatch_fp8 else ''}"
-        f"_ci{combine_form[0]}_r{depth}{'_g' if gather_rows else ''}"
-    )
-    prefetch = (
-        (gid,) if rank is None else (gid, jnp.asarray(rank, jnp.int32).reshape(2))
-    )
+    # The forms in the name: hierarchical dispatch (q: FP8 rows) and combine,
+    # the ring depth and the routed-row gather.
+    name = f"moe_lowtok_fused_dih{'q' if dispatch_fp8 else ''}_cih_r{_RING_DEPTH}_g"
+    prefetch = (gid, jnp.asarray(rank, jnp.int32).reshape(2))
     out = pl.pallas_call(
         functools.partial(
             _kernel,
-            rank_operand=rank is not None,
             n_experts=n_experts,
             inter=inter,
             w13_parts=w13_parts,
             topk=topk,
             dp=dp,
             tp=tp,
-            depth=depth,
-            dispatch_form=dispatch_form,
-            combine_form=combine_form,
             dispatch_fp8=dispatch_fp8,
-            gather_rows=gather_rows,
         ),
         out_shape=jax.ShapeDtypeStruct((out_rows, hidden), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(

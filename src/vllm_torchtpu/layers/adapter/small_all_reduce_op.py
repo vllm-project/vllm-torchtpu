@@ -124,7 +124,7 @@ def _build_all_reduce(mesh):
     )
 
 
-def _build_tp_all_reduce(mesh, tp: int, form: str | None):
+def _build_tp_all_reduce(mesh, tp: int):
     """The all-reduce over the TP pairs of the mesh seen as (dp, tp): mesh
     index i is the TP partner of i ^ (tp - 1) group-wise, which `prebuild`
     checks against the torch TP group before arming."""
@@ -141,7 +141,7 @@ def _build_tp_all_reduce(mesh, tp: int, form: str | None):
             return jax.lax.psum(block, axis_name="tp_")
         with sc_common.mesh_axes(("dp_", "tp_")):
             return all_reduce.small_all_reduce(
-                block, num_cores=tp, axis="tp_", rank=rank, form=form
+                block, num_cores=tp, axis="tp_", rank=rank, form=TP_PAIR_FORM
             )
 
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
@@ -283,7 +283,7 @@ def prebuild(vllm_config: Any) -> None:
     ):
         _TP_RANKS = tuple(int(r) for r in get_tp_group().ranks)
         _TP_RANK = torch.tensor([index % tp], dtype=torch.int32, device="tpu")
-        _AR_TP_OP = _build_tp_all_reduce(mesh, tp, TP_PAIR_FORM)
+        _AR_TP_OP = _build_tp_all_reduce(mesh, tp)
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
