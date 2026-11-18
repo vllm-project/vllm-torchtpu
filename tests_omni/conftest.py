@@ -48,12 +48,25 @@ from tests.tpu_release import wait_for_tpu_release
 
 omni_fixture_lock = threading.Lock()
 
+# TpuPlatform._prepare_singlehost_tpu_env writes these into the parent pytest
+# environment when building a multi-rank LLM stage config, and skips recomputing
+# TORCH_TPU_TOPOLOGY on later engines if it is already set.
+_TPU_BOOTSTRAP_ENV_VARS = (
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_TOPOLOGY",
+    "TORCH_TPU_XPROF_SESSION_ID",
+)
+
 
 def cleanup_test_environment() -> None:
     """Tear down distributed state and wait for TPU device nodes to be released."""
     from vllm.distributed import cleanup_dist_env_and_memory
 
     cleanup_dist_env_and_memory()
+    for var in _TPU_BOOTSTRAP_ENV_VARS:
+        os.environ.pop(var, None)
     gc.collect()
     wait_for_tpu_release()
 
