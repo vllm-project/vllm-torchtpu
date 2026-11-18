@@ -47,11 +47,12 @@ class TestTracker:
         assert tracker.requests["a"].stop_ids == (2, 9)
         assert not tracker.requests["a"].structured
 
-    def test_tracks_the_eos_added_from_the_generation_config(self):
+    @pytest.mark.parametrize("ignore_eos", [False, True])
+    def test_tracks_the_eos_added_from_the_generation_config(self, ignore_eos):
         """The usual request names no stop ids: the EOS comes from the
         generation config and is only in all_stop_token_ids."""
         tracker = min_tokens.MinTokensTracker()
-        params = SamplingParams(min_tokens=5)
+        params = SamplingParams(min_tokens=512, max_tokens=512, ignore_eos=ignore_eos)
         params.update_from_generation_config({}, eos_token_id=2)
         tracker.add("a", params)
         assert tracker.requests["a"].stop_ids == (2,)
