@@ -285,6 +285,43 @@
     const miss = Math.pow(1.0 - Math.min(1.0, topK / numExperts), tokensEp);
     return Math.max(1.0, expertsLocal * (1.0 - miss));
   }
+  const LOG_FACT_CACHE = [0.0];
+  function logFactorial(n) {
+    for (let i = LOG_FACT_CACHE.length; i <= n; i++) {
+      LOG_FACT_CACHE.push(LOG_FACT_CACHE[i - 1] + Math.log(i));
+    }
+    return LOG_FACT_CACHE[n];
+  }
+  // Expected per-rank active experts on the busiest of ownerGroups independent
+  // Binomial(E_g, hit) expert groups (E_g = numExperts / ownerGroups), evaluated
+  // via sum_{m=0}^{E_g - 1} (1 - F(m)^ownerGroups) in log space and scaled by
+  // expertsLocal / E_g (floored at 1.0).
+  function expertsHitBusiest(tokensEp, topK, numExperts, expertsLocal, ownerGroups) {
+    if (numExperts <= 0 || expertsLocal <= 0 || ownerGroups > numExperts) {
+      throw new Error(
+        `expertsHitBusiest invalid inputs: numExperts=${numExperts}, expertsLocal=${expertsLocal}, ownerGroups=${ownerGroups}`
+      );
+    }
+    if (ownerGroups <= 1) {
+      return expertsHit(tokensEp, topK, numExperts, expertsLocal);
+    }
+    const expertsPerGroup = Math.floor(numExperts / ownerGroups);
+    const hit = 1.0 - Math.pow(1.0 - Math.min(1.0, topK / numExperts), tokensEp);
+    if (hit <= 0.0) return 1.0;
+    if (hit >= 1.0) return Math.max(1.0, expertsLocal);
+    const logFactTotal = logFactorial(expertsPerGroup);
+    const logHit = Math.log(hit);
+    const logMiss = Math.log1p(-hit);
+    let cdf = 0.0, expectedGroupMax = 0.0;
+    for (let count = 0; count < expertsPerGroup; count++) {
+      const logPmf = logFactTotal - logFactorial(count) -
+        logFactorial(expertsPerGroup - count) +
+        count * logHit + (expertsPerGroup - count) * logMiss;
+      cdf = Math.min(1.0, cdf + Math.exp(logPmf));
+      expectedGroupMax += 1.0 - Math.pow(cdf, ownerGroups);
+    }
+    return Math.max(1.0, expectedGroupMax * (expertsLocal / expertsPerGroup));
+  }
   function selectAdaptiveRing(
     vmemBudget, fixedNonRing, alpha, activeTokens, hasMoe, wl, dBank, eBank
   ) {
@@ -927,12 +964,31 @@
       const measuredInCommS = commInCore ? measuredArTotalS : 0.0;
       const measuredInSyncS = commInCore ? 0.0 : measuredArTotalS;
       const effStateBytes = kvReadBytes + recRwBytes;
-      let fillDrainS = (nOps - 1) * (firstSlot / bwHbm + 2.0 * latColl) + syncStageS;
-      if (tiled) {
-        // Each tile boundary adds a sync hop per layer. The residual bytes moved there
-        // are already in actBytes.
-        fillDrainS += (nSplits - 1) * 2 * layersLocal * 2.0 * latColl;
+      const minEffFloor = Number(DATA.min_efficiency_floor);
+      const syncHopFactor = Number(DATA.boundary_sync_hop_factor);
+      const perOpMixerKernels = Number(DATA.per_op_mixer_kernels_per_layer);
+      const perOpBaseFfnKernels = Number(DATA.per_op_base_ffn_kernels_per_layer);
+      const perOpSharedExpertKernels = Number(DATA.per_op_shared_expert_kernels_per_layer);
+      if (
+        !Number.isFinite(minEffFloor) ||
+        !Number.isFinite(syncHopFactor) ||
+        !Number.isFinite(perOpMixerKernels) ||
+        !Number.isFinite(perOpBaseFfnKernels) ||
+        !Number.isFinite(perOpSharedExpertKernels)
+      ) {
+        throw new Error('Missing required per-op kernel or boundary seed constants in DATA');
       }
+      const boundaryFillDrainS = (boundaries, effHbmVal, effIciVal) => {
+        const perCallS = (firstSlot / bwHbm) / effHbmVal +
+          (syncHopFactor * latColl) / effIciVal;
+        const tiledSyncS = tiled
+          ? (((nSplits - 1) * 2 * layersLocal * syncHopFactor * latColl) / effIciVal)
+          : 0.0;
+        return (boundaries * perCallS + syncStageS) + tiledSyncS;
+      };
+      // Each tile boundary adds a sync hop per layer. The residual bytes moved there
+      // are already in actBytes.
+      const fillDrainS = boundaryFillDrainS(nOps - 1, 1.0, 1.0);
       const vecRate = ch.vector_f32_ops_per_s || (ch.bf16_flops_per_s / 128.0);
       const subchannelKThresh = DATA.subchannel_block_k_threshold || 512;
       const subchannelVecOps = DATA.subchannel_vec_ops_per_block || 2.0;
@@ -986,27 +1042,46 @@
       const pureStepUs = roofUs + repassUs;
       const launchUs = nOps * lgBox.lo, stepUs = pureStepUs + launchUs;
       const etaMoe = (groupedMoe && lMoe > 0) ? etaMoeGrp : etaDense;
+      const effHbm = Math.max(minEffFloor, etaHbm);
+      const effIci = Math.max(minEffFloor, etaIci);
+      const effDense = Math.max(minEffFloor, etaDense);
+      const effMoe = Math.max(minEffFloor, etaMoe);
       const tMatmulDenseAch = (attnIsBf16 && flopsKv > 0)
-        ? (((flopsDense - flopsKv) / peakW) / Math.max(1e-3, etaDense) +
-           (flopsKv / bf16Peak) / Math.max(1e-3, etaDense))
-        : (flopsDense / peakW) / Math.max(1e-3, etaDense);
+        ? (((flopsDense - flopsKv) / peakW) / effDense +
+           (flopsKv / bf16Peak) / effDense)
+        : (flopsDense / peakW) / effDense;
       const tDenseAch = Math.max(
         tMatmulDenseAch,
-        (vecOpsDense / vecRate) / Math.max(1e-3, etaDense)
+        (vecOpsDense / vecRate) / effDense
       );
-      const tMoeAch = ((moePadFactor * flopsMoe) / peakE) / Math.max(1e-3, etaMoe);
-      const tVecMoeAch = (vecOpsMoe / vecRate) / Math.max(1e-3, etaDense);
-      const tCompAch = tDenseAch + tMoeAch;
-      const tHbmAch = tHbm / Math.max(1e-3, etaHbm);
+      const declOwnerGroups = moeDecl ? Number(moeDecl.expert_owner_groups || 0) : 0;
+      const ownerGroups = declOwnerGroups > 0 ? declOwnerGroups : ep;
+      const tokEpStep = activeTokens * epDp;
+      const routedAchRatio = expertsLoc > 0
+        ? (expertsHitBusiest(tokEpStep, topK, nExp, expertsLoc, ownerGroups) /
+           expertsHit(tokEpStep, topK, nExp, expertsLoc))
+        : 1.0;
+      const perOpCalls = Math.max(
+        1,
+        (perOpMixerKernels + perOpBaseFfnKernels) * layersLocal +
+          ((p.shared_expert_intermediate_size || 0) > 0
+            ? perOpSharedExpertKernels * lMoe
+            : 0)
+      );
+      const boundaryCount = sc === 'per_op' ? (perOpCalls - 1) : (nOps - 1);
+      const achFillDrainS = boundaryFillDrainS(boundaryCount, effHbm, effIci);
+      const tMoeAch = ((moePadFactor * routedAchRatio * flopsMoe) / peakE) / effMoe;
+      const tVecMoeAch = ((vecOpsMoe * routedAchRatio) / vecRate) / effDense;
+      const tHbmAch = (tHbm + (routedAchRatio - 1.0) * routedHbmS) / effHbm;
       const unmeasuredCommS = Math.max(0.0, commS - measuredInCommS);
-      const tCommAch = measuredInCommS + unmeasuredCommS / Math.max(1e-3, etaIci);
+      const tCommAch = measuredInCommS + unmeasuredCommS / effIci;
       const unmeasuredSyncS = Math.max(0.0, syncStageS - measuredInSyncS);
       const syncExtraS = isFusedMulti
-        ? unmeasuredSyncS * (1.0 / Math.max(1e-3, etaIci) - 1.0) : 0.0;
-      const routedHbmAchS = routedHbmS / Math.max(1e-3, etaHbm);
+        ? unmeasuredSyncS * (1.0 / effIci - 1.0) : 0.0;
+      const routedHbmAchS = (routedHbmS * routedAchRatio) / effHbm;
       const chainAchS = routedChain(tDenseAch, routedHbmAchS, tMoeAch, tVecMoeAch);
-      const achCoreS = coreTime(tHbmAch, chainAchS, tCommAch, isFusedMulti) + syncExtraS;
-      const stepAchUs = (achCoreS + fillDrainS) * 1e6 + repassUs + launchUs;
+      const achCoreS = Math.max(tHbmAch, chainAchS) + tCommAch + syncExtraS;
+      const stepAchUs = (achCoreS + achFillDrainS) * 1e6 + repassUs + launchUs;
       const arExtraS = hasMeasuredAr ? 0.0 : (
         (numAr * nSplits * xlaArFactor * arInfo.intraHops) *
         Math.max(0.0, latCollHi - latColl)
@@ -1019,21 +1094,21 @@
       const roofHiUs = (roofHiCoreS + fillDrainS) * 1e6;
       const stepHiUs = Math.max(stepUs, roofHiUs + repassUs + nOps * lgBox.hi);
       const tMatmulDenseUpperAch = ((attnIsBf16 || isPrefOrMix) && flopsKv > 0)
-        ? (((flopsDense - flopsKv) / peakW) / Math.max(1e-3, etaDense) +
-           (flopsKv / bf16Peak) / Math.max(1e-3, etaDense))
-        : (flopsDense / peakW) / Math.max(1e-3, etaDense);
+        ? (((flopsDense - flopsKv) / peakW) / effDense +
+           (flopsKv / bf16Peak) / effDense)
+        : (flopsDense / peakW) / effDense;
       const tDenseHiAch = Math.max(
         tMatmulDenseUpperAch,
-        (vecOpsDense / vecRate) / Math.max(1e-3, etaDense)
+        (vecOpsDense / vecRate) / effDense
       );
       const tCommHiAch = measuredInCommS +
-        (unmeasuredCommS + arExtraS) / Math.max(1e-3, etaIci);
+        (unmeasuredCommS + arExtraS) / effIci;
       const chainHiAchS = routedChain(tDenseHiAch, routedHbmAchS, tMoeAch, tVecMoeAch);
-      const achHiCoreS = coreTime(tHbmAch, chainHiAchS, tCommHiAch, overlappedComm) +
-        syncExtraS + (a2aExtraS / Math.max(1e-3, etaIci));
+      const achHiCoreS = Math.max(tHbmAch, chainHiAchS) + tCommHiAch +
+        syncExtraS + (a2aExtraS / effIci);
       const stepAchHiUs = Math.max(
         stepAchUs, stepHiUs,
-        (achHiCoreS + fillDrainS) * 1e6 + repassUs + nOps * lgBox.hi
+        (achHiCoreS + achFillDrainS) * 1e6 + repassUs + nOps * lgBox.hi
       );
       const eStrict = expertsLoc > 0
         ? Math.min(expertsLoc, Math.max(1.0, topK * expertsLoc / Math.max(1, nExp)))
