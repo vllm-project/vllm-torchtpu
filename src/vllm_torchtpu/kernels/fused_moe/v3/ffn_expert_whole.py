@@ -22,7 +22,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import ffn
 from . import ffn_body as body
 from .layout import LANES, ROW_BLOCK
 
@@ -238,17 +237,6 @@ def expert_step(ctx, expert, visit_i, carry):
     weight_slot = lax.rem(visit_i, jnp.int32(b.weight_slots))
     w1_copy(ctx, expert, weight_slot).wait()
     w2_copy(ctx, expert, weight_slot).wait()
-    if b.intermediate == "bf16":  # the down matmul's bf16 copy of this expert's w2
-        ctx.scratch.w2_bf16[...] = ctx.scratch.w2[weight_slot].astype(jnp.bfloat16)
-    if ctx.scratch.w1_bf16 is not None:  # bf16 token rows: the up matmul's copy of w1
-        ctx.scratch.w1_bf16[...] = ctx.scratch.w1[weight_slot].astype(jnp.bfloat16)
-    if b.form.packed:  # this expert's four-bit slabs widened to fp8, once
-        ctx.scratch.w1_fp8[...] = ffn.widen_packed_slab(
-            ctx.scratch.w1, weight_slot, b.form.weight_dtype
-        )
-        ctx.scratch.w2_fp8[...] = ffn.widen_packed_slab(
-            ctx.scratch.w2, weight_slot, b.form.weight_dtype
-        )
 
     @pl.when(visit_i + b.weight_prefetch < ctx.n_visit)
     def _():

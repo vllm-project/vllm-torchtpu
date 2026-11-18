@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Quantization format descriptors and blockwise scale layout helpers for Fused
-EP MoE v3."""
+"""Weight format descriptors for Fused EP MoE v3."""
 
 import enum
 from typing import NamedTuple
@@ -20,19 +19,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from .layout import FP4_PER_WORD, SUBLANES
 from .rowquant import FP8
-
-# Storage only: there is no four-bit matrix unit, so each block is upcast
-# to fp8 in VMEM before it is contracted.
-FP4 = jnp.float4_e2m1fn
-INT4 = jnp.int4
-PACKED_DTYPES = (
-    FP4,
-    INT4,
-)  # four-bit weights: packed in 32-bit words, widened to fp8 in the kernel
-# Contraction rows one four-bit weight scale covers, by default.
-WEIGHT_BLOCK_DEFAULT = 512
 
 
 class WeightFormat(str, enum.Enum):
@@ -40,9 +27,6 @@ class WeightFormat(str, enum.Enum):
     messages."""
 
     FP8 = "fp8"
-    FP8_BLOCK = "fp8_block"
-    FP4 = "fp4"
-    INT4 = "int4"
     BF16 = "bf16"
 
     def __str__(self):
@@ -54,28 +38,13 @@ class WeightFormat(str, enum.Enum):
 
 class WeightForm(NamedTuple):
     """A weight format: the element type of the expert weights, and the
-    layout of the scales the caller supplies, one f32 per output channel
-    ("per_channel"), one per (contraction block, output channel)
-    ("per_contraction_block": four-bit weights, fp4 or int4 with one
-    scale per block of the contraction, and fp8 weights in the block-scaled
-    form the DeepSeek-family checkpoints ship in), or none for unscaled
-    bf16 weights. Config selects the token and result row formats and
-    token quantization block within the supported weight-format combinations."""
+    layout of the scales the caller supplies: one f32 per output channel
+    ("per_channel"), or none for unscaled bf16 weights. Config selects the
+    result row format within the supported weight formats."""
 
     name: WeightFormat
     weight_dtype: jax.typing.DTypeLike
     scale_layout: str
-
-    @property
-    def block_scaled(self):
-        """Whether the scales are per contraction block."""
-        return self.scale_layout == "per_contraction_block"
-
-    @property
-    def packed(self):
-        """Four-bit weights (fp4 or int4): stored packed in 32-bit words
-        and widened to fp8 in the kernel (an int4 value is exact in fp8)."""
-        return any(jnp.dtype(self.weight_dtype) == jnp.dtype(d) for d in PACKED_DTYPES)
 
     @property
     def has_scales(self):
@@ -85,18 +54,9 @@ class WeightForm(NamedTuple):
 
 WEIGHT_FORMS = {
     WeightFormat.FP8: WeightForm(WeightFormat.FP8, FP8, "per_channel"),
-    WeightFormat.FP8_BLOCK: WeightForm(
-        WeightFormat.FP8_BLOCK, FP8, "per_contraction_block"
-    ),
-    WeightFormat.FP4: WeightForm(WeightFormat.FP4, FP4, "per_contraction_block"),
-    WeightFormat.INT4: WeightForm(WeightFormat.INT4, INT4, "per_contraction_block"),
     WeightFormat.BF16: WeightForm(WeightFormat.BF16, jnp.bfloat16, "none"),
 }
 WEIGHT_FORMAT_NAMES = tuple(WEIGHT_FORMS)
-# Rows of packed four-bit weights one addressable block is a whole number
-# of: FP4_PER_WORD values to a 32-bit word, and those words tile to
-# layout.SUBLANES sublanes.
-PACKED_ROW_TILE = FP4_PER_WORD * SUBLANES
 
 
 def weight_form(weight_format):
