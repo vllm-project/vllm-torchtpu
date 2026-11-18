@@ -167,9 +167,11 @@ def _pairs(tokens, top_k, hidden, seed=1):
     return rows, weights
 
 
-def _k_ordered_sum(rows, coef, tokens, top_k, hidden):
-    terms = jnp.asarray(rows, jnp.float32).reshape(tokens, top_k, hidden)
-    coef = jnp.asarray(coef, jnp.float32)
+def _k_ordered_sum(rows, coef, tokens, top_k, hidden, dtype=jnp.float32):
+    """The k-ordered sum with the products and the sum in `dtype`, the
+    coefficient formed in float32 and then cast, as weighted_sum does."""
+    terms = jnp.asarray(rows).astype(dtype).reshape(tokens, top_k, hidden)
+    coef = jnp.asarray(coef, jnp.float32).astype(dtype)
     acc = None
     for k in range(top_k):
         c = coef[:, k : k + 1]
@@ -178,9 +180,30 @@ def _k_ordered_sum(rows, coef, tokens, top_k, hidden):
     return acc
 
 
+# (sum dtype, hidden): the default float32 sum; a bfloat16 sum at a width
+# whose lane blocks (8) fill no whole bfloat16 staging register, so it stages
+# in float32; and one whose 16 lane blocks do, so it stages in bfloat16.
+SUM_FORMS = {
+    "f32_sum": (jnp.float32, 1024),
+    "bf16_sum_f32_staging": (jnp.bfloat16, 1024),
+    "bf16_sum_bf16_staging": (jnp.bfloat16, 2048),
+}
+
+
+def test_the_sum_forms_cover_both_staging_dtypes():
+    stage = {
+        name: combine._stage_dtype(dtype, hidden // LANES)
+        for name, (dtype, hidden) in SUM_FORMS.items()
+    }
+    assert stage["bf16_sum_f32_staging"] == jnp.float32
+    assert stage["bf16_sum_bf16_staging"] == jnp.bfloat16
+
+
+@pytest.mark.parametrize("form", list(SUM_FORMS))
 @pytest.mark.parametrize("fp8_rows", [False, True], ids=["bf16_rows", "fp8_rows"])
-def test_weighted_sum_matches_the_k_ordered_sum(interpret, fp8_rows):
-    tokens, top_k, hidden = 128, 4, 1024
+def test_weighted_sum_matches_the_k_ordered_sum(interpret, fp8_rows, form):
+    dtype, hidden = SUM_FORMS[form]
+    tokens, top_k = 128, 4
     rows, weights = _pairs(tokens, top_k, hidden)
     if fp8_rows:
         finite = np.nan_to_num(rows, nan=0.0)
@@ -199,8 +222,9 @@ def test_weighted_sum_matches_the_k_ordered_sum(interpret, fp8_rows):
         tokens_per_shard=tokens,
         hidden=hidden,
         out_dtype=jnp.bfloat16,
+        dtype=dtype,
     )
-    want = _k_ordered_sum(q, coef, tokens, top_k, hidden)
+    want = _k_ordered_sum(q, coef, tokens, top_k, hidden, dtype)
     got = np.asarray(got.astype(jnp.float32))
     assert np.isfinite(got).all()
     # A fused multiply-add in one of the two programs can move an f32 sum by
