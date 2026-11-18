@@ -16,7 +16,7 @@ python -m vllm_torchtpu.megakernel.advisor estimate \
 
 ### 2. Trace-Measured Evaluation (`--measurements`)
 
-Pass an `advisor.measurements.v1` JSON file containing trace-measured launch gaps, collective hop latencies, step coverage, or DCN bandwidth to promote `ASSUMED` inputs to `MEASURED` and settle `tie(measure: <input>)` verdicts. You may also pass `--measurements bundled` (or `--measurements auto`) to load bundled public chip priors (such as `tpu7x_public.json`):
+Pass an `advisor.measurements.v1` JSON file containing trace-measured launch gaps, all-reduce call latencies, step coverage, or DCN bandwidth to promote `ASSUMED` inputs to `MEASURED` and settle `tie(measure: <input>)` verdicts. You may also pass `--measurements bundled` (or `--measurements auto`) to load bundled public chip priors (such as `tpu7x_public.json`):
 
 ```json
 {
@@ -24,7 +24,15 @@ Pass an `advisor.measurements.v1` JSON file containing trace-measured launch gap
   "source": {"kind": "xplane", "file": "profile.xplane.pb"},
   "launch_gap_us": {"p50": 3.5, "p90": 5.0, "n": 40},
   "collectives": [
-    {"op": "all_reduce", "group_size": 8, "bytes": 32768, "latency_us": 12.0, "n": 20}
+    {
+      "op": "all-reduce",
+      "path": "xla",
+      "group_size": 8,
+      "bytes": 32768,
+      "latency_us": 12.0,
+      "mean_latency_us": 13.5,
+      "n": 20
+    }
   ],
   "step_coverage": {"fused_eligible_fraction": 0.88, "basis": "trace"}
 }
@@ -35,6 +43,8 @@ python -m vllm_torchtpu.megakernel.advisor estimate \
   --model qwen3.5-397b --chip tpu7x --measurements measurements.json \
   --json report.json
 ```
+
+The `calibrate` command matches collectives by event-name substring across device-plane lines without recording the source line. It emits `latency_us` (median) and `mean_latency_us` (mean) per bucket, and reports no launch gap when a trace lacks step windows. Collective entries written by `calibrate` omit `path` and load as `xla`; an `in_kernel` entry is written by hand from an in-kernel measurement. Calibrated `all-reduce` entries (sources other than `architectural_prior`) apply only when `path` (`xla` for `per_op`, `in_kernel` for fused scopes) and `group_size` match the workload's tensor-parallel rank count, charging `mean_latency_us` per call when present and `latency_us` otherwise. `collective_latency_us` remains the chip's per-hop prior (`ASSUMED`), while `collective_call_us_xla` and `collective_call_us_in_kernel` report the single-call all-reduce cost on each path (`MEASURED` when matched, `ASSUMED` otherwise, or `DERIVED` on one rank).
 
 ## Provenance Tags
 
@@ -66,13 +76,14 @@ Hardware specifications (`vmem_capacity_bytes`, `hbm_bw_bytes_per_s`, `bf16_flop
 - **Support Classes (Default-Deny Guard)**:
   - `baseline`: `per_op` execution (always runnable).
   - `within_core_limits`: `whole_step` within `CORE_LIMITS` (`max_batch_rows = 128`, `verified_ranks = (1, 2, 4, 8, 16)`, `chip_kinds = ("TPU7x",)`, `ep_dp == 1`, recognized `model_type`, and all layer families in `SUPPORTED_ONCHIP_FAMILIES`).
-  - `declared`: explicitly declared in `data/presets/deployments.json` under `"megakernel"`.
+  - `declared`: explicitly declared in `data/presets/deployments.json` under `"megakernel"` or `"megakernel_layouts"` for the workload's rank count and serving layout.
   - `hypothetical`: any fused scope outside `CORE_LIMITS` without a preset declaration; `recommended_scope` stays `per_op` while `fastest_scope` and `hypothetical_best` report the physics winner and its `blockers`.
-- **Extension Contract**: update `CORE_LIMITS` in `support.py` when `megakernel/core/` expands its verified grid, or add a `"megakernel"` entry to `data/presets/deployments.json` once a workload is validated end-to-end.
-- **Rows per Call**: `t_vmem_max` for `whole_step` is the VMEM ceiling of an ideal kernel (aliased scratch, minimum ring). It is an upper bound on rows per call, not a served limit. `--max-rows-per-call`, or `max_rows` in a `"megakernel"` preset entry, caps it for decode and verify. Rows above the cap are priced as full calls plus a remainder, split in whole requests, and the report carries the `microbatch_rerun` flag. The megakernel core's default buckets stop at 32 decode rows and 64 verify rows; a larger call carries the `above_default_buckets` flag.
+- **Layout Matching**: pass the serving layout flags (`tp`, `ep`, `dp`, `pp`, `dcp`) that the server runs with. Declarations match both `ranks` and the full serving layout; a rank match on another layout reports `layout_not_declared`. A kernel that reshards experts inside the fused call is declared on its serving layout, so passing its internal expert mode as the layout yields `layout_not_declared`.
+- **Extension Contract**: update `CORE_LIMITS` in `support.py` when `megakernel/core/` expands its verified grid, or add a `"megakernel"` entry (on `decode`, `prefill`, `saturation`, or `megakernel_layouts`) to `data/presets/deployments.json` once a workload is validated end-to-end.
+- **Rows per Call**: `t_vmem_max` for `whole_step` is the VMEM ceiling of an ideal kernel (aliased scratch, minimum ring). It is an upper bound on rows per call, not a served limit. `--max-rows-per-call`, or `max_rows` in a `"megakernel"` preset entry, caps it for decode and verify. Rows above the cap are priced as full calls plus a remainder, split in whole requests, and the report carries the `microbatch_rerun` flag. The megakernel core's default buckets stop at 32 decode rows and 64 verify rows; a larger call carries the `above_default_buckets` flag. An undeclared `whole_step` call above that bucket top without `--max-rows-per-call` is marked `hypothetical` with `row_limit_not_stated` and lists `max_rows_per_call` as an unresolved input (`affects: "support"`).
 - **Collectives**: a layer requests its routed-expert weights after its router runs, so collectives add to the routed-expert stream instead of overlapping it. All-reduce transfer is priced on one ICI link, as a ring or dimension-ordered all-reduce uses it; `step_floor_strict_us` keeps the egress sum of all links.
 
 - Optimistic floor (`band[0]`): peak hardware FLOP/s (FP8 peak on native-FP8 chips when weights are FP8) and lower-bound collective latency.
 - Conservative upper bound (`band[1]` / `step_upper_us`): BF16 attention dot throughput on prefill plus upper-bound launch gap and collective hop latency.
 - Every scope is priced at each corner of the same input box (launch gap, collective hop latency, prefill attention dot dtype); the all-low corner is `step_bound_us` and the all-high corner is `step_upper_us`. `verdict` reports `tie(measure: <input>)` only when the fastest scope changes between corners, naming the assumed input that settles it; `rationale` names the competing scope and corner.
-- `--measurements` replaces the launch gap and collective latency bands with trace values, which narrows the bands and the verdict.
+- `--measurements` replaces the launch gap band and matching per-path all-reduce call costs with trace values, narrowing the uncertainty bands and verdict.
