@@ -223,7 +223,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
+        tuned_tiles: bool | None = None,
     ):
+        """tuned_tiles=None passes the block sizes above; True or False lets
+        the wrapper pick its tiles with or without the tuned rules."""
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
             page_size = utils.align_to(page_size, 128)
@@ -407,11 +410,17 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             batch_size=rpa_batch_size,
         )
 
+        if tuned_tiles is None:
+            tile_kwargs = {
+                "decode_block_sizes": decode_block_sizes,
+                "prefill_block_sizes": prefill_block_sizes,
+            }
+        else:
+            tile_kwargs = {"tuned_tiles": tuned_tiles}
         output, updated_kv_cache = wrapper.ragged_paged_attention(
             *jax.tree.map(lambda x: x.copy(), rpa_args),
             **kwargs,
-            decode_block_sizes=decode_block_sizes,
-            prefill_block_sizes=prefill_block_sizes,
+            **tile_kwargs,
             vmem_limit_bytes=vmem_limit_bytes,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
@@ -946,6 +955,26 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             dtype,
             num_pages,
             soft_cap=soft_cap,
+        )
+
+    @parameterized.product(tuned_tiles=[False, True])
+    def test_ragged_paged_attention_tuned_tiles(self, tuned_tiles):
+        """The wrapper's own tiles, with and without the tuned rules, at a
+        layer shape the rules were tuned for (32 q / 2 KV heads of 256, fp8
+        KV, SEQ_ALONG_LANE pages of 128): three 4-token decodes over contexts
+        up to 4,100 tokens and a 300-token chunk."""
+        self._test_ragged_paged_attention(
+            [(4, 3000), (4, 700), (4, 4100), (300, 2000)],
+            (32, 2),
+            256,
+            128,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            100,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            decode_query_size=4,
+            distribution=jnp.array([3, 3, 4], dtype=jnp.int32),
+            tuned_tiles=tuned_tiles,
         )
 
     @parameterized.product(
