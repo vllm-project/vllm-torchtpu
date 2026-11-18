@@ -288,6 +288,11 @@ def _flash_attention(
 
 MIN_BLOCK_SIZE = 128
 _ROW_GROUP = 1024
+# Windows are covered by block_k chunks, then by chunks of this size: at
+# block_k 2048 rounding a window up to block_k wastes 1024 columns on average
+# (packed 32768 row, block_q 2048: 1.92 -> 1.84 ms; 256 and 1024 are within
+# 0.04 ms of it).
+_TAIL_BLOCK_K = 512
 TRANS_B_DIM_NUMBERS = (((1,), (1,)), ((), ()))
 
 
@@ -464,19 +469,35 @@ def _flash_attention_kernel_single_batch(
             pl.loop(0, block_k_major, step=block_k, unroll=True)(_attend)
             return
         # Only the q block's kv window [lo, hi) can hold a matching segment.
-        # Cover its part in this kv block with the fewest block_k chunks,
-        # placed inside the kv block: columns they add past the window are
-        # masked like any other mismatch.
+        # Cover its part in this kv block with block_k chunks and the rest
+        # with tail_k ones, placed inside the kv block: columns they add past
+        # the window are masked like any other mismatch.
         batch = pl.program_id(0) * q_tile_ref.shape[0] + batch_idx[0]
         kv_start = kv_seq_idx * block_k_major
         lo = jnp.maximum(kv_windows_ref[batch, q_seq_idx, 0], kv_start)
         hi = jnp.minimum(kv_windows_ref[batch, q_seq_idx, 1], kv_start + block_k_major)
-        num_chunks = pl.cdiv(jnp.maximum(hi - lo, 0), block_k)
-        first = jnp.minimum(lo - kv_start, block_k_major - num_chunks * block_k)
+        width = jnp.maximum(hi - lo, 0)
+        tail_k = math.gcd(block_k, block_k_major, _TAIL_BLOCK_K)
+        if tail_k == block_k:
+            num_main, num_tail = pl.cdiv(width, block_k), 0
+        else:
+            num_main = width // block_k
+            num_tail = pl.cdiv(width - num_main * block_k, tail_k)
+        # tail_k divides block_k and block_k_major, so the chunks fit.
+        first = jnp.minimum(
+            lo - kv_start, block_k_major - num_main * block_k - num_tail * tail_k
+        )
 
-        @pl.loop(0, num_chunks)
-        def _body(i):
+        @pl.loop(0, num_main)
+        def _main(i):
             _attend(pl.multiple_of(first + i * block_k, NUM_LANES))
+
+        if tail_k != block_k:
+
+            @pl.loop(0, num_tail)
+            def _tail(i):
+                start = first + num_main * block_k + i * tail_k
+                _attend(pl.multiple_of(start, NUM_LANES), tail_k)
 
     @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
     def store_output():
