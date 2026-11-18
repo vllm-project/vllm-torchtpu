@@ -20,6 +20,7 @@ from typing import Any, Literal, overload
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.lse_rescale import lse_rescale_head_major
 
 
@@ -89,7 +90,13 @@ def cp_lse_ag_out_rs(
 
     # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
     lse = lse.to(torch.float32)
-    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    lses = None
+    if envs.TPU_DCP_LSE_SMALL_ALL_GATHER and output.device.type == "tpu":
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+        lses = small_all_reduce_op.dcp_lse_all_gather(lse, group)
+    if lses is None:
+        lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
     merged_lse = torch.logsumexp(lses, dim=0)
 
     if output.device.type == "tpu":

@@ -327,6 +327,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_SAMPLER_VOCAB_PARALLEL: bool = True
     TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
+    TPU_DCP_LSE_SMALL_ALL_GATHER: bool = False
     TPU_SMALL_ALL_REDUCE_CHIP_PAIRS: int = 0
     TPU_FUSED_OPROJ_AR: bool = True
     TPU_FUSED_OPROJ_AR_WAVES: bool = True
@@ -2346,6 +2347,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rows to 16. Valid rows are bitwise TPU_SMALL_ALL_REDUCE's (same f32 sum
     # in core order).
     "TPU_SMALL_ALL_REDUCE_VALID_ROWS": env_bool("TPU_SMALL_ALL_REDUCE_VALID_ROWS"),
+    # With TPU_SMALL_ALL_REDUCE: the LSE all-gather of the DCP reduce-scatter
+    # merge (`dcp_comm.cp_lse_ag_out_rs`) runs as the one-shot Pallas
+    # all-gather (small_collectives/all_gather.py) over the expert-parallel
+    # mesh, when the DCP group is that mesh in the same rank order. Backbone
+    # warmup traces only; other traces keep vLLM's all-gather. XLA's
+    # all-gather of the f32[64, 64] LSE at a 64-token decode bucket on 16
+    # cores costs 15-19 us, most of it fixed cost. The result is bitwise
+    # the same (the kernel copies bytes).
+    "TPU_DCP_LSE_SMALL_ALL_GATHER": env_bool("TPU_DCP_LSE_SMALL_ALL_GATHER"),
     # With TPU_SMALL_ALL_REDUCE: kernel all-reduces of at least this many rows
     # (up to TPU_SMALL_ALL_REDUCE_MAX_ROWS) run the two-shot by chip pairs
     # (small_collectives/all_reduce.py, form "pairs"): each core sends its

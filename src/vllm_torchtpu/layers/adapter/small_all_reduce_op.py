@@ -79,6 +79,7 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode.all_reduce import (
     check_chip_pairs,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives import (
+    all_gather,
     all_reduce,
     reduce_scatter,
 )
@@ -124,6 +125,8 @@ _AR_OP = None
 # made per exported bucket inside JAX (TPU_SMALL_ALL_REDUCE_DRAFT).
 _AR_SIZED_OP = None
 _RS_OP = None
+# The DCP merge's LSE all-gather (TPU_DCP_LSE_SMALL_ALL_GATHER).
+_AG_OP = None
 # The valid-rows all-reduce (TPU_SMALL_ALL_REDUCE_VALID_ROWS) and the bf16 row
 # tile its fold path folds into.
 _AR_VALID_OP = None
@@ -321,6 +324,36 @@ def _build_reduce_scatter(mesh):
     )
 
 
+def _build_all_gather(mesh):
+    """The one-shot all-gather op over ``mesh``: fn(x [L] 32-bit, rank int32
+    [1]) per core -> [cores * L], core r's block at [r * L, (r + 1) * L)."""
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+    hbm_operand = envs.TPU_SMALL_COLL_HBM_OPERAND
+
+    def body(block, rank):
+        return all_gather.small_all_gather(
+            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank, hbm_operand=hbm_operand
+        )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
+        )(x, rank)
+
+    def fake(x, rank):
+        return x.new_empty((n * x.numel(),))
+
+    return sharded_jax_op(
+        "pallas::small_all_gather",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec),
+        output_partition_specs=spec,
+        fake=fake,
+    )
+
+
 def _gather(obj) -> list:
     """all_gather_object over the EP group's CPU group, in group rank order."""
     group = get_ep_group()
@@ -466,6 +499,7 @@ def prebuild(hidden_size: int = 0) -> None:
     hidden_size is the model's, the width of the chip-pair self-test."""
     global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
     global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP, _UV_MM_AR_OP, _PAIR_ROWS
+    global _AG_OP
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -496,6 +530,8 @@ def prebuild(hidden_size: int = 0) -> None:
             mesh, psum_above=max_rows(), pair_rows=_PAIR_ROWS
         )
     _RS_OP = _build_reduce_scatter(mesh)
+    if envs.TPU_DCP_LSE_SMALL_ALL_GATHER:
+        _AG_OP = _build_all_gather(mesh)
     if envs.TPU_SMALL_ALL_REDUCE_VALID_ROWS:
         from jax.experimental.pallas import tpu as pltpu
 
@@ -629,6 +665,34 @@ def dp_combine_or(x: torch.Tensor, fallback) -> torch.Tensor:
     if x.shape[0] <= _CORES * COMBINE_MAX_ROWS:
         return _RS_OP(x, _RANK)
     return retain(fallback(x))
+
+
+def _covers(group) -> bool:
+    """Whether ``group`` (a vLLM group coordinator) is the mesh in mesh order,
+    so that its rank r is mesh index r and a kernel over the mesh collects
+    over exactly that group."""
+    return _RANK is not None and tuple(int(r) for r in group.ranks) == _MESH_RANKS
+
+
+def dcp_lse_all_gather(lse: torch.Tensor, group) -> torch.Tensor | None:
+    """``group.all_gather(lse.unsqueeze(0), dim=0)``, [world, *lse.shape], as
+    the one-shot Pallas all-gather (TPU_DCP_LSE_SMALL_ALL_GATHER), or None
+    when the kernel cannot take this call: not a backbone warmup trace, the
+    group is not the mesh, not float32, or not a multiple of 1024 words
+    (the kernel moves [8, 128] tiles). Bitwise the XLA all-gather. Every
+    warmup bucket already reads the rank buffer through the TP all-reduce,
+    so this read adds no buffer to a bucket's trace."""
+    if (
+        _AG_OP is None
+        or not _covers(group)
+        or not torch.compiler.is_compiling()
+        or not shape_variants.in_warmup()
+        or lse.dtype != torch.float32
+        or lse.numel() % (8 * LANES)
+    ):
+        return None
+    flat = _AG_OP(lse.reshape(-1).contiguous(), _RANK)
+    return flat.view(_CORES, *lse.shape)
 
 
 def _fused_layer_weights(layer):
