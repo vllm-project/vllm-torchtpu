@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: int = 1
     TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = True
     TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 4
+    TPU_DCP_ONLINE_LSE_COMBINE: str = ""
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -688,6 +689,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same merged [T, L, V]. Static per bucket in the JAX op.
     "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS": env_int(
         "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", 4
+    ),
+    # Single-kernel TensorCore online-LSE DCP combine (`small_collectives/
+    # dcp_lse_combine.py`) for backbone decode/mixed buckets supported by
+    # `online_lse_combine_supported`: \"\" / \"0\" = off (default),
+    # \"1\" / \"auto\" = chip-pair-first 2-stage combine (\"pairs\") when adjacent
+    # DCP ranks pair each chip's two TensorCores else 1-stage \"flat\",
+    # \"pairs\" = require chip-pair-first 2-stage combine, \"flat\" = 1-stage.
+    "TPU_DCP_ONLINE_LSE_COMBINE": env_with_choices(
+        "TPU_DCP_ONLINE_LSE_COMBINE",
+        "",
+        ["", "0", "1", "auto", "pairs", "flat"],
+        case_sensitive=False,
     ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
