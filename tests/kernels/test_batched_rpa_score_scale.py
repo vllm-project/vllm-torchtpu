@@ -142,3 +142,14 @@ def test_power_of_two_scale_folds_into_q_exactly(mode, scale_k):
     plain = _scores(cfgs, scale_k, diet=False)
     for name, a, b in zip(("p", "m_next", "l_next"), diet, plain):
         np.testing.assert_array_equal(a, b, err_msg=name)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "folds"),
+    [(jnp.bfloat16, True), (jnp.float32, True), (jnp.float16, False)],
+)
+def test_only_a_bf16_or_f32_q_folds(dtype, folds):
+    """Scaling an fp16 q by a power of two can push it out of its normal
+    range, so the fold is exact only for bf16 and f32 q."""
+    cfgs = _cfgs(configs.RpaCase.DECODE, 256, dtype)
+    assert (flash_attention.q_folded_scale(cfgs) is not None) == folds

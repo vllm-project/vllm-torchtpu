@@ -21,9 +21,9 @@ Qwen3.5 TP8 per device: 4 q heads, 1 KV head, head_dim 256, fp8 SEQ_ALONG_LANE
   page/lane boundaries, and reach 160k tokens.
 * The DCP passes (CACHE_ONLY / NEW_TOKENS_ONLY with return_lse), with and
   without a 4-way interleaved context-parallel cache shard.
-* The VPU diet (scale folded into q when the folded scale is a power of two,
-  mask skipped for KV blocks below the causal diagonal) against the original
-  path: must be bit-identical.
+* The VPU diet (scale folded into q when sm_scale and k_scale are each a
+  power of two, mask skipped for KV blocks below the causal diagonal) against
+  the original path: must be bit-identical.
 
 Inputs and references are built on device so 160k contexts stay fast.
 """
