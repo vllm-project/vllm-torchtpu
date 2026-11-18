@@ -55,7 +55,7 @@ forwards restructured so torch.compile serves every bucket:
   input; a row count derived from it ahead of an all-gather can stay symbolic
   in the compiled graph, which torch_tpu fails to lower ("SymIntArrayRef
   expected to contain only concrete integers" at the all-gather's
-  allocation). On the stack this structure comes from (bec1a1c91), the
+  allocation). On the earlier tree this structure comes from, the
   model-entry chunk hit this at every SP bucket and this structure compiles.
 - The pad before the reduce-scatter is eliminated: every sequence-parallel
   compile size divides by TP (the platform keeps only those,

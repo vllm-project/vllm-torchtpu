@@ -137,8 +137,8 @@ QWEN3_NEXT = SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
 
 @pytest.fixture(autouse=True)
 def _tpu7x(monkeypatch):
-    """The IX record jobs ran on TPU7x; a test that needs another device
-    overrides it."""
+    """The validation entries' record runs were on TPU7x; a test that needs
+    another device overrides it."""
     monkeypatch.setattr(qwen3_5_hooks, "_chip_family", lambda: "7x")
 
 
