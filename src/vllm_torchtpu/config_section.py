@@ -13,9 +13,9 @@
 # limitations under the License.
 """Strict parsing of one ``additional_config`` section into a frozen dataclass.
 
-Shared by the option modules of the host-only sections (``tpu_frontend``).
-Every field's annotation must be a class, not a string, so the option
-modules do not use ``from __future__ import annotations``.
+Shared by the option modules of the TPU sections. Every field's annotation
+must be a class, not a string, so the option modules do not use
+``from __future__ import annotations``.
 """
 
 import dataclasses
