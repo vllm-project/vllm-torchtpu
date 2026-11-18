@@ -154,6 +154,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    AllSequenceLayoutPlanner,
     SequenceLayoutKind,
     SequenceLayoutPlanner,
     create_sequence_layout_planner,
@@ -6087,8 +6088,10 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
 
-        # No placed layers or target depth left over from an earlier load.
+        # No placed or tapped layers, or target depth, left over from an
+        # earlier load.
         expert_placement.reset_model_state()
+        expert_count_tap.reset_model_state()
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
@@ -6218,6 +6221,13 @@ class TPUModelRunner(GPUModelRunner):
                 max_padded_tokens, self.device
             )
             token_padding.set_padding_state(self._token_padding_state)
+        # The count tap tells real tokens from padding rows by this mask.
+        expert_count_tap.require_padding_mask(
+            tracked=self._token_padding_state is not None,
+            all_layout=isinstance(
+                self.sequence_layout_planner, AllSequenceLayoutPlanner
+            ),
+        )
 
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:

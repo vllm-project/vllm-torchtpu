@@ -207,8 +207,8 @@ class TestTpuCompilerCache:
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
         def tap(directory, every):
-            env = {"MOE_EXPERT_COUNT_TAP_DIR": directory}
-            env["MOE_EXPERT_COUNT_TAP_EVERY"] = every
+            env = {"TPU_MOE_EXPERT_COUNT_TAP_DIR": directory}
+            env["TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS"] = every
             with patch.dict(os.environ, env):
                 return compute_tpu_compilation_hash(self._config())
 

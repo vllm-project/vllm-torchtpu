@@ -114,8 +114,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
-    MOE_EXPERT_COUNT_TAP_DIR: str = ""
-    MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
+    TPU_MOE_EXPERT_COUNT_TAP_DIR: str = ""
+    TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS: int = 1000
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -897,10 +897,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
     # Directory the per-layer routed-expert counts are written to
-    # (layers/adapter/expert_count_tap.py), every MOE_EXPERT_COUNT_TAP_EVERY
-    # steps. Empty disables the tap and leaves the program unchanged.
-    "MOE_EXPERT_COUNT_TAP_DIR": env_str("MOE_EXPERT_COUNT_TAP_DIR", ""),
-    "MOE_EXPERT_COUNT_TAP_EVERY": env_int("MOE_EXPERT_COUNT_TAP_EVERY", 1000),
+    # (layers/adapter/expert_count_tap.py). A diagnostic: every MoE forward
+    # recounts its routing. Needs TPU_MOE_SKIP_PADDED_TOKENS=1, so padding rows
+    # are told apart. Empty disables the tap and leaves the program unchanged.
+    "TPU_MOE_EXPERT_COUNT_TAP_DIR": env_str("TPU_MOE_EXPERT_COUNT_TAP_DIR", ""),
+    # Runner steps between the tap's snapshots; <= 0 is refused at load.
+    "TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS": env_int(
+        "TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS", 1000
+    ),
     # A static expert placement for expert parallelism: a JSON table naming,
     # per MoE layer, which global experts each EP rank holds and in what slot
     # order -- a permutation, experts / ranks to a rank

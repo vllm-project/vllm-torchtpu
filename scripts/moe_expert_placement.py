@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build a TPU_EXPERT_PLACEMENT table from MOE_EXPERT_COUNT_TAP_DIR snapshots.
+"""Build a TPU_EXPERT_PLACEMENT table from TPU_MOE_EXPERT_COUNT_TAP_DIR snapshots.
 
     moe_expert_placement.py --shards 16 --layers 3:60 \\
         --out placement.json TAP_DIR [TAP_DIR ...]
@@ -40,9 +40,7 @@ so each layer is placed to even out the expected rows per rank (and
 
 Layers are numbered as TPU_EXPERT_PLACEMENT numbers them: the tap records each
 layer's table number, so a drafter's MoE layer i of an n-layer target is n + i
-whatever its module is named. Snapshots written before the tap recorded the
-numbers are read by name, `layers.<n>.`, and their `mtp.*` drafter layers are
-skipped.
+whatever its module is named.
 """
 
 import argparse
@@ -53,19 +51,6 @@ import os
 import re
 
 import numpy as np
-
-_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
-_DRAFTER_RE = re.compile(r"(?:^|\.)mtp\.")
-
-
-def _index_from_name(name):
-    """A layer's table number from its name, for snapshots without
-    `layer_indices`. A `mtp.*` drafter layer is n + i of an n-layer target,
-    which its name alone does not give, so it has none."""
-    if _DRAFTER_RE.search(name):
-        return None
-    m = _LAYER_RE.search(name)
-    return int(m.group(1)) if m else None
 
 
 def load_counts(dirs, skip):
@@ -80,7 +65,7 @@ def load_counts(dirs, skip):
                 by_rank[(d, int(m.group(1)))].append((int(m.group(2)), path))
     if not by_rank:
         raise SystemExit(f"no counts_ep*_*.npz under {dirs}")
-    mean, var, names, indices = None, None, None, None
+    mean, var, names, indices, first = None, None, None, None, None
     for key, snaps in sorted(by_rank.items()):
         snaps.sort()
         # The latest run: everything from the last restart of `step` on.
@@ -90,6 +75,11 @@ def load_counts(dirs, skip):
         if len(snaps) <= skip:
             raise SystemExit(f"{key}: {len(snaps)} snapshots, need more than {skip}")
         last = np.load(snaps[-1][1])
+        if "layer_indices" not in last.files:
+            raise SystemExit(
+                f"{snaps[-1][1]} has no layer_indices: it predates the tap that "
+                "numbers layers as the table does; tap the server again"
+            )
         c = last["counts"].astype(np.int64)
         if skip:
             c = c - np.load(snaps[skip - 1][1])["counts"].astype(np.int64)
@@ -98,13 +88,14 @@ def load_counts(dirs, skip):
         v = np.maximum(c[:, 1] / steps - mu * mu, 0)
         layer_names = [str(n) for n in last["layer_names"]]
         if names is None:
-            names, mean, var = layer_names, mu, v
-            if "layer_indices" in last.files:
-                indices = [int(i) if i >= 0 else None for i in last["layer_indices"]]
-            else:
-                indices = [_index_from_name(n) for n in names]
+            names, mean, var, first = layer_names, mu, v, key
+            indices = [int(i) if i >= 0 else None for i in last["layer_indices"]]
+        elif layer_names != names:
+            raise SystemExit(
+                f"EP rank {key[1]} in {key[0]} tapped other MoE layers than EP "
+                f"rank {first[1]} in {first[0]}"
+            )
         else:
-            assert names == layer_names, key
             mean, var = mean + mu, var + v
     return {n: (indices[i], mean[i], var[i]) for i, n in enumerate(names)}
 
@@ -233,8 +224,11 @@ def main():
         a.rung,
         a.tile_rows,
     )
+    try:
+        lo, hi = (int(x) for x in a.layers.split(":"))
+    except ValueError:
+        ap.error(f"--layers takes first:last, got {a.layers!r}")
     counts = load_counts(a.dirs, a.skip)
-    lo, hi = (int(x) for x in a.layers.split(":"))
     layers, names = {}, {}
     for name, (index, mu, var) in counts.items():
         if index is None or not lo <= index <= hi:
@@ -245,6 +239,11 @@ def main():
         layers[index] = (mu, var)
     if not layers:
         raise SystemExit(f"no tapped MoE layer in --layers {a.layers}")
+    experts = next(iter(layers.values()))[0].size
+    if experts % a.shards:
+        raise SystemExit(
+            f"{experts} experts do not split evenly over {a.shards} shards"
+        )
     built = {n: place(mu, var, a.shards, model) for n, (mu, var) in layers.items()}
     table, before, after = {}, [], []
     for n, (mu, var) in sorted(layers.items()):
@@ -263,7 +262,6 @@ def main():
             table[str(n)] = built[n][0]
         else:
             after[-1] = before[-1]
-    experts = next(iter(layers.values()))[0].size
     out = {"experts": experts, "shards": a.shards, "layers": table}
     with open(a.out, "w") as f:
         json.dump(out, f)

@@ -51,6 +51,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
+from vllm_torchtpu.layers.adapter import expert_count_tap
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
@@ -695,6 +696,9 @@ class TPUWorker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
+        # A runner step too, as in execute_model: every rank snapshots its
+        # expert counts on the same steps.
+        expert_count_tap.maybe_dump()
         runner = self.model_runner
         bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
         if bucket is None:

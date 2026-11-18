@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import vllm.config
 
 from vllm_torchtpu.layers.adapter import (
     expert_count_tap,
@@ -52,11 +53,12 @@ class _Layer(torch.nn.Module):
 
 @pytest.fixture
 def tap_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("MOE_EXPERT_COUNT_TAP_DIR", str(tmp_path))
-    monkeypatch.setenv("MOE_EXPERT_COUNT_TAP_EVERY", "2")
+    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_DIR", str(tmp_path))
+    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS", "2")
     monkeypatch.setattr(expert_count_tap, "_TAPPED", [])
     monkeypatch.setattr(expert_count_tap, "_STATE", expert_count_tap._fresh_state())
     monkeypatch.setattr(expert_count_tap, "_tp_rank", lambda: 0)
+    monkeypatch.setattr(expert_count_tap, "_pp_size", lambda: 1)
     # (rank, size) in DP and in PCP: one rank of each.
     monkeypatch.setattr(expert_count_tap, "_dp_pcp", lambda: ((0, 1), (0, 1)))
     return tmp_path
@@ -170,15 +172,15 @@ def test_a_tp_replica_does_not_count_its_copy_of_the_rows(tap_env, monkeypatch):
 
 
 def test_a_zero_cadence_fails_at_load(tap_env, monkeypatch):
-    monkeypatch.setenv("MOE_EXPERT_COUNT_TAP_EVERY", "0")
-    with pytest.raises(ValueError, match="MOE_EXPERT_COUNT_TAP_EVERY"):
+    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS", "0")
+    with pytest.raises(ValueError, match="TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS"):
         expert_count_tap.register(_Layer())
 
 
 def test_the_directory_expands_environment_variables(tap_env, monkeypatch):
     monkeypatch.setenv("QH_TAP_ROOT", str(tap_env))
     _tapped(_Layer(ep_rank=0))
-    monkeypatch.setenv("MOE_EXPERT_COUNT_TAP_DIR", "$QH_TAP_ROOT/sub")
+    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_DIR", "$QH_TAP_ROOT/sub")
     for _ in range(2):
         expert_count_tap.maybe_dump()
     assert (tap_env / "sub" / "counts_ep0_0000.npz").exists()
@@ -273,8 +275,6 @@ def test_the_tap_leaves_the_routed_experts_capture_hook_to_the_kernel(tap_env):
 def test_snapshots_number_layers_as_the_placement_table_does(tap_env, monkeypatch):
     """A Qwen3.5 / Qwen3-Next drafter's `mtp.layers.<i>` MoE layer is table
     layer n + i (`expert_placement.layer_index`), not target layer i."""
-    import vllm.config
-
     text_config = SimpleNamespace(num_hidden_layers=6)
     config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -301,3 +301,63 @@ def test_snapshots_number_layers_as_the_placement_table_does(tap_env, monkeypatc
         "model.shared_moe.experts",
     ]
     assert snap["layer_indices"].tolist() == [5, 6, -1]
+
+
+@pytest.mark.parametrize(
+    ("tracked", "all_layout", "refusal"),
+    [
+        (True, True, None),
+        (False, True, "TPU_MOE_SKIP_PADDED_TOKENS=1"),
+        (True, False, "ALL sequence layout"),
+    ],
+)
+def test_the_tap_needs_a_padding_mask_that_marks_every_padding_row(
+    tap_env, tracked, all_layout, refusal
+):
+    if refusal is None:
+        expert_count_tap.require_padding_mask(tracked, all_layout)
+    else:
+        with pytest.raises(ValueError, match=refusal):
+            expert_count_tap.require_padding_mask(tracked, all_layout)
+
+
+def test_without_the_tap_no_padding_mask_is_needed(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_DIR", "")
+    expert_count_tap.require_padding_mask(tracked=False, all_layout=False)
+
+
+def test_pipeline_parallelism_is_refused_at_load(tap_env, monkeypatch):
+    """Stages share EP ranks, so they would write the same snapshot files."""
+    monkeypatch.setattr(expert_count_tap, "_pp_size", lambda: 2)
+    with pytest.raises(NotImplementedError, match="pipeline"):
+        expert_count_tap.register(_Layer())
+
+
+def test_a_directory_naming_an_unset_variable_fails_at_load(tap_env, monkeypatch):
+    monkeypatch.delenv("QH_UNSET_TAP_ROOT", raising=False)
+    monkeypatch.setenv("TPU_MOE_EXPERT_COUNT_TAP_DIR", "$QH_UNSET_TAP_ROOT/sub")
+    with pytest.raises(ValueError, match="unset variable"):
+        expert_count_tap.register(_Layer())
+
+
+def test_a_second_model_load_starts_from_no_tap_state(tap_env):
+    first = _Layer()
+    _tapped(first)
+    expert_count_tap.record(first, _selecting(1), None)
+    for _ in range(2):
+        expert_count_tap.maybe_dump()
+    expert_count_tap.reset_model_state()
+    assert expert_count_tap._TAPPED == []
+    assert expert_count_tap._fresh_state() == expert_count_tap._STATE
+    # The next model's layers have another expert count; without the reset
+    # the dump would stack them with the first model's buffers.
+    second = _Layer()
+    second.layer_name = "model.layers.2.mlp.experts"
+    second.global_num_experts = 4
+    _tapped(second)
+    for _ in range(2):
+        expert_count_tap.maybe_dump()
+    snap = np.load(tap_env / "counts_ep3_0001.npz")
+    assert snap["counts"].shape == (1, 3, 4)
+    assert snap["layer_names"].tolist() == ["model.layers.2.mlp.experts"]
+    assert snap["layer_indices"].tolist() == [2]

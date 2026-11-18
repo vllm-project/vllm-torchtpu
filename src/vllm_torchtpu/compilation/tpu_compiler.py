@@ -250,8 +250,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # The expert count tap's snapshot cadence and directory are host-side;
     # whether the tap is on at all does change the forward, and is hashed
     # separately as "expert_count_tap".
-    "MOE_EXPERT_COUNT_TAP_DIR",
-    "MOE_EXPERT_COUNT_TAP_EVERY",
+    "TPU_MOE_EXPERT_COUNT_TAP_DIR",
+    "TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS",
     # A static expert placement permutes expert weights and router tables at
     # load (layers/adapter/expert_placement.py); every program is the unplaced
     # model's, so a placed server reuses its compile cache.
@@ -429,7 +429,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         # The tap adds its selection and counters to every MoE layer's forward.
-        "expert_count_tap": bool(envs.MOE_EXPERT_COUNT_TAP_DIR),
+        "expert_count_tap": bool(envs.TPU_MOE_EXPERT_COUNT_TAP_DIR),
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config

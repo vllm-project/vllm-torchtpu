@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MOE_EXPERT_COUNT_TAP_DIR: per-layer routed-expert counts from a live server.
+"""TPU_MOE_EXPERT_COUNT_TAP_DIR: per-layer routed-expert counts from a live server.
 
 An expert placement is only as good as the routing statistics it is built
 from, and a fused kernel selects inside its own program, so its choices never
@@ -29,11 +29,12 @@ selected the expert. Rows 0-1 give the mean and the step-to-step variance of
 each expert's load from this rank.
 
 The device buffers are f32 and only ever hold the steps since the last
-snapshot: every MOE_EXPERT_COUNT_TAP_EVERY steps the runner copies them to the
-host, adds them to this process's running totals and zeroes them, so no sum
-outgrows its type however long the server runs (an int32 sum of squares of a
-hot expert's count wraps within the hour at 1024-token steps). The snapshot is
-the running total, never overwritten:
+snapshot: every TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS runner steps (an idle DP
+rank's dummy step included, so every rank snapshots on the same steps) the
+runner copies them to the host, adds them to this process's running totals and
+zeroes them, so no sum outgrows its type however long the server runs (an
+int32 sum of squares of a hot expert's count wraps within the hour at
+1024-token steps). The snapshot is the running total, never overwritten:
 
     <dir>/counts_ep<rank>_<seq>.npz   counts [layers, 3, experts] i64,
                                       layer_names, layer_indices, step, wall
@@ -49,6 +50,12 @@ the loader numbers it (`expert_placement.layer_index`: a drafter's MoE layer i
 of an n-layer target is n + i, whatever its module is named), or -1.
 A restarted process numbers its snapshots after the ones already in <dir>;
 its `step` starts over, which is how a reader tells the runs apart.
+
+Padding rows are told apart by the runner's token padding mask, which it keeps
+with TPU_MOE_SKIP_PADDED_TOKENS=1 (or an mxfp4 MoE) and which is exact only in
+the ALL sequence layout; the tap is refused at load otherwise
+(`require_padding_mask`). It is also refused with pipeline parallelism, whose
+stages share EP ranks and so snapshot names.
 
 Snapshots are cumulative so a reader can difference any two of them to drop
 warmup and compile traffic. The tap only reads the routing inputs: the model's
@@ -92,16 +99,16 @@ _STATE = _fresh_state()
 
 
 def enabled() -> bool:
-    return bool(envs.MOE_EXPERT_COUNT_TAP_DIR)
+    return bool(envs.TPU_MOE_EXPERT_COUNT_TAP_DIR)
 
 
 def _directory() -> str:
     # Pod specs pass env values verbatim, e.g. "$CDK_OUTPUT_DIR/moe_counts".
-    directory = os.path.expandvars(envs.MOE_EXPERT_COUNT_TAP_DIR)
+    directory = os.path.expandvars(envs.TPU_MOE_EXPERT_COUNT_TAP_DIR)
     if "$" in directory:
         raise ValueError(
-            f"MOE_EXPERT_COUNT_TAP_DIR={envs.MOE_EXPERT_COUNT_TAP_DIR!r} references "
-            "an unset variable"
+            "TPU_MOE_EXPERT_COUNT_TAP_DIR="
+            f"{envs.TPU_MOE_EXPERT_COUNT_TAP_DIR!r} references an unset variable"
         )
     return directory
 
@@ -110,6 +117,44 @@ def _tp_rank() -> int:
     from vllm.distributed import get_tensor_model_parallel_rank
 
     return get_tensor_model_parallel_rank()
+
+
+def _pp_size() -> int:
+    from vllm.distributed import get_pp_group
+
+    return get_pp_group().world_size
+
+
+def reset_model_state() -> None:
+    """Forget the tapped layers and the running totals, so a second model load
+    in the process starts from nothing (its snapshots number after the ones
+    already written, and their `step` starts over)."""
+    _TAPPED.clear()
+    _STATE.clear()
+    _STATE.update(_fresh_state())
+
+
+def require_padding_mask(tracked: bool, all_layout: bool) -> None:
+    """Refuse the tap unless the runner's token padding mask marks every step's
+    padding rows: the tap counts only real tokens, and tells them by that mask.
+
+    `tracked`: the runner keeps a padding mask. `all_layout`: its sequence
+    layout is ALL, the only one the mask is exact for.
+    """
+    if not enabled():
+        return
+    if not tracked:
+        raise ValueError(
+            "TPU_MOE_EXPERT_COUNT_TAP_DIR counts only real tokens, telling "
+            "padding rows apart by the runner's token padding mask: set "
+            "TPU_MOE_SKIP_PADDED_TOKENS=1 so the runner keeps one"
+        )
+    if not all_layout:
+        raise ValueError(
+            "TPU_MOE_EXPERT_COUNT_TAP_DIR needs the ALL sequence layout: under "
+            "PCP streaming or the PCP manager the token padding mask marks "
+            "every row valid, so padding would be counted"
+        )
 
 
 def _repeats_another_rank(layer) -> bool:
@@ -131,10 +176,16 @@ def register(layer) -> None:
     if not enabled():
         return
     _directory()  # an unresolvable directory fails at load, not hours later
-    if envs.MOE_EXPERT_COUNT_TAP_EVERY <= 0:
+    if envs.TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS <= 0:
         raise ValueError(
-            "MOE_EXPERT_COUNT_TAP_EVERY must be a positive step count; got "
-            f"{envs.MOE_EXPERT_COUNT_TAP_EVERY}"
+            "TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS must be a positive step "
+            f"count; got {envs.TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS}"
+        )
+    if _pp_size() > 1:
+        # Snapshots are named by EP rank, which every pipeline stage repeats.
+        raise NotImplementedError(
+            "TPU_MOE_EXPERT_COUNT_TAP_DIR does not support pipeline "
+            "parallelism: its stages would write the same snapshot files"
         )
     if _repeats_another_rank(layer):
         return
@@ -257,7 +308,8 @@ def record(
     hit = topk_ids.to(torch.int32).unsqueeze(-1) == torch.arange(
         experts, dtype=torch.int32, device=device
     )
-    # Counts of at most a step's tokens: exact in f32.
+    # A step's count is at most its token count, exact in f32; its square is
+    # exact up to 4096 and otherwise within f32 rounding.
     per_step = (hit & valid[:, None, None]).sum(dim=(0, 1), dtype=torch.float32)
     meta = torch.cat(
         [
@@ -293,7 +345,7 @@ def maybe_dump() -> None:
     if not _TAPPED:
         return
     _STATE["steps"] += 1
-    if _STATE["steps"] % envs.MOE_EXPERT_COUNT_TAP_EVERY:
+    if _STATE["steps"] % envs.TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS:
         return
     import numpy as np
 
