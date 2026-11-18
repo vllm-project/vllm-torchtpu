@@ -293,7 +293,7 @@ def test_the_binary_error_mentions_vllm_tpu_rvllm_binary(run, capsys):
 def test_vllm_tpu_use_rust_env_triggers_launcher(
     monkeypatch, env_val, argv, should_intercept
 ):
-    from sitecustomize import maybe_run_rust
+    from sitecustomize import maybe_run_experimental_rust
 
     recorded = []
 
@@ -308,7 +308,7 @@ def test_vllm_tpu_use_rust_env_triggers_launcher(
         monkeypatch.setenv("VLLM_TPU_EXPERIMENTAL_USE_RUST", env_val)
 
     monkeypatch.setattr(sys, "argv", argv)
-    assert maybe_run_rust() is should_intercept
+    assert maybe_run_experimental_rust() is should_intercept
     if should_intercept:
         assert recorded == [argv[1:]]
     else:
@@ -316,12 +316,12 @@ def test_vllm_tpu_use_rust_env_triggers_launcher(
 
 
 def test_vllm_tpu_use_rust_invalid_bool_raises(monkeypatch):
-    from sitecustomize import maybe_run_rust
+    from sitecustomize import maybe_run_experimental_rust
 
     monkeypatch.setenv("VLLM_TPU_EXPERIMENTAL_USE_RUST", "ture")
     monkeypatch.setattr(sys, "argv", ["vllm", "serve", "m"])
     with pytest.raises(ValueError, match="Invalid boolean value 'ture'"):
-        maybe_run_rust()
+        maybe_run_experimental_rust()
 
 
 def _publish(tmp_path, binary, sha=None):
