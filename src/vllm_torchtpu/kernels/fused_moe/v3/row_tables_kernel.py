@@ -30,6 +30,10 @@ from .layout import LANES
 # conversion back to int32 floors the exact quotient (no integer divide
 # on the sparse core).
 FLOOR_NUDGE = 0.5
+# The float decode of a pair number x < MAX_PAIRS floors exactly: the f32
+# product carries a relative error below 2**-23, which stays under the
+# 0.5 / divisor margin FLOOR_NUDGE leaves while x < 2**22.
+MAX_PAIRS = 1 << 22
 
 
 def _scatter_body(
@@ -66,8 +70,8 @@ def _scatter_body(
     n_chunks = run // chunk
     lanes = pltpu.get_tpu_info().sparse_core.num_lanes
     lane = lax.broadcasted_iota(jnp.int32, (lanes,), 0)
-    # Integer division as (x + FLOOR_NUDGE) * (1 / d) truncated: exact while x stays
-    # far below 2**23. A padding pair (past tokens * top_k in its shard)
+    # Integer division as (x + FLOOR_NUDGE) * (1 / d) truncated: exact while x
+    # stays below MAX_PAIRS. A padding pair (past tokens * top_k in its shard)
     # decodes to a slot past top_k; its routed row is the drop row, so
     # nothing it decodes to is written.
     inv_pairs = jnp.float32(1.0 / pairs_per_shard)
@@ -128,11 +132,10 @@ def _scatter_body(
 
     def prepare(c, slot):
         """A pair's number is its shard's word in the gathered routing
-        messages: shard *
-        pairs + top-k slot * tokens + token, so the token is the shard's
-        first plus the word's place in its top-k slot. Its scale word is
-        its shard's routing message at scale_offset words plus that place.
-        Its routed
+        messages: shard * pairs + top-k slot * tokens + token, so the token
+        is the shard's first plus the word's place in its top-k slot. Its
+        scale word for plane p is its shard's routing message at
+        scale_offset + p * plane_words words plus that place. Its routed
         row is clamped so every foreign row is the single value the scatter
         drops."""
         for vector in range(chunk // lanes):
@@ -225,8 +228,9 @@ def scatter_row_tables(
         gathered routing messages.
       routing_messages: [num_shards * message_words] int32, every shard's
         routing message, flat.
-        Token t's scale is the f32 bits of word (t // tokens_per_shard) *
-        message_words + scale_offset + t % tokens_per_shard.
+        Token t's scale in plane p is the f32 bits of word
+        (t // tokens_per_shard) * message_words + scale_offset +
+        p * plane_words + t % tokens_per_shard.
       token_table: [routed_rows] int32, zeroed.
       scale_table: [n_scales * scale words] int32, zeroed; plane p of a
         row's scales at word p * scale words + row, scale words >=
@@ -277,7 +281,12 @@ def scatter_row_tables(
     if n_pairs % pairs_per_shard:
         raise ValueError(
             f"{n_pairs} routed pairs is not a whole number of "
-            f"shards of {tokens_per_shard} tokens x {top_k}"
+            f"shards of {pairs_per_shard} pair words"
+        )
+    if n_pairs > MAX_PAIRS:
+        raise ValueError(
+            f"{n_pairs} routed pairs: the sparse cores decode a pair's shard, "
+            f"slot and token with float multiplies, exact up to {MAX_PAIRS} pairs"
         )
     if routing_messages.shape[0] != n_pairs // pairs_per_shard * message_words:
         raise ValueError(
@@ -338,11 +347,12 @@ def scatter_row_tables(
             f"vectors and of {gather.SLICE_ALIGN_WORDS}-word slices"
         )
     run = gather.rows_per_subcore(n_pairs, n_subcores, chunk)
-    if run != chunk and chunk % LANES:
+    if (run != chunk or n_scales > 1) and chunk % LANES:
         raise ValueError(
             f"chunk {chunk}: a ring part starts at a multiple of "
             f"{LANES} words, so a chunk is a multiple of {LANES} "
-            f"unless it is a subcore's whole run of {run}"
+            f"unless it is a subcore's whole run of {run} with one scale "
+            f"plane ({n_scales} here: plane 1 starts {chunk} words in)"
         )
     program = gather.sparse_core_program(
         functools.partial(
