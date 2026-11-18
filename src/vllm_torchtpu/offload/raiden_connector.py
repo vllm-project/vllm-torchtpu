@@ -339,10 +339,13 @@ def _region_tensor(kv_caches, storage) -> torch.Tensor:
     )
 
 
-def _build_fp4_transcoder(kv_cache_config, kv_caches, pool_storages, group_regions, num_blocks):
-    """VLLM_TPU_OFFLOAD_FP4: this worker's main-KV regions (the groups the plan calls
-    ``main``) as the model's typed region tensors, with one staging buffer each;
-    registered for raiden_store._tier_worker."""
+def _build_fp4_transcoder(
+    kv_cache_config, kv_caches, pool_storages, group_regions, num_blocks, kind="main"
+):
+    """VLLM_TPU_OFFLOAD_FP4: this worker's regions of the groups the plan calls
+    ``kind`` (``main``; ``gdn`` with VLLM_TPU_OFFLOAD_FP4_GDN) as the model's typed
+    region tensors, with one staging buffer each; registered for
+    raiden_store._tier_worker."""
     from vllm_torchtpu.models.vllm.qwen4_exp.offload import tier_group_kind
     from vllm_torchtpu.offload import fp4
 
@@ -351,8 +354,24 @@ def _build_fp4_transcoder(kv_cache_config, kv_caches, pool_storages, group_regio
         names = list(group.layer_names)
         if not names:
             continue  # a group with no layers on this pipeline stage
-        if tier_group_kind(group.kv_cache_spec, names) == "main":
+        if tier_group_kind(group.kv_cache_spec, names) == kind:
             regions.update(group_regions[gid])
+            if kind == "gdn":
+                # The GDN transform reads every row as FP32 words (fp4.quantize_gdn_pages).
+                from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+                    POOLED_GDN_CONV_STATE_DTYPE,
+                )
+
+                dtypes = tuple(getattr(group.kv_cache_spec, "dtypes", ()))
+                if (
+                    POOLED_GDN_CONV_STATE_DTYPE != torch.float32
+                    or len(dtypes) < 2
+                    or dtypes[1] != torch.float32
+                ):
+                    raise ValueError(
+                        "VLLM_TPU_OFFLOAD_FP4_GDN needs FP32 GDN state (conv "
+                        f"{POOLED_GDN_CONV_STATE_DTYPE}, spec dtypes {dtypes})"
+                    )
     pools: dict[int, torch.Tensor] = {}
     page = None
     for r in sorted(regions):
@@ -362,15 +381,19 @@ def _build_fp4_transcoder(kv_cache_config, kv_caches, pool_storages, group_regio
         pools[r] = _region_tensor(kv_caches, storage)
     if page is None:
         page = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-    t = fp4.Fp4Transcoder(pools, page, tpu_envs.VLLM_TPU_OFFLOAD_FP4_SLOTS)
-    fp4.set_transcoder(t)
+    first, slots = fp4.configured_slot_layout()[kind]
+    t = fp4.Fp4Transcoder(pools, page, slots, kind=kind, offset=first)
+    fp4.set_transcoder(t, kind)
     logger.info(
-        "offload fp4: main-KV regions %s, %d staging slots each (%.2f GB), FP4 page %d B "
-        "of a %d B page, pools %s",
+        "offload fp4 %s: regions %s, %d staging slots each (ids %d..%d, %.2f GB), FP4 "
+        "page %d B of a %d B page, pools %s",
+        kind,
         sorted(regions),
         t.slots,
+        first,
+        first + t.slots - 1,
         t.staging_bytes / 1e9,
-        fp4.fp4_page_bytes(page),
+        t.row_bytes,
         page,
         {r: f"{tuple(p.shape)} {p.dtype}" for r, p in pools.items()},
     )
@@ -588,23 +611,34 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             keys = manager.prepare_victim_store([k for k, _ in keep])
             tel["victim_resident"] = tel.get("victim_resident", 0) + len(keep) - len(keys)
             if keys and self.__dict__.get("_fp4", False):
-                # The main class goes through staging: quantized by the workers at
+                # The FP4 classes go through staging: quantized by the workers at
                 # this step's start_load_kv (before the new owners' forward), saved
-                # from the slots once acknowledged; no drain for it.
-                fc = manager.fp4_class
-                main = [k for k in keys if manager.class_of(k) == fc]
-                keys = [k for k in keys if manager.class_of(k) != fc]
-                if main:
+                # from the slots once acknowledged; no drain for them. One job a
+                # kind (main; gdn with VLLM_TPU_OFFLOAD_FP4_GDN), each with its own
+                # slot pool.
+                by_kind: dict[str, list[OffloadKey]] = {}
+                rest = []
+                for k in keys:
+                    kind = manager.fp4_kind_of(k)
+                    if kind is None:
+                        rest.append(k)
+                    else:
+                        by_kind.setdefault(kind, []).append(k)
+                keys = rest
+                for kind, ks4 in by_kind.items():
+                    sfx = "" if kind == "main" else f"_{kind}"
                     job4 = self._generate_job_id()
-                    blocks4 = [source[k] for k in main]
-                    slots = manager.fp4_bind_store(job4, main)
+                    blocks4 = [source[k] for k in ks4]
+                    slots = manager.fp4_bind_store(job4, ks4)
                     if slots is None:
-                        manager.on_store_job_cancelled(main)
-                        tel["fp4_victim_no_slot"] = tel.get("fp4_victim_no_slot", 0) + len(main)
+                        manager.on_store_job_cancelled(ks4)
+                        name = "fp4_victim_no_slot" + sfx
+                        tel[name] = tel.get(name, 0) + len(ks4)
                     else:
                         self._fp4_step_quant.extend(zip(blocks4, slots))
-                        self._fp4_step_victims.append((job4, main, blocks4))
-                        tel["fp4_victim_keys"] = tel.get("fp4_victim_keys", 0) + len(main)
+                        self._fp4_step_victims.append((job4, ks4, blocks4))
+                        name = "fp4_victim_keys" + sfx
+                        tel[name] = tel.get(name, 0) + len(ks4)
             if keys:
                 job_id = self._generate_job_id()
                 t0 = time.perf_counter()
@@ -668,8 +702,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             line += " " + manager.telemetry_line()
             if manager.fp4_class is not None:
                 counts = " ".join(f"{k}={v}" for k, v in manager.fp4_counts.items())
+                free = " ".join(
+                    f"free_slots{'' if k == 'main' else '_' + k}={v}"
+                    for k, v in manager.fp4_free_by_kind().items()
+                )
                 line += (
-                    f" fp4[{counts} free_slots={manager.fp4_free_slots} "
+                    f" fp4[{counts} {free} "
                     f"pending_tokens={len(self.__dict__.get('_fp4_pending', {}))}]"
                 )
         unhashed = self.__dict__.get("_tier_check_unhashed", {})
@@ -1152,18 +1190,27 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             )
         ]
 
-        fp4_t = None
+        fp4_ts = []
         if tpu_envs.VLLM_TPU_OFFLOAD_FP4:
-            # Before the class workers register: the main class registers the
-            # transcoder's staging buffers (raiden_store._tier_worker).
+            # Before the class workers register: the FP4 classes register the
+            # transcoders' staging buffers (raiden_store._tier_worker).
             assert group_regions is not None, "VLLM_TPU_OFFLOAD_FP4 needs the tier classes"
-            fp4_t = _build_fp4_transcoder(
-                self.connector_worker.kv_cache_config, kv_caches, pool_storages, group_regions, num_blocks
-            )
+            kinds = ["main"] + (["gdn"] if tpu_envs.VLLM_TPU_OFFLOAD_FP4_GDN else [])
+            fp4_ts = [
+                _build_fp4_transcoder(
+                    self.connector_worker.kv_cache_config,
+                    kv_caches,
+                    pool_storages,
+                    group_regions,
+                    num_blocks,
+                    kind=kind,
+                )
+                for kind in kinds
+            ]
         self.connector_worker._init_worker(
             CanonicalKVCaches(tensors=pool_tensors, group_data_refs=group_data_refs)
         )
-        if fp4_t is not None:
+        for fp4_t in fp4_ts:
             fp4_t.warmup_and_selftest()
         if tpu_envs.VLLM_TPU_OFFLOAD_TIER_CHECK:
             assert group_regions is not None
@@ -1184,12 +1231,11 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         meta = self._get_connector_metadata()
         if not isinstance(meta, RaidenOffloadingConnectorMetadata) or meta.fp4_token < 0:
             return
-        from vllm_torchtpu.offload.fp4 import transcoder
+        from vllm_torchtpu.offload.fp4 import dequantize_all, quantize_all
 
-        t = transcoder()
-        if t is not None:
-            t.quantize(meta.fp4_quant)
-            t.dequantize(meta.fp4_dequant)
+        # Pairs carry global slot ids: each kind's transcoder takes its own.
+        quantize_all(meta.fp4_quant)
+        dequantize_all(meta.fp4_dequant)
         self.__dict__.setdefault("_fp4_pending", []).append(
             (meta.fp4_token, _record_fence_event())
         )

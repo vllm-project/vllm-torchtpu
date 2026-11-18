@@ -323,6 +323,8 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_CHECK: bool = False
     VLLM_TPU_OFFLOAD_FP4: bool = False
     VLLM_TPU_OFFLOAD_FP4_SLOTS: int = 256
+    VLLM_TPU_OFFLOAD_FP4_GDN: bool = False
+    VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS: int = 0
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
@@ -2214,6 +2216,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_OFFLOAD_FP4": env_bool("VLLM_TPU_OFFLOAD_FP4", default=False),
     # HBM staging slots per main-KV region for VLLM_TPU_OFFLOAD_FP4 (one FP4 page each).
     "VLLM_TPU_OFFLOAD_FP4_SLOTS": env_int("VLLM_TPU_OFFLOAD_FP4_SLOTS", 256),
+    # With VLLM_TPU_OFFLOAD_FP4: the GDN state classes (gdn-*) keep MXFP4 on the host
+    # too, quantized from the pages' FP32 state words (13% of the page). Lossy:
+    # the recurrent state resumes from the dequantized values. Host-only.
+    "VLLM_TPU_OFFLOAD_FP4_GDN": env_bool("VLLM_TPU_OFFLOAD_FP4_GDN", default=False),
+    # HBM staging slots per GDN region for VLLM_TPU_OFFLOAD_FP4_GDN (0: as
+    # VLLM_TPU_OFFLOAD_FP4_SLOTS).
+    "VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS": env_int("VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS", 0),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(

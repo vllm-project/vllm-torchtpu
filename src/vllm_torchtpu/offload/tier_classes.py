@@ -182,6 +182,7 @@ def build_tier_plan(
     ratio: float,
     key_row_bytes: int | None = None,
     main_row_bytes: int | None = None,
+    gdn_row_bytes: int | None = None,
 ) -> TierPlan:
     """Splits the offloaded groups into classes and sizes them.
 
@@ -192,7 +193,8 @@ def build_tier_plan(
     many bytes a region instead of the page.
     ``main_row_bytes``, when set (VLLM_TPU_OFFLOAD_FP4), is the host bytes of one main-KV
     page in MXFP4: the ``main`` class keeps that many bytes a region (registered as rows
-    of the workers' staging buffers, not of the pool).
+    of the workers' staging buffers, not of the pool). ``gdn_row_bytes``
+    (VLLM_TPU_OFFLOAD_FP4_GDN) does the same for the ``gdn`` classes.
     """
     if not worker_configs:
         raise ValueError("host tier classes: no per-worker KV cache configs recorded")
@@ -253,6 +255,15 @@ def build_tier_plan(
                     f"{page} B page"
                 )
             row_bytes, rows_per_page = main_row_bytes, 1
+        if kind == "gdn" and gdn_row_bytes is not None:
+            # VLLM_TPU_OFFLOAD_FP4_GDN: MXFP4 of the state's FP32 words, registered
+            # as rows of the workers' GDN staging buffers.
+            if gdn_row_bytes <= 0 or gdn_row_bytes >= page:
+                raise ValueError(
+                    f"host tier classes: FP4 GDN rows of {gdn_row_bytes} B for a "
+                    f"{page} B page"
+                )
+            row_bytes, rows_per_page = gdn_row_bytes, 1
         classes.append(
             TierClass(
                 name=name,
@@ -328,26 +339,39 @@ class TieredOffloadingManager(OffloadingManager):
         plan: TierPlan,
         managers: Sequence[RaidenOffloadingManager],
         check: bool = False,
-        fp4_slots: int | None = None,
+        fp4_slots: int | dict[str, tuple[int, int]] | None = None,
     ):
         assert len(managers) == len(plan.classes)
-        # VLLM_TPU_OFFLOAD_FP4 (offload/fp4.py): the main class's device rows are
-        # the workers' staging slots, not pool blocks. A store or load job binds a
-        # slot to each of its main-class keys; store slots are freed when the child
-        # ends, load slots once every worker has dequantized them.
-        self._fp4_class: int | None = None
-        self._fp4: SlotPool | None = None
-        if fp4_slots:
-            mains = [c.index for c in plan.classes if c.kind == "main"]
-            assert len(mains) == 1, [c.name for c in plan.classes]
-            self._fp4_class = mains[0]
-            self._fp4 = SlotPool(fp4_slots)
+        # VLLM_TPU_OFFLOAD_FP4 (offload/fp4.py): an FP4 class's device rows are the
+        # workers' staging slots, not pool blocks. A store or load job binds a slot
+        # to each of its FP4-class keys; store slots are freed when the child ends,
+        # load slots once every worker has dequantized them. ``fp4_slots``: kind ->
+        # (first global slot id, slots) (fp4.slot_layout); an int is the main kind
+        # alone. Kind "main" is the main class, kind "gdn" every gdn class
+        # (VLLM_TPU_OFFLOAD_FP4_GDN), which share one pool.
+        if isinstance(fp4_slots, int):
+            fp4_slots = {"main": (0, fp4_slots)} if fp4_slots else None
+        self._fp4_kind: dict[int, str] = {}
+        self._fp4_pools: dict[str, SlotPool] = {}
+        self._fp4_first: dict[str, int] = {}
+        for kind, (first, count) in (fp4_slots or {}).items():
+            members = [c.index for c in plan.classes if c.kind == kind]
+            if kind == "main":
+                assert len(members) == 1, [c.name for c in plan.classes]
+            assert members, (kind, [c.name for c in plan.classes])
+            for c in members:
+                self._fp4_kind[c] = kind
+            self._fp4_pools[kind] = SlotPool(count)
+            self._fp4_first[kind] = first
         self._fp4_bound: dict[int, dict[OffloadKey, int]] = {}
         self._fp4_dequant: list[tuple[int, int]] = []
         self._fp4_release: list[int] = []
-        self.fp4_counts: dict[str, int] = dict.fromkeys(
-            ("store_keys", "load_keys", "store_no_slot", "load_no_slot", "dequant_keys"), 0
-        )
+        names = ("store_keys", "load_keys", "store_no_slot", "load_no_slot", "dequant_keys")
+        self.fp4_counts: dict[str, int] = {
+            n + ("" if kind == "main" else f"_{kind}"): 0
+            for kind in self._fp4_pools
+            for n in names
+        }
         self._plan = plan
         self._classes = plan.classes
         self._managers = list(managers)
@@ -376,39 +400,86 @@ class TieredOffloadingManager(OffloadingManager):
 
     @property
     def fp4_class(self) -> int | None:
-        return self._fp4_class
+        """The main class when it keeps FP4 (None: FP4 off)."""
+        return next((c for c, k in self._fp4_kind.items() if k == "main"), None)
+
+    @property
+    def fp4_kinds(self) -> dict[int, str]:
+        """FP4 class index -> its kind."""
+        return dict(self._fp4_kind)
+
+    def fp4_kind_of(self, key: OffloadKey) -> str | None:
+        return self._fp4_kind.get(self.class_of(key))
 
     @property
     def fp4_free_slots(self) -> int:
-        return 0 if self._fp4 is None else self._fp4.free
+        pool = self._fp4_pools.get("main")
+        return 0 if pool is None else pool.free
+
+    def fp4_free_by_kind(self) -> dict[str, int]:
+        return {kind: pool.free for kind, pool in self._fp4_pools.items()}
+
+    def _fp4_count(self, name: str, kind: str, n: int) -> None:
+        self.fp4_counts[name + ("" if kind == "main" else f"_{kind}")] += n
+
+    def _fp4_take(self, kind: str, n: int) -> list[int] | None:
+        local = self._fp4_pools[kind].take(n)
+        if local is None:
+            return None
+        first = self._fp4_first[kind]
+        return [first + s for s in local]
+
+    def _fp4_local(self, kind: str, slots: Sequence[int]) -> list[int]:
+        first = self._fp4_first[kind]
+        return [s - first for s in slots]
 
     def fp4_bind_store(self, job_id: int, keys: Sequence[OffloadKey]) -> list[int] | None:
-        """Slots for a main-class store job's keys (None: not enough free)."""
-        assert self._fp4 is not None
-        slots = self._fp4.take(len(keys))
+        """Global slots for a store job's keys, all of one FP4 kind (None: not enough
+        free)."""
+        kinds = {self.fp4_kind_of(k) for k in keys}
+        assert len(kinds) == 1 and None not in kinds, kinds
+        (kind,) = kinds
+        slots = self._fp4_take(kind, len(keys))
         if slots is None:
-            self.fp4_counts["store_no_slot"] += len(keys)
+            self._fp4_count("store_no_slot", kind, len(keys))
             return None
-        self._fp4_bound[job_id] = dict(zip(keys, slots))
-        self.fp4_counts["store_keys"] += len(keys)
+        self._fp4_bound.setdefault(job_id, {}).update(zip(keys, slots))
+        self._fp4_count("store_keys", kind, len(keys))
         return slots
 
     def fp4_unbind(self, job_id: int) -> None:
         """Frees a job's slots (a store that will never be submitted)."""
         bound = self._fp4_bound.pop(job_id, None)
-        if bound and self._fp4 is not None:
-            self._fp4.give(list(bound.values()))
+        if bound:
+            self.fp4_give(list(bound.values()))
+
+    def _fp4_unbind_keys(self, job_id: int, keys: Iterable[OffloadKey]) -> None:
+        """Frees the slots of ``keys`` alone (one child of a job that spans classes)."""
+        bound = self._fp4_bound.get(job_id)
+        if not bound:
+            return
+        slots = [bound.pop(k) for k in keys if k in bound]
+        if not bound:
+            del self._fp4_bound[job_id]
+        self.fp4_give(slots)
 
     def fp4_give(self, slots: Sequence[int]) -> None:
-        if slots and self._fp4 is not None:
-            self._fp4.give(slots)
+        """Returns global slot ids to their kinds' pools."""
+        for kind, pool in self._fp4_pools.items():
+            first = self._fp4_first[kind]
+            mine = [s - first for s in slots if first <= s < first + pool.total]
+            if mine:
+                pool.give(mine)
 
     def take_fp4_dequant(self) -> tuple[list[tuple[int, int]], list[int]]:
-        """``(slot, pool block)`` pairs of the loads that finished since the last call,
-        and their slots, to free once every worker has dequantized them."""
+        """``(global slot, pool block)`` pairs of the loads that finished since the last
+        call, and their slots, to free once every worker has dequantized them."""
         pairs, slots = self._fp4_dequant, self._fp4_release
         self._fp4_dequant, self._fp4_release = [], []
-        self.fp4_counts["dequant_keys"] += len(pairs)
+        for kind, pool in self._fp4_pools.items():
+            first = self._fp4_first[kind]
+            n = sum(1 for s, _ in pairs if first <= s < first + pool.total)
+            self._fp4_count("dequant_keys", kind, n)
         return pairs, slots
 
     # -- routing ------------------------------------------------------------
@@ -583,10 +654,12 @@ class TieredOffloadingManager(OffloadingManager):
             ),
         )
         for c, (ks, ids) in parts.items():
-            if c == self._fp4_class:
-                # The main class saves the staging slots its keys were quantized into.
+            kind = self._fp4_kind.get(c)
+            if kind is not None:
+                # An FP4 class saves the staging slots its keys were quantized into
+                # (its kind's local slot ids are its device rows).
                 bound = self._fp4_bound[job_id]
-                ids = [bound[k] for k in ks]
+                ids = self._fp4_local(kind, [bound[k] for k in ks])
             self._managers[c].submit_store_job(job_id, ks, ids)
 
     def submit_load_job(
@@ -628,12 +701,13 @@ class TieredOffloadingManager(OffloadingManager):
         # each owns the pins its prepare took and finalizes them itself.
         for c, (ks, ids) in parts.items():
             self._load_keys[c] += len(ks)
-            if c == self._fp4_class and self._fp4 is not None:
-                # The main class lands in staging slots; dequantized into ``ids``
-                # once the whole job has finished (take_fp4_dequant).
-                slots = self._fp4.take(len(ks))
+            kind = self._fp4_kind.get(c)
+            if kind is not None:
+                # An FP4 class lands in staging slots; dequantized into ``ids`` once
+                # the whole job has finished (take_fp4_dequant).
+                slots = self._fp4_take(kind, len(ks))
                 if slots is None:
-                    self.fp4_counts["load_no_slot"] += len(ks)
+                    self._fp4_count("load_no_slot", kind, len(ks))
                     self._managers[c].unwind_prepared_load(RaidenLoadStoreSpec(ks))
                     self._child_finished(
                         c,
@@ -646,9 +720,10 @@ class TieredOffloadingManager(OffloadingManager):
                         ),
                     )
                     continue
-                self._fp4_bound[job_id] = dict(zip(ks, slots))
-                self.fp4_counts["load_keys"] += len(ks)
-                ids = slots
+                # One load spans several FP4 classes (main, gdn-*): merge.
+                self._fp4_bound.setdefault(job_id, {}).update(zip(ks, slots))
+                self._fp4_count("load_keys", kind, len(ks))
+                ids = self._fp4_local(kind, slots)
             self._managers[c].submit_load_job(job_id, ks, ids, req_id, pinned=True)
 
     def on_store_job_cancelled(self, keys: list[OffloadKey]) -> None:
@@ -671,12 +746,15 @@ class TieredOffloadingManager(OffloadingManager):
         parent.waiting.discard(c)
         if not finished.success:
             parent.failed = True
-        if c == self._fp4_class and (
+        if c in self._fp4_kind and (
             parent.op == AdmissionOp.STORE or not finished.success
         ):
             # A store child has read its slots (or failed); a failed load child
-            # left nothing to dequantize.
-            self.fp4_unbind(finished.job_id)
+            # left nothing to dequantize. Only this child's slots: a sibling FP4
+            # class of the same job may still be landing in its own.
+            self._fp4_unbind_keys(
+                finished.job_id, [k for k in parent.keys if self.class_of(k) == c]
+            )
         if self._check is not None and finished.stored_keys:
             # Saved by this child, whatever its siblings do: a later load
             # can restore them.
@@ -694,8 +772,8 @@ class TieredOffloadingManager(OffloadingManager):
                 block_of = dict(zip(parent.keys, parent.device_block_ids))
                 self._fp4_dequant.extend((s, block_of[k]) for k, s in bound.items())
                 self._fp4_release.extend(bound.values())
-            elif self._fp4 is not None:
-                self._fp4.give(list(bound.values()))
+            else:
+                self.fp4_give(list(bound.values()))
         if (
             self._check is not None
             and parent.op == AdmissionOp.LOAD

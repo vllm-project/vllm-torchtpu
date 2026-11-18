@@ -127,6 +127,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _fp4_slot_layout() -> dict[str, tuple[int, int]]:
+    from vllm_torchtpu.offload.fp4 import configured_slot_layout
+
+    return configured_slot_layout()
+
+
 # Upper bound (seconds) on a scheduler-side drain of in-flight store/load
 # jobs whose source/destination blocks are about to be reused.
 _DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
@@ -2700,6 +2707,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 )
             if envs.VLLM_TPU_OFFLOAD_TIER_CHECK:
                 refused.append("VLLM_TPU_OFFLOAD_FP4 with VLLM_TPU_OFFLOAD_TIER_CHECK (lossy)")
+        elif envs.VLLM_TPU_OFFLOAD_FP4_GDN:
+            refused.append("VLLM_TPU_OFFLOAD_FP4_GDN without VLLM_TPU_OFFLOAD_FP4")
         if refused:
             raise ValueError(
                 "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_CLASSES serves "
@@ -2716,11 +2725,14 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         if envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS:
             key_row_bytes = self._compressed_key_live_bytes(vllm_config)
         main_row_bytes = None
+        gdn_row_bytes = None
         if envs.VLLM_TPU_OFFLOAD_FP4:
-            from vllm_torchtpu.offload.fp4 import fp4_page_bytes
+            from vllm_torchtpu.offload.fp4 import fp4_gdn_page_bytes, fp4_page_bytes
 
             page = worker_configs[0].kv_cache_groups[0].kv_cache_spec.page_size_bytes
             main_row_bytes = fp4_page_bytes(page)
+            if envs.VLLM_TPU_OFFLOAD_FP4_GDN:
+                gdn_row_bytes = fp4_gdn_page_bytes(page)
         plan = build_tier_plan(
             worker_configs,
             [group.group_id for group in config.groups],
@@ -2729,6 +2741,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             envs.VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO,
             key_row_bytes=key_row_bytes,
             main_row_bytes=main_row_bytes,
+            gdn_row_bytes=gdn_row_bytes,
         )
         check_served_plan(plan)
         refuse_ephemeral_ports(
@@ -2815,7 +2828,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             plan,
             managers,
             check=check,
-            fp4_slots=envs.VLLM_TPU_OFFLOAD_FP4_SLOTS if envs.VLLM_TPU_OFFLOAD_FP4 else None,
+            fp4_slots=_fp4_slot_layout() if envs.VLLM_TPU_OFFLOAD_FP4 else None,
         )
 
     def _tier_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
@@ -2857,17 +2870,24 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             port = self.tier_controller_port(tier_class)
             class_caches = class_kv_caches(kv_caches, indices)
             row_bytes = tier_class.row_bytes if tier_class.rows_per_page > 1 else None
+            fp4_kind = None
             if envs.VLLM_TPU_OFFLOAD_FP4 and tier_class.kind == "main":
-                # VLLM_TPU_OFFLOAD_FP4: the main class registers the transcoder's
+                fp4_kind = "main"
+            elif envs.VLLM_TPU_OFFLOAD_FP4_GDN and tier_class.kind == "gdn":
+                fp4_kind = "gdn"
+            if fp4_kind is not None:
+                # VLLM_TPU_OFFLOAD_FP4(_GDN): the class registers its kind's transcoder
                 # staging buffers (one a region, rows of one FP4 page), not the pool.
+                # The gdn classes share one set: a slot is one key's whichever class.
                 import torch
                 from vllm.v1.kv_offload.base import CanonicalKVCacheTensor
 
                 from vllm_torchtpu.offload.fp4 import transcoder
 
-                t = transcoder()
-                assert t is not None, "VLLM_TPU_OFFLOAD_FP4: no transcoder registered"
-                assert sorted(t.staging) == list(indices), (sorted(t.staging), indices)
+                t = transcoder(fp4_kind)
+                assert t is not None, f"VLLM_TPU_OFFLOAD_FP4: no {fp4_kind} transcoder"
+                assert set(indices) <= set(t.staging), (sorted(t.staging), indices)
+                assert t.row_bytes == tier_class.row_bytes, (t.row_bytes, tier_class.row_bytes)
                 row_bytes = tier_class.row_bytes
                 class_caches = CanonicalKVCaches(
                     tensors=[

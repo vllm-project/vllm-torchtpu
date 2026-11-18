@@ -102,6 +102,177 @@ def staging_shape(page_bytes: int, slots: int) -> tuple[int, int, int, int]:
     return (slots, stage_rows(page_rows(page_bytes)), ROW_SLOTS, ROW_LANES)
 
 
+# -- GDN state pages (VLLM_TPU_OFFLOAD_FP4_GDN) -----------------------------------
+# A GDN page is rows of 1,024 bytes holding FP32 words in the Mosaic typed view
+# (pd_staging._typed: one word a lane, its four bytes over the row's four sublanes):
+# 256 FP32 values a row (the SSM state, then the conv state, then padding). MXFP4 of
+# a row: 128 packed bytes + 8 scales = 136 B, 13.3% of the row.
+GDN_ROW_VALUES = ROW_LANES  # FP32 words a row
+GDN_ROW_FP4 = GDN_ROW_VALUES // 2 + GDN_ROW_VALUES // GROUP  # 136
+
+
+def gdn_packed_rows(rows: int) -> int:
+    """1,024-byte rows the MXFP4 bytes of a ``rows``-row GDN page fill."""
+    if (rows * GDN_ROW_FP4) % ROW_VALUES:
+        raise ValueError(
+            f"VLLM_TPU_OFFLOAD_FP4_GDN: {rows} rows a page do not pack into whole rows"
+        )
+    return rows * GDN_ROW_FP4 // ROW_VALUES
+
+
+def fp4_gdn_page_bytes(page_bytes: int) -> int:
+    """Host bytes of one GDN state page in MXFP4."""
+    return gdn_packed_rows(page_rows(page_bytes)) * ROW_VALUES
+
+
+def slot_layout(main_slots: int, gdn_slots: int) -> dict[str, tuple[int, int]]:
+    """Kind -> (first global slot id, slots). One id space over both kinds, so the
+    scheduler's pairs and the workers' metadata carry plain ints; a class hands
+    Raiden its local slot (id - first)."""
+    out = {"main": (0, int(main_slots))}
+    if gdn_slots:
+        out["gdn"] = (int(main_slots), int(gdn_slots))
+    return out
+
+
+def configured_slot_layout() -> dict[str, tuple[int, int]]:
+    from vllm_torchtpu import envs
+
+    main = int(envs.VLLM_TPU_OFFLOAD_FP4_SLOTS)
+    gdn = 0
+    if envs.VLLM_TPU_OFFLOAD_FP4_GDN:
+        gdn = int(envs.VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS) or main
+    return slot_layout(main, gdn)
+
+
+def page_gather_u8(source, ids, tile: int = 64):
+    """``source[ids]`` (kernel pages ``[P, R, *row]`` of the FP8 carrier) as uint8 rows
+    ``[n * R, 4, 256]``: each tile of ``tile`` rows lands by DMA in a VMEM block of the
+    carrier dtype and is stored through a Mosaic vreg bitcast (``pltpu.bitcast``), as
+    ``pd_staging.dma_row_gather`` does, so no XLA op ever holds the bytes as FP8 (an
+    XLA FP8 -> integer bitcast canonicalised NaN encodings, which FP32 state words
+    contain). One SMEM index a page."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    rows = int(source.shape[1])
+    if rows % tile:
+        raise ValueError(f"page_gather_u8: {rows} rows a page, not tiles of {tile}")
+    steps = rows // tile
+    stage = source.reshape(-1, ROW_SLOTS, ROW_LANES)
+
+    def kernel(ids_ref, src_ref, out_ref, sem, scratch):
+        i, c = pl.program_id(0), pl.program_id(1)
+        pltpu.async_copy(
+            src_ref.at[pl.ds(ids_ref[i] * rows + c * tile, tile)], scratch, sem
+        ).wait()
+        out_ref[...] = pltpu.bitcast(scratch[...], jnp.uint8)
+
+    n = ids.shape[0]
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(n, steps),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(
+                (tile, ROW_SLOTS, ROW_LANES), lambda i, c, *_: (i * steps + c, 0, 0)
+            ),
+            scratch_shapes=[
+                pltpu.SemaphoreType.DMA,
+                pltpu.VMEM((tile, ROW_SLOTS, ROW_LANES), stage.dtype),
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct((n * rows, ROW_SLOTS, ROW_LANES), jnp.uint8),
+        name="qwen4_offload_fp4_page_gather_u8",
+    )(ids.astype(jnp.int32), stage)
+
+
+def _words(rows_u8, jnp, lax):
+    """``[..., 4, 256]`` uint8 rows -> ``[..., 256]`` FP32 (pd_staging._typed)."""
+    w = jnp.swapaxes(rows_u8, -1, -2)  # [..., 256, 4]: one word a lane
+    return lax.bitcast_convert_type(lax.bitcast_convert_type(w, jnp.uint32), jnp.float32)
+
+
+def _unwords(x, jnp, lax):
+    """Inverse of ``_words``: ``[..., 256]`` FP32 -> ``[..., 4, 256]`` uint8."""
+    u = lax.bitcast_convert_type(lax.bitcast_convert_type(x, jnp.uint32), jnp.uint8)
+    return jnp.swapaxes(u, -1, -2)
+
+
+def _pow2(e, jnp):
+    """Exact ``2.0 ** e`` for integer ``e`` in [-126, 127], from the exponent bits
+    (``exp2`` is not exact on every backend)."""
+    from jax import lax
+
+    bits = ((e.astype(jnp.int32) + SCALE_BIAS) << 23).astype(jnp.uint32)
+    return lax.bitcast_convert_type(bits, jnp.float32)
+
+
+def _mx_encode(g, jnp):
+    """``[..., 32]`` float groups -> (nibbles ``[..., 32]`` uint8, exponents ``[..., 1]``)."""
+    amax = jnp.max(jnp.abs(g), axis=-1, keepdims=True)
+    mant, expo = jnp.frexp(amax / 6.0)
+    e = expo - (mant == 0.5).astype(expo.dtype)
+    e = jnp.where(amax > 0, e, 0)
+    e = jnp.clip(e, -SCALE_BIAS + 1, SCALE_BIAS - 1)
+    y = jnp.abs(g) * _pow2(-e, jnp)
+    code = jnp.zeros(y.shape, jnp.uint8)
+    for t, up in zip(E2M1_THRESHOLDS, E2M1_TIE_UP):
+        code = code + ((y >= t) if up else (y > t)).astype(jnp.uint8)
+    return code | ((g < 0).astype(jnp.uint8) << 3), e
+
+
+def _mx_decode(nib, scales_u8, jnp):
+    grid = jnp.asarray(E2M1_GRID, jnp.float32)
+    mag = grid[(nib & 7).astype(jnp.int32)]
+    val = jnp.where((nib >> 3) == 1, -mag, mag)
+    return val * _pow2(scales_u8.astype(jnp.int32) - SCALE_BIAS, jnp)
+
+
+def quantize_gdn_pages(rows_u8, jnp, lax):
+    """``[n, rows, 4, 256]`` uint8 GDN rows -> ``[n, gdn_packed_rows, 4, 256]`` uint8:
+    per page the packed nibbles (``rows * 128`` B) then the scales (``rows * 8``)."""
+    n, rows = rows_u8.shape[0], rows_u8.shape[1]
+    g = _words(rows_u8, jnp, lax).reshape(n, rows, GDN_ROW_VALUES // GROUP, GROUP)
+    nib, e = _mx_encode(g, jnp)
+    nib = nib.reshape(n, rows, GDN_ROW_VALUES // 2, 2)
+    packed = (nib[..., 0] | (nib[..., 1] << 4)).reshape(n, -1)
+    scales = (e + SCALE_BIAS).astype(jnp.uint8).reshape(n, -1)
+    out = jnp.concatenate([packed, scales], axis=1)
+    return out.reshape(n, gdn_packed_rows(rows), ROW_SLOTS, ROW_LANES)
+
+
+def dequantize_gdn_pages(staged_u8, rows: int, jnp, lax):
+    """Inverse of ``quantize_gdn_pages``: -> ``[n, rows, 4, 256]`` uint8 GDN rows."""
+    n = staged_u8.shape[0]
+    flat = staged_u8.reshape(n, -1)
+    packed = flat[:, : rows * GDN_ROW_VALUES // 2].reshape(n, rows, GDN_ROW_VALUES // 2)
+    scales = flat[:, rows * GDN_ROW_VALUES // 2 :].reshape(
+        n, rows, GDN_ROW_VALUES // GROUP, 1
+    )
+    nib = jnp.stack([packed & 0xF, packed >> 4], axis=-1).reshape(
+        n, rows, GDN_ROW_VALUES // GROUP, GROUP
+    )
+    x = _mx_decode(nib, scales, jnp).reshape(n, rows, GDN_ROW_VALUES)
+    return _unwords(x, jnp, lax)
+
+
+def gdn_rows_from_f32(values: np.ndarray) -> np.ndarray:
+    """NumPy, tests and self-test: ``[..., rows, 256]`` FP32 -> ``[..., rows, 4, 256]``
+    uint8 rows in the typed view (little-endian words over the sublanes)."""
+    u = np.ascontiguousarray(values, dtype="<f4").view(np.uint8)
+    u = u.reshape(*values.shape, 4)
+    return np.ascontiguousarray(np.swapaxes(u, -1, -2))
+
+
+def gdn_f32_from_rows(rows: np.ndarray) -> np.ndarray:
+    w = np.ascontiguousarray(np.swapaxes(rows, -1, -2))
+    return w.view("<f4").reshape(rows.shape[:-2] + (rows.shape[-1],))
+
+
 def page_scatter(target, values, dst):
     """``target[dst[i]] = values[i]`` in place: one HBM-to-HBM DMA per page, the
     target aliased to the output (donated by the caller). One SMEM index per page;
@@ -250,12 +421,31 @@ class Fp4Transcoder:
     pages are read with ``page_gather`` (whole-page DMAs), never an XLA gather.
     """
 
-    def __init__(self, pools: dict[int, torch.Tensor], page_bytes: int, slots: int):
+    def __init__(
+        self,
+        pools: dict[int, torch.Tensor],
+        page_bytes: int,
+        slots: int,
+        kind: str = "main",
+        offset: int = 0,
+    ):
+        # kind "main": FP8 main-KV pages (1,700 staged rows a page); "gdn": GDN state
+        # pages of FP32 words (425 staged rows a page). ``offset``: this kind's first
+        # global slot id (slot_layout); pairs carry global ids.
+        assert kind in ("main", "gdn"), kind
+        self.kind = kind
+        self.offset = int(offset)
         self.pools = dict(pools)
         self.page_bytes = page_bytes
         self.rows = page_rows(page_bytes)
         self.slots = slots
+        self.srows = stage_rows(self.rows) if kind == "main" else gdn_packed_rows(self.rows)
         for r, p in self.pools.items():
+            if kind == "gdn" and int(p.shape[1]) % 64:
+                raise ValueError(
+                    f"VLLM_TPU_OFFLOAD_FP4_GDN: region {r} kernel pages of {p.shape[1]} "
+                    "rows are not whole 64-row tiles"
+                )
             if (
                 p.dim() < 3
                 or p.dtype != torch.float8_e4m3fn
@@ -267,12 +457,20 @@ class Fp4Transcoder:
                     f"FP8 [pages, rows, 1,024-byte row] dividing a {self.rows}-row page"
                 )
         self.staging: dict[int, torch.Tensor] = {
-            r: torch.zeros(staging_shape(page_bytes, slots), dtype=torch.uint8, device=p.device)
+            r: torch.zeros(self.staging_shape(slots), dtype=torch.uint8, device=p.device)
             for r, p in self.pools.items()
         }
         self._quant: dict[tuple, object] = {}
         self._dequant: dict[tuple, object] = {}
         self._ops: dict[str, object] = {}
+
+    def staging_shape(self, slots: int) -> tuple[int, int, int, int]:
+        return (slots, self.srows, ROW_SLOTS, ROW_LANES)
+
+    @property
+    def row_bytes(self) -> int:
+        """Host bytes of one entry a region (a staging slot)."""
+        return self.srows * ROW_VALUES
 
     @property
     def staging_bytes(self) -> int:
@@ -287,7 +485,9 @@ class Fp4Transcoder:
         from jax import lax
         from torch_tpu._internal import pallas
 
-        rows, srow = self.rows, stage_rows(self.rows)
+        rows, srow = self.rows, self.srows
+        gdn = self.kind == "gdn"
+        tag = "_gdn" if gdn else ""
 
         def kernel_pages(pool, blocks):
             # Scheduler block b -> its kernel pages b*split .. b*split+split-1.
@@ -303,11 +503,21 @@ class Fp4Transcoder:
                 pool: jax.Array, staging: jax.Array, blocks: jax.Array, slots: jax.Array
             ) -> tuple[jax.Array, jax.Array]:
                 n = blocks.shape[0]
-                pages = page_gather(pool, kernel_pages(pool, blocks)).reshape(n, rows, ROW_SLOTS, ROW_LANES)
-                q = quantize_pages(pages, jnp, lax).reshape(n, srow, ROW_SLOTS, ROW_LANES)
+                if gdn:
+                    # FP32 words: read as uint8 rows by DMA, never through an XLA
+                    # FP8 op (page_gather_u8).
+                    u8 = page_gather_u8(pool, kernel_pages(pool, blocks))
+                    q = quantize_gdn_pages(u8.reshape(n, rows, ROW_SLOTS, ROW_LANES), jnp, lax)
+                else:
+                    pages = page_gather(pool, kernel_pages(pool, blocks)).reshape(
+                        n, rows, ROW_SLOTS, ROW_LANES
+                    )
+                    q = quantize_pages(pages, jnp, lax).reshape(n, srow, ROW_SLOTS, ROW_LANES)
                 return page_scatter(staging, q, slots), slots[0]
 
-            op = pallas.jax_op("pallas::qwen4_offload_fp4_quant", quant_fn, donate_argnums=(1,))
+            op = pallas.jax_op(
+                f"pallas::qwen4_offload_fp4_quant{tag}", quant_fn, donate_argnums=(1,)
+            )
             op.register_fake(
                 lambda pool, staging, blocks, slots: (
                     torch.empty_like(staging),
@@ -321,12 +531,25 @@ class Fp4Transcoder:
             ) -> tuple[jax.Array, jax.Array]:
                 n = slots.shape[0]
                 staged = staging[slots.astype(jnp.int32)]  # uint8: a plain gather is exact
-                staged = staged.reshape(n, rows * ROW_SLOTS + rows * SCALES_PER_ROW // 128, 128)
-                vals = dequantize_pages(staged, rows, jnp, lax, as_fp8=True).astype(pool.dtype)
-                values = vals.reshape(-1, *pool.shape[1:])
+                if gdn:
+                    u8 = dequantize_gdn_pages(staged, rows, jnp, lax)
+                    # uint8 -> carrier dtype, as the PD repack writes its rows.
+                    values = lax.bitcast_convert_type(u8, pool.dtype).reshape(
+                        -1, *pool.shape[1:]
+                    )
+                else:
+                    staged = staged.reshape(
+                        n, rows * ROW_SLOTS + rows * SCALES_PER_ROW // 128, 128
+                    )
+                    vals = dequantize_pages(staged, rows, jnp, lax, as_fp8=True).astype(
+                        pool.dtype
+                    )
+                    values = vals.reshape(-1, *pool.shape[1:])
                 return page_scatter(pool, values, kernel_pages(pool, blocks)), blocks[0]
 
-            op = pallas.jax_op("pallas::qwen4_offload_fp4_dequant", dequant_fn, donate_argnums=(0,))
+            op = pallas.jax_op(
+                f"pallas::qwen4_offload_fp4_dequant{tag}", dequant_fn, donate_argnums=(0,)
+            )
             op.register_fake(
                 lambda pool, staging, slots, blocks: (
                     torch.empty_like(pool),
@@ -369,8 +592,23 @@ class Fp4Transcoder:
             chunk = chunk + [chunk[-1]] * (b - len(chunk))
             yield b, np.asarray(chunk, dtype=np.int32)
 
+    def owns(self, slot: int) -> bool:
+        return self.offset <= slot < self.offset + self.slots
+
+    def _local(self, pairs, slot_at: int) -> list[tuple[int, int]]:
+        """This kind's pairs (global slot ids) with local slot ids."""
+        out = []
+        for p in pairs:
+            if self.owns(p[slot_at]):
+                q = list(p)
+                q[slot_at] -= self.offset
+                out.append((q[0], q[1]))
+        return out
+
     def quantize(self, pairs: Sequence[tuple[int, int]]) -> None:
-        """``(pool block, slot)`` pairs: every region's page -> its staging slot."""
+        """``(pool block, global slot)`` pairs: every region's page -> its staging slot.
+        Pairs of the other kind are skipped."""
+        pairs = self._local(pairs, 1)
         if not pairs or not self.pools:
             return
         for b, arr in self._batches(pairs):
@@ -382,7 +620,8 @@ class Fp4Transcoder:
                 run(pool, self.staging[r], blocks, slots)
 
     def dequantize(self, pairs: Sequence[tuple[int, int]]) -> None:
-        """``(slot, pool block)`` pairs: every region's staging slot -> its page."""
+        """``(global slot, pool block)`` pairs: every region's staging slot -> its page."""
+        pairs = self._local(pairs, 0)
         if not pairs or not self.pools:
             return
         for b, arr in self._batches(pairs):
@@ -396,9 +635,10 @@ class Fp4Transcoder:
     def warmup_and_selftest(self) -> dict:
         """Compiles every bucket of both programs on block 0 (vLLM's null block, never
         read) and checks the round trip on scratch tensors of random FP8 values."""
+        o = self.offset
         for b in BUCKETS:
-            self.quantize([(0, i) for i in range(b)])
-            self.dequantize([(b - 1, 0)] * b)
+            self.quantize([(0, o + i) for i in range(b)])
+            self.dequantize([(o + b - 1, 0)] * b)
             # Run them now (execution is deferred): a program that cannot load fails
             # here, attributed to its bucket. Sync the whole tensors (as
             # pooled_cache does), never a slice: a slice read joined the deferred
@@ -407,34 +647,67 @@ class Fp4Transcoder:
             from vllm_torchtpu.utils import synchronize_tensors
 
             synchronize_tensors(list(self.pools.values()) + list(self.staging.values()))
-            logger.info("offload fp4: bucket %d programs ran", b)
+            logger.info("offload fp4 %s: bucket %d programs ran", self.kind, b)
         return self.selftest()
 
     def selftest(self) -> dict:
-        """Round trip of one page of random FP8 values through both programs on the
-        device, on a scratch pool of the region tensor's dtype and row shape."""
+        """Round trip of one page through both programs on the device, on a scratch pool
+        of the region tensor's dtype and row shape: random FP8 values (main), or
+        random FP32 words over six decades of magnitude (gdn)."""
         if not self.pools:
             return {}
         pool = next(iter(self.pools.values()))
         dev = pool.device
         kr = int(pool.shape[1])
         rng = np.random.default_rng(0)
-        vals = (rng.standard_normal((2, self.rows, ROW_SLOTS, ROW_LANES)) * 4).astype(np.float32)
-        vals[0, :, :, :32] *= 50.0  # a group near the FP8 range
-        f8 = torch.from_numpy(vals).to(torch.float8_e4m3fn)
-        ref = f8.to(torch.float32).numpy()
+        if self.kind == "gdn":
+            f32 = rng.standard_normal((2, self.rows, GDN_ROW_VALUES)).astype(np.float32)
+            # Per-row magnitudes from 1e-4 to 1e2, as state rows differ by head.
+            f32 *= np.float32(10.0) ** rng.uniform(-4, 2, (2, self.rows, 1)).astype(np.float32)
+            raw = gdn_rows_from_f32(f32)  # [2, rows, 4, 256] uint8
+            ref = f32
+        else:
+            vals = (rng.standard_normal((2, self.rows, ROW_SLOTS, ROW_LANES)) * 4).astype(
+                np.float32
+            )
+            vals[0, :, :, :32] *= 50.0  # a group near the FP8 range
+            f8 = torch.from_numpy(vals).to(torch.float8_e4m3fn)
+            ref = f8.to(torch.float32).numpy()
+            raw = f8.view(torch.uint8).numpy()
         scratch_pool = (
-            f8.view(torch.uint8).reshape(2 * self.rows // kr, kr, *pool.shape[2:])
-            .view(pool.dtype).to(dev)
+            torch.from_numpy(np.ascontiguousarray(raw))
+            .reshape(2 * self.rows // kr, kr, *pool.shape[2:])
+            .view(pool.dtype)
+            .to(dev)
         )
-        scratch_stage = torch.zeros(staging_shape(self.page_bytes, 2), dtype=torch.uint8, device=dev)
+        scratch_stage = torch.zeros(self.staging_shape(2), dtype=torch.uint8, device=dev)
         q = self._program("quant", 1)
         d = self._program("dequant", 1)
         one = lambda v: torch.tensor([v], dtype=torch.int32).to(dev)
         q(scratch_pool, scratch_stage, one(0), one(0))
         d(scratch_pool, scratch_stage, one(0), one(1))  # slot 0 -> block 1
+        out_u8 = scratch_pool.cpu().view(torch.uint8).numpy()
+        if self.kind == "gdn":
+            back = gdn_f32_from_rows(out_u8.reshape(2, self.rows, ROW_SLOTS, ROW_LANES))[1]
+            src = ref[0]
+            # Relative error per row (rows differ by orders of magnitude).
+            num = np.sqrt(np.mean((back - src) ** 2, axis=-1))
+            den = np.maximum(np.sqrt(np.mean(src**2, axis=-1)), 1e-30)
+            row_rel = num / den
+            out = {
+                "rel_rms_err": round(float(np.mean(row_rel)), 4),
+                "max_row_rel_err": round(float(np.max(row_rel)), 4),
+                "finite": bool(np.isfinite(back).all()),
+                "staging_gb": round(self.staging_bytes / 1e9, 2),
+                "regions": len(self.pools),
+                "pool": f"{tuple(pool.shape)} {pool.dtype}",
+            }
+            logger.info("offload fp4 gdn: transcode self-test %s", out)
+            if not out["finite"] or out["rel_rms_err"] > 0.2 or out["max_row_rel_err"] > 0.3:
+                raise RuntimeError(f"VLLM_TPU_OFFLOAD_FP4_GDN: transcode self-test failed {out}")
+            return out
         back = (
-            scratch_pool.cpu().view(torch.uint8).view(torch.float8_e4m3fn)
+            torch.from_numpy(out_u8).view(torch.float8_e4m3fn)
             .to(torch.float32).numpy().reshape(2, self.rows, ROW_SLOTS, ROW_LANES)[1]
         )
         src = ref[0]
@@ -456,18 +729,36 @@ class Fp4Transcoder:
 
 # Per process: the worker's transcoder, registered by the connector before the class
 # workers are built (raiden_store._tier_worker reads the staging buffers from it).
-_TRANSCODER: Fp4Transcoder | None = None
+_TRANSCODERS: dict[str, Fp4Transcoder] = {}
 _LOCK = threading.Lock()
 
 
-def set_transcoder(t: Fp4Transcoder | None) -> None:
-    global _TRANSCODER
+def set_transcoder(t: Fp4Transcoder | None, kind: str = "main") -> None:
     with _LOCK:
-        _TRANSCODER = t
+        if t is None:
+            _TRANSCODERS.pop(kind, None)
+        else:
+            assert t.kind == kind, (t.kind, kind)
+            _TRANSCODERS[kind] = t
 
 
-def transcoder() -> Fp4Transcoder | None:
-    return _TRANSCODER
+def transcoder(kind: str = "main") -> Fp4Transcoder | None:
+    return _TRANSCODERS.get(kind)
+
+
+def transcoders() -> list[Fp4Transcoder]:
+    return list(_TRANSCODERS.values())
+
+
+def quantize_all(pairs: Sequence[tuple[int, int]]) -> None:
+    """``(pool block, global slot)``: each kind's transcoder takes its own slots."""
+    for t in transcoders():
+        t.quantize(pairs)
+
+
+def dequantize_all(pairs: Sequence[tuple[int, int]]) -> None:
+    for t in transcoders():
+        t.dequantize(pairs)
 
 
 # -- scheduler side --------------------------------------------------------------
