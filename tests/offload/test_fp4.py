@@ -167,3 +167,73 @@ def test_page_gather_interpret(fp4):
     finally:
         pl.pallas_call = orig
     np.testing.assert_array_equal(np.asarray(out), np.asarray(src)[[2, 0, 2]])
+
+
+# -- VLLM_TPU_OFFLOAD_FP4_GDN ------------------------------------------------------
+
+
+def test_gdn_geometry(fp4):
+    assert fp4.gdn_packed_rows(3200) == 425  # 3200 rows x 136 B / 1024 B
+    assert fp4.fp4_gdn_page_bytes(3_276_800) == 435_200
+    with pytest.raises(ValueError):
+        fp4.gdn_packed_rows(96)  # 96 x 136 B is not whole 1,024-B rows
+
+
+def test_slot_layout(fp4):
+    assert fp4.slot_layout(1024, 0) == {"main": (0, 1024)}
+    assert fp4.slot_layout(1024, 512) == {"main": (0, 1024), "gdn": (1024, 512)}
+
+
+def test_gdn_rows_typed_view_round_trip(fp4):
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((2, 8, 256)).astype(np.float32)
+    rows = fp4.gdn_rows_from_f32(x)
+    assert rows.shape == (2, 8, 4, 256) and rows.dtype == np.uint8
+    np.testing.assert_array_equal(fp4.gdn_f32_from_rows(rows), x)
+    # The JAX view agrees with the NumPy one (pd_staging._typed's convention).
+    w = np.asarray(fp4._words(jnp.asarray(rows), jnp, lax))
+    np.testing.assert_array_equal(w, x)
+    np.testing.assert_array_equal(np.asarray(fp4._unwords(jnp.asarray(x), jnp, lax)), rows)
+
+
+def test_gdn_round_trip_error(fp4):
+    rng = np.random.default_rng(5)
+    rows = 128
+    x = rng.standard_normal((2, rows, 256)).astype(np.float32)
+    x *= np.float32(10.0) ** rng.uniform(-4, 2, (2, rows, 1)).astype(np.float32)
+    raw = jnp.asarray(fp4.gdn_rows_from_f32(x))
+    q = fp4.quantize_gdn_pages(raw, jnp, lax)
+    assert q.shape == (2, fp4.gdn_packed_rows(rows), 4, 256) and q.dtype == jnp.uint8
+    back = fp4.gdn_f32_from_rows(np.asarray(fp4.dequantize_gdn_pages(q, rows, jnp, lax)))
+    assert np.isfinite(back).all()
+    row_rel = np.sqrt(np.mean((back - x) ** 2, -1)) / np.sqrt(np.mean(x**2, -1))
+    assert row_rel.mean() < 0.16 and row_rel.max() < 0.3, (row_rel.mean(), row_rel.max())
+
+
+def test_gdn_grid_values_are_exact(fp4):
+    # Values already on an e2m1 grid times a power of two survive unchanged; zeros stay 0.
+    rows = 128
+    grid = np.array(fp4.E2M1_GRID + tuple(-v for v in fp4.E2M1_GRID), np.float32)
+    x = np.resize(grid, (1, rows, 256)).astype(np.float32) * np.float32(2.0**-20)
+    x[0, 5] = 0.0
+    raw = jnp.asarray(fp4.gdn_rows_from_f32(x))
+    back = fp4.gdn_f32_from_rows(
+        np.asarray(fp4.dequantize_gdn_pages(fp4.quantize_gdn_pages(raw, jnp, lax), rows, jnp, lax))
+    )
+    np.testing.assert_array_equal(back, x)
+
+
+def test_page_gather_u8_interpret(fp4):
+    pl = pytest.importorskip("jax.experimental.pallas")
+    src_u8 = (np.arange(3 * 64 * 1 * 4 * 256) % 251).astype(np.uint8).reshape(3, 64, 1, 4, 256)
+    src = lax.bitcast_convert_type(jnp.asarray(src_u8), jnp.float8_e4m3fn)
+    orig = pl.pallas_call
+    try:
+        pl.pallas_call = lambda *a, **k: orig(*a, **{**k, "interpret": True})
+        out = fp4.page_gather_u8(src, jnp.asarray([2, 0], jnp.int32))
+    except Exception as exc:  # pragma: no cover - interpret mode lacks the vreg bitcast
+        pytest.skip(f"interpret mode unavailable: {exc}")
+    finally:
+        pl.pallas_call = orig
+    want = src_u8[[2, 0]].reshape(-1, 4, 256)
+    np.testing.assert_array_equal(np.asarray(out), want)
