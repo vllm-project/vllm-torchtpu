@@ -171,6 +171,26 @@ class ScatterTest(jtu.JaxTestCase):
             except Exception as e:  # pylint: disable=broad-except
                 print(f"Skipping {name} correctness check due to error: {e}")
 
+    def test_sc_ragged_gather_reduce_v2_narrow_hidden(self):
+        """v2 is correct at a 768-wide hidden (a latent-MoE width), where the
+        column split has to continue past the pipeline-depth preference until
+        the row partitions fit the SIMD lanes. Covers v2 only: v1 still
+        asserts on this width.
+        """
+        out_size, hidden, rgs = 16384, 768, 8
+        start, end = 300, 2358
+        key = jax.random.key(0)
+        x = jax.random.normal(key, (out_size, hidden), jnp.float32)
+        x = x.astype(jnp.bfloat16)
+        indices = jax.random.permutation(key, out_size)
+        topk_weights = jax.random.normal(key, (out_size,), jnp.bfloat16)
+        valid_rows_mask = jnp.logical_and(start <= indices, indices < end)
+        desired = reference_ragged_gather_reduce(
+            x, indices, topk_weights, valid_rows_mask, rgs
+        )
+        actual = ragged_gather_reduce_v2(x, indices, topk_weights, valid_rows_mask, rgs)
+        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
+
     def test_sc_ragged_gather_reduce_v2_multiwindow(self):
         """v2 is correct when the input spans multiple resident sort-permutation
         windows: the windowed DMA and window-relative indexing, and -- at
