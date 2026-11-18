@@ -1157,6 +1157,41 @@ class TPUModelRunner(GPUModelRunner):
             return None
         return self._drafter_padded_drafts(drafts, num_chunks)
 
+    def _skips_multi_chunk_draft_cat(
+        self,
+        is_async: bool,
+        next_tokens_per_chunk: list[torch.Tensor],
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        """Whether this spec step's MTP drafter returns chunk 0's padded block
+        alone instead of concatenating the chunks' drafts
+        (``Eagle3Proposer._skip_next_multi_chunk_draft_cat``), which saves the
+        concat when nothing reads it.
+
+        Only for an asynchronous step with two chunks whose sampled rows fit
+        the two-chunk async-spec assembly: that assembly takes each chunk's
+        padded drafts from the drafter, not from the returned tensor
+        (``_assemble_async_spec_substitution``). A replicated drafter (draft
+        TP 1) keeps the concat, because its drafts are pinned to rank 0's
+        before the assembly; so does a step with structured output, whose
+        drafts are staged for the host.
+        """
+        return (
+            is_async
+            and len(next_tokens_per_chunk) == 2
+            and isinstance(self.drafter, Eagle3Proposer)
+            and not scheduler_output.has_structured_output_requests
+            and next_tokens_per_chunk[0].device.type == "tpu"
+            and (
+                next_tokens_per_chunk[0].shape[0] + next_tokens_per_chunk[1].shape[0]
+                <= self.max_num_reqs
+            )
+            and (
+                self.speculative_config is None
+                or self.speculative_config.draft_tensor_parallel_size != 1
+            )
+        )
+
     def _defers_prev_rollback(
         self,
         combined_selected_tokens: Any,
@@ -4335,7 +4370,19 @@ class TPUModelRunner(GPUModelRunner):
                 state.num_reqs_list[0],
             )
 
-        drafts_per_chunk = self._drafts_per_chunk(drafts, state.num_reqs_list)
+        if (
+            padded_drafts is not None
+            and len(padded_drafts) > 1
+            and drafts is padded_drafts[0]
+        ):
+            # The drafter skipped the concat (_skips_multi_chunk_draft_cat) and
+            # returned chunk 0's padded block alone, but the two-chunk program
+            # above did not run: each chunk's drafts come from its own block.
+            drafts_per_chunk = [
+                d[:n] for d, n in zip(padded_drafts, state.num_reqs_list)
+            ]
+        else:
+            drafts_per_chunk = self._drafts_per_chunk(drafts, state.num_reqs_list)
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
@@ -7587,6 +7634,14 @@ class TPUModelRunner(GPUModelRunner):
             and not self._is_dspark_pd_producer
         ):
             if is_spec_step:
+                if self._skips_multi_chunk_draft_cat(
+                    is_async, next_tokens_per_chunk, scheduler_output
+                ):
+                    # The drafter returns chunk 0's padded block alone, and
+                    # _assemble_async_spec_substitution takes every chunk's
+                    # padded drafts from it; propose() resets the flag.
+                    drafter = cast(Eagle3Proposer, self.drafter)
+                    drafter._skip_next_multi_chunk_draft_cat = True
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,

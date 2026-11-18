@@ -426,6 +426,7 @@ def _make_sample_runner(
         TPUModelRunner._fused_assembly_padded_drafts,
         TPUModelRunner._drafter_padded_drafts,
         TPUModelRunner._get_zero_draft_lengths,
+        TPUModelRunner._skips_multi_chunk_draft_cat,
         TPUModelRunner._sample_chunk_logits,
         TPUModelRunner._sample_plain_chunk,
         TPUModelRunner._sample_spec_verify_chunk,

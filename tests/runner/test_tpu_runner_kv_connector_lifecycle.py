@@ -142,6 +142,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",
+        "_skips_multi_chunk_draft_cat",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
