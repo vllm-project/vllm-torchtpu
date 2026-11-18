@@ -4232,8 +4232,6 @@ class TPUModelRunner(GPUModelRunner):
                 deferred_mamba_indices is not None
                 and self.mamba_slot_read_offsets is not None
                 and len(deferred_mamba_indices) > 0
-                and "_update_mamba_slot_read_offsets"
-                not in getattr(self, "__dict__", {})
             ):
                 stacked_groups = _stack_or_single_mamba_groups(deferred_mamba_indices)
                 src_padded, spec_num_rejected = (
@@ -4307,8 +4305,6 @@ class TPUModelRunner(GPUModelRunner):
                 deferred_mamba_indices is not None
                 and self.mamba_slot_read_offsets is not None
                 and len(deferred_mamba_indices) > 0
-                and "_update_mamba_slot_read_offsets"
-                not in getattr(self, "__dict__", {})
             ):
                 stacked_groups = _stack_or_single_mamba_groups(deferred_mamba_indices)
                 src_padded, spec_num_rejected = (
@@ -5039,10 +5035,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     pre_async.spec_decode_num_rejected_tokens = num_rejected_dev
                 can_fuse_subst = (
-                    len(cur_input_indices) > 0
-                    and pre_async.next_tokens_tpu is not None
-                    and "_apply_async_token_substitution"
-                    not in getattr(self, "__dict__", {})
+                    len(cur_input_indices) > 0 and pre_async.next_tokens_tpu is not None
                 )
                 if can_fuse_subst:
                     substitution_indices = (
@@ -7396,10 +7389,6 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 and state.spec_decode_metadata_list[0] is not None
                 and self._is_async_drafter
-                and "_assemble_async_spec_substitution"
-                not in getattr(self, "__dict__", {})
-                and "_update_mamba_slot_read_offsets"
-                not in getattr(self, "__dict__", {})
             )
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
