@@ -457,47 +457,80 @@ def _flash_attention_kernel_single_batch(
                 acc_scratch_ref[(*batch_idx, rs)] * l_broadcast(alpha) + o_curr
             )
 
-        def _attend(start_k, block_k=block_k):
-            # Row groups of at most _ROW_GROUP rows: the scheduler overlaps one
-            # group's softmax with the next group's matmuls, which a single
-            # [block_q, block_k] tile serializes (a full 32768 row of 2 heads
-            # of 72 at block_q 2048: 3.79 -> 3.36 ms).
-            for row in range(0, block_q, _ROW_GROUP):
-                _attend_rows(start_k, block_k, row, min(_ROW_GROUP, block_q - row))
+        # Row groups of at most _ROW_GROUP rows: the scheduler overlaps one
+        # group's softmax with the next group's matmuls, which a single
+        # [block_q, block_k] tile serializes (a full 32768 row of 2 heads of 72
+        # at block_q 2048: 3.79 -> 3.36 ms).
+        groups = [
+            (row, min(_ROW_GROUP, block_q - row))
+            for row in range(0, block_q, _ROW_GROUP)
+        ]
+
+        def _attend(start_k, block_k=block_k, groups=groups):
+            for row, rows in groups:
+                _attend_rows(start_k, block_k, row, rows)
 
         if kv_windows_ref is None:
             pl.loop(0, block_k_major, step=block_k, unroll=True)(_attend)
             return
-        # Only the q block's kv window [lo, hi) can hold a matching segment.
-        # Cover its part in this kv block with block_k chunks and the rest
-        # with tail_k ones, placed inside the kv block: columns they add past
-        # the window are masked like any other mismatch.
+
         batch = pl.program_id(0) * q_tile_ref.shape[0] + batch_idx[0]
         kv_start = kv_seq_idx * block_k_major
-        lo = jnp.maximum(kv_windows_ref[batch, q_seq_idx, 0], kv_start)
-        hi = jnp.minimum(kv_windows_ref[batch, q_seq_idx, 1], kv_start + block_k_major)
-        width = jnp.maximum(hi - lo, 0)
         tail_k = math.gcd(block_k, block_k_major, _TAIL_BLOCK_K)
-        if tail_k == block_k:
-            num_main, num_tail = pl.cdiv(width, block_k), 0
-        else:
-            num_main = width // block_k
-            num_tail = pl.cdiv(width - num_main * block_k, tail_k)
-        # tail_k divides block_k and block_k_major, so the chunks fit.
-        first = jnp.minimum(
-            lo - kv_start, block_k_major - num_main * block_k - num_tail * tail_k
+
+        def _window(g, i):
+            return kv_windows_ref[batch, (q_seq_idx * len(groups) + g) * 2 + i]
+
+        def _walk(g, groups):
+            # Only row group g's kv window [lo, hi) can hold a matching
+            # segment. Cover its part in this kv block with block_k chunks and
+            # the rest with tail_k ones, placed inside the kv block: columns
+            # they add past the window are masked like any other mismatch.
+            lo = jnp.maximum(_window(g, 0), kv_start)
+            hi = jnp.minimum(
+                _window(g, 1), kv_start + block_k_major
+            )
+            width = jnp.maximum(hi - lo, 0)
+            if tail_k == block_k:
+                num_main, num_tail = pl.cdiv(width, block_k), 0
+            else:
+                num_main = width // block_k
+                num_tail = pl.cdiv(width - num_main * block_k, tail_k)
+            # tail_k divides block_k and block_k_major, so the chunks fit.
+            first = jnp.minimum(
+                lo - kv_start, block_k_major - num_main * block_k - num_tail * tail_k
+            )
+
+            @pl.loop(0, num_main)
+            def _main(i):
+                _attend(pl.multiple_of(first + i * block_k, NUM_LANES), groups=groups)
+
+            if tail_k != block_k:
+
+                @pl.loop(0, num_tail)
+                def _tail(i):
+                    start = first + num_main * block_k + i * tail_k
+                    _attend(pl.multiple_of(start, NUM_LANES), tail_k, groups)
+
+        # Row groups with one window walk it together; a q block that
+        # straddles a segment boundary walks each group's own window instead
+        # of their union.
+        same = functools.reduce(
+            jnp.logical_and,
+            [
+                _window(g, i) == _window(0, i)
+                for g in range(1, len(groups))
+                for i in range(2)
+            ],
+            jnp.bool_(True),
         )
+        pl.when(same)(lambda: _walk(0, groups))
+        if len(groups) > 1:
 
-        @pl.loop(0, num_main)
-        def _main(i):
-            _attend(pl.multiple_of(first + i * block_k, NUM_LANES))
-
-        if tail_k != block_k:
-
-            @pl.loop(0, num_tail)
-            def _tail(i):
-                start = first + num_main * block_k + i * tail_k
-                _attend(pl.multiple_of(start, NUM_LANES), tail_k)
+            @pl.when(jnp.logical_not(same))
+            def _apart():
+                for g, group in enumerate(groups):
+                    _walk(g, [group])
 
     @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
     def store_output():
@@ -855,17 +888,27 @@ def _block_ranges(segment_ids: jax.Array, block: int) -> jax.Array:
 
 
 def _kv_windows(segment_ids: SegmentIds, block_q: int) -> jax.Array:
-    """[batch, q blocks, 2] int32: the kv columns [lo, hi) from the first to the
-    last 128-column block whose segment range meets the q block's (empty:
-    lo >= hi). Columns outside cannot match any of the q block's ids; with
-    sorted ids (packed inputs) the window holds only the q block's segments."""
-    q = _block_ranges(segment_ids.q, block_q)[:, :, None]
-    kv = _block_ranges(segment_ids.kv, NUM_LANES)[:, None]
+    """[batch, q blocks * row groups * 2] int32 (flat for SMEM): for each row
+    group of each q block, the kv columns [lo, hi) from the first to the last 128-column block
+    whose segment range meets the group's (empty: lo >= hi). Columns outside
+    cannot match any of the group's ids; with sorted ids (packed inputs) the
+    window holds only the group's segments."""
+    batch_size, seq_len = segment_ids.q.shape
+    ids = jnp.pad(segment_ids.q, ((0, 0), (0, -seq_len % block_q)), mode="edge")
+    ids = ids.reshape(batch_size, -1, block_q).astype(jnp.int32)
+    q = jnp.stack(
+        [
+            jnp.stack([ids[..., g : g + _ROW_GROUP].min(-1), ids[..., g : g + _ROW_GROUP].max(-1)], -1)
+            for g in range(0, block_q, _ROW_GROUP)
+        ],
+        axis=2,
+    )[:, :, :, None]  # [batch, q blocks, row groups, 1, 2]
+    kv = _block_ranges(segment_ids.kv, NUM_LANES)[:, None, None]
     meets = (q[..., 0] <= kv[..., 1]) & (kv[..., 0] <= q[..., 1])
-    col = jnp.arange(kv.shape[2], dtype=jnp.int32) * NUM_LANES
+    col = jnp.arange(kv.shape[3], dtype=jnp.int32) * NUM_LANES
     lo = jnp.min(jnp.where(meets, col, segment_ids.kv.shape[1]), axis=-1)
     hi = jnp.max(jnp.where(meets, col + NUM_LANES, 0), axis=-1)
-    return jnp.stack([lo, hi], axis=-1)
+    return jnp.stack([lo, hi], axis=-1).reshape(batch_size, -1)
 
 
 # For autograd testing.
