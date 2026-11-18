@@ -570,6 +570,49 @@ class TestTpuPlatform:
         ladder = [16, 32, 64, 128, 256, 512, 1024, 2048]
         assert vllm_config.compilation_config.compile_sizes == sorted(ladder + added)
 
+    @pytest.mark.parametrize(
+        ("dcp_size", "added"),
+        [(1, []), (2, [4, 8]), (16, [4, 8])],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_dcp_decode_buckets(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        dcp_size,
+        added,
+    ):
+        monkeypatch.delenv("TPU_TOKEN_BUCKET_EXTRA", raising=False)
+        monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "0")
+        vllm_config.compilation_config.compile_sizes = None
+        vllm_config.parallel_config.decode_context_parallel_size = dcp_size
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        ladder = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        assert vllm_config.compilation_config.compile_sizes == sorted(ladder + added)
+
+    def test_dcp_decode_buckets_leave_explicit_compile_sizes(self, vllm_config):
+        # An explicit --compilation-config compile_sizes is taken as given.
+        vllm_config.compilation_config.compile_sizes = [32, 16]
+        vllm_config.parallel_config.decode_context_parallel_size = 16
+
+        with (
+            patch("vllm_torchtpu.patch_registry.apply"),
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_prepare_singlehost_tpu_env"
+            ),
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.compile_sizes == [16, 32]
+
     def test_linear_token_step_at_the_served_budget(self):
         paddings = tpu_platform._get_linear_token_paddings(16384, 262144 + 8)
 
