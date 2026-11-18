@@ -20,15 +20,21 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
+    MLAAttentionSpec,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
+    _pool_attention_geometry,
     format_kv_cache_layout_summary,
     materialize_kv_cache_tensors,
+    resolve_block_major_pool_layout,
 )
-from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_tpu
+from vllm_torchtpu.kv_cache_spec_normalizer import (
+    normalize_kv_cache_specs_for_tpu,
+    stored_rows,
+)
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 
@@ -637,3 +643,174 @@ def test_attention_aliases_reject_mixed_native_shapes():
             device=torch.device("cpu"),
             cache_dtype=torch.bfloat16,
         )
+
+
+# Row-compressing full-attention groups (tokens_per_state > 1): a page stores
+# block_size // tokens_per_state rows of a block.
+
+
+def _fa(block_size, tokens_per_state=1):
+    return FullAttentionSpec(
+        block_size,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=tokens_per_state,
+    )
+
+
+def _mamba_only_config():
+    mamba = MambaSpec(block_size=256, shapes=((4, 128),), dtypes=(torch.bfloat16,))
+    return KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["m"], kv_cache_spec=mamba)],
+    )
+
+
+def _group(gid, spec):
+    return AttentionGroup(
+        backend=FakeAttentionBackend,
+        layer_names=[f"l{gid}"],
+        kv_cache_spec=spec,
+        kv_cache_group_id=gid,
+    )
+
+
+def test_split_spec_is_described_by_its_stored_rows():
+    split = _fa(512, tokens_per_state=2)
+    spec, _, kernel = _pool_attention_geometry(
+        _mamba_only_config(), [[_group(0, split)]], {0: 512}
+    )
+    assert (spec.block_size, spec.tokens_per_state, kernel) == (256, 1, 256)
+    assert spec.page_size_bytes == split.page_size_bytes
+
+
+def test_split_spec_honors_the_runner_kernel_block_size():
+    """A smaller kernel block (in tokens) maps to proportionally fewer rows."""
+    split = _fa(512, tokens_per_state=2)
+    spec, _, kernel = _pool_attention_geometry(
+        _mamba_only_config(), [[_group(0, split)]], {0: 256}
+    )
+    assert (spec.block_size, kernel) == (256, 128)
+
+
+def test_split_spec_prefers_an_unsplit_group():
+    split, plain = _fa(512, tokens_per_state=2), _fa(256)
+    spec, _, kernel = _pool_attention_geometry(
+        _mamba_only_config(),
+        [[_group(0, split)], [_group(1, plain)]],
+        {0: 512, 1: 256},
+    )
+    assert spec is plain and kernel == 256
+
+
+def test_unsplit_first_group_keeps_its_geometry():
+    plain = _fa(256)
+    spec, _, kernel = _pool_attention_geometry(
+        _mamba_only_config(), [[_group(0, plain)]], {0: 128}
+    )
+    assert spec is plain and kernel == 128
+
+
+def test_compressed_mla_spec_is_not_token_split():
+    """DSv4's MLA specs compress tokens (tokens_per_state=4); their geometry is
+    unchanged."""
+    mla = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+    )
+    spec, _, kernel = _pool_attention_geometry(
+        _mamba_only_config(), [[_group(0, mla)], [_group(1, _fa(256))]], {0: 256}
+    )
+    assert spec is mla and kernel == 256
+
+
+def test_block_major_pool_rejects_a_row_compressing_spec():
+    """The block-major layout comes from the unhalved spec, so it would not
+    match a pool allocated from the stored rows: reject the combination."""
+    split = _fa(512, tokens_per_state=2)
+    cfg = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["a"], kv_cache_spec=split)],
+    )
+    with pytest.raises(NotImplementedError, match="block-major"):
+        resolve_block_major_pool_layout(cfg, 256)
+
+
+def test_stored_rows_needs_a_whole_number_of_rows():
+    assert stored_rows(_fa(512, tokens_per_state=2)) == 256
+    assert stored_rows(_fa(512)) == 512
+    with pytest.raises(ValueError, match="not a multiple"):
+        stored_rows(_fa(512, tokens_per_state=3))
+
+
+def test_split_spec_normalizes_and_materializes_one_pool():
+    """Normalization pads the split spec to its stored rows' page, so the pool
+    allocated from the halved geometry matches it."""
+    split = FullAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        tokens_per_state=2,
+    )
+    mamba = MambaSpec(block_size=1024, shapes=[(4096,)], dtypes=[torch.bfloat16])
+    norm = normalize_kv_cache_specs_for_tpu(
+        {"model.layers.0.self_attn": split, "model.layers.1.mamba": mamba},
+        torch.float8_e4m3fn,
+        enable_unified_kv_layout=True,
+        attention_backend=PallasAttentionBackend,
+    )
+    norm_attn = norm["model.layers.0.self_attn"]
+    norm_mamba = norm["model.layers.1.mamba"]
+    rows_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+        512, 1, 128, torch.float8_e4m3fn
+    )
+    assert norm_attn.page_size_bytes == rows_page
+    assert norm_mamba.page_size_bytes == rows_page
+
+    num_blocks = 2
+    names = ["model.layers.0.self_attn", "model.layers.1.mamba"]
+    cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=rows_page * num_blocks,
+                layers=[name],
+                layer_stride=rows_page * num_blocks,
+                block_stride=rows_page,
+            )
+            for name in names
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[names[0]], kv_cache_spec=norm_attn),
+            KVCacheGroupSpec(layer_names=[names[1]], kv_cache_spec=norm_mamba),
+        ],
+    )
+    attn_groups = [
+        [
+            AttentionGroup(
+                backend=PallasAttentionBackend,
+                layer_names=[name],
+                kv_cache_spec=spec,
+                kv_cache_group_id=gid,
+            )
+        ]
+        for gid, (name, spec) in enumerate(zip(names, (norm_attn, norm_mamba)))
+    ]
+    materialized = materialize_kv_cache_tensors(
+        kv_cache_config=cfg,
+        attn_groups=attn_groups,
+        kernel_block_sizes=[1024, 1024],
+        device=torch.device("cpu"),
+        cache_dtype="fp8",
+    )
+    assert len(materialized.raw_tensors) == 1
+    pool = materialized.raw_tensors[0]
+    assert materialized.kv_caches[names[0]] is pool
+    assert materialized.kv_caches[names[1]] == [pool]
