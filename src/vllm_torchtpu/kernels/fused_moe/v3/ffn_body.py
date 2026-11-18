@@ -302,17 +302,6 @@ def stage_tile(ctx, slot, result, result_scales):
                 ctx.scratch.result_scales[i] = result_scales
 
 
-def slot_and_pending(ctx, carry):
-    """The result slot the next tile stages in and the block count its last
-    commit is still draining (zero after a drain)."""
-    tile_count, *pending = carry
-    slot = lax.rem(tile_count, jnp.int32(ctx.b.result_slots))
-    pending_here = pending[0]
-    for i in range(1, ctx.b.result_slots):
-        pending_here = jnp.where(slot == i, pending[i], pending_here)
-    return slot, pending_here
-
-
 def drain_commits(ctx, carry):
     """Wait for every result slot with commits still pending."""
     tile_count, *pending = carry

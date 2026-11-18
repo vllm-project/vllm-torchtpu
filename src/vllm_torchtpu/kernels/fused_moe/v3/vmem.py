@@ -130,6 +130,8 @@ def tile_body_arrays(
         ("mid_fp8", (tile_rows, inter), FP8),
         ("acc2", (tile_rows, hidden), jnp.float32),
         ("down_bf16", (tile_rows, hidden), jnp.bfloat16),
+        # Counted as fp8 for bf16 result rows too: those are down_bf16
+        # itself, already counted, so the sum stays an upper bound.
         ("result_rows", (tile_rows, hidden), FP8),
     ]
     if not form.has_scales:
@@ -155,14 +157,12 @@ def estimate_bytes(
     no_gate=False,
     activation_block=0,
     result_dtype=FP8,
-    info=None,
     token_block=None,
 ):
     """VMEM one built kernel occupies, an upper bound from the arrays it
     declares and the values its tile body holds. Reads the chip's lane
     count and sublane tiling off the device record."""
-    if info is None:
-        info = pltpu.get_tpu_info()
+    info = pltpu.get_tpu_info()
     arrays = scratch_arrays(
         experts_per_shard,
         tile_rows,
