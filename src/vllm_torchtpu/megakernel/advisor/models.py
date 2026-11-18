@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import gcd
 from pathlib import Path
@@ -26,6 +26,7 @@ from ..core import errors
 from .constants import (
     BITS_FP4,
     BITS_FP8,
+    DEFAULT_DECLARED_PHASES,
     KDA_MODEL_TYPES,
     MIN_HEAD_DIM,
     MIN_INTERVAL,
@@ -876,6 +877,7 @@ class DeploymentPreset:
     prefill: ParallelLayout
     saturation: ParallelLayout | None = None
     prefill_windows: tuple[int, ...] = ()
+    megakernel_layouts: tuple[ParallelLayout, ...] = ()
 
 
 def _int_tuple(raw: object, field_name: str) -> tuple[int, ...]:
@@ -944,6 +946,77 @@ def _parse_parallel_layout(raw: Mapping[str, object]) -> ParallelLayout:
     )
 
 
+def _declared_strings(raw: object) -> tuple[str, ...]:
+    """Return string entries from a declaration sequence field."""
+    seq = _as_sequence(raw)
+    if seq is None:
+        return ()
+    return tuple(item for item in seq if type(item) is str and item)
+
+
+def validate_declared_layouts(slug: str, preset: DeploymentPreset) -> None:
+    """Reject duplicate megakernel declarations sharing layout, scope, and phase."""
+    seen_keys: set[tuple[tuple[int, int, int, int, int], str, str]] = set()
+    all_layouts = (
+        preset.decode,
+        preset.prefill,
+        preset.saturation,
+        *preset.megakernel_layouts,
+    )
+    for layout in all_layouts:
+        if layout is None or layout.megakernel is None:
+            continue
+        declaration = layout.megakernel
+        if not str(declaration.get("source", "")).strip():
+            continue
+        axis_key = (layout.tp, layout.ep, layout.dp, layout.pp, layout.dcp)
+        scopes = _declared_strings(declaration.get("scopes"))
+        phases = _declared_strings(declaration.get("phases")) or DEFAULT_DECLARED_PHASES
+        block_keys = {(axis_key, scope, phase) for scope in scopes for phase in phases}
+        overlapping_keys = seen_keys & block_keys
+        if overlapping_keys:
+            _, dup_scope, dup_phase = min(overlapping_keys)
+            msg = (
+                f"Duplicate megakernel declaration in {slug!r} on {layout.label()} "
+                f"for scope={dup_scope!r}, phase={dup_phase!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        seen_keys.update(block_keys)
+
+
+def _parse_megakernel_layouts(slug: str, raw: object) -> tuple[ParallelLayout, ...]:
+    """Parse optional megakernel_layouts entries for a deployment preset."""
+    if raw is None:
+        return ()
+    match raw:
+        case str() | bytes() | bytearray():
+            seq = None
+        case Sequence():
+            seq = tuple(raw)
+        case _:
+            seq = None
+    if seq is None:
+        msg = f"deployments.json {slug!r} megakernel_layouts must be a sequence"
+        raise errors.MegakernelConfigError(msg)
+    layouts: list[ParallelLayout] = []
+    for idx, item in enumerate(seq):
+        item_map = _as_mapping(item)
+        if item_map is None:
+            msg = (
+                f"deployments.json {slug!r} megakernel_layouts[{idx}] must be a mapping"
+            )
+            raise errors.MegakernelConfigError(msg)
+        layout = _parse_parallel_layout(item_map)
+        if layout.megakernel is None:
+            msg = (
+                f"deployments.json {slug!r} megakernel_layouts[{idx}] "
+                "requires a 'megakernel' block"
+            )
+            raise errors.MegakernelConfigError(msg)
+        layouts.append(layout)
+    return tuple(layouts)
+
+
 def _load_deployment_presets() -> tuple[
     Mapping[str, DeploymentPreset], Mapping[str, str]
 ]:
@@ -957,12 +1030,16 @@ def _load_deployment_presets() -> tuple[
         sat_map = _as_mapping(entry.get("saturation"))
         sat = _parse_parallel_layout(sat_map) if sat_map is not None else None
         windows = _int_tuple(entry.get("prefill_windows"), "prefill_windows")
-        deps[slug] = DeploymentPreset(
+        mk_layouts = _parse_megakernel_layouts(slug, entry.get("megakernel_layouts"))
+        preset = DeploymentPreset(
             decode=_parse_parallel_layout(entry["decode"]),
             prefill=_parse_parallel_layout(entry["prefill"]),
             saturation=sat,
             prefill_windows=windows,
+            megakernel_layouts=mk_layouts,
         )
+        validate_declared_layouts(slug, preset)
+        deps[slug] = preset
     return deps, sources
 
 

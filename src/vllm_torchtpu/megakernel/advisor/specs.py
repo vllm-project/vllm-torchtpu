@@ -19,13 +19,17 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from math import log2
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, TypedDict
 
 from ..core import errors
 from . import chips, constants
-from .constants import EFFICIENCY_BRACKETS, MEASUREMENTS_SCHEMA
+from .constants import (
+    COLLECTIVE_PATH_XLA,
+    EFFICIENCY_BRACKETS,
+    MEASUREMENTS_SCHEMA,
+    VALID_COLLECTIVE_PATHS,
+)
 from .models import ModelProfile, ParallelLayout
 
 if TYPE_CHECKING:
@@ -123,6 +127,18 @@ def default_double_buffer_ring_plan(dma_buffers: int = 2) -> RingPlan:
 
 
 @dataclass(frozen=True)
+class CollectiveCall:
+    """One measured collective: where it ran, which op, across how many ranks."""
+
+    path: str  # "xla" (an XLA op) or "in_kernel" (inside a fused call)
+    op: str
+    group_size: int
+    latency_us: float
+    n: int
+    mean_latency_us: float | None = None  # mean per call; charged when present
+
+
+@dataclass(frozen=True)
 class MeasurementsData:
     """Calibrated runtime measurements loaded from an `advisor.measurements.v1` file."""
 
@@ -131,8 +147,7 @@ class MeasurementsData:
     launch_gap_p50_us: float | None = None
     launch_gap_p90_us: float | None = None
     launch_gap_n: int = 0
-    collective_hop_us: float | None = None
-    collective_n: int = 0
+    collective_calls: tuple[CollectiveCall, ...] = ()
     step_coverage: float | None = None
     step_time_us: float | None = None
     dcn_bw_gbps: float | None = None
@@ -159,42 +174,81 @@ def _scalar_str(val: object, field_name: str) -> str:
     return val
 
 
-def _parse_collectives_hop_us(coll_raw: object) -> tuple[float | None, int]:
-    """Extract minimum per-hop collective latency and count from collectives."""
+def _parse_one_collective_call(
+    idx: int, entry: Mapping[str, object]
+) -> CollectiveCall | None:
+    """Validate and normalize one collective call mapping from JSON."""
+    if "latency_us" not in entry:
+        return None
+    latency_us = _scalar_float(entry["latency_us"], f"collectives[{idx}].latency_us")
+    if latency_us < 0.0:
+        msg = f"collectives[{idx}].latency_us must be >= 0"
+        raise errors.MegakernelConfigError(msg)
+    grp_raw = entry.get("group_size", 2)
+    group_size = max(2, _scalar_int(grp_raw, f"collectives[{idx}].group_size"))
+    n_raw = entry.get("n", 1)
+    n_val = _scalar_int(n_raw, f"collectives[{idx}].n")
+    if n_val < 0:
+        msg = f"collectives[{idx}].n must be >= 0"
+        raise errors.MegakernelConfigError(msg)
+    op_raw = entry.get("op")
+    op_norm = (
+        ""
+        if op_raw is None
+        else _scalar_str(op_raw, f"collectives[{idx}].op")
+        .strip()
+        .lower()
+        .replace("_", "-")
+    )
+    path_raw = entry.get("path")
+    path_val = (
+        COLLECTIVE_PATH_XLA
+        if path_raw is None
+        else _scalar_str(path_raw, f"collectives[{idx}].path")
+    )
+    if path_val not in VALID_COLLECTIVE_PATHS:
+        msg = (
+            f"collectives[{idx}].path must be one of "
+            f"{sorted(VALID_COLLECTIVE_PATHS)}, got {path_val!r}"
+        )
+        raise errors.MegakernelConfigError(msg)
+    mean_raw = entry.get("mean_latency_us")
+    mean_latency_us: float | None = None
+    if mean_raw is not None:
+        mean_latency_us = _scalar_float(mean_raw, f"collectives[{idx}].mean_latency_us")
+        if mean_latency_us < 0.0:
+            msg = f"collectives[{idx}].mean_latency_us must be >= 0"
+            raise errors.MegakernelConfigError(msg)
+    return CollectiveCall(
+        path=path_val,
+        op=op_norm,
+        group_size=group_size,
+        latency_us=latency_us,
+        n=n_val,
+        mean_latency_us=mean_latency_us,
+    )
+
+
+def _parse_collective_calls(coll_raw: object) -> tuple[CollectiveCall, ...]:
+    """Parse and normalize measured collective call entries from JSON."""
     if coll_raw is None:
-        return None, 0
+        return ()
     if type(coll_raw) is not list:
         msg = f"collectives must be a list, got {type(coll_raw).__name__}"
         raise errors.MegakernelConfigError(msg)
     if not coll_raw:
-        return None, 0
-    hops_list: list[float] = []
-    coll_n = 0
+        return ()
+    calls: list[CollectiveCall] = []
     for idx, item in enumerate(coll_raw):
         match item:
             case Mapping() as entry:
-                if "latency_us" not in entry:
-                    continue
-                latency_us = _scalar_float(
-                    entry["latency_us"], f"collectives[{idx}].latency_us"
-                )
-                if latency_us < 0.0:
-                    msg = f"collectives[{idx}].latency_us must be >= 0"
-                    raise errors.MegakernelConfigError(msg)
-                grp_raw = entry.get("group_size", 2)
-                grp = max(2, _scalar_int(grp_raw, f"collectives[{idx}].group_size"))
-                n_raw = entry.get("n", 1)
-                n_val = _scalar_int(n_raw, f"collectives[{idx}].n")
-                if n_val < 0:
-                    msg = f"collectives[{idx}].n must be >= 0"
-                    raise errors.MegakernelConfigError(msg)
-                hops = max(1, round(log2(grp)))
-                hops_list.append(latency_us / hops)
-                coll_n += n_val
+                call = _parse_one_collective_call(idx, entry)
+                if call is not None:
+                    calls.append(call)
             case _:
                 msg = f"collectives[{idx}] must be a mapping"
                 raise errors.MegakernelConfigError(msg)
-    return (min(hops_list) if hops_list else None), coll_n
+    return tuple(calls)
 
 
 def _parse_ring_plan(ring_plan_raw: object) -> RingPlan | None:
@@ -328,7 +382,7 @@ def load_measurements(
     src_desc = f"{src_kind}:{src_file}"
 
     lg_p50, lg_p90, lg_n = _parse_launch_gap(payload)
-    coll_hop, coll_n = _parse_collectives_hop_us(payload.get("collectives"))
+    collective_calls = _parse_collective_calls(payload.get("collectives"))
 
     cov_map = _optional_mapping(payload.get("step_coverage"), "step_coverage")
     cov_val = (
@@ -357,8 +411,7 @@ def load_measurements(
         launch_gap_p50_us=lg_p50,
         launch_gap_p90_us=lg_p90,
         launch_gap_n=lg_n,
-        collective_hop_us=coll_hop,
-        collective_n=coll_n,
+        collective_calls=collective_calls,
         step_coverage=cov_val,
         step_time_us=st_val,
         dcn_bw_gbps=dcn_val,
