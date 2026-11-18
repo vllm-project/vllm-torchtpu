@@ -125,6 +125,50 @@ def hp_prefill_kernel_kwargs() -> dict:
     return kw
 
 
+ROW_SPLIT_ENV = "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT"
+ROUND_CAPACITY_ENV = "TPU_MINIMAX_M3_DCP_HP_ROUND_CAPACITY"
+_hp_balance_logged = False
+
+
+def hp_row_split() -> bool:
+    """TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: the replicas of a KV head split the
+    head-parallel rows (`_split_rows_attend`) instead of its query heads."""
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT.strip().lower()
+    if spec in ("", "0", "off", "false"):
+        return False
+    if spec in ("1", "on", "true"):
+        return True
+    raise ValueError(f"{ROW_SPLIT_ENV}={spec!r}: want 0 or 1")
+
+
+def hp_round_capacity() -> int:
+    """TPU_MINIMAX_M3_DCP_HP_ROUND_CAPACITY: logical blocks per exchange
+    round, in max-length requests (>= 1)."""
+    from vllm_torchtpu import envs
+
+    factor = int(envs.TPU_MINIMAX_M3_DCP_HP_ROUND_CAPACITY)
+    if factor < 1:
+        raise ValueError(f"{ROUND_CAPACITY_ENV}={factor}: want >= 1")
+    return factor
+
+
+def _log_hp_balance(row_split: bool, factor: int) -> None:
+    global _hp_balance_logged
+    if _hp_balance_logged or not (row_split or factor > 1):
+        return
+    _hp_balance_logged = True
+    init_logger(__name__).warning(
+        "Head-parallel MSA prefill: %s=%d (replica row split), %s=%d "
+        "(round capacity in max-length requests).",
+        ROW_SPLIT_ENV,
+        int(row_split),
+        ROUND_CAPACITY_ENV,
+        factor,
+    )
+
+
 def uses_dcp_attention(
     num_tokens: int,
     max_num_seqs: int,
@@ -464,6 +508,114 @@ def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
     return selected
 
 
+# Cost of a tile with no page relative to one kernel step of pages (c64
+# j-ec09b70c: an empty 16-row tile ~0.14 us, a 16-page step ~0.9 us).
+_EMPTY_TILE_COST = 0.15
+
+
+def split_window(num_tokens: int, block_q: int) -> int:
+    """Rows of each replica's window in a replica row split: a split point
+    ``s`` in ``[T - W, W]`` (block-aligned) gives replica 0 rows ``[0, s)``
+    of window ``[0, W)`` and replica 1 rows ``[s, T)`` of ``[T - W, T)``.
+    ``W = T - floor(3T/8)`` (to the block), 0 when the step does not split."""
+    if num_tokens % block_q or num_tokens < 4 * block_q:
+        return 0
+    return num_tokens - (3 * num_tokens // 8) // block_q * block_q
+
+
+def tile_costs(keys: jax.Array, local: jax.Array, block_q: int, pages_per_step: int):
+    """Modelled kernel cost of each ``block_q``-row tile of ``keys [T, K]``
+    (page slots, ``-1`` none) and ``local [T]``: one kernel step per
+    ``pages_per_step`` distinct pages of the tile, plus a small fixed cost.
+    Rows of one tile share each page they all select, so distinct pages,
+    not selected blocks, set a tile's steps."""
+    num_tokens = keys.shape[0]
+    tiles = num_tokens // block_q
+    k = jnp.concatenate([keys, local[:, None]], axis=1).reshape(tiles, -1)
+    k = jnp.sort(k, axis=1)
+    first = jnp.concatenate([jnp.ones_like(k[:, :1], bool), k[:, 1:] != k[:, :-1]], 1)
+    distinct = jnp.sum(first & (k >= 0), axis=1)
+    steps = -(-distinct // pages_per_step)
+    return _EMPTY_TILE_COST + steps.astype(jnp.float32)
+
+
+def split_point(costs: jax.Array, block_q: int, window: int) -> jax.Array:
+    """The row where replica 1's share starts: the tile boundary nearest an
+    even split of `costs` (per tile), clamped to ``[T - window, window]``."""
+    num_tokens = costs.shape[0] * block_q
+    csum = jnp.cumsum(costs)
+    # Tiles before the boundary: the first prefix reaching half the total.
+    tiles = jnp.searchsorted(csum, csum[-1] * 0.5, side="left", method="compare_all")
+    s = (tiles + 1) * block_q
+    return jnp.clip(s, num_tokens - window, window).astype(jnp.int32)
+
+
+def _split_rows_attend(
+    attend,
+    q,
+    kv,
+    keys,
+    local,
+    limit,
+    page_table,
+    *,
+    axis,
+    rank,
+    dcp,
+    block_q,
+    pages_per_step,
+):
+    """`attend` (`msa_attention_lse.msa_sparse_attention_lse`, head-major
+    out) of this rank's rows ``q [T, Hl, D]`` with the KV head's other
+    replica (rank ``rank ^ 1``) sharing the rows instead of the heads: each
+    replica attends all ``2 * Hl`` query heads of the KV head over its own
+    rows (`split_point` of the modelled `tile_costs`), so the head's tiles
+    and page steps run once per pair. Returns ``[Hl, T, D]``, this rank's
+    heads for every row, as one call over ``q`` would (same tiles: the
+    windows start on tile boundaries).
+
+    The pair swaps static windows (`split_window`) by collective permutes:
+    the partner's heads of this replica's window rows before the call, and
+    this rank's heads of the partner's rows after it."""
+    num_tokens, num_heads, _ = q.shape
+    window = split_window(num_tokens, block_q)
+    replica = rank % 2
+    lo = num_tokens - window  # replica 1's window start
+    s = split_point(tile_costs(keys, local, block_q, pages_per_step), block_q, window)
+    perm = [(i, i ^ 1) for i in range(dcp)]
+    start_mine = replica * lo
+    start_peer = (1 - replica) * lo
+    q_hm = q.transpose(1, 0, 2)  # [Hl, T, D]
+    recv = jax.lax.ppermute(
+        jax.lax.dynamic_slice_in_dim(q_hm, start_peer, window, 1), axis, perm
+    )
+    mine = jax.lax.dynamic_slice_in_dim(q_hm, start_mine, window, 1)
+    first = replica == 0
+    # Replica 0 holds the KV head's first Hl query heads.
+    q2 = jnp.concatenate(
+        [jnp.where(first, mine, recv), jnp.where(first, recv, mine)], axis=0
+    )
+    rows = start_mine + jnp.arange(window, dtype=jnp.int32)
+    own = jnp.where(first, rows < s, rows >= s)
+
+    def sl(x):
+        return jax.lax.dynamic_slice_in_dim(x, start_mine, window, 0)
+
+    k_w = jnp.where(own[:, None], sl(keys), -1)
+    l_w = jnp.where(own, sl(local), -1)
+    out2, _ = attend(q2, kv, k_w, l_w, sl(limit), page_table, q_head_major=True)
+    head0 = replica * num_heads
+    out_mine = jax.lax.dynamic_slice_in_dim(out2, head0, num_heads, 0)
+    out_peer = jax.lax.dynamic_slice_in_dim(out2, num_heads - head0, num_heads, 0)
+    got = jax.lax.ppermute(out_peer, axis, perm)  # my heads of the partner's rows
+    zeros = jnp.zeros((num_heads, num_tokens, q.shape[2]), out2.dtype)
+    full_mine = jax.lax.dynamic_update_slice_in_dim(zeros, out_mine, start_mine, 1)
+    full_peer = jax.lax.dynamic_update_slice_in_dim(zeros, got, start_peer, 1)
+    t = jnp.arange(num_tokens, dtype=jnp.int32)
+    mine_rows = jnp.where(first, t < s, t >= s)
+    return jnp.where(mine_rows[None, :, None], full_mine, full_peer)
+
+
 def _head_parallel_attend(
     q,
     kv_cache,
@@ -495,8 +647,17 @@ def _head_parallel_attend(
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
-    capacity = block_tables_2d.shape[1]  # logical blocks per round
+    width = block_tables_2d.shape[1]  # one max-length request
+    factor = hp_round_capacity()
+    capacity = width * factor  # logical blocks per round
     replicas = kv_head_replicas
+    kernel_kw = hp_prefill_kernel_kwargs()
+    row_split = (
+        hp_row_split()
+        and replicas == 2
+        and split_window(num_tokens, kernel_kw["block_q"]) > 0
+    )
+    _log_hp_balance(row_split, factor)
     part = -(-capacity // replicas)  # each replica's share of the buffer
 
     selected = _own_selection(
@@ -541,7 +702,7 @@ def _head_parallel_attend(
         logical = buf % part * replicas + buf // part
         q_of = jnp.searchsorted(csum, logical, side="right", method="compare_all")
         q_of = jnp.minimum(q_of, max_num_seqs - 1)
-        j = jnp.clip(logical - base[q_of], 0, capacity - 1)
+        j = jnp.clip(logical - base[q_of], 0, width - 1)
         pages = jnp.where(logical < total, block_tables_2d[q_of, j], 0)
         kv, sc = _exchange_pages(
             kv_cache,
@@ -575,7 +736,7 @@ def _head_parallel_attend(
         attend = functools.partial(
             msa_attention_lse.msa_sparse_attention_lse,
             sm_scale=sm_scale,
-            **hp_prefill_kernel_kwargs(),
+            **kernel_kw,
             head=0,
             scale_cache=sc,
             k_scale_row=0,
@@ -583,6 +744,25 @@ def _head_parallel_attend(
             head_major=True,
             interpret=interpret,
         )
+        if row_split:
+            # One call per replica over its share of every row (the round's
+            # rows only have pages); later rounds keep the earlier rounds'
+            # rows.
+            out = _split_rows_attend(
+                attend,
+                q,
+                kv,
+                keys,
+                local,
+                limit,
+                page_table,
+                axis=axis,
+                rank=rank,
+                dcp=dcp,
+                block_q=kernel_kw["block_q"],
+                pages_per_step=kernel_kw["pages_per_step"],
+            )
+            return out if not merge else jnp.where(mine[None, :, None], out, acc)
         if not merge:
             # One call over every row: the kernel chunks the rows and writes
             # its output in place; rows outside the round see no page and

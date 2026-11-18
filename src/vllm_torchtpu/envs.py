@@ -256,6 +256,9 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
     TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE: str = ""
+    TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: str = ""
+    TPU_MINIMAX_M3_DCP_HP_ROUND_CAPACITY: int = 1
+    TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR: bool = True
 
 
 def env_with_choices(
@@ -1639,6 +1642,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Lossy. Prefill steps are unchanged.
     "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE": env_str(
         "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE", ""
+    ),
+    # MiniMax M3 head-parallel DCP prefill attention (`msa_dcp_heads`): the
+    # two TP replicas of a KV head (one chip's cores at TP 8) split the
+    # prefill rows instead of the query heads. Each runs one kernel pass of
+    # all the head's query heads (16) over its share of the rows, so a KV
+    # head's tiles and page steps are paid once per pair instead of twice;
+    # the split point balances the pair by a per-tile cost model (distinct
+    # selected pages per tile). The pair swaps queries and outputs of a
+    # 5/8-step row window by collective permutes. "1" = on; empty/"0" = off.
+    # Needs two replicas per KV head; other layouts keep the default path.
+    "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT": env_str("TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT", ""),
+    # MiniMax M3 head-parallel DCP prefill attention: logical blocks per page
+    # exchange round, as a multiple of one max-length request (default 1).
+    # A step whose prefill requests hold more blocks than a round runs a
+    # second round under a cond (a second exchange, a while loop of 2,048-row
+    # windows with their own work lists and page-cache sorts, and an
+    # in-place merge); 2..4 fit most c64 steps in one round. The exchange
+    # buffer grows by the factor (~32 MB a unit at DCP 8 / 4); only live
+    # pages move. Not bit-identical (tiles group rows differently).
+    "TPU_MINIMAX_M3_DCP_HP_ROUND_CAPACITY": env_int(
+        "TPU_MINIMAX_M3_DCP_HP_ROUND_CAPACITY", 1
+    ),
+    # MiniMax M3 MSA DCP over several KV heads: gather the group's K/V/index
+    # queries lane-dense ([T, 3 * D] rows) and hand the scoring op the
+    # gathered rows head-major (a free view) instead of three token-major
+    # [T, G, D] copies; the op splits them. Same values bit for bit; drops
+    # the relayout copies at the op boundary (export.py copy_/reshape,
+    # ~0.18 ms per layer at c64 8K steps). Default on; "0" restores the old
+    # path.
+    "TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR": env_bool(
+        "TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR", True
     ),
 }
 
