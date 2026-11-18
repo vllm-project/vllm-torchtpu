@@ -186,12 +186,23 @@ class _Input:
     source: Any  # torch._dynamo.source.Source, or None
 
 
+def _graph_input_source(node: fx.Node) -> Any:
+    """The Dynamo source of a graph input, or None for a placeholder that is
+    not one. Dynamo records a lifted input's GraphArg under
+    ``meta["grapharg"]``, and torch's ``split_module`` copies a placeholder's
+    meta into every subgraph that takes it, while a split subgraph's
+    intermediates carry the meta of the node that computed them, which has
+    no GraphArg."""
+    grapharg = node.meta.get("grapharg")
+    return grapharg.source if grapharg is not None else None
+
+
 def _inputs(graph: fx.GraphModule) -> list[_Input]:
     return [
         _Input(
             node.name,
             _placeholder_value(node),
-            getattr(node.meta.get("grapharg"), "source", None),
+            _graph_input_source(node),
         )
         for node in _placeholder_nodes(graph)
     ]
@@ -263,13 +274,7 @@ def _input_source(graph_input: _Input) -> str | None:
     or None for a placeholder that is not a Dynamo graph input, such as a
     split subgraph's intermediate."""
     source = graph_input.source
-    return None if source is None else _source_name(source)
-
-
-def _source_name(source: Any) -> str:
-    # torch 2.9 made Source.name a property; it was a method before.
-    name = source.name
-    return name() if callable(name) else name
+    return None if source is None else source.name
 
 
 def _symbol_sources(value: Any) -> str | None:
@@ -281,7 +286,7 @@ def _symbol_sources(value: Any) -> str | None:
         sources = value.node.shape_env.var_to_sources.get(expr)
     except AttributeError:
         return None
-    return ", ".join(_source_name(s) for s in sources) if sources else None
+    return ", ".join(s.name for s in sources) if sources else None
 
 
 def _describe_input(graph_input: _Input) -> str:
@@ -315,7 +320,7 @@ def _symbol_fate(
     if shape_env is None:
         return None
     for symbol, sources in shape_env.var_to_sources.items():
-        if any(_source_name(s) == source for s in sources):
+        if any(s.name == source for s in sources):
             replacement = shape_env.replacements.get(symbol)
             if replacement is not None:
                 return f"{symbol} = {replacement} in {trace}"
@@ -388,8 +393,10 @@ def _input_delta(stored: Sequence[_Input], current: Sequence[_Input]) -> str:
 def _handover_error(key: str, delta: str) -> ShapeSpecializationError:
     return ShapeSpecializationError(
         f"{key} was compiled by another trace of this model whose inputs "
-        f"differ beyond a reordering ({delta}). Either the graph is split, so "
-        "its subgraph boundaries move with the specialization, or the two "
+        f"cannot be matched to this trace's ({delta}): named graph inputs are "
+        "matched by name, the rest by position, dtype and shape. Either the "
+        "graph is split, so its subgraph boundaries move with the "
+        "specialization, or the two "
         "sides of a token-count branch lift different buffers; a bucket cannot "
         "be handed between such traces. Give both sides of the branch the same "
         "inputs, or unset TPU_KERNEL_ITER_MODE to serve this model."
