@@ -85,8 +85,10 @@ def test_select_top_k_breaks_ties_toward_the_lower_expert(interpret):
     np.testing.assert_array_equal(np.asarray(indices)[:, :3], [[5, 9, 40]] * 8)
 
 
-def test_select_top_k_routes_rows_past_the_valid_count_nowhere(interpret):
-    """Rows past valid_tokens, and a row with a NaN logit, get weight zero;
+@pytest.mark.parametrize("renormalize", [False, True], ids=["raw", "renormalized"])
+def test_select_top_k_routes_rows_past_the_valid_count_nowhere(interpret, renormalize):
+    """Rows past valid_tokens get weight zero, raw or renormalized, and so
+    does a row with a NaN logit under drop_nan_rows (renormalized only);
     the other rows are unchanged."""
     logits = _logits(32, 64)
     logits[3, 7] = np.nan
@@ -95,19 +97,34 @@ def test_select_top_k_routes_rows_past_the_valid_count_nowhere(interpret):
         jnp.asarray(logits),
         top_k=4,
         block_rows=8,
-        renormalize=True,
-        drop_nan_rows=True,
+        renormalize=renormalize,
+        drop_nan_rows=renormalize,
         valid_tokens=jnp.asarray([valid], jnp.int32),
     )
     weights = np.asarray(weights)
     assert not weights[valid:].any()
-    assert not weights[3].any()
+    if renormalize:
+        assert not weights[3].any()
     kept = [r for r in range(valid) if r != 3]
     values, want_indices = jax.lax.top_k(jnp.asarray(logits[kept]), 4)
     np.testing.assert_array_equal(np.asarray(indices)[kept], np.asarray(want_indices))
-    np.testing.assert_allclose(
-        weights[kept], jax.nn.softmax(values, axis=-1), rtol=1e-6, atol=0
-    )
+    if renormalize:
+        want = jax.nn.softmax(values, axis=-1)
+        np.testing.assert_allclose(weights[kept], want, rtol=1e-6, atol=0)
+    else:
+        np.testing.assert_array_equal(weights[kept], np.asarray(values))
+
+
+def test_select_top_k_refuses_drop_nan_rows_on_raw_scores():
+    """drop_nan_rows changes which rows route; raw scores would ignore it."""
+    with pytest.raises(ValueError, match="drop_nan_rows"):
+        select_kernel.select_top_k(
+            jnp.zeros((8, 64), jnp.float32),
+            top_k=4,
+            block_rows=8,
+            renormalize=False,
+            drop_nan_rows=True,
+        )
 
 
 def test_select_top_k_routing_message_marks_rows_past_the_valid_count(interpret):
