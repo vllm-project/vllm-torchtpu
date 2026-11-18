@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sequence-parallel Qwen3-VL vision tower for large inputs.
+"""Sequence-parallel Qwen3-VL vision tower.
 
 The TP tower replicates every patch row on all ranks and all-reduces the
 [patches, 1152] activation twice per layer: on a 20900-patch image that is 37%
@@ -24,10 +24,11 @@ row blocks of whole merge groups keep it local; the merged features are
 all-gathered once at the end. Each rank also moves only its rows of the pixels
 to the device.
 
-Opt in with ``TPU_SP_VISION_MIN_PATCHES``: vision calls with at least that many
-patches run this way and smaller ones keep the TP tower, which costs less
-below that size. The replica costs (tp - 1)/tp of the tower's projection
-weights per rank.
+Opt in with ``TPU_SP_VISION``; it serves every tower call, eager and the
+compiled encoder buckets alike. A one-layer bench on v7x-8 has it ahead of TP
+at every size, from 66 vs 125 us per layer (excluding attention) at 1024
+patches to 536 vs 1550 at 20992. The replica costs (tp - 1)/tp of the tower's
+projection weights per rank.
 """
 
 from typing import TYPE_CHECKING, Any, Optional
@@ -57,9 +58,9 @@ _UPSTREAM_FORWARD = None
 def maybe_patch_qwen3_vl_sp_vision(
     model_config: Optional["ModelConfig"] = None,
 ) -> bool | None:
-    """Route the Qwen3-VL vision tower's large calls to sequence parallel."""
+    """Route the Qwen3-VL vision tower to sequence parallel."""
     global _UPSTREAM_FORWARD
-    if not envs.TPU_SP_VISION_MIN_PATCHES:
+    if not envs.TPU_SP_VISION:
         return None
     if model_config is None:
         return False
@@ -84,35 +85,30 @@ def _vision_forward(
     encoder_metadata: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     sp = getattr(self, "sp_vision", None)
-    if sp is not None and encoder_metadata is None and sp.serves(x.shape[0]):
-        return sp(self, x, grid_thw)
+    if sp is not None:
+        return sp(self, x, grid_thw, encoder_metadata)
     return _UPSTREAM_FORWARD(self, x, grid_thw, encoder_metadata=encoder_metadata)
 
 
 def maybe_install(model: nn.Module) -> None:
     """Give the loaded model's vision tower its weight replica; no-op when off."""
-    min_patches = envs.TPU_SP_VISION_MIN_PATCHES
-    if not min_patches:
+    if not envs.TPU_SP_VISION:
         return
     if _UPSTREAM_FORWARD is None:
         raise ValueError(
-            "TPU_SP_VISION_MIN_PATCHES is set, but the model has no Qwen3-VL "
-            "vision tower."
+            "TPU_SP_VISION is set, but the model has no Qwen3-VL vision tower."
         )
     from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
 
     towers = [m for m in model.modules() if isinstance(m, Qwen3_VisionTransformer)]
     if len(towers) != 1:
         raise ValueError(
-            "TPU_SP_VISION_MIN_PATCHES needs one Qwen3-VL vision tower, got "
-            f"{len(towers)}."
+            f"TPU_SP_VISION needs one Qwen3-VL vision tower, got {len(towers)}."
         )
     tower = towers[0]
-    tower.sp_vision = SequenceParallelVision(tower, min_patches)
+    tower.sp_vision = SequenceParallelVision(tower)
     logger.info(
-        "Sequence-parallel vision tower from %d patches: %.2f GiB of replicated "
-        "weights per rank.",
-        min_patches,
+        "Sequence-parallel vision tower: %.2f GiB of replicated weights per rank.",
         sum(b.numel() * b.element_size() for b in tower.sp_vision.buffers()) / 2**30,
     )
 
@@ -120,14 +116,13 @@ def maybe_install(model: nn.Module) -> None:
 class SequenceParallelVision(nn.Module):
     """The vision tower forward over this rank's rows with every rank's weights."""
 
-    def __init__(self, tower: nn.Module, min_patches: int) -> None:
+    def __init__(self, tower: nn.Module) -> None:
         super().__init__()
         self.exchange = RowExchange(tower.device)
         if self.exchange.world == 1 or tower.tp_size != self.exchange.world:
             raise ValueError(
-                "TPU_SP_VISION_MIN_PATCHES needs a TP-sharded vision tower with TP > 1."
+                "TPU_SP_VISION needs a TP-sharded vision tower with TP > 1."
             )
-        self.min_patches = min_patches
         # Row blocks of whole merge groups, so the patch merger stays local.
         self.row_multiple = self.exchange.world * tower.spatial_merge_unit
         others = self.exchange.others
@@ -137,19 +132,19 @@ class SequenceParallelVision(nn.Module):
             _MergerShards(m, others) for m in tower.deepstack_merger_list
         )
 
-    def serves(self, num_patches: int) -> bool:
-        return num_patches >= self.min_patches
-
     def forward(
         self,
         tower: nn.Module,
         x: torch.Tensor,
-        grid_thw: torch.Tensor | list[list[int]],
+        grid_thw: torch.Tensor | list[list[int]] | None,
+        metadata: dict[str, torch.Tensor] | None,
     ) -> torch.Tensor:
         # Mirrors Qwen3_VisionTransformer.forward on this rank's rows.
         exchange = self.exchange
-        grid = grid_thw if isinstance(grid_thw, list) else grid_thw.tolist()
-        metadata = tower.prepare_encoder_metadata(grid)
+        if metadata is None:
+            assert grid_thw is not None
+            grid = grid_thw if isinstance(grid_thw, list) else grid_thw.tolist()
+            metadata = tower.prepare_encoder_metadata(grid)
         num_patches = x.shape[0]
         padded = -(-num_patches // self.row_multiple) * self.row_multiple
 
@@ -284,8 +279,7 @@ def _replicate(module: nn.Module, others: list[int], **linears: nn.Module) -> No
     for name, linear in linears.items():
         if not isinstance(linear.quant_method, UnquantizedLinearMethod):
             raise ValueError(
-                "TPU_SP_VISION_MIN_PATCHES supports unquantized projections, not "
-                f"{linear.prefix}."
+                f"TPU_SP_VISION supports unquantized projections, not {linear.prefix}."
             )
         weight = gather_other_shards(in_out(linear).data, others)
         module.register_buffer(name, weight, persistent=False)
