@@ -420,3 +420,149 @@ def test_gather_projections_slim_qrows_matches_full_gather(tp, num_tokens, split
         torch.testing.assert_close(got_kv, full_kv, rtol=0, atol=0)
         assert pre_kw is not None
         torch.testing.assert_close(pre_kw, full_kw, rtol=0, atol=0)
+
+
+# The served q-replicated geometry: tp = dcp 16, split_rows 64, GLM-5's MLA.
+_QREP_TP, _QREP_SPLIT, _QREP_QLORA, _QREP_KV, _QREP_KW = 16, 64, 2048, 576, 160
+
+
+def _qrep_mla(w_qkv, w_kw, rank):
+    from vllm_torchtpu.kernels.mla.dcp_token_parallel import TokenParallelLayout
+
+    layout = TokenParallelLayout(_QREP_TP, 4, 256, split_rows=_QREP_SPLIT, max_pages=8)
+    tp_op = SimpleNamespace(layout=layout, q_replicated=True, rank=rank)
+    indexer = SimpleNamespace(
+        wk_weights_proj=lambda z: (z @ w_kw, None),
+        indexer_op=SimpleNamespace(topk_op_tp=SimpleNamespace(q_own_rows=True)),
+    )
+    return SimpleNamespace(
+        fused_qkv_a_proj=lambda z: (z @ w_qkv, None),
+        indexer=indexer,
+        skip_topk=False,
+        mla_attn=SimpleNamespace(sparse_mla_tp_op=tp_op),
+        gate_is_fused=False,
+        kimi_preprocess=None,
+        qb_overlap=False,
+        q_lora_rank=_QREP_QLORA,
+    )
+
+
+def _qrep_rows(mla, x, num_tokens):
+    """The MLA op's reading of `project_gather`: this rank's q_c rows
+    (`q_rows`), every row's kv_lora, every row's indexer wk/weights."""
+    from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as tp_op_mod
+
+    pre_qkv, pre_kw = sp._GatherProjections.project_gather(mla, x, num_tokens)
+    tp_op = mla.mla_attn.sparse_mla_tp_op
+    if isinstance(pre_qkv, tuple):
+        q_c, kv_lora = pre_qkv
+        return q_c, kv_lora, pre_kw, tp_op_mod.q_rows(tp_op, kv_lora.shape[0])
+    q_idx = tp_op_mod.q_rows(tp_op, pre_qkv.shape[0])
+    q_c, kv_lora = pre_qkv.split([_QREP_QLORA, _QREP_KV], dim=-1)
+    return q_c.index_select(0, q_idx), kv_lora, pre_kw, q_idx
+
+
+@pytest.mark.parametrize("num_tokens", [1024, 2048, 8192, 16384])
+def test_gather_projections_qrows_at_every_served_bucket(num_tokens):
+    """Every rank gets its q rows, and every row's kv_lora and wk/weights, at
+    each split bucket: the slim packing above `tp * split_rows` tokens, the
+    plain gather at it (where the packing would ship every q_c row)."""
+    from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as tp_op_mod
+
+    tp, hidden = _QREP_TP, 32
+    rows_local = num_tokens // tp
+    xs = list(torch.randn(num_tokens, hidden, dtype=torch.bfloat16).chunk(tp))
+    w_qkv = torch.randn(hidden, _QREP_QLORA + _QREP_KV, dtype=torch.bfloat16)
+    w_kw = torch.randn(hidden, _QREP_KW, dtype=torch.bfloat16)
+    full_qc, full_kv = torch.cat([x @ w_qkv for x in xs]).split(
+        [_QREP_QLORA, _QREP_KV], dim=-1
+    )
+    full_kw = torch.cat([x @ w_kw for x in xs])
+    sent: list[torch.Tensor] = []
+
+    def record(t, dim):
+        sent.append(t)
+        return t.new_zeros(tp * t.shape[0], *t.shape[1:])
+
+    def run(r, gather):
+        mla = _qrep_mla(w_qkv, w_kw, torch.tensor([r], dtype=torch.int32))
+        with (
+            patch.object(tp_op_mod, "applies", return_value=True),
+            patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp),
+            patch.object(sp, "tensor_model_parallel_all_gather", gather),
+        ):
+            return _qrep_rows(mla, xs[r], num_tokens)
+
+    for r in range(tp):
+        run(r, record)
+    # At rows_local == split_rows the packing would ship all of q_c anyway.
+    slim = rows_local > _QREP_SPLIT
+    cols_qc = _QREP_SPLIT * _QREP_QLORA // rows_local if slim else _QREP_QLORA
+    assert {t.shape for t in sent} == {(rows_local, _QREP_KV + cols_qc + _QREP_KW)}
+    gathered = torch.cat(sent)
+    for r in range(tp):
+        q_c, kv_lora, kw, q_idx = run(r, lambda t, dim: gathered)
+        torch.testing.assert_close(q_c, full_qc.index_select(0, q_idx), rtol=0, atol=0)
+        torch.testing.assert_close(kv_lora, full_kv, rtol=0, atol=0)
+        torch.testing.assert_close(kw, full_kw, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [1024, 2048, 8192, 16384])
+def test_gather_projections_trace_keeps_the_token_dim_dynamic(num_tokens):
+    """Traced as the backbone is (token dim marked dynamic, guards kept), no
+    split bucket specializes the token count: the slim packing's reshapes
+    would turn into views at `tp * split_rows` tokens, whose stride check
+    pinned the trace to that bucket."""
+    from torch._dynamo import mark_dynamic
+
+    from vllm_torchtpu.compilation.shape_variants import (
+        trace_shape_env,
+        unsupported_reason,
+    )
+    from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as tp_op_mod
+
+    tp, hidden = _QREP_TP, 8
+    rank = torch.tensor([3], dtype=torch.int32)
+    mla = _qrep_mla(
+        torch.randn(hidden, _QREP_QLORA + _QREP_KV),
+        torch.randn(hidden, _QREP_KW),
+        rank,
+    )
+
+    def step(positions, hidden_states):
+        num_tokens = positions.shape[0]
+        sp._check_divides(num_tokens)
+        x = sp.own_rows(hidden_states, rank, tp)
+        q_c, kv_lora, kw, q_idx = _qrep_rows(mla, x, num_tokens)
+        return q_c, kv_lora, kw, positions.index_select(0, q_idx)
+
+    graphs = []
+
+    def capture(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    positions = torch.arange(num_tokens)
+    hidden_states = torch.randn(num_tokens, hidden)
+    with (
+        patch.object(envs, "TPU_DCP_PREFILL_TOKEN_PARALLEL", True),
+        patch.object(tp_op_mod.vllm_compilation_backends, "model_tag", "backbone"),
+        patch.object(sp, "get_tensor_model_parallel_world_size", lambda: tp),
+        patch.object(
+            sp, "tensor_model_parallel_all_gather", lambda t, dim: t.repeat(tp, 1)
+        ),
+    ):
+        want = step(positions, hidden_states)
+        mark_dynamic(positions, 0)
+        mark_dynamic(hidden_states, 0)
+        torch._dynamo.reset()
+        got = torch.compile(step, backend=capture, fullgraph=True, dynamic=False)(
+            positions, hidden_states
+        )
+    for g, w in zip(got, want):
+        torch.testing.assert_close(g, w, rtol=0, atol=0)
+    env = trace_shape_env(graphs[0])
+    served = [
+        n for n in (1024, 2048, 4096, 8192, 16384) if unsupported_reason(env, n) is None
+    ]
+    assert served == ([1024] if num_tokens == 1024 else [2048, 4096, 8192, 16384])

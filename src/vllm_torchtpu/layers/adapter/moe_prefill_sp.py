@@ -312,10 +312,13 @@ class _GatherProjections(_OProjReduceScatter):
             tp = tp_op.layout.dcp_size
             s = tp_op.layout.split_rows
             q_lora = int(mla.q_lora_rank)
+            # Only past `rows_local == s`: there the packing ships every q_c row
+            # (cols_qc == q_lora) and its reshapes turn into views whose
+            # stride check pins the traced token count to tp * s.
             if (
                 num_tokens == tp * rows_local
                 and get_tensor_model_parallel_world_size() == tp
-                and 0 < s <= rows_local
+                and 0 < s < rows_local
                 and (s * q_lora) % rows_local == 0
             ):
                 kv_dim = qkv.shape[-1] - q_lora
