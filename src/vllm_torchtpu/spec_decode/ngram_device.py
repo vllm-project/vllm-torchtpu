@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from vllm_torchtpu.kernels.partial_kv_update import pallas_index_copy_
 from vllm_torchtpu.layers.core.attention_metadata import (
     stage_h2d_upload,
     zeros_h2d_source,
@@ -52,9 +53,24 @@ FILLER_TOKEN_ID = 0
 MIN_MATCH_WIDTH = 1024
 
 
+# History rows are `[blocks, 128]`, so a row is one slot of the in-place
+# Pallas row write: a functional scatter copies the whole 270 MB history per
+# step (0.2 ms), the row write moves only the rows it changes.
+HIST_LANES = 128
+
+
+def _write_rows(hist: torch.Tensor, rows: torch.Tensor, vals: torch.Tensor) -> None:
+    """`hist[rows] = vals` in place (`vals` is `[len(rows), width]`)."""
+    vals = vals.reshape(rows.shape[0], *hist.shape[1:])
+    if hist.device.type == "tpu":
+        pallas_index_copy_(hist, rows.to(torch.int32), vals)
+    else:
+        hist.index_copy_(0, rows.long(), vals)
+
+
 def _write_row_impl(hist: torch.Tensor, packed: torch.Tensor) -> None:
     """`hist[packed[0]] = packed[1:]`: one request's history from the host."""
-    hist.index_copy_(0, packed[:1].long(), packed[1:].unsqueeze(0))
+    _write_rows(hist, packed[:1], packed[1:])
 
 
 def _propose_impl(
@@ -69,8 +85,8 @@ def _propose_impl(
     """Appends one step's tokens to the history rows and drafts from them.
 
     Args:
-        hist: [num_hist_rows, max_width] persistent token history, updated in
-            place.
+        hist: [num_hist_rows, blocks, HIST_LANES] persistent token history,
+            updated in place.
         meta: [2 * rows] int32: each chunk row's history row (padded rows point
             at the dump row), then its committed length.
         new_tokens: [rows, S] tokens sampled this step, INVALID_TOKEN_ID padded
@@ -92,8 +108,9 @@ def _propose_impl(
     # [rows, S] columns the step's tokens land in; base_len + S <= width. The
     # INVALID padding lands at or past seq_len, where nothing reads it.
     cols = base_len[:, None] + torch.arange(steps, device=device)
-    tokens = hist[:, :width][hist_rows].scatter(1, cols, new)  # [rows, width]
-    hist.index_put_((hist_rows[:, None].expand(-1, steps), cols), new)
+    full = hist[hist_rows].reshape(rows, -1).scatter(1, cols, new)
+    _write_rows(hist, hist_rows, full)
+    tokens = full[:, :width]
     seq_len = base_len + (new != INVALID_TOKEN_ID).sum(dim=1)
 
     positions = torch.arange(width, device=device)
@@ -156,9 +173,9 @@ class DeviceNgramProposer:
         self.max_model_len = vllm_config.model_config.max_model_len
         # Set by the runner each step; only each chunk's batch span is read.
         self.draft_chunks: list[DraftChunkInputs] | None = None
-        # [max_num_reqs + 1, width]; the last row absorbs the padded rows'
-        # writes. A step appends at most 1 + K tokens past a committed length
-        # of up to max_model_len.
+        # [max_num_reqs + 1, blocks, HIST_LANES]; the last row absorbs the
+        # padded rows' writes. A step appends at most 1 + K tokens past a
+        # committed length of up to max_model_len.
         self._hist: torch.Tensor | None = None
         # The match width buckets, ascending, the last the full width.
         self._match_widths: list[int] = []
@@ -180,8 +197,12 @@ class DeviceNgramProposer:
         """Allocates the device history before the KV cache is sized."""
         del target_model  # Drafts from tokens only.
         width = self.max_model_len + 1 + self.k
+        blocks = -(-width // HIST_LANES)
+        width = blocks * HIST_LANES
         self._hist = torch.zeros(
-            (self._dump_row + 1, width), dtype=torch.int32, device=self.runner.device
+            (self._dump_row + 1, blocks, HIST_LANES),
+            dtype=torch.int32,
+            device=self.runner.device,
         )
         self._match_widths = []
         w = MIN_MATCH_WIDTH
@@ -220,7 +241,7 @@ class DeviceNgramProposer:
         num_reqs = input_batch.num_reqs
         rescheduled = {r.req_id for r in scheduler_output.scheduled_new_reqs}
         rescheduled |= scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        width = self._hist.shape[1]
+        width = self._match_widths[-1]
         stale = False
         for row in range(num_reqs):
             req_id = input_batch.req_ids[row]
@@ -335,7 +356,7 @@ class DeviceNgramProposer:
             (verify_len, torch.int64),
         ]
         with runner._precompile_timed("n-gram drafter"):
-            packed = torch.zeros(1 + self._hist.shape[1], dtype=torch.int32)
+            packed = torch.zeros(1 + self._match_widths[-1], dtype=torch.int32)
             packed[0] = self._dump_row
             self._write_row(packed.to(runner.device))
             for rows in runner.num_reqs_paddings:
