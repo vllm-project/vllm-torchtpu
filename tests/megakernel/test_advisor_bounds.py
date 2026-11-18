@@ -29,6 +29,7 @@ from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     constants,
     models,
+    roofline,
     spec_bridge,
     support,
 )
@@ -1760,10 +1761,40 @@ def test_fastest_tiled_scope_arithmetic_intensity_streams_weights_once() -> None
     assert report.step_arithmetic_intensity == pytest.approx(expected_ai, abs=0.05)
 
 
-def test_evaluate_corners_matches_step_upper_us() -> None:
-    """Verify _evaluate_corners high corner matches step_upper_us."""
-    model_profile = advisor.resolve_model_profile("qwen3.5-397b")
-    workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8)
+# 16 Ki KV tokens per DCP shard across 8 shards plus 4 verify query rows keeps
+# HBM stream above chain_us so floor collectives partially hide under stream.
+_GLM_VERIFY_DCP_DEGREE = 8
+_GLM_VERIFY_QUERY_ROWS = 4
+_GLM_VERIFY_KV_TOKENS_PER_SHARD = 16384
+_GLM_VERIFY_CONTEXT_TOKENS = (
+    _GLM_VERIFY_KV_TOKENS_PER_SHARD * _GLM_VERIFY_DCP_DEGREE + _GLM_VERIFY_QUERY_ROWS
+)
+
+
+@pytest.mark.parametrize(
+    ("model_slug", "workload"),
+    [
+        ("qwen3.5-397b", advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8)),
+        (
+            "glm-5.2",
+            advisor.WorkloadSpec(
+                phase="verify",
+                spec_tokens=_GLM_VERIFY_QUERY_ROWS - 1,
+                batch=1,
+                context=_GLM_VERIFY_CONTEXT_TOKENS,
+                osl=1,
+                tp=16,
+                ep=1,
+                dcp=_GLM_VERIFY_DCP_DEGREE,
+            ),
+        ),
+    ],
+)
+def test_evaluate_corners_matches_step_upper_us(
+    model_slug: str, workload: advisor.WorkloadSpec
+) -> None:
+    """Verify _evaluate_corners low and high corners match pure floor bounds."""
+    model_profile = advisor.resolve_model_profile(model_slug)
     c7x = advisor.resolve_chip_spec("tpu7x")
     report = advisor.advise(model_profile, workload, c7x)
     scope_context = _build_scope_context(model_profile, workload, c7x)
@@ -1792,7 +1823,7 @@ def test_evaluate_corners_matches_step_upper_us() -> None:
 
 
 def test_achievable_upper_scales_a2a_extra_by_eta_ici() -> None:
-    """Verify achievable upper scales a2a_extra_s by 1 / eta_ici when ep_dp > 1."""
+    """Verify achievable upper composes exposed comm + a2a_extra_s / eta_ici."""
     model_profile = advisor.resolve_model_profile("qwen3.5-397b")
     wl_base = advisor.WorkloadSpec(
         phase="decode",
@@ -1805,20 +1836,38 @@ def test_achievable_upper_scales_a2a_extra_by_eta_ici() -> None:
     c7x = advisor.resolve_chip_spec("tpu7x")
     rep_base = advisor.advise(model_profile, wl_base, c7x)
     sc_base = next(s for s in rep_base.scopes if s.scope == "whole_step")
-    base_tol_us = 0.05
+    scope_context = _build_scope_context(model_profile, wl_base, c7x)
+    priors = _resolve_calibrated_priors(wl_base, c7x, scope_context, None)
+    box = _assumed_box(scope_context, wl_base, priors)
+    _, wl_box = _apply_box(scope_context, wl_base, box)
+    hop_delta_s = box.collective_s[1] - box.collective_s[0]
+    # TP2 on single host = 1 intra-ICI hop per all-reduce across 2 * num_layers ARs;
+    # EP8 x DP4 > 1 = 2 sync hops per MoE layer for all-to-all.
+    num_all_reduces = constants.SUBLAYER_BOUNDARIES_PER_LAYER * model_profile.num_layers
+    ar_extra_s = num_all_reduces * hop_delta_s
+    a2a_extra_s = model_profile.num_moe_layers * 2 * hop_delta_s
+    expected_base_ach_upper_us = (
+        sc_base.step_achievable_us
+        + (ar_extra_s + a2a_extra_s) * 1e6
+        + sc_base.ops_per_step * (box.launch_gap_us[1] - wl_box.op_overhead_us)
+    )
+    # 4 rounded ScopeEstimate terms at 0.01 us precision -> <= 4 * 0.005 = 0.02 us.
+    rounding_tol_us = 4 * 0.005
+    assert sc_base.step_achievable_upper_us > sc_base.step_upper_us
     assert sc_base.step_achievable_upper_us == pytest.approx(
-        sc_base.step_upper_us, abs=base_tol_us
+        expected_base_ach_upper_us, abs=rounding_tol_us
     )
 
+    low_eta_ici = 0.7
     wl_low_ici = dataclasses.replace(
-        wl_base, efficiency=advisor.specs.EfficiencySpec(1.0, 1.0, 1.0, 0.7)
+        wl_base, efficiency=advisor.specs.EfficiencySpec(1.0, 1.0, 1.0, low_eta_ici)
     )
     rep_low_ici = advisor.advise(model_profile, wl_low_ici, c7x)
     sc_low_ici = next(s for s in rep_low_ici.scopes if s.scope == "whole_step")
-    min_increase_us = 200.0
+    expected_a2a_ici_delta_us = a2a_extra_s * (1.0 / low_eta_ici - 1.0) * 1e6
     assert (
         sc_low_ici.step_achievable_upper_us - sc_base.step_achievable_upper_us
-    ) >= min_increase_us
+    ) >= expected_a2a_ici_delta_us
 
 
 def test_qwen35_tp16_outside_declared_8rank_group_is_hypothetical(
@@ -2555,4 +2604,262 @@ def test_undeclared_fused_call_above_default_bucket_is_hypothetical() -> None:
     assert ws_ver_68_exp.support == "within_core_limits"
     assert not any(
         u["name"] == "max_rows_per_call" for u in rep_ver_68_exp.unresolved_assumptions
+    )
+
+
+def test_achievable_adds_collectives_while_floor_and_corners_stay_overlapped() -> None:
+    """Verify achievable adds collectives to max(stream, chain) while floor overlaps."""
+    glm_profile = advisor.resolve_model_profile("glm-5.2")
+    unit_efficiency = advisor.specs.EfficiencySpec(1.0, 1.0, 1.0, 1.0)
+    workload = advisor.WorkloadSpec(
+        phase="verify",
+        spec_tokens=_GLM_VERIFY_QUERY_ROWS - 1,
+        batch=1,
+        context=_GLM_VERIFY_CONTEXT_TOKENS,
+        osl=1,
+        tp=16,
+        ep=1,
+        dcp=_GLM_VERIFY_DCP_DEGREE,
+        dispatch_regime="zero_floor",
+        efficiency=unit_efficiency,
+    )
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    report = advisor.advise(glm_profile, workload, chip_spec)
+    whole_step = next(s for s in report.scopes if s.scope == "whole_step")
+    # Each ScopeEstimate latency rounds to 0.01 us (0.005 us half-ULP); summing 6
+    # rounded fields + step output errs by at most (6 + 1) * 0.005 = 0.035 us.
+    rounding_tol_us = 7 * 0.005
+    min_sublayer_comm_us = (
+        glm_profile.num_layers
+        * constants.SUBLAYER_BOUNDARIES_PER_LAYER
+        * chip_spec.collective_latency_s
+        * 1e6
+    )
+    expected_floor_us = (
+        max(whole_step.hbm_us, whole_step.chain_us + whole_step.comm_us)
+        + whole_step.fill_drain_us
+        + whole_step.repass_spill_us
+        + whole_step.launch_us
+    )
+    expected_ach_us = (
+        max(whole_step.hbm_us, whole_step.chain_us)
+        + whole_step.comm_us
+        + whole_step.fill_drain_us
+        + whole_step.repass_spill_us
+        + whole_step.launch_us
+    )
+    assert whole_step.comm_us >= min_sublayer_comm_us
+    assert whole_step.hbm_us > whole_step.chain_us
+    assert whole_step.step_bound_us == pytest.approx(
+        expected_floor_us, abs=rounding_tol_us
+    )
+    assert whole_step.step_achievable_us == pytest.approx(
+        expected_ach_us, abs=rounding_tol_us
+    )
+
+
+def _exact_binomial_busiest_reference(
+    tokens_ep: int,
+    top_k: int,
+    num_experts: int,
+    experts_local: int,
+    owner_groups: int,
+) -> float:
+    """Compute exact independent-binomial busiest-group expectation via math.comb."""
+    hit = 1.0 - (1.0 - min(1.0, top_k / num_experts)) ** tokens_ep
+    if owner_groups <= 1:
+        return max(1.0, experts_local * hit)
+    experts_per_group = num_experts // owner_groups
+    if hit >= 1.0:
+        return max(1.0, float(experts_local))
+    cdf = 0.0
+    expected_group_max = 0.0
+    for count in range(experts_per_group):
+        pmf = (
+            math.comb(experts_per_group, count)
+            * (hit**count)
+            * ((1.0 - hit) ** (experts_per_group - count))
+        )
+        cdf = min(1.0, cdf + pmf)
+        expected_group_max += 1.0 - cdf**owner_groups
+    return max(1.0, expected_group_max * (experts_local / experts_per_group))
+
+
+def _lgamma_binomial_rel_tol(num_experts: int, owner_groups: int) -> float:
+    """Bound IEEE-754 float64 relative error across E_g lgamma log-PMF terms."""
+    # 3 lgamma evaluations + 1 exp per binomial log-PMF term = 4 transcendental ops.
+    transcendental_ops_per_term = 4.0
+    experts_per_group = max(1, num_experts // max(1, owner_groups))
+    return (
+        transcendental_ops_per_term
+        * experts_per_group
+        * max(1.0, math.lgamma(experts_per_group + 1))
+        * math.ulp(1.0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_slug", "tokens_ep", "ep_size", "owner_groups", "saturate_hit"),
+    [
+        ("qwen3.5-397b", 16, 8, 1, False),
+        ("qwen3.5-397b", 16, 8, 8, False),
+        ("kimi-k3", 4, 32, 8, False),
+        ("qwen3.5-397b", 4, 8, 8, True),
+    ],
+)
+def test_experts_hit_busiest_matches_exact_binomial_order_statistic(
+    model_slug: str,
+    tokens_ep: int,
+    ep_size: int,
+    owner_groups: int,
+    *,
+    saturate_hit: bool,
+) -> None:
+    """Verify experts_hit_busiest against exact math.comb sum and per-rank ratio."""
+    profile = advisor.resolve_model_profile(model_slug)
+    top_k = profile.num_experts if saturate_hit else profile.top_k
+    experts_local = profile.num_experts // ep_size
+    expected = _exact_binomial_busiest_reference(
+        tokens_ep, top_k, profile.num_experts, experts_local, owner_groups
+    )
+    actual = roofline.experts_hit_busiest(
+        tokens_ep, top_k, profile.num_experts, experts_local, owner_groups
+    )
+    rel_tol = _lgamma_binomial_rel_tol(profile.num_experts, owner_groups)
+    assert actual == pytest.approx(expected, rel=rel_tol)
+
+
+def test_busiest_owner_group_scales_achievable_and_handles_large_expert_counts() -> (
+    None
+):
+    """Verify busiest-group order statistics scale MoE without float overflow."""
+    qwen_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    qwen_ep = 8
+    qwen_local = qwen_profile.num_experts // qwen_ep
+    single_group_qwen = roofline.experts_hit_busiest(
+        16, qwen_profile.top_k, qwen_profile.num_experts, qwen_local, 1
+    )
+    busiest_qwen = roofline.experts_hit_busiest(
+        16, qwen_profile.top_k, qwen_profile.num_experts, qwen_local, qwen_ep
+    )
+    assert busiest_qwen > single_group_qwen
+
+    kimi_profile = advisor.resolve_model_profile("kimi-k3")
+    kimi_preset = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    assert kimi_preset.decode is not None
+    assert kimi_preset.decode.megakernel is not None
+    expected_kimi_groups = int(
+        str(kimi_preset.decode.megakernel["expert_owner_groups"])
+    )
+    kimi_workload = advisor.WorkloadSpec(
+        phase="decode", batch=1, context=32768, osl=1, tp=32, ep=32, dcp=32
+    )
+    kimi_whole_step_declaration = support.find_declaration(
+        "kimi-k3", "whole_step", 32, kimi_workload
+    )
+    kimi_per_op_declaration = support.find_declaration(
+        "kimi-k3", "per_op", 32, kimi_workload
+    )
+    assert (
+        support.effective_expert_owner_groups(
+            kimi_whole_step_declaration, kimi_workload
+        )
+        == expected_kimi_groups
+    )
+    assert (
+        support.effective_expert_owner_groups(kimi_per_op_declaration, kimi_workload)
+        == kimi_workload.ep
+    )
+    tp_override_workload = dataclasses.replace(kimi_workload, ep=1)
+    tp_override_declaration = support.find_declaration(
+        "kimi-k3", "whole_step", 32, tp_override_workload
+    )
+    assert (
+        support.effective_expert_owner_groups(
+            tp_override_declaration, tp_override_workload
+        )
+        == 1
+    )
+
+    kimi_local = kimi_profile.num_experts // kimi_workload.ep
+    kimi_one_row = roofline.experts_hit_busiest(
+        1,
+        kimi_profile.top_k,
+        kimi_profile.num_experts,
+        kimi_local,
+        expected_kimi_groups,
+    )
+    assert kimi_one_row == pytest.approx(
+        _exact_binomial_busiest_reference(
+            1,
+            kimi_profile.top_k,
+            kimi_profile.num_experts,
+            kimi_local,
+            expected_kimi_groups,
+        ),
+        rel=_lgamma_binomial_rel_tol(kimi_profile.num_experts, expected_kimi_groups),
+    )
+    kimi_eight_groups = advisor.advise("kimi-k3", kimi_workload, "tpu7x")
+    kimi_whole_step = next(
+        s for s in kimi_eight_groups.scopes if s.scope == "whole_step"
+    )
+    assert (
+        kimi_whole_step.step_achievable_us
+        > kimi_whole_step.step_bound_us + kimi_whole_step.comm_us
+    )
+
+    large_experts = 16384
+    large_groups = 8
+    large_local = large_experts // large_groups
+    large_single = roofline.experts_hit_busiest(
+        16, kimi_profile.top_k, large_experts, large_local, 1
+    )
+    large_busiest = roofline.experts_hit_busiest(
+        16, kimi_profile.top_k, large_experts, large_local, large_groups
+    )
+    assert math.isfinite(large_busiest)
+    assert large_busiest > large_single
+
+    with pytest.raises(ValueError, match="experts_hit_busiest"):
+        roofline.experts_hit_busiest(4, 8, 0, 8, 2)
+    with pytest.raises(ValueError, match="experts_hit_busiest"):
+        roofline.experts_hit_busiest(4, 8, 16, 4, 32)
+
+
+def test_per_op_achievable_prices_operator_kernel_boundaries() -> None:
+    """Verify per_op achievable charges operator calls while keeping ops_per_step."""
+    qwen_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    unit_efficiency = advisor.specs.EfficiencySpec(1.0, 1.0, 1.0, 1.0)
+    workload = advisor.WorkloadSpec(
+        phase="decode",
+        batch=4,
+        context=4096,
+        osl=1,
+        tp=8,
+        ep=1,
+        dispatch_regime="zero_floor",
+        efficiency=unit_efficiency,
+    )
+    report = advisor.advise(qwen_profile, workload, chip_spec)
+    per_op_scope = next(s for s in report.scopes if s.scope == "per_op")
+    expected_sublayer_ops = (
+        constants.SUBLAYER_BOUNDARIES_PER_LAYER * qwen_profile.num_layers
+    )
+    expected_operator_calls = (
+        constants.PER_OP_MIXER_KERNELS_PER_LAYER
+        + constants.PER_OP_BASE_FFN_KERNELS_PER_LAYER
+        + constants.PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER
+    ) * qwen_profile.num_layers
+    extra_boundaries = expected_operator_calls - expected_sublayer_ops
+    per_boundary_us = (
+        constants.DENSE_SLOT_DEFAULT_BYTES / chip_spec.hbm_bw_bytes_per_s
+        + constants.BOUNDARY_SYNC_HOP_FACTOR * chip_spec.collective_latency_s
+    ) * 1e6
+    # Difference of two 0.01 us-rounded step latencies -> <= 2 * 0.005 = 0.01 us.
+    rounding_tol_us = 2 * 0.005
+    assert per_op_scope.ops_per_step == expected_sublayer_ops
+    assert (
+        per_op_scope.step_achievable_us - per_op_scope.step_bound_us
+        == pytest.approx(extra_boundaries * per_boundary_us, abs=rounding_tol_us)
     )
