@@ -786,3 +786,9 @@ def test_strict_counts_ignore_kernel_row_tile() -> None:
         values = [getattr(floors_dense[tile], field_name) for tile in (1, 256, 512)]
         assert values[0] == pytest.approx(values[1], rel=1e-12)
         assert values[1] == pytest.approx(values[2], rel=1e-12)
+
+
+def test_count_hosts_rounds_up_partial_hosts() -> None:
+    """Round positive chip counts up to physical hosts using ceiling division."""
+    for num_chips, expected_hosts in ((0, 1), (4, 1), (5, 2), (8, 2), (9, 3)):
+        assert rf.chips.count_hosts(num_chips) == expected_hosts

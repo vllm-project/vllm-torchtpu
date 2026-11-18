@@ -35,6 +35,7 @@ from vllm_torchtpu.roofline import (
     cli,
     emit_ceiling_rows,
     emit_launch_args,
+    format_parallelism,
     from_hf_config,
     point_launch_args,
     pool_cli_args,
@@ -46,6 +47,7 @@ from vllm_torchtpu.roofline.emit import (
     _MODEL_PLACEHOLDER,
     _UNKNOWN_MODEL_WARNING,
     _pool_key,
+    pool_label,
 )
 from vllm_torchtpu.roofline.hf_loader import dtypes_from_hf_config as _dtypes_from_cfg
 from vllm_torchtpu.roofline.memory import (
@@ -759,3 +761,34 @@ def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
     margins = [entry["margin_vs_rank1_pct"] for entry in payload["top_k"]]
     assert roles == ["max_throughput", "balanced_knee", "max_interactivity"]
     assert margins == [0.0, -16.0, -50.0]
+
+
+def test_pool_label_joins_axes_with_x_and_omits_ones() -> None:
+    """Verify format_parallelism and pool_label omit size-1 axes and join with x."""
+    sample_pool = {
+        "instances": 1,
+        "topology": "2x2x1",
+        "chips_per_instance": 4,
+        "tp": 8,
+        "dp": 1,
+        "ep": 8,
+        "pp": 1,
+        "pcp": 1,
+        "kv_split": 4,
+    }
+    assert format_parallelism(sample_pool) == "TP8 x EP8 x DCP4"
+    label = pool_label(sample_pool)
+    assert label.endswith(": TP8 x EP8 x DCP4")
+
+    all_one_pool = {
+        "instances": 1,
+        "topology": "1x1x1",
+        "chips_per_instance": 1,
+        "tp": 1,
+        "dp": 1,
+        "ep": 1,
+        "pp": 1,
+        "pcp": 1,
+        "kv_split": 1,
+    }
+    assert format_parallelism(all_one_pool) == "TP1"

@@ -18,11 +18,14 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import TYPE_CHECKING, TypedDict
 
+from .chips import count_hosts
 from .constants import (
+    DEFAULT_CORES_PER_CHIP,
     KV_DTYPE_BYTES,
     MIN_TOP_LAYOUTS_FOR_FASTEST,
     NO_FEASIBLE_LAYOUT_WARNING,
     SOLVE_SCHEMA,
+    TOPOLOGY_AXES,
 )
 
 if TYPE_CHECKING:
@@ -37,6 +40,15 @@ _MODEL_PLACEHOLDER = "<MODEL>"
 _UNKNOWN_MODEL_WARNING = (
     f"The model to serve is not known: replace {_MODEL_PLACEHOLDER} in each "
     "command with a model ID or a model directory."
+)
+
+_POOL_AXES: tuple[tuple[str, str], ...] = (
+    ("TP", "tp"),
+    ("DP", "dp"),
+    ("EP", "ep"),
+    ("PP", "pp"),
+    ("PCP", "pcp"),
+    ("DCP", "kv_split"),
 )
 
 
@@ -143,6 +155,48 @@ def pool_cli_args(
     if gpu_memory_utilization is not None:
         args.extend(["--gpu-memory-utilization", f"{gpu_memory_utilization:g}"])
     return args
+
+
+def _pool_int(val: object, default: int = 1) -> int:
+    """Extract a non-boolean integer field from a pool mapping."""
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    return default
+
+
+def format_parallelism(pool: Mapping[str, object]) -> str:
+    """Format active parallelism axes joined by ' x ' in canonical order, or TP1."""
+    parts = [
+        f"{name}{_pool_int(pool.get(key))}"
+        for name, key in _POOL_AXES
+        if _pool_int(pool.get(key)) > 1
+    ]
+    return " x ".join(parts) if parts else "TP1"
+
+
+def pool_label(pool: Mapping[str, object]) -> str:
+    """Return a concise pool label.
+
+    Example: ``4x 2x2x2 (32 chips, 8 hosts, 64 cores): TP16 x EP16 x DCP2``.
+    """
+    instance_count = _pool_int(pool.get("instances"))
+    instance_prefix = f"{instance_count}x "
+    topology_name = str(pool.get("topology", ""))
+    chips_per_instance = _pool_int(pool.get("chips_per_instance"), default=0)
+    if chips_per_instance <= 0 and topology_name in TOPOLOGY_AXES:
+        topology_dimensions = TOPOLOGY_AXES[topology_name]
+        chips_per_instance = (
+            topology_dimensions[0] * topology_dimensions[1] * topology_dimensions[2]
+        )
+    total_chips = chips_per_instance * max(1, instance_count)
+    layout_text = format_parallelism(pool)
+    if total_chips <= 0:
+        return f"{instance_prefix}{topology_name}: {layout_text}"
+    hosts = count_hosts(total_chips)
+    host_description = "1 host" if hosts == 1 else f"{hosts} hosts"
+    cores = total_chips * DEFAULT_CORES_PER_CHIP
+    pool_description = f" ({total_chips} chips, {host_description}, {cores} cores)"
+    return f"{instance_prefix}{topology_name}{pool_description}: {layout_text}"
 
 
 def _servable_model(source: str | None) -> str | None:
