@@ -25,7 +25,7 @@ outputs from the export's real output shardings the same way.
 
 import inspect
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
 import jax
 import torch
@@ -137,18 +137,24 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
+    # One output spec per output leaf: JaxCallable zips them with the out avals.
+    output_specs = jax.tree.leaves(
+        output_partition_specs, is_leaf=lambda s: isinstance(s, PartitionSpec)
+    )
+    # torch_tpu 0.2.0 annotates the specs as tuples of axis-name tuples and
+    # donate_argnums as a list; JaxCallable takes PartitionSpecs, as main's
+    # other callers pass them, and any sequence of ints.
     wrapped_fn = pallas_impl.JaxCallable(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
         mesh=mesh,
-        input_partition_specs=input_partition_specs,
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums,
-        # One spec per output leaf: JaxCallable zips them with the out avals.
-        output_partition_specs=jax.tree.leaves(
-            output_partition_specs, is_leaf=lambda s: isinstance(s, PartitionSpec)
+        input_partition_specs=cast(
+            "tuple[tuple[str, ...], ...]", input_partition_specs
         ),
+        static_argnums=static_argnums,
+        donate_argnums=cast("list[int] | None", donate_argnums),
+        output_partition_specs=cast("tuple[tuple[str, ...], ...]", output_specs),
     )
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
