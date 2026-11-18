@@ -24,6 +24,7 @@ from .chips import ChipSpec, resolve_chip_spec
 from .constants import (
     AB_KNOB,
     BOUNDARY_SYNC_HOP_FACTOR,
+    CORE_LIMITS,
     CORNER_AXES,
     DOT_BF16,
     DOT_FP8,
@@ -39,6 +40,7 @@ from .models import (
     resolve_model_profile,
 )
 from .roofline import (
+    ResolvedCollectiveCall,
     _build_scope_context,
     _evaluate_scopes,
     _is_calibrated_trace,
@@ -84,10 +86,12 @@ def _assumed_box(
         tuple[float, float, float, ProvenanceTag, str],
         tuple[float, float, float, ProvenanceTag, str],
         tuple[float, list[float], ProvenanceTag, str],
+        ResolvedCollectiveCall,
+        ResolvedCollectiveCall,
     ],
 ) -> _AssumedBox:
     """Build the input box: measured values when present, else the assumed band."""
-    (_, lg_lo, lg_hi, lg_tag, _), (c_val, _, _, c_tag, _), _ = priors
+    (_, lg_lo, lg_hi, lg_tag, _), *_ = priors
     # Uncalibrated floor keeps the zero-launch roofline; a trace floor uses p50.
     lg_box = (
         (lg_lo, lg_hi)
@@ -95,11 +99,7 @@ def _assumed_box(
         or workload.dispatch_regime in ("unfused_eager", "compiled_xla")
         else (workload.op_overhead_us, scope_context.launch_gap_upper_us)
     )
-    coll_box = (
-        (c_val * 1e-6, c_val * 1e-6)
-        if c_tag == "MEASURED"
-        else (scope_context.lat_coll, scope_context.lat_coll_upper)
-    )
+    coll_box = (scope_context.lat_coll, scope_context.lat_coll_upper)
     dot_differs = (
         not scope_context.attn_is_bf16
         and workload.phase in ("prefill", "mixed")
@@ -352,6 +352,8 @@ def _build_provenance_and_verdict(
         (lg_val, lg_lo, lg_hi, lg_tag, lg_src),
         (coll_val, coll_lo, coll_hi, coll_tag, coll_src),
         (cov_val, cov_band, cov_tag, cov_src),
+        xla_coll,
+        in_kernel_coll,
     ) = _resolve_calibrated_priors(workload, chip_spec, scope_context, meas)
 
     # step_bound_us already carries ops * lg_floor; strip it before re-pricing.
@@ -372,6 +374,8 @@ def _build_provenance_and_verdict(
             ar_inter_latency_s=0.0,
             pp_stage_time=pp_zero_time,
             launch_gap_upper_us=0.0,
+            measured_ar_xla_s=None,
+            measured_ar_in_kernel_s=None,
         ),
         profile,
         replace(workload, op_overhead_us=0.0),
@@ -386,19 +390,22 @@ def _build_provenance_and_verdict(
     )
     pure_diff_round_us = round(pure_diff_us, 2)
     assumed_diff_us = round(max(0.0, pure_diff_round_us - fact_diff_us), 2)
+    collectives_measured = (
+        xla_coll.tag == "MEASURED" and in_kernel_coll.tag == "MEASURED"
+    )
+    ar_band_extra_us = (
+        0.0
+        if collectives_measured
+        else scope_context.num_ar * scope_context.ar_hops * max(0.0, coll_hi - coll_lo)
+    )
     c_gain_tag: ProvenanceTag = (
-        "ASSUMED" if (assumed_diff_us > 0.0 and coll_tag != "MEASURED") else "DERIVED"
+        "ASSUMED" if (assumed_diff_us > 0.0 and not collectives_measured) else "DERIVED"
     )
     b_val = round(d_ops * lg_val + pure_diff_us, 2)
     b_lo = round(d_ops * lg_lo + pure_diff_us, 2)
-    b_hi = round(
-        d_ops * lg_hi
-        + pure_diff_us
-        + scope_context.num_ar * scope_context.ar_hops * max(0.0, coll_hi - coll_lo),
-        2,
-    )
+    b_hi = round(d_ops * lg_hi + pure_diff_us + ar_band_extra_us, 2)
     b_tag: ProvenanceTag = (
-        "MEASURED" if lg_tag == "MEASURED" and coll_tag == "MEASURED" else "ASSUMED"
+        "MEASURED" if lg_tag == "MEASURED" and collectives_measured else "ASSUMED"
     )
 
     denom_us = max(1e-6, base_per_op_us + per_op_sc.ops_per_step * lg_val)
@@ -478,6 +485,20 @@ def _build_provenance_and_verdict(
             "source": coll_src,
             "band": [coll_lo, coll_hi],
         },
+        "collective_call_us_xla": {
+            "value": xla_coll.value_us,
+            "unit": "us",
+            "tag": xla_coll.tag,
+            "source": xla_coll.source,
+            "band": [xla_coll.lo_us, xla_coll.hi_us],
+        },
+        "collective_call_us_in_kernel": {
+            "value": in_kernel_coll.value_us,
+            "unit": "us",
+            "tag": in_kernel_coll.tag,
+            "source": in_kernel_coll.source,
+            "band": [in_kernel_coll.lo_us, in_kernel_coll.hi_us],
+        },
         "step_floor_us": {
             "value": recommended.step_bound_us,
             "unit": "us",
@@ -514,7 +535,7 @@ def _build_provenance_and_verdict(
             "unit": "us",
             "tag": (
                 "MEASURED"
-                if coll_tag == "MEASURED"
+                if collectives_measured
                 else ("ASSUMED" if assumed_diff_us > 0.0 else "DERIVED")
             ),
             "source": (
@@ -523,13 +544,7 @@ def _build_provenance_and_verdict(
             ),
             "band": [
                 assumed_diff_us,
-                round(
-                    assumed_diff_us
-                    + scope_context.num_ar
-                    * scope_context.ar_hops
-                    * max(0.0, coll_hi - coll_lo),
-                    2,
-                ),
+                round(assumed_diff_us + ar_band_extra_us, 2),
             ],
         },
         "compiler_proof_gain_us": {
@@ -539,13 +554,7 @@ def _build_provenance_and_verdict(
             "source": "per_op_physics_us - best_scope_physics_us (0 us boundary gap)",
             "band": [
                 round(pure_diff_us, 2),
-                round(
-                    pure_diff_us
-                    + scope_context.num_ar
-                    * scope_context.ar_hops
-                    * max(0.0, coll_hi - coll_lo),
-                    2,
-                ),
+                round(pure_diff_us + ar_band_extra_us, 2),
             ],
         },
         "compiler_proof_gain_pct": {
@@ -557,12 +566,7 @@ def _build_provenance_and_verdict(
                 round(100.0 * pure_diff_us / max(1e-6, base_per_op_us), 2),
                 round(
                     100.0
-                    * (
-                        pure_diff_us
-                        + scope_context.num_ar
-                        * scope_context.ar_hops
-                        * max(0.0, coll_hi - coll_lo)
-                    )
+                    * (pure_diff_us + ar_band_extra_us)
                     / max(1e-6, base_per_op_us),
                     2,
                 ),
@@ -710,6 +714,7 @@ def _build_provenance_and_verdict(
     winners = _corner_winners(corners, ops) if hbm_fits else {}
     flip = next(((c, w) for c, w in winners.items() if w != best.scope), None)
     challenger = flip[1] if flip else (runner_up.scope if runner_up else None)
+    coll_eff_tag: ProvenanceTag = "MEASURED" if collectives_measured else coll_tag
     unresolved = _collect_unresolved_assumptions(
         workload,
         chip_spec,
@@ -718,11 +723,33 @@ def _build_provenance_and_verdict(
             d_ops,
             b_val,
             (lg_lo, lg_hi, lg_tag),
-            (coll_lo, coll_hi, coll_tag),
+            (coll_lo, coll_hi, coll_eff_tag),
             cov_tag,
         ),
         (corners, best.scope, challenger),
     )
+    if any(
+        est.scope == "whole_step" and "row_limit_not_stated" in est.blockers
+        for est in estimates
+    ):
+        bucket_top = (
+            CORE_LIMITS.default_verify_bucket_top
+            if workload.phase == "verify"
+            else CORE_LIMITS.default_decode_bucket_top
+        )
+        unresolved.append(
+            {
+                "name": "max_rows_per_call",
+                "band": [bucket_top, CORE_LIMITS.max_batch_rows],
+                "unit": "rows",
+                "sensitivity_us": 0.0,
+                "affects": "support",
+                "how_to_settle": (
+                    "Pass --max-rows-per-call or add a megakernel declaration "
+                    "in data/presets/deployments.json"
+                ),
+            }
+        )
     scope_inputs = [str(u["name"]) for u in unresolved if u["affects"] == "scope"]
     is_tie = hbm_fits and best.feasible and flip is not None
     verdict = (
@@ -808,11 +835,14 @@ def advise(
     scope_context = _build_scope_context(
         profile_obj, eff_wl, chip_spec, plan_error=plan_error, meas=meas
     )
-    box = _assumed_box(
+    priors = _resolve_calibrated_priors(eff_wl, chip_spec, scope_context, meas)
+    _, _, _, xla_coll, in_kernel_coll = priors
+    scope_context = replace(
         scope_context,
-        eff_wl,
-        _resolve_calibrated_priors(eff_wl, chip_spec, scope_context, meas),
+        measured_ar_xla_s=xla_coll.measured_s,
+        measured_ar_in_kernel_s=in_kernel_coll.measured_s,
     )
+    box = _assumed_box(scope_context, eff_wl, priors)
     scope_context, eval_wl = _apply_box(scope_context, eff_wl, box)
     estimates, raw_step_map = _evaluate_scopes(scope_context, profile_obj, eval_wl)
     corners = _evaluate_corners(scope_context, profile_obj, eval_wl, box)
@@ -1264,11 +1294,14 @@ def compute_scope_raw_step_us(
     if meas is not None and meas.ring_plan is not None and eff_wl.ring_plan is None:
         eff_wl = replace(eff_wl, ring_plan=meas.ring_plan)
     scope_context = _build_scope_context(profile_obj, eff_wl, chip_spec, meas=meas)
-    box = _assumed_box(
+    priors = _resolve_calibrated_priors(eff_wl, chip_spec, scope_context, meas)
+    _, _, _, xla_coll, in_kernel_coll = priors
+    scope_context = replace(
         scope_context,
-        eff_wl,
-        _resolve_calibrated_priors(eff_wl, chip_spec, scope_context, meas),
+        measured_ar_xla_s=xla_coll.measured_s,
+        measured_ar_in_kernel_s=in_kernel_coll.measured_s,
     )
+    box = _assumed_box(scope_context, eff_wl, priors)
     scope_context, eval_wl = _apply_box(scope_context, eff_wl, box)
     _, raw_step_map = _evaluate_scopes(scope_context, profile_obj, eval_wl)
     return {str(s): float(v) for s, v in raw_step_map.items()}
