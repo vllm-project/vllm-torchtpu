@@ -30,11 +30,16 @@ With the flag on, three things change, and nothing else:
    not). So the runner (a) fences whenever the producer registers ahead (every
    pipeline producer, otherwise by TPU_RAIDEN_STAGE3_REGISTER_AHEAD: a superset
    of the connector's rule, so it can over-fence by one event record but never
-   under-fence), with or without a drafter; and (b) enqueues, in ONE
-   non-blocking ``synchronize_tensors`` call, the draft tokens plus every root
-   registered for the step (``register_root``; cleared at execute_model
-   start), and only then re-records the gate. The fence sits before the
-   unwaited return. The runner's own commit reads the scheduler's tokens
+   under-fence), with or without a drafter; and (b) enqueues, without
+   waiting, the drafter's graph and every root registered for the step
+   (``register_root``; cleared at execute_model start), and only then
+   re-records the gate. The fence sits before the unwaited return. The drafts
+   come back as the drafter's bucketed per-chunk [p, K] tensors (no slice or
+   cat to the real request count, eagle3.Eagle3Proposer.propose) and are
+   enqueued one ``synchronize_tensors`` call per chunk in chunk order, which
+   are the graphs the synchronous path's per-chunk ``.cpu()`` materializes;
+   the registered roots follow in one further call. So the flag adds no
+   device program of a new shape. The runner's own commit reads the scheduler's tokens
    (``apply_scheduled_token_ids``), so the output thread is the gate's only
    consumer.
 
@@ -87,21 +92,27 @@ def take_roots(runner: Any) -> list[Any]:
 
 def fence(
     copy_state: Any,
+    drafts: Sequence[Any],
     roots: Sequence[Any],
     *,
     synchronize: Callable[[list[Any]], None],
     skip_dispatch: bool = False,
     skip_fence: bool = False,
 ) -> None:
-    """Enqueue every root in one call, then re-arm the copy gate behind it.
-    ``skip_dispatch`` / ``skip_fence`` mirror the source's probe controls; this
-    tree has no probe, so the runner passes False for both."""
+    """Enqueue the drafter's graph one bucketed draft chunk per call (in chunk
+    order), then every registered root in one call, then re-arm the copy gate
+    behind them. ``skip_dispatch`` / ``skip_fence`` mirror the source's probe
+    controls; this tree has no probe, so the runner passes False for both."""
+    drafts = [d for d in drafts if d is not None]
     roots = [r for r in roots if r is not None]
-    if roots and not skip_dispatch:
-        synchronize(roots)
+    if not skip_dispatch:
+        for chunk in drafts:
+            synchronize([chunk])
+        if roots:
+            synchronize(roots)
     if not skip_fence:
         copy_state.fence_pending_device_work()
-    _note(0 if skip_dispatch else len(roots), not skip_fence)
+    _note(0 if skip_dispatch else len(drafts) + len(roots), not skip_fence)
 
 
 def _note(nroots: int, fenced: bool) -> None:

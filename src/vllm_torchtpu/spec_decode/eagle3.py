@@ -36,6 +36,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.runner import greedy_top_tokens, host_phases
+from vllm_torchtpu.runner import pp_last_async_drafter as _pparf  # q38 PPARF (default off)
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -1890,6 +1891,14 @@ class Eagle3Proposer:
         if checking:
             self._check_draft_tokens(check_tokens_per_chunk, per_chunk_stacked, chunks)
         if return_device:
+            if _pparf.enabled() and getattr(runner, "_pp_last_async_output", False):
+                # q38 PPARF (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER): the
+                # prefill-only producer's device drafts only root the copy-gate
+                # fence; nothing reads them. Keep them at the bucketed [p, K]
+                # shapes the synchronous .cpu() below materializes (the real
+                # num_reqs stays on the host), so no slice / cat program of a
+                # new shape is compiled at serving time.
+                return per_chunk_stacked
             return torch.cat(
                 [s[: c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)], dim=0
             )
