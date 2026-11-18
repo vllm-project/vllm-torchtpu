@@ -2829,17 +2829,26 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         """Executes complete TPU multi-head latent attention evaluation.
 
         A large qrep step under TPU_DCP_MLA_OPROJ_ALL_REDUCE returns the
-        unmerged, quantized `weight_lse_partials` instead of the output."""
+        unmerged, quantized `weight_lse_partials` instead of the output. With
+        `sp_o_proj` (TPU_DCP_TP_PREFILL_LOCAL_OPROJ, a token-parallel bucket
+        only) it returns o_proj's output on this rank's sequence-parallel
+        rows, `[T / dcp, hidden]`."""
         assert isinstance(q, tuple) and len(q) == 2, (
             "q must be a tuple of (q_nope, q_pe)"
         )
         q_nope, q_pe = q
         input_dtype = q_nope.dtype
+        sp_o_proj = kwargs.get("sp_o_proj")
 
         # For determine_available_memory when cache memory buffer is empty right during
         # probe (before binding, `layer.kv_cache` is the layer's default empty tensor;
         # after binding, sparse layers hold a (nope, rope) pair).
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
+            if sp_o_proj is not None:
+                rows = kv_c_normed.shape[0] // self.dcp_size
+                return torch.ones_like(
+                    kv_c_normed.flatten(1)[:rows, :1].expand(-1, sp_o_proj[0].shape[1])
+                )
             if output is None:
                 # Preserve symbolic token dimensions during the memory probe.
                 # kv_c_normed has every row; q may hold only some
@@ -2852,6 +2861,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             return output
 
         topk_indices = kwargs.get("topk_indices")
+        if sp_o_proj is not None and not (
+            topk_indices is not None
+            and getattr(layer, "sparse_mla_tp_op", None) is not None
+            and dcp_token_parallel_op.applies(kv_c_normed.shape[0])
+        ):
+            raise ValueError("sp_o_proj is only served on a token-parallel bucket")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
@@ -2941,7 +2956,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     topk_indices,
                     attn_metadata,
                     q_replicated=use_qrep,
+                    w_o=sp_o_proj,
                 )
+                if sp_o_proj is not None:
+                    return outputs
             elif self.dcp_size > 1:
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "

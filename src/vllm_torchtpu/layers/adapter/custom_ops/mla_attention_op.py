@@ -2070,6 +2070,7 @@ class VllmTPUMLAAttention(MLAAttention):
             output=output,
             topk_indices=kwargs.get("topk_indices"),
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
+            sp_o_proj=kwargs.get("sp_o_proj"),
         )
 
 
@@ -2634,6 +2635,22 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 local_view = q_proj_layer._local_view
                 q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
+        # TPU_DCP_TP_PREFILL_LOCAL_OPROJ: on a sequence-parallel token-parallel
+        # bucket the attention op runs o_proj (this rank's FP8 shard, gathered
+        # in the op) itself and returns this rank's sequence-parallel rows.
+        sp_o_proj = None
+        if (
+            envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
+            and prefill_group is not None
+            and topk_indices is not None
+            and output_gate is None
+            and self.g_proj is None
+            and getattr(self.mla_attn, "sparse_mla_tp_op", None) is not None
+            and dcp_token_parallel_op.applies(kv_c_normed.shape[0])
+            and dcp_token_parallel_op.serves_sequence_row_oproj(self.o_proj)
+        ):
+            sp_o_proj = (self.o_proj.weight, self.o_proj.weight_scale)
+
         attn_out = self.mla_attn(
             (q_nope, q_pe),
             kv_c_normed,
@@ -2641,7 +2658,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
+            sp_o_proj=sp_o_proj,
         )
+        if sp_o_proj is not None:
+            return attn_out
 
         if output_gate is not None:
             attn_out *= output_gate.sigmoid()

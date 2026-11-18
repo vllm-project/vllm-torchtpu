@@ -432,6 +432,124 @@ def tokens_to_heads(y: jax.Array, axis_name: str) -> jax.Array:
     return lax.all_to_all(y, axis_name, 1, 0, tiled=True)
 
 
+def dequantize_row_shards(
+    w_shards: jax.Array, s_shards: jax.Array, dtype: jnp.dtype
+) -> jax.Array:
+    """`[G * k, n]` FP8 row shards x `[G, n]` scales -> `[G * k, n]` in `dtype`.
+
+    Shard `g` (rows `[g * k, (g + 1) * k)`) is scaled by its own `s_shards[g]`."""
+    groups, n = s_shards.shape
+    w = w_shards.reshape(groups, -1, n).astype(dtype) * s_shards[:, None, :].astype(
+        dtype
+    )
+    return w.reshape(-1, n)
+
+
+def token_rows_to_sequence_rows(
+    layout: TokenParallelLayout,
+    own_rows: jax.Array,
+    lead_rows: jax.Array,
+    rank: jax.Array,
+    axis_name: str,
+) -> jax.Array:
+    """Token-parallel rows `[R, N]` -> this rank's sequence-parallel rows `[R, N]`.
+
+    Per rank, inside a `shard_map` over `axis_name`: `own_rows` are step rows
+    `split_rows + rank * R + i`, `lead_rows` `[split_rows, N]` step rows
+    `[0, split_rows)` (same on every rank); the result is step rows
+    `rank * R + i`. Each rank hands its last `split_rows` rows to the next
+    rank; rank 0 takes `lead_rows` instead. Rows past `T` (the last rank's
+    tail) are dropped."""
+    s = layout.split_rows
+    rows = own_rows.shape[0]
+    if lead_rows.shape[0] != s or s > rows:
+        raise ValueError(
+            f"lead rows {lead_rows.shape[0]} must equal split_rows={s} <= {rows}"
+        )
+    if s == 0:
+        return own_rows
+    perm = [(i, i + 1) for i in range(layout.dcp_size - 1)]
+    carried = lax.ppermute(own_rows[rows - s :], axis_name, perm)
+    lead = jnp.where(rank == 0, lead_rows.astype(own_rows.dtype), carried)
+    return jnp.concatenate([lead, own_rows[: rows - s]], axis=0)
+
+
+def project_sequence_rows(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    own_out: jax.Array,
+    rank_ids: jax.Array,
+    w_uv: jax.Array,
+    w_o: jax.Array,
+    w_o_scale: jax.Array,
+) -> jax.Array:
+    """Split step's attention -> o_proj on sequence-parallel rows `[T, n]`.
+
+    Global view, `[T, n]` sharded over `axis_name`, rank `r` holding step rows
+    `r * T / dcp + i` -- what o_proj's reduce-scatter of head-sharded partial
+    sums yields, without the all-to-all back to heads or the reduce-scatter:
+    each rank gathers o_proj's FP8 row shards (weights only, independent of
+    the step) and projects every head of its own token-parallel rows.
+
+    Args:
+      lead_partial, lead_lse: `[dcp * s, H, L]` / `[dcp * s, H]`, each rank's
+        DCP partial of the `s = split_rows` leading rows over its KV shard.
+      own_out: `[dcp * R, H, V]`, every head of each rank's token-parallel rows
+        (`sparse_mla_attention(..., token_rows=True)` with `w_uv`).
+      rank_ids: i32[dcp] sharded, entry r = r.
+      w_uv: `[H, L, V]` sharded over heads.
+      w_o, w_o_scale: o_proj's `(H * V, n)` FP8 rows and `[dcp * n]` scales,
+        sharded: rank r's `(h * V, n)` row shard with its own per-channel
+        scale, as the row-parallel o_proj holds them.
+
+    Notes:
+      Assumptions: DCP rank r's heads are o_proj's input rows `[r * h * V,
+      (r + 1) * h * V)` and its sequence-parallel rows are the TP rank r's
+      (DCP group == TP group, as `moe_prefill_sp` already assumes).
+    """
+    sharded = P(axis_name)
+
+    def _local(part, lse_part, own, rank_arr, w_uv_local, w_shard, s_shard):
+        lses = lax.all_gather(lse_part, axis_name, axis=0, tiled=False)
+        m = jax.nn.logsumexp(lses, axis=0)
+        safe_m = jnp.where(jnp.isfinite(m), m, 0.0)
+        w = jnp.where(jnp.isfinite(lse_part), jnp.exp(lse_part - safe_m), 0.0)
+        weighted = (part.astype(jnp.float32) * w[..., None]).astype(part.dtype)
+        head_local = lax.psum_scatter(
+            weighted, axis_name, scatter_dimension=1, tiled=True
+        )
+        head_v = jnp.einsum(
+            "rhl,hlv->rhv", head_local, w_uv_local.astype(head_local.dtype)
+        ).astype(own.dtype)
+        w_mine = dequantize_row_shards(w_shard, s_shard[None, :], own.dtype)
+        lead_partial_rows = jnp.dot(
+            head_v.reshape(head_v.shape[0], -1),
+            w_mine,
+            preferred_element_type=jnp.float32,
+        ).astype(own.dtype)
+        lead = lax.psum(lead_partial_rows, axis_name)
+        w_all = dequantize_row_shards(
+            lax.all_gather(w_shard, axis_name, axis=0, tiled=True),
+            lax.all_gather(s_shard, axis_name, axis=0, tiled=False),
+            own.dtype,
+        )
+        mine = jnp.dot(
+            own.reshape(own.shape[0], -1), w_all, preferred_element_type=jnp.float32
+        ).astype(own.dtype)
+        return token_rows_to_sequence_rows(layout, mine, lead, rank_arr[0], axis_name)
+
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(sharded,) * 7,
+        out_specs=sharded,
+        check_vma=False,
+    )(lead_partial, lead_lse, own_out, rank_ids, w_uv, w_o, w_o_scale)
+
+
 # (q [R, H, D], nope buffer, rope buffer, flat top-k [R, K], real rows) -> [R, H, L]
 AttendFn = Callable[[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array], jax.Array]
 # (nope, rope, kv_c, k_pe, seq_lens, block_tables, query_start_loc, rank) -> caches
@@ -468,6 +586,7 @@ def sparse_mla_attention(
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv: jax.Array | None = None,
     q_pe: jax.Array | None = None,
+    token_rows: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 
@@ -487,7 +606,9 @@ def sparse_mla_attention(
     Returns:
       `(kv_cache_nope, kv_cache_rope, out)`, `out` `[dcp * T, h, L]` (or
       `[dcp * T, h, V]` when `w_uv` is given): each rank's head slice, row `i`
-      being step row `split_rows + i`.
+      being step row `split_rows + i`. With `token_rows`, `out` is instead
+      `[dcp * R, H, L or V]`: every head of each rank's own token-parallel
+      rows, with no all-to-all back to head sharding.
     """
     dcp = layout.dcp_size
     sharded = P(axis_name)
@@ -549,6 +670,8 @@ def sparse_mla_attention(
                 .swapaxes(0, 1)
                 .astype(out.dtype)
             )
+        if token_rows:
+            return nope, rope, out
         return nope, rope, tokens_to_heads(out, axis_name)
 
     extra: tuple[jax.Array, ...] = ()

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
+    TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
     TPU_MLA_DECODE_LOCAL_Q_AG: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
@@ -830,6 +831,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathered KV and index-K pages (`kernels/mla/dcp_token_parallel.py`).
     "TPU_DCP_PREFILL_TOKEN_PARALLEL": env_bool(
         "TPU_DCP_PREFILL_TOKEN_PARALLEL", default=True
+    ),
+    # With TPU_DCP_PREFILL_TOKEN_PARALLEL and TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
+    # each rank's token-parallel rows already hold every head, so run the whole
+    # o_proj on them and land on the sequence-parallel rows directly, skipping
+    # the all-to-all back to heads and o_proj's reduce-scatter
+    # (`dcp_token_parallel.project_sequence_rows`): the op all-gathers o_proj's
+    # FP8 row shards per layer (weights only, so XLA can issue it early).
+    "TPU_DCP_TP_PREFILL_LOCAL_OPROJ": env_bool(
+        "TPU_DCP_TP_PREFILL_LOCAL_OPROJ", default=True
     ),
     # Decode local-Q projection under query-replicated DCP: compute each rank's
     # local head-slice columns via the fused FP8 column-window matmul + 1-round

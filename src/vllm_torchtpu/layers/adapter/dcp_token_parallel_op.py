@@ -58,6 +58,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.mla import dcp_token_parallel, page_gather
 from vllm_torchtpu.kernels.mla.kv_cache_utils import update_sparse_mla_kv_cache_dcp
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 
 # Smallest bucket that takes the split (a power of two: `bucket_gate_edge`).
 MIN_TOKENS = 1024
@@ -77,6 +78,24 @@ def applies(num_tokens: int) -> bool:
         envs.TPU_DCP_PREFILL_TOKEN_PARALLEL
         and vllm_compilation_backends.model_tag == "backbone"
         and num_tokens > envs.bucket_gate_edge(MIN_TOKENS)
+    )
+
+
+def serves_sequence_row_oproj(o_proj: Any) -> bool:
+    """Whether the op can run `o_proj` itself (TPU_DCP_TP_PREFILL_LOCAL_OPROJ).
+
+    Its row shard must be FP8 in the canonical (k, n) layout with one scale per
+    output channel, as `dcp_token_parallel.project_sequence_rows` takes it."""
+    weight = getattr(o_proj, "weight", None)
+    scale = getattr(o_proj, "weight_scale", None)
+    return (
+        weight is not None
+        and scale is not None
+        and getattr(o_proj, "bias", None) is None
+        and bool(getattr(o_proj, WEIGHT_FLIPPED_ATTR, False))
+        and weight.dtype == torch.float8_e4m3fn
+        and scale.dim() == 1
+        and scale.shape[0] == weight.shape[1]
     )
 
 
@@ -364,6 +383,8 @@ def build_attention_op(
         after: jax.Array | None,
         rank_ids: jax.Array | None,
         w_uv: jax.Array | None = None,
+        w_o: jax.Array | None = None,
+        s_o: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if after is not None:
             kv_cache_nope, kv_cache_rope = _after_reads(
@@ -567,7 +588,27 @@ def build_attention_op(
             read_pages=read_pages,
             w_uv=w_uv,
             q_pe=pe_tp,
+            token_rows=w_o is not None,
         )
+
+        if w_o is not None:
+            assert s_o is not None and w_uv is not None and rank_ids is not None
+            return (
+                kv_cache_nope,
+                kv_cache_rope,
+                dcp_token_parallel.project_sequence_rows(
+                    layout,
+                    mesh,
+                    DCP_AXIS_NAME,
+                    partial,
+                    lse,
+                    tail_out,
+                    rank_ids,
+                    w_uv,
+                    w_o,
+                    s_o,
+                ),
+            )
 
         def _merge_and_join(part, lse_part, tail_local, *w_uv_arg):
             lses = jax.lax.all_gather(lse_part, DCP_AXIS_NAME, axis=0, tiled=False)
@@ -934,6 +975,71 @@ def build_attention_op(
     ):
         sharers.append(weakref.ref(target_layer))
 
+    oproj_op = None
+    if envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ:
+        if not (fused_subbatch and has_rank and uv_in_tp):
+            raise NotImplementedError(
+                "TPU_DCP_TP_PREFILL_LOCAL_OPROJ needs the fused sub-batch op with "
+                f"the DCP rank operand and W_UV in the op (fused={fused_subbatch}, "
+                f"rank={has_rank}, uv_in_tp={uv_in_tp})."
+            )
+
+        def w_oproj(
+            n: jax.Array,
+            r: jax.Array,
+            qn: jax.Array,
+            qp: jax.Array,
+            kc: jax.Array,
+            kp: jax.Array,
+            tk: jax.Array,
+            sl: jax.Array,
+            bt: jax.Array,
+            qsl: jax.Array,
+            rd: jax.Array,
+            rk: jax.Array,
+            uv: jax.Array,
+            wo: jax.Array,
+            so: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _run(n, r, qn, qp, kc, kp, tk, sl, bt, qsl, rd, None, rk, uv, wo, so)
+
+        def _fake_oproj(kv_cache_nope, kv_cache_rope, q, *rest, **kwargs):
+            del kwargs
+            kv_c_normed, w_o = rest[1], rest[-2]
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                q.new_empty((kv_c_normed.shape[0] // layout.dcp_size, w_o.shape[1])),
+            )
+
+        def _build_oproj_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                w_oproj,
+                donate_argnums=(0, 1),
+                mesh=mesh,
+                input_partition_specs=in_specs + (sharded, sharded),
+                output_partition_specs=(sharded, sharded, sharded),
+            )
+            built.register_fake(_fake_oproj)
+            return built, layers
+
+        oproj_op, _ = get_shared_jax_op(
+            "sparse_mla_tp_oproj",
+            (
+                id(mesh),
+                layout,
+                bool(q_replicated),
+                sm_scale,
+                dequant,
+                mixed_levers,
+                chunk_tokens,
+                num_heads,
+                out_dim,
+            ),
+            _build_oproj_op,
+        )
+
     def run(
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         q: torch.Tensor,
@@ -947,10 +1053,35 @@ def build_attention_op(
         request_distribution: torch.Tensor,
         after: torch.Tensor | None,
         w_uv: torch.Tensor | None = None,
+        w_o: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         nope_cache, rope_cache = kv_cache
         q_args = (q, q_pe) if use_split_op else (q,)
         after_args = () if fused_subbatch else (after,)
+        if w_o is not None:
+            if oproj_op is None or w_uv is None or rank_tensor is None:
+                raise RuntimeError(
+                    "sequence-row o_proj requested but its op was not built "
+                    "(TPU_DCP_TP_PREFILL_LOCAL_OPROJ off at load?)"
+                )
+            new_nope, new_rope, out = oproj_op(
+                nope_cache,
+                rope_cache,
+                *q_args,
+                kv_c_normed,
+                k_pe,
+                topk_in,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rank_tensor,
+                w_uv,
+                *w_o,
+            )
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            return out
         new_nope, new_rope, out = op(
             nope_cache,
             rope_cache,
@@ -1005,11 +1136,16 @@ def attention(
     topk_rows: torch.Tensor,
     attn_metadata: Any,
     q_replicated: bool,
+    w_o: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Sparse MLA of a split bucket: `[T, heads, kv_lora_rank]`, this rank's
     heads, merged; what the DCP path returns for the same step. `ql_nope` /
     `q_pe` hold this rank's heads of every row, or, under query replication,
-    every head of the `q_rows` rows."""
+    every head of the `q_rows` rows.
+
+    With `w_o` (this rank's FP8 o_proj row shard, canonical (k, n), and its
+    per-channel scale): o_proj's output on this rank's sequence-parallel rows
+    instead, `[T / dcp, hidden]` (`dcp_token_parallel.project_sequence_rows`)."""
     from vllm_torchtpu.layers.adapter.cp_mla_attention import (
         _retain_rank,
         all_gather_q_nope_pe_heads,
@@ -1029,6 +1165,8 @@ def attention(
     if q_replicated and ql_nope.shape[0] != s + rows:
         raise ValueError(f"q has {ql_nope.shape[0]} rows, not the {s + rows} q_rows")
     md = attn_metadata
+    if w_o is not None and not getattr(tp_op, "fused_subbatch", False):
+        raise NotImplementedError("sequence-row o_proj needs the fused sub-batch op")
     if getattr(tp_op, "fused_subbatch", False):
         w_uv_arg = None
         if getattr(tp_op, "uv_in_tp", False):
@@ -1050,6 +1188,7 @@ def attention(
             md.request_distribution,
             None,
             w_uv_arg,
+            w_o,
         )
         return _retain_rank(out)
 
