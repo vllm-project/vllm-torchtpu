@@ -1115,8 +1115,14 @@ def fused_moe_prefill_nvfp4(
 
     x_clean = None
     if act_mode == "w4a16" or shared_gate_weight is not None:
+        # A padded row (no routed weight) may hold garbage, and its routes fall
+        # back to the token's shared row with coefficient 0, so a NaN there
+        # would survive as NaN * 0: zero it. A real row keeps its NaN / inf, as
+        # moe_tp_decode's _tp_chain does, so a NaN canary still surfaces (in
+        # "w4a8" the FP8 row quantization zeroes non-finite rows).
+        padded = jnp.all(topk_weights == 0, axis=-1, keepdims=True)
         row_finite = jnp.all(jnp.isfinite(x), axis=-1, keepdims=True)
-        x_clean = jnp.where(row_finite, x, jnp.zeros_like(x))
+        x_clean = jnp.where(~padded | row_finite, x, jnp.zeros_like(x))
 
     route_valid = topk_weights != 0
     if expert_start is not None:

@@ -643,8 +643,10 @@ def _run_oracles(
     def f32_body(x_, w1_, w2_, s1_, s2_, sw1_, ss1_, sw2_, ss2_, tw_, tids_, e0_, gw_):
         hp = lax.Precision.HIGHEST
         tokens = x_.shape[0]
-        row_fin = jnp.all(jnp.isfinite(x_), axis=-1, keepdims=True)
-        xc = jnp.where(row_fin, x_.astype(F32), 0.0)
+        # As the kernel: only padded rows (no routed weight) are cleaned.
+        keep = jnp.any(tw_ != 0, axis=-1, keepdims=True)
+        keep = keep | jnp.all(jnp.isfinite(x_), axis=-1, keepdims=True)
+        xc = jnp.where(keep, x_.astype(F32), 0.0)
 
         sw1_f = sw1_.astype(F32) * ss1_[None, :]
         sw2_f = sw2_.astype(F32) * ss2_[None, :]
@@ -676,8 +678,9 @@ def _run_oracles(
         x_, w1_, w2_, s1_, s2_, sw1_, ss1_, sw2_, ss2_, tw_, tids_, e0_, gw_
     ):
         tokens = x_.shape[0]
-        row_fin = jnp.all(jnp.isfinite(x_), axis=-1, keepdims=True)
-        xc_bf16 = jnp.where(row_fin, x_, jnp.zeros_like(x_))
+        keep = jnp.any(tw_ != 0, axis=-1, keepdims=True)
+        keep = keep | jnp.all(jnp.isfinite(x_), axis=-1, keepdims=True)
+        xc_bf16 = jnp.where(keep, x_, jnp.zeros_like(x_))
         e_start = e0_.reshape(()) if ep > 1 else jnp.int32(0)
 
         if act_mode == "w4a16":
@@ -1484,6 +1487,65 @@ def test_nan_padded_rows_and_gated_shared_expert(
     np.testing.assert_array_equal(got_np[valid:], np.zeros_like(got_np[valid:]))
     assert _rel_l2(got_nan, ora) <= 2e-3
     assert _rel_l2(got_nan, ref) <= (0.05 if act_mode == "w4a16" else 0.08)
+
+
+@pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
+def test_nan_in_a_real_row_stays_in_that_row(
+    _cpu8_worker_run: bool, monkeypatch: pytest.MonkeyPatch, act_mode: mod.ActMode
+):
+    """A NaN in a routed (real) token's row is not cleaned away: in "w4a16" that
+    token's output row is NaN, as moe_tp_decode's _tp_chain gives, so a NaN
+    canary surfaces. In "w4a8" the FP8 row quantization zeroes the row. Every
+    other row is bit-identical to the run without the NaN."""
+    if not _cpu8_worker_run:
+        return
+    _install_cpu_expert_emulator(monkeypatch)
+    mesh = _cpu_or_any_mesh()
+    rep = NamedSharding(mesh, P())
+    weights = _build_small_sharded_weights(mesh, SMALL_EP2TP4, seed=71)
+    w1, w2, s1, s2, sw1, ss1, sw2, ss2, e0 = weights
+    x_np, tw_np, ids_np = _make_inputs(
+        96, SMALL_EP2TP4, mode="uniform", seed=72, pad_tokens=8, poison_pad_nan=True
+    )
+    bad_row = 5
+    assert (tw_np[bad_row] != 0).any()
+    x_bad_np = x_np.copy()
+    x_bad_np[bad_row, :4] = np.nan
+    tw = jax.device_put(jnp.asarray(tw_np, dtype=BF16), rep)
+    tids = jax.device_put(jnp.asarray(ids_np, dtype=jnp.int32), rep)
+
+    def run(x_host: np.ndarray) -> np.ndarray:
+        x = jax.device_put(jnp.asarray(x_host, dtype=BF16), rep)
+        return np.asarray(
+            _run_kernel(
+                mesh,
+                SMALL_EP2TP4,
+                x,
+                w1,
+                w2,
+                s1,
+                s2,
+                sw1,
+                ss1,
+                sw2,
+                ss2,
+                None,
+                tw,
+                tids,
+                e0,
+                act_mode=act_mode,
+            )
+        )
+
+    got, got_bad = run(x_np), run(x_bad_np)
+    others = np.arange(got.shape[0]) != bad_row
+    np.testing.assert_array_equal(
+        got_bad[others].view(np.uint16), got[others].view(np.uint16)
+    )
+    if act_mode == "w4a16":
+        assert np.isnan(got_bad[bad_row].astype(np.float32)).all()
+    else:
+        np.testing.assert_array_equal(got_bad[bad_row], np.zeros_like(got[bad_row]))
 
 
 def test_w2_n_chunk_invariance(_cpu8_worker_run: bool, monkeypatch: pytest.MonkeyPatch):
