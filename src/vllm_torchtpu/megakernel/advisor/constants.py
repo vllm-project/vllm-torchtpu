@@ -503,6 +503,12 @@ XPLANE_SPARSE_FILTER = "sparse"
 COLLECTIVE_IGNORE_SUFFIXES: tuple[str, ...] = ("-done", ".done")
 XLA_MODULE_MARKERS: tuple[str, ...] = ("xla module", "xla_module")
 STEP_EVENT_MARKERS: tuple[str, ...] = ("step", "model_step", "step_num")
+COLLECTIVE_PATH_XLA = "xla"
+COLLECTIVE_PATH_IN_KERNEL = "in_kernel"
+VALID_COLLECTIVE_PATHS: frozenset[str] = frozenset(
+    {COLLECTIVE_PATH_XLA, COLLECTIVE_PATH_IN_KERNEL}
+)
+COLLECTIVE_OP_ALL_REDUCE = "all-reduce"
 COLLECTIVE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("all-reduce", "all-reduce"),
     ("allreduce", "all-reduce"),
