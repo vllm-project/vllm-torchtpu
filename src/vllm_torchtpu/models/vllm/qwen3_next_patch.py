@@ -57,8 +57,9 @@ forwards restructured so torch.compile serves every bucket:
   expected to contain only concrete integers" at the all-gather's
   allocation). On the stack this structure comes from (bec1a1c91), the
   model-entry chunk hit this at every SP bucket and this structure compiles.
-- The pad before the reduce-scatter is eliminated: buckets divide by TP
-  (`sequence_parallel.check_buckets`).
+- The pad before the reduce-scatter is eliminated: every sequence-parallel
+  compile size divides by TP (the platform keeps only those,
+  `_configure_sequence_parallel_moe`).
 - A step shorter than `sequence_parallel.min_rows()` keeps its rows
   replicated and all-reduces the attention output instead (a Qwen3.5 target
   only; the threshold is a per-layout table).
