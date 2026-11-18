@@ -15,6 +15,8 @@
 tail must emit byte-identical text to one primed with the whole prompt."""
 
 import random
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import tokenizers
@@ -163,3 +165,39 @@ def test_install_patches_vllm_detokenizer(monkeypatch):
     finally:
         cls.__init__ = orig
         ff._DETOK_INSTALLED = False
+
+
+@pytest.fixture
+def detok_cls(monkeypatch):
+    """vLLM's FastIncrementalDetokenizer, restored after the test."""
+    detok = pytest.importorskip("vllm.v1.engine.detokenizer")
+    cls = detok.FastIncrementalDetokenizer
+    monkeypatch.setattr(cls, "__init__", cls.__init__)
+    monkeypatch.setattr(ff, "_DETOK_INSTALLED", False)
+    return cls
+
+
+def _in_process(monkeypatch, name):
+    monkeypatch.setattr(
+        ff.multiprocessing, "current_process", lambda: SimpleNamespace(name=name)
+    )
+
+
+@pytest.mark.parametrize("name", ["MainProcess", "APIServer_DPRank_1", "ApiServer_0"])
+def test_install_in_every_api_server_process(monkeypatch, detok_cls, name):
+    """vLLM's DP supervisor runs its API servers as APIServer_DPRank_<n>."""
+    _in_process(monkeypatch, name)
+    orig = detok_cls.__init__
+    assert ff.maybe_install_detok_prompt_tail()
+    assert detok_cls.__init__.__wrapped__ is orig
+
+
+def test_install_elsewhere_warns_and_leaves_vllm_alone(monkeypatch, detok_cls):
+    _in_process(monkeypatch, "EngineCore_DP0")
+    logger = Mock()
+    monkeypatch.setattr(ff, "logger", logger)
+    orig = detok_cls.__init__
+    assert ff.maybe_install_detok_prompt_tail() is False
+    assert detok_cls.__init__ is orig
+    (call,) = logger.warning.call_args_list
+    assert "EngineCore_DP0" in call.args
