@@ -264,8 +264,9 @@ def prepare(cache_root: str, splitting_ops=None):
         VLLM_USE_AOT_COMPILE="1",
         VLLM_USE_MEGA_AOT_ARTIFACT="0",
     )
-    # The cache keys hash a ModelConfig these tests do not build.
-    tpu_compiler.compute_tpu_compilation_hash = lambda config: "test"
+    # The cache keys hash a ModelConfig these tests do not build. Both the AOT
+    # and the piecewise key read the factors through this one function.
+    tpu_compiler.tpu_compilation_hash_factors = lambda config: {"test": True}
     # TpuPlatform.check_and_update_config() installs this, and these tests skip
     # that hook; without it the AOT artifact path cannot tell traces apart.
     vllm_torchtpu._patch_vllm_aot_compile_cache_key()

@@ -417,8 +417,8 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
-def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
-    """Hash TPU-specific factors used by both AOT and piecewise caches."""
+def tpu_compilation_hash_factors(vllm_config: VllmConfig) -> dict[str, Any]:
+    """TPU-specific factors behind both the AOT and the piecewise cache keys."""
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
@@ -467,22 +467,30 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     }
 
     repo_root = Path(__file__).resolve().parents[2]
-    hash_obj = hashlib.sha256(
-        json.dumps(factors, sort_keys=True, separators=(",", ":")).encode()
-    )
+    sources = {}
     for path in _iter_runtime_cache_key_files(repo_root):
         relpath = path.relative_to(repo_root).as_posix()
-        hash_obj.update(relpath.encode())
         try:
-            hash_obj.update(path.read_bytes())
+            sources[relpath] = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError as exc:
             logger.warning(
                 "[TpuCompilerAdaptor] Failed to read cache key source %s: %s",
                 path,
                 exc,
             )
+            sources[relpath] = None
+    factors["sources"] = sources
+    return factors
 
-    return hash_obj.hexdigest()[:10]
+
+def _hash_factors(factors: dict[str, Any]) -> str:
+    blob = json.dumps(factors, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()[:10]
+
+
+def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
+    """Hash TPU-specific factors used by both AOT and piecewise caches."""
+    return _hash_factors(tpu_compilation_hash_factors(vllm_config))
 
 
 # TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source
@@ -531,19 +539,40 @@ class TpuCompilerAdaptor(CompilerInterface):
 
     name = "tpu"
 
+    # Written next to vLLM's cache_key_factors.json: two starts that land in
+    # different cache dirs can be diffed down to the factor that moved.
+    FACTORS_FILE = "tpu_cache_key_factors.json"
+
     def __init__(self):
         self.cache_dir: str | None = None
         self._disable_cache = False
+        self._key_factors: dict[str, Any] | None = None
 
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
     ) -> None:
         self.cache_dir = cache_dir
         self._disable_cache = disable_cache
+        # vLLM's backend calls compute_hash, which records the factors, first.
+        path = os.path.join(cache_dir, self.FACTORS_FILE)
+        if disable_cache or self._key_factors is None or os.path.exists(path):
+            return
+        # Write-then-rename, as for artifacts: a crash mid-write must not leave
+        # a truncated file that the exists() check above then keeps.
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(self._key_factors, f, indent=2, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.warning("[TpuCompilerAdaptor] Could not write %s: %s", path, e)
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
 
     def compute_hash(self, vllm_config: VllmConfig) -> str:
         """Hash TPU runtime sources that sit behind custom-op boundaries."""
-        return compute_tpu_compilation_hash(vllm_config)
+        self._key_factors = tpu_compilation_hash_factors(vllm_config)
+        return _hash_factors(self._key_factors)
 
     @staticmethod
     def _unwrap_compiled_fn(compiled_fn):
