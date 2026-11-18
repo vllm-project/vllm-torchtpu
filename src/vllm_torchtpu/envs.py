@@ -75,6 +75,8 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     FUSED_MOE_DECODE_KERNEL_FOLD: str = "off"
+    FUSED_MOE_DECODE_EXACT_WIDTH: bool = False
+    FUSED_MOE_DECODE_KERNEL_PADDING_MASK: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1680,6 +1682,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel. "off": the unfolded call.
     "FUSED_MOE_DECODE_KERNEL_FOLD": env_with_choices(
         "FUSED_MOE_DECODE_KERNEL_FOLD", "off", ["off", "xla", "kernel"]
+    ),
+    # The fused MoE decode kernel's TP all-reduce output is [tokens, hidden]:
+    # each rank's all-gather sends only the columns of its reduce chunk below
+    # hidden, instead of the whole chunk into a buffer padded to n_ranks lanes
+    # of 128 that a slice then cuts back (a copy whenever the consumer is a
+    # Pallas kernel). Bitwise the same output.
+    "FUSED_MOE_DECODE_EXACT_WIDTH": env_bool("FUSED_MOE_DECODE_EXACT_WIDTH"),
+    # The fused MoE decode kernel zeroes the target model's padded rows itself
+    # (hidden states and route weights from the real-row count, read from the
+    # TPU_MOE_SKIP_PADDED_TOKENS mask), so the decoder layer's mask of the MoE
+    # input and zero_routing_weights_for_padding are skipped for armed layers.
+    # Bitwise the same output. Needs FUSED_MOE_DECODE_KERNEL_FOLD,
+    # TPU_MOE_SKIP_PADDED_TOKENS, DP 1 and PCP 1; the drafter's layers keep
+    # both masks.
+    "FUSED_MOE_DECODE_KERNEL_PADDING_MASK": env_bool(
+        "FUSED_MOE_DECODE_KERNEL_PADDING_MASK"
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.

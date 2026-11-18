@@ -32,10 +32,29 @@ def test_arm_runner_models_without_drafter(monkeypatch):
 
     armed = []
     monkeypatch.setattr(
-        bridge, "arm_fused_moe_decode", lambda m, label: armed.append(label) or 1
+        bridge,
+        "arm_fused_moe_decode",
+        lambda m, label, padding_mask=False: armed.append(label) or 1,
     )
     assert bridge.arm_runner_models(Runner()) == 1
     assert armed == ["target model"]
+
+
+def test_padding_mask_arms_the_target_model_only(monkeypatch):
+    monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL_PADDING_MASK", "1")
+
+    class Runner:
+        model = torch.nn.Linear(1, 1)
+        drafter = SimpleNamespace(model=torch.nn.Linear(1, 1))
+
+    armed = []
+    monkeypatch.setattr(
+        bridge,
+        "arm_fused_moe_decode",
+        lambda m, label, padding_mask=False: armed.append((label, padding_mask)) or 1,
+    )
+    assert bridge.arm_runner_models(Runner()) == 2
+    assert armed == [("target model", True), ("draft model", False)]
 
 
 def test_max_tokens_env(monkeypatch):
@@ -81,6 +100,132 @@ def test_token_cap_dispatch(monkeypatch, tokens, expert_parallel):
     assert len(calls) == 1
     assert path == ("kernel" if tokens <= 256 else "gmm")
     assert start == (192 if expert_parallel else None)
+
+
+def _garbage_rows(tokens, n):
+    rng = np.random.default_rng(tokens)
+    x = rng.normal(size=(tokens, H)).astype(np.float32)
+    tw = rng.random((tokens, 2)).astype(np.float32)
+    x[n:] = np.nan
+    x[n:, 1] = -np.inf
+    tw[n:] = np.nan
+    return x, tw
+
+
+@pytest.mark.parametrize("tokens", [16, 13, 600])
+def test_padding_mask_dispatch(monkeypatch, tokens):
+    """FUSED_MOE_DECODE_KERNEL_PADDING_MASK: up to the cap the kernel takes the
+    rows as they are, with valid_rows and the count in rank[0, 2]; above it the
+    GMM path takes them zeroed from the count on, bitwise as the decoder
+    layer's mask and zero_routing_weights_for_padding leave them (+0)."""
+    n = 9
+    seen = {}
+
+    def kernel(rank, x, *args, valid_rows=False, **kwargs):
+        seen.update(path="kernel", rank=rank, x=x, tw=args[9], valid_rows=valid_rows)
+        return x
+
+    def gmm(x, *args, **kwargs):
+        seen.update(path="gmm", x=np.asarray(x), tw=np.asarray(args[9]))
+        return x
+
+    monkeypatch.setattr(bridge, "_kernel_body", kernel)
+    monkeypatch.setattr(bridge, "_gmm_layer", gmm)
+    monkeypatch.setattr(bridge, "plan_weight_ring", lambda *a, **k: (None, 3))
+    x, tw = _garbage_rows(tokens, n)
+    rank = np.array([[3, 192, n]], np.int32)
+    w = np.zeros((1, 1), np.float32)
+    bridge._layer(
+        rank,
+        x,
+        *([w] * 9),
+        tw,
+        np.zeros((tokens, 2), np.int32),
+        n_ranks=8,
+        topk=2,
+        expert_parallel=True,
+        max_tokens=512,
+        fold="xla",
+        padding_mask=True,
+    )
+    if tokens <= 512:
+        assert seen["path"] == "kernel" and seen["valid_rows"] is True
+        assert seen["rank"] is rank and seen["x"] is x and seen["tw"] is tw
+        return
+    assert seen["path"] == "gmm"
+    for got, src in ((seen["x"], x), (seen["tw"], tw)):
+        np.testing.assert_array_equal(got[:n], src[:n])
+        assert (got[n:] == 0).all() and not np.signbit(got[n:]).any()
+
+
+def test_local_valid_count(monkeypatch):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    state = token_padding.TokenPaddingState.create(32, "cpu")
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    for valid in (0, 5, 16):
+        state.update(valid, 16)
+        count = token_padding.local_valid_count(16)
+        assert count.dtype == torch.int32 and count.tolist() == [valid]
+
+
+def test_forward_appends_the_count_to_the_rank_operand(monkeypatch):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    state = token_padding.TokenPaddingState.create(32, "cpu")
+    state.update(11, 16)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    monkeypatch.setattr(
+        bridge, "_RANK_BUFFER", torch.tensor([[3, 192]], dtype=torch.int32)
+    )
+    seen = []
+    qm = SimpleNamespace()
+    setattr(qm, bridge.FUSED_MOE_DECODE_OP_ATTR, lambda *a: seen.append(a[-1]) or a[0])
+    layer = SimpleNamespace(
+        w13_weight=None, w2_weight=None, w13_weight_scale_inv=None, w2_weight_scale_inv=None
+    )
+    for name in bridge._SHARED_BUFFERS:
+        setattr(layer, name, None)
+    x = torch.zeros((16, H))
+    bridge.fused_moe_decode(qm, layer, x, None, None)
+    assert seen[-1].tolist() == [[3, 192]]
+    setattr(qm, bridge._PADDING_MASK_ATTR, True)
+    assert bridge.fused_moe_decode_masks_padding(qm)
+    bridge.fused_moe_decode(qm, layer, x, None, None)
+    assert seen[-1].dtype == torch.int32 and seen[-1].tolist() == [[3, 192, 11]]
+
+
+def test_kernel_masks_padding_reads_the_blocks_runner():
+    runner = SimpleNamespace()
+    assert not bridge.kernel_masks_padding(SimpleNamespace(experts=runner))
+    setattr(runner, bridge._PADDING_MASK_ATTR, True)
+    assert bridge.kernel_masks_padding(SimpleNamespace(experts=runner))
+    assert not bridge.kernel_masks_padding(torch.nn.Linear(1, 1))  # a dense MLP
+
+
+def test_padding_mask_declined(monkeypatch):
+    import vllm.distributed.parallel_state as parallel_state
+
+    from vllm_torchtpu.distributed import pcp
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL_FOLD", "xla")
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    state = token_padding.TokenPaddingState.create(8, "cpu")
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    monkeypatch.setattr(
+        parallel_state, "get_dp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: None)
+    assert bridge._padding_mask_declined() is None
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: SimpleNamespace(world_size=2))
+    assert "PCP 2" in bridge._padding_mask_declined()
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: None)
+    monkeypatch.setattr(token_padding, "_padding_state", None)
+    assert "TPU_MOE_SKIP_PADDED_TOKENS" in bridge._padding_mask_declined()
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL_FOLD", "off")
+    assert "FOLD" in bridge._padding_mask_declined()
 
 
 class DeepseekV2MLP(torch.nn.Module):

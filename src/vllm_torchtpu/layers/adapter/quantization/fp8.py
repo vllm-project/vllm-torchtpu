@@ -1138,6 +1138,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
         from vllm_torchtpu.layers.adapter.fused_moe_decode import (
             fused_moe_decode,
+            fused_moe_decode_masks_padding,
             fused_moe_decode_supported,
         )
 
@@ -1145,9 +1146,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # Armed layer (arm_fused_moe_decode, which also takes precedence
             # over the adaptive fused EP kernel): replicated tokens in, the
             # all-reduced shared + routed sum out; above the token cap the
-            # same op runs the GMM MoE.
+            # same op runs the GMM MoE. With FUSED_MOE_DECODE_KERNEL_PADDING_MASK
+            # the op zeroes the padded rows' weights itself.
             topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
-            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS and not fused_moe_decode_masks_padding(
+                self
+            ):
                 topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                     topk_ids, topk_weights, is_local_tensor=False
                 )

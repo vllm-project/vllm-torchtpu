@@ -37,6 +37,16 @@ An armed layer takes precedence over the adaptive fused EP kernel
 (MOE_FUSED_EP_KERNEL_IMPL=adaptive) in VllmFp8MoEMethodTPU.apply_monolithic.
 Arming logs, per model, how many layers it declined and why.
 
+With ``FUSED_MOE_DECODE_KERNEL_PADDING_MASK=1`` the target model's armed
+layers also take over the two padded-row masks around them: the decoder
+layer's zeroing of the MoE input (``kernel_masks_padding``) and
+``zero_routing_weights_for_padding``. The op takes this rank's real-row count
+from the TPU_MOE_SKIP_PADDED_TOKENS mask as a third column of its rank operand;
+the kernel reads rows from that count on as zero hidden states with zero route
+weights, and above the token cap the GMM path masks them in XLA first. In the
+ALL sequence layout (DP 1, PCP 1) the count equals the decoder layer's
+``query_start_loc[-1]``, so the output is bitwise the masked layer's.
+
 Every rank must arm the same layers: the kernel's collectives start at entry,
 and a rank serving a layer with the GMM path leaves its peers waiting. Arming
 compares a signature across the EP group and raises on any mismatch.
@@ -61,6 +71,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     plan_weight_ring,
     vmem_bytes,
 )
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -72,6 +83,8 @@ logger = init_logger(__name__)
 
 FUSED_MOE_DECODE_OP_ATTR = "_fused_moe_decode_op"
 _RUNNER_ARMED_ATTR = "_fused_moe_decode_armed"
+# On an armed runner and its quant method: the op masks the padded rows itself.
+_PADDING_MASK_ATTR = "_fused_moe_decode_padding_mask"
 # The shared expert's tensors become non-persistent buffers of the routed layer,
 # so they stay module state Dynamo traces like any weight (a tensor reached
 # through a plain attribute makes traces of the same graph disagree on inputs).
@@ -95,6 +108,20 @@ _RANK_BUFFER_INDEX: int | None = None
 
 def fused_moe_decode_supported(quant_method: Any) -> bool:
     return getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR, None) is not None
+
+
+def fused_moe_decode_masks_padding(quant_method: Any) -> bool:
+    """Whether the armed op zeroes padded rows' route weights itself
+    (FUSED_MOE_DECODE_KERNEL_PADDING_MASK)."""
+    return getattr(quant_method, _PADDING_MASK_ATTR, False)
+
+
+def kernel_masks_padding(moe_block: Any) -> bool:
+    """Whether the MoE block's runner (its `experts`, as vLLM's MoE blocks name
+    the MoERunner) is armed with FUSED_MOE_DECODE_KERNEL_PADDING_MASK, so the
+    caller may pass padded rows unmasked. The runner is then the block's only
+    consumer of its input: arming requires the runner to own the shared expert."""
+    return getattr(getattr(moe_block, "experts", None), _PADDING_MASK_ATTR, False)
 
 
 def _gmm_layer(
@@ -189,12 +216,22 @@ def _layer(
     shared_gated=True,
     routed_scale=1.0,
     fold="off",
+    exact_width=False,
+    padding_mask=False,
 ):
     """Per-rank body of the op: the kernel up to `max_tokens`, GMM MoE above.
     An ungated layer still passes its placeholder shared_gate_weight operand
-    (fixed op arity); shared_gated=False ignores it."""
+    (fixed op arity); shared_gated=False ignores it. exact_width: the TP
+    all-reduce output at [tokens, H] (FUSED_MOE_DECODE_EXACT_WIDTH).
+    padding_mask (needs fold): rank is [1, 3], rank[0, 2] the real-row count;
+    rows from it on are computed as zero hidden states with zero route weights."""
     start = rank[0, 1] if expert_parallel else None
     if x.shape[0] > max_tokens:
+        if padding_mask:
+            # The decoder layer's mask and zero_routing_weights_for_padding.
+            keep = (jnp.arange(x.shape[0]) < rank[0, 2])[:, None]
+            x = jnp.where(keep, x, jnp.zeros_like(x))
+            tw = jnp.where(keep, tw, jnp.zeros_like(tw))
         return _gmm_layer(
             x,
             w1,
@@ -251,7 +288,10 @@ def _layer(
             routed_scale=routed_scale,
             fold=True,
             gate_in_kernel=fold == "kernel",
+            exact_width=exact_width,
+            valid_rows=padding_mask,
         )
+    assert not padding_mask, "padding_mask needs fold"
     return _kernel_body(
         rank[0, :1],
         x,
@@ -269,6 +309,7 @@ def _layer(
         n_ranks=n_ranks,
         expert_start=start,
         routed_scale=routed_scale,
+        exact_width=exact_width,
     )
 
 
@@ -280,8 +321,10 @@ def _build_op(
     max_tokens: int,
     shared_gated: bool = True,
     routed_scale: float = 1.0,
+    padding_mask: bool = False,
 ):
     fold = envs.FUSED_MOE_DECODE_KERNEL_FOLD
+    exact_width = envs.FUSED_MOE_DECODE_EXACT_WIDTH
     key = (
         id(mesh),
         n_ranks,
@@ -291,6 +334,8 @@ def _build_op(
         shared_gated,
         routed_scale,
         fold,
+        exact_width,
+        padding_mask,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -305,6 +350,8 @@ def _build_op(
         shared_gated=shared_gated,
         routed_scale=routed_scale,
         fold=fold,
+        exact_width=exact_width,
+        padding_mask=padding_mask,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a
@@ -643,8 +690,29 @@ def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
         )
 
 
-def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
+def _padding_mask_declined() -> str | None:
+    """Why FUSED_MOE_DECODE_KERNEL_PADDING_MASK cannot apply, or None."""
+    if envs.FUSED_MOE_DECODE_KERNEL_FOLD == "off":
+        return "needs FUSED_MOE_DECODE_KERNEL_FOLD"
+    if not envs.TPU_MOE_SKIP_PADDED_TOKENS or token_padding._padding_state is None:
+        return "needs TPU_MOE_SKIP_PADDED_TOKENS=1 (the real-row count is its mask's)"
+    from vllm.distributed.parallel_state import get_dp_group
+
+    from vllm_torchtpu.distributed.pcp import get_pcp_group
+
+    for name, group in (("DP", get_dp_group()), ("PCP", get_pcp_group())):
+        if group is not None and int(group.world_size) > 1:
+            # zero_routing_weights_for_padding gathers the ranks' masks there.
+            return f"{name} {int(group.world_size)} > 1"
+    return None
+
+
+def arm_fused_moe_decode(
+    model: torch.nn.Module, what: str = "model", padding_mask: bool = False
+) -> int:
     """Arm every eligible MoE layer of `model`; returns how many were armed.
+    padding_mask: the layers also mask padded rows themselves
+    (FUSED_MOE_DECODE_KERNEL_PADDING_MASK), where _padding_mask_declined allows.
 
     Collective over the EP group when EP is on: every rank must call it."""
     if not envs.FUSED_MOE_DECODE_KERNEL:
@@ -698,6 +766,15 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         ),
     )
     _check_same_arming_on_every_rank(signature, what)
+    if padding_mask and plan:
+        declined = _padding_mask_declined()
+        if declined is not None:
+            logger.info(
+                "Fused MoE decode kernel: padding mask not taken over for the %s: %s",
+                what,
+                declined,
+            )
+            padding_mask = False
     armed = 0
     for runner, shared, expert_parallel, routed_scale in plan:
         layer = runner.routed_experts
@@ -740,8 +817,10 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
                 max_tokens,
                 shared_gated,
                 routed_scale,
+                padding_mask,
             ),
         )
+        setattr(runner._quant_method, _PADDING_MASK_ATTR, padding_mask)
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)
         runner._shared_experts = None
@@ -750,12 +829,13 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         runner.routed_scaling_factor = 1.0
         runner._forward_entry = runner._select_forward()
         object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
+        object.__setattr__(runner, _PADDING_MASK_ATTR, padding_mask)
         armed += 1
     # Every rank logs: the evidence that all ranks armed the same layers.
     logger.info(
         "Armed the fused MoE decode kernel on %d of %d MoE layers of the %s "
         "(ep_mesh_index %s, experts_start %s, %d ranks, shared gate %s, "
-        "routed_scale %s, up to %d tokens; GMM MoE above)",
+        "routed_scale %s, up to %d tokens; GMM MoE above; padding mask %s)",
         armed,
         len(runners),
         what,
@@ -765,6 +845,7 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         sorted({s[2] for s in signature[1]}),
         sorted({s[3] for s in signature[1]}),
         max_tokens,
+        "in the op" if padding_mask and armed else "outside",
     )
     return armed
 
@@ -782,6 +863,11 @@ def fused_moe_decode(
         getattr(layer, name) for name in _SHARED_BUFFERS
     )
     op = getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR)
+    rank = _RANK_BUFFER
+    if fused_moe_decode_masks_padding(quant_method):
+        # The same two ops in every layer, so XLA's CSE leaves one per step.
+        count = token_padding.local_valid_count(x.shape[0])
+        rank = torch.cat([rank, count.view(1, 1)], dim=1)
     return op(
         x,
         layer.w13_weight,
@@ -795,15 +881,21 @@ def fused_moe_decode(
         shared_gate_weight,
         topk_weights,
         topk_ids,
-        _RANK_BUFFER,
+        rank,
     )
 
 
 def arm_runner_models(model_runner: Any) -> int:
     """Arm the target model and, when it is a separate module, the drafter's
     model (the MTP layer). Called once after the drafter has loaded, when every
-    module has its final weight layout."""
-    armed = arm_fused_moe_decode(model_runner.model, "target model")
+    module has its final weight layout. The drafter keeps the padded-row masks
+    outside the op: its row-evaluated forwards mask by row index, and its
+    padding mask is the target step's unless VLLM_TPU_MTP_DRAFT_PADDING_MASK."""
+    armed = arm_fused_moe_decode(
+        model_runner.model,
+        "target model",
+        padding_mask=envs.FUSED_MOE_DECODE_KERNEL_PADDING_MASK,
+    )
     # Read the attribute, not the runner's `_async_drafter` property: that
     # property asserts a drafter exists, so it raises for runs without
     # speculative decoding instead of returning a default.
