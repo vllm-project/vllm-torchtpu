@@ -20,6 +20,7 @@ import ctypes
 import gc
 import os
 import time
+import types
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -93,6 +94,41 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+
+
+# TODO: Remove this function and its call in compile_or_warm_up_model() once
+# torch's aot_module_simplified stops attaching the traced module's zero_grad,
+# named_parameters and named_buffers to the forward it returns; the first check
+# in test_drop_traced_module_refs_frees_compile_time_graphs then fails.
+def _drop_traced_module_refs() -> None:
+    """Drop the traced modules that aot_autograd leaves on compiled forwards.
+
+    `aot_module_simplified` hangs the traced GraphModule's `zero_grad`,
+    `named_parameters` and `named_buffers` on the forward it returns, and
+    Dynamo's `disable()` wrapper copies them along with the forward's
+    `__qualname__`. Inference never calls them, but they keep every
+    compile-time graph, with its fake tensors and stack traces, in host memory
+    for the life of the worker.
+    """
+    dropped = 0
+    for obj in gc.get_objects():
+        # type(), not isinstance(): isinstance() reads __class__, which some
+        # deprecated torch objects turn into a warning.
+        if type(obj) is not types.FunctionType or not obj.__qualname__.endswith(
+            "aot_module_simplified.<locals>.forward"
+        ):
+            continue
+        attrs = obj.__dict__
+        for name in [name for name, value in attrs.items() if _holds_module(value)]:
+            del attrs[name]
+            dropped += 1
+    logger.info("Dropped %d traced-module references from compiled forwards.", dropped)
+
+
+def _holds_module(value: object) -> bool:
+    if isinstance(value, types.MethodType):
+        value = value.__self__
+    return isinstance(value, torch.nn.Module)
 
 
 class TPUWorker(WorkerBase):
@@ -861,6 +897,8 @@ class TPUWorker(WorkerBase):
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
+        # Before freeze_gc_heap(), whose collection then frees the graphs.
+        _drop_traced_module_refs()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
