@@ -141,23 +141,29 @@ class RequestSlotTable[RowT: Sequence[int]]:
     slot of its ``allocator``.
 
     Row 0 holds ``sentinel_row``, and the slot scatters in ``scatter_ops``
-    leave it unchanged, so kernels can read it for padding and untracked rows.
-    One step goes in this order:
+    leave it unchanged, so compiled sampler functions can read it for padding
+    and untracked rows. One step goes in this order:
 
     1. The owner calls ``release`` for requests that finished or were
        preempted, and ``mark_dirty`` for rows it has rebuilt (for example a
        resumed request's state).
-    2. ``sync_step`` releases the slots of tracked requests that are not in
-       the batch, leases a slot for each tracked request that is, and writes
-       their new rows to the table in one ``seed_slot_rows`` call.
-    3. Kernels read and update the rows through slot IDs from
-       ``allocator.build_chunk_slot_ids``, and the owner stores their output
-       with ``commit_table``.
+    2. ``sync_step`` releases the requests that are no longer tracked, leases
+       a slot for each tracked request in the batch, and writes their new
+       rows to the table in one ``seed_slot_rows`` call.
+    3. Compiled sampler functions read and update the rows through slot IDs
+       from ``allocator.build_chunk_slot_ids``, and the owner stores their
+       output with ``commit_table``.
 
     In ``sync_step``, a request's row comes from ``mark_dirty`` when one is
-    staged. Otherwise, a request without a slot (new, or back after leaving
-    the batch) gets ``compute_cold_row(req_id)``, and a request that keeps its
-    slot keeps its row.
+    staged. Otherwise, a request without a slot (new or released) gets
+    ``compute_cold_row(req_id)``, and a request that holds a slot keeps its
+    row.
+
+    A tracked request keeps its slot and its row through steps that do not
+    schedule it. The row stays valid because the owner updates it only in
+    steps that schedule the request, through the compiled sampler functions
+    and ``commit_table``. A request whose row stops being valid, for example
+    after preemption, must be released or get a new row from ``mark_dirty``.
 
     If ``sync_step`` raises, the leases and staged rows no longer match the
     table. The runner stops on such errors, so the table is not reused.
@@ -178,8 +184,11 @@ class RequestSlotTable[RowT: Sequence[int]]:
         self._sentinel_row: tuple[int, ...] = self._check_row(
             (0,) * num_cols if sentinel_row is None else sentinel_row
         )
-        self._dirty_rows: dict[str, RowT] = {}
+        self._dirty_rows: dict[str, tuple[int, ...]] = {}
         self._table: torch.Tensor | None = None
+        # Host staging buffers of the seed scatter in sync_step.
+        self._seed_slots = np.zeros(max_num_reqs, dtype=np.int32)
+        self._seed_rows = np.zeros((max_num_reqs, num_cols), dtype=np.int32)
 
     @property
     def allocator(self) -> RequestSlotAllocator:
@@ -211,7 +220,8 @@ class RequestSlotTable[RowT: Sequence[int]]:
         return self._table
 
     def commit_table(self, table: torch.Tensor) -> None:
-        """Store ``table``, for example a kernel's output, as the device state.
+        """Store ``table``, for example the output of a compiled sampler
+        function, as the device state.
 
         The leases do not change.
 
@@ -234,54 +244,41 @@ class RequestSlotTable[RowT: Sequence[int]]:
     def mark_dirty(self, req_id: str, row: RowT) -> None:
         """Stage ``row`` as the state of ``req_id``.
 
-        The next ``sync_step`` that finds ``req_id`` in the batch writes it,
-        whether or not the request holds a slot. ``release`` and
-        ``release_unscheduled`` drop it.
+        The first ``sync_step`` whose batch contains ``req_id`` writes it,
+        whether or not the request holds a slot; steps that do not schedule
+        the request leave it staged. ``release`` drops it, and so does
+        ``sync_step`` once the request is not tracked.
 
         Raises:
             ValueError: ``row`` does not have ``num_cols`` int32 values.
             TypeError: a value is not an integer.
         """
-        self._check_row(row)
-        self._dirty_rows[req_id] = row
+        self._dirty_rows[req_id] = self._check_row(row)
 
     def release(self, req_ids: Iterable[str]) -> None:
         """Free the slots and staged rows of ``req_ids``.
 
         Call it before ``sync_step`` for requests that finished or were
-        preempted in this step. ``sync_step`` only releases requests that are
-        not in the batch, so a request preempted and resumed in the same step
-        would otherwise keep its old row.
+        preempted in this step. ``sync_step`` releases only the requests that
+        are no longer tracked, so a preempted request would otherwise hold its
+        slot while it waits and keep its old row when it resumes.
         """
         released = list(req_ids)
         for req_id in released:
             self._dirty_rows.pop(req_id, None)
         self._allocator.release(released)
 
-    def release_unscheduled(self, active_req_ids: Container[str]) -> None:
-        """Free the slots and staged rows of requests not in ``active_req_ids``."""
-        self.release(
-            [
-                req_id
-                for req_id in (*self._allocator.allocated_req_ids(), *self._dirty_rows)
-                if req_id not in active_req_ids
-            ]
-        )
-
-    def needs_cold_reseed(
-        self,
-        batch_req_ids: Iterable[str | None],
-        tracked_req_ids: Container[str],
-    ) -> bool:
-        """Return True if ``sync_step`` will call ``compute_cold_row``: a tracked
-        request in the batch holds no slot and has no staged row."""
-        return any(
-            req_id is not None
-            and req_id in tracked_req_ids
-            and self._allocator.slot_for(req_id) is None
-            and req_id not in self._dirty_rows
-            for req_id in batch_req_ids
-        )
+    def _release_untracked(self, tracked_req_ids: Container[str]) -> None:
+        """Free the slots and staged rows of requests not in ``tracked_req_ids``."""
+        if not self._allocator.allocated_req_ids() and not self._dirty_rows:
+            return
+        untracked = [
+            req_id
+            for req_id in (*self._allocator.allocated_req_ids(), *self._dirty_rows)
+            if req_id not in tracked_req_ids
+        ]
+        if untracked:
+            self.release(untracked)
 
     def sync_step(
         self,
@@ -290,13 +287,17 @@ class RequestSlotTable[RowT: Sequence[int]]:
         compute_cold_row: Callable[[str], RowT],
     ) -> torch.Tensor | None:
         """Lease slots and write rows for the tracked requests in
-        ``batch_req_ids``, after releasing the tracked requests not in it.
+        ``batch_req_ids``, after releasing the requests that are no longer
+        tracked.
 
         A request listed twice in ``batch_req_ids`` is handled once. Returns
         the device table, or None when no tracked request is in the batch.
 
         Raises:
-            RuntimeError: more tracked requests than ``max_num_reqs``.
+            RuntimeError: more than ``max_num_reqs`` tracked requests hold or
+                need a slot. Requests keep their slots through steps that do
+                not schedule them, so the owner must release finished and
+                preempted requests.
             ValueError, TypeError: ``compute_cold_row`` returned an invalid row.
         """
         batch_tracked = [
@@ -304,9 +305,9 @@ class RequestSlotTable[RowT: Sequence[int]]:
             for req_id in batch_req_ids
             if req_id is not None and req_id in tracked_req_ids
         ]
-        # Release first, also when no tracked request is left in the batch,
-        # so a request that returns later gets a cold row.
-        self.release_unscheduled(set(batch_tracked))
+        # Release first, also when no tracked request is in the batch, so a
+        # request that is tracked again later gets a cold row.
+        self._release_untracked(tracked_req_ids)
         if not batch_tracked:
             return None
 
@@ -323,16 +324,16 @@ class RequestSlotTable[RowT: Sequence[int]]:
 
         if to_seed:
             # Each row has its own slot, so one [max_num_reqs] scatter writes
-            # all of them; unused entries point at slot 0, which it leaves
-            # unchanged.
-            slots_np = np.zeros(self.max_num_reqs, dtype=np.int32)
-            rows_np = np.zeros((self.max_num_reqs, self._num_cols), dtype=np.int32)
+            # all of them. Unused entries point at slot 0, which it leaves
+            # unchanged, so only the slot buffer needs clearing.
+            slots_np, rows_np = self._seed_slots, self._seed_rows
+            slots_np.fill(0)
             for idx, (slot, row) in enumerate(to_seed):
                 slots_np[idx] = slot
                 rows_np[idx] = row
             # Synchronous .to(device): sample_tokens() runs after the runner's
-            # input-staging fence, so an async H2D copy from these temporary
-            # arrays could read freed host memory in TorchTPU.
+            # input-staging fence, so an async H2D copy could still be reading
+            # these buffers when the next sync_step refills them.
             table = seed_slot_rows(
                 table,
                 torch.from_numpy(slots_np).to(self._device),

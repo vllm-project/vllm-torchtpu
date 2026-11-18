@@ -29,9 +29,9 @@ CPU = torch.device("cpu")
 
 
 @pytest.fixture(autouse=True)
-def _eager_seed_kernel(request: pytest.FixtureRequest):
-    """Run the ``@torch.compile(backend="tpu")`` seed kernel eagerly on CPU,
-    except in TPU tests, which run it compiled."""
+def _eager_seed_slot_rows(request: pytest.FixtureRequest):
+    """Run the compiled sampler function ``seed_slot_rows`` (``backend="tpu"``)
+    eagerly on CPU, except in TPU tests, which run it compiled."""
     if request.node.get_closest_marker("tpu_test"):
         yield
         return
@@ -87,9 +87,6 @@ def test_sync_step_leases_slots_and_seeds_staged_and_cold_rows() -> None:
     assert pool.max_num_reqs == 2 and pool.device == CPU
     rows = {"a": (10, 1), "b": (20, 2), "c": (30, 3)}
     pool.mark_dirty("a", rows["a"])
-    assert not pool.needs_cold_reseed(["a"], rows)
-    assert pool.needs_cold_reseed(["b"], rows)
-    assert not pool.needs_cold_reseed(["untracked", None], rows)
 
     cold_calls: list[str] = []
     cold = _cold_rows(rows, cold_calls)
@@ -106,11 +103,11 @@ def test_sync_step_leases_slots_and_seeds_staged_and_cold_rows() -> None:
     assert pool.sync_step(["b", "a"], rows, cold) is tbl
     assert (pool.allocator.slot_for("a"), pool.allocator.slot_for("b")) == slots
 
-    # "a" leaves the batch and loses its slot; "c" and later "a" get cold rows.
-    tbl = pool.sync_step(["b", "c"], rows, cold)
+    # "a" is untracked and loses its slot; "c" and later "a" get cold rows.
+    tbl = pool.sync_step(["b", "c"], {"b", "c"}, cold)
     assert tbl is not None and "a" not in pool.allocator.allocated_req_ids()
     assert cold_calls == ["b", "c"]
-    tbl = pool.sync_step(["a", "c"], rows, cold)
+    tbl = pool.sync_step(["a", "c"], {"a", "c"}, cold)
     assert tbl is not None and cold_calls == ["b", "c", "a"]
     assert pool.sync_step(["untracked"], rows, cold) is None
 
@@ -133,6 +130,46 @@ def test_mark_dirty_rewrites_the_row_of_a_request_that_keeps_its_slot() -> None:
     assert cold_calls == ["a"]
 
 
+def test_a_staged_row_waits_for_a_step_that_schedules_its_request() -> None:
+    """A staged row stays staged through steps that do not schedule its
+    request, and the first step that does writes it."""
+    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+        max_num_reqs=2, num_cols=1, device=CPU
+    )
+    rows = {"a": (1,), "b": (2,)}
+    cold_calls: list[str] = []
+    cold = _cold_rows(rows, cold_calls)
+    pool.sync_step(["a", "b"], rows, cold)
+    pool.mark_dirty("a", (5,))
+    tbl = pool.sync_step(["b"], rows, cold)
+    assert tbl is not None and _row(pool, tbl, "a") == [1]
+    tbl = pool.sync_step(["a", "b"], rows, cold)
+    assert tbl is not None and _row(pool, tbl, "a") == [5]
+    assert cold_calls == ["a", "b"]
+
+
+def test_a_tracked_request_keeps_its_slot_and_row_across_a_gap() -> None:
+    """A step that does not schedule a tracked request leaves its slot and
+    its row alone, so it needs no cold row when it comes back."""
+    pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
+        max_num_reqs=2, num_cols=1, device=CPU
+    )
+    rows = {"a": (1,), "b": (2,)}
+    cold_calls: list[str] = []
+    cold = _cold_rows(rows, cold_calls)
+    tbl = pool.sync_step(["a", "b"], rows, cold)
+    slot_a = pool.allocator.slot_for("a")
+    assert tbl is not None and slot_a is not None
+    # A compiled sampler function advanced the row of "a".
+    updated = tbl.clone()
+    updated[slot_a] = 10
+    pool.commit_table(updated)
+    assert pool.sync_step(["b"], rows, cold) is not None
+    tbl = pool.sync_step(["a"], rows, cold)
+    assert tbl is not None and pool.allocator.slot_for("a") == slot_a
+    assert tbl[slot_a].tolist() == [10] and cold_calls == ["a", "b"]
+
+
 def test_a_request_listed_twice_is_handled_once() -> None:
     pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
         max_num_reqs=2, num_cols=1, device=CPU
@@ -146,9 +183,9 @@ def test_a_request_listed_twice_is_handled_once() -> None:
 
 
 def test_untracked_only_step_releases_slots() -> None:
-    """A batch without tracked requests still releases the slots of the ones
-    that left, so a returning request gets a cold row instead of keeping its
-    old one."""
+    """A batch without tracked requests still releases the slots of requests
+    that are no longer tracked, so a request tracked again gets a cold row
+    instead of keeping its old one."""
     pool: RequestSlotTable[tuple[int]] = RequestSlotTable(
         max_num_reqs=2, num_cols=1, device=CPU
     )
@@ -157,8 +194,10 @@ def test_untracked_only_step_releases_slots() -> None:
     cold = _cold_rows(rows, cold_calls)
     assert pool.sync_step(["a"], rows, cold) is not None
     assert pool.sync_step(["x", None], rows, cold) is None
+    assert set(pool.allocator.allocated_req_ids()) == {"a"}
+    assert pool.sync_step(["x", None], set(), cold) is None
     assert not pool.allocator.allocated_req_ids()
-    # "a" returns with a state that moved on while it was away.
+    # "a" is tracked again, with a new state.
     rows["a"] = (5,)
     tbl = pool.sync_step(["a"], rows, cold)
     assert tbl is not None and cold_calls == ["a", "a"]
@@ -198,22 +237,26 @@ def test_release_frees_slots_and_staged_rows() -> None:
     pool.sync_step(["a", "b", "c"], rows, cold)
     slot_a, slot_c = pool.allocator.slot_for("a"), pool.allocator.slot_for("c")
 
-    # release drops the staged row too: "a" comes back with a cold row.
+    # release drops the slot and the staged row: "a", released and scheduled
+    # in the same step, gets a new cold row instead of either old row.
     pool.mark_dirty("a", (8,))
     pool.release(["a"])
     assert pool.allocator.slot_for("a") is None
-    assert pool.needs_cold_reseed(["a"], rows)
+    rows["a"] = (5,)
+    tbl = pool.sync_step(["a"], rows, cold)
+    assert tbl is not None and cold_calls == ["a", "b", "c", "a"]
+    assert _row(pool, tbl, "a") == [5]
 
-    # Requests outside the active set lose their slot and staged rows.
+    # Requests that sync_step no longer tracks lose their slot and staged rows.
     pool.mark_dirty("d", (9,))
-    pool.release_unscheduled({"b"})
+    pool.sync_step(["b"], {"b"}, cold)
     assert set(pool.allocator.allocated_req_ids()) == {"b"}
-    assert pool.needs_cold_reseed(["d"], rows)
 
-    # Freed slots are leased again.
+    # Freed slots are leased again, and "d" gets a cold row.
     cold_calls.clear()
-    pool.sync_step(["b", "d"], rows, cold)
-    assert cold_calls == ["d"]
+    tbl = pool.sync_step(["b", "d"], rows, cold)
+    assert tbl is not None and cold_calls == ["d"]
+    assert _row(pool, tbl, "d") == [7]
     assert pool.allocator.slot_for("d") in {slot_a, slot_c}
 
 
@@ -347,7 +390,7 @@ def test_precompile_covers_the_seed_call_sync_step_makes(
 @pytest.mark.tpu_test
 def test_precompile_then_sync_step_on_tpu_matches_cpu() -> None:
     """The compiled ``seed_slot_rows`` that ``precompile`` warms gives
-    ``sync_step`` the same table on TPU as the eager kernel on CPU."""
+    ``sync_step`` the same table on TPU as eager mode gives on CPU."""
     import torch_tpu  # noqa: F401
 
     rows = {"a": (1, 2), "b": (3, 4), "c": (5, 6)}

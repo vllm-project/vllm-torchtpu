@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for the slot-table row writes in ``scatter_ops``."""
 
+from collections.abc import Callable
+
 import pytest
 import torch
 
@@ -25,8 +27,9 @@ INT32_MIN = torch.iinfo(torch.int32).min
 
 
 @pytest.fixture
-def eager_seed_kernel():
-    """Run the ``@torch.compile(backend="tpu")`` seed kernel eagerly on CPU."""
+def eager_seed_slot_rows():
+    """Run the compiled sampler function ``seed_slot_rows`` (``backend="tpu"``)
+    eagerly on CPU."""
     with torch.compiler.set_stance("force_eager"):
         yield
 
@@ -47,21 +50,26 @@ def test_scatter_slot_rows_matches_indexed_assignment(
 ) -> None:
     gen = torch.Generator().manual_seed(0)
     table = torch.randint(-50, 50, (6, *trailing), generator=gen).to(dtype)
-    slot_ids = torch.tensor([4, 0, 2, 5, -1, 1], dtype=torch.int32)
+    slot_ids = torch.tensor([4, 0, 2, 3, -1, 1], dtype=torch.int32)
     rows = torch.randint(-50, 50, (6, *trailing), generator=gen).to(dtype)
     expected = _indexed_assignment(table, slot_ids, rows)
     assert torch.equal(scatter_slot_rows(table, slot_ids, rows), expected)
 
 
-def test_inactive_slots_leave_row_0_and_the_last_row_unchanged() -> None:
+@pytest.mark.usefixtures("eager_seed_slot_rows")
+@pytest.mark.parametrize("write_rows", [scatter_slot_rows, seed_slot_rows])
+def test_inactive_slots_leave_row_0_and_the_last_row_unchanged(
+    write_rows: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+) -> None:
     """Slot 0 and negative slots are inactive: row 0 keeps its value (it is
-    written back to itself) and a negative slot does not wrap to the end."""
-    table = torch.full((4, 2), -1, dtype=torch.int32)
-    slot_ids = torch.tensor([3, 0, 1, -1], dtype=torch.int32)
-    rows = torch.tensor([[30, 31], [0, 1], [10, 11], [7, 7]], dtype=torch.int32)
-    expected = [[-1, -1], [10, 11], [-1, -1], [30, 31]]
-    assert scatter_slot_rows(table, slot_ids, rows).tolist() == expected
-    assert table.tolist() == [[-1, -1]] * 4
+    written back to itself) and a negative slot does not wrap to the end.
+    Row 0 differs from the last row, so a wrapped write of row 0 shows."""
+    table = torch.tensor([[-9, -9], [-1, -1], [-1, -1], [-1, -1]], dtype=torch.int32)
+    slot_ids = torch.tensor([2, 0, 1, -1], dtype=torch.int32)
+    rows = torch.tensor([[20, 21], [0, 1], [10, 11], [7, 7]], dtype=torch.int32)
+    expected = [[-9, -9], [10, 11], [20, 21], [-1, -1]]
+    assert write_rows(table, slot_ids, rows).tolist() == expected
+    assert table.tolist() == [[-9, -9]] + [[-1, -1]] * 3
 
 
 @pytest.mark.parametrize(
@@ -112,19 +120,6 @@ def test_scatter_slot_rows_compiles_without_graph_breaks(dtype: torch.dtype) -> 
     )
     expected = _indexed_assignment(table, slot_ids, rows)
     assert torch.equal(compiled(table, slot_ids, rows), expected)
-
-
-@pytest.mark.usefixtures("eager_seed_kernel")
-def test_seed_slot_rows_writes_the_active_rows() -> None:
-    table = torch.full((4, 2), -1, dtype=torch.int32)
-    slot_ids = torch.tensor([3, 0, 1], dtype=torch.int32)
-    rows = torch.tensor([[30, 31], [0, 1], [10, 11]], dtype=torch.int32)
-    assert seed_slot_rows(table, slot_ids, rows).tolist() == [
-        [-1, -1],
-        [10, 11],
-        [-1, -1],
-        [30, 31],
-    ]
 
 
 @pytest.mark.tpu_test

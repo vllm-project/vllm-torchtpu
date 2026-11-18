@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Row writes into slot tables for TPU sampling kernels.
+"""Row writes into slot tables for compiled sampler functions.
 
 Row 0 of a slot table is a null row. ``RequestSlotTable`` writes new rows with
-``seed_slot_rows``, and sampling kernels that keep per-request rows in such a
-table write them back with ``scatter_slot_rows``.
+``seed_slot_rows``, and compiled sampler functions that keep per-request rows in
+such a table write them back with ``scatter_slot_rows``.
 """
 
 import torch
