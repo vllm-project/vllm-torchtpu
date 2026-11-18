@@ -17,9 +17,8 @@
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
 # Changes from the source:
-# - Own-line pyrefly ignores where jax's stubs are narrower than the runtime,
-#   and one where pyrefly cannot tell that out_act is set before the final
-#   reshape (main lists the source's errors in its pyrefly baselines).
+# - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
+#   (main lists the source's errors in .pyrefly-baseline-full.json).
 # No change targets AttentionMode.KDA, which this copy's callers never pass;
 # see compute_kda.py.
 
@@ -793,9 +792,6 @@ def fused_conv1d_gdn(
     if not batched_only:
         out_act, out_states = call_kernel(out_states, out_act, config.GDNMode.PER_SEQ)
 
-    # One of the two calls above always runs (batched_only and prefill_only are
-    # exclusive), which pyrefly cannot tell.
-    # pyrefly: ignore[missing-attribute]
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     if conv_state_shape is not None:
