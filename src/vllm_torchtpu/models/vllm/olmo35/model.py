@@ -86,6 +86,7 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
 )
@@ -95,7 +96,6 @@ from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_split_or_none,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.kimi_k3.attention import (
     CausalDepthwiseConv1d,
     _load_a_log,
@@ -106,8 +106,6 @@ from vllm_torchtpu.models.vllm.kimi_k3.moe import KimiRoutedOutputTransform
 from vllm_torchtpu.utils import fresh_buffer
 
 from .config import Olmo35Config
-
-logger = init_logger(__name__)
 
 
 def _config(vllm_config: VllmConfig) -> Olmo35Config:
@@ -138,6 +136,17 @@ class Olmo35KimiDeltaAttention(nn.Module, MambaBase):
 
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
+        # Reject unsupported cache layouts and features before any weights or
+        # KV pools are allocated.
+        if unified_kv_layout_enabled_for_architecture(
+            vllm_config.model_config.architecture
+        ):
+            raise NotImplementedError(
+                "OLMo 3.5 KDA has no unified-pool path yet; run with "
+                "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0"
+            )
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError("OLMo 3.5 on TPU has no speculative decoding")
         config = _config(vllm_config)
         self.prefix = prefix
         self.vllm_config = vllm_config
@@ -150,8 +159,6 @@ class Olmo35KimiDeltaAttention(nn.Module, MambaBase):
         key_width = self.total_heads * self.head_k_dim
         value_width = self.total_heads * self.head_v_dim
         quant_config = vllm_config.quant_config
-        if vllm_config.speculative_config is not None:
-            raise NotImplementedError("OLMo 3.5 on TPU has no speculative decoding")
 
         # q | k | v | b in one matmul. Each rank's output is its own q, k, v
         # and b slices back to back, so the first `local_conv_dim` columns
@@ -279,11 +286,6 @@ class Olmo35KimiDeltaAttention(nn.Module, MambaBase):
         if metadata is None or not self.kv_cache or self.kv_cache[0].numel() == 0:
             output = hidden_states.new_zeros(
                 (hidden_states.shape[0], self.num_heads * self.head_v_dim)
-            )
-        elif len(self.kv_cache) == 1:
-            raise NotImplementedError(
-                "OLMo 3.5 KDA has no unified-pool path yet; run with "
-                "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0"
             )
         else:
             conv_cache, recurrent_cache = self.kv_cache
@@ -772,6 +774,12 @@ class Olmo35ForCausalLM(nn.Module, HasInnerState, IsHybrid):
                         )
                         loaded.add(name)
                         break
+                    else:
+                        # Not a gate / up / down expert weight: hand it to
+                        # AutoWeightsLoader, which rejects unknown names. The
+                        # mapping covers every expert id; FusedMoE's loader
+                        # itself skips experts that are not local under EP.
+                        yield name, loaded_weight
                     continue
                 for weight_name, param_name, shard_id in self.stacked_params_mapping:
                     if weight_name not in name:
