@@ -37,6 +37,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     SequenceLayoutPlan,
 )
+from vllm_torchtpu.runner.model_adapters import ModelAdapter
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 
 
@@ -175,9 +176,40 @@ def test_intermediate_tensors_records_nans_across_activations(events):
     assert check.bad_request_ids() == {"bad_hidden", "bad_residual"}
 
 
+class _StubModelAdapter(ModelAdapter):
+    """Records the runner's adapter calls of one step."""
+
+    def __init__(self):
+        self.calls = []
+        self.token_store = torch.zeros(4, dtype=torch.int32)
+
+    def bind_model(self, model):
+        raise AssertionError("not called by execute_model")
+
+    def begin_step(self):
+        self.calls.append("begin_step")
+        return self.token_store
+
+    def prepare_inputs(self, snapshot):
+        self.calls.append(snapshot)
+        return {"chunk": snapshot.row_start}
+
+    def dummy_run(
+        self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False
+    ):
+        raise AssertionError("not called by execute_model")
+
+    def get_kv_cache_spec(self):
+        raise AssertionError("not called by execute_model")
+
+    def initialize_kv_cache(self, config):
+        raise AssertionError("not called by execute_model")
+
+
+@pytest.mark.parametrize("with_adapter", [False, True])
 @pytest.mark.parametrize("pp_is_last", [True, False])
 def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
-    events, pp_is_last
+    events, pp_is_last, with_adapter
 ):
     class OptInConnector:
         needs_kv_save_nan_check = True
@@ -240,6 +272,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         # The DP group runs 3 forwards this step, one more than this rank.
         _dp_coordinated_step=lambda *_args, **_kwargs: (2, 3),
         _run_dp_dummy_chunk=MagicMock(),
+        model_adapter=_StubModelAdapter() if with_adapter else None,
     )
 
     scheduler_output = SimpleNamespace(
@@ -274,6 +307,22 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         output = runner.sample_tokens(None)
 
     runner._run_dp_dummy_chunk.assert_called_once_with(2)
+    forwarded = [c.kwargs["model_kwargs"] for c in runner.forward_model.call_args_list]
+    if with_adapter:
+        # One begin_step per step, then one snapshot per forward chunk, whose
+        # kwargs reach forward_model.
+        adapter = runner.model_adapter
+        assert adapter.calls[0] == "begin_step"
+        snapshots = adapter.calls[1:]
+        assert [s.row_start for s in snapshots] == [0, 1]
+        for snapshot in snapshots:
+            assert snapshot.token_store is adapter.token_store
+            assert snapshot.num_requests == 1
+            assert snapshot.num_tokens_padded == 2  # the step bucket
+            assert snapshot.input_ids is not None
+        assert forwarded == [{"chunk": 0}, {"chunk": 1}]
+    else:
+        assert forwarded == [None, None]
     assert connector.snapshot is not None
     assert len(events) == 2
     for event in events:
