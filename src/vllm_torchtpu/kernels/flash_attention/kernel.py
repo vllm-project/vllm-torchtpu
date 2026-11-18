@@ -447,8 +447,8 @@ def _flash_attention_kernel_single_batch(
             m_scratch_ref[(*batch_idx, rs)] = m_next
 
             # acc stays unnormalized until the store: normalizing every step
-            # costs a reciprocal and two more passes over acc per kv block,
-            # +28% per block at block_k 512 and head_dim 72.
+            # costs a reciprocal and two more passes over acc per kv block (a
+            # full 32768 row of 2 heads of 72 at block_k 512: 5.32 -> 4.36 ms).
             v = v_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
             o_curr = jax.lax.dot(
                 p.astype(v.dtype), v, preferred_element_type=jnp.float32
