@@ -35,7 +35,29 @@ from jax.experimental.pallas import tpu as pltpu
 MAX_BLOCK_TOKENS = 128
 # Below this, XLA's matmul is as fast: it prefetches W_UK into VMEM under the
 # previous op, while the kernel has to read it itself (measured at decode).
+# The comparison did not count the relayout copy that XLA adds after its
+# matmul, so TPU_MLA_ABSORB_Q_MIN_TOKENS can lower the limit (`min_tokens`).
 MIN_TOKENS = 256
+
+
+def min_tokens() -> int:
+    """The smallest bucket that takes the kernel: TPU_MLA_ABSORB_Q_MIN_TOKENS
+    (default MIN_TOKENS). Read at trace time; each bucket is traced at a
+    concrete size, so the choice is static per bucket."""
+    from vllm_torchtpu import envs
+
+    return envs.TPU_MLA_ABSORB_Q_MIN_TOKENS
+
+
+def takes_kernel(tokens: int) -> bool:
+    """Whether a bucket of ``tokens`` takes the kernel. The test is
+    ``tokens > bucket_gate_edge(min_tokens())`` (see ``envs.bucket_gate_edge``),
+    the same test the torch-side caller makes. Example: with a limit of 64,
+    the edge is 32, so the 48- and 64-token buckets take the kernel and the
+    32-token bucket takes XLA's einsum."""
+    from vllm_torchtpu import envs
+
+    return tokens > envs.bucket_gate_edge(min_tokens())
 # The raw q head lanes the sparse MLA attention kernel reads with its
 # in-kernel rope: q_nope[128:192] | q_pe.
 HEAD_TAIL_LANES = 128
@@ -101,7 +123,7 @@ def absorb_q_head(q2d: jax.Array, w_uk_t: jax.Array) -> tuple[jax.Array, jax.Arr
 
     Args:
       q2d: `[T, H * (nope + rope)]`, q_nope in the first `nope` lanes of each
-        head; `T >= MIN_TOKENS`.
+        head; `takes_kernel(T)`.
       w_uk_t: `[H, nope, R]`.
 
     Returns:
@@ -110,7 +132,7 @@ def absorb_q_head(q2d: jax.Array, w_uk_t: jax.Array) -> tuple[jax.Array, jax.Arr
     tokens = q2d.shape[0]
     heads, nope, rank = w_uk_t.shape
     pe_lanes = HEAD_TAIL_LANES
-    assert tokens >= MIN_TOKENS, tokens
+    assert takes_kernel(tokens), tokens
     info = pltpu.get_tpu_info()
     vmem_limit = info.vmem_capacity_bytes * 7 // 8
     width = q2d.shape[1] // heads
@@ -160,7 +182,7 @@ def absorb_q(q_nope: jax.Array, w_uk_t: jax.Array) -> jax.Array:
     """
     tokens, heads, nope = q_nope.shape
     rank = w_uk_t.shape[2]
-    if tokens < MIN_TOKENS:
+    if not takes_kernel(tokens):
         out = jnp.einsum(
             "thd,hdr->thr", q_nope, w_uk_t, preferred_element_type=jnp.float32
         )

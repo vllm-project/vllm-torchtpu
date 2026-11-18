@@ -233,6 +233,7 @@ if TYPE_CHECKING:
     TPU_MLA_TC_KV_WRITER: bool = False
     TPU_MLA_DECODE_PROLOGUE: bool = False
     TPU_MLA_ABSORB_Q_FROM_HEAD: bool = False
+    TPU_MLA_ABSORB_Q_MIN_TOKENS: int = 256
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS: int = 32
     TPU_INDEXER_QB_OVERLAP: bool = False
@@ -1106,6 +1107,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # straight from the raw q head the attention kernel already takes, instead
     # of an XLA copy of the q_nope slice (prefill sizes; same bits).
     "TPU_MLA_ABSORB_Q_FROM_HEAD": env_bool("TPU_MLA_ABSORB_Q_FROM_HEAD", default=False),
+    # Smallest token bucket whose MLA q absorption (q_nope @ W_UK) runs as the
+    # Pallas kernel of kernels/mla/absorb_q.py (with
+    # TPU_MLA_ABSORB_Q_FROM_HEAD, the kernel that reads the raw q head);
+    # smaller buckets use XLA's einsum. The test is `T > bucket_gate_edge(this
+    # value)`, so give a power of 2. XLA's einsum writes its result head-major,
+    # and XLA then adds a transposing copy to the token-major layout the MLA
+    # kernel reads (about 4.6 us per layer at 64 tokens and 64 heads). The
+    # kernel writes token-major directly. Same bits.
+    "TPU_MLA_ABSORB_Q_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MLA_ABSORB_Q_MIN_TOKENS", 256
+    ),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache

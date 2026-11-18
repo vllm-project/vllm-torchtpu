@@ -71,7 +71,7 @@ from vllm_torchtpu.kernels.mla.absorb_q import (
     absorb_q,
     absorb_q_head,
 )
-from vllm_torchtpu.kernels.mla.absorb_q import MIN_TOKENS as ABSORB_Q_MIN_TOKENS
+from vllm_torchtpu.kernels.mla import absorb_q as absorb_q_module
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -2929,7 +2929,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             and q_pe.device.type == "tpu"
             and w_uk_t_scale is None
             and vllm_compilation_backends.model_tag == "backbone"
-            and q_pe.shape[0] > envs.bucket_gate_edge(ABSORB_Q_MIN_TOKENS)
+            and q_pe.shape[0] > envs.bucket_gate_edge(absorb_q_module.min_tokens())
         ):
             # q_pe is the raw q head here. The kernel reads it as the q
             # projection wrote it and hands attention only the 128 lanes per
