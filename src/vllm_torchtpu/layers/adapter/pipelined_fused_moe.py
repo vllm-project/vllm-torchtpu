@@ -239,6 +239,9 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
+        num_primary_experts: Optional bound on the shard's local experts when
+            the weights hold copy slots after its primaries (expert
+            placement); None serves every local slot.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
