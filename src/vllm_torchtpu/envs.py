@@ -193,6 +193,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP_LOCAL_MERGE: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER: bool = False
+    VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD: bool = False
+    VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS: int = 0
     VLLM_TPU_QSA_DCP_MERGE_SCORES: bool = False
     VLLM_TPU_RPA_SCHEDULE_HBM: bool = False
     VLLM_TPU_QSA_DCP_MERGE: str = ""
@@ -1081,6 +1083,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one int32 buffer [T, 2k], in place of one all-gather each. Byte-exact.
     "VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER": env_bool(
         "VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER"
+    ),
+    # q38 BLSTACK-IDX. With VLLM_TPU_QSA_COMPRESSED_DCP and TP larger than
+    # VLLM_TPU_QSA_MAIN_KV_DCP: the target layers' decode/verify-shaped graphs
+    # split the owned-group indexer's rows over the TP / DCP groups as well
+    # (ranks r and r + DCP own the same compressed groups). Each group scores
+    # one contiguous token shard of the step with the decode indexer, one TP
+    # all-gather brings every group's local lists, and every rank merges and
+    # attends exactly as without it (the prefill token-sharded op of
+    # VLLM_TPU_QSA_INDEXER_TOKEN_SHARD, routed on decode steps). Same
+    # selection, same attended groups; per-rank scoring rows drop by TP / DCP.
+    # Off: every rank scores every row of the step over its owned groups.
+    "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD": env_bool(
+        "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD", default=False
+    ),
+    # With VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD: graphs of fewer token rows
+    # keep the unsharded owned-group indexer (0 = every decode-shaped graph).
+    "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS": env_nonnegative_int(
+        "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS", 0
     ),
     # With VLLM_TPU_QSA_COMPRESSED_DCP: the pair merge's boundary key comes
     # from the bits the merge top-k returns with its slots, instead of a

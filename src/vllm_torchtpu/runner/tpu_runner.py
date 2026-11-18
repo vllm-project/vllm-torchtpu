@@ -6255,6 +6255,11 @@ class TPUModelRunner(GPUModelRunner):
 
             arm_runner_models(self)
 
+        # q38 AR-FIX (VLLM_TPU_DECODE_TP_AR, default off): a no-op unless set; raises if set and it cannot arm.
+        from vllm_torchtpu.layers.adapter import tp_ar_decode
+
+        tp_ar_decode.arm(self)
+
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 
