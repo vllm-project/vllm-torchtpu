@@ -1228,6 +1228,21 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 "mixed_live_gather": True,
                 "mixed_body_levers": sparse_mla.MIXED_BODY_DEFAULT,
             },
+            # TPU_DCP_MLA_MIXED_BODY_SMALL: the levers on buckets of <= 64
+            # tokens, which take no mixed_body_levers.
+            *(
+                {
+                    "mixed_live_gather": True,
+                    "mixed_live_widths": (256, 384),
+                    "mixed_body_levers": sparse_mla.MIXED_BODY_DEFAULT,
+                    "mixed_body_small_levers": levers,
+                }
+                for levers in (
+                    sparse_mla.MIXED_BODY_SMALL_DEFAULT,
+                    sparse_mla.MIXED_BODY_SMALL_DEFAULT + ("pair",),
+                    sparse_mla.MIXED_BODY_SMALL_DEFAULT + ("quad",),
+                )
+            ),
         ):
             out, lse = jax.block_until_ready(run(topk_glued, **kw))
             np.testing.assert_array_equal(
@@ -1908,6 +1923,31 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                     jnp.array([0, 1, 1], jnp.int32),
                     cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
                     topk_cap=bad_cap,
+                )
+
+    def test_mixed_body_small_levers_validation(self):
+        q = jnp.zeros((64, 8, HEAD_DIM), jnp.bfloat16)
+        nope = jnp.zeros((16, 256, 128), jnp.uint32)
+        rope = jnp.zeros((16, 64, 128), jnp.uint32)
+        topk_idx = jnp.zeros((64, 2048), jnp.int32)
+        for bad, message in (
+            (("zu",), "'zu' needs 'pv512'"),
+            (("pair", "quad"), "alternatives"),
+            (("lrows",), "not in"),
+        ):
+            with self.assertRaisesRegex(ValueError, message):
+                sparse_mla.sparse_ragged_paged_attention(
+                    q,
+                    nope,
+                    rope,
+                    topk_idx,
+                    jnp.arange(16, dtype=jnp.int32),
+                    jnp.array([0, 64], jnp.int32),
+                    jnp.array([0, 1, 1], jnp.int32),
+                    cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                    topk_cap=512,
+                    mixed_live_gather=True,
+                    mixed_body_small_levers=bad,
                 )
 
     def test_sparsecore_layout_validation(self):

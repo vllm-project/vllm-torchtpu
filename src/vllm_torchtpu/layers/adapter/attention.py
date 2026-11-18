@@ -66,7 +66,12 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
+from vllm_torchtpu.kernels.mla.absorb_q import (
+    HEAD_TAIL_LANES,
+    absorb_q,
+    absorb_q_head,
+)
+from vllm_torchtpu.kernels.mla.absorb_q import MIN_TOKENS as ABSORB_Q_MIN_TOKENS
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -118,6 +123,20 @@ _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
 
 
+def _fake_absorb_q_head(
+    q2d: torch.Tensor, w_uk_t: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    heads, _, rank = w_uk_t.shape
+    tokens = q2d.shape[0]
+    return q2d.new_empty((tokens, heads, rank)), q2d.new_empty(
+        (tokens, heads, HEAD_TAIL_LANES)
+    )
+
+
+_absorb_q_head = pallas.jax_op("pallas::mla_absorb_q_head", absorb_q_head)
+_absorb_q_head.register_fake(_fake_absorb_q_head)
+
+
 def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
     """Whether a W_UV-before-merge layer (TPU_DCP_MLA_UV_BEFORE_MERGE) applies
     W_UV ahead of the DCP merge for this bucket (fixed at trace time).
@@ -130,6 +149,31 @@ def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
     if min_tokens <= 0:
         return True
     return is_backbone and num_tokens > envs.bucket_gate_edge(min_tokens)
+
+
+def uses_query_replication(impl, q_dcp_replicated, topk_indices) -> bool:
+    """Whether the backend ``impl`` attends the whole DCP group's heads that
+    query replication hands it, so the sparse DCP path skips its per-step q
+    all-gather. That path is the only consumer, hence the `topk_indices`
+    term. ``impl.dcp_size`` is read only when a replicated query is given."""
+    return (
+        q_dcp_replicated is not None and topk_indices is not None and impl.dcp_size > 1
+    )
+
+
+def uv_before_merge_runs(layer, num_tokens: int, use_qrep: bool) -> bool:
+    """Whether the backend applies W_UV ahead of the DCP merge on this bucket
+    (TPU_DCP_MLA_UV_BEFORE_MERGE under query replication), and so returns the
+    projected [T, heads * v_head_dim] instead of the latent. A caller that
+    asks for the latent (TPU_FUSED_UV_OPROJ's skip_uv) must not ask for it
+    on such a bucket."""
+    is_backbone = vllm_compilation_backends.model_tag == "backbone"
+    return (
+        use_qrep
+        and getattr(layer, "W_UV_dcp_qrep", None) is not None
+        and (not envs.TPU_MTP_DCP_MERGE_SIZED or is_backbone)
+        and _uv_before_merge_applies(num_tokens, is_backbone)
+    )
 
 
 def _keep_input_fn(a: jax.Array, b: jax.Array) -> jax.Array:
@@ -2123,6 +2167,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         )
                     if envs.TPU_DCP_MLA_SEND_SMALL_A2A:
                         _cp_mla_attention.prebuild_send_small(self.dcp_size)
+                        if envs.TPU_DCP_MLA_SEND_SMALL_A2A_MERGE:
+                            _cp_mla_attention.prebuild_send_small_merge(self.dcp_size)
 
     def _get_kv_scales(
         self, layer: Any
@@ -2841,25 +2887,20 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             if output is None:
                 # Preserve symbolic token dimensions during the memory probe.
-                template = q_nope.flatten(1)[:, :1].expand(
-                    -1, layer.num_heads * layer.v_head_dim
+                width = (
+                    layer.kv_lora_rank if kwargs.get("skip_uv") else layer.v_head_dim
                 )
+                template = q_nope.flatten(1)[:, :1].expand(-1, layer.num_heads * width)
                 return torch.ones_like(template)
             output.fill_(1)
             return output
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
-        # Query replication hands us the whole DCP group's heads already, so
-        # the sparse DCP path below can skip its per-step q all-gather. It is
-        # the only consumer, hence the `topk_indices` term.
-        use_qrep = (
-            q_dcp_replicated is not None
-            and self.dcp_size > 1
-            and topk_indices is not None
-        )
+        use_qrep = uses_query_replication(self, q_dcp_replicated, topk_indices)
         q_rope_table: list[torch.Tensor] = []
         if use_qrep:
+            assert q_dcp_replicated is not None
             assert layer.W_UK_T_dcp_qrep is not None, (
                 "q_dcp_replicated was passed but W_UK_T_dcp_qrep was never "
                 "built; `process_weights_after_loading` must run first."
@@ -2877,23 +2918,25 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Not in the MTP drafter under TPU_MTP_DCP_MERGE_SIZED: the drafter's
         # projected partial stays f32, and the sized merge only takes a 2-byte
         # partial, so it would silently fall back to the f32 reduce-scatter.
-        uv_first = (
-            use_qrep
-            and getattr(layer, "W_UV_dcp_qrep", None) is not None
-            and (
-                not envs.TPU_MTP_DCP_MERGE_SIZED
-                or vllm_compilation_backends.model_tag == "backbone"
-            )
-            and _uv_before_merge_applies(
-                q_nope.shape[0], vllm_compilation_backends.model_tag == "backbone"
-            )
-        )
-        pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
+        uv_first = uv_before_merge_runs(layer, q_nope.shape[0], use_qrep)
 
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+        if (
+            envs.TPU_MLA_ABSORB_Q_FROM_HEAD
+            and q_rope_table
+            and q_pe.device.type == "tpu"
+            and w_uk_t_scale is None
+            and vllm_compilation_backends.model_tag == "backbone"
+            and q_pe.shape[0] > envs.bucket_gate_edge(ABSORB_Q_MIN_TOKENS)
+        ):
+            # q_pe is the raw q head here. The kernel reads it as the q
+            # projection wrote it and hands attention only the 128 lanes per
+            # head it reads, so XLA never relays out the whole q head.
+            ql_nope, q_pe = _absorb_q_head(q_pe.flatten(1), w_uk_t_src.to(q_pe.dtype))
+            ql_nope = ql_nope.to(input_dtype)
+        elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
             q_nope_t = q_nope.transpose(0, 1)
@@ -2914,6 +2957,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
 
         ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
+        pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
         q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
@@ -3156,10 +3200,18 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
+        assert not (uv_first and kwargs.get("skip_uv")), (
+            "skip_uv asks for the merged latent on a bucket that applies W_UV "
+            "before the merge (TPU_FUSED_UV_OPROJ with TPU_DCP_MLA_UV_BEFORE_MERGE)"
+        )
         if uv_first:
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim
             )
+        elif kwargs.get("skip_uv"):
+            # TPU_FUSED_UV_OPROJ: the caller's output projection kernel runs
+            # W_UV on the merged latent itself.
+            outputs = outputs.reshape(-1, layer.num_heads * layer.kv_lora_rank)
         else:
             outputs_t = outputs.reshape(
                 -1, layer.num_heads, layer.kv_lora_rank

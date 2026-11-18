@@ -6,12 +6,14 @@ Under MoE tensor parallelism vLLM runs the shared expert, scales and adds the
 routed output, and all-reduces the sum over the TP group. For an armed layer
 one torch op does all of it: at the token counts the kernel admits (16, 32 and 64)
 one Pallas call per rank covers routing, the shared expert, the routed experts
-and the all-reduce; every other count runs the usual TP path (router top-k,
-fused_moe_func, the shared expert's linears) and a psum in the same exported
-program. The token count is static there, so one torch op serves every bucket.
-The op's output is reduced, so arming also takes the shared expert and the
-routed scale off the runner, and VllmMoERunner._fused_output_is_reduced turns
-the runner's all-reduce off for that layer.
+and the all-reduce (counts below 16, and with TPU_MOE_TP_DECODE_PAD_ROWS counts
+between two of them, run it on the next count with trailing padding rows);
+every other count runs the usual TP path (router top-k, fused_moe_func, the
+shared expert's linears) and a psum in the same exported program. The token
+count is static there, so one torch op serves every bucket. The op's output
+is reduced, so arming also takes the shared expert and the routed scale off
+the runner, and VllmMoERunner._fused_output_is_reduced turns the runner's
+all-reduce off for that layer.
 
 `arm` runs once at the end of TPUModelRunner.load_model, when the weights,
 the MTP drafter and the token-padding mask exist. It is collective over the TP
@@ -57,18 +59,25 @@ from vllm.distributed import parallel_state
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
+from vllm_torchtpu.kernels.experimental import rotated_collectives
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+    combine_scatter,
     fused_moe_prefill,
     plan_blocks,
+    row_all_gather,
 )
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
+    _quantize_rows,
     fused_moe_prefill_stage_a,
+    gather_routes,
+    gather_rows,
+    own_rows,
 )
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import moe_routing, small_all_reduce_op, token_padding
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
@@ -83,6 +92,12 @@ _OP_ATTR = "_moe_tp_decode_op"
 # from on the FusedMoE layer.
 _OP_PREQUANT_ATTR = "_moe_tp_decode_op_prequant"
 PREQUANT_MOE_ATTR = "_tpu_prequant_moe_slot"
+# TPU_PREFILL_SEQ_PARALLEL: the op variants that take and return this core's
+# rows of the step (set by arm_token_split_op), and the slot on the FusedMoE
+# layer through which the decoder layer asks for them.
+_OP_SPLIT_ATTR = "_moe_tp_decode_op_split"
+_OP_SPLIT_PREQUANT_ATTR = "_moe_tp_decode_op_split_prequant"
+TOKEN_SPLIT_MOE_ATTR = "_tpu_token_split_moe_slot"
 # Non-persistent buffers of an armed layer: the shared expert's tensors (the
 # parameters themselves, not views: a view handed to the op is re-materialized
 # on every call), the f32 correction bias and this rank's mesh index.
@@ -107,6 +122,9 @@ _SELFTEST_OPS: dict[all_reduce.AllReduceSpec, Any] = {}
 _RANK_BUFFER: torch.Tensor | None = None
 # TPU_MOE_TP_DECODE_SHARED_META: one experts_start buffer per (device, value).
 _E0_BUFFERS: dict[tuple[str, int], torch.Tensor] = {}
+# TPU_MOE_PREFILL_ROTATED_COLLECTIVES: (chip coords, core on chip) per mesh
+# index of each op mesh the rotated collectives run over (None: XLA's).
+_ROTATED_PLACES: dict[Any, list | None] = {}
 _SELFTEST_DONE = False
 
 
@@ -137,6 +155,16 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
     # to HBM (it DMAs them itself; no XLA VMEM staging copy). Same bits.
     hbm_operands: bool = False
+    # TPU_MOE_TP_DECODE_AG_PAIRS: the all-reduce paths that exchange at least
+    # this many rows all-gather by chip pairs (0: none). Same bits.
+    ag_pairs: int = 0
+    # TPU_MOE_TP_DECODE_EXCHANGE_PIECES: the all-reduce paths that exchange at
+    # least this many rows exchange by lane-group piece (reduce-scatter and
+    # all-gather overlap; 0: none). Same bits.
+    exchange_pieces: int = 0
+    # TPU_MOE_TP_DECODE_PAD_ROWS: a token count between two kernel row counts
+    # runs the kernel on the next one (see _kernel_rows). Same bits per row.
+    pad_rows: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -353,6 +381,9 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             else None
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
+        ag_pairs=int(envs.TPU_MOE_TP_DECODE_AG_PAIRS),
+        exchange_pieces=int(envs.TPU_MOE_TP_DECODE_EXCHANGE_PIECES),
+        pad_rows=bool(envs.TPU_MOE_TP_DECODE_PAD_ROWS),
     )
     return _Admitted(
         shared=shared,
@@ -478,6 +509,18 @@ def _tp_chain(
     return shared + routed * st.routed_scale
 
 
+def _kernel_rows(n: int, pad_rows: bool) -> int:
+    """The row count the kernel runs an n-row call on: n when the kernel has
+    that size; the smallest size above n when n is below the smallest size,
+    or, with pad_rows, between two sizes; otherwise n (the usual path)."""
+    larger = [m for m in kernel.ROW_BUCKETS if m > n]
+    if n in kernel.ROW_BUCKETS or not larger:
+        return n
+    if n < kernel.ROW_BUCKETS[0] or pad_rows:
+        return larger[0]
+    return n
+
+
 def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     """The op's per-rank body under shard_map over `axis`: the fused kernel at
     the token counts it admits, else this rank's partial from the usual path
@@ -504,13 +547,14 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         is_pad = pad_mask[:n]  # replicated, so n_valid agrees on every rank
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
         weights = (w13, w2, s13, s2, sw13, ss13, sw2, ss2)
-        m = kernel.ROW_BUCKETS[0]
-        if n < m:
-            # A decode bucket below the kernel's smallest row bucket
-            # (TPU_TOKEN_BUCKET_EXTRA=4,8): run the kernel on `m` rows, the
-            # extra rows trailing padding. The kernel skips rows >= n_valid
-            # (admission requires TPU_MOE_SKIP_PADDED_TOKENS) and every row is
-            # independent, so the first n rows are bit for bit the m-row
+        m = _kernel_rows(n, statics.pad_rows)
+        if m != n:
+            # A decode bucket the kernel has no size for (4 and 8 from
+            # TPU_TOKEN_BUCKET_EXTRA, below its smallest size; 48, between
+            # sizes, with TPU_MOE_TP_DECODE_PAD_ROWS): run the kernel on `m`
+            # rows, the extra rows trailing padding. The kernel skips rows >=
+            # n_valid (admission requires TPU_MOE_SKIP_PADDED_TOKENS) and every
+            # row is independent, so the first n rows are bit for bit the m-row
             # bucket's; the plain-XLA fallback below costs far more.
             xp = jnp.pad(x, ((0, m - n), (0, 0)))
             sp = jnp.pad(scores, ((0, m - n), (0, 0)))
@@ -530,6 +574,8 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     n_ranks=n_ranks,
                     fast=statics.fast,
                     hbm_operands=statics.hbm_operands,
+                    ag_pairs=statics.ag_pairs,
+                    exchange_pieces=statics.exchange_pieces,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
@@ -547,6 +593,8 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 n_ranks=n_ranks,
                 fast=statics.fast,
                 hbm_operands=statics.hbm_operands,
+                ag_pairs=statics.ag_pairs,
+                exchange_pieces=statics.exchange_pieces,
             )
         if statics.prefill_above is not None and n > statics.prefill_above:
             return _prefill_chain(
@@ -558,11 +606,101 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     return body
 
 
-def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
+def _split_body(statics: _OpStatics, n_ranks: int, axis: str, rotated=None):
+    """The op's per-rank body for TPU_PREFILL_SEQ_PARALLEL: x, scores and the
+    optional x_q / x_scale hold this core's rows of the step (`own_rows`), and
+    so does the output. Each core routes and quantizes its own rows, the fp8
+    rows, scales and routes are all-gathered, and the fused MoE prefill kernel
+    runs as in _prefill_chain, without the all-gather after its
+    reduce-scatter. Every row's routing, quantization and sum are the ones
+    _op_body computes for it. `rotated` (TPU_MOE_PREFILL_ROTATED_COLLECTIVES):
+    the peer tables (all-gather, reduce-scatter, and the fused combine's or None
+    without TPU_MOE_PREFILL_COMBINE_SCATTER) of the rotated collectives
+    over the op's mesh, numpy int32; the core's mesh index comes from `rank`."""
+
+    def body(
+        x,
+        scores,
+        bias,
+        pad_mask,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        rank,
+        e0,
+        *prequant,
+    ):
+        del e0
+        n = x.shape[0] * n_ranks
+        if statics.prefill_above is None or n <= statics.prefill_above:
+            raise ValueError(
+                f"the split MoE op serves only the prefill kernel's token counts, "
+                f"not {n}"
+            )
+        if plan_blocks(n, x.shape[1], w2.shape[1], sw2.shape[0], w13.dtype) is not None:
+            raise NotImplementedError(
+                "the split MoE op needs the stage-A prefill build (whole experts)"
+            )
+        logger.info(
+            "moe_tp_decode: split fused MoE prefill kernel traced for %d tokens", n
+        )
+        # The rank operand, not lax.axis_index: its partition-id is refused by
+        # XLA's SPMD partitioner in the model's whole-graph compile.
+        is_pad = own_rows(pad_mask[:n], rank.reshape(()), n_ranks)
+        w, ids = _route(x, scores, bias, is_pad, statics)
+        x_q, x_scale = prequant if prequant else _quantize_rows(x, w13.dtype)
+        core_major = envs.TPU_MOE_PREFILL_GATHER_ONCE
+        if core_major:
+            w, ids, x_scale = gather_routes(w, ids, x_scale, axis)
+            if rotated is not None and row_all_gather.supports(x_q.shape, x_q.dtype):
+                x_q = row_all_gather.all_gather(
+                    x_q, rank.reshape(1), jnp.asarray(rotated[0]), axis=axis
+                )
+            else:
+                x_q = lax.all_gather(x_q, axis, axis=0, tiled=True)
+        else:
+            x_q, x_scale, w, ids = (
+                gather_rows(a, axis) for a in (x_q, x_scale, w, ids.astype(jnp.int32))
+            )
+        return fused_moe_prefill_stage_a(
+            None,
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            ss13,
+            sw2,
+            ss2,
+            None,
+            w,
+            ids,
+            axis_name=axis,
+            expert_start=None,
+            routed_scale=statics.routed_scale,
+            x_q=x_q,
+            x_scale=x_scale,
+            scatter=True,
+            core_major=core_major,
+            rank=rank.reshape(1) if rotated is not None and core_major else None,
+            rs_table=rotated[1] if rotated is not None and core_major else None,
+            cs_table=rotated[2] if rotated is not None and core_major else None,
+        ).astype(x.dtype)
+
+    return body
+
+
+def _get_op(mesh, statics: _OpStatics, prequant: bool = False, split: bool = False):
     """One jax_op per distinct closure; built at arming, never in a trace.
     `prequant`: the variant with two more per-rank operands, x_q [T, h/128,
-    128] fp8 and x_scale [T] f32 (TPU_FUSED_ADD_RMSNORM_QUANT_MOE)."""
-    key = (mesh, statics, prequant)
+    128] fp8 and x_scale [T] f32 (TPU_FUSED_ADD_RMSNORM_QUANT_MOE). `split`:
+    the variant over this core's rows of the step (`_split_body`)."""
+    key = (mesh, statics, prequant, split)
     op = _OPS.get(key)
     if op is not None:
         return op
@@ -570,7 +708,10 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
     # Operands as moe_tp_decode_forward passes them; bias and the padding mask
     # are replicated, everything else is per rank.
     specs = (P(axis), P(axis), P(), P()) + (P(axis),) * (12 if prequant else 10)
-    body = _op_body(statics, int(mesh.size), axis)
+    if split:
+        body = _split_body(statics, int(mesh.size), axis, _rotated_tables(mesh))
+    else:
+        body = _op_body(statics, int(mesh.size), axis)
 
     sharded = jax.shard_map(
         body, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
@@ -715,17 +856,20 @@ def _e0_tensor(device: torch.device, experts_start: int) -> torch.Tensor:
     return t
 
 
-def _selftest(topo: _Topology, buckets, device) -> list[tuple[int, int, int]]:
+def _selftest(
+    topo: _Topology, buckets, device, ag_pairs: int = 0, pieces: int = 0
+) -> list[tuple[int, int, int]]:
     """Run the kernel's all-reduce alone for every armed (rows, hidden) and row
-    path through the op's mesh and rank operand; returns this rank's failing
-    (rows, hidden, n_valid). Collective: every rank makes the same calls."""
+    path through the op's mesh and rank operand, with the kernel's chip-pair
+    and piece settings; returns this rank's failing (rows, hidden, n_valid).
+    Collective: every rank makes the same calls."""
     n_ranks = int(topo.mesh.size)
     rank = _rank_tensor(device, topo.mesh_index)
     failures = []
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
         for m, h in buckets:
-            spec = all_reduce.make_spec(n_ranks, m, h)
+            spec = all_reduce.make_spec(n_ranks, m, h, ag_pairs, pieces)
             op = _selftest_op(topo.mesh, spec)
             x = all_reduce.selftest_inputs(spec)
             mine = torch.from_numpy(x[topo.mesh_index]).to(torch.bfloat16).to(device)
@@ -737,6 +881,47 @@ def _selftest(topo: _Topology, buckets, device) -> list[tuple[int, int, int]]:
     finally:
         faulthandler.cancel_dump_traceback_later()
     return failures
+
+
+def _chip_places(topo: _Topology) -> list[tuple[tuple[int, ...], int]]:
+    """(chip coords, core on chip) at each index of the op's mesh, gathered
+    over the TP group (small_all_reduce_op._chip_places). Collective."""
+    return small_all_reduce_op._chip_places(
+        topo.mesh, topo.mesh_index, _gather, who="moe_tp_decode"
+    )
+
+
+def _rotated_places(topo: _Topology) -> list | None:
+    """TPU_MOE_PREFILL_ROTATED_COLLECTIVES: (chip coords, core on chip) per
+    index of the op's mesh when it is a 2x2x2 slice of 2-core chips, else None
+    with the reason logged (XLA's collectives). Collective: every rank gathers
+    every rank's device, and all get the same answer."""
+    if not envs.TPU_MOE_PREFILL_GATHER_ONCE:
+        raise ValueError(
+            "TPU_MOE_PREFILL_ROTATED_COLLECTIVES needs TPU_MOE_PREFILL_GATHER_ONCE=1"
+        )
+    return small_all_reduce_op.rotated_places(
+        topo.mesh,
+        topo.mesh_index,
+        "TPU_MOE_PREFILL_ROTATED_COLLECTIVES",
+        "the split MoE op's fp8 row all-gather and last reduce-scatter",
+        _gather,
+    )
+
+
+def _rotated_tables(mesh) -> tuple | None:
+    """The rotated collectives' peer tables (all-gather, reduce-scatter) over
+    `mesh`, numpy int32, when arming found it a 2x2x2 slice; else None."""
+    places = _ROTATED_PLACES.get(mesh)
+    if places is None:
+        return None
+    return (
+        rotated_collectives.peer_table(places, "all_gather"),
+        rotated_collectives.peer_table(places, "reduce_scatter"),
+        combine_scatter.scatter_table(places)
+        if envs.TPU_MOE_PREFILL_COMBINE_SCATTER
+        else None,
+    )
 
 
 def _gather(obj) -> list:
@@ -821,10 +1006,29 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
     ).hexdigest()[:16]
     mesh_index = -1 if isinstance(topo, str) else topo.mesh_index
     _check_ranks_agree(dict(sig=sig, mesh_index=mesh_index, armed=len(plan)))
+    ag_pairs = int(envs.TPU_MOE_TP_DECODE_AG_PAIRS)
+    pieces = int(envs.TPU_MOE_TP_DECODE_EXCHANGE_PIECES)
+    if plan and ag_pairs > 0:
+        assert not isinstance(topo, str)
+        places = _chip_places(topo)
+        all_reduce.check_chip_pairs(places)
+        ids = [int(d.id) for d in topo.mesh.devices.flat]
+        logger.info(
+            "moe_tp_decode: chip-pair all-gather pairs (mesh indices: device "
+            "ids @ chip coords): %s",
+            "; ".join(
+                f"{i},{i + 1}: {ids[i]},{ids[i + 1]} @ {places[i][0]}"
+                for i in range(0, len(ids), 2)
+            ),
+        )
+    if plan and envs.TPU_MOE_PREFILL_ROTATED_COLLECTIVES:
+        assert not isinstance(topo, str)
+        if topo.mesh not in _ROTATED_PLACES:
+            _ROTATED_PLACES[topo.mesh] = _rotated_places(topo)
     if plan and not _SELFTEST_DONE:
         assert not isinstance(topo, str)
         device = plan[0][0].routed_experts.w13_weight.device
-        failures = _selftest(topo, buckets, device)
+        failures = _selftest(topo, buckets, device, ag_pairs, pieces)
         seen = _gather(dict(mesh_index=topo.mesh_index, failures=failures))
         if any(s["failures"] for s in seen):
             raise RuntimeError(
@@ -864,13 +1068,16 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
     )
     log(
         "moe_tp_decode: armed %d/%d target and %d/%d drafter MoE layers (mesh "
-        "index %d, kernel token counts %s, sig %s); refused: %s",
+        "index %d, kernel token counts %s, chip-pair all-gather %s, piece "
+        "exchange %s, sig %s); refused: %s",
         len(plan) - armed_drafter,
         len(target),
         armed_drafter,
         len(drafter),
         mesh_index,
         sorted({m for m, _ in buckets}),
+        f"from {ag_pairs} rows" if ag_pairs else "off",
+        f"from {pieces} rows" if pieces else "off",
         sig,
         refused or "none",
     )
@@ -893,11 +1100,20 @@ def moe_tp_decode_forward(
     # bit for bit.
     slot = getattr(layer, PREQUANT_MOE_ATTR, None)
     prequant = None if slot is None else slot.value
-    op = getattr(quant_method, _OP_ATTR)
+    # TPU_PREFILL_SEQ_PARALLEL: the decoder layer fills this slot when x holds
+    # this core's rows of the step; the output then holds them too.
+    split_slot = getattr(layer, TOKEN_SPLIT_MOE_ATTR, None)
+    split = split_slot is not None and split_slot.value is not None
+    if split:
+        assert split_slot is not None
+        split_slot.value = None
+    op = getattr(quant_method, _OP_SPLIT_ATTR if split else _OP_ATTR)
     extra: tuple = ()
     if slot is not None and prequant is not None:
         slot.value = None
-        op = getattr(quant_method, _OP_PREQUANT_ATTR)
+        op = getattr(
+            quant_method, _OP_SPLIT_PREQUANT_ATTR if split else _OP_PREQUANT_ATTR
+        )
         extra = tuple(prequant)
     return op(
         x,
@@ -932,8 +1148,34 @@ def arm_prequant_op(layer: Any) -> int | None:
     entry = next(((k, v) for k, v in _OPS.items() if v is op), None)
     if entry is None:
         return None
-    (mesh, statics, prequant), _ = entry
-    if prequant or statics.prefill_above is None:
+    (mesh, statics, prequant, split), _ = entry
+    if prequant or split or statics.prefill_above is None:
         return None
     setattr(layer.quant_method, _OP_PREQUANT_ATTR, _get_op(mesh, statics, True))
     return statics.prefill_above
+
+
+def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] | None:
+    """TPU_PREFILL_SEQ_PARALLEL: build (at load, outside Dynamo) the split
+    variants of an armed layer's op and hand the layer `slot`, which the
+    decoder layer fills to ask for them. Returns the op's mesh, the token
+    count above which its prefill kernel runs and this rank's mesh index
+    operand (int32 [1, 1]), or None when the layer is not armed or has no
+    stage-A prefill kernel (FUSED_MOE_PREFILL_KERNEL_V2)."""
+    if not envs.FUSED_MOE_PREFILL_KERNEL_V2:
+        return None
+    op = getattr(layer.quant_method, _OP_ATTR, None)
+    if op is None:
+        return None
+    entry = next(((k, v) for k, v in _OPS.items() if v is op), None)
+    if entry is None:
+        return None
+    (mesh, statics, _, _), _ = entry
+    if statics.prefill_above is None or statics.use_ep:
+        return None
+    method = layer.quant_method
+    setattr(method, _OP_SPLIT_ATTR, _get_op(mesh, statics, split=True))
+    if getattr(method, _OP_PREQUANT_ATTR, None) is not None:
+        setattr(method, _OP_SPLIT_PREQUANT_ATTR, _get_op(mesh, statics, True, True))
+    setattr(layer, TOKEN_SPLIT_MOE_ATTR, slot)
+    return mesh, statics.prefill_above, layer._moe_tp_decode_rank

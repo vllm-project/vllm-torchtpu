@@ -575,6 +575,63 @@ class TestTpuCompilerCache:
         compiler._run_backend(None, [])
         assert firsts == [1, 1]
 
+    @pytest.mark.parametrize(
+        ("limit", "size", "expected"),
+        [
+            ("64", None, {}),
+            ("0", 16, {}),
+            ("-1", 16, {}),
+            ("64", 16, {"xla_tpu_enable_deduplicated_calls": "DISABLED"}),
+            ("64", 64, {"xla_tpu_enable_deduplicated_calls": "DISABLED"}),
+            ("64", 65, {}),
+        ],
+    )
+    def test_code_layout_overrides_follow_the_token_limit(
+        self, monkeypatch, limit, size, expected
+    ):
+        """Only buckets of at most TPU_NO_CODE_FUNCTIONS_MAX_TOKENS tokens give
+        up shared code functions; 0, a negative limit or no size keeps XLA's."""
+        from vllm_torchtpu.compilation.tpu_compiler import code_layout_overrides
+
+        monkeypatch.setenv("TPU_NO_CODE_FUNCTIONS_MAX_TOKENS", limit)
+        assert code_layout_overrides(size) == expected
+
+    def test_run_backend_compiles_inside_the_code_layout_options(self, monkeypatch):
+        """The options must be active while _tpu_backend compiles a small bucket,
+        and only then: a compile outside the context would silently drop them."""
+        import contextlib
+        import sys
+        import types
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        active, seen = [], []
+
+        @contextlib.contextmanager
+        def custom_compiler_options(overrides):
+            active.append(overrides)
+            try:
+                yield
+            finally:
+                active.pop()
+
+        stub = types.ModuleType("torch_tpu._internal.compiler_options")
+        stub.custom_compiler_options = custom_compiler_options
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+
+        def fake_backend(graph, example_inputs):
+            seen.append(dict(active[-1]) if active else {})
+            return lambda *args: args
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
+        monkeypatch.setenv("TPU_NO_CODE_FUNCTIONS_MAX_TOKENS", "64")
+        compiler = TpuCompilerAdaptor()
+        compiler._run_backend(None, [], 16)
+        compiler._run_backend(None, [], 128)
+        assert seen == [{"xla_tpu_enable_deduplicated_calls": "DISABLED"}, {}]
+        assert not active
+
     @staticmethod
     def _peer_compilers(tmp_path, monkeypatch, n=2, peer_replay="1"):
         """Compilers for local ranks 0..n-1 of one host, with a fake backend

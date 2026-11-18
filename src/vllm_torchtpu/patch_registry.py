@@ -136,6 +136,8 @@ PATCHES = (
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
     # API-server detokenizer priming (VLLM_TPU_DETOK_PRIME_TOKENS).
     Patch("vllm_torchtpu.detok_prime:patch_detokenizer_prime_tail", _ACTIVE),
+    # API-server output detokenization (VLLM_TPU_DETOK_SUFFIX_PRIME).
+    Patch("vllm_torchtpu.detokenizer_suffix:patch_detokenizer_suffix_prime", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
@@ -152,6 +154,10 @@ PATCHES = (
     ),
     Patch(
         "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
+        ("platform_activation", "model_load"),
+    ),
+    Patch(
+        "vllm_torchtpu.layers.adapter.prefill_token_split:maybe_patch_deepseek_v2",
         ("platform_activation", "model_load"),
     ),
 )

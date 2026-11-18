@@ -311,10 +311,18 @@ def _causal_rows(positions, topk, rng):
 
 
 def _dcp_run(
-    dcp, *, candidate, fault=None, big_mixed=False, packed_rope=False, **dcp_kwargs
+    dcp,
+    *,
+    candidate,
+    fault=None,
+    big_mixed=False,
+    bucket64=False,
+    packed_rope=False,
+    **dcp_kwargs,
 ):
     """`packed_rope`: TPU_SPARSE_MLA_PACKED_ROPE's rope cache, initialised to
-    the same token bytes as the padded run's (whose pad bytes it drops)."""
+    the same token bytes as the padded run's (whose pad bytes it drops).
+    `bucket64`: a 64-token mixed step after the decode steps."""
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
@@ -461,6 +469,21 @@ def _dcp_run(
             32,
         )
     )
+    if bucket64:
+        # A 64-token mixed bucket (MTP decode of seqs 0-1 + a 56-token prefill
+        # chunk of seq 2): one live-group chunk.
+        r = [x + 4 for x in q]
+        c = 56
+        steps.append(
+            (
+                [r[i] + j for i in range(2) for j in range(4)]
+                + list(range(r[2], r[2] + c)),
+                [r[0] + 4, r[1] + 4, r[2] + c, r[3]],
+                [0, 4, 8, 8 + c, 8 + c],
+                [2, 3, 3],
+                64,
+            )
+        )
     if big_mixed:
         # A 2048-token mixed bucket (MTP decode of seqs 0-1 + 1020-token
         # prefill chunks of seqs 2 and 3): the >= 2048-token programs.
