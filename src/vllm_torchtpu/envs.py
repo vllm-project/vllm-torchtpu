@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
+    TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
     TPU_MOE_DENSE_FP4_SHARED: bool = False
     TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS: int = 0
     TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
@@ -777,6 +778,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 disables it.
     "TPU_MOE_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_DENSE_FP4_MAX_TOKENS", 16
+    ),
+    # Steps above TPU_MOE_DENSE_FP4_MAX_TOKENS and up to this many tokens run
+    # the same kernel on each expert's own routes only (rows gathered into
+    # 16-row tiles) instead of the routing sort, permute, GMM and combine.
+    # 0 (default) disables it.
+    "TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS", 0
     ),
     # Eligible MoE layers hand their shared expert to the routed experts' op
     # (layers/adapter/dense_fp4_shared.py): the dense fp4 kernel evaluates it
