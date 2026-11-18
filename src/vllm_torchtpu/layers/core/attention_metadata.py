@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -55,6 +56,7 @@ def attention_block_table_width(
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "pcp_metadata",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -106,6 +108,8 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
+    # PCP manager only (see `runner/pcp/manager.py`); None elsewhere.
+    pcp_metadata: PcpMetadata | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -374,12 +378,23 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            if self.block_tables_cpu.shape[0] < target_num_reqs:
+                # A sequence layout's request bucket can outgrow
+                # `max_num_reqs` (see `TPUModelRunner.max_num_local_reqs`).
+                self.block_tables_cpu = torch.zeros(
+                    (target_num_reqs, self.block_tables_cpu.shape[1]),
+                    dtype=self.block_tables_cpu.dtype,
+                )
             block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
             block_tables.zero_()
-            source_block_tables = block_table_obj.get_cpu_tensor()
-            block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+            # PCP currently only read block table inside pcpmetadata
+            # TODO(weiyulin): Evaluate if we want to derive split/replicated block
+            # tables for pcpmanager from md.blocktable
+            if runner.pcp_manager is None:
+                source_block_tables = block_table_obj.get_cpu_tensor()
+                block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+                ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
             block_tables_dev = block_tables.reshape(-1).to(
@@ -450,6 +465,17 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
+        pcp_metadata = (
+            None
+            if runner.pcp_manager is None
+            else runner.pcp_manager.build_metadata(
+                runner=runner,
+                block_table_obj=block_table_obj,
+                target_num_reqs=target_num_reqs,
+                target_num_blocks=target_num_blocks,
+            )
+        )
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -460,6 +486,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            pcp_metadata=pcp_metadata,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
@@ -513,7 +540,8 @@ def stage_block_table_uploads(
     flat = scratch[:total]
     flat.zero_()
 
-    if ctx.position_ids_override is None:
+    # The PCP manager's layers read block tables inside pcp_metadata.
+    if ctx.position_ids_override is None and runner.pcp_manager is None:
         offset = 0
         for _, block_table_obj, target_num_blocks in entries:
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
