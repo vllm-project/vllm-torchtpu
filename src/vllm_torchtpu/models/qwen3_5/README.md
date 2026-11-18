@@ -39,7 +39,7 @@ that needs it:
   left unset where they were measured (see its docstring).
 - `validation/`: serving configs, golden outputs, and accuracy and performance
   baselines for this model's production configs. The first entries are the
-  serving configs of five InferenceX benchmark points (prefill/decode
+  serving configs of five benchmark points (prefill/decode
   disaggregated) and the 1P1D accuracy gates (see `validation/README.md`).
 - `experimental/`: hill-climbing kernels and features that are not yet part of
   the production configs.
