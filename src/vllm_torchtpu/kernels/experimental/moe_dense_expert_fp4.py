@@ -46,7 +46,11 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
 
 _QUANT_BLOCK = 128
+# Weight-ring slots (units in flight = slots - 1). Whole TP-sliced experts
+# are small units: one more slot keeps more of their DMAs in flight (c4 twin:
+# -3.5 % kernel time; 6 slots no better), where the width allows it.
 _NUM_BUFFERS = 3
+_WHOLE_UNIT_BUFFERS = 4
 _ACTIVATIONS = ("silu", "swigluoai")
 # Rows of the in-kernel token buffer: bf16 MXU operands pack 16 sublanes.
 _ROW_ALIGN = 16
@@ -155,7 +159,7 @@ def can_use_dense_expert_fp4(
     )
 
 
-def _vmem_bytes(m: int, h: int, chunk: int, i_s: int) -> int:
+def _vmem_bytes(m: int, h: int, chunk: int, i_s: int, slots: int = _NUM_BUFFERS) -> int:
     """VMEM of one call: the weight ring (VMEM holds fp4 one byte per
     element), its scales, the shared expert's weights, the token-sized scratch
     and the compiler's token-sized temporaries (~16 bytes per element,
@@ -165,7 +169,7 @@ def _vmem_bytes(m: int, h: int, chunk: int, i_s: int) -> int:
     scales = (2 * (h // _QUANT_BLOCK) * chunk + (chunk // _QUANT_BLOCK) * h) * 4
     mp = m + (-m % _ROW_ALIGN)
     tokens = mp * h * (2 + 4 + 4 + 2 + (2 if i_s else 0) + 16)
-    return _NUM_BUFFERS * (weights + scales) + 3 * h * i_s + tokens
+    return slots * (weights + scales) + 3 * h * i_s + tokens
 
 
 def _kernel(
@@ -208,6 +212,7 @@ def _kernel(
     f32 = jnp.float32
     m = x_ref.shape[0]
     mp = acc_ref.shape[0]
+    slots = sem_ref.shape[0]
     num_chunks = i // chunk
     # A whole expert per unit (TP-sliced experts): one contiguous w13 copy.
     whole = chunk == i
@@ -257,7 +262,7 @@ def _kernel(
         e = active_ids_ref[unit // num_chunks]
         col = pl.multiple_of((unit % num_chunks) * chunk, chunk)
         blk = (unit % num_chunks) * (chunk // _QUANT_BLOCK)
-        slot = unit % _NUM_BUFFERS
+        slot = unit % slots
         sem = sem_ref.at[slot]
         if whole:
             return [
@@ -289,7 +294,7 @@ def _kernel(
             ),
         ]
 
-    for initial in range(_NUM_BUFFERS - 1):
+    for initial in range(slots - 1):
 
         @pl.when(units > initial)
         def prime(*, initial=initial):
@@ -345,7 +350,7 @@ def _kernel(
     x_pad_ref[...] = jnp.where(jnp.isfinite(x), x, 0).astype(jnp.bfloat16)
 
     def compute(unit):
-        slot = unit % _NUM_BUFFERS
+        slot = unit % slots
         c = unit % num_chunks
         x = x_pad_ref[...]
         gate = jnp.zeros((x.shape[0], chunk), f32)
@@ -418,9 +423,9 @@ def _kernel(
         for copy in transfers(unit):
             copy.wait()
 
-        @pl.when(unit + _NUM_BUFFERS - 1 < units)
+        @pl.when(unit + slots - 1 < units)
         def prefetch():
-            for copy in transfers(unit + _NUM_BUFFERS - 1):
+            for copy in transfers(unit + slots - 1):
                 copy.start()
 
         compute(unit)
@@ -462,6 +467,10 @@ def dense_expert_moe_fp4(
     info = pltpu.get_tpu_info()
     chunk = _chunk(m, h, i, i_s, info.vmem_capacity_bytes)
     whole = chunk == i
+    slots = _NUM_BUFFERS
+    budget = info.vmem_capacity_bytes - _VMEM_HEADROOM
+    if whole and _vmem_bytes(m, h, chunk, i_s, _WHOLE_UNIT_BUFFERS) <= budget:
+        slots = _WHOLE_UNIT_BUFFERS
     # Whole f32 sublane tiles of tokens; the kernel pads to _ROW_ALIGN itself.
     pad = -m % 8
     if pad:
@@ -503,28 +512,22 @@ def dense_expert_moe_fp4(
             out_specs=vmem,
             scratch_shapes=[
                 # Whole-expert units keep gate|up in the first ring: no up ring.
-                pltpu.VMEM((_NUM_BUFFERS, h, gate_cols), w1.dtype),
+                pltpu.VMEM((slots, h, gate_cols), w1.dtype),
+                pltpu.VMEM((1, 128, 128) if whole else (slots, h, chunk), w1.dtype),
+                pltpu.VMEM((slots, chunk, h), w2.dtype),
+                pltpu.VMEM((slots, h // _QUANT_BLOCK, 1, gate_cols), jnp.float32),
                 pltpu.VMEM(
-                    (1, 128, 128) if whole else (_NUM_BUFFERS, h, chunk), w1.dtype
-                ),
-                pltpu.VMEM((_NUM_BUFFERS, chunk, h), w2.dtype),
-                pltpu.VMEM(
-                    (_NUM_BUFFERS, h // _QUANT_BLOCK, 1, gate_cols), jnp.float32
-                ),
-                pltpu.VMEM(
-                    (1, 1, 1, 128)
-                    if whole
-                    else (_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk),
+                    (1, 1, 1, 128) if whole else (slots, h // _QUANT_BLOCK, 1, chunk),
                     jnp.float32,
                 ),
-                pltpu.VMEM((_NUM_BUFFERS, chunk // _QUANT_BLOCK, 1, h), jnp.float32),
+                pltpu.VMEM((slots, chunk // _QUANT_BLOCK, 1, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.bfloat16),
                 pltpu.VMEM((mp, experts + (-experts) % lanes), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SMEM((experts,), jnp.int32),
-                pltpu.SemaphoreType.DMA((_NUM_BUFFERS, 6)),
+                pltpu.SemaphoreType.DMA((slots, 6)),
                 *shared_scratch,
             ],
         ),
