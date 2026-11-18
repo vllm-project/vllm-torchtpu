@@ -1055,6 +1055,85 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
         self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
 
+    @parameterized.product(
+        case=["mixed_runs", "mixed_empty"],
+        return_lse=[False, True],
+        skip_empty_mixed=[False, True],
+    )
+    def test_ragged_paged_attention_skip_empty_mixed_cond(
+        self, case, return_lse, skip_empty_mixed
+    ):
+        """A 16-token call, more than decode_query_size, so with
+        skip_empty_mixed MIXED runs under its lax.cond: "mixed_runs" has two
+        4-token decodes and an 8-token chunk in MIXED (the true branch);
+        "mixed_empty" has four 4-token decodes and an empty MIXED range (the
+        false branch, which passes o and the KV cache through). Outputs and
+        the cache match the reference, and the LSE matches the call without
+        the skip."""
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        rng = np.random.default_rng(1234)
+        dtype = jnp.bfloat16
+        num_q_heads, num_kv_heads = 8, 1
+        head_dim = 128
+        page_size = 128
+        num_pages = 32
+        max_num_seq = 8
+        pages_per_seq = 4
+        if case == "mixed_runs":
+            seqs, dist = [(4, 260), (4, 100), (8, 300)], (2, 2, 3)
+        else:
+            seqs, dist = [(4, 260), (4, 100), (4, 300), (4, 37)], (4, 4, 4)
+        tokens = sum(q for q, _ in seqs)
+        assert tokens == 16
+
+        def rand(shape):
+            return jnp.array(rng.random(shape, dtype=np.float32), dtype=dtype)
+
+        q = rand((tokens, num_q_heads, head_dim))
+        k = rand((tokens, num_kv_heads, head_dim))
+        v = rand((tokens, num_kv_heads, head_dim))
+        kv_packing = utils.get_dtype_packing(dtype)
+        num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
+        kv_cache = rand(
+            (num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim)
+        )
+        kv_lens = np.zeros(max_num_seq, np.int32)
+        kv_lens[: len(seqs)] = [kv for _, kv in seqs]
+        cu_q_lens = np.full(max_num_seq + 1, tokens, np.int32)
+        cu_q_lens[: len(seqs) + 1] = np.cumsum([0] + [q_len for q_len, _ in seqs])
+        args = (
+            q,
+            k,
+            v,
+            kv_cache,
+            jnp.asarray(kv_lens),
+            jnp.arange(max_num_seq * pages_per_seq, dtype=jnp.int32),
+            jnp.asarray(cu_q_lens),
+            jnp.array(dist, dtype=jnp.int32),
+        )
+        expected, expected_kvc = ref_ragged_paged_attention(
+            *jax.tree.map(lambda x: x.copy(), args)
+        )
+
+        def run(skip):
+            return wrapper.ragged_paged_attention(
+                *jax.tree.map(lambda x: x.copy(), args),
+                kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+                decode_query_size=4,
+                skip_empty_mixed=skip,
+                return_lse=return_lse,
+            )
+
+        result = run(skip_empty_mixed)
+        actual, actual_kvc = result[0], result[1]
+        self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
+        self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
+        if return_lse:
+            np.testing.assert_array_equal(
+                np.asarray(result[2]), np.asarray(run(False)[2])
+            )
+
     @parameterized.product(tuned_tiles=[False, True])
     def test_ragged_paged_attention_tuned_tiles(self, tuned_tiles):
         """The wrapper's own tiles, with and without the tuned rules, at a
