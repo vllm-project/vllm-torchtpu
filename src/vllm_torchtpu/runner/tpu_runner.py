@@ -10712,14 +10712,15 @@ class TPUModelRunner(GPUModelRunner):
                     # max_model_len, e.g. small max_model_len configs.
                     if int(P) > self.max_model_len:
                         continue
-                    if (
-                        buckets.needs_retrace(int(P))
-                        and getattr(self.drafter, "draft_model", None) is not None
-                    ):
-                        shape_variants.retrace(
-                            cast("torch.nn.Module", self.drafter.draft_model),
-                            cast("Eagle3Proposer", self.drafter).draft_vllm_config,
-                        )
+                    if buckets.needs_retrace(int(P)):
+                        drafter = self.drafter
+                        if (
+                            isinstance(drafter, Eagle3Proposer)
+                            and drafter.draft_model is not None
+                        ):
+                            shape_variants.retrace(
+                                drafter.draft_model, drafter.draft_vllm_config
+                            )
                     # Greedy and non-greedy (do_sampling=True) verify+sample are
                     # DISTINCT fused programs, so sweep both at every prompt bucket.
                     for greedy in (True, False):

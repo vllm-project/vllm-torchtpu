@@ -54,6 +54,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.spec_decode import draft_path_rules
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -479,12 +480,11 @@ class Eagle3Proposer:
         from vllm_torchtpu.runner import greedy_top_tokens
 
         try:
-            owner = greedy_top_tokens.resolve_head_owner(
-                draft_model,
-                greedy_top_tokens.draft_head_dp_lockstep(
-                    self.runner._dp_lockstep_enabled()
-                ),
-            )
+            # Resolved as off EP-DP lockstep even under it: the draft's argmax
+            # runs in _draft_propose_token on busy engines and in an idle
+            # engine's run_dp_dummy_draft alike, so every rank emits the same
+            # collectives in the same order, whatever the sampling params.
+            owner = greedy_top_tokens.resolve_head_owner(draft_model, False)
         except NotImplementedError as e:
             logger.warning_once(
                 "Draft greedy head not available (%s); the draft keeps "
@@ -492,19 +492,18 @@ class Eagle3Proposer:
                 str(e),
             )
             return
-        if (
-            getattr(owner.lm_head, "_quant_mode", None) is None
-            and self.runner._dp_lockstep_enabled()
-            and self._dp_lockstep_sharded()
-            and not self._draft_replicated
-        ):
+        if self._dp_lockstep_sharded() and not self._draft_replicated:
             # EP-DP lockstep, TP-sharded draft: every rank runs every draft
             # pass at the same loop bucket, so the BF16 head is split over the
             # whole DP x TP group.
             owner = greedy_top_tokens.vocab_parallel_draft_owner(owner)
         self._draft_greedy_head_owner = owner
         logger.info(
-            "TPU_GREEDY_TOP_TOKENS enabled for draft proposer (%s, quant=%s).",
+            "Greedy draft head on (%s): %s, quant=%s.",
+            "TPU_GREEDY_TOP_TOKENS"
+            if envs.TPU_GREEDY_TOP_TOKENS
+            else "draft-path rule "
+            + ", ".join(draft_path_rules.matching(self.vllm_config)),
             type(owner).__name__,
             getattr(owner.lm_head, "_quant_desc", "bf16"),
         )

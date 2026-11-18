@@ -303,6 +303,7 @@ def _init_greedy_head(draft: torch.nn.Module):
         draft_model=draft,
         vllm_config=None,
         runner=SimpleNamespace(_dp_lockstep_enabled=lambda: False),
+        _dp_lockstep_sharded=lambda: False,
     )
     Eagle3Proposer._init_draft_greedy_head(proposer)
     return proposer._draft_greedy_head_owner
