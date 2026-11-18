@@ -296,12 +296,12 @@ def below_or_on_diag(r, r_blk_size, c, c_blk_size):
     return ((r + 1) * r_blk_size - 1) > (c * c_blk_size)
 
 
-def _flash_attention_kernel(*refs, segment_ranges: bool, **kwargs):
-    # With segment ids, the scalar-prefetched [min, max] segment id of every q
-    # block and kv block come first.
-    q_ranges_ref = kv_ranges_ref = None
-    if segment_ranges:
-        q_ranges_ref, kv_ranges_ref, *refs = refs
+def _flash_attention_kernel(*refs, kv_windows: bool, **kwargs):
+    # With segment ids, the scalar-prefetched kv window of every q block comes
+    # first.
+    kv_windows_ref = None
+    if kv_windows:
+        kv_windows_ref, *refs = refs
     q_tile_ref, *args = refs
     block_b = q_tile_ref.shape[0]
     # If we're not going to tile the softmax, then we can avoid a bunch of VPU ops.
@@ -310,8 +310,7 @@ def _flash_attention_kernel(*refs, segment_ranges: bool, **kwargs):
     else:
         kernel = functools.partial(
             _flash_attention_kernel_single_batch,
-            q_ranges_ref=q_ranges_ref,
-            kv_ranges_ref=kv_ranges_ref,
+            kv_windows_ref=kv_windows_ref,
         )
     for batch_idx in range(block_b):
         kernel((batch_idx, 0), q_tile_ref, *args, **kwargs)
@@ -337,8 +336,7 @@ def _flash_attention_kernel_single_batch(
     block_k,
     kv_seq_len,
     mask_value,
-    q_ranges_ref=None,
-    kv_ranges_ref=None,
+    kv_windows_ref=None,
 ):
     block_k_major = k_tile_ref.shape[2]
     block_q = q_tile_ref.shape[2]
@@ -452,21 +450,23 @@ def _flash_attention_kernel_single_batch(
                 acc_scratch_ref[batch_idx] * l_broadcast(alpha) + o_curr
             )
 
-        @pl.loop(0, block_k_major, step=block_k, unroll=True)
-        def _body(start_k):
-            if q_ranges_ref is None:
-                _attend(start_k)
-                return
-            # Segment ids can only match if the q block's [min, max] range meets
-            # the kv block's; otherwise every logit is masked.
-            batch = pl.program_id(0) * q_tile_ref.shape[0] + batch_idx[0]
-            kv_block = (kv_seq_idx * block_k_major + start_k) // block_k
-            q_lo = q_ranges_ref[batch, q_seq_idx, 0]
-            q_hi = q_ranges_ref[batch, q_seq_idx, 1]
-            kv_lo = kv_ranges_ref[batch, kv_block, 0]
-            kv_hi = kv_ranges_ref[batch, kv_block, 1]
-            overlap = jnp.logical_and(q_lo <= kv_hi, kv_lo <= q_hi)
-            pl.when(overlap)(lambda: _attend(start_k))
+        if kv_windows_ref is None:
+            pl.loop(0, block_k_major, step=block_k, unroll=True)(_attend)
+            return
+        # Only the q block's kv window [lo, hi) can hold a matching segment.
+        # Cover its part in this kv block with the fewest block_k chunks,
+        # placed inside the kv block: columns they add past the window are
+        # masked like any other mismatch.
+        batch = pl.program_id(0) * q_tile_ref.shape[0] + batch_idx[0]
+        kv_start = kv_seq_idx * block_k_major
+        lo = jnp.maximum(kv_windows_ref[batch, q_seq_idx, 0], kv_start)
+        hi = jnp.minimum(kv_windows_ref[batch, q_seq_idx, 1], kv_start + block_k_major)
+        num_chunks = pl.cdiv(jnp.maximum(hi - lo, 0), block_k)
+        first = jnp.minimum(lo - kv_start, block_k_major - num_chunks * block_k)
+
+        @pl.loop(0, num_chunks)
+        def _body(i):
+            _attend(pl.multiple_of(first + i * block_k, NUM_LANES))
 
     @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
     def store_output():
@@ -659,7 +659,7 @@ def _flash_attention_impl(
 
     kernel = functools.partial(
         _flash_attention_kernel,
-        segment_ranges=segment_ids is not None,
+        kv_windows=segment_ids is not None,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
         sm_scale=sm_scale,
@@ -756,15 +756,12 @@ def _flash_attention_impl(
         kv_segment_ids_spec,
     ]
 
-    segment_ranges = ()
+    kv_windows = ()
     if segment_ids is not None:
-        # The [min, max] segment id of every q block and kv block, for the
-        # kernel to skip pairs that cannot match (packed vision inputs: most).
-        segment_ranges = (
-            _block_ranges(segment_ids.q, block_q),
-            _block_ranges(segment_ids.kv, block_k),
-        )
-        num_prefetch = len(segment_ranges)
+        # Each q block's kv window, for the kernel to skip the pairs that
+        # cannot match (packed vision inputs: most).
+        kv_windows = (_kv_windows(segment_ids, block_q),)
+        num_prefetch = len(kv_windows)
 
         def with_prefetch(spec):
             if spec is None:
@@ -780,7 +777,7 @@ def _flash_attention_impl(
     o, *aux = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(segment_ranges),
+            num_scalar_prefetch=len(kv_windows),
             grid=grid,
             in_specs=in_specs,
             out_specs=out_specs,
@@ -808,7 +805,7 @@ def _flash_attention_impl(
             kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids),
             kernel_outputs_specs=out_shape,
         ),
-    )(*segment_ranges, q, k, v, ab, q_segment_ids, kv_segment_ids)
+    )(*kv_windows, q, k, v, ab, q_segment_ids, kv_segment_ids)
     if save_residuals:
         l, m = (v[..., 0] for v in aux[-2:])
         return (o, l, m)
@@ -824,6 +821,20 @@ def _block_ranges(segment_ids: jax.Array, block: int) -> jax.Array:
     ids = jnp.pad(segment_ids, ((0, 0), (0, pad)), mode="edge")
     ids = ids.reshape(batch_size, -1, block).astype(jnp.int32)
     return jnp.stack([ids.min(axis=-1), ids.max(axis=-1)], axis=-1)
+
+
+def _kv_windows(segment_ids: SegmentIds, block_q: int) -> jax.Array:
+    """[batch, q blocks, 2] int32: the kv columns [lo, hi) from the first to the
+    last 128-column block whose segment range meets the q block's (empty:
+    lo >= hi). Columns outside cannot match any of the q block's ids; with
+    sorted ids (packed inputs) the window holds only the q block's segments."""
+    q = _block_ranges(segment_ids.q, block_q)[:, :, None]
+    kv = _block_ranges(segment_ids.kv, NUM_LANES)[:, None]
+    meets = (q[..., 0] <= kv[..., 1]) & (kv[..., 0] <= q[..., 1])
+    col = jnp.arange(kv.shape[2], dtype=jnp.int32) * NUM_LANES
+    lo = jnp.min(jnp.where(meets, col, segment_ids.kv.shape[1]), axis=-1)
+    hi = jnp.max(jnp.where(meets, col + NUM_LANES, 0), axis=-1)
+    return jnp.stack([lo, hi], axis=-1)
 
 
 # For autograd testing.
