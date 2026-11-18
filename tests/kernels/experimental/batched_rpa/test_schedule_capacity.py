@@ -14,7 +14,6 @@
 """The HBM schedule is sized for the shape's worst case, and the schedule
 kernel never writes past it (rpa_kernel reads it with bounds checks off)."""
 
-import dataclasses
 from types import SimpleNamespace
 
 import jax
@@ -86,7 +85,6 @@ def test_schedule_overflow_is_dropped_not_written_out_of_bounds(monkeypatch):
         mode=configs.RpaCase.MIXED,
         vmem_limit_bytes=64 << 20,
     )
-    cfgs = dataclasses.replace(cfgs)
     ctx = pages * 128 - 128  # one 128-token q-block over ~8191 KV blocks
     capacity = cfgs.max_steps_ub
     if (ctx // 128 + 1) // 2 <= capacity:

@@ -225,7 +225,10 @@ def worst_case_schedule_chunks(cfgs: "RpaConfigs") -> int:
     """Chunks of `cfgs.max_steps_ub` steps the shape's worst case fills: every
     sequence at the block table's full length, pairing each of its q blocks
     with each of its KV blocks."""
-    q_blocks = cfgs.serve.num_seqs  # DECODE: q_len <= bq per sequence
+    # DECODE: one q block per sequence. Its range holds only 1-token decodes
+    # and speculative verify windows of at most decode_query_size tokens,
+    # which is the DECODE bq.
+    q_blocks = cfgs.serve.num_seqs
     if cfgs.mode != RpaCase.DECODE:
         q_blocks += cfgs.serve.total_q_tokens // cfgs.bq_sz
     kv_tokens = cfgs.serve.pages_per_seq * cfgs.serve.page_size
