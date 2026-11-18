@@ -47,8 +47,7 @@ ROWS_RANK = 3
 # compiler's xla_sc_tile_overlays_size). Rows whose word count is a power
 # of two move as one copy per block. The estimate uses a fixed prologue
 # cost plus a per-block cost for these widths; other widths also carry a
-# per-row cost. test_sort_program checks the estimate against compiler
-# bundle-count fixtures.
+# per-row cost.
 SORT_PROGRAM_BUNDLE_LIMIT = 8144
 SORT_BUNDLES_FIXED = 8
 SORT_BUNDLES_PER_BLOCK = 23
@@ -352,7 +351,8 @@ def _gather_prefix_body(
     """gather_rows_prefix's body: every subcore gathers `run_live` rows
     (meta_hbm[0], a multiple of block_rows at most `run`), its run starting
     at subcore * run_live, so the first n_subcores * run_live output rows
-    are rows[index] and the rest are left as they are."""
+    are rows[index] and the rest are left unwritten (the output is a buffer
+    the compiler allocates, so they hold no defined value)."""
     rows_hbm = rows_hbm.bitcast(jnp.int32)  # the rows as words
     out_rows_hbm = out_rows_hbm.bitcast(jnp.int32)
     subcore = lax.axis_index((CORE_AXIS, SUBCORE_AXIS))

@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Device mesh, ICI ring neighborhood, and EP rank topology helpers for Fused EP
-MoE v3."""
+"""Chip-generation checks and VMEM queries for Fused EP MoE v3."""
 
 import jax
 import jax.numpy as jnp

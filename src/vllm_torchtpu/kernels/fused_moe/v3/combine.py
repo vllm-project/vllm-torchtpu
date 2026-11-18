@@ -13,8 +13,9 @@
 # limitations under the License.
 """Weighted expert output reduction and token combine stage for Fused EP MoE v3.
 
-Accumulates top-k routed expert outputs weighted by routing probabilities and
-optionally fuses the shared expert residual addition.
+Gathers each token's top-k expert result rows on the sparse cores and sums
+them in top-k order, each weighted by its routing weight (times its row scale
+for fp8 rows).
 """
 
 from typing import cast

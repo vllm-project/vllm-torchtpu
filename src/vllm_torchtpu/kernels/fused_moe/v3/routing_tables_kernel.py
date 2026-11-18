@@ -648,7 +648,7 @@ def shard_tables_kernel(
     mesh_axes=(layout.MESH_AXIS,),
 ):
     """The pallas mode's front end, from the gathered routing messages
-    (`routing messages` [num_shards, rows, LANES] int32: shard s's pair indices
+    (`routing_messages` [num_shards, rows, LANES] int32: shard s's pair indices
     flat in
     its first pairs_per_shard // LANES rows, a pair's number its word).
 
