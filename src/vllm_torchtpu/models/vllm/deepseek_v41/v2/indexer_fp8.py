@@ -804,7 +804,7 @@ def select_fp8_indexer_jax(
     )
     if (
         width >= score_width
-        or chunk >= q.shape[0]
+        or chunk > q.shape[0]
         or q.shape[0] % chunk
         or candidate_write
         or sparse_logits
