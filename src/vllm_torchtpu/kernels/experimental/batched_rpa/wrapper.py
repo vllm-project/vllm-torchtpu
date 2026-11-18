@@ -857,7 +857,10 @@ def ragged_paged_attention(
                 "Batched RPA %s: a full batch at the longest context needs %d "
                 "schedule chunks of %d steps, but the HBM schedule holds %d. A "
                 "step whose schedule runs past it drops the steps beyond the "
-                "cap, and the sequences they cover get no attention output.",
+                "cap: the sequences they cover get no attention output, and "
+                "(unless skip_kv_update is set) the new tokens of those steps "
+                "are not written to the KV cache, so their later steps are "
+                "wrong too.",
                 mode,
                 need,
                 cfgs.max_steps_ub,
