@@ -32,12 +32,12 @@ cases:
 
   - name: complex_ast
     schema_path: ../structured_schemas/complex_ast.json
-    max_tokens: 2048
+    max_tokens: 1536
     prompts:
-      - "Generate exactly 10 depth-1 AST expressions where left and right are numbers (1 to 10), each with a 2-word description."
-      - "Return exactly 10 shallow AST expressions where left is x or y and right is a single integer, each with a 2-word description."
-      - "Produce exactly 10 flat comparison AST entries using ==, <, or > on two numbers, each with a 2-word description."
-      - "List exactly 10 simple arithmetic AST entries where left and right are numbers (no nested Expression nodes) and description is 2 words."
+      - "Generate 10 arithmetic and comparison AST expressions with short descriptions."
+      - "Return 10 nested expression trees combining variables x, y, z and constants with +, -, *, /, ==, <, >."
+      - "Build 10 expression AST entries representing physics and algebra formulas."
+      - "Emit 10 valid nested binary expression trees with human-readable descriptions."
 
   - name: character_schema
     schema_path: ../structured_schemas/character_schema.json
