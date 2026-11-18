@@ -284,7 +284,6 @@ ignore-missing-imports = [
     "prometheus_client", "prometheus_client.*",
     "ray", "ray.*",
     "requests", "requests.*",
-    "safetensors", "safetensors.*",
     "sympy", "sympy.*",
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the k2-fsa/OmniVoice TPU patch in vllm_torchtpu.omni.patches."""
+"""Unit tests for src/vllm_torchtpu/omni/patches/omnivoice.py."""
 
 import inspect
 
@@ -20,7 +20,7 @@ import safetensors.torch as safetensors_torch
 import torch
 from safetensors import SafetensorError
 
-from vllm_torchtpu.omni.patches import _patch_omnivoice_cpu_safetensors_load
+from vllm_torchtpu.omni.patches.omnivoice import patch_omnivoice_cpu_safetensors_load
 
 pytestmark = [pytest.mark.omni]
 
@@ -42,8 +42,8 @@ def fake_load_file(monkeypatch):
         return {"w": torch.zeros(2)}
 
     monkeypatch.setattr(safetensors_torch, "load_file", _load_file)
-    _patch_omnivoice_cpu_safetensors_load.cache_clear()
-    _patch_omnivoice_cpu_safetensors_load()
+    patch_omnivoice_cpu_safetensors_load.cache_clear()
+    patch_omnivoice_cpu_safetensors_load()
     yield _load_file, calls, fail_on
 
 
@@ -51,8 +51,8 @@ def test_torch_tpu_safetensors_still_rejects_tpu_device(tmp_path):
     """Canary: the real safetensors still cannot load straight to TPU.
 
     This test is meant to fail once safetensors accepts torch_tpu devices. When
-    it does, the fallback in _patch_omnivoice_cpu_safetensors_load no longer
-    runs: remove the patch and this test file (see the TODO on the patch).
+    it does, the fallback in patch_omnivoice_cpu_safetensors_load no longer
+    runs: remove the patch and this test file (see the TODO in the patch module).
     """
     path = tmp_path / "w.safetensors"
     safetensors_torch.save_file({"w": torch.ones(2)}, str(path))
@@ -68,7 +68,7 @@ def test_patch_installs_wrapper_once_without_touching_original(fake_load_file):
     assert patched.__wrapped__ is original
     assert vars(original) == {}  # no attribute was set on the original function
 
-    _patch_omnivoice_cpu_safetensors_load()  # @run_once: no second wrapper
+    patch_omnivoice_cpu_safetensors_load()  # @run_once: no second wrapper
     assert safetensors_torch.load_file is patched
 
 
