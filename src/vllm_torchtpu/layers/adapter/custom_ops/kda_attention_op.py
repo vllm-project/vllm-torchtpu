@@ -415,6 +415,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 prefill_only=prefill_only,
             )
 
+        total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
         if num_spec_tokens > 0:
             window_end = window_distribution[0]
             empty_out = jnp.zeros((num_tokens, num_heads * head_dim), mixed_qkv.dtype)
@@ -424,7 +425,6 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 lambda: ((conv_state, recurrent_state), empty_out),
             )
             first_prefill_token = query_start_loc[window_end]
-            total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
             ((new_conv_state, new_pool), prefill_out) = jax.lax.cond(
                 first_prefill_token < total_tokens,
                 lambda: run_kernel(*verify_states, prefill_only=True),
@@ -438,9 +438,16 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         else:
             (new_conv_state, new_pool), out = run_kernel(conv_state, recurrent_state)
 
+        # `fused_conv1d_gdn` allocates an uninitialized HBM output buffer and
+        # only writes `[0, total_tokens)`. Clear padded tail rows before the
+        # fp32 output norm so recycled high-exponent / NaN HBM bytes cannot
+        # overflow `output * output` or propagate into downstream MXU ops.
+        valid_row = jnp.arange(num_tokens) < total_tokens
+        out = jnp.where(valid_row[:, None], out, 0)
+        safe_gate = jnp.where(valid_row[:, None], output_gate, 0)
         output = out.reshape(num_tokens, num_heads, head_dim)
         output = _gated_output_norm(
-            output, output_gate, norm_weight, eps, mixed_qkv.dtype
+            output, safe_gate, norm_weight, eps, mixed_qkv.dtype
         )
         return output, new_conv_state, new_pool
 
@@ -548,6 +555,7 @@ def _pooled_kda_core(
     pool_block_tokens: int,
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
+    pool_tokens_per_row: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
@@ -597,7 +605,16 @@ def _pooled_kda_core(
     # consecutive pool blocks — so measure the regions against the manager
     # block and let gather_region/scatter_region remap the ids
     # (`state_indices * split + kb`) through their split branch.
-    tokens_per_row = pool.shape[2] if pool.ndim > 3 else 1
+    #
+    # `pool_tokens_per_row` states the packing explicitly. The inference
+    # below holds for the 4-D MLA pool (Kimi-Linear, Kimi-K3), but a 5-D RPA
+    # pool `(blocks, block_size, kv_heads_x2 // packing, packing, head_dim)`
+    # keeps one token per row while also having ndim > 3, so callers whose
+    # attention layers are dense (e.g. GLM-5.3) must pass 1.
+    if pool_tokens_per_row is None:
+        tokens_per_row = pool.shape[2] if pool.ndim > 3 else 1
+    else:
+        tokens_per_row = pool_tokens_per_row
     if pool_block_tokens % tokens_per_row != 0:
         raise ValueError(
             "Manager block size is not a whole number of pool "
@@ -740,6 +757,7 @@ def build_kimi_pooled_kda_op(
     eps: float,
     vllm_config: VllmConfig,
     num_spec_tokens: int = 0,
+    pool_tokens_per_row: int | None = None,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
@@ -757,6 +775,10 @@ def build_kimi_pooled_kda_op(
     adjusted value exists), so a value captured at build time is the
     pre-adjustment one (16) and the op would size its regions against the
     wrong manager block.
+
+    ``pool_tokens_per_row`` is the number of tokens one pool row holds (see
+    ``_pooled_kda_core``). Leave it unset for the MLA pool; models whose
+    attention layers use the RPA pool pass 1.
     """
 
     conv_shard_heads = None
@@ -814,6 +836,7 @@ def build_kimi_pooled_kda_op(
             pool_block_tokens=vllm_config.cache_config.block_size,
             conv_shard_heads=conv_shard_heads,
             num_spec_tokens=num_spec_tokens,
+            pool_tokens_per_row=pool_tokens_per_row,
         )
 
     # vLLM's compile cache is keyed on the model config and not on the op
@@ -828,6 +851,10 @@ def build_kimi_pooled_kda_op(
         # Stored state order is part of the compiled program, including for
         # decode-local requests and prefix-cache seeds, not just PD loads.
         op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
+    if pool_tokens_per_row is not None:
+        # The row packing decides every region offset, so it is part of the
+        # compiled program too.
+        op_name += f"_rows{pool_tokens_per_row}"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
 
     def _fake_pooled(
