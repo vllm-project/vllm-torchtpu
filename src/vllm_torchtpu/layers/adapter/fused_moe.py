@@ -27,6 +27,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     armed_lowtok_max_tokens,
     fused_moe_func,
@@ -228,15 +229,6 @@ def _get_fused_moe_custom_op(
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    if use_ep and num_primary_experts is None:
-        from vllm_torchtpu.layers.adapter import expert_placement
-
-        if expert_placement.has_copies():
-            raise ValueError(
-                "this expert placement holds copies: the grouped path needs "
-                "num_primary_experts, which this quantisation method does not "
-                "supply"
-            )
     # The few-token row cap is baked into the op's program, so it is part of
     # the key: an op built before a model rule armed the kernel is not reused.
     lowtok_max_tokens = armed_lowtok_max_tokens()
@@ -252,6 +244,15 @@ def _get_fused_moe_custom_op(
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
+    # Checked when an op is built (at weight load, by prebuild), not on every
+    # lookup the compiled forward makes: no op without the bound is built
+    # under a table with copies, so no later lookup finds one.
+    if use_ep and num_primary_experts is None and expert_placement.has_copies():
+        raise ValueError(
+            "this expert placement holds copies: the grouped path needs "
+            "num_primary_experts, which this quantization method does not "
+            "supply"
+        )
     return _build_fused_moe_custom_op(
         topk=topk,
         activation=activation,
