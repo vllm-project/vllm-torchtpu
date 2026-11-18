@@ -74,9 +74,16 @@ def _config():
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("tiles", [False, True])
 def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
-    monkeypatch, rank, compiled, cpu_vllm_config_context
+    monkeypatch, rank, compiled, tiles, cpu_vllm_config_context
 ):
+    """With `tiles`, the layers carry tuned_tiles and skip_empty_mixed, as the
+    model's tile rule sets them, so the forward must look the ops up with
+    those values too."""
+    # Every case compiles the forward of three layers; start from a clean
+    # dynamo cache so the cases do not add up to its recompile limit.
+    torch._dynamo.reset()
     built, calls = [], []
 
     def build_op(_name, fn):
@@ -107,11 +114,15 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     for layout in ("LBNHC", "LBHNC", "LBNHC"):
         get_current_vllm_config().cache_config.kv_cache_layout = layout
         impl = _impl()
+        # As the model's tile rule sets them before the kernels are built.
+        impl.tuned_tiles = impl.skip_empty_mixed = tiles
         with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
             impl.initialize_kernel(layer)
         implementations.append(impl)
 
     assert len(built) == 4  # Two layouts, two scopes; shared by matching layers.
+    assert all(fn.keywords["tuned_tiles"] is tiles for fn in built)
+    assert all(fn.keywords["skip_empty_mixed"] is tiles for fn in built)
     assert (
         implementations[0].rpa_dcp_cache_kernel
         is implementations[2].rpa_dcp_cache_kernel
