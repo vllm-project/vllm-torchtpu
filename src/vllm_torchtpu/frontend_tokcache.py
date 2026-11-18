@@ -36,10 +36,12 @@ BOUNDARY = "<|im_start|>"
 _BOUNDARY_B = BOUNDARY.encode("utf-8")
 
 
-# Size limits of the installed cache: at most 2048 prompts and 64M cached
-# token ids per API server; the least recently used entries are evicted first.
+# Size limits of the installed cache: at most 2048 prompts and, by default,
+# 256M cached token ids per API server (tpu_frontend.
+# tokenize_prefix_cache_max_tokens sets the latter); the least recently used
+# entries are evicted first.
 MAX_ENTRIES = 2048
-MAX_TOKENS = 64_000_000
+MAX_TOKENS = 256_000_000
 # Prompts shorter than this are encoded directly.
 MIN_TOKENS = 2048
 # The first VERIFY_FIRST cached encodes are checked against a full encode, and
@@ -381,7 +383,9 @@ class PrefixTokenCache:
 _INSTALLED = False
 
 
-def _build_cache_for(tokenizer) -> PrefixTokenCache | None:
+def _build_cache_for(
+    tokenizer, max_tokens: int = MAX_TOKENS
+) -> PrefixTokenCache | None:
     """Create the cache around a private copy of the Rust tokenizer."""
     try:
         from tokenizers import Tokenizer
@@ -436,15 +440,18 @@ def _build_cache_for(tokenizer) -> PrefixTokenCache | None:
         encode,
         boundary_id,
         max_entries=MAX_ENTRIES,
-        max_tokens=MAX_TOKENS,
+        max_tokens=max_tokens,
         min_tokens=MIN_TOKENS,
         verify_first=VERIFY_FIRST,
         log_period_s=LOG_PERIOD_S,
     )
 
 
-def maybe_install_tokenize_prefix_cache() -> bool:
-    """Monkeypatch BaseRenderer._tokenize_prompt (API server). Idempotent."""
+def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
+    """Monkeypatch BaseRenderer._tokenize_prompt (API server). Idempotent.
+
+    ``max_tokens`` bounds the token ids the cache keeps.
+    """
     global _INSTALLED
     if _INSTALLED:
         return False
@@ -465,7 +472,9 @@ def maybe_install_tokenize_prefix_cache() -> bool:
         if not state["tried"]:
             with cache_lock:
                 if not state["tried"]:
-                    state["cache"] = _build_cache_for(renderer.get_tokenizer())
+                    state["cache"] = _build_cache_for(
+                        renderer.get_tokenizer(), max_tokens
+                    )
                     state["tried"] = True
                     if state["cache"] is not None:
                         logger.info(

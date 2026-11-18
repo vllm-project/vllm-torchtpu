@@ -49,14 +49,35 @@ def installed(monkeypatch):
     """Record which installers ran instead of patching vLLM."""
     calls = []
     for name, (module, attr) in _INSTALLERS.items():
-        monkeypatch.setattr(module, attr, lambda name=name: calls.append(name))
+        monkeypatch.setattr(
+            module, attr, lambda name=name, **kwargs: calls.append(name)
+        )
     return calls
 
 
 def test_defaults_are_all_off():
     assert frontend_options.parse(None) == FrontendOptions()
     assert frontend_options.parse({}) == FrontendOptions()
-    assert not any(vars(FrontendOptions()).values())
+    switches = {k: v for k, v in vars(FrontendOptions()).items() if type(v) is bool}
+    assert switches and not any(switches.values())
+
+
+def test_cache_keeps_256m_token_ids_by_default_and_honours_the_option(monkeypatch):
+    """256M is the default size; a deployment can lower it (its prefill legs
+    ran 64M)."""
+    assert FrontendOptions().tokenize_prefix_cache_max_tokens == 256_000_000
+    seen = []
+    monkeypatch.setattr(
+        frontend_tokcache,
+        "maybe_install_tokenize_prefix_cache",
+        lambda **kwargs: seen.append(kwargs),
+    )
+    on = {"tokenize_prefix_cache": True}
+    frontend_options.install_tokenize_prefix_cache(vllm_config=_config(on))
+    frontend_options.install_tokenize_prefix_cache(
+        vllm_config=_config({**on, "tokenize_prefix_cache_max_tokens": 64_000_000})
+    )
+    assert seen == [{"max_tokens": 256_000_000}, {"max_tokens": 64_000_000}]
 
 
 def test_get_reads_the_section():
@@ -74,6 +95,9 @@ def test_get_reads_the_section():
         ({"tokenize_prefix_cache": "true"}, "must be a bool"),
         ({"tokenize_prefix_cach": True}, "unknown keys"),
         ([True], "must be a JSON object"),
+        ({"tokenize_prefix_cache_max_tokens": "64M"}, "must be a int"),
+        ({"tokenize_prefix_cache_max_tokens": True}, "must be a int"),
+        ({"tokenize_prefix_cache_max_tokens": 0}, "must be positive"),
     ],
 )
 def test_parse_is_strict(raw, message):

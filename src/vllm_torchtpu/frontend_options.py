@@ -29,6 +29,7 @@ tokenization cache is only reached through vLLM's renderer.
 """
 
 import importlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,6 +55,18 @@ class FrontendOptions:
     new suffix. Verified against a full encode for the first prompts; any
     mismatch disables the cache."""
 
+    tokenize_prefix_cache_max_tokens: int = 256_000_000
+    """Most token ids the tokenization cache keeps per API server; the least
+    recently used prompts are evicted first. Read only with
+    ``tokenize_prefix_cache``."""
+
+    def __post_init__(self) -> None:
+        if self.tokenize_prefix_cache_max_tokens <= 0:
+            raise ValueError(
+                f"additional_config.{SECTION}.tokenize_prefix_cache_max_tokens "
+                f"must be positive, got {self.tokenize_prefix_cache_max_tokens}"
+            )
+
 
 def parse(raw: Any) -> FrontendOptions:
     """The ``tpu_frontend`` section as options (see ``config_section.parse``)."""
@@ -72,6 +85,7 @@ def install_tokenize_prefix_cache(vllm_config: Any = None) -> bool | None:
         "tokenize_prefix_cache",
         "vllm_torchtpu.frontend_tokcache",
         "maybe_install_tokenize_prefix_cache",
+        lambda options: {"max_tokens": options.tokenize_prefix_cache_max_tokens},
     )
 
 
@@ -85,19 +99,28 @@ def install_detok_prompt_tail(vllm_config: Any = None) -> bool | None:
     )
 
 
-def _install(vllm_config: Any, name: str, module: str, installer: str) -> bool | None:
+def _install(
+    vllm_config: Any,
+    name: str,
+    module: str,
+    installer: str,
+    installer_kwargs: Callable[[FrontendOptions], dict[str, Any]] = lambda _: {},
+) -> bool | None:
     """Install option ``name``'s patch with ``module.installer`` when the engine
-    config turns it on.
+    config turns it on, passing it ``installer_kwargs(options)``.
 
     Off, this returns False, which keeps the registry entry eligible: a later
     engine config built in the same process may still turn it on. A patch that
     cannot be installed logs a warning and leaves vLLM's own path in place; it
     never stops the server from starting.
     """
-    if vllm_config is None or not getattr(get(vllm_config), name):
+    if vllm_config is None:
+        return False
+    options = get(vllm_config)
+    if not getattr(options, name):
         return False
     try:
-        getattr(importlib.import_module(module), installer)()
+        getattr(importlib.import_module(module), installer)(**installer_kwargs(options))
     except Exception as e:
         logger.warning("%s.%s: install failed (%r)", SECTION, name, e)
     return None

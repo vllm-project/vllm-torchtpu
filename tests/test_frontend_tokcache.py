@@ -96,10 +96,13 @@ def _toy_hf_tokenizer():
 
 
 def test_installed_cache_uses_the_deployed_sizes():
-    """The installed cache keeps at most 2048 prompts and 64M token ids."""
+    """The installed cache keeps at most 2048 prompts and, by default, 256M
+    token ids; the token limit is the caller's when given."""
     cache = tokcache_mod._build_cache_for(_toy_hf_tokenizer())
     assert cache is not None
-    assert (cache._max_entries, cache._max_tokens) == (2048, 64_000_000)
+    assert (cache._max_entries, cache._max_tokens) == (2048, 256_000_000)
+    smaller = tokcache_mod._build_cache_for(_toy_hf_tokenizer(), 64_000_000)
+    assert smaller is not None and smaller._max_tokens == 64_000_000
     assert (cache._min_tokens, cache._verify_first, cache._verify_every) == (
         2048,
         8,
@@ -185,6 +188,27 @@ def test_first_unexpected_error_turns_the_cache_off(patched_renderer, monkeypatc
         expected = unpatched(renderer, dict(prompt), params)
         assert renderer._tokenize_prompt(dict(prompt), params) == expected
     assert len(calls) == 1
+
+
+def test_installed_wrapper_builds_its_cache_with_the_token_limit(
+    monkeypatch, cache_encodes
+):
+    from vllm.renderers import base as rbase
+    from vllm.renderers.hf import HfRenderer
+    from vllm.renderers.params import TokenizeParams
+
+    monkeypatch.setattr(
+        rbase.BaseRenderer, "_tokenize_prompt", rbase.BaseRenderer._tokenize_prompt
+    )
+    monkeypatch.setattr(tokcache_mod, "_INSTALLED", False)
+    assert tokcache_mod.maybe_install_tokenize_prefix_cache(max_tokens=64_000_000)
+    renderer = object.__new__(HfRenderer)
+    renderer.tokenizer = _toy_hf_tokenizer()
+    renderer._tokenize_prompt(
+        {"prompt": _turns(1)}, TokenizeParams(max_total_tokens=None)
+    )
+    (cache,) = set(cache_encodes)
+    assert cache._max_tokens == 64_000_000
 
 
 def test_patched_renderer_leaves_truncation_to_vllm(patched_renderer, cache_encodes):
