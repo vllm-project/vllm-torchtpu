@@ -52,9 +52,10 @@ def q_folded_scale(cfgs: configs.RpaConfigs) -> float | None:
     serve = cfgs.serve
     if serve.scale_q is not None or serve.per_token_scale:
         return None
-    if not jnp.issubdtype(serve.dtype_q, jnp.floating):
-        return None
-    if jnp.dtype(serve.dtype_q).itemsize < 2:
+    if jnp.dtype(serve.dtype_q) not in (
+        jnp.dtype(jnp.bfloat16),
+        jnp.dtype(jnp.float32),
+    ):
         return None
     factors = [float(cfgs.model.sm_scale)]
     if serve.scale_k is not None:

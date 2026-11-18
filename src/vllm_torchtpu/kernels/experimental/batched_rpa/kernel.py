@@ -429,8 +429,7 @@ def block_fully_visible(
     holds at the smallest `q_kv_diff` (1 - bkv_sz) of the first q chunk
     (bq_start=0), i.e. the block's last key is at or before the first query row.
     The block must also hold `bkv_sz` valid keys, since `generate_mask` masks
-    keys past the lane's KV end. This covers ~98% of blocks for a chunk over a
-    long cached context.
+    keys past the lane's KV end.
     """
     if not flash_attention.vpu_diet_enabled():
         return None
