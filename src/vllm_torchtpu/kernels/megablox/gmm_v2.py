@@ -273,7 +273,6 @@ class InputConfigs:
     dtype: jnp.dtype
     has_bias: bool = False
     has_scale: bool = False
-    dequantize_in_fp32: bool = False
     has_global_scale: bool = False
     has_compact_scale: bool = False
 
@@ -494,7 +493,7 @@ def inner_kernel(
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         if cfgs.rhs_cfgs.should_dequantize_before_matmul:
             dequant_dtype = (
-                jnp.float32 if cfgs.rhs_cfgs.dequantize_in_fp32 else cfgs.lhs_cfgs.dtype
+                jnp.float32 if cfgs.rhs_cfgs.has_global_scale else cfgs.lhs_cfgs.dtype
             )
             tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
                 dequant_dtype
@@ -1036,7 +1035,9 @@ def calculate_tiling(
         rhs_scale_vmem = 0
         if rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None:
             num_quant_blocks_per_tile_k = pl.cdiv(tk, rhs_cfgs.quant_block_size)
-            rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * 4
+            # E4M3 block scales stay one byte in VMEM with a global scale.
+            scale_bytes = 1 if rhs_cfgs.has_global_scale else 4
+            rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * scale_bytes
         rhs_bias_vmem = 0
         if rhs_cfgs.has_bias:
             rhs_bias_vmem = tn * 4
@@ -1045,6 +1046,9 @@ def calculate_tiling(
         )
         if rhs_cfgs.has_global_scale:
             rhs_vmem += fuse_act_factor * 2 * tn * 4
+            # FP32 dequantization holds an FP32 [tk, tn] weight tile and an
+            # FP32 [tk, tn] broadcast of the combined block scales.
+            rhs_vmem += fuse_act_factor * 2 * tk * tn * 4
 
         # 3. Accumulator
         acc_cols = fuse_act_factor * tn
@@ -1219,7 +1223,6 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
-    rhs_dequantize_in_fp32: bool = False,
     rhs_global_scale: jax.Array | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
@@ -1252,7 +1255,6 @@ def make_gmm_configs(
         dtype=rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
-        dequantize_in_fp32=rhs_dequantize_in_fp32,
         has_global_scale=rhs_global_scale is not None,
         has_compact_scale=(
             rhs_scale is not None
@@ -1340,7 +1342,6 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "zero_initialize",
         "fuse_act",
         "rhs_quant_dtype",
-        "rhs_dequantize_in_fp32",
     ]
 )
 def gmm_v2(
@@ -1360,7 +1361,6 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
-    rhs_dequantize_in_fp32: bool = False,
     rhs_global_scale: jax.Array | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
@@ -1388,12 +1388,11 @@ def gmm_v2(
         fuse_act: Activation function to fuse with GMM, None if no fusion.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
             Packed along k-axis
-        rhs_dequantize_in_fp32: Multiply sub-MXU block scales in FP32 before
-            rounding the dequantized tile to the activation dtype. This avoids
-            rounding FP32 NVFP4 scales to BF16 before applying them.
         rhs_global_scale: Optional FP32 [size_group, 1, out_size] multiplier
             for E4M3 block scales. With this input, block scales stay in FP8
-            in HBM and are combined in FP32 inside each kernel tile.
+            in HBM, are combined with it in FP32 inside each kernel tile, and
+            the tile is dequantized in FP32 before one rounding to the
+            activation dtype.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1434,7 +1433,6 @@ def gmm_v2(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
-        rhs_dequantize_in_fp32=rhs_dequantize_in_fp32,
         rhs_global_scale=rhs_global_scale,
     )
     dims = cfgs.dims
@@ -1456,7 +1454,6 @@ def gmm_v2(
             )
             or rhs_global_scale.dtype != jnp.float32
             or rhs_global_scale.shape != (dims.size_group, 1, dims.size_n)
-            or not rhs_dequantize_in_fp32
         ):
             scale_desc = (
                 "none"
@@ -1464,11 +1461,10 @@ def gmm_v2(
                 else f"dtype {rhs_scale.dtype}, shape {rhs_scale.shape}"
             )
             raise ValueError(
-                "Global scales require E4M3 block scales (FP8 or compact uint8), "
-                f"FP32 [{dims.size_group}, 1, {dims.size_n}] global scales, and FP32 "
-                f"dequantization; got block scales {scale_desc}, global scales dtype "
-                f"{rhs_global_scale.dtype}, shape {rhs_global_scale.shape}, and "
-                f"rhs_dequantize_in_fp32={rhs_dequantize_in_fp32}"
+                "Global scales require E4M3 block scales (FP8 or compact uint8) and "
+                f"FP32 [{dims.size_group}, 1, {dims.size_n}] global scales; got block "
+                f"scales {scale_desc}, global scales dtype {rhs_global_scale.dtype}, "
+                f"shape {rhs_global_scale.shape}"
             )
         if not cfgs.rhs_cfgs.should_dequantize_before_matmul:
             raise NotImplementedError(

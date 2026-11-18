@@ -567,21 +567,24 @@ _E2M1_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6
 
 
 def make_nvfp4_rhs(key, num_groups: int, size_k: int, size_n: int):
-    """K-major uint8 [G, K/2, N] E2M1 pairs and E4M3 [G, K/16, N] block scales."""
+    """K-major uint8 [G, K/2, N] E2M1 pairs and E4M3 [G, K/16, N] block scales.
+
+    Block scales are raw codes over the whole finite E4M3 range (0x7F is NaN),
+    as real checkpoints put most block scales near the 448 maximum.
+    """
     weight_key, scale_key = jax.random.split(key)
     packed = jax.random.randint(
         weight_key, (num_groups, size_k // 2, size_n), 0, 256, dtype=jnp.int32
     ).astype(jnp.uint8)
-    scale = jax.random.uniform(
-        scale_key, (num_groups, size_k // 16, size_n), minval=0.25, maxval=8.0
-    ).astype(jnp.float8_e4m3fn)
-    return packed, scale
+    codes = jax.random.randint(
+        scale_key, (num_groups, size_k // 16, size_n), 0, 0x7F, dtype=jnp.int32
+    ).astype(jnp.uint8)
+    return packed, jax.lax.bitcast_convert_type(codes, jnp.float8_e4m3fn)
 
 
-def make_gate_up_global_scale(key, num_groups: int, size_n: int) -> jax.Array:
-    """FP32 [G, 1, N]: one gate and one up multiplier per group, each on half of N."""
-    gate_up = jax.random.uniform(key, (num_groups, 2), minval=1e-3, maxval=5e-2)
-    return jnp.repeat(gate_up, size_n // 2, axis=-1)[:, None, :]
+def make_global_scale(key, num_groups: int, size_n: int) -> jax.Array:
+    """FP32 [G, 1, N] with a different multiplier on every output lane."""
+    return jax.random.uniform(key, (num_groups, 1, size_n), minval=1e-3, maxval=5e-2)
 
 
 def dequantize_nvfp4_kmajor(
@@ -631,7 +634,7 @@ def test_gmm_v2_nvfp4_global_scale_decodes_every_weight(compact_scale, tile_info
 
     num_groups, size_k, size_n = 4, 1024, 512
     packed, scale = make_nvfp4_rhs(jax.random.key(0), num_groups, size_k, size_n)
-    global_scale = make_gate_up_global_scale(jax.random.key(1), num_groups, size_n)
+    global_scale = make_global_scale(jax.random.key(1), num_groups, size_n)
     expected = dequantize_nvfp4_kmajor(
         packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
     )
@@ -644,7 +647,6 @@ def test_gmm_v2_nvfp4_global_scale_decodes_every_weight(compact_scale, tile_info
         packed,
         rhs_scale,
         rhs_global_scale=global_scale,
-        rhs_dequantize_in_fp32=True,
         tile_info=tile_info,
     )
 
@@ -659,7 +661,7 @@ def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference(compact_scale):
     batch_size, num_groups, size_k, size_n = 512, 8, 1024, 512
     rhs_key, lhs_key = jax.random.split(jax.random.key(2))
     packed, scale = make_nvfp4_rhs(rhs_key, num_groups, size_k, size_n)
-    global_scale = make_gate_up_global_scale(jax.random.key(3), num_groups, size_n)
+    global_scale = make_global_scale(jax.random.key(3), num_groups, size_n)
     rhs = dequantize_nvfp4_kmajor(
         packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
     )
@@ -678,7 +680,6 @@ def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference(compact_scale):
         rhs_scale=rhs_scale,
         rhs_global_scale=global_scale,
         rhs_quant_dtype=jnp.float4_e2m1fn,
-        rhs_dequantize_in_fp32=True,
         maybe_quantize_lhs=False,
         preferred_element_type=jnp.bfloat16,
         acc_dtype=jnp.float32,
@@ -688,17 +689,18 @@ def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference(compact_scale):
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("dequantize_in_fp32", [True, False])
-def test_gmm_v2_nvfp4_dequantize_in_fp32_rounds_once(dequantize_in_fp32):
+def test_gmm_v2_nvfp4_global_scale_rounds_once():
+    """A global scale dequantizes in FP32, so the combined scale is not rounded
+    to BF16 before it multiplies the weights."""
     _require_tpu()
 
     num_groups, size_k, size_n = 2, 512, 256
     packed, scale = make_nvfp4_rhs(jax.random.key(4), num_groups, size_k, size_n)
-    global_scale = make_gate_up_global_scale(jax.random.key(5), num_groups, size_n)
-    rhs_scale = scale.astype(jnp.float32) * global_scale
-    fp32_product = dequantize_nvfp4_kmajor(packed, rhs_scale, jnp.bfloat16)
+    global_scale = make_global_scale(jax.random.key(5), num_groups, size_n)
+    combined = scale.astype(jnp.float32) * global_scale
+    fp32_product = dequantize_nvfp4_kmajor(packed, combined, jnp.bfloat16)
     bf16_scale_product = dequantize_nvfp4_kmajor(
-        packed, rhs_scale.astype(jnp.bfloat16).astype(jnp.float32), jnp.bfloat16
+        packed, combined.astype(jnp.bfloat16).astype(jnp.float32), jnp.bfloat16
     )
     assert not np.array_equal(
         np.asarray(fp32_product, dtype=np.float32),
@@ -707,10 +709,63 @@ def test_gmm_v2_nvfp4_dequantize_in_fp32_rounds_once(dequantize_in_fp32):
 
     actual = read_back_nvfp4_rhs(
         packed,
-        rhs_scale[:, :, None, :],
-        rhs_dequantize_in_fp32=dequantize_in_fp32,
+        jax.lax.bitcast_convert_type(scale, jnp.uint8),
+        rhs_global_scale=global_scale,
     )
 
-    _assert_bitwise_equal(
-        actual, fp32_product if dequantize_in_fp32 else bf16_scale_product
+    _assert_bitwise_equal(actual, fp32_product)
+
+
+def _validation_tpu_info(monkeypatch, mxu_column_size: int = 256) -> None:
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(
+            mxu_column_size=mxu_column_size,
+            num_lanes=128,
+            vmem_capacity_bytes=64 * 1024 * 1024,
+            fp8_ops_per_second=0,
+            int8_ops_per_second=0,
+        ),
     )
+
+
+def _nvfp4_validation_call(rhs_scale, rhs_global_scale):
+    num_groups, size_k, size_n = 2, 512, 256
+    packed, _ = make_nvfp4_rhs(jax.random.key(6), num_groups, size_k, size_n)
+    return gmm_v2(
+        jnp.zeros((num_groups * 8, size_k), jnp.bfloat16),
+        packed,
+        jnp.full((num_groups,), 8, dtype=jnp.int32),
+        rhs_scale=rhs_scale,
+        rhs_global_scale=rhs_global_scale,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+        maybe_quantize_lhs=False,
+        tile_info=TileSizes(tile_m=16, tile_k=512, tile_n=256, bucket_base=16),
+    )
+
+
+def test_gmm_v2_rejects_compact_scales_without_global_scale(monkeypatch):
+    _validation_tpu_info(monkeypatch)
+    _, scale = make_nvfp4_rhs(jax.random.key(7), 2, 512, 256)
+    with pytest.raises(ValueError, match="require rhs_global_scale"):
+        _nvfp4_validation_call(jax.lax.bitcast_convert_type(scale, jnp.uint8), None)
+
+
+def test_gmm_v2_rejects_malformed_global_scale(monkeypatch):
+    _validation_tpu_info(monkeypatch)
+    _, scale = make_nvfp4_rhs(jax.random.key(8), 2, 512, 256)
+    with pytest.raises(ValueError, match="Global scales require E4M3 block scales"):
+        _nvfp4_validation_call(
+            jax.lax.bitcast_convert_type(scale, jnp.uint8),
+            jnp.ones((2, 1, 256), jnp.bfloat16),
+        )
+
+
+def test_gmm_v2_rejects_global_scale_on_dequant_after_matmul(monkeypatch):
+    _validation_tpu_info(monkeypatch, mxu_column_size=16)
+    _, scale = make_nvfp4_rhs(jax.random.key(9), 2, 512, 256)
+    with pytest.raises(NotImplementedError, match="not below the MXU column size 16"):
+        _nvfp4_validation_call(
+            jax.lax.bitcast_convert_type(scale, jnp.uint8),
+            make_global_scale(jax.random.key(10), 2, 256),
+        )
