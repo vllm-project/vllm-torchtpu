@@ -11,15 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused EP MoE v3's transport start program (``transport.start_transport``)
-traced on one CPU device.
+"""Fused EP MoE v3's token exchange (``transport``): its static schedule
+simulated in plain Python, and its start program traced on one CPU device.
 
-The program quantizes a shard's rows a QUANT_TILE_ROWS tile at a time and
-writes each tile's scale column into the routing message; a shard whose rows
-are not a whole number of tiles ends in a partial tile. The program returns
-DMA semaphores, which the TPU interpreter cannot do, so these tests trace it:
-the shapes are what is under test.
+The exchange's rounds, the pieces each one forwards and the waits that
+gate them are trace-time Python over relative addresses, so the schedule is
+run here for every supported mesh width without a device: every block
+reaches every representative exactly once, every forwarded piece has landed
+first, and the waits on each round's semaphores add up to what lands on
+them.
+
+The start program quantizes a shard's rows a QUANT_TILE_ROWS tile at a time
+and writes each tile's scale column into the routing message; a shard whose
+rows are not a whole number of tiles ends in a partial tile. The program
+returns DMA semaphores, which the TPU interpreter cannot do, so these tests
+trace it: the shapes are what is under test.
 """
+
+import collections
+import math
+import types
 
 import jax
 import jax.numpy as jnp
@@ -68,3 +79,161 @@ def test_start_traces_with_a_partial_last_tile(tokens):
     scale column is a whole tile tall and fills one message row."""
     assert transport.quant_tiles(tokens) == -(-tokens // transport.QUANT_TILE_ROWS)
     _trace_start(tokens)
+
+
+# ---- the exchange schedule, simulated ----
+
+WIDTHS = [2, 4, 8, 16, 32]
+
+
+def _schedule(width):
+    return transport.dimensions(width), transport.pieces(width)
+
+
+@pytest.mark.parametrize("width", WIDTHS)
+def test_every_block_reaches_every_representative_once(width):
+    """A representative receives each other pair's block, every piece of it,
+    exactly once, in the round its distance names, and every link carries
+    the same share each round."""
+    n, n_pieces = _schedule(width)
+    received = collections.Counter()
+    for t in range(1, n + 1):
+        per_link = []
+        for link in range(n):
+            landed = transport.arrivals(n, t, n_pieces, link)
+            per_link.append(len(landed))
+            for r, p in landed:
+                assert bin(r).count("1") == t, (t, link, r)
+                received[(r, p)] += 1
+        # C(n - 1, t - 1) / t blocks a link in round t.
+        assert per_link == [math.comb(n - 1, t - 1) * n_pieces // t] * n
+    want = {(r, p) for r in range(1, 1 << n) for p in range(n_pieces)}
+    assert set(received) == want
+    assert set(received.values()) <= {1}
+
+
+@pytest.mark.parametrize("width", WIDTHS)
+def test_a_forwarded_piece_landed_on_the_link_landing_link_names(width):
+    """Round t forwards only pieces that arrived in round t - 1, and
+    landing_link names the link each one arrived on."""
+    n, n_pieces = _schedule(width)
+    for t in range(2, n + 1):
+        for _link, r, pieces in transport.sends(n, t, n_pieces):
+            for p in pieces:
+                link = transport.landing_link(r, p, n_pieces)
+                assert (r, p) in transport.arrivals(n, t - 1, n_pieces, link)
+
+
+class _Copy:
+    def __init__(self, log, rows, sem, peer):
+        self.log, self.key = log, (rows, sem, peer)
+
+    def start(self):
+        self.log.append(("send", *self.key))
+
+    def wait_send(self):
+        self.log.append(("wait_send", *self.key))
+
+
+class _RecordingExchange:
+    """A representative's side of ``transport.Exchange`` that records what
+    the forwarding and finishing steps issue, in program order."""
+
+    mate = "mate"
+
+    def __init__(self, width):
+        self.n, self.n_pieces = _schedule(width)
+        self.log = []
+
+    def representative_only(self, body):
+        body()
+
+    def mate_only(self, body):
+        pass
+
+    def piece(self, r, p):
+        return ("piece", r, p)
+
+    def block(self, r):
+        return ("block", r)
+
+    def peer(self, link):
+        return link
+
+    def round_sem(self, t, link):
+        return ("round", t, link)
+
+    def mate_sem(self, t):
+        return ("mate", t)
+
+    def remote_copy(self, rows, sem, peer, src=None):
+        return _Copy(self.log, rows, sem, peer)
+
+    def wait_landed(self, rows, sem):
+        self.log.append(("wait", rows, sem))
+
+
+@pytest.mark.parametrize("width", WIDTHS)
+def test_the_waits_match_what_lands_on_each_semaphore(width):
+    """Run the forwarding rounds and the finish against a recorder: a piece
+    is forwarded only after a wait for it on the semaphore of the round and
+    link it landed on, each round semaphore is waited for exactly the pieces
+    that land on it, every block goes to the mate once, and every send is
+    waited for."""
+    x = _RecordingExchange(width)
+    transport.forward_middle_rounds(x)
+    transport.finish(x)
+    n, n_pieces = x.n, x.n_pieces
+    waited = collections.defaultdict(list)
+    for event in x.log:
+        kind, rows, sem = event[:3]
+        if kind == "wait":
+            waited[sem].append(rows)
+        elif kind == "send" and rows[0] == "piece" and sem[1] >= 2:
+            _, r, p = rows
+            landed_on = ("round", sem[1] - 1, transport.landing_link(r, p, n_pieces))
+            assert rows in waited[landed_on], (event, landed_on)
+    for t in range(1, n + 1):
+        for link in range(n):
+            want = [
+                ("piece", r, p) for r, p in transport.arrivals(n, t, n_pieces, link)
+            ]
+            assert waited[("round", t, link)] == want, (t, link)
+    mate_sends = [e[1] for e in x.log if e[0] == "send" and e[2][0] == "mate"]
+    assert sorted(mate_sends) == sorted(
+        ("block", r) for t in range(1, n + 1) for r in transport.blocks_at(n, t)
+    )
+    forwarded = collections.Counter(e[1:] for e in x.log if e[0] == "send")
+    finished = collections.Counter(e[1:] for e in x.log if e[0] == "wait_send")
+    # finish waits for round 1's sends too, which the start call issues.
+    round_one = collections.Counter(
+        (("piece", r, p), ("round", 1, link), link)
+        for link, r, pieces in transport.sends(n, 1, n_pieces)
+        for p in pieces
+    )
+    assert finished == forwarded + round_one
+
+
+@pytest.mark.parametrize("width", WIDTHS)
+def test_the_receive_semaphores_are_distinct_and_in_range(width):
+    """Each round's links and each round's mate copies wait on a semaphore
+    of their own, all inside receive_semaphores(width)."""
+    n, _ = _schedule(width)
+
+    class _Index:
+        def __getitem__(self, i):
+            return i
+
+    exchange = transport.Exchange(
+        None,
+        None,
+        types.SimpleNamespace(at=_Index()),
+        0,
+        transport.token_multiple(width),
+        width,
+    )
+    ids = [exchange.round_sem(t, link) for t in range(1, n + 1) for link in range(n)]
+    ids += [exchange.mate_sem(t) for t in range(1, n + 1)]
+    assert len(set(ids)) == len(ids)
+    assert transport.MATE_TILE_SEMAPHORE not in ids
+    assert all(0 <= i < transport.receive_semaphores(width) for i in ids)
