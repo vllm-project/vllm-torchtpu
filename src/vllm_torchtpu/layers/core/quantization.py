@@ -80,6 +80,8 @@ def static_per_tensor_quantize_tensor(
         raise ValueError("Quantization scale must be non-zero.")
     if is_floating_dtype(quant_dtype):
         dtype_info = torch.finfo(quant_dtype)
+        if scale == 1.0 and tensor.is_floating_point():
+            return torch.clamp(tensor, dtype_info.min, dtype_info.max).to(quant_dtype)
     else:
         dtype_info = torch.iinfo(quant_dtype)
     quantized = torch.clamp(
@@ -96,9 +98,12 @@ def quantize_kv(
     v_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Static quantize key/value tensors with per-tensor scales."""
+    same_kv = value is key and k_scale == v_scale
     key = static_per_tensor_quantize_tensor(key, quant_dtype, k_scale)
     if value is None:
         return key, None
+    if same_kv:
+        return key, key
     value = static_per_tensor_quantize_tensor(value, quant_dtype, v_scale)
     return key, value
 
