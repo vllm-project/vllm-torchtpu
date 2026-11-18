@@ -236,6 +236,7 @@ ignore = [
 "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/**" = ["E501"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark*.py" = ["E501", "E741"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/{kernels/rank_loader,tools/__init__}.py" = ["E501"]
+"src/vllm_torchtpu/models/kimi_k3/megakernel/{decode,decode_ops,draft,draft_layers,draft_mla,draft_mla_prefill,draft_ring,pools,prefill,program,sampling}.py" = ["E501"]
 
 # Library code logs through vllm_torchtpu.logger. Tests, scripts and
 # command-line tools print to the terminal on purpose.
