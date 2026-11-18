@@ -702,8 +702,13 @@ def test_precompile_backbone_trace_first_env_guards(
             assert compiled_batches == []
 
 
-def _stub_graph(order, metas=None):
-    """A GraphModule whose placeholders carry the given names and metas."""
+def _stub_graph(order, metas=None, graph_inputs=True):
+    """A GraphModule whose placeholders carry the given names and metas.
+
+    With ``graph_inputs`` each placeholder is a Dynamo graph input read from a
+    source of its own name, as a lifted buffer or weight is; without, they are
+    a split subgraph's intermediates, which carry no source.
+    """
     if metas is None:
         metas = {
             "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
@@ -715,6 +720,8 @@ def _stub_graph(order, metas=None):
     for name in order:
         node = graph.placeholder(name)
         node.meta["val"] = metas[name]
+        if graph_inputs:
+            node.meta["grapharg"] = SimpleNamespace(source=LocalSource(name))
         nodes.append(node)
     graph.output(tuple(nodes))
     return fx.GraphModule(nn.Module(), graph)
@@ -821,6 +828,68 @@ def test_handover_refuses_a_different_input_set(order):
         shape_variants.ShapeSpecializationError, match="TPU_KERNEL_ITER_MODE"
     ):
         session.get("dir", "key", _stub_graph(order, metas))
+
+
+def test_handover_matches_intermediates_by_position_not_by_name():
+    """A split subgraph's intermediates are named after the parent graph's node,
+    in creation order. Two traces that create the same two values in opposite
+    order give them each other's names while the subgraph still takes them in
+    the same order, so a match by name would swap them."""
+    metas = {
+        "getitem_7": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "getitem_8": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+    }
+    session = shape_variants.BucketExecutables()
+    compiled = lambda *args: args  # noqa: E731
+    stored = _stub_graph(["getitem_7", "getitem_8"], metas, graph_inputs=False)
+    session.put("dir", "key", stored, compiled)
+    current = _stub_graph(["getitem_8", "getitem_7"], metas, graph_inputs=False)
+    assert session.get("dir", "key", current) is compiled
+
+
+def test_handover_serves_renumbered_intermediates_of_different_shapes():
+    """Same renumbering with different shapes: the inputs still match by
+    position, as on main, so the bucket is handed over, not refused."""
+    stored_metas = {
+        "getitem_7": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "getitem_8": torch.empty(3, dtype=torch.int32),
+    }
+    current_metas = {
+        "getitem_8": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "getitem_7": torch.empty(3, dtype=torch.int32),
+    }
+    session = shape_variants.BucketExecutables()
+    compiled = lambda *args: args  # noqa: E731
+    order = ["getitem_7", "getitem_8"]
+    session.put("dir", "key", _stub_graph(order, stored_metas, False), compiled)
+    renumbered = _stub_graph(["getitem_8", "getitem_7"], current_metas, False)
+    assert session.get("dir", "key", renumbered) is compiled
+
+
+def test_handover_reorders_graph_inputs_around_positional_intermediates():
+    """Named graph inputs move by name; the intermediate keeps its position."""
+    metas = {
+        "l_self_weight_": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "l_self_bias_": torch.empty(2, dtype=torch.bfloat16),
+        "getitem_3": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+    }
+
+    def graph(order):
+        g = _stub_graph(order, metas)
+        for node in g.graph.nodes:
+            if node.name.startswith("getitem"):
+                del node.meta["grapharg"]
+        return g
+
+    session = shape_variants.BucketExecutables()
+    received = []
+    stored = graph(["getitem_3", "l_self_weight_", "l_self_bias_"])
+    session.put("dir", "key", stored, lambda *a: received.append(a))
+    runnable = session.get(
+        "dir", "key", graph(["getitem_3", "l_self_bias_", "l_self_weight_"])
+    )
+    runnable("x", "bias", "weight")
+    assert received == [("x", "weight", "bias")]
 
 
 def test_a_stored_bucket_does_not_keep_its_graph_alive():
