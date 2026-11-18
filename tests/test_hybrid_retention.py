@@ -925,3 +925,125 @@ def test_compacted_prior_turn_is_evicted_before_the_oldest_conversation():
     ret._conv_lru[newer] = ret._conv_lru[newer]._replace(is_prior=True)
     assert ret.evict_oldest_conversation()
     assert list(ret._conv_lru) == [("c", 0)]
+
+
+# ---------------------------------------------- the pinned vLLM's own classes
+
+_REAL_BS = 16
+
+
+def _real_manager(num_blocks: int):
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+    cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], _attn_spec(_REAL_BS)),
+            KVCacheGroupSpec(["mamba"], _mamba_spec(_REAL_BS)),
+        ],
+    )
+    return KVCacheManager(
+        cfg,
+        max_model_len=4096,
+        scheduler_block_size=_REAL_BS,
+        hash_block_size=_REAL_BS,
+        enable_caching=True,
+    )
+
+
+def _real_request(request_id: str, token_ids):
+    from vllm import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request
+
+    init_none_hash(sha256)
+    sampling_params = SamplingParams(max_tokens=64)
+    sampling_params.update_from_generation_config({}, eos_token_id=100_000)
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=list(token_ids),
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(_REAL_BS, sha256),
+    )
+
+
+def _run_turn(mgr, ret, request_id: str, prompt, decode_tokens: int):
+    """Prefill ``prompt`` in block-aligned chunks, as the scheduler splits an
+    align-mode prompt, pin the released boundary state after the first decode
+    step, decode, then free the request the way the scheduler does. Returns
+    the request and its boundary state block."""
+    req = _real_request(request_id, prompt)
+    boundary = (len(prompt) // _REAL_BS) * _REAL_BS
+    for chunk in (boundary, len(prompt) - boundary):
+        assert mgr.allocate_slots(req, chunk) is not None
+        req.num_computed_tokens += chunk
+    state = None
+    for i in range(decode_tokens):
+        req.append_output_token_ids(5000 + i)
+        assert mgr.allocate_slots(req, 1) is not None
+        req.num_computed_tokens += 1
+        if i == 0:
+            # The first decode step released the boundary state, still cached.
+            states, hit = ret._probe(req, len(prompt))
+            assert hit == boundary and len(states) == 1
+            (state,) = states
+            assert state.ref_cnt == 0
+            ret.pin_running([req])
+            assert state.ref_cnt == 1
+            assert ret._pinned[request_id] == ([state], boundary)
+    attn = ret.snapshot_attention_blocks(req)
+    mgr.free(req)
+    ret.on_request_freed(req, attn)
+    return req, state
+
+
+def test_retention_on_the_pinned_vllm_kv_cache_manager():
+    """pin, free, retain, evict under pool pressure and reset on vLLM's own
+    KVCacheManager, MambaManager and BlockPool, so the hooks wrap the real
+    methods and BlockPool.touch gets the flat block list it takes."""
+    mgr = _real_manager(48)
+    pool = mgr.block_pool
+    ret = HybridStateRetention(mgr)
+    assert ret.enabled
+    mamba = mgr.coordinator.single_type_managers[1]
+    for owner, name in (
+        (mamba, "_cache_partial_tail_block"),
+        (mamba, "allocate_new_blocks"),
+        (pool, "get_new_blocks"),
+        (pool, "reset_prefix_cache"),
+        (mgr.coordinator, "get_num_blocks_to_allocate"),
+        (mgr, "allocate_slots"),
+    ):
+        assert name in vars(owner), name
+
+    prompt = list(range(1000, 1088))
+    _, state = _run_turn(mgr, ret, "turn0", prompt, decode_tokens=40)
+    # The conversation LRU holds the boundary state across the think time.
+    assert state.ref_cnt == 1 and state.block_hash is not None
+    assert ret.num_pinned_blocks() == 1
+    assert [e.blocks for e in ret._conv_lru.values()] == [[state]]
+
+    # A request that shares the prompt but not the reply hits exactly at the
+    # retained boundary state.
+    nxt = _real_request("turn1", prompt + list(range(7000, 7020)))
+    assert mgr.get_computed_blocks(nxt)[1] == 80
+
+    # Pool pressure: the get_new_blocks guard evicts the retained entry so a
+    # request for every block, the pinned one included, succeeds.
+    need = pool.get_num_free_blocks() + 1
+    blocks = pool.get_new_blocks(need)
+    assert len(blocks) == need
+    assert ret.num_pinned_blocks() == 0 and not ret._conv_lru
+    pool.free_blocks(blocks)
+    assert mgr.get_computed_blocks(nxt)[1] == 0
+
+    # A retained entry holds a block, which vLLM's reset refuses; the reset
+    # guard evicts every retained entry first.
+    _run_turn(mgr, ret, "other", list(range(3000, 3088)), decode_tokens=4)
+    assert ret.num_pinned_blocks() == 1
+    assert mgr.reset_prefix_cache()
+    assert ret.num_pinned_blocks() == 0 and not ret._conv_lru
