@@ -24,9 +24,18 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.gdn.v3 import config
 
 
-def granule_view(ref: jax.Ref, leading_shape: tuple[int, ...]) -> jax.Ref:
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    return ref.bitcast(jnp.uint32).reshape(*leading_shape, -1, 1, num_lanes)
+def granule_view(
+    ref: jax.Ref, leading_shape: tuple[int, ...], width: int | None = None
+) -> jax.Ref:
+    """View `ref` as uint32 granules of `width` words (default: one lane row).
+
+    Mosaic reshapes a VMEM ref only while its minor tiled dimension stays
+    put, so a state whose last axis is wider than one lane row (OLMo 3.5's
+    d_v = 512) must keep that axis as the granule width.
+    """
+    if width is None:
+        width = pltpu.get_tpu_info().num_lanes
+    return ref.bitcast(jnp.uint32).reshape(*leading_shape, -1, 1, width)
 
 
 @jax.tree_util.register_dataclass
@@ -279,6 +288,19 @@ class _GranuleStateRef(BaseBufferedRef):
     # HBM address offset.
     offset: int = dataclasses.field(default=0, metadata=dict(static=True))
 
+    def _granule_width(self, ref: jax.Ref) -> int | None:
+        """Granule width for this state's DMA views.
+
+        The unified pool packs both state regions into one row addressed by
+        lane-row offsets, and a bf16 state is packed on a non-minor axis, so
+        both keep one-lane-row granules. A dense fp32 state is addressed whole
+        (offset 0), so its own last axis serves, which keeps the VMEM reshape
+        tile-preserving for value heads wider than one lane row.
+        """
+        if self.cfg.is_shared or jnp.dtype(ref.dtype).itemsize != 4:
+            return None
+        return ref.shape[-1]
+
     def _ckpt_state_idx(self, s_idx, ckpt):
         """Source block holding checkpoint `ckpt` of sequence `s_idx`.
 
@@ -315,8 +337,9 @@ class StateInBufferedRef(_GranuleStateRef):
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
-        vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
-        src_ref = granule_view(src_ref, src_ref.shape[:1])
+        width = self._granule_width(src_ref)
+        vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2], width)
+        src_ref = granule_view(src_ref, src_ref.shape[:1], width)
         num_granules = vmem_ref.shape[2]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -387,8 +410,9 @@ class StateOutBufferedRef(_GranuleStateRef):
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
-        vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
-        dst_ref = granule_view(dst_ref, dst_ref.shape[:1])
+        width = self._granule_width(dst_ref)
+        vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2], width)
+        dst_ref = granule_view(dst_ref, dst_ref.shape[:1], width)
         num_granules = vmem_ref.shape[2]
 
         for idx in range(self.cfg.seq_tile_size):
