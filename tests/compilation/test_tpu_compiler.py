@@ -145,6 +145,71 @@ class TestTpuCompilerCache:
 
         assert dp1 != dp4
 
+    def test_tpu_hash_covers_rank_device_layout(self):
+        """Two starts of a 2-host slice that put rank 0 on device 0 and on
+        device 8 build programs for different DeviceAssignments; they must not
+        share a cache dir."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        head_first = [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11]
+        head_second = [8, 9, 12, 13, 14, 15, 10, 11, 0, 1, 4, 5, 6, 7, 2, 3]
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            hashes = {}
+            for name, layout in (
+                ("head_first", head_first),
+                ("head_first_again", list(head_first)),
+                ("head_second", head_second),
+                ("single_process", None),
+            ):
+                with patch(
+                    "vllm_torchtpu.compilation.tpu_compiler._rank_device_layout",
+                    return_value=layout,
+                ):
+                    hashes[name] = compute_tpu_compilation_hash(self._config())
+
+        assert hashes["head_first"] == hashes["head_first_again"]
+        assert hashes["head_first"] != hashes["head_second"]
+        assert hashes["single_process"] not in (
+            hashes["head_first"],
+            hashes["head_second"],
+        )
+
+    def test_rank_device_layout_reads_the_world_group(self):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        with patch("torch.distributed.is_initialized", return_value=False):
+            assert tpu_compiler._rank_device_layout() is None
+
+        world = SimpleNamespace(world_size=4)
+        layout = SimpleNamespace(device_ids=(4, 5, 0, 1))
+        with (
+            patch("torch.distributed.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch(
+                "vllm.distributed.parallel_state.get_world_group",
+                return_value=world,
+            ),
+            patch(
+                "vllm_torchtpu.distributed.mesh_utils.get_cp_group_layout",
+                return_value=layout,
+            ) as get_layout,
+        ):
+            assert tpu_compiler._rank_device_layout() == [4, 5, 0, 1]
+        get_layout.assert_called_once_with(world)
+
+        with (
+            patch("torch.distributed.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch(
+                "vllm.distributed.parallel_state.get_world_group",
+                side_effect=AssertionError("world group is not initialized"),
+            ),
+        ):
+            assert tpu_compiler._rank_device_layout() is None
+
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler
 

@@ -407,6 +407,39 @@ def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
     return relpaths
 
 
+def _rank_device_layout() -> list[int] | None:
+    """Global TPU device id of every torch.distributed rank, in rank order.
+
+    Every Pallas mesh lists its devices in rank order, and torch_tpu compiles
+    that list into the program's DeviceAssignment (see
+    distributed.ep_mesh._ep_mesh_order), so an executable reaches the right
+    peers only where each rank sits on the device it sat on at compile time.
+    On a multi-host slice the chips the first ranks land on can change from
+    one start to the next (rank 0 on device 0 or on device 8 of a 2x2x2), so
+    the layout is part of the key.
+
+    The first call gathers over the world's CPU group: every rank reaches it
+    together because every rank compiles the same modules in the same order,
+    and get_cp_group_layout caches the result. None without a multi-process
+    torch.distributed world.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.distributed.mesh_utils import get_cp_group_layout
+
+    try:
+        world = parallel_state.get_world_group()
+    except AssertionError:
+        # torch.distributed is up but vLLM's groups are not (a bare
+        # init_process_group, as some tests do).
+        return None
+    if world is None or world.world_size <= 1:
+        return None
+    return list(get_cp_group_layout(world).device_ids)
+
+
 def _tpu_compile_env_factors() -> dict[str, Any]:
     """Return TorchTPU plugin env values that can affect compilation."""
     factors = {}
@@ -427,6 +460,12 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
+    parallel: dict[str, Any] = {
+        "effective_data_parallel_size": utils.get_dp_size(vllm_config.parallel_config),
+    }
+    layout = _rank_device_layout()
+    if layout is not None:
+        parallel["rank_device_layout"] = layout
     factors = {
         "torch": torch.__version__,
         "torch_tpu": importlib_metadata.version("torch-tpu"),
@@ -435,11 +474,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
-        "parallel": {
-            "effective_data_parallel_size": utils.get_dp_size(
-                vllm_config.parallel_config
-            ),
-        },
+        "parallel": parallel,
         # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
         # resolved block count, which every rank shares via kv_cache_config.
         # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM
