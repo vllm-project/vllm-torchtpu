@@ -466,6 +466,51 @@ def test_a_permutation_layer_gets_no_primary_count(tmp_path, monkeypatch):
     assert not hasattr(runner.routed_experts, ep.PRIMARY_EXPERTS_ATTR)
 
 
+def test_the_hook_sizes_the_layers_vllms_factory_builds(
+    tmp_path, monkeypatch, vllm_moe
+):
+    """End to end through the two wrappers: the factory, called with the
+    layer's prefix by keyword or by position, builds a map manager whose
+    vLLM-computed map the hook then sizes; another layer's manager, and one
+    computed outside the factory, keep vLLM's count."""
+
+    def factory(num_experts, top_k, hidden_size, intermediate_size, prefix=""):
+        manager = SimpleNamespace(
+            use_ep=True,
+            ep_size=2,
+            ep_rank=1,
+            global_num_experts=num_experts,
+            num_fused_shared_experts=0,
+            rocm_aiter_enabled=False,
+            _placement_strategy="linear",
+            _expert_map=None,
+            _expert_mask=None,
+        )
+        vllm_moe.emm.ExpertMapManager._calculate_expert_maps(manager)
+        return manager
+
+    monkeypatch.setattr(vllm_moe.layer, "FusedMoEFactory", factory)
+    monkeypatch.setattr(vllm_moe.pkg, "FusedMoEFactory", factory)
+    _use(tmp_path, monkeypatch, _copies())
+    assert ep.install_copy_slot_hook() is True
+    wrapped = vllm_moe.layer.FusedMoEFactory
+    assert wrapped is not factory and vllm_moe.pkg.FusedMoEFactory is wrapped
+    # Rank 1 holds primaries 1, 6, 3, 4 and a copy of 7.
+    sized = [-1] * 8
+    for slot, expert in enumerate([1, 6, 3, 4, 7]):
+        sized[expert] = slot
+    for manager in (wrapped(8, 2, 16, 32, prefix=LAYER), wrapped(8, 2, 16, 32, LAYER)):
+        assert manager._local_num_experts == 5
+        assert manager._expert_map.tolist() == sized
+    assert ep._FACTORY_PREFIX == ""
+    vllms = [-1, -1, -1, -1, 0, 1, 2, 3]
+    other = wrapped(8, 2, 16, 32, prefix="model.layers.2.mlp.experts")
+    outside = factory(8, 2, 16, 32, prefix=LAYER)
+    for manager in (other, outside):
+        assert manager._local_num_experts == 4
+        assert manager._expert_map.tolist() == vllms
+
+
 def test_a_placed_layers_map_is_built_on_the_host(tmp_path, monkeypatch):
     """vLLM computes the maps under the model's device; the copy-slot map is
     built on the host and then moved to the device vLLM's map is on."""
