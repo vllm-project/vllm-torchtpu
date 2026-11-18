@@ -75,15 +75,27 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --baseline scripts/vllm/benchmarking/baselines/perf/<config>.baseline.json
 ```
 
-#### Roofline reporting (`--roofline-targets`)
+#### Roofline and AgentX speed gates
 
 Pass `--roofline-targets` and `--config-name` in `--mode perf` to report
 physical-chip output throughput against `baselines/perf/roofline_targets.json`.
 State the physical chip count with `--chips <N>`, or `--prefill-chips <P>` and
 `--decode-chips <D>` for disaggregated serving; when omitted, the config's
 modeled `num_chips` is used. Entries with `status == "unverified"` are marked
-in the table, configs listed under `not_modeled` print a note, and the check is
-advisory (`exit 0`).
+in the table, and configs listed under `not_modeled` print a note.
+
+Add `--min-roofline-ratio <float>` (for example `0.8`) to turn the roofline
+report into a blocking gate on `status == "ok"` cells; `status == "unverified"`
+cells remain advisory unless `--enforce-unverified-rooflines` is also passed.
+
+For AgentX runs (`profile_export_aiperf.json` or `<label>_c<N>.json`), pass
+`--agentx-gpu-reference <json>` (`[{"p90_interactivity", "out_tok_s_per_gpu"}, ...]`,
+or the same list under a `"points"` key)
+with `--chips` or `--prefill-chips` + `--decode-chips` to interpolate the GPU
+reference at matching P90 interactivity (`1000.0 / p90_tpot_ms` or
+`request_metrics.latency.intvty.p90`). Add `--min-gpu-ratio <float>` to enforce
+a minimum fraction of the interpolated GPU per-chip output throughput. All speed
+checks stay advisory (`exit 0`) until a threshold flag is passed.
 
 ```bash
 python3 scripts/vllm/benchmarking/check_regression.py \
@@ -91,7 +103,8 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --results-dir <DIR> \
   --roofline-targets scripts/vllm/benchmarking/baselines/perf/roofline_targets.json \
   --config-name qwen3.5-397b-fp8-tp1-dp8-ep \
-  --chips 4
+  --chips 4 \
+  --min-roofline-ratio 0.8
 ```
 
 ### Accuracy (`--mode eval`)
