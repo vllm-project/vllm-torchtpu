@@ -143,3 +143,85 @@ def test_dispatch_and_combine_with_sequence_parallel(
             assert invocation.kwargs == {"dim": 0}
         assert ep_group.all_gather.call_count == count
         ep_group.reduce_scatter.assert_not_called()
+
+
+class _FakeAllReduce:
+    """A `ModelAllReduce` that serves bf16 tensors of the group (0, 1)."""
+
+    def __init__(self, armed=True):
+        self.armed = armed
+        self.setups = []
+        self.calls = []
+
+    def setup(self, model, vllm_config, device):
+        self.setups.append((model, vllm_config, device))
+        return self.armed
+
+    def all_reduce(self, ranks, x):
+        self.calls.append((tuple(ranks), tuple(x.shape)))
+        if tuple(ranks) != (0, 1) or x.dtype != torch.bfloat16:
+            return None
+        return x + 1
+
+
+@pytest.fixture
+def base_all_reduce(monkeypatch):
+    calls = []
+
+    def all_reduce(instance, x):
+        calls.append(tuple(x.shape))
+        return x * 2
+
+    monkeypatch.setattr(comm.DeviceCommunicatorBase, "all_reduce", all_reduce)
+    monkeypatch.setattr(comm, "_model_all_reduce", None)
+    return calls
+
+
+def test_model_all_reduce_off_by_default(communicator, base_all_reduce):
+    communicator.ranks = [0, 1]
+    assert not comm.install_model_all_reduce(Mock(spec=[]), None, "cpu")
+    # A module without the capability, and one that declares it as None.
+    plain = torch.nn.Linear(1, 1)
+    assert not isinstance(plain, comm.SupportsModelAllReduce)
+    assert not comm.install_model_all_reduce(plain, None, "cpu")
+    plain.model_all_reduce = None
+    assert isinstance(plain, comm.SupportsModelAllReduce)
+    assert not comm.install_model_all_reduce(plain, None, "cpu")
+    x = torch.ones(8, 128, dtype=torch.bfloat16)
+    assert torch.equal(communicator.all_reduce(x), x * 2)
+    assert base_all_reduce == [(8, 128)]
+
+
+def test_model_all_reduce_dispatch(communicator, base_all_reduce):
+    impl = _FakeAllReduce()
+    model = Mock(**{comm.MODEL_ALL_REDUCE_ATTR: impl})
+    assert comm.install_model_all_reduce(model, "cfg", "dev")
+    assert impl.setups == [(model, "cfg", "dev")]
+    x = torch.ones(8, 128, dtype=torch.bfloat16)
+    communicator.ranks = [0, 1]
+    assert torch.equal(communicator.all_reduce(x), x + 1)
+    # The implementation declines: vLLM's all-reduce.
+    assert torch.equal(communicator.all_reduce(x.float()), x.float() * 2)
+    communicator.ranks = [0, 2]
+    assert torch.equal(communicator.all_reduce(x), x * 2)
+    assert impl.calls == [((0, 1), (8, 128))] * 2 + [((0, 2), (8, 128))]
+    assert base_all_reduce == [(8, 128)] * 2
+
+
+def test_model_all_reduce_not_installed_when_setup_declines(
+    communicator, base_all_reduce
+):
+    impl = _FakeAllReduce(armed=False)
+    model = Mock(**{comm.MODEL_ALL_REDUCE_ATTR: impl})
+    assert not comm.install_model_all_reduce(model, None, "cpu")
+    communicator.ranks = [0, 1]
+    x = torch.ones(8, 128, dtype=torch.bfloat16)
+    assert torch.equal(communicator.all_reduce(x), x * 2)
+    assert impl.calls == []
+
+
+def test_model_all_reduce_reinstall_clears_previous(base_all_reduce):
+    model = Mock(**{comm.MODEL_ALL_REDUCE_ATTR: _FakeAllReduce()})
+    assert comm.install_model_all_reduce(model, None, "cpu")
+    assert not comm.install_model_all_reduce(Mock(spec=[]), None, "cpu")
+    assert comm._model_all_reduce is None
