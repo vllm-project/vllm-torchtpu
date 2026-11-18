@@ -148,6 +148,52 @@ def trim_resend_token_ids(cached_reqs) -> int:
     return saved
 
 
+def memo_local_prefix_cache_hit(
+    scheduler: Any, request: Request, max_cache_hit_length: int | None
+) -> tuple["KVCacheBlocks", int, int, bool] | None:
+    """The admission lookup answered from a still-exact memo, or None.
+
+    The memo branch of ``_get_local_prefix_cache_hit``, shared by
+    PrefixAwareScheduler and the pipeline chunk scheduler's prefix-aware
+    admission (#3090); each falls back to its own lookup on None.
+    """
+    connector = getattr(scheduler, "connector", None)
+    if connector is None or not connector.supports_divergent_local_hybrid_hits:
+        kvm = scheduler.kv_cache_manager
+        epoch = scheduler._get_prefix_cache_epoch()
+        if (
+            epoch is not None
+            and not (
+                getattr(kvm, "enable_kv_cache_events", False)
+                and getattr(request, "kv_cache_report_mode", "incremental") == "full"
+            )
+            and kvm.prefix_cache_lookup_enabled(request)
+        ):
+            max_len = (
+                request.num_tokens - 1
+                if max_cache_hit_length is None
+                else max_cache_hit_length
+            )
+            cached = scheduler._memo_get(request, epoch, max_len)
+            if cached is not None:
+                computed_blocks, num_new_computed_tokens, num_uncached = cached[2]
+                shared_prefix_boundary = (
+                    num_new_computed_tokens + num_uncached if num_uncached else 0
+                )
+                # Fresh lists, as a fresh lookup returns; the memo itself
+                # must never be mutated downstream.
+                blocks = kvm.create_kv_cache_blocks(
+                    tuple(list(b) for b in computed_blocks)
+                )
+                return (
+                    blocks,
+                    num_new_computed_tokens,
+                    shared_prefix_boundary,
+                    False,
+                )
+    return None
+
+
 class PrefixAwareScheduler(AsyncScheduler):
     """Admit ready requests prioritizing fewest uncached prompt tokens."""
 
@@ -864,41 +910,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         requests whose ``full`` KV-event report mode makes it emit events go
         to it.
         """
-        connector = getattr(self, "connector", None)
-        if connector is None or not connector.supports_divergent_local_hybrid_hits:
-            kvm = self.kv_cache_manager
-            epoch = self._get_prefix_cache_epoch()
-            if (
-                epoch is not None
-                and not (
-                    getattr(kvm, "enable_kv_cache_events", False)
-                    and getattr(request, "kv_cache_report_mode", "incremental")
-                    == "full"
-                )
-                and kvm.prefix_cache_lookup_enabled(request)
-            ):
-                max_len = (
-                    request.num_tokens - 1
-                    if max_cache_hit_length is None
-                    else max_cache_hit_length
-                )
-                cached = self._memo_get(request, epoch, max_len)
-                if cached is not None:
-                    computed_blocks, num_new_computed_tokens, num_uncached = cached[2]
-                    shared_prefix_boundary = (
-                        num_new_computed_tokens + num_uncached if num_uncached else 0
-                    )
-                    # Fresh lists, as a fresh lookup returns; the memo itself
-                    # must never be mutated downstream.
-                    blocks = kvm.create_kv_cache_blocks(
-                        tuple(list(b) for b in computed_blocks)
-                    )
-                    return (
-                        blocks,
-                        num_new_computed_tokens,
-                        shared_prefix_boundary,
-                        False,
-                    )
+        hit = memo_local_prefix_cache_hit(self, request, max_cache_hit_length)
+        if hit is not None:
+            return hit
         return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
 
     def _rank_and_warmth(
