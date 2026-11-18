@@ -150,15 +150,10 @@ def test_tp8_dcp4_decode_leg_gets_the_calibrated_budget():
     assert cfg.cache_config.kv_cache_memory_bytes == 45_579_595_520
 
 
-def test_dcp1_with_more_than_16_seqs_uses_the_smaller_base():
-    cfg = _run_hook(_vllm_config(tp=2, dp=4, dcp=1, max_num_seqs=28))
-    # EP = TP x DP = 8, so the same 64 slots per rank.
-    assert cfg.cache_config.kv_cache_memory_bytes == 32_500_000_000 + CREDIT_EP8
-
-
-@pytest.mark.parametrize("dcp,seqs", [(1, 16), (4, 28), (1, 1)])
-def test_other_shapes_use_the_larger_base(dcp, seqs):
-    cfg = _run_hook(_vllm_config(dcp=dcp, max_num_seqs=seqs))
+# The decode batch caps of the validation entries' TP8 + DCP4 legs.
+@pytest.mark.parametrize("seqs", [1, 3, 8, 16])
+def test_tp8_dcp4_budget_at_the_entries_batch_caps(seqs):
+    cfg = _run_hook(_vllm_config(dcp=4, max_num_seqs=seqs))
     assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
 
 
@@ -178,6 +173,13 @@ def test_other_shapes_use_the_larger_base(dcp, seqs):
         dict(tp=8, dp=2),
         # Main's nightly TP1 x DP8 decode leg.
         dict(tp=1, dp=8, dcp=1, max_num_seqs=32),
+        # The DP4 x TP2 decode leg without its pinned 39.5e9 B: the auto value
+        # (44.58e9 B) failed program allocation at that leg's shape.
+        dict(tp=2, dp=4, dcp=1, max_num_seqs=28),
+        # TP8 at a decode context parallel size no entry ran.
+        dict(dcp=1),
+        dict(dcp=2),
+        dict(dcp=8),
         # No expert parallelism: the slot count does not apply.
         dict(ep=False),
         # PCP: vLLM folds it into the EP size.
@@ -192,23 +194,21 @@ def test_other_shapes_use_the_larger_base(dcp, seqs):
         "dp2-tp2",
         "ep16",
         "dp8-tp1",
+        "dp4-tp2",
+        "tp8-dcp1",
+        "tp8-dcp2",
+        "tp8-dcp8",
         "no-ep",
         "pcp2-tp8",
     ],
 )
 def test_unmeasured_layouts_keep_mains_behaviour(layout):
-    """The budget was measured on TP8 and DP4 x TP2 decode legs with expert
+    """The budget was measured on TP8 + DCP4 decode legs with expert
     parallelism and no PP or PCP. Any other layout stays on
-    gpu_memory_utilization, where the slot credit could go negative."""
+    gpu_memory_utilization, where the slot credit could go negative or the
+    budget not fit."""
     cfg = _run_hook(_vllm_config(**layout))
     assert cfg.cache_config.kv_cache_memory_bytes is None
-
-
-@pytest.mark.parametrize("dcp,seqs", [(1, 28), (1, 16), (4, 16), (4, 1)])
-@pytest.mark.parametrize("tp,dp", [(8, 1), (2, 4)])
-def test_measured_layouts_get_a_positive_budget(tp, dp, dcp, seqs):
-    cfg = _run_hook(_vllm_config(tp=tp, dp=dp, dcp=dcp, max_num_seqs=seqs))
-    assert cfg.cache_config.kv_cache_memory_bytes > 0
 
 
 @pytest.mark.parametrize("kv_role", ["kv_consumer", None, "kv_producer", "kv_both"])
@@ -645,3 +645,26 @@ def test_validation_points_keep_their_defaults(path):
     assert decode.cache_config.prefix_match_unit is None
     point = path.name.split("-")[0]
     assert decode.cache_config.kv_cache_memory_bytes == DECODE_KV_BYTES[point]
+
+
+def test_the_budget_admits_exactly_the_entries_auto_budget_layouts():
+    """The calibrated decode layouts (TP, DP, DCP) are exactly those of the
+    point entries' decode legs that run on the auto budget (no
+    --kv-cache-memory-bytes); the gates reuse those legs."""
+    layouts = set()
+    for path in POINTS:
+        with path.open() as f:
+            args = yaml.safe_load(f)["legs"]["decode"]["serve_args"]
+        if "--kv-cache-memory-bytes" in args:
+            continue
+        layouts.add(
+            tuple(
+                int(_flag(args, name, "1"))
+                for name in (
+                    "--tensor-parallel-size",
+                    "--data-parallel-size",
+                    "--decode-context-parallel-size",
+                )
+            )
+        )
+    assert layouts == hooks._CALIBRATED_DECODE_LAYOUTS
