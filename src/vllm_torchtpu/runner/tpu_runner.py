@@ -133,10 +133,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.sample import sampler_math
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
-    apply_top_k_top_p,
     random_sampler_variants,
     select_topk_candidates,
     should_apply_top_k_top_p,
@@ -556,7 +556,7 @@ def _make_kv_connector_output(
 
 # Smallest output size
 MIN_NUM_SEQS = 8
-SAMPLING_EPS = 1e-5
+SAMPLING_EPS = sampler_math.SAMPLING_EPS
 
 
 def _compute_num_reqs_in_chunk(
@@ -9552,8 +9552,7 @@ class TPUModelRunner(GPUModelRunner):
     def _apply_temperature(
         self, logits: torch.Tensor, temperatures: torch.Tensor
     ) -> torch.Tensor:
-        safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
-        return logits / safe_temperatures
+        return sampler_math.apply_temperature(logits, temperatures)
 
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
@@ -9573,25 +9572,16 @@ class TPUModelRunner(GPUModelRunner):
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
         """
-        if all_greedy:
-            return torch.argmax(logits, dim=-1, keepdim=True)
-        is_greedy = temperatures <= SAMPLING_EPS
-        scaled_logits = self._apply_temperature(logits, temperatures)
-        if apply_topk_topp:
-            masked_logits = apply_top_k_top_p(
-                scaled_logits, top_k, top_p, topk_candidates
-            )
-        else:
-            # No request sets top-k/top-p: skip the two 32-step vocabulary
-            # bisections (separate graph, warmed in the precompile).
-            masked_logits = scaled_logits
-        u_clamped = torch.clamp(
-            u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
+        return sampler_math.sample_from_logits_impl(
+            logits,
+            temperatures,
+            u,
+            top_k,
+            top_p,
+            all_greedy=all_greedy,
+            topk_candidates=topk_candidates,
+            apply_topk_topp=apply_topk_topp,
         )
-        gumbel_noise = -torch.log(-torch.log(u_clamped))
-        noisy_logits = masked_logits + gumbel_noise
-        final_logits = torch.where(is_greedy, logits, noisy_logits)
-        return torch.argmax(final_logits, dim=-1, keepdim=True)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_logprob_row_tokens(
@@ -9614,33 +9604,8 @@ class TPUModelRunner(GPUModelRunner):
         of logprobs as an alternative to having multiple pre-compiled graphs.
         Select the number of logprobs actually demanded by each request on CPU.
         """
-        token_ids = sampled_tokens.to(torch.int64)
-        token_logits = logits.gather(-1, token_ids)
-        token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
-        # Normalize in FP32: a BF16 logsumexp/subtraction can round the selected
-        # token's logprob to 0.0 and make the top-k probabilities sum to > 1.
-        # Only the [N, 1] normalizer is materialized in FP32; the upcast feeds
-        # straight into the reduction and the FP32 subtraction is done on the
-        # gathered [N, k] values rather than on a full-vocab log_softmax.
-        log_normalizers = torch.logsumexp(
-            logits.to(torch.float32), dim=-1, keepdim=True
-        )
-        token_logprobs = token_logits.to(torch.float32) - log_normalizers
-
-        max_logprobs = self.model_config.max_logprobs
-        if max_logprobs > 0:
-            topk_logits, topk_indices = torch.topk(logits, max_logprobs, dim=-1)
-            topk_logprobs = topk_logits.to(torch.float32) - log_normalizers
-            logprob_token_ids = torch.cat((token_ids, topk_indices), dim=1)
-            logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
-        else:
-            logprob_token_ids = token_ids
-            logprobs = token_logprobs
-
-        return LogprobsTensors(
-            logprob_token_ids=logprob_token_ids.to(torch.int32),
-            logprobs=logprobs,
-            selected_token_ranks=token_ranks,
+        return sampler_math.gather_logprobs_impl(
+            logits, sampled_tokens, self.model_config.max_logprobs
         )
 
 
