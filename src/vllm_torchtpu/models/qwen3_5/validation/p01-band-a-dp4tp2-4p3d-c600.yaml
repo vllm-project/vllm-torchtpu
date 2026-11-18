@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# InferenceX point 1 (interactivity band A): the serve arguments and
+# Benchmark point 1: the serve arguments and
 # environment each leg of the record run used. See README.md in this
 # directory for how to read and use it.
 name: p01-band-a-dp4tp2-4p3d-c600
