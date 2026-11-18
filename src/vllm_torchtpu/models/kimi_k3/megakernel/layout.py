@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/layout.py
-"""Kimi-K3's unified pools at TP32 (the layout vLLM allocates with
-``gdn_pool_layout`` and the Raiden connector moves).
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/kimi_k3/layout.py
+"""Kimi-K3 unified KV and recurrent state pool layout at TP32.
+
+Matches the unified pool layout vLLM allocates with ``gdn_pool_layout`` and
+transfers across the KV connector.
 
 24 pools, one per MLA layer (every fourth layer, and the last); pool ``p``
 also holds KDA layers ``3p .. 3p + 2`` (the last pool none). A block is
@@ -31,31 +34,51 @@ also holds KDA layers ``3p .. 3p + 2`` (the last pool none). A block is
   the state by a prefill that computes the ring.
 """
 
+from __future__ import annotations
+
 import dataclasses
 
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.layout import (
-    KVLayout,
-    StateRegion,
+from .common.constants import (
+    CONV_HEAD_ROWS as CONV_HEAD_ROWS,
 )
+from .common.constants import (
+    CONV_TAPS as CONV_TAPS,
+)
+from .common.constants import (
+    HEAD_DIM as HEAD_DIM,
+)
+from .common.constants import (
+    KDA_HEADS as KDA_HEADS,
+)
+from .common.constants import (
+    NUM_LAYERS as NUM_LAYERS,
+)
+from .common.constants import (
+    TP_PEERS as TP_PEERS,
+)
+from .common.constants import (
+    TP_SIZE as TP_SIZE,
+)
+from .runtime_shim.layout import KVLayout, StateRegion
 
-NUM_LAYERS = 93
-MLA = tuple(i for i in range(NUM_LAYERS) if i % 4 == 3 or i == NUM_LAYERS - 1)
+_MLA_LAYER_STRIDE = 4
+_MLA_LAYER_MODULO = 3
+MLA = tuple(
+    i
+    for i in range(NUM_LAYERS)
+    if i % _MLA_LAYER_STRIDE == _MLA_LAYER_MODULO or i == NUM_LAYERS - 1
+)
 KDA = tuple(i for i in range(NUM_LAYERS) if i not in MLA)
-KDA_HEADS = 3  # per rank at TP32
-HEAD_DIM = 128
-CONV_TAPS = 3
 # The decoder's conv-history slots keep each (tap, q/k/v) group's KDA_HEADS
 # heads in four rows: with a second-minor dimension of three, the slot bank's
 # default device layout puts its layer axis second-minor, and XLA relayouts
 # the whole bank into and out of the decode kernels every step.
-CONV_HEAD_ROWS = 4
 
 LAYOUT = KVLayout(
     block_shape=(128, 2, 640),
     dtype="bfloat16",
     tokens_per_block=256,
     tokens_per_row=2,
-    entry_lanes=576,
     attention_layers=MLA,
     state_layers=KDA,
     state_regions=(
@@ -76,16 +99,24 @@ FP8_LAYOUT = dataclasses.replace(
 
 
 def cache_layout(dtype: str = "auto") -> KVLayout:
-    """The physical contract selected by vLLM's cache dtype.
+    """Return the physical pool contract selected by vLLM's cache dtype.
 
     FP8 doubles tokens per page, preserving the 2560-byte physical row and
     every FP32/BF16 state region. Cache latents use E4M3FN with scale one.
+
+    Args:
+        dtype: vLLM cache dtype string (``"auto"``, ``"bfloat16"``, or ``"fp8"``).
+
+    Returns:
+        Matching :class:`KVLayout` instance (:data:`LAYOUT` or :data:`FP8_LAYOUT`).
+
+    Raises:
+        NotImplementedError: If ``dtype`` is not a supported Kimi-K3 cache dtype.
     """
     dtype = str(dtype).removeprefix("torch.")
     if dtype in ("auto", "bfloat16"):
         return LAYOUT
     if dtype in ("fp8", "fp8_e4m3", "float8_e4m3fn"):
         return FP8_LAYOUT
-    raise NotImplementedError(
-        f"K3 cache dtype {dtype!r} is unsupported; use auto/bfloat16 or fp8/fp8_e4m3"
-    )
+    msg = f"K3 cache dtype {dtype!r} is unsupported; use auto/bfloat16 or fp8/fp8_e4m3"
+    raise NotImplementedError(msg)

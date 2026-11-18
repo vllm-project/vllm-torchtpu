@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/layout.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/layout.py
 """A program's declaration of the KV cache pools it reads and writes.
 
 A megakernel program works on vLLM's allocated KV cache in place, so the
@@ -26,12 +27,20 @@ when the pools are bound.
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import torch
 
 
 @dataclasses.dataclass(frozen=True)
 class StateRegion:
-    """Rows ``[first_row, first_row + rows)`` of a state block: one part of
-    a recurrent layer's state, stored as ``dtype``."""
+    """Contiguous row slice ``[first_row, first_row + rows)`` in a state block.
+
+    Represents one component of a recurrent layer's state stored as ``dtype``.
+    """
 
     name: str
     first_row: int
@@ -41,43 +50,66 @@ class StateRegion:
 
 @dataclasses.dataclass(frozen=True)
 class KVLayout:
-    """Unified pools: one tensor per attention layer, ``[num_blocks,
-    *block_shape]`` of ``dtype``, each shared with recurrent layers (pool
-    ``p`` holds the ``p``-th equal run of ``state_layers``). An attention
-    block holds ``tokens_per_block`` token entries of ``entry_lanes`` used
-    lanes (row ``t // tokens_per_row``, slot ``t % tokens_per_row``); a
-    recurrent layer's state block holds its ``state_regions``."""
+    """Unified KV and recurrent state pool geometry contract.
+
+    Allocates one tensor per attention layer of shape ``[num_blocks, *block_shape]``
+    and ``dtype``, shared with recurrent layers (pool ``p`` holds the ``p``-th
+    equal run of ``state_layers``). An attention block holds ``tokens_per_block``
+    token entries (row ``t // tokens_per_row``, slot ``t % tokens_per_row``); a
+    recurrent layer's state block holds its ``state_regions``.
+    """
 
     block_shape: tuple[int, ...]
     dtype: str
     tokens_per_block: int
     tokens_per_row: int
-    entry_lanes: int
     attention_layers: tuple[int, ...]
     state_layers: tuple[int, ...]
     state_regions: tuple[StateRegion, ...]
 
     @property
     def pools(self) -> int:
+        """Return the number of unified KV cache pools (one per attention layer)."""
         return len(self.attention_layers)
 
     def region(self, name: str) -> StateRegion:
-        return next(r for r in self.state_regions if r.name == name)
+        """Look up a recurrent state region by ``name``.
 
-    def check(self, tensors) -> None:
-        """Raise unless ``tensors`` are this layout's pools as vLLM allocated them."""
-        shapes = {tuple(t.shape[1:]) for t in tensors}
-        dtypes = {str(t.dtype).removeprefix("torch.") for t in tensors}
+        Args:
+            name: Region identifier (for example ``"recurrent"``, ``"conv"``,
+                or ``"draft"``).
+
+        Returns:
+            Matching :class:`StateRegion` descriptor.
+        """
+        return next(reg for reg in self.state_regions if reg.name == name)
+
+    def check(self, tensors: Sequence[torch.Tensor]) -> None:
+        """Verify ``tensors`` match this layout's pool count, block shape, and dtype.
+
+        Raise unless ``tensors`` are this layout's pools as vLLM allocated them.
+
+        Args:
+            tensors: Sequence of allocated KV cache pool tensors from vLLM.
+
+        Raises:
+            NotImplementedError: If pool count, block shapes, dtypes, or block
+                counts do not match this layout contract.
+        """
+        shapes = {tuple(tensor.shape[1:]) for tensor in tensors}
+        dtypes = {str(tensor.dtype).removeprefix("torch.") for tensor in tensors}
         if (
             len(tensors) != self.pools
             or shapes != {self.block_shape}
             or dtypes != {self.dtype}
         ):
-            raise NotImplementedError(
+            msg = (
                 f"the program expects {self.pools} unified pools "
                 f"[blocks, {', '.join(map(str, self.block_shape))}] "
                 f"{self.dtype}; vLLM allocated {len(tensors)} with block shapes "
                 f"{sorted(shapes)} and {sorted(dtypes)}"
             )
-        if any(int(t.shape[0]) == 0 for t in tensors):
-            raise NotImplementedError("vLLM allocated empty KV cache pools")
+            raise NotImplementedError(msg)
+        if any(int(tensor.shape[0]) == 0 for tensor in tensors):
+            msg = "vLLM allocated empty KV cache pools"
+            raise NotImplementedError(msg)
