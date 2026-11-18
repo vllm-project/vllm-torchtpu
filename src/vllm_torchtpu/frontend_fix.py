@@ -24,7 +24,6 @@ Off by default and installed by ``additional_config["tpu_frontend"]``
 
 from __future__ import annotations
 
-import contextlib
 import multiprocessing
 import os
 import time
@@ -39,10 +38,11 @@ logger = init_logger(__name__)
 #
 # vLLM's FastIncrementalDetokenizer primes ``tokenizers.decoders.DecodeStream``
 # with the *whole* prompt.  The first ``step()`` then decodes the prompt twice
-# (``prefix`` and ``prefix + new``) on the API-server event loop: ~27 ms at
-# 94k prompt ids, directly in TTFT.  After that first emitted chunk the stream
-# drops every prompt id (``ids.drain(prefix_index..)``), so the prompt only
-# matters as left context for the first chunk.
+# (``prefix`` and ``prefix + new``) on the API server before the first token
+# is emitted: 26 ms for a 105,596-token Qwen3.5 prompt, measured on one CPU.
+# After that first emitted chunk the stream drops every prompt id
+# (``ids.drain(prefix_index..)``), so the prompt only matters as left context
+# for the first chunk.
 #
 # For byte-level decoders the decoded text is ``from_utf8_lossy(concat(bytes))``
 # so the left context only matters through UTF-8 synchronization.  If
@@ -53,6 +53,11 @@ logger = init_logger(__name__)
 # streams hold exactly ``[new ids]`` (same state).  When the check fails (prompt
 # ends inside a multi-byte character, or the tail decodes to "" because it is
 # all skipped special tokens) we keep the full prompt, i.e. upstream behaviour.
+#
+# The other decoders of Hugging Face fast tokenizers (Metaspace, ByteFallback
+# with Fuse and Strip, WordPiece) change only the start of the decoded text (a
+# leading space or "##") or join neighbouring tokens, so the same holds for
+# them; tests/test_frontend_detok_tail.py checks all four families.
 # ---------------------------------------------------------------------------
 
 _DT = "tpu_frontend.detok_prompt_tail:"
@@ -66,22 +71,21 @@ class _DetokStats:
     tail = 0
     full_fallback = 0
     short = 0
+    error = 0
     last_log = 0.0
 
 
 def safe_prompt_tail(tokenizer, prompt_ids, skip_special_tokens: bool, tail_n: int):
-    """Shortest prompt suffix that primes a DecodeStream identically to the
-    full prompt, or ``prompt_ids`` itself when no safe tail exists.
+    """The last ``tail_n`` prompt ids when they prime a DecodeStream
+    identically to the full prompt (they decode to non-empty text that does
+    not end in U+FFFD), else ``prompt_ids`` itself.
 
     ``tokenizer`` is a ``tokenizers.Tokenizer`` (rust) instance.
     """
     if prompt_ids is None or tail_n <= 0 or len(prompt_ids) <= tail_n:
         return prompt_ids
     tail = list(prompt_ids[-tail_n:])
-    try:
-        text = tokenizer.decode(tail, skip_special_tokens=skip_special_tokens)
-    except Exception:
-        return prompt_ids
+    text = tokenizer.decode(tail, skip_special_tokens=skip_special_tokens)
     if not text or text.endswith("\ufffd"):
         return prompt_ids
     return tail
@@ -102,6 +106,23 @@ class _PromptTailView:
 
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_request"), name)
+
+
+def _tail_request(tokenizer, request, tail_n: int):
+    """The request to prime vLLM's detokenizer with: a view whose prompt is the
+    safe tail, or ``request`` itself when the prompt is short or has no safe
+    tail."""
+    ids = request.prompt_token_ids
+    if ids is None or len(ids) <= tail_n:
+        _DetokStats.short += 1
+        return request
+    skip_special_tokens = bool(request.sampling_params.skip_special_tokens)
+    tail = safe_prompt_tail(tokenizer._tokenizer, ids, skip_special_tokens, tail_n)
+    if tail is ids:
+        _DetokStats.full_fallback += 1
+        return request
+    _DetokStats.tail += 1
+    return _PromptTailView(request, tail)
 
 
 def maybe_install_detok_prompt_tail() -> bool:
@@ -142,31 +163,32 @@ def maybe_install_detok_prompt_tail() -> bool:
     _DetokStats.last_log = time.monotonic()
 
     def __init__(self, tokenizer, request):
-        with contextlib.suppress(Exception):
-            ids = request.prompt_token_ids
-            if ids is not None and len(ids) > tail_n:
-                sp = request.sampling_params
-                tail = safe_prompt_tail(
-                    tokenizer._tokenizer, ids, bool(sp.skip_special_tokens), tail_n
-                )
-                if tail is not ids:
-                    request = _PromptTailView(request, tail)
-                    _DetokStats.tail += 1
-                else:
-                    _DetokStats.full_fallback += 1
-            else:
-                _DetokStats.short += 1
-            now = time.monotonic()
-            if now - _DetokStats.last_log >= log_s:
-                _DetokStats.last_log = now
-                logger.debug(
-                    "%s stats tail=%d full_fallback=%d short=%d",
-                    _DT,
-                    _DetokStats.tail,
-                    _DetokStats.full_fallback,
-                    _DetokStats.short,
-                )
-        orig_init(self, tokenizer, request)
+        primed = request
+        try:
+            primed = _tail_request(tokenizer, request, tail_n)
+        except Exception as e:
+            # vLLM's own priming with the full prompt is always correct, so a
+            # request the tail cannot handle keeps it, and the error is logged.
+            _DetokStats.error += 1
+            logger.warning_once(
+                "%s %s while choosing the prompt tail (%s); priming with the "
+                "full prompt",
+                _DT,
+                type(e).__name__,
+                e,
+            )
+        now = time.monotonic()
+        if now - _DetokStats.last_log >= log_s:
+            _DetokStats.last_log = now
+            logger.debug(
+                "%s stats tail=%d full_fallback=%d short=%d error=%d",
+                _DT,
+                _DetokStats.tail,
+                _DetokStats.full_fallback,
+                _DetokStats.short,
+                _DetokStats.error,
+            )
+        orig_init(self, tokenizer, primed)
 
     # pyrefly: ignore[missing-attribute]
     __init__.__wrapped__ = orig_init
