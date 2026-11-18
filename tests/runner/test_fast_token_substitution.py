@@ -104,6 +104,9 @@ def test_spec_verify_step_skips_the_fast_slice():
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([201, 202, 203, 204], dtype=torch.int64)
         ),
+        _async_subst_dev_cache={},
+        _cached_subst_key=None,
+        _cached_substitution_indices=None,
     )
     input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
     indices = np.array([0, 1, 2, 3], dtype=np.int32)
