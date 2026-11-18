@@ -15,7 +15,9 @@
 """The GDN kernel dispatch: the Qwen3.5 MoE architectures run the Qwen3.5 copy of
 the fused Conv1D-GDN v3 kernel (models/qwen3_5/kernels/gdn), every other
 architecture runs the shared kernel in kernels/gdn/v3, and nothing in the GDN
-layer calls either kernel except through `gdn_kernel_wrapper`."""
+layer calls either kernel except through `gdn_kernel_wrapper`, apart from the
+PCP prefill (`run_jax_gdn_attention_pcp_tp_prefill`), which calls the shared
+kernel directly for every architecture."""
 
 import ast
 import inspect
@@ -75,8 +77,9 @@ def test_every_other_architecture_runs_the_shared_kernel(architecture):
     assert gdn_attention.gdn_kernel_wrapper(architecture) is main_gdn_wrapper
 
 
-# The PCP prefill keeps the shared kernel for every architecture: no serving
-# leg ran prefill context parallelism with the copy.
+# The PCP prefill keeps the shared kernel for every architecture: none of the
+# Qwen3.5-397B serving configurations the copy was validated with ran prefill
+# context parallelism.
 _SHARED_KERNEL_CALLERS = ("gdn_kernel_wrapper", "run_jax_gdn_attention_pcp_tp_prefill")
 
 

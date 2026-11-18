@@ -36,12 +36,12 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
-# The architectures the Qwen3.5 GDN copy is validated for: the Qwen3.5 MoE
-# checkpoints (Qwen3.5-397B-A17B's prefill/decode-disaggregated serving
-# configurations ran the copy's changes; Qwen3.5-35B-A3B runs in CI). The
-# other Qwen GDN architectures in gdn_pool_layout (Qwen3-Next, dense Qwen3.5,
-# Qwen4Exp) keep the shared kernel until they are validated on the copy; add
-# them here in the change that does so.
+# The architectures the Qwen3.5 GDN copy serves: the Qwen3.5 MoE checkpoints
+# (Qwen3.5-397B-A17B in its prefill/decode-disaggregated serving
+# configurations, Qwen3.5-35B-A3B in CI). The other Qwen GDN architectures in
+# gdn_pool_layout (Qwen3-Next, dense Qwen3.5, Qwen4Exp) keep the shared kernel
+# until they are validated on the copy; add them here in the change that does
+# so.
 QWEN3_5_GDN_COPY_ARCHITECTURES = frozenset(
     {
         "Qwen3_5MoeForCausalLM",
@@ -56,8 +56,8 @@ def gdn_kernel_wrapper(architecture: str | None) -> ModuleType:
     """Return the fused Conv1D-GDN v3 wrapper module that serves `architecture`.
 
     The Qwen3.5 MoE architectures (`QWEN3_5_GDN_COPY_ARCHITECTURES`) run the
-    copy in `models/qwen3_5/kernels/gdn`, which carries the Qwen3.5 GDN v3
-    changes.
+    copy of `kernels/gdn/v3` in `models/qwen3_5/kernels/gdn`, the home for
+    GDN changes validated only on the Qwen3.5 MoE serving configurations.
     Every other architecture, and a caller that passes no architecture, runs
     the shared kernel in `kernels/gdn/v3` unchanged. This is the only place
     that chooses between the two; the copy is imported only when chosen.
@@ -991,6 +991,8 @@ def run_jax_gdn_attention_pooled(
           checkpoint query offsets (0 for none).
         prefill_ckpt_indices: Optional (max_reqs,) int32 destination block IDs
           for prefill checkpoints (-1 for none).
+        architecture: The model architecture; selects the kernel through
+          `gdn_kernel_wrapper`.
 
     Returns:
         A tuple containing:

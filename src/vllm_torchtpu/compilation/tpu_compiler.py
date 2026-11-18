@@ -273,7 +273,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
-    # The Qwen3.5 kernels and their custom-op bridges.
+    # The Qwen3.5 kernel copies, which run behind custom-op boundaries too;
+    # their bridges live under layers/ and are hashed through those entries.
     "vllm_torchtpu/models/qwen3_5/kernels",
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
