@@ -97,8 +97,8 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         emit_byte_tokenizer: Whether to emit a synthetic byte-level tokenizer.json
             (valid only for vocab_size <= 256 in small test models).
         hf_checkpoint_dir: Optional path to the HuggingFace checkpoint directory
-            containing tokenizer.json, generation_config.json, and safetensors
-            headers.
+            containing config.json, tokenizer.json, generation_config.json,
+            tokenizer_config.json, and safetensors headers.
         speculative_config: Speculative decoding the runtime runs, recorded as
             `serving_config.speculative_config` (vLLM's field names); None for none.
         max_verify_tokens: The draft tokens a step can verify beyond the drafter's,
