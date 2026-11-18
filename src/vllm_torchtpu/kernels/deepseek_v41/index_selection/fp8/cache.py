@@ -123,8 +123,6 @@ def write_fp8_records(
     bases, _, order = _sort_by_slot(jnp.where(valid, bases, total_rows), columns)
     _, scales, _ = quantize_index_rows(keys)
     columns, values = prepare_sorted_fp8(keys, columns, order, scales)
-    batch = min(count, PACKED_FP8_WRITE_BATCH)
-    bases = jnp.pad(bases, (0, -count % batch + 1), constant_values=total_rows)
     return _write_sorted_packed_pages(
         banks,
         bases,
@@ -232,15 +230,11 @@ def write_packed_pages(
     padded_fields = page_rows * page_tokens // page_size
     first_rows = banks[0].shape[0]
     total_rows = sum(bank.shape[0] for bank in banks)
-    batch = min(count, PACKED_FP8_WRITE_BATCH)
     valid = (bases >= 0) & (bases + page_rows <= first_rows)
     if len(banks) == 2:
         valid |= (bases >= first_rows) & (bases + page_rows <= total_rows)
     bases, columns, order = _sort_by_slot(jnp.where(valid, bases, total_rows), columns)
     values = values[order]
-    # The final sentinel terminates the last page's merge without an end scan.
-    bases = jnp.pad(bases, (0, -count % batch + 1), constant_values=total_rows)
-    columns = jnp.pad(columns, (0, -count % batch))
     values = jnp.pad(values.T, ((0, padded_fields - fields), (0, -count % page_tokens)))
 
     return _write_sorted_packed_pages(
@@ -272,65 +266,83 @@ def _write_sorted_packed_pages(
     first_rows = banks[0].shape[0]
     total_rows = sum(bank.shape[0] for bank in banks)
     batch = min(count, PACKED_FP8_WRITE_BATCH)
+    steps = pl.cdiv(count, batch)
+    # Page and run boundaries come from vector ops, so the kernel loops over
+    # pages and runs of consecutive slots rather than over records. Sorting
+    # put valid records first; the last entry of each list is its end.
+    bases, columns = bases[:count], columns[:count].astype(jnp.int32)
+    valid = bases < total_rows
+    page_first = valid & (bases != jnp.pad(bases[:-1], (1, 0), constant_values=-1))
+    run_first = page_first | (
+        valid & (columns != jnp.pad(columns[:-1], (1, 0), constant_values=-2) + 1)
+    )
+    run_ids = jnp.cumsum(run_first, dtype=jnp.int32) - 1
+    page_ids = jnp.cumsum(page_first, dtype=jnp.int32) - 1
+    size = steps * batch + 1
 
-    def kernel(base_ref, column_ref, value_ref, *refs):
+    def compact(first, ids, values, end):
+        return (
+            jnp.full((size,), end, jnp.int32)
+            .at[jnp.where(first, ids, size)]
+            .set(values, mode="drop")
+        )
+
+    run_starts = compact(
+        run_first,
+        run_ids,
+        jnp.arange(count, dtype=jnp.int32),
+        valid.sum(dtype=jnp.int32),
+    )
+    page_bases = compact(page_first, page_ids, bases, total_rows)
+    page_runs = compact(page_first, page_ids, run_ids, run_first.sum(dtype=jnp.int32))
+
+    def kernel(page_base_ref, page_run_ref, run_ref, column_ref, value_ref, *refs):
         outputs = refs[len(banks) : 2 * len(banks)]
         pages, sem = refs[2 * len(banks) :]
 
-        def first(record):
-            base = base_ref[record]
-            return (base < total_rows) & (
-                (record == 0) | (base != base_ref[jnp.maximum(record - 1, 0)])
-            )
-
-        def each_valid(action):
+        def each_page(action):
             def body(slot):
-                action(slot, 0)
+                action(slot, pl.program_id(0) * batch + slot)
                 return slot + 1
 
-            # Sorting puts invalid records last; decode writes only compressed
-            # token boundaries, so most input rows need no page work.
             jax.lax.while_loop(
-                lambda slot: (slot < batch)
-                & (base_ref[pl.program_id(0) * batch + slot] < total_rows),
+                lambda slot: (
+                    (slot < batch)
+                    & (page_base_ref[pl.program_id(0) * batch + slot] < total_rows)
+                ),
                 body,
                 jnp.int32(0),
             )
 
         def copies(*, write, wait):
-            def body(slot, carry):
-                record = pl.program_id(0) * batch + slot
-                base = base_ref[record]
+            def body(slot, page):
+                base = page_base_ref[page]
 
-                @pl.when(first(record))
-                def _():
-                    def move(bank, offset):
-                        hbm = outputs[bank].at[pl.ds(base - offset, page_rows), :]
-                        vmem = pages.at[slot]
-                        src, dst = (vmem, hbm) if write else (hbm, vmem)
-                        copy = pltpu.make_async_copy(src, dst, sem)
-                        if wait:
-                            copy.wait()
-                        else:
-                            copy.start()
-
-                    if len(banks) == 1:
-                        move(0, 0)
+                def move(bank, offset):
+                    hbm = outputs[bank].at[pl.ds(base - offset, page_rows), :]
+                    vmem = pages.at[slot]
+                    src, dst = (vmem, hbm) if write else (hbm, vmem)
+                    copy = pltpu.make_async_copy(src, dst, sem)
+                    if wait:
+                        copy.wait()
                     else:
-                        jax.lax.cond(
-                            base < first_rows,
-                            lambda: move(0, 0),
-                            lambda: move(1, first_rows),
-                        )
+                        copy.start()
 
-                return carry
+                if len(banks) == 1:
+                    move(0, 0)
+                else:
+                    jax.lax.cond(
+                        base < first_rows,
+                        lambda: move(0, 0),
+                        lambda: move(1, first_rows),
+                    )
 
-            each_valid(body)
+            each_page(body)
 
         copies(write=False, wait=False)
         copies(write=False, wait=True)
 
-        value_lanes, column_count = value_ref.shape[1], column_ref.shape[0]
+        value_lanes = value_ref.shape[1]
         blocks = max(1, page_size // page_tokens)
         lanes = jax.lax.broadcasted_iota(jnp.int32, (padded_fields, page_tokens), 1)
         positions = jnp.arange(page_rows * page_tokens).reshape(page_rows, page_tokens)
@@ -347,9 +359,13 @@ def _write_sorted_packed_pages(
             shift = (page_tokens - skew) % page_tokens
 
             def block(index):
-                index = jnp.clip(origin + index * page_tokens, 0, value_lanes - page_tokens)
+                index = jnp.clip(
+                    origin + index * page_tokens, 0, value_lanes - page_tokens
+                )
                 return pltpu.roll(
-                    value_ref[:, pl.ds(pl.multiple_of(index, page_tokens), page_tokens)],
+                    value_ref[
+                        :, pl.ds(pl.multiple_of(index, page_tokens), page_tokens)
+                    ],
                     shift,
                     1,
                 )
@@ -383,29 +399,15 @@ def _write_sorted_packed_pages(
                         pages[slot, rows, :],
                     )
 
-        def merge(slot, carry):
-            start = pl.program_id(0) * batch + slot
+        def merge(slot, page):
+            def run(index, carry):
+                start = run_ref[index]
+                window(slot, start, run_ref[index + 1] - start)
+                return carry
 
-            @pl.when(first(start))
-            def _():
-                def same_page(record):
-                    return base_ref[record] == base_ref[start]
+            jax.lax.fori_loop(page_run_ref[page], page_run_ref[page + 1], run, 0)
 
-                def run(record):
-                    end = jax.lax.while_loop(
-                        lambda end: same_page(end)
-                        & (column_ref[jnp.minimum(end, column_count - 1)] == column_ref[end - 1] + 1),
-                        lambda end: end + 1,
-                        record + 1,
-                    )
-                    window(slot, record, end - record)
-                    return end
-
-                jax.lax.while_loop(same_page, run, start)
-
-            return carry
-
-        each_valid(merge)
+        each_page(merge)
         copies(write=True, wait=False)
         copies(write=True, wait=True)
 
@@ -413,8 +415,8 @@ def _write_sorted_packed_pages(
         kernel,
         out_shape=tuple(jax.ShapeDtypeStruct(bank.shape, bank.dtype) for bank in banks),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            grid=(pl.cdiv(count, batch),),
+            num_scalar_prefetch=4,
+            grid=(steps,),
             in_specs=(
                 pl.BlockSpec(memory_space=pltpu.VMEM),
                 *(pl.BlockSpec(memory_space=pltpu.HBM) for _ in banks),
@@ -425,7 +427,7 @@ def _write_sorted_packed_pages(
                 pltpu.SemaphoreType.DMA,
             ),
         ),
-        input_output_aliases={3 + i: i for i in range(len(banks))},
+        input_output_aliases={5 + i: i for i in range(len(banks))},
         interpret=pltpu.InterpretParams() if interpret else False,
         name="write_packed_fp8_pages",
-    )(bases, columns, values, *banks)
+    )(page_bases, page_runs, run_starts, columns, values, *banks)
