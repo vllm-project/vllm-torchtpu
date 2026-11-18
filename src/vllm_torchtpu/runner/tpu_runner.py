@@ -224,6 +224,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     LogprobsChunk,
 )
+from vllm_torchtpu.spec_decode import draft_path_rules
 from vllm_torchtpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     StepCostTable,
@@ -1489,6 +1490,12 @@ class TPUModelRunner(GPUModelRunner):
         self._fast_token_substitution: bool = fast_token_substitution_enabled(
             vllm_config
         )
+        if vllm_config.speculative_config is not None:
+            logger.info(
+                "Draft-path rule for this engine: %s.",
+                ", ".join(draft_path_rules.matching(vllm_config))
+                or "none (main's opt-in keys apply)",
+            )
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req

@@ -41,3 +41,14 @@ def holds(vllm_config: Any) -> bool:
     """Whether any registered rule turns the draft-path programs on for this
     configuration."""
     return any(rule(vllm_config) for rule in _RULES)
+
+
+def registered(rule: Callable[[Any], bool]) -> bool:
+    """Whether ``rule`` is registered."""
+    return rule in _RULES
+
+
+def matching(vllm_config: Any) -> list[str]:
+    """Qualified names of the registered rules that hold for this
+    configuration (logged at runner start)."""
+    return [f"{r.__module__}.{r.__qualname__}" for r in _RULES if r(vllm_config)]

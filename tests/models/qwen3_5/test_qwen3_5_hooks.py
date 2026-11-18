@@ -109,6 +109,7 @@ def _vllm_config(
             mamba_ssm_cache_dtype="auto",
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs, scheduler_cls=None),
+        speculative_config=None,
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp,
             data_parallel_size=dp,

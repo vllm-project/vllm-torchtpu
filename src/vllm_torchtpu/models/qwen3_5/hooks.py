@@ -120,6 +120,25 @@ def mtp_draft_path(vllm_config: VllmConfig) -> bool:
     )
 
 
+def warn_if_no_draft_path_rule(vllm_config: VllmConfig) -> None:
+    """A Qwen3.5 MTP engine whose draft-path rule is not registered (for
+    example, register_models did not run in this process) silently keeps
+    main's opt-in defaults; say so once."""
+    from vllm_torchtpu.spec_decode import draft_path_rules
+
+    spec = vllm_config.speculative_config
+    if (
+        spec is not None
+        and spec.method == "mtp"
+        and not draft_path_rules.registered(mtp_draft_path)
+    ):
+        logger.warning_once(
+            "Qwen3.5 MTP: the draft-path rule (mtp_draft_path) is not "
+            "registered, so greedy top tokens, fast token substitution, the "
+            "fused MTP draft loop and the batch-1 decode carry stay off."
+        )
+
+
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
     """Fill the Qwen3.5 TPU serving defaults the user did not set."""
     calibrated = _is_calibrated(vllm_config.model_config)
@@ -138,3 +157,4 @@ class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):
         # Fails at engine start on an unknown setting or a wrongly typed value.
         settings.get(vllm_config)
         apply_serving_defaults(vllm_config)
+        warn_if_no_draft_path_rule(vllm_config)

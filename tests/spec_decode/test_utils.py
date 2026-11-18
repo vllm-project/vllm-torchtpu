@@ -310,3 +310,28 @@ def test_register_models_registers_the_qwen3_5_draft_path_rule(monkeypatch):
     register_models()
     register_models()
     assert [mtp_draft_path] == draft_path_rules._RULES
+
+
+def test_matching_names_the_rule_that_applies(qwen3_5_draft_path_rule):
+    from vllm_torchtpu.spec_decode import draft_path_rules
+
+    assert draft_path_rules.matching(_qwen35_mtp_config()) == [
+        "vllm_torchtpu.models.qwen3_5.hooks.mtp_draft_path"
+    ]
+    assert draft_path_rules.matching(_qwen35_mtp_config(method="eagle3")) == []
+
+
+@pytest.mark.parametrize("registered", [True, False])
+def test_qwen3_5_mtp_without_its_rule_warns_once(monkeypatch, registered):
+    """A Qwen3.5 MTP engine warns when its draft-path rule is missing, and
+    stays quiet when it is registered."""
+    from vllm_torchtpu.models.qwen3_5 import hooks
+    from vllm_torchtpu.spec_decode import draft_path_rules
+
+    monkeypatch.setattr(
+        draft_path_rules, "_RULES", [hooks.mtp_draft_path] if registered else []
+    )
+    warned = []
+    monkeypatch.setattr(hooks.logger, "warning_once", lambda *a, **k: warned.append(a))
+    hooks.warn_if_no_draft_path_rule(_qwen35_mtp_config())
+    assert bool(warned) is (not registered)
