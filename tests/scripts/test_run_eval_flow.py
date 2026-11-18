@@ -25,7 +25,7 @@ _BENCHMARKING = pathlib.Path("scripts/vllm/benchmarking")
 _PERF_BASELINES = _REPO_ROOT / _BENCHMARKING / "baselines" / "perf"
 
 
-def _run_as_far_as_the_benchmark(tmp_path, accelerator_type, config):
+def _run_eval_flow(tmp_path, accelerator_type, config, *extra_args):
     """Runs run_eval_flow.sh against a server that is already up (--host).
 
     The script reaches python3 by name, and the baselines and the benchmark by
@@ -43,6 +43,12 @@ def _run_as_far_as_the_benchmark(tmp_path, accelerator_type, config):
     benchmark = benchmarking / "run_benchmarks.sh"
     benchmark.write_text("#!/usr/bin/env bash\nexit 3\n")
     benchmark.chmod(0o755)
+    src_dir = str(_REPO_ROOT / "src")
+    pythonpath = (
+        f"{src_dir}{os.pathsep}{os.environ['PYTHONPATH']}"
+        if os.environ.get("PYTHONPATH")
+        else src_dir
+    )
     return subprocess.run(
         [
             "bash",
@@ -53,11 +59,13 @@ def _run_as_far_as_the_benchmark(tmp_path, accelerator_type, config):
             "127.0.0.1",
             "--results-dir",
             str(tmp_path / "results"),
+            *extra_args,
         ],
         cwd=tmp_path / "work",
         env={
             **os.environ,
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "PYTHONPATH": pythonpath,
             "TPU_ACCELERATOR_TYPE": accelerator_type,
         },
         capture_output=True,
@@ -74,19 +82,34 @@ def test_perf_baselines_are_filed_under_a_chip():
     assert {path.name for path in _PERF_BASELINES.iterdir() if path.is_dir()} <= chips
 
 
-def test_a_tpu7x_run_gates_on_a_v7x_baseline_that_exists(tmp_path):
+def test_tpu7x_run_gates_on_v7x_baseline(tmp_path):
     # Any config with a v7x baseline will do: a lookup that lands on another
     # directory finds no baseline, and the run reports without the perf gate.
     baseline = min(_PERF_BASELINES.glob("v7x/*.baseline.json"))
     config = baseline.name.removesuffix(".baseline.json")
-    went_on = _run_as_far_as_the_benchmark(tmp_path, "tpu7x-8", config)
-    assert went_on.returncode == 3, went_on.stderr
+    result = _run_eval_flow(tmp_path, "tpu7x-8", config)
+    assert result.returncode == 3, result.stderr
     picked = _BENCHMARKING / "baselines" / "perf" / "v7x" / baseline.name
-    assert f"Perf baseline for v7x: {picked}\n" in went_on.stdout
+    assert f"Perf baseline for v7x: {picked}\n" in result.stdout
 
 
-def test_a_type_that_names_no_chip_stops_before_the_benchmark(tmp_path):
-    stopped = _run_as_far_as_the_benchmark(tmp_path, "notachip-8", "qwen3-0.6b-tp1")
-    assert stopped.returncode == 1, stopped.stderr
-    assert "Unrecognized TPU accelerator type 'notachip-8'" in stopped.stderr
-    assert "ERROR: could not read the TPU chip" in stopped.stderr
+def test_chip_without_baseline_reports_without_perf_gate(tmp_path):
+    result = _run_eval_flow(tmp_path, "v6e-8", "uncalibrated-config")
+    assert result.returncode == 3, result.stderr
+    missing = _BENCHMARKING / "baselines/perf/v6e/uncalibrated-config.baseline.json"
+    expected = f"No perf baseline for v6e at {missing}; reporting without the perf gate"
+    assert f"{expected}\n" in result.stdout
+
+
+def test_skip_perf_check_needs_no_chip(tmp_path):
+    result = _run_eval_flow(
+        tmp_path, "notachip-8", "qwen3-0.6b-tp1", "--skip-perf-check"
+    )
+    assert result.returncode == 3, result.stderr
+
+
+def test_unknown_chip_stops_before_benchmark(tmp_path):
+    result = _run_eval_flow(tmp_path, "notachip-8", "qwen3-0.6b-tp1")
+    assert result.returncode == 1, result.stderr
+    assert "Unrecognized TPU accelerator type 'notachip-8'" in result.stderr
+    assert "ERROR: could not read the TPU chip" in result.stderr
