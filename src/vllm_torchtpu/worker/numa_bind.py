@@ -16,7 +16,8 @@
 Called before the runtime starts so its threads inherit the node's CPU set
 and its host buffers prefer the node's memory. The inherited CPU set is only
 ever narrowed, so a launcher's reservation (taskset, numactl, a cgroup) stays
-in force. Single-node hosts are left alone.
+in force. On a host with one NUMA node nothing changes in effect: the node
+holds every CPU of the inherited set and all of the memory.
 """
 
 import ctypes
@@ -51,7 +52,8 @@ def _read(path: str) -> str:
 
 def tpu_pci_devices() -> list[str]:
     """PCI addresses of this host's TPU chips, in libtpu's chip order (PCI
-    address order of the TPU accelerator functions)."""
+    address order of the TPU accelerator functions). A tpu7x host lists one
+    function per device, 8 in all."""
     devices = []
     for path in glob.glob(os.path.join(_PCI_DEVICES, "*")):
         try:
