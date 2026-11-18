@@ -27,6 +27,7 @@ import pytest
 from jax.experimental import pallas as pl
 
 from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
+from vllm_torchtpu.layers.adapter import fused_moe as bridge
 from vllm_torchtpu.layers.core import fused_moe_gmm as wrapper
 
 FP8 = jnp.float8_e4m3fn
@@ -380,7 +381,8 @@ def test_unsupported_layouts_are_refused(unsupported):
     ],
 )
 def test_token_cap_dispatch(m, enabled, use_ep, selected, monkeypatch):
-    """Rows count every token of the call, draft tokens included."""
+    """An EP call takes the kernel when its rows are within the cap that
+    fused_moe_func is given; other calls keep the grouped path."""
 
     class LowtokSelected(RuntimeError):
         pass
@@ -394,7 +396,6 @@ def test_token_cap_dispatch(m, enabled, use_ep, selected, monkeypatch):
     def standard_selected(*args, **kwargs):
         raise StandardSelected
 
-    monkeypatch.setattr(wrapper, "_MOE_LOWTOK_MAX_TOKENS", 128 if enabled else 0)
     monkeypatch.setattr(wrapper, "moe_lowtok", lowtok_selected)
     monkeypatch.setattr(wrapper, "prepare_routed_gmm_inputs", standard_selected)
     wrapper.fused_moe_func.clear_cache()
@@ -409,9 +410,107 @@ def test_token_cap_dispatch(m, enabled, use_ep, selected, monkeypatch):
     try:
         with pytest.raises(LowtokSelected if selected else StandardSelected):
             jax.eval_shape(
-                functools.partial(wrapper.fused_moe_func, topk=4, use_ep=use_ep),
+                functools.partial(
+                    wrapper.fused_moe_func,
+                    topk=4,
+                    use_ep=use_ep,
+                    lowtok_max_tokens=128 if enabled else 0,
+                ),
                 *args,
             )
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+
+
+@pytest.fixture
+def unarmed(monkeypatch):
+    """No cap armed, and the op cache empty; both restored after the test."""
+    monkeypatch.setattr(wrapper, "_MOE_LOWTOK_MAX_TOKENS", 0)
+    monkeypatch.setattr(bridge, "_fused_moe_kernel_cache", {})
+
+
+@pytest.mark.parametrize("rows", [-1, kernel.MOE_LOWTOK_MAX_TOKENS + 1])
+def test_the_cap_cannot_exceed_the_rows_the_kernel_is_built_for(unarmed, rows):
+    with pytest.raises(ValueError, match=f"got {rows}"):
+        wrapper.set_lowtok_max_tokens(rows)
+    assert wrapper.armed_lowtok_max_tokens() == 0
+    wrapper.set_lowtok_max_tokens(kernel.MOE_LOWTOK_MAX_TOKENS)
+    assert wrapper.armed_lowtok_max_tokens() == kernel.MOE_LOWTOK_MAX_TOKENS
+
+
+def test_the_kernel_refuses_more_rows_than_it_is_built_for(interpret):
+    cap = kernel.MOE_LOWTOK_MAX_TOKENS
+    for m, admitted in ((cap, True), (cap + 1, False)):
+        shapes = _shapes(m, 512, 256, 8)
+        assert (
+            kernel.can_use_moe_lowtok(
+                *shapes, None, None, activation="silu", rhs_quant_dtype=None
+            )
+            == admitted
+        )
+    x, w13, w2, s13, s2 = _shapes(cap + 1, 512, 256, 8)
+    route = jax.ShapeDtypeStruct((cap + 1, 8), jnp.float32)
+    with pytest.raises(ValueError, match=f"at most {cap} rows, got {cap + 1}"):
+        jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
+    x, w13, w2, s13, s2 = _shapes(cap, 512, 256, 8)
+    route = jax.ShapeDtypeStruct((cap, 8), jnp.float32)
+    out = jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
+    assert out.shape == (cap, 512)
+
+
+class _Op:
+    """Stands in for the registered custom op; keeps the function it wraps."""
+
+    def __init__(self, name, fn):
+        self.name, self.fn = name, fn
+
+    def register_fake(self, fake):
+        del fake
+
+
+def test_the_bridge_bakes_the_armed_cap_into_the_op_it_builds(unarmed, monkeypatch):
+    """The fused MoE op takes the cap armed when it is built and its cache is
+    keyed on it: arming after an op exists builds a new op, and the op built
+    before keeps the grouped path."""
+
+    class LowtokSelected(RuntimeError):
+        pass
+
+    class StandardSelected(RuntimeError):
+        pass
+
+    def lowtok_selected(*args, **kwargs):
+        raise LowtokSelected
+
+    def standard_selected(*args, **kwargs):
+        raise StandardSelected
+
+    monkeypatch.setattr(bridge.pallas, "jax_op", _Op)
+    monkeypatch.setattr(wrapper, "moe_lowtok", lowtok_selected)
+    monkeypatch.setattr(wrapper, "prepare_routed_gmm_inputs", standard_selected)
+    get = functools.partial(
+        bridge._get_fused_moe_custom_op, topk=4, activation="silu", use_ep=True
+    )
+    before = get()
+    wrapper.set_lowtok_max_tokens(128)
+    armed = get()
+    assert armed is not before and get() is armed
+    assert before.fn.keywords["lowtok_max_tokens"] == 0
+    assert armed.fn.keywords["lowtok_max_tokens"] == 128
+    args = (
+        *_shapes(16, 512, 256, 8),
+        None,
+        None,
+        jax.ShapeDtypeStruct((16, 4), jnp.bfloat16),
+        jax.ShapeDtypeStruct((16, 4), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+    )
+    wrapper.fused_moe_func.clear_cache()
+    try:
+        with pytest.raises(LowtokSelected):
+            jax.eval_shape(armed.fn, *args)
+        with pytest.raises(StandardSelected):
+            jax.eval_shape(before.fn, *args)
     finally:
         wrapper.fused_moe_func.clear_cache()
 
@@ -441,7 +540,7 @@ def _rel_l2(got, want):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("m", [16, 128])
-def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
+def test_fused_moe_func_selects_kernel_and_matches_oracle(m):
     _needs("tpu")
     rng = np.random.default_rng(m)
     e, h, i, topk, start = 8, 512, 256, 4, 64
@@ -455,11 +554,9 @@ def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
     args = (x, w13, w2, s13, s2, None, None, weights, ids)
     kwargs = dict(experts_start=jnp.array(start, jnp.int32), topk=topk, use_ep=True)
     want = _oracle(x, ids, weights, w13, s13, w2, s2, start)
-    monkeypatch.setattr(wrapper, "_MOE_LOWTOK_MAX_TOKENS", 0)
     wrapper.fused_moe_func.clear_cache()
     gmm_err = _rel_l2(wrapper.fused_moe_func(*args, **kwargs), want)
-    monkeypatch.setattr(wrapper, "_MOE_LOWTOK_MAX_TOKENS", 128)
-    wrapper.fused_moe_func.clear_cache()
+    kwargs["lowtok_max_tokens"] = 128
     try:
         assert "moe_lowtok" in wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
         err = _rel_l2(wrapper.fused_moe_func(*args, **kwargs), want)
