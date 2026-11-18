@@ -64,6 +64,8 @@
 
 # Distributed: Core Collectives (TP/PP/DP/EP/DCP)
 /src/vllm_torchtpu/distributed/ @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824
+/src/vllm_torchtpu/distributed/dcp.py @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824 @pritha90
+/src/vllm_torchtpu/distributed/dcp_comm.py @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824 @pritha90
 /tests/distributed/ @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824
 
 # Distributed: Disaggregated KV Transfer
@@ -76,6 +78,8 @@
 
 # Model Layers
 /src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen
+/src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @pritha90
+/src/vllm_torchtpu/layers/core/dcp_indexer_cache.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @pritha90
 /tests/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen
 
 # Model Implementations & Model Loader
