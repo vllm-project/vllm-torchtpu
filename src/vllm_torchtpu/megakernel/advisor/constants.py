@@ -361,6 +361,8 @@ COMPILED_XLA_GAP_P90_US = 1.5
 UNFUSED_EAGER_GAP_US = 6.0
 PER_OP_COLLECTIVE_CALL_FACTOR = 2
 BOUNDARY_SYNC_HOP_FACTOR = 2.0
+# Floor guarding division by near-zero efficiency ratios.
+MIN_EFFICIENCY_FLOOR = 1e-3
 
 DOT_FP8 = "fp8"
 DOT_BF16 = "bf16"
@@ -435,6 +437,13 @@ MIN_STEPS_FOR_WARMUP_DROP = 3
 MIN_WARMUP_DROP_STEPS = 2
 DEFAULT_CALIBRATE_LAYERS = 60
 SUBLAYER_BOUNDARIES_PER_LAYER = 2
+# Unfused per-op operator kernel launches per layer across GQA, MLA, and GDN
+# sequence mixers: 3 mixer kernels (input projection, core attention or
+# recurrence kernel, output projection), 2 base FFN kernels (gate_up + down or
+# router + routed_moe), and 2 shared-expert FFN kernels when present.
+PER_OP_MIXER_KERNELS_PER_LAYER = 3
+PER_OP_BASE_FFN_KERNELS_PER_LAYER = 2
+PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER = 2
 MIN_STEP_OPS_FOR_EXPLICIT_NORM = 2
 CONSERVED_GAP_DECIMALS = 10
 QUANTILE_DECIMALS = 4

@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CORE_LIMITS",
     "CoreLimits",
+    "effective_expert_owner_groups",
     "evaluate_support",
     "exceeds_default_buckets",
     "find_declaration",
@@ -129,6 +130,18 @@ def find_declaration(
         if eff_tp == _declared_int(mk, "ranks") and _same_layout(layout, workload):
             return mk
     return None
+
+
+def effective_expert_owner_groups(
+    declaration: Mapping[str, object] | None, workload: WorkloadSpec
+) -> int:
+    """Return disjoint expert owner groups for `declaration` on `workload`.
+
+    A matching megakernel declaration may pack experts into fewer owner groups
+    than `workload.ep`; otherwise each `ep` shard forms its own owner group.
+    """
+    declared = _declared_int(declaration, "expert_owner_groups")
+    return declared if declared > 0 else workload.ep
 
 
 def whole_step_row_limit(
