@@ -176,7 +176,7 @@ def _exchange_call(avals: tuple, rows: tuple, tab_key: bytes):
             scratch_shapes=[pltpu.SemaphoreType.DMA((nb,)), pltpu.SemaphoreType.DMA((nb,))],
         ),
         compiler_params=pltpu.CompilerParams(
-            collective_id=COLLECTIVE_ID, has_side_effects=True
+            collective_id=COLLECTIVE_ID
         ),
         name="qar_exchange-" + "-".join(f"{d}{'x'.join(map(str, s))}" for s, d in avals),
     )
@@ -401,7 +401,7 @@ def _d2d_rs_call(t: int, h: int):
             out_specs=_HBM,
             scratch_shapes=[pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,))],
         ),
-        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
         name=f"qar_d2d_rs-t_{t}-h_{h}",
     )
 
@@ -447,7 +447,7 @@ def _d2d_ag_call(t: int, h: int):
             out_specs=_HBM,
             scratch_shapes=[pltpu.SemaphoreType.DMA((2,))] * 3,
         ),
-        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
         name=f"qar_d2d_ag-t_{t}-h_{h}",
     )
 
@@ -562,7 +562,7 @@ def _d2d_ag_full_call(t: int, h: int):
             scratch_shapes=[pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,))],
         ),
         input_output_aliases={2: 0},
-        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
         name=f"qar_d2d_ag_full-t_{t}-h_{h}",
     )
 
@@ -841,7 +841,7 @@ def _fused_call(t: int, h: int):
                 pltpu.SemaphoreType.DMA((10,)), pltpu.SemaphoreType.DMA((2,)),          # owned AG start + d2d ag
             ],
         ),
-        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
         name=f"qar_fused-t_{t}-h_{h}",
     )
 
