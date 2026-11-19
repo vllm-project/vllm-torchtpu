@@ -312,9 +312,11 @@ def _build_group(self, common_prefix_len, common_attn_metadata, fast_build=False
         if runner.pcp_manager is None
         else runner.pcp_manager.build_metadata(
             runner=runner,
-            block_table_obj=block_table_obj,
+            # As served (#2626): only the non-staged paths bind these; the
+            # model runs without PCP.
+            block_table_obj=block_table_obj,  # pyrefly: ignore[unbound-name]
             target_num_reqs=target_num_reqs,
-            target_num_blocks=target_num_blocks,
+            target_num_blocks=target_num_blocks,  # pyrefly: ignore[unbound-name]
         )
     )
 
