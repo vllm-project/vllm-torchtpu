@@ -20,8 +20,12 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_shared_step,
     pooled_qsa_step,
     pooled_qsa_token_select_step,
+    token_shard_unpermute,
 )
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @functools.cache
@@ -406,6 +410,41 @@ def _qgate_dims(qgate: torch.Tensor) -> tuple[int, int]:
     if qgate.dim() == 3:
         return qgate.shape[1], qgate.shape[0] * qgate.shape[2]
     return qgate.shape[0], qgate.shape[1]
+
+
+@functools.cache
+def _unpermute_op():
+    op = pallas.jax_op("qwen4_exp::token_shard_unpermute", token_shard_unpermute)
+
+    @op.register_fake
+    def fake(gathered, starts, context, size):
+        return torch.empty_like(gathered)
+
+    return op
+
+
+def _token_shard_step_order(gathered, starts, context, world: int):
+    """The all-gathered token-shard blocks in step order.
+
+    Under VLLM_TPU_QSA_INDEXER_BALANCED_SHARD the shards wider than the
+    request slots hold the balanced layout (``token_shard_selection``);
+    narrower ones (decode buckets) keep the contiguous one.
+    """
+    tokens, slots = gathered.shape[0], context.shape[0]
+    if (
+        not envs.VLLM_TPU_QSA_INDEXER_BALANCED_SHARD
+        or tokens % world
+        or tokens // world <= slots
+    ):
+        return gathered
+    logger.info_once(
+        "QSA indexer: rank-balanced token shard active "
+        "(VLLM_TPU_QSA_INDEXER_BALANCED_SHARD, %d tokens, TP %d, %d slots)",
+        tokens,
+        world,
+        slots,
+    )
+    return _unpermute_op()(gathered, starts, context, size=world)
 
 
 def _all_gather_ranks(x: torch.Tensor, group) -> torch.Tensor:
@@ -815,7 +854,12 @@ def build_pooled_qsa_token_shard_op(tp_group):
             args[14],
             args[12],
             pool,
-            _all_gather_ranks(blocks, tp_group).reshape(tokens, -1),
+            _token_shard_step_order(
+                _all_gather_ranks(blocks, tp_group).reshape(tokens, -1),
+                args[11],
+                args[12],
+                world,
+            ),
             kv_heads=kv_heads,
             compress_ratio=kwargs["compress_ratio"],
             token_topk=kwargs["token_topk"],
@@ -1450,7 +1494,12 @@ def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
             args[14],
             args[12],
             pool,
-            _all_gather_ranks(blocks, tp_group).reshape(-1, blocks.shape[-1])[:tokens],
+            _token_shard_step_order(
+                _all_gather_ranks(blocks, tp_group).reshape(-1, blocks.shape[-1])[:tokens],
+                args[11],
+                args[12],
+                world,
+            ),
             dcp_rank,
             kv_heads=kv_heads,
             compress_ratio=kwargs["compress_ratio"],

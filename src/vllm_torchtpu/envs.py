@@ -210,6 +210,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
     VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP: bool = False
     VLLM_TPU_QSA_INDEXER_TOKEN_SHARD: bool = False
+    VLLM_TPU_QSA_INDEXER_BALANCED_SHARD: bool = False
     VLLM_TPU_QSA_DECODE_TOKEN_SHARD: bool = False
     VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD: bool = False
     VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS: int = 256
@@ -1354,6 +1355,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # precedence over VLLM_TPU_QSA_INDEXER_SHARD in that graph.
     "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD": env_bool(
         "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD", default=False
+    ),
+    # With VLLM_TPU_QSA_INDEXER_TOKEN_SHARD or
+    # VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD (main-KV layouts, shards
+    # wider than the request slots): balance the shards instead of giving each
+    # rank a contiguous 1/TP of the rows. The runner orders verify requests
+    # first, so the contiguous shard 0 indexes all of them and every rank
+    # waits for it at the selection all-gather. Each short request goes whole
+    # to one rank (round-robin from the longest context), the other rows fill
+    # the ranks to 1/TP, and the all-gathered selection is put back in step
+    # order (pooled_qsa.balanced_token_shard_plan). Same selection.
+    "VLLM_TPU_QSA_INDEXER_BALANCED_SHARD": env_bool(
+        "VLLM_TPU_QSA_INDEXER_BALANCED_SHARD", default=False
     ),
     # Qwen4-exp pooled QSA with VLLM_TPU_QSA_COMPRESSED_DCP, the replicated
     # (non-SP) backbone, i.e. decode / verify and the small prefill buckets:
