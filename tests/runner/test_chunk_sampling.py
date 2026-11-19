@@ -644,6 +644,115 @@ def test_packed_topk_candidates_never_meet_a_processor() -> None:
     assert events == []
 
 
+def _sample_packed(packed, temperatures, u, top_k, top_p):
+    runner = SimpleNamespace(
+        _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
+    )
+    fn = TPUModelRunner.sample_from_packed_candidates._torchdynamo_orig_callable
+    return fn(runner, packed, temperatures, u, top_k, top_p)
+
+
+def _sample_packed_before_the_tie_rule(packed, temperatures, u, top_k, top_p):
+    """sample_from_packed_candidates as it was before greedy rows took the
+    lowest tied token id: the reference for every other row."""
+    num_cand = packed.shape[-1] // 2
+    cand_logits = packed[:, :num_cand]
+    cand_token_ids = packed[:, num_cand:].to(torch.int64)
+    is_greedy = temperatures <= tpu_runner.SAMPLING_EPS
+    scaled = cand_logits / torch.where(temperatures == 0.0, 1.0, temperatures)
+    masked = tpu_runner.apply_top_k_top_p(
+        scaled, top_k, top_p, max_k=min(32, scaled.shape[-1])
+    )
+    tiny, eps = torch.finfo(u.dtype).tiny, torch.finfo(u.dtype).eps
+    noisy = masked - torch.log(-torch.log(torch.clamp(u, min=tiny, max=1.0 - eps)))
+    final = torch.where(is_greedy, cand_logits, noisy)
+    return torch.gather(cand_token_ids, -1, torch.argmax(final, dim=-1, keepdim=True))
+
+
+def test_packed_candidates_greedy_rows_take_the_lowest_tied_token_id() -> None:
+    # The packed producer lists tied maxima in token-id order; the sampler
+    # keeps the rule for any order, here token 50 before token 7.
+    logits = torch.tensor([[1.0, 3.0, 2.0, 3.0], [1.0, 3.0, 2.0, 3.0]])
+    token_ids = torch.tensor([[9.0, 50.0, 8.0, 7.0], [9.0, 50.0, 8.0, 7.0]])
+    packed = torch.cat([logits, token_ids], dim=-1)
+    temperatures = torch.tensor([[0.0], [0.7]])
+    u = torch.full((2, 4), 0.5)
+    top_k = torch.tensor([[1], [1]], dtype=torch.int32)
+    top_p = torch.ones((2, 1))
+    out = _sample_packed(packed, temperatures, u, top_k, top_p)
+    # The greedy row takes the full vocabulary's first argmax among the tie.
+    assert out[0].tolist() == [7]
+    # The sampled row is unchanged.
+    ref = _sample_packed_before_the_tie_rule(packed, temperatures, u, top_k, top_p)
+    assert out[1].tolist() == ref[1].tolist()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("u_in_graph", [False, True], ids=["u_given", "u_in_graph"])
+@pytest.mark.parametrize("rows", [8, 16, 32])
+def test_compiled_packed_sampler_on_tpu_matches_the_host(rows, u_in_graph) -> None:
+    """The compiled sample_from_packed_candidates gives the host's tokens on
+    TPU at 256 candidates: greedy rows (one with a tie, the higher token id
+    listed first) and top-k 1 sampled rows, whose token depends on neither
+    the noise nor its last bits. `u_in_graph` runs the variant serving
+    compiles, which draws its uniforms in-graph (u=None)."""
+    import torch_tpu  # noqa: F401
+
+    gen = torch.Generator().manual_seed(rows)
+    num_cand = 256
+    logits = torch.randn((rows, num_cand), generator=gen)
+    token_ids = (
+        torch.randperm(248320, generator=gen)[: rows * num_cand]
+        .reshape(rows, num_cand)
+        .to(torch.float32)
+    )
+    logits[0, 3] = logits[0, 9] = logits[0].max() + 1.0
+    token_ids[0, 3], token_ids[0, 9] = 900.0, 12.0
+    packed = torch.cat([logits, token_ids], dim=-1)
+    temperatures = torch.full((rows, 1), 0.7)
+    temperatures[: rows // 2] = 0.0
+    u = torch.rand((rows, num_cand), generator=gen)
+    top_k = torch.ones((rows, 1), dtype=torch.int32)
+    top_p = torch.ones((rows, 1))
+    host = _sample_packed(packed, temperatures, u, top_k, top_p)
+    assert host[0].item() == 12
+    runner = SimpleNamespace(
+        _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
+    )
+    device = torch.device("tpu")
+    out = TPUModelRunner.sample_from_packed_candidates(
+        runner,
+        packed.to(device),
+        temperatures.to(device),
+        None if u_in_graph else u.to(device),
+        top_k.to(device),
+        top_p.to(device),
+    )
+    assert torch.equal(out.cpu(), host)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_packed_candidates_rows_without_a_greedy_tie_sample_as_before(seed) -> None:
+    """Sampled rows, and greedy rows whose maximum is unique, give exactly the
+    token they gave before the tie rule."""
+    gen = torch.Generator().manual_seed(seed)
+    rows, num_cand = 16, 64
+    logits = torch.randn((rows, num_cand), generator=gen)
+    token_ids = torch.randperm(4096, generator=gen)[: rows * num_cand]
+    packed = torch.cat(
+        [logits, token_ids.reshape(rows, num_cand).to(torch.float32)], dim=-1
+    )
+    temperatures = torch.where(torch.rand((rows, 1), generator=gen) < 0.3, 0.0, 0.7).to(
+        torch.float32
+    )
+    u = torch.rand((rows, num_cand), generator=gen)
+    top_k = torch.randint(1, 33, (rows, 1), generator=gen, dtype=torch.int32)
+    top_p = torch.where(torch.rand((rows, 1), generator=gen) < 0.5, 0.95, 1.0)
+    out = _sample_packed(packed, temperatures, u, top_k, top_p)
+    ref = _sample_packed_before_the_tie_rule(packed, temperatures, u, top_k, top_p)
+    assert torch.equal(out, ref)
+
+
 def test_in_graph_draws_seed_the_device_generator_or_refuse(monkeypatch) -> None:
     """The candidate samplers draw in-graph from the TPU default generator;
     every rank seeds it alike, and a missing generator is an error, not a
