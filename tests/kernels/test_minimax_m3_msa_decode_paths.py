@@ -171,3 +171,30 @@ def test_decode_finer_widths_same_bits(fp4):
     got = run(step_widths=(2, 4, 6, 8, 12, 16, 20, 24, 28))
     for a, b in zip(ref, got):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize(
+    "heads,reqs,fp4,one",
+    [(2, 4, True, False), (2, 6, True, True), (1, 4, False, False), (4, 3, True, True)],
+)
+def test_decode_pair_same_bits(monkeypatch, heads, reqs, fp4, one):
+    """Two one-group tiles per body (`_pair_loop`) give the per-tile bits."""
+    q, kv, sel, local, limit, table, sc = _attention_inputs(
+        np.random.default_rng(heads * 100 + reqs), heads, reqs, fp4
+    )
+    if one:
+        monkeypatch.setenv(msa_attention_lse.ONE_CALL_ENV, "1")
+
+    def run():
+        jax.clear_caches()
+        return msa_attention_lse.msa_sparse_attention_lse_heads(
+            q, kv, sel, local, limit, table, sm_scale=D**-0.5, block_q=8,
+            scale_cache=sc, interpret=True, head_major=True,
+        )
+
+    monkeypatch.delenv(msa_attention_lse.DECODE_OPT_ENV, raising=False)
+    ref = run()
+    monkeypatch.setenv(msa_attention_lse.DECODE_OPT_ENV, "pair")
+    got = run()
+    for a, b in zip(ref, got):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))

@@ -23,6 +23,7 @@ import functools
 import logging
 import math
 import os
+import types
 
 import jax
 import jax.numpy as jnp
@@ -400,6 +401,7 @@ def _kernel(
     row_split: int = 1,
     tiles_per_head: int = 0,
     precision: frozenset = frozenset(),
+    pair: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -464,6 +466,7 @@ def _kernel(
 
     def group(
         w,
+        mode="full",
         q_ref=q_ref,
         o_ref=o_ref,
         lse_ref=lse_ref,
@@ -610,7 +613,8 @@ def _kernel(
                 n *= 2
 
         if not cached:
-            stream()
+            if mode == "full":  # `pair` kernels copy and wait outside
+                stream()
 
             def group_page(g):
                 """Key, page ref and scale page ref of the group's slot `g`."""
@@ -914,40 +918,182 @@ def _kernel(
         # groups are 16, 32 or 64 pages by call). A step costs per score column,
         # filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin standalone
         # j-952e8a64), plus ~0.7 us whatever its width (j-aec3278d).
-        single = first & last
-        widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
-        for i, width in enumerate(widths):
-            fits = count > (widths[i - 1] if i else 0)
-            if width < pages_per_step:
-                fits = fits & (count <= width)
-            body = attend_t if transposed else attend
-            if bf16_cache:  # the cache in use reads bf16 pages, a streaming call unpacks
-                for from_bf16, when in ((True, use_cache), (False, jnp.logical_not(use_cache))):
-                    pl.when(fits & single & when)(
-                        functools.partial(attend, width, True, from_bf16)
-                    )
-                    pl.when(fits & jnp.logical_not(single) & when)(
-                        functools.partial(attend, width, False, from_bf16)
-                    )
-                continue
-            pl.when(fits & single)(functools.partial(body, width, True))
-            pl.when(fits & jnp.logical_not(single))(
-                functools.partial(body, width, False)
-            )
+        def run_widths(count=count, first=first, last=last):
+            single = first & last
+            widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
+            for i, width in enumerate(widths):
+                fits = count > (widths[i - 1] if i else 0)
+                if width < pages_per_step:
+                    fits = fits & (count <= width)
+                body = attend_t if transposed else attend
+                if bf16_cache:  # the cache in use reads bf16 pages, a streaming call unpacks
+                    for from_bf16, when in ((True, use_cache), (False, jnp.logical_not(use_cache))):
+                        pl.when(fits & single & when)(
+                            functools.partial(attend, width, True, from_bf16)
+                        )
+                        pl.when(fits & jnp.logical_not(single) & when)(
+                            functools.partial(attend, width, False, from_bf16)
+                        )
+                    continue
+                pl.when(fits & single)(functools.partial(body, width, True))
+                pl.when(fits & jnp.logical_not(single))(
+                    functools.partial(body, width, False)
+                )
 
-        @pl.when(count == 0)
-        def _empty():  # a tile of padding tokens: its only group holds no page
+        def empty():  # a tile of padding tokens: its only group holds no page
             write(
                 jnp.zeros((num_heads * block_q, head_dim), jnp.float32),
                 jnp.full((num_heads * block_q, 1), -jnp.inf, jnp.float32),
             )
+
+        if mode != "full":
+            return types.SimpleNamespace(
+                attend=attend, count=count, single=first & last,
+                run_widths=run_widths, empty=empty,
+            )
+        run_widths()
+        pl.when(count == 0)(empty)
 
     def loop(w, carry):
         group(w)
         return carry
 
     b = pl.program_id(0)
-    jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+    if not pair:
+        jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+        return
+    _pair_loop(
+        group, b, block_start_ref, num_groups, tiles_per_step, work_page_ref,
+        work_meta_ref, work_count_ref, page_table_ref, kv_hbm_ref, buf_ref, sem_ref,
+        scale_hbm_ref, scale_buf_ref, scale_sem_ref, pages_per_step, step_widths,
+        group_head,
+    )
+
+
+def _pair_loop(
+    group, b, block_start_ref, num_groups, tiles_per_step, work_page_ref,
+    work_meta_ref, work_count_ref, page_table_ref, kv_hbm_ref, buf_ref, sem_ref,
+    scale_hbm_ref, scale_buf_ref, scale_sem_ref, pages_per_step, step_widths,
+    group_head,
+):
+    """`_kernel`'s group loop with `pair` (decode, streamed pages): a grid
+    step whose tiles hold one group each runs them two at a time, both
+    tiles' softmax in one straight-line body at the wider tile's step width,
+    so their dependency chains (MXU push / pop, reductions, exp) interleave
+    instead of running back to back (one 8-token tile's body is latency
+    bound, ~2.5 ops per bundle). Other steps run their groups one by one.
+    Pages stream through a ring of 4 group slots, group ``g`` in slot
+    ``g % 4``: before the groups ``[w, w + n)`` run, groups ``w + 2 ..
+    w + n + 1`` start (2 groups in flight ahead of the running ones)."""
+    ring = sem_ref.shape[0]
+    row_width = buf_ref.shape[-1]
+    fp4 = scale_hbm_ref is not None
+
+    def copies(slot, sem_slot, page, kv_head, n=1, g=0):
+        src = kv_hbm_ref.at[pl.ds(page, n), :, :, pl.ds(kv_head * row_width, row_width)]
+        out = [
+            pltpu.make_async_copy(
+                src, buf_ref.at[slot, pl.ds(g, n), 0], sem_ref.at[sem_slot, 0]
+            )
+        ]
+        if fp4:
+            out.append(
+                pltpu.make_async_copy(
+                    scale_hbm_ref.at[pl.ds(page, n)],
+                    scale_buf_ref.at[slot, pl.ds(g, n), 0],
+                    scale_sem_ref.at[sem_slot, 0],
+                )
+            )
+        return out
+
+    def start(group_id):
+        slot = group_id % ring
+        base = msa_attention._slot(work_meta_ref[group_id], pages_per_step, 0)
+        kv_head = group_head(group_id)
+
+        def one(g, queue=0):
+            page = page_table_ref[work_page_ref[base + g]]
+            for copy in copies(slot, slot, page, kv_head, g=g):
+                copy.start(priority=queue)
+
+        count = work_count_ref[group_id]
+
+        def start4(i, carry):
+            for j in range(_START_UNROLL):
+                one(_START_UNROLL * i + j, j % 2)
+            return carry
+
+        jax.lax.fori_loop(0, count // _START_UNROLL, start4, 0)
+
+        def start1(g, carry):
+            one(g)
+            return carry
+
+        jax.lax.fori_loop(count - count % _START_UNROLL, count, start1, 0)
+
+    def start_if(group_id):
+        pl.when(group_id < num_groups)(functools.partial(start, group_id))
+
+    def wait(group_id):
+        slot = group_id % ring
+        count = work_count_ref[group_id]
+        n = 1
+        while n <= pages_per_step:
+            for copy in copies(slot, slot, 0, 0, n):
+                pl.when((count & n) != 0)(copy.wait)
+            n *= 2
+
+    lo, hi = block_start_ref[b], block_start_ref[b + 1]
+
+    @pl.when(lo == 0)
+    def _first():
+        start_if(0)
+        start_if(1)
+
+    def one_by_one(w, carry):
+        start_if(w + 2)
+        wait(w)
+        g = group(w, mode="setup")
+        g.run_widths()
+        pl.when(g.count == 0)(g.empty)
+        return carry
+
+    widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
+
+    def two_at_a_time(i, carry):
+        w = lo + 2 * i
+        start_if(w + 2)
+        start_if(w + 3)
+        wait(w)
+        wait(w + 1)
+        ga, gb = group(w, mode="setup"), group(w + 1, mode="setup")
+        count = jnp.maximum(ga.count, gb.count)
+        for k, width in enumerate(widths):
+            fits = count > (widths[k - 1] if k else 0)
+            if width < pages_per_step:
+                fits = fits & (count <= width)
+
+            def both(width=width):
+                ga.attend(width, True)
+                gb.attend(width, True)
+
+            pl.when(fits)(both)
+
+        @pl.when(count == 0)
+        def _empty():
+            ga.empty()
+            gb.empty()
+
+        return carry
+
+    paired = (hi - lo == tiles_per_step) & (tiles_per_step % 2 == 0)
+    @pl.when(paired)
+    def _pairs():
+        jax.lax.fori_loop(0, tiles_per_step // 2, two_at_a_time, 0)
+
+    @pl.when(jnp.logical_not(paired))
+    def _singles():
+        jax.lax.fori_loop(lo, hi, one_by_one, 0)
 
 
 def _merged_store_rows(block_q: int, num_heads: int, dtype) -> int:
@@ -1001,6 +1147,7 @@ def _attention_call(
     row_split=1,
     tiles_per_head=0,
     precision=frozenset(),
+    pair=False,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -1079,6 +1226,10 @@ def _attention_call(
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
     ring = 1 + (_FP4_PREFETCH if fp4 else 1)
+    # `pair` (decode, streamed): two running groups + two in flight.
+    pair = bool(pair) and not cache_size and not transposed and row_split == 1
+    if pair:
+        ring = 4
     # Page buffers: a ring of groups, or (page cache) one flat array of
     # max(cache_size, ring groups) pages; the cache's semaphore row follows.
     if cache_size:
@@ -1161,6 +1312,7 @@ def _attention_call(
             row_split=row_split,
             tiles_per_head=tiles_per_head,
             precision=precision if fp4 else frozenset(),
+            pair=pair,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1473,7 +1625,9 @@ def decode_opt() -> dict:
     """`TPU_MINIMAX_M3_MSA_DECODE_OPT` (read when the program is traced) for
     decode batches of 8-token tiles with wide groups (`msa_dcp`, more than
     128 tokens), comma-separated: ``widths=<w/w/...>`` the step widths below
-    the full group; ``pps=<n>`` pages per group. Empty = off (the defaults)."""
+    the full group; ``pps=<n>`` pages per group; ``pair``: every decode call
+    (`_chunked_call`, any batch) runs its one-group tiles two at a time
+    (`_pair_loop`). Empty = off (the defaults)."""
     spec = os.environ.get(DECODE_OPT_ENV, "").strip()
     opt = {}
     for item in filter(None, (x.strip() for x in spec.split(","))):
@@ -1482,11 +1636,19 @@ def decode_opt() -> dict:
             opt["step_widths"] = tuple(sorted(int(w) for w in val.split("/")))
         elif key == "pps" and val.isdigit() and int(val) >= 4:
             opt["pages_per_step"] = int(val)
+        elif key == "pair" and not val:
+            opt["pair"] = True
         else:
             raise ValueError(f"{DECODE_OPT_ENV}: unknown item {item!r} in {spec!r}")
     if opt:
         _proof(DECODE_OPT_ENV, f"MSA decode tiles run {opt}")
     return opt
+
+
+def decode_pair() -> bool:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` holds ``pair``."""
+    spec = os.environ.get(DECODE_OPT_ENV, "")
+    return "pair" in (x.strip() for x in spec.split(","))
 
 
 # 4-bit prefill calls with a page cache pick their tiles per call from the
@@ -1628,6 +1790,9 @@ def _chunked_call(
     align = _merged_store_rows(block_q, num_q_heads // num_heads, q.dtype)
     tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
     decode = num_chunks == 1 and num_tokens <= _DECODE_MAX_TOKENS and not cache_size
+    if decode and decode_pair():
+        _proof(DECODE_OPT_ENV, "MSA decode tiles run two at a time (pair)")
+        call = functools.partial(call, pair=True)
     if decode and num_heads > 1 and _env_flag(ONE_CALL_ENV):
         _proof(ONE_CALL_ENV, f"{num_heads} KV heads in one MSA decode call")
         return _one_call_heads(
