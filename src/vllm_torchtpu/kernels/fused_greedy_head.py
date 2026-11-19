@@ -11,8 +11,8 @@ from vllm_torchtpu.utils import get_device_name
 
 # Vocab tile per [vocab, K] weight, qualified on v7 with full-K reuse and
 # compact partials. The tile sets how the weight streams; the hidden rows only
-# sit beside it in VMEM, so every row count up to MAX_ROWS that fills whole
-# BF16 sublane tiles (16 rows) shares it. Other shapes fall back.
+# sit beside it in VMEM, so every row count up to MAX_ROWS shares it. Rows pad
+# to whole BF16 sublane tiles (16 rows): 72 decode rows on v7x-16 run as 80.
 TUNED_TILES = {(5120, 129280): 1280}
 MAX_ROWS = 288
 
@@ -23,11 +23,14 @@ _COL_MASK = 0xFFFF
 _NAN_KEY = 0x7FFF0000  # above the key of +inf (0x7F800000): NaN wins
 
 
+def _padded(rows: int) -> int:
+    return -(-rows // 16) * 16
+
+
 def is_supported_shape(rows: int, weight_shape: tuple[int, ...]) -> bool:
     return (
         len(weight_shape) == 2
-        and 0 < rows <= MAX_ROWS
-        and rows % 16 == 0
+        and 0 < _padded(rows) <= MAX_ROWS
         and (weight_shape[1], weight_shape[0]) in TUNED_TILES
         and get_device_name() == "TPU v7"
     )
@@ -83,7 +86,9 @@ def fused_greedy_head(hidden: jax.Array, weight: jax.Array) -> jax.Array:
     which step 1 discards by forcing its take. Step ``tiles`` reuses the last
     weight block (no DMA) and its dot is discarded.
     """
-    rows, width = hidden.shape
+    real_rows, width = hidden.shape
+    rows = _padded(real_rows)
+    hidden = jnp.pad(hidden, ((0, rows - real_rows), (0, 0)))
     vocab, weight_width = weight.shape
     assert hidden.dtype == weight.dtype == jnp.bfloat16
     assert width == weight_width
@@ -122,4 +127,4 @@ def fused_greedy_head(hidden: jax.Array, weight: jax.Array) -> jax.Array:
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
         name=f"fused_greedy_head_m{rows}_n{tile}",
     )(hidden, weight)
-    return ids[0]
+    return ids[0, :real_rows]

@@ -93,7 +93,7 @@ def test_auto_greedy_head_falls_back_and_forced_mode_rejects(monkeypatch, unsupp
     elif unsupported == "method":
         runner.speculative_config.method = "eagle"
     elif unsupported == "rows":
-        runner.max_num_reqs = 1
+        runner.max_num_reqs = 49  # 294 rows pad past MAX_ROWS
     monkeypatch.setattr(envs, "TPU_GREEDY_HEAD_BACKEND", "auto")
     TPUModelRunner._init_fused_greedy_head(runner)
     assert runner._fused_greedy_head is None
@@ -123,10 +123,13 @@ def test_greedy_head_request_dispatch(monkeypatch, fallback):
     assert enabled is (fallback is None)
 
 
-def test_fused_greedy_head_cpu_reference(device, monkeypatch):
-    """Check full-vocabulary CPU64 rounding, including a cross-tile tie."""
+@pytest.mark.parametrize("max_num_reqs", [48, 12])
+def test_fused_greedy_head_cpu_reference(device, monkeypatch, max_num_reqs):
+    """Check full-vocabulary CPU64 rounding, including a cross-tile tie; 72
+    rows (v7x-16 decode) run padded to 80."""
     generator = torch.Generator().manual_seed(9126)
-    hidden = torch.randn(288, 5120, generator=generator).to(torch.bfloat16)
+    rows = max_num_reqs * 6
+    hidden = torch.randn(rows, 5120, generator=generator).to(torch.bfloat16)
     weight = torch.randn(129280, 5120, generator=generator).to(torch.bfloat16)
     # A deliberately dominant identical pair straddles the tile boundary.
     hidden[0].zero_()
@@ -143,9 +146,11 @@ def test_fused_greedy_head_cpu_reference(device, monkeypatch):
         envs.environment_variables["TPU_GREEDY_HEAD_BACKEND"](),
     )
     runner = _runner(device_weight)
+    runner.max_num_reqs = max_num_reqs
     TPUModelRunner._init_fused_greedy_head(runner)
     head = runner._fused_greedy_head
     assert isinstance(head, FusedGreedyHead)
+    assert head.rows == rows
     assert head.weight is runner.model.lm_head.weight
     compiled = torch.compile(head, backend="tpu", fullgraph=True, dynamic=False)
     actual = compiled(hidden.to(device)).cpu()
