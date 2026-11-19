@@ -189,7 +189,7 @@ def test_builder_gives_a_draft_its_own_full_precision_op(
 ):
     target, draft = _batched_impl(), _batched_impl()
     target.attention_modes = draft.attention_modes = PVS
-    draft.native_fp8_draft = True
+    draft.is_attention_draft = True
     with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
         t_op = target._build_rpa_kernel(None, None, None)
         d_op = draft._build_rpa_kernel(None, None, None)
@@ -209,7 +209,7 @@ def test_builder_unchanged_with_the_modes_off(
     monkeypatch, registered, cpu_vllm_config_context
 ):
     target, draft = _batched_impl(), _batched_impl()
-    draft.native_fp8_draft = True
+    draft.is_attention_draft = True
     with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
         t_op = target._build_rpa_kernel(None, None, None)
         d_op = draft._build_rpa_kernel(None, None, None)
@@ -279,7 +279,7 @@ def _impl(cls, modes, draft, entry):
         kv_cache_dtype="bfloat16",
     )
     impl.attention_modes = modes
-    impl.native_fp8_draft = draft
+    impl.is_attention_draft = draft
     if entry is not None:
         # As the runner does for a tp=1 speculative draft.
         impl._kernel_entry = entry
@@ -409,11 +409,11 @@ def test_runner_marks_draft_layers_before_initialize_kernel():
     for name in ("model.layers.3.self_attn.attn", "mtp.layers.0.self_attn.attn"):
         impl = MagicMock(spec=PallasAttentionBackendImpl)
         impl.decode_query_size = 4
-        impl.native_fp8_draft = False
+        impl.is_attention_draft = False
         impl.attention_modes = PVS
 
         def record(_layer, impl=impl, name=name):
-            seen[name] = impl.native_fp8_draft
+            seen[name] = impl.is_attention_draft
 
         impl.initialize_kernel.side_effect = record
         layers[name] = SimpleNamespace(impl=impl)

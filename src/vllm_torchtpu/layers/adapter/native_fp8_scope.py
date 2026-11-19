@@ -25,7 +25,7 @@ A draft model must run at the precision it ships with, so its attention keeps
 the full-precision path whatever the target uses.
 
 The runner marks each draft attention layer's impl
-(``PallasAttentionBackendImpl.native_fp8_draft = True``) before it builds that
+(``PallasAttentionBackendImpl.is_attention_draft = True``) before it builds that
 layer's kernels. The kernel builders pass a layer's modes to the batched and
 DCP kernel entries only when the layer is not a draft. The modes are part of
 every kernel registry key, so a draft layer never shares a target layer's op.
