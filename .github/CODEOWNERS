@@ -236,5 +236,5 @@
 /tests/e2e/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
 
 # Serving Roofline Planner
-/src/vllm_torchtpu/roofline/ @brianseung-google @bigeye @guowei-dev @benliangw
-/tests/roofline/ @brianseung-google @bigeye @guowei-dev @benliangw
+/src/vllm_torchtpu/roofline/ @brianseung-google @annyan09023 @bigeye @guowei-dev @benliangw
+/tests/roofline/ @brianseung-google @annyan09023 @bigeye @guowei-dev @benliangw
