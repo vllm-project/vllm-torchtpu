@@ -868,6 +868,7 @@ class TestDeferredNoForwardOutput:
         worker = object.__new__(TPUWorker)
         worker._dummy_batch_cv = __import__("threading").Condition()
         worker._dummy_batch_count = 0
+        worker._stage3_late_poller_list = None
         return worker
 
     def test_polls_after_the_dummy_batch(self):
@@ -929,7 +930,9 @@ class TestStage3LatePollers:
     def _worker():
         from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
-        return object.__new__(TPUWorker)
+        worker = object.__new__(TPUWorker)
+        worker._stage3_late_poller_list = None
+        return worker
 
     def test_pollers_follow_the_connector_option(self, monkeypatch):
         import vllm_torchtpu.worker.tpu_worker as tpu_worker_mod
@@ -980,6 +983,114 @@ class TestStage3LatePollers:
         worker = self._worker()
         worker.model_runner = SimpleNamespace(sample_tokens=lambda g: out)
         assert worker.sample_tokens(None) is out
+
+
+class TestLatePollWorkerGates:
+    """TPUWorker wraps a step's output for the late poll only where it
+    applies: sample_tokens with the option on, execute_model for a
+    zero-token step of an async DP engine, and execute_dummy_batch counts
+    the dummy batches the deferred output waits for."""
+
+    @staticmethod
+    def _worker(pollers):
+        import threading
+
+        worker = object.__new__(TPUWorker)
+        worker._stage3_late_poller_list = pollers
+        worker._dummy_batch_cv = threading.Condition()
+        worker._dummy_batch_count = 0
+        worker.scheduler_config = SimpleNamespace(async_scheduling=True)
+        worker.parallel_config = SimpleNamespace(data_parallel_size=2)
+        return worker
+
+    def test_sample_tokens_adds_the_late_loads_with_the_option(self):
+        from vllm.v1.outputs import AsyncModelRunnerOutput
+
+        from vllm_torchtpu.worker.tpu_worker import _LatePollModelRunnerOutput
+
+        class _Out(AsyncModelRunnerOutput):
+            def get_output(self):
+                return SimpleNamespace(kv_connector_output=None)
+
+            def get_kv_connector_output(self):
+                return None
+
+        worker = self._worker([lambda: {"r1"}])
+        worker.model_runner = SimpleNamespace(sample_tokens=lambda g: _Out())
+        wrapped = worker.sample_tokens(None)
+        assert isinstance(wrapped, _LatePollModelRunnerOutput)
+        assert wrapped.get_output().kv_connector_output.finished_recving == {"r1"}
+
+    @pytest.mark.parametrize(
+        ("tokens", "async_scheduling", "dp", "pollers", "deferred"),
+        [
+            (0, True, 2, [set], True),
+            (8, True, 2, [set], False),
+            (0, False, 2, [set], False),
+            (0, True, 1, [set], False),
+            (0, True, 2, [], False),
+        ],
+        ids=["zero-token-dp", "tokens", "sync", "dp1", "no-option"],
+    )
+    def test_execute_model_defers_only_a_zero_token_async_dp_step(
+        self, tokens, async_scheduling, dp, pollers, deferred
+    ):
+        from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
+
+        output = SimpleNamespace(kv_connector_output=None)
+        worker = self._worker(pollers)
+        worker.scheduler_config.async_scheduling = async_scheduling
+        worker.parallel_config.data_parallel_size = dp
+        worker._dummy_batch_count = 3
+        worker.model_runner = SimpleNamespace(execute_model=lambda so: output)
+        result = worker.execute_model(
+            SimpleNamespace(total_num_scheduled_tokens=tokens)
+        )
+        if deferred:
+            assert isinstance(result, _DeferredNoForwardOutput)
+            assert result._generation == 3
+        else:
+            assert result is output
+
+    @pytest.mark.parametrize("bucket", [None, 8])
+    def test_execute_dummy_batch_counts_the_dummy_batch(self, bucket):
+        calls = []
+        worker = self._worker([])
+        worker.model_runner = SimpleNamespace(
+            _dp_coordinated_step=lambda tokens, chunks: (bucket, 2),
+            num_tokens_paddings=[16],
+            num_reqs_max_model_len=4,
+            max_num_blocks_per_req=32,
+            _dummy_run=lambda *a, **k: calls.append("dummy_run"),
+            _run_dp_idle_pairing=lambda b, n: calls.append("idle_pairing"),
+        )
+        worker.execute_dummy_batch()
+        assert calls == (["dummy_run"] if bucket is None else ["idle_pairing"])
+        assert worker._dummy_batch_count == 1
+
+    def test_a_zero_token_step_polls_after_the_dummy_batch_that_follows(self):
+        import threading
+
+        seen_count: list[int] = []
+
+        def poll():
+            seen_count.append(worker._dummy_batch_count)
+            return {"r1"}
+
+        worker = self._worker([poll])
+        worker.model_runner = SimpleNamespace(
+            execute_model=lambda so: SimpleNamespace(kv_connector_output=None),
+            _dp_coordinated_step=lambda tokens, chunks: (8, 2),
+            _run_dp_idle_pairing=lambda b, n: None,
+        )
+        deferred = worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=0))
+        deferred.timeout_s = 5.0
+        timer = threading.Timer(0.05, worker.execute_dummy_batch)
+        timer.start()
+        output = deferred.get_output()
+        timer.join()
+        assert seen_count == [1]
+        assert output.kv_connector_output.finished_recving == {"r1"}
 
 
 class TestLatePollSalvage:
