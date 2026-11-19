@@ -323,6 +323,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    # Bind the DSpark Markov chain and draft K/V write Pallas ops (input
+    # specs, meshes, operand layouts) around bodies hashed under kernels/.
+    "vllm_torchtpu/distributed/pallas_markov_argmax.py",
+    "vllm_torchtpu/layers/adapter/cp_draft_attention.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/sample/top_p_sample.py",
