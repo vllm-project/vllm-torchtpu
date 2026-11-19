@@ -523,13 +523,241 @@ def inner_kernel(
     m_start_local = m_start - m_offset
     m_end_local = m_end - m_offset
 
-    def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
+    chunk_mode = _k1_body_mode(cfgs)
+    pipe_buckets = _pipe_buckets_env()
+
+    def _pipe_bucket(bucket_m):
+        # TPU_GMM_V2_K1_PIPE_BUCKETS: only these buckets take the chunk mode
+        # (the others keep the fully unrolled body); unset = all buckets.
+        if chunk_mode is not None and chunk_mode.startswith("pipe"):
+            # The pipelined loop walks MXU column chunks in pairs.
+            mxu_size = pltpu.get_tpu_info().mxu_column_size
+            rhs_n = cfgs.tiles.tile_n * (2 if cfgs.fuse_act is not None else 1)
+            if rhs_n % (2 * mxu_size) != 0:
+                return False
+        return pipe_buckets is None or bucket_m in pipe_buckets
+
+    if chunk_mode is None or not (
+        chunk_mode in ("roll", "chunk") or chunk_mode.startswith("pipe")
+    ):
+        chunk_mode = None
+
+    def _dequant_rhs_before():
+        tiled_rhs = tiled_rhs_ref.get_weight()
+        rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+        tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
+            cfgs.lhs_cfgs.dtype
+        )
+        num_blocks = cfgs.num_quant_blocks_per_tile_k
+        tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
+            num_blocks, rhs_qbs, tiled_rhs.shape[1]
+        )
+        tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
+        return tiled_rhs_dequant.reshape(cfgs.tiles.tile_k, tiled_rhs.shape[1])
+
+    def _chunk_rhs(start, width):
+        # Dequantized rhs columns [start, start + width) of one weight ref.
+        def deq(ref, off, w):
+            qbs = cfgs.rhs_cfgs.quant_block_size
+            nb = cfgs.num_quant_blocks_per_tile_k
+            wt = ref.weight[:, pl.ds(off, w)].astype(cfgs.lhs_cfgs.dtype)
+            sc = ref.scale[:, :, pl.ds(off, w)].astype(cfgs.lhs_cfgs.dtype)
+            sc = jnp.broadcast_to(sc, (nb, qbs, w))
+            return (wt.reshape(nb, qbs, w) * sc).reshape(cfgs.tiles.tile_k, w)
+
+        if isinstance(tiled_rhs_ref, FusedWeightsRef):
+            # interleave_lane layout: chunk = gate lanes ++ up lanes.
+            half = width // 2
+            off = start // 2
+            if not isinstance(off, int):
+                off = pl.multiple_of(off, half)
+            return jnp.concatenate(
+                [deq(tiled_rhs_ref.gate, off, half), deq(tiled_rhs_ref.up, off, half)],
+                axis=-1,
+            )
+        return deq(tiled_rhs_ref, start, width)
+
+    def _chunked_matmul(tiled_lhs, bucket_m, rolled):
+        mxu_size = pltpu.get_tpu_info().mxu_column_size
+        rhs_tile_n = cfgs.tiles.tile_n * (2 if cfgs.fuse_act is not None else 1)
+        assert rhs_tile_n % mxu_size == 0, (rhs_tile_n, mxu_size)
+
+        def one(start):
+            rhs = _chunk_rhs(start, mxu_size)
+            block_acc = jnp.matmul(
+                tiled_lhs, rhs, preferred_element_type=jnp.float32
+            ).astype(acc_ref.dtype)
+            return jnp.zeros((bucket_m, mxu_size), acc_ref.dtype) + block_acc
+
+        num_chunks = rhs_tile_n // mxu_size
+        if not rolled:
+            return jnp.concatenate(
+                [one(j * mxu_size) for j in range(num_chunks)], axis=1
+            )
+
+        def body(j, carry):
+            start = pl.multiple_of(j * mxu_size, mxu_size)
+            acc_ref[:bucket_m, pl.ds(start, mxu_size)] = one(start)  # noqa: B023
+            return carry
+
+        lax.fori_loop(0, num_chunks, body, 0)
+        return acc_ref[:bucket_m]
+
+    def _pipe_matmul(
+        bucket_m, unroll, chunk_epilogue, compact, iters=False, deferred=False
+    ):
+        # Software-pipelined rolled loop over MXU column chunks: chunk j+1 is
+        # dequantized into one VMEM buffer while chunk j's matmul reads the
+        # other, so the VPU dequant overlaps the MXU inside each iteration and
+        # the body holds 4 chunk dequants + 4 matmuls instead of all of them.
+        # Same per-chunk operands and matmul as "chunk" mode.
+        mxu_size = pltpu.get_tpu_info().mxu_column_size
+        rhs_tile_n = cfgs.tiles.tile_n * (2 if cfgs.fuse_act is not None else 1)
+        num_chunks = rhs_tile_n // mxu_size
+        assert num_chunks >= 2 and num_chunks % 2 == 0, (rhs_tile_n, mxu_size)
+        tile_k = cfgs.tiles.tile_k
+
+        def cols(j):
+            if isinstance(j, int):
+                return pl.ds(j * mxu_size, mxu_size)
+            return pl.ds(pl.multiple_of(j * mxu_size, mxu_size), mxu_size)
+
+        def deq(j, buf):
+            start = cols(j).start
+            buf[...] = _chunk_rhs(start, mxu_size)
+
+        # Per-chunk epilogue (no bias): an MXU chunk holds whole gate/up lane
+        # pairs, so the activation, row mask and output store run per chunk
+        # inside the loop instead of once over the whole tile after it.
+        out_w = mxu_size // 2 if cfgs.fuse_act is not None else mxu_size
+        tiled_out_2d_ref = tiled_out_ref.reshape(-1, cfgs.tiles.tile_n)
+
+        def out_cols(j):
+            if isinstance(j, int):
+                return pl.ds(j * out_w, out_w)
+            return pl.ds(pl.multiple_of(j * out_w, out_w), out_w)
+
+        def mm(j, buf):
+            lhs = tiled_lhs_ref.reshape(-1, tile_k)[:bucket_m]
+            block_acc = jnp.matmul(
+                lhs, buf[...], preferred_element_type=jnp.float32
+            ).astype(acc_ref.dtype)
+            acc = jnp.zeros((bucket_m, mxu_size), acc_ref.dtype) + block_acc
+            if not chunk_epilogue:
+                acc_ref[:bucket_m, cols(j)] = acc
+                return
+            acc = apply_act_fn(acc, cfgs.fuse_act)
+            iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+            mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+            tiled_out_2d_ref[:bucket_m, out_cols(j)] = jnp.where(mask, acc, 0).astype(
+                tiled_out_ref.dtype
+            )
+
+        def mm_raw(j, buf, raw, slot):
+            lhs = tiled_lhs_ref.reshape(-1, tile_k)[:bucket_m]
+            block_acc = jnp.matmul(
+                lhs, buf[...], preferred_element_type=jnp.float32
+            ).astype(acc_ref.dtype)
+            raw[:, slot * mxu_size : (slot + 1) * mxu_size] = (
+                jnp.zeros((bucket_m, mxu_size), acc_ref.dtype) + block_acc
+            )
+
+        def epi(j, raw, slot):
+            acc = raw[:, slot * mxu_size : (slot + 1) * mxu_size]
+            acc = apply_act_fn(acc, cfgs.fuse_act)
+            iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+            mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+            tiled_out_2d_ref[:bucket_m, out_cols(j)] = jnp.where(mask, acc, 0).astype(
+                tiled_out_ref.dtype
+            )
+
+        def scoped_deferred(buf_a, buf_b, raw):
+            # The epilogue of pair p-1 runs in iteration p, beside pair p's
+            # matmuls, so the iteration does not end on a serial act + store.
+            # Iteration 0 runs it on zeros into chunk 0, overwritten later.
+            raw[...] = jnp.zeros(raw.shape, raw.dtype)
+            deq(0, buf_a)
+
+            def pair(p, carry):
+                j = 2 * p
+                deq(j + 1, buf_b)
+                epi(jnp.maximum(j - 2, 0), raw, 0)
+                mm_raw(j, buf_a, raw, 0)
+                deq(jnp.minimum(j + 2, num_chunks - 1), buf_a)
+                epi(jnp.maximum(j - 1, 0), raw, 1)
+                mm_raw(j + 1, buf_b, raw, 1)
+                return carry
+
+            num_pairs = num_chunks // 2
+            unroll_n = -(-num_pairs // unroll) if iters else unroll
+            lax.fori_loop(0, num_pairs, pair, 0, unroll=min(unroll_n, num_pairs))
+            epi(num_chunks - 2, raw, 0)
+            epi(num_chunks - 1, raw, 1)
+
+        def scoped(buf_a, buf_b):
+            deq(0, buf_a)
+
+            def pair(p, carry):
+                j = 2 * p
+                deq(j + 1, buf_b)
+                mm(j, buf_a)
+                if compact:
+                    # The last pair dequantizes chunk n-1 a second time
+                    # (unused) instead of carrying a separate tail.
+                    deq(jnp.minimum(j + 2, num_chunks - 1), buf_a)
+                else:
+                    deq(j + 2, buf_a)
+                mm(j + 1, buf_b)
+                return carry
+
+            num_pairs = num_chunks // 2 - (0 if compact else 1)
+            if iters:
+                # unroll = pairs per iteration for a target iteration count.
+                unroll_n = -(-num_pairs // unroll) if num_pairs else 1
+            else:
+                unroll_n = unroll
+            if num_pairs > 0:
+                lax.fori_loop(
+                    0, num_pairs, pair, 0, unroll=min(unroll_n, num_pairs)
+                )
+            if not compact:
+                deq(num_chunks - 1, buf_b)
+                mm(num_chunks - 2, buf_a)
+                mm(num_chunks - 1, buf_b)
+
+        buf = pltpu.VMEM((tile_k, mxu_size), cfgs.lhs_cfgs.dtype)
+        if deferred and chunk_epilogue:
+            raw = pltpu.VMEM((bucket_m, 2 * mxu_size), acc_ref.dtype)
+            pl.run_scoped(scoped_deferred, buf, buf, raw)
+        else:
+            pl.run_scoped(scoped, buf, buf)
+        if not chunk_epilogue:
+            return acc_ref[:bucket_m]
+        # Same tail as the whole-tile epilogue below.
+        partial_out_zeros = jnp.zeros_like(partial_out_ref)
+        tiled_out_ref[0] += jnp.where(
+            gm_id == 0, partial_out_zeros, partial_out_ref[...]
+        )
+        last_row = m_end_local // cfgs.dims.size_lhs_sublane
+        partial_out_ref[...] = jnp.where(
+            m_end_local % cfgs.dims.size_lhs_sublane == 0,
+            partial_out_zeros,
+            tiled_out_ref[last_row],
+        )
+        return None
+
+    def _matmul(
+        is_first_k_step: bool,
+        is_last_k_step: bool,
+        bucket_m: int,
+        rhs_pre: jax.Array | None = None,
+    ):
         tpu_info = pltpu.get_tpu_info()
         mxu_size = tpu_info.mxu_column_size
 
         # Step 1: Input pre-processing.
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
-        tiled_rhs = tiled_rhs_ref.get_weight()
+        tiled_rhs = tiled_rhs_ref.get_weight() if rhs_pre is None else rhs_pre
 
         # This should only be taken in the case where we don't requantize
         # the scales and thus we need to dequantize inside VMEM to avoid small
@@ -538,7 +766,10 @@ def inner_kernel(
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         dequant_after = cfgs.rhs_cfgs.should_dequantize_after_matmul
         fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
-        if fp8_rhs is not None:
+        if rhs_pre is not None:
+            # Already dequantized once for every bucket (k1 body "hoist").
+            rhs_qbs = cfgs.tiles.tile_k
+        elif fp8_rhs is not None:
             # Skinny m: the MXU weight push binds, and fp8 halves it.
             tiled_rhs = tiled_rhs.astype(fp8_rhs)
             dequant_after = True
@@ -561,7 +792,29 @@ def inner_kernel(
 
         # Step 2: Matmul.
         acc_list = []
-        if not cfgs.lhs_cfgs.should_quantize:
+        if chunk_mode is not None and rhs_pre is None and fp8_rhs is None and (
+            _pipe_bucket(bucket_m)
+        ) and (
+            is_first_k_step and is_last_k_step and valid_k == 0
+        ):
+            # Dequantize + matmul one MXU column chunk at a time (rolled loop
+            # for "roll", unrolled for "chunk"): the same per-chunk operands
+            # and matmul as below, without the whole-tile bf16 temporary.
+            if chunk_mode.startswith("pipe"):
+                spec = chunk_mode[4:]
+                digits = "".join(ch for ch in spec if ch.isdigit())
+                chunk_epilogue = "a" not in spec and not cfgs.rhs_cfgs.has_bias
+                iters_override = (pipe_buckets or {}).get(bucket_m)
+                acc = _pipe_matmul(
+                    bucket_m, iters_override or int(digits or 1), chunk_epilogue,
+                    "c" in spec, iters="i" in spec or iters_override is not None,
+                    deferred="d" in spec,
+                )
+                if acc is None:
+                    return
+            else:
+                acc = _chunked_matmul(tiled_lhs, bucket_m, chunk_mode == "roll")
+        elif not cfgs.lhs_cfgs.should_quantize:
             # Unquantized matmul path.
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
@@ -652,7 +905,8 @@ def inner_kernel(
 
                     acc_n += block_acc
                 acc_list.append(acc_n)
-        acc = jnp.concatenate(acc_list, axis=1)
+        if acc_list:
+            acc = jnp.concatenate(acc_list, axis=1)
 
         # Step 3: Output post-processing.
         if not is_first_k_step:
@@ -706,6 +960,45 @@ def inner_kernel(
             acc_ref[:acc_m] = acc
 
     bucket_sizes = cfgs.tiles.bucket_sizes
+    k1_mode = _k1_body_mode(cfgs)
+
+    if k1_mode is not None:
+        # One k tile: every step is the first and the last, so each bucket
+        # needs only its first_last body (the k-step conds would compile up to
+        # four copies of the dequant + matmul per bucket).
+        rhs_pre = _dequant_rhs_before() if k1_mode == "hoist" else None
+        k1_branches = [
+            functools.partial(
+                _matmul,
+                is_first_k_step=True,
+                is_last_k_step=True,
+                bucket_m=b,
+                rhs_pre=rhs_pre,
+            )
+            for b in bucket_sizes
+        ]
+        if cfgs.tiles.buckets:
+            k1_idx = sum(
+                (m_end_local > b).astype(jnp.int32) for b in bucket_sizes[:-1]
+            )
+        else:
+            k1_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
+        if os.environ.get("TPU_GMM_V2_K1_PROBE") == "dummy":
+            # Diagnostic: one extra never-taken branch with no body.
+            k1_branches.append(lambda: None)
+        elif os.environ.get("TPU_GMM_V2_K1_PROBE") == "dupe":
+            # Diagnostic: one extra never-taken full-size body.
+            k1_branches.append(
+                functools.partial(
+                    _matmul, is_first_k_step=True, is_last_k_step=True,
+                    bucket_m=bucket_sizes[-1], rhs_pre=rhs_pre,
+                )
+            )
+        if len(k1_branches) == 1:
+            k1_branches[0]()
+        else:
+            lax.switch(k1_idx, k1_branches)
+        return
 
     def run_matmul_step(bucket_idx: int):
         bucket_m = bucket_sizes[bucket_idx]
@@ -753,6 +1046,72 @@ def inner_kernel(
     else:
         bucket_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
+
+
+# Opt-in (default off, read once per process): TPU_GMM_V2_K1_BODY=single
+# compiles only the first_last matmul body per bucket when the call has a
+# single k tile (bitwise: the same body the k-step conds pick at runtime);
+# "hoist" also dequantizes the rhs tile once ahead of the bucket switch.
+_K1_BODY_ENV = "TPU_GMM_V2_K1_BODY"
+
+
+@functools.cache
+def _k1_body_env() -> str | None:
+    raw = os.environ.get(_K1_BODY_ENV, "").strip().lower()
+    if raw in ("", "0", "off"):
+        return None
+    if raw not in ("single", "hoist", "roll", "chunk") and not (
+        raw.startswith("pipe") and (raw[4:].rstrip("acid") or "1").isdigit()
+    ):
+        raise ValueError(
+            f"{_K1_BODY_ENV}={raw!r}: expected single|hoist|roll|chunk|pipe[N]"
+        )
+    return raw
+
+
+@functools.cache
+def _pipe_buckets_env() -> dict[int, int | None] | None:
+    """TPU_GMM_V2_K1_PIPE_BUCKETS=b[:iters],...: buckets that take the chunk
+    mode, optionally with their own pipe iteration count."""
+    raw = os.environ.get("TPU_GMM_V2_K1_PIPE_BUCKETS", "").strip()
+    if not raw:
+        return None
+    out: dict[int, int | None] = {}
+    for item in raw.split(","):
+        if item.strip():
+            b, _, it = item.strip().partition(":")
+            out[int(b)] = int(it) if it else None
+    return out
+
+
+_k1_body_logged: set[str] = set()
+
+
+def _k1_body_mode(cfgs: "GmmConfigs") -> str | None:
+    mode = _k1_body_env()
+    if mode is None or pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k) != 1:
+        return None
+    if mode != "single" and not (
+        cfgs.rhs_cfgs.should_dequantize_before_matmul
+        and not cfgs.lhs_cfgs.should_quantize
+        and all(cfgs.fp8_rhs_dtype(b) is None for b in cfgs.tiles.bucket_sizes)
+    ):
+        mode = "single"
+    if mode not in _k1_body_logged:
+        _k1_body_logged.add(mode)
+        args = (
+            "gmm_v2 %s=%s on: one first_last body per bucket (pipe buckets %s)",
+            _K1_BODY_ENV, mode, _pipe_buckets_env(),
+        )
+        try:
+            from vllm_torchtpu.logger import init_logger
+
+            init_logger(__name__).info(*args)
+        except ImportError:  # kernel-only use without vllm
+            import logging
+
+            logging.getLogger(__name__).info(*args)
+    return mode
 
 
 def fill_metadata(

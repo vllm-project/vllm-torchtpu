@@ -77,6 +77,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS: int = 0
     TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE: bool = False
+    TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS: int = 0
+    TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS: int = 0
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -85,6 +87,11 @@ if TYPE_CHECKING:
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
+    TPU_TP_AR_QDQ_ROWS: int = 0
+    TPU_TP_QAR_MIN_TOKENS: int = 0
+    TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
+    TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
@@ -93,7 +100,9 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTE_TRACE: int = 0
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
+    TPU_MOE_REPLICA_ASSIGN_REFINE: int = 0
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
+    TPU_MINIMAX_M3_INDEXER_DECODE_OPT: str = ""
     TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
     VLLM_TPU_MOE_REDUNDANT_PLACEMENT: str = ""
     USE_PHASED_PROFILER: bool = False
@@ -115,6 +124,10 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_ROUTER_TOPK_VALUES: bool = False
+    TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS: int = 0
+    TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS: int = 0
+    TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS: int = 0
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
@@ -238,6 +251,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    TPU_SAMPLER_TOPP_CANDIDATES: str = ""
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -251,11 +265,20 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
+    TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
+    TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
+    TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
+    TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_INDEX_FOLD_OPT: str = ""
+    TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
+    TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
+    TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
     TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE: str = ""
+    TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT: str = ""
 
 
 def env_with_choices(
@@ -770,6 +793,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE": env_bool(
         "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE", default=False
     ),
+    # MiniMax-M3 e4m3 linears: token buckets of at most this many rows split
+    # the bf16 activations into two e4m3 terms (x ~ s * (hi + lo / 16), one
+    # power-of-two scale s per row) and run one fp8 x fp8 MXU matmul over the
+    # stacked [hi; lo] rows, instead of upcasting the whole e4m3 weight to bf16
+    # inside the dot fusion. The two terms keep ~8 mantissa bits, about bf16's
+    # rounding of the activations. 0 (default) keeps the upcast path.
+    "TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS", 0
+    ),
+    # Smallest token bucket TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS applies to.
+    "TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS", 0
+    ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
@@ -830,6 +866,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
     ),
+    # Pallas TP all-reduce on the activation's own [rows, hidden] layout when
+    # rows is a multiple of this value (0, default: off). Off, the kernel runs
+    # on a [16, w] view, and the relayout into the view (and back) is a copy
+    # of the whole activation on each side of every decode all-reduce. Same
+    # bits either way (each element is summed in rank order).
+    "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS": env_int(
+        "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS", 0
+    ),
+    # Accuracy emulation of an int8-payload TP all-reduce: quantize each
+    # rank's bf16 partial and the reduced result to int8 with one absmax scale
+    # per (lane, ROWS-row block), dequantize, and all-reduce as usual. No
+    # speedup; measures what an int8 wire would cost in accuracy. 0 = off.
+    # Applies to all-reduces of at least TPU_TP_AR_QDQ_MIN_TOKENS rows.
+    "TPU_TP_AR_QDQ_ROWS": env_int("TPU_TP_AR_QDQ_ROWS", 0),
+    # TP all-reduces of at least this many rows run qar_all_reduce (int8
+    # payload on the ICI links, kernels/collectives/qar_all_reduce.py) instead
+    # of XLA's; needs the Pallas all-reduce armed (TPU_TP_PALLAS_ALL_REDUCE_
+    # MAX_BYTES > 0) on a tpu7x 2x2x1 TP8 group. Changes numerics (~0.9% rel
+    # L2 per all-reduce). 0 = off.
+    "TPU_TP_QAR_MIN_TOKENS": env_int("TPU_TP_QAR_MIN_TOKENS", 0),
+    "TPU_TP_AR_QDQ_MIN_TOKENS": env_int("TPU_TP_AR_QDQ_MIN_TOKENS", 0),
+    # Pallas TP all-reduces of at most this many rows (a multiple of 8) run
+    # the one-shot kernel: each rank pushes its whole activation to every
+    # peer and sums all n copies in rank order itself, one exchange round
+    # instead of reduce-scatter + all-gather. Same bits. 0 (default) = off.
+    "TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS": env_int(
+        "TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS", 0
+    ),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.
@@ -881,6 +945,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gmm) is exposed per call. "<chunk_rows>:<slots>[@<max size_m>]", "on" =
     # 768:4@512. Same numerics as the fp8 rhs feed. Empty = off.
     "TPU_GMM_V2_DECODE_STREAM": env_str("TPU_GMM_V2_DECODE_STREAM", ""),
+    # MSA indexer decode (transposed block_q class, folded 4-bit pages)
+    # options, comma-separated: "issue" = a full page group starts its page
+    # copies without a per-page live check or block-table clamp; "slots<N>" =
+    # N page groups in the DMA ring (default 3); "quad" = fp8 queries and four
+    # pages per MXU row (contraction 4 x 128) instead of two. "issue" and
+    # "slots" are bit-identical; "quad" rounds the queries to fp8 (scores keep
+    # their order up to that rounding). Empty = off.
+    "TPU_MINIMAX_M3_INDEXER_DECODE_OPT": env_str(
+        "TPU_MINIMAX_M3_INDEXER_DECODE_OPT", ""
+    ),
     # TPU_MOE_SKIP_PADDED_TOKENS drops padded rows from the grouped matmul only
     # in batches of at least this many routes (T * top_k); smaller batches run
     # them as with the skip off (bitwise for real rows). 0 = every size.
@@ -893,6 +967,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # router remap that moves work onto the replicas. 0 = off.
     "VLLM_TPU_MOE_REDUNDANT_EXPERTS": env_nonnegative_int(
         "VLLM_TPU_MOE_REDUNDANT_EXPERTS", 0
+    ),
+    # With redundant experts: after the per-step greedy copy assignment, up to
+    # this many rounds of moves (one replicated expert to another copy, or a
+    # two-step chain) that lower the busiest rank's expert count
+    # (kernels/moe_replica_assign.py _refine). Changes which rank computes
+    # an expert, not the math. 0 (default) = greedy only.
+    "TPU_MOE_REPLICA_ASSIGN_REFINE": env_nonnegative_int(
+        "TPU_MOE_REPLICA_ASSIGN_REFINE", 0
     ),
     # Which experts get the redundant slots: a JSON file path, inline JSON
     # ('{"L3": [17, ...]}', hottest first), or "builtin:<name>". Empty = the
@@ -960,9 +1042,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
+    # Router top-k kernel (`kernels/router_topk.select`): calls of at least
+    # this many rows (a multiple of 128) run the transposed kernel (experts
+    # on sublanes, rows on lanes: VPU reductions instead of cross-lane XLU
+    # ones). 0 (default) keeps the row kernel. Same picks bit for bit.
+    # MiniMax M3 fused qk norm + rope kernel: token block of calls with at
+    # least this many tokens (0, default: the kernel's 256). Fewer grid
+    # steps on large prefill chunks; same bits.
+    "TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS": env_int(
+        "TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS", 0
+    ),
+    # MoE router with a score-correction bias: calls of at least this many
+    # rows (a multiple of 128) pick the top-k of scores + bias and gather the
+    # unbiased scores in one transposed kernel pass instead of an add, the
+    # top-k kernel and an XLA gather. 0 (default) keeps the unfused path.
+    # Same weights and ids bit for bit.
+    "TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS": env_int(
+        "TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS", 0
+    ),
+    "TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS": env_int(
+        "TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS", 0
+    ),
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
+    # With a score-correction bias and the "rowmax" router top-k, the top-k
+    # kernel also returns the unbiased scores of the picked experts, so the
+    # routing weights need no separate XLA gather (a ~1.1 us op per MoE layer
+    # at decode). Same values. Off by default.
+    "TPU_MOE_ROUTER_TOPK_VALUES": env_bool("TPU_MOE_ROUTER_TOPK_VALUES"),
     # Keep FusedMoE top-k routing weights in float32 precision instead of casting
     # to the activation dtype (e.g. bfloat16) in fused_moe_gmm. Improves numerical
     # parity with training frameworks (e.g. MaxText) in RL and distillation workloads.
@@ -1518,6 +1626,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
     ),
+    # Top-p sampling finds its probability threshold from candidate blocks
+    # (layers/adapter/sample/topp_candidates.py): comma list of tiers in
+    # 128-logit blocks, e.g. "64,512". Each tier is used only when its blocks
+    # provably hold the whole top-p set of every row, else the next tier, and
+    # finally the full-vocabulary bisection. Same threshold up to the float32
+    # summation order. Empty (default): the full bisection only.
+    "TPU_SAMPLER_TOPP_CANDIDATES": env_str("TPU_SAMPLER_TOPP_CANDIDATES", ""),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
@@ -1597,6 +1712,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE", ""
     ),
+    # MiniMax M3 DCP candidate merge (`msa_dcp.merge_candidates`, the dense
+    # ranking used below 64 candidates per token, i.e. DCP 2) picks each
+    # output slot with a max over the candidate (lane) axis instead of over
+    # a middle axis. Same values; avoids a slow XLA layout at some row counts.
+    "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT": env_bool(
+        "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT", default=False
+    ),
     # MiniMax M3 head-parallel DCP prefill attention (`msa_dcp_heads`, steps of
     # at least 2,048 tokens at DCP 8) kernel config, "<block_q>:<pages per
     # step>:<step widths, '/'-separated>:<page cache slots>", e.g.
@@ -1606,11 +1728,61 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG": env_str(
         "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG", ""
     ),
+    # MiniMax M3 head-parallel MSA prefill: page buffer of each attention
+    # round as this many max-length requests' blocks (default 1). A long
+    # step whose prefill requests' blocks exceed one buffer attends them in
+    # several rounds (an exchange, sorts and kernel calls each); 2 holds two
+    # (c64 8k chunks of ~140K-token contexts) in one round.
+    "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR", 1
+    ),
+    # MiniMax M3 head-parallel MSA prefill: the replicas of a KV head split
+    # each kernel call's rows (alternate query tiles) instead of its query
+    # heads, so each kernel tile carries all the KV head's query heads over
+    # the same selected-page union (twice the rows per page at 2 replicas).
+    # The query heads and outputs move by an all-to-all inside the replica
+    # group (one chip's cores). Same outputs bit for bit.
+    "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT": env_bool(
+        "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT", default=False
+    ),
+    # MiniMax M3 DCP attention over several KV heads (`msa_dcp_heads`): steps
+    # of at most this many rows merge the ranks' partials by one all-to-all
+    # of the head blocks and their LSEs plus the f32 merge kernel
+    # (`msa_dcp.merge_partials`) instead of an LSE all-gather and a bf16
+    # reduce-scatter of the weighted partials. 0 = off.
+    "TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 sharded index scores (`msa.partial_block_scores`): "gather"
+    # folds the index heads into query rows by a gather instead of a
+    # scatter; "compose" unfolds the scores inside `block_scores`' layout
+    # gather instead of a second row gather; "+"-joined. Bit-identical.
+    "TPU_MINIMAX_M3_INDEX_FOLD_OPT": lambda: os.getenv(
+        "TPU_MINIMAX_M3_INDEX_FOLD_OPT", ""
+    ),
+    # MiniMax M3 head-parallel MSA prefill page exchange
+    # (`msa_dcp_heads.exchange_head_pages`): pages whose copies a rank keeps
+    # in flight (default 8), and DIRECT=1 copies every page straight to every
+    # replica of its KV head instead of forwarding inside the replica group.
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT", 8
+    ),
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT": env_bool(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT", default=False
+    ),
+    # ASYNC=1: the first round's page copies start ahead of the decode rows'
+    # DCP attention and the selection merge and are retired after them
+    # (a start / wait pair of kernels), so the exchange overlaps that work.
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC": env_bool(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC", default=False
+    ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
     # "unstable" drops the stability; "packed" sorts one packed int32 operand
     # per sort, unstable; "packed_search" also finds the distinct keys by a
-    # binary search instead of the second sort. Same table bit for bit.
+    # binary search instead of the second sort; "packed_batched" runs the
+    # second and third packed sorts as one two-row sort (they are
+    # independent). Same table bit for bit.
     "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT": env_str(
         "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT", ""
     ),
@@ -1627,6 +1799,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "qk8": fp8 queries x fp8 keys (int4 keys are exact in fp8) on the MXU;
     # "pv8": fp8 probabilities (carrying the V scales) x fp8 int4 values.
     # Not bit-identical.
+    # MiniMax M3 MSA prefill attention on fp8 KV caches: "exp16" runs the
+    # softmax exp in bf16 (p enters p @ v in bf16 anyway; not bitwise); "bias"
+    # masks whole pages by a lane-row add instead of a per-score select
+    # (bitwise); "lanemask" compares the mask once per 128 lanes (bitwise);
+    # "vt" transposes V pages as they unpack for an untransposed p @ v dot;
+    # "lmxu" takes the softmax row sums from the p @ v dot (not bitwise).
+    # Comma-separated; empty
+    # (default) = off.
+    "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT": env_str(
+        "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT", ""
+    ),
     "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION", ""
     ),

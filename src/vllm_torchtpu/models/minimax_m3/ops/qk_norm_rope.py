@@ -23,6 +23,9 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.models.minimax_m3.kernels import qk_norm_rope
 
 
+_logged: list[int] = []
+
+
 @functools.cache
 def get_qk_norm_rope_op(
     num_heads: int, num_kv_heads: int, head_dim: int, eps: float, q_head_major: bool
@@ -33,6 +36,21 @@ def get_qk_norm_rope_op(
     def _norm_rope_jax(
         qkv: jax.Array, cos_sin: jax.Array, weight: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        from vllm_torchtpu import envs
+
+        block = int(envs.TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS)
+        kw = {}
+        if block > 0 and qkv.shape[0] >= block:
+            # Rows are independent (per-row norm, exact 0/+-1 rope products):
+            # same bits at any block.
+            kw["block_tokens"] = block
+            if not _logged:
+                _logged.append(block)
+                print(
+                    f"TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS=1: qk norm + rope "
+                    f"in {block}-token blocks",
+                    flush=True,
+                )
         return qk_norm_rope.qk_norm_rope(
             qkv,
             cos_sin,
@@ -42,6 +60,7 @@ def get_qk_norm_rope_op(
             head_dim=head_dim,
             eps=eps,
             q_head_major=q_head_major,
+            **kw,
         )
 
     op = pallas.jax_op(

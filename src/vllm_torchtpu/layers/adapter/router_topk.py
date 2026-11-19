@@ -21,7 +21,12 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.router_topk import (
+    router_topk,
+    router_topk_biased,
+    router_topk_values,
+)
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
@@ -37,6 +42,39 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+_values_op = pallas.jax_op("pallas::moe_router_topk_values", router_topk_values)
+_values_op.register_fake(lambda scores, values, topk: _fake_router_topk(scores, topk))
+
+
+def _fake_router_topk_biased(scores: torch.Tensor, bias: torch.Tensor, topk: int):
+    return _fake_router_topk(scores, topk)
+
+
+_op_biased = pallas.jax_op("pallas::moe_router_topk_biased", router_topk_biased)
+_op_biased.register_fake(_fake_router_topk_biased)
+
+
+# Read at import, outside the compiled forward (as moe_routing._ROUTER_TOPK).
+_FUSED_BIAS_MIN_ROWS = int(envs.TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS)
+
+
+def rowmax_select_biased(
+    scores: torch.Tensor, bias: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(scores.gather(ids), ids)`` with ``ids`` the top-k of ``scores +
+    bias``, in one kernel pass (TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS); None
+    when the call does not qualify (the caller takes the unfused path)."""
+    min_rows = _FUSED_BIAS_MIN_ROWS
+    if (
+        min_rows <= 0
+        or scores.device.type != "tpu"
+        or scores.dim() != 2
+        or scores.shape[0] < min_rows
+        or scores.shape[0] % 128
+    ):
+        return None
+    # No print here: this runs under Dynamo (the kernel side logs the proof).
+    return _op_biased(scores.float(), bias.float().reshape(-1), topk)
 
 
 def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -48,3 +86,19 @@ def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
     return _op(scores.float(), topk)
+
+
+def rowmax_select_values(
+    scores: torch.Tensor, values: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`rowmax_select` of ``scores`` returning ``values`` (same shape) at the
+    picked columns: ``(values.gather(-1, ids), ids)``."""
+    if scores.device.type != "tpu":
+        _, ids = rowmax_topk(scores, topk)
+        return values.gather(-1, ids.long()), ids
+    if scores.dim() != 2 or values.shape != scores.shape:
+        raise ValueError(
+            f"router top-k kernel expects [rows, experts] x2, got {scores.shape},"
+            f" {values.shape}"
+        )
+    return _values_op(scores.float(), values.float(), topk)

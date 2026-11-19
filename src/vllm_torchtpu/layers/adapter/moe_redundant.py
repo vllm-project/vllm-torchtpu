@@ -76,6 +76,8 @@ SLOTS_PER_RANK: int = int(envs.VLLM_TPU_MOE_REDUNDANT_EXPERTS)
 ENABLED: bool = SLOTS_PER_RANK > 0
 # Batches above this many routes (T * top_k) use the native copies.
 MAX_ROUTES: int = 2048
+# Rounds of load-lowering moves after the greedy copy assignment.
+REFINE: int = int(envs.TPU_MOE_REPLICA_ASSIGN_REFINE) if ENABLED else 0
 # Expert ids handed to the loader for replica writes. Distinct from every
 # real id so the expert-write staging tracker counts each slot once.
 _REPLICA_ID_BASE = 1 << 20
@@ -388,6 +390,13 @@ def prepare(layer: Any) -> int:
         )
         return 0
     _widen_ep_weight_filter()
+    if REFINE:
+        logger.warning_once(
+            "[moe-redundant] TPU_MOE_REPLICA_ASSIGN_REFINE=%d: up to %d rounds of "
+            "load-lowering expert moves after the greedy copy assignment.",
+            REFINE,
+            REFINE,
+        )
     name = str(getattr(layer, "layer_name", "") or "")
     ordinal = _ORDINAL[0]
     _ORDINAL[0] += 1
@@ -634,7 +643,7 @@ def _assign_jax(ids: jax.Array, copies: jax.Array, ep: int, slots: int) -> jax.A
     """jax_op body (arrays, then statics; annotations resolved by jax_op)."""
     from vllm_torchtpu.kernels.moe_replica_assign import replica_assign
 
-    return replica_assign(ids, copies, ep=ep, slots=slots)
+    return replica_assign(ids, copies, ep=ep, slots=slots, refine=REFINE)
 
 
 def _get_assign_op():
@@ -661,7 +670,12 @@ def remap_ids(
 
 
 def remap_ids_reference(
-    topk_ids: torch.Tensor, copies: torch.Tensor, *, ep: int, slots: int
+    topk_ids: torch.Tensor,
+    copies: torch.Tensor,
+    *,
+    ep: int,
+    slots: int,
+    refine: int = 0,
 ) -> torch.Tensor:
     """Host reference of the kernel's assignment (tests, non-TPU devices)."""
     ids = topk_ids.to(torch.int64)
@@ -680,6 +694,7 @@ def remap_ids_reference(
             choice[e] = p
         else:
             flexible.append(e)
+    lists: list[list[int]] = [[] for _ in range(ep)]
     for e in flexible:
         best = int(tab[e, 0])
         for k in range(1, tab.shape[1]):
@@ -688,11 +703,60 @@ def remap_ids_reference(
                 best = p
         load[best // slots] += 1
         choice[e] = best
+        lists[best // slots].append(e)
+    _refine_reference(tab, choice, load, lists, slots, refine)
     out = torch.tensor(
         [choice[int(e)] if e >= 0 else -1 for e in ids.flatten().tolist()],
         dtype=torch.int32,
     )
     return out.view(ids.shape).to(topk_ids.device)
+
+
+def _refine_reference(tab, choice, load, lists, slots, rounds) -> None:
+    """Host mirror of the kernel's ``_refine`` (same scan order and moves)."""
+    c = tab.shape[1]
+
+    def move(e, p, frm, to, idx):
+        lists[frm][idx] = lists[frm][-1]
+        lists[frm].pop()
+        lists[to].append(e)
+        load[frm] -= 1
+        load[to] += 1
+        choice[e] = p
+
+    for _ in range(rounds):
+        m = max(load)
+        a = load.index(m)
+        found = False
+        for i in range(len(lists[a])):
+            e = lists[a][i]
+            for k in range(c):
+                if found:
+                    break
+                p = int(tab[e, k])
+                b = p // slots if p >= 0 else 0
+                if p < 0 or b == a:
+                    continue
+                if load[b] <= m - 2:
+                    move(e, p, a, b, i)
+                    found = True
+                elif load[b] == m - 1:
+                    for j in range(len(lists[b])):
+                        e2 = lists[b][j]
+                        for k2 in range(c):
+                            p2 = int(tab[e2, k2])
+                            cr = p2 // slots if p2 >= 0 else 0
+                            if p2 >= 0 and cr != b and cr != a and load[cr] <= m - 2:
+                                move(e2, p2, b, cr, j)
+                                move(e, p, a, b, i)
+                                found = True
+                                break
+                        if found:
+                            break
+            if found:
+                break
+        if not found:
+            return
 
 
 def placement_from_trace_lines(lines: Iterable[str], top: int = 64) -> dict[str, Any]:

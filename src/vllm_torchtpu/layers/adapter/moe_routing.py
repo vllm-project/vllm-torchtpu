@@ -17,7 +17,11 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
+from vllm_torchtpu.layers.adapter.router_topk import (
+    rowmax_select,
+    rowmax_select_biased,
+    rowmax_select_values,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -25,6 +29,14 @@ logger = init_logger(__name__)
 # Resolved once, at import, so the compiled forward never reads the
 # environment.
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
+_ROUTER_TOPK_VALUES = envs.TPU_MOE_ROUTER_TOPK_VALUES and _ROUTER_TOPK == "rowmax"
+if _ROUTER_TOPK_VALUES:
+    # warning, not info: this module is imported before vLLM configures the
+    # worker's logging level, and the line is the flag's proof in run logs.
+    logger.warning(
+        "TPU_MOE_ROUTER_TOPK_VALUES=1 on: biased top-k returns the routing"
+        " weights from the router kernel (no XLA gather)"
+    )
 
 
 def _get_topk_weights_dtype(default_dtype: torch.dtype) -> torch.dtype:
@@ -320,10 +332,29 @@ def select_experts(
 
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
-        bias = e_score_correction_bias.float().view(bias_shape)
-        scores_for_choice = scores + bias
-        _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = scores.gather(-1, topk_ids.long())
+        # Precedence when several router flags are on: the fused-bias kernel
+        # takes the calls it qualifies for (TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS,
+        # large prefill calls), then TPU_MOE_ROUTER_TOPK_VALUES (its kernel
+        # hands large calls to the transposed select when
+        # TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS qualifies them), then the plain
+        # top-k plus gather. Every path picks the same experts and weights.
+        fused = (
+            rowmax_select_biased(scores, e_score_correction_bias, topk)
+            if _ROUTER_TOPK == "rowmax"
+            else None
+        )
+        if fused is not None:
+            topk_weights, topk_ids = fused
+        else:
+            bias = e_score_correction_bias.float().view(bias_shape)
+            scores_for_choice = scores + bias
+            if _ROUTER_TOPK_VALUES and scores.dim() == 2:
+                topk_weights, topk_ids = rowmax_select_values(
+                    scores_for_choice, scores, topk
+                )
+            else:
+                _, topk_ids = _topk(scores_for_choice, topk)
+                topk_weights = scores.gather(-1, topk_ids.long())
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 

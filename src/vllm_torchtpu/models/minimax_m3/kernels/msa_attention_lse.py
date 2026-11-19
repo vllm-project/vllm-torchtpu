@@ -23,6 +23,7 @@ import functools
 import logging
 import math
 import os
+import types
 
 import jax
 import jax.numpy as jnp
@@ -194,6 +195,40 @@ _PV8_UNIT = 64.0
 _FP8_MAX = 448.0
 PREFILL_PRECISION_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
 _PRECISION_LEVERS = ("qk8", "pv8")
+# TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT levers of 8-bit (fp8) pages on the
+# transposed prefill path (`_kernel.attend_t`), default off, not bitwise:
+# "exp16": p = exp2(s - m) in bf16 (p enters p @ v in bf16 anyway; l sums the
+# rounded p in f32). Standalone fp8 calls on served DCP 2 selections, block_q
+# 32 and 32-page groups: -2.6% (8,192 tokens), out rel-rms 3e-3 (j-662afb0e).
+FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
+# "bias": the per-score cmp + select page mask becomes a lane-row add (0 or
+# -inf per token, from the page's hit / limit) on fully visible or unseen
+# pages; only a page some token sees in part (its local page) or an empty
+# slot keeps the select, under a scalar branch. Bitwise (finite pages).
+# "lanemask": the page mask compared once per 128-lane vreg of rows (4 heads
+# x 32 tokens at block_q 32) and reused by every head group (bitwise).
+# "vt": each page's V rows transposed as they unpack, so p @ v runs as
+# v^T [D, keys] @ p [keys, rows] with no transposed operand in the dot.
+# "lmxu": the softmax row sums come out of the p @ v dot (8 rows of ones
+# under v^T) instead of a VALU add per score vreg; l sums the bf16 p the dot
+# multiplies.
+_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt", "lmxu")
+
+
+def fp8_prefill_levers(spec: str | None = None) -> frozenset:
+    """Levers of ``envs.TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT`` (or `spec`); read
+    when the program is traced."""
+    if spec is None:
+        from vllm_torchtpu import envs
+
+        spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
+    levers = frozenset(x.strip() for x in spec.replace("/", ",").split(",") if x.strip())
+    bad = levers - set(_FP8_LEVERS)
+    if bad:
+        raise ValueError(f"{FP8_OPT_ENV}: unknown levers {sorted(bad)}")
+    if levers:
+        _proof(FP8_OPT_ENV, f"fp8 MSA prefill attention levers {sorted(levers)}")
+    return levers
 
 
 def prefill_precision_levers(spec: str | None = None) -> frozenset:
@@ -242,13 +277,17 @@ def _page_cache(
     padding as ``key_bound``) above the entry position and the position above
     ``slot + 1`` (clamped at ``cache_size + 1``: past it the call streams and
     the slots are not used); "packed_search" finds the distinct keys by a
-    binary search of the slot counts instead of a sort. Callers check
+    binary search of the slot counts instead of a sort; "packed_batched"
+    runs the packed distinct-key sort and the packed inverse-permutation sort
+    (independent of each other) as one batched sort of two rows, so the call
+    waits for two sort latencies instead of three. Callers check
     `_packed_sort_fits` for the packed modes. The table is the same bit for
     bit."""
     rows = pages.reshape(num_tiles, -1)
     width = min(width or PAGE_CACHE_TILE_PAGES, rows.shape[1])
     head = rows[:, :width].reshape(-1)
-    if mode in ("packed", "packed_search"):
+    packed_modes = ("packed", "packed_search", "packed_batched")
+    if mode in packed_modes:
         n = head.shape[0]
         pos_bits = max(1, (n - 1).bit_length())
         slot_bits = (cache_size + 1).bit_length()
@@ -269,7 +308,28 @@ def _page_cache(
     new = new & (key != no_page)
     slot = jnp.cumsum(new, dtype=jnp.int32) - 1
     num_distinct = slot[-1] + 1
-    if mode == "packed_search":
+    by_position = None
+    if mode == "packed_batched":
+        # Both rows are non-negative int32 below 2^31 (`_packed_sort_fits`).
+        both = jax.lax.sort(
+            jnp.stack(
+                [
+                    jnp.where(new, key, no_page),
+                    (position << slot_bits)
+                    | jnp.minimum(slot + 1, cache_size + 1),
+                ]
+            ),
+            dimension=1,
+            is_stable=False,
+        )
+        distinct = both[0, :cache_size]
+        distinct = jnp.pad(
+            distinct,
+            (0, cache_size - distinct.shape[0]),
+            constant_values=no_page,
+        )
+        by_position = both[1]
+    elif mode == "packed_search":
         # Slot counts ascend: the j-th distinct key is the first entry whose
         # slot reaches j.
         nth = jnp.arange(cache_size, dtype=jnp.int32)
@@ -286,11 +346,12 @@ def _page_cache(
             (0, cache_size - distinct.shape[0]),
             constant_values=no_page,
         )
-    if mode in ("packed", "packed_search"):
-        by_position = jax.lax.sort(
-            (position << slot_bits) | jnp.minimum(slot + 1, cache_size + 1),
-            is_stable=False,
-        )
+    if mode in packed_modes:
+        if by_position is None:
+            by_position = jax.lax.sort(
+                (position << slot_bits) | jnp.minimum(slot + 1, cache_size + 1),
+                is_stable=False,
+            )
         slot = (by_position & ((1 << slot_bits) - 1)) - 1
     else:
         _, slot = jax.lax.sort(
@@ -327,12 +388,12 @@ def _page_cache_tables(
 
     full = min(tile_pages or PAGE_CACHE_TILE_PAGES, unions.shape[1] // num_tiles)
     mode = envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT.strip().lower()
-    if mode not in ("", "unstable", "packed", "packed_search"):
+    if mode not in ("", "unstable", "packed", "packed_search", "packed_batched"):
         raise ValueError(f"TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT={mode!r}")
     spec = envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS.replace(",", "/")
     widths = sorted({int(w) for w in spec.split("/") if w.strip()})
     widths = [w for w in widths if 0 < w < full] + [full]
-    if mode in ("packed", "packed_search") and not _packed_sort_fits(
+    if mode in ("packed", "packed_search", "packed_batched") and not _packed_sort_fits(
         num_tiles * full, cache_size, key_bound
     ):
         mode = "unstable"
@@ -400,6 +461,7 @@ def _kernel(
     row_split: int = 1,
     tiles_per_head: int = 0,
     precision: frozenset = frozenset(),
+    pair: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -454,6 +516,11 @@ def _kernel(
     # `precision` levers (4-bit pages, `prefill_precision_levers`).
     qk8 = fp4 and "qk8" in precision
     pv8 = fp4 and "pv8" in precision
+    exp16_t = not fp4 and "exp16" in precision
+    bias_t = not fp4 and "bias" in precision
+    lanemask_t = not fp4 and "lanemask" in precision
+    lmxu_t = not fp4 and "lmxu" in precision
+    vt_t = not fp4 and ("vt" in precision or lmxu_t)
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
@@ -464,6 +531,8 @@ def _kernel(
 
     def group(
         w,
+        mode="full",
+        sink=None,
         q_ref=q_ref,
         o_ref=o_ref,
         lse_ref=lse_ref,
@@ -610,7 +679,8 @@ def _kernel(
                 n *= 2
 
         if not cached:
-            stream()
+            if mode == "full":  # `pair` kernels copy and wait outside
+                stream()
 
             def group_page(g):
                 """Key, page ref and scale page ref of the group's slot `g`."""
@@ -666,6 +736,9 @@ def _kernel(
 
         def put(out):  # [H * Bq, D] or [H, Bq, D]
             out = out.reshape(num_heads, block_q, head_dim)
+            if sink is not None:  # `_pair_loop` stores two tiles' rows at once
+                sink.append(out)
+                return
             if store_out is None:
                 o_ref[...] = out.astype(o_ref.dtype)
             else:
@@ -717,13 +790,28 @@ def _kernel(
             sel_t = selected_ref[...].T  # [K, Bq]
             local_page = local_page_ref[...].T  # [1, Bq]
             local_limit = local_limit_ref[...].T
-            keys, values, masks = [], [], []
+            keys, values, masks, limits, fixes = [], [], [], [], []
+            lane_reps = (
+                128 // block_q
+                if 128 % block_q == 0 and num_heads % (128 // block_q) == 0
+                and num_heads > 128 // block_q
+                else 0
+            )
             for g in range(width):
                 page, kv_ref, scale_ref = group_page(g)
                 hit = jnp.max((sel_t == page).astype(jnp.int32), axis=0, keepdims=True)
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
+                if bias_t:
+                    # A token sees all of the page or none of it, unless the
+                    # page is its local one; an empty slot (page -1) holds
+                    # stale bytes that may not be finite.
+                    part = jnp.max(
+                        ((limit > 0) & (limit < page_size)).astype(jnp.int32)
+                    )
+                    limits.append(limit)
+                    fixes.append((part > 0) | (page < 0))
                 if packing == 4:
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
@@ -731,27 +819,69 @@ def _kernel(
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
                 keys.append(rows[:, :head_dim])
-                # Rows are head-major (h * Bq + t): every head shares a token's mask.
-                masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
+                if lanemask_t and lane_reps:
+                    # One 128-lane mask: every 128-lane chunk of rows holds the
+                    # same tokens (h * Bq + t, Bq dividing 128).
+                    masks.append(row_slots < jnp.tile(limit, (1, lane_reps)))  # [S, 128]
+                elif not bias_t:
+                    # Rows are head-major (h * Bq + t): every head shares a token's mask.
+                    masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
             k = jnp.concatenate(keys, axis=0)
-            v = jnp.concatenate(values, axis=0)
-            mask = jnp.concatenate(masks, axis=0)
+            if vt_t:
+                v = jnp.concatenate([x.T for x in values], axis=1)  # [D, W * S]
+                if lmxu_t:
+                    v = jnp.concatenate([v, jnp.ones((8, v.shape[1]), v.dtype)], axis=0)
+            else:
+                v = jnp.concatenate(values, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             s = jax.lax.dot_general(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )  # [W * S, rows]
-            s = jnp.where(mask, s, -jnp.inf)
+            if bias_t:
+                slabs = []
+                for g in range(width):
+                    limit = jnp.tile(limits[g], (1, num_heads))  # [1, rows]
+                    s_g = s[g * page_size : (g + 1) * page_size] + jnp.where(
+                        limit > 0, 0.0, -jnp.inf
+                    )
+
+                    def _select(x, limit=limit):
+                        return jnp.where(row_slots < limit, x, -jnp.inf)
+
+                    slabs.append(jax.lax.cond(fixes[g], _select, lambda x: x, s_g))
+                s = jnp.concatenate(slabs, axis=0)
+            elif lanemask_t and lane_reps:
+                mask = jnp.concatenate(masks, axis=0)  # [W * S, 128]
+                s = jnp.concatenate(
+                    [
+                        jnp.where(mask, s[:, c : c + 128], -jnp.inf)
+                        for c in range(0, s.shape[1], 128)
+                    ],
+                    axis=1,
+                )
+            else:
+                mask = jnp.concatenate(masks, axis=0)
+                s = jnp.where(mask, s, -jnp.inf)
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
-            p = jnp.exp2(s - m_new)
-            l_cur = jnp.sum(p, axis=0, keepdims=True)
+            if exp16_t:
+                p = jnp.exp2((s - m_new).astype(jnp.bfloat16))
+                if not lmxu_t:
+                    l_cur = jnp.sum(p.astype(jnp.float32), axis=0, keepdims=True)
+            else:
+                p = jnp.exp2(s - m_new)
+                if not lmxu_t:
+                    l_cur = jnp.sum(p, axis=0, keepdims=True)
             pv = jax.lax.dot_general(
                 v,
                 p.astype(v.dtype),
-                (((0,), (0,)), ((), ())),
+                (((1 if vt_t else 0,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
-            )  # [D, rows]
+            )  # [D, rows] ([D + 8, rows] with lmxu: row D is l)
+            if lmxu_t:
+                l_cur = pv[head_dim : head_dim + 1]
+                pv = pv[:head_dim]
             if single:
                 finish_t(m_new, l_cur, pv)
                 return
@@ -914,40 +1044,199 @@ def _kernel(
         # groups are 16, 32 or 64 pages by call). A step costs per score column,
         # filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin standalone
         # j-952e8a64), plus ~0.7 us whatever its width (j-aec3278d).
-        single = first & last
-        widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
-        for i, width in enumerate(widths):
-            fits = count > (widths[i - 1] if i else 0)
-            if width < pages_per_step:
-                fits = fits & (count <= width)
-            body = attend_t if transposed else attend
-            if bf16_cache:  # the cache in use reads bf16 pages, a streaming call unpacks
-                for from_bf16, when in ((True, use_cache), (False, jnp.logical_not(use_cache))):
-                    pl.when(fits & single & when)(
-                        functools.partial(attend, width, True, from_bf16)
-                    )
-                    pl.when(fits & jnp.logical_not(single) & when)(
-                        functools.partial(attend, width, False, from_bf16)
-                    )
-                continue
-            pl.when(fits & single)(functools.partial(body, width, True))
-            pl.when(fits & jnp.logical_not(single))(
-                functools.partial(body, width, False)
-            )
+        def run_widths(count=count, first=first, last=last):
+            single = first & last
+            widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
+            for i, width in enumerate(widths):
+                fits = count > (widths[i - 1] if i else 0)
+                if width < pages_per_step:
+                    fits = fits & (count <= width)
+                body = attend_t if transposed else attend
+                if bf16_cache:  # the cache in use reads bf16 pages, a streaming call unpacks
+                    for from_bf16, when in ((True, use_cache), (False, jnp.logical_not(use_cache))):
+                        pl.when(fits & single & when)(
+                            functools.partial(attend, width, True, from_bf16)
+                        )
+                        pl.when(fits & jnp.logical_not(single) & when)(
+                            functools.partial(attend, width, False, from_bf16)
+                        )
+                    continue
+                pl.when(fits & single)(functools.partial(body, width, True))
+                pl.when(fits & jnp.logical_not(single))(
+                    functools.partial(body, width, False)
+                )
 
-        @pl.when(count == 0)
-        def _empty():  # a tile of padding tokens: its only group holds no page
+        def empty():  # a tile of padding tokens: its only group holds no page
             write(
                 jnp.zeros((num_heads * block_q, head_dim), jnp.float32),
                 jnp.full((num_heads * block_q, 1), -jnp.inf, jnp.float32),
             )
+
+        if mode != "full":
+            return types.SimpleNamespace(
+                attend=attend, count=count, single=first & last,
+                run_widths=run_widths, empty=empty,
+            )
+        run_widths()
+        pl.when(count == 0)(empty)
 
     def loop(w, carry):
         group(w)
         return carry
 
     b = pl.program_id(0)
-    jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+    if not pair:
+        jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+        return
+    _pair_loop(
+        group, b, block_start_ref, num_groups, tiles_per_step, work_page_ref,
+        work_meta_ref, work_count_ref, page_table_ref, kv_hbm_ref, buf_ref, sem_ref,
+        scale_hbm_ref, scale_buf_ref, scale_sem_ref, pages_per_step, step_widths,
+        group_head, o_ref,
+    )
+
+
+def _pair_loop(
+    group, b, block_start_ref, num_groups, tiles_per_step, work_page_ref,
+    work_meta_ref, work_count_ref, page_table_ref, kv_hbm_ref, buf_ref, sem_ref,
+    scale_hbm_ref, scale_buf_ref, scale_sem_ref, pages_per_step, step_widths,
+    group_head, o_ref,
+):
+    """`_kernel`'s group loop with `pair` (decode, streamed pages): a grid
+    step whose tiles hold one group each runs them two at a time, both
+    tiles' softmax in one straight-line body at the wider tile's step width,
+    so their dependency chains (MXU push / pop, reductions, exp) interleave
+    instead of running back to back (one 8-token tile's body is latency
+    bound, ~2.5 ops per bundle); the pair's rows (an even tile's and the
+    next) fill whole packed output tiles, so they store at once instead of
+    each merging into a shared one. Other steps run their groups one by one.
+    Pages stream through a ring of 4 group slots, group ``g`` in slot
+    ``g % 4``: before the groups ``[w, w + n)`` run, groups ``w + 2 ..
+    w + n + 1`` start (2 groups in flight ahead of the running ones)."""
+    ring = sem_ref.shape[0]
+    row_width = buf_ref.shape[-1]
+    fp4 = scale_hbm_ref is not None
+
+    def copies(slot, sem_slot, page, kv_head, n=1, g=0):
+        src = kv_hbm_ref.at[pl.ds(page, n), :, :, pl.ds(kv_head * row_width, row_width)]
+        out = [
+            pltpu.make_async_copy(
+                src, buf_ref.at[slot, pl.ds(g, n), 0], sem_ref.at[sem_slot, 0]
+            )
+        ]
+        if fp4:
+            out.append(
+                pltpu.make_async_copy(
+                    scale_hbm_ref.at[pl.ds(page, n)],
+                    scale_buf_ref.at[slot, pl.ds(g, n), 0],
+                    scale_sem_ref.at[sem_slot, 0],
+                )
+            )
+        return out
+
+    def start(group_id):
+        slot = group_id % ring
+        base = msa_attention._slot(work_meta_ref[group_id], pages_per_step, 0)
+        kv_head = group_head(group_id)
+
+        def one(g, queue=0):
+            page = page_table_ref[work_page_ref[base + g]]
+            for copy in copies(slot, slot, page, kv_head, g=g):
+                copy.start(priority=queue)
+
+        count = work_count_ref[group_id]
+
+        def start4(i, carry):
+            for j in range(_START_UNROLL):
+                one(_START_UNROLL * i + j, j % 2)
+            return carry
+
+        jax.lax.fori_loop(0, count // _START_UNROLL, start4, 0)
+
+        def start1(g, carry):
+            one(g)
+            return carry
+
+        jax.lax.fori_loop(count - count % _START_UNROLL, count, start1, 0)
+
+    def start_if(group_id):
+        pl.when(group_id < num_groups)(functools.partial(start, group_id))
+
+    def wait(group_id):
+        slot = group_id % ring
+        count = work_count_ref[group_id]
+        n = 1
+        while n <= pages_per_step:
+            for copy in copies(slot, slot, 0, 0, n):
+                pl.when((count & n) != 0)(copy.wait)
+            n *= 2
+
+    lo, hi = block_start_ref[b], block_start_ref[b + 1]
+
+    @pl.when(lo == 0)
+    def _first():
+        start_if(0)
+        start_if(1)
+
+    def one_by_one(w, carry):
+        start_if(w + 2)
+        wait(w)
+        g = group(w, mode="setup")
+        g.run_widths()
+        pl.when(g.count == 0)(g.empty)
+        return carry
+
+    widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
+
+    def two_at_a_time(i, carry):
+        w = lo + 2 * i
+        start_if(w + 2)
+        start_if(w + 3)
+        wait(w)
+        wait(w + 1)
+        outs = ([], [])
+        ga = group(w, mode="setup", sink=outs[0])
+        gb = group(w + 1, mode="setup", sink=outs[1])
+        count = jnp.maximum(ga.count, gb.count)
+        block_q = o_ref.shape[1] // tiles_per_step
+        rows = pl.ds(pl.multiple_of(2 * i * block_q, 2 * block_q), 2 * block_q)
+
+        def store():
+            o_ref[:, rows, :] = jnp.concatenate(
+                [outs[0].pop(), outs[1].pop()], axis=1
+            ).astype(o_ref.dtype)
+        for k, width in enumerate(widths):
+            fits = count > (widths[k - 1] if k else 0)
+            if width < pages_per_step:
+                fits = fits & (count <= width)
+
+            def both(width=width):
+                ga.attend(width, True)
+                gb.attend(width, True)
+                store()
+
+            pl.when(fits)(both)
+
+        @pl.when(count == 0)
+        def _empty():
+            ga.empty()
+            gb.empty()
+            store()
+
+        return carry
+
+    if tiles_per_step % 2:  # no pairs in a step
+        jax.lax.fori_loop(lo, hi, one_by_one, 0)
+        return
+    paired = hi - lo == tiles_per_step
+
+    @pl.when(paired)
+    def _pairs():
+        jax.lax.fori_loop(0, tiles_per_step // 2, two_at_a_time, 0)
+
+    @pl.when(jnp.logical_not(paired))
+    def _singles():
+        jax.lax.fori_loop(lo, hi, one_by_one, 0)
 
 
 def _merged_store_rows(block_q: int, num_heads: int, dtype) -> int:
@@ -1001,6 +1290,7 @@ def _attention_call(
     row_split=1,
     tiles_per_head=0,
     precision=frozenset(),
+    pair=False,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -1079,6 +1369,10 @@ def _attention_call(
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
     ring = 1 + (_FP4_PREFETCH if fp4 else 1)
+    # `pair` (decode, streamed): two running groups + two in flight.
+    pair = bool(pair) and not cache_size and not transposed and row_split == 1
+    if pair:
+        ring = 4
     # Page buffers: a ring of groups, or (page cache) one flat array of
     # max(cache_size, ring groups) pages; the cache's semaphore row follows.
     if cache_size:
@@ -1160,7 +1454,8 @@ def _attention_call(
             bf16_cache=bf16_cache,
             row_split=row_split,
             tiles_per_head=tiles_per_head,
-            precision=precision if fp4 else frozenset(),
+            precision=precision if fp4 else precision & frozenset(_FP8_LEVERS),
+            pair=pair,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1466,24 +1761,70 @@ def _proof(flag: str, detail: str) -> None:
         print(f"{flag}=1: {detail}", flush=True)  # workers may log nowhere
 
 
+DECODE_OPT_ENV = "TPU_MINIMAX_M3_MSA_DECODE_OPT"
+
+
+def decode_opt() -> dict:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` (read when the program is traced) for
+    decode batches of 8-token tiles with wide groups (`msa_dcp`, more than
+    128 tokens), items separated by "," or "+" (inside comma-separated env
+    lists): ``widths=<w/w/...>`` the step widths below
+    the full group; ``pps=<n>`` pages per group; ``pair``: every decode call
+    (`_chunked_call`, any batch) runs its one-group tiles two at a time
+    (`_pair_loop`). Empty = off (the defaults)."""
+    spec = os.environ.get(DECODE_OPT_ENV, "").strip()
+    opt = {}
+    for item in filter(None, (x.strip() for x in spec.replace("+", ",").split(","))):
+        key, _, val = item.partition("=")
+        if key == "widths" and val:
+            opt["step_widths"] = tuple(sorted(int(w) for w in val.split("/")))
+        elif key == "pps" and val.isdigit() and int(val) >= 4:
+            opt["pages_per_step"] = int(val)
+        elif key == "pair" and not val:
+            opt["pair"] = True
+        else:
+            raise ValueError(f"{DECODE_OPT_ENV}: unknown item {item!r} in {spec!r}")
+    if opt:
+        _proof(DECODE_OPT_ENV, f"MSA decode tiles run {opt}")
+    return opt
+
+
+def decode_pair() -> bool:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` holds ``pair``."""
+    spec = os.environ.get(DECODE_OPT_ENV, "")
+    return "pair" in (x.strip() for x in spec.replace("+", ",").split(","))
+
+
 # 4-bit prefill calls with a page cache pick their tiles per call from the
 # width of their selections (`adaptive_prefill`).
 ADAPTIVE_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE"
 
 
-def adaptive_prefill() -> tuple[int, int, int] | None:
+def adaptive_prefill() -> tuple[int, dict] | None:
     """``envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE`` = "<threshold>:<block_q>:
-    <tile_pages>" as ints, or None (unset). Read when the calling program is
+    <tile_pages>[:<pages_per_step>[:<widths w.w.w>]]" -> (threshold, the wide
+    configuration's kernel kwargs), or None (unset). The optional fields give
+    the wide configuration its own pages per step and step widths ("." between
+    widths; unset = the configured ones). Read when the calling program is
     traced, through `envs` (part of the compile-cache key)."""
     from vllm_torchtpu import envs
 
     spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE.strip()
     if not spec:
         return None
-    parts = [int(x) for x in spec.replace("/", ":").split(":")]
-    if len(parts) != 3 or min(parts) <= 0:
-        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want <threshold>:<block_q>:<tile_pages>")
-    return parts[0], parts[1], parts[2]
+    fields = spec.replace("/", ":").split(":")
+    want = "<threshold>:<block_q>:<tile_pages>[:<pages_per_step>[:<w.w...>]]"
+    if not 3 <= len(fields) <= 5:
+        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want {want}")
+    parts = [int(x) for x in fields[:4]]
+    if min(parts) <= 0:
+        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want {want}")
+    wide = dict(block_q=parts[1], page_cache_tile_pages=parts[2])
+    if len(parts) > 3:
+        wide["pages_per_step"] = parts[3]
+    if len(fields) > 4:
+        wide["step_widths"] = tuple(sorted(int(w) for w in fields[4].split(".")))
+    return parts[0], wide
 
 
 def wide_selection(
@@ -1589,6 +1930,12 @@ def _chunked_call(
             cache_bf16=page_cache_bf16,
             precision=prefill_precision_levers(prefill_precision),
         )
+    elif scale_cache is None and prefill_precision:
+        # 8-bit pages: `prefill_precision` names TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
+        # levers (`msa_dcp.msa_attend_dcp`).
+        call = functools.partial(
+            call, precision=fp8_prefill_levers(prefill_precision)
+        )
     limit = msa_attention.MAX_TOKENS_PER_CALL
     step = min(num_tokens, max(block_q, limit - limit % block_q))
     num_chunks = -(-num_tokens // step)
@@ -1605,6 +1952,9 @@ def _chunked_call(
     align = _merged_store_rows(block_q, num_q_heads // num_heads, q.dtype)
     tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
     decode = num_chunks == 1 and num_tokens <= _DECODE_MAX_TOKENS and not cache_size
+    if decode and decode_pair():
+        _proof(DECODE_OPT_ENV, "MSA decode tiles run two at a time (pair)")
+        call = functools.partial(call, pair=True)
     if decode and num_heads > 1 and _env_flag(ONE_CALL_ENV):
         _proof(ONE_CALL_ENV, f"{num_heads} KV heads in one MSA decode call")
         return _one_call_heads(

@@ -240,9 +240,80 @@ def topp_mask(
         )
         return probability_mass < p
 
-    threshold = _float32_bsearch(logits.shape[:-1], predicate, logits.device)
+    if _topp_kernel_applies(probs):
+        threshold = _topp_kernel_threshold(probs, p)
+    else:
+        threshold = _float32_bsearch(logits.shape[:-1], predicate, logits.device)
     threshold = threshold.unsqueeze(-1)
     return torch.where(probs >= threshold, logits, replace_tensor)
+
+
+_topp_threshold_op = None
+
+
+def topp_candidate_tiers() -> tuple[int, ...]:
+    """TPU_SAMPLER_TOPP_CANDIDATES as a tuple of block counts."""
+    from vllm_torchtpu import envs
+
+    raw = envs.TPU_SAMPLER_TOPP_CANDIDATES.strip()
+    if not raw:
+        return ()
+    tiers = tuple(int(x) for x in raw.split(",") if x.strip())
+    if any(t <= 0 for t in tiers) or list(tiers) != sorted(tiers):
+        raise ValueError(
+            f"TPU_SAMPLER_TOPP_CANDIDATES={raw!r}: increasing positive block counts"
+        )
+    return tiers
+
+
+def arm_topp_kernel() -> bool:
+    """Register the TPU_SAMPLER_TOPP_CANDIDATES op eagerly, before any
+    sampler graph traces. Returns whether it is armed."""
+    global _topp_threshold_op
+    tiers = topp_candidate_tiers()
+    if not tiers:
+        return False
+    if _topp_threshold_op is not None:
+        return True
+    import jax
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.layers.adapter.sample.topp_candidates import topp_threshold
+    from vllm_torchtpu.logger import init_logger
+
+    def fn(probs: jax.Array, p: jax.Array) -> jax.Array:
+        return topp_threshold(probs, p, tiers)
+
+    op = pallas.jax_op("pallas::topp_threshold_candidates", fn)
+    op.register_fake(
+        lambda probs, p: probs.new_empty(probs.shape[:1], dtype=torch.float32)
+    )
+    _topp_threshold_op = op
+    init_logger(__name__).info(
+        "TPU_SAMPLER_TOPP_CANDIDATES: top-p threshold from candidate tiers "
+        "of %s 128-logit blocks, full bisection as the fallback.",
+        ",".join(map(str, tiers)),
+    )
+    return True
+
+
+def _topp_kernel_applies(probs: torch.Tensor) -> bool:
+    """The armed TPU_SAMPLER_TOPP_CANDIDATES op, on a TPU ``[rows, vocab]``
+    probability matrix whose vocab is a whole number of 128-lane tiles."""
+    return (
+        _topp_threshold_op is not None
+        and probs.device.type == "tpu"
+        and probs.dim() == 2
+        and probs.shape[-1] % CANDIDATE_BLOCK == 0
+    )
+
+
+def _topp_kernel_threshold(probs: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """``topp_mask``'s bisection result (float32 ``[rows]``) from the
+    candidate tiers (topp_candidates.py). Rows with ``p >= 1`` get an
+    unspecified value; `apply_top_k_top_p` does not apply top-p to them."""
+    assert _topp_threshold_op is not None
+    return _topp_threshold_op(probs.to(torch.float32), p.to(torch.float32))
 
 
 def apply_top_k_top_p(

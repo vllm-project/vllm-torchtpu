@@ -48,6 +48,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
@@ -460,6 +461,13 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     s_j, b_j = s[:, None, :], b[:, None, :]
     ahead = real[:, None, :] & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
     place = jnp.where(real, jnp.sum(ahead, axis=2, dtype=jnp.int32), topk)
+    if envs.TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT:
+        # Same selection with the candidates on the reduced (minor) axis:
+        # [rows, topk, dcp * topk] -> max over lanes. XLA lays the
+        # [rows, dcp * topk, topk] form out badly at some row counts (32
+        # rows: 3.5 us vs 0.4 us at 24); the values are identical.
+        slot = jnp.arange(topk, dtype=jnp.int32)[None, :, None]
+        return jnp.max(jnp.where(place[:, None, :] == slot, b[:, None, :], -1), axis=2)
     slot = jnp.arange(topk, dtype=jnp.int32)[None, None, :]
     return jnp.max(jnp.where(place[:, :, None] == slot, b_i, -1), axis=1)
 
@@ -867,6 +875,13 @@ def msa_write_and_candidates_dcp(
     return kv_cache, index_cache, packed.reshape(num_tokens, -1)
 
 
+def _fp8_opt() -> str:
+    """TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT (read when traced)."""
+    from vllm_torchtpu import envs
+
+    return envs.TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
+
+
 def msa_attend_dcp(
     q: jax.Array,
     kv_cache: jax.Array,
@@ -1006,6 +1021,7 @@ def _attend_selected(
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
     small = num_tokens <= DCP_SMALL_BATCH_TOKENS
+    decode_opt = {}
     if small:
         block_q = msa_attention.SMALL_BATCH_BLOCK_Q
         pages_per_step = (
@@ -1013,6 +1029,12 @@ def _attend_selected(
             if num_tokens >= _WIDE_GROUP_MIN_TOKENS
             else msa_attention.DEFAULT_PAGES_PER_STEP
         )
+        decode_opt = (
+            msa_attention_lse.decode_opt()
+            if num_tokens >= _WIDE_GROUP_MIN_TOKENS
+            else {}
+        )
+        pages_per_step = decode_opt.get("pages_per_step", pages_per_step)
     elif scale_cache is not None:
         block_q = msa_attention.PREFILL_BLOCK_Q_4BIT
         pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP_4BIT
@@ -1026,6 +1048,8 @@ def _attend_selected(
         q_head_major=q_head_major,
         interpret=interpret,
     )
+    if small and "step_widths" in decode_opt:
+        common["step_widths"] = decode_opt["step_widths"]
     if num_tokens >= _MIN_CANDIDATE_TOKENS:  # prefill-sized steps only
         common["step_widths"] = msa_attention_lse.PREFILL_STEP_WIDTHS
         common["row_split"] = msa_attention_lse.PREFILL_ROW_SPLIT
@@ -1036,6 +1060,8 @@ def _attend_selected(
         if scale_cache is not None:
             common["page_cache_slots"] = msa_attention_lse.PREFILL_PAGE_CACHE_SLOTS
             common["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
+        elif _fp8_opt():
+            common["prefill_precision"] = _fp8_opt()
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     adaptive = (
         msa_attention_lse.adaptive_prefill()
@@ -1047,14 +1073,24 @@ def _attend_selected(
     if adaptive is not None:
         # Two kernel configurations in the program; each call runs one, by
         # how wide its selections are (the other's outputs are not computed).
-        threshold, wide_block_q, wide_tile_pages = adaptive
+        threshold, wide_kw = adaptive
         msa_attention_lse._proof(
             msa_attention_lse.ADAPTIVE_ENV,
             f"MSA prefill tiles per call: > {threshold} pages per "
-            f"{common['block_q']}-token tile -> block_q {wide_block_q}, "
-            f"tile pages {wide_tile_pages}",
+            f"{common['block_q']}-token tile -> block_q {wide_kw['block_q']}, "
+            f"tile pages {wide_kw['page_cache_tile_pages']}"
+            + (
+                f", pages per step {wide_kw['pages_per_step']}"
+                if "pages_per_step" in wide_kw
+                else ""
+            )
+            + (
+                f", widths {wide_kw['step_widths']}"
+                if "step_widths" in wide_kw
+                else ""
+            ),
         )
-        wide = dict(common, block_q=wide_block_q, page_cache_tile_pages=wide_tile_pages)
+        wide = dict(common, **wide_kw)
 
         def attend(kw):
             def run(operands):

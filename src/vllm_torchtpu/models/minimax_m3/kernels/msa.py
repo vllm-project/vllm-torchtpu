@@ -25,6 +25,7 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
     msa_fp4,
@@ -319,9 +320,11 @@ def _block_scores(
     scale_cache=None,
     scale_row=None,
     index_heads=1,
+    row_order=None,
 ):
     """`index_q` must already be rotated for a 4-bit cache; its rows fold
     `index_heads` heads per token (`block_score_options`)."""
+    extra = {} if row_order is None else {"row_order": row_order}
     return msa_indexer.block_scores(
         index_q,
         index_cache,
@@ -333,6 +336,7 @@ def _block_scores(
         scale_cache=scale_cache,
         scale_row=scale_row,
         interpret=interpret,
+        **extra,
     )
 
 
@@ -501,12 +505,50 @@ def fold_index_heads(
         # Padding tokens after the last request, one unique row each.
         num_heads * num_real + head * (num_tokens - num_real) + (tok - num_real)[None],
     )
+    if "gather" in index_fold_opt():
+        # The same rows by a gather: row r's (head, token), inverted from the
+        # layout above (a scatter of the rows cost ~4 us per layer at c64).
+        r = jnp.arange(num_heads * num_tokens, dtype=jnp.int32)
+        req = jnp.minimum(
+            jnp.searchsorted(
+                num_heads * cu_q_lens[1:], r, side="right", method="compare_all"
+            ).astype(jnp.int32),
+            cu_q_lens.shape[0] - 2,
+        )
+        off = r - num_heads * cu_q_lens[req]
+        r_len = jnp.maximum(cu_q_lens[req + 1] - cu_q_lens[req], 1)
+        pad = r >= num_heads * num_real
+        pad_off = r - num_heads * num_real
+        pad_len = jnp.maximum(num_tokens - num_real, 1)
+        src_head = jnp.where(pad, pad_off // pad_len, off // r_len)
+        src_tok = jnp.where(pad, num_real + pad_off % pad_len, cu_q_lens[req] + off % r_len)
+        folded = index_q.reshape(num_tokens * num_heads, head_dim)[
+            src_tok * num_heads + src_head
+        ]
+        return folded, rows
     folded = (
         jnp.zeros((num_heads * num_tokens, head_dim), index_q.dtype)
         .at[rows.reshape(-1)]
         .set(index_q.transpose(1, 0, 2).reshape(-1, head_dim))
     )
     return folded, rows
+
+
+_index_fold_logged = False
+
+
+def index_fold_opt() -> str:
+    """`TPU_MINIMAX_M3_INDEX_FOLD_OPT`: ``gather`` folds the index heads by a
+    gather instead of a scatter, ``compose`` takes the unfolded scores from
+    `block_scores`' own gather; ``+``-joined. Same values either way."""
+    global _index_fold_logged
+    from vllm_torchtpu import envs
+
+    opt = envs.TPU_MINIMAX_M3_INDEX_FOLD_OPT
+    if opt and not _index_fold_logged:
+        _index_fold_logged = True
+        init_logger(__name__).warning("TPU_MINIMAX_M3_INDEX_FOLD_OPT=%s", opt)
+    return opt
 
 
 def partial_block_scores(
@@ -547,7 +589,10 @@ def partial_block_scores(
         scale_cache,
         scale_row,
         index_heads=num_heads,
+        row_order=rows.reshape(-1) if "compose" in index_fold_opt() else None,
     )
+    if "compose" in index_fold_opt():
+        return scores.reshape(num_heads, -1, scores.shape[-1])
     return scores[rows, 0]
 
 
