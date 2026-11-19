@@ -620,7 +620,9 @@ def armed_scores_cap(monkeypatch):
     from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 
     monkeypatch.setattr(moe_lowtok_scores, "_ARMED_MAX_TOKENS", 0)
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    # In the module's dict: it shadows the environment and any attribute
+    # another test left, and is removed afterwards.
+    monkeypatch.setitem(vars(envs), "TPU_MOE_SKIP_PADDED_TOKENS", True)
 
 
 @pytest.mark.multichip

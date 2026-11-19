@@ -37,6 +37,16 @@ pytestmark = pytest.mark.cpu_test
 TOPK = 10
 
 
+def _set_env(monkeypatch, name, value):
+    """Give one of envs' lazily read values to this test only.
+
+    Set in the module's dict, the value shadows the environment and any
+    attribute another test left on the module (a setenv would be shadowed by
+    one), and monkeypatch removes it afterwards or restores the one found.
+    """
+    monkeypatch.setitem(vars(envs), name, value)
+
+
 @pytest.fixture
 def fresh(monkeypatch):
     """Unarmed module state, the op build stubbed, and rank tensors on the host."""
@@ -274,7 +284,7 @@ def test_apply_masks_padded_rows_and_passes_the_programs_operand_order(
     w13, w2, their scales; experts_start as [1]; the rank buffer."""
     from vllm_torchtpu.layers.adapter import token_padding
 
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded)
+    _set_env(monkeypatch, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded)
     build, rank = recorded_op
     layer = _served_layer()
     x = torch.randn(4, 8)
@@ -380,7 +390,7 @@ def fused_ep_v3(monkeypatch):
     eligibility."""
     from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
 
-    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+    _set_env(monkeypatch, "USE_MOE_FUSED_EP_KERNEL", True)
     monkeypatch.setattr(fused_moe_ep_v3, "_OP", object())
 
 
@@ -448,7 +458,7 @@ def test_maybe_prebuild_leaves_layers_whose_steps_never_reach_the_op(
     v3 refused (the forward takes another path), copy slots or no scores entry
     (``serves`` declines), or no expert parallelism."""
     if not requested:
-        monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", False)
+        _set_env(monkeypatch, "USE_MOE_FUSED_EP_KERNEL", False)
     op.maybe_prebuild(layer, scores_op)
     prebuild.assert_not_called()
     fresh.assert_not_called()
@@ -519,8 +529,8 @@ def test_fp8_moe_weight_processing_offers_a_v3_layer_to_the_op(monkeypatch):
     """Under fused EP v3, VllmFp8MoEMethodTPU.process_weights_after_loading
     offers the layer and its scores entry to maybe_prebuild after v3's
     prebuild has decided the layer's eligibility."""
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_IMPL", "v3")
-    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+    _set_env(monkeypatch, "MOE_FUSED_EP_KERNEL_IMPL", "v3")
+    _set_env(monkeypatch, "USE_MOE_FUSED_EP_KERNEL", True)
     calls = []
     method, layer, scores_op = _fp8_moe_layer(monkeypatch, calls)
     method.process_weights_after_loading(layer)
@@ -531,8 +541,8 @@ def test_fp8_moe_weight_processing_offers_a_v3_layer_to_the_op(monkeypatch):
 
 def test_fp8_moe_weight_processing_without_v3_never_offers_the_layer(monkeypatch):
     """Without fused EP v3 the op has no caller, so the layer is not offered."""
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_IMPL", None)
-    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", False)
+    _set_env(monkeypatch, "MOE_FUSED_EP_KERNEL_IMPL", None)
+    _set_env(monkeypatch, "USE_MOE_FUSED_EP_KERNEL", False)
     calls = []
     method, layer, _ = _fp8_moe_layer(monkeypatch, calls)
     method.process_weights_after_loading(layer)
