@@ -51,10 +51,7 @@ def parse(raw: Any) -> CollectivesOptions:
 
 def get(vllm_config: Any) -> CollectivesOptions:
     """The engine's collectives options."""
-    additional = vllm_config.additional_config
-    if not isinstance(additional, dict):
-        return CollectivesOptions()
-    return parse(additional.get(SECTION))
+    return config_section.get(CollectivesOptions, SECTION, vllm_config)
 
 
 def validate(vllm_config: Any) -> None:
