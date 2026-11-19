@@ -23,21 +23,25 @@ this build claims (``additional_config_sections``), and applies the TPU
 defaults below. Engines of other architectures get none of this.
 
 Each default fills a value only when the user left it unset, so an explicit
-command-line value always wins, and only on the engines it was measured on:
-Qwen3.5-397B-A17B on TPU7x, in the roles and layouts of the validation
-entries (``validation/``). Every other engine keeps main's behaviour.
+command-line value always wins. The KV budget and the prefix match unit apply
+only on the engines they were measured on: Qwen3.5-397B-A17B on TPU7x, in the
+roles and layouts of the validation entries (``validation/``). The kernel
+page applies to either leg of a KV-transfer pair of that checkpoint shape on
+any chip, because it only makes the two legs page alike. Every other engine
+keeps main's behaviour.
 
 - ``prefix_match_unit``: 128 tokens on a prefill (``kv_producer``) leg
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
   resolves its hash block size from its KV cache groups.
-- ``additional_config["tpu_kv_transfer"]["kernel_page_tokens"]``: 128, for an
-  engine of the calibrated checkpoint shape with a KV transfer config, a
+- ``additional_config["tpu_kv_transfer"]["kernel_page_tokens"]``: 128, for a
+  KV producer or consumer of the calibrated checkpoint shape with a
   seq-along-lane KV cache layout and no prefill context parallelism, so the
   prefill and decode legs of a pair page their seq-along-lane caches alike
   (see ``attention.kv_transfer_kernel_page``). A PCP prefill engine, an
-  engine on another layout (whose page the transfer does not carry) and
-  other checkpoints keep vLLM's page choice, as on main.
+  engine on another layout (whose page the transfer does not carry), an
+  engine whose only connector offloads (``kv_both``, no peer) and other
+  checkpoints keep vLLM's page choice, as on main.
 - ``tpu_pp_scheduler.hybrid_state_retention``: true on a prefill
   (``kv_producer``) leg with more than one pipeline stage, without context
   parallelism, whose pipeline chunk scheduler the platform installs (the
@@ -84,7 +88,7 @@ def _chip_family() -> str | None:
 def has_calibrated_shape(model_config) -> bool:
     """Whether the checkpoint has the calibrated shape (Qwen3.5-397B-A17B's
     text config), whatever the device."""
-    text = getattr(model_config, "hf_text_config", None)
+    text = model_config.hf_text_config
     return all(getattr(text, k, None) == v for k, v in _CALIBRATED_SHAPE.items())
 
 
@@ -92,11 +96,7 @@ def _is_calibrated(model_config) -> bool:
     """Whether the defaults were measured for this checkpoint and device:
     the calibrated checkpoint shape on a TPU7x device. Any other shape, a
     smaller device or an unknown device keeps main's behaviour."""
-    text = getattr(model_config, "hf_text_config", None)
-    for key, value in _CALIBRATED_SHAPE.items():
-        if getattr(text, key, None) != value:
-            return False
-    return _chip_family() == _CALIBRATED_CHIP
+    return has_calibrated_shape(model_config) and _chip_family() == _CALIBRATED_CHIP
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
@@ -164,7 +164,13 @@ def _kv_layout_is_seq_along_lane(vllm_config: VllmConfig) -> bool:
 
 
 def _apply_kv_transfer_page(vllm_config: VllmConfig) -> None:
-    if vllm_config.kv_transfer_config is None:
+    # Only a producer and a consumer exchange pages with a peer. An engine whose
+    # only connector offloads (kv_both) has none, and its page at 128 against
+    # vLLM's choice was never measured. (vLLM's MultiConnector gives each child
+    # a shallow copy of the engine config, so the offloading child of a prefill
+    # engine still sees the section written for the engine.)
+    transfer = vllm_config.kv_transfer_config
+    if transfer is None or transfer.kv_role not in ("kv_producer", "kv_consumer"):
         return
     if vllm_config.parallel_config.prefill_context_parallel_size > 1:
         return
