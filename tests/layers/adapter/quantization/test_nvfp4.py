@@ -65,6 +65,7 @@ class FakeRoutedExperts(RoutedExperts):
     ):
         torch.nn.Module.__init__(self)
         self.moe_config = MagicMock()
+        self.moe_config.swiglu_limit = None
         self.moe_config.num_experts = num_experts
         self.moe_config.experts_per_token = experts_per_token
         self.moe_config.ep_size = 1

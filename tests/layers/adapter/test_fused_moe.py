@@ -18,7 +18,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu.layers.adapter.fused_moe import get_fused_moe_activation
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    TpuMoEActivationMixin,
+    get_fused_moe_activation,
+)
 
 
 class _Activation(Enum):
@@ -26,8 +29,39 @@ class _Activation(Enum):
 
 
 @pytest.mark.parametrize("activation", ["silu", _Activation.SILU])
-def test_get_fused_moe_activation_preserves_standard_activations(activation):
-    assert get_fused_moe_activation(activation, object()) == "silu"
+@pytest.mark.parametrize("swiglu_limit", [None, 0.0])
+def test_get_fused_moe_activation_preserves_standard_activations(
+    activation, swiglu_limit
+):
+    moe_config = SimpleNamespace(swiglu_limit=swiglu_limit)
+    assert get_fused_moe_activation(activation, moe_config) == "silu"
+
+
+@pytest.mark.parametrize(
+    "swiglu_limit,expected",
+    [
+        # DeepSeek-V4 and Hy4-preview: the name the fused EP kernel matches.
+        (10.0, "silu_and_mul_with_clamp"),
+        (4.0, "silu_and_mul_with_clamp:4.0"),
+    ],
+)
+def test_get_fused_moe_activation_encodes_swiglu_limit(swiglu_limit, expected):
+    moe_config = SimpleNamespace(swiglu_limit=swiglu_limit)
+
+    assert get_fused_moe_activation("silu", moe_config) == expected
+    assert get_fused_moe_activation(_Activation.SILU, moe_config) == expected
+
+
+def test_swiglu_limit_reaches_the_quant_method_activation():
+    """The fp8 / unquantized / nvfp4 methods resolve through this mixin."""
+    layer = SimpleNamespace(
+        activation="silu", moe_config=SimpleNamespace(swiglu_limit=10.0)
+    )
+
+    assert (
+        TpuMoEActivationMixin()._resolve_tpu_activation(layer)
+        == "silu_and_mul_with_clamp"
+    )
 
 
 @pytest.mark.parametrize(
@@ -56,11 +90,14 @@ def test_get_fused_moe_activation_requires_situ_beta():
         get_fused_moe_activation("situ", moe_config)
 
 
+_NO_CLAMP = SimpleNamespace(swiglu_limit=None)
+
+
 @pytest.mark.tpu_test
 def test_get_fused_moe_activation_compiles():
     @torch.compile(fullgraph=True)
     def compiled_fn(x, activation):
-        act_str = get_fused_moe_activation(activation, None)
+        act_str = get_fused_moe_activation(activation, _NO_CLAMP)
         if act_str == "silu":
             return x * 2
         return x

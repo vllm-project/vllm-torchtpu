@@ -27,6 +27,7 @@ class FakeRoutedExperts(RoutedExperts):
         torch.nn.Module.__init__(self)
         # Gated MoE metadata consumed by native checkpoint allocation.
         self.moe_config = MagicMock(w13_num_shards=2)
+        self.moe_config.swiglu_limit = None
         self.moe_config.experts_per_token = experts_per_token
         self.moe_config.moe_parallel_config = MagicMock()
         self.moe_config.moe_parallel_config.use_ep = False
