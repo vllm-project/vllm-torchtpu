@@ -13,9 +13,13 @@
 # limitations under the License.
 """Device and chunk indexing; devices 2k and 2k+1 are the cores of chip k."""
 
+from collections.abc import Iterable
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.collectives.hierrs_tc.config import Config
 
@@ -37,6 +41,70 @@ class Topology:
 
     def get_neighbor_device_id(self, dim):
         return self.get_device_id(self.get_neighbor_chip_id(dim), self.cur_chiplet_bit)
+
+
+# Half `h` reduces along 2x2 hypercube dim `h`, then dim `1 - h`. After phase 1
+# each device holds one chunk per chip: step 0 keeps chunks matching on dim `h`,
+# and step 1 keeps only its own chip's chunk.
+def step0_send_chips(dim0_bit: Any, dim1_bit: Any, h: int) -> list[Any]:
+    return (
+        [(1 - dim0_bit) + 2 * j for j in range(2)]
+        if h == 0
+        else [2 * (1 - dim1_bit) + j for j in range(2)]
+    )
+
+
+def step0_keep_chips(dim0_bit: Any, dim1_bit: Any, h: int) -> list[Any]:
+    return (
+        [dim0_bit + 2 * j for j in range(2)]
+        if h == 0
+        else [2 * dim1_bit + j for j in range(2)]
+    )
+
+
+def step1_send_chip(dim0_bit: Any, dim1_bit: Any, h: int) -> Any:
+    return dim0_bit + 2 * (1 - dim1_bit) if h == 0 else 2 * dim1_bit + (1 - dim0_bit)
+
+
+def tpu_info() -> Any:
+    """Active TensorCore `TpuInfo`, falling back to tpu7x on TPU-less CPU tests."""
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:
+        return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+
+
+def epilogue_vmem_limit_bytes() -> int:
+    """Reserves 15/16 of TensorCore VMEM (60 MiB on 64 MiB tpu7x) for fused ops."""
+    return (int(tpu_info().vmem_capacity_bytes) * 15) // 16
+
+
+def rank_ordered_rows(
+    order: tuple[int, ...],
+    chip: int,
+    bit: Any,
+    chunk_rows: int,
+    blk: Any = 0,
+    block_rows: int | None = None,
+) -> Any:
+    """Row slice in `order` for `(chip, bit)` (and optional streaming block `blk`)."""
+    src = jnp.where(bit == 0, order[2 * chip], order[2 * chip + 1])
+    if block_rows is None:
+        return pl.ds(src * chunk_rows, chunk_rows)
+    return pl.ds(src * chunk_rows + blk * block_rows, block_rows)
+
+
+def wait_recv(buf: Any, sem: Any) -> None:
+    pltpu.make_async_copy(buf, buf, sem).wait()
+
+
+def signal_peers(
+    sem: Any,
+    peers: Iterable[Any],
+    device_id_type: Any = pl.DeviceIdType.LOGICAL,
+) -> None:
+    for p in peers:
+        pl.semaphore_signal(sem, 1, device_id=p, device_id_type=device_id_type)
 
 
 class ChunkLocator:
