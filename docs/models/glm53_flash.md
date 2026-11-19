@@ -4,7 +4,7 @@
 |---|---|
 | Hugging Face repo | `zai-org/GLM-5.3-Flash` |
 | Architecture classes | `Glm5NextForConditionalGeneration`, `Glm5NextForCausalLM` (`model_type: glm5_next`) |
-| Code | `src/vllm_torchtpu/models/vllm/glm5_next/`, `src/vllm_torchtpu/layers/adapter/custom_ops/glm53_*` |
+| Code | `src/vllm_torchtpu/models/vllm/glm5_next/`, `src/vllm_torchtpu/layers/adapter/custom_ops/glm53_*`, `src/vllm_torchtpu/kernels/glm53_*` |
 
 ## Model summary
 
@@ -28,10 +28,9 @@
   pooled KDA op (`build_kimi_pooled_kda_op` with `pool_tokens_per_row=1` on the
   RPA pool, `float32` conv state and `float32` recurrent state) so KDA state
   and MLA KV cache share a single unified block pool (`--mamba-cache-mode align`).
-- **mHC on the DeepSeek-V4 kernels**: every hyper-connection site runs the
-  DeepSeek-V4 mHC Pallas ops (GLM-5.3 uses the same gate and Sinkhorn math),
-  with the post-sublayer stream update of site `k` fused into the pre-collapse
-  of site `k + 1`, followed by GLM's weighted sublayer RMSNorm.
+- **Pallas mHC kernels** (`VLLM_TPU_GLM53_MHC_IMPL=pallas`, default): fuses the
+  post-sublayer stream update of site `k` with the Sinkhorn-Knopp pre-collapse
+  and RMSNorm of site `k + 1`.
 - **MoE**: vLLM's `FusedMoE` on the TPU grouped-matmul MoE kernels, with the
   clamped SwiGLU kernel variant for GLM's `swiglu_limit=10.0`.
 

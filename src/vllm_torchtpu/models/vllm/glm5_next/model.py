@@ -25,13 +25,11 @@ Consumes `transformers.Glm5NextTextConfig` (`model_config.hf_text_config`):
    indexer while a sequence fits in its top-k budget. The indexer tensors are
    skipped at load. See `TPUGlm5NextConfig` for the warning past that length.
 3. Manifold-constrained hyper-connections (mHC, `hc_mult` residual streams)
-   around both sublayers of every decoder layer, on the DeepSeek-V4 mHC
-   Pallas kernels (each post fused into the next pre), followed by GLM's
-   weighted sublayer RMSNorm.
+   around both sublayers of every decoder layer, on the Pallas mHC kernels
+   (each post fused into the next pre) or the compiled reference ops.
 4. Dense clamped-SwiGLU MLPs on the first layers (`mlp_layer_types`), then
    MoE layers with sigmoid `noaux_tc` routing, one shared expert and the same
-   clamped SwiGLU in every expert, on vLLM's `FusedMoE` and the TPU MoE
-   kernels.
+   clamped SwiGLU in every expert.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ from __future__ import annotations
 import functools
 import re
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -47,7 +45,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch_tpu._internal import pallas
-from vllm import ir
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -92,18 +89,16 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import _encode_layer_name
 
-from vllm_torchtpu.layers.adapter.custom_ops import glm53_kda_tpu
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    glm53_kda_tpu,
+    glm53_mhc_tpu,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmTPUMLAAttention,
 )
 from vllm_torchtpu.logger import init_logger
 
 from .config import GLM53_MLA_ROPE_PAD, MLA_IMPL_ABSORBED, glm53_mla_impl
-
-if TYPE_CHECKING:
-    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
-        MHCOps,
-    )
 
 logger = init_logger(__name__)
 
@@ -576,6 +571,9 @@ class Glm5NextMLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        # Built now so the compiled backbone finds them cached.
+        glm53_mhc_tpu.get_rms_norm_weighted_op(self.q_a_layernorm.variance_epsilon)
+        glm53_mhc_tpu.get_rms_norm_weighted_op(self.kv_a_layernorm.variance_epsilon)
         self.mla_impl = glm53_mla_impl()
         self.attn: Attention | None = None
         self.mla_attn: VllmTPUMLAAttention | None = None
@@ -618,10 +616,20 @@ class Glm5NextMLAAttention(nn.Module):
     ) -> torch.Tensor:
         """Attention output `[T, hidden]`."""
         del positions  # NoPE: no rotary embedding on the MLA layers.
+        # One compiled fusion per norm instead of eager `RMSNorm` (same op
+        # order as vLLM's `rms_norm`, so bit-exact).
         q_lora, _ = self.q_a_proj(hidden_states)
-        q_lora = self.q_a_layernorm(q_lora)
+        q_lora = glm53_mhc_tpu.rms_norm_weighted(
+            q_lora,
+            self.q_a_layernorm.weight,
+            self.q_a_layernorm.variance_epsilon,
+        )
         kv_a, _ = self.kv_a_proj_with_mqa(hidden_states)
-        kv_latent = self.kv_a_layernorm(kv_a[..., : self.kv_lora_rank])
+        kv_latent = glm53_mhc_tpu.rms_norm_weighted(
+            kv_a[..., : self.kv_lora_rank],
+            self.kv_a_layernorm.weight,
+            self.kv_a_layernorm.variance_epsilon,
+        )
         q, _ = self.q_b_proj(q_lora)  # [T, H_local * qk_head_dim]
 
         if self.mla_attn is not None:
@@ -656,109 +664,17 @@ class MhcDeferredPost(NamedTuple):
     """An mHC post (stream recombine) a layer owes, settled by the next pre."""
 
     sublayer_out: torch.Tensor  # [T, hidden_size]
-    residual: torch.Tensor  # [T, hc_mult, hidden_size] bf16
+    residual: torch.Tensor  # [T, hc_mult * hidden_size] bf16
     post: torch.Tensor  # [T, hc_mult, 1] f32
     comb: torch.Tensor  # [T, hc_mult, hc_mult] f32
 
 
-# `post = 2 * sigmoid(...)` in the GLM-5.3 hyper-connection.
-GLM53_HC_POST_MULT = 2.0
-
-
-class Glm5NextHyperConnection(nn.Module):
-    """One GLM-5.3 hyper-connection (mHC) site on the DeepSeek-V4 mHC kernels.
-
-    GLM-5.3's mHC is DeepSeek-V4's (vLLM `mhc_pre_torch` / `mhc_post_torch`):
-    an RMS-scaled mix GEMM, `sigmoid + eps` read gates, `2 * sigmoid` write
-    gates and a softmax-initialized Sinkhorn with one eps for both the pre
-    and the Sinkhorn, so it runs on the shared DeepSeek-V4 Pallas ops
-    (`deepseek_v4_mhc_op`). GLM then applies a weighted RMSNorm
-    (`sublayer_norm_weight`, the checkpoint's `input_layernorm` /
-    `post_attention_layernorm`) to the collapsed stream, through vLLM's
-    `rms_norm` op as `RMSNorm` does. The residual streams are
-    `[T, hc_mult, hidden_size]`; the parameters keep the checkpoint's
-    names and shapes.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        hc_mult: int,
-        hc_sinkhorn_iters: int,
-        hc_eps: float,
-        rms_norm_eps: float,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.hc_mult = hc_mult
-        self.hc_sinkhorn_iters = hc_sinkhorn_iters
-        self.hc_eps = hc_eps
-        self.rms_norm_eps = rms_norm_eps
-
-        mix = (2 + hc_mult) * hc_mult
-        self.fn = nn.Parameter(
-            torch.empty((mix, hc_mult * hidden_size), dtype=torch.float32)
-        )
-        self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
-        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-        self.sublayer_norm_weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=torch.float32)
-        )
-
-    @property
-    def mhc_ops(self) -> MHCOps:
-        """The DeepSeek-V4 mHC ops for this site's constants.
-
-        Built outside the compiled region: the runner materializes every
-        module's `mhc_ops` before the first compiled forward (see
-        `deepseek_v4_mhc_op.get_mhc_ops`).
-        """
-        ops = self.__dict__.get("_mhc_ops_instance")
-        if ops is None:
-            # Imported here: the op module needs the model wrapper context.
-            from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
-                deepseek_v4_mhc_op,
-            )
-
-            ops = deepseek_v4_mhc_op.get_mhc_ops(
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                GLM53_HC_POST_MULT,
-                self.hc_sinkhorn_iters,
-            )
-            object.__setattr__(self, "_mhc_ops_instance", ops)
-        return ops
-
-    def sublayer_norm(self, collapsed: torch.Tensor) -> torch.Tensor:
-        """GLM's weighted RMSNorm of the collapsed stream (in its dtype)."""
-        return ir.ops.rms_norm(collapsed, self.sublayer_norm_weight, self.rms_norm_eps)
-
-    def pre(
-        self, residual: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """`(post, comb, sublayer_input)` for the streams `residual`."""
-        post, comb, collapsed = self.mhc_ops.pre(
-            residual, self.fn, self.scale, self.base
-        )
-        return post, comb, self.sublayer_norm(collapsed)
-
-    def post_pre(
-        self,
-        sublayer_out: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The previous sublayer's post fused with this site's pre.
-
-        Returns `(residual, post, comb, sublayer_input)`, where `residual` is
-        the streams after the previous sublayer's recombine.
-        """
-        residual, post, comb, collapsed = self.mhc_ops.fused(
-            sublayer_out, residual, post, comb, self.fn, self.scale, self.base
-        )
-        return residual, post, comb, self.sublayer_norm(collapsed)
+def mhc_pallas_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether the Pallas mHC kernels run (they take bf16 residual streams)."""
+    return (
+        glm53_mhc_tpu.glm53_mhc_impl() == glm53_mhc_tpu.MHC_IMPL_PALLAS
+        and vllm_config.model_config.dtype == torch.bfloat16
+    )
 
 
 class Glm5NextDecoderLayer(nn.Module):
@@ -784,8 +700,9 @@ class Glm5NextDecoderLayer(nn.Module):
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
         )
-        self.attn_hc = Glm5NextHyperConnection(**hc_kwargs)
-        self.ffn_hc = Glm5NextHyperConnection(**hc_kwargs)
+        self.attn_hc = glm53_mhc_tpu.FusedGlm53HyperConnectionTpu(**hc_kwargs)
+        self.ffn_hc = glm53_mhc_tpu.FusedGlm53HyperConnectionTpu(**hc_kwargs)
+        self._mhc_pallas = mhc_pallas_enabled(vllm_config)
 
         if is_kda_layer(config, layer_idx):
             self.self_attn: (
@@ -824,30 +741,31 @@ class Glm5NextDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_streams: torch.Tensor,
         deferred: MhcDeferredPost | None = None,
-    ) -> tuple[torch.Tensor, MhcDeferredPost]:
+    ) -> tuple[torch.Tensor, MhcDeferredPost | None]:
         """Runs the layer; returns `(hidden_streams, deferred_post)`.
 
-        The FFN post is not applied here: it is returned as `deferred_post`
-        and fused into the next layer's attention pre (or settled by the
-        caller after the last layer), so the returned `hidden_streams` is
-        stale. With a `deferred` post from the previous layer, the input
-        `hidden_streams` is stale too and is not read.
+        On the Pallas mHC path the FFN post is not applied here: it is
+        returned as `deferred_post` and fused into the next layer's
+        attention pre (or settled by the caller after the last layer), and
+        the returned `hidden_streams` is stale. On the compiled path
+        `deferred_post` is always None.
         """
-        attn_hc, ffn_hc = self.attn_hc, self.ffn_hc
-        if deferred is None:
-            # Chain start: a standalone pre, nothing to fuse it with.
-            residual = hidden_streams
-            post, comb, norm_attn_in = attn_hc.pre(residual)
-        else:
-            residual, post, comb, norm_attn_in = attn_hc.post_pre(
-                deferred.sublayer_out, deferred.residual, deferred.post, deferred.comb
-            )
-        attn_out = self._run_attention(norm_attn_in, positions)
-        residual, post, comb, norm_ffn_in = ffn_hc.post_pre(
-            attn_out, residual, post, comb
+        if self._mhc_pallas:
+            return self._forward_pallas_mhc(positions, hidden_streams, deferred)
+        assert deferred is None
+        post_attn, comb_attn, norm_attn_in = self.attn_hc.collapse_and_norm(
+            hidden_streams
         )
+        attn_out = self._run_attention(norm_attn_in, positions)
+        hidden_streams = self.attn_hc.combine(
+            hidden_streams, attn_out, post_attn, comb_attn
+        )
+        post_ffn, comb_ffn, norm_ffn_in = self.ffn_hc.collapse_and_norm(hidden_streams)
         ffn_out = self.mlp(norm_ffn_in)
-        return residual, MhcDeferredPost(ffn_out, residual, post, comb)
+        hidden_streams = self.ffn_hc.combine(
+            hidden_streams, ffn_out, post_ffn, comb_ffn
+        )
+        return hidden_streams, None
 
     def _run_attention(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
@@ -860,6 +778,48 @@ class Glm5NextDecoderLayer(nn.Module):
         # The KDA layer's direct path declines eager steps without a state
         # cache (the startup profile run); run its generic forward instead.
         return self.self_attn(hidden_states=hidden_states, positions=positions)
+
+    def _forward_pallas_mhc(
+        self,
+        positions: torch.Tensor,
+        hidden_streams: torch.Tensor,
+        deferred: MhcDeferredPost | None,
+    ) -> tuple[torch.Tensor, MhcDeferredPost]:
+        attn_hc, ffn_hc = self.attn_hc, self.ffn_hc
+        if deferred is None:
+            # Chain start: a standalone pre, nothing to fuse it with.
+            residual = hidden_streams
+            post, comb, norm_attn_in = attn_hc.mhc_ops.pre(
+                residual,
+                *attn_hc.fn_split,
+                attn_hc.scale_f32,
+                attn_hc.base_f32,
+                attn_hc.sublayer_norm_weight,
+            )
+        else:
+            residual, post, comb, norm_attn_in = attn_hc.mhc_ops.fused(
+                deferred.sublayer_out,
+                deferred.residual,
+                deferred.post,
+                deferred.comb,
+                *attn_hc.fn_split,
+                attn_hc.scale_f32,
+                attn_hc.base_f32,
+                attn_hc.sublayer_norm_weight,
+            )
+        attn_out = self._run_attention(norm_attn_in, positions)
+        residual, post, comb, norm_ffn_in = ffn_hc.mhc_ops.fused(
+            attn_out,
+            residual,
+            post,
+            comb,
+            *ffn_hc.fn_split,
+            ffn_hc.scale_f32,
+            ffn_hc.base_f32,
+            ffn_hc.sublayer_norm_weight,
+        )
+        ffn_out = self.mlp(norm_ffn_in)
+        return residual, MhcDeferredPost(ffn_out, residual, post, comb)
 
 
 # Without `--enforce-eager` the runner compiles the whole backbone once per
@@ -885,11 +845,6 @@ class Glm5NextTextModel(nn.Module):
         self.hidden_size = int(config.hidden_size)
         self.vocab_size = int(config.vocab_size)
         self.hc_mult = int(config.hc_mult)
-        if vllm_config.model_config.dtype != torch.bfloat16:
-            raise NotImplementedError(
-                "GLM-5.3-Flash on TPU runs its hyper-connections on the bf16 "
-                "DeepSeek-V4 mHC kernels; serve it with --dtype bfloat16."
-            )
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -916,8 +871,14 @@ class Glm5NextTextModel(nn.Module):
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(self.hidden_size, eps=float(config.rms_norm_eps))
+            glm53_mhc_tpu.get_rms_norm_weighted_op(self.norm.variance_epsilon)
         else:
             self.norm = PPMissingLayer()
+
+        # Resolved here, not in `forward`: env reads and the mHC impl choice
+        # would otherwise be traced into the compiled program as constants,
+        # and every decoder layer agrees on them.
+        self._mhc_pallas = mhc_pallas_enabled(vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -932,17 +893,32 @@ class Glm5NextTextModel(nn.Module):
     ) -> torch.Tensor | IntermediateTensors:
         del kwargs
         layers = self.layers[self.start_layer : self.end_layer]
+        # The Pallas mHC ops carry the streams flattened to [T, M * D]; the
+        # compiled path keeps [T, M, D].
+        flat = bool(layers) and self._mhc_pallas
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 assert input_ids is not None
                 hidden_states = self.embed_input_ids(input_ids)
-            # [T, D] -> [T, M, D]: the same stream in every slot.
-            hidden_streams = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            if flat:
+                # [T, D] -> [T, M * D]: M copies, same bytes as [T, M, D].
+                hidden_streams = hidden_states.repeat(1, self.hc_mult)
+            else:
+                lead_expand = (-1,) * (hidden_states.ndim - 1)
+                hidden_streams = (
+                    hidden_states.unsqueeze(-2)
+                    .expand(*lead_expand, self.hc_mult, self.hidden_size)
+                    .contiguous()
+                )
         else:
             assert intermediate_tensors is not None
             hidden_streams = cast(torch.Tensor, intermediate_tensors["hidden_streams"])
+            if flat:
+                hidden_streams = hidden_streams.reshape(
+                    -1, self.hc_mult * self.hidden_size
+                )
 
         deferred: MhcDeferredPost | None = None
         for layer in layers:
@@ -952,18 +928,25 @@ class Glm5NextTextModel(nn.Module):
                 deferred=deferred,
             )
         if deferred is not None:
-            # Settle the post the last layer deferred.
+            # Pallas mHC path: settle the post the last layer deferred.
             last_layer = cast(Glm5NextDecoderLayer, self.layers[self.end_layer - 1])
+            residual = deferred.residual.view(-1, self.hc_mult, self.hidden_size)
             hidden_streams = last_layer.ffn_hc.mhc_ops.post(
-                deferred.sublayer_out, deferred.residual, deferred.post, deferred.comb
+                deferred.sublayer_out, residual, deferred.post, deferred.comb
             )
+        elif flat:
+            hidden_streams = hidden_streams.view(-1, self.hc_mult, self.hidden_size)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_streams": hidden_streams})
 
         # Collapse the mHC streams by their mean, then the final RMSNorm.
         assert isinstance(self.norm, RMSNorm)
-        return self.norm(hidden_streams.mean(dim=-2))
+        collapsed = hidden_streams.mean(dim=-2)
+        out = glm53_mhc_tpu.rms_norm_weighted(
+            collapsed, self.norm.weight, self.norm.variance_epsilon
+        )
+        return out
 
 
 def load_glm53_checkpoint_tensor(
@@ -1101,11 +1084,14 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         Folds every KDA layer's conv weight into the Kimi ops' layout (vLLM's
         per-module hook normally does this already; the fold is idempotent,
         and running it here keeps it independent of which hooks a vLLM
-        version calls).
+        version calls) and splits each mHC site's `fn` for the Pallas
+        kernels.
         """
         for module in self.modules():
             if isinstance(module, glm53_kda_tpu.Glm53TpuKimiDeltaAttention):
                 module.fold_conv_weight()
+            elif isinstance(module, glm53_mhc_tpu.FusedGlm53HyperConnectionTpu):
+                module.prepare_pallas_weights()
 
     @classmethod
     def get_mamba_state_dtype_from_config(
