@@ -235,7 +235,6 @@ def will_take_fused_draft_path(
         and getattr(runner, "max_num_reqs", None) is not None
         and len(cur_input_indices) > 0
         and runner._pre_async_results.next_tokens_tpu is not None
-        and "_apply_async_token_substitution" not in getattr(runner, "__dict__", {})
         and spec_decode_metadata is not None
         and spec_decode_metadata.final_logits_indices.shape[0]
         == runner.input_ids.shape[0]
