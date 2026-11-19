@@ -181,7 +181,18 @@ def router_topk_biased(
     scores: jax.Array, bias: jax.Array, topk: int
 ) -> tuple[jax.Array, jax.Array]:
     """``select_biased`` with a jax_op-compatible signature."""
+    global _logged_biased
+    if not _logged_biased:
+        _logged_biased = True
+        print(
+            "TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS=1: router biased top-k and "
+            f"weight gather in one kernel ({scores.shape[0]} rows)",
+            flush=True,
+        )
     return select_biased(scores, bias, topk)
+
+
+_logged_biased = False
 
 
 def select(
