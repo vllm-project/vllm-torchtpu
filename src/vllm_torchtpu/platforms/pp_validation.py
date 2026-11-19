@@ -83,12 +83,19 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
 
     unsupported = None
     remedy = ""
-    if parallel_config.tensor_parallel_size > 1:
-        # On torch_tpu (dev20260813) a stage's TP collectives stall on the
-        # first serving step, when the other stages are not launching the
-        # same collectives; warmup, where every stage runs them, passes.
-        unsupported = "tensor parallelism inside a stage"
-        remedy = " Use --tensor-parallel-size 1."
+    if (
+        parallel_config.tensor_parallel_size > 1
+        and not _torch_tpu_builds_stage_meshes()
+    ):
+        # On torch_tpu builds with world-size meshes only (dev20260813), a
+        # stage's TP collectives stall on the first serving step, when the
+        # other stages are not launching the same collectives. A torch_tpu that
+        # builds meshes over a stage's group (0.3.0) runs them.
+        unsupported = "tensor parallelism inside a stage with this torch_tpu"
+        remedy = (
+            " Use --tensor-parallel-size 1, or a torch_tpu that builds Pallas"
+            " meshes over a stage's process group."
+        )
     elif (
         parallel_config.prefill_context_parallel_size > 1
         or (
