@@ -15,7 +15,8 @@
 
 The PCP streaming kernel, kernel entries without `attention_modes` and the
 bundled block-major kernel refuse a layer that asks for modes instead of
-dropping them, and the export path marks the MTP draft's attention as a draft.
+dropping them, and the export path builds the MTP draft's attention kernels
+with every mode off.
 """
 
 from types import SimpleNamespace
@@ -140,3 +141,57 @@ def test_export_marks_the_mtp_drafts_attention(monkeypatch):
     assert id(draft_attn.impl) in impls
     assert id(target_attn.impl) not in impls
     assert universal_adapter._draft_attention_impls(None) == set()
+
+
+def test_export_builds_the_mtp_drafts_kernels_with_modes_off(monkeypatch):
+    """load_vllm_model marks the draft's attention before building its
+    kernels, so the draft's kernels run every mode off and the target's keep
+    the target's modes."""
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.platforms import current_platform
+
+    def attention_layer(impl):
+        layer = object.__new__(Attention)
+        torch.nn.Module.__init__(layer)
+        layer.impl = impl
+        return layer
+
+    target_attn = attention_layer(_impl(attention.PallasAttentionBackendImpl))
+    draft_attn = attention_layer(_impl(attention.PallasAttentionBackendImpl))
+    target, draft = torch.nn.Sequential(target_attn), torch.nn.Sequential(draft_attn)
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.compilation_config.static_forward_context.update(
+        {
+            "model.layers.3.self_attn.attn": target_attn,
+            "mtp.layers.0.self_attn.attn": draft_attn,
+        }
+    )
+    built = {}
+
+    def initialize_kernel(impl, layer):
+        built[id(layer)] = native_fp8_scope.effective(
+            impl.attention_modes, impl.is_attention_draft
+        )
+
+    monkeypatch.setattr(
+        attention.PallasAttentionBackendImpl, "initialize_kernel", initialize_kernel
+    )
+    monkeypatch.setattr(
+        universal_adapter, "init_export_distributed_environment", lambda cfg: None
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.ensure_model_parallel_initialized", lambda *args: None
+    )
+    monkeypatch.setattr(
+        universal_adapter, "_create_single_device_tpu_mesh", lambda: None
+    )
+    monkeypatch.setattr(universal_adapter, "run_model_loader", lambda cfg: target)
+    monkeypatch.setattr(universal_adapter, "_load_mtp_draft", lambda cfg, t: draft)
+    monkeypatch.setattr(
+        current_platform, "update_block_size_for_backend", lambda cfg: None
+    )
+
+    model = universal_adapter.load_vllm_model(config, load_format="dummy")
+
+    assert built == {id(target_attn): _MODES, id(draft_attn): native_fp8_scope.OFF}
+    assert getattr(model, universal_adapter.MTP_DRAFT_ATTR) is draft
