@@ -798,9 +798,11 @@ def inner_kernel(
                 spec = chunk_mode[4:]
                 digits = "".join(ch for ch in spec if ch.isdigit())
                 chunk_epilogue = "a" not in spec and not cfgs.rhs_cfgs.has_bias
+                iters_override = (pipe_buckets or {}).get(bucket_m)
                 acc = _pipe_matmul(
-                    bucket_m, int(digits or 1), chunk_epilogue, "c" in spec,
-                    iters="i" in spec, deferred="d" in spec,
+                    bucket_m, iters_override or int(digits or 1), chunk_epilogue,
+                    "c" in spec, iters="i" in spec or iters_override is not None,
+                    deferred="d" in spec,
                 )
                 if acc is None:
                     return
@@ -1062,11 +1064,18 @@ def _k1_body_env() -> str | None:
 
 
 @functools.cache
-def _pipe_buckets_env() -> frozenset[int] | None:
+def _pipe_buckets_env() -> dict[int, int | None] | None:
+    """TPU_GMM_V2_K1_PIPE_BUCKETS=b[:iters],...: buckets that take the chunk
+    mode, optionally with their own pipe iteration count."""
     raw = os.environ.get("TPU_GMM_V2_K1_PIPE_BUCKETS", "").strip()
     if not raw:
         return None
-    return frozenset(int(x) for x in raw.split(",") if x.strip())
+    out: dict[int, int | None] = {}
+    for item in raw.split(","):
+        if item.strip():
+            b, _, it = item.strip().partition(":")
+            out[int(b)] = int(it) if it else None
+    return out
 
 
 _k1_body_logged: set[str] = set()
