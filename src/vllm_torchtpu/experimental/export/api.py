@@ -125,6 +125,7 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     uses_mrope: bool = False
     speculative_config: dict[str, Any] | None = None
     max_verify_tokens: int = 0
+    additional_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.max_verify_tokens < 0:

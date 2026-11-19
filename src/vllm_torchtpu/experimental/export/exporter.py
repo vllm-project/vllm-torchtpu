@@ -1548,6 +1548,8 @@ def export(
     }
     if cfg.speculative_config is not None:
         serving_config["speculative_config"] = cfg.speculative_config
+    if cfg.additional_config:
+        serving_config["additional_config"] = dict(cfg.additional_config)
 
     metadata_doc: dict[str, Any] = {
         "format_version": 2,
