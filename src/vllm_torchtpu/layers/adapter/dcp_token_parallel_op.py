@@ -69,6 +69,19 @@ EXTRA_PAGES = 4
 SPLIT_ROWS_ALIGN = 16
 # Gather sizes (virtual pages) below the buffer's capacity a step may take.
 GATHER_CAPS = (4, 8, 12, 16, 20, 24, 32, 44)
+# Query rows per sparse MLA gather + attention chunk on the split's own rows
+# when TPU_SPARSE_MLA_CHUNK_TOKENS is unset.
+# Avoid the kernel default of 64 here: it doubles the per-layer gather +
+# attention launches over a split's 1024 rows, and each launch boundary
+# exposes a SparseCore gather wait (~60 us/layer slower at 16K tokens).
+ATTEND_CHUNK_TOKENS = 128
+
+
+def attend_chunk_kwargs(env_chunk_kwargs: dict[str, int]) -> dict[str, int]:
+    """The split attend's chunk kwargs: the env override, else 128 rows."""
+    if env_chunk_kwargs:
+        return env_chunk_kwargs
+    return {"gather_and_attention_chunk_size": ATTEND_CHUNK_TOKENS}
 
 
 def applies(num_tokens: int) -> bool:
@@ -253,7 +266,7 @@ def make_attend(
             k_scale=k_scale,
             cache_layout=cache_layout,
             mixed_body_levers=mixed_body_levers,
-            **sparse_mla_chunk_kwargs(),
+            **attend_chunk_kwargs(sparse_mla_chunk_kwargs()),
             **packed,
             **split_kw,
         )
