@@ -57,10 +57,6 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # owns the name) never change a compiled program.
 RUNNER_OPTIONS_SECTION = runner_options.SECTION
 
-# Launch topology of a single-host multi-port DP server: each engine compiles
-# the same programs as under internal-LB DP.
-MULTIPORT_DP_ADDITIONAL_CONFIG_KEY = tpu_multiport_dp.SECTION
-
 # Keys that never change the compiled graph: the diagnostics-only profiler
 # knobs above, which only steer profiling, and the host-only sections, each
 # imported from the module that reads it.
@@ -73,7 +69,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         FRONTEND_OPTIONS_SECTION,
         RUNNER_OPTIONS_SECTION,
         WORKER_OPTIONS_SECTION,
-        MULTIPORT_DP_ADDITIONAL_CONFIG_KEY,
+        tpu_multiport_dp.SECTION,
     }
 )
 

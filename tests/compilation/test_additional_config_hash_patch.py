@@ -25,6 +25,7 @@ import pytest
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
+from vllm_torchtpu.distributed import tpu_multiport_dp
 from vllm_torchtpu.runner.utils import (
     FRONTEND_OPTIONS_SECTION,
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
@@ -203,8 +204,6 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    from vllm_torchtpu.distributed import tpu_multiport_dp
-
     assert {
         KEY,
         PREFILL_KEY,
