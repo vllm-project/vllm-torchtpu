@@ -26,6 +26,9 @@ from typing import TypedDict
 
 import pytest
 
+from tests.megakernel.test_advisor_bounds import (
+    compute_expected_kimi_k3_decode_comm_us,
+)
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     constants,
@@ -54,6 +57,9 @@ class _ScopeParityEntry(TypedDict):
     chain_us: float
     support: str
     blockers: list[str]
+    expert_mode: str
+    host_head_us: float
+    break_even_host_head_delta_us: float
 
 
 class _EvalParityResult(TypedDict):
@@ -296,6 +302,9 @@ def _python_reference_eval(
             "chain_us": scope.chain_us,
             "support": scope.support,
             "blockers": list(scope.blockers),
+            "expert_mode": scope.expert_mode,
+            "host_head_us": scope.host_head_us,
+            "break_even_host_head_delta_us": (scope.break_even_host_head_delta_us),
         }
     return {
         "invalid_reasons": reasons,
@@ -468,6 +477,13 @@ def _verify_parity_records(
             )
             assert got_sc["support"] == exp_sc["support"], sc_lbl
             assert list(got_sc["blockers"]) == list(exp_sc["blockers"]), sc_lbl
+            assert got_sc["expert_mode"] == exp_sc["expert_mode"], sc_lbl
+            assert got_sc["host_head_us"] == pytest.approx(
+                exp_sc["host_head_us"], abs=0.015
+            ), f"{sc_lbl} field=host_head_us"
+            assert got_sc["break_even_host_head_delta_us"] == pytest.approx(
+                exp_sc["break_even_host_head_delta_us"], abs=0.02
+            ), f"{sc_lbl} field=break_even_host_head_delta_us"
             assert got_sc["rawStepUs"] == pytest.approx(
                 exp_sc["raw_step_us"], rel=1e-6, abs=1e-9
             ), f"{sc_lbl} field=rawStepUs"
@@ -1547,3 +1563,142 @@ def test_js_engine_parity_composition_busiest_groups_and_per_op_boundaries(
         qwen_whole_step["hbm_us"] / qwen_eff.eta_hbm
         + qwen_whole_step["comm_us"] / qwen_eff.eta_ici
     )
+
+
+def test_js_engine_matches_python_on_declared_collectives_expert_mode_and_host_head(
+    tmp_path: Path,
+) -> None:
+    """Verify Python == JS parity on declared steps, expert_mode, and host head."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+
+    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
+    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    chip_dict = dataclasses.asdict(chip_spec)
+
+    collective_and_host_head_cases: list[tuple[str, advisor.WorkloadSpec]] = [
+        (
+            "kimi-k3",
+            advisor.WorkloadSpec(
+                phase="decode",
+                batch=4,
+                context=4096,
+                osl=1,
+                tp=32,
+                ep=32,
+                dcp=32,
+            ),
+        ),
+        (
+            "kimi-k3",
+            advisor.WorkloadSpec(
+                phase="decode",
+                batch=4,
+                context=4096,
+                osl=1,
+                tp=32,
+                ep=32,
+                dcp=32,
+                pcp=2,
+            ),
+        ),
+        (
+            "qwen3.5-397b",
+            advisor.WorkloadSpec(
+                phase="verify",
+                batch=3,
+                spec_tokens=3,
+                context=4096,
+                tp=8,
+                ep=8,
+                dcp=4,
+            ),
+        ),
+        (
+            "qwen3.5-397b",
+            advisor.WorkloadSpec(
+                phase="verify",
+                batch=4,
+                spec_tokens=3,
+                context=4096,
+                tp=8,
+                ep=8,
+                dcp=4,
+            ),
+        ),
+        (
+            "qwen3.5-397b",
+            advisor.WorkloadSpec(
+                phase="verify",
+                batch=56,
+                spec_tokens=3,
+                context=4096,
+                tp=8,
+                ep=8,
+                dcp=4,
+                dispatch_regime="zero_floor",
+                host_head_per_op_us=1800.0,
+                host_head_fused_us=350.0,
+                host_head_explicit=True,
+            ),
+        ),
+    ]
+
+    batch_items: list[_BatchScenarioItem] = []
+    expected_refs: list[_EvalParityResult] = []
+    payload_items: list[dict[str, object]] = []
+    for model_name, wl in collective_and_host_head_cases:
+        prof_dict = dataclasses.asdict(models.resolve_model_profile(model_name))
+        batch_items.append({"only_validate": False, "model_name": model_name, "wl": wl})
+        expected_refs.append(_python_reference_eval(model_name, wl, chip_spec))
+        payload_items.append(
+            {
+                "params": {
+                    "only_validate": False,
+                    "profile": prof_dict,
+                    "chip": chip_dict,
+                    "wl": dataclasses.asdict(wl),
+                }
+            }
+        )
+
+    # Guard declared-collective and host-head invariants before checking JS parity.
+    expected_kimi_comm_us = compute_expected_kimi_k3_decode_comm_us(
+        models.resolve_model_profile("kimi-k3"), chip_spec, 4
+    )
+    assert expected_refs[0]["scopes"]["whole_step"]["comm_us"] == pytest.approx(
+        expected_kimi_comm_us, abs=0.05
+    )
+    assert "layout_not_declared" in expected_refs[1]["scopes"]["whole_step"]["blockers"]
+    assert expected_refs[2]["scopes"]["whole_step"]["expert_mode"] == "tp"
+    assert expected_refs[3]["scopes"]["whole_step"]["expert_mode"] == "ep"
+    expected_fused_head_us = 350.0
+    assert (
+        expected_refs[4]["scopes"]["whole_step"]["host_head_us"]
+        == expected_fused_head_us
+    )
+    assert (
+        expected_refs[4]["scopes"]["whole_step"]["break_even_host_head_delta_us"] > 0.0
+    )
+
+    in_json = tmp_path / "collective_parity_in.json"
+    out_json = tmp_path / "collective_parity_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": {
+                    "chip_spec": chip_dict,
+                    **workbench_engine.build_engine_seed_defaults(),
+                },
+                "items": payload_items,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
+    out_records = json.loads(out_json.read_text(encoding="utf-8"))
+    _verify_parity_records(batch_items, expected_refs, out_records)
