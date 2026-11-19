@@ -52,11 +52,11 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     # `branch_tmp` is declared by FakeAltMixerModule and FakeMixerModule -> overlaid!
     assert "branch_tmp" in scr
     assert scr["branch_tmp"].shape == (fake_ex.MR * 2, 128)
-    assert cp.phase_map["branch_tmp"] == "branch:gdn|branch:gqa"
+    assert cp.phase_map["branch_tmp"] == frozenset({"branch:gdn", "branch:gqa"})
 
     # Overlaying two SMEM phase buffers preserves SMEM memory space
     smem_scratch: dict[str, Any] = {}
-    smem_phases: dict[str, str] = {}
+    smem_phases: dict[str, frozenset[str]] = {}
     vmem._merge_scratch(
         smem_scratch,
         smem_phases,
@@ -67,6 +67,17 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     )
     assert smem_scratch["smem_tmp"].shape == (8,)
     assert smem_scratch["smem_tmp"].memory_space == pltpu.SMEM
+    assert smem_phases["smem_tmp"] == frozenset({"branch:a", "branch:b"})
+
+    # A 3rd request in an already-merged phase must raise MegakernelConfigError
+    with pytest.raises(
+        MegakernelConfigError, match="Conflicting scratch buffer 'smem_tmp'"
+    ):
+        vmem._merge_scratch(
+            smem_scratch,
+            smem_phases,
+            [ScratchReq("smem_tmp", pltpu.SMEM((12,), jnp.int32), phase="branch:a")],
+        )
 
     # Persistent name collision must raise MegakernelConfigError
     class CollidingModule(Module):
@@ -130,6 +141,10 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     assert fp.ex.tiles is not None
     cp_reused, _ = vmem.build_scratch(custom_ms, ex_unset, fp)
     assert cp_reused.plan == fp
+
+    ex_other = dataclasses.replace(ex_unset, B=fake_ex.B * 2)
+    cp_other, _ = vmem.build_scratch(custom_ms, ex_other, fp)
+    assert cp_other.plan.ex.B == ex_other.B
 
     # 1D VMEM buffer is counted with (1, n) tiled storage_size; unmarked 3D bf16
     # with shape[-2] == 2 is NOT guessed packed, while packed=True folds sublane words;
