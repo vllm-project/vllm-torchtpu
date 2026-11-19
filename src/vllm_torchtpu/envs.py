@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
+    TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
@@ -93,6 +94,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTE_TRACE: int = 0
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
+    TPU_MOE_REPLICA_ASSIGN_REFINE: int = 0
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
     TPU_MINIMAX_M3_INDEXER_DECODE_OPT: str = ""
     TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
@@ -837,6 +839,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS", 0
     ),
+    # Pallas TP all-reduces of at most this many rows (a multiple of 8) run
+    # the one-shot kernel: each rank pushes its whole activation to every
+    # peer and sums all n copies in rank order itself, one exchange round
+    # instead of reduce-scatter + all-gather. Same bits. 0 (default) = off.
+    "TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS": env_int(
+        "TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS", 0
+    ),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.
@@ -910,6 +919,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # router remap that moves work onto the replicas. 0 = off.
     "VLLM_TPU_MOE_REDUNDANT_EXPERTS": env_nonnegative_int(
         "VLLM_TPU_MOE_REDUNDANT_EXPERTS", 0
+    ),
+    # With redundant experts: after the per-step greedy copy assignment, up to
+    # this many rounds of moves (one replicated expert to another copy, or a
+    # two-step chain) that lower the busiest rank's expert count
+    # (kernels/moe_replica_assign.py _refine). Changes which rank computes
+    # an expert, not the math. 0 (default) = greedy only.
+    "TPU_MOE_REPLICA_ASSIGN_REFINE": env_nonnegative_int(
+        "TPU_MOE_REPLICA_ASSIGN_REFINE", 0
     ),
     # Which experts get the redundant slots: a JSON file path, inline JSON
     # ('{"L3": [17, ...]}', hottest first), or "builtin:<name>". Empty = the

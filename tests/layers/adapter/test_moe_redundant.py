@@ -216,6 +216,82 @@ def test_kernel_matches_rule(tokens, slots, padded):
     np.testing.assert_array_equal(np.asarray(got), want)
 
 
+def _max_load(phys, slots):
+    ranks = {}
+    for p in set(int(x) for x in phys.reshape(-1) if x >= 0):
+        ranks[p // slots] = ranks.get(p // slots, 0) + 1
+    return max(ranks.values())
+
+
+@pytest.mark.parametrize(
+    "tokens,slots,padded,seed",
+    [(2, 8, 0, 0), (8, 8, 0, 1), (8, 8, 0, 2), (16, 8, 0, 3), (24, 4, 8, 4),
+     (32, 8, 0, 5), (32, 8, 0, 6), (96, 8, 16, 7)],
+)
+def test_refine_lowers_max_load_and_matches_kernel(tokens, slots, padded, seed):
+    jnp = pytest.importorskip("jax.numpy")
+    from vllm_torchtpu.kernels.moe_replica_assign import replica_assign
+
+    # Skewed routing (hot experts concentrated on a few home ranks).
+    plan = rx.compute_placement(128, 8, slots, list(range(0, 40)))
+    table = rx.copies_table(plan).numpy()
+    rng = np.random.default_rng(seed)
+    p = np.ones(128)
+    p[:40] = 6.0
+    p /= p.sum()
+    ids = np.stack([rng.choice(128, 4, replace=False, p=p) for _ in range(tokens)])
+    if padded:
+        ids[-padded:] = -1
+    tid = torch.from_numpy(ids)
+    tab = torch.from_numpy(table)
+    greedy = rx.remap_ids_reference(tid, tab, ep=8, slots=plan.slots_total).numpy()
+    refined = rx.remap_ids_reference(
+        tid, tab, ep=8, slots=plan.slots_total, refine=16
+    ).numpy()
+    phys_to_logical = rx.LayerPlacement.physical_to_logical(plan)
+    for out in (greedy, refined):
+        # Every route keeps its logical expert; one copy per expert.
+        assert all(
+            (i < 0 and o < 0) or phys_to_logical[o] == i
+            for i, o in zip(ids.reshape(-1), out.reshape(-1))
+        )
+        per_e = {}
+        for i, o in zip(ids.reshape(-1), out.reshape(-1)):
+            if i >= 0:
+                per_e.setdefault(int(i), set()).add(int(o))
+        assert all(len(v) == 1 for v in per_e.values())
+    assert _max_load(refined, plan.slots_total) <= _max_load(greedy, plan.slots_total)
+    try:
+        got = replica_assign(
+            jnp.asarray(ids), jnp.asarray(table), ep=8, slots=plan.slots_total,
+            refine=16, interpret=True,
+        )
+    except Exception as exc:  # pragma: no cover - no Pallas interpreter here
+        pytest.skip(f"pallas interpret unavailable: {exc}")
+    np.testing.assert_array_equal(np.asarray(got), refined)
+
+
+def test_refine_finds_a_move():
+    """Across seeds the refinement strictly lowers the max load somewhere."""
+    plan = rx.compute_placement(128, 8, 8, list(range(0, 40)))
+    tab = rx.copies_table(plan)
+    p = np.ones(128)
+    p[:40] = 6.0
+    p /= p.sum()
+    better = 0
+    for seed in range(40):
+        rng = np.random.default_rng(100 + seed)
+        ids = torch.from_numpy(
+            np.stack([rng.choice(128, 4, replace=False, p=p) for _ in range(16)])
+        )
+        g = rx.remap_ids_reference(ids, tab, ep=8, slots=plan.slots_total).numpy()
+        r = rx.remap_ids_reference(
+            ids, tab, ep=8, slots=plan.slots_total, refine=16
+        ).numpy()
+        better += _max_load(r, plan.slots_total) < _max_load(g, plan.slots_total)
+    assert better > 0
+
+
 # --------------------------------------------------------------------------
 # End-to-end numerics on the EP contract
 # --------------------------------------------------------------------------
