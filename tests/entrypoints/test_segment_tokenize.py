@@ -476,7 +476,7 @@ def test_renderer_patch_routes_and_falls_back(monkeypatch):
 
 
 def test_tokenizer_made_ids_are_taken_once_by_identity():
-    made = TokenizerMadeIds(capacity=2)
+    made = TokenizerMadeIds(max_tokens=4)
     ids = [1, 2, 3]
     made.add(ids)
     assert not made.take([1, 2, 3])
@@ -487,12 +487,20 @@ def test_tokenizer_made_ids_are_taken_once_by_identity():
     ids.append(4)
     assert not made.take(ids)
 
-    first, second, third = [1], [2], [3]
+    first, second, third = [1, 1], [2], [3]
     for lst in (first, second, third):
         made.add(lst)
-    assert len(made) == 2
+    assert len(made) == 3
+    fourth = [4, 4]
+    made.add(fourth)
+    assert len(made) == 3
     assert not made.take(first)
-    assert made.take(second) and made.take(third)
+    assert made.take(second) and made.take(third) and made.take(fourth)
+
+    whole = list(range(10))
+    made.add([0])
+    made.add(whole)
+    assert len(made) == 1 and made.take(whole)
 
 
 def test_vocabulary_check_skips_only_segment_tokenizer_ids(monkeypatch):
