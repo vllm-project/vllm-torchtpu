@@ -78,18 +78,34 @@ class GDNConfig:
     window_size: int = 1
     # Indicate the use of unified pool.
     is_shared: bool = False
+    ssm_state_quant: str = dataclasses.field(default="", metadata=dict(static=True))
+
+    @property
+    def recurrent_q_u32_rows(self) -> int:
+        if self.ssm_state_quant == "int8_block16":
+            return self.kq_head_dim // 4
+        packing = 4 // jnp.dtype(self.dtypes.recurrent_state).itemsize
+        return self.kq_head_dim // packing
+
+    @property
+    def recurrent_scale_u32_rows(self) -> int:
+        if self.ssm_state_quant == "int8_block16":
+            return self.kq_head_dim // 16
+        return 0
+
+    @property
+    def recurrent_u32_rows(self) -> int:
+        return self.recurrent_q_u32_rows + self.recurrent_scale_u32_rows
 
     @property
     def conv_hbm_offset(self) -> int:
         if self.is_shared:
             # In Unified pool. Conv state is stored after recurrent state.
-            # Offset is calculated via recurrent state size.
-            lane_bytes = pltpu.get_tpu_info().num_lanes * 4
-            lane_elements = (
-                lane_bytes // jnp.dtype(self.dtypes.recurrent_state).itemsize
-            )
-            num_elements = self.v_dim_size * self.kq_head_dim
-            return num_elements // lane_elements
+            # Offset is calculated via recurrent state size in 512-byte granules.
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            return (
+                self.num_v_heads * self.recurrent_u32_rows * self.v_head_dim
+            ) // num_lanes
         return 0
 
     @property
@@ -198,6 +214,8 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
+        if self.ssm_state_quant:
+            suffix += f"_{self.ssm_state_quant}"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"

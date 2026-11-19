@@ -73,6 +73,7 @@ def run_jax_gdn_attention(
     kernel_size: int,
     mesh: jax.sharding.Mesh,
     num_spec_tokens: int = 0,
+    ssm_state_quant: str = "",
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -154,6 +155,7 @@ def run_jax_gdn_attention(
         d_v=d_v,
         kernel_size=kernel_size,
         num_spec_tokens=num_spec_tokens,
+        ssm_state_quant=ssm_state_quant,
     )
 
     mapped_fn = jax.shard_map(
@@ -848,6 +850,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    ssm_state_quant: str = "",
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -884,6 +887,7 @@ def run_jax_gdn_attention_pooled_local(
         recurrent_dtype=jnp.dtype(recurrent_state_dtype),
         conv_dtype=jnp.dtype(jnp.float32),
         num_spec_tokens=num_spec_tokens,
+        ssm_state_quant=ssm_state_quant,
         prefill_ckpt_offsets=prefill_ckpt_offsets,
         prefill_ckpt_indices=prefill_ckpt_indices,
     )
@@ -915,6 +919,7 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    ssm_state_quant: str = "",
     prefill_ckpt_offsets: jnp.ndarray | None = None,
     prefill_ckpt_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -1026,6 +1031,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        ssm_state_quant=ssm_state_quant,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

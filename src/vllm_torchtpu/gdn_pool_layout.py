@@ -119,14 +119,44 @@ def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     )
 
 
+GDN_SSM_STATE_QUANT_CHOICES = ("", "int8_block16")
+
+
+def gdn_ssm_quant_u32_rows(head_k_dim: int, quant_mode: str = "") -> int | None:
+    """Return packed uint32 rows per (head, v_lane) for block-16 SSM quantization.
+
+    Requires ``head_k_dim % 128 == 0`` so both the packed INT8 value tile
+    (``head_k_dim // 4`` uint32 rows) and the FP32 block-16 scale tile
+    (``head_k_dim // 16`` uint32 rows) are multiples of the 8-sublane VREG
+    height.
+    """
+    if not quant_mode:
+        return None
+    if quant_mode not in GDN_SSM_STATE_QUANT_CHOICES:
+        raise ValueError(
+            f"Unsupported GDN SSM state quant mode {quant_mode!r}; "
+            f"expected one of {GDN_SSM_STATE_QUANT_CHOICES}."
+        )
+    if head_k_dim <= 0 or head_k_dim % 128 != 0:
+        raise ValueError(
+            f"GDN SSM state quant {quant_mode!r} requires head_k_dim "
+            f"divisible by 128; got {head_k_dim}."
+        )
+    return (head_k_dim // 4) + (head_k_dim // 16)
+
+
 def pooled_gdn_ssm_state_bytes(
     *,
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
     dtype: object = DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
+    quant_mode: str = "",
 ) -> int:
     """Live bytes of one slot's head-major, dense SSM region in ``dtype``."""
+    u32_rows = gdn_ssm_quant_u32_rows(head_k_dim, quant_mode)
+    if u32_rows is not None:
+        return num_v_heads * u32_rows * head_v_dim * 4
     return num_v_heads * head_k_dim * head_v_dim * pooled_gdn_state_itemsize(dtype)
 
 

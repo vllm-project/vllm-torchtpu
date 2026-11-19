@@ -42,6 +42,14 @@ def align_to(x: int, alignment: int) -> int:
     return pl.cdiv(x, alignment) * alignment
 
 
+def _rec_state_bytes(
+    recurrent_state_dtype: jnp.dtype, ssm_state_quant: str = ""
+) -> float:
+    if ssm_state_quant == "int8_block16":
+        return 1.25
+    return float(jnp.dtype(recurrent_state_dtype).itemsize)
+
+
 def get_vmem_estimate_bytes(
     tile_b: int,
     chunk_sz: int,
@@ -51,7 +59,7 @@ def get_vmem_estimate_bytes(
     d_v: int,
     kernel_size: int,
     act_out_bytes: int,
-    rec_state_bytes: int,
+    rec_state_bytes: int | float,
     num_lanes: int,
     conv_state_dim_size: int,
     is_decode: bool = False,
@@ -82,7 +90,7 @@ def get_vmem_estimate_bytes(
         * conv_state_dim_size
         * carry_scratch_bytes
     )
-    recurrent_state_buffer_bytes = 2 * (
+    recurrent_state_buffer_bytes = 2 * int(
         tile_b * state_slots_per_seq * n_v * d_v * d_k * rec_state_bytes
     )
 
@@ -145,6 +153,7 @@ def calculate_decode_tile_size(
     vmem_capacity_limit_bytes: int,
     kernel_size: int = 4,
     window_size: int = 1,
+    ssm_state_quant: str = "",
 ) -> int:
     """Largest decode tile whose VMEM estimate fits the limit.
 
@@ -163,6 +172,7 @@ def calculate_decode_tile_size(
       vmem_capacity_limit_bytes: Maximum allowed VMEM capacity in bytes.
       kernel_size: 1D convolution kernel window size.
       window_size: Number of state checkpoints per sequence in decode.
+      ssm_state_quant: Optional block-16 quantization mode for recurrent state.
 
     Returns:
       Derived batch tile size fitting within VMEM capacity limits.
@@ -172,7 +182,7 @@ def calculate_decode_tile_size(
         return 1
 
     act_out_bytes = jnp.dtype(act_out_dtype).itemsize
-    rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
+    rec_state_bytes = _rec_state_bytes(recurrent_state_dtype, ssm_state_quant)
 
     # Search descending power-of-2 tile candidates (up to 16) bounded by
     # batch size.
@@ -213,6 +223,7 @@ def calculate_mixed_tile_size(
     num_lanes: int,
     vmem_capacity_limit_bytes: int,
     kernel_size: int = 4,
+    ssm_state_quant: str = "",
 ) -> int:
     """Largest prefill chunk whose VMEM estimate fits the limit.
 
@@ -230,6 +241,7 @@ def calculate_mixed_tile_size(
       num_lanes: Number of lanes for TPU vector layout alignment.
       vmem_capacity_limit_bytes: Maximum allowed VMEM capacity in bytes.
       kernel_size: 1D convolution kernel window size.
+      ssm_state_quant: Optional block-16 quantization mode for recurrent state.
 
     Returns:
       Derived chunk tile size fitting within VMEM capacity limits.
@@ -239,7 +251,7 @@ def calculate_mixed_tile_size(
         return 1
 
     act_out_bytes = jnp.dtype(act_out_dtype).itemsize
-    rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
+    rec_state_bytes = _rec_state_bytes(recurrent_state_dtype, ssm_state_quant)
 
     # Select the largest candidate chunk (up to 128 tokens) that fits in VMEM.
     prefill_candidates = [c for c in MIXED_TILE_SIZES if c <= seq_len]
@@ -294,6 +306,7 @@ def get_tile_sizes(
     window_size: int = 1,
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
+    ssm_state_quant: str = "",
 ) -> tuple[int, int]:
     """Derives decode and mixed tile sizes within each kernel's VMEM limit.
 
@@ -319,6 +332,7 @@ def get_tile_sizes(
         window_size: Number of state checkpoints per sequence in decode.
         decode_tile_size: Explicit decode sequence tile size override, if provided.
         mixed_tile_size: Explicit prefill/mixed chunk size override, if provided.
+        ssm_state_quant: Optional block-16 quantization mode for recurrent state.
 
     Returns:
         Tuple of (decode_tile_size, mixed_tile_size).
@@ -340,6 +354,7 @@ def get_tile_sizes(
             vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
             kernel_size=kernel_size,
             window_size=window_size,
+            ssm_state_quant=ssm_state_quant,
         )
         decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
 
@@ -359,6 +374,7 @@ def get_tile_sizes(
             num_lanes=num_lanes,
             vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
             kernel_size=kernel_size,
+            ssm_state_quant=ssm_state_quant,
         )
         mixed_tile_size = vmem_fit
 

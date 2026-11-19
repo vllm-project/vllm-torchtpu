@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import (
     QWEN_GDN_ARCHITECTURES,
     PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,
+    gdn_ssm_quant_u32_rows,
     pooled_gdn_state_dtypes,
     pooled_gdn_state_itemsize,
     unified_kv_layout_enabled_for_architecture,
@@ -284,6 +286,14 @@ def _hybrid_mamba_state_layout(
     ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
     conv_bytes = math.prod(shapes[0]) * conv_itemsize
     ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
+    if (
+        pcp_size == 1
+        and model_config.architecture in QWEN_GDN_ARCHITECTURES
+        and envs.TPU_GDN_SSM_STATE_QUANT
+    ):
+        u32_rows = gdn_ssm_quant_u32_rows(shapes[1][-2], envs.TPU_GDN_SSM_STATE_QUANT)
+        if u32_rows is not None:
+            ssm_bytes = shapes[1][0] * u32_rows * shapes[1][2] * 4
 
     if pcp_size > 1 and model_config.architecture not in QWEN_GDN_ARCHITECTURES:
         # Same item sizes on both sides of the ratio, so the check compares

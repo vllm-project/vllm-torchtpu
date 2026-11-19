@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
+    TPU_GDN_SSM_STATE_QUANT: str = ""
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -517,6 +518,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block boundary. Set it to the same value on every rank and PP stage: the
     # scheduler requires identical MambaSpecs.
     "TPU_GDN_PREFILL_CHECKPOINT": env_bool("TPU_GDN_PREFILL_CHECKPOINT", default=True),
+    # Opt-in block-16 INT8 quantization for GDN recurrent SSM state ("int8_block16";
+    # empty keeps fp32/bf16). Packs 16-element K-blocks into INT8 + FP32 scale
+    # (1.25 B/element) when head_k_dim % 128 == 0 and PCP == 1.
+    "TPU_GDN_SSM_STATE_QUANT": env_with_choices(
+        "TPU_GDN_SSM_STATE_QUANT", "", ["", "int8_block16"]
+    ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
