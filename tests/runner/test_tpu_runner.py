@@ -2408,6 +2408,7 @@ class TestInputStagingFence:
             _dp_num_tokens_across_dp=lambda n: None,
             # a0567106's _dummy_run also asks whether DP lockstep is on.
             _dp_lockstep_enabled=lambda: False,
+            _vocab_parallel_rows=lambda: None,
             forward_model=forward_model,
             compute_selected_logits=lambda out, idx: out,
         )
