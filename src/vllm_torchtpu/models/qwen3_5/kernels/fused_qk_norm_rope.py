@@ -135,6 +135,11 @@ def _unsupported_reason(layer: torch.nn.Module, model_config) -> str | None:
         return "the attention has no output gate"
     if not layer.rotary_emb.is_neox_style:
         return "the rope is not NeoX style"
+    width, rot = layer.rotary_emb.cos_sin_cache.shape[-1], layer.rotary_emb.rotary_dim
+    if width != rot:
+        # The kernel reads rot columns, [cos | sin]; a compacted cache
+        # (layers/adapter/rotary_embedding.py) holds fewer.
+        return f"the rope cache holds {width} of the {rot} rotary columns"
     if mm_config is not None and not mm_config.language_model_only:
         return "multimodal positions need M-RoPE; serve with --language-model-only"
     heads = (layer.num_heads, layer.num_kv_heads)
