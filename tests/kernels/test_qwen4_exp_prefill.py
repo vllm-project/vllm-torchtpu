@@ -278,3 +278,92 @@ def test_blocked_prefill_bf16_pool_view_matches_native_cache(tokens, carrier):
     assert np.all((ids == -1) | ((ids >= 0) & (ids < visible[:, None])))
     np.testing.assert_array_equal(np.sum(ids >= 0, axis=1), np.minimum(visible, 512))
     np.testing.assert_array_equal(np.asarray(packed).view(np.uint8), before)
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "expected_chunk"),
+    [
+        ("sparsecore", 512),
+        ("tensorcore", 512),
+        ("fused_small", None),
+        ("fused_large", 512),
+    ],
+)
+def test_pooled_prefill_chunking_respects_fuses_in_streamindex(
+    monkeypatch, backend_name, expected_chunk
+):
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        PallasFusedTopK,
+        SparseCoreTopK,
+        TensorCoreTopK,
+    )
+
+    backends = {
+        "sparsecore": SparseCoreTopK(),
+        "tensorcore": TensorCoreTopK(),
+        "fused_small": PallasFusedTopK(min_tokens=64),
+        "fused_large": PallasFusedTopK(min_tokens=2048),
+    }
+    seen_chunks = []
+
+    def capture(q, weights, cache, lengths, table, starts, distribution, **kwargs):
+        seen_chunks.append(kwargs.get("chunk_tokens"))
+        return jnp.full((len(q), kwargs["k"]), -1, jnp.int32)
+
+    monkeypatch.setattr(pooled_qsa, "streamindex_topk", capture)
+    monkeypatch.setattr(
+        pooled_qsa, "default_topk_backend", lambda: backends[backend_name]
+    )
+    pooled_qsa.select_blocks(
+        jnp.zeros((1024, 4, 128), jnp.bfloat16),
+        jnp.zeros((3, 128, 1, 4, 256), jnp.float8_e4m3fn),
+        jnp.zeros(1024, jnp.int32),
+        jnp.zeros((2, 4), jnp.int32),
+        jnp.zeros(1024, jnp.int32),
+        jnp.array([0, 512, 1024], jnp.int32),
+        jnp.array([2048, 2048], jnp.int32),
+        ratio=4,
+        block_topk=512,
+    )
+    assert seen_chunks == [expected_chunk]
+
+
+@pytest.mark.parametrize("tokens", [512, 4096])
+def test_pallas_fused_topk_prefill_traces_and_caps_vmem_on_tpu7x(tpu_info, tokens):
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        PallasFusedTopK,
+    )
+
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    shape = jax.ShapeDtypeStruct
+    fn = jax.jit(
+        functools.partial(
+            streamindex.streamindex_topk,
+            k=512,
+            compression_ratio=4,
+            num_kv_pages_per_block=(8, 8, 8),
+            num_queries_per_block=(1, 128, 128),
+            chunk_tokens=None,
+            components=qsa_indexing(3),
+            topk_backend=PallasFusedTopK(min_tokens=64),
+            return_scores=False,
+        )
+    )
+    args = (
+        shape((tokens, 4, 256), jnp.bfloat16),
+        shape((tokens, 4), jnp.float32),
+        shape((4096, 16, 4, 256), jnp.uint8),
+        shape((2,), jnp.int32),
+        shape((4096,), jnp.int32),
+        shape((3,), jnp.int32),
+        shape((3,), jnp.int32),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        out = jax.eval_shape(fn, *args)
+        hlo = fn.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+    assert out.shape == (tokens, 512) and out.dtype == jnp.int32
+    assert "StreamIdxTC-m-bq_64-bkvp_8-ftk512" in hlo

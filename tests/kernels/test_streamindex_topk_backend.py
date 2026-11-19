@@ -151,3 +151,135 @@ def test_sparsecore_backend_forwards_bounded_copy(monkeypatch, bounded):
     assert seen["bounded_copy"] is bounded
     assert SparseCoreTopK() == SparseCoreTopK(bounded_copy=False)
     assert hash(SparseCoreTopK(bounded_copy=True)) != hash(SparseCoreTopK())
+
+
+def test_default_topk_backend_routing_and_env_overrides(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import topk_backend
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        PallasFusedTopK,
+        TensorCoreTopK,
+        default_topk_backend,
+    )
+
+    monkeypatch.setattr(topk_backend, "has_usable_sparse_core", lambda: False)
+    monkeypatch.delenv("VLLM_TPU_TOPK_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_TPU_TOPK_FUSED_MIN_TOKENS", raising=False)
+    assert default_topk_backend() == PallasFusedTopK(min_tokens=256)
+
+    monkeypatch.setenv("VLLM_TPU_TOPK_FUSED_MIN_TOKENS", "128")
+    assert default_topk_backend() == PallasFusedTopK(min_tokens=128)
+
+    monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "fused_all")
+    assert default_topk_backend() == PallasFusedTopK(min_tokens=1)
+
+    monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "tensorcore")
+    assert default_topk_backend() == TensorCoreTopK()
+
+    monkeypatch.setattr(topk_backend, "has_usable_sparse_core", lambda: True)
+    monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "auto")
+    assert default_topk_backend() == SparseCoreTopK()
+
+    monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "fused")
+    assert default_topk_backend() == PallasFusedTopK(min_tokens=128)
+    assert envs.VLLM_TPU_TOPK_FUSED_MIN_TOKENS == 128
+
+    monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "sparsecore")
+    monkeypatch.setattr(topk_backend, "has_usable_sparse_core", lambda: False)
+    assert default_topk_backend() == SparseCoreTopK()
+
+    monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "invalid_backend")
+    with pytest.raises(ValueError, match="Invalid VLLM_TPU_TOPK_BACKEND"):
+        default_topk_backend()
+
+
+@pytest.mark.parametrize("return_scores", [False, True])
+def test_tensorcore_topk_tie_certified_subbatch_matches_reference(return_scores):
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        PallasFusedTopK,
+        TensorCoreTopK,
+    )
+
+    rng = np.random.default_rng(123)
+    # 64 rows (> 32 sub_batch) with an empty second sub-tile exercises
+    # VMEM sub-batching and both certified fast-path and fallback tournament.
+    scores = rng.integers(-3, 4, (64, 8192)).astype(np.float32)
+    scores[:, 13] = -np.inf
+    scores[0, :16] = 0.0
+    scores[0, 16:32] = -0.0
+    bits = jnp.asarray(scores.view(np.int32))
+    lengths = jnp.asarray(
+        [0, 7, 512, 1025, 4096, 8192] * 5 + [19, 256] + [0] * 32,
+        dtype=jnp.int32,
+    )
+    expected = ReferenceTopK().select(
+        bits,
+        128,
+        lengths,
+        scheduling_group_id=None,
+        return_scores=return_scores,
+    )
+    for backend in (
+        TensorCoreTopK(enable_prefix_bucketing=False),
+        TensorCoreTopK(enable_prefix_bucketing=True),
+        PallasFusedTopK(min_tokens=64),
+    ):
+        actual = backend.select(
+            bits,
+            128,
+            lengths,
+            scheduling_group_id=None,
+            return_scores=return_scores,
+        )
+        for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_streamindex_topk_resolves_default_backend_outside_jit(monkeypatch):
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+        streamindex_topk,
+    )
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((8, 4, 128), jnp.bfloat16),
+        shape((8, 4), jnp.float32),
+        shape((4, 32, 4, 256), jnp.uint8),
+        shape((8,), jnp.int32),
+        shape((64,), jnp.int32),
+        shape((9,), jnp.int32),
+        shape((3,), jnp.int32),
+    )
+    kw = dict(
+        k=128,
+        compression_ratio=2,
+        num_kv_pages_per_block=8,
+        num_queries_per_block=1,
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,), ("x",), abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu")
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "tensorcore")
+        hlo_tc = (
+            streamindex_topk.trace(*args, **kw)
+            .lower(lowering_platforms=("tpu",))
+            .as_text()
+        )
+        assert "ftk128" not in hlo_tc
+
+        monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "fused_all")
+        hlo_fused = (
+            streamindex_topk.trace(*args, **kw)
+            .lower(lowering_platforms=("tpu",))
+            .as_text()
+        )
+        assert "ftk128" in hlo_fused
+
+        monkeypatch.setenv("VLLM_TPU_TOPK_BACKEND", "invalid_backend")
+        with pytest.raises(ValueError, match="Invalid VLLM_TPU_TOPK_BACKEND"):
+            streamindex_topk.trace(*args, **kw)
