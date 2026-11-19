@@ -300,97 +300,95 @@ class HybridStateRetention:
                     continue
                 mgr._hybrid_retention_hooked = True
 
-                orig_cache_partial = getattr(mgr, "_cache_partial_tail_block", None)
-                if callable(orig_cache_partial):
+                orig_cache_partial = mgr._cache_partial_tail_block
 
-                    def _wrapped_cache_partial(
-                        request: Any,
-                        num_tokens: int,
-                        *args: Any,
-                        _orig: Any = orig_cache_partial,
-                        _mgr: Any = mgr,
-                        _gid: int = gid,
-                        **kwargs: Any,
-                    ) -> Any:
-                        orig_prompt = int(getattr(request, "num_prompt_tokens", 0) or 0)
-                        eff_prompt = self._effective_prompt_tokens(orig_prompt)
-                        hb = self._alignment_tokens()
-                        bs = self._mamba_block_size()
-                        fine_boundary = (eff_prompt // hb) * hb
-                        full_boundary = (fine_boundary // bs) * bs
-                        adjusted_prompt = False
-                        if (
-                            eff_prompt < orig_prompt
-                            and fine_boundary > full_boundary
-                            and int(num_tokens) == fine_boundary
-                        ):
-                            request.num_prompt_tokens = eff_prompt
-                            adjusted_prompt = True
-                        elif (
-                            eff_prompt < orig_prompt
-                            and int(num_tokens) == (orig_prompt // hb) * hb
-                            and int(num_tokens) != fine_boundary
-                        ):
-                            return None
-                        try:
-                            res = _orig(request, num_tokens, *args, **kwargs)
-                        finally:
-                            if adjusted_prompt:
-                                request.num_prompt_tokens = orig_prompt
-                        if res is not None:
-                            rid = request.request_id
-                            partial_reqs = getattr(_mgr, "_partial_hit_reqs", None)
-                            if isinstance(partial_reqs, dict) and rid in partial_reqs:
-                                _, src_blk = partial_reqs[rid]
-                                self._record_tracked_block(
-                                    rid, _gid, src_blk, int(num_tokens)
-                                )
-                            else:
-                                req_blocks = getattr(_mgr, "req_to_blocks", {}).get(rid)
-                                bidx = int(num_tokens) // int(_mgr.block_size)
-                                if req_blocks and bidx < len(req_blocks):
-                                    self._record_tracked_block(
-                                        rid,
-                                        _gid,
-                                        req_blocks[bidx],
-                                        int(num_tokens),
-                                    )
-                        return res
-
-                    mgr._cache_partial_tail_block = _wrapped_cache_partial
-
-                orig_alloc_new = getattr(mgr, "allocate_new_blocks", None)
-                if callable(orig_alloc_new):
-
-                    def _wrapped_allocate_new_blocks(
-                        request_id: str,
-                        num_tokens: int,
-                        num_tokens_main_model: int,
-                        _orig: Any = orig_alloc_new,
-                        _mgr: Any = mgr,
-                        _gid: int = gid,
-                    ) -> Any:
+                def _wrapped_cache_partial(
+                    request: Any,
+                    num_tokens: int,
+                    *args: Any,
+                    _orig: Any = orig_cache_partial,
+                    _mgr: Any = mgr,
+                    _gid: int = gid,
+                    **kwargs: Any,
+                ) -> Any:
+                    orig_prompt = int(getattr(request, "num_prompt_tokens", 0) or 0)
+                    eff_prompt = self._effective_prompt_tokens(orig_prompt)
+                    hb = self._alignment_tokens()
+                    bs = self._mamba_block_size()
+                    fine_boundary = (eff_prompt // hb) * hb
+                    full_boundary = (fine_boundary // bs) * bs
+                    adjusted_prompt = False
+                    if (
+                        eff_prompt < orig_prompt
+                        and fine_boundary > full_boundary
+                        and int(num_tokens) == fine_boundary
+                    ):
+                        request.num_prompt_tokens = eff_prompt
+                        adjusted_prompt = True
+                    elif (
+                        eff_prompt < orig_prompt
+                        and int(num_tokens) == (orig_prompt // hb) * hb
+                        and int(num_tokens) != fine_boundary
+                    ):
+                        return None
+                    try:
+                        res = _orig(request, num_tokens, *args, **kwargs)
+                    finally:
+                        if adjusted_prompt:
+                            request.num_prompt_tokens = orig_prompt
+                    if res is not None:
+                        rid = request.request_id
                         partial_reqs = getattr(_mgr, "_partial_hit_reqs", None)
-                        had_partial = (
-                            partial_reqs.get(request_id)
-                            if isinstance(partial_reqs, dict)
-                            else None
-                        )
-                        pending_cows = getattr(_mgr, "_pending_cow_copies", None)
-                        cow_len_before = (
-                            len(pending_cows) if isinstance(pending_cows, list) else 0
-                        )
-                        ret = _orig(request_id, num_tokens, num_tokens_main_model)
-                        if had_partial is not None and isinstance(pending_cows, list):
-                            _, src_blk = had_partial
-                            for src_c, cow_blk in pending_cows[cow_len_before:]:
-                                if src_c is src_blk:
-                                    self._replace_tracked_block(
-                                        request_id, _gid, src_blk, cow_blk
-                                    )
-                        return ret
+                        if isinstance(partial_reqs, dict) and rid in partial_reqs:
+                            _, src_blk = partial_reqs[rid]
+                            self._record_tracked_block(
+                                rid, _gid, src_blk, int(num_tokens)
+                            )
+                        else:
+                            req_blocks = getattr(_mgr, "req_to_blocks", {}).get(rid)
+                            bidx = int(num_tokens) // int(_mgr.block_size)
+                            if req_blocks and bidx < len(req_blocks):
+                                self._record_tracked_block(
+                                    rid,
+                                    _gid,
+                                    req_blocks[bidx],
+                                    int(num_tokens),
+                                )
+                    return res
 
-                    mgr.allocate_new_blocks = _wrapped_allocate_new_blocks
+                mgr._cache_partial_tail_block = _wrapped_cache_partial
+
+                orig_alloc_new = mgr.allocate_new_blocks
+
+                def _wrapped_allocate_new_blocks(
+                    request_id: str,
+                    num_tokens: int,
+                    num_tokens_main_model: int,
+                    _orig: Any = orig_alloc_new,
+                    _mgr: Any = mgr,
+                    _gid: int = gid,
+                ) -> Any:
+                    partial_reqs = getattr(_mgr, "_partial_hit_reqs", None)
+                    had_partial = (
+                        partial_reqs.get(request_id)
+                        if isinstance(partial_reqs, dict)
+                        else None
+                    )
+                    pending_cows = getattr(_mgr, "_pending_cow_copies", None)
+                    cow_len_before = (
+                        len(pending_cows) if isinstance(pending_cows, list) else 0
+                    )
+                    ret = _orig(request_id, num_tokens, num_tokens_main_model)
+                    if had_partial is not None and isinstance(pending_cows, list):
+                        _, src_blk = had_partial
+                        for src_c, cow_blk in pending_cows[cow_len_before:]:
+                            if src_c is src_blk:
+                                self._replace_tracked_block(
+                                    request_id, _gid, src_blk, cow_blk
+                                )
+                    return ret
+
+                mgr.allocate_new_blocks = _wrapped_allocate_new_blocks
 
     def _record_tracked_block(
         self, request_id: str, gid: int, block: Any, boundary_tokens: int
@@ -417,59 +415,55 @@ class HybridStateRetention:
         pool = self.block_pool
         if pool is not None and not getattr(pool, "_hybrid_retention_guarded", False):
             pool._hybrid_retention_guarded = True
-            orig_get_new_blocks = getattr(pool, "get_new_blocks", None)
-            if callable(orig_get_new_blocks):
+            orig_get_new_blocks = pool.get_new_blocks
 
-                def _guarded_get_new_blocks(
-                    num_blocks: int, _orig: Any = orig_get_new_blocks
-                ) -> Any:
-                    while (
-                        self._conv_lru or self._fork_lru
-                    ) and self._get_num_free_blocks() < num_blocks:
-                        if not self.evict_oldest_retained():
-                            break
-                    return _orig(num_blocks)
+            def _guarded_get_new_blocks(
+                num_blocks: int, _orig: Any = orig_get_new_blocks
+            ) -> Any:
+                while (
+                    self._conv_lru or self._fork_lru
+                ) and self._get_num_free_blocks() < num_blocks:
+                    if not self.evict_oldest_retained():
+                        break
+                return _orig(num_blocks)
 
-                pool.get_new_blocks = _guarded_get_new_blocks
+            pool.get_new_blocks = _guarded_get_new_blocks
 
-            orig_reset = getattr(pool, "reset_prefix_cache", None)
-            if callable(orig_reset):
+            orig_reset = pool.reset_prefix_cache
 
-                def _guarded_reset_prefix_cache(
-                    _orig: Any = orig_reset,
-                ) -> Any:
-                    self.evict_all_conversations()
-                    return _orig()
+            def _guarded_reset_prefix_cache(
+                _orig: Any = orig_reset,
+            ) -> Any:
+                self.evict_all_conversations()
+                return _orig()
 
-                pool.reset_prefix_cache = _guarded_reset_prefix_cache
+            pool.reset_prefix_cache = _guarded_reset_prefix_cache
 
         kvm = self.kvm
         if kvm is not None and not getattr(kvm, "_hybrid_retention_guarded", False):
             kvm._hybrid_retention_guarded = True
             coordinator = self.coordinator
-            orig_need = getattr(coordinator, "get_num_blocks_to_allocate", None)
-            if callable(orig_need):
+            orig_need = coordinator.get_num_blocks_to_allocate
 
-                def _recorded_need(
-                    *args: Any, _orig: Any = orig_need, **kwargs: Any
-                ) -> Any:
-                    need = _orig(*args, **kwargs)
-                    self._last_need = need
-                    return need
+            def _recorded_need(
+                *args: Any, _orig: Any = orig_need, **kwargs: Any
+            ) -> Any:
+                need = _orig(*args, **kwargs)
+                self._last_need = need
+                return need
 
-                coordinator.get_num_blocks_to_allocate = _recorded_need
+            coordinator.get_num_blocks_to_allocate = _recorded_need
 
-            orig_allocate_slots = getattr(kvm, "allocate_slots", None)
-            if callable(orig_allocate_slots):
+            orig_allocate_slots = kvm.allocate_slots
 
-                def _guarded_allocate_slots(
-                    *args: Any,
-                    _orig: Any = orig_allocate_slots,
-                    **kwargs: Any,
-                ) -> Any:
-                    return self._allocate_slots_with_eviction(_orig, args, kwargs)
+            def _guarded_allocate_slots(
+                *args: Any,
+                _orig: Any = orig_allocate_slots,
+                **kwargs: Any,
+            ) -> Any:
+                return self._allocate_slots_with_eviction(_orig, args, kwargs)
 
-                kvm.allocate_slots = _guarded_allocate_slots
+            kvm.allocate_slots = _guarded_allocate_slots
 
     def _allocate_slots_with_eviction(
         self, orig: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
