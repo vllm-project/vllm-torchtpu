@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 
 _padding_state: "TokenPaddingState | None" = None
+_SPARE_ROWS = 128
 
 
 @dataclass
@@ -27,8 +28,13 @@ class TokenPaddingState:
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
+        # One spare block past the largest bucket: get_local_padding_mask()
+        # then never slices the whole buffer, so Dynamo guards the token count
+        # from above only. Slicing the full buffer at the largest bucket made
+        # it guard num_tokens >= max and specialize the dynamic dim when that
+        # bucket is also the profile-run size (--max-num-batched-tokens 4096).
         local_padding_mask = torch.zeros(
-            max_local_tokens, dtype=torch.bool, device=device
+            max_local_tokens + _SPARE_ROWS, dtype=torch.bool, device=device
         )
         return cls(local_padding_mask=local_padding_mask)
 
