@@ -467,6 +467,7 @@ def _kernel(
     def group(
         w,
         mode="full",
+        sink=None,
         q_ref=q_ref,
         o_ref=o_ref,
         lse_ref=lse_ref,
@@ -670,6 +671,9 @@ def _kernel(
 
         def put(out):  # [H * Bq, D] or [H, Bq, D]
             out = out.reshape(num_heads, block_q, head_dim)
+            if sink is not None:  # `_pair_loop` stores two tiles' rows at once
+                sink.append(out)
+                return
             if store_out is None:
                 o_ref[...] = out.astype(o_ref.dtype)
             else:
@@ -966,7 +970,7 @@ def _kernel(
         group, b, block_start_ref, num_groups, tiles_per_step, work_page_ref,
         work_meta_ref, work_count_ref, page_table_ref, kv_hbm_ref, buf_ref, sem_ref,
         scale_hbm_ref, scale_buf_ref, scale_sem_ref, pages_per_step, step_widths,
-        group_head,
+        group_head, o_ref,
     )
 
 
@@ -974,14 +978,16 @@ def _pair_loop(
     group, b, block_start_ref, num_groups, tiles_per_step, work_page_ref,
     work_meta_ref, work_count_ref, page_table_ref, kv_hbm_ref, buf_ref, sem_ref,
     scale_hbm_ref, scale_buf_ref, scale_sem_ref, pages_per_step, step_widths,
-    group_head,
+    group_head, o_ref,
 ):
     """`_kernel`'s group loop with `pair` (decode, streamed pages): a grid
     step whose tiles hold one group each runs them two at a time, both
     tiles' softmax in one straight-line body at the wider tile's step width,
     so their dependency chains (MXU push / pop, reductions, exp) interleave
     instead of running back to back (one 8-token tile's body is latency
-    bound, ~2.5 ops per bundle). Other steps run their groups one by one.
+    bound, ~2.5 ops per bundle); the pair's rows (an even tile's and the
+    next) fill whole packed output tiles, so they store at once instead of
+    each merging into a shared one. Other steps run their groups one by one.
     Pages stream through a ring of 4 group slots, group ``g`` in slot
     ``g % 4``: before the groups ``[w, w + n)`` run, groups ``w + 2 ..
     w + n + 1`` start (2 groups in flight ahead of the running ones)."""
@@ -1066,8 +1072,17 @@ def _pair_loop(
         start_if(w + 3)
         wait(w)
         wait(w + 1)
-        ga, gb = group(w, mode="setup"), group(w + 1, mode="setup")
+        outs = ([], [])
+        ga = group(w, mode="setup", sink=outs[0])
+        gb = group(w + 1, mode="setup", sink=outs[1])
         count = jnp.maximum(ga.count, gb.count)
+        block_q = o_ref.shape[1] // tiles_per_step
+        rows = pl.ds(pl.multiple_of(2 * i * block_q, 2 * block_q), 2 * block_q)
+
+        def store():
+            o_ref[:, rows, :] = jnp.concatenate(
+                [outs[0].pop(), outs[1].pop()], axis=1
+            ).astype(o_ref.dtype)
         for k, width in enumerate(widths):
             fits = count > (widths[k - 1] if k else 0)
             if width < pages_per_step:
@@ -1076,6 +1091,7 @@ def _pair_loop(
             def both(width=width):
                 ga.attend(width, True)
                 gb.attend(width, True)
+                store()
 
             pl.when(fits)(both)
 
@@ -1083,10 +1099,15 @@ def _pair_loop(
         def _empty():
             ga.empty()
             gb.empty()
+            store()
 
         return carry
 
-    paired = (hi - lo == tiles_per_step) & (tiles_per_step % 2 == 0)
+    if tiles_per_step % 2:  # no pairs in a step
+        jax.lax.fori_loop(lo, hi, one_by_one, 0)
+        return
+    paired = hi - lo == tiles_per_step
+
     @pl.when(paired)
     def _pairs():
         jax.lax.fori_loop(0, tiles_per_step // 2, two_at_a_time, 0)
@@ -1624,13 +1645,14 @@ DECODE_OPT_ENV = "TPU_MINIMAX_M3_MSA_DECODE_OPT"
 def decode_opt() -> dict:
     """`TPU_MINIMAX_M3_MSA_DECODE_OPT` (read when the program is traced) for
     decode batches of 8-token tiles with wide groups (`msa_dcp`, more than
-    128 tokens), comma-separated: ``widths=<w/w/...>`` the step widths below
+    128 tokens), items separated by "," or "+" (inside comma-separated env
+    lists): ``widths=<w/w/...>`` the step widths below
     the full group; ``pps=<n>`` pages per group; ``pair``: every decode call
     (`_chunked_call`, any batch) runs its one-group tiles two at a time
     (`_pair_loop`). Empty = off (the defaults)."""
     spec = os.environ.get(DECODE_OPT_ENV, "").strip()
     opt = {}
-    for item in filter(None, (x.strip() for x in spec.split(","))):
+    for item in filter(None, (x.strip() for x in spec.replace("+", ",").split(","))):
         key, _, val = item.partition("=")
         if key == "widths" and val:
             opt["step_widths"] = tuple(sorted(int(w) for w in val.split("/")))
@@ -1648,7 +1670,7 @@ def decode_opt() -> dict:
 def decode_pair() -> bool:
     """`TPU_MINIMAX_M3_MSA_DECODE_OPT` holds ``pair``."""
     spec = os.environ.get(DECODE_OPT_ENV, "")
-    return "pair" in (x.strip() for x in spec.split(","))
+    return "pair" in (x.strip() for x in spec.replace("+", ",").split(","))
 
 
 # 4-bit prefill calls with a page cache pick their tiles per call from the
