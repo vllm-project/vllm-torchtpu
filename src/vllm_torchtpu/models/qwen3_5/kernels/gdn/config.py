@@ -32,10 +32,10 @@ from jax.experimental.pallas import tpu as pltpu
 # Shapes (kq heads, value heads, kq head dim, value head dim per rank) at which
 # the chunked prefill computes (beta k) k^T as diag(beta) (k k^T), one dot per
 # kq head (`compute_gdn.chunked_gdn_per_seq`). That form reassociates the beta
-# product, so its results differ from main's in the last bits. It was measured
-# only on the Qwen3.5-397B prefill legs (TP1: 16 kq and 64 value heads of 128),
-# so every other shape keeps main's (beta k) k^T and computes what main
-# computes.
+# product, so its results differ from kernels/gdn/v3's in the last bits. It was
+# measured only on the Qwen3.5-397B prefill legs (TP1: 16 kq and 64 value heads
+# of 128), so every other shape keeps kernels/gdn/v3's (beta k) k^T and
+# computes what that kernel computes.
 SHARED_KKT_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
     {(16, 64, 128, 128)}
 )
