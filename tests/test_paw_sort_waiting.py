@@ -70,6 +70,7 @@ def _scheduler(monkeypatch, requests, warmth, sort="1", aging="0", window=None):
     s._hit_estimator = None
     s._kv_prefetch_n = 0
     s._kv_prefetch_cap = None
+    s._promote_warmest_switch = True
     s.block_size = 2176
 
     coordinator = MagicMock()
