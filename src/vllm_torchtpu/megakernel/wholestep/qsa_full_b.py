@@ -32,6 +32,7 @@ see DESIGN.md). Groups completed during this step are stage C.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import jax
@@ -58,6 +59,7 @@ DBG_IQ = (
 )
 DBG_IDS = "qsa_dbg_ids"
 UNION_SLOTS = 3  # attention ring slots with `union_attn`
+NVIS_DIGIT = int(os.environ.get("VLLM_TPU_MK_QSA_NVIS_DIGIT", "3"))  # bits per bisection pass
 IDX_N = 4 * ix.IDX_DIM + ix.IDX_DIM  # 512 query + 128 raw-key columns
 
 
@@ -233,6 +235,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.select_nvis = bool(int(select_nvis)) and per_request_scores
         # 2: also the union compaction (`qsa_ucompact`) over those rows.
         self.select_nvis_union = self.select_nvis and int(select_nvis) >= 2 and union_attn
+        # 3: also the bisection `NVIS_DIGIT` bits per pass (fewer dependent count passes).
+        self.nvis_digit = NVIS_DIGIT if self.select_nvis and int(select_nvis) >= 3 else 1
         self.nvis_rows = tuple(int(x) for x in nvis_rows)
         if self.select_nvis:
             S, rs = max_groups // 128, max_groups // 128 // self.n_chunks

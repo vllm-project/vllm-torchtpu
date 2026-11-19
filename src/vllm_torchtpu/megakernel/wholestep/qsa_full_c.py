@@ -407,7 +407,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return pltpu.bitcast(qs[ix_].reshape(shape), I32)
 
         return ix.thresholds_chunks(
-            bits, lambda c: self._nvis_ids(ctx, shape, base_of(c)), m, nv, K, G, shape
+            bits, lambda c: self._nvis_ids(ctx, shape, base_of(c)), m, nv, K, G, shape,
+            digit=self.nvis_digit,
         )
 
     def _nvis_row(self, ctx: Any, r: Any, lo: Any, s0: Any, ga: Any, consts: tuple) -> tuple:

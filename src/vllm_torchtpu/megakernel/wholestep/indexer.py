@@ -196,10 +196,16 @@ def compact_consts(S: int, K: int) -> tuple:
 # hold visible groups: every other row is all -1 (invisible) and adds nothing to any count,
 # so the same thresholds, ids and order come out of fewer passes over fewer rows.
 def thresholds_chunks(load_bits, load_ids, n_ch: Any, nv: jax.Array, K: int, G: int,
-                      shape: tuple):
+                      shape: tuple, digit: int = 1):
     """`thresholds` over `n_ch` (traced) score chunks: `load_bits(c)` / `load_ids(c)` give
     chunk `c`'s bit patterns (-1 = invisible) / group ids, both `shape = [R, CH, 128]`; the
-    rows outside the chunks must be invisible. Integer counts: any summation order."""
+    rows outside the chunks must be invisible. Integer counts: any summation order.
+    `digit` > 1: each pass settles `digit` bits of the bisection at once (the counts of all
+    `2^digit - 1` candidates of the next digit; the count is monotone in the candidate, so
+    the digit is the number of candidates that pass): the same values in fewer dependent
+    passes."""
+    if digit > 1:
+        return _thresholds_digits(load_bits, load_ids, n_ch, nv, K, G, shape, digit)
 
     def cnt(*fs):
         def body(c: Any, accs: Any) -> Any:
@@ -222,6 +228,53 @@ def thresholds_chunks(load_bits, load_ids, n_ch: Any, nv: jax.Array, K: int, G: 
         cand = t | (1 << b)
         (n,) = cnt(lambda c, cand=cand: (load_bits(c) == thr) & (load_ids(c) < cand))
         t = jnp.where(n < need, cand, t)
+    tmax = jnp.where(over & (n_eq > need), t, G)
+    return thr, tmax
+
+
+def _thresholds_digits(load_bits, load_ids, n_ch, nv, K, G, shape, digit):
+    R, CH = shape[0], shape[1]
+    part = (R, CH // 8, 8, 128) if CH % 8 == 0 else None
+
+    def cnt(fs):
+        """Counts `[R, 1, 1]` of the predicates `fs` (one pass over the chunks)."""
+        acc_shape = (R, 8, 128) if part else shape
+
+        def body(c: Any, accs: Any) -> Any:
+            out = []
+            for a, f in zip(accs, fs):
+                m = f(c).astype(I32)
+                out.append(a + (jnp.sum(m.reshape(part), axis=1) if part else m))
+            return tuple(out)
+
+        accs = jax.lax.fori_loop(0, n_ch, body, tuple(jnp.zeros(acc_shape, I32) for _ in fs))
+        return [jnp.sum(a, axis=(1, 2), keepdims=True) for a in accs]
+
+    def steps(top: int):
+        hi = top
+        while hi >= 0:
+            lo_b = max(hi - digit + 1, 0)
+            yield lo_b, hi - lo_b + 1
+            hi = lo_b - 1
+
+    over = nv > K
+    lo = jnp.zeros(nv.shape, I32)
+    for s, w in steps(30):
+        cands = [lo | (k << s) for k in range(1, 1 << w)]
+        ns = cnt([lambda c, cd=cd: load_bits(c) >= cd for cd in cands])
+        k = sum((n >= K).astype(I32) for n in ns)
+        lo = lo | (k << s)
+    thr = jnp.where(over, lo, 0)
+    n_gt, n_eq = cnt([lambda c: load_bits(c) > thr, lambda c: load_bits(c) == thr])
+    need = K - n_gt
+    t = jnp.zeros(nv.shape, I32)
+    for s, w in steps(int(G - 1).bit_length() - 1):
+        cands = [t | (k << s) for k in range(1, 1 << w)]
+        ns = cnt([
+            lambda c, cd=cd: (load_bits(c) == thr) & (load_ids(c) < cd) for cd in cands
+        ])
+        k = sum((n < need).astype(I32) for n in ns)
+        t = t | (k << s)
     tmax = jnp.where(over & (n_eq > need), t, G)
     return thr, tmax
 
