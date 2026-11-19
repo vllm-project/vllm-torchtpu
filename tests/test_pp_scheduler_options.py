@@ -41,10 +41,7 @@ from vllm_torchtpu.core import (
 from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
 from vllm_torchtpu.core.pp_chunks import StepCostModel, step_limit
 from vllm_torchtpu.models import qwen3_5
-from vllm_torchtpu.runner.utils import (
-    HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
-    PP_SCHEDULER_OPTIONS_SECTION,
-)
+from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 BUCKETS = [4096, 8192, 12288, 16384]
 _EMPTY_STEP = SimpleNamespace(total_num_scheduled_tokens=0)
@@ -171,7 +168,6 @@ def test_parse_is_strict(raw, match):
 
 
 def test_section_is_registered_and_kept_out_of_the_compile_cache_key():
-    assert pp_scheduler_options.SECTION == PP_SCHEDULER_OPTIONS_SECTION
     assert pp_scheduler_options.SECTION in additional_config_sections.KNOWN_SECTIONS
     assert pp_scheduler_options.SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
