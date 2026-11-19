@@ -678,6 +678,8 @@ def _exchange_pages(
             in_flight=in_flight,
             interpret=interpret,
         )
+        # The scales' XLA collectives run after the page copies retire.
+        recv, scale_cache = jax.lax.optimization_barrier((recv, scale_cache))
     else:
         recv = exchange_head_pages(
             kv_cache,
