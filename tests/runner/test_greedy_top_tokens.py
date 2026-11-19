@@ -14,6 +14,7 @@
 """TPU_GREEDY_TOP_TOKENS: the vocabulary-parallel argmax against the
 full-logits argmax, and when a step may take it."""
 
+import contextlib
 import logging
 import math
 import subprocess
@@ -38,7 +39,7 @@ from vllm.sampling_params import StructuredOutputsParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.lora.torch_punica_tpu import PunicaWrapperTPU
-from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, min_tokens, tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -384,6 +385,46 @@ def test_runner_topk_candidates_step_choice(monkeypatch):
 
     runner._greedy_head_owner = None
     assert not runner._topk_candidates_this_step()
+
+
+def test_candidate_head_warmup_follows_the_serving_gate(monkeypatch):
+    """The candidate heads are warmed only where steps can serve from them:
+    with the option on and a head that gives candidates, not under an lm_head
+    LoRA and not with the option off."""
+    from vllm_torchtpu import envs
+
+    runner = _runner(torch.zeros(8, 2))
+    calls = []
+    runner.compute_selected_topk_candidates = lambda *args: calls.append(args)
+    runner.model_config = SimpleNamespace(get_hidden_size=lambda: 2)
+    runner.num_tokens_paddings = [16]
+    runner._selected_logits_lengths = lambda _num_tokens: [8]
+    runner._hidden_states_dtype = torch.float32
+    runner.device = torch.device("cpu")
+    runner._precompile_timed = lambda _name: contextlib.nullcontext()
+    runner.get_pcp_planner = lambda: SimpleNamespace(
+        uses_selected_logits_hidden_states=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda _out: None)
+
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    TPUModelRunner._precompile_compute_topk_candidates(runner)
+    assert len(calls) == 1
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 0)
+    TPUModelRunner._precompile_compute_topk_candidates(runner)
+    assert len(calls) == 1
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    runner._greedy_head_owner = _lora_owner(monkeypatch)
+    TPUModelRunner._precompile_compute_topk_candidates(runner)
+    assert len(calls) == 1
+
+
+def test_the_candidate_block_verify_takes_some_but_not_all_of_the_vocabulary():
+    """Serving and its warmup share the rule: the candidate blocks must be
+    some of the vocabulary but not all of it."""
+    assert tpu_runner._candidate_block_verify_fits(40, 248320)
+    assert not tpu_runner._candidate_block_verify_fits(0, 248320)
+    assert not tpu_runner._candidate_block_verify_fits(248320 // 128, 248320)
 
 
 def test_runner_keeps_thinking_budget_steps_off_the_topk_candidates(monkeypatch):
