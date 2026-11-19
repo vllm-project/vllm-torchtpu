@@ -1665,7 +1665,11 @@ def sparse_mla_attention_dcp(
             # kernel default).
             small_chunk_tokens=small_chunk_tokens,
             small_chunk_gather_atoms=dcp_small_chunk_gather_atoms(topk_idx.shape[0]),
-            sparsecore_gather_early_dma=envs.TPU_MLA_GATHER_EARLY_DMA and decode_bucket,
+            sparsecore_gather_early_dma=envs.TPU_MLA_GATHER_EARLY_DMA
+            and (
+                decode_bucket
+                or (envs.TPU_MLA_GATHER_EARLY_DMA_LIVE_GROUP and kv_write is not None)
+            ),
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,
@@ -1681,6 +1685,7 @@ def sparse_mla_attention_dcp(
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
+            mixed_fused_prep_small=envs.TPU_DCP_MLA_MIXED_FUSED_PREP_SMALL,
             decode_row_widths=(
                 tuple(int(w) for w in envs.TPU_MLA_DECODE_ROW_WIDTHS.split(",") if w)
                 if topk_cap

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
     TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS: str = ""
     TPU_MLA_GATHER_EARLY_DMA: bool = False
+    TPU_MLA_GATHER_EARLY_DMA_LIVE_GROUP: bool = False
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_FUSED_PREP: bool = False
     TPU_DCP_MLA_MIXED_LIVE: bool = False
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MIXED_BODY_SMALL: str = ""
     TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
+    TPU_DCP_MLA_MIXED_FUSED_PREP_SMALL: bool = False
     TPU_MTP_DCP_MERGE_SMALL_A2A: bool = True
     TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS: int = 8
     TPU_VOCAB_EMBED_I32_BOUNDS: bool = True
@@ -990,6 +992,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MLA_KV_WRITE_IN_GATHER write phase and its fence instead of after
     # it, one round trip each. Same rows, same writes, same fence.
     "TPU_MLA_GATHER_EARLY_DMA": env_bool("TPU_MLA_GATHER_EARLY_DMA", default=False),
+    # With TPU_MLA_GATHER_EARLY_DMA: also start the early DMAs in the gather of
+    # a live-group call that writes the step's KV rows (TPU_MLA_KV_WRITE_IN_GATHER
+    # on the one-chunk 64-token bucket), not only on decode buckets of at most
+    # 32 tokens. Same rows, same writes, same fence.
+    "TPU_MLA_GATHER_EARLY_DMA_LIVE_GROUP": env_bool(
+        "TPU_MLA_GATHER_EARLY_DMA_LIVE_GROUP", default=False
+    ),
     # DCP sparse MLA, decode buckets (<= 32 tokens): drop the per-layer
     # owns mask / dummy key / lse select glue. The kernel takes each token's
     # true kv_len (0 = this rank owns none of its top-k), attends nothing for
@@ -1072,6 +1081,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rows, kv_lens and table; decode buckets unaffected.
     "TPU_DCP_MLA_MIXED_FUSED_PREP": env_bool(
         "TPU_DCP_MLA_MIXED_FUSED_PREP", default=False
+    ),
+    # With TPU_DCP_MLA_MIXED_FUSED_PREP: also take the fused prep on a
+    # live-group call of exactly one chunk shorter than 128 tokens (the
+    # 64-token decode bucket under TPU_DCP_MLA_SMALL_CHUNK_TOKENS=32). Without
+    # it that bucket runs kv_lens, the group table and the window rows as
+    # about 13 separate TensorCore ops between the indexer top-k and the
+    # SparseCore gather. Same rows, kv_lens and table.
+    "TPU_DCP_MLA_MIXED_FUSED_PREP_SMALL": env_bool(
+        "TPU_DCP_MLA_MIXED_FUSED_PREP_SMALL", default=False
     ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps

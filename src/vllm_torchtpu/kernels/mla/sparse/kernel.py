@@ -776,14 +776,39 @@ def _window_stream_rows(
 
 
 def mixed_fused_prep_supported(
-    num_tokens: int, topk: int, chunk_size: int, kernel_batch_size: int, topk_cap: int
+    num_tokens: int,
+    topk: int,
+    chunk_size: int,
+    kernel_batch_size: int,
+    topk_cap: int,
+    small_chunk: bool = False,
 ) -> bool:
-    """Whether `prepare_capped_window_live_fused` serves a mixed bucket: the
-    live-group layout holds, and kv_lens fits whole 128-lane rows per chunk."""
+    """Whether `prepare_capped_window_live_fused` serves a live-group bucket.
+
+    Args:
+      num_tokens: Query tokens of the call (the padded bucket).
+      topk: Top-k width of each token's index row.
+      chunk_size: Tokens per gather-and-attention chunk.
+      kernel_batch_size: Tokens per attention grid step.
+      topk_cap: Slots per capped window.
+      small_chunk: TPU_DCP_MLA_MIXED_FUSED_PREP_SMALL. Also accept a call of
+        exactly one chunk whose chunk is shorter than 128 tokens (the 64-token
+        decode bucket). Its kv_lens is then written as one partial 128-lane
+        row.
+
+    Returns:
+      True when the live-group layout holds and kv_lens fits the kernel's
+      output: whole 128-lane rows per chunk, or (with `small_chunk`) one
+      sub-128-token chunk.
+    """
+    whole_rows = chunk_size % 128 == 0
+    one_small_chunk = (
+        small_chunk and num_tokens == chunk_size < 128 and chunk_size % 8 == 0
+    )
     return (
         live_group_supported(chunk_size, kernel_batch_size, topk_cap)
         and num_tokens % chunk_size == 0
-        and chunk_size % 128 == 0
+        and (whole_rows or one_small_chunk)
         and topk % topk_cap == 0
         and topk % 128 == 0
     )
@@ -885,14 +910,33 @@ def _capped_window_live_fused_kernel(
             jnp.float32
         )
     kv_col = jnp.sum(acc, axis=1, keepdims=True)  # f32[chunk, 1], exact
-    for h in range(chunk_size // 128):
-        blk = jnp.broadcast_to(kv_col[h * 128 : (h + 1) * 128, :], (128, 128))
-        kv_row = jnp.transpose(blk)[0:1, :].astype(jnp.int32)
+
+    def kv_fault(kv_row):
         if fault == "kv":  # test-only positive control
-            kv_row = kv_row + (
+            return kv_row + (
                 lax.broadcasted_iota(jnp.int32, kv_row.shape, 1) == 5
             ).astype(jnp.int32)
+        return kv_row
+
+    for h in range(chunk_size // 128):
+        blk = jnp.broadcast_to(kv_col[h * 128 : (h + 1) * 128, :], (128, 128))
+        kv_row = kv_fault(jnp.transpose(blk)[0:1, :].astype(jnp.int32))
         kv_ref[pl.ds(c * (chunk_size // 128) + h, 1), :] = kv_row
+    if chunk_size % 128:
+        # One chunk of fewer than 128 tokens (`mixed_fused_prep_supported`
+        # with small_chunk): pad the token column with zero rows to a
+        # (128, 128) tile, transpose it, and store lanes [0, chunk) of row 0
+        # into the i32[1, chunk] output. Example: chunk 64 gives lanes 0..63
+        # = kv_lens of tokens 0..63; lanes 64..127 (zeros) are not stored.
+        blk = jnp.concatenate(
+            [
+                jnp.broadcast_to(kv_col, (chunk_size, 128)),
+                jnp.zeros((128 - chunk_size, 128), jnp.float32),
+            ],
+            axis=0,
+        )
+        kv_row = kv_fault(jnp.transpose(blk)[0:1, :].astype(jnp.int32))
+        kv_ref[...] = kv_row[:, :chunk_size]
     kv_i = kv_col.astype(jnp.int32)
 
     # 2. Group table and the chunk's gather bound (`live_group_table`).
@@ -1065,11 +1109,18 @@ def prepare_capped_window_live_fused(
     `native_sc_gather.WINDOW_META_ROWS` meta rows, for
     `dsa_gather_native_sc(window_cache=True)`.
 
+    A `chunk_size` below 128 (TPU_DCP_MLA_MIXED_FUSED_PREP_SMALL) is served
+    only when the call is that one chunk; the caller checks it with
+    `mixed_fused_prep_supported(..., small_chunk=True)`.
+
     `_fault` is a test-only positive control ("kv", "off", "win1").
     """
     num_tokens, topk = topk_indices.shape
     bz = kernel_batch_size
-    if not mixed_fused_prep_supported(num_tokens, topk, chunk_size, bz, topk_cap):
+    small_chunk = chunk_size % 128 != 0
+    if not mixed_fused_prep_supported(
+        num_tokens, topk, chunk_size, bz, topk_cap, small_chunk=small_chunk
+    ):
         raise ValueError(
             f"mixed fused prep unsupported: tokens {num_tokens}, topk {topk}, "
             f"chunk {chunk_size}, batch {bz}, cap {topk_cap}"
@@ -1108,6 +1159,8 @@ def prepare_capped_window_live_fused(
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    # kv_lens: whole 128-lane rows, or one partial row for a sub-128 chunk.
+    kv_shape = (1, num_tokens) if small_chunk else (num_tokens // 128, 128)
     outs = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1118,7 +1171,7 @@ def prepare_capped_window_live_fused(
             ],
             out_specs=[
                 *([hbm] * num_chunks),
-                pl.BlockSpec((num_tokens // 128, 128), lambda c, te: (0, 0)),
+                pl.BlockSpec(kv_shape, lambda c, te: (0, 0)),
                 smem,
                 smem,
             ],
@@ -1135,7 +1188,7 @@ def prepare_capped_window_live_fused(
         ),
         out_shape=[
             *([jax.ShapeDtypeStruct((chunk_rows, 128), jnp.int32)] * num_chunks),
-            jax.ShapeDtypeStruct((num_tokens // 128, 128), jnp.int32),
+            jax.ShapeDtypeStruct(kv_shape, jnp.int32),
             jax.ShapeDtypeStruct((2 * num_tokens // bz,), jnp.int32),
             jax.ShapeDtypeStruct((num_chunks,), jnp.int32),
         ],
@@ -3872,6 +3925,7 @@ def prepare_outputs(
         "prologue_fault",
         "kv_write_fault",
         "mixed_fused_prep",
+        "mixed_fused_prep_small",
         "decode_row_widths",
         "decode_body_levers",
         "send_world",
@@ -3932,6 +3986,7 @@ def sparse_ragged_paged_attention(
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     kv_write_fault: str | None = None,
     mixed_fused_prep: bool = False,
+    mixed_fused_prep_small: bool = False,
     decode_row_widths: tuple[int, ...] = (),
     send_world: int = 0,
     out_pieces: int = 0,
@@ -4081,6 +4136,12 @@ def sparse_ragged_paged_attention(
         live-group window rows in one call that reads the top-k as 128-lane
         rows and writes one window array per chunk
         (`prepare_capped_window_live_fused`). Same rows, kv_lens and table.
+      mixed_fused_prep_small: TPU_DCP_MLA_MIXED_FUSED_PREP_SMALL. With
+        `mixed_fused_prep`: also take the fused prep on a live-group call of
+        one chunk shorter than 128 tokens (the 64-token decode bucket), which
+        otherwise runs kv_lens, `live_group_table` and
+        `prepare_capped_window_live` as separate ops. Same rows, kv_lens and
+        table.
       send_world: TPU_DCP_MLA_SEND_LAYOUT. With `lse_in_kernel` taking effect
         (lane-dense lse, one chunk) and split q, on `send_layout_supported`
         geometry: the kernel writes the DCP merge's packed real-rows send
@@ -4427,7 +4488,12 @@ def sparse_ragged_paged_attention(
         )
         token_end = cu_q_lens[distribution[2]]
         if mixed_fused_prep and mixed_fused_prep_supported(
-            q.shape[0], topk, uniform_chunk, prep_batch, topk_cap
+            q.shape[0],
+            topk,
+            uniform_chunk,
+            prep_batch,
+            topk_cap,
+            small_chunk=mixed_fused_prep_small,
         ):
             window_cache = (
                 gather_window_cache
