@@ -1439,6 +1439,42 @@ class TestChunkedPipelining:
                      " exact"),
         )
 
+    # fmt: off
+    @pytest.mark.parametrize(
+        "T_list, kv_layout, skip_empty_decode_chunked",
+        [
+            # Four chunks: chunk 2 scores into chunk 0's buffer, chunk 3 into
+            # chunk 1's.
+            pytest.param((40, 88), _SAL, False, id="seq_along_lane"),
+            # Chunk 0 comes out of the skip-empty cond, as on the served path.
+            pytest.param((40, 88), _SAL, True, id="seq_along_lane_skip_empty"),
+            # Decodes in chunk 0 (its DECODE passes run), a prefill after.
+            pytest.param((1,) * 8 + (120,), _HAS, True, id="decodes_then_prefill"),
+        ],
+    )
+    # fmt: on
+    def test_score_ring_matches_unchunked(
+        self, T_list, kv_layout, skip_empty_decode_chunked
+    ):
+        """`score_ring` scores chunk m into chunk m - 2's buffer: the result
+        equals the chunked one bit for bit and the unchunked one as a set."""
+        B, chunk_tokens = len(T_list), 32
+        assert sum(T_list) // chunk_tokens >= 3, "no chunk reuses a buffer"
+        inputs = _chunk_inputs(T_list, _fragmented_pages(B), 128, 4, 128)
+        common = (inputs, T_list, (512,) * B, 128, 1, 8, 2, kv_layout)
+
+        def run(chunk, **kw):
+            kwargs = _chunk_call_kwargs(*common, chunk)
+            kwargs.update(skip_empty_decode_chunked=skip_empty_decode_chunked, **kw)
+            return np.array(streamindex_topk(**kwargs))
+
+        ring = run(chunk_tokens, score_ring=True)
+        _verify_padding_at_end(ring)
+        np.testing.assert_array_equal(ring, run(chunk_tokens))
+        np.testing.assert_array_equal(
+            np.sort(ring, axis=-1), np.sort(run(None), axis=-1)
+        )
+
     def test_chunking_matches_unchunked_with_return_scores(self):
         """`return_scores` adds a second output concatenated per chunk.
 

@@ -1296,6 +1296,7 @@ def _effective_row_lengths(
         "shared_meta",
         "dcp_axis_name",
         "decode_as_mixed",
+        "score_ring",
     ),
 )
 def streamindex_topk(
@@ -1332,6 +1333,7 @@ def streamindex_topk(
     shared_meta: bool = False,
     dcp_axis_name: str | None = None,
     decode_as_mixed: bool = False,
+    score_ring: bool = False,
 ) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
 
@@ -1439,6 +1441,17 @@ def streamindex_topk(
         and `shared_meta`'s lazy DECODE schedules have nothing to act on. The
         DECODE passes sum the heads with one reduction, the MIXED pass head by
         head, so scores can differ in the last f32 bits.
+      score_ring: chunked calls score chunk m >= 2 into chunk m - 2's buffer,
+        once that chunk's SparseCore top-k has read it, so two score buffers
+        are live instead of one per chunk. Chunk m's scoring already follows
+        chunk m - 1's, and with it chunk m - 2's top-k, unless the top-k is
+        the longer of the two; then the TensorCore waits for it either way.
+        Every position a row's top-k reads is written by its own chunk, as in
+        a fresh buffer, so the result is the same bit for bit. That rests on
+        two invariants: the scoring passes only write their aliased
+        `scores_init` (no pass reads or pre-fills it), and the top-k reads a
+        row only up to its row length (0 on padding rows). Needs
+        `dcp_axis_name=None`.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1465,6 +1478,8 @@ def streamindex_topk(
             )
     if dcp_axis_name is not None and (cp_size == 1 or return_scores):
         raise ValueError("dcp_axis_name needs cp_size > 1 and return_scores=False.")
+    if score_ring and dcp_axis_name is not None:
+        raise NotImplementedError("score_ring needs dcp_axis_name=None.")
     if enable_early_exit and return_scores:
         raise NotImplementedError(
             "return_scores is not supported with enable_early_exit."
@@ -1811,12 +1826,14 @@ def streamindex_topk(
         chunk_tokens,
         out_dtype,
         scheduling_group_id,
+        donor=None,
     ):
-        """Scores for one window of the flat token axis, in a private buffer."""
+        """Scores for one window of the flat token axis, in a private buffer
+        (or in `donor`, a buffer nothing reads any more)."""
         # `scores=None`: no -inf pre-fill. It would write all of HBM scores, and
         # XLA would common the identical per-chunk fills into one buffer then clone
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
-        scores = None
+        scores = donor
         for spec, pass_meta, start_end in passes:
             if callable(pass_meta):
                 # TPU_STREAMIDX_SHARED_META: a DECODE schedule built here, in
@@ -1917,6 +1934,7 @@ def streamindex_topk(
         )
         topk_idxs = []
         topk_scores_list = []
+        score_bufs = []
         tied = ()
         for m in range(num_chunks):
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
@@ -1941,6 +1959,16 @@ def streamindex_topk(
                 )
                 for spec, meta in passes
             )
+            donor = None
+            if score_ring and m >= 2:
+                # Chunk m - 2's buffer, ordered after the top-k that read it. It
+                # is taken as the flat view the SparseCore top-k reads (the
+                # block's own bytes), so chunk 0's skip-empty cond returns one
+                # value rather than the block and that view (one of them a copy).
+                donor, _ = lax.optimization_barrier(
+                    (score_bufs[m - 2], topk_idxs[m - 2])
+                )
+                donor = donor.reshape(chunk_len, num_sublanes_total, 128)
             scores_for = functools.partial(
                 _scores_for_chunk,
                 chunk_idx=m,
@@ -1948,6 +1976,7 @@ def streamindex_topk(
                 chunk_tokens=chunk_len,
                 out_dtype=out_dtype,
                 scheduling_group_id=tc_group,
+                donor=donor,
             )
             mixed_only = tuple(p for p in chunk_passes if p[0]["case"] == MlaCase.MIXED)
             if decode_as_mixed:
@@ -1973,6 +2002,7 @@ def streamindex_topk(
                 )
             else:
                 scores = scores_for(chunk_passes)
+            score_bufs.append(scores.reshape(-1))
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(

@@ -70,6 +70,17 @@ MIN_TOKENS = 1024
 CHUNK_TOKENS = 128
 # Rows [0, split_rows) stay on the DCP path; a multiple of this.
 SPLIT_ROWS_ALIGN = 16
+# Query rows per chunk of the split's indexer top-k (its `streamindex_topk`
+# `chunk_tokens`): each chunk's SparseCore top-k runs beside the next chunk's
+# TensorCore scoring instead of after all of it, and the chunks score into a
+# ring of two buffers (`score_ring`) instead of one buffer of every row. A row's
+# scores and top-k do not depend on the chunk. Buckets whose rows per rank it
+# does not divide run one pass. 256 makes 4 / 2 / 1 chunks of the 16K / 8K /
+# 4K buckets' rows: the top-k takes longer per row than the scoring, so all
+# but the first chunk's scoring hides under it, and halving the chunk would
+# hide at most 1/8 more at 16K for one more SparseCore launch and pipeline
+# fill per extra chunk.
+INDEXER_CHUNK_ROWS = 256
 # Gather sizes (virtual pages) below the buffer's capacity a step may take; the
 # buffer's capacity (`dcp_token_parallel.max_step_pages`) is always the last.
 # 44 is one max-model-len request (163840 / 4096) plus four pages: the steps of
@@ -296,6 +307,7 @@ def make_select_topk(
             chunk_tokens=chunk_tokens,
             decode_pack=decode_pack,
             shared_meta=shared_meta,
+            score_ring=True,
         )
 
     return select
@@ -1313,7 +1325,7 @@ def build_indexer_op(
         select = make_select_topk(
             topk,
             kv_layout,
-            chunk_tokens=chunk_tokens,
+            chunk_tokens=INDEXER_CHUNK_ROWS,
             small_bucket=small_bucket,
             skip_empty_decode=skip_empty_decode,
             skip_empty_decode_chunked=skip_empty_decode_chunked,

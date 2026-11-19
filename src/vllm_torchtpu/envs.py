@@ -1499,7 +1499,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
-    # Unset means unchunked: one single pass, no pipelining.
+    # Unset means unchunked: one single pass, no pipelining. The token-parallel
+    # split's rows take dcp_token_parallel_op.INDEXER_CHUNK_ROWS instead; this
+    # sizes the DCP indexer's chunks.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
