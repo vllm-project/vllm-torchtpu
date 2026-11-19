@@ -1390,8 +1390,13 @@ def block_scores(
     transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
     interpret: bool = False,
     fp8_q: bool | None = None,
+    row_order: jax.Array | None = None,
 ) -> jax.Array:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
+
+    `row_order` (int ``[N]``): return rows ``row_order`` of that result,
+    ``[N, 1, P]``, from the same single gather that lays the kernel's tiles
+    out (the caller's own row gather would be a second pass over the scores).
 
     Requests of at most `block_q` query tokens (decode, short chunks) are
     scored in `block_q`-row tiles; longer prefill chunks in `large_block_q`-row
@@ -1445,7 +1450,8 @@ def block_scores(
     pages = max(small.shape[1 if token_major else 0], plan.large_pages)
 
     def small_only():
-        rows = small[small_col] if token_major else small[:, small_col].T
+        col = small_col if row_order is None else small_col[row_order]
+        rows = small[col] if token_major else small[:, col].T
         return jnp.pad(rows, ((0, 0), (0, pages - rows.shape[1])))
 
     if max_large == 0:
@@ -1464,6 +1470,8 @@ def block_scores(
         # One gather over both classes' columns (XLA fuses the concatenate
         # into it) instead of a transposing gather per class and a select.
         col = jnp.where(lookup(is_large, seq), small_t.shape[1] + large_col, small_col)
+        if row_order is not None:
+            col = col[row_order]
         small_t, large = (
             jnp.pad(x, ((0, pages - x.shape[0]), (0, 0))) for x in (small_t, large)
         )

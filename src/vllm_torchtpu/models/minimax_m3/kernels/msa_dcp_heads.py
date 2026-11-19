@@ -178,6 +178,8 @@ def merge_partials(
     """`ops.msa.merge_head_partials` inside the SPMD program: head-major
     partials ``out [H, T, D]``, ``lse [H, T]`` -> this rank's heads,
     unrotated, ``[T, H / dcp, D]``."""
+    if out.shape[1] <= _merge_a2a_max_tokens():
+        return _merge_partials_a2a(out, lse, axis)
     lse = lse.astype(jnp.float32).T  # token-major across the gather
     lses = jax.lax.all_gather(lse, axis, axis=0)
     weight = jnp.exp(lse - jax.nn.logsumexp(lses, axis=0)).T[..., None]
@@ -187,6 +189,44 @@ def merge_partials(
         weighted = weighted.astype(out.dtype)
     merged = jax.lax.psum_scatter(weighted, axis, scatter_dimension=0, tiled=True)
     return msa_fp4.unrotate_output(merged.astype(out.dtype)).transpose(1, 0, 2)
+
+
+_merge_a2a_logged = False
+
+
+def _merge_a2a_max_tokens() -> int:
+    """`TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS` (0 = off)."""
+    global _merge_a2a_logged
+    from vllm_torchtpu import envs
+
+    limit = envs.TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS
+    if limit and not _merge_a2a_logged:
+        _merge_a2a_logged = True
+        init_logger(__name__).warning(
+            "TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS=%d: MSA DCP partials "
+            "of steps up to that many rows merged by all-to-all + f32 kernel.",
+            limit,
+        )
+    return limit
+
+
+def _merge_partials_a2a(out: jax.Array, lse: jax.Array, axis: str) -> jax.Array:
+    """`merge_partials` by one all-to-all of the partials' head blocks (and
+    one of their LSEs) and `msa_dcp.merge_partials`, which weights and sums
+    them in f32 and unrotates in one pass. The reduce-scatter path rounds
+    each weighted partial to bf16 and sums in bf16, so the results differ
+    in the last bits. The rank attended nothing for a token -> its partial
+    is zero (`msa_sparse_attention_lse`), so the plain product is safe."""
+    num_heads, num_tokens, head_dim = out.shape
+    dcp = jax.lax.axis_size(axis)
+    local = num_heads // dcp
+    parts = out.reshape(dcp, local, num_tokens, head_dim)
+    lses = lse.astype(jnp.float32).reshape(dcp, local, num_tokens).transpose(0, 2, 1)
+    parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
+    lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
+    hadamard = jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16)
+    merged = msa_dcp.merge_partials(parts, lses, hadamard)
+    return merged.reshape(num_tokens, local, head_dim)
 
 
 def _dcp_attend(
