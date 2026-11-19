@@ -63,9 +63,10 @@ forwards restructured so torch.compile serves every bucket:
 - A step shorter than `sequence_parallel.min_rows()` keeps its rows
   replicated and all-reduces the attention output instead (a Qwen3.5 target
   only; the threshold is a per-layout table).
-- The attention-side all-gather carries FP8 rows and their scales
-  (`sequence_parallel.fp8_gather`), which the attention projections consume
-  as pre-quantized input (`apply_prequant`).
+- For a layer whose main input projection takes pre-quantized rows, the
+  attention-side all-gather carries FP8 rows and their scales
+  (`sequence_parallel.fp8_gather`), which the projections consume as
+  pre-quantized input (`apply_prequant`); any other layer gathers bf16 rows.
 - The fused pre-attention norm computes the input norm and that row
   quantization as one op. Replicated rows take it only where every
   projection of the attention input is FP8 per-channel, so the pre-quantized
@@ -139,7 +140,6 @@ UPSTREAM_GEMMA_RMSNORM_FORWARD_NATIVE = GemmaRMSNorm.forward_native
 
 PAL_GATE_Q_MAX_ROWS = 8192
 
-_sigmoid_gate_quant_op: Callable | None = None
 _sigmoid_gate_o_proj_op: Callable | None = None
 _fp8_gate_and_se_op: Callable | None = None
 _V6_PATCHES_INSTALLED = False
@@ -174,33 +174,11 @@ def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
     )
 
 
-def _get_sigmoid_gate_quant_op() -> Callable:
-    global _sigmoid_gate_quant_op
-    if _sigmoid_gate_quant_op is None:
-
-        def _fn(
-            attn_out: jax.Array,
-            gate: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
-            m, k = attn_out.shape
-            if m <= PAL_GATE_Q_MAX_ROWS and k % 128 == 0:
-                return pallas_sigmoid_gate_quant(attn_out, gate)
-            return sigmoid_gate_quant_reference(attn_out, gate)
-
-        op = pallas.jax_op("pallas::qwen3_next_sigmoid_gate_quant", _fn)
-
-        def _fake(attn_out: torch.Tensor, gate: torch.Tensor):
-            return (
-                attn_out.new_empty(attn_out.shape, dtype=torch.float8_e4m3fn),
-                attn_out.new_empty((attn_out.shape[0], 1), dtype=torch.float32),
-            )
-
-        op.register_fake(_fake)
-        _sigmoid_gate_quant_op = op
+def _prebuild_sigmoid_gate_ops() -> None:
+    """Build the ops the fused sigmoid gate + FP8 o_proj path calls, before any
+    forward is traced: an op cannot be built inside a traced forward."""
     linear_common._get_prequant_matmul_op()
     _get_sigmoid_gate_o_proj_op()
-    assert _sigmoid_gate_quant_op is not None
-    return _sigmoid_gate_quant_op
 
 
 def _get_sigmoid_gate_o_proj_op() -> Callable:
@@ -1018,7 +996,7 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         if isinstance(module, qwen3_next.Qwen3NextSparseMoeBlock):
             maybe_setup_fused_gate_se(module)
         elif isinstance(module, qwen3_next.Qwen3NextAttention):
-            _get_sigmoid_gate_quant_op()
+            _prebuild_sigmoid_gate_ops()
             o_proj = getattr(module, "o_proj", None)
             # torch's Module.__setattr__ stub only accepts modules and tensors.
             # pyrefly: ignore[bad-argument-type]
@@ -1121,7 +1099,7 @@ def install_qwen3_next_v6_patches() -> None:
     @functools.wraps(orig_attn_init)
     def _patched_attn_init(self, *args, **kwargs):
         orig_attn_init(self, *args, **kwargs)
-        _get_sigmoid_gate_quant_op()
+        _prebuild_sigmoid_gate_ops()
 
     GemmaRMSNorm.forward_native = _patched_gemma_rmsnorm_forward_native
     qwen3_next.Qwen3NextAttention.__init__ = _patched_attn_init
