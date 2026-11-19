@@ -355,3 +355,33 @@ def test_an_error_in_the_tail_logs_and_primes_with_the_full_prompt(
     assert primed == [prompt]
     (call,) = logger.warning_once.call_args_list
     assert "RuntimeError" in call.args and ff._DetokStats.error == 1
+    (detail,) = logger.debug.call_args_list[-1:]
+    assert "decode moved" in str(detail.args)
+
+
+def test_repeated_tail_errors_of_one_type_warn_once(monkeypatch, detok_cls, tok):
+    """Through vLLM's own warning_once: two failing requests with different
+    messages of one error type log one warning, and the warning's arguments
+    hold no exception (warning_once caches them)."""
+    from vllm.logger import _print_warning_once
+
+    fast = PreTrainedTokenizerFast(tokenizer_object=tok)
+    prompt = tok.encode(" ".join(CORPUS)).ids
+    cont = tok.encode(CORPUS[0]).ids
+    messages = iter(["first failure", "second failure"])
+
+    def broken(*args):
+        raise RuntimeError(next(messages))
+
+    monkeypatch.setattr(ff, "safe_prompt_tail", broken)
+    vllm_logger = ff.logger._resolve()
+    warnings = []
+    monkeypatch.setattr(
+        vllm_logger, "warning", lambda msg, *args, **kw: warnings.append(args)
+    )
+    _print_warning_once.cache_clear()
+    assert ff.maybe_install_detok_prompt_tail()
+    _detokenize(fast, prompt, cont)
+    _detokenize(fast, prompt, cont)
+    (args,) = warnings
+    assert all(isinstance(a, str) for a in args) and "RuntimeError" in args

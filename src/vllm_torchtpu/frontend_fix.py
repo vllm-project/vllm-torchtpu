@@ -168,14 +168,19 @@ def maybe_install_detok_prompt_tail() -> bool:
             primed = _tail_request(tokenizer, request, tail_n)
         except Exception as e:
             # vLLM's own priming with the full prompt is always correct, so a
-            # request the tail cannot handle keeps it, and the error is logged.
+            # request the tail cannot handle keeps it. The warning is keyed on
+            # the error type alone (warning_once caches its arguments), so a
+            # failure that repeats on every request logs once and keeps no
+            # exception alive; each request's detail goes to debug.
             _DetokStats.error += 1
             logger.warning_once(
-                "%s %s while choosing the prompt tail (%s); priming with the "
-                "full prompt",
+                "%s %s while choosing the prompt tail; priming with the full "
+                "prompt (details at debug level)",
                 _DT,
                 type(e).__name__,
-                e,
+            )
+            logger.debug(
+                "%s %s while choosing the prompt tail: %s", _DT, type(e).__name__, e
             )
         now = time.monotonic()
         if now - _DetokStats.last_log >= log_s:
