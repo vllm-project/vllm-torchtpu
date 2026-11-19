@@ -306,7 +306,8 @@ def decode_opt() -> DecodeOpt:
 
     spec = envs.TPU_MINIMAX_M3_INDEXER_DECODE_OPT
     opt = DecodeOpt()
-    for item in filter(None, (x.strip() for x in spec.split(","))):
+    # "+" separates items too: EXTRA_SERVER_ENV-style lists split on commas.
+    for item in filter(None, (x.strip() for x in spec.replace("+", ",").split(","))):
         if item == "issue":
             opt = opt._replace(issue=True)
         elif item == "quad":
