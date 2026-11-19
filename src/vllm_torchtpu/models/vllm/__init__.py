@@ -46,6 +46,8 @@ def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
+    from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
+    from vllm_torchtpu.models.qwen3_5.settings import ARCHITECTURES as QWEN3_5_ARCHS
     from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
@@ -64,3 +66,6 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    # Qwen3.5 serving defaults and settings; see models/qwen3_5/hooks.py.
+    for arch in QWEN3_5_ARCHS:
+        MODELS_CONFIG_MAP[arch] = TPUQwen35MoeConfig

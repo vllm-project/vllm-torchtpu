@@ -477,6 +477,78 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize(
+        "tp,pcp,dcp,kv_heads,use_mla,refused",
+        [
+            # Qwen3.5-397B (2 KV heads) at TP8: DCP 8 spans both heads.
+            (8, 1, 8, 2, False, True),
+            (8, 1, 4, 2, False, False),
+            # The PCP manager's DCP = TP x PCP on an MLA model (GLM-5.2's
+            # TP2 / PCP4 / DCP8 in the parallelism guide).
+            (2, 4, 8, 128, True, False),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_decode_context_parallelism_is_validated(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        tp,
+        pcp,
+        dcp,
+        kv_heads,
+        use_mla,
+        refused,
+    ):
+        """check_and_update_config runs the DCP admission: it refuses a group
+        that spans two KV heads and admits the others, which then go on with
+        the rest of the platform check (stopped right after the admission)."""
+
+        class Admitted(Exception):
+            pass
+
+        admit = tpu_platform.validate_decode_context_parallel_config
+
+        def admit_then_stop(config):
+            admit(config)
+            raise Admitted
+
+        monkeypatch.setattr(
+            tpu_platform, "validate_decode_context_parallel_config", admit_then_stop
+        )
+        monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", pcp > 1)
+        vllm_config.model_config.get_total_num_kv_heads = lambda: kv_heads
+        vllm_config.model_config.use_mla = use_mla
+        pc = vllm_config.parallel_config
+        pc.tensor_parallel_size = tp
+        pc.prefill_context_parallel_size = pcp
+        pc.decode_context_parallel_size = dcp
+        pc.cp_kv_cache_interleave_size = 4
+        if refused:
+            with pytest.raises(ValueError, match="share one KV head"):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            with pytest.raises(Admitted):
+                TpuPlatform.check_and_update_config(vllm_config)
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_malformed_kv_transfer_page_is_refused_at_startup(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.additional_config = {
+            "tpu_kv_transfer": {"kernel_page_tokens": "128"}
+        }
+        with pytest.raises(ValueError, match="positive int"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
