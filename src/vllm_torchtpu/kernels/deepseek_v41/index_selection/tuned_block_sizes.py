@@ -21,5 +21,5 @@ class StreamingTopKConfig:
 # (generation, score width, topk): measured scan, bootstrap and output sorting.
 STREAMING_TOPK_CONFIG = {
     (7, width, 512): StreamingTopKConfig(4, 8, True)
-    for width in (16384, 32768, 49408, 98816)
+    for width in (16384, 32768, 49408, 98816, 262144, 524288, 1048576)
 }
