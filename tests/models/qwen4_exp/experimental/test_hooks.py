@@ -63,6 +63,10 @@ def test_register_takes_over_qwen4_exp_architectures(monkeypatch):
         mock.patch(
             "vllm_torchtpu.spec_decode.proposer_registry.register_draft_proposer"
         ) as draft_proposer,
+        mock.patch(
+            "vllm_torchtpu.models.qwen4_exp.experimental.runner.metadata."
+            "_install_block_table_version"
+        ) as block_table_version,
     ):
         hooks.register()
         from vllm.model_executor.models.config import MODELS_CONFIG_MAP
@@ -79,6 +83,7 @@ def test_register_takes_over_qwen4_exp_architectures(monkeypatch):
     draft_archs, make_draft = draft_proposer.call_args.args
     assert tuple(draft_archs) == ("Qwen4ExpMTP",)
     assert make_draft is hooks._make_draft_proposer
+    block_table_version.assert_called_once_with()
     factors = cache_key.call_args.kwargs["env_factors"]()
     assert set(factors) == {"model_plan"}
     for target in registered.values():
