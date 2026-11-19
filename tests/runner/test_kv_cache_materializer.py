@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from unittest.mock import patch
+
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -25,6 +27,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
+    DeviceKVCacheAllocator,
     format_kv_cache_layout_summary,
     materialize_kv_cache_tensors,
 )
@@ -252,7 +255,7 @@ def test_attention_only_allocates_direct_cache_without_raw_backing():
         kv_cache_config=cfg,
         attn_groups=[[attn_group]],
         kernel_block_sizes=[16],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype=torch.bfloat16,
     )
 
@@ -271,7 +274,7 @@ def test_direct_attention_materialization_maps_kernel_block_sizes_after_encoder_
         kv_cache_config=cfg,
         attn_groups=make_attention_groups(cfg),
         kernel_block_sizes=[16, 8],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype=torch.bfloat16,
     )
 
@@ -292,7 +295,7 @@ def test_hybrid_materializes_one_attention_shaped_pool(attn_dtype):
         kv_cache_config=cfg,
         attn_groups=_hybrid_groups(cfg),
         kernel_block_sizes=[16, 16],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype=("fp8" if attn_dtype == torch.float8_e4m3fn else "bfloat16"),
     )
 
@@ -310,7 +313,7 @@ def test_hybrid_materialization_builds_raiden_logical_regions():
         kv_cache_config=cfg,
         attn_groups=_hybrid_groups(cfg),
         kernel_block_sizes=[16, 16],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="bfloat16",
     )
 
@@ -356,7 +359,7 @@ def test_hybrid_materialization_skips_encoder_only_kernel_entry():
         kv_cache_config=cfg,
         attn_groups=make_attention_groups(cfg),
         kernel_block_sizes=[16, 8, 16],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="bfloat16",
     )
 
@@ -380,7 +383,7 @@ def test_materialization_rejects_mismatched_kernel_block_size_count(kernel_block
             kv_cache_config=cfg,
             attn_groups=make_attention_groups(cfg),
             kernel_block_sizes=kernel_block_sizes,
-            device=torch.device("cpu"),
+            allocator=DeviceKVCacheAllocator(torch.device("cpu")),
             cache_dtype=torch.bfloat16,
         )
 
@@ -401,25 +404,25 @@ def _hybrid_groups(cfg: KVCacheConfig) -> list[list[AttentionGroup]]:
     return [[attn_group], [mamba_group]]
 
 
-def test_pool_fp8_is_born_uninitialized_without_zero_fill(monkeypatch):
-    # fp8 pools cannot zero-fill on TPU (and slots are overwritten before
-    # use), so the pool must be allocated via torch.empty; the monkeypatch
-    # makes any fp8 torch.zeros call fail loudly.
-    torch_zeros = torch.zeros
+def test_pool_fp8_is_zero_filled(monkeypatch):
+    # The pool keeps the contract of every other KV cache array: it is
+    # zero-filled in every dtype, fp8 included (an fp8 byte can encode NaN).
+    # The monkeypatch makes any fp8 torch.empty call fail loudly.
+    torch_empty = torch.empty
 
-    def zeros_without_fp8(*args, **kwargs):
+    def empty_without_fp8(*args, **kwargs):
         if kwargs.get("dtype") in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise RuntimeError("fp8 pool must not require zero_")
-        return torch_zeros(*args, **kwargs)
+            raise RuntimeError("fp8 pool must be zero-filled")
+        return torch_empty(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "zeros", zeros_without_fp8)
+    monkeypatch.setattr(torch, "empty", empty_without_fp8)
     cfg = make_hybrid_config(num_blocks=4, attn_dtype=torch.float8_e4m3fn)
 
     materialized = materialize_kv_cache_tensors(
         kv_cache_config=cfg,
         attn_groups=_hybrid_groups(cfg),
         kernel_block_sizes=[16, 16],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="fp8",
     )
 
@@ -432,6 +435,7 @@ def test_pool_fp8_is_born_uninitialized_without_zero_fill(monkeypatch):
     assert isinstance(mamba_cache, list)
     assert len(mamba_cache) == 1
     assert mamba_cache[0] is attn_cache
+    assert not attn_cache.view(torch.uint8).any()
 
 
 def test_pool_layout_summary_shows_single_pool_state():
@@ -441,7 +445,7 @@ def test_pool_layout_summary_shows_single_pool_state():
         kv_cache_config=cfg,
         attn_groups=attn_groups,
         kernel_block_sizes=[16, 16],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="bfloat16",
     )
 
@@ -539,7 +543,7 @@ def test_hybrid_materialization_workload_a_geometry() -> None:
         kv_cache_config=cfg,
         attn_groups=attn_groups,
         kernel_block_sizes=[512, 512],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype="fp8",
     )
 
@@ -599,7 +603,7 @@ def test_native_placements_preserve_pool_budget_and_aliases(hybrid):
         kv_cache_config=config,
         attn_groups=make_attention_groups(config),
         kernel_block_sizes=[16, 16],
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         cache_dtype=torch.bfloat16,
     )
     pools = [result.kv_caches[f"attn.{index}"] for index in range(2)]
@@ -634,6 +638,63 @@ def test_attention_aliases_reject_mixed_native_shapes():
             kv_cache_config=config,
             attn_groups=make_attention_groups(config),
             kernel_block_sizes=[16, 16],
-            device=torch.device("cpu"),
+            allocator=DeviceKVCacheAllocator(torch.device("cpu")),
             cache_dtype=torch.bfloat16,
         )
+
+
+@pytest.mark.parametrize(
+    "make_config, kernel_block_sizes, block_major",
+    [
+        (make_attention_only_config, [16], False),
+        (make_attention_encoder_attention_config, [16, 8], False),
+        (make_hybrid_config, [16, 16], False),
+        (make_hybrid_config, [16, 16], True),
+    ],
+    ids=["direct", "direct-two-regions", "pool", "block-major-pool"],
+)
+def test_materialization_allocates_every_array_through_the_allocator(
+    make_config, kernel_block_sizes, block_major
+):
+    """Direct attention caches and unified pools both come from the caller's
+    allocator, so its one synchronize covers every array."""
+    cfg = make_config(num_blocks=4)
+    allocator = DeviceKVCacheAllocator(torch.device("cpu"))
+
+    materialized = materialize_kv_cache_tensors(
+        kv_cache_config=cfg,
+        attn_groups=make_attention_groups(cfg),
+        kernel_block_sizes=kernel_block_sizes,
+        allocator=allocator,
+        cache_dtype=torch.bfloat16,
+        block_major=block_major,
+    )
+
+    arrays = {
+        id(array)
+        for cache in materialized.kv_caches.values()
+        for array in (cache if isinstance(cache, list) else [cache])
+    }
+    assert sorted(map(id, allocator.arrays)) == sorted(arrays)
+    assert set(map(id, materialized.raw_tensors)) <= arrays
+
+
+def test_device_allocator_synchronizes_its_arrays_in_one_call():
+    """Each zero-filled array is synchronized exactly once; an allocator that
+    allocated nothing synchronizes nothing."""
+    allocator = DeviceKVCacheAllocator(torch.device("cpu"))
+    with patch(
+        "vllm_torchtpu.kv_cache_materializer.synchronize_tensors"
+    ) as synchronize:
+        allocator.synchronize()
+        synchronize.assert_not_called()
+
+        first = allocator.allocate((2, 3), torch.bfloat16)
+        second = allocator.allocate((4,), torch.int32)
+        allocator.synchronize()
+
+    synchronize.assert_called_once()
+    assert list(map(id, synchronize.call_args.args[0])) == [id(first), id(second)]
+    assert (first.shape, first.dtype) == ((2, 3), torch.bfloat16)
+    assert (second.shape, second.dtype) == ((4,), torch.int32)
+    assert not first.any() and not second.any()
