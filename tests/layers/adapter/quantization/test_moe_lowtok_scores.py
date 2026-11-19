@@ -219,6 +219,7 @@ def test_fp8_all_gather_forward_gathers_before_the_grouped_kernel(enabled, monke
         _tpu_activation_str="silu",
         _use_adaptive_fused_moe=False,
         _moe_lowtok_scores_op=op,
+        _gmm_primary_experts=None,
     )
     x = torch.empty(16, 512)
     out = fp8.VllmFp8MoEMethodTPU.apply_monolithic(
@@ -342,6 +343,7 @@ def test_fp8_forward_takes_the_scores_entry_when_armed(monkeypatch, armed):
         _tpu_activation_str="silu",
         _use_adaptive_fused_moe=False,
         _moe_lowtok_scores_op=Mock() if armed else None,
+        _gmm_primary_experts=None,
     )
     layer = make_layer()
     layer.w13_bias = layer.w2_bias = None

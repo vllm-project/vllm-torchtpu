@@ -1428,7 +1428,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "topk_weights": topk_weights,
             "topk_ids": topk_ids,
             "experts_start": layer._experts_start,
-            "num_primary_experts": getattr(layer, "_gmm_primary_experts", None),
+            "num_primary_experts": self._gmm_primary_experts,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
