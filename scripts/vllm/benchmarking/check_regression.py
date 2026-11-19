@@ -16,6 +16,8 @@
 
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
+    check_regression.py --mode perf --results-dir <dir> --roofline-targets <targets.json> --config-name <stem> [--chips <N>] [--min-roofline-ratio 0.8]
+    check_regression.py --mode perf --results-dir <dir> --agentx-gpu-reference <gpu.json> --chips <N> [--min-gpu-ratio 0.8]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
     check_regression.py --mode update --baseline <new.json> [--previous-baseline <old.json>]
 
@@ -229,12 +231,64 @@ class RooflineRow(NamedTuple):
 
 @dataclasses.dataclass(frozen=True)
 class RooflineCheckResult:
-    """Advisory % of roofline report for one config."""
+    """Outcome of a roofline speed check; truthy when any cell failed."""
 
     config_name: str
     num_chips: int | None
     rows: list[RooflineRow]
     not_modeled: NotModeledEntry | None = None
+
+    @property
+    def failed_rows(self) -> list[RooflineRow]:
+        return [r for r in self.rows if r.status.startswith("FAIL")]
+
+    def __bool__(self) -> bool:
+        return bool(self.failed_rows)
+
+
+AGENTX_AGGREGATE_RE = re.compile(r"^(.+)_c(\d+)\.json$")
+CONC_DIR_RE = re.compile(r"^conc_(\d+)$")
+
+
+class AgentxPoint(NamedTuple):
+    key: str
+    concurrency: int | None
+    output_tok_s_total: float
+    p90_interactivity: float
+    invalid_reason: str | None = None
+
+
+class GpuReferencePoint(NamedTuple):
+    p90_interactivity: float
+    out_tok_s_per_gpu: float
+
+
+class AgentxGpuRow(NamedTuple):
+    key: str
+    p90_interactivity: float
+    actual_per_chip: float
+    gpu_ref_per_gpu: float | None
+    ratio: float | None
+    status: str
+    invalid_reason: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentxGpuCheckResult:
+    """Outcome of an AgentX GPU reference speed check."""
+
+    config_name: str
+    num_chips: int
+    rows: list[AgentxGpuRow]
+    ref_range: tuple[float, float]
+    out_of_range_failed: bool = False
+
+    @property
+    def failed_rows(self) -> list[AgentxGpuRow]:
+        return [r for r in self.rows if r.status.startswith("FAIL")]
+
+    def __bool__(self) -> bool:
+        return bool(self.failed_rows) or self.out_of_range_failed
 
 
 def _finite_number(value: Any) -> float | None:
@@ -330,11 +384,20 @@ def load_roofline_targets(path: Path) -> RooflineTargets:
     return RooflineTargets(targets, not_modeled)
 
 
+def _positive_ratio(value: Any, name: str) -> float:
+    num = _finite_number(value)
+    if num is None or num <= 0:
+        raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+    return num
+
+
 def check_roofline(
     results: dict[str, dict],
     roofline_targets: RooflineTargets,
     config_name: str,
     chips: int | None = None,
+    min_ratio: float | None = None,
+    enforce_unverified: bool = False,
 ) -> RooflineCheckResult:
     """Compare measured output throughput per physical chip against roofline."""
     if config_name in roofline_targets.not_modeled:
@@ -350,6 +413,10 @@ def check_roofline(
     num_chips = chips if chips is not None else config_target.num_chips
     if num_chips is None or num_chips <= 0:
         raise ValueError(f"chip count required for roofline check of {config_name!r}")
+    if min_ratio is not None and not any(k in config_target.cells for k in results):
+        raise ValueError(
+            f"no measured cells match roofline targets for {config_name!r}"
+        )
 
     rows: list[RooflineRow] = []
     for key in sorted(results):
@@ -359,6 +426,12 @@ def check_roofline(
             )
             continue
         cell_target = config_target.cells[key]
+        unverified = cell_target.status == "unverified"
+        gated = (
+            min_ratio is not None
+            and cell_target.status != "oom"
+            and (not unverified or enforce_unverified)
+        )
         raw_tput = _finite_number(results[key].get("output_throughput"))
         if cell_target.status == "oom":
             skip = "SKIP (oom)"
@@ -375,6 +448,7 @@ def check_roofline(
             )
             continue
         if raw_tput is None or raw_tput < 0:
+            missing_status = "FAIL (missing output_throughput)" if gated else "SKIP"
             rows.append(
                 RooflineRow(
                     key,
@@ -383,17 +457,19 @@ def check_roofline(
                     cell_target.output_token_throughput_per_chip,
                     0.0,
                     cell_target.status,
-                    "SKIP",
+                    missing_status,
                 )
             )
             continue
         actual_per_chip = raw_tput / num_chips
         ratio = actual_per_chip / cell_target.output_token_throughput_per_chip
-        status = (
-            "ADVISORY (unverified)"
-            if cell_target.status == "unverified"
-            else "ADVISORY"
-        )
+        if not gated:
+            status = "ADVISORY (unverified)" if unverified else "ADVISORY"
+        else:
+            assert min_ratio is not None
+            ok = ratio + FLOAT_EPSILON >= min_ratio
+            suffix = " (unverified)" if unverified else ""
+            status = f"{'PASS' if ok else 'FAIL'}{suffix}"
         rows.append(
             RooflineRow(
                 key,
@@ -406,9 +482,12 @@ def check_roofline(
             )
         )
 
+    mode_desc = (
+        "advisory" if min_ratio is None else f"min ratio: {min_ratio * 100:.2f}%"
+    )
     print(
         f"\n## Roofline speed check (`{config_name}`, "
-        f"{num_chips} physical chips, advisory)\n"
+        f"{num_chips} physical chips, {mode_desc})\n"
     )
     print("| key | metric | actual/chip | roofline/chip | % of roofline | status |")
     print("|---|---|---:|---:|---:|---|")
@@ -420,6 +499,316 @@ def check_roofline(
         )
     print()
     return RooflineCheckResult(config_name, num_chips, rows)
+
+
+def _dotted_number(data: Any, path: str) -> float | None:
+    cur = data
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return _finite_number(cur)
+
+
+def _aiperf_stat(data: dict, metric: str, stat: str) -> tuple[float | None, str]:
+    block = data.get(metric)
+    if isinstance(block, dict):
+        return _finite_number(block.get(stat)), str(block.get("unit", "ms"))
+    if stat == "avg":
+        return _finite_number(block), ""
+    return None, ""
+
+
+def _parse_agentx_metrics(
+    path: Path, data: dict, *, allow_missing: bool = False
+) -> tuple[float, float]:
+    output_tput = _dotted_number(
+        data, "request_metrics.throughput.output.tokens_per_second"
+    )
+    if output_tput is None:
+        output_tput, _ = _aiperf_stat(data, "output_token_throughput", "avg")
+    if output_tput is None:
+        output_tput = _finite_number(data.get("output_throughput"))
+
+    p90_intvty = _dotted_number(data, "request_metrics.latency.intvty.p90")
+    if p90_intvty is None:
+        p90_intvty = _finite_number(data.get("p90_interactivity"))
+    if p90_intvty is None:
+        tpot_ms = _finite_number(data.get("p90_tpot_ms"))
+        if tpot_ms is None:
+            for metric in ("inter_token_latency", "time_per_output_token"):
+                val, unit = _aiperf_stat(data, metric, "p90")
+                if val is not None:
+                    tpot_ms = val * 1000.0 if unit in ("s", "sec", "seconds") else val
+                    break
+        if tpot_ms is not None and tpot_ms > 0:
+            p90_intvty = 1000.0 / tpot_ms
+
+    if output_tput is None or output_tput < 0 or p90_intvty is None or p90_intvty <= 0:
+        if allow_missing:
+            return max(output_tput or 0.0, 0.0), max(p90_intvty or 0.0, 0.0)
+        raise ValueError(
+            f"{path}: AgentX result requires non-negative output throughput "
+            "and positive P90 interactivity"
+        )
+    return output_tput, p90_intvty
+
+
+def _aiperf_concurrency(results_dir: Path, path: Path, data: dict) -> int | None:
+    input_cfg = data.get("input_config")
+    phases = input_cfg.get("phases") if isinstance(input_cfg, dict) else None
+    for phase in phases if isinstance(phases, list) else ():
+        if isinstance(phase, dict) and phase.get("kind") == "profiling":
+            conc = phase.get("concurrency")
+            if not isinstance(conc, bool) and isinstance(conc, int) and conc > 0:
+                return conc
+    for part in path.relative_to(results_dir).parts:
+        m = CONC_DIR_RE.match(part)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _has_hard_timeout_ancestor(results_dir: Path, path: Path) -> bool:
+    cur = path.parent
+    stop = results_dir.resolve()
+    while True:
+        if (cur / "HARD_TIMEOUT").exists():
+            return True
+        if cur.resolve() == stop or cur.parent == cur:
+            return False
+        cur = cur.parent
+
+
+def load_agentx_results(results_dir: Path) -> list[AgentxPoint]:
+    """Load AgentX points from `<label>_c<N>.json` and `profile_export_aiperf.json`."""
+    timeout_concs: set[int] = set()
+    for marker in sorted(results_dir.rglob("HARD_TIMEOUT")):
+        m = CONC_DIR_RE.match(marker.parent.name)
+        if m:
+            timeout_concs.add(int(m.group(1)))
+
+    cancelled_concs: set[int] = set()
+    aiperf_exports: list[tuple[Path, dict, int | None, str | None]] = []
+    for path in sorted(results_dir.rglob("profile_export_aiperf.json")):
+        data = load_baseline_file(path)
+        conc = _aiperf_concurrency(results_dir, path, data)
+        reason: str | None = None
+        if data.get("was_cancelled") is True:
+            reason = "was_cancelled=true"
+            if conc is not None:
+                cancelled_concs.add(conc)
+        elif (conc is not None and conc in timeout_concs) or _has_hard_timeout_ancestor(
+            results_dir, path
+        ):
+            reason = "HARD_TIMEOUT"
+        aiperf_exports.append((path, data, conc, reason))
+
+    points: list[AgentxPoint] = []
+    seen_keys: set[str] = set()
+    covered_concs: set[int] = set()
+
+    for path in sorted(results_dir.rglob("*_c*.json")):
+        if (
+            RESULT_FILENAME_RE.match(path.name)
+            or path.name.startswith("results_")
+            or path.name.endswith(".baseline.json")
+        ):
+            continue
+        m = AGENTX_AGGREGATE_RE.match(path.name)
+        if not m:
+            continue
+        data = load_baseline_file(path)
+        conc = int(m.group(2))
+        reason = None
+        if (
+            conc in timeout_concs
+            or (path.parent / f"conc_{conc}" / "HARD_TIMEOUT").exists()
+        ):
+            reason = "HARD_TIMEOUT"
+        elif conc in cancelled_concs or data.get("was_cancelled") is True:
+            reason = "was_cancelled=true"
+        output_tput, p90_intvty = _parse_agentx_metrics(
+            path, data, allow_missing=reason is not None
+        )
+        if path.stem in seen_keys:
+            raise ValueError(f"duplicate AgentX result {path.stem!r}")
+        seen_keys.add(path.stem)
+        covered_concs.add(conc)
+        points.append(AgentxPoint(path.stem, conc, output_tput, p90_intvty, reason))
+
+    for path, data, conc, reason in aiperf_exports:
+        if conc is not None and conc in covered_concs:
+            continue
+        output_tput, p90_intvty = _parse_agentx_metrics(
+            path, data, allow_missing=reason is not None
+        )
+        key = f"c{conc}" if conc is not None else "profile_export_aiperf"
+        if key in seen_keys:
+            raise ValueError(f"duplicate AgentX concurrency point {key!r}")
+        seen_keys.add(key)
+        if conc is not None:
+            covered_concs.add(conc)
+        points.append(AgentxPoint(key, conc, output_tput, p90_intvty, reason))
+
+    for conc in sorted(timeout_concs - covered_concs):
+        key = f"c{conc}"
+        points.append(AgentxPoint(key, conc, 0.0, 0.0, "HARD_TIMEOUT"))
+
+    return sorted(
+        points, key=lambda p: (p.concurrency is None, p.concurrency or 0, p.key)
+    )
+
+
+def load_gpu_reference(path: Path) -> list[GpuReferencePoint]:
+    """Load GPU `(p90_interactivity, out_tok_s_per_gpu)` points sorted by x.
+
+    Accepts a list or {"points": [...]} object.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"cannot read GPU reference {path}: {e}") from e
+    items = raw.get("points") if isinstance(raw, dict) else raw
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"{path} must be a non-empty list of reference points")
+    points: list[GpuReferencePoint] = []
+    seen_x: set[float] = set()
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}[{idx}] must be an object")
+        x = _positive_ratio(
+            item.get("p90_interactivity"), f"{path}[{idx}].p90_interactivity"
+        )
+        y = _positive_ratio(
+            item.get("out_tok_s_per_gpu"), f"{path}[{idx}].out_tok_s_per_gpu"
+        )
+        if x in seen_x:
+            raise ValueError(f"{path}: duplicate p90_interactivity {x}")
+        seen_x.add(x)
+        points.append(GpuReferencePoint(x, y))
+    return sorted(points, key=lambda p: p.p90_interactivity)
+
+
+def interpolate_gpu_reference(
+    reference: Sequence[GpuReferencePoint], p90_interactivity: float
+) -> float | None:
+    """Linearly interpolate `out_tok_s_per_gpu` at `p90_interactivity`, or None."""
+    if not reference:
+        return None
+    if (
+        p90_interactivity < reference[0].p90_interactivity - FLOAT_EPSILON
+        or p90_interactivity > reference[-1].p90_interactivity + FLOAT_EPSILON
+    ):
+        return None
+    if abs(p90_interactivity - reference[0].p90_interactivity) <= FLOAT_EPSILON:
+        return reference[0].out_tok_s_per_gpu
+    if abs(p90_interactivity - reference[-1].p90_interactivity) <= FLOAT_EPSILON:
+        return reference[-1].out_tok_s_per_gpu
+    for lo, hi in zip(reference, reference[1:]):
+        if lo.p90_interactivity <= p90_interactivity <= hi.p90_interactivity:
+            span = hi.p90_interactivity - lo.p90_interactivity
+            weight = (p90_interactivity - lo.p90_interactivity) / span
+            return lo.out_tok_s_per_gpu + weight * (
+                hi.out_tok_s_per_gpu - lo.out_tok_s_per_gpu
+            )
+    return None
+
+
+def check_agentx_gpu(
+    points: Sequence[AgentxPoint],
+    reference: Sequence[GpuReferencePoint],
+    num_chips: int,
+    config_name: str,
+    min_ratio: float | None = None,
+) -> AgentxGpuCheckResult:
+    """Compare AgentX per-chip output throughput against interpolated GPU points."""
+    if not reference:
+        raise ValueError("GPU reference must be non-empty")
+
+    rows: list[AgentxGpuRow] = []
+    in_range_count = 0
+    for point in points:
+        actual_per_chip = point.output_tok_s_total / num_chips
+        if point.invalid_reason is not None:
+            gpu_ref = (
+                interpolate_gpu_reference(reference, point.p90_interactivity)
+                if point.p90_interactivity > 0
+                else None
+            )
+            ratio = actual_per_chip / gpu_ref if gpu_ref is not None else None
+            prefix = "ADVISORY" if min_ratio is None else "FAIL"
+            rows.append(
+                AgentxGpuRow(
+                    point.key,
+                    point.p90_interactivity,
+                    actual_per_chip,
+                    gpu_ref,
+                    ratio,
+                    f"{prefix} ({point.invalid_reason})",
+                    point.invalid_reason,
+                )
+            )
+            continue
+        gpu_ref = interpolate_gpu_reference(reference, point.p90_interactivity)
+        if gpu_ref is None:
+            rows.append(
+                AgentxGpuRow(
+                    point.key,
+                    point.p90_interactivity,
+                    actual_per_chip,
+                    None,
+                    None,
+                    "SKIP (out of range)",
+                )
+            )
+            continue
+        in_range_count += 1
+        ratio = actual_per_chip / gpu_ref
+        if min_ratio is None:
+            status = "ADVISORY"
+        else:
+            status = "PASS" if ratio + FLOAT_EPSILON >= min_ratio else "FAIL"
+        rows.append(
+            AgentxGpuRow(
+                point.key,
+                point.p90_interactivity,
+                actual_per_chip,
+                gpu_ref,
+                ratio,
+                status,
+            )
+        )
+
+    mode_desc = (
+        "advisory" if min_ratio is None else f"min ratio: {min_ratio * 100:.2f}%"
+    )
+    print(
+        f"\n## AgentX GPU reference speed check (`{config_name}`, "
+        f"{num_chips} physical chips, {mode_desc})\n"
+    )
+    print("| point | p90 intvty | actual/chip | gpu ref/gpu | % of gpu | status |")
+    print("|---|---:|---:|---:|---:|---|")
+    for row in rows:
+        ref_str = "-" if row.gpu_ref_per_gpu is None else f"{row.gpu_ref_per_gpu:.2f}"
+        pct_str = "-" if row.ratio is None else f"{row.ratio * 100:.2f}%"
+        print(
+            f"| `{row.key}` | {row.p90_interactivity:.2f} | "
+            f"{row.actual_per_chip:.2f} | {ref_str} | {pct_str} | {row.status} |"
+        )
+    print()
+
+    ref_range = (reference[0].p90_interactivity, reference[-1].p90_interactivity)
+    has_row_failures = any(r.status.startswith("FAIL") for r in rows)
+    out_of_range_failed = (
+        min_ratio is not None
+        and bool(rows)
+        and in_range_count == 0
+        and not has_row_failures
+    )
+    return AgentxGpuCheckResult(
+        config_name, num_chips, rows, ref_range, out_of_range_failed
+    )
 
 
 def calibrate_perf(
@@ -927,6 +1316,32 @@ def main() -> int:
         default=None,
         help="Perf mode: physical decode chips in a disaggregated run.",
     )
+    parser.add_argument(
+        "--min-roofline-ratio",
+        type=float,
+        default=None,
+        help="Perf mode: minimum fraction of roofline throughput required "
+        "(for example 0.8). Advisory when omitted.",
+    )
+    parser.add_argument(
+        "--enforce-unverified-rooflines",
+        action="store_true",
+        help="Perf mode: enforce --min-roofline-ratio on status=='unverified' "
+        "roofline cells too.",
+    )
+    parser.add_argument(
+        "--agentx-gpu-reference",
+        type=Path,
+        default=None,
+        help="Perf mode: JSON of {p90_interactivity, out_tok_s_per_gpu} points.",
+    )
+    parser.add_argument(
+        "--min-gpu-ratio",
+        type=float,
+        default=None,
+        help="Perf mode: minimum fraction of interpolated GPU AgentX throughput "
+        "required per physical chip. Advisory when omitted.",
+    )
     args = parser.parse_args()
 
     perf_only = (
@@ -961,8 +1376,8 @@ def main() -> int:
     if tolerance is None:
         tolerance = 0.05 if args.mode == "perf" else 0.015
 
-    if (args.mode == "eval" or args.calibrate) and any(
-        v is not None for v in perf_only
+    if (args.mode == "eval" or args.calibrate) and (
+        any(v is not None for v in perf_only) or args.enforce_unverified_rooflines
     ):
         parser.error("speed gate and chip flags are only valid in perf check mode")
 
@@ -1029,17 +1444,32 @@ def main() -> int:
 
     if len(args.results_dir) != 1:
         parser.error("--results-dir may only be given once in perf check mode")
-    if args.baseline is None and args.roofline_targets is None:
+    if (
+        args.baseline is None
+        and args.roofline_targets is None
+        and args.agentx_gpu_reference is None
+    ):
         parser.error(
-            "--baseline or --roofline-targets is required unless --calibrate is set"
+            "--baseline, --roofline-targets, or --agentx-gpu-reference is "
+            "required unless --calibrate is set"
         )
     if args.roofline_targets is not None and not args.config_name:
         parser.error("--config-name is required with --roofline-targets")
+    if args.min_roofline_ratio is not None and args.roofline_targets is None:
+        parser.error("--min-roofline-ratio requires --roofline-targets")
+    if args.enforce_unverified_rooflines and args.min_roofline_ratio is None:
+        parser.error("--enforce-unverified-rooflines requires --min-roofline-ratio")
+    if args.min_gpu_ratio is not None and args.agentx_gpu_reference is None:
+        parser.error("--min-gpu-ratio requires --agentx-gpu-reference")
 
     try:
         chips = resolve_physical_chips(
             args.chips, args.prefill_chips, args.decode_chips
         )
+        if args.min_roofline_ratio is not None:
+            _positive_ratio(args.min_roofline_ratio, "--min-roofline-ratio")
+        if args.min_gpu_ratio is not None:
+            _positive_ratio(args.min_gpu_ratio, "--min-gpu-ratio")
         roofline_db = (
             load_roofline_targets(args.roofline_targets)
             if args.roofline_targets is not None
@@ -1058,6 +1488,16 @@ def main() -> int:
             if args.baseline is not None
             else None
         )
+        gpu_ref = (
+            load_gpu_reference(args.agentx_gpu_reference)
+            if args.agentx_gpu_reference is not None
+            else None
+        )
+        if gpu_ref is not None and chips is None:
+            raise ValueError(
+                "--chips or --prefill-chips/--decode-chips is required with "
+                "--agentx-gpu-reference"
+            )
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
@@ -1065,35 +1505,131 @@ def main() -> int:
     roofline_not_modeled = (
         roofline_db is not None and args.config_name in roofline_db.not_modeled
     )
+    needs_bench_results = baseline_entries is not None or (
+        roofline_db is not None and not roofline_not_modeled
+    )
     results = load_perf_results(args.results_dir[0])
-    if not results and (baseline_entries is not None or not roofline_not_modeled):
+    if not results and needs_bench_results:
         print(
             f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
             file=sys.stderr,
         )
         return 2
 
+    agentx_points: list[AgentxPoint] = []
+    if gpu_ref is not None:
+        try:
+            agentx_points = load_agentx_results(args.results_dir[0])
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        if not agentx_points:
+            print(
+                "ERROR: no AgentX result files (profile_export_aiperf.json or "
+                f"<label>_c<N>.json) found under {args.results_dir[0]}",
+                file=sys.stderr,
+            )
+            return 2
+
     perf_failed = 0
     if baseline_entries is not None:
         perf_failed = check_perf(results, baseline_entries, tolerance)
 
+    roofline_result: RooflineCheckResult | None = None
     if roofline_db is not None:
         try:
-            check_roofline(results, roofline_db, args.config_name, chips=chips)
+            roofline_result = check_roofline(
+                results,
+                roofline_db,
+                args.config_name,
+                chips=chips,
+                min_ratio=args.min_roofline_ratio,
+                enforce_unverified=args.enforce_unverified_rooflines,
+            )
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
 
+    agentx_result: AgentxGpuCheckResult | None = None
+    if gpu_ref is not None:
+        assert chips is not None
+        label = args.config_name or args.results_dir[0].name
+        try:
+            agentx_result = check_agentx_gpu(
+                agentx_points,
+                gpu_ref,
+                chips,
+                config_name=label,
+                min_ratio=args.min_gpu_ratio,
+            )
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+
+    any_failed = False
     if perf_failed:
         print(
             f"FAILED: {perf_failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
             file=sys.stderr,
         )
+        any_failed = True
+    if roofline_result:
+        assert args.min_roofline_ratio is not None
+        for row in roofline_result.failed_rows:
+            min_target = row.target_per_chip * args.min_roofline_ratio
+            print(
+                f"FAILED: config={roofline_result.config_name} cell={row.cell} "
+                f"metric={row.metric} "
+                f"measured={row.actual_per_chip:.2f} tok/s/chip "
+                f"({row.ratio * 100:.2f}%) "
+                f"target>={min_target:.2f} tok/s/chip "
+                f"({args.min_roofline_ratio * 100:.2f}% of {row.target_per_chip:.2f})",
+                file=sys.stderr,
+            )
+        any_failed = True
+    if agentx_result:
+        assert args.min_gpu_ratio is not None
+        for a_row in agentx_result.failed_rows:
+            if a_row.invalid_reason is not None:
+                print(
+                    f"FAILED: config={agentx_result.config_name} point={a_row.key} "
+                    f"metric=out_tok_s_per_chip measured=invalid "
+                    f"({a_row.invalid_reason}) "
+                    f"target>={args.min_gpu_ratio * 100:.2f}% of GPU reference",
+                    file=sys.stderr,
+                )
+                continue
+            assert a_row.gpu_ref_per_gpu is not None and a_row.ratio is not None
+            min_target = a_row.gpu_ref_per_gpu * args.min_gpu_ratio
+            print(
+                f"FAILED: config={agentx_result.config_name} point={a_row.key} "
+                "metric=out_tok_s_per_chip@"
+                f"p90_interactivity={a_row.p90_interactivity:.2f} "
+                f"measured={a_row.actual_per_chip:.2f} tok/s/chip "
+                f"({a_row.ratio * 100:.2f}%) "
+                f"target>={min_target:.2f} tok/s/chip "
+                f"({args.min_gpu_ratio * 100:.2f}% of {a_row.gpu_ref_per_gpu:.2f})",
+                file=sys.stderr,
+            )
+        if agentx_result.out_of_range_failed:
+            lo_x, hi_x = agentx_result.ref_range
+            print(
+                f"FAILED: config={agentx_result.config_name} "
+                f"metric=out_tok_s_per_chip measured=0 in-range points "
+                f"target=p90_interactivity within [{lo_x:.2f}, {hi_x:.2f}]",
+                file=sys.stderr,
+            )
+        any_failed = True
+
+    if any_failed:
         return 1
-    if baseline_entries is not None:
+    roofline_gated = roofline_result is not None and any(
+        r.status.startswith(("PASS", "FAIL")) for r in roofline_result.rows
+    )
+    if baseline_entries is not None or roofline_gated or args.min_gpu_ratio:
         print("PASS: all gated metrics within tolerance.")
     else:
-        print("PASS: advisory roofline check complete.")
+        print("PASS: advisory speed checks complete.")
     return 0
 
 
