@@ -536,6 +536,26 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
         mock_apply_patches.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "section,match",
+        [
+            ({"gc_freeze": 1}, "must be a bool"),
+            ({"switch_interval_us": -1}, "must be >= 0"),
+            ({"stage_timing": "off"}, "must be a bool"),
+            ({"gc": True}, "unknown keys"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    def test_malformed_tpu_runner_is_refused_at_startup(
+        self, mock_apply_patches, vllm_config, section, match
+    ):
+        """Before any worker builds its runner, which parses the section
+        again."""
+        vllm_config.additional_config = {"tpu_runner": section}
+        with pytest.raises(ValueError, match=match):
+            TpuPlatform.check_and_update_config(vllm_config)
+        mock_apply_patches.assert_not_called()
+
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
