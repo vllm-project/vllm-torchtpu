@@ -507,7 +507,8 @@ class TestRunnerIntegration:
 def test_precompile_covers_the_calls_serving_makes():
     """At every request bucket, the kernel call of a step with a penalized
     row has the shapes and dtypes of a precompiled call (logits, bitmask and
-    penalties). Both sides take their logits from `_dummy_logits`."""
+    penalties). Both sides take their logits from `_dummy_logits` and stage
+    the tracker's buffers through `apply_penalties_table`."""
     buckets = [8, 16]
     runner = object.__new__(TPUModelRunner)
     runner.num_reqs_paddings = buckets

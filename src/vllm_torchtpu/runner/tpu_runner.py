@@ -133,9 +133,6 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
-from vllm_torchtpu.layers.adapter.sample import (
-    repetition_penalty as repetition_penalty_op,
-)
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -7317,17 +7314,7 @@ class TPUModelRunner(GPUModelRunner):
             for num_rows in _rotate_precompile_sweep(
                 self.num_reqs_paddings, "repetition_penalty"
             ):
-                logits = self._dummy_logits(num_rows)
-                num_words = cdiv(logits.shape[1], 32)
-                seen_bitmask = torch.zeros(
-                    (num_rows, num_words), dtype=torch.int32, device=self.device
-                )
-                penalties = torch.ones(
-                    (num_rows, 1), dtype=torch.float32, device=self.device
-                )
-                out = repetition_penalty_op.apply_repetition_penalty(
-                    logits, seen_bitmask, penalties
-                )
+                out = self._repetition_penalty.warmup(self._dummy_logits(num_rows))
                 synchronize_tensors(out)
                 logger.info("  -- num_rows: %d", num_rows)
 

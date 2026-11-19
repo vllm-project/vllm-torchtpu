@@ -32,6 +32,7 @@ from vllm_torchtpu.layers.adapter.sample import (
     thinking_budget,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
+from vllm_torchtpu.runner import repetition_penalty as repetition_penalty_tracker
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -84,7 +85,9 @@ def _runner(seen, speculative=False):
         _thinking_budget=ThinkingBudgetTracker(
             _reasoning_config(), max_num_reqs=PADDINGS[-1], device=torch.device("cpu")
         ),
-        _repetition_penalty=SimpleNamespace(supported=True),
+        _repetition_penalty=repetition_penalty_tracker.RepetitionPenaltyTracker(
+            4, PADDINGS[-1], async_scheduling=False, speculative_decoding=False
+        ),
     )
     # The real helper; without a speculative config it yields no verify rows.
     runner._verify_logits_paddings = types.MethodType(

@@ -173,6 +173,15 @@ class RepetitionPenaltyTracker:
             return logits
         return apply_penalties_table(logits, *inputs)
 
+    def warmup(self, logits: torch.Tensor) -> torch.Tensor:
+        """Run the kernel on ``logits`` with the staging buffers, as ``apply``
+        does for a chunk of ``logits.shape[0]`` rows. The runner's precompile
+        calls this, so warmup and serving stage their inputs in one way."""
+        num_rows = logits.shape[0]
+        return apply_penalties_table(
+            logits, self._bitmask_buf[:num_rows], self._penalties_buf[:num_rows]
+        )
+
     def _prune(self, req_ids: Collection[str]) -> None:
         """Drop the bitmasks of requests that are not in ``req_ids``."""
         if len(self._seen) > len(req_ids):
