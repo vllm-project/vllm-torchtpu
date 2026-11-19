@@ -429,8 +429,6 @@ def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
         return
     parallel_config = vllm_config.parallel_config
     unsupported = {
-        # Each MoE layer sees the rows of every DP rank.
-        "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
         # Comes with fused EP v2, where SP pays off. With chunk pipelining or
         # FP8 all-gather, `route()` would also see only this rank's tokens.
         "MoE sequence parallelism (TPU_MOE_SEQUENCE_PARALLEL)": (

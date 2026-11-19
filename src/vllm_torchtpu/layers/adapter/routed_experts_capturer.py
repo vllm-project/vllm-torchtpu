@@ -91,6 +91,8 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
     forward's whole table is copied to the host, which needs no device program,
     and the host keeps each forward's real rows and joins them for the step. So
     the forward is the only program the capture adds to.
+    With `num_gathered_dp_ranks` above 1, each MoE layer hands over the rows
+    of every DP rank, and the table holds this DP rank's.
     """
 
     def __init__(
@@ -99,6 +101,8 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
         moe_layer_ids: Sequence[int],
         *,
         copies_to_host: bool,
+        num_gathered_dp_ranks: int,
+        gathered_rows_index: int,
     ) -> None:
         """
         Args:
@@ -107,6 +111,12 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
                 `capture()`, in the order the forward runs them.
             copies_to_host: whether this rank copies each forward's table to
                 the host for vLLM's connector.
+            num_gathered_dp_ranks: how many DP ranks' rows each `capture()`
+                call receives, equally many from each and in the order of
+                the DP group; 1 when it receives only this rank's.
+            gathered_rows_index: which of those ranks' rows are this rank's:
+                its position in the DP group, or 0 when it receives only its
+                own.
         """
         # vLLM accepts --enable-return-routed-experts for a model without MoE
         # layers, so the empty case is reachable from the command line.
@@ -124,6 +134,8 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
         # Callers pass True only on the first TP rank, the one whose rows
         # vLLM's connector publishes.
         self._copies_to_host = copies_to_host
+        self._num_gathered_dp_ranks = num_gathered_dp_ranks
+        self._gathered_rows_index = gathered_rows_index
         # The MoE layers that wrote expert ids in the latest forward;
         # `check_forward` reads and clears it. A compiled forward sets it after
         # every call, to the ids collected while torch.compile traced the
@@ -138,8 +150,9 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
             # A table for this forward only, created inside the compiled
             # forward and in the snapshot dtype; vLLM's write below casts the
             # ids to it.
+            num_rows = topk_ids.shape[0] // self._num_gathered_dp_ranks
             self.device_buffer = torch.zeros(
-                (topk_ids.shape[0], *self.shape_per_token),
+                (num_rows, *self.shape_per_token),
                 dtype=self.output_dtype,
                 device=topk_ids.device,
             )
@@ -154,12 +167,21 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
     ) -> torch.Tensor:
         # vLLM picks the row layout by comparing the row count with the forward
         # context's token count. The backbone is traced once for every bucket,
-        # so that comparison would be fixed at trace time. Layers bound to this
-        # capturer hand over this rank's rows in token order.
+        # so that comparison would be fixed at trace time. The layout is fixed
+        # when the engine starts instead: the rows of every DP rank in the
+        # order of the DP group, each padded to the same bucket, or only this
+        # rank's rows.
         # TODO(haotianx): Move this to vLLM's `RoutedExpertsRowRestorer` hook on
         # the MoE runner once the vLLM pin includes
         # https://github.com/vllm-project/vllm/pull/64689.
-        return topk_ids
+        if self._num_gathered_dp_ranks == 1:
+            return topk_ids
+        num_rows = topk_ids.shape[0] // self._num_gathered_dp_ranks
+        # Not vLLM's `self.dp_rank`, which is the engine's DP index: under
+        # RayDistributedExecutorV2 an engine's position in the DP group follows
+        # the chips it was placed on and can differ from that index.
+        start = self._gathered_rows_index * num_rows
+        return topk_ids[start : start + num_rows]
 
     def check_forward(self, num_padded_tokens: int) -> torch.Tensor:
         """Returns the table of the forward that just ran, after checking that

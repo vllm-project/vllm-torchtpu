@@ -33,7 +33,7 @@ BLOCK_SIZE = 4
 PADDING = 511
 
 
-def make_vllm_config(num_experts=512):
+def make_vllm_config(num_experts=512, data_parallel_rank=0):
     model_config = SimpleNamespace(
         get_total_num_hidden_layers=lambda: NUM_LAYERS,
         get_num_experts=lambda: num_experts,
@@ -48,8 +48,9 @@ def make_vllm_config(num_experts=512):
             max_num_seqs=8,
         ),
         parallel_config=SimpleNamespace(
-            data_parallel_rank=0,
+            data_parallel_rank=data_parallel_rank,
             data_parallel_size=1,
+            enable_expert_parallel=False,
             tensor_parallel_size=1,
             decode_context_parallel_size=1,
             use_sequence_parallel_moe=False,
@@ -65,13 +66,23 @@ def make_vllm_config(num_experts=512):
     return cast(VllmConfig, vllm_config)
 
 
-def make_capturer(num_experts=512, copies_to_host=True, moe_layer_ids=None):
+def make_capturer(
+    num_experts=512,
+    copies_to_host=True,
+    moe_layer_ids=None,
+    num_gathered_dp_ranks=1,
+    gathered_rows_index=0,
+):
     """A capturer for MoE layers of the given ids, one per table column by
     default."""
     if moe_layer_ids is None:
         moe_layer_ids = range(NUM_LAYERS)
     return routed_experts_capturer.TPURoutedExpertsCapturer(
-        make_vllm_config(num_experts), moe_layer_ids, copies_to_host=copies_to_host
+        make_vllm_config(num_experts),
+        moe_layer_ids,
+        copies_to_host=copies_to_host,
+        num_gathered_dp_ranks=num_gathered_dp_ranks,
+        gathered_rows_index=gathered_rows_index,
     )
 
 
@@ -112,21 +123,25 @@ def expert_ids(num_tokens, num_experts=512, seed=0):
 
 class MoELayer(torch.nn.Module):
     """A MoE layer as vLLM's capturer binder finds it, with no fused kernel
-    and no expert placement."""
+    and no expert placement. With `vllm_gathers_dp_rows`, vLLM gathers the
+    rows of its `dp_size` DP ranks before the layer's hook, in the order of
+    the DP group, where this rank is at `dp_rank`."""
 
-    def __init__(self, layer_id):
+    def __init__(self, layer_id, dp_size=1, dp_rank=0, vllm_gathers_dp_rows=False):
         super().__init__()
         self.layer_id = layer_id
         self.capture_fn = None
         self.picks_experts_in_route = True
         self.routed_experts = SimpleNamespace(quant_method=SimpleNamespace())
+        self.moe_config = SimpleNamespace(dp_size=dp_size, dp_rank=dp_rank)
+        self.do_naive_dispatch_combine = vllm_gathers_dp_rows
 
 
-def make_moe_model(layer_ids=None):
+def make_moe_model(layer_ids=None, **layer_kwargs):
     """MoE layers of the given ids; one per table column by default."""
     if layer_ids is None:
         layer_ids = range(NUM_LAYERS)
-    return torch.nn.ModuleList(MoELayer(layer) for layer in layer_ids)
+    return torch.nn.ModuleList(MoELayer(layer, **layer_kwargs) for layer in layer_ids)
 
 
 def run_hooks(model, ids):
