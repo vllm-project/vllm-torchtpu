@@ -1250,7 +1250,7 @@ def test_ltx2_split_rope_rotates_views_of_unknown_storage(
     assert len(table_syncs) == syncs
 
 
-@pytest.mark.parametrize("batch", [1, 2], ids=["b1_c4u2", "b2_c2u4"])
+@pytest.mark.parametrize("batch", [1, 2], ids=["b1", "b2"])
 def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batch):
     torch.manual_seed(0)
     rope = _ltx2_rope(heads=3, head_dim=8)
@@ -1268,11 +1268,11 @@ def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batc
     upstream_cos, upstream_sin = _UPSTREAM_ROPE_FORWARD(
         rope, coords, None, torch.bfloat16
     )
-    for rank, (start, end) in enumerate(((0, 4), (4, 8)), start=1):
+    for rank, (start, end) in enumerate(((0, 4), (4, 8))):
         x_shard = torch.randn(batch, 4, 3 * 8, dtype=torch.bfloat16)
         freqs_view = (cos_full[:, :, start:end, :], sin_full[:, :, start:end, :])
         out1 = ltx2.apply_split_rotary_emb(x_shard, freqs_view, head_dim=8)
-        assert len(table_syncs) == 1 + rank
+        assert len(table_syncs) == 2 + rank
         # The synced copies own a buffer of the slice's shape.
         for owned, view in zip(table_syncs[-1], freqs_view, strict=True):
             assert torch.equal(owned, view)
@@ -1284,7 +1284,7 @@ def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batc
             (cos_full[:, :, start:end, :], sin_full[:, :, start:end, :]),
             head_dim=8,
         )
-        assert len(table_syncs) == 1 + rank
+        assert len(table_syncs) == 2 + rank
         want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(
             x_shard,
             (upstream_cos[:, :, start:end, :], upstream_sin[:, :, start:end, :]),
@@ -1292,3 +1292,35 @@ def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batc
         ).to(torch.bfloat16)
         torch.testing.assert_close(out1, want, rtol=0, atol=0)
         torch.testing.assert_close(out2, want, rtol=0, atol=0)
+
+
+def test_ltx2_split_rope_torch_compile_skips_lane_cache(ltx2, table_syncs):
+    # Under torch.compile(fullgraph=True), split RoPE builds the lane mask
+    # inline instead of caching a FakeTensor in _first_half_lanes, and skips
+    # eager shard-cache materialization while matching upstream output exactly.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    coords = _ltx2_coords(batch=2, tokens=8)
+    tables = rope(coords, out_dtype=torch.bfloat16)
+    cos_shard, sin_shard = _ltx2_sp_shard(tables)
+    x = torch.randn(2, 4, 24, dtype=torch.bfloat16)
+    upstream = _UPSTREAM_ROPE_FORWARD(rope, coords, None, torch.bfloat16)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, _ltx2_sp_shard(upstream), head_dim=8).to(
+        torch.bfloat16
+    )
+
+    def compiled_rotate(
+        t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        return ltx2.apply_split_rotary_emb(t, (cos, sin), head_dim=8)
+
+    omni_rope._first_half_lanes.cache_clear()
+    syncs_before = len(table_syncs)
+    try:
+        fn = torch.compile(compiled_rotate, backend="eager", fullgraph=True)
+        got = fn(x, cos_shard, sin_shard)
+        assert omni_rope._first_half_lanes.cache_info().currsize == 0
+        assert len(table_syncs) == syncs_before
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    finally:
+        omni_rope._first_half_lanes.cache_clear()

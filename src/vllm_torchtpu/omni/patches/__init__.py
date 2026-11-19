@@ -534,6 +534,11 @@ def _wrap_ltx2_bwe_filter_restore(ltx2_runtime: Any) -> None:
 
 
 _SPLIT_ROPE_PATCHED = "_tpu_split_rope_patched"
+# Upper bounds on the split-RoPE rotation caches. A single LTX-2 request uses
+# a small handful of distinct view layouts (video, cross-attention, audio) and
+# tensor objects; clearing on overflow bounds HBM across varying resolutions.
+_MAX_OWNED_ROPE_LAYOUTS = 8
+_MAX_ROPE_VIEW_ENTRIES = 16
 
 
 def _patch_ltx2_split_rope() -> None:
@@ -578,8 +583,9 @@ def _patch_ltx2_split_rope() -> None:
     #     argument, so a rotation that reads a slice takes the full table as
     #     an input and slices it again, in every attention layer. The
     #     rotation reads fresh_buffer copies with a buffer of the slice's
-    #     shape instead, built once per table and slice layout; a slice whose
-    #     storage has no data pointer is rotated as before.
+    #     shape instead, built once per table and slice layout (replacing the
+    #     entry on new tables and skipped under torch.compiler.is_compiling());
+    #     a slice whose storage has no data pointer is rotated as before.
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 
@@ -724,7 +730,7 @@ def _patch_ltx2_split_rope() -> None:
             if cached is None or cached[0] != cos_ptr or cached[1] != sin_ptr:
                 owned = (fresh_buffer(local[0]), fresh_buffer(local[1]))
                 synchronize_tensors(list(owned), wait=False)
-                if cached is None and len(owned_by_layout) >= 8:
+                if cached is None and len(owned_by_layout) >= _MAX_OWNED_ROPE_LAYOUTS:
                     owned_by_layout.clear()
                 # The entry keeps the views: their storage, and with it the
                 # data pointers above, stays valid while it is cached.
@@ -734,7 +740,7 @@ def _patch_ltx2_split_rope() -> None:
                 owned = (cached[4], cached[5])
         if owned is None and tp_layout is not None:
             return local  # Lanes without an owned copy are cut again next time.
-        if len(tables_by_view) >= 16:
+        if len(tables_by_view) >= _MAX_ROPE_VIEW_ENTRIES:
             tables_by_view.clear()
         tables_by_view[id(cos)] = (
             weakref.ref(cos),
