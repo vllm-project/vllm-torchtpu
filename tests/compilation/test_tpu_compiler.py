@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib
 import os
 import re
@@ -31,6 +32,53 @@ from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 @pytest.fixture
 def group_stand_ins(monkeypatch):
     return install_group_stand_ins(monkeypatch)
+
+
+def _install_fake_backend(monkeypatch):
+    """Swap `_tpu_backend` and `_deserialize_entry` as a matched pair."""
+    import threading
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    compiled = []
+    replayed = []
+    state = {"serializable": True}
+    local_tag = threading.local()
+
+    class Compiled:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def __call__(self, *args):
+            return (self.tag,)
+
+        def serialize(self):
+            return f"entry-from-rank-{self.tag}"
+
+    def set_tag(tag):
+        local_tag.value = tag
+
+    def backend(graph, example_inputs):
+        tag = getattr(local_tag, "value", 0)
+        compiled.append(tag)
+        if not state["serializable"]:
+            return lambda *args: (tag,)
+        return Compiled(tag)
+
+    def deserialize(entry):
+        replayed.append(entry)
+        return lambda *args: (entry,)
+
+    monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", deserialize)
+    return SimpleNamespace(
+        compiled=compiled, replayed=replayed, state=state, set_tag=set_tag
+    )
+
+
+@pytest.fixture
+def fake_backend(monkeypatch):
+    return _install_fake_backend(monkeypatch)
 
 
 class TestTpuCompilerCache:
@@ -136,6 +184,22 @@ class TestTpuCompilerCache:
                 phased = compute_tpu_compilation_hash(self._config())
 
         assert unprofiled == phased
+
+    def test_tpu_hash_ignores_the_raiden_advertise_host(self):
+        """The advertised host is the pod IP: hashing it gives every pod its
+        own compile cache, so a cache restored from an earlier pod misses."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            with patch.dict(os.environ, {"TPU_RAIDEN_ADVERTISE_HOST": "10.0.0.1"}):
+                first_pod = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ, {"TPU_RAIDEN_ADVERTISE_HOST": "10.0.0.2"}):
+                second_pod = compute_tpu_compilation_hash(self._config())
+
+        assert first_pod == second_pod
 
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
@@ -269,10 +333,14 @@ class TestTpuCompilerCache:
             path.relative_to(source_root).as_posix()
             for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
         }
+        # sharded_jax_op is the legacy helper some ops still register with.
         custom_op_boundaries = {
             path.relative_to(source_root).as_posix()
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
-            if "pallas.jax_op" in path.read_text()
+            if any(
+                marker in path.read_text()
+                for marker in ("pallas.jax_op", "sharded_jax_op(")
+            )
         }
         excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
         excluded_dirs = tuple(
@@ -361,6 +429,9 @@ class TestTpuCompilerCache:
             "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
             "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
             "TPU_RAIDEN_TRANSFER_STREAMS",
+            "TPU_RAIDEN_ADVERTISE_HOST",
+            "TPU_RAIDEN_RESHARD_PORT_BASE",
+            "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE",
             "TPU_SIDE_CHANNEL_PORT",
             "TPU_USE_RAIDEN_CONNECTOR",
             "DEBUG_TPU_LOCAL_RANK_OFFSET",
@@ -629,6 +700,189 @@ class TestTpuCompilerCache:
             is None
         )
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _capture_vllm_info():
+        import logging
+
+        import vllm.logger  # noqa: F401
+
+        messages: list[str] = []
+        handler = logging.Handler(logging.INFO)
+        handler.emit = lambda record: messages.append(record.getMessage())
+        vllm_logger = logging.getLogger("vllm")
+        old_level = vllm_logger.level
+        old_disable = logging.root.manager.disable
+        vllm_logger.addHandler(handler)
+        if vllm_logger.level == logging.NOTSET or vllm_logger.level > logging.INFO:
+            vllm_logger.setLevel(logging.INFO)
+        logging.disable(logging.NOTSET)
+        try:
+            yield messages
+        finally:
+            vllm_logger.removeHandler(handler)
+            vllm_logger.setLevel(old_level)
+            logging.disable(old_disable)
+
+    @pytest.mark.parametrize(
+        ("init_cache", "disable_cache", "key"),
+        [
+            (False, False, "bucket_1"),
+            (True, False, None),
+            (True, True, "bucket_1"),
+        ],
+    )
+    def test_compile_without_cache_skips_saving(
+        self, tmp_path, fake_backend, init_cache, disable_cache, key
+    ):
+        """`compile` returns a runnable and `handle=None` without writing to disk
+        before `initialize_cache`, when `key=None`, and when `disable_cache=True`."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        fake_backend.set_tag("compiled")
+        graph = torch.fx.symbolic_trace(lambda x: x + 1)
+        cache_dir = tmp_path / "cache"
+
+        c = TpuCompilerAdaptor()
+        if init_cache:
+            c.initialize_cache(cache_dir=str(cache_dir), disable_cache=disable_cache)
+        fn, handle = c.compile(graph, [], {}, Range(start=1, end=1), key=key)
+
+        assert handle is None
+        assert fn() == "compiled"
+        assert not cache_dir.exists()
+        assert fake_backend.compiled == ["compiled"]
+
+    def test_compile_logs_and_skips_saving_when_unserializable(
+        self, tmp_path, fake_backend
+    ):
+        """When `compile` has an active cache and the backend output has no
+        `serialize`, `handle` is `None`, no artifact is written, and the log
+        names the artifact path."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        fake_backend.set_tag("compiled")
+        fake_backend.state["serializable"] = False
+        cache_dir = tmp_path / "cache"
+        artifact = cache_dir / "bucket_1"
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(cache_dir))
+        graph = torch.fx.symbolic_trace(lambda x: x + 1)
+
+        with self._capture_vllm_info() as messages:
+            fn, handle = c.compile(graph, [], {}, Range(start=1, end=1), key="bucket_1")
+
+        assert handle is None
+        assert fn() == "compiled"
+        assert not artifact.exists()
+        assert any(
+            f"[TpuCompilerAdaptor] No serializable artifact for {artifact}; it "
+            "will be recompiled on the next start" in m
+            for m in messages
+        )
+
+    def test_load_self_heal_overwrites_stale_artifact(self, tmp_path, fake_backend):
+        """When `load` encounters an unreadable artifact, it recompiles and
+        overwrites the file so the next `load` replays from disk."""
+        import pickle
+
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilationHandle,
+            TpuCompilerAdaptor,
+        )
+
+        fake_backend.set_tag("compiled")
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        stale = tmp_path / "cache" / "stale_bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"corrupt")
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+
+        healed = c.load(
+            ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+        )
+        assert fake_backend.compiled == ["compiled"]
+        assert fake_backend.replayed == []
+        assert healed() == "compiled"
+        with open(stale, "rb") as f:
+            saved = pickle.load(f)
+        assert isinstance(saved, TpuCompilationHandle)
+        assert saved.entry == "entry-from-rank-compiled"
+
+        warm = c.load(
+            ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+        )
+        assert fake_backend.compiled == ["compiled"]
+        assert fake_backend.replayed == ["entry-from-rank-compiled"]
+        assert warm() == "entry-from-rank-compiled"
+
+    def test_load_with_disabled_cache_keeps_stale_file(self, tmp_path, fake_backend):
+        """When `disable_cache=True`, `load` recompiles an unreadable artifact
+        without overwriting the stale file."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        fake_backend.set_tag("compiled")
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(tmp_path / "cache"), disable_cache=True)
+        stale = tmp_path / "cache" / "stale_bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"corrupt")
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+
+        fn = c.load(
+            ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+        )
+
+        assert fake_backend.compiled == ["compiled"]
+        assert fake_backend.replayed == []
+        assert fn() == "compiled"
+        assert stale.read_bytes() == b"corrupt"
+
+    def test_load_self_heal_logs_and_keeps_stale_file_when_unserializable(
+        self, tmp_path, fake_backend
+    ):
+        """When `load` recompiles a stale artifact whose backend output has no
+        `serialize`, it leaves the stale file untouched and logs the path."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        fake_backend.set_tag("compiled")
+        fake_backend.state["serializable"] = False
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        stale = tmp_path / "cache" / "stale_bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"corrupt")
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+
+        with self._capture_vllm_info() as messages:
+            fn = c.load(
+                ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+            )
+
+        assert fn() == "compiled"
+        assert stale.read_bytes() == b"corrupt"
+        assert any(
+            f"[TpuCompilerAdaptor] No serializable artifact for {stale}; it "
+            "will be recompiled on the next start" in m
+            for m in messages
+        )
+
     def test_compiler_initialize_cache(self):
         """Verify that TpuCompilerAdaptor sets cache_dir accurately."""
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
@@ -683,17 +937,7 @@ class TestTpuCompilerCache:
             monkeypatch.delenv("TPU_PRECOMPILE_PEER_REPLAY", raising=False)
         else:
             monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", peer_replay)
-        compiled, replayed = [], []
-
-        class Compiled:
-            def __init__(self, rank):
-                self.rank = rank
-
-            def __call__(self, *args):
-                return (self.rank,)
-
-            def serialize(self):
-                return f"entry-from-rank-{self.rank}"
+        fb = _install_fake_backend(monkeypatch)
 
         def compilers():
             for rank in range(n):
@@ -704,29 +948,17 @@ class TestTpuCompilerCache:
                 compiler.rank = rank
                 yield compiler
 
-        current = {}
-
-        def fake_backend(graph, example_inputs):
-            compiled.append(current["rank"])
-            return Compiled(current["rank"])
-
-        def fake_deserialize(entry):
-            replayed.append(entry)
-            return lambda *args: (entry,)
-
-        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
-        monkeypatch.setattr(tpu_compiler, "_deserialize_entry", fake_deserialize)
         monkeypatch.setattr(tpu_compiler, "_PEER_POLL_S", 0.01)
 
         def compile(compiler, graph=None):
-            current["rank"] = compiler.rank
+            fb.set_tag(compiler.rank)
             if graph is None:
                 graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
             return compiler.compile(
                 graph, [], {}, Range(start=1, end=4096), key="artifact_bucket"
             )
 
-        return list(compilers()), compile, compiled, replayed
+        return list(compilers()), compile, fb.compiled, fb.replayed
 
     def test_a_peer_artifact_is_replayed_instead_of_compiled(
         self, tmp_path, monkeypatch

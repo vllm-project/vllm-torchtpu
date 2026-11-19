@@ -181,6 +181,8 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    w1_scales_expert_second_minor=False,
+    w2_scales_expert_second_minor=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -203,6 +205,8 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        w1_scales_expert_second_minor,
+        w2_scales_expert_second_minor,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -244,6 +248,8 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            w1_scales_expert_second_minor=w1_scales_expert_second_minor,
+            w2_scales_expert_second_minor=w2_scales_expert_second_minor,
             **bias_kw,
             **routing_kw,
         )
@@ -639,6 +645,39 @@ def _simulated_routing_operands(
     return noise, score_bias, hash_ids
 
 
+# The minor-to-major order of an [E, blocks, N] scale table whose expert axis
+# is second-minor: stored as [blocks, E, N].
+_EXPERT_SECOND_MINOR = [2, 0, 1]
+
+
+def _default_scale_layout(shape) -> list[int]:
+    """The minor-to-major order torch_tpu gives an f32 table of `shape`."""
+    from torch_tpu._internal.compile import tpu_torch_compile
+
+    return tpu_torch_compile.get_default_layout(torch.float32, tuple(shape))[0]
+
+
+def _staged_scale_layout(table) -> list[int] | None:
+    """The minor-to-major order of `table`'s device buffer, if it has one."""
+    from torch_tpu._internal.compile import tpu_torch_compile
+
+    layout = tpu_torch_compile.get_device_layout_if_materialized(table)
+    return None if layout is None else layout[0]
+
+
+def _scales_expert_second_minor(scale) -> bool:
+    """Whether the `[E, blocks, 1, N]` scale table `scale` is staged with its
+    expert axis second-minor.
+
+    `register_fused_scale_buffers` stages it as `[E, blocks, N]`, and torch_tpu
+    picks that buffer's layout: the one with less padding, so `{2,0,1}` when
+    `blocks` fills its sublane tiles worse than E does. It is asked here rather
+    than predicted, because the op is built before the table is staged.
+    """
+    experts, blocks, _, n = scale.shape
+    return _default_scale_layout((experts, blocks, n)) == _EXPERT_SECOND_MINOR
+
+
 def register_fused_scale_buffers(layer) -> None:
     """Stage the fp4 weight scales as the `[E, K/block, N]` tables the op takes.
 
@@ -662,6 +701,29 @@ def register_fused_scale_buffers(layer) -> None:
         tables.append(table)
     if tables[0].device.type == "tpu":
         synchronize_tensors(tables)
+        _check_staged_scale_layouts(tables)
+
+
+def _check_staged_scale_layouts(tables) -> None:
+    """Warn if a staged scale table is not in the layout the op was built for.
+
+    `prebuild_fused_moe_ep` reads each table expert-second-minor exactly when
+    `_scales_expert_second_minor` says torch_tpu will stage it so. A table
+    staged otherwise gives the same output, but XLA copies it on every call.
+    """
+    for table in tables:
+        staged = _staged_scale_layout(table)
+        expected = _default_scale_layout(table.shape)
+        if staged is not None and (staged == _EXPERT_SECOND_MINOR) != (
+            expected == _EXPERT_SECOND_MINOR
+        ):
+            logger.warning_once(
+                "Fused EP MoE scale table %s was staged in layout %s, but the op "
+                "was built for %s, so XLA copies it on every call.",
+                tuple(table.shape),
+                staged,
+                expected,
+            )
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -784,6 +846,9 @@ def prebuild_fused_moe_ep(
     layer under a method that is not would route every token by top-k instead,
     silently. So the layer's table alone does not admit it; the caller's
     promise does.
+
+    For FP4, each scale table is read in the layout torch_tpu will stage it
+    in (`_scales_expert_second_minor`), so no caller has to predict it.
 
     `weights` optionally supplies (w1, w2, w1_scale, w2_scale) before they are
     installed on the layer. NVFP4 uses meta tensors describing the proposed
@@ -946,6 +1011,11 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
+        # Only FP4 has [E, blocks, N] scale tables.
+        w1_scales_expert_second_minor=weight_format == "fp4"
+        and _scales_expert_second_minor(w1_scale),
+        w2_scales_expert_second_minor=weight_format == "fp4"
+        and _scales_expert_second_minor(w2_scale),
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

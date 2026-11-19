@@ -151,7 +151,7 @@ def tile_numerics() -> dict[str, NumericsClass]:
     return out
 
 
-def default_tiles(B: int, **kw: Any) -> Tiles:
+def default_tiles(B: Any = 4, **kw: Any) -> Tiles:
     """Model-agnostic default tiles (`profiles/default.py:default_tiles`).
 
     Used when `ExecSpec.tiles` is `None`; ring depths may be refined at build
@@ -165,10 +165,32 @@ def default_tiles(B: int, **kw: Any) -> Tiles:
 
 @dataclass(frozen=True)
 class DebugOptions:
-    """Debug and ablation flags kept separate from model geometry and execution."""
+    """Debug, ablation, and LLO profiling flags (`ExecSpec.debug`).
+
+    `scopes` configures `jax.named_scope` LLO region markers and
+    `pltpu.trace_value` layer tags for the megakernel step builder
+    (`sc(name, level)` is enabled when `int(scopes) >= level`):
+    - `0` / `False`: off (default; zero LLO instructions emitted).
+    - `1` / `True`: per-module hook scopes `<module>/<phase>` around every module's
+      `prologue`, `init_buffers`, `on_layer_start`, `emit`, and `epilogue`, plus
+      `pltpu.trace_value("layer", lyr)` inside `<module>/emit`.
+    - `2`: phase scopes (`sc(name)` default `level=2`, e.g. `norm_in`, `smalls_sync`,
+      `allreduce`, `final_norm`, and intra-module phase scopes).
+    - `3`: fine-grained DMA wait and routing scopes (`dwait`, `ewait`, `swait`,
+      `route_topk`, `route_dma`, `route_dedup`, `route_fetch`).
+
+    Capturing custom-call LLO scopes in xprof on TPU requires enabling LLO profiling
+    in the XLA TPU compiler: pass `compiler_options={"xla_tpu_enable_llo_profiling":
+    "true"}` to `pl.pallas_call` or set `LIBTPU_INIT_ARGS` with
+    `--xla_tpu_enable_llo_profiling=true` (optionally with
+    `--xla_xprof_enable_custom_call_tracing=true` and
+    `--xla_xprof_register_llo_debug_info=true`). In the captured `.xplane.pb`, scope
+    events and `"layer"` (`int_value` = layer index `0..L-1` from `pltpu.trace_value`)
+    appear on the `/device:TPU:*` plane's `"XLA TraceMe"` line.
+    """
 
     skip: frozenset[str] = frozenset()  # Named execution phases to skip during ablation
-    scopes: int | bool = False  # Emit per-phase jax.named_scope annotations
+    scopes: int | bool = False  # 0/False off, 1/True module, 2 phase, 3 wait/route
     # Per-module debug flags (registered `Debug` dataclasses keyed by module name).
     # Kept out of `Tiles`, so setting them leaves `ExecSpec.tiles=None` (and its
     # build-time VMEM refinement) intact.
