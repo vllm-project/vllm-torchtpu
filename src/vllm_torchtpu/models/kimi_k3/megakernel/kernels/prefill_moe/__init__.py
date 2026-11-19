@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_moe/__init__.py
-"""Packed EP16/TP2 prefill MoE kernels: the FP32-reduction schedule for
-512- through 8192-token windows (``fused``), the BF16-reduction layer for
-4096- and 8192-token windows (``layer``) and the Pallas pieces they share."""
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+#   src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_moe/__init__.py
+"""Packed EP16 x TP2 prefill MoE kernels and shared Pallas building blocks."""
