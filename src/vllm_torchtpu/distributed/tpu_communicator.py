@@ -25,6 +25,7 @@ collectives are latency-bound, so the number of collectives per MoE layer, not
 their size, sets the cost.
 """
 
+import functools
 import math
 
 import torch
@@ -34,37 +35,87 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.hier_reduce_scatter import moe_combine_reduce_scatter
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Pack only decode-sized steps. There the gathers are latency-bound and one
 # collective instead of two or three is a net win; at prefill sizes the
 # concatenate / split copies cost more than the saved collective (measured on
-# v7x: 32K-context prefill took 1.4x as long with packing always on).
+# v7x: 32K-context prefill took 1.4x as long with packing always on). The
+# count compared is this rank's padded token bucket as the communicator sees
+# it: the per-rank `compile_sizes` bucket, divided by TP under
+# sequence-parallel MoE.
 _PACK_MAX_TOKENS = 512
+
+# The only carrier measured, and checked bit-exact on device. Other hidden
+# dtypes (fp32, fp8) keep per-tensor gathers.
+_PACK_CARRIER = torch.bfloat16
+
+
+@functools.cache
+def _chip_is_tpu7x() -> bool:
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.tpu_info import get_chip_version
+
+    return get_chip_version() == pltpu.ChipVersion.TPU_7X
+
+
+@torch.compiler.assume_constant_result
+def _chip_allows_packing() -> bool:
+    """The cutoff and the A/B data are from tpu7x; other chips keep
+    per-tensor gathers until they are measured."""
+    return _chip_is_tpu7x()
+
+
+@torch.compiler.assume_constant_result
+def _log_unpackable(dtypes: str) -> None:
+    """Trace-time log; takes no symbolic values."""
+    logger.warning_once(
+        "EP dispatch gathers tensors one by one: their dtypes (%s) do not fit a "
+        "bfloat16 carrier.",
+        dtypes,
+    )
+
+
+def _should_pack(tensors: list[torch.Tensor], num_tokens) -> bool:
+    if tensors[0].dtype != _PACK_CARRIER:
+        return False
+    if any(t.dtype.itemsize % _PACK_CARRIER.itemsize for t in tensors):
+        _log_unpackable(", ".join(str(t.dtype) for t in tensors))
+        return False
+    if not _chip_allows_packing():
+        return False
+    # Branch on the token count only where each side of the branch gets its
+    # own trace: eager runs, or traces inside `shape_variants.warmup()`. A
+    # module compiled once for every bucket (profile run, MTP / Eagle drafters)
+    # keeps per-tensor gathers, so its trace does not specialize on the count.
+    if torch.compiler.is_compiling() and shape_variants.aot_cache_tag() is None:
+        return False
+    return num_tokens <= _PACK_MAX_TOKENS
 
 
 def _packed_all_gather(group, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
     """All-gather per-token tensors along dim 0 with a single collective.
 
-    The rows of every tensor are bit-cast to the first tensor's dtype (the
-    hidden states) and concatenated along the last dim, gathered once, then
-    split and cast back. Using the hidden-state dtype as the carrier keeps the
-    bulk of the payload in its native layout; a byte carrier forces TPU to
-    repack every element. An all-gather only copies, so the result is
-    bit-identical to gathering each tensor separately. Tensors whose element
-    size is not a multiple of the carrier's, and steps above
-    `_PACK_MAX_TOKENS` tokens, are gathered tensor by tensor.
+    The rows of every tensor are bit-cast to bfloat16 (the hidden-state dtype)
+    and concatenated along the last dim, gathered once, then split and cast
+    back. Using the hidden-state dtype as the carrier keeps the bulk of the
+    payload in its native layout; a byte carrier forces TPU to repack every
+    element. An all-gather only copies, so the result is bit-identical to
+    gathering each tensor separately. Everything `_should_pack` rejects is
+    gathered tensor by tensor.
     """
     num_tokens = tensors[0].shape[0]
     if any(t.shape[0] != num_tokens for t in tensors):
         raise ValueError("packed all-gather needs the same token count per tensor")
-    carrier = tensors[0].dtype
-    if num_tokens > _PACK_MAX_TOKENS or any(
-        t.dtype.itemsize % carrier.itemsize for t in tensors
-    ):
+    if not _should_pack(tensors, num_tokens):
         return [group.all_gather(t, dim=0) for t in tensors]
     rows = [
-        t.contiguous().reshape(num_tokens, math.prod(t.shape[1:])).view(carrier)
+        t.contiguous().reshape(num_tokens, math.prod(t.shape[1:])).view(_PACK_CARRIER)
         for t in tensors
     ]
     gathered = group.all_gather(torch.cat(rows, dim=1), dim=0)
