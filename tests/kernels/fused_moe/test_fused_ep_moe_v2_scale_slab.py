@@ -142,3 +142,35 @@ def test_lookup_scale_slab_matches_the_scatter(ep, t_local, g_local, topk, routi
             np.full(padding.sum(), scale_bits[0], np.int32),
             err_msg=f"shard {me}: a padding row is not token 0's scale",
         )
+
+
+def test_lookup_runs_at_the_largest_token_count_the_budget_admits():
+    """The lookup compiles and runs with its scale table at the full budget.
+
+    scale_slab_fits admits up to SCALE_SLAB_MAX_TABLE_BYTES of per-token
+    scales (131,072 tokens), which the kernel holds in SMEM next to its two
+    windows and Mosaic's own scalar working set. This builds it at exactly
+    that count and checks every row against numpy; one token more is over the
+    budget, where the layer keeps the scatter.
+    """
+    T = kernel.SCALE_SLAB_MAX_TABLE_BYTES // 4
+    assert kernel.scale_slab_fits(T)
+    assert not kernel.scale_slab_fits(T + 1)
+    W = kernel.SCALE_SLAB_WINDOW
+    table_rows, out_rows = 8 * W, 10 * W
+    live = table_rows - 100  # a partly filled last window
+    rng = np.random.default_rng(7)
+    scale_bits = (rng.random(T, dtype=np.float32) + 0.5).view(np.int32)
+    token_gather = rng.integers(0, T, size=table_rows, dtype=np.int32)
+    # Read both ends of the table, so a short copy into SMEM would show.
+    token_gather[0], token_gather[1] = 0, T - 1
+
+    got = np.asarray(
+        kernel.build_act_scale_slab(
+            n_tokens=T, table_rows=table_rows, out_rows=out_rows
+        )(jnp.int32(live), jnp.asarray(token_gather), jnp.asarray(scale_bits))
+    )
+
+    want = np.zeros(out_rows, np.int32)
+    want[:live] = scale_bits[token_gather[:live]]
+    np.testing.assert_array_equal(got, want)
