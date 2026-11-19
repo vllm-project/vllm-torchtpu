@@ -355,7 +355,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         # Decoders first: vLLM schedules ``running`` in list order and a
         # partial prefill takes min(remaining, budget), so a prefill ahead of
         # a decoder can leave it no tokens. Stably move every decoding request
-        # ahead of every prefilling one.
+        # ahead of every prefilling one. vLLM's FCFS preemption takes
+        # running[-1], so under KV pressure a request still prefilling here
+        # is preempted before any decoder.
         decoding = [r for r in self.running if _is_decoding(r)]
         prefilling = [r for r in self.running if not _is_decoding(r)]
         if prefilling and decoding:
