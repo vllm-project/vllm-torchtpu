@@ -87,7 +87,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_TP_FP8_ALL_REDUCE: bool = False
     TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS: int = 2048
-    TPU_TP_FP8_ALL_REDUCE_MODE: str = "a2a"
+    TPU_TP_FP8_ALL_REDUCE_MODE: str = "rs"
     TPU_TP_FP8_ALL_REDUCE_SCALE: str = "g128"
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -839,16 +839,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inside the TP all-reduce op of distributed/pallas_all_reduce.py (armed
     # with this switch even when TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES is 0) for
     # steps of at least _MIN_TOKENS tokens (a multiple of TP); smaller ones
-    # (decode) keep their path. _MODE: "a2a" (fp8 all-to-all, f32 sum, fp8
-    # all-gather; ~1/2 the bytes), "rs" (bf16 reduce-scatter, fp8 all-gather)
-    # or "a2a16" (fp8 all-to-all, bf16 all-gather; both ~3/4). _SCALE: "row"
-    # or "g128" (one scale per 128 columns). Default off; off = unchanged.
+    # (decode) keep their path. _MODE: "rs" (bf16 reduce-scatter, fp8
+    # all-gather; ~3/4 the bytes; default), "a2a" (fp8 all-to-all, f32 sum,
+    # fp8 all-gather; ~1/2) or "a2a16" (fp8 all-to-all, bf16 all-gather). On
+    # tpu7x 2x2x1 TP8 at 8192 x 6144 (c48 LIBTPU flags) "rs" takes 0.98 ms
+    # against the SparseCore all-reduce's 1.03; the all-to-all modes take
+    # ~2 ms (the all-to-all is slow even when offloaded). _SCALE: "row" or
+    # "g128" (one scale per 128 columns). Default off; off = unchanged.
     "TPU_TP_FP8_ALL_REDUCE": env_bool("TPU_TP_FP8_ALL_REDUCE"),
     "TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS": env_nonnegative_int(
         "TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS", 2048
     ),
     "TPU_TP_FP8_ALL_REDUCE_MODE": env_with_choices(
-        "TPU_TP_FP8_ALL_REDUCE_MODE", "a2a", ["a2a", "rs", "a2a16"]
+        "TPU_TP_FP8_ALL_REDUCE_MODE", "rs", ["a2a", "rs", "a2a16"]
     ),
     "TPU_TP_FP8_ALL_REDUCE_SCALE": env_with_choices(
         "TPU_TP_FP8_ALL_REDUCE_SCALE", "g128", ["row", "g128"]

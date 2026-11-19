@@ -27,6 +27,12 @@ over a 1-D mesh axis of n ranks:
 "a2a16" fp8 all-to-all + f32 sum -> bf16 all-gather. One rounding (of the
         partials); ~3/4 of the bytes.
 
+Measured on tpu7x 2x2x1 TP8, [8192, 6144] bf16, c48 served LIBTPU flags
+(scripts/benchmark_fp8_all_reduce.py): SparseCore all-reduce 1.03 ms per
+call, "rs" 0.98-0.99, bf16 reduce-scatter + all-gather 1.15, "a2a" 1.98-2.17
+and "a2a16" 1.88-2.33 (the all-to-all is the slow part, SparseCore offload or
+not). Without SparseCore all-gather offload (c64 flags) "rs" takes 1.23.
+
 Scales: "row" (one per row) or "g128" (one per 128 columns of a row), from
 the amax of the finite values, so a NaN still propagates through its value.
 The e4m3 values and the scales' bytes travel as one int8 payload

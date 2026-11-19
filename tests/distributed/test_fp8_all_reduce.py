@@ -276,11 +276,11 @@ def test_fp8_config_from_env(par, monkeypatch):
         monkeypatch.delenv(k, raising=False)
     assert par.fp8_config_from_env() is None
     monkeypatch.setenv("TPU_TP_FP8_ALL_REDUCE", "1")
-    assert par.fp8_config_from_env() == par.Fp8Config(2048, "a2a", "g128")
+    assert par.fp8_config_from_env() == par.Fp8Config(2048, "rs", "g128")
     monkeypatch.setenv("TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS", "4096")
-    monkeypatch.setenv("TPU_TP_FP8_ALL_REDUCE_MODE", "rs")
+    monkeypatch.setenv("TPU_TP_FP8_ALL_REDUCE_MODE", "a2a")
     monkeypatch.setenv("TPU_TP_FP8_ALL_REDUCE_SCALE", "row")
-    assert par.fp8_config_from_env() == par.Fp8Config(4096, "rs", "row")
+    assert par.fp8_config_from_env() == par.Fp8Config(4096, "a2a", "row")
     monkeypatch.setenv("TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS", "0")
     assert par.fp8_config_from_env() is None
     monkeypatch.setenv("TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS", "2048")
