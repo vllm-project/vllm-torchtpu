@@ -327,6 +327,27 @@ def test_draft_flags_are_laid_out_like_the_drafts(enabled):
     assert flags.tolist() == [G, G, M, G, M, 0, 0, 0]
 
 
+def test_grammar_rows_skip_the_lm_head():
+    from vllm_torchtpu.runner.speculative_decoding_manager import (
+        SpeculativeDecodingManager,
+    )
+
+    # Request 0 drafts [G, M, G] (logits rows 0-2, bonus row 3); request 1
+    # drafts [G, G] (rows 4-5, bonus row 6).
+    logits, bonus, target = SpeculativeDecodingManager._skip_grammar_rows(
+        np.array([3, 2]),
+        np.array([G, M, G, G, G]),
+        np.array([10, 11, 12, 13, 20, 21, 22]),
+        np.array([3, 6]),
+        np.array([0, 1, 2, 4, 5]),
+    )
+    # Only the MODEL draft's row and the bonus rows keep the LM head.
+    assert logits.tolist() == [11, 13, 22]
+    assert bonus.tolist() == [1, 2]
+    # GRAMMAR drafts point at their request's bonus row.
+    assert target.tolist() == [1, 0, 1, 2, 2]
+
+
 def test_the_drafter_fills_only_its_share_of_the_row():
     assert gaad.draft_limit(_vllm_config(_DRAFTER, gaad={"draft_tokens": 1})) == 1
     # The drafter's x after the forced run is past its share; the grammar
