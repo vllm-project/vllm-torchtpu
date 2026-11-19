@@ -209,9 +209,9 @@ class AttentionMetadataBuilderContext:
     # block column `(seq_len - 1) // block_size` is invariant across
     # `[seq_lens_hi - max_rejected, seq_lens_hi]`.
     mamba_seq_lens_bounds: tuple[Any, ...] | None = None
-    # The walk's mamba group state indices stacked as one [G, num_reqs]
-    # tensor (more than one group), and the ids of the per-group tensors it
-    # was stacked from, for the runner's read-offset reset to reuse.
+    # The walk's mamba group state indices, for the runner's read-offset reset
+    # to reuse: one [G, num_reqs] tensor stacked from several groups, or the
+    # single group's [num_reqs] tensor; and the ids of the per-group tensors.
     _stacked_mamba_groups: Any = None
     _stacked_mamba_groups_ids: tuple[int, ...] | None = None
 
@@ -459,12 +459,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             else None
         )
         self.has_prefill_ckpt_blocks = self.prefill_ckpt_spec_blocks is not None
-        # Only mamba/GDN layers consume physical state slot ids; attention
-        # groups leave AttentionMetadata.mamba_state_indices None.
         # `_block_table_geometry`'s cache: the key it last computed the width
         # for, and that width.
         self._cached_geom_key: tuple[int, int, int] | None = None
         self._cached_target_num_blocks = 0
+        # Only mamba/GDN layers consume physical state slot ids; attention
+        # groups leave AttentionMetadata.mamba_state_indices None.
 
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
@@ -888,8 +888,12 @@ def stage_block_table_uploads(
     # joining, finishing, being preempted or reordered, spec tokens being
     # rejected); comparing contents covers every cause. An unchanged upload
     # reuses the previous device tensor, which also lets the products cache
-    # below key on its identity.
-    staged_dev = _stage_unless_unchanged(runner, "staged_block_tables", flat)
+    # below key on its identity. A targeted walk keeps its own slot, so a full
+    # and a targeted walk in the same step do not evict each other.
+    slot = "staged_block_tables"
+    if gids is not None:
+        slot += ":" + ",".join(str(gid) for gid, _, _ in entries)
+    staged_dev = _stage_unless_unchanged(runner, slot, flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
