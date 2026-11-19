@@ -79,3 +79,27 @@ def test_apply_top_k_top_p_per_request():
     result = sampling.apply_top_k_top_p(logits, top_k, top_p)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(logits, original)
+
+
+@pytest.mark.parametrize("use_top_k, use_top_p", sampling.MASK_FLAG_COMBINATIONS)
+def test_apply_top_k_top_p_leaves_out_searches_no_row_uses(use_top_k, use_top_p):
+    """With the flags masks_in_use gives, the result equals running both
+    searches bit for bit. Rows with top_k 0 or -1 and top_p 1 apply no mask."""
+    generator = torch.Generator().manual_seed(5)
+    logits = 3 * torch.randn((4, 33), generator=generator)
+    logits[2, ::4] = float("-inf")
+    top_k = torch.tensor([[0], [-1], [3 if use_top_k else 0], [0]])
+    top_p = torch.tensor([[1.0], [1.0], [1.0], [0.6 if use_top_p else 1.0]])
+    assert sampling.masks_in_use(top_k, top_p) == (use_top_k, use_top_p)
+
+    both = sampling.apply_top_k_top_p(logits, top_k, top_p)
+    flagged = sampling.apply_top_k_top_p(
+        logits, top_k, top_p, use_top_k=use_top_k, use_top_p=use_top_p
+    )
+
+    assert torch.equal(flagged, both)
+    masked_rows = (top_k > 0) | (top_p < 1.0)
+    assert torch.equal(flagged[~masked_rows.view(-1)], logits[~masked_rows.view(-1)])
+    assert (flagged[masked_rows.view(-1)] == sampling.MASKED_LOGIT_VALUE).any() == (
+        use_top_k or use_top_p
+    )
