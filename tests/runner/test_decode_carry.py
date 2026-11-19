@@ -526,3 +526,55 @@ def test_prepare_inputs_reuploads_when_the_fused_path_is_not_taken(
     assert carried_calls[1] == ["_compiled_subtract_and_substitute_placeholder_token"]
     assert carried_outs == upload_outs
     assert carried._decode_carry_state is None
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("all_hold", True),
+        ("no_pending_counts", False),
+        ("inputs_off_tpu", False),
+        ("no_device_inputs", False),
+        ("no_previous_results", False),
+        ("no_device_source", False),
+        ("no_metadata", False),
+        ("verify_rows_short_of_the_bucket", False),
+    ],
+)
+def test_draft_token_program_predicate(case, expected):
+    """_subtracts_with_draft_token_program, which both _prepare_inputs and the
+    carry follow: each condition on its own turns the fused draft-token
+    program (and so the carry) off, including a verify step whose final logits
+    rows fall short of the token bucket."""
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    t = torch.zeros(4, dtype=torch.int32)
+    runner = types.SimpleNamespace(
+        _pre_async_results=types.SimpleNamespace(next_tokens_tpu=t),
+        input_ids=torch.zeros(16, dtype=torch.int32),
+    )
+    pending = (t, t, t)
+    seq_lens = t.as_subclass(_TpuTyped)
+    indices = np.arange(4)
+    md = types.SimpleNamespace(final_logits_indices=torch.zeros(16, dtype=torch.int32))
+    if case == "no_pending_counts":
+        pending = None
+    elif case == "inputs_off_tpu":
+        seq_lens = t
+    elif case == "no_device_inputs":
+        indices = np.arange(0)
+    elif case == "no_previous_results":
+        runner._pre_async_results = None
+    elif case == "no_device_source":
+        runner._pre_async_results.next_tokens_tpu = None
+    elif case == "no_metadata":
+        md = None
+    elif case == "verify_rows_short_of_the_bucket":
+        md.final_logits_indices = torch.zeros(12, dtype=torch.int32)
+
+    assert (
+        TPUModelRunner._subtracts_with_draft_token_program(
+            runner, pending, seq_lens, indices, md
+        )
+        is expected
+    )
