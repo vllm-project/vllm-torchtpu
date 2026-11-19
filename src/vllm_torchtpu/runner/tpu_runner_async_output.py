@@ -24,6 +24,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.runner.prompt_logprobs import PendingPromptLogprobs
+
 INVALID_TOKEN_ID = -1
 
 
@@ -108,6 +110,11 @@ class AsyncTPUCopyState:
     logprobs: list[LogprobsChunk] | None = None
     # Device sources of `logprobs`, kept alive until the copy lands.
     _logprobs_tpu: list[LogprobsTensors] | None = None
+    # Step with prompt logprobs: their rows, copied with the tokens and
+    # written to the requests' buffers in `get_output`.
+    prompt_logprobs: PendingPromptLogprobs | None = None
+    # Device sources of `prompt_logprobs`, kept alive until the copy lands.
+    _prompt_logprobs_tpu: list[LogprobsTensors] | None = None
 
     @classmethod
     def from_device_chunks(
@@ -115,6 +122,7 @@ class AsyncTPUCopyState:
         chunks_tpu: list[torch.Tensor],
         chunk_real_lens: list[int],
         logprobs: list[LogprobsChunk] | None = None,
+        prompt_logprobs: PendingPromptLogprobs | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
@@ -130,6 +138,9 @@ class AsyncTPUCopyState:
                 LogprobsChunk(c.tensors.to_cpu_nonblocking(), c.row_starts)
                 for c in logprobs
             ]
+        prompt_logprobs_tpu = (
+            prompt_logprobs.copy_to_host() if prompt_logprobs is not None else None
+        )
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
         return cls(
@@ -139,6 +150,8 @@ class AsyncTPUCopyState:
             chunks_tpu=chunks_tpu,
             logprobs=logprobs or None,
             _logprobs_tpu=logprobs_tpu,
+            prompt_logprobs=prompt_logprobs,
+            _prompt_logprobs_tpu=prompt_logprobs_tpu,
         )
 
     def fence_pending_device_work(self) -> None:
@@ -156,6 +169,7 @@ class AsyncTPUCopyState:
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
         self._logprobs_tpu = None
+        self._prompt_logprobs_tpu = None
         self.completed = True
 
     @property
@@ -218,6 +232,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             return self._model_runner_output
 
         self.copy_state.wait()
+        if self.copy_state.prompt_logprobs is not None:
+            self._model_runner_output.prompt_logprobs_dict = (
+                self.copy_state.prompt_logprobs.fill()
+            )
         selected_token_ids = self.copy_state.sampled_token_ids_cpu
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []

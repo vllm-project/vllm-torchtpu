@@ -379,6 +379,40 @@ def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
         AsyncTPUCopyState.from_device_chunks(tokens, [5], logprobs=[short])
 
 
+def test_prompt_logprobs_are_copied_with_the_tokens_and_filled_after_the_wait(
+    monkeypatch,
+):
+    """Their copy starts before the copy event is recorded, and get_output
+    fills them only after waiting on it."""
+    calls = []
+    event = MagicMock()
+    event.record.side_effect = lambda: calls.append("event.record")
+    event.synchronize.side_effect = lambda: calls.append("event.synchronize")
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
+    )
+    device_rows, buffer = object(), object()
+    pending = MagicMock()
+    pending.copy_to_host.side_effect = lambda: calls.append("copy") or [device_rows]
+    pending.fill.side_effect = lambda: calls.append("fill") or {"r0": buffer}
+
+    state = AsyncTPUCopyState.from_device_chunks(
+        [torch.zeros((8, 1), dtype=torch.int32)], [1], prompt_logprobs=pending
+    )
+    assert state._prompt_logprobs_tpu == [device_rows]
+    out = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["r0"], req_id_to_index={"r0": 0}, sampled_token_ids=[]
+        ),
+        copy_state=state,
+        discard_sampled_tokens_req_indices=[],
+    ).get_output()
+
+    assert calls == ["copy", "event.record", "event.synchronize", "fill"]
+    assert out.prompt_logprobs_dict == {"r0": buffer}
+    assert state._prompt_logprobs_tpu is None
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("num_logprobs", [0, 2])
 @pytest.mark.parametrize("real_rows", [[5], [8, 3]])
