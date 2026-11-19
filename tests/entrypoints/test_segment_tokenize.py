@@ -26,8 +26,10 @@ import weakref
 import pytest
 import tokenizers
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
+from vllm.exceptions import VLLMValidationError
+from vllm.renderers import base as renderer_base
 
-from vllm_torchtpu.segment_tokenize import SegmentTokenizer
+from vllm_torchtpu.segment_tokenize import SegmentTokenizer, TokenizerMadeIds
 
 SPECIALS = [
     "<|user|>",
@@ -431,6 +433,7 @@ def test_renderer_patch_routes_and_falls_back(monkeypatch):
     monkeypatch.setattr(cls, "validate_token_ids", cls.validate_token_ids)
     monkeypatch.setattr(cls, "_tpu_segment_tokenize", False, raising=False)
     monkeypatch.setattr(st, "_INSTANCES", {})
+    monkeypatch.setattr(st, "TOKENIZER_MADE_IDS", TokenizerMadeIds())
     monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
     st.patch_renderer_segment_tokenize()
     assert cls._tokenize_prompt is not counted_original
@@ -473,13 +476,10 @@ def test_renderer_patch_routes_and_falls_back(monkeypatch):
 
 
 def test_tokenizer_made_ids_are_taken_once_by_identity():
-    from vllm_torchtpu.segment_tokenize import TokenizerMadeIds
-
     made = TokenizerMadeIds(capacity=2)
     ids = [1, 2, 3]
     made.add(ids)
     assert not made.take([1, 2, 3])
-    made.add(ids)
     assert made.take(ids)
     assert not made.take(ids)
 
@@ -496,10 +496,6 @@ def test_tokenizer_made_ids_are_taken_once_by_identity():
 
 
 def test_vocabulary_check_skips_only_segment_tokenizer_ids(monkeypatch):
-    pytest.importorskip("vllm")
-    from vllm.exceptions import VLLMValidationError
-    from vllm.renderers import base as renderer_base
-
     from vllm_torchtpu import segment_tokenize as st
 
     toy = _toy_tokenizer()
@@ -518,54 +514,48 @@ def test_vocabulary_check_skips_only_segment_tokenizer_ids(monkeypatch):
             return dict(truncation=False, max_length=None, add_special_tokens=False)
 
     cls = renderer_base.BaseRenderer
-    saved = {
-        name: cls.__dict__[name] for name in ("_tokenize_prompt", "validate_token_ids")
-    }
+    monkeypatch.setattr(cls, "_tokenize_prompt", cls._tokenize_prompt)
+    monkeypatch.setattr(cls, "validate_token_ids", cls.validate_token_ids)
+    monkeypatch.setattr(cls, "_tpu_segment_tokenize", False, raising=False)
     monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
     monkeypatch.setattr(st, "_INSTANCES", {})
-    monkeypatch.setattr(st, "TOKENIZER_MADE_IDS", st.TokenizerMadeIds())
-    try:
-        cls._tpu_segment_tokenize = False
-        st.patch_renderer_segment_tokenize()
+    monkeypatch.setattr(st, "TOKENIZER_MADE_IDS", TokenizerMadeIds())
+    st.patch_renderer_segment_tokenize()
 
-        class R:
-            _tokenize_prompt = cls._tokenize_prompt
-            validate_token_ids = cls.validate_token_ids
-            _build_tokens_prompt = staticmethod(cls._build_tokens_prompt)
-            tokenizer = HF()
-            model_config = ModelConfig()
+    class R:
+        _tokenize_prompt = cls._tokenize_prompt
+        validate_token_ids = cls.validate_token_ids
+        _build_tokens_prompt = staticmethod(cls._build_tokens_prompt)
+        tokenizer = HF()
+        model_config = ModelConfig()
 
-            def get_tokenizer(self):
-                return self.tokenizer
+        def get_tokenizer(self):
+            return self.tokenizer
 
-            def _wants_offsets(self, prompt, params):
-                return False
+        def _wants_offsets(self, prompt, params):
+            return False
 
-        r = R()
-        text = "[gMASK]<sop><|user|>" + CORPUS + "<|assistant|>"
-        ids = r._tokenize_prompt({"prompt": text}, Params())["prompt_token_ids"]
-        assert ids == toy.encode(text, add_special_tokens=False).ids
-        assert len(st.TOKENIZER_MADE_IDS) == 1
+    r = R()
+    text = "[gMASK]<sop><|user|>" + CORPUS + "<|assistant|>"
+    ids = r._tokenize_prompt({"prompt": text}, Params())["prompt_token_ids"]
+    assert ids == toy.encode(text, add_special_tokens=False).ids
+    assert len(st.TOKENIZER_MADE_IDS) == 1
 
-        # A vocabulary one id smaller makes vLLM's check fail on these ids,
-        # so passing proves the check was skipped.
-        HF.max_token_id = max(ids) - 1
+    # A vocabulary one id smaller makes vLLM's check fail on these ids,
+    # so passing proves the check was skipped.
+    HF.max_token_id = max(ids) - 1
+    r.validate_token_ids(ids)
+    # Taken once: a second check of the same list runs in full.
+    with pytest.raises(VLLMValidationError):
         r.validate_token_ids(ids)
-        # Taken once: a second check of the same list runs in full.
-        with pytest.raises(VLLMValidationError):
-            r.validate_token_ids(ids)
 
-        HF.max_token_id = toy.get_vocab_size(with_added_tokens=True) - 1
-        out_of_vocab = HF.max_token_id + 1
-        for sent in ([5, out_of_vocab], [5, -1]):
-            with pytest.raises(VLLMValidationError):
-                r.validate_token_ids(sent)
-
-        grown = r._tokenize_prompt({"prompt": text}, Params())["prompt_token_ids"]
-        grown.append(out_of_vocab)
+    HF.max_token_id = toy.get_vocab_size(with_added_tokens=True) - 1
+    out_of_vocab = HF.max_token_id + 1
+    for sent in ([5, out_of_vocab], [5, -1]):
         with pytest.raises(VLLMValidationError):
-            r.validate_token_ids(grown)
-    finally:
-        for name, value in saved.items():
-            setattr(cls, name, value)
-        cls._tpu_segment_tokenize = False
+            r.validate_token_ids(sent)
+
+    grown = r._tokenize_prompt({"prompt": text}, Params())["prompt_token_ids"]
+    grown.append(out_of_vocab)
+    with pytest.raises(VLLMValidationError):
+        r.validate_token_ids(grown)
