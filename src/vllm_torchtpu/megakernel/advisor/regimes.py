@@ -38,6 +38,8 @@ from .models import (
     DeploymentPreset,
     ModelProfile,
     ParallelLayout,
+    has_dsa_profile,
+    indexer_record_bytes,
     resolve_model_profile,
 )
 from .specs import (
@@ -307,6 +309,12 @@ def _compute_disagg_handoff(
     kv_wire_bytes = (
         profile.num_attention_layers * isl * kv_per_tok * profile.kv_compress_factor
     )
+    if has_dsa_profile(profile):
+        kv_wire_bytes += (
+            profile.num_indexer_layers
+            * isl
+            * indexer_record_bytes(profile.index_head_dim)
+        )
     qkv_lin_full = (
         2 * profile.linear_key_heads * profile.linear_key_dim
         + profile.linear_value_heads * profile.linear_value_dim
