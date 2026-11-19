@@ -441,6 +441,27 @@ def main() -> None:
                         check=True,
                     )
                 timing["profile_status"] = "passed"
+            # DSV41_GSM8K=<questions> (1319 = all) gates accuracy on this
+            # server after the measurements; gsm8k.py compare pairs two runs.
+            if questions := int(env.get("DSV41_GSM8K", "0")):
+                timing["gsm8k_status"] = "failed"
+                with (args.out / "gsm8k.log").open("w") as gsm8k_log:
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(here / "gsm8k.py"),
+                            "run",
+                            "--out",
+                            str(args.out / "gsm8k"),
+                            "--limit",
+                            str(questions),
+                        ],
+                        env=env,
+                        stdout=gsm8k_log,
+                        stderr=subprocess.STDOUT,
+                        check=True,
+                    )
+                timing["gsm8k_status"] = "passed"
             if multihost:
                 # Keep the head alive until the host coordinator has stopped
                 # the worker. Killing the DP master first looks like a peer crash.
