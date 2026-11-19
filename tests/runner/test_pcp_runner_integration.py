@@ -994,6 +994,24 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
     assert runner._attention_runs_batched_kernel is False
 
 
+@pytest.mark.parametrize("vocab_parallel_rows", [None, 40])
+def test_idle_dummy_logits_rows_match_the_vocab_parallel_bound(
+    monkeypatch, vocab_parallel_rows
+):
+    """An idle DP rank issues the logits call with the busy ranks' row count
+    when the LM head is vocab-parallel, and one row per request otherwise."""
+    runner = _make_runner(
+        num_computed_tokens=[0],
+        prompt_tokens=[64],
+        scheduled_tokens=[1],
+        token_paddings=[256],
+    )
+    runner._vocab_parallel_rows = lambda: vocab_parallel_rows
+    _run_dummy_run(monkeypatch, runner, num_tokens=256, dp_lockstep=True)
+    (_, indices), _ = runner.compute_selected_logits.call_args
+    assert indices.shape[0] == (vocab_parallel_rows or runner.num_reqs_max_model_len)
+
+
 @pytest.mark.parametrize("idle", [False, True])
 def test_idle_dummy_ced_replay_has_no_local_rows(monkeypatch, idle):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
