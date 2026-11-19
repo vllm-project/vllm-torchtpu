@@ -17,9 +17,6 @@ Per head ``h`` of a token: ``y = x_h * rsqrt(mean(x_h^2) + eps) * w * silu(z_h)`
 rounded to bf16 as ``RMSNormGated`` returns it; then ``scale = max|y| / 448``
 over the token (1 for an all-zero row) and ``q = clip(y / scale)`` in
 float8_e4m3fn -- the rows and scales the fp8 linear would compute for itself.
-
-Fused Pallas kernel for gated RMSNorm (RMSNormGated) and per-token dynamic
-FP8 quantization.
 """
 
 import functools
