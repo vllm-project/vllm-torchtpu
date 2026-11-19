@@ -290,7 +290,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            union: bool = False, stats: bool = False, loop: bool = False, ctx: list | None = None,
            max_groups: int | None = None, phys: bool = False, dcp: int = 1, dcp_pool: bool = True,
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
-           async_dma: bool = False):
+           async_dma: bool = False, B: int | None = None, xreq: int = 0,
+           skip_idle: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -302,7 +303,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     CTX = CTX_C if ctx is None else ctx
     MG = MAX_GROUPS if max_groups is None else max_groups
     R = 2
-    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    ex = ExecSpec(R=R, B=2 * T if B is None else B, T=T, ctx=128, interpret=True, tiles=_TILES)
     d = wi.random_wholestep_inputs(
         key, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True
     )
@@ -331,7 +332,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
                    bounded_chunks=True, shard_index=shard, union_attn=union,
                    union_stats=stats, union_phys=phys, loop_requests=loop, dcp=dcp,
-                   compressed_dcp=cdcp)
+                   compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle)
     spec = wholestep_spec(
         G,
         R,
@@ -1255,3 +1256,75 @@ def test_async_selection_dmas_bit_identical(kw):
     for a, b in ((base[0], run[0]), (base[3], run[3]), (base[4], run[4]), (base[7], run[7]),
                  (base[8]["_kr_new"], run[8]["_kr_new"]), (base[8]["_ir_new"], run[8]["_ir_new"])):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+# Ragged requests for the cross-request prefetch: 4 / 1 / 0 / 4 / 1 / 4 / 0 / 3 union tiles
+# (ctx 3: no pool-path group; a one-tile request ahead of a full one).
+CTX_XREQ = [3001, 100, 3, 2000, 50, 3001, 1, 777]
+
+
+def _xreq_pair(monkeypatch, B: int, dcp: int = 1, skip_idle: bool = False, phys: bool = False,
+               xreq: int = 2):
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    kw = dict(long=True, rank_ids=True, union=True, shard=True, loop=True, B=B, phys=phys,
+              ctx=CTX_XREQ, skip_idle=skip_idle, async_dma=True)
+    if dcp > 1:
+        monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, str(dcp))
+        kw.update(dcp=dcp, shared_kv=True)
+    return _run_c(**kw), _run_c(**kw, xreq=xreq)
+
+
+def _assert_xreq_identical(base: tuple, run: tuple) -> None:
+    for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
+        np.testing.assert_array_equal(run[i], base[i], err_msg=name)
+    for k in ("_kr_new", "_ir_new"):
+        np.testing.assert_array_equal(run[8][k], base[8][k], err_msg=k)
+
+
+@pytest.mark.parametrize("B,dcp", [(8, 1), (8, 2), (32, 1), (32, 2), (64, 2)])
+def test_xreq_prefetch_bit_identical(monkeypatch, B, dcp):
+    """VLLM_TPU_MK_QSA_XREQ_PREFETCH: the union tile stream continues across the request loop
+    (request q+1's ids staged in the second `qu_row` bank, its first tiles issued into the
+    slots request q's last tiles free); ragged unions incl. empty requests and a one-tile
+    request ahead of a full one; level 2 also issues the request loop's loads one request
+    ahead. Every output byte-identical, with and without main-KV DCP."""
+    base, run = _xreq_pair(monkeypatch, B, dcp)
+    assert np.isfinite(base[0]).all()
+    _assert_xreq_identical(base, run)
+
+
+def test_xreq_prefetch_skip_idle_and_phys_bit_identical(monkeypatch):
+    """The prefetch under `skip_idle` (the loop stops at the last live request: no prefetch
+    past it) and under `union_phys` (the next request's physical ids staged early)."""
+    global CTX_XREQ
+    ctx = CTX_XREQ
+    try:
+        CTX_XREQ = [3001, 100, 3, 2000, 0, 0, 0, 0]  # live first, then idle slots
+        base, run = _xreq_pair(monkeypatch, 32, skip_idle=True)
+        _assert_xreq_identical(base, run)
+    finally:
+        CTX_XREQ = ctx
+    base, run = _xreq_pair(monkeypatch, 32, phys=True)
+    _assert_xreq_identical(base, run)
+
+
+def test_xreq_prefetch_wrong_request_is_caught(monkeypatch):
+    """Mutation: the prefetched tiles read the current request's ids instead of the next
+    one's; the comparison must fail."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    base, _ = _xreq_pair(monkeypatch, 32)
+    orig = ua.attend_request
+
+    def wrong(**kw):  # noqa: ANN003
+        if kw.get("stream") is not None:
+            sbase, first, (live, nrow, trow, n_next) = kw["stream"]
+            kw["stream"] = (sbase, first, (live, 1 - nrow, trow - 1, n_next))
+        return orig(**kw)
+
+    monkeypatch.setattr(ua, "attend_request", wrong)
+    run = _run_c(long=True, rank_ids=True, union=True, shard=True, loop=True, B=32,
+                 ctx=CTX_XREQ, async_dma=True, xreq=1)
+    with pytest.raises(AssertionError):
+        _assert_xreq_identical(base, run)

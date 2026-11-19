@@ -102,6 +102,7 @@ def indexed_options() -> dict:
         loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, dcp=main_kv_dcp(),
         compressed_dcp=compressed_dcp(),
         async_dma=envs.VLLM_TPU_MK_QSEL_ASYNC,
+        xreq_prefetch=envs.VLLM_TPU_MK_QSA_XREQ_PREFETCH,
     )
 
 

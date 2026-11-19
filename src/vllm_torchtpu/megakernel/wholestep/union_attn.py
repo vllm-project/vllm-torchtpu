@@ -159,6 +159,8 @@ def attend_request(
     phys: bool = False,
     dcp: int = 1,
     sc: Any = None,
+    ids_row: Any = 0,
+    stream: Any = None,
 ) -> list[Any]:
     """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
 
@@ -175,6 +177,14 @@ def attend_request(
     [8, 1])` in pool units, `ok_rows` `T` `[1, 8]` masks. Each tile is copied and unpacked once and
     scored per row (`[nh, 256]` queries, as `attend_row`); scaling follows `attend_row` without
     `fold`: K by `scale_k`, scores by `sm_scale`, V by `scale_v`, per tile.
+    `ids_row`: the row of `ids` holding this request's ids.
+    `stream` (cross-request prefetch) = `(base, first, nxt)`: the request's tiles are positions
+    `[0, ntiles)` of one tile stream over the request loop, ring slot `(base + position) %
+    nslots`; positions from `ntiles` on are the next request's tiles, issued into the slots this
+    request's last tiles free. `first`: no tile of this request was issued by the previous one
+    (else its first `min(ntiles, nslots - 1)` were). `nxt = (live, ids_row, table_row, n_union)`
+    of the next request (its ids already staged in `ids[ids_row]`). Every issued tile is waited
+    by its own request; the caller carries `base + ntiles` to the next request.
     """
     sc = sc or (lambda *_: contextlib.nullcontext())
     per_page = pool.shape[1] // MICRO
@@ -186,15 +196,17 @@ def attend_request(
     length = n_union * MICRO
     ntiles = (length + TILE - 1) // TILE
 
-    def copies(t: Any, s: Any) -> list[Any]:
+    def copies(t: Any, s: Any, row: Any = None, trow: Any = None) -> list[Any]:
         out = []
         base = t * GROUPS_PER_TILE
+        row = ids_row if row is None else row
+        trow = table_row if trow is None else trow
         for j in range(GROUPS_PER_TILE):
             if phys:
-                v = ids[0, base + j]
+                v = ids[row, base + j]
             else:
-                v = ids[0, jnp.minimum(base + j, ncols - 1)]
-                v = table[table_row, v >> cshift] * per_page + (v & (per_page - 1))
+                v = ids[row, jnp.minimum(base + j, ncols - 1)]
+                v = table[trow, v >> cshift] * per_page + (v & (per_page - 1))
             out.append(
                 pltpu.make_async_copy(
                     pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],
@@ -215,11 +227,38 @@ def attend_request(
         else:
             pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
 
-    for k in range(nslots - 1):
+    if stream is None:
+        for k in range(nslots - 1):
 
-        @pl.when(k < ntiles)
-        def _(k=k):
-            start(k, k)
+            @pl.when(k < ntiles)
+            def _(k=k):
+                start(k, k)
+
+        slot = lambda t: jax.lax.rem(t, nslots)  # noqa: E731
+
+        def issue(p: Any) -> None:
+            @pl.when(p < ntiles)
+            def _():
+                start(p, slot(p))
+
+    else:
+        sbase, first, (nlive, nrow, ntrow, n_next) = stream
+        nt_next = jnp.where(nlive, (n_next * MICRO + TILE - 1) // TILE, 0)
+        slot = lambda p: jax.lax.rem(sbase + p, nslots)  # noqa: E731
+
+        def issue(p: Any, own_ok: Any = True) -> None:
+            # Position p: this request's tile p, or the next request's tile p - ntiles.
+            @pl.when((p < ntiles) & own_ok)
+            def _():
+                start(p, slot(p))
+
+            @pl.when((p >= ntiles) & (p - ntiles < nt_next))
+            def _():
+                for cp in copies(p - ntiles, slot(p), nrow, ntrow):
+                    cp.start()
+
+        for k in range(nslots - 1):
+            issue(k, first)
 
     # A tile's 64 group codes sit in one half of an aligned 128-lane window; expanding
     # the whole
@@ -240,15 +279,10 @@ def attend_request(
     rowbit = jax.lax.broadcasted_iota(I32, (T * nh, 1), 0) // nh
 
     def tile(t: Any, carry: Any) -> Any:
-        s = jax.lax.rem(t, nslots)
+        s = slot(t)
         with sc("u_wait", 3):
             wait(t, s)
-        ahead = t + nslots - 1
-
-        @pl.when(ahead < ntiles)
-        def _():
-            start(ahead, jax.lax.rem(ahead, nslots))
-
+        issue(t + nslots - 1)
         return _tile_body(t, s, carry)
 
     def _tile_body(t: Any, s: Any, carry: Any) -> Any:
