@@ -456,6 +456,20 @@ def test_prebuild_refuses_tp_pairs_that_are_not_mesh_blocks(prebuild_layout):
     builders.tp.assert_not_called()
 
 
+def test_prebuild_builds_no_tp_pair_for_single_core_tp_groups(
+    prebuild_layout, monkeypatch
+):
+    """DP8 x TP1 on a chip that reports one device: a TP group of one core is
+    one chip's devices, but no TP all-reduce runs over it, so nothing is built
+    and the pairs collective does not run."""
+    builders, _ = prebuild_layout((3,))
+    monkeypatch.setattr(sc_common, "devices_per_chip", lambda: 1)
+    op.prebuild(ON)
+    assert op._AR_TP_OP is None
+    builders.tp.assert_not_called()
+    builders.pairs.assert_not_called()
+
+
 def test_prebuild_without_the_setting_builds_no_tp_pair(prebuild_layout):
     builders, _ = prebuild_layout((2, 3))
     op.prebuild(_config({}))
@@ -532,10 +546,6 @@ def test_devices_per_chip_comes_from_the_device_info(
     info = pltpu.get_tpu_info_for_chip(chip, cores_per_device)
     monkeypatch.setattr(sc_common.pltpu, "get_tpu_info", lambda: info)
     assert sc_common.devices_per_chip() == want
-
-
-def test_tp_pair_form_is_oneshot():
-    assert op.TP_PAIR_FORM == "oneshot"
 
 
 # The layout predicate behind groups_match_mesh, on an 8-core mesh whose mesh

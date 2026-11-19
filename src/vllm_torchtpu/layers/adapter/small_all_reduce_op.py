@@ -302,7 +302,7 @@ def prebuild(vllm_config: Any) -> None:
     assert index is not None  # build_ep_mesh found the EP group
     if (
         not tp_all_reduce
-        and tp < _CORES
+        and 1 < tp < _CORES
         and _CORES % tp == 0
         and tp_group_is_one_chip(tp, "The TP-pair small all-reduce")
         and groups_match_mesh(index, tp)
