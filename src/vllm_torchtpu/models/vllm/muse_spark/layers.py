@@ -36,7 +36,9 @@ class MuseRMSNorm(nn.Module):
         self.center = center if zero_centered else 0.0
         self.weight_first = weight_first
         self.weight = (
-            nn.Parameter(torch.empty(hidden_size), requires_grad=False)
+            nn.Parameter(
+                torch.empty(hidden_size, dtype=torch.float32), requires_grad=False
+            )
             if has_weight
             else None
         )
