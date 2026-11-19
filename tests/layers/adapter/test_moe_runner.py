@@ -155,6 +155,31 @@ def test_fused_output_is_reduced_under_torch_compile(fused_ep_kernel, armed, exp
         torch.testing.assert_close(compiled(x), x if expected else x * 2)
 
 
+@pytest.mark.parametrize("eligible", [True, False], ids=["v3_armed", "v3_refused"])
+def test_a_v3_armed_layer_reads_as_reduced_under_torch_compile(monkeypatch, eligible):
+    """Fused EP v3 returns this rank's rows combined over every expert and TP
+    rank (below its gate, through the EP combine), so an armed layer must read
+    as reduced; a layer v3 refused keeps upstream's answer and its all-reduce.
+    Traced as the fullgraph forward is."""
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+
+    monkeypatch.setattr(fused_moe_ep_v3, "_OP", object())
+    quant_method = SimpleNamespace(moe_kernel=None, _tpu_fused_ep_eligible=eligible)
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace(quant_method=quant_method)
+    runner.moe_config = SimpleNamespace(skip_final_all_reduce=False)
+
+    def reduce_unless_reduced(x):
+        return x if runner._fused_output_is_reduced else x * 2
+
+    x = torch.ones(2)
+    with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
+        torch._dynamo.reset()
+        compiled = torch.compile(reduce_unless_reduced, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(x), x if eligible else x * 2)
+
+
 def test_routing_simulation_keeps_real_logits_for_tpu_methods(monkeypatch):
     """The TPU MoE methods simulate routing from the real router logits, so
     vLLM's simulator must not replace (or reject) them first."""
