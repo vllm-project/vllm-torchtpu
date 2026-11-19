@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_DISPATCH_CHUNKS: str = "1"
     TPU_MOE_EP_PACKED_SORTS: str = "off"
     TPU_MOE_COMBINE_PRESORTED: bool = False
+    TPU_MOE_NONEP_RFORM_PORT: bool = False
     TPU_MOE_NONEP_GATHER_COLS: int = 0
     TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
     TPU_MOE_NONEP_PERMUTE: str = "sorts"
@@ -1939,6 +1940,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # statically on the EP all-valid combine (TPU_MOE_EP_COMBINE=dense), by a
     # runtime check on the non-EP combine. Same metadata, same output bits.
     "TPU_MOE_COMBINE_PRESORTED": env_bool("TPU_MOE_COMBINE_PRESORTED"),
+    # q38 MOEPORT-R umbrella (hill-climb round 1, ruling (iii)): 1 forces the four non-EP prefill MoE dispatch values
+    # TPU_MOE_NONEP_GATHER=sc_fp8, TPU_MOE_NONEP_DISPATCH_CHUNKS=2, TPU_MOE_COMBINE_PRESORTED=1 and
+    # TPU_MOE_NONEP_PERMUTE=packed_onehot, whatever those keys say; 0 / unset leaves every key as it is.
+    "TPU_MOE_NONEP_RFORM_PORT": env_bool("TPU_MOE_NONEP_RFORM_PORT"),
     # Columns per block for "xla_colchunk". 0 picks the widest block (a
     # multiple of 128 dividing the hidden size) whose source table is at most
     # 3200 x 2560 bf16 bytes, the largest size measured in VMEM; a step whose
