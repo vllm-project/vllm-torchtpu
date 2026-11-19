@@ -78,7 +78,9 @@ class MarkovChainOp:
         anchors = anchors.to(torch.int32).clamp(0, self.words.shape[0] - 1)
         scalars = torch.cat([self.header, anchors])
         out = self.op(scalars, logits, self.words, self.w2_even, self.w2_odd)
-        return out[:, :steps]
+        # A buffer of its own: returned as a view of the [rows, 128] output,
+        # the drafts were re-materialized by an eager program after the draft.
+        return out[:, :steps].contiguous()
 
 
 def _refusal() -> str | None:
