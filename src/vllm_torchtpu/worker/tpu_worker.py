@@ -207,6 +207,8 @@ class TPUWorker(WorkerBase):
         # Counts DP dummy batches, for _DeferredNoForwardOutput.
         self._dummy_batch_cv = threading.Condition()
         self._dummy_batch_count = 0
+        # The late-poll connector workers, listed on first use.
+        self._stage3_late_poller_list: list | None = None
 
         # Multi-host object-storage serve: ranks on hosts other than the API
         # server's receive a model_config.model rewritten to a local aux-file
@@ -806,9 +808,8 @@ class TPUWorker(WorkerBase):
         late_poll is listed, so with the option unset no step output is
         wrapped.
         """
-        pollers = getattr(self, "_stage3_late_poller_list", None)
-        if pollers is not None:
-            return pollers
+        if self._stage3_late_poller_list is not None:
+            return self._stage3_late_poller_list
         pollers = []
         if has_kv_transfer_group():
             connector = get_kv_transfer_group()
