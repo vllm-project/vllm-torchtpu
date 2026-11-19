@@ -21,10 +21,7 @@ from collections.abc import Callable, Sequence
 
 import torch
 
-try:
-    from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
-except ImportError:  # no torch_tpu (host-side unit tests)
-    rowmax_select = None
+from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
 
 MASKED_LOGIT_VALUE = -1e12
 # 128 matches the native TPU (8, 128) vector tile / 128-element lane width
@@ -204,7 +201,7 @@ def topk_mask(
     """
     k = k.squeeze(-1)
     if 0 < max_k <= logits.shape[-1]:
-        if rowmax_select is not None and logits.device.type == "tpu":
+        if logits.device.type == "tpu":
             # Values descending, duplicates included, like torch.topk's.
             top_vals = rowmax_select(logits.float(), max_k)[0].to(logits.dtype)
         else:
