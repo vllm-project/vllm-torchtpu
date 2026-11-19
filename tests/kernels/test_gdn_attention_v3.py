@@ -1478,6 +1478,7 @@ class GDNAttentionTest(parameterized.TestCase):
                     atol=1e-2,
                 )
 
+    @mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False)
     def test_per_seq_boundary_read_after_write(self):
         """PER_SEQ multi-tile sequences preserve initial state and final writeback."""
         n_kq, n_v, d_k, d_v, kernel_size = 4, 8, 128, 128, 4

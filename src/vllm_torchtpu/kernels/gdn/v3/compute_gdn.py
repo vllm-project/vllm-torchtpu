@@ -574,24 +574,84 @@ def recurrent_gdn(
     gating_log = fused_transpose_broadcast(gating_log, src_dim=4, dst_dim=1)
     gating_log = gating_log[:, : cfg.num_v_heads]
 
-    out_list = []
-    new_state_list = []
+    # Vectorized & [k, q]-fused recurrent scan across all seq_tile_size (B)
+    # sequences for both 1-token decode (chunk_size == 1) and multi-token
+    # speculative verify windows (e.g. q_len = chunk_size = window_size = 4).
+    # When speculative checkpoints (window_size > 1) pack > 96 head states into
+    # one VMEM tile, fallback to per-sequence execution keeps stack allocations
+    # within the scoped VMEM limit.
+    b_size, n_v_heads = cfg.seq_tile_size, cfg.num_v_heads
+    if cfg.window_size > 1 and b_size * n_v_heads > 96:
+        out_list = []
+        new_state_list = []
+        for idx in range(b_size):
+            out, state = recurrent_gdn_per_seq(
+                q_compact[idx],
+                k_compact[idx],
+                k_compact_t[idx],
+                v_compact[idx],
+                gating_log[idx],
+                beta[idx],
+                state_prev[idx],
+                cfg,
+            )
+            out_list.append(out)
+            new_state_list.append(state)
+        return jnp.stack(out_list, axis=0), jnp.stack(new_state_list, axis=0)
 
-    for idx in range(cfg.seq_tile_size):
-        out, state = recurrent_gdn_per_seq(
-            q_compact[idx],
-            k_compact[idx],
-            k_compact_t[idx],
-            v_compact[idx],
-            gating_log[idx],
-            beta[idx],
-            state_prev[idx],
-            cfg,
-        )
-        out_list.append(out)
-        new_state_list.append(state)
+    q_rep = jnp.repeat(q_compact[:, :, :, 0, :], cfg.v_per_kq_head, axis=1)
+    k_rep = jnp.repeat(k_compact[:, :, :, 0, :], cfg.v_per_kq_head, axis=1)
+    k_t_rep = jnp.repeat(k_compact_t[:, :, :, :, 0], cfg.v_per_kq_head, axis=1)
 
-    out = jnp.stack(out_list, axis=0)
-    new_recurrent_state = jnp.stack(new_state_list, axis=0)
+    out_steps = []
+    state_steps = []
+    state = state_prev
 
+    for c_idx in range(cfg.chunk_size):
+        q_curr = jnp.expand_dims(q_rep[:, :, c_idx, :], axis=2)  # [B, n_v, 1, d_k]
+        k_curr = jnp.expand_dims(k_rep[:, :, c_idx, :], axis=2)  # [B, n_v, 1, d_k]
+        k_curr_t = jnp.expand_dims(k_t_rep[:, :, c_idx, :], axis=3)  # [B, n_v, d_k, 1]
+        v_curr = jnp.expand_dims(
+            v_compact[:, :, c_idx, 0, :], axis=2
+        )  # [B, n_v, 1, d_v]
+        beta_curr = beta[:, :, c_idx, 0, 0].reshape(b_size, n_v_heads, 1, 1)
+        gating_curr = gating_log[:, :, c_idx, 0, 0].reshape(b_size, n_v_heads, 1, 1)
+
+        # 1. State decay update
+        state_updated = state * gating_curr
+
+        # 2. Fused [k, q] projection against state_updated across all B sequences
+        kq_merged = jnp.concat([k_curr, q_curr], axis=2)  # [B, n_v, 2, d_k]
+        kq_merged_flat = kq_merged.reshape(-1, 2, cfg.kq_head_dim)
+        state_updated_flat = state_updated.reshape(-1, cfg.kq_head_dim, cfg.v_head_dim)
+
+        kq_proj_flat = jax.lax.dot_general(
+            kq_merged_flat,
+            state_updated_flat,
+            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        ).astype(cfg.dtypes.compute)  # [B * n_v, 2, d_v]
+        kq_proj = kq_proj_flat.reshape(b_size, n_v_heads, 2, cfg.v_head_dim)
+
+        v_updated = kq_proj[:, :, :1, :]
+        out_decayed = kq_proj[:, :, 1:, :]
+
+        # 3. Output difference via rank-1 identity:
+        #    q @ (S + k^T v_new) = q @ S + (q.k) v_new
+        v_diff = v_curr - v_updated
+        v_new = beta_curr * v_diff
+        qk_dot = jnp.sum(q_curr * k_curr, axis=-1, keepdims=True)  # [B, n_v, 1, 1]
+        out_step = out_decayed + qk_dot * v_new  # [B, n_v, 1, d_v]
+
+        # 4. State rank-1 update
+        state = state_updated + k_curr_t * v_new  # [B, n_v, d_k, d_v]
+
+        out_steps.append(out_step[:, :, 0, :])  # [B, n_v, d_v]
+        if c_idx >= cfg.chunk_size - cfg.window_size:
+            state_steps.append(state)
+
+    out = jnp.stack(out_steps, axis=1)  # [B, chunk_size, n_v, d_v]
+    new_recurrent_state = jnp.stack(
+        state_steps, axis=1
+    )  # [B, window_size, n_v, d_k, d_v]
     return out, new_recurrent_state
