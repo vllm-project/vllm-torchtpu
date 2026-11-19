@@ -1117,6 +1117,13 @@ class TPUModelRunner(GPUModelRunner):
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
+    # The decode carry (runner/decode_carry.py): whether its rule holds (set in
+    # __init__), the carried state, the last rejected counts read back, and the
+    # cached numpy view of the mrope positions.
+    _decode_carry_enabled: bool = False
+    _decode_carry_state: _decode_carry.CarryState | None = None
+    _decode_carry_rej: tuple[int | None, dict[str, int]] | None = None
+    _mrope_np_view: tuple[tuple[Any, ...], np.ndarray] | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -1202,6 +1209,31 @@ class TPUModelRunner(GPUModelRunner):
             )
             and self.speculative_config.draft_tensor_parallel_size != 1
             and not self._fence_spec_kv_under_token_copy
+        )
+
+    def _subtracts_with_draft_token_program(
+        self,
+        pending_rejected_sub: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        seq_lens: torch.Tensor,
+        cur_input_indices: np.ndarray,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        """Whether _prepare_inputs subtracts the previous step's rejected drafts
+        with the fused draft-token program (or its decode-carry form): rejected
+        counts are pending, the inputs are on TPU, every request's input ids
+        come from the device-resident source, and this step verifies drafts over
+        the whole token bucket. The decode carry keys on the same answer."""
+        if pending_rejected_sub is None:
+            return False
+        pre_async = self._pre_async_results
+        return (
+            seq_lens.device.type == "tpu"
+            and len(cur_input_indices) > 0
+            and pre_async is not None
+            and pre_async.next_tokens_tpu is not None
+            and spec_decode_metadata is not None
+            and spec_decode_metadata.final_logits_indices.shape[0]
+            == self.input_ids.shape[0]
         )
 
     def _defers_prev_rollback(
@@ -1494,6 +1526,9 @@ class TPUModelRunner(GPUModelRunner):
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
         self._fast_token_substitution: bool = fast_token_substitution_enabled(
             vllm_config
+        )
+        self._decode_carry_enabled = _decode_carry.rule_holds(
+            self.scheduler_config, vllm_config
         )
         if vllm_config.speculative_config is not None:
             logger.info(
@@ -5052,14 +5087,17 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     )
 
-        carry_recorded = False
-        if carry is not None and not _decode_carry.will_take_fused_draft_path(
+        # Decided once, before any re-upload below: an upload keeps the inputs on
+        # the device and input_ids at the same token bucket, so the answer holds.
+        draft_token_program = TPUModelRunner._subtracts_with_draft_token_program(
             self,
             pending_rejected_sub,
             seq_lens,
             cur_input_indices,
             spec_decode_metadata,
-        ):
+        )
+        carry_recorded = False
+        if carry is not None and not draft_token_program:
             # The early check assumed the fused draft-token path; it is not taken.
             seq_lens = _upload_seq_pos_ids()
             carry = None
@@ -5095,11 +5133,8 @@ class TPUModelRunner(GPUModelRunner):
                             use_subst_cache=True,
                         )
                     )
-                    if (
-                        spec_decode_metadata is not None
-                        and spec_decode_metadata.final_logits_indices.shape[0]
-                        == self.input_ids.shape[0]
-                    ):
+                    if draft_token_program:
+                        assert spec_decode_metadata is not None
                         if carry is not None:
                             from vllm_torchtpu.runner.tpu_runner_async_output import (
                                 _compiled_carry_subtract_and_substitute_draft_token_ids,

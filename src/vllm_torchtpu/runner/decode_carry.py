@@ -14,10 +14,9 @@
 """Steady-state device carry for async speculative decode.
 
 Every async-spec decode step uploads three small host arrays (input_ids, positions,
-seq_lens; ~0.3 ms of worker main-thread time per step at batch 1-2, measured), only for
-the fused subtract-and-substitute program to correct positions / seq_lens by the
-previous step's rejected-draft count and to overwrite every real input id from the
-device-resident draft source.
+seq_lens) from the worker's main thread, only for the fused subtract-and-substitute
+program to correct positions / seq_lens by the previous step's rejected-draft count
+and to overwrite every real input id from the device-resident draft source.
 
 In steady state (same requests in the same order, the same 1+K scheduled tokens each,
 a fused draft-token step last time too) the host's optimistic counts advance by
@@ -39,30 +38,37 @@ configuration it was measured on; every other engine keeps the uploads.
 from __future__ import annotations
 
 import itertools
-from typing import Any
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
+    from vllm.config import SchedulerConfig, VllmConfig
+
+    from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutPlan
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    from vllm_torchtpu.runner.tpu_runner_async_output import AsyncPreResults
 
 _SEQ = itertools.count(1)
 
 
-def enabled(runner: Any) -> bool:
-    """The carry's rule, decided once per runner: asynchronous scheduling,
-    max_num_seqs == 1, and a configuration a model-provided draft-path rule
-    covers (spec_decode/draft_path_rules.py)."""
-    cached = runner.__dict__.get("_decode_carry_enabled")
-    if cached is None:
-        from vllm_torchtpu.spec_decode import draft_path_rules
+def rule_holds(scheduler_config: SchedulerConfig, vllm_config: VllmConfig) -> bool:
+    """The carry's rule: asynchronous scheduling, max_num_seqs == 1, and a
+    configuration a model-provided draft-path rule covers
+    (spec_decode/draft_path_rules.py). The runner decides it once, in
+    __init__ (TPUModelRunner._decode_carry_enabled)."""
+    from vllm_torchtpu.spec_decode import draft_path_rules
 
-        sched = getattr(runner, "scheduler_config", None)
-        cached = bool(
-            sched is not None
-            and getattr(sched, "async_scheduling", False)
-            and getattr(sched, "max_num_seqs", 0) == 1
-            and draft_path_rules.holds(runner.vllm_config)
-        )
-        runner.__dict__["_decode_carry_enabled"] = cached
-    return cached
+    return bool(
+        scheduler_config.async_scheduling
+        and scheduler_config.max_num_seqs == 1
+        and draft_path_rules.holds(vllm_config)
+    )
+
+
+def enabled(runner: TPUModelRunner) -> bool:
+    return runner._decode_carry_enabled
 
 
 class CarryState:
@@ -71,13 +77,13 @@ class CarryState:
     target: int
     padded_total: int
     total: int
-    src_seq: Any
+    src_seq: int
     S: np.ndarray
     seq_pad: np.ndarray
     pos: np.ndarray
-    seq_lens: Any
-    positions: Any
-    input_ids: Any
+    seq_lens: torch.Tensor
+    positions: torch.Tensor
+    input_ids: torch.Tensor
     step_delta: int
 
     __slots__ = (
@@ -97,47 +103,51 @@ class CarryState:
     )
 
 
-def tag_results(runner: Any, results: Any) -> None:
+def tag_results(runner: TPUModelRunner, results: AsyncPreResults) -> None:
     """Number each AsyncPreResults, so a carry can tell which step's rejections
     it saw."""
-    if results is not None and enabled(runner):
-        results._decode_carry_seq = next(_SEQ)
+    if enabled(runner):
+        results.decode_carry_seq = next(_SEQ)
 
 
-def record_rejected(runner: Any, results: Any, rejected: dict[str, int]) -> None:
+def record_rejected(
+    runner: TPUModelRunner, results: AsyncPreResults, rejected: dict[str, int]
+) -> None:
     """Called by `_modify_prev_results` with the per-request rejected count it
     read back."""
-    runner._decode_carry_rej = (getattr(results, "_decode_carry_seq", None), rejected)
+    runner._decode_carry_rej = (results.decode_carry_seq, rejected)
 
 
-def clear(runner: Any) -> None:
-    runner.__dict__["_decode_carry_state"] = None
+def clear(runner: TPUModelRunner) -> None:
+    runner._decode_carry_state = None
 
 
 # The mrope position buffer is read through a cached numpy view of the whole
 # CPU tensor instead of a torch slice per call. Same values, same dtype.
 
 
-def _host_positions(runner: Any, total: int) -> np.ndarray:
+def _host_positions(runner: TPUModelRunner, total: int) -> np.ndarray:
     if runner.uses_mrope:
         cpu = runner.mrope_positions.cpu
-        cached = runner.__dict__.get("_mrope_np_view")
+        cached = runner._mrope_np_view
         key = (id(cpu), cpu.data_ptr(), tuple(cpu.shape), cpu.dtype)
         if cached is None or cached[0] != key:
             cached = (key, cpu.numpy())
-            runner.__dict__["_mrope_np_view"] = cached
+            runner._mrope_np_view = cached
         return np.asarray(cached[1][:, :total], dtype=np.int64)
     return np.asarray(runner.positions_np[:total], dtype=np.int64)
 
 
-def _layout_is_all(layout_plan: Any) -> bool:
+def _layout_is_all(layout_plan: SequenceLayoutPlan | None) -> bool:
+    """Whether the step's tokens use the ALL layout (every device holds the
+    whole chunk). None is the PCP plan's place, where the carry never runs."""
     from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 
-    return getattr(layout_plan, "kind", None) is SequenceLayoutKind.ALL
+    return layout_plan is not None and layout_plan.kind is SequenceLayoutKind.ALL
 
 
 def check(
-    runner: Any,
+    runner: TPUModelRunner,
     *,
     start_index: int,
     num_reqs: int,
@@ -145,36 +155,36 @@ def check(
     total_num_scheduled_tokens: int,
     padded_total_num_scheduled_tokens: int,
     target_num_reqs: int,
-    layout_plan: Any,
+    layout_plan: SequenceLayoutPlan | None,
 ) -> CarryState | None:
     """The carried state if this step may skip the uploads, else None."""
     if not enabled(runner):
         return None
-    st = runner.__dict__.get("_decode_carry_state")
     return _check(
         runner,
-        st,
-        start_index,
-        num_reqs,
-        num_scheduled_tokens_per_req_list,
-        total_num_scheduled_tokens,
-        padded_total_num_scheduled_tokens,
-        target_num_reqs,
-        layout_plan,
+        runner._decode_carry_state,
+        start_index=start_index,
+        num_reqs=num_reqs,
+        num_scheduled_tokens_per_req_list=num_scheduled_tokens_per_req_list,
+        total_num_scheduled_tokens=total_num_scheduled_tokens,
+        padded_total_num_scheduled_tokens=padded_total_num_scheduled_tokens,
+        target_num_reqs=target_num_reqs,
+        layout_plan=layout_plan,
     )
 
 
 def _check(
-    runner,
-    st,
-    start_index,
-    num_reqs,
-    nsched_list,
-    total,
-    padded_total,
-    target,
-    layout_plan,
-):
+    runner: TPUModelRunner,
+    st: CarryState | None,
+    *,
+    start_index: int,
+    num_reqs: int,
+    num_scheduled_tokens_per_req_list: list[int],
+    total_num_scheduled_tokens: int,
+    padded_total_num_scheduled_tokens: int,
+    target_num_reqs: int,
+    layout_plan: SequenceLayoutPlan | None,
+) -> CarryState | None:
     if st is None:
         return None
     pre = runner._pre_async_results
@@ -187,13 +197,13 @@ def _check(
         return None
     if start_index != 0 or num_reqs != runner.input_batch.num_reqs:
         return None
-    if getattr(runner, "_pcp_enabled", False) or not _layout_is_all(layout_plan):
+    if runner._pcp_enabled or not _layout_is_all(layout_plan):
         return None
     if (
-        total != st.total
-        or padded_total != st.padded_total
-        or target != st.target
-        or tuple(nsched_list) != st.nsched
+        total_num_scheduled_tokens != st.total
+        or padded_total_num_scheduled_tokens != st.padded_total
+        or target_num_reqs != st.target
+        or tuple(num_scheduled_tokens_per_req_list) != st.nsched
     ):
         return None
     req_ids = tuple(runner.input_batch.req_ids[:num_reqs])
@@ -202,7 +212,7 @@ def _check(
     mapped = pre.req_id_to_index_copy
     if any(r not in mapped for r in req_ids):
         return None
-    rec = runner.__dict__.get("_decode_carry_rej")
+    rec = runner._decode_carry_rej
     if rec is None or rec[0] is None or rec[0] != st.src_seq:
         return None
     rej = rec[1]
@@ -214,35 +224,20 @@ def _check(
     d_s = s_now - st.S
     if not np.all(d_s + r_prev == st.step_delta):
         return None
-    if not np.array_equal(np.asarray(runner.seq_lens_np[num_reqs:target]), st.seq_pad):
+    if not np.array_equal(
+        np.asarray(runner.seq_lens_np[num_reqs:target_num_reqs]), st.seq_pad
+    ):
         return None
-    pos_now = _host_positions(runner, total)
+    pos_now = _host_positions(runner, total_num_scheduled_tokens)
     if not np.array_equal(pos_now, st.pos + np.repeat(d_s, st.nsched)):
         return None
-    if int(st.input_ids.shape[0]) != padded_total:
+    if int(st.input_ids.shape[0]) != padded_total_num_scheduled_tokens:
         return None
     return st
 
 
-def will_take_fused_draft_path(
-    runner, pending_rejected_sub, seq_lens, cur_input_indices, spec_decode_metadata
-) -> bool:
-    """Mirror of `_prepare_inputs`' conditions for the fused draft-token
-    subtract path."""
-    return (
-        pending_rejected_sub is not None
-        and seq_lens.device.type == "tpu"
-        and getattr(runner, "max_num_reqs", None) is not None
-        and len(cur_input_indices) > 0
-        and runner._pre_async_results.next_tokens_tpu is not None
-        and spec_decode_metadata is not None
-        and spec_decode_metadata.final_logits_indices.shape[0]
-        == runner.input_ids.shape[0]
-    )
-
-
 def record(
-    runner: Any,
+    runner: TPUModelRunner,
     *,
     start_index: int,
     num_reqs: int,
@@ -250,15 +245,15 @@ def record(
     total_num_scheduled_tokens: int,
     padded_total_num_scheduled_tokens: int,
     target_num_reqs: int,
-    sub_pairs: Any,
-    seq_lens: Any,
+    sub_pairs: tuple[tuple[int | None, int], ...] | None,
+    seq_lens: torch.Tensor,
 ) -> bool:
     """After a fused draft-token subtract: keep its corrected device tensors
     for the next step."""
     if not enabled(runner):
         return False
     pre = runner._pre_async_results
-    src_seq = getattr(pre, "_decode_carry_seq", None) if pre is not None else None
+    src_seq = pre.decode_carry_seq if pre is not None else None
     if (
         src_seq is None
         or start_index != 0
@@ -266,7 +261,7 @@ def record(
         or sub_pairs is None
         or len(sub_pairs) != num_reqs
         or any(p is None for p, _ in sub_pairs)
-        or getattr(runner, "_pcp_enabled", False)
+        or runner._pcp_enabled
         or not _layout_is_all(runner._last_sequence_layout_plan)
     ):
         return False
@@ -283,6 +278,7 @@ def record(
     st.seq_lens = seq_lens
     st.positions = runner.position_ids
     st.input_ids = runner.input_ids
+    assert runner.speculative_config is not None
     st.step_delta = 1 + int(runner.speculative_config.num_speculative_tokens)
-    runner.__dict__["_decode_carry_state"] = st
+    runner._decode_carry_state = st
     return True

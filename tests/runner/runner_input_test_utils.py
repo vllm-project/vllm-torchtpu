@@ -155,6 +155,8 @@ def _make_runner(
     )
     runner._dp_target_bucket = None
     runner._has_mamba_state = False
+    # The decode carry's rule (decided in __init__) does not hold here.
+    runner._decode_carry_enabled = False
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True
     runner._pp_is_last = True
@@ -395,6 +397,7 @@ def _make_sample_runner(
         _tp_rank0_mask=None,
         _fence_spec_kv_under_token_copy=False,
         _is_dspark_pd_producer=False,
+        _decode_carry_enabled=False,
         is_pooling_model=False,
         max_num_reqs=max_num_reqs,
         num_tokens_paddings=[16, 32, 64, 128],

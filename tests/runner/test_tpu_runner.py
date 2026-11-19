@@ -4392,6 +4392,7 @@ class TestAsyncSpecDecodeTokenAccounting:
     def _setup_runner(self, max_num_reqs=4, max_model_len=64):
         runner = MagicMock()
         runner.max_model_len = max_model_len
+        runner._decode_carry_enabled = False
         runner.input_batch = SimpleNamespace(
             token_ids_cpu=np.zeros((max_num_reqs, max_model_len), dtype=np.int32),
             num_tokens_no_spec=np.zeros((max_num_reqs,), dtype=np.int32),
@@ -4846,6 +4847,7 @@ def test_flush_keeps_zero_token_async_results_until_waited():
             req_id_to_index_copy={},
             copy_state=copy_state,
         ),
+        _decode_carry_enabled=False,
     )
     # A flush that rolls back calls self._modify_prev_results().
     runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
