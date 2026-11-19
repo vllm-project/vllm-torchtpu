@@ -53,20 +53,17 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 )
 RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY = "raiden_telemetry_backends"
 
-# Launch topology of a single-host multi-port DP server: each engine compiles
-# the same programs as under internal-LB DP.
-MULTIPORT_DP_ADDITIONAL_CONFIG_KEY = tpu_multiport_dp.SECTION
-
-# Knobs that never change the compiled graph (the profiling and telemetry
-# diagnostics above and the multi-port launch topology), so
+# Knobs that never change the compiled graph, so
 # `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU
-# compile cache key.
+# compile cache key: the profiling and telemetry diagnostics above, and the
+# single-host multi-port DP launch topology, under which each engine compiles
+# the same programs as under internal-LB DP.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
         RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY,
-        MULTIPORT_DP_ADDITIONAL_CONFIG_KEY,
+        tpu_multiport_dp.SECTION,
     }
 )
 
