@@ -953,6 +953,82 @@ def test_config_path_honors_quantization_ignore_list() -> None:
     assert kv_only_profile.expert_dtype == "fp8"
 
 
+def test_config_path_resolves_to_matching_preset(tmp_path: Path) -> None:
+    """Verify config file and directory paths resolve to matching shipped presets."""
+    snapshots = _load_config_snapshots()
+    config_files: dict[str, Path] = {}
+    for index, (preset_name, snapshot_payload) in enumerate(snapshots.items()):
+        checkpoint_dir = tmp_path / f"checkpoint-{index}"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        config_file = checkpoint_dir / "config.json"
+        config_file.write_text(json.dumps(snapshot_payload["config"]), encoding="utf-8")
+        config_files[preset_name] = config_file
+        assert advisor.resolve_model_profile(str(config_file)).name == preset_name
+        assert (
+            advisor.resolve_model_profile(str(config_file.parent)).name == preset_name
+        )
+
+    workload = advisor.WorkloadSpec(
+        phase="decode", batch=1, context=4096, tp=32, ep=32, dcp=32
+    )
+    config_profile = advisor.resolve_model_profile(str(config_files["kimi-k3"]))
+    config_report = advisor.advise(config_profile, workload, chip="tpu7x")
+    preset_report = advisor.advise("kimi-k3", workload, chip="tpu7x")
+    config_whole_step = next(
+        scope_estimate
+        for scope_estimate in config_report.scopes
+        if scope_estimate.scope == "whole_step"
+    )
+    preset_whole_step = next(
+        scope_estimate
+        for scope_estimate in preset_report.scopes
+        if scope_estimate.scope == "whole_step"
+    )
+    assert config_whole_step.support == "declared"
+    assert config_whole_step.support == preset_whole_step.support
+    assert config_whole_step.step_achievable_us == preset_whole_step.step_achievable_us
+
+    dict_profile = advisor.resolve_model_profile(snapshots["kimi-k3"]["config"])
+    assert dict_profile.name == "kimi-k3"
+    dict_report = advisor.advise(dict_profile, workload, chip="tpu7x")
+    dict_whole_step = next(
+        scope_estimate
+        for scope_estimate in dict_report.scopes
+        if scope_estimate.scope == "whole_step"
+    )
+    assert dict_whole_step.support == "declared"
+    assert dict_whole_step.step_achievable_us == preset_whole_step.step_achievable_us
+
+    requantized_kimi = copy.deepcopy(snapshots["kimi-k3"]["config"])
+    assert isinstance(requantized_kimi, dict)
+    text_config = requantized_kimi["text_config"]
+    assert isinstance(text_config, dict)
+    quant_config = text_config["quantization_config"]
+    assert isinstance(quant_config, dict)
+    quant_config["format"] = "nvfp4-pack-quantized"
+    config_groups = quant_config["config_groups"]
+    assert isinstance(config_groups, dict)
+    group_zero = config_groups["group_0"]
+    assert isinstance(group_zero, dict)
+    group_zero["format"] = "nvfp4-pack-quantized"
+
+    neutral_dir = tmp_path / "neutral-checkpoint"
+    neutral_dir.mkdir(parents=True, exist_ok=True)
+    neutral_file = neutral_dir / "config.json"
+    neutral_file.write_text(json.dumps(requantized_kimi), encoding="utf-8")
+    requantized_profile = advisor.resolve_model_profile(str(neutral_file))
+    assert requantized_profile.expert_dtype == "nvfp4"
+    assert models.match_preset_by_geometry(requantized_profile) is None
+    assert requantized_profile.name != "kimi-k3"
+    requantized_report = advisor.advise(requantized_profile, workload, chip="tpu7x")
+    requantized_whole_step = next(
+        scope_estimate
+        for scope_estimate in requantized_report.scopes
+        if scope_estimate.scope == "whole_step"
+    )
+    assert requantized_whole_step.support != "declared"
+
+
 def test_declared_blocks_cite_openable_source() -> None:
     """Verify each declared source_ref is a repo file, https URL, or unpublished."""
     seen_blocks = 0
