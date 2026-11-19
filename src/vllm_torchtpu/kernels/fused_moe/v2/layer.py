@@ -244,14 +244,12 @@ _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
 
-def rebalance_ep_tp_pair_experts(
-    pairs_g, local_blocks, block_hist, rows_by_dest, *, ep, ep_tp_size, g_local, e_total
-):
-    """Balance paired (j, j + g_local) experts across ep_tp=2 via VPU bitmask."""
-    g_shift = g_local.bit_length() - 1
-    chip_shift = g_shift + 1
-    n_chips = ep // ep_tp_size
-    counts_2 = rows_by_dest.sum(axis=0).reshape(n_chips, 2, g_local)
+TP_PAIR_MAX_ROW_SPLITS = 4
+TP_PAIR_VISIT_FLOOR_TILES = 2.4
+
+
+def _ep_tp_pair_flip_mask(counts_2):
+    """Return alternating-parity swap mask [n_chips, g_local] for paired experts."""
     c0, c1 = counts_2[:, 0, :], counts_2[:, 1, :]
     hi = jnp.maximum(c0, c1)
     lo = jnp.minimum(c0, c1)
@@ -261,18 +259,190 @@ def rebalance_ep_tp_pair_experts(
     pair_rank = jnp.argsort(jnp.argsort(-pair_key, axis=1, stable=True), axis=1).astype(
         jnp.int32
     )
-    flip = jnp.where((pair_rank & 1) == 0, c1 > c0, c0 > c1)
-    n_pairs = n_chips * g_local
+    return jnp.where((pair_rank & 1) == 0, c1 > c0, c0 > c1)
+
+
+def _pack_flip_words(flip):
+    n_pairs = flip.size
     n_words = (n_pairs + 31) // 32
     flip_pad = jnp.pad(
         flip.reshape(-1).astype(jnp.uint32), (0, n_words * 32 - n_pairs)
     ).reshape(n_words, 32)
     bit_weights = jnp.left_shift(jnp.uint32(1), jnp.arange(32, dtype=jnp.uint32))
-    words = jnp.sum(flip_pad * bit_weights[None, :], axis=1, dtype=jnp.uint32)
+    return jnp.sum(flip_pad * bit_weights[None, :], axis=1, dtype=jnp.uint32)
 
-    def _remap_ids(ids):
-        # Avoid 1D dynamic LUT gather over T*topk pairs: XLA offloads it to
-        # SparseCore and adds ~438us/layer overhead on uniform routing.
+
+def _select_by_chip(chip_idx, per_chip_vals, n_chips):
+    # Avoid 1D dynamic LUT gather over T*topk pairs: XLA offloads it to
+    # SparseCore, whereas a small unrolled chip select stays on the VPU.
+    val = per_chip_vals[0]
+    for ci in range(1, n_chips):
+        val = jnp.where(chip_idx == jnp.int32(ci), per_chip_vals[ci], val)
+    return val
+
+
+def _choose_ep_tp_row_splits(counts_chip, *, g_local, k_split, capacity):
+    """Pick per-chip split count ks in [0, k_split] minimizing lockstep tiles."""
+    n_chips = counts_chip.shape[0]
+    top_order = jnp.argsort(-counts_chip, axis=1, stable=True).astype(jnp.int32)
+    split_phys = top_order[:, :k_split]
+    split_rows = jnp.take_along_axis(counts_chip, split_phys, axis=1)
+    phys_idx = jnp.arange(2 * g_local, dtype=jnp.int32)[None, :]
+    min_split_rows = jnp.int32(2 * capacity)
+    k_arange = jnp.arange(k_split, dtype=jnp.int32)[None, :]
+    floor_tiles = jnp.float32(TP_PAIR_VISIT_FLOOR_TILES)
+
+    def _tile_cost(rows):
+        tiles = ((rows + jnp.int32(capacity - 1)) // jnp.int32(capacity)).astype(
+            jnp.float32
+        )
+        return jnp.where(rows > 0, jnp.maximum(tiles, floor_tiles), jnp.float32(0.0))
+
+    costs = []
+    for ks in range(k_split + 1):
+        act = (k_arange < jnp.int32(ks)) & (split_rows >= min_split_rows)
+        is_sp = jnp.any(
+            (phys_idx[:, :, None] == split_phys[:, None, :]) & act[:, None, :],
+            axis=-1,
+        )
+        rem_2 = jnp.where(is_sp, jnp.int32(0), counts_chip).reshape(n_chips, 2, g_local)
+        fl = _ep_tp_pair_flip_mask(rem_2)
+        c0_rem = jnp.where(fl, rem_2[:, 1, :], rem_2[:, 0, :])
+        c1_rem = jnp.where(fl, rem_2[:, 0, :], rem_2[:, 1, :])
+        h0 = jnp.where(act, (split_rows + jnp.int32(1)) // jnp.int32(2), jnp.int32(0))
+        h1 = jnp.where(act, split_rows // jnp.int32(2), jnp.int32(0))
+        v0 = jnp.sort(jnp.concatenate([c0_rem, h0], axis=1), axis=1)[:, ::-1]
+        v1 = jnp.sort(jnp.concatenate([c1_rem, h1], axis=1), axis=1)[:, ::-1]
+        # Tiny tie-break favors fewer splits when lockstep cost is identical.
+        step_cost = jnp.sum(
+            jnp.maximum(_tile_cost(v0), _tile_cost(v1)), axis=1
+        ) + jnp.float32(1e-4 * ks)
+        costs.append(step_cost)
+
+    best_ks = jnp.argmin(jnp.stack(costs, axis=0), axis=0).astype(jnp.int32)
+    split_active = (k_arange < best_ks[:, None]) & (split_rows >= min_split_rows)
+    is_split_phys = jnp.any(
+        (phys_idx[:, :, None] == split_phys[:, None, :]) & split_active[:, None, :],
+        axis=-1,
+    )
+    rem_2 = jnp.where(is_split_phys, jnp.int32(0), counts_chip).reshape(
+        n_chips, 2, g_local
+    )
+    flip = _ep_tp_pair_flip_mask(rem_2)
+    return split_phys, split_active, is_split_phys, flip
+
+
+def _resolve_ep_tp_row_splits(
+    *,
+    ep_tp_size,
+    has_bias,
+    g_local,
+    n_tokens,
+    topk,
+    ep,
+    capacity,
+    user_ragged_stride,
+    ep_tp_row_splits,
+):
+    if ep_tp_size != 2 or has_bias or g_local <= 0 or (g_local & (g_local - 1)) != 0:
+        return 0
+    if ep_tp_row_splits is None:
+        if n_tokens < 2 * capacity:
+            return 0
+        candidate = min(TP_PAIR_MAX_ROW_SPLITS, g_local)
+    else:
+        candidate = min(max(int(ep_tp_row_splits), 0), g_local)
+    if candidate <= 0:
+        return 0
+    split_stride = ragged_stride_bound(
+        n_tokens, topk, ep * (g_local + candidate), capacity
+    )
+    if user_ragged_stride is not None and user_ragged_stride < split_stride:
+        return 0
+    return candidate
+
+
+def rebalance_ep_tp_pair_experts(
+    pairs_g,
+    local_blocks,
+    block_hist,
+    rows_by_dest,
+    *,
+    ep,
+    ep_tp_size,
+    g_local,
+    e_total,
+    k_split=0,
+    capacity=128,
+    me=None,
+    t_local=None,
+    topk=None,
+):
+    """Balance paired experts and optionally split hot experts 50/50 across ep_tp=2."""
+    g_shift = g_local.bit_length() - 1
+    chip_shift = g_shift + 1
+    n_chips = ep // ep_tp_size
+    counts_chip = rows_by_dest.sum(axis=0).reshape(n_chips, 2 * g_local)
+
+    if k_split <= 0:
+        flip = _ep_tp_pair_flip_mask(counts_chip.reshape(n_chips, 2, g_local))
+        words = _pack_flip_words(flip)
+        n_words = words.shape[0]
+
+        def _remap_ids(ids):
+            # Avoid 1D dynamic LUT gather over T*topk pairs: XLA offloads it to
+            # SparseCore and adds ~438us/layer overhead on uniform routing.
+            pair_idx = jnp.bitwise_or(
+                jnp.left_shift(jnp.right_shift(ids, chip_shift), g_shift),
+                jnp.bitwise_and(ids, jnp.int32(g_local - 1)),
+            )
+            word_idx = jnp.right_shift(pair_idx, 5)
+            bit_idx = jnp.bitwise_and(pair_idx, jnp.int32(31)).astype(jnp.uint32)
+            w = words[0]
+            for wi in range(1, n_words):
+                w = jnp.where(word_idx == jnp.int32(wi), words[wi], w)
+            bit = jnp.bitwise_and(jnp.right_shift(w, bit_idx), jnp.uint32(1))
+            do_flip = jnp.where(
+                (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total)),
+                bit.astype(jnp.int32),
+                jnp.int32(0),
+            )
+            return jnp.bitwise_xor(ids, jnp.left_shift(do_flip, g_shift))
+
+        def _swap_hist(h):
+            h4 = h.reshape(h.shape[0], n_chips, 2, g_local)
+            return jnp.where(flip[None, :, None, :], h4[:, :, ::-1, :], h4).reshape(
+                h.shape
+            )
+
+        base_phys = jnp.broadcast_to(
+            jnp.arange(2 * g_local, dtype=jnp.int32).reshape(1, 2, g_local),
+            (n_chips, 2, g_local),
+        )
+        tp_slot_to_local_phys = jnp.where(
+            flip[:, None, :], base_phys[:, ::-1, :], base_phys
+        ).reshape(n_chips, 2 * g_local)
+        return (
+            _remap_ids(pairs_g),
+            _remap_ids(local_blocks),
+            _swap_hist(block_hist),
+            _swap_hist(rows_by_dest),
+            tp_slot_to_local_phys,
+        )
+
+    assert me is not None and t_local is not None and topk is not None
+    g_plan = g_local + k_split
+    e_plan = ep * g_plan
+    split_phys, split_active, is_split_phys, flip = _choose_ep_tp_row_splits(
+        counts_chip, g_local=g_local, k_split=k_split, capacity=capacity
+    )
+    words = _pack_flip_words(flip)
+    n_words = words.shape[0]
+    chip_base = jnp.arange(n_chips, dtype=jnp.int32)[:, None] * jnp.int32(2 * g_local)
+    split_match = jnp.where(split_active, chip_base + split_phys, jnp.int32(-1))
+
+    def _remap_with_splits(ids, tok_par):
+        valid = (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total))
         pair_idx = jnp.bitwise_or(
             jnp.left_shift(jnp.right_shift(ids, chip_shift), g_shift),
             jnp.bitwise_and(ids, jnp.int32(g_local - 1)),
@@ -283,31 +453,88 @@ def rebalance_ep_tp_pair_experts(
         for wi in range(1, n_words):
             w = jnp.where(word_idx == jnp.int32(wi), words[wi], w)
         bit = jnp.bitwise_and(jnp.right_shift(w, bit_idx), jnp.uint32(1))
-        do_flip = jnp.where(
-            (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total)),
-            bit.astype(jnp.int32),
-            jnp.int32(0),
-        )
-        return jnp.bitwise_xor(ids, jnp.left_shift(do_flip, g_shift))
+        do_flip = jnp.where(valid, bit.astype(jnp.int32), jnp.int32(0))
+        swapped = jnp.bitwise_xor(ids, jnp.left_shift(do_flip, g_shift))
+        core = jnp.right_shift(swapped, g_shift)
+        slot = jnp.bitwise_and(swapped, jnp.int32(g_local - 1))
+        log_id = core * jnp.int32(g_plan) + slot
+        ch = jnp.right_shift(ids, chip_shift)
+        hits = []
+        for k in range(k_split):
+            s_k = _select_by_chip(ch, split_match[:, k], n_chips)
+            hit_k = valid & (ids == s_k)
+            dst_k = (jnp.left_shift(ch, 1) + tok_par) * jnp.int32(g_plan) + jnp.int32(
+                g_local + k
+            )
+            log_id = jnp.where(hit_k, dst_k, log_id)
+            hits.append(hit_k)
+        # Avoid leaving masked rows at e_total: e_total is now a live virtual
+        # expert slot, so shift non-negative out-of-range sentinels to e_plan.
+        sentinel = jnp.where(ids >= jnp.int32(e_total), jnp.int32(e_plan), ids)
+        return jnp.where(valid, log_id, sentinel), hits
 
-    def _swap_hist(h):
-        h4 = h.reshape(h.shape[0], n_chips, 2, g_local)
-        return jnp.where(flip[None, :, None, :], h4[:, :, ::-1, :], h4).reshape(h.shape)
+    n_tokens = pairs_g.size // topk
+    global_par = jnp.broadcast_to(
+        (jnp.arange(n_tokens, dtype=jnp.int32) & jnp.int32(1))[:, None],
+        (n_tokens, topk),
+    ).reshape(pairs_g.shape)
+    local_tok_par = (
+        (jnp.arange(t_local, dtype=jnp.int32) + me * jnp.int32(t_local)) & jnp.int32(1)
+    )[:, None]
+    local_par = jnp.broadcast_to(local_tok_par, (t_local, topk)).reshape(
+        local_blocks.shape
+    )
+    new_pairs, global_hits = _remap_with_splits(pairs_g, global_par)
+    new_local, local_hits = _remap_with_splits(local_blocks, local_par)
+
+    is_sp_flat = is_split_phys.reshape(e_total)
+
+    def _swap_rem_4d(h):
+        h_rem = jnp.where(is_sp_flat[None, :], jnp.int32(0), h)
+        h4 = h_rem.reshape(h.shape[0], n_chips, 2, g_local)
+        return jnp.where(flip[None, :, None, :], h4[:, :, ::-1, :], h4)
+
+    def _count_split_hist(ids_2d, hits_list, par_2d):
+        ch_2d = jnp.right_shift(ids_2d, chip_shift)
+        chip_masks = [ch_2d == jnp.int32(ci) for ci in range(n_chips)]
+        par0 = par_2d == jnp.int32(0)
+        par1 = ~par0
+        cols = []
+        for hk in hits_list:
+            h0 = hk & par0
+            h1 = hk & par1
+            c0 = jnp.stack(
+                [(h0 & cm).sum(axis=1, dtype=jnp.int32) for cm in chip_masks], axis=1
+            )
+            c1 = jnp.stack(
+                [(h1 & cm).sum(axis=1, dtype=jnp.int32) for cm in chip_masks], axis=1
+            )
+            cols.append(jnp.stack([c0, c1], axis=2))
+        return jnp.stack(cols, axis=3)
+
+    bh_sp = _count_split_hist(local_blocks, local_hits, local_par)
+    rbd_sp = _count_split_hist(
+        pairs_g.reshape(ep, t_local * topk),
+        [gh.reshape(ep, t_local * topk) for gh in global_hits],
+        global_par.reshape(ep, t_local * topk),
+    )
+    new_bh = jnp.concatenate([_swap_rem_4d(block_hist), bh_sp], axis=3).reshape(
+        block_hist.shape[0], e_plan
+    )
+    new_rbd = jnp.concatenate([_swap_rem_4d(rows_by_dest), rbd_sp], axis=3).reshape(
+        ep, e_plan
+    )
 
     base_phys = jnp.broadcast_to(
         jnp.arange(2 * g_local, dtype=jnp.int32).reshape(1, 2, g_local),
         (n_chips, 2, g_local),
     )
-    tp_slot_to_local_phys = jnp.where(
-        flip[:, None, :], base_phys[:, ::-1, :], base_phys
-    ).reshape(n_chips, 2 * g_local)
-    return (
-        _remap_ids(pairs_g),
-        _remap_ids(local_blocks),
-        _swap_hist(block_hist),
-        _swap_hist(rows_by_dest),
-        tp_slot_to_local_phys,
-    )
+    orig_phys = jnp.where(flip[:, None, :], base_phys[:, ::-1, :], base_phys)
+    split_phys_both = jnp.broadcast_to(split_phys[:, None, :], (n_chips, 2, k_split))
+    tp_slot_to_local_phys = jnp.concatenate(
+        [orig_phys, split_phys_both], axis=2
+    ).reshape(n_chips, 2 * g_plan)
+    return new_pairs, new_local, new_bh, new_rbd, tp_slot_to_local_phys
 
 
 def fused_ep_moe_v2(
@@ -339,6 +566,7 @@ def fused_ep_moe_v2(
     token_replica_groups=None,
     wire_dtype=None,
     ep_tp_size=1,
+    ep_tp_row_splits=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -496,7 +724,24 @@ def fused_ep_moe_v2(
     t_local = token_layout.local_rows
     T = ep * t_local
     P = jax.sharding.PartitionSpec
-    stride_bound = ragged_stride_bound(T, topk, e_total, capacity)
+    has_w1_bias = w1_bias is not None
+    has_w2_bias = w2_bias is not None
+    if ep_tp_size > 1 and (has_w1_bias or has_w2_bias):
+        raise NotImplementedError("ep_tp_size > 1 does not support expert biases")
+    k_split = _resolve_ep_tp_row_splits(
+        ep_tp_size=ep_tp_size,
+        has_bias=has_w1_bias or has_w2_bias,
+        g_local=g_local,
+        n_tokens=T,
+        topk=topk,
+        ep=ep,
+        capacity=capacity,
+        user_ragged_stride=ragged_stride,
+        ep_tp_row_splits=ep_tp_row_splits,
+    )
+    g_plan = g_local + k_split
+    e_plan = ep * g_plan
+    stride_bound = ragged_stride_bound(T, topk, e_plan, capacity)
     if ragged_stride is None:
         ragged_stride = stride_bound
     if block is None:
@@ -512,10 +757,6 @@ def fused_ep_moe_v2(
             f"{stride_bound}, so one shard's slab could bleed into the "
             f"next. Pass {stride_bound} or more."
         )
-    has_w1_bias = w1_bias is not None
-    has_w2_bias = w2_bias is not None
-    if ep_tp_size > 1 and (has_w1_bias or has_w2_bias):
-        raise NotImplementedError("ep_tp_size > 1 does not support expert biases")
     has_score_bias = score_bias is not None
     has_hash_ids = hash_topk_ids is not None
     if scoring_fn not in SCORING_FNS:
@@ -537,7 +778,7 @@ def fused_ep_moe_v2(
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
     kfn = build_fused_ep_moe_kernel(
-        g_local=g_local,
+        g_local=g_plan,
         capacity=capacity,
         hidden=hidden,
         inter=inter,
@@ -694,6 +935,11 @@ def fused_ep_moe_v2(
                 ep_tp_size=ep_tp_size,
                 g_local=g_local,
                 e_total=e_total,
+                k_split=k_split,
+                capacity=capacity,
+                me=me,
+                t_local=t_local,
+                topk=topk,
             )
         gathered = GatheredPairs(
             expert_blocks=pairs_g.reshape(T * topk // block, block),
@@ -705,7 +951,7 @@ def fused_ep_moe_v2(
         )
 
         plan_kw = dict(
-            e_total=e_total,
+            e_total=e_plan,
             ep=ep,
             t_local=t_local,
             block=block,
@@ -719,9 +965,9 @@ def fused_ep_moe_v2(
         else:
             routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
         block_tables = shard_transport_tables_in_blocks(
-            routing, me, e_total=e_total, ep=ep
+            routing, me, e_total=e_plan, ep=ep
         )
-        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
+        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_plan, ep=ep)
         # Both slab tables scatter onto this shard's own slab. The rows of
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
@@ -769,8 +1015,8 @@ def fused_ep_moe_v2(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
-        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
+        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_plan, ep=ep)
+        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_plan, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
         bias_it = operands
@@ -785,14 +1031,14 @@ def fused_ep_moe_v2(
             tp_grp = lax.div(me, jnp.int32(ep_tp_size))
             grp_rows = lax.dynamic_slice(
                 routing.expert_rows_aligned,
-                (tp_grp * ep_tp_size * g_local,),
-                (ep_tp_size * g_local,),
-            ).reshape(ep_tp_size, g_local)
+                (tp_grp * ep_tp_size * g_plan,),
+                (ep_tp_size * g_plan,),
+            ).reshape(ep_tp_size, g_plan)
             tp_order = jnp.argsort(-grp_rows, axis=1, stable=True).astype(jnp.int32)
             sorted_rows = jnp.take_along_axis(grp_rows, tp_order, axis=1)
             active_step = (sorted_rows.max(axis=0, keepdims=True) > 0).astype(jnp.int32)
             if tp_slot_to_local_phys is not None:
-                chip_phys = tp_slot_to_local_phys[tp_grp].reshape(ep_tp_size, g_local)
+                chip_phys = tp_slot_to_local_phys[tp_grp].reshape(ep_tp_size, g_plan)
                 tp_phys_order = jnp.take_along_axis(chip_phys, tp_order, axis=1)
                 visit = jnp.concatenate([tp_order, active_step, tp_phys_order], axis=0)
             else:
@@ -802,7 +1048,7 @@ def fused_ep_moe_v2(
             visit = visit_1d[None, :]
         # One pass builds every count the kernel needs, still spread over
         # the expert-parallel axis; the kernel's scalar core closes them.
-        counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
+        counts = shard_count_vector(routing, expert_rows, me, e_total=e_plan, ep=ep)
 
         # The kernel takes four of the seven transport tables and one of the
         # three push tables. The two totals are rows of `counts`, and three
@@ -923,6 +1169,7 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         None if wire_dtype is None else jnp.dtype(wire_dtype),
         ep_tp_size,
+        k_split,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

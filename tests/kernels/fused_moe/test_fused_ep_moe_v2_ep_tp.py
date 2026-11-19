@@ -646,3 +646,330 @@ def test_should_match_reference_under_skewed_routing_and_two_hop_commits(wire_dt
         np.dot(got.ravel(), ref.ravel()) / (np.linalg.norm(got) * np.linalg.norm(ref))
     )
     assert cos > 0.9985, cos
+
+
+def test_should_split_skewed_ep_tp_experts_and_keep_balanced_noop():
+    # n_chips * g_local = 64 exercises the multi-word (n_words=2) VPU bitmask.
+    ep, ep_tp_size, g_local, k_split, topk, t_local, capacity = 8, 2, 16, 2, 4, 128, 128
+    n_tokens = ep * t_local
+    e_total = ep * g_local
+    g_plan = g_local + k_split
+    e_plan = ep * g_plan
+    block = host_mod.routing_block(t_local, topk)
+    stride = host_mod.ragged_stride_bound(n_tokens, topk, e_plan, capacity)
+    blocks_per_dest = (t_local * topk) // block
+
+    rng = np.random.default_rng(19)
+    pairs = rng.integers(0, e_total, size=(n_tokens, topk), dtype=np.int32)
+    # Chip 0: single dominant expert (~970 rows = 8 tiles) -> splitting halves it.
+    pairs[: int(n_tokens * 0.95), 0] = 1
+    # Chip 1: two equal heavy experts on opposite cores -> skip splitting.
+    pairs[: int(n_tokens * 0.45), 1] = 2 * g_local
+    pairs[int(n_tokens * 0.45) : int(n_tokens * 0.90), 1] = 2 * g_local + g_local
+    pairs[-2:, :] = e_total
+    pairs_2d = jnp.asarray(pairs.reshape(ep, t_local * topk))
+    pairs_flat = pairs_2d.reshape(-1)
+
+    all_bh = []
+    rbd_rows = []
+    for r in range(ep):
+        lb = pairs_2d[r].reshape(blocks_per_dest, block)
+        bh = host_mod.pair_block_hist(lb, e_total)
+        all_bh.append(bh)
+        rbd_rows.append(bh.sum(axis=0))
+    rows_by_dest = jnp.stack(rbd_rows, axis=0)
+
+    ref_pairs = ref_rbd = ref_phys = None
+    for r in (0, 1, ep - 1):
+        lb = pairs_2d[r].reshape(blocks_per_dest, block)
+        new_p, new_l, new_bh, new_rbd, slot_phys = (
+            layer_mod.rebalance_ep_tp_pair_experts(
+                pairs_2d,
+                lb,
+                all_bh[r],
+                rows_by_dest,
+                ep=ep,
+                ep_tp_size=ep_tp_size,
+                g_local=g_local,
+                e_total=e_total,
+                k_split=k_split,
+                capacity=capacity,
+                me=jnp.int32(r),
+                t_local=t_local,
+                topk=topk,
+            )
+        )
+        assert new_p.shape == pairs_2d.shape
+        if ref_pairs is None:
+            ref_pairs, ref_rbd, ref_phys = new_p, new_rbd, slot_phys
+        else:
+            assert np.array_equal(np.asarray(new_p), np.asarray(ref_pairs))
+            assert np.array_equal(np.asarray(new_rbd), np.asarray(ref_rbd))
+            assert np.array_equal(np.asarray(slot_phys), np.asarray(ref_phys))
+        expected_bh = host_mod.pair_block_hist(new_l, e_plan)
+        assert np.array_equal(np.asarray(new_bh), np.asarray(expected_bh))
+        assert np.array_equal(np.asarray(new_bh.sum(axis=0)), np.asarray(new_rbd[r]))
+
+        gathered = host_mod.GatheredPairs(
+            expert_blocks=new_p.reshape(n_tokens * topk // block, block),
+            local_blocks=new_l,
+            block_hist=new_bh,
+            rows_by_dest=new_rbd,
+            n_tokens=n_tokens,
+            topk=topk,
+        )
+        rt_sh = host_mod.build_routing_tables_sharded(
+            None,
+            jnp.int32(r),
+            gathered=gathered,
+            e_total=e_plan,
+            ep=ep,
+            t_local=t_local,
+            block=block,
+            tile_m=capacity,
+            shard_stride=stride,
+        )
+        rt_full = host_mod.build_routing_tables(
+            new_p.reshape(n_tokens, topk),
+            e_total=e_plan,
+            ep=ep,
+            t_local=t_local,
+            block=block,
+            tile_m=capacity,
+            shard_stride=stride,
+        )
+        assert np.array_equal(
+            np.asarray(rt_sh.pos),
+            np.asarray(rt_full.arrival_row[r * t_local : (r + 1) * t_local]),
+        )
+        assert np.array_equal(
+            np.asarray(rt_sh.mirror_pos),
+            np.asarray(rt_full.mirror_row[r * t_local : (r + 1) * t_local]),
+        )
+
+    assert ref_pairs is not None and ref_rbd is not None and ref_phys is not None
+    orig_np = np.asarray(pairs_flat)
+    new_np = np.asarray(ref_pairs).reshape(-1)
+    phys_np = np.asarray(ref_phys)
+    for orig_id, remapped in zip(orig_np, new_np):
+        o_i, n_i = int(orig_id), int(remapped)
+        if o_i == e_total:
+            assert n_i == e_plan
+        else:
+            chip = o_i // (2 * g_local)
+            assert n_i // (2 * g_plan) == chip
+            assert int(phys_np[chip, n_i % (2 * g_plan)]) == o_i % (2 * g_local)
+
+    chip0_counts = np.asarray(ref_rbd).sum(axis=0)[: 2 * g_plan].reshape(2, g_plan)
+    assert int(chip0_counts[0, g_local]) > 400
+    assert int(chip0_counts[1, g_local]) > 400
+    chip1_counts = (
+        np.asarray(ref_rbd).sum(axis=0)[2 * g_plan : 4 * g_plan].reshape(2, g_plan)
+    )
+    assert int(chip1_counts[:, g_local:].sum()) == 0
+
+    bal_pairs = jnp.asarray(np.arange(n_tokens * topk, dtype=np.int32) % e_total)
+    lb0 = bal_pairs[: t_local * topk].reshape(blocks_per_dest, block)
+    bh0 = host_mod.pair_block_hist(lb0, e_total)
+    rbd_bal = jnp.stack(
+        [
+            host_mod.pair_block_hist(
+                bal_pairs[r * t_local * topk : (r + 1) * t_local * topk].reshape(
+                    blocks_per_dest, block
+                ),
+                e_total,
+            ).sum(axis=0)
+            for r in range(ep)
+        ],
+        axis=0,
+    )
+    _, _, _, rbd_bal_new, _ = layer_mod.rebalance_ep_tp_pair_experts(
+        bal_pairs,
+        lb0,
+        bh0,
+        rbd_bal,
+        ep=ep,
+        ep_tp_size=ep_tp_size,
+        g_local=g_local,
+        e_total=e_total,
+        k_split=k_split,
+        capacity=capacity,
+        me=jnp.int32(0),
+        t_local=t_local,
+        topk=topk,
+    )
+    virtual_counts = (
+        np.asarray(rbd_bal_new).sum(axis=0).reshape(ep, g_plan)[:, g_local:]
+    )
+    assert int(virtual_counts.sum()) == 0
+
+
+def test_should_expand_virtual_slots_for_large_ep_tp_and_honor_explicit_stride():
+    x, w1, w2, w1s, w2s, gate, mesh = _dummy_ep_tp_operands(
+        ep=4, ep_tp_size=2, g_local=2, rows=64, hidden=512, inter=256
+    )
+
+    class _StopAfterBuild(RuntimeError):
+        pass
+
+    captured = {}
+
+    def _capture(**kw):
+        captured.clear()
+        captured.update(kw)
+        raise _StopAfterBuild
+
+    with (
+        patch.object(layer_mod, "build_fused_ep_moe_kernel", side_effect=_capture),
+        pytest.raises(_StopAfterBuild),
+    ):
+        fused_ep_moe_v2(
+            x,
+            w1,
+            w2,
+            w1s,
+            w2s,
+            gate,
+            topk=2,
+            renormalize=True,
+            mesh=mesh,
+            capacity=128,
+            ep_tp_size=2,
+        )
+    assert captured["g_local"] == 4
+
+    # When an explicit ragged_stride is smaller than the split-slot bound,
+    # virtual row-split slots must stay off instead of tripping stride validation.
+    x_lg, w1_lg, w2_lg, w1s_lg, w2s_lg, gate_lg, mesh_lg = _dummy_ep_tp_operands(
+        ep=8, ep_tp_size=2, g_local=16, rows=64, hidden=512, inter=256
+    )
+    base_stride = host_mod.ragged_stride_bound(8 * 64, 4, 8 * 16, 128)
+    split_stride = host_mod.ragged_stride_bound(8 * 64, 4, 8 * 20, 128)
+    assert base_stride < split_stride
+    with (
+        patch.object(layer_mod, "build_fused_ep_moe_kernel", side_effect=_capture),
+        pytest.raises(_StopAfterBuild),
+    ):
+        fused_ep_moe_v2(
+            x_lg,
+            w1_lg,
+            w2_lg,
+            w1s_lg,
+            w2s_lg,
+            gate_lg,
+            topk=4,
+            renormalize=True,
+            mesh=mesh_lg,
+            capacity=128,
+            ragged_stride=base_stride,
+            ep_tp_size=2,
+        )
+    assert captured["g_local"] == 16
+
+    with (
+        patch.object(layer_mod, "build_fused_ep_moe_kernel", side_effect=_capture),
+        pytest.raises(_StopAfterBuild),
+    ):
+        fused_ep_moe_v2(
+            x,
+            w1,
+            w2,
+            w1s,
+            w2s,
+            gate,
+            topk=2,
+            renormalize=True,
+            mesh=mesh,
+            capacity=128,
+            ep_tp_size=2,
+            ep_tp_row_splits=0,
+        )
+    assert captured["g_local"] == 2
+
+
+def test_should_trace_sharded_ep_tp_row_split_end_to_end():
+    ep, ep_tp_size, g_local, rows, hidden, inter, topk, cap = (
+        4,
+        2,
+        4,
+        128,
+        512,
+        256,
+        4,
+        128,
+    )
+    mesh = jax.sharding.AbstractMesh((ep,), ("ep",))
+    sh = jax.sharding.NamedSharding(mesh, P("ep"))
+    x = jax.ShapeDtypeStruct((ep * rows, hidden), jnp.bfloat16, sharding=sh)
+    w1 = jax.ShapeDtypeStruct(
+        (ep * ep_tp_size * g_local, hidden, inter), jnp.float8_e4m3fn, sharding=sh
+    )
+    w2 = jax.ShapeDtypeStruct(
+        (ep * ep_tp_size * g_local, inter // ep_tp_size, hidden),
+        jnp.float8_e4m3fn,
+        sharding=sh,
+    )
+    w1s = jax.ShapeDtypeStruct(
+        (ep * ep_tp_size * g_local, inter), jnp.float32, sharding=sh
+    )
+    w2s = jax.ShapeDtypeStruct(
+        (ep * ep_tp_size * g_local, hidden), jnp.float32, sharding=sh
+    )
+    gate = jax.ShapeDtypeStruct((ep * rows, ep * g_local), jnp.float32, sharding=sh)
+    rank = jax.ShapeDtypeStruct((ep, 1), jnp.int32, sharding=sh)
+    captured_visit_shape: list[tuple[int, ...]] = []
+
+    def _stub_kernel(**kw):
+        # Hardware-only Pallas boundary stub so shard_map(local_fn) traces
+        # _unpack_routing_exchange -> rebalance -> routing -> combine.
+        g_plan = kw["g_local"]
+
+        def _call(*args, recv_rows, visit, counts, rank):
+            del args, counts, rank
+            captured_visit_shape.append(tuple(visit.shape))
+            n_recv_scl = recv_rows // cap + 2 * ep * g_plan
+            return (
+                jnp.zeros((recv_rows, hidden // 128, 128), dtype=jnp.float8_e4m3fn),
+                jnp.zeros((n_recv_scl, 128), dtype=jnp.float32),
+            )
+
+        return _call
+
+    def _stub_combine(**kw):
+        del kw
+        return lambda *args: jnp.zeros((rows, hidden), dtype=jnp.bfloat16)
+
+    with (
+        patch.object(layer_mod, "build_fused_ep_moe_kernel", side_effect=_stub_kernel),
+        patch.object(layer_mod, "build_combine_kernel", side_effect=_stub_combine),
+    ):
+        out = jax.eval_shape(
+            lambda x_a, w1_a, w2_a, w1s_a, w2s_a, g_a, r_a: fused_ep_moe_v2(
+                x_a,
+                w1_a,
+                w2_a,
+                w1s_a,
+                w2s_a,
+                g_a,
+                topk=topk,
+                renormalize=True,
+                mesh=mesh,
+                capacity=cap,
+                rank=r_a,
+                sharded_plan=True,
+                scoring_fn="sigmoid",
+                ep_tp_size=ep_tp_size,
+                ep_tp_row_splits=2,
+            ),
+            x,
+            w1,
+            w2,
+            w1s,
+            w2s,
+            gate,
+            rank,
+        )
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
+    # visit has ep_tp_size + 1 + ep_tp_size = 5 rows and g_local + 2 = 6 cols.
+    assert captured_visit_shape == [(5, 6)]
