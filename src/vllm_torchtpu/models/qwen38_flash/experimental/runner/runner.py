@@ -229,7 +229,7 @@ class SinkStageTiming(RunnerStageTiming):
     """`RunnerStageTiming` that records only when a KV connector can report
     the samples (#2723)."""
 
-    def __init__(self, rank: int | str):
+    def __init__(self, rank: int):
         super().__init__(rank)
         # Whether a KV connector exists to report samples through.
         self._sink = False
@@ -286,7 +286,7 @@ class Qwen38Runner(TPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # #2723: stage timings are recorded only with a KV connector sink.
-        self._stage_timing = SinkStageTiming(self._stage_timing._rank)
+        self._stage_timing = SinkStageTiming(int(self._stage_timing._rank))
 
     def load_model(self) -> None:
         super().load_model()
