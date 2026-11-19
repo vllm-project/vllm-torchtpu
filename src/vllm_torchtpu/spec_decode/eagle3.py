@@ -44,7 +44,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.runner import fast_forward_context as _ffc
 from vllm_torchtpu.runner import host_trims
-from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -618,7 +617,7 @@ class Eagle3Proposer:
         num_tokens = input_ids.shape[0]
         with (
             set_model_tag("eagle_head"),
-            (fast_set_forward_context if _ffc.enabled() else set_forward_context)(
+            (_ffc.fast_set_forward_context if _ffc.enabled() else set_forward_context)(
                 attn_metadata,
                 self.draft_vllm_config,
                 num_tokens=num_tokens,
@@ -2077,7 +2076,7 @@ class Eagle3Proposer:
         model = self._draft_model_for_step(step_idx)
         with (
             set_model_tag("eagle_head"),
-            (fast_set_forward_context if _ffc.enabled() else set_forward_context)(
+            (_ffc.fast_set_forward_context if _ffc.enabled() else set_forward_context)(
                 attn_metadata,
                 self.draft_vllm_config,
                 num_tokens=num_tokens,
