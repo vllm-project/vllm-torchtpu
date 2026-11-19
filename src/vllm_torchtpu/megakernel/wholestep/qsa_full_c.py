@@ -353,6 +353,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         each(lambda d: d.wait_send())
 
     # ------------------------------------------- visible-chunk selection (`select_nvis`)
+    def _nvis_route(self, nv: Any, cut: int, ranged: Any, full: Any) -> Any:
+        """`ranged()` when `nv` (scalar visible groups) <= `cut`, else `full()` (the original
+        full-row scan): both exact, so the choice only moves time. `cut` >= max_groups:
+        always ranged (no branch)."""
+        if cut >= self.max_groups:
+            return ranged()
+        return jax.lax.cond(nv <= cut, ranged, full)
+
     def _nvis_plan(self, ctx: Any, nv: Any, CH: int) -> tuple:
         """(count, base row of chunk i) of the `CH`-row score chunks holding groups < `nv`
         (scalar), in score-position order: under `compressed_dcp` rank 0's half's visible
@@ -749,9 +757,18 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     nv_h = jnp.where(rid_h == i, ctx.extra[NVIS][lo + o + i], nv_h)
                 ids_h = ids[:h]
                 if self.nvis_thr:
+                    nvm = nv_max(lo + o, h)
+
+                    def full_h() -> Any:
+                        sc = pltpu.bitcast(
+                            scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32
+                        )
+                        return ix.thresholds(jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G)
+
                     with ctx.stream.sc("qsa_thr", 2):
-                        thr, tmax = self._nvis_thresholds(
-                            ctx, s0 + o, h, nv_h, nv_max(lo + o, h)
+                        thr, tmax = self._nvis_route(
+                            nvm, self.nvis_cut,
+                            lambda: self._nvis_thresholds(ctx, s0 + o, h, nv_h, nvm), full_h,
                         )
                 else:
                     sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32)
@@ -772,8 +789,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     ]
                     ctx.comm.exchange(xs)
             elif self.nvis_thr:
+                nvm = nv_max(lo, n)
+
+                def full_n() -> Any:
+                    sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
+                    return ix.thresholds(jnp.where(ids < nv, sc, -1), ids, nv, K, G)
+
                 with ctx.stream.sc("qsa_thr", 2):
-                    thr, tmax = self._nvis_thresholds(ctx, s0, n, nv, nv_max(lo, n))
+                    thr, tmax = self._nvis_route(
+                        nvm, self.nvis_cut,
+                        lambda: self._nvis_thresholds(ctx, s0, n, nv, nvm), full_n,
+                    )
                 scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
                 scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             else:
@@ -798,9 +824,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             def row(r: Any, carry: Any) -> Any:
                 if self.nvis_cmp:
                     ga = ctx.extra[CTXQ][r // T] // 4
-                    pos, sga, kept = self._nvis_row(ctx, r, lo, s0, ga, nconsts)
-                    scr["qc_sga"][r] = sga
+
+                    def ranged() -> Any:
+                        pos, sga, kept = self._nvis_row(ctx, r, lo, s0, ga, nconsts)
+                        scr["qc_sga"][r] = sga
+                        return pos, kept
+
+                    pos, kept = self._nvis_route(
+                        ctx.extra[NVIS][r], self.nvis_cut, ranged, lambda: full_row(r)
+                    )
                     return tail(r, pos, kept, carry)
+                return tail(r, *full_row(r), carry)
+
+            def full_row(r: Any) -> Any:
                 nvr = scr["qi_nv"][r][:, :1]
                 ga = ctx.extra[CTXQ][r // T] // 4
                 b = jnp.where(
@@ -831,7 +867,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
                     jnp.zeros((1, 1), I32) + kept, K, consts,
                 )
-                return tail(r, pos, kept, carry)
+                return pos, kept
 
             def tail(r: Any, pos: Any, kept: Any, carry: Any) -> Any:
                 scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
@@ -864,10 +900,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     # Under `compressed_dcp` both pair ranks hold the request: each builds only
                     # its own union (the one it attends), and `_exchange_unions` sends it to the
                     # ranks of the same pair rank.
-                    for r in [jax.lax.rem(ctx.me, D)] if cdcp else range(D):
-                        if self.select_nvis_union:
-                            self._nvis_union(ctx, lo, r, KU, D, gpp, nv_max(lo, T))
-                            continue
+                    def full_union(r: Any) -> None:
                         code = code_all if D == 1 else jnp.where(
                             jax.lax.rem(gidx // gpp, D) == r, code_all, 0
                         )
@@ -878,6 +911,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         scr["qu_id"][lo // T, :, pl.ds(at, KU)] = ids
                         scr["qu_cd"][lo // T, :, pl.ds(at, KU)] = codes
                         scr["qu_n"][lo // T, r] = jnp.sum(nu)
+
+                    for r in [jax.lax.rem(ctx.me, D)] if cdcp else range(D):
+                        if self.select_nvis_union:
+                            nvm = nv_max(lo, T)
+                            self._nvis_route(
+                                nvm, self.nvis_ucut,
+                                lambda r=r, nvm=nvm: self._nvis_union(ctx, lo, r, KU, D, gpp, nvm),
+                                lambda r=r: full_union(r),
+                            )
+                            continue
+                        full_union(r)
         self.load_tables(ctx, l)
         npr = self._shard_rows(ex)[0] if self.shard_index else nreq
         c_off = jax.lax.rem(ctx.me, self.dcp) * (NC // self.dcp) if cdcp else 0
