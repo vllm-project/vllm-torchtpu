@@ -16,14 +16,19 @@
 from __future__ import annotations
 
 import html
+from typing import TYPE_CHECKING
 
 from .assets import load_asset
 from .constants import VALID_MESH_AXIS_VALUES
+from .specs import SUPPORT_TIER_DESCRIPTIONS
 from .workbench_engine import render_workbench_engine_js
 from .workbench_phase import (
     render_phase_extension_js,
     render_phase_stage_tab_button,
 )
+
+if TYPE_CHECKING:
+    from .specs import AdvisorSweepReport
 
 
 def _esc_attr(value: object) -> str:
@@ -74,19 +79,52 @@ def render_workbench_css() -> str:
     return load_asset("workbench.css")
 
 
+def _render_tier_and_sublayer_html(
+    sweep: AdvisorSweepReport,
+) -> tuple[str, str]:
+    """Return escaped support-tier pill and decode sublayer label HTML spans."""
+    escaped_tier = _esc_attr(sweep.support_tier)
+    escaped_description = _esc_attr(SUPPORT_TIER_DESCRIPTIONS[sweep.support_tier])
+    escaped_sublayer = _esc_attr(sweep.submodule_labels.get("decode", ""))
+    tier_html = (
+        f'<span class="wb-tier-pill" id="wb-support-tier" '
+        f'title="{escaped_description}">{escaped_tier}</span>'
+    )
+    sublayer_html = f'<span id="wb-sublayer-label">{escaped_sublayer}</span>'
+    return (tier_html, sublayer_html)
+
+
+def _render_unmodeled_notes_html(
+    sweep: AdvisorSweepReport,
+) -> str:
+    """Return collapsible unmodeled-notes details HTML when the sweep has notes."""
+    if not sweep.unmodeled_notes:
+        return ""
+    items = "".join(f"<li>{_esc_attr(note)}</li>" for note in sweep.unmodeled_notes)
+    return (
+        '<details id="wb-unmodeled-notes">'
+        f"<summary>Not modeled ({len(sweep.unmodeled_notes)})</summary>"
+        f"<ul>{items}</ul>"
+        "</details>"
+    )
+
+
 def render_workbench_body(
     *,
     model_name: str,
     chip_name: str,
     layout_label: str,
     mode_source: str,
+    sweep: AdvisorSweepReport,
     vmem_bounds_mib: tuple[float, float] = (62.0, 62.0),
 ) -> str:
     """Render the 3-pane Fusion Workbench HTML shell."""
     tabs_html = render_phase_stage_tab_button()
     vmem_init, vmem_max = vmem_bounds_mib
-    model_escaped, chip_escaped = _esc_attr(model_name), _esc_attr(chip_name)
-    layout_escaped, source_escaped = _esc_attr(layout_label), _esc_attr(mode_source)
+    m_e, c_e = _esc_attr(model_name), _esc_attr(chip_name)
+    l_e, s_e = _esc_attr(layout_label), _esc_attr(mode_source)
+    tier_html, sublayer_html = _render_tier_and_sublayer_html(sweep)
+    notes_html = _render_unmodeled_notes_html(sweep)
     phases = tuple((p, p) for p in ("decode", "verify", "prefill", "mixed"))
     dma_o, al_o = (("2", "2 slots"), ("3", "3 slots")), (("1", "on"), ("0", "off"))
     hw_fn = "wbOnHwControl()"
@@ -103,7 +141,7 @@ def render_workbench_body(
         + "</div>"
     )
     pair_wl = _sknob("phase", "Phase", "decode", phases, "wbOnPhaseChange()") + _sknob(
-        "layout", "Parallelism", layout_escaped, (), "wbOnLayoutPresetChange()"
+        "layout", "Parallelism", l_e, (), "wbOnLayoutPresetChange()"
     )
     mesh_drawer = (
         '<details class="wb-eta-details" id="wb-mesh-details">'
@@ -209,10 +247,10 @@ def render_workbench_body(
         )
     )
     return f"""  <header class="wb-topbar" id="wb-topbar"><div class="wb-brand">
-  <h1>Megakernel Fusion Workbench &middot; {model_escaped}</h1><div class="wb-sub">Chip:
-  <strong>{chip_escaped}</strong> &middot; Mesh:
-  <strong id="wb-active-layout">{layout_escaped}</strong>
-  ({source_escaped})</div></div><div class="wb-verdict-wrap">
+  <h1>Megakernel Fusion Workbench &middot; {m_e}</h1><div class="wb-sub">Chip:
+  <strong>{c_e}</strong> &middot; Mesh: <strong id="wb-active-layout">{l_e}</strong>
+  ({s_e}) {sublayer_html} {tier_html}{notes_html}</div></div>
+  <div class="wb-verdict-wrap">
   <span class="wb-verdict-pill" id="wb-verdict-pill">BUILD WHOLE_STEP</span>
   <div class="wb-verdict-meta tabular" id="wb-verdict-summary">-</div></div>
   <div class="wb-top-kpis">{kpis}</div><div class="wb-actions">
