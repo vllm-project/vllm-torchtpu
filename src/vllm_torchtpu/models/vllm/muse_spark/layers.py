@@ -17,8 +17,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
-
 
 class MuseRMSNorm(nn.Module):
     def __init__(
@@ -69,24 +67,6 @@ class MuseResidual(nn.Module):
         beta = torch.sigmoid(w)
         alpha = torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1 + beta), min=1e-3))
         return (alpha * stream + beta * branch).to(stream.dtype)
-
-
-def route_experts(
-    logits: torch.Tensor,
-    bias: torch.Tensor,
-    *,
-    top_k: int,
-    multiplier: float,
-    scoring: str,
-    eps: float | None,
-    route_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    logits = logits.float() * multiplier
-    scores = logits.sigmoid() if scoring == "sigmoid" else logits.softmax(dim=-1)
-    _, ids = rowmax_select(scores + bias.float(), top_k)
-    weights = scores.gather(-1, ids.long())
-    weights = weights / (weights.sum(dim=-1, keepdim=True) + (eps or 0.0))
-    return weights * route_scale, ids
 
 
 def selected_expert_outputs(

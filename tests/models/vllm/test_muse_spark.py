@@ -26,7 +26,6 @@ from vllm_torchtpu.models.vllm.muse_spark.layers import (
     MuseRMSNorm,
     MuseRotaryEmbedding,
     attention_layout,
-    route_experts,
     selected_expert_outputs,
 )
 from vllm_torchtpu.models.vllm.muse_spark.weights import (
@@ -177,20 +176,26 @@ def test_residual_gate_preserves_fp32_stream():
 
 
 def test_router_bias_affects_selection_but_not_contribution():
-    logits = torch.tensor([[2.0, -2.0, 1.0, 0.0]])
-    bias = torch.tensor([-1.0, 1.0, 0.0, 0.0])
-    weights, ids = route_experts(
-        logits,
-        bias,
-        top_k=2,
-        multiplier=0.5,
-        scoring="sigmoid",
-        eps=0.1,
-        route_scale=1.7,
-    )
+    from vllm_torchtpu.models.vllm.muse_spark.model import MuseMoE
+
+    class Gate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer(
+                "e_score_correction_bias", torch.tensor([-1.0, 1.0, 0.0, 0.0])
+            )
+            self.routed_scaling_factor = 1.7
+            self.use_grouped_topk = False
+
+        def forward(self, x):
+            return torch.tensor([[2.0, -2.0, 1.0, 0.0]]), None
+
+    moe = SimpleNamespace(gate=Gate(), multiplier=0.5, top_k=2)
+    weights, ids = MuseMoE.route(moe, torch.zeros(1, 4, dtype=torch.bfloat16))
     assert ids.tolist() == [[1, 2]]
+    assert weights.dtype == torch.float32
     scores = [1 / (1 + math.exp(1)), 1 / (1 + math.exp(-0.5))]
-    expected = torch.tensor([[v / (sum(scores) + 0.1) * 1.7 for v in scores]])
+    expected = torch.tensor([[v / sum(scores) * 1.7 for v in scores]])
     torch.testing.assert_close(weights, expected)
 
 
@@ -668,15 +673,7 @@ def test_ep_normalizes_each_expert_before_weighted_reduction(monkeypatch):
         count = 32 // ep
         moe.experts.gate_up_proj.copy_(w13[rank * count : (rank + 1) * count])
         moe.experts.down_proj.copy_(w2[rank * count : (rank + 1) * count])
-        weights, ids = route_experts(
-            moe.gate(x.float())[0],
-            bias,
-            top_k=4,
-            multiplier=moe.multiplier,
-            scoring=moe.scoring,
-            eps=moe.division_eps,
-            route_scale=moe.route_scale,
-        )
+        weights, ids = moe.route(x)
         rows = selected_expert_outputs(x, ids, w13, w2)
         normalized = moe.experts.post_expert_norm(rows, out_dtype=torch.float32)
         expected = (normalized * weights[..., None]).sum(1)
@@ -764,15 +761,7 @@ def test_dp_attention_returns_only_local_tokens(monkeypatch):
             moe.experts.to(torch.bfloat16)
             moe.experts.gate_up_proj.copy_(w13[rank * count : (rank + 1) * count])
             moe.experts.down_proj.copy_(w2[rank * count : (rank + 1) * count])
-        weights, ids = route_experts(
-            x.float() @ router.T,
-            moe.gate.e_score_correction_bias,
-            top_k=4,
-            multiplier=moe.multiplier,
-            scoring=moe.scoring,
-            eps=moe.division_eps,
-            route_scale=moe.route_scale,
-        )
+        weights, ids = moe.route(x)
         rows = moe.experts.post_expert_norm(
             selected_expert_outputs(x, ids, w13, w2), out_dtype=torch.float32
         )

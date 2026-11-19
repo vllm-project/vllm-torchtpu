@@ -41,6 +41,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 from vllm_torchtpu.logger import init_logger
@@ -50,7 +51,6 @@ from .layers import (
     MuseRMSNorm,
     MuseRotaryEmbedding,
     attention_layout,
-    route_experts,
     selected_expert_outputs,
 )
 from .weights import (
@@ -199,9 +199,6 @@ class MuseMoE(nn.Module):
         self.dp_size = self.dp_group.world_size if self.dp_group is not None else 1
         self.top_k = config.num_experts_per_tok
         self.multiplier = config.output_multiplier
-        self.scoring = "sigmoid"
-        self.division_eps = 1e-15
-        self.route_scale = config.routed_scaling_factor
         dense = VllmUnquantizedConfig()
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -215,6 +212,9 @@ class MuseMoE(nn.Module):
             "e_score_correction_bias",
             torch.zeros(config.num_local_experts, dtype=torch.float32),
         )
+        # Read by moe_routing.select_experts.
+        self.gate.routed_scaling_factor = config.routed_scaling_factor
+        self.gate.use_grouped_topk = False
         hidden = config.moe_hidden_size
         self.pre_expert_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -246,17 +246,20 @@ class MuseMoE(nn.Module):
             hidden, config.post_norm_eps, zero_centered=True, weight_first=True
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """FP32 routing weights and int32 expert ids for each token."""
         logits, _ = self.gate(x.float())
-        weights, ids = route_experts(
-            logits,
-            cast(torch.Tensor, self.gate.e_score_correction_bias),
-            top_k=self.top_k,
-            multiplier=self.multiplier,
-            scoring=self.scoring,
-            eps=self.division_eps,
-            route_scale=self.route_scale,
+        return moe_routing.select_experts(
+            x.float(),
+            logits * self.multiplier,
+            topk=self.top_k,
+            renormalize=True,
+            scoring_fn="sigmoid",
+            layer=self.gate,
         )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights, ids = self.route(x)
         x, _ = self.pre_expert_proj(x)
         x = self.pre_expert_norm(x)
         if self.dp_size > 1:
