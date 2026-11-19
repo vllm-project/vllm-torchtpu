@@ -243,3 +243,231 @@ def all_reduce(x: jax.Array, me: jax.Array, tab: np.ndarray, exchange: Exchange)
     full = lax.dynamic_update_slice_in_dim(full, half, core * hh, axis=1)
     full = lax.dynamic_update_slice_in_dim(full, sib_half, (1 - core) * hh, axis=1)
     return full[:rows]
+
+
+# --------------------------------------------------------------------------
+# v1: the same algorithm with the glue in Pallas. Every chunk is addressed by
+# a scalar-prefetched column-block index in a BlockSpec index_map (no dynamic
+# slices, no 4-D views), quantize / dequantize / add run per 256-row tile, and
+# the all-gather writes each chunk in place.
+_TILE = 256
+
+
+def _quant_tile(a):
+    r, w = a.shape
+    b = a.reshape(r // QROWS, QROWS, w)
+    s = jnp.max(jnp.abs(b), axis=1) / 127.0
+    s = jnp.where(s == 0, 1.0, s)
+    q = jnp.clip(jnp.round(b / s[:, None, :]), -127.0, 127.0)
+    return q.reshape(r, w).astype(I8), s
+
+
+def _deq_tile(q, s):
+    r, w = q.shape
+    return (q.astype(F32).reshape(r // QROWS, QROWS, w) * s[:, None, :]).reshape(r, w)
+
+
+@functools.cache
+def _step_call(t: int, h: int, w: int, with_prev: bool):
+    """(x, recv, [q_cw, s_cw, q_cc, s_cc]) -> q/s of (x_chunk + recv_chunk
+    [+ deq(prev)]) for both directions. blk = [x block cw, x block cc, recv
+    block cw, recv block cc] in units of w columns."""
+    sr = _TILE // QROWS
+
+    def kernel(blk_ref, *refs):
+        if with_prev:
+            x_cw, x_cc, r_cw, r_cc, pq_cw, ps_cw, pq_cc, ps_cc = refs[:8]
+            outs = refs[8:]
+        else:
+            x_cw, x_cc, r_cw, r_cc = refs[:4]
+            outs = refs[4:]
+        q_cw, s_cw, q_cc, s_cc = outs
+        a_cw = x_cw[...].astype(F32) + r_cw[...].astype(F32)
+        a_cc = x_cc[...].astype(F32) + r_cc[...].astype(F32)
+        if with_prev:
+            a_cw = a_cw + _deq_tile(pq_cw[...], ps_cw[...])
+            a_cc = a_cc + _deq_tile(pq_cc[...], ps_cc[...])
+        q_cw[...], s_cw[...] = _quant_tile(a_cw)
+        q_cc[...], s_cc[...] = _quant_tile(a_cc)
+
+    tile = lambda j: pl.BlockSpec((_TILE, w), lambda i, blk: (i, blk[j]))
+    qspec = pl.BlockSpec((_TILE, w), lambda i, blk: (i, 0))
+    sspec = pl.BlockSpec((sr, w), lambda i, blk: (i, 0))
+    in_specs = [tile(0), tile(1), tile(2), tile(3)]
+    if with_prev:
+        in_specs += [qspec, sspec, qspec, sspec]
+    q_shape = jax.ShapeDtypeStruct((t, w), I8)
+    s_shape = jax.ShapeDtypeStruct((t // QROWS, w), F32)
+    return pl.pallas_call(
+        kernel,
+        out_shape=(q_shape, s_shape, q_shape, s_shape),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(t // _TILE,),
+            in_specs=in_specs,
+            out_specs=[qspec, sspec, qspec, sspec],
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name=f"qar_step-t_{t}-w_{w}-prev_{int(with_prev)}",
+    )
+
+
+@functools.cache
+def _put_call(t: int, w: int):
+    """Dequantize q/s of both directions into blocks blk[0] / blk[1] of the
+    per-direction halves [t, 4w], in place."""
+    sr = _TILE // QROWS
+
+    def kernel(blk_ref, q_cw, s_cw, q_cc, s_cc, h_cw_in, h_cc_in, h_cw, h_cc):
+        del h_cw_in, h_cc_in
+        h_cw[...] = _deq_tile(q_cw[...], s_cw[...]).astype(BF16)
+        h_cc[...] = _deq_tile(q_cc[...], s_cc[...]).astype(BF16)
+
+    qspec = pl.BlockSpec((_TILE, w), lambda i, blk: (i, 0))
+    sspec = pl.BlockSpec((sr, w), lambda i, blk: (i, 0))
+    hspec = lambda j: pl.BlockSpec((_TILE, w), lambda i, blk: (i, blk[j]))
+    half = jax.ShapeDtypeStruct((t, 4 * w), BF16)
+    return pl.pallas_call(
+        kernel,
+        out_shape=(half, half),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(t // _TILE,),
+            in_specs=[qspec, sspec, qspec, sspec, hspec(0), hspec(1)],
+            out_specs=[hspec(0), hspec(1)],
+        ),
+        input_output_aliases={5: 0, 6: 1},  # operand index counts the prefetch arg
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name=f"qar_put-t_{t}-w_{w}",
+    )
+
+
+@functools.cache
+def _d2d_rs_call(t: int, h: int):
+    """x [t, h] -> the sibling's column half (1 - its core) of x, bf16 [t, h/2]:
+    each core sends x[:, (1 - core) * h/2 :] straight from x."""
+    hh = h // 2
+
+    def kernel(rank_ref, tab_ref, x_ref, o_ref, send_sem, recv_sem):
+        me = rank_ref[0]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(_N):
+            pl.semaphore_signal(barrier, 1, device_id=(d,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, _N)
+        off = pl.multiple_of((1 - tab_ref[CORE, me]) * hh, 128)
+        copy = pltpu.make_async_remote_copy(
+            x_ref.at[:, pl.ds(off, hh)],
+            o_ref,
+            send_sem.at[0],
+            recv_sem.at[0],
+            device_id=(tab_ref[SIB, me],),
+            device_id_type=_MESH,
+        )
+        copy.start()
+        copy.wait_recv()
+        copy.wait_send()
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((t, hh), BF16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[_HBM],
+            out_specs=_HBM,
+            scratch_shapes=[pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,))],
+        ),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        name=f"qar_d2d_rs-t_{t}-h_{h}",
+    )
+
+
+@functools.cache
+def _d2d_ag_call(t: int, h: int):
+    """Halves h_cw, h_cc [t, h/4] -> full [t, h]: each core writes its two
+    quarters at columns core * h/2 (+ h/4) of its own and its sibling's output."""
+    hh, hq = h // 2, h // 4
+
+    def kernel(rank_ref, tab_ref, h_cw, h_cc, o_ref, send_sem, recv_sem, local_sem):
+        me = rank_ref[0]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(_N):
+            pl.semaphore_signal(barrier, 1, device_id=(d,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, _N)
+        base = tab_ref[CORE, me] * hh
+        sib = tab_ref[SIB, me]
+        copies, locals_ = [], []
+        for j, src in enumerate((h_cw, h_cc)):
+            dst = o_ref.at[:, pl.ds(pl.multiple_of(base + j * hq, 128), hq)]
+            copy = pltpu.make_async_remote_copy(
+                src, dst, send_sem.at[j], recv_sem.at[j], device_id=(sib,), device_id_type=_MESH
+            )
+            copy.start()
+            copies.append(copy)
+            local = pltpu.make_async_copy(src, dst, local_sem.at[j])
+            local.start()
+            locals_.append(local)
+        for c in locals_:
+            c.wait()
+        for c in copies:
+            c.wait_recv()
+        for c in copies:
+            c.wait_send()
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((t, h), BF16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[_HBM, _HBM],
+            out_specs=_HBM,
+            scratch_shapes=[pltpu.SemaphoreType.DMA((2,))] * 3,
+        ),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        name=f"qar_d2d_ag-t_{t}-h_{h}",
+    )
+
+
+def all_reduce_v1(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
+    """v1 of `all_reduce` (TPU only): same algorithm and bits, glue in Pallas."""
+    rows, h = x.shape
+    hh = h // 2
+    if h % (2 * 2 * 4 * 128):
+        raise ValueError(f"hidden {h} must split into 16 lane-aligned chunks")
+    w = hh // 8
+    t = padded_rows(rows)
+    if t != rows:
+        x = jnp.pad(x, ((0, t - rows), (0, 0)))
+    tab_j = jnp.asarray(tab)
+    rank = me.reshape(1).astype(jnp.int32)
+    me = rank[0]
+    core = tab_j[CORE, me]
+    pos = tab_j[POS, me]
+    exchange = pallas_exchange(rank, tab)
+    recv = _d2d_rs_call(t, h)(rank, tab_j, x)
+
+    def blocks(k_cw, k_cc):
+        # x column blocks (units of w): core*8 + d*4 + k; recv: d*4 + k.
+        k_cw, k_cc = k_cw % 4, k_cc % 4
+        return jnp.stack([core * 8 + k_cw, core * 8 + 4 + k_cc, k_cw, 4 + k_cc]).astype(jnp.int32)
+
+    q_cw, s_cw, q_cc, s_cc = _step_call(t, h, w, False)(blocks(pos, pos), x, x, recv, recv)
+    for i in range(3):
+        prev = exchange([q_cw, s_cw, q_cc, s_cc], [CW_NEXT, CW_NEXT, CW_PREV, CW_PREV])
+        q_cw, s_cw, q_cc, s_cc = _step_call(t, h, w, True)(
+            blocks(pos - i - 1, pos + i + 1), x, x, recv, recv, *prev
+        )
+    h_cw = jnp.zeros((t, 4 * w), BF16)
+    h_cc = jnp.zeros((t, 4 * w), BF16)
+    put = _put_call(t, w)
+
+    def put_blocks(k_cw, k_cc):
+        return jnp.stack([k_cw % 4, k_cc % 4]).astype(jnp.int32)
+
+    h_cw, h_cc = put(put_blocks(pos + 1, pos - 1), q_cw, s_cw, q_cc, s_cc, h_cw, h_cc)
+    for i in range(3):
+        q_cw, s_cw, q_cc, s_cc = exchange(
+            [q_cw, s_cw, q_cc, s_cc], [CW_NEXT, CW_NEXT, CW_PREV, CW_PREV]
+        )
+        h_cw, h_cc = put(put_blocks(pos - i, pos + i), q_cw, s_cw, q_cc, s_cc, h_cw, h_cc)
+    full = _d2d_ag_call(t, h)(rank, tab_j, h_cw, h_cc)
+    return full[:rows]
