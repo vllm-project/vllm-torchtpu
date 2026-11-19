@@ -73,7 +73,7 @@ def min_rows(parallel_config: Any = None) -> int:
 
 
 def enabled() -> bool:
-    """Whether sequence-parallel MoE is on at all (main #1463's switch).
+    """Whether sequence-parallel MoE is on at all (`TPU_MOE_SEQUENCE_PARALLEL`).
 
     The row threshold (see min_rows) only decides which steps of an enabled
     model run sliced; it never turns SP on by itself.
