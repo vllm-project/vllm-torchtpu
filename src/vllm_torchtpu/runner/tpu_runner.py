@@ -4241,7 +4241,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_layout_free_embeds(self) -> None:
         """Compile the row-handle gathers (every encoder budget at every token
-        bucket), their combination, and the embedding merge."""
+        bucket) and the embedding merge (every token bucket)."""
         manager = self.encoder_cudagraph_manager
         if not isinstance(manager, MMEncoderManager) or not manager.layout_free:
             return
@@ -4252,13 +4252,9 @@ class TPUModelRunner(GPUModelRunner):
             parts = [EncoderRows(source, one)]
             for num_tokens in self.num_tokens_paddings:
                 synchronize_tensors([EncoderEmbeds(parts).gather(num_tokens)])
-        other = torch.zeros(1, hidden, dtype=dtype, device=self.device)
-        parts = [EncoderRows(source, one), EncoderRows(other, one)]
         for num_tokens in self.num_tokens_paddings:
-            if num_tokens < 2:
-                continue
             is_mm = torch.zeros(num_tokens, dtype=torch.bool)
-            is_mm[:2] = True
+            is_mm[0] = True
             ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
             _, embeds = self._get_model_inputs(ids, ([EncoderEmbeds(parts)], is_mm))
             synchronize_tensors([embeds])
@@ -4279,6 +4275,9 @@ class TPUModelRunner(GPUModelRunner):
                 # Row handles: gathers at the token bucket's shape.
                 (embeds,) = mm_embeds
                 mm_embeds = [embeds.gather(input_ids.shape[0])]
+                # A program of its own: fused into the merge, the gather would
+                # make a merge program per encoder budget and token bucket.
+                synchronize_tensors(mm_embeds, wait=False)
 
             # _gather_mm_embeddings returns is_mm_embed sized to the number
             # of scheduled tokens, but TPU pads input_ids to a fixed bucket.
