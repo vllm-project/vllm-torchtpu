@@ -60,10 +60,12 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
     TPU_QWEN4_HC_DECODE_FOLD: bool = False
     TPU_QWEN4_HC_DECODE_TILE_ROWS: int = 0
+    TPU_QWEN4_HC_DECODE_COMPARE: bool = False
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
     TPU_QWEN4_HC_PREFILL_NORM: str = "vpu"
+    TPU_QWEN4_HC_PREFILL_COMPARE: bool = False
     VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
@@ -72,6 +74,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_STAGING_LEASES: int = 0
     QWEN4_EXP_PD_DRAFT_KV: bool = False
     QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP: float = 0.0
+    QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS: bool = False
     QWEN4_EXP_PD_ROUTED_DST: str = ""
     QWEN4_EXP_PD_REPACK_SHAPE: str = ""
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
@@ -130,6 +133,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     VLLM_TPU_GDN_WINDOW_LOG: bool = False
+    VLLM_TPU_L6_SEED_SPEC: str = ""
     VLLM_TPU_GDN_WINDOW_FACTORED: bool = False
     VLLM_TPU_GDN_LEAN_GLUE: bool = False
     VLLM_TPU_GDN_PREFILL_BF16_QKV_2D: bool = False
@@ -164,6 +168,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QWEN4_FUSED_PREP_CHECK: str = ""
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
+    VLLM_TPU_QSA_ZERO_PREFIX_FAST: bool = False
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -182,18 +187,32 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE: bool = False
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP: int = 4096
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH: int = 8
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES: str = "sparsecore"
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS: int = 0
+    VLLM_TPU_QSA_PREFILL_COMPARE_CORE_HELD: int = 0
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP_LOCAL_MERGE: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER: bool = False
+    VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD: bool = False
+    VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS: int = 0
     VLLM_TPU_QSA_DCP_MERGE_SCORES: bool = False
     VLLM_TPU_RPA_SCHEDULE_HBM: bool = False
+    VLLM_TPU_QSA_UNION_LEAN_GLUE: bool = False
+    VLLM_TPU_QSA_UNION_CHAINED_CALLS: bool = False
+    VLLM_TPU_QSA_INDEXER_META_SELECT: bool = False
     VLLM_TPU_QSA_DCP_MERGE: str = ""
     VLLM_TPU_QSA_DCP_MERGE_CHECK: bool = False
     VLLM_TPU_QSA_DCP_LOCAL_QGATE: bool = False
@@ -243,6 +262,8 @@ if TYPE_CHECKING:
     TPU_PP_EXTRA_STEPS_IN_FLIGHT: int = -1
     TPU_PP_RING_VERIFY: int = 0
     TPU_PP_RING_VERIFY_MUTANT: int = -1
+    TPU_PP_WARMUP_BARRIER: bool = False
+    TPU_PP_MTP_WARMUP_BARRIER: bool = False
     TPU_PP_SPREAD_MAX_PREFIX: int = 0
     TPU_PP_WARM_FIRST: bool = False
     TPU_PP_WARM_FIRST_AGING: float = 10000.0
@@ -666,6 +687,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # next step applies the first read-offset logged positions on load.
     # Refused with the megakernel and on any other leg.
     "VLLM_TPU_GDN_WINDOW_LOG": env_bool("VLLM_TPU_GDN_WINDOW_LOG"),
+    # q38 SEED-SPEC (HCDEC-HOSTADM, ported by BLSTACK-SEED; runner/l6_seedspec.py,
+    # core/l6_ab.py shim; host-only): unset / 0 off, 1 on; "ab:" is refused.
+    # On, a request whose last token of the step sits within the previous
+    # step's draft count past a GDN state-column edge no longer makes
+    # _collect_mamba_state_seed_copies wait for the previous step's sampled
+    # copy: in the canonical case (recorded column = the low side, all
+    # accepted = low + 1, speculative checkpoint seed) the seed is staged as
+    # for a crossing and the column is resolved at the next step from that
+    # copy. Same programs and shapes; never part of the compile key.
+    "VLLM_TPU_L6_SEED_SPEC": env_str("VLLM_TPU_L6_SEED_SPEC", ""),
     # With VLLM_TPU_GDN_WINDOW_LOG: the BATCHED GDN kernel runs the verify
     # window in factored form (one product of the window's keys and queries
     # with the stored state, the logged and window updates as vector work, one
@@ -867,6 +898,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Mixed QSA steps: move the decode prefix off the prefill rows with contiguous dynamic
     # slices instead of row gathers (same values; prefill chunks spent ~3 ms/8K on the gathers).
     "VLLM_TPU_QSA_PREFIX_SLICE": env_bool("VLLM_TPU_QSA_PREFIX_SLICE", default=False),
+    # Mixed QSA steps without a decode prefix (prefix 0: every step of a disaggregated prefill engine but a tiny
+    # leading request): the prefill kernel reads the step's rows in place, with no row gathers in and no gather /
+    # merge out; steps with a prefix route as before (with PREFIX_SLICE's slices if set). Same values (bitwise).
+    "VLLM_TPU_QSA_ZERO_PREFIX_FAST": env_bool("VLLM_TPU_QSA_ZERO_PREFIX_FAST", default=False),
     # QSA indexer cache updates: build each token's compression-group members from static
     # shifts and the ring / tag rows from a one-hot product instead of per-token row gathers
     # (same values; ~3 ms of gathers per 8K prefill chunk).
@@ -1044,6 +1079,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE"),
     # SC_BITSET: the union plan's per-row bitset built on the SparseCore (the same bits), off the TensorCore.
     "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET": env_bool("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET"),
+    # IN_PLACE (with GATHERED=sparsecore): gather/walk chunks read the plan's bits, queries and lengths in place
+    # (static chunk offsets) instead of from sliced copies, and the walk stages no unused bitset block. Bitwise.
+    "VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE"),
+    # SC_BITS_PLAN (with SC_BITSET; ignored without it): the SparseCore bitset kernel writes the plan layout
+    # [G * words, 128] itself (each 16-row slab into its 16 lanes of its group's rows), so the TensorCore regroup
+    # (reshape, copy and pad) is gone. The group's lanes are the same bits; lanes >= group are left unwritten (no reader
+    # uses them).
+    "VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN"),
+    # GATHERED_LEAN (with IN_PLACE; ignored without it): the in-place gathered walk takes no union words and no page
+    # rows, which it never reads (no per-chunk union-word slices / padding / staging, no per-word pool bases). Bitwise.
+    "VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
@@ -1057,6 +1103,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # COMPACT_COPY: how the compact pool is copied ("vmem": whole pages staged through VMEM by DMA; "pipe": a Pallas
     # pipeline copying 32-bit words; "dma": HBM-to-HBM DMAs, slow on TPU per i2b j-950efc5d). All byte-exact.
     "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY": env_str("VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY", "vmem"),
+    # COMPARE_CORE: the QSA prefill attention of the union walk's eligible steps through
+    # qsa_compare_core (16-row union groups, one flat tile list over all of them, 512-token tiles of
+    # 4-token copies from the served pool; default off). It takes the union walk's static guard
+    # (Q24/KV2/D256, FP8 pool of 128-aligned pages, no DCP, offset or LSE, at least 1024 rows) with
+    # rows a multiple of 16, and falls back to the call the flag-off path makes when the longest row is
+    # below VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT or a union group's union passes CAP 4-token groups
+    # (a multiple of 128 whose 128-slot tiles are a power of two). DEPTH: tiles in flight (a power of
+    # two). TABLES: the union list and row codes on the "sparsecore" (with the bitset there under
+    # VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET) or by the XLA "reference". Not bitwise against the served
+    # kernels (bf16 probabilities, union-order accumulation).
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE": env_bool("VLLM_TPU_QSA_PREFILL_COMPARE_CORE"),
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP", 4096),
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH", 8),
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES": env_str("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES", "sparsecore"),
+    # Debug only (untimed runs), N seconds: each pooled QSA layer folds its compare-core calls' union groups,
+    # tiles, largest union and max relative error against the flag-off call on the same inputs (which then runs
+    # too) into a device buffer, by range of the step's longest row; every N seconds the runner logs and zeroes
+    # the buffers (QSA_CMP_STATS lines, compare_core_stats). 0 (default) adds nothing to the program.
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS", 0),
+    # HELD (tokens, 0 = off): the compare core's held read (qsa_compare_held): each sequence's cached KV of one KV
+    # head held in VMEM for that head's pass, union slots gathered from it by vector loads; a step with a sequence
+    # longer than this many tokens takes the flag-off call.
+    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_HELD": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_COMPARE_CORE_HELD", 0),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.
@@ -1083,6 +1152,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER": env_bool(
         "VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER"
     ),
+    # q38 BLSTACK-IDX. With VLLM_TPU_QSA_COMPRESSED_DCP and TP larger than
+    # VLLM_TPU_QSA_MAIN_KV_DCP: the target layers' decode/verify-shaped graphs
+    # split the owned-group indexer's rows over the TP / DCP groups as well
+    # (ranks r and r + DCP own the same compressed groups). Each group scores
+    # one contiguous token shard of the step with the decode indexer, one TP
+    # all-gather brings every group's local lists, and every rank merges and
+    # attends exactly as without it (the prefill token-sharded op of
+    # VLLM_TPU_QSA_INDEXER_TOKEN_SHARD, routed on decode steps). Same
+    # selection, same attended groups; per-rank scoring rows drop by TP / DCP.
+    # Off: every rank scores every row of the step over its owned groups.
+    "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD": env_bool(
+        "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD", default=False
+    ),
+    # With VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD: graphs of fewer token rows
+    # keep the unsharded owned-group indexer (0 = every decode-shaped graph).
+    "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS": env_nonnegative_int(
+        "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS", 0
+    ),
     # With VLLM_TPU_QSA_COMPRESSED_DCP: the pair merge's boundary key comes
     # from the bits the merge top-k returns with its slots, instead of a
     # gather of the candidate keys at those slots. Same integers.
@@ -1091,6 +1178,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the schedule kernel. Untyped, XLA may place them in VMEM and then
     # copy each one to HBM before the attention kernel reads it.
     "VLLM_TPU_RPA_SCHEDULE_HBM": env_bool("VLLM_TPU_RPA_SCHEDULE_HBM"),
+    # With VLLM_TPU_QSA_DECODE_RPA_UNION: the union RPA call's inputs and
+    # outputs are built at the step's size when one call covers the step (up to
+    # UNION_REQUESTS * max_query_len rows), so the f32 query, LSE buffer and
+    # placeholder KV are not padded to that many rows; and the call reads the
+    # selection words as [tiles * bkv / 128, 1, 128], the union kernel's flat
+    # output without a relayout. Same results.
+    "VLLM_TPU_QSA_UNION_LEAN_GLUE": env_bool("VLLM_TPU_QSA_UNION_LEAN_GLUE"),
+    # With VLLM_TPU_QSA_DECODE_RPA_UNION: a step of several union RPA calls
+    # runs each over the step's rows and threads one output and one LSE buffer
+    # through them in the kernel's layout, in place of a padded query sliced
+    # per call and each call's output scattered back. Same results.
+    "VLLM_TPU_QSA_UNION_CHAINED_CALLS": env_bool("VLLM_TPU_QSA_UNION_CHAINED_CALLS"),
+    # The indexer kernel's step metadata is selected (empty pass: zeros) rather
+    # than computed in a conditional, whose small outputs XLA places in VMEM
+    # and then copies to HBM before every StreamIdxTC call. Same integers.
+    "VLLM_TPU_QSA_INDEXER_META_SELECT": env_bool("VLLM_TPU_QSA_INDEXER_META_SELECT"),
     # With VLLM_TPU_QSA_MAIN_KV_DCP: how the group merges its partial attention
     # outputs. Unset: all-gather every rank's f32 partial and LSE, each rank
     # combines its heads. "rs" / "rs_bf16": all-gather the LSE only, scale the
@@ -1366,6 +1469,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (192 rows: one tile instead of three of 64). Each tile streams the
     # layer's HC weights through the MXU again. 0 keeps the 128-row tiling.
     "TPU_QWEN4_HC_DECODE_TILE_ROWS": env_int("TPU_QWEN4_HC_DECODE_TILE_ROWS", 0),
+    # qwen4_exp, with TPU_QWEN4_HC_DECODE_FUSED: steps of 16 to 256 rows (a
+    # multiple of 16) run the fused decode HC mix as hc_decode_cmp.py, which
+    # issues every row and weight copy at entry, takes the injection logits
+    # from the down projection's MXU pass and writes the combined rows back
+    # stream by stream. Other row counts keep hc_decode.py.
+    "TPU_QWEN4_HC_DECODE_COMPARE": env_bool("TPU_QWEN4_HC_DECODE_COMPARE"),
     # qwen4_exp prefill: let the fused HC mix (hc_full) and the gated_residual
     # combine take any whole number (>= 2) of hc_prefill_full_tile tiles, not
     # only even counts, so 6,400- and 3,200-token steps leave the unfused
@@ -1391,6 +1500,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["vpu", "rows64", "gram", "gram64", "bf16ep", "bf16ep64"],
         case_sensitive=False,
     ),
+    # qwen4_exp prefill, at the fused-mix row counts (whole or partial
+    # hc_prefill_full_tile tiles, at least two): the HC mixes run as
+    # hc_prefill_cmp.py (row tile r's combine, norm and down dot beside row
+    # tile r - 1's up dots and mean; weights copied into VMEM from their
+    # checkpoint layouts), and each layer's mlp combine runs as the prologue of
+    # the next layer's attn mix inside a pipeline stage (as
+    # TPU_QWEN4_HC_DECODE_FOLD at decode sizes). Layers with a per-layer
+    # embedding and a stage's last layer keep the separate combine. Implies the
+    # fused mix's tile counts.
+    "TPU_QWEN4_HC_PREFILL_COMPARE": env_bool("TPU_QWEN4_HC_PREFILL_COMPARE"),
     # Pooled GDN: skip zero-filling the [T, n_v, d_v] output before the
     # decode (BATCHED) and prefill (PER_SEQ) kernels write it. Rows no request
     # owns (bucket padding) are then left unwritten; the decoder layer masks
@@ -1452,6 +1571,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # zero-fills the rows the producer never computed (above the decode's
     # local hit, below the producer's). In [0, 1); 0 is off. Host-only.
     "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP": env_float("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", 0.0),
+    # With QWEN4_EXP_PD_DRAFT_KV on a staged decode that splits compressed
+    # keys over its main-KV DCP ranks (VLLM_TPU_QSA_COMPRESSED_DCP=1): admit
+    # it (q38 BLSTACK-R). The landing planners split every compressed owner,
+    # the F2 draft's included, and zero-fill its draft gap through the same
+    # split pair tokens. Off keeps the refusal. Decode-side, host-only
+    # (admission of the staging plan): in the compile-key ignore set.
+    "QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS": env_bool("QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS"),
     # "<decode tp>,<decode dcp>,<decode block>" on BOTH legs of a TP1 pipeline
     # producer -> staged TP>1 Qwen4Exp decode: the producer routes each decode
     # rank only its slice (main-KV DCP runs, its GDN heads; compressed keys,
@@ -1907,6 +2033,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # digests a copy of what it received with one bit flipped, so its link
     # must report mismatches; the forward reads the unchanged tensor. -1: off.
     "TPU_PP_RING_VERIFY_MUTANT": env_int("TPU_PP_RING_VERIFY_MUTANT", -1),
+    # Pipeline stages meet at a host barrier (the world group's CPU group)
+    # after each has compiled its standalone forwards and before the
+    # hand-off warmup runs every bucket through the stages in step. Without
+    # it a stage that finishes compiling more than 300 s after its upstream
+    # neighbour trips the ring's cross-host descriptor wait (c10d store
+    # timeout; q38 b1 lever P j-8b02d3ec, IX l5p1), which uneven layer
+    # partitions (VLLM_PP_LAYER_PARTITION) and cold compiles make likely.
+    # Host-only, startup-only: in the compile-key ignore set.
+    "TPU_PP_WARMUP_BARRIER": env_bool("TPU_PP_WARMUP_BARRIER"),
+    # The same host barrier before each prompt length of the pipeline MTP
+    # prefill warmup (runner _warmup_mtp_prefill). The last stage
+    # cold-compiles its draft inside the first prompt, after posting that
+    # step's receive, so the stages ahead of it send the next prompt's
+    # hand-off and wait on the ring's cross-host descriptor (c10d store,
+    # 300 s) for as long as the compile takes (q38 x1c r j-ab73d6ff: PP3-PP6
+    # timed out while PP7 compiled 12 draft programs). With it, that skew
+    # waits in the barrier, under the CPU group's own timeout (PyTorch's
+    # gloo default, 1800 s). Host-only, startup-only: in the compile-key
+    # ignore set.
+    "TPU_PP_MTP_WARMUP_BARRIER": env_bool("TPU_PP_MTP_WARMUP_BARRIER"),
     # Pipeline chunk scheduler: pending prefill of requests that have at least
     # this many tokens computed is left out of the spread over the stages, so
     # their chunks are cut by the step's time budget alone (full steps at long

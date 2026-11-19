@@ -1,0 +1,16 @@
+Files base/src/vllm_torchtpu/__init__.py and head/src/vllm_torchtpu/__init__.py differ
+Files base/src/vllm_torchtpu/compilation/tpu_compiler.py and head/src/vllm_torchtpu/compilation/tpu_compiler.py differ
+Files base/src/vllm_torchtpu/core/l6_ab.py and head/src/vllm_torchtpu/core/l6_ab.py differ
+Files base/src/vllm_torchtpu/envs.py and head/src/vllm_torchtpu/envs.py differ
+Files base/src/vllm_torchtpu/layers/core/attention_metadata.py and head/src/vllm_torchtpu/layers/core/attention_metadata.py differ
+Files base/src/vllm_torchtpu/layers/core/pcp_sequence_layout.py and head/src/vllm_torchtpu/layers/core/pcp_sequence_layout.py differ
+Files base/src/vllm_torchtpu/models/vllm/qwen4_exp/inputs.py and head/src/vllm_torchtpu/models/vllm/qwen4_exp/inputs.py differ
+Files base/src/vllm_torchtpu/models/vllm/qwen4_exp/ple_offload.py and head/src/vllm_torchtpu/models/vllm/qwen4_exp/ple_offload.py differ
+Files base/src/vllm_torchtpu/patch_registry.py and head/src/vllm_torchtpu/patch_registry.py differ
+Files base/src/vllm_torchtpu/runner/decode_carry.py and head/src/vllm_torchtpu/runner/decode_carry.py differ
+Files base/src/vllm_torchtpu/runner/sampling_copy_full.py and head/src/vllm_torchtpu/runner/sampling_copy_full.py differ
+Files base/src/vllm_torchtpu/runner/speculative_decoding_manager.py and head/src/vllm_torchtpu/runner/speculative_decoding_manager.py differ
+Files base/src/vllm_torchtpu/runner/tpu_runner.py and head/src/vllm_torchtpu/runner/tpu_runner.py differ
+Files base/src/vllm_torchtpu/runner/tpu_runner_async_output.py and head/src/vllm_torchtpu/runner/tpu_runner_async_output.py differ
+Only in head/src/vllm_torchtpu/compilation: l6_aotskip.py
+Only in head/src/vllm_torchtpu/runner: l6_fskip.py

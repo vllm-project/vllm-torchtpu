@@ -386,9 +386,13 @@ def generate_selection_mask(
     masks = []
     for b_idx in range(b):
         bit = jnp.left_shift(1, query + (step_meta.query_base[b_idx] + bq_start))
-        words = jnp.concatenate(
-            [sel_vref[b_idx, r : r + 1, :] for r in range(s // num_lanes)], axis=1
-        )
+        rows = [
+            sel_vref[b_idx, r]
+            if cfgs.serve.selection_word_rows
+            else sel_vref[b_idx, r : r + 1, :]
+            for r in range(s // num_lanes)
+        ]
+        words = jnp.concatenate(rows, axis=1)
         mask_b = (words & bit) != 0
         masks.append(jnp.broadcast_to(mask_b[None], (k_heads, tq, s)))
     return masks
@@ -829,7 +833,7 @@ def get_kernel_metadata(
     cfgs_dict = dataclasses.asdict(cfgs)
     # Kernels without these fields set keep the metadata, and so the compiled
     # program and its cache key, they had before the fields.
-    for field in ("selection_mask", "read_only_cache"):
+    for field in ("selection_mask", "selection_word_rows", "read_only_cache"):
         if not getattr(cfgs.serve, field):
             del cfgs_dict["serve"][field]
     ret = {}
@@ -882,7 +886,9 @@ def rpa_kernel(
         lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
         selection_hbm: [max_num_seqs * tiles_per_seq, bkv_sz // 128, 128] int32
             selection words, row ``s * tiles_per_seq + k`` for KV tile ``k`` of
-            sequence ``s``. Required exactly when ``cfgs.serve.selection_mask``.
+            sequence ``s``; [..., bkv_sz // 128, 1, 128] with
+            ``cfgs.serve.selection_word_rows``. Required exactly when
+            ``cfgs.serve.selection_mask``.
         cfgs: Configuration of the kernel.
 
     Returns:

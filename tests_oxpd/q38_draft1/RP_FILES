@@ -1,0 +1,30 @@
+# Per-file regression candidates for X-D14-DRAFT-1 (the touched modules' test files). KEY = must run on CPU.
+KEY tests/kernels/test_qwen4_exp_shared_selection.py
+KEY tests/kernels/test_qwen4_exp_mtp_draft_rows.py
+KEY tests/kernels/qwen4_exp/dcp2/test_dcp2_draft.py
+KEY tests/kernels/qwen4_exp/dcp2/test_dcp2_op.py
+KEY tests/kernels/qwen4_exp/dcp2/test_dcp2_writes.py
+KEY tests/megakernel/test_wholestep_qsa_cache.py
+KEY tests/models/vllm/test_qwen4_exp_qsa.py
+KEY tests/models/vllm/test_qwen4_exp_mtp.py
+KEY tests/models/vllm/test_qwen4_exp_shared_selection_bind.py
+KEY tests/compilation/test_tpu_compile_key_registration.py
+KEY tests/test_envs_builders.py
+RUN tests/kernels/qwen4_exp/dcp2/test_dcp2_compressed.py
+RUN tests/kernels/test_qwen4_exp_main_kv_dcp.py
+RUN tests/kernels/test_qwen4_exp_fused_kv_write.py
+RUN tests/kernels/test_qwen4_exp_packed_compressed.py
+RUN tests/kernels/test_qwen4_exp_paired_main_kv.py
+RUN tests/kernels/test_qwen4_exp_pool_inplace.py
+RUN tests/kernels/test_qwen4_exp_qsa_spec_ring.py
+RUN tests/kernels/test_qwen4_exp_indexer_update_shift.py
+RUN tests/megakernel/test_wholestep_stock_parity.py
+RUN tests/models/vllm/test_qwen4_exp_qsa_cache_layout.py
+RUN tests/layers/adapter/test_qsa_dcp_one_gather.py
+RUN tests/layers/adapter/test_qsa_dcp_one_gather_port.py
+RUN tests/deccoll/test_dcp_head_a2a_final_wiring.py
+RUN tests/arfix/test_tp_ar_decode_wiring.py
+RUN tests/test_envs.py
+RUN tests/runner/test_qwen4_exp_pool.py
+# Dropped: tests/kernels/qwen4_exp/dcp2/test_o1s_request_shard.py (its base run exceeded the 1500 s per-file cap in
+# j-c1524c63; it exercises the target's O1s request shard, whose traced kernels the flag-off jaxpr identity covers).

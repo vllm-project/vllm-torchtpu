@@ -539,7 +539,9 @@ class SelectionFetch:
     ``selection_hbm`` is [sequences * tiles_per_seq, bkv // 128, 128]: tile
     ``k`` of sequence ``s`` is row ``s * tiles_per_seq + k``. ``window`` is
     [NUM_INPUT_SLOTS, batch, bkv // 128, 128] and ``sems`` one DMA semaphore a
-    slot. A lane with no task (s_idx -1) fetches nothing.
+    slot. With selection_word_rows both carry a unit dim before the last
+    ([..., bkv // 128, 1, 128]); the copies are the same. A lane with no task
+    (s_idx -1) fetches nothing.
     """
 
     selection_hbm: jax.Ref

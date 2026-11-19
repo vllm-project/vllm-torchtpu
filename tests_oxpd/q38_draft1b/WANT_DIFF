@@ -1,0 +1,5 @@
+Files base/src/vllm_torchtpu/compilation/tpu_compiler.py and head/src/vllm_torchtpu/compilation/tpu_compiler.py differ
+Files base/src/vllm_torchtpu/envs.py and head/src/vllm_torchtpu/envs.py differ
+Files base/src/vllm_torchtpu/spec_decode/eagle3.py and head/src/vllm_torchtpu/spec_decode/eagle3.py differ
+Only in head/src/vllm_torchtpu/spec_decode: draft_one.py
+Files base/src/vllm_torchtpu/models/vllm/qwen4_exp/mtp.py and head/src/vllm_torchtpu/models/vllm/qwen4_exp/mtp.py differ

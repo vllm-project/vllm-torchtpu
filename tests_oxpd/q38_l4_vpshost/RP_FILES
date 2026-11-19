@@ -1,0 +1,21 @@
+# Per-file regression candidates for the VPSHOST levers (test files of the touched modules). KEY = must run on CPU.
+KEY tests/q38mm_dstock/test_vps_wiring.py
+KEY tests/decfb2/test_vps_fb_wiring.py
+KEY tests/compilation/test_tpu_compile_key_registration.py
+KEY tests/q38_l6/test_l6_ab_envcache.py
+KEY tests/runner/test_spec_verify_served_only.py
+KEY tests/runner/test_q38_eagerfix.py
+RUN tests/decfb2/test_vps_fallback.py
+RUN tests/decfb2/test_vps_harness_no_leak.py
+RUN tests/q38mm_dstock/test_vp_sampler.py
+RUN tests/q38_l6/test_l6_lockstep.py
+RUN tests/q38_l6/test_l6_jitter.py
+RUN tests/q38_l6/test_l6_defer.py
+RUN tests/q38_l6/test_l6_sab_compose.py
+RUN tests/q38_l6/test_l6_fctx.py
+RUN tests/test_envs.py
+RUN tests/test_envs_builders.py
+RUN tests/layers/adapter/test_top_k_top_p.py
+RUN tests/runner/test_tpu_runner.py
+RUN tests/runner/test_tpu_runner_async_output.py
+RUN tests/compilation/test_fast_compiled_call.py

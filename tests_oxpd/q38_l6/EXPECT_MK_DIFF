@@ -1,0 +1,8 @@
+Files base/src/vllm_torchtpu/__init__.py and head/src/vllm_torchtpu/__init__.py differ
+Files base/src/vllm_torchtpu/compilation/tpu_compiler.py and head/src/vllm_torchtpu/compilation/tpu_compiler.py differ
+Files base/src/vllm_torchtpu/core/l6_ab.py and head/src/vllm_torchtpu/core/l6_ab.py differ
+Files base/src/vllm_torchtpu/envs.py and head/src/vllm_torchtpu/envs.py differ
+Files base/src/vllm_torchtpu/megakernel_runtime/qwen38_driver.py and head/src/vllm_torchtpu/megakernel_runtime/qwen38_driver.py differ
+Files base/src/vllm_torchtpu/worker/tpu_worker.py and head/src/vllm_torchtpu/worker/tpu_worker.py differ
+Only in head/src/vllm_torchtpu/core: l6_fuse_rpc.py
+Only in head/src/vllm_torchtpu/runner: l6_mk.py

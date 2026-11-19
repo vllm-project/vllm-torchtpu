@@ -1,0 +1,9 @@
+Files base/src/vllm_torchtpu/compilation/tpu_compiler.py and head/src/vllm_torchtpu/compilation/tpu_compiler.py differ
+Files base/src/vllm_torchtpu/core/host_knobs.py and head/src/vllm_torchtpu/core/host_knobs.py differ
+Files base/src/vllm_torchtpu/core/l6_ab.py and head/src/vllm_torchtpu/core/l6_ab.py differ
+Files base/src/vllm_torchtpu/core/l6_jitter.py and head/src/vllm_torchtpu/core/l6_jitter.py differ
+Files base/src/vllm_torchtpu/envs.py and head/src/vllm_torchtpu/envs.py differ
+Files base/src/vllm_torchtpu/runner/utils.py and head/src/vllm_torchtpu/runner/utils.py differ
+Files base/src/vllm_torchtpu/worker/tpu_worker.py and head/src/vllm_torchtpu/worker/tpu_worker.py differ
+Only in head/src/vllm_torchtpu/worker: numa_bind.py
+Only in head/src/vllm_torchtpu/worker: worker_options.py

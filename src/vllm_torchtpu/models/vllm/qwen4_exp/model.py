@@ -408,7 +408,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prev_output,
                 prev_residual,
                 self.attn_hyper_connection,
-                prefill_fused=False,
+                prefill_fused=envs.TPU_QWEN4_HC_PREFILL_COMPARE,
             )
         else:
             hidden = self.apply_ple(
@@ -822,10 +822,13 @@ class Qwen4ExpBackbone(nn.Module):
             assert intermediate_tensors is not None and not sequence_parallel
             hidden = intermediate_tensors["hidden_states"]
             rows = hidden.shape[0]
-        # TPU_QWEN4_HC_DECODE_FOLD: a layer hands its mlp combine to the next
-        # attn mix (or the final mixer) unless the next layer adds its PLE
-        # embedding to the combined streams first.
-        fold = envs.TPU_QWEN4_HC_DECODE_FOLD and not sequence_parallel
+        # TPU_QWEN4_HC_DECODE_FOLD / TPU_QWEN4_HC_PREFILL_COMPARE: a layer
+        # hands its mlp combine to the next attn mix (or the final mixer)
+        # unless the next layer adds its PLE embedding to the combined streams
+        # first.
+        fold = (
+            envs.TPU_QWEN4_HC_DECODE_FOLD or envs.TPU_QWEN4_HC_PREFILL_COMPARE
+        ) and not sequence_parallel
         stage = list(self.stage)
         pending = None
         for position, index in enumerate(stage):

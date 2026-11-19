@@ -42,13 +42,16 @@ class GatedResidual(common_hc.GatedResidual):
         self._prefill_norm_op = None
         self._prefill_full_op = None
         self._prefill_combine_op = None
+        # TPU_QWEN4_HC_PREFILL_COMPARE: the fused prefill mixes run as
+        # hc_prefill_cmp.py (the fused mix's gates and tile counts).
+        cmp = envs.TPU_QWEN4_HC_PREFILL_COMPARE
+        fused_mix = envs.TPU_QWEN4_HC_PREFILL_FUSED_MIX or cmp
         # Fused prefill mix and combine take T % tile == 0 (any count >= 2)
         # under TPU_QWEN4_HC_PREFILL_ODD_TILES or ..._FUSED_MIX, else even
         # tile counts only (the served default).
         self._prefill_tile_step = (
             prefill_full_tile
-            if envs.TPU_QWEN4_HC_PREFILL_ODD_TILES
-            or envs.TPU_QWEN4_HC_PREFILL_FUSED_MIX
+            if envs.TPU_QWEN4_HC_PREFILL_ODD_TILES or fused_mix
             else 2 * prefill_full_tile
         )
         # TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: any multiple of 32 rows (at least
@@ -61,7 +64,7 @@ class GatedResidual(common_hc.GatedResidual):
         self._prefill_inj_mix_op = None
         self._prefill_combine_mix_op = None
         if (
-            envs.TPU_QWEN4_HC_PREFILL_FUSED_MIX
+            fused_mix
             and prefill_full_tile
             and self.config.hc_per_branch_norm
             and self.hidden_size % 128 == 0
@@ -75,11 +78,12 @@ class GatedResidual(common_hc.GatedResidual):
 
             eps = self.hc_norm.variance_epsilon
             self._prefill_inj_mix_op = build_prefill_inj_mix_op(
-                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl
+                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl, cmp
             )
-            # Used by the preceding HC's combine_mix (attn -> mlp).
+            # Used by the preceding HC's combine_mix (attn -> mlp, and with
+            # TPU_QWEN4_HC_PREFILL_COMPARE the previous layer's mlp -> attn).
             self._prefill_combine_mix_op = build_prefill_combine_mix_op(
-                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl
+                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl, cmp
             )
         if (
             prefill_full_tile

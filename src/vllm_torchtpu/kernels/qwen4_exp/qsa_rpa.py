@@ -534,10 +534,24 @@ def union_decode_attention(
         starts = jnp.concatenate([starts, jnp.broadcast_to(starts[-1:], (pad,))])
         pages, sel, meta = (jnp.pad(x, ((0, pad), (0, 0))) for x in (pages, sel, meta))
     call_rows = UNION_REQUESTS * max_query_len
+    # VLLM_TPU_QSA_UNION_LEAN_GLUE: when one call covers the step, it runs over
+    # the step's own rows, so its query, output and LSE buffers have the step's
+    # size and call row r is step row r. A row before starts[0] belongs to no
+    # request; union_row_live masks whatever the kernel leaves in it.
+    # VLLM_TPU_QSA_UNION_CHAINED_CALLS: with several calls, each runs over the
+    # whole step too and takes the previous call's output and LSE buffers, in
+    # the kernel's layout, as its own (wrapper carry). A call reads the queries
+    # of its own sequences, rows no earlier call wrote, and writes only them.
+    lean = bool(envs.VLLM_TPU_QSA_UNION_LEAN_GLUE)
+    chained = bool(envs.VLLM_TPU_QSA_UNION_CHAINED_CALLS) and chunks > 1
+    whole = (lean and chunks == 1 and len(q) <= call_rows) or chained
+    span = call_rows
+    if whole:
+        call_rows = len(q)
     # Rows past the last call's slice are padding, so a slice never clamps.
     query = jnp.pad(
         q.astype(jnp.float32),
-        ((0, call_rows), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
+        ((0, 0 if whole else call_rows), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
     )
     dummy_k = jnp.zeros((call_rows, 1, query.shape[-1]), cache.dtype)
     virtual_cache = cache.reshape(-1, ratio, *cache.shape[2:])
@@ -548,14 +562,22 @@ def union_decode_attention(
         batch_size=envs.VLLM_TPU_QSA_DECODE_RPA_LANES,
     )
     skip = envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY
-    out = jnp.zeros(query.shape, jnp.float32)
-    lse = jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
+    out = None if whole else jnp.zeros(query.shape, jnp.float32)
+    lse = None if whole else jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
+    carry = None
     for c in range(chunks):
         first = c * UNION_REQUESTS
         part = slice(first, first + UNION_REQUESTS)
-        row0 = starts[first]
+        row0 = 0 if whole else starts[first]
+        edges = starts[first : first + UNION_REQUESTS + 1]
+        if chained:
+            # The rows a sliced call would attend, [starts[first], + span),
+            # in step coordinates.
+            cu_q_lens = jnp.clip(edges, edges[0], jnp.minimum(edges[0] + span, len(q)))
+        else:
+            cu_q_lens = jnp.clip(edges - row0, 0, call_rows)
         out_c, virtual_cache, lse_c = wrapper.ragged_paged_attention(
-            jax.lax.dynamic_slice_in_dim(query, row0, call_rows),
+            query if whole else jax.lax.dynamic_slice_in_dim(query, row0, call_rows),
             dummy_k,
             dummy_k,
             virtual_cache,
@@ -564,7 +586,7 @@ def union_decode_attention(
             # A request of more than max_query_len rows (the precompile's
             # dummy steps) could carry a call past its query slice; rows
             # past the slice are not attended.
-            jnp.clip(starts[first : first + UNION_REQUESTS + 1] - row0, 0, call_rows),
+            cu_q_lens,
             jnp.full((3,), UNION_REQUESTS, jnp.int32),
             sm_scale=q.shape[-1] ** -0.5,
             q_scale=None,
@@ -588,11 +610,21 @@ def union_decode_attention(
             selection_bits=sel[part],
             **({"read_only_cache": True} if read_only else {}),
             schedule_in_hbm=envs.VLLM_TPU_RPA_SCHEDULE_HBM,
+            **({"selection_word_rows": True} if lean else {}),
+            **({"carry": carry, "return_carry": True} if chained else {}),
         )
+        if chained:
+            carry = (out_c, lse_c)
+            continue
+        if whole:
+            out, lse = out_c, lse_c.astype(jnp.float32)
+            continue
         # Later calls start at their own first row, so each row keeps the
         # value its own call wrote.
         out = jax.lax.dynamic_update_slice_in_dim(out, out_c, row0, 0)
         lse = jax.lax.dynamic_update_slice_in_dim(lse, lse_c.astype(jnp.float32), row0, 0)
+    if chained:
+        out, lse = wrapper.finish_carry(carry, query.shape, 1, query.dtype)
     out = jnp.where(live[:, None, None], out[: len(q), :, : q.shape[-1]], 0)
     lse = jnp.where(live[:, None], lse[: len(q)], -jnp.inf)
     return out, lse, virtual_cache.reshape(cache.shape)
@@ -804,9 +836,45 @@ def _prefill_attention(
     kv_head_offset=0,
     dcp=None,
     return_lse=False,
+    compare=True,
 ):
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
-    ``block_sparse_gqa_attention``)."""
+    ``block_sparse_gqa_attention``). ``compare=False`` skips the compare core
+    (its own fallback: the flag-off call)."""
+    if (
+        compare
+        and envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE
+        and dcp is None
+        and not return_lse
+        and kv_head_offset == 0
+        and ratio == 4
+        and cache.dtype == jnp.float8_e4m3fn
+        and cache.shape[1] % 128 == 0
+        and tuple(cache.shape[2:]) == (1, 4, 256)
+        and query.shape[1:] == (24, 256)
+        and kv_heads == 2
+        and query.shape[0] % 16 == 0
+        and query.shape[0] >= 1024
+    ):
+        from vllm_torchtpu.kernels.qwen4_exp.qsa_compare_core import compare_core_prefill
+
+        def fallback():
+            output, _ = _prefill_attention(
+                query, gate, blocks, lengths, table, cache, starts, kv_heads=kv_heads, ratio=ratio,
+                k_scale=k_scale, v_scale=v_scale, compare=False,
+            )
+            return output
+
+        return compare_core_prefill(
+            query, gate, blocks, lengths, table, cache, starts, kv_heads=kv_heads, ratio=ratio,
+            k_scale=k_scale, v_scale=v_scale, union_cap=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_CAP,
+            min_context=envs.VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT, fallback=fallback,
+            depth=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_DEPTH,
+            bitset="sparsecore" if envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET else "tensorcore",
+            lister=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_TABLES,
+            stats=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS,
+            held_tokens=envs.VLLM_TPU_QSA_PREFILL_COMPARE_CORE_HELD,
+        )
     union_group = envs.VLLM_TPU_QSA_PREFILL_UNION_WALK
     if union_group and (128 % union_group or union_group < 8):
         raise ValueError("VLLM_TPU_QSA_PREFILL_UNION_WALK must be a divisor of 128, at least 8")
@@ -855,6 +923,9 @@ def _prefill_attention(
             compact_reqs=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS,
             compact_copy_method=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
             sc_bitset=envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET,
+            **({"in_place": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE else {}),
+            **({"sc_bits_plan": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN else {}),
+            **({"gathered_lean": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN else {}),
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
@@ -1280,6 +1351,23 @@ def qsa_attention(
         cache,
         **options,
     )
+    if envs.VLLM_TPU_QSA_ZERO_PREFIX_FAST and dcp is None:
+        # Steps without a decode prefix hand the prefill kernel the rows in
+        # place; the rest route as below. Same values.
+        return _zero_prefix_fast_route(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            decoded,
+            prefix,
+            capacity=capacity,
+            prefill_fn=prefill_fn,
+            options=options,
+        )
     # Keep bucket shapes fixed while removing the decode prefix on device.
     rows = jnp.arange(len(query))
     if envs.VLLM_TPU_QSA_PREFIX_SLICE:
@@ -1327,6 +1415,104 @@ def qsa_attention(
     if dcp is not None:
         return _split_lse_channel(output, lengths, cache)
     return jnp.where((lengths > 0)[:, None, None], output, 0), cache
+
+
+def _zero_prefix_fast_route(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    decoded,
+    prefix,
+    *,
+    capacity,
+    prefill_fn,
+    options,
+):
+    """``qsa_attention``'s prefill rows under VLLM_TPU_QSA_ZERO_PREFIX_FAST.
+
+    The same values as the routed path. A step without a decode prefix
+    (``prefix == 0``: every step of a disaggregated prefill engine but a tiny
+    leading request) hands the prefill kernel its rows in place: no row
+    gathers in, no gather and ``where`` merge out, only the final
+    ``lengths > 0`` mask. Steps with a prefix move the rows as before (row
+    gathers, or VLLM_TPU_QSA_PREFIX_SLICE's slices) and merge the decoded rows
+    back. ``lax.cond`` selects only the row movement and the output merge; the
+    prefill kernel and the cache stay outside it, so the walk is traced once
+    and the cache is never a conditional's result (that would copy the pool).
+
+    With ``prefix == 0`` the routed path's ``ids`` are ``rows``, its prefill
+    lengths ``where(rows < starts[-1], lengths, 0)``, its starts ``starts``
+    and its output ``prefilled``.
+    """
+    n = len(query)
+    rows = jnp.arange(n)
+    move_in, move_out, decoded_rows = _prefix_moves(decoded, prefix, n, capacity)
+    in_place = prefix == 0
+    moved = jax.lax.cond(
+        in_place,
+        lambda xs: xs,
+        lambda xs: tuple(move_in(x) for x in xs),
+        (query, gate, blocks, lengths, table),
+    )
+    prefill_lengths = jnp.where(rows < starts[-1] - prefix, moved[3], 0)
+    prefilled, cache = prefill_fn(
+        moved[0],
+        moved[1],
+        moved[2],
+        prefill_lengths,
+        moved[4],
+        cache,
+        jnp.maximum(starts - prefix, 0),
+        **options,
+    )
+    live = (lengths > 0)[:, None, None]
+
+    def direct(out):
+        return jnp.where(live, out, 0)
+
+    def merged(out):
+        head = (rows < prefix)[:, None, None]
+        return jnp.where(live, jnp.where(head, decoded_rows(), move_out(out)), 0)
+
+    return jax.lax.cond(in_place, direct, merged, prefilled), cache
+
+
+def _prefix_moves(decoded, prefix, n, capacity):
+    """The routed path's row movement: ``(move_in, move_out, decoded_rows)``.
+
+    ``move_in(x)[r] = x[min(r + prefix, n - 1)]``, ``move_out(x)[r] =
+    x[max(r - prefix, 0)]`` and ``decoded_rows()[r] = decoded[min(r,
+    capacity - 1)]``: row gathers, or contiguous dynamic slices under
+    VLLM_TPU_QSA_PREFIX_SLICE.
+    """
+    if envs.VLLM_TPU_QSA_PREFIX_SLICE:
+
+        def move_in(x):
+            return _shift_rows_up(x, prefix, capacity)
+
+        def move_out(x):
+            return _shift_rows_down(x, prefix, capacity)
+
+        def decoded_rows():
+            return _pad_rows(decoded, n)
+
+        return move_in, move_out, decoded_rows
+    rows = jnp.arange(n)
+
+    def gather_in(x):
+        return x[jnp.minimum(rows + prefix, n - 1)]
+
+    def gather_out(x):
+        return x[jnp.maximum(rows - prefix, 0)]
+
+    def gather_decoded():
+        return decoded[jnp.minimum(rows, capacity - 1)]
+
+    return gather_in, gather_out, gather_decoded
 
 
 def _pad_rows(x: jax.Array, n: int) -> jax.Array:

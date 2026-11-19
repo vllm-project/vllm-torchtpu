@@ -356,6 +356,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # How much of each load's draft KV a staged decode zero-fills (q38 F2-3's
     # forced-gap arm): host-side repack indices only.
     "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP",
+    # Whether a staged decode admits F2's draft KV with split compressed keys
+    # (q38 BLSTACK-R): admission only, the staging plan's rows are the same.
+    "QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS",
     # Where a staged decode's compressed keys land (once per host, then a
     # landing all-gather): adds shape-keyed landing programs, changes none.
     "QWEN4_EXP_PD_SHARED_COMPRESSED",
@@ -378,6 +381,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_PP_LAST_ASYNC_OUTPUT",
     # Engine-core KV cache bookkeeping shortcut (core/kv_decode_fast_path.py).
     "VLLM_TPU_KV_DECODE_FAST_PATH",
+    # q38 SEED-SPEC (runner/l6_seedspec.py): whether the block-edge GDN seed
+    # waits for the previous step's copy; the seed rows, their programs and
+    # every model program are the same.
+    "VLLM_TPU_L6_SEED_SPEC",
     # Engine-core cap on remote KV loads started a pass (core/kv_load_pacing.py).
     "VLLM_TPU_KV_LOAD_STARTS_PER_STEP",
     # New-request prompt arrays (core/prompt_token_array.py).
@@ -424,6 +431,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PP_EXTRA_STEPS_IN_FLIGHT",
     "TPU_PP_RING_VERIFY",
     "TPU_PP_RING_VERIFY_MUTANT",
+    # Startup-only host barrier before the hand-off warmup: the compiled
+    # forwards are the same either way.
+    "TPU_PP_WARMUP_BARRIER",
+    # The same barrier before each prompt length of the MTP prefill warmup.
+    "TPU_PP_MTP_WARMUP_BARRIER",
     # The chunk scheduler's spread (engine side): it changes which buckets
     # steps use, not the compiled programs.
     "TPU_PP_SPREAD_MAX_PREFIX",
@@ -537,6 +549,11 @@ _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/kernels/diffusion_attention",
     "vllm_torchtpu/omni/attention.py",
     "vllm_torchtpu/omni/rope.py",
+    # q38 oxpd form (Q38_OXPD_FORM=1, see vllm_torchtpu/__init__.py): a second
+    # copy of the package that this form never imports. No hashed path above
+    # contains it, so listing it changes no hash; it keeps the importer scans
+    # (test_runtime_hash_excluded_kernels_stay_omni_only) off that copy.
+    "vllm_torchtpu/_forms",
 )
 
 
@@ -616,6 +633,14 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
             logger.warning(
                 "Skipping TPU compile environment variable %s: %s", name, exc
             )
+    # q38 AR-FIX decode TP all-reduce kernel (layers/adapter/tp_ar_decode.py; BLSTACK-H8 port onto Benliang Wang's
+    # d523c2ce0): not registered in envs.py, so the loop above never sees it; it keys the cache only when set. Import
+    # only when the flag is set (q38 INT-4, ffd6a8c81): compile_factors() is {} whenever it is empty, so unset leaves
+    # the factors unchanged and imports nothing.
+    if os.environ.get("VLLM_TPU_DECODE_TP_AR", "").strip():
+        from vllm_torchtpu.kernels.collectives import tp8_ar_decode_fn
+
+        factors.update(tp8_ar_decode_fn.compile_factors())
     return factors
 
 

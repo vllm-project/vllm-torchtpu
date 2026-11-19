@@ -1,0 +1,252 @@
+# SPDX-License-Identifier: Apache-2.0
+"""PD page ownership at partial compression and scheduler-page boundaries."""
+
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+import torch
+from vllm.config.cache import CacheConfig
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
+
+from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
+from vllm_torchtpu.models.vllm.qwen4_exp.pd import (
+    TransferExtent,
+    build_transfer_groups,
+    handoff_block_ids,
+    skipped_source_pages,
+    suffix_pages,
+)
+from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
+
+
+def cache_groups():
+    specs = [
+        FullAttentionSpec(
+            block_size=128, num_kv_heads=1, head_size=128, dtype=torch.float8_e4m3fn
+        ),
+        MLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            tokens_per_state=4,
+        ),
+        CircularBufferSpec(
+            block_size=4, num_kv_heads=1, head_size=132, dtype=torch.bfloat16
+        ),
+        MambaSpec(
+            block_size=9216,
+            shapes=((3, 1, 256), (2, 128, 128)),
+            dtypes=(torch.float32, torch.bfloat16),
+            mamba_cache_mode="none",
+        ),
+        MambaSpec(
+            block_size=9216,
+            shapes=((9, 256),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="none",
+        ),
+    ]
+    names = ["qsa", "qsa.compressed_k", "qsa.raw_ring", "gdn", "ple"]
+    return [
+        KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
+        for name, spec in zip(names, specs)
+    ]
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 3, 4, 5, 127, 128, 129, 8191, 8192])
+def test_committed_prefix_uses_paged_kv_and_single_request_states(tokens):
+    plan = build_transfer_groups(cache_groups())
+    expected = [(tokens + 127) // 128] * 2 + [int(tokens > 0)] * 3
+    tables = []
+    next_page = 1
+    for count in expected:
+        tables.append(list(range(next_page, next_page + count)))
+        next_page += count
+    assert [group.page_count(tokens) for group in plan] == expected
+    assert [g.extent for g in plan[2:]] == [TransferExtent.REQUEST_STATE] * 3
+    assert handoff_block_ids(
+        plan, tables, committed_tokens=tokens, computed_tokens=tokens
+    ) == tuple(tuple(table) for table in tables)
+
+
+@pytest.mark.parametrize("computed", [126, 128])
+def test_reject_state_from_a_different_prefix(computed):
+    with pytest.raises(ValueError, match="published committed prefix"):
+        handoff_block_ids(
+            build_transfer_groups(cache_groups()),
+            [[1], [2], [3], [4], [5]],
+            committed_tokens=127,
+            computed_tokens=computed,
+        )
+
+
+@pytest.mark.parametrize(
+    "tables,reason",
+    [
+        ([[1], [2], [3], [4]], "one block table"),
+        ([[1], [2], [0], [4], [5]], "null or invalid"),
+        ([[1], [2], [3, 0], [4], [5]], "needs 1 pages"),
+        ([[1], [], [3], [4], [5]], "needs 1 pages"),
+        ([[True], [2], [3], [4], [5]], "null or invalid"),
+    ],
+)
+def test_reject_missing_null_or_padded_scheduler_tables(tables, reason):
+    with pytest.raises(ValueError, match=reason):
+        handoff_block_ids(
+            build_transfer_groups(cache_groups()),
+            tables,
+            committed_tokens=127,
+            computed_tokens=127,
+        )
+
+
+def test_reject_duplicate_pages_and_reordered_groups():
+    plan = build_transfer_groups(cache_groups())
+    with pytest.raises(ValueError, match="repeats a physical page"):
+        handoff_block_ids(
+            plan,
+            [[1, 1], [2, 3], [4], [5], [6]],
+            committed_tokens=129,
+            computed_tokens=129,
+        )
+    with pytest.raises(ValueError, match="scheduler group order"):
+        handoff_block_ids(
+            tuple(reversed(plan)),
+            [[1], [2], [3], [4], [5]],
+            committed_tokens=1,
+            computed_tokens=1,
+        )
+
+
+def align_cache_groups():
+    """The groups under prefix caching: align-mode state tables paged like KV."""
+    groups = cache_groups()
+    for index in (3, 4):
+        groups[index] = replace(
+            groups[index],
+            kv_cache_spec=replace(
+                groups[index].kv_cache_spec, mamba_cache_mode="align", block_size=128
+            ),
+        )
+    return groups
+
+
+def test_align_state_tables_are_positional_single_page_states():
+    plan = build_transfer_groups(align_cache_groups())
+    assert [g.positional_state for g in plan] == [False, False, False, True, True]
+    assert [g.extent for g in plan[2:]] == [TransferExtent.REQUEST_STATE] * 3
+    # One page moves per state group however many block columns the table has.
+    assert [g.page_count(1000) for g in plan] == [8, 8, 1, 1, 1]
+    assert not any(g.positional_state for g in build_transfer_groups(cache_groups()))
+
+
+def test_speculative_align_state_is_one_positional_request_state_page():
+    # Decode-only MTP with decode prefix caching: align-mode state tables
+    # with speculative blocks still transfer one committed state page.
+    groups = align_cache_groups()
+    for index in (3, 4):
+        groups[index] = replace(
+            groups[index],
+            kv_cache_spec=replace(groups[index].kv_cache_spec, num_speculative_blocks=3),
+        )
+    plan = build_transfer_groups(groups)
+    assert [g.extent for g in plan[3:]] == [TransferExtent.REQUEST_STATE] * 2
+    assert all(g.positional_state for g in plan[3:])
+    assert [g.page_count(1000) for g in plan[3:]] == [1, 1]
+
+
+def test_refuse_unknown_state_mode_and_duplicate_owners():
+    groups = align_cache_groups()
+    groups[3] = replace(
+        groups[3],
+        kv_cache_spec=replace(groups[3].kv_cache_spec, mamba_cache_mode="all"),
+    )
+    with pytest.raises(NotImplementedError, match="none or align"):
+        build_transfer_groups(groups)
+    groups = cache_groups()
+    groups.append(groups[0])
+    with pytest.raises(ValueError, match="every cache owner once"):
+        build_transfer_groups(groups)
+
+
+@pytest.mark.parametrize("skip", [0, 128, 256, 896])
+def test_prefix_suffix_pages_skip_whole_token_pages_and_keep_states(skip):
+    plan = build_transfer_groups(align_cache_groups())
+    tables = [list(range(1, 9)), list(range(11, 19)), [21], [31], [41]]
+    pages = [suffix_pages(g, ids, skip) for g, ids in zip(plan, tables)]
+    assert pages[0] == tuple(range(1 + skip // 128, 9))
+    assert pages[1] == tuple(range(11 + skip // 128, 19))
+    assert pages[2:] == [(21,), (31,), (41,)]
+    assert [skipped_source_pages(g, skip) for g in plan] == [skip // 128] * 2 + [0] * 3
+
+
+@pytest.mark.parametrize(
+    "skip,reason", [(100, "does not end"), (1024, "whole transfer")]
+)
+def test_prefix_suffix_pages_refuse_a_split_page_or_no_suffix(skip, reason):
+    group = build_transfer_groups(align_cache_groups())[0]
+    with pytest.raises(ValueError, match=reason):
+        suffix_pages(group, list(range(1, 9)), skip)
+
+
+def test_pool_exposes_only_the_bound_transfer_plan():
+    cache = object.__new__(Qwen4ExpPooledCache)
+    cache.materialized = None
+    with pytest.raises(ValueError, match="Initialize Qwen caches"):
+        cache.get_transfer_groups()
+    cache.materialized = object()
+    cache.native_config = SimpleNamespace(kv_cache_groups=cache_groups())
+    assert cache.get_transfer_groups() == build_transfer_groups(cache_groups())
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_plan_covers_the_native_qwen_scheduler_groups(tp):
+    cfg = SimpleNamespace(
+        additional_config={},
+        cache_config=CacheConfig(
+            block_size=128,
+            cache_dtype="fp8_e4m3",
+            enable_prefix_caching=False,
+            mamba_cache_mode="none",
+            mamba_ssm_cache_dtype="bfloat16",
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=q4exp_text_config(),
+            max_model_len=9216,
+            dtype=torch.bfloat16,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+    cfg.cache_config.kv_cache_layout = "BLHNC"
+    layout, specs = pooled_cache_specs(cfg)
+    cfg.cache_config.block_size = layout.block_size
+    cfg.cache_config.mamba_block_size = cfg.model_config.max_model_len
+    groups = get_kv_cache_groups(cfg, specs)
+    plan = build_transfer_groups(groups)
+    assert {name for group in plan for name in group.layer_names} == set(specs)
+    for group in plan:
+        spec = groups[group.group_index].kv_cache_spec
+        if isinstance(spec, (CircularBufferSpec, MambaSpec)):
+            assert group.page_count(8191) == 1
+        else:
+            assert (
+                group.page_count(8191)
+                == (8191 + spec.block_size - 1) // spec.block_size
+            )

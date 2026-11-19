@@ -1,0 +1,8 @@
+Files base/src/vllm_torchtpu/compilation/tpu_compiler.py and head/src/vllm_torchtpu/compilation/tpu_compiler.py differ
+Files base/src/vllm_torchtpu/envs.py and head/src/vllm_torchtpu/envs.py differ
+Files base/src/vllm_torchtpu/megakernel_runtime/qwen38_driver.py and head/src/vllm_torchtpu/megakernel_runtime/qwen38_driver.py differ
+Files base/src/vllm_torchtpu/models/vllm/qwen4_exp/inputs.py and head/src/vllm_torchtpu/models/vllm/qwen4_exp/inputs.py differ
+Files base/src/vllm_torchtpu/runner/decode_carry.py and head/src/vllm_torchtpu/runner/decode_carry.py differ
+Files base/src/vllm_torchtpu/runner/host_phases.py and head/src/vllm_torchtpu/runner/host_phases.py differ
+Files base/src/vllm_torchtpu/runner/tpu_runner.py and head/src/vllm_torchtpu/runner/tpu_runner.py differ
+Files base/src/vllm_torchtpu/spec_decode/eagle3.py and head/src/vllm_torchtpu/spec_decode/eagle3.py differ

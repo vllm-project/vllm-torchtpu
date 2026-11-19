@@ -1,0 +1,24 @@
+# Per-file regression candidates for q38 L4 X-D14-DRAFT-2 (c) (head q38-l4-draftemb vs base 9b8d39a74).
+# KEY = touches the changed modules or their callers; must run on CPU. RUN = neighbours; a RUN file collecting 0 on both trees is excluded.
+KEY tests/models/vllm/test_qwen4_exp_mtp.py
+KEY tests/models/vllm/test_qwen4_exp_shared_selection_bind.py
+KEY tests/models/vllm/test_qwen4_exp_draft_no_index_state.py
+KEY tests/q38_draft2/test_draft_embed_h8.py
+KEY tests/compilation/test_tpu_compile_key_registration.py
+KEY tests/spec_decode/test_eagle3.py
+KEY tests/spec_decode/test_utils.py
+KEY tests/q38_draftasm/test_draftasm_units.py
+RUN tests/spec_decode/test_draft_top_tokens_port.py
+RUN tests/spec_decode/test_mtp_fused_loop_dims.py
+RUN tests/runner/test_carry_rows_fresh_port.py
+RUN tests/q38_draftasm/test_draftasm_flagoff.py
+RUN tests/q38_draftasm/test_draftasm_multirank.py
+RUN tests/models/vllm/test_qwen4_exp.py
+RUN tests/models/vllm/test_qwen4_exp_model.py
+RUN tests/test_envs_builders.py
+RUN tests/platforms/test_patch_registry.py
+RUN tests/layers/adapter/quantization/test_fp8_embedding.py
+RUN tests/runner/test_greedy_top_tokens.py
+# EMB-REP-TGT changes the TPU-patched VocabParallelEmbedding.forward in src/vllm_torchtpu/__init__.py:
+RUN tests/core/test_host_knobs.py
+RUN tests/megakernel/test_portability.py
