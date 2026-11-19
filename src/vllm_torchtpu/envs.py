@@ -1481,8 +1481,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expert, W4A8 block-quantized routed weights) with one op covering
     # routing, the shared expert, the routed experts and the all-reduce at the
     # decode kernel's row counts up to 64 (TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64
-    # adds the larger ones),
-    # and the GMM path plus a psum at other token counts
+    # adds the larger ones), and the GMM path plus a psum at other token counts
     # (layers/adapter/moe_tp_decode_nvfp4.py). Also clamps
     # MOE_REQUANTIZE_BLOCK_SIZE per matrix on non-EP-fused NVFP4 MoE layers
     # (b13=512, b2=min(512, I_rank): 512/512 at EP2xTP4, 512/256 at TP8) so TP

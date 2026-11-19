@@ -9,7 +9,8 @@ W4A16 and does not fit 4-chip HBM).
 
 One Pallas call per rank that runs a MoE layer's router top-k, its
 online-FP8 shared expert, its W4A8 block-scaled routed experts, and the
-in-kernel cross-rank all-reduce for decode batches (`n <= 64`). Opt-in with
+in-kernel cross-rank all-reduce for decode batches (`n <= 64`, or up to 128 with
+`TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64=1`). Opt-in with
 `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` (default `0`) and
 `TPU_MOE_SKIP_PADDED_TOKENS=1`.
 
@@ -74,12 +75,12 @@ def moe_tp_decode_nvfp4(
 layers after model load when `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and
 `TPU_MOE_SKIP_PADDED_TOKENS=1`:
 
-- **Decode (`n <= 64`):** `n in (16, 32, 64)` calls `moe_tp_decode_nvfp4`
-  directly; `n < 16` pads `x` and `scores` to `m = 16`, runs the `m = 16`
-  bucket, and slices `[:n]`. `TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64=1` adds the
-  row counts above 64 where they fit VMEM (128 rows: at `EP2xTP4` with
-  `b2 = 512` below, not at `TP8`).
-- **Mixed / prefill (`n > 64`):** calls `_tp_chain` (`layers/adapter/moe_tp_decode.py`)
+- **Decode (`n <= 64`, or up to 128 with the flag):** `n in (16, 32, 64)`
+  calls `moe_tp_decode_nvfp4` directly; `n < 16` pads `x` and `scores` to
+  `m = 16`, runs the `m = 16` bucket, and slices `[:n]`.
+  `TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64=1` adds the row counts above 64 where
+  they fit VMEM (128 rows: at `EP2xTP4` with `b2 = 512` below, not at `TP8`).
+- **Mixed / prefill (every other `n`):** calls `_tp_chain` (`layers/adapter/moe_tp_decode.py`)
   (`fused_moe_func` -> `gmm_v2` W4A16 + online-FP8 shared expert + `lax.psum`)
   inside the same custom op on the same K-major FP4 weights and 4D block scales,
   with zero weight duplication.
@@ -120,6 +121,9 @@ layers):
 | `USE_MOE_FUSED_EP_KERNEL=1` *(pure EP admitted; `+ MOE_FUSED_EP_ENABLE_W4A8=1` or `adaptive` on NVFP4)* | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | Unarmed (`fused_moe_gmm`) |
 | `USE_MOE_FUSED_EP_KERNEL=1` *(`TP` or `EP x TP` with `tp > 1`)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode` if `USE_MOE_TP_DECODE_KERNEL=1`, else unarmed | `_tp_chain` / `fused_moe_prefill` if `USE_MOE_TP_DECODE_KERNEL=1`, else unarmed | Unarmed (`fused_moe_gmm`) |
 
+- **`TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64=1`:** the NVFP4 columns' `n <= 64` /
+  `n > 64` split moves to the layer's largest admitted row count (128 where its
+  VMEM plan fits, else 64); the FP8 columns are unchanged.
 - **No cross-dtype stand-down:** FP8-only flags (`USE_MOE_TP_DECODE_KERNEL`,
   `FUSED_MOE_DECODE_KERNEL`, `FUSED_MOE_PREFILL_KERNEL`,
   `TPU_MOE_FP8_ALL_GATHER`) neither arm nor disable NVFP4 layers; `256` above
@@ -129,9 +133,10 @@ layers):
   (`USE_MOE_FUSED_EP_KERNEL=1` with `MOE_FUSED_EP_ENABLE_W4A8=1`, or
   `MOE_FUSED_EP_KERNEL_IMPL=adaptive`) or collective chunking
   (`TPU_MOE_COLLECTION_CHUNK_SIZE > 0`).
-- **Sub-bucket decode counts (`n <= 64`):** on armed NVFP4 layers, `n in (16,
-  32, 64)` invokes `moe_tp_decode_nvfp4` directly, `n < 16` pads to `16` and
-  slices `[:n]`, and any non-bucket `16 < n < 64` falls back to `_tp_chain`.
+- **Sub-bucket decode counts:** on armed NVFP4 layers, `n in (16, 32, 64)`
+  invokes `moe_tp_decode_nvfp4` directly, `n < 16` pads to `16` and slices
+  `[:n]`, and any count between the row counts (`16 < n < 64`, and
+  `64 < n < 128` with the flag) falls back to `_tp_chain`.
 
 ## Supported layouts (`TP8` and `EP2xTP4`)
 
