@@ -2811,18 +2811,18 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
     request's query, so a trimmed count slides the verify window forward and
     the sampler validates the wrong drafts.
     """
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(
-            token_ids_cpu=np.zeros((4, 2048), dtype=np.int32),
-            num_tokens_no_spec=np.array([10, 2038, 2048, 0], dtype=np.int32),
-            req_id_to_index={"roomy": 0, "edge": 1, "full": 2},
-            spec_token_ids=[[] for _ in range(4)],
-        ),
-        requests={},
-    )
+    from vllm.v1.worker.gpu_input_batch import InputBatch
+
+    ib = object.__new__(InputBatch)
+    ib.token_ids_cpu = np.zeros((4, 2048), dtype=np.int32)
+    ib.is_token_ids = np.zeros((4, 2048), dtype=bool)
+    ib.num_tokens_no_spec = np.array([10, 2038, 2048, 0], dtype=np.int32)
+    ib.req_id_to_index = {"roomy": 0, "edge": 1, "full": 2}
+    ib.spec_token_ids = [[] for _ in range(4)]
+    runner = SimpleNamespace(input_batch=ib, requests={})
     calls = []
-    runner.input_batch.update_req_spec_token_ids = lambda request, scheduled: (
-        calls.append((request.req_id, list(scheduled[request.req_id])))
+    ib.update_req_spec_token_ids = lambda request, scheduled: calls.append(
+        (request.req_id, list(scheduled[request.req_id]))
     )
     TPUModelRunner._install_spec_token_room_guard(runner)
 
@@ -2832,25 +2832,24 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         for rid in ("roomy", "edge", "full")
     }
     for rid in ("roomy", "edge", "full"):
-        runner.input_batch.update_req_spec_token_ids(requests[rid], scheduled)
+        ib.update_req_spec_token_ids(requests[rid], scheduled)
 
-    # Only what fits is staged into token_ids_cpu.
-    assert [(r, len(ids)) for r, ids in calls] == [
-        ("roomy", 15),
-        ("edge", 10),
-        ("full", 0),
-    ]
+    # "roomy" fits and is staged by the guard itself; the others go through
+    # the wrapped method with only what fits.
+    assert ib.token_ids_cpu[0, 10:25].tolist() == [1] * 15
+    assert ib.is_token_ids[0, 10:25].all() and not ib.is_token_ids[0, 25:].any()
+    assert [(r, len(ids)) for r, ids in calls] == [("edge", 10), ("full", 0)]
     # ...and the clamped write keeps the first drafts, not the last.
-    assert calls[1][1] == [2] * 10
+    assert calls[0][1] == [2] * 10
     # The scheduler's counts are restored, so the verify window stays aligned
     # with num_scheduled_tokens.
     assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] == [15, 15, 15]
     assert [requests[r].prev_num_draft_len for r in ("roomy", "edge", "full")] == [
-        0,
+        15,
         15,
         15,
     ]
-    assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] == [15, 15]
+    assert [len(ib.spec_token_ids[i]) for i in (0, 1, 2)] == [15, 15, 15]
 
 
 @pytest.mark.parametrize(
