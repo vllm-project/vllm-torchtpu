@@ -14,7 +14,7 @@
 # Benchmark point 10: the serve arguments and
 # environment each leg of the record run used. See README.md in this
 # directory for how to read and use it.
-name: p10-band-g-tp8-2p5d-cap3-c208
+name: p10-tp8-2p5d-cap3-c208
 point: 10
 record:
   mtok_per_dollar: 105.88
