@@ -163,6 +163,11 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_INGRAPH_RNG: bool = False
     TPU_SPEC_SYNTHETIC_HEAD_FUSION: bool = False
     TPU_SPEC_SUBST_EXTRACT_FUSION: bool = False
+    TPU_HOST_STAGE_TIMING_HOST_ONLY: bool = False
+    TPU_HOST_TOKEN_PADDING_REUSE: bool = False
+    TPU_HOST_SAMPLING_PARAMS_REUSE: bool = False
+    TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS: int = 0
+    TPU_HOST_KEEP_INPUT_MUTATIONS: int = 0
     TPU_DSPARK_MARKOV_KERNEL: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -1251,6 +1256,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compiled program instead of an eager slice plus an eager gather.
     "TPU_SPEC_SUBST_EXTRACT_FUSION": env_bool(
         "TPU_SPEC_SUBST_EXTRACT_FUSION", default=False
+    ),
+    # Host critical path of the decode loop (all default off, same tokens).
+    # Runner stage timings record host time only: no TpuEvent pair per stage
+    # (each record is ~30 us of host time; about 8 stages per decode cycle).
+    # The device-side stage samples (KV connector stats only) are dropped.
+    "TPU_HOST_STAGE_TIMING_HOST_ONLY": env_bool(
+        "TPU_HOST_STAGE_TIMING_HOST_ONLY", default=False
+    ),
+    # Skip the token-padding mask upload (a host alloc plus a synchronous
+    # H2D copy, twice per spec-decode cycle: target forward and drafter)
+    # when the mask already holds the same (valid, padded) rows.
+    "TPU_HOST_TOKEN_PADDING_REUSE": env_bool(
+        "TPU_HOST_TOKEN_PADDING_REUSE", default=False
+    ),
+    # Reuse the previous upload of the padded sampling params (temperature,
+    # top-k, top-p) when the batch's values are unchanged.
+    "TPU_HOST_SAMPLING_PARAMS_REUSE": env_bool(
+        "TPU_HOST_SAMPLING_PARAMS_REUSE", default=False
+    ),
+    # After this many consecutive execute_model steps with no new Dynamo
+    # graph, set torch.compiler stance skip_guard_eval_unsafe: Dynamo then
+    # runs only the guards that ever told its cache entries apart. A later
+    # recompile raises instead of compiling, so this needs every program
+    # warm. 0 = off.
+    "TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS": env_nonnegative_int(
+        "TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS", 0
+    ),
+    # Keep compiled graphs' input mutations (kv/index cache writes) in the
+    # graph instead of AOTAutograd's eager copy_ epilogue (120 host copy_ per
+    # MiniMax forward). 1 = keep_inference_input_mutations; 2 = also donate
+    # the written placeholders to torch_tpu's StaticCompiler. 0 = off. Changes
+    # every compiled program (and the compile cache key). BROKEN on the
+    # pinned torch_tpu: exos j-d93796de lost every in-graph cache write in
+    # both modes (caches_equal 0/120). Kept only for a future torch_tpu.
+    "TPU_HOST_KEEP_INPUT_MUTATIONS": env_nonnegative_int(
+        "TPU_HOST_KEEP_INPUT_MUTATIONS", 0
     ),
     # Run the DSpark greedy Markov chain over the vocab-parallel draft logits
     # as one Pallas call (kernels/collectives/markov_argmax.py) instead of K

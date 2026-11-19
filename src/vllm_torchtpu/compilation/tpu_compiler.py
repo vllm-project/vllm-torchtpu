@@ -190,6 +190,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_SRPT_ATTN_WORK_CAP",
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
     "PYTHON_TRACER_LEVEL",
+    # Decode-loop host switches (runner bookkeeping and Dynamo stance only;
+    # TPU_HOST_KEEP_INPUT_MUTATIONS does change the graphs and stays keyed).
+    "TPU_HOST_STAGE_TIMING_HOST_ONLY",
+    "TPU_HOST_TOKEN_PADDING_REUSE",
+    "TPU_HOST_SAMPLING_PARAMS_REUSE",
+    "TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
     "USE_PHASED_PROFILER",

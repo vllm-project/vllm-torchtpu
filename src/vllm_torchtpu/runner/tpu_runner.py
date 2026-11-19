@@ -179,6 +179,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.bucket_stats import BucketStats
+from vllm_torchtpu.runner.host_path import GuardEvalSkipper
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
@@ -1269,7 +1270,14 @@ class TPUModelRunner(GPUModelRunner):
         self._synthetic_row_rank: torch.Tensor | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._guard_eval_skipper = GuardEvalSkipper(
+            envs.TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS
+        )
+        # TPU_HOST_SAMPLING_PARAMS_REUSE: (key, device tuple, host sources).
+        self._sampling_params_reuse: tuple | None = None
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank, device_events=not envs.TPU_HOST_STAGE_TIMING_HOST_ONLY
+        )
         self._bucket_stats = BucketStats(enabled=profiler_rank == 0)
 
     def _init_phased_profiling(self) -> None:
@@ -4105,6 +4113,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._guard_eval_skipper.pending:
+            self._guard_eval_skipper.step()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -9248,6 +9258,27 @@ class TPUModelRunner(GPUModelRunner):
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
         num_active_reqs = cur_end_idx - cur_start_idx
+        reuse_key = None
+        if envs.TPU_HOST_SAMPLING_PARAMS_REUSE:
+            # The three uploads are a function of these host values; steady
+            # decode repeats them step after step. One entry: memory stays
+            # bounded, and it keeps the host sources alive while their
+            # non-blocking uploads may still read them.
+            batch = self.input_batch
+            reuse_key = (
+                padded_num_reqs,
+                num_active_reqs,
+                dtype,
+                str(device),
+                batch.temperature_cpu_tensor[cur_start_idx:cur_end_idx]
+                .numpy()
+                .tobytes(),
+                batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx].numpy().tobytes(),
+                batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx].numpy().tobytes(),
+            )
+            prev = self._sampling_params_reuse
+            if prev is not None and prev[0] == reuse_key:
+                return prev[1]
         temps_cpu = torch.ones(padded_num_reqs, dtype=dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
@@ -9267,11 +9298,18 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
-        return (
+        uploaded = (
             temps_cpu.unsqueeze(1).to(device, non_blocking=True),
             top_k_cpu.unsqueeze(1).to(device, non_blocking=True),
             top_p_cpu.unsqueeze(1).to(device, non_blocking=True),
         )
+        if reuse_key is not None:
+            self._sampling_params_reuse = (
+                reuse_key,
+                uploaded,
+                (temps_cpu, top_k_cpu, top_p_cpu),
+            )
+        return uploaded
 
     def _topk_candidate_blocks(self) -> int:
         """Returns TPU_SAMPLER_TOPK_CANDIDATES if the vocab allows it, else 0."""

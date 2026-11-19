@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -25,9 +25,15 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # TPU_HOST_TOKEN_PADDING_REUSE: skip an update that would rewrite the
+    # mask with the rows it already holds. Only `update` writes the mask.
+    reuse: bool = False
+    _written: tuple[int, int] | None = field(default=None, repr=False)
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
+        from vllm_torchtpu import envs
+
         # One spare block past the largest bucket: get_local_padding_mask()
         # then never slices the whole buffer, so Dynamo guards the token count
         # from above only. Slicing the full buffer at the largest bucket made
@@ -36,14 +42,21 @@ class TokenPaddingState:
         local_padding_mask = torch.zeros(
             max_local_tokens + _SPARE_ROWS, dtype=torch.bool, device=device
         )
-        return cls(local_padding_mask=local_padding_mask)
+        return cls(
+            local_padding_mask=local_padding_mask,
+            reuse=bool(envs.TPU_HOST_TOKEN_PADDING_REUSE),
+        )
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        key = (local_valid_tokens, local_padded_tokens)
+        if self.reuse and key == self._written:
+            return
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        self._written = key
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]

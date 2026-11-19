@@ -37,8 +37,10 @@ class RunnerStageTiming:
 
     MAX_IN_FLIGHT_DEVICE_TIMINGS = 1024
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, device_events: bool = True):
         self._rank = str(rank)
+        # False: `stage` times the host only (no TpuEvent pair per stage).
+        self._device_events = device_events
         self._cpu_samples: list[tuple[str, str, float]] = []
         # Includes active stages; saturation keeps CPU samples only.
         self._pending: deque[_PendingTiming] = deque()
@@ -51,6 +53,15 @@ class RunnerStageTiming:
 
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
+        if not self._device_events:
+            cpu_start = time.perf_counter()
+            try:
+                yield
+            finally:
+                self._cpu_samples.append(
+                    (self._rank, stage, time.perf_counter() - cpu_start)
+                )
+            return
         if len(self._pending) >= self.MAX_IN_FLIGHT_DEVICE_TIMINGS:
             with self.host_stage(stage):
                 yield
