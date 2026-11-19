@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -23,6 +24,10 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Util.
 
@@ -1147,6 +1152,37 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     )
 
 
+# Input quantization involves reading all elements in a block to compute scale
+# value. Since this operation is very memory intensive, we use a block size
+# that is small enough to minimize memory overhead but large enough to minimize
+# compute overhead of quantization.
+_LHS_QUANT_BLOCK_SIZE = 512
+
+
+def lhs_quant_block_size(rhs_block_size: int, size_k: int) -> int | None:
+    """Chooses the K block size for on-the-fly lhs quantization.
+
+    The quantized matmul applies one rhs scale per lhs block, so an lhs block
+    must not straddle rhs scale blocks. The default block is kept when the rhs
+    block is a multiple of it or spans K; otherwise the largest divisor of the
+    default block that also divides the rhs block is used.
+
+    Args:
+        rhs_block_size: Size of one rhs scale block along K.
+        size_k: Size of the contracting dimension K.
+
+    Returns:
+        The lhs quantization block size, or None if no divisor is a multiple of
+        the lane width, in which case lhs should stay unquantized.
+    """
+    if rhs_block_size >= size_k or rhs_block_size % _LHS_QUANT_BLOCK_SIZE == 0:
+        return _LHS_QUANT_BLOCK_SIZE
+    block_size = math.gcd(_LHS_QUANT_BLOCK_SIZE, rhs_block_size)
+    if block_size % pltpu.get_tpu_info().num_lanes != 0:
+        return None
+    return block_size
+
+
 def make_gmm_configs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -1214,14 +1250,33 @@ def make_gmm_configs(
         if tpu_info.int8_ops_per_second > 0 and not is_rhs_float:
             lhs_q_dtype = jnp.int8.dtype
 
+    lhs_qbs = _LHS_QUANT_BLOCK_SIZE
+    if lhs_q_dtype is not None:
+        aligned_qbs = lhs_quant_block_size(block_size, dims.size_k)
+        if aligned_qbs is None:
+            logger.warning_once(
+                "[GMM kernel] rhs quant block size %d (K=%d) has no lane-aligned "
+                "lhs quantization block that divides it; lhs stays unquantized "
+                "(bf16).",
+                block_size,
+                dims.size_k,
+            )
+            lhs_q_dtype = None
+        else:
+            lhs_qbs = aligned_qbs
+
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
-        # Input quantization involves reading all elements in a block to compute
-        # scale value. Since this operation is very memory intensive, we use a
-        # block size that is small enough to minimize memory overhead but large
-        # enough to minimize compute overhead of quantization.
-        quant_block_size=512,
+        quant_block_size=lhs_qbs,
         dtype=lhs.dtype,
+    )
+    assert (
+        not lhs_cfgs.should_quantize
+        or block_size >= dims.size_k
+        or block_size % lhs_cfgs.quant_block_size == 0
+    ), (
+        f"lhs quant block {lhs_cfgs.quant_block_size} straddles rhs scale blocks "
+        f"of {block_size}; each lhs block must get exactly one rhs scale."
     )
 
     if out_dtype is None:
