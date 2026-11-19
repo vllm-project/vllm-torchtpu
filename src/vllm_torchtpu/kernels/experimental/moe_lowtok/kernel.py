@@ -500,9 +500,7 @@ def _kernel_copies(
 
 
 def weight_layout(x, w13):
-    """(experts, intermediate width, w13 weight units, padded rows) of a call:
-    w13 streams as two units when each half of the intermediate width is
-    whole lanes, else as one."""
+    """(experts, intermediate width, w13 weight units, padded rows) of a call."""
     tokens, _ = x.shape
     n_experts, _, two_inter = w13.shape
     inter = two_inter // 2
