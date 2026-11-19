@@ -237,6 +237,7 @@ if TYPE_CHECKING:
     TPU_MLA_TC_KV_WRITER: bool = False
     TPU_MLA_DECODE_PROLOGUE: bool = False
     TPU_MLA_ABSORB_Q_FROM_HEAD: bool = False
+    TPU_MLA_SPARSE_FLAT_Q: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS: int = 32
     TPU_INDEXER_QB_OVERLAP: bool = False
@@ -1124,6 +1125,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # straight from the raw q head the attention kernel already takes, instead
     # of an XLA copy of the q_nope slice (prefill sizes; same bits).
     "TPU_MLA_ABSORB_Q_FROM_HEAD": env_bool("TPU_MLA_ABSORB_Q_FROM_HEAD", default=False),
+    # With TPU_MLA_DECODE_PROLOGUE: pass the 2D `[tokens, heads * qk_head_dim]`
+    # q projection output directly to `absorb_q` and the sparse MLA attention
+    # kernel on prefill/mixed buckets instead of reshaping to 3D `[tokens,
+    # heads, *]` in HBM, avoiding XLA's sublane-transposing `{3,1,2,0} ->
+    # {3,2,1,0}` layout copy between `q_b_proj` and its two consumers.
+    "TPU_MLA_SPARSE_FLAT_Q": env_bool("TPU_MLA_SPARSE_FLAT_Q", default=False),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache

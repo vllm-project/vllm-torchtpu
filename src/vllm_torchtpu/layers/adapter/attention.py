@@ -115,7 +115,7 @@ logger = init_logger(__name__)
 
 
 def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
-    return q_nope.new_empty((*q_nope.shape[:2], w_uk_t.shape[2]))
+    return q_nope.new_empty((q_nope.shape[0], w_uk_t.shape[0], w_uk_t.shape[2]))
 
 
 # Registered at import: Dynamo cannot trace a lock-guarded registration.
@@ -2944,7 +2944,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
-            q_nope_t = q_nope.transpose(0, 1)
+            q_nope_3d = (
+                q_nope.view(-1, attn_heads, q_nope.shape[1] // attn_heads)[
+                    ..., : w_uk_t_src.shape[1]
+                ]
+                if q_nope.ndim == 2
+                else q_nope
+            )
+            q_nope_t = q_nope_3d.transpose(0, 1)
             ql_nope = torch.bmm(q_nope_t, w_uk_t_src.to(q_nope_t.dtype))
             if w_uk_t_scale is not None:
                 ql_nope = ql_nope * w_uk_t_scale
@@ -2962,8 +2969,20 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
 
         ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
-        pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
-        q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
+        if (
+            q_pe.ndim == 2
+            and use_qrep
+            and bool(q_rope_table)
+            and envs.TPU_MLA_SPARSE_SPLIT_Q
+        ):
+            q_pe_flat = q_pe
+        else:
+            pe_dim = (
+                q_pe.shape[-1] // attn_heads
+                if q_pe.ndim == 2
+                else (q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim)
+            )
+            q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
 

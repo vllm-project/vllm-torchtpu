@@ -152,12 +152,15 @@ def _problem(rng, query_tokens, seq_q, topk=2048):
     )
 
 
-def _kernel(p, *, candidate, fault=None, q_pe=None):
+def _kernel(p, *, candidate, fault=None, q_pe=None, flat_q_pe=False):
     cache = _cos_sin_cache()
     kw = {}
     if candidate:
+        raw_q_pe = (
+            p["q_raw"].reshape(p["q_raw"].shape[0], -1) if flat_q_pe else p["q_raw"]
+        )
         kw = dict(
-            q_pe=p["q_raw"],
+            q_pe=raw_q_pe,
             q_rope_table=rope_table(p["positions"], cache),
             lse_in_kernel=True,
             prologue_fault=fault,
@@ -216,6 +219,15 @@ class DecodePrologueKernelTest(parameterized.TestCase):
         p = _problem(np.random.default_rng(1012 + query_tokens), query_tokens, seq_q)
         ref, ref_lse = _kernel(p, candidate=False)
         out, lse = _kernel(p, candidate=True)
+        np.testing.assert_array_equal(_bits16(out), _bits16(ref))
+        np.testing.assert_array_equal(_bits32(lse), _bits32(ref_lse))
+
+    @parameterized.parameters(*CELLS)
+    def test_flat_2d_q_pe_bit_identical(self, query_tokens, seq_q):
+        _require_tpu()
+        p = _problem(np.random.default_rng(2024 + query_tokens), query_tokens, seq_q)
+        ref, ref_lse = _kernel(p, candidate=False)
+        out, lse = _kernel(p, candidate=True, flat_q_pe=True)
         np.testing.assert_array_equal(_bits16(out), _bits16(ref))
         np.testing.assert_array_equal(_bits32(lse), _bits32(ref_lse))
         real = int(sum(seq_q))
