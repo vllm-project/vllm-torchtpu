@@ -38,6 +38,21 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def shared_step0_rows(
+    source: torch.Tensor, rows: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    """Draft step 0's shared selection (bind_shared_selection): the target's
+    sink row of each request's last verified token. Every row index is below
+    the step's token count (padding rows are -1, read as row 0), and the target
+    wrote its selection to the sink's first ``num_tokens`` rows. With
+    VLLM_TPU_QSA_DRAFT_SELECTION_SLICE the gather reads only those rows, so its
+    SparseCore offload formats a [num_tokens, width] operand rather than the
+    whole [max_num_batched_tokens, width] sink (~50 us per step 0 at 8192)."""
+    if vllm_torchtpu_envs.VLLM_TPU_QSA_DRAFT_SELECTION_SLICE:
+        source = source[:num_tokens]
+    return source[rows.clamp_min(0)]
+
+
 @dataclass(frozen=True)
 class QSAMetadata:
     """The model adapter supplies one shared ragged geometry and group-native pages.
@@ -994,7 +1009,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             # order) reuse what step 0 took.
             carried = cast(torch.Tensor, self._selection_rows)
             if rows is not None:
-                shared = source[rows.clamp_min(0)]
+                shared = shared_step0_rows(source, rows, hidden.shape[0])
                 update_rows_(carried, shared)
             else:
                 shared = carried[: hidden.shape[0]]

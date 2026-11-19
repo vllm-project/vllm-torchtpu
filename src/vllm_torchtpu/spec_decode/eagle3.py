@@ -1718,20 +1718,7 @@ class Eagle3Proposer:
         # `_draft_gather_positions` + `_draft_propose_token` as one program for
         # a row-selected step 0 (VLLM_TPU_DRAFT_CARRY_FUSED): the position
         # carry and the first draft token, the same ops in one dispatch.
-        assert self.draft_model is not None
-        indices = indices.clamp_min(0)
-        positions_carry = torch.index_select(positions, positions.ndim - 1, indices)
-        d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
-        if d2t is None:
-            token = (
-                self.draft_model.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
-            )
-        else:
-            draft_id = self.draft_model.logits_processor(
-                self.draft_model.lm_head, last_hidden
-            ).argmax(dim=-1)
-            token = (draft_id + d2t[draft_id]).to(torch.int32)
-        return positions_carry, token
+        return self._carry_and_token_body(positions, indices, last_hidden)
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1760,7 +1747,9 @@ class Eagle3Proposer:
         indices = indices.clamp_min(0)
         positions_carry = torch.index_select(positions, positions.ndim - 1, indices)
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
-        if d2t is None:
+        if d2t is None and envs.VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX:
+            token = greedy_draft_token(self.draft_model, last_hidden)
+        elif d2t is None:
             token = (
                 self.draft_model.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
             )

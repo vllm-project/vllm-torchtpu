@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES: bool = False
     VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
     VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: bool = False
+    VLLM_TPU_QSA_DRAFT_SELECTION_SLICE: bool = False
     VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
     VLLM_TPU_QWEN4_FUSED_PREP: bool = False
     VLLM_TPU_QWEN4_FUSED_PREP_CHECK: str = ""
@@ -431,6 +432,7 @@ if TYPE_CHECKING:
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
     VLLM_TPU_PROPOSE_DEVICE_CONSTANTS: bool = False
     VLLM_TPU_DRAFT_SHARD_ARGMAX: bool = False
+    VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX: bool = False
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
     VLLM_TPU_MTP_DRAFT_DECODE_ROWS: bool = False
     VLLM_TPU_MTP_DRAFT_PADDING_MASK: bool = False
@@ -870,6 +872,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION": env_bool(
         "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
+    ),
+    # With VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: draft step 0 gathers its rows
+    # from the first T rows of the target's selection sink (T = the step's
+    # tokens; every row index is below T) instead of the whole
+    # [max_num_batched_tokens, width] sink. Same rows; the gather's
+    # SparseCore offload then formats a [T, width] operand, not the whole sink.
+    "VLLM_TPU_QSA_DRAFT_SELECTION_SLICE": env_bool(
+        "VLLM_TPU_QSA_DRAFT_SELECTION_SLICE"
     ),
     "VLLM_TPU_QSA_INDEXER_MIXED_ONLY": env_bool(
         "VLLM_TPU_QSA_INDEXER_MIXED_ONLY", default=False
@@ -2709,6 +2719,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # logits (spec_decode/shard_argmax.py). Bit-identical to the full argmax.
     "VLLM_TPU_DRAFT_SHARD_ARGMAX": env_bool(
         "VLLM_TPU_DRAFT_SHARD_ARGMAX", default=False
+    ),
+    # With VLLM_TPU_DRAFT_SHARD_ARGMAX: also the first draft token of a
+    # row-selected step 0 (_draft_rows_carry_and_token and its ROWS_FRESH
+    # variant) takes the vocab-shard argmax, instead of all-gathering the
+    # full logits. Bit-identical to the full argmax.
+    "VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX": env_bool(
+        "VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX", default=False
     ),
     # MTP draft step 0 on a draft declaring `supports_draft_rows` (Qwen4Exp):
     # write the draft layer's caches for every token of the target's step but
