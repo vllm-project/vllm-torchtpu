@@ -1292,10 +1292,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pairs (distinct destinations; same bytes).
     "VLLM_TPU_MK_QSEL_ASYNC": env_bool("VLLM_TPU_MK_QSEL_ASYNC"),
     # Whole-step QSA cross-request prefetch (exact: same copies and math, only the DMA
-    # schedule changes). 1: the union attention's tile stream continues across requests
-    # (request q+1's ids staged and its first tiles issued while request q's last tiles
-    # compute). 2: also the request loop's per-request loads (raw ring row, RoPE row, recent
-    # tile's pool rows) are issued one request ahead (`wholeloop=1`).
+    # schedule changes). Bit mask. 1: the union attention's tile stream continues across
+    # requests (request q+1's ids staged and its first tiles issued while request q's last
+    # tiles compute; exos: +10..+113 us per call, the stream is issue-bound). 2: the request
+    # loop's per-request loads (raw ring row, RoPE row, recent tile's pool rows) are issued one
+    # request ahead (`wholeloop=1`). 2 is the useful setting; 3 = both.
     "VLLM_TPU_MK_QSA_XREQ_PREFETCH": env_int("VLLM_TPU_MK_QSA_XREQ_PREFETCH", 0),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;

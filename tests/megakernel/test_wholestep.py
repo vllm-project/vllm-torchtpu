@@ -1264,7 +1264,7 @@ CTX_XREQ = [3001, 100, 3, 2000, 50, 3001, 1, 777]
 
 
 def _xreq_pair(monkeypatch, B: int, dcp: int = 1, skip_idle: bool = False, phys: bool = False,
-               xreq: int = 2):
+               xreq: int = 3):
     from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
 
     kw = dict(long=True, rank_ids=True, union=True, shard=True, loop=True, B=B, phys=phys,
@@ -1282,14 +1282,17 @@ def _assert_xreq_identical(base: tuple, run: tuple) -> None:
         np.testing.assert_array_equal(run[8][k], base[8][k], err_msg=k)
 
 
-@pytest.mark.parametrize("B,dcp", [(8, 1), (8, 2), (32, 1), (32, 2), (64, 2)])
-def test_xreq_prefetch_bit_identical(monkeypatch, B, dcp):
+@pytest.mark.parametrize("B,dcp,xreq", [
+    (8, 1, 3), (8, 2, 3), (32, 1, 3), (32, 2, 3), (64, 2, 3), (8, 1, 2), (8, 2, 2),
+])
+def test_xreq_prefetch_bit_identical(monkeypatch, B, dcp, xreq):
     """VLLM_TPU_MK_QSA_XREQ_PREFETCH: the union tile stream continues across the request loop
     (request q+1's ids staged in the second `qu_row` bank, its first tiles issued into the
     slots request q's last tiles free); ragged unions incl. empty requests and a one-tile
-    request ahead of a full one; level 2 also issues the request loop's loads one request
-    ahead. Every output byte-identical, with and without main-KV DCP."""
-    base, run = _xreq_pair(monkeypatch, B, dcp)
+    request ahead of a full one; bit 2 issues the request loop's loads one request ahead
+    (alone and with the tile stream). Every output byte-identical, with and without main-KV
+    DCP."""
+    base, run = _xreq_pair(monkeypatch, B, dcp, xreq=xreq)
     assert np.isfinite(base[0]).all()
     _assert_xreq_identical(base, run)
 
