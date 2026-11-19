@@ -1617,7 +1617,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR", 1
     ),
     # MiniMax M3 head-parallel MSA prefill: the replicas of a KV head split
-    # the first round's rows (alternate query tiles) instead of its query
+    # each kernel call's rows (alternate query tiles) instead of its query
     # heads, so each kernel tile carries all the KV head's query heads over
     # the same selected-page union (twice the rows per page at 2 replicas).
     # The query heads and outputs move by an all-to-all inside the replica

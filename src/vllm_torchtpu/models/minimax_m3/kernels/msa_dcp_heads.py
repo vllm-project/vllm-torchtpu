@@ -943,16 +943,11 @@ def _head_parallel_attend(
             head_major=True,
             interpret=interpret,
         )
-        if not merge:
-            # One call over every row: the kernel chunks the rows and writes
-            # its output in place; rows outside the round see no page and
-            # come back zero (cheap empty tiles).
-            block_q = attend.keywords["block_q"]
-            if (
-                replicas > 1
-                and hp_row_split()
-                and num_tokens % (replicas * block_q) == 0
-            ):
+        block_q = attend.keywords["block_q"]
+        split = replicas > 1 and hp_row_split()
+
+        def call(q, keys, local, limit):
+            if split and q.shape[0] % (replicas * block_q) == 0:
                 return _attend_row_split(
                     attend,
                     q,
@@ -967,8 +962,13 @@ def _head_parallel_attend(
                     axis=axis,
                     dcp=dcp,
                 )
-            out, _ = attend(q, kv, keys, local, limit, page_table)
-            return out
+            return attend(q, kv, keys, local, limit, page_table)[0]
+
+        if not merge:
+            # One call over every row: the kernel chunks the rows and writes
+            # its output in place; rows outside the round see no page and
+            # come back zero (cheap empty tiles).
+            return call(q, keys, local, limit)
 
         def window_body(i, acc):
             start = jnp.minimum(lo + i * window, num_tokens - window)
@@ -976,7 +976,7 @@ def _head_parallel_attend(
             def sl(x):
                 return jax.lax.dynamic_slice_in_dim(x, start, window, 0)
 
-            out, _ = attend(sl(q), kv, sl(keys), sl(local), sl(limit), page_table)
+            out = call(sl(q), sl(keys), sl(local), sl(limit))
             old = jax.lax.dynamic_slice_in_dim(acc, start, window, 1)
             out = jnp.where(sl(mine)[None, :, None], out, old)  # earlier rounds
             return jax.lax.dynamic_update_slice_in_dim(acc, out, start, 1)

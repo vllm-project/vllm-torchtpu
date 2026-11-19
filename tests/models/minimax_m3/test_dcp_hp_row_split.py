@@ -27,7 +27,7 @@ import pytest
 _E2E = textwrap.dedent(
     """
     import os, sys
-    dcp = int(sys.argv[1])
+    dcp, nreq = int(sys.argv[1]), int(sys.argv[2])
     os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG"] = "8:16::64"
@@ -46,17 +46,25 @@ _E2E = textwrap.dedent(
         rng.integers(0, 16, (pool, S, heads * 2 * D)), jnp.uint8))) for _ in range(dcp)])
     sc = rng.uniform(0.01, 0.05, (dcp, pool, msa_fp4.SCALE_ROWS, S)).astype(np.float32)
     q = rng.standard_normal((dcp, T, Hl, D)).astype(np.float32)
-    bt = np.zeros((nseq, C), np.int32); bt[1] = rng.permutation(pool)[:C]
+    bt = np.zeros((nseq, C), np.int32); bt[1] = rng.permutation(pool)[:C]; bt[2] = rng.permutation(pool)[:C]
+    if nreq == 2:
+        # Two prefill requests of 6 blocks per rank each: two rounds of an
+        # 8-block buffer (the second one in windows).
+        nblk = 6 * dcp
     sel = np.full((dcp, T, K), -1, np.int32)
-    widths = (64, 16, 32, 16)
+    widths = (64, 16, 32, 16) if nreq == 1 else (24, 16, 20, 16)
     for h in range(heads):
         w = widths[h]
         for t in range(8, TREAL):
             lo = rng.integers(0, nblk - w + 1) if h == 0 else 0
             sel[h * R:(h + 1) * R, t] = np.sort(rng.choice(np.arange(lo, lo + w), K, replace=False))[::-1]
-    # Request 0: 8 decode rows (not head-parallel); request 1: the prefill rows.
-    seq_lens = np.array([8, nblk * S, 0], np.int32); cu = np.array([0, 8, TREAL, TREAL], np.int32)
-    hp = np.array([False, True, False])
+    # Request 0: 8 decode rows (not head-parallel); then the prefill rows.
+    if nreq == 1:
+        seq_lens = np.array([8, nblk * S, 0], np.int32); cu = np.array([0, 8, TREAL, TREAL], np.int32)
+        hp = np.array([False, True, False])
+    else:
+        seq_lens = np.array([8, nblk * S, nblk * S], np.int32); cu = np.array([0, 8, 56, TREAL], np.int32)
+        hp = np.array([False, True, True])
     H._own_selection = lambda candidates, **kw: candidates
     def run(between=None):
         @jax.jit
@@ -98,10 +106,10 @@ _E2E = textwrap.dedent(
 )
 
 
-@pytest.mark.parametrize("dcp", [4, 8])
-def test_row_split_same_bits(dcp):
+@pytest.mark.parametrize("dcp,nreq", [(4, 1), (8, 1), (4, 2)])
+def test_row_split_same_bits(dcp, nreq):
     r = subprocess.run(
-        [sys.executable, "-c", _E2E, str(dcp)],
+        [sys.executable, "-c", _E2E, str(dcp), str(nreq)],
         capture_output=True,
         text=True,
         env=dict(os.environ),
