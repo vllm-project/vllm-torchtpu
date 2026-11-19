@@ -110,14 +110,17 @@ PREFILL_ROW_SPLIT = int(os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_ROW_SPLIT", "
 PREFILL_FP8_BODY = os.environ.get("TPU_MINIMAX_M3_MSA_PREFILL_FP8_BODY", "").strip() or None
 
 
-def chunk_body(spec: str | None) -> tuple[int, int] | None:
-    """``"c<P>r<R>"`` -> ``(P, R)``: pages per softmax chunk, query rows per block."""
+def chunk_body(spec: str | None) -> tuple[int, int, str] | None:
+    """``"c<P>r<R>[x<flags>]"`` -> ``(P, R, flags)``: pages per softmax chunk,
+    query rows per block; benchmark-only removal flags after ``x`` (m: no
+    score mask, e: no exp2, u: no page unpack, p: no p @ v) give wrong
+    outputs and price their part."""
     if not spec:
         return None
-    m = re.fullmatch(r"c(\d+)r(\d+)", spec)
+    m = re.fullmatch(r"c(\d+)r(\d+)(?:x([meup]+))?", spec)
     if not m:
         raise ValueError(f"MSA prefill body {spec!r} is not c<pages>r<rows>.")
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1)), int(m.group(2)), m.group(3) or ""
 
 
 if PREFILL_PAGE_CACHE_SLOTS:
@@ -422,7 +425,8 @@ def _kernel(
     tiles_per_head: int = 0,
     precision: frozenset = frozenset(),
     pair: bool = False,
-    chunk: tuple[int, int] | None = None,
+    chunk: tuple[int, int, str] | None = None,
+    removed: str = "",
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -752,13 +756,19 @@ def _kernel(
             local_page = local_page_ref[...].T  # [1, Bq]
             local_limit = local_limit_ref[...].T
             keys, values, masks = [], [], []
+            rows0 = None
             for g in range(width):
                 page, kv_ref, scale_ref = group_page(g)
                 hit = jnp.max((sel_t == page).astype(jnp.int32), axis=0, keepdims=True)
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
-                if packing == 4:
+                if packing == 4 and "u" in removed:  # benchmark only: one relayout
+                    if rows0 is None:
+                        rows0 = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
+                    rows = rows0
+                    values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
+                elif packing == 4:
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
                 else:
@@ -766,26 +776,31 @@ def _kernel(
                     values.append(rows[:, head_dim:])
                 keys.append(rows[:, :head_dim])
                 # Rows are head-major (h * Bq + t): every head shares a token's mask.
-                masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
+                if "m" not in removed:
+                    masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
-            mask = jnp.concatenate(masks, axis=0)
+            mask = jnp.concatenate(masks, axis=0) if masks else None
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             s = jax.lax.dot_general(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )  # [W * S, rows]
-            s = jnp.where(mask, s, -jnp.inf)
+            if mask is not None:
+                s = jnp.where(mask, s, -jnp.inf)
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
-            p = jnp.exp2(s - m_new)
+            p = s - m_new if "e" in removed else jnp.exp2(s - m_new)
             l_cur = jnp.sum(p, axis=0, keepdims=True)
-            pv = jax.lax.dot_general(
-                v,
-                p.astype(v.dtype),
-                (((0,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )  # [D, rows]
+            if "p" in removed:
+                pv = jnp.zeros((head_dim, s.shape[1]), jnp.float32) + l_cur
+            else:
+                pv = jax.lax.dot_general(
+                    v,
+                    p.astype(v.dtype),
+                    (((0,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )  # [D, rows]
             if single:
                 finish_t(m_new, l_cur, pv)
                 return
@@ -811,7 +826,7 @@ def _kernel(
             scores [P * S, R] stay in vector registers (the whole-group
             ``s^T [W * S, H * Bq]`` of `attend_t` round-trips VMEM per pass).
             One instance serves single and carried groups."""
-            chunk_pages, chunk_rows = chunk
+            chunk_pages, chunk_rows, removed = chunk
             rows = num_heads * block_q
             row_slots = jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
             sel_t = selected_ref[...].T  # [K, Bq]
@@ -831,7 +846,8 @@ def _kernel(
                 lim_scr[g] = jnp.tile(limit, (1, reps))
                 return carry
 
-            jax.lax.fori_loop(0, count, unpack, 0)
+            if "u" not in removed:
+                jax.lax.fori_loop(0, count, unpack, 0)
             num_chunks = (count + chunk_pages - 1) // chunk_pages
 
             def pad(g, carry):  # the last chunk's pages past the group's
@@ -863,11 +879,14 @@ def _kernel(
                     s = jax.lax.dot_general(
                         k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
                     )  # [P * S, R]
-                    s = jnp.where(mask, s, -jnp.inf)
+                    if "m" not in removed:
+                        s = jnp.where(mask, s, -jnp.inf)
                     m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
-                    p = jnp.exp2(s - m_new)
+                    p = s - m_new if "e" in removed else jnp.exp2(s - m_new)
                     alpha = jnp.exp2(m_prev - m_new)
                     l_new = alpha * l_prev + jnp.sum(p, axis=0, keepdims=True)
+                    if "p" in removed:
+                        return m_new, l_new, alpha * acc_prev
                     pv = jax.lax.dot_general(
                         v, p.astype(v.dtype), (((0,), (0,)), ((), ())),
                         preferred_element_type=jnp.float32,
@@ -1395,6 +1414,9 @@ def _attention_call(
     )
     if row_split < 1 or num_heads % row_split or (num_heads // row_split * block_q) % 128:
         row_split = 1
+    removed = ""
+    if prefill_body and prefill_body.startswith("x"):  # benchmark-only removal arms
+        removed, prefill_body = prefill_body[1:], None
     chunk = chunk_body(prefill_body)
     if chunk is not None and not (
         transposed and packing == 4 and not cache_size and not pair and row_split == 1
@@ -1470,6 +1492,7 @@ def _attention_call(
             precision=precision if fp4 else frozenset(),
             pair=pair,
             chunk=chunk,
+            removed=removed,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
