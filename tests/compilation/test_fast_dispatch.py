@@ -50,7 +50,7 @@ def _config(section=None):
     return SimpleNamespace(additional_config=additional)
 
 
-def _compiled(fn, **options):
+def _compiled(fn):
     """What the hook builds for an eligible function, on the eager backend."""
     compiled = torch.compile(
         fn,
