@@ -1870,11 +1870,21 @@ def unpatched_v6(monkeypatch):
 
 def test_install_qwen3_next_v6_patches_wraps_the_loader_once(monkeypatch, unpatched_v6):
     """The install routes Qwen3NextAttention and the sparse MoE block through
-    the patched forwards and has the loader run the post-load setup on every
-    model it processes; a second install changes nothing."""
+    the patched forwards, prebuilds the fused gate's ops when an attention
+    layer is built, and has the loader run the post-load setup on every model
+    it processes; a second install changes nothing."""
     setups = []
+    prebuilds = []
     monkeypatch.setattr(patch_mod, "setup_qwen3_next_v6_after_loading", setups.append)
-    monkeypatch.setattr(patch_mod, "_get_sigmoid_gate_quant_op", lambda: None)
+    monkeypatch.setattr(
+        patch_mod, "_prebuild_sigmoid_gate_ops", lambda: prebuilds.append(True)
+    )
+    attn_inits = []
+    monkeypatch.setattr(
+        qwen3_next.Qwen3NextAttention,
+        "__init__",
+        lambda self, *args, **kwargs: attn_inits.append(args),
+    )
     patch_mod.install_qwen3_next_v6_patches()
     assert (
         qwen3_next.Qwen3NextAttention.forward
@@ -1892,6 +1902,14 @@ def test_install_qwen3_next_v6_patches_wraps_the_loader_once(monkeypatch, unpatc
     assert wrapped(model, None, "cpu") == "processed"
     assert setups == [model]
 
+    # Constructing an attention layer runs vLLM's __init__, then prebuilds the
+    # fused gate's ops.
+    qwen3_next.Qwen3NextAttention.__init__(
+        object.__new__(qwen3_next.Qwen3NextAttention), "config"
+    )
+    assert attn_inits == [("config",)]
+    assert prebuilds == [True]
+
     patch_mod.install_qwen3_next_v6_patches()
     assert unpatched_v6.process_weights_after_loading is wrapped
 
@@ -1901,7 +1919,7 @@ def test_step0_post_attn_gather_is_installed_with_the_patched_forwards(
 ):
     """A draft model runs the step-0 post-attention gather when it says so or
     when the attention, decoder-layer and MTP forwards are the patched ones."""
-    monkeypatch.setattr(patch_mod, "_get_sigmoid_gate_quant_op", lambda: None)
+    monkeypatch.setattr(patch_mod, "_prebuild_sigmoid_gate_ops", lambda: None)
 
     class Mtp:
         forward = patch_mod.patched_mtp_forward
