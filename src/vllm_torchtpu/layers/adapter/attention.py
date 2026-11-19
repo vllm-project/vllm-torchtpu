@@ -882,7 +882,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
     attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF
     # Set by the runner on a speculative draft's attention layers before
     # their kernels are built: those layers keep full precision.
-    native_fp8_draft: bool = False
+    is_attention_draft: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1016,7 +1016,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if use_pcp_streaming
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
-        modes = native_fp8_scope.effective(self.attention_modes, self.native_fp8_draft)
+        modes = native_fp8_scope.effective(
+            self.attention_modes, self.is_attention_draft
+        )
         if modes.any() and (
             use_pcp_streaming
             or "attention_modes" not in inspect.signature(self._kernel_entry).parameters
@@ -1280,7 +1282,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
             attention_modes=native_fp8_scope.effective(
-                self.attention_modes, self.native_fp8_draft
+                self.attention_modes, self.is_attention_draft
             ),
             tuned_tiles=self.tuned_tiles,
             skip_empty_mixed=self.skip_empty_mixed,
@@ -1345,7 +1347,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "kernel but has no bundled variant; refusing to fall "
                 "back to the default bundled kernel."
             )
-        modes = native_fp8_scope.effective(self.attention_modes, self.native_fp8_draft)
+        modes = native_fp8_scope.effective(
+            self.attention_modes, self.is_attention_draft
+        )
         if modes.any():
             raise NotImplementedError(
                 "VLLM_TPU_BLOCK_MAJOR_KV=1: the bundled RPA kernel has no "
@@ -1514,7 +1518,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
                     attention_modes=native_fp8_scope.effective(
-                        self.attention_modes, self.native_fp8_draft
+                        self.attention_modes, self.is_attention_draft
                     ),
                     tuned_tiles=self.tuned_tiles,
                     skip_empty_mixed=self.skip_empty_mixed,

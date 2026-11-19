@@ -6453,7 +6453,7 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     # Reduced-precision attention is target-only: mark the
                     # layer before its kernels are built (native_fp8_scope).
-                    impl.native_fp8_draft = is_draft
+                    impl.is_attention_draft = is_draft
                     if not is_draft and target_modes is None:
                         target_modes = impl.attention_modes
                     impl.initialize_kernel(cast(AttentionLayer, attn_layer))
