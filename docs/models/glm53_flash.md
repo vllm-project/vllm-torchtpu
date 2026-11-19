@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Hugging Face repo | `zai-org/GLM-5.3-Flash` |
-| Architecture classes | `Glm5NextForConditionalGeneration`, `Glm5NextForCausalLM` (`model_type: glm5_next`) |
+| Architecture classes | `Glm5NextForConditionalGeneration`, `Glm5NextForCausalLM`, `Glm5NextMTPModel` (`model_type: glm5_next`) |
 | Code | `src/vllm_torchtpu/models/vllm/glm5_next/`, `src/vllm_torchtpu/layers/adapter/custom_ops/glm53_*`, `src/vllm_torchtpu/kernels/glm53_*` |
 
 ## Model summary
@@ -47,6 +47,16 @@ vllm serve zai-org/GLM-5.3-Flash \
   --mamba-cache-mode align \
   --max-model-len 131072 \
   --max-num-seqs 64
+```
+
+To enable Multi-Token Prediction (`k=3` speculative draft tokens):
+
+```bash
+vllm serve zai-org/GLM-5.3-Flash \
+  --tensor-parallel-size 8 \
+  --kv-cache-dtype fp8 \
+  --mamba-cache-mode align \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 ```
 
 ## Limitations
