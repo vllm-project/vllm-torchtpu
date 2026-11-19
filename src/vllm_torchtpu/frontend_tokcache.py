@@ -31,7 +31,7 @@ from collections import OrderedDict
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-_P = "tpu_frontend.tokenize_prefix_cache:"
+_LOG_PREFIX = "tpu_frontend.tokenize_prefix_cache:"
 
 BOUNDARY = "<|im_start|>"
 _BOUNDARY_B = BOUNDARY.encode("utf-8")
@@ -250,7 +250,9 @@ class PrefixTokenCache:
             except ValueError:
                 ok = False
             if not ok:
-                logger.warning_once("%s boundary/token mismatch; full encode", _P)
+                logger.warning_once(
+                    "%s boundary/token mismatch; full encode", _LOG_PREFIX
+                )
                 return self._encode(text)
             ids = e.ids[:tok_idx]
             ids.extend(suf_ids)
@@ -270,7 +272,7 @@ class PrefixTokenCache:
                     logger.error(
                         "%s verify mismatch (len %d vs %d); disabling "
                         "the tokenize prefix cache permanently",
-                        _P,
+                        _LOG_PREFIX,
                         len(full),
                         len(ids),
                     )
@@ -378,7 +380,7 @@ class PrefixTokenCache:
         now = time.monotonic()
         if now - self._last_log >= self._log_period:
             self._last_log = now
-            logger.debug("%s stats %s", _P, self.stats())
+            logger.debug("%s stats %s", _LOG_PREFIX, self.stats())
 
 
 _INSTALLED = False
@@ -405,13 +407,13 @@ def _build_cache_for(
     if backend is None or not isinstance(backend, Tokenizer):
         logger.warning(
             "%s tokenizer %s has no Rust backend; not enabled",
-            _P,
+            _LOG_PREFIX,
             type(tokenizer).__name__,
         )
         return None
     boundary_id = tokenizer.convert_tokens_to_ids(BOUNDARY)
     if not isinstance(boundary_id, int) or boundary_id < 0:
-        logger.warning("%s %s not in vocab; not enabled", _P, BOUNDARY)
+        logger.warning("%s %s not in vocab; not enabled", _LOG_PREFIX, BOUNDARY)
         return None
     # Per-thread private copies: no truncation/padding state, no RefCell
     # borrow conflicts with the vLLM tokenizer pool.
@@ -442,7 +444,7 @@ def _build_cache_for(
         or encode(probe) != tokenizer(probe, add_special_tokens=False)["input_ids"]
         or encode(probe).count(boundary_id) != 1
     ):
-        logger.warning("%s tokenizer safety probe failed; not enabled", _P)
+        logger.warning("%s tokenizer safety probe failed; not enabled", _LOG_PREFIX)
         return None
     return PrefixTokenCache(encode, boundary_id, max_tokens=max_tokens)
 
@@ -459,7 +461,9 @@ def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
         from vllm.renderers import base as rbase
         from vllm.renderers.hf import HfRenderer
     except Exception as e:  # pragma: no cover
-        logger.warning("%s cannot import vLLM renderer (%r); not enabled", _P, e)
+        logger.warning(
+            "%s cannot import vLLM renderer (%r); not enabled", _LOG_PREFIX, e
+        )
         return False
 
     orig = rbase.BaseRenderer._tokenize_prompt
@@ -480,7 +484,7 @@ def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
                         logger.info(
                             "%s active: incremental prompt "
                             "tokenization at %s boundaries (pid %d)",
-                            _P,
+                            _LOG_PREFIX,
                             BOUNDARY,
                             os.getpid(),
                         )
@@ -516,7 +520,7 @@ def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
             logger.warning(
                 "%s %s in the cached tokenization (%s); the cache is off and "
                 "every prompt now uses vLLM's tokenization",
-                _P,
+                _LOG_PREFIX,
                 type(e).__name__,
                 e,
             )
@@ -526,7 +530,7 @@ def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
     _INSTALLED = True
     logger.info(
         "%s installed BaseRenderer._tokenize_prompt patch (pid %d)",
-        _P,
+        _LOG_PREFIX,
         os.getpid(),
     )
     return True
