@@ -612,6 +612,16 @@ _TUNED_PREFILL_TILES: dict[
 ] = {
     (pltpu.ChipVersion.TPU_7X, 32, 2, 256, True): (256, 16, 1024, 1),
 }
+# Layer shapes that keep the heuristic's prefill/mixed tiles, listed so that
+# the miss log names only shapes nobody has looked at: the decode legs of
+# Qwen3.5-397B on TPU7x (16 q / 1 KV head with DP4 x TP2, 4 q / 1 KV head with
+# TP8 and DCP4) were measured with the heuristic's tiles.
+_HEURISTIC_PREFILL_SHAPES = frozenset(
+    {
+        (pltpu.ChipVersion.TPU_7X, 16, 1, 256, True),
+        (pltpu.ChipVersion.TPU_7X, 4, 1, 256, True),
+    }
+)
 # Tiles that produced wrong outputs at the tuned shape: 128,16,1024,1 scored
 # 78.01% on GSM8K (gate 97%). No table entry, and no table entry after the bq
 # clamp, may use them.
@@ -630,10 +640,11 @@ def tuned_prefill_block_sizes(
     shape, or `default` (the heuristic's). Applied with ``tuned_tiles`` only.
 
     bq is clamped to the aligned token count as the heuristic does, and bq_c
-    to a divisor of bq. A shape the table does not list, a page size that does
-    not divide the table's bkv, a clamp that lands on `_UNSAFE_PREFILL_TILES`,
-    and tiles that do not pass `fits` (the VMEM check) each take `default`
-    and log it once.
+    to a divisor of bq. A shape the table does not list takes `default` and
+    logs its key once, unless `_HEURISTIC_PREFILL_SHAPES` lists it. A page
+    size that does not divide the table's bkv, a clamp that lands on
+    `_UNSAFE_PREFILL_TILES`, and tiles that do not pass `fits` (the VMEM
+    check) each take `default` and log it once.
     """
     is_fp8_kv = jnp.dtype(serve_cfgs.dtype_kv) in (
         jnp.dtype(jnp.float8_e4m3fn),
@@ -648,12 +659,13 @@ def tuned_prefill_block_sizes(
     )
     tiles = _TUNED_PREFILL_TILES.get(key)
     if tiles is None:
-        logger.warning_once(
-            "Batched RPA: no tuned prefill tiles for (chip, q heads, KV heads, "
-            "head_dim, fp8 KV) = %s; using the heuristic's %s.",
-            key,
-            default,
-        )
+        if key not in _HEURISTIC_PREFILL_SHAPES:
+            # Once per shape: the heuristic's tiles vary with the token count.
+            logger.warning_once(
+                "Batched RPA: no tuned prefill tiles for (chip, q heads, KV "
+                "heads, head_dim, fp8 KV) = %s; using the heuristic's tiles.",
+                key,
+            )
         return default
     if tiles in _UNSAFE_PREFILL_TILES:
         raise ValueError(f"prefill tiles {tiles} for {key} are known to be wrong")
