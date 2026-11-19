@@ -76,6 +76,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
     TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS: int = 0
+    TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS: int = 0
+    TPU_MINIMAX_M3_FP8_CAST_SKIP: str = "shared_experts.gate_up_proj"
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -759,6 +761,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Smallest token bucket TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS applies to.
     "TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS": env_nonnegative_int(
         "TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS", 0
+    ),
+    # MiniMax-M3 e4m3 linears: token buckets of at least this many rows cast
+    # the bf16 activations to e4m3 unscaled (clamped to +-448; no abs-max
+    # pass) and run the matmul fp8 x fp8 on the MXU with f32 accumulation.
+    # The cast fuses into the activation's producer (input RMSNorm for
+    # qkv), so it costs no extra pass; the per-token abs-max of
+    # TPU_MINIMAX_M3_FP8_W8A8_* costs as much as the fp8 MXU saves at
+    # prefill sizes. Changes numerics. 0 (default) keeps bf16 activations.
+    "TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS", 0
+    ),
+    # Comma-separated linear-name suffixes TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS
+    # leaves on bf16 activations: the shared expert's gate_up input also
+    # feeds the bf16 routed experts, so its cast is an extra pass.
+    "TPU_MINIMAX_M3_FP8_CAST_SKIP": env_str(
+        "TPU_MINIMAX_M3_FP8_CAST_SKIP", "shared_experts.gate_up_proj"
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/

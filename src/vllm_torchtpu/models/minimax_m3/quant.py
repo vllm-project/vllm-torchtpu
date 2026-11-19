@@ -76,6 +76,36 @@ _materialized_bf16 = pallas.jax_op("pallas::minimax_m3_upcast_e4m3", _upcast_e4m
 _materialized_bf16.register_fake(lambda w: torch.empty_like(w, dtype=torch.bfloat16))
 
 
+_E4M3_MAX = 448.0
+
+
+def _fp8_cast_matmul(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
+    """``bf16(e4m3(clip(x)) @ w * scale)`` with f32 accumulation: no
+    per-token scale, so the cast is elementwise and fuses into x's producer."""
+    x8 = jnp.clip(x, -_E4M3_MAX, _E4M3_MAX).astype(jnp.float8_e4m3fn)
+    acc = jax.lax.dot_general(
+        x8, w, (((x.ndim - 1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    return (acc * scale.astype(jnp.float32).reshape(-1)).astype(jnp.bfloat16)
+
+
+_fp8_cast_linear = pallas.jax_op("pallas::minimax_m3_fp8_cast_linear", _fp8_cast_matmul)
+_fp8_cast_linear.register_fake(
+    lambda x, w, scale: torch.empty(
+        (*x.shape[:-1], w.shape[1]), dtype=torch.bfloat16, device=x.device
+    )
+)
+
+
+def _fp8_cast_applies(layer: torch.nn.Module, rows: int) -> bool:
+    min_rows = envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS
+    if not min_rows or rows < min_rows:
+        return False
+    prefix = getattr(layer, "prefix", "")
+    skip = [s for s in envs.TPU_MINIMAX_M3_FP8_CAST_SKIP.split(",") if s]
+    return not any(prefix.endswith(s) for s in skip)
+
+
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
 _E8M0_BIAS = 127
@@ -227,6 +257,15 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
                 max(1, envs.TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS),
                 envs.TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS,
             )
+        if envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS:
+            logger.info_once(
+                "TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS=%d: MXFP8 linears cast "
+                "activations to e4m3 (unscaled) and run fp8 x fp8 for token "
+                "buckets of >= %d rows, except %s.",
+                envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS,
+                envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS,
+                envs.TPU_MINIMAX_M3_FP8_CAST_SKIP or "none",
+            )
         logger.debug(
             "MXFP8 linear %s kept e4m3: %d of %d elements below e4m3's normal "
             "range after the block shift.",
@@ -252,6 +291,8 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         ):
             # Rows are static at trace time, so each bucket picks one path.
             return quantized_matmul(x, layer.weight, layer.weight_scale)
+        if x.dtype == torch.bfloat16 and _fp8_cast_applies(layer, rows):
+            return _fp8_cast_linear(x, layer.weight, layer.weight_scale)
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
             weight = _materialized_bf16(layer.weight)
         else:
