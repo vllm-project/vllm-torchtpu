@@ -38,7 +38,7 @@
   const STATE = { pinA: 0, pinB: -1, customDirty: false, hwDirty: false,
   meshDirty: false, calibrated: false, dispatchRegime: 'compiled_xla',
   selectedTopic: { kind: 'scope', scope: 'whole_step', sub: 'total' },
-  calSource: '', calStepTimeUs: null, launchGapHiUs: 1.5,
+  calSource: '', calStepTimeUs: null, calHostHeadUs: null, launchGapHiUs: 1.5,
   collectiveCalls: [],
   denseSlotBytes: 2097152, collHopHiUs: (CHIP.collective_latency_us_bracket ||
   [1.0, 5.0])[1], expertSlotBytes: 1048576, presets: [], resetSeq: 0,
@@ -96,6 +96,8 @@
   etaHbm: parseFloat(el('ctl-eta-hbm').value) || 0.82,
   etaIci: parseFloat(el('ctl-eta-ici').value) || 0.75,
   launchGapHiUs: STATE.launchGapHiUs, collHopHiUs: STATE.collHopHiUs,
+  hostHeadPerOpUs: el('ctl-host-head-per-op') ? (parseFloat(el('ctl-host-head-per-op').value) || 0.0) : 0.0,
+  hostHeadFusedUs: el('ctl-host-head-fused') ? (parseFloat(el('ctl-host-head-fused').value) || 0.0) : 0.0,
   collectiveCalls: STATE.collectiveCalls || [],
   denseSlotBytes: STATE.denseSlotBytes, expertSlotBytes: STATE.expertSlotBytes }; }
   function regimeToWorkload(idx) {
@@ -170,6 +172,8 @@
   el('lbl-alias').textContent = wl.vmemAlias ? 'enabled' : 'disabled';
   el('lbl-launch-gap').textContent = wl.launchGapUs.toFixed(2) + ' us';
   el('lbl-coll-hop').textContent = wl.collHopUs.toFixed(2) + ' us';
+  if (el('lbl-host-head-per-op')) el('lbl-host-head-per-op').textContent = Math.round(wl.hostHeadPerOpUs || 0) + ' us';
+  if (el('lbl-host-head-fused')) el('lbl-host-head-fused').textContent = Math.round(wl.hostHeadFusedUs || 0) + ' us';
   if (el('lbl-dispatch-regime')) el('lbl-dispatch-regime').textContent = wl.dispatchRegime;
   for (const [id, mode] of [['btn-dr-zero','zero_floor'],
   ['btn-dr-xla','compiled_xla'],['btn-dr-eager','unfused_eager']]) {
@@ -235,10 +239,25 @@
       `${cpFastPct.toFixed(1)}% physics)</span>` : '';
   const moeNote = (PROF.num_moe_layers || 0) > 0
     ? ` &middot; MoE: masked &lt;${tCross}, grouped &ge;${tCross}` : '';
+  const supFused = evalA.scopes.filter(
+    s => s.scope !== 'per_op' && s.feasible &&
+      (s.support === 'within_core_limits' || s.support === 'declared')
+  );
+  const feasFused = evalA.scopes.filter(s => s.scope !== 'per_op' && s.feasible);
+  let minBreakEvenUs = 0.0;
+  if (win.scope !== 'per_op') {
+    minBreakEvenUs = Number(win.break_even_host_head_delta_us || 0);
+  } else if (supFused.length) {
+    minBreakEvenUs = Math.min(...supFused.map(s => Number(s.break_even_host_head_delta_us || 0)));
+  } else if (fast.scope === 'per_op' && feasFused.length) {
+    minBreakEvenUs = Math.min(...feasFused.map(s => Number(s.break_even_host_head_delta_us || 0)));
+  }
+  const breakEvenBadge = (win.scope === 'per_op' && minBreakEvenUs > 0.0)
+    ? ` &middot; Break-even host-head: <strong>+${minBreakEvenUs.toFixed(1)} us</strong>` : '';
   sumEl.innerHTML = `${roiBadge}Saves <strong>${achGain.toFixed(1)} us ` +
   `(${achPct.toFixed(1)}% achievable)</strong> &middot; Fusion gain (estimate): ` +
   `<strong>${cpGain.toFixed(1)} us (${cpPct.toFixed(1)}%)</strong> &middot; ` +
-  `Ideal 1-pass: <strong>T&le;${evalA.tWideMax}</strong>${hypBadge}` +
+  `Ideal 1-pass: <strong>T&le;${evalA.tWideMax}</strong>${hypBadge}${breakEvenBadge}` +
   `<details class="wb-topbar-details"><summary>Blueprint &amp; Tile Specs ` +
   `(nbd=${win.selected_dense_slots}, nbe=${win.selected_expert_slots})</summary>` +
   `Physics share: <strong>${physShare.toFixed(0)}%</strong> &middot; ` +
@@ -380,7 +399,8 @@
   ['Cold Pipeline Fill/Drain', scA.fill_drain_us - scB.fill_drain_us],
   ['Multi-Pass HBM Weight Re-stream', scA.repass_spill_us - scB.repass_spill_us],
   ['Dispatch / Boundary Bubble',
-    (scA.ops_per_step - scB.ops_per_step) * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs)]];
+    (scA.ops_per_step - scB.ops_per_step) * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs) +
+    ((scA.host_head_us || 0) - (scB.host_head_us || 0))]];
   const netD = scA.step_bound_us - scB.step_bound_us;
   const pct = scB.step_bound_us > 0 ? (netD / scB.step_bound_us) * 100.0 : 0.0;
   const sgn = v => (v >= 0 ? '+' : '') + v.toFixed(1);
@@ -435,21 +455,25 @@
   `phi_moe = ${sc.moe_flop_factor.toFixed(3)}x\n` +
   `eta = (dense ${wlA.etaDense.toFixed(2)}, moe ${wlA.etaMoeGrouped.toFixed(2)}, ` +
   `hbm ${wlA.etaHbm.toFixed(2)}, ici ${wlA.etaIci.toFixed(2)})</div>`;
+  const scopeHeadUs = sc.host_head_us || 0;
+  const headFormulaTerm = scopeHeadUs > 0 ? ' + t_head' : '';
   const eqHead = (isFused
-    ? 't_step = max(t_hbm, t_chain + t_comm) + t_fd + t_rep + N*t_gap'
-    : 't_step = max(t_chain, t_hbm) + t_comm + t_fd + t_rep + N*t_gap') +
+    ? `t_step = max(t_hbm, t_chain + t_comm) + t_fd + t_rep + N*t_gap${headFormulaTerm}`
+    : `t_step = max(t_chain, t_hbm) + t_comm + t_fd + t_rep + N*t_gap${headFormulaTerm}`) +
     '\nt_chain = t_dense + max(t_routed, t_moe)';
   // A microbatched scope is a sum of calls, so its summed terms do not recombine
   // through one max(); list them instead of printing an equation that would not hold.
   const eqNum = nCalls > 1
     ? `per call, summed over ${nCalls} calls: hbm ${f2(sc.hbm_us)}, chain ` +
       `${f2(sc.chain_us)}, comm ${f2(sc.comm_us)}, fd ${f2(sc.fill_drain_us)}, ` +
-      `rep ${f2(sc.repass_spill_us)}, gaps ${f2(sc.launch_us)}`
+      `rep ${f2(sc.repass_spill_us)}, gaps ${f2(sc.launch_us)}` +
+      (scopeHeadUs > 0 ? `, step head ${f2(scopeHeadUs)}` : '')
     : (isFused
       ? `= max(${f2(sc.hbm_us)}, ${f2(sc.chain_us)} + ${f2(sc.comm_us)})`
       : `= max(${f2(sc.chain_us)}, ${f2(sc.hbm_us)}) + ${f2(sc.comm_us)}`) +
       ` + ${f2(sc.fill_drain_us)} + ${f2(sc.repass_spill_us)} + ` +
-      `${sc.ops_per_step}*${f2(evalA.launchGapLoUs)}`;
+      `${sc.ops_per_step}*${f2(evalA.launchGapLoUs)}` +
+      (scopeHeadUs > 0 ? ` + ${f2(scopeHeadUs)}` : '');
   const eqStr = `${eqHead}\n${eqNum}`;
   const stFl = (sc.step_floor_strict_us ?? sc.step_bound_us).toFixed(2);
   const r3 = `<div class="wb-formula">${eqStr}\n= ${sc.step_bound_us.toFixed(2)} us ` +
@@ -463,13 +487,17 @@
   const perOp = evalA.scopes[0], gapPr = evalA.launchGapPriorUs ?? evalA.launchGapLoUs;
   const cpUs = perOp.pureStepUs - sc.pureStepUs;
   const dbUs = (perOp.ops_per_step - sc.ops_per_step) * gapPr;
-  const totUs = cpUs + dbUs;
+  const headGainUs = (perOp.host_head_us || 0) - scopeHeadUs;
+  const totUs = cpUs + dbUs + headGainUs;
   const shPct = Math.abs(totUs) > 1e-6 ? ((cpUs / totUs) * 100).toFixed(0) : '100';
+  const headGainLine = Math.abs(headGainUs) > 1e-6
+    ? `Host Dispatch Head Gain: ${headGainUs >= 0 ? '+' : ''}${headGainUs.toFixed(2)} us\n`
+    : '';
   const r4 = `<div class="wb-formula">Fusion gain (estimate): ` +
   `${cpUs >= 0 ? '+' : ''}${cpUs.toFixed(2)} us (HBM + sync + MoE pad)\n` +
   `Dispatch Bubble Gain: ${dbUs >= 0 ? '+' : ''}${dbUs.toFixed(2)} us ` +
   `((${perOp.ops_per_step}-${sc.ops_per_step}) * ` +
-  `${gapPr.toFixed(2)} us)\n` +
+  `${gapPr.toFixed(2)} us)\n${headGainLine}` +
   `Total vs per_op: ${totUs >= 0 ? '+' : ''}${totUs.toFixed(2)} us ` +
   `(${shPct}% fusion-estimate) | w_step=${sc.w_step_gb} GB</div>` +
   `<div style="font-size:11px;margin-top:4px;">${cal.line}</div>`;
@@ -520,7 +548,7 @@
   `overflow:hidden;text-overflow:ellipsis;">${escH(r.label)}</div><div style=` +
   `"color:var(--muted);font-size:10px;"><span style="color:${col};font-weight:700;">` +
   `${escH(scopeLbl)}</span> &middot; T=${ev.activeTokens} &middot; ` +
-  `${recEst.step_bound_us} us${hypTag}</div></div><button class="wb-mini-btn` +
+  `${recEst.step_bound_us.toFixed(1)} us${hypTag}</div></div><button class="wb-mini-btn` +
   `${isA ? ' active-a' : ''}" type="button" onclick="event.stopPropagation();` +
   `wbPinRegime(${i}, 'A')">A</button><button class="wb-mini-btn` +
   `${isB ? ' active-b' : ''}" type="button" onclick="event.stopPropagation();` +
@@ -573,8 +601,11 @@
   Math.max(2.0, DATA.vmem_budget_mib || STATE.maxVmemMib)));
   el('ctl-dma').value = String(DATA.dma_buffers || 2); el('ctl-alias').value = '1';
   el('ctl-eta-dense').value = '0.72'; el('ctl-eta-moe').value = '0.50';
+  STATE.calHostHeadUs = null;
   el('ctl-eta-hbm').value = '0.82'; el('ctl-eta-ici').value = '0.75';
   el('ctl-coll-hop').value = ((CHIP.collective_latency_s || 1e-6) * 1e6).toFixed(2);
+  if (el('ctl-host-head-per-op')) el('ctl-host-head-per-op').value = '0';
+  if (el('ctl-host-head-fused')) el('ctl-host-head-fused').value = '0';
   syncControlsFromRegime(0);
   const winSc = evaluateWorkload(regimeToWorkload(0)).winner.scope;
   el('ctl-arena-scope').value = winSc;
@@ -624,6 +655,27 @@
   renderSignedWaterfall(evalA, evalB, lblB);
   renderDerivDrawer(wlA, evalA, evalB, lblB);
   if (window.wbRenderPhaseExtension) window.wbRenderPhaseExtension(wlA, evalA); };
+  window.wbPreviewLittlesLaw = function() {
+    const tps = parseFloat((el('ctl-out-tps') || {}).value) || 0.0;
+    const tpot = parseFloat((el('ctl-mean-tpot') || {}).value) || 0.0;
+    const prev = el('lbl-littles-preview');
+    if (tps > 0 && tpot > 0) {
+      const exact = tps * (tpot / 1000.0), b = Math.max(1, Math.round(exact));
+      if (prev) prev.textContent = `B = ${exact.toFixed(2)} -> ${b} seqs`;
+      return b;
+    }
+    if (prev) prev.textContent = 'Enter > 0 tok/s & TPOT';
+    return null;
+  };
+  window.wbApplyLittlesLaw = function() {
+    const b = window.wbPreviewLittlesLaw();
+    if (b !== null && el('ctl-batch')) {
+      el('ctl-batch').max = String(Math.max(1024, b));
+      el('ctl-batch').value = String(b);
+      STATE.customDirty = true; STATE.topicPinned = false;
+      window.wbRenderAll();
+    }
+  };
   window.wbOnControl = function() { STATE.customDirty = true; STATE.topicPinned = false; window.wbRenderAll(); };
   window.wbOnHwControl = function() { STATE.hwDirty = true; window.wbRenderAll(); };
   window.wbSelectTopic = function(kind, scope, sub) {
