@@ -292,11 +292,9 @@ class HybridStateRetention:
         """Hook MambaManager partial-tail caching and CoW hash movement so both
         the full 640-token boundary block and 128-token CoW partial-tail block
         are tracked for running requests."""
-        managers = getattr(self.coordinator, "single_type_managers", None) or ()
+        managers = self.coordinator.single_type_managers
         for group in self.mamba_groups:
             for gid in group.group_ids:
-                if gid >= len(managers):
-                    continue
                 mgr = managers[gid]
                 if getattr(mgr, "_hybrid_retention_hooked", False):
                     continue

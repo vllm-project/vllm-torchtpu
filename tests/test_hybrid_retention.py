@@ -861,7 +861,7 @@ def test_retention_is_for_a_kv_producer():
     assert not retention_wanted(cfg(None))
 
 
-def test_default_bounds_are_the_values_the_points_ran():
+def test_default_bounds():
     ret = HybridStateRetention(SimpleNamespace(enable_caching=False, coordinator=None))
     assert (ret.max_conversations, ret.max_pinned_blocks) == (96, 360)
     assert (ret.smart_fork, ret.safe_tail_offset) == (True, 4)
