@@ -65,9 +65,10 @@ def _check_logits():
         assert not np.array_equal(np.asarray(head(xs, shifted)), np.asarray(want))
 
 
-def _head_setup(monkeypatch, **changes):
-    """An LM head, logits processor and parallel config as DeepSeek-V4.1 Flash
-    serves them on 8 EP ranks with DP lockstep, with ``changes`` applied."""
+def _head_setup(monkeypatch, vocab=VOCAB, width=WIDTH, device="cpu", **changes):
+    """An LM head, logits processor and vLLM config as DeepSeek-V4.1 Flash
+    serves them on 8 EP ranks with DP lockstep, 64 requests and DSpark K=5,
+    with ``changes`` applied."""
     import torch
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
@@ -80,17 +81,29 @@ def _head_setup(monkeypatch, **changes):
     monkeypatch.delenv("TPU_GREEDY_HEAD_BACKEND", raising=False)
     lm_head = torch.nn.Module()
     lm_head.weight = torch.nn.Parameter(
-        torch.zeros(VOCAB, WIDTH, dtype=torch.bfloat16), requires_grad=False
+        torch.zeros(vocab, width, dtype=torch.bfloat16, device=device),
+        requires_grad=False,
     )
     lm_head.quant_method = UnquantizedEmbeddingMethod()
     processor = SimpleNamespace(
         logits_as_input=False,
         soft_cap=None,
         scale=1.0,
-        org_vocab_size=VOCAB,
+        org_vocab_size=vocab,
         head_dtype=None,
     )
-    parallel = SimpleNamespace(data_parallel_size=WORLD, enable_expert_parallel=True)
+    parallel = SimpleNamespace(
+        data_parallel_size=WORLD,
+        enable_expert_parallel=True,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel,
+        speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=5),
+        scheduler_config=SimpleNamespace(max_num_seqs=64),
+        lora_config=None,
+    )
     for name, value in changes.items():
         if name == "greedy_head_backend":
             monkeypatch.setenv("TPU_GREEDY_HEAD_BACKEND", value)
@@ -100,12 +113,14 @@ def _head_setup(monkeypatch, **changes):
         elif name == "quantized":
             lm_head.quant_method = object()
         elif name == "bias":
-            lm_head.bias = torch.nn.Parameter(torch.zeros(VOCAB), requires_grad=False)
+            lm_head.bias = torch.nn.Parameter(torch.zeros(vocab), requires_grad=False)
+        elif name == "max_num_seqs":
+            config.scheduler_config.max_num_seqs = value
         elif hasattr(parallel, name):
             setattr(parallel, name, value)
         else:
             setattr(processor, name, value)
-    return lm_head, processor, parallel
+    return lm_head, processor, config
 
 
 def test_measured_setup_splits_the_head(monkeypatch):
@@ -129,9 +144,29 @@ def test_measured_setup_splits_the_head(monkeypatch):
     ],
 )
 def test_unsupported_setups_keep_the_whole_head(monkeypatch, changes, reason):
-    lm_head, processor, parallel = _head_setup(monkeypatch, **changes)
+    lm_head, processor, config = _head_setup(monkeypatch, **changes)
     weight = lm_head.weight
-    assert reason in vocab_parallel_head.whole_head_reason(lm_head, processor, parallel)
-    assert not vocab_parallel_head.shard_lm_head(lm_head, processor, parallel)
+    assert reason in vocab_parallel_head.whole_head_reason(lm_head, processor, config)
+    assert not vocab_parallel_head.shard_lm_head(lm_head, processor, config)
     assert lm_head.weight is weight
     assert not vocab_parallel_head.is_vocab_parallel(lm_head)
+
+
+@pytest.mark.parametrize("tpu_v7", [False, True])
+def test_head_stays_whole_where_a_fused_head_reads_the_whole_vocab(monkeypatch, tpu_v7):
+    """With 48 requests and K=5 on DeepSeek-V4.1 Flash's head, the fused
+    greedy head (288 rows, TPU v7 only) or the fused DSpark draft sampler
+    serves the step and needs the whole vocab; with 64 requests neither does,
+    and the head is split."""
+    from vllm_torchtpu.kernels import fused_greedy_head
+
+    monkeypatch.setattr(
+        fused_greedy_head, "get_device_name", lambda: "TPU v7" if tpu_v7 else "cpu"
+    )
+    flash = dict(vocab=129280, width=5120, device="meta")
+    head = _head_setup(monkeypatch, max_num_seqs=48, **flash)
+    reason = vocab_parallel_head.whole_head_reason(*head)
+    assert ("greedy head" if tpu_v7 else "draft sampler") in reason
+
+    head = _head_setup(monkeypatch, **flash)
+    assert vocab_parallel_head.whole_head_reason(*head) is None
