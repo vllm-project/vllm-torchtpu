@@ -829,6 +829,10 @@ def fused_ep_moe(
         replicas=replicas,
     )
     if experts_per_shard is None:
+        if num_experts % num_shards:
+            raise ValueError(
+                f"{num_experts} experts do not split evenly over {num_shards} shards"
+            )
         experts_per_shard = num_experts // num_shards
     elif num_experts < num_shards * experts_per_shard:
         raise ValueError(
@@ -842,6 +846,18 @@ def fused_ep_moe(
         # routing tables and the FFN visit the first experts_per_shard of every
         # shard's block, the rest of the block is never read
         num_experts = num_shards * experts_per_shard
+    # The routed experts: the weights' slots past experts_per_shard in each
+    # shard's block are copy slots the router never selects.
+    if not 1 <= top_k <= num_experts:
+        raise ValueError(
+            f"top_k {top_k}: the kernel routes over {num_experts} experts, "
+            f"so 1 to {num_experts} selections per token"
+        )
+    if routing is None and tuple(router_logits.shape) != (tokens, num_experts):
+        raise ValueError(
+            f"router_logits is {tuple(router_logits.shape)}; one logit per "
+            f"token and routed expert, {(tokens, num_experts)}, is expected"
+        )
     tokens_per_shard = tokens // (num_shards * replicas)
     # shard_index: int32 [num_shards, 1], the shard's own index handed to the
     # transport and shard-tables programs as data (layout.SHARD_INDEX_OPERAND,

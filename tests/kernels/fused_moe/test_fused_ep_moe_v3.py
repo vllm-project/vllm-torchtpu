@@ -702,6 +702,19 @@ def test_the_layer_refuses_a_caller_routing(one_cpu_shard):
 
 
 @pytest.mark.cpu_test
+def test_top_k_and_the_logits_are_checked_against_the_routed_experts(
+    one_cpu_shard,
+):
+    """With copy slots the kernel routes over experts_per_shard experts a
+    shard, fewer than the weights carry: top_k and the router logits'
+    width are checked against those, not the weights' count."""
+    with pytest.raises(ValueError, match="top_k 2: the kernel routes over 1 "):
+        one_cpu_shard(experts_per_shard=1)
+    with pytest.raises(ValueError, match=r"router_logits is \(32, 8\)"):
+        one_cpu_shard(experts_per_shard=6)
+
+
+@pytest.mark.cpu_test
 def test_the_scatter_drops_the_rows_the_shard_tables_drop(one_cpu_shard, monkeypatch):
     """The shard tables write routed_rows_per_shard as the drop row, and the
     token table is padded to whole LANES-row blocks past it when the bound
