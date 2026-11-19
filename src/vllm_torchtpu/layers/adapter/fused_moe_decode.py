@@ -429,6 +429,11 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     sharded_ok = sharded_ok and get_tensor_model_parallel_world_size() == n_ranks
     if not isinstance(qm, VllmFp8MoEMethodTPU) or not sharded_ok:
         return None
+    if qm.served_before_fused_decode(layer) is not None:
+        # apply_monolithic serves the layer by another path before this
+        # kernel's check; armed as well, the runner would drop the shared
+        # expert and the all-reduce that path's output needs.
+        return None
     if expert_placement.primary_experts(layer) not in (None, layer.w13_weight.shape[0]):
         # The layer holds copy slots after its primaries (an expert placement
         # with copies); the kernel would serve every slot as a primary.

@@ -1175,6 +1175,37 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             num_primary_experts=self._gmm_primary_experts,
         )
 
+    def served_before_fused_decode(self, layer: RoutedExperts) -> str | None:
+        """The path `apply_monolithic` serves this layer by before it reaches
+        the fused MoE decode kernel's check, or None.
+
+        In `apply_monolithic`'s order: adaptive fused MoE, fused EP v2, the TP
+        decode MoE kernel, fused EP v3, the few-token scores entry, and the
+        grouped path that issues its own collectives. `fused_moe_decode`
+        arms only a layer this returns None for: arming makes the runner skip
+        the shared expert and the all-reduce, which the other paths' outputs
+        still need.
+        """
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_supported as fused_moe_ep_v3_supported,
+        )
+        from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
+
+        if self._use_adaptive_fused_moe:
+            return "adaptive fused MoE"
+        if fused_moe_ep_supported(self):
+            return "fused EP v2"
+        if moe_tp_decode_supported(self):
+            return "the TP decode MoE kernel"
+        if envs.USE_MOE_FUSED_EP_KERNEL and fused_moe_ep_v3_supported(self):
+            return "fused EP v3"
+        if self._moe_lowtok_scores_op is not None:
+            return "the few-token scores entry"
+        if enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER:
+            return "the grouped path with its own collectives"
+        return None
+
     def apply_monolithic(
         self,
         layer: RoutedExperts,
@@ -1306,6 +1337,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if fused_moe_decode_supported(self):
             # Armed layer: the runner no longer runs the shared expert or the
             # all-reduce, so this returns the reduced shared + routed sum.
+            # Arming refuses a layer an earlier branch serves
+            # (served_before_fused_decode).
             return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
 
         return fused_moe_gmm(**kwargs)
