@@ -49,6 +49,7 @@ logger = init_logger(__name__)
 RING: int = int(envs.TPU_MOE_ROUTE_TRACE)
 ENABLED: bool = RING > 0
 EVERY: int = max(1, int(envs.TPU_MOE_ROUTE_TRACE_EVERY))
+MIN_TOKENS: int = int(envs.TPU_MOE_ROUTE_TRACE_MIN_TOKENS)
 MAX_ROWS = 128
 
 _ring: torch.Tensor | None = None
@@ -148,6 +149,8 @@ def dump() -> None:
     n = len(_names)
     for s in range(step - new, step):
         slot = s % RING
+        if int(tok[slot]) < MIN_TOKENS:
+            continue
         fields = []
         for r in range(n):
             row = ring[r, slot]
