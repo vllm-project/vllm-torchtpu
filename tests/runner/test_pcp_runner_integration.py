@@ -142,6 +142,7 @@ def _make_runner(
     runner._dp_num_tokens_across_dp = types.MethodType(
         TPUModelRunner._dp_num_tokens_across_dp, runner
     )
+    runner._vocab_parallel_rows = lambda: None
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True
