@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_XCHG_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
+    TPU_DCP_MLA_Q_HEAD_MAJOR: bool = False
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -810,6 +811,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefetches it may run under the call). The kernel's scratch is ~13 MiB
     # at T = 64; 32 is the pinned fused small all-to-all calls' limit.
     "TPU_DCP_MLA_OUT_VMEM_MIB": env_int("TPU_DCP_MLA_OUT_VMEM_MIB", 32),
+    # On the calls TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS puts in VMEM (decode
+    # buckets, one chunk): the attention kernel reads the absorbed query
+    # head-major, [heads, tokens, 512], as XLA's batched W_UK matmul writes
+    # it, and relays each grid step's [heads, 16, 512] block out to
+    # token-major in VMEM. Without it, XLA inserts a transposing copy of the
+    # whole query between the matmul and the kernel (`copy bf16[64,64,512]`,
+    # ~5 us per layer at T = 64). Same bits. Off = the token-major operand.
+    "TPU_DCP_MLA_Q_HEAD_MAJOR": env_bool("TPU_DCP_MLA_Q_HEAD_MAJOR", False),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done

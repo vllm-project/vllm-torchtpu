@@ -1555,6 +1555,8 @@ PROLOGUE_FAULTS = (
     "skip_lse_fill",
     # `row_widths`: attend one width below what the batch needs (test-only).
     "row_width_undersize",
+    # `q_head_major`: read the head-major q block as token-major (test-only).
+    "q_head_major_reshape",
 )
 
 
@@ -1821,7 +1823,18 @@ def _attention_kernel(
     out_in: bool = False,
     send_exchange: tuple | None = None,
     recv_in: bool = False,
+    q_head_major: bool = False,
 ):
+    # Head-major q (`q_head_major`, TPU_DCP_MLA_Q_HEAD_MAJOR): `q_hbm_ref` is
+    # [num_q_heads, max_num_tokens, head_dim]; the bq double buffer holds
+    # [2, num_q_heads, bsz, head_dim] blocks, and the last scratch ref is the
+    # token-major [bsz, num_q_heads, head_dim] block `load_bq` reads, written
+    # once per grid step right after the step's q DMA is waited on.
+    bq_tm_ref = None
+    if q_head_major:
+        bq_tm_ref = refs[-1]
+        refs = refs[:-1]
+    q_tokens = q_hbm_ref.shape[1] if q_head_major else q_hbm_ref.shape[0]
     # Fused exchange (`send_exchange` = (axis, lane_axis or None), with the
     # send layout on a one-step grid; TPU_MLA_FUSED_SMALL_A2A, see
     # SEND_SLAB_ROW0): the bo tile is per-destination slabs [W, SEND_SLAB_ROW0
@@ -1896,7 +1909,7 @@ def _attention_kernel(
     recv_v_ref = None
     # Fused exchange over several grid steps (see SEND_SLAB_ROW0): merge mode
     # on a bucket the grid walks in more than one step.
-    xchg_steps = send_exchange is not None and batch_size < q_hbm_ref.shape[0]
+    xchg_steps = send_exchange is not None and batch_size < q_tokens
     assert not xchg_steps or xchg_merge, "a multi-step exchange merges in the kernel"
     merge_w_ref = None
     merge_out_ref = None
@@ -2062,9 +2075,11 @@ def _attention_kernel(
         blse_x2_ref = None
 
     assert o_hbm_ref is not None
-    assert q_hbm_ref.shape[1:] == o_hbm_ref.shape[1:]
-
-    num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    if q_head_major:
+        num_q_heads, num_tokens, head_dim = q_hbm_ref.shape
+    else:
+        num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    assert (num_q_heads, head_dim) == tuple(o_hbm_ref.shape[1:])
     # "nofill" (decode levers): the one grid step stores every row's lse.
     nofill = (
         "nofill" in body_levers and lse_fill and not send and num_tokens <= batch_size
@@ -2479,7 +2494,11 @@ def _attention_kernel(
 
         if not wait:
             _async_copy(
-                q_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                # Whole (16, 128) bf16 tiles: the caller takes this path only
+                # when bsz is a multiple of the packed tile's rows.
+                q_hbm_ref.at[:, pl.ds(pl.multiple_of(seq_idx_start, batch_size), batch_size)]
+                if q_head_major
+                else q_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
                 bq_vmem_ref,
                 sem,
                 wait,
@@ -2644,8 +2663,21 @@ def _attention_kernel(
     def wait_send_bo_batch(seq_idx_start, bo_sem_idx):
         return _send_bo_batch(seq_idx_start, bo_sem_idx, wait=True)
 
+    def relayout_bq(bq_sem_idx):
+        """Head-major q: the step's [heads, bsz, D] block to [bsz, heads, D]."""
+        assert bq_tm_ref is not None
+        block = bq_x2_ref.at[bq_sem_idx][...]
+        if fault == "q_head_major_reshape":
+            # Test only: reads the head-major block as if it were token-major.
+            bq_tm_ref[...] = block.reshape(bq_tm_ref.shape)
+        else:
+            bq_tm_ref[...] = pltpu.einshape("htd->thd", block)
+
     def load_bq(bq_sem_idx, batch_idx):
-        q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
+        if q_head_major:
+            q = bq_tm_ref.at[batch_idx][...]
+        else:
+            q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
         if q_rope:
             # The caller's rope + concat + zero pad, rebuilt in VMEM: lanes
             # 128:256 of the raw head are one aligned vreg column.
@@ -3362,6 +3394,8 @@ def _attention_kernel(
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
+        if q_head_major:
+            relayout_bq(bi_sem_idx)
         if not row_widths:
             wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
 
@@ -3945,6 +3979,7 @@ def sparse_ragged_paged_attention(
     packed_gather: bool = False,
     out_vmem: int = 0,
     gather_window_cache: bool = False,
+    q_head_major: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -4148,6 +4183,14 @@ def sparse_ragged_paged_attention(
         the grid never reaches hold no defined value; their lse stays -inf,
         so a DCP merge weights them 0. Every row the grid writes is
         bit-identical.
+      q_head_major: TPU_DCP_MLA_Q_HEAD_MAJOR. Optional `q` transposed to
+        `[num_q_heads, max_num_tokens, head_dim]`, the layout XLA's batched
+        query absorption writes. Used only when `out_vmem` takes effect and
+        `q` needs no padding: the kernel then reads this operand instead of
+        `q` and relays each grid step's block out to token-major in VMEM, so
+        XLA does not add a transposing copy in front of the call. `q` still
+        gives the shapes; XLA drops it when nothing else reads it. Same
+        results bit for bit.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -4590,6 +4633,16 @@ def sparse_ragged_paged_attention(
         and not piece_rows
     )
     out_vmem = out_vmem if out_vmem_applies else 0
+    # The head-major query replaces `q` only where q is read-only (the VMEM
+    # outputs do not alias it) and unpadded.
+    q_hm = (
+        q_head_major
+        if out_vmem
+        and q_head_major is not None
+        and q_head_major.shape == (q.shape[1], q.shape[0], q.shape[2])
+        and q_head_major.dtype == q.dtype
+        else None
+    )
     if out_pieces_fault not in (None, "swap"):
         raise ValueError(f"unknown out_pieces_fault {out_pieces_fault}")
     piece_outs: list[jax.Array] = []
@@ -4670,6 +4723,7 @@ def sparse_ragged_paged_attention(
             packed_gather=packed_gather and group_tab is not None,
             out_vmem=out_vmem,
             gather_window_cache=window_cache,
+            q_hm=q_hm,
             **extra,
         )
 
@@ -4872,6 +4926,7 @@ def sparse_attention_chunk(
     packed_gather: bool = False,
     out_vmem: int = 0,
     gather_window_cache: bool = False,
+    q_hm: jax.Array | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -5064,6 +5119,22 @@ def sparse_attention_chunk(
         )
 
         bo_double_buf = bq_double_buf
+        # Head-major q (`q_hm`): each grid step DMAs its [heads, bsz, D]
+        # block, which is relaid out once into a token-major block (the last
+        # scratch ref) that `load_bq` reads.
+        # The step's q block slices the token axis, which is tiled in the
+        # head-major layout: it must cover whole packed tiles (16 bf16 rows).
+        q_head_major = (
+            q_hm is not None
+            and batch_size % (8 * get_dtype_packing(q.dtype)) == 0
+        )
+        if q_head_major:
+            assert out_vmem and q_hm.shape == (num_q_heads, q.shape[0], q.shape[-1])
+            assert send_exchange is None and not preserve_suffix
+            bq_double_buf = pltpu.VMEM(
+                (2, num_q_heads, batch_size, q.shape[-1]),
+                q.dtype,
+            )
         # Multi-step exchange: one bo (and blse) slot per grid step.
         bo_slots = max(2, q.shape[0] // batch_size) if xchg_steps else 2
         if send_world:
@@ -5197,6 +5268,10 @@ def sparse_attention_chunk(
                     jnp.int16,
                 )
             )
+        if q_head_major:
+            scratch_shapes.append(
+                pltpu.VMEM((batch_size, num_q_heads, q.shape[-1]), q.dtype)
+            )
         bounds = [start_seq_idx, end_seq_idx]
         if preserve_suffix:
             bounds.append(token_end)
@@ -5236,6 +5311,7 @@ def sparse_attention_chunk(
             out_in=out_carried is not None,
             send_exchange=send_exchange,
             recv_in=send_recv_in is not None,
+            q_head_major=q_head_major,
         )
         if live_views is None and row_levers and row_widths and capped_windows:
             # Decode body levers on the row-widths body.
@@ -5262,6 +5338,8 @@ def sparse_attention_chunk(
             scope_name += "-xa2a"
         if out_vmem:
             scope_name += "-ov"
+        if q_head_major:
+            scope_name += "-qhm"
         num_prefetch = len(scalar_prefetches)
         # Merge pieces: q is read-only; the lse input (and the carried piece
         # output, the operand after it) alias the two outputs.
@@ -5384,7 +5462,7 @@ def sparse_attention_chunk(
                 name=scope_name,
             )
         )
-        operands = [q, cache_kv_nope, cache_kv_rope]
+        operands = [q_hm if q_head_major else q, cache_kv_nope, cache_kv_rope]
         roles = ["q", "kv", "kv"]
         if split_q:
             operands.append(q_pe)

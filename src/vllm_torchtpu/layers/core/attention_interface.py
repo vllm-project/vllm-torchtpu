@@ -1694,6 +1694,17 @@ def sparse_mla_attention_dcp(
                 if topk_idx.shape[0] <= envs.TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS
                 else 0
             ),
+            # TPU_DCP_MLA_Q_HEAD_MAJOR: the swap undoes the one that made the
+            # absorbed query token-major, so XLA passes its matmul output
+            # through. The kernel takes it only on calls whose outputs go to
+            # VMEM; elsewhere it is unused and XLA drops it.
+            q_head_major=(
+                jnp.swapaxes(ql_nope, 0, 1)
+                if envs.TPU_DCP_MLA_Q_HEAD_MAJOR
+                and envs.TPU_MLA_SPARSE_SPLIT_Q
+                and topk_idx.shape[0] <= envs.TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS
+                else None
+            ),
             **chunk_kwargs,
             **split_kwargs,
             **packed_rope_kwargs,
