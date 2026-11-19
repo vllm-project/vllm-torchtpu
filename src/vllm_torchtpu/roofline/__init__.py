@@ -24,7 +24,12 @@ from .chips import (
     SliceTopology,
 )
 from .collectives import Collective, CollectiveConfig, torus_collective_s
-from .constants import ACTIVATION_HULL_SCHEMA, SOLVE_SCHEMA, SUPPORTED_MODEL_TYPES
+from .constants import (
+    ACTIVATION_HULL_SCHEMA,
+    MAX_EMBEDDED_CANDIDATES,
+    SOLVE_SCHEMA,
+    SUPPORTED_MODEL_TYPES,
+)
 from .emit import (
     CeilingRow,
     LaunchPayload,
@@ -35,6 +40,8 @@ from .emit import (
     build_solve_payload,
     emit_ceiling_rows,
     emit_launch_args,
+    format_parallelism,
+    format_submodule_parallelism,
     point_launch_args,
     pool_cli_args,
     top_layouts,
@@ -59,6 +66,7 @@ from .occupancy import (
     min_experts_per_ep_shard,
     parse_activation_spec,
 )
+from .report import render_html, write_html
 from .serving import ConcurrencyRow, ServingRequest, plan
 from .solver import (
     FloorTimes,
@@ -77,6 +85,7 @@ from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_flo
 __all__ = [
     "ACTIVATION_HULL_SCHEMA",
     "CHIPS",
+    "MAX_EMBEDDED_CANDIDATES",
     "SOLVE_SCHEMA",
     "SUPPORTED_CHIPS",
     "SUPPORTED_MODEL_TYPES",
@@ -125,6 +134,8 @@ __all__ = [
     "dtypes_from_hf_config",
     "emit_ceiling_rows",
     "emit_launch_args",
+    "format_parallelism",
+    "format_submodule_parallelism",
     "from_hf_config",
     "hbm_breakdown_per_core_bytes",
     "hbm_footprint_per_core_bytes",
@@ -136,9 +147,11 @@ __all__ = [
     "plan",
     "point_launch_args",
     "pool_cli_args",
+    "render_html",
     "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
     "top_layouts",
     "torus_collective_s",
+    "write_html",
 ]

@@ -35,17 +35,20 @@ from vllm_torchtpu.roofline import (
     cli,
     emit_ceiling_rows,
     emit_launch_args,
+    format_parallelism,
     from_hf_config,
     point_launch_args,
     pool_cli_args,
     solve_serving_plan,
     top_layouts,
 )
+from vllm_torchtpu.roofline import emit as rf_emit
 from vllm_torchtpu.roofline.constants import NO_FEASIBLE_LAYOUT_WARNING
 from vllm_torchtpu.roofline.emit import (
     _MODEL_PLACEHOLDER,
     _UNKNOWN_MODEL_WARNING,
     _pool_key,
+    pool_label,
 )
 from vllm_torchtpu.roofline.hf_loader import dtypes_from_hf_config as _dtypes_from_cfg
 from vllm_torchtpu.roofline.memory import (
@@ -761,3 +764,58 @@ def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
     margins = [entry["margin_vs_rank1_pct"] for entry in payload["top_k"]]
     assert roles == ["max_throughput", "balanced_knee", "max_interactivity"]
     assert margins == [0.0, -16.0, -50.0]
+
+
+def test_pool_label_joins_axes_with_x_and_omits_ones() -> None:
+    """Verify format_parallelism and pool_label omit size-1 axes and join with x."""
+    sample_pool = {
+        "instances": 1,
+        "topology": "2x2x1",
+        "chips_per_instance": 4,
+        "tp": 8,
+        "dp": 1,
+        "ep": 8,
+        "pp": 1,
+        "pcp": 1,
+        "kv_split": 4,
+    }
+    assert format_parallelism(sample_pool) == "TP8 x EP8 x DCP4"
+    label = pool_label(sample_pool)
+    assert label.endswith(": TP8 x EP8 x DCP4")
+
+    all_one_pool = {
+        "instances": 1,
+        "topology": "1x1x1",
+        "chips_per_instance": 1,
+        "tp": 1,
+        "dp": 1,
+        "ep": 1,
+        "pp": 1,
+        "pcp": 1,
+        "kv_split": 1,
+    }
+    assert format_parallelism(all_one_pool) == "TP1"
+
+
+def test_format_submodule_parallelism_splits_attn_and_moe() -> None:
+    """format_submodule_parallelism separates Attention, PP, and MoE sharding."""
+    pcp_ep_pool = {"tp": 1, "dp": 1, "ep": 8, "pp": 1, "pcp": 8, "kv_split": 1}
+    assert (
+        rf_emit.format_submodule_parallelism(pcp_ep_pool, has_moe=True)
+        == "Attn: PCP8 · MoE: EP8"
+    )
+
+    tp_sliced_pool = {"tp": 8, "dp": 1, "ep": 1, "pp": 1, "pcp": 1, "kv_split": 4}
+    assert (
+        rf_emit.format_submodule_parallelism(tp_sliced_pool, has_moe=True)
+        == "Attn: TP8 x DCP4 · MoE: TP8"
+    )
+
+    pp_pcp_ep_pool = {"tp": 1, "dp": 1, "ep": 2, "pp": 4, "pcp": 2, "kv_split": 1}
+    assert (
+        rf_emit.format_submodule_parallelism(pp_pcp_ep_pool, has_moe=True)
+        == "PP4 · Attn: PCP2 · MoE: EP2"
+    )
+
+    dense_tp_pool = {"tp": 8, "dp": 1, "ep": 1, "pp": 1, "pcp": 1, "kv_split": 1}
+    assert rf_emit.format_submodule_parallelism(dense_tp_pool, has_moe=False) == "TP8"

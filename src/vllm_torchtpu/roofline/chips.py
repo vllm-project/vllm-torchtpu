@@ -646,6 +646,14 @@ def from_jax(
     )
 
 
+def count_hosts(num_chips: int) -> int:
+    """Return physical host count for ``num_chips`` using ceiling division."""
+    return max(
+        1,
+        (num_chips + DEFAULT_CHIPS_PER_HOST - 1) // DEFAULT_CHIPS_PER_HOST,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SliceTopology:
     """Physical 3D chip slice topology and torus wraparound rules."""
