@@ -129,6 +129,9 @@ class MiniMaxM3MoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
+        # VLLM_TPU_MOE_EXPERT_PERMUTATION may reorder these into the experts'
+        # physical slot order (layers/adapter/moe_permute.py).
+        self.experts._perm_router = (self.gate, self.e_score_correction_bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)

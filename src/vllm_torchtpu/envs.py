@@ -901,6 +901,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoE layer, with no extra slots. "builtin:<name>", a JSON path or inline
     # JSON {"moe<i>": [slot of logical expert e, ...]}. Empty = off.
     "VLLM_TPU_MOE_EXPERT_PERMUTATION": env_str("VLLM_TPU_MOE_EXPERT_PERMUTATION", ""),
+    # With VLLM_TPU_MOE_EXPERT_PERMUTATION, reorder the router's expert rows
+    # into slot order at load (models that expose their router) instead of
+    # mapping routed ids through a table every step. 0 = keep the gather.
+    "VLLM_TPU_MOE_EXPERT_PERMUTATION_FOLD": env_bool(
+        "VLLM_TPU_MOE_EXPERT_PERMUTATION_FOLD", True
+    ),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.

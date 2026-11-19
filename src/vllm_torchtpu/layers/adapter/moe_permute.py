@@ -233,18 +233,64 @@ def install(layer: Any) -> None:
                     "filter by linear placement? on exos set EXOS_WEIGHT_LOAD_FILTER=0)"
                 )
     device = layer.w13_weight.device
-    layer.register_buffer(
-        "_perm_table", torch.tensor(perm, dtype=torch.int32, device=device),
-        persistent=False,
-    )
+    if _fold_into_router(layer, perm):
+        # The router now scores experts in physical slot order, so routed ids
+        # are physical ids already: no per-step gather.
+        _STATS["folded"] = _STATS.get("folded", 0) + 1
+    else:
+        layer.register_buffer(
+            "_perm_table", torch.tensor(perm, dtype=torch.int32, device=device),
+            persistent=False,
+        )
     _STATS["layers"] += 1
     if _STATS["layers"] == 1:
         _, ep, rank = _layer_ep(layer)
         logger.info(
             "[moe-permute] VLLM_TPU_MOE_EXPERT_PERMUTATION=%s on: E=%d ep=%d rank=%d "
-            "first_layer=%s (no extra expert slots)",
+            "first_layer=%s router_folded=%s (no extra expert slots)",
             SPEC, len(perm), ep, rank, getattr(layer, "layer_name", "?"),
+            bool(_STATS.get("folded")),
         )
+
+
+def _fold_into_router(layer: Any, perm: list[int]) -> bool:
+    """Reorder the router's expert rows (and correction bias) into slot order.
+
+    A model that sets ``layer._perm_router = (gate_linear, correction_bias)``
+    (MiniMax M3) gets its router scores produced directly in physical slot
+    order: row ``p`` of the gate becomes logical expert ``inv[p]``. Top-k then
+    yields physical ids, so ``to_physical`` (a gather per MoE layer per step)
+    is skipped. Experts and their scores are unchanged; only the order the
+    top-k entries come out in (and hence the summation order of a token's
+    expert outputs) can differ. ``VLLM_TPU_MOE_EXPERT_PERMUTATION_FOLD=0``
+    keeps the gather.
+    """
+    router = getattr(layer, "_perm_router", None)
+    if router is None or not envs.VLLM_TPU_MOE_EXPERT_PERMUTATION_FOLD:
+        return False
+    gate, bias = router
+    num = len(perm)
+    weight = getattr(gate, "weight", None)
+    if weight is None or weight.dim() != 2 or num not in weight.shape:
+        return False
+    dim = 0 if weight.shape[0] == num else 1
+    inv = [0] * num
+    for e, p in enumerate(perm):
+        inv[p] = e
+    with torch.no_grad():
+        idx = torch.tensor(inv, dtype=torch.int64, device=weight.device)
+        weight.data = weight.data.index_select(dim, idx).contiguous()
+        tensors = [weight]
+        if bias is not None:
+            bias.data = bias.data.index_select(
+                0, idx.to(bias.device)
+            ).contiguous()
+            tensors.append(bias)
+    if weight.device.type == "tpu":
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        synchronize_tensors(tensors)
+    return True
 
 
 def summary() -> dict[str, int]:
