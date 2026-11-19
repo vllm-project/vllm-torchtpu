@@ -2949,6 +2949,13 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
+    def _async_spec_source_len(self) -> int:
+        """Length the async-spec substitution source is padded to: the
+        largest stride-``1+K`` span, so the next step's substitution sees one
+        shape (`sample_tokens`)."""
+        assert self.speculative_config is not None
+        return self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
 
@@ -2979,6 +2986,11 @@ class TPUModelRunner(GPUModelRunner):
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
         padded_req_offset = 0
+        # A lone chunk's source is the step's whole source: pad it in its
+        # program to the length sample_tokens pads the parked source to.
+        source_len = (
+            self._async_spec_source_len() if len(next_tokens_per_chunk) == 1 else 0
+        )
         # Uniform `1+K` source span per request: req position `p` maps to source
         # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
         # index builder multiplies by the stride). All chunks carry their next
@@ -2992,7 +3004,7 @@ class TPUModelRunner(GPUModelRunner):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
             if bucketed and md is not None:
                 src, num_rejected = spec_chunk_sources(
-                    nt_chunk, drafts_chunk, md.draft_lengths
+                    nt_chunk, drafts_chunk, md.draft_lengths, source_len
                 )
             else:
                 drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
@@ -5683,10 +5695,7 @@ class TPUModelRunner(GPUModelRunner):
                 # positions are unchanged. Spec only (stride 1+K); pure-non-spec
                 # async keeps its stride-1 source + existing precompile.
                 if spec_num_rejected is not None:
-                    assert self.speculative_config is not None
-                    bound = self.max_num_reqs * (
-                        1 + self.speculative_config.num_speculative_tokens
-                    )
+                    bound = self._async_spec_source_len()
                     if next_tokens_tpu.shape[0] < bound:
                         next_tokens_tpu = torch.nn.functional.pad(
                             next_tokens_tpu, (0, bound - next_tokens_tpu.shape[0])
