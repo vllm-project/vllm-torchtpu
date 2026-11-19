@@ -1151,8 +1151,8 @@ def _walk_kernel(
                 mass_ref[0, head, :] = mass * alpha + jnp.sum(prob, axis=1)
                 accumulator_ref[0, head, :, :] = acc * alpha[:, None] + weighted
 
-    def stage_a(tile, kv_ref, line_ref):
-        # walk_pipe: compute_tile up to the masked scores (same ops, same order); returns [(score, value)] per KV head.
+    def stage_a_prep(tile, kv_ref, line_ref):
+        # walk_pipe: compute_tile's mask and decode (same ops, same order).
         logical = tile * kv_tile
         if line_matmul:
             lines = line_ref[...].T[:query_block, :].astype(jnp.float32)
@@ -1179,43 +1179,56 @@ def _walk_kernel(
                 value = jnp.where(jnp.isfinite(value) & written, value, 0)
             key_values.append((key, value))
         rows = query_block * q_heads_per_kv
+        row_visible = None
         if not mask_view:
             row_visible = jnp.broadcast_to(
                 visible[None, :, :], (q_heads_per_kv, query_block, kv_tile)
             ).reshape(rows, kv_tile)
-        staged = []
-        for head, (key, value) in enumerate(key_values):
-            query = q[head].reshape(rows, head_dim)
-            score = lax.dot(
-                query, key, dimension_numbers=(([1], [1]), ([], [])),
-                preferred_element_type=jnp.float32,
-            )
-            if mask_view:
-                score = jnp.where(
-                    visible[None, :, :], score.reshape(q_heads_per_kv, query_block, kv_tile), -jnp.inf
-                ).reshape(rows, kv_tile)
-            else:
-                score = jnp.where(row_visible, score, -jnp.inf)
-            staged.append((score, value))
-        return staged
+        return key_values, visible, row_visible
+
+    def stage_a_head(prep, head):
+        # walk_pipe: one KV head's masked QK scores (compute_tile's ops); returns (score, value).
+        key_values, visible, row_visible = prep
+        key, value = key_values[head]
+        rows = query_block * q_heads_per_kv
+        query = q[head].reshape(rows, head_dim)
+        score = lax.dot(
+            query, key, dimension_numbers=(([1], [1]), ([], [])),
+            preferred_element_type=jnp.float32,
+        )
+        if mask_view:
+            score = jnp.where(
+                visible[None, :, :], score.reshape(q_heads_per_kv, query_block, kv_tile), -jnp.inf
+            ).reshape(rows, kv_tile)
+        else:
+            score = jnp.where(row_visible, score, -jnp.inf)
+        return score, value
+
+    def stage_a(tile, kv_ref, line_ref):
+        # walk_pipe: compute_tile up to the masked scores (same ops, same order); returns [(score, value)] per KV head.
+        prep = stage_a_prep(tile, kv_ref, line_ref)
+        return [stage_a_head(prep, head) for head in range(kv_heads)]
 
     def stage_b(staged):
-        # walk_pipe: the rest of compute_tile (online softmax, PV, state), same ops on the staged scores and values.
         for head, (score, value) in enumerate(staged):
-            m = max_ref[0, head, :]
-            mass = mass_ref[0, head, :]
-            acc = accumulator_ref[0, head, :, :]
-            next_m = jnp.maximum(m, jnp.max(score, axis=1))
-            finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
-            prob = jnp.exp(score - finite_m[:, None])
-            alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
-            weighted = lax.dot(
-                prob, value, dimension_numbers=(([1], [0]), ([], [])),
-                preferred_element_type=jnp.float32,
-            )
-            max_ref[0, head, :] = next_m
-            mass_ref[0, head, :] = mass * alpha + jnp.sum(prob, axis=1)
-            accumulator_ref[0, head, :, :] = acc * alpha[:, None] + weighted
+            stage_b_head(head, score, value)
+
+    def stage_b_head(head, score, value):
+        # walk_pipe: the rest of compute_tile for one KV head (online softmax, PV, state), same ops.
+        m = max_ref[0, head, :]
+        mass = mass_ref[0, head, :]
+        acc = accumulator_ref[0, head, :, :]
+        next_m = jnp.maximum(m, jnp.max(score, axis=1))
+        finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
+        prob = jnp.exp(score - finite_m[:, None])
+        alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
+        weighted = lax.dot(
+            prob, value, dimension_numbers=(([1], [0]), ([], [])),
+            preferred_element_type=jnp.float32,
+        )
+        max_ref[0, head, :] = next_m
+        mass_ref[0, head, :] = mass * alpha + jnp.sum(prob, axis=1)
+        accumulator_ref[0, head, :, :] = acc * alpha[:, None] + weighted
 
     if walk_pipe:
         s_slots, v_slots = (pipe_refs[0], pipe_refs[1]), (pipe_refs[2], pipe_refs[3])
@@ -1247,11 +1260,20 @@ def _walk_kernel(
 
         def half(t, kv_ref, line_ref, sem_ref, a_slot, b_slot):
             # stage A of tile t + 1 (in kv_ref) and stage B of tile t (slot b_slot) in one block; then refill kv_ref with
-            # tile t + 3 (tiles start in order: start_tile_gathered counts them).
+            # tile t + 3 (tiles start in order: start_tile_gathered counts them). walk_pipe == 2: the two stages are
+            # interleaved per KV head in program order (decode of t + 1, then per head: QK of t + 1, softmax / PV of t).
             wait_tile(kv_ref, sem_ref, line_ref)
-            staged = stage_a(t + 1, kv_ref, line_ref)
-            stage_b(take(b_slot))
-            put(a_slot, staged)
+            if walk_pipe == 2:
+                prep = stage_a_prep(t + 1, kv_ref, line_ref)
+                for head in range(kv_heads):
+                    score_next, value_next = stage_a_head(prep, head)
+                    stage_b_head(head, s_slots[b_slot][head], v_slots[b_slot][head])
+                    s_slots[a_slot][head] = score_next
+                    v_slots[a_slot][head] = value_next
+            else:
+                staged = stage_a(t + 1, kv_ref, line_ref)
+                stage_b(take(b_slot))
+                put(a_slot, staged)
 
             @pl.when(t + 3 < count)
             def pipe_refill():
@@ -1726,6 +1748,9 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         raise ValueError("mask_view / vguard_lean (QA-1) apply to the gathered walk only")
     if walk_pipe and gathered is None:
         raise ValueError("walk_pipe (the pipelined tile loop) applies to the gathered walk only")
+    if walk_pipe not in (False, True, 0, 1, 2):
+        raise ValueError("walk_pipe: 0 (off), 1 (stage A beside stage B) or 2 (interleaved per KV head)")
+    walk_pipe = int(walk_pipe)
     if (group_offset or bits is None) and gathered is None:
         raise ValueError("group_offset and bits=None need the gathered walk")
     in_place = bool(group_offset) or bits is None
@@ -1824,7 +1849,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             line_matmul=line_matmul, fast_walk=True, scopes=scopes, qk16=qk16,
             gathered_cap_tiles=cap_tiles, **({"stage_ubits": False} if lean_gathered else {}),
             **({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
-            **({"walk_pipe": True} if walk_pipe else {}),
+            **({"walk_pipe": walk_pipe} if walk_pipe else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
@@ -1875,7 +1900,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         + ("_gathered" if gathered is not None else "") + ("_listed" if listed is not None else "")
         + ("_lines" if listed_lines is not None else "") + ("_runs" if run_tables is not None else "")
         + ("_glean" if lean_gathered else "") + ("_mv" if mask_view else "") + ("_vg" if vguard_lean else "")
-        + ("_pipe" if walk_pipe else ""),
+        + ("_pipe" if walk_pipe == 1 else "_pipe2" if walk_pipe == 2 else ""),
     )(
         tiles,
         usize.astype(jnp.int32),
@@ -2197,12 +2222,12 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
     )
 
     qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
-           **({"walk_pipe": True} if walk_pipe else {})}
+           **({"walk_pipe": int(walk_pipe)} if walk_pipe else {})}
     if walk_pipe:
         if not gathered:
             raise ValueError("walk_pipe needs the gathered walk (gathered='reference' or 'sparsecore')")
-        _engagement_log("QSA union walk: pipelined tile loop (walk_pipe) traced for %d-row steps (group %d, KV tile %d)",
-                        int(tokens), int(group), int(kv_tile))
+        _engagement_log("QSA union walk: pipelined tile loop (walk_pipe %d) traced for %d-row steps (group %d, KV tile %d)",
+                        int(walk_pipe), int(tokens), int(group), int(kv_tile))
 
     def walk(max_tokens):
         """(ungated bf16 output in the original row order, whether every union fits)."""
@@ -2600,7 +2625,7 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
     if lean_gathered and not in_place:
         raise ValueError("lean_gathered needs in_place")
     qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
-           **({"walk_pipe": True} if walk_pipe else {})}
+           **({"walk_pipe": int(walk_pipe)} if walk_pipe else {})}
     outs = []
     for g0, g1 in gather_chunk_bounds(ngroups, chunks, growth):
         sl, rs = slice(g0, g1), slice(g0 * group, g1 * group)

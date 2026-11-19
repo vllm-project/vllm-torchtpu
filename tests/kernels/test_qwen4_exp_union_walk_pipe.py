@@ -166,28 +166,31 @@ def test_kernel_refuses_walk_pipe_off_the_gathered_walk(kernels):
                               walk_pipe=True)
 
 
+@pytest.mark.parametrize("pipe", [1, 2], ids=["pipe1", "pipe2"])
 @pytest.mark.parametrize("base", [SERVED_GL, SERVED_G], ids=["glean", "gathered"])
-def test_names_and_bitwise_packed_unaligned(kernels, base):
+def test_names_and_bitwise_packed_unaligned(kernels, base, pipe):
     step = _packed_step(2, SPARE[0], SPARE[1])
     assert any(t >= 3 for t in _tiles(step)) and any(t <= 2 for t in _tiles(step)), _tiles(step)
-    names = _walk_names(step, base, walk_pipe=True)
+    suffix = "_pipe" if pipe == 1 else "_pipe2"
+    names = _walk_names(step, base, walk_pipe=pipe)
     gathered = [n for n in names if "_gathered" in n]  # the listed fallback (more requests than compact_reqs) has no pipe
-    assert gathered and all(n.endswith("_pipe") for n in gathered), names
-    assert all(n.endswith("_pipe") == ("_gathered" in n) for n in names), names
+    assert gathered and all(n.endswith(suffix) for n in gathered), names
+    assert all(n.endswith(suffix) == ("_gathered" in n) for n in names), names
     assert not any(n.endswith("_pipe") for n in _walk_names(step, base)), "flag off must not build the pipe kernel"
     off = _walk(step, base)
-    on = _walk(step, base, walk_pipe=True)
+    on = _walk(step, base, walk_pipe=pipe)
     assert np.array_equal(_bits(off), _bits(on))
 
 
 @pytest.mark.parametrize("ctx", [600, 1500, 2500, 3500, 7300, 13000], ids=lambda c: "ctx%d" % c)
 def test_bitwise_tile_counts(kernels, ctx):
     # one request: tile counts 1, 2, 3, 4-5, 6+ per group as the context grows (odd and even counts, the remainder half and
-    # both final-stage-B branches)
+    # both final-stage-B branches); walk_pipe 1 and 2
     step = _packed_step(3 + ctx, (192,), (ctx,), tokens=256, local=48)
     off = _walk(step, SERVED_GL)
-    on = _walk(step, SERVED_GL, walk_pipe=True)
-    assert np.array_equal(_bits(off), _bits(on)), _tiles(step)
+    for pipe in (1, 2):
+        on = _walk(step, SERVED_GL, walk_pipe=pipe)
+        assert np.array_equal(_bits(off), _bits(on)), (pipe, _tiles(step))
 
 
 def test_tile_counts_cover_odd_and_even(kernels):
@@ -240,7 +243,7 @@ def test_env_key_reaches_the_walk(kernels, monkeypatch):
     monkeypatch.setenv(ENV, "1")
     jax.clear_caches()
     got, _ = qsa_rpa._prefill_attention(q, gate, blocks, lengths, table, pool, starts, kv_heads=2, ratio=RATIO)
-    assert calls[-1].get("walk_pipe") is True, calls[-1]
+    assert calls[-1].get("walk_pipe") == 1, calls[-1]
     assert np.array_equal(_bits(want), _bits(got))
 
 
