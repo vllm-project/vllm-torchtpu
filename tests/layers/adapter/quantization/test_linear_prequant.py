@@ -71,25 +71,39 @@ def test_fp8_method_runs_the_prequant_matmul_on_the_kn_weight(
     torch.testing.assert_close(out, torch.full((_M, _N), 3.0 if with_bias else 1.0))
 
 
+@pytest.mark.parametrize(
+    "weight_dtype, scale_shape",
+    [
+        (torch.float8_e4m3fn, (1, _K // 16, 1, _N)),
+        (torch.int8, (_N,)),
+        (torch.float8_e5m2, (_N,)),
+    ],
+    ids=["block_scales", "int8_weight", "e5m2_weight"],
+)
 @pytest.mark.parametrize("keep_vllm_layout", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_fp8_method_runs_apply_on_the_dequantized_rows_for_block_scales(
-    monkeypatch, keep_vllm_layout, with_bias
+def test_fp8_method_runs_apply_on_the_dequantized_rows_for_other_weights(
+    monkeypatch, weight_dtype, scale_shape, keep_vllm_layout, with_bias
 ):
-    """A block-scaled weight (REQUANTIZE_BLOCK_SIZE gives a rank-4 scale) cannot
-    take the per-channel pre-quantized matmul; apply_prequant runs the method's
-    own apply on the dequantized rows instead of raising."""
+    """Only a float8_e4m3fn weight with per-channel scales takes the
+    pre-quantized matmul. A block-scaled weight (REQUANTIZE_BLOCK_SIZE gives a
+    rank-4 scale) or an int8 or float8_e5m2 weight (REQUANTIZE_WEIGHT_DTYPE)
+    runs the method's own apply on the dequantized rows instead."""
     seen = {}
 
     def apply(self, layer, x, bias=None):
         seen.update(layer=layer, x=x, bias=bias)
         return torch.full((x.shape[0], _N), 7.0)
 
+    def prequant(*args):
+        raise AssertionError("the pre-quantized matmul must not run")
+
     monkeypatch.setattr(VllmFp8LinearMethodTPU, "apply", apply)
-    weight = torch.randn(_K, _N).to(torch.float8_e4m3fn)
+    monkeypatch.setattr(linear_common, "quantized_matmul_prequant", prequant)
+    weight = (torch.randn(_K, _N) * 4).to(weight_dtype)
     layer = SimpleNamespace(
         weight=weight.t() if keep_vllm_layout else weight,
-        weight_scale=torch.rand(1, _K // 16, 1, _N),
+        weight_scale=torch.rand(*scale_shape),
     )
     if keep_vllm_layout:
         setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
