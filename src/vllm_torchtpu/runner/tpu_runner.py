@@ -10224,8 +10224,11 @@ class TPUModelRunner(GPUModelRunner):
         logits: torch.Tensor,
         padded_num_reqs: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Stage [padded_num_reqs] on CPU with neutral padding, then use one
-        # fixed-shape H2D copy per tensor to keep decode shape-stable.
+        # Stage [padded_num_reqs] rows on CPU (one per logits row unless the
+        # caller sizes them), then use one fixed-shape H2D copy per tensor to
+        # keep decode shape-stable. Rows past the active requests get the
+        # batch's own values when every request samples alike, and
+        # temperature 1, no top-k and top-p 1 otherwise.
         if padded_num_reqs is None:
             padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
