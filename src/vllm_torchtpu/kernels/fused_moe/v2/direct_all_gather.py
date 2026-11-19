@@ -28,18 +28,35 @@ from jax.experimental.compute_on import compute_on
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+# The scoped SPMEM allocation on TPU7x, the bound
+# preprocessing.supports_activation_gather also uses. Every shard's payload
+# must fit it at once.
+SHARED_MEMORY_BYTES = 32 * 1024 * 1024
+# The measured exchanges: 8 shards on one 2x2 TPU7x host, routing rows of
+# DeepSeek-V4.1-Flash from decode (640 int32) up to a 2,048-token step
+# (14,720 int32, top-6 of 384 experts).
+MAX_SHARDS = 8
+MAX_LOCAL_BYTES = 64 * 1024
+# Whole 128-lane int32 rows, as layer._exchange_layout pads every routing
+# row; a multiple of the SparseCore's 64-byte DMA granule.
+LOCAL_BYTES_ALIGNMENT = 512
 
-def supports_direct_all_gather(ep: int, local_bytes: int) -> bool:
+
+def supports_direct_all_gather(ep: int, local_bytes: int, single_host: bool) -> bool:
     """Whether direct_all_gather serves ep shards of local_bytes each.
 
-    It needs a TPU7x SparseCore, at least one peer, and every shard's payload
-    in the 32 MiB scoped SPMEM allocation at once.
+    It admits what was measured: a TPU7x SparseCore, 2 to 8 shards on one
+    host, and payloads of whole 128-lane int32 rows up to the largest
+    measured routing row. Everything else stays on lax.all_gather.
     """
     return (
         jax.default_backend() == "tpu"
-        and pltpu.get_tpu_info().generation >= 7
-        and ep >= 2
-        and 0 < ep * local_bytes <= 32 * 1024 * 1024
+        and pltpu.get_tpu_info().generation == 7
+        and 2 <= ep <= MAX_SHARDS
+        and single_host
+        and 0 < local_bytes <= MAX_LOCAL_BYTES
+        and local_bytes % LOCAL_BYTES_ALIGNMENT == 0
+        and ep * local_bytes <= SHARED_MEMORY_BYTES
     )
 
 
