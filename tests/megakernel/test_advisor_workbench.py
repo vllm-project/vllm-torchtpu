@@ -27,6 +27,15 @@ from typing import Any, cast
 
 import pytest
 
+from tests.megakernel.test_advisor_calibrate import (
+    XLA_MOD_ACTIVE_SPAN_US,
+    XLA_MOD_BUSY_US,
+    XLA_MOD_FIRST_OP_OFFSET_US,
+    XLA_MOD_NUM_LAYERS,
+    XLA_MOD_NUM_STEPS,
+    XLA_MOD_START_OFFSET_US,
+    build_multi_program_xla_modules_perfetto_events,
+)
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     constants,
@@ -1539,3 +1548,165 @@ def test_workbench_littles_law_and_host_head_controls(tmp_path: Path) -> None:
     assert " + t_head" in drawer_html
     assert " + 350.00" in drawer_html
     assert "Host Dispatch Head Gain: +1450.00 us" in drawer_html
+
+
+def _eval_phase_calibration_drawer(
+    tmp_path: Path,
+    sweep_report: advisor.AdvisorSweepReport,
+    cal_payload: dict[str, object],
+    file_name: str,
+) -> dict[str, object]:
+    """Run applyCalibrationObject in a temp phase runner and capture derivDrawer."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+    base_runner = (
+        Path(__file__)
+        .with_name("advisor_workbench_phase_runner.js")
+        .read_text(encoding="utf-8")
+    )
+    anchor = (
+        '  res.launchGapValue = elems.get("ctl-launch-gap").value;\n'
+        "  writeFile(args[1], JSON.stringify(res));"
+    )
+    replacement = (
+        '  res.launchGapValue = elems.get("ctl-launch-gap").value;\n'
+        '  res.derivDrawer = elems.get("wb-deriv-drawer").innerHTML;\n'
+        "  writeFile(args[1], JSON.stringify(res));"
+    )
+    if anchor not in base_runner:
+        msg = (
+            "Missing apply_calibration output anchor in "
+            "advisor_workbench_phase_runner.js"
+        )
+        raise RuntimeError(msg)
+    temp_runner = tmp_path / "custom_phase_runner.js"
+    temp_runner.write_text(
+        base_runner.replace(anchor, replacement, 1),
+        encoding="utf-8",
+    )
+    engine_path = (
+        Path(workbench_engine.__file__).parent / "assets" / "workbench_engine.js"
+    )
+    html_text = advisor.render_advisor_html(sweep_report)
+    m_seed = re.search(
+        r'<script id="advisor-data" type="application/json">(.*?)</script>',
+        html_text,
+        re.DOTALL,
+    )
+    assert m_seed is not None
+    seed_data = {
+        **workbench_engine.build_engine_seed_defaults(),
+        **json.loads(m_seed.group(1)),
+    }
+    in_json = tmp_path / "custom_phase_cal_in.json"
+    out_json = tmp_path / "custom_phase_cal_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": seed_data,
+                "phase_grid_seed": _phase_grid_seed_from_html(html_text),
+                "action": "apply_calibration",
+                "calPayload": cal_payload,
+                "fileName": file_name,
+            }
+        ),
+        encoding="utf-8",
+    )
+    argv = [js_runtime, str(temp_runner), str(in_json), str(out_json)]
+    pid = os.posix_spawnp(js_runtime, argv, os.environ)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            if os.waitstatus_to_exitcode(status) != 0:
+                msg = "Custom workbench phase runner failed"
+                raise RuntimeError(msg)
+            return cast(
+                "dict[str, object]",
+                json.loads(out_json.read_text(encoding="utf-8")),
+            )
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    msg = "Custom workbench phase runner timed out"
+    raise TimeoutError(msg)
+
+
+def test_workbench_littles_law_decoding_seqs_and_xla_modules_trace_trim(
+    tmp_path: Path,
+) -> None:
+    """Verify Decoding Seqs Little's Law UI helper and JS XLA Modules trimming."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    snaps = _eval_workbench_custom_steps(
+        tmp_path,
+        sweep_report,
+        [
+            {
+                "op": "apply_littles_law",
+                "outTps": 605.0,
+                "meanTpot": 13.42,
+                "tag": "littles_8",
+            }
+        ],
+    )
+    expected_seqs = round(605.0 * (13.42 / 1000.0))
+    assert snaps["littles_8"]["ctlBatch"] == str(expected_seqs)
+    assert snaps["littles_8"]["activeTokens"] == expected_seqs
+
+    expected_host_head_us = XLA_MOD_FIRST_OP_OFFSET_US - XLA_MOD_START_OFFSET_US
+    expected_step_time_us = XLA_MOD_ACTIVE_SPAN_US
+    boundaries = constants.SUBLAYER_BOUNDARIES_PER_LAYER * XLA_MOD_NUM_LAYERS
+    expected_launch_gap_us = (XLA_MOD_ACTIVE_SPAN_US - XLA_MOD_BUSY_US) / boundaries
+
+    meas_res = cast(
+        "dict[str, object]",
+        _run_workbench_phase_runner(
+            tmp_path,
+            sweep_report,
+            {
+                "action": "trace_to_meas",
+                "raw": build_multi_program_xla_modules_perfetto_events(
+                    ranks=(1, 2),
+                    host_wraps=True,
+                    step0_compile_extra_us=9000.0,
+                ),
+                "fileName": "xla_mod_multirank.json",
+            },
+        ),
+    )
+    js_meas = cast("dict[str, dict[str, float]]", meas_res["meas"])
+    expected_multirank_steady = 2 * (XLA_MOD_NUM_STEPS - 1)
+    assert js_meas["host_head_us"]["p50"] == pytest.approx(
+        expected_host_head_us, abs=1e-2
+    )
+    assert js_meas["host_head_us"]["n"] == expected_multirank_steady
+    assert js_meas["step_time_us"]["p50"] == pytest.approx(
+        expected_step_time_us, abs=1e-2
+    )
+    assert js_meas["step_time_us"]["n"] == expected_multirank_steady
+    assert js_meas["launch_gap_us"]["p50"] == pytest.approx(
+        expected_launch_gap_us, abs=1e-3
+    )
+    assert js_meas["launch_gap_us"]["n"] == expected_multirank_steady
+
+    apply_res = _eval_phase_calibration_drawer(
+        tmp_path,
+        sweep_report,
+        {
+            "schema": "advisor.measurements.v1",
+            "source": {"file": "head_only.json"},
+            "host_head_us": {
+                "p50": expected_host_head_us,
+                "p90": expected_host_head_us + 200.0,
+                "n": XLA_MOD_NUM_STEPS - 1,
+            },
+        },
+        "head_only.json",
+    )
+    assert apply_res["calibrated"] is True
+    drawer_after_cal = str(apply_res["derivDrawer"])
+    assert "Calibrated Host Head:" in drawer_after_cal
+    assert f"{expected_host_head_us:.1f} us" in drawer_after_cal

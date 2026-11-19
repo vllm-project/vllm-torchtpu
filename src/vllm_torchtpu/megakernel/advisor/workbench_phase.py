@@ -19,7 +19,14 @@ import json
 from typing import TYPE_CHECKING
 
 from .assets import load_asset
-from .constants import PHASE_PREFILL_TOKEN_GRID, PHASE_S_GRID, PHASE_T_GRID
+from .constants import (
+    MIN_STEPS_FOR_WARMUP_DROP,
+    MIN_WARMUP_DROP_STEPS,
+    PHASE_PREFILL_TOKEN_GRID,
+    PHASE_S_GRID,
+    PHASE_T_GRID,
+    WARMUP_OUTLIER_RATIO,
+)
 from .support import _find_deployment_preset
 
 if TYPE_CHECKING:
@@ -68,6 +75,9 @@ def build_phase_grid_seed(model_name: str) -> dict[str, object]:
         "s_grid": list(PHASE_S_GRID),
         "roles": roles,
         "prefill_token_grid": list(PHASE_PREFILL_TOKEN_GRID) if roles else [],
+        "min_steps_for_warmup_drop": MIN_STEPS_FOR_WARMUP_DROP,
+        "min_warmup_drop_steps": MIN_WARMUP_DROP_STEPS,
+        "warmup_outlier_ratio": WARMUP_OUTLIER_RATIO,
     }
 
 
