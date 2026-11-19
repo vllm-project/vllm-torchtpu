@@ -23,8 +23,10 @@ from vllm.models.deepseek_v41.common.mm_preprocess import (
 )
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v41.engram_gate import engram_gate
 from vllm_torchtpu.kernels.engram_hash import engram_hash, engram_prep, hash_tables
 from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
+from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
@@ -595,6 +597,48 @@ def _fused_prep_op():
         )
         _FUSED_PREP_OP = op
     return _FUSED_PREP_OP
+
+
+_ENGRAM_GATE_OP = None
+
+
+def _engram_gate_op():
+    """Torch op for ``engram_gate``: 7 arrays, then eps and clamp."""
+    global _ENGRAM_GATE_OP
+    if _ENGRAM_GATE_OP is None:
+        from jax.sharding import PartitionSpec as P
+        from torch_tpu._internal import pallas
+
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            get_pallas_op_mesh,
+        )
+
+        def call(
+            x: jax.Array,
+            w: jax.Array,
+            w_scale: jax.Array,
+            hidden: jax.Array,
+            q_weight: jax.Array,
+            k_weight: jax.Array,
+            mask: jax.Array,
+            eps: float,
+            clamp: float,
+        ) -> jax.Array:
+            return engram_gate(
+                x, w, w_scale, hidden, q_weight, k_weight, mask, eps=eps, clamp=clamp
+            )
+
+        op = pallas.jax_op(
+            "pallas::dsv41_engram_gate",
+            call,
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * 7 + (None,) * 2
+            ),
+        )
+        op.register_fake(lambda x, w, w_scale, hidden, *_: torch.empty_like(hidden))
+        _ENGRAM_GATE_OP = op
+    return _ENGRAM_GATE_OP
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -1280,6 +1324,20 @@ class Engram(upstream.Engram):
         local = gathered[:, rank * chunk : (rank + 1) * chunk]
         return local.transpose(0, 1).flatten(1, 2)[:, :cols]
 
+    def _fused_gate(self, x: torch.Tensor) -> bool:
+        """Whether ``engram_gate`` runs wkv, gate and residual in one kernel:
+        a full (not column-sharded) per-channel FP8 wkv on TPU."""
+        wkv = self.wkv
+        scale = getattr(wkv, "weight_scale", None)
+        return (
+            x.device.type == "tpu"
+            and wkv.weight.dtype == torch.float8_e4m3fn
+            and scale is not None
+            and scale.ndim == 1
+            and not getattr(wkv, KEEP_VLLM_LAYOUT_ATTR, False)
+            and tuple(wkv.weight.shape) == (x.shape[-1], (self.hc_mult + 1) * self.dim)
+        )
+
     def forward(self, hidden_states, hash_ids, token_mask=None):
         if self.use_sequence_parallel:
             tp = self.embed_tokens.tp_size
@@ -1294,7 +1352,25 @@ class Engram(upstream.Engram):
             embedded = self._sp_embed(hash_ids)
         else:
             embedded = self.embed(hash_ids)
-        kv = self.wkv(embedded.flatten(-2))
+        x = embedded.flatten(-2)
+        if self._fused_gate(x):
+            mask = (
+                hidden_states.new_ones(x.shape[0], dtype=torch.float32)
+                if token_mask is None
+                else token_mask
+            )
+            return _engram_gate_op()(
+                x,
+                self.wkv.weight,
+                self.wkv.weight_scale,
+                hidden_states,
+                self.q_weight,
+                self.k_weight,
+                mask,
+                self.eps,
+                self.clamp_value,
+            )
+        kv = self.wkv(x)
         keys = (
             kv[:, : self.hc_mult * self.dim]
             .unflatten(-1, (self.hc_mult, self.dim))
