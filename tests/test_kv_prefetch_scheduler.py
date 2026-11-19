@@ -132,9 +132,7 @@ def _model_dir(tmp_path):
     return str(d)
 
 
-def _make_sched(
-    tmp_path, monkeypatch, prefetch=0, num_blocks=2000, role="kv_consumer", reserve=8
-):
+def _make_sched(tmp_path, prefetch=0, num_blocks=2000, role="kv_consumer", reserve=8):
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=CAP,
@@ -277,9 +275,9 @@ class _Engine:
         return ids
 
 
-def test_stock_loop_defers_pull_while_running_is_full(tmp_path, monkeypatch):
+def test_stock_loop_defers_pull_while_running_is_full(tmp_path):
     """Gate off: at the cap no waiting request's pull starts (the deferral)."""
-    eng = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=0))
+    eng = _Engine(_make_sched(tmp_path, prefetch=0))
     assert eng.s._kv_prefetch_n == 0
     eng.fill_running()
     n_loads = len(eng.loads)
@@ -292,8 +290,8 @@ def test_stock_loop_defers_pull_while_running_is_full(tmp_path, monkeypatch):
     assert all(eng.blocks(r) == 0 for r in ("w0", "w1", "w2"))
 
 
-def test_prefetch_pulls_head_of_waiting_without_exceeding_cap(tmp_path, monkeypatch):
-    eng = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=2))
+def test_prefetch_pulls_head_of_waiting_without_exceeding_cap(tmp_path):
+    eng = _Engine(_make_sched(tmp_path, prefetch=2))
     assert eng.s._kv_prefetch_n == 2
     running = eng.fill_running()
     n_loads = len(eng.loads)
@@ -333,10 +331,10 @@ def test_prefetch_pulls_head_of_waiting_without_exceeding_cap(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("prefetch", [0, 3])
-def test_freed_slot_refill_latency(tmp_path, monkeypatch, prefetch):
+def test_freed_slot_refill_latency(tmp_path, prefetch):
     """Steps from a slot freeing to a waiting request filling it, when KV
     takes 2 steps to arrive after the pull starts."""
-    eng = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=prefetch))
+    eng = _Engine(_make_sched(tmp_path, prefetch=prefetch))
     running = eng.fill_running()
     n_loads = len(eng.loads)
     eng.s.add_request(_req("w0"))
@@ -362,8 +360,8 @@ def test_freed_slot_refill_latency(tmp_path, monkeypatch, prefetch):
         assert idle_steps >= 2  # the slot idles while the pull runs
 
 
-def test_abort_of_prefetched_requests_frees_blocks(tmp_path, monkeypatch):
-    eng = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=2))
+def test_abort_of_prefetched_requests_frees_blocks(tmp_path):
+    eng = _Engine(_make_sched(tmp_path, prefetch=2))
     running = eng.fill_running()
     eng.s.add_request(_req("w0"))
     eng.s.add_request(_req("w1"))
@@ -405,13 +403,11 @@ def test_abort_of_prefetched_requests_frees_blocks(tmp_path, monkeypatch):
     assert all(b.ref_cnt == 0 for b in pool.blocks)
 
 
-def test_prefetch_respects_free_blocks_and_reserve(tmp_path, monkeypatch):
+def test_prefetch_respects_free_blocks_and_reserve(tmp_path):
     # 4 running x 5 blocks (4 prompt + 1 decode) = 20 used. The stock
     # async-load reservation is 0 once every running prefill has finished.
     # With 50 blocks (49 usable): 29 free - prefetch reserve must fit 4 blocks.
-    eng = _Engine(
-        _make_sched(tmp_path, monkeypatch, prefetch=2, num_blocks=50, reserve=64)
-    )
+    eng = _Engine(_make_sched(tmp_path, prefetch=2, num_blocks=50, reserve=64))
     running = eng.fill_running()
     free_before = eng.free_blocks()
     eng.s.add_request(_req("w0"))
@@ -422,19 +418,15 @@ def test_prefetch_respects_free_blocks_and_reserve(tmp_path, monkeypatch):
     assert [r.request_id for r in eng.s.running] == running
     assert eng.free_blocks() >= free_before - CAP  # only running growth
 
-    eng2 = _Engine(
-        _make_sched(tmp_path, monkeypatch, prefetch=2, num_blocks=50, reserve=0)
-    )
+    eng2 = _Engine(_make_sched(tmp_path, prefetch=2, num_blocks=50, reserve=0))
     eng2.fill_running()
     eng2.s.add_request(_req("w0"))
     eng2.step()
     assert eng2.status("w0") == RequestStatus.WAITING_FOR_REMOTE_KVS
 
 
-def test_request_without_async_load_stops_prefetch_and_never_passes_cap(
-    tmp_path, monkeypatch
-):
-    eng = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=3))
+def test_request_without_async_load_stops_prefetch_and_never_passes_cap(tmp_path):
+    eng = _Engine(_make_sched(tmp_path, prefetch=3))
     running = eng.fill_running()
     n_loads = len(eng.loads)
     eng.s.add_request(_req("local0", remote=False))  # would compute locally
@@ -453,21 +445,21 @@ def test_request_without_async_load_stops_prefetch_and_never_passes_cap(
     assert len(eng.s.running) == CAP
 
 
-def test_the_option_is_refused_on_a_kv_producer(tmp_path, monkeypatch):
+def test_the_option_is_refused_on_a_kv_producer(tmp_path):
     with pytest.raises(ValueError, match="kv_prefetch"):
-        _make_sched(tmp_path, monkeypatch, prefetch=4, role="kv_producer")
-    assert _make_sched(tmp_path, monkeypatch, role="kv_producer")._kv_prefetch_n == 0
+        _make_sched(tmp_path, prefetch=4, role="kv_producer")
+    assert _make_sched(tmp_path, role="kv_producer")._kv_prefetch_n == 0
 
 
 @pytest.mark.parametrize("prefetch", [0, 1, 4])
-def test_randomized_cap_bound_and_no_leaks(tmp_path, monkeypatch, prefetch):
+def test_randomized_cap_bound_and_no_leaks(tmp_path, prefetch):
     """Random arrivals, finishes, aborts (running and held) and KV arrival
     delays. Every step: the running set never passes the cap (_Engine.step),
     and a step that starts with the running set full starts at most
     max(0, prefetch - held) pulls (none with the gate off). At the end
     everything drains with every block free."""
     rng = random.Random(1234 + prefetch)
-    eng = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=prefetch, num_blocks=200))
+    eng = _Engine(_make_sched(tmp_path, prefetch=prefetch, num_blocks=200))
     started_at: dict[str, int] = {}
     delay: dict[str, int] = {}
     n = 0
@@ -522,7 +514,7 @@ def test_randomized_cap_bound_and_no_leaks(tmp_path, monkeypatch, prefetch):
     assert all(b.ref_cnt == 0 for b in pool.blocks)
 
 
-def test_a_kv_consumer_prefetches_only_with_the_option(tmp_path, monkeypatch):
+def test_a_kv_consumer_prefetches_only_with_the_option(tmp_path):
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     s._kv_prefetch_switch = True
     s._init_kv_prefetch()
@@ -531,9 +523,9 @@ def test_a_kv_consumer_prefetches_only_with_the_option(tmp_path, monkeypatch):
     s._init_kv_prefetch()
     assert s._kv_prefetch_n == 0
     # On the real scheduler: a consumer without the option keeps vLLM's loop.
-    s = _make_sched(tmp_path, monkeypatch)
+    s = _make_sched(tmp_path)
     assert s._kv_prefetch_n == 0 and s._is_kv_consumer
-    s = _make_sched(tmp_path, monkeypatch, prefetch=8)
+    s = _make_sched(tmp_path, prefetch=8)
     assert s._kv_prefetch_n == 8
 
 
@@ -554,5 +546,5 @@ def test_building_the_scheduler_leaves_the_vllm_classes_alone(tmp_path, monkeypa
     for cls, name in _WRAPPED:
         monkeypatch.setattr(cls, name, inspect.unwrap(cls.__dict__[name]))
     before = {(cls, name): cls.__dict__[name] for cls, name in _WRAPPED}
-    _make_sched(tmp_path, monkeypatch, prefetch=2)
+    _make_sched(tmp_path, prefetch=2)
     assert {(cls, name): cls.__dict__[name] for cls, name in _WRAPPED} == before
