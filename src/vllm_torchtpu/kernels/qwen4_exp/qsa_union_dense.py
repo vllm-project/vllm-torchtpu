@@ -1892,8 +1892,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             ] + ids_scratch + ([
                 pltpu.VMEM((kv_heads, group * q_heads_per_kv, kv_tile), jnp.float32),
                 pltpu.VMEM((kv_heads, group * q_heads_per_kv, kv_tile), jnp.float32),
-                pltpu.VMEM((kv_heads, kv_tile, head_dim), jnp.float32),
-                pltpu.VMEM((kv_heads, kv_tile, head_dim), jnp.float32),
+                pltpu.VMEM((kv_heads, kv_tile, head_dim), jnp.bfloat16 if dot16 else jnp.float32),
+                pltpu.VMEM((kv_heads, kv_tile, head_dim), jnp.bfloat16 if dot16 else jnp.float32),
             ] if walk_pipe else []),
         ),
         compiler_params=pltpu.CompilerParams(
