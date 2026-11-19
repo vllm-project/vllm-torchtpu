@@ -291,6 +291,67 @@ def _op_runner(mesh, cap, geometry=(E, H, INTER, TOPK), scores_cap=None):
     return run
 
 
+def _built_op(mesh):
+    """What moe_lowtok_fused_op._build_op registers, for top-k TOPK with the
+    cap armed at OP_CAP, on a one-axis EP mesh of ``mesh``'s devices in mesh
+    order: the op's name and specs, its (dp, tp) view, and the forms its
+    program traces at the cap and one row per engine above it."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
+    from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op as op
+    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+    devices = np.asarray(mesh.devices).reshape(-1)
+    registered = {}
+
+    def record(name, fn, **kwargs):
+        registered.update(kwargs, name=name, fn=fn)
+        return object()
+
+    op.build_ep_mesh = lambda: Mesh(devices, (EP_AXIS_NAME,))
+    op.sharded_jax_op = record
+    op._DP, op._TP = DP, TP
+    op._OPS.clear()
+    moe_lowtok_scores._ARMED_MAX_TOKENS = OP_CAP
+    op._build_op(TOPK)
+    view = registered["mesh"]
+    n, s = E * DP * TP, jax.ShapeDtypeStruct
+
+    def forms(rows):
+        program = str(
+            jax.make_jaxpr(registered["fn"])(
+                s((DP * rows, H), jnp.bfloat16),
+                s((DP * rows, n), jnp.bfloat16),
+                s((n, H, 2 * INTER), kernel.FP8_DTYPE),
+                s((n, INTER, H), kernel.FP8_DTYPE),
+                s((n, 1, 1, 2 * INTER), jnp.float32),
+                s((n, 1, 1, H), jnp.float32),
+                s((DP * TP,), jnp.int32),
+                s((DP * TP * 2,), jnp.int32),
+            )
+        )
+        return dict(
+            fused_kernel="moe_lowtok_fused_dih" in program,
+            all_gather="all_gather" in program,
+        )
+
+    return dict(
+        name=registered["name"],
+        axes=list(view.axis_names),
+        device_ids=[[d.id for d in row] for row in np.asarray(view.devices)],
+        mesh_order=[[d.id for d in row] for row in devices.reshape(DP, TP)],
+        specs=registered["input_partition_specs"] == op._IN_SPECS
+        and registered["output_partition_specs"] == op._OUT_SPEC,
+        at_cap=forms(OP_CAP // DP),
+        above_cap=forms(OP_CAP // DP + 1),
+    )
+
+
 def _summary(cores, want):
     """(bits of every core, the checks on them): both cores of a TP pair hold
     the same bytes, no NaN, and the engines' rows against the reference."""
@@ -434,6 +495,7 @@ def _worker():
         result["op_cases"][name]["races_found"] = bool(
             interpret_pallas_call.races.races_found
         )
+    result["built_op"] = _built_op(mesh)
     print("RESULT " + json.dumps(result))
 
 
@@ -492,6 +554,23 @@ def test_op_program_sums_the_engine_rows_on_either_side_of_its_cap(on_8_devices,
     case = on_8_devices["op_cases"][name]
     assert not case["races_found"], case
     _check_op(case, *OP_CASES[name][1:])
+
+
+@pytest.mark.cpu_test
+def test_build_op_registers_the_program_on_the_mesh_view_with_the_armed_cap(
+    on_8_devices,
+):
+    """_build_op, which serves, hands sharded_jax_op the program on the
+    (dp, tp) view of the EP mesh in mesh order, so each core's position is
+    the one its rank operand names, and with the armed cap: the fused kernel
+    at the cap, the all-gather path one row per engine above it."""
+    built = on_8_devices["built_op"]
+    assert built["name"] == f"pallas::moe_lowtok_fused_k{TOPK}"
+    assert built["axes"] == ["dp", "tp"]
+    assert built["device_ids"] == built["mesh_order"]
+    assert built["specs"]
+    assert built["at_cap"] == {"fused_kernel": True, "all_gather": False}
+    assert built["above_cap"] == {"fused_kernel": False, "all_gather": True}
 
 
 def _call(rows=32, experts=E, logit_cols=None, **kwargs):
