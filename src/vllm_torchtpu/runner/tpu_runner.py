@@ -134,6 +134,7 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampl
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
+    sample_from_logits_fast_topk,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -1940,7 +1941,16 @@ class TPUModelRunner(GPUModelRunner):
         bucket of size num_reqs."""
         offsets = self._prefill_ckpt_zero_offsets.get(num_reqs)
         if offsets is None:
-            offsets = torch.zeros((num_reqs,), dtype=torch.int32).to(self.device)
+            if envs.VLLM_TPU_ASYNC_HOST_OVERLAP:
+                cpu_z = torch.zeros((num_reqs,), dtype=torch.int32)
+                keepalive = getattr(self, "_prefill_ckpt_zero_offsets_cpu", None)
+                if keepalive is None:
+                    keepalive = {}
+                    self._prefill_ckpt_zero_offsets_cpu = keepalive
+                keepalive[num_reqs] = cpu_z
+                offsets = cpu_z.to(self.device, non_blocking=True)
+            else:
+                offsets = torch.zeros((num_reqs,), dtype=torch.int32).to(self.device)
             self._prefill_ckpt_zero_offsets[num_reqs] = offsets
         return offsets
 
@@ -4097,6 +4107,94 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output.free_encoder_mm_hashes,
                 )
 
+    def _get_dp_lockstep_dummy_tensors(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
+    ]:
+        """Return cached device tensors for an idle DP lockstep dummy step.
+
+        Uploading once with ``non_blocking=True`` (while retaining the CPU
+        sources) avoids synchronous ``.to(self.device)`` stream barriers that
+        would otherwise stall an idle DP rank behind the previous step's TPU
+        execution and hold up cross-rank EP collectives.
+        """
+        actual_num_reqs = min(num_tokens, num_reqs)
+        has_read_offsets = self.mamba_slot_read_offsets is not None
+        logits_rows = self._dp_vocab_logits_rows() if self._dp_vocab_logits else num_reqs
+        key = (
+            int(num_tokens),
+            int(num_reqs),
+            int(actual_num_reqs),
+            bool(self.uses_mrope),
+            bool(self._has_mamba_state),
+            has_read_offsets,
+            int(logits_rows),
+        )
+        cache = getattr(self, "_dp_lockstep_dummy_cache", None)
+        if cache is None:
+            cache = {}
+            self._dp_lockstep_dummy_cache = cache
+        entry = cache.get(key)
+        if entry is not None:
+            return entry[0]
+
+        cpu_sources: list[torch.Tensor] = []
+
+        def _stage(cpu_t: torch.Tensor) -> torch.Tensor:
+            cpu_c = cpu_t.contiguous()
+            cpu_sources.append(cpu_c)
+            return cpu_c.to(self.device, non_blocking=True)
+
+        input_ids = _stage(torch.zeros((num_tokens,), dtype=torch.int32))
+        pos_shape = (3, num_tokens) if self.uses_mrope else (num_tokens,)
+        position_ids = _stage(torch.zeros(pos_shape, dtype=torch.int32))
+        query_lens = [1] * actual_num_reqs + [0] * (num_reqs - actual_num_reqs)
+        query_start_loc = _stage(
+            torch.cumsum(
+                torch.tensor([0] + query_lens, dtype=torch.int32),
+                dim=0,
+                dtype=torch.int32,
+            )
+        )
+        seq_lens = _stage(torch.ones((num_reqs,), dtype=torch.int32))
+        distribution = [actual_num_reqs] * 3
+        dummy_mamba_state_indices = (
+            _stage(torch.zeros((num_reqs,), dtype=torch.int32))
+            if self._has_mamba_state
+            else None
+        )
+        dummy_mamba_request_distribution = None
+        if has_read_offsets:
+            combined_device = _stage(torch.tensor(distribution * 2, dtype=torch.int32))
+            request_distribution = combined_device[0:3]
+            dummy_mamba_request_distribution = combined_device[3:6]
+        else:
+            request_distribution = _stage(torch.tensor(distribution, dtype=torch.int32))
+        logits_idx = _stage(torch.zeros((logits_rows,), dtype=torch.int32))
+
+        dev_tuple = (
+            input_ids,
+            position_ids,
+            query_start_loc,
+            seq_lens,
+            request_distribution,
+            dummy_mamba_state_indices,
+            dummy_mamba_request_distribution,
+            logits_idx,
+        )
+        cache[key] = (dev_tuple, cpu_sources)
+        return dev_tuple
+
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
         self._dummy_run(
             bucket,
@@ -4130,8 +4228,25 @@ class TPUModelRunner(GPUModelRunner):
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
             return None
+        dp_size = utils.get_dp_size(self.parallel_config)
+        if envs.VLLM_TPU_ASYNC_HOST_OVERLAP:
+            cache = getattr(self, "_dp_tokens_cpu_cache", None)
+            if cache is None:
+                cache = {}
+                self._dp_tokens_cpu_cache = cache
+            key = (dp_size, int(num_tokens))
+            cached = cache.get(key)
+            if cached is None:
+                cached = torch.full(
+                    (dp_size,),
+                    num_tokens,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+                cache[key] = cached
+            return cached
         return torch.full(
-            (utils.get_dp_size(self.parallel_config),),
+            (dp_size,),
             num_tokens,
             dtype=torch.int32,
             device="cpu",
@@ -5078,8 +5193,11 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates = self._sampler_topk_candidates(
                     cur_start_idx, cur_end_idx, grammar_output
                 )
-                bonus_u = torch.rand_like(
-                    bonus_logits, dtype=torch.float32, generator=sampling_generator
+                fast_topk_cap = self._sampler_fast_topk_cap(
+                    cur_start_idx, cur_end_idx, grammar_output
+                )
+                bonus_u = self._sample_uniform_u(
+                    bonus_logits, fast_topk_cap, sampling_generator
                 )
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
@@ -5090,6 +5208,7 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=False,
                     topk_candidates=topk_candidates,
                     apply_topk_topp=self._sampler_applies_topk_topp(),
+                    fast_topk_cap=fast_topk_cap,
                 ).view(-1)
         accept_u = None
         assert self.rejection_sampler is not None
@@ -5288,10 +5407,11 @@ class TPUModelRunner(GPUModelRunner):
                                     cur_start_idx, cur_end_idx, logits
                                 )
                             )
-                            u = torch.rand_like(
-                                logits,
-                                dtype=torch.float32,
-                                generator=sampling_generator,
+                            fast_topk_cap = self._sampler_fast_topk_cap(
+                                cur_start_idx, cur_end_idx, grammar_output
+                            )
+                            u = self._sample_uniform_u(
+                                logits, fast_topk_cap, sampling_generator
                             )
                             selected = self.sample_from_logits_func(
                                 logits,
@@ -5304,6 +5424,7 @@ class TPUModelRunner(GPUModelRunner):
                                     cur_start_idx, cur_end_idx, grammar_output
                                 ),
                                 apply_topk_topp=self._sampler_applies_topk_topp(),
+                                fast_topk_cap=fast_topk_cap,
                             )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -5371,8 +5492,11 @@ class TPUModelRunner(GPUModelRunner):
                                 cur_start_idx, cur_end_idx, logits
                             )
                         )
-                        u = torch.rand_like(
-                            logits, dtype=torch.float32, generator=sampling_generator
+                        fast_topk_cap = self._sampler_fast_topk_cap(
+                            cur_start_idx, cur_end_idx, grammar_output
+                        )
+                        u = self._sample_uniform_u(
+                            logits, fast_topk_cap, sampling_generator
                         )
                         selected_token_ids = self.sample_from_logits_func(
                             logits,
@@ -5385,6 +5509,7 @@ class TPUModelRunner(GPUModelRunner):
                                 cur_start_idx, cur_end_idx, grammar_output
                             ),
                             apply_topk_topp=self._sampler_applies_topk_topp(),
+                            fast_topk_cap=fast_topk_cap,
                         )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
@@ -6141,70 +6266,97 @@ class TPUModelRunner(GPUModelRunner):
         # A profile batch carries random values so every token row routes
         # on its own, as real tokens do; a warmup batch traces shapes only.
         profile_query_lens: list[int] = []
-        if profiling:
-            input_ids = self._profile_input("ids", (self.max_num_tokens,), torch.int32)[
-                :num_tokens
-            ].to(self.device)
-            if profile_decode_query_lens is not None:
-                profile_query_lens = list(profile_decode_query_lens)
-                assert sum(profile_query_lens) <= num_tokens, (
-                    profile_query_lens,
-                    num_tokens,
+        use_async_dp_dummy = bool(
+            envs.VLLM_TPU_ASYNC_HOST_OVERLAP
+            and dp_lockstep
+            and not profiling
+            and self.kv_cache_config is not None
+        )
+        cached_logits_idx: torch.Tensor | None = None
+        if use_async_dp_dummy:
+            inputs_embeds = None
+            actual_num_reqs = min(num_tokens, num_reqs)
+            (
+                input_ids,
+                position_ids,
+                query_start_loc,
+                seq_lens,
+                request_distribution,
+                dummy_mamba_state_indices,
+                dummy_mamba_request_distribution,
+                cached_logits_idx,
+            ) = self._get_dp_lockstep_dummy_tensors(num_tokens, num_reqs)
+        else:
+            if profiling:
+                input_ids = self._profile_input(
+                    "ids", (self.max_num_tokens,), torch.int32
+                )[:num_tokens].to(self.device)
+                if profile_decode_query_lens is not None:
+                    profile_query_lens = list(profile_decode_query_lens)
+                    assert sum(profile_query_lens) <= num_tokens, (
+                        profile_query_lens,
+                        num_tokens,
+                    )
+                else:
+                    # One prefill request, or several of at most the model length
+                    # when a bucket exceeds it.
+                    left = num_tokens
+                    while left > 0:
+                        profile_query_lens.append(min(left, self.max_model_len))
+                        left -= profile_query_lens[-1]
+                actual_num_reqs = len(profile_query_lens)
+                assert actual_num_reqs <= num_reqs, (
+                    f"profiling {num_tokens} tokens needs {actual_num_reqs} "
+                    f"requests, the batch holds {num_reqs}"
                 )
             else:
-                # One prefill request, or several of at most the model length
-                # when a bucket exceeds it.
-                left = num_tokens
-                while left > 0:
-                    profile_query_lens.append(min(left, self.max_model_len))
-                    left -= profile_query_lens[-1]
-            actual_num_reqs = len(profile_query_lens)
-            assert actual_num_reqs <= num_reqs, (
-                f"profiling {num_tokens} tokens needs {actual_num_reqs} "
-                f"requests, the batch holds {num_reqs}"
-            )
-        else:
-            input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(self.device)
-            actual_num_reqs = min(num_tokens, num_reqs)
-        inputs_embeds = None
-        if self.uses_mrope:
-            position_ids = torch.zeros((3, num_tokens), dtype=torch.int32).to(
+                input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(self.device)
+                actual_num_reqs = min(num_tokens, num_reqs)
+            inputs_embeds = None
+            if self.uses_mrope:
+                position_ids = torch.zeros((3, num_tokens), dtype=torch.int32).to(
+                    self.device
+                )
+            else:
+                position_ids = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
+                )
+            if profiling:
+                query_lens = profile_query_lens + [0] * (num_reqs - actual_num_reqs)
+            else:
+                query_lens = [1] * actual_num_reqs + [0] * (num_reqs - actual_num_reqs)
+            query_start_loc = torch.cumsum(
+                torch.tensor([0] + query_lens, dtype=torch.int32),
+                dim=0,
+                dtype=torch.int32,
+            ).to(self.device)
+            seq_lens_cpu = torch.ones((num_reqs,), dtype=torch.int32)
+            if profile_prefix is not None:
+                for i, q in enumerate(profile_query_lens):
+                    seq_lens_cpu[i] = q
+                if profile_decode_query_lens is not None:
+                    seq_lens_cpu[:actual_num_reqs] += profile_prefix
+                else:
+                    seq_lens_cpu[0] += profile_prefix
+            seq_lens = seq_lens_cpu.to(self.device)
+            # V3: request_distribution = [decode_end, prefill_end, mixed_end].
+            # Dummy runs use one scheduled token per active request, so model
+            # them as pure decode to match the real single-chip path; a profile
+            # run holds mixed requests, as a real prefill chunk does, and a
+            # decode-shaped profile run the segments a verify step has.
+            if profile_decode_query_lens is not None:
+                num_single = sum(q == 1 for q in profile_query_lens)
+                num_static = sum(
+                    q == self._static_verify_q_len for q in profile_query_lens
+                )
+                distribution = [num_single, num_single + num_static, actual_num_reqs]
+            elif profiling:
+                distribution = [0, 0, actual_num_reqs]
+            else:
+                distribution = [actual_num_reqs] * 3
+            request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
                 self.device
             )
-        else:
-            position_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
-        if profiling:
-            query_lens = profile_query_lens + [0] * (num_reqs - actual_num_reqs)
-        else:
-            query_lens = [1] * actual_num_reqs + [0] * (num_reqs - actual_num_reqs)
-        query_start_loc = torch.cumsum(
-            torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
-        ).to(self.device)
-        seq_lens_cpu = torch.ones((num_reqs,), dtype=torch.int32)
-        if profile_prefix is not None:
-            for i, q in enumerate(profile_query_lens):
-                seq_lens_cpu[i] = q
-            if profile_decode_query_lens is not None:
-                seq_lens_cpu[:actual_num_reqs] += profile_prefix
-            else:
-                seq_lens_cpu[0] += profile_prefix
-        seq_lens = seq_lens_cpu.to(self.device)
-        # V3: request_distribution = [decode_end, prefill_end, mixed_end].
-        # Dummy runs use one scheduled token per active request, so model
-        # them as pure decode to match the real single-chip path; a profile
-        # run holds mixed requests, as a real prefill chunk does, and a
-        # decode-shaped profile run the segments a verify step has.
-        if profile_decode_query_lens is not None:
-            num_single = sum(q == 1 for q in profile_query_lens)
-            num_static = sum(q == self._static_verify_q_len for q in profile_query_lens)
-            distribution = [num_single, num_single + num_static, actual_num_reqs]
-        elif profiling:
-            distribution = [0, 0, actual_num_reqs]
-        else:
-            distribution = [actual_num_reqs] * 3
-        request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
-            self.device
-        )
         dummy_layout_plan = _get_sequence_layout_planner_for_runner(self).prepare_dummy(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
@@ -6212,27 +6364,28 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         if self.kv_cache_config is not None:
-            # Dummy compact-mamba slot ids (all null slot 0): the dummy run
-            # only traces shapes/HBM, so the recurrent state read/written is
-            # never consumed. Shape must match the GDN op's max_reqs
-            # (= seq_lens length = num_reqs).
-            dummy_mamba_state_indices = (
-                torch.zeros((num_reqs,), dtype=torch.int32).to(self.device)
-                if self._has_mamba_state
-                else None
-            )
-            # Match _prepare_inputs: the spec-decode mamba fields are set iff
-            # the model has mamba layers and spec decoding is enabled, so the
-            # dummy runs compile the same GDN program signature — including
-            # the two distributions being views of one [6] base tensor (see
-            # _combined_request_distribution_cpu for why).
-            dummy_mamba_request_distribution = None
-            if self.mamba_slot_read_offsets is not None:
-                combined_device = torch.tensor(distribution * 2, dtype=torch.int32).to(
-                    self.device
+            if not use_async_dp_dummy:
+                # Dummy compact-mamba slot ids (all null slot 0): the dummy run
+                # only traces shapes/HBM, so the recurrent state read/written is
+                # never consumed. Shape must match the GDN op's max_reqs
+                # (= seq_lens length = num_reqs).
+                dummy_mamba_state_indices = (
+                    torch.zeros((num_reqs,), dtype=torch.int32).to(self.device)
+                    if self._has_mamba_state
+                    else None
                 )
-                request_distribution = combined_device[0:3]
-                dummy_mamba_request_distribution = combined_device[3:6]
+                # Match _prepare_inputs: the spec-decode mamba fields are set iff
+                # the model has mamba layers and spec decoding is enabled, so the
+                # dummy runs compile the same GDN program signature — including
+                # the two distributions being views of one [6] base tensor (see
+                # _combined_request_distribution_cpu for why).
+                dummy_mamba_request_distribution = None
+                if self.mamba_slot_read_offsets is not None:
+                    combined_device = torch.tensor(
+                        distribution * 2, dtype=torch.int32
+                    ).to(self.device)
+                    request_distribution = combined_device[0:3]
+                    dummy_mamba_request_distribution = combined_device[3:6]
             dummy_prefill_ckpt_offsets = (
                 self._dummy_prefill_ckpt_offsets(num_reqs)
                 if self._prefill_ckpt_units is not None
@@ -6364,10 +6517,16 @@ class TPUModelRunner(GPUModelRunner):
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
-                _idx = torch.zeros(
-                    self._dp_vocab_logits_rows() if self._dp_vocab_logits else num_reqs,
-                    dtype=torch.int32,
-                    device=out.device,
+                _idx = (
+                    cached_logits_idx
+                    if cached_logits_idx is not None
+                    else torch.zeros(
+                        self._dp_vocab_logits_rows()
+                        if self._dp_vocab_logits
+                        else num_reqs,
+                        dtype=torch.int32,
+                        device=out.device,
+                    )
                 )
                 _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
@@ -6821,24 +6980,42 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                # (all_greedy, topk_candidates, apply_topk_topp): under
-                # speculative decoding the random path has a no-top-k/top-p
-                # graph next to the full one (_sampler_applies_topk_topp).
-                variants = [(False, 0, True), (True, 0, True)]
-                if self.speculative_config is not None:
-                    variants.insert(1, (False, 0, False))
+                # (all_greedy, topk_candidates, apply_topk_topp, fast_topk_cap):
+                # under speculative decoding or VLLM_TPU_FAST_TOPK_TOPP, the
+                # random path has a no-top-k/top-p graph next to the full one
+                # (_sampler_applies_topk_topp), plus the exact small-k graph.
+                variants = [(False, 0, True, 0), (True, 0, True, 0)]
+                if self.speculative_config is not None or envs.VLLM_TPU_FAST_TOPK_TOPP:
+                    variants.insert(1, (False, 0, False, 0))
                 if blocks := self._topk_candidate_blocks():
-                    variants.append((False, blocks, True))
-                for all_greedy, topk_candidates, apply_topk_topp in variants:
+                    variants.append((False, blocks, True, 0))
+                if fast_cap := self._fast_topk_max_k():
+                    variants.append((False, 0, True, fast_cap))
+                for (
+                    all_greedy,
+                    topk_candidates,
+                    apply_topk_topp,
+                    fast_topk_cap,
+                ) in variants:
+                    u_arg = (
+                        torch.rand(
+                            (num_reqs, fast_topk_cap),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        if fast_topk_cap > 0
+                        else dummy_u
+                    )
                     out = self.sample_from_logits_func(
                         dummy_logits,
                         dummy_temperatures,
-                        dummy_u,
+                        u_arg,
                         dummy_top_k,
                         dummy_top_p,
                         all_greedy=all_greedy,
                         topk_candidates=topk_candidates,
                         apply_topk_topp=apply_topk_topp,
+                        fast_topk_cap=fast_topk_cap,
                     )
                     synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -8825,8 +9002,8 @@ class TPUModelRunner(GPUModelRunner):
         return num_blocks
 
     def _sampler_applies_topk_topp(self) -> bool:
-        """False when speculative decoding is on and no running request sets
-        top-k or top-p.
+        """False when speculative decoding (or VLLM_TPU_FAST_TOPK_TOPP) is on
+        and no running request sets top-k or top-p.
 
         `apply_top_k_top_p` runs two 31-step bisections over the whole
         vocabulary per row (7.5 ms for 512 verify rows on Flash) and is the
@@ -8834,12 +9011,64 @@ class TPUModelRunner(GPUModelRunner):
         GPU sampler skips it in the same case, keyed on the same
         `InputBatch.no_top_k` / `no_top_p`. The samplers skip it on a
         separate compiled graph that the precompiles warm next to the full
-        one. Without speculative decoding the sampler keeps its single
-        full-path graph.
+        one. Without speculative decoding or VLLM_TPU_FAST_TOPK_TOPP, the
+        sampler keeps its single full-path graph.
         """
-        if self.speculative_config is None:
+        if self.speculative_config is None and not envs.VLLM_TPU_FAST_TOPK_TOPP:
             return True
         return not (self.input_batch.no_top_k and self.input_batch.no_top_p)
+
+    def _fast_topk_max_k(self) -> int:
+        """Returns VLLM_TPU_FAST_TOPK_TOPP_MAX_K when fast small-k sampling is on."""
+        if not envs.VLLM_TPU_FAST_TOPK_TOPP:
+            return 0
+        max_k = envs.VLLM_TPU_FAST_TOPK_TOPP_MAX_K
+        if max_k <= 0 or self.vocab_size <= 0:
+            return 0
+        return min(max_k, self.vocab_size)
+
+    def _sampler_fast_topk_cap(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        grammar_output: object | None,
+    ) -> int:
+        """Returns k_cap for exact small-k sampling on this chunk, or 0.
+
+        Eligible when VLLM_TPU_FAST_TOPK_TOPP is enabled, no grammar mask
+        applies, and every active non-greedy request in [cur_start_idx,
+        cur_end_idx) has 1 <= top_k <= k_cap.
+        """
+        k_cap = self._fast_topk_max_k()
+        if k_cap == 0 or grammar_output is not None or cur_end_idx <= cur_start_idx:
+            return 0
+        temps = self.input_batch.temperature_cpu_tensor[cur_start_idx:cur_end_idx]
+        top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
+        non_greedy = temps > SAMPLING_EPS
+        if not bool(non_greedy.any()):
+            return 0
+        if not bool((~non_greedy | ((top_k >= 1) & (top_k <= k_cap))).all()):
+            return 0
+        logger.info_once(
+            "Sampler fast small-k top-k/top-p path active (k_cap=%d).",
+            k_cap,
+        )
+        return k_cap
+
+    def _sample_uniform_u(
+        self,
+        logits: torch.Tensor,
+        fast_topk_cap: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        if fast_topk_cap > 0:
+            return torch.rand(
+                (logits.shape[0], fast_topk_cap),
+                dtype=torch.float32,
+                device=logits.device,
+                generator=generator,
+            )
+        return torch.rand_like(logits, dtype=torch.float32, generator=generator)
 
     def _sampler_topk_candidates(
         self,
@@ -8853,7 +9082,14 @@ class TPUModelRunner(GPUModelRunner):
         keeps 1 <= top_k <= num_blocks // 2 and no grammar mask applies.
         """
         num_blocks = self._topk_candidate_blocks()
-        if num_blocks == 0 or grammar_output is not None:
+        if (
+            num_blocks == 0
+            or grammar_output is not None
+            or self._sampler_fast_topk_cap(
+                cur_start_idx, cur_end_idx, grammar_output
+            )
+            > 0
+        ):
             return 0
         top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
         if not bool(((top_k >= 1) & (top_k <= num_blocks // 2)).all()):
@@ -9014,6 +9250,7 @@ class TPUModelRunner(GPUModelRunner):
         all_greedy: bool = False,
         topk_candidates: int = 0,
         apply_topk_topp: bool = True,
+        fast_topk_cap: int = 0,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
@@ -9021,6 +9258,16 @@ class TPUModelRunner(GPUModelRunner):
         """
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
+        if fast_topk_cap > 0:
+            return sample_from_logits_fast_topk(
+                logits,
+                temperatures,
+                u,
+                top_k,
+                top_p,
+                k_cap=fast_topk_cap,
+                sampling_eps=SAMPLING_EPS,
+            )
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
         if apply_topk_topp:

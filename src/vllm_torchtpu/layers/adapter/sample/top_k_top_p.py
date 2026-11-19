@@ -311,3 +311,146 @@ def apply_top_k_top_p_candidates(
         logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
     )
     return torch.where(top_k > 0, masked, logits)
+
+
+def apply_top_k_top_p_sorted(
+    topk_vals: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    replace_val: float = MASKED_LOGIT_VALUE,
+) -> torch.Tensor:
+    """Applies exact top-k then top-p on descending-sorted candidate logits.
+
+    Args:
+      topk_vals: [batch, k_cap] logits sorted in descending order along dim=-1.
+      top_k: [batch, 1] integer top-k per row (<= 0 disables top-k on that row).
+      top_p: [batch, 1] float top-p per row (>= 1.0 disables top-p on that row).
+      replace_val: Masked logit sentinel (default MASKED_LOGIT_VALUE = -1e12).
+
+    Returns:
+      Masked candidate logits of shape [batch, k_cap].
+    """
+    k_cap = topk_vals.shape[-1]
+    vals_f32 = topk_vals.to(torch.float32)
+    replace_tensor = torch.full_like(topk_vals, replace_val)
+
+    should_apply_topk = (top_k > 0) & (top_k <= k_cap)
+    k_idx = (top_k.to(torch.int64) - 1).clamp(min=0, max=k_cap - 1)
+    kth_val = vals_f32.gather(-1, k_idx)
+    cutoff = torch.clamp(kth_val, min=torch.finfo(torch.float32).min)
+    topk_masked = torch.where(vals_f32 >= cutoff, topk_vals, replace_tensor)
+    masked_vals = torch.where(
+        should_apply_topk.expand_as(topk_vals), topk_masked, topk_vals
+    )
+
+    should_apply_topp = top_p < 1.0
+    probs = torch.softmax(masked_vals.to(torch.float32), dim=-1)
+    cum_probs = torch.cumsum(probs, dim=-1)
+    reached = cum_probs >= top_p
+    any_reached = reached.any(dim=-1, keepdim=True)
+    # Because probs is sorted descending, the maximum probability at indices
+    # where cum_probs >= top_p equals the exact threshold at the first index
+    # reaching top_p (preserving tie semantics of topp_mask).
+    boundary_prob = torch.where(
+        reached, probs, torch.full_like(probs, -1.0)
+    ).amax(dim=-1, keepdim=True)
+    first_col = torch.arange(k_cap, device=topk_vals.device).unsqueeze(0) == 0
+    keep_topp = (
+        torch.where(
+            any_reached,
+            (probs >= boundary_prob) & (probs > 0.0),
+            masked_vals.to(torch.float32) > replace_val,
+        )
+        | first_col
+    )
+    topp_masked = torch.where(keep_topp, masked_vals, replace_tensor)
+    return torch.where(
+        should_apply_topp.expand_as(masked_vals), topp_masked, masked_vals
+    )
+
+
+def sample_from_logits_fast_topk(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    u: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    k_cap: int,
+    sampling_eps: float = 1e-5,
+) -> torch.Tensor:
+    """Exact small-k top-k + top-p + Gumbel-max sampler on [batch, k_cap].
+
+    Avoids the 64 full-vocab binary-search passes and full-vocab uniform RNG /
+    softmax / Gumbel noise when every active non-greedy row has 1 <= top_k <=
+    k_cap. When vocab_size is a multiple of CANDIDATE_BLOCK and exceeds k_cap
+    blocks, pre-filters to the k_cap blocks with the largest maxima (guaranteed
+    to contain the global top-k_cap elements) before extracting the sorted
+    top-k_cap values and global token IDs.
+    """
+    rows, vocab_size = logits.shape
+    eff_cap = min(k_cap, vocab_size)
+    is_greedy = temperatures <= sampling_eps
+    safe_temperatures = torch.where(
+        is_greedy, torch.ones_like(temperatures), temperatures
+    )
+    scaled_logits = logits / safe_temperatures
+
+    num_vocab_blocks = vocab_size // CANDIDATE_BLOCK
+    if vocab_size % CANDIDATE_BLOCK == 0 and num_vocab_blocks > eff_cap:
+        blocks = scaled_logits.reshape(rows, num_vocab_blocks, CANDIDATE_BLOCK)
+        block_max = blocks.amax(dim=-1)
+        raw_block_ids = torch.topk(
+            block_max, eff_cap, dim=-1, sorted=False
+        ).indices
+        block_ids = torch.sort(raw_block_ids, dim=-1).values
+        # Gather whole 128-logit rows (a row gather), not an element-wise
+        # torch.gather over a [rows, k_cap, 128] index, which XLA lowers to a
+        # per-element gather. Gather the raw logits and divide afterwards: the
+        # divide is elementwise, so the candidates are bit-identical.
+        flat_rows = (
+            torch.arange(rows, device=logits.device, dtype=block_ids.dtype)
+            .unsqueeze(-1)
+            * num_vocab_blocks
+            + block_ids
+        ).reshape(-1)
+        candidates = (
+            logits.reshape(rows * num_vocab_blocks, CANDIDATE_BLOCK)
+            .index_select(0, flat_rows)
+            .reshape(rows, eff_cap * CANDIDATE_BLOCK)
+            / safe_temperatures
+        )
+        topk_vals, local_idx = torch.topk(
+            candidates, eff_cap, dim=-1, sorted=True
+        )
+        blk_slot = torch.div(local_idx, CANDIDATE_BLOCK, rounding_mode="floor")
+        blk_off = local_idx % CANDIDATE_BLOCK
+        topk_indices = (
+            block_ids.gather(-1, blk_slot) * CANDIDATE_BLOCK + blk_off
+        )
+        greedy_local = torch.argmax(candidates, dim=-1, keepdim=True)
+        greedy_slot = torch.div(
+            greedy_local, CANDIDATE_BLOCK, rounding_mode="floor"
+        )
+        greedy_off = greedy_local % CANDIDATE_BLOCK
+        greedy_token_ids = (
+            block_ids.gather(-1, greedy_slot) * CANDIDATE_BLOCK + greedy_off
+        )
+    else:
+        topk_vals, topk_indices = torch.topk(
+            scaled_logits, eff_cap, dim=-1, sorted=True
+        )
+        greedy_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
+
+    masked_vals = apply_top_k_top_p_sorted(
+        topk_vals, top_k, top_p, MASKED_LOGIT_VALUE
+    )
+    u_clamped = torch.clamp(
+        u[..., :eff_cap],
+        min=torch.finfo(u.dtype).tiny,
+        max=1.0 - torch.finfo(u.dtype).eps,
+    )
+    gumbel_noise = -torch.log(-torch.log(u_clamped))
+    noisy_vals = masked_vals.to(torch.float32) + gumbel_noise
+    sampled_pos = torch.argmax(noisy_vals, dim=-1, keepdim=True)
+    sampled_token_ids = topk_indices.gather(-1, sampled_pos)
+    return torch.where(is_greedy, greedy_token_ids, sampled_token_ids)
