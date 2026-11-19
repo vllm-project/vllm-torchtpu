@@ -73,7 +73,7 @@ def test_a_small_step_stays_sliced_until_a_model_follows_the_form(groups, monkey
 
 
 @pytest.mark.parametrize("layout", [(1, 8), (4, 2), (2, 4)])
-def test_unlisted_layouts_use_the_default(groups, layout):
+def test_every_layout_uses_the_default_until_a_model_follows_the_form(groups, layout):
     groups(*layout)
     assert sp.min_rows() == sp.DEFAULT_MIN_ROWS
     assert sp.min_rows(_parallel(*layout)) == sp.DEFAULT_MIN_ROWS
