@@ -12,17 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/common/collectives32.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/common/collectives32.py
 """TP32 collectives: a barrier across the 32 ranks of the ``tp`` mesh axis."""
+
+from __future__ import annotations
 
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
+from .constants import AXIS_TP, TP_PEERS, TP_SIZE
 
-def barrier():
-    rank = jax.lax.axis_index("tp")
+
+def barrier() -> None:
+    """Synchronize all 32 ranks across the ``tp`` mesh axis via barrier semaphore."""
+    rank = jax.lax.axis_index(AXIS_TP)
     sem = tpu.get_barrier_semaphore()
-    for offset in range(1, 32):
-        pl.semaphore_signal(sem, 1, device_id=(rank ^ offset,), device_id_type=pl.DeviceIdType.MESH)
-    pl.semaphore_wait(sem, 31)
+    for offset in range(1, TP_SIZE):
+        pl.semaphore_signal(
+            sem,
+            1,
+            device_id=(rank ^ offset,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+    pl.semaphore_wait(sem, TP_PEERS)

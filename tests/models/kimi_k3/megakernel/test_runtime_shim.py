@@ -11,41 +11,122 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU unit tests for Kimi-K3 runtime_shim compilation, bridge, and export cache."""
+"""CPU unit tests for Kimi-K3 runtime_shim, vmem_pool, pool_alias, and collectives32."""
 
 from __future__ import annotations
 
+import base64
+import builtins
 import contextlib
 import enum
+import inspect
+import re
 import sys
 import types
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
 
 import jax
 import jax.experimental.topologies as jax_topologies
+import jax.numpy as jnp
 import numpy as np
+import pytest
 import torch
+from jax._src.lib import tpu as mosaic_tpu
+from jax._src.lib.mlir import ir as mlir_ir
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from vllm_torchtpu.distributed import pallas_shapes
+from vllm_torchtpu.models.kimi_k3.megakernel import common
+from vllm_torchtpu.models.kimi_k3.megakernel import config as k3_config
+from vllm_torchtpu.models.kimi_k3.megakernel import layout as k3_layout
+from vllm_torchtpu.models.kimi_k3.megakernel.common import (
+    collectives32,
+    vmem_pool,
+)
+from vllm_torchtpu.models.kimi_k3.megakernel.common.constants import (
+    GIB_BYTES,
+    MIB_BYTES,
+    TP_PEERS,
+    TP_SIZE,
+)
 from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import (
+    backend,
     bridge,
     compilation,
     export_cache,
 )
+from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import (
+    config as runtime_config,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-    from pathlib import Path
+    from collections.abc import Callable, Iterator, Mapping
 
-    import pytest
+    from vllm.config import VllmConfig
+
+    from vllm_torchtpu.models.kimi_k3.megakernel.common import (
+        protocols as k3_protocols,
+    )
+
+_TEST_RANK = 13
+
+
+class _MonkeyPatch(Protocol):
+    """Subset of pytest.MonkeyPatch used by runtime_shim unit tests."""
+
+    def setattr(
+        self,
+        target: object,
+        name: str,
+        value: object = ...,
+        *,
+        raising: bool = ...,
+    ) -> None:
+        """Patch attribute on target object or dotted import path."""
+
+    def setenv(self, name: str, value: str, prepend: str | None = None) -> None:
+        """Set environment variable for the duration of the test."""
+
+    def setitem(self, dic: Mapping[str, object], name: str, value: object) -> None:
+        """Set dictionary entry for the duration of the test."""
 
 
 class _PrivateOnlyEagerMode(enum.Enum):
-    """Stand-in matching torch_tpu 0.2.0 EagerMode attribute names."""
+    """Stand-in matching torch_tpu 0.2.0 private EagerMode attribute names."""
 
     _INTERNAL_COMPILE_FX_GRAPH = "private_fx_graph"
+
+
+def _stub_module(name: str, **attrs: object) -> types.ModuleType:
+    """Create a stub ``ModuleType`` populated with ``attrs``."""
+    module = types.ModuleType(name)
+    module.__dict__.update(attrs)
+    return module
+
+
+def _clear_active_kernel_config(monkeypatch: _MonkeyPatch) -> None:
+    """Reset the active Kimi-K3 runtime kernel config state for unit tests."""
+    state = getattr(runtime_config, "_ACTIVE_STATE", None)
+    assert state is not None
+    monkeypatch.setattr(state, "config", None)
+
+
+class _InvokeOpDouble:
+    """Minimal CustomOpDef stand-in carrying ``_init_fn`` and a call spy."""
+
+    def __init__(self, callable_op: object, callback: Callable[[], None]) -> None:
+        """Initialize wrapper around ``callable_op`` and spy ``callback``."""
+        self._init_fn = callable_op
+        self._callback = callback
+
+    def __call__(self, *_inputs: object) -> tuple[str]:
+        """Record call invocation and return synthetic output tuple."""
+        self._callback()
+        return ("ok",)
 
 
 @dataclass
@@ -55,36 +136,52 @@ class _ReadyHandle:
     ready: bool = True
 
     def is_ready(self) -> bool:
-        """Report handle readiness."""
+        """Report handle readiness.
+
+        Returns:
+            True when the compilation handle has completed.
+        """
         return self.ready
 
     def get(self) -> None:
         """Consume completed compilation."""
 
 
-def test_compile_ops_falls_back_to_private_fx_graph_mode(
-    monkeypatch: pytest.MonkeyPatch,
+def test_compile_ops_uses_compile_fx_graph_mode(
+    monkeypatch: _MonkeyPatch,
 ) -> None:
-    """Resolve _INTERNAL_COMPILE_FX_GRAPH when the public enum name is absent."""
+    """Resolve pinned private FX-graph EagerMode during placeholder tracing."""
     recorded_modes: list[object] = []
     recorded_options: list[dict[str, str]] = []
     active_options: dict[str, str] = {}
 
     @contextlib.contextmanager
     def fake_set_eager_mode(mode: object) -> Iterator[None]:
-        """Record active eager mode during placeholder tracing."""
+        """Record active eager mode during placeholder tracing.
+
+        Yields:
+            Control to the caller while the eager mode is active.
+        """
         recorded_modes.append(mode)
         yield
 
     @contextlib.contextmanager
     def fake_compiler_options(opts: dict[str, str]) -> Iterator[None]:
-        """Capture custom compiler options around async compile."""
+        """Capture custom compiler options around async compile.
+
+        Yields:
+            Control to the caller while custom compiler options are active.
+        """
         active_options.clear()
         active_options.update(opts)
         yield
 
     def fake_placeholder_like(value: int) -> str:
-        """Build synthetic placeholder value."""
+        """Build synthetic placeholder value.
+
+        Returns:
+            Formatted placeholder identifier string.
+        """
         return f"ph:{value}"
 
     def fake_async_compile(
@@ -93,33 +190,40 @@ def test_compile_ops_falls_back_to_private_fx_graph_mode(
         *,
         fast_compile: bool,
     ) -> _ReadyHandle:
-        """Verify placeholder wiring and record active compiler options."""
+        """Verify placeholder wiring and record active compiler options.
+
+        Returns:
+            Completed compilation handle double.
+        """
         assert fast_compile is True
         assert inputs == ["ph:7"]
         assert outputs == ["out:ph:7"]
         recorded_options.append(dict(active_options))
         return _ReadyHandle()
 
-    exec_mod = types.ModuleType("torch_tpu._internal.execution_mode")
-    exec_mod.EagerMode = _PrivateOnlyEagerMode
-    exec_mod.set_eager_mode = fake_set_eager_mode
-
+    exec_mod = _stub_module(
+        "torch_tpu._internal.execution_mode",
+        EagerMode=_PrivateOnlyEagerMode,
+        set_eager_mode=fake_set_eager_mode,
+    )
     compile_pkg = types.ModuleType("torch_tpu._internal.compile")
-    compile_mod = types.ModuleType("torch_tpu._internal.compile.tpu_torch_compile")
-    compile_mod.placeholder_like = fake_placeholder_like
-    compile_mod.async_traverse_and_compile = fake_async_compile
-    compile_pkg.tpu_torch_compile = compile_mod
-
-    opts_mod = types.ModuleType("torch_tpu._internal.compiler_options")
-    opts_mod.custom_compiler_options = fake_compiler_options
-
-    internal_pkg = types.ModuleType("torch_tpu._internal")
-    internal_pkg.execution_mode = exec_mod
-    internal_pkg.compile = compile_pkg
-    internal_pkg.compiler_options = opts_mod
-
-    root_pkg = types.ModuleType("torch_tpu")
-    root_pkg._internal = internal_pkg
+    compile_mod = _stub_module(
+        "torch_tpu._internal.compile.tpu_torch_compile",
+        placeholder_like=fake_placeholder_like,
+        async_traverse_and_compile=fake_async_compile,
+    )
+    compile_pkg.__dict__["tpu_torch_compile"] = compile_mod
+    opts_mod = _stub_module(
+        "torch_tpu._internal.compiler_options",
+        custom_compiler_options=fake_compiler_options,
+    )
+    internal_pkg = _stub_module(
+        "torch_tpu._internal",
+        execution_mode=exec_mod,
+        compile=compile_pkg,
+        compiler_options=opts_mod,
+    )
+    root_pkg = _stub_module("torch_tpu", _internal=internal_pkg)
 
     for mod_name, mod_obj in (
         ("torch_tpu", root_pkg),
@@ -132,7 +236,11 @@ def test_compile_ops_falls_back_to_private_fx_graph_mode(
         monkeypatch.setitem(sys.modules, mod_name, mod_obj)
 
     def sample_op(ph_val: str) -> tuple[str]:
-        """Return traced output tuple."""
+        """Return traced output tuple.
+
+        Returns:
+            Single-element tuple containing the tagged placeholder string.
+        """
         return (f"out:{ph_val}",)
 
     call = compilation.CompileCall(
@@ -142,8 +250,7 @@ def test_compile_ops_falls_back_to_private_fx_graph_mode(
     )
     compilation.compile_ops([call])
 
-    expected_mode = _PrivateOnlyEagerMode._INTERNAL_COMPILE_FX_GRAPH
-    assert recorded_modes == [expected_mode]
+    assert recorded_modes == [_PrivateOnlyEagerMode["_INTERNAL_COMPILE_FX_GRAPH"]]
     assert recorded_options == [{"xla_flag": "1"}]
 
 
@@ -174,12 +281,16 @@ class _FakeJaxCallable:
         self.donate_argnums: tuple[int, ...] = ()
         self.static_argnums: tuple[int, ...] = ()
         self.trace_key = name
-        self.output_shapes: dict[str, object] = {}
+        self.output_shapes: dict[str, tuple[object, object]] = {}
         self.kernel_key_to_mlir_fingerprint: dict[str, str] = {}
         self.export_calls = 0
 
     def exported(self, *args: jax.Array) -> _FakeLowered:
-        """Record export invocation and return serialized payload."""
+        """Record export invocation and return serialized payload.
+
+        Returns:
+            Synthetic lowered export object carrying output avals and MLIR bytes.
+        """
         self.export_calls += 1
         aval = jax.core.ShapedArray(args[0].shape, args[0].dtype)
         _, out_tree = jax.tree.flatten((aval,))
@@ -195,8 +306,12 @@ class _FakeJaxCallable:
             _out_named_shardings=(NamedSharding(self.mesh, spec),),
         )
 
-    def __call__(self, *args: jax.Array) -> tuple[str, object]:
-        """Populate fingerprint on cold miss or return cached output shapes."""
+    def __call__(self, *args: jax.Array) -> tuple[str, tuple[object, object]]:
+        """Populate fingerprint on cold miss or return cached output shapes.
+
+        Returns:
+            Status tag paired with the recorded output shape entry.
+        """
         key = f"k:{args[0].shape}"
         if key not in self.output_shapes:
             self.exported(*args)
@@ -206,7 +321,7 @@ class _FakeJaxCallable:
 
 
 def test_register_op_forwards_specs_and_export_cache_hook(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: _MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Attach flattened PartitionSpecs and reload persisted MLIR from k3_export."""
@@ -216,26 +331,24 @@ def test_register_op_forwards_specs_and_export_cache_hook(
     def fake_register_sharded_op(
         name: str,
         _fn: object,
-        *,
         mesh: Mesh,
-        **kwargs: object,
+        op_spec: bridge.OpRegistrationSpec,
+        configure_callable: Callable[[export_cache.JaxCallableProtocol], None]
+        | None = None,
     ) -> object:
-        """Construct wrapper carrying _init_fn like torch_tpu CustomOpDef."""
-        raw_in_specs = kwargs["input_partition_specs"]
-        assert isinstance(raw_in_specs, tuple)
-        configure_callable = kwargs.get("configure_callable")
-        raw_out_specs = kwargs.get("output_partition_specs", ())
-        callable_op = _FakeJaxCallable(name, mesh, raw_in_specs)
-        callable_op.output_partition_specs = list(raw_out_specs)
-        if callable(configure_callable):
-            configure_callable(callable_op)
+        """Construct wrapper carrying _init_fn like torch_tpu CustomOpDef.
+
+        Returns:
+            Namespace wrapping the configured _FakeJaxCallable instance.
+        """
+        callable_op = _FakeJaxCallable(name, mesh, op_spec.in_specs)
+        callable_op.output_partition_specs = list(op_spec.out_specs)
+        if configure_callable is not None:
+            configure_callable(cast("export_cache.JaxCallableProtocol", callable_op))
         return types.SimpleNamespace(_init_fn=callable_op)
 
     monkeypatch.setattr(bridge, "_register_sharded_op", fake_register_sharded_op)
-    monkeypatch.setattr(
-        "vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config._ACTIVE",
-        None,
-    )
+    _clear_active_kernel_config(monkeypatch)
     monkeypatch.setattr(
         export_cache.pallas_impl,
         "_get_kernel_invocation_key",
@@ -245,7 +358,7 @@ def test_register_op_forwards_specs_and_export_cache_hook(
         export_cache.pallas_impl.tpu_torch_pallas,
         "register_custom_kernel",
         lambda name, fp, serialized_mlir_module: registered_kernels.append(
-            (name, fp, serialized_mlir_module)
+            (name, fp, serialized_mlir_module),
         ),
     )
     monkeypatch.setattr(
@@ -254,7 +367,7 @@ def test_register_op_forwards_specs_and_export_cache_hook(
         lambda aval, *, mesh=None, partition_spec=None: (
             aval.shape,
             str(aval.dtype),
-            partition_spec,
+            partition_spec if mesh is not None else None,
         ),
     )
 
@@ -264,14 +377,17 @@ def test_register_op_forwards_specs_and_export_cache_hook(
         "kimi_k3::shim_unit_op",
         mesh,
         lambda x: (x,),
-        in_specs=(spec,),
-        out_specs=(spec,),
-        export_key="unit_v1",
+        bridge.OpRegistrationSpec(
+            in_specs=(spec,),
+            out_specs=(spec,),
+            export_key="unit_v1",
+        ),
     )
-    callable_op = op_wrapper._init_fn
+    callable_op = getattr(op_wrapper, "_init_fn", None)
+    assert isinstance(callable_op, _FakeJaxCallable)
     assert callable_op.output_partition_specs == [spec]
 
-    sample = jax.numpy.zeros((4,), dtype=jax.numpy.float32)
+    sample = jnp.zeros((4,), dtype=jnp.float32)
     callable_op(sample)
     assert callable_op.export_calls == 1
     assert list((tmp_path / "k3_export").glob("module-fp123.mlirbc"))
@@ -280,7 +396,7 @@ def test_register_op_forwards_specs_and_export_cache_hook(
     reloaded_op.output_partition_specs = [spec]
     hook_fn = export_cache.hook("unit_v1")
     assert hook_fn is not None
-    hook_fn(reloaded_op)
+    hook_fn(cast("export_cache.JaxCallableProtocol", reloaded_op))
     status, cached_entry = reloaded_op(sample)
     assert status == "ok"
     assert reloaded_op.export_calls == 0
@@ -289,17 +405,25 @@ def test_register_op_forwards_specs_and_export_cache_hook(
     assert loaded_outputs == [((4,), "float32", spec)]
 
 
-def test_register_sharded_op_with_sharded_and_replicated_outputs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exercise real bridge._register_sharded_op on a multi-device topology mesh."""
-    topology = jax_topologies.get_topology_desc("tpu7x_2x2x4")
-    devices = list(topology.devices)
-    world_size = len(devices)
-    mesh = Mesh(np.array(devices), ("tp",))
-    in_spec = PartitionSpec("tp", None)
-    out_specs = (PartitionSpec("tp", None), PartitionSpec())
+@dataclass
+class _CustomOpCapture:
+    """Captured registration events and placeholder shapes from stubbed custom_op."""
 
+    events: list[str]
+    registered: dict[str, object]
+    recorded_call_shapes: list[tuple[int, ...]]
+
+
+def _install_custom_op_stubs(monkeypatch: _MonkeyPatch) -> _CustomOpCapture:
+    """Install CPU-only torch custom_op and Pallas shape stubs for bridge tests.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        Capture bundle recording hook ordering, fake_fn, and call output shapes.
+    """
+    capture = _CustomOpCapture(events=[], registered={}, recorded_call_shapes=[])
     monkeypatch.setattr(
         bridge.pallas_impl, "get_global_shape", pallas_shapes.get_global_shape
     )
@@ -307,19 +431,18 @@ def test_register_sharded_op_with_sharded_and_replicated_outputs(
         bridge.pallas_impl, "get_local_shape", pallas_shapes.get_local_shape
     )
 
-    events: list[str] = []
-    registered: dict[str, Any] = {}
-    recorded_call_shapes: list[tuple[int, ...]] = []
-
-    def fake_custom_op(name: str, fn: Any, *, mutates_args: tuple[Any, ...]) -> Any:
+    def fake_custom_op(
+        name: str, fn: object, *, mutates_args: tuple[object, ...]
+    ) -> object:
         """Record custom_op registration and capture registered fake_fn."""
         assert mutates_args == ()
-        events.append("custom_op")
-        registered["name"] = name
-        registered["fn"] = fn
+        capture.events.append("custom_op")
+        capture.registered["name"] = name
+        capture.registered["fn"] = fn
 
-        def register_fake(fake_fn: Any) -> Any:
-            registered["fake_fn"] = fake_fn
+        def register_fake(fake_fn: Callable[..., object]) -> Callable[..., object]:
+            """Capture registered fake_fn."""
+            capture.registered["fake_fn"] = fake_fn
             return fake_fn
 
         return types.SimpleNamespace(_init_fn=fn, register_fake=register_fake)
@@ -341,7 +464,7 @@ def test_register_sharded_op_with_sharded_and_replicated_outputs(
         **_kwargs: object,
     ) -> list[torch.Tensor]:
         """Record per-rank placeholder shapes passed by JaxCallable.__call__."""
-        recorded_call_shapes.extend(tuple(out.shape) for out in output_shapes)
+        capture.recorded_call_shapes.extend(tuple(out.shape) for out in output_shapes)
         return output_shapes
 
     monkeypatch.setattr(torch.library, "custom_op", fake_custom_op)
@@ -356,30 +479,45 @@ def test_register_sharded_op_with_sharded_and_replicated_outputs(
         "call_custom_kernel",
         stub_call_custom_kernel,
     )
+    return capture
 
-    def configure_hook(callable_obj: Any) -> None:
+
+def test_register_sharded_op_with_sharded_and_replicated_outputs(
+    monkeypatch: _MonkeyPatch,
+) -> None:
+    """Exercise real bridge._register_sharded_op on a multi-device topology mesh."""
+    topology = jax_topologies.get_topology_desc("tpu7x_2x2x4")
+    devices = list(topology.devices)
+    world_size = len(devices)
+    mesh = Mesh(np.array(devices), ("tp",))
+    in_spec = PartitionSpec("tp", None)
+    out_specs = (PartitionSpec("tp", None), PartitionSpec())
+    capture = _install_custom_op_stubs(monkeypatch)
+
+    def configure_hook(callable_obj: object) -> None:
         """Verify hook runs before custom_op registration."""
-        events.append("configure")
-        assert "name" not in registered
+        capture.events.append("configure")
+        assert "name" not in capture.registered
         assert type(callable_obj) is bridge.pallas_impl.JaxCallable
 
     def body(x: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Return one sharded output and one replicated output."""
         return x, x
 
+    register_helper = getattr(bridge, "_register_sharded_op", None)
+    assert callable(register_helper)
     previous_ignore_fc = bool(jax.config.jax_export_ignore_forward_compatibility)
     jax.config.update("jax_export_ignore_forward_compatibility", val=True)
     try:
-        op_wrapper = bridge._register_sharded_op(
+        op_wrapper = register_helper(
             "kimi_k3::real_helper_unit_op",
             body,
-            mesh=mesh,
-            input_partition_specs=(in_spec,),
-            output_partition_specs=out_specs,
-            configure_callable=configure_hook,
+            mesh,
+            bridge.OpRegistrationSpec(in_specs=(in_spec,), out_specs=out_specs),
+            configure_hook,
         )
-        assert events == ["configure", "custom_op"]
-        callable_op = op_wrapper._init_fn
+        assert capture.events == ["configure", "custom_op"]
+        callable_op = getattr(op_wrapper, "_init_fn", None)
         assert type(callable_op) is bridge.pallas_impl.JaxCallable
         assert callable_op.output_partition_specs == out_specs
 
@@ -394,13 +532,930 @@ def test_register_sharded_op_with_sharded_and_replicated_outputs(
         assert tuple(s.spec for s in named_shardings) == out_specs
 
         expected_local = [(local_rows, cols), (local_rows * world_size, cols)]
-        fake_outputs = registered["fake_fn"](sample)
+        fake_fn = capture.registered["fake_fn"]
+        assert callable(fake_fn)
+        fake_outputs = fake_fn(sample)
         assert [tuple(out.shape) for out in fake_outputs] == expected_local
 
         callable_op(sample)
-        assert recorded_call_shapes == expected_local
+        assert capture.recorded_call_shapes == expected_local
     finally:
         jax.config.update(
             "jax_export_ignore_forward_compatibility", val=previous_ignore_fc
         )
         jax.clear_caches()
+
+
+class _FakeArenaSlice:
+    """Minimal arena slice double recording bitcast and transform views."""
+
+    def __init__(
+        self,
+        row_slice: object,
+        col_slice: object,
+        dtype: jnp.dtype | None = None,
+    ) -> None:
+        """Store sliced arena coordinates and active element dtype."""
+        self.row_slice = row_slice
+        self.col_slice = col_slice
+        self.dtype = jnp.dtype(jnp.uint8) if dtype is None else dtype
+        self.ref = self
+        self.transforms: tuple[object, ...] = ()
+
+    def bitcast(self, dtype: object) -> _FakeArenaSlice:
+        """Return a slice view reinterpreted as ``dtype``."""
+        return _FakeArenaSlice(self.row_slice, self.col_slice, jnp.dtype(dtype))
+
+
+class _FakeArena:
+    """Minimal flat uint8 arena double indexed by 128-byte rows."""
+
+    @property
+    def at(self) -> _FakeArena:
+        """Return indexable ``.at`` view matching Pallas ref indexing."""
+        return self
+
+    def __getitem__(self, indices: tuple[object, object]) -> _FakeArenaSlice:
+        """Slice arena at requested row range and column slice.
+
+        Returns:
+            Synthetic arena slice recording the row and column slices.
+        """
+        return _FakeArenaSlice(indices[0], indices[1])
+
+
+def test_vmem_pool_uses_local_common_pool_alias() -> None:
+    """Verify VmemPool uses Kimi-K3's local common.pool_alias."""
+    assert vmem_pool.pool_alias is common.pool_alias
+    common_dir = Path(common.__file__).resolve().parent
+    assert (common_dir / "pool_alias.py").is_file()
+
+    arena = _FakeArena()
+    pool = vmem_pool.VmemPool(arena, capacity=16384)
+    offset = pool.allocate("stage_buf", 8192)
+    assert offset == 0
+    assert pool.offset("stage_buf") == 0
+
+    aliased = pool.view(offset, (8, 128), jnp.bfloat16)
+    assert isinstance(aliased, common.pool_alias.types.TransformedRef)
+    assert aliased.transforms[-1] == common.pool_alias.Reinterpret((8, 128))
+    pool.release("stage_buf")
+
+
+def test_bridge_typed_signature_registers_without_exec(
+    monkeypatch: _MonkeyPatch,
+) -> None:
+    """Build typed inspect.Signature on bridge ops without calling builtins.exec."""
+    captured_ops: dict[str, Callable[..., object]] = {}
+    captured_specs: dict[str, bridge.OpRegistrationSpec] = {}
+    captured_hooks: dict[str, object] = {}
+
+    def forbid_exec(*_args: object, **_kwargs: object) -> None:
+        """Fail if dynamic code execution is invoked during op registration.
+
+        Raises:
+            AssertionError: Always, because bridge registration must avoid exec.
+        """
+        msg = "builtins.exec must not be called by bridge op registration"
+        raise AssertionError(msg)
+
+    def fake_register_sharded_op(
+        name: str,
+        fn: Callable[..., object],
+        mesh: Mesh,
+        op_spec: bridge.OpRegistrationSpec,
+        configure_callable: object = None,
+    ) -> Callable[..., object]:
+        """Capture the typed wrapper function passed to _register_sharded_op.
+
+        Args:
+            name: Custom op registration name.
+            fn: Typed JAX wrapper callable.
+            mesh: Global JAX device mesh.
+            op_spec: Op registration spec bundle.
+            configure_callable: Optional export-cache hook callback.
+
+        Returns:
+            The wrapper callable registered for ``name``.
+        """
+        assert mesh.axis_names == ("tp",)
+        captured_ops[name] = fn
+        captured_specs[name] = op_spec
+        captured_hooks[name] = configure_callable
+        return fn
+
+    monkeypatch.setattr(builtins, "exec", forbid_exec)
+    monkeypatch.setattr(bridge, "_register_sharded_op", fake_register_sharded_op)
+    _clear_active_kernel_config(monkeypatch)
+
+    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+    spec = PartitionSpec("tp")
+
+    bridge.register_op(
+        "kimi_k3::typed_local_op",
+        mesh,
+        lambda x, y: (x + y,),
+        (spec, spec),
+        (spec,),
+    )
+    local_fn = captured_ops["kimi_k3::typed_local_op"]
+    local_sig = inspect.signature(local_fn)
+    assert tuple(local_sig.parameters) == ("arg_0", "arg_1")
+    for param in local_sig.parameters.values():
+        assert param.annotation is jax.Array
+    assert local_sig.return_annotation == tuple[jax.Array]
+    assert local_fn.__annotations__ == {
+        "arg_0": jax.Array,
+        "arg_1": jax.Array,
+        "return": tuple[jax.Array],
+    }
+
+    bridge.register_global_op(
+        "kimi_k3::typed_global_op",
+        mesh,
+        lambda x: (x, x),
+        bridge.OpRegistrationSpec(
+            in_specs=(spec,),
+            out_specs=(spec, spec),
+            donate_argnums=(0,),
+            export_key="global_v1",
+        ),
+    )
+    assert captured_specs["kimi_k3::typed_global_op"].donate_argnums == (0,)
+    assert "kimi_k3::typed_global_op" in captured_hooks
+    global_fn = captured_ops["kimi_k3::typed_global_op"]
+    global_sig = inspect.signature(global_fn)
+    assert tuple(global_sig.parameters) == ("arg_0",)
+    assert global_sig.parameters["arg_0"].annotation is jax.Array
+    assert global_sig.return_annotation == tuple[jax.Array, jax.Array]
+    assert global_fn.__annotations__ == {
+        "arg_0": jax.Array,
+        "return": tuple[jax.Array, jax.Array],
+    }
+
+
+def test_bridge_resolve_op_spec_rejects_invalid_out_specs() -> None:
+    """Fail closed with TypeError on missing or duplicate out_specs."""
+    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+    spec = PartitionSpec("tp")
+    missing_error = ""
+    try:
+        bridge.register_op("kimi_k3::missing_out", mesh, lambda x: (x,), (spec,))
+    except TypeError as exc:
+        missing_error = str(exc)
+    assert "out_specs is required" in missing_error
+
+    duplicate_error = ""
+    try:
+        bridge.register_op(
+            "kimi_k3::extra_out",
+            mesh,
+            lambda x: (x,),
+            bridge.OpRegistrationSpec(in_specs=(spec,), out_specs=(spec,)),
+            (spec,),
+        )
+    except TypeError as exc:
+        duplicate_error = str(exc)
+    assert "out_specs must be omitted" in duplicate_error
+
+
+def test_export_cache_placeholder_roundtrip(
+    monkeypatch: _MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Size local torch output placeholders via pallas_impl.torch_placeholder."""
+    assert "_placeholder" not in dir(export_cache)
+    assert "_create_torch_placeholder" not in dir(export_cache)
+    monkeypatch.setenv("VLLM_XLA_CACHE_PATH", str(tmp_path))
+    topology = jax_topologies.get_topology_desc("tpu7x_2x2x4")
+    devices = list(topology.devices)[:2]
+    mesh = Mesh(np.array(devices), ("tp",))
+    spec = PartitionSpec("tp", None)
+    out_specs = [spec, PartitionSpec()]
+
+    monkeypatch.setattr(
+        export_cache.pallas_impl,
+        "get_local_shape",
+        pallas_shapes.get_local_shape,
+    )
+    monkeypatch.setattr(
+        export_cache.pallas_impl,
+        "_get_kernel_invocation_key",
+        lambda _trace_key, args, _kwargs, _static_argnums: f"k:{args[0].shape}",
+    )
+    monkeypatch.setattr(
+        torch,
+        "empty",
+        lambda shape, *, dtype=None, **_kw: torch.zeros(
+            shape, dtype=dtype or torch.float32
+        ),
+    )
+    monkeypatch.setattr(
+        export_cache.pallas_impl.tpu_torch_pallas,
+        "register_custom_kernel",
+        lambda *_args, **_kwargs: None,
+    )
+
+    class _TwoOutputFakeCallable(_FakeJaxCallable):
+        """Two-output callable double returning one sharded and one replicated aval."""
+
+        def exported(self, *args: jax.Array) -> _FakeLowered:
+            """Return two-output lowered export with distinct output shardings."""
+            self.export_calls += 1
+            aval = jax.core.ShapedArray(args[0].shape, jnp.bfloat16)
+            _, out_tree = jax.tree.flatten((aval, aval))
+            return _FakeLowered(
+                out_avals=(aval, aval),
+                out_tree=out_tree,
+                mlir_module_serialized=b"MLIRBC_RT",
+                _out_named_shardings=(
+                    NamedSharding(self.mesh, out_specs[0]),
+                    NamedSharding(self.mesh, out_specs[1]),
+                ),
+            )
+
+    hook_fn = export_cache.hook("roundtrip_v1")
+    assert hook_fn is not None
+
+    cold_op = _TwoOutputFakeCallable("kimi_k3::placeholder_op", mesh, (spec,))
+    cold_op.output_partition_specs = out_specs
+    hook_fn(cast("export_cache.JaxCallableProtocol", cold_op))
+    sample = jnp.zeros((8, 16), dtype=jnp.bfloat16)
+    cold_op(sample)
+    assert cold_op.export_calls == 1
+
+    warm_op = _TwoOutputFakeCallable("kimi_k3::placeholder_op", mesh, (spec,))
+    warm_op.output_partition_specs = out_specs
+    hook_fn(cast("export_cache.JaxCallableProtocol", warm_op))
+    status, cached_entry = warm_op(sample)
+    assert status == "ok"
+    assert warm_op.export_calls == 0
+    loaded_outputs, _ = cached_entry
+    assert isinstance(loaded_outputs, list)
+    sharded_tensor, replicated_tensor = loaded_outputs
+    assert isinstance(sharded_tensor, torch.Tensor)
+    assert sharded_tensor.shape == (4, 16)
+    assert sharded_tensor.dtype == torch.bfloat16
+    assert isinstance(replicated_tensor, torch.Tensor)
+    assert replicated_tensor.shape == (8, 16)
+    assert replicated_tensor.dtype == torch.bfloat16
+
+
+def test_collectives32_barrier_signals_all_xor_peers(
+    monkeypatch: _MonkeyPatch,
+) -> None:
+    """Signal all 31 XOR peer devices across the 32-rank tp axis and wait for 31."""
+    signaled_peers: list[int] = []
+    waited_counts: list[int] = []
+    sentinel_sem = object()
+
+    def record_signal(
+        sem: object,
+        inc: int,
+        *,
+        device_id: tuple[int, ...],
+        device_id_type: object,
+    ) -> None:
+        """Record peer device ID when semaphore and mesh id type match."""
+        is_valid = (
+            sem is sentinel_sem and inc == 1 and device_id_type == pl.DeviceIdType.MESH
+        )
+        signaled_peers.append(device_id[0] if is_valid else -1)
+
+    monkeypatch.setattr(jax.lax, "axis_index", lambda _axis: _TEST_RANK)
+    monkeypatch.setattr(
+        collectives32.tpu,
+        "get_barrier_semaphore",
+        lambda: sentinel_sem,
+    )
+    monkeypatch.setattr(pl, "semaphore_signal", record_signal)
+    monkeypatch.setattr(
+        pl,
+        "semaphore_wait",
+        lambda sem, count: waited_counts.append(
+            count if sem is sentinel_sem else -1,
+        ),
+    )
+
+    collectives32.barrier()
+    assert len(signaled_peers) == TP_PEERS
+    assert set(signaled_peers) == set(range(TP_SIZE)) - {_TEST_RANK}
+    assert waited_counts == [TP_PEERS]
+
+
+def test_peer_ranks_and_owner_ignore_stale_marker_files(
+    tmp_path: Path,
+) -> None:
+    """Group host-local cache peers by directory identity and ignore stale markers."""
+    shared_root = tmp_path / "host0_cache"
+    other_root = tmp_path / "host1_cache"
+    shared_root.mkdir(parents=True, exist_ok=True)
+    other_root.mkdir(parents=True, exist_ok=True)
+    for stale_rank in (0, 1, 2, 3):
+        (shared_root / f".peer-{stale_rank}").write_bytes(b"stale")
+
+    id_host0_a = export_cache.cache_dir_identity(shared_root)
+    id_host0_b = export_cache.cache_dir_identity(shared_root)
+    id_host1 = export_cache.cache_dir_identity(other_root)
+    assert id_host0_a is not None
+    assert id_host0_a == id_host0_b
+    assert id_host0_a != id_host1
+
+    identities = [id_host0_a, id_host0_b, id_host1, id_host1]
+    assert export_cache.peer_ranks_for_cache(identities, 0) == (0, 1)
+    assert export_cache.peer_ranks_for_cache(identities, 1) == (0, 1)
+    assert export_cache.peer_ranks_for_cache(identities, 2) == (2, 3)
+    assert export_cache.peer_ranks_for_cache([None, id_host0_a], 0) == (0,)
+
+    host0_peers = export_cache.peer_ranks_for_cache(identities, 0)
+    assert [export_cache.assign_export_owner(i, host0_peers) for i in range(5)] == [
+        0,
+        1,
+        0,
+        1,
+        0,
+    ]
+
+
+def test_prepare_distributed_assigns_host_local_peer_owners(
+    monkeypatch: _MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Gather (signatures, cache_identity) once and partition across host peers."""
+    host0_base = tmp_path / "host0"
+    host0_root = host0_base / "k3_export"
+    host1_root = tmp_path / "host1" / "k3_export"
+    host0_root.mkdir(parents=True, exist_ok=True)
+    host1_root.mkdir(parents=True, exist_ok=True)
+    (host0_root / ".peer-3").write_bytes(b"leftover")
+    monkeypatch.setenv("VLLM_XLA_CACHE_PATH", str(host0_base))
+
+    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+    spec = PartitionSpec("tp")
+    executed_indices: list[int] = []
+
+    def make_call(idx: int) -> types.SimpleNamespace:
+        """Construct synthetic distributed compile call for program ``idx``."""
+        callable_op = _FakeJaxCallable(f"kimi_k3::dist_op_{idx}", mesh, (spec,))
+        hook_fn = export_cache.hook(f"dist_key_{idx}")
+        assert hook_fn is not None
+        hook_fn(cast("export_cache.JaxCallableProtocol", callable_op))
+        cache_inst = getattr(callable_op, "_export_cache", None)
+        assert cache_inst is not None
+        monkeypatch.setattr(
+            cache_inst,
+            "path",
+            lambda _op, _args, _kw, *, rank=None, _i=idx: (
+                host0_root / f"prog_{_i}_{rank}.pkl"
+            ),
+        )
+        callable_op.mesh = types.SimpleNamespace(size=4)
+
+        invoke_op = _InvokeOpDouble(
+            callable_op, lambda _i=idx: executed_indices.append(_i)
+        )
+        return types.SimpleNamespace(
+            op=invoke_op,
+            operands=(np.zeros((4,), dtype=np.float32),),
+            options={"idx": str(idx)},
+        )
+
+    calls = [make_call(0), make_call(1), make_call(2)]
+    id0 = export_cache.cache_dir_identity(host0_root)
+    id1 = export_cache.cache_dir_identity(host1_root)
+
+    def fake_all_gather(output_list: list[object], local_obj: object) -> None:
+        """Simulate 2-rank all_gather_object where rank 0 & 1 share host0_root."""
+        if local_obj is None or isinstance(local_obj, str):
+            output_list[:] = [local_obj] * 4
+            return
+        assert isinstance(local_obj, tuple)
+        local_sigs, local_id = local_obj
+        assert local_id == id0
+        output_list[:] = [
+            (local_sigs, id0),
+            (local_sigs, id0),
+            (local_sigs, id1),
+            (local_sigs, id1),
+        ]
+
+    for attr_name, fn_val in (
+        ("is_initialized", lambda: True),
+        ("get_world_size", lambda: 4),
+        ("get_rank", lambda: 1),
+        ("all_gather_object", fake_all_gather),
+    ):
+        monkeypatch.setattr(export_cache.torch.distributed, attr_name, fn_val)
+
+    exec_mod = _stub_module(
+        "torch_tpu._internal.execution_mode",
+        EagerMode=_PrivateOnlyEagerMode,
+        set_eager_mode=contextlib.nullcontext,
+    )
+    compile_mod = _stub_module(
+        "torch_tpu._internal.compile.tpu_torch_compile",
+        placeholder_like=lambda t: t,
+    )
+    compile_pkg = _stub_module(
+        "torch_tpu._internal.compile",
+        tpu_torch_compile=compile_mod,
+    )
+    internal_pkg = _stub_module(
+        "torch_tpu._internal",
+        execution_mode=exec_mod,
+        compile=compile_pkg,
+    )
+    root_pkg = _stub_module("torch_tpu", _internal=internal_pkg)
+    for mod_name, mod_obj in (
+        ("torch_tpu", root_pkg),
+        ("torch_tpu._internal", internal_pkg),
+        ("torch_tpu._internal.execution_mode", exec_mod),
+        ("torch_tpu._internal.compile", compile_pkg),
+        ("torch_tpu._internal.compile.tpu_torch_compile", compile_mod),
+    ):
+        monkeypatch.setitem(sys.modules, mod_name, mod_obj)
+
+    export_cache.prepare_distributed(calls)
+    owners = [
+        getattr(getattr(call.op, "_init_fn", None), "_export_cache", None).shared_rank
+        for call in calls
+    ]
+    assert owners == [0, 1, 0]
+    assert executed_indices == [1]
+
+
+_KEY_HEX_LEN = 16
+_COERCED_INT = 128
+_COERCED_FLOAT = 6.5
+_UNALIGNED_CAPACITY_BYTES = vmem_pool.ALIGN + 1
+_TEST_ARENA_MIB = 4
+
+
+def test_kernel_config_validates_invariants_and_coerces_cli_overrides() -> None:
+    """Verify KernelConfig validates tile/dtype invariants and coerces CLI strings."""
+    base = k3_config.KernelConfig()
+    default_ktile = k3_config.KernelConfig.mla_decode_ktile
+    experimental_ktile = 2 * default_ktile
+    experimental_dp = 2
+    experimental_dcp = TP_SIZE // experimental_dp
+    assert base.mla_decode_ktile == default_ktile
+
+    coerced = base.replace(
+        mla_decode_ktile=str(experimental_ktile),
+        attention_dp=str(experimental_dp),
+        dcp_group=str(experimental_dcp),
+        vmem_spill_reserve_mb=str(_COERCED_FLOAT),
+        vmem_pad_kb=str(_COERCED_INT),
+        compact_only="true",
+        weight_streams='{"dense_gu": [0, 2]}',
+    )
+    assert coerced.mla_decode_ktile == experimental_ktile
+    assert coerced.attention_dp == experimental_dp
+    assert coerced.dcp_group == experimental_dcp
+    assert coerced.vmem_spill_reserve_mb == _COERCED_FLOAT
+    assert coerced.vmem_pad_kb == _COERCED_INT
+    assert coerced.compact_only is True
+    assert coerced.weight_streams == (("dense_gu", (0, 2)),)
+    assert len(coerced.key()) == _KEY_HEX_LEN
+
+    with pytest.raises(ValueError, match="moe_reduce_dtype"):
+        base.replace(moe_reduce_dtype="float16")
+    with pytest.raises(ValueError, match="mla_decode_ktile supports"):
+        base.replace(mla_decode_ktile=default_ktile // 2)
+    with pytest.raises(ValueError, match="mla_decode_ktile=2048 requires"):
+        base.replace(
+            mla_decode_ktile=experimental_ktile, attention_dp=1, dcp_group=TP_SIZE
+        )
+
+
+def test_cache_layout_selects_bf16_and_fp8_contracts_and_rejects_unknown() -> None:
+    """Verify cache_layout maps BF16 and FP8 dtypes and rejects unsupported names."""
+    bf16_auto = k3_layout.cache_layout("auto")
+    bf16_explicit = k3_layout.cache_layout("torch.bfloat16")
+    assert bf16_auto == bf16_explicit
+    assert bf16_auto == k3_layout.LAYOUT
+    assert bf16_auto.tokens_per_block == k3_layout.LAYOUT.tokens_per_block
+    assert bf16_auto.tokens_per_row == k3_layout.LAYOUT.tokens_per_row
+
+    fp8 = k3_layout.cache_layout("fp8_e4m3")
+    assert fp8 == k3_layout.cache_layout("float8_e4m3fn")
+    assert fp8 == k3_layout.FP8_LAYOUT
+    assert fp8.tokens_per_block == 2 * bf16_auto.tokens_per_block
+    assert fp8.tokens_per_row == 2 * bf16_auto.tokens_per_row
+
+    with pytest.raises(NotImplementedError, match="unsupported"):
+        k3_layout.cache_layout("float32")
+
+
+def test_vmem_pool_enforces_alignment_lifecycle_and_loop_state_invariants() -> None:
+    """Verify VmemPool rejects unaligned, over-capacity, and drifted loops."""
+    assert GIB_BYTES == 1024 * MIB_BYTES
+    with pytest.raises(vmem_pool.PoolError, match="multiple of 4 KiB"):
+        vmem_pool.VmemPool(None, _UNALIGNED_CAPACITY_BYTES)
+
+    pool = vmem_pool.VmemPool(None, _TEST_ARENA_MIB * MIB_BYTES)
+    with pytest.raises(vmem_pool.PoolError, match="MiB arena"):
+        pool.allocate("oversized", (_TEST_ARENA_MIB + 1) * MIB_BYTES)
+
+    pool.request("tile_a", MIB_BYTES, start=lambda _off, _idx: None)
+    with pytest.raises(vmem_pool.PoolError, match="already live"):
+        pool.request("tile_a", MIB_BYTES, start=lambda _off, _idx: None)
+    with pytest.raises(vmem_pool.PoolError, match="never waited on"):
+        pool.release("tile_a")
+    pool.acquire("tile_a")
+    pool.release("tile_a")
+    with pytest.raises(vmem_pool.PoolError, match="is not live"):
+        pool.release("tile_a")
+
+    with pytest.raises(vmem_pool.PoolError, match="arena state it began in"):
+
+        @pool.loop(0, 1)
+        def _drifted_body(_idx: int) -> None:
+            """Traced loop body to verify drift detection."""
+            pool.allocate("leaked_buf", MIB_BYTES)
+
+
+def test_pool_alias_unpadded_expert_scale_views() -> None:
+    """Verify local pool_alias.view aliases unpadded scale and tile shapes."""
+    # (32, 128) uint8 tiles: 4 * ceil(112/32)=4 * (1536/128)=12 * 4096 B.
+    gus_shape = (4, 112, 1536)
+    gus_unpadded = 4 * 112 * 1536
+    assert (
+        common.pool_alias.storage_size(gus_shape, jnp.uint8)
+        == 4 * 4 * 12 * vmem_pool.ALIGN
+    )
+    gus_raw = _FakeArenaSlice(pl.ds(0, gus_unpadded // 128), slice(None))
+    gus_view = common.pool_alias.view(gus_raw, gus_shape, jnp.uint8)
+    assert isinstance(gus_view, common.pool_alias.types.TransformedRef)
+    assert gus_view.transforms[-1] == common.pool_alias.Reinterpret(gus_shape)
+
+    # (32, 128) uint8 tiles: 4 * ceil(24/32)=1 * (3584/128)=28 * 4096 B.
+    ds_shape = (4, 24, 3584)
+    ds_unpadded = 4 * 24 * 3584
+    assert (
+        common.pool_alias.storage_size(ds_shape, jnp.uint8) == 4 * 28 * vmem_pool.ALIGN
+    )
+    ds_raw = _FakeArenaSlice(pl.ds(0, ds_unpadded // 128), slice(None))
+    ds_view = common.pool_alias.view(ds_raw, ds_shape, jnp.uint8)
+    assert isinstance(ds_view, common.pool_alias.types.TransformedRef)
+    assert ds_view.transforms[-1] == common.pool_alias.Reinterpret(ds_shape)
+
+    # (16, 128) bf16 tiles: ceil(8/16)=1 * (128/128)=1 * 4096 B.
+    bf16_shape = (8, 128)
+    bf16_unpadded = 8 * 128 * 2
+    assert common.pool_alias.storage_size(bf16_shape, jnp.bfloat16) == vmem_pool.ALIGN
+    bf16_raw = _FakeArenaSlice(pl.ds(0, bf16_unpadded // 128), slice(None))
+    bf16_view = common.pool_alias.view(bf16_raw, bf16_shape, jnp.bfloat16)
+    assert isinstance(bf16_view, common.pool_alias.types.TransformedRef)
+    assert bf16_view.transforms[-1] == common.pool_alias.Reinterpret(bf16_shape)
+
+    arena_rows = common.pool_alias.storage_size(gus_shape, jnp.uint8) // 128
+
+    def _alias_copy_kernel(
+        src_ref: k3_protocols.PallasRefProtocol,
+        dst_ref: k3_protocols.PallasRefProtocol,
+        arena_ref: k3_protocols.PallasRefProtocol,
+        sem_ref: object,
+    ) -> None:
+        """Copy an unpadded expert-scale tensor through a tiled arena view."""
+        aliased = common.pool_alias.view(
+            arena_ref.at[pl.ds(0, gus_unpadded // 128), :],
+            gus_shape,
+            jnp.uint8,
+        )
+        for src, dst in ((src_ref, aliased), (aliased, dst_ref)):
+            copy = pltpu.make_async_copy(src, dst, sem_ref)
+            copy.start()
+            copy.wait()
+
+    pallas_fn = pl.pallas_call(
+        _alias_copy_kernel,
+        out_shape=jax.ShapeDtypeStruct(gus_shape, jnp.uint8),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        scratch_shapes=[
+            pltpu.VMEM((arena_rows, 128), jnp.uint8),
+            pltpu.SemaphoreType.DMA(()),
+        ],
+    )
+    devices = jax_topologies.get_topology_desc(
+        topology_name="tpu7x_2x2x4", platform="tpu"
+    ).devices
+    sharding = NamedSharding(Mesh(devices[:1], ("tp",)), PartitionSpec())
+    try:
+        hlo_text = (
+            jax.jit(pallas_fn, in_shardings=sharding, out_shardings=sharding)
+            .lower(jax.ShapeDtypeStruct(gus_shape, jnp.uint8))
+            .as_text()
+        )
+    finally:
+        jax.clear_caches()
+    body_match = re.search(r"\\22body\\22:\s*\\22([A-Za-z0-9+/=]+)\\22", hlo_text)
+    assert body_match is not None
+    with mlir_ir.Context() as ctx:
+        ctx.allow_unregistered_dialects = True
+        mosaic_tpu.register_dialect(ctx)
+        mosaic_text = str(mlir_ir.Module.parse(base64.b64decode(body_match.group(1))))
+    assert "tpu.reinterpret_cast" in mosaic_text
+    assert "#tpu.tiled<(32,128)(4,1),[48,12,1]>" in mosaic_text
+
+
+@dataclass(frozen=True)
+class _UnvalidatedOpSpec:
+    """Duck-typed op spec bypassing OpRegistrationSpec validation."""
+
+    in_specs: object
+    out_specs: object
+    donate_argnums: tuple[int, ...] = ()
+    export_key: str | None = None
+
+
+def test_register_sharded_op_rejects_none_partition_spec() -> None:
+    """Reject None, bare, and non-PartitionSpec entries in spec init and bridge."""
+    spec = PartitionSpec("tp")
+
+    with pytest.raises(ValueError, match=r"PartitionSpec\(\)"):
+        bridge.OpRegistrationSpec(
+            in_specs=cast("tuple[PartitionSpec, ...]", (None,)),
+            out_specs=(spec,),
+        )
+
+    with pytest.raises(ValueError, match=r"PartitionSpec\(\)"):
+        bridge.OpRegistrationSpec(
+            in_specs=(spec,),
+            out_specs=cast("tuple[PartitionSpec, ...]", (None,)),
+        )
+
+    with pytest.raises(TypeError, match="bare PartitionSpec"):
+        bridge.OpRegistrationSpec(
+            in_specs=(spec,),
+            out_specs=cast("tuple[PartitionSpec, ...]", PartitionSpec()),
+        )
+
+    with pytest.raises(TypeError, match="PartitionSpec instances"):
+        bridge.OpRegistrationSpec(
+            in_specs=cast("tuple[PartitionSpec, ...]", (("tp",),)),
+            out_specs=(spec,),
+        )
+
+    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+    register_helper = getattr(bridge, "_register_sharded_op", None)
+    assert callable(register_helper)
+
+    def identity(x: jax.Array) -> tuple[jax.Array]:
+        """Return single-element output tuple."""
+        return (x,)
+
+    with pytest.raises(ValueError, match=r"PartitionSpec\(\)"):
+        register_helper(
+            "kimi_k3::reject_duck_none_in",
+            identity,
+            mesh,
+            _UnvalidatedOpSpec(in_specs=(None,), out_specs=(spec,)),
+        )
+
+    with pytest.raises(TypeError, match="PartitionSpec instances"):
+        register_helper(
+            "kimi_k3::reject_duck_tuple_in",
+            identity,
+            mesh,
+            _UnvalidatedOpSpec(in_specs=(("tp",),), out_specs=(spec,)),
+        )
+
+
+def test_prepare_distributed_skips_uncached_op_without_mesh(
+    monkeypatch: _MonkeyPatch,
+) -> None:
+    """Short-circuit uncached ops in prepare_distributed before accessing op.mesh."""
+
+    class _NoMeshCallable:
+        """Non-JaxCallable double lacking both _export_cache and mesh."""
+
+    gathered_payloads: list[object] = []
+
+    def fake_all_gather(output: list[object], payload: object) -> None:
+        """Record the gathered signature tuple and populate both ranks."""
+        gathered_payloads.append(payload)
+        for index in range(len(output)):
+            output[index] = payload
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather)
+
+    op_double = _InvokeOpDouble(_NoMeshCallable(), lambda: None)
+    call = compilation.CompileCall(op=op_double, operands=(), options={})
+    export_cache.prepare_distributed([call])
+
+    assert gathered_payloads == [(None, None)]
+
+
+@dataclass
+class _StubLoadConfig:
+    """Minimal load_config stand-in for backend and engine config tests."""
+
+    load_format: object = "megakernel"
+    model_loader_extra_config: object = None
+
+
+@dataclass
+class _StubKvTransferConfig:
+    """Minimal kv_transfer_config stand-in selecting prefill or decode role."""
+
+    is_kv_producer: bool = False
+    is_kv_consumer: bool = True
+
+
+@dataclass
+class _StubHfConfig:
+    """Minimal hf_config stand-in exposing supported model architectures."""
+
+    architectures: tuple[str, ...] | None = ("KimiK3ForConditionalGeneration",)
+
+
+@dataclass
+class _StubModelConfig:
+    """Minimal model_config stand-in carrying hf_config and max_model_len."""
+
+    hf_config: _StubHfConfig | None = None
+    max_model_len: int = 32768
+
+
+@dataclass
+class _StubParallelConfig:
+    """Minimal parallel_config stand-in for TP and DCP settings."""
+
+    tensor_parallel_size: int = TP_SIZE
+    decode_context_parallel_size: int = TP_SIZE
+    cp_kv_cache_interleave_size: int = 1
+
+
+@dataclass
+class _StubSchedulerConfig:
+    """Minimal scheduler_config stand-in for batch and token limits."""
+
+    max_num_seqs: int = 64
+    max_num_batched_tokens: int = 8192
+    async_scheduling: bool = True
+
+
+@dataclass
+class _StubCacheConfig:
+    """Minimal cache_config stand-in for block size and dtypes."""
+
+    block_size: int = 256
+    cache_dtype: str = "fp8"
+    mamba_ssm_cache_dtype: str = "auto"
+
+
+@dataclass
+class _StubSpeculativeConfig:
+    """Minimal speculative_config stand-in for synthetic acceptance tests."""
+
+    num_speculative_tokens: int = 7
+    num_speculative_tokens_per_batch_size: tuple[tuple[int, int, int], ...] | None = (
+        (1, 8, 7),
+        (9, 64, 3),
+    )
+    rejection_sample_method: str | None = "synthetic"
+    synthetic_acceptance_rates: tuple[float, ...] = (0.9, 0.8, 0.7)
+
+
+@dataclass
+class _StubVllmConfig:
+    """Minimal VllmConfig stand-in for runtime_shim unit tests."""
+
+    load_config: _StubLoadConfig | None
+    kv_transfer_config: _StubKvTransferConfig | None
+    model_config: _StubModelConfig | None
+    parallel_config: _StubParallelConfig
+    scheduler_config: _StubSchedulerConfig
+    cache_config: _StubCacheConfig
+    speculative_config: _StubSpeculativeConfig | None = None
+
+
+def _make_vllm_config(
+    *,
+    is_producer: bool = False,
+    is_consumer: bool = True,
+    extra: object = None,
+    spec: _StubSpeculativeConfig | None = None,
+    load_format: str = "megakernel",
+) -> VllmConfig:
+    """Construct a synthetic VllmConfig for runtime_shim unit tests."""
+    resolved_extra = {"presharded": "/mnt/k3_shards"} if extra is None else extra
+    return cast(
+        "VllmConfig",
+        _StubVllmConfig(
+            load_config=_StubLoadConfig(
+                load_format=load_format,
+                model_loader_extra_config=resolved_extra,
+            ),
+            kv_transfer_config=_StubKvTransferConfig(
+                is_kv_producer=is_producer,
+                is_kv_consumer=is_consumer,
+            ),
+            model_config=_StubModelConfig(hf_config=_StubHfConfig()),
+            parallel_config=_StubParallelConfig(),
+            scheduler_config=_StubSchedulerConfig(),
+            cache_config=_StubCacheConfig(),
+            speculative_config=spec,
+        ),
+    )
+
+
+def test_backend_role_and_loader_config_contracts() -> None:
+    """Verify backend role selection and loader validation."""
+    inactive = _make_vllm_config(load_format="safetensors")
+    assert backend.role(inactive) is None
+    assert backend.synthetic_acceptance_lengths(inactive) is None
+
+    prefill_cfg = _make_vllm_config(
+        is_producer=True,
+        is_consumer=False,
+        extra={"presharded": "/mnt/shards", "draft": "/mnt/draft"},
+    )
+    assert backend.role(prefill_cfg) == "prefill"
+    assert backend.presharded(prefill_cfg) == Path("/mnt/shards")
+    assert backend.draft(prefill_cfg) == Path("/mnt/draft")
+    assert backend.synthetic_acceptance_lengths(prefill_cfg) is None
+
+    expected_dp = 2
+    decode_cfg = _make_vllm_config(
+        extra={
+            "presharded": "/mnt/shards",
+            "attention_dp": expected_dp,
+            "synthetic_acceptance_lengths": {"3": 2.87, "7": 3.78},
+        },
+    )
+    assert backend.role(decode_cfg) == "decode"
+    assert backend.draft(decode_cfg) is None
+    assert backend.attention_dp(decode_cfg) == expected_dp
+    assert backend.synthetic_acceptance_lengths(decode_cfg) == {3: 2.87, 7: 3.78}
+
+    with pytest.raises(TypeError, match="takes --model-loader-extra-config as a dict"):
+        backend.role(_make_vllm_config(extra=["bad"]))
+    with pytest.raises(ValueError, match="megakernel decode role takes"):
+        backend.role(_make_vllm_config(extra={"presharded": "/x", "draft": "/d"}))
+    with pytest.raises(ValueError, match="presharded"):
+        backend.role(_make_vllm_config(extra={}))
+    with pytest.raises(TypeError, match="maps draft widths to mean acceptance lengths"):
+        backend.synthetic_acceptance_lengths(
+            _make_vllm_config(
+                extra={"presharded": "/x", "synthetic_acceptance_lengths": [1, 2]}
+            )
+        )
+    with pytest.raises(
+        ValueError, match="maps draft widths to mean acceptance lengths"
+    ):
+        backend.synthetic_acceptance_lengths(
+            _make_vllm_config(
+                extra={"presharded": "/x", "synthetic_acceptance_lengths": {}}
+            )
+        )
+
+
+def test_engine_config_from_vllm_config_acceptance_rates(
+    monkeypatch: _MonkeyPatch,
+) -> None:
+    """Verify KernelConfigProtocol and MegakernelEngineConfig.from_vllm_config."""
+    assert isinstance(runtime_config.KernelConfigProtocol, type)
+    assert not hasattr(runtime_config, "KernelConfig")
+    _clear_active_kernel_config(monkeypatch)
+    installed: runtime_config.KernelConfigProtocol = k3_config.KernelConfig()
+    runtime_config.set_active_kernel_config(installed)
+    assert runtime_config.get_active_kernel_config() is installed
+
+    expected_dp = 2
+    spec = _StubSpeculativeConfig()
+    vllm_cfg = _make_vllm_config(
+        extra={
+            "presharded": "/mnt/shards",
+            "attention_dp": expected_dp,
+            "synthetic_acceptance_lengths": {"3": 2.5, "7": 3.25},
+        },
+        spec=spec,
+    )
+    engine_cfg = runtime_config.MegakernelEngineConfig.from_vllm_config(vllm_cfg)
+    assert engine_cfg.role == "decode"
+    assert engine_cfg.attention_dp == expected_dp
+    assert engine_cfg.synthetic_acceptance_rates == (0.9, 0.8, 0.7)
+    assert engine_cfg.synthetic_acceptance_rates_by_width is not None
+    by_width = dict(engine_cfg.synthetic_acceptance_rates_by_width)
+    assert by_width[3] == pytest.approx((1.0, 0.5, 0.0))
+    assert by_width[7] == pytest.approx((1.0, 1.0, 0.25, 0.0, 0.0, 0.0, 0.0))
+
+    bad_method_cfg = _make_vllm_config(
+        extra={"presharded": "/mnt/shards", "synthetic_acceptance_lengths": {"3": 2.0}},
+        spec=_StubSpeculativeConfig(rejection_sample_method="rejection_sampler"),
+    )
+    with pytest.raises(ValueError, match="rejection_sample_method synthetic"):
+        runtime_config.MegakernelEngineConfig.from_vllm_config(bad_method_cfg)
+
+    out_of_range_cfg = _make_vllm_config(
+        extra={"presharded": "/mnt/shards", "synthetic_acceptance_lengths": {"3": 5.0}},
+        spec=spec,
+    )
+    with pytest.raises(ValueError, match="mean acceptance length"):
+        runtime_config.MegakernelEngineConfig.from_vllm_config(out_of_range_cfg)
