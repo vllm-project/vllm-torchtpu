@@ -87,6 +87,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
         _fence_spec_kv_under_token_copy=False,
         _adaptive_verification=None,
         _thinking_budget=None,
+        _routed_experts=None,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
         spec_decode_manager=SimpleNamespace(

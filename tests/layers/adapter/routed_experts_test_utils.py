@@ -109,12 +109,14 @@ def expert_ids(num_tokens, num_experts=512, seed=0):
 
 
 class MoELayer(torch.nn.Module):
-    """A MoE layer as vLLM's capturer binder finds it."""
+    """A MoE layer as vLLM's capturer binder finds it, with no fused kernel
+    and no expert placement."""
 
     def __init__(self, layer_id):
         super().__init__()
         self.layer_id = layer_id
         self.capture_fn = None
+        self.routed_experts = SimpleNamespace(quant_method=SimpleNamespace())
 
 
 def make_moe_model(layer_ids=None):
