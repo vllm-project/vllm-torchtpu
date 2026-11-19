@@ -731,8 +731,8 @@ def _sparse_mla_attention_core(
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
     q: jax.Array,
-    kv_c_normed: jax.Array,
-    k_pe: jax.Array,
+    kv_c_normed: jax.Array | None,
+    k_pe: jax.Array | None,
     flat_topk: jax.Array,
     seq_lens: jax.Array,
     block_tables: jax.Array,
@@ -748,6 +748,7 @@ def _sparse_mla_attention_core(
     q_pe: jax.Array | None = None,
     token_rows: bool = False,
     w_uv_replicated: bool = False,
+    num_tokens: int | None = None,
     lead_partial: jax.Array | None = None,
     lead_lse: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
@@ -760,9 +761,23 @@ def _sparse_mla_attention_core(
     dcp = layout.dcp_size
     sharded = P(axis_name)
     rep = P()
+    has_kv_inputs = write_kv is not None
+    if has_kv_inputs and (kv_c_normed is None or k_pe is None):
+        raise ValueError("kv_c_normed and k_pe are required when write_kv is set")
+    step_tokens = (
+        num_tokens
+        if num_tokens is not None
+        else (kv_c_normed.shape[0] if kv_c_normed is not None else None)
+    )
+    if step_tokens is None:
+        raise ValueError("num_tokens or kv_c_normed must be provided")
 
-    def _local(nope, rope, q, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *extra_args):
+    def _local(nope, rope, q, topk, seq_lens, bt, qsl, dist, *extra_args):
         idx = 0
+        kv_c = k_pe_local = None
+        if has_kv_inputs:
+            kv_c, k_pe_local = extra_args[idx], extra_args[idx + 1]
+            idx += 2
         q_pe_local = None
         if q_pe is not None:
             q_pe_local = extra_args[idx]
@@ -779,7 +794,7 @@ def _sparse_mla_attention_core(
             lead_part_local, lead_lse_local = extra_args[idx], extra_args[idx + 1]
         rank = _rank(rank_arg, axis_name, dcp)
         if write_kv is not None:
-            nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
+            nope, rope = write_kv(nope, rope, kv_c, k_pe_local, seq_lens, bt, qsl, rank)
         # Keep cache arrays in their [pages, rows, 128] layout across the cap
         # switch rather than propagating the SparseCore writer's 32-word view.
         nope, rope = lax.optimization_barrier((nope, rope))
@@ -795,7 +810,7 @@ def _sparse_mla_attention_core(
                 else heads_to_tokens(layout, q_pe_local, axis_name)
             )
         )
-        rr = rank_rows(layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2])
+        rr = rank_rows(layout, rank, step_tokens, seq_lens, qsl, dist[2])
         w_uv_all = (
             None
             if w_uv_local is None
@@ -856,11 +871,17 @@ def _sparse_mla_attention_core(
         return nope, rope, tokens_to_heads(out, axis_name)
 
     extra: tuple[jax.Array, ...] = ()
+    extra_specs: tuple[P, ...] = ()
+    if has_kv_inputs:
+        assert kv_c_normed is not None and k_pe is not None
+        extra = (*extra, kv_c_normed, k_pe)
+        extra_specs = (*extra_specs, rep, rep)
     if q_pe is not None:
         extra = (*extra, q_pe)
+        extra_specs = (*extra_specs, sharded)
     if rank_ids is not None:
         extra = (*extra, rank_ids)
-    extra_specs = (sharded,) * len(extra)
+        extra_specs = (*extra_specs, sharded)
     if w_uv is not None:
         extra = (*extra, w_uv)
         extra_specs = (*extra_specs, rep if w_uv_replicated else sharded)
@@ -874,16 +895,13 @@ def _sparse_mla_attention_core(
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
-        + extra_specs,
+        in_specs=(sharded, sharded, sharded, sharded, rep, rep, rep, rep) + extra_specs,
         out_specs=out_specs,
         check_vma=False,
     )(
         kv_cache_nope,
         kv_cache_rope,
         q,
-        kv_c_normed,
-        k_pe,
         flat_topk,
         seq_lens,
         block_tables,
@@ -900,8 +918,8 @@ def sparse_mla_attention(
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
     q: jax.Array,
-    kv_c_normed: jax.Array,
-    k_pe: jax.Array,
+    kv_c_normed: jax.Array | None,
+    k_pe: jax.Array | None,
     flat_topk: jax.Array,
     seq_lens: jax.Array,
     block_tables: jax.Array,
@@ -917,6 +935,7 @@ def sparse_mla_attention(
     q_pe: jax.Array | None = None,
     token_rows: bool = False,
     w_uv_replicated: bool = False,
+    num_tokens: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 
@@ -965,6 +984,7 @@ def sparse_mla_attention(
         q_pe=q_pe,
         token_rows=token_rows,
         w_uv_replicated=w_uv_replicated,
+        num_tokens=num_tokens,
     )
     return nope, rope, out
 
@@ -976,8 +996,8 @@ def sparse_mla_attention_with_lead(
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
     q: jax.Array,
-    kv_c_normed: jax.Array,
-    k_pe: jax.Array,
+    kv_c_normed: jax.Array | None,
+    k_pe: jax.Array | None,
     flat_topk: jax.Array,
     seq_lens: jax.Array,
     block_tables: jax.Array,
@@ -994,6 +1014,7 @@ def sparse_mla_attention_with_lead(
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     q_pe: jax.Array | None = None,
     w_uv_replicated: bool = False,
+    num_tokens: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Run token-parallel sparse MLA with overlapped lead merge + W_UV inside branch."""
     nope, rope, own_v, lead_v = _sparse_mla_attention_core(
@@ -1019,6 +1040,7 @@ def sparse_mla_attention_with_lead(
         q_pe=q_pe,
         token_rows=True,
         w_uv_replicated=w_uv_replicated,
+        num_tokens=num_tokens,
         lead_partial=lead_partial,
         lead_lse=lead_lse,
     )

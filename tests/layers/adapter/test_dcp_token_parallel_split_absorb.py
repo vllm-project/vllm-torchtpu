@@ -119,7 +119,7 @@ def test_should_accept_split_q_tuple_and_preserve_fake_shapes(monkeypatch):
         monkeypatch, q_replicated=True, local_oproj=True
     )
     assert tp_op.split_q_inputs is True
-    assert len(captured) == 2  # base op + oproj_op
+    assert len(captured) == 3  # base op + oproj_op + oproj_sharded_kv_op
 
     num_tokens, s, rows = 64, 8, 16
     nope_cache = torch.zeros((4, 16, 32), dtype=torch.bfloat16)

@@ -47,11 +47,25 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
+
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import (
     dcp_lane_operand,
     dcp_rank_operand,
     get_dcp_group,
     get_or_create_dcp_mesh,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME,
+    KVLayout,
+    coalesced_kv_append,
+    coalesced_kv_append_dcp,
+    cp_rank_as_data,
+    get_kv_cache_shape,
+    indexer_kv_layout,
+    kv_cache_append,
+    streamindex_topk,
+    streamindex_topk_dcp,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
     register_indexer_layer,
@@ -59,6 +73,16 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
+from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, fp8_window_all_gather
+from vllm_torchtpu.layers.adapter import dcp_token_parallel_op, small_all_reduce_op
+from vllm_torchtpu.layers.adapter.attention import (
+    TPU_STR_DTYPE_TO_TORCH_DTYPE,
+    PallasMLAttentionBackendImpl,
+    VllmTPUDeepseekV32IndexerBackend,
+    _retain_buffers,
+)
+from vllm_torchtpu.layers.adapter.cp_mla_attention import local_q_all_gather_op
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
     FP8_PALLAS_N_ATTR,
@@ -76,30 +100,6 @@ from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, get_shared_jax_op, synchronize_tensors
-
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME,
-    KVLayout,
-    coalesced_kv_append,
-    coalesced_kv_append_dcp,
-    cp_rank_as_data,
-    get_kv_cache_shape,
-    indexer_kv_layout,
-    kv_cache_append,
-    streamindex_topk,
-    streamindex_topk_dcp,
-)
-from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
-from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, fp8_window_all_gather
-from vllm_torchtpu.layers.adapter import dcp_token_parallel_op, small_all_reduce_op
-from vllm_torchtpu.layers.adapter.attention import (
-    TPU_STR_DTYPE_TO_TORCH_DTYPE,
-    PallasMLAttentionBackendImpl,
-    VllmTPUDeepseekV32IndexerBackend,
-    _retain_buffers,
-)
-from vllm_torchtpu.layers.adapter.cp_mla_attention import local_q_all_gather_op
 
 logger = init_logger(__name__)
 
@@ -2130,6 +2130,7 @@ class VllmTPUMLAAttention(MLAAttention):
             topk_indices=kwargs.get("topk_indices"),
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
             sp_o_proj=kwargs.get("sp_o_proj"),
+            kv_sharded=kwargs.get("kv_sharded", False),
         )
 
 
@@ -2471,25 +2472,43 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # the hidden rows. From here on the gathered fused_qkv_a output stands
         # in for the step's rows wherever only their count is read.
         pre_qkv = pre_kw = pre_qc_qrows = None
+        kv_positions = positions
+        kv_sharded = False
+        num_tokens = positions.shape[0]
         project_gather = getattr(prefill_group, "project_gather", None)
         if project_gather is not None:
-            pre_qkv, pre_kw = project_gather(self, hidden_states, positions.shape[0])
+            pre_qkv, pre_kw = project_gather(self, hidden_states, num_tokens)
             if isinstance(pre_qkv, tuple):
-                pre_qc_qrows, kv_lora = pre_qkv
-                hidden_states = kv_lora
+                if len(pre_qkv) == 3:
+                    pre_qc_qrows, kv_lora, kv_positions = pre_qkv
+                    kv_sharded = True
+                else:
+                    pre_qc_qrows, kv_lora = pre_qkv
+                hidden_states = (
+                    pre_kw if (kv_sharded and pre_kw is not None) else kv_lora
+                )
             else:
                 hidden_states = pre_qkv
+        else:
+            num_tokens = hidden_states.shape[0]
         if getattr(self, "local_q_fused_op", None) is not None:
             operands = (self.local_q_window, self.local_q_lane)
-            hidden_states = _retain_buffers(
-                hidden_states, *(t for t in operands if t is not None)
-            )
+            if kv_lora is not None:
+                kv_lora = _retain_buffers(
+                    kv_lora, *(t for t in operands if t is not None)
+                )
+                if not kv_sharded:
+                    hidden_states = kv_lora
+            else:
+                hidden_states = _retain_buffers(
+                    hidden_states, *(t for t in operands if t is not None)
+                )
         # TPU_DCP_PREFILL_TOKEN_PARALLEL under query replication: project q for
         # only the rows this rank attends (`dcp_token_parallel_op.q_rows`).
         q_rows = None
         tp_op = getattr(self.mla_attn, "sparse_mla_tp_op", None)
         if tp_op is not None and tp_op.q_replicated:
-            if not dcp_token_parallel_op.applies(hidden_states.shape[0]):
+            if not dcp_token_parallel_op.applies(num_tokens):
                 # Lift the rank operand here too: the warmup hands buckets
                 # over only between traces that lift the same buffers.
                 hidden_states = _retain_buffers(hidden_states, tp_op.rank)
@@ -2498,7 +2517,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     "TPU_DCP_PREFILL_TOKEN_PARALLEL: no fused q preprocessing"
                 )
             else:
-                q_rows = dcp_token_parallel_op.q_rows(tp_op, hidden_states.shape[0])
+                q_rows = dcp_token_parallel_op.q_rows(tp_op, num_tokens)
 
         indexer_qrows = None
         if q_rows is not None:
@@ -2567,7 +2586,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     and q_rows is None
                     and pre_qkv is None
                     and pre_qc_qrows is None
-                    and not dcp_token_parallel_op.applies(hidden_states.shape[0])
+                    and not dcp_token_parallel_op.applies(num_tokens)
                 ):
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
@@ -2585,7 +2604,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     and q_rows is None
                     and pre_qkv is None
                     and pre_qc_qrows is None
-                    and not dcp_token_parallel_op.applies(hidden_states.shape[0])
+                    and not dcp_token_parallel_op.applies(num_tokens)
                     and vllm_compilation_backends.model_tag == "backbone"
                     and self._local_q_serves(q_c.shape[0])
                 ):
@@ -2648,13 +2667,13 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             if q_rows is None:
                 q_pe, k_pe = rope(positions, q_pe, k_pe)
             else:
-                # q exists for `q_rows` only; k for every row.
+                # q exists for `q_rows` only; k is either full-step or rank-sharded.
                 q_pe = rope(
                     positions.index_select(0, q_rows),
                     q_pe,
-                    k_pe.index_select(0, q_rows),
+                    q_pe[:, :1, :] if kv_sharded else k_pe.index_select(0, q_rows),
                 )[0]
-                k_pe = rope(positions, k_pe, k_pe)[1]
+                k_pe = rope(kv_positions, k_pe, k_pe)[1]
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the
             # cache dtype, and queries should remain in the activation dtype.
@@ -2682,7 +2701,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer
             assert topk_index is not None
-            topk_indices = topk_index[: hidden_states.shape[0]]
+            topk_indices = topk_index[:num_tokens]
 
             # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
 
@@ -2724,7 +2743,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and getattr(
                 getattr(self.mla_attn, "sparse_mla_tp_op", None), "serves_oproj", False
             )
-            and dcp_token_parallel_op.applies(kv_c_normed.shape[0])
+            and dcp_token_parallel_op.applies(num_tokens)
             and dcp_token_parallel_op.serves_sequence_row_oproj(self.o_proj)
         ):
             w_half = getattr(self.mla_attn, "W_O_tp_half", None)
@@ -2738,10 +2757,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             (q_nope, q_pe),
             kv_c_normed,
             k_pe,
-            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+            output_shape=(num_tokens, self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
             sp_o_proj=sp_o_proj,
+            kv_sharded=kv_sharded,
         )
         # The two branches lift different W_UV buffers; each lifts the other's
         # too, as the bucket warmup requires (_retain_buffers: no data read).

@@ -2852,12 +2852,17 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         input_dtype = q_nope.dtype
         sp_o_proj = kwargs.get("sp_o_proj")
 
+        kv_sharded = bool(kwargs.get("kv_sharded", False))
         # For determine_available_memory when cache memory buffer is empty right during
         # probe (before binding, `layer.kv_cache` is the layer's default empty tensor;
         # after binding, sparse layers hold a (nope, rope) pair).
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             if sp_o_proj is not None:
-                rows = kv_c_normed.shape[0] // self.dcp_size
+                rows = (
+                    kv_c_normed.shape[0]
+                    if kv_sharded
+                    else kv_c_normed.shape[0] // self.dcp_size
+                )
                 return torch.ones_like(
                     kv_c_normed.flatten(1)[:rows, :1].expand(-1, sp_o_proj[0].shape[1])
                 )
@@ -2872,13 +2877,18 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             output.fill_(1)
             return output
 
+        num_kv_tokens = kv_c_normed.view(-1, layer.kv_lora_rank).shape[0] * (
+            self.dcp_size if kv_sharded else 1
+        )
         topk_indices = kwargs.get("topk_indices")
         if sp_o_proj is not None and not (
             topk_indices is not None
             and getattr(layer, "sparse_mla_tp_op", None) is not None
-            and dcp_token_parallel_op.applies(kv_c_normed.shape[0])
+            and dcp_token_parallel_op.applies(num_kv_tokens)
         ):
             raise ValueError("sp_o_proj is only served on a token-parallel bucket")
+        if kv_sharded and sp_o_proj is None:
+            raise ValueError("kv_sharded requires sp_o_proj on a token-parallel bucket")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
@@ -2924,7 +2934,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
         tp_op = getattr(layer, "sparse_mla_tp_op", None)
-        num_kv_tokens = kv_c_normed.view(-1, layer.kv_lora_rank).shape[0]
         use_tp_split_absorb = (
             topk_indices is not None
             and tp_op is not None
@@ -2975,9 +2984,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "sparse MLA layers use a native (nope, rope) split "
                 f"cache; got {type(kv_cache)}"
             )
-            if tp_op is not None and dcp_token_parallel_op.applies(
-                kv_c_normed_flat.shape[0]
-            ):
+            if tp_op is not None and dcp_token_parallel_op.applies(num_kv_tokens):
                 # TPU_DCP_PREFILL_TOKEN_PARALLEL: the DCP path on the leading
                 # rows, the token-parallel split on the rest; merged outputs.
                 outputs = dcp_token_parallel_op.attention(
@@ -2991,6 +2998,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata,
                     q_replicated=use_qrep,
                     w_o=sp_o_proj,
+                    kv_sharded=kv_sharded,
                 )
                 if sp_o_proj is not None:
                     return outputs

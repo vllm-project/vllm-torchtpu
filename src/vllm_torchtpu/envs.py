@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: bool = True
+    TPU_DCP_TP_SHARDED_KV_WRITE: bool = True
     TPU_MLA_DECODE_LOCAL_Q_AG: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
@@ -860,6 +861,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # linears do, instead of bf16 against per-shard dequantized weights.
     "TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES": env_bool(
         "TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
+    # keep kv_lora sequence-sharded across kv_a_layernorm, k_pe RoPE, and FP8
+    # quantization, then route packed KV bytes directly to their DCP owner via
+    # all_to_all instead of all-gathering bf16 kv_lora to every rank.
+    "TPU_DCP_TP_SHARDED_KV_WRITE": env_bool(
+        "TPU_DCP_TP_SHARDED_KV_WRITE", default=True
     ),
     # Decode local-Q projection under query-replicated DCP: compute each rank's
     # local head-slice columns via the fused FP8 column-window matmul + 1-round

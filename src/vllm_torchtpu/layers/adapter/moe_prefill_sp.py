@@ -378,8 +378,17 @@ class _GatherProjections(_OProjReduceScatter):
 
     @staticmethod
     def project_gather(
-        mla: Any, x: torch.Tensor, num_tokens: int
-    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor | None]:
+        mla: Any,
+        x: torch.Tensor,
+        num_tokens: int,
+        *,
+        positions_local: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor | None,
+    ]:
         qkv = mla.fused_qkv_a_proj(x)[0]
         indexer = mla.indexer if not mla.skip_topk else None
         tp_op = getattr(getattr(mla, "mla_attn", None), "sparse_mla_tp_op", None)
@@ -411,15 +420,40 @@ class _GatherProjections(_OProjReduceScatter):
                 kv_dim = qkv.shape[-1] - q_lora
                 q_c_local, kv_lora_local = qkv.split([q_lora, kv_dim], dim=-1)
                 cols_qc = (s * q_lora) // rows_local
-                parts = [kv_lora_local, q_c_local[:s].reshape(rows_local, cols_qc)]
+                use_sharded_kv = (
+                    envs.TPU_DCP_TP_SHARDED_KV_WRITE
+                    and envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
+                    and positions_local is not None
+                    and getattr(mla, "is_sparse", False)
+                    and getattr(mla, "g_proj", None) is None
+                    and getattr(tp_op, "serves_sharded_kv", False)
+                    and getattr(mla, "o_proj", None) is not None
+                    and dcp_token_parallel_op.serves_sequence_row_oproj(mla.o_proj)
+                )
+                qc_head_packed = q_c_local[:s].reshape(rows_local, cols_qc)
+                parts = (
+                    [qc_head_packed]
+                    if use_sharded_kv
+                    else [kv_lora_local, qc_head_packed]
+                )
                 if indexer is not None:
                     parts.append(indexer.wk_weights_proj(x)[0])
-                gathered = _all_rows(torch.cat(parts, dim=-1), num_tokens)
-                kv_lora = gathered[:, :kv_dim]
-                all_heads = gathered[:, kv_dim : kv_dim + cols_qc].reshape(
-                    tp, s, q_lora
+                gathered = _all_rows(
+                    parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1),
+                    num_tokens,
                 )
-                kw = gathered[:, kv_dim + cols_qc :] if indexer is not None else None
+                kv_lora = kv_lora_local
+                if use_sharded_kv:
+                    all_heads = gathered[:, :cols_qc].reshape(tp, s, q_lora)
+                    kw = gathered[:, cols_qc:] if indexer is not None else None
+                else:
+                    kv_lora = gathered[:, :kv_dim]
+                    all_heads = gathered[:, kv_dim : kv_dim + cols_qc].reshape(
+                        tp, s, q_lora
+                    )
+                    kw = (
+                        gathered[:, kv_dim + cols_qc :] if indexer is not None else None
+                    )
                 rank = tp_op.rank.view(1)
                 next_rank = torch.clamp(rank + 1, max=tp - 1)
                 from_next = all_heads.index_select(0, next_rank).squeeze(0)
@@ -429,6 +463,9 @@ class _GatherProjections(_OProjReduceScatter):
                     q_c_local[-1:].expand(s, -1),
                 )
                 q_c_qrows = torch.cat([all_heads[0], q_c_local[s:], tail_s], dim=0)
+                if use_sharded_kv:
+                    assert positions_local is not None
+                    return (q_c_qrows, kv_lora_local, positions_local), kw
                 return (q_c_qrows, kv_lora), kw
 
         parts = [qkv]
@@ -439,6 +476,35 @@ class _GatherProjections(_OProjReduceScatter):
             return rows, None
         width = parts[0].shape[-1]
         return rows[:, :width], rows[:, width:]
+
+
+class _ShardedKVGatherProjections(_OProjReduceScatter):
+    """Per-step projection gatherer that slices local positions lazily."""
+
+    def __init__(self, positions: torch.Tensor, tp: int) -> None:
+        self._positions = positions
+        self._tp = tp
+        self._positions_local: torch.Tensor | None = None
+
+    def project_gather(
+        self, mla: Any, x: torch.Tensor, num_tokens: int
+    ) -> tuple[
+        torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor | None,
+    ]:
+        # Avoid eager slicing in patched_model_forward: calling
+        # fused_moe_ep.rank_operand() before layer 0's _retain_buffers(*keep)
+        # binds the rank tensor to the module global instead of
+        # layers[0]._tpu_sp_keep, causing ShapeSpecializationError on bucket handover.
+        if self._positions_local is None:
+            self._positions_local = own_rows(
+                self._positions, fused_moe_ep.rank_operand(), self._tp
+            )
+        return _GatherProjections.project_gather(
+            mla, x, num_tokens, positions_local=self._positions_local
+        )
 
 
 _O_PROJ_RS = _OProjReduceScatter()
@@ -511,6 +577,7 @@ def _sequence_parallel_layer_forward(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
     llama_4_scaling: torch.Tensor | None,
+    gather_group: Any = _GATHER_PROJECTIONS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = positions.shape[0]
     tp = _check_divides(num_tokens)
@@ -520,7 +587,7 @@ def _sequence_parallel_layer_forward(
         hidden_states = layer.input_layernorm(hidden_states)
     else:
         hidden_states, residual = layer.input_layernorm(hidden_states, residual)
-    group = _GATHER_PROJECTIONS if sharded_in else _O_PROJ_RS
+    group = gather_group if sharded_in else _O_PROJ_RS
     hidden_states = layer.self_attn.mla_attn(
         positions, hidden_states, llama_4_scaling, prefill_group=group
     )
@@ -538,6 +605,8 @@ def patched_decoder_layer_forward(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
     llama_4_scaling: torch.Tensor | None = None,
+    *,
+    gather_group: Any = _GATHER_PROJECTIONS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     keep = getattr(self, KEEP_ATTR, None)
     if keep is None:
@@ -550,7 +619,7 @@ def patched_decoder_layer_forward(
             self, positions, hidden_states, residual, llama_4_scaling
         )
     return _sequence_parallel_layer_forward(
-        self, positions, hidden_states, residual, llama_4_scaling
+        self, positions, hidden_states, residual, llama_4_scaling, gather_group
     )
 
 
@@ -581,9 +650,21 @@ def patched_model_forward(
     # embed_tokens and all leading dense layers take SP collectives, no
     # all-reduce runs on the prefill branch to lift small_all_reduce_op._RANK.
     hidden_states = small_all_reduce_op.retain(hidden_states)
+    active_layers = list(islice(self.layers, self.start_layer, self.end_layer))
+    gather_group: Any = _GATHER_PROJECTIONS
+    if envs.TPU_DCP_TP_SHARDED_KV_WRITE and any(
+        getattr(layer, KEEP_ATTR, None) is not None for layer in active_layers
+    ):
+        tp = _check_divides(num_tokens)
+        gather_group = _ShardedKVGatherProjections(positions, tp)
     residual = None
-    for layer in islice(self.layers, self.start_layer, self.end_layer):
-        hidden_states, residual = layer(positions, hidden_states, residual, None)
+    for layer in active_layers:
+        if getattr(layer, KEEP_ATTR, None) is not None:
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, None, gather_group=gather_group
+            )
+        else:
+            hidden_states, residual = layer(positions, hidden_states, residual, None)
     hidden_states, _ = self.norm(hidden_states, residual)
     if hidden_states.shape[0] != num_tokens:
         hidden_states = _all_rows(hidden_states, num_tokens)
