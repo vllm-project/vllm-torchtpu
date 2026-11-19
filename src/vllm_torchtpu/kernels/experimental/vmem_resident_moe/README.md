@@ -103,6 +103,53 @@ residual on TPU is between the kernel and the XLA-compiled oracle. Most
 likely a few fp8 roundings flip and RMS norm carries them through 4 serial
 steps, but this has not been isolated. Do not read 0.234 as a tolerance.
 
+### Arm 3: one `pallas_call` per step (`percall.py`, job `j-93ed3f76-ee90-4dba-bb49`)
+
+v7x, one TensorCore, 4 local experts, µs per step. Each row is one decode
+loop jitted as a whole.
+
+| arm | Mosaic scratch limit | B = 16 | B = 64 | weights `S(1)` (VMEM) in the while body |
+| --- | --- | --- | --- | --- |
+| in-kernel resident (one call) | 62 MiB | 8.18 | 8.64 | by construction |
+| in-kernel streamed | 62 MiB | 9.78 | 9.68 | - |
+| `percall_vmem` | 62 MiB | 19.86 | 19.34 | not visible (annotation truncated) |
+| `percall_vmem` | 20 MiB | 8.53 | 10.52 | yes |
+| `percall_constrained` | 20 MiB | 9.52 | 9.46 | yes |
+| `percall_streamed` | 20 MiB | 11.79 | 12.65 | yes (XLA placed the `pl.ANY` weights in VMEM) |
+
+* With VMEM headroom, XLA's memory-space assignment keeps loop-invariant
+  weights in VMEM across separate calls without being asked. One call per
+  step then runs at 8.5 µs, against 8.2 µs for the single-call resident
+  kernel.
+* With the Mosaic scratch limit at 62 MiB, the per-call arm is 2.4× slower,
+  which suggests a reload per call. That is inferred from time: the HLO scan
+  found no copy op in any loop. `with_memory_space_constraint` then fails at
+  compile time ("Too many buffers are colored in the alternate memory",
+  `j-e116da82`).
+* Kernel scratch and XLA-placed weights share one VMEM. On v7x, 8 experts
+  (~48 MiB) leave no room for both, so that case was not run.
+* This only holds within one jitted program. Nothing here shows VMEM
+  surviving across program executions, which is how vLLM steps today.
+
+### Stage L1: EP-sharded MoE block on 8 TensorCores (`layer.py`, job `j-3ba6ace4-bded-46fe-8f9d`)
+
+v7x 2x2 (8 TensorCores), 64 experts (8 per TensorCore), top-8, tokens
+replicated, one in-kernel recursive-doubling all-reduce per step, 64 padded
+f32 rows on the wire. µs per step:
+
+| B | resident + AR | streamed + AR | resident, no AR | streamed, no AR | AR cost |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 38.6 | 43.7 | 3.3 | 2.6 | 35-41 |
+| 16 | 43.5 | 54.2 | 10.1 | 15.8 | 33-38 |
+| 64 | 50.9 | 55.0 | 12.1 | 16.7 | 38-39 |
+
+* All-reduce arms match the single-device oracle on all 8 devices (7.2e-7).
+* Without the all-reduce, residency is 1.39-1.55× at B ≥ 16 with real top-8
+  routing. The all-reduce cost ~35 µs, against the 6 µs assumed in the
+  whole-layer model, and absorbed most of the gain. That run sent 721 KB per
+  round even at B = 1. `j-4e6685a1` reruns it with the wire sized to the batch,
+  in f32 and in a symmetric bf16 variant.
+
 ## Running
 
 ```bash

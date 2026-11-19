@@ -37,6 +37,7 @@ import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.vmem_resident_moe import kernel as K
+from vllm_torchtpu.kernels.experimental.vmem_resident_moe import percall as P
 
 
 def _emit(*parts):
@@ -54,6 +55,28 @@ def _time(fn, args, reps):
     return float(np.median(ts)), float(np.min(ts))
 
 
+def _runner(arm, sched, steps, common):
+    """(callable, args-builder) for any arm, in-kernel or per-call."""
+    if arm in K.ARMS:
+        f = K.build(arm, items=sched.items, **common)
+        return lambda x0, gate, ws: f(sched, x0, gate, ws)
+    count, order = P.step_schedule(sched, steps, common["experts"])
+    f = P.build_percall(arm, **common)
+    return lambda x0, gate, ws: f(count, order, x0, gate, ws)
+
+
+def _hlo_scan(arm, sched, steps, common, x0, gate, ws, hlo_dir):
+    count, order = P.step_schedule(sched, steps, common["experts"])
+    f = P.build_percall(arm, **common)
+    text = f.lower(count, order, x0, gate, ws).compile().as_text()
+    if hlo_dir:
+        path = f"{hlo_dir}/{arm}_e{common['experts']}.hlo.txt"
+        with open(path, "w") as fh:
+            fh.write(text)
+    dims = (common["experts"], common["hidden"], common["inter"])
+    return P.weight_copies_in_loop(text, *dims)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--experts", type=int, default=8)
@@ -67,6 +90,12 @@ def main():
     p.add_argument("--check-tokens", type=int, default=16)
     p.add_argument("--interpret", action="store_true")
     p.add_argument("--check-only", action="store_true")
+    p.add_argument("--hlo-dir", default="", help="write compiled HLO of per-call arms")
+    p.add_argument(
+        "--arms",
+        default="resident,streamed",
+        help=f"comma list from {K.ARMS + P.PERCALL_ARMS}",
+    )
     a = p.parse_args()
 
     info = {}
@@ -84,13 +113,20 @@ def main():
         vmem_limit_bytes=a.vmem_limit_mib * 2**20, interpret=a.interpret, **dims
     )
     n_lo, n_hi = (int(v) for v in a.steps.split(","))
+    arms = a.arms.split(",")
     key = jax.random.PRNGKey(0)
 
     b = a.check_tokens
     sched, x0, gate, ws = K.make_inputs(key, tokens=b, steps=n_lo, **dims)
     ref = K.reference(sched, x0, gate, ws)
-    for arm in K.ARMS:
-        out = K.build(arm, items=sched.items, **common)(sched, x0, gate, ws)
+    failed = set()
+    for arm in arms:
+        try:
+            out = _runner(arm, sched, n_lo, common)(x0, gate, ws)
+        except Exception as ex:  # noqa: BLE001  report and keep the other arms
+            failed.add(arm)
+            _emit("ARMERROR", json.dumps({"arm": arm, "error": repr(ex)[:600]}))
+            continue
         err = float(jnp.max(jnp.abs(out[:b] - ref[:b])))
         _emit(
             "CHECK",
@@ -112,19 +148,24 @@ def main():
             {"max_abs_err_with_fault": float(jnp.max(jnp.abs(out[:b] - ref[:b])))}
         ),
     )
+    if not a.interpret:
+        for arm in (x for x in arms if x in P.PERCALL_ARMS and x not in failed):
+            scan = _hlo_scan(arm, sched, n_lo, common, x0, gate, ws, a.hlo_dir)
+            _emit("HLO", json.dumps({"arm": arm, **scan}))
     if a.check_only:
         return
 
+    arms = [x for x in arms if x not in failed]
     for b in (int(v) for v in a.batches.split(",")):
         row = {"B": b, "experts": a.experts}
-        for arm in K.ARMS:
+        for arm in arms:
             meas = {}
             for n in (n_lo, n_hi):
                 sched, x0, gate, ws = K.make_inputs(
                     key, tokens=b, steps=n, seed=b, **dims
                 )
-                f = K.build(arm, items=sched.items, **common)
-                meas[n] = (*_time(f, (sched, x0, gate, ws), a.reps), sched.items)
+                f = _runner(arm, sched, n, common)
+                meas[n] = (*_time(f, (x0, gate, ws), a.reps), sched.items)
             (m0, mn0, t0), (m1, mn1, t1) = meas[n_lo], meas[n_hi]
             slope = (m1 - m0) / (n_hi - n_lo)
             row[arm] = {
@@ -134,7 +175,11 @@ def main():
                 "fixed_us": (m0 - slope * n_lo) * 1e6,
                 "items": [t0, t1],
             }
-        row["speedup"] = row["streamed"]["us_per_step"] / row["resident"]["us_per_step"]
+        if "streamed" in row:
+            for arm in arms:
+                row[arm]["speedup_vs_streamed"] = (
+                    row["streamed"]["us_per_step"] / row[arm]["us_per_step"]
+                )
         _emit("RESULT", json.dumps(row))
 
 

@@ -214,8 +214,8 @@ def reference(sched, x0, gate, weights):
     return x
 
 
-def make_inputs(key, *, experts, hidden, inter, tokens, rows, steps, seed=0):
-    """Synthetic fp8 experts; each real token hits one local expert per step."""
+def make_inputs(key, *, experts, hidden, inter, tokens, rows, steps, seed=0, top_k=1):
+    """Synthetic fp8 experts; each real token routes to top_k experts per step."""
     k = jax.random.split(key, 4)
 
     def weight(kk, shape, fan_in):
@@ -233,10 +233,14 @@ def make_inputs(key, *, experts, hidden, inter, tokens, rows, steps, seed=0):
     )
     x0 = jax.random.normal(k[3], (rows, hidden), jnp.float32).astype(jnp.bfloat16)
     rng = np.random.default_rng(seed)
-    assign = rng.integers(0, experts, size=(steps, tokens))
-    gval = rng.uniform(0.5, 1.0, size=(steps, tokens)).astype(np.float32)
+    if top_k == 1:
+        assign = rng.integers(0, experts, size=(steps, tokens))[..., None]
+    else:
+        assign = rng.random((steps, tokens, experts)).argsort(-1)[..., :top_k]
+    gval = rng.uniform(0.5, 1.0, size=assign.shape).astype(np.float32)
     gate = np.zeros((steps, experts, rows, 128), np.float32)
     for s in range(steps):
         for b in range(tokens):
-            gate[s, assign[s, b], b, :] = gval[s, b]
-    return make_schedule(assign), x0, jnp.asarray(gate), weights
+            for j in range(assign.shape[-1]):
+                gate[s, assign[s, b, j], b, :] = gval[s, b, j]
+    return make_schedule(assign.reshape(steps, -1)), x0, jnp.asarray(gate), weights
