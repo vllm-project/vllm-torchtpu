@@ -77,7 +77,7 @@ logger = init_logger("vllm." + __name__)
 class ExternalHitEstimator(Protocol):
     """A KV connector that estimates how many prompt tokens past a request's
     local hit a lookup would load from its external tier (the Raiden
-    offloading connector and the multi-connector of #3083)."""
+    offloading connector and the TPU multi-connector)."""
 
     def estimate_external_hit_tokens(
         self, request: Request, num_local_tokens: int
@@ -168,7 +168,7 @@ def memo_local_prefix_cache_hit(
 
     The memo branch of ``_get_local_prefix_cache_hit``, shared by
     PrefixAwareScheduler and the pipeline chunk scheduler's prefix-aware
-    admission (#3090); each falls back to its own lookup on None.
+    admission; each falls back to its own lookup on None.
     """
     connector = getattr(scheduler, "connector", None)
     if connector is None or not connector.supports_divergent_local_hybrid_hits:
