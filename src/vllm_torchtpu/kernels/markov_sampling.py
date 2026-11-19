@@ -2,8 +2,9 @@
 """Fused BF16 Markov projection, base-logit addition and greedy selection.
 
 The BF16 ordered key preserves NaNs-first and lowest-index tie behavior.
-The 16384-column tile is measured for M48/K256/V129280 on TPU v7x;
-callers must gate that envelope. Keep the FP32 accumulator through the add.
+The 16384-column tile is measured for K256/V129280 on TPU v7x at the request
+rows in SLOT_ROWS; callers must gate that envelope (`slot_rows`). Keep the
+FP32 accumulator through the add.
 """
 
 import functools
@@ -12,6 +13,15 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+# Request rows per slot: whole BF16 sublane tiles, so every slot's base-logit
+# block starts on a tile boundary.
+SLOT_ROWS = (16, 32, 48, 64)
+
+
+def slot_rows(num_reqs: int) -> int | None:
+    """Rows per slot for `num_reqs` requests (zero-padded), None if too many."""
+    return next((rows for rows in SLOT_ROWS if rows >= num_reqs), None)
 
 
 def _pipelined_kernel(x, w, base, vo, io, *, group, vocab_size):
@@ -108,8 +118,9 @@ def sample_slot(
     *,
     slot: int,
 ) -> jax.Array:
-    assert x.shape == (48, 256) and w.shape == (129280, 256)
-    assert base.shape == (240, 129280) and 0 <= slot < 5
+    assert x.shape[0] in SLOT_ROWS and x.shape[1] == 256
+    assert w.shape == (129280, 256)
+    assert base.shape == (5 * x.shape[0], 129280) and 0 <= slot < 5
     assert x.dtype == w.dtype == base.dtype == jnp.bfloat16
     group = 16384
     m = x.shape[0]

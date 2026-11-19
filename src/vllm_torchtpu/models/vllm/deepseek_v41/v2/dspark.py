@@ -8,6 +8,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -391,10 +392,15 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         None means the proposer retains its ordinary logits/Markov path.
         The returned sampler may also return None for an unsupported bucket.
         """
+        from vllm_torchtpu.kernels.logits_head import is_supported_shape
+        from vllm_torchtpu.kernels.markov_sampling import slot_rows
+
         from .dspark_sampling import initialize_logits_head, initialize_samples
 
         self._decode_samples = None
         self._decode_logits = None
+        self._slot_rows = slot_rows
+        self._pallas_logits_shape = is_supported_shape
         if not (tp_size == 1 and sample_from_anchor and block_size == 5):
             return None
         assert self.lm_head is not None
@@ -417,31 +423,46 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     def _sample_decode(
         self, hidden: torch.Tensor, input_ids: torch.Tensor, block_size: int
     ) -> torch.Tensor | None:
+        rows, width = hidden.shape
         if (
-            hidden.shape != (240, 5120)
+            width != 5120
+            or rows % block_size
             or hidden.dtype != torch.bfloat16
             or block_size != 5
         ):
             return None
-        slot_hidden = hidden.view(48, 5, 5120).transpose(0, 1).reshape(240, 5120)
-        if self._decode_logits is not None:
-            assert self.lm_head is not None
+        num_reqs = rows // block_size
+        slot_reqs = self._slot_rows(num_reqs)
+        if slot_reqs is None:
+            return None
+        # Slot-major rows, each slot zero-padded to the kernel's request rows.
+        slot_hidden = hidden.view(num_reqs, block_size, width).transpose(0, 1)
+        anchors = input_ids[:rows].view(num_reqs, block_size)[:, 0]
+        if slot_reqs != num_reqs:
+            slot_hidden = F.pad(slot_hidden, (0, 0, 0, slot_reqs - num_reqs))
+            anchors = F.pad(anchors, (0, slot_reqs - num_reqs))
+        padded_rows = block_size * slot_reqs
+        slot_hidden = slot_hidden.reshape(padded_rows, width)
+        assert self.lm_head is not None
+        if self._decode_logits is not None and self._pallas_logits_shape(
+            padded_rows, tuple(self.lm_head.weight.shape)
+        ):
             logits = self._decode_logits(
                 self.model.norm(slot_hidden), self.lm_head.weight
             )
         else:
             logits = self.compute_logits(slot_hidden)
-        if logits.shape != (240, 129280) or logits.dtype != torch.bfloat16:
+        if logits.shape != (padded_rows, 129280) or logits.dtype != torch.bfloat16:
             return None
         markov = self.model.markov_head
-        anchors = input_ids[:240].view(48, 5)[:, 0]
         assert self._decode_samples is not None
-        return self._decode_samples(
+        tokens = self._decode_samples(
             logits,
             markov.markov_w1.weight,
             markov.markov_w2.weight,
             anchors,
         )
+        return tokens if slot_reqs == num_reqs else tokens[:num_reqs]
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Base logits U_k = lm_head(norm(head_hidden))."""

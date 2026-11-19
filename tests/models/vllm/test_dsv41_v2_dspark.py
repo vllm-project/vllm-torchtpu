@@ -857,11 +857,56 @@ def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypat
     assert actual_embedding is embedding
     assert actual_weight is markov_weight
     torch.testing.assert_close(anchors, input_ids[::5])
-    assert sampler(hidden[:235], input_ids[:235], 5) is None
+    assert sampler(hidden[:234], input_ids[:234], 5) is None
     assert compute_logits.call_count == 1
     compute_logits.return_value = logits.float()
     assert sampler(hidden, input_ids, 5) is None
     assert sample.call_count == 1
+
+
+def test_decode_sampler_pads_small_buckets_to_whole_slot_tiles(monkeypatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
+
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", False)
+    model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
+        v2_dspark.DSparkDeepseekV41ForCausalLM
+    )
+    nn.Module.__init__(model)
+    model.lm_head = SimpleNamespace(
+        weight=torch.empty((129280, 5120), dtype=torch.bfloat16, device="meta")
+    )
+    embedding = torch.empty((129280, 256), dtype=torch.bfloat16, device="meta")
+    model.model = SimpleNamespace(
+        markov_head=SimpleNamespace(
+            markov_w1=SimpleNamespace(weight=embedding),
+            markov_w2=SimpleNamespace(weight=torch.empty_like(embedding)),
+        )
+    )
+    # 8 requests (the MIN_NUM_SEQS draft bucket) run as 16 rows per slot.
+    logits = torch.empty((80, 129280), dtype=torch.bfloat16, device="meta")
+    compute_logits = MagicMock(return_value=logits)
+    monkeypatch.setattr(model, "compute_logits", compute_logits)
+    tokens = torch.arange(80, dtype=torch.int64).view(16, 5)
+    sample = MagicMock(return_value=tokens)
+    monkeypatch.setattr(dspark_sampling, "initialize_samples", lambda: sample)
+    sampler = model.prepare_tpu_draft_sampler(
+        tp_size=1, block_size=5, sample_from_anchor=True
+    )
+    hidden = (torch.arange(40, dtype=torch.bfloat16) + 1)[:, None].expand(40, 5120)
+    input_ids = torch.arange(40) + 1
+    torch.testing.assert_close(sampler(hidden, input_ids, 5), tokens[:8])
+    slot_major = compute_logits.call_args.args[0][:, 0].view(5, 16)
+    torch.testing.assert_close(
+        slot_major[:, :8], (torch.arange(40, dtype=torch.bfloat16) + 1).view(8, 5).T
+    )
+    assert not slot_major[:, 8:].any()
+    anchors = sample.call_args.args[3]
+    torch.testing.assert_close(anchors[:8], input_ids[::5])
+    assert not anchors[8:].any()
+    # More requests than the largest slot tile keep the proposer's own path.
+    hidden = torch.zeros((325, 5120), dtype=torch.bfloat16)
+    assert sampler(hidden, torch.zeros(325, dtype=torch.int64), 5) is None
+    assert compute_logits.call_count == 1
 
 
 @pytest.mark.parametrize(

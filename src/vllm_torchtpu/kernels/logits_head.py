@@ -7,8 +7,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 # Measured on v7x for the DSpark drafter's [240, 5120] x [129280, 5120]^T:
-# 435 us against 530 us for the XLA dot (the HBM floor is 448 us).
-TUNED_TILES = {(240, 5120, 129280): 1280}
+# 435 us against 530 us for the XLA dot (the HBM floor is 448 us). The 80-
+# and 160-row slot-major draft buckets (16 and 32 requests per slot) reuse the
+# tile: the weight stream is the same and their VMEM footprint is smaller.
+TUNED_TILES = {
+    (80, 5120, 129280): 1280,
+    (160, 5120, 129280): 1280,
+    (240, 5120, 129280): 1280,
+}
 
 
 def is_supported_shape(rows: int, weight_shape: tuple[int, ...]) -> bool:
