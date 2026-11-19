@@ -273,14 +273,30 @@ def _kv_transfer_page_unused_reason(
     return None
 
 
-def check_kv_transfer_page(vllm_config: VllmConfig, layout: VllmKVCacheLayout) -> None:
+def check_kv_transfer_page(
+    vllm_config: VllmConfig,
+    layout: VllmKVCacheLayout,
+    backend: type[AttentionBackend] | None = None,
+) -> None:
     """Startup check of the ``tpu_kv_transfer`` section for an engine whose
-    KV cache layout resolved to ``layout``: a malformed section raises
-    ValueError, and a page the engine will not apply is logged once."""
+    KV cache layout resolved to ``layout`` and whose attention backend is
+    ``backend`` (None: not checked): a malformed section raises ValueError,
+    and a page the engine will not apply is logged once. Only the batched-RPA
+    backend (``--attention-backend CUSTOM``) pages by the setting."""
     page = kv_transfer_page_option(vllm_config)
     if page is None:
         return
-    reason = _kv_transfer_page_unused_reason(vllm_config, layout)
+    if (
+        vllm_config.kv_transfer_config is not None
+        and backend is not None
+        and not issubclass(backend, PallasBatchedRPAAttentionBackend)
+    ):
+        reason: str | None = (
+            f"the {backend.__name__} attention backend does not page by it; "
+            "only --attention-backend CUSTOM does"
+        )
+    else:
+        reason = _kv_transfer_page_unused_reason(vllm_config, layout)
     if reason is not None:
         logger.warning_once(
             "additional_config[%r]['kernel_page_tokens']=%d is ignored: %s; "

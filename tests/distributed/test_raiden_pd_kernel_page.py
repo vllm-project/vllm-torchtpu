@@ -263,6 +263,29 @@ def test_a_page_the_engine_does_not_apply_is_logged(
         assert call.args[2] == 128 and call.args[3].startswith(reason)
 
 
+@pytest.mark.parametrize("backend,logged", [("other", True), ("batched", False)])
+def test_a_page_another_attention_backend_ignores_is_logged(
+    monkeypatch, backend, logged
+):
+    """Only the batched-RPA backend (--attention-backend CUSTOM) pages by the
+    setting; on any other backend it is logged as ignored."""
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+    cls = PallasAttentionBackend if backend == "other" else BATCHED
+    logger = Mock()
+    section = {"kernel_page_tokens": 128}
+    with _engine(monkeypatch, kv_role="kv_producer", section=section) as c:
+        monkeypatch.setattr(attention, "logger", logger)
+        attention.check_kv_transfer_page(
+            c, c.cache_config.get_resolved_kv_cache_layout(), cls
+        )
+    if logged:
+        (call,) = logger.warning_once.call_args_list
+        assert call.args[3].startswith("the PallasAttentionBackend attention backend")
+    else:
+        logger.warning_once.assert_not_called()
+
+
 def test_a_page_the_kernel_lacks_is_refused(monkeypatch):
     engine = _engine(
         monkeypatch, kv_role="kv_producer", section={"kernel_page_tokens": 512}

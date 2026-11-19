@@ -605,6 +605,32 @@ class TestTpuPlatform:
         (call,) = mock_logger.warning_once.call_args_list
         assert call.args[3] == "the engine has no kv_transfer_config"
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_kv_transfer_page_check_gets_the_attention_backend(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        """check_and_update_config hands the page check the engine's backend:
+        the fixture's engine uses the default backend, not CUSTOM."""
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+        class Checked(Exception):
+            pass
+
+        with (
+            patch(
+                "vllm_torchtpu.layers.adapter.attention.check_kv_transfer_page",
+                side_effect=Checked,
+            ) as check,
+            pytest.raises(Checked),
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+        (call,) = check.call_args_list
+        assert call.args[0] is vllm_config
+        assert call.args[2] is PallasAttentionBackend
+
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
