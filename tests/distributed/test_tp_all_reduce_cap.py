@@ -60,3 +60,33 @@ def test_direct_layout_gate(rows, direct_rows, want):
     assert kernel.direct_ok(rows, HIDDEN, N, direct_rows) is want
     # 6144 / 8 = 768 lanes per rank chunk: whole lane tiles.
     assert not kernel.direct_ok(rows, 6144 + 128, N, 8)
+
+
+@pytest.mark.parametrize(
+    "rows,qar_min,want",
+    [
+        (8, 1024, "pallas"),  # decode bucket under the cap: Pallas, direct rows
+        (512, 1024, "psum"),  # between the cap and the qar minimum
+        (1024, 1024, "qar"),
+        (8192, 1024, "qar"),
+        (8192, 0, "psum"),  # qar off
+    ],
+)
+def test_size_routing_with_qar_and_direct_rows(monkeypatch, rows, qar_min, want):
+    """The op picks one path per static size: Pallas (keeping direct_rows),
+    psum, or qar at >= TPU_TP_QAR_MIN_TOKENS rows."""
+    par = pytest.importorskip("vllm_torchtpu.distributed.pallas_all_reduce")
+    calls = []
+    monkeypatch.setattr(
+        par.kernel, "all_reduce", lambda x, r, n, d=0: calls.append(("pallas", d)) or x
+    )
+    monkeypatch.setattr(par.qar, "all_reduce_v2", lambda x, r, t: calls.append(("qar",)) or x)
+    monkeypatch.setattr(par.lax, "psum", lambda x, a: calls.append(("psum",)) or x)
+    tab = object() if qar_min else None
+    body = par._body(N, 589824, "x", direct_rows=8, qar_min_rows=qar_min, qar_tab=tab)
+    import numpy as np
+
+    body(np.zeros((rows, HIDDEN), np.float32), None)
+    assert [c[0] for c in calls] == [want]
+    if want == "pallas":
+        assert calls[0][1] == 8

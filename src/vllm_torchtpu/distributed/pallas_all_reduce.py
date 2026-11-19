@@ -64,6 +64,7 @@ class _Armed:
 
 
 _ARMED: _Armed | None = None
+_QAR_TRACED: set[int] = set()
 
 
 def _qdq(x: jax.Array) -> jax.Array:
@@ -82,6 +83,10 @@ def _body(n: int, max_bytes: int, axis: str, direct_rows: int = 0,
         rows, hidden = x.shape
         # Static per bucket: decided at trace time inside the op.
         if qar_tab is not None and 0 < qar_min_rows <= rows:
+            if rows not in _QAR_TRACED:
+                # JAX trace time (once per bucket), not the torch forward.
+                _QAR_TRACED.add(rows)
+                logger.warning("tp_all_reduce: qar_all_reduce lowered for [%d, %d]", rows, hidden)
             return qar.all_reduce_v2(x, rank, qar_tab)
         qdq = 0 < qdq_min_rows <= rows
         if qdq:
