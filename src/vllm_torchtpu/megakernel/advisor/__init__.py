@@ -93,7 +93,14 @@ from .specs import (
     default_double_buffer_ring_plan,
     load_measurements,
 )
-from .support import CORE_LIMITS, CoreLimits, evaluate_support
+from .support import (
+    CORE_LIMITS,
+    CoreLimits,
+    declared_collectives,
+    effective_expert_owner_groups,
+    evaluate_support,
+    resolve_declared_expert_mode,
+)
 from .verdict import (
     advise,
     compare_parallelism_candidates,
@@ -162,8 +169,10 @@ __all__ = [
     "compute_per_token_vmem_bytes",
     "compute_scope_raw_step_us",
     "constants",
+    "declared_collectives",
     "default_double_buffer_ring_plan",
     "detect_tpu_from_sysfs",
+    "effective_expert_owner_groups",
     "evaluate_support",
     "fit_vmem_budget_bytes",
     "jax_bridge",
@@ -176,6 +185,7 @@ __all__ = [
     "parse_expert_mode_rules",
     "public_calibration_path",
     "resolve_chip_spec",
+    "resolve_declared_expert_mode",
     "resolve_hf_snapshot_config",
     "resolve_model_profile",
     "roofline",
