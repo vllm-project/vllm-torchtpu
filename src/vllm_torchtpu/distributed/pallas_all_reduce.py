@@ -34,6 +34,7 @@ import os
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 from jax import lax
@@ -44,6 +45,7 @@ from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
+from vllm_torchtpu.kernels.collectives import qar_all_reduce as qar
 from vllm_torchtpu.kernels.collectives import tp_all_reduce as kernel
 from vllm_torchtpu.logger import init_logger
 
@@ -64,21 +66,45 @@ class _Armed:
 _ARMED: _Armed | None = None
 
 
-def _body(n: int, max_bytes: int, axis: str):
+def _qdq(x: jax.Array) -> jax.Array:
+    """bf16 [rows, hidden] -> int8 with one absmax scale per (32 rows, lane) ->
+    bf16: the payload rounding of kernels/collectives/qar_all_reduce.py."""
+    rows = x.shape[0]
+    t = qar.padded_rows(rows)
+    xf = jnp.pad(x.astype(jnp.float32), ((0, t - rows), (0, 0)))
+    return qar.dequantize(*qar.quantize(xf))[:rows].astype(x.dtype)
+
+
+def _body(n: int, max_bytes: int, axis: str, qdq_min_rows: int = 0):
     def body(x, rank):
         rows, hidden = x.shape
+        # Static per bucket: decided at trace time inside the op.
+        qdq = 0 < qdq_min_rows <= rows
+        if qdq:
+            x = _qdq(x)
         if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
-            return kernel.all_reduce(x, rank, n)
-        return lax.psum(x, axis)
+            out = kernel.all_reduce(x, rank, n)
+        else:
+            out = lax.psum(x, axis)
+        return _qdq(out) if qdq else out
 
     return body
 
 
-def _make_op(mesh, max_bytes: int):
+def _qdq_min_rows() -> int:
+    """TPU_TP_AR_QDQ_ROWS > 0 emulates the int8 all-reduce payload (accuracy
+    only, no speedup) on all-reduces of >= max(1, TPU_TP_AR_QDQ_MIN_TOKENS)
+    rows; 0 = off."""
+    if envs.TPU_TP_AR_QDQ_ROWS <= 0:
+        return 0
+    return max(1, envs.TPU_TP_AR_QDQ_MIN_TOKENS)
+
+
+def _make_op(mesh, max_bytes: int, qdq_min_rows: int = 0):
     axis = mesh.axis_names[0]
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis),
+        _body(int(mesh.size), max_bytes, axis, qdq_min_rows),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -96,7 +122,7 @@ def _make_op(mesh, max_bytes: int):
     # annotation is narrower).
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        "pallas::tp_all_reduce",
+        "pallas::tp_all_reduce" + ("_qdq" if qdq_min_rows else ""),
         fn,
         mesh=mesh,
         input_partition_specs=specs,
@@ -197,6 +223,17 @@ def arm(hidden: int, device: torch.device) -> bool:
     if any(failures):
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
+        )
+    qdq_min_rows = _qdq_min_rows()
+    if qdq_min_rows:
+        # The self-test checks exact sums; the emulation rounds, so it runs on
+        # the plain op above and serving gets the rounding one.
+        op = _make_op(mesh, max_bytes, qdq_min_rows)
+        logger.info(
+            "tp_all_reduce: int8 payload emulation ON (TPU_TP_AR_QDQ_ROWS=%d) on"
+            " all-reduces of >= %d rows",
+            envs.TPU_TP_AR_QDQ_ROWS,
+            qdq_min_rows,
         )
     _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank)
     logger.info(

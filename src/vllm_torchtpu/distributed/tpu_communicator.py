@@ -26,24 +26,6 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
-from vllm.logger import init_logger
-
-
-logger = init_logger(__name__)
-
-
-def _int8_qdq(x: torch.Tensor, rows: int) -> torch.Tensor:
-    """bf16 [T, H] -> int8 with one absmax scale per (lane, `rows`-row block)
-    -> bf16. Emulates an int8 all-reduce payload."""
-    t, h = x.shape
-    pad = -t % rows
-    xf = x.float()
-    if pad:
-        xf = torch.nn.functional.pad(xf, (0, 0, 0, pad))
-    blocks = xf.view(-1, rows, h)
-    scale = blocks.abs().amax(dim=1, keepdim=True).clamp_min(1e-30) / 127.0
-    q = torch.round(blocks / scale).clamp(-127.0, 127.0) * scale
-    return q.view(-1, h)[:t].to(x.dtype)
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -59,32 +41,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
-        from vllm_torchtpu import envs
-
-        if envs.TPU_TP_AR_QDQ_ROWS > 0:
-            # Logged here, outside the traced forward (Dynamo cannot trace it).
-            logger.info(
-                "TP all-reduce int8 QDQ emulation ON: rows=%d min_tokens=%d",
-                envs.TPU_TP_AR_QDQ_ROWS,
-                envs.TPU_TP_AR_QDQ_MIN_TOKENS,
-            )
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        from vllm_torchtpu import envs
         from vllm_torchtpu.distributed import pallas_all_reduce
 
-        rows = envs.TPU_TP_AR_QDQ_ROWS
-        qdq = (
-            rows > 0
-            and input_.dim() == 2
-            and input_.dtype == torch.bfloat16
-            and input_.shape[0] >= envs.TPU_TP_AR_QDQ_MIN_TOKENS
-        )
-        if qdq:
-            input_ = _int8_qdq(input_, rows)
         out = pallas_all_reduce.all_reduce(self.ranks, input_)
-        out = super().all_reduce(input_) if out is None else out
-        return _int8_qdq(out, rows) if qdq else out
+        return super().all_reduce(input_) if out is None else out
 
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
