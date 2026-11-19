@@ -18,12 +18,14 @@ a request that hits a block another request fills in the same step can read
 it before it is written. See `_patch_vllm_same_step_prefix_hits`.
 """
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.distributed.aux_output_connector.connector import (
+    AuxOutputSchedulerConnector,
+)
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -36,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 
+from tests.platforms.same_step_prefix_hits_test_utils import apply_patch
 from vllm_torchtpu import _patch_vllm_same_step_prefix_hits
 
 BLOCK_SIZE = 16
@@ -45,29 +48,20 @@ PROMPT = list(range(BLOCK_SIZE + 8))
 
 @pytest.fixture(autouse=True)
 def patched(monkeypatch):
-    """Patch unpatched methods around a stub `Scheduler.schedule`.
+    """Patch upstream's methods around a stub `Scheduler.schedule`.
 
-    The plugin may already have patched these in this process; unwrap to
-    upstream first so the test patches exactly once, and restore afterwards.
     The stub keeps the one thing the real `schedule()` does that matters here:
     it calls `kv_cache_manager.new_step_starts()` once per step, before it
     looks anything up or allocates. So the `[scheduler]` cases check the wiring
     through `Scheduler.schedule`, not vLLM's scheduler itself; that the real
     `schedule()` clears the set is covered in tests/test_abort_on_preemption.py.
     """
-    for name in ("_insert_block_hash", "get_cached_block"):
-        monkeypatch.setattr(BlockPool, name, inspect.unwrap(getattr(BlockPool, name)))
-    monkeypatch.setattr(
-        KVCacheManager,
-        "new_step_starts",
-        inspect.unwrap(KVCacheManager.new_step_starts),
-    )
     monkeypatch.setattr(
         Scheduler,
         "schedule",
         lambda self, *args, **kwargs: self.kv_cache_manager.new_step_starts(),
     )
-    _patch_vllm_same_step_prefix_hits()
+    apply_patch(monkeypatch)
 
 
 @pytest.fixture
@@ -146,11 +140,45 @@ def test_later_step_hits_written_prefix(manager, start_step):
     assert _admit(manager, _request("next_step")) == BLOCK_SIZE
 
 
+def test_connector_sees_unwritten_blocks_and_admission_does_not(manager):
+    """vLLM's routed-experts connector asks whether a block is still cached,
+    so it sees the block a request filled this step. Admission still does not
+    hit that block."""
+    manager.new_step_starts()
+    filler = _request("filler")
+    _admit(manager, filler)
+    connector = AuxOutputSchedulerConnector(manager)
+
+    assert connector._gpu_cached(filler.block_hashes[0]) is not None
+    assert _admit(manager, _request("same_step")) == 0
+
+
+def test_connector_asks_the_pools_own_lookup():
+    """The connector's lookup still goes through its block pool's own
+    `get_cached_block`, which a stand-in pool in a test may replace."""
+    cached = object()
+    pool = SimpleNamespace(
+        get_cached_block=lambda block_hash, group_ids: [cached], hash_block_size=4
+    )
+    connector = AuxOutputSchedulerConnector(
+        SimpleNamespace(
+            coordinator=SimpleNamespace(
+                single_type_managers=[SimpleNamespace(block_size=4, block_pool=pool)]
+            ),
+            block_pool=pool,
+            kv_cache_config=SimpleNamespace(num_blocks=16),
+        )
+    )
+
+    assert connector._gpu_cached(b"block") == [cached]
+
+
 def test_patch_is_idempotent():
     patched_methods = (
         BlockPool._insert_block_hash,
         BlockPool.get_cached_block,
         KVCacheManager.new_step_starts,
+        AuxOutputSchedulerConnector._gpu_cached,
     )
 
     _patch_vllm_same_step_prefix_hits()
@@ -159,4 +187,5 @@ def test_patch_is_idempotent():
         BlockPool._insert_block_hash,
         BlockPool.get_cached_block,
         KVCacheManager.new_step_starts,
+        AuxOutputSchedulerConnector._gpu_cached,
     ) == patched_methods
