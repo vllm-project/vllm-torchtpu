@@ -30,7 +30,6 @@ from vllm.logger import init_logger
 
 
 logger = init_logger(__name__)
-_QDQ_LOGGED = False
 
 
 def _int8_qdq(x: torch.Tensor, rows: int) -> torch.Tensor:
@@ -60,6 +59,15 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+        from vllm_torchtpu import envs
+
+        if envs.TPU_TP_AR_QDQ_ROWS > 0:
+            # Logged here, outside the traced forward (Dynamo cannot trace it).
+            logger.info(
+                "TP all-reduce int8 QDQ emulation ON: rows=%d min_tokens=%d",
+                envs.TPU_TP_AR_QDQ_ROWS,
+                envs.TPU_TP_AR_QDQ_MIN_TOKENS,
+            )
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         from vllm_torchtpu import envs
@@ -73,16 +81,6 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             and input_.shape[0] >= envs.TPU_TP_AR_QDQ_MIN_TOKENS
         )
         if qdq:
-            global _QDQ_LOGGED
-            if not _QDQ_LOGGED:
-                _QDQ_LOGGED = True
-                logger.info(
-                    "TP all-reduce int8 QDQ emulation ON: rows=%d min_tokens=%d"
-                    " first shape %s",
-                    rows,
-                    envs.TPU_TP_AR_QDQ_MIN_TOKENS,
-                    tuple(input_.shape),
-                )
             input_ = _int8_qdq(input_, rows)
         out = pallas_all_reduce.all_reduce(self.ranks, input_)
         out = super().all_reduce(input_) if out is None else out
