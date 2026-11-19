@@ -9133,14 +9133,8 @@ class TPUModelRunner(GPUModelRunner):
 
         `num_valid_tokens` is the step's real token count; None takes it from
         the sequence layout plan (the ALL layout only, else no row is
-        padding). `rows_sliced` says whether the forward about to run slices
-        its rows over TP (each rank owns `num_tokens_padded // tp` rows): the
-        mask is then this rank's slice. Otherwise it covers all
-        `num_tokens_padded` rows, which every rank holds. The MoE paths read
-        the mask over all of a step's rows, so the per-rank slice is right
-        only for a forward that reads its own slice: written for one that
-        reads every row, it marks other ranks' real rows as padding and the
-        MoE drops their experts.
+        padding). `rows_sliced` writes this rank's slice of the mask instead
+        of all `num_tokens_padded` rows.
 
         TODO: pass rows_sliced=True from the change that makes the model
         follow each step's form; until then every caller writes the full mask.
