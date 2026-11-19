@@ -51,8 +51,8 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 )
 
 # Keys that never change the compiled graph: the diagnostics-only profiler
-# knobs above, which only steer profiling, and the host-only scheduler
-# section (`core.scheduler_options`), which only decides admission order.
+# knobs above, which only steer profiling, and the host-only sections, each
+# imported from the module that reads it.
 # `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU
 # compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
