@@ -152,6 +152,7 @@ def test_validation_corpus_zero_lower_bound_violations() -> None:
     assert len(evaluated) >= min_corpus_points
     for point, estimate in evaluated:
         measured_us = float(str(point["fixture_step_us"]))
+        assert estimate.step_floor_strict_us <= estimate.step_bound_us
         assert estimate.step_upper_us >= estimate.step_bound_us
         assert estimate.step_bound_us <= measured_us, (
             f"{point['id']}: floor {estimate.step_bound_us:.2f} us exceeds "
