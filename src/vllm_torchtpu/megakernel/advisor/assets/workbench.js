@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 (function() { const ENG = window.__MK_ADVISOR_ENGINE; if (!ENG) return;
-  const { DATA, PROF, CHIP, REGIMES, evaluateWorkload } = ENG;
+  const {
+    DATA, PROF, CHIP, REGIMES, evaluateWorkload, sublayerLabel, declaredExpertOwnerGroups
+  } = ENG;
   const el = id => document.getElementById(id);
   const escH = s => String(s == null ? '' : s).replace(/&/g, '&amp;')
   .replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -188,7 +190,11 @@
   const axes = []; for (const k of ['tp', 'dp', 'ep', 'pp', 'pcp', 'dcp'])
   if (wl[k] > 1) axes.push(`${k.toUpperCase()}${wl[k]}`);
   const layStr = axes.length ? axes.join(' x ') : 'TP1';
-  el('lbl-layout').textContent = layStr; el('wb-active-layout').textContent = layStr; }
+  el('lbl-layout').textContent = layStr; el('wb-active-layout').textContent = layStr;
+  const subEl = el('wb-sublayer-label');
+  if (subEl) {
+    subEl.textContent = sublayerLabel(wl, declaredExpertOwnerGroups(PROF, wl));
+  } }
   function renderTopVerdictAndBanner(wlA, evalA) {
   const pill = el('wb-verdict-pill'), sumEl = el('wb-verdict-summary');
   const ban = el('wb-invalid-banner'); if (!pill || !sumEl || !ban) return;

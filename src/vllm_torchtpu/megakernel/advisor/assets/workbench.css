@@ -77,3 +77,9 @@
   font-weight:700;font-size:11px;list-style:none}.wb-acc summary::-webkit-details-marker{
   display:none}.wb-acc-body{padding:0 10px 9px}.view-hidden{display:none !important}
   .audit-scroll-wrap{padding:24px}
+  .wb-tier-pill{display:inline-block;padding:1px 6px;margin-left:5px;
+  border-radius:4px;font-size:10px;font-weight:700;background:var(--card-inner);
+  color:var(--text);border:1px solid var(--border)}
+  #wb-unmodeled-notes{margin-top:3px;font-size:10px;color:var(--muted)}
+  #wb-unmodeled-notes summary{cursor:pointer;font-weight:600}
+  #wb-unmodeled-notes ul{margin:3px 0 0;padding-left:16px}
