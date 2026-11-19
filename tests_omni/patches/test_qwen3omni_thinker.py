@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_BUCKETS,
     _AUDIO_CHUNK_LENGTHS_PATCHED,
+    _CU_SEQLENS_BLOCK_SIZE,
     _get_compiled_bucket_fn,
     maybe_patch_qwen3_omni_thinker,
 )
@@ -41,6 +42,7 @@ _PATCHED_ATTRS = (
     "forward",
     "prepare_encoder_metadata",
     "forward_with_encoder_metadata",
+    "forward_chunks",
     "_tpu_orig_forward",
 )
 
@@ -70,16 +72,27 @@ class _DummyPosEmb(nn.Module):
 class _DummyReplicatedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
+        self.input_size = in_features
+        self.output_size = out_features
         self.linear = nn.Linear(in_features, out_features)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
         return self.linear(x), None
 
 
+class _TrackedTensor(torch.Tensor):
+    cpu_called: bool = False
+
+    def cpu(self, *args: object, **kwargs: object) -> torch.Tensor:
+        _TrackedTensor.cpu_called = True
+        return super().cpu(*args, **kwargs)
+
+
 def _make_dummy_audio_encoder(
     seen_conv_batch_sizes: list[int] | None = None,
     seen_layer_seq_lens: list[int] | None = None,
     seen_cu_seqlens: list[list[int]] | None = None,
+    n_window_infer: int = 400,
 ) -> nn.Module:
     class _Layer(nn.Module):
         def forward(
@@ -103,16 +116,15 @@ def _make_dummy_audio_encoder(
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             if seen_conv_batch_sizes is not None:
                 seen_conv_batch_sizes.append(int(x.shape[0]))
-            b, c, f, _ = x.shape
+            _, _, f, _ = x.shape
             return x[:, :, : max(1, f // 2), :13]
 
     class _DummyEncoder(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.n_window = 50
-            self.n_window_infer = 400
+            self.n_window_infer = n_window_infer
             self.conv_chunksize = 500
-            self.output_dim = 8
             self.conv2d1 = _Conv1()
             self.conv2d2 = nn.Identity()
             self.conv2d3 = nn.Identity()
@@ -145,56 +157,94 @@ def test_non_omni_config_is_not_patched(architectures: list[str] | None) -> None
     assert Qwen3OmniMoeAudioEncoder.forward is before
 
 
-def test_patch_moves_lengths_to_cpu_and_supports_metadata_api() -> None:
+def test_patch_application_is_idempotent() -> None:
     cls = Qwen3OmniMoeAudioEncoder
     assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
     patched_forward = cls.forward
     assert getattr(patched_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
     assert hasattr(cls, "_tpu_orig_forward")
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is False
+    assert cls.forward is patched_forward
 
-    class TrackedTensor(torch.Tensor):
-        cpu_called: bool = False
 
-        def cpu(self, *args, **kwargs):
-            TrackedTensor.cpu_called = True
-            return super().cpu(*args, **kwargs)
-
+def test_forward_moves_feature_lens_to_cpu() -> None:
+    cls = Qwen3OmniMoeAudioEncoder
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    _TrackedTensor.cpu_called = False
     enc = _make_dummy_audio_encoder()
-    lens = torch.tensor([800]).as_subclass(TrackedTensor)
-    out = patched_forward(enc, torch.zeros(16, 800), lens, torch.tensor([104]))
-    assert TrackedTensor.cpu_called is True
+    lens = torch.tensor([800]).as_subclass(_TrackedTensor)
+    out = cls.forward(enc, torch.zeros(16, 800), lens, torch.tensor([104]))
+    assert _TrackedTensor.cpu_called is True
     assert out.shape == (104, 8)
 
+
+def test_metadata_api_computes_aftercnn_lens_and_encodes() -> None:
+    cls = Qwen3OmniMoeAudioEncoder
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    enc = _make_dummy_audio_encoder()
     metadata = cls.prepare_encoder_metadata(enc, [800, 250])
     assert metadata["aftercnn_lens"] == [104, 33]
     out_meta = cls.forward_with_encoder_metadata(enc, torch.zeros(16, 1050), metadata)
     assert out_meta.shape == (137, 8)
 
-    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is False
-    assert cls.forward is patched_forward
+
+@pytest.mark.parametrize("clip_lens", [[], [0], [0, 0]])
+def test_empty_audio_inputs_derive_output_dim_from_proj2(
+    clip_lens: list[int],
+) -> None:
+    cls = Qwen3OmniMoeAudioEncoder
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    enc = _make_dummy_audio_encoder()
+    assert not hasattr(enc, "output_dim")
+    metadata = cls.prepare_encoder_metadata(enc, clip_lens)
+    out = cls.forward_with_encoder_metadata(enc, torch.zeros(16, 0), metadata)
+    assert out.shape == (0, 8)
+
+
+def test_forward_chunks_raises_not_implemented() -> None:
+    cls = Qwen3OmniMoeAudioEncoder
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    enc = _make_dummy_audio_encoder()
+    metadata = cls.prepare_encoder_metadata(enc, [800])
+    with pytest.raises(NotImplementedError, match="forward_chunks"):
+        cls.forward_chunks(enc, torch.zeros(8, 16, 100), metadata)
+
+
+@pytest.mark.parametrize("n_window_infer", [300, 600, 1200])
+def test_unaligned_attention_window_ratio_raises(n_window_infer: int) -> None:
+    cls = Qwen3OmniMoeAudioEncoder
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    enc = _make_dummy_audio_encoder(n_window_infer=n_window_infer)
+    lens = torch.tensor([800], dtype=torch.long)
+    with pytest.raises(AssertionError, match="divisible"):
+        cls.forward(enc, torch.zeros(16, 800), lens, torch.tensor([104]))
 
 
 @pytest.mark.parametrize(
-    ("clip_lens", "expected_buckets", "expected_cu_prefix"),
+    ("clip_lens", "expected_buckets", "expected_cu_prefixes"),
     [
-        ([250], [8], [0, 33, 104, 105]),
-        ([250, 800], [16], [0, 33, 39, 91, 143, 208, 209]),
+        ([250], [8], [[0, 33, 104, 105]]),
+        ([250, 800], [16], [[0, 33, 39, 91, 143, 208, 209]]),
         (
             [2000, 2000],
             [64],
-            [0, 52, 104, 156, 208, 260, 312, 364, 416, 468, 520, 832],
+            [[0, 52, 104, 156, 208, 260, 312, 364, 416, 468, 520, 832, 833]],
         ),
-        ([25601, 200], [256, 8], [0, 52, 104, 156, 208]),
+        ([6500], [128], [[0, 52, 104, 156, 208]]),
+        (
+            [12801, 200],
+            [128, 8],
+            [[0, 52, 104, 156, 208], [0, 1, 13, 39, 104, 105]],
+        ),
     ],
 )
 def test_audio_encoder_static_bucketing_and_packing(
     clip_lens: list[int],
     expected_buckets: list[int],
-    expected_cu_prefix: list[int],
+    expected_cu_prefixes: list[list[int]],
 ) -> None:
-    """Verify power-of-2 (8..256) bucketing, multi-clip packing, and >256 split."""
+    """Verify power-of-2 bucketing, multi-clip packing, and >128 split layout."""
     assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
-    assert _AUDIO_CHUNK_BUCKETS == (8, 16, 32, 64, 128, 256)
     cls = Qwen3OmniMoeAudioEncoder
 
     seen_conv_batch_sizes: list[int] = []
@@ -221,14 +271,20 @@ def test_audio_encoder_static_bucketing_and_packing(
         expected_seq_lens = [b * 13 for b in expected_buckets for _ in range(2)]
         assert seen_layer_seq_lens == expected_seq_lens
         for cu in seen_cu_seqlens:
-            assert len(cu) == 128
-        assert seen_cu_seqlens[0][: len(expected_cu_prefix)] == expected_cu_prefix
+            assert len(cu) == _CU_SEQLENS_BLOCK_SIZE
+        pass_cu_seqlens = seen_cu_seqlens[::2]
+        assert pass_cu_seqlens == seen_cu_seqlens[1::2]
+        assert len(pass_cu_seqlens) == len(expected_cu_prefixes)
+        for cu, expected_prefix in zip(
+            pass_cu_seqlens, expected_cu_prefixes, strict=True
+        ):
+            assert cu[: len(expected_prefix)] == expected_prefix
 
 
 def test_compiled_bucket_cache_uses_distinct_code_objects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify per-bucket caching and distinct CodeTypes across >8 buckets."""
+    """Verify per-bucket compile caching and distinct CodeTypes across encoders."""
     seen_calls: list[tuple[types.FunctionType, dict[str, object]]] = []
 
     def _fake_compile(fn: types.FunctionType, **kwargs: object) -> types.FunctionType:
@@ -239,14 +295,18 @@ def test_compiled_bucket_cache_uses_distinct_code_objects(
     enc_a = _make_dummy_audio_encoder()
     enc_b = _make_dummy_audio_encoder()
 
-    assert _get_compiled_bucket_fn(enc_a, 8) is _get_compiled_bucket_fn(enc_a, 8)
+    first_bucket = _AUDIO_CHUNK_BUCKETS[0]
+    assert _get_compiled_bucket_fn(enc_a, first_bucket) is _get_compiled_bucket_fn(
+        enc_a, first_bucket
+    )
     assert len(seen_calls) == 1
 
     for b in _AUDIO_CHUNK_BUCKETS:
         _get_compiled_bucket_fn(enc_a, b)
         _get_compiled_bucket_fn(enc_b, b)
 
-    assert len(seen_calls) == 12
-    assert len({fn.__code__ for fn, _ in seen_calls}) == 12
+    expected_total = 2 * len(_AUDIO_CHUNK_BUCKETS)
+    assert len(seen_calls) == expected_total
+    assert len({fn.__code__ for fn, _ in seen_calls}) == expected_total
     for _, kwargs in seen_calls:
         assert kwargs == {"backend": "tpu", "fullgraph": True, "dynamic": False}

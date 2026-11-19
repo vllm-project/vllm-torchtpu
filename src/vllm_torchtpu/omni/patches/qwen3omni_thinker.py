@@ -17,9 +17,9 @@ Fixes two TPU issues across ``vllm-omni`` ``0.32.0rc1`` (``forward``) and
 ``>= 0.33.0rc1`` (``prepare_encoder_metadata`` + ``forward_with_encoder_metadata``):
 1. Evaluates 100-frame window counts with integer division on ``torch.device("cpu")``
    to avoid TPU float32 reciprocal rounding on exact multiples of 100 frames.
-2. Splits clips longer than 256 windows along 256-window (``32 * n_window_infer``)
+2. Splits clips longer than 128 windows along 128-window (``16 * n_window_infer``)
    boundaries, packs consecutive clips into power-of-2 window buckets
-   ``(8, 16, 32, 64, 128, 256)``, and compiles one fused TPU graph per bucket via
+   ``(8, 16, 32, 64, 128)``, and compiles one fused TPU graph per bucket via
    ``torch.compile(..., backend="tpu", fullgraph=True, dynamic=False)``.
 
 TODO: retire the 0.32.0rc1 ``xfail`` test in ``test_qwen3_omni_components.py`` once
@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import types
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -45,7 +45,21 @@ logger = init_logger(__name__)
 _QWEN3_OMNI_ARCH = "Qwen3OmniMoeForConditionalGeneration"
 _CPU_DEVICE = torch.device("cpu")
 _AUDIO_CHUNK_LENGTHS_PATCHED = "_tpu_audio_chunk_lengths_patched"
-_AUDIO_CHUNK_BUCKETS: tuple[int, ...] = (8, 16, 32, 64, 128, 256)
+# Cap at 128 100-frame windows (1,664 = 13 * 128 post-CNN tokens): exact
+# multiple of Pallas FlashAttention's 128-token block size at minimum
+# per-window latency before quadratic 2D masked-tile overhead grows at 256+.
+_AUDIO_CHUNK_BUCKETS: tuple[int, ...] = (8, 16, 32, 64, 128)
+_CU_SEQLENS_BLOCK_SIZE = 128
+# Reserve 1 leading `0` entry plus up to 1 trailing `padded_total` sentinel.
+_CU_SEQLENS_RESERVED_ENTRIES = 2
+
+
+class _MelSubClip(NamedTuple):
+    """Contiguous mel-window slice ready for static-bucket packing."""
+
+    chunks_u8: np.ndarray
+    num_chunks: int
+    valid_tokens: int
 
 
 def _pad_cu_seqlens(
@@ -53,12 +67,14 @@ def _pad_cu_seqlens(
     padded_total: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Pad ``cu_seqlens`` to a multiple of 128, isolating ``[valid, padded_total)``."""
+    """Pad ``cu_seqlens`` to a multiple of ``_CU_SEQLENS_BLOCK_SIZE``."""
     cu = torch.tensor(cu_cpu, dtype=torch.int32, device=_CPU_DEVICE)
     if int(cu[-1].item()) < padded_total:
         tail = torch.tensor([padded_total], dtype=torch.int32, device=_CPU_DEVICE)
         cu = torch.cat([cu, tail])
-    pad_len = ((cu.numel() + 127) // 128) * 128 - cu.numel()
+    pad_len = (
+        (cu.numel() + _CU_SEQLENS_BLOCK_SIZE - 1) // _CU_SEQLENS_BLOCK_SIZE
+    ) * _CU_SEQLENS_BLOCK_SIZE - cu.numel()
     if pad_len > 0:
         cu = F.pad(cu, (0, pad_len), value=padded_total + 1)
     return cu.to(device=device)
@@ -67,14 +83,19 @@ def _pad_cu_seqlens(
 def _prepare_audio_encoder_metadata(
     self: Any, feature_lens: Sequence[int] | torch.Tensor
 ) -> dict[str, Any]:
-    """Compute window and post-CNN token counts with vectorized CPU torch ops."""
+    """Compute host-side window and post-CNN token counts.
+
+    Same as upstream ``Qwen3OmniMoeAudioEncoder.prepare_encoder_metadata``:
+    - Uses ``2 * n_window`` windows and ``_get_cnn_output_lengths`` to derive
+      per-clip ``aftercnn_lens``.
+
+    Adapted for TPU:
+    - Evaluates integer division on ``_CPU_DEVICE`` (avoids 0.32.0rc1 TPU
+      float32 ``ceil`` rounding) and returns bucket-packing counts instead of
+      device ``valid_index`` / ``cu_seqlens`` / ``max_seqlen``.
+    """
     if isinstance(feature_lens, torch.Tensor):
-        lens_cpu = (
-            feature_lens.detach()
-            .cpu()
-            .to(device=_CPU_DEVICE, dtype=torch.long)
-            .reshape(-1)
-        )
+        lens_cpu = feature_lens.detach().cpu().to(dtype=torch.long).reshape(-1)
     else:
         lens_cpu = torch.tensor(
             feature_lens, dtype=torch.long, device=_CPU_DEVICE
@@ -126,16 +147,17 @@ def _pack_mel_windows_cpu(
     window_size: int,
     max_bucket: int,
     tokens_per_chunk: int,
-) -> list[tuple[np.ndarray, int, int]]:
+) -> list[_MelSubClip]:
     """Chunk, zero-pad, and split ``> max_bucket`` mel clips via ``uint8`` views."""
     feats_contig = feats_cpu if feats_cpu.is_contiguous() else feats_cpu.contiguous()
     elem_size = feats_contig.element_size()
     mel_bins = int(feats_contig.shape[0])
+    # View mel frames as raw uint8 bytes because NumPy has no native bfloat16 dtype.
     raw = (
         feats_contig.detach().view(torch.uint8).numpy().reshape(mel_bins, -1, elem_size)
     )
 
-    sub_items: list[tuple[np.ndarray, int, int]] = []
+    sub_items: list[_MelSubClip] = []
     col_off = 0
     for clip_idx, clip_len in enumerate(feature_lens):
         cnn_len = aftercnn_lens[clip_idx]
@@ -161,12 +183,22 @@ def _pack_mel_windows_cpu(
         while rem_chunks > max_bucket:
             sub_toks = max_bucket * tokens_per_chunk
             sub_items.append(
-                (clip_chunks[offset : offset + max_bucket], max_bucket, sub_toks)
+                _MelSubClip(
+                    chunks_u8=clip_chunks[offset : offset + max_bucket],
+                    num_chunks=max_bucket,
+                    valid_tokens=sub_toks,
+                )
             )
             offset += max_bucket
             rem_chunks -= max_bucket
             rem_tokens -= sub_toks
-        sub_items.append((clip_chunks[offset:], rem_chunks, rem_tokens))
+        sub_items.append(
+            _MelSubClip(
+                chunks_u8=clip_chunks[offset:],
+                num_chunks=rem_chunks,
+                valid_tokens=rem_tokens,
+            )
+        )
     return sub_items
 
 
@@ -175,7 +207,19 @@ def _run_static_bucket_pass(
     x: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
-    """Execute one static-shape Conv2d + 32-layer Transformer + MLP pass."""
+    """Execute one static-shape Conv2d + Transformer + MLP pass.
+
+    Same as upstream ``Qwen3OmniMoeAudioEncoder.forward`` (0.32.0rc1) /
+    ``forward_chunks`` (0.33.0rc1):
+    - Runs ``conv2d1..3`` (chunked by ``conv_chunksize``), ``conv_out``,
+      ``positional_embedding``, ``layers``, ``ln_post``, ``proj1``, ``act``,
+      and ``proj2`` in identical order.
+
+    Adapted for TPU:
+    - Skips mid-forward boolean masking (``padded_embed[mask]``) /
+      ``index_select`` and passes ``max_seqlen=None``, keeping ``[b * t, d]``
+      static across ``layers..proj2`` for full-graph ``torch.compile``.
+    """
     if x.size(0) <= encoder.conv_chunksize:
         x = F.gelu(encoder.conv2d1(x))
         x = F.gelu(encoder.conv2d2(x))
@@ -240,13 +284,38 @@ def _padded_forward_with_encoder_metadata(
     input_features: torch.Tensor,
     encoder_metadata: dict[str, Any],
 ) -> torch.Tensor:
-    """Pack clips into ``_AUDIO_CHUNK_BUCKETS`` passes and slice valid token spans."""
+    """Run ``Qwen3OmniMoeAudioEncoder`` over static power-of-2 window buckets.
+
+    Same as upstream ``forward`` / ``forward_with_encoder_metadata``:
+    - Preserves per-clip ``window_aftercnn`` attention segments and returns
+      ``[sum(aftercnn_lens), proj2.output_size]`` on the encoder device.
+
+    Adapted for TPU:
+    - Zero-pads windows on CPU, splits clips >128 windows on attention-window
+      boundaries, packs items into ``_AUDIO_CHUNK_BUCKETS``, isolates padded
+      spans in 128-aligned ``cu_seqlens``, runs per-bucket ``torch.compile``,
+      and slices ``valid_spans`` after ``proj2``.
+    """
+    window_size = self.n_window * 2
+    buckets = _AUDIO_CHUNK_BUCKETS
+    max_bucket = buckets[-1]
+    assert self.n_window_infer > 0 and self.n_window_infer % window_size == 0, (
+        f"n_window_infer ({self.n_window_infer}) must be a positive multiple "
+        f"of 2 * n_window ({window_size})."
+    )
+    chunks_per_attn_window = self.n_window_infer // window_size
+    assert max_bucket % chunks_per_attn_window == 0, (
+        f"max_bucket ({max_bucket}) must be divisible by "
+        f"n_window_infer // (2 * n_window) ({chunks_per_attn_window}) "
+        "so multi-pass splits preserve attention window boundaries."
+    )
+
     device = self.conv2d1.weight.device
     dtype = self.conv2d1.weight.dtype
     feature_lens: list[int] = encoder_metadata["feature_lens"]
     aftercnn_lens: list[int] = encoder_metadata["aftercnn_lens"]
     if len(feature_lens) == 0 or sum(aftercnn_lens) == 0:
-        return torch.empty((0, self.output_dim), device=device, dtype=dtype)
+        return torch.empty((0, self.proj2.output_size), device=device, dtype=dtype)
 
     feats_cpu = (
         input_features.to(dtype=dtype)
@@ -255,11 +324,8 @@ def _padded_forward_with_encoder_metadata(
     )
     mel_bins = int(feats_cpu.shape[0])
     elem_size = feats_cpu.element_size()
-    window_size = self.n_window * 2
     tokens_per_chunk: int = encoder_metadata["tokens_per_chunk"]
-    window_aftercnn = tokens_per_chunk * (self.n_window_infer // window_size)
-    buckets = _AUDIO_CHUNK_BUCKETS
-    max_bucket = buckets[-1]
+    window_aftercnn = tokens_per_chunk * chunks_per_attn_window
 
     sub_items = _pack_mel_windows_cpu(
         feats_cpu=feats_cpu,
@@ -271,21 +337,24 @@ def _padded_forward_with_encoder_metadata(
         tokens_per_chunk=tokens_per_chunk,
     )
 
-    groups: list[list[tuple[np.ndarray, int, int]]] = []
-    cur_group: list[tuple[np.ndarray, int, int]] = []
+    groups: list[list[_MelSubClip]] = []
+    cur_group: list[_MelSubClip] = []
     cur_chunks = 0
-    cur_cu_entries = 2
+    cur_cu_entries = _CU_SEQLENS_RESERVED_ENTRIES
     for item in sub_items:
-        item_cu_entries = (item[2] + window_aftercnn - 1) // window_aftercnn + 1
+        item_cu_entries = (
+            item.valid_tokens + window_aftercnn - 1
+        ) // window_aftercnn + 1
         if (
-            cur_chunks + item[1] > max_bucket or cur_cu_entries + item_cu_entries > 128
+            cur_chunks + item.num_chunks > max_bucket
+            or cur_cu_entries + item_cu_entries > _CU_SEQLENS_BLOCK_SIZE
         ) and len(cur_group) > 0:
             groups.append(cur_group)
             cur_group = []
             cur_chunks = 0
-            cur_cu_entries = 2
+            cur_cu_entries = _CU_SEQLENS_RESERVED_ENTRIES
         cur_group.append(item)
-        cur_chunks += item[1]
+        cur_chunks += item.num_chunks
         cur_cu_entries += item_cu_entries
     if len(cur_group) > 0:
         groups.append(cur_group)
@@ -293,7 +362,7 @@ def _padded_forward_with_encoder_metadata(
     is_tpu = device.type == "tpu"
     outputs: list[torch.Tensor] = []
     for group in groups:
-        group_chunks = sum(it[1] for it in group)
+        group_chunks = sum(sub.num_chunks for sub in group)
         num_chunks = next(b for b in buckets if group_chunks <= b)
         x_np = np.zeros(
             (num_chunks, 1, mel_bins, window_size * elem_size), dtype=np.uint8
@@ -301,11 +370,11 @@ def _padded_forward_with_encoder_metadata(
         cu_list = [0]
         valid_spans: list[tuple[int, int]] = []
         local_chunk_off = 0
-        for sub_idx, (sub_arr, sub_n_chunks, sub_valid_toks) in enumerate(group):
-            x_np[local_chunk_off : local_chunk_off + sub_n_chunks, 0] = sub_arr
+        for sub_idx, sub in enumerate(group):
+            x_np[local_chunk_off : local_chunk_off + sub.num_chunks, 0] = sub.chunks_u8
             row_start = local_chunk_off * tokens_per_chunk
-            row_valid_end = row_start + sub_valid_toks
-            row_chunk_end = (local_chunk_off + sub_n_chunks) * tokens_per_chunk
+            row_valid_end = row_start + sub.valid_tokens
+            row_chunk_end = (local_chunk_off + sub.num_chunks) * tokens_per_chunk
             if len(valid_spans) > 0 and valid_spans[-1][1] == row_start:
                 valid_spans[-1] = (valid_spans[-1][0], row_valid_end)
             else:
@@ -317,7 +386,7 @@ def _padded_forward_with_encoder_metadata(
             cu_list.append(row_valid_end)
             if sub_idx + 1 < len(group) and row_valid_end < row_chunk_end:
                 cu_list.append(row_chunk_end)
-            local_chunk_off += sub_n_chunks
+            local_chunk_off += sub.num_chunks
 
         x = torch.from_numpy(x_np).view(dtype).to(device=device)
         cu_seqlens = _pad_cu_seqlens(
@@ -333,6 +402,19 @@ def _padded_forward_with_encoder_metadata(
             outputs.append(hidden_states[span_start:span_end])
 
     return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+
+def _unimplemented_forward_chunks(
+    self: Any,
+    padded_feature: torch.Tensor,
+    metadata: dict[str, Any],
+) -> torch.Tensor:
+    """Fail fast if upstream CUDA-graph ``forward_chunks`` is called on TPU."""
+    del self, padded_feature, metadata
+    raise NotImplementedError(
+        "Qwen3OmniMoeAudioEncoder.forward_chunks CUDA-graph capture is not "
+        "supported on TPU; use forward_with_encoder_metadata instead."
+    )
 
 
 def _padded_audio_forward(
@@ -358,6 +440,7 @@ def _patch_audio_encoder(encoder_cls: type[Any]) -> bool:
     encoder_cls._tpu_orig_forward = orig_forward
     encoder_cls.prepare_encoder_metadata = _prepare_audio_encoder_metadata
     encoder_cls.forward_with_encoder_metadata = _padded_forward_with_encoder_metadata
+    encoder_cls.forward_chunks = _unimplemented_forward_chunks
     encoder_cls.forward = _padded_audio_forward
     return True
 
