@@ -176,6 +176,16 @@ from vllm_torchtpu.runner import repetition_penalty as repetition_penalty_tracke
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
+from vllm_torchtpu.runner.metadata_req_bucketing import (
+    activate_wrapper_states,
+    build_warmup_req_groups,
+    capture_wrapper_states,
+    find_compile_wrappers,
+    metadata_req_bucket_scope,
+    record_metadata_step,
+    resolve_req_buckets,
+    select_target_num_reqs,
+)
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
     maybe_create_mm_encoder_manager,
@@ -914,6 +924,9 @@ class TPUModelRunner(GPUModelRunner):
         self._prefill_ckpt_units: PrefillCheckpointUnits | None = None
         self._prefill_ckpt_offsets_cpu: torch.Tensor | None = None
         self._prefill_ckpt_zero_offsets: dict[int, torch.Tensor] = {}
+        self._req_bucket_states: dict[int, list[tuple[Any, dict[str, Any]]]] = {}
+        self._current_target_num_reqs: int | None = None
+        self._compiling_req_bucket: bool = False
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
@@ -3657,17 +3670,40 @@ class TPUModelRunner(GPUModelRunner):
             self.position_ids = self.positions_cpu[local_token_slice].to(
                 self.device, non_blocking=True
             )
+        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
+        req_bucketing_on = TPUModelRunner._metadata_req_bucketing_enabled(self)
         if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
+            if req_bucketing_on:
+                target_num_reqs = select_target_num_reqs(
+                    num_tokens_padded=int(padded_total_num_scheduled_tokens),
+                    min_token_bucket=int(self.num_tokens_paddings[0]),
+                    active_num_reqs=int(num_reqs),
+                    is_decode_only=is_decode_only,
+                    req_buckets=TPUModelRunner._resolved_metadata_req_buckets(self),
+                    max_reqs_cap=self.num_reqs_max_model_len,
+                )
+                self.seq_lens_np[num_reqs:target_num_reqs] = 0
+                record_metadata_step(
+                    num_tokens_padded=int(padded_total_num_scheduled_tokens),
+                    target_num_reqs=target_num_reqs,
+                    is_decode_only=is_decode_only,
+                    max_num_seqs_cap=self.num_reqs_max_model_len,
+                )
+            else:
+                target_num_reqs = self.num_reqs_max_model_len
+            seq_lens = self.seq_lens_cpu[:target_num_reqs].to(
                 self.device, non_blocking=True
             )
-            target_num_reqs = self.num_reqs_max_model_len
+            self._current_target_num_reqs = (
+                target_num_reqs if req_bucketing_on else None
+            )
         else:
             assert self.num_reqs_most_model_len is not None
             seq_lens = self.seq_lens_cpu[: self.num_reqs_most_model_len].to(
                 self.device, non_blocking=True
             )
             target_num_reqs = self.num_reqs_most_model_len
+            self._current_target_num_reqs = None
 
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
@@ -3712,11 +3748,11 @@ class TPUModelRunner(GPUModelRunner):
 
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
-        # change between decode steps for a given (num_reqs, padded_num_reqs).
-        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
+        # change across decode steps for a given (num_reqs, padded, target_num_reqs).
         decode_cache_key = (
             num_reqs,
             padded_num_reqs,
+            target_num_reqs,
             use_max_model_len,
             layout_descriptor.cache_key,
         )
@@ -3804,7 +3840,7 @@ class TPUModelRunner(GPUModelRunner):
             # steps miss the decode cache above but usually repeat the same
             # query_start_loc, so reuse the last upload while it matches.
             if use_max_model_len:
-                qsl_host = self.query_start_loc_cpu[: self.num_reqs_max_model_len + 1]
+                qsl_host = self.query_start_loc_cpu[: target_num_reqs + 1]
             else:
                 assert self.num_reqs_most_model_len is not None
                 qsl_host = self.query_start_loc_cpu[: self.num_reqs_most_model_len + 1]
@@ -6814,12 +6850,19 @@ class TPUModelRunner(GPUModelRunner):
                     inputs.append(self._pp_topk_buffer)
                 synchronize_tensors(inputs)
             started = time.perf_counter()
-            out, _ = self.forward_model(
-                input_ids=input_ids,
-                positions=position_ids,
-                inputs_embeds=inputs_embeds,
-                intermediate_tensors=intermediate_tensors,
-            )
+            prev_target_reqs = getattr(self, "_current_target_num_reqs", None)
+            if not getattr(self, "_compiling_req_bucket", False):
+                self._current_target_num_reqs = num_reqs if use_max_model_len else None
+            try:
+                out, _ = self.forward_model(
+                    input_ids=input_ids,
+                    positions=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    intermediate_tensors=intermediate_tensors,
+                )
+            finally:
+                if not getattr(self, "_compiling_req_bucket", False):
+                    self._current_target_num_reqs = prev_target_reqs
             if isinstance(out, IntermediateTensors):
                 if through_handoff:
                     # The output leaves at the bucket's row count; it is
@@ -7981,6 +8024,34 @@ class TPUModelRunner(GPUModelRunner):
         top = _get_padded_token_len(self.num_tokens_paddings, cap)
         return [n for n in self.num_tokens_paddings if n <= top]
 
+    def _metadata_req_bucketing_enabled(self) -> bool:
+        if not bool(envs.TPU_METADATA_REQ_BUCKETING):
+            return False
+        if bool(envs.TPU_PRECOMPILE_TRACE_FIRST):
+            return False
+        pc = getattr(self, "parallel_config", None)
+        if pc is not None:
+            if int(getattr(pc, "pipeline_parallel_size", 1)) > 1:
+                return False
+            dp_size = utils.get_dp_size(pc) if hasattr(pc, "data_parallel_size") else 1
+            if dp_size > 1:
+                return False
+        return (
+            getattr(self, "pcp_manager", None) is None
+            and getattr(self, "speculative_config", None) is None
+            and getattr(self, "most_model_len", None) is None
+            and getattr(self, "lora_config", None) is None
+            and not bool(getattr(self, "enforce_eager", False))
+            and int(getattr(self, "num_reqs_max_model_len", 0)) >= 1
+            and bool(getattr(self, "num_tokens_paddings", None))
+        )
+
+    def _resolved_metadata_req_buckets(self) -> list[int]:
+        return resolve_req_buckets(
+            envs.TPU_METADATA_REQ_BUCKETS,
+            self.num_reqs_max_model_len,
+        )
+
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.
 
@@ -8007,6 +8078,78 @@ class TPUModelRunner(GPUModelRunner):
                 "before deferred compiles finish, writing an empty artifact. "
                 "Set VLLM_USE_MEGA_AOT_ARTIFACT=0 (the TPU default)."
             )
+        if self._metadata_req_bucketing_enabled():
+            from vllm.compilation.wrapper import reset_compile_wrapper
+            from vllm.config import set_current_vllm_config
+
+            cc = self.vllm_config.compilation_config
+            orig_sizes = list(cc.compile_sizes or [])
+            orig_cache = (cc.cache_dir, cc.local_cache_dir)
+            groups = build_warmup_req_groups(
+                self._backbone_token_paddings(),
+                self._resolved_metadata_req_buckets(),
+                self.num_reqs_max_model_len,
+            )
+            self._req_bucket_states = {}
+            self._compiling_req_bucket = True
+            self._current_target_num_reqs = None
+            try:
+                for idx, (req_cap, tok_list) in enumerate(groups):
+                    if idx > 0:
+                        for w in find_compile_wrappers(self.model):
+                            w.cleanup()
+                    cc.compile_sizes = list(tok_list)
+                    for w in find_compile_wrappers(self.model):
+                        w_vcfg = getattr(w, "vllm_config", None)
+                        if w_vcfg is not None:
+                            w_vcfg.compilation_config.compile_sizes = list(tok_list)
+                        w_ccfg = getattr(w, "compilation_config", None)
+                        if w_ccfg is not None:
+                            w_ccfg.compile_sizes = list(tok_list)
+                    with set_current_vllm_config(self.vllm_config):
+                        reset_compile_wrapper(self.model)
+                    cc.cache_dir = ""
+                    cc.local_cache_dir = ""
+                    logger.info(
+                        "  -- metadata_req_bucket: %d, token_buckets: %s",
+                        req_cap,
+                        tok_list,
+                    )
+                    with (
+                        metadata_req_bucket_scope(req_cap),
+                        shape_variants.warmup() as buckets,
+                    ):
+                        for num_tokens in tok_list:
+                            logger.info(
+                                "     num_tokens=%d, req_cap=%d", num_tokens, req_cap
+                            )
+                            if buckets.needs_retrace(num_tokens):
+                                shape_variants.retrace(self.model, self.vllm_config)
+                            self._dummy_run(
+                                num_tokens,
+                                req_cap,
+                                self.max_num_blocks_per_req,
+                                use_max_model_len=True,
+                            )
+                        if buckets.refused:
+                            raise shape_variants.ShapeSpecializationError(
+                                "warmup left token buckets uncompiled for "
+                                f"req_cap={req_cap}: {sorted(buckets.refused)}"
+                            )
+                    self._req_bucket_states[req_cap] = capture_wrapper_states(
+                        self.model
+                    )
+            finally:
+                self._compiling_req_bucket = False
+                cc.compile_sizes = list(orig_sizes)
+                cc.cache_dir, cc.local_cache_dir = orig_cache
+                if self.num_reqs_max_model_len in self._req_bucket_states:
+                    activate_wrapper_states(
+                        self._req_bucket_states[self.num_reqs_max_model_len]
+                    )
+            if self._pp_handoff is not None:
+                self._warmup_handoff_forwards()
+            return
         with shape_variants.warmup() as buckets:
             with (
                 shape_variants.trace_only() if trace_first else contextlib.nullcontext()
@@ -9183,6 +9326,19 @@ class TPUModelRunner(GPUModelRunner):
     ):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
+        req_states = getattr(self, "_req_bucket_states", None)
+        cur_req_cap = getattr(self, "_current_target_num_reqs", None)
+        if (
+            req_states
+            and cur_req_cap is not None
+            and not getattr(self, "_compiling_req_bucket", False)
+        ):
+            if cur_req_cap not in req_states:
+                raise RuntimeError(
+                    f"Uncompiled metadata request bucket {cur_req_cap}; "
+                    f"compiled={sorted(req_states)}"
+                )
+            activate_wrapper_states(req_states[cur_req_cap])
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors

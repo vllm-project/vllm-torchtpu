@@ -218,6 +218,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_MEGAKERNEL: str = ""
+    TPU_METADATA_REQ_BUCKETING: bool = False
+    TPU_METADATA_REQ_BUCKETS: list[int] = [4, 8, 16, 256]
 
 
 def env_with_choices(
@@ -336,6 +338,41 @@ def _nonnegative(parse: Callable[[], Any], env_name: str) -> Callable[[], Any]:
         return value
 
     return _get_nonnegative_env
+
+
+def env_positive_int_list(env_name: str, default: list[int]) -> Callable[[], list[int]]:
+    """Comma-separated list of positive integers.
+
+    Unset or blank reads as a fresh copy of ``default``; any empty item,
+    non-integer token, or value <= 0 raises ``ValueError``.
+    """
+
+    def _get_positive_int_list_env() -> list[int]:
+        raw = os.getenv(env_name)
+        if raw is None or raw.strip() == "":
+            return list(default)
+        out: list[int] = []
+        for item in raw.split(","):
+            tok = item.strip()
+            if not tok:
+                raise ValueError(
+                    f"Invalid value '{raw}' for {env_name}: "
+                    "empty entry in comma-separated list."
+                )
+            try:
+                val = int(tok)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid value '{raw}' for {env_name}: '{tok}' is not an integer."
+                ) from exc
+            if val <= 0:
+                raise ValueError(
+                    f"Invalid value '{raw}' for {env_name}: '{tok}' must be > 0."
+                )
+            out.append(val)
+        return out
+
+    return _get_positive_int_list_env
 
 
 def env_float(env_name: str, default: float) -> Callable[[], float]:
@@ -579,9 +616,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable the blockwise Pallas quantized matmul kernel for dense linears.
     "ENABLE_QUANTIZED_MATMUL_KERNEL": env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
     # Runtime block size for dense linear weight requantization.
-    "REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    "REQUANTIZE_BLOCK_SIZE": lambda: (
+        int(block_size)
+        if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None
+        else None
+    ),
     # Runtime dtype for dense linear weight requantization.
     "REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -608,9 +647,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
     # Selecting MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically.
     # Other MoE paths retain their default, including explicit requantization.
-    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: (
+        int(block_size)
+        if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
+        else None
+    ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
@@ -832,9 +873,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MLA_MASKED_DENSE_MAX_KV_LEN"
     ),
     # Most model length cap for TPU compile bucketing
-    "VLLM_TPU_MOST_MODEL_LEN": lambda: int(val)
-    if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None
-    else None,
+    "VLLM_TPU_MOST_MODEL_LEN": lambda: (
+        int(val) if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None
+    ),
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
@@ -1066,16 +1107,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
-    "TPU_PCP_TOPOLOGY_AWARE_MESH": lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1")
-    .strip()
-    .lower()
-    not in ("0", "false", "off", "no"),
+    "TPU_PCP_TOPOLOGY_AWARE_MESH": lambda: (
+        os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower()
+        not in ("0", "false", "off", "no")
+    ),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
-    "USE_RPA_PIPELINED_DMA_STAGING": lambda: env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
-    or env_bool("USE_PIPELINED_DMA_STAGING")(),
-    "USE_PIPELINED_DMA_STAGING": lambda: env_bool("USE_PIPELINED_DMA_STAGING")()
-    or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
+    "USE_RPA_PIPELINED_DMA_STAGING": lambda: (
+        env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
+        or env_bool("USE_PIPELINED_DMA_STAGING")()
+    ),
+    "USE_PIPELINED_DMA_STAGING": lambda: (
+        env_bool("USE_PIPELINED_DMA_STAGING")()
+        or env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
+    ),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.
@@ -1335,6 +1380,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
     # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").
     "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
+    # Opt-in request metadata bucketing for attention and GDN metadata tensors.
+    # Keeps global max_num_seqs unchanged while sizing per-step request metadata
+    # arrays to the smallest configured bucket in TPU_METADATA_REQ_BUCKETS.
+    "TPU_METADATA_REQ_BUCKETING": env_bool("TPU_METADATA_REQ_BUCKETING", False),
+    "TPU_METADATA_REQ_BUCKETS": env_positive_int_list(
+        "TPU_METADATA_REQ_BUCKETS", [4, 8, 16, 256]
+    ),
 }
 
 

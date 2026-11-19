@@ -46,6 +46,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
+| `TPU_METADATA_REQ_BUCKETING` | `False` | Opt-in. Sizes per-step attention and GDN request metadata tensors (`seq_lens`, `query_start_loc`, `block_tables`, `mamba_state_indices`, and `mamba_prefill_ckpt_offsets`) to the smallest bucket in `TPU_METADATA_REQ_BUCKETS` covering the step's active requests and padded token bucket, while keeping global `max_num_seqs` admission unchanged. |
+| `TPU_METADATA_REQ_BUCKETS` | `[4, 8, 16, 256]` | Comma-separated positive integer request metadata bucket sizes used when `TPU_METADATA_REQ_BUCKETING=1` (automatically capped at and extended with `num_reqs_max_model_len`). |
 
 Removed pipeline variables. Startup with pipeline parallelism fails while any of them is set:
 
