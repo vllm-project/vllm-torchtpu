@@ -89,16 +89,22 @@ def enabled(monkeypatch):
     return op
 
 
+def _logs(monkeypatch):
+    logs = SimpleNamespace(warning=Mock(), info=Mock())
+    monkeypatch.setattr(scores.logger, "warning", logs.warning)
+    monkeypatch.setattr(scores.logger, "info", logs.info)
+    return logs
+
+
 def test_disabled_builds_and_logs_nothing(monkeypatch):
     monkeypatch.setattr(scores, "enabled", lambda vllm_config: False)
     monkeypatch.setattr(scores, "_LAYERS", [])
+    logs = _logs(monkeypatch)
     assert scores.prebuild(method(), make_layer(use_ep=False), "gelu") is None
     scores.log_summary()
-
-
-def test_layer_without_expert_parallelism_is_declined_not_refused(enabled):
-    assert scores.prebuild(method(), make_layer(use_ep=False), "silu") is None
-    scores.log_summary()
+    assert scores._LAYERS == []
+    logs.warning.assert_not_called()
+    logs.info.assert_not_called()
 
 
 def test_plain_softmax_router_moves_into_the_kernel(enabled):
@@ -128,10 +134,25 @@ def test_layer_the_kernel_cannot_serve_is_reported_at_the_summary(
     assert re.search(f"cannot serve.*{match}", message % tuple(args))
 
 
-@pytest.mark.parametrize("owner", ["adaptive", "v2"])
-def test_layer_a_fused_path_owns_is_declined_not_refused(enabled, owner):
+@pytest.mark.parametrize(
+    "owner, reason",
+    [
+        ("adaptive", "adaptive fused MoE owns the layer"),
+        ("v2", "the fused EP kernel owns the layer"),
+    ],
+)
+def test_layer_a_fused_path_owns_is_declined_not_refused(
+    enabled, monkeypatch, owner, reason
+):
+    """A layer the kernel cannot serve but a fused path owns is counted as
+    declined in the summary line, not warned about as unservable."""
+    logs = _logs(monkeypatch)
     scores.prebuild(method(owner), make_layer(use_ep=False), "silu")
     scores.log_summary()
+    logs.warning.assert_not_called()
+    (message, *args), _ = logs.info.call_args
+    line = message % tuple(args)
+    assert "0/1 MoE layers armed" in line and f"1 x {reason}" in line
 
 
 @pytest.mark.parametrize(
