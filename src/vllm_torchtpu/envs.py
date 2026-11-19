@@ -264,6 +264,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
+    TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT: str = ""
 
 
 def env_with_choices(
@@ -1696,6 +1697,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "qk8": fp8 queries x fp8 keys (int4 keys are exact in fp8) on the MXU;
     # "pv8": fp8 probabilities (carrying the V scales) x fp8 int4 values.
     # Not bit-identical.
+    # MiniMax M3 MSA prefill attention on fp8 KV caches: "exp16" runs the
+    # softmax exp in bf16 (p enters p @ v in bf16 anyway). Not bitwise; empty
+    # (default) = off.
+    "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT": env_str(
+        "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT", ""
+    ),
     "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION", ""
     ),
