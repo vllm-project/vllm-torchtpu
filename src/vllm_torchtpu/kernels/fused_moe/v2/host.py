@@ -25,8 +25,9 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
-FP8_MAX = 448.0
-FP8 = jnp.float8_e4m3fn
+from vllm_torchtpu.kernels.fp8_wire import FP8, FP8_E4M3_MAX
+
+FP8_MAX = FP8_E4M3_MAX
 # Storage only: there is no four-bit MXU, so each block is widened to e4m3.
 FP4 = jnp.float4_e2m1fn
 # Default scale block along the contraction axis for a block-scaled weight.
