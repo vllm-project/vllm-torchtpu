@@ -52,7 +52,11 @@ def _assert_parity(tokens, geometry, interpret, tile=None):
         kw["tile"] = tile
     got = jax.block_until_ready(qk_norm_rope_gate(*operands, **kw, interpret=interpret))
     kw.pop("tile", None)
-    want = reference(*operands, **kw)
+    # The reference runs on the host, so on a TPU it shares no lowering with
+    # the kernel.
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        want = reference(*jax.device_put(operands, cpu), **kw)
     for a, b in zip(got, want):
         assert a.shape == b.shape and a.dtype == b.dtype
         np.testing.assert_allclose(

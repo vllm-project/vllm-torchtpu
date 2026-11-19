@@ -151,7 +151,13 @@ def test_compiled_kernel_matches_the_two_step_path_on_tpu(heads, tokens, z_2d):
     if z_2d:
         z = z.reshape(tokens, -1)
     q, s = jax.block_until_ready(gnq.gated_norm_quant(o, z, w, 1e-6))
-    q_ref, s_ref = jax.block_until_ready(gnq.reference(o, z, w, 1e-6))
+    # The reference runs on the host, so it shares no TPU lowering with the
+    # kernel.
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        q_ref, s_ref = jax.block_until_ready(
+            gnq.reference(*jax.device_put((o, z, w), cpu), 1e-6)
+        )
     # The fp8 rows take the gate's shape, 3D or 2D.
     assert q.shape == q_ref.shape == z.shape
     assert q.dtype == q_ref.dtype == jnp.float8_e4m3fn
