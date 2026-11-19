@@ -6003,9 +6003,15 @@ class TPUModelRunner(GPUModelRunner):
                 dev_idx = self.device.index or 0
                 # torch_tpu adds torch.tpu at runtime; torch's stubs do not declare it.
                 # pyrefly: ignore[missing-attribute]
-                default_gens = getattr(torch.tpu, "default_generators", ())
-                if dev_idx < len(default_gens):
-                    default_gens[dev_idx].manual_seed(seed)
+                default_gens = torch.tpu.default_generators
+                if dev_idx >= len(default_gens):
+                    raise RuntimeError(
+                        f"torch.tpu.default_generators has no generator for TPU "
+                        f"device {dev_idx} ({len(default_gens)} generators), so "
+                        "the candidate samplers' in-graph draws cannot be seeded "
+                        "alike on every rank"
+                    )
+                default_gens[dev_idx].manual_seed(seed)
             self._sampling_generator = gen
         return self._sampling_generator
 
