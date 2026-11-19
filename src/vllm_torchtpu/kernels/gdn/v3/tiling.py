@@ -44,12 +44,18 @@ def decode_tile_target(num_seqs: int, n_v: int) -> int:
 _HIGH_V_HEAD_THRESHOLD = 64
 _MIN_HIGH_V_HEAD_BATCH_TOKENS_FOR_C128 = 2048
 
-# Guard 2: in a mixed batch, use C = 128 only if the prefill part has at least
-# max(256, 28 * n_v) tokens. Bigger chunks save a fixed setup cost per chunk, but
-# each prefill sequence is padded up to a whole chunk, and that padding costs
-# work on every value head. The crossover is about 28 tokens per value head.
-_MIN_MIXED_PREFILL_TOKENS_FLOOR = 256
-_MIN_MIXED_PREFILL_TOKENS_PER_V_HEAD = 28
+# Guard 2: in a mixed batch, use C = 128 only if at least 256 prefill tokens
+# (two 128-token chunks) can remain once every other active slot is assumed to
+# be a decode or verify window. Bigger chunks save a fixed setup cost per chunk,
+# but each prefill sequence is padded up to a whole chunk, and on a short,
+# ragged prefill part that padding costs more than the setup it saves. The
+# bound is a fixed token count rather than one that grows with the head count:
+# a per-head bound would also cap a lone prefill of a few hundred tokens in the
+# smallest request bucket, which runs 10% to 20% slower at C = 64.
+_MIN_MIXED_PREFILL_TOKENS = 256
+
+# The chunk size both guards fall back to (64).
+_CAPPED_MIXED_TILE_SIZE = MIXED_TILE_SIZES[1]
 
 
 def has_prefill_tokens(batch_size: int, active_num_seqs: int, window_size: int) -> bool:
@@ -93,14 +99,15 @@ def mixed_tile_target(
     2. Fragmented mixed steps: up to `active_num_seqs - 1` slots hold
        `window_size`-token decodes, leaving
        `batch_size - (active_num_seqs - 1) * window_size` prefill tokens. Below
-       `max(256, 28 * n_v)` of them, 128-token ragged-tail padding costs more
-       than the per-chunk overhead it saves.
+       256 of them, 128-token ragged-tail padding costs more than the per-chunk
+       overhead it saves.
 
     Pure decode/verify buckets (no prefill tokens, see `has_prefill_tokens`)
     are left uncapped at 128.
 
     Args:
-        batch_size: Total unpadded token count in the batch.
+        batch_size: Token count of the compiled batch bucket (`qkv.shape[0]`),
+            which the caller has already padded; not the number of live tokens.
         active_num_seqs: Upper bound on active sequences in the batch.
         n_v: Number of value heads per device.
         window_size: Tokens per decode or speculative-verify sequence.
@@ -115,7 +122,7 @@ def mixed_tile_target(
         n_v >= _HIGH_V_HEAD_THRESHOLD
         and batch_size < _MIN_HIGH_V_HEAD_BATCH_TOKENS_FOR_C128
     ):
-        return min(max_chunk, 64)
+        return _CAPPED_MIXED_TILE_SIZE
 
     # Guard 2: ragged-tail padding on fragmented mixed steps. Only a batch
     # with more than one active sequence and at least one prefill token can
@@ -126,12 +133,8 @@ def mixed_tile_target(
         effective_prefill_tokens = min_prefill_tokens_in_batch(
             batch_size, active_num_seqs, window_size
         )
-        min_prefill_tokens = max(
-            _MIN_MIXED_PREFILL_TOKENS_FLOOR,
-            _MIN_MIXED_PREFILL_TOKENS_PER_V_HEAD * n_v,
-        )
-        if effective_prefill_tokens < min_prefill_tokens:
-            return min(max_chunk, 64)
+        if effective_prefill_tokens < _MIN_MIXED_PREFILL_TOKENS:
+            return _CAPPED_MIXED_TILE_SIZE
 
     return max_chunk
 

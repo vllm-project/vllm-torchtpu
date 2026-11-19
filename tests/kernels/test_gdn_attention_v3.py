@@ -647,17 +647,25 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
             ("n64_single_b2048", 64, 2048, 1, 1, 128),
             ("n64_mixed_b2048_n32", 64, 2048, 32, 1, 128),
             ("n64_mixed_b8192_n49", 64, 8192, 49, 1, 128),
-            # Guard 2: fewer than max(256, 28 * n_v) prefill tokens remain after
+            # Guard 2: fewer than 256 prefill tokens remain after
             # (active_num_seqs - 1) decodes of window_size tokens each.
             ("n8_ragged_b248_n16", 8, 248, 16, 1, 64),  # 233 < 256
             ("n8_mixed_b512_n280", 8, 512, 280, 1, 64),  # 233 < 256
             ("n8_mixed_b1024_n64", 8, 1024, 64, 1, 128),  # 961 >= 256
-            ("n16_mixed_b1024_n329", 16, 1024, 329, 1, 128),  # 696 >= 448
-            ("n16_mixed_b1024_n600", 16, 1024, 600, 1, 64),  # 425 < 448
-            ("n32_mixed_b1024_n16", 32, 1024, 16, 1, 128),  # 1009 >= 896
-            ("n32_mixed_b1024_n160", 32, 1024, 160, 1, 64),  # 865 < 896
-            ("n32_mixed_b2048_n32", 32, 2048, 32, 1, 128),  # 2017 >= 896
-            ("n32_verify_w4_b1024_n64", 32, 1024, 64, 4, 64),  # 772 < 896
+            ("n16_mixed_b1024_n329", 16, 1024, 329, 1, 128),  # 696 >= 256
+            ("n16_mixed_b1024_n600", 16, 1024, 600, 1, 128),  # 425 >= 256
+            ("n32_mixed_b1024_n16", 32, 1024, 16, 1, 128),  # 1009 >= 256
+            ("n32_mixed_b1024_n160", 32, 1024, 160, 1, 128),  # 865 >= 256
+            ("n32_mixed_b2048_n32", 32, 2048, 32, 1, 128),  # 2017 >= 256
+            ("n32_verify_w4_b1024_n64", 32, 1024, 64, 4, 128),  # 772 >= 256
+            # 63 verify windows plus a 132-token prefill (or one 384-token
+            # prefill; the bucket shape cannot tell them apart).
+            ("n8_verify_w4_b384_n64", 8, 384, 64, 4, 64),  # 132 < 256
+            ("n32_verify_w4_b384_n64", 32, 384, 64, 4, 64),  # 132 < 256
+            # A lone prefill in the 8-slot request bucket is not capped.
+            ("n16_lone_b384_n8", 16, 384, 8, 1, 128),  # 377 >= 256
+            ("n32_lone_b384_n8", 32, 384, 8, 1, 128),  # 377 >= 256
+            ("n32_lone_b768_n8", 32, 768, 8, 1, 128),  # 761 >= 256
             # Single sequences below 64 heads and decode/verify buckets stay at 128.
             ("n8_single_b1024", 8, 1024, 1, 1, 128),
             ("n32_single_b256", 32, 256, 1, 1, 128),
@@ -672,7 +680,9 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
     def test_get_tile_sizes_takes_min_of_vmem_fit_and_mixed_tile_target(self):
         """mixed_tile_size = min(mixed_tile_target, VMEM fit) unless overridden."""
         d_k, d_v, kernel_size, n_kq, n_v = 128, 128, 4, 8, 64  # Qwen 3.8 at TP=2
-        limit_192mib = int(0.80 * 192 * 1024 * 1024)
+        # A budget large enough that VMEM never binds, so the speed target alone
+        # decides; it stands for no particular chip.
+        limit_unbounded = 1 << 30
         mesh = AbstractMesh(
             (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
         )
@@ -700,13 +710,13 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                     mixed_tile_size=override,
                 )[1]
 
-            # 192 MiB VMEM fits C=128 at n_v=64, but the target caps 1,024-token steps.
-            self.assertEqual(mixed_tile(1024, 93, limit_192mib), 64)
-            self.assertEqual(mixed_tile(8192, 1, limit_192mib), 128)
+            # Where C=128 fits at n_v=64, the target still caps 1,024-token steps.
+            self.assertEqual(mixed_tile(1024, 93, limit_unbounded), 64)
+            self.assertEqual(mixed_tile(8192, 1, limit_unbounded), 128)
             # 64 MiB VMEM cannot fit C=128 at n_v=64 even where the target allows it.
             self.assertEqual(mixed_tile(8192, 1, limit_64mib), 64)
             # An explicit mixed_tile_size bypasses the heuristic.
-            self.assertEqual(mixed_tile(1024, 93, limit_192mib, override=128), 128)
+            self.assertEqual(mixed_tile(1024, 93, limit_unbounded, override=128), 128)
 
 
 class GDNStatePipelineRaceTest(parameterized.TestCase):
