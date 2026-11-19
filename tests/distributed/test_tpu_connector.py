@@ -3469,6 +3469,66 @@ class TestTPURaidenConnectorWorker:
         assert kwargs["transfer_pool_tags"][0] == "fa"
         assert "dst_skip_bytes" not in kwargs
 
+    def test_inline_sharded_leader_path_reports_a_released_transfer(self):
+        """A released failure is "released"; the same text as a plain
+        RuntimeError stays "uncertain"."""
+
+        class TransferReleasedError(RuntimeError):
+            pass
+
+        fake_client = MagicMock()
+        fake_client.TransferReleasedError = TransferReleasedError
+        torch_pkg = MagicMock()
+        torch_pkg.reshard_client = fake_client
+        modules = {
+            "tpu_sync": MagicMock(),
+            "tpu_sync.api": MagicMock(),
+            "tpu_sync.api.torch": torch_pkg,
+            "tpu_sync.api.torch.reshard_client": fake_client,
+        }
+        worker = _make_raiden_worker(
+            is_producer=False, block_size=1024, tp_rank=0, tp_size=2
+        )
+        worker._stage3_source_facades["prefill-controller.test:27000"] = MagicMock()
+        req_meta = _Stage3LoadMeta(
+            uuid=1999,
+            source_req_id="src-long",
+            local_block_ids=[50, 51],
+            num_tokens=2047,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+        )
+        text = "Remote Controller Server execution failed: injected arm refusal"
+        statuses = []
+        for error in (TransferReleasedError(text), RuntimeError(text)):
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(
+                    worker, "_stage3_source_work_units", return_value=[MagicMock()]
+                ),
+                patch.object(
+                    worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)
+                ),
+                patch.object(
+                    worker, "_start_stage3_transfer_with_d5_retry", side_effect=error
+                ),
+            ):
+                outcome = worker._submit_stage3_load_as_leader(
+                    req_meta=req_meta,
+                    source_req_id="src-long",
+                    destination_req_id="dst-long",
+                    uuid=1999,
+                    num_tokens=2047,
+                    local_blocks=[50, 51],
+                    dst_controller_address="10.0.0.2:28000",
+                    dst_units=[MagicMock(), MagicMock()],
+                )
+            statuses.append(outcome[0])
+        assert statuses == ["released", "uncertain"]
+
     @pytest.mark.parametrize("hybrid", [False, True])
     def test_stage3_consumer_window_kwarg_only_for_requests_over_the_window(
         self, hybrid
@@ -5013,6 +5073,61 @@ class TestTPURaidenConnectorWorker:
             assert worker._load_block_ids["dst-late"] == [11, 12]
         assert facade.start_transfer.call_count == 1
 
+    @pytest.mark.parametrize("prior_state", [None, "accepted", "uncertain"])
+    def test_stage3_released_transfer_frees_blocks(self, prior_state):
+        """A released failure frees the blocks at once, unless an earlier
+        attempt was accepted or is still uncertain."""
+
+        class TransferReleasedError(RuntimeError):
+            pass
+
+        # The import reads reshard_client off the package, so set it there too.
+        fake_client = MagicMock()
+        fake_client.TransferReleasedError = TransferReleasedError
+        torch_pkg = MagicMock()
+        torch_pkg.reshard_client = fake_client
+        modules = {
+            "tpu_sync": MagicMock(),
+            "tpu_sync.api": MagicMock(),
+            "tpu_sync.api.torch": torch_pkg,
+            "tpu_sync.api.torch.reshard_client": fake_client,
+        }
+        worker = _make_raiden_worker(
+            is_producer=False, tp_rank=0, tp_size=1, block_size=1024
+        )
+        if prior_state == "accepted":
+            worker._stage3_controller_accepted.add("dst-late")
+        if prior_state == "uncertain":
+            worker._stage3_pending_controller_failures["dst-late"] = time.time() + 120
+        error = TransferReleasedError(
+            "Remote Controller Server execution failed: Raiden remote native "
+            "execution failed: pool staging: uuid 1003 waited 10s for 2 slots "
+            "on storage 0 (free=0 of 16, active leases=8)"
+        )
+        with patch.dict(sys.modules, modules):
+            _, facade = self._park_missing_registration_load(
+                worker, [error], registration_wait_s=30.0
+            )
+            with (
+                patch(
+                    f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True
+                ),
+                patch(f"{_MOD}.logger.error") as log,
+            ):
+                if prior_state is None:
+                    assert worker.get_finished() == (set(), {"dst-late"})
+                    assert worker.get_block_ids_with_load_errors() == {11, 12}
+                    assert worker._stage3_pending_controller_failures == {}
+                    assert worker._stage3_inflight_submits == set()
+                    message = log.call_args.args[0] % log.call_args.args[1:]
+                    assert "with no receiver left" in message
+                else:
+                    assert worker.get_finished() == (set(), set())
+                    assert worker.get_block_ids_with_load_errors() == set()
+                    assert "dst-late" in worker._stage3_pending_controller_failures
+                    assert worker._load_block_ids["dst-late"] == [11, 12]
+        assert facade.start_transfer.call_count == 1
+
     def test_stage3_layout_mismatch_log_names_the_fingerprints_to_compare(self):
         worker = _make_raiden_worker(
             is_producer=False, tp_rank=0, tp_size=1, block_size=1024
@@ -5755,6 +5870,44 @@ class TestTPURaidenConnectorWorker:
             outcome if tp_rank == 0 else None, src=0
         )
         assert "dst-tp2" in worker._stage3_controller_accepted
+
+    @pytest.mark.parametrize("tp_rank", [0, 1])
+    @pytest.mark.parametrize(
+        ("status", "phrase"),
+        [
+            ("failed", "before receiver arming"),
+            ("released", "with no receiver left"),
+        ],
+    )
+    def test_inline_tp_load_failure_is_recorded_on_every_rank(
+        self, tp_rank, status, phrase
+    ):
+        """A failed or released leader outcome fails the load on the leader
+        and on a follower, and the log says which of the two it was."""
+        worker = _make_raiden_worker(
+            tp_rank=tp_rank, tp_size=2, is_producer=False, dp_size=4
+        )
+        worker._raiden_work_unit = MagicMock()
+        meta = self._make_stage3_load_meta("dst-tp2", "src-tp2", 901, [7, 8])
+        group = MagicMock()
+        outcome = (status, None, "injected failure", 0, 0)
+        group.broadcast_object.return_value = outcome
+        with (
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "decode:28000"),
+            ),
+            patch.object(worker, "_stage3_tp_group", return_value=group),
+            patch.object(worker, "_submit_stage3_load_as_leader", return_value=outcome),
+            patch(f"{_MOD}.logger.error") as log,
+        ):
+            worker._submit_stage3_loads(meta, MagicMock(), synchronous=True)
+        assert worker._failed_recving == {"dst-tp2"}
+        assert worker.get_block_ids_with_load_errors() == {7, 8}
+        assert "dst-tp2" not in worker._stage3_controller_accepted
+        message = log.call_args.args[0] % log.call_args.args[1:]
+        assert phrase in message
 
     def test_v1_admission_rejects_tp3_decode_topology(self):
         worker = _make_raiden_worker(
