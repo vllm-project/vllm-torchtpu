@@ -33,7 +33,15 @@ from vllm_torchtpu.kernels.mla.sparse import (
     dma,
     dsa_gather,
     index_prep,
+    native_sc_gather,
     ref_registry,
+    testing_faults,
+)
+from vllm_torchtpu.kernels.mla.sparse import (
+    config as sparse_config,
+)
+from vllm_torchtpu.kernels.mla.sparse import (
+    kernel as sparse_kernel,
 )
 from vllm_torchtpu.kernels.mla.sparse.config import (
     DECODE_BODY_DEFAULT,
@@ -61,6 +69,7 @@ from vllm_torchtpu.kernels.mla.sparse.config import (
     SendExchangeConfig,
     SparseMlaConfig,
     align_to,
+    resolve_entry_config,
     send_layout_lanes,
     send_layout_shape,
 )
@@ -2242,14 +2251,294 @@ def test_fault_hooks_positive_controls_array_transforms() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Regression tests for config, registry, and fault contracts
+# 4. Backward-compatibility export contract tests
 # ---------------------------------------------------------------------------
+
+
+_EXPECTED_KERNEL_EXPORTS = (
+    # Legacy constants
+    "DEFAULT_VMEM_LIMIT_BYTES",
+    "DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE",
+    "DEFAULT_ATTENTION_KERNEL_BATCH_SIZE",
+    "GATHER_ATOM_ROWS",
+    "FUSED_PREP_MAX_TOKENS",
+    "FUSED_PREP_META_ROWS",
+    "Q_ROPE_DIM",
+    "Q_ROPE_HEAD_DIM",
+    "DECODE_STEP8_TOKENS",
+    "MIXED_BODY_MAX_SKIP_TOKENS",
+    "SEND_PAD_ROWS",
+    "SEND_SLAB_ROW0",
+    "SEND_EXCHANGE_COLLECTIVE_ID",
+    "SEND_EXCHANGE_VMEM_LIMIT_BYTES",
+    "SEND_EXCHANGE_PIN_ROLES",
+    "TENSORCORE_CACHE_LAYOUT",
+    "SPARSECORE_CACHE_LAYOUT",
+    "MIXED_BODY_LEVERS",
+    "MIXED_BODY_DEFAULT",
+    "DECODE_BODY_LEVERS",
+    "DECODE_BODY_DEFAULT",
+    "MIXED_KERNEL_V2_LEVERS",
+    "PROLOGUE_FAULTS",
+    "SEND_FAULTS",
+    "SEND_EXCHANGE_FAULTS",
+    # Typed refactor exports
+    "CacheLayout",
+    "GatherWaitMode",
+    "BodyExecutionStrategy",
+    "HbmPinRole",
+    "BodyOptimizationConfig",
+    "SendExchangeConfig",
+    "GatherConfig",
+    "CappedWindowConfig",
+    "LseConfig",
+    "DcpConfig",
+    "SparseMlaConfig",
+    "AttentionKernelConfig",
+    "PallasRefRegistry",
+    "FaultHooks",
+    "NO_FAULT_HOOKS",
+    # Helpers and entry points
+    "cdiv",
+    "align_to",
+    "get_dtype_bitwidth",
+    "get_dtype_packing",
+    "live_group_supported",
+    "mixed_fused_prep_supported",
+    "merge_pieces_supported",
+    "send_layout_lanes",
+    "send_layout_supported",
+    "send_layout_shape",
+    "_largest_divisor",
+    "_chunk_kernel_batch_size",
+    "gather_page_ids",
+    "scatter_padding_slots",
+    "prepare_capped_window_indices",
+    "prepare_capped_window_live",
+    "prepare_capped_window_live_fused",
+    "prepare_capped_window_fused",
+    "live_group_table",
+    "capped_live_windows",
+    "rope_q_block",
+    "prepare_q_inputs",
+    "prepare_outputs",
+    "prepare_gather_indices",
+    "select_attention_kernel",
+    "_attention_kernel",
+    "_decode_attention_kernel",
+    "_mixed_prefill_attention_kernel",
+    "sparse_attention_chunk",
+    "sparse_ragged_paged_attention",
+)
+
+
+def test_kernel_backward_compatible_exports() -> None:
+    for name in _EXPECTED_KERNEL_EXPORTS:
+        assert hasattr(sparse_kernel, name), f"kernel.py missing export {name!r}"
+
+    # Verify re-exported modules match canonical module objects.
+    assert sparse_kernel.pl is pl
+    assert sparse_kernel.dsa_gather is dsa_gather
+    assert sparse_kernel.native_sc_gather is native_sc_gather
+
+    # Verify private aliases and typed singletons point to canonical definitions.
+    assert sparse_kernel._largest_divisor is sparse_config.largest_divisor
+    assert (
+        sparse_kernel._chunk_kernel_batch_size is sparse_config.chunk_kernel_batch_size
+    )
+    assert sparse_kernel.NO_FAULT_HOOKS is testing_faults.NO_FAULT_HOOKS
+    assert sparse_kernel.FaultHooks is testing_faults.FaultHooks
+    assert sparse_kernel.PallasRefRegistry is ref_registry.PallasRefRegistry
+    assert (
+        sparse_kernel.select_attention_kernel
+        is attention_kernel.select_attention_kernel
+    )
+    assert sparse_kernel._attention_kernel is attention_kernel._attention_kernel
+    assert (
+        sparse_kernel._decode_attention_kernel
+        is attention_kernel._decode_attention_kernel
+    )
+    assert (
+        sparse_kernel._mixed_prefill_attention_kernel
+        is attention_kernel._mixed_prefill_attention_kernel
+    )
+
+    # Verify jit-wrapped entry point preserves __wrapped__ for callers/tests.
+    wrapped = getattr(sparse_kernel.sparse_ragged_paged_attention, "__wrapped__", None)
+    assert callable(wrapped)
+
+
+# ---------------------------------------------------------------------------
+# 5. Regression tests for config/hooks/typing/validation contracts
+# ---------------------------------------------------------------------------
+
+
+def _minimal_ragged_args() -> tuple[Any, ...]:
+    q = jnp.zeros((8, 16, 128), jnp.bfloat16)
+    cache_nope = jnp.zeros((2, 8, 4, 128), jnp.uint8)
+    cache_rope = jnp.zeros((2, 2, 4, 128), jnp.uint8)
+    topk = jnp.zeros((8, 16), jnp.int32)
+    page_indices = jnp.zeros((4,), jnp.int32)
+    cu_q_lens = jnp.array([0, 8], jnp.int32)
+    distribution = jnp.array([0, 0, 1], jnp.int32)
+    return (q, cache_nope, cache_rope, topk, page_indices, cu_q_lens, distribution)
+
+
+def _minimal_chunk_args() -> tuple[tuple[Any, ...], dict[str, Any]]:
+    q = jnp.zeros((8, 16, 128), jnp.bfloat16)
+    cache_nope = jnp.zeros((2, 8, 128), jnp.uint32)
+    cache_rope = jnp.zeros((2, 2, 128), jnp.uint32)
+    kv_lens = jnp.zeros((8,), jnp.int32)
+    phys = jnp.zeros((8, 128), jnp.int32)
+    lse = None
+    pos = (q, cache_nope, cache_rope, kv_lens, phys, lse)
+    kw = {"start_pos": 0, "end_pos": 8, "token_end": jnp.int32(8)}
+    return pos, kw
 
 
 def test_unset_sentinel_is_hashable_and_distinct() -> None:
     assert isinstance(hash(UNSET), int)
     assert {UNSET: "ok"}[UNSET] == "ok"
     assert UNSET is not None
+
+
+def test_resolve_entry_config_preserves_chunk_vs_ragged_defaults() -> None:
+    ragged_cfg = resolve_entry_config(None, {})
+    assert ragged_cfg.gather.small_chunk_tokens == 16
+    assert ragged_cfg.gather.small_chunk_batch_size == 1
+    assert ragged_cfg.gather.small_chunk_live_gather is True
+    assert ragged_cfg.gather.live_gather_all_chunks is True
+
+    chunk_cfg = resolve_entry_config(
+        None,
+        {"sm_scale": 0.25, "k_scale": 0.5, "topk_cap": UNSET},
+        defaults=sparse_kernel._ATTENTION_CHUNK_LEGACY_DEFAULTS,
+        required=("sm_scale", "k_scale"),
+    )
+    assert chunk_cfg.sm_scale == 0.25
+    assert chunk_cfg.k_scale == 0.5
+    assert chunk_cfg.gather.small_chunk_tokens == 0
+    assert chunk_cfg.gather.small_chunk_batch_size is None
+    assert chunk_cfg.gather.small_chunk_live_gather is False
+    assert chunk_cfg.gather.live_gather_all_chunks is False
+
+
+@pytest.mark.parametrize(
+    ("legacy_kwargs", "expected_match"),
+    [
+        ({"sm_scale": 1.0}, "sm_scale"),
+        ({"topk_cap": None, "return_lse": False}, "return_lse, topk_cap"),
+        ({"cache_layout": "sparsecore"}, "cache_layout"),
+    ],
+)
+def test_sparse_ragged_paged_attention_rejects_config_plus_legacy(
+    legacy_kwargs: dict[str, Any], expected_match: str
+) -> None:
+    args = _minimal_ragged_args()
+    with pytest.raises(
+        ValueError,
+        match=f"cannot pass both 'config' and legacy config kwargs: {expected_match}",
+    ):
+        sparse_kernel.sparse_ragged_paged_attention(
+            *args, config=SparseMlaConfig(), **legacy_kwargs
+        )
+
+
+@pytest.mark.parametrize(
+    ("legacy_kwargs", "expected_match"),
+    [
+        ({"sm_scale": 0.1}, "sm_scale"),
+        ({"small_chunk_tokens": 0, "k_scale": 1.0}, "k_scale, small_chunk_tokens"),
+    ],
+)
+def test_sparse_attention_chunk_rejects_config_plus_legacy(
+    legacy_kwargs: dict[str, Any], expected_match: str
+) -> None:
+    pos, kw = _minimal_chunk_args()
+    with pytest.raises(
+        ValueError,
+        match=f"cannot pass both 'config' and legacy config kwargs: {expected_match}",
+    ):
+        sparse_kernel.sparse_attention_chunk(
+            *pos, **kw, config=SparseMlaConfig(), **legacy_kwargs
+        )
+
+
+@pytest.mark.parametrize(
+    "extra_kwargs",
+    [
+        {},
+        {"sm_scale": 0.1},
+        {"k_scale": 1.0},
+    ],
+)
+def test_sparse_attention_chunk_requires_scales_without_config(
+    extra_kwargs: dict[str, Any],
+) -> None:
+    pos, kw = _minimal_chunk_args()
+    with pytest.raises(TypeError, match="missing required keyword-only argument"):
+        sparse_kernel.sparse_attention_chunk(*pos, **kw, **extra_kwargs)
+
+
+def test_sparse_ragged_paged_attention_rejects_live_prep_without_mixed_fused() -> None:
+    args = _minimal_ragged_args()
+    q_pe = jnp.zeros((8, 16, 64), jnp.bfloat16)
+    hooks = FaultHooks(live_prep=LivePrepFault.KV)
+    with pytest.raises(ValueError, match="live_prep fault requires mixed_fused_prep"):
+        sparse_kernel.sparse_ragged_paged_attention(
+            *args, config=SparseMlaConfig(), hooks=hooks, q_pe=q_pe
+        )
+
+
+def test_sparse_ragged_paged_attention_forwards_hooks_to_live_fused_prep() -> None:
+    num_tokens = 128
+    topk = 256
+    q = jnp.zeros((num_tokens, 16, 128), jnp.bfloat16)
+    q_pe = jnp.zeros((num_tokens, 16, 64), jnp.bfloat16)
+    cache_nope = jnp.zeros((4, 16, 128), jnp.uint32)
+    cache_rope = jnp.zeros((4, 4, 128), jnp.uint32)
+    topk_indices = jnp.zeros((num_tokens, topk), jnp.int32)
+    page_indices = jnp.zeros((8,), jnp.int32)
+    cu_q_lens = jnp.array([0, num_tokens], jnp.int32)
+    distribution = jnp.array([0, 0, 1], jnp.int32)
+
+    cfg = SparseMlaConfig(
+        attention_kernel_batch_size=16,
+        gather=GatherConfig(cache_layout=CacheLayout.SPARSECORE, chunk_size=128),
+        capped=CappedWindowConfig(
+            topk_cap=128, mixed_live_gather=True, mixed_fused_prep=True
+        ),
+    )
+    hooks = FaultHooks(live_prep=LivePrepFault.OFF)
+    captured: list[FaultHooks] = []
+
+    class _StopAfterPrep(RuntimeError):
+        pass
+
+    def _fake_prep(*_a: Any, **kw: Any) -> Any:
+        captured.append(kw["hooks"])
+        raise _StopAfterPrep()
+
+    with (
+        patch.object(
+            sparse_kernel, "prepare_capped_window_live_fused", side_effect=_fake_prep
+        ),
+        pytest.raises(_StopAfterPrep),
+    ):
+        sparse_kernel.sparse_ragged_paged_attention(
+            q,
+            cache_nope,
+            cache_rope,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            config=cfg,
+            hooks=hooks,
+            q_pe=q_pe,
+        )
+
+    assert captured == [hooks]
 
 
 def test_bounds_builder_and_registry_accept_int_and_1d_send_peer_array() -> None:
@@ -2320,6 +2609,96 @@ def test_build_attention_ref_registry_rejects_bad_send_peer_array(
         build_attention_ref_registry(cfg, **inputs)
 
 
+def test_rope_q_block_supports_fault_and_hooks_and_rejects_both() -> None:
+    class _Tab2D:
+        def __getitem__(self, _key: Any) -> jax.Array:
+            return jnp.zeros((2, 128), jnp.float32)
+
+    x = jnp.zeros((2, 128), jnp.bfloat16)
+    tab: Any = _Tab2D()
+
+    recorded_shifts: list[int] = []
+
+    def _fake_roll(arr: Any, shift: int, _axis: int) -> Any:
+        recorded_shifts.append(shift)
+        return arr
+
+    def _fake_where(_cond: Any, a: Any, _b: Any) -> Any:
+        return a
+
+    with (
+        patch.object(sparse_kernel.pltpu, "roll", side_effect=_fake_roll, create=True),
+        patch.object(sparse_kernel.jnp, "where", side_effect=_fake_where, create=True),
+        patch.object(
+            sparse_kernel.lax,
+            "broadcasted_iota",
+            return_value=jnp.zeros((2, 128), jnp.int32),
+        ),
+        patch.object(
+            type(x),
+            "__lt__",
+            lambda self, _other: self,
+            create=True,
+        ),
+    ):
+        # Default (no fault) uses shifts (96, 32) then 64.
+        recorded_shifts.clear()
+        sparse_kernel.rope_q_block(x, tab)
+        assert recorded_shifts == [96, 32, 64]
+
+        # Positional fault string.
+        recorded_shifts.clear()
+        sparse_kernel.rope_q_block(x, tab, "rope_swap")
+        assert recorded_shifts == [32, 96, 64]
+
+        # Keyword fault string (backward-compatible signature).
+        recorded_shifts.clear()
+        sparse_kernel.rope_q_block(x, tab, fault="rope_swap")
+        assert recorded_shifts == [32, 96, 64]
+
+        # Keyword hooks object.
+        swap_hooks = FaultHooks(prologue=PrologueFault.ROPE_SWAP)
+        recorded_shifts.clear()
+        sparse_kernel.rope_q_block(x, tab, hooks=swap_hooks)
+        assert recorded_shifts == [32, 96, 64]
+
+        # Positional FaultHooks object.
+        recorded_shifts.clear()
+        sparse_kernel.rope_q_block(x, tab, swap_hooks)
+        assert recorded_shifts == [32, 96, 64]
+
+    with pytest.raises(ValueError, match="cannot pass both fault and hooks"):
+        sparse_kernel.rope_q_block(
+            x, tab, fault="rope_swap", hooks=FaultHooks(prologue=PrologueFault.ROPE_F32)
+        )
+
+    with pytest.raises(ValueError, match="unknown prologue_fault"):
+        sparse_kernel.rope_q_block(x, tab, fault="not_a_fault")
+
+
+def test_fault_hooks_validate_for_context_and_entry_point_enforcement() -> None:
+    xchg_hooks = FaultHooks(prologue=SendExchangeFault.SEND_PEER_DROP)
+    with pytest.raises(ValueError, match="unknown prologue_fault send_peer_drop"):
+        xchg_hooks.validate_for_context(allow_send_exchange=False)
+    xchg_hooks.validate_for_context(allow_send_exchange=True)
+    FaultHooks(prologue=PrologueFault.ROPE_SWAP).validate_for_context(
+        allow_send_exchange=False
+    )
+    NO_FAULT_HOOKS.validate_for_context(allow_send_exchange=False)
+
+    args = _minimal_ragged_args()
+    with pytest.raises(ValueError, match="unknown prologue_fault send_peer_drop"):
+        sparse_kernel.sparse_ragged_paged_attention(
+            *args, config=SparseMlaConfig(), hooks=xchg_hooks
+        )
+
+    pos, kw = _minimal_chunk_args()
+    with pytest.raises(ValueError, match="unknown prologue_fault send_peer_drop"):
+        sparse_kernel.sparse_attention_chunk(
+            *pos, **kw, sm_scale=0.1, k_scale=1.0, hooks=xchg_hooks
+        )
+
+
 def test_width_sequences_normalized_to_tuples_and_hashable() -> None:
     capped = CappedWindowConfig(
         topk_cap=512,
@@ -2352,6 +2731,19 @@ def test_width_sequences_normalized_to_tuples_and_hashable() -> None:
     assert isinstance(decode_kernel.row_widths, tuple)
     assert decode_kernel.row_widths == (128, 256)
     assert isinstance(hash(decode_kernel), int)
+
+
+def test_sparse_attention_chunk_topk_cap_zero_raises_value_error() -> None:
+    pos, kw = _minimal_chunk_args()
+    with pytest.raises(ValueError, match=r"topk_cap \(0\) must be a multiple"):
+        sparse_kernel.sparse_attention_chunk(
+            *pos,
+            **kw,
+            sm_scale=0.1,
+            k_scale=1.0,
+            cache_layout=SPARSECORE_CACHE_LAYOUT,
+            topk_cap=0,
+        )
 
 
 # ---------------------------------------------------------------------------
