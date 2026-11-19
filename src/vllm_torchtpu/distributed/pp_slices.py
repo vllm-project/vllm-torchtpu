@@ -37,6 +37,9 @@ rank or a device of another slice. What spans the engine is layered on top:
     through which a worker joins the engine's message queues: the queues'
     handles go through the start-up rendezvous store instead of a world
     that spans every worker.
+  * Stages inside a slice hand activations on over ICI; the hop from the
+    last stage of one slice to the first of the next goes over TCP
+    (``pp_buffered``, ``pp_dcn_link``).
 """
 
 import base64

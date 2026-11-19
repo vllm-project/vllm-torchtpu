@@ -21,6 +21,18 @@ landing buffer, and once the sender's data is ready the runtime copies it
 there. So a stage waits only for its own input, never for the other stages
 to reach the same point, and a forward moves on as soon as it is done.
 
+A pipeline over several TPU slices (``pp_slices``) has a torch.distributed
+world per slice and no ICI between them, so the hop from the last stage of
+one slice to the first stage of the next goes over TCP instead
+(``pp_dcn_link``): the sender copies its output to host memory and writes
+it to the receiving host, which uploads it to a fresh device tensor. A copy
+to the host completes only after everything the device was given before
+it, so the sender starts it as it stages the forward's outputs, right
+behind the forward and ahead of its fence. Each direction of a hop is a
+link, ``IciLink`` or ``DcnLink``: a forward reads what the link's receive
+returns, and its outputs go to the link's stage and what that returns to
+the link's send.
+
 What travels is the sum of hidden states and residual, one tensor in the
 model dtype, plus any side tensor such as a sparse model's top-k table. The
 next stage starts from that sum and a zero residual, one kept per padded
@@ -50,7 +62,12 @@ the receive is published to the store, and the thread that prepares the
 step waits for none of it; a forward waits only until its own receive is
 posted. The posted tensor is bound to a fresh landing buffer. The receiver
 does not wait for the data on the host: the forward reads the tensor, and
-the runtime runs the forward once the data has landed.
+the runtime runs the forward once the data has landed. A receive over TCP
+posts nothing: it holds the posting thread until the data has arrived and
+its upload has started, so a forward that waits for its receive to be
+posted waits for its input; the forward reads the tensor, and the runtime
+runs it once the upload is done. The link takes the host buffer back once
+the forward has completed, as a receive frees its flag.
 
 A device has 8 receive flags, and a receive posted beyond them stalls its
 sender without an error. A receive holds its flag until its data has
@@ -61,7 +78,9 @@ The posting thread posts a transfer only while at most 7 receive calls are
 posted whose forwards have not completed, so a step of many forwards, or a
 large depth, waits in that thread rather than stalling the sender.
 ``check_buffered_receives`` refuses a depth that, with one forward per step,
-could hold more than 7 at once.
+could hold more than 7 at once. Receives over TCP take no flag but keep the
+same bound, which also bounds the device memory their tensors hold and the
+host buffers their uploads read.
 
 The sender hands its output on from a helper thread. end_forward submits the
 ops that produce the outgoing tensors, has the link stage them, records a
@@ -71,12 +90,14 @@ tensors alive until then. The last stage queues the fence alone, which the
 helper only waits on.
 ``isend`` returns only once the receiver has posted the matching receive:
 that is the credit, a stage cannot send a forward before the next stage has
-taken up its step. At most ``depth`` forwards wait in a stage's queue, the
-one being sent included; end_forward blocks until there is room, which
-bounds the memory a stage that runs ahead holds for its outputs. The engine
-keeps more steps in flight than the pipeline has stages
-(``pp_engine.buffered_extra_steps``), so stage 0 has its next forward
-queued while the engine core prepares the following step.
+taken up its step. Over TCP the credit is the room left in the
+connections' socket buffers, which the receiver frees as it reads. At most
+``depth`` forwards wait in a stage's queue, the one being sent included;
+end_forward blocks until there is room, which bounds the memory a stage
+that runs ahead holds for its outputs. The engine keeps more steps in
+flight than the pipeline has stages (``pp_engine.buffered_extra_steps``),
+so stage 0 has its next forward queued while the engine core prepares the
+following step.
 
 Nothing here needs the stages to issue matching launches: a stage of
 several chips neither drains its device nor waits at a world barrier before
@@ -93,7 +114,12 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu.distributed.pp_dcn_link import DcnLink
 from vllm_torchtpu.distributed.pp_engine import buffered_extra_steps
+from vllm_torchtpu.distributed.pp_slices import (
+    SlicedPipelineGroup,
+    in_slice_pipeline_group,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
@@ -288,7 +314,7 @@ class PPBuffered:
         self.size = int(group.world_size)
         self.last = self.size - 1
         # The pipeline group of a device holds its column of every stage:
-        # the devices that hold the same token rows.
+        # the devices that hold the same token rows, in engine ranks.
         ranks = [int(rank) for rank in group.ranks]
         self.global_rank = ranks[self.rank]
         self.prev = ranks[self.rank - 1] if self.rank > 0 else None
@@ -319,12 +345,31 @@ class PPBuffered:
         specs = tuple(self.template[key] for key in self.carried)
         # The transport of the hop from the previous stage and of the hop to
         # the next one.
-        self._inbound: IciLink | None = None
-        self._outbound: IciLink | None = None
+        # Over ICI to a stage of this device's torch world, in its ranks; over
+        # TCP to a stage of another slice.
+        in_slice = in_slice_pipeline_group()
+        stage = int(in_slice.rank_in_group)
+        peers = [int(rank) for rank in in_slice.ranks]
+
+        def tcp(src: int, dst: int) -> DcnLink:
+            # Only a sliced pipeline has a hop out of the torch world.
+            assert isinstance(group, SlicedPipelineGroup)
+            return DcnLink(group.store, src, dst, self.global_rank, specs, device)
+
+        self._inbound: IciLink | DcnLink | None = None
+        self._outbound: IciLink | DcnLink | None = None
         if self.prev is not None:
-            self._inbound = IciLink(self.prev, specs, device)
+            self._inbound = (
+                IciLink(peers[stage - 1], specs, device)
+                if stage > 0
+                else tcp(self.prev, self.global_rank)
+            )
         if self.next is not None:
-            self._outbound = IciLink(self.next, specs, device)
+            self._outbound = (
+                IciLink(peers[stage + 1], specs, device)
+                if stage < len(peers) - 1
+                else tcp(self.global_rank, self.next)
+            )
         self.max_rows = int(max_rows)
         self.depth = int(depth)
         # Transfers started: the warmup's, then one per forward.
@@ -384,7 +429,8 @@ class PPBuffered:
 
     def _post(self, transfer: int, rows: int) -> tuple[torch.Tensor, ...]:
         """Posts the receives of one transfer of ``rows`` rows and returns
-        the tensors they land in."""
+        the tensors they land in; over TCP, once the data is on the
+        device."""
         assert self._inbound is not None
         self._check_rows(transfer, rows)
         if transfer != self.posted_through + 1:
@@ -422,9 +468,9 @@ class PPBuffered:
 
     def warmup(self) -> None:
         """One small transfer of every carried tensor from each device to
-        the same column of the next stage, carrying the sender's global
-        rank; checks that what arrived came from the same column of the
-        previous stage."""
+        the same column of the next stage, over the hop's link, carrying the
+        sender's global rank, its rank in the engine; checks that what
+        arrived came from the same column of the previous stage."""
         assert self.transfers == 0 and not self._posted
         self.transfers = 1
         rows = 2
@@ -446,17 +492,23 @@ class PPBuffered:
                 )
                 _flush(sent)
                 staged = self._outbound.stage(sent)
+                # The send reads the staged host buffers, so the device work
+                # staging queued must have finished: at warm-up this waits for
+                # the whole device, once.
+                _fence().synchronize()
                 self._outbound.send(self.transfers, staged)
             got = [_first_and_last(x) for x in received]
         except Exception as exc:
             raise RuntimeError(
-                f"PP buffered rank {self.rank}: the hand-off self-test failed. "
-                f"{_LIBTPU_REQUIREMENT}."
+                f"PP buffered rank {self.rank}: the hand-off self-test failed."
+                f"{self._requirement(self._inbound, self._outbound)}"
             ) from exc
         if self.prev is None:
             return
         # Reading the received tensors waited for their data to land.
         self.landed_through = self.transfers
+        if isinstance(self._inbound, DcnLink):
+            self._inbound.landed(self.transfers)
         for key, values in zip(self.carried, got):
             dtype = self.template[key][1]
             want = float(torch.tensor(self.prev + 1).to(dtype).item())
@@ -464,8 +516,16 @@ class PPBuffered:
                 raise RuntimeError(
                     f"PP buffered rank {self.rank}: hand-off self-test tensor "
                     f"{key!r} received {values}, expected {want} from global "
-                    f"rank {self.prev}. {_LIBTPU_REQUIREMENT}."
+                    f"rank {self.prev}.{self._requirement(self._inbound)}"
                 )
+
+    @staticmethod
+    def _requirement(*links: "IciLink | DcnLink | None") -> str:
+        """What a failed self-test over ``links`` points at: the libtpu the
+        ICI hand-off needs, when one of them is an ICI link."""
+        if any(isinstance(link, IciLink) for link in links):
+            return f" {_LIBTPU_REQUIREMENT}."
+        return ""
 
     def begin_step(self, rows_per_forward: list[int]) -> None:
         """Called before the first forward of a scheduler step with the
@@ -532,18 +592,27 @@ class PPBuffered:
                 with TraceAnnotation("PP:PostReceives"):
                     received = self._post(transfer, rows)
             except BaseException as exc:  # re-raised on the worker thread
+                with self._cv:
+                    closing = self._closing
+                    failed = [landing, *(queued[2] for queued in self._to_post)]
+                    self._to_post.clear()
+                    if not closing:
+                        # Nothing after it can be posted in order.
+                        self._post_error = exc
+                if closing:
+                    # close() ended the link this receive waited on, and the
+                    # forwards these were queued for will not run.
+                    for future in failed:
+                        future.cancel()
+                    return
                 logger.exception(
                     "PP buffered rank %d: posting transfer %d failed",
                     self.rank,
                     transfer,
                 )
-                # Nothing after it can be posted in order.
-                with self._cv:
-                    self._post_error = exc
-                    failed = [landing, *(queued[2] for queued in self._to_post)]
-                    self._to_post.clear()
                 for future in failed:
                     future.set_exception(exc)
+                self._close_tcp_links()
                 return
             landing.set_result(received)
 
@@ -670,6 +739,10 @@ class PPBuffered:
         the transfer's forward completed, its receives count as landed."""
         with TraceAnnotation("PP:Send"):
             fence.synchronize()
+            # The host buffers come back before the posting thread may post
+            # past this transfer, so the receives it lets through reuse them.
+            if isinstance(self._inbound, DcnLink):
+                self._inbound.landed(transfer)
             with self._cv:
                 self.landed_through = transfer
                 self._cv.notify_all()
@@ -705,26 +778,42 @@ class PPBuffered:
                         landing.set_exception(error)
                     self._to_post.clear()
                     self._cv.notify_all()
-                    return
-                # Releases the tensors: the copies are done.
-                _, outgoing, _ = self._sends.popleft()
-                if outgoing:
-                    self.sent += 1
-                self._cv.notify_all()
+                else:
+                    # Releases the tensors: the copies are done.
+                    _, outgoing, _ = self._sends.popleft()
+                    if outgoing:
+                        self.sent += 1
+                    self._cv.notify_all()
+            if error is not None:
+                self._close_tcp_links()
+                return
+
+    def _close_tcp_links(self) -> None:
+        """Closes this hand-off's TCP links after a helper thread failed, so
+        the stages across them fail at once instead of waiting for data."""
+        for link in (self._inbound, self._outbound):
+            if isinstance(link, DcnLink):
+                link.close()
 
     def close(self) -> None:
         """Drops the receives still queued, whose forwards will not run,
-        waits until every queued send is done, stops the helper threads, and
-        raises a failure of either. The helper threads are daemon threads, so
-        close is for tests and explicit shutdown."""
+        waits until every queued send is done, stops the helper threads,
+        closes the TCP links, and raises a failure of either thread. A
+        receive over TCP in progress waits for a forward the previous slice
+        will not run, so the inbound TCP link closes before the posting
+        thread is joined. The helper threads are daemon threads, so close is
+        for tests and explicit shutdown."""
         threads = [t for t in (self._post_thread, self._thread) if t is not None]
-        if threads:
-            with self._cv:
-                self._closing = True
-                self._cv.notify_all()
-            for thread in threads:
-                thread.join()
-            self._post_thread = self._thread = None
-            self._closing = False
+        with self._cv:
+            self._closing = True
+            self._cv.notify_all()
+        if isinstance(self._inbound, DcnLink):
+            self._inbound.close()
+        for thread in threads:
+            thread.join()
+        if isinstance(self._outbound, DcnLink):
+            self._outbound.close()
+        self._post_thread = self._thread = None
+        self._closing = False
         self._raise_post_failure()
         self._raise_send_failure()
