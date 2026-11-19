@@ -17,6 +17,8 @@ projection matches RMSNormGated followed by the fp8 linear. The torch<->JAX op
 bridge runs the JAX functions on the host."""
 
 import functools
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import jax
@@ -114,11 +116,40 @@ def _gdn_outputs(attention, tokens=16, seed=1):
 
 # A block-quantized checkpoint is requantized per channel at load.
 @pytest.mark.parametrize("quantization", ["fp8_channel", "fp8_block"])
-def test_install_marks_every_gdn_layer(make_gdn_attention, host_ops, quantization):
+def test_install_marks_every_gdn_layer(
+    make_gdn_attention, host_ops, monkeypatch, quantization
+):
     attention = _loaded_gdn(make_gdn_attention, host_ops, quantization)
-    assert not attention.fused_norm_quant
+    assert attention.fused_output_projection is None
+    logged = []
+    monkeypatch.setattr(
+        gated_norm_quant_op,
+        "logger",
+        SimpleNamespace(info=lambda msg, *args: logged.append(msg % args)),
+    )
     assert gated_norm_quant_op.install(torch.nn.ModuleList([attention])) == 1
-    assert attention.fused_norm_quant
+    assert attention.fused_output_projection is gated_norm_quant_op.output_projection
+    # The line the measured legs' logs are read for.
+    assert logged == [
+        "[GDN] 1 layers run the gated norm and out_proj fp8 quantization as one kernel"
+    ]
+
+
+def test_the_gdn_layer_loads_no_qwen3_5_module():
+    """The GDN layer is shared by Qwen3-Next and every GDN model: importing it
+    loads nothing from the Qwen3.5 folder, whose rule sets the layer's
+    fused_output_projection after loading."""
+    code = (
+        "import sys\n"
+        "import vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op\n"
+        "print(sorted(m for m in sys.modules "
+        "if m.startswith('vllm_torchtpu.models.qwen3_5')))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "[]"
 
 
 def _block_scales(attention):
@@ -161,7 +192,7 @@ def test_install_refuses_an_unsupported_layer(
         edit(attention)
     with pytest.raises(NotImplementedError, match=reason):
         gated_norm_quant_op.install(torch.nn.ModuleList([attention]))
-    assert not attention.fused_norm_quant
+    assert attention.fused_output_projection is None
 
 
 @pytest.mark.parametrize(
@@ -183,7 +214,7 @@ def test_install_if_supported_keeps_an_unsupported_layer_unfused(
     assert (
         gated_norm_quant_op.install_if_supported(torch.nn.ModuleList([attention])) == 0
     )
-    assert not attention.fused_norm_quant
+    assert attention.fused_output_projection is None
 
 
 def test_install_if_supported_routes_a_supported_model(make_gdn_attention, host_ops):
@@ -191,14 +222,15 @@ def test_install_if_supported_routes_a_supported_model(make_gdn_attention, host_
     assert (
         gated_norm_quant_op.install_if_supported(torch.nn.ModuleList([attention])) == 1
     )
-    assert attention.fused_norm_quant
+    assert attention.fused_output_projection is not None
 
 
 @pytest.mark.parametrize("measured", [True, False])
 def test_install_if_supported_routes_the_measured_value_heads_only(
     make_gdn_attention, host_ops, measured
 ):
-    """With ``value_heads`` (the runner passes the 397B legs' counts), a layer
+    """With ``value_heads`` (``route_measured_model`` passes
+    ``measured.GDN_VALUE_HEADS``, the 397B legs' counts), a layer
     whose value heads per device are not listed keeps RMSNormGated + linear,
     whose output is main's, unchanged."""
     attention = _loaded_gdn(make_gdn_attention, host_ops)
@@ -211,7 +243,7 @@ def test_install_if_supported_routes_the_measured_value_heads_only(
         value_heads={heads} if measured else {heads + 1},
     )
     assert routed == int(measured)
-    assert attention.fused_norm_quant is measured
+    assert (attention.fused_output_projection is not None) is measured
     if not measured:
         got = attention._apply_output_projection(core, z, core.shape[0])
         assert torch.equal(got, want)
