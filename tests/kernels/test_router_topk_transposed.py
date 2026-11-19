@@ -51,3 +51,21 @@ def test_rows_not_multiple_of_128_keep_row_kernel(monkeypatch):
     tw, ti = _sel(monkeypatch, scores, 4, "128")
     np.testing.assert_array_equal(ti, ri)
     np.testing.assert_array_equal(tw, rw)
+
+
+@pytest.mark.parametrize("rows,experts,topk", [(256, 128, 4), (640, 128, 8)])
+def test_biased_matches_add_topk_gather(monkeypatch, rows, experts, topk):
+    """select_biased == top-k of scores + bias, then gather the scores."""
+    rng = np.random.default_rng(rows * 3 + topk)
+    scores = np.round(rng.random((rows, experts), dtype=np.float32), 2)
+    scores[3] = np.nan
+    scores[7] = -np.inf
+    bias = np.round(rng.standard_normal(experts).astype(np.float32) * 0.1, 2)
+    monkeypatch.setenv(ENV, "0")
+    _, ri = router_topk.select(jnp.asarray(scores + bias[None, :]), topk, interpret=True)
+    rw = np.take_along_axis(scores, np.asarray(ri), axis=1)
+    tw, ti = router_topk.select_biased(
+        jnp.asarray(scores), jnp.asarray(bias), topk, interpret=True
+    )
+    np.testing.assert_array_equal(np.asarray(ti), np.asarray(ri))
+    np.testing.assert_array_equal(np.asarray(tw), rw)

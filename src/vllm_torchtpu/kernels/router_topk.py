@@ -124,6 +124,66 @@ def _select_t(scores: jax.Array, topk: int, interpret: bool = False):
     return w.T, i.T
 
 
+def _select_biased_kernel_t(x_ref, b_ref, w_ref, i_ref, *, topk: int, n: int):
+    """`_select_kernel_t` choosing by ``scores + bias`` and returning the
+    unbiased scores of the picks (the router's ``scores.gather(ids)``):
+    each pick's score is the one-hot sum of its column, exact."""
+    s = x_ref[...].T  # [n, block] unbiased scores
+    x = s + b_ref[...]  # [n, 1] bias broadcast along lanes
+    x = jnp.where(x > NEG, x, NEG)
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+    for j in range(topk):
+        m = jnp.max(x, axis=0, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=0, keepdims=True)
+        hit = iota == idx
+        # One hit per lane: the sum is the picked score itself (NaN and
+        # -inf included, which a max reduction may not propagate).
+        w_ref[j : j + 1, :] = jnp.sum(jnp.where(hit, s, 0.0), axis=0, keepdims=True)
+        i_ref[j : j + 1, :] = idx.astype(jnp.int32)
+        x = jnp.where(hit, masked, x)
+
+
+def select_biased(
+    scores: jax.Array, bias: jax.Array, topk: int, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """Top-k of ``scores + bias`` over ``[rows, experts]`` f32 scores, returning
+    ``(scores at the picks, picks)`` -- the router's biased choice and its
+    gather in one pass (transposed kernel; rows a multiple of 128). Elsewhere
+    the same as `select` on the biased scores plus a gather."""
+    rows, n = scores.shape
+    bias = bias.astype(jnp.float32).reshape(n)
+    if rows % 128 or n % 8 or scores.dtype != jnp.float32:
+        _, ids = select(scores + bias[None, :], topk, interpret)
+        return jnp.take_along_axis(scores, ids, axis=1), ids
+    block = min(MAX_BLOCK_ROWS, rows)
+    w, i = pl.pallas_call(
+        functools.partial(_select_biased_kernel_t, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[
+            pl.BlockSpec((block, n), lambda b: (b, 0)),
+            pl.BlockSpec((n, 1), lambda b: (0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((topk, block), lambda b: (0, b)),
+            pl.BlockSpec((topk, block), lambda b: (0, b)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((topk, rows), jnp.float32),
+            jax.ShapeDtypeStruct((topk, rows), jnp.int32),
+        ],
+        interpret=interpret,
+    )(scores, bias.reshape(n, 1))
+    return w.T, i.T
+
+
+def router_topk_biased(
+    scores: jax.Array, bias: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    """``select_biased`` with a jax_op-compatible signature."""
+    return select_biased(scores, bias, topk)
+
+
 def select(
     scores: jax.Array, topk: int, interpret: bool = False
 ) -> tuple[jax.Array, jax.Array]:

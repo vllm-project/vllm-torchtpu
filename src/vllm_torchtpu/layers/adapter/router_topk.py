@@ -21,7 +21,7 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_biased
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
@@ -37,6 +37,45 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+
+
+def _fake_router_topk_biased(scores: torch.Tensor, bias: torch.Tensor, topk: int):
+    return _fake_router_topk(scores, topk)
+
+
+_op_biased = pallas.jax_op("pallas::moe_router_topk_biased", router_topk_biased)
+_op_biased.register_fake(_fake_router_topk_biased)
+
+
+def rowmax_select_biased(
+    scores: torch.Tensor, bias: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(scores.gather(ids), ids)`` with ``ids`` the top-k of ``scores +
+    bias``, in one kernel pass (TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS); None
+    when the call does not qualify (the caller takes the unfused path)."""
+    from vllm_torchtpu import envs
+
+    min_rows = int(envs.TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS)
+    if (
+        min_rows <= 0
+        or scores.device.type != "tpu"
+        or scores.dim() != 2
+        or scores.shape[0] < min_rows
+        or scores.shape[0] % 128
+    ):
+        return None
+    global _biased_logged
+    if not _biased_logged:
+        _biased_logged = True
+        print(
+            "TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS=1: router biased top-k and "
+            "weight gather in one kernel",
+            flush=True,
+        )
+    return _op_biased(scores.float(), bias.float().reshape(-1), topk)
+
+
+_biased_logged = False
 
 
 def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
