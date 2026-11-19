@@ -13,9 +13,9 @@
 # limitations under the License.
 """Per-chunk sampling processor contracts for ``TPUModelRunner``.
 
-``TPUModelRunner._sample_plain_chunk`` runs ``PlainChunkProcessor`` hooks on a
+``chunk_sampling.sample_plain_chunk`` runs ``PlainChunkProcessor`` hooks on a
 chunk with one logits row per request (plain decode, and the draft-less chunks
-of speculative steps); ``TPUModelRunner._sample_spec_verify_chunk`` runs
+of speculative steps); ``chunk_sampling.sample_spec_verify_chunk`` runs
 ``SpecChunkProcessor`` hooks on a verify chunk. The thinking-token budget
 (``runner/thinking_budget_tracker.py``) implements both.
 

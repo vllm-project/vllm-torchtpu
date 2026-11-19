@@ -28,6 +28,7 @@ from runner_output_test_utils import (
     _blocking_logprobs_lists,
     _sample_tokens_runner,
 )
+from sampling_test_utils import _sampling_step
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -71,7 +72,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     zeros_h2d_source,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner import chunk_sampling, tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
@@ -3976,7 +3977,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     assert seen_u_dtypes == [torch.float32] * 3
     seen_u_dtypes.clear()
 
-    # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
+    # 2. sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
 
     def fake_rejection_sampler(**kwargs):
@@ -3994,9 +3995,6 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
-    spec_runner._sample_chunk_logits = TPUModelRunner._sample_chunk_logits.__get__(
-        spec_runner
-    )
     spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
     spec_runner.rejection_sampler.synthetic_mode = False
     md = SimpleNamespace(
@@ -4007,16 +4005,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         segment_ids=torch.tensor([0, 1], dtype=torch.int32),
         group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
     )
-    TPUModelRunner._sample_spec_verify_chunk(
-        spec_runner,
-        bf16_logits,
-        md,
-        cur_start_idx=0,
-        cur_end_idx=2,
-        all_greedy=False,
-        grammar_output=None,
-        scheduler_output=SimpleNamespace(),
-        sampling_generator=None,
+    chunk_sampling.sample_spec_verify_chunk(
+        spec_runner, _sampling_step(all_greedy=False), bf16_logits, md, 0, 2
     )
     assert seen_u_dtypes == [torch.float32]
     assert seen_recover_dtypes == [torch.float32]

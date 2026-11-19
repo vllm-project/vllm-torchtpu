@@ -25,6 +25,7 @@ from runner_output_test_utils import (
     plain_step_runner,
     run_sample_tokens,
 )
+from sampling_test_utils import _sampling_runner, _sampling_step, _verify_md
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -32,7 +33,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.runner import min_tokens
+from vllm_torchtpu.runner import chunk_sampling, min_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
@@ -717,7 +718,6 @@ def test_draft_less_chunk_of_a_spec_step_masks_below_min_tokens(num_output, expe
     runner.speculative_config = SimpleNamespace(
         method="ngram", num_speculative_tokens=1
     )
-    runner._sample_spec_verify_chunk = lambda *_args: torch.tensor([[7, -1]])
 
     with (
         patch(
@@ -725,6 +725,11 @@ def test_draft_less_chunk_of_a_spec_step_masks_below_min_tokens(num_output, expe
         ),
         patch.object(
             AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
+        patch.object(
+            chunk_sampling,
+            "sample_spec_verify_chunk",
+            side_effect=lambda *_args: torch.tensor([[7, -1]]),
         ),
         torch.compiler.set_stance("force_eager"),
     ):
@@ -759,7 +764,6 @@ def _spec_step_runner(num_output, logits_list, md_list, req_ids):
     runner.speculative_config = spec_config
     runner.rejection_sampler = RejectionSampler(spec_config, torch.device("cpu"))
     for name in (
-        "_sample_spec_verify_chunk",
         "spec_bonus_and_target_logits",
         "spec_gather_bonus_and_target_logits",
     ):
@@ -772,17 +776,7 @@ def _one_request_verify_md():
     then token 6 (logit 2)."""
     logits = torch.zeros(4, 8)
     logits[:, 3], logits[:, 6] = 4.0, 2.0
-    md = SimpleNamespace(
-        draft_token_ids=torch.tensor([3, 3, 3], dtype=torch.int32),
-        draft_lengths=torch.tensor([3], dtype=torch.int32),
-        draft_lengths_cpu=np.array([3]),
-        target_logits_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
-        bonus_logits_indices=torch.tensor([3], dtype=torch.int32),
-        final_logits_indices=torch.arange(4, dtype=torch.int32),
-        segment_ids=torch.tensor([0, 0, 0], dtype=torch.int64),
-        group_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
-    )
-    return logits, md
+    return logits, _verify_md([[3, 3, 3]], pad_tokens=3, pad_reqs=1)
 
 
 @pytest.mark.parametrize(
@@ -836,37 +830,14 @@ def _verify(
     is a factor e^200. With `num_acceptable_drafts`, the structured requests
     r0 and r1 get the real draft-token mask. Returns the selected tokens and
     whether the fused greedy prelude ran."""
-    draft_lengths = [3, 1]
     prefer = [[1, 1, 1, 3], [2, 5]]  # per request: draft rows, then the bonus
     rows = [t for req in prefer for t in req]
     logits = torch.zeros(len(rows), 8)
     for r, t in enumerate(rows):
         logits[r, t] = 4.0
         logits[r, 6] = 2.0
-    md = SimpleNamespace(
-        draft_token_ids=torch.tensor([1, 1, 1, 2], dtype=torch.int32),
-        draft_lengths=torch.tensor(draft_lengths, dtype=torch.int32),
-        draft_lengths_cpu=np.array(draft_lengths),
-        target_logits_indices=torch.tensor([0, 1, 2, 4], dtype=torch.int32),
-        bonus_logits_indices=torch.tensor([3, 5], dtype=torch.int32),
-        segment_ids=torch.tensor([0, 0, 0, 1], dtype=torch.int64),
-        group_indices=torch.tensor([0, 1, 2, 0], dtype=torch.int32),
-    )
-    spec_config = SimpleNamespace(
-        num_speculative_tokens=3,
-        rejection_sample_method="strict",
-        synthetic_acceptance_rates=None,
-    )
-    runner = _runner(SimpleNamespace(no_top_k=True, no_top_p=True))
-    runner.speculative_config = spec_config
-    runner.rejection_sampler = RejectionSampler(spec_config, torch.device("cpu"))
-    runner.sample_from_logits_func = runner.sample_from_logits
-    runner._build_padded_sampling_params = lambda *_args: (
-        torch.full((2, 1), 0.01),
-        torch.zeros((2, 1), dtype=torch.int32),
-        torch.ones((2, 1)),
-    )
-    runner._sampler_topk_candidates = lambda *_args: 0
+    md = _verify_md([[1, 1, 1], [2]], pad_reqs=2)
+    runner = _sampling_runner(temperature=0.01, spec_k=3)
     fused = MagicMock(wraps=runner.spec_bonus_and_target_logits)
     runner.spec_bonus_and_target_logits = fused
     grammar_output = None
@@ -899,19 +870,20 @@ def _verify(
             mask_spec_logits=mask_spec_logits,
             mask_invalid_draft_tokens=mask_invalid_draft_tokens,
         )
+    step = _sampling_step(
+        all_greedy=greedy,
+        sampling_generator=None if greedy else torch.Generator().manual_seed(0),
+        grammar_output=grammar_output,
+        min_toks=min_toks,
+    )
     with torch.compiler.set_stance("force_eager"):
-        out = TPUModelRunner._sample_spec_verify_chunk(
+        out = chunk_sampling.sample_spec_verify_chunk(
             runner,
+            step,
             logits,
             md,
-            grammar_output,
-            SimpleNamespace(scheduled_spec_decode_tokens={}),
             start,
             start + 2,
-            greedy,
-            None if greedy else torch.Generator().manual_seed(0),
-            False,
-            min_toks,
         ).tolist()
     return out, fused.called
 

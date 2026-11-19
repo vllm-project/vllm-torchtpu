@@ -300,9 +300,8 @@ def _make_sample_runner(
 ) -> SimpleNamespace:
     """Stand-in ``TPUModelRunner`` for ``sample_tokens`` and its chunk samplers.
 
-    Binds the real sampling methods (``_sample_chunk_logits``,
-    ``_sample_plain_chunk``, ``_sample_spec_verify_chunk``, min_tokens, async
-    output, verify gathers) to a CPU ``SimpleNamespace`` with real
+    Binds the real sampling methods (min_tokens, async output, verify
+    gathers) to a CPU ``SimpleNamespace`` with real
     ``MinTokensTracker`` and ``ThinkingBudgetTracker`` instances fed from
     ``requests``, and a real ``RepetitionPenaltyTracker`` with no penalized
     request.
@@ -413,9 +412,6 @@ def _make_sample_runner(
         TPUModelRunner._scheduled_draft_counts,
         TPUModelRunner._assemble_async_spec_substitution,
         TPUModelRunner._assemble_async_prefill_bootstrap,
-        TPUModelRunner._sample_chunk_logits,
-        TPUModelRunner._sample_plain_chunk,
-        TPUModelRunner._sample_spec_verify_chunk,
         TPUModelRunner.spec_bonus_and_target_logits,
         TPUModelRunner.spec_bonus_and_target_tokens,
         TPUModelRunner.spec_gather_bonus_and_target_logits,

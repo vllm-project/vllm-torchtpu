@@ -587,17 +587,12 @@ class TestPrepareSpecStructuredDecodingInput:
             # req1: bonus 20 + 2 unused tail rows.
             [row(10), row(11), row(12), row(20), row(99), row(99)],
         )
-        scheduled = {"req0": [5, 6]}
         logits = torch.zeros(2, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask, _) = (
-            manager.prepare_spec_structured_decoding_input(
-                None, logits, grammar_output, scheduled, None, 1, 2
-            )
+        require_bonus, bonus_bitmask, _ = manager.prepare_structured_decoding_input(
+            logits, grammar_output, 1, 2
         )
 
-        assert require_target is None
-        assert target_bitmask is None
         # req1 is local row 0 of this chunk.
         assert require_bonus[:, 0].tolist() == [True, False]
         assert bonus_bitmask[0].tolist() == row(20)
@@ -749,22 +744,6 @@ class TestMaskLogitsWithTrace:
             in name
             for name in events
         ), f"SD:MaskSpecLogits not found in {events}"
-
-        # 3. TraceAnnotation verification when target_logits is None (non-draft chunk).
-        # The scheduler still sends the request's full 1 + K row block.
-        grammar_output_none = make_grammar_output(
-            ["req0"], [[ALLOW_ALL, BLOCK_ALL], [ALLOW_ALL, ALLOW_ALL]]
-        )
-        with capture_trace() as prof_none:
-            manager.mask_spec_logits(
-                None, bonus_logits, grammar_output_none, {}, None, 0, 1
-            )
-        events_none = [evt.name for evt in prof_none.events()]
-        assert any(
-            "SD:PrepareSpecInput#num_reqs=1,num_target_rows=0,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
-            in name
-            for name in events_none
-        ), f"SD:PrepareSpecInput (target=None) not found in {events_none}"
 
 
 class TestMaskInvalidDraftTokens:

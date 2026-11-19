@@ -166,6 +166,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import (
     chunk_processors,
+    chunk_sampling,
     greedy_top_tokens,
     prompt_logprobs,
     spec_boundary_state,
@@ -268,17 +269,6 @@ class ExecuteModelState:
     prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = field(
         default_factory=list
     )
-
-
-@dataclass(frozen=True)
-class _ChunkSamplingParams:
-    """A sampled chunk's padded ``[rows, 1]`` sampling params. The rejection
-    sampler reuses them to verify the chunk's drafts."""
-
-    temperatures: torch.Tensor
-    top_k: torch.Tensor
-    top_p: torch.Tensor
-    topk_candidates: int
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -5334,300 +5324,6 @@ class TPUModelRunner(GPUModelRunner):
             return logits
         return min_tokens_mask.apply_stop_table(logits, *table)
 
-    def _sample_chunk_logits(
-        self,
-        logits: torch.Tensor,
-        *,
-        cur_start_idx: int,
-        cur_end_idx: int,
-        all_greedy: bool,
-        grammar_output: "GrammarOutput | None",
-        sampling_generator: torch.Generator | None,
-    ) -> tuple[torch.Tensor, _ChunkSamplingParams | None]:
-        """Samples one token per row of a chunk's ``[rows, vocab]`` logits.
-
-        Returns the ``[rows, 1]`` token IDs and, for a sampled (not all-greedy)
-        chunk, the padded sampling params that drew them.
-        """
-        if all_greedy:
-            return self._greedy_sample(logits), None
-        temperatures, top_k, top_p = self._build_padded_sampling_params(
-            cur_start_idx, cur_end_idx, logits
-        )
-        params = _ChunkSamplingParams(
-            temperatures,
-            top_k,
-            top_p,
-            self._sampler_topk_candidates(cur_start_idx, cur_end_idx, grammar_output),
-        )
-        u = torch.rand_like(logits, dtype=torch.float32, generator=sampling_generator)
-        token_ids = self.sample_from_logits_func(
-            logits,
-            temperatures,
-            u,
-            top_k,
-            top_p,
-            all_greedy=False,
-            topk_candidates=params.topk_candidates,
-            apply_topk_topp=self._sampler_applies_topk_topp(),
-        )
-        return token_ids, params
-
-    def _sample_plain_chunk(
-        self,
-        logits: torch.Tensor,
-        *,
-        cur_start_idx: int,
-        cur_end_idx: int,
-        top_tokens: bool,
-        all_greedy: bool,
-        sampling_generator: torch.Generator | None,
-        grammar_output: "GrammarOutput | None",
-        scheduler_output: "SchedulerOutput",
-        is_spec_step: bool,
-        min_toks: min_tokens_mask.MinTokensState,
-        rep_pen: bool = False,
-        processors: Sequence[chunk_processors.PlainChunkProcessor] = (),
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``.
-
-        ``is_spec_step`` marks a draft-less chunk inside a speculative step,
-        whose grammar rows follow ``scheduled_spec_decode_tokens``. With
-        ``top_tokens``, ``logits`` holds each row's greedy token instead.
-        ``rep_pen`` is ``RepetitionPenaltyTracker.begin_step`` for this step.
-        ``processors`` run after the ``min_tokens`` mask and the repetition
-        penalty, in order
-        (``chunk_processors.PlainChunkProcessor``).
-
-        Returns ``(selected_token_ids, logprob_logits)``. Logprobs come from the
-        logits before the min_tokens mask and the repetition penalty, as vLLM's
-        default raw_logprobs mode precedes its logits processors (the TPU runner
-        has no logprobs_mode).
-        """
-        if grammar_output is not None:
-            if is_spec_step:
-                _, logits = self.structured_decoding_manager.mask_spec_logits(
-                    None,
-                    logits,
-                    grammar_output,
-                    scheduler_output.scheduled_spec_decode_tokens,
-                    None,
-                    cur_start_idx,
-                    cur_end_idx,
-                )
-            else:
-                logits = self.structured_decoding_manager.mask_logits(
-                    logits, grammar_output, cur_start_idx, cur_end_idx
-                )
-        logprob_logits = logits
-        min_tokens_rows = min_tokens_mask.plain_rows(
-            min_toks, cur_start_idx, cur_end_idx
-        )
-        if min_tokens_rows:
-            # _greedy_top_tokens_this_step keeps a step with a request below
-            # min_tokens on the full logits.
-            assert not top_tokens
-            logits = self._mask_min_tokens(logits, min_tokens_rows, min_toks)
-        if rep_pen:
-            # _greedy_top_tokens_this_step keeps a step with a penalized
-            # request on the full logits.
-            assert not top_tokens
-            logits = self._repetition_penalty.apply(
-                logits,
-                self.input_batch,
-                self.requests,
-                cur_start_idx,
-                cur_end_idx,
-            )
-        if not top_tokens:
-            for proc in processors:
-                logits = proc.apply(logits)
-        with self._stage_timing.stage("sample"):
-            if top_tokens:
-                selected = logits
-                for proc in processors:
-                    selected = proc.override_top_tokens(selected)
-            else:
-                selected, _ = self._sample_chunk_logits(
-                    logits,
-                    cur_start_idx=cur_start_idx,
-                    cur_end_idx=cur_end_idx,
-                    all_greedy=all_greedy,
-                    grammar_output=grammar_output,
-                    sampling_generator=sampling_generator,
-                )
-            for proc in processors:
-                proc.on_sampled(selected)
-        return selected, logprob_logits
-
-    def _sample_spec_verify_chunk(
-        self,
-        logits: torch.Tensor,
-        md: SpecDecodeMetadata,
-        grammar_output: "GrammarOutput | None",
-        scheduler_output: "SchedulerOutput",
-        cur_start_idx: int,
-        cur_end_idx: int,
-        all_greedy: bool,
-        sampling_generator: torch.Generator | None,
-        top_tokens: bool = False,
-        min_toks: min_tokens_mask.MinTokensState | None = None,
-        processors: Sequence[chunk_processors.SpecChunkProcessor] = (),
-    ) -> torch.Tensor:
-        """Bonus-token sampling + draft rejection for one spec-verify chunk.
-
-        Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
-        selected tokens for the chunk. With ``top_tokens``, ``logits`` holds
-        each row's greedy token instead (no request is below min_tokens then).
-        ``processors`` prepare the target and bonus rows and the drafts before
-        the rejection sampler runs, then ``finish`` on its output
-        (``chunk_processors.SpecChunkProcessor``).
-        """
-        assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
-        assert self.rejection_sampler is not None
-        assert self.speculative_config is not None
-        max_draft_tokens = self.speculative_config.num_speculative_tokens
-        draft_token_ids = md.draft_token_ids
-        target_logits: torch.Tensor | None = None
-        target_argmax: torch.Tensor | None = None
-        params: _ChunkSamplingParams | None = None
-        if top_tokens:
-            bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
-                logits, md.bonus_logits_indices, md.target_logits_indices
-            )
-            for proc in processors:
-                target_argmax, bonus_token_ids, draft_token_ids = proc.prepare_tokens(
-                    target_argmax,
-                    bonus_token_ids,
-                    draft_token_ids,
-                    md.segment_ids,
-                    md.group_indices,
-                    max_draft_tokens,
-                )
-        else:
-            min_toks = min_toks or {}
-            min_tokens_rows = None
-            if min_toks and any(cur_start_idx <= i < cur_end_idx for i in min_toks):
-                draft_lengths = md.draft_lengths_cpu[: cur_end_idx - cur_start_idx]
-                if grammar_output is None:
-                    # Mask before the gathers, so a greedy chunk keeps the fused
-                    # verify prelude.
-                    logits = self._mask_min_tokens(
-                        logits,
-                        min_tokens_mask.verify_logits_rows(
-                            min_toks, cur_start_idx, draft_lengths.tolist()
-                        ),
-                        min_toks,
-                    )
-                else:
-                    # After the grammar mask, which the structured-output
-                    # restore needs to see.
-                    min_tokens_rows = min_tokens_mask.verify_rows(
-                        min_toks, cur_start_idx, draft_lengths.tolist()
-                    )
-            if all_greedy and grammar_output is None and not processors:
-                bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
-                    logits, md.bonus_logits_indices, md.target_logits_indices
-                )
-            else:
-                bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
-                    logits, md.bonus_logits_indices, md.target_logits_indices
-                )
-                if grammar_output is not None:
-                    target_logits, bonus_logits = (
-                        self.structured_decoding_manager.mask_spec_logits(
-                            target_logits,
-                            bonus_logits,
-                            grammar_output,
-                            scheduler_output.scheduled_spec_decode_tokens,
-                            md.draft_lengths_cpu,
-                            cur_start_idx,
-                            cur_end_idx,
-                        )
-                    )
-                    assert target_logits is not None
-                    draft_token_ids = (
-                        self.structured_decoding_manager.mask_invalid_draft_tokens(
-                            draft_token_ids,
-                            grammar_output,
-                            cur_start_idx,
-                            cur_end_idx,
-                            draft_lengths_cpu=md.draft_lengths_cpu,
-                        )
-                    )
-                if min_tokens_rows is not None:
-                    target_rows, bonus_rows = min_tokens_rows
-                    target_logits = self._mask_min_tokens(
-                        target_logits, target_rows, min_toks
-                    )
-                    bonus_logits = self._mask_min_tokens(
-                        bonus_logits, bonus_rows, min_toks
-                    )
-                for proc in processors:
-                    target_logits, bonus_logits, draft_token_ids = proc.prepare_logits(
-                        target_logits,
-                        bonus_logits,
-                        draft_token_ids,
-                        md.segment_ids,
-                        md.group_indices,
-                        max_draft_tokens,
-                    )
-                bonus_token_ids, params = self._sample_chunk_logits(
-                    bonus_logits,
-                    cur_start_idx=cur_start_idx,
-                    cur_end_idx=cur_end_idx,
-                    all_greedy=all_greedy,
-                    grammar_output=grammar_output,
-                    sampling_generator=sampling_generator,
-                )
-                bonus_token_ids = bonus_token_ids.view(-1)
-        # Greedy chunks (and the top-tokens path, whose steps are all greedy)
-        # draw acceptance noise only for synthetic acceptance; sampled chunks
-        # also draw the recovery noise and verify on their sampling params.
-        do_sampling = params is not None
-        accept_u = None
-        if self.rejection_sampler.synthetic_mode or do_sampling:
-            accept_u = torch.rand(
-                draft_token_ids.shape,
-                dtype=torch.float32,
-                device=logits.device,
-                generator=sampling_generator,
-            )
-        temperatures = top_k = top_p = recover_u = None
-        topk_candidates = 0
-        apply_topk_topp = True
-        if do_sampling:
-            assert params is not None and target_logits is not None
-            temperatures = params.temperatures[md.segment_ids]
-            top_k = params.top_k[md.segment_ids]
-            top_p = params.top_p[md.segment_ids]
-            topk_candidates = params.topk_candidates
-            apply_topk_topp = self._sampler_applies_topk_topp()
-            recover_u = torch.rand_like(
-                target_logits, dtype=torch.float32, generator=sampling_generator
-            )
-        next_tokens = self.rejection_sampler(
-            draft_token_ids=draft_token_ids,
-            num_draft_tokens=md.draft_lengths,
-            target_logits=target_logits,
-            bonus_token_ids=bonus_token_ids,
-            segment_ids=md.segment_ids,
-            group_indices=md.group_indices,
-            max_draft_tokens=max_draft_tokens,
-            temperatures=temperatures,
-            top_k=top_k,
-            top_p=top_p,
-            accept_u=accept_u,
-            recover_u=recover_u,
-            do_sampling=do_sampling,
-            topk_candidates=topk_candidates,
-            target_argmax=target_argmax,
-            apply_topk_topp=apply_topk_topp,
-        )
-        for proc in processors:
-            proc.finish(next_tokens)
-        return next_tokens
-
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -5738,11 +5434,19 @@ class TPUModelRunner(GPUModelRunner):
             tb_chunk = tb_step.plain_chunk(start_idx, end_idx)
             return () if tb_chunk is None else (tb_chunk,)
 
+        step = chunk_sampling.StepContext(
+            top_tokens=state.top_tokens,
+            all_greedy=self.input_batch.all_greedy,
+            sampling_generator=sampling_generator,
+            grammar_output=grammar_output,
+            scheduler_output=scheduler_output,
+            min_toks=min_toks,
+            rep_pen=rep_pen,
+        )
         if self.is_pooling_model:
             self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
             cur_start_idx = 0
-            all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
                 state.logits_list,
                 state.num_reqs_list,
@@ -5758,17 +5462,13 @@ class TPUModelRunner(GPUModelRunner):
                         if tb_chunk is not None:
                             spec_processors.append(tb_chunk)
                     with self._stage_timing.stage("sample"):
-                        next_tokens = self._sample_spec_verify_chunk(
+                        next_tokens = chunk_sampling.sample_spec_verify_chunk(
+                            self,
+                            step,
                             logits,
                             md,
-                            grammar_output,
-                            scheduler_output,
                             cur_start_idx,
                             cur_end_idx,
-                            all_greedy,
-                            sampling_generator,
-                            state.top_tokens,
-                            min_toks,
                             spec_processors,
                         )
                     combined_selected_tokens.append(next_tokens)
@@ -5796,18 +5496,12 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                 else:
-                    selected, logprob_logits = self._sample_plain_chunk(
+                    selected, logprob_logits = chunk_sampling.sample_plain_chunk(
+                        self,
+                        step,
                         logits,
                         cur_start_idx=cur_start_idx,
                         cur_end_idx=cur_end_idx,
-                        top_tokens=state.top_tokens,
-                        all_greedy=all_greedy,
-                        sampling_generator=sampling_generator,
-                        grammar_output=grammar_output,
-                        scheduler_output=scheduler_output,
-                        is_spec_step=True,
-                        min_toks=min_toks,
-                        rep_pen=rep_pen,
                         processors=plain_processors(cur_start_idx, cur_end_idx),
                     )
                     assert self.speculative_config is not None
@@ -5838,7 +5532,6 @@ class TPUModelRunner(GPUModelRunner):
                 cur_start_idx = cur_end_idx
         else:
             cur_start_idx = 0
-            all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, mamba_indices in zip(
                 state.logits_list, state.num_reqs_list, mamba_idx_list
             ):
@@ -5846,18 +5539,12 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
-                selected_token_ids, logprob_logits = self._sample_plain_chunk(
+                selected_token_ids, logprob_logits = chunk_sampling.sample_plain_chunk(
+                    self,
+                    step,
                     logits,
                     cur_start_idx=cur_start_idx,
                     cur_end_idx=cur_end_idx,
-                    top_tokens=state.top_tokens,
-                    all_greedy=all_greedy,
-                    sampling_generator=sampling_generator,
-                    grammar_output=grammar_output,
-                    scheduler_output=scheduler_output,
-                    is_spec_step=False,
-                    min_toks=min_toks,
-                    rep_pen=rep_pen,
                     processors=plain_processors(cur_start_idx, cur_end_idx),
                 )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
@@ -7452,7 +7139,7 @@ class TPUModelRunner(GPUModelRunner):
         ``drafter.precompile()`` (draft forward only), so they recompile every
         time the verify length (``padded_logits_length``) lands in a new
         num-tokens bucket as requests finish and the batch shrinks. Replay the
-        verify inner body (``_sample_spec_verify_chunk``) at every
+        verify inner body (``chunk_sampling.sample_spec_verify_chunk``) at every
         ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
         produce so the real call is a cache hit. Shared sync + async.
 

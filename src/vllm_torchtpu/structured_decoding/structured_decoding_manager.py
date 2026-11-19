@@ -169,16 +169,16 @@ class StructuredDecodingManager:
 
     def prepare_spec_structured_decoding_input(
         self,
-        target_logits: torch.Tensor | None,
+        target_logits: torch.Tensor,
         bonus_logits: torch.Tensor,
         grammar_output: GrammarOutput,
         scheduled_spec_decode_tokens: Mapping[str, Sequence[int]],
-        draft_lengths_cpu: np.ndarray | None,
+        draft_lengths_cpu: np.ndarray,
         cur_start_idx: int,
         cur_end_idx: int,
     ) -> tuple[
-        torch.Tensor | None,
-        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -191,23 +191,18 @@ class StructuredDecodingManager:
         step and row `s_r` covers the bonus token.
 
         Returns `(require_target, target_bitmask, require_bonus,
-        bonus_bitmask, arange)`; the first two are None when `target_logits`
-        is None.
+        bonus_bitmask, arange)`.
         """
         padded_bonus_rows = bonus_logits.shape[0]
         self.grammar_bitmask_cpu[:padded_bonus_rows].zero_()
         self.require_structured_out_cpu[:padded_bonus_rows].zero_()
 
-        padded_target_rows = 0
-        target_row_starts = None
-        if target_logits is not None:
-            assert draft_lengths_cpu is not None
-            padded_target_rows = target_logits.shape[0]
-            self.target_grammar_bitmask_cpu[:padded_target_rows].zero_()
-            self.require_structured_out_target_cpu[:padded_target_rows].zero_()
-            # Chunk-local start row of each request's drafts in target_logits.
-            target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int64)
-            np.cumsum(draft_lengths_cpu, out=target_row_starts[1:])
+        padded_target_rows = target_logits.shape[0]
+        self.target_grammar_bitmask_cpu[:padded_target_rows].zero_()
+        self.require_structured_out_target_cpu[:padded_target_rows].zero_()
+        # Chunk-local start row of each request's drafts in target_logits.
+        target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int64)
+        np.cumsum(draft_lengths_cpu, out=target_row_starts[1:])
 
         req_id_to_index = self.runner.input_batch.req_id_to_index
         bitmask = grammar_output.grammar_bitmask
@@ -221,10 +216,6 @@ class StructuredDecodingManager:
                 continue
             local_index = batch_index - cur_start_idx
             if num_drafts:
-                assert target_row_starts is not None, (
-                    f"chunk without target_logits scheduled drafts for request {req_id}"
-                )
-                assert draft_lengths_cpu is not None
                 if draft_lengths_cpu[local_index] != num_drafts:
                     raise ValueError(
                         f"Draft lengths mismatch for request {req_id}: "
@@ -242,16 +233,12 @@ class StructuredDecodingManager:
             )
             self.require_structured_out_cpu[local_index] = True
 
-        if target_logits is not None:
-            require_target = self.require_structured_out_target_cpu[
-                :padded_target_rows
-            ].to(bonus_logits.device)
-            target_bitmask = self.target_grammar_bitmask_cpu[:padded_target_rows].to(
-                bonus_logits.device
-            )
-        else:
-            require_target = None
-            target_bitmask = None
+        require_target = self.require_structured_out_target_cpu[:padded_target_rows].to(
+            bonus_logits.device
+        )
+        target_bitmask = self.target_grammar_bitmask_cpu[:padded_target_rows].to(
+            bonus_logits.device
+        )
         return (
             require_target,
             target_bitmask,
@@ -291,21 +278,17 @@ class StructuredDecodingManager:
 
     def mask_spec_logits(
         self,
-        target_logits: torch.Tensor | None,
+        target_logits: torch.Tensor,
         bonus_logits: torch.Tensor,
         grammar_output: GrammarOutput,
         scheduled_spec_decode_tokens: Mapping[str, Sequence[int]],
-        draft_lengths_cpu: np.ndarray | None,
+        draft_lengths_cpu: np.ndarray,
         cur_start_idx: int,
         cur_end_idx: int,
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
-        """Applies the grammar bitmask to both bonus and target(if not None).
-
-        `target_logits` passes as None for non-draft chunks (when `md` is None),
-        where only the bonus applies.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Applies the grammar bitmask to both bonus and target logits."""
         num_reqs = cur_end_idx - cur_start_idx
-        num_target_rows = target_logits.shape[0] if target_logits is not None else 0
+        num_target_rows = target_logits.shape[0]
         num_bonus_rows = bonus_logits.shape[0]
         with TraceAnnotation(
             "SD:PrepareSpecInput",
@@ -334,12 +317,9 @@ class StructuredDecodingManager:
             cur_start_idx=cur_start_idx,
             cur_end_idx=cur_end_idx,
         ):
-            if target_logits is not None:
-                assert require_target is not None
-                assert target_bitmask is not None
-                target_logits = self.structured_decode(
-                    require_target, target_bitmask, target_logits, arange
-                )
+            target_logits = self.structured_decode(
+                require_target, target_bitmask, target_logits, arange
+            )
             bonus_logits = self.structured_decode(
                 require_bonus, bonus_bitmask, bonus_logits, arange
             )
