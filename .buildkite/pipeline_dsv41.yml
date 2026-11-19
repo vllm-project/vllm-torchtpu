@@ -136,6 +136,9 @@ steps:
             python -m pytest tests/models/vllm/test_dsv41_v2_attention_addressing.py
             -k "test_pure_swa_pallas_preserves_cache_addressing or test_swa_query_group_bridge_keeps_token_count_dynamic"
             -q --junitxml=perf_eval_results/dsv41-swa-parity.xml;
+            python -m pytest tests/spec_decode/test_dflash.py
+            -k test_compiled_input_builders_compile_no_program_per_request_count
+            --use-tpu -q --junitxml=perf_eval_results/dsv41-draft-compile.xml;
             env JAX_PLATFORMS=cpu python -m pytest
             tests/models/vllm/test_dsv41_v2_attention.py
             -k test_dsv41_attention_init_buffers_and_flags_bfloat16
@@ -162,6 +165,15 @@ steps:
             tests/scripts/test_dsv41_serve_recipe.py
             tests/scripts/test_dsv41_multihost_ci.py
             -q --junitxml=perf_eval_results/dsv41-benchmark-cpu.xml
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/spec_decode/test_dflash.py
+            -k "draft_padding_has_empty_attention_windows or dummy_draft_forward_marks_all_rows_padding or dummy_context_update_has_no_writable_cache_rows"
+            -q --junitxml=perf_eval_results/dsv41-draft-padding.xml
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/runner/test_min_tokens.py -m "not tpu_test"
+            -q --junitxml=perf_eval_results/dsv41-min-tokens.xml
 
       - label: "DeepSeek-V4.1 index configuration: CPU contracts"
         key: "dsv41_kernel_config_cpu"

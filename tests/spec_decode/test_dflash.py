@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from types import SimpleNamespace
 from unittest import mock
 
@@ -467,7 +468,7 @@ def test_prepare_dflash_inputs(device):
         [[101, 102, 103, -1], [201, 202, -1, -1]], dtype=torch.int32, device=device
     )
 
-    input_ids, position_ids, seq_lens = proposer._prepare_dflash_inputs(
+    input_ids, position_ids, seq_lens, _, _ = proposer._prepare_dflash_inputs(
         chunk, next_tokens_device=next_tokens_device
     )
 
@@ -568,6 +569,8 @@ def test_propose_unit(device):
             torch.zeros(8, dtype=torch.int32, device=device),
             torch.zeros(8, dtype=torch.int32, device=device),
             torch.zeros(2, dtype=torch.int32, device=device),
+            torch.tensor([0, 4, 8], dtype=torch.int32, device=device),
+            torch.tensor([0, 0, 2], dtype=torch.int32, device=device),
         )
     )
     proposer._update_draft_kv_cache_from_target = mock.MagicMock()
@@ -649,7 +652,9 @@ def test_propose_marks_padding_for_draft_rows():
         return_value=(
             torch.zeros(16, dtype=torch.int32),
             torch.zeros(16, dtype=torch.int32),
-            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(4, dtype=torch.int32),
+            torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32),
+            torch.tensor([0, 0, 2], dtype=torch.int32),
         )
     )
     proposer._build_draft_attn_metadata = mock.MagicMock(return_value={})
@@ -685,6 +690,11 @@ def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
     )
 
     assert mask == [True] * 8
+    metadata = proposer._build_attn_metadata_for_draft.call_args.kwargs
+    assert metadata["num_reqs"] == 0
+    assert metadata["padded_num_reqs"] == 2
+    for name in ("seq_lens", "query_start_loc", "request_distribution"):
+        assert torch.count_nonzero(metadata[name]) == 0
 
 
 def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
@@ -757,7 +767,7 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
         [[101, 102, 103, -1]], dtype=torch.int32, device=device
     )
 
-    input_ids, position_ids, _ = proposer._prepare_dflash_inputs(
+    input_ids, position_ids, _, _, _ = proposer._prepare_dflash_inputs(
         chunk, next_tokens_device=next_tokens_device
     )
 
@@ -810,7 +820,7 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     shape bucket is one program however many requests are live."""
     if device.type != "tpu":
         pytest.skip("needs the TPU compile cache")
-    K, block, rows, padded_len = 5, 5, 32, 128
+    K, block, rows, padded_len = 5, 5, 32, 160
     proposer = DFlashProposer.__new__(DFlashProposer)
     proposer._max_model_len = 9216
     proposer.mask_token_id = 7777
@@ -822,29 +832,32 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
         nr = torch.tensor(num_reqs, dtype=torch.int32).to(device)
         if builder == "seed":
             seed = torch.ones(rows, dtype=torch.int32).to(device)
-            return proposer._tpu_build_dflash_inputs_seed(
+            result = proposer._tpu_build_dflash_inputs_seed(
                 seed, qsl, pos, nr, block, padded_len, 7777
             )
-        next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
-        draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
-        return proposer._tpu_build_dflash_inputs_next_tokens(
-            next_tokens,
-            qsl,
-            pos,
-            draft_lengths,
-            nr,
-            block,
-            padded_len,
-            7777,
-            INVALID_TOKEN_ID,
-        )
+        else:
+            next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
+            draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
+            result = proposer._tpu_build_dflash_inputs_next_tokens(
+                next_tokens,
+                qsl,
+                pos,
+                draft_lengths,
+                nr,
+                block,
+                padded_len,
+                7777,
+                INVALID_TOKEN_ID,
+            )
+        dflash_module.synchronize_tensors(result, wait=True)
+        return result
 
     def programs() -> int:
         return len(torch.tpu._get_cache_stats().per_entry_stats)
 
     run(1)  # the first use of the shape may compile
     before = programs()
-    for num_reqs in (2, 17, 32):
+    for num_reqs in (0, 2, 15, 16, 17, 19, 32):
         run(num_reqs)
     assert programs() == before, (
         f"{builder} builder compiled a program per request count"
@@ -926,3 +939,90 @@ def test_context_only_prefill_requires_captured_aux_states(chunks):
     with pytest.raises(RuntimeError, match="requires"):
         proposer.prepare_prefill_handoff()
     proposer._update_draft_kv_cache_from_target.assert_not_called()
+
+
+@pytest.mark.parametrize("builder", ["seed", "next_tokens"])
+@pytest.mark.parametrize("num_reqs", [0, 1, 15, 16, 19, 32])
+@pytest.mark.parametrize("block_size", [4, 5])
+def test_draft_padding_has_empty_attention_windows(builder, num_reqs, block_size):
+    """Padding must not expose null pages or writable cache records."""
+    proposer = DFlashProposer.__new__(DFlashProposer)
+    proposer._max_model_len = 9216
+    rows = 32
+    qsl = torch.arange(rows + 1, dtype=torch.int32) * 6
+    positions = torch.arange(rows * 6, dtype=torch.int32)
+    live = torch.tensor(num_reqs, dtype=torch.int32)
+    if builder == "seed":
+        result = inspect.unwrap(DFlashProposer._tpu_build_dflash_inputs_seed)(
+            proposer,
+            torch.ones(rows, dtype=torch.int32),
+            qsl,
+            positions,
+            live,
+            block_size,
+            rows * block_size,
+            7777,
+        )
+    else:
+        result = inspect.unwrap(DFlashProposer._tpu_build_dflash_inputs_next_tokens)(
+            proposer,
+            torch.ones((rows, 6), dtype=torch.int32),
+            qsl,
+            positions,
+            torch.full((rows,), 5, dtype=torch.int32),
+            live,
+            block_size,
+            rows * block_size,
+            7777,
+            INVALID_TOKEN_ID,
+        )
+    ids, pos, lengths, starts, distribution = result
+    assert ids.shape == pos.shape == (rows * block_size,)
+    torch.testing.assert_close(
+        starts,
+        torch.arange(rows + 1, dtype=torch.int32).clamp(max=num_reqs) * block_size,
+    )
+    torch.testing.assert_close(
+        distribution, torch.tensor([0, 0, num_reqs], dtype=torch.int32)
+    )
+    assert torch.all(lengths[num_reqs:] == 0)
+    torch.testing.assert_close(
+        lengths[:num_reqs],
+        torch.arange(1, num_reqs + 1, dtype=torch.int32) * 6 + block_size,
+    )
+    torch.testing.assert_close(
+        pos[: num_reqs * block_size].reshape(num_reqs, block_size),
+        torch.arange(1, num_reqs + 1, dtype=torch.int32)[:, None] * 6
+        + torch.arange(block_size, dtype=torch.int32)[None, :],
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [6, 80, 96, 160, 192, 240, 2048])
+def test_dummy_context_update_has_no_writable_cache_rows(num_tokens):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark
+
+    proposer = _make_proposer()
+    proposer.vllm_config.model_config.get_hidden_size = lambda: 8
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=torch.nn.Embedding(2, 8))
+    )
+    hidden, metadata = proposer._dummy_kv_update_inputs(num_tokens, 48, 4)
+    assert proposer._dummy_kv_update_inputs(num_tokens, 48, 4) == (hidden, metadata)
+    assert not metadata.request_distribution.any()
+    assert not metadata.seq_lens.any()
+    attn = SimpleNamespace(
+        window_size=128,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.ones((2, 64, 8))),
+    )
+    before = attn.swa_cache_layer.kv_cache.clone()
+    slots = dspark._cache_slots(
+        attn.swa_cache_layer.kv_cache, metadata, metadata.input_positions
+    )
+    assert torch.all(slots == -1)
+    dspark._insert_context_kv(
+        attn,
+        torch.full_like(hidden[0], float("nan")),
+        metadata.input_positions,
+        metadata,
+    )
+    torch.testing.assert_close(attn.swa_cache_layer.kv_cache, before)
