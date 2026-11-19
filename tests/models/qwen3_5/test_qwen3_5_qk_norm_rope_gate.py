@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The fused q/k norm + rope + gate kernel against vLLM's eager path in jnp, at
-a served per-core geometry (4 q heads, 1 kv head of 256, 64 rotary dims) and a
+the served per-core geometries (32, 16 and 4 q heads with 2, 1 and 1 kv heads
+of 256 and 64 rotary dims: the 397B attention at TP1, TP2 and TP8) and a
 full-rope one."""
 
 import jax
@@ -25,7 +26,8 @@ from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate import (
     reference,
 )
 
-GEOMETRIES = [(4, 1, 256, 64), (16, 1, 256, 64), (2, 2, 128, 128)]
+GEOMETRIES = [(32, 2, 256, 64), (16, 1, 256, 64), (4, 1, 256, 64), (2, 2, 128, 128)]
+GEOMETRY_IDS = ["tp1", "tp2", "tp8", "full_rope"]
 
 
 def _operands(seed, tokens, heads, kv_heads, dim, rot):
@@ -41,13 +43,15 @@ def _operands(seed, tokens, heads, kv_heads, dim, rot):
     return q_gate, k, q_w, k_w, cos_sin
 
 
-def _assert_parity(tokens, geometry, interpret, tile=512):
+def _assert_parity(tokens, geometry, interpret, tile=None):
+    """``tile=None`` runs the kernel's default tile, as serving does."""
     heads, kv_heads, dim, rot = geometry
     operands = _operands(tokens * 3 + heads, tokens, heads, kv_heads, dim, rot)
     kw = dict(heads=heads, kv_heads=kv_heads, dim=dim, rot=rot, eps=1e-6)
-    got = jax.block_until_ready(
-        qk_norm_rope_gate(*operands, **kw, tile=tile, interpret=interpret)
-    )
+    if tile is not None:
+        kw["tile"] = tile
+    got = jax.block_until_ready(qk_norm_rope_gate(*operands, **kw, interpret=interpret))
+    kw.pop("tile", None)
     want = reference(*operands, **kw)
     for a, b in zip(got, want):
         assert a.shape == b.shape and a.dtype == b.dtype
@@ -57,8 +61,8 @@ def _assert_parity(tokens, geometry, interpret, tile=512):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("tokens, tile", [(13, 512), (24, 8)])
-@pytest.mark.parametrize("geometry", GEOMETRIES)
+@pytest.mark.parametrize("tokens, tile", [(13, None), (24, 8)])
+@pytest.mark.parametrize("geometry", GEOMETRIES, ids=GEOMETRY_IDS)
 def test_parity_in_the_interpreter(tokens, tile, geometry):
     with jax.default_device(jax.devices("cpu")[0]):
         _assert_parity(tokens, geometry, interpret=True, tile=tile)
@@ -66,7 +70,7 @@ def test_parity_in_the_interpreter(tokens, tile, geometry):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32, 64, 1024, 4096, 8192])
-@pytest.mark.parametrize("geometry", GEOMETRIES)
+@pytest.mark.parametrize("geometry", GEOMETRIES, ids=GEOMETRY_IDS)
 def test_parity(tokens, geometry):
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")
