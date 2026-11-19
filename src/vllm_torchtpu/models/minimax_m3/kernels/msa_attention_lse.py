@@ -243,13 +243,17 @@ def _page_cache(
     padding as ``key_bound``) above the entry position and the position above
     ``slot + 1`` (clamped at ``cache_size + 1``: past it the call streams and
     the slots are not used); "packed_search" finds the distinct keys by a
-    binary search of the slot counts instead of a sort. Callers check
+    binary search of the slot counts instead of a sort; "packed_batched"
+    runs the packed distinct-key sort and the packed inverse-permutation sort
+    (independent of each other) as one batched sort of two rows, so the call
+    waits for two sort latencies instead of three. Callers check
     `_packed_sort_fits` for the packed modes. The table is the same bit for
     bit."""
     rows = pages.reshape(num_tiles, -1)
     width = min(width or PAGE_CACHE_TILE_PAGES, rows.shape[1])
     head = rows[:, :width].reshape(-1)
-    if mode in ("packed", "packed_search"):
+    packed_modes = ("packed", "packed_search", "packed_batched")
+    if mode in packed_modes:
         n = head.shape[0]
         pos_bits = max(1, (n - 1).bit_length())
         slot_bits = (cache_size + 1).bit_length()
@@ -270,7 +274,28 @@ def _page_cache(
     new = new & (key != no_page)
     slot = jnp.cumsum(new, dtype=jnp.int32) - 1
     num_distinct = slot[-1] + 1
-    if mode == "packed_search":
+    by_position = None
+    if mode == "packed_batched":
+        # Both rows are non-negative int32 below 2^31 (`_packed_sort_fits`).
+        both = jax.lax.sort(
+            jnp.stack(
+                [
+                    jnp.where(new, key, no_page),
+                    (position << slot_bits)
+                    | jnp.minimum(slot + 1, cache_size + 1),
+                ]
+            ),
+            dimension=1,
+            is_stable=False,
+        )
+        distinct = both[0, :cache_size]
+        distinct = jnp.pad(
+            distinct,
+            (0, cache_size - distinct.shape[0]),
+            constant_values=no_page,
+        )
+        by_position = both[1]
+    elif mode == "packed_search":
         # Slot counts ascend: the j-th distinct key is the first entry whose
         # slot reaches j.
         nth = jnp.arange(cache_size, dtype=jnp.int32)
@@ -287,11 +312,12 @@ def _page_cache(
             (0, cache_size - distinct.shape[0]),
             constant_values=no_page,
         )
-    if mode in ("packed", "packed_search"):
-        by_position = jax.lax.sort(
-            (position << slot_bits) | jnp.minimum(slot + 1, cache_size + 1),
-            is_stable=False,
-        )
+    if mode in packed_modes:
+        if by_position is None:
+            by_position = jax.lax.sort(
+                (position << slot_bits) | jnp.minimum(slot + 1, cache_size + 1),
+                is_stable=False,
+            )
         slot = (by_position & ((1 << slot_bits) - 1)) - 1
     else:
         _, slot = jax.lax.sort(
@@ -328,12 +354,12 @@ def _page_cache_tables(
 
     full = min(tile_pages or PAGE_CACHE_TILE_PAGES, unions.shape[1] // num_tiles)
     mode = envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT.strip().lower()
-    if mode not in ("", "unstable", "packed", "packed_search"):
+    if mode not in ("", "unstable", "packed", "packed_search", "packed_batched"):
         raise ValueError(f"TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT={mode!r}")
     spec = envs.TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS.replace(",", "/")
     widths = sorted({int(w) for w in spec.split("/") if w.strip()})
     widths = [w for w in widths if 0 < w < full] + [full]
-    if mode in ("packed", "packed_search") and not _packed_sort_fits(
+    if mode in ("packed", "packed_search", "packed_batched") and not _packed_sort_fits(
         num_tiles * full, cache_size, key_bound
     ):
         mode = "unstable"

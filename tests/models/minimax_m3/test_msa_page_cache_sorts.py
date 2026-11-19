@@ -31,6 +31,8 @@ COMBOS = (
     ("", "16/48"),
     ("packed", "64/128"),
     ("packed_search", "8/32/96/160"),
+    ("packed_batched", ""),
+    ("packed_batched", "64/128"),
 )
 
 

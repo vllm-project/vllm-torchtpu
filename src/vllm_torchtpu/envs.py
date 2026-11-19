@@ -117,6 +117,9 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_ROUTER_TOPK_VALUES: bool = False
+    TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS: int = 0
+    TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS: int = 0
+    TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS: int = 0
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
@@ -977,6 +980,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
+    # Router top-k kernel (`kernels/router_topk.select`): calls of at least
+    # this many rows (a multiple of 128) run the transposed kernel (experts
+    # on sublanes, rows on lanes: VPU reductions instead of cross-lane XLU
+    # ones). 0 (default) keeps the row kernel. Same picks bit for bit.
+    # MiniMax M3 fused qk norm + rope kernel: token block of calls with at
+    # least this many tokens (0, default: the kernel's 256). Fewer grid
+    # steps on large prefill chunks; same bits.
+    "TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS": env_int(
+        "TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS", 0
+    ),
+    # MoE router with a score-correction bias: calls of at least this many
+    # rows (a multiple of 128) pick the top-k of scores + bias and gather the
+    # unbiased scores in one transposed kernel pass instead of an add, the
+    # top-k kernel and an XLA gather. 0 (default) keeps the unfused path.
+    # Same weights and ids bit for bit.
+    "TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS": env_int(
+        "TPU_ROUTER_TOPK_FUSED_BIAS_MIN_ROWS", 0
+    ),
+    "TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS": env_int(
+        "TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS", 0
+    ),
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
@@ -1679,7 +1703,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
     # "unstable" drops the stability; "packed" sorts one packed int32 operand
     # per sort, unstable; "packed_search" also finds the distinct keys by a
-    # binary search instead of the second sort. Same table bit for bit.
+    # binary search instead of the second sort; "packed_batched" runs the
+    # second and third packed sorts as one two-row sort (they are
+    # independent). Same table bit for bit.
     "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT": env_str(
         "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT", ""
     ),
