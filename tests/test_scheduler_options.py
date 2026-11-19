@@ -22,10 +22,7 @@ import yaml
 from vllm_torchtpu import additional_config_sections
 from vllm_torchtpu.core import scheduler_options
 from vllm_torchtpu.models import qwen3_5
-from vllm_torchtpu.runner.utils import (
-    HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
-    SCHEDULER_OPTIONS_SECTION,
-)
+from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 
 def test_defaults_are_mains_behaviour():
@@ -71,7 +68,6 @@ def test_parse_is_strict(raw, match):
 
 
 def test_section_is_registered_and_kept_out_of_the_compile_cache_key():
-    assert scheduler_options.SECTION == SCHEDULER_OPTIONS_SECTION
     assert scheduler_options.SECTION in additional_config_sections.KNOWN_SECTIONS
     assert scheduler_options.SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
