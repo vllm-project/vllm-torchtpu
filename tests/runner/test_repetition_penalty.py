@@ -198,6 +198,16 @@ class TestTracker:
         assert tracker.begin_step(_batch(rows, ["b"]))
         assert sorted(tracker._seen) == ["b"]
 
+    def test_step_without_a_penalized_request_drops_all_bitmasks(self):
+        """The last penalized request finished: nothing is kept for it."""
+        tracker = _tracker(vocab_size=8)
+        requests = {"a": SimpleNamespace(prompt_token_ids=[1])}
+        batch = _batch({"a": (1.1, [])}, ["a"])
+        tracker.build_plain_inputs(batch, requests, 0, 1, num_rows=1)
+        assert sorted(tracker._seen) == ["a"]
+        assert not tracker.begin_step(_batch({"b": (1.0, [])}, ["b"]))
+        assert tracker._seen == {}
+
 
 @pytest.mark.usefixtures("eager")
 class TestScalingMath:

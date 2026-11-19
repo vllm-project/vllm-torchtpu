@@ -144,6 +144,7 @@ class RepetitionPenaltyTracker:
         no longer penalized."""
         penalized = input_batch.repetition_penalties_reqs
         if not penalized:
+            self._seen.clear()
             return False
         if not self.supported:
             logger.warning_once(
