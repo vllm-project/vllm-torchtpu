@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, get_args
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -398,6 +398,11 @@ DOUBLE_BUFFER_SLOTS = 2
 GROUPED_MOE_MODES: frozenset[str] = frozenset({"grouped_on_chip"})
 # Expert layouts a deployment may declare for a megakernel call.
 DECLARED_MOE_LAYOUTS: frozenset[str] = frozenset({"grouped", "masked"})
+CollectiveStepKind = Literal["routed_transport", "split_kv", "dcp_gather"]
+DeclaredExpertMode = Literal["tp", "ep"]
+GainBasis = Literal["calibrated_whole_server_e2e", "fused_scope_device_estimate"]
+DECLARED_COLLECTIVE_KINDS: frozenset[str] = frozenset(get_args(CollectiveStepKind))
+DECLARED_EXPERT_MODES: frozenset[str] = frozenset(get_args(DeclaredExpertMode))
 VALID_DMA_BUFFERS = (2, 3)
 # Phases a megakernel declaration covers when it lists none.
 DEFAULT_DECLARED_PHASES: tuple[str, ...] = ("decode", "verify")
@@ -409,7 +414,9 @@ ARENA_ALIGN_RESERVE_BYTES = 2 << 20
 ATTN_TILE_TOKENS = 128
 GDN_STREAMED_HEADS_CAP = 8
 DENSE_FFN_TILE_CAP = 1024
+BF16_BYTES = 2
 FP32_BYTES = 4
+LSE_SCALARS_PER_HEAD = 1
 SUBCHANNEL_BLOCK_K_THRESHOLD = 512
 SUBCHANNEL_VPU_OPS_PER_BLOCK = 2.0
 # Elements per 32-bit vector word: 4 at the widest packing of 8-bit elements, and 8
@@ -433,6 +440,19 @@ DOT_FP8 = "fp8"
 DOT_BF16 = "bf16"
 AB_KNOB = "ab_step_time"
 SETTLE_CMD = "Pass --measurements measurements.json (schema advisor.measurements.v1)"
+DEFAULT_DECLARED_CALLS_PER_LAYER = 2
+GAIN_BASIS_E2E, GAIN_BASIS_ESTIMATE = get_args(GainBasis)
+HOST_HEAD_SETTLE_CMD = (
+    "Pass --host-head-us per_op=<us>,fused=<us> or run advisor calibrate on "
+    "an XPlane trace with XLA Modules"
+)
+PER_OP_STEP_SETTLE_CMD = (
+    "Pass --per-op-step-us <us> or --measurements measurements.json from the "
+    "served baseline image"
+)
+DECODING_SEQS_SETTLE_CMD = (
+    "Pass --decoding-seqs <N> or --output-tok-s <rate> --mean-tpot-ms <ms>"
+)
 CORNER_AXES: Mapping[str, int] = {
     "launch_gap_us": 0,
     "collective_latency_us": 1,

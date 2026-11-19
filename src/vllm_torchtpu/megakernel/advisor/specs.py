@@ -20,17 +20,23 @@ import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, TypedDict
+from typing import TYPE_CHECKING, ClassVar, Literal, TypedDict, get_args
 
 from ..core import errors
 from . import chips, constants
 from .constants import (
     COLLECTIVE_PATH_XLA,
     EFFICIENCY_BRACKETS,
+    GAIN_BASIS_ESTIMATE,
     MEASUREMENTS_SCHEMA,
     VALID_COLLECTIVE_PATHS,
+    GainBasis,
 )
-from .models import ModelProfile, ParallelLayout
+from .models import (
+    InCallExpertMode,
+    ModelProfile,
+    ParallelLayout,
+)
 
 if TYPE_CHECKING:
     from ..core.exec_spec import Tiles
@@ -46,6 +52,7 @@ ProvenanceTag = Literal["DERIVED", "ASSUMED", "MEASURED"]
 ObjectiveMode = Literal["step", "throughput", "both"]
 DispatchRegime = Literal["auto", "zero_floor", "compiled_xla", "unfused_eager"]
 SupportStatus = Literal["baseline", "within_core_limits", "declared", "hypothetical"]
+VALID_SOURCE_SCOPES: frozenset[str] = frozenset({"", *get_args(FusionScope)})
 
 SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
     {"gqa", "mla", "gdn", "kda", "dense_mlp", "moe"}
@@ -85,7 +92,7 @@ def _scalar_int(val: object, field_name: str) -> int:
 class ProvenanceMetric(TypedDict):
     """Single output metric value paired with its provenance tag, source, and band."""
 
-    value: float | int | bool
+    value: float | int | bool | str
     unit: str
     tag: ProvenanceTag
     source: str
@@ -144,12 +151,18 @@ class MeasurementsData:
 
     source_desc: str
     source_kind: str = "trace"
+    source_image: str = ""
+    source_scope: str = ""
     launch_gap_p50_us: float | None = None
     launch_gap_p90_us: float | None = None
     launch_gap_n: int = 0
     collective_calls: tuple[CollectiveCall, ...] = ()
     step_coverage: float | None = None
     step_time_us: float | None = None
+    per_op_step_us: float | None = None
+    host_head_p50_us: float | None = None
+    host_head_p90_us: float | None = None
+    host_head_n: int = 0
     dcn_bw_gbps: float | None = None
     ring_plan: RingPlan | None = None
 
@@ -322,41 +335,50 @@ def _load_measurements_payload(
             raise errors.MegakernelConfigError(msg)
 
 
-def _parse_launch_gap(
+def _parse_nonneg_quantiles(
     payload: Mapping[str, object],
+    field_name: str,
 ) -> tuple[float | None, float | None, int]:
-    """Parse optional launch_gap_us statistics, failing closed on bad scalars."""
-    lg_map = _optional_mapping(payload.get("launch_gap_us"), "launch_gap_us")
-    if "p50" not in lg_map:
+    """Parse optional `{p50, p90, n}` quantile statistics in microseconds."""
+    stat_map = _optional_mapping(payload.get(field_name), field_name)
+    if "p50" not in stat_map:
         return None, None, 0
-    lg_p50 = _scalar_float(lg_map["p50"], "launch_gap_us.p50")
-    if lg_p50 < 0.0:
-        msg = f"launch_gap_us.p50 must be >= 0, got {lg_p50}"
+    p50_val = _scalar_float(stat_map["p50"], f"{field_name}.p50")
+    if p50_val < 0.0:
+        msg = f"{field_name}.p50 must be >= 0, got {p50_val}"
         raise errors.MegakernelConfigError(msg)
-    lg_p90 = _scalar_float(lg_map.get("p90", lg_p50), "launch_gap_us.p90")
-    if lg_p90 < 0.0:
-        msg = f"launch_gap_us.p90 must be >= 0, got {lg_p90}"
+    p90_val = _scalar_float(stat_map.get("p90", p50_val), f"{field_name}.p90")
+    if p90_val < 0.0:
+        msg = f"{field_name}.p90 must be >= 0, got {p90_val}"
         raise errors.MegakernelConfigError(msg)
-    lg_n = _scalar_int(lg_map.get("n", 0), "launch_gap_us.n")
-    if lg_n < 0:
-        msg = f"launch_gap_us.n must be >= 0, got {lg_n}"
+    n_val = _scalar_int(stat_map.get("n", 0), f"{field_name}.n")
+    if n_val < 0:
+        msg = f"{field_name}.n must be >= 0, got {n_val}"
         raise errors.MegakernelConfigError(msg)
-    return lg_p50, lg_p90, lg_n
+    return p50_val, p90_val, n_val
 
 
-def _parse_step_time(st_raw: object) -> float | None:
-    """Parse optional step_time_us scalar or `{p50: ...}` mapping."""
+def _parse_step_time(
+    st_raw: object,
+    field_name: str = "step_time_us",
+    *,
+    strictly_positive: bool = False,
+) -> float | None:
+    """Parse optional step latency scalar or `{p50: ...}` mapping."""
     match st_raw:
         case None:
             return None
         case Mapping() as st_map:
             if "p50" not in st_map:
                 return None
-            st_val = _scalar_float(st_map["p50"], "step_time_us.p50")
+            st_val = _scalar_float(st_map["p50"], f"{field_name}.p50")
         case _:
-            st_val = _scalar_float(st_raw, "step_time_us")
+            st_val = _scalar_float(st_raw, field_name)
+    if strictly_positive and st_val <= 0.0:
+        msg = f"{field_name} must be > 0, got {st_val}"
+        raise errors.MegakernelConfigError(msg)
     if st_val < 0.0:
-        msg = f"step_time_us must be >= 0, got {st_val}"
+        msg = f"{field_name} must be >= 0, got {st_val}"
         raise errors.MegakernelConfigError(msg)
     return st_val
 
@@ -379,9 +401,20 @@ def load_measurements(
     src_map = _optional_mapping(payload.get("source"), "source")
     src_kind = _scalar_str(src_map.get("kind", "trace"), "source.kind")
     src_file = _scalar_str(src_map.get("file", file_label), "source.file")
+    src_image = _scalar_str(src_map.get("image", ""), "source.image").strip()
+    src_scope = _scalar_str(src_map.get("scope", ""), "source.scope").strip()
+    if src_scope not in VALID_SOURCE_SCOPES:
+        msg = (
+            f"source.scope must be one of {sorted(VALID_SOURCE_SCOPES)}, "
+            f"got {src_scope!r}"
+        )
+        raise errors.MegakernelConfigError(msg)
     src_desc = f"{src_kind}:{src_file}"
 
-    lg_p50, lg_p90, lg_n = _parse_launch_gap(payload)
+    lg_p50, lg_p90, lg_n = _parse_nonneg_quantiles(payload, "launch_gap_us")
+    host_head_p50, host_head_p90, host_head_n = _parse_nonneg_quantiles(
+        payload, "host_head_us"
+    )
     collective_calls = _parse_collective_calls(payload.get("collectives"))
 
     cov_map = _optional_mapping(payload.get("step_coverage"), "step_coverage")
@@ -398,6 +431,11 @@ def load_measurements(
         raise errors.MegakernelConfigError(msg)
 
     st_val = _parse_step_time(payload.get("step_time_us"))
+    per_op_step_val = _parse_step_time(
+        payload.get("per_op_step_us"),
+        "per_op_step_us",
+        strictly_positive=True,
+    )
 
     dcn_raw = payload.get("dcn_bw_gbps")
     dcn_val = _scalar_float(dcn_raw, "dcn_bw_gbps") if dcn_raw is not None else None
@@ -408,12 +446,18 @@ def load_measurements(
     return MeasurementsData(
         source_desc=src_desc,
         source_kind=src_kind,
+        source_image=src_image,
+        source_scope=src_scope,
         launch_gap_p50_us=lg_p50,
         launch_gap_p90_us=lg_p90,
         launch_gap_n=lg_n,
         collective_calls=collective_calls,
         step_coverage=cov_val,
         step_time_us=st_val,
+        per_op_step_us=per_op_step_val,
+        host_head_p50_us=host_head_p50,
+        host_head_p90_us=host_head_p90,
+        host_head_n=host_head_n,
         dcn_bw_gbps=dcn_val,
         ring_plan=_parse_ring_plan(payload.get("ring_plan")),
     )
@@ -483,6 +527,12 @@ class WorkloadSpec:
     # batch runs as separate calls that each stream their weights again.
     # 0: no declared limit.
     max_rows_per_call: int = 0
+    host_head_per_op_us: float = 0.0
+    host_head_fused_us: float = 0.0
+    host_head_explicit: bool = False
+    per_op_step_us: float | None = None
+    step_coverage: float | None = None
+    batch_explicit: bool = False
 
     def __post_init__(self) -> None:
         """Enforce non-negative finite scalar lengths and overhead inputs."""
@@ -498,10 +548,39 @@ class WorkloadSpec:
             if val < 0:
                 msg = f"WorkloadSpec.{field_name} must be >= 0, got {val}"
                 raise errors.MegakernelConfigError(msg)
-        if not math.isfinite(self.op_overhead_us) or self.op_overhead_us < 0.0:
+        for head_field, head_val in (
+            ("op_overhead_us", self.op_overhead_us),
+            ("host_head_per_op_us", self.host_head_per_op_us),
+            ("host_head_fused_us", self.host_head_fused_us),
+        ):
+            if (
+                isinstance(head_val, bool)
+                or not math.isfinite(head_val)
+                or head_val < 0.0
+            ):
+                msg = (
+                    f"WorkloadSpec.{head_field} must be finite and >= 0, "
+                    f"got {head_val!r}"
+                )
+                raise errors.MegakernelConfigError(msg)
+        if self.per_op_step_us is not None and (
+            isinstance(self.per_op_step_us, bool)
+            or not math.isfinite(self.per_op_step_us)
+            or self.per_op_step_us <= 0.0
+        ):
             msg = (
-                "WorkloadSpec.op_overhead_us must be finite and >= 0, "
-                f"got {self.op_overhead_us}"
+                "WorkloadSpec.per_op_step_us must be finite and > 0, "
+                f"got {self.per_op_step_us!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        if self.step_coverage is not None and (
+            isinstance(self.step_coverage, bool)
+            or not math.isfinite(self.step_coverage)
+            or not (0.0 < self.step_coverage <= 1.0)
+        ):
+            msg = (
+                "WorkloadSpec.step_coverage must be in (0, 1], "
+                f"got {self.step_coverage!r}"
             )
             raise errors.MegakernelConfigError(msg)
 
@@ -543,6 +622,9 @@ class ScopeEstimate:
     # The core is max(hbm_us, chain_us + comm_us) when fused, else
     # max(hbm_us, chain_us) + comm_us.
     chain_us: float = 0.0
+    expert_mode: InCallExpertMode = "none"
+    host_head_us: float = 0.0
+    break_even_host_head_delta_us: float = 0.0
 
     @property
     def step_ach_upper_us(self) -> float:
@@ -593,6 +675,7 @@ class AdvisorReport:
     fastest_verdict: str = "separate_likely"
     evidence: SupportStatus = "baseline"
     hypothetical_best: dict[str, object] | None = None
+    gain_basis: GainBasis = GAIN_BASIS_ESTIMATE
     coverage: str = (
         "decoder layer stack; excludes embedding, LM head, sampling, "
         "draft heads and modality towers"
@@ -662,6 +745,7 @@ class RegimeEntry:
     step_floor_strict_us: float = 0.0
     blockers: tuple[str, ...] = ()
     hypothetical_best: dict[str, object] | None = None
+    gain_basis: GainBasis = GAIN_BASIS_ESTIMATE
 
     @property
     def step_ach_upper_us(self) -> float:

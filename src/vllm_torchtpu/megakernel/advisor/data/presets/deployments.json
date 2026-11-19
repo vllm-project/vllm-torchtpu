@@ -25,7 +25,7 @@
         "dcp": 32,
         "spec_tokens": 7,
         "megakernel": {
-          "source": "Decode megakernel on TP32 x EP32 x DCP32: one call serves up to 128 rows across 8 expert owner groups (4 TP ranks per group sharing 112 of the 896 experts) and runs each expert on its own grouped rows",
+          "source": "Decode megakernel on TP32 x EP32 x DCP32: one call serves up to 128 rows across 8 expert owner groups (4 TP ranks per group sharing 112 of the 896 experts), runs each expert on its own grouped rows, and executes 94 attention/MLP all-reduces (93 attention layers plus 1 dense-MLP prefix layer while 92 MoE layers use group-8 routed transport), 8-group routed transport, and 32-way DCP gathers",
           "scopes": [
             "whole_step"
           ],
@@ -36,7 +36,22 @@
             "verify"
           ],
           "moe_layout": "grouped",
-          "expert_owner_groups": 8
+          "expert_owner_groups": 8,
+          "collectives": {
+            "all_reduces": 94,
+            "steps": [
+              {
+                "kind": "routed_transport",
+                "group_size": 8,
+                "calls_per_layer": 2
+              },
+              {
+                "kind": "dcp_gather",
+                "group_size": 32,
+                "calls_per_layer": 2
+              }
+            ]
+          }
         }
       },
       "prefill": {
@@ -72,7 +87,7 @@
         "dp": 2,
         "dcp": 16,
         "megakernel": {
-          "source": "Decode megakernel on TP16 x DP2 x EP32 x DCP16: one call covers both attention replicas, serves up to 128 rows across 8 expert owner groups (4 ranks per group sharing 112 of the 896 experts), and runs each expert on its own grouped rows",
+          "source": "Decode megakernel on TP16 x DP2 x EP32 x DCP16: one call covers both attention replicas, serves up to 128 rows across 8 expert owner groups (4 ranks per group sharing 112 of the 896 experts), runs each expert on its own grouped rows, and executes 94 attention/MLP all-reduces (93 attention layers plus 1 dense-MLP prefix layer while 92 MoE layers use group-8 routed transport), 8-group routed transport, and 16-way DCP gathers",
           "scopes": [
             "whole_step"
           ],
@@ -84,7 +99,22 @@
           ],
           "attention_dp_in_call": true,
           "moe_layout": "grouped",
-          "expert_owner_groups": 8
+          "expert_owner_groups": 8,
+          "collectives": {
+            "all_reduces": 94,
+            "steps": [
+              {
+                "kind": "routed_transport",
+                "group_size": 8,
+                "calls_per_layer": 2
+              },
+              {
+                "kind": "dcp_gather",
+                "group_size": 16,
+                "calls_per_layer": 2
+              }
+            ]
+          }
         }
       }
     },
@@ -96,7 +126,7 @@
         "dcp": 4,
         "spec_tokens": 3,
         "megakernel": {
-          "source": "Decode megakernel on TP8 x EP8 x DCP4: one call serves up to 112 rows, split calls serve up to 800 rows per step, and each expert runs on a masked batch",
+          "source": "Decode megakernel on TP8 x EP8 x DCP4: one call serves up to 112 rows, split calls serve up to 800 rows per step, rows up to 12 reshard experts to TP inside the call before switching to EP above 12 rows, split_kv exchanges partial attention across 4 DCP peers, and each expert runs on a masked batch",
           "scopes": [
             "whole_step"
           ],
@@ -107,7 +137,26 @@
             "decode",
             "verify"
           ],
-          "moe_layout": "masked"
+          "moe_layout": "masked",
+          "expert_mode_by_rows": [
+            {
+              "max_rows": 12,
+              "mode": "tp"
+            },
+            {
+              "max_rows": 800,
+              "mode": "ep"
+            }
+          ],
+          "collectives": {
+            "steps": [
+              {
+                "kind": "split_kv",
+                "group_size": 4,
+                "calls_per_layer": 2
+              }
+            ]
+          }
         }
       },
       "prefill": {
@@ -128,7 +177,7 @@
           "tp": 8,
           "ep": 8,
           "megakernel": {
-            "source": "Colocated decode megakernel on TP8 x EP8: one call serves up to 64 rows without splitting, and each expert runs on a masked batch",
+            "source": "Colocated decode megakernel on TP8 x EP8: one call serves up to 64 rows without splitting, split_kv exchanges partial attention across 4 KV-split peers per KV head (TP8 / 2 KV heads = 4), and each expert runs on a masked batch",
             "scopes": [
               "whole_step"
             ],
@@ -138,7 +187,16 @@
               "decode",
               "verify"
             ],
-            "moe_layout": "masked"
+            "moe_layout": "masked",
+            "collectives": {
+              "steps": [
+                {
+                  "kind": "split_kv",
+                  "group_size": 4,
+                  "calls_per_layer": 2
+                }
+              ]
+            }
           }
         }
       ]
