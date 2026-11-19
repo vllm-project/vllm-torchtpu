@@ -79,12 +79,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import (
-    expert_placement,
-    moe_lowtok_fused_op,
-    moe_routing,
-    token_padding,
-)
+from vllm_torchtpu.layers.adapter import expert_placement, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -1142,6 +1137,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             )
             self._tpu_fused_ep_eligible = layer._tpu_fused_ep_eligible
             setattr(self, FUSED_MOE_EP_OP_ATTR, None)
+            # Imported here: moe_lowtok_fused_op imports
+            # quantization.moe_lowtok_scores, and this package's __init__
+            # imports this module.
+            from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
+
             # After v3's prebuild: the fused few-token op serves only steps of
             # a layer v3 armed (_apply_owning_dispatch_v3).
             moe_lowtok_fused_op.maybe_prebuild(layer, self._moe_lowtok_scores_op)
@@ -1357,7 +1357,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         layer = cast("TpuRoutedExperts", layer)
         from vllm.distributed.parallel_state import get_ep_group
 
-        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+        # moe_lowtok_fused_op is imported here for the import cycle named in
+        # process_weights_after_loading.
+        from vllm_torchtpu.layers.adapter import (
+            moe_lowtok_fused_op,
+            small_all_reduce_op,
+        )
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             fused_moe_ep,
             fused_moe_ep_supported,
