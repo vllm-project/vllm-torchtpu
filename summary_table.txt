@@ -1,0 +1,10 @@
+Tag                      | Joint128 |  ChainedUs |  SingleUs |  XlaModUs | HloSorts | Pallas128
+-----------------------------------------------------------------------------------------------
+prep_baseline_tl10       | False    |     12.634 |    66.185 |     5.776 |        1 |         0
+prep_candidate_tl10      | True     |      8.955 |    45.014 |     3.559 |        0 |         6
+moe_baseline_tl10        | False    |    155.234 |   136.853 |   125.885 |        1 |         0
+moe_candidate_tl10       | True     |    153.397 |   134.373 |   122.974 |        0 |         5
+prep_candidate_r2_tl10   | True     |      7.954 |    40.947 |     3.559 |        0 |         6
+prep_baseline_r2_tl10    | False    |     12.166 |    45.077 |     5.796 |        1 |         0
+moe_candidate_r2_tl10    | True     |    151.516 |   133.618 |   123.330 |        0 |         5
+moe_baseline_r2_tl10     | False    |    153.572 |   136.427 |   125.916 |        1 |         0
