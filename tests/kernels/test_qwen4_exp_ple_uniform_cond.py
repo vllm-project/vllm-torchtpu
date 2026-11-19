@@ -169,9 +169,12 @@ def _child_main(a):
     if a.get("hrk"):
         os.environ[HRK] = "1"
     case = W._conv_case(**a["case"])
+    if a.get("finite"):  # finite-range pool: every byte in [0, 64), so every history bf16 is finite with |v| < 2
+        case["pool"] = jnp.asarray((np.asarray(case["pool"]).view(np.uint8) & np.uint8(0x3F)).view(jnp.float8_e4m3fn))
     args = W._conv_args(case, "spec")
     fn = functools.partial(P.pooled_short_conv_speculative, dilation=DILATION, state_len=STATE_LEN)
     before = np.asarray(case["pool"]).view(np.uint8)
+    outs = {}
     for arm in a["arms"]:
         for name in (FLAG_U, FLAG_W):
             os.environ.pop(name, None)
@@ -181,6 +184,7 @@ def _child_main(a):
         conds = sum(1 for e in _walk(jaxpr.jaxpr) if e.primitive.name == "cond")
         pool1, out1 = W._fresh_jit(fn)(*args)
         pb, ob = W._bytes(pool1), W._bits16(out1)
+        outs[arm] = ob
         out["arms"][arm] = {
             "pool_sha": hashlib.sha256(pb.tobytes()).hexdigest()[:16],
             "out_sha": hashlib.sha256(ob.tobytes()).hexdigest()[:16],
@@ -188,11 +192,44 @@ def _child_main(a):
             "uniform_ran": len(ran) - n0,
             "conds": conds,
         }
+    if a.get("stress") and "base" in outs and "WU" in outs:
+        out["stress"] = _overflow_confinement(P, case, outs["base"], outs["WU"])
     if hasattr(P, "uniform_window_pred"):
         T = a["case"]["tokens"]
         starts = case["starts"][: min(T, a["case"]["count"]) + 1] if T < a["case"]["count"] else case["starts"]
         out["pred"] = bool(P.uniform_window_pred(starts, T // WINDOW, WINDOW))
     return out
+
+
+def _overflow_confinement(P, case, base_bits, wu_bits):
+    """STRESS accounting (addendum 1 (b)): the elements (live token, channel) where some tap's bf16 x bf16 product overflows f32
+    on its own ('overflow elements', counted over the whole case), the elements where WU's output bits differ from base, how many
+    of those are overflow elements, how many are not ('clean'), and how many are finite-vs-finite (both outputs finite)."""
+    T, C = case["x"].shape
+    hist = np.asarray(P.read_region(case["pool"], case["read_ids"], elements=STATE_LEN * C,
+                                    dtype=jnp.bfloat16).reshape(case["read_ids"].shape[0], STATE_LEN, -1).astype(jnp.float32))
+    starts, initial = np.asarray(case["starts"]), np.asarray(case["initial"])
+    x = np.asarray(case["x"].astype(jnp.float32))
+    w = np.asarray(case["weight"].astype(jnp.float32))
+    t_idx = np.arange(T)
+    live = t_idx < starts[-1]
+    req = np.minimum(np.searchsorted(starts[1:], t_idx, side="right"), len(starts) - 2)
+    rel = t_idx - starts[req]
+    over = np.zeros((T, C), bool)
+    with np.errstate(all="ignore"):
+        for k in range(w.shape[1]):
+            pos = rel - (STATE_LEN - k * DILATION)
+            cur = x[np.clip(starts[req] + pos, 0, T - 1)]
+            past = hist[req, np.clip(pos + STATE_LEN, 0, STATE_LEN - 1)] * initial[req][:, None]
+            tap = np.where((pos >= 0)[:, None], cur, past)
+            over |= np.isinf(tap.astype(np.float32) * w[None, :, k].astype(np.float32))
+    over &= live[:, None]
+    diff = base_bits != wu_bits
+    bf = base_bits.view(jnp.bfloat16).astype(np.float32)
+    wf = wu_bits.view(jnp.bfloat16).astype(np.float32)
+    fin_fin = diff & np.isfinite(bf) & np.isfinite(wf)
+    return {"overflow_elements": int(over.sum()), "n_diff": int(diff.sum()), "diff_at_overflow": int((diff & over).sum()),
+            "clean": int((diff & ~over).sum()), "finite_vs_finite": int(fin_fin.sum())}
 
 
 def _walk(jaxpr):
@@ -238,7 +275,39 @@ def _sid(s):
 def test_bitwise_base_w_wu(shape, kind):
     T, count, channels = shape
     kw, expected = _case_kw(kind, T, count, channels, seed=T * 7 + count * 3 + KINDS.index(kind))
-    _check_bitwise(_sub(case=kw, arms=["base", "W", "WU"], hrk=1), expected)
+    _check_bitwise(_sub(case=kw, arms=["base", "W", "WU"], hrk=1, finite=1), expected)
+
+
+# STRESS set (random-byte pools: history bf16 values include NaN / inf / subnormal and |v| up to ~3.4e38). Gating cases above use
+# finite-range pools. How the stress set counts follows the lead's ruling (DECODE-L3b 2026-11-19): 'bitwise' = WU == base bit for
+# bit; 'overflow-confined' = pool bytes and W bitwise, and WU's output differs from base only at elements where a tap's
+# bf16 x bf16 product overflows f32 on its own (diag2 / diag3 / diag4: the stock path and the uniform branch round such a sum in a
+# different order on XLA-CPU).
+STRESS_RULE = "overflow-confined"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("shape", SHAPES, ids=_sid)
+def test_stress_random_bytes(shape, kind):
+    T, count, channels = shape
+    kw, expected = _case_kw(kind, T, count, channels, seed=T * 7 + count * 3 + KINDS.index(kind))
+    out = _sub(case=kw, arms=["base", "W", "WU"], hrk=1, stress=1)
+    arms = out["arms"]
+    print("Q38 RPLEW U STRESS %s %s rule %s: %s" % (_sid(shape), kind, STRESS_RULE, out.get("stress")))
+    if STRESS_RULE == "bitwise":
+        _check_bitwise(out, expected)
+        return
+    assert STRESS_RULE == "overflow-confined", STRESS_RULE
+    assert arms["W"]["pool_sha"] == arms["base"]["pool_sha"] and arms["W"]["out_sha"] == arms["base"]["out_sha"]
+    assert arms["WU"]["pool_sha"] == arms["base"]["pool_sha"], "pool bytes: WU vs base"
+    assert out["stress"]["clean"] == 0, f"WU output differs from base where no tap product overflows: {out['stress']}"
+    assert out["stress"]["finite_vs_finite"] == 0, f"finite-vs-finite flips: {out['stress']}"
+    assert out["stress"]["diff_at_overflow"] <= out["stress"]["overflow_elements"]
+    if expected is None:
+        assert arms["WU"]["conds"] == 0 and arms["WU"]["uniform_ran"] == 0
+    else:
+        assert arms["WU"]["conds"] == 1 and out["pred"] is expected
+        assert arms["WU"]["uniform_ran"] == (1 if expected else 0)
 
 
 @pytest.mark.parametrize("kind", ["U-full", "N-one1"])
@@ -247,13 +316,13 @@ def test_bitwise_static_fallback_t_mod_window(shape, kind):
     T, count, channels = shape
     kw, expected = _case_kw(kind, T, count, channels, seed=T + count + KINDS.index(kind))
     assert expected is None
-    _check_bitwise(_sub(case=kw, arms=["base", "W", "WU"], hrk=1), None)
+    _check_bitwise(_sub(case=kw, arms=["base", "W", "WU"], hrk=1, finite=1), None)
 
 
 @pytest.mark.parametrize("kind", ["U-full", "N-one1", "U-initmix"])
 def test_bitwise_without_history_row_kernel(kind):
     kw, expected = _case_kw(kind, 160, 48, 256, seed=900 + KINDS.index(kind))
-    _check_bitwise(_sub(case=kw, arms=["base", "W", "WU"], hrk=0), expected)
+    _check_bitwise(_sub(case=kw, arms=["base", "W", "WU"], hrk=0, finite=1), expected)
 
 
 @pytest.mark.parametrize("kind", ["U-full", "N-one1"])
@@ -263,8 +332,8 @@ def test_literal_rw3_tree_matches(shape, kind):
     which the W and WU arms equal (test_bitwise_base_w_wu)."""
     T, count, channels = shape
     kw, _ = _case_kw(kind, T, count, channels, seed=T * 7 + count * 3 + KINDS.index(kind))
-    head = _sub(case=kw, arms=["base", "WU"], hrk=1)
-    rw3 = _sub(base_tree=True, case=kw, arms=["base"], hrk=1)
+    head = _sub(case=kw, arms=["base", "WU"], hrk=1, finite=1)
+    rw3 = _sub(base_tree=True, case=kw, arms=["base"], hrk=1, finite=1)
     assert rw3["arms"]["base"]["pool_sha"] == head["arms"]["base"]["pool_sha"] == head["arms"]["WU"]["pool_sha"]
     assert rw3["arms"]["base"]["out_sha"] == head["arms"]["base"]["out_sha"] == head["arms"]["WU"]["out_sha"]
 
