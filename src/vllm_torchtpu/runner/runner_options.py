@@ -56,6 +56,15 @@ class RunnerOptions:
     every thread of the process, and a shorter interval adds switching
     overhead to busy threads."""
 
+    def __post_init__(self) -> None:
+        # Here, not in parse(): get() builds the options through
+        # config_section without calling parse().
+        if self.switch_interval_us < 0:
+            raise ValueError(
+                f"additional_config.{SECTION}.switch_interval_us must be >= 0, "
+                f"got {self.switch_interval_us}"
+            )
+
 
 def parse(raw: Any) -> RunnerOptions:
     """The ``tpu_runner`` section as options; None gives the defaults.
@@ -63,13 +72,7 @@ def parse(raw: Any) -> RunnerOptions:
     Strict: an unknown key, or a value whose type is not exactly the field's
     (``1`` for a bool, say), raises ``ValueError`` (``config_section.parse``).
     """
-    options = config_section.parse(RunnerOptions, SECTION, raw)
-    if options.switch_interval_us < 0:
-        raise ValueError(
-            f"additional_config.{SECTION}.switch_interval_us must be >= 0, "
-            f"got {options.switch_interval_us}"
-        )
-    return options
+    return config_section.parse(RunnerOptions, SECTION, raw)
 
 
 def get(vllm_config: Any) -> RunnerOptions:

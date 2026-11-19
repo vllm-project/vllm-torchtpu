@@ -488,6 +488,9 @@ def test_process_settings_come_from_the_tpu_runner_section(restore_trims):
 def test_process_settings_parse_strictly(raw, match):
     with pytest.raises(ValueError, match=match):
         runner_options.parse(raw)
+    # The engine reads the section through get(), which must refuse it too.
+    with pytest.raises(ValueError, match=match):
+        runner_options.get(types.SimpleNamespace(additional_config={"tpu_runner": raw}))
 
 
 def test_scheduler_step_configures_its_process_once(monkeypatch, restore_trims):
