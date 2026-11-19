@@ -11,25 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ModelOpt MIXED_PRECISION quantization support for TPU.
+"""TPU support for ModelOpt MIXED_PRECISION checkpoints.
 
-A ModelOpt ``MIXED_PRECISION`` checkpoint names a quantization algorithm for
-each layer in ``quantized_layers``. vLLM detects these checkpoints as the
-``modelopt_mixed`` method. This config reuses upstream's checkpoint parsing.
-Each layer gets the TPU method that a single-algorithm checkpoint of the same
-algorithm would use.
+These checkpoints name a quantization algorithm for each layer in
+``quantized_layers``. vLLM selects the ``modelopt_mixed`` method for them, and
+each layer is served by the existing TPU method for its algorithm.
 
-TPU supports ``FP8`` on linear layers, and ``NVFP4`` or ``W4A16_NVFP4`` on linear
-layers and routed experts. Layers that are excluded, marked ``"NONE"``, or
-absent from ``quantized_layers`` load unquantized. Any other layer and algorithm
-pair raises ``NotImplementedError``. A fused projection or expert group whose
-entries disagree raises ``ValueError``.
-
-By default, TPU runs both ``NVFP4`` and ``W4A16_NVFP4`` layers as W4A16, with
-FP4 weights and bf16 activations. The two therefore share one ``NVFP4`` spec and
-may be mixed within a fused projection or an expert group. An NVFP4 entry
-without ``group_size`` uses the checkpoint's top-level ``group_size``, or
-ModelOpt's default of 16.
+``NVFP4`` and ``W4A16_NVFP4`` resolve to one spec. By default TPU runs both as
+W4A16, with FP4 weights and bf16 activations, so the two may be mixed within a
+fused projection or an expert group.
 """
 
 from __future__ import annotations
