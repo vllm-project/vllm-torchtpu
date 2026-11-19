@@ -71,20 +71,25 @@ def test_early_prep_is_bitwise_identical(tokens):
 
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
 @pytest.mark.parametrize("tokens", [240, 72, 60])
-def test_kernel_matches_unfused_within_rounding(tokens):
-    """T=240 runs 16-token groups; 72 and 60 (v7x-16 decode) run padded."""
+def test_padded_tokens_equal_the_kernel_rows(tokens):
+    """Tokens off the 32-token groups run padded; the kernel is per token, so
+    their rows equal the same rows of an aligned call bitwise."""
     from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
         deepseek_v41_mhc_op as op,
     )
 
-    x, flat, post, comb, pre, weight, scale, base, norm = _inputs(tokens)
-    args = (x, flat, post, comb, weight, scale, base, pre, norm)
+    aligned = -(-tokens // 32) * 32
+    x, flat, post, comb, pre, weight, scale, base, norm = _inputs(aligned)
     consts = (1e-20, 1e-6, 1e-6, 2.0, 20, 1e-6)
-    ref = jax.jit(lambda *a: op._unfused(*a, *consts))(*args)
-    got = jax.jit(lambda *a: op._post_pre_rms_jax(*a, *consts))(*args)
-    # residual, value: one BF16 rounding step; gates: FP32 reassociation.
-    for r, g, rtol in zip(ref, got, (2.0**-7, 1e-4, 1e-4, 2.0**-6, 1e-4)):
-        assert r.shape == g.shape
-        r, g = np.asarray(r, np.float32), np.asarray(g, np.float32)
-        bound = np.maximum(np.abs(r), np.abs(g)) * rtol + 1e-6
-        assert np.all(np.abs(r - g) <= bound)
+
+    def layer(rows):
+        args = (x, flat, post, comb, weight, scale, base, pre)
+        args = [a[:rows] if i in (0, 1, 2, 3, 7) else a for i, a in enumerate(args)]
+        return jax.jit(lambda *a: op._post_pre_rms_jax(*a, norm, *consts))(*args)
+
+    for r, g in zip(layer(aligned), layer(tokens), strict=True):
+        assert g.shape[0] == tokens
+        np.testing.assert_array_equal(
+            np.ascontiguousarray(r[:tokens]).view(np.uint8),
+            np.ascontiguousarray(g).view(np.uint8),
+        )
