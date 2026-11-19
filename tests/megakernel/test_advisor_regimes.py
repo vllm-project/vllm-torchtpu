@@ -42,7 +42,12 @@ from tests.megakernel.test_advisor_bounds import (
     MIXTRAL_8X7B_CFG,
     QWEN35_08B_CFG,
 )
-from tests.megakernel.test_advisor_specs import KIMI_K3_PRO_CFG, QWEN35_397B_CFG
+from tests.megakernel.test_advisor_specs import (
+    DEEPSEEK_V4_CFG,
+    KIMI_K3_PRO_CFG,
+    QWEN4_EXP_CFG,
+    QWEN35_397B_CFG,
+)
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import chips, constants
@@ -1416,14 +1421,21 @@ def test_dispatch_regimes_and_compiler_proof_gain_split(
 
 def test_no_fused_recommendation_outside_core_limits() -> None:
     """Fused scopes outside core or declared limits stay gated to per_op."""
-    for model_name in (
+    ds4_profile = advisor.model_profile_from_hf_config(
+        DEEPSEEK_V4_CFG, name="deepseek-v4-hf", weight_dtype="fp8"
+    )
+    q4_profile = advisor.model_profile_from_hf_config(
+        QWEN4_EXP_CFG, name="qwen4-exp-hf", weight_dtype="fp8"
+    )
+    targets: tuple[str | advisor.ModelProfile, ...] = (
         "kimi-k3.1-pro",
         "glm-5.2",
         "qwen3.8-2.4t",
-        "deepseek-v4",
-        "qwen4-exp",
-    ):
-        sweep = advisor.advise_regimes(model_name, "tpu7x")
+        ds4_profile,
+        q4_profile,
+    )
+    for model_target in targets:
+        sweep = advisor.advise_regimes(model_target, "tpu7x")
         assert all(r.recommended_scope == "per_op" for r in sweep.regimes)
         dec_small = sweep.regimes[0]
         assert dec_small.fastest_scope == "whole_step"
@@ -1466,9 +1478,12 @@ def test_cli_invalid_sharding_exits_nonzero(
 
 def test_cli_prints_evidence_blockers_and_inputs(
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     """CLI summary prints Evidence, Blocked by, and Inputs."""
-    rc = advisor.main(["--model", "deepseek-v4", "--tp", "16", "--explain"])
+    config_path = tmp_path / "deepseek_v4_config.json"
+    config_path.write_text(json.dumps(DEEPSEEK_V4_CFG), encoding="utf-8")
+    rc = advisor.main(["--model", str(config_path), "--tp", "16", "--explain"])
     assert rc == 0
     out = capsys.readouterr().out
     for token in (
@@ -1551,12 +1566,13 @@ def test_recommend_parallelism_raises_when_no_layout_fits() -> None:
         advisor.recommend_parallelism(model_profile, tiny_chip)
 
     v6e_spec = advisor.resolve_chip_spec("v6e")
-    par_v6e = advisor.recommend_parallelism(
-        advisor.resolve_model_profile("qwen4-exp"), v6e_spec
+    qwen4_v6e_profile = advisor.model_profile_from_hf_config(
+        QWEN4_EXP_CFG, name="qwen4-exp-hf", weight_dtype="fp8"
     )
+    par_v6e = advisor.recommend_parallelism(qwen4_v6e_profile, v6e_spec)
     v6e_cores = par_v6e.tp * par_v6e.dp * par_v6e.pp
     assert v6e_cores in v6e_spec.topologies
-    v6e_sweep = advisor.advise_regimes("qwen4-exp", "v6e")
+    v6e_sweep = advisor.advise_regimes(qwen4_v6e_profile, "v6e")
     assert not v6e_sweep.regimes[0].verdict.startswith("invalid_config(")
 
     dp2_sweep = advisor.advise_regimes(
@@ -2068,3 +2084,35 @@ def test_cli_decoding_sequences_littles_law_and_host_head_flags(
     ):
         with pytest.raises(MegakernelConfigError):
             advisor.main(invalid_argv)
+
+
+def test_glm52_regime_sweep_and_disagg_indexer_wire_bytes() -> None:
+    """Verify GLM-5.2 regime sweep stays gated to per_op and prices indexer DCN wire."""
+    glm_profile = advisor.resolve_model_profile("glm-5.2")
+    sweep = advisor.advise_regimes(glm_profile, "tpu7x")
+    assert all(entry.recommended_scope == "per_op" for entry in sweep.regimes)
+    assert sweep.disagg_handoff is not None
+    isl = sweep.disagg_handoff.isl
+    kv_per_tok = (
+        glm_profile.kv_lora_rank + glm_profile.qk_rope_head_dim
+    ) * constants.DTYPE_BYTES[glm_profile.kv_dtype]
+    expected_mla_bytes = glm_profile.num_attention_layers * isl * kv_per_tok
+    expected_indexer_bytes = (
+        glm_profile.num_indexer_layers
+        * isl
+        * advisor.models.indexer_record_bytes(glm_profile.index_head_dim)
+    )
+    expected_kv_wire_mb = round((expected_mla_bytes + expected_indexer_bytes) / 1e6, 2)
+    # 2 * 0.005 MB = 0.01 MB half-ULP rounding across two 2-decimal MB values.
+    wire_mb_round_tol = 2 * 0.005
+    assert sweep.disagg_handoff.kv_wire_mb == pytest.approx(
+        expected_kv_wire_mb, abs=wire_mb_round_tol
+    )
+    assert sweep.disagg_handoff.kv_wire_mb > round(expected_mla_bytes / 1e6, 2)
+
+    html = advisor.render_advisor_html(sweep)
+    assert (
+        f"top-k={glm_profile.index_topk} "
+        f"({glm_profile.num_indexer_layers} indexer layers)" in html
+    )
+    assert KERNEL_NAME_DENYLIST.search(html) is None
