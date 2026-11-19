@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -113,6 +115,16 @@ def build(
     assert set(skip) <= set(ABLATIONS), skip
     tiles = ex.resolve_tiles(g)
     scopes = ex.scopes
+    if scopes and not ex.interpret and "xla_enable_custom_call_region_trace" not in os.environ.get(
+        "LIBTPU_INIT_ARGS", ""
+    ):
+        # The kernel emits tpu.trace_start/stop per scope, but libtpu drops them (no
+        # profile events, same compiled kernel) unless it starts with these flags.
+        warnings.warn(
+            "megakernel scopes need LIBTPU_INIT_ARGS='--xla_enable_custom_call_region_trace=true "
+            "--xla_xprof_register_llo_debug_info=true' to appear in TPU profiles",
+            stacklevel=2,
+        )
 
     def sc(name: str, level: int = 1):
         return (
