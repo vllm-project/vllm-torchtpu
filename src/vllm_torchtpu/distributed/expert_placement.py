@@ -193,11 +193,11 @@ def moe_layer_indices(hf_config: Any) -> list[int]:
     """The routed-MoE decoder layers of a DeepSeek-V2-family config."""
     try:
         n, first = hf_config.num_hidden_layers, hf_config.first_k_dense_replace
-        freq = hf_config.moe_layer_freq
     except AttributeError as e:
         raise NotImplementedError(
             f"{CONFIG_KEY} serves DeepSeek-V2-family MoE configs: {e}"
         ) from e
+    freq = getattr(hf_config, "moe_layer_freq", 1)  # vLLM's deepseek_v2 default
     return [i for i in range(first, n) if i % freq == 0]
 
 
@@ -226,6 +226,9 @@ def _load(vllm_config: Any, path: str) -> ExpertPlacement:
         ),
         "is applied by the Run:ai streaming loader only (--load-format "
         "runai_streamer)": load.load_format != "runai_streamer",
+        "assumes the linear expert placement strategy": (
+            parallel.expert_placement_strategy != "linear"
+        ),
     }
     bad = [why for why, hit in refusals.items() if hit]
     if bad:

@@ -590,6 +590,8 @@ def _build_load_op(topk: int) -> Any:
 def _arm_load_stats(mlp: Any, experts: Any, topk: int) -> None:
     if token_padding._padding_state is None:
         raise NotImplementedError(f"{LOAD_STATS_KEY} needs the token padding mask")
+    if experts.use_grouped_topk and experts.num_expert_group > 1:
+        raise NotImplementedError(f"{LOAD_STATS_KEY} does not count grouped top-k")
     if experts.scoring_func != "sigmoid" or experts.e_score_correction_bias is None:
         raise NotImplementedError(
             f"{LOAD_STATS_KEY} counts sigmoid routing with a score bias; got "
@@ -605,9 +607,10 @@ def _arm_load_stats(mlp: Any, experts: Any, topk: int) -> None:
 def dump_expert_load(model: torch.nn.Module, stats_path: str, table_path: str) -> dict:
     """Write the counts summed over the TP group (every rank's own rows) as an
     `expert_placement.STATS_FORMAT` file and their LPT placement table as a
-    TABLE_FORMAT file. Collective over the TP group (call on every rank, e.g.
-    as a collective RPC); every rank writes the same two files, so each host
-    gets its own copy."""
+    TABLE_FORMAT file, then zero the counts (so a first call after warmup
+    drops the precompile runs). Collective over the TP group (call on every
+    rank, e.g. as a collective RPC); every rank writes the same two files, so
+    each host gets its own copy. int32 counts: topk per own row per step."""
     backbone = _backbone(model)
     first = backbone.start_layer
     layers = [
@@ -624,6 +627,8 @@ def dump_expert_load(model: torch.nn.Module, stats_path: str, table_path: str) -
         )
     counts = torch.stack([getattr(mlp, LOAD_ATTR) for _, mlp in layers]).cpu()
     counts = counts.to(torch.int64)
+    for _, mlp in layers:
+        getattr(mlp, LOAD_ATTR).zero_()
     torch.distributed.all_reduce(counts, group=get_tp_group().cpu_group)
     stats = dict(
         format=expert_placement.STATS_FORMAT,
