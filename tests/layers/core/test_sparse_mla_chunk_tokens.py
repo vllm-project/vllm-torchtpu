@@ -13,6 +13,7 @@
 # limitations under the License.
 """TPU_SPARSE_MLA_CHUNK_TOKENS: the sparse MLA gather + attention chunk size."""
 
+import jax.numpy as jnp
 import pytest
 
 from vllm_torchtpu.layers.core import attention_interface
@@ -54,3 +55,38 @@ def test_partial_kernel_batch_is_rejected(monkeypatch, value):
 
     with pytest.raises(ValueError, match="multiple of"):
         attention_interface.sparse_mla_chunk_kwargs()
+
+
+@pytest.mark.parametrize(("value", "want"), [(None, 128), ("64", 64)])
+def test_a_caller_default_applies_only_when_unset(monkeypatch, value, want):
+    if value is None:
+        monkeypatch.delenv(ENV, raising=False)
+    else:
+        monkeypatch.setenv(ENV, value)
+
+    assert attention_interface.sparse_mla_chunk_kwargs(128) == {
+        "gather_and_attention_chunk_size": want
+    }
+
+
+@pytest.mark.parametrize(("value", "want"), [(None, 128), ("256", 256)])
+def test_the_token_parallel_split_attends_in_its_own_chunk(monkeypatch, value, want):
+    from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as op
+
+    if value is None:
+        monkeypatch.delenv(ENV, raising=False)
+    else:
+        monkeypatch.setenv(ENV, value)
+    seen = {}
+
+    def kernel(q, *args, **kwargs):
+        seen.update(kwargs)
+        return q
+
+    monkeypatch.setattr(op.sparse_mla_kernel, "sparse_ragged_paged_attention", kernel)
+    attend = op.make_attend(
+        sm_scale=1.0, k_scale=None, cache_layout="", packed_rope=False, lkv_dim=4
+    )
+    attend(jnp.zeros((2, 1, 4)), None, None, None, jnp.int32(2))
+    assert seen["gather_and_attention_chunk_size"] == want
+    assert op.CHUNK_TOKENS == 128

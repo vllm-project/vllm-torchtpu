@@ -1666,7 +1666,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # holds `num_tokens / chunk` gather + attention kernel pairs per layer;
     # bigger chunks compile faster but need a bigger gather buffer
     # (chunk * top-k rows) and pipeline gather with attention more coarsely.
-    # Unset keeps the kernel default (64).
+    # Unset keeps the kernel default (64), except in the token-parallel
+    # prefill split (dcp_token_parallel_op.CHUNK_TOKENS).
     "TPU_SPARSE_MLA_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_SPARSE_MLA_CHUNK_TOKENS"
     ),

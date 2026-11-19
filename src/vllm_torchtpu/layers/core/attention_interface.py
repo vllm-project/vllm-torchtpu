@@ -61,15 +61,16 @@ mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attention
 
 
-def sparse_mla_chunk_kwargs() -> dict[str, int]:
+def sparse_mla_chunk_kwargs(default: int | None = None) -> dict[str, int]:
     """Kernel kwargs for the sparse MLA gather + attention chunk size.
 
-    Empty unless `TPU_SPARSE_MLA_CHUNK_TOKENS` is set, so the kernel keeps its
-    default chunk. The chunk must be a multiple of the attention kernel's batch
-    size: the attention grid walks a chunk in whole batches, and the SparseCore
-    gather splits a chunk's `chunk * topk` rows into whole owner batches.
+    `TPU_SPARSE_MLA_CHUNK_TOKENS` when set, else the caller's `default`; empty
+    when both are unset, so the kernel keeps its default chunk. The chunk must
+    be a multiple of the attention kernel's batch size: the attention grid
+    walks a chunk in whole batches, and the SparseCore gather splits a chunk's
+    `chunk * topk` rows into whole owner batches.
     """
-    chunk = envs.TPU_SPARSE_MLA_CHUNK_TOKENS
+    chunk = envs.TPU_SPARSE_MLA_CHUNK_TOKENS or default
     if chunk is None:
         return {}
     batch = sparse_mla_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE

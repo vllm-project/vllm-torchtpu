@@ -61,6 +61,13 @@ from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 
 # Smallest bucket that takes the split (a power of two: `bucket_gate_edge`).
 MIN_TOKENS = 1024
+# The split's sparse MLA gather + attention chunk (query rows) unless
+# TPU_SPARSE_MLA_CHUNK_TOKENS is set. The op unrolls one SparseCore row gather
+# and attention call per chunk in each of its gather-cap branches, and every
+# such call site holds its own program-lifetime HBM; twice the kernel's
+# default chunk halves those sites. A row's softmax spans its whole top-k in
+# any chunk, so the result does not depend on the chunk.
+CHUNK_TOKENS = 128
 # Rows [0, split_rows) stay on the DCP path; a multiple of this.
 SPLIT_ROWS_ALIGN = 16
 # Gather sizes (virtual pages) below the buffer's capacity a step may take; the
@@ -239,7 +246,7 @@ def make_attend(
             k_scale=k_scale,
             cache_layout=cache_layout,
             mixed_body_levers=mixed_body_levers,
-            **sparse_mla_chunk_kwargs(),
+            **sparse_mla_chunk_kwargs(CHUNK_TOKENS),
             **packed,
             **split_kw,
         )
@@ -352,7 +359,7 @@ def build_attention_op(
     fused_subbatch = True
     num_heads = int(layer.num_heads)
     out_dim = int(layer.v_head_dim if uv_in_tp else layer.kv_lora_rank)
-    chunk_tokens = envs.TPU_SPARSE_MLA_CHUNK_TOKENS
+    chunk_tokens = envs.TPU_SPARSE_MLA_CHUNK_TOKENS or CHUNK_TOKENS
     target_layer = layer
     del layer, impl
 
