@@ -249,6 +249,9 @@ def test_the_budget_needs_the_fused_ep_v3_kernel(monkeypatch, kernel):
         ("1", None, "v2"),
         (None, "v2", "v2"),
         (None, "adaptive", "adaptive"),
+        # The TP8 decode legs' environment, and v3 alone (it turns fused EP on).
+        ("1", "v3", "v3"),
+        (None, "v3", "v3"),
     ],
 )
 def test_the_moe_kernel_is_the_fused_ep_selection(monkeypatch, use, impl, kernel):
