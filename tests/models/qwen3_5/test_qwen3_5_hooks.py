@@ -32,8 +32,10 @@ from vllm_torchtpu.models.qwen3_5 import hooks, settings
 from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
 from vllm_torchtpu.models.vllm import register_models
 
-# The real lookup, before the autouse fixture below replaces it.
+# The real lookups, before the autouse fixtures (here and in conftest.py)
+# replace them.
 _REAL_CHIP_FAMILY = hooks._chip_family
+_REAL_MOE_KERNEL = hooks._moe_kernel
 TPU7X = pltpu.ChipVersion.TPU_7X.value
 
 QWEN35 = "Qwen3_5MoeForConditionalGeneration"
@@ -228,6 +230,37 @@ def test_mixed_engine_keeps_mains_behaviour(kv_role):
     """The budget was measured on decode legs only."""
     cfg = _run_hook(_vllm_config(kv_role=kv_role))
     assert cfg.cache_config.kv_cache_memory_bytes is None
+
+
+@pytest.mark.parametrize("kernel", [None, "v2", "adaptive"])
+def test_the_budget_needs_the_fused_ep_v3_kernel(monkeypatch, kernel):
+    """The decode legs ran the budget with fused EP MoE v3; with v2, the
+    adaptive kernel or the grouped-matmul MoE (no fused EP) the same layout
+    stays on gpu_memory_utilization."""
+    monkeypatch.setattr(hooks, "_moe_kernel", lambda: kernel)
+    assert _run_hook(_vllm_config()).cache_config.kv_cache_memory_bytes is None
+
+
+@pytest.mark.parametrize(
+    ("use", "impl", "kernel"),
+    [
+        (None, None, None),
+        ("0", None, None),
+        ("1", None, "v2"),
+        (None, "v2", "v2"),
+        (None, "adaptive", "adaptive"),
+    ],
+)
+def test_the_moe_kernel_is_the_fused_ep_selection(monkeypatch, use, impl, kernel):
+    for name, value in (
+        ("USE_MOE_FUSED_EP_KERNEL", use),
+        ("MOE_FUSED_EP_KERNEL_IMPL", impl),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert _REAL_MOE_KERNEL() == kernel
 
 
 def test_a_text_config_without_moe_fields_fails_loudly():
@@ -618,15 +651,29 @@ DECODE_KV_BYTES = {
 }
 
 
+def _leg_moe_kernel(leg: dict) -> str | None:
+    """The fused EP MoE implementation a leg's environment selects, read as
+    envs.py reads it (``_moe_kernel``)."""
+    env = leg.get("env") or {}
+    impl = env.get("MOE_FUSED_EP_KERNEL_IMPL")
+    use = impl is not None or env.get("USE_MOE_FUSED_EP_KERNEL", "0") in ("1", "true")
+    return (impl or "v2") if use else None
+
+
 @pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
-def test_validation_points_keep_their_defaults(path):
+def test_validation_points_keep_their_defaults(path, monkeypatch):
     """Every point's prefill leg gets the 128-token unit and stays on
     gpu_memory_utilization; every decode leg keeps the default unit and gets
-    its budget: the measured legs are unchanged."""
+    its budget, with the MoE kernel its environment selects: the measured
+    legs are unchanged."""
     with path.open() as f:
         legs = yaml.safe_load(f)["legs"]
-    prefill = _run_hook(_leg_config(legs["prefill"]))
-    decode = _run_hook(_leg_config(legs["decode"]))
+    configs = {}
+    for name in ("prefill", "decode"):
+        kernel = _leg_moe_kernel(legs[name])
+        monkeypatch.setattr(hooks, "_moe_kernel", lambda kernel=kernel: kernel)
+        configs[name] = _run_hook(_leg_config(legs[name]))
+    prefill, decode = configs["prefill"], configs["decode"]
     assert prefill.kv_transfer_config.kv_role == "kv_producer"
     assert prefill.cache_config.prefix_match_unit == 128
     assert prefill.cache_config.kv_cache_memory_bytes is None
@@ -639,13 +686,16 @@ def test_validation_points_keep_their_defaults(path):
 def test_the_budget_admits_exactly_the_entries_auto_budget_layouts():
     """The calibrated decode layouts (TP, DP, DCP) are exactly those of the
     point entries' decode legs that run on the auto budget (no
-    --kv-cache-memory-bytes); the gates reuse those legs."""
+    --kv-cache-memory-bytes), and every such leg runs the calibrated MoE
+    kernel; the gates reuse those legs."""
     layouts = set()
     for path in POINTS:
         with path.open() as f:
-            args = yaml.safe_load(f)["legs"]["decode"]["serve_args"]
+            decode = yaml.safe_load(f)["legs"]["decode"]
+        args = decode["serve_args"]
         if "--kv-cache-memory-bytes" in args:
             continue
+        assert _leg_moe_kernel(decode) == hooks._CALIBRATED_MOE_KERNEL, path.name
         layouts.add(
             tuple(
                 int(_flag(args, name, "1"))
