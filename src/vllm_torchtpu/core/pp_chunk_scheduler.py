@@ -92,8 +92,8 @@ RETENTION_ARCHITECTURES = frozenset(
 @runtime_checkable
 class TransferPoller(Protocol):
     """A KV connector that completes finished async loads when the scheduler
-    polls it at the start of a step (the multi-connector and the Raiden
-    offloading connector of #3083)."""
+    polls it at the start of a step (the TPU multi-connector and the Raiden
+    offloading connector)."""
 
     def poll_and_complete_transfers(self, scheduler: Any) -> Any: ...
 
@@ -102,8 +102,8 @@ class TransferPoller(Protocol):
 class DivergentHitResolver(Protocol):
     """A KV connector that decides how much of a diverged local hybrid hit to
     keep: None keeps the reconciled hit, otherwise the number of local tokens
-    to keep (the multi-connector and the Raiden offloading connector of
-    #3083)."""
+    to keep (the TPU multi-connector and the Raiden offloading
+    connector)."""
 
     def resolve_divergent_local_hit_tokens(
         self, request: Any, num_local: int, num_reconciled: int, block_size: int
@@ -215,7 +215,7 @@ class TpuPipelineChunkScheduler(Scheduler):
             options.prefix_aware
             and scheduler_options.get(self.vllm_config).promote_warmest
         )
-        # The connector's host-tier estimate (#3083), read by the borrowed
+        # The connector's host-tier estimate, read by the borrowed
         # _external_warmth.
         self._hit_estimator: ExternalHitEstimator | None = (
             self.connector if isinstance(self.connector, ExternalHitEstimator) else None
