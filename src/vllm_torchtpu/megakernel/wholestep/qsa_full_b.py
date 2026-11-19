@@ -176,13 +176,13 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # request slots of a T = 1 tile do no work when idle. Their outputs are left
         # unwritten: the cache writer and the caller read only live requests.
         self.skip_idle = bool(skip_idle)
-        # `xreq_prefetch` >= 1 (union attention): one tile stream across the request loop;
+        # `xreq_prefetch` bit 0 (union attention): one tile stream across the request loop;
         # request q+1's ids are staged (second `qu_row` bank) and its first tiles issued into
         # the ring slots request q's last tiles free (`union_attn.attend_request`'s `stream`).
-        # >= 2 (`loop_requests`): the request loop's own loads (raw ring row, RoPE row, recent
+        # Bit 1 (`loop_requests`): the request loop's own loads (raw ring row, RoPE row, recent
         # tile's pool rows) issued one request ahead into a second bank. Exact.
-        self.xreq_prefetch = bool(xreq_prefetch) and bool(union_attn)
-        self.xreq_loads = int(xreq_prefetch) >= 2 and bool(loop_requests)
+        self.xreq_prefetch = bool(int(xreq_prefetch) & 1) and bool(union_attn)
+        self.xreq_loads = bool(int(xreq_prefetch) & 2) and bool(loop_requests)
         assert not skip_idle or loop_requests, "skip_idle bounds the request loops"
         assert not shard_index or per_request_scores, (
             "the sharded indexer selects per request"
