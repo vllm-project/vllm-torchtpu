@@ -57,7 +57,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kern
     scatter_rows,
     token_chunks,
 )
-from vllm_torchtpu.layers.adapter import rmsnorm, small_all_reduce_op
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
 from vllm_torchtpu.layers.adapter.linear_common import PrequantSlot
 from vllm_torchtpu.logger import init_logger
 
@@ -576,6 +576,8 @@ def _layer_forward(layer, positions, hidden_states, residual, split: TokenSplit)
 def split_model_forward(model, positions, hidden_states, split: TokenSplit):
     """DeepseekV2Model.forward's layers and final norm from the embedding,
     with the residual stream split from `split.first_layer` on."""
+    from vllm_torchtpu.layers.adapter import rmsnorm
+
     tokens = positions.shape[0]
     torch._check(tokens % split.ranks == 0)
     residual = None

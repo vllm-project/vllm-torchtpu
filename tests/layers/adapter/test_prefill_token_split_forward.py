@@ -301,3 +301,24 @@ def test_a_broken_split_fails(upstream, monkeypatch, broken):
     results = _run(384, **broken)
     worst = max((split - today).abs().max().item() for today, split in results)
     assert worst > 1e-3
+
+
+def test_flag_off_keeps_the_stock_rmsnorm():
+    """Importing this module at startup (patch_registry) registers no
+    out-of-tree RMSNorm while TPU_FUSED_ADD_RMSNORM is off."""
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "TPU_FUSED_ADD_RMSNORM"}
+    probe = (
+        "import sys\n"
+        "from vllm.model_executor.custom_op import op_registry_oot\n"
+        "import vllm_torchtpu.layers.adapter.prefill_token_split\n"
+        "assert 'RMSNorm' not in op_registry_oot, op_registry_oot.get('RMSNorm')\n"
+        "assert 'vllm_torchtpu.layers.adapter.rmsnorm' not in sys.modules\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", probe], env=env, capture_output=True, text=True
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
