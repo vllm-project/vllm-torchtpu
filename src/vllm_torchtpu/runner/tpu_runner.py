@@ -6567,7 +6567,7 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates = self._sampler_topk_candidates(
                     cur_start_idx, cur_end_idx, grammar_output
                 )
-                if 0 < topk_candidates * CANDIDATE_BLOCK < logits.shape[-1]:
+                if _candidate_block_verify_fits(topk_candidates, logits.shape[-1]):
                     padded_num_reqs = md.bonus_logits_indices.shape[0]
                     req_temperatures, req_top_k, req_top_p = (
                         self._build_padded_sampling_params(
@@ -8408,7 +8408,7 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out)
 
     def _precompile_compute_topk_candidates(self) -> None:
-        if self._greedy_head_owner is None or envs.TPU_SAMPLER_TOPK_CANDIDATES <= 0:
+        if _packed_candidates_owner(self._greedy_head_owner) is None:
             return
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_topk_candidates"):
@@ -8562,12 +8562,10 @@ class TPUModelRunner(GPUModelRunner):
                         apply_topk_topp=apply_topk_topp,
                     )
                     synchronize_tensors(out)
-                if (
-                    self._greedy_head_owner is not None
-                    and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
-                ):
+                packed_owner = _packed_candidates_owner(self._greedy_head_owner)
+                if packed_owner is not None:
                     num_packed_cand = greedy_top_tokens.num_packed_candidates(
-                        self._greedy_head_owner
+                        packed_owner
                     )
                     dummy_packed = torch.zeros(
                         (num_reqs, 2 * num_packed_cand),
@@ -8981,7 +8979,10 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors(out)
                 # The candidate blocks of TPU_SAMPLER_TOPK_CANDIDATES (0: off).
                 blocks = self._topk_candidate_blocks()
-                if blocks and warm_fused:
+                if (
+                    _candidate_block_verify_fits(blocks, dummy_logits.shape[-1])
+                    and warm_fused
+                ):
                     # Fused bonus sampling + rejection over the candidate
                     # blocks (`_sample_spec_verify_chunk`'s non-greedy path).
                     warm_req_temps = torch.ones(
@@ -9038,13 +9039,10 @@ class TPUModelRunner(GPUModelRunner):
                         self.rejection_sampler.synthetic_mode,
                     )
                     synchronize_tensors(out)
-                if (
-                    warm_fused
-                    and self._greedy_head_owner is not None
-                    and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
-                ):
+                packed_owner = _packed_candidates_owner(self._greedy_head_owner)
+                if warm_fused and packed_owner is not None:
                     num_packed_cand = greedy_top_tokens.num_packed_candidates(
-                        self._greedy_head_owner
+                        packed_owner
                     )
                     dummy_packed_cand = torch.zeros(
                         (num_tokens, 2 * num_packed_cand),
@@ -11038,9 +11036,7 @@ class TPUModelRunner(GPUModelRunner):
         # As for the greedy top tokens, a request below min_tokens needs the
         # full logits to mask its stops.
         return (
-            self._greedy_head_owner is not None
-            and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
-            and greedy_top_tokens.topk_candidates_supported(self._greedy_head_owner)
+            _packed_candidates_owner(self._greedy_head_owner) is not None
             and greedy_top_tokens.topk_candidates_step_eligible(
                 self.input_batch, self.requests
             )
@@ -11321,6 +11317,27 @@ def _draft_extract_input_ids(
     ):
         return input_ids[:length].clone()
     return input_ids
+
+
+def _packed_candidates_owner(owner: torch.nn.Module | None) -> torch.nn.Module | None:
+    """`owner` when the engine's steps can sample from packed top-k candidates
+    (the option is on and the head gives them, so not under an lm_head LoRA),
+    else None. The serving gate and the warmups of the candidate programs
+    share it."""
+    if (
+        owner is None
+        or envs.TPU_SAMPLER_TOPK_CANDIDATES <= 0
+        or not greedy_top_tokens.topk_candidates_supported(owner)
+    ):
+        return None
+    return owner
+
+
+def _candidate_block_verify_fits(blocks: int, vocab_size: int) -> bool:
+    """Whether the fused verify can sample from `blocks` candidate blocks of a
+    `vocab_size` vocabulary: some, but fewer than the whole vocabulary. Serving
+    and its warmup share it."""
+    return 0 < blocks * CANDIDATE_BLOCK < vocab_size
 
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:
