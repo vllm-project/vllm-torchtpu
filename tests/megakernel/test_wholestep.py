@@ -1405,7 +1405,7 @@ def test_qsa_xmerge_lost_union_is_caught(monkeypatch):
     from vllm_torchtpu.megakernel.wholestep import qsa_full_c as qc
 
     base = _main_run(monkeypatch, 16)
-    orig = qc.QSAFullIndexedBlock._gather_runs
+    orig = qc.QSAFullStepBlock._gather_runs
 
     def lossy(self, ctx, send, recv, ssem, rsem, own_rank=False):  # noqa: ANN001
         orig(self, ctx, send, recv, ssem, rsem, own_rank)
@@ -1416,7 +1416,7 @@ def test_qsa_xmerge_lost_union_is_caught(monkeypatch):
                 (recv.shape[1], 1, wm - u0), jnp.int32
             )
 
-    monkeypatch.setattr(qc.QSAFullIndexedBlock, "_gather_runs", lossy)
+    monkeypatch.setattr(qc.QSAFullStepBlock, "_gather_runs", lossy)
     run = _main_run(monkeypatch, 16, xmerge=True)
     with pytest.raises(AssertionError):
         _assert_live_identical(base, run, 4)
