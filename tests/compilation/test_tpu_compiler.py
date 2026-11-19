@@ -166,7 +166,7 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
 
-    def test_serving_only_kv_knobs_stay_out_of_the_compile_cache_key(self):
+    def test_serving_only_knobs_stay_out_of_the_compile_cache_key(self):
         """Serving-time knobs must stay out of the compile-cache key.
 
         Every `envs.py` entry not in `_TPU_COMPILE_ENV_IGNORED` is hashed, so
