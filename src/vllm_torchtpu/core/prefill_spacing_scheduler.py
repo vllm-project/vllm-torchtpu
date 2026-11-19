@@ -53,6 +53,15 @@ warmest-first admission, each step this scheduler:
   step's prefill by its tokens: prefill is cut to the tokens whose cost (per
   token, measured on long-chunk steps) fits in the smallest slack it
   protects, and deferred only when less than one KV block fits.
+* with ``VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS`` set, while a prompt with at
+  most that many uncached tokens left waits beside a longer pending prefill,
+  the step's prefill is only such short prompts, whole, up to that many
+  tokens: a short prompt's first token then comes from a short step, not from
+  a step that also carries a long chunk. At most
+  ``VLLM_TPU_PREFILL_SHORT_FIRST_MAX_STREAK`` such steps run in a row while a
+  longer prefill is pending. The TPOT rule lets such a step through when the
+  measured time of short-first steps over decode-only steps fits the smallest
+  slack; the debt still defers it unless ``SHORT_TOKENS`` allows it.
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -86,6 +95,8 @@ _TOKENS_PER_STEP_EMA = 0.05
 _LONG_TOKENS_EMA = 0.2
 
 _LONG, _PREFILL, _DECODE = "long", "prefill", "decode"
+# A short-first step: whole short prompts only, beside the decodes.
+_SHORT = "short"
 
 
 class PrefillSpacingScheduler(PrefixAwareScheduler):
@@ -100,6 +111,12 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.max_hold_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S
         self.short_tokens = envs.VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS
         self.tpot_priced = envs.VLLM_TPU_PREFILL_TPOT_PRICED
+        self.short_first_tokens = envs.VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS
+        self.short_first_max_streak = envs.VLLM_TPU_PREFILL_SHORT_FIRST_MAX_STREAK
+        self._short_streak = 0
+        self._short_first_steps = 0
+        # Smallest slack found by the last TPOT check (seconds), or None.
+        self._min_slack_s: float | None = None
         # Prefill tokens per long-chunk step (moving average): with the
         # long-chunk step time it prices one prefill token.
         self._long_tokens: float | None = None
@@ -136,13 +153,16 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         logger.info(
             "PrefillSpacingScheduler active (spacing_frac=%.2f, "
             "long_prompt_tokens=%d, max_starved_steps=%d, tpot_target_ms=%.1f, "
-            "short_tokens=%d, tpot_priced=%s)",
+            "short_tokens=%d, tpot_priced=%s, short_first_tokens=%d, "
+            "short_first_max_streak=%d)",
             self.spacing_frac,
             self.long_prompt_tokens,
             self.max_starved_steps,
             self.tpot_target_s * 1e3,
             self.short_tokens,
             self.tpot_priced,
+            self.short_first_tokens,
+            self.short_first_max_streak,
         )
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
@@ -193,20 +213,32 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         cap = None
         if in_debt:
             cap = self.short_tokens
+        held = False
         if self.tpot_target_s > 0:
             fit = self._hold_for_tpot(decoders, queue)
             if fit is not None:
+                held = True
                 cap = fit if cap is None else min(cap, fit)
+        prefilling = [r for r in self.running if r.is_prefill_chunk]
+        short_first = False
+        free = cap is None
+        if self.short_first_tokens > 0:
+            short_first = self._short_first(prefilling, in_debt, held, cap)
+            if short_first:
+                # cap is None (prefill free), 0 (a TPOT hold the short step
+                # fits), or a debt / priced cap the short step stays within.
+                limit = self.short_first_tokens
+                cap = limit if not cap else min(cap, limit)
         if cap is not None and cap < self.cache_config.block_size:
             cap = 0
         spacing = cap == 0
         capped = cap is not None and cap > 0
+        short_first = short_first and capped
         self._cap_left = cap if capped else None
-        # The debt allows only whole short prompts; the TPOT price alone
-        # allows a cut chunk.
-        self._cap_whole = capped and in_debt
+        # The debt and a short-first step allow only whole short prompts; the
+        # TPOT price alone allows a cut chunk.
+        self._cap_whole = capped and (in_debt or short_first)
         defer = throttle_prefills or spacing
-        prefilling = [r for r in self.running if r.is_prefill_chunk]
         self._reserve = {} if defer else self._plan_reserve(prefilling)
         capacity_bound = self.prefill_capacity_bound
         if spacing:
@@ -225,8 +257,53 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             # A capped step holds chunks back by design, not for lack of
             # budget: it does not count toward starvation.
             self._update_starved(prefilling, output)
-        self._account(output, decoding, spacing, capped)
+        if short_first:
+            self._short_first_steps += 1
+            if free:
+                self._short_streak += 1
+        elif not spacing:
+            self._short_streak = 0
+        self._account(output, decoding, spacing, capped, short_first)
         return output
+
+    def _short_first(
+        self,
+        prefilling: list[Request],
+        in_debt: bool,
+        held: bool,
+        cap: int | None,
+    ) -> bool:
+        """Whether this step's prefill should be only whole short prompts:
+        one waits beside a longer pending prefill, the streak allows it, and
+        neither the debt nor the TPOT rule forbids a short step."""
+        limit = self.short_first_tokens
+        room = min(self.max_num_running_reqs, self.max_num_active_reqs) - len(
+            self.running
+        )
+        pending = [self._remaining(r) for r in prefilling]
+        pending += self._window_cold[: max(room, 0)]
+        if not any(n <= limit for n in pending):
+            return False
+        if not any(n > limit for n in pending):
+            # Nothing longer to hold back: the step runs prefill as usual.
+            return False
+        if in_debt:
+            # The debt decides: SHORT_TOKENS (cap > 0) lets short prompts run.
+            return bool(cap)
+        if held and cap == 0:
+            return self._short_step_fits()
+        # Prefill is free: the streak bounds how long a longer prefill that
+        # could run now is held back.
+        return cap is not None or self._short_streak < self.short_first_max_streak
+
+    def _short_step_fits(self) -> bool:
+        """A short-first step's measured extra time over a decode-only step
+        fits the smallest slack the TPOT rule protects."""
+        decode_s = self._step_s.get(_DECODE)
+        short_s = self._step_s.get(_SHORT, self._step_s.get(_PREFILL))
+        if decode_s is None or short_s is None or self._min_slack_s is None:
+            return False
+        return short_s - decode_s < self._min_slack_s
 
     def _hold_for_tpot(
         self, decoders: list[Request], queue: RequestQueue | None
@@ -239,6 +316,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._track_decoders(decoders, now)
         pending = bool(queue) or any(r.is_prefill_chunk for r in self.running)
         slack_s = self._short_of_slack(decoders, now) if pending else None
+        self._min_slack_s = slack_s
         if slack_s is None:
             self._held_since = None
             return None
@@ -303,7 +381,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             # A request already past the target is not protected: holding
             # prefill for it cannot bring it back under.
             if 0 < slack_s < extra_s:
-                if not self.tpot_priced:
+                if not self.tpot_priced and not self.short_first_tokens:
                     return slack_s
                 if smallest is None or slack_s < smallest:
                     smallest = slack_s
@@ -384,6 +462,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         decoding: bool,
         spacing: bool,
         capped: bool = False,
+        short_first: bool = False,
     ) -> None:
         """Charge the step to the decode-only debt and remember its kind."""
         kind = None
@@ -406,6 +485,8 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             # A cut chunk of a long prompt is neither timed nor charged as a
             # long-chunk step.
             kind = _PREFILL
+        if short_first and kind == _PREFILL:
+            kind = _SHORT
         if kind == _LONG:
             n = prefill_tokens
             if self._long_tokens is None:
@@ -429,11 +510,12 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         if self._steps % _LOG_EVERY == 0:
             logger.info(
                 "PrefillSpacingScheduler: steps=%d long=%d spacing=%d capped=%d "
-                "step_s=%s",
+                "short_first=%d step_s=%s",
                 self._steps,
                 self._long_steps,
                 self._spacing_steps,
                 self._capped_steps,
+                self._short_first_steps,
                 {k: round(v, 4) for k, v in self._step_s.items()},
             )
 

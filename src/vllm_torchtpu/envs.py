@@ -250,6 +250,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS: int = 0
     VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
+    VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS: int = 0
+    VLLM_TPU_PREFILL_SHORT_FIRST_MAX_STREAK: int = 1
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
@@ -1588,6 +1590,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prompts still run; prefill is deferred only when less than one KV block
     # fits.
     "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED", False),
+    # PrefillSpacingScheduler: while a prompt with at most this many uncached
+    # tokens left waits beside a longer pending prefill, run a step whose
+    # prefill is only such short prompts, whole, up to this many tokens, so
+    # their first token does not wait for a long chunk in the same step. The
+    # TPOT hold lets such a step through when its measured extra time fits
+    # the smallest slack. 0 disables.
+    "VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS", 0
+    ),
+    # PrefillSpacingScheduler: at most this many short-first steps in a row
+    # while a longer prefill is pending; the next step runs prefill normally.
+    "VLLM_TPU_PREFILL_SHORT_FIRST_MAX_STREAK": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_SHORT_FIRST_MAX_STREAK", 1
+    ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
     # output reduce-scatter (`models.minimax_m3.dcp_pack`). 0 keeps the

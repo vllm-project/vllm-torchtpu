@@ -234,3 +234,85 @@ def test_priced_tpot_without_slack_runs_prefill(shared_model_config, monkeypatch
     )
     monkeypatch.setattr(scheduler, "_short_of_slack", lambda decoders, now: None)
     assert set(scheduler.schedule().num_scheduled_tokens) == {"dec", "short", "big"}
+
+
+def test_short_first_runs_short_prompts_alone(shared_model_config, monkeypatch):
+    scheduler = _decoding_scheduler(
+        shared_model_config,
+        monkeypatch,
+        VLLM_TPU_PREFILL_SPACING_FRAC=0,
+        VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS=16,
+    )
+    hasher = get_request_block_hasher(BLOCK_SIZE, sha256)
+    scheduler.add_request(_make_real_request("short2", 16, hasher, seed=4))
+    # `short` and `short2` (16 left) wait beside `big` (48): the step runs
+    # one whole short prompt (the cap is 16 tokens) and no chunk of `big`.
+    out = scheduler.schedule()
+    assert set(out.num_scheduled_tokens) == {"dec", "short"}
+    assert scheduler._short_first_steps == 1
+    # The streak (1) is used up: the next step runs prefill as usual.
+    out = scheduler.schedule()
+    assert {"short2", "big"} <= set(out.num_scheduled_tokens)
+    assert scheduler._short_streak == 0
+
+
+def test_short_first_needs_a_longer_pending_prefill(
+    shared_model_config, monkeypatch
+):
+    monkeypatch.setenv("VLLM_TPU_PREFILL_SPACING_FRAC", "0")
+    monkeypatch.setenv("VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS", "16")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config, num_blocks=64, max_num_batched_tokens=64
+    )
+    scheduler.add_request(_make_real_request("a", 16, hasher, seed=1))
+    scheduler.add_request(_make_real_request("b", 16, hasher, seed=2))
+    # Only short prompts pending: no short-first cap, both run.
+    out = scheduler.schedule()
+    assert set(out.num_scheduled_tokens) == {"a", "b"}
+    assert scheduler._short_first_steps == 0
+
+
+def test_short_first_off_by_default(shared_model_config, monkeypatch):
+    scheduler = _decoding_scheduler(
+        shared_model_config, monkeypatch, VLLM_TPU_PREFILL_SPACING_FRAC=0
+    )
+    out = scheduler.schedule()
+    assert set(out.num_scheduled_tokens) == {"dec", "short", "big"}
+
+
+@pytest.mark.parametrize(
+    ("slack_s", "expected"),
+    [
+        # Short-first steps cost 0.03 - 0.01 = 0.02 s over a decode step.
+        (0.05, {"dec", "short"}),
+        (0.015, {"dec"}),
+    ],
+)
+def test_short_first_through_tpot_hold(
+    shared_model_config, monkeypatch, slack_s, expected
+):
+    scheduler = _decoding_scheduler(
+        shared_model_config,
+        monkeypatch,
+        VLLM_TPU_PREFILL_SPACING_FRAC=0,
+        VLLM_TPU_PREFILL_TPOT_TARGET_MS=20,
+        VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS=16,
+    )
+    scheduler._step_s["short"] = 0.03
+    monkeypatch.setattr(scheduler, "_short_of_slack", lambda decoders, now: slack_s)
+    out = scheduler.schedule()
+    assert set(out.num_scheduled_tokens) == expected
+    if "short" in expected:
+        assert out.num_scheduled_tokens["short"] == 16
+
+
+def test_short_first_respects_debt(shared_model_config, monkeypatch):
+    scheduler = _decoding_scheduler(
+        shared_model_config,
+        monkeypatch,
+        VLLM_TPU_PREFILL_SPACING_FRAC=0.5,
+        VLLM_TPU_PREFILL_SHORT_FIRST_TOKENS=16,
+    )
+    scheduler._debt_s = 0.05
+    # SHORT_TOKENS is 0: the debt defers the short prompt too.
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"dec"}
