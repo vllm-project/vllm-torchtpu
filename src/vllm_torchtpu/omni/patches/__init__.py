@@ -914,16 +914,28 @@ _LTX2_ASYNC_STEP_PATCHED = "_tpu_ltx2_async_step_patched"
 def _patch_ltx2_guidance_sigma_scalar() -> None:
     """Pre-materialize LTX-2 scheduler sigmas on CPU to avoid per-step D2H syncs.
 
-    Upstream ``LTXGuidanceExecutor.predict_parallel_guidance`` and
-    ``predict_noise`` call ``self._guide_modality(..., sigma=scheduler.sigmas[index])``
-    twice per denoise step (video and audio) without passing ``sigma_scalar``,
-    so ``velocity_from_x0`` executes ``sigma.to(torch.float32).item()`` on a
-    TPU tensor twice every step. In TorchTPU lazy execution mode, each
-    ``.item()`` forces a blocking ``TransferFromDevice`` that drains the
-    in-flight execution queue and starves TensorCore between steps. Caching
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_guidance.py``
+    (``LTXGuidanceExecutor.predict_noise``, ``predict_parallel_guidance``, and
+    ``_guide_modality``) and ``ltx2_denoise.py`` (``prepare_scheduler_stage``).
+
+    Upstream ``LTXGuidanceExecutor.predict_noise`` (and
+    ``predict_parallel_guidance``, which ``predict_noise`` dispatches to when
+    ``forward_ctx.guidance_parallel_ready`` is True) calls
+    ``self._guide_modality(..., sigma=scheduler.sigmas[index])`` twice per
+    denoise step (video and audio) without passing ``sigma_scalar``, so
+    ``velocity_from_x0`` executes ``sigma.to(torch.float32).item()`` on a TPU
+    tensor twice every step. In TorchTPU lazy execution mode, each ``.item()``
+    forces a blocking ``TransferFromDevice`` that drains the in-flight
+    execution queue and starves TensorCore between steps. Caching
     ``scheduler.sigmas`` as CPU ``float32`` scalars once per stage and
     supplying ``sigma_scalar`` eliminates all per-step D2H host syncs while
     preserving the exact IEEE-754 ``float32`` scalar value.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni pre-materializes scheduler sigmas on CPU and passes
+    ``sigma_scalar`` from ``LTXGuidanceExecutor.predict_noise`` /
+    ``predict_parallel_guidance`` into ``_guide_modality``.
     """
     from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_guidance
 
@@ -1052,7 +1064,25 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
 
 
 def _patch_ltx2_async_guidance_step() -> None:
-    """Replace CUDA-only per-step device synchronize() with non-blocking flush."""
+    """Replace CUDA-only per-step device synchronize() with non-blocking flush.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_runtime.py``
+    (``LTXRuntime._synchronize_guidance_parallel_step_output``).
+
+    Upstream materializes contiguous latents and calls
+    ``current_omni_platform.synchronize()`` at the end of every CFG-parallel
+    denoise step to avoid CUDA async numerical drift. On TPU, that blocking
+    sync stalls the host between steps and cannot be wrapped without invoking
+    the sync itself, so this patch replaces the 5-line method body to keep the
+    same CFG-world-size guard and ``.contiguous()`` materialization while
+    flushing via ``synchronize_tensors(list(latents), wait=False)``.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni gates the blocking ``synchronize()`` in
+    ``LTXRuntime._synchronize_guidance_parallel_step_output`` to CUDA (or
+    uses a non-blocking flush on TPU).
+    """
     from vllm_omni.diffusion.distributed import parallel_state
     from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
 
