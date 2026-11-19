@@ -18,7 +18,9 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 from vllm_torchtpu.structured_decoding import gaad
 from vllm_torchtpu.structured_decoding.gaad import (
@@ -252,7 +254,15 @@ def _vllm_config(speculative_config=None, async_scheduling=True, gaad=None):
     )
 
 
+_STANDALONE = SimpleNamespace(
+    method="custom_class", model=gaad.GAAD_PROPOSER, num_speculative_tokens=7
+)
 _DRAFTER = SimpleNamespace(method="mtp", model=None, num_speculative_tokens=7)
+
+
+def test_check_config_needs_gaad_for_standalone():
+    with pytest.raises(ValueError, match="gaad entry"):
+        gaad.check_config(_vllm_config(_STANDALONE))
 
 
 def test_check_config_needs_a_speculative_config():
@@ -286,6 +296,35 @@ def test_check_config_leaves_other_configs_alone():
     config = _vllm_config(SimpleNamespace(method="ngram", model=None))
     gaad.check_config(config)
     assert config.scheduler_config.async_scheduling is True
+
+
+def _manager_for(req_ids, enabled):
+    from vllm_torchtpu.runner.speculative_decoding_manager import (
+        SpeculativeDecodingManager,
+    )
+
+    manager = SpeculativeDecodingManager.__new__(SpeculativeDecodingManager)
+    manager.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(req_ids=req_ids),
+        vllm_config=_vllm_config(_DRAFTER, gaad={} if enabled else None),
+    )
+    return manager
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_draft_flags_are_laid_out_like_the_drafts(enabled):
+    manager = _manager_for(["x", "a", "b", "c"], enabled)
+    flat = manager._flat_draft_flags(
+        np.array([3, 0, 2], dtype=np.int32), {"a": [G, G, M], "c": [G]}, start_index=1
+    )
+    # a: its flags; b: no drafts; c: G then MODEL by default.
+    assert flat.tolist() == [G, G, M, G, M]
+    flags = manager._build_draft_flags_tensor(flat, 8)
+    if not enabled:
+        assert flags is None
+        return
+    assert flags.tolist() == [G, G, M, G, M, 0, 0, 0]
 
 
 def test_the_drafter_fills_only_its_share_of_the_row():
