@@ -135,7 +135,11 @@ def test_mxfp4_create_weights_and_process():
     ) as mock_prebuild:
         method.process_weights_after_loading(layer)
     mock_prebuild.assert_called_once_with(
-        topk=2, activation="silu", use_ep=False, skip_padded_tokens=True
+        topk_weights_float32=False,
+        topk=2,
+        activation="silu",
+        use_ep=False,
+        skip_padded_tokens=True,
     )
 
     # Validate output
