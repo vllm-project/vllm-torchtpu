@@ -363,7 +363,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         if prefilling and decoding:
             self.running[:] = decoding + prefilling
         self._step_wait_event = None
-        waiting_at_start = len(getattr(self, "waiting", ()) or ())
+        waiting_at_start = len(self.waiting)
         if getattr(self, "_memo_xstep", False):
             self._memo_trim_log()
         try:
@@ -382,7 +382,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     "prefix-scheduler telemetry: running=%d waiting=%d decoding=%d "
                     "prefilling=%d sched_tokens=%d %s",
                     len(self.running),
-                    len(getattr(self, "waiting", ())),
+                    len(self.waiting),
                     len(decoding),
                     len(prefilling),
                     getattr(out, "total_num_scheduled_tokens", 0),
@@ -416,19 +416,18 @@ class PrefixAwareScheduler(AsyncScheduler):
         event = getattr(self, "_step_wait_event", None)
         if event is not None:
             return event
-        if waiting_at_start == 0 and not getattr(self, "kv_holding_waiting", None):
+        if waiting_at_start == 0 and not self.kv_holding_waiting:
             return "idle"
         if getattr(out, "preempted_req_ids", None):
             return "preempted"
         # The admission check the scan stops at.
-        max_active = getattr(self, "max_num_active_reqs", None)
-        num_active = len(self.running) + int(
-            getattr(self, "num_waiting_for_streaming_input", 0) or 0
-        )
-        if isinstance(max_active, int) and num_active >= max_active:
+        num_active = len(self.running) + self.num_waiting_for_streaming_input
+        if num_active >= self.max_num_active_reqs:
             return "max_running"
-        budget = int(getattr(self, "max_num_scheduled_tokens", 8192) or 8192)
-        if getattr(out, "total_num_scheduled_tokens", 0) >= budget:
+        if (
+            getattr(out, "total_num_scheduled_tokens", 0)
+            >= self.max_num_scheduled_tokens
+        ):
             return "budget"
         if not self._has_undeferred_waiting():
             return "drained"
@@ -440,8 +439,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         The scan puts a skipped request that holds no KV blocks back into
         ``waiting`` and keeps it in ``deferred_waiting`` until it is scheduled.
         """
-        deferred = getattr(self, "deferred_waiting", None) or ()
-        return any(r not in deferred for r in getattr(self, "waiting", None) or ())
+        return any(r not in self.deferred_waiting for r in self.waiting)
 
     def _record_step_telemetry(self, out, waiting_at_start: int, stop: str) -> None:
         """Accumulates the per-minute step counters of the telemetry line.
@@ -520,23 +518,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         return reserved
 
     def _get_block_size(self) -> int:
-        """Return KV cache block size in tokens (defaults to 16 if unset)."""
-        block_size = getattr(self, "block_size", None)
-        if (
-            isinstance(block_size, int)
-            and not isinstance(block_size, bool)
-            and block_size > 0
-        ):
-            return block_size
-        cache_cfg = getattr(self, "cache_config", None)
-        cfg_block_size = getattr(cache_cfg, "block_size", None)
-        if (
-            isinstance(cfg_block_size, int)
-            and not isinstance(cfg_block_size, bool)
-            and cfg_block_size > 0
-        ):
-            return cfg_block_size
-        return 16
+        """The scheduler's KV cache block size in tokens."""
+        return self.block_size
 
     def _get_num_free_blocks(self) -> int | None:
         """Return free HBM blocks from BlockPool if available as an int."""
@@ -664,13 +647,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         is promoted even while ``kv_holding_waiting`` is not empty. Returns
         the queue the scan reads first.
         """
-        kv_holding = getattr(self, "kv_holding_waiting", None)
-        if kv_holding:
-            self._promote_warmest(kv_holding)
-        waiting = getattr(self, "waiting", None)
-        if waiting:
-            self._promote_warmest(waiting)
-        return kv_holding or waiting
+        if self.kv_holding_waiting:
+            self._promote_warmest(self.kv_holding_waiting)
+        if self.waiting:
+            self._promote_warmest(self.waiting)
+        return self.kv_holding_waiting or self.waiting
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
