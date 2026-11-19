@@ -23,7 +23,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 from vllm_torchtpu.kernels import fp8_lm_head as kernel
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -58,7 +58,10 @@ class Fp8LMHeadMethod(UnquantizedEmbeddingMethod):
             return  # reload paths re-enter this hook
         q, scale = quantize(weight.data)
         layer.weight = Parameter(q, requires_grad=False)
-        layer.weight_scale = Parameter(scale, requires_grad=False)
+        # A [1, vocab] buffer of its own, not the [vocab, 1] one under the
+        # view: a view argument costs every head call an eager as_strided copy
+        # program (`fresh_buffer`).
+        layer.weight_scale = Parameter(fresh_buffer(scale), requires_grad=False)
         if q.device.type == "tpu":
             synchronize_tensors([layer.weight, layer.weight_scale])
         logger.info_once(
