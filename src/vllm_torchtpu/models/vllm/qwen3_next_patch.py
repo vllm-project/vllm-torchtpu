@@ -986,8 +986,8 @@ def _patched_gemma_rmsnorm_forward_native(
 
 def _draft_borrows_target_head() -> bool:
     """Whether the engine being loaded runs a draft that borrows the target's
-    LM head: an EAGLE/MTP or DFlash draft (the runner's async drafters, whose
-    proposers bind it in maybe_share_lm_head). An n-gram drafter has no head.
+    LM head: an EAGLE/MTP, DFlash or DSpark draft (the proposers that bind it
+    in maybe_share_lm_head). An n-gram drafter has no head.
 
     Read from the current vLLM config, which _quantize_target_lm_head has
     already read for the same head.
@@ -995,7 +995,9 @@ def _draft_borrows_target_head() -> bool:
     from vllm.config import get_current_vllm_config
 
     spec = get_current_vllm_config().speculative_config
-    return spec is not None and (spec.use_eagle() or spec.method == "dflash")
+    return spec is not None and (
+        spec.use_eagle() or spec.method in ("dflash", "dspark")
+    )
 
 
 def _quantize_target_lm_head() -> bool:

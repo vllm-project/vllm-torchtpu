@@ -268,6 +268,7 @@ def test_post_load_hook_keeps_no_twin_without_a_draft(monkeypatch):
         ("mtp", True),
         ("eagle3", True),
         ("dflash", True),
+        ("dspark", True),
         ("ngram", False),
         (None, False),
     ],
@@ -275,8 +276,9 @@ def test_post_load_hook_keeps_no_twin_without_a_draft(monkeypatch):
 def test_only_a_draft_that_borrows_the_target_head_keeps_a_twin(
     monkeypatch, method, borrows
 ):
-    """The BF16 twin is kept only for an EAGLE/MTP or DFlash draft, the drafts
-    that bind the target's head; an n-gram drafter or no drafter keeps none."""
+    """The BF16 twin is kept only for an EAGLE/MTP, DFlash or DSpark draft,
+    the drafts that bind the target's head; an n-gram drafter or no drafter
+    keeps none."""
     import vllm.config
 
     from vllm_torchtpu.models.vllm import qwen3_next_patch
