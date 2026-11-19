@@ -105,28 +105,26 @@ class EncoderEmbeds:
 
     def gather(self, num_rows: int) -> torch.Tensor:
         """The embeddings in `num_rows` rows: these first, then the first row
-        of the first source (the merge reads only the first `len(self)`)."""
-        sources: dict[int, tuple[torch.Tensor, np.ndarray, np.ndarray]] = {}
-        offset = 0
+        of the first source (the merge reads only the first `len(self)`).
+
+        One host-built table of row indices (-1 where a row is another
+        source's) uploads once for all sources.
+        """
+        sources: dict[int, int] = {}
         for part in self.parts:
-            key = id(part.source)
-            if key not in sources:
-                sources[key] = (
-                    part.source,
-                    np.zeros(num_rows, dtype=np.int64),
-                    np.zeros(num_rows, dtype=bool),
-                )
-            _, index, mask = sources[key]
-            index[offset : offset + len(part)] = part.rows
-            mask[offset : offset + len(part)] = True
+            sources.setdefault(id(part.source), len(sources))
+        table = np.full((len(sources), num_rows), -1, dtype=np.int64)
+        table[0] = 0
+        offset, by_index = 0, {}
+        for part in self.parts:
+            s = sources[id(part.source)]
+            by_index[s] = part.source
+            table[s, offset : offset + len(part)] = part.rows
             offset += len(part)
-        out = None
-        for source, index, mask in sources.values():
-            rows = source[torch.from_numpy(index).to(source.device, non_blocking=True)]
-            if out is None:
-                out = rows
-            else:
-                keep = torch.from_numpy(mask).to(source.device, non_blocking=True)
-                out = torch.where(keep.unsqueeze(-1), rows, out)
-        assert out is not None
+        device = by_index[0].device
+        table = torch.from_numpy(table).to(device, non_blocking=True)
+        out = by_index[0][table[0].clamp(min=0)]
+        for s in range(1, len(sources)):
+            rows = by_index[s][table[s].clamp(min=0)]
+            out = torch.where((table[s] >= 0).unsqueeze(-1), rows, out)
         return out

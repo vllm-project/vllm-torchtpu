@@ -30,6 +30,7 @@ from vllm.v1.worker.encoder_cudagraph import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.mm_host_copy_patch import copy_bytes_
 from vllm_torchtpu.runner.mm_encoder_rows import split_batch_output
 from vllm_torchtpu.runner.mm_video_chunking import (
     embed_multimodal_chunked,
@@ -52,10 +53,11 @@ def _to_device(mm_kwargs: Any, device: torch.device) -> Any:
 
 
 # Host rows reach the device as ROW_CHUNKS chunks of 1/ROW_CHUNKS of a budget's
-# rows (`rows_to_device`), so no device program depends on the row count.
-# Uploading 30000 of 32768 rows as 8 chunks took 6.3 ms, as one tensor 8.5 ms;
-# copying them into one budget-shaped host buffer first, 14 ms.
-ROW_CHUNKS = 8
+# rows (`rows_to_device`), so no device program depends on the row count. Each
+# transfer holds up the H2D copies after it (8 chunks cost a 5200-row image
+# 5 ms of TTFT); 2 chunks cover any batch without a host copy, as a batch has
+# more rows than the next smaller budget, at least half of its own.
+ROW_CHUNKS = 2
 
 
 def rows_to_device(
@@ -118,7 +120,15 @@ def _span(
             span = first.as_strided(shape, first.stride(), base)
             return span, [(p.storage_offset() - base) // row for p in parts], False
     starts = np.cumsum([0] + [p.shape[0] for p in parts[:-1]])
-    return torch.cat(list(parts)), [int(s) for s in starts], True
+    out = first.new_empty((int(starts[-1]) + parts[-1].shape[0], *first.shape[1:]))
+    flat = out.view(-1).view(torch.uint8)
+    pairs, at = [], 0
+    for part in parts:
+        src = part.contiguous().view(-1).view(torch.uint8)
+        pairs.append((flat[at : at + src.numel()], src))
+        at += src.numel()
+    copy_bytes_(pairs)
+    return out, [int(s) for s in starts], True
 
 
 @contextmanager
