@@ -20,6 +20,7 @@ import pytest
 from vllm.config import KVTransferConfig
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log
@@ -62,6 +63,8 @@ def _make_scheduler(
     s.policy = SchedulingPolicy.FCFS
     s.WINDOW = window
     s._is_kv_consumer = False
+    s._promote_warmest_switch = True
+    s._promote_warmest_switch = True
     s._paw_n = 0
     s._paw_cold_tokens = 0
     s._paw_prompt_tokens = 0
@@ -319,6 +322,9 @@ def _make_step_scheduler(running, monkeypatch, budget=8192):
     # Read by the admission telemetry's inflight_reserved field.
     s._inflight_prefills = set()
     s._decode_throttle_switch = False
+    s._kv_prefetch_n = 0
+    s._kv_prefetch_cap = None
+    s._promote_warmest_switch = True
     return s, seen
 
 
@@ -420,6 +426,29 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     # The per-minute counters restart after each telemetry line.
     text = s._admission_telemetry("idle")
     assert "min_steps=0" in text and "min_stops=-" in text
+
+
+def test_admission_telemetry_reads_the_throttle_not_the_prefetch_hook(monkeypatch):
+    """With KV prefetch at the cap and its held slots full, the prefetch-aware
+    hook refuses loads and counts the refusal; the telemetry must report the
+    throttle's reservation and count nothing."""
+    monkeypatch.setattr(Scheduler, "_inflight_prefill_reserved_blocks", lambda self: 0)
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.running = []
+    s.num_waiting_for_streaming_input = 0
+    s._decode_throttle_switch = False
+    s._inflight_prefills = [
+        SimpleNamespace(status=RequestStatus.WAITING_FOR_REMOTE_KVS)
+    ]
+    s._kv_prefetch_in_waiting = True
+    s._kv_prefetch_cap = 0
+    s._kv_prefetch_n = 1
+    s._kv_prefetch_full_refusals = 0
+    assert s._inflight_prefill_reserved_blocks() == 1 << 30
+    assert s._kv_prefetch_full_refusals == 1
+
+    assert "inflight_reserved=0 " in s._admission_telemetry("budget")
+    assert s._kv_prefetch_full_refusals == 1
 
 
 def test_local_prefix_hit_forwards_max_cache_hit_length(monkeypatch):
