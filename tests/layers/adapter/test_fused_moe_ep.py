@@ -1455,6 +1455,12 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["plan_kernel"] is True
 
 
+def test_plan_kernel_switch_is_copied_to_ray_workers():
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    assert "MOE_FUSED_EP_V2_PLAN_KERNEL" in TpuPlatform.additional_env_vars
+
+
 def test_shared_expert_operands_reach_the_push_layer(monkeypatch):
     """A shared limit adds four replicated operands, hands them to the push
     layer as `shared_expert`, and keys its own op."""
