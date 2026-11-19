@@ -629,6 +629,7 @@ class TestTPUConnector:
                 children.append(object.__new__(TPURaidenOffloadingConnector))
             connector = object.__new__(TPUMultiConnector)
             connector._connectors = children
+            connector._producer_divergent_hits = False
 
         manager = SimpleNamespace(
             get_computed_blocks=lambda request, max_cache_hit_length=None: (
