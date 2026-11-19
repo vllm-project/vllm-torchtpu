@@ -31,6 +31,7 @@ from .config import (
     num_speculative_tokens,
     use_unified_pool,
 )
+from .runner.metadata import build_attention_metadata
 
 if TYPE_CHECKING:
     from .pooled_cache import Qwen4ExpPooledCache
@@ -238,6 +239,11 @@ class Qwen4ExpAdapter(ModelAdapter):
         self._recent: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._previous_rows: dict[str, int] = {}
         self._current_rows: dict[str, int] = {}
+
+    def build_attention_metadata(self, ctx, num_reqs_padded):
+        """The runner's attention metadata walk, from this directory's copy
+        (runner/metadata.py) instead of the shared builder."""
+        return build_attention_metadata(self.runner, ctx, num_reqs_padded)
 
     def bind_model(self, model):
         if self.pooled:

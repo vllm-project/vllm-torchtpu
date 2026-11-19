@@ -79,6 +79,10 @@ def register() -> None:
     from vllm_torchtpu.runner.model_adapters import register_model_adapter
 
     register_model_adapter(QWEN4_EXP_ARCHITECTURES, _make_adapter)
+    # The adapter's metadata walk re-packs block tables by BlockTable version.
+    from .runner.metadata import _install_block_table_version
+
+    _install_block_table_version()
 
     # Served on every agentx config: each worker pinned to its chip's node.
     from vllm_torchtpu.worker.cpu_pinning import register_cpu_pinning
