@@ -70,10 +70,13 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     TPURaidenConnectorWorker,
     _KV_PARAMS_ADMITTED,
     _KV_PARAMS_REJECTED,
+    _STAGE3_REGISTRY_STATUS_CANCELLED,
+    _STAGE3_REGISTRY_STATUS_UNKNOWN,
     _CoordRecvEntry,
     _CoordSendEntry,
     _Stage3LoadMeta,
     _Stage3RegisteredSend,
+    _Stage3SubmitOutcome,
     _Stage3TransferGroup,
     _reshard_advertise_host,
     _select_committed_mamba_blocks,
@@ -8478,8 +8481,8 @@ class TestPipelineParallelRegisterAheadWorker:
         meta.reqs_to_send["early"] = _stage3_send(
             1234, expiration_time=time.time() - 1.0
         )
-        # The store has no row yet (a lagging stage would see UNKNOWN too).
-        facade.request_block_statuses[("early", 1234)] = 1
+        # Consumer cancelled while this stage is still finish_pending.
+        facade.request_block_statuses[("early", 1234)] = 4
         with (
             _stage3_worker_env(),
             patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=1e-9),
@@ -8777,8 +8780,8 @@ class TestContextParallelRegisterAheadWorker:
         meta.reqs_to_send["early"] = self._send(
             1234, registered_ahead=True, expiration_time=time.time() - 1.0
         )
-        # The store has no row yet (a lagging rank would see UNKNOWN too).
-        facade.request_block_statuses[("early", 1234)] = 1
+        # Consumer cancelled while this rank is still finish_pending.
+        facade.request_block_statuses[("early", 1234)] = 4
         with (
             _stage3_worker_env(),
             patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=1e-9),
@@ -8914,3 +8917,386 @@ def test_pd_native_load_failure_retains_identity_across_cleanup(policy, monkeypa
     assert worker.get_block_ids_with_load_errors() == set()
     assert worker.get_transfer_results({"destination"}).failed_recving == set()
     assert "destination" not in worker._failed_recving
+
+
+class _DmaDrainEngine(_FakeRaidenEngine):
+    def __init__(self):
+        super().__init__()
+        self.poll_results = []
+        self.cancel_receive_calls = []
+        self.cancel_receive_settled = False
+        self.receive_settled = False
+        self.send_settled = False
+
+    def cancel_receive(self, uuid):
+        self.cancel_receive_calls.append(int(uuid))
+        return self.cancel_receive_settled
+
+    def is_receive_settled(self, uuid):
+        self.calls.append(("is_receive_settled", int(uuid)))
+        return self.receive_settled
+
+    def is_send_settled(self, uuid):
+        self.calls.append(("is_send_settled", int(uuid)))
+        return self.send_settled
+
+
+class TestStage3DmaDrainSafety:
+    """Regression suite for Stage-3 Decode H2D and Prefill D2H DMA-drain gates."""
+
+    @staticmethod
+    def _seeded_decode_worker(
+        *,
+        dst_req_id="dst-req",
+        src_req_id="src-req",
+        uuid=601,
+        blocks=None,
+        tp_rank=0,
+        tp_size=1,
+    ):
+        worker = _make_raiden_worker(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            is_producer=False,
+            dp_size=4,
+            pcp_size=1,
+        )
+        engine = _DmaDrainEngine()
+        worker._raiden_transfer_engine = engine
+        worker._bind_stage3_request_ids(dst_req_id, src_req_id)
+        worker._stage3_submitted_loads[dst_req_id] = uuid
+        worker._stage3_submitted_load_tokens[dst_req_id] = 1024
+        worker._stage3_load_start_times[dst_req_id] = 10.0
+        worker._load_block_ids[dst_req_id] = list([0, 2] if blocks is None else blocks)
+        return worker, engine
+
+    @staticmethod
+    def _seeded_prefill_worker(
+        *,
+        req_id="send-req",
+        uuid=701,
+        expiration_time=1e20,
+        send_completion=True,
+    ):
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            is_producer=True,
+            dp_size=1,
+            pcp_size=1,
+            block_size=1024,
+            send_completion=send_completion,
+        )
+        engine = _DmaDrainEngine()
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "prefill-controller.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(
+            job_name="prefill",
+            job_replica_id="rank0",
+            data_name="kv.fa",
+            data_replica_idx=0,
+        )
+        worker._local_raiden_transfer_rank = MagicMock(return_value=0)
+        worker._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
+            uuid=uuid,
+            local_block_ids=(0,),
+            num_tokens=1024,
+            expiration_time=expiration_time,
+            finish_pending=False,
+        )
+        return worker, engine, facade
+
+    def test_decode_10_6a_late_done_recving_after_timeout_waits_for_dma(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        worker, engine = self._seeded_decode_worker(
+            dst_req_id="dst-10-6a", src_req_id="src-10-6a", uuid=601, blocks=[0, 2]
+        )
+        worker._stage3_controller_accepted.add("dst-10-6a")
+        worker._stage3_pending_controller_failures["dst-10-6a"] = 0.0
+
+        # Poll 1: Python wait timeout expires while H2D is still in flight.
+        assert worker.get_finished() == (set(), set())
+        assert engine.cancel_receive_calls == [601]
+        assert worker._stage3_draining_cancelled_loads == {"dst-10-6a": 601}
+        assert worker._load_block_ids["dst-10-6a"] == [0, 2]
+        assert worker.get_block_ids_with_load_errors() == set()
+
+        # Poll 2: Even if C++ emits done_recving while DMA is not yet settled,
+        # the connector withholds completion and preserves the failure outcome.
+        engine.poll_results.append(([], ["src-10-6a"], []))
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_block_ids_with_load_errors() == set()
+
+        # Poll 3: Once H2D settles, the expired load surfaces as failed->done
+        # once and records failed blocks for recompute.
+        engine.receive_settled = True
+        assert worker.get_finished() == (set(), {"dst-10-6a"})
+        assert worker.get_block_ids_with_load_errors() == {0, 2}
+        assert worker._stage3_draining_cancelled_loads == {}
+
+        # Poll 4: Replayed native records do not duplicate completion/errors.
+        engine.poll_results.append(([], [], ["src-10-6a"]))
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_block_ids_with_load_errors() == set()
+        assert worker.get_finished({"dst-10-6a"}) == (set(), set())
+        assert worker._load_block_ids == {}
+
+    def test_decode_10_6b_draining_receive_and_immediate_settle(self, monkeypatch):
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        worker, engine = self._seeded_decode_worker(
+            dst_req_id="dst-10-6b", src_req_id="src-10-6b", uuid=602, blocks=[4, 5]
+        )
+        worker._stage3_controller_accepted.add("dst-10-6b")
+        worker._stage3_pending_controller_failures["dst-10-6b"] = 0.0
+
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_finished() == (set(), set())
+        assert engine.cancel_receive_calls == [602]
+        assert worker._load_block_ids["dst-10-6b"] == [4, 5]
+
+        engine.receive_settled = True
+        engine.poll_results.append(([], [], ["src-10-6b"]))
+        assert worker.get_finished() == (set(), {"dst-10-6b"})
+        assert worker.get_block_ids_with_load_errors() == {4, 5}
+        assert worker.get_finished() == (set(), set())
+
+        # Also exercise immediate settlement when cancel_receive returns True.
+        worker2, engine2 = self._seeded_decode_worker(
+            dst_req_id="dst-settled", src_req_id="src-settled", uuid=603, blocks=[7]
+        )
+        engine2.cancel_receive_settled = True
+        engine2.receive_settled = True
+        worker2._stage3_controller_accepted.add("dst-settled")
+        worker2._stage3_pending_controller_failures["dst-settled"] = 0.0
+        assert worker2.get_finished() == (set(), {"dst-settled"})
+        assert worker2.get_block_ids_with_load_errors() == {7}
+
+    def test_decode_scheduler_abort_holds_blocks_until_h2d_settled(self, monkeypatch):
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        worker, engine = self._seeded_decode_worker(
+            dst_req_id="dst-abort", src_req_id="src-abort", uuid=604, blocks=[9, 10]
+        )
+        worker._stage3_controller_accepted.add("dst-abort")
+
+        # Abort while H2D is unsettled: blocks remain pinned and unreported.
+        assert worker.get_finished({"dst-abort"}) == (set(), set())
+        assert engine.cancel_receive_calls == [604]
+        assert worker._load_block_ids == {"dst-abort": [9, 10]}
+        assert worker._stage3_draining_cancelled_loads == {"dst-abort": 604}
+
+        # Repeat finished_req_ids while still draining keeps blocks pinned.
+        assert worker.get_finished({"dst-abort"}) == (set(), set())
+        assert worker._load_block_ids == {"dst-abort": [9, 10]}
+
+        # Once DMA settles, delayed block free completes and cleans up state.
+        engine.receive_settled = True
+        assert worker.get_finished() == (set(), {"dst-abort"})
+        assert worker.get_block_ids_with_load_errors() == {9, 10}
+        assert worker._load_block_ids == {}
+        assert worker._stage3_draining_cancelled_loads == {}
+        assert worker.get_finished() == (set(), set())
+
+        # Immediate-settled abort completes in one step.
+        worker_now, engine_now = self._seeded_decode_worker(
+            dst_req_id="dst-abort-now",
+            src_req_id="src-abort-now",
+            uuid=605,
+            blocks=[11],
+        )
+        engine_now.cancel_receive_settled = True
+        engine_now.receive_settled = True
+        worker_now._stage3_controller_accepted.add("dst-abort-now")
+        assert worker_now.get_finished({"dst-abort-now"}) == (
+            set(),
+            {"dst-abort-now"},
+        )
+        assert worker_now.get_block_ids_with_load_errors() == {11}
+        assert worker_now._load_block_ids == {}
+
+    def test_decode_tp2_inflight_abort_syncs_and_drains_per_rank(self, monkeypatch):
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        leader, leader_engine = self._seeded_decode_worker(
+            dst_req_id="dst-tp",
+            src_req_id="src-tp",
+            uuid=606,
+            blocks=[12],
+            tp_rank=0,
+            tp_size=2,
+        )
+        follower, follower_engine = self._seeded_decode_worker(
+            dst_req_id="dst-tp",
+            src_req_id="src-tp",
+            uuid=606,
+            blocks=[13],
+            tp_rank=1,
+            tp_size=2,
+        )
+        for rank_worker in (leader, follower):
+            rank_worker._stage3_inflight_submits.add("dst-tp")
+            rank_worker._stage3_tp_submits.add("dst-tp")
+
+        broadcast_box: dict[str, Any] = {"states": {}}
+
+        def _leader_bcast(obj, src=0):
+            assert src == 0
+            broadcast_box["states"] = dict(obj)
+            return broadcast_box["states"]
+
+        def _follower_bcast(_obj, src=0):
+            assert src == 0
+            return dict(broadcast_box["states"])
+
+        leader_group = SimpleNamespace(broadcast_object=_leader_bcast)
+        follower_group = SimpleNamespace(broadcast_object=_follower_bcast)
+
+        # Step 1: Both ranks abort while leader submit is still in flight;
+        # both cancel locally and wait for submit sync + local DMA drain.
+        with patch(f"{_MOD}.get_tp_group", return_value=leader_group):
+            assert leader.get_finished({"dst-tp"}) == (set(), set())
+        with patch(f"{_MOD}.get_tp_group", return_value=follower_group):
+            assert follower.get_finished({"dst-tp"}) == (set(), set())
+        assert leader_engine.cancel_receive_calls == [606]
+        assert follower_engine.cancel_receive_calls == [606]
+
+        # Step 2: Leader RPC posts outcome; TP sync drains _stage3_tp_submits
+        # while follower DMA remains unsettled until Step 3.
+        pending = SimpleNamespace(
+            destination_req_id="dst-tp",
+            source_req_id="src-tp",
+            uuid=606,
+            num_tokens=1024,
+            local_blocks=[12],
+            defer_deadline=None,
+            req_meta=SimpleNamespace(src_controller_address="src:27000"),
+            wait_logged=False,
+        )
+        task = SimpleNamespace(
+            pending=pending, skip_tokens=0, fa_skip_bytes=0, source_units=1
+        )
+        leader._stage3_submit_outcomes.append(
+            _Stage3SubmitOutcome(
+                task=task,
+                error=RuntimeError("post-arm timeout"),
+                submit_ms=1.0,
+                attempted_at=1.0,
+            )
+        )
+        leader_engine.receive_settled = True
+        with patch(f"{_MOD}.get_tp_group", return_value=leader_group):
+            assert leader.get_finished() == (set(), {"dst-tp"})
+        with patch(f"{_MOD}.get_tp_group", return_value=follower_group):
+            assert follower.get_finished() == (set(), set())
+        assert follower._stage3_tp_submits == set()
+        assert follower._load_block_ids == {"dst-tp": [13]}
+
+        follower_engine.receive_settled = True
+        with patch(f"{_MOD}.get_tp_group", return_value=follower_group):
+            assert follower.get_finished() == (set(), {"dst-tp"})
+        assert follower.get_block_ids_with_load_errors() == {13}
+        assert follower._load_block_ids == {}
+
+    def test_prefill_status_probe_ignores_status_unknown(self, monkeypatch):
+        from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+            RaidenSendOutcome,
+        )
+
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        monkeypatch.setattr(
+            f"{_MOD}.dist_utils.get_stage3_status_probe_s", lambda: 1e-9
+        )
+        worker, engine, facade = self._seeded_prefill_worker(
+            req_id="prefill-10-7a", uuid=701
+        )
+        engine.send_settled = True
+        facade.request_block_statuses[("prefill-10-7a", 701)] = (
+            _STAGE3_REGISTRY_STATUS_UNKNOWN
+        )
+
+        # Arm probe, then probe STATUS_UNKNOWN(1) twice: never retired!
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_finished() == (set(), set())
+        assert len(facade.get_request_block_status_calls) == 2
+        assert "prefill-10-7a" in worker._stage3_registered_sends
+        assert worker.take_pd_send_results() is None
+
+        # Explicit STATUS_CANCELLED(4) retires once DMA is settled.
+        facade.request_block_statuses[("prefill-10-7a", 701)] = (
+            _STAGE3_REGISTRY_STATUS_CANCELLED
+        )
+        assert worker.get_finished() == ({"prefill-10-7a"}, set())
+        results = worker.take_pd_send_results()
+        assert results is not None
+        assert results.outcomes == {
+            "prefill-10-7a": RaidenSendOutcome.UNCLAIMED_TIMEOUT
+        }
+
+    def test_prefill_send_drain_gate_holds_cancelled_and_expired_sends(
+        self, monkeypatch
+    ):
+        from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+            RaidenSendOutcome,
+        )
+
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        monkeypatch.setattr(
+            f"{_MOD}.dist_utils.get_stage3_status_probe_s", lambda: 1e-9
+        )
+
+        # Case A: STATUS_CANCELLED(4) held while is_send_settled is False.
+        worker, engine, facade = self._seeded_prefill_worker(
+            req_id="send-cancel-drain", uuid=702
+        )
+        facade.request_block_statuses[("send-cancel-drain", 702)] = (
+            _STAGE3_REGISTRY_STATUS_CANCELLED
+        )
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_finished() == (set(), set())
+        assert worker._stage3_draining_sends == {"send-cancel-drain": "cancelled"}
+        assert "send-cancel-drain" in worker._stage3_registered_sends
+        assert worker.take_pd_send_results() is None
+        # While draining, status probe is not re-issued.
+        assert len(facade.get_request_block_status_calls) == 1
+
+        engine.send_settled = True
+        assert worker.get_finished() == ({"send-cancel-drain"}, set())
+        results = worker.take_pd_send_results()
+        assert results is not None
+        assert results.outcomes == {
+            "send-cancel-drain": RaidenSendOutcome.UNCLAIMED_TIMEOUT
+        }
+        assert worker._stage3_draining_sends == {}
+        assert worker.get_finished() == (set(), set())
+
+        # Case B: Store-restart race where lease expiry cancels unclaimed=True
+        # while D2H is still in flight, then native done_sending arrives.
+        worker2, engine2, facade2 = self._seeded_prefill_worker(
+            req_id="send-restart-drain", uuid=703, expiration_time=0.0
+        )
+        assert worker2.get_finished() == (set(), set())
+        assert len(facade2.cancel_request_blocks_calls) == 1
+        assert worker2._stage3_draining_sends == {"send-restart-drain": "cancelled"}
+        assert "send-restart-drain" in worker2._stage3_registered_sends
+        # Subsequent poll while draining does not spam cancel RPCs.
+        assert worker2.get_finished() == (set(), set())
+        assert len(facade2.cancel_request_blocks_calls) == 1
+
+        engine2.poll_results.append((["send-restart-drain"], [], []))
+        engine2.send_settled = True
+        assert worker2.get_finished() == ({"send-restart-drain"}, set())
+        results2 = worker2.take_pd_send_results()
+        assert results2 is not None
+        assert results2.outcomes == {"send-restart-drain": RaidenSendOutcome.SUCCESS}
+        assert len(facade2.complete_request_blocks_calls) == 1
+        # Tombstone expiry cleans up _stage3_draining_sends tracking too.
+        worker2._stage3_terminal_sends["send-restart-drain"] = _Stage3RegisteredSend(
+            uuid=703,
+            local_block_ids=(0,),
+            num_tokens=1024,
+            expiration_time=0.0,
+        )
+        worker2.process_send_load(TPUConnectorMetadata(reqs_to_release={"noop": 999}))
