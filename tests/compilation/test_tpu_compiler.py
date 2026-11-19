@@ -360,6 +360,7 @@ class TestTpuCompilerCache:
         }
         assert {
             "vllm_torchtpu/gdn_pool_layout.py",
+            "vllm_torchtpu/kv_cache_spec_normalizer.py",
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",

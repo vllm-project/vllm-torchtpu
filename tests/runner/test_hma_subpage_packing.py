@@ -31,6 +31,7 @@ from vllm.config import (
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
+    get_current_vllm_config,
     set_current_vllm_config,
 )
 from vllm.config.attention import AttentionConfig
@@ -417,6 +418,31 @@ def test_guards_keep_specs_pinned(case: str, monkeypatch: pytest.MonkeyPatch):
         assert all(g.kv_cache_spec.block_size == 256 for g in groups)
 
 
+def test_resolve_runs_backend_helpers_under_the_given_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An ambient config with another KV layout must not leak into the gate."""
+    mgr = _make_manager(max_model_len=4096)
+    given = mgr.runner.vllm_config
+    seen: list[VllmConfig] = []
+    page_size_bytes = BACKEND.get_kv_cache_page_size_bytes
+
+    def _spy(*args: Any, **kwargs: Any) -> int:
+        seen.append(get_current_vllm_config())
+        return page_size_bytes(*args, **kwargs)
+
+    monkeypatch.setattr(BACKEND, "get_kv_cache_page_size_bytes", staticmethod(_spy))
+    with set_current_vllm_config(_build_vllm_cfg(kv_layout=VllmKVCacheLayout.LBHNC)):
+        assert (
+            resolve_subpage_packing_block_size(
+                cast(Any, _layers()), given, mgr.runner.kv_cache_dtype, BACKEND, 256
+            )
+            == 128
+        )
+    assert seen
+    assert all(config is given for config in seen)
+
+
 def test_unified_kv_layout_skips_packing():
     mgr = _make_manager(unified_kv_layout=True)
     specs = _kv_cache_spec(mgr, _layers())
@@ -654,6 +680,39 @@ def _rpa_impl(layer: dict[str, int], **kwargs: Any) -> Any:
         kv_cache_dtype="auto",
         **kwargs,
     )
+
+
+def test_batched_rpa_impl_builds_a_distinct_op_per_subpage_split(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Changing the split rebuilds the op instead of reusing the unsplit one."""
+    built: list[tuple[str, Any]] = []
+
+    def _fake_jax_op(op_name: str, fn: Any, **kwargs: Any) -> MagicMock:
+        built.append((op_name, fn))
+        return MagicMock()
+
+    monkeypatch.setattr(attn_module.pallas, "jax_op", _fake_jax_op)
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    impl = _rpa_impl(GLOBAL)
+    with set_vllm_model_wrapper_context(mesh=cast(Any, None)):
+        unsplit = impl._build_rpa_kernel(None, None, None)
+        assert impl._build_rpa_kernel(None, None, None) is unsplit
+        impl.set_subpage_split(2)
+        split = impl._build_rpa_kernel(None, None, None)
+        assert impl._build_rpa_kernel(None, None, None) is split
+        # Layers with the same config share an op only at the same split.
+        assert _rpa_impl(GLOBAL)._build_rpa_kernel(None, None, None) is unsplit
+        other = _rpa_impl(GLOBAL)
+        other.set_subpage_split(2)
+        assert other._build_rpa_kernel(None, None, None) is split
+
+    assert split is not unsplit
+    (unsplit_name, unsplit_fn), (split_name, split_fn) = built
+    assert unsplit_name != split_name
+    assert unsplit_fn.func is split_fn.func is attn_module._pallas_rpa_kernel_batched
+    assert "subpage_split" not in unsplit_fn.keywords
+    assert split_fn.keywords["subpage_split"] == 2
 
 
 def _initialize_kv_cache(

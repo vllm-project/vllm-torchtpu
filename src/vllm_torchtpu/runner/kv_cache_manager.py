@@ -41,7 +41,7 @@ from vllm.models.deepseek_v4.attention import (
     DeepseekV4IndexerCache,
 )
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
-from vllm.v1.attention.backend import AttentionLayer, AttentionType, MultipleOf
+from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
@@ -119,17 +119,6 @@ if TYPE_CHECKING:
             head_size: int,
             cache_dtype_str: str | torch.dtype = "auto",
         ) -> int: ...
-
-        @staticmethod
-        def get_supported_kernel_block_sizes(
-            kv_cache_spec: KVCacheSpec | None = None,
-        ) -> list[int | MultipleOf]: ...
-
-        @classmethod
-        def supports_subpage_packing(cls) -> bool: ...
-
-        @classmethod
-        def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec: ...
 
         @staticmethod
         def get_name() -> str: ...

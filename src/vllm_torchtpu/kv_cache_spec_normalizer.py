@@ -159,8 +159,7 @@ def _subpage_packing_blocker(
         or parallel_config.decode_context_parallel_size > 1
     ):
         return "PCP/DCP > 1"
-    with set_current_vllm_config(vllm_config):
-        resolved_layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    resolved_layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     if resolved_layout != VllmKVCacheLayout.LBNHC:
         return f"the {resolved_layout.value} KV cache layout"
     return None
@@ -207,8 +206,7 @@ def _subpage_base_block_size(
     if block_size % ratio:
         return block_size
     base = block_size // ratio
-    with set_current_vllm_config(vllm_config):
-        supported = attention_backend.get_supported_kernel_block_sizes()
+    supported = attention_backend.get_supported_kernel_block_sizes()
     min_tpu_page = get_tpu_min_page_size(vllm_config)
     if not _is_supported_kernel_block_size(base, min_tpu_page, supported):
         return block_size
@@ -254,6 +252,20 @@ def resolve_subpage_packing_block_size(
     native page size so vLLM's `unify_kv_cache_spec_page_size` scales the
     smaller-page layers' `block_size`, packing sub-pages into one shared 4D pool.
     """
+    # The backend's page and spec helpers read the current vLLM config.
+    with set_current_vllm_config(vllm_config):
+        return _resolve_subpage_packing_block_size(
+            layers, vllm_config, kv_cache_dtype, attention_backend, block_size
+        )
+
+
+def _resolve_subpage_packing_block_size(
+    layers: dict[str, AttentionLayerBase],
+    vllm_config: VllmConfig,
+    kv_cache_dtype: torch.dtype,
+    attention_backend: type[PallasAttentionBackend],
+    block_size: int,
+) -> int | None:
     geometries: dict[tuple[int, int, int | None], AttentionSpec] = {}
     for module in layers.values():
         if not isinstance(module, Attention):
