@@ -164,14 +164,16 @@ def _kernel(
 
                 k = project(i, t)
                 h_copy(k_cell, u).wait()
-                h = hb[u % 2].astype(jnp.float32)
-                product = ((h * qw) * kw) * k
                 rows = at(t * token_tile, token_tile)
+                # One 128-lane group at a time keeps the FP32 temporaries in
+                # registers instead of spilling [tile, window] arrays.
                 for lane in range(0, window, LANES):
                     part = slice(lane, lane + LANES)
-                    dot_sum[rows, :] += product[:, part]
-                    h_sum[rows, :] += h[:, part] * h[:, part]
-                    k_sum[rows, :] += k[:, part] * k[:, part]
+                    h = hb[u % 2, :, part].astype(jnp.float32)
+                    kp = k[:, part]
+                    dot_sum[rows, :] += ((h * qw[:, part]) * kw[:, part]) * kp
+                    h_sum[rows, :] += h * h
+                    k_sum[rows, :] += kp * kp
 
             @pl.when(i + 2 < windows)
             def _():
@@ -215,7 +217,10 @@ def _kernel(
                     o_copy(u - 2).wait()
 
                 g = gate[s, rows, :]
-                ob[u % 2] = (hb[u % 2].astype(jnp.float32) + g * v).astype(ob.dtype)
+                for lane in range(0, window, LANES):
+                    part = slice(lane, lane + LANES)
+                    h = hb[u % 2, :, part].astype(jnp.float32)
+                    ob[u % 2, :, part] = (h + g * v[:, part]).astype(ob.dtype)
                 o_copy(u).start()
 
         @pl.when(i + 2 < windows)
