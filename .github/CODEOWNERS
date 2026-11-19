@@ -158,6 +158,8 @@
 /src/vllm_torchtpu/models/vllm/deepseek_v4/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
 /tests/kernels/deepseek_v4/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
 /tests/**/test_dsv4_*.py @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
+/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin @pritha90
+/tests/kernels/test_dsv4_streamindex_topk*.py @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin @pritha90
 
 # Kernels & Models: DeepSeek v4.1
 /src/vllm_torchtpu/kernels/experimental/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
