@@ -202,3 +202,44 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert q is not None
     assert [r.request_id for r in q] == ["r1", "r2"]
     assert s._paw_scoring_broken is True
+
+
+def _bookkeeping_calls(monkeypatch, async_scheduling: bool) -> list[str]:
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    calls: list[str] = []
+    for cls, name in ((AsyncScheduler, "async"), (Scheduler, "sync")):
+        monkeypatch.setattr(
+            cls,
+            "_update_after_schedule",
+            lambda self, out, name=name: calls.append(f"{name}:schedule"),
+        )
+        monkeypatch.setattr(
+            cls,
+            "_update_request_with_output",
+            lambda self, req, ids, is_stale=False, name=name: (
+                calls.append(f"{name}:output") or (ids, False)
+            ),
+        )
+    s = _make_scheduler([], {})
+    s.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+    s._update_after_schedule(object())
+    s._update_request_with_output(object(), [7])
+    return calls
+
+
+def test_sync_scheduling_skips_async_placeholders(monkeypatch):
+    # Pipeline parallelism runs without async scheduling; the async output
+    # placeholders would reschedule a request before its token is back.
+    assert _bookkeeping_calls(monkeypatch, async_scheduling=False) == [
+        "sync:schedule",
+        "sync:output",
+    ]
+
+
+def test_async_scheduling_keeps_async_bookkeeping(monkeypatch):
+    assert _bookkeeping_calls(monkeypatch, async_scheduling=True) == [
+        "async:schedule",
+        "async:output",
+    ]

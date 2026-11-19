@@ -33,11 +33,13 @@ from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
     SchedulingPolicy,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
 logger = init_logger("vllm." + __name__)
@@ -63,6 +65,27 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_scoring_broken = False
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
+
+    # Without async scheduling, keep the synchronous Scheduler's bookkeeping.
+    # AsyncScheduler's output placeholders let a request be scheduled again
+    # before its sampled token returns; under pipeline parallelism the first
+    # stage then gets no token for it (IndexError in `_update_states`).
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        if self.scheduler_config.async_scheduling:
+            super()._update_after_schedule(scheduler_output)
+        else:
+            Scheduler._update_after_schedule(self, scheduler_output)
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        if self.scheduler_config.async_scheduling:
+            return super()._update_request_with_output(
+                request, new_token_ids, is_stale=is_stale
+            )
+        return Scheduler._update_request_with_output(
+            self, request, new_token_ids, is_stale=is_stale
+        )
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
