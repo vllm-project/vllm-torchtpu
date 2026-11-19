@@ -25,7 +25,10 @@ from typing import TYPE_CHECKING
 
 from vllm import envs as vllm_envs
 from vllm.ray.lazy_utils import is_in_ray_actor
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.registry import (
+    AttentionBackendEnum,
+    register_backend,
+)
 
 from vllm_torchtpu import envs
 
@@ -34,6 +37,27 @@ if TYPE_CHECKING:
 
 
 _REGISTERED_BACKENDS: set[str] = set()
+
+# Default TPU AttentionBackend class path attached to AttentionBackendEnum.FLYWHEEL
+# for --mm-encoder-attn-backend; register_attention_backend("flywheel", ...)
+# overrides it via register_backend when a decoder backend registers.
+FLYWHEEL_BACKEND_CLASS_PATH = (
+    "vllm_torchtpu.layers.adapter.attention.PallasAttentionBackend"
+)
+# Maximum head_dim supported by flywheel_tpu.flash_attn_varlen_func.
+MAX_FLYWHEEL_VIT_HEAD_DIM = 256
+
+
+def ensure_flywheel_enum_registered() -> AttentionBackendEnum:
+    """Register AttentionBackendEnum.FLYWHEEL without activating decoder routing.
+
+    Registers by class-path string only so nothing from torch_tpu or
+    flywheel_tpu is imported at registration time.
+    """
+    member = AttentionBackendEnum.__members__.get("FLYWHEEL")
+    if member is None:
+        return AttentionBackendEnum.register("FLYWHEEL", FLYWHEEL_BACKEND_CLASS_PATH)
+    return member
 
 
 def register_attention_backend(name: str, *, vllm_backend: str) -> None:
@@ -49,6 +73,12 @@ def register_attention_backend(name: str, *, vllm_backend: str) -> None:
     member = AttentionBackendEnum.__members__.get(name.upper())
     if member is None:
         AttentionBackendEnum.register(name.upper(), vllm_backend)
+    elif (
+        name not in _REGISTERED_BACKENDS
+        and member.value == FLYWHEEL_BACKEND_CLASS_PATH
+        and not member.is_overridden()
+    ):
+        register_backend(member, vllm_backend)
     elif member.get_path() != vllm_backend:
         raise ValueError(
             f"vLLM already has an attention backend named {name.upper()}, at "

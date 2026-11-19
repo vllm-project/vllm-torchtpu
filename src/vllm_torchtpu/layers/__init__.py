@@ -16,6 +16,9 @@
 # this module must be imported before any model is constructed.
 from vllm_torchtpu.layers.adapter import attention as attention
 from vllm_torchtpu.layers.adapter import linear as linear
+from vllm_torchtpu.layers.adapter.attention_backend import (
+    ensure_flywheel_enum_registered,
+)
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.tokenizers import register_tokenizers
 
@@ -23,3 +26,4 @@ from vllm_torchtpu.tokenizers import register_tokenizers
 def register_layers() -> None:
     register_models()
     register_tokenizers()
+    ensure_flywheel_enum_registered()

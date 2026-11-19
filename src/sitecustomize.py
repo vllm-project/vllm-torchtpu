@@ -159,6 +159,55 @@ class _VllmOmniCompatFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             launchers_pkg_any.cli_args = target
 
 
+class _FlywheelAttnEnumFinder(importlib.abc.MetaPathFinder):
+    """Register ``AttentionBackendEnum.FLYWHEEL`` as soon as vLLM's registry loads.
+
+    Spawned worker/DP subprocesses unpickle ``VllmConfig`` before vLLM loads
+    ``vllm.general_plugins``; registering ``FLYWHEEL`` on import of
+    ``vllm.v1.attention.backends.registry`` lets ``--mm-encoder-attn-backend
+    flywheel`` unpickle cleanly under ``spawn`` without eagerly importing
+    ``flywheel_tpu``.
+    """
+
+    _ATTN_BACKEND_REGISTRY = "vllm.v1.attention.backends.registry"
+    # Defined inline so sitecustomize never imports vllm_torchtpu at Python
+    # startup (tested for equality against FLYWHEEL_BACKEND_CLASS_PATH).
+    _FLYWHEEL_BACKEND_PATH = (
+        "vllm_torchtpu.layers.adapter.attention.PallasAttentionBackend"
+    )
+
+    @classmethod
+    def _register_flywheel_attn_enum(cls, module: Any) -> None:
+        enum_cls = vars(module).get("AttentionBackendEnum")
+        if enum_cls is not None and "FLYWHEEL" not in enum_cls.__members__:
+            enum_cls.register("FLYWHEEL", cls._FLYWHEEL_BACKEND_PATH)
+
+    @classmethod
+    def apply_to_loaded_modules(cls) -> None:
+        attn_registry = sys.modules.get(cls._ATTN_BACKEND_REGISTRY)
+        if attn_registry is not None:
+            cls._register_flywheel_attn_enum(attn_registry)
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        if fullname == self._ATTN_BACKEND_REGISTRY:
+            spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _PostExecLoader(
+                    spec.loader, self._register_flywheel_attn_enum
+                )
+            return spec
+        return None
+
+
 if not any(type(f).__name__ == "_VllmOmniCompatFinder" for f in sys.meta_path):
     sys.meta_path.insert(0, _VllmOmniCompatFinder())
 _VllmOmniCompatFinder.apply_to_loaded_modules()
+
+if not any(type(f).__name__ == "_FlywheelAttnEnumFinder" for f in sys.meta_path):
+    sys.meta_path.insert(0, _FlywheelAttnEnumFinder())
+_FlywheelAttnEnumFinder.apply_to_loaded_modules()
