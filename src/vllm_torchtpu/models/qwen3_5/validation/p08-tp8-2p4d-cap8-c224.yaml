@@ -11,37 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Benchmark point 1: the serve arguments and
+# Benchmark point 8: the serve arguments and
 # environment each leg of the record run used. See README.md in this
 # directory for how to read and use it.
-name: p01-band-a-dp4tp2-4p3d-c600
-point: 1
+name: p08-tp8-2p4d-cap8-c224
+point: 8
 record:
-  mtok_per_dollar: 259.22
-  p90_interactivity: 101.71
+  mtok_per_dollar: 136.04
+  p90_interactivity: 329.95
   # The record run's decode megakernel mode; this tree has no decode megakernel.
-  decode_megakernel: "off"
-decode_layout: "DP4 x TP2, multi-port external LB"
-concurrency: 600
-chips: 28
+  decode_megakernel: "on (mode ep)"
+decode_layout: "TP8 + DCP4"
+concurrency: 224
+chips: 24
 # Values the record run used that this tree cannot run yet (README.md).
 not_yet_supported:
   decode:
     MOE_FUSED_EP_KERNEL_IMPL: "the fused EP MoE v3 kernel (this tree accepts v2 and adaptive)"
-    TPU_EXPERT_PLACEMENT: "an expert placement table that permutes the 512 experts over 8 ranks, which this tree does not ship"
+    TPU_EXPERT_PLACEMENT: "an expert placement table with 68 slots per rank (64 experts and 4 copies) and placement with expert copies; this tree ships no table and places permutations only"
 legs:
   prefill:
-    replicas: 4
+    replicas: 2
     chips_per_replica: 4
     serve_args:
       - "$MODEL"
       - "--served-model-name"
       - "$SERVED_MODEL"
       - "Qwen/$SERVED_MODEL"
-      - "--load-format"
-      - "safetensors"
-      - "--safetensors-load-strategy"
-      - "prefetch"
       - "--default-chat-template-kwargs"
       - "{\"enable_thinking\":true}"
       - "--tool-call-parser=qwen3_coder"
@@ -77,7 +73,7 @@ legs:
       - "--enable-prompt-tokens-details"
       - "--no-enable-log-requests"
       - "--compilation-config"
-      - "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[8,16,32,64,128,256,512,1024,1536,1664,2048,2176,3840,4352,6016,6528,8192],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}"
+      - "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[2176, 4352, 6528, 8192],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}"
       - "--enable-prefix-caching"
       - "--scheduler-cls"
       - "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
@@ -101,7 +97,7 @@ legs:
       - "--data-parallel-size-local"
       - "1"
       - "--kv-transfer-config"
-      - "{\"kv_connector\":\"TPUMultiConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\",\"kv_port\":14579},{\"kv_connector\":\"TPURaidenOffloadingConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.offload.raiden_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":550000000000,\"raiden_controller_port\":47800}}]}}"
+      - "{\"kv_connector\":\"TPUMultiConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\",\"kv_port\":14579,\"kv_connector_extra_config\":{\"destination_decode_context_parallel_size\":4}},{\"kv_connector\":\"TPURaidenOffloadingConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.offload.raiden_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":550000000000,\"raiden_controller_port\":47800}}]}}"
       - "--speculative-config"
       - "{\"method\":\"mtp\",\"num_speculative_tokens\":1}"
       - "--renderer-num-workers"
@@ -119,7 +115,7 @@ legs:
       TPU_MOE_SKIP_PADDED_TOKENS: "1"
       TPU_P2P_WAIT_PULL_TIMEOUT: "300"
       TPU_PP_CHUNK_SLACK: "0.5"
-      TPU_RAIDEN_DST_SHARDS: "2"
+      TPU_RAIDEN_DST_SHARDS: "8"
       TPU_RAIDEN_JOB_NAME: "prefill"
       TPU_RAIDEN_MAX_TRANSFER_TOKENS: "262144"
       TPU_RAIDEN_POOL_TAGS_PER_LAYER: "1"
@@ -136,15 +132,13 @@ legs:
       VLLM_XLA_CHECK_RECOMPILATION: "0"
     additional_config: {}
   decode:
-    replicas: 3
+    replicas: 4
     chips_per_replica: 4
     serve_args:
       - "$MODEL"
       - "--served-model-name"
       - "$SERVED_MODEL"
       - "Qwen/$SERVED_MODEL"
-      - "--load-format"
-      - "runai_streamer"
       - "--default-chat-template-kwargs"
       - "{\"enable_thinking\":true}"
       - "--tool-call-parser=qwen3_coder"
@@ -170,7 +164,7 @@ legs:
       - "--max-num-batched-tokens"
       - "2048"
       - "--max-num-seqs"
-      - "28"
+      - "8"
       - "--no-disable-hybrid-kv-cache-manager"
       - "--attention-backend"
       - "CUSTOM"
@@ -179,33 +173,32 @@ legs:
       - "--enable-prompt-tokens-details"
       - "--no-enable-log-requests"
       - "--compilation-config"
-      - "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[8,16,24,32,48,64,72,80,96,112,128,256,512,2048],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}"
+      - "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[4, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 320, 384, 448, 512, 2048],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}"
       - "--enable-prefix-caching"
       - "--async-scheduling"
       - "--scheduler-cls"
       - "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
       - "--block-size"
       - "640"
-      - "--kv-cache-memory-bytes"
-      - "39500000000"
       - "--disable-sliding-window"
       - "--tensor-parallel-size"
-      - "2"
+      - "8"
       - "--host"
       - "0.0.0.0"
       - "--port"
       - "7200"
       - "--prefill-context-parallel-size"
       - "1"
+      - "--decode-context-parallel-size"
+      - "4"
       - "--cp-kv-cache-interleave-size"
-      - "1"
+      - "128"
       - "--data-parallel-size"
-      - "4"
+      - "1"
       - "--data-parallel-size-local"
-      - "4"
-      - "--data-parallel-multi-port-external-lb"
+      - "1"
       - "--kv-transfer-config"
-      - "{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\",\"kv_port\":14579}"
+      - "{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\",\"kv_port\":14579,\"kv_connector_extra_config\":{\"destination_decode_context_parallel_size\":4}}"
       - "--speculative-config"
       - "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":3.39}"
       - "--renderer-num-workers"
@@ -224,7 +217,7 @@ legs:
       TPU_MOE_SINGLE_SORT: "1"
       TPU_MOE_SKIP_PADDED_TOKENS: "1"
       TPU_P2P_WAIT_PULL_TIMEOUT: "300"
-      TPU_RAIDEN_DST_SHARDS: "2"
+      TPU_RAIDEN_DST_SHARDS: "8"
       TPU_RAIDEN_JOB_NAME: "decode"
       TPU_RAIDEN_MAX_TRANSFER_TOKENS: "262144"
       TPU_RAIDEN_POOL_TAGS_PER_LAYER: "1"
@@ -234,7 +227,7 @@ legs:
       TPU_RAIDEN_TRANSFER_PARALLELISM: "8"
       TPU_ROPE_CACHE_TRUNCATE: "1"
       TPU_SAMPLER_TOPK_CANDIDATES: "40"
-      TPU_TOKEN_BUCKET_EXTRA: "8,48,2048"
+      TPU_TOKEN_BUCKET_EXTRA: "4,8,48,2048"
       TPU_USE_RAIDEN_KV_CACHE_MANAGER: "1"
       TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
       USE_MOE_FUSED_EP_KERNEL: "1"
