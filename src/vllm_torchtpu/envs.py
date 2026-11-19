@@ -85,6 +85,9 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
+    TPU_TP_AR_QDQ_ROWS: int = 0
+    TPU_TP_QAR_MIN_TOKENS: int = 0
+    TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
@@ -837,6 +840,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS", 0
     ),
+    # Accuracy emulation of an int8-payload TP all-reduce: quantize each
+    # rank's bf16 partial and the reduced result to int8 with one absmax scale
+    # per (lane, ROWS-row block), dequantize, and all-reduce as usual. No
+    # speedup; measures what an int8 wire would cost in accuracy. 0 = off.
+    # Applies to all-reduces of at least TPU_TP_AR_QDQ_MIN_TOKENS rows.
+    "TPU_TP_AR_QDQ_ROWS": env_int("TPU_TP_AR_QDQ_ROWS", 0),
+    # TP all-reduces of at least this many rows run qar_all_reduce (int8
+    # payload on the ICI links, kernels/collectives/qar_all_reduce.py) instead
+    # of XLA's; needs the Pallas all-reduce armed (TPU_TP_PALLAS_ALL_REDUCE_
+    # MAX_BYTES > 0) on a tpu7x 2x2x1 TP8 group. Changes numerics (~0.9% rel
+    # L2 per all-reduce). 0 = off.
+    "TPU_TP_QAR_MIN_TOKENS": env_int("TPU_TP_QAR_MIN_TOKENS", 0),
+    "TPU_TP_AR_QDQ_MIN_TOKENS": env_int("TPU_TP_AR_QDQ_MIN_TOKENS", 0),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.
