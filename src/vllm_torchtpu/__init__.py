@@ -1708,17 +1708,16 @@ def _patch_vllm_compile_prefix_isolation() -> None:
                 compile_prefix = prefix
             else:
                 # The class name plus the instance's index within its class.
-                # Instances of one class are built in a fixed order, so a
-                # restart that builds the same model gets the same names and
-                # reads the same cache dirs.
+                # A restart gets the same names, and reads the same cache
+                # dirs, only if it builds this class's instances in the same
+                # order; nothing here enforces that order.
                 cls_name = f"{type(self).__module__}.{type(self).__qualname__}"
                 index = instances_per_class.get(cls_name, 0)
                 instances_per_class[cls_name] = index + 1
                 compile_prefix = f"{cls_name}_{index}"
                 logger.info(
-                    "compile_prefix isolation: %s has no self.prefix; caching "
-                    "it under %s (class name and instance index).",
-                    type(self).__name__,
+                    "compile_prefix isolation: no self.prefix; caching under %s "
+                    "(class name and instance index).",
                     compile_prefix,
                 )
         original_init(self, compile_prefix=compile_prefix, is_encoder=is_encoder)
