@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_CAST_SKIP: str = "shared_experts.gate_up_proj"
+    TPU_MINIMAX_M3_FP8_CAST_IN_TORCH: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -777,6 +778,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # feeds the bf16 routed experts, so its cast is an extra pass.
     "TPU_MINIMAX_M3_FP8_CAST_SKIP": env_str(
         "TPU_MINIMAX_M3_FP8_CAST_SKIP", "shared_experts.gate_up_proj"
+    ),
+    # TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS: cast the activations in torch before
+    # the fp8 matmul op instead of inside it.
+    "TPU_MINIMAX_M3_FP8_CAST_IN_TORCH": env_bool(
+        "TPU_MINIMAX_M3_FP8_CAST_IN_TORCH", default=False
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/

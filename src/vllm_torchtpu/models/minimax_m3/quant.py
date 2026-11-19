@@ -82,7 +82,10 @@ _E4M3_MAX = 448.0
 def _fp8_cast_matmul(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
     """``bf16(e4m3(clip(x)) @ w * scale)`` with f32 accumulation: no
     per-token scale, so the cast is elementwise and fuses into x's producer."""
-    x8 = jnp.clip(x, -_E4M3_MAX, _E4M3_MAX).astype(jnp.float8_e4m3fn)
+    if x.dtype == jnp.float8_e4m3fn:
+        x8 = x
+    else:
+        x8 = jnp.clip(x, -_E4M3_MAX, _E4M3_MAX).astype(jnp.float8_e4m3fn)
     acc = jax.lax.dot_general(
         x8, w, (((x.ndim - 1,), (0,)), ((), ())), preferred_element_type=jnp.float32
     )
@@ -292,6 +295,10 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             # Rows are static at trace time, so each bucket picks one path.
             return quantized_matmul(x, layer.weight, layer.weight_scale)
         if x.dtype == torch.bfloat16 and _fp8_cast_applies(layer, rows):
+            if envs.TPU_MINIMAX_M3_FP8_CAST_IN_TORCH:
+                # Cast outside the jax_op, so XLA can fuse it into x's
+                # producer (the op boundary kept it a separate pass).
+                x = x.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
             return _fp8_cast_linear(x, layer.weight, layer.weight_scale)
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
             weight = _materialized_bf16(layer.weight)
