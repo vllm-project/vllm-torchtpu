@@ -24,6 +24,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op im
 )
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tracing.named_scope import initialize_named_scopes, named_scope
 from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
@@ -1289,32 +1290,33 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if stage_sp:
                 aux_hidden = upstream.sp_all_gather(aux_hidden)[:full_num_tokens]
             aux_hidden_by_layer[start_layer] = aux_hidden
-        with stage_attention_cache_scope():
+        with stage_attention_cache_scope(), named_scope(f"stage_{stage}"):
             for idx, layer in enumerate(
                 islice(self.layers, start_layer, end_layer),
                 start=start_layer,
             ):
-                (
-                    hidden_states,
-                    residual,
-                    post_mix,
-                    res_mix,
-                    pre_mix,
-                    previous_aux,
-                ) = layer(
-                    hidden_states,
-                    positions,
-                    input_ids,
-                    pre_mix,
-                    post_mix,
-                    res_mix,
-                    residual,
-                    engram_hashes,
-                    engram_mask,
-                    capture_previous_aux=(
-                        idx in self.aux_hidden_state_layers and residual is not None
-                    ),
-                )
+                with named_scope(f"layer_{idx}"):
+                    (
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                        pre_mix,
+                        previous_aux,
+                    ) = layer(
+                        hidden_states,
+                        positions,
+                        input_ids,
+                        pre_mix,
+                        post_mix,
+                        res_mix,
+                        residual,
+                        engram_hashes,
+                        engram_mask,
+                        capture_previous_aux=(
+                            idx in self.aux_hidden_state_layers and residual is not None
+                        ),
+                    )
                 if previous_aux is not None:
                     # idx is the one-based id of the layer whose post this is.
                     if stage_sp:
@@ -1409,6 +1411,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         initialize_mhc_post()
         initialize_flat_collapse()
         initialize_paged_attention()
+        initialize_named_scopes()
         with (
             device_hooks(
                 upstream,

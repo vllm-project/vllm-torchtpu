@@ -11,6 +11,7 @@ from vllm_torchtpu.kernels.fused_greedy_head import (
     fused_greedy_head,
     is_supported_shape,
 )
+from vllm_torchtpu.tracing.named_scope import scoped
 
 _head_op = pallas.jax_op("pallas::fused_greedy_head", fused_greedy_head)
 
@@ -37,5 +38,6 @@ class FusedGreedyHead:
         self.weight = weight
         self.rows = rows
 
+    @scoped("greedy_head")
     def __call__(self, hidden: torch.Tensor) -> torch.Tensor:
         return _head_op(hidden, self.weight)
