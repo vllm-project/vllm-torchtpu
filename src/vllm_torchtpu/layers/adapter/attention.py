@@ -101,6 +101,7 @@ from vllm_torchtpu.layers.core.attention_interface import (
     uses_seq_along_lane_kv_page,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.draft_dcp_attention import DraftDcpAttention
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -1007,6 +1008,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # when decode_context_parallel_size > 1.
         self.dcp_world_size = 1
         self.dcp_rank = 0
+        # Set before initialize_kernel() to keep this layer's KV whole on every
+        # DCP rank (see `kv_cache_manager.dcp_replicated_page_tokens`): it then
+        # attends like a non-DCP layer, over pages of block_size * dcp tokens
+        # that line up with the DCP-sharded layers' logical blocks.
+        self.kv_replicated_over_dcp = False
+        # Set (with kv_replicated_over_dcp, which keeps the plain kernel) by a
+        # drafter whose KV is DCP-sharded like the target's
+        # (`enable_sharded_draft_dcp`): the drafter's implementation then
+        # writes the context K/V and attends. Off by default.
+        self.sharded_draft_dcp: DraftDcpAttention | None = None
+        # KV heads per row of that sharded cache.
+        self.sharded_draft_dcp_kv_heads = 0
         self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
         self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
@@ -1274,6 +1287,56 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self._kernel_config_cache[config_key] = rpa_kernel_impl
         return rpa_kernel_impl
 
+    def enable_sharded_draft_dcp(
+        self,
+        layer: AttentionLayer,
+        *,
+        impl: DraftDcpAttention,
+        dcp: int,
+        dcp_rank: int,
+        kv_head_replicas: int,
+    ) -> None:
+        """Keep this drafter layer's KV DCP-sharded like the target's instead
+        of whole on every rank; ``impl`` writes its context K/V and attends.
+
+        The cache rows hold every KV head of the DCP group
+        (``max(1, dcp // kv_head_replicas)``). The rank is a buffer of
+        `layer`, so every rank traces one program.
+        """
+        if self.num_kv_heads != 1:
+            # The group's rows hold one KV head per `kv_head_replicas` ranks;
+            # several local KV heads per rank would not fit them.
+            raise NotImplementedError(
+                "sharded draft DCP needs one local KV head per rank, got "
+                f"{self.num_kv_heads}"
+            )
+        self.kv_replicated_over_dcp = True
+        self.sharded_draft_dcp_kv_heads = max(1, dcp // kv_head_replicas)
+        cast(torch.nn.Module, layer).register_buffer(
+            "draft_dcp_rank",
+            torch.tensor([dcp_rank], dtype=torch.int32, device=layer._k_scale.device),
+            persistent=False,
+        )
+        self.sharded_draft_dcp = impl
+
+    def write_sharded_draft_kv(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        """Write the drafter's context K/V into its DCP-sharded cache."""
+        assert self.sharded_draft_dcp is not None
+        self.sharded_draft_dcp.write(
+            cast(torch.nn.Module, layer),
+            key.view(key.shape[0], self.num_kv_heads, self.head_size),
+            value.view(value.shape[0], self.num_kv_heads, self.head_size),
+            kv_cache,
+            attn_metadata,
+        )
+
     def _run_dcp_forward(
         self,
         layer: AttentionLayer,
@@ -1493,6 +1556,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         dcp_configured = (
             parallel_config is not None
             and getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+            and not self.kv_replicated_over_dcp
         )
         if dcp_configured:
             # These backends allocate NHD even when the global layout is HND.
@@ -1655,6 +1719,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
             value = torch.nn.functional.pad(value, (0, pad_size))
+        if self.sharded_draft_dcp is not None:
+            outputs = self.sharded_draft_dcp.forward(
+                cast(torch.nn.Module, layer),
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+            )
+            if query_dim == 2:
+                outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
+            if output is not None:
+                output.copy_(outputs)
+            return outputs
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float
